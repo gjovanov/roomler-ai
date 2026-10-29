@@ -506,7 +506,7 @@ mod tests {
             height: 2,
             stride: 8,
             pixel_format: PixelFormat::Bgra,
-            data: vec![tag; 16],
+            data: vec![tag; 16].into(),
             monotonic_us: u64::from(tag) * 33_333,
             monitor: 0,
             damage: Damage::Unknown,
@@ -543,12 +543,12 @@ mod tests {
             self.log
                 .lock()
                 .unwrap()
-                .push(format!("encode:{}@{thread}", frame.data[0]));
+                .push(format!("encode:{}@{thread}", frame.cpu()[0]));
             if self.fail_encode {
                 return Err(anyhow!("hw says no"));
             }
             Ok(vec![crate::encode::EncodedPacket {
-                data: vec![frame.data[0]],
+                data: vec![frame.cpu()[0]],
                 is_keyframe: false,
                 duration_us: 33_333,
                 qp: None,

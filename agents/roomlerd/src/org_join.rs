@@ -527,6 +527,24 @@ fn assign_netstack_port(org: &mut OrgEntry, claimed: &[u16]) -> Option<u16> {
     org.netstack_socks_port
 }
 
+/// FR-129 B1 — a loopback port for the PRIMARY enrollment's netstack front
+/// (`netstack_socks_port`), picked as the secondary orgs' are: the first port
+/// of the band that no org claims and nothing on this host listens on. The
+/// wizard writes it for a per-user Linux daemon that joins the overlay, which
+/// has no CAP_NET_ADMIN under its unit and reaches the mesh only through the
+/// userspace stack. `None` when the band is exhausted; the caller says so.
+pub fn pick_primary_netstack_port(cfg: &AgentConfig) -> Option<u16> {
+    if let Some(port) = cfg.netstack_socks_port {
+        return Some(port);
+    }
+    let claimed: Vec<u16> = cfg
+        .orgs
+        .iter()
+        .filter_map(|o| o.netstack_socks_port)
+        .collect();
+    pick_netstack_port(&claimed)
+}
+
 /// The line a CLI verb prints about a netstack org's front.
 fn say_netstack_front(label: &str, port: Option<u16>) {
     match port {
@@ -566,6 +584,36 @@ pub fn heal_netstack_ports(cfg: &mut AgentConfig) -> bool {
                  mesh until `netstack_socks_port` is set on its [[orgs]] entry"
             ),
         }
+    }
+    changed
+}
+
+/// FR-129 B1 — at daemon start, every org whose overlay is on (`netstack` or
+/// `tun`) and that has no WireGuard key gets one of its own, so it joins its
+/// mesh: [`AgentConfig::for_org`] reads a keyless org as overlay OFF,
+/// whatever its mode says. The primary has always had its key minted at its
+/// first overlay-enabled start (`run_cmd`); a secondary's was minted only when
+/// it was appended (`apply_enrollment`), and only by a build with an overlay
+/// surface. So an org appended by a build without one — the setup wizard's
+/// in-process fold, the tray's enroll — or one whose key a new device row
+/// retired (`enrollment::retire_key_of_previous_row`) had none, and never
+/// joined. Each key is freshly minted, never a copy of another org's (a shared
+/// pubkey would let two orgs correlate the device). An org whose overlay is
+/// off is left alone: it gets its key at the first start after its mode is
+/// turned on. `true` = the config changed and must be saved.
+pub fn heal_org_keys(cfg: &mut AgentConfig) -> bool {
+    let mut changed = false;
+    for org in cfg.orgs.iter_mut() {
+        if org.overlay_mode == OrgOverlayMode::Off || org.overlay_wg_secret_key.is_some() {
+            continue;
+        }
+        let Some((secret, _public)) = crate::key_rotation::mint_wg_identity() else {
+            // A build with no overlay surface: there is no mesh to join.
+            continue;
+        };
+        org.overlay_wg_secret_key = Some(secret);
+        info!(org = %org.label, "overlay: an org on the mesh had no WireGuard key; it has its own now");
+        changed = true;
     }
     changed
 }
@@ -968,5 +1016,58 @@ mod fr49_tests {
         cfg.orgs[0].overlay_mode = crate::config::OrgOverlayMode::Tun;
         cfg.orgs[0].netstack_socks_port = None;
         assert!(!heal_netstack_ports(&mut cfg), "a tun org never gets one");
+    }
+
+    /// FR-129 B1 — at daemon start every org on the mesh with no WireGuard key
+    /// gets one of its own: an org the setup wizard appended (its build mints
+    /// none) or one whose key a new device row retired would otherwise join
+    /// nothing, since `for_org` reads a keyless org as off the mesh. An org off
+    /// the mesh, and a key already set, are left alone; a key is never a copy
+    /// of the primary's or another org's; `true` only when something changed.
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    #[test]
+    fn heal_gives_keyless_orgs_on_the_mesh_a_key_of_their_own() {
+        let mut cfg = two_org_cfg();
+        cfg.overlay_wg_secret_key = crate::key_rotation::mint_wg_identity().map(|(s, _)| s);
+        assert!(!heal_org_keys(&mut cfg), "an off org: nothing to do");
+        assert_eq!(cfg.orgs[0].overlay_wg_secret_key, None);
+
+        cfg.orgs[0].overlay_mode = crate::config::OrgOverlayMode::Netstack;
+        cfg.orgs[0].netstack_socks_port = Some(10800);
+        assert!(
+            !cfg.for_org(&cfg.orgs[0]).overlay_enabled,
+            "keyless: off the mesh, whatever its mode says"
+        );
+        assert!(
+            heal_org_keys(&mut cfg),
+            "a keyless org on the mesh is healed"
+        );
+        let key = cfg.orgs[0]
+            .overlay_wg_secret_key
+            .clone()
+            .expect("a key of its own");
+        assert_ne!(
+            Some(&key),
+            cfg.overlay_wg_secret_key.as_ref(),
+            "never the primary's"
+        );
+        assert!(cfg.for_org(&cfg.orgs[0]).overlay_enabled, "and it joins");
+        assert!(!heal_org_keys(&mut cfg), "it has one: nothing to do");
+        assert_eq!(
+            cfg.orgs[0].overlay_wg_secret_key.as_deref(),
+            Some(key.as_str())
+        );
+
+        // A second keyless org gets ANOTHER fresh key, not a copy.
+        let mut second = cfg.orgs[0].clone();
+        second.label = "beta".into();
+        second.tenant_id = "t3id".into();
+        second.agent_id = "a3".into();
+        second.overlay_wg_secret_key = None;
+        second.netstack_socks_port = Some(10801);
+        cfg.orgs.push(second);
+        assert!(heal_org_keys(&mut cfg));
+        let other = cfg.orgs[1].overlay_wg_secret_key.as_deref();
+        assert!(other.is_some() && other != Some(key.as_str()));
     }
 }

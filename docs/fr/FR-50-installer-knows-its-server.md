@@ -19,6 +19,8 @@ script substitutes the default before the bytes leave the process.
 
 ## Root cause, with anchors
 
+*Anchors in this section: master `e49718946` (the claim). FR-50 shipped, and the code below moved since.*
+
 `scripts/install.sh:46`
 
 ```sh

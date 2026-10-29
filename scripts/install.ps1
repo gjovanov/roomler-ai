@@ -20,6 +20,9 @@
 #     & ([scriptblock]::Create((irm https://roomler.ai/api/setup/install.ps1))) -Role daemon-system -Token <jwt>
 #   )
 #
+#   Or pair in the browser instead of pasting a token (FR-129 A4):
+#     powershell -ExecutionPolicy Bypass -File .\install.ps1 -Role daemon-system -Pair [-PairOrg <org-slug>]
+#
 # Roles (same vocabulary as the roomler-setup wizard):
 #   daemon-user     perUser MSI -- Scheduled-Task autostart, no UAC.
 #                   Run from a NORMAL (non-elevated) shell -- see -AllowElevated.
@@ -36,6 +39,17 @@
 #   -DownloadOnly   resolve + download + verify, print what WOULD run,
 #                   touch nothing else (safe on any box).
 #   -NoEnroll       install without enrolling (no token needed).
+#   -Pair           pair in the browser instead of pasting a token (FR-129 A4):
+#                   roomlerd prints a code and the page to type it on, waits
+#                   for the approval, shows the org and the approver (name AND
+#                   unique slug, name AND unique username) and asks
+#                   "Join ...? [y/N]" on this console before it enrolls. The
+#                   token the approval delivers stays inside roomlerd's own
+#                   process: never on a command line. Daemon roles only today.
+#   -PairOrg SLUG   with -Pair: the org the approval must name. It stands in
+#                   for the question (the check, stated in advance), and with
+#                   no console to ask on (a remote shell, a scheduler) it is
+#                   the only way to enroll.
 #   -SkipDesktop    daemon roles: don't fetch roomler-desktop.exe.
 # RETIRED-NAME-ANCHOR-BEGIN
 # 'Roomler Agent' IS the MSI ARP DisplayName, so the uninstall lookups below
@@ -69,6 +83,9 @@ param(
     # fails the build rather than silently disabling the substitution.
     [string]$Server = 'https://roomler.ai',
     [string]$Token = '',
+    # FR-129 A4 -- pair in the browser instead of pasting a token (header).
+    [switch]$Pair,
+    [string]$PairOrg = '',
     [string]$Name = $env:COMPUTERNAME,
     [switch]$DownloadOnly,
     [switch]$NoEnroll,
@@ -187,6 +204,23 @@ if (-not $machineRole -and -not $DownloadOnly -and -not $Uninstall -and -not $Al
     throw "refusing an elevated '$Role' install (use -AllowElevated only on a UAC-disabled box)."
 }
 
+# FR-129 A4 -- one enrollment, two ways to its token: -Token, or a pairing
+# roomlerd runs on this console (enroll --pair). The daemon's own process does
+# the whole pairing -- the code, the poll, the "Join ...?" question on the
+# console, the enroll -- so no token reaches a command line here either.
+if ($Pair -and -not $Uninstall) {
+    if ($Token) { throw "-Pair and -Token are two ways to the same enrollment: pass one of them." }
+    if ($NoEnroll) { throw "-Pair enrolls; it cannot be combined with -NoEnroll." }
+    if ($Role -eq 'tunnel-client') {
+        throw "-Pair is for the daemon roles today: the roomler CLI has no --pair yet, so a tunnel client pairs in the roomler-setup wizard or enrolls with -Token <tunnel-enrollment-jwt>."
+    }
+    if ($PairOrg -and ($PairOrg -cnotmatch '^[a-z0-9-]+$')) {
+        throw "-PairOrg takes the org's slug (lowercase letters, digits and dashes), got '$PairOrg'."
+    }
+} elseif ($PairOrg -and -not $Uninstall) {
+    throw "-PairOrg applies to -Pair only."
+}
+
 # Pre-rendered hint fragment for enroll commands. S1b: ONLY the
 # SystemContext flavour reads the machine-global config -- a plain-SCM
 # daemon's worker runs user-context and reads the per-user file, so
@@ -221,7 +255,9 @@ function Install-Daemon {
 
     if ($DownloadOnly) {
         Say "download-only: would run: msiexec $msiArgs"
-        Say "download-only: would enroll via: '$daemon' enroll --server $Server --token <token> --name '$Name'$mgFlag"
+        $cred = '--token <token>'
+        if ($Pair) { $cred = '--pair'; if ($PairOrg) { $cred = "--pair --pair-org $PairOrg" } }
+        Say "download-only: would enroll via: '$daemon' enroll --server $Server $cred --name '$Name'$mgFlag"
         if (-not $SkipDesktop) { Say "download-only: would place roomler-desktop.exe into $installDir" }
         return
     }
@@ -252,14 +288,27 @@ function Install-Daemon {
 
     if (-not $SkipDesktop) { Install-Desktop -InstallDir $installDir }
 
-    if ($NoEnroll -or -not $Token) {
-        if (-not $NoEnroll) { Warn "no -Token given -- skipping enrollment" }
-        Say "enroll later with: & '$daemon' enroll --server $Server --token <agent-enrollment-jwt> --name '$Name'$mgFlag"
+    if ($NoEnroll -or (-not $Token -and -not $Pair)) {
+        if (-not $NoEnroll) { Warn "no -Token or -Pair given -- skipping enrollment" }
+        Say "enroll later with: & '$daemon' enroll --server $Server --token <agent-enrollment-jwt> --name '$Name'$mgFlag   (or --pair in place of --token)"
         return
     }
 
-    Say "enrolling this machine as '$Name' against $Server (token is single-use, never echoed)"
-    $enrollArgs = @('enroll', '--server', $Server, '--token', $Token, '--name', $Name)
+    if ($Pair) {
+        # FR-129 A4 -- roomlerd pairs in its own process: it prints the code,
+        # polls, asks "Join ...?" on the console (CONIN$, never stdin) and
+        # enrolls with the token the approval delivered, which therefore never
+        # appears on a command line. A refusal -- a no, a -PairOrg the approval
+        # did not name, no console and no -PairOrg -- is an exit of 1 with
+        # nothing enrolled, and the install stops here, as a failed -Token
+        # enroll stops it.
+        Say "pairing this machine as '$Name' with $Server -- open the page below and type the code"
+        $enrollArgs = @('enroll', '--pair', '--server', $Server, '--name', $Name)
+        if ($PairOrg) { $enrollArgs += @('--pair-org', $PairOrg) }
+    } else {
+        Say "enrolling this machine as '$Name' against $Server (token is single-use, never echoed)"
+        $enrollArgs = @('enroll', '--server', $Server, '--token', $Token, '--name', $Name)
+    }
     # S1b: machine-global is the SystemContext flavour's config source only
     # (see the $mgFlag comment above).
     if ($Role -eq 'daemon-system') { $enrollArgs += '--machine-global' }
@@ -284,7 +333,14 @@ function Install-Daemon {
         # would be recorded as this script's.
         Remove-Item Env:ROOMLER_INSTALL_METHOD, Env:ROOMLER_INSTALL_SCOPE -ErrorAction SilentlyContinue
     }
-    if ($enrollExit -ne 0) { throw "enrollment failed (exit $enrollExit)" }
+    if ($enrollExit -ne 0) {
+        if ($Pair) {
+            $orgHint = ''
+            if ($PairOrg) { $orgHint = " --pair-org $PairOrg" }
+            throw "not enrolled (roomlerd exited $enrollExit; see above). Run this again with -Pair, or enroll later with: & '$daemon' enroll --pair$orgHint --server $Server --name '$Name'$mgFlag"
+        }
+        throw "enrollment failed (exit $enrollExit)"
+    }
 
     # Kick the autostart so the daemon picks up the fresh config now
     # rather than at the next logon / service cycle. Best-effort.

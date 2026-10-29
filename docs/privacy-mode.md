@@ -70,7 +70,7 @@ A device that could curtain but whose owner has not allowed it advertises only
 ## Who can say no, and what the viewer says
 
 The server strips `PRIVACY` before the device ever sees it
-([`privacy_grant`, `hub.rs:437`](../crates/modules/fleet/src/hub.rs#L437)). The first reason
+([`privacy_grant`, `hub.rs:508`](../crates/modules/fleet/src/hub.rs#L508)). The first reason
 that applies wins, and it reaches the viewer (`rc:session.created.privacy_refused`) and the
 session's `session_requested` audit row (`privacy_stripped`):
 
@@ -214,7 +214,7 @@ sequenceDiagram
 - The key is the device's own. It is set over the LocalAPI only by the person at the console, whose screen
   it locks, and no server can push it. An admin can ask for stricter (below).
 - **The default is `never`, except on a new Windows service install, which starts at `auto`** (P3c, the
-  spec's decision 3; [`apply_service_install_defaults`](../crates/agent-core/src/enrollment.rs#L730)). Its
+  spec's decision 3; [`apply_service_install_defaults`](../crates/agent-core/src/enrollment.rs#L858)). Its
   worker reaches the secure desktop, so the next controller can unlock what `auto` locked. Per-user installs
   keep `never`, since nothing could unlock them remotely. So does the Linux root daemon, until a field cell
   shows a remote unlock there. An install already in the field keeps its value when it is re-enrolled.

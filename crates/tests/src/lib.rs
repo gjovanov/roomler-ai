@@ -262,6 +262,14 @@ mod overlay_route_offer_tests;
 mod overlay_tests;
 #[cfg(test)]
 mod pagination_tests;
+/// FR-129 A1 — device pairing, the server half: the daemon and tunnel
+/// flows end to end, two halves, two pods, the codes (a user code or a
+/// forged device code retrieves nothing; the device code in no response
+/// but start's), slow-down, expiry, denial, the gate re-checked at delivery,
+/// the device cap and an archived org refusing a paired token like a pasted
+/// one, the address and account ceilings, the kill switch, the audit trail.
+#[cfg(test)]
+mod pairing_tests;
 #[cfg(test)]
 mod pdf_export_tests;
 /// FR-100 P1a — a device's identity key as the fleet stores and shows it, and
@@ -315,6 +323,11 @@ mod session_carrier_tests;
 /// switch's empty 404, `purge_user`, and the digest's `quality.ratings`.
 #[cfg(test)]
 mod session_feedback_tests;
+/// FR-129 B1-s — `GET /api/setup/features`: the Phase B kill switch
+/// (`wizard_unix_daemon`, default off) and `pairing`, each following its
+/// setting, read by a guest and a member alike.
+#[cfg(test)]
+mod setup_features_tests;
 #[cfg(test)]
 mod ssh_grant_ack_tests;
 #[cfg(test)]

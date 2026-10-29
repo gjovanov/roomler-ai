@@ -242,7 +242,10 @@ impl Modules {
             }
         }
 
-        let _ = core;
+        // FR-129 A1 — the mounted set, copied into the core from the ONE
+        // function `/api/capabilities` reads, so a module asking whether a
+        // sibling is present (fleet, about `network`) reads the same answer.
+        core.mounted.set(modules.mounted());
         Ok(modules)
     }
 

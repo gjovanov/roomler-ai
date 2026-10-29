@@ -58,6 +58,7 @@ could only ever answer `no_relay`.
 |---|---|
 | `base` | every 4:2:0 open + the software cells + the vp9_qsv IDR verdict |
 | `444` | only the 4:4:4 forms of `candidates_444`, answered as `ROOMLER_CAPS_444:[…]`, folded in by `merge_444` |
+| `gpu` (FR-118 P2-3) | only with `zero_copy` on: the GPU-input forms of `candidates_gpu` (QSV 4:2:0), each opened on the capture adapter's device and fed two GPU frames, answered as `ROOMLER_CAPS_GPU:[…]` |
 
 The 0.4.84 roll found the cost of one child: a laptop's Intel media runtime died
 with `0xc0000005` on the first `vp9_qsv` 4:4:4 open and the daemon advertised
@@ -66,7 +67,12 @@ with `0xc0000005` on the first `vp9_qsv` 4:4:4 open and the daemon advertised
 ⚠️ **The child's stderr reaches no log on a service host.** It announces every
 open on stdout (`ROOMLER_CAPS_PROGRESS:<name>:yuv444`, line-buffered so it
 survives the crash) and the parent quotes the last one — *that* is the
-`encoder_cells_deny` entry to add.
+`encoder_cells_deny` entry to add (`<name>:gpu` → `zero_copy_deny`).
+
+⚠️ **A form no child has opened never opens in the daemon.** A session's GPU
+input reads the `gpu` child's answer at every open (`gpu_input::plan` →
+`unproven`); the probe child is the only process exempt, because proving the
+form is its job. A new input form gets a phase of its own on the same terms.
 
 ## 2 · The cache
 

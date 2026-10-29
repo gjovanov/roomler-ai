@@ -135,6 +135,37 @@ flowchart TB
   diagnostics, agent-log fetch — surfaced in an opt-in HUD.
 - **Resilience**: reconnect with backoff, decode-pressure shedding.
 
+### The frame-rate picker (FR-119)
+
+The Video tab of the viewer's settings offers **Frame rate**, with 60, 120 and
+144, only for an agent whose hello carries `fps-high`
+(`views/remote/RemoteControl.vue:1712`). The agent's side, the grant and its
+step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-the-viewer-asks-the-host-proves-it-fr-119).
+
+- **The options** (`frameRateOptions`, `composables/frameRate.ts:52`): 60 is
+  always on. 120 and 144 are disabled, with the reason as text, when the host
+  reported a screen slower than the rate ("the host's screen refreshes at
+  60 Hz").
+- **The pick** is stored per browser (`roomler-rc-fps`,
+  `composables/frameRate.ts:30`) and sent again each time the control channel
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7469`), so
+  a reload asks again without a click.
+- **The hint under it is the agent's answer**, from `rc:video-info`
+  (`frameRateSummary`, `composables/frameRate.ts:147`): "120 fps"; "120 fps, on
+  trial until this host has shown it can keep up"; "60 fps (144 fps not granted:
+  this host hasn't shown it can sustain that rate yet)"; or, while the rate
+  below a refused ask runs as a trial, "120 fps on trial (144 fps not granted:
+  …)". A reason word from a newer agent is shown as it came. With no session
+  open, the hint reads "Above 60 only where this device has shown it can sustain
+  it".
+- **"Try N fps again"** (`views/remote/RemoteControl.vue:1722`) appears under
+  the picker for an `unproven` refusal, from an agent that advertises
+  `fps-retry` (`frameRateCanRetry`, `composables/frameRate.ts:164`). It re-sends
+  the pick with `retry: true`, and the agent trials the step-down again from the
+  top. ⚠️ It is a text button inside the Video tab. The page's own blue "Try
+  again", shown after a session fails, has the same icon and reconnects
+  instead.
+
 ## Observability components
 
 `ui/src/components/stats/`: `MeshGraph` (d3 force graph of overlay edges +

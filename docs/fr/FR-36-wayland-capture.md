@@ -134,13 +134,13 @@ is tempting to skip. Do not skip it permanently. RustDesk's shape is a separate
 attacker-controllable field is a CRTC-id equality filter. That is the right
 target for a binary shipping to every fleet host — and it maps onto this repo's
 existing self-spawn precedent (`roomlerd caps-probe`,
-`#[command(hide = true)]` at `app.rs:149`, spawned via `current_exe()` at
+`#[command(hide = true)]` at `app.rs:172`, spawned via `current_exe()` at
 `encode/caps.rs:79`), so it needs **no new packaged artifact**.
 
 ### The seam is unchanged
 
-`ScreenCapture` (`capture/mod.rs:269`), chosen in `open_default`
-(`capture/mod.rs:463`); backends at `:16` scrap, `:22` x11_damage, `:25` wgc,
+`ScreenCapture` (`capture/mod.rs:306`), chosen in `open_default`
+(`capture/mod.rs:500`); backends at `:16` scrap, `:22` x11_damage, `:25` wgc,
 `:34` synthetic. DRM is a fifth — no pump changes.
 
 ## Host readiness — measured on `scw-m2-asahi`, 2026-08-29

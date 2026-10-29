@@ -48,6 +48,11 @@ export type ConsentMode = 'auto' | 'prompt' | 'email' | 'push' | 'prompt_then_em
  *  ends. Mirrors the Rust `LockOnEnd` (lowercase on the wire). */
 export type LockOnEnd = 'never' | 'auto' | 'always'
 
+/** FR-128 — how a device's remote-desktop sessions may use the mesh: the
+ *  stored `rc_overlay` / `rc_overlay_auto` pair read as one choice (the Rust
+ *  `RcOverlayMode`). Never on the wire as such. */
+export type RcOverlayMode = 'off' | 'auto' | 'on'
+
 /** FR-101 P2 — one sensitive session feature, as an org allows it. Mirrors the
  *  Rust `RcFeaturePolicy` (lowercase on the wire). */
 export type RcFeaturePolicy = 'on' | 'ask' | 'off'
@@ -86,6 +91,11 @@ export interface AccessPolicy {
    *  the best one (it can be the only working path between two hostile NATs,
    *  but it inherits the mesh's failure modes). */
   rc_overlay?: boolean | null
+  /** FR-128 — `auto`: each session decides at the agent's offer. It takes
+   *  the mesh when the mesh link to the browser's own device is direct, and
+   *  not otherwise. `rc_overlay: true` wins over it. `null`/absent/`false`
+   *  is not auto. */
+  rc_overlay_auto?: boolean | null
   /** FR-99 P3b — what this device's sessions ask of it when the last one
    *  ends: `auto` (lock again if it was locked, or nobody was at it, when the
    *  session began) or `always`. The device takes the stricter of this and its

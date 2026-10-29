@@ -62,6 +62,11 @@ pub(crate) struct CacheFile {
     pub caps: AgentCaps,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vp9_qsv_idr: Option<(bool, bool)>,
+    /// FR-118 P2-3 — the encoders whose GPU-input form the probe opened. Not a
+    /// wire capability: it decides whether a session on THIS host may open
+    /// that form. A file without it reads as "none proven".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu_input: Vec<String>,
 }
 
 impl CacheFile {
@@ -79,7 +84,14 @@ impl CacheFile {
             probe_ms,
             caps,
             vp9_qsv_idr,
+            gpu_input: Vec::new(),
         }
+    }
+
+    /// FR-118 P2-3 — with the GPU-input forms the probe proved.
+    pub(crate) fn with_gpu_input(mut self, gpu_input: Vec<String>) -> Self {
+        self.gpu_input = gpu_input;
+        self
     }
 }
 

@@ -27,7 +27,7 @@ pub mod app;
 // `tunnel/mod.rs` so `crate::tunnel::acl::…` still resolves.
 pub use roomler_node_core::{
     appdirs, config, config_surface, crash_recorder, enrollment, files_dir, logging, logs_upload,
-    machine, token_slot,
+    machine, pairing, pairing_terminal, token_slot,
 };
 
 pub mod apps;
@@ -246,6 +246,9 @@ pub use roomler_node_core::tcc;
 #[cfg(target_os = "linux")]
 pub mod tarball_owner;
 pub mod telemetry;
+/// #3018 — every thread's stack, read from outside the stuck code, for the
+/// record a stall leaves.
+pub mod thread_dump;
 /// FR-103 — renewing each enrollment's agent token before it expires.
 pub mod token_renewal;
 pub mod tunnel;

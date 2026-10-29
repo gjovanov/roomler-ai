@@ -153,8 +153,9 @@ impl BackendBail {
 /// to recompute.
 #[cfg(feature = "scrap-capture")]
 pub struct DxgiFrame {
-    /// BGRA8 pixel data, length `width * height * 4`.
-    pub bytes: Vec<u8>,
+    /// BGRA8 pixels, `width * height * 4` bytes in memory, or (FR-118 P2) a
+    /// texture on the capture device.
+    pub data: crate::capture::FrameData,
     pub width: u32,
     pub height: u32,
     /// Bytes per row. Always `width * 4` on the DXGI path; carried
@@ -169,6 +170,10 @@ pub struct DxgiFrame {
     /// Phase B — native dims when the backend GPU-scaled before the
     /// readback; `None` = the frame is native-sized.
     pub source: Option<(u32, u32)>,
+    /// FR-118 P0 — how long this frame's copy of the desktop surface into
+    /// CPU memory took, in microseconds. The adapter-bound direct backend
+    /// times it; `None` from the scrap-wrapped one, which copies inside scrap.
+    pub readback_us: Option<u64>,
 }
 
 /// Uniform interface over the two DXGI Desktop Duplication backends —
@@ -270,12 +275,13 @@ impl DxgiDupBackend {
                 }
                 let bytes = buf[..expected].to_vec();
                 Ok(DxgiFrame {
-                    bytes,
+                    data: bytes.into(),
                     width: self.width,
                     height: self.height,
                     stride,
                     damage: crate::capture::Damage::Unknown,
                     source: None,
+                    readback_us: None,
                 })
             }
             Err(e) => Err(BackendBail::from_io(e)),

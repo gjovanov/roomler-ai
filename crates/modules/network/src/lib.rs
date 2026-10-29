@@ -370,8 +370,22 @@ impl Module for NetworkState {
                     for sid in dead {
                         tunnel_tokens.remove(&sid);
                     }
-                    for entry in tunnel_tokens.iter() {
-                        let (sid, token) = (*entry.key(), entry.value().clone());
+                    // The KEYS, snapshotted; never the live iterator: it holds
+                    // its shard's guard across the Redis await below, and a
+                    // session opening or closing meanwhile (a write to that
+                    // shard) would park a tokio worker THREAD for the round
+                    // trip. Two of them on a 2-CPU pod and the runtime stops
+                    // (FR-127 P1.1; `clippy.toml` at the root holds the rule).
+                    let sessions: Vec<ObjectId> =
+                        tunnel_tokens.iter().map(|entry| *entry.key()).collect();
+                    for sid in sessions {
+                        // Read live, right before its refresh, as the iterator
+                        // read it: `refresh_if_mine` re-sets a missing key, so
+                        // a token released since the snapshot would resurrect
+                        // its record.
+                        let Some(token) = tunnel_tokens.get(&sid).map(|t| t.value().clone()) else {
+                            continue;
+                        };
                         let key = roomler_core::cluster::directory::tunnel_key(&sid.to_hex());
                         if let Err(e) = dir.refresh_if_mine(&key, &token, 90).await {
                             tracing::debug!(session = %sid, %e, "tunnel directory refresh failed");
@@ -390,8 +404,15 @@ impl Module for NetworkState {
                     for k in dead {
                         derp_tokens.remove(&k);
                     }
-                    for entry in derp_tokens.iter() {
-                        let ((net, pk), token) = (*entry.key(), entry.value().clone());
+                    // The keys, snapshotted, and each token read live, for the
+                    // reasons the tunnel loop above gives.
+                    let registrations: Vec<derp_types::DerpKey> =
+                        derp_tokens.iter().map(|entry| *entry.key()).collect();
+                    for (net, pk) in registrations {
+                        let Some(token) = derp_tokens.get(&(net, pk)).map(|t| t.value().clone())
+                        else {
+                            continue;
+                        };
                         let key = roomler_core::cluster::directory::derp_key(
                             &net.to_hex(),
                             &derp_cluster::pk_hex(&pk),

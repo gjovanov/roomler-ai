@@ -69,11 +69,51 @@
               data-testid="heard-about"
             />
 
+            <!-- FR-129 A2: a person sent here by the pairing page is about to
+                 approve a device into an organization, so the account can be
+                 born with one (the server creates it from `tenant_name` +
+                 `tenant_slug`). Optional: the pairing page creates one too.
+                 Shown by the pending-pairing marker, never by anything in the
+                 URL, so the ordinary sign-up page is unchanged. -->
+            <template v-if="forPairing">
+              <v-divider class="my-4" />
+              <div class="text-subtitle-2 mb-1" data-test="register-org">{{ $t('auth.pairOrgTitle') }}</div>
+              <p class="text-body-2 text-medium-emphasis mb-3">{{ $t('auth.pairOrgHint') }}</p>
+              <v-text-field
+                v-model="orgName"
+                :label="$t('auth.orgName')"
+                prepend-inner-icon="mdi-domain"
+                autocomplete="organization"
+                @update:model-value="autoSlug"
+              />
+              <v-text-field
+                v-model="orgSlug"
+                :label="$t('auth.orgSlug')"
+                :hint="$t('auth.orgSlugHint')"
+                prepend-inner-icon="mdi-link-variant"
+                :rules="[orgSlugRule, rules.slug]"
+                autocapitalize="none"
+                autocorrect="off"
+                spellcheck="false"
+                @update:model-value="slugTouched = true"
+              />
+            </template>
+
             <v-alert v-if="auth.error" type="error" density="compact" class="mb-4">
               {{ auth.error }}
             </v-alert>
 
+            <!-- FR-129 A2: on production the account needs its email
+                 activated before it can sign in; while a pairing waits, say
+                 so here rather than leaving for the dashboard, and say that
+                 signing in afterwards leads back to the pairing. -->
+            <v-alert v-if="pairingAwaitsActivation" type="success" variant="tonal" class="mb-4" data-test="register-activation">
+              <div>{{ pairingAwaitsActivation }}</div>
+              <div class="mt-2">{{ $t('auth.pairAfterActivation') }}</div>
+            </v-alert>
+
             <v-btn
+              v-if="!pairingAwaitsActivation"
               type="submit"
               color="primary"
               block
@@ -130,6 +170,7 @@ import {
   type SignupAttribution,
 } from '@/utils/attribution'
 import { trackGoal } from '@/utils/goals'
+import { PAIR_PATH, hasPendingPair, takePendingPair } from '@/utils/pairing'
 
 const auth = useAuthStore()
 // Provider buttons are a real touch target on a phone (28 px at `small`).
@@ -172,6 +213,35 @@ const onward = computed(() => carriedQuery(route.query, landing()))
 
 const inviteCode = computed(() => (route.query.invite as string) || sessionStorage.getItem('pending_invite_code') || undefined)
 
+// FR-129 A2 — a pairing waiting in this browser (`utils/pairing.ts`). Read
+// once, when the page opens: the fields it reveals must not vanish under
+// the person's hands when the marker runs out mid-form.
+const forPairing = ref(hasPendingPair())
+const orgName = ref('')
+const orgSlug = ref('')
+const slugTouched = ref(false)
+/** The dashboard's rule: the slug follows the name until the person edits it. */
+function autoSlug() {
+  if (!slugTouched.value) {
+    orgSlug.value = orgName.value
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+  }
+}
+/** A name without a slug would be silently dropped by the server (it needs both). */
+function orgSlugRule(v: string) {
+  return !orgName.value.trim() || !!v || t('auth.orgSlugNeeded')
+}
+function orgToCreate(): { name: string; slug: string } | undefined {
+  const name = orgName.value.trim()
+  const slug = orgSlug.value.trim()
+  return forPairing.value && name && slug ? { name, slug } : undefined
+}
+/** The server's "check your email" answer, kept on screen while a pairing waits. */
+const pairingAwaitsActivation = ref<string | null>(null)
+
 const oauthProviders = [
   { name: 'google', label: 'Google', icon: 'mdi-google', color: '#DB4437' },
   { name: 'facebook', label: 'Facebook', icon: 'mdi-facebook', color: '#4267B2' },
@@ -197,6 +267,7 @@ async function handleRegister() {
       displayName.value,
       inviteCode.value,
       attribution(),
+      orgToCreate(),
     )
     // FR-88 §3b: on the server's yes, and before navigating, so the goal is
     // recorded on the page the visitor signed up from.
@@ -205,6 +276,15 @@ async function handleRegister() {
     sessionStorage.removeItem('pending_invite_code')
     if (result?.invite_tenant) {
       router.push(`/tenant/${result.invite_tenant.tenant_id}`)
+    } else if (!result?.user && forPairing.value) {
+      // FR-129 A2 — no session yet: production wants the email activated
+      // first. Stay here and say so; the marker in localStorage brings the
+      // tab that signs in afterwards back to the pairing.
+      pairingAwaitsActivation.value = result?.message || t('auth.pairCheckEmail')
+    } else if (result?.user && takePendingPair()) {
+      // A session arrived with the account (the auto-verified overlay):
+      // straight back to the pairing.
+      router.push(PAIR_PATH)
     } else {
       router.push({ name: 'dashboard' })
     }

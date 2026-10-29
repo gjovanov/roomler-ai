@@ -403,7 +403,7 @@
                 @input-mode="(m: 'free' | 'exclusive') => onInputModeChange(agentFor(item)!, m)"
                 @idle-minutes="(m: number) => onIdleMinutesChange(agentFor(item)!, m)"
                 @lock-on-end="(l: LockOnEnd) => onLockOnEndChange(agentFor(item)!, l)"
-                @rc-overlay="(v: boolean) => onRcOverlayChange(agentFor(item)!, v)"
+                @rc-overlay="(m: RcOverlayMode) => onRcOverlayChange(agentFor(item)!, m)"
               />
             </template>
             <span v-else class="text-caption text-medium-emphasis">—</span>
@@ -795,7 +795,7 @@
                       @input-mode="(m: 'free' | 'exclusive') => onInputModeChange(agentFor(item)!, m)"
                       @idle-minutes="(m: number) => onIdleMinutesChange(agentFor(item)!, m)"
                       @lock-on-end="(l: LockOnEnd) => onLockOnEndChange(agentFor(item)!, l)"
-                      @rc-overlay="(v: boolean) => onRcOverlayChange(agentFor(item)!, v)"
+                      @rc-overlay="(m: RcOverlayMode) => onRcOverlayChange(agentFor(item)!, m)"
                     />
                   </v-expansion-panel-text>
                 </v-expansion-panel>
@@ -1453,6 +1453,7 @@ import {
   type ConsentMode,
   type EnrollmentToken,
   type LockOnEnd,
+  type RcOverlayMode,
 } from '@/stores/agents'
 import { codecChips, permissionWarnings } from './agentCodecChips'
 import { keepBusyBriefTitle } from '@/composables/keepBusy'
@@ -1492,7 +1493,7 @@ import GridColumnPickerDialog from '@/components/common/GridColumnPickerDialog.v
 import DeviceEditDialog, { type EditableDevice } from '@/components/admin/DeviceEditDialog.vue'
 import DeviceActionsMenu, { type DeviceAction } from './DeviceActionsMenu.vue'
 import DeviceAccessPolicyFields from './DeviceAccessPolicyFields.vue'
-import { policySummary } from './devicePolicy'
+import { policySummary, rcOverlayFields, rcOverlayMode } from './devicePolicy'
 import FactChip from '@/components/common/FactChip.vue'
 
 const props = defineProps<{ tenantId: string }>()
@@ -1998,13 +1999,14 @@ async function onLockOnEndChange(a: Agent, lock: LockOnEnd) {
   }
 }
 
-async function onRcOverlayChange(a: Agent, rc_overlay: boolean) {
-  if ((a.access_policy.rc_overlay ?? false) === rc_overlay) return
+async function onRcOverlayChange(a: Agent, mode: RcOverlayMode) {
+  if (rcOverlayMode(a.access_policy) === mode) return
   consentBusy.value = a.id
   try {
     await agentStore.updateAccessPolicy(props.tenantId, a.id, {
       ...a.access_policy,
-      rc_overlay,
+      // FR-128 — both fields, so the row never says `on` and `auto` at once.
+      ...rcOverlayFields(mode),
     })
   } catch (e) {
     agentStore.error = (e as Error).message

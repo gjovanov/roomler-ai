@@ -33,12 +33,60 @@
 #   --no-enroll       install without enrolling (no token needed); prints the
 #                     enroll command to run later.
 #
+#   Or pair in the browser instead of pasting a token (FR-129 A4):
+#
+#   curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+#       --role daemon --pair [--pair-org <org-slug>] [--server …] [--name …]
+#
+#   --pair            prints a code and the page to type it on; sign in there
+#                     (or create an account and an org), type the code, approve.
+#                     The daemon then shows the org and the approver — name AND
+#                     unique slug, name AND unique username — and asks
+#                     "Join …? [y/N]" on this terminal before it enrolls. The
+#                     token the approval delivers stays inside the daemon's
+#                     own process: never on a command line, never on disk
+#                     outside the enrolled config.
+#   --pair-org SLUG   with --pair: the org the approval must name. It stands in
+#                     for the question (the check, stated in advance), and with
+#                     no terminal to ask on it is the only way to enroll.
+#
 # The desktop companion (roomler-desktop) rides IN the macOS .pkg. On Linux it
 # is a SEPARATE .deb (FR-27), or .rpm on Fedora, the RHEL family and openSUSE
 # (FR-93 P6d) — installed automatically when this box has a
 # graphical session, since the companion is the device's consent PROMPT
 # surface and a device set to "Prompt on host" without one cannot ask anybody.
 #   --desktop / --no-desktop   force that decision either way.
+#
+# FR-129 B0 — the two HALVES of a daemon install, for a GUI that elevates once
+# through the desktop's own prompt (pkexec on Linux, osascript "with
+# administrator privileges" on macOS) and runs everything else as the person:
+#
+#   --privileged-steps   only what needs root: the package (and the tarball's
+#                        owner repair), the macOS root-half marker, the FR-96
+#                        update helper, the Linux companion package, the SYSTEM
+#                        unit. Refuses to run unprivileged. A release that
+#                        publishes no digest is an ERROR here, where the
+#                        terminal path only warns: root installs nothing it
+#                        cannot verify.
+#   --user-steps         only what runs as the person: the systemd user unit,
+#                        the LaunchAgent kickstart. Refuses to run as root.
+#   --config-from FILE   (with --privileged-steps) a SYSTEM-scope config the
+#                        caller enrolled in its own process: the Linux
+#                        --system unit's, or the macOS root half's — which it
+#                        also requests, as --daemon-token does on a terminal.
+#                        A config already at the target is NOT replaced: the
+#                        installed daemon folds the new enrollment into it
+#                        (`roomlerd adopt-enrollment`), keeping the operator's
+#                        settings — FR-129 B1, #2338 — and a running root
+#                        unit is restarted onto the result.
+#   --config-take KEYS   (with --config-from) comma-separated config keys to
+#                        copy from FILE on top of a kept config: the options
+#                        the person set by hand in the wizard.
+#
+# Neither half takes a token. The caller enrolls in-process between them, as
+# the Windows wizard does, because a token on a command line is readable by
+# every process on the host. Without either flag this script runs both halves
+# in today's order, with today's sudo prompts.
 #
 # Conventions: POSIX sh (no bashisms), curl -fsSL, /tmp staging, sudo only
 # where the target dir demands it. The enrollment token is single-use and is
@@ -61,6 +109,9 @@ set -eu
 SERVER="https://roomler.ai"
 ROLE=""
 TOKEN=""
+# FR-129 A4 — pair in the browser instead of pasting a token (see the header).
+PAIR=0
+PAIR_ORG=""
 NAME="$(hostname 2>/dev/null || echo roomler-device)"
 DOWNLOAD_ONLY=0
 SYSTEM=0
@@ -77,6 +128,10 @@ SYSTEM_CONFIG="/etc/roomler/config.toml"
 # existing Mac and both gates it guards dual-read during the changeover.
 MACOS_DAEMON_CONFIG="/etc/roomler/config.toml"
 MACOS_DAEMON_MARKER="/etc/roomler/enable-daemon"
+# The daemon inside the frozen bundle (its name keys the macOS TCC grants —
+# see install_daemon_macos). Both halves need it: the privileged one checks
+# the .pkg put it there, the user one kickstarts what runs from it.
+MACOS_DAEMON_BIN="/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd"
 DAEMON_TOKEN=""
 NO_ENROLL=0
 # FR-27 — the Linux desktop companion. Empty = decide by probing for a
@@ -86,13 +141,43 @@ DESKTOP=""
 # package, installed. It takes no --role, and refuses one.
 UNINSTALL=0
 KEEP_CONFIG=0
+# FR-129 B0 — the halves (see the header). Each refuses the other's
+# privilege, and both refuse a token.
+PRIV_STEPS=0
+USER_STEPS=0
+CONFIG_FROM=""
+# FR-129 B1 — the keys `adopt-enrollment` takes from --config-from on top of
+# a kept config (comma-separated; see place_system_config).
+CONFIG_TAKE=""
+# An elevated run places nothing it cannot verify: with this set, a release
+# without a digest is an error where the terminal path only warns.
+DIGEST_REQUIRED=0
 
 usage() {
-    sed -n '2,32p' "$0" 2>/dev/null || true
-    echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT] [--name NAME]"
-    echo "                  [--daemon-token JWT] [--system] [--download-only] [--no-enroll]"
+    sed -n '2,51p' "$0" 2>/dev/null || true
+    echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT | --pair [--pair-org SLUG]]"
+    echo "                  [--name NAME] [--daemon-token JWT] [--system] [--download-only] [--no-enroll]"
     echo "                  [--desktop|--no-desktop]"
+    echo "       install.sh --privileged-steps --role daemon [--system] [--config-from FILE]"
+    echo "                  [--config-take KEYS] [--server URL] [--name NAME] [--desktop|--no-desktop]"
+    echo "       install.sh --user-steps --role daemon [--system]"
     echo "       install.sh --uninstall [--keep-config]"
+    echo
+    echo "  --pair          Pair in the browser instead of pasting a token: prints a code and the"
+    echo "                  page to type it on, waits for the approval, shows the org and the"
+    echo "                  approver (name AND slug, name AND username) and asks before it"
+    echo "                  enrolls. The token never touches a command line. --pair-org SLUG"
+    echo "                  names the org the approval must name; with no terminal to ask on"
+    echo "                  it is the only way to enroll. Daemon role only today."
+    echo
+    echo "  --privileged-steps / --user-steps"
+    echo "                  The two halves of a daemon install, for a GUI that elevates ONCE"
+    echo "                  through the desktop's own prompt and runs the rest as the person."
+    echo "                  Neither takes a token: enroll in your own process between them."
+    echo "                  --config-from FILE hands the privileged half a system-scope config"
+    echo "                  (Linux --system; on macOS it also requests the root half). A config"
+    echo "                  already there keeps its operator settings (the daemon folds the new"
+    echo "                  enrollment in); --config-take KEYS copies those keys from FILE anyway."
     echo
     echo "  --uninstall     Remove every Roomler part on this machine — the daemon, the"
     echo "                  companion, the tunnel CLI — however it was installed (this"
@@ -123,6 +208,8 @@ while [ $# -gt 0 ]; do
         --role) ROLE="$2"; shift 2 ;;
         --server) SERVER="$2"; shift 2 ;;
         --token) TOKEN="$2"; shift 2 ;;
+        --pair) PAIR=1; shift ;;
+        --pair-org) PAIR_ORG="$2"; shift 2 ;;
         --name) NAME="$2"; shift 2 ;;
         --daemon-token) DAEMON_TOKEN="$2"; shift 2 ;;
         --system) SYSTEM=1; shift ;;
@@ -132,6 +219,10 @@ while [ $# -gt 0 ]; do
         --no-desktop) DESKTOP=0; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         --keep-config) KEEP_CONFIG=1; shift ;;
+        --privileged-steps) PRIV_STEPS=1; shift ;;
+        --user-steps) USER_STEPS=1; shift ;;
+        --config-from) CONFIG_FROM="$2"; shift 2 ;;
+        --config-take) CONFIG_TAKE="$2"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "unknown flag: $1" >&2; usage ;;
     esac
@@ -142,7 +233,9 @@ if [ "$UNINSTALL" = 1 ]; then
     # "only this part" and remove more than was asked: refuse it, with the rest
     # of the install options.
     if [ -n "$ROLE" ] || [ -n "$TOKEN" ] || [ -n "$DAEMON_TOKEN" ] || [ "$SYSTEM" = 1 ] ||
-        [ "$DOWNLOAD_ONLY" = 1 ] || [ "$NO_ENROLL" = 1 ] || [ -n "$DESKTOP" ]; then
+        [ "$DOWNLOAD_ONLY" = 1 ] || [ "$NO_ENROLL" = 1 ] || [ -n "$DESKTOP" ] ||
+        [ "$PRIV_STEPS" = 1 ] || [ "$USER_STEPS" = 1 ] || [ -n "$CONFIG_FROM" ] || [ -n "$CONFIG_TAKE" ] ||
+        [ "$PAIR" = 1 ] || [ -n "$PAIR_ORG" ]; then
         echo "error: --uninstall removes every Roomler part on this machine and takes no install options (only --keep-config)" >&2
         exit 1
     fi
@@ -172,6 +265,99 @@ fi
 if [ -n "$DAEMON_TOKEN" ] && { [ "$ROLE" != daemon ] || [ "$OS" != Darwin ]; }; then
     echo "error: --daemon-token applies to '--role daemon' on macOS only" >&2
     exit 1
+fi
+
+# ─── FR-129 A4: --pair ──────────────────────────────────────────────────────
+#
+# One enrollment, two ways to its token: a pasted --token, or a pairing the
+# daemon runs on this terminal (`roomlerd enroll --pair`). The pairing is the
+# daemon's own process end to end — the code, the poll, the "Join …?" question
+# on /dev/tty, the enroll — so no token reaches a command line here either.
+if [ "$PAIR" = 1 ] && [ "$UNINSTALL" != 1 ]; then
+    if [ -n "$TOKEN" ]; then
+        echo "error: --pair and --token are two ways to the same enrollment: pass one of them" >&2
+        exit 1
+    fi
+    if [ "$NO_ENROLL" = 1 ]; then
+        echo "error: --pair enrolls; it cannot be combined with --no-enroll" >&2
+        exit 1
+    fi
+    if [ "$ROLE" != daemon ]; then
+        echo "error: --pair is for '--role daemon' today: the roomler CLI has no --pair yet, so a tunnel client pairs in the roomler-setup wizard or enrolls with --token <tunnel-enrollment-jwt>" >&2
+        exit 1
+    fi
+    if [ -n "$DAEMON_TOKEN" ]; then
+        # The root half is its own enrollment (FR-43). One approval for both
+        # halves is FR-129 B2; until then a paired Mac gets its root half from
+        # a second pairing run as root, which the per-user install prints.
+        echo "error: --pair pairs the per-user half; the macOS root half is a second enrollment, paired afterwards as root (the install prints the command) or taken from --token <jwt> --daemon-token <second-jwt>. One approval for both halves is FR-129 B2." >&2
+        exit 1
+    fi
+elif [ -n "$PAIR_ORG" ] && [ "$UNINSTALL" != 1 ]; then
+    echo "error: --pair-org applies to --pair only" >&2
+    exit 1
+fi
+# The slug as the admin UI makes it. The daemon matches it byte for byte, so
+# this only catches an org's display name typed in its place before anybody
+# approves anything. The class is spelled out: a range like a-z follows the
+# locale's collation in some shells and can let capitals through.
+case "$PAIR_ORG" in
+    *[!abcdefghijklmnopqrstuvwxyz0123456789-]*)
+        echo "error: --pair-org takes the org's slug (lowercase letters, digits and dashes), got '$PAIR_ORG'" >&2
+        exit 1
+        ;;
+esac
+
+# ─── FR-129 B0: the halves ──────────────────────────────────────────────────
+#
+# A GUI elevates ONCE, through the desktop's own prompt, for exactly the steps
+# that need root, and runs the rest as the person. Each half therefore refuses
+# the other's privilege, and both refuse a token: the enroll happens in the
+# caller's own process between them. A missing digest fails the privileged
+# half CLOSED — root installs nothing it cannot verify.
+half_err() { echo "error: $*" >&2; exit 1; }
+if [ "$PRIV_STEPS" = 1 ] || [ "$USER_STEPS" = 1 ]; then
+    if [ "$PRIV_STEPS" = 1 ] && [ "$USER_STEPS" = 1 ]; then
+        half_err "--privileged-steps and --user-steps are one half each: run them one at a time"
+    fi
+    if [ "$DOWNLOAD_ONLY" = 1 ]; then
+        half_err "--download-only is the terminal path's dry run; a half is never a dry run"
+    fi
+    if [ "$ROLE" != daemon ]; then
+        half_err "the halves exist for '--role daemon' only (a GUI installs the tunnel CLI itself)"
+    fi
+    if [ -n "$TOKEN" ] || [ -n "$DAEMON_TOKEN" ]; then
+        half_err "a half never takes a token — enroll in your own process between the halves (a token on a command line is readable by every process on the host)"
+    fi
+    if [ "$PAIR" = 1 ]; then
+        half_err "a half never pairs — pair and enroll in your own process between the halves, as the wizard does (FR-129 A3)"
+    fi
+    if [ "$PRIV_STEPS" = 1 ]; then
+        if [ "$(id -u)" != 0 ]; then
+            half_err "--privileged-steps needs root: run it under pkexec, osascript 'with administrator privileges', or sudo"
+        fi
+        DIGEST_REQUIRED=1
+    else
+        if [ "$(id -u)" = 0 ]; then
+            half_err "--user-steps runs as the person whose session the daemon joins, never as root"
+        fi
+        [ -z "$CONFIG_FROM" ] || half_err "--config-from belongs to --privileged-steps"
+    fi
+elif [ -n "$CONFIG_FROM" ]; then
+    half_err "--config-from applies to --privileged-steps only"
+fi
+if [ -n "$CONFIG_FROM" ]; then
+    if [ "$OS" = Linux ] && [ "$SYSTEM" != 1 ]; then
+        half_err "on Linux --config-from is the SYSTEM unit's config and needs --system (a per-user daemon's config is written by the enroll in the caller's own process, as the person)"
+    fi
+    [ -s "$CONFIG_FROM" ] || half_err "--config-from: $CONFIG_FROM is not a readable, non-empty file"
+fi
+if [ -n "$CONFIG_TAKE" ]; then
+    [ -n "$CONFIG_FROM" ] || half_err "--config-take applies with --config-from only"
+    # Key names only: they become arguments of the daemon's own verb.
+    case "$CONFIG_TAKE" in
+        *[!a-z0-9_,]*) half_err "--config-take: keys are lowercase config key names, comma-separated (got '$CONFIG_TAKE')" ;;
+    esac
 fi
 
 # ─── who is the desktop user? ───────────────────────────────────────────────
@@ -217,10 +403,19 @@ say()  { printf '==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 
 # Verify a file against a "sha256:<hex>" digest (GitHub asset format).
-# Soft-skips when the digest is empty (older releases lack it).
+# Soft-skips when the digest is empty (older releases lack it) — except in a
+# privileged half (FR-129 B0), where DIGEST_REQUIRED makes it an error: a GUI
+# that elevated to root must not place a package nothing vouches for.
 verify_sha256() {
     file="$1"; digest="$2"
-    [ -n "$digest" ] || { warn "no sha256 digest published for $(basename "$file") — skipping verification"; return 0; }
+    if [ -z "$digest" ]; then
+        if [ "$DIGEST_REQUIRED" = 1 ]; then
+            echo "error: no sha256 digest published for $(basename "$file") — an elevated install places nothing it cannot verify (the terminal path only warns here)" >&2
+            exit 1
+        fi
+        warn "no sha256 digest published for $(basename "$file") — skipping verification"
+        return 0
+    fi
     want="$(printf '%s' "$digest" | sed 's/^sha256://')"
     if command -v sha256sum >/dev/null 2>&1; then
         got="$(sha256sum "$file" | awk '{print $1}')"
@@ -253,6 +448,15 @@ download() {
     url="$1"; out="$2"
     say "downloading $(basename "$out")"
     curl -fsSL -o "$out" "$url"
+}
+
+# FR-129 A4 — how the dry run spells the enroll's credential.
+enroll_cred_hint() {
+    if [ "$PAIR" = 1 ]; then
+        printf '%s' "--pair${PAIR_ORG:+ --pair-org $PAIR_ORG}"
+    else
+        printf '%s' "--token <token>"
+    fi
 }
 
 # ─── daemon role ────────────────────────────────────────────────────────────
@@ -294,9 +498,9 @@ repair_tarball_owners() {
         mode="$(packaged_mode "$d")"
         warn "repairing $d: owned by $owner since an earlier tarball install; restoring root:root${mode:+, mode $mode}"
         if [ -n "$mode" ]; then
-            sudo chown -h root:root "$d" && sudo chmod "$mode" "$d" || skip="$skip $d"
+            as_root chown -h root:root "$d" && as_root chmod "$mode" "$d" || skip="$skip $d"
         else
-            sudo chown -h root:root "$d" && sudo chmod go-w "$d" || skip="$skip $d"
+            as_root chown -h root:root "$d" && as_root chmod go-w "$d" || skip="$skip $d"
         fi
     done
     # RETIRED-NAME-ANCHOR(3): the same two payload dirs, for the files in them.
@@ -307,7 +511,7 @@ repair_tarball_owners() {
         owner="$(stat -c %u:%g "$f")" || continue
         [ "$owner" = "0:0" ] && continue
         warn "repairing $f: owned by $owner; restoring root:root"
-        sudo chown -h root:root "$f" && sudo chmod go-w "$f"
+        as_root chown -h root:root "$f" && as_root chmod go-w "$f"
     done
 }
 
@@ -327,8 +531,8 @@ enable_update_helper() {
         return 0
     fi
     say "enabling the root update helper (roomler-update.timer + .path — sudo): this daemon's updates install unattended, as root"
-    sudo systemctl daemon-reload || true
-    if sudo systemctl enable --now roomler-update.timer roomler-update.path; then
+    as_root systemctl daemon-reload || true
+    if as_root systemctl enable --now roomler-update.timer roomler-update.path; then
         if [ -e /etc/roomler/disable-auto-update ]; then
             say "NOTE: /etc/roomler/disable-auto-update is set: the helper honours it and installs nothing until it is removed"
         fi
@@ -343,7 +547,7 @@ disable_update_helper() {
     for u in roomler-update.timer roomler-update.path; do
         if systemctl is-enabled --quiet "$u" 2>/dev/null; then
             say "disabling $u: this system install's root daemon installs its own updates"
-            sudo systemctl disable --now "$u" || warn "could not disable $u"
+            as_root systemctl disable --now "$u" || warn "could not disable $u"
         fi
     done
 }
@@ -445,11 +649,11 @@ install_daemon_linux() {
             say "download-only: would run: sudo tar -xzf $deb --strip-components=1 -C /"
         fi
         if [ "$SYSTEM" = 1 ]; then
-            say "download-only: would run: sudo roomlerd --config $SYSTEM_CONFIG enroll --server $SERVER --token <token> --name $NAME"
+            say "download-only: would run: sudo roomlerd --config $SYSTEM_CONFIG enroll --server $SERVER $(enroll_cred_hint) --name $NAME"
             say "download-only: would run: sudo systemctl disable --now roomler-update.timer roomler-update.path (only if a per-user install left them enabled)"
             say "download-only: would run: sudo systemctl enable --now roomlerd.service"
         else
-            say "download-only: would run: roomlerd enroll --server $SERVER --token <token> --name $NAME"
+            say "download-only: would run: roomlerd enroll --server $SERVER $(enroll_cred_hint) --name $NAME"
             say "download-only: would run: sudo systemctl enable --now roomler-update.timer roomler-update.path (when the release's daemon lists step-aside)"
             say "download-only: would run: systemctl --user enable --now roomler.service"
         fi
@@ -458,7 +662,7 @@ install_daemon_linux() {
 
     if [ "$fmt" = deb ]; then
         say "installing the roomlerd daemon (.deb — sudo required)"
-        sudo dpkg -i "$deb" || sudo apt-get -f install -y
+        as_root dpkg -i "$deb" || as_root apt-get -f install -y
     else
         say "installing the roomlerd daemon (tarball — sudo required)"
         # --strip-components=1 drops the versioned prefix dir so the payload
@@ -474,19 +678,33 @@ install_daemon_linux() {
         # Tarballs up to 0.4.126 carried their directories with the CI
         # builder's uid (1001), so this one line made /usr, /usr/bin and
         # /usr/lib the property of whichever local account held that uid.
-        sudo tar --no-same-owner --no-overwrite-dir -xzf "$deb" --strip-components=1 -C /
-        sudo test -x /usr/bin/roomlerd || { echo "error: tarball did not install /usr/bin/roomlerd" >&2; exit 1; }
+        as_root tar --no-same-owner --no-overwrite-dir -xzf "$deb" --strip-components=1 -C /
+        as_root test -x /usr/bin/roomlerd || { echo "error: tarball did not install /usr/bin/roomlerd" >&2; exit 1; }
         repair_tarball_owners
     fi
 
-    enroll_daemon /usr/bin/roomlerd
+    # The terminal path enrolls here, between the package and the unit. A
+    # privileged half never does: the token stays in the caller's process,
+    # which enrolls between the halves (FR-129 B0).
+    [ "$PRIV_STEPS" = 1 ] || enroll_daemon /usr/bin/roomlerd
 
     if [ "$SYSTEM" = 1 ]; then
+        [ -z "$CONFIG_FROM" ] || place_system_config "$SYSTEM_CONFIG" /usr/bin/roomlerd
         disable_update_helper
         say "enabling the systemd SYSTEM unit (root: self-update, the overlay TUN, and the desktop of the person on screen)"
-        sudo systemctl daemon-reload || true
-        sudo systemctl enable --now roomlerd.service
-        say "daemon status: $(sudo systemctl is-active roomlerd.service || true)"
+        as_root systemctl daemon-reload || true
+        if [ -n "$CONFIG_FROM" ] && as_root systemctl is-active --quiet roomlerd.service; then
+            # FR-129 B1 — `enable --now` leaves an ACTIVE unit exactly as it
+            # is, so on a reinstall the running root daemon would keep its
+            # previous config in memory while the placed one waits for the
+            # next boot. The placed config is the one to run: restart onto it.
+            say "the root daemon is running — restarting it onto the placed config (a remote or SSH session to this device drops for a few seconds)"
+            as_root systemctl enable roomlerd.service
+            as_root systemctl restart roomlerd.service
+        else
+            as_root systemctl enable --now roomlerd.service
+        fi
+        say "daemon status: $(as_root systemctl is-active roomlerd.service || true)"
         say "logs: sudo journalctl -u roomlerd.service -f"
     else
         # FR-96 — the helper FIRST: the daemon decides once, at its start,
@@ -495,17 +713,88 @@ install_daemon_linux() {
         enable_update_helper
         helper_after=0; helper_on && helper_after=1
         helper_changed=0; [ "$helper_before" = "$helper_after" ] || helper_changed=1
-        say "enabling the systemd user unit (autostart, this login session's user)"
-        old_pid="$(systemctl --user show -p MainPID --value roomler.service 2>/dev/null || true)"
-        systemctl --user daemon-reload || true
-        systemctl --user enable --now roomler.service
-        restart_old_user_daemon "$old_pid" "$helper_changed"
-        say "daemon status: $(systemctl --user is-active roomler.service || true)"
-        # `id -un`, not $USER: nothing sets USER in a container or a service,
-        # and under `set -u` this last line then failed an install that had
-        # worked (found by the FR-97 P6d cells).
-        say "NOTE: on a headless host, run 'sudo loginctl enable-linger $(id -un)' so the user unit runs without an open session."
+        # The user unit is the user half: the terminal path runs it now, as
+        # the person who invoked it; a privileged half leaves it to
+        # `--user-steps`, run as the person once they have enrolled.
+        [ "$PRIV_STEPS" = 1 ] || enable_user_unit "$helper_changed"
     fi
+}
+
+# The user half of a per-user Linux install: the person's own systemd unit, on
+# the person's own bus — what the terminal path runs right after the enroll,
+# and what `--user-steps` runs as the person once a privileged half has placed
+# the package.
+enable_user_unit() {
+    helper_changed="$1"
+    [ -x /usr/bin/roomlerd ] || { echo "error: /usr/bin/roomlerd is not installed — run the privileged steps first" >&2; exit 1; }
+    say "enabling the systemd user unit (autostart, this login session's user)"
+    old_pid="$(systemctl --user show -p MainPID --value roomler.service 2>/dev/null || true)"
+    systemctl --user daemon-reload || true
+    systemctl --user enable --now roomler.service
+    restart_old_user_daemon "$old_pid" "$helper_changed"
+    say "daemon status: $(systemctl --user is-active roomler.service || true)"
+    # `id -un`, not $USER: nothing sets USER in a container or a service,
+    # and under `set -u` this last line then failed an install that had
+    # worked (found by the FR-97 P6d cells).
+    say "NOTE: on a headless host, run 'sudo loginctl enable-linger $(id -un)' so the user unit runs without an open session."
+}
+
+# FR-129 B0 — `--user-steps` on Linux.
+user_steps_linux() {
+    if [ "$SYSTEM" = 1 ]; then
+        say "a --system install has no user half: the privileged steps enabled the root unit"
+        return 0
+    fi
+    # The privileged half ran in another process, so whether it turned the
+    # update helper on just now cannot be known here. A daemon already running
+    # beside an enabled helper is therefore restarted, so it decides again at
+    # its start who installs its updates (FR-96 P2a); a first install has no
+    # daemon to restart and loses nothing.
+    helper_changed=0; helper_on && helper_changed=1
+    enable_user_unit "$helper_changed"
+}
+
+# FR-129 B0 — the one step that needs root AND the token. A SYSTEM-scope
+# enroll writes a root-owned config (the Linux system unit's, the macOS root
+# half's). The halves keep the token in the caller's process, so the caller
+# enrolls into a private file of its own and the privileged half places that
+# file where the root daemon reads it: root-owned, 0600, as `roomlerd enroll`
+# writes it. The source file is the caller's to shred.
+#
+# FR-129 B1 (#2338) — a config already at the target is the device's operator
+# state (the mesh, its routes, its lock policy, secondary orgs …), and the
+# person running the wizard cannot read it to merge it: it is root's. So the
+# merge runs HERE, as root, through the daemon this half just installed:
+# `roomlerd adopt-enrollment` folds the new identity into the existing config
+# exactly as `roomlerd enroll` does for a config it can read, and
+# `--config-take` copies the keys the person set by hand in the wizard. A
+# daemon too old for the verb (a self-hosted server pinning an older release)
+# gets the B0 placement — the old config kept beside as `.prev` — and says so.
+#   place_system_config <target> <daemon-binary>
+place_system_config() {
+    target="$1"; daemon_bin="$2"
+    grp=root; [ "$OS" = Darwin ] && grp=wheel
+    if [ -f "$target" ] && "$daemon_bin" adopt-enrollment --help >/dev/null 2>&1; then
+        say "a config already exists at $target — folding the new enrollment into it (operator settings kept)"
+        take_args=""
+        if [ -n "$CONFIG_TAKE" ]; then
+            for k in $(printf '%s' "$CONFIG_TAKE" | tr ',' ' '); do take_args="$take_args --take $k"; done
+        fi
+        # shellcheck disable=SC2086
+        if "$daemon_bin" --config "$target" adopt-enrollment --from "$CONFIG_FROM" $take_args; then
+            return 0
+        fi
+        warn "the daemon could not fold the enrollment in — placing the new config instead, the old one kept as $target.prev"
+    elif [ -f "$target" ]; then
+        warn "this daemon cannot fold an enrollment into an existing config (no adopt-enrollment verb) — the old config is kept as $target.prev and its settings do NOT carry over"
+    fi
+    if [ -f "$target" ]; then
+        say "keeping the existing config as $target.prev"
+        mv -f "$target" "$target.prev"
+    fi
+    say "placing the enrolled config at $target (root-owned, 0600)"
+    mkdir -p "$(dirname "$target")"
+    install -m 600 -o root -g "$grp" "$CONFIG_FROM" "$target"
 }
 
 install_daemon_macos() {
@@ -527,11 +816,11 @@ install_daemon_macos() {
     # renaming would change the binary's TCC identity and force every existing
     # Mac to re-grant Screen Recording and Accessibility. The old probe led
     # with `roomlerd`, which never exists, and relied on the fallback.
-    daemon_bin="/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd"
+    daemon_bin="$MACOS_DAEMON_BIN"
 
     if [ "$DOWNLOAD_ONLY" = 1 ]; then
         say "download-only: would run: sudo installer -pkg $pkg -target /"
-        say "download-only: would run: $daemon_bin enroll --server $SERVER --token <token> --name $NAME"
+        say "download-only: would run: $daemon_bin enroll --server $SERVER $(enroll_cred_hint) --name $NAME"
         [ -n "$DAEMON_TOKEN" ] && say "download-only: would also enroll the privileged half at $MACOS_DAEMON_CONFIG"
         return 0
     fi
@@ -541,14 +830,16 @@ install_daemon_macos() {
     # removes a previously-installed one. Nothing in the product ever created
     # this file, which is why the privileged half was unreachable through the
     # advertised one-liner despite shipping for months.
-    if [ -n "$DAEMON_TOKEN" ]; then
+    # A terminal requests the root half with --daemon-token; a privileged
+    # half with --config-from (FR-129 B0).
+    if [ -n "$DAEMON_TOKEN" ] || [ -n "$CONFIG_FROM" ]; then
         say "requesting the privileged half (root LaunchDaemon — the overlay needs root)"
-        sudo mkdir -p "$(dirname "$MACOS_DAEMON_MARKER")"
-        sudo touch "$MACOS_DAEMON_MARKER"
+        as_root mkdir -p "$(dirname "$MACOS_DAEMON_MARKER")"
+        as_root touch "$MACOS_DAEMON_MARKER"
     fi
 
     say "installing the roomler agent (.pkg — sudo required)"
-    sudo installer -pkg "$pkg" -target /
+    as_root installer -pkg "$pkg" -target /
 
     [ -x "$daemon_bin" ] || {
         echo "error: the package did not install $daemon_bin" >&2
@@ -556,25 +847,53 @@ install_daemon_macos() {
     }
 
     # ── the per-user half: capture + input, inside the GUI session ──
-    enroll_daemon "$daemon_bin"
-
-    # postinstall bootstrapped com.roomler.agent into the CONSOLE user's gui
-    # domain, so kickstart it THERE. `gui/$(id -u)` was wrong under sudo — uid
-    # 0 has no Aqua domain, the error went to /dev/null, and the warning that
-    # replaced it ("will pick up the config at next login") was misleading.
-    say "restarting the LaunchAgent so it picks up the enrollment"
-    launchctl kickstart -k "gui/$CONSOLE_UID/com.roomler.agent" 2>/dev/null \
-        || warn "launchctl kickstart failed — the agent will pick up the config at next login"
+    # The terminal path enrolls and kickstarts here; a privileged half leaves
+    # both to the caller — its own enroll, then `--user-steps` as the person.
+    if [ "$PRIV_STEPS" != 1 ]; then
+        enroll_daemon "$daemon_bin"
+        kickstart_user_agent "$CONSOLE_UID"
+    fi
 
     # ── the privileged half: overlay/mesh, as root, its own enrollment ──
-    if [ -n "$DAEMON_TOKEN" ]; then
+    if [ -n "$DAEMON_TOKEN" ] || [ -n "$CONFIG_FROM" ]; then
         install_macos_privileged_half "$daemon_bin"
+    elif [ "$PAIR" = 1 ]; then
+        # FR-129 A4 — the root half is its own enrollment, so until B2 pairs
+        # both halves from one approval it is paired afterwards, as root, in
+        # a second run: the daemon's own process again, no token anywhere.
+        say "NOTE: this Mac has the per-user half only — screen sharing works, the overlay"
+        say "      mesh does not (creating a utun needs root). To add the root half, pair it"
+        say "      as root afterwards (a second approval), then install its service:"
+        say "        sudo $daemon_bin --config $MACOS_DAEMON_CONFIG enroll --pair --server $SERVER --name \"$NAME-daemon\" --overlay"
+        say "        sudo $daemon_bin service install --as-service"
     else
         say "NOTE: this Mac has the per-user half only — screen sharing works, the overlay"
         say "      mesh does not (creating a utun needs root). Pass --daemon-token <a second"
         say "      enrollment token> to add the privileged half."
     fi
 
+    [ "$PRIV_STEPS" = 1 ] || macos_permissions_notice
+}
+
+# postinstall bootstrapped com.roomler.agent into the CONSOLE user's gui
+# domain, so kickstart it THERE. `gui/$(id -u)` was wrong under sudo — uid 0
+# has no Aqua domain, the error went to /dev/null, and the warning that
+# replaced it ("will pick up the config at next login") was misleading. The
+# user half (`--user-steps`) runs as the console user, so there the two agree.
+kickstart_user_agent() {
+    say "restarting the LaunchAgent so it picks up the enrollment"
+    launchctl kickstart -k "gui/$1/com.roomler.agent" 2>/dev/null \
+        || warn "launchctl kickstart failed — the agent will pick up the config at next login"
+}
+
+# FR-129 B0 — `--user-steps` on macOS.
+user_steps_macos() {
+    [ -x "$MACOS_DAEMON_BIN" ] || { echo "error: $MACOS_DAEMON_BIN is not installed — run the privileged steps first" >&2; exit 1; }
+    uid="$(id -u)"
+    if [ "$uid" != "$CONSOLE_UID" ]; then
+        warn "running as uid $uid, but the console user is '$CONSOLE_USER' (uid $CONSOLE_UID) — the LaunchAgent lives in the console user's gui domain, so kickstarting it as anyone else reaches nothing"
+    fi
+    kickstart_user_agent "$uid"
     macos_permissions_notice
 }
 
@@ -589,7 +908,11 @@ install_macos_privileged_half() {
         return 0
     fi
 
-    if sudo test -f "$MACOS_DAEMON_CONFIG"; then
+    if [ -n "$CONFIG_FROM" ]; then
+        # FR-129 B0 — the caller enrolled this half in its own process (B1:
+        # folded into a config already here, through the daemon).
+        place_system_config "$MACOS_DAEMON_CONFIG" "$daemon_bin"
+    elif as_root test -f "$MACOS_DAEMON_CONFIG"; then
         say "privileged half already enrolled at $MACOS_DAEMON_CONFIG — leaving it alone"
     else
         # `--overlay` writes overlay_enabled with the rest of the enrolled
@@ -601,12 +924,12 @@ install_macos_privileged_half() {
         # The install trace rides the environment (see `install_trace`): a
         # root LaunchDaemon is the `system` scope.
         # shellcheck disable=SC2046
-        sudo $(install_trace system) "$daemon_bin" --config "$MACOS_DAEMON_CONFIG" \
+        as_root $(install_trace system) "$daemon_bin" --config "$MACOS_DAEMON_CONFIG" \
             enroll --server "$SERVER" --token "$DAEMON_TOKEN" --name "$NAME-daemon" --overlay
     fi
 
     say "starting the privileged half"
-    sudo launchctl kickstart -k system/com.roomler.daemon 2>/dev/null \
+    as_root launchctl kickstart -k system/com.roomler.daemon 2>/dev/null \
         || warn "launchctl kickstart failed for the daemon — it will start at next boot"
 }
 
@@ -659,9 +982,34 @@ enroll_daemon() {
         enroll_bin="$daemon_bin"
         enroll_trace="$(install_trace per-user)"
     fi
-    if [ "$NO_ENROLL" = 1 ] || [ -z "$TOKEN" ]; then
-        [ "$NO_ENROLL" = 1 ] || warn "no --token given — skipping enrollment"
-        say "enroll later with: $enroll_sudo $enroll_bin enroll --server $SERVER --token <agent-enrollment-jwt> --name \"$NAME\""
+    if [ "$NO_ENROLL" = 1 ] || { [ -z "$TOKEN" ] && [ "$PAIR" != 1 ]; }; then
+        [ "$NO_ENROLL" = 1 ] || warn "no --token or --pair given — skipping enrollment"
+        say "enroll later with: $enroll_sudo $enroll_bin enroll --server $SERVER --token <agent-enrollment-jwt> --name \"$NAME\"   (or --pair in place of --token)"
+        return 0
+    fi
+    if [ "$PAIR" = 1 ]; then
+        # FR-129 A4 — the daemon pairs in its own process: it prints the code,
+        # polls, asks "Join …?" on /dev/tty and enrolls with the token the
+        # approval delivered, which therefore never appears on a command line.
+        # A refusal — a no, a --pair-org the approval did not name, no
+        # terminal and no --pair-org — exits 1 with nothing enrolled, and the
+        # install stops here, as it stops when a pasted token is refused.
+        #
+        # stdin is /dev/null on purpose. Under `curl … | sh` this script's
+        # stdin IS the rest of the script, still being read. Nothing on this
+        # path reads stdin today — the daemon asks on /dev/tty, and sudo
+        # 1.9.15 passed a piped script through untouched even with log_stdin
+        # set (measured, FR-129 A4) — and the redirect keeps it that way for
+        # whatever stands between the two tomorrow. The question and sudo's
+        # own password prompt both use /dev/tty, so nothing needs stdin.
+        say "pairing this machine as '$NAME' with $SERVER — open the page below and type the code"
+        set -- enroll --pair --server "$SERVER" --name "$NAME"
+        [ -z "$PAIR_ORG" ] || set -- "$@" --pair-org "$PAIR_ORG"
+        # shellcheck disable=SC2086
+        if ! $enroll_sudo $enroll_trace $enroll_bin "$@" </dev/null; then
+            echo "error: not enrolled (see above). Run this again with --pair, or enroll later with: $enroll_sudo $enroll_bin enroll --pair${PAIR_ORG:+ --pair-org $PAIR_ORG} --server $SERVER --name \"$NAME\"" >&2
+            exit 1
+        fi
         return 0
     fi
     say "enrolling this machine as '$NAME' against $SERVER (token is single-use, never echoed)"
@@ -806,15 +1154,15 @@ desktop_install() {
         *.deb)
             # `apt-get -f install` pulls webkit2gtk / GTK / appindicator when
             # dpkg reports them missing, which on a fresh desktop it usually will.
-            sudo dpkg -i "$1" || sudo apt-get -f install -y
+            as_root dpkg -i "$1" || as_root apt-get -f install -y
             ;;
         *.rpm)
             # The package is ours and its sha256 is checked by the caller;
             # zypper alone refuses an unsigned local package without being told.
             case "$(desktop_rpm_tool)" in
-                dnf) sudo dnf install -y "$1" ;;
-                zypper) sudo zypper --non-interactive install --allow-unsigned-rpm "$1" ;;
-                yum) sudo yum install -y "$1" ;;
+                dnf) as_root dnf install -y "$1" ;;
+                zypper) as_root zypper --non-interactive install --allow-unsigned-rpm "$1" ;;
+                yum) as_root yum install -y "$1" ;;
                 *) return 1 ;;
             esac
             ;;
@@ -873,6 +1221,13 @@ install_desktop_linux() {
         return 0
     fi
     desktop_digest="$(asset_field_for "$releases" "$desktop_pattern" digest)"
+    # FR-129 B0 — never fatal still holds in a privileged half, but so does
+    # "root places nothing it cannot verify": an undigested companion is
+    # skipped there, where the daemon package in the same state is an error.
+    if [ -z "$desktop_digest" ] && [ "$DIGEST_REQUIRED" = 1 ]; then
+        warn "no sha256 digest published for the companion .${desktop_ext} — an elevated install places nothing it cannot verify; skipping the companion (the daemon is unaffected)"
+        return 0
+    fi
     desktop_pkg="$STAGE/roomler-desktop.${desktop_ext}"
     download "$desktop_url" "$desktop_pkg"
     verify_sha256 "$desktop_pkg" "$desktop_digest"
@@ -1480,7 +1835,22 @@ if [ "$UNINSTALL" = 1 ]; then
     uninstall_finish
 fi
 
-say "roomler install.sh — role=$ROLE os=$OS server=$SERVER"
+HALF=""
+[ "$PRIV_STEPS" = 1 ] && HALF=" half=privileged"
+[ "$USER_STEPS" = 1 ] && HALF=" half=user"
+[ "$PAIR" = 1 ] && HALF="$HALF enroll=pair"
+say "roomler install.sh — role=$ROLE os=$OS server=$SERVER$HALF"
+
+# FR-129 B0 — the user half is the tail of a daemon install, run on its own
+# as the person after the privileged half and the caller's own enroll.
+if [ "$USER_STEPS" = 1 ]; then
+    case "$OS" in
+        Linux)  user_steps_linux ;;
+        Darwin) user_steps_macos ;;
+    esac
+    say "done."
+    exit 0
+fi
 
 case "$ROLE/$OS" in
     # FR-27 — the companion AFTER the daemon: it depends on `roomlerd` (the
@@ -1491,5 +1861,13 @@ case "$ROLE/$OS" in
     tunnel/Linux)  install_tunnel_linux ;;
     tunnel/Darwin) install_tunnel_macos ;;
 esac
+
+if [ "$PRIV_STEPS" = 1 ]; then
+    if [ "$SYSTEM" = 1 ]; then
+        say "privileged steps done — a --system install has no user half"
+    else
+        say "privileged steps done. Next, as the person: enroll in your own process, then install.sh --user-steps --role daemon"
+    fi
+fi
 
 say "done."

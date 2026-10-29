@@ -353,6 +353,12 @@ mod imp {
 
     /// A child of `pid`, any one: what a test needs to find the process a
     /// wrapper it started is running.
+    ///
+    /// #3036 — a child by the same rule as [`parent`]: one created no earlier
+    /// than `pid`. Windows keeps a dead process's pid as its children's parent
+    /// pid and hands the number out again. So on a busy machine an orphan whose
+    /// dead parent had this pid matched too, and the walk up from it met the
+    /// stale parent that `parent` rightly refuses.
     #[cfg(test)]
     pub(super) fn child_of(pid: u32) -> Option<u32> {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -360,6 +366,7 @@ mod imp {
             CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
             TH32CS_SNAPPROCESS,
         };
+        let born = created(pid)?;
         // SAFETY: as in `entry`.
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snap == INVALID_HANDLE_VALUE {
@@ -372,7 +379,9 @@ mod imp {
         // SAFETY: as in `entry`.
         let mut more = unsafe { Process32FirstW(snap, &mut e) } != 0;
         while more {
-            if e.th32ParentProcessID == pid {
+            if e.th32ParentProcessID == pid
+                && created(e.th32ProcessID).is_some_and(|child| born <= child)
+            {
                 found = Some(e.th32ProcessID);
                 break;
             }
