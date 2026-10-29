@@ -13,7 +13,7 @@ use bson::oid::ObjectId;
 use roomler_ai_mod_fleet::hub::{DispatchCtx, OrgPolicy};
 use roomler_ai_mod_fleet::nudge::{note_agent_offline_evidence, spawn_agent_nudge};
 use roomler_ai_remote_control::{
-    models::ConsentMode,
+    models::{ConsentMode, RcOverlayMode},
     signaling::{ClientMsg, Role, ServerMsg},
 };
 use tracing::{info, warn};
@@ -152,8 +152,8 @@ pub async fn dispatch_controller_rc(
     // FR-85 P3 — may this controller record (resolved by the same gate)?
     may_record: bool,
     // #1882 — may the session use the overlay (the device's policy, resolved
-    // by the same gate)?
-    rc_overlay: bool,
+    // by the same gate)? FR-128 — `auto` carries the gate's far-TURN hint.
+    rc_overlay: RcOverlayMode,
     // FR-101 P2 — the org's session policy (resolved by the same gate).
     session_policy: OrgPolicy,
     // FR-101 P4b — the org's maximum session length (the same gate).
@@ -542,9 +542,11 @@ pub struct SessionAuthz {
     pub may_record: bool,
     /// #1882 — the device's `AccessPolicy.rc_overlay`, resolved: may the
     /// session's ICE use the WireGuard overlay? Like `input_mode` it is the
-    /// DEVICE's setting and rides every allowed outcome; `false` on the
-    /// early-out paths, which never build a session.
-    pub rc_overlay: bool,
+    /// DEVICE's setting and rides every allowed outcome; `off` on the
+    /// early-out paths, which never build a session. FR-128 — `auto` with the
+    /// far-TURN hint for the device and the browser's own device, when the
+    /// request names the latter.
+    pub rc_overlay: RcOverlayMode,
     /// FR-101 P2 — the org's session policy for clipboard, files and audio,
     /// from the tenant row this gate already reads. It binds every
     /// controller, the owner and break-glass included (the hub decides what
@@ -584,7 +586,7 @@ impl SessionAuthz {
             input_mode: None,
             tenant_name: None,
             may_record: false,
-            rc_overlay: false,
+            rc_overlay: RcOverlayMode::Off,
             session_policy: OrgPolicy::Unavailable,
             max_duration: None,
             idle_secs: None,
@@ -596,7 +598,7 @@ impl SessionAuthz {
         mode: ConsentMode,
         input_mode: Option<roomler_ai_remote_control::models::InputMode>,
         tenant_name: Option<String>,
-        rc_overlay: bool,
+        rc_overlay: RcOverlayMode,
         session_policy: OrgPolicy,
     ) -> Self {
         Self {
@@ -654,6 +656,46 @@ pub(crate) fn org_session_cap_of(t: &roomler_ai_db::models::Tenant) -> Option<u3
     (n != u32::MAX).then_some(n)
 }
 
+/// FR-128 — the device the browser runs on, by the hub's own precedence
+/// (FR-121): a probed descriptor wins and names its device, otherwise the
+/// device the request named. `None` when neither says, which leaves `auto`
+/// with no far-TURN hint.
+fn viewer_device_of(
+    probed: Option<&roomler_ai_remote_control::signaling::LocalRelayDescriptor>,
+    named: Option<ObjectId>,
+) -> Option<ObjectId> {
+    match probed {
+        Some(d) => d
+            .agent_id
+            .as_deref()
+            .and_then(|hex| ObjectId::parse_str(hex).ok()),
+        None => named,
+    }
+}
+
+/// FR-128 — how long the authz gate waits for the far-TURN hint. Past it the
+/// hint is "not measured", which the agent reads as "it works": a slow read
+/// costs the hint, never the session.
+const FAR_TURN_HINT_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// FR-128 — do both devices reach the far TURN over UDP, by their last
+/// netcheck? Asked of the hook registry, which `network` answers; `None` when
+/// nothing is measured or no `network` is mounted.
+async fn far_turn_hint(
+    state: &RemoteState,
+    tenant_id: ObjectId,
+    target: ObjectId,
+    viewer: ObjectId,
+) -> Option<bool> {
+    tokio::time::timeout(
+        FAR_TURN_HINT_BUDGET,
+        state.hooks.far_turn_udp(tenant_id, target, viewer),
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Authorization + consent-mode gate for `rc:session.request` — the Hub can't
 /// do this because the `remote_control` crate sits below `services` in the dep
 /// graph and has no access to tenant roles. Returns `Ok(SessionAuthz)` for an
@@ -675,12 +717,18 @@ pub async fn resolve_session_authz(
     use roomler_ai_db::models::role::permissions;
     use roomler_ai_remote_control::models::AgentStatus;
 
-    let (agent_id, override_reason) = match serde_json::from_str::<ClientMsg>(text) {
+    let (agent_id, override_reason, viewer_device) = match serde_json::from_str::<ClientMsg>(text) {
         Ok(ClientMsg::SessionRequest {
             agent_id,
             override_reason,
+            local_relay,
+            local_relay_from,
             ..
-        }) => (agent_id, override_reason),
+        }) => (
+            agent_id,
+            override_reason,
+            viewer_device_of(local_relay.as_ref(), local_relay_from),
+        ),
         // Not a session request → the mode is unused; allow through.
         _ => return Ok(SessionAuthz::allow(ConsentMode::Prompt)),
     };
@@ -699,8 +747,14 @@ pub async fn resolve_session_authz(
 
     // P6 — the device's input arbitration mode rides every allowed outcome.
     let input_mode = agent.access_policy.input_mode;
-    // #1882 — and so does whether its sessions may use the overlay.
-    let rc_overlay = agent.access_policy.rc_overlay_allowed();
+    // #1882 — and so does whether its sessions may use the overlay. FR-128 —
+    // under `auto`, with the hint the agent decides a relayed mesh by.
+    let rc_overlay = match (agent.access_policy.rc_overlay_mode(), viewer_device) {
+        (RcOverlayMode::Auto { .. }, Some(viewer)) => RcOverlayMode::Auto {
+            far_turn: far_turn_hint(state, agent.tenant_id, agent_id, viewer).await,
+        },
+        (mode, _) => mode,
+    };
     // FR-99 P3b — and what its sessions ask of their end. The device takes
     // the stricter of this and its own setting, so it can only tighten.
     let lock_on_end = agent.access_policy.lock_on_end_ask();
@@ -920,5 +974,42 @@ fn error_session_id(e: &roomler_ai_remote_control::Error) -> Option<bson::oid::O
         SessionNotFound(hex) => bson::oid::ObjectId::parse_str(hex).ok(),
         BadPhase(hex, _) => bson::oid::ObjectId::parse_str(hex).ok(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roomler_ai_remote_control::signaling::LocalRelayDescriptor;
+
+    fn probed(agent_id: Option<String>) -> LocalRelayDescriptor {
+        LocalRelayDescriptor {
+            turn_port: 47989,
+            overlay_ip: "100.64.0.9".into(),
+            username: "1700000600:uid".into(),
+            credential: "abcd1234".into(),
+            agent_id,
+        }
+    }
+
+    /// FR-128 — the far-TURN hint asks about the device whose relay the hub
+    /// hands out: a probed descriptor's own device wins over a named one, as
+    /// it does in the hub (FR-121). A probe from an agent too old to say its
+    /// id, or one that says garbage, names nobody rather than the named
+    /// device, whose relay the hub will not use.
+    #[test]
+    fn the_viewer_device_follows_the_hubs_precedence() {
+        let (mine, named) = (ObjectId::new(), ObjectId::new());
+        assert_eq!(viewer_device_of(None, Some(named)), Some(named));
+        assert_eq!(viewer_device_of(None, None), None);
+        assert_eq!(
+            viewer_device_of(Some(&probed(Some(mine.to_hex()))), Some(named)),
+            Some(mine)
+        );
+        assert_eq!(viewer_device_of(Some(&probed(None)), Some(named)), None);
+        assert_eq!(
+            viewer_device_of(Some(&probed(Some("not-hex".into()))), None),
+            None
+        );
     }
 }

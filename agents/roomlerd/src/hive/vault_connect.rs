@@ -1007,6 +1007,18 @@ mod endpoint {
         fn handover(&self) -> Option<(std::os::fd::BorrowedFd<'_>, super::handed::At)> {
             None
         }
+        /// FR-90 P8-2b-3 — Windows: the same, a raw socket rather than a
+        /// descriptor (there is no `AsFd` there); exactly what
+        /// `worker::win::duplicate_for` takes.
+        #[cfg(windows)]
+        fn handover(
+            &self,
+        ) -> Option<(
+            windows_sys::Win32::Networking::WinSock::SOCKET,
+            super::handed::At,
+        )> {
+            None
+        }
     }
 
     /// What every connection of one endpoint shares: where it authenticates,
@@ -1098,7 +1110,6 @@ mod endpoint {
         /// FR-90 P8-2a-2 — the first `count` values, as each connection of
         /// the session's worker starts: read from the leases now, none once
         /// any is let go.
-        #[cfg(unix)]
         fn reader(self: &Arc<Self>, count: usize) -> super::handed::Values {
             let endpoint = Arc::clone(self);
             Arc::new(move || (0..count).map(|i| endpoint.read(i)).collect())
@@ -1571,7 +1582,6 @@ mod endpoint {
         req: &ConnectRequest,
         h: Handover<'_>,
     ) -> Result<(Value, Option<Control>), String> {
-        #[cfg(unix)]
         let run = match &h.kind {
             Kind::Run { session, fence, .. } => Some((*session, *fence)),
             Kind::Person(_) => None,
@@ -1675,7 +1685,25 @@ mod endpoint {
             }
             _ => None,
         };
-        #[cfg(unix)]
+        // FR-90 P8-2b-3 — the same, on Windows: `bound.handover()` gives a
+        // raw socket instead of a descriptor, and `handed::hand` takes it
+        // by value rather than by reference.
+        #[cfg(windows)]
+        let handed = match (run, bound.handover()) {
+            (Some((session, fence)), Some((listener, at))) => {
+                let spec = super::handed::Spec::of(&endpoint.conf, at);
+                let reader = endpoint.reader(h.values);
+                match super::handed::hand(session, fence, spec, listener, reader).await {
+                    Ok(handed) => handed,
+                    Err(why) => {
+                        stop.cancel();
+                        bound.close();
+                        return Err(why);
+                    }
+                }
+            }
+            _ => None,
+        };
         if let Some(handed) = handed {
             drop(live);
             tokio::spawn(async move {
@@ -1687,8 +1715,6 @@ mod endpoint {
         } else {
             tokio::spawn(serve(bound, endpoint, stop, live, end));
         }
-        #[cfg(windows)]
-        tokio::spawn(serve(bound, endpoint, stop, live, end));
         let ends = if renewed {
             "It stays open while it is held, its leases renewed before they end; a lease taken \
              back cuts its connections."
@@ -2469,6 +2495,26 @@ mod endpoint {
                 let at = super::super::handed::At::Loopback { peer: self.peer };
                 Some((self.listener.as_fd(), at))
             }
+
+            /// FR-90 P8-2b-3 — the listener's raw socket, for
+            /// `worker::win::duplicate_for` to target the worker's pid with.
+            #[cfg(windows)]
+            fn handover(
+                &self,
+            ) -> Option<(
+                windows_sys::Win32::Networking::WinSock::SOCKET,
+                super::super::handed::At,
+            )> {
+                use std::os::windows::io::AsRawSocket;
+                let at = super::super::handed::At::Loopback {
+                    peer: self.peer.clone(),
+                };
+                Some((
+                    self.listener.as_raw_socket()
+                        as windows_sys::Win32::Networking::WinSock::SOCKET,
+                    at,
+                ))
+            }
         }
 
         /// FR-90 P3-7-3b — the one account a loopback connection is served
@@ -2755,8 +2801,7 @@ mod endpoint {
     }
 }
 
-/// FR-90 P8-2a-2 — a session's endpoints served by its worker (Unix first).
-#[cfg(unix)]
+/// FR-90 P8-2a-2, P8-2b-3 — a session's endpoints served by its worker.
 pub(crate) mod handed;
 
 #[cfg(test)]

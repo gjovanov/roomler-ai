@@ -291,7 +291,7 @@ async fn forward(
             // frame is the extauth relay's on the owner pod, which never
             // records one and never puts one on the org's overlay.
             false,
-            false,
+            roomler_ai_remote_control::models::RcOverlayMode::Off,
             // FR-101 / FR-99 — nor are these read for it: the owner pod hands
             // an `rc:extauth.*` frame to `on_relayed` before its Hub sees the
             // frame, and `handle_session` there reads the org's policy and
@@ -1065,10 +1065,10 @@ pub async fn handle_session(
         // No break-glass from outside the org, and no relay descriptor (F4):
         // the frame cannot carry either, and neither is invented here.
         None,
-        None,
+        Vec::new(),
         // #1882 — never the org's overlay: an outsider is not on its mesh, and
         // F4 already keeps every overlay relay off this session.
-        false,
+        roomler_ai_remote_control::models::RcOverlayMode::Off,
         agent.access_policy.input_mode,
         // The device labels an outsider itself; no org name to show.
         None,

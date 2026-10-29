@@ -60,12 +60,12 @@ from scratchpad to `scripts/`.
 
 ## FR-A — Encoder rate changes without an IDR (first)
 
-**A0 — measure on silicon.** Extend `Command::EncoderSmoke` (`app.rs:248–251`, dispatch
+**A0 — measure on silicon.** Extend `Command::EncoderSmoke` (`app.rs:289–251`, dispatch
 `encoder_smoke_cmd` :4059) with `--reconfigure-sweep [--width/--height 1280×800]
 [--frames-per-rung 30] [--constrained] [--json]`: synthetic desktop frame with a moving 200×200
 block (solid colours make P-frames ~0 bytes and hide CBR/QVBR); 30 frames at 6 M, then rungs
 `4.5M 3M 2M 1.5M 1M 750k 550k 400k 300k 200k` down and back (20 changes via `set_bitrate`). Per
-rung: `applied_maxrate, set_bitrate_ms, key_packets` (`AV_PKT_FLAG_KEY`, encoder.rs:1554; size
+rung: `applied_maxrate, set_bitrate_ms, key_packets` (`AV_PKT_FLAG_KEY`, encoder.rs:1599; size
 heuristic as the second detector for vp9_qsv), `burst = first3_max/trailing_mean`, `ratio =
 mean_bytes/(rung/fps/8)`. **Pass** = 0 key packets after the opener, `set_bitrate_ms < 5`, ratio
 ±25 % by frame 10, burst ≤ 2×. Hosts: CORPLAP-1 (`hevc_qsv`, `low_power` 1 and 0), an
@@ -75,7 +75,7 @@ Arc/Meteor-Lake host (`av1_qsv`), the RTX box (`hevc/av1_nvenc`), one Apple Sili
 the coarsen gate (:1591–1594).
 
 **A1 — in-place applies, gated.** Replace `supports_dynamic_bitrate = name.contains("nvenc")`
-(encoder.rs:1126) with `rate_mode: RateReconfig::{InPlace, Rebuild}` resolved at open (InPlace for
+(encoder.rs:1160) with `rate_mode: RateReconfig::{InPlace, Rebuild}` resolved at open (InPlace for
 `*_nvenc`, `*_qsv`; Rebuild for `*_amf`, `*_videotoolbox`); keep `supports_dynamic_bitrate()` (:1471)
 = `InPlace` so no pump call site changes. QSV in-place arm writes **`bit_rate = target;
 rc_max_rate = target; rc_buffer_size = target × hrd_pct/100`** (CBR: TargetKbps must move with
@@ -85,7 +85,7 @@ targets when `|Δ| ≥ 3 %` (a QSV Reset flushes the pipeline). Kill switch `enc
 (env `ROOMLERD_ENCODER_INPLACE_RATE`), **default OFF in the PR, ON after A0 passes on CORPLAP-1**
 (six places: `config_surface.rs` KEYS near :630 / get :877 / set :1290; `config.rs` field :879,
 default :1996, `env_bridge_bools` :2122 array 72→73; `enrollment.rs:203`; parity test :1935).
-Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:6836–6771`) with
+Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:6840–6771`) with
 `rate_mode`; read `idr_count` against `keyframe_requests` (`session_telemetry.rs:29`). A startup
 `probe_and_cache_rate_reconfig` (like `VP9_QSV_IDR_VERDICT`, encoder.rs:71): open 640×480, change
 rate once, count key flags — per host, per codec, OnceLock; a driver table is not evidence.
@@ -112,7 +112,7 @@ simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same
 | PR | delete | anchors | precondition |
 |---|---|---|---|
 | A2 | motion-defer: `deferred_bps`, `DEFER_QUIET`, `last_motion_at`, `last_deferred_apply_at`, `held_increase`; `rebuild_apply_allowed` + `relay_deferred_apply_allowed` (+tests); `relay_idr_thrift` narrows to settle-KF suppression | `peer.rs:4926, 4856–4863, 6100–6147, 6158–6194, 6251–6256`; `mod.rs:417–474` | A0 pass on QSV, switch ON one release |
-| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:4993–4991, 5022–5088`; `encoder.rs:1588–1546`; `aimd.rs:285–338`; `mod.rs:370–381` | VT measured or kept on the settle rule |
+| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:4993–4991, 5022–5088`; `encoder.rs:1633–1546`; `aimd.rs:285–338`; `mod.rs:370–381` | VT measured or kept on the settle rule |
 | A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence) | `governor.rs:731–699`; `peer.rs:3841` | — |
 
 Stays: dims/chroma/backend rebuilds (:5749–5813), FlipTracker rebuild (:5112–5136), error ladder,
@@ -138,7 +138,7 @@ Inputs: per frame `SendSample { capacity, depth, bytes_inflight, queue_budget, n
 `pre_encode_tick`'s position; per 1 s `Window { fps, struggling, age (avg,min,rtt), rx_bps,
 queue_ms, goodput, sent_bps, frames_lost, delay_slope_ms_s }` at `tick_viewer_window`; events
 (full channel, overflow, blocked-send stall). **Viewer adds** (all optional; older viewers omit;
-`decodeStatWireMessage` `useRemoteControl.ts:1288–1270`, parser `peer.rs:7514–7365`): `frames_lost`
+`decodeStatWireMessage` `useRemoteControl.ts:1288–1270`, parser `peer.rs:7519–7365`): `frames_lost`
 (chunk gaps, already in `rc-hevc-worker.ts:330`), `frames_rx`, `delay_slope_ms_s` (least-squares
 slope of the window's per-frame `arrival − wire` — `QueueDrift` in `rc-hop-stats.ts:102–138` already
 holds the pairs), `age_p95_ms`. **Bounds:** `RateDomain { floor, ceiling }` — the single source of

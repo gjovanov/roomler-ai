@@ -21,7 +21,9 @@ use roomler_core::{ApiError, extractors::auth::AuthUser};
 
 use crate::FleetState;
 
-const ENROLLMENT_TTL_SECS: u64 = 600; // 10 minutes per §11.1
+// FR-129 A1 — `pairing` mints the same token with the same life, so the
+// constant is the crate's, not this file's.
+pub(crate) const ENROLLMENT_TTL_SECS: u64 = 600; // 10 minutes per §11.1
 
 /// Require a `role::permissions` bit for `user_id` in `tenant_id`. Doubles as
 /// the membership check — `get_member_permissions` returns `Forbidden` for a

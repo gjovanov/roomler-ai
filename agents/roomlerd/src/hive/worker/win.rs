@@ -29,7 +29,9 @@
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+use std::os::windows::io::{
+    AsRawHandle, FromRawHandle, FromRawSocket, OwnedHandle, OwnedSocket, RawHandle,
+};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -38,6 +40,10 @@ use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOp
 use tracing::warn;
 use windows_sys::Win32::Foundation::{
     GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
+};
+use windows_sys::Win32::Networking::WinSock::{
+    FROM_PROTOCOL_INFO, INVALID_SOCKET, WSA_FLAG_OVERLAPPED, WSADATA, WSADuplicateSocketW,
+    WSAPROTOCOL_INFOW, WSASocketW, WSAStartup,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -525,6 +531,95 @@ impl Running for InJob {
         // The job's last handle: KILL_ON_JOB_CLOSE ends anything left in it.
         self.job = None;
     }
+}
+
+// ─── FR-90 P8-2b-3: a listener crosses to the worker as protocol info ──────
+//
+// There is no fd-4 channel here (P8-2b-1: the client end of the pipe is the
+// one handle a worker inherits), so a loopback listener crosses inside the
+// `Serve` call's own frame: its `WSAPROTOCOL_INFOW`, 628 bytes, which the
+// worker turns back into a real listener with `WSASocketW`. Measured
+// (`C:/dev/_tools/...`): the mechanism round-trips across a real process
+// boundary; a `rehand` (a new worker, a new pid) duplicates the same source
+// listener again, which survives every duplication untouched.
+
+/// One listener's protocol info, exactly: what [`duplicate_for`] produces and
+/// [`socket_from_info`] takes back.
+pub(crate) const PROTOCOL_INFO_LEN: usize = std::mem::size_of::<WSAPROTOCOL_INFOW>();
+
+/// `WSAStartup`, before relying on it: idempotent (its count only grows until
+/// `WSACleanup`, never called here), so every caller invokes it rather than
+/// assume some other code already has. Measured: a process that goes straight
+/// to `WSASocketW` without an ordinary socket call of its own first gets
+/// `WSANOTINITIALISED`, since std's own sockets call it lazily and nothing
+/// guarantees a path through this process took one first.
+fn wsa_startup() -> std::io::Result<()> {
+    // SAFETY: a valid out-buffer of the size the call documents.
+    let rc = unsafe {
+        let mut data: WSADATA = std::mem::zeroed();
+        WSAStartup(0x0202, &mut data)
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(rc))
+    }
+}
+
+/// `socket`'s protocol info, for `pid` to reconstruct with [`socket_from_info`]:
+/// fresh every time, so a hand-over and a later `rehand` (a new worker, a new
+/// pid) each duplicate the daemon's own copy again. `socket` is untouched —
+/// cloneable this way as many times as workers come and go.
+pub(crate) fn duplicate_for(
+    pid: u32,
+    socket: windows_sys::Win32::Networking::WinSock::SOCKET,
+) -> std::io::Result<[u8; PROTOCOL_INFO_LEN]> {
+    // SAFETY: `socket` is a live socket handle the caller owns across this
+    // call; `info` is a valid out-buffer of the exact size the call expects.
+    unsafe {
+        let mut info: WSAPROTOCOL_INFOW = std::mem::zeroed();
+        if WSADuplicateSocketW(socket, pid, &mut info) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut bytes = [0u8; PROTOCOL_INFO_LEN];
+        let p = (&raw const info).cast::<u8>();
+        bytes.copy_from_slice(std::slice::from_raw_parts(p, PROTOCOL_INFO_LEN));
+        Ok(bytes)
+    }
+}
+
+/// A listener, reconstructed from `bytes` ([`duplicate_for`]'s): refused where
+/// this is not the process `pid` named, or where `bytes` is not one whole
+/// protocol info. Calls [`wsa_startup`] first, every time.
+pub(crate) fn socket_from_info(bytes: &[u8]) -> std::io::Result<std::net::TcpListener> {
+    if bytes.len() != PROTOCOL_INFO_LEN {
+        return Err(std::io::Error::other(format!(
+            "a listener's protocol info is {} bytes, not {PROTOCOL_INFO_LEN}",
+            bytes.len()
+        )));
+    }
+    wsa_startup()?;
+    // SAFETY: `bytes` is exactly one WSAPROTOCOL_INFOW, read back as the same
+    // POD type it was written as.
+    let info: WSAPROTOCOL_INFOW = unsafe { std::ptr::read(bytes.as_ptr().cast()) };
+    // SAFETY: `info` lives across the call; the handle WSASocketW returns is
+    // owned by nobody else, taken into an `OwnedSocket` below.
+    let raw = unsafe {
+        WSASocketW(
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            (&raw const info).cast_mut(),
+            0,
+            WSA_FLAG_OVERLAPPED,
+        )
+    };
+    if raw == INVALID_SOCKET {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a handle WSASocketW just made, owned nowhere else.
+    let socket = unsafe { OwnedSocket::from_raw_socket(raw as std::os::windows::io::RawSocket) };
+    Ok(std::net::TcpListener::from(socket))
 }
 
 #[cfg(test)]

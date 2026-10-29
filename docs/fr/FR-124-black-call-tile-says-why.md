@@ -1,7 +1,9 @@
 # FR-124: A black call tile says why — a covered camera is named, a refused start recovers
 
-**Issue:** [#2945](https://github.com/gjovanov/roomler-ai/issues/2945) · **Status:** in progress 2026-10-26 — P1–P3 built in
-one PR; red on production recorded (§8), green owed after the roll
+**Issue:** [#2945](https://github.com/gjovanov/roomler-ai/issues/2945) · **Status:** in progress — P1–P3 (#2949, with the
+image-build fix #2951) on production since 2026-10-26 12:42Z (`hosted-20261026-212b254`), and in every image since,
+including the 2026-10-27 rollback target `hosted-20261026-21d7c18`. Field-verified red then green: AC1, AC2, AC4, AC5,
+AC6. AC3 is open for one real-camera check in a dim room (§8)
 · **Owner:** the web app (UI) · **Anchors:** master `a350082a8` · **Builds on:** [FR-30](FR-30-camera-state-signalling.md)
 (a peer's own word that their camera is off), [FR-25](FR-25-call-layout-mentions-pip.md) (the call layouts)
 
@@ -115,19 +117,28 @@ P1–P3 ship in one PR.
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1**: a black camera is named on its sender's call page within 5 s: the warning shows, and the local tile
-  reads "Black picture". A picture again clears both within 2 s. Shown to fail on the current deploy first.
-- [ ] **AC2**: a peer's black picture is named on a viewer's tile within 5 s. A peer who turned their camera off gets
-  FR-30's avatar, not the notice.
+- [x] **AC1**: a black camera is named on its sender's call page within 5 s: the warning shows, and the local tile
+  reads "Black picture". A picture again clears both within 2 s. Shown to fail on the current deploy first. *(Red
+  2026-10-26 10:55Z; green 2026-10-27 20:07Z: flagged 3.0 s after the picture turned black, cleared 0.24 s after a
+  picture came back. §8)*
+- [x] **AC2**: a peer's black picture is named on a viewer's tile within 5 s. A peer who turned their camera off gets
+  FR-30's avatar, not the notice. *(Red 2026-10-26; green 2026-10-27: the viewer's notice 3.2 s after the sender turned
+  black, timed by a watcher armed before the switch. After the sender turned its camera off: the avatar and the
+  camera-off badge, no notice. §8)*
 - [ ] **AC3**: no false flag: your own camera turned off shows no warning, and a real picture in a dim room shows none.
-- [ ] **AC4**: a refused start recovers: a remote tile whose unmuted `play()` is refused shows its picture within 1 s,
+  *(2026-10-27 on production: the sender's camera turned off cleared its warning and notice within 4 s, and a synthetic
+  dim picture (mean 16.4, peak 41) ran 9 s with no flag on either side. Owed: a real camera in a dim room.)*
+- [x] **AC4**: a refused start recovers: a remote tile whose unmuted `play()` is refused shows its picture within 1 s,
   muted, with "Tap for sound", and the next click anywhere restores the sound. Shown to fail on the current deploy
-  first.
-- [ ] **AC5**: unit tests lock the thresholds and the hysteresis, the tile's notice (local, remote, camera off, screen
+  first. *(Red 2026-10-26: `paused: true`, black, no button. Green 2026-10-27: the tile appeared 0.76 s after the join
+  and played at 1.05 s, muted, picture visible, "Tap for sound" shown. One real click on empty stage space unmuted it.
+  §8)*
+- [x] **AC5**: unit tests lock the thresholds and the hysteresis, the tile's notice (local, remote, camera off, screen
   share) and the refused-start path (`NotAllowedError` → a muted retry, `AbortError` ignored, a gesture restores the
-  sound).
-- [ ] **AC6**: Docs: `docs/ui.md` describes the notice and the recovery, with a diagram, and the `docs/README.md` index
-  row for `ui.md` names them.
+  sound). *(#2949: 4 files, 50 cases. Each guard was removed in turn and its test failed: 11 negative controls.)*
+- [x] **AC6**: Docs: `docs/ui.md` describes the notice and the recovery, with a diagram, and the `docs/README.md` index
+  row for `ui.md` names them. *(#2949: `docs/ui.md` § "Calls: a black tile says why", a flowchart and a sequence
+  diagram, plus the index row.)*
 
 ## 6. Decisions
 
@@ -160,6 +171,9 @@ is the page's own DOM, plus a 16×12 luma probe of every tile's `<video>`.
 | date | build | host | result |
 |---|---|---|---|
 | 2026-10-26 10:55–10:57Z | production before FR-124 (entry `index-DbWa1WpV.js`) | neo16, Edge 156, tabs A and B as above | 🔴 **AC1**: tab A sent black for 8 s; its own tile played at 640 px with mean and peak luma 0, and there was **no notice and no warning**. 🔴 **AC2**: with tab B sending black, tab A played B's tile (`paused: false`, mean and peak 0) for 7 s with **no notice**. 🔴 **AC4**: in tab B (`userActivation.hasBeenActive: false`) the browser refused A's unmuted tile: `paused: true`, black, **no button**. It stayed black after A switched to a bright pattern (A's own tile read mean 83), so the black was the refusal and not the content |
+| 2026-10-26 11:53Z | #2949's image (run 40317779897, `7a5ca9f89`) | the hosted-image lane | 🔴 **a wrong turn: the image did not build.** `VideoTileFr124.spec.ts(181,24): error TS2353 … 'videoPaused' does not exist in type 'Partial<{ style?: unknown; …`. The image runs `vue-tsc` in `oven/bun`, which has no node, so `.vue` resolves through `env.d.ts`'s shim: a `setProps({ realProp })` literal fails there and nowhere else (PR CI 24/24, local build green). This is the trap `KeepBusyMenu.spec.ts:85` documents, met for the fourth time. Every master image was blocked until #2951 (`212b254cb`, 12:38Z), proven red then green with a 6-line `oven/bun:1` Dockerfile over `ui/` |
+| 2026-10-26 12:42–12:53Z | `hosted-20261026-212b254` promoted (run 40324468944) | prod | pods on it from 12:42Z, `/health` 0.4.175, 14 devices online before and 14 after. It carried #2938 (FR-90, server-only), with its owner's agreement |
+| 2026-10-27 20:07–20:10Z | production `hosted-20261026-21d7c18` (entry `index-CQ0nDNH8.js`), the rollback target that afternoon, with FR-124 inside; announced to the session investigating the rollback, and kept to 2 tabs at its request | neo16, Edge 156, the same two-tab instrument | 🟢 **AC1**: tab A's own tile read *"Your camera is sending a black picture · Is the lens covered?"* and the warning showed at the first sample after the join. A picture again cleared both in 0.24 s, and black again flagged them in 3.0 s. 🟢 **AC4**: in tab B (`hasBeenActive: false`) A's tile appeared 0.76 s after the join and played at 1.05 s, muted, with the picture visible (mean 89–177) and "Tap for sound". One real click on empty stage space unmuted it (`muted: false`) and removed the button. 🟢 **AC2**: B's tile for A read *"Black picture from this camera · Its lens may be covered"* 3.2 s after A turned black, timed by a 100 ms watcher armed before the switch (a first, unarmed read said 5.3 s: that was the tool round trip, not the detector). When A turned its camera off, B showed the avatar and the camera-off badge with no notice, and A's warning and notice cleared within 4 s (AC3's first half). **AC3, synthetic**: a dim picture (mean 16.4, peak 41) ran 9 s with no flag in A or B. Both pods stayed ready with 0 restarts. **Owed**: a real camera in a dim room |
 
 ## 9. Related
 

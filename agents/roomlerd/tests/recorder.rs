@@ -150,7 +150,7 @@ impl ScreenCapture for CounterCapture {
             height: h,
             stride: w * 4,
             pixel_format: PixelFormat::Bgra,
-            data: render(self.n as u16, w, h),
+            data: render(self.n as u16, w, h).into(),
             monotonic_us: self.start.elapsed().as_micros() as u64,
             monitor: 0,
             damage: Damage::Unknown,

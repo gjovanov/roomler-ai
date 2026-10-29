@@ -18,8 +18,14 @@ flowchart TB
     OS1 -->|Windows| WGUI{"GUI or terminal?"}
     WGUI -->|GUI| WIZ["roomler-setup wizard<br/>role picker → MSI"]
     WGUI -->|terminal| PS1["irm roomler.ai/api/setup/install.ps1 | iex"]
-    OS1 -->|Linux| SH["curl roomler.ai/api/setup/install.sh | sh<br/>--role daemon (.deb x86_64/arm64)"]
-    OS1 -->|macOS| PKG["install.sh --role daemon (.pkg, arm64)<br/>(the wizard's daemon roles are Windows-only)"]
+    OS1 -->|Linux| LGUI{"GUI or terminal?"}
+    LGUI -->|"GUI (FR-129 B1)"| LWIZ["roomler-setup wizard<br/>per-user or system daemon →<br/>the embedded install.sh halves,<br/>one pkexec prompt"]
+    LGUI -->|terminal| SH["curl roomler.ai/api/setup/install.sh | sh<br/>--role daemon (.deb x86_64/arm64)"]
+    OS1 -->|macOS| MGUI{"GUI or terminal?"}
+    MGUI -->|"GUI (FR-129 B1)"| MWIZ["roomler-setup wizard<br/>per-user daemon → install.sh halves,<br/>one osascript admin prompt<br/>(the root half: B2)"]
+    MGUI -->|terminal| PKG["install.sh --role daemon (.pkg, arm64)"]
+    LWIZ -.->|"only when the server says<br/>wizard_unix_daemon: true"| LGUI
+    MWIZ -.->|"same switch"| MGUI
 
     TC --> OS2{"OS?"}
     OS2 -->|Windows| TCW["wizard (tunnel-client role)<br/>or the zip"]
@@ -28,7 +34,10 @@ flowchart TB
 
 Everything needs an **enrollment token** — minted in the admin UI
 (**Admin → Agents → Enroll** for daemons, **Tunnel clients → Enroll** for CLIs),
-valid 10 minutes, single-use.
+valid 10 minutes, single-use — or, for a daemon, a **pairing** (FR-129): the
+wizard's "Set up in the browser", and `--pair` on the terminal installers
+([below](#pairing-from-a-terminal)), mint that same token into the installing
+process after you approve a code at `/pair`, so nothing is copied or pasted.
 
 ## Enrollment — what every path does
 
@@ -54,16 +63,35 @@ wizard's and `install.ps1`'s) and the tunnel CLI's installers do
 which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
-- `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:325`);
+- `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:381`);
 - every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1555`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
-(`scripts/install.ps1:147`).
+(`scripts/install.ps1:164`).
 
 `machine_id` is a stable hardware hash and `(tenant_id, machine_id)` is unique —
 re-running an installer on a known machine reuses its identity instead of
 duplicating it.
+
+**A reinstall keeps the device's settings** (#2338, FR-129 B1). `roomlerd
+enroll` and the setup wizard, on every OS, fold the new enrollment into the
+config already at its path instead of replacing it
+(`agents/roomler-setup/src/enroll_step.rs`). A refresh of the same organization
+keeps the mesh and its key, the routes, the lock and consent policy and every
+other operator-owned key; of the wizard's Advanced boxes, only the ones the
+person *touched* are written over them. An enrollment into **another
+organization** is added beside the primary one (`roomlerd org ls`):
+
+- none of the Advanced boxes is written then, touched or not, because they are
+  the primary enrollment's settings (`auto_grant_session` is the device's
+  consent policy for every organization);
+- the added organization's private network starts off (`roomlerd org overlay
+  <label> netstack` joins it), and the daemon mints that organization's own
+  key at its first start on the mesh (`org_join::heal_org_keys`);
+- the Done page names the added organization's device, not the primary's;
+- on Windows, a token minted to anchor the device does not anchor it: the
+  machine's one SYSTEM anchor stays with the primary organization.
 
 **The enroll says how it was installed** (FR-102 P3, the install trace in
 [growth-observability.md](growth-observability.md)): the device row records
@@ -89,6 +117,62 @@ current, and a daemon from before the flag existed would refuse an argument it
 does not know. A `re-enroll` sends nothing and leaves the row's recorded install
 alone.
 
+### Pairing from a terminal
+
+`roomlerd enroll --pair` (FR-129 A4; `install.sh --pair` and `install.ps1 -Pair`
+run it for you once the package is placed) is the token step without the token:
+
+```text
+To pair this device, open   https://roomler.ai/pair
+and type the code           BCDF-GHJK
+
+(The code expires in 15 minutes. Waiting for the approval…)
+
+Approved in the browser.
+  Organization: Acme Corp  (slug: acme)
+  Approved by:  Dana Smith  (username: dana)
+Join «Acme Corp» (acme) as approved by «Dana Smith» (@dana)? [y/N] y
+Enrollment successful. Agent id: …
+```
+
+- The page's address never carries the code: you type it there, signed in (or
+  after creating an account and an org on that page). The daemon polls, and on
+  the approval enrolls **in the same process** through exactly the `--token`
+  path — the delivered token never touches a command line, a log line, or any
+  file but the enrolled config.
+- **Check the two unique handles before you answer.** Anybody can give an org or
+  an account any display name; the org's slug and the approver's username are
+  unique — but only byte for byte. An approval into an org you don't recognise
+  ends at this question: `n` (or nothing)
+  enrolls nothing, the pairing stays delivered on the server, and its token
+  expires unused in 10 minutes. Everything the server sent is shown with its
+  control and invisible characters escaped (`\u{1b}`), and a slug the admin UI
+  could not have made (`ACME`, `acme `, a Cyrillic `а`) or a username with
+  spaces or non-ASCII letters carries a `WARNING:` line — that is what an
+  org dressed up as yours looks like.
+- The question is asked on the **terminal** (`/dev/tty`; the console on
+  Windows), never on stdin — under `curl … | sh` stdin is the script itself.
+  With no terminal at all (a scheduler, `ssh host 'curl … | sh -s -- --pair'`
+  without `-t`) the only way to enroll is **`--pair-org <slug>`**: the device
+  enrolls only if the approval names exactly that org — **byte for byte**, so
+  `ACME` is not `acme`. On a terminal the flag replaces the question; a
+  mismatch refuses either way. On Windows the question goes to the console
+  `roomlerd.exe` is attached to, so where nobody can see that console (a
+  scheduled task, a tool that hosts programs on a hidden console) pass
+  `--pair-org` too.
+- A poll that fails (a network blip, a server restarting) is retried at a
+  longer interval until the code expires; nothing needs restarting.
+- `--pair` and `--token` refuse each other; `--pair` refuses `--ephemeral` (a
+  pairing mints a standard token, never an ephemeral key). An older server, or
+  one with `[pairing] enabled = false`, answers "this server does not support
+  pairing; use --token", and the command exits 1.
+- The served scripts: `install.sh --role daemon --pair [--pair-org SLUG]`
+  (per-user, `--system`, and on macOS the per-user half) and
+  `install.ps1 -Role … -Pair [-PairOrg SLUG]`. The tunnel role still takes
+  `--token` (the `roomler` CLI has no `--pair` yet). The macOS root half is a
+  second enrollment, paired afterwards as root — the install prints the two
+  commands (the macOS section below); one approval for both halves is FR-129 B2.
+
 ### "The host must be re-enrolled" — when to believe it
 
 Re-enrolling is **destructive**: removal is final, and a re-enrolled device
@@ -99,8 +183,8 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3485`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3521`) |
-| `config::read_if_present` (`:3490`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3541`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3585`) |
+| `config::read_if_present` (`:3615`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
 flowchart TD
@@ -130,6 +214,102 @@ process runs on, it is exactly as serious as it was. And never use
 "running on an older config must never look like a normal boot" failure the
 ERROR exists to prevent. FR-66's P2 audited all 37 `load` call sites on this
 question; two moved to `read_if_present`.
+
+### What a save keeps: the keys this build does not know (#2078)
+
+`roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
+start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
+`crates/agent-core/src/config.rs:2609`, `:2631`), at the clean-run promotion
+(`record_clean_run_at`, `:2618`), at every `ConfigSet`, and at enrollment. The daemon, the
+desktop app and the setup wizard all write it through `config::save` (`:4060`). Each save
+serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
+does not model:
+
+- **A key set ahead of the update that knows it** was gone by the old daemon's stop, so the
+  new daemon started on the default and nothing said so. Measured twice: `mutter_input`,
+  written while 0.4.131 ran on the FR-93 lab, and `hive_worker` under 0.4.177 on a vmtest
+  cell (#2972).
+- **A rollback** erased every key newer than the version it rolled back to, and the next
+  upgrade did not bring them back.
+
+Now `save` writes the struct **plus** every key of the file it replaces that this build
+ignores (`serialise_for`, `:3962`):
+
+| In the file being replaced | After the save |
+|---|---|
+| a key this build does not know, top level or a whole table | kept where it was |
+| a key it does not know inside a table it knows (`[forward_acl]`) | kept inside that table |
+| a key it does not know inside an `[[orgs]]` or `[[tunnel_routes]]` entry | kept on that entry wherever the save moved it, found by the org's `tenant_id` or the route's `id` — this build's own key for that array, never one read off the entry; **dropped, with a WARN naming it,** once that entry is gone, or when it has no identity (a route with an empty `id`) |
+| a key this build knows and the save cleared | stays cleared: only ignored keys are copied |
+| nothing it does not know | written exactly as before, byte for byte |
+| comments | lost, as before; keeping them needs an in-place editor |
+
+```mermaid
+flowchart TD
+    S["save(cfg)"] --> P["plain = cfg serialised"]
+    P --> R{"the base parses as a config?<br/>(the file being replaced, or on a<br/>recovery the .prev copy that loaded)"}
+    R -->|"no file"| W["write plain"]
+    R -->|"there, and no"| WP["write plain<br/>WARN: it does not parse"]
+    R -->|"yes"| U{"keys this build<br/>ignores in it?"}
+    U -->|"none"| W
+    U -->|"some"| M["copy each into plain's table,<br/>where it was"]
+    M --> C{"reads back, and serialises<br/>to exactly plain?"}
+    C -->|"yes"| WM["write the merged text"]
+    C -->|"no"| WW["write plain<br/>WARN, the keys named"]
+```
+
+"Unknown" means exactly what this build's deserializer skipped: `serde_ignored` names the
+keys (`unknown_keys`, `:3799`). A key this build knows is written as this build read it: a
+value a newer build wrote that this one cannot represent — `peer_auth = "enforce"`, read as
+`audit` (`:2780`) — is rewritten to that reading, for instance after a rollback. Only the keys
+the deserializer skipped are kept as written.
+
+⚠️ **An array entry is found by its identity, never by its position** (`same_entry`,
+`:3866`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
+array (`entry_identity`, `:3850`), never one read off the entry on disk. A newer build's
+entry can carry a key that looks like an identity (an `id` on an org) which no entry this
+build writes has: keyed on it, the entry is found nowhere, and every key on it is lost, in
+exactly the array the merge exists for. Positions move: removing an org shifts the ones
+after it, and promoting an org puts the demoted primary at the promoted org's index, under
+the promoted org's label, with the array's length unchanged (`promote_org_to_primary`).
+Matched by position, or by label, a key would land on another org, which is worse than
+losing it. A route's `id` may be empty, and an empty id is no identity: a key on such a
+route is dropped, never copied onto another, even with one such route. An array with no identity
+(`[[forward_acl.allowlist]]`) drops the keys inside its entries at every save, with the
+WARN; a test holds every array of tables this build writes to naming its identity, or its
+lack of one.
+
+⚠️ **A key at the top level stays at the top level when the primary identity changes.**
+`promote_org_to_primary` and `enroll --replace` swap the identity the file's scalar keys
+describe, and a key this build does not know beside them stays beside them. A newer build
+may scope such a key to the org and would have moved it with the demoted one; this build
+keeps it with the new primary, as `preserve_operator_config` keeps every operator setting
+with the file.
+
+Two guards keep the worst case at the old behaviour. The merged text must read back and
+serialise to exactly what the struct alone would have written (`:3946`), so the merge can only
+add what this build ignores and never change a key it knows. And any failure writes the struct
+alone, with a WARN that names the keys it could not keep.
+
+`load` names them once per process and file (`note_unknown_keys`, `:4030`), with WARN *"config
+keys this build does not know: ignored here, and kept in the file through every save"* and the
+key paths. After a rollback, "my setting did nothing" has its answer in the log.
+
+`load`'s recovery keeps them too. It reinstates the `config.toml.prev` copy it loaded over a
+live file that does not parse, and names the copy as the base (`save_with_base`, `:4068`):
+the keys to keep are the copy's, and the live file holds nothing a merge can read. Every
+other save reads the file it replaces, and one over a file that does not parse says so —
+WARN *"the config being replaced does not parse: keys this build does not know in it, if
+any, are NOT kept through this save"*, a fixed string, never the parser's.
+
+⚠️ **Key paths only, never values.** The file holds the agent token and the overlay keys. A
+TOML parse error quotes the line it stopped at, so the merge reports fixed strings and never
+passes a parser message on.
+
+⚠️ **A key a build retires now stays in the file** and is logged as unknown at every start,
+where the next save used to scrub it. Every key retired so far was a knob or a kill switch. A
+retired key that held a secret would need an explicit scrub; no code relies on a save to
+remove one today.
 
 ## Windows
 
@@ -181,7 +361,12 @@ Details worth knowing:
   tunnels pane, consent prompts) and **`roomler.exe`** — a small shim that
   re-execs `roomlerd cli`, so CLI and daemon can never version-skew.
 - Terminal alternative: `irm https://roomler.ai/api/setup/install.ps1 | iex`
-  (prompts for role/token; flags mirror the sh script).
+  runs the script with its defaults (`-Role daemon-system` from an elevated
+  shell, nothing enrolled — it asks for nothing). To pass parameters, which
+  mirror the sh script's, download it first or use
+  `& ([scriptblock]::Create((irm https://roomler.ai/api/setup/install.ps1))) -Role daemon-system -Pair`:
+  `-Pair [-PairOrg <slug>]` pairs in the browser instead of taking `-Token`
+  ([above](#pairing-from-a-terminal)).
 - Binaries are Authenticode-signed; the MSI's payload EXEs are signed before
   packaging.
 - On a perMachine install the SCM host writes the Defender rule
@@ -198,6 +383,10 @@ Details worth knowing:
 ```bash
 curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   --role daemon --token <enrollment-jwt> [--server https://roomler.ai] [--name lab-1]
+
+# or pair in the browser instead of pasting a token (FR-129 A4):
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+  --role daemon --pair [--pair-org <org-slug>] [--server https://roomler.ai] [--name lab-1]
 ```
 
 - Installs the `.deb` (x86_64 **and** arm64) or tarball, verifies SHA-256,
@@ -299,6 +488,103 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 - Headless servers: the daemon's virtual-desktop mode gives the machine a
   display, so "Connect" drops you into a live console.
 - Design notes for the tarball/self-update path: [linux-self-update.md](linux-self-update.md).
+
+### The wizard on Linux (FR-129 B1)
+
+The same `roomler-setup` wizard that installs the daemon on Windows installs it
+on a Linux desktop, with two daemon cards — **this user only** (the systemd user
+unit, the overlay through the userspace netstack; the default for a desktop)
+and **system service** (the root `roomlerd.service`, the TUN overlay, config at
+`/etc/roomler/config.toml` — the terminal path's `--system`). It is a GUI front
+end to the **embedded `install.sh`**, never a second implementation of its steps
+(`agents/roomler-setup/src/unix_daemon.rs`, `orchestrator_unix.rs`):
+
+```mermaid
+sequenceDiagram
+    participant W as wizard (the person)
+    participant P as polkit prompt
+    participant R as install.sh --privileged-steps (root)
+    participant U as install.sh --user-steps (the person)
+    Note over W: system scope only: ask the root daemon which device it is, then enroll in-process → a 0600 file in a 0700 scratch dir
+    W->>P: pkexec /bin/sh #lt;script#gt; --privileged-steps --role daemon --server … --name … --desktop [--system --config-from #lt;file#gt;]
+    P-->>W: ONE password dialog (GNOME Shell / KDE)
+    P->>R: as root, its stdout and stderr to files in the scratch dir
+    R->>R: resolve · sha256 (REQUIRED) · dpkg -i / tarball · FR-96 helper · companion .deb/.rpm
+    R->>R: --system: roomlerd adopt-enrollment folds the file into an existing config (#35;2338), then enable or RESTART roomlerd.service
+    R-->>W: lines tailed as written · exit 0 (file shredded) · before its first line: 126 = cancelled, 127 = no prompt → the terminal command · after it: the script's own exit
+    Note over W: per-user scope: enroll in-process now, folded into ~/.config/roomler/config.toml, then make the unit's folders
+    W->>U: /bin/sh #lt;script#gt; --user-steps --role daemon [--system]
+    U->>U: systemctl --user enable --now roomler.service (restarted beside an enabled helper)
+```
+
+- **The cards appear only when the chosen server says so**: the wizard reads
+  `GET /api/setup/features` and shows the Linux cards on a JSON
+  `wizard_unix_daemon: true` and on nothing else — a 404 (an older server), a
+  503, a timeout, a string `"true"` all mean the tunnel-client card alone
+  (`ROOMLER__SETUP__WIZARD_UNIX_DAEMON`, default off; B1-s). The server is picked
+  after the role, so the Server page asks again when the URL changes and the
+  pipeline once more before it installs.
+- **One prompt, through the desktop's own agent.** `pkexec` is launched from
+  the wizard's process, which GNOME and Plasma put in the user manager; polkit
+  resolves it to the seat session and GNOME Shell or `polkit-kde-agent` shows
+  the dialog. `pkexec` strips `DISPLAY`, so the half cannot see a desktop:
+  the wizard passes `--desktop`, because the companion is the device's consent
+  prompt surface. Until the half prints its first line, exit **126** is the
+  person's No ("cancelled", nothing installed) and **127** is "no prompt
+  possible" (no agent in this session, `pkexec` absent, the password refused):
+  the wizard then shows the identical half as `sudo /bin/sh …` for a terminal
+  — no secret on it — waits for the person to say it ran, and checks the daemon
+  is there. After that line every exit is the script's own: a step whose
+  command is missing exits 127 too, and that is a failed step, never a reason
+  to show the terminal command.
+- **Cancel** while the dialog is up closes it, and nothing was installed. Once
+  the password is accepted the half runs as root, and nothing the wizard does
+  can stop it: a cancel then is reported, the half runs to its end, and the
+  install stops there and says what the half left. The window does not close
+  while the half runs, since the wizard's exit would remove the files the half
+  is still using. **Retry** picks up where it stopped: a half that ran to its
+  end is not run again (no second password), and a system scope is not enrolled
+  twice with a token already spent.
+- **A missing digest is an error here**, where the terminal path only warns:
+  a GUI that elevated to root places nothing it cannot verify (AC12).
+- **The token never leaves the wizard's process** — not in argv, a URL or a
+  line. A system scope enrolls *before* the prompt into a private file the half
+  places root-owned 0600; the file is shredded once placed, kept for a Retry
+  when the half failed (the single-use token is already spent, so the Retry
+  reuses the enrollment), and shredded at the wizard's exit at the latest.
+- **A reinstall keeps the device's settings (#2338).** The wizard folds the new
+  enrollment into the config already at its path, as `roomlerd enroll` does;
+  for the root config, which the person cannot read, the privileged half runs
+  `roomlerd adopt-enrollment` as root. Only the Advanced boxes the person
+  *touched* are written over an existing config. And because `systemctl enable
+  --now` leaves an active unit as it is, the half **restarts** a running
+  `roomlerd.service` onto the placed config.
+  - An enrollment into **another organization** is added beside the primary
+    one, and none of the Advanced boxes is written then
+    ([every path's rule](#enrollment--what-every-path-does)); for the root
+    config, `adopt-enrollment` applies that rule as root and says so.
+  - A config there that **does not load** is not treated as absent: the wizard
+    (or, for the root config, `adopt-enrollment`) says so, folds the enrollment
+    into its last good copy (`config.toml.prev`) when that one loads, and keeps
+    the damaged file as `config.toml.unreadable`.
+  - A system scope's machine id is **derived from the host name** (the person
+    cannot read the one in root's config). On a renamed host, or a VM cloned
+    together with its config, the server therefore enrolls a **new device**: the
+    old private-network key, which the old row still claims, is dropped so the
+    mesh comes up on a fresh one, and the old device is named — remove it if it
+    was this machine, keep it if it is the machine this one was cloned from.
+- **The overlay on a per-user install** goes through the userspace netstack:
+  the wizard writes `netstack_socks_port` (the first free port in 10800–10899)
+  with `overlay_enabled`, since a per-user unit has no `CAP_NET_ADMIN` and
+  joins nothing without it.
+- **The per-user unit's folders exist before it starts.** The packaged unit
+  lists `~/.config/roomler` and `~/.local/share/roomler` in `ReadWritePaths=`
+  without `-`, and wherever the user manager applies that sandbox (Fedora's
+  does; Ubuntu 24.04's skips its mounts) a missing one stops the unit with
+  226/NAMESPACE, every 5 s. On the terminal path `roomlerd enroll` makes both;
+  the wizard enrolls in its own process, so it makes them itself, from the same
+  resolution as the config path (a pre-rename host keeps its legacy tree).
+- Install trace: `install.method = wizard`, `scope = per-user` or `system`.
 
 ### Where a root daemon's config lives (rc.435)
 
@@ -416,6 +702,25 @@ cannot have its limits never runs (FR-90 P8-2a-3), and the daemon's log says why
 > raises a dylib's minimum fails the release instead of shipping a daemon that
 > cannot start.
 
+**The wizard on macOS (FR-129 B1)** installs the per-user half — the
+LaunchAgent, screen sharing — through the same embedded `install.sh` halves as
+on Linux, under one `osascript … with administrator privileges` dialog. The
+AppleScript is a constant that takes the half's argv as *its* arguments and
+quotes each with `quoted form of`, so nothing from the device name or the
+server URL is ever interpolated into script source; a dismissed dialog
+(`User canceled. (-128)`) reads as "cancelled", a failed shell command as its
+own exit code. `do shell script` hands back nothing until the command has
+finished, so the root shell writes its output to files the wizard tails as
+they grow, and its exit status to a third. A cancel closes the dialog while it
+is up; once the password is accepted, killing `osascript` would no longer stop
+the root shell — `installer -pkg` would run on — so the wizard waits it out
+and says so instead. The card appears only when the server's `wizard_unix_daemon`
+switch is on, like the Linux cards. The root half (the overlay) is **B2**: the
+seam is in place — the pairing's `halves: 2`, two tokens, `--config-from` on
+macOS requests the root half and folds into an existing `/etc/roomler/config.toml`
+through `roomlerd adopt-enrollment` — but the wizard does not run it yet. The
+two privacy grants below remain the person's; the Done page says so.
+
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
 processes**, and it is worth knowing why before you install:
 
@@ -457,6 +762,14 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   --role daemon --token <token> --daemon-token <second-token> \
   --server https://roomler.ai --name "$(hostname)"
+
+# Or pair in the browser instead of pasting a token (FR-129 A4): the per-user half …
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+  --role daemon --pair --server https://roomler.ai --name "$(hostname)"
+# … then, for the overlay, pair the root half as root (its own approval):
+sudo /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd --config /etc/roomler/config.toml \
+  enroll --pair --server https://roomler.ai --name "$(hostname)-daemon" --overlay
+sudo roomlerd service install --as-service
 ```
 
 `--daemon-token` also turns the overlay on (`enroll --overlay`) — installing a
@@ -571,6 +884,138 @@ The Overview's **Service** line reads the root daemon too (`System daemon
 (root) · running`). Before #2871 the companion understood only Windows' answers,
 and a supervised Mac — whose LaunchAgent FR-43 P2d boots out by design — read
 "not installed".
+
+### The GUI worker never outlives its daemon (#2987)
+
+The supervisor starts the GUI worker as `launchctl asuser <uid> sudo -u '#<uid>'
+… roomlerd run --supervised`, in a process group of its own, so that it can stop
+the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:587`). The same
+group is why launchd's teardown of the daemon never reaches the worker. Before
+#2987, a daemon that ended any way other than its clean shutdown (the watchdog's
+`exit(2)` after a stall, a crash, a `kill -9`) left its worker running. That
+worker stayed on the old release, its delegation was refused (`secret
+mismatch`), and it held the person's single-instance lock. Each worker the next
+daemon spawned then exited 0 within seconds, and after five the supervisor gave
+up. Measured on the operator's MacBook on 2026-10-26: a 0.4.174 worker outlived
+the 0.4.175 and 0.4.177 updates.
+
+```mermaid
+sequenceDiagram
+  participant L as launchd
+  participant D as root daemon
+  participant W as GUI worker (the person)
+  D->>W: spawn - stdin carries the secret, then roomler-lifeline/1
+  Note over D,W: the daemon keeps its end of the pipe open for the worker's life
+  D->>D: dies without its clean shutdown - exit(2), a crash, kill -9
+  Note over W: the pipe closes - end-of-file on stdin
+  W->>W: internal shutdown - a stop that completes is marked clean
+  L->>D: KeepAlive starts a new daemon
+  D->>D: reap - stop any worker still running run --supervised
+  D->>W: spawn a fresh worker on the current release
+```
+
+| Mechanism | How | Catches |
+|---|---|---|
+| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:651`, `:530`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). | A worker of this release, however its daemon ended |
+| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:820`, `:457`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
+| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:475`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
+
+⚠️ **Mixed versions are safe in both directions.** The offer is a line of its
+own after the secret. A worker from before #2987 reads one line, as it always
+did, and never sees the offer. A new worker under an older daemon reads
+end-of-file where the offer would be, arms nothing and behaves as before. Which
+release is on disk is never known at spawn time, because an update replaces the
+binary under a running daemon.
+
+⚠️ **The worker leaves as an update would, not as an OS stop.** A stop that
+completes marks the run clean, so the crash-and-rollback counter never counts
+it. An ephemeral device does not unenroll, and the next daemon's worker comes
+up on the same enrollment. The 15 s backstop's exit is unclean on purpose: it
+fires only when that stop wedged.
+
+⚠️ The reap matches the whole command line, and nothing else: `--supervised` is
+on no command line but the one `spawn_worker` builds. A hand-run `roomlerd run`,
+launchd's own worker (`… run`) and the daemon (`… --config … run`) never match,
+and neither does a root process.
+
+**If a Mac is stuck anyway**, the daemon's log ends with `the GUI worker died
+on arrival too many times — NOT retrying: each worker exited 0 at once: another
+roomlerd holds this person's single-instance lock`. The holder is then not a
+supervised worker: `pgrep -lU <uid> roomlerd` names it. Stop it, then run
+`sudo launchctl kickstart -k system/com.roomler.daemon`.
+
+**Field-verified on 0.4.181** (the operator's MacBook, 2026-10-28, both halves on
+0.4.181). Before the fix, the same Mac lost its worker on 2026-10-26, as
+described above.
+
+| Test | Result |
+|---|---|
+| `kill -9` of the root daemon | The worker logged `delegation: our daemon is gone` 5.7 ms after the kill and recorded a clean stop 9 ms later. launchd started a new daemon at once, and its worker attached **472 ms** after the kill. Nothing was left with ppid 1, and the reap found nothing to stop |
+| A worker the lifeline cannot reach. The stand-in was a process run as the person, with its argv set to exactly `<exe> run --supervised`, followed by `launchctl kickstart -k system/com.roomler.daemon` | The new daemon logged `stopping a GUI worker a previous daemon left behind … pid=<stand-in>`, and spawned its own worker 107 ms later |
+
+⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
+daemon dies, the worker's process group becomes orphaned with a stopped member,
+so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3297`), so
+the worker is gone before the next daemon's reap looks. That exit is abrupt, and
+the next worker counts it as a crash (`crash_count=1`). This is harmless while
+`last_known_good_version` is the running release: `should_rollback` never rolls
+back to the version that is running (`crates/agent-core/src/config.rs:2659`).
+
+### No pipe can stall the supervisor (#3080)
+
+macOS has no `pipe2`, so Rust's std makes a pipe there with `pipe()` and marks
+each end close-on-exec in two later calls. A child that another thread spawns
+inside that window inherits both ends without the flag. A short-lived child
+closes them when it exits. A long-lived one holds the write end for as long as
+it lives, and the pipe's reader waits for an end-of-file that does not come.
+Linux is not exposed: its `pipe2(O_CLOEXEC)` is atomic.
+
+On 2026-10-29, at the 0.4.184 install on the operator's MacBook, netstate's
+`route -n monitor` was spawned inside the window of the reap's `/bin/ps`: their
+pids are consecutive. `ps` exited and `route` kept the pipe's write end. The
+reap's `Command::output()` waited on a runtime worker, before the supervisor's
+first poll, so the Mac got no GUI worker: no capture and no input until a
+restart. The reap has run at every start since 0.4.181 (#3014). The hang
+showed once in two starts.
+
+```mermaid
+sequenceDiagram
+  participant S as supervisor - the reap
+  participant N as netstate - another thread
+  participant P as /bin/ps
+  participant R as route -n monitor
+  S->>S: pipe() for the stdout of ps - not yet close-on-exec
+  N->>R: spawn - R inherits both ends of that pipe
+  S->>S: mark both ends close-on-exec - too late for R
+  S->>P: spawn with the pipe as stdout
+  P-->>S: the rows, then exit
+  Note over S,R: R still holds the write end - end-of-file never comes
+  Note over S: before the fix - output() blocks for good
+  Note over S: since the fix - ps has exited, so the reap drains what is buffered and goes on
+```
+
+| Side of the race | Since #3080 | Where |
+|---|---|---|
+| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:878`, `:827`; `crates/tunnel-core/src/child.rs:75` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:617` |
+| **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:927` |
+
+⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own
+`route -n monitor` child by its PID, after checking that its parent PID is the
+daemon's, never by pattern. The supervisor carries on within milliseconds, and
+netstate respawns its monitor by itself (#1867). Restarting the daemon
+(`sudo launchctl kickstart -k system/com.roomler.daemon`) works too, but it
+rolls the race again: check that `state action=` follows `supervisor ON` in the
+log.
+
+⚠️ **The sweep is for long-lived children only.** It costs a `fork` where std
+would use `posix_spawn`, and up to 65,536 `fcntl` calls in the child. The other
+long-lived macOS children, such as the recorder's own `posix_spawn`, SSH shells
+and long `exec` sessions, are not swept yet (#3082). Until they are, one narrow
+window stays open: the `fork` path waits on an exec-error pipe of its own, made
+the same non-atomic way, so an unswept long-lived child spawned inside that
+window would hold the swept spawn until it exits.
 
 ### Paths, logs, limits
 
@@ -726,8 +1171,8 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:902` (the section) — `uninstall_linux` at `:1328`,
-`uninstall_macos` at `:1377`.
+`scripts/install.sh:1257` (the section) — `uninstall_linux` at `:1683`,
+`uninstall_macos` at `:1494`.
 
 ```mermaid
 flowchart TD
@@ -751,7 +1196,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2019`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2067`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

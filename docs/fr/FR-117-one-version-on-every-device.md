@@ -37,7 +37,7 @@ Asahi tarball install.
 **Root cause.** `companion::refresh_if_stale` (`agents/roomlerd/src/companion.rs:1060`) is Windows-only "by design".
 Its premise (`companion.rs:1067-1078`) is that on Linux "the companion is its own `roomler-desktop` .deb that apt
 upgrades". That is false: there is no apt or dnf repository. `install.sh` installs the companion once, from a release
-asset (`desktop_install`, `scripts/install.sh:804`), and the daemon's updater picks only the daemon's own asset
+asset (`desktop_install`, `scripts/install.sh:788`), and the daemon's updater picks only the daemon's own asset
 (`is_daemon_asset`, `updater.rs:978`, on purpose: FR-27's companion-as-daemon freeze). So the companion package moves
 only when a person re-runs the installer. The dashboard has shown the skew since FR-27 (`companion_version`), and
 until today the fleet had none to show.
@@ -78,7 +78,7 @@ flowchart TD
     the daemon (#2055).
   - **Install:** the host's own package manager, so it stays the source of truth. `apt-get install -y` (then
     `dpkg --install`) for a `.deb`; `dnf`, `zypper` or `yum` for an `.rpm`, in `install.sh`'s order
-    (`desktop_rpm_tool`, `scripts/install.sh:793`). `NEEDRESTART_SUSPEND=1`: Ubuntu's needrestart hook otherwise
+    (`desktop_rpm_tool`, `scripts/install.sh:1141`). `NEEDRESTART_SUSPEND=1`: Ubuntu's needrestart hook otherwise
     restarts services, roomlerd among them, after an apt run (a vmtest trap, seen 2026-10-19). Then `DEBIAN_FRONTEND=noninteractive`
     and a dpkg lock timeout, so unattended-upgrades holding the lock costs one tick, not a hang.
   - **Restart:** a companion that was running is stopped and started again in its person's graphical session, through
@@ -88,7 +88,7 @@ flowchart TD
     after a sync, so the dashboard's skew clears at the next heartbeat.
 - **When:** at the owner's start, and again on a 4 h tick, so a failed sync no longer waits for the next restart.
 - **Windows: the same retry.** `refresh_if_stale` runs once, at the start of whichever process owns the refresh (#1686:
-  the SCM host, `win_service/mod.rs:479`, or the worker, `app.rs:3879`). It now runs on the same 4 h tick in that
+  the SCM host, `win_service/mod.rs:479`, or the worker, `app.rs:4148`). It now runs on the same 4 h tick in that
   process. It costs one file read when the version marker matches.
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` on both platforms gives back today's behaviour.
 

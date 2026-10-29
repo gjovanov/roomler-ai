@@ -175,6 +175,18 @@ pub trait FleetLifecycle: Send + Sync {
         let _ = agent_id;
         None
     }
+
+    /// FR-128 — can both devices reach the far TURN over UDP, by their last
+    /// measurement? Asked by `remote`'s authz gate for a session whose device
+    /// is set to `rc_overlay = auto`: the device a session targets and the
+    /// browser's own device. `network` answers from each overlay node's last
+    /// netcheck: `Some(false)` when either one measured it dead,
+    /// `Some(true)` when both measured it alive. `None` = not measured, or no
+    /// holder knows, which the agent reads as "it works".
+    async fn far_turn_udp(&self, tenant_id: ObjectId, a: ObjectId, b: ObjectId) -> Option<bool> {
+        let _ = (tenant_id, a, b);
+        None
+    }
 }
 
 /// FR-90 P3-2b — what a session's vault role is decided with: who asks, for
@@ -391,6 +403,23 @@ impl HookRegistry {
         for (_, hook) in self.fleet_lifecycles() {
             if let Some(reason) = hook.agent_busy(agent_id).await {
                 return Some(reason);
+            }
+        }
+        None
+    }
+
+    /// FR-128 — the first holder's answer to [`FleetLifecycle::far_turn_udp`];
+    /// `None` when no holder knows (no `network` mounted, or nothing
+    /// measured).
+    pub async fn far_turn_udp(
+        &self,
+        tenant_id: ObjectId,
+        a: ObjectId,
+        b: ObjectId,
+    ) -> Option<bool> {
+        for (_, hook) in self.fleet_lifecycles() {
+            if let Some(verdict) = hook.far_turn_udp(tenant_id, a, b).await {
+                return Some(verdict);
             }
         }
         None
@@ -626,6 +655,45 @@ mod tests {
                 .unwrap(),
             RenamePropagation::NoLiveNode
         );
+        assert_eq!(
+            reg.far_turn_udp(ObjectId::new(), ObjectId::new(), ObjectId::new())
+                .await,
+            None,
+            "FR-128: no holder means not measured"
+        );
+    }
+
+    struct FarTurn(Option<bool>);
+
+    #[async_trait]
+    impl FleetLifecycle for FarTurn {
+        async fn far_turn_udp(&self, _t: ObjectId, _a: ObjectId, _b: ObjectId) -> Option<bool> {
+            self.0
+        }
+    }
+
+    /// FR-128 — the first holder with an answer gives it, in hook order; a
+    /// holder that does not know (`None`, the default) is skipped, never read
+    /// as "dead".
+    #[tokio::test]
+    async fn far_turn_udp_is_the_first_holder_that_knows() {
+        let reg = HookRegistry::default();
+        reg.register(
+            "remote",
+            Hooks {
+                fleet: Some(Arc::new(FarTurn(None))),
+                ..Default::default()
+            },
+        );
+        reg.register(
+            "network",
+            Hooks {
+                fleet: Some(Arc::new(FarTurn(Some(false)))),
+                ..Default::default()
+            },
+        );
+        let ids = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        assert_eq!(reg.far_turn_udp(ids.0, ids.1, ids.2).await, Some(false));
     }
 
     struct Gate(bool);

@@ -61,6 +61,15 @@ in shape (`…/tunnel-client/enroll-token` → `POST /api/tunnel-client/enroll` 
 `{tunnel_client_token}`), with a distinct audience so a leaked agent token can't
 impersonate a client or vice-versa.
 
+Since FR-129 A1 the installer can obtain the same `Enrollment` (or `TunnelEnrollment`)
+token **without anyone copying it**: `POST /api/pair/start` → the person types the
+`user_code` on `/pair` and approves → the installer's `POST /api/pair/poll` receives the
+token, minted on that first poll behind the same gate (`MANAGE_AGENTS` / membership),
+once. Everything after it — the enroll route, the single-use `jti`, the 10-minute life,
+the device cap, the archived-org refusal — is unchanged. The routes are in the public and
+user-scoped tables below; the contract is in
+[the spec](fr/FR-129-guided-cross-platform-installer.md#the-pairing-api).
+
 ### Rate limiting
 
 Everything under `/api` sits behind a per-client-IP governor (trusted-proxy-aware —
@@ -79,7 +88,7 @@ capability URLs, webhook signatures).
 | POST | `/api/auth/login` | Password login (`email` or `username`) |
 | POST | `/api/auth/logout` | Invalidate session |
 | POST | `/api/auth/refresh` | Rotate the access token |
-| POST | `/api/auth/activate` | Redeem an email activation code |
+| POST | `/api/auth/activate` | Redeem an email activation code (`{user_id, token}`); the SPA's `/auth/activate` page, where the activation email's link lands, posts it (#3029) |
 | GET/PUT | `/api/auth/me` | Current user (read / update) |
 | GET | `/api/oauth/{provider}` | OAuth redirect (google, facebook, github, linkedin, microsoft) |
 | GET | `/api/oauth/callback/{provider}` | OAuth callback |
@@ -89,6 +98,8 @@ capability URLs, webhook signatures).
 | POST | `/api/stripe/checkout` · `/portal` | Stripe checkout / customer portal |
 | POST | `/api/stripe/webhook` | Stripe events (HMAC-signed; un-governed). FR-102 P4: the six billing kinds (`customer.subscription.{created,updated,deleted,trial_will_end}`, `invoice.paid`, `invoice.payment_failed`) are also recorded in `billing_events` with the invoice's amounts ([growth-observability.md](growth-observability.md#revenue-what-stripe-billed-p4)) |
 | POST | `/api/sendgrid/webhook` | FR-102 P5 (`saas`): SendGrid's Event Webhook — ECDSA P-256 signed, verified **before the body is parsed** (401), the empty 404 without `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY`; records `delivered` · `bounce` · `dropped` · `spamreport` of newsletter messages on their ledger rows (never opens or clicks); un-governed ([growth-observability.md](growth-observability.md#the-newsletter-delivery-per-issue-tags-and-unsubscribes-p5)) |
+| POST | `/api/pair/start` | FR-129 A1: an installer starts a **device pairing** instead of asking for a pasted token — `{machine_name, os, arch, role: daemon\|tunnel, halves?, client, client_version}` → `{device_code, user_code: "BCDF-GHJK", verification_uri, expires_in, interval}`. The `device_code` is the installer's secret (stored only as a hash, in no other response); the `user_code` is what the person types on `/pair`. Per-address ceiling (429 `rate_limited`); 415 unless the body declares `application/json` (every `/api/pair/*` route — a cross-site `text/plain` form cannot reach the cookie-authenticated routes without a preflight); 400 `network_unmounted` for a tunnel role on a server without the network module; the **empty 404** while `ROOMLER__PAIRING__ENABLED=false` ([the spec](fr/FR-129-guided-cross-platform-installer.md#the-pairing-api)) |
+| POST | `/api/pair/poll` | FR-129 A1: `{device_code}` → `{status: authorization_pending \| slow_down (+interval) \| access_denied \| expired_token \| approved (+tokens[], org_name, org_slug, approver_name, approver_username)}` — the installer shows the two unique handles beside the display names before it installs. The device code **is** the auth; an unknown, delivered or expired code answers `expired_token` alike. The first poll after an approval mints the ordinary single-use enrollment token(s) behind the approver's gate, re-checked — delivery is once |
 | POST | `/api/agent/enroll` | Exchange enrollment token → agent credential |
 | GET | `/api/agent/latest-release` | Agent release manifest (cached GitHub proxy) |
 | GET | `/api/agent/installer/{flavour}` (+`/health`) | Stream the MSI/installer through roomler.ai (`peruser` \| `permachine`) |
@@ -99,6 +110,7 @@ capability URLs, webhook signatures).
 | GET | `/api/tunnel/latest-release` · `/installer/{platform}` (+`/health`) | Tunnel-CLI release manifest + artifact proxy |
 | GET | `/api/setup/latest-release` · `/{platform}` (+`/health`) | `roomler-setup` wizard manifest + artifact proxy |
 | GET | `/api/setup/install.sh` · `/install.ps1` | Terminal installers (served from the binary, curl-able) |
+| GET | `/api/setup/features` | FR-129 B1-s: the switches a client reads before offering an install path — `{"pairing": bool, "wizard_unix_daemon": bool, "wizard_pairing": bool}`, unauthenticated. `pairing` mirrors `ROOMLER__PAIRING__ENABLED`, a fact about this **server** (whether `/api/pair/*` answers), for the wizard to read. The two `[setup]` switches are the operator's assertions about the **released** wizard, each default **`false`** and flipped after its field run: `wizard_unix_daemon` (`ROOMLER__SETUP__WIZARD_UNIX_DAEMON`) — it installs the full daemon on Linux and macOS, so the enrollment dialog, both homepages and the wizard show the Linux and macOS daemon cards only on `true` (AC14); `wizard_pairing` (`ROOMLER__SETUP__WIZARD_PAIRING`) — it pairs (A3), so the homepages say "sign in from your browser" only on `pairing && wizard_pairing`, never on the server's fact alone. ⚠️ Every consumer reads anything but a JSON `true` as `false`: a 404 (an older server), a 503 (fleet unmounted), non-JSON, a timeout — absent means the daemon wizard on Windows only and the token lead. Deliberately not a field on `latest-release`, whose bare array every shipped wizard parses ([the spec](fr/FR-129-guided-cross-platform-installer.md#b--the-full-daemon-from-the-gui-on-linux-and-macos)) |
 | POST | `/api/setup/diagnostics` | FR-102 P3b: the setup wizard's **opt-in** step diagnostics — one `{run, step, outcome, elapsed_ms, error_code, os, wizard_version}` per step boundary, sent only when the person ticked the box. Unauthenticated by necessity, so every field is checked against its vocabulary (422 with a code, nothing stored); body ≤ 1 KiB; ≤ 48 rows per run (429 `run_capped`); 202 with no body. Stores no IP and no User-Agent. The empty 404 while `ROOMLER__GROWTH__SETUP_DIAGNOSTICS=false` ([growth-observability.md](growth-observability.md#the-wizards-opt-in-diagnostics-p3b)). The static segment also makes `GET /api/setup/diagnostics` a 405 (it used to fall into the `{platform}` proxy's 400) |
 | POST | `/api/releases/refresh` | CI cache-bust after a release is published (bearer; fans out to all pods) |
 | GET | `/api/turn/credentials` | Ephemeral TURN credentials (user-scoped) |
@@ -123,6 +135,9 @@ capability URLs, webhook signatures).
 | PUT | `/api/notification/{id}/read` | Mark one read |
 | POST | `/api/notification/read-all` | Mark all read |
 | GET/PUT | `/api/user/newsletter` | FR-58: the signed-in newsletter toggle — a door into the same `subscribers` store the public form writes; subscribing pre-confirms only on a verified account email |
+| POST | `/api/pair/lookup` | FR-129 A1: `{user_code}` → what the typed code names, before approving it — `{machine_name, os, arch, role, halves, client, client_version, country, started_at, expires_at}`; 404 unless a live pending pairing has that code. Each 404 is a miss against the account; past `ROOMLER__PAIRING__MISSES_PER_ACCOUNT_PER_HOUR` the three pairing routes answer 429 for the hour. Every call audited (`pairing_audit`) |
+| POST | `/api/pair/approve` | FR-129 A1: `{user_code, tenant_id}` → `{approved: true}`. The decision, recorded; **no token yet**. `MANAGE_AGENTS` in that org for a daemon pairing, membership for a tunnel one — the same gate the enroll-token routes hold, re-checked at delivery. 403 `forbidden` (the gate, counted as a miss, or an **archived** org, refused before the decision is recorded; **never `not_a_member`**, the one code the SPA leaves the org on — a refused approval must not evict the person from `/pair`), 404 not pending, 400 `network_unmounted`. The org's other `MANAGE_AGENTS` holders are told by push and email |
+| POST | `/api/pair/deny` | FR-129 A1: `{user_code}` → `{denied: true}`; the installer's next poll answers `access_denied`. 404 counted as a miss |
 
 ### Device-scoped — `/api/agent/self/*` (agent JWT, no tenant prefix)
 

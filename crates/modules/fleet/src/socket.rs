@@ -290,6 +290,11 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_honours_lock_on_end(agent_id, caps.has_rpc(RpcCap::LockOnEnd));
+    // FR-128 — whether it decides `rc_overlay = auto` itself, so `auto` is
+    // sent only where the device can take it. Equality-matched.
+    state
+        .rc_hub
+        .set_agent_honours_rc_overlay_auto(agent_id, caps.has_rpc(RpcCap::RcOverlayAuto));
     state
         .rc_hub
         .set_agent_keep_busy_support(agent_id, supports_keep_busy);
@@ -519,7 +524,7 @@ pub async fn handle_agent_socket(
         input_mode: None,
         tenant_name: None,
         may_record: false,
-        rc_overlay: false,
+        rc_overlay: roomler_ai_remote_control::models::RcOverlayMode::Off,
         session_policy: crate::hub::OrgPolicy::Unavailable,
         max_duration: None,
         idle_secs: None,
@@ -806,6 +811,11 @@ pub async fn handle_agent_socket(
                                     state.rc_hub.set_agent_honours_lock_on_end(
                                         agent_id,
                                         caps.has_rpc(RpcCap::LockOnEnd),
+                                    );
+                                    // FR-128 — and its `auto` word.
+                                    state.rc_hub.set_agent_honours_rc_overlay_auto(
+                                        agent_id,
+                                        caps.has_rpc(RpcCap::RcOverlayAuto),
                                     );
                                     // FR-94 — the SYSTEM service came up, was
                                     // anchored, or went away while this worker

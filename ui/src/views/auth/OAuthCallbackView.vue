@@ -22,6 +22,7 @@ import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'
 import { isOAuthSignup, trackGoal } from '@/utils/goals'
+import { PAIR_PATH, takePendingPair } from '@/utils/pairing'
 
 const router = useRouter()
 const route = useRoute()
@@ -87,6 +88,10 @@ onMounted(async () => {
     ) {
       sessionStorage.removeItem('pending_redirect')
       router.push(pendingRedirect)
+    } else if (takePendingPair()) {
+      // FR-129 A2 — the pairing waiting in this browser (parity with the
+      // password login path). A literal path, never a stored one.
+      router.push(PAIR_PATH)
     } else {
       router.push({ name: 'dashboard' })
     }
