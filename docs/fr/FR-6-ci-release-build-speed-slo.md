@@ -49,9 +49,9 @@ itself on the affected run's page. Baseline when the program started: releases t
   TAG build; failed rehearsals file a GitHub issue (`seed-failure-alert` job); saves run
   under `if: always()` so a downstream failure still seeds.
 - **Growth control**: accretion GC before the build (registry mtime sweep + all-or-nothing
-  `target` drop over `SEED_TARGET_MAX_MB`, never file-level deletes under `target` —
-  cargo fingerprints outlive outputs); `cache-janitor.yml` sweeps PR-ref/idle/tag-ref
-  strays every 6 h.
+  `target` drop over `SEED_TARGET_MAX_MB`, 3,000 MB by default and 4,500 MB on the four daemon
+  jobs since wave 32; never file-level deletes under `target` — cargo fingerprints outlive
+  outputs); `cache-janitor.yml` sweeps PR-ref/idle/tag-ref strays every 6 h.
 - **A tag run reuses its rehearsal's compile** (wave 29). After a job's last cargo build,
   `.github/actions/seed-tree-stamp` writes `tree=<HEAD^{tree}> job=<workflow>/<job>` into
   `target/.seed-source-tree`. When the next run of that job restores the seed,
@@ -125,6 +125,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 29 | 10-25 | **A tag run reuses its rehearsal's compile.** Six of six releases checked (0.4.163 to 0.4.171) tagged exactly the tree their rehearsal had just built, and recompiled every crate of ours anyway. A stamp in the seed now records the tree and job a successful build compiled; the next run of that job on that tree marks its checkout unchanged and cargo reuses the build. The macOS job drops its cached libvpx build only when brew's Cellar path moved, and the vendored `scrap` build script declares `rerun-if-changed` | #2914 |
 | 30 | 10-26 | **The companion jobs reuse too.** `tauri_build::build()` declares `cargo:rerun-if-changed=capabilities` whether or not the directory exists, and cargo treats a missing watched path as changed. `roomler-desktop` had no `capabilities/`, so every build re-ran its build script and recompiled it, including a reused tag run (114–149 s per companion job). An `agents/roomler-desktop/capabilities/README.md` makes the directory exist. The capability parser loads only `*.json`/`*.toml`, so the app's ACL is unchanged (still no capability). **And the release lane's two cached-apt steps are bounded.** One hung 23+ min on 0.4.175's tag run where it takes ~37 s. Each now has `timeout-minutes: 8` + `continue-on-error`, and falls through to the existing verify/apt-get fallback, which first repairs an interrupted dpkg | #2940 |
 | 31 | 10-28 | **A release's first build no longer makes its tag run recompile.** Tauri's `generate_context!` writes `out/tauri-codegen-assets/<hash>` into `roomler-desktop`'s OUT_DIR *while that crate compiles*, only when the file is missing, and lists it as an input. So the first build of a new version (a release's rehearsal) left an input newer than the build itself, and the tag run, plus the reseed after it, recompiled `roomler-desktop` once. That cost about 2.5 min on macOS every release, and on Windows whenever the write and the compile's start fell in different seconds (the seed's tar keeps whole seconds). Two things found it: `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the four companion build steps (#3024, diagnostic), and a probe that bumps only `roomler-desktop`'s version. On a same-tree reuse, `seed-tree-reuse` now marks the build's OUT_DIR files unchanged, as it already does the sources. Field-verified on 0.4.181: no companion recompiled on the tag run or the reseed after it, and the diagnostic came out again (#3037) | #3024, #3030, #3037 |
+| 32 | 10-28 | **The daemon lanes' seed cap rises to 4,500 MB.** The accretion GC drops a seed's `target` whole once it passes `SEED_TARGET_MAX_MB`, 3,000 MB by default. A daemon seed restarts at ~2.2–2.7 GB after a cold build and grows ~340–390 MB with each warm one, so the default dropped it again within one or two runs: the Windows seed on four post-release reseeds in a row (0.4.180–0.4.183), and 0.4.183's reseed the `.pkg` and `.deb` aarch64 seeds too (574–580 crates cold, a 31 min run). The four daemon jobs' restore steps now set the cap to 4,500 MB, release-setup's macOS job already running at 5,000; that allows four to six warm builds, and a compressed seed (535–790 MiB) stays far under the 2 GiB asset limit. The GC line also prints the cap in effect and the volume's free space, so a bigger target's disk headroom shows on every run. The operator chose this over pruning stale units, the riskier change: rc.422–424's seed died on a deleted output whose fingerprint survived. Field proof owed: a seed between 3,000 and 4,500 MB kept intact and built warm | #3068 |
 
 ## Acceptance criteria
 
@@ -1051,3 +1052,21 @@ itself on the affected run's page. Baseline when the program started: releases t
   - Two seeds are at the cap's edge: the `.pkg` at 2,995 MB and the `.deb` aarch64 at 2,902 MB, so
     the next rehearsal or reseed will likely drop them and compile those jobs cold once. A tag run
     skips that check ("tag run — skipping accretion GC"), so no release pays it.
+- 2026-10-28, evening: **agent-v0.4.183, cut by stardesk-teardown-roomler.** Wave 31 held on its
+  third release. Rehearsal 40742354169, tag run 40751997218 and the bump's squash `7d9040a82` all
+  had tree `7daedbf21ffd`.
+  - The rehearsal compiled `roomler-desktop` once in each companion job: the positive control.
+  - **The tag run is clean.** All 8 jobs carry the reuse notice and compiled nothing, and the four
+    daemon jobs reported `roomlerd 0.4.183`.
+  - **Tag to publish took 16 min 00 s** (19:11:09 → 19:27:09Z), again almost all of it runner
+    queueing. The `.pkg` waited 8 min 12 s for a macOS runner (0.4.182's waited 8 min 09 s), then
+    took 343 s, 10 s of it the build step. On both releases the ≤10 min mark failed on macOS runner
+    queueing alone.
+  - The reseed (40754452329) ran on master `200a521c7`: a docs PR merged after the bump, so its tree
+    differed from the tag's and every job compiled, as designed for a new tree. It dropped three
+    seeds over the cap, the MSI's at 3,025 MB (the fourth reseed in a row), the `.pkg`'s at
+    3,332 MB and the `.deb` aarch64's at 3,290 MB; those jobs compiled 574–580 crates cold, and the
+    run took 31 min. Wave 32 raises the four daemon jobs' cap to 4,500 MB.
+  - The rehearsal's `.pkg` build step read 1,519 s, a new high: the daemon lib's codegen took
+    1,374 s against 672 s on 0.4.182. The reseed compiled the same code on another runner in 713 s,
+    so it was the runner (FR-123 §8, decision 8).

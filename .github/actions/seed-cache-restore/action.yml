@@ -81,12 +81,12 @@ runs:
           exit 0
         fi
         find ~/.cargo/registry/cache -type f -mtime +4 -delete 2>/dev/null || true
-        TARGET_MB=$(du -sm target 2>/dev/null | cut -f1 || echo 0)
+        TARGET_MB=$(du -sm target 2>/dev/null | cut -f1 || echo 0); FREE_MB=$(df -Pm . 2>/dev/null | awk 'NR==2 {print $4}')
         if [ "${TARGET_MB:-0}" -gt "${SEED_TARGET_MAX_MB:-3000}" ]; then
-          echo "target is ${TARGET_MB} MB (> ${SEED_TARGET_MAX_MB:-3000}) — dropping it whole"
+          echo "target is ${TARGET_MB} MB (> ${SEED_TARGET_MAX_MB:-3000}) — dropping it whole; ${FREE_MB:-?} MB free on the volume"
           rm -rf target
         else
-          echo "target is ${TARGET_MB} MB — kept intact"
+          echo "target is ${TARGET_MB} MB (cap ${SEED_TARGET_MAX_MB:-3000}) — kept intact; ${FREE_MB:-?} MB free on the volume"
         fi
 
     # FR-6 wave 29: a seed this job built from this very tree (a rehearsal,
