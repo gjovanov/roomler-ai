@@ -1,6 +1,6 @@
 # FR-128: Remote desktop over the mesh, automatically — the overlay path only while the mesh link is direct, or when it is the only path
 
-**Issue:** [#2989](https://github.com/gjovanov/roomler-ai/issues/2989) · **Status:** proposed 2026-10-27, on the operator's choice of an "auto" mode after a same-network session relayed. **§2.1's premise was corrected 2026-10-28**: those sessions measured a worker that #2987 had orphaned, not `rc_overlay=off` · **Related:** #1882 (the switch), FR-64 ([#1244](https://github.com/gjovanov/roomler-ai/issues/1244)), FR-121 ([#2862](https://github.com/gjovanov/roomler-ai/issues/2862)), [#2781](https://github.com/gjovanov/roomler-ai/issues/2781), [#2774](https://github.com/gjovanov/roomler-ai/issues/2774)
+**Issue:** [#2989](https://github.com/gjovanov/roomler-ai/issues/2989) · **Status:** proposed 2026-10-27, on the operator's choice of an "auto" mode after a same-network session relayed. **§2.1's premise was corrected 2026-10-28**: those sessions measured a worker that #2987 had orphaned, not `rc_overlay=off`. **D6 and D7 decided 2026-10-28**: §2.2 was re-measured (Chrome on a Mac still relays; the cause is found), and P1 is in review · **Related:** #1882 (the switch), FR-64 ([#1244](https://github.com/gjovanov/roomler-ai/issues/1244)), FR-121 ([#2862](https://github.com/gjovanov/roomler-ai/issues/2862)), [#2781](https://github.com/gjovanov/roomler-ai/issues/2781), [#2774](https://github.com/gjovanov/roomler-ai/issues/2774)
 
 ## 1. Goal
 
@@ -44,6 +44,15 @@ So §2.1 is no case for this FR. With a working agent, a Windows browser on the 
 
 A Mac browser (Chrome and Safari) → a Windows agent on the same network relayed every session: macOS Local Network privacy denies Chrome's helper, and Safari offers no host candidates without a camera grant. Turning `rc_overlay` on for the target fixed it. The viewer's own device's loopback relay (FR-121) carries the session over the mesh.
 
+**Re-measured 2026-10-28 (D6), target `off`, on 0.4.182.** Carriers are from the server's own record (`remote_sessions.carrier`):
+
+| Mac browser → Windows agent | sessions | carrier | time to first frame |
+|---|---|---|---|
+| Safari | 3 | `direct` ×3 | 628–873 ms |
+| Chrome | 3 | `turn` ×3 | 1062–1129 ms |
+
+So §2.2 still holds for **Chrome** and no longer for **Safari**. The cause for Chrome is per-process. The Mac's network-extension rules (`/Library/Preferences/com.apple.networkextension.plist`) allow `com.google.Chrome` local-network access, but deny it to `com.google.Chrome.helper` (`DenyMulticast = true`, never chosen by the user). That helper is the process that owns WebRTC's UDP sockets, so every ICE check to a LAN address is refused. Under `on`, Chrome sends to 127.0.0.1 (its own device's loopback relay), which is not "local network". That is why `on` fixes it: 35 of 35 sessions from that Mac rode the mesh from 2026-10-25 to 10-27.
+
 ### 2.3 Why `rc_overlay` defaults off (`docs/remote-control.md` §4.4)
 
 - **#1856:** a 3 ms route hole on a Mac killed sessions.
@@ -58,7 +67,7 @@ On a UDP-blocked, TLS-inspected network no TURN allocation answers (`TURN alloca
 
 ### 3.1 The decision
 
-`AccessPolicy.rc_overlay` (`crates/remote_control/src/models.rs:1601`) gains a third value, **`auto`**. Under `auto` the **target agent** decides per session. Both inputs are facts it already has:
+`AccessPolicy.rc_overlay` (`crates/remote_control/src/models.rs:1612`) gains a third value, **`auto`**. Under `auto` the **target agent** decides per session. Both inputs are facts it already has:
 
 | mesh carrier to the viewer's device | far TURN candidate gathered | the session behaves as | why |
 |---|---|---|---|
@@ -79,13 +88,20 @@ flowchart TD
 
 ### 3.2 The inputs
 
-- **The carrier.** The same LocalAPI `peers` call the guard makes (`peer.rs:2238`), keyed by the viewer device's overlay address. A delegated Mac session's GUI worker runs no overlay, so it asks the daemon, as the guard already does.
-- **The viewer's device** (D3): by default, the overlay address of the session's remote relay candidate. When the browser uses its own device's loopback relay (FR-121, `resolve_local_relay`, `crates/modules/fleet/src/hub.rs:3386`), that candidate's address is the viewer device's overlay address, so no new wire field is needed.
-- **Far TURN availability** (D5): whether ICE gathered a relay candidate that is **not** fast-local (`relay_addr_is_fast_local`, `agents/roomlerd/src/encode/mod.rs:884`). The filters apply at gathering (`RcOverlay::keeps_local`/`ice_servers`, `agents/roomlerd/src/rc_overlay.rs:64-77`), so this needs one of two mechanisms: defer the overlay candidates until far-TURN gathering has finished, or restart ICE after a failed first round.
+**As built in P1 (2026-10-28): the session decides at its offer, before ICE gathers, from three inputs. The peer then sees a plain on/off, filtered exactly as `on` and `off` always were.**
+
+- **The carrier.** The same LocalAPI `peers` call the relay-tier guard makes, bounded at 400 ms the same way, keyed by the viewer device's overlay address (`mesh_carrier_of`, `agents/roomlerd/src/rc_overlay.rs:245`). `Direct` reads direct. `Relay` and `Tunnel` read relayed. `Blocked`, `Offline` and no answer read unknown (`MeshCarrier`, `:203`).
+- **The viewer's device** (D3, option B): the **server names it** in `rc:request` (`RcOverlayAutoWire.viewer`, `crates/remote_control/src/signaling.rs:5513`). It is the `overlay_ip` of the loopback-relay descriptor the Hub hands the browser (FR-121, `resolve_local_relay`, `crates/modules/fleet/src/hub.rs:3388`), which the Hub has already checked lies in the overlay range.
+- **Far TURN availability** (D5, alternative): also from the server, `RcOverlayAutoWire.far_turn`. It is true only when **both** devices' last netcheck reached the far TURN over UDP: `stun_udp`, and not `relay_band_udp: Some(false)` (`crates/remote_control/src/signaling.rs:5288`, `:5292`). `None` means not measured, and is read as "it works", so a relayed mesh stays off. #2781's viewer sits behind exactly such an egress drop, which the agent's own gathering could never see.
+- **Where it runs.** `RcOverlay::decide` (`rc_overlay.rs:94`), called by the `rc:sdp.offer` handler (`agents/roomlerd/src/signaling.rs:4078`). That handler also runs in a delegated macOS GUI worker. The inputs cross to that worker inside `RcOverlay`, which already carries the decision there, so whichever process builds the peer decides. The server sends the offer only after the request is answered, so the decision never races the consent.
+
+⚠️ **Why not the proposed defaults (decide while gathering, holding the overlay candidates).** Holding a candidate means gathering it, and webrtc-rs pairs every candidate it gathered, trickled or not. On a weak-host OS (Linux, macOS), checks from the overlay-bound host candidate to a browser's LAN address can come back over the mesh as a peer-reflexive pair. That would put the session on a relayed mesh exactly when `auto` had decided against it. Deciding before gathering keeps the proven `off` filters intact. It also needs no candidate buffering in `peer.rs` at all.
 
 ### 3.3 The policy on the wire
 
-`RcOverlay` (`rc_overlay.rs:34`) is resolved per session from a bool (`RcOverlay::resolve`, `:48`) and reaches a delegated worker in `SessionParams.rc_overlay` (`agents/roomlerd/src/delegate.rs:216`). `auto` adds a mode beside it, so an older reader sees the bool it understands (D1).
+`RcOverlay` (`rc_overlay.rs:34`) is resolved per session from the request (`RcOverlay::resolve_mode`, `:73`) and reaches a delegated worker in `SessionParams.rc_overlay` (`agents/roomlerd/src/delegate.rs:216`). `auto` travels beside the bool, as `rc_overlay_auto` next to `rc_overlay: false`, so an older reader sees the bool it understands (D1).
+
+As built, the Hub also sends `auto` only to an agent that advertises the `rc-overlay-auto` verb (`crates/remote_control/src/models.rs:1286`), as it sends `lock_on_end` only to one advertising `lock-on-end`. To any other agent the policy reads as `off`: no `rc_overlay_auto`, and no viewer relay handed out. That makes D1 hold on the server, not only in the older agent's parser. A device with the kill switch set stops advertising the verb (`agents/roomlerd/src/encode/caps.rs:2462`).
 
 ### 3.4 Mid-session
 
@@ -95,8 +111,8 @@ The guard keeps clamping a carrier that degrades during a session. Moving such a
 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
-| P0 | **Measure before building**: same network, Mac ↔ Windows both directions, `off` vs `on` vs a mesh forced onto DERP, plus #2781's topology. Carrier, fps and Mbit/s per cell | — | **in progress.** Windows browser → Mac measured on 2026-10-28: direct with a working agent (§2.1). Still owed: a Mac browser → Windows (§2.2), a mesh forced onto DERP, and #2781's topology |
-| P1 | Agent: the `auto` decision (§3.1), its log line naming the inputs and the outcome, and the D5 mechanism | `ROOMLERD_RC_OVERLAY_AUTO=0`: `auto` behaves as `off` | — |
+| P0 | **Measure before building**: same network, Mac ↔ Windows both directions, `off` vs `on` vs a mesh forced onto DERP, plus #2781's topology. Carrier, fps and Mbit/s per cell | — | **in progress.** Windows browser → Mac measured on 2026-10-28: direct with a working agent (§2.1). Mac browser → Windows re-measured the same day (D6): Safari direct, Chrome relayed, cause found (§2.2). Still owed: a mesh forced onto DERP, and #2781's topology |
+| P1 | Agent: the `auto` decision (§3.1, §3.2 as built), its log line naming the inputs and the outcome, the wire field `rc_overlay_auto`, and the `rc-overlay-auto` verb (§3.3) | `ROOMLERD_RC_OVERLAY_AUTO=0`: `auto` behaves as `off`, and the verb is not advertised | **in review** (2026-10-28). Inert until P2's server sends the field. |
 | P2 | Server + UI: the tri-state on the device policy (Off / Auto / On). The Hub hands out the viewer's loopback relay under `auto` as under `on`. Wire compatibility per D1 | P1's switch, plus the policy itself | — |
 | P3 | (D4) Move a session off an overlay that degrades to a relay mid-session, when a far TURN path exists | its own env switch | — |
 | P4 | Docs + field verification (AC1–AC6) | — | — |
@@ -116,11 +132,11 @@ The guard keeps clamping a carrier that degrades during a session. Moving such a
 |---|---|---|
 | D1 | What an **older agent** receives for `auto` | **`rc_overlay=false`**: it behaves as today's default. Or `true` |
 | D2 | The **default** for new devices once AC1–AC3 hold | **stay `off`, and the operator decides then**. Or `auto` |
-| D3 | How the target learns the **viewer's device** | **the overlay address of the session's remote relay candidate**. Or FR-121's named device, carried in `rc:request` |
+| D3 | How the target learns the **viewer's device** | ~~the overlay address of the session's remote relay candidate~~. **P1 took the other option: the server names it in `rc:request`**, because the remote candidate only arrives while ICE gathers (§3.2's ⚠️). The operator's to confirm. |
 | D4 | **P3** in scope (a mid-session move off a degraded overlay) | **no: the guard's clamp covers it**. Or an ICE restart |
-| D5 | How **far-TURN availability** is known before the overlay is offered | **defer the overlay candidates until far-TURN gathering has finished**. Or an ICE restart after a failed first round |
-| D6 | Build P1–P2 now that §2.1 is void (added 2026-10-28) | **first re-measure §2.2 with a current Mac browser, then decide**. Or proceed on §2.2 and §2.4 as recorded |
-| D7 | The interim `rc_overlay=on` on the MacBook's GUI-worker row (§8), set for the Windows → Mac case that §2.1 no longer supports | **keep it until D6 is decided**: the LAN pair still wins under `on` (§2.1's control). Or set it back to `off` |
+| D5 | How **far-TURN availability** is known before the overlay is offered | ~~defer the overlay candidates until far-TURN gathering has finished~~. **P1 took a third option: the server's hint from both devices' last netcheck** (§3.2), absent = "it works". Deferring candidates leaks (§3.2's ⚠️), and only the server sees the viewer's side. The operator's to confirm. |
+| D6 | Build P1–P2 now that §2.1 is void (added 2026-10-28) | **Decided 2026-10-28 (operator): re-measure first, then build.** Re-measured the same day (§2.2), then the build began. |
+| D7 | The interim `rc_overlay=on` on the MacBook's GUI-worker row (§8), set for the Windows → Mac case that §2.1 no longer supports | **Decided 2026-10-28 (operator): keep it.** |
 
 ## 7. Out of scope
 
@@ -142,3 +158,12 @@ The Mac worker's log resolved 59 mDNS names while healthy (10-23 19:27Z → 10-2
 ### 2026-10-28 — the control: a browser that hides its address, on a healthy 0.4.181 worker
 
 Edge (no camera grant) on the operator's Windows laptop → MacBook-1: resolved in 9 ms, direct LAN Host↔Host, `constrained=false`, 120 fps target (§2.1). The same visit field-verified #2987's fix on this Mac (`docs/installation.md`, "The GUI worker never outlives its daemon"). Every session since the orphan was replaced has been direct: 10 of 10.
+
+### 2026-10-28 night — D6: §2.2 re-measured, and why Chrome on a Mac relays
+
+The operator unticked "Remote desktop over the mesh" on the Windows laptop's row. They then connected three times from Safari and three times from Chrome on the MacBook, and ticked the box back (20:34:36Z).
+- **Safari:** `direct` ×3.
+- **Chrome:** `turn` ×3.
+- The carriers come from `remote_sessions.carrier`, because the laptop's daemon had logged nothing since its update restart (#3073), so the ICE pair types were not recorded.
+
+The cause is per-process macOS Local Network privacy: Chrome's network helper is denied the LAN, while Chrome itself is allowed (§2.2). Posted on [#2989](https://github.com/gjovanov/roomler-ai/issues/2989#issuecomment-6480088242) and [#2989](https://github.com/gjovanov/roomler-ai/issues/2989#issuecomment-6484202232). On the operator's decision, P1 began the same night.

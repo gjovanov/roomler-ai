@@ -25,7 +25,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use roomler_ai_remote_control::signaling::IceServer;
+use roomler_ai_remote_control::signaling::{IceServer, RcOverlayAutoWire};
 use serde::{Deserialize, Serialize};
 use tunnel_core::overlay_footprint as footprint;
 
@@ -35,6 +35,19 @@ pub struct RcOverlay {
     /// The device's `AccessPolicy.rc_overlay`. `false`, the default, keeps the
     /// session off the overlay.
     pub allow: bool,
+    /// FR-128 — the device's policy is `auto`. The session decides at its
+    /// offer, in the process that builds the peer ([`Self::decide`]), and
+    /// `allow` then holds the outcome; until then it is `false`. Absent, from
+    /// an older daemon on the delegation channel, reads `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto: bool,
+    /// FR-128 — the viewer's own device on the overlay, as the server named it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer: Option<IpAddr>,
+    /// FR-128 — whether both ends' last netcheck reached the far TURN over
+    /// UDP. `None` = not measured, read as "it works".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub far_turn: Option<bool>,
     /// The overlay's v4 blocks, snapshotted by the DAEMON when the session is
     /// requested. Carried rather than re-read so a delegated session's GUI
     /// worker, which runs no overlay of its own, filters the same addresses.
@@ -42,17 +55,77 @@ pub struct RcOverlay {
     pub v4_nets: Vec<(Ipv4Addr, u8)>,
 }
 
+/// FR-128 — `ROOMLERD_RC_OVERLAY_AUTO=0` makes `auto` behave as `off`.
+pub fn auto_enabled() -> bool {
+    tunnel_core::env::flag("RC_OVERLAY_AUTO", true)
+}
+
 impl RcOverlay {
     /// The decision for a session THIS process resolves: the device's policy,
     /// plus this process's overlay blocks when they are needed.
     pub fn resolve(allow: bool) -> Self {
+        Self::resolve_mode(allow, None)
+    }
+
+    /// [`Self::resolve`] with FR-128's third value, `auto` (the server's
+    /// hints present). It stands only while `allow` is off and
+    /// [`auto_enabled`] holds; it starts as off, and the offer decides.
+    pub fn resolve_mode(allow: bool, auto: Option<&RcOverlayAutoWire>) -> Self {
+        let auto = auto.filter(|_| !allow && auto_enabled());
         Self {
             allow,
+            auto: auto.is_some(),
+            viewer: auto
+                .and_then(|a| a.viewer.as_deref())
+                .and_then(|v| v.parse().ok()),
+            far_turn: auto.and_then(|a| a.far_turn),
             v4_nets: if allow {
                 Vec::new()
             } else {
                 footprint::v4_nets()
             },
+        }
+    }
+
+    /// FR-128 — make an `auto` session's decision, at its offer: the live
+    /// carrier to the viewer's device ([`mesh_carrier_of`]) and the server's
+    /// far-TURN hint, read by [`auto_allows`]. Anything that is not `auto`
+    /// comes back as it went in. One line in the log names the inputs.
+    pub async fn decide(self, session: impl std::fmt::Display) -> Self {
+        self.decide_with(session, mesh_carrier_of).await
+    }
+
+    /// [`Self::decide`] with the carrier lookup passed in, for tests.
+    pub async fn decide_with<F, Fut>(self, session: impl std::fmt::Display, lookup: F) -> Self
+    where
+        F: FnOnce(IpAddr) -> Fut,
+        Fut: std::future::Future<Output = MeshCarrier>,
+    {
+        if !self.auto {
+            return self;
+        }
+        let carrier = match self.viewer {
+            Some(viewer) => lookup(viewer).await,
+            None => MeshCarrier::Unknown,
+        };
+        let allow = auto_allows(carrier, self.far_turn.unwrap_or(true));
+        tracing::info!(
+            %session,
+            viewer = ?self.viewer,
+            ?carrier,
+            far_turn = ?self.far_turn,
+            allow,
+            "rc ICE: overlay auto (FR-128) — {}",
+            if allow {
+                "the session may ride the mesh"
+            } else {
+                "the session stays off the mesh"
+            }
+        );
+        Self {
+            allow,
+            v4_nets: if allow { Vec::new() } else { self.v4_nets },
+            ..self
         }
     }
 
@@ -115,11 +188,78 @@ impl RcOverlay {
     /// The decision in words, for the one line a session logs, so "why did
     /// it not take the overlay pair" has an answer in the device's log.
     pub fn describe(&self) -> &'static str {
-        if self.allow {
-            "allowed (device policy rc_overlay=on)"
-        } else {
-            "excluded (device policy rc_overlay=off, the default)"
+        match (self.allow, self.auto) {
+            (true, true) => "allowed (device policy rc_overlay=auto, decided for this session)",
+            (false, true) => "excluded (device policy rc_overlay=auto, decided for this session)",
+            (true, false) => "allowed (device policy rc_overlay=on)",
+            (false, false) => "excluded (device policy rc_overlay=off, the default)",
         }
+    }
+}
+
+/// FR-128 — what carries the mesh link to the viewer's device, as `auto`
+/// reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshCarrier {
+    /// LAN, public or hole-punched: the overlay pair is a direct path.
+    Direct,
+    /// DERP, a peer relay or a tunnel: the overlay would carry the video over
+    /// somebody else's TCP.
+    Relayed,
+    /// No answer: an older daemon, a peer that is unknown, blocked or offline,
+    /// or LocalAPI slower than 400 ms.
+    Unknown,
+}
+
+impl MeshCarrier {
+    /// A LocalAPI `peers` answer, read for `auto`. `None`: the peer is not
+    /// in the answer.
+    pub fn of(connection: Option<tunnel_core::localapi::ConnectionType>) -> Self {
+        use tunnel_core::localapi::ConnectionType as C;
+        match connection {
+            Some(C::Direct) => Self::Direct,
+            Some(C::Relay | C::Tunnel) => Self::Relayed,
+            Some(C::Blocked | C::Offline) | None => Self::Unknown,
+        }
+    }
+}
+
+/// FR-128 §3.1 — may an `auto` session use the overlay?
+pub fn auto_allows(carrier: MeshCarrier, far_turn: bool) -> bool {
+    match carrier {
+        // The case a Mac's Chrome loses today, where macOS denies its network
+        // helper the LAN: take the mesh, unconstrained.
+        MeshCarrier::Direct => true,
+        // A relayed mesh would put the video on TCP (§2.3), so take the far
+        // TURN over UDP while there is one. With none, the overlay is the
+        // only path (§2.4), and the relay-tier guard clamps the session.
+        MeshCarrier::Relayed => !far_turn,
+        // Fail safe.
+        MeshCarrier::Unknown => false,
+    }
+}
+
+/// FR-128 — the mesh carrier to the peer that owns `addr`: LocalAPI `peers`
+/// (the `roomler peers` verb) within 400 ms, the bound the relay-tier guard
+/// uses. Ungated, unlike that guard, because any session can be `auto`.
+pub async fn mesh_carrier_of(addr: IpAddr) -> MeshCarrier {
+    let addr = addr.to_string();
+    let query = async {
+        let mut client = tunnel_core::localapi::connect().await.ok()?;
+        let peers = client.peers().await.ok()?;
+        Some(
+            peers
+                .into_iter()
+                .find(|p| {
+                    p.overlay_ip.as_deref() == Some(addr.as_str())
+                        || p.overlay_ip6.as_deref() == Some(addr.as_str())
+                })
+                .map(|p| p.connection),
+        )
+    };
+    match tokio::time::timeout(std::time::Duration::from_millis(400), query).await {
+        Ok(Some(connection)) => MeshCarrier::of(connection),
+        _ => MeshCarrier::Unknown,
     }
 }
 
@@ -152,6 +292,7 @@ mod tests {
         RcOverlay {
             allow: false,
             v4_nets: vec![(Ipv4Addr::new(100, 65, 4, 0), 22)],
+            ..Default::default()
         }
     }
 
@@ -159,6 +300,7 @@ mod tests {
         RcOverlay {
             allow: true,
             v4_nets: vec![(Ipv4Addr::new(100, 65, 4, 0), 22)],
+            ..Default::default()
         }
     }
 
@@ -285,5 +427,135 @@ mod tests {
         let empty: RcOverlay = serde_json::from_str(r#"{"allow":false}"#).unwrap();
         assert_eq!(empty, RcOverlay::default());
         assert!(!RcOverlay::default().allow);
+        // FR-128 — an older daemon's frame, which has no `auto`, reads
+        // not-auto; and a plain off costs no bytes for it.
+        assert!(!empty.auto && empty.viewer.is_none() && empty.far_turn.is_none());
+        assert!(!serde_json::to_string(&off()).unwrap().contains("auto"));
+    }
+
+    /// An `auto` session before its offer: off, with the server's hints.
+    fn auto(viewer: Option<&str>, far_turn: Option<bool>) -> RcOverlay {
+        RcOverlay {
+            auto: true,
+            viewer: viewer.map(|v| v.parse().unwrap()),
+            far_turn,
+            ..off()
+        }
+    }
+
+    /// The hints cross to a delegated GUI worker, which makes the decision.
+    #[test]
+    fn auto_and_its_hints_cross_the_delegation_channel() {
+        let a = auto(Some("100.65.4.33"), Some(false));
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains(r#""auto":true"#), "{json}");
+        assert!(json.contains(r#""viewer":"100.65.4.33""#), "{json}");
+        assert_eq!(serde_json::from_str::<RcOverlay>(&json).unwrap(), a);
+    }
+
+    /// `auto` only while the policy is not `on`; it starts off; a viewer that
+    /// is not an address is no viewer.
+    #[test]
+    fn resolve_mode_keeps_auto_only_for_an_off_policy() {
+        let hints = RcOverlayAutoWire {
+            viewer: Some("100.65.4.33".into()),
+            far_turn: Some(true),
+        };
+        let a = RcOverlay::resolve_mode(false, Some(&hints));
+        assert!(a.auto && !a.allow);
+        assert_eq!(a.viewer, Some(ip("100.65.4.33")));
+        assert_eq!(a.far_turn, Some(true));
+        let on = RcOverlay::resolve_mode(true, Some(&hints));
+        assert!(on.allow && !on.auto && on.viewer.is_none(), "on wins");
+        assert!(!RcOverlay::resolve_mode(false, None).auto);
+        let junk = RcOverlayAutoWire {
+            viewer: Some("not-an-address".into()),
+            far_turn: None,
+        };
+        let a = RcOverlay::resolve_mode(false, Some(&junk));
+        assert!(a.auto && a.viewer.is_none());
+    }
+
+    /// FR-128 §3.1, the whole table.
+    #[test]
+    fn auto_allows_the_mesh_only_when_it_is_direct_or_the_only_path() {
+        assert!(auto_allows(MeshCarrier::Direct, true));
+        assert!(auto_allows(MeshCarrier::Direct, false));
+        assert!(
+            !auto_allows(MeshCarrier::Relayed, true),
+            "the far TURN over UDP wins"
+        );
+        assert!(
+            auto_allows(MeshCarrier::Relayed, false),
+            "the only path (§2.4)"
+        );
+        assert!(!auto_allows(MeshCarrier::Unknown, true));
+        assert!(!auto_allows(MeshCarrier::Unknown, false));
+    }
+
+    #[test]
+    fn a_peers_answer_reads_as_direct_relayed_or_unknown() {
+        use tunnel_core::localapi::ConnectionType as C;
+        assert_eq!(MeshCarrier::of(Some(C::Direct)), MeshCarrier::Direct);
+        assert_eq!(MeshCarrier::of(Some(C::Relay)), MeshCarrier::Relayed);
+        assert_eq!(MeshCarrier::of(Some(C::Tunnel)), MeshCarrier::Relayed);
+        assert_eq!(MeshCarrier::of(Some(C::Blocked)), MeshCarrier::Unknown);
+        assert_eq!(MeshCarrier::of(Some(C::Offline)), MeshCarrier::Unknown);
+        assert_eq!(MeshCarrier::of(None), MeshCarrier::Unknown);
+    }
+
+    /// The decision at the offer, with the lookup stubbed: what each carrier
+    /// and hint makes of the session, and that the outcome is an ordinary
+    /// on/off the filters already know.
+    #[tokio::test]
+    async fn the_offer_decides_from_the_carrier_and_the_far_turn_hint() {
+        let decided = |p: RcOverlay, c: MeshCarrier| async move {
+            p.decide_with("s", move |_| async move { c }).await
+        };
+        // The same-network Mac Chrome case: a direct mesh carries it.
+        let d = decided(auto(Some("100.65.4.33"), None), MeshCarrier::Direct).await;
+        assert!(d.allow && d.auto && d.v4_nets.is_empty(), "{d:?}");
+        assert!(d.keeps_local(ip("100.65.4.34")), "on: no filter");
+        assert_eq!(
+            d.describe(),
+            "allowed (device policy rc_overlay=auto, decided for this session)"
+        );
+        // A relayed mesh gives way to a far TURN, measured or assumed.
+        for hint in [Some(true), None] {
+            let d = decided(auto(Some("100.65.4.33"), hint), MeshCarrier::Relayed).await;
+            assert!(!d.allow && !d.v4_nets.is_empty(), "{hint:?}");
+            assert!(!d.keeps_local(ip("100.65.4.34")), "off: filtered");
+        }
+        // ... unless the far TURN is measured dead: then the mesh is the path.
+        let d = decided(auto(Some("100.65.4.33"), Some(false)), MeshCarrier::Relayed).await;
+        assert!(d.allow);
+        // No answer: off.
+        let d = decided(auto(Some("100.65.4.33"), Some(false)), MeshCarrier::Unknown).await;
+        assert!(!d.allow);
+        assert_eq!(
+            d.describe(),
+            "excluded (device policy rc_overlay=auto, decided for this session)"
+        );
+    }
+
+    /// No viewer named: unknown, off, and the lookup is never asked.
+    #[tokio::test]
+    async fn no_viewer_is_off_without_a_lookup() {
+        let d = auto(None, Some(false))
+            .decide_with("s", |_| async { panic!("no viewer, no lookup") })
+            .await;
+        assert!(!d.allow && d.auto);
+    }
+
+    /// Not `auto`: the offer leaves the decision exactly as it was.
+    #[tokio::test]
+    async fn a_session_that_is_not_auto_is_left_as_it_was() {
+        for p in [off(), on()] {
+            let d = p
+                .clone()
+                .decide_with("s", |_| async { panic!("not auto, no lookup") })
+                .await;
+            assert_eq!(d, p);
+        }
     }
 }

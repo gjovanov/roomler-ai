@@ -3448,6 +3448,13 @@ pub enum ServerMsg {
         /// so the default costs nothing on the wire.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         rc_overlay: bool,
+        /// FR-128 — the device's policy is `auto`: the agent decides per
+        /// session whether its ICE may use the overlay, from the live mesh
+        /// carrier to the viewer's device and whether a far TURN path exists.
+        /// Present = auto. Sent with `rc_overlay: false`, so an agent older
+        /// than the field takes the policy default, off (D1).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rc_overlay_auto: Option<RcOverlayAutoWire>,
         /// FR-101 P2 — the org's session policy for clipboard, files and
         /// audio. The hub has already taken out of `permissions` (and
         /// `audio_enabled`) what the policy refuses here; an agent that
@@ -5497,6 +5504,25 @@ pub struct FileNote {
     /// many; the name itself never leaves the device.
     pub name_sha256: String,
     pub bytes: u64,
+}
+
+/// FR-128 — what an `auto` session needs from the server, beside the policy
+/// itself: [`ServerMsg::Request::rc_overlay_auto`]. Both fields are hints the
+/// agent may lack; every one it lacks makes it more careful, never less.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct RcOverlayAutoWire {
+    /// The viewer's own device on the overlay: the `overlay_ip` of the
+    /// [`LocalRelayDescriptor`] the Hub handed the browser. The agent asks its
+    /// daemon which carrier holds that peer. `None` (the browser's device sent
+    /// no relay, or is in another network) = unknown, so off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer: Option<String>,
+    /// Whether BOTH ends' last netcheck reached the far TURN over UDP
+    /// ([`CapVectorWire::stun_udp`] and not `relay_band_udp: Some(false)`).
+    /// `Some(false)` makes a relayed mesh the only path (§2.4). `None` = not
+    /// measured, which the agent reads as "the far TURN works".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub far_turn: Option<bool>,
 }
 
 /// Loopback-TURN corp-relay descriptor (loopback-TURN Phase 2). Minted + served
@@ -9574,7 +9600,7 @@ mod tests {
     /// skipped so the default costs nothing on the wire; `true` round-trips.
     #[test]
     fn request_rc_overlay_is_off_when_absent_and_round_trips_when_on() {
-        let req = |rc_overlay| ServerMsg::Request {
+        let req = |rc_overlay, rc_overlay_auto| ServerMsg::Request {
             session_id: ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap(),
             controller_user_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
             controller_name: "Alice".into(),
@@ -9590,28 +9616,59 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             rc_overlay,
+            rc_overlay_auto,
             session_policy: None,
             idle_secs: None,
             lock_on_end: None,
             external: None,
         };
-        let off = serde_json::to_string(&req(false)).unwrap();
+        let off = serde_json::to_string(&req(false, None)).unwrap();
         assert!(
             !off.contains("rc_overlay"),
             "false is the default and must not reach the wire: {off}"
         );
         match serde_json::from_str::<ServerMsg>(&off).unwrap() {
-            ServerMsg::Request { rc_overlay, .. } => {
-                assert!(!rc_overlay, "absent (an older server) must read OFF")
+            ServerMsg::Request {
+                rc_overlay,
+                rc_overlay_auto,
+                ..
+            } => {
+                assert!(!rc_overlay, "absent (an older server) must read OFF");
+                assert_eq!(rc_overlay_auto, None, "and not auto");
             }
             _ => panic!("expected Request"),
         }
-        let on = serde_json::to_string(&req(true)).unwrap();
+        let on = serde_json::to_string(&req(true, None)).unwrap();
         assert!(on.contains("\"rc_overlay\":true"), "{on}");
         match serde_json::from_str::<ServerMsg>(&on).unwrap() {
             ServerMsg::Request { rc_overlay, .. } => assert!(rc_overlay),
             _ => panic!("expected Request"),
         }
+        // FR-128 D1 — `auto` travels as its own field beside `rc_overlay:
+        // false`, which is skipped: an agent that knows only `rc_overlay`
+        // reads OFF, the policy default.
+        let hints = RcOverlayAutoWire {
+            viewer: Some("100.65.4.33".into()),
+            far_turn: Some(false),
+        };
+        let auto = serde_json::to_string(&req(false, Some(hints.clone()))).unwrap();
+        assert!(auto.contains("\"rc_overlay_auto\":{"), "{auto}");
+        assert!(auto.contains("\"viewer\":\"100.65.4.33\""), "{auto}");
+        assert!(
+            !auto.contains("\"rc_overlay\":"),
+            "an older agent reads off: {auto}"
+        );
+        match serde_json::from_str::<ServerMsg>(&auto).unwrap() {
+            ServerMsg::Request {
+                rc_overlay,
+                rc_overlay_auto,
+                ..
+            } => assert!(!rc_overlay && rc_overlay_auto == Some(hints)),
+            _ => panic!("expected Request"),
+        }
+        // Auto with no hints at all is still auto, and costs two bytes.
+        let bare = serde_json::to_string(&req(false, Some(RcOverlayAutoWire::default()))).unwrap();
+        assert!(bare.contains("\"rc_overlay_auto\":{}"), "{bare}");
     }
 
     /// FR-101 P2 — `session_policy` on `rc:request`: absent (an older server,
@@ -9637,6 +9694,7 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             rc_overlay: false,
+            rc_overlay_auto: None,
             session_policy,
             idle_secs: None,
             lock_on_end: None,
@@ -9734,6 +9792,7 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             rc_overlay: false,
+            rc_overlay_auto: None,
             session_policy: None,
             idle_secs,
             lock_on_end: None,
@@ -9869,6 +9928,7 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             rc_overlay: false,
+            rc_overlay_auto: None,
             session_policy: None,
             idle_secs: None,
             lock_on_end,
