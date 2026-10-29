@@ -286,8 +286,8 @@ sessions never touch the learner (`governor.rs:543` gates on `constrained`).
 >   `send_wait_max_ms` 0.04–2.1 except the heartbeat holding an opener burst
 >   (52.4 ms on 09:23:26, 163.9 ms on 10-28 07:57:43) — never near `HARD_STALL`.
 >   Viewer paint age p50 66–68 / p95 103–117 ms over a 45–50 ms floor, the maxima
->   (438, 775 ms) inside a session's first ten seconds. The ceiling never passed
->   5,146,238 (`hi` = 8 M) in any of the seven.
+>   (438, 775 ms) in a session's opening ten seconds (4 s and 10 s in). The
+>   ceiling never passed 5,146,238 (`hi` = 8 M) in any of the seven.
 > - **What held the opener at ~1.5×, not 2.5×:** the memory sat at 4.40–4.76 M
 >   while the pipe carried 6–7.6 Mbps windows with sub-ms send waits. The
 >   write-back rows below show why: a session that *proved* 4.84 M stable moved

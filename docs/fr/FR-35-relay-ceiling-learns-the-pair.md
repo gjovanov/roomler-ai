@@ -105,7 +105,9 @@ shipped defaults:
       (`ceiling_learn.rs:237`, `.min(hi)`); **the drag itself was never driven**, so the send-wait
       and viewer-age halves are unexercised — what was seen without a drag (four sessions read in
       full): `send_stalls=0`, `send_wait_max_ms` ≤ 163.9 (the opener), paint age p50 66–68 /
-      p95 103–117 ms, not compared against the FR-18 p99 figure
+      p95 103–117 / max 775 ms. The FR-18 numbers to beat under drag (0.4.10, CORPLAP-3 relay):
+      `send_wait` p99 200 ms / max 1 778 ms, viewer age max 2 185 ms — the undriven sessions sit
+      under them, but that is not the same test
 - [ ] a ~2 Mbps relay (CORPLAP-3, `av1_qsv`): `target_bps` never exceeds the nominal unless every growth
       gate passed — read from its heartbeats; the session must not get worse than today
       (0.4.21, 2026-08-29: no learner steps, `learned_ceiling_bps=0`, target ≤ 3.0 Mbps, 65–78 ms).
