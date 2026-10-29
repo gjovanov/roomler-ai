@@ -731,6 +731,8 @@ async fn run_install_inner(
         cli_included,
         desktop_installed,
         anchored,
+        // FR-129 B2 — the root half is macOS's; Windows has none.
+        root_half: None,
     })
 }
 

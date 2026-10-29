@@ -204,9 +204,9 @@ flowchart TD
     T -- "died / hung" --> H2["the 4:2:0 matrix, and the log names<br/>the last open — the entry for encoder_cells_deny"]
     G --> P
     H2 --> P
-    P{candidates_gpu:<br/>zero_copy on? the QSV and NVENC 4:2:0 cells<br/>the GPU input covers, minus both denylists}
+    P{candidates_gpu:<br/>zero_copy on? the QSV, NVENC and VideoToolbox<br/>4:2:0 cells the GPU input covers,<br/>minus both denylists}
     P -- "none: the switch is off, or no such cell" --> W
-    P -- some --> U["child 3 — PHASE=gpu<br/>ROOMLERD_CAPS_GPU_NAMES=…<br/>each GPU-input form opened on a device of its<br/>frames' adapter, two GPU frames encoded"]
+    P -- some --> U["child 3 — PHASE=gpu<br/>ROOMLERD_CAPS_GPU_NAMES=…<br/>each GPU-input form opened on a device of its<br/>frames' adapter, two GPU frames encoded<br/>(VideoToolbox: IOSurface frames until a packet)"]
     U -- ROOMLER_CAPS_GPU --> V[gpu_input: the forms<br/>a session may open]
     U -- "died / hung" --> V2["no GPU-input form, and the log names<br/>the last open — the entry for zero_copy_deny"]
     V --> W{any hardware cell?}
@@ -239,7 +239,9 @@ Why a third (FR-118 P2-3): a QSV encoder that takes GPU frames
 pool of the capture's own D3D11 device, an open no other cell makes. The `gpu`
 child makes it first and encodes two GPU frames through it. QSV's forms open
 on a device of the adapter the SystemContext DXGI arm captures on, and NVENC's
-(FR-118 P3) on a device of the NVIDIA adapter, where WGC's device goes. A
+(FR-118 P3) on a device of the NVIDIA adapter, where WGC's device goes.
+VideoToolbox's (FR-118 P5) needs no device: the child feeds it IOSurfaces it
+makes itself until a packet comes out. A
 session opens that form only for an encoder the child proved
 (`input_reason=unproven` otherwise), so a driver that faults on it takes down a
 child, never the daemon. With `zero_copy` off there are no candidates and no
@@ -533,12 +535,14 @@ the denylist, and the raw dump of a healthy build decodes as-is.
 The input path is a third dimension of a cell, beside codec × backend and
 chroma: an encoder takes its frames from CPU memory, as every cell did until
 FR-118, or as textures on the capture's own GPU. The GPU form is **off by
-default** (`zero_copy`), and two families take it so far, both at 4:2:0:
+default** (`zero_copy`), and three families take it so far, all at 4:2:0:
 
 - **QSV** (`hevc_qsv`, `av1_qsv`, `h264_qsv`) on the SystemContext DXGI arm, which is the arm every QSV host in
   the fleet captures through.
 - **NVENC** (`hevc_nvenc`, `av1_nvenc`, `h264_nvenc`) on the WGC arm (FR-118 P3). On a hybrid laptop WGC's device
   moves to the NVIDIA adapter.
+- **VideoToolbox** (`hevc_videotoolbox`, `h264_videotoolbox`) on macOS's display stream (FR-118 P5). The stream's
+  IOSurface reaches VideoToolbox as a CVPixelBuffer over the same memory, and VideoToolbox converts the BGRA itself.
 
 ```mermaid
 flowchart LR
@@ -559,15 +563,20 @@ flowchart LR
     C3 -->|CopySubresourceRegion| D3[D3D11 pool slice]
     D3 -->|AV_PIX_FMT_D3D11| E3[NVENC]
   end
+  subgraph vt["GPU input (zero_copy, a proven VideoToolbox cell)"]
+    A4["display stream IOSurface (BGRA)"] -->|"Frame::into_surface:<br/>the use count moves with it"| B4[IoSurfaceFrame]
+    B4 -->|"CVPixelBufferCreateWithIOSurface<br/>+ the BT.601 matrix attached"| C4[CVPixelBuffer, same memory]
+    C4 -->|AV_PIX_FMT_VIDEOTOOLBOX| E4[VideoToolbox<br/>converts the BGRA]
+  end
 ```
 
 | Piece | What it is | Where |
 |---|---|---|
-| the switch | `zero_copy` (`ROOMLERD_ZERO_COPY`), default off; a restart applies it | `capture::gpu_frame::zero_copy_enabled` |
-| the denylist | `zero_copy_deny`, entries `name:gpu` (`none` = empty), read by the probe and at every encoder open | `encode::ffmpeg::gpu_hint::denied` |
-| the GPU frame | `FrameData::Gpu`: a BGRA texture on the capture's device. A consumer that needs bytes reads it back, once | `agents/roomlerd/src/capture/gpu_frame.rs` |
-| the capture's adapter | the DXGI arm: the primary output's. WGC: the adapter of the first proven GPU-input cell's vendor, in the order every cascade opens backends (NVENC, QSV, AMF); with none proven, the default adapter | `capture::gpu_frame::capture_adapter` |
-| the GPU input | QSV: a D3D11VA device context wrapping the capture's device, a QSV device derived from it, and a decoder-target frame pool. NVENC: the same D3D11VA context and an `AV_PIX_FMT_D3D11` NV12 pool, decoder-bound (the RTX 5090 refuses its NV12 array otherwise) | `agents/roomlerd/src/encode/ffmpeg/gpu_input.rs` |
+| the switch | `zero_copy` (`ROOMLERD_ZERO_COPY`), default off; a restart applies it. On a supervised Mac the root's value is handed to the GUI worker, which captures and encodes | `capture::zero_copy_enabled` |
+| the denylist | `zero_copy_deny`, entries `name:gpu` (`none` = empty), read by the probe and at every encoder open; handed to a supervised Mac's GUI worker as the switch is | `encode::ffmpeg::gpu_hint::denied` |
+| the GPU frame | `FrameData::Gpu`: a BGRA texture on the capture's device. On macOS, `FrameData::IoSurface`: the display stream's surface, its use count held until the last clone goes. A consumer that needs bytes reads either back, once | `agents/roomlerd/src/capture/gpu_frame.rs`, `agents/roomlerd/src/capture/iosurface_frame.rs` |
+| the capture's adapter | the DXGI arm: the primary output's. WGC: the adapter of the first proven GPU-input cell's vendor, in the order every cascade opens backends (NVENC, QSV, AMF); with none proven, the default adapter. macOS: none, an IOSurface is not bound to a device | `capture::gpu_frame::capture_adapter` |
+| the GPU input | QSV: a D3D11VA device context wrapping the capture's device, a QSV device derived from it, and a decoder-target frame pool. NVENC: the same D3D11VA context and an `AV_PIX_FMT_D3D11` NV12 pool, decoder-bound (the RTX 5090 refuses its NV12 array otherwise). VideoToolbox: no device at all; a CVPixelBuffer over the frame's IOSurface, or a pool buffer a frame in memory is copied into, as `AV_PIX_FMT_VIDEOTOOLBOX` | `agents/roomlerd/src/encode/ffmpeg/gpu_input.rs`, `agents/roomlerd/src/encode/ffmpeg/vt_input.rs` |
 | the proof | the probe's `gpu` child opens each GPU form and encodes two frames through it; a session opens only a form the child proved | [The probe lifecycle](#the-probe-lifecycle) |
 
 The session reports which form it opened and why, on the heartbeat as
@@ -576,7 +585,7 @@ The session reports which form it opened and why, on the heartbeat as
 | `input_reason` | Meaning |
 |---|---|
 | `switch_off` | `zero_copy` is off |
-| `cpu_frames` | the capture delivered frames in memory: another arm, an FP16 desktop, a rotated output, a fallback |
+| `cpu_frames` | the capture delivered frames in memory: another arm, an FP16 desktop, a rotated output, a fallback. Never on a Mac: VideoToolbox's GPU form takes a frame in memory too, with one copy |
 | `no_gpu_cell` | this encoder or chroma takes no GPU frames yet |
 | `denied` | `zero_copy_deny` names it |
 | `unproven` | the probe's `gpu` child did not prove this form on this host |
@@ -592,7 +601,12 @@ The session reports which form it opened and why, on the heartbeat as
 - **The colour is the CPU path's.** The VideoProcessor converts with BT.601
   limited range, the matrix of the CPU path's conversion, so flipping the
   switch does not change the picture. In the field, on an Intel adapter,
-  flat regions decode identically on both paths.
+  flat regions decode identically on both paths. On macOS VideoToolbox does
+  the conversion, and it converts an unmarked BGRA buffer with BT.709, so
+  every buffer carries the BT.601 matrix (the session's colour properties
+  only tag the stream). Measured on an M5 Pro, the test bars then decode
+  within 2 code values of the CPU path in every plane, against 21 unmarked
+  ([FR-118 §5.8](fr/FR-118-gpu-resident-frames.md#58-p5--videotoolbox-takes-the-iosurface-as-built-2026-10-29)).
 - **Measured** ([FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28),
   `av1_qsv` at 1920×1200 and 60 fps on a moving test pattern, 20-minute legs
   on, off, on): capture + encode fell from 14.70 to 12.30 ms per frame, and the
@@ -622,9 +636,23 @@ The session reports which form it opened and why, on the heartbeat as
   forms, because a capture opens before the session's encoder exists. On a host
   with both NVENC and QSV, a codec NVENC lacks opens on QSV on the other adapter
   and reads `adapter_mismatch`: CPU frames, the picture unchanged.
-- **Not yet:** the NVENC cell's field run (P3 is unreleased), and AMF. The
-  measurement above made the AMF route unnecessary on the hybrid host, so an
-  AMD-only host's AMF cells stay on CPU frames until one needs them.
+- **Field-verified and released:** the QSV cell on the DXGI arm (0.4.181,
+  [FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28)) and
+  the NVENC cell on the WGC arm (0.4.183,
+  [FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29)).
+- **Built, not yet field-verified:** the VideoToolbox cells on macOS
+  ([FR-118 §5.8](fr/FR-118-gpu-resident-frames.md#58-p5--videotoolbox-takes-the-iosurface-as-built-2026-10-29)).
+  On a Mac `input_path=gpu` means VideoToolbox converts the BGRA, for a frame
+  in memory as well (the 2× CPU downscale's), which is copied once into a pool
+  buffer first. The capture holds a surface until VideoToolbox is done with
+  it, out of the display stream's queue of 3, so the field run reads the frame
+  rate with the switch on and off.
+- **Not built:** AMF — the measurement above
+  ([FR-118 §9.4](fr/FR-118-gpu-resident-frames.md#94-wgc-across-adapters-for-p3-2026-10-28))
+  made its route unnecessary on the hybrid host, so an AMD-only host's AMF cells
+  stay on CPU frames until one needs them — and VAAPI (Linux), deferred with its
+  measurement: its conversion and upload are 1.2 ms of a 4.1 ms encode stage, on
+  the one 1600×900 virtual desktop that runs it (FR-118 open decision 6).
 
 ## Configuration
 
@@ -633,8 +661,8 @@ The session reports which form it opened and why, on the heartbeat as
 | `encoder_preference` | `ROOMLERD_ENCODER` (CLI `--encoder` wins) | `auto` | `auto` · `hardware` · `software` |
 | `encoder_cells_deny` | `ROOMLERD_ENCODER_CELLS_DENY` | the built-in list | `name:chroma` cells never opened nor advertised; `none` = deny nothing; pushable through remote config (`MANAGE_AGENTS`), `needs_restart`. On a supervised Mac the session's encoders open in the GUI worker, which reads the person's config, so the root's effective value is handed to it at spawn (FR-43, `WORKER_ENV_FORWARD`, from 0.4.155); before that a root-side deny bound the probe and the hello but not the worker's sessions |
 | `caps_cache` | `ROOMLERD_CAPS_CACHE` | on | the probe cache (read and write) |
-| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them ([above](#gpu-resident-frames-the-input-path-fr-118)) |
-| `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing |
+| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them; on macOS the display stream's IOSurfaces go to a proven VideoToolbox cell ([above](#gpu-resident-frames-the-input-path-fr-118)). On a supervised Mac the root's value is handed to the GUI worker at spawn (`WORKER_ENV_FORWARD`, from FR-118 P5) |
+| `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing. Handed to a supervised Mac's GUI worker as `zero_copy` is |
 | `vaapi_device` | `ROOMLERD_VAAPI_DEVICE` | unset | pin the render node; unset = `/dev/dri/renderD128`…`135` in order |
 | `d3d12_adapter` | `ROOMLERD_D3D12_ADAPTER` | unset | pin the DXGI adapter index for D3D12 video encode (Windows); unset = adapters `0`…`3` in order |
 | `vulkan_device` | `ROOMLERD_VULKAN_DEVICE` | unset | pin the Vulkan physical device by index or name; unset = the loader's default |

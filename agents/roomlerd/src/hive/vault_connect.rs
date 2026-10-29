@@ -2447,6 +2447,7 @@ mod endpoint {
     pub(super) mod loopback {
         use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
+        use bson::oid::ObjectId;
         use serde_json::json;
         use tokio::net::{TcpListener, TcpStream};
 
@@ -2607,15 +2608,79 @@ mod endpoint {
             ))
         }
 
-        /// FR-90 P4-6-1b-2 — the admit hook of a flow only this daemon may
-        /// use (`net_tools::daemon_flow`), whose end a proxy dials its
-        /// upstream through: never the session's account. Windows asks the
-        /// connection's process itself, which must be this one; Unix asks
-        /// its account, which must be this daemon's own (root, as it runs).
+        /// FR-90 P4-6-1b-2, P8-2b-4 — the admit hook of a flow only this
+        /// daemon may use (`net_tools::daemon_flow`), whose end a proxy
+        /// dials its upstream through: never the session's account. The
+        /// connection's process must be this one, or — once `session` at
+        /// `fence` has a worker running its proxies — that worker's.
         /// Refused where this system cannot say who connects to a loopback
         /// port.
-        pub(crate) fn daemon_admit() -> Result<tunnel_core::flow_listener::Admit, String> {
+        #[cfg(windows)]
+        pub(crate) fn daemon_admit(
+            session: ObjectId,
+            fence: u64,
+        ) -> Result<tunnel_core::flow_listener::Admit, String> {
+            admit_daemon_or_live(session, fence)
+        }
+
+        /// Unix is unchanged by P8-2b-4 (P8-0's point 6): the admit hook of
+        /// a flow only this daemon may use, asking the connection's
+        /// account, which must be this daemon's own (root, as it runs) —
+        /// and a worker there already runs as that account, so `session`
+        /// and `fence` go unused.
+        #[cfg(unix)]
+        pub(crate) fn daemon_admit(
+            _session: ObjectId,
+            _fence: u64,
+        ) -> Result<tunnel_core::flow_listener::Admit, String> {
             admit_only(own())
+        }
+
+        /// [`daemon_admit`]'s own hook on Windows: `worker::pid_of` read
+        /// fresh on every connection (not cached at this call, before a
+        /// worker existed, started again or ended — P8-0's point 2), so
+        /// whichever one is up right now is always the one asked.
+        #[cfg(windows)]
+        fn admit_daemon_or_live(
+            session: ObjectId,
+            fence: u64,
+        ) -> Result<tunnel_core::flow_listener::Admit, String> {
+            identifies()?;
+            let daemon = own();
+            Ok(std::sync::Arc::new(
+                move |tcp: &TcpStream, local: SocketAddr| {
+                    let SocketAddr::V4(client) = tcp.peer_addr().map_err(|e| e.to_string())? else {
+                        return Err("a client that is not IPv4 loopback".into());
+                    };
+                    let SocketAddr::V4(server) = local else {
+                        return Err("a listener that is not IPv4 loopback".into());
+                    };
+                    let worker = crate::hive::worker::pid_of(session, fence);
+                    match crate::hive_win::tcp_client_pid(client, server) {
+                        Some(pid) => held_by_daemon_or_worker(pid, daemon, worker),
+                        None => Err("a connection no process owns any more".into()),
+                    }
+                },
+            ))
+        }
+
+        /// Whether `pid` is `daemon`'s, or `worker`'s while one is up
+        /// (P8-2b-4): the comparison [`admit_daemon_or_live`] makes once it
+        /// has read `pid` off the connection and `worker` off
+        /// `worker::pid_of` — factored out, `pub(crate)`, so a test can
+        /// drive it with fabricated identities and no real connection at
+        /// all.
+        #[cfg(windows)]
+        pub(crate) fn held_by_daemon_or_worker(
+            pid: Own,
+            daemon: Own,
+            worker: Option<Own>,
+        ) -> Result<(), String> {
+            if pid == daemon || worker == Some(pid) {
+                Ok(())
+            } else {
+                Err(format!("pid {pid}, not this daemon or its worker"))
+            }
         }
 
         /// This daemon's identity, as a connection is asked for it: its
@@ -2638,8 +2703,13 @@ mod endpoint {
             unsafe { libc::geteuid() }
         }
 
-        /// The admit hook that serves `own` alone ([`daemon_admit`]'s, and a
-        /// test's for another identity).
+        /// The admit hook that serves `own` alone: Unix's [`daemon_admit`]
+        /// in production (a worker there already is the daemon's own
+        /// account, so this needs no [`held_by_daemon_or_worker`] of its
+        /// own); on Windows, where [`daemon_admit`] has its own OR-aware
+        /// hook since P8-2b-4, this is a test's only, for a single fixed
+        /// identity.
+        #[cfg(any(test, not(windows)))]
         pub(crate) fn admit_only(own: Own) -> Result<tunnel_core::flow_listener::Admit, String> {
             identifies()?;
             Ok(std::sync::Arc::new(
@@ -2655,12 +2725,13 @@ mod endpoint {
             ))
         }
 
-        /// Whether the connection `client` → `server` is `own`'s.
-        #[cfg(windows)]
+        /// Whether the connection `client` → `server` is `own`'s: a test's
+        /// only on Windows ([`admit_only`]'s own gate), `own` alone there
+        /// since no worker enters into a test built on it.
+        #[cfg(all(windows, test))]
         fn held_by_own(own: Own, client: SocketAddrV4, server: SocketAddrV4) -> Result<(), String> {
             match crate::hive_win::tcp_client_pid(client, server) {
-                Some(pid) if pid == own => Ok(()),
-                Some(pid) => Err(format!("pid {pid}, not this daemon")),
+                Some(pid) => held_by_daemon_or_worker(pid, own, None),
                 None => Err("a connection no process owns any more".into()),
             }
         }
