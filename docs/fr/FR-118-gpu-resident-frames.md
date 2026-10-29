@@ -211,7 +211,7 @@ flowchart LR
 | P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `zero_copy` / `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3), **P2-2 built** (§5.4), **P2-3 built** (§5.5); released in 0.4.181, first field run 2026-10-28 (§9.2) |
 | P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter. **The WGC arm + NVENC built 2026-10-28** (§5.6), released in 0.4.183 the same day. First field contact the same evening (§9.6): neo16 captures through the DXGI arm in SystemContext. **Field-verified 2026-10-29** (§9.7), on neo16 with its SystemContext swap off for the run: WGC + `av1_nvenc` at 2560×1600, readback + encode 18.26 → 5.14 and 5.23 ms a frame, the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame. The heartbeat's reason after an adoption (#3071) fixed 2026-10-29 (§5.7), field-verified on 0.4.186 the same day (§9.8, AC5). AMF not built: the measurement found no need for it |
 | P4 | Folded into P2 on 2026-10-27: it was the DXGI arm, which is where the first cell's hosts capture | — | → P2 |
-| P5 | macOS: IOSurface → VideoToolbox | the same; on a supervised Mac the root's values reach the GUI worker | **built 2026-10-29** (§5.8), chosen by open decision 6 the same day: VideoToolbox's CPU conversion is 70–87 % of its encode stage (§9.5). The display stream's IOSurface reaches `hevc_videotoolbox` and `h264_videotoolbox` as a CVPixelBuffer over the same memory, marked BT.601, because VideoToolbox converts an unmarked buffer with BT.709. Unreleased; its field run is AC7's |
+| P5 | macOS: IOSurface → VideoToolbox | the same; on a supervised Mac the root's values reach the GUI worker | **built 2026-10-29** (§5.8), chosen by open decision 6 the same day: VideoToolbox's CPU conversion is 70–87 % of its encode stage (§9.5). The display stream's IOSurface reaches `hevc_videotoolbox` and `h264_videotoolbox` as a CVPixelBuffer over the same memory, marked BT.601, because VideoToolbox converts an unmarked buffer with BT.709. Released in 0.4.187 and field-verified the same day on the MacBook (§9.9): the encode stage 4.18 → 0.12 ms a frame, the worker's CPU 14.58 → 2.55 and 2.60 ms an encoded frame, the frame rate unchanged |
 | P6 | Linux: the DRM arm's dma-buf → VAAPI | the same | **deferred** (open decision 6, 2026-10-29): VAAPI's conversion and upload are 1.2 ms of a 4.1 ms stage, on the one 1600×900 virtual desktop that runs it (§9.5) |
 | P7 | Docs and the final field table | — | **P2's half written** (2026-10-28): `docs/encoders.md` § GPU-resident frames and its two configuration rows, `docs/remote-control.md` §5.1f, and both index rows; each later cell adds its own. **P5's half written** 2026-10-29: the VideoToolbox rows in both docs |
 
@@ -605,9 +605,10 @@ flowchart LR
   `plan` without the `unproven` gate fails the gate test (`left: "gpu", right: "unproven"`); the candidates without
   the cell filter fail the phase test (`av1_videotoolbox` joins them). The readback test and the encode test pass
   under all four.
-- **Not yet:** the release, and AC7's field run: a Mac with the switch on and off, 20-minute legs on AC3's pattern,
-  read on capture + encode per frame, the worker's CPU per encoded frame, the frame rate, decode errors and the
-  pattern's colour.
+- **Released in 0.4.187 and field-verified** (§9.9, 2026-10-29): on the MacBook at 3024×1964, 20-minute legs on,
+  off, on. The encode stage falls 4.18 → 0.12 ms a frame and the worker's CPU 14.58 → 2.55 and 2.60 ms an encoded
+  frame. The frame rate is the same on both paths, so the surfaces held in flight cost no frames, and the deeper
+  queue stays unbuilt. No decode error, and the pattern decodes within 2 code values.
 
 ## 6. Acceptance criteria
 
@@ -671,7 +672,7 @@ flowchart LR
   switch off, the probe ran no `gpu` child (04:17:55Z, 04:30:56Z) and every session read
   `input_reason=switch_off`. With `zero_copy_deny = av1_qsv:gpu`, the probe's `gpu` child tried only `h264_qsv`
   (04:48:49Z) and an AV1 session read `input_reason=denied`.
-- [ ] **AC7 — every further cell, or its reason.** NVENC, AMF, the WGC arm, VideoToolbox and VAAPI are each
+- [x] **AC7 — every further cell, or its reason.** NVENC, AMF, the WGC arm, VideoToolbox and VAAPI are each
   field-verified like AC3, or deferred with the measurement that deferred them. *(P3 built the WGC arm and NVENC,
   2026-10-28 (§5.6), released in 0.4.183 the same day. AMF is not built: on the hybrid host that might have needed
   it, §9.4 measured the route through NVENC as cheap. An AMD-only host's AMF cells stay on CPU frames until a host
@@ -688,8 +689,17 @@ flowchart LR
   4.1 ms encode stage, on the one 1600×900 virtual desktop that runs it (§9.5).)* *(2026-10-29, §5.8: **VideoToolbox
   (P5) is built.** The display stream's IOSurface reaches `hevc_videotoolbox` and `h264_videotoolbox` with no CPU copy
   and no CPU conversion, and on the MacBook the test bars decode within 2 code values of the CPU path. Its field run
-  is owed, on a release that carries it.)*
-- [~] **AC8 — docs.** `docs/encoders.md` (the input path as a cell dimension, the switch, the denylist) and
+  is owed, on a release that carries it.)* *(2026-10-29, §9.9: **VideoToolbox is verified like AC3**, on agent
+  0.4.187 on the MacBook, `hevc_videotoolbox` at 3024×1964, 20-minute legs on, off, on. The encode stage 4.18 → 0.12
+  and 0.12 ms a frame; the worker's CPU 14.58 → 2.55 and 2.60 ms an encoded frame; the frame rate unchanged (median
+  87.8, 87.8, 88.0 fps); no decode error; keyframes 9, 11 and 5, every burst on both paths with the viewer
+  struggling or unexplained, so no rise with the switch on; the pattern within 2 code values of the CPU path, and
+  identical on both legs with the switch on. On this arm AC3's "capture + encode" is the frame period on both paths
+  (11.3 ms), because the capture stage waits for the display stream's next frame and holds the CPU path's copy; the
+  work per frame is read as the encode stage and the worker's CPU. **Met:** QSV (AC3), NVENC and the WGC arm (§9.7)
+  and VideoToolbox (§9.9) are verified; AMF (§9.4) and VAAPI (§9.5, open decision 6) are deferred with the
+  measurements that deferred them.)*
+- [x] **AC8 — docs.** `docs/encoders.md` (the input path as a cell dimension, the switch, the denylist) and
   `docs/remote-control.md` (the frame path, both arms, as the §4.6 mermaid diagram with the measured numbers).
   Linked from `docs/README.md`. *(P2's half written 2026-10-28: `encoders.md` § GPU-resident frames, with the
   input reasons and the configuration rows; `remote-control.md` §5.1f, with both arms' frame paths and the field
@@ -700,7 +710,10 @@ flowchart LR
   carry both arms with the measured numbers. **Not met:** the VideoToolbox and VAAPI rows, which follow their
   cells — AC7's unbuilt remainder. So `[~]`, not `[x]`.)* *(2026-10-29, P5: the VideoToolbox rows are written,
   in `encoders.md`'s GPU-input section and its configuration rows and in `remote-control.md` §5.1f, without field
-  numbers until AC7's run on a Mac.)*
+  numbers until AC7's run on a Mac.)* *(2026-10-29, §9.9: **met.** The VideoToolbox rows carry their field numbers:
+  `encoders.md` lists the cells as field-verified and released (0.4.187) with the measured split, and
+  `remote-control.md` §5.1f has the macOS table beside the WGC one. VAAPI's row is its deferral and the measurement
+  behind it, in `encoders.md`'s "Not built" bullet. Every cell is in them.)*
 
 ## 7. Open decisions
 
@@ -759,6 +772,7 @@ flowchart LR
 | 2026-10-29 | agents 0.4.183 (ON1) and 0.4.184 (OFF, ON2), neo16 with its SystemContext swap off for the run: WGC on the RTX 5090, `av1_nvenc` at 2560×1600 and 60 fps, a local pair, AC3's test pattern | **AC7's NVENC cell and the WGC arm, like AC3** (§9.7): 20-minute legs on, off, on. Readback + encode 18.26 → 5.14 and 5.23 ms a frame, `send_frame` 11.05 → 5.05 and 5.13 ms; the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame; the pattern identical on both paths; no decode error; every keyframe but one at an outside load spike on the host |
 | 2026-10-29 | agent 0.4.186, neo16 back on SystemContext with `zero_copy` on: the DXGI arm on the Radeon 610M, `av1_nvenc` on the RTX 5090; a local-pair session at 10:17Z | **AC5's field half** (§9.8). The session repeated §9.6: the refusal (`adapter_mismatch`), the follow's reopen, FR-119's replacement adopted. Every heartbeat read `input_reason=adapter_mismatch`, against `cpu_frames` on 0.4.183. #3071's fix (§5.7) held in the field |
 | 2026-10-29 | the P5 branch on the MacBook (Apple M5 Pro, macOS 27.0.1): `h264_videotoolbox` at 480×270, 20 frames per form, decoded by FFmpeg 9.0.1's H.264 decoder | **VideoToolbox's colour on the GPU form, measured for P5** (§5.8). Eight flat bars (black, white, grey, and 75 % red, green, blue, yellow, cyan) encoded by the CPU form and the GPU form, decoded, and compared per plane over a block inside each bar. An unmarked BGRA buffer converts with BT.709: worst plane 21 code values (75 % green Y 133 against 112). The session's `colorspace` / `color_range` tag the stream (`SMPTE170M`, limited range) and still convert with BT.709: worst 21. The BT.601 matrix attached to each buffer: worst 2.0 (75 % green U 74 against 72; white Y 234 against 235). A lab measurement, not field verification |
+| 2026-10-29 | agent 0.4.187, the MacBook (Apple M5 Pro, macOS 27.0.1, a supervised two-half Mac): the scrap arm's display stream at 3024×1964, `hevc_videotoolbox`, 120 fps asked; Chrome on neo16 over a direct path, hardware decode; AC3's test pattern full screen in Safari | **AC7's VideoToolbox cell, like AC3** (§9.9): 20-minute legs on, off, on. The encode stage 4.18 → 0.12 and 0.12 ms a frame (the conversion 3.27 → 0.04 and 0.03 ms); the worker's CPU 14.58 → 2.55 and 2.60 ms an encoded frame, 126 % → 22 % and 23 % of a core; the frame rate the same on both paths (median 87.8, 87.8, 88.0 fps); no decode error; keyframes 9, 11 and 5, no rise with the switch on; the pattern within 2 code values of the CPU path and identical on both legs with the switch on |
 
 ### 9.1 The interim split (2026-10-27)
 
@@ -1116,6 +1130,63 @@ The red run is §9.6, agent 0.4.183 (2026-10-28 21:11Z). The green run is the sa
   machine-global config, whose directory had no `peer-auth\`, so the daemon minted new device keys. Every browser
   that knew neo16 then refused its answer (`key-changed`, #3096). With the operator's agreement, neo16's original key
   was restored into the machine-global directory before this run.
+
+### 9.9 AC7: VideoToolbox on the MacBook (2026-10-29)
+
+The MacBook (Apple M5 Pro, macOS 27.0.1) is a supervised two-half Mac: the root daemon runs the overlay and SSH, and
+its GUI worker captures and encodes. Agent 0.4.187, which carries P5, was installed by the Mac's own update helper at
+20:17:58Z. The switch was set on the root half, and the supervisor handed it to the worker at each spawn
+(`ROOMLERD_ZERO_COPY=1`, then `=0`, then `=1`: P5's forwarding, `agents/roomlerd/src/macos_supervisor.rs:322`). At
+every start with the switch on, the probe's `gpu` child proved both forms (`GPU-input phase reported …
+proven=["hevc_videotoolbox", "h264_videotoolbox"]`, in 162–165 ms). The session ran `hevc_videotoolbox` at the
+panel's 3024×1964, 120 fps asked, to Chrome on neo16 over a direct path with hardware decode, `constrained=false`
+and a flat 104 Mbit/s target. The content was AC3's test pattern, full screen in Safari. The switch was flipped with
+`roomler config set zero_copy` and `roomler restart`, three legs back to back: on, off, on. Stage times are medians
+of the 2-second heartbeats. Worker CPU is the GUI worker's processor time (`ps -o time`) at each end of a leg, over
+the frames encoded in between.
+
+| Leg (UTC) | Switch | Input | Heartbeats | Encoded fps (median window; over the leg) | Capture | Encode | Convert | Submit | Capture + encode | Worker CPU (per encoded frame) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ON1 20:25:19–20:44:45 | on | `gpu` | 582 | 87.8; 86.1 | 11.22 | 0.12 | 0.04 | 0.05 | 11.34 | 22 % of a core (2.55 ms) |
+| OFF 21:16:15–21:36:15 | off | `cpu`, `switch_off` | 599 | 87.8; 86.4 | 7.18 | 4.18 | 3.27 | 0.87 | 11.34 | 126 % (14.58 ms) |
+| ON2 21:38:18–21:58:14 | on | `gpu` | 597 | 88.0; 87.0 | 11.21 | 0.12 | 0.03 | 0.05 | 11.32 | 23 % (2.60 ms) |
+
+- **On this arm capture + encode is the frame period.** The pump times the whole `next_frame()`
+  (`agents/roomlerd/src/peer.rs:7927`): the pacing gate's sleep, the capture thread polling the display stream every
+  2 ms until a new frame arrives (`agents/roomlerd/src/capture/scrap_backend.rs:554`), and on the CPU path the copy
+  of the 23.7 MB frame into memory (`:551`). At 88 fps the pump waits for the stream on both paths, so capture +
+  encode is 11.3 ms on both, and the time the GPU path saves goes into the wait. The work per frame is the encode
+  stage, which falls 4.18 → 0.12 ms (−97 %): the CPU conversion (3.27 ms) is gone, and so is FFmpeg's copy of the
+  NV12 frame into VideoToolbox's buffer, inside `send_frame` (0.87 → 0.05 ms). The copy in the capture stage has no
+  timer of its own; the worker's CPU counts it.
+- **The worker's CPU per encoded frame falls by 82 %**, 14.58 → 2.55 and 2.60 ms, at the same frame rate and bytes
+  (45–46 kB/s on every leg): 126 % of a core with the switch off, 22 % and 23 % with it on.
+- **The frame rate is the same on both paths**, so the surfaces held in flight (§5.8) cost no frames: the median
+  window reads 87.8, 87.8 and 88.0 fps, and the legs 86.1, 86.4 and 87.0. §5.8's remedy, a deeper queue under the
+  switch, stays unbuilt. Each leg had one stretch of 1.5–2 minutes at 72–76 fps with both hosts idle (ON1
+  20:30:42–20:32:33, OFF 21:27:25–21:28:47, ON2 21:55:13–21:56:58). It happened with the switch on and off alike, so
+  it comes from the stream or the content, not from the GPU path.
+- **Colour.** All 13 patches of the pattern (16×16 means, three reads 2 s apart, spread 0) decode to the same RGB on
+  both legs with the switch on, and within 2 code values of the CPU path: bar 5's red 186 against 184, bar 7's blue
+  192 against 190, the light grey 191 against 192, white 254 against 255. The bars decode desaturated on every leg,
+  as on neo16 (§9.7): the Mac's panel is colour-managed, and both paths capture the composed screen.
+- **Decode errors: none.** The viewer's console carried no decoder error or warning from 20:23Z to 21:58Z, and the
+  data channel stayed up in every leg.
+- **Keyframes: 9, 11 and 5; no rise with the switch on.** ON1: 7 in 20:29:02–20:30:02, a minute that ended with the
+  viewer reporting it was struggling (`viewer-rate fps cap … struggling=true` at 20:30:02; neo16's load was not
+  logged during ON1), and 2 at 20:38:34. OFF: 8 at 21:19:59–21:21:00, while other sessions' builds and a WSL job loaded neo16 and
+  the viewer reported struggling again, 3 at 21:22:24–21:22:26 with the viewer struggling, and 1 at 21:34:57. ON2: 2
+  at 21:39:58, while the Mac ran its own background malware scan at about a full core, and 3 for which neither side
+  logged a reason. No swaps, rebuilds or backpressure drops in any leg.
+- **A person at the Mac ended ON1 early.** At 20:44:47Z someone used the Mac's own keyboard or mouse (the worker's
+  keep-busy logged `paused_by="local"`), which took the pattern out of full screen. ON1 ends at 20:44:45, before it,
+  and the pattern was back in full screen before OFF.
+- **The supervised Mac carries the switch.** Before P5 the GUI worker never saw the root's `zero_copy` (§5.8). Here
+  the heartbeat read `input_path=gpu` with the switch on and `input_reason=switch_off` with it off, in the worker's
+  own sessions.
+
+**AC7's VideoToolbox cell: verified like AC3.** The Mac is back as it was: `zero_copy` cleared at 22:00Z, so the
+built-in default (off) applies.
 
 ## 10. Related
 
