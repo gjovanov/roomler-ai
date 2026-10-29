@@ -33,6 +33,13 @@ use std::time::{Duration, Instant};
 /// whether the child has exited.
 const EXIT_POLL: Duration = Duration::from_millis(20);
 
+/// One read's worth.
+const CHUNK: usize = 16 * 1024;
+
+/// The most chunks one drain takes before it hands back to the exit and
+/// deadline checks: 1 MiB, far more than a pipe holds.
+const DRAIN_CHUNKS: usize = 64;
+
 /// The highest descriptor [`inherit_only_stdio`] sweeps, whatever
 /// `RLIMIT_NOFILE` says. An unlimited soft limit must not cost a child
 /// billions of `fcntl` calls before it can exec.
@@ -123,11 +130,15 @@ impl<R: Read + AsRawFd> Stream<R> {
         self.pipe.as_ref().map(AsRawFd::as_raw_fd)
     }
 
-    /// Read whatever the pipe holds now, without waiting for more. The pipe is
-    /// dropped at EOF.
+    /// Read whatever the pipe holds now, without waiting for more, and at most
+    /// [`DRAIN_CHUNKS`] chunks, so a writer that never stops cannot keep the
+    /// caller from its exit and deadline checks. The pipe is dropped at EOF.
     fn drain(&mut self) -> io::Result<()> {
-        let mut chunk = [0u8; 16 * 1024];
-        while let Some(pipe) = self.pipe.as_mut() {
+        let mut chunk = [0u8; CHUNK];
+        for _ in 0..DRAIN_CHUNKS {
+            let Some(pipe) = self.pipe.as_mut() else {
+                return Ok(());
+            };
             // A pipe that polls readable has data or is at EOF, so this read
             // returns at once.
             if poll_readable(&[pipe.as_raw_fd()], Duration::ZERO)? == 0 {
@@ -352,6 +363,17 @@ mod tests {
         let out = output_bounded(&mut cmd, Duration::from_secs(10)).expect("ran");
         assert_eq!(out.stdout.len(), 300_000);
         assert!(out.status.success());
+    }
+
+    /// A child that writes without end is still stopped at its deadline: one
+    /// drain pass cannot keep the read from its deadline check.
+    #[test]
+    fn output_bounded_stops_an_endless_writer_at_its_deadline() {
+        let mut cmd = Command::new("yes");
+        let started = Instant::now();
+        let e = output_bounded(&mut cmd, Duration::from_millis(300)).expect_err("timed out");
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
