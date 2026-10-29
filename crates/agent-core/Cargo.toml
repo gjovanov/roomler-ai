@@ -94,3 +94,12 @@ optional = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# #3073's elevated test hardens from the daemon's position: it disables the
+# privileges that let icacls rewrite a DACL it has no access to, which a shell
+# may hand it enabled (AdjustTokenPrivileges, OpenProcessToken).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
