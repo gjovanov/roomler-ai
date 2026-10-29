@@ -3,7 +3,7 @@
 **Issue:** [#2941](https://github.com/gjovanov/roomler-ai/issues/2941) · **Status:** P2 merged 2026-10-27
 (#2999, master `ae5ca6f6e`), released in 0.4.180: the daemon compiles as one unit. Probe v3 measured −14.3 % /
 −30.5 % of its compile; 0.4.180's rehearsal reads −19 % / −12 % on the two Linux lanes, the only ones steady
-enough to read from one release (§8.1); every artifact is 3.2–7.8 % smaller, and its post-roll check passed; P1 (#2944) held, a draft · **Owner:** the agent's build shape (with FR-6 for the lane and
+enough to read from one release (§8.1); every artifact is 3.2–7.8 % smaller, and its post-roll check passed. AC1, read on three releases, is not met; by decision 8 (2026-10-28) it is now judged phase by phase on a same-runner A/B. P1 (#2944) held, a draft · **Owner:** the agent's build shape (with FR-6 for the lane and
 FR-90 P8 for Hive's crate) · **Anchors:** master `12a0edc81` (2026-10-26) unless a row says otherwise ·
 **Parent:** [FR-6](FR-6-ci-release-build-speed-slo.md) (#773), whose residual lever this is
 
@@ -588,10 +588,18 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1 — the release compiles shorter.** The rehearsal's MSI build step and `.pkg` build step are
-  each ≥ 30 % shorter than 0.4.173's rehearsal (13.8 min and 18.2 min for the whole build step on
-  0.4.171's; the daemon's lib + bin 494 s on Windows, 674–793 s on macOS) on three consecutive
-  releases, and each phase's same-runner A/B (§4) shows its own share.
+- [ ] **AC1 — the release compiles shorter.** The daemon's compile (lib + bin) is ≥ 30 % shorter on
+  Windows and on macOS, judged phase by phase on a same-runner A/B (§4: each phase's tree and its base
+  built back to back on one runner per OS), the phases' shares compounding. The release reading is
+  the sanity check: the rehearsal's MSI and `.pkg` build steps, read as codegen + bin per second of
+  the run's own front end beside the absolute codegen time (§8.1), must not show a regression the A/B
+  missed. *Reworded 2026-10-28 by decision 8 (b). As first written: the rehearsal's MSI build step
+  and `.pkg` build step each ≥ 30 % shorter than 0.4.173's rehearsal (13.8 min and 18.2 min for the
+  whole build step on 0.4.171's; the daemon's lib + bin 494 s on Windows, 674–793 s on macOS) on
+  three consecutive releases, and each phase's same-runner A/B (§4) shows its own share; the three
+  release readings with P2 are kept below. By the A/B so far, P2 gives −14.3 % on Windows and
+  −30.5 % on macOS (§2.4 v3): macOS is past 30 %, and Windows needs about another 18 % from the
+  phases after P2.*
   *P2's share, measured (§2.4 v3, 2026-10-27, the release runners, one per OS): the daemon's lib + bin
   719 → 617 s on Windows (−14.3 %), 977 → 679 s on macOS (−30.5 %). The release-side half — the
   rehearsal's MSI and `.pkg` build steps — is 0.4.180's and after; open until it is read off three.*
@@ -680,17 +688,17 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
    of both crates and move or de-generify what both instantiate); or an LTO re-measurement on
    today's tree (FR-6 P3e's +5 % thin-LTO finding is from the rc.363 tree, seven months and ×3.6
    lines ago).
-8. **How AC1 is read** (the operator, posed 2026-10-28). AC1 compares single release build steps
-   against 0.4.173's rehearsal, but one reading swings with the runner far more than a phase moves
-   it. The same work took 466–1,117 s on macOS across 33 builds (§8.1). Two consecutive rehearsals
-   put the MSI build step at 542 s (0.4.180) and 814 s (0.4.181): −22.9 % and then +15.8 % against
-   the baseline. The tree also grows from release to release. Options:
-   - (a) keep AC1 as written and read the median of the three;
-   - (b) judge each phase by its same-runner A/B (the probe, §2.4), keeping the release reading as a
-     sanity check with a normalised metric: codegen + bin per second of the run's own front end
-     (§8.1);
-   - (c) both.
-   Recommended: (b). It is the only reading that can tell a phase's share from runner noise.
+8. **How AC1 is read** — **decided 2026-10-28 (the operator): (b).** Each phase is judged by its
+   same-runner A/B (the probe, §2.4), and the release reading stays as a sanity check with a
+   normalised metric: codegen + bin per second of the run's own front end (§8.1), read beside the
+   absolute codegen time, since a fast front end alone inflates the ratio. AC1 is reworded to match
+   (§5). The reason: AC1 compared single release build steps against 0.4.173's rehearsal, and one
+   reading swings with the runner far more than a phase moves it. The same work took 466–1,117 s on
+   macOS across 33 builds (§8.1). Two consecutive rehearsals put the MSI build step at 542 s
+   (0.4.180) and 814 s (0.4.181): −22.9 % and then +15.8 % against the baseline. 0.4.183's rehearsal
+   and the reseed an hour later compiled the same code with the `.pkg` lib's codegen at 1,374 s and
+   713 s (§8). The tree also grows from release to release. The alternatives stay recorded: (a) keep
+   AC1 as written and read the median of the three; (c) both.
 
 ## 7. Out of scope
 
@@ -720,6 +728,8 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
 | 2026-10-28 01:35Z | 0.4.180's post-roll check (AC3, P2's half): the server's agent listing, exec, one remote-desktop session, an overlay ping, a tunnel request | 20 of 20 online agents in four orgs on 0.4.180; exec reads 0.4.180 on two Linux servers and two Windows corporate laptops; the session ran H.265 4:2:0 hardware (VAAPI), direct, 15 fps, ~17 ms, and was closed; overlay 3/3 at 31 ms; two SOCKS5 listeners returned 200 in 0.31–0.33 s |
 | 2026-10-28 04:06Z | AC1 read 2: 0.4.181's rehearsal (run 40627954705, `3d96ea216`), the second release with P2 | build steps: MSI 814 s, `.pkg` 884, `.deb` x86_64 490 and aarch64 500. Lib · bin · total: aarch64 463 · 4 · 467 s (front end 52 s), x86_64 447 · 1 · 448 (61), `.pkg` 797 · 4 · 801 (113), MSI 701 · 3 · 704. Against 0.4.180's rehearsal the Linux front ends ran 10–33 % slower and the macOS one 13 % slower; per second of front end the `.pkg` went 8.18 → 6.08. Runner noise swamps a single reading on every lane: decision 8 |
 | 2026-10-28 16:49Z | AC1 read 3: 0.4.182's rehearsal (run 40723384188, `ca5e34764`), the third release with P2 | build steps: MSI 814 s, `.pkg` 822, `.deb` x86_64 484 and aarch64 457. Lib · bin · total: aarch64 423 · 3 · 426 s (front end 46 s), x86_64 443 · 1 · 444 (63), `.pkg` 764 · 5 · 769 (92), MSI 715 · 3 · 718. The three reads' medians: MSI 814 s (+15.8 % against 0.4.173), `.pkg` 884 s (+7.0 %), so AC1 is not met. Against the 39 runs before P2, Linux keeps −18 % / −12 % while the MSI and `.pkg` sit at their old medians (decision 8) |
+| 2026-10-28 20:05Z | 0.4.183's rehearsal (run 40742354169, tree `7daedbf21ffd`) and its post-release reseed (run 40754452329, master `200a521c7`: the same code plus a docs commit), an hour apart | build steps on the rehearsal: MSI 614 s, `.pkg` 1,519 s (a new high), `.deb` x86_64 510 and aarch64 475. The `.pkg`'s lib codegen took **1,374 s** (front end 99 s) on the rehearsal and **713 s** (68 s) on the reseed; 0.4.182's was 672 s (92 s), and Linux codegen moved only +3 % / +8 %. A nearly 2× spread on one phase of identical work, read as runner noise. The reseed's `.pkg` built its dependencies cold, its seed past the cap (FR-6 wave 32), which can only have slowed it |
+| 2026-10-28 20:30Z | The operator decided 8: (b), each phase by its same-runner A/B, with the release reading as a normalised sanity check | recorded in §6; AC1 reworded in §5 (the first wording kept); #2941 comment 6479859634 carried the evidence |
 
 ### 8.1 Reading the release side (0.4.180)
 
