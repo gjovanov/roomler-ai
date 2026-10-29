@@ -204,7 +204,7 @@ prevent, and the guard re-asserts it on every tick.
 - A restart does not heal it: `purge_split_default` runs at boot, then the runtime re-installs from the persisted
   `overlay_exit_node`.
 - Reach: a Mac running the opt-in root daemon whose operator sets `overlay_exit_node`. The key is not in
-  `DesiredConfig` (`crates/remote_control/src/models.rs:2712`), so no server push can set it; a local
+  `DesiredConfig` (`crates/remote_control/src/models.rs:2723`), so no server push can set it; a local
   `sudo roomler config set` can, and so can an `exec` on the daemon's row. Once it lands, the control WS that the
   `exec` came in on is captured too, so the same channel cannot undo it.
 - `NetstackTun` inherits the same default. It installs no OS routes, so it cannot wedge, but `roomler status`
@@ -728,7 +728,7 @@ test of the SIGKILL property itself.
   two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1428-1494`): whether
   the lock screen's password field takes injected keys is not measured, so the chip claims neither way. At a prompt,
   as Windows does, as `rc:consent.pending{host_locked}`: the prompt's probe (`lock_state.rs:301-320`, read at
-  `signaling.rs:3892`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
+  `signaling.rs:3897`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
   Advisory only, never an input gate (FR-92's rule, `FR-92-keep-busy.md:53`), so the pump's overlay never sees it.
   Another user on the console (fast user switching) counts as locked: this session's screen is out of sight either
   way. The root half has no session to ask and says nothing; `ROOMLERD_LOCK_HINT=0` turns it off, as on Linux. Linux
@@ -1078,7 +1078,7 @@ model on Windows, so the three agree on what the mode means.
   must never see: it would ignore it and run the command as root. So the agent advertises `console-user` (every
   Unix build, never Windows), the policy `PUT` stores `console_user` off Windows only for an agent whose hello
   carried it, `authorize` checks the live connection, and the hub refuses to push the field to a connection
-  without the word (`hub.rs:3598`). SSH's half fails closed on its own: an older agent refuses the mode.
+  without the word (`hub.rs:3600`). SSH's half fails closed on its own: an older agent refuses the mode.
 
 **P5b (built).** P5a's field run found every session as a person starting in `/`, the daemon's directory, for
 `named` too, where sshd starts it in the home. Now the shell, an SSH command and `sftp` start in the person's home:
