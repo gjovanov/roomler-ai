@@ -624,6 +624,18 @@ The session reports which form it opened and why, on the heartbeat as
   WGC reads back off the pump's clock, so on this arm the comparison is
   readback + encode, not capture + encode. The pattern decodes identically on
   both paths.
+- **Measured on macOS with VideoToolbox**
+  ([FR-118 §9.9](fr/FR-118-gpu-resident-frames.md#99-ac7-videotoolbox-on-the-macbook-2026-10-29),
+  `hevc_videotoolbox` at 3024×1964 on an M5 Pro, the same pattern, 20-minute
+  legs on, off, on): the encode stage fell from 4.18 to 0.12 ms per frame,
+  because the CPU conversion and FFmpeg's copy into VideoToolbox's buffer are
+  gone, and the worker's CPU from 14.58 to 2.55 and 2.60 ms per encoded frame
+  (126 % of a core to 22 %). The frame rate is the same on both paths (88 fps),
+  so the surfaces the capture holds until VideoToolbox is done with them, out
+  of the display stream's queue of 3, cost no frames. The scrap arm's capture
+  stage waits for the stream's next frame, so capture + encode is the frame
+  period on both paths, and the comparison is the encode stage and the CPU.
+  The pattern decodes within 2 code values of the CPU path.
 - **WGC across adapters.** On a hybrid laptop whose panel is driven by the
   iGPU, WGC's device and the dGPU's encoder sit on different adapters. Measured
   on such a laptop
@@ -637,16 +649,16 @@ The session reports which form it opened and why, on the heartbeat as
   with both NVENC and QSV, a codec NVENC lacks opens on QSV on the other adapter
   and reads `adapter_mismatch`: CPU frames, the picture unchanged.
 - **Field-verified and released:** the QSV cell on the DXGI arm (0.4.181,
-  [FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28)) and
+  [FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28)),
   the NVENC cell on the WGC arm (0.4.183,
-  [FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29)).
-- **Built, not yet field-verified:** the VideoToolbox cells on macOS
-  ([FR-118 §5.8](fr/FR-118-gpu-resident-frames.md#58-p5--videotoolbox-takes-the-iosurface-as-built-2026-10-29)).
+  [FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29))
+  and the VideoToolbox cells on macOS (0.4.187,
+  [FR-118 §9.9](fr/FR-118-gpu-resident-frames.md#99-ac7-videotoolbox-on-the-macbook-2026-10-29);
+  as built:
+  [§5.8](fr/FR-118-gpu-resident-frames.md#58-p5--videotoolbox-takes-the-iosurface-as-built-2026-10-29)).
   On a Mac `input_path=gpu` means VideoToolbox converts the BGRA, for a frame
   in memory as well (the 2× CPU downscale's), which is copied once into a pool
-  buffer first. The capture holds a surface until VideoToolbox is done with
-  it, out of the display stream's queue of 3, so the field run reads the frame
-  rate with the switch on and off.
+  buffer first.
 - **Not built:** AMF — the measurement above
   ([FR-118 §9.4](fr/FR-118-gpu-resident-frames.md#94-wgc-across-adapters-for-p3-2026-10-28))
   made its route unnecessary on the hybrid host, so an AMD-only host's AMF cells
