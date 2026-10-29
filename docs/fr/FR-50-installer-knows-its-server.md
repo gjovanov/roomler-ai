@@ -19,13 +19,15 @@ script substitutes the default before the bytes leave the process.
 
 ## Root cause, with anchors
 
-`scripts/install.sh:63`
+*Anchors in this section: master `e49718946` (the claim). FR-50 shipped, and the code below moved since.*
+
+`scripts/install.sh:46`
 
 ```sh
 SERVER="https://roomler.ai"
 ```
 
-`scripts/install.ps1:78`
+`scripts/install.ps1:64`
 
 ```powershell
 [string]$Server = 'https://roomler.ai',

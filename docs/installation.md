@@ -183,8 +183,8 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3507`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3551`) |
-| `config::read_if_present` (`:3490`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3541`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3585`) |
+| `config::read_if_present` (`:3615`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
 flowchart TD
@@ -221,7 +221,7 @@ question; two moved to `read_if_present`.
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2609`, `:2631`), at the clean-run promotion
 (`record_clean_run_at`, `:2618`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4023`). Each save
+desktop app and the setup wizard all write it through `config::save` (`:4057`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -233,7 +233,7 @@ does not model:
   upgrade did not bring them back.
 
 Now `save` writes the struct **plus** every key of the file it replaces that this build
-ignores (`serialise_for`, `:3925`):
+ignores (`serialise_for`, `:3959`):
 
 | In the file being replaced | After the save |
 |---|---|
@@ -259,14 +259,14 @@ flowchart TD
 ```
 
 "Unknown" means exactly what this build's deserializer skipped: `serde_ignored` names the
-keys (`unknown_keys`, `:3765`). A key this build knows is written as this build read it: a
+keys (`unknown_keys`, `:3799`). A key this build knows is written as this build read it: a
 value a newer build wrote that this one cannot represent — `peer_auth = "enforce"`, read as
 `audit` (`:2780`) — is rewritten to that reading, for instance after a rollback. Only the keys
 the deserializer skipped are kept as written.
 
 ⚠️ **An array entry is found by its identity, never by its position** (`same_entry`,
-`:3832`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
-array (`entry_identity`, `:3816`), never one read off the entry on disk. A newer build's
+`:3866`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
+array (`entry_identity`, `:3850`), never one read off the entry on disk. A newer build's
 entry can carry a key that looks like an identity (an `id` on an org) which no entry this
 build writes has: keyed on it, the entry is found nowhere, and every key on it is lost, in
 exactly the array the merge exists for. Positions move: removing an org shifts the ones
@@ -287,16 +287,16 @@ keeps it with the new primary, as `preserve_operator_config` keeps every operato
 with the file.
 
 Two guards keep the worst case at the old behaviour. The merged text must read back and
-serialise to exactly what the struct alone would have written (`:3909`), so the merge can only
+serialise to exactly what the struct alone would have written (`:3943`), so the merge can only
 add what this build ignores and never change a key it knows. And any failure writes the struct
 alone, with a WARN that names the keys it could not keep.
 
-`load` names them once per process and file (`note_unknown_keys`, `:3993`), with WARN *"config
+`load` names them once per process and file (`note_unknown_keys`, `:4027`), with WARN *"config
 keys this build does not know: ignored here, and kept in the file through every save"* and the
 key paths. After a rollback, "my setting did nothing" has its answer in the log.
 
 `load`'s recovery keeps them too. It reinstates the `config.toml.prev` copy it loaded over a
-live file that does not parse, and names the copy as the base (`save_with_base`, `:4031`):
+live file that does not parse, and names the copy as the base (`save_with_base`, `:4065`):
 the keys to keep are the copy's, and the live file holds nothing a merge can read. Every
 other save reads the file it replaces, and one over a file that does not parse says so —
 WARN *"the config being replaced does not parse: keys this build does not know in it, if
@@ -1116,7 +1116,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1074` (the section) — `uninstall_linux` at `:1500`,
+`scripts/install.sh:1257` (the section) — `uninstall_linux` at `:1683`,
 `uninstall_macos` at `:1494`.
 
 ```mermaid
