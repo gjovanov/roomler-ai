@@ -622,9 +622,15 @@ The session reports which form it opened and why, on the heartbeat as
   forms, because a capture opens before the session's encoder exists. On a host
   with both NVENC and QSV, a codec NVENC lacks opens on QSV on the other adapter
   and reads `adapter_mismatch`: CPU frames, the picture unchanged.
-- **Not yet:** the NVENC cell's field run (P3 is unreleased), and AMF. The
-  measurement above made the AMF route unnecessary on the hybrid host, so an
-  AMD-only host's AMF cells stay on CPU frames until one needs them.
+- **Field-verified and released:** the QSV cell on the DXGI arm (0.4.181,
+  [FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28)) and
+  the NVENC cell on the WGC arm (0.4.183,
+  [FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29)).
+- **Not built:** AMF — the measurement above
+  ([FR-118 §9.4](fr/FR-118-gpu-resident-frames.md#94-wgc-across-adapters-for-p3-2026-10-28))
+  made its route unnecessary on the hybrid host, so an AMD-only host's AMF cells
+  stay on CPU frames until one needs them — and VideoToolbox (macOS) and VAAPI
+  (Linux), later phases.
 
 ## Configuration
 
