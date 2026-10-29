@@ -76,6 +76,8 @@ On a UDP-blocked, TLS-inspected network no TURN allocation answers (`TURN alloca
 | relayed | **no** | **on**, clamped by the existing guard | §2.4: the overlay is the only path |
 | unknown (an old daemon, no answer within the guard's 400 ms) | — | **off** | fail safe |
 
+With several viewer devices (FR-121 P3b: one relay per agent on the viewer's computer), the **best** of their carriers is the row, and a session on the mesh keeps every device on a worse link out of its ICE (§3.2).
+
 ```mermaid
 flowchart TD
     R["rc:request, policy rc_overlay = auto"] --> V{"carrier to the<br/>viewer's device<br/>(LocalAPI peers)"}
@@ -90,16 +92,16 @@ flowchart TD
 
 **As built in P1 (2026-10-28): the session decides at its offer, before ICE gathers, from three inputs. The peer then sees a plain on/off, filtered exactly as `on` and `off` always were.**
 
-- **The carrier.** The same LocalAPI `peers` call the relay-tier guard makes, bounded at 400 ms the same way, keyed by the viewer device's overlay address (`mesh_carrier_of`, `agents/roomlerd/src/rc_overlay.rs:245`). `Direct` reads direct. `Relay` and `Tunnel` read relayed. `Blocked`, `Offline` and no answer read unknown (`MeshCarrier`, `:203`).
-- **The viewer's device** (D3, option B): the **server names it** in `rc:request` (`RcOverlayAutoWire.viewer`, `crates/remote_control/src/signaling.rs:5513`). It is the `overlay_ip` of the loopback-relay descriptor the Hub hands the browser (FR-121, `resolve_local_relay`, `crates/modules/fleet/src/hub.rs:3388`), which the Hub has already checked lies in the overlay range.
+- **The carriers.** One LocalAPI `peers` call, the one the relay-tier guard makes, bounded at 400 ms the same way, read for each of the viewer's devices by its overlay address (`mesh_carriers_of`, `agents/roomlerd/src/rc_overlay.rs:298`). `Direct` reads direct. `Relay` and `Tunnel` read relayed. `Blocked`, `Offline` and no answer read unknown (`MeshCarrier`, `:245`). The best carrier among the viewer's devices decides. When the session rides the mesh, every device on a worse link stays out of its ICE (`exclude`, `:57`).
+- **The viewer's devices** (D3, option B): the **server names them** in `rc:request` (`RcOverlayAutoWire.viewers`, `crates/remote_control/src/signaling.rs:5522`). Each is the `overlay_ip` of a loopback-relay descriptor the Hub hands the browser (FR-121, `resolve_local_relay`, `crates/modules/fleet/src/hub.rs:3388`), which the Hub has already checked lies in the overlay range. Since FR-121 P3b there is one per agent on the viewer's computer, at most four. Windows and WSL each run a relay, and their mesh links can differ completely: on neo16 the Windows agent is direct to every peer while the WSL one rides DERP.
 - **Far TURN availability** (D5, alternative): also from the server, `RcOverlayAutoWire.far_turn`. It is true only when **both** devices' last netcheck reached the far TURN over UDP: `stun_udp`, and not `relay_band_udp: Some(false)` (`crates/remote_control/src/signaling.rs:5288`, `:5292`). `None` means not measured, and is read as "it works", so a relayed mesh stays off. #2781's viewer sits behind exactly such an egress drop, which the agent's own gathering could never see.
-- **Where it runs.** `RcOverlay::decide` (`rc_overlay.rs:94`), called by the `rc:sdp.offer` handler (`agents/roomlerd/src/signaling.rs:4078`). That handler also runs in a delegated macOS GUI worker. The inputs cross to that worker inside `RcOverlay`, which already carries the decision there, so whichever process builds the peer decides. The server sends the offer only after the request is answered, so the decision never races the consent.
+- **Where it runs.** `RcOverlay::decide` (`rc_overlay.rs:111`), called by the `rc:sdp.offer` handler (`agents/roomlerd/src/signaling.rs:4078`). That handler also runs in a delegated macOS GUI worker. The inputs cross to that worker inside `RcOverlay`, which already carries the decision there, so whichever process builds the peer decides. The server sends the offer only after the request is answered, so the decision never races the consent.
 
 ⚠️ **Why not the proposed defaults (decide while gathering, holding the overlay candidates).** Holding a candidate means gathering it, and webrtc-rs pairs every candidate it gathered, trickled or not. On a weak-host OS (Linux, macOS), checks from the overlay-bound host candidate to a browser's LAN address can come back over the mesh as a peer-reflexive pair. That would put the session on a relayed mesh exactly when `auto` had decided against it. Deciding before gathering keeps the proven `off` filters intact. It also needs no candidate buffering in `peer.rs` at all.
 
 ### 3.3 The policy on the wire
 
-`RcOverlay` (`rc_overlay.rs:34`) is resolved per session from the request (`RcOverlay::resolve_mode`, `:73`) and reaches a delegated worker in `SessionParams.rc_overlay` (`agents/roomlerd/src/delegate.rs:216`). `auto` travels beside the bool, as `rc_overlay_auto` next to `rc_overlay: false`, so an older reader sees the bool it understands (D1).
+`RcOverlay` (`rc_overlay.rs:34`) is resolved per session from the request (`RcOverlay::resolve_mode`, `:80`) and reaches a delegated worker in `SessionParams.rc_overlay` (`agents/roomlerd/src/delegate.rs:216`). `auto` travels beside the bool, as `rc_overlay_auto` next to `rc_overlay: false`, so an older reader sees the bool it understands (D1).
 
 As built, the Hub also sends `auto` only to an agent that advertises the `rc-overlay-auto` verb (`crates/remote_control/src/models.rs:1286`), as it sends `lock_on_end` only to one advertising `lock-on-end`. To any other agent the policy reads as `off`: no `rc_overlay_auto`, and no viewer relay handed out. That makes D1 hold on the server, not only in the older agent's parser. A device with the kill switch set stops advertising the verb (`agents/roomlerd/src/encode/caps.rs:2462`).
 

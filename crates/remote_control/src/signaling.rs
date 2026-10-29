@@ -5511,12 +5511,15 @@ pub struct FileNote {
 /// agent may lack; every one it lacks makes it more careful, never less.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct RcOverlayAutoWire {
-    /// The viewer's own device on the overlay: the `overlay_ip` of the
-    /// [`LocalRelayDescriptor`] the Hub handed the browser. The agent asks its
-    /// daemon which carrier holds that peer. `None` (the browser's device sent
-    /// no relay, or is in another network) = unknown, so off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub viewer: Option<String>,
+    /// The viewer's own devices on the overlay: the `overlay_ip` of each
+    /// [`LocalRelayDescriptor`] the Hub hands the browser, at most
+    /// [`LOCAL_RELAYS_MAX`] (FR-121 P3b: Windows and WSL on one computer each
+    /// run a relay). The agent asks its daemon which carrier holds each of
+    /// those peers; the best one decides, and a device behind a worse one is
+    /// left off. Empty (the browser's device sent no relay, or is in another
+    /// network) = unknown, so off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewers: Vec<String>,
     /// Whether BOTH ends' last netcheck reached the far TURN over UDP
     /// ([`CapVectorWire::stun_udp`] and not `relay_band_udp: Some(false)`).
     /// `Some(false)` makes a relayed mesh the only path (§2.4). `None` = not
@@ -9648,12 +9651,15 @@ mod tests {
         // false`, which is skipped: an agent that knows only `rc_overlay`
         // reads OFF, the policy default.
         let hints = RcOverlayAutoWire {
-            viewer: Some("100.65.4.33".into()),
+            viewers: vec!["100.65.4.33".into(), "100.65.4.40".into()],
             far_turn: Some(false),
         };
         let auto = serde_json::to_string(&req(false, Some(hints.clone()))).unwrap();
         assert!(auto.contains("\"rc_overlay_auto\":{"), "{auto}");
-        assert!(auto.contains("\"viewer\":\"100.65.4.33\""), "{auto}");
+        assert!(
+            auto.contains("\"viewers\":[\"100.65.4.33\",\"100.65.4.40\"]"),
+            "{auto}"
+        );
         assert!(
             !auto.contains("\"rc_overlay\":"),
             "an older agent reads off: {auto}"
