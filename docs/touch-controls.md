@@ -37,7 +37,7 @@ machine with its own tests).
 | a finger that moves more than 8 px | a left press where it landed, the moves, a release where it lifted ([`touchGestures.ts:37`](../ui/src/composables/touchGestures.ts#L37) `SLOP_PX`) |
 | a finger held still for 500 ms | a right click where it is ([`touchGestures.ts:39`](../ui/src/composables/touchGestures.ts#L39) `LONG_PRESS_MS`) |
 | two fingers lifted within 350 ms, unmoved | a right click between them ([`touchGestures.ts:42`](../ui/src/composables/touchGestures.ts#L42)) |
-| two fingers moving together | the wheel, one notch per 100 px the fingers travel. The picture follows the fingers, so fingers moving up scroll down. **While the picture is zoomed past the stage**, they pan the picture instead and a one-line hint says so; the host scrolls only once the picture fits (the operator's decision 4, 2026-10-17; [`RemoteControl.vue:3913`](../ui/src/views/remote/RemoteControl.vue#L3913) `onTwoFingerScroll`, [`touchInput.ts:104`](../ui/src/composables/touchInput.ts#L104) `pictureOverflows`) |
+| two fingers moving together | the wheel, one notch per 100 px the fingers travel. The picture follows the fingers, so fingers moving up scroll down. **While the picture is zoomed past the stage**, they pan the picture instead and a one-line hint says so; the host scrolls only once the picture fits (the operator's decision 4, 2026-10-17; [`RemoteControl.vue:3915`](../ui/src/views/remote/RemoteControl.vue#L3915) `onTwoFingerScroll`, [`touchInput.ts:104`](../ui/src/composables/touchInput.ts#L104) `pictureOverflows`) |
 | two fingers spreading or pinching | **nothing**: the viewer zooms its own picture around the point between the fingers |
 
 ```mermaid
@@ -59,7 +59,7 @@ stateDiagram-v2
 
 - **The zoom** switches the viewer to Custom zoom, starting from the size the picture is shown at, and scrolls
   the stage so the point between the fingers stays under them
-  ([`RemoteControl.vue:3885`](../ui/src/views/remote/RemoteControl.vue#L3885) `onPinchZoom`). Zooming
+  ([`RemoteControl.vue:3887`](../ui/src/views/remote/RemoteControl.vue#L3887) `onPinchZoom`). Zooming
   out and back in somewhere else is how a phone moves around a zoomed picture today (open decision 4 in the
   spec).
 - ⚠️ **The scroll goes out in whole steps.** The agent turns a `mouse_wheel` in pixels into wheel steps at
@@ -182,7 +182,7 @@ flowchart LR
   default is off.
 - **In fullscreen and in a zoomed picture.** The overlay lives inside the stage, which is the fullscreen
   element, and follows the stage's scroll, so it stays over the part of the picture on screen
-  ([`RemoteControl.vue:3869`](../ui/src/views/remote/RemoteControl.vue#L3869) `onStageScroll`).
+  ([`RemoteControl.vue:3871`](../ui/src/views/remote/RemoteControl.vue#L3871) `onStageScroll`).
 - ⚠️ **Alt+Tab is the host's own chord.** On a Windows host it opens the task switcher and moves the focus,
   as the physical keys do. On a Mac host it is Option+Tab, not the app switcher (Cmd+Tab). A preset binds
   the same keys whatever the host, so a Mac host gets a layout of its own from the editor (P4b-2), chosen
@@ -210,10 +210,10 @@ sequenceDiagram
 ```
 
 - **The data is the viewer's own preset**, stored as it is: rows of buttons, d-pads and sticks
-  ([`models.rs:5749`](../crates/remote_control/src/models.rs#L5749) `TouchPreset`). P4 adds one action
+  ([`models.rs:5816`](../crates/remote_control/src/models.rs#L5816) `TouchPreset`). P4 adds one action
   beside a chord of keys and a mouse button: a **macro**, a list of steps, each a key or a mouse button
   pressed, released or tapped, then a wait
-  ([`models.rs:5867`](../crates/remote_control/src/models.rs#L5867) `MacroStep`).
+  ([`models.rs:5934`](../crates/remote_control/src/models.rs#L5934) `MacroStep`).
 - **Who:** any member reads them, since every viewer in the org offers them. Writing takes `MANAGE_TENANT`,
   like the org's session policy, because a stored preset runs on every member's viewer
   ([`touch_presets.rs:88`](../crates/modules/remote/src/touch_presets.rs#L88) `list`,
@@ -223,13 +223,13 @@ sequenceDiagram
   is a 404 that leaks nothing
   ([`touch_presets.rs:152`](../crates/modules/remote/src/touch_presets.rs#L152) `update`,
   [`touch_presets.rs:185`](../crates/modules/remote/src/touch_presets.rs#L185) `delete`).
-- **Read strictly** ([`models.rs:5921`](../crates/remote_control/src/models.rs#L5921) `validate`). Each
+- **Read strictly** ([`models.rs:5988`](../crates/remote_control/src/models.rs#L5988) `validate`). Each
   refusal is a 422 with a code, and nothing is stored:
 
   | Refused | Code |
   |---|---|
   | an unknown field at any level, a key past a byte, a malformed body | `invalid_json` |
-  | a key the keyboard path cannot send: only the Keyboard/Keypad page's keys and its eight modifiers ([`models.rs:5896`](../crates/remote_control/src/models.rs#L5896) `touch_key_ok`) | `key_invalid` |
+  | a key the keyboard path cannot send: only the Keyboard/Keypad page's keys and its eight modifiers ([`models.rs:5963`](../crates/remote_control/src/models.rs#L5963) `touch_key_ok`) | `key_invalid` |
   | a name empty, over 48 characters or with a control character | `name_empty`, `name_invalid` |
   | a label over 16 characters, an id over 32 or repeated within the preset | `label_invalid`, `id_invalid`, `id_duplicate` |
   | no controls or more than 24, an empty row or one of more than 12 buttons, a chord of more than 4 keys | `no_controls`, `too_many_controls`, `row_buttons`, `chord_keys` |
@@ -246,9 +246,9 @@ sequenceDiagram
 
 - **Offered under "Your organization"** in the on-screen controls menu, below the built-ins, once the
   session connects on a device that offers the controls
-  ([`RemoteControl.vue:3775`](../ui/src/views/remote/RemoteControl.vue#L3775) `orgTouchList`). Any member's
+  ([`RemoteControl.vue:3777`](../ui/src/views/remote/RemoteControl.vue#L3777) `orgTouchList`). Any member's
   viewer fetches them
-  ([`agents.ts:1462`](../ui/src/stores/agents.ts#L1462) `fetchOrgTouchPresets`). An older server without
+  ([`agents.ts:1472`](../ui/src/stores/agents.ts#L1472) `fetchOrgTouchPresets`). An older server without
   the route, or any error, means none, and the built-ins are offered as before.
 - **Under their own ids.** An org preset is `org:<its server id>`
   ([`touchControls.ts:230`](../ui/src/composables/touchControls.ts#L230) `ORG_PRESET_PREFIX`), so it can
@@ -289,7 +289,7 @@ layout:
 |---|---|---|
 | **Built-in** | nobody: **Copy** makes it a draft of the member's own | the build |
 | **This browser** | the member, with no permission (decision 6, settled as recommended on 2026-10-18) | `localStorage['roomler-rc-touch-presets:<user id>']`, per user ([`touchPresetEdit.ts:251`](../ui/src/composables/touchPresetEdit.ts#L251) `readMyPresets`) |
-| **Your organization** | an org admin (`MANAGE_TENANT`); anyone else sees it read-only and may copy it ([`TouchPresetEditor.vue:399`](../ui/src/components/remote/TouchPresetEditor.vue#L399) `readOnly`) | the server, P4a's routes ([`agents.ts:1481`](../ui/src/stores/agents.ts#L1481) `saveOrgTouchPreset`) |
+| **Your organization** | an org admin (`MANAGE_TENANT`); anyone else sees it read-only and may copy it ([`TouchPresetEditor.vue:399`](../ui/src/components/remote/TouchPresetEditor.vue#L399) `readOnly`) | the server, P4a's routes ([`agents.ts:1491`](../ui/src/stores/agents.ts#L1491) `saveOrgTouchPreset`) |
 
 - **A draft is checked against the server's own rules before it is saved anywhere**
   ([`touchPresetEdit.ts:104`](../ui/src/composables/touchPresetEdit.ts#L104) `validatePreset`), with the
