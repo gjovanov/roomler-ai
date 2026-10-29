@@ -2957,16 +2957,11 @@ impl VideoEncoder for FfmpegEncoder {
         // FR-62 A1 — the HRD/VBV reservoir this move should size to. Pre-A1 the
         // NVENC arm wrote `rc_buffer_size = target` (a 1× window, silently
         // resizing the reservoir on every move); with the flag ON both in-place
-        // arms size it to the window the session opened with. Flag OFF keeps the
-        // 1× write so a flag-OFF session is byte-for-byte the pre-A1 behaviour.
-        let bufsize = if self.inplace_rate {
-            // Exactly the open sizing (`open_hrd_pct`), which on a constrained
-            // session is deliberately < 1× — matching it is the point; a
-            // `.max(target)` floor here would re-create the pre-A1 divergence.
-            (target.saturating_mul(self.hrd_pct) / 100).max(1)
-        } else {
-            target
-        };
+        // arms size it to the window the session opened with (`open_hrd_pct`).
+        // Flag OFF keeps the 1× write so a flag-OFF session is byte-for-byte the
+        // pre-A1 behaviour — `encode::inplace_rate_bufsize` pins both arms in
+        // the ungated lane (AC5).
+        let bufsize = crate::encode::inplace_rate_bufsize(target, self.hrd_pct, self.inplace_rate);
 
         match self.rate_mode {
             RateReconfig::InPlaceVbr => {

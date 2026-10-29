@@ -6248,10 +6248,9 @@ async fn encoder_reconfigure_sweep_cmd(
         enc.set_bitrate(target);
         let set_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        let mut key_on_change = 0u32;
-        let mut key_periodic = 0u32;
         let mut sizes: Vec<usize> = Vec::with_capacity(frames_per_rung as usize);
-        for f in 0..frames_per_rung {
+        let mut keys: Vec<bool> = Vec::with_capacity(frames_per_rung as usize);
+        for _ in 0..frames_per_rung {
             let packets = enc.encode(make_frame(frame_n)).await?;
             frame_n += 1;
             let mut frame_bytes = 0usize;
@@ -6260,20 +6259,20 @@ async fn encoder_reconfigure_sweep_cmd(
                 frame_bytes += p.data.len();
                 frame_is_key |= p.is_keyframe;
             }
-            if frame_is_key {
-                // Frame 0 of a rung right after `set_bitrate` = the rate change
-                // forced it; any later keyframe is the encoder's periodic GOP.
-                // (The warm-up rung's frame 0 is the genuine opening IDR.)
-                if f == 0 {
-                    if ri != 0 {
-                        key_on_change += 1;
-                    }
-                } else {
-                    key_periodic += 1;
-                }
-            }
             sizes.push(frame_bytes);
+            keys.push(frame_is_key);
         }
+        // The rate change forced the keyframe on the rung's FIRST OUTPUT frame
+        // (`sweep_attribute_idrs`). Rung 0 re-applies the warm-up rate, so a
+        // keyframe there is the encoder's own GOP, never rate-caused.
+        let (key_on_change, key_periodic) = {
+            let (rate, periodic) = sweep_attribute_idrs(&sizes, &keys);
+            if ri == 0 {
+                (0, periodic + rate)
+            } else {
+                (rate, periodic)
+            }
+        };
         let mean_bytes = sizes.iter().sum::<usize>() as f64 / sizes.len().max(1) as f64;
         let first3_max = sizes.iter().take(3).copied().max().unwrap_or(0);
         // Mean of the last few frames of the rung — the settled size the burst
@@ -6317,7 +6316,12 @@ async fn encoder_reconfigure_sweep_cmd(
             }
         })
         .fold(0.0, f64::max);
-    let pass = total_idr == 0 && max_set_ms < 5.0 && worst_ratio_dev <= 0.25 && worst_burst <= 2.0;
+    let (pass, basis) = sweep_verdict(backend, total_idr, max_set_ms, worst_ratio_dev, worst_burst);
+    let tracking_note = if basis == SWEEP_BASIS_CBR {
+        "want ≤0.25 / ≤2"
+    } else {
+        "informational on this backend: quality-driven, sits under the cap"
+    };
 
     if json {
         let rungs_json: Vec<String> = rows
@@ -6330,7 +6334,7 @@ async fn encoder_reconfigure_sweep_cmd(
             })
             .collect();
         println!(
-            "ROOMLER_A0_JSON:{{\"backend\":\"{backend}\",\"codec\":\"{actual_codec}\",\"w\":{w},\"h\":{h},\"fpr\":{frames_per_rung},\"constrained\":{constrained},\"total_rate_idr\":{total_idr},\"total_periodic_idr\":{total_periodic},\"max_set_ms\":{max_set_ms:.3},\"worst_ratio_dev\":{worst_ratio_dev:.3},\"worst_burst\":{worst_burst:.3},\"pass\":{pass},\"rungs\":[{}]}}",
+            "ROOMLER_A0_JSON:{{\"backend\":\"{backend}\",\"codec\":\"{actual_codec}\",\"w\":{w},\"h\":{h},\"fpr\":{frames_per_rung},\"constrained\":{constrained},\"total_rate_idr\":{total_idr},\"total_periodic_idr\":{total_periodic},\"max_set_ms\":{max_set_ms:.3},\"worst_ratio_dev\":{worst_ratio_dev:.3},\"worst_burst\":{worst_burst:.3},\"pass\":{pass},\"basis\":\"{basis}\",\"rungs\":[{}]}}",
             rungs_json.join(",")
         );
     } else {
@@ -6354,7 +6358,7 @@ async fn encoder_reconfigure_sweep_cmd(
             );
         }
         println!(
-            "VERDICT: {} — rate-caused IDRs={total_idr} (want 0), periodic GOP IDRs={total_periodic} (informational), max set_ms={max_set_ms:.2} (want <5), worst |ratio-1|={worst_ratio_dev:.2} (want ≤0.25), worst burst={worst_burst:.2} (want ≤2)",
+            "VERDICT: {} [{basis}] — rate-caused IDRs={total_idr} (want 0), periodic GOP IDRs={total_periodic} (informational), max set_ms={max_set_ms:.2} (want <5), worst |ratio-1|={worst_ratio_dev:.2}, worst burst={worst_burst:.2} ({tracking_note})",
             if pass {
                 "PASS (in-place capable)"
             } else {
@@ -6363,6 +6367,69 @@ async fn encoder_reconfigure_sweep_cmd(
         );
     }
     Ok(())
+}
+
+/// FR-62 A0 — the sweep's verdict basis for a CBR backend: the tracking signals
+/// (bytes-per-frame ratio, burst) gate the verdict too.
+const SWEEP_BASIS_CBR: &str = "idr+apply+tracking";
+/// FR-62 A0 — the verdict basis for every other backend: the content-independent
+/// signals only (no rate-caused IDR, apply under 5 ms).
+const SWEEP_BASIS_FREE: &str = "idr+apply";
+
+/// FR-62 A0 — attribute one rung's keyframes. The rate change forced the
+/// keyframe on the FIRST FRAME THAT PRODUCED OUTPUT after `set_bitrate`; every
+/// later keyframe is the encoder's own GOP. The earlier rule keyed on frame 0,
+/// which is right for a backend that answers a frame on the call that fed it
+/// (NVENC, `delay=0`) and wrong for one with a frame of output latency: AMF
+/// (`query_timeout=1`) returns nothing for the frame that fed the rebuilt
+/// encoder and its IDR on the next call, so the Radeon 610M read of 2026-10-29
+/// filed one "periodic" IDR on every one of the 20 rungs and reported
+/// `total_rate_idr: 0` for a backend that rebuilds on every move.
+fn sweep_attribute_idrs(sizes: &[usize], keys: &[bool]) -> (u32, u32) {
+    let first_output = sizes.iter().position(|&b| b > 0);
+    let mut rate = 0u32;
+    let mut periodic = 0u32;
+    for (f, &key) in keys.iter().enumerate() {
+        if !key {
+            continue;
+        }
+        if Some(f) == first_output {
+            rate += 1;
+        } else {
+            periodic += 1;
+        }
+    }
+    (rate, periodic)
+}
+
+/// FR-62 A0 — the sweep's verdict, per backend. The content-independent
+/// signals (no rate-caused IDR, apply under 5 ms) gate every backend. The
+/// tracking signals (bytes-per-frame ratio within ±25 %, burst at most 2×) gate
+/// only a backend that runs CBR — QSV, whose `select_rc_mode` takes the CBR
+/// branch because the session opens with `rc_max_rate == bit_rate`, so every
+/// frame is `target ÷ fps ÷ 8` bytes by contract. NVENC (cq-VBR, `bit_rate = 0`),
+/// AMF (`vbr_latency` with a fixed QP), D3D12, Vulkan, VAAPI and VideoToolbox
+/// open quality-driven under a maxrate cap and sit far below it on compressible
+/// content: the RTX read of 2026-09-02 printed `pass: false` on a 0.985 ratio
+/// deviation and a 623-byte "burst" with 0/20 IDRs and a 0.004 ms apply — the
+/// verdict backwards on the only two numbers that are content-independent.
+/// Returns the verdict and the basis it was reached on.
+fn sweep_verdict(
+    backend: &str,
+    total_rate_idr: u32,
+    max_set_ms: f64,
+    worst_ratio_dev: f64,
+    worst_burst: f64,
+) -> (bool, &'static str) {
+    let free = total_rate_idr == 0 && max_set_ms < 5.0;
+    if backend.contains("qsv") {
+        (
+            free && worst_ratio_dev <= 0.25 && worst_burst <= 2.0,
+            SWEEP_BASIS_CBR,
+        )
+    } else {
+        (free, SWEEP_BASIS_FREE)
+    }
 }
 
 /// `capture-smoke` CLI dispatch — "does screen capture work on this host,
@@ -6965,6 +7032,66 @@ mod tests {
     //! hands.
 
     use super::*;
+
+    /// FR-62 A0 — the rung attribution keys on the first OUTPUT frame, so a
+    /// backend with a frame of output latency (AMF) still has its rebuild IDR
+    /// counted as rate-caused, and a frame-0 backend (NVENC) reads as before.
+    #[test]
+    fn sweep_attributes_the_idr_on_the_first_output_frame() {
+        // NVENC shape: output on frame 0, keyframe there → rate-caused.
+        assert_eq!(
+            sweep_attribute_idrs(&[2400, 200, 210, 190], &[true, false, false, false]),
+            (1, 0)
+        );
+        // AMF shape (the Radeon 610M read): frame 0 produced nothing, the
+        // rebuilt encoder's IDR came out on frame 1 → rate-caused, not periodic.
+        assert_eq!(
+            sweep_attribute_idrs(&[0, 5409, 627, 600], &[false, true, false, false]),
+            (1, 0)
+        );
+        // A keyframe after the first output frame is the encoder's own GOP.
+        assert_eq!(
+            sweep_attribute_idrs(&[2400, 200, 2300, 190], &[true, false, true, false]),
+            (1, 1)
+        );
+        assert_eq!(
+            sweep_attribute_idrs(&[300, 200, 2300, 190], &[false, false, true, false]),
+            (0, 1)
+        );
+        // No keyframe at all, and a rung that produced no output at all.
+        assert_eq!(sweep_attribute_idrs(&[200, 200], &[false, false]), (0, 0));
+        assert_eq!(sweep_attribute_idrs(&[0, 0], &[false, false]), (0, 0));
+    }
+
+    /// FR-62 A0 — the verdict gates every backend on the content-independent
+    /// signals and only a CBR backend (QSV) on the tracking ones.
+    #[test]
+    fn sweep_verdict_gates_tracking_only_for_cbr_backends() {
+        // The RTX read: 0/20 IDRs, 0.004 ms, ratio deviation 0.985, burst 3.175.
+        assert_eq!(
+            sweep_verdict("hevc_nvenc", 0, 0.004, 0.985, 3.175),
+            (true, SWEEP_BASIS_FREE)
+        );
+        // The Radeon 610M read, attributed: 20 rate-caused IDRs, 55 ms rebuilds.
+        assert_eq!(
+            sweep_verdict("hevc_amf", 20, 55.512, 0.980, 19.128),
+            (false, SWEEP_BASIS_FREE)
+        );
+        // A rebuild that is fast still fails on the IDR; an IDR-free apply that
+        // is slow still fails on the apply.
+        assert!(!sweep_verdict("hevc_d3d12va", 20, 42.0, 0.1, 1.0).0);
+        assert!(!sweep_verdict("hevc_videotoolbox", 0, 12.0, 0.1, 1.0).0);
+        // QSV is CBR: the ratio and the burst gate it too.
+        assert_eq!(
+            sweep_verdict("hevc_qsv", 0, 0.5, 0.1, 1.5),
+            (true, SWEEP_BASIS_CBR)
+        );
+        assert!(!sweep_verdict("hevc_qsv", 0, 0.5, 0.4, 1.5).0);
+        assert!(!sweep_verdict("av1_qsv", 0, 0.5, 0.1, 2.5).0);
+        // The Iris Xe rebuild arm: 20/20 IDRs, 2.17 s applies.
+        assert!(!sweep_verdict("hevc_qsv", 20, 2166.1, 0.2, 5.6).0);
+    }
+
     /// FR-21 P3 (D1) — the acceptance case taken from the LIVE fleet, not invented.
     /// The three cluster nodes each carried these exact four entries in an
     /// operator-authored `/etc/systemd/system/roomlerd.service.d/virtual-desktop.conf`,
