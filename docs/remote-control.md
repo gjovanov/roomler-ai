@@ -210,7 +210,7 @@ This hybrid is exactly the `WorkerPool + RoomManager` pattern already in roomler
 
 ### 4.4 Whether a session may ride the overlay (#1882)
 
-A session's ICE can find a pair over the WireGuard **overlay**, not just over the LAN, a direct path or TURN. That needs only the controller's browser to run on an overlay node, which an operator's laptop usually is. Whether that is allowed is **the device's call**: `AccessPolicy.rc_overlay`, set per device on the **Devices** page ("Remote desktop over the mesh" on the device's row), **off by default**.
+A session's ICE can find a pair over the WireGuard **overlay**, not just over the LAN, a direct path or TURN. That needs only the controller's browser to run on an overlay node, which an operator's laptop usually is. Whether that is allowed is **the device's call**: `AccessPolicy.rc_overlay`, set per device on the **Devices** page (**Mesh: off / auto / on** on the device's row), **off by default**. FR-128's `auto` lets each session decide for itself ([below](#auto-the-session-decides-fr-128)).
 
 **Why off.** A session on the overlay inherits the overlay's failure modes, and its carrier is invisible to rate control:
 
@@ -240,7 +240,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 | How the overlay gets in | Filter (off) | Where |
 |---|---|---|
 | A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:386` |
-| An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:409`, `crates/modules/fleet/src/hub.rs:1793` |
+| An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:409`, `crates/modules/fleet/src/hub.rs:1825` |
 | A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1515`, `peer.rs:1557`, `peer.rs:1483` |
 
 "Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2148`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
@@ -260,6 +260,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 |---|---|---|
 | Older (no field) | New | Absent reads **off** (`signaling.rs:3449`, `serde(default)`) |
 | New | Older | The old agent ignores the field and keeps its old behaviour, except the loopback-TURN relay, which the Hub now withholds |
+| New, policy `auto` (FR-128) | Older than `rc-overlay-auto` | The Hub reads `auto` as `off` for it: no `rc_overlay_auto`, and no relay handed out |
 | Cross-pod | | The relay envelope carries `rc_overlay`; absent reads **off** |
 
 **What "off" does not cover.** It keeps overlay addresses out of the session; it does not override the host's own routing. A controller host using an **exit node**, or a route the mesh advertises for the browser's LAN (a **subnet router**), still sends ordinary internet or LAN traffic through the mesh. That traffic is the host's routing choice, not an overlay candidate.
@@ -291,8 +292,8 @@ flowchart TD
 |---|---|
 | that the agent decides at all | the `rc-overlay-auto` verb in `AgentCaps.rpc` (`crates/remote_control/src/models.rs:1286`), advertised while the kill switch is on (`agents/roomlerd/src/encode/caps.rs:2462`). The Hub sends `auto` to no other agent |
 | that the policy is `auto` | `rc:request`'s `rc_overlay_auto`, sent with `rc_overlay: false`, so an agent older than the field reads off (`crates/remote_control/src/signaling.rs:3457`) |
-| the viewer's devices | `RcOverlayAutoWire.viewers` (`crates/remote_control/src/signaling.rs:5522`): the `overlay_ip` of every loopback relay the Hub hands the browser, at most `LOCAL_RELAYS_MAX`, since FR-121 P3b hands over one relay per agent on the viewer's computer |
-| the far TURN | `RcOverlayAutoWire.far_turn`: both ends' last netcheck (`stun_udp`, `relay_band_udp`). `None` = not measured, read as usable |
+| the viewer's devices | `RcOverlayAutoWire.viewers` (`crates/remote_control/src/signaling.rs:5522`): the `overlay_ip` of every loopback relay the Hub hands the browser, at most `LOCAL_RELAYS_MAX`, since FR-121 P3b hands over one relay per agent on the viewer's computer. The Hub fills it from the relays in the overlay range (`rc_overlay_auto_wire`, `crates/modules/fleet/src/hub.rs:144`) |
+| the far TURN | `RcOverlayAutoWire.far_turn`: both ends' last netcheck (`stun_udp`, `relay_band_udp`), read by the server (below). `None` = not measured, read as usable |
 | the carriers | `mesh_carriers_of` (`agents/roomlerd/src/rc_overlay.rs:298`), one LocalAPI `peers` call for every viewer device: `Direct` direct, `Relay`/`Tunnel` relayed, anything else unknown. The best of them decides |
 | the rule | `auto_allows` (`rc_overlay.rs:280`) |
 
@@ -301,7 +302,30 @@ Notes on the implementation:
 - **A viewer device on a worse link stays off** (`exclude`, `rc_overlay.rs:57`). One computer can run several agents, each with its own relay: Windows and WSL, where the Windows agent is direct to its peers and the WSL one rides DERP (FR-121 P3b). A session that rides the mesh through the best one keeps every other one out of its ICE servers, its remote candidates and the offer's SDP. Otherwise ICE, which ranks relays by the order of their TURN servers, could pick the relay behind DERP.
 - **It logs one line:** `rc ICE: overlay auto (FR-128) — the session may ride the mesh` (or `stays off`), with `viewers`, `carriers`, `far_turn`, `allow` and `exclude`.
 - **Kill switch:** `ROOMLERD_RC_OVERLAY_AUTO=0` (`rc_overlay.rs:66`) makes `auto` behave as `off`. The device then stops advertising `rc-overlay-auto`, so the Hub reads its policy as `off` too.
-- **Status:** the agent half shipped first. Until a server sends `rc_overlay_auto` (FR-128 P2: the Off / Auto / On control on the device row), no session takes this path.
+
+**How the server feeds it.** The device row stores `auto` in a field of its own, `AccessPolicy.rc_overlay_auto` (`crates/remote_control/src/models.rs:1623`), beside `rc_overlay`. A pod or a page older than the field therefore reads `off`, never a row it cannot parse. On the **Devices** page it is the middle choice of **Mesh: off / auto / on** (`ui/src/components/admin/devicePolicy.ts:82`).
+
+```mermaid
+flowchart LR
+    P["AccessPolicy<br/>rc_overlay / rc_overlay_auto"] --> M["rc_overlay_mode()<br/>on wins, then auto"]
+    M --> G["authz gate<br/>far_turn_hint, ≤500 ms"]
+    G -->|"asks"| K["hook far_turn_udp<br/>network: both nodes' netcheck"]
+    G -->|"Auto { far_turn }"| H["Hub dispatch<br/>effective_rc_overlay"]
+    G -->|"other pod"| X["relay envelope<br/>rc_overlay_auto + rc_overlay_far_turn"]
+    X --> H
+    H -->|"agent says rc-overlay-auto"| A["rc:request: rc_overlay false +<br/>rc_overlay_auto { viewers, far_turn };<br/>every relay goes to both ends"]
+    H -->|"agent does not"| O["read as off: no rc_overlay_auto,<br/>relay refused rc_overlay_off"]
+```
+
+- **The mode** is `RcOverlayMode` (`models.rs:1653`). `rc_overlay_mode()` (`:1701`) reads `on` first, then `auto`, else `off`, the same order the page uses.
+- **The far-TURN hint** comes from the authz gate (`far_turn_hint`, `crates/modules/remote/src/controller.rs:684`). It asks the hook registry (`far_turn_udp`, `crates/core/src/hooks.rs:186`), and `network` answers from both devices' live overlay nodes, behind the same 60-minute freshness gate every consumer uses (`crates/modules/network/src/hooks.rs:109`).
+  - The rule is `far_turn_verdict` (`:135`): either end measured dead is `false`; both measured alive is `true`; anything else is not measured.
+  - The gate waits at most 500 ms, then sends no hint. A slow read costs the hint, never the session.
+- **Which device is the viewer's** follows the Hub's own precedence (`viewer_device_of`, `controller.rs:663`): a probed descriptor's device wins over a named one.
+- **The Hub** reads `auto` as `off` for an agent that does not advertise `rc-overlay-auto` (`effective_rc_overlay`, `crates/modules/fleet/src/hub.rs:2767`). It decides this once per request, for the relay and the session alike.
+- **Under `auto` the Hub hands out the browser's relays** to both ends, as under `on` (`resolve_local_relay`, `hub.rs:3461`; `forward_offer`, `:2316`). The agent may yet take them, and it filters out itself whichever it leaves off the mesh.
+- **Across pods** the relay envelope carries `rc_overlay_auto` and `rc_overlay_far_turn` beside the bool (`rc_overlay_to_relay`, `crates/modules/remote/src/relay.rs:585`; `rc_overlay_from_relay`, `:598`). An older pod reads only the bool, so `auto` reaches it as `off`.
+- **Status:** the agent (P1) and the server and page (P2) are built. A session takes this path once an agent from the release carrying P1 meets a server image carrying P2.
 
 > ⚠️ **Never "decide while gathering" by holding overlay candidates back.** A candidate that is held has still been gathered, and webrtc-rs pairs every gathered candidate. On a weak-host OS, checks from the overlay-bound socket to a browser's LAN address can come back over the mesh as a peer-reflexive pair. The session would then ride a relayed mesh exactly when `auto` had said no.
 
@@ -334,10 +358,11 @@ flowchart TD
 
 Chrome gates only the second. A public page's WebRTC reaches a TURN server on 127.0.0.1 without the permission
 (FR-121 P0, measured on Chrome 155). The Hub hands a named device's relay over only to its owner, for a target in the
-same organization whose `rc_overlay` is on, and otherwise answers `local_relay_refused`: `not_your_device`,
+same organization whose `rc_overlay` is on, or `auto` on an agent that decides it (FR-128), and otherwise answers
+`local_relay_refused`: `not_your_device`,
 `other_network`, `device_offline`, `rc_overlay_off` or `same_device` (`resolve_local_relay`,
-`crates/modules/fleet/src/hub.rs:3388`). The report lives in the Hub's memory with the agent's connection
-(`set_agent_local_relay`, `crates/modules/fleet/src/hub.rs:3369`) and is never stored. ⚠️ It carries a live
+`crates/modules/fleet/src/hub.rs:3461`). The report lives in the Hub's memory with the agent's connection
+(`set_agent_local_relay`, `crates/modules/fleet/src/hub.rs:3441`) and is never stored. ⚠️ It carries a live
 credential, minted by the device and re-minted every 30 minutes, so nothing logs it.
 
 **More than one agent on one computer (FR-121 P3b, #2774).** Windows and WSL under mirrored networking share
@@ -345,8 +370,8 @@ loopback, each agent with its own relay on its own probe port, and their overlay
 completely: on neo16 the Windows agent is direct to every peer while the WSL one rides DERP, and a relay reached over
 DERP carries no media. So the viewer takes every answer, not the first: it names every own device, the Hub resolves
 each on its own (`named_devices`, `crates/modules/fleet/src/hub.rs:125`) and hands the target every `turn:` with the
-offer (`crates/modules/fleet/src/hub.rs:2277`), at most `LOCAL_RELAYS_MAX` (4), and ICE checks a pair through each. A
-target whose `rc_overlay` is off is refused that first (`crates/modules/fleet/src/hub.rs:3997`). Otherwise a refusal
+offer (`crates/modules/fleet/src/hub.rs:2315`), at most `LOCAL_RELAYS_MAX` (4), and ICE checks a pair through each. A
+target whose `rc_overlay` is off is refused that first (`crates/modules/fleet/src/hub.rs:4075`). Otherwise a refusal
 is told only when no named device got a relay, and then it is the first one's.
 
 > ⚠️ Chrome ranks its relay candidates by the order of its TURN servers, so among relays that all work, the first in
@@ -1265,7 +1290,7 @@ upload (`:11778`). Whichever listener runs first owns the paste, so a future
 change to the registration order cannot bring the double back. With the
 drawer open, a files paste that does reach `onPaste` — one aimed at the soft
 keyboard's textarea, which the drawer leaves to it as a form field — uploads
-into the drawer's directory as well (`RemoteControl.vue:5570`).
+into the drawer's directory as well (`RemoteControl.vue:5572`).
 
 ```mermaid
 flowchart TD
@@ -1599,7 +1624,7 @@ live viewer to the consent page, and the device hung its session up.
 
 The mapping is `ConsentMode::asks`
 ([`models.rs:1546`](../crates/remote_control/src/models.rs#L1546)), sent at
-[`hub.rs:1918`](../crates/modules/fleet/src/hub.rs#L1918). A duplicate request
+[`hub.rs:1953`](../crates/modules/fleet/src/hub.rs#L1953). A duplicate request
 coalesced onto a live session gets the same value (`:1571`).
 
 The viewer words two things for the person actually asked:
@@ -1962,7 +1987,7 @@ session goes without it, with a reason:
   bypassed hub, is masked to no `FILES` when the floor says `off`
   (`the_device_floor_holds_when_the_server_sends_no_policy`). Field-verified on 0.4.136, with the red
   on 0.4.132 (FR-101 AC4).
-- The hub decides in [`feature_grant`, `hub.rs:571`](../crates/modules/fleet/src/hub.rs#L571). The
+- The hub decides in [`feature_grant`, `hub.rs:598`](../crates/modules/fleet/src/hub.rs#L598). The
   viewer reads `features_refused` into words naming whose decision it was
   ([`useSessionFeatures.ts:53`](../ui/src/composables/useSessionFeatures.ts#L53)). A reason it does
   not know still greys the control, so a newer server's refusal is never ignored.
@@ -2068,7 +2093,7 @@ machine is a new identity until a person says otherwise.
 **The other direction: the device judges the browser (P1c).** The daemon judges the browser behind every in-org
 offer as it notes it ([`judge_offer`, `peer_auth.rs:220`](../agents/roomlerd/src/peer_auth.rs#L220)),
 and the hub records the verdict on the session's `session_started` audit row
-([`forward_answer`, `hub.rs:2325`](../crates/modules/fleet/src/hub.rs#L2325)). Nothing is refused
+([`forward_answer`, `hub.rs:2364`](../crates/modules/fleet/src/hub.rs#L2364)). Nothing is refused
 before FR-100 P3; the record is what the fleet's audit week is counted over.
 
 | Verdict | Means | The device |
@@ -2305,9 +2330,9 @@ sequenceDiagram
 | Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:13480`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:13458`). An offer with no `m=video` is answered without the track |
 | Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4092`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:13489`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
-| Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:641`), on both ends' `rc:terminate` and in the `session_ended` audit row |
+| Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:668`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:318`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:756`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:410`, #2326) |
-| Tests | the predicate on recorded offers (`codec_cap_tests` in `peer.rs`); the field's own offer, which `create_answer` fails on, is the one it refuses (`agents/roomlerd/tests/dc_track_codec.rs`); who may name the code (`only_the_device_names_no_common_codec`, `hub.rs:4991`); the real agent through a real server, with an H.264 offer as the control (`crates/tests/src/rc_no_common_codec_tests.rs:147`) |
+| Tests | the predicate on recorded offers (`codec_cap_tests` in `peer.rs`); the field's own offer, which `create_answer` fails on, is the one it refuses (`agents/roomlerd/tests/dc_track_codec.rs`); who may name the code (`only_the_device_names_no_common_codec`, `hub.rs:5064`); the real agent through a real server, with an H.264 offer as the control (`crates/tests/src/rc_no_common_codec_tests.rs:147`) |
 
 ⚠️ **The consent prompt has already been answered** by the time the offer
 arrives, so the person at the device approved a session that then cannot start.
@@ -2451,7 +2476,7 @@ flowchart LR
 | `session_created` | **one server hop**: the request reached a live hub | `rc:session.created` | `remote_audit` `consent_prompted` | ✅ |
 | `ready` | a human, on a Prompt-mode device | `rc:ready` | `remote_audit` `consent_granted` | ✅ |
 | `offer_sent` | the browser building its offer | after `setLocalDescription` | — | ✅ |
-| `answer` | the agent receiving the offer and answering | `rc:sdp.answer` | `remote_audit` `session_started` (`crates/modules/fleet/src/hub.rs:1882`, `crates/remote_control/src/audit.rs:152`) | ✅ |
+| `answer` | the agent receiving the offer and answering | `rc:sdp.answer` | `remote_audit` `session_started` (`crates/modules/fleet/src/hub.rs:1917`, `crates/remote_control/src/audit.rs:152`) | ✅ |
 | `pc_connected` | ICE + DTLS | `RTCPeerConnection` `connected` | — | ✅ |
 | `dc_open` | SCTP — the `video-bytes` DataChannel | DC `open` | — | ✅ |
 | `first_frame` | the decode worker's first output frame | worker `first-frame` | — | ✅ |

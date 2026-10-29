@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 use roomler_ai_mod_fleet::hub::{DispatchCtx, OrgPolicy};
-use roomler_ai_remote_control::models::{ConsentMode, InputMode, SessionPolicy};
+use roomler_ai_remote_control::models::{ConsentMode, InputMode, RcOverlayMode, SessionPolicy};
 use roomler_ai_remote_control::signaling::{ClientMsg, Role};
 use tracing::{debug, info, warn};
 
@@ -137,11 +137,9 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     .unwrap_or(false);
                 // #1882 — the device's `AccessPolicy.rc_overlay`, resolved by
                 // the same ORIGIN-pod gate. Absent (an older pod) reads OFF,
-                // the policy's own default.
-                let rc_overlay = body
-                    .get("rc_overlay")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                // the policy's own default. FR-128 — and `auto`, with its
+                // far-TURN hint.
+                let rc_overlay = rc_overlay_from_relay(&body);
                 // FR-101 P2 — the org's session policy, read by the ORIGIN
                 // pod's gate. See `session_policy_from_relay` for absent.
                 let session_policy = session_policy_from_relay(body.get("session_policy"));
@@ -430,7 +428,8 @@ pub async fn relay_rc_frame(
     // strips RECORD without it.
     may_record: bool,
     // #1882 — resolved by the same gate; the owner pod reads absent as off.
-    rc_overlay: bool,
+    // FR-128 — `auto` and its hint cross beside the bool.
+    rc_overlay: RcOverlayMode,
     // FR-101 P2 — the org's session policy, read by the same gate. ⚠️ The
     // owner pod's hub applies it; without this a cross-pod session would
     // skip the org's switches.
@@ -455,6 +454,7 @@ pub async fn relay_rc_frame(
     if owner_pod.is_empty() {
         return Err(());
     }
+    let (rc_overlay_on, rc_overlay_auto, rc_overlay_far_turn) = rc_overlay_to_relay(rc_overlay);
     let body = serde_json::json!({
         "conn": conn,
         "origin": state.pod.pod_id,
@@ -465,7 +465,11 @@ pub async fn relay_rc_frame(
         "input_mode": input_mode,
         "tenant_name": tenant_name,
         "may_record": may_record,
-        "rc_overlay": rc_overlay,
+        "rc_overlay": rc_overlay_on,
+        // FR-128 — beside the bool, so an owner pod older than them reads
+        // only the bool, and `auto` reaches it as `off`.
+        "rc_overlay_auto": rc_overlay_auto,
+        "rc_overlay_far_turn": rc_overlay_far_turn,
         "session_policy": session_policy_to_relay(session_policy),
         "max_secs": max_duration.map(|d| d.as_secs()),
         "idle_secs": idle_secs,
@@ -575,6 +579,35 @@ fn session_policy_from_relay(v: Option<&serde_json::Value>) -> OrgPolicy {
     }
 }
 
+/// #1882 / FR-128 — the relay body's three fields for the device's mode:
+/// `rc_overlay` (only `on` says yes), `rc_overlay_auto`, and the far-TURN
+/// hint (`None` = not measured, and for every mode but `auto`).
+fn rc_overlay_to_relay(mode: RcOverlayMode) -> (bool, bool, Option<bool>) {
+    match mode {
+        RcOverlayMode::Off => (false, false, None),
+        RcOverlayMode::Auto { far_turn } => (false, true, far_turn),
+        RcOverlayMode::On => (true, false, None),
+    }
+}
+
+/// #1882 / FR-128 — the device's mode as the ORIGIN pod's gate resolved it.
+/// Every field absent (an older origin pod) reads `off`, the policy's own
+/// default. `rc_overlay` wins, as it does on the policy row. `auto` rides
+/// beside a `false` bool, so an origin pod that sends only the bool never
+/// sends it; its hint is `None` (not measured) when absent or null.
+fn rc_overlay_from_relay(body: &serde_json::Value) -> RcOverlayMode {
+    let flag = |k: &str| body.get(k).and_then(|v| v.as_bool());
+    if flag("rc_overlay").unwrap_or(false) {
+        RcOverlayMode::On
+    } else if flag("rc_overlay_auto").unwrap_or(false) {
+        RcOverlayMode::Auto {
+            far_turn: flag("rc_overlay_far_turn"),
+        }
+    } else {
+        RcOverlayMode::Off
+    }
+}
+
 /// FR-99 P3b — the device's lock ask on the owner pod's side of the relay.
 /// Absent or null is no ask: an origin pod older than the field asked
 /// nothing of the device itself. `never` asks nothing either. A value this
@@ -622,6 +655,58 @@ mod lock_ask_relay_tests {
             lock_ask_from_relay(body.get("lock_on_end")),
             Some(LockOnEnd::Auto)
         );
+    }
+}
+
+#[cfg(test)]
+mod rc_overlay_relay_tests {
+    use super::*;
+
+    /// The body `relay_rc_frame` writes for a mode, the fields alone.
+    fn written(mode: RcOverlayMode) -> serde_json::Value {
+        let (on, auto, far_turn) = rc_overlay_to_relay(mode);
+        serde_json::json!({
+            "rc_overlay": on,
+            "rc_overlay_auto": auto,
+            "rc_overlay_far_turn": far_turn,
+        })
+    }
+
+    /// FR-128 — every mode, and every hint, crosses as the gate resolved it.
+    #[test]
+    fn every_mode_crosses_the_relay_as_resolved() {
+        for mode in [
+            RcOverlayMode::Off,
+            RcOverlayMode::On,
+            RcOverlayMode::Auto { far_turn: None },
+            RcOverlayMode::Auto {
+                far_turn: Some(true),
+            },
+            RcOverlayMode::Auto {
+                far_turn: Some(false),
+            },
+        ] {
+            assert_eq!(rc_overlay_from_relay(&written(mode)), mode, "{mode:?}");
+        }
+    }
+
+    /// An older origin pod sends the bool alone, or nothing: `off`, or `on`
+    /// as it said. And `auto` reaches an older OWNER pod as the bool it
+    /// reads, which is `false`.
+    #[test]
+    fn an_older_pod_reads_and_sends_only_the_bool() {
+        assert_eq!(
+            rc_overlay_from_relay(&serde_json::json!({ "may_record": false })),
+            RcOverlayMode::Off
+        );
+        assert_eq!(
+            rc_overlay_from_relay(&serde_json::json!({ "rc_overlay": true })),
+            RcOverlayMode::On
+        );
+        let auto = written(RcOverlayMode::Auto {
+            far_turn: Some(true),
+        });
+        assert_eq!(auto["rc_overlay"], serde_json::json!(false));
     }
 }
 

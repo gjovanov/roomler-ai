@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::consent::ConsentSlot;
 use crate::error::{Error, Result};
-use crate::models::{ConsentMode, EndReason, SessionPhase, SessionStats};
+use crate::models::{ConsentMode, EndReason, RcOverlayMode, SessionPhase, SessionStats};
 use crate::permissions::Permissions;
 use crate::signaling::{LocalRelayDescriptor, ServerMsg};
 
@@ -63,10 +63,10 @@ pub struct LiveSession {
     pub local_relays: Vec<LocalRelayDescriptor>,
 
     /// #1882 — the device's `AccessPolicy.rc_overlay`, resolved at session
-    /// create. `forward_offer` hands the agent the overlay `local_relays` TURN
-    /// only when this is `true`: with the overlay off, an overlay relay is a
-    /// candidate the agent would only discard.
-    pub rc_overlay: bool,
+    /// create (FR-128: `auto` is already `off` for an agent that cannot decide
+    /// it). `forward_offer` hands the agent the overlay `local_relays` TURN
+    /// unless it is `off`: under `auto` the agent may yet take it.
+    pub rc_overlay: RcOverlayMode,
 
     /// Multi-region relay: the region FROZEN at session create (load-aware
     /// pick over the agent's home + RTT-ordered prefs). Frozen so all three
@@ -147,7 +147,7 @@ impl LiveSession {
             watchers: HashMap::new(),
             controller_tx: Some(controller_tx),
             local_relays: Vec::new(),
-            rc_overlay: false,
+            rc_overlay: RcOverlayMode::Off,
             relay_region: None,
             offer_seen: false,
             pending_request: None,
