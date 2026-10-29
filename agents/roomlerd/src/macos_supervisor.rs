@@ -316,6 +316,11 @@ pub const WORKER_ENV_FORWARD: &[&str] = &[
     // The encoder-cells kill switch: a gate applies at every entry point, and
     // the worker is where a session's encoders open.
     "ENCODER_CELLS_DENY",
+    // FR-118 P5 — GPU-resident frames and their kill switch, for the same
+    // reason: the worker captures, runs the probe whose `gpu` child proves
+    // VideoToolbox's IOSurface form, and opens the session's encoders.
+    "ZERO_COPY",
+    "ZERO_COPY_DENY",
 ];
 
 /// The worker's `ROOMLERD_<suffix>=<value>` assignments: every
@@ -1364,6 +1369,9 @@ mod tests {
             "FPS_DENY" => Some("*:144".to_string()),
             "CLIPBOARD_MAC_WATCH" => Some("0".to_string()),
             "ENCODER_CELLS_DENY" => Some("hevc_videotoolbox:yuv444".to_string()),
+            // FR-118 P5 — the switch and its denylist bind the worker too.
+            "ZERO_COPY" => Some("1".to_string()),
+            "ZERO_COPY_DENY" => Some("hevc_videotoolbox:gpu".to_string()),
             // FR-97 P2c — the root's `[virtual_desktop_apps] enabled = false`.
             "APPS" => Some("0".to_string()),
             // Set on the root, but root-only: never forwarded.
@@ -1377,6 +1385,8 @@ mod tests {
                 "ROOMLERD_APPS=0",
                 "ROOMLERD_FPS_DENY=*:144",
                 "ROOMLERD_ENCODER_CELLS_DENY=hevc_videotoolbox:yuv444",
+                "ROOMLERD_ZERO_COPY=1",
+                "ROOMLERD_ZERO_COPY_DENY=hevc_videotoolbox:gpu",
             ]
         );
         assert!(

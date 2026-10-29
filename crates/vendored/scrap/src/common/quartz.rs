@@ -134,6 +134,13 @@ impl<'a> Frame<'a> {
     pub fn bytes_per_row(&self) -> usize {
         self.0.bytes_per_row()
     }
+
+    /// ROOMLER PATCH: the `IOSurfaceRef` this frame holds, handed over with
+    /// its retain and its use count (see `quartz::Frame::into_surface`). The
+    /// caller gives both back: `IOSurfaceDecrementUseCount`, then `CFRelease`.
+    pub fn into_surface(self) -> *mut std::os::raw::c_void {
+        self.0.into_surface()
+    }
 }
 
 impl<'a> ops::Deref for Frame<'a> {
