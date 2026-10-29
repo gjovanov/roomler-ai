@@ -80,7 +80,7 @@ flowchart TD
 ### 3.2 The inputs
 
 - **The carrier.** The same LocalAPI `peers` call the guard makes (`peer.rs:2238`), keyed by the viewer device's overlay address. A delegated Mac session's GUI worker runs no overlay, so it asks the daemon, as the guard already does.
-- **The viewer's device** (D3): by default, the overlay address of the session's remote relay candidate. When the browser uses its own device's loopback relay (FR-121, `resolve_local_relay`, `crates/modules/fleet/src/hub.rs:3329`), that candidate's address is the viewer device's overlay address, so no new wire field is needed.
+- **The viewer's device** (D3): by default, the overlay address of the session's remote relay candidate. When the browser uses its own device's loopback relay (FR-121, `resolve_local_relay`, `crates/modules/fleet/src/hub.rs:3386`), that candidate's address is the viewer device's overlay address, so no new wire field is needed.
 - **Far TURN availability** (D5): whether ICE gathered a relay candidate that is **not** fast-local (`relay_addr_is_fast_local`, `agents/roomlerd/src/encode/mod.rs:884`). The filters apply at gathering (`RcOverlay::keeps_local`/`ice_servers`, `agents/roomlerd/src/rc_overlay.rs:64-77`), so this needs one of two mechanisms: defer the overlay candidates until far-TURN gathering has finished, or restart ICE after a failed first round.
 
 ### 3.3 The policy on the wire

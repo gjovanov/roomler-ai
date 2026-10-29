@@ -1419,7 +1419,7 @@ Reserved fact paths, read only when the fact is `active` or `stale`
 | `user` | `ssh`'s: the one account the key signs in as | in `options`, and in the `ssh` upstream (`ssh://user@host`) |
 
 **The access** (`rc:knowhow.access {req_id, access}`,
-[`signaling.rs`](../crates/remote_control/src/signaling.rs#L5209)):
+[`signaling.rs`](../crates/remote_control/src/signaling.rs#L5234)):
 
 | Field | Holds |
 |---|---|
