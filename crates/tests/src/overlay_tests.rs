@@ -15,7 +15,7 @@
 
 use bson::{doc, oid::ObjectId};
 use roomler_ai_db::indexes::apply_index_sets;
-use roomler_ai_remote_control::models::{NodeRef, OverlayBlockState, OverlayNetwork, OverlayNode};
+use roomler_ai_remote_control::models::{NodeRef, OverlayNetwork, OverlayNode};
 use roomler_ai_services::dao::base::DaoError;
 use roomler_ai_services::dao::overlay_block::{NextSlot, SlotClaim};
 use roomler_ai_services::dao::overlay_network::OverlayNetworkDao;
