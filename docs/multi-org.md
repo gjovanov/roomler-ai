@@ -505,7 +505,7 @@ flowchart TD
 throttled to 1/min/prefix, so counting log lines under-reports by up to 40×:
 
 ```
-route guard evicted=0 spared=0 waves=593 [tick=325 pulled=47 event=268] revalidations=1828
+route guard evicted=0 spared=0 waves=1348 [tick=1294 pulled=8 event=54] revalidations=384
            (cumulative — DIFF two readings, never judge the absolute)
 ```
 
@@ -514,7 +514,7 @@ route guard evicted=0 spared=0 waves=593 [tick=325 pulled=47 event=268] revalida
 | `evicted` | a foreign route for our prefix was deleted | a route war in progress if it climbs per wave; `0` is healthy |
 | `spared` | the foreign route belonged to a sibling org adapter and was left alone | the exemption being consulted. ⚠️ On a healthy multi-org host it is **static, not climbing**: narrowing makes the per-org prefixes disjoint, so the exemption is never reached. It climbs only when narrowing is OFF (`OVERLAY_V6_DEFEND_NARROW=0`) — then exactly one spare per wave |
 | `waves [tick · pulled · event]` | every guard pass, attributed to its arm (#1282) | the rate is tick-driven and the same in a storm and at rest; a war lives in evictions **per wave**, not in waves |
-| `revalidations` | a network change forced a rekey poke — every peer re-keyed, a healthy direct carrier possibly demoted | the cost of route churn, whatever causes it; ~100/min was the #1237 signature, but it is not by itself a sibling war (neo16 runs ~15/min from Docker/WSL route events with `evicted=0`) |
+| `revalidations` | a network change forced a rekey poke — every peer re-keyed, a healthy direct carrier possibly demoted | the cost of route churn, whatever causes it; ~100/min was the #1237 signature, but it is not by itself a sibling war (a quiet neo16 on 2026-10-29 read `revalidations` flat at 384 across a 5½-minute window with `evicted=0` and `waves` +22 — the counter moves with network churn, not with waves) |
 | `yielded` | a prefix hit the strike cap and the guard stopped re-asserting it | the brake (#1328); `evicted` goes flat while it holds |
 
 ⚠️ **Diff two readings ≥ 30 s apart, and check for a DECREASE first.** The
@@ -756,7 +756,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
 |---|---|
 | Config v2 + enrollment dispatch | `agents/roomlerd/src/config.rs`, `enrollment.rs` units; the two-tenant integration test driving ONE agent lib into TWO TestApps |
 | Block grid + allocator | `crates/remote_control/src/models.rs` units (grid rendering, prefix→width, buddy-alignment property, in-block leases) |
-| Renumber planner + version floor | `crates/api/src/routes/overlay_block.rs` units (preservation, compaction ordering, determinism, capacity refusal, numeric rc compare, fail-closed unknowns) |
+| Renumber planner + version floor | `crates/modules/network/src/routes/overlay_block.rs` units (preservation, compaction ordering, determinism, capacity refusal, numeric rc compare, fail-closed unknowns) |
 | Renumber end-to-end | `crates/tests/src/overlay_tests.rs` — inert dry run, apply + invertibility + next lease, double renumber ⇒ quarantine trail, cross-tenant disjointness over mixed widths, floor refusal + force, permission gate, carve-new-networks-only |
 | IPAM ceiling (P2a) | `allocate_host_stops_at_the_block_ceiling` |
 | Growth + the allocator's races (FR-47 P5c · FR-68) | `crates/tests/src/overlay_tests.rs` — the one-way door (`turning_multi_block_off_after_a_grow_fails_the_boot_loudly`), a cross-tenant carve racing a grow (`a_cross_tenant_carve_racing_a_grow_is_retried_above_the_winner`), twin grows at one position, renumber refused on a grown network, the door flip installing the position guard; `overlay_growth_tests.rs` — a real join past the ceiling, and `agent-v0.4.42`'s decoder (verbatim) against the netmap it produces |
