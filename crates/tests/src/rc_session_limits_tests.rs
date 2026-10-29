@@ -619,3 +619,136 @@ async fn the_lock_ask_reaches_only_a_device_that_honours_it() {
     assert!(requested["lock_on_end"].is_null(), "{requested}");
     assert!(requested["lock_enforced"].is_null(), "{requested}");
 }
+
+/// FR-128 — a session request that names the browser's own device
+/// (`local_relay_from`, FR-121), answered by [`request_session`]'s two frames.
+async fn request_session_from(
+    app: &TestApp,
+    token: &str,
+    agent_id: &str,
+    agent: &mut Ws,
+    from: &str,
+) -> (Ws, Value, Value) {
+    let url = format!("ws://{}/ws?token={}", app.addr, urlencode(token));
+    let (mut ctl, _) = connect_async(&url).await.expect("controller ws");
+    let _ = tokio::time::timeout(Duration::from_millis(200), ctl.next()).await;
+    ctl.send(Message::Text(
+        json!({
+            "t": "rc:session.request",
+            "agent_id": agent_id,
+            "permissions": "VIEW | INPUT",
+            "local_relay_from": from,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let created = next_of(&mut ctl, "rc:session.created", Duration::from_secs(5))
+        .await
+        .expect("rc:session.created");
+    let request = next_of(agent, "rc:request", Duration::from_secs(5))
+        .await
+        .expect("the agent's rc:request");
+    (ctl, created, request)
+}
+
+/// FR-128 — `auto` through the real route, authz gate and hub.
+/// - A device that says `rc-overlay-auto` is sent `rc_overlay_auto`, naming
+///   the browser's own device by its relay's overlay address, beside an
+///   `rc_overlay` that is not `true`. The browser gets its relay back.
+/// - A device that does not say it is sent neither, and the browser is
+///   refused its relay as `rc_overlay_off` (D1, held by the server).
+/// - `rc_overlay: true` wins over `auto` on one row.
+///
+/// No overlay node exists here, so the far-TURN hint is "not measured" and
+/// rides as nothing.
+#[tokio::test]
+async fn auto_reaches_only_a_device_that_decides_it() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr128auto").await;
+    // FR-115 P3 — several sessions at once in one org: Free runs one.
+    app.set_plan(&seeded.tenant_id, "business").await;
+    let admin = seeded.admin.access_token.clone();
+
+    // The device the browser runs on: the admin's own, reporting its relay.
+    let (viewer, mut viewer_ws) =
+        connect_agent_rpc(&app, &seeded, "mach-fr128-viewer", &["local-relay"]).await;
+    viewer_ws
+        .send(Message::Text(
+            json!({
+                "t": "rc:agent.local_relay",
+                "relay": {
+                    "turn_port": 47989,
+                    "overlay_ip": "100.64.0.9",
+                    "username": "1700000600:uid",
+                    "credential": "abcd1234",
+                },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A device that decides `auto` itself.
+    let (new_agent, mut new_ws) =
+        connect_agent_rpc(&app, &seeded, "mach-fr128-new", &["rc-overlay-auto"]).await;
+    set_access_policy(
+        &app,
+        &seeded,
+        &admin,
+        &new_agent,
+        json!({ "rc_overlay_auto": true }),
+    )
+    .await;
+    let (_ctl1, created, request) =
+        request_session_from(&app, &admin, &new_agent, &mut new_ws, &viewer).await;
+    assert_eq!(created["local_relay"]["turn_port"], 47989, "{created}");
+    assert!(created["local_relay_refused"].is_null(), "{created}");
+    assert_eq!(
+        request["rc_overlay_auto"]["viewers"],
+        json!(["100.64.0.9"]),
+        "{request}"
+    );
+    assert!(
+        request["rc_overlay_auto"]["far_turn"].is_null(),
+        "nothing measured, so no hint: {request}"
+    );
+    assert_ne!(request["rc_overlay"], true, "{request}");
+
+    // A device that does not: `auto` reads as `off` for it.
+    let (old_agent, mut old_ws) = connect_agent(&app, &seeded, "mach-fr128-old").await;
+    set_access_policy(
+        &app,
+        &seeded,
+        &admin,
+        &old_agent,
+        json!({ "rc_overlay_auto": true }),
+    )
+    .await;
+    let (_ctl2, created, request) =
+        request_session_from(&app, &admin, &old_agent, &mut old_ws, &viewer).await;
+    assert!(created["local_relay"].is_null(), "{created}");
+    assert_eq!(
+        created["local_relay_refused"], "rc_overlay_off",
+        "{created}"
+    );
+    assert!(request["rc_overlay_auto"].is_null(), "{request}");
+    assert_ne!(request["rc_overlay"], true, "{request}");
+
+    // `on` wins over `auto`.
+    set_access_policy(
+        &app,
+        &seeded,
+        &admin,
+        &new_agent,
+        json!({ "rc_overlay": true, "rc_overlay_auto": true }),
+    )
+    .await;
+    let (_ctl3, _created, request) =
+        request_session_from(&app, &admin, &new_agent, &mut new_ws, &viewer).await;
+    assert_eq!(request["rc_overlay"], true, "{request}");
+    assert!(request["rc_overlay_auto"].is_null(), "{request}");
+}

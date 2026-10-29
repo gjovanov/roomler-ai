@@ -1275,6 +1275,15 @@ pub enum RpcCap {
     /// (`ROOMLERD_LOCAL_TURN`, default on); a device with no overlay yet
     /// still advertises it and reports `None`.
     LocalRelay,
+    /// FR-128 — this device decides `rc_overlay = auto` for each session at
+    /// the offer (`Request.rc_overlay_auto`): the overlay when its mesh link
+    /// to the viewer's own device is direct, and not otherwise. The hub sends
+    /// `auto`, and hands out the viewer's relay under it, only to a
+    /// connection advertising this; to any other the policy reads as `off`,
+    /// which is D1's answer for an older agent. Advertised while the decision
+    /// is switched on (`ROOMLERD_RC_OVERLAY_AUTO`, default on). Not a prefix
+    /// of another verb, nor another of it.
+    RcOverlayAuto,
 }
 
 impl RpcCap {
@@ -1328,11 +1337,12 @@ impl RpcCap {
             Self::KnowhowTools => "knowhow-tools",
             Self::KnowhowProbe => "knowhow-probe",
             Self::LocalRelay => "local-relay",
+            Self::RcOverlayAuto => "rc-overlay-auto",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 42] = [
+    pub const ALL: [RpcCap; 43] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1375,6 +1385,7 @@ impl RpcCap {
         Self::KnowhowTools,
         Self::KnowhowProbe,
         Self::LocalRelay,
+        Self::RcOverlayAuto,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -1599,6 +1610,17 @@ pub struct AccessPolicy {
     /// carries over DERP/TCP reads as a direct host pair.
     #[serde(default)]
     pub rc_overlay: Option<bool>,
+    /// FR-128 — `auto`: each session decides for itself, at the agent's
+    /// offer. It takes the overlay when the mesh link to the viewer's own
+    /// device is direct, and not otherwise. `rc_overlay: true` wins over
+    /// it ([`Self::rc_overlay_mode`]). `None`/`false` (the default, and every
+    /// row older than the field) is not `auto`.
+    ///
+    /// A separate field rather than a third value of `rc_overlay`, so a pod
+    /// or a page older than it reads an `auto` row as `off`, never as a row
+    /// it cannot parse.
+    #[serde(default)]
+    pub rc_overlay_auto: Option<bool>,
     /// FR-99 P3b — what this device's sessions ask of it when the last one
     /// ends: `auto` (lock again if the screen was locked, or nobody was at it,
     /// when the session started) or `always`. Set by a `MANAGE_AGENTS` admin.
@@ -1624,10 +1646,66 @@ pub fn stricter_idle_limit(org_secs: Option<u32>, device_secs: Option<u32>) -> O
     }
 }
 
+/// FR-128 — how a device's remote-desktop sessions may use the overlay: its
+/// [`AccessPolicy::rc_overlay_mode`], carried from the authz gate to the hub
+/// that builds the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RcOverlayMode {
+    /// #1882's default: the agent keeps every overlay address out of the
+    /// session's ICE.
+    #[default]
+    Off,
+    /// The agent decides at its offer, from its mesh carrier to the viewer's
+    /// own device. `far_turn`: did both devices' last netcheck reach the far
+    /// TURN over UDP? `None` = not measured, which the agent reads as "it
+    /// works".
+    Auto { far_turn: Option<bool> },
+    /// Whichever pair ICE finds best, the overlay included.
+    On,
+}
+
+impl RcOverlayMode {
+    /// The `rc_overlay` bool of `rc:request`: only `on` says yes. `auto`
+    /// rides beside a `false`, so an agent that knows only the bool reads
+    /// `off` (FR-128 D1).
+    pub fn is_on(self) -> bool {
+        self == Self::On
+    }
+
+    /// May the hub hand the viewer's loopback relay to this session (FR-121)?
+    /// Under `auto` as under `on`: the relay is an overlay path, and under
+    /// `auto` the agent may yet decide to take it.
+    pub fn hands_out_relay(self) -> bool {
+        self != Self::Off
+    }
+
+    /// For a log line.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto { .. } => "auto",
+            Self::On => "on",
+        }
+    }
+}
+
 impl AccessPolicy {
     /// #1882 — [`Self::rc_overlay`] resolved: off unless explicitly on.
     pub fn rc_overlay_allowed(&self) -> bool {
         self.rc_overlay.unwrap_or(false)
+    }
+
+    /// FR-128 — [`Self::rc_overlay`] and [`Self::rc_overlay_auto`] resolved:
+    /// `on` wins, then `auto`, else `off`. The far-TURN hint is the authz
+    /// gate's to fill in; a policy row has none.
+    pub fn rc_overlay_mode(&self) -> RcOverlayMode {
+        if self.rc_overlay_allowed() {
+            RcOverlayMode::On
+        } else if self.rc_overlay_auto.unwrap_or(false) {
+            RcOverlayMode::Auto { far_turn: None }
+        } else {
+            RcOverlayMode::Off
+        }
     }
 
     /// FR-101 P4b-2 — [`Self::auto_terminate_idle_minutes`] as seconds. `0`
@@ -7108,6 +7186,80 @@ mod tests {
         assert!(!off.rc_overlay_allowed());
     }
 
+    /// FR-128 — the tri-state from the two fields: every row older than
+    /// `rc_overlay_auto` is `off` (or `on`, as before), `auto` survives the
+    /// round trip, and `on` wins over `auto` on a row that says both.
+    #[test]
+    fn rc_overlay_mode_reads_on_then_auto_then_off() {
+        let old: AccessPolicy = bson::from_document(bson::doc! {
+            "consent_mode": "auto",
+            "allowed_role_ids": [],
+            "allowed_user_ids": [],
+            "rc_overlay": null,
+        })
+        .expect("a pre-FR-128 row deserialises");
+        assert_eq!(old.rc_overlay_auto, None);
+        assert_eq!(old.rc_overlay_mode(), RcOverlayMode::Off);
+        assert_eq!(
+            AccessPolicy::default().rc_overlay_mode(),
+            RcOverlayMode::Off
+        );
+
+        let auto = AccessPolicy {
+            rc_overlay: Some(false),
+            rc_overlay_auto: Some(true),
+            ..Default::default()
+        };
+        let back: AccessPolicy = bson::from_document(bson::to_document(&auto).expect("serialises"))
+            .expect("round-trips");
+        assert_eq!(
+            back.rc_overlay_mode(),
+            RcOverlayMode::Auto { far_turn: None }
+        );
+        assert!(
+            !back.rc_overlay_allowed(),
+            "auto is not on to a reader of the bool"
+        );
+
+        let both = AccessPolicy {
+            rc_overlay: Some(true),
+            rc_overlay_auto: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(both.rc_overlay_mode(), RcOverlayMode::On);
+
+        let auto_off = AccessPolicy {
+            rc_overlay_auto: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(auto_off.rc_overlay_mode(), RcOverlayMode::Off);
+    }
+
+    /// FR-128 — what each mode tells the agent and the relay: only `on` sets
+    /// the `rc:request` bool, and `auto` hands out the viewer's relay as `on`
+    /// does.
+    #[test]
+    fn rc_overlay_mode_on_is_the_only_bool_and_auto_hands_out_the_relay() {
+        let auto = RcOverlayMode::Auto {
+            far_turn: Some(false),
+        };
+        assert!(RcOverlayMode::On.is_on());
+        assert!(!auto.is_on());
+        assert!(!RcOverlayMode::Off.is_on());
+        assert!(RcOverlayMode::On.hands_out_relay());
+        assert!(auto.hands_out_relay());
+        assert!(!RcOverlayMode::Off.hands_out_relay());
+        assert_eq!(RcOverlayMode::default(), RcOverlayMode::Off);
+        assert_eq!(
+            [
+                RcOverlayMode::Off.wire(),
+                auto.wire(),
+                RcOverlayMode::On.wire()
+            ],
+            ["off", "auto", "on"]
+        );
+    }
+
     /// FR-99 P3b — every row written before `lock_on_end` asks nothing, a
     /// stored `null` asks nothing (the `Option` sees it before `LockOnEnd`'s
     /// unknown-reads-as-`always` rule can), `never` asks nothing, and an ask
@@ -7648,6 +7800,7 @@ mod tests {
         assert_eq!(RpcCap::KnowhowTools.wire(), "knowhow-tools");
         assert_eq!(RpcCap::KnowhowProbe.wire(), "knowhow-probe");
         assert_eq!(RpcCap::LocalRelay.wire(), "local-relay");
+        assert_eq!(RpcCap::RcOverlayAuto.wire(), "rc-overlay-auto");
     }
 
     /// FR-90 P4-4-1 — `knowhow-tools` and `knowhow-scan` are two verbs: a

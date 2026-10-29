@@ -2003,9 +2003,15 @@ mod params_tests {
             &bson::oid::ObjectId::new().to_hex(),
             roomler_ai_remote_control::permissions::Permissions::all(),
         );
+        // FR-128 — `auto` and its hints cross too: the GUI worker builds the
+        // peer, so it makes the session's decision at the offer.
         p.rc_overlay = Some(crate::rc_overlay::RcOverlay {
             allow: false,
+            auto: true,
+            viewers: vec!["100.65.4.33".parse().unwrap()],
+            far_turn: Some(false),
             v4_nets: vec![(std::net::Ipv4Addr::new(100, 65, 4, 0), 22)],
+            ..Default::default()
         });
         let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(p.clone())))
             .expect("serialises");

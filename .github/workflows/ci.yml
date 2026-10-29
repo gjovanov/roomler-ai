@@ -1275,12 +1275,14 @@ jobs:
       # FR-97 P2f-2: and `macos_spawn::`, a child started as its own
       # responsible process: the private call is there, and a real
       # posix_spawn's pipes carry both ways, with the extra environment.
+      # #3018: and `thread_dump::`, a stall's thread stacks: `/usr/bin/sample`
+      # reads this test process, and its real report must parse.
       - name: cargo check + test agent sessions on macOS (FR-90 P1h — `hive`)
         env:
           ROOMLERD_TEST_MAC_PASTEBOARD: "1"
         run: |
           cargo check -p roomlerd --lib --bins --features hive,vault
-          cargo test -p roomlerd --lib --features hive,vault,clipboard,enigo-input -- hive:: vault:: vault_proxy:: macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn::
+          cargo test -p roomlerd --lib --features hive,vault,clipboard,enigo-input -- hive:: vault:: vault_proxy:: macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn:: thread_dump::
 
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the
@@ -1303,6 +1305,16 @@ jobs:
       # Settings pane) exist on exactly this target.
       - name: cargo check the desktop companion
         run: cargo check -p roomler-desktop
+
+      # FR-129 B1 — the setup wizard installs the daemon on macOS now (the
+      # `osascript` half, `agents/roomler-setup/src/unix_daemon.rs`), and its
+      # macOS arms compiled NOWHERE before a `setup-v*` tag: release-setup.yml
+      # is the wizard's only macOS build, and it runs after the agent release
+      # it follows (FR-84 S1), so a macOS-only error there would leave
+      # `/api/setup/macos` serving the previous wizard. Check only, `--bins` for
+      # main.rs's window guard.
+      - name: cargo check the setup wizard (the macOS daemon install)
+        run: cargo check -p roomler-setup --lib --bins
 
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
@@ -1634,6 +1646,15 @@ jobs:
       - name: The installer's SystemContext record — unit tests (#1727)
         if: ${{ !cancelled() }}
         run: cargo test -p roomlerd --lib --features recording,openh264-encoder,synthetic-frame-source -- win_service::system_context_attempt --nocapture
+      # #3073 — a SystemContext host's first healthy run hardens the
+      # machine-global dir. Proven here on a real tree someone else owns (the
+      # elevated runner hands it to SYSTEM): with the owner taken and the grant
+      # made before inheritance goes, SYSTEM keeps full control of the
+      # directory and of every child. The other lane that runs
+      # `roomler-node-core` is Linux, where the test does not exist.
+      - name: The machine-global hardening keeps SYSTEM in (#3073)
+        if: ${{ !cancelled() }}
+        run: cargo test -p roomler-node-core --lib -- config::tests::harden --nocapture
       # Runs even when the unit step failed: the two prove different halves
       # (the child's integrity, the daemon's impersonation), and one red must
       # not hide the other's evidence.
@@ -1646,11 +1667,14 @@ jobs:
       # `scrap-capture` bring them in. The units: a recording's WGC session
       # draws the pointer and the live one does not (unless
       # ROOMLERD_WGC_CURSOR=1), and the pointer's placement.
+      # FR-118 P2-1 — and the GPU frame (`capture::gpu_frame`): a texture on a
+      # WARP device reads back the bytes it holds, once, on any thread, and
+      # goes back to its pool. The same features compile it.
       - name: The recorder's pointer — Windows capture compiles, lints, and its units pass
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomlerd --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture --tests -- -D warnings
-          cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer
+          cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer capture::gpu_frame
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.

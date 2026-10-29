@@ -110,7 +110,7 @@ flowchart TB
 
 The heartbeat carries the tally as `evidence_rejected=[agent-stalled,
 transit-stalled, stall-shadow, carrier-changed, opening, keyframe-burst]` (`Rejections`,
-`evidence.rs:219`; printed at `peer.rs:9700` for the FFmpeg pump and `:5150` for
+`evidence.rs:219`; printed at `peer.rs:9766` for the FFmpeg pump and `:5150` for
 VP9's) — one field where T1b, T2 and
 T2b each had their own counter. `opening` was appended (P2b-8) and then
 `keyframe-burst` (P2b-13), so the earlier positions keep their meaning for a
@@ -275,7 +275,7 @@ flowchart LR
 | piece | rule | anchor |
 |---|---|---|
 | the key | `remote_addr\|carrier` — `direct`, `tunnel`, `relay:<kind>/<transport>` from the LocalAPI peer record; a mid-churn carrier (`blocked` / `offline`) leaves the bare pre-FR-79 key. DERP-over-TLS and a UDP relay are different pipes on the same address, four times apart in capacity | `rate_memory.rs:42`, `:65`; `peer.rs:1566` |
-| the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:7539` (`opener_measured_bps`) |
+| the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:7544` (`opener_measured_bps`) |
 | the write | `record_session(peer, evidence, now)`: `None` or 0 ⇒ **no write**; first evidence ⇒ adopted outright; otherwise `damp` with the goodput estimator's own asymmetry (`ALPHA_DOWN` 0.50 / `ALPHA_UP` 0.10, `goodput.rs:94`, `:98`). The maximum rule, `had_decrease`, the unqueued ×1.5 step and its constants are gone | `rate_memory.rs:147`, `:79`; `peer.rs:1615` |
 | the file | `rate_memory.json` in the daemon's data dir (`appdirs::project_dirs().data_dir()` — on a Windows SYSTEM service `…\config\systemprofile\AppData\Roaming\roomler\roomler\data\`); whole-file atomic write; a missing or corrupt file is an empty memory; an entry older than 7 days never seeds and is pruned on the next write | `rate_memory.rs:185`, `:22` |
 | the log line | `FR-79 V4 rate memory: … peer=… evidence_bps=… kept_bps=…` at every session end that had a key. **`kept` lies between the old value and the evidence**, so `kept > evidence` on one line proves the entry moved DOWN — no old value needed | `peer.rs:1604` |
@@ -311,7 +311,7 @@ evidence the old `min(goodput, link_rx)` averaged together:
 | the anchor a ceiling may be built on | `max(capacity, floor)` — never `min` | — | `ceiling_anchor_bps` (`pipe.rs:242`) |
 
 ⚠️ **It is a shadow.** The heartbeat prints `pipe_belief=(anchor, floor,
-capacity)` and `pipe_belief_n=(deliveries, capacities)` (`peer.rs:8154`) and
+capacity)` and `pipe_belief_n=(deliveries, capacities)` (`peer.rs:8164`) and
 **no consumer reads them** — not V5, not the ceiling, not the memory. The
 shadow corrected its own design three times in five days, which is why this
 page stops here rather than describing a law:
@@ -436,14 +436,14 @@ show the products: 34.56 M for AV1 at 1920×1200 @ 60, 43.2 M for HEVC and
 target**: the encoders run constant quality under `maxrate`, so a settled
 desktop spends almost nothing and only motion approaches the bound.
 
-`policy::rate_plan` (`encode/policy.rs:236`) finishes the chain: × the dial
+`policy::rate_plan` (`encode/policy.rs:241`) finishes the chain: × the dial
 (`dial_rate_factor_pct` — 70 / 85 / 100, clamped to [30, 100]) × the
 encode-pressure factor (`governor.encode_factor()`, `governor.rs:1537`),
 floored at `MIN_BITRATE_BPS` (1.5 M, `encode/mod.rs:241`). On a direct
 transport `effective_ceiling` is the plan's value unchanged (`governor.rs:539`
 — the learner lifts it on constrained sessions only); the shared-pipeline split
 divides it by the follower count; and the result is both the AIMD's ceiling
-and the gate's reference rate (`last_ceiling_bps`, `peer.rs:7019`).
+and the gate's reference rate (`last_ceiling_bps`, `peer.rs:7023`).
 
 ⚠️ The encode-pressure factor multiplies the bound, so a host whose encoder is
 struggling lowers its own ceiling with no path evidence in it. On 2026-09-25
@@ -469,8 +469,8 @@ meant to bound.
 | soft budget | `direct_queue_ms` (150) × ceiling ÷ 8, floored at 48 KiB; `0` disables the gate | `rate_profile.rs:559` (`direct_queue_budget_bytes`) |
 | hard budget | `max(soft, HRD reservoir)`, the reservoir being `maxrate × open_hrd_pct ÷ 8` — 100 % on direct (`direct_hrd_pct`, `:590`; config `direct_hrd_pct`, [25, 200]), 200 % for every `av1_*` encoder regardless | `rate_profile.rs:578` (`direct_queue_hard_budget_bytes`); `ffmpeg/encoder.rs` `open_hrd_pct` |
 | measured wait | the larger of an EMA (α 0.3 per pass) of completed frames' enqueue→wire-complete waits and the **live age of the frame the send task is writing** (`send_head_enqueued_us`) — a stalled pipe completes nothing, so the EMA alone reads stale-low exactly when the queue grows | `peer.rs:6333`–`6261`; set and cleared by the send task at `:5677`, `:5745` |
-| the verdict | bytes ≥ hard ⇒ trip; bytes ≥ soft **and** wait ≥ `direct_queue_ms` ⇒ trip; otherwise pass | `rate_profile.rs:597` (`direct_gate_trips`), called at `peer.rs:6373` |
-| on a trip | the pass skips producing a frame (`frames_skipped_backpressure`) and drives the AIMD's multiplicative decrease, as the full-channel arm always did; the first trip logs `direct byte-budget gate engaged` with `inflight`, `budget`, `hard_budget` and `measured_wait_ms`, so a field read can tell which arm fired | `peer.rs:6449`, `:6331` |
+| the verdict | bytes ≥ hard ⇒ trip; bytes ≥ soft **and** wait ≥ `direct_queue_ms` ⇒ trip; otherwise pass | `rate_profile.rs:597` (`direct_gate_trips`), called at `peer.rs:6377` |
+| on a trip | the pass skips producing a frame (`frames_skipped_backpressure`) and drives the AIMD's multiplicative decrease, as the full-channel arm always did; the first trip logs `direct byte-budget gate engaged` with `inflight`, `budget`, `hard_budget` and `measured_wait_ms`, so a field read can tell which arm fired | `peer.rs:6453`, `:6331` |
 | relay paths | unchanged: bytes vs `constrained_queue_ms` (450) of the relay ceiling, no wait term | `peer.rs:6302`–`6190` |
 
 ```mermaid
@@ -478,7 +478,7 @@ flowchart TB
     subgraph ceiling["the ceiling — a bound, never an operating point"]
         G["w × h × fps × 0.25 bpp/s<br/>(0.07 on a constrained path)"] --> C["clamp [3, 48] M × codec/chroma factor<br/>rate_profile.rs:219"]
         C --> D["× dial 70 / 85 / 100 %"]
-        D --> E["× encode-pressure factor,<br/>floor 1.5 M — policy.rs:236"]
+        D --> E["× encode-pressure factor,<br/>floor 1.5 M — policy.rs:241"]
         E --> S["÷ followers (shared split)"]
         S --> CEIL["ceiling_bps<br/>= the AIMD's ceiling = the gate's reference"]
     end
@@ -590,6 +590,39 @@ crossed (a field trace: 55 → 50 → 55 → 50 → 45 → 50, five moves in ten
 once and up only when the encoder clears the higher step by 2.5 fps. The hardware pace keeps margin 0 until it
 is measured on hardware ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
 
+## Above 60 fps (FR-119) — the ceiling law and the pipe, per rate
+
+A viewer may ask for 120 or 144 fps, and the agent grants a rate only where the host has shown it can sustain
+it ([`remote-control.md` §5.4](remote-control.md#54-above-60-fps-the-viewer-asks-the-host-proves-it-fr-119)).
+Here is what the rate controller does differently above 60. At and below 60, every ceiling is byte-identical
+to before.
+
+**The rate law.** The ceiling is computed at `rate_law_fps` (`encode/rate_profile.rs:184`): the rate itself up to
+60, and above that the 60 fps rate scaled by `(fps / 60)^α`, with `HIGH_FPS_ALPHA = 0.8`
+(`encode/rate_profile.rs:179`). The band's top grows the same way. α is the upper envelope of FR-119 P0(d)'s
+offline measurement, where α ran from about 0 to 0.8 by codec and content. A linear law would double the bits
+at 120; a fixed band would halve them per frame.
+
+| Rate | `rate_law_fps` | Bits per frame, as a share of 60 fps |
+|---|---|---|
+| 60 | 60.0 | 1.00 |
+| 120 | 104.5 | 0.87 |
+| 144 | 120.9 | 0.84 |
+
+So 1080p at 144 gets 62.7 Mbit/s where the linear law clamped it to 48, and 2560×1600 or 4K at 144 reach the
+class top, 96.7 Mbit/s.
+
+**The pipe, per rate.** Before granting a rate the agent checks that rate's own ceiling against the session's
+pipe push-back (`pipe_covers`, `encode/frame_rate.rs:263`). Since P2b-18, a pipe that covers 120's ceiling but
+not 144's runs the session at 120 instead of the base rate. Only a push-back refuses: the FR-79 belief's
+`capacity_bps`. The belief's floor is never read as a limit. At 60 fps the floor is the content's weight at 60,
+which is always under the ceiling at 120, so read as a limit it would refuse every healthy session.
+
+⚠️ **A keyframe is not a capacity measurement** (P2b-13, P2b-14, `Reason::KeyframeBurst`,
+`encode/evidence.rs:90`). On a direct path, a window holding a blocked keyframe send is rejected as evidence.
+Before that, one ~625 KB keyframe whose send blocked for 72 ms read as 70 Mbit/s of capacity on a mesh that
+carried 311, and took 120 back on `pipe`.
+
 ## The media plan, in shadow (FR-70 M3a)
 
 FR-70's M3 moves every rate and geometry decision out of the media loop into a
@@ -613,11 +646,13 @@ flowchart TD
     PACE -. "check_fps" .-> CNT
     PACE --> CAP["capture"]
     CAP --> DIMS["inline plan_dims → plan_target"]
-    DIMS -. "check_dims" .-> CNT
+    DIMS -. "check_dims(dims, inputs)" .-> CNT
+    DIMS -. "inputs moved since the snapshot" .-> APART["counted apart<br/>plan_lags · plan_stale_swaps · plan_stale_ticks"]
     DIMS --> BUILD["inline open / adopted replacement<br/>note_built(rate, dims)"]
     BUILD --> TICK["governor.pre_encode_tick"]
-    TICK -. "after_tick: republish bitrate, judge the build" .-> CNT
-    TICK --> OUT["encode → send → heartbeat<br/>plan_divergences · plan_epoch"]
+    TICK -. "after_tick(target, ceiling): republish bitrate, judge the build" .-> CNT
+    TICK -. "a replacement re-rated within the ceiling on its first tick" .-> APART
+    TICK --> OUT["encode → send → heartbeat<br/>plan_divergences · plan_epoch · plan_lags · plan_stale_*"]
 ```
 
 | plan field | what it is | the inline value it is compared with |
@@ -644,13 +679,24 @@ WARN FR-70 M3a: the shadow plan diverged from the pump's inline value (first tim
      field="dims" plan="(1920, 1200)" inline="(944, 590)"
 ```
 
-Read the line, not the count: it names the field and the two numbers. The
-counts the shadow is EXPECTED to show, each a one-frame lag M3b has to design
-for rather than a bug: a native-dims change under a live session, a refine
-flip during the pass's capture (inert on the fleet default — the dial's
-dims-caps are off), a resolution or Priority write landing between the
-snapshot and the inline read, a `pipe_bps` TTL expiry between the two reads.
-Anything else is a plan bug and blocks M3b.
+Read the line, not the count: it names the field and the two numbers.
+
+Three things are counted **apart** from the divergences, because none is a bug
+in the plan, and each logs its first occurrence once:
+
+| heartbeat field | counts | since |
+|---|---|---|
+| `plan_lags` | a geometry difference whose INPUTS moved between the plan's snapshot and the inline read: a native-dims change under a live session (a display-mode switch), a resolution or Priority write landing in between, a viewer joining a shared pipeline, a refine flip or a soft-cap move. The log line names the input that moved (`moved="native"`, `"target"`, `"priority_cap"`, …) | FR-70 M3a.3 |
+| `plan_stale_swaps` | a replacement adopted after the plan moved while it opened | FR-70 M3a.1 |
+| `plan_stale_ticks` | a replacement adopted while the plan held, whose rate the controller moved on its very next tick within the frame's ceiling (a congestion decrease, often set off by the replacement's own IDR) | FR-70 M3a.3 |
+
+The gate reads `plan_divergences` alone. A geometry divergence there had its
+inputs hold, and a bitrate divergence is an encoder built at a rate the plan
+did not stand behind: an inline open re-rated on its first tick, a replacement
+built above its frame's ceiling, or one re-rated on a tick that did not move.
+Each of those is a plan bug and blocks M3b. ⚠️ A `pipe_bps` TTL expiry between
+the two reads would still read as a budget divergence: no counter classifies
+the budget fields yet, and none has been seen.
 
 ⚠️ **No kill switch, on purpose.** The shadow changes no decision, takes no
 await, adds no env read to the frame path (every knob is resolved once per pump

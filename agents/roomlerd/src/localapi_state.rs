@@ -652,6 +652,25 @@ impl DaemonState {
 #[async_trait]
 impl LocalApiState for DaemonState {
     fn status(&self) -> NodeStatus {
+        // #2551 — ONE borrow of the overlay view, dropped before the literal.
+        // A field that borrowed it would hold that read guard until the whole
+        // literal was built, so ten such fields took ten nested read locks.
+        // tokio's watch lock parks a new reader once a writer waits: the
+        // overlay runtime publishing between two of them deadlocked this
+        // thread and the runtime, and every later borrow (the heartbeat's
+        // included) parked behind them until the watchdog killed the worker.
+        let view = self.overlay.borrow();
+        let overlay_ip = view.self_ip.clone();
+        let overlay_ip6 = view.self_ip6.clone();
+        let exit_node = view.exit_node.clone();
+        let route_offer_withheld = view.route_offer_withheld.clone();
+        let host_firewall = view.host_firewall.clone();
+        let dns = view.dns.clone();
+        let srflx = view.srflx.clone();
+        let warm_relay = view.warm_relay.clone();
+        let direct_socks = view.direct_socks.clone();
+        let derp_inbound_drops = view.derp_inbound_drops;
+        drop(view);
         NodeStatus {
             node_id: self.node_id.clone(),
             name: self.name.lock().map(|n| n.clone()).unwrap_or_default(),
@@ -661,8 +680,8 @@ impl LocalApiState for DaemonState {
             tenant_id: self.tenant_id.clone(),
             // The overlay IP the runtime last assigned us — a stable identity,
             // so it's kept even across a brief disconnect.
-            overlay_ip: self.overlay.borrow().self_ip.clone(),
-            overlay_ip6: self.overlay.borrow().self_ip6.clone(),
+            overlay_ip,
+            overlay_ip6,
             // #2892 — its own, until `person_socket::with_machine_network`
             // lends a Mac's per-user half the root half's and says so.
             network_from: None,
@@ -670,10 +689,10 @@ impl LocalApiState for DaemonState {
             // FR-51 P4 — the primary enrollment's nature, stamped at startup.
             ephemeral: self.ephemeral,
             // P5/S4 — exit-node routing status the overlay runtime published.
-            exit_node: self.overlay.borrow().exit_node.clone(),
+            exit_node,
             // FR-97 P0b — why this node offers no routes it was configured to.
-            route_offer_withheld: self.overlay.borrow().route_offer_withheld.clone(),
-            host_firewall: self.overlay.borrow().host_firewall.clone(),
+            route_offer_withheld,
+            host_firewall,
             // S1b — the config file this daemon actually loaded, so the
             // desktop stops guessing which copy is live.
             config_path: self
@@ -681,10 +700,10 @@ impl LocalApiState for DaemonState {
                 .as_ref()
                 .map(|(p, _)| p.display().to_string()),
             // S2 — MagicDNS status the overlay runtime published.
-            dns: self.overlay.borrow().dns.clone(),
+            dns,
             // NAT-traversal — the srflx gather outcome. Empty candidates means
             // this node can't hole-punch and reads as UDP-blocked to every peer.
-            srflx: self.overlay.borrow().srflx.clone(),
+            srflx,
             // FR-33 — captured LAN prefixes, from the process-wide netstate
             // snapshot (a HOST property, like netcheck). `None` when the
             // monitor is not running — and, since 2026-09-06, also when the
@@ -729,7 +748,7 @@ impl LocalApiState for DaemonState {
             #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
             join_refusal: None,
             // C4 stage 1 — the warm TURN/UDP allocation's state.
-            warm_relay: self.overlay.borrow().warm_relay.clone(),
+            warm_relay,
             // B4 — the measured capability vector, read straight from the
             // process-wide netcheck slot (a HOST property; no runtime
             // threading needed). The slot lives behind tunnel-core's
@@ -783,10 +802,10 @@ impl LocalApiState for DaemonState {
                 })
                 .unwrap_or_default(),
             // PR-B1 — per-socket receive liveness + band-walk tripwire.
-            direct_socks: self.overlay.borrow().direct_socks.clone(),
+            direct_socks,
             // #32 — the `/derp` inbound-drop counters, verbatim from the
             // overlay view. `None` when the overlay is not running.
-            derp_inbound_drops: self.overlay.borrow().derp_inbound_drops,
+            derp_inbound_drops,
             direct_bind_walks: Some(
                 tunnel_core::evidence::DIRECT_BIND_WALKS.load(Ordering::Relaxed),
             ),
@@ -2305,6 +2324,64 @@ mod tests {
         assert_eq!(s.privileged, Some(expected));
         // The kind of node does not follow the account.
         assert_eq!(s.mode, DaemonMode::Service);
+    }
+
+    /// #2551 — `status` survives the overlay runtime publishing its view
+    /// while it reads. tokio's watch lock parks a new reader once a writer
+    /// waits, so a `status` that took the view's read lock twice deadlocked
+    /// when a publish landed between the two: it waited on the writer, the
+    /// writer waited on its first guard, and every later borrow, the
+    /// heartbeat's included, waited on both (`signaling=95s@heartbeat.sys`,
+    /// 0.4.177). A writer spinning on `send_replace` keeps that window
+    /// covered, so a deadlocking `status` fails here at the timeout; the
+    /// old one failed every run.
+    #[tokio::test]
+    async fn status_survives_a_view_publish_mid_read() {
+        let (tx, rx) = watch::channel(view());
+        let st = DaemonState::new(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            consent_broker("view-publish"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    tx.send_replace(view());
+                }
+            })
+        };
+        // `status` starts the process-wide netstate monitor on its first
+        // call, which spawns a task: the reader needs the test's runtime.
+        let rt = tokio::runtime::Handle::current();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _rt = rt.enter();
+            for _ in 0..20_000 {
+                assert_eq!(st.status().overlay_ip.as_deref(), Some("100.64.0.2"));
+            }
+            let _ = done_tx.send(());
+        });
+        let outcome = done_rx.recv_timeout(Duration::from_secs(30));
+        stop.store(true, Ordering::Relaxed);
+        // A deadlocked reader never reports and its writer never returns, so
+        // neither is joined. A reader that panicked fails with its own panic.
+        assert!(
+            !matches!(outcome, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "status() deadlocked against the overlay view's writer (#2551)"
+        );
+        writer.join().unwrap();
+        if let Err(panic) = reader.join() {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[tokio::test]

@@ -6,7 +6,13 @@
 // from the defaults.
 import { describe, expect, it } from 'vitest'
 import type { AccessPolicy } from '@/stores/agents'
-import { idleMinuteItems, ownerPromptLabel, policySummary } from '@/components/admin/devicePolicy'
+import {
+  idleMinuteItems,
+  ownerPromptLabel,
+  policySummary,
+  rcOverlayFields,
+  rcOverlayMode,
+} from '@/components/admin/devicePolicy'
 
 function policy(over: Partial<AccessPolicy> = {}): AccessPolicy {
   return {
@@ -62,6 +68,41 @@ describe('policySummary', () => {
 
   it('is empty for a device with no policy yet', () => {
     expect(policySummary(undefined, true)).toEqual([])
+  })
+
+  it('says when the mesh is taken only on a direct link (FR-128)', () => {
+    expect(policySummary(policy({ rc_overlay_auto: true }), false)).toEqual([
+      'Prompt on host',
+      'mesh when direct',
+    ])
+    // `on` wins over `auto`, as it does on the server.
+    expect(policySummary(policy({ rc_overlay: true, rc_overlay_auto: true }), false)).toEqual([
+      'Prompt on host',
+      'over the mesh',
+    ])
+  })
+})
+
+describe('rcOverlayMode / rcOverlayFields (FR-128)', () => {
+  it('reads the stored pair as one choice: on, then auto, else off', () => {
+    expect(rcOverlayMode(policy())).toBe('off')
+    expect(rcOverlayMode(policy({ rc_overlay: false, rc_overlay_auto: false }))).toBe('off')
+    expect(rcOverlayMode(policy({ rc_overlay_auto: true }))).toBe('auto')
+    expect(rcOverlayMode(policy({ rc_overlay: true }))).toBe('on')
+    expect(rcOverlayMode(policy({ rc_overlay: true, rc_overlay_auto: true }))).toBe('on')
+    // A row older than the field has no `rc_overlay_auto` at all, as `policy()`
+    // builds it.
+    expect('rc_overlay_auto' in policy()).toBe(false)
+    expect(rcOverlayMode(policy({ rc_overlay: null }))).toBe('off')
+  })
+
+  it('stores each choice as both fields, and reads back what it stored', () => {
+    expect(rcOverlayFields('off')).toEqual({ rc_overlay: false, rc_overlay_auto: false })
+    expect(rcOverlayFields('auto')).toEqual({ rc_overlay: false, rc_overlay_auto: true })
+    expect(rcOverlayFields('on')).toEqual({ rc_overlay: true, rc_overlay_auto: false })
+    for (const mode of ['off', 'auto', 'on'] as const) {
+      expect(rcOverlayMode(rcOverlayFields(mode))).toBe(mode)
+    }
   })
 })
 

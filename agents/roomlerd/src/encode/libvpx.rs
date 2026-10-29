@@ -529,14 +529,14 @@ impl Vp9Encoder {
         // Size the floor off the ACTUAL stride. The old `width * height * 4`
         // check passed on a padded buffer and then read past the last row.
         let expected = src_stride * (frame.height as usize);
-        if frame.data.len() < expected {
+        if frame.cpu().len() < expected {
             bail!(
                 "vp9-444: BGRA buffer too small — need {} bytes ({}x{} at stride {}), got {}",
                 expected,
                 frame.width,
                 frame.height,
                 src_stride,
-                frame.data.len()
+                frame.cpu().len()
             );
         }
         use dcv_color_primitives as dcv;
@@ -554,7 +554,7 @@ impl Vp9Encoder {
             color_space: dcv::ColorSpace::Bt601,
             num_planes: 3,
         };
-        let src_buffers: &[&[u8]] = &[&frame.data];
+        let src_buffers: &[&[u8]] = &[frame.cpu()];
         let src_strides = &[src_stride];
         let dst_buffers: &mut [&mut [u8]] =
             &mut [&mut self.y_plane, &mut self.u_plane, &mut self.v_plane];
@@ -964,7 +964,7 @@ mod tests {
             height: h,
             stride: w * 4,
             pixel_format: PixelFormat::Bgra,
-            data,
+            data: data.into(),
             monotonic_us: 0,
             monitor: 0,
             damage: crate::capture::Damage::Unknown,
@@ -1023,7 +1023,7 @@ mod tests {
         }
 
         let mut padded_frame = synth_bgra(w, h);
-        padded_frame.data = padded;
+        padded_frame.data = padded.into();
         padded_frame.stride = stride as u32;
 
         let mut from_padded = Vp9Encoder::new(w, h).expect("encoder init");
@@ -1051,7 +1051,7 @@ mod tests {
         let mut frame = synth_bgra(w, h);
         frame.stride = stride as u32;
         // Big enough for the old `w*h*4` check, too small for the real rows.
-        frame.data = vec![0u8; stride * (h as usize - 1)];
+        frame.data = vec![0u8; stride * (h as usize - 1)].into();
 
         let mut enc = Vp9Encoder::new(w, h).expect("encoder init");
         assert!(enc.bgra_to_yuv(&frame).is_err());
@@ -1210,7 +1210,7 @@ mod tests {
                     height: h,
                     stride: self.w * 4,
                     pixel_format: PixelFormat::Bgra,
-                    data,
+                    data: data.into(),
                     monotonic_us: t_us as _,
                     monitor: 0,
                     damage: crate::capture::Damage::Unknown,
@@ -1489,7 +1489,7 @@ mod fr112_bench {
                     height: H,
                     stride: W * 4,
                     pixel_format: PixelFormat::Bgra,
-                    data: d,
+                    data: d.into(),
                     monotonic_us: (k as u64) * 16_667,
                     monitor: 0,
                     damage: crate::capture::Damage::Unknown,

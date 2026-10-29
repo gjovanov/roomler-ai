@@ -142,6 +142,9 @@ mod child {
     /// FR-77 P3c — the 4:4:4 phase's answer: a JSON array of the encoder
     /// names whose 4:4:4 form opened.
     pub(super) const MARKER_444: &str = "ROOMLER_CAPS_444:";
+    /// FR-118 P2-3 — the GPU-input phase's answer: a JSON array of the encoder
+    /// names whose GPU-input form opened and encoded a GPU frame.
+    pub(super) const MARKER_GPU: &str = "ROOMLER_CAPS_GPU:";
     /// FR-77 P3c — printed by the child BEFORE each open it attempts. On a
     /// service host the child's stderr reaches no log, so this is the only
     /// record of which open a dying child was inside; the parent quotes the
@@ -198,6 +201,8 @@ mod child {
     /// [`NAMES_444_ENV`]). Unset = the pre-P3c single-phase probe.
     pub(super) const PHASE_ENV: &str = "ROOMLERD_CAPS_PHASE";
     pub(super) const NAMES_444_ENV: &str = "ROOMLERD_CAPS_444_NAMES";
+    /// FR-118 P2-3 — the names the `gpu` phase tries.
+    pub(super) const NAMES_GPU_ENV: &str = "ROOMLERD_CAPS_GPU_NAMES";
 
     /// Generous, because a cold GPU driver init on a loaded corp laptop is
     /// genuinely slow (~300 ms per codec, several codecs, plus process
@@ -220,6 +225,11 @@ mod child {
         pub(super) caps: AgentCaps,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub(super) vp9_qsv_idr: Option<(bool, bool)>,
+        /// FR-118 P2-3 — the encoders whose GPU-input form the `gpu` phase
+        /// proved: not a wire capability, the gate a session's GPU form reads
+        /// (`gpu_input::plan`). Rides the envelope and the cache with the caps.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub(super) gpu_input: Vec<String>,
     }
 
     /// FR-77 P3c — which phase THIS process was started for.
@@ -233,18 +243,30 @@ mod child {
         Base,
         /// Only the 4:4:4 forms of the names in [`NAMES_444_ENV`].
         Only444,
+        /// FR-118 P2-3 — only the GPU-input forms of the names in
+        /// [`NAMES_GPU_ENV`].
+        OnlyGpu,
     }
 
     pub(super) fn phase_from_env() -> Phase {
         match std::env::var(PHASE_ENV).as_deref() {
             Ok("base") => Phase::Base,
             Ok("444") => Phase::Only444,
+            Ok("gpu") => Phase::OnlyGpu,
             _ => Phase::Full,
         }
     }
 
     pub(super) fn names_444_from_env() -> Vec<String> {
-        std::env::var(NAMES_444_ENV)
+        names_from_env(NAMES_444_ENV)
+    }
+
+    pub(super) fn names_gpu_from_env() -> Vec<String> {
+        names_from_env(NAMES_GPU_ENV)
+    }
+
+    fn names_from_env(var: &str) -> Vec<String> {
+        std::env::var(var)
             .map(|v| {
                 v.split(',')
                     .map(str::trim)
@@ -331,7 +353,48 @@ mod child {
             }
         }
 
-        // The whole cost the daemon paid: both spawns, every open, both parses.
+        // FR-118 P2-3 — the GPU-input forms, in a child of their own: a form
+        // that kills its process costs only the GPU forms (the 4:4:4
+        // lesson), and the daemon never opens one the probe has not proven.
+        // With the switch off there are no candidates, so no child (AC6).
+        let gpu_names = candidates_gpu(&report.caps);
+        if !gpu_names.is_empty() {
+            match run_child(&[
+                (PHASE_ENV, "gpu".to_string()),
+                (NAMES_GPU_ENV, gpu_names.join(",")),
+            ]) {
+                Some(run) if run.ok => match parse_gpu_line(&run.stdout) {
+                    Some(ok) => {
+                        tracing::info!(
+                            elapsed_ms = run.elapsed.as_millis(),
+                            tried = ?gpu_names,
+                            proven = ?ok,
+                            "caps probe: GPU-input phase reported"
+                        );
+                        report.gpu_input = ok;
+                    }
+                    None => tracing::warn!(
+                        tried = ?gpu_names,
+                        "caps probe: GPU-input phase printed no answer — sessions take CPU frames"
+                    ),
+                },
+                other => {
+                    let last = other
+                        .as_ref()
+                        .and_then(|r| last_progress(&r.stdout))
+                        .unwrap_or_else(|| "(none reported)".to_string());
+                    tracing::error!(
+                        tried = ?gpu_names,
+                        last_open = %last,
+                        "caps probe: the GPU-input probe child DIED or hung — sessions take CPU \
+                         frames. The open it was inside is the entry to add to `zero_copy_deny` \
+                         (`<name>:gpu`); the daemon is unaffected."
+                    );
+                }
+            }
+        }
+
+        // The whole cost the daemon paid: every spawn, every open, every parse.
         report.caps.probe_ms =
             Some(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX));
         tracing::info!(
@@ -533,6 +596,7 @@ mod child {
                 Ok(caps) => ProbeReport {
                     caps,
                     vp9_qsv_idr: None,
+                    gpu_input: Vec::new(),
                 },
                 Err(_) => {
                     tracing::warn!(%e, "caps probe: child output was not parseable — no HW advertisement");
@@ -550,6 +614,59 @@ mod child {
             .lines()
             .find_map(|l| l.trim().strip_prefix(MARKER_444))?;
         serde_json::from_str::<Vec<String>>(line).ok()
+    }
+
+    /// FR-118 P2-3 — the GPU-input phase's marked line → the names proven.
+    pub(super) fn parse_gpu_line(out: &str) -> Option<Vec<String>> {
+        let line = out
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(MARKER_GPU))?;
+        serde_json::from_str::<Vec<String>>(line).ok()
+    }
+
+    /// FR-118 P2-3 — the encoders whose GPU-input form the third phase should
+    /// try: the base matrix's QSV and (P3) NVENC cells the GPU input covers
+    /// (4:2:0), minus the cell denylist and `zero_copy_deny`; none at all with
+    /// the switch off or on a build without GPU frames. A gate the probe
+    /// honours is a gate only if the session honours it too: `gpu_input::plan`
+    /// reads the same two lists at every open.
+    pub(super) fn candidates_gpu(caps: &AgentCaps) -> Vec<String> {
+        #[cfg(all(
+            target_os = "windows",
+            feature = "ffmpeg-encoder",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        ))]
+        {
+            if !crate::capture::gpu_frame::zero_copy_enabled() {
+                return Vec::new();
+            }
+            let cells_deny = crate::encode::cells::denied_cells();
+            let gpu_deny = crate::encode::ffmpeg::gpu_hint::denied();
+            let mut names: Vec<String> = Vec::new();
+            for cell in caps.typed_cells() {
+                if !matches!(cell.backend, VideoBackend::Qsv | VideoBackend::Nvenc) {
+                    continue;
+                }
+                let name = format!("{}_{}", cell.codec.wire(), cell.backend.wire());
+                if crate::encode::ffmpeg::gpu_input::gpu_cell(&name, false)
+                    && !crate::encode::cells::cell_denied(&cells_deny, &name, ChromaFormat::Yuv420)
+                    && !crate::encode::ffmpeg::gpu_hint::is_denied(&gpu_deny, &name)
+                    && !names.contains(&name)
+                {
+                    names.push(name);
+                }
+            }
+            names
+        }
+        #[cfg(not(all(
+            target_os = "windows",
+            feature = "ffmpeg-encoder",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        )))]
+        {
+            let _ = caps;
+            Vec::new()
+        }
     }
 
     /// `wait` with a deadline. `None` = still running when time ran out.
@@ -623,6 +740,17 @@ mod child {
 /// be mistaken for the result.
 pub fn print_probe_result() {
     match child::phase_from_env() {
+        child::Phase::OnlyGpu => {
+            let names = child::names_gpu_from_env();
+            let proven = probe_gpu(&names);
+            match serde_json::to_string(&proven) {
+                Ok(json) => child::emit(&format!("{}{json}", child::MARKER_GPU)),
+                Err(e) => {
+                    tracing::error!(%e, "caps probe: could not serialise the GPU-input answer");
+                    std::process::exit(2);
+                }
+            }
+        }
         child::Phase::Only444 => {
             let names = child::names_444_from_env();
             let opened = probe_444(&names);
@@ -691,6 +819,165 @@ fn probe_444(_names: &[String]) -> Vec<String> {
     Vec::new()
 }
 
+/// FR-118 P2-3 — the GPU-input phase: open each named encoder's GPU-input form
+/// on a device of the adapter its frames would come from, and encode two GPU
+/// frames through it. QSV's forms open on the adapter the SystemContext DXGI
+/// arm captures on (the primary output's); P3, NVENC's on the NVIDIA adapter,
+/// where WGC puts its device for them (`gpu_frame::capture_adapter`). A name is
+/// proven only if the encoder took the GPU input (not a fallback to CPU frames)
+/// and packets came out. Every attempt is announced on stdout first, so a dying
+/// process names the open it was inside (`<name>:gpu`, the `zero_copy_deny`
+/// entry).
+#[cfg(all(
+    target_os = "windows",
+    feature = "system-context",
+    feature = "mf-encoder",
+    feature = "scrap-capture",
+    feature = "ffmpeg-encoder"
+))]
+fn probe_gpu(names: &[String]) -> Vec<String> {
+    use crate::capture::gpu_frame::TexturePool;
+    use crate::encode::ffmpeg::FfmpegEncoder;
+    use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+    let mut proven = Vec::new();
+    if !crate::encode::ffmpeg::available() {
+        return proven;
+    }
+    // One device, with its texture pool, per adapter the frames would come
+    // from, made on first need: QSV's on the primary output's adapter, NVENC's
+    // on the NVIDIA adapter (P3). `None` inside = no such device here.
+    type Source = Option<(ID3D11Device, TexturePool)>;
+    let make = |device: Option<ID3D11Device>| -> Source {
+        let device = device?;
+        match TexturePool::new(&device) {
+            Ok(pool) => Some((device, pool)),
+            Err(e) => {
+                tracing::info!(%e, "caps probe: no texture pool on that adapter's device — no GPU-input form there");
+                None
+            }
+        }
+    };
+    let mut qsv_source: Option<Source> = None;
+    let mut nvenc_source: Option<Source> = None;
+    for name in names {
+        let Some(name) = FfmpegEncoder::static_name(name) else {
+            continue;
+        };
+        let source = if name.ends_with("_nvenc") {
+            nvenc_source
+                .get_or_insert_with(|| make(crate::capture::gpu_frame::device_on_vendor(0x10de)))
+        } else {
+            qsv_source.get_or_insert_with(|| {
+                make(crate::system_context::dxgi_direct::primary_output_device())
+            })
+        };
+        let Some((device, pool)) = source.as_ref() else {
+            tracing::info!(
+                encoder = name,
+                "caps probe: no device on this encoder's adapter — no GPU-input form"
+            );
+            continue;
+        };
+        child::emit(&format!("{}{name}:gpu", child::PROGRESS));
+        let t = std::time::Instant::now();
+        let encoded = crate::encode::ffmpeg::gpu_hint::opening_on(Some(device.clone()), || {
+            FfmpegEncoder::new_named_probe(name, PROBE_WIDTH, PROBE_HEIGHT, false)
+        })
+        .and_then(|mut encoder| {
+            let input = encoder.rate_stats().input;
+            if !input.gpu {
+                anyhow::bail!("it opened on CPU frames ({})", input.reason);
+            }
+            let mut bytes = 0usize;
+            for i in 0..2u64 {
+                let frame = probe_gpu_frame(device, pool, i)?;
+                bytes += encoder
+                    .encode_sync(&frame)?
+                    .iter()
+                    .map(|p| p.data.len())
+                    .sum::<usize>();
+            }
+            if bytes == 0 {
+                anyhow::bail!("two GPU frames encoded to nothing");
+            }
+            Ok(bytes)
+        });
+        match encoded {
+            Ok(bytes) => {
+                tracing::info!(
+                    encoder = name,
+                    bytes,
+                    elapsed_ms = t.elapsed().as_millis(),
+                    "caps probe: GPU-input form proven"
+                );
+                proven.push(name.to_string());
+            }
+            Err(e) => tracing::info!(
+                encoder = name,
+                %e,
+                elapsed_ms = t.elapsed().as_millis(),
+                "caps probe: GPU-input form not proven — sessions take CPU frames"
+            ),
+        }
+    }
+    proven
+}
+
+/// A probe-sized GPU frame on `device`: a gradient that moves with `index`,
+/// so the second frame is not a copy of the first.
+#[cfg(all(
+    target_os = "windows",
+    feature = "system-context",
+    feature = "mf-encoder",
+    feature = "scrap-capture",
+    feature = "ffmpeg-encoder"
+))]
+fn probe_gpu_frame(
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    pool: &crate::capture::gpu_frame::TexturePool,
+    index: u64,
+) -> anyhow::Result<crate::capture::Frame> {
+    use crate::capture::{Damage, Frame, FrameData, PixelFormat};
+    let (w, h) = (PROBE_WIDTH, PROBE_HEIGHT);
+    let mut bgra = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let v = ((x + y + index as u32 * 16) & 0xff) as u8;
+            bgra.extend_from_slice(&[v, v.wrapping_mul(3), 255 - v, 0xff]);
+        }
+    }
+    let texture = pool.take(w, h)?;
+    // SAFETY: `bgra` holds `h` rows of `w × 4` bytes, the texture's dims.
+    unsafe {
+        device
+            .GetImmediateContext()
+            .map_err(|e| anyhow::anyhow!("GetImmediateContext: {e}"))?
+            .UpdateSubresource(&texture, 0, None, bgra.as_ptr().cast(), w * 4, 0);
+    }
+    Ok(Frame {
+        width: w,
+        height: h,
+        stride: w * 4,
+        pixel_format: PixelFormat::Bgra,
+        data: FrameData::Gpu(pool.frame(texture, w, h)),
+        monotonic_us: index * 16_667,
+        monitor: 0,
+        damage: Damage::Unknown,
+        source: None,
+    })
+}
+
+#[cfg(not(all(
+    target_os = "windows",
+    feature = "system-context",
+    feature = "mf-encoder",
+    feature = "scrap-capture",
+    feature = "ffmpeg-encoder"
+)))]
+fn probe_gpu(_names: &[String]) -> Vec<String> {
+    Vec::new()
+}
+
 /// Probe dimensions for codec activation checks (HEVC, AV1, VP9-444).
 /// Even number, small enough that any encoder accepts it, matching
 /// what the internal `probe_pipeline` uses for MFT output
@@ -702,6 +989,21 @@ fn probe_444(_names: &[String]) -> Vec<String> {
 const PROBE_WIDTH: u32 = 480;
 #[allow(dead_code)]
 const PROBE_HEIGHT: u32 = 270;
+
+/// FR-118 P2-3 — whether this process is a `caps-probe` child: the one place
+/// an encoder form may open before a probe proved it (proving it is the
+/// child's job).
+#[cfg_attr(
+    not(all(
+        target_os = "windows",
+        feature = "ffmpeg-encoder",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn in_probe_child() -> bool {
+    std::env::var_os(child::CHILD_ENV).is_some()
+}
 
 /// Detect the codecs and HW backends compiled into this agent build
 /// and currently functional on this host. First call runs the
@@ -1150,6 +1452,7 @@ fn cached_or_probed() -> AgentCaps {
                     "caps probe: cache hit — reusing the last probe's encoder matrix"
                 );
                 install_vp9_qsv_idr(hit.vp9_qsv_idr);
+                install_gpu_input(hit.gpu_input.clone());
                 return merge_cached(hit);
             }
             Err(miss) => tracing::info!(
@@ -1170,6 +1473,7 @@ fn cached_or_probed() -> AgentCaps {
     match child::probe() {
         Some(report) => {
             install_vp9_qsv_idr(report.vp9_qsv_idr);
+            install_gpu_input(report.gpu_input.clone());
             if let (Some(key), Some(path)) = (key, path) {
                 if cache::worth_caching(&report.caps) {
                     let file = cache::CacheFile::new(
@@ -1178,7 +1482,8 @@ fn cached_or_probed() -> AgentCaps {
                         report.caps.probe_ms.unwrap_or(0),
                         report.caps.clone(),
                         report.vp9_qsv_idr,
-                    );
+                    )
+                    .with_gpu_input(report.gpu_input.clone());
                     match cache::store(&path, &file) {
                         Ok(()) => tracing::info!(
                             path = %path.display(),
@@ -1238,6 +1543,26 @@ fn install_vp9_qsv_idr(verdict: Option<(bool, bool)>) {
 #[cfg(not(feature = "ffmpeg-encoder"))]
 fn install_vp9_qsv_idr(_verdict: Option<(bool, bool)>) {}
 
+/// FR-118 P2-3 — the GPU-input forms the probe proved, for the session's gate.
+#[cfg(all(
+    target_os = "windows",
+    feature = "ffmpeg-encoder",
+    any(feature = "mf-encoder", feature = "wgc-capture")
+))]
+fn install_gpu_input(proven: Vec<String>) {
+    // FR-118 P3 — the capture side reads the same list to put its device on
+    // those cells' adapter.
+    crate::capture::gpu_frame::install_gpu_input_cells(proven.clone());
+    crate::encode::ffmpeg::gpu_input::install_proven(proven);
+}
+
+#[cfg(not(all(
+    target_os = "windows",
+    feature = "ffmpeg-encoder",
+    any(feature = "mf-encoder", feature = "wgc-capture")
+)))]
+fn install_gpu_input(_proven: Vec<String>) {}
+
 #[cfg(feature = "ffmpeg-encoder")]
 fn vp9_qsv_idr_verdict() -> Option<(bool, bool)> {
     crate::encode::ffmpeg::FfmpegEncoder::vp9_qsv_idr_verdict()
@@ -1258,6 +1583,8 @@ fn in_process_report(attempt_444: bool) -> child::ProbeReport {
     child::ProbeReport {
         caps,
         vp9_qsv_idr: vp9_qsv_idr_verdict(),
+        // The GPU-input forms are proven by their own phase only.
+        gpu_input: Vec::new(),
     }
 }
 
@@ -2127,6 +2454,12 @@ fn rpc_caps() -> Vec<String> {
     // on". A device without an overlay yet still says it and reports `None`.
     if crate::rc_local_turn::enabled() {
         caps.push(RpcCap::LocalRelay);
+    }
+    // FR-128 — it decides `rc_overlay = auto` for each session, while that is
+    // switched on. The hub sends `auto` only to a device that says this, so a
+    // device with the decision switched off reads the policy as `off`.
+    if crate::rc_overlay::auto_enabled() {
+        caps.push(RpcCap::RcOverlayAuto);
     }
     if cfg!(feature = "ssh-server") {
         caps.push(RpcCap::Ssh);
@@ -3415,6 +3748,7 @@ mod tests {
         let report = child::ProbeReport {
             caps: caps.clone(),
             vp9_qsv_idr: Some((true, false)),
+            gpu_input: vec!["hevc_qsv".into()],
         };
         let line = format!(
             "{}{}",
@@ -3432,6 +3766,7 @@ mod tests {
             "FR-77 cells must survive the round trip"
         );
         assert_eq!(back.vp9_qsv_idr, Some((true, false)));
+        assert_eq!(back.gpu_input, vec!["hevc_qsv".to_string()], "FR-118 P2-3");
         assert_eq!(back.caps.probe_ms, Some(1234), "stamped by the parent");
 
         // A P1-shaped line (bare caps, no envelope) is still a valid answer.
@@ -3576,6 +3911,98 @@ mod tests {
         assert!(child::candidates_444(&AgentCaps::default()).is_empty());
     }
 
+    /// FR-118 P2-3, AC6's probe half — the GPU-input phase tries the base
+    /// matrix's QSV 4:2:0 cells the GPU input covers, and NOTHING with the
+    /// switch off, nor a cell either denylist names: the probe opens only
+    /// what a session may (the session's half is `gpu_input`'s
+    /// `plan_reads_every_gate_at_the_open`).
+    #[cfg(all(
+        target_os = "windows",
+        feature = "ffmpeg-encoder",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    ))]
+    #[test]
+    fn the_gpu_phase_tries_only_what_a_session_may_open() {
+        use tunnel_core::env::test_env::{Saved, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _cells = Saved::cleared("ENCODER_CELLS_DENY");
+        let _switch = Saved::cleared("ZERO_COPY");
+        let _deny = Saved::cleared("ZERO_COPY_DENY");
+        let cell = |codec, backend| VideoCell::new(codec, backend, &[ChromaFormat::Yuv420], true);
+        let caps = AgentCaps {
+            video_cells: vec![
+                cell(VideoCodec::Hevc, VideoBackend::Qsv),
+                cell(VideoCodec::Av1, VideoBackend::Qsv),
+                cell(VideoCodec::H264, VideoBackend::Qsv),
+                cell(VideoCodec::Vp9, VideoBackend::Qsv),
+                cell(VideoCodec::Hevc, VideoBackend::Nvenc),
+            ],
+            ..AgentCaps::default()
+        };
+        assert!(child::candidates_gpu(&caps).is_empty(), "the switch is off");
+        // SAFETY: serialised by DENY_ENV_LOCK; the guards restore all three.
+        unsafe { set("ZERO_COPY", "1") };
+        assert_eq!(
+            child::candidates_gpu(&caps),
+            vec!["hevc_qsv", "av1_qsv", "h264_qsv", "hevc_nvenc"],
+            "vp9_qsv takes no GPU frames yet; NVENC does since P3"
+        );
+        // SAFETY: as above.
+        unsafe { set("ZERO_COPY_DENY", "av1_qsv:gpu") };
+        assert_eq!(
+            child::candidates_gpu(&caps),
+            vec!["hevc_qsv", "h264_qsv", "hevc_nvenc"]
+        );
+        // SAFETY: as above.
+        unsafe { set("ENCODER_CELLS_DENY", "h264_qsv:yuv420") };
+        assert_eq!(child::candidates_gpu(&caps), vec!["hevc_qsv", "hevc_nvenc"]);
+        // A list REPLACES the one before it, so both entries go in one list.
+        // SAFETY: as above.
+        unsafe { set("ZERO_COPY_DENY", "av1_qsv:gpu,hevc_nvenc:gpu") };
+        assert_eq!(child::candidates_gpu(&caps), vec!["hevc_qsv"]);
+    }
+
+    /// FR-118 P3 — the GPU phase proves NVENC's GPU-input forms on an NVIDIA
+    /// device: each opens on the D3D11 pool (not CPU frames) and two GPU frames
+    /// come out as packets. Runs where an NVIDIA adapter is (neo16's RTX 5090);
+    /// a runner without one has nothing to prove and says so. The test stands
+    /// in for the probe child (`ROOMLERD_CAPS_CHILD`), whose job is the proof.
+    #[cfg(all(
+        target_os = "windows",
+        feature = "system-context",
+        feature = "mf-encoder",
+        feature = "scrap-capture",
+        feature = "ffmpeg-encoder"
+    ))]
+    #[test]
+    fn the_gpu_phase_proves_nvenc_on_an_nvidia_device() {
+        use tunnel_core::env::test_env::{Saved, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _switch = Saved::cleared("ZERO_COPY");
+        let _deny = Saved::cleared("ZERO_COPY_DENY");
+        let _child = Saved::cleared("CAPS_CHILD");
+        if crate::capture::gpu_frame::device_on_vendor(0x10de).is_none() {
+            eprintln!("no NVIDIA adapter here — nothing to prove");
+            return;
+        }
+        // SAFETY: serialised by DENY_ENV_LOCK; the guards restore all three.
+        unsafe {
+            set("ZERO_COPY", "1");
+            set("CAPS_CHILD", "1");
+        }
+        let names: Vec<String> = ["hevc_nvenc", "h264_nvenc"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let proven = probe_gpu(&names);
+        eprintln!("proven on the NVIDIA device: {proven:?}");
+        assert_eq!(proven, names, "both NVENC forms take GPU frames");
+    }
+
     /// FR-77 P3c — the merge adds `yuv444` to exactly the named cells, and
     /// the legacy `hevc_chroma` follows the P7 rule (hevc_nvenc won AND opened).
     #[test]
@@ -3611,6 +4038,7 @@ mod tests {
                 ..AgentCaps::default()
             },
             vp9_qsv_idr: None,
+            gpu_input: Vec::new(),
         };
         child::merge_444(
             &mut report,
@@ -3652,6 +4080,7 @@ mod tests {
                 ..AgentCaps::default()
             },
             vp9_qsv_idr: None,
+            gpu_input: Vec::new(),
         };
         child::merge_444(&mut qsv, &["hevc_qsv".to_string()]);
         assert_eq!(qsv.caps.hevc_chroma, vec!["yuv420"]);

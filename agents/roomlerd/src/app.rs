@@ -29,7 +29,8 @@ use roomlerd::win_timer;
 use roomlerd::win32_monitors;
 use roomlerd::{
     config, crash_uploader, encode, enrollment, instance_lock, localapi_state, logging, machine,
-    notify, post_install, preflight, service, signaling, updater, watchdog,
+    notify, pairing, pairing_terminal, post_install, preflight, service, signaling, updater,
+    watchdog,
 };
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -56,9 +57,31 @@ enum Command {
         /// Base URL of the Roomler API (e.g. https://roomler.live).
         #[arg(long)]
         server: String,
-        /// Enrollment token, as printed by the admin UI.
-        #[arg(long)]
-        token: String,
+        /// Enrollment token, as printed by the admin UI. Either this or
+        /// `--pair`.
+        #[arg(long, required_unless_present = "pair", conflicts_with = "pair")]
+        token: Option<String>,
+        /// FR-129 A4 — pair in the browser instead of pasting a token: prints
+        /// a code and the page to type it on, waits for the approval, shows
+        /// the org and the approver (with their unique slug and username) and
+        /// asks before enrolling. The question is asked on the terminal
+        /// (`/dev/tty`, the Windows console), never on stdin; with no
+        /// terminal at all only `--pair-org` can let it enroll. The token the
+        /// approval delivers stays inside this process. An ephemeral
+        /// enrollment needs an ephemeral KEY, which a pairing never mints, so
+        /// the two flags refuse each other.
+        #[arg(long, conflicts_with = "ephemeral")]
+        pair: bool,
+        /// FR-129 A4 — with `--pair`: the slug of the org the approval must
+        /// name, as the admin UI shows it. Stated in advance it replaces the
+        /// terminal's question: the device enrolls only if the approval names
+        /// exactly this org, and never otherwise — on a headless install, or
+        /// `ssh host 'curl … | sh -s -- --pair'`, the only way to enroll.
+        /// Refused without `--pair` (`enroll_token_source`: clap's `requires`
+        /// is satisfied by a `SetTrue` flag's own default, so the check is
+        /// explicit).
+        #[arg(long, value_name = "SLUG")]
+        pair_org: Option<String>,
         /// Friendly name shown in the admin agents list.
         #[arg(long)]
         name: String,
@@ -152,6 +175,24 @@ enum Command {
         /// org (a different-tenant token belongs in `enroll`).
         #[arg(long)]
         org: Option<String>,
+    },
+    /// FR-129 B1 (#2338) — fold an enrollment another process wrote into the
+    /// config at `--config`, keeping that config's operator state: what
+    /// `enroll` does for a config it can read. The setup wizard enrolls a
+    /// SYSTEM-scope install in its own process, as the person, into a private
+    /// file, and the person cannot read the root daemon's own config to merge
+    /// it; the privileged install half runs this as root instead. With no
+    /// config at `--config` the file is placed as it is. Takes no token.
+    AdoptEnrollment {
+        /// The freshly enrolled config whose identity is taken.
+        #[arg(long)]
+        from: PathBuf,
+        /// A config key to copy from `--from` as well — the wizard's Advanced
+        /// options the person set explicitly (`overlay_enabled`, …). Each must
+        /// be a config-surface key; an unknown one refuses the whole adopt,
+        /// before anything is written. Repeatable.
+        #[arg(long = "take", value_name = "KEY")]
+        take: Vec<String>,
     },
     /// FR-94 (Windows) — anchor this machine's device, so Fleet RPC runs as
     /// SYSTEM through the Roomler service instead of as the signed-in user.
@@ -1597,6 +1638,8 @@ async fn daemon_main() -> Result<()> {
         Command::Enroll {
             server,
             token,
+            pair,
+            pair_org,
             name,
             machine_global,
             label,
@@ -1607,11 +1650,15 @@ async fn daemon_main() -> Result<()> {
             install_method,
             install_scope,
         } => {
+            // FR-129 A4 — before anything else: a flag combination that
+            // names nothing must be seen at the prompt, not after a browser
+            // approval.
+            let token = enroll_token_source(token.as_deref(), pair, pair_org.as_deref())?;
             enroll_cmd(
                 &config_path,
                 EnrollOptions {
                     server: &server,
-                    enrollment_token: &token,
+                    token,
                     machine_name: &name,
                     machine_global,
                     label: label.as_deref(),
@@ -1628,6 +1675,7 @@ async fn daemon_main() -> Result<()> {
         Command::ReEnroll { token, org } => {
             re_enroll_cmd(&config_path, &token, org.as_deref()).await
         }
+        Command::AdoptEnrollment { from, take } => adopt_enrollment_cmd(&config_path, &from, &take),
         Command::Anchor { action } => {
             use roomlerd::exec_service::{AnchorAction, parse_ssh_ceiling};
             let action = match action {
@@ -2437,6 +2485,47 @@ fn resolve_encoder_preference(
     }
 }
 
+/// FR-129 A4 — where `enroll` gets its enrollment token.
+enum TokenSource<'a> {
+    /// `--token`: pasted by the person, minted in the admin UI.
+    Given(&'a str),
+    /// `--pair`: a browser approval, waited for on this terminal
+    /// ([`pairing_terminal`]). The token it delivers never leaves the
+    /// process: it goes from the poll's answer into `enrollment::enroll` and
+    /// into nothing else. `expect_org` is `--pair-org`.
+    Pair { expect_org: Option<&'a str> },
+}
+
+/// FR-129 A4 — which of `--token` / `--pair [--pair-org SLUG]` the command
+/// line asked for. clap already refuses `--token` beside `--pair` and
+/// requires one of them; this adds the one rule clap cannot express for a
+/// `SetTrue` flag (its `requires` is satisfied by the flag's own default):
+/// `--pair-org` belongs to `--pair`. A blank `--pair-org` is refused too,
+/// rather than read as absent: a scripted `--pair-org "$SLUG"` whose
+/// variable came out empty names no org, and should say so.
+fn enroll_token_source<'a>(
+    token: Option<&'a str>,
+    pair: bool,
+    pair_org: Option<&'a str>,
+) -> Result<TokenSource<'a>> {
+    match (token, pair) {
+        (Some(_), true) => bail!("--token and --pair are two ways to one enrollment: pass one"),
+        (Some(t), false) => {
+            if pair_org.is_some() {
+                bail!("--pair-org applies to --pair only");
+            }
+            Ok(TokenSource::Given(t))
+        }
+        (None, true) => match pair_org.map(str::trim) {
+            Some("") => bail!(
+                "--pair-org needs the org's slug, exactly as the admin UI shows it; an empty one names no org"
+            ),
+            expect_org => Ok(TokenSource::Pair { expect_org }),
+        },
+        (None, false) => bail!("one of --token or --pair is required"),
+    }
+}
+
 /// What `enroll` was asked to do.
 ///
 /// A struct rather than eight positionals because three of them are bools:
@@ -2446,7 +2535,7 @@ fn resolve_encoder_preference(
 /// meaning rather than silently ignored.
 struct EnrollOptions<'a> {
     server: &'a str,
-    enrollment_token: &'a str,
+    token: TokenSource<'a>,
     machine_name: &'a str,
     machine_global: bool,
     label: Option<&'a str>,
@@ -2466,7 +2555,7 @@ struct EnrollOptions<'a> {
 async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     let EnrollOptions {
         server,
-        enrollment_token,
+        token,
         machine_name,
         machine_global,
         label,
@@ -2502,6 +2591,51 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         }
     } else {
         config_path.to_path_buf()
+    };
+
+    // FR-129 A4 — `--pair` waits, minutes if need be, for a person in a
+    // browser, so the pairing runs HERE: after the refusals above (the
+    // install trace, the target path) and the archive replica's, which reads
+    // the config — so a refusal costs nobody an approval — and BEFORE
+    // everything below, which then runs exactly as it runs for a pasted
+    // token: the same read of the existing config, the same machine id, the
+    // same `apply_enrollment` merge, the same save. The read belongs AFTER
+    // the wait: a daemon running on this machine saves its own config in
+    // the meantime (token renewal, remote configuration, the companion's
+    // settings), and a copy read before the wait would be merged and saved
+    // over them. The delivered token lives in `paired` and nowhere else.
+    let paired: String;
+    let enrollment_token: &str = match token {
+        TokenSource::Given(t) => t,
+        TokenSource::Pair { expect_org } => {
+            // `--ephemeral` cannot reach here: clap refuses it beside `--pair`.
+            if archive_replica {
+                roomlerd::archive_replica::preflight(
+                    config::read_if_present(&target_path).is_some(),
+                    ephemeral,
+                )?;
+            }
+            let approved = pairing_terminal::pair_from_terminal(
+                pairing_terminal::PairParams {
+                    server,
+                    machine_name,
+                    role: pairing::PairRole::Daemon,
+                    halves: 1,
+                    client: pairing_terminal::client_for(&install.method),
+                    client_version: env!("CARGO_PKG_VERSION"),
+                    expect_org,
+                },
+                &mut std::io::stdout(),
+                &mut pairing_terminal::TtyConsole,
+            )
+            .await?;
+            paired = approved
+                .tokens
+                .into_iter()
+                .next()
+                .context("the pairing delivered no token")?;
+            &paired
+        }
     };
 
     // Multi-org P1: when a config already exists at the target path, reuse
@@ -2646,13 +2780,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         }
     })?;
     use enrollment::EnrollOutcome;
-    let enrolled_agent_id = match &outcome {
-        EnrollOutcome::RefreshedOrg { label } | EnrollOutcome::AppendedOrg { label } => cfg
-            .find_org(label)
-            .map(|o| o.agent_id.clone())
-            .unwrap_or_else(|| cfg.agent_id.clone()),
-        _ => cfg.agent_id.clone(),
-    };
+    let (enrolled_agent_id, _) = enrollment::enrolled_identity(&cfg, &outcome);
     tracing::info!(
         path = %target_path.display(),
         agent_id = %enrolled_agent_id,
@@ -2739,6 +2867,137 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         eprintln!();
         eprint!("{}", warning_message_for_user_context_enroll());
     }
+    Ok(())
+}
+
+/// FR-129 B1 (#2338) — `roomlerd --config TARGET adopt-enrollment --from FILE
+/// [--take KEY]…`: the identity from `FILE` folded into the config at
+/// `TARGET` through the same dispatch `enroll` uses
+/// ([`enrollment::apply_enrollment`]): a refresh of the same org keeps every
+/// operator-owned key, another org is appended, no config at all is written
+/// fresh. `--take` copies named keys from `FILE` on top — the wizard's
+/// Advanced options the person set by hand — so an untouched box never
+/// overwrites a value the device already had. Nothing here reads a token: the
+/// enroll already happened in the caller's process.
+///
+/// A `FILE` that does not parse is a refusal before anything is written, and
+/// so is a `--take` key outside the config surface. A `TARGET` that exists but
+/// does not load is not a refusal either — nothing can read it anyway — but it
+/// is never silently "absent": its last good copy (`.prev`) is folded into
+/// when that one loads, as the daemon itself would recover at its next start,
+/// the damaged file is kept as `.unreadable`, and both are said on stderr,
+/// which the setup wizard streams to the person
+/// ([`config::read_merge_base`]).
+///
+/// The person's process enrolled with a machine id derived from the host
+/// name, since it could not read this file. When the server answered that
+/// with ANOTHER device row of the same org (a renamed host, a VM cloned with
+/// its config), the kept WireGuard key — which the previous row still claims,
+/// and the overlay join refuses to share — is retired, so the daemon mints a
+/// fresh one, and the previous row is named for the operator
+/// ([`enrollment::retire_key_of_previous_row`]).
+fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Result<()> {
+    let from_path = from.to_path_buf();
+    let Some(fresh) = config::read_if_present(&from_path) else {
+        bail!(
+            "--from {} is not a readable, enrolled config",
+            from_path.display()
+        );
+    };
+    if fresh.agent_token.trim().is_empty() || fresh.agent_id.trim().is_empty() {
+        bail!(
+            "--from {} carries no enrollment (agent_id / agent_token are empty)",
+            from_path.display()
+        );
+    }
+    // Every `--take` key is checked first: a typo must not cost the adopt.
+    let mut taken: Vec<(String, Option<String>)> = Vec::with_capacity(take.len());
+    for key in take {
+        let key = key.trim();
+        let Some(entry) = roomlerd::config_surface::entry_for(&fresh, key) else {
+            bail!("--take {key:?} is not a config key");
+        };
+        taken.push((key.to_string(), entry.value));
+    }
+    let target = config_path.to_path_buf();
+    let existing = match config::read_merge_base(&target) {
+        config::MergeBase::Absent => None,
+        config::MergeBase::Loaded(cfg) => Some(cfg),
+        config::MergeBase::Unreadable { reason, recovered } => {
+            let kept = config::keep_unreadable(&target).map_err(|e| e.to_string());
+            let said = config::describe_unreadable(&target, &reason, recovered.is_some(), &kept);
+            tracing::warn!(path = %target.display(), %reason, recovered = recovered.is_some(), "adopt-enrollment: {said}");
+            eprintln!("WARNING: {said}");
+            recovered
+        }
+    };
+    let previous = existing.clone();
+    let new_agent_id = fresh.agent_id.clone();
+    let (mut cfg, outcome) = enrollment::apply_enrollment(existing, fresh, None, false)?;
+    let retired = enrollment::retire_key_of_previous_row(previous.as_ref(), &mut cfg, &outcome);
+    if let Some(row) = &retired {
+        let said = enrollment::describe_previous_row(row, &new_agent_id);
+        tracing::warn!(previous = %row.agent_id, new = %new_agent_id, org = %row.org_label, "adopt-enrollment: a new device row; the previous row's overlay key retired");
+        eprintln!("WARNING: {said}");
+    }
+    use enrollment::EnrollOutcome;
+    // The `--take` keys are the person's boxes for the enrollment they just
+    // made. When that enrollment is ANOTHER org — appended beside the
+    // primary, or a secondary refreshed — every one of them is the PRIMARY's
+    // (the device's consent policy, the primary's mesh and routes), so none
+    // is taken: the wizard's own fold refuses them the same way
+    // (`enroll_step::finish`).
+    let added_org = matches!(
+        outcome,
+        EnrollOutcome::RefreshedOrg { .. } | EnrollOutcome::AppendedOrg { .. }
+    );
+    if added_org && !taken.is_empty() {
+        eprintln!(
+            "NOTE: this enrollment is another organization, added beside the primary one; the \
+             options set for it ({}) are the primary enrollment's settings and were not changed.",
+            taken
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        taken.clear();
+    }
+    for (key, value) in &taken {
+        roomlerd::config_surface::apply(&mut cfg, key, value.as_deref())
+            .map_err(|e| anyhow::anyhow!("--take {key}: {e}"))?;
+    }
+    config::save(&target, &cfg).context("saving the adopted config")?;
+    let what = match &outcome {
+        EnrollOutcome::FreshPrimary => "written fresh (no config was here)".to_string(),
+        EnrollOutcome::RefreshedPrimary => {
+            "folded into the existing config (same server + org; operator settings kept)"
+                .to_string()
+        }
+        EnrollOutcome::ReplacedPrimary => "replaced the primary enrollment".to_string(),
+        EnrollOutcome::RefreshedOrg { label } => format!("refreshed org {label:?}"),
+        EnrollOutcome::AppendedOrg { label } => {
+            format!("appended as an ADDITIONAL org {label:?} (the primary enrollment stays)")
+        }
+    };
+    tracing::info!(path = %target.display(), ?outcome, taken = taken.len(), "enrollment adopted");
+    println!(
+        "Enrollment adopted: {what}{}. Config written to: {}",
+        if taken.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} key(s) taken from the new config ({})",
+                taken.len(),
+                taken
+                    .iter()
+                    .map(|(k, _)| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+        target.display()
+    );
     Ok(())
 }
 
@@ -3526,6 +3785,16 @@ async fn run_cmd(
             Ok(()) => tracing::info!("overlay: generated + persisted node WireGuard key"),
             Err(e) => tracing::warn!(error = %e, "overlay: failed to persist WG key"),
         }
+    }
+
+    // FR-129 B1 — the same for every secondary org on the mesh: one appended
+    // by a build without an overlay surface (the setup wizard, the tray), or
+    // whose key a new device row retired, has none and would join nothing.
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    if roomlerd::org_join::heal_org_keys(&mut cfg)
+        && let Err(e) = config::save(config_path, &cfg)
+    {
+        tracing::warn!(error = %e, "overlay: failed to persist the orgs' WG keys");
     }
 
     // #2493 — a secondary in `netstack` mode joins only with a loopback port
@@ -4500,6 +4769,8 @@ async fn run_cmd(
         supervised,
         worker_channels,
         shutdown_rx.clone(),
+        // #2987 — a worker whose daemon is gone stops through this door.
+        shutdown_tx.clone(),
     ));
     #[cfg(not(unix))]
     let _ = supervised;
@@ -5800,7 +6071,7 @@ async fn encoder_smoke_cmd(
             height: h,
             stride: w * 4,
             pixel_format: roomlerd::capture::PixelFormat::Bgra,
-            data,
+            data: data.into(),
             monotonic_us: (i as u64) * 33_333,
             monitor: 0,
             damage: roomlerd::capture::Damage::Unknown,
@@ -5925,7 +6196,7 @@ async fn encoder_reconfigure_sweep_cmd(
             height: h,
             stride: w * 4,
             pixel_format: roomlerd::capture::PixelFormat::Bgra,
-            data,
+            data: data.into(),
             monotonic_us: (n as u64) * 33_333,
             monitor: 0,
             damage: roomlerd::capture::Damage::Unknown,
@@ -6368,7 +6639,7 @@ async fn capture_smoke_cmd(
         let mut out = Vec::with_capacity(w * h * 3 + 32);
         out.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
         for y in 0..h {
-            let row = &frame.data[y * stride..y * stride + w * 4];
+            let row = &frame.cpu()[y * stride..y * stride + w * 4];
             for x in 0..w {
                 // BGRA in memory -> RGB on the wire.
                 out.push(row[x * 4 + 2]);
@@ -6903,6 +7174,144 @@ mod tests {
         assert!(cli.is_ok(), "rc.30 snippet line 2 must parse: {cli:?}");
     }
 
+    // ─── FR-129 A4: `enroll --pair` ─────────────────────────────────────────
+
+    const SERVER: &str = "https://example.invalid";
+
+    /// `--pair` stands in for `--token`: the two are exclusive and one is
+    /// required — the served scripts spell both, so each must keep parsing.
+    #[test]
+    fn enroll_takes_a_token_or_a_pairing_but_not_both() {
+        let cli = Cli::try_parse_from([
+            "roomlerd", "enroll", "--server", SERVER, "--name", "lab-1", "--pair",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Enroll {
+                token,
+                pair,
+                pair_org,
+                ..
+            }) => {
+                assert!(token.is_none());
+                assert!(pair);
+                assert!(pair_org.is_none());
+            }
+            other => panic!("expected Enroll --pair, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from([
+            "roomlerd",
+            "enroll",
+            "--server",
+            SERVER,
+            "--name",
+            "lab-1",
+            "--token",
+            "tok-for-the-parse-test",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Enroll { token, pair, .. }) => {
+                assert_eq!(token.as_deref(), Some("tok-for-the-parse-test"));
+                assert!(!pair);
+            }
+            other => panic!("expected Enroll --token, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "roomlerd",
+                "enroll",
+                "--server",
+                SERVER,
+                "--name",
+                "lab-1",
+                "--token",
+                "tok-for-the-parse-test",
+                "--pair",
+            ])
+            .is_err(),
+            "--token and --pair are two ways to one token: refused together"
+        );
+        assert!(
+            Cli::try_parse_from(["roomlerd", "enroll", "--server", SERVER, "--name", "lab-1"])
+                .is_err(),
+            "one of the two is required"
+        );
+    }
+
+    /// `--pair-org` belongs to `--pair`, and a pairing can never be an
+    /// ephemeral enrollment (that needs an ephemeral KEY, never minted by an
+    /// approval).
+    #[test]
+    fn pair_org_needs_pair_and_pair_refuses_ephemeral() {
+        let cli = Cli::try_parse_from([
+            "roomlerd",
+            "enroll",
+            "--server",
+            SERVER,
+            "--name",
+            "lab-1",
+            "--pair",
+            "--pair-org",
+            "acme",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Enroll { pair, pair_org, .. }) => {
+                assert!(pair);
+                assert_eq!(pair_org.as_deref(), Some("acme"));
+            }
+            other => panic!("expected Enroll --pair --pair-org, got {other:?}"),
+        }
+        // clap parses `--token … --pair-org …` (a SetTrue flag's `requires`
+        // is satisfied by its own default), so the refusal is the run-time
+        // one, before any token is spent or any pairing started.
+        let e = enroll_token_source(Some("tok-for-the-parse-test"), false, Some("acme"))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            e.contains("--pair-org applies to --pair only"),
+            "--pair-org without --pair names nothing: {e}"
+        );
+        assert!(matches!(
+            enroll_token_source(None, true, Some(" acme ")),
+            Ok(TokenSource::Pair {
+                expect_org: Some("acme")
+            })
+        ));
+        // A blank `--pair-org` names no org: refused, not read as absent.
+        let e = enroll_token_source(None, true, Some("  "))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("names no org"), "{e}");
+        assert!(matches!(
+            enroll_token_source(None, true, None),
+            Ok(TokenSource::Pair { expect_org: None })
+        ));
+        assert!(matches!(
+            enroll_token_source(Some("tok-for-the-parse-test"), false, None),
+            Ok(TokenSource::Given("tok-for-the-parse-test"))
+        ));
+        assert!(enroll_token_source(Some("t"), true, None).is_err());
+        assert!(enroll_token_source(None, false, None).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "roomlerd",
+                "enroll",
+                "--server",
+                SERVER,
+                "--name",
+                "lab-1",
+                "--pair",
+                "--ephemeral",
+            ])
+            .is_err(),
+            "a paired token is a standard token: --ephemeral would enroll a permanent device under a random id"
+        );
+    }
+
     // ─── rc.52: config-path resolution ladder ──────────────────────────────
 
     #[test]
@@ -6987,4 +7396,280 @@ mod tests {
         assert!(!should_self_heal_config(true, peruser, mg, true));
     }
     // RETIRED-NAME-ANCHOR-END
+
+    // ─── FR-129 B1 (#2338): adopt-enrollment ───────────────────────────────
+
+    /// The operator state #2338 names, on a config that stands in for the
+    /// root daemon's: the mesh on, a declared route, a lock policy.
+    fn operator_config() -> config::AgentConfig {
+        let mut existing = config::test_fixture();
+        existing.overlay_enabled = true;
+        existing.overlay_wg_secret_key = Some("existing-wg-key".into());
+        existing.lock_on_end = roomler_ai_remote_control::models::LockOnEnd::Always;
+        existing
+            .tunnel_routes
+            .push(tunnel_core::localapi::RouteDescriptor {
+                id: "db".into(),
+                kind: tunnel_core::localapi::FlowKind::Forward,
+                node: "abc123".into(),
+                local: 15432,
+                remote: Some("db.internal:5432".into()),
+                transport: String::new(),
+                enabled: true,
+                org: None,
+            });
+        existing
+    }
+
+    /// A fresh enrollment of the same machine into the same org: a new
+    /// token, the same agent id (the server reuses the row), a new name.
+    fn fresh_same_org() -> config::AgentConfig {
+        let mut fresh = config::test_fixture();
+        fresh.agent_token = "tok-2".into();
+        fresh.machine_name = "renamed".into();
+        fresh
+    }
+
+    /// #2338 — a reinstall's enrollment is folded into the existing config:
+    /// the identity is the new one, every operator-owned key survives, and
+    /// `lock_on_end` is not reset to a fresh install's default.
+    #[test]
+    fn adopt_enrollment_keeps_operator_state_on_a_reinstall() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("etc").join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        config::save(&target, &operator_config()).unwrap();
+        config::save(&from, &fresh_same_org()).unwrap();
+
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+
+        let merged = config::load(&target).unwrap();
+        assert_eq!(merged.agent_token, "tok-2", "the new credential");
+        assert_eq!(merged.machine_name, "renamed", "the new name");
+        assert!(merged.overlay_enabled, "overlay_enabled survived");
+        assert_eq!(
+            merged.overlay_wg_secret_key.as_deref(),
+            Some("existing-wg-key"),
+            "the WG key did not rotate"
+        );
+        assert_eq!(merged.tunnel_routes.len(), 1, "the declared route survived");
+        assert_eq!(merged.tunnel_routes[0].id, "db");
+        assert_eq!(
+            merged.lock_on_end,
+            roomler_ai_remote_control::models::LockOnEnd::Always,
+            "lock_on_end kept the device's own value"
+        );
+        // The source file is the caller's to shred; it is untouched here.
+        assert!(from.exists());
+    }
+
+    /// With no config at the target the fresh one is placed as it is — the
+    /// first install — and the file is the daemon's own 0600.
+    #[test]
+    fn adopt_enrollment_places_a_fresh_config_where_none_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("etc").join("roomler").join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        config::save(&from, &fresh_same_org()).unwrap();
+
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+
+        let placed = config::load(&target).unwrap();
+        assert_eq!(placed.agent_token, "tok-2");
+        assert!(
+            !placed.overlay_enabled,
+            "a fresh config carries its own defaults"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the config holds a bearer token");
+        }
+    }
+
+    /// `--take` copies a named key from the new config on top of the kept
+    /// state — the box the person ticked wins, the one they never touched
+    /// does not exist on the command line and changes nothing — and an
+    /// unknown key refuses before anything is written.
+    #[test]
+    fn adopt_enrollment_takes_only_the_keys_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        config::save(&target, &operator_config()).unwrap();
+        let mut fresh = fresh_same_org();
+        fresh.overlay_enabled = false;
+        fresh.auto_grant_session = false;
+        config::save(&from, &fresh).unwrap();
+
+        // Untouched: the existing `true` stays although the fresh file says false.
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+        let merged = config::load(&target).unwrap();
+        assert!(merged.overlay_enabled);
+        assert!(merged.auto_grant_session);
+
+        // Named: the fresh file's value lands, and only for that key.
+        adopt_enrollment_cmd(&target, &from, &["overlay_enabled".to_string()]).unwrap();
+        let merged = config::load(&target).unwrap();
+        assert!(!merged.overlay_enabled, "the taken key");
+        assert!(merged.auto_grant_session, "the key not named");
+        assert_eq!(merged.tunnel_routes.len(), 1, "everything else still kept");
+
+        // A key outside the surface: refused, and the target untouched.
+        let before = std::fs::read_to_string(&target).unwrap();
+        let e = adopt_enrollment_cmd(&target, &from, &["no_such_key".to_string()]).unwrap_err();
+        assert!(e.to_string().contains("not a config key"), "{e}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
+    }
+
+    /// The person's boxes describe the enrollment they made. When that is
+    /// ANOTHER org, appended beside the primary, every `--take` key is the
+    /// primary's — `auto_grant_session` is the device's consent policy — so
+    /// none is taken, as the wizard's own fold refuses them. Before this an
+    /// install into org B with "auto-grant" ticked auto-granted org A's
+    /// remote-control sessions.
+    #[test]
+    fn adopt_enrollment_takes_no_key_onto_another_orgs_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        let mut existing = operator_config(); // the primary: example.invalid / tid / aid
+        existing.auto_grant_session = false;
+        config::save(&target, &existing).unwrap();
+        let mut other = config::test_fixture();
+        other.server_url = "https://other.invalid".into();
+        other.tenant_id = "tid-other".into();
+        other.agent_id = "aid-other".into();
+        other.agent_token = "tok-other".into();
+        other.auto_grant_session = true;
+        other.overlay_enabled = false;
+        config::save(&from, &other).unwrap();
+
+        adopt_enrollment_cmd(
+            &target,
+            &from,
+            &[
+                "auto_grant_session".to_string(),
+                "overlay_enabled".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let merged = config::load(&target).unwrap();
+        assert_eq!(merged.agent_id, "aid", "the primary stays the primary");
+        assert!(
+            !merged.auto_grant_session,
+            "the primary's consent policy is not the added org's box"
+        );
+        assert!(merged.overlay_enabled, "nor is the primary's mesh");
+        assert_eq!(merged.orgs.len(), 1, "the org is appended all the same");
+        assert_eq!(merged.orgs[0].agent_id, "aid-other");
+    }
+
+    /// A `--from` that is not an enrolled config is a refusal, and the target
+    /// is left alone.
+    #[test]
+    fn adopt_enrollment_refuses_an_unenrolled_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        config::save(&target, &operator_config()).unwrap();
+        let mut empty = config::test_fixture();
+        empty.agent_token = String::new();
+        config::save(&from, &empty).unwrap();
+        let before = std::fs::read_to_string(&target).unwrap();
+        assert!(adopt_enrollment_cmd(&target, &from, &[]).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
+        assert!(adopt_enrollment_cmd(&target, &dir.path().join("missing.toml"), &[]).is_err());
+    }
+
+    /// FR-129 B1 (F3) — the wizard enrolled the system scope with a machine id
+    /// derived from the host name (root's config is unreadable to it), and the
+    /// host was renamed since, so the server made ANOTHER row of the same org.
+    /// The fold keeps the operator state but must not keep the WireGuard key,
+    /// which the previous row still claims: the new row's overlay join would be
+    /// refused for good (`wg_key_taken_by_other`, fail-closed).
+    #[test]
+    fn adopt_enrollment_retires_the_key_a_previous_row_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        let mut existing = operator_config(); // agent "aid", machine "mid", key existing-wg-key
+        existing.overlay_wg_key_epoch = 2;
+        config::save(&target, &existing).unwrap();
+        let mut fresh = fresh_same_org();
+        fresh.machine_id = "mid-from-the-new-host-name".into();
+        fresh.agent_id = "aid-new-row".into();
+        config::save(&from, &fresh).unwrap();
+
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+
+        let merged = config::load(&target).unwrap();
+        assert_eq!(merged.agent_id, "aid-new-row", "the new row's identity");
+        assert_eq!(merged.machine_id, "mid-from-the-new-host-name");
+        assert_eq!(
+            merged.overlay_wg_secret_key, None,
+            "the previous row's key is retired; the daemon mints one at start"
+        );
+        assert_eq!(merged.overlay_wg_key_epoch, 0);
+        assert!(merged.overlay_enabled, "the operator state stays");
+        assert_eq!(merged.tunnel_routes.len(), 1);
+        assert_eq!(
+            merged.lock_on_end,
+            roomler_ai_remote_control::models::LockOnEnd::Always
+        );
+
+        // The ordinary reinstall (the server reused the row): the key stays.
+        let mut again = fresh_same_org();
+        again.agent_id = "aid-new-row".into();
+        again.machine_id = "mid-from-the-new-host-name".into();
+        config::save(&from, &again).unwrap();
+        let mut keyed = config::load(&target).unwrap();
+        keyed.overlay_wg_secret_key = Some("minted-for-the-new-row".into());
+        config::save(&target, &keyed).unwrap();
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+        assert_eq!(
+            config::load(&target)
+                .unwrap()
+                .overlay_wg_secret_key
+                .as_deref(),
+            Some("minted-for-the-new-row")
+        );
+    }
+
+    /// FR-129 B1 (F4) — a root config that is there and does not load (an
+    /// unclean shutdown zeroed it) is neither refused nor silently replaced:
+    /// its last good copy carries the operator state over, as the daemon's own
+    /// load would, and the damaged file is kept aside, never over `.prev`.
+    #[test]
+    fn adopt_enrollment_recovers_a_damaged_target_from_its_last_good_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let from = dir.path().join("fresh.toml");
+        config::save(&target, &operator_config()).unwrap();
+        config::save(&target, &operator_config()).unwrap(); // rotates the first to .prev
+        let len = std::fs::metadata(&target).unwrap().len() as usize;
+        std::fs::write(&target, vec![0u8; len]).unwrap();
+        config::save(&from, &fresh_same_org()).unwrap();
+
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+
+        let merged = config::load(&target).unwrap();
+        assert_eq!(merged.agent_token, "tok-2", "the new credential");
+        assert!(merged.overlay_enabled, "recovered from .prev");
+        assert_eq!(merged.tunnel_routes.len(), 1, "recovered from .prev");
+        let kept = config::unreadable_copy_path(&target);
+        assert_eq!(std::fs::read(&kept).unwrap(), vec![0u8; len]);
+        // A damaged target with no last good copy: written fresh, still kept.
+        std::fs::write(&target, b"overlay_enabled = ture\n").unwrap();
+        std::fs::remove_file(target.with_extension("toml.prev")).unwrap();
+        adopt_enrollment_cmd(&target, &from, &[]).unwrap();
+        let fresh = config::load(&target).unwrap();
+        assert!(!fresh.overlay_enabled, "nothing to recover");
+        assert_eq!(
+            std::fs::read_to_string(&kept).unwrap(),
+            "overlay_enabled = ture\n"
+        );
+    }
 }

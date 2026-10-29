@@ -8,10 +8,11 @@
 //! P4c-2 (`roomler-installer` drove the daemon MSIs,
 //! `roomler-tunnel-installer` the tunnel CLI). The operator picks a
 //! role on the Welcome step
-//! — three daemon flavours (Windows) or the tunnel client (any OS) —
-//! and the wizard drives the matching install pipeline end-to-end:
-//! detect → server + device → token → install (download / MSI or
-//! extract / enroll) → done.
+//! — three daemon flavours (Windows), two (Linux) or one (macOS) when
+//! the chosen server allows them (FR-129 B1), or the tunnel client
+//! (any OS) — and the wizard drives the matching install pipeline
+//! end-to-end: detect → server + device → token → install (download /
+//! MSI, the `install.sh` halves, or extract / enroll) → done.
 //!
 //! Architecture mirrors the rc.28 wizard lineage:
 //!
@@ -88,6 +89,34 @@ fn main() {
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        // FR-129 B1 — the window's own close button: whatever a Linux/macOS
+        // daemon install left in the private scratch directory (an enrolled
+        // system-scope config kept for a Retry) is shredded before the
+        // process goes. `cmd_exit_wizard` does the same for Finish/Cancel.
+        // While the privileged half runs the window does not close at all:
+        // the exit would remove that directory — the script a terminal step
+        // has yet to run, the config a root half has yet to place — from
+        // under a step that cannot be stopped from here.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if wizard_app::unix_daemon::privileged_running() {
+                    use tauri_plugin_dialog::{DialogExt as _, MessageDialogKind};
+                    api.prevent_close();
+                    window
+                        .dialog()
+                        .message(
+                            "An install step is running as administrator and cannot be \
+                             interrupted. Cancel it from the wizard while the password prompt is \
+                             still open, or wait for it to finish; the wizard closes after that.",
+                        )
+                        .title("Roomler Setup")
+                        .kind(MessageDialogKind::Warning)
+                        .show(|_| {});
+                    return;
+                }
+                wizard_app::unix_daemon::clear_kept();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::cmd_detect_install,
             commands::cmd_default_device_name,
@@ -103,6 +132,15 @@ fn main() {
             // FR-102 P3b — the opt-in diagnostics box and the page boundaries.
             commands::cmd_diagnostics_opt_in,
             commands::cmd_diagnostics_page,
+            // FR-129 A3 — device pairing: start, poll, open the page, cancel.
+            commands::cmd_pair_start,
+            commands::cmd_pair_poll,
+            commands::cmd_pair_open,
+            commands::cmd_pair_cancel,
+            // FR-129 B1 — the server's switches, and the terminal fallback's
+            // "I've run it".
+            commands::cmd_setup_features,
+            commands::cmd_privileged_half_done,
         ])
         .run(tauri::generate_context!())
         .expect("error while running roomler-setup");

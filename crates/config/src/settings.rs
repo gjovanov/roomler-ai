@@ -71,6 +71,115 @@ pub struct Settings {
     /// FR-115 P4a — the relay allowance on DERP. Absent ⇒ off.
     #[serde(default)]
     pub relay_allowance: RelayAllowanceSettings,
+    /// FR-129 A1 — device pairing (`/api/pair/*`). Absent ⇒ on, with its
+    /// defaults.
+    #[serde(default)]
+    pub pairing: PairingSettings,
+    /// FR-129 B1-s — what `GET /api/setup/features` advertises to the
+    /// installers and the download cards. Absent ⇒ every switch off.
+    #[serde(default)]
+    pub setup: SetupSettings,
+}
+
+/// FR-129 B1-s — `[setup]`, env `ROOMLER__SETUP__*`: the switches
+/// `GET /api/setup/features` advertises (`crates/modules/fleet/src/setup_release.rs`,
+/// `setup_features`). Each is the operator's assertion about a RELEASED
+/// client, not a fact about this server, so each defaults **off** and is
+/// flipped in the deploy env — later a default change — once the field run
+/// that proves the client is on record.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SetupSettings {
+    /// "The released Roomler Setup installs the full daemon on Linux and
+    /// macOS, and it is field-proven" (FR-129 B1; AC11). While `false`, the
+    /// SPA's enrollment dialog and both homepages offer the wizard for a
+    /// daemon on Windows only, as before FR-129, and a B1 wizard shows no
+    /// daemon card off Windows (AC14, key design B.6) — so the cards can be
+    /// turned off without a release. Default **off**: the wizard that can do
+    /// it has not shipped. Env: `ROOMLER__SETUP__WIZARD_UNIX_DAEMON`.
+    #[serde(default)]
+    pub wizard_unix_daemon: bool,
+    /// "The released Roomler Setup pairs — signs the person in from their
+    /// browser instead of asking for a token (FR-129 A3) — and that is
+    /// field-proven against this server." `pairing` on `/api/setup/features`
+    /// is a fact about the SERVER (`/api/pair/*` answers; on by default); this
+    /// is the claim about the DOWNLOAD, and both homepages word the install
+    /// lead as "sign in from your browser" only when both are true. Without
+    /// it, a server image promoted before the first `setup-v*` that carries
+    /// A3 would promise a flow the wizard cannot do. Default **off**.
+    /// Env: `ROOMLER__SETUP__WIZARD_PAIRING`.
+    #[serde(default)]
+    pub wizard_pairing: bool,
+}
+
+/// FR-129 A1 — `[pairing]`, env `ROOMLER__PAIRING__*`: the RFC 8628-shaped
+/// device pairing an installer runs instead of asking for a pasted token
+/// (`docs/fr/FR-129-guided-cross-platform-installer.md`, "The pairing API").
+#[derive(Debug, Deserialize, Clone)]
+pub struct PairingSettings {
+    /// The kill switch. `false`: every `/api/pair/*` route answers the empty
+    /// 404 an older server answers, so a client falls back to the paste
+    /// step. Default **on**. Env: `ROOMLER__PAIRING__ENABLED`.
+    #[serde(default = "pairing_default_on")]
+    pub enabled: bool,
+    /// How long a pairing lives from `start`, in seconds — the `expires_in`
+    /// the installer is told, and the row's own expiry (every read compares
+    /// it to the clock; the TTL sweep only tidies). Default 900 (15 min,
+    /// operator decision 2, 2026-10-28). Env: `ROOMLER__PAIRING__TTL_SECS`.
+    #[serde(default = "pairing_default_ttl_secs")]
+    pub ttl_secs: u64,
+    /// The polling interval the installer is told at `start`, in seconds; a
+    /// poll sooner than the row's current interval answers `slow_down` and
+    /// lengthens it by 5 s (RFC 8628 §3.5). Default 5.
+    /// Env: `ROOMLER__PAIRING__POLL_INTERVAL_SECS`.
+    #[serde(default = "pairing_default_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// How many pairings one client address may start per hour, on top of
+    /// the global per-IP governor; past it `start` answers 429 (audited).
+    /// `0` disables this ceiling. Per pod, in memory. Default 60: a
+    /// corporate NAT rolling out a floor of machines must not be refused
+    /// at install #21, and sixty is still a bound on the user-code space
+    /// one address can fill. Env: `ROOMLER__PAIRING__START_PER_IP_PER_HOUR`.
+    #[serde(default = "pairing_default_start_per_ip_per_hour")]
+    pub start_per_ip_per_hour: u32,
+    /// How many misses (a lookup or deny of a code that names no live
+    /// pending pairing, an approval refused) one account may make per hour;
+    /// past it that account's lookups, approvals and denials answer 429 for
+    /// the rest of the hour (audited). `0` disables this ceiling. Per pod, in
+    /// memory. Default 10. Env: `ROOMLER__PAIRING__MISSES_PER_ACCOUNT_PER_HOUR`.
+    #[serde(default = "pairing_default_misses_per_account_per_hour")]
+    pub misses_per_account_per_hour: u32,
+}
+
+fn pairing_default_on() -> bool {
+    true
+}
+
+fn pairing_default_ttl_secs() -> u64 {
+    900
+}
+
+fn pairing_default_poll_interval_secs() -> u64 {
+    5
+}
+
+fn pairing_default_start_per_ip_per_hour() -> u32 {
+    60
+}
+
+fn pairing_default_misses_per_account_per_hour() -> u32 {
+    10
+}
+
+impl Default for PairingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: pairing_default_on(),
+            ttl_secs: pairing_default_ttl_secs(),
+            poll_interval_secs: pairing_default_poll_interval_secs(),
+            start_per_ip_per_hour: pairing_default_start_per_ip_per_hour(),
+            misses_per_account_per_hour: pairing_default_misses_per_account_per_hour(),
+        }
+    }
 }
 
 /// FR-90 P3-1 — `[vault]`, env `ROOMLER__VAULT__*`.
@@ -1954,6 +2063,63 @@ mod hive_settings_tests {
         assert!(!absent.teleport_have_want, "a file without the key");
         let on: HiveSettings = toml::from_str("teleport_have_want = true").unwrap();
         assert!(on.teleport_have_want);
+    }
+}
+
+#[cfg(test)]
+mod pairing_settings_tests {
+    use super::PairingSettings;
+
+    /// FR-129 A1 — pairing ships ON with RFC 8628's order of magnitude
+    /// (15 min, 5 s), both where the settings are built whole and where a
+    /// file leaves every key out; `enabled = false` is the kill switch.
+    #[test]
+    fn pairing_is_on_by_default_and_a_file_can_switch_it_off() {
+        let d = PairingSettings::default();
+        assert!(d.enabled);
+        assert_eq!(d.ttl_secs, 900);
+        assert_eq!(d.poll_interval_secs, 5);
+        assert_eq!(d.start_per_ip_per_hour, 60);
+        assert_eq!(d.misses_per_account_per_hour, 10);
+        let absent: PairingSettings = toml::from_str("").expect("every key defaults");
+        assert!(absent.enabled, "a file without the key");
+        assert_eq!(absent.ttl_secs, 900);
+        let off: PairingSettings = toml::from_str("enabled = false\nttl_secs = 60").unwrap();
+        assert!(!off.enabled);
+        assert_eq!(off.ttl_secs, 60);
+        assert_eq!(
+            off.poll_interval_secs, 5,
+            "the other keys keep their defaults"
+        );
+    }
+}
+
+#[cfg(test)]
+mod setup_settings_tests {
+    use super::SetupSettings;
+
+    /// FR-129 B1-s — both claims about the released wizard ship OFF, where
+    /// the settings are built whole and where a file leaves the keys out;
+    /// only a file (or `ROOMLER__SETUP__WIZARD_UNIX_DAEMON=true`,
+    /// `ROOMLER__SETUP__WIZARD_PAIRING=true`) turns one on, and neither
+    /// implies the other. The default is the claim: the wizard that installs
+    /// the daemon off Windows, or pairs, has not shipped, and a card or a
+    /// lead the released wizard cannot honour is the failure the switches
+    /// exist to prevent.
+    #[test]
+    fn the_wizard_claims_are_off_until_turned_on() {
+        let d = SetupSettings::default();
+        assert!(!d.wizard_unix_daemon);
+        assert!(!d.wizard_pairing);
+        let absent: SetupSettings = toml::from_str("").expect("every key defaults");
+        assert!(!absent.wizard_unix_daemon, "a file without the key");
+        assert!(!absent.wizard_pairing, "a file without the key");
+        let daemon: SetupSettings = toml::from_str("wizard_unix_daemon = true").unwrap();
+        assert!(daemon.wizard_unix_daemon);
+        assert!(!daemon.wizard_pairing, "each key on its own");
+        let pairing: SetupSettings = toml::from_str("wizard_pairing = true").unwrap();
+        assert!(pairing.wizard_pairing);
+        assert!(!pairing.wizard_unix_daemon, "each key on its own");
     }
 }
 

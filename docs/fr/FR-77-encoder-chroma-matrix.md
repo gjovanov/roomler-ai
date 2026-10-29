@@ -27,8 +27,8 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
 - The agent hard-wires `yuv420` for the VP9/AV1/H.264 data-channel codecs
   (`agents/roomlerd/src/peer.rs:5310-5317`); the ONLY hardware 4:4:4 path is
   `hevc_nvenc` with the RExt profile (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:765-782`),
-  advertised by `hevc_chroma` iff the name is `hevc_nvenc` (`agents/roomlerd/src/encode/caps.rs:548-551`).
-- The picker (`ui/src/views/remote/RemoteControl.vue:2977-2985`) is a hard-coded list
+  advertised by `hevc_chroma` iff the name is `hevc_nvenc` (`agents/roomlerd/src/encode/caps.rs:612-615`).
+- The picker (`ui/src/views/remote/RemoteControl.vue:2985-2993`) is a hard-coded list
   — `auto / av1 / hevc / hevc-444 / vp9-444 / vp9-420 / h264` — English literals, no
   i18n, chroma inside the value. Its per-agent override allow-list omitted `hevc-444`
   (fixed in #1468 by making the list the single source the type derives from).
@@ -36,7 +36,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
   `h264/hevc/av1 × nvenc/qsv/amf/videotoolbox` + `vp9_qsv` (profile 0 only, `:655-659`).
   VAAPI was never wired (`agents/roomlerd/Cargo.toml:208-209` still promises it for
   "rc.74"); no `*_mf` name exists anywhere. macOS ships FFmpeg again since 2026-08-25
-  (`release-agent.yml:2335-2358`) — several docs still say it does not.
+  (`release-agent.yml:2343-2366`) — several docs still say it does not.
 - There is **no video decoder anywhere on the agent side** (grep-confirmed). The
   browser decodes, through WebCodecs, and probes per codec string
   (`ui/src/composables/useRemoteControl.ts:2918-2948`).
@@ -116,7 +116,7 @@ Two structural facts shape the design: Chromium keeps **one** `HEVCPROFILE_REXT`
 every RExt chroma form, so `isConfigSupported` cannot tell 4:4:4 from 4:2:2 (the
 mismatch surfaces at the first SPS); and no browser API says whether hardware or software
 decoded. Only a real-bytes trial proves a cell, and the page-scoped transport ban
-(`useRemoteControl.ts:4178`) already is that trial.
+(`useRemoteControl.ts:4435`) already is that trial.
 
 **The honest 4:4:4 cells** are therefore: HEVC 4:4:4 (hardware both ends on modern
 NVIDIA and Intel; not on Linux Chrome), VP9 4:4:4 (software or Intel hardware encode,
@@ -150,7 +150,7 @@ flowchart LR
    hardware-only device, so a software implementation fails the open. (FR-16's
    "advertises hardware, runs software" case.)
 3. **The probe is eager, in the child, bounded.** One timeout per open; the probe's
-   duration reported in the hello. Today's probe (`caps.rs:51-296`) opens the first
+   duration reported in the hello. Today's probe (`caps.rs:51-318`) opens the first
    working backend per codec in ~2.6 s on the dev box; the matrix prunes to roughly
    16–18 opens on a Windows host. A cache keyed by GPU + driver version is added only if
    fleet p95 crosses ~3 s.

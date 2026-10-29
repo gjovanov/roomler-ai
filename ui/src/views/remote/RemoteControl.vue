@@ -1942,14 +1942,21 @@
             {{ localRelayTooltip }}
           </div>
           <!-- FR-121 — which of your devices this browser runs on, so the
-               server hands its relay over and the browser never asks for the
-               local-network permission. Next Connect, like the switch. -->
+               server hands their relays over and the browser never asks for
+               the local-network permission. Next Connect, like the switch.
+               P3b (#2774) — more than one: a computer can run several agents
+               (Windows and WSL), each with its own relay and its own path. -->
           <v-select
             v-if="localRelayOn"
-            v-model="thisDevice"
+            v-model="thisDevicesPick"
             :items="thisDeviceItems"
             :disabled="sessionLive"
             label="This browser runs on"
+            placeholder="Not set — look for a relay on this computer"
+            persistent-placeholder
+            multiple
+            chips
+            closable-chips
             density="compact"
             variant="outlined"
             hide-details
@@ -2538,6 +2545,7 @@ import {
   awaitingConsentLabel,
   drawerPasteFiles,
   uploadOutcomeMessage,
+  thisDevicesFromPick,
 } from '@/composables/useRemoteControl'
 import {
   PICKER_CHROMAS,
@@ -3712,12 +3720,13 @@ function toggleLocalRelay() {
   rc.setLocalRelayEnabled(!localRelayOn.value)
 }
 
-// FR-121 — "This browser runs on": one of the signed-in person's own devices
-// that report their loopback relay (`local-relay`), or none of them. Named, the
-// server hands that device's relay over and the browser never fetches
-// 127.0.0.1, so Chrome's local-network permission is never asked. Per browser,
-// and like the switch above it takes effect on the next Connect. A probe that
-// finds a relay naming its device fills it in by itself.
+// FR-121 — "This browser runs on": the signed-in person's own devices that
+// report their loopback relay (`local-relay`), or none of them. Named, the
+// server hands their relays over and the browser never fetches 127.0.0.1, so
+// Chrome's local-network permission is never asked. Per browser, and like the
+// switch above it takes effect on the next Connect. A probe that finds relays
+// naming the person's devices fills them in by itself. P3b (#2774) — every
+// device on this computer, not one: a computer can run several agents.
 const thisDeviceItems = computed(() => {
   const me = authStore.user?.id
   const own = agentStore.agents
@@ -3731,9 +3740,12 @@ const thisDeviceItems = computed(() => {
     ...own,
   ]
 })
-const thisDevice = computed<string>({
-  get: () => rc.thisDeviceId.value ?? '',
-  set: (v) => rc.setThisDevice(v === '' ? null : v),
+const thisDevicesPick = computed<string[]>({
+  get: () => {
+    const v = rc.thisDevices.value
+    return v === null ? [] : v === 'none' ? ['none'] : [...v]
+  },
+  set: (next) => rc.setThisDevices(thisDevicesFromPick(thisDevicesPick.value, next)),
 })
 const localRelayRefusedText = computed<string | null>(() => {
   const why = rc.localRelayRefused.value
@@ -3742,7 +3754,9 @@ const localRelayRefusedText = computed<string | null>(() => {
     not_your_device: 'that device is not yours',
     other_network: 'that device is in another organization',
     device_offline: 'that device is offline, or reports no relay',
-    rc_overlay_off: 'this device does not let remote desktop use the mesh (rc_overlay)',
+    // FR-128 — also `auto` on an agent too old to decide it, which reads as off.
+    rc_overlay_off:
+      'this device does not let remote desktop use the mesh (rc_overlay off, or auto on an agent that predates it)',
     same_device: 'you are viewing the device this browser runs on',
   }
   return `The local relay was not used: ${reasons[why] ?? why}.`

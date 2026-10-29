@@ -186,17 +186,27 @@ pub fn init() {
     let (upload_layer, upload_rx) = LogUploadLayer::new();
     let _ = LOG_UPLOAD_RX.set(Mutex::new(Some(upload_rx)));
 
-    let dir = resolve_log_dir();
-    let _ = LOG_DIR.set(dir.clone());
-
-    if let Some(d) = dir.as_deref()
-        && std::fs::create_dir_all(d).is_ok()
-    {
-        prune_old_logs(d, KEEP_DAYS);
+    // #3073 — a log dir that cannot be used falls back to the per-profile
+    // one, and the reason is the first thing logged. It used to drop to
+    // stdout-only in silence, and a service's stdout goes nowhere: a sealed
+    // `service-logs` left a daemon running for hours with no log at all.
+    let (opened, notes) = open_log_appender(resolve_log_dir(), fallback_log_dir(), |d| {
+        std::fs::create_dir_all(d)?;
         // P3d Slice B: write under the new `roomlerd.log` basename
         // (S1b: `roomlerd-service.log` for the SCM host — see
-        // [`ServiceLogRole`]).
-        let appender = tracing_appender::rolling::daily(d, log_basename());
+        // [`ServiceLogRole`]). The builder, not `rolling::daily`, which
+        // panics when the file cannot be opened.
+        tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix(log_basename())
+            .build(d)
+            .map_err(std::io::Error::other)
+    });
+    let _ = LOG_DIR.set(opened.as_ref().map(|(d, _)| d.clone()));
+
+    if let Some((dir, appender)) = opened {
+        let d = dir.as_path();
+        prune_old_logs(d, KEEP_DAYS);
         let (nb, guard) = tracing_appender::non_blocking(appender);
         let _ = GUARD.set(guard);
         let file = fmt::layer()
@@ -219,6 +229,66 @@ pub fn init() {
         // No log dir → no panic hook. Stdout-only is the right
         // fallback for cargo-test and ad-hoc `cargo run` from a
         // checkout where `directories` couldn't resolve a home.
+    }
+    // After the subscriber is up, so the reason reaches the file that IS in
+    // use and, through the upload layer, the server.
+    for note in notes {
+        tracing::warn!(%note, "logging: the log directory could not be used (#3073)");
+    }
+}
+
+/// #3073 — where [`init`] logs when the resolved directory cannot be used:
+/// the per-profile data dir, which for a SYSTEM process is SYSTEM's own
+/// profile. `None` under `cfg(test)`, for the reason [`resolve_log_dir`] is.
+fn fallback_log_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    let dirs = crate::appdirs::project_dirs()?;
+    Some(dirs.data_local_dir().join("logs"))
+}
+
+/// #3073 — open the log appender in `primary`, else in `fallback`. The notes
+/// say what failed, for [`init`] to log once the subscriber is up. Generic
+/// over the appender, so the choice is tested without touching a disk.
+fn open_log_appender<A>(
+    primary: Option<PathBuf>,
+    fallback: Option<PathBuf>,
+    mut open: impl FnMut(&Path) -> std::io::Result<A>,
+) -> (Option<(PathBuf, A)>, Vec<String>) {
+    let Some(primary) = primary else {
+        return (None, Vec::new());
+    };
+    let first = match open(&primary) {
+        Ok(appender) => return (Some((primary, appender)), Vec::new()),
+        Err(e) => e,
+    };
+    let Some(fallback) = fallback.filter(|f| *f != primary) else {
+        return (
+            None,
+            vec![format!(
+                "could not log in {}: {first}; this process keeps no log file",
+                primary.display()
+            )],
+        );
+    };
+    match open(&fallback) {
+        Ok(appender) => (
+            Some((fallback.clone(), appender)),
+            vec![format!(
+                "could not log in {}: {first}; logging in {} instead",
+                primary.display(),
+                fallback.display()
+            )],
+        ),
+        Err(second) => (
+            None,
+            vec![format!(
+                "could not log in {} ({first}) or in {} ({second}); this process keeps no log file",
+                primary.display(),
+                fallback.display()
+            )],
+        ),
     }
 }
 
@@ -886,6 +956,56 @@ mod tests {
         // No panic when the dir doesn't exist.
         let bogus = std::path::PathBuf::from("definitely/not/a/real/path/12345");
         prune_old_logs_at(&bogus, SystemTime::now());
+    }
+
+    /// #3073 — a log directory that cannot be used falls back, and says why.
+    /// It used to drop to stdout in silence: a service with a sealed
+    /// `service-logs` ran for hours with no log and nothing saying so.
+    #[test]
+    fn an_unusable_log_dir_falls_back_and_says_why() {
+        let primary = PathBuf::from("C:/ProgramData/roomler/roomler/service-logs");
+        let fallback = PathBuf::from("C:/profile/AppData/Local/roomler/roomler/data/logs");
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        // Usable: the primary, and nothing to say.
+        let (got, notes) = open_log_appender(Some(primary.clone()), Some(fallback.clone()), |d| {
+            Ok(d.to_path_buf())
+        });
+        assert_eq!(got.map(|(d, _)| d), Some(primary.clone()));
+        assert!(notes.is_empty());
+
+        // Sealed: the fallback, and the reason names both places.
+        let (got, notes) = open_log_appender(Some(primary.clone()), Some(fallback.clone()), |d| {
+            if d == primary { Err(denied()) } else { Ok(()) }
+        });
+        assert_eq!(got.map(|(d, _)| d), Some(fallback.clone()));
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("service-logs") && notes[0].contains("instead"),
+            "{}",
+            notes[0]
+        );
+
+        // Neither usable: no file, and it says so instead of going quiet.
+        let (got, notes) = open_log_appender(Some(primary.clone()), Some(fallback.clone()), |_| {
+            Err::<(), _>(denied())
+        });
+        assert!(got.is_none());
+        assert!(notes[0].contains("keeps no log file"), "{}", notes[0]);
+
+        // A fallback that IS the primary is not a second chance.
+        let mut tries = 0;
+        let (got, notes) = open_log_appender(Some(primary.clone()), Some(primary.clone()), |_| {
+            tries += 1;
+            Err::<(), _>(denied())
+        });
+        assert!(got.is_none());
+        assert_eq!(tries, 1);
+        assert!(notes[0].contains("keeps no log file"), "{}", notes[0]);
+
+        // No directory at all (tests, no home): stdout-only, quietly, as ever.
+        let (got, notes) = open_log_appender(None, Some(fallback), |_| Ok(()));
+        assert!(got.is_none() && notes.is_empty());
     }
 }
 // RETIRED-NAME-ANCHOR-END

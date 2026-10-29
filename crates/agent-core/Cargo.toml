@@ -36,7 +36,11 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = { workspace = true }
+# #2078 — a save keeps the keys this build does not model: `serde_ignored`
+# names them, and `preserve_order` keeps the merged file in the struct's own
+# order instead of sorting it.
+serde_ignored = "0.1.14"
+toml = { workspace = true, features = ["preserve_order"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = "0.2"
@@ -56,10 +60,13 @@ libc = "0.2"
 # FR-84 D6 — the companion's `…\Run\Roomler Desktop` value, written by the
 # daemon (HKLM from the elevated service install, HKCU from the per-user one)
 # and by the companion (its own HKCU toggle). The 0.59 line the daemon and the
-# companion already resolve; Registry is the only feature this crate adds.
+# companion already resolve. FR-129 A4 adds Console: `pairing_terminal` writes
+# its `Join …? [y/N]` question with `WriteConsoleW`, which the daemon's own
+# ConPTY code already enables on the same line.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_System_Console",
     "Win32_System_Registry",
 ] }
 
@@ -87,3 +94,12 @@ optional = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# #3073's elevated test hardens from the daemon's position: it disables the
+# privileges that let icacls rewrite a DACL it has no access to, which a shell
+# may hand it enabled (AdjustTokenPrivileges, OpenProcessToken).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Security",
+    "Win32_System_Threading",
+] }

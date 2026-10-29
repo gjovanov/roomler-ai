@@ -191,6 +191,9 @@ export async function installMocks(context: BrowserContext, unmocked: Set<string
       const table: Record<string, unknown> = {
         '/auth/me': user,
         '/capabilities': { modules: ['chat', 'conference', 'fleet', 'remote', 'network', 'saas'], compiled: ['chat', 'conference', 'fleet', 'remote', 'network', 'saas'], version: 'smoke' },
+        // FR-129 B1-s — every switch ON: the fuller layout (a wizard button
+        // on every install card, the pairing lead) is the one to fit.
+        '/setup/features': { pairing: true, wizard_unix_daemon: true, wizard_pairing: true },
         '/tenant': tenants,
         [`${T}/member/me`]: { permissions: -1, is_owner: true },
         [`${T}/agent`]: { items: agents, total: agents.length, page: 1, per_page: 100, total_pages: 1 },

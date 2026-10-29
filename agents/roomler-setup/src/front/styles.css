@@ -107,6 +107,17 @@ pre {
   word-break: break-all;
 }
 
+/* FR-129 B1 — the install.sh halves' last lines, as they arrive. A fixed
+   height so the page does not grow with the companion's package pull. */
+.script-output {
+  max-height: 11em;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.78em;
+  line-height: 1.35;
+}
+
 /* Step indicator (1 of 5 across the top) */
 .step-indicator { margin-bottom: 4px; }
 .step-indicator ol {
@@ -146,6 +157,15 @@ pre {
    renders → true step-pages. */
 .step[hidden] {
   display: none;
+}
+/* The same trap for every element the SPA toggles with `hidden` (FR-129 B1):
+   a role card is a `label.radio`, `display: flex`, so a hidden card stayed on
+   screen. On Linux and macOS the released wizard showed the Windows daemon
+   cards it cannot install, and the server's `wizard_unix_daemon` switch hid
+   nothing — measured in a field cell, the DOM saying "hidden" over a card in
+   plain view. `[hidden]` now wins over every author `display`. */
+[hidden] {
+  display: none !important;
 }
 
 .card {
@@ -349,7 +369,8 @@ button.secondary:hover:not(:disabled) {
   to { opacity: 1; transform: translate(-50%, 0); }
 }
 
-/* S2: advanced-options collapsible on the Server step */
+/* S2: advanced-options collapsible on the Server step (and FR-129's
+   "I already have a token" on the Join step) */
 details.card > summary {
   cursor: pointer;
   font-weight: 600;
@@ -357,6 +378,27 @@ details.card > summary {
   user-select: none;
 }
 details.card[open] > summary { margin-bottom: 12px; }
+
+/* FR-129 A3: the pairing code — large enough to read across a desk and to
+   type into the browser from. The buttons under it sit left, beside the
+   code they act on, unlike the step's own Back/Install footer. */
+.pair-code {
+  font-family: "Cascadia Mono", "Consolas", "SF Mono", Menlo, monospace;
+  font-size: 2.4rem;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-align: center;
+  padding: 14px 12px;
+  margin: 8px 0 12px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg-strong);
+  user-select: all;
+}
+.actions.actions-start { justify-content: flex-start; }
+#pair-card .info,
+#pair-card .warning { margin-top: 0; }
 .field.checkline {
   display: flex;
   flex-direction: row;
