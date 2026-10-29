@@ -200,6 +200,9 @@ features = [
 system-configuration = "0.7"
 system-configuration-sys = "0.6"
 core-foundation = "0.9"
+# #3080 — `child`'s `poll`, `fcntl` and `getrlimit` (Linux has it below).
+# Already in the lock through roomlerd, so no new crate.
+libc = "0.2"
 
 # FR-110: `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE` for the carrier sockets (socket2
 # has no FORCE options). Already in the lock through roomlerd and agent-core, so

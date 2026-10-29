@@ -385,6 +385,12 @@ jobs:
         # of it — the old actions/cache restore needed no token).
         env:
           GH_TOKEN: ${{ github.token }}
+          # FR-6 wave 32: a daemon seed restarts at ~2.2-2.7 GB after a cold
+          # build and grows ~340-390 MB per warm one, so the 3,000 MB default
+          # dropped the Windows seed on four reseeds in a row (0.4.180-0.4.183).
+          # 4,500 allows four to six warm builds; compressed, a seed is
+          # 535-790 MiB, far under the 2 GiB release-asset limit.
+          SEED_TARGET_MAX_MB: "4500"
         with:
           shared-key: agent-linux
 
@@ -1120,6 +1126,7 @@ jobs:
         # of it — the old actions/cache restore needed no token).
         env:
           GH_TOKEN: ${{ github.token }}
+          SEED_TARGET_MAX_MB: "4500" # FR-6 wave 32: see build-linux
         with:
           shared-key: agent-linux-arm64
 
@@ -1594,6 +1601,7 @@ jobs:
         # of it — the old actions/cache restore needed no token).
         env:
           GH_TOKEN: ${{ github.token }}
+          SEED_TARGET_MAX_MB: "4500" # FR-6 wave 32: see build-linux
         with:
           shared-key: agent-windows-vp9-444
 
@@ -2564,6 +2572,7 @@ jobs:
         # of it — the old actions/cache restore needed no token).
         env:
           GH_TOKEN: ${{ github.token }}
+          SEED_TARGET_MAX_MB: "4500" # FR-6 wave 32: see build-linux
         with:
           shared-key: agent-macos
 

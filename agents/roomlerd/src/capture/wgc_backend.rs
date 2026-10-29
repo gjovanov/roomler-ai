@@ -54,17 +54,17 @@ use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_11_0,
-    D3D_FEATURE_LEVEL_11_1,
+    D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_0,
+    D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_FLAG, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_BIND_FLAG, D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device,
     ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIAdapter1, IDXGIDevice};
 use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
@@ -73,8 +73,9 @@ use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemIntero
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows::core::{IInspectable, Interface};
 
+use super::gpu_frame::{self, TexturePool};
 use super::pointer::{PointerRequest, RecordedPointer};
-use super::{Damage, DirtyRect, DownscalePolicy, Frame, PixelFormat, ScreenCapture};
+use super::{Damage, DirtyRect, DownscalePolicy, Frame, FrameData, PixelFormat, ScreenCapture};
 
 /// Number of buffers in the frame pool. `2` is the canonical WGC
 /// default — one frame is being decoded by the OS while the other is
@@ -124,7 +125,9 @@ struct SharedSlot {
 /// handler's hot path doesn't allocate the outer struct when nobody
 /// is reading.
 struct FramePayload {
-    bgra: Vec<u8>,
+    /// FR-118 P3 — the pixels: a GPU frame on the capture's device when the
+    /// zero-copy switch is on, the read-back bytes otherwise.
+    data: FrameData,
     width: u32,
     height: u32,
     stride: u32,
@@ -496,7 +499,7 @@ fn payload_to_frame(payload: FramePayload, monitor: u8, start: Instant) -> Frame
         height: payload.height,
         stride: payload.stride,
         pixel_format: PixelFormat::Bgra,
-        data: payload.bgra,
+        data: payload.data,
         monotonic_us,
         monitor,
         damage: payload.damage,
@@ -527,7 +530,54 @@ fn worker_main(
     // 1. Create an ID3D11Device (+ context) we'll use for: (a) wrapping
     //    as IDirect3DDevice for the frame pool, (b) CopyResource
     //    from the capture frame to a staging texture for CPU readback.
-    let (d3d_device, d3d_context) = create_d3d11_device()?;
+    //
+    //    FR-118 P3 — with the zero-copy switch on, the device goes on the
+    //    GPU-input encoder's adapter, and each frame is copied into a texture
+    //    on it and handed on as a GPU frame instead of being read back. A
+    //    device that will not open there, or will not take a texture pool,
+    //    leaves the backend exactly as it was: the default adapter, CPU frames.
+    let zero_copy = gpu_frame::zero_copy_enabled();
+    let chosen = if zero_copy {
+        gpu_frame::capture_adapter()
+    } else {
+        None
+    };
+    let (d3d_device, d3d_context, adapter_name) = match chosen {
+        Some((adapter, name)) => match create_d3d11_device(Some(&adapter)) {
+            Ok((device, context)) => (device, context, Some(name)),
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    adapter = %name,
+                    "FR-118: WGC's device would not open on the GPU-input encoder's adapter — the default adapter"
+                );
+                let (device, context) = create_d3d11_device(None)?;
+                (device, context, None)
+            }
+        },
+        None => {
+            let (device, context) = create_d3d11_device(None)?;
+            (device, context, None)
+        }
+    };
+    let texture_pool: Option<Arc<TexturePool>> = if zero_copy {
+        match TexturePool::new(&d3d_device) {
+            Ok(pool) => Some(Arc::new(pool)),
+            Err(e) => {
+                tracing::warn!(%e, "FR-118: zero-copy is on, but WGC's device takes no texture pool — CPU frames");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if zero_copy {
+        tracing::info!(
+            adapter = adapter_name.as_deref().unwrap_or("the default adapter"),
+            gpu_frames = texture_pool.is_some(),
+            "FR-118: WGC zero-copy ON — frames stay on the GPU, read back only if a consumer asks"
+        );
+    }
 
     // 2. Wrap the D3D11 device as the WinRT `IDirect3DDevice` that
     //    Direct3D11CaptureFramePool::CreateFreeThreaded expects.
@@ -602,6 +652,7 @@ fn worker_main(
     let handler_d3d_context = d3d_context.clone();
     let handler_shared = shared.clone();
     let handler_staging = staging_slot.clone();
+    let handler_pool = texture_pool.clone();
 
     let handler =
         TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(move |sender, _args| {
@@ -631,30 +682,51 @@ fn worker_main(
                 return Ok(());
             };
 
-            // Copy to staging (allocated on first use / size change).
-            let readback_started = Instant::now();
-            let bgra = match copy_to_cpu(
-                &handler_d3d_device,
-                &handler_d3d_context,
-                &handler_staging,
-                &gpu_tex,
-                w,
-                h,
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::debug!(%e, "wgc: CPU readback failed");
-                    return Ok(());
+            // FR-118 P3 — on the GPU: a copy into a texture from the pool,
+            // handed on as a GPU frame. The frame's own surface goes back to
+            // WGC when `frame` drops, as it always has; the copy is queued on
+            // this device first, so it reads the surface before WGC's next
+            // write into it. A copy that fails (the pool could not make a
+            // texture) reads this frame back instead, as the DXGI arm falls
+            // back: an encoder on GPU input uploads a CPU frame into its pool.
+            let gpu = handler_pool.as_deref().and_then(|pool| {
+                match copy_to_pool(pool, &handler_d3d_context, &gpu_tex, w, h) {
+                    Ok(gpu) => Some(gpu),
+                    Err(e) => {
+                        tracing::debug!(%e, "wgc: GPU copy failed — this frame is read back");
+                        None
+                    }
                 }
+            });
+            let data = if let Some(gpu) = gpu {
+                FrameData::Gpu(gpu)
+            } else {
+                // Copy to staging (allocated on first use / size change).
+                let readback_started = Instant::now();
+                let bgra = match copy_to_cpu(
+                    &handler_d3d_device,
+                    &handler_d3d_context,
+                    &handler_staging,
+                    &gpu_tex,
+                    w,
+                    h,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!(%e, "wgc: CPU readback failed");
+                        return Ok(());
+                    }
+                };
+                // FR-118 P0 — counted only when it succeeded, like a frame.
+                handler_shared.readback_us_total.fetch_add(
+                    readback_started.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                handler_shared
+                    .readback_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                FrameData::Cpu(bgra)
             };
-            // FR-118 P0 — counted only when it succeeded, like a frame.
-            handler_shared.readback_us_total.fetch_add(
-                readback_started.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            handler_shared
-                .readback_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let stride = w * 4;
 
             // DirtyRegions() lands on the IDirect3D11CaptureFrame2
@@ -665,7 +737,7 @@ fn worker_main(
             let damage = collect_damage(&frame, w, h);
 
             let mut payload = FramePayload {
-                bgra,
+                data,
                 width: w,
                 height: h,
                 stride,
@@ -807,25 +879,42 @@ fn apply_min_update(
 }
 
 /// Builds a new `ID3D11Device` + `ID3D11DeviceContext` tuned for WGC:
-/// BGRA support (needed to read the capture surface's format), driver
-/// type `HARDWARE`, feature-level cascade starting at 11_1. The device
-/// is created bound to the default adapter — multi-GPU hosts where
-/// the capture target lives on a non-default adapter would need
-/// `EnumAdapters1` + adapter-bound `D3D11CreateDevice`; defer until
-/// that's a real field issue.
-fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+/// BGRA support (needed to read the capture surface's format), feature-level
+/// cascade starting at 11_1.
+///
+/// The device is bound to the default adapter (driver type `HARDWARE`), unless
+/// `adapter` names one (driver type `UNKNOWN`, as `D3D11CreateDevice` requires
+/// with an explicit adapter). FR-118 P3: with the zero-copy switch on, that is
+/// the GPU-input encoder's adapter (`gpu_frame::capture_adapter`). WGC accepts
+/// a device on an adapter without the monitor, and the OS copies each frame
+/// across (open decision 1, measured in FR-118 §9.4).
+fn create_d3d11_device(
+    adapter: Option<&IDXGIAdapter1>,
+) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let feature_levels = [
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_10_0,
     ];
+    let base: Option<IDXGIAdapter> = match adapter {
+        Some(a) => Some(
+            a.cast()
+                .map_err(|e| anyhow!("IDXGIAdapter1 -> IDXGIAdapter cast: {e:?}"))?,
+        ),
+        None => None,
+    };
+    let driver_type: D3D_DRIVER_TYPE = if base.is_some() {
+        D3D_DRIVER_TYPE_UNKNOWN
+    } else {
+        D3D_DRIVER_TYPE_HARDWARE
+    };
     let mut device: Option<ID3D11Device> = None;
     let mut context: Option<ID3D11DeviceContext> = None;
     let mut actual_level = D3D_FEATURE_LEVEL_11_0;
     unsafe {
         D3D11CreateDevice(
-            None, // default adapter
-            D3D_DRIVER_TYPE_HARDWARE,
+            base.as_ref(),
+            driver_type,
             windows::Win32::Foundation::HMODULE::default(),
             D3D11_CREATE_DEVICE_FLAG(D3D11_CREATE_DEVICE_BGRA_SUPPORT.0),
             Some(&feature_levels),
@@ -839,6 +928,37 @@ fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let device = device.ok_or_else(|| anyhow!("D3D11CreateDevice returned null device"))?;
     let context = context.ok_or_else(|| anyhow!("D3D11CreateDevice returned null context"))?;
     Ok((device, context))
+}
+
+/// FR-118 P3 — the capture surface's content (its top-left `w × h`, the frame's
+/// `ContentSize`) copied into a texture from `pool`, as a GPU frame. A region
+/// copy rather than `CopyResource`, because WGC's surface keeps the size the
+/// frame pool was created at while the content can be smaller.
+fn copy_to_pool(
+    pool: &TexturePool,
+    context: &ID3D11DeviceContext,
+    gpu_tex: &ID3D11Texture2D,
+    w: u32,
+    h: u32,
+) -> Result<gpu_frame::GpuFrame> {
+    let texture = pool.take(w, h)?;
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    // SAFETY: `gpu_tex` is the live capture surface; `GetDesc` fills `desc`.
+    unsafe { gpu_tex.GetDesc(&mut desc) };
+    let region = D3D11_BOX {
+        left: 0,
+        top: 0,
+        front: 0,
+        right: w.min(desc.Width),
+        bottom: h.min(desc.Height),
+        back: 1,
+    };
+    // SAFETY: both textures are BGRA8 on this context's device; the region
+    // lies inside the source, and the destination is at least as large.
+    unsafe {
+        context.CopySubresourceRegion(&texture, 0, 0, 0, 0, gpu_tex, 0, Some(&region));
+    }
+    Ok(pool.frame(texture, w, h))
 }
 
 /// Cast the frame's `IDirect3DSurface` down to `ID3D11Texture2D` via
@@ -1068,7 +1188,7 @@ mod tests {
         assert!(frame.width > 0);
         assert!(frame.height > 0);
         assert_eq!(frame.pixel_format, PixelFormat::Bgra);
-        assert_eq!(frame.data.len(), (frame.width * frame.height * 4) as usize);
+        assert_eq!(frame.cpu().len(), (frame.width * frame.height * 4) as usize);
         assert_eq!(frame.stride, frame.width * 4);
     }
 

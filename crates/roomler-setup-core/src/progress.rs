@@ -139,6 +139,32 @@ pub enum ProgressEvent {
     #[serde(rename_all = "camelCase")]
     AnchorSkipped { reason: String },
 
+    /// FR-129 B1 — a half of the embedded `install.sh` started (a daemon
+    /// role on Linux or macOS). `half` is `privileged` or `user`; `tool` is
+    /// what runs it: `pkexec` or `osascript` (the desktop's own administrator
+    /// prompt), `terminal` (the person runs the command themselves), `sh`
+    /// (the user half, as the person).
+    #[serde(rename_all = "camelCase")]
+    ScriptHalfStarted { half: String, tool: String },
+    /// FR-129 B1 — one line a half printed, stdout or stderr, as it printed
+    /// it. The halves take no token, so a line never carries one.
+    #[serde(rename_all = "camelCase")]
+    ScriptLine { half: String, line: String },
+    /// FR-129 B1 — a half exited; `code` is its exit status, `0` done.
+    #[serde(rename_all = "camelCase")]
+    ScriptHalfDone { half: String, code: i32 },
+    /// FR-129 B1 — the person dismissed the administrator prompt. Nothing was
+    /// installed and nothing is wrong with the package; the install ends.
+    #[serde(rename_all = "camelCase")]
+    ElevationCancelled { half: String },
+    /// FR-129 B1 — no administrator prompt could be shown or it refused
+    /// (`pkexec` absent, no polkit agent, the password not accepted): the SPA
+    /// shows `command` for the person to run in a terminal — it carries no
+    /// secret — and the pipeline waits until they say it ran. `reason` is for
+    /// the person.
+    #[serde(rename_all = "camelCase")]
+    ElevationUnavailable { command: String, reason: String },
+
     /// Whole install finished. SPA transitions to the Done step.
     Done,
 

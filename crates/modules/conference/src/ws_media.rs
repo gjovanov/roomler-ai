@@ -333,8 +333,15 @@ async fn handle_media_join(
         }
     };
 
-    if let Some(room) = state.room_manager.rooms_ref().get(&rid) {
-        let caps = serde_json::to_value(room.router.rtp_capabilities()).unwrap_or_default();
+    // FR-127 P1.1 — read the capabilities and release the rooms guard BEFORE
+    // the send: a guard held across an await parks every thread that wants its
+    // shard (`room_manager.rs` `tests`).
+    let caps = state
+        .room_manager
+        .rooms_ref()
+        .get(&rid)
+        .map(|room| serde_json::to_value(room.router.rtp_capabilities()).unwrap_or_default());
+    if let Some(caps) = caps {
         let msg = serde_json::json!({
             "type": "media:router_capabilities",
             "data": { "rtp_capabilities": caps }

@@ -95,7 +95,7 @@ already held the stale row, so a VPN reconnect does not cure it.
 
 That case is repaired, not reported
 (`crates/tunnel-core/src/overlay/lan_repair.rs:165`, run from the network-state
-sample before the capture probe at `netstate.rs:537`):
+sample before the capture probe at `netstate.rs:650`):
 
 ```mermaid
 flowchart TD

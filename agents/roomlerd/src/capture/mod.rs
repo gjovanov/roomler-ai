@@ -76,6 +76,13 @@ pub mod cursor;
 /// it into the frame, and where it is when the recorder has to draw it.
 pub mod pointer;
 
+/// FR-118 P2 — a frame that stays on the GPU: a texture on the capture's device.
+#[cfg(all(
+    target_os = "windows",
+    any(feature = "mf-encoder", feature = "wgc-capture")
+))]
+pub mod gpu_frame;
+
 /// A captured frame, in an encoder-agnostic representation.
 ///
 /// We don't commit to a specific colour space in the trait — backends can
@@ -87,7 +94,9 @@ pub struct Frame {
     pub height: u32,
     pub stride: u32,
     pub pixel_format: PixelFormat,
-    pub data: Vec<u8>,
+    /// FR-118 P1 — the pixels, where they live. Read them through
+    /// [`Frame::cpu`].
+    pub data: FrameData,
     pub monotonic_us: u64,
     /// Screen index that produced this frame. Matches `DisplayInfo::index`
     /// in the `rc:agent.hello` message.
@@ -116,6 +125,67 @@ impl Frame {
     /// unless a downscale recorded the pre-scale size in `source`.
     pub fn native_dims(&self) -> (u32, u32) {
         self.source.unwrap_or((self.width, self.height))
+    }
+
+    /// FR-118 P1 — the frame's bytes in CPU memory, laid out as
+    /// `pixel_format` with `stride` bytes per row. Every consumer that does
+    /// not take a GPU surface reads the pixels here. A GPU frame reads them
+    /// back on the first call and keeps them.
+    pub fn cpu(&self) -> &[u8] {
+        match &self.data {
+            FrameData::Cpu(bytes) => bytes,
+            #[cfg(all(
+                target_os = "windows",
+                any(feature = "mf-encoder", feature = "wgc-capture")
+            ))]
+            FrameData::Gpu(gpu) => gpu.cpu(),
+        }
+    }
+
+    /// FR-118 P1 — the bytes, to change in place: the recorder draws the
+    /// pointer into a frame, and tests paint one. A GPU frame becomes a CPU
+    /// frame first: a consumer that changes pixels needs them in memory.
+    pub fn cpu_mut(&mut self) -> &mut Vec<u8> {
+        #[cfg(all(
+            target_os = "windows",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        ))]
+        if let FrameData::Gpu(gpu) = &self.data {
+            self.data = FrameData::Cpu(gpu.cpu().to_vec());
+        }
+        match &mut self.data {
+            FrameData::Cpu(bytes) => bytes,
+            #[cfg(all(
+                target_os = "windows",
+                any(feature = "mf-encoder", feature = "wgc-capture")
+            ))]
+            FrameData::Gpu(_) => unreachable!("a GPU frame was replaced by its bytes just above"),
+        }
+    }
+}
+
+/// FR-118 P1 (C0) — where a frame's pixels live.
+///
+/// The GPU forms arrive with their cells (FR-118 §4.1): the D3D11 texture
+/// first (P2), an IOSurface and a dma-buf later. A consumer that has not
+/// moved keeps reading through [`Frame::cpu`].
+/// ⚠️ Each accessor matches this enum without a wildcard, so a new variant
+/// fails to compile until every one of them handles it.
+#[derive(Clone)]
+pub enum FrameData {
+    /// In system memory.
+    Cpu(Vec<u8>),
+    /// FR-118 P2 — a BGRA texture on the capture's D3D11 device.
+    #[cfg(all(
+        target_os = "windows",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    ))]
+    Gpu(gpu_frame::GpuFrame),
+}
+
+impl From<Vec<u8>> for FrameData {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Cpu(bytes)
     }
 }
 
@@ -437,9 +507,9 @@ pub trait ScreenCapture: Send {
     }
 
     /// FR-118 P0 — the backend's own copy of a GPU surface into CPU memory,
-    /// cumulative `(frames, microseconds)`, for a backend that does it OFF the
-    /// pump's clock: WGC reads back on its capture thread, inside
-    /// `FrameArrived`, so the pump's `avg_capture_ms` never contained it.
+    /// cumulative `(frames, microseconds)`. WGC reads back inside `FrameArrived`,
+    /// off the pump's clock, so `avg_capture_ms` never contains it; the DXGI arm
+    /// reads back on its capture thread while the pump waits, so it does.
     /// `None` from every backend that does not measure it.
     fn readback_totals(&self) -> Option<(u64, u64)> {
         None
@@ -3311,6 +3381,31 @@ mod frame_tests {
         )));
     }
 
+    /// FR-118 P1 (C0) — a CPU frame hands back exactly the bytes it was built
+    /// with, and `cpu_mut` changes them in place. With only `Cpu` produced,
+    /// every consumer reads what it read before C0.
+    #[test]
+    fn a_cpu_frame_reads_back_the_bytes_it_was_built_with() {
+        let bytes: Vec<u8> = (0..64u8).collect();
+        let mut f = Frame {
+            width: 4,
+            height: 4,
+            stride: 16,
+            pixel_format: PixelFormat::Bgra,
+            data: bytes.clone().into(),
+            monotonic_us: 0,
+            monitor: 0,
+            damage: Damage::Unknown,
+            source: None,
+        };
+        assert_eq!(f.cpu(), bytes.as_slice());
+        f.cpu_mut()[0] = 0xFF;
+        assert_eq!(f.cpu()[0], 0xFF);
+        assert_eq!(&f.cpu()[1..], &bytes[1..]);
+        let copy = f.clone();
+        assert_eq!(copy.cpu(), f.cpu(), "a clone carries the same bytes");
+    }
+
     // P8a — damage re-projection through a downscale (moved here with
     // scale_damage in Phase B).
     #[test]
@@ -3472,7 +3567,7 @@ mod frame_tests {
             height: 640,
             stride: 4096,
             pixel_format: PixelFormat::Bgra,
-            data: vec![],
+            data: vec![].into(),
             monotonic_us: 0,
             monitor: 0,
             damage: Damage::Unknown,

@@ -544,7 +544,7 @@ fn capture_one_blocking(
                     height: out_h,
                     stride: out_stride,
                     pixel_format: PixelFormat::Bgra,
-                    data,
+                    data: data.into(),
                     monotonic_us,
                     monitor: 0,
                     // scrap doesn't expose a dirty-rect API on any
@@ -792,7 +792,7 @@ mod tests {
         assert_eq!(frame.height, expected_h);
         assert_eq!(frame.pixel_format, PixelFormat::Bgra);
         assert!(
-            frame.data.len() >= (frame.width * frame.height * 3) as usize,
+            frame.cpu().len() >= (frame.width * frame.height * 3) as usize,
             "unexpectedly small capture buffer"
         );
 
@@ -816,11 +816,11 @@ mod tests {
         );
         // Every row the encoder will read has to be inside the buffer.
         assert!(
-            (frame.stride as u64) * u64::from(frame.height) <= frame.data.len() as u64,
+            (frame.stride as u64) * u64::from(frame.height) <= frame.cpu().len() as u64,
             "stride {} x height {} overruns the {}-byte buffer",
             frame.stride,
             frame.height,
-            frame.data.len()
+            frame.cpu().len()
         );
     }
 }
