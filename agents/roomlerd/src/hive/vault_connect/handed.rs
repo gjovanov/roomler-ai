@@ -118,6 +118,58 @@ pub(crate) enum Call {
     /// only so far.
     #[cfg(unix)]
     Leaf { host: String },
+    /// FR-90 P8-2c-2 — the daemon: serve the run's toolbelt as `endpoint`,
+    /// for `session` at `fence`, admitting `peer` alone — the listener on
+    /// the second channel just before this frame. Unix only so far — there
+    /// is no Windows variant of this call yet.
+    #[cfg(unix)]
+    ToolbeltServe {
+        endpoint: u64,
+        session: ObjectId,
+        fence: u64,
+        peer: u32,
+    },
+    /// FR-90 P8-2c-2 — the daemon: stop serving the toolbelt's `endpoint`,
+    /// its connections cut.
+    #[cfg(unix)]
+    ToolbeltClose { endpoint: u64 },
+    /// FR-90 P8-2c-2 — the worker: approval `id` opened on the toolbelt's
+    /// `endpoint`, for the daemon to record and tell the session's viewers,
+    /// exactly as it does for one opened in the daemon itself.
+    #[cfg(unix)]
+    ToolbeltOpen {
+        endpoint: u64,
+        id: String,
+        tool_name: String,
+        tool_use_id: Option<String>,
+        input: serde_json::Value,
+    },
+    /// FR-90 P8-2c-2 — the worker: approval `id` on the toolbelt's
+    /// `endpoint` closed, however it ended (answered, expired or
+    /// withdrawn) — the worker's own word, since it alone holds the wait.
+    #[cfg(unix)]
+    ToolbeltClosed {
+        endpoint: u64,
+        id: String,
+        ended: crate::hive::toolbelt::Ended,
+    },
+    /// FR-90 P8-2c-2 — the daemon: a driver answered approval `id` on the
+    /// toolbelt's `endpoint`; the worker's own wait resolves it.
+    #[cfg(unix)]
+    ToolbeltAnswer {
+        endpoint: u64,
+        id: String,
+        answer: crate::hive::toolbelt::Answer,
+    },
+    /// FR-90 P8-2c-2 — the daemon: withdraw approval `id` on the toolbelt's
+    /// `endpoint` — its wait ends `Withdrawn`, as one answered or expired.
+    #[cfg(unix)]
+    ToolbeltWithdraw { endpoint: u64, id: String },
+    /// FR-90 P8-2c-2 — the daemon: withdraw every approval open on the
+    /// toolbelt's `endpoint` (the session is ending, or draining for a
+    /// move).
+    #[cfg(unix)]
+    ToolbeltWithdrawAll { endpoint: u64 },
 }
 
 /// The answer to a [`Call`].
