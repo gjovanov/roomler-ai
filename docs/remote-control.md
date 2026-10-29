@@ -786,14 +786,32 @@ flowchart TB
   keeps its D3D11 device when the device is alive and still on the primary
   output's adapter, so the encoder does not reopen and send a keyframe each
   time. A capture that does come back on a new device moves the encoder to it.
-- **WGC's GPU path has no field numbers yet.** It is built and tested on a
-  hybrid laptop (the probe proves NVENC's GPU form on the RTX 5090, and the
-  pool refuses the Radeon), but no release carries it yet
-  ([FR-118 §5.6](fr/FR-118-gpu-resident-frames.md#56-p3--the-wgc-arm-hands-nvenc-its-frames-as-built-2026-10-28)).
+WGC's GPU path, measured on a hybrid laptop whose panel is on the iGPU (WGC's
+device on the RTX 5090, the OS copying each frame across):
+
+| Measured: `av1_nvenc` 2560×1600 at 60 fps on the WGC arm, a moving test pattern, 20-minute legs (FR-118 AC7) | Switch off | Switch on |
+|---|---|---|
+| readback (in `FrameArrived`, off the pump's clock) | 6.23 ms | 0 |
+| encode | 12.06 ms | 5.14–5.23 ms |
+| of which `send_frame` | 11.05 ms | 5.05–5.13 ms |
+| **readback + encode** | **18.26 ms** | **5.14–5.23 ms** |
+| worker CPU per encoded frame | 9.64 ms (52 % of a core) | 3.09–3.18 ms (18 %) |
+
+- **On WGC the encode stage shrinks too.** With CPU frames, NVENC's wrapper
+  copies each 6 MB NV12 frame to the GPU inside `send_frame`. With GPU frames
+  it takes the pool's texture, so the readback and most of `send_frame` go
+  together: the work per frame falls by 71 %. The pump's capture stage is the
+  wait for the next frame on this arm, so the comparison is readback + encode
+  ([FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29)).
+- **A SystemContext hybrid host gains nothing.** Its DXGI arm captures on the
+  panel's adapter, and Desktop Duplication cannot cross adapters, so NVENC on
+  the other GPU refuses the frame (`adapter_mismatch`) and reads it back
+  ([FR-118 §9.6](fr/FR-118-gpu-resident-frames.md#96-p3s-first-field-contact-2026-10-28)).
 - The cells, the reasons a session took CPU frames, and the configuration:
   [`encoders.md`](encoders.md#gpu-resident-frames-the-input-path-fr-118). The
-  field record: [FR-118 §9.2](fr/FR-118-gpu-resident-frames.md#92-the-first-field-run-2026-10-28)
-  and [§9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28).
+  field record: [FR-118 §9.2](fr/FR-118-gpu-resident-frames.md#92-the-first-field-run-2026-10-28),
+  [§9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28)
+  and [§9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29).
 
 ### 5.2 Encoder selection
 
