@@ -72,9 +72,9 @@ use wizard_shared::progress::{ProgressEvent, replay_log};
 
 use crate::role::{HostOs, Scope};
 
-/// `scripts/install.sh`, verbatim. The server embeds the same file
-/// (`crates/modules/fleet/src/setup_release.rs`), and both are cut with the
-/// agent release, so the wizard runs exactly the script a terminal would.
+/// `scripts/install.sh`, verbatim. The server serves its own copy
+/// (`crates/modules/fleet/src/setup_release.rs`), which changes with a promote,
+/// and this one with an agent release, so the two can differ for a while.
 pub const INSTALL_SH: &str = include_str!("../../../scripts/install.sh");
 
 /// The script's name in the scratch directory — the terminal fallback shows
