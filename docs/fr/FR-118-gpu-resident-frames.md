@@ -209,7 +209,7 @@ flowchart LR
 | P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from the capture thread: WGC's (P0), then the SystemContext DXGI arm's (P0b). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1): P0 shipped in 0.4.150, P0b in 0.4.181. The fleet read is AC1, done 2026-10-28 (§9.5) |
 | P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | **built** (§5.2) |
 | P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `zero_copy` / `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3), **P2-2 built** (§5.4), **P2-3 built** (§5.5); released in 0.4.181, first field run 2026-10-28 (§9.2) |
-| P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter. **The WGC arm + NVENC built 2026-10-28** (§5.6), released in 0.4.183 the same day. First field contact the same evening (§9.6): neo16 captures through the DXGI arm in SystemContext. **Field-verified 2026-10-29** (§9.7), on neo16 with its SystemContext swap off for the run: WGC + `av1_nvenc` at 2560×1600, readback + encode 18.26 → 5.14 and 5.23 ms a frame, the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame. The heartbeat's reason after an adoption (#3071) fixed 2026-10-29 (§5.7). AMF not built: the measurement found no need for it |
+| P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter. **The WGC arm + NVENC built 2026-10-28** (§5.6), released in 0.4.183 the same day. First field contact the same evening (§9.6): neo16 captures through the DXGI arm in SystemContext. **Field-verified 2026-10-29** (§9.7), on neo16 with its SystemContext swap off for the run: WGC + `av1_nvenc` at 2560×1600, readback + encode 18.26 → 5.14 and 5.23 ms a frame, the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame. The heartbeat's reason after an adoption (#3071) fixed 2026-10-29 (§5.7), field-verified on 0.4.186 the same day (§9.8, AC5). AMF not built: the measurement found no need for it |
 | P4 | Folded into P2 on 2026-10-27: it was the DXGI arm, which is where the first cell's hosts capture | — | → P2 |
 | P5 | macOS: IOSurface → VideoToolbox | the same | — |
 | P6 | Linux: the DRM arm's dma-buf → VAAPI | the same | — |
@@ -573,7 +573,7 @@ the wrong reason stayed for the rest of the session.
   §2.2's 2880×1800 laptop peaked at 29.4 over 590 windows. If P0 shows the hardware encode itself is the bound
   there, this AC records the measured bound instead, and why. *(The first field host is 1920×1200, so it cannot
   answer this; §2.2's host is not available for test sessions.)*
-- [ ] **AC5 — the adapter rule.** A host whose capture and encoder adapters differ never takes the GPU path:
+- [x] **AC5 — the adapter rule.** A host whose capture and encoder adapters differ never takes the GPU path:
   unit-tested on the rule, and seen on one hybrid host in the field as `input_path=cpu reason=adapter_mismatch`.
   *(The first field host captures on its Intel adapter, so it has no mismatch to show. P3 adds NVENC's half of the
   rule, unit-tested on neo16's Radeon (§5.6). On a hybrid host P3 moves WGC's device to the NVIDIA adapter, so
@@ -584,7 +584,11 @@ the wrong reason stayed for the rest of the session.
   `input_reason=cpu_frames`: a background replacement opened before the refusal was adopted after it and
   overwrote the reason (#3071). The box stays open until the heartbeat carries the reason.)* *(2026-10-29,
   §5.7: #3071's fix keeps the refusal's reason through an adoption. The field half reads once a release carries
-  it: the same neo16 session shape, its heartbeat at `input_reason=adapter_mismatch`.)*
+  it: the same neo16 session shape, its heartbeat at `input_reason=adapter_mismatch`.)* **Met 2026-10-29** (§9.8):
+  neo16 on agent 0.4.186, the session shape of §9.6 (the DXGI arm on the Radeon, `av1_nvenc` on the RTX 5090,
+  1916×1198, 144 fps asked). NVENC refused the frames (`adapter_mismatch`), the device follow reopened on CPU
+  frames, and FR-119's frame-rate replacement was adopted, as on 0.4.183. All 10 heartbeats read
+  `input_path=cpu input_reason=adapter_mismatch`, where every 0.4.183 heartbeat read `cpu_frames`.
 - [x] **AC6 — the gate holds at every entry point.** With the switch off, or the cell denied, neither the probe
   nor a session opens the GPU-input form. Tested at both entry points. **Met 2026-10-28.** Both halves are
   unit-tested at both entry points (P2-3, §5.5), and both were seen in the field on agent 0.4.181 (§9.2). With the
@@ -658,6 +662,7 @@ the wrong reason stayed for the rest of the session.
 | 2026-10-28 | fleet, agents 0.4.150–0.4.182, 2026-10-21 20:14Z → 2026-10-28 20:14Z | every FFmpeg DC heartbeat on the CPU path: 27 encoder × geometry groups of ≥ 10 windows, and the readback over the windows that measured one | **AC1, the red record** (§9.5). Conversion and copy are 15–35 % of the encode stage on QSV, with `send_frame` and the drain 60–83 %. On NVENC they are 10–23 % against 75–89 %. On VideoToolbox the conversion is 70–87 %. WGC's readback is 5.7–6.1 ms at 2560×1600 over the week. The DXGI arm's (P0b, 0.4.181–0.4.182, 16 hours) is 3.4–4.1 ms at 1080p and 1200p and 7.3 ms on §2.2's 2880×1800 laptop. **AC1 met** |
 | 2026-10-28 | agent 0.4.183, neo16: `zero_copy` on, the SystemContext DXGI arm on the Radeon 610M, `av1_nvenc` on the RTX 5090; a local-pair session 21:11:06–21:14:00Z | **P3's first field contact** (§9.6). The probe's `gpu` child proved `hevc_nvenc`, `av1_nvenc` and `h264_nvenc` in 357 ms. The capture was not WGC: the service has run the SystemContext swap since 08:25Z, so the DXGI arm captured on the panel's adapter, and NVENC refused its frames with `adapter_mismatch`. The session ran on CPU frames, read back inside the encoder's conversion. The heartbeat's reason read `cpu_frames`, a race (#3071). The WGC arm's run needs a user-context capture |
 | 2026-10-29 | agents 0.4.183 (ON1) and 0.4.184 (OFF, ON2), neo16 with its SystemContext swap off for the run: WGC on the RTX 5090, `av1_nvenc` at 2560×1600 and 60 fps, a local pair, AC3's test pattern | **AC7's NVENC cell and the WGC arm, like AC3** (§9.7): 20-minute legs on, off, on. Readback + encode 18.26 → 5.14 and 5.23 ms a frame, `send_frame` 11.05 → 5.05 and 5.13 ms; the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame; the pattern identical on both paths; no decode error; every keyframe but one at an outside load spike on the host |
+| 2026-10-29 | agent 0.4.186, neo16 back on SystemContext with `zero_copy` on: the DXGI arm on the Radeon 610M, `av1_nvenc` on the RTX 5090; a local-pair session at 10:17Z | **AC5's field half** (§9.8). The session repeated §9.6: the refusal (`adapter_mismatch`), the follow's reopen, FR-119's replacement adopted. Every heartbeat read `input_reason=adapter_mismatch`, against `cpu_frames` on 0.4.183. #3071's fix (§5.7) held in the field |
 
 ### 9.1 The interim split (2026-10-27)
 
@@ -992,6 +997,29 @@ after each leg, over the frames encoded in between.
 
 **AC7's NVENC cell and the WGC arm: verified like AC3.** neo16 is back on SystemContext + `zero_copy` from
 01:19:42Z, where NVENC takes CPU frames again (`adapter_mismatch`, §9.6).
+
+### 9.8 AC5: the heartbeat names the adapter rule (2026-10-29)
+
+The red run is §9.6, agent 0.4.183 (2026-10-28 21:11Z). The green run is the same host and session shape on agent
+0.4.186, which carries #3071's fix (§5.7).
+
+| | 0.4.183, 2026-10-28 21:11Z (red) | 0.4.186, 2026-10-29 10:17Z (green) |
+|---|---|---|
+| capture | the DXGI arm, bound to the Radeon 610M | the same |
+| encode geometry | `av1_nvenc`, 1916×1198 | the same; 144 fps asked |
+| the refusal | `no GPU input for this encoder`, `reason=adapter_mismatch` | the same: `the capture device is on vendor 0x1002, not NVIDIA's` |
+| the follow's reopen | `input=cpu input_reason=adapter_mismatch` | the same |
+| FR-119's replacement | adopted (`FR-70 M2: dims swap adopted`) | adopted, 60 → 144 fps |
+| **heartbeats** | every one `input_reason=cpu_frames` | **all 10 `input_reason=adapter_mismatch`** |
+
+- **The rule held in both runs**: the GPU path was never taken. What changed is that the adopted replacement no
+  longer overwrites the refusal's reason, so the heartbeat names the cause.
+- **A red run on 0.4.185 was not possible.** The daemon restart before it ran the updater, which installed 0.4.186
+  at once (published 25 minutes earlier). Restarting a daemon after a release publishes updates it within seconds.
+- **The session needed neo16's device key back first.** The 0.4.184 restart of 01:19Z made SystemContext read the
+  machine-global config, whose directory had no `peer-auth\`, so the daemon minted new device keys. Every browser
+  that knew neo16 then refused its answer (`key-changed`, #3096). With the operator's agreement, neo16's original key
+  was restored into the machine-global directory before this run.
 
 ## 10. Related
 
