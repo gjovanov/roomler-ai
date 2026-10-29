@@ -239,3 +239,21 @@ back into.
 ⚠️ `/api/setup/*` is served from the same per-pod release cache as the agent
 feed; the wizard lane's `refresh-release-cache` busts it, and the 15 min TTL is
 the backstop.
+
+⚠️ **`scripts/install.sh` ships on two trains (FR-129 B1).** The server compiles
+it in and serves it as `/api/setup/install.sh`
+(`crates/modules/fleet/src/setup_release.rs:258`), so the **terminal's** copy
+changes with a **promote**. The wizard compiles in its own for the Linux and macOS
+daemon installs (`agents/roomler-setup/src/unix_daemon.rs:78`), so the **GUI's**
+copy changes with an **agent release** (its `setup-v<V>` twin). A fix reaches each
+path only on its own train. The two copies differ whenever the deployed image and
+the newest wizard come from different commits, which during a promote hold can
+last weeks. (`agents/roomlerd/src/updater.rs` includes it too, in a test only.)
+⚠️ Both copies install the **newest** packages (`/api/agent/latest-release`), and a
+wizard someone downloaded keeps running its own copy for as long as the download
+is kept: an admin's share, or the SourceForge default, which stays on a pinned
+`setup-v` until someone moves it. So everything the script assumes about a package
+is a compatibility surface: the asset names it matches, the macOS marker that must
+exist before the `.pkg` (`/etc/roomler/enable-daemon`), what the postinstall does
+with it, and the `adopt-enrollment` verb. A package that changes one of these must
+keep the old behaviour working for the scripts already out there.
