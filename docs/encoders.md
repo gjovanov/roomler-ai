@@ -600,6 +600,16 @@ The session reports which form it opened and why, on the heartbeat as
   readback leaves the capture stage. `send_frame` grows by 1.9 ms, because it
   now waits for the GPU's conversion before QSV reads the surface. The pattern
   decodes identically on both paths.
+- **Measured on the WGC arm with NVENC**
+  ([FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29),
+  `av1_nvenc` at 2560×1600 and 60 fps on the same pattern, a hybrid laptop with
+  WGC's device on the RTX 5090, 20-minute legs on, off, on): readback + encode
+  fell from 18.26 to 5.14 and 5.23 ms per frame, and the worker's CPU from 9.64
+  to 3.18 and 3.09 ms per encoded frame. Here `send_frame` shrinks as well
+  (11.05 → 5.1 ms), because NVENC no longer copies the frame to the GPU itself.
+  WGC reads back off the pump's clock, so on this arm the comparison is
+  readback + encode, not capture + encode. The pattern decodes identically on
+  both paths.
 - **WGC across adapters.** On a hybrid laptop whose panel is driven by the
   iGPU, WGC's device and the dGPU's encoder sit on different adapters. Measured
   on such a laptop
