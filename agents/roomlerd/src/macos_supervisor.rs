@@ -1316,6 +1316,8 @@ mod imp {
         /// the child got 9 the way the race hands one over: a copy made after
         /// the fork, open and without close-on-exec. (`tunnel_core::child`'s
         /// own tests run in a Linux lane; the macOS lane runs this module's.)
+        /// In a quiet process 9 may be std's own exec-error pipe; replacing it
+        /// is harmless here, because `/bin/sh` always execs.
         fn fd9_after_exec(sweep: bool) -> String {
             let mut cmd = Command::new("/bin/sh");
             cmd.arg("-c")

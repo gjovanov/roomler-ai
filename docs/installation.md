@@ -916,7 +916,10 @@ log.
 ⚠️ **The sweep is for long-lived children only.** It costs a `fork` where std
 would use `posix_spawn`, and up to 65,536 `fcntl` calls in the child. The other
 long-lived macOS children, such as the recorder's own `posix_spawn`, SSH shells
-and long `exec` sessions, are not swept yet (#3082).
+and long `exec` sessions, are not swept yet (#3082). Until they are, one narrow
+window stays open: the `fork` path waits on an exec-error pipe of its own, made
+the same non-atomic way, so an unswept long-lived child spawned inside that
+window would hold the swept spawn until it exits.
 
 ### Paths, logs, limits
 

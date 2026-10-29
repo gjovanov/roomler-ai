@@ -40,6 +40,11 @@ const CHUNK: usize = 16 * 1024;
 /// deadline checks: 1 MiB, far more than a pipe holds.
 const DRAIN_CHUNKS: usize = 64;
 
+/// The most bytes [`output_bounded`] keeps from either stream. Its callers'
+/// commands print kilobytes. A child that writes more is stopped like one past
+/// its deadline, so no command can balloon the daemon's memory.
+const MAX_OUTPUT: usize = 16 * 1024 * 1024;
+
 /// The highest descriptor [`inherit_only_stdio`] sweeps, whatever
 /// `RLIMIT_NOFILE` says. An unlimited soft limit must not cost a child
 /// billions of `fcntl` calls before it can exec.
@@ -59,7 +64,9 @@ const SWEEP_FLOOR: libc::c_int = 1_024;
 ///   written after the child exits, by a background process it started for
 ///   instance, is not collected.
 /// - A child still running at `deadline` is killed, and the error is
-///   [`io::ErrorKind::TimedOut`].
+///   [`io::ErrorKind::TimedOut`]. A child that writes more than
+///   [`MAX_OUTPUT`] bytes to either stream is killed the same way, with an
+///   error of its own.
 ///
 /// Either way the child is reaped before this returns, so no call leaves a
 /// zombie behind. stdin is `/dev/null`, as with `output()`; stdout and stderr
@@ -146,7 +153,14 @@ impl<R: Read + AsRawFd> Stream<R> {
             }
             match pipe.read(&mut chunk) {
                 Ok(0) => self.pipe = None,
-                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Ok(n) => {
+                    self.buf.extend_from_slice(&chunk[..n]);
+                    if self.buf.len() > MAX_OUTPUT {
+                        return Err(io::Error::other(format!(
+                            "the child wrote more than {MAX_OUTPUT} bytes to one stream"
+                        )));
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
@@ -365,15 +379,25 @@ mod tests {
         assert!(out.status.success());
     }
 
-    /// A child that writes without end is still stopped at its deadline: one
-    /// drain pass cannot keep the read from its deadline check.
+    /// A child that writes without end is still stopped, at its deadline or at
+    /// the output cap, whichever it reaches first: one drain pass cannot keep
+    /// the read from either check.
     #[test]
-    fn output_bounded_stops_an_endless_writer_at_its_deadline() {
+    fn output_bounded_stops_an_endless_writer() {
         let mut cmd = Command::new("yes");
         let started = Instant::now();
-        let e = output_bounded(&mut cmd, Duration::from_millis(300)).expect_err("timed out");
-        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        let r = output_bounded(&mut cmd, Duration::from_millis(300));
+        assert!(r.is_err(), "an endless writer ended: {r:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn output_bounded_refuses_more_than_its_cap() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("head -c 20000000 /dev/zero");
+        let e = output_bounded(&mut cmd, Duration::from_secs(10)).expect_err("over the cap");
+        assert_ne!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        assert!(e.to_string().contains("more than"), "{e}");
     }
 
     #[test]
@@ -390,6 +414,8 @@ mod tests {
     /// child got 9 the way the race hands one over: a copy made after the fork,
     /// open and without close-on-exec. The sweep, when asked for, is set after
     /// that copy, so it finds 9 open, as it would find an inherited pipe.
+    /// (In a quiet process 9 may be the write end of std's own exec-error
+    /// pipe. Replacing it is harmless here: `/bin/sh` always execs.)
     fn fd9_after_exec(sweep: bool) -> String {
         let mut cmd = Command::new("/bin/sh");
         // `true`, not `:`: a redirection error on a special builtin would end
