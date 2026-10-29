@@ -53,12 +53,17 @@ pub struct LiveSession {
     /// Loopback-TURN corp-relay (Phase 2). Set from the controller's
     /// `rc:session.request` when its browser discovered a local-agent TURN; the
     /// Hub reads it back in `forward_offer` to append `turn:{overlay_ip}:{port}`
-    /// to the REMOTE agent's ICE servers. `None` for every session that didn't
+    /// to the REMOTE agent's ICE servers. Empty for every session that didn't
     /// forward one (the default). See [`LocalRelayDescriptor`].
-    pub local_relay: Option<LocalRelayDescriptor>,
+    ///
+    /// FR-121 P3b (#2774) — every relay of the browser's computer, in the
+    /// order the request gave them, at most `LOCAL_RELAYS_MAX`: one computer
+    /// can run several enrolled agents, and each has its own overlay path to
+    /// the target.
+    pub local_relays: Vec<LocalRelayDescriptor>,
 
     /// #1882 — the device's `AccessPolicy.rc_overlay`, resolved at session
-    /// create. `forward_offer` hands the agent the overlay `local_relay` TURN
+    /// create. `forward_offer` hands the agent the overlay `local_relays` TURN
     /// only when this is `true`: with the overlay off, an overlay relay is a
     /// candidate the agent would only discard.
     pub rc_overlay: bool,
@@ -141,7 +146,7 @@ impl LiveSession {
             consent_mode: ConsentMode::Prompt,
             watchers: HashMap::new(),
             controller_tx: Some(controller_tx),
-            local_relay: None,
+            local_relays: Vec::new(),
             rc_overlay: false,
             relay_region: None,
             offer_seen: false,

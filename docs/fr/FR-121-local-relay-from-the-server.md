@@ -1,7 +1,7 @@
 # FR-121: The viewer's own device's relay, from the server — no local-network permission
 
-**Issue:** [#2862](https://github.com/gjovanov/roomler-ai/issues/2862) · **Status:** proposed 2026-10-25 — spec and
-claim; P0 measured, nothing built yet · **Owner:** the agent, the fleet module's Hub and the viewer · **Anchors:**
+**Issue:** [#2862](https://github.com/gjovanov/roomler-ai/issues/2862) · **Status:** P1 to P3 built and live
+(2026-10-25); P3b built (2026-10-28, #2774); P0's Safari and Firefox, P4 and P5 open · **Owner:** the agent, the fleet module's Hub and the viewer · **Anchors:**
 master `9e236c2fb` · **Found by:** [FR-119](FR-119-high-refresh-streaming.md) (#2670), on its first Windows run
 
 ## 1. Goal
@@ -16,6 +16,10 @@ browser ever fetching `http://127.0.0.1`:
 
 Everything after the hand-off stays as it is today: the browser dials `turn:127.0.0.1:<port>`, the remote agent dials
 `turn:<overlay>:<port>`, and both relay ciphertext through the device over the mesh.
+
+One computer can run more than one enrolled agent: Windows and WSL, a container, a second test agent. Each has its
+own relay and its own overlay path to the target, so the browser names every one, and the target is offered every
+relay (P3b, §3.6).
 
 ## 2. Evidence
 
@@ -151,6 +155,70 @@ not on the device gets a loopback address it cannot use.
 TURN host, so a device whose whole probe band is reserved (the Hyper-V case `PROBE_PORT_FALLBACK` exists for) reports
 no relay either. Splitting the two is a later step if the field ever shows it.
 
+### 3.6 P3b — every relay on the computer, not the first to answer (#2774), as built (2026-10-28)
+
+**The finding.** neo16 runs two enrolled agents that share loopback under WSL's mirrored networking: the Windows one
+and the WSL one, each with its own relay on its own probe port. Their overlay paths differ completely. On 2026-10-28
+`roomler peers` showed the Windows agent **direct** to every online peer (4–7 ms on the LAN, the MacBook at 5 ms)
+and the WSL agent on `relay:derp/tcp` or `relay:turn/udp` to every one of them (the MacBook at 154 ms). A relay
+reached over DERP is no relay for media. Two things made the first answer the one that counted:
+
+- **The probe took the first descriptor.** On 2026-10-23 the WSL agent held 47989; the target gathered no candidate
+  from its relay, and the session fell back to the far TURN at 30 fps on a LAN whose overlay pair was direct. The
+  bind order is a start-order race. By 10-28 it had flipped (Windows on 47989, WSL on 47990).
+- **P3 made that answer permanent.** The first successful probe pairs the browser with the device it named and never
+  probes again (§3.2). neo16's own Chrome was found paired with the **WSL** agent on 10-28 (`roomler-rc-this-device`),
+  with relay assist on by default, so every later connect named the device with the bad path.
+
+**The choice: every relay, and ICE decides.** Options were set out on #2774; the operator chose this one on
+2026-10-28. "Let the server choose" was ruled out because its premise failed: the server holds no live carrier for a
+pair. The heartbeat carries each node's own facts, and the overlay verdict (`relay_verdict_core`) is a planned relay
+strategy, not a measurement. "Prefer the native agent" was a guess that covers one layout.
+
+```mermaid
+sequenceDiagram
+    participant W as Windows agent (47989)
+    participant L as WSL agent (47990)
+    participant B as browser on that computer
+    participant S as server (fleet Hub)
+    participant R as remote agent
+    Note over B: the first connect, nothing paired yet
+    B->>W: probe (every port at once)
+    B->>L: probe
+    W-->>B: descriptor {agent_id: W}
+    L-->>B: descriptor {agent_id: L}
+    Note over B: pairs with [W, L]: every own device that answered, in port order
+    B->>S: rc:session.request {local_relay: W's, local_relay_also: [L's]}
+    Note over B,S: every later connect: no probe, the devices named
+    B->>S: rc:session.request {local_relay_from: W, local_relay_from_also: [L]}
+    Note over S: the target's rc_overlay first, then each device on its own: owner, organization, a report
+    S->>B: rc:session.created {local_relay: W's, local_relay_also: [L's]}
+    Note over B: setConfiguration: turn:127.0.0.1 for each, in order
+    B->>S: rc:sdp.offer
+    S->>R: rc:sdp.offer + turn:overlay of W, turn:overlay of L
+    Note over B,R: ICE checks a pair through each relay, ranked in that order
+```
+
+| piece | where |
+|---|---|
+| The probe asks every port of the band at once, so a connect waits one timeout, not one per port, and keeps every answer in port order, one per relay, at most `LOCAL_RELAYS_MAX` (4) | `ui/src/composables/useRemoteControl.ts:3805`, `:3810`, `:3833` |
+| "This browser runs on" holds a list: a new key, `roomler-rc-this-devices`, beside the old one, which still gets the first device for a tab on an older bundle. The list holds only while the old key echoes it, so a choice made since in such a tab wins. A probe pairs an unanswered browser with every own device it found (`devicesToPairFromProbe`) | `ui/src/composables/useRemoteControl.ts:3883`, `:3909`, `:3935`, `:3983` |
+| A device stored before P3b is **legacy**. On a later connect the browser looks once more, only when the device list in view vouches for the stored device as the person's own (`mayLookAgain`; another organization in view, or a list that failed to load, waits for a later connect) and Chrome says the loopback permission is already granted (`loopback-network`, before the split `local-network-access`). It widens the pairing to every own device found, in probe order (the stored device was a race too), and that connect names them, so the Hub checks each. Found or not, the look happens once (`relayChoiceAfterProbe`) | `ui/src/composables/useRemoteControl.ts:4006`, `:4028`, `:4060`, `:9558` |
+| The plan names every paired device except the one being viewed; the request carries the first of each list where an older server reads it, and the rest as `local_relay_also` / `local_relay_from_also`; the answer's relays all go in with `setConfiguration`, in order | `ui/src/composables/useRemoteControl.ts:3961`, `:4083`, `:4099`, `:4112`, `:8671`, `:11034` |
+| The picker takes several devices; "Not set" or "None of my devices" picked wins over the rest | `ui/src/views/remote/RemoteControl.vue:1951`, `:3743`; `useRemoteControl.ts:4135` |
+| The wire: the two `_also` lists on the request, `local_relay_also` on the answer, `LOCAL_RELAYS_MAX` | `crates/remote_control/src/signaling.rs:2037`, `:2044`, `:3349`, `:5544` |
+| The Hub refuses a target whose `rc_overlay` is off first, whatever devices are named. Otherwise it resolves each named device on its own (`named_devices`, each once, at most four). The answer is `Ok` when any got a relay, else the **first** one's refusal. A probed list keeps one relay per address (`bounded_relays`); the session holds them all (`LiveSession::local_relays`); `forward_offer` hands the target each, behind the same overlay-range and `rc_overlay` gates; a coalesced retry gets the same list | `crates/modules/fleet/src/hub.rs:84`, `:104`, `:125`, `:1624`, `:1852`, `:2275`, `:3986`, `:3995`; `crates/remote_control/src/session.rs:63` |
+
+⚠️ **ICE keeps the path that works, not the fastest one that works.** Chrome ranks its relay candidates by the order of
+its TURN servers, the first highest, and nominates the best-ranked pair that succeeds. The browser puts the relays in
+port order. If the slow agent's relay ranks first and its pair succeeds at all, it can still win. On 10-23 the WSL
+agent's relay produced no working pair, but that is a field question, open as decision 4 and measured by AC9.
+
+⚠️ The re-look of a legacy pairing is the one exception to AC4 ("no probe once chosen"). It runs once, only where the
+permission is already granted and the device list in view vouches for the stored device. Where the permission cannot
+be known (another browser, a Chrome that knows neither name), there is no re-look: such a browser keeps its one device
+until the person picks again.
+
 ## 4. Phases
 
 | P | Scope | Kill switch | Status |
@@ -159,6 +227,7 @@ no relay either. Splitting the two is a later step if the field ever shows it.
 | P1 | The agent reports its relay (`rc:agent.local_relay`, the `watch`, re-minting), the `local-relay` verb, the Hub's in-memory copy | `ROOMLERD_LOCAL_TURN=0` (stops the relay and the report) | **built** (§3.5) |
 | P2 | `local_relay_from` on the request, `local_relay` / `local_relay_refused` on `rc:session.created`, every refusal; integration tests | the viewer's switch (it never sends the field) | **built** (§3.5): the hub's every arm and the end-to-end dispatch are unit tests; the integration lane runs the composition gate |
 | P3 | The viewer: the choice, the probe's suggestion (the descriptor's `agent_id`), no probe once chosen, `setConfiguration`, the refusal's words | `roomler-rc-local-relay` | **built** (§3.5) |
+| P3b | Every relay on the computer (#2774): the probe asks every port at once and keeps every answer, the browser pairs with every own device, the `_also` lists, the Hub resolves and forwards each, the one re-look of a pre-P3b pairing | per browser: pick one device in "This browser runs on"; `roomler-rc-local-relay` off for all of it | **built** (§3.6): unit tests on each side, red and green on the field owed (AC9) |
 | P4 | Field: the MacBook's Chrome with the permission back at "ask", red first | — | — |
 | P5 | Docs | — | — |
 
@@ -180,6 +249,16 @@ no relay either. Splitting the two is a later step if the field ever shows it.
 - [ ] **AC7 — docs.** `docs/remote-control.md` (the loopback relay, both ways of finding it, the refusals) and
   `docs/security-baseline.md` (who holds the credential, for how long) updated, with this FR's row in
   `docs/README.md`'s index.
+- [ ] **AC8 — P3b, the wire stays additive.** An older server reads the first relay and the first device alone; an
+  older viewer never sends the lists and gets the answer it got before; a refusal is sent only when no named device got
+  a relay. Tests on each side, each shown to fail with the first-only behaviour put back.
+- [ ] **AC9 — P3b, the field.** On neo16 (the Windows agent direct, the WSL agent on DERP), a browser whose
+  first-answering or only paired agent is the WSL one: red on today's build (the session rides the far TURN), green on
+  P3b (the Windows agent's relay carries it, `carrier="overlay_*"`), the nominated pair read from
+  `chrome://webrtc-internals` or `getStats()`. Both runs on #2774.
+- [ ] **AC10 — P3b, the re-pairing.** A browser paired with the WSL agent before P3b, the loopback permission granted,
+  widens to both devices on its next connect with no prompt, and stays paired with its device when the look finds none
+  of the person's own.
 
 ## 6. Open decisions
 
@@ -190,6 +269,10 @@ no relay either. Splitting the two is a later step if the field ever shows it.
    switch it is.
 3. **The probe.** Recommended: keep it as the pairing suggestion until a choice exists, then never probe. Retiring it
    would leave a browser that never asks for the permission with an extra step.
+4. **Which relay ranks first when several work** (P3b). Today: port order, which is the agents' start order. If AC9
+   shows a slow relay's pair winning, the order needs a measured input. The likely one is each local agent's own
+   carrier to the target, which only the agents hold: the probe could carry it, at the cost of an agent change. Not
+   decided until the field says it is needed.
 
 ## 7. Out of scope
 
@@ -202,8 +285,10 @@ no relay either. Splitting the two is a later step if the field ever shows it.
 
 | Date | Build | Cell | Result |
 |---|---|---|---|
+| 2026-10-23 | the viewer before FR-121 (backfilled from #2774) | neo16's Chrome viewing the MacBook, `rc_overlay` on, during FR-119 P3 | **The red record for P3b.** The WSL agent answered the probe first (47989); the target gathered no candidate from its relay and the session rode the far TURN, constrained at 30 fps, while the overlay pair between the two machines was direct. With 47989 made to fail in the tab, the probe landed on the Windows agent (47992) and the assist used it |
 | 2026-10-24 | agent 0.4.165 on neo16 | The MacBook's fresh Chrome viewing neo16 | **The red record.** Far TURN until `rc_overlay` was on and the local-network permission granted by hand; then `overlay_direct`, `relay=false` |
 | 2026-10-25 | Chrome 155 on neo16, agent 0.4.167 | **P0** (§2.3) | The permission does not gate a TURN server on 127.0.0.1: reached from a public origin at 102 ms with the permission at `prompt`, no prompt shown |
+| 2026-10-28 | agents 0.4.182 on neo16, Chrome 156 | neo16, read only (before P3b) | The Windows agent holds 47989 and the WSL agent 47990 (flipped since 10-23). `roomler peers`: Windows direct to all 13 online peers, WSL on `relay:derp/tcp` or `relay:turn/udp` to all of them. Chrome's `roomler-rc-this-device` names the WSL agent, `roomler-rc-local-relay` unset (on). Permissions: `loopback-network` granted, `local-network` prompt, `local-network-access` granted |
 
 ## 9. Related
 
@@ -212,3 +297,4 @@ no relay either. Splitting the two is a later step if the field ever shows it.
 - `docs/remote-control.md`: the loopback-TURN corp relay. `docs/security-baseline.md`: the CSP allowlist's loopback
   origins, which the probe needs and this path does not.
 - #1882: `rc_overlay`, which decides whether the relay is offered at all.
+- #2774: the probe took the first local agent's relay, whatever its path; P3b (§3.6).
