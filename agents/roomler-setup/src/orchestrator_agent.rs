@@ -1120,6 +1120,13 @@ fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String
     // owns (the daemon hardening it later runs as SYSTEM) must belong to
     // Administrators before inheritance goes. Abort rather than strip it
     // from a directory we could not take.
+    //
+    // ⚠️ Then ONE call drops inheritance and grants: icacls writes the new
+    // DACL once, so each child inherits SYSTEM and Administrators while it
+    // still holds the ACEs that let them in. Split into two calls
+    // (inheritance first), a child someone else owns comes out with an
+    // empty DACL — measured on the daemon's copy in 0.4.185, which now
+    // grants before it drops inheritance (`roomler_node_core::config`).
     let owner = std::process::Command::new("icacls")
         .arg(roomler_dir)
         .arg("/setowner")
