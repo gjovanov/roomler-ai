@@ -905,16 +905,31 @@ flowchart TB
   buffer with BT.709, which moves 75 % green from Y 112 to 133. Marked, the
   test bars decode within 2 code values of the CPU path in every plane.
 - **The surface is held until VideoToolbox is done with it**, out of the
-  stream's queue of 3, so P5's field run reads the frame rate with the switch
-  on and off. Built and tested on an M5 Pro; the field run is
-  [FR-118](fr/FR-118-gpu-resident-frames.md#58-p5--videotoolbox-takes-the-iosurface-as-built-2026-10-29)
-  AC7's.
+  stream's queue of 3, and that costs no frames: the frame rate is the same
+  with the switch on and off.
+
+| Measured: `hevc_videotoolbox` 3024×1964 on an M5 Pro, 120 fps asked, a moving test pattern, 20-minute legs (FR-118 AC7) | Switch off | Switch on |
+|---|---|---|
+| capture (the wait for the stream's next frame; switch off: and the copy into memory) | 7.18 ms | 11.21–11.22 ms |
+| encode | 4.18 ms | 0.12 ms |
+| of which the CPU conversion | 3.27 ms | 0.03–0.04 ms |
+| **capture + encode** (the frame period at 88 fps) | **11.34 ms** | **11.32–11.34 ms** |
+| worker CPU per encoded frame | 14.58 ms (126 % of a core) | 2.55–2.60 ms (22–23 %) |
+| encoded fps (median window) | 87.8 | 87.8–88.0 |
+
+- **On the scrap arm the capture stage is a wait too.** The pump times the
+  whole `next_frame()`, which waits for the display stream's next frame, so
+  capture + encode is the frame period on both paths and the time the GPU path
+  saves goes into the wait. The work it removes shows in the encode stage
+  (−97 %) and the worker's CPU (−82 %), which also counts the copy into memory
+  ([FR-118 §9.9](fr/FR-118-gpu-resident-frames.md#99-ac7-videotoolbox-on-the-macbook-2026-10-29)).
 
 - The cells, the reasons a session took CPU frames, and the configuration:
   [`encoders.md`](encoders.md#gpu-resident-frames-the-input-path-fr-118). The
   field record: [FR-118 §9.2](fr/FR-118-gpu-resident-frames.md#92-the-first-field-run-2026-10-28),
-  [§9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28)
-  and [§9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29).
+  [§9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28),
+  [§9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29)
+  and [§9.9](fr/FR-118-gpu-resident-frames.md#99-ac7-videotoolbox-on-the-macbook-2026-10-29).
 
 ### 5.2 Encoder selection
 
