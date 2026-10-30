@@ -31,7 +31,7 @@
 //!   before the first report is `Unknown`: the first field session on 0.4.67
 //!   classified its opening window `TransitStalled` because the viewer's first
 //!   report had simply not arrived yet, and a viewer that never reports must
-//!   not hold a session forever under T1b.
+//!   not have its every window rejected as evidence.
 //! - [`PipeState::ViewerLate`] — the browser is the limiter: its own share is
 //!   [`VIEWER_SLACK_MS`] or more over its floor, or it reports `struggling`.
 //! - [`PipeState::Clear`] — none of the above.
@@ -42,15 +42,24 @@
 //! smallest value seen, so a permanently slow path is not a permanent stall
 //! and a stall never lowers the floor it is measured against.
 //!
-//! **T1a is SHADOW**: the verdict is logged and counted, nothing acts on it.
-//! T1b (the hold) is a separate switch. Pure — no clocks, no I/O — so it
-//! unit-tests on the default build and runs inside the B0 simulator.
+//! **Nothing here acts; the gate does.** The verdict was a shadow for one
+//! release (`transit_classify`, `agent-v0.4.67` → `0.4.92`) with a hold behind
+//! a second switch (`transit_hold`, T1b). FR-79 V1 (`agent-v0.4.93`) deleted
+//! both: `super::evidence::rejected` reads this window's verdict and the
+//! previous window's as two of its facts, and every rate loop consumes that
+//! one answer at the window fold (`governor.rs`). So the classifier always
+//! runs on a constrained window, a `TransitStalled` verdict means the window
+//! is not a measurement of the pipe, and — FR-79 V5 — it is the transport
+//! pushing back, which cuts only while the target sits above the measured
+//! pipe. Pure — no clocks, no I/O — so it unit-tests on the default build and
+//! runs inside the B0 simulator. The field record is `docs/rate-control.md`,
+//! "The classifier the gate reads".
 
 /// Transit share this far over its floor is a stall, not jitter. Two hundred
 /// milliseconds: FR-15's age slack is 70 ms for a *paint* excursion the loop
 /// should act on; a transit *stall* is a coarser event (finding 4 was seconds,
-/// the DERP fixture's are 1–4 s) and the cost of a false positive under T1b is
-/// a held rate, so the bar is higher.
+/// the DERP fixture's are 1–4 s) and the cost of a false positive is a window
+/// dropped as evidence by the FR-79 gate, so the bar is higher.
 pub const TRANSIT_SLACK_MS: u16 = 200;
 /// Browser share this far over its floor is the browser being late.
 pub const VIEWER_SLACK_MS: u16 = 100;
@@ -132,11 +141,12 @@ pub struct PipeClassifier {
     last: Option<PipeState>,
     counts: [u32; 5],
     /// How many of the `TransitStalled` verdicts came from the report-gap
-    /// rule rather than the split. AC2 counts gap-holds and split-holds
-    /// separately: the first field sessions showed ~2 % of a long relay
-    /// session's windows are report gaps, which is ~1 hold a minute if the
-    /// hold acts on them — a number the counter has to carry before the
-    /// default flips.
+    /// rule rather than the split. The fleet read counts the two apart: the
+    /// first field sessions showed ~2 % of a long relay session's windows are
+    /// report gaps, and over four days of fleet data 96 % of all
+    /// `TransitStalled` verdicts were gaps (FR-71 AC2) — each one a window
+    /// the FR-79 gate drops as evidence, so the number says how much of the
+    /// gate's rejecting is silence rather than a measured stall.
     gap_stalls: u32,
 }
 
@@ -338,7 +348,7 @@ mod tests {
     /// the sender had written frames and the viewer's FIRST report had not
     /// arrived yet. Silence before any report is `Unknown`; the same silence
     /// after a report is the gap finding 4 showed. A viewer that never
-    /// reports therefore never holds a session under T1b.
+    /// reports therefore never has its windows rejected on silence alone.
     #[test]
     fn silence_before_the_first_report_is_unknown_not_a_stall() {
         let mut c = PipeClassifier::new();
