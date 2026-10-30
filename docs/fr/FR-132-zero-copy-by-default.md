@@ -1,7 +1,8 @@
 # FR-132: Zero-copy by default — each GPU-input cell turns on for the fleet after a clean week of its own
 
-**Issue:** [#3141](https://github.com/gjovanov/roomler-ai/issues/3141) · **Status:** proposed 2026-10-30 — spec and
-claim · **Owner:** the agent's capture and encode path, and remote config · **Anchors:** master `01520c8af` ·
+**Issue:** [#3141](https://github.com/gjovanov/roomler-ai/issues/3141) · **Status:** P1 built 2026-10-30, unreleased;
+the four decisions taken 2026-10-30 (§6); proposed 2026-10-30 · **Owner:** the agent's capture and encode path, and
+remote config · **Anchors:** master `01520c8af` (§2); the as-built notes in §3a and §3b, master `ff29120ed` + P1 ·
 **Takes over:** [FR-118](FR-118-gpu-resident-frames.md) open decision 2 (the default) · **Builds on:**
 [FR-118](FR-118-gpu-resident-frames.md) (the GPU-input cells), [FR-77](FR-77-encoder-chroma-matrix.md) (cells, the
 probe, `encoder_cells_deny`), [FR-119](FR-119-high-refresh-streaming.md) (`fps_deny`, the second pushable denylist)
@@ -79,12 +80,36 @@ agent applies it as it applies `fps_deny` (a blank push clears it, `none` denies
 `needs_restart`, since the probe and the config fallbacks read it once per process. It ships before any cell is on
 by default, so the first flip already has a switch the server can push.
 
+As built: the route passes the text on unread, as it does the other two denylists, because an entry the gate cannot
+read denies nothing (`crates/modules/fleet/src/remote_config.rs:206`). The agent stores it trimmed, a blank clears
+it, and it reports `needs_restart` (`agents/roomlerd/src/remote_config.rs:354`). A test chains the pushed value
+through the restarted daemon's config fallbacks to the exact `name:gpu` entry `gpu_hint::is_denied` matches.
+Decision 1 is held by `the_device_owned_refusals_are_not_pushable`, which compares whole keys
+(`crates/remote_control/src/models.rs:9530`). The dialog gets the field, and
+[`remote-config.md`](../remote-config.md) §6 the key, with its value table.
+
 ### 3b. Decode errors become countable (P1)
 
 The viewer sends one control message per decode error, with the stage that failed (configure, decode, the pipe),
 before it falls back. The agent counts them per session, as it counts `keyframe_requests`, and `rc:session.stats`
 carries the count. A viewer without this sends nothing, which reads as zero, so the canary read in 3d compares
 sessions from viewers that have it.
+
+As built, a session's count tells "zero" from "not counted":
+
+- Every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts. `rc:session.stats` then carries
+  `decode_errors`, and `Some(0)` is a measured zero. A session whose viewer or agent predates P1, or that never
+  decoded in a worker, carries no field, and the server writes none. The canary read compares only rows that have it.
+- `rc:decode-error` carries `stage` (`configure` · `decode` · `pipe`), `path` (`webcodecs` · `vp9-444` · `hevc`),
+  and the codec and the decoder's message, cut short.
+- The agent logs the first eight errors with their stage.
+- The first `de`, and each of those first eight errors, send one sample at once, by the carrier's road
+  (FR-102 P9d). A session someone leaves right after a black screen still records its count, and a short clean
+  session records its zero.
+- A re-offer carries the count to the new peer.
+- The server writes `stats.decode_errors` only from a sample that counted.
+
+Detail: [remote-control.md §11.10](../remote-control.md#1110-the-viewers-decode-errors-fr-132-p1).
 
 ### 3c. A default per cell (P2)
 
@@ -122,7 +147,7 @@ the flip on every host that runs the cell, canary or not.
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | The red record: a fleet week of heartbeats read per cell (encoder × capture arm), counting the sessions that could have opened a GPU form and read `switch_off`, and naming the hosts that run each cell | — | not started |
-| P1 | 3a and 3b: `zero_copy_deny` in `DesiredConfig` and the agent's `apply`; the viewer's decode-error message and its count in `rc:session.stats` | the push is absent (no change); a viewer without the message sends nothing | not started |
+| P1 | 3a and 3b: `zero_copy_deny` in `DesiredConfig` and the agent's `apply`; the viewer's decode-error message and its count in `rc:session.stats` | the push is absent (no change); a viewer without the message sends nothing | **built 2026-10-30** (PR #PR_FR132_P1, unreleased). 3a: `MANAGE_AGENTS` alone, passed on unread, written by the device with `needs_restart`, end to end in `agent_tests` (AC2's integration half). 3b: `rc:decode-error` per error before the fallback, `de: 1` on every `rc:decodestat`, `decode_errors` on `rc:session.stats` (absent = not counted), the first `de` and the first eight errors sent at once, end to end through a real agent and viewer peer in `session_decode_errors_tests` (AC3's integration half). AC2's and AC3's field halves wait for a release |
 | P2 | 3c: the three-valued reading, the default list (empty), `default_off`, at both entry points | `zero_copy = off`; the list empty | not started |
 | P3 | QSV: the canary week, then the flip (if open decision 4 orders it first) | `zero_copy_deny` pushed; the cell off the list in the next release | not started |
 | P4 | NVENC on the WGC arm: the same | the same | not started |
@@ -148,17 +173,21 @@ the flip on every host that runs the cell, canary or not.
 - [ ] **AC7 (docs):** `docs/encoders.md` (the default per cell and the record of each flip), `docs/remote-config.md`
   (the pushable deny list) and `docs/remote-control.md` §5.1f, with a row in `docs/README.md`'s index.
 
-## 6. Open decisions
+## 6. Decisions
 
-1. **Should `zero_copy` itself be pushable**, so a canary can be started from the server? Recommended: no. Push only
-   the deny list, the half that removes, as with `encoder_cells_deny` and `fps_deny`. Turning a cell on stays a
-   decision made on the device, or by a release.
-2. **Which hosts are each cell's canaries.** P0 names the hosts that run each cell. The 2880×1800 laptop is not a
-   test host, so it joins a canary only in a window its owner agrees to, as in FR-118's decision 7.
-3. **What "clean" means in numbers.** Within the spread of the CPU-path week on the same hosts, or a fixed bound per
-   session-hour. Recommended: the spread, with a floor of one event in the week, since a single host's week can be
-   all zeros.
-4. **The order of the flips.** Recommended: by the hosts each cell covers, read from P0. QSV is likely first: every
+All four were decided by the operator on 2026-10-30, each as recommended
+([#3141 comment](https://github.com/gjovanov/roomler-ai/issues/3141#issuecomment-6524105510)).
+
+1. **Should `zero_copy` itself be pushable**, so a canary can be started from the server? **Decided: no.** Only
+   the deny list is pushed, the half that removes, as with `encoder_cells_deny` and `fps_deny`. Turning a cell on
+   stays a decision made on the device, or by a release. P1 holds it in a test that compares whole keys
+   (`zero_copy` is a prefix of `zero_copy_deny`).
+2. **Which hosts are each cell's canaries.** **Decided: picked from P0's list.** P0 names the hosts that run each
+   cell. The 2880×1800 laptop is not a test host, so it joins a canary only in a window its owner agrees to, as in
+   FR-118's decision 7.
+3. **What "clean" means in numbers.** **Decided: within the spread of the CPU-path week on the same hosts**, with a
+   floor of one event in the week, since a single host's week can be all zeros.
+4. **The order of the flips.** **Decided: by the hosts each cell covers**, read from P0. QSV is likely first: every
    QSV host captures through the DXGI arm (FR-118 §9, 2026-10-27).
 
 ## 7. Out of scope

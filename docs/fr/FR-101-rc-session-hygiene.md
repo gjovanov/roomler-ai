@@ -81,7 +81,7 @@ advertises `session-policy` (P2b). Every other session goes without it:
   `AUDIO` permission bit is read by nothing; the hub clears it along with the flag.
 - The strip takes effect on every deployed agent, because the agent already enforces the grant it is
   sent: it refuses the `files` channel without `FILES` (`agents/roomlerd/src/peer.rs:1204`) and
-  clipboard traffic without `CLIPBOARD` (`agents/roomlerd/src/peer.rs:10705`), and adds no audio track
+  clipboard traffic without `CLIPBOARD` (`agents/roomlerd/src/peer.rs:10780`), and adds no audio track
   without `audio_enabled`. Until P2c the viewer does not explain the refusal.
 - ⚠️ **Mid-roll.** An absent `session_policy` in the relay body comes from an origin pod older than
   the feature and reads as unrestricted: that pod applied no policy and would have granted the
@@ -117,7 +117,7 @@ advertises `session-policy` (P2b). Every other session goes without it:
 | `rc:session.created.features_refused` read into a map: string values only, and a key or reason this build does not know is kept, so a newer server's refusal still greys its control. Each reason in words, naming whose decision it was (the organization's, the device owner's, the person at the device not being asked, an agent too old to ask, a policy that could not be read) | `ui/src/composables/useSessionFeatures.ts:43`, `:53` |
 | The controls: the clipboard send and get buttons and clipboard auto-sync, file upload and browse, and drag-and-drop onto the screen or the files drawer, each disabled with the reason as its title. A drop or click that still reaches a refused feature says why instead of starting. The audio toggle's title gives the reason during a session. One snackbar at the session's start names what is off | `ui/src/views/remote/RemoteControl.vue:2437` |
 | Clipboard auto-sync stands down in both directions for a session whose clipboard was refused, rather than pushing into a channel the agent refuses | `ui/src/composables/useRemoteControl.ts:5823`, `:6015` |
-| The org settings card, "Remote session features": a select per feature (`on` / ask the person at the device / `off`) through P2a's route. The read is gated like the other org switches; a change names only its feature | `ui/src/components/admin/SettingsSection.vue:260`; `ui/src/stores/agents.ts:1399` |
+| The org settings card, "Remote session features": a select per feature (`on` / ask the person at the device / `off`) through P2a's route. The read is gated like the other org switches; a change names only its feature | `ui/src/components/admin/SettingsSection.vue:260`; `ui/src/stores/agents.ts:1404` |
 
 ### 3b. Write the audit that is already defined
 

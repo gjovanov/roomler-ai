@@ -1167,6 +1167,63 @@ async fn agent_row(
     .unwrap()
 }
 
+/// The owner makes the seeded member a device admin with the seeded `admin`
+/// role: `MANAGE_AGENTS` and neither grant bit, which the exec refusal at the
+/// end proves, so a 200 the member gets afterwards is `MANAGE_AGENTS` alone
+/// and not a caller who holds everything. `desired` is the device's
+/// desired-config route.
+async fn make_member_a_device_admin(
+    app: &TestApp,
+    seeded: &crate::fixtures::seed::SeededTenant,
+    desired: &str,
+) {
+    let roles: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/role", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let admin_role = roles
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "admin")
+        .expect("the seeded admin role")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/role/{admin_role}/assign/{}",
+                seeded.tenant_id, seeded.member.id
+            ),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the owner may assign a role");
+
+    // Control: the role really lacks the grant bits.
+    let (s, _) = put_json(
+        app,
+        desired,
+        &seeded.member.access_token,
+        json!({ "exec_enabled": true }),
+    )
+    .await;
+    assert_eq!(
+        s, 403,
+        "a device admin without EXEC_DEVICE cannot open exec"
+    );
+}
+
 /// FR-130 P1b — the colour-description switch, pushed end to end: the happy
 /// path the refusal test above stops short of, on the terms the switch is
 /// pushable under.
@@ -1206,47 +1263,7 @@ async fn a_device_admin_pushes_the_colour_description_off_and_the_device_awaits_
     .await;
     assert_eq!(s, 403, "MANAGE_AGENTS is still required");
 
-    // The owner makes the member a device admin with the seeded `admin` role.
-    let roles: Value = app
-        .auth_get(
-            &format!("/api/tenant/{}/role", seeded.tenant_id),
-            &seeded.admin.access_token,
-        )
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let admin_role = roles
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["name"] == "admin")
-        .expect("the seeded admin role")["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let resp = app
-        .auth_post(
-            &format!(
-                "/api/tenant/{}/role/{admin_role}/assign/{}",
-                seeded.tenant_id, seeded.member.id
-            ),
-            &seeded.admin.access_token,
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 200, "the owner may assign a role");
-
-    // Control: the role really lacks the grant bits, so the 200 below is
-    // MANAGE_AGENTS alone, not a caller who holds everything.
-    let (s, _) = put_json(&app, &desired, &member, json!({ "exec_enabled": true })).await;
-    assert_eq!(
-        s, 403,
-        "a device admin without EXEC_DEVICE cannot open exec"
-    );
+    make_member_a_device_admin(&app, &seeded, &desired).await;
 
     // A word no device could read: refused, and nothing recorded.
     let (s, body) = put_json(
@@ -1321,5 +1338,102 @@ async fn a_device_admin_pushes_the_colour_description_off_and_the_device_awaits_
         roomlerd::config::load(&path).unwrap().color_description,
         Some(false),
         "the device wrote the switch off in its own config file"
+    );
+}
+
+/// FR-132 P1 (AC2, the integration half) — FR-118's kill switch, pushed end
+/// to end. A device admin with `MANAGE_AGENTS` alone pushes `zero_copy_deny`;
+/// the server passes the text on unread, as it does the two other denylists; a
+/// device that opted in writes it to its config file and reports it as
+/// waiting for a restart, which the listing resolves into `needs_restart`.
+/// After that restart the gate refuses the cell (`input_reason=denied`),
+/// which the agent's own tests chain through the config fallbacks
+/// (`remote_config::tests`) and the field read shows. A plain member cannot
+/// push it, and `zero_copy` itself is not a key the route knows.
+#[tokio::test]
+async fn a_device_admin_pushes_the_gpu_input_denylist_and_the_device_awaits_a_restart() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("rcfgzcdeny").await;
+    let mut cfg = enrol_via_agent_lib(&app, &seeded, "mach-rcfgzcdeny", "GPU box").await;
+    assert_eq!(cfg.zero_copy_deny, None, "a fresh device denies nothing");
+    // The device's own opt-in, set where only someone at the machine can set
+    // it: in its config file.
+    cfg.remote_config_enabled = true;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    roomlerd::config::save(&path, &cfg).unwrap();
+    let desired = format!(
+        "/api/tenant/{}/agent/{}/desired-config",
+        seeded.tenant_id, cfg.agent_id
+    );
+    let member = seeded.member.access_token.clone();
+    let push = json!({ "zero_copy_deny": "hevc_qsv:gpu,av1_nvenc:gpu" });
+
+    // A plain member is not a device admin.
+    let (s, _) = put_json(&app, &desired, &member, push.clone()).await;
+    assert_eq!(s, 403, "MANAGE_AGENTS is still required");
+
+    make_member_a_device_admin(&app, &seeded, &desired).await;
+
+    // The push, with the switch's own name beside it: `zero_copy` is no key
+    // the route knows (FR-132 decision 1), so it is not stored.
+    let mut body = push.clone();
+    body["zero_copy"] = json!("on");
+    let (s, body) = put_json(&app, &desired, &member, body).await;
+    assert_eq!(s, 200, "MANAGE_AGENTS alone may push the denylist: {body}");
+    assert_eq!(
+        body["desired"]["zero_copy_deny"],
+        json!("hevc_qsv:gpu,av1_nvenc:gpu"),
+        "passed on as given: {body}"
+    );
+    assert!(
+        body["desired"].get("zero_copy").is_none(),
+        "the GPU path's ON switch is never pushable: {body}"
+    );
+    let revision = body["revision"].as_u64().expect("a revision");
+
+    // The device connects and reconciles (delivery is on connect).
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let sig_task = spawn_agent_signaling_on(
+        signaling::OrgCtx::primary(roomlerd::token_slot::TokenSlot::new(
+            cfg.agent_token.clone(),
+        )),
+        cfg.clone(),
+        path.clone(),
+        stop_rx,
+    );
+    let mut row = Value::Null;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        row = agent_row(&app, &seeded, &cfg.agent_id).await;
+        if row["remote_config"]["report"]["revision"].as_u64() == Some(revision) {
+            break;
+        }
+    }
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), sig_task).await;
+
+    let rc = &row["remote_config"];
+    assert_eq!(
+        rc["report"]["revision"].as_u64(),
+        Some(revision),
+        "the device never reported on this revision: {row}"
+    );
+    assert_eq!(rc["report"]["outcome"].as_str(), Some("applied"), "{rc}");
+    assert_eq!(
+        rc["report"]["needs_restart"],
+        json!(["zero_copy_deny"]),
+        "read once per process: written now, in force at the next start: {rc}"
+    );
+    assert_eq!(rc["state"].as_str(), Some("needs_restart"), "{rc}");
+    let written = roomlerd::config::load(&path).unwrap();
+    assert_eq!(
+        written.zero_copy_deny.as_deref(),
+        Some("hevc_qsv:gpu,av1_nvenc:gpu"),
+        "the device wrote the denylist in its own config file"
+    );
+    assert_eq!(
+        written.zero_copy, cfg.zero_copy,
+        "and nothing pushed touched the switch itself"
     );
 }

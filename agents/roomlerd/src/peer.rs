@@ -344,6 +344,10 @@ pub struct SessionTelemetry {
     /// FR-102 P9c — the carrier recorded for this session, once it is
     /// known; `None` until the observation after `Connected` has landed.
     pub carrier: Option<crate::session_carrier::SessionCarrier>,
+    /// FR-132 P1 — the viewer's decode errors, once it counts them
+    /// (`session_telemetry::SessionCounters::decode_errors`); `None` = not
+    /// counted, never zero.
+    pub decode_errors: Option<u32>,
 }
 
 impl AgentPeer {
@@ -1181,6 +1185,11 @@ impl AgentPeer {
         let keyframe_for_dc = keyframe_requested.clone();
         let viewer_report_for_dc = viewer_report.clone();
         let priority_for_dc = priority.clone();
+        // FR-132 P1 — a decode error the viewer reports sends one
+        // `rc:session.stats` at once, by the carrier observation's road
+        // (FR-102 P9d): a session someone leaves right after a black screen
+        // would otherwise end before the next 30 s tick carried it.
+        let stats_now_for_dc = carrier_ready_tx.clone();
         let video_bytes_dc_for_callback = video_bytes_dc.clone();
         let control_dc_for_callback = control_dc.clone();
         let cursor_dc_for_callback = cursor_dc_stash.clone();
@@ -1204,6 +1213,7 @@ impl AgentPeer {
             let keyframe_for_dc = keyframe_for_dc.clone();
             let viewer_report_for_dc = viewer_report_for_dc.clone();
             let priority_for_dc = priority_for_dc.clone();
+            let stats_now_for_dc = stats_now_for_dc.clone();
             let video_bytes_stash = video_bytes_dc_for_callback.clone();
             let control_stash = control_dc_for_callback.clone();
             let cursor_stash = cursor_dc_for_callback.clone();
@@ -1281,6 +1291,7 @@ impl AgentPeer {
                             keyframe_for_dc,
                             viewer_report_for_dc,
                             priority_for_dc,
+                            stats_now_for_dc,
                         )
                     }
                     "cursor" => {
@@ -1749,6 +1760,8 @@ impl AgentPeer {
         out.mixed_dial_seconds = c.mixed_dial_seconds.load(Ordering::Relaxed);
         // FR-102 P9c — the recorded carrier rides every sample once known.
         out.carrier = self.carrier.get().copied();
+        // FR-132 P1 — the viewer's decode errors, once it counts them.
+        out.decode_errors = c.decode_errors();
         out
     }
 
@@ -10264,6 +10277,52 @@ fn layout_json(snap: &crate::input::layout::LayoutSnapshot) -> String {
     .to_string()
 }
 
+/// FR-132 P1 (§3b) — one `rc:decode-error` from the viewer, read for the
+/// device's log. The stage that failed is `configure`, `decode` or `pipe` and
+/// the decode path `webcodecs`, `vp9-444` or `hevc`, each matched by EQUALITY
+/// (a wire spelling is a compatibility surface, never a prefix); anything else
+/// reads `other`. The codec and the decoder's message are cut short and their
+/// control characters dropped, so a viewer cannot write an unbounded or
+/// multi-line entry into the device's log. Nothing here decides anything: the
+/// count is what `rc:session.stats` carries.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ViewerDecodeError {
+    pub stage: &'static str,
+    pub path: &'static str,
+    pub codec: String,
+    pub error: String,
+}
+
+pub(crate) fn viewer_decode_error(val: &serde_json::Value) -> ViewerDecodeError {
+    let word = |key: &str, known: &[&'static str]| -> &'static str {
+        let v = val.get(key).and_then(|v| v.as_str()).unwrap_or("");
+        known.iter().copied().find(|k| *k == v).unwrap_or("other")
+    };
+    let text = |key: &str, max: usize| -> String {
+        val.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(max)
+            .collect()
+    };
+    ViewerDecodeError {
+        stage: word("stage", &["configure", "decode", "pipe"]),
+        path: word("path", &["webcodecs", "vp9-444", "hevc"]),
+        codec: text("codec", 64),
+        error: text("error", 160),
+    }
+}
+
+/// FR-132 P1 — does this `rc:decodestat` say its viewer counts decode errors
+/// (`de: 1`, or `true`)? An older viewer sends no `de`, and its session's
+/// decode errors read as not counted rather than as zero.
+pub(crate) fn viewer_counts_decode_errors(val: &serde_json::Value) -> bool {
+    val.get("de")
+        .is_some_and(|v| v.as_u64() == Some(1) || v.as_bool() == Some(true))
+}
+
 /// `control` data-channel handler. Parses JSON `rc:*` envelopes and
 /// applies them. Today the only message is `rc:quality` (mutating the
 /// shared atomic that the media pump polls before each encode); future
@@ -10282,6 +10341,9 @@ fn attach_control_handler(
     viewer_report: Arc<crate::encode::viewer_rate::ViewerFeedback>,
     // rc.199 — per-session Priority dial; the `rc:priority` match arm writes it.
     priority: Arc<std::sync::atomic::AtomicU8>,
+    // FR-132 P1 — asks the signalling loop for one `rc:session.stats` for this
+    // session now (the FR-102 P9d carrier-ready channel), on a decode error.
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
 ) {
     // A handle the on_message closure sends replies through (e.g.
     // rc:logs-fetch.reply) over the same DC. #1740 — WEAK: the closure is
@@ -10329,6 +10391,7 @@ fn attach_control_handler(
         let priority = priority.clone();
         let last_kf_request = last_kf_request.clone();
         let dc_for_reply = dc_for_reply.clone();
+        let stats_now = stats_now.clone();
         Box::pin(async move {
             // Trust-but-verify: a malformed message must never crash
             // the data-channel callback (it'd kill the channel for
@@ -10604,6 +10667,18 @@ fn attach_control_handler(
                         .unwrap_or(false);
                     viewer_report
                         .store_report(crate::encode::viewer_rate::pack_report(fps, struggling));
+                    // FR-132 P1 — `de`: this viewer counts its decode errors
+                    // (one `rc:decode-error` each), so the session's zero is a
+                    // measured one. Absent (an older viewer): not counted. The
+                    // first time, one sample goes out at once, so a short
+                    // session with no errors records its zero before it ends,
+                    // as one with errors records them (the arm below).
+                    if viewer_counts_decode_errors(&val)
+                        && crate::session_telemetry::counters(session_id)
+                            .note_decode_errors_counted()
+                    {
+                        let _ = stats_now.try_send(session_id);
+                    }
                     // FR-15 — the viewer's paint-age for the window (avg +
                     // the window's minimum, the floor sample). Absent from
                     // pre-FR-15 viewers and from a window that painted
@@ -10755,6 +10830,35 @@ fn attach_control_handler(
                         keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
                         crate::session_telemetry::counters(session_id).note_keyframe();
                         debug!(%session_id, "control: rc:keyframe — forcing IDR (browser decode-backlog resync)");
+                    }
+                }
+                "rc:decode-error" => {
+                    // FR-132 P1 (§3b) — the viewer's decoder failed, and the
+                    // viewer falls back to `<video>` (it sends this BEFORE it
+                    // does). Counted per session for `rc:session.stats`
+                    // (`decode_errors`), the measure a zero-copy canary week
+                    // reads (FR-132 §3d). The first few are logged with their
+                    // stage and sent at once, so a session someone leaves
+                    // right after still reports them; past those a flood is
+                    // counted, never logged or sent early.
+                    const LOGGED: u32 = 8;
+                    let e = viewer_decode_error(&val);
+                    let n = crate::session_telemetry::counters(session_id).note_decode_error();
+                    if n <= LOGGED {
+                        info!(
+                            %session_id,
+                            n,
+                            stage = e.stage,
+                            path = e.path,
+                            codec = %e.codec,
+                            error = %e.error,
+                            "control: rc:decode-error — the viewer's decoder failed; it falls back to <video>"
+                        );
+                        // Best-effort, as the carrier's is: a full or closed
+                        // channel leaves the count to the next 30 s tick.
+                        let _ = stats_now.try_send(session_id);
+                    } else {
+                        debug!(%session_id, n, stage = e.stage, "control: rc:decode-error (past the logged few)");
                     }
                 }
                 "rc:apps.list" | "rc:apps.focus" | "rc:apps.launch" => {
@@ -14053,6 +14157,75 @@ mod codec_cap_tests {
 #[cfg(test)]
 mod tests {
     use super::quality::*;
+
+    /// FR-132 P1 — an `rc:decode-error` reads the spellings the viewer sends
+    /// (`decodeErrorWireMessage` in `useRemoteControl.ts`) by equality, an
+    /// unknown or missing one as `other`, and bounds what it puts in the log.
+    #[test]
+    fn a_viewer_decode_error_is_read_by_equality_and_bounded() {
+        use super::{ViewerDecodeError, viewer_decode_error};
+        let v = serde_json::json!({
+            "t": "rc:decode-error", "stage": "decode", "path": "hevc",
+            "codec": "hev1.1.6.L153.B0", "error": "Decoding error.",
+        });
+        assert_eq!(
+            viewer_decode_error(&v),
+            ViewerDecodeError {
+                stage: "decode",
+                path: "hevc",
+                codec: "hev1.1.6.L153.B0".into(),
+                error: "Decoding error.".into(),
+            }
+        );
+        for (stage, read) in [
+            ("configure", "configure"),
+            ("pipe", "pipe"),
+            ("decoder", "other"),
+            ("Decode", "other"),
+            ("", "other"),
+        ] {
+            let v = serde_json::json!({ "t": "rc:decode-error", "stage": stage });
+            assert_eq!(viewer_decode_error(&v).stage, read, "{stage:?}");
+        }
+        let bare = viewer_decode_error(&serde_json::json!({ "t": "rc:decode-error" }));
+        assert_eq!((bare.stage, bare.path), ("other", "other"));
+        assert!(bare.codec.is_empty() && bare.error.is_empty());
+        let flood = serde_json::json!({
+            "t": "rc:decode-error", "stage": 7, "path": "vp9-444",
+            "codec": "x".repeat(500), "error": format!("line one\nline two\r{}", "y".repeat(500)),
+        });
+        let e = viewer_decode_error(&flood);
+        assert_eq!((e.stage, e.path), ("other", "vp9-444"));
+        assert_eq!(e.codec.chars().count(), 64);
+        assert_eq!(e.error.chars().count(), 160);
+        assert!(
+            !e.error.contains('\n') && !e.error.contains('\r'),
+            "{}",
+            e.error
+        );
+    }
+
+    /// FR-132 P1 — only a viewer that says so counts: `de: 1` (what
+    /// `decodeStatWireMessage` sends) or `true`; absent or anything else is an
+    /// older viewer, whose session's decode errors read as not counted.
+    #[test]
+    fn a_decodestat_says_whether_its_viewer_counts_decode_errors() {
+        use super::viewer_counts_decode_errors as counts;
+        assert!(counts(
+            &serde_json::json!({ "t": "rc:decodestat", "fps": 60, "de": 1 })
+        ));
+        assert!(counts(
+            &serde_json::json!({ "t": "rc:decodestat", "de": true })
+        ));
+        for older in [
+            serde_json::json!({ "t": "rc:decodestat", "fps": 60 }),
+            serde_json::json!({ "t": "rc:decodestat", "de": 0 }),
+            serde_json::json!({ "t": "rc:decodestat", "de": "1" }),
+            serde_json::json!({ "t": "rc:decodestat", "de": false }),
+        ] {
+            assert!(!counts(&older), "{older}");
+        }
+    }
 
     /// rc.227 / FR-97 P3e — the `rc:layout` envelope as the viewer's
     /// `parseControlInbound` reads it: `active_hkl` and `active` strings, and

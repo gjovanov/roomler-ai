@@ -27,7 +27,7 @@ Nothing to install on the controlling side stays true: Pointer Lock is a web API
 | The uinput device is an absolute tablet **by design**: "a relative device would force us to track the pointer and guess at acceleration" | [`uinput_backend.rs:18`](../../agents/roomlerd/src/input/uinput_backend.rs#L18), axes at `:312` |
 | The portal path moves with `NotifyPointerMotionAbsolute` on the stream | [`portal/input.rs:468`](../../agents/roomlerd/src/capture/portal/input.rs#L468) |
 | The viewer coalesces pointer moves at the input gap and sends the last position | [`useRemoteControl.ts:6389`](../../ui/src/composables/useRemoteControl.ts#L6389), the gap's key at `:2440` |
-| The agent already says when the host hides its cursor (`cursor:hide`); the viewer only drops its ghost cursor | `useRemoteControl.ts:9631` |
+| The agent already says when the host hides its cursor (`cursor:hide`); the viewer only drops its ghost cursor | `useRemoteControl.ts:9696` |
 | No Pointer Lock anywhere in the viewer | `git grep requestPointerLock ui/src`: nothing |
 | `AgentCaps.input` today: `arbiter`, `exclusive`, `ghost-cursor` | [`caps.rs:1750`](../../agents/roomlerd/src/encode/caps.rs#L1750) |
 

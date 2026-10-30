@@ -40,6 +40,10 @@ pub struct DesiredConfigBody {
     /// FR-130 P1b — `on`, `off`, or blank (back to the device's default).
     #[serde(default)]
     pub color_description: Option<String>,
+    /// FR-132 P1 — `name:gpu` entries, `none`, or blank (clear the device's
+    /// key). Passed on unread, as the two denylists above are.
+    #[serde(default)]
+    pub zero_copy_deny: Option<String>,
 }
 
 /// ⚠️ `desired` is the SAME projection the listing returns
@@ -199,6 +203,7 @@ pub async fn set_desired_config(
         encoder_cells_deny: body.encoder_cells_deny,
         fps_deny: body.fps_deny,
         color_description,
+        zero_copy_deny: body.zero_copy_deny,
         revision: agent.desired_config.revision + 1,
         updated_by: Some(auth.user_id),
         updated_at: Some(DateTime::now()),
@@ -553,6 +558,34 @@ mod tests {
             decide(0, &DesiredConfig::default(), &deny),
             Err(ConfigDenyReason::NotDeviceAdmin)
         );
+    }
+
+    /// FR-132 P1 — the GPU-input denylist is FR-118's kill switch, the same
+    /// way: it only ever REMOVES a GPU form a device would otherwise open, so
+    /// `MANAGE_AGENTS` alone may push it, a clear included, and nothing less
+    /// may push any of it.
+    #[test]
+    fn the_gpu_input_denylist_needs_only_manage_agents() {
+        for value in ["hevc_qsv:gpu,av1_nvenc:gpu", "none", ""] {
+            let deny = DesiredConfig {
+                zero_copy_deny: Some(value.into()),
+                ..Default::default()
+            };
+            decide(DEFAULT_ADMIN, &DesiredConfig::default(), &deny)
+                .unwrap_or_else(|e| panic!("MANAGE_AGENTS alone may push {value:?}: {e:?}"));
+            assert!(!deny.touches_exec() && !deny.touches_ssh(), "{value:?}");
+            assert!(
+                !deny.is_empty(),
+                "{value:?}: a denylist-only request is a request"
+            );
+            for short in [0, DEFAULT_MEMBER] {
+                assert_eq!(
+                    decide(short, &DesiredConfig::default(), &deny),
+                    Err(ConfigDenyReason::NotDeviceAdmin),
+                    "{value:?}"
+                );
+            }
+        }
     }
 
     /// FR-130 P1b — the colour-description switch is no gate either: `off`

@@ -29,9 +29,9 @@ relay (P3b, §3.6).
 The loopback-TURN corp relay (`agents/roomlerd/src/rc_local_turn.rs`) hosts a small TURN server on the device's
 overlay address and loopback. It answers a probe on `127.0.0.1:47989` (`:44`), with fallback ports from `:41989`
 (`:53`), returning a descriptor with freshly minted 1-hour credentials (`CRED_TTL`, `:68`; minted at `:268`). The
-viewer probes the whole range before every session (`probeLocalRelay`, `ui/src/composables/useRemoteControl.ts:7362`,
+viewer probes the whole range before every session (`probeLocalRelay`, `ui/src/composables/useRemoteControl.ts:7421`,
 called at `:9168`). It adds `turn:127.0.0.1:<port>` to its own ICE servers (`localRelayIceServer`, `:3810`) and
-forwards the descriptor on `rc:session.request` (`:10620`; the wire field is `signaling.rs:2039`). The Hub stores it
+forwards the descriptor on `rc:session.request` (`:10620`; the wire field is `signaling.rs:2049`). The Hub stores it
 on the session (`crates/modules/fleet/src/hub.rs:1803`) and hands the remote agent `turn:<overlay>:<port>` with the
 offer (`forward_offer`, `:2133`, the relay at `:2173`), only for an overlay address (`is_overlay_relay_ip`, `:65`) and
 only when the device lets remote desktop use the overlay (#1882's `rc_overlay`).
@@ -99,7 +99,7 @@ sequenceDiagram
 
 - A per-browser choice, **This browser runs on**: one of the signed-in person's own devices that advertise
   `local-relay`, or none. Stored in `localStorage`, beside today's `roomler-rc-local-relay` switch
-  (`useRemoteControl.ts:3595`).
+  (`useRemoteControl.ts:3634`).
 - **Suggested by the probe while the probe still works**: the probe's descriptor gains the device's `agent_id`, and
   the first successful probe records it unless the person chose none. That covers every browser that has the
   permission or does not ask for it. ⚠️ Only a device of the **person's own** is recorded: a browser on someone
@@ -124,7 +124,7 @@ On `rc:session.request` with `local_relay_from` and no descriptor, the Hub answe
 The descriptor is stored on the session exactly as a probed one is, so `forward_offer` hands the remote agent the
 overlay relay as today, with the same overlay-range check. The browser adds `turn:127.0.0.1:<port>` with
 `pc.setConfiguration` when `rc:session.created` arrives. The peer connection exists by then
-(`useRemoteControl.ts:9406`) and has gathered nothing: the offer waits for `rc:ready` (`:8577`).
+(`useRemoteControl.ts:9471`) and has gathered nothing: the offer waits for `rc:ready` (`:8642`).
 
 ⚠️ The descriptor's credential lets its holder allocate on the device's relay, which the overlay and loopback reach.
 It is minted by the device, valid for an hour, held only in the Hub's memory, and handed only to the device's owner's
@@ -203,11 +203,11 @@ sequenceDiagram
 | piece | where |
 |---|---|
 | The probe asks every port of the band at once, so a connect waits one timeout, not one per port, and keeps every answer in port order, one per relay, at most `LOCAL_RELAYS_MAX` (4) | `ui/src/composables/useRemoteControl.ts:3805`, `:3810`, `:3833` |
-| "This browser runs on" holds a list: a new key, `roomler-rc-this-devices`, beside the old one, which still gets the first device for a tab on an older bundle. The list holds only while the old key echoes it, so a choice made since in such a tab wins. A probe pairs an unanswered browser with every own device it found (`devicesToPairFromProbe`) | `ui/src/composables/useRemoteControl.ts:3883`, `:3909`, `:3935`, `:3983` |
-| A device stored before P3b is **legacy**. On a later connect the browser looks once more, only when the device list in view vouches for the stored device as the person's own (`mayLookAgain`; another organization in view, or a list that failed to load, waits for a later connect) and Chrome says the loopback permission is already granted (`loopback-network`, before the split `local-network-access`). It widens the pairing to every own device found, in probe order (the stored device was a race too), and that connect names them, so the Hub checks each. Found or not, the look happens once (`relayChoiceAfterProbe`) | `ui/src/composables/useRemoteControl.ts:4006`, `:4028`, `:4060`, `:9558` |
-| The plan names every paired device except the one being viewed; the request carries the first of each list where an older server reads it, and the rest as `local_relay_also` / `local_relay_from_also`; the answer's relays all go in with `setConfiguration`, in order | `ui/src/composables/useRemoteControl.ts:3961`, `:4083`, `:4099`, `:4112`, `:8671`, `:11034` |
-| The picker takes several devices; "Not set" or "None of my devices" picked wins over the rest | `ui/src/views/remote/RemoteControl.vue:1951`, `:3743`; `useRemoteControl.ts:4135` |
-| The wire: the two `_also` lists on the request, `local_relay_also` on the answer, `LOCAL_RELAYS_MAX` | `crates/remote_control/src/signaling.rs:2037`, `:2044`, `:3349`, `:5573` |
+| "This browser runs on" holds a list: a new key, `roomler-rc-this-devices`, beside the old one, which still gets the first device for a tab on an older bundle. The list holds only while the old key echoes it, so a choice made since in such a tab wins. A probe pairs an unanswered browser with every own device it found (`devicesToPairFromProbe`) | `ui/src/composables/useRemoteControl.ts:3922`, `:3948`, `:3974`, `:4022` |
+| A device stored before P3b is **legacy**. On a later connect the browser looks once more, only when the device list in view vouches for the stored device as the person's own (`mayLookAgain`; another organization in view, or a list that failed to load, waits for a later connect) and Chrome says the loopback permission is already granted (`loopback-network`, before the split `local-network-access`). It widens the pairing to every own device found, in probe order (the stored device was a race too), and that connect names them, so the Hub checks each. Found or not, the look happens once (`relayChoiceAfterProbe`) | `ui/src/composables/useRemoteControl.ts:4045`, `:4067`, `:4099`, `:9623` |
+| The plan names every paired device except the one being viewed; the request carries the first of each list where an older server reads it, and the rest as `local_relay_also` / `local_relay_from_also`; the answer's relays all go in with `setConfiguration`, in order | `ui/src/composables/useRemoteControl.ts:4000`, `:4122`, `:4138`, `:4151`, `:8736`, `:11099` |
+| The picker takes several devices; "Not set" or "None of my devices" picked wins over the rest | `ui/src/views/remote/RemoteControl.vue:1951`, `:3743`; `useRemoteControl.ts:4174` |
+| The wire: the two `_also` lists on the request, `local_relay_also` on the answer, `LOCAL_RELAYS_MAX` | `crates/remote_control/src/signaling.rs:2047`, `:2054`, `:3359`, `:5583` |
 | The Hub refuses a target whose `rc_overlay` is off first, whatever devices are named. Otherwise it resolves each named device on its own (`named_devices`, each once, at most four). The answer is `Ok` when any got a relay, else the **first** one's refusal. A probed list keeps one relay per address (`bounded_relays`); the session holds them all (`LiveSession::local_relays`); `forward_offer` hands the target each, behind the same overlay-range and `rc_overlay` gates; a coalesced retry gets the same list | `crates/modules/fleet/src/hub.rs:84`, `:104`, `:125`, `:1656`, `:1884`, `:2315`, `:4066`, `:4075`; `crates/remote_control/src/session.rs:63` |
 
 ⚠️ **ICE keeps the path that works, not the fastest one that works.** Chrome ranks its relay candidates by the order of

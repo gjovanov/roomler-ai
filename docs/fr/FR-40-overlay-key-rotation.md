@@ -41,12 +41,12 @@ additionally refuses a registration whose pubkey is not the row's (`derp.rs:339-
 | primary key mint | `agents/roomlerd/src/main.rs:3439-3446` | lazy, at daemon start, `WgKeypair::generate()` → `config::save`; the ONLY primary mint |
 | secondary-org mint | `crates/agent-core/src/enrollment.rs:629-630` | at enroll-append; never copied from the primary (cross-org correlation) |
 | storage | `crates/agent-core/src/config.rs:1900` (primary), `:2030` (`OrgEntry`), `for_org` at `:2164-2192` | the key is **per org** — `for_org` scopes it, unlike `exec_enabled`/`ssh_*` which are host-global |
-| atomic save | `config.rs:3586` | tmp + `sync_all` + 0600/ACL + `.prev` + rename, under the daemon-wide write lock (`org_join.rs:48`) |
+| atomic save | `config.rs:3588` | tmp + `sync_all` + 0600/ACL + `.prev` + rename, under the daemon-wide write lock (`org_join.rs:48`) |
 | how a session gets its key | `agents/roomlerd/src/signaling.rs:476-481`, `:957-959`; `overlay.rs:210-217` | from the in-memory `AgentConfig` snapshot taken at start — **never re-read from disk per session** |
 | runtime identity | `agents/roomlerd/src/overlay.rs:79-86` (`RuntimeFingerprint::same_shape` includes `wg_public_key`), `:236-243`, `:430-438` | a changed secret already fails re-attach and rebuilds the runtime |
 | existing per-org cycle | `main.rs:2893-2914` (`spawn_org`: stop the previous loop, re-load config from disk, respawn) | the primary loop has NO stop handle |
 | server join | `crates/api/src/ws/overlay.rs:232`, `:279-297` (`wg_key_taken_by_other`, machine-scoped ⇒ a same-machine rotation is allowed), `:299-390` (`rehydrate` stores `wg_public_key` + `key_epoch`) | `key_epoch` is stored and **read by nothing** (`models.rs:2982`; the agent always sends 0, `runtime.rs:1951`) |
-| peer fan-out | `overlay.rs:538-568` → `OverlayNetmapDelta { upserts, removes }` (`signaling.rs:4180`) | an upsert IS the update; the re-join already carries the new key to every peer |
+| peer fan-out | `overlay.rs:538-568` → `OverlayNetmapDelta { upserts, removes }` (`signaling.rs:4190`) | an upsert IS the update; the re-join already carries the new key to every peer |
 | peer reinstall | `crates/tunnel-core/src/overlay/runtime/establish.rs:1147-1180` | "peer's WG public key changed — reinstalling its carrier" (`PeerRoute::Keep`) |
 | DERP | `crates/api/src/ws/derp.rs:339-362` (pubkey must equal the row's), `derp_acl.rs:99-140` rebuilt on every join (`overlay.rs:488-497`) | the row must carry the new key BEFORE the node re-registers — the join does exactly that |
 | the push precedent | `crates/api/src/routes/remote_control.rs:831-872` (`trigger_agent_update`, `MANAGE_AGENTS`, `Hub::send_to_agent`), agent arm `signaling.rs:2896-2918` (primary-only) | `UpdateNow` is sent BLIND — no cap gate |

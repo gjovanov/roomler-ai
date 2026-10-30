@@ -26,17 +26,23 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-type Ws =
+// FR-132 P1 — the helpers below are shared with `session_decode_errors_tests`,
+// which drives the same server and the same real agent.
+pub(crate) type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     s.replace('+', "%2B")
         .replace('/', "%2F")
         .replace('=', "%3D")
 }
 
 /// Enroll a device and connect its agent WS.
-async fn connect_agent(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> (String, Ws) {
+pub(crate) async fn connect_agent(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    machine_id: &str,
+) -> (String, Ws) {
     let et: Value = app
         .auth_post(
             &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
@@ -89,7 +95,7 @@ async fn connect_agent(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -
 }
 
 /// Ask for a session on a fresh controller connection; returns it live.
-async fn ask(app: &TestApp, token: &str, agent_id: &str) -> (Ws, String) {
+pub(crate) async fn ask(app: &TestApp, token: &str, agent_id: &str) -> (Ws, String) {
     let url = format!("ws://{}/ws?token={}", app.addr, urlencode(token));
     let (mut ws, _) = connect_async(&url).await.expect("controller ws");
     let _ = tokio::time::timeout(Duration::from_millis(200), ws.next()).await;
@@ -121,7 +127,7 @@ async fn ask(app: &TestApp, token: &str, agent_id: &str) -> (Ws, String) {
     panic!("no rc:session.created within 5 s");
 }
 
-async fn wait_for_session_row(app: &TestApp, seeded: &SeededTenant, session_id: &str) {
+pub(crate) async fn wait_for_session_row(app: &TestApp, seeded: &SeededTenant, session_id: &str) {
     for _ in 0..50 {
         let resp = app
             .client
@@ -273,7 +279,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 /// Spawn the real agent signalling loop, as `rc_idle_limit_tests` does: the
 /// consent broker auto-grants, no GUI-worker delegation (`Off` is the real
 /// production value on every platform but a supervised Mac).
-fn spawn_real_agent(
+pub(crate) fn spawn_real_agent(
     cfg: AgentConfig,
     stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -313,7 +319,11 @@ fn spawn_real_agent(
 }
 
 /// Enroll a device through the agent library (a real config + token).
-async fn enrol_real(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> AgentConfig {
+pub(crate) async fn enrol_real(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    machine_id: &str,
+) -> AgentConfig {
     let et: Value = app
         .auth_post(
             &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
@@ -337,7 +347,7 @@ async fn enrol_real(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> A
 }
 
 /// Wait for the agent's row to say online.
-async fn wait_online(app: &TestApp, seeded: &SeededTenant, cfg: &AgentConfig) {
+pub(crate) async fn wait_online(app: &TestApp, seeded: &SeededTenant, cfg: &AgentConfig) {
     let url = format!("/api/tenant/{}/agent/{}", seeded.tenant_id, cfg.agent_id);
     for _ in 0..40 {
         if let Ok(resp) = app.auth_get(&url, &seeded.admin.access_token).send().await
@@ -355,7 +365,7 @@ async fn wait_online(app: &TestApp, seeded: &SeededTenant, cfg: &AgentConfig) {
 /// The overlay's address ranges, as the agent's carrier observation reads them
 /// (`roomlerd::peer::addr_is_overlay_range`): the CGNAT `/10` the overlay
 /// lives in, and the derived-v6 ULA `fd72:6f6f:6d6c::/48`.
-fn is_overlay_range(ip: IpAddr) -> bool {
+pub(crate) fn is_overlay_range(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
