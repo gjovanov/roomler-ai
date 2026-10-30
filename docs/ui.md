@@ -142,7 +142,7 @@ flowchart TB
 
 The Video tab of the viewer's settings offers **Frame rate**, with 60, 120 and
 144, only for an agent whose hello carries `fps-high`
-(`views/remote/RemoteControl.vue:1712`). The agent's side, the grant and its
+(`views/remote/RemoteControl.vue:1715`). The agent's side, the grant and its
 step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-the-viewer-asks-the-host-proves-it-fr-119).
 
 - **The options** (`frameRateOptions`, `composables/frameRate.ts:52`): 60 is
@@ -161,7 +161,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   …)". A reason word from a newer agent is shown as it came. With no session
   open, the hint reads "Above 60 only where this device has shown it can sustain
   it".
-- **"Try N fps again"** (`views/remote/RemoteControl.vue:1722`) appears under
+- **"Try N fps again"** (`views/remote/RemoteControl.vue:1725`) appears under
   the picker for an `unproven` refusal, from an agent that advertises
   `fps-retry` (`frameRateCanRetry`, `composables/frameRate.ts:164`). It re-sends
   the pick with `retry: true`, and the agent trials the step-down again from the

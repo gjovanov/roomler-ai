@@ -133,7 +133,7 @@ happens while the host is locked.
 The agent only injects. It never reads input, so there is no hook, no raw-input sink and no key polling, by
 FR-92's rule. The field probes that read raw input (§5) are test scripts on throwaway guests, never part
 of `roomlerd`. A unit test holds this
-([`input/mod.rs:853`](../../agents/roomlerd/src/input/mod.rs#L853) `fr109_relative_mouse_reads_no_input`,
+([`input/mod.rs:868`](../../agents/roomlerd/src/input/mod.rs#L868) `fr109_relative_mouse_reads_no_input`,
 AC6). It scans the six files relative mode touches for hooks, raw-input registration and reads,
 keyboard-state reads, an evdev grab, XRecord, XI2 event selection and a macOS event tap. It allows exactly
 one key-state call: FR-92's own keep-busy check for a held mouse button (`buttons_held_now`), and only
@@ -209,7 +209,7 @@ inside that function.
 - [x] **AC6 (no hooks):** a source scan in FR-92's shape covers this FR's agent code and fails on a planted
   raw-input registration. **Verified:** `input::tests::fr109_relative_mouse_reads_no_input` (§3f) passed
   on Windows. Two negative controls each failed it, with the file and line. A `RegisterRawInputDevices`
-  string constant planted at the end of `arbiter.rs` failed with `input/arbiter.rs:1848: uses
+  string constant planted at the end of `arbiter.rs` failed with `input/arbiter.rs:1931: uses
   RegisterRawInputDevices`. A `GetAsyncKeyState` one planted at the end of `enigo_backend.rs`, outside
   FR-92's mouse-button read, failed with `polls key state outside FR-92's mouse-button read`. Restored
   from a copy, it passed again. It is a sibling of FR-92's own scan and of FR-108's, for the reason FR-108

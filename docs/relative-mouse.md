@@ -140,7 +140,7 @@ each absolute move as a large jump. In relative mode the same probe read the del
 ## The viewer
 
 - **The control** is a toolbar button, shown only for an agent that advertises `mouse-rel`
-  ([`RemoteControl.vue:3684`](../ui/src/views/remote/RemoteControl.vue#L3684) `relativeMouseOffered`).
+  ([`RemoteControl.vue:3688`](../ui/src/views/remote/RemoteControl.vue#L3688) `relativeMouseOffered`).
   Pointer Lock needs a user gesture, and the click is one.
 - **Entering** asks for raw, unaccelerated deltas (`unadjustedMovement`). A browser that rejects the option
   gets plain Pointer Lock ([`useRemoteControl.ts:6823`](../ui/src/composables/useRemoteControl.ts#L6823)
@@ -220,7 +220,7 @@ person's.
 
 - It never reads input on the host. The agent only injects; there is no hook and no raw-input reader in
   `roomlerd` (FR-92's rule). A unit test scans the relative-mouse code for any of them
-  ([`input/mod.rs:853`](../agents/roomlerd/src/input/mod.rs#L853) `fr109_relative_mouse_reads_no_input`).
+  ([`input/mod.rs:868`](../agents/roomlerd/src/input/mod.rs#L868) `fr109_relative_mouse_reads_no_input`).
 - No ghost cursor in relative mode: other viewers see the host's own cursor in the picture.
 - The host's pointer speed and acceleration settings are not changed.
 - Not measured on macOS: an app that reads the GameController framework (`GCMouse`). It reads the mouse

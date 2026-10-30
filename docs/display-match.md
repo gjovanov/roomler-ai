@@ -77,7 +77,7 @@ Every request gets exactly one `rc:display-match.state`
 ⚠️ An agent from before FR-108 answers nothing, and the viewer then shows the toggle as it always did. A word
 this viewer does not know, from a newer agent, is shown as it came and never read as success
 ([`displayMatch.ts:39`](../ui/src/composables/displayMatch.ts#L39) `describeDisplayMatchRefusal`). The viewer
-puts the answer under the toggle ([`RemoteControl.vue:4443`](../ui/src/views/remote/RemoteControl.vue#L4443)
+puts the answer under the toggle ([`RemoteControl.vue:4447`](../ui/src/views/remote/RemoteControl.vue#L4447)
 `displayMatchSaid`).
 
 ⚠️ `attended` and `disabled_on_device` hand the screen back: a mode this session applied earlier is restored
@@ -97,7 +97,7 @@ roomler config set display_match auto     # auto (default) | always | never
 | `never` | never |
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
-  ([`lib.rs:3403`](../crates/localapi/src/lib.rs#L3403)), and absent from `DesiredConfig`, so a server cannot
+  ([`lib.rs:3424`](../crates/localapi/src/lib.rs#L3424)), and absent from `DesiredConfig`, so a server cannot
   push it ([`models.rs:9738`](../crates/remote_control/src/models.rs#L9738)). A server that could set it could
   take every screen it reaches.
 - **Read live** at every request ([`display_match.rs:1226`](../agents/roomlerd/src/display_match.rs#L1226)
@@ -222,7 +222,7 @@ sequenceDiagram
   refuses to delete the mode in use ([`display_match.rs:303`](../agents/roomlerd/src/display_match.rs#L303)).
 - **The capture opens again at the new size.** X11's capturer takes its size when it opens, so every switch
   and restore bumps a counter the capture worker watches
-  ([`scrap_backend.rs:261`](../agents/roomlerd/src/capture/scrap_backend.rs#L261)). The encoder already
+  ([`scrap_backend.rs:263`](../agents/roomlerd/src/capture/scrap_backend.rs#L263)). The encoder already
   rebuilds when the frame size changes.
 - **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb
   ([`virtual_desktop.rs:747`](../agents/roomlerd/src/virtual_desktop.rs#L747) `spawn_x_server`).
@@ -334,7 +334,7 @@ sequenceDiagram
   with the tracker it shares with Windows, with no exception for the switch itself.
 - **The capture follows the mode.** A Mac's stream is a `CGDisplayStream` opened at a size, so after a switch it
   opens again, as X11's capturer does
-  ([`capture/scrap_backend.rs:308`](../agents/roomlerd/src/capture/scrap_backend.rs#L308)).
+  ([`capture/scrap_backend.rs:310`](../agents/roomlerd/src/capture/scrap_backend.rs#L310)).
 - **Off the main thread.** `CGDisplaySetDisplayMode` from a second thread switched the mode and returned 0
   (measured), so the switch does not wait on the AppKit pump.
 

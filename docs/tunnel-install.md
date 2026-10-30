@@ -163,7 +163,7 @@ sudo dpkg -i /tmp/roomler-cli.deb
 > `linux-deb-aarch64` and `linux-aarch64`. A release built before P7b has no
 > aarch64 CLI, and the proxy answers 404 for it rather than hand over the
 > x86_64 one. `install.sh --role tunnel` picks the arch by itself
-> (`scripts/install.sh:1030-1034`), and the aarch64 wizard asks for
+> (`scripts/install.sh:1034-1038`), and the aarch64 wizard asks for
 > `linux-aarch64`. The arm64 build is made on Ubuntu 22.04, so it needs glibc
 > 2.35 or later, as the x86_64 agent does.
 

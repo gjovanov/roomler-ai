@@ -102,7 +102,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3719`, `crates/agent-core/src/config.rs:4153`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3776`, `crates/agent-core/src/config.rs:4153`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:633`, `:965`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -962,13 +962,13 @@ Device configuration card carries a banner naming both files
 `config set` print the "a second roomler daemon is running" note that `status`
 and `peers` already printed — a note that had gone silent for the console user,
 because the root socket's `0700` directory refuses their `stat`; the root half's
-person socket is the evidence now (`crates/localapi/src/lib.rs:4571`).
+person socket is the evidence now (`crates/localapi/src/lib.rs:4592`).
 
 The root half's switches are **root's to set by design**, not by omission: its
 LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person socket it
 serves the console user admits the safety surface only — status, sessions,
 consent, the Devices view — never a config verb (`localapi::person_may`,
-`crates/localapi/src/lib.rs:3080`). Whether the console user should flip the
+`crates/localapi/src/lib.rs:3101`). Whether the console user should flip the
 root half's gates from the app is the decision left open on #2871; until it is
 taken, the gate stays with `sudo`.
 
@@ -1048,7 +1048,7 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3373`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3388`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
@@ -1263,7 +1263,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1257` (the section) — `uninstall_linux` at `:1683`,
+`scripts/install.sh:1261` (the section) — `uninstall_linux` at `:1687`,
 `uninstall_macos` at `:1494`.
 
 ```mermaid
@@ -1288,7 +1288,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2136`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2151`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

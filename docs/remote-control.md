@@ -250,7 +250,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2813`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:191`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:363`, wired at `app.rs:4227`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:363`, wired at `app.rs:4284`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -482,7 +482,7 @@ off while the machine stayed up (FR-55's keeper holds
 `PreventUserIdleSystemSleep`, which keeps the **machine** reachable and lets the
 display sleep, on purpose). The capture worker now takes
 `power::DisplayAwake` for its whole life
-(`agents/roomlerd/src/capture/scrap_backend.rs:152`,
+(`agents/roomlerd/src/capture/scrap_backend.rs:154`,
 `agents/roomlerd/src/power.rs:372`): `IOPMAssertionDeclareUserActivity` wakes
 the display (`caffeinate -u`), and `PreventUserIdleDisplaySleep` keeps it on,
 so a view-only session, which injects no input to count as activity, does not
@@ -679,7 +679,7 @@ and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5508`](../agents/roomlerd/src/peer.rs#L5508); the viewer parses it
 at [`useRemoteControl.ts:1621`](../ui/src/composables/useRemoteControl.ts#L1621)
 and puts it on the toggle's title
-([`RemoteControl.vue:3679`](../ui/src/views/remote/RemoteControl.vue#L3679)).
+([`RemoteControl.vue:3683`](../ui/src/views/remote/RemoteControl.vue#L3683)).
 
 | `code` | Means |
 |---|---|
@@ -1353,7 +1353,7 @@ composition.
 
 ⚠️ **A paste has one owner too** (#2910). Two `paste` listeners sit on
 `window`: the files drawer's `onWindowPasteForDrawer`
-(`RemoteControl.vue:3398`), registered at mount (`:5630`), and the deferred
+(`RemoteControl.vue:3402`), registered at mount (`:5634`), and the deferred
 Ctrl+V's `onPaste` (`useRemoteControl.ts:12102`), registered later by
 `attachInput` (`:12006`). Same node, same phase, so the drawer's runs
 **first** — and `preventDefault` stops no other listener on the same node.
@@ -1367,7 +1367,7 @@ upload (`:11778`). Whichever listener runs first owns the paste, so a future
 change to the registration order cannot bring the double back. With the
 drawer open, a files paste that does reach `onPaste` — one aimed at the soft
 keyboard's textarea, which the drawer leaves to it as a form field — uploads
-into the drawer's directory as well (`RemoteControl.vue:5572`).
+into the drawer's directory as well (`RemoteControl.vue:5576`).
 
 ```mermaid
 flowchart TD
@@ -2024,7 +2024,7 @@ org or a device that sets nothing.
 | | The org's switch (P2a) | The device's floor (P2b) |
 |---|---|---|
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
-| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3427`](../crates/localapi/src/lib.rs#L3427)); live, no restart |
+| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3448`](../crates/localapi/src/lib.rs#L3448)); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
 | Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:518`](../crates/remote_control/src/models.rs#L518)) and re-announced on the heartbeat when it changes |
 
@@ -3524,8 +3524,8 @@ The constraint that shapes it is the thread. Text Input Sources (Carbon's
 HIToolbox) is called on the main thread only; recent macOS asserts it. A daemon
 built with `viewer-indicator-macos` gives its main thread to AppKit for its
 whole life (`main.rs`'s swap, FR-27), so every read and switch is queued for it:
-`indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:107`) parks a
-closure that the pump runs on its next pass (`mac.rs:214`), at most 120 ms
+`indicator::mac::on_main` (`agents/roomlerd/src/indicator/mac.rs:123`) parks a
+closure that the pump runs on its next pass (`mac.rs:403`), at most 120 ms
 later, and sends the answer back.
 
 ```mermaid
@@ -3940,7 +3940,7 @@ ruled out by the rule above. The lock behind that borrow is what held it.
   feature includes `parking_lot`. It is task-fair: once a writer waits,
   a new `read()` parks, even on a thread that already holds a read guard.
 - `DaemonState::status()`
-  (`agents/roomlerd/src/localapi_state.rs:654`) built `NodeStatus` as
+  (`agents/roomlerd/src/localapi_state.rs:725`) built `NodeStatus` as
   one struct literal, and ten of its fields each called
   `self.overlay.borrow()`. A temporary lives until the literal is
   finished, so every field's guard was still held when the next field
