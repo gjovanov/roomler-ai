@@ -809,7 +809,19 @@ sequenceDiagram
 - **The wait.** The elevated copy waits, at most 15 s, for the limited one to exit
   (`launch.rs:191`, called from `agents/roomler-setup/src/main.rs:65`) **before** Tauri's
   single-instance plugin initialises: the plugin finds a running copy by its mutex and window
-  and would hand that dying copy the arguments and quit.
+  and would hand that dying copy the arguments and quit. Under over-the-shoulder credentials
+  (a standard user types an administrator's password) the elevated copy is another account,
+  whose `OpenProcess` on the limited copy can be refused; the wait then polls the process list
+  for that pid running this same image (`wizard_shared::elevation::poll_until_gone`), so a
+  reused id is not waited on. Read from the plugin's source (2.4.2), a mutex the elevated
+  account may not open is not a hand-off either: `CreateMutexW` fails with access denied
+  rather than "already exists", and the copy simply runs as its own instance.
+- **Over-the-shoulder credentials, otherwise.** The elevated copy then keeps that account's
+  `%LOCALAPPDATA%` (its saved state and log), which is why the role and server travel on the
+  command line, and "Open the page" on the Join step opens that account's browser. The Join step
+  shows the page and the code as text, so the person can type both into their own browser; the
+  copy does not name the effect, because the wizard does not tell such an elevation from an
+  administrator approving their own prompt, where it does not arise.
 - **WebView2.** An elevated run gives WebView2 a user-data folder of its own,
   `%LOCALAPPDATA%\ai.roomler.setup\elevated` (`launch.rs:173`). WebView2 shares one browser
   process among every host that names the same folder, and the limited copy's browser process

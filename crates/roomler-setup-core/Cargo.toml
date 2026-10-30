@@ -72,7 +72,9 @@ tar = "0.4"
 #   elevation.rs     → Win32_UI_Shell (ShellExecuteExW "runas" — FR-129 C3,
 #                      the wizard's elevated relaunch; CommandLineToArgvW in
 #                      its test) + Win32_System_Threading (OpenProcess /
-#                      WaitForSingleObject / GetProcessId)
+#                      WaitForSingleObject / GetProcessId) +
+#                      Win32_System_Diagnostics_ToolHelp (the process list,
+#                      when another account's process refuses a handle)
 # NB Win32_UI_WindowsAndMessaging was declared by NEITHER legacy
 # crate — it compiled there only via cargo feature-unification with
 # roomlerd's windows-sys features. This crate declares what it
@@ -80,6 +82,7 @@ tar = "0.4"
 # are unused by the moved code and deliberately dropped.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
     "Win32_System_Registry",
     "Win32_UI_Shell",

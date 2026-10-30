@@ -187,13 +187,22 @@ pub fn webview_data_directory() -> Option<std::path::PathBuf> {
 /// The elevated copy's first act, before Tauri's single-instance plugin looks
 /// for a running copy: wait, bounded, for the limited copy that asked for
 /// this start to be gone. While it lives, the plugin would find its lock,
-/// hand it this copy's arguments and quit.
+/// hand it this copy's arguments and quit. The limited copy is this same
+/// file, so its image name is this process's own — which also tells it apart
+/// from a process that reused its id. Under over-the-shoulder credentials the
+/// limited copy is another account's process; the wait then reads the
+/// process list instead of holding a handle
+/// (`wizard_shared::elevation::wait_for_exit`).
 pub fn wait_for_parent(args: &LaunchArgs) {
     let Some(pid) = args.after_elevation else {
         return;
     };
+    let image = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default();
     let started = std::time::Instant::now();
-    let outcome = wizard_shared::elevation::wait_for_exit(pid, PARENT_EXIT_WAIT);
+    let outcome = wizard_shared::elevation::wait_for_exit(pid, &image, PARENT_EXIT_WAIT);
     tracing::info!(
         pid,
         ?outcome,

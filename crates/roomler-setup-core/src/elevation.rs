@@ -39,13 +39,13 @@ pub enum ElevationError {
 /// What [`wait_for_exit`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitOutcome {
-    /// The process exited within the bound.
+    /// The process exited (or was gone already) within the bound.
     Exited,
     /// It was still running when the bound ran out.
     TimedOut,
-    /// It could not be opened: already gone, or not this account's to
-    /// open (an over-the-shoulder elevation runs as another account).
-    NotOpened,
+    /// Neither a handle nor the process list could be had: nothing to wait
+    /// on, so the caller goes ahead.
+    Unknown,
 }
 
 /// The Win32 code of a declined UAC prompt.
@@ -162,9 +162,17 @@ pub fn run_elevated(_file: &Path, _args: &[String]) -> Result<u32, ElevationErro
     ))
 }
 
-/// Wait until process `pid` has exited, at most `timeout`.
+/// Wait until process `pid`, running the image named `image` (a file name:
+/// the wizard passes its own, which may be a release's long name), has
+/// exited, at most `timeout`.
+///
+/// A handle is the precise way: `OpenProcess(SYNCHRONIZE)` and a wait. Under
+/// over-the-shoulder credentials (a standard user types an administrator's
+/// password) the elevated copy runs as ANOTHER account, and the limited copy's
+/// process may refuse it that handle; then the process list is polled
+/// instead ([`poll_until_gone`]), which needs no access to the process.
 #[cfg(target_os = "windows")]
-pub fn wait_for_exit(pid: u32, timeout: Duration) -> WaitOutcome {
+pub fn wait_for_exit(pid: u32, image: &str, timeout: Duration) -> WaitOutcome {
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
     // The standard right, as msi_runner.rs spells it (windows-sys 0.59 has it
@@ -174,7 +182,7 @@ pub fn wait_for_exit(pid: u32, timeout: Duration) -> WaitOutcome {
     // SAFETY: a plain OpenProcess; the handle is null-checked and closed.
     let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
     if handle.is_null() {
-        return WaitOutcome::NotOpened;
+        return poll_until_gone(pid, image, timeout);
     }
     let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
     // SAFETY: a valid handle, waited on once.
@@ -187,10 +195,63 @@ pub fn wait_for_exit(pid: u32, timeout: Duration) -> WaitOutcome {
     }
 }
 
+/// [`wait_for_exit`]'s fallback: poll the process list every 100 ms until no
+/// process has id `pid` AND image `image` — a reused id belongs to another
+/// image, so it is never waited on — or until `timeout`.
+#[cfg(target_os = "windows")]
+pub fn poll_until_gone(pid: u32, image: &str, timeout: Duration) -> WaitOutcome {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match listed(pid, image) {
+            None => return WaitOutcome::Unknown,
+            Some(false) => return WaitOutcome::Exited,
+            Some(true) if std::time::Instant::now() >= deadline => return WaitOutcome::TimedOut,
+            Some(true) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+/// Is a process with id `pid` and image `image` in the process list? `None`
+/// when the list could not be read.
+#[cfg(target_os = "windows")]
+fn listed(pid: u32, image: &str) -> Option<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: a snapshot handle, checked and closed below.
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    // SAFETY: plain data, valid zeroed; dwSize set as the API requires.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut found = false;
+    // SAFETY: a valid snapshot and a correctly sized entry, each call.
+    let mut more = unsafe { Process32FirstW(snap, &mut entry) } != 0;
+    while more {
+        if entry.th32ProcessID == pid {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            found = String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case(image);
+            break;
+        }
+        more = unsafe { Process32NextW(snap, &mut entry) } != 0;
+    }
+    // SAFETY: the snapshot handle from above.
+    unsafe { CloseHandle(snap) };
+    Some(found)
+}
+
 /// Nothing hands a process id across an elevation off Windows.
 #[cfg(not(target_os = "windows"))]
-pub fn wait_for_exit(_pid: u32, _timeout: Duration) -> WaitOutcome {
-    WaitOutcome::NotOpened
+pub fn wait_for_exit(_pid: u32, _image: &str, _timeout: Duration) -> WaitOutcome {
+    WaitOutcome::Unknown
 }
 
 #[cfg(test)]
@@ -267,32 +328,66 @@ mod tests {
         assert_eq!(back, args);
     }
 
+    /// A long-ish child to wait on: `cmd` running a one-second ping.
+    #[cfg(target_os = "windows")]
+    fn a_second_long_child() -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/C", "ping -n 2 127.0.0.1 >NUL"])
+            .spawn()
+            .unwrap()
+    }
+
     /// A process that has already exited is not waited on, and a running
     /// one is waited on until it ends.
     #[cfg(target_os = "windows")]
     #[test]
     fn wait_for_exit_follows_a_real_process() {
-        let mut child = std::process::Command::new("cmd")
-            .args(["/C", "ping -n 2 127.0.0.1 >NUL"])
-            .spawn()
-            .unwrap();
+        let mut child = a_second_long_child();
         let pid = child.id();
         assert_eq!(
-            wait_for_exit(pid, Duration::from_millis(50)),
+            wait_for_exit(pid, "cmd.exe", Duration::from_millis(50)),
             WaitOutcome::TimedOut
         );
         assert_eq!(
-            wait_for_exit(pid, Duration::from_secs(30)),
+            wait_for_exit(pid, "cmd.exe", Duration::from_secs(30)),
             WaitOutcome::Exited
         );
         child.wait().unwrap();
-        // A pid nobody holds any more: not opened, no wait at all.
+        // A pid nobody runs any more: no wait at all.
         let started = std::time::Instant::now();
-        let gone = wait_for_exit(pid, Duration::from_secs(30));
-        assert!(
-            matches!(gone, WaitOutcome::NotOpened | WaitOutcome::Exited),
-            "{gone:?}"
-        );
+        let gone = wait_for_exit(pid, "cmd.exe", Duration::from_secs(30));
+        assert_eq!(gone, WaitOutcome::Exited);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The over-the-shoulder fallback, driven directly: the process list
+    /// keeps the wait going while the process runs and ends it when the
+    /// process is gone; a pid whose image is another program's (a reused id)
+    /// is not waited on at all, and the image name compares without case.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_process_list_fallback_follows_a_real_process() {
+        let mut child = a_second_long_child();
+        let pid = child.id();
+        assert_eq!(
+            poll_until_gone(pid, "CMD.EXE", Duration::from_millis(250)),
+            WaitOutcome::TimedOut
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            poll_until_gone(
+                pid,
+                "roomler-setup-0.4.190-x86_64-pc-windows-msvc.exe",
+                Duration::from_secs(30)
+            ),
+            WaitOutcome::Exited,
+            "another image under that id is not the wizard"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            poll_until_gone(pid, "cmd.exe", Duration::from_secs(30)),
+            WaitOutcome::Exited
+        );
+        child.wait().unwrap();
     }
 }

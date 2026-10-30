@@ -159,7 +159,11 @@ Welcome, before a token exists. The elevated copy
 
 1. waits, at most 15 s, for the limited copy to exit, **before** Tauri's
    single-instance plugin looks for a running copy — otherwise it would find
-   the dying copy's lock, hand it its arguments and quit;
+   the dying copy's lock, hand it its arguments and quit. With over-the-shoulder
+   credentials (a standard user typing an administrator's password) the copy is
+   another account, may be refused a handle on the limited one, and polls the
+   process list instead; it also runs in that account's profile, which is why
+   the role travels on the command line rather than in the saved state;
 2. keeps its WebView2 data in its own folder
    (`%LOCALAPPDATA%\ai.roomler.setup\elevated`): WebView2 shares one browser
    process among every host naming the same folder, the limited copy's can
