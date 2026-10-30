@@ -446,6 +446,9 @@ enum Command {
         /// Emit the sweep result as one JSON line for the FR doc (A0).
         #[arg(long)]
         json: bool,
+        /// FR-16 L1 — `--bench` and its flags (`encode::bench`).
+        #[command(flatten)]
+        bench: roomlerd::encode::bench::BenchArgs,
     },
     /// Smoke-test the screen-capture cascade on THIS host: run
     /// `open_default`, pull N frames, and report which backend answered,
@@ -1944,7 +1947,9 @@ async fn daemon_main() -> Result<()> {
             frames_per_rung,
             constrained,
             json,
+            bench,
         } => {
+            use roomlerd::encode::bench::{SmokeMode, smoke_mode};
             // FR-130 — the smoke opens encoders as the daemon would, with the
             // device's config-backed encoder knobs (the colour description's
             // switch, the cell denylists) published first.
@@ -1954,20 +1959,27 @@ async fn daemon_main() -> Result<()> {
                 &ENCODER_SMOKE_CONFIG_KEYS,
                 "encoder",
             );
-            if reconfigure_sweep {
-                encoder_reconfigure_sweep_cmd(
-                    &encoder,
-                    &codec,
-                    name.as_deref(),
-                    width,
-                    height,
-                    frames_per_rung,
-                    constrained,
-                    json,
-                )
-                .await
-            } else {
-                encoder_smoke_cmd(&encoder, &codec, name.as_deref(), dump.as_deref()).await
+            match smoke_mode(reconfigure_sweep, bench.bench) {
+                // FR-16 L1 — opt-in; the release lane runs the plain smoke.
+                SmokeMode::Bench => {
+                    roomlerd::encode::bench::run(&bench, &encoder, name.as_deref()).await
+                }
+                SmokeMode::Sweep => {
+                    encoder_reconfigure_sweep_cmd(
+                        &encoder,
+                        &codec,
+                        name.as_deref(),
+                        width,
+                        height,
+                        frames_per_rung,
+                        constrained,
+                        json,
+                    )
+                    .await
+                }
+                SmokeMode::Smoke => {
+                    encoder_smoke_cmd(&encoder, &codec, name.as_deref(), dump.as_deref()).await
+                }
             }
         }
         Command::AppsProbe => apps_probe_cmd(&config_path),
@@ -7310,6 +7322,109 @@ mod tests {
                 assert!(value.is_none(), "expected None (unset), got {value:?}");
             }
             other => panic!("expected SetServiceEnvVar, got {other:?}"),
+        }
+    }
+
+    /// FR-16 L1 — release-agent.yml runs `encoder-smoke --encoder hardware` on
+    /// every freshly built EXE. The bench is opt-in: that line, and the bare
+    /// command, still parse to the plain 10-frame smoke with every flag where
+    /// it was before the bench existed.
+    #[test]
+    fn the_release_lanes_encoder_smoke_is_still_the_plain_smoke() {
+        use roomlerd::encode::bench::{SmokeMode, smoke_mode};
+        for argv in [
+            &["roomlerd", "encoder-smoke", "--encoder", "hardware"][..],
+            &["roomlerd", "encoder-smoke"][..],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            match cli.command {
+                Some(Command::EncoderSmoke {
+                    encoder,
+                    codec,
+                    reconfigure_sweep,
+                    name,
+                    dump,
+                    width,
+                    height,
+                    frames_per_rung,
+                    constrained,
+                    json,
+                    bench,
+                }) => {
+                    assert_eq!((encoder.as_str(), codec.as_str()), ("hardware", "h264"));
+                    assert!(!reconfigure_sweep && !constrained && !json);
+                    assert_eq!((name, dump), (None, None));
+                    assert_eq!((width, height, frames_per_rung), (1280, 800, 30));
+                    assert!(!bench.bench && !bench.bench_full && !bench.bench_paced);
+                    assert!(bench.bench_cells.is_empty() && bench.bench_sizes.is_empty());
+                    assert_eq!(smoke_mode(reconfigure_sweep, bench.bench), SmokeMode::Smoke);
+                }
+                other => panic!("expected EncoderSmoke for {argv:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// FR-16 L1 — `--bench` picks the bench; each of its flags needs it, and it
+    /// will not mix with the sweep, `--dump`, `--json`, or cells beside `--name`.
+    #[test]
+    fn the_bench_is_opt_in_and_its_flags_need_it() {
+        use roomlerd::encode::bench::{SmokeMode, smoke_mode};
+        let cli = Cli::try_parse_from([
+            "roomlerd",
+            "encoder-smoke",
+            "--bench",
+            "--bench-cells",
+            "rtp:h264,dc:vp9:444",
+            "--bench-sizes",
+            "1920x1080",
+            "--bench-frames",
+            "30",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::EncoderSmoke {
+                reconfigure_sweep,
+                bench,
+                ..
+            }) => {
+                assert_eq!(smoke_mode(reconfigure_sweep, bench.bench), SmokeMode::Bench);
+                assert_eq!(bench.bench_cells, ["rtp:h264", "dc:vp9:444"]);
+                assert_eq!(bench.bench_sizes, ["1920x1080"]);
+                assert_eq!((bench.bench_frames, bench.bench_fps), (30, 30));
+                assert_eq!(bench.bench_budget_secs, None);
+            }
+            other => panic!("expected EncoderSmoke --bench, got {other:?}"),
+        }
+        for flags in [
+            &["--bench-full"][..],
+            &["--bench-cells", "rtp:h264"][..],
+            &["--bench-sizes", "1280x720"][..],
+            &["--bench-bitrates", "auto"][..],
+            &["--bench-motions", "pan"][..],
+            &["--bench-frames", "30"][..],
+            &["--bench-fps", "60"][..],
+            &["--bench-paced"][..],
+            &["--bench-budget-secs", "10"][..],
+            &["--bench", "--reconfigure-sweep"][..],
+            &["--bench", "--dump", "out.h264"][..],
+            &["--bench", "--json"][..],
+            &[
+                "--bench",
+                "--name",
+                "hevc_nvenc",
+                "--bench-cells",
+                "rtp:h264",
+            ][..],
+            &["--bench", "--bench-frames", "5"][..],
+        ] {
+            let argv: Vec<&str> = ["roomlerd", "encoder-smoke"]
+                .into_iter()
+                .chain(flags.iter().copied())
+                .collect();
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{flags:?} must not parse"
+            );
         }
     }
 

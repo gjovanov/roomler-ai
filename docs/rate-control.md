@@ -301,7 +301,7 @@ such drops in the fortnight. Both are recorded with their arcs in
 ### The ceiling learner (FR-35 P1) — growth above the nominal
 
 On a constrained (relayed) session the AIMD runs under a ceiling, and that
-ceiling used to be a fleet constant: `relay_max_bps` = 3 Mbps (`mod.rs:873`,
+ceiling used to be a fleet constant: `relay_max_bps` = 3 Mbps (`mod.rs:875`,
 env `ROOMLERD_RELAY_MAX_KBPS`), the encoder opened at 85 % of it. One constant
 cannot be right for the fleet. The real `neo16 → CORPLAP-2` DERP path, measured
 2026-08-29, sustains ~6–9 Mbps and absorbs short bursts far above; other corp
@@ -316,7 +316,7 @@ the picture (FR-31) — within a session it may only ever **climb**.
 plan's nominal ceiling and the AIMD. `RateGovernor::effective_ceiling`
 (`governor.rs:572`) returns `plan.max(learned.min(hi))` on a constrained
 session, so the learned ceiling only ever RAISES the plan's, never past `hi`
-(`relay_max_hi_bps` = 8 Mbps, `mod.rs:931`). Once per viewer window the governor
+(`relay_max_hi_bps` = 8 Mbps, `mod.rs:933`). Once per viewer window the governor
 hands the learner that window's evidence (`governor.rs:1441` → `on_window`,
 `ceiling_learn.rs:190`), and it steps the ceiling up only when **all five** gates
 pass:
@@ -378,7 +378,7 @@ target sits at the opener's seed for the whole session, so `stable_bps()` is
 that seed — see the write-back rows below for what that does to the memory.
 Kill switches: `relay_ceiling_learn` (tribool, default on; off ⇒ `hi` = 0 ⇒ the
 plan ceiling verbatim and no memory) and `relay_max_hi_kbps`
-(`crates/agent-core/src/config_surface.rs:1236`, `:1348`; `mod.rs:931`). Direct
+(`crates/agent-core/src/config_surface.rs:1236`, `:1348`; `mod.rs:933`). Direct
 sessions never touch the learner (`governor.rs:572` gates on `constrained`).
 
 > **Field, `CORPLAP-2` over `relay:derp/tcp`, 2026-10-27/28 — agent 0.4.177,
@@ -621,7 +621,7 @@ desktop spends almost nothing and only motion approaches the bound.
 `policy::rate_plan` (`encode/policy.rs:241`) finishes the chain: × the dial
 (`dial_rate_factor_pct` — 70 / 85 / 100, clamped to [30, 100]) × the
 encode-pressure factor (`governor.encode_factor()`, `governor.rs:1616`),
-floored at `MIN_BITRATE_BPS` (1.5 M, `encode/mod.rs:256`). On a direct
+floored at `MIN_BITRATE_BPS` (1.5 M, `encode/mod.rs:258`). On a direct
 transport `effective_ceiling` is the plan's value unchanged (`governor.rs:568`
 — the learner lifts it on constrained sessions only); the shared-pipeline split
 divides it by the follower count; and the result is both the AIMD's ceiling
@@ -758,7 +758,7 @@ What it changes here:
 | Lever | Before FR-112 | Now |
 |---|---|---|
 | frame rate | a constant 30 | 60, paced by `SoftwarePace` (`encode/encode_pressure.rs:242`) in 5-fps steps, never below 30: down at once, up only with 2.5 fps of headroom (P2d) |
-| bitrate base | `w·h·fps·0.20` at the target | `bitrate_base_for_fps` (`encode/mod.rs:806`): the old figure at 30, ×√(fps/30) at the rate the pump runs at |
+| bitrate base | `w·h·fps·0.20` at the target | `bitrate_base_for_fps` (`encode/mod.rs:808`): the old figure at 30, ×√(fps/30) at the rate the pump runs at |
 | OpenH264's per-frame budget | configured for 30 whatever the rate | `set_frame_rate`: the rate the pump runs at, the keyframe period kept at 2 s |
 | the auto-fps-cap (a software encoder dropped to 30) | always | only where the tier is off: Windows and macOS by default |
 
