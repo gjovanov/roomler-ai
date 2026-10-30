@@ -294,6 +294,19 @@ impl Role {
         }
     }
 
+    /// The kebab-case spelling the serde form, the SPA's cards and
+    /// `WizardState.role` use — the inverse of [`Self::from_state_str`]
+    /// (FR-129 C3: the role an elevated relaunch is handed on its command
+    /// line).
+    pub fn wire(&self) -> &'static str {
+        match self {
+            Role::DaemonSystem => "daemon-system",
+            Role::DaemonUser => "daemon-user",
+            Role::DaemonMachine => "daemon-machine",
+            Role::TunnelClient => "tunnel-client",
+        }
+    }
+
     /// Parse the kebab-case string persisted in `WizardState.role`
     /// back into a typed `Role`. Unknown / stale values return `None`
     /// so the SPA re-prompts the picker on resume instead of failing.
@@ -585,6 +598,24 @@ mod tests {
             );
         }
         assert_eq!(system_context_switch(None), SystemContextSwitch::Off);
+    }
+
+    /// FR-129 C3 — `wire` is the inverse of `from_state_str`, and the serde
+    /// spelling, for every role.
+    #[test]
+    fn wire_round_trips_through_from_state_str_and_serde() {
+        for role in [
+            Role::DaemonSystem,
+            Role::DaemonUser,
+            Role::DaemonMachine,
+            Role::TunnelClient,
+        ] {
+            assert_eq!(Role::from_state_str(role.wire()), Some(role));
+            assert_eq!(
+                serde_json::to_string(&role).unwrap(),
+                format!("\"{}\"", role.wire())
+            );
+        }
     }
 
     #[test]

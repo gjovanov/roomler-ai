@@ -124,6 +124,9 @@ const state = {
   systemContextNeedsElevation: false, // #3116: a limited wizard on a device
                        // whose pre-logon service config it cannot write (a
                        // reinstall); from cmd_system_context_needs_elevation
+  relaunchNote: null,  // FR-129 C3: the line under "Restart as administrator"
+                       // (waiting, cancelled, or why it failed)
+  relaunchBusy: false, // FR-129 C3: the UAC prompt is up
   diagOptIn: false,    // FR-102 P3b: the Welcome page's diagnostics box.
                        // Memory only — deliberately NOT in the persisted
                        // WizardState and never defaulted from an earlier
@@ -171,6 +174,7 @@ let installRows = new Map();
 async function init() {
   wireGlobalListeners();
   await loadPersistedState();
+  await applyLaunchOptions();
   await probeAndRender();
 }
 
@@ -201,6 +205,26 @@ async function loadPersistedState() {
     }
   } catch (err) {
     console.warn("load wizard state failed:", err);
+  }
+}
+
+// FR-129 C3 — what this run was started with. "Restart as administrator"
+// hands the elevated copy the role the person had picked (and the server,
+// when it was not the default): it opens on Welcome with that role, which
+// wins over the detected default and still has to pass the Continue gate.
+async function applyLaunchOptions() {
+  let launch;
+  try {
+    launch = await invoke("cmd_launch_options");
+  } catch (err) {
+    console.warn("launch options not read:", err);
+    return;
+  }
+  if (!launch) return;
+  if (typeof launch.server === "string" && launch.server) state.server = launch.server;
+  if (ROLES.includes(launch.role)) {
+    state.role = launch.role;
+    state.step = "welcome";
   }
 }
 
@@ -466,10 +490,13 @@ function wireWelcome() {
   document.getElementById("diag-opt-in").addEventListener("change", async (e) => {
     await setDiagOptIn(e.target.checked);
   });
+  // FR-129 C3 — #3116's note can now do what it asks for.
+  document.getElementById("elevation-relaunch").addEventListener("click", relaunchElevated);
   document.querySelectorAll("input[name='role']").forEach((radio) => {
     radio.addEventListener("change", (e) => {
       state.role = e.target.value;
       state.roleAck = false;
+      state.relaunchNote = null;
       document.getElementById("cross-flavour-ack").checked = false;
       // Role change invalidates any previous token introspection (the
       // audience gate depends on the role) — and any pairing, whose token
@@ -578,6 +605,12 @@ function renderWelcome() {
   // the enroll has spent the token.
   const needsElevation = needsElevatedWizard(state.role);
   document.getElementById("elevation-note").hidden = !needsElevation;
+  // FR-129 C3 — the note's own way out: the button sits inside the note, so
+  // it shows exactly when the note does; its line says how the last try went.
+  document.getElementById("elevation-relaunch").disabled = state.relaunchBusy;
+  const relaunchStatus = document.getElementById("elevation-relaunch-status");
+  relaunchStatus.hidden = !state.relaunchNote;
+  relaunchStatus.textContent = state.relaunchNote ?? "";
 
   // Continue button gate.
   const canContinue =
@@ -604,6 +637,34 @@ function needsElevatedWizard(role) {
 // tunnel client, which every OS has.
 function isOfferedRole(role, offered) {
   return ROLES.includes(role) && (role === "tunnel-client" || offered.has(role));
+}
+
+// FR-129 C3 — "Restart as administrator": Rust starts this wizard again
+// through Windows' administrator prompt (one UAC prompt), with the role the
+// person picked, and this copy exits once the elevated one has started. A
+// declined prompt leaves this window as it was, with one line saying so.
+async function relaunchElevated() {
+  if (state.relaunchBusy || !state.role) return;
+  state.relaunchBusy = true;
+  state.relaunchNote = "Waiting for you to approve the administrator prompt…";
+  renderWelcome();
+  let view;
+  try {
+    view = await invoke("cmd_relaunch_elevated", { role: state.role, server: state.server });
+  } catch (err) {
+    view = { kind: "failed", message: String(err) };
+  }
+  state.relaunchBusy = false;
+  if (view && view.kind === "started") {
+    state.relaunchBusy = true; // this window is closing
+    state.relaunchNote = "Roomler Setup is starting again as administrator…";
+  } else if (view && view.kind === "cancelled") {
+    state.relaunchNote = "The administrator prompt was cancelled; Roomler Setup is still running without administrator rights.";
+  } else {
+    const reason = ((view && view.message) || "no reason given").replace(/[.\s]+$/, "");
+    state.relaunchNote = `Could not restart as administrator: ${reason}. You can close Roomler Setup, then right-click it and choose Run as administrator.`;
+  }
+  renderWelcome();
 }
 
 // FR-129 B1 — why no daemon card is shown, in the person's terms. On Linux

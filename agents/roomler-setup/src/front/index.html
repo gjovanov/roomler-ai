@@ -90,12 +90,19 @@
 
         <!-- #3116: on a reinstall the pre-logon service's config is in a
              folder only administrators may open, so a wizard that is not
-             elevated stops here, before a token is pasted or paired. -->
+             elevated stops here, before a token is pasted or paired.
+             FR-129 C3: the button is INSIDE the note, so it shows exactly
+             when the note does; it restarts the wizard through Windows'
+             administrator prompt with the role kept (cmd_relaunch_elevated). -->
         <div id="elevation-note" class="warning" hidden>
           <p>This device already has the background service, and its settings are
-          in a folder only administrators may open. To install it again, close
-          Roomler Setup, then right-click it and choose <strong>Run as
-          administrator</strong>. Or pick another option above.</p>
+          in a folder only administrators may open. To install it again, Roomler
+          Setup has to run as administrator: restart it that way (Windows asks you
+          to approve it once), or pick another option above.</p>
+          <footer class="actions">
+            <button id="elevation-relaunch" type="button">Restart as administrator</button>
+          </footer>
+          <p id="elevation-relaunch-status" class="muted" aria-live="polite" hidden></p>
         </div>
       </div>
 

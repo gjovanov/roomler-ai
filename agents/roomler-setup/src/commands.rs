@@ -2,9 +2,10 @@
 // Copyright (C) 2026 G ROX EOOD
 //! Tauri invoke handlers for the unified setup wizard.
 //!
-//! 19 handlers — the union of the two legacy wizards' surfaces, the
-//! diagnostics pair (FR-102), the pairing four (FR-129 A3) and the two
-//! of the Linux/macOS daemon install (FR-129 B1) behind ONE command
+//! 22 handlers — the union of the two legacy wizards' surfaces, the
+//! diagnostics pair (FR-102), the pairing four (FR-129 A3), the two
+//! of the Linux/macOS daemon install (FR-129 B1), #3116's elevation probe
+//! and the elevated relaunch pair (FR-129 C3) behind ONE command
 //! vocabulary. Each handler returns `Result<T, String>` (or a
 //! plain value) so Tauri marshals errors as rejected promises the SPA
 //! renders verbatim. The raw enrollment token NEVER flows back from any
@@ -244,6 +245,101 @@ pub fn cmd_privileged_half_done() -> Result<(), String> {
 #[tauri::command]
 pub fn cmd_system_context_needs_elevation() -> bool {
     crate::orchestrator_agent::system_context_needs_elevation()
+}
+
+// ─── FR-129 C3: the elevated relaunch ────────────────────────────────────────
+
+/// What `cmd_launch_options` answers: what this run was started with
+/// ([`crate::launch::LaunchArgs`]), for the Welcome page. An elevated
+/// relaunch carries the role the limited copy had picked, which the SPA
+/// preselects over the detected default.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchView {
+    pub role: Option<Role>,
+    pub server: Option<String>,
+    /// Started by "Restart as administrator" (it carried `--after-elevation`).
+    pub relaunched: bool,
+}
+
+/// FR-129 C3 — this run's own command line, parsed and validated.
+#[tauri::command]
+pub fn cmd_launch_options() -> LaunchView {
+    let args = crate::launch::LaunchArgs::from_env();
+    LaunchView {
+        role: args.role,
+        server: args.server,
+        relaunched: args.after_elevation.is_some(),
+    }
+}
+
+/// What "Restart as administrator" came to.
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum RelaunchView {
+    /// The elevated copy started; this one is exiting.
+    Started,
+    /// The person declined the UAC prompt: nothing changed.
+    Cancelled,
+    /// It could not be started; the text says why.
+    Failed { message: String },
+}
+
+/// FR-129 C3 — start this wizard again as administrator (one UAC prompt),
+/// handing it `role` and the Server page's `server`, and exit once it has
+/// started. The Welcome page offers it where #3116's note says an elevated
+/// wizard is needed — before any token exists, so nothing secret is on the
+/// command line. No other path elevates the wizard itself: a fresh install
+/// still gets the MSI's own UAC prompt.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn cmd_relaunch_elevated(
+    app: tauri::AppHandle,
+    role: Role,
+    server: Option<String>,
+) -> RelaunchView {
+    if crate::INSTALL_IN_PROGRESS.load(Ordering::SeqCst) {
+        return RelaunchView::Failed {
+            message: "An install is running; let it finish or cancel it first.".to_string(),
+        };
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            return RelaunchView::Failed {
+                message: format!("Roomler Setup could not find its own file ({e})."),
+            };
+        }
+    };
+    let args = crate::launch::relaunch_args(
+        role,
+        server.as_deref(),
+        &cmd_default_server_url(),
+        std::process::id(),
+    );
+    // The prompt blocks its caller until the person answers; off the async
+    // workers, so the window keeps painting meanwhile.
+    let started = tauri::async_runtime::spawn_blocking(move || {
+        wizard_shared::elevation::run_elevated(&exe, &args)
+    })
+    .await;
+    use wizard_shared::elevation::ElevationError;
+    match started {
+        Ok(Ok(pid)) => {
+            tracing::info!(pid, "started the elevated wizard; this one exits");
+            crate::unix_daemon::clear_kept();
+            app.exit(0);
+            RelaunchView::Started
+        }
+        Ok(Err(ElevationError::Cancelled)) => RelaunchView::Cancelled,
+        Ok(Err(ElevationError::Failed(message))) => RelaunchView::Failed { message },
+        Err(e) => RelaunchView::Failed {
+            message: format!("The administrator start did not complete ({e})."),
+        },
+    }
 }
 
 /// The legacy tunnel wizard's config.toml probe, verbatim: resolve
@@ -1072,6 +1168,35 @@ mod tests {
 
         let json = serde_json::to_string(&PairStartView::Unavailable).unwrap();
         assert_eq!(json, r#"{"kind":"unavailable"}"#);
+    }
+
+    /// FR-129 C3 — the SPA reads `kind`, and the role in kebab-case.
+    #[test]
+    fn relaunch_and_launch_views_serialise_as_the_spa_reads_them() {
+        assert_eq!(
+            serde_json::to_string(&RelaunchView::Started).unwrap(),
+            r#"{"kind":"started"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&RelaunchView::Cancelled).unwrap(),
+            r#"{"kind":"cancelled"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&RelaunchView::Failed {
+                message: "no".into()
+            })
+            .unwrap(),
+            r#"{"kind":"failed","message":"no"}"#
+        );
+        let v = LaunchView {
+            role: Some(Role::DaemonSystem),
+            server: None,
+            relaunched: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&v).unwrap(),
+            r#"{"role":"daemon-system","server":null,"relaunched":true}"#
+        );
     }
 
     /// Only a web address is handed to the OS to open.

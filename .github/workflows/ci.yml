@@ -1539,11 +1539,14 @@ jobs:
       # the SystemContext preflight, the restart onto a reinstall's enrollment
       # over the LocalAPI) first compiled at a `setup-v*` tag. `--lib` tests
       # only: its bin is `test = false` by the UAC lib-naming rule.
+      # FR-129 C3 — its mechanics crate too: `roomler-setup-core` holds the
+      # wizard's Win32 calls (the elevated relaunch, the MSI wait), and its
+      # Windows tests compiled out on the Linux step that runs its others.
       - name: The setup wizard on Windows — clippy + unit tests (#3116)
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy -p roomler-setup --all-targets -- -D warnings
-          cargo test -p roomler-setup --lib
+          cargo clippy -p roomler-setup -p roomler-setup-core --all-targets -- -D warnings
+          cargo test -p roomler-setup -p roomler-setup-core --lib
       # FR-90 P1i's agent-session tests run in their own job,
       # windows-agent-sessions, below (FR-6 wave 27).
 

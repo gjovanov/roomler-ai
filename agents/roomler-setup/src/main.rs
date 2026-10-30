@@ -45,6 +45,15 @@ use tauri::{Emitter, Manager};
 use wizard_app::{INSTALL_IN_PROGRESS, commands};
 
 fn main() {
+    // FR-129 C3 — first, while this is still the process's only thread: an
+    // elevated wizard keeps its WebView2 data apart from a limited one's
+    // (`launch::webview_folder_override` says why).
+    if let Some(dir) = wizard_app::launch::webview_folder_override() {
+        // SAFETY: no other thread exists yet — not tracing's, not Tauri's,
+        // not tokio's — so nothing can read the environment while it changes.
+        unsafe { std::env::set_var(wizard_app::launch::WEBVIEW2_USER_DATA_FOLDER, &dir) };
+    }
+
     // Stderr-only tracing. The wizard is a foreground EXE the
     // operator launches manually; persistent logging is the daemon's
     // job, not ours. Operators who want wizard-side logs run from a
@@ -57,6 +66,12 @@ fn main() {
         .with_target(false)
         .with_writer(std::io::stderr)
         .try_init();
+
+    // FR-129 C3 — an elevated relaunch waits for the limited copy that asked
+    // for it to exit BEFORE the single-instance plugin below looks for a
+    // running copy; otherwise it would hand its arguments to that dying copy
+    // and quit.
+    wizard_app::launch::wait_for_parent(&wizard_app::launch::LaunchArgs::from_env());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -143,6 +158,10 @@ fn main() {
             commands::cmd_privileged_half_done,
             // #3116 — the Welcome page's elevation gate.
             commands::cmd_system_context_needs_elevation,
+            // FR-129 C3 — "Restart as administrator", and what an elevated
+            // relaunch was handed.
+            commands::cmd_relaunch_elevated,
+            commands::cmd_launch_options,
         ])
         .run(tauri::generate_context!())
         .expect("error while running roomler-setup");
