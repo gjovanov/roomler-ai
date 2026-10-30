@@ -166,6 +166,86 @@ impl Drop for ActivityGuard {
     }
 }
 
+/// FR-55 P4 — what the keeper holds, as the rest of the daemon reads it: the
+/// heartbeat's power brief, the suspend announcement, `roomler status`.
+///
+/// One value behind one lock, so a reader never sees a policy from one
+/// reconcile beside a hold from another. Never held across an `.await`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Posture {
+    pub policy: PowerPolicy,
+    /// As [`Inputs::on_ac`]: `None` = this platform could not tell.
+    pub on_ac: Option<bool>,
+    /// A stay-awake request is held right now, for the policy or a session.
+    pub held: bool,
+}
+
+fn posture_slot() -> &'static std::sync::Mutex<Option<Posture>> {
+    static POSTURE: std::sync::OnceLock<std::sync::Mutex<Option<Posture>>> =
+        std::sync::OnceLock::new();
+    POSTURE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn publish(p: Posture) {
+    *posture_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+}
+
+/// The keeper's last posture. `None` before the daemon published one, which
+/// it does before it spawns the keeper ([`publish_policy`]).
+pub fn posture() -> Option<Posture> {
+    *posture_slot().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Publish the standing policy before the keeper's first reconcile, so a
+/// connection that says hello in the first five seconds already reports it.
+/// Nothing is held yet.
+pub fn publish_policy(policy: PowerPolicy) {
+    publish(Posture {
+        policy,
+        on_ac: imp::on_ac(),
+        held: false,
+    });
+}
+
+/// FR-55 P4 — the heartbeat's power brief: the keeper's last posture.
+pub fn brief() -> Option<roomler_ai_remote_control::models::PowerBrief> {
+    posture().map(brief_of)
+}
+
+/// The brief for the moment of a sleep: the keeper's posture with the power
+/// source read again, since the keeper's own read can be five seconds old
+/// and a charger that just went out is exactly what the reader wants to see.
+/// A process without a keeper (none in the shipped daemon, which publishes
+/// before anything connects) reads as the default: `never`, nothing held.
+pub fn brief_now() -> roomler_ai_remote_control::models::PowerBrief {
+    let p = posture().unwrap_or(Posture {
+        policy: PowerPolicy::Never,
+        on_ac: None,
+        held: false,
+    });
+    brief_of(Posture {
+        on_ac: imp::on_ac(),
+        ..p
+    })
+}
+
+fn brief_of(p: Posture) -> roomler_ai_remote_control::models::PowerBrief {
+    roomler_ai_remote_control::models::PowerBrief {
+        policy: p.policy.as_str().to_string(),
+        on_ac: p.on_ac,
+        held: p.held,
+    }
+}
+
+/// `roomler status`'s power line (the LocalAPI's leaf mirror of the brief).
+pub fn local_status() -> Option<tunnel_core::localapi::PowerStatus> {
+    posture().map(|p| tunnel_core::localapi::PowerStatus {
+        policy: p.policy.as_str().to_string(),
+        on_ac: p.on_ac,
+        held: p.held,
+    })
+}
+
 /// Why the OS is being asked to stay awake — shown in `pmset -g assertions` and
 /// `powercfg /requests`, so an operator inspecting the machine finds a sentence
 /// rather than a process name.
@@ -233,6 +313,14 @@ impl PowerKeeper {
             }
             _ => {}
         }
+        // FR-55 P4 — what is actually held after this pass, not what was
+        // wanted: an acquire the OS refused holds nothing, and the reader of
+        // a sleep must be able to tell the two apart.
+        publish(Posture {
+            policy: self.policy,
+            on_ac,
+            held: self.held.is_some(),
+        });
     }
 }
 

@@ -310,6 +310,8 @@ pub async fn devices(
                 magic_dns_fqdn: r.magic_dns_fqdn,
                 tags: r.tags,
                 reachable,
+                // FR-55 P4 — the fact and the moment only (the field's doc).
+                asleep_since: r.sleep.map(|s| s.since),
                 ephemeral: r.ephemeral,
             }
         })

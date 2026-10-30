@@ -4580,6 +4580,9 @@ async fn run_cmd(
     // there. Handed to both, which take an RAII guard for their lifetime.
     let power_activity = roomlerd::power::shared_activity().clone();
     let power_policy = roomlerd::power::PowerPolicy::parse(&cfg.power_policy);
+    // FR-55 P4 — published before anything connects, so the first hello's
+    // heartbeat and an early sleep both report the policy.
+    roomlerd::power::publish_policy(power_policy);
     // Not aborted at shutdown: it exits on the watch, and its exit is what
     // RELEASES the assertion. An abort would leave the machine unable to sleep.
     let _power_task = tokio::spawn(roomlerd::power::run(

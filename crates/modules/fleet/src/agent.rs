@@ -623,6 +623,15 @@ pub struct AgentResponse {
     /// Mac's daemon): unknown, never "off".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_busy: Option<roomler_ai_remote_control::models::KeepBusyBrief>,
+    /// FR-55 P4 — the device's power posture as it last reported it. Omitted
+    /// when it does not say (an agent before P4): unknown, never `never`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power: Option<roomler_ai_remote_control::models::PowerBrief>,
+    /// FR-55 P4 — on a device that is not online: it announced it was going
+    /// to sleep, since when, and its posture then. Omitted otherwise, so
+    /// "offline" with no `sleep` means no reason was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<roomler_ai_remote_control::models::SleepView>,
     pub status: AgentStatus,
     /// FR-51 — this device enrolled as temporary: the reaper removes it after
     /// its inactivity TTL, and removal is final (hard delete, no tombstone).
@@ -1765,6 +1774,8 @@ fn to_agent_response(
         agent_version: a.agent_version,
         companion_version: a.companion_version,
         keep_busy: a.keep_busy,
+        power: a.power,
+        sleep: roomler_ai_remote_control::models::SleepView::of(a.sleep.as_ref(), is_online),
         status: a.status,
         ephemeral: a.ephemeral,
         ephemeral_ttl_secs: a.ephemeral_ttl_secs,

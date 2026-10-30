@@ -117,6 +117,10 @@ pub struct DeviceRowLite {
     /// The netmap's verdict: may this device dial the peer right now?
     #[serde(default, deserialize_with = "null_as_default")]
     pub reachable: bool,
+    /// FR-55 P4 — not online because it announced a sleep, at this RFC 3339
+    /// time. Absent on every device that gave no such reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asleep_since: Option<String>,
     #[serde(
         default,
         deserialize_with = "null_as_default",
@@ -402,6 +406,7 @@ mod tests {
             magic_dns_fqdn: None,
             tags: vec!["lab".into()],
             reachable: true,
+            asleep_since: None,
             ephemeral: false,
             is_self: false,
         }
