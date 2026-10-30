@@ -32,10 +32,10 @@ measured-rate line (#678: a sender cannot see capacity it is not using). Operato
 
 ## What is in force today
 
-- `relay_max_bps()` = **3 Mbps** (`agents/roomlerd/src/encode/mod.rs:481`, env `RELAY_MAX_KBPS`),
+- `relay_max_bps()` = **3 Mbps** (`agents/roomlerd/src/encode/mod.rs:489`, env `RELAY_MAX_KBPS`),
   applied as the encoder's `maxrate` cap on every constrained session
   (`encoder.rs` ↔ `rate_profile::ffmpeg_maxrate_bps_scaled`, `peer.rs:3133`), opened at 85 % =
-  **2.55 Mbps**, and as the AIMD's ceiling (`governor.rs:254-273`); the send-queue budget derives
+  **2.55 Mbps**, and as the AIMD's ceiling (`governor.rs:264-283`); the send-queue budget derives
   from the same constant (`peer.rs:4652`).
 - The AIMD (`encode/aimd.rs`) climbs additively (+ceiling/16 ≥ 150 kbps per 5 s of quiet) but
   **never above that ceiling**; it decreases ×0.85 on a full send channel, on a send-wait stall
@@ -87,7 +87,7 @@ memory) and `relay_max_hi_kbps` (config-surface + env). Direct sessions are unto
 startup bandwidth probe (measures burst capacity, which this measurement shows is *not* the
 sustainable rate — 18 Mbps instantaneous vs ~8 sustained — and costs bytes on exactly the thin
 links); the goodput estimator as the learning input (its down-fast EWMA crashed on relay
-lumpiness, governor.rs:246-252 — the AIMD's own stable target is the robust signal).
+lumpiness, governor.rs:256-262 — the AIMD's own stable target is the robust signal).
 
 ## Acceptance criteria
 
