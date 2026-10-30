@@ -3,9 +3,10 @@
 **Status:** **reopened 2026-10-30** for a regression found the same day (wave 33): from #3125 on,
 `ci.yml`'s Windows clippy lane built cold on every run, because its cache was over its cap. It had
 been **closed 2026-10-30**, with every acceptance criterion field-verified and ticked through
-wave 32 (2026-10-29) and documented in [`docs/build-caches.md`](../build-caches.md). What is left
-is runner queueing and, since 2026-10-30, the Actions cache refusing downloads (Open decisions).
-First shipped and field-verified 2026-08-26
+wave 32 (2026-10-29) and documented in [`docs/build-caches.md`](../build-caches.md). Since
+2026-10-30 the Actions cache also refuses downloads (Open decisions): wave 34 moves the Linux
+lanes off it, and wave 35 skips the heavy lanes on docs-only PRs. What is left after those is
+runner queueing. First shipped and field-verified 2026-08-26
 (retroactive FR per the CLAUDE.md standing rule — the program ran 2026-07-13 → 2026-08-26 across
 ~20 PRs). Tracking issue: `FR-6` (#773) in gjovanov/roomler-ai/issues.
 
@@ -132,6 +133,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 31 | 10-28 | **A release's first build no longer makes its tag run recompile.** Tauri's `generate_context!` writes `out/tauri-codegen-assets/<hash>` into `roomler-desktop`'s OUT_DIR *while that crate compiles*, only when the file is missing, and lists it as an input. So the first build of a new version (a release's rehearsal) left an input newer than the build itself, and the tag run, plus the reseed after it, recompiled `roomler-desktop` once. That cost about 2.5 min on macOS every release, and on Windows whenever the write and the compile's start fell in different seconds (the seed's tar keeps whole seconds). Two things found it: `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the four companion build steps (#3024, diagnostic), and a probe that bumps only `roomler-desktop`'s version. On a same-tree reuse, `seed-tree-reuse` now marks the build's OUT_DIR files unchanged, as it already does the sources. Field-verified on 0.4.181: no companion recompiled on the tag run or the reseed after it, and the diagnostic came out again (#3037) | #3024, #3030, #3037 |
 | 32 | 10-28 | **The daemon lanes' seed cap rises to 4,500 MB.** The accretion GC drops a seed's `target` whole once it passes `SEED_TARGET_MAX_MB`, 3,000 MB by default. A daemon seed restarts at ~2.2–2.7 GB after a cold build and grows ~350–400 MB with each release. Only a new version adds artifacts: cargo names them by name, version, features and profile, never by source, so a rebuild of the same version overwrites in place. The default therefore dropped a seed again within one or two releases: the Windows seed on four post-release reseeds in a row (0.4.180–0.4.183), and 0.4.183's reseed the `.pkg` and `.deb` aarch64 seeds too (574–580 crates cold, a 31 min run). The four daemon jobs' restore steps now set the cap to 4,500 MB, release-setup's macOS job already running at 5,000. That lasts about four releases, and a compressed seed (535–790 MiB) stays far under the 2 GiB asset limit. The GC line also prints the cap in effect and the volume's free space, so a bigger target's disk headroom shows on every run. The operator chose this over pruning stale units, the riskier change: rc.422–424's seed died on a deleted output whose fingerprint survived. Field-verified on 0.4.185's post-release reseed: at the tag's tree it kept the MSI seed at 3,037 MB and the `.deb` x86_64 seed at 3,367 MB and reused the build, with 0 compiles in all 8 jobs. The same run on 0.4.184 had dropped the MSI seed at 3,082 MB and compiled 586 crates cold | #3068 |
 | 33 | 10-30 | **The Windows clippy lane's CI cache fits its cap again.** #3125 (for #3116) added the setup wizard's clippy and unit tests to `windows-overlay-clippy`, and the job's cold build then pruned to 4,440 MB, over `ci-seed-restore`'s default cap of 4,000 MB. Every restore dropped the cache whole (`restored target is 4440 MB (> 4000) — dropping it whole`), every run compiled or checked ~1,740 units cold, and each master run published the same 4,440 MB again. The GC's promise that "the next master run publishes a lean one" cannot hold once a lean one is over the cap. The lane took 7.4–8.3 min in the three runs before #3125 and 17.0–22.6 min in all 20 runs checked after it, the floor of each run's wall clock. The job now sets `max-target-mb: "6000"`, as the macOS overlay check and the integration shards already did. And a master run that publishes a cache its own restore would drop warns `CI cache over its cap` (the restore exports the cap it applied as `CI_SEED_MAX_TARGET_MB`) | #3153 |
+| 34 | 10-30 | **The Linux lanes' cargo caches move to `seed-cache`.** From 2026-10-30 the Actions cache refused downloads under load (`Failed to restore: Egress is over the account limit.`), and Swatinem then built the lane cold: `Rust unit tests` compiled 1,795 crates in 23–27 min against ~8 (Open decisions). The seven Linux families now restore and publish through `ci-seed-restore` and `ci-seed-save`, as the macOS, Windows, integration and installer families have since wave 22. They are `lint`, `unit`, `agent`, `ffmpeg-encoder`, `recording-ffmpeg`, `profiles` and `recorder-audio`, which both recorder lanes restore. Each publishing job gets `contents: write`, and `CARGO_INCREMENTAL=0` is set where rust-cache used to set it. A target archive over the 2 GiB asset cap goes up as numbered 1,900 MiB parts that the restore concatenates (the unit lane's is ~2.5 GB). A publish writes one form and then retires the other. A whole asset wins over parts, and parts from two publishes fail zstd's checksum, so a mixed set builds cold rather than wrong. A local harness with real tar and zstd passed 8 of 8 restore cases and, against a fake `gh`, 6 of 6 publish cases. First caps are about 1.5× each lane's old Actions-cache archive at the integration lane's 4.3× unpack ratio. The Actions cache keeps the apt and bun sets | #3157 |
 
 ## Acceptance criteria
 
@@ -206,13 +208,13 @@ itself on the affected run's page. Baseline when the program started: releases t
   which fall back to the mirror. The limit is GitHub's, on the account's downloads, not the
   pool's 10 GB; other projects report the same message from 2026-10-24. The `seed-cache` release
   assets are not behind it: the Windows and macOS lanes restored from them in every run checked.
-  Levers, posed to the operator:
-  - move the Linux lanes' cargo caches to `seed-cache`, as wave 22 did for the rest. The unit
-    lane's archive is 2.85 GB, so its target may need splitting across assets under the
-    2 GiB cap;
-  - skip the Rust, Windows and macOS lanes on a docs-only change. That means fewer downloads,
-    and fewer of the account's 20 concurrent job slots taken;
-  - a plan with more concurrent jobs (Pro 40, Team 60; macOS stays at 5).
+  Levers posed to the operator, who chose the first two on 2026-10-30:
+  - **wave 34:** move the Linux lanes' cargo caches to `seed-cache`, as wave 22 did for the
+    rest. The unit lane's archive is 2.85 GB, so its target goes up in parts under the 2 GiB
+    asset cap;
+  - **wave 35:** skip the Rust, Windows and macOS lanes on a docs-only change. That means
+    fewer downloads, and fewer of the account's 20 concurrent job slots taken;
+  - not chosen: a plan with more concurrent jobs (Pro 40, Team 60; macOS stays at 5).
 
 - The warm Windows floor is the per-release rebuild of every path crate under the
   size-optimized `cgu=1` profile, plus Azure signing steps. **Measured 2026-10-01, now
@@ -333,8 +335,8 @@ itself on the affected run's page. Baseline when the program started: releases t
 
 - The tag-race double-runs during release bursts (release-cutting process: `ls-remote`
   before tagging).
-- CI-lane cache sizing owned by other programs (`ci-integration`, `ci-ffmpeg-encoder`…) —
-  the pool is theirs now; the janitor governs it.
+- CI-lane cache sizing owned by other programs (`ci-integration`, `ci-ffmpeg-encoder`…).
+  Wave 34 moved their store and set first caps; tuning a lane's cap is its owner's.
 
 ## Field-verification log
 
@@ -1153,3 +1155,9 @@ itself on the affected run's page. Baseline when the program started: releases t
     (41041779768, 41042348489, 41042618394) and 17.0–22.6 min in all 20 runs checked after it.
     So even without the refused download, the bump PR's CI would have taken ~22 min. Wave 33
     (#3153) is the fix.
+  - **The operator chose two of the three egress levers**: move the Linux lanes to `seed-cache`
+    (wave 34), and skip the heavy lanes on docs-only PRs (wave 35). A bigger plan was not chosen.
+- 2026-10-30, 15:31Z: **wave 33 (#3153) merged as `4c43b714a`.** Its own PR run (41076872429)
+  restored `ci-windows-clippy-Windows-X64: target 4440 MB, key changed` and kept it, compiled or
+  checked 98 units instead of ~1,740, and took 11.2 min against 17.0–22.6 cold. The wizard's step
+  took 179 s, against 503 s cold. The macOS overlay check (13.8 min) is now each run's floor.

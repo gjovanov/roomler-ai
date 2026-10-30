@@ -24,6 +24,12 @@
 //! PoP's nginx terminates TLS for `derp-{region}.roomler.ai:443` and proxies
 //! here (`scripts/relay-pop/`). `/healthz` serves the health cron.
 //!
+//! Network scope (FR-76 P3): with `DERP_NETWORKS` unset the relay serves every
+//! overlay network, as the shared regional PoPs do. Set to a comma-separated
+//! list of network ids, it serves only those, and answers a valid ticket for
+//! any other network 403 at the upgrade, before anything is registered. Set
+//! but empty or malformed, it refuses to start.
+//!
 //! v1 scope note: the central relay additionally consults the overlay-ACL
 //! DERP table (`ws/derp_acl.rs`) for ENFORCING tenants. Tickets don't carry
 //! per-peer allow-lists yet, so a PoP enforces network scoping only; ACL
@@ -50,7 +56,7 @@ use roomler_ai_remote_control::derp_ticket::{self, AllowanceSetClaims};
 use roomler_ai_remote_control::derp_ticket::jsonwebtoken::DecodingKey;
 use roomler_ai_remote_control::turn_stats;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -404,6 +410,113 @@ async fn subscribe_turn_usage(url: &str, usage: &TurnUsage) -> Result<(), redis:
     Ok(())
 }
 
+/// FR-76 P3 — one refusal line per network per this long.
+const SCOPE_LOG_EVERY: Duration = Duration::from_secs(10);
+
+/// FR-76 P3 — the overlay networks this relay serves (`DERP_NETWORKS`).
+///
+/// Unset, it serves every network, exactly as before. That is a shared
+/// regional PoP, which carries every tenant's network, and some of those
+/// hosts have no carrier but DERP. Set, it is a node that serves only the
+/// networks it names, such as a tenant's own relay, and it refuses a valid
+/// ticket for any other network at the upgrade, before anything is registered.
+///
+/// ⚠ A value that is present never means "every network": empty or
+/// malformed, the relay refuses to start ([`parse_networks`]). A node that
+/// cannot read its scope serves nobody, and the operator learns of it at
+/// deploy time rather than from a refused ticket later.
+struct NetworkScope {
+    /// `None`: every network. `Some`: exactly these ids, never empty.
+    networks: Option<HashSet<String>>,
+    /// The scope as the refusal line shows it: network hex only, sorted.
+    shown: String,
+    refused_total: AtomicU64,
+    /// network → when its last refusal was logged. Keyed by verified tickets
+    /// only, so by networks the API minted tickets for.
+    logged_at: DashMap<String, Instant>,
+}
+
+impl NetworkScope {
+    fn new(networks: Option<HashSet<String>>) -> Self {
+        let shown = {
+            let mut ids: Vec<&str> = networks.iter().flatten().map(String::as_str).collect();
+            ids.sort_unstable();
+            ids.join(",")
+        };
+        Self {
+            networks,
+            shown,
+            refused_total: AtomicU64::new(0),
+            logged_at: DashMap::new(),
+        }
+    }
+
+    /// Whether this relay serves `network`: exact equality with an id it
+    /// names. Never a prefix, never a case-folded match: the ticket's `net` is
+    /// the API's own `ObjectId::to_hex`, compared as it arrives.
+    fn serves(&self, network: &str) -> bool {
+        match &self.networks {
+            None => true,
+            Some(ids) => ids.contains(network),
+        }
+    }
+
+    /// Count a refused ticket, and log it at most once per network per
+    /// [`SCOPE_LOG_EVERY`]; `true` when this one was logged.
+    fn refused(&self, network: &str) -> bool {
+        let total = self.refused_total.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = Instant::now();
+        let due = match self.logged_at.get(network) {
+            Some(at) => now.duration_since(*at) >= SCOPE_LOG_EVERY,
+            None => true,
+        };
+        if due {
+            self.logged_at.insert(network.to_string(), now);
+            warn!(
+                %network,
+                serves = %self.shown,
+                derp_scope_refused_total = total,
+                "derp-relay: refused a valid ticket for a network this relay does not serve (DERP_NETWORKS)"
+            );
+        }
+        due
+    }
+}
+
+/// FR-76 P3 — `DERP_NETWORKS` as `main` reads it. Unset is every network
+/// (`None`). Otherwise it is a comma-separated list of overlay network ids,
+/// each 24 lowercase hex characters, as the API mints a ticket's `net`. A
+/// value that is present but empty, or that holds anything else, is an error
+/// naming the variable, so it can mean neither every network nor none.
+fn parse_networks(
+    var: Result<String, std::env::VarError>,
+) -> Result<Option<HashSet<String>>, String> {
+    let raw = match var {
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(
+                "DERP_NETWORKS is set but is not valid UTF-8; unset it to serve every network"
+                    .into(),
+            );
+        }
+        Ok(raw) => raw,
+    };
+    if raw.trim().is_empty() {
+        return Err("DERP_NETWORKS is set but empty: name the overlay networks this relay serves, or unset it to serve every network".into());
+    }
+    let mut ids = HashSet::new();
+    for entry in raw.split(',') {
+        let id = entry.trim();
+        if id.len() != 24 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(format!(
+                "DERP_NETWORKS: {id:?} is not an overlay network id (24 lowercase hex characters, comma-separated)"
+            ));
+        }
+        ids.insert(id.to_string());
+    }
+    Ok(Some(ids))
+}
+
 #[derive(Clone)]
 struct RelayState {
     registry: Registry,
@@ -415,6 +528,8 @@ struct RelayState {
     region: Arc<str>,
     /// FR-115 P4b-2 — `Some` when `TURN_STATS_REDIS` names this PoP's Redis.
     turn_usage: Option<Arc<TurnUsage>>,
+    /// FR-76 P3 — the networks `DERP_NETWORKS` names; unset, every network.
+    scope: Arc<NetworkScope>,
 }
 
 #[derive(Deserialize)]
@@ -434,6 +549,14 @@ async fn main() {
         .expect("DERP_TICKET_PUBLIC_KEY (base64 raw 32-byte Ed25519 public key) is required");
     let ticket_key = derp_ticket::decoding_key_from_public_b64(&public_b64)
         .expect("DERP_TICKET_PUBLIC_KEY is not a valid Ed25519 public key");
+    // FR-76 P3 — read before the bind, so a relay that cannot read its scope
+    // never listens.
+    let scope = NetworkScope::new(
+        parse_networks(std::env::var("DERP_NETWORKS")).unwrap_or_else(|e| panic!("{e}")),
+    );
+    if scope.networks.is_some() {
+        info!(serves = %scope.shown, "derp-relay: serving only the overlay networks DERP_NETWORKS names");
+    }
     let bind = std::env::var("DERP_BIND").unwrap_or_else(|_| "127.0.0.1:8443".into());
     let region: Arc<str> = std::env::var("REGION").unwrap_or_default().into();
 
@@ -459,6 +582,7 @@ async fn main() {
         allowance: Arc::new(Allowance::default()),
         region,
         turn_usage,
+        scope: Arc::new(scope),
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -675,7 +799,9 @@ async fn coturn_prometheus() -> serde_json::Value {
     }
 }
 
-/// `GET /derp?ticket=<eddsa-jwt>` — verify the ticket, then upgrade.
+/// `GET /derp?ticket=<eddsa-jwt>` — verify the ticket, then upgrade. FR-76
+/// P3: a relay that serves only some networks (`DERP_NETWORKS`) answers 403
+/// to a valid ticket for any other, here, before anything is registered.
 async fn derp_upgrade(
     State(state): State<RelayState>,
     Query(params): Query<DerpParams>,
@@ -691,6 +817,13 @@ async fn derp_upgrade(
                 .unwrap();
         }
     };
+    if !state.scope.serves(&claims.net) {
+        state.scope.refused(&claims.net);
+        return Response::builder()
+            .status(403)
+            .body("Forbidden (this relay does not serve the ticket's network)".into())
+            .unwrap();
+    }
     ws.on_upgrade(move |socket| handle_socket(state, socket, claims.net, claims.pk))
 }
 
@@ -844,22 +977,43 @@ mod tests {
         key: DecodingKey,
         turn_usage: Option<Arc<TurnUsage>>,
     ) -> (std::net::SocketAddr, Registry, Option<Arc<TurnUsage>>) {
+        let (addr, registry, _) = serve_state(key, turn_usage.clone(), None).await;
+        (addr, registry, turn_usage)
+    }
+
+    /// FR-76 P3 — a relay serving only `networks`, as `DERP_NETWORKS` sets it.
+    async fn serve_scoped(
+        key: DecodingKey,
+        networks: &[&str],
+    ) -> (std::net::SocketAddr, Registry, Arc<NetworkScope>) {
+        let ids = networks.iter().map(|n| n.to_string()).collect();
+        serve_state(key, None, Some(ids)).await
+    }
+
+    /// A relay for region `us-east`, with its `TURN_STATS_REDIS` and its
+    /// `DERP_NETWORKS` (`None`: unset).
+    async fn serve_state(
+        key: DecodingKey,
+        turn_usage: Option<Arc<TurnUsage>>,
+        networks: Option<HashSet<String>>,
+    ) -> (std::net::SocketAddr, Registry, Arc<NetworkScope>) {
         let state = RelayState {
             registry: Arc::new(DashMap::new()),
             ticket_key: Arc::new(key),
             network_bytes: Arc::new(DashMap::new()),
             allowance: Arc::new(Allowance::default()),
             region: "us-east".into(),
-            turn_usage: turn_usage.clone(),
+            turn_usage,
+            scope: Arc::new(NetworkScope::new(networks)),
         };
-        let registry = state.registry.clone();
+        let (registry, scope) = (state.registry.clone(), state.scope.clone());
         let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (addr, registry, turn_usage)
+        (addr, registry, scope)
     }
 
     async fn connect(
@@ -980,6 +1134,161 @@ mod tests {
             registry.is_empty(),
             "mismatched registration must never enter the registry"
         );
+    }
+
+    // ── FR-76 P3 — a relay that serves only some networks ───────────────
+
+    const NET_A: &str = "6a54bf440b4fd609a7356f97";
+    const NET_B: &str = "6a54bf440b4fd609a7356f98";
+
+    fn mint(signer: &DerpTicketSigner, net: &str, p: DerpPubKey) -> String {
+        signer.mint(net, &BASE64.encode(p)).unwrap().0
+    }
+
+    /// The HTTP status a `/derp` upgrade is refused with; `None` when it is
+    /// admitted.
+    async fn refusal(addr: std::net::SocketAddr, ticket: &str) -> Option<u16> {
+        let url = format!("ws://{addr}/derp?ticket={ticket}");
+        match tokio_tungstenite::connect_async(&url).await {
+            Ok(_) => None,
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Some(resp.status().as_u16()),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Unset, a relay serves every network as it always has (a shared
+    /// regional PoP): tickets for two networks are both admitted and
+    /// registered, and nothing is refused.
+    #[tokio::test]
+    async fn unset_derp_networks_serves_every_network() {
+        let (signer, key) = test_signer();
+        let (addr, registry, scope) = serve_state(key, None, None).await;
+        let (a, b) = (pk(0x41), pk(0x42));
+        let _ws_a = connect(addr, &mint(&signer, NET_A, a), a).await;
+        let _ws_b = connect(addr, &mint(&signer, NET_B, b), b).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(registry.contains_key(&(NET_A.to_string(), a)), "network A");
+        assert!(registry.contains_key(&(NET_B.to_string(), b)), "network B");
+        assert_eq!(scope.refused_total.load(Ordering::Relaxed), 0);
+    }
+
+    /// AC4 — a relay serving network B answers a VALID ticket for network A
+    /// 403 at the upgrade, registers nothing for it, and still admits network
+    /// B. A foreign key is still 401: the scope never reads a ticket whose
+    /// signature failed.
+    #[tokio::test]
+    async fn a_relay_serving_one_network_refuses_another_before_registering() {
+        let (signer, key) = test_signer();
+        let (addr, registry, scope) = serve_scoped(key, &[NET_B]).await;
+        let (a, b) = (pk(0x51), pk(0x52));
+        assert_eq!(
+            refusal(addr, &mint(&signer, NET_A, a)).await,
+            Some(403),
+            "network A's valid ticket"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            registry.is_empty(),
+            "nothing is registered for a refused ticket"
+        );
+        assert_eq!(scope.refused_total.load(Ordering::Relaxed), 1);
+
+        let _ws_b = connect(addr, &mint(&signer, NET_B, b), b).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(registry.len(), 1);
+        assert!(registry.contains_key(&(NET_B.to_string(), b)), "network B");
+
+        let (foreign, _) = test_signer();
+        assert_eq!(
+            refusal(addr, &mint(&foreign, NET_A, a)).await,
+            Some(401),
+            "a foreign key"
+        );
+        assert_eq!(
+            scope.refused_total.load(Ordering::Relaxed),
+            1,
+            "a 401 is not a scope refusal"
+        );
+    }
+
+    /// A relay serving networks A and B admits both.
+    #[tokio::test]
+    async fn a_relay_serving_two_networks_admits_both() {
+        let (signer, key) = test_signer();
+        let (addr, registry, scope) = serve_scoped(key, &[NET_B, NET_A]).await;
+        let (a, b) = (pk(0x61), pk(0x62));
+        let _ws_a = connect(addr, &mint(&signer, NET_A, a), a).await;
+        let _ws_b = connect(addr, &mint(&signer, NET_B, b), b).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(registry.contains_key(&(NET_A.to_string(), a)), "network A");
+        assert!(registry.contains_key(&(NET_B.to_string(), b)), "network B");
+        assert_eq!(scope.refused_total.load(Ordering::Relaxed), 0);
+        assert_eq!(scope.shown, format!("{NET_A},{NET_B}"));
+    }
+
+    /// The scope matches a network id exactly: one character short, one
+    /// longer, or the same id in capitals is another network.
+    #[test]
+    fn the_scope_matches_a_network_id_exactly() {
+        let scope = NetworkScope::new(Some(HashSet::from([NET_B.to_string()])));
+        assert!(scope.serves(NET_B));
+        let longer = format!("{NET_B}0");
+        let capitals = NET_B.to_uppercase();
+        for other in [NET_A, &NET_B[..23], &longer, &capitals, ""] {
+            assert!(!scope.serves(other), "{other:?}");
+        }
+        let every = NetworkScope::new(None);
+        for any in [NET_A, NET_B, &capitals, ""] {
+            assert!(every.serves(any), "unset serves {any:?}");
+        }
+    }
+
+    /// `DERP_NETWORKS`: unset is every network and a list of ids is those
+    /// networks. Set but empty, or holding anything but ids, refuses to start
+    /// with an error that names the variable.
+    #[test]
+    fn an_empty_or_malformed_derp_networks_refuses_to_start() {
+        use std::env::VarError;
+        assert_eq!(parse_networks(Err(VarError::NotPresent)), Ok(None));
+        assert_eq!(
+            parse_networks(Ok(format!(" {NET_A} ,{NET_B},{NET_A}"))),
+            Ok(Some(HashSet::from([NET_A.to_string(), NET_B.to_string()])))
+        );
+        for bad in [
+            String::new(),
+            " ".into(),
+            ",".into(),
+            format!("{NET_A},"),
+            format!("{NET_A},,{NET_B}"),
+            format!("{NET_A};{NET_B}"),
+            NET_A.to_uppercase(),
+            NET_A[..23].to_string(),
+            format!("{NET_A}0"),
+            "6a54bf440b4fd609a7356fzz".into(),
+        ] {
+            let err = parse_networks(Ok(bad.clone())).expect_err(&bad);
+            assert!(err.starts_with("DERP_NETWORKS"), "{bad:?}: {err}");
+        }
+        let err = parse_networks(Err(VarError::NotUnicode(Default::default()))).unwrap_err();
+        assert!(err.starts_with("DERP_NETWORKS"), "{err}");
+    }
+
+    /// A refusal is counted every time and logged once per network per
+    /// window, as the allowance's drops are.
+    #[test]
+    fn a_refusal_is_logged_once_per_network_per_window() {
+        let scope = NetworkScope::new(Some(HashSet::from([NET_B.to_string()])));
+        assert!(scope.refused(NET_A), "a network's first refusal is logged");
+        assert!(
+            !scope.refused(NET_A),
+            "the next, inside the window, is counted"
+        );
+        assert!(
+            scope.refused("6a54bf440b4fd609a7356f99"),
+            "another network has its own window"
+        );
+        assert_eq!(scope.refused_total.load(Ordering::Relaxed), 3);
+        assert_eq!(scope.shown, NET_B);
     }
 
     // ── FR-115 P4a-2 — the relay allowance on a PoP ─────────────────────

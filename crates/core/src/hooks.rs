@@ -176,15 +176,21 @@ pub trait FleetLifecycle: Send + Sync {
         None
     }
 
-    /// FR-128 — can both devices reach the far TURN over UDP, by their last
+    /// FR-128 — can both ends reach the far TURN over UDP, by their last
     /// measurement? Asked by `remote`'s authz gate for a session whose device
-    /// is set to `rc_overlay = auto`: the device a session targets and the
-    /// browser's own device. `network` answers from each overlay node's last
-    /// netcheck: `Some(false)` when either one measured it dead,
-    /// `Some(true)` when both measured it alive. `None` = not measured, or no
-    /// holder knows, which the agent reads as "it works".
-    async fn far_turn_udp(&self, tenant_id: ObjectId, a: ObjectId, b: ObjectId) -> Option<bool> {
-        let _ = (tenant_id, a, b);
+    /// is set to `rc_overlay = auto`: the device a session targets, and every
+    /// device the browser runs on (D8: one per relay it found, FR-121 P3b).
+    /// `network` answers from each overlay node's last netcheck:
+    /// `Some(false)` when either end measured it dead, `Some(true)` when both
+    /// measured it alive. `None` = not measured, or no holder knows, which
+    /// the agent reads as "it works".
+    async fn far_turn_udp(
+        &self,
+        tenant_id: ObjectId,
+        target: ObjectId,
+        viewers: &[ObjectId],
+    ) -> Option<bool> {
+        let _ = (tenant_id, target, viewers);
         None
     }
 }
@@ -414,11 +420,11 @@ impl HookRegistry {
     pub async fn far_turn_udp(
         &self,
         tenant_id: ObjectId,
-        a: ObjectId,
-        b: ObjectId,
+        target: ObjectId,
+        viewers: &[ObjectId],
     ) -> Option<bool> {
         for (_, hook) in self.fleet_lifecycles() {
-            if let Some(verdict) = hook.far_turn_udp(tenant_id, a, b).await {
+            if let Some(verdict) = hook.far_turn_udp(tenant_id, target, viewers).await {
                 return Some(verdict);
             }
         }
@@ -656,7 +662,7 @@ mod tests {
             RenamePropagation::NoLiveNode
         );
         assert_eq!(
-            reg.far_turn_udp(ObjectId::new(), ObjectId::new(), ObjectId::new())
+            reg.far_turn_udp(ObjectId::new(), ObjectId::new(), &[ObjectId::new()])
                 .await,
             None,
             "FR-128: no holder means not measured"
@@ -667,7 +673,7 @@ mod tests {
 
     #[async_trait]
     impl FleetLifecycle for FarTurn {
-        async fn far_turn_udp(&self, _t: ObjectId, _a: ObjectId, _b: ObjectId) -> Option<bool> {
+        async fn far_turn_udp(&self, _t: ObjectId, _a: ObjectId, _v: &[ObjectId]) -> Option<bool> {
             self.0
         }
     }
@@ -693,7 +699,7 @@ mod tests {
             },
         );
         let ids = (ObjectId::new(), ObjectId::new(), ObjectId::new());
-        assert_eq!(reg.far_turn_udp(ids.0, ids.1, ids.2).await, Some(false));
+        assert_eq!(reg.far_turn_udp(ids.0, ids.1, &[ids.2]).await, Some(false));
     }
 
     struct Gate(bool);

@@ -2,7 +2,8 @@ name: ci-seed-restore
 description: >-
   FR-6 wave 22 (#773): restore a CI job's cargo cache from the free
   release-asset store (the rolling `seed-cache` release, assets
-  `ci-<family>-<os>-<arch>-{cargo,target}.tar.zst`) instead of the Actions
+  `ci-<family>-<os>-<arch>-{cargo,target}.tar.zst`, the target in numbered
+  `.partNN` assets when it is over the 2 GiB asset cap) instead of the Actions
   cache. The Actions cache's free 10 GB holds the hot Linux lanes. Above 10 GB
   it bills the ACCOUNT's Actions budget, and when another repository spent that
   budget (2026-10-09) the pool went read-only. Release assets have no LRU, no
@@ -87,9 +88,15 @@ runs:
           exit 0
         fi
         dl="$(mktemp -d)"
-        if ! gh release download seed-cache --repo "${GITHUB_REPOSITORY}" \
-              --pattern "${FAM}-*.tar.zst" --dir "$dl" 2>/dev/null \
-           || [ ! -f "$dl/${FAM}-target.tar.zst" ]; then
+        # The target is one asset, or numbered parts when its archive is over the 2 GiB asset
+        # cap (`<fam>-target.tar.zst.part00`, `.part01`, …; ci-seed-save, FR-6 wave 34).
+        parts=0
+        if gh release download seed-cache --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${FAM}-*.tar.zst" --pattern "${FAM}-target.tar.zst.part*" \
+              --dir "$dl" 2>/dev/null; then
+          for p in "$dl/${FAM}-target.tar.zst.part"*; do [ -f "$p" ] && parts=$((parts + 1)); done
+        fi
+        if [ ! -f "$dl/${FAM}-target.tar.zst" ] && [ "$parts" -eq 0 ]; then
           echo "no ${FAM} cache on the seed-cache release yet — building cold (a master run publishes it)"
           rm -rf "$dl"
           exit 0
@@ -101,7 +108,16 @@ runs:
         if [ -f "$dl/${FAM}-cargo.tar.zst" ]; then
           tar --zstd -xf "$dl/${FAM}-cargo.tar.zst" -C "$home" || echo "::warning::${FAM}: the cargo-home asset did not unpack"
         fi
-        if ! tar --zstd -xf "$dl/${FAM}-target.tar.zst"; then
+        # A whole asset wins over parts: while a publish switches form, the whole one is either
+        # the new cache or a consistent old one. Parts from two publishes never unpack: zstd's
+        # frame checksum fails, and a failure drops whatever was written.
+        if [ -f "$dl/${FAM}-target.tar.zst" ]; then
+          tar --zstd -xf "$dl/${FAM}-target.tar.zst"
+        else
+          echo "${FAM}: the target comes in ${parts} parts"
+          cat "$dl/${FAM}-target.tar.zst.part"* | tar --zstd -xf -
+        fi
+        if [ $? -ne 0 ]; then
           echo "::warning::${FAM}: the target asset did not unpack — building cold"
           rm -rf target "$dl"
           exit 0

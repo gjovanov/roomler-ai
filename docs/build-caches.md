@@ -19,14 +19,19 @@ run page rather than silently going cold. The program's full history, wave by wa
 |---|---|---|---|
 | `release-agent.yml`, 8 build jobs | `seed-cache` release assets | `seed-<shared-key>-<os>-<arch>`, e.g. `seed-agent-windows-vp9-444-Windows-X64` | non-tag runs: rehearsals, post-release reseeds, the Monday 03:17 UTC cron |
 | `release-setup.yml`, 4 build jobs | `seed-cache` release assets | `seed-setup-<platform>-…` | non-tag runs |
-| `integration-tests.yml`'s shards, `installer-smoke.yml`, `ci.yml`'s macOS and Windows lanes | `seed-cache` release assets (`ci-<family>-…`, through `ci-seed-restore` / `ci-seed-save`) | one per lane | master only |
-| `ci.yml`'s five Rust lanes | the Actions cache (Swatinem), salted per job | one per lane | master only (`save-if`) |
+| `integration-tests.yml`'s shards, `installer-smoke.yml`, every cargo cache in `ci.yml` (its Linux lanes since wave 34) | `seed-cache` release assets (`ci-<family>-…`, through `ci-seed-restore` / `ci-seed-save`) | one per lane; the two recorder lanes share one | master only |
+| `ci.yml`'s apt and bun sets | the Actions cache | one per package set | any run |
 
 **Why a release and not the Actions cache.** The 10 GB cache pool kept evicting the seeds.
 LRU dropped a *verified* save 29 minutes after it landed (rc.472), and saves made from a tag
 ref can never be restored by a later tag. Release assets have no LRU, no budget, no
 reservations and no ref scoping.
-- Each family is two assets, `<fam>-cargo.tar.zst` and `<fam>-target.tar.zst`.
+- Each family is two assets, `<fam>-cargo.tar.zst` and `<fam>-target.tar.zst`. A CI
+  family's target archive over the 2 GiB asset cap goes up in numbered 1,900 MiB parts,
+  `<fam>-target.tar.zst.part00`, `.part01`, … (`ci-seed-save/action.yml:131`), which the
+  restore concatenates (`ci-seed-restore/action.yml:111`). A publish writes one form and then
+  retires the other (`ci-seed-save/action.yml:166`). A whole asset wins over parts, and parts
+  from two publishes fail zstd's checksum, so a mixed set builds cold rather than wrong.
 - `--clobber` on upload is the retention policy: keep the newest one
   (`.github/actions/seed-cache-save/action.yml:72`).
 - `--latest=false` keeps the `seed-cache` release from ever becoming the
@@ -134,8 +139,9 @@ days. So before every non-tag build, `seed-cache-restore` runs a GC step
 | Default (companions, everything else) | 3,000 MB | `seed-cache-restore/action.yml:85` |
 | The four daemon jobs (`.deb` ×2, MSI, `.pkg`) | 4,500 MB | `release-agent.yml:393`, `:1129`, `:1604`, `:2575` |
 | The wizard's macOS universal job (two triples) | 5,000 MB | `release-setup.yml:396` |
-| CI caches in the release-asset store (`ci-seed-restore`), default | 4,000 MB | `ci-seed-restore/action.yml:28` |
-| The integration shards, `ci.yml`'s macOS overlay check and its Windows clippy lane | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1212`, `:1457` |
+| CI caches in the release-asset store (`ci-seed-restore`), default | 4,000 MB | `ci-seed-restore/action.yml:29` |
+| The integration shards, `ci.yml`'s macOS overlay check and its Windows clippy lane | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1265`, `:1510` |
+| `ci.yml`'s Linux lanes (wave 34): unit, lint, agent; recorder-audio, ffmpeg-encoder, recording-ffmpeg, profiles | 16,000, 10,000, 7,000; 5,000 each | `ci.yml:431`, `:165`, `:580`; `:1091`, `:1815`, `:1993`, `:2470` |
 
 **A cold build has to fit under its cap.** If it does not, every restore drops the cache, every
 run builds cold, and each master run publishes the same size again, so the GC never recovers.
@@ -143,6 +149,10 @@ run builds cold, and each master run publishes the same size again, so the GC ne
 4,440 MB against the default 4,000, and the lane took 17–23 min on every CI run instead of
 ~8 (FR-6 wave 33). A master run that publishes a CI cache over its cap now warns
 `CI cache over its cap` on the run page (`ci-seed-save/action.yml:95`).
+
+The Linux lanes' caps are first estimates, about 1.5 times each lane's old Actions-cache
+archive at the 4.3× unpack ratio the integration lane measures (its 1,181 MB asset restores to
+5,077 MB). The first master run's `pruned target: A MB -> B MB` line gives the real figure.
 
 **A seed grows per release, not per build.** Cargo names an artifact by the unit's name,
 version, features and profile, never by its source. So a rebuild of the same version
@@ -199,6 +209,7 @@ closes it (`:3742`).
 | 31 (#3030) | reuse marks OUT_DIR files unchanged | no companion recompiles on a tag run since 0.4.181 |
 | 32 (#3068) | the daemon seeds' cap rises to 4,500 MB, and the GC line reports free disk | a reseed reuses instead of a 26-minute cold MSI |
 | 33 (#3153) | the Windows clippy lane's CI cache cap rises to 6,000 MB, and a master run warns when it publishes a cache over its cap | ends a cold build of that lane on every CI run since #3125 (17–23 min, against 7.4–8.3 before it) |
+| 34 (#3157) | `ci.yml`'s seven Linux cargo caches move from the Actions cache to `seed-cache`, the largest in parts | a download the Actions cache refuses ("Egress is over the account limit") no longer builds a lane cold (the unit lane: 27 min against ~8) |
 
 What is left is runner queueing, not compiling. On 0.4.182 and 0.4.183 the `.pkg` waited
 about 8 minutes for a macOS runner, and tag to publish took 13–16 minutes. On 0.4.184 and

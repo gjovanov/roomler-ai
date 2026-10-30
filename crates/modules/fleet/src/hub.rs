@@ -100,8 +100,8 @@ fn local_relay_reply(
 /// FR-121 P3b (#2774) — the relays one session keeps: the first of each
 /// `turn:` address, and at most [`LOCAL_RELAYS_MAX`]. Each one is another
 /// TURN allocation for the target's agent, and a probed list is whatever the
-/// browser sent.
-fn bounded_relays(
+/// browser sent. FR-128 D8: `remote`'s far-TURN hint counts the same ones.
+pub fn bounded_relays(
     relays: impl IntoIterator<Item = LocalRelayDescriptor>,
 ) -> Vec<LocalRelayDescriptor> {
     let mut kept: Vec<LocalRelayDescriptor> = Vec::new();
@@ -121,8 +121,8 @@ fn bounded_relays(
 
 /// FR-121 P3b (#2774) — the devices a request names, each once, in order, at
 /// most [`LOCAL_RELAYS_MAX`]: `local_relay_from`, then
-/// `local_relay_from_also`.
-fn named_devices(first: ObjectId, also: Vec<ObjectId>) -> Vec<ObjectId> {
+/// `local_relay_from_also`. FR-128 D8: `remote`'s far-TURN hint reads them.
+pub fn named_devices(first: ObjectId, also: Vec<ObjectId>) -> Vec<ObjectId> {
     let mut named = vec![first];
     for device in also {
         if named.len() == LOCAL_RELAYS_MAX {
