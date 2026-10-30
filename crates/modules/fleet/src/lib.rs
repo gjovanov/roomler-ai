@@ -562,7 +562,7 @@ impl Module for FleetState {
         let public_setup = Router::new()
             .route("/latest-release", get(setup_release::setup_latest_release))
             // FR-129 B1-s — the switches a client reads before offering an
-            // install path (`pairing`, `wizard_unix_daemon`, `wizard_pairing`);
+            // install path (`pairing`, the daemon switch per OS, `wizard_pairing`);
             // static, so it wins over `/{platform}` like the others.
             .route("/features", get(setup_release::setup_features))
             .route("/install.sh", get(setup_release::install_script_sh))

@@ -248,7 +248,9 @@ or a `+json` type is refused 415 before it is read (`declares_json`, `parse_body
 | `[pairing] start_per_ip_per_hour` | `ROOMLER__PAIRING__START_PER_IP_PER_HOUR` | `60` | per address, on top of the governor — a corporate NAT rolling out a floor of machines must not be refused at install twenty-one; `0` disables |
 | `[pairing] misses_per_account_per_hour` | `ROOMLER__PAIRING__MISSES_PER_ACCOUNT_PER_HOUR` | `10` | per account; `0` disables |
 | `[setup] wizard_pairing` | `ROOMLER__SETUP__WIZARD_PAIRING` | `false` | the operator's assertion that the **released** wizard pairs (§12) |
-| `[setup] wizard_unix_daemon` | `ROOMLER__SETUP__WIZARD_UNIX_DAEMON` | `false` | its sibling for B1 — the released wizard installs the daemon on Linux and macOS; not a pairing switch |
+| `[setup] wizard_unix_daemon` | `ROOMLER__SETUP__WIZARD_UNIX_DAEMON` | `false` | its sibling for B1 — the released wizard installs the daemon on Linux and macOS; not a pairing switch. Since B1-s2 (after this doc's anchors) it is the legacy key, which turns both per-OS switches below on |
+| `[setup] wizard_linux_daemon` | `ROOMLER__SETUP__WIZARD_LINUX_DAEMON` | `false` | B1-s2: the same claim for Linux alone, so Linux can go live without macOS (`SetupSettings::linux_daemon`) |
+| `[setup] wizard_macos_daemon` | `ROOMLER__SETUP__WIZARD_MACOS_DAEMON` | `false` | B1-s2: the same for macOS (`SetupSettings::macos_daemon`) |
 
 `PairingSettings` and its defaults: `crates/config/src/settings.rs:118-183`; `SetupSettings`:
 `:91-112`. Both load whole or absent (a file with no `[pairing]` table is the defaults), and a
@@ -453,7 +455,9 @@ word on which install paths a client may offer, a public JSON object with every 
 |---|---|---|
 | `pairing` | `[pairing] enabled` (`:141`) | a fact about **this server**: `/api/pair/*` answers. It mirrors the kill switch, so a consumer can offer "sign in from your browser" up front rather than discover the 404 on `start` |
 | `wizard_pairing` | `[setup] wizard_pairing` (`settings.rs:111`) | the operator's assertion about the **released** wizard: it pairs (A3), and that is field-proven against this server. Default `false`, flipped in the deploy env after the field run |
-| `wizard_unix_daemon` | `[setup] wizard_unix_daemon` (`settings.rs:100`) | B1's sibling: the released wizard installs the daemon on Linux and macOS; it gates the Linux and macOS daemon cards, not pairing |
+| `wizard_unix_daemon` | `[setup] wizard_unix_daemon` (`settings.rs:100`); since B1-s2, `wizard_linux_daemon && wizard_macos_daemon` | B1's sibling: the released wizard installs the daemon on Linux and macOS; it gates the Linux and macOS daemon cards, not pairing. Since B1-s2 it is what the wizards released before the split read, for both OSes, so one OS on alone shows them nothing; a newer client reads its OS's key OR this one, so a server from before the split, which sends only this key, still works |
+| `wizard_linux_daemon` | B1-s2: `[setup] wizard_linux_daemon`, or the legacy `wizard_unix_daemon` (`SetupSettings::linux_daemon`) | the Linux daemon cards alone, so Linux can go live without macOS |
+| `wizard_macos_daemon` | B1-s2: `[setup] wizard_macos_daemon`, or the legacy `wizard_unix_daemon` (`SetupSettings::macos_daemon`) | the same for macOS |
 
 The homepages word the install lead as "sign in from your browser" only on
 **`pairing && wizard_pairing`** (`ui/docs/theme/home.js:195`, `ui/src/views/LandingView.vue:287`):

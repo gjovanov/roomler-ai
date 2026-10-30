@@ -87,8 +87,10 @@ const state = {
   roleAck: false,      // cross-flavour acknowledgement checkbox
   detection: null,     // DetectResult {agent: {...}, tunnel: {...}}
   os: "windows",       // FR-129 B1: detection.agent.os — which card copy
-  features: null,      // FR-129 B1: {server, wizardUnixDaemon} for the URL
-                       // last asked on the Server page (null = not asked)
+  features: null,      // FR-129 B1: {server, daemonOffered} for the URL
+                       // last asked on the Server page (null = not asked);
+                       // daemonOffered is that server's switch for THIS OS,
+                       // decided in Rust (B1-s2, features::daemon_offered)
   advTouched: new Set(), // #2338: the Advanced boxes the operator touched
                        // (config keys); only these land on an existing
                        // config. Memory only, like overlayChoice.
@@ -228,7 +230,7 @@ async function probeAndRender() {
     state.detection = {
       agent: {
         supported: false, kind: "clean", peruserVersion: null, permachineVersion: null, ambiguous: false,
-        os: "other", daemonRoles: [], featuresServer: null, wizardUnixDaemon: false,
+        os: "other", daemonRoles: [], featuresServer: null, daemonOffered: false,
       },
       tunnel: { installed: false, machineName: null, configPath: null },
     };
@@ -246,7 +248,7 @@ async function probeAndRender() {
   if (state.detection.agent.featuresServer) {
     state.features = {
       server: state.detection.agent.featuresServer,
-      wizardUnixDaemon: state.detection.agent.wizardUnixDaemon === true,
+      daemonOffered: state.detection.agent.daemonOffered === true,
     };
   }
 
@@ -579,8 +581,9 @@ function needsElevatedWizard(role) {
 }
 
 // FR-129 B1 — why no daemon card is shown, in the person's terms. On Linux
-// and macOS the reason is the server's: its setup features did not say
-// `wizard_unix_daemon: true` (an older server, the switch off, or no answer).
+// and macOS the reason is the server's: its setup features did not offer the
+// daemon on this OS (B1-s2: this OS's switch off, an older server, or no
+// answer).
 function platformNote(a) {
   const os = a.os ?? "other";
   if (os === "linux" || os === "macos") {
@@ -660,9 +663,10 @@ function wireServer() {
 }
 
 // FR-129 B1 — ask the Server page's URL whether it allows the daemon role on
-// this OS (Linux/macOS only; Windows never asks). A stale answer (the URL
-// changed again meanwhile) is dropped. Anything but a JSON `true` reads as
-// not allowed; the install step asks once more, and refuses, before it runs.
+// this OS (Linux/macOS only; Windows never asks). Rust applies the per-OS
+// rule and answers `daemonOffered` (B1-s2). A stale answer (the URL changed
+// again meanwhile) is dropped. Anything but a JSON `true` reads as not
+// allowed; the install step asks once more, and refuses, before it runs.
 async function refreshFeatures() {
   if (!isUnix() || !state.role || state.role === "tunnel-client") return;
   const server = state.server;
@@ -673,10 +677,10 @@ async function refreshFeatures() {
     view = await invoke("cmd_setup_features", { server });
   } catch (err) {
     console.warn("[features] not read:", err);
-    view = { wizardUnixDaemon: false };
+    view = { daemonOffered: false };
   }
   if (server !== state.server) return;
-  state.features = { server, wizardUnixDaemon: view.wizardUnixDaemon === true };
+  state.features = { server, daemonOffered: view.daemonOffered === true };
   renderServer();
 }
 
@@ -688,7 +692,7 @@ function renderServer() {
   const note = document.getElementById("server-features-note");
   const daemonOnUnix = isUnix() && state.role && state.role !== "tunnel-client";
   const refused = daemonOnUnix && state.features
-    && state.features.server === state.server && !state.features.wizardUnixDaemon;
+    && state.features.server === state.server && !state.features.daemonOffered;
   const unknown = daemonOnUnix && (!state.features || state.features.server !== state.server);
   note.hidden = !refused;
   if (refused) {
