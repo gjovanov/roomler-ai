@@ -63,26 +63,149 @@ const DERP_RX_DEADLINE: Duration = Duration::from_secs(80);
 /// (possibly TLS-wrapped) WebSocket. Best-effort by design: an OS may clamp or
 /// ignore the request, and a carrier that works with a big buffer must not fail
 /// to start because we could not shrink it.
+///
+/// AC4 — so the size is read back, and one line says what the kernel holds. A
+/// set that returns `Ok` proves only that the OS took the call: Linux clamps at
+/// `net.core.wmem_max` without an error, and before Linux 6.18 that defaults to
+/// 212992, below the request.
 fn cap_send_buffer(
     ws: &tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     relay: &str,
-) {
-    use socket2::SockRef;
+) -> SndbufCap {
     use tokio_tungstenite::MaybeTlsStream;
-    let tcp = match ws.get_ref() {
-        MaybeTlsStream::Plain(s) => s,
-        MaybeTlsStream::Rustls(s) => s.get_ref().0,
+    let cap = match ws.get_ref() {
+        MaybeTlsStream::Plain(s) => cap_tcp(s, DERP_SNDBUF_BYTES),
+        MaybeTlsStream::Rustls(s) => cap_tcp(s.get_ref().0, DERP_SNDBUF_BYTES),
         // `MaybeTlsStream` is `#[non_exhaustive]`; an unknown wrapper just
         // keeps the OS default rather than blocking the connection.
-        _ => {
-            debug!(%relay, "overlay derp: unrecognised TLS wrapper — send buffer left at the OS default");
-            return;
-        }
+        _ => SndbufCap::NoSocket,
     };
-    if let Err(e) = SockRef::from(tcp).set_send_buffer_size(DERP_SNDBUF_BYTES) {
-        debug!(%relay, %e, "overlay derp: set_send_buffer_size failed — OS default retained");
+    cap.log(relay, DERP_SNDBUF_BYTES);
+    cap
+}
+
+/// Ask for `requested` on `tcp`, then read back what the kernel holds.
+fn cap_tcp(tcp: &tokio::net::TcpStream, requested: usize) -> SndbufCap {
+    let sock = socket2::SockRef::from(tcp);
+    let set = sock.set_send_buffer_size(requested);
+    SndbufCap::read_back(
+        requested,
+        set,
+        sock.send_buffer_size(),
+        KERNEL_DOUBLES_SNDBUF,
+    )
+}
+
+/// FR-18 AC4 — Linux doubles a `SO_SNDBUF` request for its own bookkeeping,
+/// and `getsockopt` returns the doubled figure (socket(7); `sk_setsockopt` in
+/// `net/core/sock.c`). Windows and macOS return the size in force.
+const KERNEL_DOUBLES_SNDBUF: bool = cfg!(target_os = "linux");
+
+/// FR-18 AC4 — how the cap on one `/derp` socket ended, as
+/// `getsockopt(SO_SNDBUF)` reads it back after the set, in the request's units.
+///
+/// One read, straight after the set, is the size the connection keeps: on all
+/// three OSes the set turns that socket's send-buffer autotuning off (Linux
+/// sets `SOCK_SNDBUF_LOCK`; on Windows, dynamic send buffering "is enabled
+/// unless an application sets the SO_SNDBUF socket option"; XNU clears
+/// `SB_AUTOSIZE`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SndbufCap {
+    /// The kernel holds the size asked for.
+    Applied(usize),
+    /// It holds less, and the set still returned `Ok`: Linux clamps at
+    /// `net.core.wmem_max`, and Winsock "can succeed even if the implementation
+    /// did not provide the whole amount requested". A tighter cap is still a cap.
+    Clamped(usize),
+    /// It holds more than asked: the cap did not take.
+    Exceeded(usize),
+    /// The OS refused the request. It keeps its own size, when that reads back.
+    Refused { kept: Option<usize>, error: String },
+    /// The set took, but the size could not be read back.
+    Unread { error: String },
+    /// No TCP socket under the WebSocket to cap (an unknown TLS wrapper).
+    NoSocket,
+}
+
+impl SndbufCap {
+    /// Judge a set by what `getsockopt` `reported` after it. `doubles`: this
+    /// kernel reports twice the size in force ([`KERNEL_DOUBLES_SNDBUF`]).
+    fn read_back(
+        requested: usize,
+        set: std::io::Result<()>,
+        reported: std::io::Result<usize>,
+        doubles: bool,
+    ) -> Self {
+        use std::cmp::Ordering;
+        let in_force = |r: usize| if doubles { r / 2 } else { r };
+        match (set, reported) {
+            (Err(e), reported) => Self::Refused {
+                kept: reported.ok().map(in_force),
+                error: e.to_string(),
+            },
+            (Ok(()), Err(e)) => Self::Unread {
+                error: e.to_string(),
+            },
+            (Ok(()), Ok(r)) => {
+                let applied = in_force(r);
+                match applied.cmp(&requested) {
+                    Ordering::Equal => Self::Applied(applied),
+                    Ordering::Less => Self::Clamped(applied),
+                    Ordering::Greater => Self::Exceeded(applied),
+                }
+            }
+        }
+    }
+
+    /// The connect's line: INFO while the kernel holds the cap or a tighter
+    /// one, WARN when it does not. Every message opens "overlay derp: send
+    /// buffer", so one grep reads a host's log.
+    fn log(&self, relay: &str, requested: usize) {
+        match self {
+            Self::Applied(applied) => info!(
+                %relay,
+                requested,
+                applied,
+                clamped = false,
+                "overlay derp: send buffer capped — the kernel holds the requested size (FR-18)"
+            ),
+            Self::Clamped(applied) => info!(
+                %relay,
+                requested,
+                applied,
+                clamped = true,
+                "overlay derp: send buffer capped below the request — the OS clamped it \
+                 (FR-18; on Linux, net.core.wmem_max)"
+            ),
+            Self::Exceeded(applied) => warn!(
+                %relay,
+                requested,
+                applied,
+                clamped = false,
+                "overlay derp: send buffer not capped — the kernel holds more than requested (FR-18)"
+            ),
+            Self::Refused { kept, error } => warn!(
+                %relay,
+                requested,
+                applied = *kept,
+                %error,
+                "overlay derp: send buffer cap refused — the OS keeps its own size (FR-18)"
+            ),
+            Self::Unread { error } => warn!(
+                %relay,
+                requested,
+                %error,
+                "overlay derp: send buffer cap set but not read back — the size in force is unknown \
+                 (FR-18)"
+            ),
+            Self::NoSocket => warn!(
+                %relay,
+                requested,
+                "overlay derp: send buffer left at the OS default — unrecognised TLS wrapper (FR-18)"
+            ),
+        }
     }
 }
 
@@ -543,5 +666,202 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         task.abort();
+    }
+
+    /// FR-18 AC4 — a cap is judged by what the kernel reports after the set,
+    /// in the request's units. Linux reports twice the size in force, and
+    /// clamps at `net.core.wmem_max` with no error (212992 before Linux 6.18).
+    #[test]
+    fn a_cap_is_judged_by_what_the_kernel_reports_after_the_set() {
+        let req = DERP_SNDBUF_BYTES;
+        let judge = |reported: usize, doubles: bool| {
+            SndbufCap::read_back(req, Ok(()), Ok(reported), doubles)
+        };
+        // Windows and macOS report the size in force.
+        assert_eq!(judge(req, false), SndbufCap::Applied(req));
+        // Linux: the doubled figure is the request, applied...
+        assert_eq!(judge(2 * req, true), SndbufCap::Applied(req));
+        // ...or the clamp, which the set never mentions.
+        assert_eq!(judge(2 * 212_992, true), SndbufCap::Clamped(212_992));
+        // Winsock may provide less than asked and still return success.
+        assert_eq!(judge(64 * 1024, false), SndbufCap::Clamped(64 * 1024));
+        // On an OS that reports the size in force, Linux's doubled figure would
+        // be a buffer twice the cap.
+        assert_eq!(judge(2 * req, false), SndbufCap::Exceeded(2 * req));
+    }
+
+    /// A refused set and an unreadable size are outcomes of their own, never
+    /// a cap.
+    #[test]
+    fn a_refused_or_unread_cap_is_never_read_as_applied() {
+        let req = DERP_SNDBUF_BYTES;
+        let err = |m: &str| std::io::Error::other(m.to_string());
+        assert_eq!(
+            SndbufCap::read_back(req, Err(err("no buffer space")), Ok(4 << 20), false),
+            SndbufCap::Refused {
+                kept: Some(4 << 20),
+                error: "no buffer space".into()
+            }
+        );
+        assert_eq!(
+            SndbufCap::read_back(req, Err(err("refused")), Err(err("bad fd")), true),
+            SndbufCap::Refused {
+                kept: None,
+                error: "refused".into()
+            }
+        );
+        assert_eq!(
+            SndbufCap::read_back(req, Ok(()), Err(err("bad fd")), true),
+            SndbufCap::Unread {
+                error: "bad fd".into()
+            }
+        );
+    }
+
+    /// A loopback TCP connection: the dialled end and the accepted one.
+    async fn loopback_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (dialled, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        (dialled.unwrap(), accepted.unwrap().0)
+    }
+
+    /// What the kernel under this test should hold after a `requested` cap:
+    /// the request, or on Linux `net.core.wmem_max` where that is lower. `None`
+    /// when the clamp cannot be read: the sysctl lives in the initial network
+    /// namespace only, so a container may not see it.
+    fn this_kernel_holds(requested: usize) -> Option<SndbufCap> {
+        if !cfg!(target_os = "linux") {
+            return Some(SndbufCap::Applied(requested));
+        }
+        let max: usize = std::fs::read_to_string("/proc/sys/net/core/wmem_max")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(if max < requested {
+            SndbufCap::Clamped(max)
+        } else {
+            SndbufCap::Applied(requested)
+        })
+    }
+
+    /// FR-18 AC4 — through a WebSocket like the dialler's, the cap reaches the
+    /// socket under it and reads back as this kernel applies it.
+    #[tokio::test]
+    async fn a_derp_socket_reads_its_cap_back_as_this_kernel_applies_it() {
+        let (dialled, _accepted) = loopback_pair().await;
+        let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            tokio_tungstenite::MaybeTlsStream::Plain(dialled),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let cap = cap_send_buffer(&ws, "test");
+        // The kernel's answer, for a run with `--nocapture` (a container
+        // cannot read its clamp, so this is all it can show).
+        eprintln!("requested {DERP_SNDBUF_BYTES}: {cap:?}");
+        match this_kernel_holds(DERP_SNDBUF_BYTES) {
+            Some(want) => assert_eq!(cap, want),
+            None => assert!(
+                matches!(
+                    cap,
+                    SndbufCap::Applied(DERP_SNDBUF_BYTES) | SndbufCap::Clamped(_)
+                ),
+                "{cap:?}"
+            ),
+        }
+    }
+
+    /// The set turns the socket's send-buffer autotuning off, so the size read
+    /// back at connect is the one the carrier keeps: filling the socket until
+    /// the kernel takes no more leaves it where the cap put it.
+    #[tokio::test]
+    async fn a_full_socket_keeps_the_size_its_cap_read_back() {
+        // The accepted end never reads, so both buffers fill.
+        let (dialled, _accepted) = loopback_pair().await;
+        let capped = cap_tcp(&dialled, DERP_SNDBUF_BYTES);
+        let chunk = vec![0u8; 64 * 1024];
+        let mut sent = 0usize;
+        // Full = not writable for 250 ms.
+        while let Ok(ready) =
+            tokio::time::timeout(Duration::from_millis(250), dialled.writable()).await
+        {
+            ready.unwrap();
+            match dialled.try_write(&chunk) {
+                Ok(n) => sent += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("write failed after {sent} bytes: {e}"),
+            }
+            assert!(sent < 1 << 30, "the socket never filled");
+        }
+        let after = SndbufCap::read_back(
+            DERP_SNDBUF_BYTES,
+            Ok(()),
+            socket2::SockRef::from(&dialled).send_buffer_size(),
+            KERNEL_DOUBLES_SNDBUF,
+        );
+        assert!(sent > 0, "nothing was written");
+        assert_eq!(after, capped, "the cap moved after {sent} bytes");
+    }
+
+    /// What `f` logs, as the daemon's log file writes it.
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, never one (`hive::view`'s tests: with one, a
+        // callsite's interest is taken once for every thread).
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+    }
+
+    /// FR-18 AC4 — the line a field read greps for names the request, what the
+    /// kernel applied and whether it clamped, at INFO. A cap that did not take
+    /// is a WARN.
+    #[test]
+    fn the_cap_line_names_requested_applied_and_clamped() {
+        let line = logged(|| SndbufCap::Clamped(212_992).log("central", DERP_SNDBUF_BYTES));
+        for want in [
+            "INFO",
+            "overlay derp: send buffer capped below the request",
+            "relay=central",
+            "requested=262144",
+            "applied=212992",
+            "clamped=true",
+        ] {
+            assert!(line.contains(want), "{want:?} is not in {line:?}");
+        }
+        let line =
+            logged(|| SndbufCap::Applied(DERP_SNDBUF_BYTES).log("central", DERP_SNDBUF_BYTES));
+        for want in ["INFO", "applied=262144", "clamped=false"] {
+            assert!(line.contains(want), "{want:?} is not in {line:?}");
+        }
+        let line = logged(|| SndbufCap::Exceeded(1 << 20).log("central", DERP_SNDBUF_BYTES));
+        for want in [
+            "WARN",
+            "overlay derp: send buffer not capped",
+            "applied=1048576",
+        ] {
+            assert!(line.contains(want), "{want:?} is not in {line:?}");
+        }
     }
 }
