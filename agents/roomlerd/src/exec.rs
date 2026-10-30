@@ -2553,10 +2553,16 @@ mod tests {
     /// reads it: the command exits and the engine returns.
     #[tokio::test]
     async fn an_open_feed_does_not_hold_up_a_command_that_ignores_it() {
+        // Its own deadline, four times the others': half of 60 s was not
+        // "well before" enough once, when the busy Windows runner took
+        // 35.3 s to start PowerShell and echo (10-29, after #3002).
+        let deadline_ms = 4 * TEST_DEADLINE_MS;
+        let mut request = req(echo_hello());
+        request.timeout_ms = deadline_ms;
         let (_tx, rx) = tokio::sync::mpsc::channel(4);
         let started = std::time::Instant::now();
         let out = engine()
-            .run_fed(req(echo_hello()), &Redactor::default(), Some(rx))
+            .run_fed(request, &Redactor::default(), Some(rx))
             .await;
         assert_eq!(out.error, None, "stderr was: {}", out.stderr);
         assert!(out.stdout.contains("hello"), "stdout was: {:?}", out.stdout);
@@ -2564,7 +2570,7 @@ mod tests {
         // before it is the property. A fixed 8 s was not: on a busy runner,
         // starting PowerShell alone took 8.2–8.4 s (#3002).
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(TEST_DEADLINE_MS / 2),
+            started.elapsed() < std::time::Duration::from_millis(deadline_ms / 2),
             "the engine waited on the feed: {:?}",
             started.elapsed()
         );

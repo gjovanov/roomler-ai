@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 /// `approved → delivered`, and handed to the installer once.
 ///
 /// ⚠️ `expires_at` is the authority on a pairing's life and every reader
-/// compares it to the clock; the TTL index on it only tidies, and the
-/// monitor runs about a minute late.
+/// compares it to the clock; the TTL index on it only tidies. Its monitor
+/// passes every 60 s, so an expired row lingers up to a minute, or goes at once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevicePairing {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
