@@ -2,7 +2,8 @@
 
 **Issue:** [#2090](https://github.com/gjovanov/roomler-ai/issues/2090) · **Status:** proposed 2026-10-13 — spec
 and claim; P1 (C1, the slot-first gate) built behind its switch, field A/B owed; P5 (C6) field-measured
-2026-10-16 and on by default after it (§9) · **Owner:** the agent's capture and encode path, the viewer's input and paint path · **Anchors:**
+2026-10-16 and on by default after it (§9); P0's baseline measured on cells 3 and 4 on 0.4.187 (2026-10-30),
+cells 1 and 2 owed (§9, §4.3) · **Owner:** the agent's capture and encode path, the viewer's input and paint path · **Anchors:**
 master `c689d26a0` · **Program:** [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 1 ·
 **Builds on:** [FR-16](FR-16-rc-quality-benchmark.md) (L0 and L4, the instrument this FR is accepted on),
 [FR-1](FR-1-remote-desktop-drag-smoothness.md), [FR-70](FR-70-media-pipeline-leaves-the-runtime.md),
@@ -114,11 +115,29 @@ that no cut in §4 covers. Each is its own issue, because each is a one-PR fix:
 been checked, and they are the browsers the RTP track mostly serves, because Chrome and Edge take a
 DataChannel cell wherever one exists. A browser without the extension is left with whatever #2284 costs it.
 
+### 4.3 What P0's baseline cells found
+
+The first two baseline cells (§9, 2026-10-30) turned up five things the cut list above did not expect.
+Anchors are against master `787f03200`.
+
+| Finding | Where | Consequence |
+|---|---|---|
+| **L4's target mode cannot see C3 or C4.** A target probe is a `mouse_move` written straight to the input channel, past the coalescer. Probes also go out ~250 ms apart, so even through the coalescer a lone probe would clear the 8 ms gap at once. The cursor poller only sends the viewer cursor shape and position messages; L4 reads a marker in the captured frame, which the poller never touches | `useRemoteControl.ts` L6962 (`sendBenchTargetMove`), L6777 (`schedulePendingMove`); `rcBench.ts` L35; `peer.rs` L10875, L10914 | An L4 A/B of either cut reads "no movement" by construction, and §4's rule would then revert it for the wrong reason. C3 needs a probe inside continuous motion: moves through the coalescer at the pointer's own rate, timing each cell change. C4 needs a probe that times a cursor change. Both are FR-16 instrument work, owed before either A/B (open decision 4) |
+| **C1's switch is environment-only.** `ROOMLERD_CAPTURE_GATE` is read through `node_env` and is not in the config bridge | `capture/gate.rs` L49; `crates/agent-core/src/config.rs` L3311 (`env_fallbacks`) | Its field A/B needs the service's environment, which needs an administrator. On both corporate cells `roomler exec` runs as the signed-in user, who is not one, so AC3's field half could not run there. Bridging the key into `config.toml`, the route the other agent knobs take, would let the A/B run on any host |
+| **The idle keepalive is not near-zero bytes on `av1_qsv`.** The FFmpeg DataChannel pump re-encodes the last frame every 60 ms while nothing new is captured. It does that for two reasons: the browser decoder keeps painting, and a hardware encoder that holds a frame gets drained. Its comment expects ~16 fps of near-zero-byte deltas | `peer.rs` L6559–6569 (`media_pump_ffmpeg_dc`) | On cell 3 the pump encoded ~18.5 frames a second from ~3.8 captured. That came to ~72 KB per encoded frame on average (2.66 MB per 2 s window over 37 encodes, ~29 of them keepalives, at a 34.6 Mbit/s target) and ~10.8 ms of `av1_qsv` for each. A probe frame that lands during a keepalive encode waits for it. **A candidate cut, not on the list yet**: it would have to keep the drain for an encoder that holds a frame (open decision 5) |
+| **On QSV, encode is the direct cell's largest single stage.** `av1_qsv` at 1920×1200 takes 10.8 ms, 27 % of cell 3's p50; `hevc_qsv` on cell 4 takes 7.9 ms | the hosts' pump heartbeats, §9 | C5 covers NVENC presets only. A QSV latency setting is the obvious sibling, unmeasured |
+| **The viewer's Wi-Fi sets the direct cell's tail.** Every cell-3 probe over 80 ms in the clean run fell inside a burst of the viewer's own Wi-Fi. A 10 Hz ping to its gateway shows the bursts every ~33 s, a few seconds each | §9, 2026-10-30 | Outside the bursts, cell 3 reads p95 49 ms against 82–90 ms with them. AC4's p95 bound is partly a property of the viewer's network, so every cell records the viewer's link, and a burst monitor runs beside L4 (`docs/testing.md`) |
+
+**C2's default moved under this spec.** FR-119 P2b-16 ([#2920](https://github.com/gjovanov/roomler-ai/pull/2920))
+changed `ROOMLERD_GPU_CLOCK_PIN`. Unset now pins the graphics and memory clocks while an NVENC session runs
+above 60 fps; `1` pins every session, and `0` never pins (`gpu_clock.rs` L25–28). C2's A/B is therefore the
+60 fps cell with `1` against unset, and §2's "default OFF" row describes the code before that change.
+
 ## 5. Phases
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| P0 | This spec and the claim. The **baseline**: L4 on the cells of §9, recorded before any cut | docs only | this PR |
+| P0 | This spec and the claim. The **baseline**: L4 on the cells of §9, recorded before any cut | docs only | spec and claim merged (#2095). **Baseline measured on cells 3 and 4** on agent and server 0.4.187, 2026-10-30 (§9). Cells 1 and 2 are owed: cell 1 needs a viewer on the MacBook that a bench can drive, and cell 2 needs `probe-target` on macOS (FR-16) |
 | P1 | C1, the slot-first gate | `ROOMLERD_CAPTURE_GATE` unset or `legacy` | **built**: `capture/gate.rs` (the token bucket, unit-tested on synthetic timelines); the WGC backend behind the switch, legacy branch unchanged; L0's `gate_lgcy` / `gate_slot` cells (§9). Field A/B owed |
 | P2 | C2, the GPU clock pin A/B, then the default decision | `ROOMLERD_GPU_CLOCK_PIN=0` | — |
 | P3 | C3 + C4, the input and cursor cadences | `roomler-rc-input-gap` unset (8 ms); `ROOMLERD_CURSOR_POLL_MS` unset (8 ms) | **knobs built**, defaults unchanged: `storedInputGapMs` (0–16 ms, read once per viewer) and `capture::cursor::poll_interval` (2–50 ms, read once per session). The 0/2/4 ms A/B on L4 is owed, and open decision 3 waits on it |
@@ -128,29 +147,41 @@ DataChannel cell wherever one exists. A browser without the extension is left wi
 
 ## 6. Acceptance criteria
 
-- [ ] **AC1:** the P0 baseline exists: L4 p50/p95/p99 on every cell of §9, on the deployed build, before any
-  cut ships. This is the red record every later AC is read against.
+- [~] **AC1:** the P0 baseline exists: L4 p50/p95/p99 on every cell of §9, on the deployed build, before any
+  cut ships. This is the red record every later AC is read against. **Half met, on 0.4.187 (§9, 2026-10-30):**
+  cell 3 (direct, QSV) reads p50/p95/p99 40.0/90.1/149.9 ms over 1558 probes, and cell 4 (relay) reads
+  131.3/206.0/304.5 ms over 1901. C6 had already shipped, but it changes only the RTP fallback track, and
+  neither cell took that track. **Missing:** cell 1 (NVENC, viewed from the MacBook) needs a viewer on the
+  MacBook that a bench can drive. Cell 2 (a VideoToolbox host) has no instrument on a release build, because
+  `probe-target` is Windows-only (`probe_target.rs` L127–132).
 - [ ] **AC2:** each cut C1–C6 has an L4 A/B on the same cells, one switch flipped. A cut that does not move
-  p50 or p95 beyond the cell's run-to-run spread is reverted, and the revert is recorded.
-- [ ] **AC3:** C1 moves L0's capture→decode p50 by at least **a quarter** of a frame period in CI (gate on
+  p50 or p95 beyond the cell's run-to-run spread is reverted, and the revert is recorded. *(2026-10-30: L4's
+  target mode cannot read C3 or C4 as built, so their A/B waits on the instrument, §4.3.)*
+- [~] **AC3:** C1 moves L0's capture→decode p50 by at least **a quarter** of a frame period in CI (gate on
   vs off). It also moves L4 on a direct field pair. *(Amended 2026-10-13, before any measurement: the spec
   first said half a period. A real sleep overshoots, so the legacy wait saws through the period instead of
   locking, and half a period is the expected difference itself, not a bound with room. §4.1 has the
   reasoning.)* L0 measures it on an emulated source at 25 fps, whose 40 ms period is exact, with frames
   landing three quarters of a period ahead of the legacy cadence. Only there can L0 make the legacy gate
-  pay at all (§4.1).
+  pay at all (§4.1). **CI half met** ([#2114](https://github.com/gjovanov/roomler-ai/pull/2114): L0's p50
+  fell 19.9 ms on the CI runner and 22.1 ms on the dev box, against a 10 ms bound). **Missing:** the L4 move
+  on a direct field pair. The switch is environment-only, and neither corporate cell could set it (§4.3).
 - [ ] **AC4:** a direct LAN pair at 60 fps meets the target fixed at P0 (expected: p50 ≤ 50 ms, p95 ≤ 80 ms).
   It is measured by L4, and cross-checked once against a 240 fps camera.
 - [ ] **AC5:** no relay pair regresses: CORPLAP-1 → neo16 L4 p95 and freeze count stay within the baseline's
-  spread, with every cut on.
+  spread, with every cut on. *(The baseline is recorded, §9, 2026-10-30: p95 182.9 and 224.3 ms on two runs,
+  and 2 and 8 arrival gaps over 200 ms. The run with every cut on is owed.)*
 - [x] **AC6:** C6 either closes the "Chrome ~80 ms jitter-buffer floor" Known Issue with an L4 number on
   the `<video>` path, or rewrites it with the measured floor. **Closed, field-checked on agent 0.4.139**
   (§9). On the `<video>` path with no switch set, C6 is negotiated by default. Chrome's buffer reads 0.1 ms,
   and L4 batch p50s read 34–44 ms (median 37), p95 46–61 ms, with 0 of 480 probes lost. On 0.4.138 the same
   path read p50 78–362 ms with C6 off. Without the extension, #2284's fix keeps Chrome's buffer at 7.6 ms
   on average, where it was 193 ms. The Known Issue is gone from `CLAUDE.md`.
-- [ ] **AC7:** **Docs:** `docs/remote-control.md` §12 replaces its target table with the measured budget (a
+- [~] **AC7:** **Docs:** `docs/remote-control.md` §12 replaces its target table with the measured budget (a
   mermaid diagram of the stages and their L4 shares) and each cut's switch. Linked from `docs/README.md`.
+  **Half met (2026-10-30):** §12.0 carries the measured budget of cells 3 and 4, with a mermaid diagram of the
+  stages and their shares, and every cut's switch; `docs/README.md` links it. **Missing:** cells 1 and 2, and
+  each cut's measured effect. The design-target table stays until the NVENC cell replaces its LAN column.
 
 ## 7. Open decisions
 
@@ -161,6 +192,12 @@ DataChannel cell wherever one exists. A browser without the extension is left wi
    `gpu_clock.rs` L21–24), so they keep it off.
 3. **Input gap 0.** One message per `pointerrawupdate` can mean 1 kHz input on a gaming mouse. Recommended:
    measure 0, 2 and 4 ms; ship the smallest gap that does not flood the input DC.
+4. **C3 and C4's instrument** (§4.3). L4's target mode cannot read either cut. Recommended: build a
+   continuous-motion probe (through the coalescer) and a cursor-change probe in FR-16 before either A/B.
+   Until then neither cut can be kept or reverted on L4's evidence, and decision 3 waits too.
+5. **The keepalive candidate** (§4.3). Does a 60 ms keepalive need a full encode on an encoder that holds no
+   frame? Recommended: first add the keepalive bytes per window to the pump heartbeat, then A/B a cadence only
+   where no frame needs draining.
 
 ## 8. Out of scope
 
@@ -175,12 +212,15 @@ DataChannel cell wherever one exists. A browser without the extension is left wi
 
 Planned cells. Each records the deployed build first.
 
-| # | Cell | Pair | Path |
-|---|---|---|---|
-| 1 | direct LAN, NVENC | neo16 → MacBook | direct |
-| 2 | direct LAN, VideoToolbox | MacBook → neo16 | direct |
-| 3 | direct, QSV | neo16 → CORPLAP-3 | direct where the VPN allows, else noted |
-| 4 | relay, the no-regression cell | CORPLAP-1 → neo16 | structural relay |
+| # | Cell | Pair | Host (its encoder) | Viewer | Path | Baseline |
+|---|---|---|---|---|---|---|
+| 1 | direct LAN, NVENC | neo16 → MacBook | neo16 (NVENC) | MacBook | direct | owed: no viewer on the MacBook that a bench can drive |
+| 2 | direct LAN, VideoToolbox | MacBook → neo16 | MacBook (VideoToolbox) | neo16 | direct | owed: `probe-target` is Windows-only |
+| 3 | direct, QSV | neo16 → CORPLAP-3 | CORPLAP-3 (QSV) | neo16 | direct where the VPN allows, else noted | 2026-10-30, 0.4.187 |
+| 4 | relay, the no-regression cell | CORPLAP-1 → neo16 | CORPLAP-1 (QSV) | neo16 | structural relay; forced from the viewer when the VPN is down | 2026-10-30, 0.4.187 |
+
+The pair's arrow points both ways across the table: cell 1's runs host → viewer, cell 3's viewer → host. The
+host is the machine whose encoder the cell names.
 
 | # | Date | Build | Result |
 |---|---|---|---|
@@ -198,6 +238,10 @@ Planned cells. Each records the deployed build first.
 | L0 | 2026-10-16 | the same | **Negative control, red:** the pump's old write put back (one marked line: advance after the frame, by the gap before it) failed `cadence: … p50 158.8 ms, p95 176.5 ms (want … ≤ 10 ms and ≤ 40 ms)` (exit 101). At a fixed rate the old write hides: `clean` read p50 4.1 ms. Restored from the commit; the diff was that one line |
 | R | 2026-10-16 | **Release build, field.** Agent **0.4.139** (MSI, service) on a kept vmtest Win11 guest (KVM, 1280×800, Microsoft Basic Render Driver only), **no `ROOMLERD_*` switch set**. P5's harness: the production viewer in headless Chromium on a LAN neighbour, forced onto the RTP track, with L4 in target mode against `roomlerd probe-target` | **The defaults, green: C6 and #2283 together.** The agent's log: the MF pipeline ended on `backend="sw-pure"`, then "ended on Microsoft's software MFT with no GPU behind it - using openh264 instead (#2283)", then `encoder selected: openh264 (software)`. Every session logged `rtp playout-delay 0/0 offered on the video track (FR-98 C6)`, and the remote description carried the extension. Chrome's jitter buffer: **0.1 ms** (twelve 10 s windows, 0.1–0.2). L4 batch p50s **34.2–43.8 ms** (median 37.2), p95 46.0–60.7 ms, **0 of 480** lost. P5's Auto pair on 0.4.138, on the same kind of guest, read batch-p50 medians of 836–859 ms, with 25–28 % of probes unanswered |
 | R | 2026-10-16 | the same guest, `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO=0` (and a restart) | **#2284, green: the track's timestamps.** The extension is not negotiated, so Chrome's jitter buffer runs on its own estimate. **7.6 ms** on average (median window 2.4 ms, 0.1–32.7). L4 batch p50s 46.0–73.5 ms (median 51.7), p95 66–222 ms, 1 of 480 lost. The red is P5's off cell on 0.4.138 with the same encoder: 193 ms on average, growing from 46 to 326, and L4 p50s 78–362 ms (median 203). So the off-by-one, not the browser, was most of Chrome's hold, and a browser that never offers `playout-delay` now gets a few ms of it |
+| P0 | 2026-10-30 | **Release build, field: cell 3.** Agent **0.4.187** (attended install) on CORPLAP-3: Intel QSV, 1920×1200 at 60 Hz, its corporate VPN client up. Server and viewer **0.4.187** (`index-Q-z97m5u.js`) in Chrome 156 on neo16, on the viewer's stored settings (priority `sharper`, the default). Display match was off for this device: on, it switches the host to a mode that fits the viewer and moves the window out of the corner. No `ROOMLERD_*` switch set. `roomlerd probe-target` started in the signed-in session through `roomler exec`, which runs as the signed-in user on this install. Auto took `data-channel-av1` on `av1_qsv`: 60 fps, not constrained. ICE host ↔ host on one Wi-Fi LAN, RTT 3 ms | **The direct QSV baseline.** Two clean runs, **1558 probes, 0 lost: p50 40.0 ms, p95 90.1, p99 149.9** (runs: p50 39.2 and 40.8, p95 90.1 and 82.4, p99 152.9 and 148.8; batch p50s 35.5–50.3, median 39.8). The host's heartbeat medians: capture 1.0 ms, encode 10.8 ms, enqueue → paint 10 ms (transit 9, viewer 1). That leaves ~19 ms up to the encoder's input: the input leg, injection, the window's own paint, the compositor and the capture gate. **The tail is the viewer's Wi-Fi.** A 10 Hz ping from neo16 to its gateway, run beside L4, shows bursts up to 120–160 ms about every 33 s, a few seconds each, and in run 3 all 43 probes over 80 ms fell inside them. Outside the bursts, 618 probes read **p50 40.1, p95 49.1, p99 55.9**. The host saw the same from its side: its paint-age spikes (10 → 40–54 ms) were all transit, 33–35 s apart, while CORPLAP-3's own 10 Hz ping to the gateway stayed clean (p95 3 ms, max 33). No keyframe recoveries |
+| P0 | 2026-10-30 | the same | **Wrong turn, recorded.** Four of a second run's batches came at one probe a second. The automation-driven tab went `hidden` about 20 s after the last call into it, and stayed hidden until the next one. Chrome then fired the page's timers once a second: a 250 ms timer chain in the page read 1000 ms gaps. The prober is a timer chain, so it probed at 1 Hz, and those batches read 3–8 ms higher at p50. The run is excluded. The two clean runs kept calls going into the page and carried a timer-gap monitor (largest gap 265 ms); `docs/testing.md` now says how |
+| P0 | 2026-10-30 | the same build. Cell 4 on CORPLAP-1: Intel Iris Xe, 1920×1200 at 60 Hz. Its corporate VPN was down, so the pair would have gone direct. The viewer forced a relay instead (`iceTransportPolicy: "relay"`, loopback relays removed): browser relay (coturn, UDP) ↔ host srflx, RTT 80 ms. Auto took `data-channel-hevc` on `hevc_qsv`: 30 fps, constrained, 3 Mbit/s | **The relay baseline, AC5's reference.** Two runs, **1901 probes, 4 lost: p50 131.3 ms, p95 206.0, p99 304.5** (runs: p50 131.0 and 131.6, p95 182.9 and 224.3, p99 283.2 and 318.0; batch p50s 126.8–159.2, median 131.2). Outside the viewer's Wi-Fi bursts: p50 130.0 and 130.4, p95 144.2 and 149.2. Heartbeat medians: capture 4.8 ms, encode 7.9 ms, enqueue → paint 45 ms (transit 44). The freeze proxy, the viewer's arrival gaps over 200 ms on 50 ms sampling, read 2 in 181 s, then 8 in 247 s, one of those 8 a 0.4 s stall of the page's own main thread. Keyframe recoveries: none, then 4. Run 2's lost probes are one loss episode at 02:20:22Z: three IDRs in 4 s while the rate fell 3.0 → 2.17 Mbit/s, back at 3.0 within 27 s. Two of run 1's batches overlapped a hidden stretch and are excluded |
+| P0 | 2026-10-30 | — | **Cells 1 and 2 not measured.** Cell 1 (NVENC on neo16, viewed from the MacBook) needs a viewer on the MacBook that a bench can drive; the automation extension reached only Windows browsers that night. Cell 2 (VideoToolbox on the MacBook) has no instrument on a release build: `probe-target` is Windows-only (`probe_target.rs` L127–132), and a synthetic-source build is not the deployed one |
 
 ## 10. Related
 
