@@ -16,11 +16,16 @@ So the map catches the machines you know about, and this catches the class.
 When it fires, the fix is: add the real name to the map (which lives outside
 the repo), re-run the sweep, and let this go green -- never add the real name
 to the allowlist below.
+
+With `--staged --map <map>` it also refuses the map's own names wherever the
+commit ADDS one, on a machine that has the map. That is the pre-commit hook's
+mode; see the map gate below.
 """
 
 from __future__ import annotations
 
 import argparse
+import codecs
 import os
 import subprocess
 import re
@@ -28,7 +33,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sanitize import SKIP_DIRS, SKIP_SUFFIXES, read_text, walk  # noqa: E402
+from sanitize import (SKIP_DIRS, SKIP_SUFFIXES, build_regex, load_map,  # noqa: E402
+                      read_text, walk)
 
 # Exit codes. These are a CONTRACT with .githooks/pre-commit, which blocks a
 # commit on EXIT_FOUND and on nothing else.
@@ -222,28 +228,172 @@ def scan(root: Path, staged=False):
     return findings
 
 
+# ── The map gate (--staged --map) ────────────────────────────────────────────
+#
+# A name with no shape -- a personal laptop called after its owner -- passed
+# every automatic layer until 2026-10-30: this guard, CI and the hook. Only the
+# hand-run, map-driven sweep found one, after someone added it to the map, and
+# the price was the fifth whole-history rewrite. So on a machine that HAS the
+# map, the hook hands it over and the names the sweep would rewrite are refused
+# at the commit. The map never enters the repo; CI has none and runs unchanged.
+#
+# ⚠️ ADDED lines and NEW paths only, never the whole staged blob. A name already
+# in the tree is the sweep's to rewrite. Judging whole blobs would refuse every
+# commit that merely touches such a file -- every file holding a name, from the
+# moment the name joins the map until the sweep has run -- and a gate that
+# refuses work nobody did is one people skip with --no-verify.
+#
+# ⚠️ The matcher is the sweep's own, imported: load_map(), build_regex(re.I) and
+# the residual scan's two exemptions. A gate that disagreed with the sweep would
+# refuse what it leaves alone, or pass what it rewrites.
+#
+# ⚠️⚠️ A mapped name is NEVER printed, only the alias the map gives it, and every
+# path and shape token printed beside it goes through the map too. This output
+# lands in terminals and agent transcripts, and from there in PR bodies and
+# comments -- which is how names reached GitHub's edit history.
+HUNK = re.compile(r"@@ -[0-9]+(?:,([0-9]+))? \+([0-9]+)(?:,([0-9]+))? @@")
+
+
+class MapUnreadable(Exception):
+    """load_map() refused the map."""
+
+
+class MapGate:
+    def __init__(self, path):
+        try:
+            self.pairs, self.keep = load_map(Path(path))
+        except SystemExit:
+            # load_map() refuses a malformed map with sys.exit(<message>). That
+            # message quotes the offending line, which may BE a real name, and it
+            # exits 1 -- the hook's "names found". Neither may get out.
+            raise MapUnreadable() from None
+        self.safe = {v.lower() for _, v in self.pairs}
+        # An empty alternation matches the empty string at every offset.
+        self.rx = build_regex(self.pairs, re.I) if self.pairs else None
+        self.alias = {}
+        for real, repl in self.pairs:
+            self.alias.setdefault(real.lower(), repl)
+
+    def _mapped(self, hit):
+        return hit.lower() not in self.safe and hit not in self.keep
+
+    def hits(self, text):
+        """The alias of every mapped name in `text`."""
+        if self.rx is None:
+            return
+        for m in self.rx.finditer(text):
+            if self._mapped(m.group(0)):
+                yield self.alias.get(m.group(0).lower(), "?")
+
+    def redact(self, text):
+        """`text` with every mapped name replaced by `<alias>`, fit to print."""
+        if self.rx is None:
+            return text
+        return self.rx.sub(
+            lambda m: ("<%s>" % self.alias.get(m.group(0).lower(), "?")
+                       if self._mapped(m.group(0)) else m.group(0)), text)
+
+
+def git_text(root, *args):
+    return subprocess.run(
+        ["git", "-C", str(root), "-c", "core.quotePath=false", *args],
+        capture_output=True, check=True).stdout.decode("utf-8", "replace")
+
+
+def unquote(path):
+    """git C-quotes a path that holds a quote, a backslash or a control
+    character, core.quotePath=false notwithstanding."""
+    if len(path) >= 2 and path[0] == path[-1] == '"':
+        raw = codecs.escape_decode(path[1:-1].encode("utf-8"))[0]
+        return raw.decode("utf-8", "replace")
+    return path
+
+
+def staged_additions(root):
+    """(path, line-or-"name", text) for what the commit ADDS: the name of each
+    new path, and each added line of each text file, numbered as committed."""
+    for name in git_text(root, "diff", "--cached", "--name-only",
+                         "--diff-filter=ACR", "-z").split("\0"):
+        if name:
+            yield name, "name", name
+    diff = git_text(root, "diff", "--cached", "-U0", "--no-color", "--no-ext-diff",
+                    "--no-textconv", "--diff-filter=ACMR",
+                    "--src-prefix=a/", "--dst-prefix=b/")
+    path, line_no, old_left, new_left = None, 0, 0, 0
+    for line in diff.split("\n"):
+        if old_left > 0 or new_left > 0:
+            # Inside a hunk the counts decide what a line is. An added line can
+            # itself begin `++ ` or `@@ ` -- a diff quoted in a doc -- and read as
+            # a header it would move every later finding to the wrong file.
+            if line.startswith("+"):
+                if path is not None:
+                    yield path, line_no, line[1:]
+                line_no += 1
+                new_left -= 1
+            elif line.startswith("-"):
+                old_left -= 1
+            continue
+        if line.startswith("diff --git "):
+            path = None
+        elif line.startswith("+++ "):
+            dst = unquote(line[4:])
+            path = dst[2:] if dst.startswith("b/") else None
+            if path is not None and Path(path).suffix.lower() in SKIP_SUFFIXES:
+                path = None   # its NAME was judged above, as scan() does
+        else:
+            m = HUNK.match(line)
+            if m:
+                old_left = int(m.group(1)) if m.group(1) is not None else 1
+                line_no = int(m.group(2))
+                new_left = int(m.group(3)) if m.group(3) is not None else 1
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", type=Path, default=Path("."))
     ap.add_argument("--staged", action="store_true",
                     help="check the staged blobs only (for a pre-commit hook)")
+    ap.add_argument("--map", type=Path, metavar="MAP",
+                    help="with --staged: also refuse every name in this sanitize "
+                         "map that the commit adds (printed as its alias only)")
     args = ap.parse_args()
+    if args.map is not None and not args.staged:
+        ap.error("--map needs --staged")
+
+    gate = None
+    if args.map is not None:
+        try:
+            gate = MapGate(args.map)
+        except MapUnreadable:
+            print("machine-name guard could not run: the sanitize map %s is "
+                  "malformed; `sanitize.py --map <map> --check` names the line"
+                  % args.map, file=sys.stderr)
+            return EXIT_ERROR
 
     findings = scan(args.root, staged=args.staged)
-    if not findings:
+    mapped = []
+    if gate is not None:
+        for path, where, text in staged_additions(args.root):
+            for alias in gate.hits(text):
+                mapped.append((gate.redact(path), where, alias))
+    if not findings and not mapped:
         print("machine-name shapes: none found")
+        if gate is not None:
+            print("sanitize map: no mapped name added")
         return EXIT_CLEAN
 
-    seen = set()
-    print("Real machine names look like they are committed here:\n")
-    for path, line, tok, why in findings:
-        print("  %s:%s  %s" % (path, line, tok))
-        if tok not in seen:
-            seen.add(tok)
-    print("\n%d occurrence(s), %d distinct name(s): %s"
-          % (len(findings), len(seen), ", ".join(sorted(seen))))
-    print("""
+    show = gate.redact if gate is not None else (lambda s: s)
+    if findings:
+        seen = set()
+        print("Real machine names look like they are committed here:\n")
+        for path, line, tok, why in findings:
+            print("  %s:%s  %s" % (show(path), line, show(tok)))
+            if show(tok) not in seen:
+                seen.add(show(tok))
+        print("\n%d occurrence(s), %d distinct name(s): %s"
+              % (len(findings), len(seen), ", ".join(sorted(seen))))
+        print("""
 Fix: add each real name to the sanitisation map -- which lives OUTSIDE this
 repo, because it is the one place a real name and its replacement sit side by
 side -- then re-run the sweep:
@@ -252,6 +402,19 @@ side -- then re-run the sweep:
         --map <path-to-map> --root . --apply
 
 Do NOT add a real machine name to this file's allowlist. See SKILL.md.""")
+    if mapped:
+        aliases = sorted({alias for _, _, alias in mapped})
+        print("%sNames from the sanitize map are ADDED here, each shown by its "
+              "alias:\n" % ("\n" if findings else ""))
+        for path, where, alias in mapped:
+            print("  %s:%s  -> %s" % (path, where, alias))
+        print("\n%d addition(s), %d mapped name(s): %s"
+              % (len(mapped), len(aliases), ", ".join(aliases)))
+        print("""
+Fix: write the alias in place of the name, then re-stage. A name that lands in
+a commit costs a whole-history rewrite, and GitHub keeps it reachable through
+refs/pull and in edit history until Support purges it. A spelling that is not
+the machine at all gets a `!keep` line in the map, never --no-verify.""")
     return EXIT_FOUND
 
 
