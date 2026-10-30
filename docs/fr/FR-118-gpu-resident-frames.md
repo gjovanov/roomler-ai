@@ -102,7 +102,7 @@ only when it asks:
 |---|---|---|
 | the pump's CPU resample | `encode/resample.rs:461`, `:463` | `cpu()`; on the GPU path the scale happens on the GPU first (§4.3), so it passes through |
 | `FfmpegEncoder::convert_into` | `encode/ffmpeg/encoder.rs:1960` | takes the GPU surface instead, on a GPU cell |
-| libvpx (VP9 4:4:4), openh264, Media Foundation | `encode/libvpx.rs`, `encode/openh264_backend.rs:455`, `encode/mf/sync_pipeline.rs:313` | `cpu()`, unchanged |
+| libvpx (VP9 4:4:4), openh264, Media Foundation | `encode/libvpx.rs`, `encode/openh264_backend.rs:466`, `encode/mf/sync_pipeline.rs:331` | `cpu()`, unchanged |
 | the idle detector's hash | `session_idle.rs:218` | `cpu()`; it samples a few rows, and the cost is measured in P2 |
 | the recorder and its pointer | `recording/recorder.rs`, `recording/pointer.rs` | `cpu()`, unchanged |
 
@@ -208,12 +208,12 @@ flowchart LR
 |---|---|---|---|
 | P0 | **The split.** `encode_sync`'s five steps timed apart: `avg_convert_ms`, `avg_upload_ms`, `avg_submit_ms`, `avg_drain_ms` on the FFmpeg DC heartbeat, plus `avg_readback_ms` from the capture thread: WGC's (P0), then the SystemContext DXGI arm's (P0b). Then a fleet read, per encoder × geometry | none: telemetry, a handful of `Instant` pairs per frame, no knobs read in the frame path | **built** (§5.1): P0 shipped in 0.4.150, P0b in 0.4.181. The fleet read is AC1, done 2026-10-28 (§9.5) |
 | P1 | **C0, the contract.** `FrameData` + `Frame::cpu()`. Only `Cpu` is produced | none: no behaviour change, byte-identical by test | **built** (§5.2) |
-| P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `zero_copy` / `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3), **P2-2 built** (§5.4), **P2-3 built** (§5.5); released in 0.4.181, first field run 2026-10-28 (§9.2) |
+| P2 | **Windows, the SystemContext DXGI arm → QSV, the first cell.** Every QSV host in the fleet captures through this arm, none through WGC (§9, 2026-10-27). The GPU scale + NV12 conversion, `HwKind::D3d11va` on the capture device, the adapter rule, the probe's GPU-input open, the session's `input_path` and reason, and the encoder following the capture device across a rebuild (§4.3). In three steps: **P2-1** the GPU frame, read back by every consumer; **P2-2** QSV takes it; **P2-3** the probe's GPU-input open | `zero_copy` / `ROOMLERD_ZERO_COPY` (default OFF) + `zero_copy_deny` | **P2-1 built** (§5.3), **P2-2 built** (§5.4), **P2-3 built** (§5.5); released in 0.4.181, first field run 2026-10-28 (§9.2). On §2.2's 2880×1800 laptop, 2026-10-30 (§9.10, AC4): the encoded rate rises from 38 fps to its 60 fps target |
 | P3 | The WGC arm, and NVENC and AMF on D3D11 frames; open decision 1 measured on a hybrid laptop | the same | **open decision 1 measured 2026-10-28** (§9.4): WGC's device goes on the encoder's adapter. **The WGC arm + NVENC built 2026-10-28** (§5.6), released in 0.4.183 the same day. First field contact the same evening (§9.6): neo16 captures through the DXGI arm in SystemContext. **Field-verified 2026-10-29** (§9.7), on neo16 with its SystemContext swap off for the run: WGC + `av1_nvenc` at 2560×1600, readback + encode 18.26 → 5.14 and 5.23 ms a frame, the worker's CPU 9.64 → 3.18 and 3.09 ms an encoded frame. The heartbeat's reason after an adoption (#3071) fixed 2026-10-29 (§5.7), field-verified on 0.4.186 the same day (§9.8, AC5). AMF not built: the measurement found no need for it |
 | P4 | Folded into P2 on 2026-10-27: it was the DXGI arm, which is where the first cell's hosts capture | — | → P2 |
 | P5 | macOS: IOSurface → VideoToolbox | the same; on a supervised Mac the root's values reach the GUI worker | **built 2026-10-29** (§5.8), chosen by open decision 6 the same day: VideoToolbox's CPU conversion is 70–87 % of its encode stage (§9.5). The display stream's IOSurface reaches `hevc_videotoolbox` and `h264_videotoolbox` as a CVPixelBuffer over the same memory, marked BT.601, because VideoToolbox converts an unmarked buffer with BT.709. Released in 0.4.187 and field-verified the same day on the MacBook (§9.9): the encode stage 4.18 → 0.12 ms a frame, the worker's CPU 14.58 → 2.55 and 2.60 ms an encoded frame, the frame rate unchanged |
 | P6 | Linux: the DRM arm's dma-buf → VAAPI | the same | **deferred** (open decision 6, 2026-10-29): VAAPI's conversion and upload are 1.2 ms of a 4.1 ms stage, on the one 1600×900 virtual desktop that runs it (§9.5) |
-| P7 | Docs and the final field table | — | **P2's half written** (2026-10-28): `docs/encoders.md` § GPU-resident frames and its two configuration rows, `docs/remote-control.md` §5.1f, and both index rows; each later cell adds its own. **P5's half written** 2026-10-29: the VideoToolbox rows in both docs |
+| P7 | Docs and the final field table | — | **P2's half written** (2026-10-28): `docs/encoders.md` § GPU-resident frames and its two configuration rows, `docs/remote-control.md` §5.1f, and both index rows; each later cell adds its own. **P5's half written** 2026-10-29: the VideoToolbox rows in both docs. **AC4's rows written** 2026-10-30: the 2880×1800 laptop's table in `docs/remote-control.md` §5.1f and its bullet in `docs/encoders.md` |
 
 P0 decides the rest. If convert + copy + upload turn out to be a small share of the encode stage on a backend,
 that backend's phase is not built, and the reason is recorded here.
@@ -644,12 +644,17 @@ flowchart LR
   at 60 fps. Capture + encode 14.70 → 12.30 / 12.33 ms; the worker's CPU 15.9 → 10.6 / 10.9 ms per encoded frame
   at the same bytes; no decode error; resyncs at the same rate with the switch on and off (2 in 36 min, 1 in
   19), one swap episode per leg on both paths; every patch of the pattern identical on both paths.
-- [ ] **AC4 — the slow laptop.** A host at ≥ 2560×1600 on QSV reaches a peak of **≥ 50 fps** with the switch on;
+- [x] **AC4 — the slow laptop.** A host at ≥ 2560×1600 on QSV reaches a peak of **≥ 50 fps** with the switch on;
   §2.2's 2880×1800 laptop peaked at 29.4 over 590 windows. If P0 shows the hardware encode itself is the bound
   there, this AC records the measured bound instead, and why. *(The first field host is 1920×1200, so it cannot
   answer this; §2.2's host is not available for test sessions.)* *(2026-10-29, open decision 7: the run goes on
   §2.2's laptop after all, in a window its owner agrees to. It is switch-on and switch-off legs like AC3's, and its
   red record is §9.5: an encode stage of 19.1 ms, 16.4 ms of it in `send_frame`, and a 7.3 ms readback.)*
+  **Met 2026-10-30** (§9.10): §2.2's laptop, `av1_qsv` at 2880×1800 on the DXGI arm, AC3's test pattern with
+  60 fps asked. With the switch on, 594 of the 596 windows of a 20-minute leg reached 50 fps (median 60.0, the
+  target; the other two are the viewer stalling in the leg's last 4 s); with it off, none of 564 did (highest
+  42.8). Capture + encode 25.12 and 25.88 → 16.61 ms; the worker's CPU 15.93 → 3.88 ms an encoded frame. What
+  bounds the rate now is the encode itself: `send_frame` takes about 16 ms a frame on both paths.
 - [x] **AC5 — the adapter rule.** A host whose capture and encoder adapters differ never takes the GPU path:
   unit-tested on the rule, and seen on one hybrid host in the field as `input_path=cpu reason=adapter_mismatch`.
   *(The first field host captures on its Intel adapter, so it has no mismatch to show. P3 adds NVENC's half of the
@@ -773,6 +778,7 @@ flowchart LR
 | 2026-10-29 | agent 0.4.186, neo16 back on SystemContext with `zero_copy` on: the DXGI arm on the Radeon 610M, `av1_nvenc` on the RTX 5090; a local-pair session at 10:17Z | **AC5's field half** (§9.8). The session repeated §9.6: the refusal (`adapter_mismatch`), the follow's reopen, FR-119's replacement adopted. Every heartbeat read `input_reason=adapter_mismatch`, against `cpu_frames` on 0.4.183. #3071's fix (§5.7) held in the field |
 | 2026-10-29 | the P5 branch on the MacBook (Apple M5 Pro, macOS 27.0.1): `h264_videotoolbox` at 480×270, 20 frames per form, decoded by FFmpeg 9.0.1's H.264 decoder | **VideoToolbox's colour on the GPU form, measured for P5** (§5.8). Eight flat bars (black, white, grey, and 75 % red, green, blue, yellow, cyan) encoded by the CPU form and the GPU form, decoded, and compared per plane over a block inside each bar. An unmarked BGRA buffer converts with BT.709: worst plane 21 code values (75 % green Y 133 against 112). The session's `colorspace` / `color_range` tag the stream (`SMPTE170M`, limited range) and still convert with BT.709: worst 21. The BT.601 matrix attached to each buffer: worst 2.0 (75 % green U 74 against 72; white Y 234 against 235). A lab measurement, not field verification |
 | 2026-10-29 | agent 0.4.187, the MacBook (Apple M5 Pro, macOS 27.0.1, a supervised two-half Mac): the scrap arm's display stream at 3024×1964, `hevc_videotoolbox`, 120 fps asked; Chrome on neo16 over a direct path, hardware decode; AC3's test pattern full screen in Safari | **AC7's VideoToolbox cell, like AC3** (§9.9): 20-minute legs on, off, on. The encode stage 4.18 → 0.12 and 0.12 ms a frame (the conversion 3.27 → 0.04 and 0.03 ms); the worker's CPU 14.58 → 2.55 and 2.60 ms an encoded frame, 126 % → 22 % and 23 % of a core; the frame rate the same on both paths (median 87.8, 87.8, 88.0 fps); no decode error; keyframes 9, 11 and 5, no rise with the switch on; the pattern within 2 code values of the CPU path and identical on both legs with the switch on |
+| 2026-10-29 and 2026-10-30 | agent 0.4.187, §2.2's laptop (Windows 11 Home, Intel graphics, a 2880×1800 panel at 60 Hz): the SystemContext DXGI arm, `av1_qsv` at 2880×1800, 60 fps asked; Chrome on neo16 over a direct path; AC3's test pattern full screen | **AC4, the slow laptop** (§9.10): two legs with the switch off, then a 20-minute leg with it on. The encoded rate rises from 38 to the 60 fps target: 594 of the on leg's 596 windows at ≥ 50 fps (the other two are a viewer stall), none of 564 with the switch off (highest 42.8). Capture + encode 25.12 and 25.88 → 16.61 ms, because the 7.9 ms readback the pump waited for is gone. The worker's CPU 15.93 → 3.88 ms an encoded frame. `send_frame` takes about 16 ms a frame on both paths: the hardware encode is now what bounds the rate. **AC4 met** |
 
 ### 9.1 The interim split (2026-10-27)
 
@@ -1187,6 +1193,62 @@ the frames encoded in between.
 
 **AC7's VideoToolbox cell: verified like AC3.** The Mac is back as it was: `zero_copy` cleared at 22:00Z, so the
 built-in default (off) applies.
+
+### 9.10 AC4: the slow laptop at 60 fps (2026-10-30)
+
+§2.2's laptop is a person's own machine, and the legs ran in windows its owner agreed to (open decision 7): the first
+switch-off leg on the evening of 2026-10-29, the rest after midnight. Windows 11 Home, Intel graphics driving a
+2880×1800 panel at 60 Hz, agent 0.4.187. The service runs a SystemContext worker, so the capture is the DXGI arm, with
+`av1_qsv` on the same adapter. The viewer was Chrome on neo16 at the original resolution with 60 fps asked, over a
+direct path. The content was AC3's test pattern, full screen in a separate Chrome app window that a scheduled task
+started in the signed-in user's session; it was the top window at every check. The switch was flipped with
+`roomler config set zero_copy` and `roomler restart`. Stage times are medians of the 2-second heartbeats. Worker CPU is
+`Get-Process` on the session's worker at each end of a leg, over the frames encoded in between. Times are the laptop's
+own clock, which ran about 50 s ahead of UTC.
+
+| Leg | Switch | Input | Heartbeats | Encoded fps: median / p99 / max | Windows ≥ 50 fps | Capture | Readback | Encode | Convert | `send_frame` | Capture + encode | Worker CPU (per encoded frame) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| OFF1 10-29 22:06:29–22:13:20 | off | `cpu`, `switch_off` | 205 | 38.6 / 40.2 / 42.8 | 0 | 8.16 | 7.92 | 17.23 | 0.74 | 16.38 | 25.12 | 58 % of a core (15.93 ms) |
+| OFF2 10-30 00:07:44–00:19:45 | off | `cpu`, `switch_off` | 359 | 37.6 / 39.0 / 40.0 | 0 | 8.14 | 7.91 | 17.74 | 0.67 | 16.95 | 25.88 | not read |
+| ON 10-30 00:50:55–01:10:54 | on | `gpu` | 596 | 60.0 / 60.1 / 60.3 | 594 | 0.26 | 0 | 16.34 | 0.20 | 16.04 | 16.61 | 23 % (3.88 ms) |
+
+- **The switch takes the encoded rate from 38 fps to the 60 fps target.** With it on, 594 of the leg's 596 windows
+  reached 50 fps, with a median of 60.0. The other two are the leg's last 4 s, when the viewer stalled again (below).
+  With it off, none did: 0 of 564, the highest 42.8. §2.2's week peaked at 29.4 on `hevc_qsv`. This host now
+  encodes AV1, and with the switch off it peaks at 40–43.
+- **The readback was in series with the encode.** The DXGI arm copies and maps each frame on its capture thread
+  while the pump waits (§3). With the switch off a frame took 8.2 ms of capture, 7.9 of it the readback, and then
+  17.2–17.7 ms of encode: 25.1–25.9 ms, a ceiling of about 40 fps. With it on, capture is 0.26 ms and the CPU's
+  share of the conversion 0.20 ms, so a frame takes 16.61 ms, the frame period at 60 fps.
+- **The hardware encode is the next bound.** `send_frame` takes 16.0–17.0 ms on both paths (16.38 and 16.95 with
+  the switch off, 16.04 with it on). At 2880×1800, `av1_qsv` on this GPU needs about one 60 fps period per frame,
+  which caps the encoder alone at about 62 fps. The GPU input took out everything else, so above 60 fps (FR-119) this
+  host is held by the encode, not by copies. Unlike AC3's host (§9.3), `send_frame` did not grow with the switch on.
+- **The worker's CPU per encoded frame falls by 76 %**, 15.93 → 3.88 ms: from 58 % of a core encoding 38 fps to 23 %
+  encoding 60.
+- **The bitrate does not move the encode.** In the leg, an AIMD decrease at 00:57:04 cut the target from 48 M to
+  4.0 M, with no report from the viewer, and the climb back reached 48 M at 00:59:16. The encode stage read 16.35 ms
+  at 48 M (00:52–00:57) and 16.34 ms at 4 M (00:57–00:58), at 60 fps in both. So the swings do not explain the
+  difference from the switch-off legs, which ran at 48 M flat.
+- **Keyframes: 22 in the leg.** 11 are the bitrate swaps, one each: QSV reopens to change its rate, and a
+  replacement starts on an IDR. The other 11 came with no swap, 3 at 01:04:21–25 and 8 at 01:10:41–54, the last
+  running into the viewer's second stall. Keyframes with no swap come with the switch off too: 5 in OFF2's 12 minutes.
+- **The viewer stalled twice: before the leg, and in its last 4 s.** At 00:49:11–00:50:50 the viewer reported it
+  was struggling, with frames up to 7 s old and 829 skipped at decode. The pump capped the rate at 12–43 fps, and the
+  bitrate fell to 3.4 M. It recovered without a reconnect. The same viewer's session minutes before the restart,
+  with the switch off, had a drop of the same kind (37 → 5.5 M). The leg is read from 00:50:55, once the rate was
+  back at 60. The second stall began at 01:10:51 with the same signature, the rate capped at 12 fps, and lasted
+  until 01:11:39, past the leg's end. Those are its two windows under 50 fps (49.1 and 12.7).
+- **Decode errors: none seen.** The session stayed on the DC path for the whole leg, and a decode error tears it
+  down (§9.3). The viewer's console was not read for the on leg: the browser extension that reads it was down that
+  night.
+- **Colour.** OFF1's read: all 13 patches (16×16 means, three reads 2 s apart, spread 0), the grey steps exact (0,
+  64, 128, 192, 255), the bars desaturated as on every host (#3049). The ON leg's canvas could not be sampled, for
+  the same reason as the console. The GPU conversion here is the VideoProcessor pass at BT.601 that AC3 measured on
+  the same arm with `av1_qsv`, where every patch decoded identically on both paths (§9.3).
+
+**AC4 met.** The laptop is back as it was: `zero_copy` cleared, so the built-in default (off) applies, and the
+pattern's window, task and files are gone.
 
 ## 10. Related
 

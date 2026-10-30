@@ -22,7 +22,8 @@ use windows::Win32::Media::MediaFoundation::{
     IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MF_E_NOTACCEPTING,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MFCreateMediaType, MFCreateMemoryBuffer,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE,
+    MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MFCreateMediaType, MFCreateMemoryBuffer,
     MFCreateSample, MFMediaType_Video, MFT_MESSAGE_COMMAND_FLUSH,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
     MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
@@ -75,6 +76,7 @@ impl OutputCodec {
 use super::super::EncodedPacket;
 use crate::capture::Frame;
 use crate::encode::color;
+use crate::encode::color_desc::{self, MfAttributes};
 
 /// Frame-rate the MFT is told about. Has to match the
 /// `MF_MT_FRAME_RATE` we set on input/output media types so the VBV
@@ -112,6 +114,11 @@ pub(super) struct MfPipeline {
     /// line is "HW pipeline active" regardless of actual backend, so
     /// log-parsing wouldn't work.
     backend_kind: &'static str,
+    /// FR-130 P1 — the colour attributes the media types carry, put back on
+    /// the type `drain_output` renegotiates (a stream change hands over a
+    /// type of the MFT's own). `None`: `color_description` is off, or this
+    /// MFT refused them and runs undescribed, as before.
+    colour: Option<MfAttributes>,
 }
 
 impl MfPipeline {
@@ -150,16 +157,25 @@ impl MfPipeline {
         codec: OutputCodec,
     ) -> Result<Self> {
         unsafe {
-            // Set output type first (required by the MFT contract).
-            let out_type = build_output_media_type(width, height, codec)?;
-            transform
-                .SetOutputType(0, &out_type, 0)
-                .map_err(|e| anyhow!("SetOutputType: {e:?}"))?;
-
-            let in_type = build_input_media_type(width, height)?;
-            transform
-                .SetInputType(0, &in_type, 0)
-                .map_err(|e| anyhow!("SetInputType: {e:?}"))?;
+            // FR-130 P1 — the colour description rides both media types. An
+            // MFT that refuses a type carrying it opens without it, exactly as
+            // before FR-130, rather than dropping out of the cascade: the
+            // description must never cost a host the encoder it had.
+            let wanted = color_desc::active().map(color_desc::mf);
+            let colour = match set_media_types(&transform, width, height, codec, wanted.as_ref()) {
+                Ok(()) => wanted,
+                Err(e) if wanted.is_some() => {
+                    tracing::warn!(
+                        backend = backend_kind,
+                        codec = codec.backend_name(),
+                        error = %e,
+                        "mf-encoder: the MFT refused the colour description — opening without it (FR-130)"
+                    );
+                    set_media_types(&transform, width, height, codec, None)?;
+                    None
+                }
+                Err(e) => return Err(e),
+            };
 
             // Latency + rate-control knobs.
             let codec_api: ICodecAPI = transform
@@ -233,6 +249,7 @@ impl MfPipeline {
                 width,
                 height,
                 initial_bps,
+                described = colour.is_some(),
                 "mf-encoder: pipeline ready"
             );
 
@@ -246,6 +263,7 @@ impl MfPipeline {
                 frame_count: 0,
                 codec,
                 backend_kind,
+                colour,
             })
         }
     }
@@ -407,7 +425,29 @@ impl MfPipeline {
                     );
                     unsafe {
                         let new_type = self.transform.GetOutputAvailableType(0, 0)?;
-                        self.transform.SetOutputType(0, &new_type, 0)?;
+                        match self.colour {
+                            None => self.transform.SetOutputType(0, &new_type, 0)?,
+                            // FR-130 P1 — the MFT's own type need not keep the
+                            // colour attributes; put them back, or the stream
+                            // goes undescribed from here on. Refused, the type
+                            // goes in as the MFT offered it, as before.
+                            Some(c) => {
+                                let described = set_colour(&new_type, &c).and_then(|()| {
+                                    self.transform
+                                        .SetOutputType(0, &new_type, 0)
+                                        .map_err(|e| anyhow!("SetOutputType: {e:?}"))
+                                });
+                                if let Err(e) = described {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "mf-encoder: the renegotiated type refused the colour description (FR-130)"
+                                    );
+                                    let offered = self.transform.GetOutputAvailableType(0, 0)?;
+                                    self.transform.SetOutputType(0, &offered, 0)?;
+                                    self.colour = None;
+                                }
+                            }
+                        }
                     }
                     // Loop continues, retry ProcessOutput with the new
                     // type. The MFT will now accept / produce output.
@@ -431,6 +471,30 @@ impl MfPipeline {
         set_codec_u32(&self.codec_api, &CODECAPI_AVEncCommonMeanBitRate, bps)
     }
 
+    /// FR-130 P1 — TEST-ONLY: the parameter sets on the MFT's current output
+    /// type (`MF_MT_MPEG_SEQUENCE_HEADER`), for an MFT that keeps them out of
+    /// the samples.
+    #[cfg(test)]
+    pub(super) fn sequence_header(&self) -> Option<Vec<u8>> {
+        use windows::Win32::Media::MediaFoundation::MF_MT_MPEG_SEQUENCE_HEADER;
+        // SAFETY: attribute reads on the MFT's own type, into a buffer of the
+        // size it reports.
+        unsafe {
+            let t = self.transform.GetOutputCurrentType(0).ok()?;
+            let size = t.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER).ok()?;
+            let mut buf = vec![0u8; size as usize];
+            t.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut buf, None)
+                .ok()?;
+            Some(buf)
+        }
+    }
+
+    /// FR-130 P1 — TEST-ONLY: whether the media types carry the description.
+    #[cfg(test)]
+    pub(super) fn described(&self) -> bool {
+        self.colour.is_some()
+    }
+
     pub(super) fn end_stream(&self) -> Result<()> {
         unsafe {
             self.transform
@@ -451,10 +515,33 @@ impl MfPipeline {
 // Helpers (all unsafe-COM, kept in one place for easier auditing).
 // ---------------------------------------------------------------------
 
+/// The output type, then the input type (the MFT contract's order), each
+/// carrying `colour` when it is `Some`.
+unsafe fn set_media_types(
+    transform: &IMFTransform,
+    width: u32,
+    height: u32,
+    codec: OutputCodec,
+    colour: Option<&MfAttributes>,
+) -> Result<()> {
+    unsafe {
+        let out_type = build_output_media_type(width, height, codec, colour)?;
+        transform
+            .SetOutputType(0, &out_type, 0)
+            .map_err(|e| anyhow!("SetOutputType: {e:?}"))?;
+        let in_type = build_input_media_type(width, height, colour)?;
+        transform
+            .SetInputType(0, &in_type, 0)
+            .map_err(|e| anyhow!("SetInputType: {e:?}"))?;
+        Ok(())
+    }
+}
+
 unsafe fn build_output_media_type(
     width: u32,
     height: u32,
     codec: OutputCodec,
+    colour: Option<&MfAttributes>,
 ) -> Result<IMFMediaType> {
     unsafe {
         let t: IMFMediaType = MFCreateMediaType()?;
@@ -469,11 +556,18 @@ unsafe fn build_output_media_type(
         set_ratio(&t, &MF_MT_FRAME_RATE, TARGET_FPS_NUM, TARGET_FPS_DEN)?;
         set_ratio(&t, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        if let Some(c) = colour {
+            set_colour(&t, c)?;
+        }
         Ok(t)
     }
 }
 
-unsafe fn build_input_media_type(width: u32, height: u32) -> Result<IMFMediaType> {
+unsafe fn build_input_media_type(
+    width: u32,
+    height: u32,
+    colour: Option<&MfAttributes>,
+) -> Result<IMFMediaType> {
     unsafe {
         let t: IMFMediaType = MFCreateMediaType()?;
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -482,8 +576,33 @@ unsafe fn build_input_media_type(width: u32, height: u32) -> Result<IMFMediaType
         set_ratio(&t, &MF_MT_FRAME_RATE, TARGET_FPS_NUM, TARGET_FPS_DEN)?;
         set_ratio(&t, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        if let Some(c) = colour {
+            set_colour(&t, c)?;
+        }
         Ok(t)
     }
+}
+
+/// FR-130 P1 — the four colour attributes of `c` on a media type: the YUV the
+/// input carries (BT.601 at limited range, `color::bgra_to_nv12`), for an
+/// encoder MFT to write into its stream's colour description.
+///
+/// ⚠️ Measured on neo16 (2026-10-30): Microsoft's encoders write NO
+/// description from these, from either type, nor from the encoder API's
+/// `CODECAPI_AVEncVideo{Input,Output}Color*` (tried before and after the
+/// types, then removed): neither the H.264 encoder MFT (its SPS rides
+/// `MF_MT_MPEG_SEQUENCE_HEADER`) nor the HEVC Video Extension (in band). The
+/// vendors' MFTs did not open there (NVIDIA's are async-only, AMD's fail
+/// `ActivateObject` with `E_OUTOFMEMORY`), so whether they do is unmeasured.
+fn set_colour(t: &IMFMediaType, c: &MfAttributes) -> Result<()> {
+    // SAFETY: plain attribute writes on a media type we hold a reference to.
+    unsafe {
+        t.SetUINT32(&MF_MT_YUV_MATRIX, c.matrix.0 as u32)?;
+        t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, c.range.0 as u32)?;
+        t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, c.primaries.0 as u32)?;
+        t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, c.transfer.0 as u32)?;
+    }
+    Ok(())
 }
 
 /// MF encodes a pair of u32 values into a single u64 for ratio-type

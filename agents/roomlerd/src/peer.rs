@@ -5140,11 +5140,11 @@ async fn media_pump_vp9_444_dc(
                 // FR-70 M0 — the fused age split by plane (transit is an
                 // upper bound here: this pump keeps no send-wait figure).
                 age_split = ?governor.viewer_age_split(None),
-                // FR-71 T1a — which plane was the limiter last window, in
-                // SHADOW (nothing acts on it until T1b), and windows per
-                // verdict: [unknown, clear, overproduced, transit_stalled,
-                // viewer_late]. A repeat of finding 4 reads `transit-stalled`
-                // here while `target_bps` shows the cut T1b will remove.
+                // FR-71 T1a — which plane was the limiter last window (the
+                // verdict FR-79's gate reads; `evidence_rejected` below says
+                // what it rejected), and windows per verdict: [unknown, clear,
+                // overproduced, transit_stalled, viewer_late]. A repeat of
+                // finding 4 reads `transit-stalled` here, with no cut after it.
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
                 evidence_rejected = ?governor.evidence_rejected(),
@@ -5170,6 +5170,15 @@ async fn media_pump_vp9_444_dc(
                 // FR-59 P3/P4 — (congested windows, drains ordered, live
                 // queue-depth estimate in ms) from the viewer-side loop.
                 link_stats = ?governor.link_stats(),
+                // FR-63 B1 — the shadow controller beside this pump too (see the
+                // FFmpeg heartbeat for the fields' meaning). Pure telemetry;
+                // nothing live reads it.
+                shadow_target_bps = ?governor.shadow_target_bps(),
+                shadow_state = governor.shadow_state(),
+                shadow_measured_bps = ?governor.shadow_measured_bps(),
+                shadow_disagree_pct = ?governor.shadow_disagree_pct(),
+                shadow_pauses = governor.shadow_pauses(),
+                shadow_reason = governor.shadow_reason(),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
             qp_sum = 0;
@@ -9756,11 +9765,11 @@ async fn media_pump_ffmpeg_dc(
                 // iter_max 28 ms) reads here as transit ≈ 4.9 s. None = a
                 // pre-M0 viewer, or a window with no age report.
                 age_split = ?governor.viewer_age_split(Some(send_wait_avg_ms)),
-                // FR-71 T1a — which plane was the limiter last window, in
-                // SHADOW (nothing acts on it until T1b), and windows per
-                // verdict: [unknown, clear, overproduced, transit_stalled,
-                // viewer_late]. A repeat of finding 4 reads `transit-stalled`
-                // here while `target_bps` shows the cut T1b will remove.
+                // FR-71 T1a — which plane was the limiter last window (the
+                // verdict FR-79's gate reads; `evidence_rejected` below says
+                // what it rejected), and windows per verdict: [unknown, clear,
+                // overproduced, transit_stalled, viewer_late]. A repeat of
+                // finding 4 reads `transit-stalled` here, with no cut after it.
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
                 evidence_rejected = ?governor.evidence_rejected(),
@@ -9839,6 +9848,21 @@ async fn media_pump_ffmpeg_dc(
                 open_ms_max = open_us_max as f64 / 1000.0,
                 iter_ms_max = iter_us_max as f64 / 1000.0,
                 pump_stalls,
+                // FR-63 B1 — the ONE delay-based controller, in SHADOW: what it
+                // WOULD target beside what the governor applied, so a week of
+                // these across the fleet answers the flip criterion (AC2)
+                // without the controller having steered a single session.
+                // `shadow_disagree_pct` is (shadow − live)/live: NEGATIVE means
+                // the shadow asked for less, the safe direction. `shadow_state`
+                // reads `off` when `ROOMLERD_RATECTL=off`. Nothing here is read
+                // by any live decision — it is pure telemetry (FR-63 B2 flips
+                // it live on the flip criterion).
+                shadow_target_bps = ?governor.shadow_target_bps(),
+                shadow_state = governor.shadow_state(),
+                shadow_measured_bps = ?governor.shadow_measured_bps(),
+                shadow_disagree_pct = ?governor.shadow_disagree_pct(),
+                shadow_pauses = governor.shadow_pauses(),
+                shadow_reason = governor.shadow_reason(),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;

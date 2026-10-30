@@ -1760,6 +1760,151 @@ mod tests {
         GovernorLaw::new(floor, ceiling, true)
     }
 
+    // -- FR-63 B1: the shadow controller as a RateLaw ------------------------
+    //
+    // `ratectl::Controller` is the ONE delay-based controller B1 ships in
+    // shadow. Wrapping it as a `RateLaw` runs it against the SAME recorded
+    // cells as the shipped `GovernorLaw`, so the numbers here are the baseline
+    // B2 must beat rather than a separate exercise (the trait's own doc names
+    // this). The cells are all constrained (relay), the posture the FR cares
+    // about; a direct cell is asserted separately to exercise the "never pause
+    // on direct" rule.
+
+    struct RatectlLaw {
+        ctrl: super::super::ratectl::Controller,
+        floor: u32,
+        ceiling: u32,
+        constrained: bool,
+        opened: bool,
+    }
+
+    impl RatectlLaw {
+        fn new(floor: u32, ceiling: u32, constrained: bool, remembered: Option<u32>) -> Self {
+            Self {
+                ctrl: super::super::ratectl::Controller::new(remembered),
+                floor,
+                ceiling,
+                constrained,
+                opened: false,
+            }
+        }
+    }
+
+    impl RateLaw for RatectlLaw {
+        fn label(&self) -> &'static str {
+            "ratectl (shadow)"
+        }
+
+        fn on_frame(&mut self, _occupied: u32, full: bool, now: Instant) -> u32 {
+            if !self.opened {
+                self.ctrl.mark_opened(now);
+                self.opened = true;
+            }
+            self.ctrl
+                .set_domain(self.floor, self.ceiling, self.constrained);
+            self.ctrl.observe_frame(full, now);
+            self.ctrl.target_bps().unwrap_or(self.floor)
+        }
+
+        fn on_window(&mut self, w: &WindowStats, now: Instant) {
+            self.ctrl.fold_window(
+                &super::super::ratectl::ShadowWindow {
+                    fps: w.frames_rx,
+                    struggling: false,
+                    age_avg_ms: Some(w.age_ms.min(u32::from(u16::MAX)) as u16),
+                    age_min_ms: Some(w.age_min_ms.min(u32::from(u16::MAX)) as u16),
+                    rtt_ms: Some(w.one_way_ms.saturating_mul(2)),
+                    rx_bps: (w.rx_bps > 0).then_some(w.rx_bps),
+                    queue_ms: Some(
+                        w.queue_ms.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
+                    ),
+                    goodput_bps: None,
+                    sent_bps: w.rx_bps,
+                    frames_rx: w.frames_rx,
+                    frames_lost: w.frames_lost,
+                },
+                now,
+            );
+        }
+
+        fn target_bps(&self) -> u32 {
+            self.ctrl.target_bps().unwrap_or(self.floor)
+        }
+
+        fn on_budget_skip(&mut self, now: Instant) {
+            self.ctrl.on_budget_skip(now);
+        }
+    }
+
+    /// The controller must never leave its own `[floor, ceiling]` domain on any
+    /// recorded cell — the single-source-of-pins invariant, exercised against
+    /// the thin pipe that over-drove the shipped governor.
+    #[test]
+    fn ratectl_stays_inside_its_domain_on_every_cell() {
+        for (name, sc, ceiling) in [
+            ("thin pipe", corp_vpn_thin_pipe(), RELAY_CEILING_BPS),
+            ("airport", airport_hotspot(), RELAY_CEILING_BPS),
+            ("DERP stalls", derp_with_stalls(), RELAY_CEILING_BPS),
+            ("LAN burst", lan_wifi_burst(), 5_000_000u32),
+        ] {
+            let mut law = RatectlLaw::new(
+                super::super::ratectl::CONSTRAINED_FLOOR_BPS,
+                ceiling,
+                true,
+                None,
+            );
+            let tr = run(&sc, &mut law);
+            for r in &tr.rows {
+                assert!(
+                    (super::super::ratectl::CONSTRAINED_FLOOR_BPS..=ceiling)
+                        .contains(&r.target_bps),
+                    "{name}: target {} left [{}, {ceiling}]{}",
+                    r.target_bps,
+                    super::super::ratectl::CONSTRAINED_FLOOR_BPS,
+                    tr.render()
+                );
+            }
+        }
+    }
+
+    /// On the recorded 213 kbps cell the shadow opens at its 200 k floor and
+    /// climbs, so its PEAK commitment is far under arm A's 2.55 M nominal —
+    /// the whole point of the controller, measured against the shipped law on
+    /// the same deterministic pipe. (A field A/B is still what ticks AC0b;
+    /// this is the law being right, which is what the field run confirms.)
+    #[test]
+    fn ratectl_commits_far_less_than_the_shipped_opener_on_the_thin_pipe() {
+        let sc = corp_vpn_thin_pipe();
+        let mut arm_a = arm_a(FLAT_FLOOR_BPS, RELAY_CEILING_BPS);
+        let a = run(&sc, &mut arm_a);
+        let mut shadow = RatectlLaw::new(
+            super::super::ratectl::CONSTRAINED_FLOOR_BPS,
+            RELAY_CEILING_BPS,
+            true,
+            None,
+        );
+        let s = run(&sc, &mut shadow);
+        assert!(
+            s.peak_target_bps() * 2 < a.peak_target_bps(),
+            "the shadow should commit far less than arm A: shadow peak {} vs arm A {}{}{}",
+            s.peak_target_bps(),
+            a.peak_target_bps(),
+            a.render(),
+            s.render()
+        );
+    }
+
+    /// The controller never counts a pause on a DIRECT cell, however deep the
+    /// level — the FR-1 P2 relay regression, held by construction.
+    #[test]
+    fn ratectl_never_pauses_on_a_direct_cell() {
+        // A fast pipe with a stall, run as DIRECT: deep ages, but no pause.
+        let sc = fast_pipe_early_stall();
+        let mut law = RatectlLaw::new(3_000_000, 20_000_000, false, None);
+        let _ = run(&sc, &mut law);
+        assert_eq!(law.ctrl.pauses(), 0, "a direct path must never pause");
+    }
+
     // -- the simulator itself -------------------------------------------------
     //
     // A fixture is only evidence if the harness under it is right. These test

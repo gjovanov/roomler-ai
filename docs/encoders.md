@@ -98,6 +98,17 @@ one line and the next rung is tried. Locked by tests
 | macOS arm64 | `h264/hevc/av1_videotoolbox`, plus the `h264` decoder and the `aac` encoder (~3.0 MB of dylibs), built with `--disable-autodetect` so nothing Homebrew is baked in | shared dylibs in the app bundle |
 | Linux arm64 | from 0.4.170 (FR-97 P7a): `h264/hevc/av1_nvenc` + `h264/hevc/av1/vp9_vaapi` + `h264/hevc/av1_vulkan` (ten), plus the `h264` decoder and the `aac` encoder, the Linux x86_64 tree built on an arm64 runner without qsv and amf (neither ships an arm64 Linux runtime); libva + libdrm in the tree, searching `/usr/lib/aarch64-linux-gnu/dri`. Where nothing opens (an Asahi Mac, a GPU-less server) the probe finds no hardware and video stays on OpenH264 + libvpx. No arm64 hardware cell has been proven in a session yet: [FR-122](fr/FR-122-arm64-linux-hardware-cell.md). Before 0.4.170: no FFmpeg | shared, bundled in the `.deb` and the tarball like x86_64's |
 
+> [!IMPORTANT]
+> **NVENC needs NVIDIA driver 570.0 or newer, on every OS.** FFmpeg opens NVENC
+> only when the driver's highest NVENC API is at least the SDK the build was
+> compiled against, so the header pin *is* the floor. Every tree takes
+> `nv-codec-headers` 13.0.19.0: Windows through the vcpkg baseline's `ffnvcodec`,
+> Linux by the vendor jobs' pin. Below the floor the probe advertises no NVENC
+> cell and the cascade's next rung serves. The Linux trees pinned 13.1 (driver
+> 610.00) until FR-122 P0c, which cost NVENC on NVIDIA's R580 long-term branch
+> and on AWS's G5g image (595). Each Linux vendor job now asserts the floor in
+> the binary it built ([FR-122 §3.2](fr/FR-122-arm64-linux-hardware-cell.md#32-the-nvenc-driver-floor-p0c)).
+
 ## The cell matrix a host advertises (FR-77 P1)
 
 The probe opens **every encoder** in cascade order, not the first that works,
@@ -614,6 +625,15 @@ The session reports which form it opened and why, on the heartbeat as
   readback leaves the capture stage. `send_frame` grows by 1.9 ms, because it
   now waits for the GPU's conversion before QSV reads the surface. The pattern
   decodes identically on both paths.
+- **Measured on a 2880×1800 laptop**
+  ([FR-118 §9.10](fr/FR-118-gpu-resident-frames.md#910-ac4-the-slow-laptop-at-60-fps-2026-10-30),
+  `av1_qsv` with 60 fps asked, the same pattern, the same arm): the encoded
+  rate rose from 38 fps to the 60 fps target. With the switch off, the
+  capture thread's 7.9 ms readback runs in series with a 17 ms encode stage,
+  so a frame took 25 ms. With it on, a frame takes 16.61 ms, the period at
+  60 fps. QSV's own `send_frame`, about 16 ms a frame on both paths, is what
+  bounds this host now. The worker's CPU fell from 15.93 to 3.88 ms per
+  encoded frame.
 - **Measured on the WGC arm with NVENC**
   ([FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29),
   `av1_nvenc` at 2560×1600 and 60 fps on the same pattern, a hybrid laptop with
@@ -649,7 +669,9 @@ The session reports which form it opened and why, on the heartbeat as
   with both NVENC and QSV, a codec NVENC lacks opens on QSV on the other adapter
   and reads `adapter_mismatch`: CPU frames, the picture unchanged.
 - **Field-verified and released:** the QSV cell on the DXGI arm (0.4.181,
-  [FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28)),
+  [FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28);
+  at 2880×1800 on 0.4.187,
+  [§9.10](fr/FR-118-gpu-resident-frames.md#910-ac4-the-slow-laptop-at-60-fps-2026-10-30)),
   the NVENC cell on the WGC arm (0.4.183,
   [FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29))
   and the VideoToolbox cells on macOS (0.4.187,
@@ -675,6 +697,7 @@ The session reports which form it opened and why, on the heartbeat as
 | `caps_cache` | `ROOMLERD_CAPS_CACHE` | on | the probe cache (read and write) |
 | `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them; on macOS the display stream's IOSurfaces go to a proven VideoToolbox cell ([above](#gpu-resident-frames-the-input-path-fr-118)). On a supervised Mac the root's value is handed to the GUI worker at spawn (`WORKER_ENV_FORWARD`, from FR-118 P5) |
 | `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing. Handed to a supervised Mac's GUI worker as `zero_copy` is |
+| `color_description` | `ROOMLERD_COLOR_DESCRIPTION` | on | every encoder writes the colour description its input was converted with (BT.601 matrix, BT.709 primaries, sRGB transfer, limited range: `encode::color_desc::DESCRIPTION`, [FR-130](fr/FR-130-colours-decode-true.md)), and the hello says `color-described`; `false` writes the undescribed stream of earlier agents. Read at every encoder open, so a restart applies it; the probe and recorder children, a hand-run `roomlerd record` and `encoder-smoke` follow it, and a supervised Mac's GUI worker gets the root's value (`WORKER_ENV_FORWARD`). Not every encoder can carry it: `vp9_qsv` and `vp9_vaapi` (FFmpeg writes none), Microsoft's MF encoders (they ignore the attributes), and `h264_amf`'s matrix (AMD's H.264 runtime writes 2) |
 | `vaapi_device` | `ROOMLERD_VAAPI_DEVICE` | unset | pin the render node; unset = `/dev/dri/renderD128`…`135` in order |
 | `d3d12_adapter` | `ROOMLERD_D3D12_ADAPTER` | unset | pin the DXGI adapter index for D3D12 video encode (Windows); unset = adapters `0`…`3` in order |
 | `vulkan_device` | `ROOMLERD_VULKAN_DEVICE` | unset | pin the Vulkan physical device by index or name; unset = the loader's default |
@@ -746,7 +769,115 @@ flowchart LR
   Vulkan — **rebuilds** the encoder on a coarsened ladder. D3D12 and Vulkan are
   measured (FR-78 P2, the A0 ladder on the dev box): every rung forced an IDR,
   42–77 ms per apply. `encoder-smoke --reconfigure-sweep --name <encoder>` is
-  the read for any host.
+  the read for any host. The per-backend cost table, the counters and the sweep's
+  verdict are the next section.
+
+### A rate move, per backend (FR-62)
+
+What a rate move costs decided the shape of the rate-control code: nine of its
+heuristics exist only to ration that cost
+([FR-62](fr/FR-62-encoder-rate-changes-without-an-idr.md)). The pump hands every
+AIMD target to `FfmpegEncoder::set_bitrate`
+(`agents/roomlerd/src/encode/ffmpeg/encoder.rs:3000`), which snaps it to the
+ladder first (`encode/aimd.rs:297` — 100 k … 25 M, `coarsen_bitrate` at `:317`)
+and returns when the rung is the one already running. Only a rung crossing reaches
+the backend's arm, resolved once at open by `resolve_rate_mode` (`encoder.rs:869`).
+
+```mermaid
+flowchart TD
+    T["AIMD target_bps"] --> C["coarsen_bitrate<br/>nearest ladder rung"]
+    C -->|"same rung as the running maxrate"| N["no-op"]
+    C -->|"rung crossed"| M{"RateReconfig<br/>resolved at open"}
+    M -->|"NVENC: InPlaceVbr"| V["write rc_max_rate + rc_buffer_size<br/>FFmpeg reconfigures on the next send_frame<br/>0.004 ms, no IDR with patch 0001"]
+    M -->|"QSV with the flag ON: InPlaceCbr"| Q["write bit_rate + rc_max_rate + rc_buffer_size<br/>MFXVideoENCODE_Reset answers −14 on Iris Xe<br/>the encoder is unusable after it"]
+    M -->|"QSV flag OFF, AMF, VideoToolbox, VAAPI, D3D12, Vulkan: Rebuild"| R["reopen at the new maxrate<br/>a fresh IDR plus the open's cost"]
+    R -->|"bg_rebuild on a direct path, bg_rebuild_constrained on a relay"| S["off-thread swap, adopted at quiet on a relay<br/>counted as swaps"]
+    R -->|"inline"| I["blocks the pump for the open<br/>counted as rebuilds"]
+```
+
+Measured with the sweep described below (20 rate changes 6 M → 200 k → 6 M at
+1280×800, 30 frames a rung, `set_ms` the apply alone):
+
+| Backend (host) | Arm | Rate-caused IDRs | Apply | Read |
+|---|---|---|---|---|
+| `hevc_nvenc` (RTX 5090 Laptop) | in place, unpatched FFmpeg | **20/20** | 0.001–0.008 ms | 0.4.50, 2026-09-02 (#1242) |
+| `hevc_nvenc` (the same GPU) | in place, patch 0001 | **0/20**, default and constrained HRD windows alike | 0.004 ms | a patched 0.4.51 build, 2026-09-02; re-read on the released **0.4.187**, 2026-10-29 |
+| `hevc_qsv` (Iris Xe) | rebuild, flag OFF | 20/20 | 340–390 ms above 1.5 M, **1.3–2.2 s at or below 1 M** | 0.4.51, 2026-09-02 |
+| `hevc_qsv` (Iris Xe) | in place, flag ON | — | `MFX_ERR_INCOMPATIBLE_VIDEO_PARAM`, both `low_power` modes, with and without the buffer write | 0.4.51 and 0.4.62 |
+| `hevc_amf` (Radeon 610M) | rebuild | **20/20** | **41–55 ms** | **0.4.187, 2026-10-29** — the 0.4.187 harness filed every one as periodic (below); the corrected harness reads `total_rate_idr: 20`, `pass: false` |
+| `hevc_d3d12va`, `hevc_vulkan` (the dev box) | rebuild | 20/20 | 42–77 ms | FR-78 P2 |
+| `*_vaapi` | rebuild, by construction | — | unmeasured | — |
+| `hevc_videotoolbox` | rebuild | unmeasured | unmeasured | A3's open decision: patch 0002, or a rebuild at settle |
+
+So the two rebuild families are not one: QSV's rebuild is a multi-second stall at
+the rates a slow link runs, while AMF, D3D12 and Vulkan rebuild in 40–80 ms and pay
+only the IDR. The rationing a backend needs follows from its row, which is why A4
+retires heuristics per backend rather than deleting them.
+
+⚠️ **Above the ladder the controller moves nothing.** The top rung is 25 Mbps. A
+direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climbed
+`target_bps` 34 → 65 Mbps in eight AIMD steps while `rate_moves` stayed 0: every step
+coarsened to the top rung and `set_bitrate` returned. The encoder's maxrate is the
+rung, never the target.
+
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:9806-9839`):
+
+| Field | Meaning |
+|---|---|
+| `inplace_rate` | `supports_dynamic_bitrate()`: the backend applies in place (NVENC always, QSV only with the flag) |
+| `rate_moves` | in-place writes |
+| `rebuilds` | synchronous reopens, the inline arm |
+| `swaps` | background-rebuilt encoders adopted. Read it beside the two above: on a direct QSV session every rate move lands here and only here (FR-65) |
+| `dims_swaps` | reopens for a resolution change (FR-70 M2) |
+| `idr_count` | every keyframe the encoder emitted. Read against `dims_swaps` and the session's `PLI/FIR → forcing keyframe` lines (`peer.rs:836`) to isolate the rate-caused ones |
+| `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
+
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6146`):
+
+```
+roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
+roomlerd encoder-smoke --reconfigure-sweep --name hevc_amf --codec hevc --json   # a backend the cascade outranks
+```
+
+Per rung it prints `set_ms`, `rate_idr`, `periodic_idr`, `mean_bytes`, the
+bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
+`trailing_mean`; `--json` emits one `ROOMLER_A0_JSON:{…}` line. Two rules the first
+reads taught it:
+
+- **The rate change is charged with the keyframe on the rung's first output frame**
+  (`sweep_attribute_idrs`, `app.rs:6407`), not on frame 0. AMF answers the frame that
+  fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
+  "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
+  for a backend that rebuilds on every move.
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6436`). Every
+  backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
+  CBR (`select_rc_mode` takes the CBR branch because the session opens with
+  `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst
+  (≤ 2×): a quality-driven backend sits under its cap on compressible content, so the
+  RTX read printed `pass: false` on a 0.985 ratio deviation with 0/20 IDRs and a
+  0.004 ms apply. The JSON names the basis (`"basis":"idr+apply"` or
+  `"idr+apply+tracking"`).
+
+**The patch and its gate.** `.github/ffmpeg-patches/0001-nvenc-no-idr-on-bitrate-reconfig.patch`
+drops `resetEncoder = forceIDR = 1` from `nvenc.c`'s bitrate-only reconfigure.
+`vendor-ffmpeg-windows.yml` applies it to the Windows and both Linux assets and
+writes `ROOMLER-PATCHES.txt` (sha256 per patch) into each; `release-agent.yml`
+refuses to tag when an asset's manifest differs from the committed patches
+(`.github/workflows/release-agent.yml:449-471`, `:1167` for arm64). The pump reads
+one const, `NVENC_RECONFIG_FORCES_IDR` (`encoder.rs:893`), so the binary and the
+FFmpeg it links cannot disagree. The macOS builder carries no patch today.
+
+**Switches, and when each retires:**
+
+| Switch | Default | What it does | Retires when |
+|---|---|---|---|
+| `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:340`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:353`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
+| `ROOMLERD_ENCODER_NVENC_ASSUME_IDR` (`:354`) | off | reverts NVENC to the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` |
+| `bg_rebuild_constrained` (`:498`) | on | a constrained session's rebuild runs off-thread (#1254), adopted at quiet | never while a rebuild backend exists |
+
+**Open**: QSV's `mfxExtEncoderResetOption` (patch 0004, an FFmpeg-level change),
+VideoToolbox's A0 on a Mac, and A4's per-backend retirements — NVENC can shed its
+rationing, QSV keeps `coarsen_bitrate`, and AMF, D3D12 and Vulkan keep it for the IDR.
 
 ## Software encoders: the clock and 60 fps (FR-112)
 
@@ -791,11 +922,11 @@ flowchart LR
 - **Software paths target 60, paced to what they sustain** (P2). `SoftwarePace` (`encode/encode_pressure.rs:242`)
   runs FR-1's `FpsPace` over its own encode EWMA. It is its own EWMA so that `ROOMLERD_ENCODE_PRESSURE=0`, the
   hardware path's switch, cannot turn the software pace off as a side effect. The pace is never below 30
-  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:741`), so a host that cannot sustain 30 runs exactly as it did before.
+  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:828`), so a host that cannot sustain 30 runs exactly as it did before.
   The RTP pump starts at 60 under the tier (`target_fps_with_tier`, `peer.rs:123`). The auto-fps-cap that drops
   a software encoder to 30 applies only where the tier is off: Windows and macOS by default, where the WGC
   readback it was written for lives.
-  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:734`). On a host whose clock was
+  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:821`). On a host whose clock was
     never the limit, 60 frames cost twice the CPU of 30, and an attended desktop pays for it, so Windows and
     macOS opt in with `ROOMLERD_SW_FPS_60=1` until P3. `ROOMLERD_SW_FPS_60=0` gives back 30 everywhere.
   - ⚠️ **A step up waits for headroom** (P2d, `SW_PACE_UP_MARGIN_FPS`, `encode/encode_pressure.rs:255`).
@@ -806,7 +937,7 @@ flowchart LR
     found it, window for window. The hardware pace keeps margin 0 until it is measured on hardware
     ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
 - **The bitrate base follows the rate the pump runs at**, by √(fps/30) (`bitrate_base_for_fps`,
-  `encode/mod.rs:719`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
+  `encode/mod.rs:806`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
   measured.
 
 ### OpenH264's runtime settings (FR-112 P2b)
@@ -816,7 +947,7 @@ release before it:
 
 | Fact | What went wrong | Now |
 |---|---|---|
-| The `openh264` crate creates the C encoder's state at the **first encode**, and `SetOption` before that answers `cmInitExpected` (4) | every session's first `set_bitrate` (the quality-derived target) was refused, recorded as applied, and never retried | early settings wait for the first frame (`Settings`, `encode/openh264_backend.rs:311`) |
+| The `openh264` crate creates the C encoder's state at the **first encode**, and `SetOption` before that answers `cmInitExpected` (4) | every session's first `set_bitrate` (the quality-derived target) was refused, recorded as applied, and never retried | early settings wait for the first frame (`Settings`, `encode/openh264_backend.rs:322`) |
 | The crate sets layer 0's **max** bitrate to the construction bitrate, and OpenH264 refuses a target above the max (`cmInitParaError`) | no runtime raise past the construction figure ever took: not Quality=High, not REMB recovering | the max moves with the target: raised first, lowered after (`apply_runtime_bitrate`, `:216`) |
 | OpenH264 budgets each frame's bits from its **frame rate**, and its keyframe period is counted in frames | at 60 fps a 30 fps budget per frame, and the 60-frame period put a keyframe every second | `set_frame_rate` hands it the rate the pump runs at, and the period follows to keep 2 s (`IDR_EVERY_S`, `:59`) |
 

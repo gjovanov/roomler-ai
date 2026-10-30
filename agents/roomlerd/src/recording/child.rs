@@ -243,13 +243,30 @@ fn stop_reason_from(word: Option<&str>) -> StopReason {
 }
 
 /// Register the encoder knobs the record child reads from config, exactly the
-/// keys `main.rs` registers for the daemon's own encoders (`ENCODER_CELLS_DENY`
-/// and the pinned hardware devices). An env var set by a parent still wins —
-/// that is `node_env`'s precedence.
+/// keys `main.rs` registers for the daemon's own encoders (`ENCODER_CELLS_DENY`,
+/// FR-130's `COLOR_DESCRIPTION` and the pinned hardware devices). An env var
+/// set by a parent still wins — that is `node_env`'s precedence.
 pub fn register_encoder_fallbacks(cfg: &roomler_node_core::config::AgentConfig) {
+    let m = encoder_fallbacks(cfg);
+    if !m.is_empty() {
+        tunnel_core::env::register_config_fallbacks(m);
+    }
+}
+
+/// The map [`register_encoder_fallbacks`] registers.
+fn encoder_fallbacks(cfg: &roomler_node_core::config::AgentConfig) -> HashMap<String, String> {
     let mut m: HashMap<String, String> = HashMap::new();
     if let Some(v) = &cfg.encoder_cells_deny {
         m.insert("ENCODER_CELLS_DENY".into(), v.clone());
+    }
+    // FR-130 — the colour description's kill switch: an FFmpeg-encoded
+    // recording writes the description too, so a hand-run recorder honours the
+    // switch the daemon's recorders inherit. Bools bridge as `1` / `0`.
+    if let Some(on) = cfg.color_description {
+        m.insert(
+            "COLOR_DESCRIPTION".into(),
+            if on { "1" } else { "0" }.into(),
+        );
     }
     if let Some(v) = &cfg.vaapi_device {
         m.insert("VAAPI_DEVICE".into(), v.clone());
@@ -260,9 +277,7 @@ pub fn register_encoder_fallbacks(cfg: &roomler_node_core::config::AgentConfig) 
     if let Some(v) = &cfg.vulkan_device {
         m.insert("VULKAN_DEVICE".into(), v.clone());
     }
-    if !m.is_empty() {
-        tunnel_core::env::register_config_fallbacks(m);
-    }
+    m
 }
 
 /// Every protocol line starts with this, like the probe children's
@@ -520,6 +535,30 @@ pub async fn run(args: RecordArgs, config_path: &std::path::Path) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-130 — a hand-run recorder reads the colour description's switch
+    /// from the config, as the daemon's recorders inherit it: an explicit off
+    /// is published as `0`, and unset publishes nothing (the built-in on).
+    #[test]
+    fn a_hand_run_recorder_reads_the_colour_switch_from_the_config() {
+        let mut cfg = roomler_node_core::config::test_fixture();
+        assert!(!encoder_fallbacks(&cfg).contains_key("COLOR_DESCRIPTION"));
+        cfg.color_description = Some(false);
+        cfg.encoder_cells_deny = Some("h264_nvenc:yuv420".into());
+        let m = encoder_fallbacks(&cfg);
+        assert_eq!(m.get("COLOR_DESCRIPTION").map(String::as_str), Some("0"));
+        assert_eq!(
+            m.get("ENCODER_CELLS_DENY").map(String::as_str),
+            Some("h264_nvenc:yuv420")
+        );
+        cfg.color_description = Some(true);
+        assert_eq!(
+            encoder_fallbacks(&cfg)
+                .get("COLOR_DESCRIPTION")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
 
     #[test]
     fn stdin_stop_reasons_map_to_the_closed_set() {

@@ -54,6 +54,7 @@ import {
   DEFAULT_RCAS_SHARPNESS,
   type SharpenMode,
 } from '@/workers/rc-fsr-render'
+import { colorSpaceLabel } from '@/workers/rc-decoder-config'
 
 /**
  * Remote-control session state machine driven from the controller browser.
@@ -4163,6 +4164,24 @@ export function storedDecodePref(): 'prefer-software' | 'prefer-hardware' | 'no-
   return 'no-preference'
 }
 
+/** FR-130 P2 — the per-browser kill switch for the decoder colour space.
+ *  `localStorage.setItem('roomler-rc-colorspace', 'off')` (any case), then
+ *  reconnect: the decoders are no longer told set S, and each stream's own
+ *  description decides again (an undescribed one Chrome decodes as BT.709,
+ *  the colour shift of #3049). Anything else, or no value, leaves the override
+ *  on, and so does storage that cannot be read. Read once per connect, like
+ *  every `roomler-rc-*` knob. Pure + exported for tests. */
+export const COLORSPACE_STORAGE_KEY = 'roomler-rc-colorspace'
+
+export function storedColorSpaceOverride(): boolean {
+  try {
+    const raw = globalThis.localStorage?.getItem(COLORSPACE_STORAGE_KEY)
+    return (raw ?? '').trim().toLowerCase() !== 'off'
+  } catch {
+    return true
+  }
+}
+
 /** The browser's ICE-server entry for the loopback TURN (dialled over loopback,
  *  never firewalled). Pure + exported for tests. */
 export function localRelayIceServer(desc: LocalRelayDescriptor): IceServer {
@@ -4737,15 +4756,19 @@ export const VP9_444_DC_LABEL = 'video-bytes'
  * backlog has no bound — measured `send_wait_max` 10,263 ms on an agent
  * whose encoder was idle at 8-12 ms/frame.
  *
- * `maxRetransmits: 0` rather than a bounded retransmit is deliberate and
- * is coupled to the RECEIVER. Stage A's assembler treats a chunk-index
- * jump as an unrecoverable gap: it drops the frame and asks for an IDR.
- * That is exactly right when a lost chunk never arrives, and WRONG the
- * moment retransmits are allowed — a chunk that arrives one RTT late
- * would be discarded as a gap, converting a recoverable frame into a
- * lost one plus a keyframe request. Testing 1-2 retransmits (stage C)
- * therefore requires a reorder buffer in the worker first; it is not a
- * number that can be turned up on its own.
+ * `maxRetransmits: 0` rather than a bounded retransmit was chosen for
+ * stage B because it was coupled to the RECEIVER of the day. Stage A's
+ * assembler treated a chunk-index jump as an unrecoverable gap: it
+ * dropped the frame and asked for an IDR. That is exactly right when a
+ * lost chunk never arrives, and WRONG the moment retransmits are allowed
+ * — a chunk that arrives one RTT late would be discarded as a gap,
+ * converting a recoverable frame into a lost one plus a keyframe request.
+ * Stage C's reorder buffer (FR-59 P7, #1169, `rc-chunk-framing.ts`)
+ * removed that coupling: a late chunk lands in its slot while its frame
+ * is still open. The number is still 0 because 1-2 (or the
+ * `maxPacketLifeTime` deadline FR-17 prefers) has not been MEASURED on a
+ * relay-locked pair — it is now a measurement that can be run, not a
+ * number that can be turned up without one.
  *
  * ⚠️ Unordered is only legal WITH framing. An unframed stream is a bare
  * byte sequence whose reassembly depends entirely on arrival order, so
@@ -5629,6 +5652,12 @@ export function useRemoteControl(
    *  its `init-canvas`, which carries `sessionBench`. */
   let sessionBenchMode: BenchMode | null = null
   let sessionBench = false
+  /** FR-130 P2 — true when THIS session's decoders are told the colour space
+   *  the agent converted with (set S: BT.601 matrix, limited range;
+   *  `workers/rc-decoder-config.ts`). Resolved beside `sessionChunkFraming`,
+   *  before any worker is started: the data-channel workers get it in their
+   *  `init-canvas`, the RTP WebCodecs worker in its transform's options. */
+  let sessionColorSpace = false
   let benchProber: BenchProber | null = null
   let videoBench: VideoBenchSampler | null = null
   /** The element `attachInput` was given: the `<video>` the bench sampler
@@ -7246,6 +7275,21 @@ export function useRemoteControl(
     }
   }
 
+  /** FR-130 P2 — a decode worker gave up the decoder colour space and decodes
+   *  without it: the browser refused it at configure(), or the decoder failed
+   *  before its first frame with it set (the worker then tries once more
+   *  without it). The worker reports this at most once a session. */
+  function warnColorSpaceDropped(path: string, msg: Record<string, unknown>) {
+    const why = msg.stage === 'configure'
+      ? 'configure() refused it'
+      : 'the decoder failed before its first frame with it set'
+    console.warn(
+      `[rc] ${path} decoder colour space dropped (FR-130 P2): ${why}; decoding without it, as before FR-130 -`,
+      msg.codec,
+      msg.error,
+    )
+  }
+
   function sendQualityPreference() {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
@@ -7672,12 +7716,21 @@ export function useRemoteControl(
         onBenchProbe(msg.seq, msg.paintedAt, 'webcodecs')
         return
       }
+      if (msg.type === 'request-keyframe') {
+        // FR-130 P2 — the worker rebuilt its decoder without the colour
+        // space and waits for a key frame to start it.
+        requestKeyframe()
+        return
+      }
       if (msg.type === 'first-frame' && typeof msg.width === 'number' && typeof msg.height === 'number') {
         mediaIntrinsicW.value = msg.width
         mediaIntrinsicH.value = msg.height
         markConnect('first_frame')
         logConnectTiming('first-frame')
-        console.info('[rc] webcodecs first frame', msg.width, 'x', msg.height)
+        // FR-130 P2 — what the decoder says it produced (P3 reads it per session).
+        console.info('[rc] webcodecs first frame', msg.width, 'x', msg.height, '| decoded colour space', colorSpaceLabel(msg.colorSpace))
+      } else if (msg.type === 'colorspace-dropped') {
+        warnColorSpaceDropped('webcodecs', msg)
       } else if (msg.type === 'transform-active') {
         console.info('[rc] webcodecs transform active', msg)
       } else if (msg.type === 'first-encoded-frame' || msg.type === 'early-encoded-frame') {
@@ -7716,7 +7769,10 @@ export function useRemoteControl(
     try {
       ;(receiver as unknown as { transform: unknown }).transform = new TransformCtor(
         worker,
-        { codec },
+        // FR-130 P2 — `colorSpace` rides the options, not `init-canvas`: the
+        // worker configures its decoder when the transform starts, which can
+        // be before the canvas mounts. See `sessionColorSpace`.
+        { codec, colorSpace: sessionColorSpace },
       )
     } catch (err) {
       console.warn('[rc] setting receiver.transform failed', err)
@@ -7985,7 +8041,10 @@ export function useRemoteControl(
         vp9_444FramesDecoded.value = Math.max(vp9_444FramesDecoded.value, 1)
         markConnect('first_frame')
         logConnectTiming('first-frame')
-        console.info('[rc] vp9-444 first frame', msg.width, 'x', msg.height)
+        // FR-130 P2 — what the decoder says it produced (P3 reads it per session).
+        console.info('[rc] vp9-444 first frame', msg.width, 'x', msg.height, '| decoded colour space', colorSpaceLabel(msg.colorSpace))
+      } else if (msg.type === 'colorspace-dropped') {
+        warnColorSpaceDropped('vp9-444', msg)
       } else if (msg.type === 'decoder-configured') {
         // `pref` (round 3) = the hardwareAcceleration ACTUALLY passed to
         // configure() Ã¢ÂÂ proves whether the roomler-rc-decode-pref A/B took.
@@ -7993,7 +8052,8 @@ export function useRemoteControl(
         // the truth (this worker decodes VP9, AV1 and H.264). The pill reads
         // it until the agent names its encoder.
         dcDecoderCodec.value = typeof msg.codec === 'string' ? msg.codec : null
-        console.info('[rc] vp9-444 decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference')
+        // FR-130 P2 — `colorSpace`: what configure() was told (none: the stream decides).
+        console.info('[rc] vp9-444 decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference', '| colour space', colorSpaceLabel(msg.colorSpace))
       } else if (msg.type === 'decoder-error'
         || msg.type === 'decoder-configure-error'
         || msg.type === 'decode-error') {
@@ -8137,6 +8197,8 @@ export function useRemoteControl(
           chunkFraming: sessionChunkFraming,
           // FR-16 L4 — resolved per session; see `sessionBench`.
           bench: sessionBench,
+          // FR-130 P2 — resolved per session; see `sessionColorSpace`.
+          colorSpace: sessionColorSpace,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -8275,11 +8337,16 @@ export function useRemoteControl(
           '[rc] hevc first frame', msg.width, 'x', msg.height,
           '| coded', msg.coded, 'display', msg.display, 'visible', msg.visible,
           '| crop', msg.crop, 'rewrapped', msg.rewrapped,
+          // FR-130 P2 — what the decoder says it produced (P3 reads it per session).
+          '| decoded colour space', colorSpaceLabel(msg.colorSpace),
         )
+      } else if (msg.type === 'colorspace-dropped') {
+        warnColorSpaceDropped('hevc', msg)
       } else if (msg.type === 'decoder-configured') {
         // `pref` (round 3) Ã¢ÂÂ see the vp9-444 handler.
         dcDecoderCodec.value = typeof msg.codec === 'string' ? msg.codec : null
-        console.info('[rc] hevc decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference')
+        // FR-130 P2 — `colorSpace`: what configure() was told (none: the stream decides).
+        console.info('[rc] hevc decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference', '| colour space', colorSpaceLabel(msg.colorSpace))
       } else if (msg.type === 'decoder-error'
         || msg.type === 'decoder-configure-error'
         || msg.type === 'decode-error') {
@@ -8395,6 +8462,8 @@ export function useRemoteControl(
           chunkFraming: sessionChunkFraming,
           // FR-16 L4 — resolved per session; see `sessionBench`.
           bench: sessionBench,
+          // FR-130 P2 — resolved per session; see `sessionColorSpace`.
+          colorSpace: sessionColorSpace,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -10947,6 +11016,21 @@ export function useRemoteControl(
     // will answer it, decided before any worker is told.
     sessionBenchMode = benchSessionMode(storedBenchMode(), agent?.value?.capabilities?.video)
     sessionBench = sessionBenchMode !== null
+    // FR-130 P2 — tell the decoders the colour space the agent converted with,
+    // on every session from every agent (open decision 2): every agent so far
+    // converts the captured BGRA with BT.601 at limited range and advertises
+    // nothing about it, and for VP9 the decoder config is the only fix
+    // (Chrome's WebCodecs ignores VP9's own description). Off only under this
+    // browser's kill switch, `roomler-rc-colorspace=off`.
+    // ⚠️ The hook: an agent that ever converts otherwise would advertise a
+    // token in `AgentCaps.video` (FR-130 adds none), and it would be read
+    // into `agentConvertsBt601Limited` here, turning the override off for
+    // that agent so its stream's own description decides.
+    const agentConvertsBt601Limited = true
+    sessionColorSpace = agentConvertsBt601Limited && storedColorSpaceOverride()
+    if (!sessionColorSpace) {
+      console.info('[rc] decoder colour space: not set this session (roomler-rc-colorspace=off) - each stream\'s own description decides (FR-130 P2)')
+    }
     if (sessionBenchMode === 'probe') {
       console.info('[rc] bench mode: the agent advertised `bench`; probing once the input channel opens (FR-16 L4)')
     } else if (sessionBenchMode === 'target') {

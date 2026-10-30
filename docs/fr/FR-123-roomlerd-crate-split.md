@@ -1,6 +1,7 @@
 # FR-123: The daemon compiles in parallel — `roomlerd` split into sibling crates
 
-**Issue:** [#2941](https://github.com/gjovanov/roomler-ai/issues/2941) · **Status:** P2 merged 2026-10-27
+**Issue:** [#2941](https://github.com/gjovanov/roomler-ai/issues/2941) · **Status:** **parked 2026-10-30 after P2**
+(the operator, decision 9: the compile left the release's critical path; P3 and P4 not started). P2 merged 2026-10-27
 (#2999, master `ae5ca6f6e`), released in 0.4.180: the daemon compiles as one unit. Probe v3 measured −14.3 % /
 −30.5 % of its compile; 0.4.180's rehearsal reads −19 % / −12 % on the two Linux lanes, the only ones steady
 enough to read from one release (§8.1); every artifact is 3.2–7.8 % smaller, and its post-roll check passed. AC1, read on three releases, is not met; by decision 8 (2026-10-28) it is now judged phase by phase on a same-runner A/B. P1 (#2944) held, a draft · **Owner:** the agent's build shape (with FR-6 for the lane and
@@ -581,10 +582,10 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
 | **P0** | this spec, the claim, the Phase 0 measurements (§2.2) and the probes (§2.4, §8) | runs 40303391151 (v1), 40308429566 (v2) | spec PR #2942; v1 measured 2026-10-26, v2 in flight |
 | **P1** | `roomler-node-tunnel` (§3.4): the crate, the registry inversion, the licence tables, the CI lanes, the anchor pass | the v2 probe's same-runner A/B, Windows + macOS; then **re-measured on top of P2** (base vs A vs A + P1, one runner per OS) | PR #2944, every lane green; alone: −6.7 % / −12.6 % time, +3.4 % / +3.1 % size; **on top of A: −0.6 % / −1.4 % time, +4.1 % size** (§2.4 v3) — **held** (decision 7): A + P1 is still smaller than today (−1.7 % / −7.9 %), but P1 earns ~1 % now; the recipe waits for a sibling with sync work |
 | **P2** | the former bin as one unit (§3.6, option A, decided 2026-10-27): `src/main.rs` → `src/app.rs`, `pub mod app`, the bin one call; its tests run for the first time; the anchor pass | same-runner A/B against 0.4.178's tree (§2.4 v3); the field proof is 0.4.180's rehearsal build steps (AC1) and its MSI size notice (AC2) | **merged** 2026-10-27, #2999 → master `ae5ca6f6e`; **measured −14.3 % / −30.5 % time, −5.6 % / −11.6 % size**; **released in 0.4.180** (§8.1): the bin's 132–303 s are gone on all four lanes, the daemon's compile is −19 % / −12 % on the steady Linux lanes, every artifact 3.2–7.8 % smaller; its post-roll check passed on 2026-10-28 (AC3's half); owed: AC1's three releases |
-| **P3** | `roomler-node-media` (§3.5), in a merge window FR-118/119 agree to | same-runner A/B, sibling by sibling | after P2 |
-| **P4** | `roomler-node-host` (§3.7) | same-runner A/B | after P3 (or before, if P3's window is late) |
+| **P3** | `roomler-node-media` (§3.5), in a merge window FR-118/119 agree to | same-runner A/B, sibling by sibling | **parked** 2026-10-30 (decision 9), not started |
+| **P4** | `roomler-node-host` (§3.7) | same-runner A/B | **parked** with P3 (decision 9), not started |
 | **P5** | Hive's crate — FR-90 P8-1, with the dependency property of §3.1 | FR-90's | FR-90's schedule |
-| **P6** | docs: the crate layout in `docs/architecture.md` (workspace map + a daemon section with §3.2's rules), `CLAUDE.md`'s Architecture tree, a row in `docs/README.md`'s index, this spec's status | — | the map and the tree carry P1 since #2944; the section and the row with P2 |
+| **P6** | docs: the crate layout in `docs/architecture.md` (workspace map + a daemon section with §3.2's rules), `CLAUDE.md`'s Architecture tree, a row in `docs/README.md`'s index, this spec's status | — | the map and the tree carry P1 since #2944; the section and the row with P2; owed before a close, which the park (decision 9) is not |
 
 ## 5. Acceptance criteria
 
@@ -699,6 +700,22 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
    and the reseed an hour later compiled the same code with the `.pkg` lib's codegen at 1,374 s and
    713 s (§8). The tree also grows from release to release. The alternatives stay recorded: (a) keep
    AC1 as written and read the median of the three; (c) both.
+9. **Whether to go on past P2** — **decided 2026-10-30 (the operator): park.** FR-123 stays open,
+   with P2 shipped, P1 held as a draft (#2944), and P3 and P4 not started. The reasons:
+   - **The compile left the release's critical path.** Since FR-6 wave 29, a tag run reuses its
+     rehearsal's build and compiles nothing. 0.4.187 did so in 8 of 8 jobs and published 5 min 33 s
+     after its tag. FR-6 closed on 2026-10-30, so what this FR could still shorten is the rehearsal
+     and the post-release reseed.
+   - **P3 is the largest move left, with the least evidence of payoff.** On master `97ff97213` the
+     media plane is 130 files and 107,691 lines, 31 % of the crate's 347,043, and its files reach 12
+     modules that stay in the hub. By the probe's IR attribution (§2.4) the media modules are a few
+     per cent of the lib (`encode` 2.2 %, `input` 0.7 %). P1, the one sibling measured on top of P2,
+     earned about 1 % of time for +4.1 % of size (decision 7).
+   - **There is no merge window.** Four open PRs edit the plane's files: #3102, #3111, #3119, #3121.
+
+   What would reopen it: a release compile back on the critical path (same-tree reuse lost or
+   switched off), a rehearsal whose wait starts to matter, or a size budget that pays for a sibling
+   (decision 7's alternatives). AC1 stays unmet, and P6's docs (AC7) are owed before any close.
 
 ## 7. Out of scope
 
@@ -730,6 +747,7 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
 | 2026-10-28 16:49Z | AC1 read 3: 0.4.182's rehearsal (run 40723384188, `ca5e34764`), the third release with P2 | build steps: MSI 814 s, `.pkg` 822, `.deb` x86_64 484 and aarch64 457. Lib · bin · total: aarch64 423 · 3 · 426 s (front end 46 s), x86_64 443 · 1 · 444 (63), `.pkg` 764 · 5 · 769 (92), MSI 715 · 3 · 718. The three reads' medians: MSI 814 s (+15.8 % against 0.4.173), `.pkg` 884 s (+7.0 %), so AC1 is not met. Against the 39 runs before P2, Linux keeps −18 % / −12 % while the MSI and `.pkg` sit at their old medians (decision 8) |
 | 2026-10-28 20:05Z | 0.4.183's rehearsal (run 40742354169, tree `7daedbf21ffd`) and its post-release reseed (run 40754452329, master `200a521c7`: the same code plus a docs commit), an hour apart | build steps on the rehearsal: MSI 614 s, `.pkg` 1,519 s (a new high), `.deb` x86_64 510 and aarch64 475. The `.pkg`'s lib codegen took **1,374 s** (front end 99 s) on the rehearsal and **713 s** (68 s) on the reseed; 0.4.182's was 672 s (92 s), and Linux codegen moved only +3 % / +8 %. A nearly 2× spread on one phase of identical work, read as runner noise. The reseed's `.pkg` built its dependencies cold, its seed past the cap (FR-6 wave 32), which can only have slowed it |
 | 2026-10-28 20:30Z | The operator decided 8: (b), each phase by its same-runner A/B, with the release reading as a normalised sanity check | recorded in §6; AC1 reworded in §5 (the first wording kept); #2941 comment 6479859634 carried the evidence |
+| 2026-10-30 02:00Z | The operator decided 9: park after P2. Measured on master `97ff97213` first: the media plane's size (130 files, 107,691 of 347,043 lines) and its reach into the hub (12 modules), plus four open PRs editing its files | recorded in §6 and §4; #2941 comment 6513094898; P1 #2944 stays a draft |
 
 ### 8.1 Reading the release side (0.4.180)
 

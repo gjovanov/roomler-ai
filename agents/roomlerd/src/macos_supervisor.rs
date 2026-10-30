@@ -321,6 +321,9 @@ pub const WORKER_ENV_FORWARD: &[&str] = &[
     // VideoToolbox's IOSurface form, and opens the session's encoders.
     "ZERO_COPY",
     "ZERO_COPY_DENY",
+    // FR-130 — the colour description's switch: the worker's encoders write
+    // it, and its probe says `color-described` in the hello it computes.
+    "COLOR_DESCRIPTION",
 ];
 
 /// The worker's `ROOMLERD_<suffix>=<value>` assignments: every
@@ -1372,6 +1375,8 @@ mod tests {
             // FR-118 P5 — the switch and its denylist bind the worker too.
             "ZERO_COPY" => Some("1".to_string()),
             "ZERO_COPY_DENY" => Some("hevc_videotoolbox:gpu".to_string()),
+            // FR-130 — the root's `color_description = false` binds the worker.
+            "COLOR_DESCRIPTION" => Some("0".to_string()),
             // FR-97 P2c — the root's `[virtual_desktop_apps] enabled = false`.
             "APPS" => Some("0".to_string()),
             // Set on the root, but root-only: never forwarded.
@@ -1387,6 +1392,7 @@ mod tests {
                 "ROOMLERD_ENCODER_CELLS_DENY=hevc_videotoolbox:yuv444",
                 "ROOMLERD_ZERO_COPY=1",
                 "ROOMLERD_ZERO_COPY_DENY=hevc_videotoolbox:gpu",
+                "ROOMLERD_COLOR_DESCRIPTION=0",
             ]
         );
         assert!(

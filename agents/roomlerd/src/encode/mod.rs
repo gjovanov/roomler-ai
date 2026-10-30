@@ -23,7 +23,14 @@ pub mod caps;
 pub mod caps_cache;
 pub mod cells;
 pub mod color;
+/// FR-130 P1 — the colour description every encoder writes, in one place.
+pub mod color_desc;
 pub mod hwid;
+
+/// FR-130 P1 — TEST-ONLY readers of the colour description a bitstream
+/// carries (H.264/HEVC SPS VUI, AV1 `color_config`, a VP9 keyframe header).
+#[cfg(test)]
+pub(crate) mod bitstream_color;
 
 #[cfg(feature = "openh264-encoder")]
 pub mod openh264_backend;
@@ -81,6 +88,14 @@ pub(crate) mod plan;
 pub mod prior;
 /// FR-35 P2 — per-peer rate memory (one JSON file in the data dir).
 pub mod rate_memory;
+/// FR-63 B1 — ONE delay-based rate controller, run in SHADOW beside the
+/// governor (pure; no clock, no I/O). Replaces eight estimators of one
+/// quantity; shadow-first, so it drives nothing until B2's flip criterion.
+/// No `dead_code` allowance, deliberately: the governor constructs and feeds it
+/// on EVERY build, so nothing in it is legitimately dead — and an allowance here
+/// once hid an unused test helper from the default lane while the
+/// `ffmpeg-encoder` lane (no `-A dead_code`) caught it (PR #3102's first CI run).
+pub mod ratectl;
 /// FR-63 B0 — the deterministic rate-law simulator. TEST-ONLY: it ships zero
 /// bytes, and it exists so the cells the field cannot summon (a genuinely thin
 /// pipe, a link that stalls on cue) can still be run against the SHIPPED laws.
@@ -326,6 +341,23 @@ pub fn encoder_inplace_rate_enabled() -> bool {
     tunnel_core::env::node_env("ENCODER_INPLACE_RATE").as_deref() == Some("1")
 }
 
+/// FR-62 A1 — the HRD/VBV reservoir an in-place rate move writes, in bits.
+///
+/// Flag OFF is the pre-A1 write: a 1× window (`target`), which silently
+/// resizes the reservoir on every move. Flag ON sizes it to the window the
+/// session opened with (`target × hrd_pct / 100`, the open's `open_hrd_pct`),
+/// which on a constrained session is deliberately below 1× — matching the open
+/// is the point, and a `.max(target)` floor here would re-create the pre-A1
+/// divergence. Pure and in the ungated module, so the lane everyone runs pins
+/// the OFF arm (AC5: `encoder_inplace_rate = false` is today's behaviour).
+pub fn inplace_rate_bufsize(target: usize, hrd_pct: usize, inplace_rate: bool) -> usize {
+    if inplace_rate {
+        (target.saturating_mul(hrd_pct) / 100).max(1)
+    } else {
+        target
+    }
+}
+
 /// FR-62 A2 — escape hatch: force NVENC rate moves back onto the pre-A2
 /// IDR-rationing path (the pump defers a constrained increase instead of
 /// applying it live) if some driver ever emits a keyframe on an in-place
@@ -509,6 +541,49 @@ pub fn rate_slow_start_enabled() -> bool {
     tunnel_core::env::node_env("RATE_SLOW_START").as_deref() == Some("1")
 }
 
+/// FR-63 B1 — whether the shadow controller (`encode::ratectl`) runs beside the
+/// governor.
+///
+/// ⚠️ B1 has exactly two modes, and NEITHER drives the encoder: the shadow
+/// observes and emits `shadow_*` heartbeat fields, nothing more. `live` — the
+/// controller actually steering the rate — is **FR-63 B2**, which adds the
+/// config-surface tribool and the one apply seam; it is deliberately not a value
+/// B1 understands, so there is no way to turn the shadow into a driver by a
+/// config edit on a B1 fleet. This mirrors FR-70 M3a's shadow plan, which also
+/// ships with no live path and no config key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RatectlMode {
+    /// The shadow does not run (the kill switch, for a host where the extra
+    /// per-window bookkeeping is ever suspected — it should never be).
+    Off,
+    /// The shipped B1 posture: the controller runs, emits `shadow_*`, drives
+    /// nothing.
+    Shadow,
+}
+
+impl RatectlMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RatectlMode::Off => "off",
+            RatectlMode::Shadow => "shadow",
+        }
+    }
+}
+
+/// Default ON (`Shadow`): the shadow is the point of B1. `ROOMLERD_RATECTL=off`
+/// is the only value that stops it; any other value is `shadow`. Env-only in
+/// B1 — the config-surface key lands with `live` in B2.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn ratectl_mode() -> RatectlMode {
+    match tunnel_core::env::node_env("RATECTL").as_deref() {
+        Some("off") => RatectlMode::Off,
+        _ => RatectlMode::Shadow,
+    }
+}
+
 /// FR-70 M1 — the FFmpeg encoder lives on its own OS thread per session
 /// (`rc-enc-<session>`) behind a command channel, instead of encoding under
 /// `block_in_place` on whichever runtime worker polls the pump. Every
@@ -551,6 +626,18 @@ pub fn pump_stall_warn_ms() -> u64 {
 #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
 pub fn par_convert_enabled() -> bool {
     tunnel_core::env::node_env("PAR_CONVERT").as_deref() != Some("0")
+}
+
+/// FR-130 P1 — every encoder writes the colour description its input was
+/// converted with ([`color_desc::DESCRIPTION`]: the BT.601 matrix at limited
+/// range), so a decoder stops guessing BT.709 for an HD picture and shifting
+/// every saturated colour (#3049). Default **on**. `ROOMLERD_COLOR_DESCRIPTION=0`
+/// / config `color_description = false` writes exactly the undescribed stream
+/// every earlier agent sent. Read at every encoder open, in every family
+/// (FFmpeg, Media Foundation, openh264, libvpx), and by the hello's
+/// `color-described` token; the probe and recorder children inherit it.
+pub fn color_description_enabled() -> bool {
+    tunnel_core::env::flag("COLOR_DESCRIPTION", true)
 }
 
 /// FR-10 kill switch (2026-08-27): when on (default), CONSTRAINED sessions
@@ -1660,6 +1747,21 @@ fn hw_auto_disabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-62 AC5 — with `encoder_inplace_rate` OFF an in-place move writes
+    /// the pre-A1 1× window, whatever the session opened with; ON writes the
+    /// open's window, below 1× on a constrained session, never a `.max(target)`.
+    #[test]
+    fn inplace_rate_off_writes_the_pre_a1_one_times_window() {
+        for hrd_pct in [25usize, 100, 200] {
+            assert_eq!(inplace_rate_bufsize(3_000_000, hrd_pct, false), 3_000_000);
+        }
+        assert_eq!(inplace_rate_bufsize(3_000_000, 100, true), 3_000_000);
+        assert_eq!(inplace_rate_bufsize(3_000_000, 200, true), 6_000_000);
+        assert_eq!(inplace_rate_bufsize(3_000_000, 25, true), 750_000);
+        // Never zero: FFmpeg reads 0 as "unset" and would size the window itself.
+        assert_eq!(inplace_rate_bufsize(1, 25, true), 1);
+    }
 
     /// FR-112 P2 — at 30 the base is exactly today's; at 60 it grows by √2,
     /// not 2×; it never leaves the bitrate bounds.

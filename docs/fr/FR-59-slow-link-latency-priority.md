@@ -1,6 +1,6 @@
 # FR-59 — Slow-link latency priority: make delay the controlled variable
 
-**Issue:** [#1163](https://github.com/gjovanov/roomler-ai/issues/1163) · **Status:** P1–P8 shipped (0.4.47 → 0.4.50); **0.4.47–0.4.49 regressed the fleet** — see "What the field regression taught"; AC4 open ·
+**Issue:** [#1163](https://github.com/gjovanov/roomler-ai/issues/1163) · **Status:** P1–P8 shipped (0.4.47 → 0.4.50); **0.4.47–0.4.49 regressed the fleet** — see "What the field regression taught"; AC1–AC5 open (they need a relay-locked CORPLAP pair); **AC6 unit-verified 2026-10-29** ·
 **Parent/siblings:** FR-1 (drag smoothness), FR-14 (direct jitter), FR-15 (age feedback),
 FR-17 (partial-reliability video), FR-35 (relay ceiling learns the pair)
 
@@ -40,14 +40,14 @@ therefore **increased**.
 ### The six mechanisms
 
 1. **A hard 1.5 Mbps bitrate floor.** `MIN_BITRATE_BPS = 1_500_000`
-   (`agents/roomlerd/src/encode/mod.rs:202`); on a constrained path `area_min_bitrate_bps()`
-   (`:215`) returns exactly it, and `governor.rs:317` passes it as the AIMD's `floor_bps`.
+   (`agents/roomlerd/src/encode/mod.rs:217`); on a constrained path `area_min_bitrate_bps()`
+   (`:215`) returns exactly it, and `governor.rs:327` passes it as the AIMD's `floor_bps`.
    **The encoder cannot be told to emit less than 1.5 Mbps, ever** — 3.8× the measured pipe at
    best, 23× in the worst window. Every other lever is downstream of a target the encoder is
    not allowed to reach.
 
 2. **The measured-goodput clamp is off on exactly the path that needs it.**
-   `governor.rs:299` — `if self.measured_ceiling && !constrained` — is DIRECT-only, disabled
+   `governor.rs:309` — `if self.measured_ceiling && !constrained` — is DIRECT-only, disabled
    for relay on 2026-08-27 because lumpy TURN-TCP samples crashed the down-fast EWMA. So the
    relay path has **no rate anchor at all**. And `derived_ceiling_bps` is itself
    `.max(1_000_000)` (`goodput.rs:107`), so even re-enabled it could not describe a 395 kbps
@@ -71,7 +71,7 @@ therefore **increased**.
    `age_over` cuts **fps** and issues an AIMD MD — which stops at the 1.5 Mbps floor.
 
 6. **Video rides a reliable + ordered DataChannel.** FR-17 stage B exists but is behind a
-   viewer `localStorage` opt-in (`useRemoteControl.ts:3128`). On a lossy mobile link every lost
+   viewer `localStorage` opt-in (`useRemoteControl.ts:3129`). On a lossy mobile link every lost
    chunk head-of-line-blocks the stream *and* burns scarce capacity retransmitting a frame that
    is already stale. `peer.rs:2871` still records "a gap cannot occur".
 
@@ -156,7 +156,12 @@ evidence is why both are already in the stats).
       2,284–7,095 ms band to **under 600 ms sustained**, with the before/after heartbeats recorded.
 - [ ] **AC5** — No regression on a healthy relay (CORPLAP-3 from the office LAN) or a direct
       path: `target_bps`, age and `frames_skipped_backpressure` unchanged within noise.
-- [ ] **AC6** — Every phase's kill switch restores the prior behaviour, verified by unit test.
+- [x] **AC6** — Every phase's kill switch restores the prior behaviour, verified by unit test.
+      **Unit-verified 2026-10-29** — every switch in the Phases table traced from its config
+      key to the line that consumes it, each with a unit test that drives it OFF and asserts the
+      pre-phase behaviour ("AC6 — the kill-switch audit" below). Two gaps found and closed in the
+      same PR: P6's governor-level wiring had no OFF arm, and nothing pinned P8's ladder at or
+      above the floor. Each new test was shown to FAIL against a mutation first.
 - [x] **AC7** (P8) — On a constrained session whose `target_bps` sits below 1.5 M, the encoder
       FOLLOWS it: `bytes_written` per encoded frame ≤ 1.5 × `target_bps` ÷ `target_fps` ÷ 8
       over any 10-window span (the 0.4.49 signature was exactly 1.5 M ÷ fps ÷ 8 per frame
@@ -170,6 +175,53 @@ evidence is why both are already in the stats).
       LAN session on CORPLAP-3, 171 in a day on CORPLAP-1).
       **Field-verified 2026-09-02 on 0.4.50**: 0 in the AFTER session at 25 mouse events/s,
       against 24 in 2 minutes at 1.7 events/s on 0.4.49 the same hour, same path.
+
+## AC6 — the kill-switch audit (2026-10-29)
+
+Every switch in the Phases table, traced from its config key to the line that consumes it,
+with the unit test that drives it OFF and asserts the pre-phase behaviour. Anchors are
+against master `f4ec58e55`; the two tests marked **this PR** are the gaps the audit found.
+The plumbing is one shape for all of them:
+
+```mermaid
+flowchart LR
+  cfg["config.toml / remote config<br/>slow_link_floor … slow_link_profile"] --> bridge["env bridge<br/>config.rs:3156–3161 → ROOMLERD_*"]
+  bridge --> rd["readers<br/>encode/mod.rs:317–448<br/>on unless the value is \"0\""]
+  rd --> gf["GovernorFlags::from_env<br/>governor.rs:171"]
+  rd --> pk["PlanKnobs::from_env<br/>plan.rs:187 (P2)"]
+  rd --> pump["pump, resolved once<br/>peer.rs:6362 (P5) · :6745 (P2)"]
+  gf --> gov["RateGovernor<br/>:449 opener (P8) · :750 learner (P6)<br/>:827 floor (P1) · :1264 clamp (P3) · :1279 drain (P4)"]
+```
+
+| Phase | Switch → flag | Consumed at | OFF-arm unit test — what it asserts |
+|---|---|---|---|
+| **P1** | `ROOMLERD_SLOW_LINK_FLOOR=0` → `GovernorFlags.floor_relief` | `governor.rs:827` | `governor.rs:2256` `a_measured_slow_pipe_lets_the_floor_and_the_target_descend` — the OFF arm on a measured 395 kbps pipe: `relieved_floor_bps() == None`, target pinned at `MIN_BITRATE_BPS` ("3.8× the measured pipe"); `:2330` the direct path untouched either way |
+| **P2** | `ROOMLERD_CONSTRAINED_QUEUE_MEASURED=0` → `PlanKnobs.constrained_queue_measured`, and the pump's local | `plan.rs:233`; `peer.rs:7692` | `rate_profile.rs:1521` `constrained_queue_reference_only_ever_lowers` — OFF with a 395 kbps belief ⇒ the nominal ceiling verbatim; `plan.rs:913` `a_constrained_budget_is_the_reference_rate_s_window_floored_at_one_chunk` — OFF ⇒ 168,750 B, the once-resolved band; `plan.rs:1599` ties the knob to the per-frame reader |
+| **P3** | `ROOMLERD_VIEWER_RATE_CLAMP=0` → `viewer_rate_clamp` | `governor.rs:1264` — `link_acts` gates all three effects: the capacity observation, the fps cap (`link_over`), the AIMD sample | `governor.rs:2754` `the_viewer_link_clamp_is_off_by_switch_and_on_direct` — eight windows of a growing viewer queue: `!link_congested`, target still at the ceiling, no relief |
+| **P4** | `ROOMLERD_QUEUE_DRAIN=0` → `queue_drain` | `governor.rs:1279` | `governor.rs:2490` `the_drain_is_off_by_switch_and_on_direct` — a 400 ms-deep queue orders no drain and `draining()` is never true |
+| **P5** | `ROOMLERD_SLOW_LINK_PROFILE=0` → `slow_link_profile(_, enabled)` | `peer.rs:6362`, resolved once at pump start | `rate_profile.rs:1499` `the_slow_link_profile_engages_only_on_a_remembered_slow_pair` — OFF on the remembered 395 kbps pair ⇒ `None`: native size, native fps, and the refine lift eligible again (`peer.rs:8096`) |
+| **P6** | `ROOMLERD_SEED_CONTRADICTION=0` → `seed_contradiction` | `governor.rs:750` → `CeilingLearner::on_measurement` | `ceiling_learn.rs:368` `on_measurement_is_inert_without_a_contradiction` — OFF on a real contradiction ⇒ `None`, the 5.1 M seed stands; **this PR** `governor.rs` `a_contradicted_seed_stands_when_the_switch_is_off` — the governor's flag reaches the learner (one line of wiring no other test drove OFF) |
+| **P7** | `localStorage['roomler-rc-unordered-video']` ≠ `'1'` | `useRemoteControl.ts:4769`, channels at `:8159` / `:8419` | `useRemoteControl.spec.ts:1744` the reliable + ordered profile is the default, `:1773` off unless exactly `'1'`. The reorder buffer itself has no switch (the Phases table says so); its in-order contract — the pre-stage-C assembler's — is `rcChunkFraming.spec.ts:28–95` |
+| **P8** | `slow_link_floor` (the opener and the relative step ride on it) | `governor.rs:449` (`open_seed_bps` filtered on `floor_relief`); `aimd.rs:269` | `governor.rs:2092` `seed_opening_is_inert_without_the_floor_relief` — OFF ⇒ opens at the 2.55 M cap, no seed, no relief; `aimd.rs:676` `ai_step_is_relative_below_the_nominal_floor` — the step at or above the floor unchanged; **this PR** `aimd.rs` `the_ladder_extension_is_inert_at_or_above_the_nominal_floor` — every rung P8 added sits below the floor and the coarsening at or above it equals the pre-P8 table's (`bc4a9a3e3^`) value for value, so a switched-off session, pinned at the floor, never reaches one |
+| **T1** | none — a parse fix | `crates/vendored/webrtc-sctp` | not a switch; the vendored parser's own tests plus the CI drift gate (`ci.yml:273`, `scripts/revendor-webrtc-sctp.sh --check`) |
+
+`config_surface.rs:4315` `env_bridge_pairs_have_surface_parity` is the test that every key above is also
+editable through the config surface, not only by env.
+
+**Fail-first.** A unit test is evidence only if it fails without the thing it protects, so each
+new test was run against a mutation before the tick: `governor.rs:750` hard-wired to `true`
+fails `a_contradicted_seed_stands_when_the_switch_is_off` (the seed is abandoned), and a
+1.75 M rung added to the ladder fails `the_ladder_extension_is_inert_at_or_above_the_nominal_floor`.
+
+**What the audit leaves outside unit reach**, named rather than rounded up:
+
+- The pump's inline pass-throughs — `peer.rs:6362` (P5), `:7692` (P2), `:8096` / `:8487`
+  (the refine hold on P5's profile) — are not unit-testable. P2's law is the plan's, and the
+  shadow's `plan_divergences` counts any drift between the two in the field.
+- `P3=0` alone does not silence the viewer's link report: the drain it can order is P4's, behind
+  P4's own switch. Both off ⇒ the report is observe-only.
+- With FR-63's `rate_slow_start` on (default OFF) the floor descends to `slow_link_min_bitrate`
+  without P1 (`governor.rs:855`). That is FR-63's switch, not this FR's.
 
 ## What building P1–P4 + P6 changed about the design
 

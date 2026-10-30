@@ -334,10 +334,12 @@ impl VtInput {
 /// (FR-118 open decision 3). Measured on the MacBook, macOS 27, 2026-10-29,
 /// `h264_videotoolbox` on 75 % colour bars: unmarked, VideoToolbox converts
 /// with BT.709 (green's Y 133 against the CPU path's 112). Marked, it converts
-/// with BT.601, within 2 code values in every plane. Either way the stream
-/// carries no colour description, as the CPU path's does not. The session's
-/// own colour properties are no substitute: they tag the stream BT.601 and
-/// still convert with BT.709.
+/// with BT.601, within 2 code values in every plane. The session's own colour
+/// properties are no substitute: they tag the stream BT.601 and still convert
+/// with BT.709. Since FR-130 P1 the session carries them anyway, from the
+/// codec context (`build_encoder`): this mark fixes the CONVERSION, those
+/// properties are the SIGNALLING, and both forms' streams describe the same
+/// BT.601 limited range.
 fn wrap(
     buffer: CvPixelBufferRef,
     keep: Option<IoSurfaceFrame>,
@@ -658,6 +660,8 @@ mod tests {
         let _guard = knobs();
         let _switch = Saved::cleared("ZERO_COPY");
         let _deny = Saved::cleared("ZERO_COPY_DENY");
+        // FR-130 P1 — the default: both forms describe their colour.
+        let _colour = Saved::cleared("COLOR_DESCRIPTION");
         let (w, h) = (480u32, 270u32);
         let name = "h264_videotoolbox";
         let encode = |gpu: bool| -> Vec<u8> {
@@ -719,6 +723,21 @@ mod tests {
             cpu_tags, gpu_tags,
             "the GPU form describes its colour as the CPU form does"
         );
+        // FR-130 P1 — and that description is `color_desc`'s, read from the
+        // SPS itself. VideoToolbox takes CoreVideo's names, which merge
+        // BT.601's two matrix codes and BT.709's two transfer codes, so it is
+        // held to their meaning (`Signalled::check`).
+        for (form, stream) in [("CPU", &cpu), ("GPU", &gpu)] {
+            let sps = crate::encode::bitstream_color::h264(stream)
+                .unwrap_or_else(|e| panic!("{form} form: {e}"));
+            println!("{form} form's SPS: {sps:?}");
+            if let Err(e) = sps.check(
+                crate::encode::color_desc::DESCRIPTION,
+                crate::encode::bitstream_color::Vocabulary::Merged,
+            ) {
+                panic!("{form} form: {e}");
+            }
+        }
         let mut worst = 0f64;
         for (i, bgr) in BARS.iter().enumerate() {
             let cx = i * 60 + 22;

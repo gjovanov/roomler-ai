@@ -138,8 +138,8 @@ Inputs: per frame `SendSample { capacity, depth, bytes_inflight, queue_budget, n
 `pre_encode_tick`'s position; per 1 s `Window { fps, struggling, age (avg,min,rtt), rx_bps,
 queue_ms, goodput, sent_bps, frames_lost, delay_slope_ms_s }` at `tick_viewer_window`; events
 (full channel, overflow, blocked-send stall). **Viewer adds** (all optional; older viewers omit;
-`decodeStatWireMessage` `useRemoteControl.ts:1288–1270`, parser `peer.rs:7519–7365`): `frames_lost`
-(chunk gaps, already in `rc-hevc-worker.ts:330`), `frames_rx`, `delay_slope_ms_s` (least-squares
+`decodeStatWireMessage` `useRemoteControl.ts:1289–1270`, parser `peer.rs:7519–7365`): `frames_lost`
+(chunk gaps, already in `rc-hevc-worker.ts:349`), `frames_rx`, `delay_slope_ms_s` (least-squares
 slope of the window's per-frame `arrival − wire` — `QueueDrift` in `rc-hop-stats.ts:102–138` already
 holds the pairs), `age_p95_ms`. **Bounds:** `RateDomain { floor, ceiling }` — the single source of
 pins; floor is a constant per path (`area_min_bitrate_bps` direct, 200 k constrained), ceiling =

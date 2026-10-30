@@ -142,6 +142,12 @@ pub struct GovernorFlags {
     /// change ships live without field evidence. Every other field defaults
     /// on because it already earned that.
     pub slow_start: bool,
+    /// FR-63 B1 — whether the shadow controller (`encode::ratectl`) runs beside
+    /// the governor. `Shadow` (default) runs it observe-only; `Off` is the kill
+    /// switch. It steers NOTHING in B1 — the heartbeat's `shadow_*` fields are
+    /// its only output — so, unlike every other flag here, turning it on cannot
+    /// change a rate the encoder sees.
+    pub ratectl: super::RatectlMode,
 }
 
 impl Default for GovernorFlags {
@@ -157,6 +163,9 @@ impl Default for GovernorFlags {
             queue_drain: true,
             // FR-63 — see the field doc: OFF even here, until field evidence.
             slow_start: false,
+            // FR-63 B1 — the shadow runs by default; it drives nothing, so ON
+            // is the shipped posture (unlike `slow_start`, which acts).
+            ratectl: super::RatectlMode::Shadow,
         }
     }
 }
@@ -177,6 +186,7 @@ impl GovernorFlags {
             viewer_rate_clamp: super::viewer_rate_clamp_enabled(),
             queue_drain: super::queue_drain_enabled(),
             slow_start: super::rate_slow_start_enabled(),
+            ratectl: super::ratectl_mode(),
         }
     }
 }
@@ -324,6 +334,15 @@ pub struct RateGovernor {
     /// The ramp doubles on a clean window and ENDS on a dirty one, so this is
     /// the one bit of state that decides which.
     slow_start_congested: bool,
+    /// FR-63 B1 — the ONE delay-based controller, run in SHADOW. `Some` unless
+    /// `ratectl = off`; fed at the live positions, read only by the `shadow_*`
+    /// accessors below.
+    ///
+    /// ⚠️ **Nothing the live path computes may read this.** It is the FR's whole
+    /// safety property for this phase: the controller observes and the heartbeat
+    /// reports, and `tests::the_shadow_never_moves_the_live_decision` holds the
+    /// line. B2 adds the one seam that lets it steer; B1 has none.
+    shadow: Option<super::ratectl::Controller>,
 }
 
 /// FR-71 T1a — what the pump measured about its own send side over one
@@ -467,6 +486,16 @@ impl RateGovernor {
             slow_start: None,
             slow_start_logged: false,
             slow_start_congested: false,
+            // FR-63 B1 — the shadow controller, seeded with the same
+            // remembered-slow rate the live opener uses (FR-59 P8). `None` when
+            // the kill switch is off. It opens lazily at its first domain, like
+            // the AIMD.
+            shadow: match flags.ratectl {
+                super::RatectlMode::Off => None,
+                super::RatectlMode::Shadow => {
+                    Some(super::ratectl::Controller::new(ceiling_seed_bps))
+                }
+            },
         }
     }
 
@@ -658,6 +687,11 @@ impl RateGovernor {
         // below so it is not lost when the AIMD has not been built yet. The
         // first frames of a session are exactly when that happens.
         self.slow_start_congested = true;
+        // FR-63 B1 — the SHADOW hears the same budget-gate skip (a congestion
+        // sample, not a blocked send), also before the `?`.
+        if let Some(s) = self.shadow.as_mut() {
+            s.on_budget_skip(now);
+        }
         let ctrl = self.aimd.as_mut()?;
         ctrl.observe(self.send_depth as u32, true, now);
         let bps = ctrl.take_pending()?;
@@ -865,6 +899,16 @@ impl RateGovernor {
         };
         let depth = self.send_depth;
         let open_seed_bps = self.open_seed_bps;
+        // FR-63 B1 — feed the SHADOW the same resolved domain and occupancy the
+        // live AIMD below gets, and let it open on its first frame. Placed where
+        // no `&mut self.aimd` borrow is live and before the `?` the AIMD takes,
+        // so the shadow sees every frame. It returns nothing; its only outlet is
+        // the `shadow_*` heartbeat accessors.
+        if let Some(s) = self.shadow.as_mut() {
+            s.mark_opened(now);
+            s.set_domain(floor_bps, ceiling_bps, constrained);
+            s.observe_frame(send_capacity == 0, now);
+        }
         let ctrl = self.aimd.get_or_insert_with(|| {
             // FR-59 P1 — construct at the floor already in force rather
             // than the flat `MIN_BITRATE_BPS`, so the constructor's own
@@ -904,6 +948,10 @@ impl RateGovernor {
         // FR-63 — congestion for the opener's ramp; see `on_backpressure_skip`
         // for why this precedes the `?`.
         self.slow_start_congested = true;
+        // FR-63 B1 — the SHADOW hears the same overflow, before the `?`.
+        if let Some(s) = self.shadow.as_mut() {
+            s.on_overflow(now);
+        }
         let ctrl = self.aimd.as_mut()?;
         ctrl.note_buffer_overflow(now);
         let bps = ctrl.take_pending()?;
@@ -928,6 +976,11 @@ impl RateGovernor {
     pub fn note_send_stall(&mut self, wait: Duration, now: Instant) {
         // FR-63 — a blocked send is congestion for the opener's ramp.
         self.slow_start_congested = true;
+        // FR-63 B1 — the SHADOW hears the same stall: a hard one (≥ 1 s) halves
+        // it, a softer one is a rate-limited decrease.
+        if let Some(s) = self.shadow.as_mut() {
+            s.on_stall(wait, now);
+        }
         // FR-70 P1 — and the pipe pushing back, for the prior's window verdict.
         self.stall_seen = true;
         // FR-35 — a send blocked ≥ 1 s is a HARD stall and earns ×0.5 rather
@@ -1393,6 +1446,32 @@ impl RateGovernor {
         } else {
             None
         };
+        // FR-63 B1 — fold the SAME window into the shadow controller, reading
+        // only what the live loops above already computed. It returns nothing
+        // and no field below is a function of it. `frames_lost` is 0 until the
+        // viewer-feedback v2 wire (B2) carries it, so the loss trigger is inert
+        // in B1 — the age LEVEL, goodput and the full channel carry the verdict.
+        // `frames_rx` is the viewer's reported fps, which is also the `fps == 0`
+        // "no evidence" sentinel (a window the viewer painted nothing in).
+        let shadow_goodput = self.goodput.estimate_bps(now);
+        if let Some(s) = self.shadow.as_mut() {
+            s.fold_window(
+                &super::ratectl::ShadowWindow {
+                    fps: reported_fps,
+                    struggling,
+                    age_avg_ms: report.map(|(avg, _, _)| avg),
+                    age_min_ms: report.map(|(_, min, _)| min),
+                    rtt_ms: report.map(|(_, _, rtt)| rtt),
+                    rx_bps: link.map(|(rx, _)| rx),
+                    queue_ms: link.map(|(_, q)| q),
+                    goodput_bps: shadow_goodput,
+                    sent_bps,
+                    frames_rx: reported_fps,
+                    frames_lost: 0,
+                },
+                now,
+            );
+        }
         Some(ViewerWindow {
             reported_fps,
             struggling,
@@ -1575,6 +1654,58 @@ impl RateGovernor {
         self.frames_skipped_decode
     }
 
+    // --- FR-63 B1 — the shadow controller's outputs, for the heartbeat ---
+    //
+    // These accessors are the ONLY path out of the shadow. None of them feeds a
+    // live decision; the controller drives nothing until B2. `None` throughout
+    // when `ratectl = off` or the shadow has not opened yet.
+
+    /// What the shadow controller would be targeting right now.
+    pub fn shadow_target_bps(&self) -> Option<u32> {
+        self.shadow
+            .as_ref()
+            .and_then(super::ratectl::Controller::target_bps)
+    }
+
+    /// The shadow's state machine position (`startup`/`normal`/`overuse`/
+    /// `hold`/`underuse`), or `off` when the shadow is not running.
+    pub fn shadow_state(&self) -> &'static str {
+        self.shadow.as_ref().map_or("off", |s| s.state().as_str())
+    }
+
+    /// The shadow's own estimate of what the path carries.
+    pub fn shadow_measured_bps(&self) -> Option<u32> {
+        self.shadow
+            .as_ref()
+            .and_then(super::ratectl::Controller::measured_bps)
+    }
+
+    /// Why the shadow's target last moved.
+    pub fn shadow_reason(&self) -> &'static str {
+        self.shadow.as_ref().map_or("off", |s| s.reason().as_str())
+    }
+
+    /// Bounded pauses the shadow would have ordered on a constrained path (it
+    /// cannot pause anything in B1 — this counts what it would have done).
+    pub fn shadow_pauses(&self) -> u32 {
+        self.shadow
+            .as_ref()
+            .map_or(0, super::ratectl::Controller::pauses)
+    }
+
+    /// `(shadow − live) / live`, percent — the quantity the flip criterion
+    /// reads. NEGATIVE means the shadow asked for LESS than the governor
+    /// applied, the safe direction. `None` when the shadow is off, has no target
+    /// yet, or the live target is 0.
+    pub fn shadow_disagree_pct(&self) -> Option<i32> {
+        let shadow = self.shadow_target_bps()?;
+        let live = self.applied_bps();
+        if live == 0 {
+            return None;
+        }
+        Some(((i64::from(shadow) - i64::from(live)) * 100 / i64::from(live)) as i32)
+    }
+
     fn record_applied(&mut self, bps: u32) -> AppliedBitrate {
         let changed = bps != self.applied_bps;
         self.applied_bps = bps;
@@ -1602,6 +1733,129 @@ mod tests {
             None,
             now,
         )
+    }
+
+    /// FR-63 B1 — the containment proof, and the only field evidence B1 can
+    /// offer (a fleet release is a different phase). Two governors, identical
+    /// but for `ratectl` (Off vs the shipped Shadow), driven through the SAME
+    /// frames, events and windows — a thin constrained pipe that congests, then
+    /// recovers — must produce byte-identical LIVE output: the applied bitrate,
+    /// the relieved floor, the pipe-state tally, the link stats and the goodput
+    /// samples. The shadow observes and the heartbeat reports; it steers
+    /// nothing. If a future edit ever wires it into a live decision, this test
+    /// goes red. (Red-run confirmed 2026-10-29: making the shadow's fold write
+    /// `self.applied_bps` fails exactly this test.)
+    #[test]
+    fn the_shadow_never_moves_the_live_decision() {
+        let now = Instant::now();
+        let mk = |mode: crate::encode::RatectlMode| {
+            RateGovernor::new(
+                30,
+                DEPTH,
+                GovernorFlags {
+                    ratectl: mode,
+                    ..GovernorFlags::default()
+                },
+                0,
+                Some(300_000), // a remembered-slow pair, so the shadow opens and climbs
+                now,
+            )
+        };
+        let mut off = mk(crate::encode::RatectlMode::Off);
+        let mut shadow = mk(crate::encode::RatectlMode::Shadow);
+        assert!(off.shadow_target_bps().is_none(), "Off runs no shadow");
+        // `shadow` has no target until its first `set_domain` (it opens lazily,
+        // like the AIMD); the end-of-test assertions prove it opened and ran.
+
+        // Drive both byte-identically. A constrained session: a floor of 1.5 M,
+        // a 2.55 M ceiling, send capacity swinging full↔free, viewer windows
+        // with a rising then falling age, and a hard stall partway.
+        let mut t = now;
+        let ceiling = 2_550_000u32;
+        let floor = 1_500_000u32;
+        for i in 0..120u32 {
+            t += Duration::from_millis(33);
+            let capacity = if i % 7 == 0 { 0 } else { DEPTH }; // periodic full
+            let a = off.pre_encode_tick(ceiling, floor, true, capacity, t);
+            let b = shadow.pre_encode_tick(ceiling, floor, true, capacity, t);
+            assert_eq!(
+                a.map(|x| x.bps),
+                b.map(|x| x.bps),
+                "pre_encode_tick diverged at frame {i}"
+            );
+            if i == 40 {
+                // `note_send_stall` returns () (it feeds the AIMD a sample for
+                // the next tick); the per-step `applied_bps` assertions below
+                // are what prove it did the same thing to both governors.
+                off.note_send_stall(Duration::from_secs(2), t);
+                shadow.note_send_stall(Duration::from_secs(2), t);
+            }
+            if i % 30 == 29 {
+                // A viewer window: a rising age in the first half, falling after.
+                let age = if i < 70 { 400u16 } else { 40u16 };
+                let packed_age = viewer_rate::pack_age(age, age, 80);
+                let packed_link = viewer_rate::pack_link(900_000, if i < 70 { 150 } else { 0 });
+                let packed_report = viewer_rate::pack_report(28, i < 70);
+                let va = off.tick_viewer_window(
+                    t,
+                    30,
+                    || packed_report,
+                    || packed_age,
+                    || packed_link,
+                    true,
+                    |d| d,
+                    u64::from(i) * 50_000,
+                );
+                let vb = shadow.tick_viewer_window(
+                    t,
+                    30,
+                    || packed_report,
+                    || packed_age,
+                    || packed_link,
+                    true,
+                    |d| d,
+                    u64::from(i) * 50_000,
+                );
+                // ViewerWindow is not PartialEq; compare the fields the pump
+                // reads and acts on.
+                assert_eq!(
+                    va.map(|w| (w.skip_divisor, w.age_over, w.link_congested, w.drain_for_ms)),
+                    vb.map(|w| (w.skip_divisor, w.age_over, w.link_congested, w.drain_for_ms)),
+                    "tick_viewer_window diverged at frame {i}"
+                );
+            }
+            // Every live output must match at every step.
+            assert_eq!(
+                off.applied_bps(),
+                shadow.applied_bps(),
+                "applied_bps at {i}"
+            );
+            assert_eq!(
+                off.relieved_floor_bps(),
+                shadow.relieved_floor_bps(),
+                "relieved_floor_bps at {i}"
+            );
+            assert_eq!(
+                off.pipe_state_counts(),
+                shadow.pipe_state_counts(),
+                "pipe_state_counts at {i}"
+            );
+            assert_eq!(off.link_stats(), shadow.link_stats(), "link_stats at {i}");
+            assert_eq!(
+                off.goodput_samples(),
+                shadow.goodput_samples(),
+                "goodput_samples at {i}"
+            );
+            assert_eq!(off.viewer_age(), shadow.viewer_age(), "viewer_age at {i}");
+        }
+
+        // And the shadow actually did something — otherwise the test proves
+        // only that a dead controller is inert.
+        assert!(
+            shadow.shadow_target_bps().is_some(),
+            "the shadow must have a target to be worth containing"
+        );
+        assert_ne!(shadow.shadow_state(), "off", "the shadow must have run");
     }
 
     /// FR-79 — the WIRING (the classifier is unit-tested in
@@ -2834,6 +3088,56 @@ mod tests {
             g.effective_ceiling(3_000_000, true),
             3_000_000,
             "back to the nominal band"
+        );
+    }
+
+    /// FR-59 P6 kill switch — the SAME contradiction, ignored: nothing is
+    /// abandoned and the session keeps planning at the seeded ceiling until
+    /// the AIMD walks it down, which is the pre-P6 posture.
+    ///
+    /// The learner proves the switch for itself
+    /// (`ceiling_learn::on_measurement_is_inert_without_a_contradiction`);
+    /// this proves the governor's FLAG reaches it. The wiring is one line —
+    /// `on_measurement(g, self.slow_link.seed_contradiction)` — and every
+    /// other test constructs the flags with the field on, so a hard-wired
+    /// `true` there would have passed the whole module (AC6).
+    #[test]
+    fn a_contradicted_seed_stands_when_the_switch_is_off() {
+        let start = Instant::now();
+        let mut g = RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                seed_contradiction: false,
+                ..GovernorFlags::default()
+            },
+            8_000_000,
+            Some(5_964_000),
+            start,
+        );
+        assert_eq!(g.effective_ceiling(3_000_000, true), 5_069_400);
+        // The field pipe, 12.8× under the seed — the ON arm above abandons on it.
+        let sink = g.goodput_sink();
+        for _ in 0..12 {
+            sink.record(1_000, Duration::from_micros(20_248));
+        }
+        let t1 = start + Duration::from_secs(2);
+        g.tick_viewer_window(t1, 30, || 0, || 0, || 0, true, |o| o, 0);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, 0, t1);
+        assert_eq!(
+            g.blocked_send_bps(t1),
+            Some(395_100),
+            "the contradicting measurement is held — the switch is the only thing in the way"
+        );
+        assert_eq!(
+            g.take_seed_abandoned(),
+            None,
+            "kill switch: nothing abandoned"
+        );
+        assert_eq!(
+            g.effective_ceiling(3_000_000, true),
+            5_069_400,
+            "the seed stands until the AIMD walks it down"
         );
     }
 

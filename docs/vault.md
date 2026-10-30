@@ -594,10 +594,10 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the device's switch | `vault_enabled` ([`config.rs:579`](../crates/agent-core/src/config.rs#L579)), off, never pushable: [`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9453) |
+| the device's switch | `vault_enabled` ([`config.rs:579`](../crates/agent-core/src/config.rs#L579)), off, never pushable: [`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9460) |
 | the key, and its half in the hello | [`vault.rs:35`](../agents/roomlerd/src/vault.rs#L35) `hello_key`, feature `vault` (it implies `hive`, and no release build carries it yet); the hello at [`signaling.rs:1673`](../agents/roomlerd/src/signaling.rs#L1673) |
 | the wire | `AgentHello::vault_key` ([`signaling.rs:593`](../crates/remote_control/src/signaling.rs#L593)) and [`vault_key_is_well_formed`](../crates/remote_control/src/signaling.rs#L120) |
-| what the fleet stores | [`socket.rs:103`](../crates/modules/fleet/src/socket.rs#L103), [`AgentDao::update_hello`](../crates/services/src/dao/agent.rs#L491), `Agent::vault_key` ([`models.rs:2264`](../crates/remote_control/src/models.rs#L2264)); no route answers it |
+| what the fleet stores | [`socket.rs:103`](../crates/modules/fleet/src/socket.rs#L103), [`AgentDao::update_hello`](../crates/services/src/dao/agent.rs#L491), `Agent::vault_key` ([`models.rs:2271`](../crates/remote_control/src/models.rs#L2271)); no route answers it |
 
 ## 10. Leases (P3-3b)
 
@@ -1105,7 +1105,7 @@ sequenceDiagram
 
 | Step | What holds | Where |
 |---|---|---|
-| the switch | the device's own `vault_activity_log`, default off, read at each primary hello. Never pushable: like `ssh_activity_log`, it is the device's word about itself, and a test holds every remote configuration to leaving it out | [`config.rs:588`](../crates/agent-core/src/config.rs#L588), [`config_surface.rs:509`](../crates/agent-core/src/config_surface.rs#L509), [`models.rs:9541`](../crates/remote_control/src/models.rs#L9541) |
+| the switch | the device's own `vault_activity_log`, default off, read at each primary hello. Never pushable: like `ssh_activity_log`, it is the device's word about itself, and a test holds every remote configuration to leaving it out | [`config.rs:588`](../crates/agent-core/src/config.rs#L588), [`config_surface.rs:509`](../crates/agent-core/src/config_surface.rs#L509), [`models.rs:9548`](../crates/remote_control/src/models.rs#L9548) |
 | the report | after a `vault_exec` that ran its command (the program, and its exit code or its timeout) and a `vault_render` that wrote its file (its name), naming every lease the use took, asked for there or ahead. A call refused before anything ran or was written reports nothing. Fire-and-forget: a full connection drops the report rather than hold the call | [`vault.rs:689`](../agents/roomlerd/src/vault.rs#L689), [`vault_exec.rs:471`](../agents/roomlerd/src/hive/vault_exec.rs#L471), [`vault_render.rs:300`](../agents/roomlerd/src/hive/vault_render.rs#L300) |
 | the frame | `rc:vault.activity {session_id, fence, kind, lease_ids, target, exit_code?, timed_out?}`. `kind` is `exec` (a command `vault_exec` ran: the program as the target, and how it ended) or `render` (a file `vault_render` wrote: its name as the target); 1 to 8 leases. Fire-and-forget, like `rc:ssh.activity`: no answer, and an older server ignores it | [`signaling.rs:1565`](../crates/remote_control/src/signaling.rs#L1565), [`vault.rs:340`](../crates/remote_control/src/vault.rs#L340) |
 | the queue | the connection's own lease queue: a flood is dropped at its bound like a flood of requests, and each connection's reports are handled in order. At most 120 a minute per session on its device | [`lease.rs:463`](../crates/modules/vault/src/lease.rs#L463) |
@@ -2230,7 +2230,7 @@ bash elsewhere.
 
 | Piece | Where |
 |---|---|
-| the wire | `rc:vault.ssh` ([`signaling.rs:1629`](../crates/remote_control/src/signaling.rs#L1629)) · `rc:vault.ssh.granted` ([`:5110`](../crates/remote_control/src/signaling.rs#L5110)) · `rc:vault.refused`; `no_target` ([`vault.rs:222`](../crates/remote_control/src/vault.rs#L222)); the accounts' words, `SshAccountMode::wire` ([`models.rs:2736`](../crates/remote_control/src/models.rs#L2736)), locked against serde's |
+| the wire | `rc:vault.ssh` ([`signaling.rs:1629`](../crates/remote_control/src/signaling.rs#L1629)) · `rc:vault.ssh.granted` ([`:5110`](../crates/remote_control/src/signaling.rs#L5110)) · `rc:vault.refused`; `no_target` ([`vault.rs:222`](../crates/remote_control/src/vault.rs#L222)); the accounts' words, `SshAccountMode::wire` ([`models.rs:2743`](../crates/remote_control/src/models.rs#L2743)), locked against serde's |
 | the decision | `ssh:run` in the schema ([`policy.cedarschema:170`](../crates/modules/vault/src/policy.cedarschema#L170)) and `Ask::SshRun` ([`policy.rs`](../crates/modules/vault/src/policy.rs)) |
 | the handler | [`ssh.rs`](../crates/modules/vault/src/ssh.rs) `ticket` ([`ssh.rs:87`](../crates/modules/vault/src/ssh.rs#L87): the checks above), answered in order on the lease queue (§10) |
 | the ticket | [`auth/mod.rs`](../crates/services/src/auth/mod.rs): `TokenType::SshTicket`, `issue_ssh_ticket`, `verify_ssh_ticket`, `ssh_ticket_holds` |
