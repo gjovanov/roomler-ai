@@ -384,6 +384,11 @@ async fn serve_halves(
     let serving = Arc::new(super::vault_connect::handed::Serving::default());
     #[cfg(worker_calls)]
     let _stops_all = serving.all.clone().drop_guard();
+    // FR-90 P8-2c-2 — the toolbelts this worker serves. Unix only so far.
+    #[cfg(all(worker_calls, unix))]
+    let toolbelt_serving = Arc::new(super::toolbelt::handed::Serving::default());
+    #[cfg(all(worker_calls, unix))]
+    let _stops_all_toolbelts = toolbelt_serving.all.clone().drop_guard();
     let ended = loop {
         let m = match recv(&mut rd).await {
             Ok(Some(m)) => m,
@@ -419,16 +424,22 @@ async fn serve_halves(
                 // the egress fronts' two, the HTTP one's first), so they are
                 // taken here, in order, before the next frame is read.
                 let listeners = match (&call, &descriptors) {
-                    (Call::Serve { .. }, Some(ch)) => vec![fds::recv(ch).await],
+                    (Call::Serve { .. } | Call::ToolbeltServe { .. }, Some(ch)) => {
+                        vec![fds::recv(ch).await]
+                    }
                     (Call::Egress { .. }, Some(ch)) => {
                         let http = fds::recv(ch).await;
                         vec![http, fds::recv(ch).await]
                     }
                     _ => Vec::new(),
                 };
-                let (link, serving) = (Arc::clone(&link), Arc::clone(&serving));
+                let (link, serving, toolbelt_serving) = (
+                    Arc::clone(&link),
+                    Arc::clone(&serving),
+                    Arc::clone(&toolbelt_serving),
+                );
                 tokio::spawn(async move {
-                    let answer = answer_call(&link, &serving, call, listeners);
+                    let answer = answer_call(&link, &serving, &toolbelt_serving, call, listeners);
                     let _ = link.answer(id, answer).await;
                 });
                 Ok(())
@@ -445,6 +456,8 @@ async fn serve_halves(
                 });
                 Ok(())
             }
+            // (Unix's own arm, above, passes `toolbelt_serving` too — FR-90
+            // P8-2c-2 has no Windows variant yet.)
             #[cfg(worker_calls)]
             Msg::Answer { id, answer } => {
                 link.answered(id, answer);
@@ -464,6 +477,7 @@ async fn serve_halves(
 fn answer_call(
     link: &Arc<link::Link>,
     serving: &Arc<super::vault_connect::handed::Serving>,
+    #[cfg(unix)] toolbelt_serving: &Arc<super::toolbelt::handed::Serving>,
     call: Call,
     #[cfg(unix)] listeners: Vec<std::io::Result<std::os::fd::OwnedFd>>,
 ) -> Answer {
@@ -516,6 +530,47 @@ fn answer_call(
                 why: "the daemon answers that, never a worker".into(),
             }
         }
+        // FR-90 P8-2c-2 — the toolbelt. Unix only so far.
+        #[cfg(unix)]
+        Call::ToolbeltServe {
+            endpoint,
+            session,
+            fence,
+            peer,
+        } => match next() {
+            Ok(fd) => super::toolbelt::handed::serve_handed(
+                toolbelt_serving,
+                Arc::clone(link),
+                session,
+                fence,
+                peer,
+                endpoint,
+                fd,
+            ),
+            Err(refused) => refused,
+        },
+        #[cfg(unix)]
+        Call::ToolbeltClose { endpoint } => {
+            super::toolbelt::handed::close_handed(toolbelt_serving, endpoint)
+        }
+        #[cfg(unix)]
+        Call::ToolbeltAnswer {
+            endpoint,
+            id,
+            answer,
+        } => super::toolbelt::handed::answered(toolbelt_serving, endpoint, &id, answer),
+        #[cfg(unix)]
+        Call::ToolbeltWithdraw { endpoint, id } => {
+            super::toolbelt::handed::withdrawn(toolbelt_serving, endpoint, &id)
+        }
+        #[cfg(unix)]
+        Call::ToolbeltWithdrawAll { endpoint } => {
+            super::toolbelt::handed::withdrawn_all(toolbelt_serving, endpoint)
+        }
+        #[cfg(unix)]
+        Call::ToolbeltOpen { .. } | Call::ToolbeltClosed { .. } => Answer::Refused {
+            why: "the daemon answers that, never a worker".into(),
+        },
     }
 }
 
@@ -1037,6 +1092,9 @@ async fn life(
             // P8-2a-4b — and the run's egress fronts. Unix only so far.
             #[cfg(unix)]
             super::egress::handed::rehand(session, fence, &link).await;
+            // FR-90 P8-2c-2 — and the toolbelt. Unix only so far.
+            #[cfg(unix)]
+            super::toolbelt::handed::rehand(session, fence, &link).await;
         });
     }
     let mut relay = log::Relay::new(pid);
@@ -1143,6 +1201,40 @@ fn answer_worker(run: &Run, link: &Arc<link::Link>, id: u64, call: Call) {
             Call::Egress { .. } => Answer::Refused {
                 why: "a worker asks the daemon for values and the egress proxy's answers alone"
                     .into(),
+            },
+            // FR-90 P8-2c-2 — the toolbelt's approvals. Unix only so far.
+            #[cfg(unix)]
+            Call::ToolbeltOpen {
+                endpoint,
+                id,
+                tool_name,
+                tool_use_id,
+                input,
+            } => {
+                super::toolbelt::handed::opened(
+                    session,
+                    fence,
+                    endpoint,
+                    id,
+                    tool_name,
+                    tool_use_id,
+                    input,
+                )
+                .await
+            }
+            #[cfg(unix)]
+            Call::ToolbeltClosed {
+                endpoint,
+                id,
+                ended,
+            } => super::toolbelt::handed::closed(session, fence, endpoint, id, ended).await,
+            #[cfg(unix)]
+            Call::ToolbeltServe { .. }
+            | Call::ToolbeltClose { .. }
+            | Call::ToolbeltAnswer { .. }
+            | Call::ToolbeltWithdraw { .. }
+            | Call::ToolbeltWithdrawAll { .. } => Answer::Refused {
+                why: "the worker answers that, never the daemon".into(),
             },
         };
         let _ = link.answer(id, answer).await;

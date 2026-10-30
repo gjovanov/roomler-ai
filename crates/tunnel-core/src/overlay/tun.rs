@@ -3371,6 +3371,114 @@ mod system {
                 let mine = (Ipv4Addr::new(100, 65, 4, 0), 22);
                 assert_eq!(overlapping_sibling(&existing, "roomler-abc", mine), None);
             }
+
+            /// A `tracing` writer into a buffer, so a test can read the WARN
+            /// line `register` formats rather than only the decision behind
+            /// it. Installed thread-scoped (`with_default`), so a parallel
+            /// test's events never land in it.
+            #[derive(Clone, Default)]
+            struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+            impl std::io::Write for Captured {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+
+            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+                type Writer = Captured;
+                fn make_writer(&'a self) -> Captured {
+                    self.clone()
+                }
+            }
+
+            impl Captured {
+                fn text(&self) -> String {
+                    String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+                }
+            }
+
+            /// Run `f` with every WARN+ event captured, and return the text.
+            fn capture_warns(f: impl FnOnce()) -> String {
+                let buf = Captured::default();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(buf.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::WARN)
+                    .finish();
+                tracing::subscriber::with_default(subscriber, f);
+                buf.text()
+            }
+
+            /// FR-68 AC9 — a nested pair (a legacy `/10` primary beside a
+            /// carved `/22` secondary) EMITS the overlap WARN. The vectors
+            /// above lock the decision; this locks the last ten lines of
+            /// `register` — the line an operator will actually read, naming
+            /// the adapter, its block, and the sibling to renumber away from.
+            ///
+            /// The registry is process-global, so the adapter names are
+            /// unique to this test and removed again: another test running
+            /// beside it must neither see them nor be seen by them. A
+            /// stranger's entry overlapping ours could only ADD a WARN, never
+            /// suppress this one, so the assertion is on the line naming our
+            /// own nested adapter.
+            #[test]
+            fn a_nested_legacy_and_carved_pair_emits_the_overlap_warn() {
+                let legacy = (Ipv4Addr::new(100, 64, 0, 0), 10);
+                let carved = (Ipv4Addr::new(100, 65, 4, 0), 22);
+                let out = capture_warns(|| {
+                    register("fr68-ac9-legacy", 0xF68A_C901, Some(legacy));
+                    register("fr68-ac9-carved", 0xF68A_C902, Some(carved));
+                    deregister("fr68-ac9-carved");
+                    deregister("fr68-ac9-legacy");
+                });
+                let line = out
+                    .lines()
+                    .find(|l| l.contains("adapter=fr68-ac9-carved"))
+                    .unwrap_or_else(|| {
+                        panic!("no WARN named the nested adapter; captured:\n{out}")
+                    });
+                assert!(line.contains("WARN"), "it is a WARN, not lower: {line}");
+                assert!(
+                    line.contains("OVERLAPPING v4 blocks"),
+                    "the line must say what is wrong: {line}"
+                );
+                assert!(
+                    line.contains("block=100.65.4.0/22")
+                        && line.contains("sibling=fr68-ac9-legacy")
+                        && line.contains("sibling_block=100.64.0.0/10"),
+                    "the line must name both blocks and the sibling adapter, so the \
+                     operator knows which org to renumber: {line}"
+                );
+                assert!(
+                    line.contains("Renumber one org"),
+                    "the line must say what to do about it: {line}"
+                );
+            }
+
+            /// The shipped fleet shape — two carved `/22`s, disjoint by the
+            /// registry's construction — must stay SILENT. A WARN here would
+            /// fire on every healthy multi-org host and train operators to
+            /// ignore the real one.
+            #[test]
+            fn two_carved_disjoint_blocks_emit_no_overlap_warn() {
+                let a = (Ipv4Addr::new(100, 65, 20, 0), 22);
+                let b = (Ipv4Addr::new(100, 65, 28, 0), 22);
+                let out = capture_warns(|| {
+                    register("fr68-ac9-quiet-a", 0xF68A_C903, Some(a));
+                    register("fr68-ac9-quiet-b", 0xF68A_C904, Some(b));
+                    deregister("fr68-ac9-quiet-b");
+                    deregister("fr68-ac9-quiet-a");
+                });
+                assert!(
+                    !out.lines().any(|l| l.contains("adapter=fr68-ac9-quiet-")),
+                    "disjoint carved blocks must not warn; captured:\n{out}"
+                );
+            }
         }
     }
 

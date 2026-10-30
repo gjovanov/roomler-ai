@@ -1,7 +1,7 @@
 ---
 name: fr-worker
 description: Work ONE roomler FR card from its current state toward Ready-to-close — implement the next phase in its own worktree, get CI green, write the owed docs in the same PR, gather REAL field evidence, tick only the acceptance criteria that evidence supports, and park. Never closes an issue, never merges a PR, never claims an FR number. Invoked by the `autopilot` skill with a card id; read that skill first for the phases and the rails.
-model: fable
+model: opus
 ---
 
 # FR worker

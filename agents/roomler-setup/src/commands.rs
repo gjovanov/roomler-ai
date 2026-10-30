@@ -369,6 +369,22 @@ pub struct DoneReport {
     /// page then shows the manual command), `None` it did not apply (a plain
     /// token, a per-user or tunnel install, non-Windows).
     pub anchored: Option<bool>,
+    /// FR-129 B2 — the macOS root half this install enrolled beside the
+    /// person's device: its own device row, the one that owns the overlay.
+    /// `None` everywhere else.
+    pub root_half: Option<RootHalfReport>,
+}
+
+/// FR-129 B2 — the device the macOS root half enrolled as, for the Done page.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RootHalfReport {
+    pub principal_id: String,
+    pub tenant_id: String,
+    /// Its device name (`<name>-daemon`).
+    pub name: String,
+    /// `/etc/roomler/config.toml` — root's, 0600.
+    pub config_path: String,
 }
 
 /// Drive the full install pipeline end-to-end for the picked role:
@@ -391,25 +407,43 @@ pub struct DoneReport {
 /// `device_name = ""`.
 ///
 /// FR-129 A3 — `usePaired: true` installs with the token the pairing
-/// delivered ([`crate::pairing::PairStore::token_for`]) instead of the
+/// delivered ([`crate::pairing::PairStore::tokens_for`]) instead of the
 /// pasted one; the SPA then passes `token: ""`. Everything from the
 /// orchestrators on is the same call with the same token argument — a
 /// paired token is an ordinary single-use enrollment token. The session
 /// is cleared only when the install SUCCEEDS, so a Retry after a failure
 /// before the enroll reads the same token again. Absent or `false` is the
 /// pasted path, byte for byte as before.
+///
+/// FR-129 B2 — on macOS the daemon role with the private-network box ticked
+/// also installs the ROOT HALF, a second device with a token of its own: the
+/// pairing's second token, or on the pasted path `rootToken`, the second
+/// token the person pasted (required then, and never the first one again).
 #[tauri::command(rename_all = "camelCase")]
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_install(
     role: Role,
     server: String,
     token: String,
+    root_token: Option<String>,
     device_name: String,
     advanced: Option<crate::orchestrator_agent::AdvancedOptions>,
     use_paired: Option<bool>,
     on_event: tauri::ipc::Channel<wizard_shared::progress::ProgressEvent>,
 ) -> Result<DoneReport, String> {
     let store = crate::pairing::PairStore::global();
-    let (token, paired) = resolve_install_token(store, role, &server, token, use_paired)?;
+    let root_half = crate::role::wants_root_half(
+        crate::role::HostOs::current(),
+        role,
+        advanced.as_ref().and_then(|a| a.overlay_enabled),
+    );
+    let (tokens, paired) = resolve_install_tokens(
+        store, role, &server, token, root_token, use_paired, root_half,
+    )?;
+    let crate::pairing::InstallTokens {
+        main: token,
+        root_half: root_token,
+    } = tokens;
     let report = match role {
         Role::TunnelClient => {
             // Advanced options are daemon-config keys — the SPA hides the
@@ -436,6 +470,7 @@ pub async fn cmd_install(
                     role,
                     server,
                     token,
+                    root_token,
                     device_name,
                     advanced.unwrap_or_default(),
                     on_event,
@@ -450,24 +485,53 @@ pub async fn cmd_install(
     report
 }
 
-/// Which token `cmd_install` enrolls with: the pasted one as given, or —
-/// `use_paired` — the one the pairing delivered for this role and server,
-/// cloned out of the store. Returns the token and whether it came from the
+/// Which tokens `cmd_install` enrolls with: the pasted ones as given, or —
+/// `use_paired` — the ones the pairing delivered for this role and server,
+/// cloned out of the store. `root_half` (FR-129 B2): the install adds the
+/// macOS root half, which needs a second token — the pairing's second, or
+/// the second one pasted. Returns the tokens and whether they came from the
 /// pairing (so a success can close the session). A pasted call never reads
 /// the store, so a pairing left behind cannot leak into a paste.
-fn resolve_install_token(
+fn resolve_install_tokens(
     store: &crate::pairing::PairStore,
     role: Role,
     server: &str,
     pasted: String,
+    pasted_root: Option<String>,
     use_paired: Option<bool>,
-) -> Result<(String, bool), String> {
+    root_half: bool,
+) -> Result<(crate::pairing::InstallTokens, bool), String> {
     if use_paired.unwrap_or(false) {
-        let token = store.token_for(role, server)?;
-        Ok((token, true))
-    } else {
-        Ok((pasted, false))
+        return Ok((store.tokens_for(role, server, root_half)?, true));
     }
+    let root_half = if root_half {
+        let root = pasted_root
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| {
+                "the private network on a Mac is a second device with an enrollment token of its \
+                 own: paste a second token, or untick \"Join the overlay network\" to install \
+                 screen sharing only"
+                    .to_string()
+            })?;
+        if root == pasted.trim() {
+            return Err(
+                "the two tokens are the same token — each enrolls one device and works once, so \
+                 the private network needs a second, different one"
+                    .to_string(),
+            );
+        }
+        Some(root)
+    } else {
+        None
+    };
+    Ok((
+        crate::pairing::InstallTokens {
+            main: pasted,
+            root_half,
+        },
+        false,
+    ))
 }
 
 /// Pre-spawn cancel: flips the process-wide
@@ -566,6 +630,11 @@ pub enum PairStartView {
 /// rest. A pairing already held is replaced (its token dropped) — a Start
 /// again is this call.
 ///
+/// `rootHalf` (FR-129 B2) is the private-network box as the SPA shows it:
+/// on macOS the daemon role with it ticked adds the root half, so the
+/// pairing asks for `halves: 2` — one approval, two tokens. Anywhere else it
+/// changes nothing ([`crate::role::wants_root_half`]).
+///
 /// The verification URI must be a web address: the wizard opens it with
 /// the shell plugin, and a server that answered anything else is refused
 /// here rather than handed to the OS.
@@ -574,14 +643,20 @@ pub async fn cmd_pair_start(
     server: String,
     role: Role,
     device_name: String,
+    root_half: Option<bool>,
 ) -> Result<PairStartView, String> {
     use roomlerd::pairing::{StartOutcome, StartRequest, host_arch, host_os};
+    let halves = crate::role::pair_halves(crate::role::wants_root_half(
+        crate::role::HostOs::current(),
+        role,
+        root_half,
+    ));
     let request = StartRequest {
         machine_name: device_name,
         os: host_os(),
         arch: host_arch(),
         role: role.pair_role(),
-        halves: 1,
+        halves,
         client: "wizard".to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
     };
@@ -603,7 +678,7 @@ pub async fn cmd_pair_start(
         expires_in: started.expires_in,
         interval: started.interval,
     };
-    crate::pairing::PairStore::global().begin(server, role, started);
+    crate::pairing::PairStore::global().begin(server, role, halves, started);
     Ok(view)
 }
 
@@ -791,8 +866,20 @@ mod tests {
             cli_included: None,
             desktop_installed: None,
             anchored: None,
+            root_half: Some(RootHalfReport {
+                principal_id: "507f1f77bcf86cd799439012".to_string(),
+                tenant_id: "507f191e810c19729de860ea".to_string(),
+                name: "lab-daemon".to_string(),
+                config_path: "/etc/roomler/config.toml".to_string(),
+            }),
         };
         let json = serde_json::to_string(&r).unwrap();
+        // FR-129 B2: the root half's report binds camelCase too.
+        assert!(
+            json.contains(r#""rootHalf":{"principalId":"507f1f77bcf86cd799439012""#),
+            "{json}"
+        );
+        assert!(!json.contains("root_half"), "{json}");
         assert!(
             json.contains(r#""principalKind":"tunnel_client""#),
             "{json}"
@@ -927,12 +1014,47 @@ mod tests {
         assert!(!is_web_address(""));
     }
 
+    /// One token, no root half: what `cmd_install` enrolls with.
+    fn resolve_install_token(
+        store: &crate::pairing::PairStore,
+        role: Role,
+        server: &str,
+        pasted: String,
+        use_paired: Option<bool>,
+    ) -> Result<(String, bool), String> {
+        resolve_install_tokens(store, role, server, pasted, None, use_paired, false).map(
+            |(t, paired)| {
+                assert!(t.root_half.is_none());
+                (t.main, paired)
+            },
+        )
+    }
+
+    fn started_pairing() -> roomlerd::pairing::Started {
+        roomlerd::pairing::Started {
+            device_code: roomlerd::pairing::DeviceCode::new("dc"),
+            user_code: "BCDF-GHJK".into(),
+            verification_uri: "https://example.invalid/pair".into(),
+            expires_in: 900,
+            interval: 5,
+        }
+    }
+
+    fn approved_with(tokens: &[&str]) -> roomlerd::pairing::PollOutcome {
+        roomlerd::pairing::PollOutcome::Approved(roomlerd::pairing::Approved {
+            tokens: tokens.iter().map(|t| t.to_string()).collect(),
+            org_name: "Acme".into(),
+            org_slug: Some("acme".into()),
+            approver_name: "Dana".into(),
+            approver_username: Some("dana".into()),
+        })
+    }
+
     /// `cmd_install`'s token choice: a pasted call never touches the store
     /// (a pairing left behind cannot leak into a paste), and a paired call
     /// reads the delivered token for its role and server — or refuses.
     #[test]
     fn install_token_resolution_keeps_the_paths_apart() {
-        use roomlerd::pairing::{Approved, DeviceCode, PollOutcome, Started};
         let store = crate::pairing::PairStore::new();
         let server = "https://example.invalid";
 
@@ -957,32 +1079,12 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("no pairing in progress"), "{e}");
 
-        let generation = store.begin(
-            server.to_string(),
-            Role::DaemonSystem,
-            Started {
-                device_code: DeviceCode::new("dc"),
-                user_code: "BCDF-GHJK".into(),
-                verification_uri: "https://example.invalid/pair".into(),
-                expires_in: 900,
-                interval: 5,
-            },
-        );
+        let generation = store.begin(server.to_string(), Role::DaemonSystem, 1, started_pairing());
         let e = resolve_install_token(&store, Role::DaemonSystem, server, "".into(), Some(true))
             .unwrap_err();
         assert!(e.contains("not been approved"), "{e}");
 
-        store.apply_poll(
-            generation,
-            PollOutcome::Approved(Approved {
-                tokens: vec!["eyJ.paired.sig".into()],
-                org_name: "Acme".into(),
-                org_slug: Some("acme".into()),
-                approver_name: "Dana".into(),
-                approver_username: Some("dana".into()),
-            }),
-            5,
-        );
+        store.apply_poll(generation, approved_with(&["eyJ.paired.sig"]), 5);
         let (t, paired) =
             resolve_install_token(&store, Role::DaemonSystem, server, "".into(), Some(true))
                 .unwrap();
@@ -1014,6 +1116,89 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// FR-129 B2 — the root half's token. Paired: the approval's second
+    /// token, from a pairing started for two halves. Pasted: the second
+    /// token the person pasted — required, and never the first one again (a
+    /// token works once; the second enroll would be refused after the first
+    /// had made its device). Without the root half a second paste is ignored.
+    #[test]
+    fn the_root_half_takes_a_token_of_its_own() {
+        let store = crate::pairing::PairStore::new();
+        let server = "https://example.invalid";
+
+        let (t, paired) = resolve_install_tokens(
+            &store,
+            Role::DaemonUser,
+            server,
+            "eyJ.user.sig".into(),
+            Some(" eyJ.root.sig\n".into()),
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(!paired);
+        assert_eq!(t.main, "eyJ.user.sig");
+        assert_eq!(t.root_half.as_deref(), Some("eyJ.root.sig"));
+
+        for missing in [None, Some(String::new()), Some("  \n".into())] {
+            let e = resolve_install_tokens(
+                &store,
+                Role::DaemonUser,
+                server,
+                "eyJ.user.sig".into(),
+                missing,
+                None,
+                true,
+            )
+            .unwrap_err();
+            assert!(
+                e.contains("paste a second token") && e.contains("Join the overlay network"),
+                "{e}"
+            );
+        }
+        let e = resolve_install_tokens(
+            &store,
+            Role::DaemonUser,
+            server,
+            "eyJ.same.sig".into(),
+            Some("eyJ.same.sig ".into()),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(e.contains("same token"), "{e}");
+
+        // No root half: a second paste goes nowhere.
+        let (t, _) = resolve_install_tokens(
+            &store,
+            Role::DaemonUser,
+            server,
+            "eyJ.user.sig".into(),
+            Some("eyJ.root.sig".into()),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(t.root_half.is_none());
+
+        // Paired: the two the approval delivered, in order.
+        let generation = store.begin(server.to_string(), Role::DaemonUser, 2, started_pairing());
+        store.apply_poll(generation, approved_with(&["eyJ.p1.sig", "eyJ.p2.sig"]), 5);
+        let (t, paired) = resolve_install_tokens(
+            &store,
+            Role::DaemonUser,
+            server,
+            String::new(),
+            None,
+            Some(true),
+            true,
+        )
+        .unwrap();
+        assert!(paired);
+        assert_eq!(t.main, "eyJ.p1.sig");
+        assert_eq!(t.root_half.as_deref(), Some("eyJ.p2.sig"));
     }
 
     #[test]

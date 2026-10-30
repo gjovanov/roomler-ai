@@ -5140,11 +5140,11 @@ async fn media_pump_vp9_444_dc(
                 // FR-70 M0 — the fused age split by plane (transit is an
                 // upper bound here: this pump keeps no send-wait figure).
                 age_split = ?governor.viewer_age_split(None),
-                // FR-71 T1a — which plane was the limiter last window, in
-                // SHADOW (nothing acts on it until T1b), and windows per
-                // verdict: [unknown, clear, overproduced, transit_stalled,
-                // viewer_late]. A repeat of finding 4 reads `transit-stalled`
-                // here while `target_bps` shows the cut T1b will remove.
+                // FR-71 T1a — which plane was the limiter last window (the
+                // verdict FR-79's gate reads; `evidence_rejected` below says
+                // what it rejected), and windows per verdict: [unknown, clear,
+                // overproduced, transit_stalled, viewer_late]. A repeat of
+                // finding 4 reads `transit-stalled` here, with no cut after it.
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
                 evidence_rejected = ?governor.evidence_rejected(),
@@ -9765,11 +9765,11 @@ async fn media_pump_ffmpeg_dc(
                 // iter_max 28 ms) reads here as transit ≈ 4.9 s. None = a
                 // pre-M0 viewer, or a window with no age report.
                 age_split = ?governor.viewer_age_split(Some(send_wait_avg_ms)),
-                // FR-71 T1a — which plane was the limiter last window, in
-                // SHADOW (nothing acts on it until T1b), and windows per
-                // verdict: [unknown, clear, overproduced, transit_stalled,
-                // viewer_late]. A repeat of finding 4 reads `transit-stalled`
-                // here while `target_bps` shows the cut T1b will remove.
+                // FR-71 T1a — which plane was the limiter last window (the
+                // verdict FR-79's gate reads; `evidence_rejected` below says
+                // what it rejected), and windows per verdict: [unknown, clear,
+                // overproduced, transit_stalled, viewer_late]. A repeat of
+                // finding 4 reads `transit-stalled` here, with no cut after it.
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
                 evidence_rejected = ?governor.evidence_rejected(),

@@ -36,14 +36,14 @@ full-tunnel VPN **has not worked**. **CI green ≠ done** — networking and
 remote-desktop changes are proven on the real fleet (`roomler exec`,
 `roomler ssh`) across those topologies after every roll.
 
-## 3. Model tier — this work runs on Fable, and stays on Fable
+## 3. Model tier — this work runs on Opus 5.5, and stays on it
 
 Any task touching **remote desktop / control**, **the WireGuard overlay, NAT
 traversal, relays, DERP or tunnels**, or **WebRTC video conferencing** is
 top-tier work. Do not route it to a weaker model — not Opus 4.8, not Sonnet, not
 Haiku — and do not quietly spend a smaller effort budget on it. Where a router, a
 subagent spawn or a cost heuristic is choosing the tier for this repository, the
-answer is **the strongest model available, at maximum effort**.
+answer is **Opus 5.5 (`opus`), at maximum effort**.
 
 That is not a preference. It is the shape the bugs in this codebase actually have:
 

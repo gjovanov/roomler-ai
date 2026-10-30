@@ -704,6 +704,11 @@ pub struct FfmpegEncoder {
         any(feature = "mf-encoder", feature = "wgc-capture")
     ))]
     refused_device: Option<super::gpu_hint::GpuDevice>,
+    /// FR-118 P5 — a VideoToolbox encoder opened in its GPU form takes every
+    /// frame as a `CVPixelBuffer` through this input (`None` = CPU frames,
+    /// today's path); replaced together with the encoder on a rebuild.
+    #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+    vt: Option<super::vt_input::VtInput>,
     /// FR-118 P2-2 — the input form this encoder opened in, and for CPU frames
     /// why.
     input: super::gpu_hint::InputForm,
@@ -782,6 +787,9 @@ struct Opened {
         any(feature = "mf-encoder", feature = "wgc-capture")
     ))]
     gpu: Option<super::gpu_input::GpuInput>,
+    /// FR-118 P5 — a VideoToolbox encoder's GPU input.
+    #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+    vt: Option<super::vt_input::VtInput>,
     input: super::gpu_hint::InputForm,
 }
 
@@ -1436,6 +1444,8 @@ impl FfmpegEncoder {
                 any(feature = "mf-encoder", feature = "wgc-capture")
             ))]
             refused_device: None,
+            #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+            vt: opened.vt,
             input: opened.input,
             fps: 30,
             cq,
@@ -1704,6 +1714,8 @@ impl FfmpegEncoder {
                             any(feature = "mf-encoder", feature = "wgc-capture")
                         ))]
                         refused_device: None,
+                        #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+                        vt: opened.vt,
                         input: opened.input,
                         fps,
                         cq,
@@ -1817,11 +1829,21 @@ impl FfmpegEncoder {
                 } else if let Some((pool, pix_fmt)) = gpu_frames {
                     // FR-118 P2-2 / P3 — the encoder takes the GPU input's pool
                     // frames. A fresh reference per open attempt, as above.
+                    // FR-118 P5 — no pool (null) is VideoToolbox's form: each
+                    // frame carries its own `CVPixelBuffer`, and `sw_pix_fmt`
+                    // names the layout (BGRA; `alpha_quality` stays 0, so HEVC
+                    // never picks its alpha codec type).
                     // SAFETY: an unopened, exclusively owned context; `pool` is a
                     // live frames context the GPU input owns for the whole open.
                     unsafe {
                         (*enc.as_mut_ptr()).pix_fmt = pix_fmt;
-                        (*enc.as_mut_ptr()).hw_frames_ctx = ffmpeg_next::ffi::av_buffer_ref(pool);
+                        if pool.is_null() {
+                            (*enc.as_mut_ptr()).sw_pix_fmt =
+                                ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_BGRA;
+                        } else {
+                            (*enc.as_mut_ptr()).hw_frames_ctx =
+                                ffmpeg_next::ffi::av_buffer_ref(pool);
+                        }
                     }
                 } else {
                     // P7 — HEVC Rext 4:4:4 takes planar yuv444p; everything else
@@ -1974,6 +1996,8 @@ impl FfmpegEncoder {
                     any(feature = "mf-encoder", feature = "wgc-capture")
                 ))]
                 gpu: None,
+                #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+                vt: None,
                 input,
             }
         };
@@ -2032,9 +2056,50 @@ impl FfmpegEncoder {
                 super::gpu_hint::InputForm::cpu(refused.reason)
             }
         };
-        #[cfg(not(all(
-            target_os = "windows",
-            any(feature = "mf-encoder", feature = "wgc-capture")
+        // FR-118 P5 — a VideoToolbox cell opens in its GPU form whenever its
+        // gates hold (`vt_input::plan`). That form takes an IOSurface frame as
+        // it is and copies a frame in memory into a buffer of its own, so it
+        // does not depend on the frame the encoder opens on.
+        #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+        let input = match super::vt_input::plan(name, chroma444) {
+            Ok(()) => match open_with((
+                None,
+                Some((
+                    std::ptr::null_mut(),
+                    ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX,
+                )),
+            )) {
+                Ok((encoder, hw)) => {
+                    tracing::info!(
+                        encoder = name,
+                        width,
+                        height,
+                        "FR-118: the encoder takes the capture's IOSurfaces"
+                    );
+                    return Ok(Opened {
+                        encoder,
+                        hw,
+                        vt: Some(super::vt_input::VtInput::new(width, height)),
+                        input: super::gpu_hint::InputForm::GPU,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        encoder = name,
+                        %e,
+                        "FR-118: the encoder did not open in its GPU form — CPU frames"
+                    );
+                    super::gpu_hint::InputForm::cpu("open_failed")
+                }
+            },
+            Err(reason) => super::gpu_hint::InputForm::cpu(reason),
+        };
+        #[cfg(not(any(
+            all(
+                target_os = "windows",
+                any(feature = "mf-encoder", feature = "wgc-capture")
+            ),
+            all(target_os = "macos", feature = "scrap-capture")
         )))]
         let input = no_gpu_cell;
         open_with((None, None)).map(cpu_form(input))
@@ -2350,6 +2415,8 @@ pub struct RebuiltEncoder {
         any(feature = "mf-encoder", feature = "wgc-capture")
     ))]
     gpu: Option<super::gpu_input::GpuInput>,
+    #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+    vt: Option<super::vt_input::VtInput>,
     input: super::gpu_hint::InputForm,
 }
 
@@ -2495,6 +2562,8 @@ impl FfmpegEncoder {
                 any(feature = "mf-encoder", feature = "wgc-capture")
             ))]
             gpu: opened.gpu,
+            #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+            vt: opened.vt,
             input: opened.input,
         })
     }
@@ -2538,6 +2607,10 @@ impl FfmpegEncoder {
         ))]
         {
             self.gpu = opened.gpu;
+        }
+        #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+        {
+            self.vt = opened.vt;
         }
         self.adopt_input(opened.input);
         self.frame_count = 0;
@@ -2602,6 +2675,10 @@ impl FfmpegEncoder {
         {
             self.gpu = rebuilt.gpu;
         }
+        #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+        {
+            self.vt = rebuilt.vt;
+        }
         self.adopt_input(rebuilt.input);
         self.width = spec.width;
         self.height = spec.height;
@@ -2645,6 +2722,12 @@ impl FfmpegEncoder {
             if self.gpu.is_some() {
                 return self.encode_through_gpu_input(frame);
             }
+        }
+        // FR-118 P5 — a VideoToolbox encoder in its GPU form takes every frame
+        // as a `CVPixelBuffer`.
+        #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+        if self.vt.is_some() {
+            return self.encode_through_vt(frame);
         }
 
         // FR-118 P0 — each step timed apart (`StageTimes`). A frame that fails
@@ -2813,6 +2896,41 @@ impl FfmpegEncoder {
         self.stage.drain_us += us(t3, t4);
         Ok(packets)
     }
+
+    /// FR-118 P5 — a frame through VideoToolbox's GPU form. An IOSurface
+    /// frame goes on as it is: no copy, no conversion, which VideoToolbox does
+    /// itself. A frame in memory is copied into a buffer from the input's pool,
+    /// the copy FFmpeg makes for every frame on the CPU form. Stages as on the
+    /// CPU path: `convert` is the wrap (or the copy), `upload` is zero.
+    #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+    fn encode_through_vt(&mut self, frame: &Frame) -> Result<Vec<EncodedPacket>> {
+        let t0 = std::time::Instant::now();
+        let Some(vt) = self.vt.as_mut() else {
+            return Err(anyhow!("the GPU input went away mid-frame"));
+        };
+        let mut av = match &frame.data {
+            crate::capture::FrameData::IoSurface(surface) => vt.surface_frame(surface)?,
+            crate::capture::FrameData::Cpu(_) => vt.bytes_frame(frame.cpu(), frame.stride)?,
+        };
+        self.stamp_frame(&mut av, frame.monotonic_us);
+        let t1 = std::time::Instant::now();
+        self.encoder
+            .send_frame(&av)
+            .map_err(|e| anyhow!("ffmpeg send_frame failed: {}", e))?;
+        let t2 = std::time::Instant::now();
+
+        self.force_keyframe = false;
+        self.frame_count += 1;
+
+        let packets = self.drain_packets()?;
+        let t3 = std::time::Instant::now();
+        let us = |a: std::time::Instant, b: std::time::Instant| (b - a).as_micros() as u64;
+        self.stage.frames += 1;
+        self.stage.convert_us += us(t0, t1);
+        self.stage.submit_us += us(t1, t2);
+        self.stage.drain_us += us(t2, t3);
+        Ok(packets)
+    }
 }
 
 #[async_trait::async_trait]
@@ -2839,16 +2957,11 @@ impl VideoEncoder for FfmpegEncoder {
         // FR-62 A1 — the HRD/VBV reservoir this move should size to. Pre-A1 the
         // NVENC arm wrote `rc_buffer_size = target` (a 1× window, silently
         // resizing the reservoir on every move); with the flag ON both in-place
-        // arms size it to the window the session opened with. Flag OFF keeps the
-        // 1× write so a flag-OFF session is byte-for-byte the pre-A1 behaviour.
-        let bufsize = if self.inplace_rate {
-            // Exactly the open sizing (`open_hrd_pct`), which on a constrained
-            // session is deliberately < 1× — matching it is the point; a
-            // `.max(target)` floor here would re-create the pre-A1 divergence.
-            (target.saturating_mul(self.hrd_pct) / 100).max(1)
-        } else {
-            target
-        };
+        // arms size it to the window the session opened with (`open_hrd_pct`).
+        // Flag OFF keeps the 1× write so a flag-OFF session is byte-for-byte the
+        // pre-A1 behaviour — `encode::inplace_rate_bufsize` pins both arms in
+        // the ungated lane (AC5).
+        let bufsize = crate::encode::inplace_rate_bufsize(target, self.hrd_pct, self.inplace_rate);
 
         match self.rate_mode {
             RateReconfig::InPlaceVbr => {
