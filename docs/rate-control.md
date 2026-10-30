@@ -1002,6 +1002,77 @@ removed by FR-79 V3a in `agent-v0.4.95` — the prior always decays, which
 FR-70 P1 field-verified on 0.4.64 with a same-build control). Their
 behaviour is described under the validity gate at the top of this page.
 
+## Kill switches and when each retires — the registry (FR-62 AC4)
+
+This is every rate-control kill switch in `agents/roomlerd/src/encode/mod.rs`, with
+the evidence that retires it and the phase that deletes it. It implements rule 4 of
+the [rate-control plan](plans/rate-control-architecture.md): a switch gets its
+retirement condition the day it ships, and it leaves the code only through its row
+here. The plan put this table in `docs/fr/README.md`. It lives on this page instead,
+beside the keys it retires, because every FR session edits that registry and these
+rows change with every deletion PR.
+
+```mermaid
+flowchart LR
+  B["a switch ships<br/>with its row: default +<br/>the evidence that flips it"] --> E["evidence on the surface:<br/>a field read shown RED first,<br/>or a release of heartbeats"]
+  E --> F["the default flips,<br/>or the condition is met"]
+  F --> S["one release soak"]
+  S --> D["the deletion PR removes the old arm<br/>AND the switch, and fills<br/>its row's Deletion PR"]
+  D --> I["an older config.toml that still<br/>carries the key is ignored,<br/>not refused"]
+```
+
+⚠️ **Nothing below has been deleted, and nothing is due before FR-63's B2 flip plus one
+release soak.** The plan sequences the deletions after that soak (its Sequencing row 5),
+and `encode/` is shadow-first (its Process rule 1). FR-62's A0 also showed that a
+heuristic which rations rate moves is dead weight on NVENC but load-bearing on QSV,
+so every retirement is gated on the backend it is retired for.
+
+**The switches.** Each one is `ROOMLERD_<KEY>` in the environment and the lowercase
+key in the config (`roomler config set`), except the three marked *env only*. A
+default of *on* guards shipped behaviour. A default of *off* means the behaviour is
+still waiting for its evidence.
+
+| Switch | `encode/mod.rs` | From | Default | What it guards | Retires when | Exit | Deletion PR |
+|---|---|---|---|---|---|---|---|
+| `ENCODER_INPLACE_RATE` | `:342` | FR-62 A1 | off | QSV applies a rate move in place; NVENC sizes its VBV to the open's window (`inplace_rate_bufsize`, `:355`) | QSV gets an in-place path (patch 0004), or the arm is dropped. On Iris Xe the Reset fails `-14` in both `low_power` modes | FR-62 | — |
+| `ENCODER_NVENC_ASSUME_IDR` (env only) | `:371` | FR-62 A2 | off | sends NVENC back onto the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` (FR-62 AC3's read) | FR-62 | — |
+| `BG_REBUILD` | `:494` | FR-1 P3 | on | a rebuild-bound rate apply opens the new encoder off-thread and swaps between frames | ⚠️ not while QSV rebuilds: inline, a QSV rebuild is the 0.34–2.0 s pump freeze (#1254) | FR-62 A4 row 2, FR-63 B3 | — |
+| `BG_REBUILD_CONSTRAINED` | `:515` | FR-62 (#1254) | on | the same on constrained sessions | never, while any rebuild backend exists | — | — |
+| `RELAY_IDR_THRIFT` | `:657` | FR-10 | on | a constrained session suppresses the idle-settle keyframe | narrows to settle-keyframe suppression on a backend whose rate move costs no IDR. The plan's precondition, "A0 pass on QSV", failed | FR-62 A4 row 1, FR-63 B3 | — |
+| `MEASURED_CEILING` | `:319` | measured-rate stage 1 | on | the ceiling is clamped to 85 % of the measured drain rate | one release after B2's `live` | FR-63 B3a | — |
+| `SLOW_LINK_FLOOR` | `:333` | FR-59 P1 | on | the floor descends toward a measured pipe | one release after `live` | FR-63 B3a | — |
+| `SEED_CONTRADICTION` | `:427` | FR-59 P6 | on | a held goodput far below the learned ceiling abandons it | one release after `live` | FR-63 B3a | — |
+| `VIEWER_RATE_CLAMP` | `:448` | FR-59 P3 | on | the viewer's arrival report drives the constrained loop | one release after `live` | FR-63 B3a | — |
+| `QUEUE_DRAIN` | `:466` | FR-59 P4 | on | a transit queue too deep to cut through pauses the pump | one release after `live` | FR-63 B3a | — |
+| `RELAY_AGE_FEEDBACK` | `:665` | FR-15 | on | the viewer's paint age caps the frame rate and cuts the rate | one release after `live` | FR-63 B3a | — |
+| `CONSTRAINED_QUEUE_MEASURED` | `:411` | FR-59 P2 | on | the constrained queue budget is counted in the measured drain rate | the budget becomes `reference_bps` | FR-63 B3b | — |
+| `SLOW_LINK_PROFILE` | `:481` | FR-59 P5 | on | a pair remembered as slow opens with fewer pixels and frames | it becomes a rung | FR-63 B3b | — |
+| `RELAY_CEILING_LEARN`, with `RELAY_MAX_HI_KBPS` | `:934` | FR-35 | on | the constrained ceiling learns the pair | it becomes the prior's bound | FR-63 B3b | — |
+| `AREA_MIN_BITRATE` | `:304` | area floor (2026-08-26) | on | the AIMD floor scales with the encoded area | it becomes a `RateDomain` rule | FR-63 B3b | — |
+| `RATE_SLOW_START` | `:542` | FR-63 | off | a session opens with slow start instead of a constant | B2's evidence flips it, or it is deleted | FR-63 | — |
+| `RATECTL` (env only) | `:582` | FR-63 B1 | shadow | whether the shadow controller runs beside the governor | B2 turns it into the `ratectl` tribool (`shadow`, `live`, `off`) | FR-63 B2 | — |
+| `SHARED_RATE_SPLIT` (env only) | `:895` | shared pipeline | on | a constrained shared encoder divides its ceiling by the live viewer count | ⚠️ an open row: the plan's B3 list does not name it | — | — |
+
+**Heuristics with no switch of their own.** These are FR-62's A4 deletions. Each one
+retires through this table too, and its deletion PR cites the precondition below.
+
+| Heuristic | Anchor | Plan row | Precondition | State |
+|---|---|---|---|---|
+| Motion-defer: `deferred_bps`, `DEFER_QUIET`, `relay_deferred_apply_allowed`, `rebuild_apply_allowed` | `peer.rs:6917`, `:6924`; `encode/mod.rs:675`, `:717` | A4 row 1 | A0 passes on QSV, and the switch is ON for one release | ❌ QSV's A0 failed (2026-09-02); both recorded causes are refuted (2026-09-04). NVENC already skips the `held_increase` arm, because `NVENC_RECONFIG_FORCES_IDR` is `false` (`encode/ffmpeg/encoder.rs:893`, #1252) |
+| The coarsen ladder: `BITRATE_LADDER_BPS`, `coarsen_bitrate` | `encode/aimd.rs:297`, `:317` | A4 row 2 | VideoToolbox is measured, or kept on the settle rule | It is load-bearing for QSV, which has no cheap apply. It keeps AMF, D3D12 and Vulkan's rate IDRs rare. It is dead weight on NVENC, and it caps NVENC at the 25 Mbps rung |
+| The background swap: `rebuild_spec`, `open_rebuilt`, `adopt_rebuilt` | `encode/ffmpeg/encoder.rs:2542`, `:2590`, `:2712` | A4 row 2 | as above, plus a cheap QSV apply | load-bearing while QSV rebuilds |
+| VP9's rebuild divergence: `on_encoder_rebuilt_mirror_only` | `encode/governor.rs:1017` | A4 row 3 | none in the plan, but the code calls unifying it "a behavioral decision for the post-soak pass" | waits for B2's soak |
+
+⚠️ **B3b deletes `aimd.rs` whole, and the ladder goes with it.** The plan was written
+before A0-QSV, so whatever replaces the AIMD must carry QSV's rationing forward, or
+every QSV session pays a 0.34–2.0 s rebuild per move.
+
+Out of scope here are the feature switches, each owned by its FR: `media_thread`
+(FR-70 M1, `:597`), `par_convert` (FR-1 P5, `:629`), `color_description` (FR-130,
+`:641`), `pump_stall_watch` (FR-65 P0, `:528`), `sw_fps_60` (FR-112, `:829`) and
+`fps_high` (FR-119, `:838`). `ICE_RELAY_TCP` (`:859`) is a test pin, not a kill
+switch.
+
 ## Field history (why it is shaped this way)
 
 | Release | Change | Field driver |

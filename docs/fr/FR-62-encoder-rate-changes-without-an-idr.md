@@ -1,8 +1,37 @@
 # FR-62 — Encoder rate changes without an IDR
 
-**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; **both** recorded causes are REFUTED (the second by measurement on 0.4.62); patch 0004 is what is left; A1 shipped inert; A2 + const flip shipped (0.4.51) · **A3 — AMF measured** on the Radeon 610M (0.4.187, 2026-10-29): a rebuild on every rung, **41–55 ms, 20/20 IDRs** — the 0.4.187 harness filed them as periodic, fixed in the same PR; VideoToolbox still unmeasured · NVENC re-read on the released 0.4.187: **0/20** · docs: [`encoders.md` § A rate move, per backend](../encoders.md#a-rate-move-per-backend-fr-62) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
+**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; **both** recorded causes are REFUTED (the second by measurement on 0.4.62); patch 0004 is what is left; A1 shipped inert; A2 + const flip shipped (0.4.51) · **A3 — AMF measured** on the Radeon 610M (0.4.187, 2026-10-29): a rebuild on every rung, **41–55 ms, 20/20 IDRs** — the 0.4.187 harness filed them as periodic, fixed in the same PR; VideoToolbox still unmeasured · NVENC re-read on the released 0.4.187: **0/20** · docs: [`encoders.md` § A rate move, per backend](../encoders.md#a-rate-move-per-backend-fr-62) · the kill-switch registry (AC4's instrument): [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 ## Progress
+
+- **2026-10-31 — AC2/AC3's read corrected, AC4's registry built, AC4's sequencing recorded.**
+  - 🔑 **On NVENC the default build already moves the rate in place, with no IDR.**
+    `resolve_rate_mode` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:868`) returns
+    `InPlaceVbr` for every `*_nvenc` whatever `encoder_inplace_rate` says, and
+    `NVENC_RECONFIG_FORCES_IDR` (`:893`) has been `false` since patch 0001 shipped
+    (0.4.51). On NVENC the flag only sizes the VBV window that a move writes
+    (`inplace_rate_bufsize`, `encode/mod.rs:355`). So a constrained NVENC session needs
+    no config change to be read for AC2/AC3, and flipping the flag off does not produce
+    a RED (no IDR per rate step). The read's RED is a **positive control**: one viewer
+    resize (a dims change) must move `idr_count` by exactly one. A read that cannot
+    see that IDR cannot vouch for the absence of the others.
+  - **The cell.** The only NVENC devices in the test org are the dev box (the
+    operator's own machine, never a test target) and CORPLAP-2, a corporate laptop
+    whose `av1_nvenc` sessions relay over its VPN without any pin. So AC2/AC3 wait for
+    the operator to choose the cell; the other test hosts are AMD VAAPI, a
+    VideoToolbox Mac and a server with no GPU.
+  - **AC4's instrument exists.** Plan rule 4's table is now
+    [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4).
+    It lists 18 switches with the evidence that retires each and the phase that
+    deletes it, plus the four A4 heuristics that have no switch of their own, each
+    with its plan precondition and its state. Nothing has been deleted.
+  - **Why A4 does not start now.** The plan sequences A4's deletions after FR-63's B2
+    flip plus one release soak (Sequencing row 5), and every A4 row's precondition is
+    unmet: row 1 needs "A0 passes on QSV", which failed; row 2 needs VideoToolbox
+    measured, and QSV still needs the ladder; row 3 is marked "a behavioral decision for
+    the post-soak pass" in the code (`encode/governor.rs:1017`). Found on the way:
+    B3b deletes `aimd.rs` whole, the coarsen ladder included, and the plan predates
+    A0-QSV. Whatever replaces the AIMD must carry QSV's rationing forward.
 
 - **2026-10-29 — A3 (AMF), the released-build re-read, and the harness's attribution fix.**
   - `hevc_nvenc` on the released **0.4.187** (RTX 5090 Laptop, the same GPU as the 2026-09-02 read):
@@ -157,16 +186,20 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
       sessions the dev box's agent saw on 2026-10-29 were direct (`constrained=false`), and a direct
       path at a 25 M rung is not the cell. The read: per heartbeat window, `bytes_written` ÷
       `frames_encoded` against `target_bps ÷ target_fps ÷ 8`, judged at the first window after each
-      `DC pump set_bitrate (AIMD)` line.
+      `DC pump set_bitrate (AIMD)` line. The default build is the arm under test: NVENC applies
+      in place with no flag (2026-10-31 above). The only NVENC host in the test org that is not
+      the dev box is CORPLAP-2 over its VPN, so the operator picks the cell.
 - [ ] AC3 — A 5-minute constrained session's `idr_count` ≤ dims changes + viewer keyframe requests.
       Same session as AC2: `idr_count` against `dims_swaps` plus the session's `PLI/FIR → forcing
       keyframe` lines. (The 2026-10-29 direct session read `idr_count=2` with `dims_swaps=1` and the
-      opener — consistent, but direct, so not this criterion's cell.)
+      opener — consistent, but direct, so not this criterion's cell.) The positive control comes
+      first: one viewer resize in the same session must move `idr_count` by exactly one.
 - [ ] AC4 — Every deleted heuristic's kill switch is retired through the registry table with its evidence.
-      No heuristic has been deleted yet (A4 has not started), and the registry table the plan names
-      (`rate-control-architecture.md`, rule 4: switch, default, evidence to flip, retire-by release,
-      deletion PR) does not exist. `encoders.md` § "A rate move, per backend" carries this FR's
-      three switches with their retirement conditions as the seed for it.
+      No heuristic has been deleted yet (A4 has not started). The registry table the plan names
+      (`rate-control-architecture.md`, rule 4) exists since 2026-10-31:
+      [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4),
+      18 switches plus the four A4 heuristics with no switch. Blocked on FR-63's B2 flip plus one
+      release soak, where the plan sequences every deletion, and on each row's own precondition.
 - [x] AC5 — `encoder_inplace_rate = false` restores today's behaviour byte-for-byte (unit test + field check).
       Unit: `encoder::tests::rate_mode_resolves_per_backend_and_flag` (OFF ⇒ `Rebuild` for QSV,
       `InPlaceVbr` for NVENC) and `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window`

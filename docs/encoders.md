@@ -956,12 +956,16 @@ FFmpeg it links cannot disagree. The macOS builder carries no patch today.
 | Switch | Default | What it does | Retires when |
 |---|---|---|---|
 | `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:342`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:355`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
-| `ROOMLERD_ENCODER_NVENC_ASSUME_IDR` (`:354`) | off | reverts NVENC to the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` |
-| `bg_rebuild_constrained` (`:498`) | on | a constrained session's rebuild runs off-thread (#1254), adopted at quiet | never while a rebuild backend exists |
+| `ROOMLERD_ENCODER_NVENC_ASSUME_IDR` (`:371`) | off | reverts NVENC to the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` |
+| `bg_rebuild_constrained` (`:515`) | on | a constrained session's rebuild runs off-thread (#1254), adopted at quiet | never while a rebuild backend exists |
 
 **Open**: QSV's `mfxExtEncoderResetOption` (patch 0004, an FFmpeg-level change),
 VideoToolbox's A0 on a Mac, and A4's per-backend retirements — NVENC can shed its
 rationing, QSV keeps `coarsen_bitrate`, and AMF, D3D12 and Vulkan keep it for the IDR.
+
+Every rate-control switch, with the evidence that retires it and the phase that
+deletes it, is in the registry:
+[`rate-control.md` § Kill switches](rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4).
 
 ## Software encoders: the clock and 60 fps (FR-112)
 
