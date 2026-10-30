@@ -123,11 +123,11 @@ impl FleetLifecycle for NetworkHooks {
 }
 
 /// FR-128 — one device reaches the far TURN over UDP when its netcheck found
-/// a public mapping (`stun_udp`) and did not measure the relay band blocked.
-/// `relay_band_udp: None` is "not measured", never "blocked": netcheck leaves
-/// it unmeasured whenever it has no credentials or no mapping to permit.
+/// a public mapping (`stun_udp`): a relay↔relay pair needs only that port.
+/// `relay_band_udp` is the dialer's bit, never read here: read as "dead" it
+/// put a session on DERP while the far TURN carried others (spec §8, 10-30).
 fn reaches_far_turn(caps: &CapVectorWire) -> bool {
-    caps.stun_udp && caps.relay_band_udp != Some(false)
+    caps.stun_udp
 }
 
 /// FR-128 — the pair's verdict: `Some(false)` when either end measured the
@@ -220,10 +220,11 @@ mod tests {
         }
     }
 
-    /// FR-128 — the far-TURN verdict for a pair. One end measured dead
-    /// decides `false` whatever the other says; both alive is `true`; any end
-    /// not measured, with the other alive, is `None`, which the agent reads
-    /// as "it works". An unmeasured relay band is not a blocked one.
+    /// FR-128 — the far-TURN verdict for a pair. One end with no UDP to coturn
+    /// decides `false` whatever the other says; both reaching it is `true`;
+    /// any end not measured, with the other alive, is `None`, which the agent
+    /// reads as "it works". The relay band is not read: on 2026-10-30 a lab
+    /// session rode the far TURN with the band measured blocked at both ends.
     #[test]
     fn far_turn_verdict_is_dead_if_either_end_measured_it_dead() {
         let alive = caps(true, Some(true));
@@ -238,11 +239,13 @@ mod tests {
             "a band netcheck could not measure is not a blocked band"
         );
         assert_eq!(
-            far_turn_verdict(Some(&alive), Some(&band_blocked)),
-            Some(false)
+            far_turn_verdict(Some(&band_blocked), Some(&band_blocked)),
+            Some(true),
+            "a blocked relay band still lets a relay↔relay pair through coturn's port"
         );
         assert_eq!(far_turn_verdict(Some(&no_udp), Some(&alive)), Some(false));
-        assert_eq!(far_turn_verdict(None, Some(&band_blocked)), Some(false));
+        assert_eq!(far_turn_verdict(None, Some(&no_udp)), Some(false));
+        assert_eq!(far_turn_verdict(None, Some(&band_blocked)), None);
         assert_eq!(far_turn_verdict(Some(&alive), None), None);
         assert_eq!(far_turn_verdict(None, None), None);
     }
