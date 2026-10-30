@@ -1766,7 +1766,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "FR-130 - every encoder writes the colour description it converted with (the BT.601 matrix at limited range) into its stream: the H.264/HEVC SPS VUI, the AV1 sequence header, the VP9 header. Without it a browser decodes an HD picture as BT.709 and shifts every saturated colour. Built-in default: on; off writes the undescribed stream of earlier agents. Env: ROOMLERD_COLOR_DESCRIPTION. Restart required.",
+        description: "FR-130 - every encoder writes the colour description it converted with (the BT.601 matrix at limited range) into its stream: the H.264/HEVC SPS VUI, the AV1 sequence header, the VP9 header. Without it a browser decodes an HD picture as BT.709 and shifts every saturated colour. Built-in default: on; off writes the undescribed stream of earlier agents. Env: ROOMLERD_COLOR_DESCRIPTION. Pushable through remote config. Restart required.",
     },
     KeyMeta {
         key: "zero_copy_deny",
@@ -5468,6 +5468,32 @@ mod tests {
         apply(&mut cfg, "color_description", None).unwrap();
         assert_eq!(cfg.color_description, None);
         assert!(apply(&mut cfg, "color_description", Some("maybe")).is_err());
+    }
+
+    /// FR-130 P1b — a pushed `color_description` means on the device what
+    /// `roomler config set color_description <word>` means: the push's one
+    /// reading (`parse_pushed_tribool`, which the server also refuses words
+    /// with) and this surface's take every word alike and refuse the same
+    /// ones, blank included (a clear on both).
+    #[test]
+    fn a_pushed_colour_description_reads_as_config_set_reads_it() {
+        for word in [
+            "on", "off", "", "  ", "true", "false", "1", "0", "yes", "no", "ON", " Off ", "maybe",
+            "default", "2", "o n",
+        ] {
+            let mut cfg = crate::config::test_fixture();
+            let local =
+                apply(&mut cfg, "color_description", Some(word)).map(|()| cfg.color_description);
+            let pushed = roomler_ai_remote_control::models::parse_pushed_tribool(word);
+            assert_eq!(
+                local.is_ok(),
+                pushed.is_ok(),
+                "{word:?}: {local:?} vs {pushed:?}"
+            );
+            if let (Ok(l), Ok(p)) = (local, pushed) {
+                assert_eq!(l, p, "{word:?}");
+            }
+        }
     }
 
     /// The chroma column keys ride the numeric bridge like the codec factors.

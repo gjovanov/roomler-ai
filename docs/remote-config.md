@@ -222,6 +222,52 @@ key back to the device. A pushed value is not validated by the server, as with
 `encoder_cells_deny`: an entry the device cannot parse is skipped, never widened
 into a match, and `roomler config set fps_deny` refuses it locally.
 
+**A third (FR-130 P1b).** `color_description`, the switch that has every
+encoder write the BT.601 colour description it converted with
+([FR-130](fr/FR-130-colours-decode-true.md)), rides the same document on the
+same terms: `MANAGE_AGENTS` alone, because it is not a gate and grants nothing
+either way (`off` only removes metadata from the stream, and `on` writes what
+the built-in default writes), and `needs_restart`, because the encoders read it
+through the config fallbacks, registered once per process. It is the kill
+switch for a viewer or a player that misreads the description, reachable
+without a person at each device. On the device the key is a tribool, so a push
+carries a word:
+
+| pushed `color_description` | what the device's key becomes |
+|---|---|
+| absent | not managed: left as it is |
+| `""` | cleared, back to the built-in default (on) |
+| `off` | `false`: no description, the stream earlier agents sent |
+| `on` | `true` |
+
+Unlike the two denylists, the server reads the word. It takes the words
+`roomler config set` takes (`true`/`false`, `1`/`0`, `yes`/`no`, in any case),
+stores the spelling above, and refuses anything else with a 400 that names the
+key, recording nothing (`pushed_tribool`,
+`crates/modules/fleet/src/remote_config.rs:155`). A tribool has no entries a
+device could skip, so an unreadable word would reach every device as a no-op
+reported as applied. Both ends read the word with one function
+(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3005`), and a test
+holds it to what `roomler config set` reads. A word that reaches a device anyway,
+from some other server, leaves its key as it is, logged, and never fails the
+keys beside it (`agents/roomlerd/src/remote_config.rs:340`).
+
+⚠️ **Not managed is not a revert.** A device keeps what it was pushed last, so
+an `off` is undone by pushing the default, and only then stopping management:
+"Stop managing" alone leaves every device off. The dialog's select therefore
+has four states, not the switches' three: cleared (not managed), the built-in
+default, off and on (`ui/src/utils/managedTribool.ts`). An agent from before
+P1b ignores the key and reports the push applied, as it does any key it
+predates; no released agent before it writes a description at all, because P1
+ships with P1b.
+
+⚠️ **A push lands on connect, and takes effect at the restart after it.** A
+device that was online when the push was made picks it up at its next
+reconnect. Restarting it before it has reported the push only reconnects it:
+the new daemon starts on the old value, then writes the pushed one and reports
+`needs_restart`, so it takes a second restart. Restart once the device reports
+`needs_restart`. The same holds for every `needs_restart` key here.
+
 ## 7. What this does not do
 
 - **No bootstrapping problem.** Enabling `exec_enabled` remotely does not

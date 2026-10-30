@@ -179,6 +179,28 @@
           <code>none</code> = deny nothing. It only ever removes rates, so no
           extra permission bit; takes effect at the next daemon restart.
         </div>
+        <!-- FR-130 P1b — four states, because a tribool key has three and a
+             request adds "not managed". Cleared and "default" differ: the
+             first leaves the device's value alone, the second clears it. -->
+        <v-select
+          v-model="colorDescriptionChoice"
+          :items="colorDescriptionOptions"
+          label="Colour description (color_description)"
+          density="compact"
+          variant="outlined"
+          clearable
+          hide-details
+          class="mb-1"
+        />
+        <div class="text-caption text-medium-emphasis mb-4 ml-1">
+          Whether the device's encoders tell the decoder the colour (BT.601,
+          limited range) they converted with. <strong>Off</strong> is the
+          kill switch for a viewer or player that misreads it: the stream goes
+          back to what agents sent before. Cleared = not managed, and the
+          device keeps its own value, so after an Off choose the default
+          before you stop managing it. It grants nothing, so no extra
+          permission bit; takes effect at the next daemon restart.
+        </div>
 
         <!-- The combination checks. Each of these produces a device that is
              "on" and reaches nobody — the exact silent-nothing this feature
@@ -260,6 +282,7 @@ import { deviceLabel } from '@/composables/useHideDeviceName'
 import { useAgentStore, type Agent, type DesiredConfig } from '@/stores/agents'
 import { useTenantStore } from '@/stores/tenant'
 import { canGrantDeviceExec, canGrantDeviceSsh } from '@/utils/permissions'
+import { triboolChoice, triboolWord } from '@/utils/managedTribool'
 import ManagedSwitch from './ManagedSwitch.vue'
 
 const props = defineProps<{
@@ -477,6 +500,19 @@ const fpsDenyText = computed({
     draft.value.fps_deny = t === '' ? undefined : t
   },
 })
+/** FR-130 P1b — the colour-description switch. A cleared select is "not
+ *  managed"; "default" sends `''`, which clears the device's key. */
+const colorDescriptionChoice = computed({
+  get: () => triboolChoice(draft.value.color_description),
+  set: (v: unknown) => {
+    draft.value.color_description = triboolWord(v)
+  },
+})
+const colorDescriptionOptions = [
+  { title: 'Off: no colour description, as earlier agents sent', value: 'off' },
+  { title: 'On: describe the colour', value: 'on' },
+  { title: 'The device’s built-in default (on)', value: 'default' },
+]
 const accountOptions = [
   { title: 'The signed-in user at the device', value: 'console_user' },
   { title: 'The daemon account (SYSTEM / root)', value: 'daemon' },
@@ -499,6 +535,7 @@ watch(
       ssh_port: d?.ssh_port,
       encoder_cells_deny: d?.encoder_cells_deny,
       fps_deny: d?.fps_deny,
+      color_description: d?.color_description,
     }
     original.value = JSON.stringify(draft.value)
     if (agentStore.orgExecEnabled === null) void agentStore.fetchOrgExecEnabled(props.tenantId)

@@ -14,7 +14,7 @@ use axum::{
 };
 use bson::{DateTime, doc, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
-use roomler_ai_remote_control::models::DesiredConfig;
+use roomler_ai_remote_control::models::{DesiredConfig, parse_pushed_tribool, pushed_tribool_wire};
 use serde::{Deserialize, Serialize};
 
 use roomler_core::{ApiError, extractors::auth::AuthUser};
@@ -37,6 +37,9 @@ pub struct DesiredConfigBody {
     pub encoder_cells_deny: Option<String>,
     #[serde(default)]
     pub fps_deny: Option<String>,
+    /// FR-130 P1b — `on`, `off`, or blank (back to the device's default).
+    #[serde(default)]
+    pub color_description: Option<String>,
 }
 
 /// ⚠️ `desired` is the SAME projection the listing returns
@@ -142,6 +145,19 @@ pub fn decide(
     Ok(())
 }
 
+/// FR-130 P1b — a pushed tribool, spelled the one way the device and the
+/// dialog read it (`on`, `off`, or blank to clear the device's key), or a 400
+/// naming the key. The words `roomler config set` takes are accepted too.
+///
+/// Unlike the two denylists, which the server passes on unread, a tribool has
+/// three meaningful values and nothing else: there is no entry for a device
+/// to skip while it applies the rest of the value.
+fn pushed_tribool(key: &str, v: &str) -> Result<String, ApiError> {
+    parse_pushed_tribool(v)
+        .map(|b| pushed_tribool_wire(b).to_string())
+        .map_err(|e| ApiError::BadRequest(format!("{key}: {e}")))
+}
+
 pub async fn set_desired_config(
     State(state): State<FleetState>,
     auth: AuthUser,
@@ -152,6 +168,15 @@ pub async fn set_desired_config(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     let aid = ObjectId::parse_str(&agent_id)
         .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
+    // FR-130 P1b — a word no device can read is a malformed body, refused
+    // before anything is decided, as a mistyped field is. Recorded, it would
+    // leave the device's key as it is, and the device would report the push
+    // applied.
+    let color_description = body
+        .color_description
+        .as_deref()
+        .map(|v| pushed_tribool("color_description", v))
+        .transpose()?;
 
     // Membership first: `get_member_permissions` is the membership check too,
     // so a non-member never reaches the policy below.
@@ -173,6 +198,7 @@ pub async fn set_desired_config(
         ssh_port: body.ssh_port,
         encoder_cells_deny: body.encoder_cells_deny,
         fps_deny: body.fps_deny,
+        color_description,
         revision: agent.desired_config.revision + 1,
         updated_by: Some(auth.user_id),
         updated_at: Some(DateTime::now()),
@@ -356,6 +382,9 @@ mod tests {
     fn the_put_response_is_the_same_shape_the_listing_returns() {
         let requested = DesiredConfig {
             exec_enabled: Some(true),
+            // FR-130 P1b — a clear, which must reach the client as `""`: an
+            // absent key would read as "not managed", a different request.
+            color_description: Some(String::new()),
             revision: 1,
             updated_by: Some(bson::oid::ObjectId::new()),
             updated_at: Some(DateTime::now()),
@@ -382,6 +411,11 @@ mod tests {
                 .as_str()
                 .is_some_and(|s| s.contains('T') && s.ends_with('Z')),
             "updated_at must be an RFC3339 string: {json}"
+        );
+        assert_eq!(
+            v["desired"]["color_description"].as_str(),
+            Some(""),
+            "a clear must stay a clear in the projection: {json}"
         );
     }
 
@@ -519,5 +553,63 @@ mod tests {
             decide(0, &DesiredConfig::default(), &deny),
             Err(ConfigDenyReason::NotDeviceAdmin)
         );
+    }
+
+    /// FR-130 P1b — the colour-description switch is no gate either: `off`
+    /// only removes metadata from the stream, and `on` or a clear writes what
+    /// the built-in default writes. So `MANAGE_AGENTS` alone may push any of
+    /// the three, a clear included, and nothing less may push any.
+    #[test]
+    fn the_colour_description_switch_needs_only_manage_agents() {
+        for word in ["off", "on", ""] {
+            let push = DesiredConfig {
+                color_description: Some(word.into()),
+                ..Default::default()
+            };
+            decide(DEFAULT_ADMIN, &DesiredConfig::default(), &push)
+                .unwrap_or_else(|e| panic!("MANAGE_AGENTS alone may push {word:?}: {e:?}"));
+            assert!(!push.touches_exec() && !push.touches_ssh(), "{word:?}");
+            assert!(!push.is_empty(), "{word:?}: a clear is a request too");
+            for short in [0, DEFAULT_MEMBER] {
+                assert_eq!(
+                    decide(short, &DesiredConfig::default(), &push),
+                    Err(ConfigDenyReason::NotDeviceAdmin),
+                    "{word:?}"
+                );
+            }
+        }
+    }
+
+    /// FR-130 P1b — the route stores the one spelling the device and the
+    /// dialog read, takes the words `roomler config set` takes, and refuses
+    /// a word no device could read, naming the key.
+    #[test]
+    fn a_pushed_tribool_is_stored_in_one_spelling_or_refused() {
+        for (given, stored) in [
+            ("off", "off"),
+            (" OFF ", "off"),
+            ("false", "off"),
+            ("0", "off"),
+            ("on", "on"),
+            ("True", "on"),
+            ("1", "on"),
+            ("yes", "on"),
+            ("", ""),
+            ("  ", ""),
+        ] {
+            match pushed_tribool("color_description", given) {
+                Ok(s) => assert_eq!(s, stored, "{given:?}"),
+                Err(e) => panic!("{given:?} must be stored as {stored:?}: {e}"),
+            }
+        }
+        for unread in ["maybe", "default", "2", "o n"] {
+            match pushed_tribool("color_description", unread) {
+                Err(ApiError::BadRequest(m)) => {
+                    assert!(m.starts_with("color_description: "), "{unread:?}: {m}")
+                }
+                Err(other) => panic!("{unread:?} must be a 400, got {other}"),
+                Ok(s) => panic!("{unread:?} must be refused, got {s:?}"),
+            }
+        }
     }
 }
