@@ -64,10 +64,17 @@ import {
   stripChunkPrefix,
 } from './rc-chunk-framing'
 import { createBenchSampler } from './rc-bench-sampler'
+import { createDecoderColorSpace, frameColorSpace, rcDecoderConfig } from './rc-decoder-config'
 
 type InitCanvasMessage = {
   type: 'init-canvas'
   canvas: OffscreenCanvas
+  /** FR-130 P2 — tell the decoder the colour space the agent converted with
+   *  (set S, BT.601 limited; `rc-decoder-config.ts`). Resolved per session by
+   *  the composable (`sessionColorSpace`, off under the kill switch
+   *  `roomler-rc-colorspace=off`). Absent/false configures as before FR-130,
+   *  and it sticks across the idempotent visible-canvas re-init. */
+  colorSpace?: boolean
   /** FR-17 — true when the controller negotiated per-chunk framing for
    *  this session (the agent advertised `chunk-framing` in
    *  `AgentCaps.video`). Absent/false keeps the pre-FR-17 bare byte
@@ -154,6 +161,18 @@ const workerScope = self as unknown as {
 
 /** FR-16 L4 — reads the bench probe off painted frames, only while armed. */
 const bench = createBenchSampler({ post: (m) => workerScope.postMessage(m), now: epochNowMs })
+
+/** FR-130 P2 — the session's decoder colour space, and its one fallback: a
+ *  browser that refuses it gets the config without it (one console line on
+ *  the main thread, from `colorspace-dropped`). */
+const decoderColorSpace = createDecoderColorSpace((stage, error) =>
+  workerScope.postMessage({
+    type: 'colorspace-dropped',
+    stage,
+    codec: activeCodec,
+    error: extractErrorMessage(error),
+  }),
+)
 
 let canvas: OffscreenCanvas | null = null
 let ctx: OffscreenCanvasRenderingContext2D | null = null
@@ -434,6 +453,8 @@ workerScope.onmessage = (e) => {
     ) {
       decodePref = msg.decodePref
     }
+    // FR-130 P2 — before `initDecoder`, whose configure() reads it.
+    if (typeof msg.colorSpace === 'boolean') decoderColorSpace.setWanted(msg.colorSpace)
     initDecoder()
   } else if (msg.type === 'viewport') {
     // P7 — cache the element box; the sizing policy runs per paint.
@@ -477,6 +498,33 @@ workerScope.onmessage = (e) => {
   } else if (msg.type === 'close') {
     teardown()
   }
+}
+
+/** FR-130 P2 — the decoder failed before its first frame while told the
+ *  colour space: an error closes a VideoDecoder, so start a new one, which
+ *  `initDecoder` configures without it, and wait for a key frame as after
+ *  configure() (the leading-delta gate drops the deltas meanwhile and keeps
+ *  asking for one). */
+function rebuildDecoderWithoutColorSpace(): void {
+  try {
+    decoder?.close()
+  } catch {
+    /* already closed by its error */
+  }
+  decoder = null
+  configured = false
+  sawKeyframe = false
+  framesSkippedAwaitingKey = 0
+  // The failed decoder's submissions will never come out; left in, they
+  // would read as a growing backlog and shed the new decoder's deltas.
+  backlog.clear()
+  pendingArrivalUs.clear()
+  initDecoder()
+  // Ask for the key frame at once, past `requestKeyframeResync`'s debounce:
+  // this happens at most once a session, and early in a worker's life the
+  // debounce swallows a request (its clock starts at the worker's creation).
+  lastKeyframeReqMs = performance.now()
+  workerScope.postMessage({ type: 'request-keyframe' })
 }
 
 function initDecoder() {
@@ -552,6 +600,9 @@ function initDecoder() {
           visible: vr ? { x: vr.x, y: vr.y, w: vr.width, h: vr.height } : null,
           crop,
           rewrapped,
+          // FR-130 P2 — the colour space the decoder says it produced: how the
+          // field reads, per session, what it made of the stream.
+          colorSpace: frameColorSpace(frame),
         }
       }
       statsLastWidth = renderW
@@ -595,6 +646,15 @@ function initDecoder() {
       maybeEmitStats()
     },
     error: (err) => {
+      // FR-130 P2 — a decoder told the colour space that fails before its
+      // first frame gets one more try without it, so a browser that refuses
+      // the member or a value in it still shows the picture. Any other error
+      // is reported as before (before the first frame the composable bans
+      // this transport and renegotiates).
+      if (decoderColorSpace.retryAfterError(err, framesDecoded)) {
+        rebuildDecoderWithoutColorSpace()
+        return
+      }
       workerScope.postMessage({
         type: 'decoder-error',
         error: extractErrorMessage(err),
@@ -616,19 +676,27 @@ function initDecoder() {
   // validated), no fallback otherwise (HEVC HAS no SW fallback in
   // WebCodecs, unlike VP9). Same setting as the VP9-444 worker for
   // consistency.
+  //
+  // FR-130 P2 — `rcDecoderConfig` adds the colour space the agent converted
+  // with (set S) while the session wants it, and a configure() that throws
+  // on it goes again without it (`rc-decoder-config.ts`). Every other field
+  // is the worker's own, unchanged.
   try {
-    decoder.configure({
+    const applied = decoderColorSpace.configure(decoder, (colorSpace) => rcDecoderConfig({
       codec: activeCodec,
       optimizeForLatency: true,
       // 2026-07-24 — `decodePref` (localStorage A/B) can override for the
       // decode-stall field diagnosis; defaults to 'no-preference'.
       hardwareAcceleration: decodePref,
-    } as VideoDecoderConfig)
+    } as VideoDecoderConfig, colorSpace))
     configured = true
     workerScope.postMessage({
       type: 'decoder-configured',
       codec: activeCodec,
       pref: decodePref,
+      // FR-130 P2 — the colour space configure() took, or null (the stream's
+      // own description decides).
+      colorSpace: applied.colorSpace ?? null,
     })
   } catch (err) {
     workerScope.postMessage({

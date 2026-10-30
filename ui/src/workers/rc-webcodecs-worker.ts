@@ -31,6 +31,7 @@
 
 import { epochNowMs } from './rc-hop-stats'
 import { createBenchSampler } from './rc-bench-sampler'
+import { createDecoderColorSpace, frameColorSpace, rcDecoderConfig } from './rc-decoder-config'
 
 /** `bench` — FR-16 L4 bench mode, set only when the knob is on AND the
  *  agent advertised `bench`: sample the probe marker while a probe is armed. */
@@ -43,7 +44,13 @@ type IncomingMessage = InitCanvasMessage | BenchArmMessage | CloseMessage
 interface RTCTransformerLike {
   readable: ReadableStream<unknown>
   writable: WritableStream<unknown>
-  options?: { codec?: string }
+  /** The composable's `new RTCRtpScriptTransform(worker, options)`.
+   *  `colorSpace` — FR-130 P2: tell the decoder the colour space the agent
+   *  converted with (set S; `rc-decoder-config.ts`), resolved per session by
+   *  the composable (`sessionColorSpace`). It rides the options rather than
+   *  `init-canvas` because this transform can start, and configure the
+   *  decoder, before the canvas arrives. Absent/false configures as before. */
+  options?: { codec?: string; colorSpace?: boolean }
 }
 
 interface RTCTransformEventLike {
@@ -72,6 +79,37 @@ let configured = false
 let framesDecoded = 0
 let framesReceived = 0
 let framesFedToDecoder = 0
+/** The codec string this transform decodes, for the `colorspace-dropped` line. */
+let activeCodecString = ''
+
+/** FR-130 P2 — the session's decoder colour space, and its one fallback: a
+ *  browser that refuses it gets the config without it (one console line on
+ *  the main thread, from `colorspace-dropped`). */
+const decoderColorSpace = createDecoderColorSpace((stage, error) =>
+  workerScope.postMessage({
+    type: 'colorspace-dropped',
+    stage,
+    codec: activeCodecString,
+    error: extractErrorMessage(error),
+  }),
+)
+/** FR-130 P2 — set when the decoder was rebuilt without the colour space. A
+ *  new decoder takes a key frame first, so until one arrives the deltas go on
+ *  to the default path undecoded, and the agent is asked for one. */
+let awaitingKeyAfterRebuild = false
+let lastKeyframeReqMs = 0
+
+/** Ask the agent (the composable → `rc:keyframe` on the control channel) for
+ *  a key frame; debounced like the data-channel workers' resync request.
+ *  `now` skips the debounce, for the once-a-session rebuild: early in a
+ *  worker's life the debounce would swallow it (the clock starts at the
+ *  worker's creation). */
+function requestKeyframe(opts: { now?: boolean } = {}): void {
+  const now = performance.now()
+  if (!opts.now && now - lastKeyframeReqMs < 250) return
+  lastKeyframeReqMs = now
+  workerScope.postMessage({ type: 'request-keyframe' })
+}
 
 workerScope.onmessage = (e) => {
   const msg = e.data
@@ -93,6 +131,7 @@ workerScope.onmessage = (e) => {
     ctx = null
     configured = false
     framesDecoded = 0
+    awaitingKeyAfterRebuild = false
   }
 }
 
@@ -100,31 +139,78 @@ workerScope.onrtctransform = async (event) => {
   const transformer = event.transformer
   const codec = transformer.options?.codec ?? 'h264'
   const codecString = codecMimeForShort(codec)
+  activeCodecString = codecString
+  // FR-130 P2 — set before the decoder is configured below.
+  decoderColorSpace.setWanted(transformer.options?.colorSpace === true)
+  /** The config the decoder was last configured from, without its colour
+   *  space: what a rebuild configures again. */
+  let configuredBase: VideoDecoderConfig | null = null
 
-  decoder = new VideoDecoder({
-    output: (frame) => {
-      framesDecoded++
-      // Snapshot before paint closes the frame (a closed one reports 0).
-      const firstDims = framesDecoded === 1 ? { w: frame.displayWidth, h: frame.displayHeight } : null
-      // FR-16 L4 — a clone for the probe read; null unless a probe is armed.
-      const benchClone = bench.take(frame)
-      paintFrame(frame)
-      if (benchClone) bench.settle(benchClone, epochNowMs())
-      if (firstDims) {
+  function makeDecoder(): VideoDecoder {
+    return new VideoDecoder({
+      output: (frame) => {
+        framesDecoded++
+        // Snapshot before paint closes the frame (a closed one reports 0).
+        const firstDims = framesDecoded === 1 ? { w: frame.displayWidth, h: frame.displayHeight } : null
+        // FR-130 P2 — and the colour space the decoder says it produced.
+        const colorSpace = firstDims ? frameColorSpace(frame) : null
+        // FR-16 L4 — a clone for the probe read; null unless a probe is armed.
+        const benchClone = bench.take(frame)
+        paintFrame(frame)
+        if (benchClone) bench.settle(benchClone, epochNowMs())
+        if (firstDims) {
+          workerScope.postMessage({
+            type: 'first-frame',
+            width: firstDims.w,
+            height: firstDims.h,
+            colorSpace,
+          })
+        }
+      },
+      error: (err) => {
+        // FR-130 P2 — a decoder told the colour space that fails before its
+        // first frame gets one more try without it, so a browser that
+        // refuses the member or a value in it keeps this path. Any other
+        // error is reported as before (the composable falls back to <video>).
+        if (decoderColorSpace.retryAfterError(err, framesDecoded)) {
+          rebuildWithoutColorSpace()
+          return
+        }
         workerScope.postMessage({
-          type: 'first-frame',
-          width: firstDims.w,
-          height: firstDims.h,
+          type: 'decoder-error',
+          error: extractErrorMessage(err),
         })
-      }
-    },
-    error: (err) => {
+      },
+    })
+  }
+
+  /** FR-130 P2 — an error closes a VideoDecoder: start a new one, configured
+   *  without the colour space (`decoderColorSpace` has dropped it), and wait
+   *  for a key frame. */
+  function rebuildWithoutColorSpace(): void {
+    try {
+      decoder?.close()
+    } catch {
+      /* already closed by its error */
+    }
+    decoder = makeDecoder()
+    configured = false
+    const base = configuredBase ?? ({ codec: codecString, optimizeForLatency: true } as VideoDecoderConfig)
+    try {
+      decoderColorSpace.configure(decoder, (colorSpace) => rcDecoderConfig(base, colorSpace))
+      configured = true
+    } catch (err) {
       workerScope.postMessage({
-        type: 'decoder-error',
+        type: 'decoder-configure-error',
+        codec: codecString,
         error: extractErrorMessage(err),
       })
-    },
-  })
+    }
+    awaitingKeyAfterRebuild = true
+    requestKeyframe({ now: true })
+  }
+
+  decoder = makeDecoder()
 
   // Try the "latency-first" config first, then fall back to a plain
   // config. Some Chrome builds reject `optimizeForLatency: true` for
@@ -150,8 +236,13 @@ workerScope.onrtctransform = async (event) => {
     }
   }
   const toUse = picked ?? configs[0]!
+  // FR-130 P2 — the probes above stay codec-only; the colour space joins only
+  // the config configure() takes, and a configure() that throws on it goes
+  // again without it (`rc-decoder-config.ts`).
+  let applied: VideoDecoderConfig | null = null
   try {
-    decoder.configure(toUse)
+    applied = decoderColorSpace.configure(decoder, (colorSpace) => rcDecoderConfig(toUse, colorSpace))
+    configuredBase = toUse
     configured = true
   } catch (err) {
     workerScope.postMessage({
@@ -167,6 +258,8 @@ workerScope.onrtctransform = async (event) => {
     codecString,
     configured,
     pickedConfig: picked ? 'with-optimize-for-latency' : 'fallback',
+    // FR-130 P2 — the colour space configure() took, or null.
+    colorSpace: applied?.colorSpace ?? null,
   })
 
   // Watchdog: if 3 seconds pass after onrtctransform fires and no
@@ -247,16 +340,29 @@ workerScope.onrtctransform = async (event) => {
             return
           }
           if (!configured) {
+            const lazyBase = {
+              codec: codecString,
+              optimizeForLatency: true,
+            } as VideoDecoderConfig
             try {
-              decoder.configure({
-                codec: codecString,
-                optimizeForLatency: true,
-              } as VideoDecoderConfig)
+              // FR-130 P2 — through the colour-space helper, like the first try.
+              decoderColorSpace.configure(decoder, (colorSpace) => rcDecoderConfig(lazyBase, colorSpace))
+              configuredBase = lazyBase
               configured = true
             } catch {
               controller.enqueue(value)
               return
             }
+          }
+          // FR-130 P2 — a rebuilt decoder takes a key frame first; until one
+          // arrives, the deltas still go on to the default path below.
+          if (awaitingKeyAfterRebuild) {
+            if (encFrame.type !== 'key') {
+              requestKeyframe()
+              controller.enqueue(value)
+              return
+            }
+            awaitingKeyAfterRebuild = false
           }
           try {
             const chunk = new EncodedVideoChunk({
