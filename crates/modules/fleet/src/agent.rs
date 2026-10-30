@@ -978,6 +978,10 @@ pub struct DesiredConfigView {
     pub encoder_cells_deny: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fps_deny: Option<String>,
+    /// FR-130 P1b — `on`, `off`, or `""` (a request to clear the device's
+    /// key). Absent = not managed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1003,6 +1007,7 @@ impl From<roomler_ai_remote_control::models::DesiredConfig> for DesiredConfigVie
             ssh_port: d.ssh_port,
             encoder_cells_deny: d.encoder_cells_deny,
             fps_deny: d.fps_deny,
+            color_description: d.color_description,
             updated_by: d.updated_by.map(|i| i.to_hex()),
             updated_at: d.updated_at.map(fmt_dt),
         }

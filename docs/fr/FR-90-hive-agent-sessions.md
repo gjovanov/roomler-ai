@@ -5459,7 +5459,7 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
         admits. `allowed_user_ids` and `allowed_role_ids` never match a session.
       - ⚠️ An empty `allowed_session_roles` admits **no** session: the opposite sense to the two
         lists beside it, where empty means no restriction
-        (`crates/remote_control/src/models.rs:3201`). The same field must not read both ways.
+        (`crates/remote_control/src/models.rs:3251`). The same field must not read both ways.
       - No SSH policy written before P3-8 opens a device to a session.
       - What it costs: each device a session may reach says so in its own policy.
     - *Or: a session matches as its owner does*: the owner's id against `allowed_user_ids`, the
