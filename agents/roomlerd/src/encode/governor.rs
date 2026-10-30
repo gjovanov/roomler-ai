@@ -2837,6 +2837,56 @@ mod tests {
         );
     }
 
+    /// FR-59 P6 kill switch — the SAME contradiction, ignored: nothing is
+    /// abandoned and the session keeps planning at the seeded ceiling until
+    /// the AIMD walks it down, which is the pre-P6 posture.
+    ///
+    /// The learner proves the switch for itself
+    /// (`ceiling_learn::on_measurement_is_inert_without_a_contradiction`);
+    /// this proves the governor's FLAG reaches it. The wiring is one line —
+    /// `on_measurement(g, self.slow_link.seed_contradiction)` — and every
+    /// other test constructs the flags with the field on, so a hard-wired
+    /// `true` there would have passed the whole module (AC6).
+    #[test]
+    fn a_contradicted_seed_stands_when_the_switch_is_off() {
+        let start = Instant::now();
+        let mut g = RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                seed_contradiction: false,
+                ..GovernorFlags::default()
+            },
+            8_000_000,
+            Some(5_964_000),
+            start,
+        );
+        assert_eq!(g.effective_ceiling(3_000_000, true), 5_069_400);
+        // The field pipe, 12.8× under the seed — the ON arm above abandons on it.
+        let sink = g.goodput_sink();
+        for _ in 0..12 {
+            sink.record(1_000, Duration::from_micros(20_248));
+        }
+        let t1 = start + Duration::from_secs(2);
+        g.tick_viewer_window(t1, 30, || 0, || 0, || 0, true, |o| o, 0);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, 0, t1);
+        assert_eq!(
+            g.blocked_send_bps(t1),
+            Some(395_100),
+            "the contradicting measurement is held — the switch is the only thing in the way"
+        );
+        assert_eq!(
+            g.take_seed_abandoned(),
+            None,
+            "kill switch: nothing abandoned"
+        );
+        assert_eq!(
+            g.effective_ceiling(3_000_000, true),
+            5_069_400,
+            "the seed stands until the AIMD walks it down"
+        );
+    }
+
     /// FR-79 V5 — the WIRING (the per-reason law is unit-tested in
     /// `encode::evidence`, and finding 4's opposite cell is the B0 sim's).
     ///

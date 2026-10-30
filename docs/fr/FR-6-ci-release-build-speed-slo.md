@@ -1,8 +1,10 @@
 # FR-6: CI + release build-speed SLO — every lane ≤10 min warm, self-healing
 
-**Status:** shipped + field-verified through 2026-08-26 (retroactive FR per the CLAUDE.md
-standing rule — the program ran 2026-07-13 → 2026-08-26 across ~20 PRs). Tracking issue:
-`FR-6` (#773) in gjovanov/roomler-ai/issues.
+**Status:** **closed 2026-10-30.** Every acceptance criterion is field-verified and ticked, through
+wave 32 (2026-10-29), and documented in [`docs/build-caches.md`](../build-caches.md). What is left
+is runner queueing, not compiling (Open decisions). First shipped and field-verified 2026-08-26
+(retroactive FR per the CLAUDE.md standing rule — the program ran 2026-07-13 → 2026-08-26 across
+~20 PRs). Tracking issue: `FR-6` (#773) in gjovanov/roomler-ai/issues.
 
 ## Goal
 
@@ -183,6 +185,10 @@ itself on the affected run's page. Baseline when the program started: releases t
       SHA `ff3290048`, no release dispatch between them), and the four daemon jobs
       reported `roomlerd 0.4.174`. The longest jobs were the Windows companion (4.2 min)
       and the MSI (4.0); wave 30 takes the companions' remaining compile out.
+- [x] **Docs** — [`docs/build-caches.md`](../build-caches.md) describes what this FR built, in
+      house style: the seed store, a release's five runs, same-tree reuse and its traps, the
+      accretion GC and its caps, the merge freeze, and the log lines a run is read by. It has
+      a row in `docs/README.md`'s index (2026-10-29).
 
 ## Open decisions / residual levers (all trade-offs, not waste)
 
@@ -1096,3 +1102,17 @@ itself on the affected run's page. Baseline when the program started: releases t
     seed at 3,037 MB and the `.deb` x86_64 seed at 3,367 MB, both over the old cap, and every job
     reused the build with 0 compiles. The MSI job took 6.0 min and the whole run 6.7 min, against
     26.3 min for the MSI's cold build one release earlier.
+- 2026-10-29, evening: **agent-v0.4.187, cut by roomler-ai-de.**
+  - **The tag run is clean** (40929759871): reuse in 8 of 8 jobs, nothing compiled, `roomlerd
+    0.4.187` in 4 of 4, no companion compile. Tag to publish took 5 min 33 s (18:19:47 →
+    18:25:20Z).
+  - **The post-release reseed** (40930679656) kept all four daemon seeds under 4,500 MB and reused
+    the build: MSI 3,765, `.deb` x86_64 4,153, `.pkg` 3,386 and `.deb` aarch64 3,321 MB. The
+    Windows companion EXE's seed reached its 3,000 MB cap for the first time (2,877 → 2,972 →
+    3,068 MB over three reseeds) and was dropped whole, so its build ran cold, 6 min 6 s, after the
+    release had published.
+  - That is the cycle `docs/build-caches.md` §4 describes, not a regression. A tag run skips the
+    GC, and a rehearsal restores a seed the last reseed already checked, so a drop lands on a
+    reseed. At ~390 MB a release, the `.deb` x86_64 seed should drop on 0.4.188's reseed and the
+    MSI's about two releases later.
+- 2026-10-30: **closed**, with every criterion ticked and the docs merged in #3107 (`19c5773f6`).

@@ -204,9 +204,9 @@ flowchart TD
     T -- "died / hung" --> H2["the 4:2:0 matrix, and the log names<br/>the last open — the entry for encoder_cells_deny"]
     G --> P
     H2 --> P
-    P{candidates_gpu:<br/>zero_copy on? the QSV and NVENC 4:2:0 cells<br/>the GPU input covers, minus both denylists}
+    P{candidates_gpu:<br/>zero_copy on? the QSV, NVENC and VideoToolbox<br/>4:2:0 cells the GPU input covers,<br/>minus both denylists}
     P -- "none: the switch is off, or no such cell" --> W
-    P -- some --> U["child 3 — PHASE=gpu<br/>ROOMLERD_CAPS_GPU_NAMES=…<br/>each GPU-input form opened on a device of its<br/>frames' adapter, two GPU frames encoded"]
+    P -- some --> U["child 3 — PHASE=gpu<br/>ROOMLERD_CAPS_GPU_NAMES=…<br/>each GPU-input form opened on a device of its<br/>frames' adapter, two GPU frames encoded<br/>(VideoToolbox: IOSurface frames until a packet)"]
     U -- ROOMLER_CAPS_GPU --> V[gpu_input: the forms<br/>a session may open]
     U -- "died / hung" --> V2["no GPU-input form, and the log names<br/>the last open — the entry for zero_copy_deny"]
     V --> W{any hardware cell?}
@@ -239,7 +239,9 @@ Why a third (FR-118 P2-3): a QSV encoder that takes GPU frames
 pool of the capture's own D3D11 device, an open no other cell makes. The `gpu`
 child makes it first and encodes two GPU frames through it. QSV's forms open
 on a device of the adapter the SystemContext DXGI arm captures on, and NVENC's
-(FR-118 P3) on a device of the NVIDIA adapter, where WGC's device goes. A
+(FR-118 P3) on a device of the NVIDIA adapter, where WGC's device goes.
+VideoToolbox's (FR-118 P5) needs no device: the child feeds it IOSurfaces it
+makes itself until a packet comes out. A
 session opens that form only for an encoder the child proved
 (`input_reason=unproven` otherwise), so a driver that faults on it takes down a
 child, never the daemon. With `zero_copy` off there are no candidates and no
@@ -533,12 +535,14 @@ the denylist, and the raw dump of a healthy build decodes as-is.
 The input path is a third dimension of a cell, beside codec × backend and
 chroma: an encoder takes its frames from CPU memory, as every cell did until
 FR-118, or as textures on the capture's own GPU. The GPU form is **off by
-default** (`zero_copy`), and two families take it so far, both at 4:2:0:
+default** (`zero_copy`), and three families take it so far, all at 4:2:0:
 
 - **QSV** (`hevc_qsv`, `av1_qsv`, `h264_qsv`) on the SystemContext DXGI arm, which is the arm every QSV host in
   the fleet captures through.
 - **NVENC** (`hevc_nvenc`, `av1_nvenc`, `h264_nvenc`) on the WGC arm (FR-118 P3). On a hybrid laptop WGC's device
   moves to the NVIDIA adapter.
+- **VideoToolbox** (`hevc_videotoolbox`, `h264_videotoolbox`) on macOS's display stream (FR-118 P5). The stream's
+  IOSurface reaches VideoToolbox as a CVPixelBuffer over the same memory, and VideoToolbox converts the BGRA itself.
 
 ```mermaid
 flowchart LR
@@ -559,15 +563,20 @@ flowchart LR
     C3 -->|CopySubresourceRegion| D3[D3D11 pool slice]
     D3 -->|AV_PIX_FMT_D3D11| E3[NVENC]
   end
+  subgraph vt["GPU input (zero_copy, a proven VideoToolbox cell)"]
+    A4["display stream IOSurface (BGRA)"] -->|"Frame::into_surface:<br/>the use count moves with it"| B4[IoSurfaceFrame]
+    B4 -->|"CVPixelBufferCreateWithIOSurface<br/>+ the BT.601 matrix attached"| C4[CVPixelBuffer, same memory]
+    C4 -->|AV_PIX_FMT_VIDEOTOOLBOX| E4[VideoToolbox<br/>converts the BGRA]
+  end
 ```
 
 | Piece | What it is | Where |
 |---|---|---|
-| the switch | `zero_copy` (`ROOMLERD_ZERO_COPY`), default off; a restart applies it | `capture::gpu_frame::zero_copy_enabled` |
-| the denylist | `zero_copy_deny`, entries `name:gpu` (`none` = empty), read by the probe and at every encoder open | `encode::ffmpeg::gpu_hint::denied` |
-| the GPU frame | `FrameData::Gpu`: a BGRA texture on the capture's device. A consumer that needs bytes reads it back, once | `agents/roomlerd/src/capture/gpu_frame.rs` |
-| the capture's adapter | the DXGI arm: the primary output's. WGC: the adapter of the first proven GPU-input cell's vendor, in the order every cascade opens backends (NVENC, QSV, AMF); with none proven, the default adapter | `capture::gpu_frame::capture_adapter` |
-| the GPU input | QSV: a D3D11VA device context wrapping the capture's device, a QSV device derived from it, and a decoder-target frame pool. NVENC: the same D3D11VA context and an `AV_PIX_FMT_D3D11` NV12 pool, decoder-bound (the RTX 5090 refuses its NV12 array otherwise) | `agents/roomlerd/src/encode/ffmpeg/gpu_input.rs` |
+| the switch | `zero_copy` (`ROOMLERD_ZERO_COPY`), default off; a restart applies it. On a supervised Mac the root's value is handed to the GUI worker, which captures and encodes | `capture::zero_copy_enabled` |
+| the denylist | `zero_copy_deny`, entries `name:gpu` (`none` = empty), read by the probe and at every encoder open; handed to a supervised Mac's GUI worker as the switch is | `encode::ffmpeg::gpu_hint::denied` |
+| the GPU frame | `FrameData::Gpu`: a BGRA texture on the capture's device. On macOS, `FrameData::IoSurface`: the display stream's surface, its use count held until the last clone goes. A consumer that needs bytes reads either back, once | `agents/roomlerd/src/capture/gpu_frame.rs`, `agents/roomlerd/src/capture/iosurface_frame.rs` |
+| the capture's adapter | the DXGI arm: the primary output's. WGC: the adapter of the first proven GPU-input cell's vendor, in the order every cascade opens backends (NVENC, QSV, AMF); with none proven, the default adapter. macOS: none, an IOSurface is not bound to a device | `capture::gpu_frame::capture_adapter` |
+| the GPU input | QSV: a D3D11VA device context wrapping the capture's device, a QSV device derived from it, and a decoder-target frame pool. NVENC: the same D3D11VA context and an `AV_PIX_FMT_D3D11` NV12 pool, decoder-bound (the RTX 5090 refuses its NV12 array otherwise). VideoToolbox: no device at all; a CVPixelBuffer over the frame's IOSurface, or a pool buffer a frame in memory is copied into, as `AV_PIX_FMT_VIDEOTOOLBOX` | `agents/roomlerd/src/encode/ffmpeg/gpu_input.rs`, `agents/roomlerd/src/encode/ffmpeg/vt_input.rs` |
 | the proof | the probe's `gpu` child opens each GPU form and encodes two frames through it; a session opens only a form the child proved | [The probe lifecycle](#the-probe-lifecycle) |
 
 The session reports which form it opened and why, on the heartbeat as
@@ -576,7 +585,7 @@ The session reports which form it opened and why, on the heartbeat as
 | `input_reason` | Meaning |
 |---|---|
 | `switch_off` | `zero_copy` is off |
-| `cpu_frames` | the capture delivered frames in memory: another arm, an FP16 desktop, a rotated output, a fallback |
+| `cpu_frames` | the capture delivered frames in memory: another arm, an FP16 desktop, a rotated output, a fallback. Never on a Mac: VideoToolbox's GPU form takes a frame in memory too, with one copy |
 | `no_gpu_cell` | this encoder or chroma takes no GPU frames yet |
 | `denied` | `zero_copy_deny` names it |
 | `unproven` | the probe's `gpu` child did not prove this form on this host |
@@ -592,7 +601,12 @@ The session reports which form it opened and why, on the heartbeat as
 - **The colour is the CPU path's.** The VideoProcessor converts with BT.601
   limited range, the matrix of the CPU path's conversion, so flipping the
   switch does not change the picture. In the field, on an Intel adapter,
-  flat regions decode identically on both paths.
+  flat regions decode identically on both paths. On macOS VideoToolbox does
+  the conversion, and it converts an unmarked BGRA buffer with BT.709, so
+  every buffer carries the BT.601 matrix (the session's colour properties
+  only tag the stream). Measured on an M5 Pro, the test bars then decode
+  within 2 code values of the CPU path in every plane, against 21 unmarked
+  ([FR-118 §5.8](fr/FR-118-gpu-resident-frames.md#58-p5--videotoolbox-takes-the-iosurface-as-built-2026-10-29)).
 - **Measured** ([FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28),
   `av1_qsv` at 1920×1200 and 60 fps on a moving test pattern, 20-minute legs
   on, off, on): capture + encode fell from 14.70 to 12.30 ms per frame, and the
@@ -610,6 +624,18 @@ The session reports which form it opened and why, on the heartbeat as
   WGC reads back off the pump's clock, so on this arm the comparison is
   readback + encode, not capture + encode. The pattern decodes identically on
   both paths.
+- **Measured on macOS with VideoToolbox**
+  ([FR-118 §9.9](fr/FR-118-gpu-resident-frames.md#99-ac7-videotoolbox-on-the-macbook-2026-10-29),
+  `hevc_videotoolbox` at 3024×1964 on an M5 Pro, the same pattern, 20-minute
+  legs on, off, on): the encode stage fell from 4.18 to 0.12 ms per frame,
+  because the CPU conversion and FFmpeg's copy into VideoToolbox's buffer are
+  gone, and the worker's CPU from 14.58 to 2.55 and 2.60 ms per encoded frame
+  (126 % of a core to 22 %). The frame rate is the same on both paths (88 fps),
+  so the surfaces the capture holds until VideoToolbox is done with them, out
+  of the display stream's queue of 3, cost no frames. The scrap arm's capture
+  stage waits for the stream's next frame, so capture + encode is the frame
+  period on both paths, and the comparison is the encode stage and the CPU.
+  The pattern decodes within 2 code values of the CPU path.
 - **WGC across adapters.** On a hybrid laptop whose panel is driven by the
   iGPU, WGC's device and the dGPU's encoder sit on different adapters. Measured
   on such a laptop
@@ -623,14 +649,22 @@ The session reports which form it opened and why, on the heartbeat as
   with both NVENC and QSV, a codec NVENC lacks opens on QSV on the other adapter
   and reads `adapter_mismatch`: CPU frames, the picture unchanged.
 - **Field-verified and released:** the QSV cell on the DXGI arm (0.4.181,
-  [FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28)) and
+  [FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28)),
   the NVENC cell on the WGC arm (0.4.183,
-  [FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29)).
+  [FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29))
+  and the VideoToolbox cells on macOS (0.4.187,
+  [FR-118 §9.9](fr/FR-118-gpu-resident-frames.md#99-ac7-videotoolbox-on-the-macbook-2026-10-29);
+  as built:
+  [§5.8](fr/FR-118-gpu-resident-frames.md#58-p5--videotoolbox-takes-the-iosurface-as-built-2026-10-29)).
+  On a Mac `input_path=gpu` means VideoToolbox converts the BGRA, for a frame
+  in memory as well (the 2× CPU downscale's), which is copied once into a pool
+  buffer first.
 - **Not built:** AMF — the measurement above
   ([FR-118 §9.4](fr/FR-118-gpu-resident-frames.md#94-wgc-across-adapters-for-p3-2026-10-28))
   made its route unnecessary on the hybrid host, so an AMD-only host's AMF cells
-  stay on CPU frames until one needs them — and VideoToolbox (macOS) and VAAPI
-  (Linux), later phases.
+  stay on CPU frames until one needs them — and VAAPI (Linux), deferred with its
+  measurement: its conversion and upload are 1.2 ms of a 4.1 ms encode stage, on
+  the one 1600×900 virtual desktop that runs it (FR-118 open decision 6).
 
 ## Configuration
 
@@ -639,8 +673,8 @@ The session reports which form it opened and why, on the heartbeat as
 | `encoder_preference` | `ROOMLERD_ENCODER` (CLI `--encoder` wins) | `auto` | `auto` · `hardware` · `software` |
 | `encoder_cells_deny` | `ROOMLERD_ENCODER_CELLS_DENY` | the built-in list | `name:chroma` cells never opened nor advertised; `none` = deny nothing; pushable through remote config (`MANAGE_AGENTS`), `needs_restart`. On a supervised Mac the session's encoders open in the GUI worker, which reads the person's config, so the root's effective value is handed to it at spawn (FR-43, `WORKER_ENV_FORWARD`, from 0.4.155); before that a root-side deny bound the probe and the hello but not the worker's sessions |
 | `caps_cache` | `ROOMLERD_CAPS_CACHE` | on | the probe cache (read and write) |
-| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them ([above](#gpu-resident-frames-the-input-path-fr-118)) |
-| `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing |
+| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them; on macOS the display stream's IOSurfaces go to a proven VideoToolbox cell ([above](#gpu-resident-frames-the-input-path-fr-118)). On a supervised Mac the root's value is handed to the GUI worker at spawn (`WORKER_ENV_FORWARD`, from FR-118 P5) |
+| `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing. Handed to a supervised Mac's GUI worker as `zero_copy` is |
 | `vaapi_device` | `ROOMLERD_VAAPI_DEVICE` | unset | pin the render node; unset = `/dev/dri/renderD128`…`135` in order |
 | `d3d12_adapter` | `ROOMLERD_D3D12_ADAPTER` | unset | pin the DXGI adapter index for D3D12 video encode (Windows); unset = adapters `0`…`3` in order |
 | `vulkan_device` | `ROOMLERD_VULKAN_DEVICE` | unset | pin the Vulkan physical device by index or name; unset = the loader's default |
@@ -712,7 +746,115 @@ flowchart LR
   Vulkan — **rebuilds** the encoder on a coarsened ladder. D3D12 and Vulkan are
   measured (FR-78 P2, the A0 ladder on the dev box): every rung forced an IDR,
   42–77 ms per apply. `encoder-smoke --reconfigure-sweep --name <encoder>` is
-  the read for any host.
+  the read for any host. The per-backend cost table, the counters and the sweep's
+  verdict are the next section.
+
+### A rate move, per backend (FR-62)
+
+What a rate move costs decided the shape of the rate-control code: nine of its
+heuristics exist only to ration that cost
+([FR-62](fr/FR-62-encoder-rate-changes-without-an-idr.md)). The pump hands every
+AIMD target to `FfmpegEncoder::set_bitrate`
+(`agents/roomlerd/src/encode/ffmpeg/encoder.rs:2946`), which snaps it to the
+ladder first (`encode/aimd.rs:297` — 100 k … 25 M, `coarsen_bitrate` at `:317`)
+and returns when the rung is the one already running. Only a rung crossing reaches
+the backend's arm, resolved once at open by `resolve_rate_mode` (`encoder.rs:869`).
+
+```mermaid
+flowchart TD
+    T["AIMD target_bps"] --> C["coarsen_bitrate<br/>nearest ladder rung"]
+    C -->|"same rung as the running maxrate"| N["no-op"]
+    C -->|"rung crossed"| M{"RateReconfig<br/>resolved at open"}
+    M -->|"NVENC: InPlaceVbr"| V["write rc_max_rate + rc_buffer_size<br/>FFmpeg reconfigures on the next send_frame<br/>0.004 ms, no IDR with patch 0001"]
+    M -->|"QSV with the flag ON: InPlaceCbr"| Q["write bit_rate + rc_max_rate + rc_buffer_size<br/>MFXVideoENCODE_Reset answers −14 on Iris Xe<br/>the encoder is unusable after it"]
+    M -->|"QSV flag OFF, AMF, VideoToolbox, VAAPI, D3D12, Vulkan: Rebuild"| R["reopen at the new maxrate<br/>a fresh IDR plus the open's cost"]
+    R -->|"bg_rebuild on a direct path, bg_rebuild_constrained on a relay"| S["off-thread swap, adopted at quiet on a relay<br/>counted as swaps"]
+    R -->|"inline"| I["blocks the pump for the open<br/>counted as rebuilds"]
+```
+
+Measured with the sweep described below (20 rate changes 6 M → 200 k → 6 M at
+1280×800, 30 frames a rung, `set_ms` the apply alone):
+
+| Backend (host) | Arm | Rate-caused IDRs | Apply | Read |
+|---|---|---|---|---|
+| `hevc_nvenc` (RTX 5090 Laptop) | in place, unpatched FFmpeg | **20/20** | 0.001–0.008 ms | 0.4.50, 2026-09-02 (#1242) |
+| `hevc_nvenc` (the same GPU) | in place, patch 0001 | **0/20**, default and constrained HRD windows alike | 0.004 ms | a patched 0.4.51 build, 2026-09-02; re-read on the released **0.4.187**, 2026-10-29 |
+| `hevc_qsv` (Iris Xe) | rebuild, flag OFF | 20/20 | 340–390 ms above 1.5 M, **1.3–2.2 s at or below 1 M** | 0.4.51, 2026-09-02 |
+| `hevc_qsv` (Iris Xe) | in place, flag ON | — | `MFX_ERR_INCOMPATIBLE_VIDEO_PARAM`, both `low_power` modes, with and without the buffer write | 0.4.51 and 0.4.62 |
+| `hevc_amf` (Radeon 610M) | rebuild | **20/20** | **41–55 ms** | **0.4.187, 2026-10-29** — the 0.4.187 harness filed every one as periodic (below); the corrected harness reads `total_rate_idr: 20`, `pass: false` |
+| `hevc_d3d12va`, `hevc_vulkan` (the dev box) | rebuild | 20/20 | 42–77 ms | FR-78 P2 |
+| `*_vaapi` | rebuild, by construction | — | unmeasured | — |
+| `hevc_videotoolbox` | rebuild | unmeasured | unmeasured | A3's open decision: patch 0002, or a rebuild at settle |
+
+So the two rebuild families are not one: QSV's rebuild is a multi-second stall at
+the rates a slow link runs, while AMF, D3D12 and Vulkan rebuild in 40–80 ms and pay
+only the IDR. The rationing a backend needs follows from its row, which is why A4
+retires heuristics per backend rather than deleting them.
+
+⚠️ **Above the ladder the controller moves nothing.** The top rung is 25 Mbps. A
+direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climbed
+`target_bps` 34 → 65 Mbps in eight AIMD steps while `rate_moves` stayed 0: every step
+coarsened to the top rung and `set_bitrate` returned. The encoder's maxrate is the
+rung, never the target.
+
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:9797-9830`):
+
+| Field | Meaning |
+|---|---|
+| `inplace_rate` | `supports_dynamic_bitrate()`: the backend applies in place (NVENC always, QSV only with the flag) |
+| `rate_moves` | in-place writes |
+| `rebuilds` | synchronous reopens, the inline arm |
+| `swaps` | background-rebuilt encoders adopted. Read it beside the two above: on a direct QSV session every rate move lands here and only here (FR-65) |
+| `dims_swaps` | reopens for a resolution change (FR-70 M2) |
+| `idr_count` | every keyframe the encoder emitted. Read against `dims_swaps` and the session's `PLI/FIR → forcing keyframe` lines (`peer.rs:836`) to isolate the rate-caused ones |
+| `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
+
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6127`):
+
+```
+roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
+roomlerd encoder-smoke --reconfigure-sweep --name hevc_amf --codec hevc --json   # a backend the cascade outranks
+```
+
+Per rung it prints `set_ms`, `rate_idr`, `periodic_idr`, `mean_bytes`, the
+bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
+`trailing_mean`; `--json` emits one `ROOMLER_A0_JSON:{…}` line. Two rules the first
+reads taught it:
+
+- **The rate change is charged with the keyframe on the rung's first output frame**
+  (`sweep_attribute_idrs`, `app.rs:6388`), not on frame 0. AMF answers the frame that
+  fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
+  "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
+  for a backend that rebuilds on every move.
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6417`). Every
+  backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
+  CBR (`select_rc_mode` takes the CBR branch because the session opens with
+  `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst
+  (≤ 2×): a quality-driven backend sits under its cap on compressible content, so the
+  RTX read printed `pass: false` on a 0.985 ratio deviation with 0/20 IDRs and a
+  0.004 ms apply. The JSON names the basis (`"basis":"idr+apply"` or
+  `"idr+apply+tracking"`).
+
+**The patch and its gate.** `.github/ffmpeg-patches/0001-nvenc-no-idr-on-bitrate-reconfig.patch`
+drops `resetEncoder = forceIDR = 1` from `nvenc.c`'s bitrate-only reconfigure.
+`vendor-ffmpeg-windows.yml` applies it to the Windows and both Linux assets and
+writes `ROOMLER-PATCHES.txt` (sha256 per patch) into each; `release-agent.yml`
+refuses to tag when an asset's manifest differs from the committed patches
+(`.github/workflows/release-agent.yml:449-471`, `:1167` for arm64). The pump reads
+one const, `NVENC_RECONFIG_FORCES_IDR` (`encoder.rs:893`), so the binary and the
+FFmpeg it links cannot disagree. The macOS builder carries no patch today.
+
+**Switches, and when each retires:**
+
+| Switch | Default | What it does | Retires when |
+|---|---|---|---|
+| `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:325`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:338`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
+| `ROOMLERD_ENCODER_NVENC_ASSUME_IDR` (`:354`) | off | reverts NVENC to the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` |
+| `bg_rebuild_constrained` (`:498`) | on | a constrained session's rebuild runs off-thread (#1254), adopted at quiet | never while a rebuild backend exists |
+
+**Open**: QSV's `mfxExtEncoderResetOption` (patch 0004, an FFmpeg-level change),
+VideoToolbox's A0 on a Mac, and A4's per-backend retirements — NVENC can shed its
+rationing, QSV keeps `coarsen_bitrate`, and AMF, D3D12 and Vulkan keep it for the IDR.
 
 ## Software encoders: the clock and 60 fps (FR-112)
 

@@ -47,6 +47,13 @@ pub(crate) mod gpu_hint;
 pub(crate) mod gpu_input;
 /// FR-77 P4 — the VAAPI device + frame pools (`*_vaapi` encoders only).
 pub(crate) mod hwframes;
+/// FR-118 P5 — VideoToolbox takes the capture's IOSurface (macOS).
+#[cfg(all(
+    target_os = "macos",
+    feature = "ffmpeg-encoder",
+    feature = "scrap-capture"
+))]
+pub(crate) mod vt_input;
 
 #[cfg(feature = "ffmpeg-encoder")]
 pub use encoder::{FfmpegEncoder, RebuiltEncoder};

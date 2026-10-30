@@ -143,7 +143,7 @@ const PROTOCOL_VERSIONS: [&str; 4] = ["2024-11-05", "2025-03-26", "2025-06-18", 
 const MAX_NAME: usize = 256;
 
 /// What a driver decided.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Decision {
     Allow,
     /// `message` goes to the model with the denial.
@@ -153,14 +153,14 @@ pub(crate) enum Decision {
 }
 
 /// A driver's answer to one approval.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Answer {
     pub decision: Decision,
     pub by: Author,
 }
 
 /// How an approval ended.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Ended {
     Answered(Answer),
     /// Nobody answered within the timeout.
@@ -185,34 +185,103 @@ pub(crate) enum ApprovalEvent {
     },
 }
 
+/// One open approval, from [`Pending`]'s own side: the real wait
+/// ([`Slot::Local`], where this process runs [`run_approval`]), or a note
+/// that it is open in the session's worker ([`Slot::Remote`], FR-90
+/// P8-2c-2) — tracked here too, so [`Pending::ids`] and a double-answer's
+/// refusal stay correct from the daemon's side, though the worker holds the
+/// real wait.
+enum Slot {
+    Local(oneshot::Sender<Answer>),
+    #[cfg(all(unix, worker_calls))]
+    Remote,
+}
+
+/// Where a [`Slot::Remote`] resolution forwards: the session's worker, at
+/// the toolbelt endpoint it was handed as (FR-90 P8-2c-2) — looked up by
+/// [`crate::hive::worker::link_of`] fresh at every forward, never cached,
+/// since `open` (synchronous, and called before a starting worker may have
+/// answered its `Hello`) cannot wait for one to exist. `None` where this
+/// `Pending` only ever holds [`Slot::Local`]s — no worker serves this
+/// session, or this process IS the worker. Unix only, like the hand-over
+/// itself (P8-2c-2 has no Windows variant yet) — `worker_calls` alone is
+/// the `vault` feature on EITHER OS, so it is not enough of a gate by
+/// itself here.
+#[cfg(all(unix, worker_calls))]
+type Remote = (ObjectId, u64, u64); // (session, fence, endpoint)
+
 /// A session's open approvals: the toolbelt opens them; a driver's answer,
 /// the timeout, or the session's end closes them.
 #[derive(Default)]
 pub(crate) struct Pending {
-    map: Mutex<HashMap<String, oneshot::Sender<Answer>>>,
+    map: Mutex<HashMap<String, Slot>>,
+    #[cfg(all(unix, worker_calls))]
+    remote: Option<Remote>,
 }
 
 impl Pending {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, oneshot::Sender<Answer>>> {
+    /// FR-90 P8-2c-2 — a `Pending` whose resolutions forward to `session`
+    /// at `fence`'s worker, at `endpoint`, once the toolbelt is handed to
+    /// one. Every slot it holds is [`Slot::Remote`].
+    #[cfg(all(unix, worker_calls))]
+    pub(crate) fn remote(session: ObjectId, fence: u64, endpoint: u64) -> Self {
+        Self {
+            map: Mutex::default(),
+            remote: Some((session, fence, endpoint)),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Slot>> {
         self.map.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Open `id`; `None` when [`MAX_PENDING`] are open already.
+    /// Open `id`; `None` when [`MAX_PENDING`] are open already. The worker's
+    /// own use: this `Pending` is never [`Self::remote`] there.
     fn open(&self, id: &str) -> Option<oneshot::Receiver<Answer>> {
         let mut map = self.lock();
         if map.len() >= MAX_PENDING {
             return None;
         }
         let (tx, rx) = oneshot::channel();
-        map.insert(id.to_string(), tx);
+        map.insert(id.to_string(), Slot::Local(tx));
         Some(rx)
     }
 
+    /// FR-90 P8-2c-2 — `id` opened in the session's worker: noted here as
+    /// [`Slot::Remote`] so the daemon's own view of what is open (`ids`, a
+    /// double-answer's refusal) stays correct. `false` past [`MAX_PENDING`]
+    /// — the worker's own [`Self::open`] already refused it there too; this
+    /// is the daemon's record of that refusal, not a second gate.
+    #[cfg(all(unix, worker_calls))]
+    pub(crate) fn note_remote_open(&self, id: &str) -> bool {
+        let mut map = self.lock();
+        if map.len() >= MAX_PENDING {
+            return false;
+        }
+        map.insert(id.to_string(), Slot::Remote);
+        true
+    }
+
     /// Answer `id`. `false` when it is not open — answered already, expired,
-    /// withdrawn, or never this session's.
+    /// withdrawn, or never this session's. A [`Slot::Remote`] forwards the
+    /// answer to the worker that holds the real wait, on a task of its own:
+    /// a failed forward takes that worker's link for lost, as any other
+    /// failed call does, rather than silently drop the answer.
     pub(crate) fn answer(&self, id: &str, answer: Answer) -> bool {
         match self.lock().remove(id) {
-            Some(tx) => tx.send(answer).is_ok(),
+            Some(Slot::Local(tx)) => tx.send(answer).is_ok(),
+            #[cfg(all(unix, worker_calls))]
+            Some(Slot::Remote) => {
+                self.forward(
+                    id,
+                    super::vault_connect::handed::Call::ToolbeltAnswer {
+                        endpoint: self.endpoint(),
+                        id: id.to_string(),
+                        answer,
+                    },
+                );
+                true
+            }
             None => false,
         }
     }
@@ -230,14 +299,74 @@ impl Pending {
 
     /// FR-90 P2e-4 — withdraw `id`: its call sees the answer channel close,
     /// tells the harness so, and the session hears it ended `withdrawn`. An
-    /// approval that opens while the session drains for a move.
+    /// approval that opens while the session drains for a move. A
+    /// [`Slot::Remote`] forwards the withdrawal to the worker.
     pub(crate) fn withdraw(&self, id: &str) {
+        #[cfg(all(unix, worker_calls))]
+        if matches!(self.lock().get(id), Some(Slot::Remote)) {
+            self.forward(
+                id,
+                super::vault_connect::handed::Call::ToolbeltWithdraw {
+                    endpoint: self.endpoint(),
+                    id: id.to_string(),
+                },
+            );
+        }
         self.forget(id);
     }
 
-    /// Withdraw every open approval: their calls see the answer channel close.
+    /// Withdraw every open approval: their calls see the answer channel
+    /// close. Where any [`Slot::Remote`] is open, the worker is told once
+    /// for all of them, rather than once per id.
     pub(crate) fn withdraw_all(&self) {
+        #[cfg(all(unix, worker_calls))]
+        {
+            let any_remote = self.lock().values().any(|s| matches!(s, Slot::Remote));
+            if any_remote {
+                self.forward(
+                    "*",
+                    super::vault_connect::handed::Call::ToolbeltWithdrawAll {
+                        endpoint: self.endpoint(),
+                    },
+                );
+            }
+        }
         self.lock().clear();
+    }
+
+    /// FR-90 P8-2c-2 — this `Pending`'s endpoint, where it is [`Self::remote`].
+    /// Panics otherwise: every caller of [`Self::forward`] has already
+    /// matched a [`Slot::Remote`], which exists only where [`Self::remote`]
+    /// built this `Pending`.
+    #[cfg(all(unix, worker_calls))]
+    fn endpoint(&self) -> u64 {
+        self.remote
+            .as_ref()
+            .map(|(_, _, endpoint)| *endpoint)
+            .expect("a Slot::Remote only ever exists in a remote Pending")
+    }
+
+    /// Fire `call` at this `Pending`'s worker, on a task of its own: the
+    /// caller (a sync `answer`/`withdraw`/`withdraw_all`) does not wait on
+    /// it. The worker is looked up fresh, since the one `open` knew of (if
+    /// any was up yet) may since have restarted; no worker up right now
+    /// drops the call — the same loss [`handed`] already documents for a
+    /// worker that dies mid-approval.
+    #[cfg(all(unix, worker_calls))]
+    fn forward(&self, log_id: &str, call: super::vault_connect::handed::Call) {
+        let Some((session, fence, _)) = self.remote else {
+            return;
+        };
+        let log_id = log_id.to_string();
+        tokio::spawn(async move {
+            let Some(link) = crate::hive::worker::link_of(session, fence) else {
+                debug!(%session, fence, approval = %log_id, "hive: a toolbelt approval's forward found no worker up");
+                return;
+            };
+            if let Err(why) = link.call(call, Vec::new()).await {
+                debug!(%session, fence, approval = %log_id, %why, "hive: a toolbelt approval's forward to its worker went unanswered");
+            }
+        });
     }
 }
 
@@ -403,6 +532,39 @@ struct Ctx {
     pending: Arc<Pending>,
     events: mpsc::Sender<ApprovalEvent>,
     timing: Timing,
+}
+
+impl Ctx {
+    /// FR-90 P8-2c-2 — a run's `Ctx` as its worker builds it: every trait
+    /// field `None` (P8-2c's remaining scope — none of `vault`, `knowhow`,
+    /// `exec`, `net`, `ssh` are forwarded across the worker's channel yet,
+    /// so none of their tools are offered from a worker-hosted session),
+    /// `pending` and `events` the worker's own (real, local).
+    #[cfg(all(unix, worker_calls))]
+    fn worker_hosted(
+        session: ObjectId,
+        fence: u64,
+        peer: PeerId,
+        pending: Arc<Pending>,
+        events: mpsc::Sender<ApprovalEvent>,
+    ) -> Self {
+        Self {
+            session,
+            fence,
+            vault: None,
+            knowhow: None,
+            #[cfg(feature = "vault")]
+            exec: None,
+            #[cfg(feature = "vault")]
+            net: None,
+            #[cfg(all(feature = "vault", feature = "ssh-server"))]
+            ssh: None,
+            peer,
+            pending,
+            events,
+            timing: Timing::default(),
+        }
+    }
 }
 
 /// FR-90 P3-4b — the vault tools this server offers where the device takes
@@ -677,6 +839,12 @@ pub(crate) struct Toolbelt {
     socket: PathBuf,
     pending: Arc<Pending>,
     stop: CancellationToken,
+    /// FR-90 P8-2c-2 — this run and the endpoint it was handed as, where
+    /// the toolbelt is handed to its worker instead of served here. `None`
+    /// where it is served here, as before this step (and always, on
+    /// Windows so far).
+    #[cfg(all(unix, worker_calls))]
+    handed: Option<(ObjectId, u64, u64)>,
 }
 
 impl Toolbelt {
@@ -693,6 +861,23 @@ impl Drop for Toolbelt {
     fn drop(&mut self) {
         self.stop.cancel();
         self.pending.withdraw_all();
+        // FR-90 P8-2c-2 — handed to a worker: forgotten here (so a later
+        // `rehand` finds nothing), and told to stop — on a task of its
+        // own, since `Drop` cannot await it.
+        #[cfg(all(unix, worker_calls))]
+        if let Some((session, fence, endpoint)) = self.handed {
+            handed::forget(session, fence);
+            tokio::spawn(async move {
+                if let Some(link) = crate::hive::worker::link_of(session, fence) {
+                    let _ = link
+                        .call(
+                            super::vault_connect::handed::Call::ToolbeltClose { endpoint },
+                            Vec::new(),
+                        )
+                        .await;
+                }
+            });
+        }
         // A pipe is gone with its last instance; a socket stays a file.
         #[cfg(unix)]
         let _ = std::fs::remove_file(&self.socket);
@@ -741,8 +926,29 @@ pub(crate) fn open(
         let _ = std::fs::remove_file(&socket);
         return Err(format!("{}: {e}", socket.display()));
     }
-    let pending = Arc::new(Pending::default());
     let stop = CancellationToken::new();
+    // FR-90 P8-2c-2 — where this run's worker exists, the toolbelt is handed
+    // to it instead of served here; `None` keeps today's behavior exactly.
+    #[cfg(worker_calls)]
+    let handed = handed::prepare(run.session, run.fence, uid, &listener, events.clone())?;
+    #[cfg(not(worker_calls))]
+    let handed: Option<(Arc<Pending>, u64)> = None;
+    if let Some((pending, endpoint)) = handed {
+        // `endpoint` is read only by the `handed` field below, which is
+        // itself compiled out where `worker_calls` is off (the `vault`
+        // feature, independent of `unix`) — without this, that
+        // configuration sees the binding as unused.
+        #[cfg(not(all(unix, worker_calls)))]
+        let _ = endpoint;
+        return Ok(Toolbelt {
+            socket,
+            pending,
+            stop,
+            #[cfg(all(unix, worker_calls))]
+            handed: Some((run.session, run.fence, endpoint)),
+        });
+    }
+    let pending = Arc::new(Pending::default());
     let ctx = Arc::new(Ctx {
         session: run.session,
         fence: run.fence,
@@ -764,6 +970,8 @@ pub(crate) fn open(
         socket,
         pending,
         stop,
+        #[cfg(all(unix, worker_calls))]
+        handed: None,
     })
 }
 
@@ -843,6 +1051,8 @@ pub(crate) fn open(
         socket: PathBuf::from(name),
         pending,
         stop,
+        #[cfg(all(unix, worker_calls))]
+        handed: None,
     })
 }
 
@@ -1954,9 +2164,16 @@ pub fn relay_args() -> Option<PathBuf> {
     Some(PathBuf::from(socket))
 }
 
-/// Pipe this process's stdin and stdout to the session's toolbelt until
-/// either side ends. The relay is bytes only: every message is read, bounded
-/// and answered by the daemon.
+/// Pipe this process's stdin and stdout to the session's toolbelt for the
+/// whole run (P8-0's point 1). Claude Code starts this once a session and
+/// never again, so it must never see it exit for a worker's sake: a dropped
+/// connection answers whatever was waiting with a JSON-RPC error and
+/// reconnects, with backoff, until the daemon hands a fresh worker the same
+/// listener — replaying the run's own `initialize` and
+/// `notifications/initialized` so the new worker starts where the old one
+/// left off. The one failure this does NOT absorb is the very first dial:
+/// nothing has run yet for anything to reconnect to, so that one is fatal,
+/// exactly as before P8.
 pub async fn relay(socket: &Path) -> anyhow::Result<()> {
     relay_io(socket, tokio::io::stdin(), tokio::io::stdout()).await
 }
@@ -1998,31 +2215,264 @@ pub(crate) async fn connect(
     }
 }
 
+/// How long a line that arrives while the relay is reconnecting waits before
+/// it, too, is answered the restarted error (P8-0's point 1). Several lines
+/// in the same window share it rather than each getting its own fresh 10 s:
+/// Claude Code sends one tool call at a time and waits for its answer
+/// (measured — see [`APPROVAL_TIMEOUT`]'s own note), so this only matters
+/// for the rare notification that arrives mid-reconnect.
+const RECONNECT_GIVE_UP: Duration = Duration::from_secs(10);
+/// Between dial attempts while reconnecting — quick enough that several fit
+/// inside [`RECONNECT_GIVE_UP`], slow enough not to hot-loop a socket the
+/// daemon is still rebinding for a restarting worker.
+const RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
+/// JSON-RPC's own reserved range for an implementation-defined server error
+/// starts here; this one means "ask again, nothing is wrong with the call
+/// itself."
+const RESTARTED: i64 = -32000;
+
+type ToolbeltRead = Box<dyn AsyncRead + Unpin + Send>;
+type ToolbeltWrite = Box<dyn AsyncWrite + Unpin + Send>;
+
+/// The run's own `initialize` and `notifications/initialized`, kept
+/// verbatim so a fresh worker is replayed byte for byte (P8-0's point 1).
+#[derive(Default)]
+struct Handshake {
+    initialize: Option<Vec<u8>>,
+    initialized: Option<Vec<u8>>,
+}
+
+impl Handshake {
+    /// The first of each, never a later one of the same name — there should
+    /// be only one per run, and a second mid-run is not this relay's to
+    /// interpret.
+    fn remember(&mut self, v: &Value, raw: &[u8]) {
+        match v.get("method").and_then(Value::as_str) {
+            Some("initialize") if self.initialize.is_none() => {
+                self.initialize = Some(raw.to_vec());
+            }
+            Some("notifications/initialized") if self.initialized.is_none() => {
+                self.initialized = Some(raw.to_vec());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `v`'s id where `v` is a REQUEST (a method and a non-null id) — a
+/// notification or a response has nothing for a failure to answer later.
+fn request_id(v: &Value) -> Option<Value> {
+    v.get("method")?;
+    v.get("id").filter(|i| !i.is_null()).cloned()
+}
+
+/// Drop `v`'s id from `inflight` where `v` is a response to one of them.
+fn forget_inflight(inflight: &mut Vec<Value>, v: &Value) {
+    let Some(id) = v.get("id").filter(|i| !i.is_null()) else {
+        return;
+    };
+    inflight.retain(|w| w != id);
+}
+
+/// Answer every one of `ids` the way the harness sees a tool call whose
+/// worker died mid-flight: a JSON-RPC error it and the model can read,
+/// never a transport failure (P8-0's point 1).
+async fn fail_inflight(
+    output: &mut (impl AsyncWrite + Unpin),
+    ids: Vec<Value>,
+) -> std::io::Result<()> {
+    for id in ids {
+        let line = error(&id, RESTARTED, "the session's tools restarted: call again");
+        output.write_all(line.as_bytes()).await?;
+        output.write_all(b"\n").await?;
+    }
+    output.flush().await
+}
+
+/// The same answer for whatever queued up while reconnecting and ran out of
+/// patience; a notification among them gets none — nothing was ever going
+/// to answer it.
+async fn fail_queue(
+    output: &mut (impl AsyncWrite + Unpin),
+    queue: Vec<(Vec<u8>, Option<Value>)>,
+) -> std::io::Result<()> {
+    let ids = queue
+        .into_iter()
+        .filter_map(|(_, parsed)| parsed.and_then(|v| request_id(&v)))
+        .collect();
+    fail_inflight(output, ids).await
+}
+
+/// Bring a freshly dialed worker up to where the harness already believes
+/// the run is: `initialize`, whose answer is swallowed (the harness already
+/// has its first run's), then `notifications/initialized`. Either is
+/// skipped where the drop happened before the harness ever sent it.
+async fn replay(
+    hs: &Handshake,
+    lines: &mut LineReader<BufReader<ToolbeltRead>>,
+    wr: &mut ToolbeltWrite,
+) -> std::io::Result<()> {
+    if let Some(init) = &hs.initialize {
+        wr.write_all(init).await?;
+        wr.write_all(b"\n").await?;
+        lines.next_line().await?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "no reply to the replayed initialize",
+            )
+        })?;
+    }
+    if let Some(ready) = &hs.initialized {
+        wr.write_all(ready).await?;
+        wr.write_all(b"\n").await?;
+    }
+    Ok(())
+}
+
+/// Dial `socket` once and replay `hs` onto it. `Err` here is [`reconnect`]'s
+/// to retry — never this function's.
+async fn dial_and_replay(
+    socket: &Path,
+    hs: &Handshake,
+) -> std::io::Result<(LineReader<BufReader<ToolbeltRead>>, ToolbeltWrite)> {
+    let (rd, wr) = connect(socket).await?;
+    let mut lines = LineReader::new(BufReader::new(Box::new(rd) as ToolbeltRead), MAX_MESSAGE);
+    let mut wr: ToolbeltWrite = Box::new(wr);
+    replay(hs, &mut lines, &mut wr).await?;
+    Ok((lines, wr))
+}
+
+/// Redial `socket` with backoff, queueing whatever the harness sends
+/// meanwhile. A line already in flight when the connection dropped was
+/// failed before this was called ([`fail_inflight`]); a line that arrives
+/// HERE, while reconnecting, is queued and gets at most
+/// [`RECONNECT_GIVE_UP`] before it is failed the same way — but dialing
+/// itself never gives up, so the harness never sees this server die
+/// (P8-0's point 1).
+#[allow(clippy::too_many_arguments)]
+async fn reconnect(
+    socket: &Path,
+    hs: &Handshake,
+    stdin: &mut LineReader<BufReader<impl AsyncRead + Unpin>>,
+    output: &mut (impl AsyncWrite + Unpin),
+    queue: &mut Vec<(Vec<u8>, Option<Value>)>,
+    toolbelt_lines: &mut LineReader<BufReader<ToolbeltRead>>,
+    toolbelt_wr: &mut ToolbeltWrite,
+    inflight: &mut Vec<Value>,
+) -> anyhow::Result<()> {
+    let mut window = Box::pin(tokio::time::sleep(RECONNECT_GIVE_UP));
+    loop {
+        let mut attempt = Box::pin(dial_and_replay(socket, hs));
+        loop {
+            tokio::select! {
+                dialed = &mut attempt => {
+                    let Ok((lines, wr)) = dialed else { break };
+                    *toolbelt_lines = lines;
+                    *toolbelt_wr = wr;
+                    for (line, parsed) in queue.drain(..) {
+                        toolbelt_wr.write_all(&line).await?;
+                        toolbelt_wr.write_all(b"\n").await?;
+                        if let Some(id) = parsed.as_ref().and_then(request_id) {
+                            inflight.push(id);
+                        }
+                    }
+                    return Ok(());
+                }
+                got = stdin.next_line() => {
+                    let Some(line) = got? else {
+                        fail_queue(output, std::mem::take(queue)).await?;
+                        return Ok(());
+                    };
+                    if !line.is_empty() {
+                        let parsed = serde_json::from_slice::<Value>(&line).ok();
+                        queue.push((line, parsed));
+                    }
+                }
+                () = &mut window => {
+                    fail_queue(output, std::mem::take(queue)).await?;
+                    window = Box::pin(tokio::time::sleep(RECONNECT_GIVE_UP));
+                }
+            }
+        }
+        tokio::time::sleep(RECONNECT_BACKOFF).await;
+    }
+}
+
 async fn relay_io(
     socket: &Path,
-    mut input: impl AsyncRead + Unpin,
+    input: impl AsyncRead + Unpin,
     mut output: impl AsyncWrite + Unpin,
 ) -> anyhow::Result<()> {
-    let (mut rd, mut wr) = connect(socket).await.with_context(|| {
+    let (rd, wr) = connect(socket).await.with_context(|| {
         format!(
             "the session's toolbelt at {} is unreachable",
             socket.display()
         )
     })?;
-    let up = async {
-        let _ = tokio::io::copy(&mut input, &mut wr).await;
-        let _ = wr.shutdown().await;
-    };
-    let down = async {
-        let _ = tokio::io::copy(&mut rd, &mut output).await;
-        let _ = output.flush().await;
-    };
-    tokio::select! {
-        _ = up => {}
-        _ = down => {}
+    let mut toolbelt_lines =
+        LineReader::new(BufReader::new(Box::new(rd) as ToolbeltRead), MAX_MESSAGE);
+    let mut toolbelt_wr: ToolbeltWrite = Box::new(wr);
+    let mut stdin = LineReader::new(BufReader::new(input), MAX_MESSAGE);
+    let mut hs = Handshake::default();
+    let mut inflight: Vec<Value> = Vec::new();
+
+    loop {
+        tokio::select! {
+            got = stdin.next_line() => {
+                let Some(line) = got? else { return Ok(()) };
+                if line.is_empty() {
+                    continue;
+                }
+                let parsed = serde_json::from_slice::<Value>(&line).ok();
+                if let Some(v) = &parsed {
+                    hs.remember(v, &line);
+                }
+                let sent = toolbelt_wr.write_all(&line).await.is_ok()
+                    && toolbelt_wr.write_all(b"\n").await.is_ok();
+                if sent {
+                    if let Some(id) = parsed.as_ref().and_then(request_id) {
+                        inflight.push(id);
+                    }
+                } else {
+                    fail_inflight(&mut output, std::mem::take(&mut inflight)).await?;
+                    let mut queue = vec![(line, parsed)];
+                    reconnect(
+                        socket, &hs, &mut stdin, &mut output, &mut queue,
+                        &mut toolbelt_lines, &mut toolbelt_wr, &mut inflight,
+                    ).await?;
+                }
+            }
+            line = toolbelt_lines.next_line() => {
+                match line {
+                    Ok(Some(line)) if !line.is_empty() => {
+                        if let Ok(v) = serde_json::from_slice::<Value>(&line) {
+                            forget_inflight(&mut inflight, &v);
+                        }
+                        output.write_all(&line).await?;
+                        output.write_all(b"\n").await?;
+                        output.flush().await?;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => {
+                        fail_inflight(&mut output, std::mem::take(&mut inflight)).await?;
+                        let mut queue = Vec::new();
+                        reconnect(
+                            socket, &hs, &mut stdin, &mut output, &mut queue,
+                            &mut toolbelt_lines, &mut toolbelt_wr, &mut inflight,
+                        ).await?;
+                    }
+                }
+            }
+        }
     }
-    Ok(())
 }
+
+/// FR-90 P8-2c-2 — the toolbelt served by a session's worker, Unix only so
+/// far, and only where `worker_calls` applies (the `vault` feature; see
+/// `build.rs`): this submodule's whole reason to exist is calling across a
+/// worker's channel, which does not exist without it.
+#[cfg(all(unix, worker_calls))]
+pub(crate) mod handed;
 
 #[cfg(test)]
 pub(crate) mod tests;

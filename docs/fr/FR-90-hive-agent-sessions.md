@@ -1511,7 +1511,7 @@ flowchart LR
 | the start, as the console user | `hive/supervisor.rs:2266` `spawn`: the mapping, the harness, the session's directory (`:2301`), its settings and MCP config, `roomlerd hive-prep` as the user (`blocking`, `:2355`), then the harness SUSPENDED into its Job Object | the blocks' own (P1i-1); the whole path is P1i-4's field run |
 | the harness's process | `hive_win.rs:1170` `HarnessChild`: the part of tokio's `Child` the session task uses, over the job, its pipes as async files | a line in, a line out, the exit code; a kill seen by the wait |
 | the stop | `hive/supervisor.rs:3295`: stdin closed, then the job ended after the grace. No signal reaches a console-less process | — |
-| the toolbelt | `hive/toolbelt.rs:788`: a named pipe, `FILE_FLAG_FIRST_PIPE_INSTANCE`, no remote client, with `hive_win.rs:990`'s DACL: SYSTEM and Administrators, and the session's account to read and write (`0x12008b`) but not to make an instance. The relay opens it with exactly that mask (`hive_win.rs:1131`); each client's account is checked again by SID (`toolbelt.rs:863`) | every approval test, over the pipe; another account's connection dropped unanswered; a name in use never taken as the first |
+| the toolbelt | `hive/toolbelt.rs:990`: a named pipe, `FILE_FLAG_FIRST_PIPE_INSTANCE`, no remote client, with `hive_win.rs:990`'s DACL: SYSTEM and Administrators, and the session's account to read and write (`0x12008b`) but not to make an instance. The relay opens it with exactly that mask (`hive_win.rs:1131`); each client's account is checked again by SID (`toolbelt.rs:1067`) | every approval test, over the pipe; another account's connection dropped unanswered; a name in use never taken as the first |
 | a crash's leftover | `hive/procs.rs:120`, `:248`: creation times by `GetProcessTimes`, and an ended process reads as none even while a handle holds it open | an ended process has no start time; `take_down` ends what it is given |
 | the key helper | `hive/sidecar.rs:182`: `cmd.exe /d /s /c "<helper>"`, by its full path, passed raw | — |
 | adopting | `hive/gates.rs:79`: `hive_adopt` reads off on Windows, so the device never advertises `hive-adopt` | the owner's word on Unix, off on Windows. Since FR-97 P4c, the owner's word on Windows too, through a named pipe (`docs/hive.md` §8, *On Windows*) |
@@ -2831,7 +2831,7 @@ sequenceDiagram
   - any system trust store;
   - a placeholder in a URL.
 
-**The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:1659`):
+**The toolbelt grows** beyond `approve` (`agents/roomlerd/src/hive/toolbelt.rs:1863`):
 - the vault tools: `vault_list`, `vault_describe`, `vault_request`, `vault_exec`, `vault_render`;
 - the network tools: `net_forward`, `net_socks`;
 - `ssh_run`;
@@ -3289,7 +3289,7 @@ sequenceDiagram
 | what it may read | decision 48: what the session's starter may, now. The starter is the record's `owner_id` (`crates/modules/hive/src/model.rs:115`). Their `KNOWHOW_VIEW` or `KNOWHOW_EDIT` in the organization is read at every question, as a person's route reads it (`crates/modules/knowhow/src/routes.rs:100`; `denied`). A starter whose role loses the bit stops their sessions' reads at the next question; one who leaves the organization ends their sessions (hive's `member_removed`) |
 | the reads | `knowhow_search {q?, kind?, env?, limit?}`: the people's search (`crates/modules/knowhow/src/routes.rs:333`), at most 50 (20 by default). `knowhow_get {kind, key}`: the people's card (`:405`), by the name a chip and a session use, with at most 50 links, cut from the end with `truncated` until the card fits 64 KiB, so one answer stays within what a tool hands a model; the entity itself is never cut, its own bounds hold it. Every entity, fact and link comes with its status and source: a session sees `proposed` and `stale` for what they are |
 | how a device knows | decision 49: at each hello of a device advertising `knowhow-tools` (an `RpcCap`, matched whole), the pod's knowhow sends `rc:knowhow.served` when it serves the device's organization. The device forgets the word at every primary connection and keeps it from that frame on. A session's toolbelt offers the knowhow tools only when the device held it at the session's launch, as the vault's tools follow `takes_leases` (`agents/roomlerd/src/vault.rs:1350`). So where knowhow is switched off, as on prod today, no session is shown a tool no module would answer. Sent to a device that asks for it: an older one logs an `rc:` frame it cannot read as a warning (`agents/roomlerd/src/signaling.rs:2913`) |
-| the device | a small client on the primary's connection, as the vault's lease client is (`agents/roomlerd/src/vault.rs:601`): a `req_id` a question, each answer matched to its question, 15 s each (`:131`). Compiled wherever agent sessions are (`cfg(hive_host)`: Linux, macOS and Windows), apart from the scanner. The toolbelt names the tools `mcp__roomler__knowhow_*`, lists them beside the vault's (`agents/roomlerd/src/hive/toolbelt.rs:1660`), and calls them on a branch of their own: the vault's chain ends in `vault_describe` for any name it does not know (`:1476`). The session's settings allow all three (`agents/roomlerd/src/hive/supervisor.rs:4948`), since decision 39 asks no person a call |
+| the device | a small client on the primary's connection, as the vault's lease client is (`agents/roomlerd/src/vault.rs:601`): a `req_id` a question, each answer matched to its question, 15 s each (`:131`). Compiled wherever agent sessions are (`cfg(hive_host)`: Linux, macOS and Windows), apart from the scanner. The toolbelt names the tools `mcp__roomler__knowhow_*`, lists them beside the vault's (`agents/roomlerd/src/hive/toolbelt.rs:1864`), and calls them on a branch of their own: the vault's chain ends in `vault_describe` for any name it does not know (`:1680`). The session's settings allow all three (`agents/roomlerd/src/hive/supervisor.rs:4948`), since decision 39 asks no person a call |
 | a proposal (P4-4-2) | decision 50: a new entity, a fact at a path no fact holds, or a link between two live entities, each end named by its kind and key. Written with status `proposed` and source `session` (`crates/modules/knowhow/src/model.rs:67`, `:82`), the session named on the row, on each fact and on its history row, as a scan names its device. Its `why`, up to 500 characters, rides the history row. A proposal never changes what is there: no fact replaced, nothing archived. It is checked as a person's write is (kinds, keys, attributes, the map's 10,000 entities and 50,000 links), and refused whole when any of its text holds a credential's shape (`crates/remote_control/src/knowhow.rs:337`; `refused`). P4-4-2a's further words: what it names is there already (`exists`), it reaches into a device's part (`reserved`, the warning below; a link a scan makes is one too), the map or the entity has no room (`full`) |
 | the ceiling (P4-4-2) | decision 51: 50 proposals a session, over its whole life and every fence, counted from the history (`ceiling`) |
 | a person's word (P4-4-3) | decision 52: a person with `KNOWHOW_EDIT` confirms a proposed entity, link or fact. It turns `active`, with who confirmed it and when beside the session that proposed it (`confirmed_by`, `confirmed_at`), in the history as `confirm`. Rejecting is what the routes already do: archive a proposed entity or link, remove a proposed fact. P4-4-3 stores the pair as one `confirmed: {by, at}` on the row or the fact, and confirms an entity's facts each on its own |
@@ -3833,7 +3833,7 @@ What runs where today, and where P8 puts it:
 | # | Part | Plan |
 |---|---|---|
 | 1 | **Same binary, separate processes** | the heavy and risky parts run as supervised children of `roomlerd`: `roomlerd hive-worker`, one per session or per device (decision 63). The pattern is the encoder probe's: it runs behind a process boundary, so "the child died" costs that child's work and never the daemon (`agents/roomlerd/src/encode/caps.rs:115`). Sessions already run that way, with Claude Code, the checkpointer and the materializer as separate processes as the session's account. A worker runs as the daemon's own identity, so there is no new account, install or updater, and it may shed privileges it does not use where the OS allows. It is restarted with backoff. A crash loop ends that session's run with a reason, and a hang is caught by a heartbeat. Resource limits come from rlimits on Unix, a cgroup's `memory.max` where the service delegates one, and a Job object on Windows, whose handle inheritance stays as clean as #2836 left it. The daemon's own control path never waits on a worker |
-| 2 | **A narrow boundary in code** | hive already reaches the daemon through traits: `VaultTools` (`agents/roomlerd/src/hive/toolbelt.rs:272`), `KnowhowTools` (`agents/roomlerd/src/hive/knowhow_tools.rs:478`), and the tunnel hub for its session flows (`agents/roomlerd/src/tunnel/client_mgr.rs:462`). Its daemon-free half is in `crates/hive-node` (`crates/hive-node/src/lib.rs`). Finishing the split means every call hive makes into the daemon goes through a trait: `SessionEgress` for the tunnel hub's session flows, P4-6's flow stream among them, and `ControlLink` for the `rc:hive.*`, `rc:vault.*` and `rc:knowhow.*` frames. The session-facing machinery then moves behind them into `crates/hive-node`, or a sibling crate. Those traits are the worker's channel: a worker needs only their calls answered across it, so part 1 is cheap once part 2 is done, and a later separation would be too |
+| 2 | **A narrow boundary in code** | hive already reaches the daemon through traits: `VaultTools` (`agents/roomlerd/src/hive/toolbelt.rs:401`), `KnowhowTools` (`agents/roomlerd/src/hive/knowhow_tools.rs:478`), and the tunnel hub for its session flows (`agents/roomlerd/src/tunnel/client_mgr.rs:462`). Its daemon-free half is in `crates/hive-node` (`crates/hive-node/src/lib.rs`). Finishing the split means every call hive makes into the daemon goes through a trait: `SessionEgress` for the tunnel hub's session flows, P4-6's flow stream among them, and `ControlLink` for the `rc:hive.*`, `rc:vault.*` and `rc:knowhow.*` frames. The session-facing machinery then moves behind them into `crates/hive-node`, or a sibling crate. Those traits are the worker's channel: a worker needs only their calls answered across it, so part 1 is cheap once part 2 is done, and a later separation would be too |
 | 3 | **A hive-free build and package** | the `hive` cargo feature already compiles hive out: it is not in `full`, release builds name it explicitly (`.github/workflows/release-agent.yml:552`, `:1180`, `:1667`, `:2746`), and a build without it advertises no `hive` verb, so no server sends it a session (`agents/roomlerd/src/lib.rs:76`). `vault` implies `hive` (`agents/roomlerd/Cargo.toml`). A package per OS from such a build serves a customer who wants the runtime truly absent, not merely switched off (decision 65) |
 
 - ⚠️ **A worker holds what the daemon gives it, and no more.** The device's vault key stays in the
@@ -3894,7 +3894,7 @@ and the harness went on.
 *What follows from it:*
 
 1. **The relay outlives the worker.** `roomlerd hive-mcp`
-   ([`relay`](../../agents/roomlerd/src/hive/toolbelt.rs#L1960)) is started by Claude Code once
+   ([`relay`](../../agents/roomlerd/src/hive/toolbelt.rs#L2171)) is started by Claude Code once
    a run, and today it is bytes only and ends with its socket. Under P8 it holds the session's stdio
    for the whole run:
    - it keeps the run's own `initialize` and `notifications/initialized`;
@@ -4428,6 +4428,108 @@ P4-6-1b-2's flow admitting the worker are all built; P8-2c is next.
 Nothing that runs a worker is released yet: `hive_worker` is off by default, and no release build
 has the vault.
 
+**P8-2c-1, as built** ([`relay`](../../agents/roomlerd/src/hive/toolbelt.rs#L2171), both OSes —
+the relay is daemon-independent stdio handling, not a per-OS hand-over). P8-0's point 1: the relay
+(`roomlerd hive-mcp`, what Claude Code starts once a session and never again) must never let
+Claude Code see its MCP server exit for a worker's sake. Before this step it was bytes only
+(`tokio::io::copy` both ways) and ended the instant either side did — the exact failure point 1
+exists to remove. This step builds the relay's OWN resilience; it does not yet move the toolbelt
+or the sidecar into a worker (P8-2c's remaining scope, below) — today there is nothing on the
+other end to restart, so this is provable only by killing and replacing the toolbelt connection
+itself, which the tests below do directly.
+
+| Piece | As built |
+|---|---|
+| the handshake | `Handshake` keeps the run's first `initialize` and first `notifications/initialized`, verbatim bytes, so a fresh worker is replayed byte for byte |
+| a drop | detected on either side (a write to the toolbelt fails, or a read from it hits EOF/error); every request with no answer yet (`inflight`) is answered at once with a JSON-RPC error (code `-32000`, "the session's tools restarted: call again") — never left hanging |
+| reconnecting | `reconnect` redials with backoff (250 ms) and never gives up — the harness must never see this process exit. A line that arrives while it is down is queued; it gets at most 10 s (`RECONNECT_GIVE_UP`) before it, too, is failed the same way. Several lines in one window share the 10 s rather than each getting its own: Claude Code sends one call at a time and waits for its answer (measured, [`APPROVAL_TIMEOUT`]'s own note), so this only matters for the rare notification that arrives mid-reconnect |
+| the replay | the moment a dial succeeds, `replay` sends the stashed `initialize` and reads back (and discards) its answer — Claude Code already has its first run's reply and expects no second one — then sends `notifications/initialized`. Either is skipped where the drop happened before the harness ever sent it |
+| the first dial | unchanged and still fatal: nothing has run yet for anything to reconnect to, so a relay that cannot reach the toolbelt at all still exits with an error, exactly as before P8 |
+
+Tests (`toolbelt/tests.rs`, both against a hand-rolled fake worker — one accepted connection, read
+and written as raw lines — so the assertions are about the relay alone, not the real toolbelt's
+own dispatch, which its own tests already cover):
+- `a_dropped_worker_is_recovered_without_the_harness_seeing_it`: a call left waiting when the
+  worker dies is failed at once; a fresh worker at the same address receives the replayed
+  `initialize` first and `notifications/initialized` second, in that order, before anything new;
+  the replayed `initialize`'s own (deliberately distinctive) answer never reaches the harness; a
+  call after reconnecting is served normally and the relay still ends when the harness does.
+- `a_request_that_outwaits_the_reconnect_window_is_failed_too` (`start_paused = true`, so the
+  window's 10 virtual seconds cost nothing real): a line arriving while the worker never comes
+  back is not failed early, and is failed once the window closes.
+
+Both platforms' CI clippy line clean (`--features overlay-l3,ssh-server,hive,vault --tests -D
+warnings`); `cargo fmt --all -- --check` clean on both. Windows `hive::` 268 passed, 2 ignored (0
+failed), full lib suite 2396 passed (0 failed) — the movement over P8-2b-4's own count beyond
+this step's own +2 new tests is master's, not this one's. Linux/WSL `hive::` 609 passed, 1 ignored
+(0 failed) — the exact +2 over P8-2b-1/P8-2b-3/P8-2b-4's own recorded 607, confirming nothing
+platform-specific slipped in; this step touches no `#[cfg(unix)]`/`#[cfg(windows)]` production
+code at all, only the two test-only fake-worker halves. `scripts/anchor-range-audit.sh` 0 new
+faults.
+
+Nothing that runs a worker is released yet: `hive_worker` is off by default, and no release build
+has the vault. **Still open in P8-2c** (after this step, see below): the toolbelt's socket/pipe
+and the sidecar's port are not yet among the listeners a worker is handed (P8-0's point 2) —
+today's worker runs only the vault/egress proxies (P8-2a/P8-2b); the toolbelt and the sidecar
+still run in the daemon. This step makes the relay safe to restart underneath; moving what it
+talks to is the rest of P8-2c.
+
+**P8-2c-2, as built** ([`toolbelt::handed`](../../agents/roomlerd/src/hive/toolbelt/handed.rs#L55),
+Unix only, like P8-2a's own first cut). The toolbelt's socket joins the listeners a worker is
+handed (P8-0's point 2) — the second of the two point 2 names as P8-2c's own job, the sidecar's
+port still open. The daemon keeps the socket it bound (`toolbelt::open`); the worker runs the real
+MCP dispatch — [`serve`](../../agents/roomlerd/src/hive/toolbelt.rs#L973) and
+[`connection`](../../agents/roomlerd/src/hive/toolbelt.rs#L1789), UNCHANGED — against a copy of it
+(`SCM_RIGHTS`), exactly as P8-2a's credential endpoints already do.
+
+⚠️ **Only the toolbelt's SOCKET moved — not what it offers.** The worker's
+[`Ctx`](../../agents/roomlerd/src/hive/toolbelt.rs#L514) is built with `vault`, `knowhow`, `exec`,
+`net` and `ssh` all `None`
+([`Ctx::worker_hosted`](../../agents/roomlerd/src/hive/toolbelt.rs#L544)): none of those traits
+cross the worker's channel yet, so a worker-hosted session offers none of their tools (`vault_*`,
+`net_socks`/`net_forward`, `ssh_run`, the knowhow reach) — each needs its own remote
+implementation of the seam P8-1a already built, and that is its own follow-up, not this step's.
+**`approve` is the one exception, and it is fully wired**, because it is the tool every other tool
+call waits behind (`docs/remote-control.md`'s own "nothing runs unapproved" is this module's too)
+— see the next row.
+
+| Piece | As built |
+|---|---|
+| the listener | [`handed::prepare`](../../agents/roomlerd/src/hive/toolbelt/handed.rs#L92), called from `toolbelt::open` where a worker serves this run — synchronous, since `open` is (and its own callers up to `spawn`, `launch`): it records the toolbelt as kept and returns a `Pending` that already forwards correctly before the actual hand-over (which must wait on a starting worker) has even run, spawned as [`hand_over`](../../agents/roomlerd/src/hive/toolbelt/handed.rs#L123) |
+| a new worker | [`rehand`](../../agents/roomlerd/src/hive/toolbelt/handed.rs#L159) hands the kept listener again, the same shape as `vault_connect`'s and the egress proxy's own — called from the same one spot in `worker.rs` that already calls theirs |
+| the approval seam | `approve` runs in the worker exactly as it does in the daemon (`run_approval`, UNCHANGED) against the worker's own, real, local [`Pending`](../../agents/roomlerd/src/hive/toolbelt.rs#L216) — the long wait (up to 25 min) never crosses the channel, only its OPENING (`Call::ToolbeltOpen`, a fast bounded ack so the daemon can record it and tell viewers) and its CLOSING (`Call::ToolbeltClosed`, the worker's own word, however it ended) |
+| a driver's answer, or a withdrawal | the daemon's own `Pending` is never the real wait here — it holds [`Slot::Remote`](../../agents/roomlerd/src/hive/toolbelt.rs#L194) markers instead of oneshots, and forwards (`Call::ToolbeltAnswer` / `Call::ToolbeltWithdraw` / `Call::ToolbeltWithdrawAll`) to whatever worker `worker::link_of` finds **looked up fresh at every forward, never a link cached from `open`-time** — a restart between opening and answering still reaches the new worker |
+| no worker up when a forward fires | dropped (debug-logged), the same loss already documented below for a worker that dies mid-approval — `Pending`'s own forward is fire-and-forget by construction (the sync `answer`/`withdraw`/`withdraw_all` callers never await it) |
+
+⚠️ **Known gap, left open rather than silently patched over**: an approval open when its worker
+dies has no `Call::ToolbeltClosed` to close it — the task that would send it died with the worker.
+The daemon's `Pending` is left holding a `Slot::Remote` that answers and expiries can no longer
+reach, until the session itself ends (`withdraw_all`). Not reachable today: `hive_worker` stays off
+by default and no release ships the vault.
+
+Tests: 12 in [`toolbelt::handed::tests`](../../agents/roomlerd/src/hive/toolbelt/handed/tests.rs) —
+both sides' dispatch (`answered`/`withdrawn`/`withdrawn_all`/`close_handed`, `opened`/`closed`),
+each against a `Serving`/`Kept` built directly (`claim_for_test`/`keep_for_test`), no real listener
+or worker process, since the real socket-crossing is already proven by P8-2a's own real-worker
+tests reusing the identical SCM_RIGHTS mechanism; 7 in `toolbelt::tests::remote_pending` — `Pending`'s
+own `Slot` bookkeeping (`note_remote_open`'s `MAX_PENDING` bound, `ids()`, a double-answer's refusal)
+with no worker at all. Both platforms' CI clippy line clean; `cargo fmt --all -- --check` clean.
+Windows unaffected (the whole module is Unix-only; `Ctx::worker_hosted`, `Pending::remote` and
+`Slot::Remote` are themselves gated `cfg(all(unix, worker_calls))`, not bare `cfg(worker_calls)` —
+caught by compiling on Windows first, where `worker_calls` is the `vault` feature alone and nothing
+Unix-specific should ever reach it). Linux/WSL `hive::toolbelt` 89 passed (0 failed) — the 19 new
+tests alongside the 70 this step found already there; `scripts/anchor-range-audit.sh` 0 new faults.
+
+Nothing that runs a worker is released yet: `hive_worker` is off by default, and no release build
+has the vault. **Still open in P8-2c**: the sidecar's port (P8-0's point 2's other name) is not yet
+handed to a worker — it is also a bigger lift than this step's: today's sidecar is ONE shared,
+device-wide listener multiplexing every session on the device by path (`/s/<sid>/...`), not a
+per-session resource like the toolbelt or vault_connect's endpoints, so moving it needs a design
+decision (a per-session port? a shared worker, which P8-2d's device-wide parts already anticipate?)
+before it needs code. Flagging this now rather than guessing at it in code. The other four of the
+five point-2 traits (`vault`, `knowhow`, `exec`, `net`, `ssh`) that `Ctx` carries are also still
+`None` in a worker — each needs its own remote implementation of P8-1a's seam.
+
 | Step | Builds | Kill switch | AC |
 |---|---|---|---|
 | P8-0 | the boundary's design, after decisions 63–65: the channel's protocol, what crosses it, supervision and limits per OS, and a probe of the harness across a worker's restart | docs only | — |
@@ -4697,7 +4799,9 @@ has the vault.
 | P8-2b-1 | the worker on Windows (§3i "P8-2b-1, as built"), its process and its channel: a pipe of its own, its DACL the daemon's account alone, its client end the one handle the worker inherits (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, beside `NUL`), found by `ROOMLERD_HIVE_WORKER_CHANNEL`; started suspended into a job of its own (`KILL_ON_JOB_CLOSE`, 512 MiB a process) as the daemon's identity, then resumed; the same supervisor, handshake, heartbeat, restarts and log as on Unix; no endpoint served there yet (P8-2b-3). 3 new tests on Windows (a worker's pipe has its two ends alone, one instance, a frame either way; the daemon keeps a worker up over its pipe; a worker starts into a job of its own, in it before it runs, the job ending what is in it, 512 MiB a process, and ended at once at its end) and the real `roomlerd.exe` started as the daemon starts it (its pipe found, `ready` with its own pid at this build's version, each beat answered, its end at `bye`; `#[ignore]`d in CI, which builds no binary for a lib test); the Unix suite unchanged (607); 6 negative controls on Windows, each caught at its own assertion | device `hive_worker = false` (default) | **merged** #2984 `aee65c269` |
 | P8-2b-2 | a Windows worker's crash keeps nothing of its memory (§3i "P8-2b-2, as built"): `SEM_NOGPFAULTERRORBOX` set in `worker_main` before the channel (`no_crash_dump`), so WER writes no dump, no Application Error event and no upload for the worker, on every fault path and thread; a worker that cannot set it does not run (exit 3). Measured as SYSTEM with a full `LocalDumps` (§8): `WerSetFlags(NOHEAP)`, a top-level filter and the job's `DIE_ON_UNHANDLED_EXCEPTION` each leak on some path (a fail-fast — Rust's `abort`, so every OOM at the bound — skips the filter and the flag); only the own-process mode held on every one. With it, nothing on the box records a worker's crash, so the daemon reads the exit code and names the fault (`InJob::ended`), ending the job with a code that never reads as one. 1 new unit test on Windows (the guard arms the bit, keeps the others; 2 negative controls, each caught at its own assertion) and the real worker's `ready` proving it armed the mode before serving; the config matrix (the probe as SYSTEM under machine-wide `LocalDumps` and `AeDebug`) green on a throwaway Windows host (§8). Decision 67 (the pagefile) posed. The daemon's own dumps are #2977 | device `hive_worker = false` (default) | **merged** #3008 `652002500` |
 | P8-2b-3 | credential endpoints cross to a Windows worker too (§3i "P8-2b-3, as built"): a listener rides inside `Call::Serve`'s own frame as its `WSAPROTOCOL_INFOW` (no fd-4 channel there), duplicated fresh at every hand-over and `rehand`; the daemon's own kept copy likewise duplicated, independent of the original place; `At::Loopback`'s `peer` now the per-OS `Peer` (a SID on Windows), `At` no longer `Copy`; `Egress`/`Decide`/`Bound`/`Valued`/`Leaf` stay `#[cfg(unix)]` as wire variants (egress's own step is next). 2 new unit tests (protocol info round-trips across a real pid, a `rehand`-shaped second duplicate of the one source; the wrong length refused) and a real end-to-end one, a real `roomlerd.exe` handed a real listener's protocol info over the wire, answering `Done`, with a connection from this process accepted on the same address once this test's own copy is dropped; both platforms' CI clippy line clean; Windows `hive::` 265 passed (1 ignored), full suite 2347 passed; Linux/WSL `hive::` unchanged at 607 passed (1 ignored), same as P8-2b-1's count. ⚠️ Not yet built: P4-6-1b-2's through-another-device flow still admits the daemon's own pid alone on Windows (P8-0's point 6) | device `hive_worker = false` (default) | **merged** #3057 `51123d591` |
-| P8-2b-4 | P8-2b's last piece: P4-6-1b-2's through-another-device flow now admits the session's own worker too (§3i "P8-2b-4, as built"), closing the gap P8-2b-3 flagged. `Admits::Daemon` carries `(ObjectId, u64)` — the run — now, threaded through `net_tools::admit_of` and `daemon_flow`'s two constructions; `vault_connect::daemon_admit`'s Windows body reads `worker::pid_of(session, fence)` fresh on every connection, never cached at the hook's own build; the comparison itself, `held_by_daemon_or_worker`, is `pub(crate)` so a test drives it with fabricated pids, no socket needed. Unix unchanged (P8-0's point 6): a worker there already runs as the daemon's own account. Found on the way: a different test's literal `Admits::Daemon` debug-string assertions (`hive::toolbelt::tests`) now build their expectation from the real value instead of a stale constant. 1 new unit test (the comparison's four branches) and the existing admit test updated for the new signature; both platforms' CI clippy line clean; Windows `hive::` 266 passed (2 ignored), full suite 2378 passed; Linux/WSL `hive::` unchanged at 607 passed (1 ignored), the exact count P8-2b-1 and P8-2b-3 both recorded. P8-2b closes here | device `hive_worker = false` (default) | **in review** |
+| P8-2b-4 | P8-2b's last piece: P4-6-1b-2's through-another-device flow now admits the session's own worker too (§3i "P8-2b-4, as built"), closing the gap P8-2b-3 flagged. `Admits::Daemon` carries `(ObjectId, u64)` — the run — now, threaded through `net_tools::admit_of` and `daemon_flow`'s two constructions; `vault_connect::daemon_admit`'s Windows body reads `worker::pid_of(session, fence)` fresh on every connection, never cached at the hook's own build; the comparison itself, `held_by_daemon_or_worker`, is `pub(crate)` so a test drives it with fabricated pids, no socket needed. Unix unchanged (P8-0's point 6): a worker there already runs as the daemon's own account. Found on the way: a different test's literal `Admits::Daemon` debug-string assertions (`hive::toolbelt::tests`) now build their expectation from the real value instead of a stale constant. 1 new unit test (the comparison's four branches) and the existing admit test updated for the new signature; both platforms' CI clippy line clean; Windows `hive::` 266 passed (2 ignored), full suite 2378 passed; Linux/WSL `hive::` unchanged at 607 passed (1 ignored), the exact count P8-2b-1 and P8-2b-3 both recorded. P8-2b closes here | device `hive_worker = false` (default) | **merged** #3070 `76db51f09` |
+| P8-2c-1 | the relay's own resilience (§3i "P8-2c-1, as built"), both OSes: `roomlerd hive-mcp` never exits for a worker's sake (P8-0's point 1) — a dropped toolbelt connection fails whatever was waiting at once, reconnects with backoff that never gives up, and replays the run's `initialize`/`notifications/initialized` onto the worker that replaces it without forwarding the replay's own answer; a line that arrives mid-reconnect gets at most 10 s before it is failed the same way; the first dial stays fatal, exactly as before. Does not yet move the toolbelt or the sidecar into a worker — P8-2c's remaining scope. 2 new tests against a hand-rolled fake worker (a dropped call failed and the next worker recovered with the handshake replayed and swallowed; a line that outwaits the 10 s window failed too, `start_paused` so it costs nothing real); both platforms' CI clippy line clean; Windows `hive::` 268 passed (2 ignored), full suite 2396 passed; Linux/WSL `hive::` 609 passed (1 ignored) — the exact +2 this step's own tests add over 607 | device `hive_worker = false` (default) | **merged** #3106 `c16ddfcf` |
+| P8-2c-2 | the toolbelt's socket joins the listeners a worker is handed (§3i "P8-2c-2, as built"), Unix only: the daemon keeps the bound socket, a copy crosses to the worker (`SCM_RIGHTS`), which runs the real MCP dispatch (`serve`/`connection`, UNCHANGED) against it; `approve` — the one tool every other call waits behind — is fully wired end to end (its long wait never crosses the channel, only its opening and its closing); every other tool (`vault_*`, `net_*`, `ssh_run`, knowhow) stays `None` in a worker-hosted `Ctx`, each needing its own remote implementation of P8-1a's seam, not this step's. The sidecar's port (P8-0's point 2's other name) is NOT moved — it is one shared, device-wide listener today, not per-session like the toolbelt, so moving it needs a design decision first. 19 new tests (12 of the dispatch on both sides against a `Serving`/`Kept` built directly, no real listener or worker process; 7 of `Pending`'s own `Slot` bookkeeping with no worker at all); both platforms' CI clippy line clean; `cargo fmt --all -- --check` clean; Linux/WSL `hive::toolbelt` 89 passed (0 failed) | device `hive_worker = false` (default) | **in review** |
 
 Child sessions, automatic failover, browser terminal attach, encryption at rest on replicas,
 customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follow-up FRs (design
