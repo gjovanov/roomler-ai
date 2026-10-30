@@ -1,6 +1,8 @@
 # FR-131: Hub — one coordinator session runs the backlog through parallel worker sessions (`/hub` skill + hub view)
 
-**Status: P1, P2, P3 and P4 done 2026-10-30. Every acceptance criterion is met.**
+**Status: P1, P2, P3 and P4 done 2026-10-30. Every acceptance criterion is met, so FR-131 is ready to
+close: once the P3 close-out PR merges, the hub ticks AC10 in #3127's body, posts the Result comment and
+closes the issue, under the operator's rule of 2026-10-30 19:50Z.**
 P1 is the skill, the worker protocol and the helper, with the mechanics measured live. P2 is the hub view mod,
 `hub-view` 0.2.0. P3 is the first real backlog run, hub `bl1`. P4 is the engineering doc,
 [`docs/agent-hub.md`](../agent-hub.md), which also holds the operating lessons from P3.
@@ -150,9 +152,10 @@ All three were resolved on 2026-10-30.
 
 - Agent teams (they can't nest and don't survive `/resume`) and in-process subagents as workers (they
   can't be entered and die with their parent's `/clear`).
-- The hub closing an FR, or deciding scope, priority, money or accounts: those stay with the operator.
-  Merging and deploying were out of scope too, until the operator's standing rule of 2026-10-30 16:28Z
-  during P3: the hub merges and deploys a PR as soon as it is ready
+- The hub deciding scope, priority, money or accounts: those stay with the operator. Merging, deploying
+  and closing were out of scope too, until two standing rules the operator set during P3 on 2026-10-30.
+  From 16:28Z the hub merges and deploys a PR as soon as it is ready. From 19:50Z it also closes an FR
+  once every criterion is `[x]` with its evidence and the docs are merged
   ([`docs/agent-hub.md` §11](../agent-hub.md#11-operating-lessons-from-the-first-real-run)).
 - Cloud and remote-machine workers.
 

@@ -6,8 +6,8 @@ background Claude Code session (`claude --bg`) in a git worktree of its own. The
 every worker on each tick, answers or routes its questions, rotates its context before it
 degrades, and checks each claim it makes on GitHub, CI or the fleet before that claim counts.
 The operator watches one board and can enter any worker and leave it again. Since
-2026-10-30 the hub merges and deploys a PR as soon as it is ready (§11), and the operator
-keeps every FR close and every decision that is theirs.
+2026-10-30 the hub merges and deploys a PR as soon as it is ready, and closes an FR once every
+criterion is ticked with its evidence (§11). The operator keeps every decision that is theirs.
 
 This page is the engineering reference. The decisions and their evidence are in the spec,
 [FR-131](fr/FR-131-hub-coordinator.md) (#3127). The FR rules that every FR worker follows are in
@@ -224,8 +224,9 @@ The verbs are defined once, in `worker.md §Messages`:
 | `PARKED W-n:` · `DONE W-n:` | the agent part is done, with the claims to verify and what the operator owes |
 
 **Who decides.** The hub answers what it can from the spec, the rails, master and GitHub. A
-merge, a close, a release, a change of scope, risk to a live host, an operator-only AC, and a
-design choice the spec leaves open go to the operator. The hub escalates with a first line that
+change of scope or priority, money or accounts, risk to a live host, an operator-only AC, and a
+design choice the spec leaves open go to the operator. Merging, deploying, testing, ticking and
+closing complete work are the hub's since 2026-10-30 (§10). The hub escalates with a first line that
 stands alone and the exact commands to answer (in the hub's terminal, from the view, or by entering
 the worker with `claude attach <short>`). A message from the hub view reads
 `(the operator, from the hub view)` on its second line, and the worker treats it as the operator's
@@ -421,7 +422,7 @@ until it breaks a run.
 
 | Rail | Why |
 |---|---|
-| **The hub merges and deploys a READY PR; workers never merge.** The operator closes FRs and keeps scope, priority, money and accounts, risk to a host they use, operator-only ACs, and the design choices a spec leaves open. | A ready PR that waits goes stale as master moves (§11, lesson 2). Ready means verified on the surface, because a worker's report is a claim until someone has looked. The rest are decisions about the product. |
+| **The hub merges and deploys a READY PR, and closes an FR once it is complete; workers never merge or close.** The operator keeps scope, priority, money and accounts, risk to a host they use, operator-only ACs, and the design choices a spec leaves open. | A ready PR that waits goes stale as master moves (§11, lesson 2). Ready means verified on the surface, because a worker's report is a claim until someone has looked. Complete means every criterion `[x]` with its evidence and the docs merged; a `[~]`, an open AC or an operator-only AC keeps the issue open. The rest are decisions about the product. |
 | **`Refs #n` only**, never `close`, `fix` or `resolve #n`, in a PR body or a commit | GitHub closes the issue the moment the PR merges. On 2026-09-25 "close #819" in a worker's PR body closed FR-22 with two criteria still open ([`.claude/agents/fr-worker.md:57-61`](../.claude/agents/fr-worker.md)). |
 | **The only commit the hub pushes to master is an FR claim**: the spec and its ledger row in one commit, made back to back with the issue, and only while no release-bump PR is open | Only master arbitrates a number ([`fr/README.md`](fr/README.md)). Only the hub claims, one claim at a time, so its workers never race each other for N. |
 | **Public text names no hostnames, local paths, session ids or account names** | The repo is public. A name edited out later stays in the edit history. The hub issue lives in the private docs repo for this reason. |
@@ -441,7 +442,7 @@ four are in the generic skill, and two are specific to this repo and are kept he
 | # | Lesson | What bl1 measured | The rule | Where it lives |
 |---|---|---|---|---|
 | 1 | **A message respawns a stopped background worker.** So does the operator typing into it, and likely a viewer opening its session. | A peer session's release broadcasts went to the workers' session names. They revived two parked workers and FR-55 P4's rotated g3, which then wrote into the live g4's handoff and status files: two generations on one worktree. The operator's `go`, typed into the retired g3, revived it again. A parked worker also came back with no turn in its transcript, likely when a viewer opened it. | Peers send a hub's notices to the hub, never to a worker. On every tick, after `hub.mjs status`, the hub runs `claude agents --json --all`. A generation that should be stopped but shows a `status` first has its transcript tail read (what woke it, and whether it touched the worktree), then gets `claude stop <short>`. `hub.mjs stop` reaches only the latest generation, so an older one is stopped by its short id. | `SKILL.md §Tick` (Measure), `§Messages` |
-| 2 | **Merge and deploy as soon as a PR is ready.** This is the operator's standing rule, from 2026-10-30 16:28Z. | Verified PRs that waited for the operator's merge kept conflicting as master moved. FR-55 P4's PR ([#3148](https://github.com/gjovanov/roomler-ai/pull/3148)) needed five merge rounds in one afternoon, and each round cost its worker a rebuild. | §11.1. Ready means verified by the hub on the surface. FR closes stay the operator's. | `SKILL.md §Rails` |
+| 2 | **Merge and deploy as soon as a PR is ready.** This is the operator's standing rule, from 2026-10-30 16:28Z. | Verified PRs that waited for the operator's merge kept conflicting as master moved. FR-55 P4's PR ([#3148](https://github.com/gjovanov/roomler-ai/pull/3148)) needed five merge rounds in one afternoon, and each round cost its worker a rebuild. | §11.1. Ready means verified by the hub on the surface. From 19:50Z the same holds for a close: once an FR is complete, the hub ticks the issue body, posts the Result and closes it. | `SKILL.md §Rails` (Merge, Close when complete) |
 | 3 | **Anchor churn.** PRs that move a heavily anchored file conflict with each other, and with master, in many docs at once. | 24 docs anchor into `agents/roomlerd/src/app.rs`. After one merge to master, FR-16 L1's PR ([#3155](https://github.com/gjovanov/roomler-ai/pull/3155)) conflicted in 16 docs. FR-55 P4's conflicted in 4 to 11 docs a round. Every hunk differed only in anchor numbers. | One of the two methods in §11.2, each with its cross-check. Merging soon after green (lesson 2) keeps the rounds few. | here (repo-specific) |
 | 4 | **Disk.** Container target volumes grow fast. | One worker held about 72 GB: a 39 GB target volume, a 30 GB native target and a 3 GB image. The hub read C: falling 21 GB in 11 minutes. | Every brief tells the worker to run `df` before each build, build one feature set at a time, send `BLOCKED: disk` under 45 GB free, and tear down its containers, volumes and images at park. Under pressure, the hub may delete a parked or done worker's regenerable target cache, never a running one's. One such cache gave back 16 GB. The budget hold starts nothing under 40 GB free (§7). | `SKILL.md §Rails` |
 | 5 | **Missed cron fires can arrive back to back.** | While the hub was busy, the heartbeat's missed fires came in one after another, which reads like a doubled cron. | It is not a second cron: `CronList` shows one. Never add another. | `SKILL.md §Start` (Heartbeat) |
@@ -465,6 +466,10 @@ flowchart TB
     D -- "agent code" --> AR["the next agent release, agreed with its owner"]
     PR --> FV["field-verify from the fleet"]
     AR --> FV
+    NO --> C{"is the FR complete?<br/>every AC [x] with its evidence · docs merged"}
+    FV --> C
+    C -- "yes" --> CL["tick the issue body · post the Result · close"]
+    C -- "no: a [~], an open AC or an operator-only AC" --> OPEN["the issue stays open"]
 ```
 
 The gate and the merge run in **one** shell call, so a freeze stops the merge itself and does not
@@ -478,7 +483,9 @@ gh pr merge <n> -R gjovanov/roomler-ai --squash --match-head-commit <verified sh
 
 One merge at a time. The branch is kept (no `--delete-branch`). After each merge the hub posts the FR's
 `## Step log` row, brings the issue body's ticks in line with the merged spec, and fetches master, because
-every other ready PR may conflict now. Merging is the hub's alone, and a worker never merges.
+every other ready PR may conflict now. If that leaves the FR complete, the hub posts its
+`## Result — field-verified on <version>` and closes the issue in the same pass; it never ticks a box
+in order to close. Merging and closing are the hub's alone, and a worker does neither.
 
 ### 11.2 Anchor churn: two ways through a conflict
 

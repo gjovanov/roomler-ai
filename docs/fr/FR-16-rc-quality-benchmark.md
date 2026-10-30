@@ -2,6 +2,11 @@
 
 Status: **proposed** (2026-08-27); **amended 2026-10-13**, so that L0 (an in-process
 harness) and L4 (input-to-photon) come first ([§ Amendment](#amendment-2026-10-13--l0-and-l4-come-first)).
+L0 merged; L4's agent and viewer halves built and run end to end on a release build. **L1
+built 2026-10-30**: `roomlerd encoder-smoke --bench` prints a per-host encoder cost table
+whose verdict reads `fallback` when hardware was asked for and software answered
+([testing.md](../testing.md#the-l1-encoder-bench-fr-16)). Its fleet run through `roomler exec`
+waits for a release that carries it.
 Tracking issue: `FR-16` (#798). Sibling of FR-17 (#799, the architectural fix); the
 measurement half of the FR-1 program, and the instrument of the
 [StarDesk teardown program](../plans/stardesk-teardown-program.md).
@@ -202,14 +207,22 @@ competitors". Engineering may use the numbers; the public pages never print them
 | L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | **merged** #2097 (`67d3ca9e8`): `agents/roomlerd/tests/l4_latency.rs` + the marker and clock in `capture/synthetic_backend.rs` + the `peer::l0` seam; local and CI runs in the field log |
 | L4 | The probe, the worker sampler, the upload, `probe-target`, the nightly spec; baselines on a direct and a relay pair | `ROOMLERD_BENCH` unset; the build feature; the viewer knob `roomler-rc-bench` | **agent half built**: `synthetic_backend::probe` + the bottom-right marker, the input-handler hook in `peer.rs`, `bench` in `AgentCaps.video`, the `probe`/`probe50` cells. **Viewer half built**: the TS marker decoder, the worker sampler in all three decode workers, the `<video>` sampler, the jittered prober, the `rc.l4` upload, the server's parse lock. **`probe-target` built**: the window (`probe_target.rs`) and the viewer's `target` mode. **End to end on a release build: done** against `probe-target` on vmtest guests (the field log, 2026-10-13; FR-98 P5's cells used it on 2026-10-16, on the RTP track and the DataChannel). Owed: the nightly spec, which needs the agent-e2e pods in bench mode (`ROOMLERD_BENCH=1` in `scripts/e2e-k8s/overlay-template/statefulset-agent-e2e.yaml`, and an agent-e2e image from 0.4.133 or later, built by hand on the build host), and the baselines on real hosts |
 | T | The StarDesk comparison cell on the spare box (private results) | — | — |
-| L1–L3 | As designed above | — | — |
-| D | Docs | — | — |
+| L1 | `roomlerd encoder-smoke --bench`: each cell opened through the constructor a session calls, a synthetic motion profile encoded on one thread holding its clock, one row per cell with encode ms p50/p95, produced vs target bitrate, IDR and delta sizes and the encoder that opened; the `fallback` verdict | the flag: `--bench` is opt-in, and every `--bench-*` flag requires it, so the release lane's `encoder-smoke --encoder hardware` runs the plain smoke as before | **built** (2026-10-30): `agents/roomlerd/src/encode/bench.rs`, the painter moved to the always-compiled `capture/synthetic_scene.rs` with its motion profiles, the flags flattened into `EncoderSmoke` (`app.rs:451`) and dispatched by `smoke_mode` (`app.rs:1962`). The container run is in the field log. Owed: the fleet run through `roomler exec` once a release carries it (AC1) |
+| L2–L3 | As designed above | — | — |
+| D | Docs | — | L0 and L4: `docs/testing.md`, done. L1: `docs/testing.md` § The L1 encoder bench, done |
 
 ## Acceptance criteria
 
-- [ ] L1 runs on every fleet host through `roomler exec` and produces a per-host
+- [~] L1 runs on every fleet host through `roomler exec` and produces a per-host
       encoder cost table, including a host where an advertised HW encoder actually
       falls back (proving the check can fail).
+      **The code half is done** (#3155): `roomlerd encoder-smoke --bench`
+      (`agents/roomlerd/src/encode/bench.rs`), with the verdict read from the opened encoder and
+      pinned through a fake opener (`the_verdict_is_read_from_what_opened`,
+      `a_run_through_the_seam_prints_one_verdict_per_row`), and a release build's table from a
+      container in which `dc:vp9:444` read `fallback` (field log, 2026-10-30). **Owed:** the
+      fleet run through `roomler exec` once a release carries it, including a host whose hello
+      advertises a hardware encoder that the bench opens in software.
 - [ ] L2 produces an N×N pair matrix with carrier + RTT + goodput.
 - [ ] L3 reproduces a known-bad cell (MacBook → CORPLAP-1 H.265) and a known-good cell
       (a direct pair) with scores on opposite ends of the ladder — the harness must
@@ -228,9 +241,20 @@ competitors". Engineering may use the numbers; the public pages never print them
       display latency.
 - [ ] The StarDesk comparison cell is recorded in the private docs repo, with method and
       date, and never published (compare rule 3).
-- [ ] **Docs:** `docs/testing.md` gains the L0 harness and the L4 bench (a mermaid diagram
+- [x] **Docs:** `docs/testing.md` gains the L0 harness and the L4 bench (a mermaid diagram
       of the probe → marker → sample loop, how to run each, how to read `rc.l4` in
       `agent_logs`), linked from `docs/README.md`.
+      Evidence, read on master `4f2bccc53` (2026-10-30): § The L0 latency harness
+      (`docs/testing.md:271`, its mermaid `:278`, how to run it `:321`); § L4 in process: the
+      bench probe (`:349`, its sequence `:356`); § L4 in the real viewer (`:398`, the probe →
+      marker → sample sequence `:404`, how to run it `:417`, mining `rc.l4` in `agent_logs`
+      `:439`); § L4 on a release build: `roomlerd probe-target` (`:460`, its sequence `:469`,
+      how to run it `:488`); the index row `docs/README.md:173` links the L0 section.
+- [x] **Docs (L1):** `docs/testing.md` gains the L1 encoder bench: how to run it on a host and
+      through `roomler exec`, what each cell opens, the table's columns, the verdicts and what
+      `fallback` means, how it paces frames and holds its clock, with a mermaid diagram, linked
+      from `docs/README.md`. Evidence: § The L1 encoder bench (`docs/testing.md:505`, its
+      mermaid `:513`) and the index row `docs/README.md:173`.
 
 ## Out of scope
 
@@ -256,3 +280,4 @@ competitors". Engineering may use the numbers; the public pages never print them
 | 2026-10-13 | the same | **Negative control, red:** a window that reads its cells 10 px wide instead of 9 (one marked line in `cell_at`) failed `every_cell_centre_lands_in_its_own_cell` (cell 6's centre read back as 5) and `a_point_maps_to_its_cell_and_the_marker_area_to_none`. A drift between where the viewer aims and where the window reads is caught. Restored from the commit; the diff was that one line. |
 | 2026-10-13 | **Release build, field.** Agent **0.4.134** (MSI, SystemContext) on a throwaway vmtest Win11 guest (KVM on a fleet host, 1280×800), the **production viewer** (`hosted-20261013-b180d92`) in headless Chromium on a LAN neighbour | **L4 end to end on a release build, first field run, a smoke test rather than an AC cell.** `roomlerd probe-target --seconds 1500` ran in the signed-in session as a scheduled `/IT` task: `144x80 at (1136,720) on a 1280x800 primary monitor`. The viewer set `roomler-rc-bench=target` and was given `data-channel-vp9-444` (libvpx 4:4:4, software). ICE moved relay → direct 5 s in. **15 batches × 40 probes = 600, lost 0. p50 42–49 ms, p95 59–74 ms, max 62–230 ms**, with two batches above 200 ms. Every round trip is a real `mouse_move`: SendInput in the guest, its compositor, DXGI capture, VP9 software encode, the data channel, WebCodecs decode in the worker sampler. The viewer's display is not in it. The streamed corner showed the window's pad and marker in the viewer's screenshot. Not an AC cell: a VM, a software encoder, no real display. The direct and relay cells on real hosts are still owed. Same run: the harness's own `win11/installer/system` cell passed 17 of 18. The miss is `probe-error`, its FR-84 companion-UI probes (`page.click: Timeout 30000ms exceeded`), outside this FR |
 | 2026-10-16 | **Release build, field: L4 as FR-98 P5's instrument.** Agent **0.4.138** (MSI, service) on a throwaway vmtest Win11 guest, the production viewer in headless Chromium on a LAN neighbour, `roomlerd probe-target` in the signed-in session; the viewer forced onto the RTP track or left to its own DataChannel pick | **L4 told three paths apart on one guest.** The DataChannel (`data-channel-vp9-444`): batch p50s 44–52 ms, 0 of 480 lost, as on 10-13. The RTP track on OpenH264: 35–40 ms with FR-98's `playout-delay` on, 78–362 ms with it off. The RTP track on Auto: **~850 ms with a quarter of the probes unanswered in 2 s**, because Auto had picked Microsoft's software MFT, which no other instrument here could see (#2283). FR-98 §9 has the full rows |
+| 2026-10-30 | **L1, a release build of the branch** (#3155) with the Linux release lane's features (`release-agent.yml:552`), in an Ubuntu 24.04 container on the Windows dev box, no GPU, no config | **RED:** the released 0.4.188 `.deb` (sha256 checked) answers `encoder-smoke --bench` with `error: unexpected argument '--bench' found`, exit 2, and no `L1` line. Its plain smoke still passes (`openh264`, 4 keyframes, 13 238 bytes). **GREEN:** the quick profile printed six rows in 2.0 s, 18.5 KB with its log lines against exec's 256 KiB. `rtp:h264` is OpenH264 `sw-only` (p50 6.6 ms, p95 12.9 ms, 3383 kbps for a 5529 kbps target). `rtp:h265` and the three FFmpeg DataChannel cells read `none`, as no GPU means they should. **`dc:vp9:444` reads `fallback`**: the build carries FFmpeg's VP9 hardware path, the container has no device for it, and libvpx answered (p50 5.2 ms). The release lane's own line on this binary gave 0.4.188's result exactly. The thread's clock reads `refused:95`: this kernel has no util clamp. **Twice:** `rtp:h264` over static, drag and pan, back to back, repeated its sizes and rates to the byte. Its p50s were 3.7/4.7, 8.1/7.5 and 7.6/6.4 ms, and its p95s up to 60 % apart (27.8/17.2 ms on pan) on a busy host. A paced run read about the same as back to back on this x86 host. **Wrong turn, fixed:** the first GREEN read `rtp:h264` `idr_n=6` with an IDR p50 of 30 bytes. OpenH264 returns an IDR as two packets (the parameter sets, then the slice), and the bench counted packets. A frame is now one `encode()`'s output, and against the old count the seam test fails `6` against `3` |

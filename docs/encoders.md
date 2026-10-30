@@ -689,6 +689,77 @@ The session reports which form it opened and why, on the heartbeat as
   measurement: its conversion and upload are 1.2 ms of a 4.1 ms encode stage, on
   the one 1600×900 virtual desktop that runs it (FR-118 open decision 6).
 
+## Colour: one conversion, and the description that names it (FR-130)
+
+Every converter in the agent produces **BT.601 YUV at limited range**: the CPU converters
+(`agents/roomlerd/src/encode/color.rs`), the D3D11 VideoProcessor of the GPU input path (above), and
+VideoToolbox, whose input is marked with the BT.601 matrix (FR-118 P5). Until
+[FR-130](fr/FR-130-colours-decode-true.md) no encoder said so. Chrome decodes an HD picture that says
+nothing as BT.709, so the greys came out exact and every saturated colour shifted: magenta 191/0/191
+arrived as 205/30/197 (#3049).
+
+```mermaid
+flowchart LR
+    CAP["captured BGRA"] -->|"BT.601, limited range<br/>(every converter)"| YUV["YUV"]
+    YUV --> ENC["encoder"]
+    ENC -->|"lever 1 (P1): set S in the bitstream<br/>color_description, default on"| BS["SPS VUI · AV1 color_config<br/>· VP9 header · MF attributes"]
+    BS --> V["&lt;video&gt; (RTP)<br/>reads the bitstream"]
+    BS --> W["WebCodecs workers<br/>(the data channel)"]
+    P2["lever 2 (P2): configure({colorSpace: set S})<br/>roomler-rc-colorspace"] -.->|"overrides the bitstream"| W
+    V --> RGB["RGB as captured"]
+    W --> RGB
+```
+
+**The description** is FR-130's set S, defined once (`agents/roomlerd/src/encode/color_desc.rs:82`):
+- the SMPTE 170M matrix (BT.601's coefficients, H.273 code 6);
+- limited range;
+- the BT.709 primaries and sRGB transfer of the desktop the pixels came from.
+
+The matrix and the range are what every converter produces, and a compile-time assertion keeps them that
+way. The primaries and the transfer describe the content. In Chrome, sets A (SMPTE 170M for all three), B
+(BT.709 primaries and transfer) and S decode identically. S is the truthful one for a player that
+colour-manages by primaries and transfer (FR-130 §2.5).
+
+| Family | Where it is written | What the bitstream carries (read on neo16 in P1, and in the field in P3) |
+|---|---|---|
+| FFmpeg, every backend | the codec context's four fields in `build_encoder` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1912`), before the open, for every cell, rebuild, probe, recording and GPU form | NVENC, D3D12 and Vulkan: set S exactly (H.264, HEVC and AV1; NVENC 4:4:4 too). QSV (AV1, H.264) and VideoToolbox (HEVC, H.264): set S, as Chrome's decoder reads it in the field when it is told nothing. `hevc_amf`: S's values, with the matrix under code 5 (BT.470 BG, the same coefficients). `h264_amf`: matrix 2 (unspecified), AMD's runtime's choice. `vp9_qsv`, `vp9_vaapi`: nothing, because FFmpeg 9.0.1 cannot tag VP9 there. VAAPI: not yet read |
+| Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES` and `MF_MT_TRANSFER_FUNCTION` on both media types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:600`), and again on the renegotiated output type | Microsoft's H.264 and HEVC encoders ignore the attributes and write no description. NVIDIA's and AMD's MF encoders did not open on neo16, so they are unread |
+| openh264, live | the SPS VUI (`agents/roomlerd/src/encode/openh264_backend.rs:116`) | set S |
+| libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:435`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
+| openh264, recording | its own VUI and the MP4 `colr` box, unchanged since FR-85 | SMPTE 170M at limited range |
+
+A vendor runtime that refuses the description opens the encoder without it rather than failing the open.
+While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:1833`).
+
+**Which lever reaches which path:**
+
+| Viewer path | Decodes true through | Notes |
+|---|---|---|
+| Data channel, VP9 (4:2:0 and 4:4:4) | lever 2 only | Chrome's WebCodecs ignores VP9's in-band colour space (FR-130 §2.5) |
+| Data channel, H.264, HEVC and AV1 | lever 2, and lever 1 where the encoder writes it | either alone decodes true, and together they agree |
+| RTP `<video>` | lever 1 only | lever 2 cannot reach it. Microsoft's MF H.264 and `h264_amf` still decode as BT.709 here (FR-130 open decision 6: accepted for now) |
+| a recording | lever 1 (FFmpeg-encoded) or the recorder's own openh264 VUI | |
+
+Read in the field on agent 0.4.188 ([FR-130 §8](fr/FR-130-colours-decode-true.md#8-field-verification-log)):
+lever 1 alone decodes `<video>` true from live openh264, and VP9 on the data channel decodes true through lever 2
+only, with or without the description in its header. From NVENC, QSV and VideoToolbox, H.264, HEVC and AV1 decode
+true on the data channel from the encoder's own description alone (read on blit), and HEVC and AV1 also with both
+levers, on blit and FSR. H.264 on `<video>` comes from the RTP track's own
+cascade, Media Foundation and then openh264, never from FFmpeg. From openh264 it decodes true; from Microsoft's
+software MF it still shifts (open decision 6).
+
+**The switches.**
+- `color_description` turns lever 1 off on a device (*Configuration*, below). Since FR-130 P1b it can be
+  pushed through remote config ([remote-config.md](remote-config.md)). A push lands at the device's next
+  connect and applies at the restart after that.
+- `roomler-rc-colorspace=off` turns lever 2 off in one browser
+  ([remote-control.md §18.6.2](remote-control.md#1862-the-decoder-is-told-the-colour-space-fr-130-p2)).
+
+⚠️ A colour-managed capture is a different effect. On a wide-gamut panel the compositor hands the capture
+pixels that already differ from the page's CSS, and both input paths capture the same pixels. Compare a
+decoded picture with the pixels as captured (`roomlerd capture-smoke --dump`, a P6 PPM), not with the
+source's CSS values.
+
 ## Configuration
 
 | Key (config.toml / `roomler config set`) | Env | Default | What |
@@ -698,7 +769,7 @@ The session reports which form it opened and why, on the heartbeat as
 | `caps_cache` | `ROOMLERD_CAPS_CACHE` | on | the probe cache (read and write) |
 | `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them; on macOS the display stream's IOSurfaces go to a proven VideoToolbox cell ([above](#gpu-resident-frames-the-input-path-fr-118)). On a supervised Mac the root's value is handed to the GUI worker at spawn (`WORKER_ENV_FORWARD`, from FR-118 P5) |
 | `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing. Handed to a supervised Mac's GUI worker as `zero_copy` is |
-| `color_description` | `ROOMLERD_COLOR_DESCRIPTION` | on | every encoder writes the colour description its input was converted with (BT.601 matrix, BT.709 primaries, sRGB transfer, limited range: `encode::color_desc::DESCRIPTION`, [FR-130](fr/FR-130-colours-decode-true.md)), and the hello says `color-described`; `false` writes the undescribed stream of earlier agents. Read at every encoder open, so a restart applies it; the probe and recorder children, a hand-run `roomlerd record` and `encoder-smoke` follow it, and a supervised Mac's GUI worker gets the root's value (`WORKER_ENV_FORWARD`). Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`: a push of `off` or `on` sets it, and a blank one clears it back to on (FR-130 P1b, [remote-config.md](remote-config.md)). Not every encoder can carry it: `vp9_qsv` and `vp9_vaapi` (FFmpeg writes none), Microsoft's MF encoders (they ignore the attributes), and `h264_amf`'s matrix (AMD's H.264 runtime writes 2) |
+| `color_description` | `ROOMLERD_COLOR_DESCRIPTION` | on | every encoder writes the colour description its input was converted with (BT.601 matrix, BT.709 primaries, sRGB transfer, limited range: `encode::color_desc::DESCRIPTION`, [FR-130](fr/FR-130-colours-decode-true.md)), and the hello says `color-described`; `false` writes the undescribed stream of earlier agents. Read at every encoder open, so a restart applies it; the probe and recorder children, a hand-run `roomlerd record`, `encoder-smoke` and the recording editor's `media export` follow it (the export reads the config file only where the person running it can read it), and a supervised Mac's GUI worker gets the root's value (`WORKER_ENV_FORWARD`). Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`: a push of `off` or `on` sets it, and a blank one clears it back to on (FR-130 P1b, [remote-config.md](remote-config.md)). Not every encoder can carry it: `vp9_qsv` and `vp9_vaapi` (FFmpeg writes none), Microsoft's MF encoders (they ignore the attributes), and `h264_amf`'s matrix (AMD's H.264 runtime writes 2) |
 | `vaapi_device` | `ROOMLERD_VAAPI_DEVICE` | unset | pin the render node; unset = `/dev/dri/renderD128`…`135` in order |
 | `d3d12_adapter` | `ROOMLERD_D3D12_ADAPTER` | unset | pin the DXGI adapter index for D3D12 video encode (Windows); unset = adapters `0`…`3` in order |
 | `vulkan_device` | `ROOMLERD_VULKAN_DEVICE` | unset | pin the Vulkan physical device by index or name; unset = the loader's default |
@@ -833,7 +904,7 @@ rung, never the target.
 | `idr_count` | every keyframe the encoder emitted. Read against `dims_swaps` and the session's `PLI/FIR → forcing keyframe` lines (`peer.rs:836`) to isolate the rate-caused ones |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
-**The read for any host** — the FR-62 A0 sweep (`app.rs:6197`):
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6209`):
 
 ```
 roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
@@ -846,11 +917,11 @@ bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
 reads taught it:
 
 - **The rate change is charged with the keyframe on the rung's first output frame**
-  (`sweep_attribute_idrs`, `app.rs:6458`), not on frame 0. AMF answers the frame that
+  (`sweep_attribute_idrs`, `app.rs:6470`), not on frame 0. AMF answers the frame that
   fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
   "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
   for a backend that rebuilds on every move.
-- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6487`). Every
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6499`). Every
   backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
   CBR (`select_rc_mode` takes the CBR branch because the session opens with
   `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst
@@ -872,7 +943,7 @@ FFmpeg it links cannot disagree. The macOS builder carries no patch today.
 
 | Switch | Default | What it does | Retires when |
 |---|---|---|---|
-| `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:340`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:353`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
+| `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:342`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:355`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
 | `ROOMLERD_ENCODER_NVENC_ASSUME_IDR` (`:354`) | off | reverts NVENC to the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` |
 | `bg_rebuild_constrained` (`:498`) | on | a constrained session's rebuild runs off-thread (#1254), adopted at quiet | never while a rebuild backend exists |
 
@@ -923,11 +994,11 @@ flowchart LR
 - **Software paths target 60, paced to what they sustain** (P2). `SoftwarePace` (`encode/encode_pressure.rs:242`)
   runs FR-1's `FpsPace` over its own encode EWMA. It is its own EWMA so that `ROOMLERD_ENCODE_PRESSURE=0`, the
   hardware path's switch, cannot turn the software pace off as a side effect. The pace is never below 30
-  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:828`), so a host that cannot sustain 30 runs exactly as it did before.
+  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:830`), so a host that cannot sustain 30 runs exactly as it did before.
   The RTP pump starts at 60 under the tier (`target_fps_with_tier`, `peer.rs:123`). The auto-fps-cap that drops
   a software encoder to 30 applies only where the tier is off: Windows and macOS by default, where the WGC
   readback it was written for lives.
-  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:821`). On a host whose clock was
+  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:823`). On a host whose clock was
     never the limit, 60 frames cost twice the CPU of 30, and an attended desktop pays for it, so Windows and
     macOS opt in with `ROOMLERD_SW_FPS_60=1` until P3. `ROOMLERD_SW_FPS_60=0` gives back 30 everywhere.
   - ⚠️ **A step up waits for headroom** (P2d, `SW_PACE_UP_MARGIN_FPS`, `encode/encode_pressure.rs:255`).
@@ -938,7 +1009,7 @@ flowchart LR
     found it, window for window. The hardware pace keeps margin 0 until it is measured on hardware
     ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
 - **The bitrate base follows the rate the pump runs at**, by √(fps/30) (`bitrate_base_for_fps`,
-  `encode/mod.rs:806`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
+  `encode/mod.rs:808`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
   measured.
 
 ### OpenH264's runtime settings (FR-112 P2b)

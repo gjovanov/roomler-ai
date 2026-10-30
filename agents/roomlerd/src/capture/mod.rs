@@ -70,6 +70,10 @@ pub mod refresh;
 /// the synthetic source and `roomlerd probe-target` paint and the viewer reads.
 pub mod bench_marker;
 
+/// FR-16 L1 — the synthetic source's painter and the motion profiles, in every
+/// build: the encoder bench paints them on release builds.
+pub mod synthetic_scene;
+
 pub mod cursor;
 
 /// FR-85 P1d — the mouse pointer in a recording: whether each backend draws

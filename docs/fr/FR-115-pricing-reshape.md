@@ -134,7 +134,7 @@ one. So `Core::plans_sold` (`crates/core/src/state.rs:131`) is true only where t
 self-host image and the compose build are both built without it. With it false, the one
 decision point refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and the
 two fences that read the plan outside it stand down too: the session cap
-(`crates/modules/remote/src/controller.rs:799`) and the meeting sweep
+(`crates/modules/remote/src/controller.rs:824`) and the meeting sweep
 (`crates/modules/conference/src/meeting_cap.rs:104`).
 
 ⚠️ Found while documenting P5, after P1 and P3 had merged. Without the flag, P1's

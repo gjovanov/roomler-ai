@@ -19,6 +19,8 @@ use tunnel_core::env::node_env;
 
 use crate::capture::{DirtyRect, Frame};
 
+/// FR-16 L1 — `encoder-smoke --bench`: what this host's encoders cost.
+pub mod bench;
 pub mod caps;
 pub mod caps_cache;
 pub mod cells;
