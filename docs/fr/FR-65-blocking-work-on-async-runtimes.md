@@ -1,6 +1,6 @@
 # FR-65 — Blocking work on async runtimes: measure first, then remove
 
-**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 shipped and field-read on 0.4.60** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), and the verdict as a pure tested type (#1304). **1 of 7 criteria ticked**: the rest are measurement criteria and none of them has its measurement yet, which is the point of an FR whose first rule is *measure first*. · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
+**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.035 % of the frame budget on NEO16 (AC1)**. **3 of 8 criteria ticked** — AC1, AC2, and AC6 (the caps-probe respawn, measured gone on four hosts) — AC8 (docs) `[~]`. Next: the census after-read on the release that carries #3138 (AC7), then P1. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
 
 ## Goal
 
@@ -63,6 +63,32 @@ synchronous at pump start and invisible to `open_ms` because it precedes the
 loop), rather than three wraps.
 
 ### P0 — the stall watch (blocks every other phase)
+
+> **Status 2026-10-30 — the instrument was wrong for every stall longer than its
+> own heartbeat; fixed, six more regions named, and its cost measured (AC1).** A
+> census of its own output — 344 STALL lines from 14 days of the three CORPLAP
+> hosts' logs, `scripts/fr65-stall-census.sh` — found two defects in the
+> bookkeeping that FEEDS the verdict (the verdict itself, and AC2, held):
+>
+> 1. **The heartbeat's window reset saturated the pass that held it.** It
+>    zeroes six accumulators at a pass's tail, after that pass's mark, so the
+>    close read `0 − mark = 0` for each. A pass longer than the 2 s heartbeat
+>    always holds one, so the LONGEST stalls were blamed on nobody: 84 of 344
+>    lines, 1.5–2.6 s mean per host, and on CORPLAP-1 six first-pass `hevc_qsv`
+>    opens of 2.0–3.5 s. `PassWatch::rebase` carries the pass across the reset.
+> 2. **The FR-79 gate lost the heartbeat pass's own stall**: it was fed
+>    `pump_stalls − win_stalls_last` against a count the heartbeat zeroes. It
+>    now reads a monotonic `stalls_total`.
+>
+> The bookkeeping now lives beside the verdict as `encode::stall::PassWatch`
+> (default features; 15 new tests, two of them negative controls that reproduce
+> the field line without the fix). Six regions the census's untimed passes are
+> shaped like are named — `dc_lock`, `enc_cmd`, `close`, `recapture`, `poll`,
+> `heartbeat` — and naming never changes a verdict. The eleven watch-only timers
+> read no clock with the watch off. The watch's own cost is measured by
+> `roomlerd stall-watch-cost` (AC1, below). Owed: the census after-read on the
+> release that carries it (AC7). The manual is
+> [`docs/stall-watch.md`](../stall-watch.md).
 
 > **Status 2026-09-04 — shipped, field-read, and now unit-tested.** The watch
 > (0.4.55), the 100 ms bar, `open_ms`/`other_ms` (#1279, 0.4.59) and the
@@ -186,6 +212,16 @@ stay within today's SLA.
 
 ### P4 — the caps-probe respawn
 
+> **Status 2026-10-30 — measured gone; AC6 met, with no FR-65 fix in it.**
+> `scripts/fr65-stall-census.sh --probes` over 2026-10-17 → 30 04:44Z: every
+> probe line on CORPLAP-1/-2/-3 (83/87/108) fell within 60 s of a daemon start,
+> **0 at steady state** over 317 h each; on NEO16, the host this was first seen
+> on, 12 of 12 (2026-10-28 08:25 → 10-30 04:40). The probe runs once per daemon
+> start whose version changed, and a restart on the same version runs none
+> (NEO16 2026-10-29 10:14:34, a cache hit). What stopped the respawn is not
+> established here, and nothing under this FR changed it — so there is no
+> before/after for AC7 to hold, only the measurement AC6 asks for.
+
 Observed on neo16: a `caps-probe` **child process every ~10 s for nearly three
 hours**. `detect()` is meant to cache in a `OnceLock`, so this is a bug — a
 process spawn plus a driver enumeration on a repeating timer. Measure the spawn
@@ -220,7 +256,7 @@ of each is to produce a number.
 
 ## Acceptance criteria
 
-- [ ] **AC1** — the stall watch ships and its overhead is **measured** at < 1 % of
+- [x] **AC1** — the stall watch ships and its overhead is **measured** at < 1 % of
       the frame budget by an A/B with it disabled, on real hardware. An instrument
       that costs what it measures is worthless.
       ⚠️ **Half of this is done and the half that is left is the whole point.**
@@ -229,6 +265,22 @@ of each is to produce a number.
       them"*): that is an argument, not a measurement, and this FR's first rule is
       that inference does not count. Arithmetic over a constant nobody timed on
       the hardware in question is exactly what AC7 refuses.
+      ✅ **Measured 2026-10-30 on NEO16** ([`docs/stall-watch.md` §8](../stall-watch.md#8-what-the-watch-costs-fr-65-ac1), #3138):
+      `roomlerd stall-watch-cost` runs an interleaved A/B of the REAL
+      `PassWatch`, enabled against disabled. Four runs of 31 rounds: at most
+      **1 090 ns a pass** (the `worst-cold` p90 — every watch-only timer on
+      every pass, caches evicted between them; 225 ns in the steady warm cell)
+      against a bar of **69.4 µs**, 1 % of a frame at 144 fps — the pump's top
+      rate (`frame_rate::CHOICES`), not the 60 fps the design above assumed.
+      The positive control, 208 µs injected into the ON arm, came back at
+      1.00× in every run: the instrument can fail. Per second, at the
+      field's busiest pass rate — measured, at most 322 passes/s over 36 357
+      heartbeat windows on NEO16 and the three CORPLAP hosts — that is **0.35 ms
+      a second, 0.035 % of the frame budget**. Every factor was timed on the
+      hardware it describes. ⚠️ Not a pair of sessions through the kill switch:
+      since FR-79 the switch also blinds the governor's `agent_stalled` gate, so
+      a session A/B would measure a different controller as well (§4 of the
+      manual).
 - [x] **AC2** — a synthetic stall is caught and attributed to the correct phase.
       *#1304 (merged 2026-09-04) made the verdict a pure type,
       `encode::stall::PassTiming`, and the tests assert **attribution**, not just
@@ -256,6 +308,15 @@ of each is to produce a number.
       is now declared unconditionally; verified on master, not assumed, because a
       checked-out test file that no module registers runs nothing and still
       reports green.
+      *2026-10-30 — the verdict held; the bookkeeping that FEEDS it did not.*
+      Eighty-four field STALL lines came from passes that held the heartbeat,
+      whose window reset saturated six phase deltas to 0, so in the pump every
+      stall longer than 2 s was attributed to nobody — the same mistake, one
+      level up: the bookkeeping lived inline behind `ffmpeg-encoder`. It now
+      lives beside the verdict as `encode::stall::PassWatch`, and attribution is
+      tested through it: `a_window_reset_mid_pass_keeps_the_pass_whole`, with
+      `without_the_rebase_the_reset_reproduces_the_field_line` as its negative
+      control (**26 `encode::stall` tests**, 2026-10-30).
 - [ ] **AC3** — no pump iteration exceeds 250 ms across a downscale-tier change on
       a constrained QSV session; recorded **before and after** P1.
 - [ ] **AC4** — the encode-scheduling question is answered with canary data; if
@@ -263,9 +324,36 @@ of each is to produce a number.
       unchanged or better.
 - [ ] **AC5** — overlay guard waves and forced rekeys/min are measured at idle and
       under a VPN flap, and bounded; no rekey storm.
-- [ ] **AC6** — caps-probe spawns at steady state are 0/hour on a measured host.
+- [x] **AC6** — caps-probe spawns at steady state are 0/hour on a measured host.
+      ✅ **Measured 2026-10-30, four hosts** (`scripts/fr65-stall-census.sh
+      --probes`, #3138): **0 steady-state probe runs** on CORPLAP-1/-2/-3 over
+      317 h each (2026-10-17 → 30 04:44Z) and on NEO16 — the host P4 was opened
+      on — over the 44 h its logs retain. Every one of the 83/87/108/12 probe
+      lines fell within 60 s of a daemon start. The instrument sees every spawn:
+      the probe child has one spawn site (`encode/caps.rs`, `run_child`), every
+      run logs its decision and its outcome, and every caller is a `roomlerd`
+      process writing this log. The "fail first" is the same reading: each
+      version-changing start shows its probe, so a steady-state probe would show
+      the same way; and a restart on an unchanged version shows none (a cache
+      hit, NEO16 2026-10-29 10:14:34). No FR-65 change was involved; what
+      stopped the respawn is not established here (see P4's status).
 - [ ] **AC7** — every fix carries a before/after from the **same** instrument on
       this issue. A fix with no measurement does not count as shipped.
+      *2026-10-30:* P0's two fixes (#3138: the window-reset rebase and the
+      governor's monotonic stall count) have their **before** —
+      `scripts/fr65-stall-census.sh` over 2026-10-17..30 on CORPLAP-1/-2/-3: 84
+      `reset`-class lines (7/51/26) and 46 `untimed` (4/27/15). The **after** is
+      owed: the same script, the same hosts, a 14-day window on the release that
+      carries #3138. `reset` must read 0 with those long passes attributed
+      (`open`, `encode`, …), and `untimed` must shrink by what the six newly
+      named phases take.
+- [~] **AC8** — Docs: [`docs/stall-watch.md`](../stall-watch.md) in the house
+      style (mermaid, tables, `file:line` anchors) for the instrument and for each
+      later phase as it ships, and a `docs/README.md` index row.
+      *Met for P0, 2026-10-30: the page and its row exist — the phases, the
+      verdict's rules, the bookkeeping, what the kill switch does not turn off,
+      reading a STALL line, the census, the cost harness and its measurement.
+      Owed: P1–P5, each as it ships.*
 
 ## Open decisions
 
@@ -273,6 +361,16 @@ of each is to produce a number.
 - Dedicated encoder thread vs. leaving encode on the worker if the canary shows no
   starvation — P2's measurement decides, not preference.
 - Whether `apply_ms` belongs in the heartbeat permanently or only under the watch.
+- **The send task's DataChannel guard** (2026-10-30). The send task holds the
+  video DC's mutex across a frame's whole send (a Rust 2024 `if let` scrutinee
+  temporary, `peer.rs:7032`), so the pump's `dc_lock` waits out the previous
+  frame. Narrowing it is a one-line change; it waits for the `dc_lock` numbers
+  the next release brings, then ships with its before/after (AC7).
+- **Should the verdict survive its own kill switch?** Since FR-79,
+  `pump_stall_watch = false` blinds the governor's `agent_stalled` gate. Either
+  the switch keeps counting stalls (one clock read a pass) and drops only the
+  line and the timers, or it stays a full off with the coupling documented
+  (`docs/stall-watch.md` §4). The operator's call.
 
 ## Risks
 
@@ -289,6 +387,63 @@ path), FR-63 #1243, FR-64 #1244, #1237 (the sibling route war).
 ## Field-verification log
 
 _(every entry must carry a before/after from the stall watch.)_
+
+- **2026-10-30 — a census of the instrument's own output: it was blind to every
+  stall longer than its heartbeat; and its cost, measured (AC1).** The new
+  `scripts/fr65-stall-census.sh` over 14 days of daemon logs (2026-10-17..30) on
+  CORPLAP-1/-2/-3: **344 STALL lines** — `open` 21/122/37, `reset` 7/51/26,
+  `untimed` 4/27/15, `encode` 10/0/19, other 5 (swap, capture, ctrl, stats,
+  swap).
+  - **Before**, as the census reads the current release: the 84 `reset` lines —
+    emitted within 5 ms of their session's heartbeat, the six phases it zeroes
+    all at 0.0, `other ≈ iter` — were the LONGEST stalls (1.5–2.6 s mean per
+    host, 4.1 s max), because a pass longer than the 2 s heartbeat always holds
+    one. On CORPLAP-1 six of the seven came right after a heartbeat with
+    `open_ms` 1951–3529: **`hevc_qsv` first-pass opens of 2.0–3.5 s, blamed on
+    nobody** — against 748–789 ms on 0.4.60. The open has grown, and the watch
+    could not say so.
+  - Mechanism, from the code: the heartbeat zeroed capture/scale/encode/send/
+    apply/open at the TAIL of a pass, after that pass's mark, and the next close
+    computed `0 − mark`, which saturates to 0. The same shape one level over:
+    FR-79's gate was fed `pump_stalls − win_stalls_last` against a count the
+    heartbeat zeroes, which hid the heartbeat pass's own stall after any window
+    that held one. Fixed in #3138 (`PassWatch::rebase`, a monotonic
+    `stalls_total`); the bookkeeping moved into `encode::stall::PassWatch`, with
+    two negative controls that reproduce the field line exactly without the fix.
+    **After:** owed (AC7).
+  - **The 46 untimed**: 40 encoded a frame, then waited — capture and encode
+    normal, the rest in `other`. The send task takes the video DataChannel's
+    mutex in an `if let` scrutinee, and Rust 2024 keeps such a temporary alive
+    through the body, so the guard is held for a frame's whole chunked send and
+    the pump's post-encode `lock().await` waits out the previous frame (checked
+    on the pinned 1.95 toolchain: `try_lock` fails inside such a body, succeeds
+    after a `let`). Named `dc_lock`, not fixed: the number comes first.
+  - **Two 30 s passes on CORPLAP-1** (2026-10-24: 29 995 and 28 281 ms, capture
+    < 0.4 ms, no encode): an empty poll that did not come back, each ending
+    10–20 ms after a `keep-busy` state change, followed by the keyframe fallback
+    (`pending_ms=30244`) and the peer failing. ⚠️ Dead end: keep-busy runs on its
+    own OS thread (`keep_busy/mod.rs:214`), so its `std::thread::sleep`s hold no
+    runtime worker. Unexplained; `poll`, `close` and `enc_cmd` now name every
+    region such a pass can sit in.
+  - **Six phases named** from those shapes: `dc_lock`; `enc_cmd`; `close` — a
+    dropped encoder JOINS its thread on the runtime worker
+    (`encode/thread.rs:277`), blocking work on a shared runtime that nothing
+    timed; `recapture`; `poll` — a 2 ms sleep that comes back late is runtime
+    starvation, so it doubles as P2's canary; `heartbeat`. Naming never changes
+    a verdict.
+  - **AC1** — see the criterion: at most 1 090 ns a pass on NEO16 against a
+    69.4 µs bar, at most 322 passes/s in the field, 0.035 % of the frame budget;
+    the control (a fixed wall-clock busy-wait) resolved at 1.00× in every run.
+  - **AC6** — the caps-probe census (`--probes`): 0 steady-state probe runs on
+    CORPLAP-1/-2/-3 over 317 h each and on NEO16 over 44 h; all 83/87/108/12
+    probe lines within 60 s of a daemon start. See the criterion and P4.
+  - ⚠️ **The census's own dead end:** its first version read the logs with
+    `[IO.File]::ReadLines`, which the daemon's open handle on today's file
+    refuses; the error reached `roomler exec` only as CLIXML, which the wrapper
+    drops, so the census silently left out 2026-10-30 — five STALL lines on
+    CORPLAP-1 and -3 (first-pass opens). It now opens files as a tail does and
+    prints `read through …` and `unreadable=N`; every count above is from the
+    corrected read (through 2026-10-30 04:44Z).
 
 - **2026-09-04 — `other_ms` found a SECOND untimed phase, and this one is not the
   open.** Operator report: on all three CORPLAP hosts the frame age goes over
