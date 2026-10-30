@@ -77,6 +77,9 @@ IGNORED=("WIN""HOST-A" "CORP""LAP-2" "Mac""Book-1" "ARGB""2101010" "XRGB""8888"
          # an X11 font string and is allowlisted. If any of these ever trips,
          # the shape has been loosened and a real GUID will start crying wolf.
          "DEF""012345678" "dbf""342009340" "iso""10646" "ISO""10646"
+         # The sRGB transfer's standard number, as WebCodecs and FFmpeg spell it
+         # (FR-130). Allowlisted as IEC[0-9]+, asserted here in both casings.
+         "iec""61966" "IEC""61966"
          # The RETIRED canary (rotated 2026-09-06). It is allowlisted because
          # writing up the guard published it, so it now appears only in
          # documentation -- and it lives HERE so that exemption is asserted
