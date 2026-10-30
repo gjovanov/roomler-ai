@@ -1331,7 +1331,12 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: macos-latest
-    timeout-minutes: 25
+    # FR-6 wave 37: 35, not 25. This job's cache crossed its cap on 2026-10-30
+    # (republished at 6,159 MB by 41069134834), so the next master run dropped
+    # it and built cold: 1,954 units in 22 min 33 s (41072792020), 90 % of the
+    # old ceiling. A cold run cut off before it publishes leaves every later
+    # run cold too (see rust-unit). 35 is about 1.5 times that cold run.
+    timeout-minutes: 35
     # FR-6 wave 22 (#773): this job's cargo cache lives on the seed-cache
     # release, not in the Actions cache (see .github/actions/ci-seed-restore),
     # and publishing a release asset needs `contents: write`. Only a master
@@ -2538,11 +2543,12 @@ jobs:
         # env.d.ts's shim. A spec's `setProps({ realProp })` then fails the
         # excess-property check there and nowhere else: the build step above
         # runs vue-tsc on the runner's Node, where the real SFC types resolve.
-        # That gap broke every hosted-image build on master four times, after
-        # #1942, #2174, the 2026-10-26 VideoTileFr124 spec and #3176, each found
-        # only after the merge. `--bun` type-checks the image's way, so the PR
-        # fails instead (bun 1.3.12 reproduces #3176's error). In a spec, the
-        # cure is the cast VideoTileFr124.spec.ts uses.
+        # That gap broke every hosted-image build on master six times since
+        # 2026-10-11, after #1977, #2174, #2499, #2586, #2949 and #3176 (#2586's
+        # was a named `{ type X }` import from a `.vue` file), each found only
+        # after the merge. `--bun` type-checks the image's way, so the PR fails
+        # instead (bun 1.3.12 reproduces #3176's error). In a spec, the cure is
+        # the cast VideoTileFr124.spec.ts uses, or the type from a `.ts` file.
         run: cd ui && bun --bun x vue-tsc --noEmit
 
       - name: Run unit tests
