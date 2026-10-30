@@ -242,6 +242,12 @@ no encode is an empty poll, so the 30 s was spent in that arm or at the loop
 top — exactly the regions `poll` and `close` now name. The mechanism is not
 established; the next occurrence will say which.
 
+⚠️ **A dead end, recorded so nobody re-walks it:** keep-busy is not blocking a
+runtime worker. Its Windows host does `std::thread::sleep` while it settles and
+waits (`keep_busy/host_win.rs:96`, `:134`), but the engine runs on its own OS
+thread (`keep_busy/mod.rs:214`), so those sleeps hold no tokio worker. The
+correlation stands, unexplained.
+
 ### 6.3 The send task holds the DataChannel mutex for a whole frame
 
 Forty of the 46 `untimed` lines (CORPLAP-1 2 of 4, CORPLAP-2 23 of 27,
@@ -307,7 +313,45 @@ both arms, so the difference is the watch.
 tops out at 144 fps, so 1 % of 6.94 ms = **69.4 µs a pass** — not the 167 µs a
 60 fps budget would give.
 
-TBD-AC1
+**Measured on NEO16, 2026-10-30 02:29Z** — the dev box (Windows 11), a release
+build of this branch, the desktop in normal use (the interleaving absorbs that
+load). Four runs of 31 rounds:
+
+| Cell | Watch cost per pass, median (range of the four runs) | Worst p90 in any run | Worst p90, % of a 144 fps frame |
+|---|---|---|---|
+| `steady-warm` | 200 ns (183–210) | 224 ns | 0.0032 % |
+| `steady-cold` | 231 ns (204–250) | 276 ns | 0.0040 % |
+| `worst-warm` | 585 ns (573–629) | 695 ns | 0.0100 % |
+| `worst-cold` | 657 ns (607–739) | **869 ns** | **0.0125 %** |
+| `control` | 208.3 µs injected, 184–242 µs measured back (0.88–1.16×) | — | resolved in every run |
+
+One `Instant::now()` costs 24–27 ns here, so the steady cell's seven clock
+reads are most of its 200 ns.
+
+**Per second — what "1 % of the frame budget" means once a frame takes several
+passes.** The pump re-polls an idle screen every ~2 ms (rc.99), so it makes
+more passes than frames. The field's rate, bounded from the heartbeat's frame
+counters (`Δframes_empty + Δframes_encoded + Δframes_skipped_backpressure +
+Δdc_unopen_drops` per window, which over-counts a keepalive pass) over 14 days
+and 35 649 windows: at most **322 passes/s** (NEO16, 144 fps); 299, 314 and 296
+on the three CORPLAP hosts (p99 273–282), up to 10.5 passes per frame interval
+at 30 fps. At the worst cell's p90 that is 322 × 869 ns = **0.28 ms of watch per
+second, 0.028 % of the frame budget — 36× under the 1 % bar**, with every factor
+measured on the host it describes. From this build on the heartbeat carries the
+rate itself (`passes`), so the next read needs no bound.
+
+**The positive control is the "fail first".** The current release cannot run
+this harness at all, so the failing run is the control: with 208 µs injected
+into the ON arm the same instrument reads 184–242 µs, three times the bar — a
+watch costing that much would FAIL (`the_verdict_needs_the_control_to_resolve`
+pins the verdict side).
+
+⚠️ **A dead end, recorded:** the first version differenced whole cold passes,
+as the warm cells do. A cold pass is ~80–280 µs of walking whose time varies by
+microseconds, so the watch came out at −6.4…+5.7 µs medians and p90s up to
+37 µs — a bound set by noise, which multiplied by 322 passes/s is 1.2 % of each
+second and proves nothing. The cold cells now bracket only the watch's own
+operations after each eviction walk (`pass_timed`, `stall.rs:812`).
 
 ```bash
 roomlerd stall-watch-cost            # ~15 s, text; exit 0 PASS, 3 FAIL, 4 INVALID

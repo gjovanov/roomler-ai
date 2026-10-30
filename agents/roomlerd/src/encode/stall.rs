@@ -411,6 +411,7 @@ pub struct PassWatch {
     carried: PhaseAccum,
     window_iter_us_max: u64,
     window_stalls: u32,
+    window_passes: u32,
     stalls_total: u64,
     last_log: Option<Instant>,
 }
@@ -430,6 +431,7 @@ impl PassWatch {
             carried: PhaseAccum::default(),
             window_iter_us_max: 0,
             window_stalls: 0,
+            window_passes: 0,
             stalls_total: 0,
             last_log: None,
         }
@@ -482,6 +484,7 @@ impl PassWatch {
                     .since(mark)
                     .plus(std::mem::take(&mut self.carried))
                     .with_iter(iter_us);
+                self.window_passes = self.window_passes.saturating_add(1);
                 self.window_iter_us_max = self.window_iter_us_max.max(iter_us);
                 if pass.is_stall(self.warn_us) {
                     self.window_stalls = self.window_stalls.saturating_add(1);
@@ -533,11 +536,19 @@ impl PassWatch {
         self.window_stalls
     }
 
+    /// Passes closed in this window (the heartbeat's `passes`). The watch's
+    /// cost per second is this rate times its cost per pass — FR-65 AC1 reads
+    /// the rate from here rather than inferring it from the frame counters.
+    pub fn window_passes(&self) -> u32 {
+        self.window_passes
+    }
+
     /// The heartbeat's window reset: its maxes and counts describe that window
     /// alone. [`Self::stalls_total`] is NOT reset.
     pub fn reset_window(&mut self) {
         self.window_iter_us_max = 0;
         self.window_stalls = 0;
+        self.window_passes = 0;
     }
 
     /// Every stall since the pump started. Monotonic — the governor's per-pass
@@ -793,6 +804,55 @@ pub mod cost {
         }
     }
 
+    /// The same pass for a COLD cell: the walk evicts the watch's state and
+    /// code before each operation, and each operation is bracketed by its own
+    /// clock pair; the return is the nanoseconds inside the brackets.
+    ///
+    /// ⚠️ Why not the whole pass, as the warm cells do: a cold pass is ~100 us
+    /// of walking whose time varies by microseconds, so a difference of two
+    /// whole-pass blocks bounds the watch only at that noise (tens of us on
+    /// NEO16, 2026-10-30) — useless once multiplied by a pass rate. The
+    /// brackets leave the walk outside the measurement and keep the eviction
+    /// inside it. The bracket's own clock reads are in both arms and cancel;
+    /// the first one does warm the clock's path for the watch's own read, so a
+    /// cold miss on THAT is not in the figure.
+    #[inline(never)]
+    fn pass_timed(
+        w: &mut PassWatch,
+        a: &mut PhaseAccum,
+        profile: Profile,
+        walker: &mut Walker,
+    ) -> u64 {
+        let mut ns = 0u64;
+        walker.walk();
+        let t = Instant::now();
+        black_box(w.turn_with(|| *a));
+        ns += t.elapsed().as_nanos() as u64;
+        macro_rules! timed {
+            ($($field:ident),*) => {$(
+                walker.walk();
+                let t = Instant::now();
+                let s = w.start();
+                PassWatch::stop(s, &mut a.$field);
+                ns += t.elapsed().as_nanos() as u64;
+            )*};
+        }
+        timed!(swap_us, gate_us, dc_lock_us);
+        if profile == Profile::Worst {
+            timed!(
+                pace_us,
+                stats_us,
+                ctrl_us,
+                enc_cmd_us,
+                close_us,
+                recapture_us,
+                poll_us,
+                heartbeat_us
+            );
+        }
+        ns
+    }
+
     /// A busy loop of `iters` steps — the positive control's injected cost.
     #[inline(never)]
     fn spin(iters: u64) {
@@ -835,8 +895,17 @@ pub mod cost {
             }
         }
 
-        /// `passes` passes; the mean nanoseconds per pass.
+        /// `passes` passes; the mean nanoseconds per pass. A cold walker
+        /// (`seg > 0`) switches to [`pass_timed`]: the mean nanoseconds inside
+        /// the watch's bracketed operations per pass.
         fn block(&mut self, profile: Profile, walker: &mut Walker, passes: u32) -> f64 {
+            if walker.seg > 0 {
+                let mut ns = 0u64;
+                for _ in 0..passes {
+                    ns += pass_timed(&mut self.watch, &mut self.acc, profile, walker);
+                }
+                return ns as f64 / f64::from(passes.max(1));
+            }
             let t = Instant::now();
             for _ in 0..passes {
                 pass(&mut self.watch, &mut self.acc, profile, walker);
@@ -979,6 +1048,10 @@ pub mod cost {
             r.bar_ns / 1000.0
         ));
         s.push_str(
+            "(warm cells: whole passes, ON vs OFF. cold cells: only the watch's operations, each\n \
+             bracketed after the eviction walk, ON vs OFF - the walk is outside the brackets.)\n\n",
+        );
+        s.push_str(
             "cell          passes x rounds  reads/pass  OFF ns/pass  ON ns/pass  watch ns/pass p10 / median / p90  p90 % of frame\n",
         );
         for c in r.cells.iter().chain(std::iter::once(&r.control)) {
@@ -1008,13 +1081,25 @@ pub mod cost {
             },
         ));
         let worst = r.worst_p90_ns();
+        // The precise figure is a warm cell's median; a cold cell's p90 is a
+        // BOUND, mostly its own noise (a ~100 us body whose time varies by
+        // microseconds), so the headroom is read from the former.
+        let precise = r
+            .cells
+            .iter()
+            .find(|c| c.name == "steady-warm")
+            .map_or(worst, |c| c.diff_median_ns);
         let verdict = match r.verdict() {
             Verdict::Pass => format!(
-                "PASS - the worst cell's p90 is {:.1} ns, {:.4} % of a {fps} fps frame; the watch \
-                 could run {:.0} passes per frame before it reached 1 %",
+                "PASS - every cell's p90 is under the bar; the worst ({:.1} ns, {:.4} % of a \
+                 {fps} fps frame) is an upper bound set by that cell's noise. Per pass the watch \
+                 costs {:.1} ns (steady-warm median), {:.4} % of a frame: the pump could make \
+                 {:.0} passes per frame before it reached 1 %",
                 worst,
                 pct_of_frame(worst, fps),
-                r.bar_ns / worst.max(1e-9)
+                precise,
+                pct_of_frame(precise, fps),
+                r.bar_ns / precise.max(1e-9)
             ),
             Verdict::Fail => format!(
                 "FAIL - the worst cell's p90 is {:.1} ns, over the {:.1} ns bar",
@@ -1025,6 +1110,20 @@ pub mod cost {
             }
         };
         s.push_str(&format!("verdict: {verdict}\n"));
+        // The pump makes several passes per frame when it polls an idle
+        // screen, so the per-second view is the one AC1's "1 % of the frame
+        // budget" really means. A reference rate, not a field rate: the
+        // heartbeat's `passes` is this host's.
+        const REF_PASSES_PER_SEC: f64 = 1000.0;
+        s.push_str(&format!(
+            "per second at {REF_PASSES_PER_SEC:.0} passes/s (a reference rate - read the heartbeat's \
+             `passes` for this host's): {:.1} us of watch ({:.4} % of each second), {:.1} us at \
+             the worst cell's p90 ({:.4} %)\n",
+            precise * REF_PASSES_PER_SEC / 1000.0,
+            precise * REF_PASSES_PER_SEC / 1e7,
+            worst * REF_PASSES_PER_SEC / 1000.0,
+            worst * REF_PASSES_PER_SEC / 1e7,
+        ));
         s
     }
 
@@ -1049,6 +1148,11 @@ pub mod cost {
             "max_fps": r.max_fps,
             "bar_ns": r.bar_ns,
             "worst_p90_ns": r.worst_p90_ns(),
+            "steady_warm_median_ns": r
+                .cells
+                .iter()
+                .find(|c| c.name == "steady-warm")
+                .map(|c| c.diff_median_ns),
             "inject_ns": r.inject_ns,
             "cells": r.cells.iter().map(cell).collect::<Vec<_>>(),
             "control": cell(&r.control),
@@ -1596,11 +1700,16 @@ mod tests {
         w.turn_at(acc, t0 + ms(300));
         w.turn_at(acc, t0 + ms(310));
         assert_eq!(w.window_iter_us_max(), 300_000);
+        assert_eq!(w.window_passes(), 2, "the opening turn closes nothing");
         w.reset_window();
-        assert_eq!((w.window_iter_us_max(), w.window_stalls()), (0, 0));
+        assert_eq!(
+            (w.window_iter_us_max(), w.window_stalls(), w.window_passes()),
+            (0, 0, 0)
+        );
         assert_eq!(w.stalls_total(), 1);
         w.turn_at(acc, t0 + ms(320));
         assert_eq!(w.window_iter_us_max(), 10_000);
+        assert_eq!(w.window_passes(), 1);
     }
 
     /// The kill switch: no clock, no snapshot, no counters.

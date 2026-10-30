@@ -9864,6 +9864,8 @@ async fn media_pump_ffmpeg_dc(
                 open_ms_max = open_us_max as f64 / 1000.0,
                 iter_ms_max = watch.window_iter_us_max() as f64 / 1000.0,
                 pump_stalls = watch.window_stalls(),
+                // FR-65 AC1 — the pass rate the watch's cost scales with.
+                passes = watch.window_passes(),
                 // FR-63 B1 — the ONE delay-based controller, in SHADOW: what it
                 // WOULD target beside what the governor applied, so a week of
                 // these across the fleet answers the flip criterion (AC2)
