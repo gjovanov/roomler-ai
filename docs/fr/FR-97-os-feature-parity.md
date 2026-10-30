@@ -1044,7 +1044,7 @@ test of the SIGKILL property itself.
     until the clean shutdown is on disk (`session_end.rs:220`). A console handler hears no sign-out once `user32` is
     loaded.
   - Restart Manager's `ENDSESSION_CLOSEAPP`, `WM_CLOSE` and `service uninstall` are never a leave (D15).
-  - `service stop --as-service` stops the SCM service (`environment.rs:355`).
+  - `service stop --as-service` stops the SCM service (`environment.rs:440`).
   - Kill switch: `ROOMLERD_SESSION_END=0`.
   - The design is not the companion setting the event, as first planned (D15). `docs/ephemeral-nodes.md` has the
     per-user section.

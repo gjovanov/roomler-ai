@@ -45,7 +45,7 @@ use windows_sys::Win32::System::Registry::{
     RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 
-use super::resolved_service_name;
+use super::{Registration, resolved_service_name};
 
 const ENV_KEY_PREFIX: &str = r"SYSTEM\CurrentControlSet\Services\";
 const ENV_VALUE_NAME: &str = "Environment";
@@ -133,10 +133,69 @@ pub fn rmw_unset(pairs: Vec<(String, String)>, name: &str) -> Vec<(String, Strin
         .collect()
 }
 
+/// #3115 — what to do with a service's `Environment` value as found, so an
+/// entry reconfigured in place never keeps one the SCM refuses: StartServiceW
+/// failed with error 87 on a malformed EMPTY one (`hex(7):00,00`, P3d).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvRepair {
+    /// Absent, or exactly what [`encode_multi_sz`] writes: left alone.
+    Keep,
+    /// Not a REG_MULTI_SZ, or no entry in it: deleted (no override), as
+    /// `write_service_env` does with an empty list.
+    Delete,
+    /// Entries in it, but not in the form [`encode_multi_sz`] writes: written
+    /// back in that form.
+    Rewrite(Vec<(String, String)>),
+}
+
+/// [`EnvRepair`]'s decision, pure: the value's registry type and its bytes.
+pub fn env_repair(value_type: u32, bytes: &[u8]) -> EnvRepair {
+    if value_type != REG_MULTI_SZ {
+        return EnvRepair::Delete;
+    }
+    let wide: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let pairs = decode_multi_sz(&wide);
+    if pairs.is_empty() {
+        return EnvRepair::Delete;
+    }
+    let canonical: Vec<u8> = encode_multi_sz(&pairs)
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    if canonical == bytes {
+        EnvRepair::Keep
+    } else {
+        EnvRepair::Rewrite(pairs)
+    }
+}
+
 // ─── SCM-side IO ──────────────────────────────────────────────────────────────
 
-fn service_env_key_path() -> String {
-    format!("{ENV_KEY_PREFIX}{}", resolved_service_name())
+/// #3115 — the error for a service that is not there to read or write, naming
+/// the service actually missing.
+fn not_registered(name: &str, registration: Registration) -> anyhow::Error {
+    match registration {
+        Registration::MarkedForDelete => anyhow::anyhow!(
+            "the {name} service is marked for deletion (1072): it was deleted while still held, \
+             by its host still stopping or a handle open elsewhere, and Windows removes it once \
+             that lets go"
+        ),
+        _ => anyhow::anyhow!("the {name} service is not registered"),
+    }
+}
+
+/// The service the env-block paths act on, once the SCM says it is there.
+/// A refusal to say (`Unknown`: a filtered token, say) is let through: the
+/// registry open that follows reports its own error.
+fn registered_service_name() -> Result<&'static str> {
+    let name = resolved_service_name();
+    match super::registration(name) {
+        r @ (Registration::Absent | Registration::MarkedForDelete) => Err(not_registered(name, r)),
+        Registration::Registered | Registration::Unknown(_) => Ok(name),
+    }
 }
 
 fn wide_with_nul(s: &str) -> Vec<u16> {
@@ -154,22 +213,28 @@ impl Drop for OpenKey {
     }
 }
 
-fn open_service_key(access: u32) -> Result<OpenKey> {
-    let path = service_env_key_path();
+fn open_key_of(name: &str, access: u32) -> Result<OpenKey> {
+    let path = format!("{ENV_KEY_PREFIX}{name}");
     let wpath = wide_with_nul(&path);
     let mut out: HKEY = ptr::null_mut();
     // SAFETY: wpath is NUL-terminated and lives through the call.
     let rc = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, wpath.as_ptr(), 0, access, &mut out) };
+    if rc == ERROR_FILE_NOT_FOUND {
+        // Gone between the SCM's answer and this open.
+        return Err(not_registered(name, Registration::Absent));
+    }
     if rc != ERROR_SUCCESS {
         anyhow::bail!("RegOpenKeyExW(HKLM\\{path}, access={access:#x}) failed: error {rc}");
     }
     Ok(OpenKey(out))
 }
 
-/// Read the `Environment` REG_MULTI_SZ value. Missing-value returns
-/// an empty list (SCM-equivalent of "no environment overrides").
-pub fn read_service_env() -> Result<Vec<(String, String)>> {
-    let key = open_service_key(KEY_QUERY_VALUE)?;
+fn open_service_key(access: u32) -> Result<OpenKey> {
+    open_key_of(registered_service_name()?, access)
+}
+
+/// The `Environment` value's registry type and bytes; `None` when absent.
+fn read_env_raw(key: &OpenKey) -> Result<Option<(u32, Vec<u8>)>> {
     let wname = wide_with_nul(ENV_VALUE_NAME);
     let mut buf_len: u32 = 0;
     let mut value_type: u32 = 0;
@@ -186,16 +251,13 @@ pub fn read_service_env() -> Result<Vec<(String, String)>> {
         )
     };
     if rc == ERROR_FILE_NOT_FOUND {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     if rc != ERROR_SUCCESS {
         anyhow::bail!("RegQueryValueExW(Environment) failed: error {rc}");
     }
-    if value_type != REG_MULTI_SZ {
-        anyhow::bail!("Environment value has unexpected type {value_type} (expected REG_MULTI_SZ)");
-    }
     if buf_len == 0 {
-        return Ok(Vec::new());
+        return Ok(Some((value_type, Vec::new())));
     }
     let mut bytes = vec![0u8; buf_len as usize];
     // SAFETY: bytes has buf_len capacity; we pass it back as the size.
@@ -212,11 +274,43 @@ pub fn read_service_env() -> Result<Vec<(String, String)>> {
     if rc != ERROR_SUCCESS {
         anyhow::bail!("RegQueryValueExW(Environment) read failed: error {rc}");
     }
+    bytes.truncate(buf_len as usize);
+    Ok(Some((value_type, bytes)))
+}
+
+/// Read the `Environment` REG_MULTI_SZ value. Missing-value returns
+/// an empty list (SCM-equivalent of "no environment overrides").
+pub fn read_service_env() -> Result<Vec<(String, String)>> {
+    let key = open_service_key(KEY_QUERY_VALUE)?;
+    let Some((value_type, bytes)) = read_env_raw(&key)? else {
+        return Ok(Vec::new());
+    };
+    if value_type != REG_MULTI_SZ {
+        anyhow::bail!("Environment value has unexpected type {value_type} (expected REG_MULTI_SZ)");
+    }
     let wide: Vec<u16> = bytes
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     Ok(decode_multi_sz(&wide))
+}
+
+/// #3115 — repair the `Environment` value of the service `name` in place, if
+/// it is one the SCM may refuse ([`env_repair`]). Called on an entry that is
+/// reconfigured rather than re-created, which no longer starts from an empty
+/// value; a well-formed one, the SystemContext switch included, is kept.
+pub fn normalize_service_env(name: &str) -> Result<EnvRepair> {
+    let key = open_key_of(name, KEY_QUERY_VALUE | KEY_SET_VALUE)?;
+    let Some((value_type, bytes)) = read_env_raw(&key)? else {
+        return Ok(EnvRepair::Keep);
+    };
+    let repair = env_repair(value_type, &bytes);
+    match &repair {
+        EnvRepair::Keep => {}
+        EnvRepair::Delete => write_env_value(&key, &[])?,
+        EnvRepair::Rewrite(pairs) => write_env_value(&key, pairs)?,
+    }
+    Ok(repair)
 }
 
 /// Read a single named env var. Returns `Ok(None)` when absent.
@@ -230,6 +324,10 @@ pub fn read_service_env_var(name: &str) -> Result<Option<String>> {
 
 fn write_service_env(pairs: &[(String, String)]) -> Result<()> {
     let key = open_service_key(KEY_SET_VALUE)?;
+    write_env_value(&key, pairs)
+}
+
+fn write_env_value(key: &OpenKey, pairs: &[(String, String)]) -> Result<()> {
     let wname = wide_with_nul(ENV_VALUE_NAME);
     if pairs.is_empty() {
         // No env overrides left: DELETE the `Environment` value rather than write
@@ -296,14 +394,8 @@ pub fn unset_service_env_var(name: &str) -> Result<()> {
 /// service is left in whatever state it ended up in; the operator can
 /// recover via `services.msc`.
 pub fn restart_service(timeout: Duration) -> Result<()> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .context("ServiceManager::local_computer(CONNECT)")?;
-    let service = manager
-        .open_service(
-            resolved_service_name(),
-            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START,
-        )
-        .with_context(|| format!("open_service({})", resolved_service_name()))?;
+    let service =
+        open_resolved(ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START)?;
 
     let status = service.query_status().context("query_status before stop")?;
     if status.current_state == ServiceState::Running
@@ -325,14 +417,7 @@ pub fn restart_service(timeout: Duration) -> Result<()> {
 /// SCM supervisor respawns its own worker, so this is only ever needed when
 /// the whole service is down.
 pub fn start_service(timeout: Duration) -> Result<()> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .context("ServiceManager::local_computer(CONNECT)")?;
-    let service = manager
-        .open_service(
-            resolved_service_name(),
-            ServiceAccess::QUERY_STATUS | ServiceAccess::START,
-        )
-        .with_context(|| format!("open_service({})", resolved_service_name()))?;
+    let service = open_resolved(ServiceAccess::QUERY_STATUS | ServiceAccess::START)?;
     let status = service
         .query_status()
         .context("query_status before start")?;
@@ -353,14 +438,7 @@ pub fn start_service(timeout: Duration) -> Result<()> {
 /// elevation on a stock install. A service already stopped is left alone and
 /// reported as success.
 pub fn stop_service(timeout: Duration) -> Result<()> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .context("ServiceManager::local_computer(CONNECT)")?;
-    let service = manager
-        .open_service(
-            resolved_service_name(),
-            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
-        )
-        .with_context(|| format!("open_service({})", resolved_service_name()))?;
+    let service = open_resolved(ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)?;
     let status = service.query_status().context("query_status before stop")?;
     if status.current_state == ServiceState::Stopped {
         return Ok(());
@@ -370,6 +448,25 @@ pub fn stop_service(timeout: Duration) -> Result<()> {
     }
     wait_for_state(&service, ServiceState::Stopped, timeout).context("waiting for STOPPED")?;
     Ok(())
+}
+
+/// Open the service the env-block paths act on. #3115: a 1060 or a 1072 says
+/// which service is missing, and why, instead of "open_service(…)".
+fn open_resolved(access: ServiceAccess) -> Result<windows_service::service::Service> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("ServiceManager::local_computer(CONNECT)")?;
+    let name = resolved_service_name();
+    manager.open_service(name, access).map_err(|e| {
+        let code = match &e {
+            windows_service::Error::Winapi(io) => io.raw_os_error(),
+            _ => None,
+        };
+        match code {
+            Some(1060) => not_registered(name, Registration::Absent),
+            Some(1072) => not_registered(name, Registration::MarkedForDelete),
+            _ => anyhow::Error::new(e).context(format!("open_service({name})")),
+        }
+    })
 }
 
 fn wait_for_state(
@@ -494,5 +591,54 @@ mod tests {
         let original = pairs(&[("A", "1")]);
         let updated = rmw_unset(original, "MISSING");
         assert_eq!(updated, pairs(&[("A", "1")]));
+    }
+
+    fn bytes_of(wide: &[u16]) -> Vec<u8> {
+        wide.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// #3115 — an entry reconfigured in place keeps a well-formed Environment,
+    /// the SystemContext switch included, byte for byte.
+    #[test]
+    fn a_well_formed_environment_is_kept() {
+        let swap = pairs(&[("ROOMLERD_ENABLE_SYSTEM_SWAP", "1")]);
+        let value = bytes_of(&encode_multi_sz(&swap));
+        assert_eq!(env_repair(REG_MULTI_SZ, &value), EnvRepair::Keep);
+    }
+
+    /// #3115 — the P3d value (`hex(7):00,00`, one UTF-16 NUL) that made
+    /// StartServiceW fail with 87, and every other empty one, is deleted.
+    #[test]
+    fn the_p3d_empty_value_and_every_empty_one_is_deleted() {
+        assert_eq!(env_repair(REG_MULTI_SZ, &[0, 0]), EnvRepair::Delete);
+        assert_eq!(env_repair(REG_MULTI_SZ, &[0, 0, 0, 0]), EnvRepair::Delete);
+        assert_eq!(env_repair(REG_MULTI_SZ, &[]), EnvRepair::Delete);
+        // Entries the SCM cannot use (no `=`) are no entries at all.
+        let mut junk: Vec<u16> = "JUNK".encode_utf16().collect();
+        junk.extend([0, 0]);
+        assert_eq!(
+            env_repair(REG_MULTI_SZ, &bytes_of(&junk)),
+            EnvRepair::Delete
+        );
+    }
+
+    /// A value of the wrong type is no override the SCM can use: deleted.
+    #[test]
+    fn a_value_of_the_wrong_type_is_deleted() {
+        let mut sz: Vec<u16> = "ROOMLERD_ENABLE_SYSTEM_SWAP=1".encode_utf16().collect();
+        sz.push(0);
+        // REG_SZ = 1.
+        assert_eq!(env_repair(1, &bytes_of(&sz)), EnvRepair::Delete);
+    }
+
+    /// Entries without the double-NUL end are written back in canonical form.
+    #[test]
+    fn entries_missing_their_terminator_are_rewritten_canonically() {
+        let mut wide: Vec<u16> = "ROOMLERD_ENABLE_SYSTEM_SWAP=1".encode_utf16().collect();
+        wide.push(0);
+        assert_eq!(
+            env_repair(REG_MULTI_SZ, &bytes_of(&wide)),
+            EnvRepair::Rewrite(pairs(&[("ROOMLERD_ENABLE_SYSTEM_SWAP", "1")]))
+        );
     }
 }
