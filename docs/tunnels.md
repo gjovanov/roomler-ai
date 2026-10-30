@@ -1082,7 +1082,7 @@ Four parties each say yes, and each for itself:
 
 | Piece | Where |
 |---|---|
-| the tools | `net_tools` ([`toolbelt.rs:1112`](../agents/roomlerd/src/hive/toolbelt.rs#L1112)), offered in `tools/list` ([`:1666`](../agents/roomlerd/src/hive/toolbelt.rs#L1666)) and answered in `ask_vault` ([`:1511`](../agents/roomlerd/src/hive/toolbelt.rs#L1511)); their names in the settings, `NET_TOOLS` ([`:463`](../agents/roomlerd/src/hive/toolbelt.rs#L463)) |
+| the tools | `net_tools` ([`toolbelt.rs:1316`](../agents/roomlerd/src/hive/toolbelt.rs#L1316)), offered in `tools/list` ([`:1870`](../agents/roomlerd/src/hive/toolbelt.rs#L1870)) and answered in `ask_vault` ([`:1715`](../agents/roomlerd/src/hive/toolbelt.rs#L1715)); their names in the settings, `NET_TOOLS` ([`:625`](../agents/roomlerd/src/hive/toolbelt.rs#L625)) |
 | a call | `net_tools::call` ([`net_tools.rs:192`](../agents/roomlerd/src/hive/net_tools.rs#L192)), its arguments `parse` ([`:144`](../agents/roomlerd/src/hive/net_tools.rs#L144)), the run's end `drop_run` ([`:336`](../agents/roomlerd/src/hive/net_tools.rs#L336)), called as the run's leases go ([`supervisor.rs:4068`](../agents/roomlerd/src/hive/supervisor.rs#L4068)) |
 | the owner's gate | `hive_net` ([`config.rs:596`](../crates/agent-core/src/config.rs#L596)), `HiveConfig.net` ([`gates.rs:55`](../agents/roomlerd/src/hive/gates.rs#L55)), `Supervisor::net_hub` ([`supervisor.rs:1559`](../agents/roomlerd/src/hive/supervisor.rs#L1559)); the settings' `ask`, `vault_use_tools` ([`:5048`](../agents/roomlerd/src/hive/supervisor.rs#L5048)) |
 | the hub | `TunnelClientHub::set_primary` ([`client_mgr.rs:289`](../agents/roomlerd/src/tunnel/client_mgr.rs#L289)), called as the daemon builds it ([`app.rs:4383`](../agents/roomlerd/src/app.rs#L4383)) |
