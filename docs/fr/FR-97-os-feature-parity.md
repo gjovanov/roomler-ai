@@ -204,7 +204,7 @@ prevent, and the guard re-asserts it on every tick.
 - A restart does not heal it: `purge_split_default` runs at boot, then the runtime re-installs from the persisted
   `overlay_exit_node`.
 - Reach: a Mac running the opt-in root daemon whose operator sets `overlay_exit_node`. The key is not in
-  `DesiredConfig` (`crates/remote_control/src/models.rs:2790`), so no server push can set it; a local
+  `DesiredConfig` (`crates/remote_control/src/models.rs:2797`), so no server push can set it; a local
   `sudo roomler config set` can, and so can an `exec` on the daemon's row. Once it lands, the control WS that the
   `exec` came in on is captured too, so the same channel cannot undo it.
 - `NetstackTun` inherits the same default. It installs no OS routes, so it cannot wedge, but `roomler status`
@@ -215,13 +215,13 @@ prevent, and the guard re-asserts it on every tick.
 
 **S2 — exit and subnet serving is offered where nothing NATs, and an approval outlives the offer.** ✔
 
-- The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2440-2449`) and independent of NAT setup
+- The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2449-2458`) and independent of NAT setup
   (`runtime.rs:2149-2172`; the setup's success only picks a log level, `nat.rs:80-94`). macOS has no NAT arm at all
   (`nat.rs:376-378` returns `false`), and because the guard is armed only on Linux and Windows (`nat.rs:87`), it logs
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
 - The server derives `can_be_exit_node` from the advertisement alone
   (`crates/modules/network/src/routes/overlay_route.rs:63`), and the admin row carries no OS (`overlay_route.rs:28-59`)
-  although every agent row has one (`models.rs:2089`).
+  although every agent row has one (`models.rs:2096`).
 - `approved_routes` survives a rejoin on purpose (`crates/services/src/dao/overlay_node.rs:239-241`), and the netmap
   fans `approved_routes` without intersecting what the node still advertises
   (`crates/modules/network/src/overlay.rs:2651`). A client accepts any peer whose fanned routes hold `/0`
@@ -261,9 +261,9 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ✅ since P2c: the window server's list, focus through Accessibility, launch through LaunchServices and Terminal; on a supervised Mac the GUI worker serves it, and the root's row carries its words | Was: `Unavailable::Platform` (`apps/mod.rs:347`), no `apps/macos.rs`. *P2c:* `agents/roomlerd/src/apps/macos.rs` | P2c |
 | R4 | Live cursor shape | ✅ | ✅ X11 since P3a (XFixes), and the DRM arm's hardware cursor (FR-93 P3c, 0.4.134); a per-user Wayland compositor draws it into the frames | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`). *P8-2:* the inventory missed the DRM arm (`agents/roomlerd/src/capture/cursor.rs:128-152`) | P3a, P2d |
 | R5 | "Host is locked" consent hint | ✅ | 🟡 since P3b: advisory, from logind's `LockedHint`, and input passes (`lock_state.rs:347`), in a session; a request waiting for consent is not told (P2d-1 found it: the prompt's probe answers `None` here) | ✅ since P2d-1: advisory, from the session dictionary (`lock_state.rs:357`), in a session (`input: "unknown"`) and at a prompt | The pump's `LockState` is always `Unlocked` off Windows (`lock_state.rs:290-326`), on purpose: the hint never becomes its overlay. *P2d-1:* the prompt's probe asks a Mac's session (`lock_state.rs:301-320`) | P2d-1, P3b |
-| R6 | Keyboard layout report / switch | ✅ | ✅ X11 since P3e-1: the XKB group (`input/layout_x11.rs`); 🟡 GNOME on Xorg reports only, since GNOME Shell puts its own source back; ❌ under Wayland, where the compositor owns it, and on a system install, which has no X connection | ✅ since P2d-2a: Text Input Sources, on AppKit's main thread | Windows-only cap (`caps.rs:2233-2237` before P3e). *P3e-1:* Windows and Linux (`agents/roomlerd/src/encode/caps.rs:2353-2364`), and on Linux only in an X11 session, without `set` under GNOME (`:1493`). *P2d-2a:* a Mac (`agents/roomlerd/src/input/layout_mac.rs:54`) | P2d, P3e |
+| R6 | Keyboard layout report / switch | ✅ | ✅ X11 since P3e-1: the XKB group (`input/layout_x11.rs`); 🟡 GNOME on Xorg reports only, since GNOME Shell puts its own source back; ❌ under Wayland, where the compositor owns it, and on a system install, which has no X connection | ✅ since P2d-2a: Text Input Sources, on AppKit's main thread | Windows-only cap (`caps.rs:2243-2247` before P3e). *P3e-1:* Windows and Linux (`agents/roomlerd/src/encode/caps.rs:2363-2374`), and on Linux only in an X11 session, without `set` under GNOME (`:1493`). *P2d-2a:* a Mac (`agents/roomlerd/src/input/layout_mac.rs:54`) | P2d, P3e |
 | R7 | Match remote display | ✅ | ✅ X11 since P3e-2: a person's own display with one active output, a per-user install, and the virtual desktop (FR-108 P2); ❌ Wayland, a system install | ✅ since P2d-2b: the main display, with one active display, at its scale and refresh rate; the mode reverts by itself if the process dies | `display_match.rs:911`. *P3e-2:* `agents/roomlerd/src/display_match.rs:333` `x11_offered`; the viewer's toggle followed the OS until P3e-2. *P2d-2b:* `agents/roomlerd/src/display_match.rs:351` `mac_offered` | P2d, P3e |
-| R8 | Clipboard: host → viewer image sync | ✅ | ✅ X11 since P3e-3a, behind the XFixes change gate; ❌ Wayland and a system install | ✅ since P2e-1, behind the pasteboard's change count | Forced off (`clipboard.rs:818-822` before P3e-3a) ✔ while advertised (`caps.rs:2312-2320`). *P3e-3a:* `agents/roomlerd/src/clipboard.rs:643` `x11_gate`. *P2e-1:* `agents/roomlerd/src/clipboard.rs:756` `mac_gate` | P0c, P2e, P3e |
+| R8 | Clipboard: host → viewer image sync | ✅ | ✅ X11 since P3e-3a, behind the XFixes change gate; ❌ Wayland and a system install | ✅ since P2e-1, behind the pasteboard's change count | Forced off (`clipboard.rs:818-822` before P3e-3a) ✔ while advertised (`caps.rs:2322-2330`). *P3e-3a:* `agents/roomlerd/src/clipboard.rs:643` `x11_gate`. *P2e-1:* `agents/roomlerd/src/clipboard.rs:756` `mac_gate` | P0c, P2e, P3e |
 | R9 | Clipboard: RTF lane | ✅ | ❌ | ❌ | `clipboard.rs:1044` | P2e, P3e |
 | R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:10291-10294`) | FR-93 P7 |
 | R11 | Typing text on a non-US layout (uinput) | ✅ | ✅ since P3f: the host's own XKB keymap; the US table where libxkbcommon is missing | ✅ | `keylayout.rs:40-46`, `uinput_backend.rs:628-634`. *P3f:* `agents/roomlerd/src/input/keylayout/xkb.rs:82`, the KeyText arm at `agents/roomlerd/src/input/uinput_backend.rs:639` | P3f |
@@ -306,16 +306,16 @@ and the consent chain's fallbacks.
 | O4 | One CLI verb registers the system service | ✅ `service install --as-service` | 🟡 built (P6c) | 🟡 built (P6c) | Was: refused as "Windows-only". P6c gives the same verb (alias `--system`) its Unix meaning: `roomlerd.service` enabled, or `com.roomler.daemon` bootstrapped, refused until the root daemon's own config exists (`service.rs`, `pub mod system`) | P6c |
 | O5 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | 🟡 built (P6d) | 🟡 built (P6d) | Was: apt alone on Linux, the tarball nothing, and macOS a pasted recipe. P6d's `install.sh --uninstall` removes what any path installed, after a clean stop through each service's manager (`install.sh:1257`) | P6d |
 | O6 | An update's outcome is recorded | 🟡 written, never read | ❌ the watcher dies with the unit (#1239) | ❌ none | — | FR-67 |
-| O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:254-278`, `:1030-1037`) | P6e |
+| O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:254-278`, `:1033-1040`) | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1180-1189` | P6f |
-| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`app.rs:3439`, `session_end.rs:220`) | P4d |
+| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`app.rs:3458`, `session_end.rs:220`) | P4d |
 | A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2448-2454`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:80-81`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` in the arm64 build step before P7a; recordings write Opus, not AAC. *P7a (#2881):* the arm64 build carries the vendored FFmpeg (nvenc, vaapi, vulkan, AAC); a cell's proof is FR-122 | P7a |
 | A4 | Tunnel CLI and wizard on Linux arm64 | — | ❌ | — | x86_64 only (`release-tunnel.yml:127-131`, `release-setup.yml:184-189`). *P7b:* the aarch64 jobs (`.github/workflows/release-tunnel.yml:215`, `.github/workflows/release-setup.yml:255`) and the proxy's `linux-aarch64` (`crates/modules/fleet/src/tunnel_release.rs:197`), from 0.4.149 | P7b |
 
-The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:2068`), so it cannot count the
+The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:2075`), so it cannot count the
 devices A1 and A2 would serve. P0d adds the native machine architecture to the hello. On Windows that is
 `IsWow64Process2`'s native machine, because an x64 build under emulation would otherwise report x86_64.
 
@@ -356,8 +356,8 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:181-224`); DRM captures from root (opt-in). ⏳ **P8-2.** This row moved under it: since FR-95 (verified on 0.4.141) a system install switches DRM and uinput on by itself for the person's Wayland session, FR-113 (merged, not yet released) does the same for X11, and the wlroots portal never produced frames in the lab. ✅ **P8-2** (#2548), once FR-113 shipped (0.4.144, closed on 0.4.145): `unattended-access.md`'s Linux tab, and the same claim in `ui/docs/content/start/install/linux.md`'s tip and in `scripts/install.sh`'s `--system` help and its enable line. ⏳ `per-os-permissions.md` and `troubleshooting/black-screen.md` ride #2533 |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`). ✅ **P8** |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93. ✅ FR-93 added the Wayland section; **P8** rewrote the system unit's half, which still read "only once both keys are set", for FR-95 and FR-113 (the package ships master's code) |
-| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:83-84`, `caps.rs:2626`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:81-85`, `agents/roomlerd/src/encode/caps.rs:2664`, `crates/tunnel-core/src/overlay/tun.rs:4034-4035`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
-| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:227`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:3887`, `:3983`, `:4390`, `agents/roomlerd/src/app.rs:5063` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:628-633`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
+| code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:83-84`, `caps.rs:2636`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:81-85`, `agents/roomlerd/src/encode/caps.rs:2674`, `crates/tunnel-core/src/overlay/tun.rs:4034-4035`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
+| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:227`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:3887`, `:3983`, `:4390`, `agents/roomlerd/src/app.rs:5082` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:628-633`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
 | `ui/docs/content/reference/ports-and-firewall.md`, "Allow-listing by hostname" | installers and updates come from the server's own origin, so an allow-list needs only `roomler.ai` | the same split as the `installation.md` row above. ✅ **P8-2** (#2548), found writing the user page: it names GitHub's two hosts and `aka.ms` too |
 | `docs/README.md`'s `multi-org.md` row | the doc covers the mux NAT | history since W7c (the `multi-org.md` row above). ✅ **P8-2** (#2548) |
 
@@ -436,7 +436,7 @@ silence (R1). Clipboard image events sat on every Linux and macOS agent, whose w
 Ctrl+Alt+Del at all.
 
 **The shape (D10).** A word stays a promise. What a host cannot keep, the daemon takes out and explains in a new map,
-`AgentCaps.unavailable: {feature → {code, reason}}` (`crates/remote_control/src/models.rs:534`). The keys are
+`AgentCaps.unavailable: {feature → {code, reason}}` (`crates/remote_control/src/models.rs:541`). The keys are
 matched by equality (`Unavailable::KEYS`, `:548`), and the wire shape is locked by
 `unavailable_wire_shape_is_locked`. The viewer's rule:
 
@@ -1037,7 +1037,7 @@ test of the SIGKILL property itself.
     through Unix tools.
   - Kill switch: `hive_adopt`, the device's own key, default off. `docs/hive.md` §8 (*On Windows*).
 - **P4d, a clean stop for Scheduled-Task installs** (built). Two channels into the arm the SCM host's event already
-  reaches (`app.rs:3439`):
+  reaches (`app.rs:3458`):
   - **`roomlerd service stop`** signals a `Local\` event keyed by the config's instance id (`stop_event.rs:342`),
     waits up to 15 s for the daemon to leave, and only then ends the task (`service.rs:785`).
   - **A hidden top-level window** turns `WM_ENDSESSION` into the stop and holds the session's end for at most 5 s,
@@ -1268,7 +1268,7 @@ model on Windows, so the three agree on what the mode means.
 
 - Unit tests wherever the logic can run on every OS (FR-43's practice: keep `decide()` out of `cfg(macos)`), and a
   macOS `cargo test` lane for `tunnel-core` with `overlay-l3`. Today macOS only compiles, plus the real-utun kernel
-  test (`ci.yml:1333-1360`).
+  test (`ci.yml:1340-1367`).
 - Extend `macos_kernel_tests` on the runner's real utun: an exemption pinned and read back, the pf anchor loaded and
   flushed, the resolver keys installed and purged.
 - Field: the `vmtest` macOS, Win11 (Home and Pro) and Ubuntu cells; one exit cell per (client OS × exit OS) pair;

@@ -67,7 +67,7 @@ On a UDP-blocked, TLS-inspected network no TURN allocation answers (`TURN alloca
 
 ### 3.1 The decision
 
-`AccessPolicy.rc_overlay` (`crates/remote_control/src/models.rs:1612`) gains a third value, **`auto`**. Under `auto` the **target agent** decides per session. Both inputs are facts it already has:
+`AccessPolicy.rc_overlay` (`crates/remote_control/src/models.rs:1619`) gains a third value, **`auto`**. Under `auto` the **target agent** decides per session. Both inputs are facts it already has:
 
 | mesh carrier to the viewer's device | far TURN candidate gathered | the session behaves as | why |
 |---|---|---|---|
@@ -103,10 +103,10 @@ flowchart TD
 
 `RcOverlay` (`rc_overlay.rs:34`) is resolved per session from the request (`RcOverlay::resolve_mode`, `:80`) and reaches a delegated worker in `SessionParams.rc_overlay` (`agents/roomlerd/src/delegate.rs:216`). `auto` travels beside the bool, as `rc_overlay_auto` next to `rc_overlay: false`, so an older reader sees the bool it understands (D1).
 
-As built, the Hub also sends `auto` only to an agent that advertises the `rc-overlay-auto` verb (`crates/remote_control/src/models.rs:1286`), as it sends `lock_on_end` only to one advertising `lock-on-end`. To any other agent the policy reads as `off`: no `rc_overlay_auto`, and no viewer relay handed out. That makes D1 hold on the server, not only in the older agent's parser. A device with the kill switch set stops advertising the verb (`agents/roomlerd/src/encode/caps.rs:2620`).
+As built, the Hub also sends `auto` only to an agent that advertises the `rc-overlay-auto` verb (`crates/remote_control/src/models.rs:1293`), as it sends `lock_on_end` only to one advertising `lock-on-end`. To any other agent the policy reads as `off`: no `rc_overlay_auto`, and no viewer relay handed out. That makes D1 hold on the server, not only in the older agent's parser. A device with the kill switch set stops advertising the verb (`agents/roomlerd/src/encode/caps.rs:2630`).
 
 P2, as built (`docs/remote-control.md` §4.4 has the diagram):
-- **Stored.** The policy row keeps `auto` in a field of its own, `AccessPolicy.rc_overlay_auto` (`crates/remote_control/src/models.rs:1623`), rather than as a third value of `rc_overlay`. A pod rolled back below P2 then reads the row as `off`, never as one it cannot parse.
+- **Stored.** The policy row keeps `auto` in a field of its own, `AccessPolicy.rc_overlay_auto` (`crates/remote_control/src/models.rs:1630`), rather than as a third value of `rc_overlay`. A pod rolled back below P2 then reads the row as `off`, never as one it cannot parse.
 - **Carried.** `RcOverlayMode` (`:1653`) is what the authz gate hands the Hub, and it crosses pods as `rc_overlay_auto` plus `rc_overlay_far_turn` beside the bool (`crates/modules/remote/src/relay.rs:585`).
 - **The far-TURN hint (D5).** The authz gate asks a new core hook, `far_turn_udp` (`crates/core/src/hooks.rs:186`), bounded at 500 ms (`crates/modules/remote/src/controller.rs:684`). `network` answers from both devices' fresh netcheck (`crates/modules/network/src/hooks.rs:109`). A hook, because the Hub has no database and `remote` must not call `network` (the module DAG).
 - **The page.** **Mesh: off / auto / on** on each device's row (`ui/src/components/admin/devicePolicy.ts:82`) replaces the checkbox, and both fields are written on every change, so a row never says `on` and `auto` at once.

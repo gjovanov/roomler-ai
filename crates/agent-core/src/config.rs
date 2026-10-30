@@ -1610,6 +1610,15 @@ pub struct AgentConfig {
     /// supervised Mac the root's value binds the GUI worker.
     #[serde(default)]
     pub zero_copy: Option<bool>,
+    /// FR-130 — every encoder writes the colour description it converted
+    /// with (the BT.601 matrix at limited range) into its stream
+    /// (`ROOMLERD_COLOR_DESCRIPTION`), so a decoder stops guessing BT.709 for
+    /// an HD picture and shifting every saturated colour. Built-in: on;
+    /// `false` writes the undescribed stream every earlier agent sent. Read at
+    /// every encoder open and by the probe, so a change needs a restart. On a
+    /// supervised Mac the root's value binds the GUI worker.
+    #[serde(default)]
+    pub color_description: Option<bool>,
     /// FR-118 — GPU-input cells this device must not open, comma-separated
     /// `name:gpu` (`hevc_qsv:gpu`). Unset or `none` = deny nothing. Env
     /// `ROOMLERD_ZERO_COPY_DENY`, read by the probe and at every encoder open.
@@ -3021,6 +3030,7 @@ pub fn test_fixture() -> AgentConfig {
         encoder_cells_deny: None,
         fps_deny: None,
         zero_copy: None,
+        color_description: None,
         zero_copy_deny: None,
         nvenc_split: None,
         vaapi_device: None,
@@ -3144,7 +3154,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 91] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 92] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -3249,6 +3259,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 91]
         ("CAPS_CACHE", cfg.caps_cache),
         ("FPS_HIGH", cfg.fps_high),
         ("ZERO_COPY", cfg.zero_copy),
+        ("COLOR_DESCRIPTION", cfg.color_description),
     ]
 }
 
@@ -4187,10 +4198,13 @@ mod tests {
         cfg.zero_copy = Some(true);
         cfg.zero_copy_deny = Some("hevc_qsv:gpu".into());
         cfg.nvenc_split = Some("off".into());
+        // FR-130 — default ON, so the direction worth bridging is the off.
+        cfg.color_description = Some(false);
         let m = env_fallbacks(&cfg);
         let get = |k: &str| m.get(k).map(String::as_str);
         assert_eq!(get("FPS_DENY"), Some("hevc_qsv:120"));
         assert_eq!(get("ZERO_COPY"), Some("1"));
+        assert_eq!(get("COLOR_DESCRIPTION"), Some("0"));
         assert_eq!(get("ZERO_COPY_DENY"), Some("hevc_qsv:gpu"));
         assert_eq!(get("NVENC_SPLIT"), Some("off"));
         assert_eq!(get("DRM_CAPTURE"), Some("1"));

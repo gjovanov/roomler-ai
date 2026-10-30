@@ -90,6 +90,9 @@ impl Openh264Encoder {
     /// (dock/undock) the caller must rebuild this encoder.
     pub fn new(width: u32, height: u32) -> Result<Self> {
         let bitrate_bps = initial_bitrate_for(width, height);
+        // FR-130 P1 — the SPS VUI says what `bgra_to_yuv_buffer` produced
+        // (`None` with `color_description` off: no VUI signal type, as before).
+        let colour = crate::encode::color_desc::active();
         Self::spawn(
             width,
             height,
@@ -97,7 +100,7 @@ impl Openh264Encoder {
             Some(IDR_EVERY_S),
             move || {
                 tracing::info!(bitrate_bps, width, height, "openh264 encoder init");
-                EncoderConfig::new()
+                let config = EncoderConfig::new()
                     .bitrate(BitRate::from_bps(bitrate_bps))
                     .max_frame_rate(FrameRate::from_hz(TARGET_FPS as f32))
                     // Force an IDR every 60 frames (≈2 s @ 30 fps).
@@ -106,7 +109,13 @@ impl Openh264Encoder {
                     // desktop; a single lost packet then freezes the
                     // decoder for ~10 s. 60 gives <2 s recovery floor
                     // even if the RTCP-PLI round-trip drops.
-                    .intra_frame_period(IntraFramePeriod::from_num_frames(TARGET_FPS * IDR_EVERY_S))
+                    .intra_frame_period(IntraFramePeriod::from_num_frames(
+                        TARGET_FPS * IDR_EVERY_S,
+                    ));
+                match colour {
+                    Some(d) => config.vui(crate::encode::color_desc::openh264(d)),
+                    None => config,
+                }
             },
         )
     }
@@ -123,6 +132,8 @@ impl Openh264Encoder {
     /// - BT.601 limited range signalled in the SPS VUI — what
     ///   [`bgra_to_yuv_buffer`] actually produces, and what the MP4's `colr`
     ///   says, so an HD player does not assume BT.709 and shift every colour.
+    ///   FR-130 leaves it as it is, whatever `color_description` says (the
+    ///   spec's open decision 5): it has been right since FR-85.
     pub fn new_recording(width: u32, height: u32, fps: u32, gop_frames: u32) -> Result<Self> {
         let fps = fps.clamp(1, 60);
         let bitrate_bps = recording_bitrate_for(width, height, fps);
@@ -850,6 +861,59 @@ mod tests {
             vec![0, 120],
             "one at the start, the next two seconds of 60 fps later"
         );
+    }
+
+    /// FR-130 P1 — the live encoder's SPS VUI says `color_desc::DESCRIPTION`
+    /// exactly with the switch on and nothing with it off; the recording
+    /// profile keeps its own BT.601 (SMPTE 170M ×3, `VuiConfig::bt601()`, what
+    /// the MP4's `colr` box says) whatever the switch says (the spec's open
+    /// decision 5). A sync test driving its own runtime, so the env lock is
+    /// never held across an `.await`.
+    #[test]
+    fn the_live_encoder_describes_its_colour_and_the_recording_keeps_its_own() {
+        use crate::encode::bitstream_color::{self, Signalled};
+        use crate::encode::color_desc::DESCRIPTION;
+        use tunnel_core::env::test_env::{Saved, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _switch = Saved::cleared("COLOR_DESCRIPTION");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let sps = |enc: &mut Openh264Encoder| -> Signalled {
+            let frame = std::sync::Arc::new(bitstream_color::bars(320, 240, 0));
+            let packets = rt.block_on(enc.encode(frame)).expect("encode");
+            let stream: Vec<u8> = packets.iter().flat_map(|p| p.data.clone()).collect();
+            bitstream_color::h264(&stream).expect("an SPS")
+        };
+        let live = sps(&mut Openh264Encoder::new(320, 240).expect("encoder"));
+        eprintln!("FR-130 openh264 live, switch on: {live:?}");
+        if let Err(e) = live.check(DESCRIPTION, bitstream_color::Vocabulary::CodePoints) {
+            panic!("switch on: {e}");
+        }
+        // SAFETY: serialised by DENY_ENV_LOCK; the guard restores it.
+        unsafe { set("COLOR_DESCRIPTION", "0") };
+        let live = sps(&mut Openh264Encoder::new(320, 240).expect("encoder"));
+        eprintln!("FR-130 openh264 live, switch off: {live:?}");
+        assert!(live.unspecified(), "switch off: {live:?}");
+        for switch in ["0", "1"] {
+            // SAFETY: as above.
+            unsafe { set("COLOR_DESCRIPTION", switch) };
+            let recording =
+                sps(&mut Openh264Encoder::new_recording(320, 240, 30, 60).expect("encoder"));
+            assert_eq!(
+                recording,
+                Signalled {
+                    full_range: Some(false),
+                    primaries: Some(6),
+                    transfer: Some(6),
+                    matrix: Some(6),
+                },
+                "the recording's VUI with the switch at {switch}"
+            );
+        }
     }
 
     /// FR-112 P2b — through the worker: a frame rate and a bitrate sent before

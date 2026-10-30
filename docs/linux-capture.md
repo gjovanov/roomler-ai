@@ -483,7 +483,7 @@ what would capture it. An exec sweep cannot answer "how many hosts are Wayland,
 and which arm serves each": a sweep reaches only the devices that are online.
 The server can, because every device says it in its hello.
 
-The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1480`),
+The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1487`),
 all strings, so a newer agent's word reaches an older server as a word:
 
 | field | values | from |
@@ -557,7 +557,7 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3294`,
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3313`,
 `virtual_desktop.rs:685`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
@@ -1272,7 +1272,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:6505`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:6524`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -2025,7 +2025,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1243-1274`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2978`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2987`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|

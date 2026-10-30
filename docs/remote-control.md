@@ -250,7 +250,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2771`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:191`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:363`, wired at `app.rs:4145`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:363`, wired at `app.rs:4164`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -290,7 +290,7 @@ flowchart TD
 
 | Input | Where it comes from |
 |---|---|
-| that the agent decides at all | the `rc-overlay-auto` verb in `AgentCaps.rpc` (`crates/remote_control/src/models.rs:1286`), advertised while the kill switch is on (`agents/roomlerd/src/encode/caps.rs:2620`). The Hub sends `auto` to no other agent |
+| that the agent decides at all | the `rc-overlay-auto` verb in `AgentCaps.rpc` (`crates/remote_control/src/models.rs:1293`), advertised while the kill switch is on (`agents/roomlerd/src/encode/caps.rs:2630`). The Hub sends `auto` to no other agent |
 | that the policy is `auto` | `rc:request`'s `rc_overlay_auto`, sent with `rc_overlay: false`, so an agent older than the field reads off (`crates/remote_control/src/signaling.rs:3457`) |
 | the viewer's devices | `RcOverlayAutoWire.viewers` (`crates/remote_control/src/signaling.rs:5522`): the `overlay_ip` of every loopback relay the Hub hands the browser, at most `LOCAL_RELAYS_MAX`, since FR-121 P3b hands over one relay per agent on the viewer's computer. The Hub fills it from the relays in the overlay range (`rc_overlay_auto_wire`, `crates/modules/fleet/src/hub.rs:144`) |
 | the far TURN | `RcOverlayAutoWire.far_turn`: both ends' last netcheck (`stun_udp`, `relay_band_udp`), read by the server (below). `None` = not measured, read as usable |
@@ -303,7 +303,7 @@ Notes on the implementation:
 - **It logs one line:** `rc ICE: overlay auto (FR-128) — the session may ride the mesh` (or `stays off`), with `viewers`, `carriers`, `far_turn`, `allow` and `exclude`.
 - **Kill switch:** `ROOMLERD_RC_OVERLAY_AUTO=0` (`rc_overlay.rs:66`) makes `auto` behave as `off`. The device then stops advertising `rc-overlay-auto`, so the Hub reads its policy as `off` too.
 
-**How the server feeds it.** The device row stores `auto` in a field of its own, `AccessPolicy.rc_overlay_auto` (`crates/remote_control/src/models.rs:1623`), beside `rc_overlay`. A pod or a page older than the field therefore reads `off`, never a row it cannot parse. On the **Devices** page it is the middle choice of **Mesh: off / auto / on** (`ui/src/components/admin/devicePolicy.ts:82`).
+**How the server feeds it.** The device row stores `auto` in a field of its own, `AccessPolicy.rc_overlay_auto` (`crates/remote_control/src/models.rs:1630`), beside `rc_overlay`. A pod or a page older than the field therefore reads `off`, never a row it cannot parse. On the **Devices** page it is the middle choice of **Mesh: off / auto / on** (`ui/src/components/admin/devicePolicy.ts:82`).
 
 ```mermaid
 flowchart LR
@@ -317,7 +317,7 @@ flowchart LR
     H -->|"agent does not"| O["read as off: no rc_overlay_auto,<br/>relay refused rc_overlay_off"]
 ```
 
-- **The mode** is `RcOverlayMode` (`models.rs:1653`). `rc_overlay_mode()` (`:1701`) reads `on` first, then `auto`, else `off`, the same order the page uses.
+- **The mode** is `RcOverlayMode` (`models.rs:1660`). `rc_overlay_mode()` (`:1708`) reads `on` first, then `auto`, else `off`, the same order the page uses.
 - **The far-TURN hint** comes from the authz gate (`far_turn_hint`, `crates/modules/remote/src/controller.rs:684`). It asks the hook registry (`far_turn_udp`, `crates/core/src/hooks.rs:186`), and `network` answers from both devices' live overlay nodes, behind the same 60-minute freshness gate every consumer uses (`crates/modules/network/src/hooks.rs:109`).
   - The rule is `far_turn_verdict` (`:135`): either end measured dead is `false`; both measured alive is `true`; anything else is not measured.
   - The gate waits at most 500 ms, then sends no hint. A slow read costs the hint, never the session.
@@ -515,7 +515,7 @@ macOS agent, whose watchers never send them; `supports_clipboard` on a root
 Linux daemon with no clipboard to reach. Nothing at all governed
 Ctrl+Alt+Del. Since P0c the daemon takes out what the host cannot keep and
 says why, in `AgentCaps.unavailable`
-([`models.rs:534`](../crates/remote_control/src/models.rs#L534)).
+([`models.rs:541`](../crates/remote_control/src/models.rs#L541)).
 
 ```mermaid
 flowchart LR
@@ -569,7 +569,7 @@ of the process, so a root daemon started outside every session keeps its
 documents ([`remote-apps.md`](remote-apps.md)).
 
 The keys are matched by equality (`Unavailable::KEYS`,
-[`models.rs:557`](../crates/remote_control/src/models.rs#L557)) and the wire
+[`models.rs:564`](../crates/remote_control/src/models.rs#L564)) and the wire
 shape is locked by `unavailable_wire_shape_is_locked`. FR-97's census
 (`scripts/fr97-caps-census.sh`) counts the map by OS as `key:code`, beside
 the words.
@@ -1701,7 +1701,7 @@ live viewer to the consent page, and the device hung its session up.
 - absent for `auto`.
 
 The mapping is `ConsentMode::asks`
-([`models.rs:1546`](../crates/remote_control/src/models.rs#L1546)), sent at
+([`models.rs:1553`](../crates/remote_control/src/models.rs#L1553)), sent at
 [`hub.rs:1953`](../crates/modules/fleet/src/hub.rs#L1953). A duplicate request
 coalesced onto a live session gets the same value (`:1571`).
 
@@ -2027,7 +2027,7 @@ org or a device that sets nothing.
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
 | Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3404`](../crates/localapi/src/lib.rs#L3404)); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
-| Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:511`](../crates/remote_control/src/models.rs#L511)) and re-announced on the heartbeat when it changes |
+| Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:518`](../crates/remote_control/src/models.rs#L518)) and re-announced on the heartbeat when it changes |
 
 ```mermaid
 sequenceDiagram
