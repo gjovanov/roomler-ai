@@ -166,7 +166,11 @@ describe('RemoteConfigDialog fills its draft from the device (#3156)', () => {
     expect(store.fetchOrgExecEnabled).not.toHaveBeenCalled()
     expect(store.fetchOrgSshEnabled).not.toHaveBeenCalled()
     expect(w.emitted('update:modelValue')).toBeUndefined()
-    await w.setProps({ modelValue: true })
+    // Cast, as VideoTileFr124.spec.ts does: the hosted image type-checks
+    // `.vue` through env.d.ts's shim (oven/bun has no `node`), where a REAL
+    // prop fails the excess-property check. Uncast, this broke every hosted
+    // image build after #3176.
+    await w.setProps({ modelValue: true } as unknown as Parameters<typeof w.setProps>[0])
     await flushPromises()
     expectRecordedDraft()
   })

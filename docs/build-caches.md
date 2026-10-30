@@ -141,7 +141,7 @@ days. So before every non-tag build, `seed-cache-restore` runs a GC step
 | The wizard's macOS universal job (two triples) | 5,000 MB | `release-setup.yml:396` |
 | CI caches in the release-asset store (`ci-seed-restore`), default | 4,000 MB | `ci-seed-restore/action.yml:29` |
 | The integration shards, `ci.yml`'s macOS overlay check and its Windows clippy lane | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1362`, `:1609` |
-| `ci.yml`'s Linux lanes (wave 34): unit, lint, agent; recorder-audio, ffmpeg-encoder, recording-ffmpeg, profiles | 16,000, 10,000, 7,000; 5,000 each | `ci.yml:504`, `:231`, `:655`; `:1170`, `:1920`, `:2100`, `:2579` |
+| `ci.yml`'s Linux lanes (wave 34): unit, lint, agent; recorder-audio, ffmpeg-encoder, recording-ffmpeg, profiles | 16,000, 10,000, 7,000; 5,000 each | `ci.yml:504`, `:231`, `:655`; `:1170`, `:1920`, `:2100`, `:2592` |
 
 **A cold build has to fit under its cap.** If it does not, every restore drops the cache, every
 run builds cold, and each master run publishes the same size again, so the GC never recovers.
