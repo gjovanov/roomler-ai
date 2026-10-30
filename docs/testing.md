@@ -638,6 +638,28 @@ cascades and `--name` are hardware by construction, so they always ask.
 - ⚠️ **Noise.** These are wall-clock times on a host doing other things. Run a cell twice and read
   the spread before comparing two hosts: the reference run below did, on a busy machine.
 
+**Reference run** (2026-10-30). A release build with the Linux release lane's features
+(`release-agent.yml:552`) ran in an Ubuntu 24.04 container on a busy Windows dev box, with no GPU
+and `clock=refused:95` (that kernel has no util clamp). The quick profile printed six rows in 2.0 s,
+18.5 KB of output with its log lines:
+
+| Cell | Opened | Verdict | Encode p50 / p95 | Produced (rate) | IDRs, p50 | Deltas p50 / p95 |
+|---|---|---|---|---|---|---|
+| `rtp:h264` | `openh264`, sw | `sw-only` | 6.56 / 12.87 ms | 3383 kbps (0.61) | 3, 42 722 B | 15 476 / 22 270 B |
+| `rtp:h265` | `noop` | `none` | | | | |
+| `dc:h264`, `dc:h265`, `dc:av1` | nothing | `none` | | | | |
+| `dc:vp9:444` | `libvpx-vp9-444`, sw | **`fallback`** | 5.22 / 8.85 ms | 3594 kbps (0.65) | 3, 41 007 B | 8 604 / 40 698 B |
+
+`dc:vp9:444` reads `fallback` because the build carries FFmpeg's VP9 hardware path, the container
+has no device for it, and libvpx answered. The released 0.4.188 binary answers `--bench` with
+`unexpected argument`, and its plain smoke gave the same result before and after
+(`openh264`, 4 keyframes, 13 238 bytes). Run twice, `rtp:h264` over the three motions repeated
+its sizes and rates to the byte, because the frames and the encoder are deterministic. Its encode
+p50s were 3.7 and 4.7 ms (static), 8.1 and 7.5 (drag), 7.6 and 6.4 (pan), and its p95s up to 60 %
+apart (27.8 and 17.2 ms on pan). So compare p50s across hosts, and p95s only between runs on a quiet
+host. `pan` cost OpenH264 a fifth of `drag`'s bitrate (676 against 3383 kbps): a uniform shift is
+what motion compensation predicts, and the dragged text's edges are what costs.
+
 ## The overlay stress lane (FR-81)
 
 Everything the mesh promises is a **latency and stability** claim, and before this lane nothing
