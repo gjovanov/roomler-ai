@@ -259,6 +259,13 @@ pub struct AgentCaps {
     ///   to photon. Only a build with the synthetic frame source, running
     ///   it, with `ROOMLERD_BENCH=1`, ever advertises it; a viewer sends no
     ///   probe to an agent without it.
+    /// * `color-described` — FR-130: every encoder of this agent that can
+    ///   carry a colour description writes the one it converted with (the
+    ///   BT.601 matrix at limited range, in the SPS VUI, the AV1 sequence
+    ///   header or the VP9 header). Absent on older agents and with the
+    ///   agent's `color_description` switch off: their streams are
+    ///   undescribed, and a decoder guessing BT.709 for HD shifts every
+    ///   saturated colour.
     ///
     /// Empty / unset (older agents) deserialises to `[]` and the browser
     /// keeps the legacy unframed format. The capability is what makes the

@@ -1907,6 +1907,15 @@ async fn daemon_main() -> Result<()> {
             constrained,
             json,
         } => {
+            // FR-130 — the smoke opens encoders as the daemon would, with the
+            // device's config-backed encoder knobs (the colour description's
+            // switch, the cell denylists) published first.
+            publish_config_for_smoke(
+                &config_path,
+                "encoder-smoke",
+                &ENCODER_SMOKE_CONFIG_KEYS,
+                "encoder",
+            );
             if reconfigure_sweep {
                 encoder_reconfigure_sweep_cmd(
                     &encoder,
@@ -1967,7 +1976,12 @@ async fn daemon_main() -> Result<()> {
             fps,
             downscale,
         } => {
-            publish_config_for_smoke(&config_path, "capture-smoke");
+            publish_config_for_smoke(
+                &config_path,
+                "capture-smoke",
+                &SMOKE_CONFIG_KEYS,
+                "capture or input",
+            );
             capture_smoke_cmd(frames, dump.as_deref(), fps, &downscale).await
         }
         Command::InputSmoke {
@@ -1976,7 +1990,12 @@ async fn daemon_main() -> Result<()> {
             text,
             delay_ms,
         } => {
-            publish_config_for_smoke(&config_path, "input-smoke");
+            publish_config_for_smoke(
+                &config_path,
+                "input-smoke",
+                &SMOKE_CONFIG_KEYS,
+                "capture or input",
+            );
             input_smoke_cmd(
                 move_to.as_deref(),
                 click.as_deref(),
@@ -6558,16 +6577,28 @@ const SMOKE_CONFIG_KEYS: [&str; 8] = [
     "WAYLAND_AWARE",
 ];
 
+/// FR-130 — the encoder keys `encoder-smoke` names when it starts: the colour
+/// description's switch and the cell denylists, so the line says which
+/// encoders, and which stream, the smoke is about to open.
+const ENCODER_SMOKE_CONFIG_KEYS: [&str; 4] = [
+    "COLOR_DESCRIPTION",
+    "ENCODER_CELLS_DENY",
+    "ZERO_COPY",
+    "ZERO_COPY_DENY",
+];
+
 /// FR-93 P1 — a smoke test answers as the DAEMON would: it publishes the
 /// device's own config-backed knobs first (`config::env_fallbacks`, the map
 /// `run` publishes), so a key set with `roomler config set` is honoured by the
 /// smoke that is meant to prove it. Before this, `capture-smoke` read env and
 /// built-in defaults only, and on a host configured through the config file
-/// it tested a cascade the daemon was not running.
+/// it tested a cascade the daemon was not running. `keys` (of `kind`) are the
+/// ones the start line names; every key is published. FR-130 gave
+/// `encoder-smoke` the same: before it, the encoder smoke read env only.
 ///
 /// ⚠️ `read_if_present`, not `load`, as `apps-probe` does: a diagnostic must
 /// never write the config it probes (`load` self-heals).
-fn publish_config_for_smoke(config_path: &std::path::Path, what: &str) {
+fn publish_config_for_smoke(config_path: &std::path::Path, what: &str, keys: &[&str], kind: &str) {
     let Some(cfg) = config::read_if_present(&config_path.to_path_buf()) else {
         println!(
             "{what}: no config at {} — env and built-in defaults only",
@@ -6576,7 +6607,7 @@ fn publish_config_for_smoke(config_path: &std::path::Path, what: &str) {
         return;
     };
     let fallbacks = config::env_fallbacks(&cfg);
-    let set: Vec<String> = SMOKE_CONFIG_KEYS
+    let set: Vec<String> = keys
         .iter()
         .filter_map(|k| {
             fallbacks
@@ -6588,7 +6619,7 @@ fn publish_config_for_smoke(config_path: &std::path::Path, what: &str) {
         "{what}: config {} — {} (an env var still wins)",
         config_path.display(),
         if set.is_empty() {
-            "no capture or input keys set".to_string()
+            format!("no {kind} keys set")
         } else {
             set.join(" ")
         }

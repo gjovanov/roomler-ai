@@ -23,7 +23,14 @@ pub mod caps;
 pub mod caps_cache;
 pub mod cells;
 pub mod color;
+/// FR-130 P1 — the colour description every encoder writes, in one place.
+pub mod color_desc;
 pub mod hwid;
+
+/// FR-130 P1 — TEST-ONLY readers of the colour description a bitstream
+/// carries (H.264/HEVC SPS VUI, AV1 `color_config`, a VP9 keyframe header).
+#[cfg(test)]
+pub(crate) mod bitstream_color;
 
 #[cfg(feature = "openh264-encoder")]
 pub mod openh264_backend;
@@ -619,6 +626,18 @@ pub fn pump_stall_warn_ms() -> u64 {
 #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
 pub fn par_convert_enabled() -> bool {
     tunnel_core::env::node_env("PAR_CONVERT").as_deref() != Some("0")
+}
+
+/// FR-130 P1 — every encoder writes the colour description its input was
+/// converted with ([`color_desc::DESCRIPTION`]: the BT.601 matrix at limited
+/// range), so a decoder stops guessing BT.709 for an HD picture and shifting
+/// every saturated colour (#3049). Default **on**. `ROOMLERD_COLOR_DESCRIPTION=0`
+/// / config `color_description = false` writes exactly the undescribed stream
+/// every earlier agent sent. Read at every encoder open, in every family
+/// (FFmpeg, Media Foundation, openh264, libvpx), and by the hello's
+/// `color-described` token; the probe and recorder children inherit it.
+pub fn color_description_enabled() -> bool {
+    tunnel_core::env::flag("COLOR_DESCRIPTION", true)
 }
 
 /// FR-10 kill switch (2026-08-27): when on (default), CONSTRAINED sessions

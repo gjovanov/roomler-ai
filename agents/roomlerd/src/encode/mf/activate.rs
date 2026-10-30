@@ -300,6 +300,73 @@ pub(super) fn activate_and_probe_pipeline_for_codec(
     }
 }
 
+/// FR-130 P1 — TEST-ONLY: every pipeline this host opens for `codec`, one at
+/// a time and probed as the cascade probes them: each adapter × hardware MFT,
+/// then (H.264) Microsoft's software MFT on the default adapter — the
+/// cascade's winner and every candidate it would have fallen through to.
+/// Candidates are enumerated afresh per adapter (an `IMFActivate` is spent by
+/// its activation), and each pipeline ends before the next opens. `f` gets
+/// the MFT's friendly name (`CLSID_MSH264EncoderMFT` for the software
+/// fallback), the adapter and the pipeline. A candidate that does not open is
+/// printed, never an error: what opens here is the host's business.
+#[cfg(test)]
+pub(super) fn for_each_pipeline(
+    codec: OutputCodec,
+    width: u32,
+    height: u32,
+    mut f: impl FnMut(&str, &str, &mut MfPipeline),
+) {
+    for adapter in enumerate_adapters().unwrap_or_default() {
+        let Ok((device, manager)) = create_d3d11_device_on(&adapter.adapter) else {
+            eprintln!("FR-130: no D3D11 device on {}", adapter.description);
+            continue;
+        };
+        let candidates = match codec {
+            OutputCodec::H264 => enumerate_hw_h264_mfts(),
+            OutputCodec::Hevc => enumerate_hw_hevc_mfts(),
+            OutputCodec::Av1 => enumerate_hw_av1_mfts(),
+        }
+        .unwrap_or_default();
+        for candidate in &candidates {
+            match try_activate_and_probe(
+                candidate,
+                &device,
+                &manager,
+                width,
+                height,
+                codec,
+                adapter.luid,
+            ) {
+                Ok(mut pipeline) => {
+                    f(
+                        &candidate.friendly_name,
+                        &adapter.description,
+                        &mut pipeline,
+                    );
+                    let _ = pipeline.end_stream();
+                }
+                Err(e) => eprintln!(
+                    "FR-130: {} on {}: did not open ({e})",
+                    candidate.friendly_name, adapter.description
+                ),
+            }
+        }
+    }
+    if codec == OutputCodec::H264 {
+        match build_sw_fallback(width, height) {
+            Ok(mut pipeline) => {
+                f(
+                    "CLSID_MSH264EncoderMFT",
+                    "the default adapter",
+                    &mut pipeline,
+                );
+                let _ = pipeline.end_stream();
+            }
+            Err(e) => eprintln!("FR-130: CLSID_MSH264EncoderMFT did not open ({e})"),
+        }
+    }
+}
+
 /// Activate one HW candidate against a specific D3D11 device, build
 /// the full pipeline, and probe it. Any failure short-circuits to
 /// [`MfInitError`]; the caller's cascade handles the rollback.

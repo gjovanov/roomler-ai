@@ -1819,8 +1819,18 @@ fn video_features() -> Vec<String> {
     if crate::encode::fps_high_enabled() {
         features.extend(crate::encode::frame_rate::CAPS.map(str::to_string));
     }
+    // FR-130 P1 — this agent's encoders write the colour description they
+    // converted with (`color_desc`), so a viewer knows before it connects.
+    if crate::encode::color_description_enabled() {
+        features.push(COLOR_DESCRIBED.to_string());
+    }
     features
 }
+
+/// FR-130 P1 — the `AgentCaps.video` token for "every encoder that can carry a
+/// colour description writes `color_desc::DESCRIPTION`". Absent with
+/// `color_description` off and on every agent before P1.
+pub const COLOR_DESCRIBED: &str = "color-described";
 
 /// `run_hw_probes = false` computes everything that needs no driver call —
 /// which is exactly the honest answer when the probe child did not come back.
@@ -2967,6 +2977,24 @@ mod tests {
             !crate::encode::frame_rate::any_verb_in(&features),
             "a frame-rate verb advertised with the switch unset: {features:?}"
         );
+    }
+
+    /// FR-130 P1 — `color-described` rides the hello exactly while the
+    /// encoders write the description: by default, and not with
+    /// `color_description` off.
+    #[test]
+    fn color_described_follows_the_switch() {
+        use tunnel_core::env::test_env::{Saved, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _switch = Saved::cleared("COLOR_DESCRIPTION");
+        let has = || video_features().iter().any(|f| f == COLOR_DESCRIBED);
+        assert!(has(), "on by default");
+        // SAFETY: serialised by DENY_ENV_LOCK; the guard restores it.
+        unsafe { set("COLOR_DESCRIPTION", "0") };
+        assert!(!has(), "off with the switch off");
+        assert!(video_features().iter().any(|f| f == "chunk-framing"));
     }
 
     /// FR-84 D4 — the LocalAPI's read of the encoder matrix must never be

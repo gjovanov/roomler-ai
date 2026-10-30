@@ -131,9 +131,9 @@ shared successor of `macos_forward_triggers`, `:3334-3416`) as before. Linux ask
   `EROFS`. P2a adds `ReadWritePaths=-/var/tmp` (only the directory can be granted: a `ReadWritePaths` entry binds
   what exists when the sandbox is built, and the helper deletes the wake file each run). A daemon whose unit
   predates P2a logs the failure and names the cure; the push then waits for the helper's 6 h timer. CI guards
-  the grant in both sandbox cells. The system-unit cell (`ci.yml:838-863`) has the sandboxed unit write
+  the grant in both sandbox cells. The system-unit cell (`ci.yml:845-870`) has the sandboxed unit write
   `/var/tmp`, and a negative control (the same sandbox without the grant) must come back read-only. The
-  user-manager cell (Fedora's configuration, `ci.yml:917-921`) requires a read-write `/var/tmp` mount in the
+  user-manager cell (Fedora's configuration, `ci.yml:924-928`) requires a read-write `/var/tmp` mount in the
   daemon's namespace. Both directions were measured on systemd 255 before landing (§8).
 - **Decided at the start.** Enabling or disabling the helper takes effect at the daemon's next start — `install.sh`
   (P3) must refresh `roomler.service`, then `systemctl --user daemon-reload` and restart the per-user daemon after
@@ -149,7 +149,7 @@ A host without the helper (an install from before this FR) keeps today's path un
 ### 3.3 Onto the new binary (P2b, as built)
 
 The per-user daemon notices for itself (D2): `agents/roomlerd/src/replaced_binary.rs`, spawned beside the updater
-(`app.rs:5205-5212`) on a Linux, non-root daemon whose kill switch is unset and whose supervisor will relaunch it
+(`app.rs:5224-5231`) on a Linux, non-root daemon whose kill switch is unset and whose supervisor will relaunch it
 (`spawn`, `replaced_binary.rs:241-265`). ONE mechanism serves the helper's install, an admin's `apt upgrade` and a
 hand install alike, and the helper never speaks to a daemon.
 
@@ -243,7 +243,7 @@ at `:452` and `:461-469`):
   as a real install leaves it). It failed that row and restarted onto a binary that cannot run on the first cut,
   and passes all 14 cases on this one (§8).
 - **`roomlerd self-update`**, run by a non-root user on a host whose helper owns updates, wakes the helper instead
-  of failing (`app.rs:5849-5865`). It asks the daemon's own decision, `helper_owns_updates`
+  of failing (`app.rs:5868-5884`). It asks the daemon's own decision, `helper_owns_updates`
   (`updater.rs:4204-4212`), so the CLI and the daemon never disagree. Root keeps the direct path; `--check-only`
   touches nothing. On a daemon host `roomler self-update` already refuses and names `roomlerd self-update`.
 - **`README.Debian`**'s manual desktop flow enables the helper before the daemon starts, and says to leave it off

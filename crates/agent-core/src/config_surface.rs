@@ -1761,6 +1761,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-118 - keep a captured frame on the GPU until the encoder takes it, without a CPU copy, once the capability probe has proven that encoder's GPU-input form: the SystemContext DXGI capture's frames go to QSV (hevc_qsv, av1_qsv, h264_qsv), the WGC capture's to NVENC (hevc_nvenc, av1_nvenc, h264_nvenc), and on macOS the display stream's to VideoToolbox (hevc_videotoolbox, h264_videotoolbox). Built-in default: off. Env: ROOMLERD_ZERO_COPY. Restart required.",
     },
     KeyMeta {
+        key: "color_description",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-130 - every encoder writes the colour description it converted with (the BT.601 matrix at limited range) into its stream: the H.264/HEVC SPS VUI, the AV1 sequence header, the VP9 header. Without it a browser decodes an HD picture as BT.709 and shifts every saturated colour. Built-in default: on; off writes the undescribed stream of earlier agents. Env: ROOMLERD_COLOR_DESCRIPTION. Restart required.",
+    },
+    KeyMeta {
         key: "zero_copy_deny",
         group: Group::VideoEncoding,
         tier: Tier::Advanced,
@@ -2198,6 +2206,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "encoder_cells_deny" => cfg.encoder_cells_deny.clone(),
         "fps_deny" => cfg.fps_deny.clone(),
         "zero_copy" => cfg.zero_copy.map(fmt_bool),
+        "color_description" => cfg.color_description.map(fmt_bool),
         "zero_copy_deny" => cfg.zero_copy_deny.clone(),
         "nvenc_split" => cfg.nvenc_split.clone(),
         "vaapi_device" => cfg.vaapi_device.clone(),
@@ -2828,6 +2837,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "caps_cache" => cfg.caps_cache = parse_tribool(value)?,
         "fps_high" => cfg.fps_high = parse_tribool(value)?,
         "zero_copy" => cfg.zero_copy = parse_tribool(value)?,
+        "color_description" => cfg.color_description = parse_tribool(value)?,
         "vaapi_device" => {
             cfg.vaapi_device = value
                 .map(str::trim)
@@ -5393,6 +5403,48 @@ mod tests {
                 "{bad:?} must be refused"
             );
         }
+    }
+
+    /// FR-130 — `color_description` is a tribool that reaches the daemon (and
+    /// the probe and recorder children) as `ROOMLERD_COLOR_DESCRIPTION`: unset
+    /// publishes nothing (the built-in on), and the off that matters is
+    /// published as `0`.
+    #[test]
+    fn color_description_sets_echoes_clears_and_bridges() {
+        let mut cfg = crate::config::test_fixture();
+        let entry = entry_for(&cfg, "color_description").unwrap();
+        assert_eq!(entry.kind, "tribool");
+        assert!(
+            entry.restart_required,
+            "an encoder reads it at its open: a restart"
+        );
+        let bridged = |cfg: &crate::config::AgentConfig| {
+            crate::config::env_bridge_bools(cfg)
+                .iter()
+                .find(|(s, _)| *s == "COLOR_DESCRIPTION")
+                .map(|(_, v)| *v)
+        };
+        assert_eq!(bridged(&cfg), Some(None), "unset: bridged as nothing");
+        assert_eq!(current_value(&cfg, "color_description"), None);
+        apply(&mut cfg, "color_description", Some("off")).unwrap();
+        assert_eq!(cfg.color_description, Some(false));
+        assert_eq!(bridged(&cfg), Some(Some(false)));
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("COLOR_DESCRIPTION")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            entry_for(&cfg, "color_description")
+                .unwrap()
+                .value
+                .as_deref(),
+            current_value(&cfg, "color_description").as_deref()
+        );
+        apply(&mut cfg, "color_description", None).unwrap();
+        assert_eq!(cfg.color_description, None);
+        assert!(apply(&mut cfg, "color_description", Some("maybe")).is_err());
     }
 
     /// The chroma column keys ride the numeric bridge like the codec factors.

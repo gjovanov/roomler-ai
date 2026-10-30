@@ -442,6 +442,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         encoder_cells_deny: None,
         fps_deny: None,
         zero_copy: None,
+        color_description: None,
         zero_copy_deny: None,
         nvenc_split: None,
         vaapi_device: None,

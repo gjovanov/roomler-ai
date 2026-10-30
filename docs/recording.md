@@ -1138,7 +1138,7 @@ sequenceDiagram
   for the new console user and stops the old worker's process group, recorder
   included. The partial is finalized as `interrupted` the next time that
   person records (the recorder reconciles its staging folder as it starts,
-  `child.rs:408-416`); a recording never follows a user switch.
+  `child.rs:423-431`); a recording never follows a user switch.
 - **Both audio sources on a supervised Mac.** Computer audio since FR-97 P2a
   (ScreenCaptureKit, in the worker's session: the worker advertises
   `remote-audio` while the owner allows it, as any host does). The microphone

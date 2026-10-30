@@ -1774,6 +1774,16 @@ impl FfmpegEncoder {
             encoder_options(name, maxrate_bps, cq, qsv_low_power, chroma444, constrained);
         // FR-119 P2b-10 — empty except on NVENC HEVC / AV1 above 60 fps.
         let throughput = throughput_options(name, fps, NvencSplit::from_env());
+        // FR-130 P1 — what the bitstream says about the YUV, read once per open
+        // (`None` with `color_description` off: the context's fields stay
+        // unspecified, today's stream exactly). None on the VP9 names: FFmpeg
+        // 9.0.1 writes no VP9 description for QSV or VAAPI, so setting one
+        // would only buy an absent `vp9_qsv` the refusal fallback's extra open.
+        let colour = if name.starts_with("vp9_") {
+            None
+        } else {
+            crate::encode::color_desc::active().map(crate::encode::color_desc::ffmpeg)
+        };
 
         // FR-77 P4 / FR-78 P1 — a `*_vaapi` / `*_d3d12va` / `*_vulkan`
         // encoder takes HARDWARE frames from a pool on one of the kind's
@@ -1807,7 +1817,9 @@ impl FfmpegEncoder {
             // OPENED encoder this fn returns). `open_as*` converts unopened →
             // opened. The closure must therefore declare the unopened type;
             // annotating it as the opened type was the rc.86 CI E0308.
-            let configure = || -> Result<ffmpeg_next::encoder::video::Video> {
+            let configure = |colour: Option<crate::encode::color_desc::FfmpegFields>| -> Result<
+                ffmpeg_next::encoder::video::Video,
+            > {
                 let ctx = codec::Context::new_with_codec(codec);
                 let mut enc = ctx.encoder().video().context("encoder().video() failed")?;
                 enc.set_width(width);
@@ -1886,6 +1898,22 @@ impl FfmpegEncoder {
                 };
                 enc.set_gop(gop as u32);
                 enc.set_max_b_frames(0); // low-latency: no B-frames
+                // FR-130 P1 — the colour description, on the context before the
+                // open: no backend reads a frame's colour fields, and
+                // `avcodec_open2` neither checks nor changes these. One place for
+                // every cell, rebuild, probe, recording and GPU form. NVENC, QSV,
+                // AMF and VideoToolbox hand them to their runtime; VAAPI, D3D12
+                // and Vulkan write them into the headers FFmpeg builds. VideoToolbox's
+                // GPU form keeps its attached BT.601 matrix (`vt_input`): that
+                // fixes the CONVERSION, this is the signalling. `vp9_qsv` and
+                // `vp9_vaapi` carry no description in FFmpeg 9.0.1 (`qsvenc.c`
+                // attaches no signal info to VP9; the VAAPI VP9 writer has none).
+                if let Some(c) = colour {
+                    enc.set_colorspace(c.space);
+                    enc.set_color_range(c.range);
+                    enc.set_color_primaries(c.primaries);
+                    enc.set_color_transfer_characteristic(c.transfer);
+                }
                 Ok(enc)
             };
 
@@ -1900,89 +1928,115 @@ impl FfmpegEncoder {
             //      was rejected — a full revert to defaults would lose
             //      `forced-idr` → the NVENC black-screen IDR bug),
             //   3. plain defaults (blurry-but-working beats a black screen).
-            let opened = 'open: {
-                if !throughput.is_empty() {
-                    let mut full = dict_from_pairs(&base);
-                    for (k, v) in lowlat.iter().chain(throughput.iter()) {
-                        full.set(k.as_str(), v.as_str());
+            let ladder = |colour| -> Result<codec::encoder::Video> {
+                let opened = 'open: {
+                    if !throughput.is_empty() {
+                        let mut full = dict_from_pairs(&base);
+                        for (k, v) in lowlat.iter().chain(throughput.iter()) {
+                            full.set(k.as_str(), v.as_str());
+                        }
+                        let throughput_summary = throughput
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let enc = configure(colour)?;
+                        match enc.open_as_with(codec, full) {
+                            Ok(encoder) => {
+                                tracing::info!(
+                                    encoder = name,
+                                    options = %format!("{opt_summary} {throughput_summary}"),
+                                    "ffmpeg encoder opened with throughput + quality + low-latency options"
+                                );
+                                break 'open encoder;
+                            }
+                            Err(open_err) => {
+                                tracing::warn!(
+                                    encoder = name,
+                                    %open_err,
+                                    rejected = throughput_summary,
+                                    "ffmpeg open rejected the throughput knobs — retrying without them"
+                                );
+                            }
+                        }
                     }
-                    let throughput_summary = throughput
+                    if !lowlat.is_empty() {
+                        let mut full = dict_from_pairs(&base);
+                        for (k, v) in &lowlat {
+                            full.set(k.as_str(), v.as_str());
+                        }
+                        let enc = configure(colour)?;
+                        match enc.open_as_with(codec, full) {
+                            Ok(encoder) => {
+                                tracing::info!(
+                                    encoder = name,
+                                    options = opt_summary,
+                                    "ffmpeg encoder opened with quality + low-latency options"
+                                );
+                                break 'open encoder;
+                            }
+                            Err(open_err) => {
+                                tracing::warn!(
+                                    encoder = name,
+                                    %open_err,
+                                    "ffmpeg open rejected the low-latency knobs — retrying with quality options only"
+                                );
+                            }
+                        }
+                    }
+
+                    let base_summary = base
                         .iter()
                         .map(|(k, v)| format!("{k}={v}"))
                         .collect::<Vec<_>>()
                         .join(" ");
-                    let enc = configure()?;
-                    match enc.open_as_with(codec, full) {
+                    let enc = configure(colour)?;
+                    match enc.open_as_with(codec, dict_from_pairs(&base)) {
                         Ok(encoder) => {
                             tracing::info!(
                                 encoder = name,
-                                options = %format!("{opt_summary} {throughput_summary}"),
-                                "ffmpeg encoder opened with throughput + quality + low-latency options"
+                                options = base_summary,
+                                "ffmpeg encoder opened with quality options"
                             );
-                            break 'open encoder;
+                            encoder
                         }
                         Err(open_err) => {
                             tracing::warn!(
                                 encoder = name,
                                 %open_err,
-                                rejected = throughput_summary,
-                                "ffmpeg open rejected the throughput knobs — retrying without them"
+                                attempted_options = base_summary,
+                                "ffmpeg open_as_with rejected the quality options — retrying with encoder defaults"
                             );
+                            let enc2 = configure(colour)?;
+                            enc2.open_as(codec)
+                                .with_context(|| format!("open_as({}) fallback failed", name))?
                         }
                     }
+                };
+                Ok(opened)
+            };
+            let opened = match ladder(colour) {
+                Ok(encoder) => encoder,
+                // FR-130 P1 — a vendor runtime takes the description into
+                // closed code (QSV's on Windows, the NVIDIA driver, AMF,
+                // VideoToolbox), and QSV only attaches its signal-info buffer
+                // once a description exists. A runtime that refused it must not
+                // cost the host this encoder: one plain open without it tells
+                // that apart from an encoder that does not open here at all
+                // (which pays this one extra attempt), and the refusal opens
+                // undescribed, as before FR-130, with a warning.
+                Err(e) if colour.is_some() && colour_goes_to_a_vendor_runtime(name) => {
+                    if configure(None)?.open_as(codec).is_err() {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        encoder = name,
+                        error = %e,
+                        "FR-130: the encoder refused the colour description — opening it without one"
+                    );
+                    ladder(None)?
                 }
-                if !lowlat.is_empty() {
-                    let mut full = dict_from_pairs(&base);
-                    for (k, v) in &lowlat {
-                        full.set(k.as_str(), v.as_str());
-                    }
-                    let enc = configure()?;
-                    match enc.open_as_with(codec, full) {
-                        Ok(encoder) => {
-                            tracing::info!(
-                                encoder = name,
-                                options = opt_summary,
-                                "ffmpeg encoder opened with quality + low-latency options"
-                            );
-                            break 'open encoder;
-                        }
-                        Err(open_err) => {
-                            tracing::warn!(
-                                encoder = name,
-                                %open_err,
-                                "ffmpeg open rejected the low-latency knobs — retrying with quality options only"
-                            );
-                        }
-                    }
-                }
-
-                let base_summary = base
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let enc = configure()?;
-                match enc.open_as_with(codec, dict_from_pairs(&base)) {
-                    Ok(encoder) => {
-                        tracing::info!(
-                            encoder = name,
-                            options = base_summary,
-                            "ffmpeg encoder opened with quality options"
-                        );
-                        encoder
-                    }
-                    Err(open_err) => {
-                        tracing::warn!(
-                            encoder = name,
-                            %open_err,
-                            attempted_options = base_summary,
-                            "ffmpeg open_as_with rejected the quality options — retrying with encoder defaults"
-                        );
-                        let enc2 = configure()?;
-                        enc2.open_as(codec)
-                            .with_context(|| format!("open_as({}) fallback failed", name))?
-                    }
-                }
+                Err(e) => return Err(e),
             };
             Ok((opened, hw_frames))
         };
@@ -3114,6 +3168,15 @@ impl Drop for FfmpegEncoder {
         let _ = self.encoder.send_eof();
         let _ = self.drain_packets();
     }
+}
+
+/// FR-130 P1 — backends whose runtime, closed code, receives the colour
+/// description and writes the header itself (NVENC, QSV, AMF, VideoToolbox).
+/// VAAPI, D3D12 and Vulkan get headers FFmpeg writes, which cannot refuse it.
+fn colour_goes_to_a_vendor_runtime(name: &str) -> bool {
+    ["_nvenc", "_qsv", "_amf", "_videotoolbox"]
+        .iter()
+        .any(|backend| name.ends_with(backend))
 }
 
 /// FR-77 P3b — the pixel format a backend takes for 4:4:4. NVENC (and the
@@ -4296,5 +4359,283 @@ mod tests {
             pct(90),
             pct(99),
         );
+    }
+}
+
+/// FR-130 P1 — what each FFmpeg encoder on this host writes about colour, read
+/// from its own output.
+#[cfg(test)]
+mod colour_tests {
+    use super::*;
+    use crate::encode::bitstream_color::{self, Field, Signalled, Vocabulary};
+    use crate::encode::color_desc::DESCRIPTION;
+    use tunnel_core::env::test_env::{Saved, set};
+
+    /// Six frames of the bars, a keyframe forced halfway.
+    fn encode(enc: &mut FfmpegEncoder, w: u32, h: u32) -> Result<Vec<EncodedPacket>, String> {
+        let mut out = Vec::new();
+        for i in 0..6u64 {
+            if i == 3 {
+                enc.request_keyframe();
+            }
+            out.extend(
+                enc.encode_sync(&bitstream_color::bars(w, h, i))
+                    .map_err(|e| format!("encode: {e:#}"))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// The opened context's extradata (empty without global headers; AV1's is
+    /// an `av1C` record whose config OBUs follow its four-byte head).
+    fn extradata(enc: &FfmpegEncoder) -> Vec<u8> {
+        // SAFETY: read-only field reads of the opened context, which `enc`
+        // owns for the duration of the borrow.
+        let raw = unsafe {
+            let ctx = enc.encoder.as_ptr();
+            let (data, size) = ((*ctx).extradata, (*ctx).extradata_size);
+            if data.is_null() || size <= 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(data, size as usize).to_vec()
+            }
+        };
+        if enc.encoder_name.starts_with("av1_") && raw.first() == Some(&0x81) {
+            raw.get(4..).unwrap_or(&[]).to_vec()
+        } else {
+            raw
+        }
+    }
+
+    /// The description `name`'s output carries: in the packets, else in the
+    /// extradata.
+    fn read(
+        name: &str,
+        enc: &FfmpegEncoder,
+        packets: &[EncodedPacket],
+    ) -> Result<(Signalled, &'static str), String> {
+        let parse = |bytes: &[u8]| {
+            if name.starts_with("h264_") {
+                bitstream_color::h264(bytes)
+            } else if name.starts_with("hevc_") {
+                bitstream_color::hevc(bytes)
+            } else {
+                bitstream_color::av1(bytes)
+            }
+        };
+        let stream: Vec<u8> = packets
+            .iter()
+            .flat_map(|p| p.data.iter().copied())
+            .collect();
+        match parse(&stream) {
+            Ok(s) => Ok((s, "in band")),
+            Err(in_band) => parse(&extradata(enc))
+                .map(|s| (s, "extradata"))
+                .map_err(|e| format!("in band: {in_band}; extradata: {e}")),
+        }
+    }
+
+    /// The fields a vendor runtime is MEASURED not to write as it was given,
+    /// per backend, with the evidence. The test holds every other field, and
+    /// fails when one of these starts saying the description (the gap closed:
+    /// delete its entry) as much as when another field stops.
+    const RUNTIME_GAPS: &[(&str, &[Field], &str)] = &[(
+        "h264_amf",
+        &[Field::Matrix],
+        "AMD's H.264 runtime writes matrix_coefficients 2 (unspecified) for the 601 colour \
+         profile FFmpeg hands it (`av_amf_get_color_profile`); its HEVC writes 5. Primaries \
+         and transfer arrive as given. Radeon 610M on neo16, 2026-10-30",
+    )];
+
+    /// How `name`'s API names the description.
+    fn vocabulary(name: &str) -> Vocabulary {
+        if name.ends_with("_amf") {
+            Vocabulary::AmfProfile
+        } else if name.ends_with("_videotoolbox") {
+            Vocabulary::Merged
+        } else {
+            Vocabulary::CodePoints
+        }
+    }
+
+    /// Whether `name`'s runtime describes a stream it is told nothing about:
+    /// AMF's "auto by size" writes BT.709 for an HD picture (measured on
+    /// neo16), so its switch-off stream is described, wrongly, rather than
+    /// unspecified.
+    fn describes_by_default(name: &str) -> bool {
+        name.ends_with("_amf")
+    }
+
+    /// Every H.264, HEVC and AV1 cell this host opens (4:2:0, and 4:4:4 where
+    /// the matrix has the cell) writes `color_desc::DESCRIPTION` with the
+    /// switch on, in its API's vocabulary and minus the measured
+    /// [`RUNTIME_GAPS`], and nothing of it with the switch off: no
+    /// description, or for a runtime that [`describes_by_default`], its own
+    /// default, which is not ours and not what the switch on wrote. A cell
+    /// that does not open here is printed and skipped (on a CI runner, every
+    /// one); one that opens with the description and not without it fails.
+    /// `vp9_qsv` and `vp9_vaapi` cannot carry a description in FFmpeg 9.0.1,
+    /// so their header is printed, not judged: the viewer's override is their
+    /// lever.
+    #[test]
+    fn every_ffmpeg_encoder_here_describes_its_colour() {
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _switch = Saved::cleared("COLOR_DESCRIPTION");
+        if ffmpeg_next::init().is_err() {
+            eprintln!("FR-130 FFmpeg: no FFmpeg here — nothing to read");
+            return;
+        }
+        let (w, h) = (1280u32, 720u32);
+        let mut read_cells = Vec::new();
+        let mut failures = Vec::new();
+        let names = H264_ENCODER_NAMES
+            .iter()
+            .chain(HEVC_ENCODER_NAMES)
+            .chain(AV1_ENCODER_NAMES)
+            .chain(VP9_ENCODER_NAMES);
+        for &name in names {
+            let chromas: &[bool] = if crate::encode::cells::FFMPEG_444_CAPABLE.contains(&name) {
+                &[false, true]
+            } else {
+                &[false]
+            };
+            for &chroma444 in chromas {
+                let cell = format!("{name}:{}", if chroma444 { "yuv444" } else { "yuv420" });
+                let mut with_switch_on: Option<Signalled> = None;
+                for on in [true, false] {
+                    // SAFETY: serialised by DENY_ENV_LOCK; the guard restores it.
+                    unsafe { set("COLOR_DESCRIPTION", if on { "1" } else { "0" }) };
+                    let switch = if on { "on" } else { "off" };
+                    let started = std::time::Instant::now();
+                    let opened = FfmpegEncoder::new_named_probe(name, w, h, chroma444);
+                    let open_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    let mut enc = match opened {
+                        Ok(e) => e,
+                        Err(e) => {
+                            eprintln!(
+                                "FR-130 FFmpeg {cell}, switch {switch}: does not open here in \
+                                 {open_ms:.1} ms ({e:#})"
+                            );
+                            if !on {
+                                failures.push(format!(
+                                    "{cell}: opens with the description and not without it"
+                                ));
+                                continue;
+                            }
+                            // Absent here, or refused the description? Without
+                            // it, an absent encoder fails again; the gap
+                            // between the two timings is what the refusal
+                            // fallback costs an absent vendor backend.
+                            // SAFETY: as above.
+                            unsafe { set("COLOR_DESCRIPTION", "0") };
+                            let started = std::time::Instant::now();
+                            let plain = FfmpegEncoder::new_named_probe(name, w, h, chroma444);
+                            let plain_ms = started.elapsed().as_secs_f64() * 1000.0;
+                            eprintln!(
+                                "FR-130 FFmpeg {cell}: without the description, {} in \
+                                 {plain_ms:.1} ms",
+                                if plain.is_ok() {
+                                    "OPENS"
+                                } else {
+                                    "does not open either"
+                                }
+                            );
+                            if plain.is_ok() {
+                                failures.push(format!(
+                                    "{cell}: the description stops it opening ({e:#})"
+                                ));
+                            }
+                            break;
+                        }
+                    };
+                    eprintln!("FR-130 FFmpeg {cell}, switch {switch}: opened in {open_ms:.1} ms");
+                    let packets = match encode(&mut enc, w, h) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            failures.push(format!("{cell}, switch {switch}: {e}"));
+                            continue;
+                        }
+                    };
+                    if name.starts_with("vp9_") {
+                        let header = packets
+                            .iter()
+                            .find(|p| p.is_keyframe)
+                            .map(|p| bitstream_color::vp9_keyframe(&p.data));
+                        eprintln!("FR-130 FFmpeg {cell}, switch {switch}: {header:?} (not judged)");
+                        continue;
+                    }
+                    let vocabulary = vocabulary(name);
+                    let verdict = read(name, &enc, &packets).and_then(|(s, place)| {
+                        eprintln!("FR-130 FFmpeg {cell}, switch {switch}: {s:?} ({place})");
+                        if on {
+                            with_switch_on = Some(s);
+                            let gap = RUNTIME_GAPS.iter().find(|(n, _, _)| *n == name);
+                            let gaps = gap.map_or(&[][..], |(_, fields, _)| *fields);
+                            let wrong = s.mismatches(DESCRIPTION, vocabulary);
+                            return if wrong == gaps {
+                                if let Some((_, fields, evidence)) = gap {
+                                    eprintln!(
+                                        "FR-130 FFmpeg {cell}: measured gap {fields:?}: {evidence}"
+                                    );
+                                }
+                                Ok(())
+                            } else {
+                                Err(format!(
+                                    "{s:?}: {wrong:?} do not say the description \
+                                     (measured gaps: {gaps:?})"
+                                ))
+                            };
+                        }
+                        if describes_by_default(name) {
+                            let ours = s.mismatches(DESCRIPTION, vocabulary).is_empty();
+                            return if !ours && with_switch_on != Some(s) {
+                                Ok(())
+                            } else {
+                                Err(format!("the switch off changed nothing: {s:?}"))
+                            };
+                        }
+                        if s.unspecified() {
+                            Ok(())
+                        } else {
+                            Err(format!("a description with the switch off: {s:?}"))
+                        }
+                    });
+                    match verdict {
+                        Ok(()) => read_cells.push(format!("{cell}/{switch}")),
+                        Err(e) => failures.push(format!("{cell}, switch {switch}: {e}")),
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "FR-130 FFmpeg: {} reads passed: {read_cells:?}",
+            read_cells.len()
+        );
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// The refusal fallback (`colour_goes_to_a_vendor_runtime`) knows every
+    /// backend the cascades carry: a vendor runtime gets it, a header FFmpeg
+    /// writes does not need it. A new backend must be classed here.
+    #[test]
+    fn every_cascade_backend_is_classed_for_the_refusal_fallback() {
+        let vendor = ["_nvenc", "_qsv", "_amf", "_videotoolbox"];
+        let written_by_ffmpeg = ["_vaapi", "_d3d12va", "_vulkan"];
+        let names = H264_ENCODER_NAMES
+            .iter()
+            .chain(HEVC_ENCODER_NAMES)
+            .chain(AV1_ENCODER_NAMES)
+            .chain(VP9_ENCODER_NAMES);
+        for &name in names {
+            let by_vendor = vendor.iter().any(|b| name.ends_with(b));
+            let by_ffmpeg = written_by_ffmpeg.iter().any(|b| name.ends_with(b));
+            assert!(
+                by_vendor ^ by_ffmpeg,
+                "{name}: a backend this test does not know — class its colour path"
+            );
+            assert_eq!(colour_goes_to_a_vendor_runtime(name), by_vendor, "{name}");
+        }
     }
 }

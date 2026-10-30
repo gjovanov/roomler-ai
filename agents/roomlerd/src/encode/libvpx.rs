@@ -422,14 +422,35 @@ impl Vp9Encoder {
             0 as c_uint,
             "VP9E_SET_NOISE_SENSITIVITY",
         );
+        // FR-130 P1 — the header's colour space and range, for 4:2:0 and 4:4:4
+        // alike. libvpx writes them from these two controls ONLY: `img.cs` /
+        // `img.range` in `encode_sync` never reach the bitstream (libvpx
+        // 1.12 `vp9_cx_iface.c:1876-1888`, `vp9_bitstream.c:1184-1187`), so
+        // until FR-130 every VP9 keyframe said CS_UNKNOWN. Unset (the switch
+        // off) leaves libvpx's defaults, CS_UNKNOWN at studio range: today's
+        // header exactly. VP9 has no primaries or transfer field.
+        if let Some(d) = crate::encode::color_desc::active() {
+            let c = crate::encode::color_desc::vp9(d);
+            self.set_ctrl(
+                vpx::vp8e_enc_control_id::VP9E_SET_COLOR_SPACE as c_int,
+                c.color_space,
+                "VP9E_SET_COLOR_SPACE",
+            );
+            self.set_ctrl(
+                vpx::vp8e_enc_control_id::VP9E_SET_COLOR_RANGE as c_int,
+                c.color_range,
+                "VP9E_SET_COLOR_RANGE",
+            );
+        }
     }
 
     fn set_ctrl<T: Copy>(&mut self, id: c_int, value: T, name: &'static str) {
         // SAFETY: libvpx's variadic control ABI accepts an int-sized
         // argument for every VP9 control we touch (cpuused, tune,
         // aq_mode, tile_columns, frame_parallel, static_threshold,
-        // noise_sensitivity). We only ever pass `c_int` or `c_uint`,
-        // both of which are int-width on every supported target.
+        // noise_sensitivity, color_space, color_range). We only ever pass
+        // `c_int` or `c_uint`, both of which are int-width on every
+        // supported target.
         let err = unsafe { vpx::vpx_codec_control_(&mut self.ctx, id, value) };
         if err != vpx::VPX_CODEC_OK {
             tracing::warn!(
@@ -626,6 +647,8 @@ impl Vp9Encoder {
             ),
         };
         img.fmt = img_fmt;
+        // Never reaches the bitstream: the header's colour comes from the
+        // FR-130 controls in `apply_screen_content_controls`.
         img.cs = vpx::vpx_color_space::VPX_CS_BT_601;
         img.range = vpx::vpx_color_range::VPX_CR_STUDIO_RANGE;
         img.w = self.width as c_uint;
@@ -993,6 +1016,45 @@ mod tests {
     fn rejects_odd_dims() {
         assert!(Vp9Encoder::new(321, 240).is_err());
         assert!(Vp9Encoder::new(320, 241).is_err());
+    }
+
+    /// FR-130 P1 — both VP9 forms' keyframe headers carry
+    /// `color_desc::vp9(DESCRIPTION)` with the switch on, and libvpx's
+    /// defaults (CS_UNKNOWN at studio range: today's header) with it off.
+    /// `img.cs` is set either way, which is why the off case reads unknown.
+    #[test]
+    fn both_vp9_forms_describe_their_colour() {
+        use crate::encode::bitstream_color::{bars, vp9_keyframe};
+        use crate::encode::color_desc::{DESCRIPTION, vp9};
+        use tunnel_core::env::test_env::{Saved, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _switch = Saved::cleared("COLOR_DESCRIPTION");
+        let want = vp9(DESCRIPTION);
+        for chroma in [Vp9Chroma::Yuv420, Vp9Chroma::Yuv444] {
+            for on in [true, false] {
+                // SAFETY: serialised by DENY_ENV_LOCK; the guard restores it.
+                unsafe { set("COLOR_DESCRIPTION", if on { "1" } else { "0" }) };
+                let mut enc = Vp9Encoder::new_with_fps_chroma(320, 240, 30, chroma).expect("init");
+                let packets = enc.encode_sync(&bars(320, 240, 0)).expect("encode");
+                let key = packets.iter().find(|p| p.is_keyframe).expect("a keyframe");
+                let header = vp9_keyframe(&key.data).expect("a keyframe header");
+                eprintln!("FR-130 libvpx {}, switch {on}: {header:?}", chroma.as_str());
+                assert_eq!(u32::from(header.profile), chroma.vpx_profile());
+                if on {
+                    assert_eq!(
+                        i32::from(header.color_space),
+                        want.color_space,
+                        "{chroma:?}"
+                    );
+                    assert_eq!(i32::from(header.full_range), want.color_range, "{chroma:?}");
+                } else {
+                    assert_eq!(header.color_space, 0, "{chroma:?}: CS_UNKNOWN");
+                    assert!(!header.full_range, "{chroma:?}: studio range");
+                }
+            }
+        }
     }
 
     /// A padded source must convert to the same picture as a tight one.
