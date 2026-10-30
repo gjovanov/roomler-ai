@@ -2017,7 +2017,7 @@ async fn daemon_main() -> Result<()> {
         Command::Media { action } => match action {
             MediaAction::Probe { file } => roomlerd::recording::media::probe(&file),
             MediaAction::Export { edl, encoder } => {
-                roomlerd::recording::media::export(&edl, &encoder).await
+                roomlerd::recording::media::export(&edl, &encoder, &config_path).await
             }
         },
         Command::CaptureSmoke {
