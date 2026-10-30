@@ -1,7 +1,8 @@
 # FR-131: Hub — one coordinator session runs the backlog through parallel worker sessions (`/hub` skill + hub view)
 
-**Status: P1 shipped 2026-10-30. P2 (the hub view mod) in progress.** P1 is the skill, the worker protocol and
-the helper, with the mechanics measured live. P3 (the first real backlog run) and P4 (the docs) are pending.
+**Status: P1 and P2 shipped 2026-10-30. P3 (the first real backlog run) in progress. P4 (the docs) in review.**
+P1 is the skill, the worker protocol and the helper, with the mechanics measured live. P2 is the hub view mod,
+`hub-view` 0.2.0. The engineering doc is [`docs/agent-hub.md`](../agent-hub.md).
 
 ## Problem / Goal
 
@@ -41,7 +42,7 @@ flowchart LR
 | Worker protocol | `~/.claude/skills/hub/worker.md` | Start (orient on the surface, plan, report), the loop, the message verbs both ways (their single definition), questions, handoff, park, sub-hub, and the `status.json` schema. |
 | Templates | `~/.claude/skills/hub/templates.md` | The hub issue, the brief, the worker's progress comment, and the FR, task and sub-issue shapes. |
 | Helper | `~/.claude/skills/hub/hub.mjs` | No dependencies. `init`, `add`, `spawn` (including `--rotate [--from-status]`), `stop`, `respawn`, `msg`, `status` (the board plus recommendations), `sync` (reading the hub issue's controls and queue) and `attach`. |
-| Hub view mod (P2) | a function-hooks plugin | `/hub` with no arguments lists every worker of every hub, active and inactive, with total, done and in-progress task counts. A worker can be entered (its task list and its whole conversation), answered, activated or deactivated, and left again for the hub view. |
+| Hub view mod (P2) | `~/.claude/skills/hub-view/`, a function-hooks plugin (`hub-view` 0.2.0) | `/hub` with no arguments lists every worker of every hub, active and inactive, with total, done and in-progress task counts. A worker can be entered (its task list and its whole conversation), answered, activated or deactivated, and left again for the hub view. |
 | State | `~/.claude/hub/<id>/` | `state.json` (the registry, written only by the hub), `status.json`, `board.md` and `board.txt` (generated), `events.log`, and `workers/<W>/` (the brief, `status.json` written by the worker, and the handoffs). |
 
 ## Evidence — the mechanics the design rests on
@@ -65,9 +66,9 @@ removed afterwards.
 |---|---|---|---|
 | P1 | Skill, worker protocol, templates and helper. Mechanics measured with five throwaway workers. An independent review found 12 defects, all fixed and retested. | shipped 2026-10-30 | Don't invoke `/hub`; delete `~/.claude/skills/hub/`. |
 | P1b | Claude Code 2.1.280 → 2.1.314, so that Sonnet 5.5 is first-class | done 2026-10-30 | Rename the kept 2.1.280 binary back. |
-| P2 | Hub view mod: list, counts, enter (tasks and conversation), answer, activate and deactivate, back | in progress | Remove the plugin's folder. |
-| P3 | First real backlog run, at least two workers in parallel on real FRs | pending | ⏸ Pause in the hub issue. |
-| P4 | Docs: `docs/agent-hub.md` in house style, plus a `docs/README.md` row | pending | — |
+| P2 | Hub view mod: list, counts, enter (tasks and conversation), answer, activate and deactivate, back. `hub-view` 0.2.0, 35 tests, shown live on 2.1.314 ([Step log](https://github.com/gjovanov/roomler-ai/issues/3127#issuecomment-6515103295)). | shipped 2026-10-30 | Remove the plugin's folder. |
+| P3 | First real backlog run, at least two workers in parallel on real FRs | in progress 2026-10-30 | ⏸ Pause in the hub issue. |
+| P4 | Docs: `docs/agent-hub.md` in house style, plus a `docs/README.md` row | in review, PR #3144 | Revert the PR; the tooling does not read the doc. |
 
 ## Acceptance criteria
 
@@ -83,26 +84,52 @@ removed afterwards.
   replayed.
 - [x] **AC5 — signals.** On real transcripts, `LIMIT` fires on a real limit hit and quotes its reset, a
   "No response requested." reply raises nothing, and a model switch is flagged as drift.
-- [ ] **AC6 — hub view.** `/hub` with no arguments lists every worker of every hub, active and inactive,
-  each with total, done and in-progress task counts that match its `status.json` plan.
-- [ ] **AC7 — enter.** Entering a worker shows its task list and its whole conversation, scrollable, and
-  "back" returns to the hub view.
-- [ ] **AC8 — answer.** An answer typed in the view reaches the worker, and the worker continues with it,
-  as shown in its transcript.
-- [ ] **AC9 — activate and deactivate.** `respawn` and `stop` work from the view, and the hub's state
-  follows.
+- [x] **AC6 — hub view.** `/hub` with no arguments lists every worker of every hub, active and inactive,
+  each with total, done and in-progress task counts that match its `status.json` plan. Evidence: shown
+  live on 2.1.314 on 2026-10-30, with no model turn. Both hubs were listed, and each worker's counts
+  equalled its `status.json` plan: 12 · 9 · 1 · 2, 3 · 1 · 1 · 1 and 4 · 1 · 1 · 2
+  ([Step log](https://github.com/gjovanov/roomler-ai/issues/3127#issuecomment-6515103295)).
+- [x] **AC7 — enter.** Entering a worker shows its task list and its whole conversation, scrollable, and
+  "back" returns to the hub view. Evidence: shown live, including a multi-megabyte conversation paged
+  from its end with `⇡ Older` above it, and the first generation opened read-only. Back, Esc and Older
+  are key presses, which UI tests on both terminal and desktop exercise
+  ([Step log](https://github.com/gjovanov/roomler-ai/issues/3127#issuecomment-6515103295)).
+- [x] **AC8 — answer.** An answer typed in the view reaches the worker, and the worker continues with it,
+  as shown in its transcript. Evidence: `/hub-view answer` read `✔ received · route a`, and the worker's
+  transcript shows the answer arrive from the view, then the worker mark q1 answered and reply
+  `applied: ANSWER q1: …`
+  ([Step log](https://github.com/gjovanov/roomler-ai/issues/3127#issuecomment-6515103295)).
+- [x] **AC9 — activate and deactivate.** `respawn` and `stop` work from the view, and the hub's state
+  follows. Evidence: a deactivate left `state.json` at `paused` with the stop stamped, and an activate
+  respawned the same job, not a fork, with `state.json` back at `running` and the RESUME acknowledged
+  ([Step log](https://github.com/gjovanov/roomler-ai/issues/3127#issuecomment-6515103295)).
 - [ ] **AC10 — real run.** At least two workers in parallel each park one phase of a real FR with PRs the
   hub has verified. The board and the hub issue track them, and at least one rotation happens on a
   context or cache signal.
-- [ ] **AC11 — docs.** `docs/agent-hub.md` in house style (mermaid, tables) and a `docs/README.md` row.
+- [x] **AC11 — docs.** `docs/agent-hub.md` in house style (mermaid, tables) and a `docs/README.md` row.
+  Evidence: [`docs/agent-hub.md`](../agent-hub.md), with four mermaid diagrams (the hub and its spokes,
+  the tick loop, a worker's states, the message sequence) and tables for the pieces, state, verbs,
+  signals, tiers, rotation, the view and the traps; and its row in [`docs/README.md`](../README.md),
+  under 🧭 How the work is run, in the table and the map (PR #3144).
 
 ## Open decisions
 
+All three were resolved on 2026-10-30.
+
 - **The command.** `/hub` with no arguments opens the view; `/hub <args>` stays with the skill.
+  **Resolved 2026-10-30, as written.** P2 built it that way, and `/hub tick <id>` still reached the
+  skill in the live check.
 - **The answer route.** If the function-hooks API can send a cross-session message, the view sends the
-  answer directly. Otherwise it relays through the hub session (`W-n: <answer>`).
+  answer directly. Otherwise it relays through the hub session (`W-n: <answer>`). **Resolved
+  2026-10-30 by this rule: directly.** P2 found that the API has a cross-session send
+  (`$.session.send`), so the view sends the answer to the worker itself (route a). The relay through
+  the hub (route b) is used only when the view runs in the hub session and its permission mode
+  differs from the worker's; otherwise the view copies the attach command and sends nothing (route c).
+  The hub recorded the resolution in the issue the same day.
 - **Where the tooling lives.** The skill and the mod could move into this repo (tracked, like `autopilot`)
-  or into a repo of their own (like Cache Keeper).
+  or into a repo of their own (like Cache Keeper). **Decided 2026-10-30 by the operator: it stays
+  local for now.** The skill and the view live in the user's Claude skills folder, each with a local
+  source history; neither is in this repo.
 
 ## Out of scope
 
@@ -122,3 +149,21 @@ removed afterwards.
 - **2026-10-30 — P1b.** 2.1.314 was staged in a separate folder, probed (Sonnet 5.5 served, a 1M window,
   list pricing, `sonnet` resolving to it), and the operator's mods' suites passed on it. The global binary
   was then swapped by rename, so the running sessions stayed on 2.1.280.
+- **2026-10-30 — P2.** One worker built `hub-view` 0.2.0 across three generations, under the first hub.
+  g1 handed off to g2 at 35% context, after reading the function-hooks API declarations had grown it by
+  about 80k tokens in nine minutes. g2 handed off to g3 across a budget hold: the account's 5-hour
+  window went from 55 to 89% in about 50 minutes. The hub had g2 hand off at 85%, stopped it, and
+  started g3 after the window reset, because the hub starts no session under the hold and a rotation
+  starts one. By checking claims on the surface, the hub caught two gaps before the park: AC7's paging
+  had not been shown live, and the helper's `self` read the permission mode as null from a 2.1.280
+  transcript. Both were closed. The plugin has 35 tests, every UI test on both terminal and desktop,
+  and AC6–AC9 were then shown live on 2.1.314 with two throwaway workers, which were removed afterwards
+  ([Step log](https://github.com/gjovanov/roomler-ai/issues/3127#issuecomment-6515103295)).
+  - **Dead hypothesis:** a send whose `isDelivered` is true has reached the worker. It means queued: a
+    session in another permission mode holds the message and lets it expire. The view counts an
+    answer as received only once it shows in the worker's transcript.
+  - **Dead hypothesis:** the view can read a worker's transcript whole. `$.fs.read` refuses a file over
+    4 MiB, and worker transcripts are bigger, so `hub.mjs convo` pages one back from its end by byte
+    offset.
+  - **Dead hypothesis:** the hub relay can submit from the `/hub` hook. The engine refuses a submit from
+    a `command.run` hook that holds the turn, so route b submits from a timer.

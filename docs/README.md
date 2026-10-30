@@ -66,6 +66,10 @@ flowchart TB
         RCM["relay-cost-metering.md"]
     end
 
+    subgraph work["🧭 How the work is run"]
+        AHUB["agent-hub.md"]
+    end
+
     REF["api.md · permissions.md · data-model.md · testing.md · vmtest.md"]
 
     UC --> rd & net & collab
@@ -182,6 +186,15 @@ transcript stays on the device; the server keeps the record.*
 | [permissions.md](permissions.md) | The `u64` bit catalogue and the `ADMINISTRATOR` bypass; the five system-managed roles, seeded from ONE table and **reconciled** to it at boot so a permission bit reaches orgs that already exist (FR-82 — 63 of 72 prod orgs were frozen at their creation-day masks); the splits that are deliberately not implied (`MANAGE_AGENTS` ⇏ `EXEC_DEVICE` ⇏ `SSH_DEVICE`); and what a `403` means — **a permission refusal is not a logout**, only `not_a_member` navigates, and an unclassified 403 does nothing |
 | [security-baseline.md](security-baseline.md) | The server and web security controls and **why each is shaped the way it is**: identity and session handling, the email-ownership invariant that closes the nOAuth class, object-level tenant scoping (`is_member` is not an authorization check), the device plane (the remote-desktop transport hardening, a device that reaches its server over TLS whatever its config says, the session-policy floor no server can lift, the session limits, and where FR-101's audit rows are written), SSRF/CORS/CSP and the loopback origins the remote-desktop viewer needs, content sniffing and the message-HTML allowlist, the four-layer publishing-identity allowlist, and the open gaps |
 | [data-model.md](data-model.md) | Every MongoDB collection with ER diagrams, indexes, TTLs |
+
+## 🧭 How the work is run
+
+*How the FR backlog is worked: Claude Code sessions in parallel, each claim checked on GitHub, CI
+or the fleet, and every merge, close and deploy left to the operator.*
+
+| Doc | What it covers |
+|---|---|
+| [agent-hub.md](agent-hub.md) | The agent hub (FR-131): one coordinator session hands FR phases, bugs, specs and research to worker sessions (`claude --bg`, each in its own worktree) and tracks them on one board. Why workers are sessions and not subagents or agent teams; the pieces (the `/hub` skill, the worker protocol, the `hub.mjs` helper, the hub view) and where their state lives; the tick loop and a worker's states; the message verbs both ways; the signal table; the tiers, with CLAUDE.md §3 work pinned to max, and why the effort goes through `--settings` (the project env beats `--effort`); context rotation at 40 and 60% and the budget hold at 85%, which is why a worker rotates before the hold; the hub view's keys and answer routes, and why an answer counts only once it shows in the worker's transcript; the measured traps (matching permission modes, `--bg --resume` forking a copy, `state: blocked`, `<synthetic>` replies, cron prompts as plain text); the rails |
 
 ## ⚖️ Licensing
 
