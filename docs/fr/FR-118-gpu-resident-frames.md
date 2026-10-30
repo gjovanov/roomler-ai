@@ -1,7 +1,9 @@
 # FR-118: GPU-resident frames — a captured frame stays on the GPU until the encoder takes it
 
-**Issue:** [#2669](https://github.com/gjovanov/roomler-ai/issues/2669) · **Status:** proposed 2026-10-21 —
-spec and claim · **Owner:** the agent's capture and encode path · **Anchors:** master `c636c6e8c` ·
+**Issue:** [#2669](https://github.com/gjovanov/roomler-ai/issues/2669) · **Status:** closed 2026-10-30 — every
+criterion field-verified (§6), docs in `docs/encoders.md` and `docs/remote-control.md` §5.1f; the default (open
+decision 2) moved to [FR-132](FR-132-zero-copy-by-default.md) · **Owner:** the agent's capture and encode path ·
+**Anchors:** master `c636c6e8c` ·
 **Program:** [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 2 ("zero-copy") ·
 **Builds on:** [FR-70](FR-70-media-pipeline-leaves-the-runtime.md) (the encoder thread, M1),
 [FR-77](FR-77-encoder-chroma-matrix.md) (cells and the probe), [FR-107](FR-107-drm-capture-throughput.md)
@@ -731,12 +733,23 @@ flowchart LR
    frame lands where NVENC can take it without the readback (3.7 ms on the Radeon device), the CPU conversion and
    the upload. So P3 gives WGC's device the encoder's adapter whenever the encoder is a GPU cell on another one.
 2. **The default.** Recommended: OFF for one release, then ON per cell after a clean fleet week of that cell
-   (decode errors, keyframe requests, `input_path` reasons), never globally.
+   (decode errors, keyframe requests, `input_path` reasons), never globally. **Moved to
+   [FR-132](FR-132-zero-copy-by-default.md) by the operator, 2026-10-30, when FR-118 closed.** The first half held:
+   the switch shipped off in 0.4.181 and is off on every host that did not set it. The second half needs two
+   things this FR did not build: a kill switch the server can push (`zero_copy_deny` is not in remote config) and a
+   count of the viewer's decode errors (a fleet week cannot see them). FR-132 builds both before the first cell
+   goes on.
 3. **Colour.** Recommended: BT.601 limited range on the GPU path, matching today's CPU path, so the switch never
    changes the picture. Moving both paths to BT.709 with VUI signalled is a separate decision for every viewer.
+   **Built as recommended** (P2, P3, P5): every GPU form converts at BT.601 limited range, and the pattern decodes
+   within 2 code values of the CPU path on every cell (§9.3, §9.7, §9.9). Writing that description into the stream
+   is [FR-130](FR-130-colours-decode-true.md).
 4. **Who converts to NV12.** Our VideoProcessor (one matrix we control and test), or the encoder from BGRA (NVENC
    ARGB input, QSV RGB4: one pass fewer, each with its own matrix). Recommended: VideoProcessor first. Encoder-side
-   RGB input is measured afterwards as an optimisation, per backend, against AC3's colour check.
+   RGB input is measured afterwards as an optimisation, per backend, against AC3's colour check. **Built as
+   recommended** for QSV and NVENC (P2, P3). VideoToolbox converts the BGRA itself (P5), since the display stream's
+   IOSurface reaches it with no copy at all and the BT.601 matrix rides on the buffer. Encoder-side RGB input on
+   QSV and NVENC was never measured, so it stays an optimisation for a later FR.
 5. **AC3's encode-stage clause** (raised by the first field run, §9.2). On the DXGI arm the readback that the GPU
    input removes sits in the capture stage (P0b), and on the GPU path `send_frame` waits for the GPU's conversion
    and copies before QSV reads the surface. So the encode stage alone rises (10.0 → 11.4 ms on the first host)
@@ -1252,6 +1265,9 @@ pattern's window, task and files are gone.
 
 ## 10. Related
 
+- [FR-132](FR-132-zero-copy-by-default.md): the default this FR left off, turned on one cell at a time after a
+  clean fleet week of each (open decision 2).
+- [FR-130](FR-130-colours-decode-true.md): the BT.601 description written into the stream (open decision 3).
 - [FR-119](FR-119-high-refresh-streaming.md): above 60 fps needs the encode stage under one period; this FR is
   how that is reached on the CPU-bound cells.
 - [FR-70](FR-70-media-pipeline-leaves-the-runtime.md): the encoder thread this design shares a device with.
