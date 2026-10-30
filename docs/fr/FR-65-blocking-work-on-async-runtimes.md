@@ -1,6 +1,6 @@
 # FR-65 — Blocking work on async runtimes: measure first, then remove
 
-**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.028 % of the frame budget on NEO16 (AC1)**. **2 of 8 criteria ticked**, AC8 (docs) `[~]`. Next: the census after-read on the release that carries #3138 (AC7), then P1. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
+**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.028 % of the frame budget on NEO16 (AC1)**. **3 of 8 criteria ticked** — AC1, AC2, and AC6 (the caps-probe respawn, measured gone on four hosts) — AC8 (docs) `[~]`. Next: the census after-read on the release that carries #3138 (AC7), then P1. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
 
 ## Goal
 
@@ -66,14 +66,14 @@ loop), rather than three wraps.
 
 > **Status 2026-10-30 — the instrument was wrong for every stall longer than its
 > own heartbeat; fixed, six more regions named, and its cost measured (AC1).** A
-> census of its own output — 339 STALL lines from 14 days of the three CORPLAP
+> census of its own output — 344 STALL lines from 14 days of the three CORPLAP
 > hosts' logs, `scripts/fr65-stall-census.sh` — found two defects in the
 > bookkeeping that FEEDS the verdict (the verdict itself, and AC2, held):
 >
 > 1. **The heartbeat's window reset saturated the pass that held it.** It
 >    zeroes six accumulators at a pass's tail, after that pass's mark, so the
 >    close read `0 − mark = 0` for each. A pass longer than the 2 s heartbeat
->    always holds one, so the LONGEST stalls were blamed on nobody: 84 of 339
+>    always holds one, so the LONGEST stalls were blamed on nobody: 84 of 344
 >    lines, 1.5–2.6 s mean per host, and on CORPLAP-1 six first-pass `hevc_qsv`
 >    opens of 2.0–3.5 s. `PassWatch::rebase` carries the pass across the reset.
 > 2. **The FR-79 gate lost the heartbeat pass's own stall**: it was fed
@@ -212,6 +212,16 @@ stay within today's SLA.
 
 ### P4 — the caps-probe respawn
 
+> **Status 2026-10-30 — measured gone; AC6 met, with no FR-65 fix in it.**
+> `scripts/fr65-stall-census.sh --probes` over 2026-10-17 → 30 04:44Z: every
+> probe line on CORPLAP-1/-2/-3 (83/87/108) fell within 60 s of a daemon start,
+> **0 at steady state** over 317 h each; on NEO16, the host this was first seen
+> on, 12 of 12 (2026-10-28 08:25 → 10-30 04:40). The probe runs once per daemon
+> start whose version changed, and a restart on the same version runs none
+> (NEO16 2026-10-29 10:14:34, a cache hit). What stopped the respawn is not
+> established here, and nothing under this FR changed it — so there is no
+> before/after for AC7 to hold, only the measurement AC6 asks for.
+
 Observed on neo16: a `caps-probe` **child process every ~10 s for nearly three
 hours**. `detect()` is meant to cache in a `OnceLock`, so this is a bug — a
 process spawn plus a driver enumeration on a repeating timer. Measure the spawn
@@ -264,7 +274,7 @@ of each is to produce a number.
       rate (`frame_rate::CHOICES`), not the 60 fps the design above assumed.
       The positive control, 208 µs injected into the ON arm, came back at
       0.88–1.16× in every run: the instrument can fail. Per second, at the
-      field's busiest pass rate — measured, at most 322 passes/s over 35 649
+      field's busiest pass rate — measured, at most 322 passes/s over 36 357
       heartbeat windows on NEO16 and the three CORPLAP hosts — that is **0.28 ms
       a second, 0.028 % of the frame budget**. Every factor was timed on the
       hardware it describes. ⚠️ Not a pair of sessions through the kill switch:
@@ -314,7 +324,19 @@ of each is to produce a number.
       unchanged or better.
 - [ ] **AC5** — overlay guard waves and forced rekeys/min are measured at idle and
       under a VPN flap, and bounded; no rekey storm.
-- [ ] **AC6** — caps-probe spawns at steady state are 0/hour on a measured host.
+- [x] **AC6** — caps-probe spawns at steady state are 0/hour on a measured host.
+      ✅ **Measured 2026-10-30, four hosts** (`scripts/fr65-stall-census.sh
+      --probes`, #3138): **0 steady-state probe runs** on CORPLAP-1/-2/-3 over
+      317 h each (2026-10-17 → 30 04:44Z) and on NEO16 — the host P4 was opened
+      on — over the 44 h its logs retain. Every one of the 83/87/108/12 probe
+      lines fell within 60 s of a daemon start. The instrument sees every spawn:
+      the probe child has one spawn site (`encode/caps.rs`, `run_child`), every
+      run logs its decision and its outcome, and every caller is a `roomlerd`
+      process writing this log. The "fail first" is the same reading: each
+      version-changing start shows its probe, so a steady-state probe would show
+      the same way; and a restart on an unchanged version shows none (a cache
+      hit, NEO16 2026-10-29 10:14:34). No FR-65 change was involved; what
+      stopped the respawn is not established here (see P4's status).
 - [ ] **AC7** — every fix carries a before/after from the **same** instrument on
       this issue. A fix with no measurement does not count as shipped.
       *2026-10-30:* P0's two fixes (#3138: the window-reset rebase and the
@@ -369,7 +391,7 @@ _(every entry must carry a before/after from the stall watch.)_
 - **2026-10-30 — a census of the instrument's own output: it was blind to every
   stall longer than its heartbeat; and its cost, measured (AC1).** The new
   `scripts/fr65-stall-census.sh` over 14 days of daemon logs (2026-10-17..30) on
-  CORPLAP-1/-2/-3: **339 STALL lines** — `open` 19/122/34, `reset` 7/51/26,
+  CORPLAP-1/-2/-3: **344 STALL lines** — `open` 21/122/37, `reset` 7/51/26,
   `untimed` 4/27/15, `encode` 10/0/19, other 5 (swap, capture, ctrl, stats,
   swap).
   - **Before**, as the census reads the current release: the 84 `reset` lines —
@@ -412,6 +434,16 @@ _(every entry must carry a before/after from the stall watch.)_
   - **AC1** — see the criterion: at most 869 ns a pass on NEO16 against a
     69.4 µs bar, at most 322 passes/s in the field, 0.028 % of the frame budget;
     the control resolved at 0.88–1.16× in every run.
+  - **AC6** — the caps-probe census (`--probes`): 0 steady-state probe runs on
+    CORPLAP-1/-2/-3 over 317 h each and on NEO16 over 44 h; all 83/87/108/12
+    probe lines within 60 s of a daemon start. See the criterion and P4.
+  - ⚠️ **The census's own dead end:** its first version read the logs with
+    `[IO.File]::ReadLines`, which the daemon's open handle on today's file
+    refuses; the error reached `roomler exec` only as CLIXML, which the wrapper
+    drops, so the census silently left out 2026-10-30 — five STALL lines on
+    CORPLAP-1 and -3 (first-pass opens). It now opens files as a tail does and
+    prints `read through …` and `unreadable=N`; every count above is from the
+    corrected read (through 2026-10-30 04:44Z).
 
 - **2026-09-04 — `other_ms` found a SECOND untimed phase, and this one is not the
   open.** Operator report: on all three CORPLAP hosts the frame age goes over

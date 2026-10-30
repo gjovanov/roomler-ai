@@ -54,9 +54,22 @@ $lastHb = @{}      # session -> (time, line) of its latest heartbeat
 $classes = @{}     # class -> @{n; max; sum}
 $heartbeats = 0; $stalls = 0
 $rowsOut = New-Object System.Collections.Generic.List[string]
+$unreadable = New-Object System.Collections.Generic.List[string]
+$lastLine = ''
 
 foreach ($f in $files) {
-  foreach ($line in [System.IO.File]::ReadLines($f.FullName)) {
+  # ⚠️ The daemon holds TODAY's file open for writing. [IO.File]::ReadLines is
+  # refused there (a sharing violation), PowerShell reports that as a
+  # non-terminating error, and `roomler exec` delivers stderr as CLIXML that the
+  # wrapper drops — so the first version of this census silently skipped today
+  # (2026-10-30). Open it the way a tail does, and say so if a file still fails.
+  try {
+    $fs = [System.IO.File]::Open($f.FullName, 'Open', 'Read', [System.IO.FileShare]'ReadWrite, Delete')
+  } catch { $unreadable.Add("$($f.Name): $($_.Exception.Message)"); continue }
+  $sr = New-Object System.IO.StreamReader($fs)
+  try {
+  while ($null -ne ($line = $sr.ReadLine())) {
+    if ($line.Length -ge 19) { $lastLine = $line }
     if ($line.Length -lt 40) { continue }
     $isHb = $line.Contains('DC pump heartbeat')
     $isSt = $line.Contains('DC pump STALL')
@@ -93,9 +106,11 @@ foreach ($f in $files) {
       $rowsOut.Add($row)
     }
   }
+  } finally { $sr.Dispose() }
 }
 
-'files={0} ({1} .. {2}) heartbeats={3} stalls={4}' -f $files.Count, $files[0].Name, $files[-1].Name, $heartbeats, $stalls
+'files={0} ({1} .. {2}, read through {3}) heartbeats={4} stalls={5} unreadable={6}' -f $files.Count, $files[0].Name, $files[-1].Name, $lastLine.Substring(0, [Math]::Min(19, $lastLine.Length)), $heartbeats, $stalls, $unreadable.Count
+foreach ($u in $unreadable) { "  UNREADABLE $u" }
 foreach ($k in ($classes.Keys | Sort-Object)) {
   $c = $classes[$k]
   '  {0,-10} n={1,4}  iter_ms max={2,9:F1}  mean={3,8:F1}' -f $k, $c.n, $c.max, ($c.sum / [math]::Max(1, $c.n))
