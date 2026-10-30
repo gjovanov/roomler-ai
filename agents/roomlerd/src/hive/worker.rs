@@ -389,6 +389,12 @@ async fn serve_halves(
     let toolbelt_serving = Arc::new(super::toolbelt::handed::Serving::default());
     #[cfg(all(worker_calls, unix))]
     let _stops_all_toolbelts = toolbelt_serving.all.clone().drop_guard();
+    // FR-90 P8-2c-3 — the sidecars this worker serves: both OSes, unlike
+    // the toolbelt's Unix-domain socket.
+    #[cfg(worker_calls)]
+    let sidecar_serving = Arc::new(super::sidecar::handed::Serving::default());
+    #[cfg(worker_calls)]
+    let _stops_all_sidecars = sidecar_serving.all.clone().drop_guard();
     let ended = loop {
         let m = match recv(&mut rd).await {
             Ok(Some(m)) => m,
@@ -424,7 +430,10 @@ async fn serve_halves(
                 // the egress fronts' two, the HTTP one's first), so they are
                 // taken here, in order, before the next frame is read.
                 let listeners = match (&call, &descriptors) {
-                    (Call::Serve { .. } | Call::ToolbeltServe { .. }, Some(ch)) => {
+                    (
+                        Call::Serve { .. } | Call::ToolbeltServe { .. } | Call::SidecarServe { .. },
+                        Some(ch),
+                    ) => {
                         vec![fds::recv(ch).await]
                     }
                     (Call::Egress { .. }, Some(ch)) => {
@@ -433,13 +442,21 @@ async fn serve_halves(
                     }
                     _ => Vec::new(),
                 };
-                let (link, serving, toolbelt_serving) = (
+                let (link, serving, toolbelt_serving, sidecar_serving) = (
                     Arc::clone(&link),
                     Arc::clone(&serving),
                     Arc::clone(&toolbelt_serving),
+                    Arc::clone(&sidecar_serving),
                 );
                 tokio::spawn(async move {
-                    let answer = answer_call(&link, &serving, &toolbelt_serving, call, listeners);
+                    let answer = answer_call(
+                        &link,
+                        &serving,
+                        &toolbelt_serving,
+                        &sidecar_serving,
+                        call,
+                        listeners,
+                    );
                     let _ = link.answer(id, answer).await;
                 });
                 Ok(())
@@ -449,9 +466,13 @@ async fn serve_halves(
             // inside `call` itself, as its `info`.
             #[cfg(all(worker_calls, windows))]
             Msg::Call { id, call } => {
-                let (link, serving) = (Arc::clone(&link), Arc::clone(&serving));
+                let (link, serving, sidecar_serving) = (
+                    Arc::clone(&link),
+                    Arc::clone(&serving),
+                    Arc::clone(&sidecar_serving),
+                );
                 tokio::spawn(async move {
-                    let answer = answer_call(&link, &serving, call);
+                    let answer = answer_call(&link, &serving, &sidecar_serving, call);
                     let _ = link.answer(id, answer).await;
                 });
                 Ok(())
@@ -478,6 +499,7 @@ fn answer_call(
     link: &Arc<link::Link>,
     serving: &Arc<super::vault_connect::handed::Serving>,
     #[cfg(unix)] toolbelt_serving: &Arc<super::toolbelt::handed::Serving>,
+    sidecar_serving: &Arc<super::sidecar::handed::Serving>,
     call: Call,
     #[cfg(unix)] listeners: Vec<std::io::Result<std::os::fd::OwnedFd>>,
 ) -> Answer {
@@ -569,6 +591,49 @@ fn answer_call(
         }
         #[cfg(unix)]
         Call::ToolbeltOpen { .. } | Call::ToolbeltClosed { .. } => Answer::Refused {
+            why: "the daemon answers that, never a worker".into(),
+        },
+        // FR-90 P8-2c-3 — the sidecar. Both OSes, unlike the toolbelt's
+        // Unix-domain socket.
+        #[cfg(unix)]
+        Call::SidecarServe {
+            endpoint,
+            session,
+            upstream,
+            workspace,
+        } => match next() {
+            Ok(fd) => super::sidecar::handed::serve_handed(
+                sidecar_serving,
+                Arc::clone(link),
+                session,
+                endpoint,
+                upstream,
+                workspace,
+                fd,
+            ),
+            Err(refused) => refused,
+        },
+        // FR-90 P8-2b-3 — Windows: the listener rode inside the call itself.
+        #[cfg(windows)]
+        Call::SidecarServe {
+            endpoint,
+            session,
+            upstream,
+            workspace,
+            info,
+        } => super::sidecar::handed::serve_handed(
+            sidecar_serving,
+            Arc::clone(link),
+            session,
+            endpoint,
+            upstream,
+            workspace,
+            info,
+        ),
+        Call::SidecarClose { endpoint } => {
+            super::sidecar::handed::close_handed(sidecar_serving, endpoint)
+        }
+        Call::SidecarAdmit { .. } | Call::SidecarForgetKey { .. } => Answer::Refused {
             why: "the daemon answers that, never a worker".into(),
         },
     }
@@ -1095,6 +1160,9 @@ async fn life(
             // FR-90 P8-2c-2 — and the toolbelt. Unix only so far.
             #[cfg(unix)]
             super::toolbelt::handed::rehand(session, fence, &link).await;
+            // FR-90 P8-2c-3 — and the sidecar. Both OSes, unlike the
+            // toolbelt's Unix-domain socket.
+            super::sidecar::handed::rehand(session, fence, &link).await;
         });
     }
     let mut relay = log::Relay::new(pid);
@@ -1235,6 +1303,17 @@ fn answer_worker(run: &Run, link: &Arc<link::Link>, id: u64, call: Call) {
             | Call::ToolbeltWithdraw { .. }
             | Call::ToolbeltWithdrawAll { .. } => Answer::Refused {
                 why: "the worker answers that, never the daemon".into(),
+            },
+            // FR-90 P8-2c-3 — the sidecar's admission and key, asked of the
+            // daemon one call at a time. Both OSes, unlike the toolbelt's.
+            Call::SidecarAdmit { endpoint, token } => {
+                super::sidecar::handed::admit(session, fence, endpoint, token).await
+            }
+            Call::SidecarForgetKey { endpoint } => {
+                super::sidecar::handed::key_forgotten(session, fence, endpoint).await
+            }
+            Call::SidecarServe { .. } | Call::SidecarClose { .. } => Answer::Refused {
+                why: "a worker asks the daemon for the sidecar's admission and key alone".into(),
             },
         };
         let _ = link.answer(id, answer).await;
