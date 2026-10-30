@@ -80,12 +80,17 @@
         <div class="text-subtitle-2 mb-1">Connect code</div>
         <div class="d-flex align-center flex-wrap ga-2 mb-1">
           <code v-if="connectCode" class="text-h6">{{ connectCode }}</code>
-          <span v-else class="text-medium-emphasis">Not yet created</span>
+          <span v-else-if="codeListRead" class="text-medium-emphasis">Not yet created</span>
+          <span v-else-if="readingCodes" class="text-medium-emphasis">Reading…</span>
+          <span v-else class="text-medium-emphasis">Could not read the code.</span>
           <v-spacer />
+          <!-- Until the list is read, "no code" only means "not read yet", and
+               Create would rotate a code the device may already have (#3182). -->
           <v-btn
             size="small"
             variant="tonal"
             :loading="rotating"
+            :disabled="!connectCode && !codeListRead"
             prepend-icon="mdi-autorenew"
             @click="rotate"
           >
@@ -164,9 +169,28 @@ const agentStore = useAgentStore()
 const saving = ref(false)
 const rotating = ref(false)
 const error = ref('')
-const connectCode = ref<string | null>(null)
+/** A code this dialog minted. The store's list holds APPROVED devices only, so
+ *  a code minted for a device not yet approved is known nowhere else here. */
+const mintedCode = ref<string | null>(null)
+/** Whether this dialog's own read of the list is in flight. */
+const readingCodes = ref(false)
 const agent = computed(() => props.agent)
 const orgDisabled = computed(() => agentStore.orgExternalAccessEnabled === false)
+
+/** Whether the list the device's code comes from has been read. Until it has,
+ *  "no code" is unknown rather than absent. */
+const codeListRead = computed(() => agentStore.orgExternalAccessEnabled !== null)
+
+/** The device's code, read from the store reactively rather than copied when
+ *  the dialog opens. On a fresh page load the list lands AFTER the open, and a
+ *  copy taken at the open showed "Not yet created" and offered Create, which
+ *  rotates the code the device already has (#3182). */
+const connectCode = computed(
+  () =>
+    mintedCode.value ??
+    agentStore.externalDevices.find((d) => d.id === agent.value?.id)?.connect_code ??
+    null,
+)
 
 /** Gate 3 as the device last advertised it. An agent that cannot say "this
  *  controller is from outside your organization" must not be approvable —
@@ -225,21 +249,31 @@ const expiryLocal = computed({
   },
 })
 
-/** Fill the draft and the code from the device on every open. Immediate
- *  (#3156): AgentsSection mounts this dialog with `v-if` and opens it in the
- *  same tick, so the first open MOUNTS it open and a lazy watch never fired:
- *  the draft stayed unapproved, and Save revoked a standing approval. It runs
- *  during setup, so it must stay below everything it reads. */
+/** Read the list that holds the device's code, once, if the store has not. */
+async function readCodes() {
+  readingCodes.value = true
+  try {
+    await agentStore.fetchExternalAccess(props.tenantId)
+  } finally {
+    readingCodes.value = false
+  }
+}
+
+/** Fill the draft from the device, and read the code list if the store has
+ *  not, on every open. Immediate (#3156): AgentsSection mounts this dialog
+ *  with `v-if` and opens it in the same tick, so the first open MOUNTS it open
+ *  and a lazy watch never fired: the draft stayed unapproved, and Save revoked
+ *  a standing approval. It runs during setup, so it must stay below everything
+ *  it reads. */
 watch(
   () => props.modelValue,
   (v) => {
     if (!v) return
     error.value = ''
     draft.value = { ...emptyPolicy(), ...(agent.value?.external_access_policy ?? {}) }
-    connectCode.value =
-      agentStore.externalDevices.find((d) => d.id === agent.value?.id)?.connect_code ?? null
+    mintedCode.value = null
     if (agentStore.orgExternalAccessEnabled === null) {
-      void agentStore.fetchExternalAccess(props.tenantId)
+      void readCodes()
     }
   },
   { immediate: true },
@@ -249,7 +283,7 @@ async function rotate() {
   rotating.value = true
   error.value = ''
   try {
-    connectCode.value = await agentStore.rotateConnectCode(props.tenantId, agent.value.id)
+    mintedCode.value = await agentStore.rotateConnectCode(props.tenantId, agent.value.id)
   } catch (e) {
     error.value = e instanceof Error ? e.message : 'Could not create a connect code.'
   } finally {
