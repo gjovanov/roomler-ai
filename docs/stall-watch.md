@@ -18,10 +18,10 @@ fleet, and what the watch itself costs (measured, FR-65 AC1).
 | | |
 |---|---|
 | Verdict + bookkeeping | `encode::stall` (`agents/roomlerd/src/encode/stall.rs`) — a pure module on the **default** feature set, so `cargo test -p roomlerd --lib` covers it although the pump is behind `ffmpeg-encoder` |
-| The pump's sites | `peer.rs:6647` (the watch), `:6659` (the one phase list), `:7128` (the pass boundary), `:9883` (the heartbeat's rebase) |
-| Kill switch | `pump_stall_watch` / `ROOMLERD_PUMP_STALL_WATCH=0` (`encode/mod.rs:494`), restart required |
-| The bar | `pump_stall_warn_ms` / `ROOMLERD_PUMP_STALL_WARN_MS`, default 100 (`encode/mod.rs:539`) |
-| Its own cost | `roomlerd stall-watch-cost` (`stall.rs:579`, §8) |
+| The pump's sites | `peer.rs:6647` (the watch), `:6659` (the one phase list), `:7128` (the pass boundary), `:9885` (the heartbeat's rebase) |
+| Kill switch | `pump_stall_watch` / `ROOMLERD_PUMP_STALL_WATCH=0` (`encode/mod.rs:513`), restart required |
+| The bar | `pump_stall_warn_ms` / `ROOMLERD_PUMP_STALL_WARN_MS`, default 100 (`encode/mod.rs:558`) |
+| Its own cost | `roomlerd stall-watch-cost` (`stall.rs:590`, §8) |
 | The census | `scripts/fr65-stall-census.sh` (§7) |
 
 ## 1. A pass, and where its time goes
@@ -145,8 +145,8 @@ counted as work, its encoder open as nothing, and the pass went to `other`.
 
 🔑 A pass longer than the heartbeat interval **always** holds a heartbeat — the
 long pass is what makes it due — so the rule was blind to exactly the stalls
-worth finding. `PassWatch::rebase` (`stall.rs:519`) carries what the open pass
-had accrued and moves its mark past the reset (`peer.rs:9883`). The census that
+worth finding. `PassWatch::rebase` (`stall.rs:522`) carries what the open pass
+had accrued and moves its mark past the reset (`peer.rs:9885`). The census that
 found it is §6.
 
 ### 3.2 The governor reads a total that never resets (fixed 2026-10-30)
@@ -156,7 +156,7 @@ FR-79's gate asks whether the agent's own loop was free in a window
 `pump_stalls − win_stalls_last`, and the heartbeat zeroed `pump_stalls` but not
 the mark: after a window that held a stall, the next verdict read `1 − N`,
 which saturates to 0. The first verdict after a reset is the heartbeat pass's
-own — the long one. It now reads `PassWatch::stalls_total` (`stall.rs:545`,
+own — the long one. It now reads `PassWatch::stalls_total` (`stall.rs:556`,
 `peer.rs:8905`), which only grows.
 
 **What the two fixes change for the controller**, since a stall verdict gates
@@ -295,7 +295,7 @@ daemon's dated logs and prints one summary row per class (§5's table).
 > `Instant::now()` is ~20–40 ns, and there are N of them") the switch's own
 > description used to quote.
 
-`roomlerd stall-watch-cost` (`stall.rs:579`, dispatched in `app.rs:1231` before
+`roomlerd stall-watch-cost` (`stall.rs:590`, dispatched in `app.rs:1231` before
 any runtime, config, log, lock or updater) runs the pump's per-pass watch work
 through the **real** `PassWatch`, once enabled and once disabled, rounds
 alternating which arm goes first. Everything else in a pass is the same in
@@ -351,7 +351,7 @@ as the warm cells do. A cold pass is ~80–280 µs of walking whose time varies 
 microseconds, so the watch came out at −6.4…+5.7 µs medians and p90s up to
 37 µs — a bound set by noise, which multiplied by 322 passes/s is 1.2 % of each
 second and proves nothing. The cold cells now bracket only the watch's own
-operations after each eviction walk (`pass_timed`, `stall.rs:812`).
+operations after each eviction walk (`pass_timed`, `stall.rs:820`).
 
 ```bash
 roomlerd stall-watch-cost            # ~15 s, text; exit 0 PASS, 3 FAIL, 4 INVALID
