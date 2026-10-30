@@ -99,15 +99,16 @@ one line and the next rung is tried. Locked by tests
 | Linux arm64 | from 0.4.170 (FR-97 P7a): `h264/hevc/av1_nvenc` + `h264/hevc/av1/vp9_vaapi` + `h264/hevc/av1_vulkan` (ten), plus the `h264` decoder and the `aac` encoder, the Linux x86_64 tree built on an arm64 runner without qsv and amf (neither ships an arm64 Linux runtime); libva + libdrm in the tree, searching `/usr/lib/aarch64-linux-gnu/dri`. Where nothing opens (an Asahi Mac, a GPU-less server) the probe finds no hardware and video stays on OpenH264 + libvpx. No arm64 hardware cell has been proven in a session yet: [FR-122](fr/FR-122-arm64-linux-hardware-cell.md). Before 0.4.170: no FFmpeg | shared, bundled in the `.deb` and the tarball like x86_64's |
 
 > [!IMPORTANT]
-> **NVENC needs NVIDIA driver 570.0 or newer, on every OS.** FFmpeg opens NVENC
-> only when the driver's highest NVENC API is at least the SDK the build was
-> compiled against, so the header pin *is* the floor. Every tree takes
-> `nv-codec-headers` 13.0.19.0: Windows through the vcpkg baseline's `ffnvcodec`,
-> Linux by the vendor jobs' pin. Below the floor the probe advertises no NVENC
-> cell and the cascade's next rung serves. The Linux trees pinned 13.1 (driver
-> 610.00) until FR-122 P0c, which cost NVENC on NVIDIA's R580 long-term branch
-> and on AWS's G5g image (595). Each Linux vendor job now asserts the floor in
-> the binary it built ([FR-122 §3.2](fr/FR-122-arm64-linux-hardware-cell.md#32-the-nvenc-driver-floor-p0c)).
+> **NVENC needs NVIDIA driver 530.41 or newer on Linux, 570.0 on Windows.**
+> FFmpeg opens NVENC only when the driver's highest NVENC API is at least the
+> SDK the build was compiled against, so the header pin *is* the floor. Linux
+> takes `nv-codec-headers` 12.1.14.0 (the vendor jobs' pin, the oldest FFmpeg
+> 9.0.1 builds against); Windows takes 13.0.19.0 (the vcpkg baseline's
+> `ffnvcodec`). Below the floor the probe advertises no NVENC cell and the
+> cascade's next rung serves. The Linux trees pinned 13.1 (driver 610.00) until
+> FR-122 P0c, which cost NVENC on NVIDIA's R580 long-term branch and on AWS's
+> G5g image (595). Each Linux vendor job now asserts the floor in the binary it
+> built ([FR-122 §3.2](fr/FR-122-arm64-linux-hardware-cell.md#32-the-nvenc-driver-floor-p0c)).
 
 ## The cell matrix a host advertises (FR-77 P1)
 

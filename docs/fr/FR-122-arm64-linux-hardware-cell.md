@@ -3,9 +3,10 @@
 **Issue:** [#2875](https://github.com/gjovanov/roomler-ai/issues/2875) · **Status:** P0 decided 2026-10-29 (D1: the
 operator's own AWS account); the rig is built and rehearsed end to end on a GPU-less arm64 box (§3.1, §8). The g5g
 run waits on that account's G and VT quota (§2). P0c (2026-10-30): the released Linux trees needed NVIDIA driver
-610, and the g5g's image ships 595, so the box could not have opened NVENC on any release to date; the Linux trees
-now take Windows' NVENC SDK, driver 570 (§2, §3.2) · **Owner:** the agent's encoder surface ·
-**Anchors:** master `787f03200` · **Split from:** [FR-97](FR-97-os-feature-parity.md) P7a, by its D18 (the
+610, and the g5g's image ships 595, so the box could not have opened NVENC on any release to date. The Linux trees
+now need 530.41, the oldest floor FFmpeg 9.0.1 builds against (D2, the operator); Windows needs 570 (§2, §3.2) ·
+**Owner:** the agent's encoder surface ·
+**Anchors:** master `b101fc456` · **Split from:** [FR-97](FR-97-os-feature-parity.md) P7a, by its D18 (the
 operator, 2026-10-25: "ship AAC now, GPU later")
 
 ## 1. Goal
@@ -43,12 +44,12 @@ This is the half of FR-97's P7a that the lab could not prove (FR-97 AC14's first
   version"). Both Linux jobs of `vendor-ffmpeg-windows.yml` pinned `nv-codec-headers` **n13.1.15.0**, and SDK 13.1
   needs driver **610.00** (`nvenc_print_driver_requirement`; NVIDIA's SDK 13.1 read-me says the same). The
   released 0.4.187 arm64 `libavcodec.so.63` carries exactly that string. AWS's G5g image, *Deep Learning ARM64
-  Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20261028*, ships driver **595.112.07**. The Windows build was
+  Base OSS Nvidia Driver GPU AMI (Ubuntu Pro 24.04) 20261028*, ships driver **595.112.07**. The Windows build was
   never affected: its `ffnvcodec` comes from the pinned vcpkg baseline, **13.0.19.0**, which needs 570.0. So on
-  Linux, x86_64 and arm64 alike, every host on a 570–609 driver silently lost NVENC: NVIDIA's R580 long-term
-  branch (supported until 2028), the cloud images, and the Maxwell, Pascal and Volta cards that R580 is the last
-  branch for. The workflow's own
-  comment said the pin kept "the driver floor reasonable". It had been 13.1 since the job was written (#473).
+  Linux, x86_64 and arm64 alike, every host below driver 610 silently lost NVENC, including the 570–609 range
+  Windows serves: NVIDIA's R580 long-term branch (supported until 2028), the cloud images, and the Maxwell, Pascal
+  and Volta cards that R580 is the last branch for. The workflow's own comment said the pin kept "the driver floor
+  reasonable". It had been 13.1 since the job was written (#473).
 
 ## 3. Key design
 
@@ -90,8 +91,8 @@ sequenceDiagram
 | The box | `up.sh`: a VPC of its own, port 22 from the dev box and mars only, a key made for the run, a systemd timer that powers it off (= terminates it) at the deadline; `down.sh` deletes by id and sweeps by tag | `DOWN OK … nothing tagged … is left` |
 | The agent | the **released** build through the served `install.sh --role daemon --system`, `ROOMLERD_VIRTUAL_DESKTOP=1` (Xvfb 1920×1080, openbox, a ticking clock, `top`), `ROOMLERD_AUTO_UPDATE=0`. Enrolled with the vmtest org's ephemeral key, which goes from mars to the box on stdin, so the row deletes itself when the daemon stops | `roomlerd --version`, the agent row |
 | AC1 | the daemon's `caps probe: child reported … hw_encoders=[…]` ([`caps.rs:400-407`](../../agents/roomlerd/src/encode/caps.rs#L400-L407)), and `roomlerd caps-probe` run again for the cell list | `guest-roomlerd.sh caps` |
-| AC2 | the vmtest remote-desktop spec from mars, steered onto the cell: `E2E_RC_CODEC=h264` seeds the picker's per-agent override ([`useRemoteControl.ts:2269`](../../ui/src/composables/useRemoteControl.ts#L2269)), which maps an explicit H.264 to `data-channel-h264` ([`peer.rs:2492`](../../agents/roomlerd/src/peer.rs#L2492)), an FFmpeg cascade with `h264_nvenc` first ([`peer.rs:5275`](../../agents/roomlerd/src/peer.rs#L5275)); `E2E_RC_EXPECT_ENCODER=h264_nvenc` fails the run unless the viewer's codec pill names it. Headless Chromium decodes H.264 in software; HEVC needs a viewer with hardware HEVC decode | the agent's `media pump:` line, the pill, decoded frames |
-| AC3 | `roomlerd record --encoder hardware --system-audio` on a private Xvfb with a null sink: `hardware` is the FFmpeg H.264 cascade or a refusal, never a quiet software fallback ([`child.rs:315`](../../agents/roomlerd/src/recording/child.rs#L315)) | the `started` event's `encoder`, the MP4's `mp4a`/`esds` |
+| AC2 | the vmtest remote-desktop spec from mars, steered onto the cell: `E2E_RC_CODEC=h264` seeds the picker's per-agent override ([`useRemoteControl.ts:2270`](../../ui/src/composables/useRemoteControl.ts#L2270)), which maps an explicit H.264 to `data-channel-h264` ([`peer.rs:2492`](../../agents/roomlerd/src/peer.rs#L2492)), an FFmpeg cascade with `h264_nvenc` first ([`peer.rs:5275`](../../agents/roomlerd/src/peer.rs#L5275)); `E2E_RC_EXPECT_ENCODER=h264_nvenc` fails the run unless the viewer's codec pill names it. Headless Chromium decodes H.264 in software; HEVC needs a viewer with hardware HEVC decode | the agent's `media pump:` line, the pill, decoded frames |
+| AC3 | `roomlerd record --encoder hardware --system-audio` on a private Xvfb with a null sink: `hardware` is the FFmpeg H.264 cascade or a refusal, never a quiet software fallback ([`child.rs:330`](../../agents/roomlerd/src/recording/child.rs#L330)) | the `started` event's `encoder`, the MP4's `mp4a`/`esds` |
 
 ### 3.2 The NVENC driver floor (P0c)
 
@@ -109,22 +110,32 @@ flowchart LR
 | `nv-codec-headers` | NVENC API | Driver floor (FFmpeg 9.0.1) | Which build |
 |---|---|---|---|
 | n13.1.15.0 | 13.1 | 610.00 | Linux x86_64 and arm64, from #473 (2026-08-15) to P0c |
-| **n13.0.19.0** | 13.0 | **570.0** | Windows always (the vcpkg baseline's `ffnvcodec`); Linux from P0c |
-| n12.1.14.0 | 12.1 | 530.41.03 (Linux) | FFmpeg 9.0.1's own minimum (`configure`); AV1 encode needs ≥ 12.0 |
+| n13.0.19.0 | 13.0 | 570.0 | Windows always (the vcpkg baseline's `ffnvcodec`); Linux for a morning (#3135, never released) |
+| **n12.1.14.0** | 12.1 | **530.41.03** (Linux) | Linux from P0c (D2); FFmpeg 9.0.1's own minimum (`configure`); AV1 encode needs ≥ 12.0 |
 
-What P0c changes: both Linux jobs clone n13.0.19.0
-([`vendor-ffmpeg-windows.yml:283`](../../.github/workflows/vendor-ffmpeg-windows.yml#L283),
-[`:520`](../../.github/workflows/vendor-ffmpeg-windows.yml#L520)), and each asserts the floor in the binary it
+What P0c changes: both Linux jobs clone n12.1.14.0
+([`vendor-ffmpeg-windows.yml:285`](../../.github/workflows/vendor-ffmpeg-windows.yml#L285),
+[`:522`](../../.github/workflows/vendor-ffmpeg-windows.yml#L522)), and each asserts the floor in the binary it
 built, because nvenc.c compiles in exactly one minimum-driver string
-([`:443`](../../.github/workflows/vendor-ffmpeg-windows.yml#L443),
-[`:617`](../../.github/workflows/vendor-ffmpeg-windows.yml#L617)). Nothing is lost by going back from 13.1. FFmpeg
-9.0.1 gates two things on 13.1: the layout of the SMPTE timecode SEI's counting-type field
-(`NVENC_NEW_COUNTING_TYPE`, which writes 0 either way, on frames carrying a timecode, which the agent never sends),
-and AV1's hierarchical B-frame reference mode (`NVENC_HAVE_AV1_HGOP_SUPPORT`). The agent opens every FFmpeg encoder with no B-frames
-([`encoder.rs:1888`](../../agents/roomlerd/src/encode/ffmpeg/encoder.rs#L1888), and `bf=0` in NVENC's options,
-[`encoder.rs:367`](../../agents/roomlerd/src/encode/ffmpeg/encoder.rs#L367)), and the Windows build's NVENC cells
-have run on 13.0 since FFmpeg 9.0.1 arrived (FR-77 P0, #1472). A newer driver still opens an older SDK: the dev
-box's 610.88 runs the Windows build's 13.0.
+([`:445`](../../.github/workflows/vendor-ffmpeg-windows.yml#L445),
+[`:619`](../../.github/workflows/vendor-ffmpeg-windows.yml#L619)). The first cut (#3135) took Windows' 13.0; the
+operator chose to reach further back, to 12.1, which admits the R535 and R550 branches as well. Nothing is lost by
+going back from 13.1 to 12.1, because what FFmpeg 9.0.1 gates on the newer SDKs is nothing the agent asks for:
+
+| SDK | What FFmpeg 9.0.1 gates on it | The agent |
+|---|---|---|
+| 13.1 | the timecode SEI's counting-type layout (`NVENC_NEW_COUNTING_TYPE`); AV1 hierarchical B-frames | never attaches a timecode; no B-frames |
+| 13.0 | H.264 10-bit, 4:2:2, AV1 UHQ tuning, H.264/AV1 temporal filter, mastering metadata, MV-HEVC, a **4-strip** split | 8-bit 4:2:0 and 4:4:4 only; the split is `forced` (the driver's count) unless `nvenc_split` is set |
+| 12.2 | the new bit-depth fields, temporal filter, lookahead level, UHQ tuning, unidirectional B, timecodes | `rc-lookahead=0`, `tune=ll`, 8-bit (the old bit-depth field describes the same 8 bits) |
+
+No B-frames anywhere ([`encoder.rs:1900`](../../agents/roomlerd/src/encode/ffmpeg/encoder.rs#L1900), and `bf=0` in
+NVENC's options, [`encoder.rs:367`](../../agents/roomlerd/src/encode/ffmpeg/encoder.rs#L367)). Two opt-in knobs can
+name what 12.1 does not. `nvenc_split=4` ([`encoder.rs:605`](../../agents/roomlerd/src/encode/ffmpeg/encoder.rs#L605))
+is for a GPU with four or more engines: on the Linux trees it reaches the driver as a number, which either takes it or
+refuses the throughput tier, and the frame then encodes whole, the degradation FR-119 P2b-10 opens that tier
+separately for. `ROOMLERD_FFMPEG_TUNE=uhq` is an offline tuning no live session wants. The 12.1 trees refuse the
+value, which takes the quality tier with it, so the open falls to the ladder's plain defaults.
+A newer driver still opens an older SDK: the dev box's 610.88 runs the Windows build's 13.0.
 
 ## 4. Phases
 
@@ -132,7 +143,7 @@ box's 610.88 runs the Windows build's 13.0.
 |---|---|---|---|---|
 | **P0** | A host: **decided 2026-10-29, the operator's own AWS account (D1)** | — | — | — |
 | **P0b** | The rig of §3.1, rehearsed on a GPU-less arm64 box: **done 2026-10-29** (§8) | — | `t4g.small`, `eu-north-1` | S |
-| **P0c** | The Linux trees' NVENC driver floor, 610 → 570: `nv-codec-headers` n13.0.19.0 as on Windows, asserted in the binary (§3.2); the trees re-vendored and the LGPL offer republished before the merge | re-pin + re-vendor (the assets are replaced in place) | the g5g's own image (driver 595) | S |
+| **P0c** | The Linux trees' NVENC driver floor, 610 → 530.41: `nv-codec-headers` n12.1.14.0 (first cut: n13.0.19.0, as on Windows, #3135), asserted in the binary (§3.2); the trees re-vendored and the LGPL offer republished before each merge | re-pin + re-vendor (the assets are replaced in place) | the g5g's own image (driver 595) | S |
 | **P1** | On an NVENC host: the released arm64 build's hello names `ffmpeg-h264_nvenc` (and `hevc`), a session opens it, and a recording uses it with AAC | `encoder_cells_deny` | `g5g.xlarge`, `eu-central-1` | S |
 | **P2** | Only if P0 picks a SoC board: a V4L2 M2M backend | its own deny cell | the board | M |
 | **P3** | Docs, below | — | — | S |
@@ -154,11 +165,12 @@ box's 610.88 runs the Windows build's 13.0.
    spend limit, and then to open `eu-central-1` in the SCP's `RegionFloor` statement. That is a change to the
    organisation's security policy, so the operator makes it, not a session. After it, a G and VT quota of 4 vCPUs
    is requested in `eu-central-1`.
-2. **Which NVENC SDK the Linux trees take** (P0c). **D2, 2026-10-30: 13.0 (driver 570), the Windows build's.** One
-   floor for every NVENC the agent ships, every Windows NVENC cell already runs on it, and it admits NVIDIA's
-   current long-term branch, R580. 12.1 would reach further back (530.41, the R535 branch), but R535 reached its
-   end of life in June 2026 and the two builds would then differ. This is open to the operator: going lower is the
-   same one-line pin plus a re-vendor.
+2. **Which NVENC SDK the Linux trees take** (P0c). **D2, the operator, 2026-10-30: 12.1 (driver 530.41).** The
+   first cut (#3135) took 13.0 (driver 570), the Windows build's, which admits NVIDIA's current long-term branch,
+   R580. 12.1 is the oldest SDK FFmpeg 9.0.1 builds against, and it also admits R535 (its support ended in June
+   2026; hosts outlive their driver's support) and R550. The cost is that the two builds' floors now differ
+   (Windows 570, Linux 530.41) and two opt-in knobs lose a value each (§3.2). Windows keeps its vcpkg baseline's
+   13.0: moving it needs an overlay port for `ffnvcodec`.
 
 ## 7. Out of scope
 
