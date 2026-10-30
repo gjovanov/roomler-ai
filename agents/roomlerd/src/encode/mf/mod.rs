@@ -399,3 +399,163 @@ const fn windows_mf_version() -> u32 {
     // From `mfapi.h`: MF_SDK_VERSION = 0x2, MF_API_VERSION = 0x70.
     0x0002_0070
 }
+
+/// FR-130 P1 — what each Media Foundation encoder on this host writes about
+/// colour, read from its own output.
+#[cfg(test)]
+mod colour_tests {
+    use super::activate::for_each_pipeline;
+    use super::sync_pipeline::{MfPipeline, OutputCodec};
+    use super::windows_mf_version;
+    use crate::encode::bitstream_color::{self, Signalled, Vocabulary};
+    use crate::encode::color_desc::DESCRIPTION;
+    use tunnel_core::env::test_env::{Saved, set};
+    use windows::Win32::Media::MediaFoundation::{MFSTARTUP_FULL, MFShutdown, MFStartup};
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+
+    /// Eight frames of the bars through the pipeline's own BGRA path, a
+    /// keyframe forced halfway, and the parameter sets wherever this MFT puts
+    /// them: in its samples, or on its output type.
+    fn read(codec: OutputCodec, p: &mut MfPipeline) -> Result<(Signalled, &'static str), String> {
+        let (w, h) = p.dims();
+        let mut stream = Vec::new();
+        for i in 0..8u64 {
+            if i == 4 {
+                p.force_keyframe()
+                    .map_err(|e| format!("force a keyframe: {e:#}"))?;
+            }
+            for pkt in p
+                .encode(&bitstream_color::bars(w, h, i))
+                .map_err(|e| format!("encode: {e:#}"))?
+            {
+                stream.extend_from_slice(&pkt.data);
+            }
+        }
+        let parse = |bytes: &[u8]| match codec {
+            OutputCodec::H264 => bitstream_color::h264(bytes),
+            OutputCodec::Hevc => bitstream_color::hevc(bytes),
+            OutputCodec::Av1 => bitstream_color::av1(bytes),
+        };
+        if codec != OutputCodec::Av1 {
+            let types = bitstream_color::nal_types(&stream, codec == OutputCodec::Hevc);
+            eprintln!(
+                "FR-130 MF: the samples carry {} bytes, NAL types {types:?}",
+                stream.len()
+            );
+        }
+        match parse(&stream) {
+            Ok(s) => Ok((s, "in the samples")),
+            Err(in_band) => match p.sequence_header() {
+                Some(seq) => parse(&seq)
+                    .map(|s| (s, "MF_MT_MPEG_SEQUENCE_HEADER"))
+                    .map_err(|e| format!("samples: {in_band}; MF_MT_MPEG_SEQUENCE_HEADER: {e}")),
+                None => Err(format!(
+                    "samples ({} bytes): {in_band}; no MF_MT_MPEG_SEQUENCE_HEADER",
+                    stream.len()
+                )),
+            },
+        }
+    }
+
+    /// MFTs MEASURED to write no colour description whatever they are told
+    /// (the media-type attributes on both types, and the encoder API's
+    /// `CODECAPI_AVEncVideo{Input,Output}Color*`, tried and removed), with the
+    /// evidence. For them the test holds the switch-on stream to "nothing",
+    /// so it fails the day one starts describing (delete its entry).
+    const WRITES_NO_DESCRIPTION: &[(&str, &str)] = &[
+        (
+            "CLSID_MSH264EncoderMFT",
+            "Microsoft's H.264 encoder: its SPS rides MF_MT_MPEG_SEQUENCE_HEADER with no \
+             video_signal_type. neo16, Windows 11, 2026-10-30",
+        ),
+        (
+            "HEVCVideoExtensionEncoder",
+            "Microsoft's HEVC Video Extension: VPS/SPS/PPS in band, the SPS VUI with no \
+             video_signal_type. neo16 (on the RTX 5090 and the Radeon 610M), 2026-10-30",
+        ),
+    ];
+
+    /// Every MF encoder this host opens (each adapter × hardware MFT, and
+    /// Microsoft's software one) takes the colour attributes on its types
+    /// and, with the switch on, writes `color_desc::DESCRIPTION` in MF's
+    /// vocabulary (one BT.601 matrix, one BT.709 curve), except the MFTs
+    /// measured to write none ([`WRITES_NO_DESCRIPTION`]), which must still
+    /// write none. With the switch off every one writes no description. An
+    /// MFT that refused the attributes fails here: the fallback keeps the
+    /// host's encoder, this keeps the refusal visible.
+    #[test]
+    fn every_mf_encoder_here_describes_its_colour() {
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _switch = Saved::cleared("COLOR_DESCRIPTION");
+        // SAFETY: COM (MTA) and Media Foundation for this thread, released
+        // below, as the encoder's worker thread does.
+        unsafe {
+            if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
+                eprintln!("FR-130 MF: no COM on this thread — nothing to read");
+                return;
+            }
+            if let Err(e) = MFStartup(windows_mf_version(), MFSTARTUP_FULL) {
+                CoUninitialize();
+                eprintln!("FR-130 MF: no Media Foundation here ({e:?}) — nothing to read");
+                return;
+            }
+        }
+        let mut read_count = 0;
+        let mut failures = Vec::new();
+        for codec in [OutputCodec::H264, OutputCodec::Hevc, OutputCodec::Av1] {
+            for on in [true, false] {
+                // SAFETY: serialised by DENY_ENV_LOCK; the guard restores it.
+                unsafe { set("COLOR_DESCRIPTION", if on { "1" } else { "0" }) };
+                let switch = if on { "on" } else { "off" };
+                for_each_pipeline(codec, 1280, 720, |mft, adapter, p| {
+                    let cell = format!(
+                        "{} {mft} on {adapter}, switch {switch}",
+                        codec.backend_name()
+                    );
+                    let silent = WRITES_NO_DESCRIPTION.iter().find(|(name, _)| *name == mft);
+                    let verdict = read(codec, p).and_then(|(s, place)| {
+                        eprintln!("FR-130 MF {cell}: {s:?} ({place})");
+                        if !on {
+                            // The switch must reach the open itself: an MFT
+                            // that writes nothing either way cannot show it in
+                            // the stream.
+                            return if p.described() {
+                                Err("the types carry the description with the switch off".into())
+                            } else if s.unspecified() {
+                                Ok(())
+                            } else {
+                                Err(format!("a description with the switch off: {s:?}"))
+                            };
+                        }
+                        if !p.described() {
+                            return Err("the MFT refused the colour attributes".into());
+                        }
+                        match silent {
+                            Some((_, evidence)) if s.unspecified() => {
+                                eprintln!("FR-130 MF {cell}: measured, writes none: {evidence}");
+                                Ok(())
+                            }
+                            Some(_) => Err(format!(
+                                "listed as writing no description, and wrote {s:?}: delete its entry"
+                            )),
+                            None => s.check(DESCRIPTION, Vocabulary::Merged),
+                        }
+                    });
+                    read_count += 1;
+                    if let Err(e) = verdict {
+                        failures.push(format!("{cell}: {e}"));
+                    }
+                });
+            }
+        }
+        // SAFETY: the matching shutdown of the startup above.
+        unsafe {
+            MFShutdown().ok();
+            CoUninitialize();
+        }
+        eprintln!("FR-130 MF: {read_count} pipelines read");
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+}

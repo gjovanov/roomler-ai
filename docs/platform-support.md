@@ -24,7 +24,7 @@ other two, or the device says why it cannot, in its hello and on screen.
 
 A capability word in the hello promises that this device serves the feature, on this OS, now.
 What a host cannot keep, the daemon takes out and explains in `AgentCaps.unavailable`, a map
-of feature → `{code, reason}` (`crates/remote_control/src/models.rs:534`, its keys at `:557`).
+of feature → `{code, reason}` (`crates/remote_control/src/models.rs:541`, its keys at `:564`).
 One seam decides it, `with_honest_words` (`agents/roomlerd/src/encode/caps.rs:1452`), over
 plain facts about the host, so the decision runs and is tested on every OS. Features with a
 channel of their own say no there: capture as `rc:media-unavailable` (FR-80), input as
@@ -107,7 +107,7 @@ flowchart LR
 | Match the remote display to the viewer | ✅ | ✅ a person's own X11 display with one active output, a per-user install (FR-97 P3e-2, from 0.4.148), and the daemon's own virtual desktop on Xorg's dummy driver · ❌ Wayland, a system install, several active outputs | ✅ from 0.4.157 (FR-97 P2d-2b): the main display, with one active display, at its scale and refresh rate · ❌ several active displays | `agents/roomlerd/src/display_match.rs:1081-1086`, `:333`, `:351`; `docs/display-match.md` |
 | Clipboard: text, HTML, images both ways | ✅ | ✅ per-user · ❌ a system install: no session to reach, said as `no-session` | ✅ | `agents/roomlerd/src/encode/caps.rs:1428-1446`; FR-93 P7 |
 | Clipboard: a copied image reaches the viewer by itself | ✅ | ✅ an X11 session with a per-user install, through XFixes' selection events (FR-97 P3e-3a, from 0.4.148) · ❌ Wayland and a system install: on request only, said as `not-watched` | ✅ from 0.4.154, through the pasteboard's change count (FR-97 P2e-1); before it, on request only | image watching rides Windows' clipboard sequence number, on X11 the change gate (`agents/roomlerd/src/clipboard.rs:643`, `:1148`), on a Mac the change count (`agents/roomlerd/src/clipboard.rs:756`); `docs/remote-control.md`, the watcher on X11 and on a Mac |
-| Clipboard: RTF with embedded images | ✅ | ❌ | ❌ | `agents/roomlerd/src/encode/caps.rs:2336-2340` |
+| Clipboard: RTF with embedded images | ✅ | ❌ | ❌ | `agents/roomlerd/src/encode/caps.rs:2346-2350` |
 | An idle desktop costs little CPU | ✅ dirty regions | ✅ X11 damage; Wayland's compositor sends frames on change; the DRM arm skips an unchanged frame | ❌ every frame is a full frame | `Damage::Unknown` (`agents/roomlerd/src/capture/scrap_backend.rs:598`); `docs/wayland.md` |
 | The "being viewed" banner kept out of the stream | ✅ | ❌ | ❌ | `CGDisplayStream` ignores `NSWindowSharingNone` (`docs/desktop-companion.md:625`) |
 | Privacy mode (the curtain) | ✅ Windows 10 2004 and later | ❌ | ⛔ | `docs/privacy-mode.md`, Platforms; §8 |
