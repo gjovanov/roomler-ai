@@ -161,11 +161,15 @@ Welcome, before a token exists. The elevated copy
    single-instance plugin looks for a running copy — otherwise it would find
    the dying copy's lock, hand it its arguments and quit;
 2. keeps its WebView2 data in its own folder
-   (`%LOCALAPPDATA%\ai.roomler.setup\elevated`, through the documented
-   `WEBVIEW2_USER_DATA_FOLDER` override): WebView2 shares one browser process
-   among every host naming the same folder, the limited copy's can outlive it by
-   a moment, and an elevated host must not join a limited browser process. Any
-   elevated run does this, a hand-made "Run as administrator" included; a
+   (`%LOCALAPPDATA%\ai.roomler.setup\elevated`): WebView2 shares one browser
+   process among every host naming the same folder, the limited copy's can
+   outlive it by a moment, and an elevated host must not join a limited browser
+   process. The folder goes through the API (Tauri's `data_directory`, so the
+   main window is created by the wizard's setup hook and `tauri.conf.json` says
+   `"create": false`), never through `WEBVIEW2_USER_DATA_FOLDER`: an elevated
+   WebView2 host ignores every `WEBVIEW2_*` environment variable — for the same
+   reason an elevated wizard's debugging port comes only from the HKLM policy.
+   Any elevated run does this, a hand-made "Run as administrator" included; a
    limited run keeps Tauri's folder unchanged;
 3. opens on Welcome with the handed role preselected, over the detected
    default, and the Continue gate as usual.

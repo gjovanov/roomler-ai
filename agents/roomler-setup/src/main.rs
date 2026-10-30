@@ -45,15 +45,6 @@ use tauri::{Emitter, Manager};
 use wizard_app::{INSTALL_IN_PROGRESS, commands};
 
 fn main() {
-    // FR-129 C3 — first, while this is still the process's only thread: an
-    // elevated wizard keeps its WebView2 data apart from a limited one's
-    // (`launch::webview_folder_override` says why).
-    if let Some(dir) = wizard_app::launch::webview_folder_override() {
-        // SAFETY: no other thread exists yet — not tracing's, not Tauri's,
-        // not tokio's — so nothing can read the environment while it changes.
-        unsafe { std::env::set_var(wizard_app::launch::WEBVIEW2_USER_DATA_FOLDER, &dir) };
-    }
-
     // Stderr-only tracing. The wizard is a foreground EXE the
     // operator launches manually; persistent logging is the daemon's
     // job, not ours. Operators who want wizard-side logs run from a
@@ -104,6 +95,28 @@ fn main() {
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        // FR-129 C3 — the one window, from its `tauri.conf.json` entry (which
+        // says `"create": false`), so that an ELEVATED wizard can hand
+        // WebView2 a user-data folder of its own: through the API, the only
+        // channel an elevated host honours (`launch::webview_data_directory`
+        // says why). A limited wizard passes nothing and keeps Tauri's folder.
+        .setup(|app| {
+            let config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == wizard_app::launch::MAIN_WINDOW)
+                .cloned()
+                .ok_or("tauri.conf.json has no main window")?;
+            let mut window = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?;
+            if let Some(dir) = wizard_app::launch::webview_data_directory() {
+                tracing::info!(dir = %dir.display(), "elevated: WebView2 keeps its own data folder");
+                window = window.data_directory(dir);
+            }
+            window.build()?;
+            Ok(())
+        })
         // FR-129 B1 — the window's own close button: whatever a Linux/macOS
         // daemon install left in the private scratch directory (an enrolled
         // system-scope config kept for a Retry) is shredded before the

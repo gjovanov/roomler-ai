@@ -16,7 +16,7 @@
 //! (`main.rs`), opens on Welcome with the role preselected (the SPA asks
 //! [`crate::commands::cmd_launch_options`]; the role wins over the detected
 //! default) and keeps its WebView2 data apart from the limited copy's
-//! ([`elevated_webview_folder`]).
+//! ([`webview_data_directory`]).
 //!
 //! Nothing secret is on this command line: the relaunch happens on Welcome,
 //! before a token is pasted or paired. Every value is validated on both
@@ -142,10 +142,7 @@ pub fn relaunch_args(
 /// same folder ("Manage user data folders", Microsoft Learn), and the limited
 /// copy's can still be running for a moment after that copy has exited; an
 /// elevated host joining a limited browser process is the cross-integrity
-/// failure. So an elevated run names its own folder, through the
-/// `WEBVIEW2_USER_DATA_FOLDER` override, which replaces the folder Tauri
-/// passes (`main.rs` sets it before Tauri starts, and only when nothing set it
-/// already). `None` when there is no local app-data folder to put it in.
+/// failure. `None` when there is no local app-data folder to put it in.
 pub fn elevated_webview_folder() -> Option<std::path::PathBuf> {
     directories::BaseDirs::new().map(|b| {
         b.data_local_dir()
@@ -158,22 +155,25 @@ pub fn elevated_webview_folder() -> Option<std::path::PathBuf> {
 /// copy's WebView2 data in (asserted against the file by a test).
 pub const TAURI_IDENTIFIER: &str = "ai.roomler.setup";
 
-/// The WebView2 loader's documented override of the user-data folder an app
-/// passes ("the values … as replacements for the corresponding values in
-/// `CreateCoreWebView2EnvironmentWithOptions` parameters").
-pub const WEBVIEW2_USER_DATA_FOLDER: &str = "WEBVIEW2_USER_DATA_FOLDER";
+/// The label of the one window, created by `main.rs`'s setup hook from its
+/// `tauri.conf.json` entry (which says `"create": false`, so Tauri does not
+/// create it first without the folder below).
+pub const MAIN_WINDOW: &str = "main";
 
-/// The folder `main.rs` names in [`WEBVIEW2_USER_DATA_FOLDER`] before Tauri
-/// starts: [`elevated_webview_folder`] when this wizard is elevated — the C3
-/// relaunch, and a "Run as administrator" by hand alike — and nothing set the
-/// variable already (a harness's choice wins); `None` for a limited wizard,
-/// which keeps Tauri's folder exactly as before.
-pub fn webview_folder_override() -> Option<std::path::PathBuf> {
+/// The user-data folder `main.rs` hands the main window's builder
+/// (`WebviewWindowBuilder::data_directory`, which reaches WebView2 as the
+/// `userDataFolder` argument): [`elevated_webview_folder`] when this wizard is
+/// elevated — the C3 relaunch and a "Run as administrator" by hand alike —
+/// and `None` for a limited wizard, which keeps Tauri's folder exactly as
+/// before. Through the API, not the `WEBVIEW2_USER_DATA_FOLDER` variable: an
+/// elevated WebView2 host ignores every `WEBVIEW2_*` environment override and
+/// honours what the app passes through the API ("Develop secure WebView2
+/// apps", Microsoft Learn), which is why an elevated wizard's CDP port also
+/// comes only from machine policy, never from the environment.
+pub fn webview_data_directory() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        if std::env::var_os(WEBVIEW2_USER_DATA_FOLDER).is_some()
-            || !roomlerd::win_identity::process_is_elevated()
-        {
+        if !roomlerd::win_identity::process_is_elevated() {
             return None;
         }
         elevated_webview_folder()
@@ -337,5 +337,39 @@ mod tests {
         if let Some(dir) = elevated_webview_folder() {
             assert!(dir.ends_with(std::path::Path::new(TAURI_IDENTIFIER).join("elevated")));
         }
+    }
+
+    /// The main window is ours to create: with `"create": false` Tauri leaves
+    /// it to `main.rs`'s setup hook, which is the only place the elevated
+    /// folder can be handed to WebView2. Should the flag go, Tauri would make
+    /// the window first, from the config, without that folder.
+    #[test]
+    fn the_main_window_is_created_by_the_setup_hook() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let windows = conf["app"]["windows"].as_array().expect("the windows list");
+        assert_eq!(windows.len(), 1, "one window");
+        assert_eq!(windows[0]["label"], MAIN_WINDOW);
+        assert_eq!(windows[0]["create"], false);
+        let main = include_str!("main.rs");
+        assert!(main.contains("WebviewWindowBuilder::from_config"));
+        assert!(main.contains("webview_data_directory()"));
+    }
+
+    /// A limited process never names a folder of its own: Tauri's default
+    /// stays exactly what it was. (This test runs limited unless the shell
+    /// that ran it was elevated; then it checks the elevated answer.)
+    #[test]
+    fn only_an_elevated_wizard_names_its_own_folder() {
+        #[cfg(target_os = "windows")]
+        {
+            let elevated = roomlerd::win_identity::process_is_elevated();
+            assert_eq!(webview_data_directory().is_some(), elevated);
+            if elevated {
+                assert_eq!(webview_data_directory(), elevated_webview_folder());
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(webview_data_directory(), None);
     }
 }

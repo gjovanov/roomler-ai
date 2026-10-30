@@ -807,17 +807,23 @@ sequenceDiagram
   sides, and an unknown argument is ignored. `SEE_MASK_NOZONECHECKS`, because the file is the
   wizard's own running image, whose zone check ran when the person opened it.
 - **The wait.** The elevated copy waits, at most 15 s, for the limited one to exit
-  (`launch.rs:191`, called from `agents/roomler-setup/src/main.rs:74`) **before** Tauri's
+  (`launch.rs:191`, called from `agents/roomler-setup/src/main.rs:65`) **before** Tauri's
   single-instance plugin initialises: the plugin finds a running copy by its mutex and window
   and would hand that dying copy the arguments and quit.
-- **WebView2.** An elevated run names its own WebView2 user-data folder,
-  `%LOCALAPPDATA%\ai.roomler.setup\elevated`, through the loader's documented
-  `WEBVIEW2_USER_DATA_FOLDER` override, set in `main.rs:51` before any other thread exists
-  (`launch.rs:171`). WebView2 shares one browser process among every host that names the same
-  folder, and the limited copy's browser process can outlive that copy by a moment; an elevated
-  host joining a limited browser process is the cross-integrity failure. Any elevated run does
-  this, a hand-made "Run as administrator" included; a limited run keeps Tauri's folder, and a
-  folder a harness set is respected.
+- **WebView2.** An elevated run gives WebView2 a user-data folder of its own,
+  `%LOCALAPPDATA%\ai.roomler.setup\elevated` (`launch.rs:173`). WebView2 shares one browser
+  process among every host that names the same folder, and the limited copy's browser process
+  can outlive that copy by a moment; an elevated host joining a limited browser process is the
+  cross-integrity failure. **Through the API, not the environment:** an elevated WebView2 host
+  ignores every `WEBVIEW2_*` environment override and honours what the app passes through the
+  API (Microsoft's "Develop secure WebView2 apps"), so the folder goes to Tauri's
+  `WebviewWindowBuilder::data_directory`, the `userDataFolder` argument WebView2 receives. That
+  is why the main window is now created by the setup hook (`main.rs:103`) from its
+  `tauri.conf.json` entry, which says `"create": false`; a test holds the two together. (The
+  first cut of C3 set `WEBVIEW2_USER_DATA_FOLDER`, which an elevated host would have ignored;
+  the #3116 kit had already met the same rule for the CDP port, which an elevated wizard takes
+  only from machine policy.) Any elevated run does this, a hand-made "Run as administrator"
+  included; a limited run passes nothing and keeps Tauri's folder.
 - **The outcomes.** A declined prompt leaves the limited wizard as it was, with one line; any
   other failure shows its reason and the right-click way; a started copy makes this one exit.
   The elevated copy opens on Welcome with the handed role, which wins over C1's default
