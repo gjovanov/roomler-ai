@@ -1260,6 +1260,26 @@ fn embedded_cli_args() -> Option<Vec<std::ffi::OsString>> {
     Some(argv)
 }
 
+/// FR-65 AC1 — `roomlerd stall-watch-cost`: the pump stall watch's own cost,
+/// A/B'd on THIS host (`encode::stall::cost`). The exit code when this is the
+/// command line, `None` otherwise.
+///
+/// Answered first, in both `main`s, from raw argv like [`embedded_cli_args`]:
+/// it builds no runtime, reads no config, opens no log, takes no lock, starts
+/// no updater and never hands the main thread to AppKit. The host whose cost
+/// matters is a fleet host with a live daemon on it, so the diagnostic must be
+/// pure computation that leaves nothing behind.
+fn answer_stall_watch_cost() -> Option<i32> {
+    use roomlerd::encode::stall::cost;
+    Some(match cost::cli_opts(std::env::args_os())? {
+        Ok(opts) => cost::cli_main(&opts),
+        Err(e) => {
+            logging::say_on_stderr(format!("roomlerd {}: {e}\n{}", cost::VERB, cost::USAGE));
+            1
+        }
+    })
+}
+
 /// FR-27 — on macOS with the native consent panel, tokio may NOT own the main
 /// thread.
 ///
@@ -1281,6 +1301,9 @@ fn embedded_cli_args() -> Option<Vec<std::ffi::OsString>> {
 /// clean shutdown is a `process::exit` after its drain.
 #[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
 pub fn main() -> Result<()> {
+    if let Some(code) = answer_stall_watch_cost() {
+        std::process::exit(code);
+    }
     // The embedded CLI must still short-circuit before any of this — and it
     // must NOT hand the main thread to AppKit, since a CLI call has to be able
     // to return an exit code.
@@ -1359,6 +1382,9 @@ fn shut_down_runtime(rt: tokio::runtime::Runtime) {
 /// than dropped (#2718, [`shut_down_runtime`]).
 #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
 pub fn main() -> Result<()> {
+    if let Some(code) = answer_stall_watch_cost() {
+        std::process::exit(code);
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
