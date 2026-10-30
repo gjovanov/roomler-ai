@@ -1,8 +1,8 @@
 # FR-88: Measure what promotion brings — attribution to an activated device, a link hub, and video on the site
 
 **Issue:** [#1790](https://github.com/gjovanov/roomler-ai/issues/1790) · **Status:** P1 merged 2026-09-30, not yet
-promoted: P1a, the server half, in #1800 (`d359ddf01`); P1b, the site and SPA half, in #1798. P0 merged
-2026-09-29 (#1791); P2–P4 not started · **Owner:** web / public site + auth · **Anchors:** master `dfb78e151` ·
+promoted: P1a, the server half, in #1800 (`ca755310e`); P1b, the site and SPA half, in #1798. P0 merged
+2026-09-29 (#1791); P2–P4 not started · **Owner:** web / public site + auth · **Anchors:** master `9ddf0aa6b` ·
 **Builds on:** [FR-87](FR-87-blog-and-google-indexing.md) (the static site, purestat on every page),
 [FR-60](FR-60-public-docs-site.md) (the generator), [FR-39](FR-39-launch-readiness.md) (`subscribers.source`)
 
@@ -28,7 +28,7 @@ visitor's device**, and gives the videos a home on the site.
 The channel program itself (what is posted, where, when, and why) is not engineering and is not in
 this spec. Nothing here depends on it.
 
-## 2. Evidence (measured 2026-09-29, production and master `dfb78e151`)
+## 2. Evidence (measured 2026-09-29, production and master `9ddf0aa6b`)
 
 - **purestat is already everywhere.** It loads on the SPA (`ui/index.html:42`) and on every static
   page through the shared shell (`ui/docs/site.ts:152-157`). Its event schema stores
@@ -215,9 +215,9 @@ sequenceDiagram
 
 | P | What | Kill switch | Status |
 |---|---|---|---|
-| P0 | claim: issue #1790, this spec, the ledger row | docs only | **merged** #1791 `1366d5423` |
-| P1a | the server half of §3a — `RegisterRequest.attribution`, the `utm_*` query on `GET /api/oauth/{provider}` and its Redis parking spot, `users.signup_attribution` — and the §3c view | the SPA omits `attribution`; the view is platform-admin only | **merged** #1800 `d359ddf01`, promoted `hosted-20260930-60fe7a7` |
-| P1b | the site and SPA half of §3a (the shell script, the register view and its select, the provider buttons, the newsletter form), the goals (§3b), the privacy-policy section, and the `/landing` and `/pricing` redirects in nginx that now keep the query | `ATTRIBUTION_ENABLED = false` in `ui/src/utils/attribution.ts`; `ANALYTICS = null` | **merged** #1798 `71bba4bd3`, promoted `hosted-20260930-60fe7a7` |
+| P0 | claim: issue #1790, this spec, the ledger row | docs only | **merged** #1791 `91c02f6f5` |
+| P1a | the server half of §3a — `RegisterRequest.attribution`, the `utm_*` query on `GET /api/oauth/{provider}` and its Redis parking spot, `users.signup_attribution` — and the §3c view | the SPA omits `attribution`; the view is platform-admin only | **merged** #1800 `ca755310e`, promoted `hosted-20260930-60fe7a7` |
+| P1b | the site and SPA half of §3a (the shell script, the register view and its select, the provider buttons, the newsletter form), the goals (§3b), the privacy-policy section, and the `/landing` and `/pricing` redirects in nginx that now keep the query | `ATTRIBUTION_ENABLED = false` in `ui/src/utils/attribution.ts`; `ANALYTICS = null` | **merged** #1798 `78a2ea096`, promoted `hosted-20260930-60fe7a7` |
 | P2 | `/links/` and the short paths (§3d) | remove the locations and the page | PR open |
 | P3 | video on the site (§3e, as built below it): the homepage, `/docs/start/what-is-roomler/`, the SPA landing and the tutorial's first chapter, with `docs/public-site.md` §7 | empty manifest; revert `frame-src` | PR open |
 | P4 | docs: `docs/public-site.md` gains the attribution flow, the link hub and the video facade, with mermaid; the field log | — | — |

@@ -38,7 +38,7 @@ opaque desynchronized canvas, `pointerrawupdate` sampling, the Keyboard Lock API
 ## 1. The teardown: StarDesk's claims against the code
 
 Sources: stardesk.net (home, /help, /blog, /games) and its Grokipedia entry, read 2026-10-13. Roomler anchors
-are master `4fc8ea7bb`.
+are master `c689d26a0`.
 
 | # | StarDesk claims | Roomler today | Verdict |
 |---|---|---|---|

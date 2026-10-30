@@ -180,7 +180,7 @@ evidence is why both are already in the stats).
 
 Every switch in the Phases table, traced from its config key to the line that consumes it,
 with the unit test that drives it OFF and asserts the pre-phase behaviour. Anchors are
-against master `f4ec58e55`; the two tests marked **this PR** are the gaps the audit found.
+against master `183b89b39`; the two tests marked **this PR** are the gaps the audit found.
 The plumbing is one shape for all of them:
 
 ```mermaid
@@ -202,7 +202,7 @@ flowchart LR
 | **P5** | `ROOMLERD_SLOW_LINK_PROFILE=0` → `slow_link_profile(_, enabled)` | `peer.rs:6362`, resolved once at pump start | `rate_profile.rs:1499` `the_slow_link_profile_engages_only_on_a_remembered_slow_pair` — OFF on the remembered 395 kbps pair ⇒ `None`: native size, native fps, and the refine lift eligible again (`peer.rs:8096`) |
 | **P6** | `ROOMLERD_SEED_CONTRADICTION=0` → `seed_contradiction` | `governor.rs:750` → `CeilingLearner::on_measurement` | `ceiling_learn.rs:368` `on_measurement_is_inert_without_a_contradiction` — OFF on a real contradiction ⇒ `None`, the 5.1 M seed stands; **this PR** `governor.rs` `a_contradicted_seed_stands_when_the_switch_is_off` — the governor's flag reaches the learner (one line of wiring no other test drove OFF) |
 | **P7** | `localStorage['roomler-rc-unordered-video']` ≠ `'1'` | `useRemoteControl.ts:4769`, channels at `:8159` / `:8419` | `useRemoteControl.spec.ts:1744` the reliable + ordered profile is the default, `:1773` off unless exactly `'1'`. The reorder buffer itself has no switch (the Phases table says so); its in-order contract — the pre-stage-C assembler's — is `rcChunkFraming.spec.ts:28–95` |
-| **P8** | `slow_link_floor` (the opener and the relative step ride on it) | `governor.rs:449` (`open_seed_bps` filtered on `floor_relief`); `aimd.rs:269` | `governor.rs:2092` `seed_opening_is_inert_without_the_floor_relief` — OFF ⇒ opens at the 2.55 M cap, no seed, no relief; `aimd.rs:676` `ai_step_is_relative_below_the_nominal_floor` — the step at or above the floor unchanged; **this PR** `aimd.rs` `the_ladder_extension_is_inert_at_or_above_the_nominal_floor` — every rung P8 added sits below the floor and the coarsening at or above it equals the pre-P8 table's (`bc4a9a3e3^`) value for value, so a switched-off session, pinned at the floor, never reaches one |
+| **P8** | `slow_link_floor` (the opener and the relative step ride on it) | `governor.rs:449` (`open_seed_bps` filtered on `floor_relief`); `aimd.rs:269` | `governor.rs:2092` `seed_opening_is_inert_without_the_floor_relief` — OFF ⇒ opens at the 2.55 M cap, no seed, no relief; `aimd.rs:676` `ai_step_is_relative_below_the_nominal_floor` — the step at or above the floor unchanged; **this PR** `aimd.rs` `the_ladder_extension_is_inert_at_or_above_the_nominal_floor` — every rung P8 added sits below the floor and the coarsening at or above it equals the pre-P8 table's (`170d18473^`) value for value, so a switched-off session, pinned at the floor, never reaches one |
 | **T1** | none — a parse fix | `crates/vendored/webrtc-sctp` | not a switch; the vendored parser's own tests plus the CI drift gate (`ci.yml:273`, `scripts/revendor-webrtc-sctp.sh --check`) |
 
 `config_surface.rs:4315` `env_bridge_pairs_have_surface_parity` is the test that every key above is also

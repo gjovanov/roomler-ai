@@ -1,7 +1,7 @@
 # FR-132: Zero-copy by default — each GPU-input cell turns on for the fleet after a clean week of its own
 
 **Issue:** [#3141](https://github.com/gjovanov/roomler-ai/issues/3141) · **Status:** proposed 2026-10-30 — spec and
-claim · **Owner:** the agent's capture and encode path, and remote config · **Anchors:** master `b101fc456` ·
+claim · **Owner:** the agent's capture and encode path, and remote config · **Anchors:** master `01520c8af` ·
 **Takes over:** [FR-118](FR-118-gpu-resident-frames.md) open decision 2 (the default) · **Builds on:**
 [FR-118](FR-118-gpu-resident-frames.md) (the GPU-input cells), [FR-77](FR-77-encoder-chroma-matrix.md) (cells, the
 probe, `encoder_cells_deny`), [FR-119](FR-119-high-refresh-streaming.md) (`fps_deny`, the second pushable denylist)
@@ -17,7 +17,7 @@ open (§7, decision 2) was "OFF for one release, then ON per cell after a clean 
 keyframe requests, `input_path` reasons), never globally". The first half has held since 0.4.181. This FR is the
 second half, and §2 shows that two things it needs are missing today.
 
-## 2. Evidence (master `b101fc456`)
+## 2. Evidence (master `01520c8af`)
 
 ### 2.1 What the GPU path saves, per cell
 

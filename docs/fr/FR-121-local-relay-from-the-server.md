@@ -3,7 +3,7 @@
 **Issue:** [#2862](https://github.com/gjovanov/roomler-ai/issues/2862) · **Status:** P1 to P3 built and live
 (2026-10-25); P3b built (2026-10-28, #2774) and live (2026-10-29): AC8 and AC10 met, AC9 blocked because Chrome 156
 reaches neither relay on 127.0.0.1 from roomler.ai (§3.7); P0's Safari and Firefox, P4 and P5 open · **Owner:** the agent, the fleet module's Hub and the viewer · **Anchors:**
-master `9e236c2fb` · **Found by:** [FR-119](FR-119-high-refresh-streaming.md) (#2670), on its first Windows run
+master `a4d5f8e55` · **Found by:** [FR-119](FR-119-high-refresh-streaming.md) (#2670), on its first Windows run
 
 ## 1. Goal
 
@@ -302,7 +302,7 @@ its own sending is not known yet, and only `chrome://webrtc-internals` can show 
   a relay. Tests on each side, each shown to fail with the first-only behaviour put back.
   **Met 2026-10-29.** On the wire, `several_local_relays_are_additive_on_the_wire`. In the Hub (#3066): with only the
   first device resolved again, both dispatch tests fail, and with the `rc_overlay` guard off, the refusal test fails.
-  In the viewer, run on master `a7a13435d`: with the probe keeping only its first answer, 3 of the 23 FR-121 cases
+  In the viewer, run on master `e7c03c181`: with the probe keeping only its first answer, 3 of the 23 FR-121 cases
   fail; with the pairing taking only the first own device, 2 fail; with the request dropping its `_also` lists, 1
   fails. Restored, all 23 pass.
 - [ ] **AC9 — P3b, the field.** On neo16 (the Windows agent direct, the WSL agent on DERP), a browser whose
