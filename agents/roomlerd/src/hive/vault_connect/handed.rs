@@ -170,6 +170,33 @@ pub(crate) enum Call {
     /// move).
     #[cfg(unix)]
     ToolbeltWithdrawAll { endpoint: u64 },
+    /// FR-90 P8-2c-3 — the daemon: serve the run's model sidecar as
+    /// `endpoint`, for `session` at `fence`, forwarding to `upstream` on
+    /// the device's `workspace` — the listener on the second channel just
+    /// before this frame (Unix), or riding along as `info` (Windows,
+    /// `WSAPROTOCOL_INFOW`, targeting the worker that receives this call,
+    /// exactly as [`Call::Serve`]'s does).
+    SidecarServe {
+        endpoint: u64,
+        session: ObjectId,
+        upstream: String,
+        workspace: Option<String>,
+        #[cfg(windows)]
+        info: Vec<u8>,
+    },
+    /// FR-90 P8-2c-3 — the daemon: stop serving the sidecar's `endpoint`,
+    /// its connections cut.
+    SidecarClose { endpoint: u64 },
+    /// FR-90 P8-2c-3 — the worker: whether `token` may call the model on
+    /// the sidecar's `endpoint` now, and if so, the device's key for this
+    /// one call — never retained past it.
+    SidecarAdmit {
+        endpoint: u64,
+        token: Option<String>,
+    },
+    /// FR-90 P8-2c-3 — the worker: the provider refused the device's key
+    /// on the sidecar's `endpoint` — fetch it again next time.
+    SidecarForgetKey { endpoint: u64 },
 }
 
 /// The answer to a [`Call`].
@@ -205,6 +232,16 @@ pub(crate) enum Answer {
     #[cfg(unix)]
     Leaf {
         leaf: crate::hive::egress::handed::Leaf,
+    },
+    /// FR-90 P8-2c-3 — the device's model key, for one sidecar call.
+    SidecarKey {
+        key: Secret,
+    },
+    /// FR-90 P8-2c-3 — a sidecar call refused, narrow enough to rebuild
+    /// the provider's exact error shape on the worker's side.
+    SidecarRefused {
+        kind: crate::hive::sidecar::AdmitRefusalKind,
+        message: String,
     },
 }
 
