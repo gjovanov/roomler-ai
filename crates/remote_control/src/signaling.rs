@@ -10038,6 +10038,7 @@ mod tests {
                 companion_version,
                 caps,
                 keep_busy,
+                power,
             } => {
                 // FR-43 P2c — the steady state is ABSENT, and that is the
                 // property worth asserting: caps ride the heartbeat only when
@@ -10047,6 +10048,9 @@ mod tests {
                 // busy says nothing: the key is absent on the wire.
                 assert!(keep_busy.is_none());
                 assert!(!s.contains("keep_busy"), "{s}");
+                // FR-55 P4 — nor about power.
+                assert!(power.is_none());
+                assert!(!s.contains("\"power\""), "{s}");
                 assert_eq!(rss_mb, 142);
                 assert!((cpu_pct - 3.25).abs() < f32::EPSILON);
                 assert_eq!(active_sessions, 2);
