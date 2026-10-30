@@ -26,7 +26,7 @@ with p50 ≤ 50 ms and p95 ≤ 80 ms, and no regression on a relay pair.
 |---|---|---|
 | The only clock probe measures **paint age**, not input to photon | `rc:clock` → `rc:clock.echo`: `ui/src/composables/useRemoteControl.ts` L5509, `agents/roomlerd/src/peer.rs` L3036, L8874; consumed in `rc:decodestat` L8739 | Age starts at capture. Input coalescing, injection, the host's own compositor and the capture gate are all invisible to it |
 | The §12 latency budget has never been measured | `docs/remote-control.md` §12 (L970–981): ~50 ms LAN at 60 Hz, "up to 16 ms" for injection → next capture | A table of targets, not of numbers |
-| Direct-path paint age is already small | FR-74's Regal-Elena-PZ cell (2026-09-10): 1920×1080 HEVC, direct, 6–11 ms | On direct paths the sender and the wire are **not** where the time goes |
+| Direct-path paint age is already small | FR-74's WINHOST-K cell (2026-09-10): 1920×1080 HEVC, direct, 6–11 ms | On direct paths the sender and the wire are **not** where the time goes |
 | WGC is event-driven, but a minimum-period sleep runs **before** the slot is checked | `agents/roomlerd/src/capture/wgc_backend.rs` L293–297 (sleep), L302 (slot), L309–311 (`FrameArrived` notify); period in whole ms at L259 | A frame already waiting can pay up to one period (16.7 ms at 60 fps). `1000/144` truncates to 6 ms |
 | The same gate in the scrap backend | `capture/scrap_backend.rs` L352, L505–509 | Same cost on macOS and X11 |
 | The pump deliberately has no second pacer | `peer.rs` L5340–5350 (the rc.92/93 lesson), once-per-open config L5353–5391 | Pacing changes belong in the capture backend, not the pump |

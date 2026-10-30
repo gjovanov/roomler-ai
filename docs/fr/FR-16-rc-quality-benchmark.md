@@ -17,13 +17,13 @@ argued from one person's impression of one drag.
 ## Why the current method cannot answer the question
 
 Field session 2026-08-27, six machines on ONE desk sharing one Wi-Fi (neo16, CORPLAP-3[vpn],
-CORPLAP-1[vpn], CORPLAP-2, MacBook, ROZALINA), operator driving each pair by hand:
+CORPLAP-1[vpn], CORPLAP-2, MacBook, WINHOST-J), operator driving each pair by hand:
 
 | pair | result |
 |---|---|
 | neo16 → CORPLAP-3 | fine |
 | CORPLAP-1 → CORPLAP-3 | 60 ms baseline, 600+ ms spikes |
-| CORPLAP-1 → ROZALINA | 1–2 s frozen at drag start, then ~80 ms, "not smooth" |
+| CORPLAP-1 → WINHOST-J | 1–2 s frozen at drag start, then ~80 ms, "not smooth" |
 | MacBook → CORPLAP-1 (H.265) | **20 000+ ms**; VP9 HW better but still sluggish |
 
 Three properties of that data make hand-testing structurally unable to compare cells:

@@ -96,7 +96,7 @@ shrinks.
      numbers are only ever appended below it. -->
 | FR | Issue | Title | Status |
 |---|---|---|---|
-| [FR-1](FR-1-remote-desktop-drag-smoothness.md) | [#767](https://github.com/gjovanov/roomler-ai/issues/767) | RustDesk-parity remote-desktop drag smoothness | in progress — P1–P5 shipped + field-verified (0.4.4 "Rozalina works nicely"), P6 + P7-HUD open |
+| [FR-1](FR-1-remote-desktop-drag-smoothness.md) | [#767](https://github.com/gjovanov/roomler-ai/issues/767) | RustDesk-parity remote-desktop drag smoothness | in progress — P1–P5 shipped + field-verified (0.4.4 "WINHOST-J works nicely"), P6 + P7-HUD open |
 | [FR-2](FR-2-pin-update-downgrade-guard.md) | [#770](https://github.com/gjovanov/roomler-ai/issues/770) | Pin-update downgrade guard | closed — shipped (#771) + field-verified on prod 2026-08-27 |
 | ~~FR-3~~ | — | *vacated* — the #773/#774 collision; both claimants renumbered | never reuse |
 | [FR-4](FR-4-conference-media-path-integrity.md) | [#776](https://github.com/gjovanov/roomler-ai/issues/776) | Conference media-path integrity | closed — shipped + field-verified (retrospective) |

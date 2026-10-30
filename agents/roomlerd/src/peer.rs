@@ -6718,7 +6718,7 @@ async fn media_pump_ffmpeg_dc(
     // BUFFERED instead of shed (the "movement stutter"); a constrained relay-TCP
     // path stays shallow to shed fast rather than build a stale backlog. Input
     // rides a SEPARATE DC, so a deeper video queue adds no input lag.
-    // 2026-08-26 (field, neo16↔Rozalina): direct 12 → 6. Twelve frames at
+    // 2026-08-26 (field, neo16↔WINHOST-J): direct 12 → 6. Twelve frames at
     // 40 fps was ~300 ms of standing latency all by itself once the byte
     // gate below started bounding the ledger — the burst-absorption job
     // moved to the byte budget (time-denominated), the frame count is now
@@ -6732,7 +6732,7 @@ async fn media_pump_ffmpeg_dc(
     let (send_tx, mut send_rx) =
         tokio::sync::mpsc::channel::<(u64, std::time::Instant, bytes::Bytes)>(ffmpeg_send_depth);
     // Byte-budget gate (field 2026-08-21, winhost-a/corplap — extended to
-    // DIRECT 2026-08-26, neo16↔Rozalina): the channel's FRAME-count bound
+    // DIRECT 2026-08-26, neo16↔WINHOST-J): the channel's FRAME-count bound
     // bounds nothing in BYTES — four native motion frames are ~0.5-1 MB
     // ≈ 2-4 s of a ~2 Mbps relay, and on a LAN a drag burst at a stale
     // maxrate queued 100-345 KB ≈ 100-300+ ms of standing lag. Track the

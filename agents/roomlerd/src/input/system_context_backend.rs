@@ -147,7 +147,7 @@ impl SystemContextInjector {
                     }
                 };
                 // rc.120 — log the worker's own integrity level + the foreground
-                // window's integrity at startup. The REGAL-112500982 field report
+                // window's integrity at startup. The WINHOST-L field report
                 // (can't type into a "Run as admin" PowerShell, can type into a
                 // normal one) is the textbook UIPI signature; this line tells us
                 // whether the system-context worker is actually at System IL
@@ -197,7 +197,7 @@ fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<Job>) {
             }
         };
         events_since_log = events_since_log.wrapping_add(1);
-        // rc.121 — rc.120 PROVED this is NOT UIPI on REGAL-112500982 (worker
+        // rc.121 — rc.120 PROVED this is NOT UIPI on WINHOST-L (worker
         // integrity=System 0x4000 > foreground powershell.exe High 0x3000 ⇒
         // UIPI-exempt) yet letters don't land while Enter/Backspace do. The
         // remaining unknown is the INJECTION PATH: a printable letter arrives as
@@ -351,7 +351,7 @@ impl InputInjector for SystemContextInjector {
 }
 
 // ───────────────────────── rc.120 input diagnostics ─────────────────────────
-// REGAL-112500982 (rc.116): keystrokes reach a normal (Medium-IL) PowerShell
+// WINHOST-L (rc.116): keystrokes reach a normal (Medium-IL) PowerShell
 // but NOT a "Run as administrator" (High-IL) one. That is the textbook UIPI
 // integrity block — and `SendInput` returns SUCCESS even when UIPI silently
 // drops the event, so nothing showed up in the logs. We never logged the

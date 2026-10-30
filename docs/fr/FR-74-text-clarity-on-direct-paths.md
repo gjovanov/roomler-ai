@@ -400,7 +400,7 @@ now nothing on screen said whether the frame that came back actually matched the
 
 ### The field case that decides it
 
-**Regal-Elena-PZ, 2026-09-10, session `6aa286e4`** — 1920×1080 HEVC over a
+**WINHOST-K, 2026-09-10, session `6aa286e4`** — 1920×1080 HEVC over a
 DIRECT carrier, paint age 6–11 ms the whole way, reported by the operator as
 *"started very blurred and it took maybe over 5s to clear up"*.
 

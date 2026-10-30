@@ -248,7 +248,7 @@ fn dispatch<E: Mouse + Keyboard>(enigo: &mut E, msg: InputMsg) -> Result<()> {
             // rc.122 — on Windows, inject printable text as real virtual keys
             // (scancode) instead of enigo.text()'s KEYEVENTF_UNICODE, which the
             // legacy console (Windows PowerShell 5.1 / cmd in conhost) silently
-            // drops (field: REGAL-112500982 — letters vanished in elevated
+            // drops (field: WINHOST-L — letters vanished in elevated
             // Windows PowerShell but worked in pwsh 7 / Windows Terminal). The
             // `ROOMLERD_UNICODE_TEXT=1` kill switch reverts to enigo.text().
             #[cfg(target_os = "windows")]

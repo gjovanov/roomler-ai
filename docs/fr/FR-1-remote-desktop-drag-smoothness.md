@@ -7,7 +7,7 @@ read; P5 shipped in 0.4.4 (field gate pending); P6 + P7-HUD remaining. Tracking 
 
 Dragging a window on a remote screen through the browser viewer must feel as fast and
 smooth as RustDesk on the same pair — and better where our hardware allows. Reference
-field test (2026-08-26, neo16 → Rozalina, same LAN, direct): RustDesk H265 @ ~7 Mbps /
+field test (2026-08-26, neo16 → WINHOST-J, same LAN, direct): RustDesk H265 @ ~7 Mbps /
 29 fps felt instant; roomler hevc_qsv 2880×1800 @ "10 Mbps / 40 fps" felt sluggish,
 bulky, with occasional freezes.
 
@@ -38,7 +38,7 @@ rate control:
 | P2 | Measured-rate v2 (per-frame blocked-send ≥10 ms samples, window-aggregated ≥60 ms) + stage-1 `ceiling := min(nominal, 0.85×G)` | `measured_ceiling` | ✅ rc.484 · **direct-only since 0.4.3** |
 | P3 | Background encoder rebuild: replacement opens on a blocking thread while the current encoder keeps producing; swap between frames + `send_epoch` bump | `bg_rebuild` | ✅ rc.484 · **direct-only since 0.4.3** |
 | P4 | Direct HRD window 2×→1× (`av1_*` floored at 2× — rc.443 VDENC kill) + area-scaled AIMD floor (~3.1 M @ 2880×1800, cap 4 M, unconstrained only) | `direct_hrd_pct`, `area_min_bitrate` | ✅ rc.483 |
-| P5 | Encode cost & cadence: parallel `convert_bgra` (row bands); `block_in_place` the encode; encode-pressure sheds **fps first** on HW (paced, even cadence) instead of the bitrate factor | `par_convert`, `fps_pace` | ✅ 0.4.4 (#781) — **field PASS** ("Rozalina works nicely", 2026-08-27) |
+| P5 | Encode cost & cadence: parallel `convert_bgra` (row bands); `block_in_place` the encode; encode-pressure sheds **fps first** on HW (paced, even cadence) instead of the bitrate factor | `par_convert`, `fps_pace` | ✅ 0.4.4 (#781) — **field PASS** ("WINHOST-J works nicely", 2026-08-27) |
 | P6 | Pointer cadence decoupled from rAF: immediate-send + 8 ms min-gap timer (latest-wins), `pointerrawupdate` sampling where supported | web deploy | ✅ #793 — field gate pending |
 | P7 | Latency telemetry: agent `send_wait_avg/max_ms` (✅ rc.483) + HUD end-to-end age | — | ✅ #793 (agent 0.4.6 + web deploy) — field gate pending |
 
@@ -68,7 +68,7 @@ lumpiness-robust estimator (its own follow-up FR when picked up).
 - [x] AIMD tops out just under the measured pipe on direct (no more 15 M restarts /
       floor visits in steady state)
 - [x] Field: direct drag "definitively faster" (rc.483) and "much better" (0.4.x,
-      verified from neo16, CORPLAP-1 AND the MacBook viewing Rozalina)
+      verified from neo16, CORPLAP-1 AND the MacBook viewing WINHOST-J)
 - [x] Relay unaffected vs rc.483 (0.4.3 gating; regression caught same-day on CORPLAP-3 +
       CORPLAP-2 and reverted)
 - [ ] P5: ≥45 fps at 2880×1800 on Iris-Xe-class with even cadence (WGC drop ratio no
@@ -84,7 +84,7 @@ lumpiness-robust estimator (its own follow-up FR when picked up).
 1. Relay-robust measured ceiling — estimator design (longer aggregation / stall-aware /
    median-of-windows) once enough relay heartbeat data accumulates.
 2. The ~10 Mbps drain plateau: Wi-Fi leg vs webrtc-rs SCTP ceiling (`iperf3`
-   neo16↔Rozalina decides; only matters for >10 Mbps ambitions).
+   neo16↔WINHOST-J decides; only matters for >10 Mbps ambitions).
 3. Background dims/tier rebuilds (still synchronous; rare after P2, but each tier flip is
    a stall — P3's swap machinery could cover them).
 
@@ -98,7 +98,7 @@ lumpiness-robust estimator (its own follow-up FR when picked up).
 | Release | Result |
 |---|---|
 | rc.483 (P1+P4) | "definitively feels faster movement, but still bulky in several ms chunks/steps" — the byte gate converting queue-lag into skips against the still-unmeasured overrun |
-| rc.484 (P2+P3) | ROZALINA direct = better; CORPLAP-3 + CORPLAP-2 over corp relay = WORSE than rc.483 (both mechanisms relay-hostile — see relay note) |
-| 0.4.3 (relay gating) | Rozalina "much better now", verified from neo16, CORPLAP-1 and MacBook; relay reverted to rc.483 posture (re-test pending) |
-| 0.4.4 (P5) | **field PASS 2026-08-27**: "Rozalina's screen works nicely now" (direct); relay pairs handled by FR-10 (0.4.5, its own field PASS) |
-| 0.4.6 + web deploy (P6+P7, #793) | pending — expect: `~NN ms` age pill on the DC canvas paths (ROZALINA ≈ 40–70 ms direct; CORPLAP-3-from-neo16 ≈ 120–180 ms relay; CORPLAP-1 pairs ≈ 200–300 ms — making FR-14's physics visible), drag cadence unchanged-or-better under heavy video |
+| rc.484 (P2+P3) | WINHOST-J direct = better; CORPLAP-3 + CORPLAP-2 over corp relay = WORSE than rc.483 (both mechanisms relay-hostile — see relay note) |
+| 0.4.3 (relay gating) | WINHOST-J "much better now", verified from neo16, CORPLAP-1 and MacBook; relay reverted to rc.483 posture (re-test pending) |
+| 0.4.4 (P5) | **field PASS 2026-08-27**: "WINHOST-J's screen works nicely now" (direct); relay pairs handled by FR-10 (0.4.5, its own field PASS) |
+| 0.4.6 + web deploy (P6+P7, #793) | pending — expect: `~NN ms` age pill on the DC canvas paths (WINHOST-J ≈ 40–70 ms direct; CORPLAP-3-from-neo16 ≈ 120–180 ms relay; CORPLAP-1 pairs ≈ 200–300 ms — making FR-14's physics visible), drag cadence unchanged-or-better under heavy video |

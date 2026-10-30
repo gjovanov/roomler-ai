@@ -285,7 +285,7 @@ fn encoder_options(
     // quality-floored AV1 IDR exceeds a sub-1× reservoir and Intel's AV1
     // VDENC errors rather than clamping). The default is back to 200 %
     // both ways; `constrained_hrd_pct` remains a per-host experiment knob.
-    // Direct-path window (field 2026-08-26, neo16↔Rozalina): the fixed 2×
+    // Direct-path window (field 2026-08-26, neo16↔WINHOST-J): the fixed 2×
     // reservoir legalised drag-start bursts of seconds' worth of bits —
     // the 100-345 KB standing send queue the viewer feels as lag. Direct
     // sessions now default to 1× (`direct_hrd_pct`, env/config tunable);

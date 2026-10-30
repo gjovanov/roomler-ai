@@ -15,7 +15,7 @@ weekly automated audit — never again "signalling green, video black, nothing l
 ## Incident (field evidence, 2026-08-26 21:57–22:01Z)
 
 Reported: no remote video in the Grox room `69a1dbc8d2000f26adc875d5` from any pairing
-(neo16 Chrome ↔ MacBook Safari, same user; neo16 ↔ Rozalina's Chrome), while chat,
+(neo16 Chrome ↔ MacBook Safari, same user; neo16 ↔ WINHOST-J's Chrome), while chat,
 presence and the call UI worked. Pod logs showed **all three connections on ONE pod**
 (worker-2 / zeus, `10.10.20.11`) with textbook signalling: `media:join` → transports
 created **and connected** → audio+video producers → consumers for every remote producer.

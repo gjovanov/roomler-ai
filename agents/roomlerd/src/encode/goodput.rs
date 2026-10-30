@@ -10,7 +10,7 @@
 //! absolute anchor at all: sessions (re)open at the resolution-derived
 //! ceiling (15 Mbps at 2880×1800) while the pipe drains ~10, and the
 //! whole mismatch lands as send-queue lag + production skips (field
-//! 2026-08-26, neo16↔Rozalina — the "sluggish, then chunky" drag).
+//! 2026-08-26, neo16↔WINHOST-J — the "sluggish, then chunky" drag).
 //! The AIMD only observes send-channel occupancy, so it rediscovers the
 //! pipe by congesting it on every burst.
 //!

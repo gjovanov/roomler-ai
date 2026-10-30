@@ -6,7 +6,7 @@
 //! The previous path called `enigo.text()`, which on Windows injects every
 //! character via `KEYEVENTF_UNICODE` (VK_PACKET). The **legacy Windows console
 //! host** (Windows PowerShell 5.1 / cmd.exe in conhost) silently DROPS
-//! VK_PACKET-injected characters — field-confirmed on REGAL-112500982: typed
+//! VK_PACKET-injected characters — field-confirmed on WINHOST-L: typed
 //! letters never appeared in an elevated *Windows PowerShell*, but DID appear
 //! in `pwsh` 7 / Windows Terminal (which accept VK_PACKET), while Enter /
 //! Backspace (real virtual keys) worked everywhere. (rc.120 already proved this
@@ -273,7 +273,7 @@ pub(super) fn type_text(text: &str) {
     // SAFETY: plain read of the thread's active layout.
     let mut hkl: HKL = unsafe { GetKeyboardLayout(fg_tid) };
     // rc.123 — scancode injection is subject to the TARGET's CapsLock (unlike the
-    // old KEYEVENTF_UNICODE path, which ignored it). REGAL-112500982 had CapsLock
+    // old KEYEVENTF_UNICODE path, which ignored it). WINHOST-L had CapsLock
     // toggled ON → every injected letter came out with inverted case. VkKeyScanExW
     // computes the shift state assuming CapsLock OFF, so when it's ON we flip the
     // shift bit for ALPHABETIC chars (CapsLock only affects letters). Non-letters

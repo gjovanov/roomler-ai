@@ -535,7 +535,7 @@ pub fn constrained_hrd_pct() -> usize {
 }
 
 /// DIRECT-path twin of [`constrained_queue_ms`] (field 2026-08-26,
-/// neo16 viewing Rozalina, LAN direct): the direct pump had a
+/// neo16 viewing WINHOST-J, LAN direct): the direct pump had a
 /// frame-count send bound only, so a drag burst at a stale-high maxrate
 /// queued 100–345 KB ≈ 100–300+ ms of standing latency — the "sluggish,
 /// bulky" drag. Budgeting the in-flight bytes converts that lag into an
@@ -642,7 +642,7 @@ pub fn direct_gate_trips(
 
 /// HRD/VBV window for DIRECT sessions, as a percent of `maxrate`.
 /// Default 100 — HALF the rc.234 2× window. Field 2026-08-26 (neo16
-/// viewing Rozalina, hevc_qsv 2880×1800 direct): the 2× reservoir
+/// viewing WINHOST-J, hevc_qsv 2880×1800 direct): the 2× reservoir
 /// legalises drag-start bursts of seconds' worth of bits, which is
 /// exactly the 100–345 KB standing send queue the viewer feels as lag;
 /// 1× still lets a transient spend a full second's budget (the blur fix

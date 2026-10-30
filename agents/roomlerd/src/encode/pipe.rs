@@ -12,7 +12,7 @@
 //!    time, every one under `goodput::MIN_WINDOW_BLOCKED`, nothing accepted. So
 //!    FR-79 V5's rule ("a stall while sending above the measured pipe is our
 //!    fault") had no measurement to compare against and was inert on that host.
-//! 2. **The ceiling sawtooths on a direct path.** Regal-Elena-PZ, 1920×1080
+//! 2. **The ceiling sawtooths on a direct path.** WINHOST-K, 1920×1080
 //!    HEVC over a direct carrier at 6–11 ms paint age: the ceiling is a
 //!    bits-per-pixel CONSTANT (0.625 bpp = 38,880,000), the blocked-send
 //!    goodput measured **6,028,814**, and the target oscillated between them
@@ -279,7 +279,7 @@ mod tests {
         );
     }
 
-    /// Symptom 2, Regal-Elena-PZ: a capacity sample of 6.03 Mbps arrives on a
+    /// Symptom 2, WINHOST-K: a capacity sample of 6.03 Mbps arrives on a
     /// path that has just delivered 20 Mbps. The old `min` rule read 6 M and
     /// the target collapsed to it; the delivery is the harder fact.
     #[test]

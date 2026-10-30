@@ -23,7 +23,7 @@ either agent-reachable or operator-only.**
   `profiletest` / `tunnel-fleet-test` cell, a Chrome-driven RC session, a doc.
 - **operator** — a human's perception or a human's decision. FR-77 is open *only for the
   operator's Notepad++ scroll*. FR-74's remainder is *the operator's cap call*. FR-1 was
-  verified by *"Rozalina works nicely"*. No agent reaches those, ever.
+  verified by *"WINHOST-J works nicely"*. No agent reaches those, ever.
 
 A card is **Ready to close** when every *agent* criterion is ticked with linked evidence.
 The board's top section then answers the question that exists nowhere else today:

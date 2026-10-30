@@ -266,7 +266,7 @@ pub(crate) fn initial_bitrate_for(width: u32, height: u32) -> u32 {
 /// unusability while the link is still technically up.
 pub const MIN_BITRATE_BPS: u32 = 1_500_000;
 
-/// Area-scaled AIMD floor (field 2026-08-26, neo16 viewing Rozalina):
+/// Area-scaled AIMD floor (field 2026-08-26, neo16 viewing WINHOST-J):
 /// [`MIN_BITRATE_BPS`] was tuned as a 1080p legibility floor, but the
 /// AIMD collapse rides it at ANY resolution — at 2880×1800 (5.2 MPix)
 /// 1.5 Mbps is 0.006 bpp, unreadable mush for the whole post-collapse
@@ -1816,7 +1816,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         // ≤ ~2.5 MPix keeps the legacy floor.
         assert_eq!(area_min_bitrate_bps(1920, 1200, false), MIN_BITRATE_BPS);
-        // 2880×1800 (the Rozalina panel) → ~3.1 Mbps.
+        // 2880×1800 (the WINHOST-J panel) → ~3.1 Mbps.
         assert_eq!(area_min_bitrate_bps(2880, 1800, false), 3_110_400);
         // 4K caps at 4 Mbps.
         assert_eq!(area_min_bitrate_bps(3840, 2160, false), 4_000_000);

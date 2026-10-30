@@ -142,7 +142,7 @@ pub const FPS_PACE_MIN: u32 = 15;
 ///
 /// On QSV/NVENC the encode time is pixels-bound and nearly
 /// bitrate-independent, so the bitrate factor above cannot buy frame time
-/// there — it only degrades quality (field: Rozalina rode factor 0.4 with
+/// there — it only degrades quality (field: WINHOST-J rode factor 0.4 with
 /// encode still ~25 ms). The correct first lever on HW is CADENCE: pace the
 /// pump at the encoder's sustainable rate so consumed frames are EVENLY
 /// spaced. Unpaced, a 60 Hz WGC feed consumed at ~40 fps drops ~33 % of

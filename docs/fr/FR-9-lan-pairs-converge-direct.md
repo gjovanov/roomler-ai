@@ -92,7 +92,7 @@ Reproduce the operator's own test — `ping <overlay-ip>` from one end — and r
 | CORPLAP-1 | 108 ms avg (relay) | **6.7 ms** direct |
 | CORPLAP-2 | 145 ms (relay) | **6.5 ms** direct |
 | MacBook | 113 ms avg (relay) | **direct**, 4-5 ms floor |
-| rozalina | 4-7 ms direct (control) | unchanged |
+| winhost-j | 4-7 ms direct (control) | unchanged |
 
 ## Out of scope
 
