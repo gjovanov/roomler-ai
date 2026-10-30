@@ -841,7 +841,24 @@ Binary Images:
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let dump = capture(&dir, Duration::from_secs(20)).expect("this OS has a source");
+        // `sample` reads this whole test binary's symbols (`-mayDie`) while
+        // every other test runs beside it, and on the 3-CPU macOS runner that
+        // outran the 20 s this test once allowed: 26 failures from 10-28 to
+        // 10-30, each this `None`. The deadline is the test's, not the
+        // watchdog's, so it is generous, and a second try covers a `sample`
+        // that exits non-zero under the same load. The time each try took
+        // tells a slow `sample` (at the deadline) from a failing one.
+        let mut tries = Vec::new();
+        let dump = loop {
+            let started = std::time::Instant::now();
+            let dump = capture(&dir, Duration::from_secs(120));
+            tries.push(started.elapsed());
+            match dump {
+                Some(dump) => break dump,
+                None if tries.len() < 2 => {}
+                None => panic!("this OS has a source, yet no try gave a dump: {tries:?}"),
+            }
+        };
 
         let _ = tx.send(());
         let _ = parked.join();

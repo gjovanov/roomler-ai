@@ -1012,7 +1012,7 @@ test of the SIGKILL property itself.
   - The command line is the quoted path alone: no shell stands in front, and nothing a client sends becomes an
     argument.
   - The bytes are raw. The streamed shell path redacts, and redaction inside a binary SFTP stream is corruption.
-  - It starts in the person's profile, read from the token the child runs under (`exec.rs:3538`). A service starts
+  - It starts in the person's profile, read from the token the child runs under (`exec.rs:3544`). A service starts
     in System32, where a bare `put` cannot land.
   - The client gets the exit status, then EOF, then close (`scp`'s verdict), and its abort sits with the exec
     channels', so a closed channel or a dropped session kills the tree.

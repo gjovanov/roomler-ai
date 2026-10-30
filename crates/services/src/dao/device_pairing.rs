@@ -9,8 +9,8 @@
 //! winning the CAS is the right to act: the poll that flips
 //! `approved → delivered` is the one that mints, and a second poll gets
 //! nothing. Every filter that must only match a live pairing also compares
-//! `expires_at` to the clock: the TTL monitor runs about a minute late and
-//! is never relied on for correctness.
+//! `expires_at` to the clock: the TTL monitor passes every 60 s, so an
+//! expired row lingers up to a minute, and it is never relied on for correctness.
 
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;

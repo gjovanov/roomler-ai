@@ -336,7 +336,7 @@ ceilings, not the boundary (§5), and a flood can therefore leave up to one audi
 per hour rather than one.
 
 The clock is the authority on a pairing's life, not the TTL sweep: the TTL index on
-`expires_at` (`lib.rs:641`) only tidies, because the monitor runs about a minute late, and
+`expires_at` (`lib.rs:641`) only tidies, because its monitor passes every 60 s (an expired row lingers up to a minute, or goes at once), and
 **every reader compares `expires_at` to now** (`live_pending`; `decide_poll`; the CAS filters
 `expires_at > now` on `approve` and `deliver`). A row found past its life is flipped to
 `expired` by whichever reader found it, so the expiry is audited exactly once.

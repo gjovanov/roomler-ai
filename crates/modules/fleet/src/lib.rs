@@ -628,7 +628,7 @@ impl Module for FleetState {
             // partial index), so a code is free again once its pairing is
             // decided, and `start` regenerates on a collision. The TTL on
             // `expires_at` only tidies: every read compares the clock itself,
-            // because the monitor runs about a minute late.
+            // because the monitor passes every 60 s (a row lingers up to 60 s).
             IndexSet {
                 collection: roomler_ai_db::models::DevicePairing::COLLECTION,
                 pre_ops: Vec::new(),
