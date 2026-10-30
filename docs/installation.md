@@ -22,7 +22,7 @@ flowchart TB
     LGUI -->|"GUI (FR-129 B1)"| LWIZ["roomler-setup wizard<br/>per-user or system daemon →<br/>the embedded install.sh halves,<br/>one pkexec prompt"]
     LGUI -->|terminal| SH["curl roomler.ai/api/setup/install.sh | sh<br/>--role daemon (.deb x86_64/arm64)"]
     OS1 -->|macOS| MGUI{"GUI or terminal?"}
-    MGUI -->|"GUI (FR-129 B1)"| MWIZ["roomler-setup wizard<br/>per-user daemon → install.sh halves,<br/>one osascript admin prompt<br/>(the root half: B2)"]
+    MGUI -->|"GUI (FR-129 B1, B2)"| MWIZ["roomler-setup wizard<br/>per-user daemon + the root half<br/>(the overlay box) → install.sh halves,<br/>one osascript admin prompt"]
     MGUI -->|terminal| PKG["install.sh --role daemon (.pkg, arm64)"]
     LWIZ -.->|"only when the server says<br/>wizard_unix_daemon: true"| LGUI
     MWIZ -.->|"same switch"| MGUI
@@ -171,7 +171,9 @@ Enrollment successful. Agent id: …
   `install.ps1 -Role … -Pair [-PairOrg SLUG]`. The tunnel role still takes
   `--token` (the `roomler` CLI has no `--pair` yet). The macOS root half is a
   second enrollment, paired afterwards as root — the install prints the two
-  commands (the macOS section below); one approval for both halves is FR-129 B2.
+  commands (the macOS section below). One approval for both halves is the
+  wizard's (FR-129 B2); the terminal keeps two runs, because one would hand a
+  credential across the `sudo` boundary with no Retry.
 
 ### "The host must be re-enrolled" — when to believe it
 
@@ -183,7 +185,7 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3541`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3585`) |
+| `config::load` (`crates/agent-core/src/config.rs:3543`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3587`) |
 | `config::read_if_present` (`:3615`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
@@ -219,7 +221,7 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2609`, `:2631`), at the clean-run promotion
+`crates/agent-core/src/config.rs:2611`, `:2633`), at the clean-run promotion
 (`record_clean_run_at`, `:2618`), at every `ConfigSet`, and at enrollment. The daemon, the
 desktop app and the setup wizard all write it through `config::save` (`:4060`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
@@ -715,10 +717,21 @@ they grow, and its exit status to a third. A cancel closes the dialog while it
 is up; once the password is accepted, killing `osascript` would no longer stop
 the root shell — `installer -pkg` would run on — so the wizard waits it out
 and says so instead. The card appears only when the server's `wizard_unix_daemon`
-switch is on, like the Linux cards. The root half (the overlay) is **B2**: the
-seam is in place — the pairing's `halves: 2`, two tokens, `--config-from` on
-macOS requests the root half and folds into an existing `/etc/roomler/config.toml`
-through `roomlerd adopt-enrollment` — but the wizard does not run it yet. The
+switch is on, like the Linux cards.
+
+**The root half from the wizard (FR-129 B2).** With "Join the overlay network"
+ticked, which is the macOS default, the wizard adds the root half beside the
+person's: the root LaunchDaemon that owns the overlay's utun, enrolled as a
+device of its own named `<name>-daemon`. One approval delivers both tokens (the
+pairing's `halves: 2`). On the paste path the box asks for a second token, and
+each half counts as a device on the plan. The root half enrolls in the wizard's
+process, before the one administrator dialog, into a 0600 file. `--config-from`
+hands that file to the privileged half, which places it at
+`/etc/roomler/config.toml`, or folds it into the config already there through
+`roomlerd adopt-enrollment`. Its machine id comes from the hardware: the
+platform UUID, and on a virtual Mac its `en0` address too, since a cloned VM
+keeps the original's UUID. So a reinstall finds its row however the network has
+renamed the Mac. Unticked, the wizard installs the per-user half alone. The
 two privacy grants below remain the person's; the Done page says so.
 
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
@@ -889,7 +902,7 @@ and a supervised Mac — whose LaunchAgent FR-43 P2d boots out by design — rea
 
 The supervisor starts the GUI worker as `launchctl asuser <uid> sudo -u '#<uid>'
 … roomlerd run --supervised`, in a process group of its own, so that it can stop
-the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:587`). The same
+the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:592`). The same
 group is why launchd's teardown of the daemon never reaches the worker. Before
 #2987, a daemon that ended any way other than its clean shutdown (the watchdog's
 `exit(2)` after a stall, a crash, a `kill -9`) left its worker running. That
@@ -916,9 +929,9 @@ sequenceDiagram
 
 | Mechanism | How | Catches |
 |---|---|---|
-| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:651`, `:530`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). | A worker of this release, however its daemon ended |
-| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:820`, `:457`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
-| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:475`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
+| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:656`, `:535`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). | A worker of this release, however its daemon ended |
+| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:825`, `:462`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
+| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:480`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
 
 ⚠️ **Mixed versions are safe in both directions.** The offer is a line of its
 own after the secret. A worker from before #2987 reads one line, as it always
@@ -960,7 +973,7 @@ handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3297`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2659`).
+back to the version that is running (`crates/agent-core/src/config.rs:2661`).
 
 ### No pipe can stall the supervisor (#3080)
 
@@ -997,8 +1010,8 @@ sequenceDiagram
 
 | Side of the race | Since #3080 | Where |
 |---|---|---|
-| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:878`, `:827`; `crates/tunnel-core/src/child.rs:75` |
-| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:617` |
+| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:883`, `:832`; `crates/tunnel-core/src/child.rs:75` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:622` |
 | **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:927` |
 
 ⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own

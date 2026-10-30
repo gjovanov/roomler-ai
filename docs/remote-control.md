@@ -290,7 +290,7 @@ flowchart TD
 
 | Input | Where it comes from |
 |---|---|
-| that the agent decides at all | the `rc-overlay-auto` verb in `AgentCaps.rpc` (`crates/remote_control/src/models.rs:1286`), advertised while the kill switch is on (`agents/roomlerd/src/encode/caps.rs:2462`). The Hub sends `auto` to no other agent |
+| that the agent decides at all | the `rc-overlay-auto` verb in `AgentCaps.rpc` (`crates/remote_control/src/models.rs:1286`), advertised while the kill switch is on (`agents/roomlerd/src/encode/caps.rs:2620`). The Hub sends `auto` to no other agent |
 | that the policy is `auto` | `rc:request`'s `rc_overlay_auto`, sent with `rc_overlay: false`, so an agent older than the field reads off (`crates/remote_control/src/signaling.rs:3457`) |
 | the viewer's devices | `RcOverlayAutoWire.viewers` (`crates/remote_control/src/signaling.rs:5522`): the `overlay_ip` of every loopback relay the Hub hands the browser, at most `LOCAL_RELAYS_MAX`, since FR-121 P3b hands over one relay per agent on the viewer's computer. The Hub fills it from the relays in the overlay range (`rc_overlay_auto_wire`, `crates/modules/fleet/src/hub.rs:144`) |
 | the far TURN | `RcOverlayAutoWire.far_turn`: both ends' last netcheck (`stun_udp`, `relay_band_udp`), read by the server (below). `None` = not measured, read as usable |
@@ -322,10 +322,13 @@ flowchart LR
   - The rule is `far_turn_verdict` (`:135`): either end measured dead is `false`; both measured alive is `true`; anything else is not measured.
   - The gate waits at most 500 ms, then sends no hint. A slow read costs the hint, never the session.
 - **Which device is the viewer's** follows the Hub's own precedence (`viewer_device_of`, `controller.rs:663`): a probed descriptor's device wins over a named one.
+- ⚠️ **The hint has two blind spots** (FR-128 D8, open):
+  - **A Mac target is never measured.** The hook finds nodes by agent id (`find_live_by_agent`, `crates/services/src/dao/overlay_node.rs:413`). A Mac's RC target is its GUI worker's row, which has no overlay node; the node belongs to the daemon's row. So for a Mac target the hint reads `false` only when the viewer's device measured the far TURN dead.
+  - **Only the browser's first device counts** (`local_relay: probed[0]`, `ui/src/composables/useRemoteControl.ts:4118`). On a Windows computer that is whichever agent holds the first loopback port. A WSL agent there can measure the far TURN dead while Windows reaches it.
 - **The Hub** reads `auto` as `off` for an agent that does not advertise `rc-overlay-auto` (`effective_rc_overlay`, `crates/modules/fleet/src/hub.rs:2767`). It decides this once per request, for the relay and the session alike.
 - **Under `auto` the Hub hands out the browser's relays** to both ends, as under `on` (`resolve_local_relay`, `hub.rs:3461`; `forward_offer`, `:2316`). The agent may yet take them, and it filters out itself whichever it leaves off the mesh.
 - **Across pods** the relay envelope carries `rc_overlay_auto` and `rc_overlay_far_turn` beside the bool (`rc_overlay_to_relay`, `crates/modules/remote/src/relay.rs:585`; `rc_overlay_from_relay`, `:598`). An older pod reads only the bool, so `auto` reaches it as `off`.
-- **Status:** the agent (P1) and the server and page (P2) are built. A session takes this path once an agent from the release carrying P1 meets a server image carrying P2.
+- **Status:** live since 2026-10-29, on agents from 0.4.185 and server images from `hosted-20261029-2ae4ffd`. The field record is FR-128 §8.
 
 > ⚠️ **Never "decide while gathering" by holding overlay candidates back.** A candidate that is held has still been gathered, and webrtc-rs pairs every gathered candidate. On a weak-host OS, checks from the overlay-bound socket to a browser's LAN address can come back over the mesh as a peer-reflexive pair. The session would then ride a relayed mesh exactly when `auto` had said no.
 
@@ -365,6 +368,12 @@ same organization whose `rc_overlay` is on, or `auto` on an agent that decides i
 (`set_agent_local_relay`, `crates/modules/fleet/src/hub.rs:3441`) and is never stored. ⚠️ It carries a live
 credential, minted by the device and re-minted every 30 minutes, so nothing logs it.
 
+> ⚠️ **On Chrome 156, a TURN server on 127.0.0.1 is no path from roomler.ai** (measured on neo16, 2026-10-29). There
+> is no candidate and no error. Yet example.com reaches the same server, and roomler.ai reaches it on the device's
+> overlay address (FR-121 §3.7). A named device's relay is handed over and the target allocates on it, but the browser
+> gathers nothing from `turn:127.0.0.1:<port>` (`localRelayIceServer`, `ui/src/composables/useRemoteControl.ts:4168`),
+> and the session rides the far TURN. Which address to hand the browser is FR-121's open decision 5.
+
 **More than one agent on one computer (FR-121 P3b, #2774).** Windows and WSL under mirrored networking share
 loopback, each agent with its own relay on its own probe port, and their overlay paths to a target can differ
 completely: on neo16 the Windows agent is direct to every peer while the WSL one rides DERP, and a relay reached over
@@ -376,7 +385,14 @@ is told only when no named device got a relay, and then it is the first one's.
 
 > ⚠️ Chrome ranks its relay candidates by the order of its TURN servers, so among relays that all work, the first in
 > port order wins, not the fastest. Port order is the agents' start order. Whether a slow relay can win that way is
-> FR-121's open decision 4, measured by its AC9.
+> FR-121's open decision 4, measured by its AC9. On neo16 on 2026-10-29 it decided nothing: the WSL relay gave the
+> browser no candidate at all (FR-121 §3.7).
+
+> ⚠️ **The two directions can ride different pairs.** The agent keeps the first pair nominated. It follows a later
+> nomination only to a non-overlay pair of higher priority, or away from a pair gone silent
+> (`should_follow_renomination`, `crates/vendored/webrtc-ice/src/agent/agent_selector.rs:56`). Through a local relay,
+> the video rides the relay's pair, but Chrome may send its own packets on another: on 2026-10-29 it sent input and
+> the data channel's acks on the far TURN (FR-121 §3.7).
 
 A browser paired with one device before P3b holds whichever agent answered first. On a later connect it looks once
 more for the others, but only where Chrome says the loopback permission is already granted (`loopback-network`, or
@@ -467,7 +483,7 @@ off while the machine stayed up (FR-55's keeper holds
 `PreventUserIdleSystemSleep`, which keeps the **machine** reachable and lets the
 display sleep, on purpose). The capture worker now takes
 `power::DisplayAwake` for its whole life
-(`agents/roomlerd/src/capture/scrap_backend.rs:143`,
+(`agents/roomlerd/src/capture/scrap_backend.rs:152`,
 `agents/roomlerd/src/power.rs:284`): `IOPMAssertionDeclareUserActivity` wakes
 the display (`caffeinate -u`), and `PreventUserIdleDisplaySleep` keeps it on,
 so a view-only session, which injects no input to count as activity, does not
@@ -514,17 +530,17 @@ flowchart LR
 ```
 
 The decision is one daemon-side seam, `with_honest_words`
-([`caps.rs:1311`](../agents/roomlerd/src/encode/caps.rs#L1311)), applied in
-`detect()` ([`caps.rs:1013`](../agents/roomlerd/src/encode/caps.rs#L1013))
+([`caps.rs:1452`](../agents/roomlerd/src/encode/caps.rs#L1452)), applied in
+`detect()` ([`caps.rs:1154`](../agents/roomlerd/src/encode/caps.rs#L1154))
 after the config lists, over plain `HostFacts`
-([`caps.rs:1025`](../agents/roomlerd/src/encode/caps.rs#L1025)), so it runs and
+([`caps.rs:1166`](../agents/roomlerd/src/encode/caps.rs#L1166)), so it runs and
 is tested on every OS.
 
 | Feature | When | What the hello says | What the viewer does |
 |---|---|---|---|
 | `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3433`](../agents/roomlerd/src/signaling.rs#L3433)); `no-backend` | the receive-audio toggle is off, with the device's reason |
 | `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
-| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:1292`](../agents/roomlerd/src/encode/caps.rs#L1292)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
+| `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:1433`](../agents/roomlerd/src/encode/caps.rs#L1433)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows and (FR-97 P3e-3a) a Linux X11 session, whose watchers report copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
 | `sas` | Windows, Linux | `keys-only`: the button types three ordinary keys. Windows' lock and sign-in screens ignore them; Linux desktops bind them, GNOME and KDE to log out. A Windows host that can send the real sequence advertises `input: sas` instead and drops this entry (P4a, §5.1e) | the button stays, and says what the keys reach |
 | `sas` | macOS | `not-applicable`: the chord means nothing there | the button is hidden |
@@ -567,7 +583,7 @@ OS may open, and the session says why when it opens nothing.
 | OS | What a session captures | Where it cannot |
 |---|---|---|
 | Windows | WASAPI loopback of the default output device | no output device, usual on a server or a VM with no sound device: `no_output` |
-| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:217`](../agents/roomlerd/src/audio_source.rs#L217)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:1174`](../agents/roomlerd/src/encode/caps.rs#L1174)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
+| Linux | the default output's monitor (`@DEFAULT_MONITOR@`) through Pulse's client library, in the daemon for a per-user install and through the seat user's helper for a root one (P3c-2, [`audio_source.rs:217`](../agents/roomlerd/src/audio_source.rs#L217)); a device named in `ROOMLERD_AUDIO_SOURCE` wins | no Pulse client library: the hello offers no track (`no-sound-server`, [`caps.rs:1315`](../agents/roomlerd/src/encode/caps.rs#L1315)); a root daemon with nobody at the screen: `no_session`; a named device that is not there: `source_not_found`; `ROOMLERD_AUDIO_SESSION=0`: P3c-1's rule, a named device or `no-monitor` |
 | macOS | since FR-97 P2a: ScreenCaptureKit's mix of every app, this process's own excluded ([`audio/sck.rs`](../agents/roomlerd/src/audio/sck.rs)), in a process with a window-server session. On a supervised Mac that is the GUI worker, and the root's row carries the worker's offer (`DelegateHost::effective_audio`); the root decides a delegated session's audio by it. 48 kHz stereo float, 20 ms buffers: Opus's own frame, nothing resampled. It hears the apps with the output muted | the root half itself: `no-session`; the kill switch `ROOMLERD_SCK_AUDIO=0` (forwarded to the worker): `switched-off` on the hello, `switched_off` from a capture; ScreenCaptureKit's own refusal (the Screen Recording grant): `backend_error` with its words |
 
 ⚠️ **On Linux the default input is a microphone, and before P3c-1 it was the
@@ -871,11 +887,52 @@ device on the RTX 5090, the OS copying each frame across):
   panel's adapter, and Desktop Duplication cannot cross adapters, so NVENC on
   the other GPU refuses the frame (`adapter_mismatch`) and reads it back
   ([FR-118 §9.6](fr/FR-118-gpu-resident-frames.md#96-p3s-first-field-contact-2026-10-28)).
+
+**macOS** (FR-118 P5) has no readback, but the same copies. The display
+stream already delivers each frame as an IOSurface. With the switch off the
+scrap arm copies it into memory, the encoder converts the BGRA to NV12 on the
+CPU, and FFmpeg copies that into a buffer for VideoToolbox: 70–87 % of
+VideoToolbox's encode stage over AC1's fleet week. With the switch on, the
+surface itself reaches a proven VideoToolbox encoder as a CVPixelBuffer over
+the same memory, and VideoToolbox converts the BGRA on the GPU.
+
+```mermaid
+flowchart TB
+  S["CGDisplayStream<br/>(scrap arm)"] -->|"switch off: copy into memory"| C1[BGRA in memory]
+  C1 -->|"BGRA→NV12 on the CPU"| V1["VideoToolbox<br/>NV12 copied into its buffer"]
+  S -->|"switch on: the IOSurface itself,<br/>its use count held"| B["CVPixelBuffer over the surface<br/>BT.601 matrix attached"]
+  B -->|AV_PIX_FMT_VIDEOTOOLBOX| V2["VideoToolbox<br/>converts the BGRA"]
+```
+
+- **Each buffer is marked BT.601.** VideoToolbox converts an unmarked BGRA
+  buffer with BT.709, which moves 75 % green from Y 112 to 133. Marked, the
+  test bars decode within 2 code values of the CPU path in every plane.
+- **The surface is held until VideoToolbox is done with it**, out of the
+  stream's queue of 3, and that costs no frames: the frame rate is the same
+  with the switch on and off.
+
+| Measured: `hevc_videotoolbox` 3024×1964 on an M5 Pro, 120 fps asked, a moving test pattern, 20-minute legs (FR-118 AC7) | Switch off | Switch on |
+|---|---|---|
+| capture (the wait for the stream's next frame; switch off: and the copy into memory) | 7.18 ms | 11.21–11.22 ms |
+| encode | 4.18 ms | 0.12 ms |
+| of which the CPU conversion | 3.27 ms | 0.03–0.04 ms |
+| **capture + encode** (the frame period at 88 fps) | **11.34 ms** | **11.32–11.34 ms** |
+| worker CPU per encoded frame | 14.58 ms (126 % of a core) | 2.55–2.60 ms (22–23 %) |
+| encoded fps (median window) | 87.8 | 87.8–88.0 |
+
+- **On the scrap arm the capture stage is a wait too.** The pump times the
+  whole `next_frame()`, which waits for the display stream's next frame, so
+  capture + encode is the frame period on both paths and the time the GPU path
+  saves goes into the wait. The work it removes shows in the encode stage
+  (−97 %) and the worker's CPU (−82 %), which also counts the copy into memory
+  ([FR-118 §9.9](fr/FR-118-gpu-resident-frames.md#99-ac7-videotoolbox-on-the-macbook-2026-10-29)).
+
 - The cells, the reasons a session took CPU frames, and the configuration:
   [`encoders.md`](encoders.md#gpu-resident-frames-the-input-path-fr-118). The
   field record: [FR-118 §9.2](fr/FR-118-gpu-resident-frames.md#92-the-first-field-run-2026-10-28),
-  [§9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28)
-  and [§9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29).
+  [§9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28),
+  [§9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29)
+  and [§9.9](fr/FR-118-gpu-resident-frames.md#99-ac7-videotoolbox-on-the-macbook-2026-10-29).
 
 ### 5.2 Encoder selection
 
@@ -908,7 +965,7 @@ without the switch behaves exactly as before. Spec and field log:
 
 **The switch and the wire.** `fps_high` in the config (or `ROOMLERD_FPS_HIGH`),
 default off. With it on, the hello's `AgentCaps.video` carries `fps-high` and
-`fps-retry` ([`caps.rs:1662`](../agents/roomlerd/src/encode/caps.rs#L1662)).
+`fps-retry` ([`caps.rs:1820`](../agents/roomlerd/src/encode/caps.rs#L1820)).
 Without them the viewer never offers above 60 and never sends `rc:fps`.
 
 | Message | Direction | Fields |
@@ -3187,7 +3244,7 @@ to-activate, so the browser never sees a bait-and-switch.
   because an X server buffers what a client does not read. Our own writes
   change the owner too, and the content hashes swallow them as before.
   `AgentCaps.unavailable["clipboard-image-events"]` goes away where the
-  gate opens (`agents/roomlerd/src/encode/caps.rs:1137`). ⚠️ Not under
+  gate opens (`agents/roomlerd/src/encode/caps.rs:1278`). ⚠️ Not under
   Wayland: the clipboard is the compositor's there, and Xwayland's copy
   of it is unmeasured. A broken gate connection drops back to text
   polling with images unwatched. Kill switch
@@ -3203,7 +3260,7 @@ to-activate, so the browser never sees a bait-and-switch.
   the gate skips cannot ask. The count is read inside an autorelease pool of
   its own (`clipboard.rs:797`), because the clipboard worker is not the main
   thread. `unavailable["clipboard-image-events"]` goes away wherever the
-  switch is on (`agents/roomlerd/src/encode/caps.rs:1144`), without asking this
+  switch is on (`agents/roomlerd/src/encode/caps.rs:1285`), without asking this
   process's own pasteboard (`clipboard.rs:807`): on a supervised Mac the root
   daemon says the hello, while a delegated session's clipboard runs in the GUI
   worker. A root daemon outside the console session cannot reach the
@@ -3424,7 +3481,7 @@ the compositor's, and no protocol the desktops share reads or sets it.
 Xwayland's XKB group is a copy of what the compositor sends, and locking it
 does not reach the compositor. A system install reaches the screen through DRM
 and has no X connection (FR-113). Both leave `layout` out of the hello
-(`agents/roomlerd/src/encode/caps.rs:1352`), with no reason in `unavailable`:
+(`agents/roomlerd/src/encode/caps.rs:1493`), with no reason in `unavailable`:
 there is no control to grey, so the chip does not appear, as before P3e.
 
 ### 18.3.3 The keyboard layout on a Mac (FR-97 P2d-2a)

@@ -83,6 +83,29 @@ pub mod pointer;
 ))]
 pub mod gpu_frame;
 
+/// FR-118 P5 — a frame that stays on the GPU on macOS: the IOSurface the
+/// display stream delivered.
+#[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+pub mod iosurface_frame;
+
+/// FR-118 — the kill switch for GPU-resident frames, on every platform:
+/// `ROOMLERD_ZERO_COPY` (config `zero_copy`), default OFF. A capture backend
+/// reads it once, when it opens, and delivers GPU frames only while it is on.
+pub fn zero_copy_enabled() -> bool {
+    zero_copy_from(tunnel_core::env::node_env("ZERO_COPY").as_deref())
+}
+
+/// `1`, `true`, `yes` or `on`, in any case, turn it on; anything else leaves
+/// it off.
+fn zero_copy_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        let v = v.trim();
+        ["1", "true", "yes", "on"]
+            .iter()
+            .any(|on| v.eq_ignore_ascii_case(on))
+    })
+}
+
 /// A captured frame, in an encoder-agnostic representation.
 ///
 /// We don't commit to a specific colour space in the trait — backends can
@@ -139,6 +162,8 @@ impl Frame {
                 any(feature = "mf-encoder", feature = "wgc-capture")
             ))]
             FrameData::Gpu(gpu) => gpu.cpu(),
+            #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+            FrameData::IoSurface(surface) => surface.cpu(),
         }
     }
 
@@ -153,6 +178,10 @@ impl Frame {
         if let FrameData::Gpu(gpu) = &self.data {
             self.data = FrameData::Cpu(gpu.cpu().to_vec());
         }
+        #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+        if let FrameData::IoSurface(surface) = &self.data {
+            self.data = FrameData::Cpu(surface.cpu().to_vec());
+        }
         match &mut self.data {
             FrameData::Cpu(bytes) => bytes,
             #[cfg(all(
@@ -160,6 +189,10 @@ impl Frame {
                 any(feature = "mf-encoder", feature = "wgc-capture")
             ))]
             FrameData::Gpu(_) => unreachable!("a GPU frame was replaced by its bytes just above"),
+            #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+            FrameData::IoSurface(_) => {
+                unreachable!("an IOSurface frame was replaced by its bytes just above")
+            }
         }
     }
 }
@@ -181,6 +214,10 @@ pub enum FrameData {
         any(feature = "mf-encoder", feature = "wgc-capture")
     ))]
     Gpu(gpu_frame::GpuFrame),
+    /// FR-118 P5 — the BGRA IOSurface `CGDisplayStream` delivered, held for as
+    /// long as a consumer holds the frame.
+    #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+    IoSurface(iosurface_frame::IoSurfaceFrame),
 }
 
 impl From<Vec<u8>> for FrameData {
@@ -3404,6 +3441,19 @@ mod frame_tests {
         assert_eq!(&f.cpu()[1..], &bytes[1..]);
         let copy = f.clone();
         assert_eq!(copy.cpu(), f.cpu(), "a clone carries the same bytes");
+    }
+
+    /// FR-118 — the switch is off unless it says on: unset, empty, `0` and
+    /// anything unrecognised all leave a host on today's path.
+    #[test]
+    fn the_zero_copy_switch_is_off_unless_it_says_on() {
+        for on in ["1", "true", "TRUE", "yes", "On", " on "] {
+            assert!(zero_copy_from(Some(on)), "{on:?} turns it on");
+        }
+        for off in ["0", "false", "no", "off", "", "2", "enabled"] {
+            assert!(!zero_copy_from(Some(off)), "{off:?} leaves it off");
+        }
+        assert!(!zero_copy_from(None));
     }
 
     // P8a — damage re-projection through a downscale (moved here with

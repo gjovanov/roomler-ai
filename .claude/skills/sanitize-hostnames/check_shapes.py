@@ -145,6 +145,10 @@ ALLOW = re.compile(
     # positive the generalised shape produced across the whole history, so it
     # is listed rather than weakening the shape.
     r"|ISO[0-9]+"                                             # spec numbers
+    # IEC 61966-2-1 is the sRGB standard, and WebCodecs and FFmpeg spell its
+    # transfer `iec61966-2-1` / `IEC61966_2_1` (FR-130, 2026-10-30): the same
+    # spec-number family as ISO10646, so it is listed the same way.
+    r"|IEC[0-9]+"
     # A RETIRED canary, not a machine -- it never named anything. Writing up
     # this guard published it into a GitHub issue, so step 2b's scan of
     # PUBLISHED content reported it on every run, and a standing "known

@@ -32,6 +32,7 @@ use dashmap::DashMap;
 use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{
     IndexOp, IndexSet, index, index_ttl, index_unique, index_unique_partial,
+    index_unique_partial_named,
 };
 use roomler_ai_mod_fleet::FleetState;
 use roomler_ai_remote_control::signaling::ServerMsg;
@@ -646,8 +647,6 @@ impl Module for NetworkState {
             // The allocator's "highest end" probe — one indexed sort+limit.
             index(bson::doc! { "end_slot": -1 }),
             index(bson::doc! { "tenant_id": 1 }),
-            // Multi-block reads a network's blocks in allocation order.
-            index(bson::doc! { "network_id": 1, "seq": 1 }),
         ];
         let mut overlay_block_ops = Vec::new();
         if multi_block {
@@ -663,7 +662,32 @@ impl Module for NetworkState {
                 index: "network_id_1",
                 why: "multi-block schema — one-block-per-network guard removed",
             });
+            // FR-68 AC4 — what replaces that guard. A network's address
+            // space is its assigned blocks concatenated in `seq` order, so
+            // two ASSIGNED blocks at one position would silently re-point
+            // every ordinal above them. Single-block never needed this (one
+            // assigned block per network, so one position); multi-block
+            // makes it the structural half of the guarantee: a concurrent
+            // carve or grow of the same network collides on this index, and
+            // the allocator's re-read of the position returns the winner's
+            // row instead of inserting a twin. The plain read index it
+            // replaces has the same key pattern, so it is dropped first —
+            // under a DISTINCT name below, or the drop would find the
+            // replacement on every later boot.
+            overlay_block_ops.push(IndexOp::DropIndexIfPresent {
+                index: "network_id_1_seq_1",
+                why: "multi-block schema — the plain (network_id, seq) read index is \
+                      replaced by the assigned-unique position guard",
+            });
+            overlay_block_indexes.push(index_unique_partial_named(
+                bson::doc! { "network_id": 1, "seq": 1 },
+                bson::doc! { "state": "assigned" },
+                "network_id_1_seq_1_assigned",
+            ));
         } else {
+            // Multi-block reads a network's blocks in allocation order; under
+            // single-block there is one, so this is a plain read index.
+            overlay_block_indexes.push(index(bson::doc! { "network_id": 1, "seq": 1 }));
             overlay_block_indexes.push(index_unique_partial(
                 bson::doc! { "network_id": 1 },
                 bson::doc! { "state": "assigned" },

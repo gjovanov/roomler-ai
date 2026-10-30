@@ -131,6 +131,15 @@ impl ScrapCapture {
         let desired = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         #[cfg(target_os = "macos")]
         let desired_worker = desired.clone();
+        // FR-118 P5 — read once, when the backend opens. On macOS the switch
+        // hands each frame's IOSurface on instead of its bytes; elsewhere this
+        // arm has no GPU form.
+        let zero_copy = cfg!(target_os = "macos") && super::zero_copy_enabled();
+        if zero_copy {
+            tracing::info!(
+                "FR-118: zero-copy ON — each frame's IOSurface goes on, read back only if a consumer asks"
+            );
+        }
 
         thread::Builder::new()
             .name("roomlerd-capture".into())
@@ -401,8 +410,15 @@ impl ScrapCapture {
                         }
                     }
                     #[allow(unused_mut)]
-                    let mut reply =
-                        capture_one_blocking(&mut cap, w, h, (native_w, native_h), start, downscale);
+                    let mut reply = capture_one_blocking(
+                        &mut cap,
+                        w,
+                        h,
+                        (native_w, native_h),
+                        start,
+                        downscale,
+                        zero_copy,
+                    );
                     #[cfg(target_os = "macos")]
                     if let (Some(since), Ok(Some(_))) = (woke_at, reply.as_ref()) {
                         tracing::info!(
@@ -509,6 +525,32 @@ fn native_source(native: (u32, u32), out: (u32, u32)) -> Option<(u32, u32)> {
     (native != out && native.0 > 0 && native.1 > 0).then_some(native)
 }
 
+/// FR-118 P5 — a delivered frame at its own size, as a frame's pixels: on
+/// macOS with the switch on, the IOSurface itself, which VideoToolbox takes on
+/// the GPU and every other consumer reads back through `Frame::cpu()`;
+/// otherwise its bytes, copied into memory.
+fn whole_frame(
+    buf: scrap::Frame<'_>,
+    width: u32,
+    height: u32,
+    stride: u32,
+    zero_copy: bool,
+) -> (super::FrameData, u32, u32, u32) {
+    #[cfg(target_os = "macos")]
+    if zero_copy {
+        let surface = buf.into_surface();
+        // SAFETY: `into_surface` hands over a live BGRA surface of the
+        // stream's output size, with the retain and the use count `adopt`
+        // takes over.
+        let frame =
+            unsafe { super::iosurface_frame::IoSurfaceFrame::adopt(surface, width, height) };
+        let stride = frame.stride().max(width.saturating_mul(4));
+        return (super::FrameData::IoSurface(frame), width, height, stride);
+    }
+    let _ = zero_copy;
+    (buf.to_vec().into(), width, height, stride)
+}
+
 fn capture_one_blocking(
     cap: &mut Capturer,
     width: u32,
@@ -516,6 +558,7 @@ fn capture_one_blocking(
     native: (u32, u32),
     start: Instant,
     downscale: DownscalePolicy,
+    zero_copy: bool,
 ) -> CaptureReply {
     // Give the compositor a budget — if nothing is ready within ~100 ms we
     // return None and let the async side decide whether to retry.
@@ -535,16 +578,16 @@ fn capture_one_blocking(
                 };
                 let (data, out_w, out_h, out_stride) = if should_downscale {
                     let (dst, dw, dh) = downscale_bgra_2x(&buf, width, height, stride);
-                    (dst, dw, dh, dw * 4)
+                    (dst.into(), dw, dh, dw * 4)
                 } else {
-                    (buf.to_vec(), width, height, stride)
+                    whole_frame(buf, width, height, stride, zero_copy)
                 };
                 return Ok(Some(Frame {
                     width: out_w,
                     height: out_h,
                     stride: out_stride,
                     pixel_format: PixelFormat::Bgra,
-                    data: data.into(),
+                    data,
                     monotonic_us,
                     monitor: 0,
                     // scrap doesn't expose a dirty-rect API on any

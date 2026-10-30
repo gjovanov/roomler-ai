@@ -334,6 +334,23 @@ pub fn encoder_inplace_rate_enabled() -> bool {
     tunnel_core::env::node_env("ENCODER_INPLACE_RATE").as_deref() == Some("1")
 }
 
+/// FR-62 A1 — the HRD/VBV reservoir an in-place rate move writes, in bits.
+///
+/// Flag OFF is the pre-A1 write: a 1× window (`target`), which silently
+/// resizes the reservoir on every move. Flag ON sizes it to the window the
+/// session opened with (`target × hrd_pct / 100`, the open's `open_hrd_pct`),
+/// which on a constrained session is deliberately below 1× — matching the open
+/// is the point, and a `.max(target)` floor here would re-create the pre-A1
+/// divergence. Pure and in the ungated module, so the lane everyone runs pins
+/// the OFF arm (AC5: `encoder_inplace_rate = false` is today's behaviour).
+pub fn inplace_rate_bufsize(target: usize, hrd_pct: usize, inplace_rate: bool) -> usize {
+    if inplace_rate {
+        (target.saturating_mul(hrd_pct) / 100).max(1)
+    } else {
+        target
+    }
+}
+
 /// FR-62 A2 — escape hatch: force NVENC rate moves back onto the pre-A2
 /// IDR-rationing path (the pump defers a constrained increase instead of
 /// applying it live) if some driver ever emits a keyframe on an in-place
@@ -1711,6 +1728,21 @@ fn hw_auto_disabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-62 AC5 — with `encoder_inplace_rate` OFF an in-place move writes
+    /// the pre-A1 1× window, whatever the session opened with; ON writes the
+    /// open's window, below 1× on a constrained session, never a `.max(target)`.
+    #[test]
+    fn inplace_rate_off_writes_the_pre_a1_one_times_window() {
+        for hrd_pct in [25usize, 100, 200] {
+            assert_eq!(inplace_rate_bufsize(3_000_000, hrd_pct, false), 3_000_000);
+        }
+        assert_eq!(inplace_rate_bufsize(3_000_000, 100, true), 3_000_000);
+        assert_eq!(inplace_rate_bufsize(3_000_000, 200, true), 6_000_000);
+        assert_eq!(inplace_rate_bufsize(3_000_000, 25, true), 750_000);
+        // Never zero: FFmpeg reads 0 as "unset" and would size the window itself.
+        assert_eq!(inplace_rate_bufsize(1, 25, true), 1);
+    }
 
     /// FR-112 P2 — at 30 the base is exactly today's; at 60 it grows by √2,
     /// not 2×; it never leaves the bitrate bounds.
