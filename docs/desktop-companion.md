@@ -439,6 +439,27 @@ sequenceDiagram
   persisted and reported as *applied-pending-restart*, and there is no server message that
   restarts anything (`docs/remote-config.md` §7b).
 
+### 7.1 The macOS permission card's Restart (#3164)
+
+macOS applies a Screen Recording grant to a freshly started process only, so a Mac's card offers
+**Restart roomlerd** beside its Screen Recording row: the same flow as *Apply now*
+(`window.Roomler.restartDaemon`, the LocalAPI `RestartDaemon` verb, the agent's own supervisor
+relaunches it). Accessibility needs none: the agent reads it live and opens its input backend
+again once it is granted.
+
+The card shows the **agent's** grants, as the agent reports them in its status
+(`NodeStatus.macos_grants`, read from its own process). Before #3164 it asked TCC about the
+menu-bar app's own process, `ai.roomler.agent-tray`, which never holds either grant: the card
+kept asking for both after the person had granted them to `roomlerd`, and its button registered
+the menu-bar app itself in the pane, as the "Roomler" entry that changes nothing. The buttons now
+only open the pane. An agent that does not report its grants (older than #3164, not running, or a
+root half with no GUI session) shows no card.
+
+macOS's own **Quit & Reopen** restarts the agent too (`agents/roomlerd/src/macos_quit.rs`): a
+Quit AppleEvent from anyone but `loginwindow` ends it with the supervisor's restart code instead
+of AppKit's exit 0. Up to 0.4.188 that button left the agent offline (`docs/installation.md`,
+the macOS grants).
+
 ## 8. What this device can encode
 
 The Overview's **Hardware video encoding** card is a codec × backend matrix — H.264, HEVC,

@@ -857,25 +857,64 @@ are silently dropped.
      LaunchDaemon plist passes as its config. It is not — the plist passes
      /etc/roomler/config.toml, and the old dir survives only as a migration
      source in the .pkg postinstall. Corrected 2026-09-02. -->
-- System Settings → Privacy & Security → **Screen & System Audio Recording** → enable **Roomler Daemon**
-- System Settings → Privacy & Security → **Accessibility** → enable **Roomler Daemon**
+- System Settings → Privacy & Security → **Screen & System Audio Recording** → turn on **roomlerd**
+- System Settings → Privacy & Security → **Accessibility** → turn on **roomlerd**
+
+The panes list the agent by its bundle's file name, **`roomlerd`** (with a
+generic icon), and its prompts say "“roomlerd” would like to…" — not its
+`CFBundleName`, "Roomler Daemon", which this page named until #3164. An entry
+called **Roomler** (the brand icon) is the menu-bar app; turning it on changes
+nothing.
 
 If a stale **Roomler Agent** entry is still listed from a pre-rename install,
 remove it — macOS does not carry a grant across a bundle rename, and the `.pkg`
 postinstall prints the same instruction when it detects one.
+<!-- RETIRED-NAME-ANCHOR-END -->
 
 You do not have to hunt for this: the **Roomler menu-bar app** names whichever
-grant is missing and gives you a button per permission that opens the right
-pane. The agent also probes both at startup, says what is missing in its log,
-and reports the state to the server — so the device list shows "No screen
-access" / "No input access" instead of letting you discover it by connecting to
-a black screen.
+grant the agent is missing, as the agent itself reports it, and gives you a
+button per permission that opens the right pane. The agent also probes both at
+startup, says what is missing in its log, and reports the state to the server —
+so the device list shows "No screen access" / "No input access" instead of
+letting you discover it by connecting to a black screen.
 
-Then restart it: `launchctl kickstart -k gui/$(id -u)/com.roomler.agent`
+**Screen Recording needs a restart; Accessibility does not.** macOS applies a
+Screen Recording grant only to a freshly started process, so a session after the
+grant still reports `permission` until the agent restarts (#3164, field-measured
+on macOS 15.7). Restart it in any of three ways:
 
-⚠️ Grants are keyed to the binary's code signature. Until Apple notarisation is
-finished the `.pkg` is unsigned, so **an agent update invalidates them** and
-both toggles need re-enabling.
+| how | what happens |
+|---|---|
+| **Quit & Reopen** — the button macOS offers when you turn the toggle on | System Settings sends the agent a Quit AppleEvent (with a log-out's reason, `'rlgo'`); the agent tells it from a real log-out by its sender (only `loginwindow` quits a session that is ending), leaves with its restart code, and launchd relaunches it within milliseconds. Finder may still say "The application “roomlerd” is not open anymore": its *Reopen* looks for the process that quit, while launchd has already brought the agent back. ⚠️ Agents up to 0.4.188 exited 0 instead, which launchd does not relaunch: the device stayed **offline** until a `kickstart` |
+| **Restart roomlerd** in the menu-bar app's permission card | the LocalAPI `RestartDaemon` verb (the same as Settings' *Apply now*) |
+| `launchctl kickstart -k gui/$(id -u)/com.roomler.agent` in Terminal | the restart that works on every version |
+
+Accessibility is read live: input works from the next remote event, with no
+restart (up to 0.4.188 the first session's failed input backend was kept until
+the agent restarted, so typed input was dropped while the viewer no longer
+warned).
+
+A log-out, restart or shut-down still ends the agent with exit 0 (those quits
+come from `loginwindow`), so nothing relaunches it into a session that is going
+away; `RunAtLoad` starts it again at the next login.
+
+**Two more prompts, and what to answer:**
+
+- **"Allow “roomlerd” to find devices on local networks?"** — at the first
+  remote-control session (macOS 15's Local Network privacy, raised as the
+  session gathers its network paths). Allow it: it is the agent's own request,
+  and macOS limits what the agent may reach on the local network until it is
+  answered.
+- **"“roomlerd” is requesting to bypass the system private window picker and
+  directly access your screen and audio"** — macOS 15 asks this again every 30
+  days (`kScreenCapturePrivacyHintPolicy`). Capture keeps flowing while it waits,
+  so a session is not interrupted; answer **Allow** when you are at the Mac.
+
+<!-- RETIRED-NAME-ANCHOR-BEGIN — the layout below is still FR-21 D5's frozen one. -->
+
+⚠️ Grants are keyed to the bundle's code signature. A release's Developer ID
+signature keeps them across updates; a re-signed or locally built agent gets
+entries of its own, to grant again.
 
 ### What the package installs
 
