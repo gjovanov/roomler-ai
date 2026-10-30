@@ -208,6 +208,31 @@ in an unfiltered module was invisible until someone ran the suite on a Windows b
 > sees nothing passes every absence check. The pattern: `Logs::capture` in
 > [`tests.rs:746`](../agents/roomlerd/src/hive/view/tests.rs#L746).
 
+Three flakes fixed on 2026-10-30, and what each one teaches:
+
+> [!WARNING]
+> **Two in-process webrtc-rs peers swap SDPs after gathering completes, never by trickle.**
+> `add_ice_candidate` refuses a candidate that arrives before the far side's remote
+> description (`ErrNoRemoteDescription`), and a test that ignores the refusal and loses every
+> candidate both ways never connects. `privacy_dc` hit its 30 s `on_data_channel` timeout that
+> way in CI. The pattern: `exchange` in
+> [`privacy_dc.rs:416`](../agents/roomlerd/tests/privacy_dc.rs#L416), as `dc_throughput.rs`'s
+> `connect` always did; `control_dc_record` and `file_dc` follow it too.
+
+> [!WARNING]
+> **A Mongo TTL index deletes on a monitor pass every 60 s, at any moment after expiry.** A test
+> that expires a row and then reads it races that pass: "one pairing row … 0" once in the
+> integration lane. `pairing_tests`' expiry test reads `serverStatus.metrics.ttl.passes`
+> ([`pairing_tests.rs:201`](../crates/tests/src/pairing_tests.rs#L201)) around each try, and
+> reruns only a try that a pass ran through. A missing row with no pass is still a failure.
+
+> [!WARNING]
+> **An external tool's deadline in a test is the test's, sized for the busiest runner.**
+> `thread_dump`'s own-process test gave macOS's `/usr/bin/sample` 20 s, while ~830 other tests
+> ran on a 3-CPU runner and `sample` read the whole test binary's symbols. It failed 26 times
+> in three days. It now allows 120 s and a second try, and its panic prints how long each try
+> took ([`thread_dump.rs:854`](../agents/roomlerd/src/thread_dump.rs#L854)).
+
 ## CI & special lanes
 
 | Lane | What it does |

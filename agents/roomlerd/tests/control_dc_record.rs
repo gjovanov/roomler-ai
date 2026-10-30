@@ -40,7 +40,6 @@ use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 
@@ -551,12 +550,26 @@ async fn rig(opts: Opts) -> Result<Rig> {
     })
 }
 
+/// Offer/answer with every candidate in the SDP (no trickle); see
+/// `privacy_dc.rs`'s `exchange` for the race that trickling lost.
 async fn exchange(browser_pc: &RTCPeerConnection, agent_pc: &RTCPeerConnection) -> Result<()> {
     let offer = browser_pc.create_offer(None).await?;
-    browser_pc.set_local_description(offer.clone()).await?;
+    let mut gathered = browser_pc.gathering_complete_promise().await;
+    browser_pc.set_local_description(offer).await?;
+    let _ = gathered.recv().await;
+    let offer = browser_pc
+        .local_description()
+        .await
+        .ok_or_else(|| anyhow!("no local offer"))?;
     agent_pc.set_remote_description(offer).await?;
     let answer = agent_pc.create_answer(None).await?;
-    agent_pc.set_local_description(answer.clone()).await?;
+    let mut gathered = agent_pc.gathering_complete_promise().await;
+    agent_pc.set_local_description(answer).await?;
+    let _ = gathered.recv().await;
+    let answer = agent_pc
+        .local_description()
+        .await
+        .ok_or_else(|| anyhow!("no local answer"))?;
     browser_pc.set_remote_description(answer).await?;
     Ok(())
 }
@@ -573,28 +586,6 @@ async fn mk_pc_pair() -> Result<(Arc<RTCPeerConnection>, Arc<RTCPeerConnection>)
     };
     let browser_pc = Arc::new(api()?.new_peer_connection(cfg.clone()).await?);
     let agent_pc = Arc::new(api()?.new_peer_connection(cfg).await?);
-    let a = agent_pc.clone();
-    browser_pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
-        let a = a.clone();
-        Box::pin(async move {
-            if let Some(c) = c
-                && let Ok(j) = c.to_json()
-            {
-                let _ = a.add_ice_candidate(j).await;
-            }
-        })
-    }));
-    let b = browser_pc.clone();
-    agent_pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
-        let b = b.clone();
-        Box::pin(async move {
-            if let Some(c) = c
-                && let Ok(j) = c.to_json()
-            {
-                let _ = b.add_ice_candidate(j).await;
-            }
-        })
-    }));
     Ok((browser_pc, agent_pc))
 }
 

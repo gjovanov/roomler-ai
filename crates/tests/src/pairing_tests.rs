@@ -196,6 +196,27 @@ async fn pairing_row(app: &TestApp, user_code: &str) -> Document {
     found.remove(0)
 }
 
+/// MongoDB's TTL monitor passes so far (`serverStatus.metrics.ttl.passes`).
+/// A pass is the only thing that deletes a pairing row on its own.
+async fn ttl_passes(app: &TestApp) -> i64 {
+    let status = app
+        .db
+        .client()
+        .database("admin")
+        .run_command(doc! { "serverStatus": 1 })
+        .await
+        .expect("serverStatus");
+    let ttl = status
+        .get_document("metrics")
+        .and_then(|m| m.get_document("ttl"))
+        .expect("serverStatus.metrics.ttl");
+    match ttl.get("passes") {
+        Some(Bson::Int64(n)) => *n,
+        Some(Bson::Int32(n)) => i64::from(*n),
+        other => panic!("serverStatus.metrics.ttl.passes: {other:?}"),
+    }
+}
+
 /// Create a role holding only `MANAGE_AGENTS` and hand it to `user_id`.
 /// Returns the role id, so the test can take it back.
 async fn grant_manage_agents(app: &TestApp, org: &SeededTenant, user_id: &str) -> String {
@@ -751,8 +772,16 @@ async fn approving_into_an_archived_org_is_refused_before_any_notice() {
 }
 
 /// A pairing past its life answers `expired_token`, names nothing to the
-/// person, and its expiry is audited exactly once — without waiting for
-/// the TTL sweep, which runs a minute late.
+/// person, and its expiry is audited exactly once, by the reader that found
+/// it expired rather than by the TTL sweep.
+///
+/// The TTL index on `expires_at` is real, and its monitor passes every 60 s.
+/// A pass in the second after the row expires takes it, and the readers then
+/// find no row (still `expired_token`, but audited as an unknown code), so
+/// the checks below fail with nothing wrong: "one pairing row … 0" on
+/// 2026-10-29. A try that a pass ran through proves nothing, so it runs
+/// again, with the next pass a minute off. With no pass during the try, a
+/// missing row is a real failure.
 #[tokio::test]
 async fn an_expired_pairing_is_gone_everywhere_and_its_expiry_is_audited_once() {
     let app = TestApp::spawn_with_settings(|s| {
@@ -761,24 +790,41 @@ async fn an_expired_pairing_is_gone_everywhere_and_its_expiry_is_audited_once() 
     })
     .await;
     let org = app.seed_tenant("pair7").await;
-    let (device_code, user_code) = start_daemon(&app).await;
-    let (_, live) = lookup(&app, &org.admin.access_token, &user_code).await;
-    assert_eq!(live["role"], "daemon");
+    for _ in 0..3 {
+        let passes = ttl_passes(&app).await;
+        let (device_code, user_code) = start_daemon(&app).await;
+        let (_, live) = lookup(&app, &org.admin.access_token, &user_code).await;
+        assert_eq!(live["role"], "daemon");
 
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let (_, polled) = poll(&app, &device_code).await;
-    assert_eq!(polled["status"], "expired_token", "{polled}");
-    let (status, _) = lookup(&app, &org.admin.access_token, &user_code).await;
-    assert_eq!(status, 404);
-    let (status, _) = approve(&app, &org.admin.access_token, &user_code, &org.tenant_id).await;
-    assert_eq!(status, 404);
-    let (_, polled) = poll(&app, &device_code).await;
-    assert_eq!(polled["status"], "expired_token");
+        let (_, polled) = poll(&app, &device_code).await;
+        assert_eq!(polled["status"], "expired_token", "{polled}");
+        let (status, _) = lookup(&app, &org.admin.access_token, &user_code).await;
+        assert_eq!(status, 404);
+        let (status, _) = approve(&app, &org.admin.access_token, &user_code, &org.tenant_id).await;
+        assert_eq!(status, 404);
+        let (_, polled) = poll(&app, &device_code).await;
+        assert_eq!(polled["status"], "expired_token");
 
-    let row = pairing_row(&app, &user_code).await;
-    assert_eq!(row.get_str("status").unwrap(), "expired");
-    assert_eq!(audit(&app, "expire", "ok").await.len(), 1, "audited once");
+        let stored = user_code.replace('-', "");
+        let left = rows(&app, "device_pairings", doc! { "user_code": stored }).await;
+        if left.is_empty() && ttl_passes(&app).await != passes {
+            continue;
+        }
+        let row = pairing_row(&app, &user_code).await;
+        assert_eq!(row.get_str("status").unwrap(), "expired");
+        let id = row.get_object_id("_id").unwrap();
+        let expired = rows(
+            &app,
+            "pairing_audit",
+            doc! { "pairing_id": id, "action": "expire", "outcome": "ok" },
+        )
+        .await;
+        assert_eq!(expired.len(), 1, "audited once");
+        return;
+    }
+    panic!("a TTL monitor pass ran through three tries in a row");
 }
 
 // ── the decisions ───────────────────────────────────────────────────────────
