@@ -63,10 +63,8 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use zeroize::Zeroizing;
 
 use super::supervisor::Supervisor;
-use super::vault_connect::handed::Secret;
 
 #[cfg(worker_calls)]
 pub(crate) mod handed;
@@ -356,11 +354,18 @@ pub(crate) async fn bind() -> Result<(TcpListener, u16), String> {
 /// id at call time — each already knows its own.
 pub(crate) trait Source: Clone + Send + Sync + 'static {
     /// Whether `token` may call the model now, and if so, the device's
-    /// key for this one call — never retained past it.
+    /// key for this one call — never retained past it. A plain `String`:
+    /// [`Source`] must compile with no `vault` feature at all (a
+    /// daemon-hosted sidecar needs none of it), so it cannot name
+    /// `vault_connect::handed::Secret`, `vault`-gated. The zeroizing
+    /// wrapper stays where it earns its keep — crossing the worker's
+    /// channel ([`handed::WorkerSource::admit`](super::sidecar::handed)) —
+    /// and is unwrapped before it reaches here, exactly as `model_key`
+    /// was already a plain, unzeroized `String` before this trait existed.
     fn admit(
         &self,
         token: Option<&str>,
-    ) -> impl std::future::Future<Output = Result<Secret, Refusal>> + Send;
+    ) -> impl std::future::Future<Output = Result<String, Refusal>> + Send;
     /// The provider refused the key: fetch it again next time.
     fn forget_key(&self) -> impl std::future::Future<Output = ()> + Send;
     fn upstream(&self) -> &str;
@@ -382,7 +387,7 @@ struct DaemonSource {
 }
 
 impl Source for DaemonSource {
-    async fn admit(&self, token: Option<&str>) -> Result<Secret, Refusal> {
+    async fn admit(&self, token: Option<&str>) -> Result<String, Refusal> {
         let Some(sup) = self.sup.upgrade() else {
             return Err(Refusal::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -392,7 +397,6 @@ impl Source for DaemonSource {
         };
         sup.sidecar_admit_and_key(self.session, token)
             .await
-            .map(|k| Secret(Zeroizing::new(k)))
             .map_err(|(kind, message)| kind.into_refusal(message))
     }
 
@@ -728,7 +732,7 @@ async fn handle<S: Source>(
         }
         headers.append(name.clone(), value.clone());
     }
-    if let Err(r) = put_credential(&mut headers, &key.0, source.workspace()) {
+    if let Err(r) = put_credential(&mut headers, &key, source.workspace()) {
         return refusal(r);
     }
     let method = req.method().clone();

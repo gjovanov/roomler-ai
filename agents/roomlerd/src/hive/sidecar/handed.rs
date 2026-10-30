@@ -389,7 +389,7 @@ struct WorkerSource {
 }
 
 impl Source for WorkerSource {
-    async fn admit(&self, token: Option<&str>) -> Result<Secret, Refusal> {
+    async fn admit(&self, token: Option<&str>) -> Result<String, Refusal> {
         let call = Call::SidecarAdmit {
             endpoint: self.endpoint,
             token: token.map(str::to_string),
@@ -399,7 +399,12 @@ impl Source for WorkerSource {
         #[cfg(windows)]
         let answer = self.link.call(call).await;
         match answer {
-            Ok(Answer::SidecarKey { key }) => Ok(key),
+            // The zeroizing wrapper's job ends here, at the channel it
+            // crossed to escape: `Source::admit` is a plain `String`
+            // (it must compile with no `vault` feature at all), the same
+            // shape `model_key` was already, unzeroized, before a worker
+            // existed to ask for it over a channel.
+            Ok(Answer::SidecarKey { key }) => Ok(key.0.to_string()),
             Ok(Answer::SidecarRefused { kind, message }) => Err(kind.into_refusal(message)),
             Ok(other) => Err(Refusal::new(
                 StatusCode::SERVICE_UNAVAILABLE,
