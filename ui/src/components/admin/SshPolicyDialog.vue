@@ -314,6 +314,12 @@ const memberOptions = computed(() =>
   })),
 )
 
+/** Fill the draft from the device's stored policy on every open. Immediate
+ *  (#3156): AgentsSection mounts this dialog with `v-if` and opens it in the
+ *  same tick, so the first open MOUNTS it open and a lazy watch never fired:
+ *  the draft stayed `emptyPolicy(false)` (a named account, even on Windows)
+ *  and Save wrote it over the stored policy. It runs during setup, so it must
+ *  stay below everything it reads. */
 watch(
   () => props.modelValue,
   (v) => {
@@ -336,6 +342,7 @@ watch(
       void agentStore.fetchOrgSshEnabled(props.tenantId)
     }
   },
+  { immediate: true },
 )
 
 async function save() {
