@@ -671,7 +671,92 @@ single-relay lacks — which is why single-relay must force QUIC while DERP
 deliberately stays raw. QUIC over a reliable WebSocket would be double-reliable,
 head-of-line blocking on top of head-of-line blocking.
 
+### Queue discipline: the age bound and the kernel send-buffer cap (FR-18)
+
+For a host whose corporate VPN blocks every UDP path, DERP is the only carrier
+there is, so the two buffers a frame waits in on its way out are the latency
+this carrier adds. FR-18 bounds both. The first is the node's outbound queue.
+The second is the kernel's TCP send buffer under the `/derp` WebSocket.
+
+```mermaid
+flowchart LR
+    WG["WireGuard datagram"] --> SEND["DerpConn::send_to<br/>stamps the frame"]
+    SEND -->|"queue full"| FULL["dropped, uncounted"]
+    SEND --> Q["outbound queue<br/>512 frames, a memory bound"]
+    Q --> AGE{"waited longer than<br/>the age bound?"}
+    AGE -->|"yes"| STALE["dropped_stale + 1"]
+    AGE -->|"no"| KBUF["kernel send buffer<br/>capped at 256 KiB"]
+    KBUF --> WIRE["TLS over TCP 443<br/>to the relay"]
+    CAP["at connect: set SO_SNDBUF,<br/>read it back, log one line"] -.-> KBUF
+```
+
+| Lever | Where | What it does |
+|---|---|---|
+| Age bound | `crates/tunnel-core/src/transport/derp.rs:72` (`queue_max_age`), checked by the WS writer at `agents/roomlerd/src/derp.rs:472` | The writer drops a frame that waited longer than `ROOMLERD_DERP_QUEUE_MAX_AGE_MS` (default 100) instead of sending it. That bounds the queue in time whatever the link rate: 512 frames are 33 ms at 160 Mbit/s and 1.8 s at 3 Mbit/s. `0` turns the check off, the behaviour before FR-18 |
+| Send-buffer cap | `cap_send_buffer` (`agents/roomlerd/src/derp.rs:71`), called once per connect (`:374`) | Asks for `SO_SNDBUF` = 256 KiB (`DERP_SNDBUF_BYTES`, `:39`), above the bandwidth-delay product of these paths (3 Mbit/s × 200 ms is about 75 KB) and far below the megabytes that autotuning grows. Without it, a frame the age check let through could still sit for seconds in the kernel. The cap has no switch of its own |
+| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:440`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it when it changed (`agents/roomlerd/src/derp.rs:440`): *"overlay derp: shed stale carrier frames (queue age bound)"* |
+
+⚠️ **A successful set is not a cap.** The OS may apply less than was asked and
+still return success, so the daemon reads the size back with
+`getsockopt(SO_SNDBUF)` right after the set
+(`cap_tcp`, `agents/roomlerd/src/derp.rs:90`) and judges it in the request's
+units (`SndbufCap::read_back`, `agents/roomlerd/src/derp.rs:135`). This is
+FR-18's AC4. In a Linux 6.6 container at stock sysctls (2026-10-30), a 262144
+request returned `Ok`, and the kernel then reported 425984: **212992 in
+force**. The daemon used to assume 256 KiB.
+
+How each OS answers, from its documentation or source:
+
+| OS | `getsockopt` returns | What can change the request | Why one read is enough |
+|---|---|---|---|
+| Linux | **twice** the size in force, for kernel bookkeeping (socket(7)). The daemon halves it (`KERNEL_DOUBLES_SNDBUF`, `agents/roomlerd/src/derp.rs:104`) | `net.core.wmem_max` clamps it **without an error**. The default was 212992 until Linux 6.18 raised it to 4 MiB, so a stock older kernel holds 208 KiB of the 256 asked | The set takes `SOCK_SNDBUF_LOCK`, so TCP neither grows nor shrinks the buffer afterwards (`tcp_should_expand_sndbuf`, `sk_stream_moderate_sndbuf`) |
+| Windows | the size in force | Winsock "can succeed even if the implementation did not provide the whole amount requested" and tells the caller to check with `getsockopt` | Dynamic send buffering "is enabled unless an application sets the SO_SNDBUF socket option" |
+| macOS | the size in force (`sb_hiwat`) | `kern.ipc.maxsockbuf` (8 MiB by default) clamps a larger request, far above this one | The set clears `SB_AUTOSIZE`, which TCP's send-buffer growth and trim both require. The MSS rounding runs only on a SYN, before the cap |
+
+Every connect logs one line, and every message opens with *"overlay derp: send
+buffer"* (`SndbufCap::log`, `agents/roomlerd/src/derp.rs:165`). It carries
+`relay`, `requested` and, where it was read, `applied` in the request's units:
+
+| Read-back | Level | Message |
+|---|---|---|
+| applied = requested | INFO | *"… capped — the kernel holds the requested size (FR-18)"*, `clamped=false` |
+| applied < requested | INFO | *"… capped below the request — the OS clamped it …"*, `clamped=true`. A tighter cap is still a cap |
+| applied > requested | WARN | *"… not capped — the kernel holds more than requested"*. No OS is documented to do this. The read-back is there to catch it if one does |
+| the set failed | WARN | *"… cap refused — the OS keeps its own size"*, with that size when it reads back |
+| the read failed | WARN | *"… cap set but not read back — the size in force is unknown"* |
+| no TCP socket under the WebSocket | WARN | *"… left at the OS default — unrecognised TLS wrapper"* |
+
+The verdict per OS and the line's fields are pinned by unit tests
+(`agents/roomlerd/src/derp.rs:675`, `:841`). Two more use a real loopback
+socket. In one, the cap reaches the socket under the WebSocket and reads back
+as the kernel under the test applies it (`agents/roomlerd/src/derp.rs:753`).
+In the other, a socket filled until the kernel takes no more keeps the size its
+cap read back (`agents/roomlerd/src/derp.rs:781`). CI runs them on Linux and
+Windows.
+
+⚠️ **To read the cap on a host, grep its log for `overlay derp: send buffer`.**
+A node writes the line each time its `/derp` socket connects. Since the
+always-on floor (`ROOMLERD_OVERLAY_DERP_FLOOR`, default on since rc.400) opens
+the central `/derp` socket at startup (see the lazy connection below), that is
+every node, and a regional relay's socket logs a line of its own under its
+`relay` name. Expect
+`clamped=true applied=212992` on a stock Linux kernel before 6.18, and
+`applied=262144` on Windows and macOS. On Linux, `ss -tmp` shows the same
+socket's `tb` as twice `applied`.
+
+⚠️ **A full outbound queue drops the frame uncounted.** `DerpConn::send_to`
+answers `Ok` when the queue is full (`crates/tunnel-core/src/transport/derp.rs:323`)
+so that a transient overflow never latches the carrier dead. FR-18's design
+also named a `dropped_full` counter, and it was never built.
+
 ### Lazy connection
+
+⚠️ **Since rc.400 the always-on floor opens `/derp` on every node at startup**
+(`ROOMLERD_OVERLAY_DERP_FLOOR`, default on;
+`crates/tunnel-core/src/overlay/runtime.rs:2576`), so that DERP can carry every
+fresh pair from birth while better tiers upgrade over it. A server's force-DERP
+push can open it mid-run too. The lazy rule below is what a node does with the
+floor switched off.
 
 DERP is default-ON, but the `/derp` WS is opened **only when the node is itself
 UDP-blocked** — that is, when its own srflx gather came back empty, the same
@@ -856,6 +941,7 @@ prefix is still honoured.
 | `…_SRFLX_KEEPALIVE_SECS` | 20 | STUN keepalive holding the mapping open |
 | `…_RELAY_SINGLE` | on | single-relay tier |
 | `…_DERP` | **on** since rc.203 | DERP tier |
+| `…_DERP_FLOOR` | **on** since rc.400 | the always-on floor: every node opens its central `/derp` socket at startup, and DERP carries each fresh pair while better tiers upgrade over it (§6); off = open `/derp` only when UDP-blocked, or when a force-DERP push asks |
 | `…_ORG_RELAY` | off | ride a tenant-owned org relay when the server mints a session for a pair (FR-19 P4b); serving is `RELAY_SERVER_ENABLED` |
 | `…_PATHMON` | **on** | path-monitor telemetry (`on`/`shadow`/`off`). Selection is always monitor-driven since rc.282 — non-`on` values only silence the 10-min decision summaries |
 | `…_ROUTE_EVENTS` | **on** | event-driven route guard: OS route-change subscription driving immediate re-asserts; off = 2 s blind tick only |
@@ -863,6 +949,10 @@ prefix is still honoured.
 | `…_ROUTE_EVICT_WINNERS_ONLY` | **on** | Windows: evict a competing VPN route only when it wins the FIB lookup (#1405); off = evict every competing row every wave |
 | `…_NETSTACK_SOCKS` | unset | userspace netstack + SOCKS5 instead of an OS TUN |
 | `…_SOCKBUF` | **on** (FR-110) | every direct carrier socket asks for 7 MiB receive and send buffers (§2); off = the OS default |
+
+One DERP knob sits outside that prefix: the queue's age bound,
+`ROOMLERD_DERP_QUEUE_MAX_AGE_MS`, default 100, where `0` turns the check off
+(FR-18, §6). The `/derp` socket's send-buffer cap has no switch.
 
 Joining the mesh at all additionally requires `overlay_enabled = true` in the
 node config and a build carrying the `overlay-l3` (or `overlay-netstack`)
