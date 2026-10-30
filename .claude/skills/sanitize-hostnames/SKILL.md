@@ -126,10 +126,11 @@ with a hole in the repo scan and CI too.
 | layer | stops it at | enable |
 |---|---|---|
 | `.githooks/pre-commit` | the commit | `git config core.hooksPath .githooks` |
+| … its **map gate**, on a machine that has the map | the commit | `git config --global roomler.sanitizeMap <path-to-map>` |
 | CI job **No real machine names** | the merge | required status check on `master` |
 | the sweep below | after publication | run it by hand |
 
-Layer 3 has run four times now. Each run force-pushes ~1000 branches and ~700
+Layer 3 has run five times now. Each run force-pushes ~1000 branches and ~700
 tags with GitHub Actions disabled around it, and it still **cannot remove
 anything from GitHub** — the pre-rewrite commits stay reachable by SHA through
 `refs/pull/*` until GitHub Support runs GC. Treat every sweep as damage
@@ -147,6 +148,41 @@ clone has no hook until someone runs that line. Worktrees **share** that config
 and the hook is tracked, so setting it once in the clone covers every worktree
 made from it — but a worktree on a branch predating the hook still has no file,
 which is the harmless `tool absent -- do not block` path.
+
+### The map gate — names with no shape
+
+The shapes catch the class: asset tags and generated Windows names. A name with
+no shape (a laptop called after its owner) passed the hook, CI and the shapes
+until 2026-10-30. Only the hand-run sweep found it, once someone had added it to
+the map, and the fifth whole-history rewrite paid for it. So where the map is
+configured, the hook hands it to `check_shapes.py --staged --map <map>`, and a
+commit that **adds** a mapped name is refused.
+
+```bash
+git config --global roomler.sanitizeMap <path-to-map>   # once per machine
+ROOMLER_SANITIZE_MAP=<path-to-map> git commit …          # or for one command
+```
+
+- **Added lines and new paths only.** A name already in the tree is the sweep's
+  job. Judging whole staged blobs would refuse every commit that touches such a
+  file, from the moment its name joins the map until the sweep runs.
+- **The sweep's own matcher**, imported from `sanitize.py` and not copied:
+  `load_map()`, the whole-word rules of `bounded()`, case-insensitive like the
+  residual scan, and the same `safe` / `!keep` exemptions. A false positive is a
+  `!keep` line in the map, never `--no-verify`.
+- **The name is never printed.** A finding reads `path:line  -> ALIAS`, and every
+  printed path and shape token goes through the map. Hook output lands in agent
+  transcripts, and from there in PR bodies and comments.
+- **Only a guard that has the gate gets `--map`.** When `core.hooksPath` names
+  one clone's `.githooks` by absolute path, every worktree runs that one hook
+  against its *own* `check_shapes.py`. A worktree on a branch from before the
+  gate would answer `--map` with argparse's exit 2. That reads as "could not
+  run", and it would switch off the shape check too. The hook checks first,
+  warns, and runs the shapes alone.
+- **Cost:** ~0.4 s inside the guard: one more `git diff --cached`. CI has no
+  map and runs exactly as before. `selftest.sh` asserts every bullet above with
+  a synthetic map, and each canary was seen to fail against a mutant of the
+  code it guards.
 
 ## The other kind of name: WHO, not WHICH MACHINE
 
