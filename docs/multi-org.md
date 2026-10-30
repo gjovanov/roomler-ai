@@ -231,6 +231,75 @@ message names the consequence and why a fresh carve WARNs
 | `overlay.block_version_floor` | `ROOMLER__OVERLAY__BLOCK_VERSION_FLOOR` | `0.3.0-rc.301` |
 | `overlay.multi_block_enabled` | `ROOMLER__OVERLAY__MULTI_BLOCK_ENABLED` | `false` (FR-47 P5c growth; **a one-way door** — see below) |
 
+#### A join that cannot be given an address (FR-47 P2)
+
+A device the server cannot give an address is **told why**. Before P2 the join path
+logged a WARN and returned, so the device waited for a netmap that never came, and a
+device without an address looked exactly like an offline one, on the host as much as on
+the dashboard.
+
+```mermaid
+sequenceDiagram
+    participant D as roomlerd (joining)
+    participant S as server, network module
+    participant N as overlay_networks
+    participant C as roomler status
+    D->>S: rc:overlay.join (supports_join_refusal = true)
+    S->>N: allocate_host(network, ceiling 1022)
+    N-->>S: Validation, every ordinal up to 1022 is leased
+    Note over S: ERROR overlay.join refused, alert = overlay_join_refused
+    S-->>D: rc:overlay.join_refused { address_space_exhausted, detail }
+    Note over D: ERROR, kept in a process-global slot, no TUN and no netmap
+    C->>D: LocalAPI status
+    D-->>C: join_refusal { reason, detail, at_unix, retryable = false }
+    Note over C: join REFUSED 17s ago, address_space_exhausted
+```
+
+| `reason` | the server sends it when | `roomler status` says |
+|---|---|---|
+| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:436-439`](../crates/modules/network/src/overlay.rs#L436-L439)) | retrying will not help; an operator has to act |
+| `network_unavailable` | the tenant's network row cannot be read or created, or an allocated ordinal falls outside the network's address space | retrying will not help; an operator has to act |
+| `store_unavailable` | any other allocation failure: a store fault | transient — a retry may succeed |
+| `unknown` | a reason this build does not know, from a newer server | retrying will not help; an operator has to act |
+
+Only `store_unavailable` is retryable ([`signaling.rs:503`](../crates/remote_control/src/signaling.rs#L503)).
+An unknown reason takes the conservative arm. The device does not retry on its own in
+either case: its signalling loop reconnects on its own ladder, and a retry at the
+refusal would race it.
+
+- **The wire.** `rc:overlay.join_refused { reason, detail }`
+  ([`signaling.rs:4335-4341`](../crates/remote_control/src/signaling.rs#L4335-L4341)) goes only to a
+  node whose join set `supports_join_refusal`
+  ([`signaling.rs:2488`](../crates/remote_control/src/signaling.rs#L2488)). An older node keeps the
+  old silence, and the server's ERROR line, `alert = "overlay_join_refused"`
+  ([`overlay.rs:278-295`](../crates/modules/network/src/overlay.rs#L278-L295)), is then the only
+  trace. The frame is a new top-level variant, which an old agent drops as an unknown
+  frame, so it needed no forward-compatible pre-roll.
+- **The device.** The daemon logs `overlay: the server REFUSED our join` at ERROR and
+  keeps the refusal in a process-global slot
+  ([`overlay.rs:1060-1070`](../agents/roomlerd/src/overlay.rs#L1060-L1070)). No overlay runtime
+  exists to hold it, because the runtime is exactly what never came up.
+- **`roomler status`** prints it
+  ([`localclient.rs:2546-2568`](../agents/roomler-cli/src/localclient.rs#L2546-L2568)):
+
+  ```
+    overlay ip  —
+    server      connected
+    join        REFUSED 17s ago — address_space_exhausted (retrying will not help; an operator has to act)
+                Validation: overlay network 6ae47fa7f8603e6bdfbba607 exhausted: every host ordinal up to 1022 is leased (grow the tenant's block or release unused devices)
+  ```
+
+  `server connected` with no overlay address is the shape that used to read as offline.
+  The line stays for the daemon's lifetime, even after a later join succeeds: "refused
+  twenty minutes ago" is the only trace left once the log rotates, and `server` already
+  says what is true now. A daemon that predates the field sends no `join_refusal`
+  ([`lib.rs:261`](../crates/localapi/src/lib.rs#L261)), and then nothing is printed, never a
+  false "clear". `roomler status --json` carries it as
+  `join_refusal { reason, detail, at_unix, retryable }`.
+
+Field-verified 2026-10-30 on a throwaway stack: FR-47 AC3, reads in
+[`fr/FR-47-overlay-multi-block-ipam.md`](fr/FR-47-overlay-multi-block-ipam.md) §8.
+
 #### Growth, and the allocator's two races (FR-47 P5c · FR-68)
 
 With `multi_block_enabled` a network that fills its block **grows**: a second
