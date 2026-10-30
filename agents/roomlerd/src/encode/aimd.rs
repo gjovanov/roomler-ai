@@ -704,7 +704,7 @@ mod tests {
     // the governor's `a_measured_slow_pipe_lets_the_floor_and_the_target_descend`
     // — no target can reach one, and at or above the floor the coarsening is
     // the pre-P8 table's, value for value. Pinned against that table and the
-    // same nearest-rung walk verbatim (`bc4a9a3e3^`), so a rung added or moved
+    // same nearest-rung walk verbatim (`170d18473^`), so a rung added or moved
     // ABOVE the floor fails here instead of in the field as a changed
     // rebuild/IDR cadence (AC6).
     #[test]

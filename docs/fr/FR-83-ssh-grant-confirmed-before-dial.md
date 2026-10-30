@@ -62,7 +62,7 @@ ordering, and that a losable race is presented to the user as a terminal key ref
 never for others, which is the hardest shape to diagnose from a report. The grant that
 arrived 4.4 s late still had ~50 s of its 60 s life left — the window was there to use.
 
-## The mechanism, in the code (master `5008895cd`)
+## The mechanism, in the code (master `477ee57b7`)
 
 | step | where | what it does |
 |---|---|---|
@@ -203,9 +203,9 @@ one small frame per grant.
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P0 | spec + ledger row + issue | — | **merged** #1602 `b48f13f90` |
-| P1 | wire, capability, server wait, agent ack, tests, docs | promote the previous server image (`promote.yml`) — an old server never waits, and the ack is dropped at `debug!` | **merged** #1607 `64488d3d5` |
-| P2 | agent release + server image promoted; field verification (AC7, AC8) | as P1 — `hosted-20260910-4114dc7` was live before | **shipped** `agent-v0.4.101` (#1609 `e8f48bcc0`) + `hosted-20260924-531fde8`; field-verified — see the log |
+| P0 | spec + ledger row + issue | — | **merged** #1602 `bdd9f1f60` |
+| P1 | wire, capability, server wait, agent ack, tests, docs | promote the previous server image (`promote.yml`) — an old server never waits, and the ack is dropped at `debug!` | **merged** #1607 `d8902ccdb` |
+| P2 | agent release + server image promoted; field verification (AC7, AC8) | as P1 — `hosted-20260910-4114dc7` was live before | **shipped** `agent-v0.4.101` (#1609 `ccba972f4`) + `hosted-20260924-531fde8`; field-verified — see the log |
 
 ## Acceptance criteria
 

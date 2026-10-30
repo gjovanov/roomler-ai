@@ -575,7 +575,7 @@ war, and not this FR's.
 
 ### 2026-10-29 — the P1 tail's tests, RED on the shipped behaviour and GREEN on the fix (#3097)
 
-`origin/master` (`12e7bf0d7`) was merged into the branch first (`8b9c4667b`, a
+`origin/master` (`4fe9fe0dc`) was merged into the branch first (`4c96334b1`, a
 clean merge; `composition_tests::composition_matches_baseline` passes on the
 merged tree, so the baseline the branch re-recorded needed no second
 re-record). Then each fix was flipped back to the shipped behaviour in place,

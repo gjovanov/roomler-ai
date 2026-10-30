@@ -327,7 +327,7 @@ and a declared route whose target never comes up does it *once per retry* (every
 with `roomler kill fl-N`: the macOS root exit agent's UDP socket count climbed
 **5 → 11 → 16 across five kills** — its `AgentTunnelPeer` map only ever grew.
 
-The audit (against `origin/master` c443af83e) found the client ends a session
+The audit (against `origin/master` 9532fdeee) found the client ends a session
 **without** `ClientMsg::TunnelTerminate` on:
 
 | Client path | Where | Why it sent nothing |

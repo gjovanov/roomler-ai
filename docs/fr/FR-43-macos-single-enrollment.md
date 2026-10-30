@@ -2,7 +2,7 @@
 
 **Status:** P0 + P1 + **P2 complete and field-verified** (0.4.33 → 0.4.43) — the daemon's row streams real pixels; P2c/P3 next. Tracking issue: `FR-43`.
 
-⚠️ Anchors RE-VERIFIED against master `9700e9ff` on 2026-09-06, when this record was
+⚠️ Anchors RE-VERIFIED against master `c6e8ec58` on 2026-09-06, when this record was
 landed 27 releases after the field run. `remote_control`'s hub moved to
 `crates/modules/fleet/src/hub.rs` in the interim and every citation to it was stale —
 which is exactly why the convention asks for a master sha rather than a bare line number.
@@ -247,7 +247,7 @@ touched: dispatch it on the branch before merging.
 
 ## P2c design — the daemon's row stops calling itself "not a capture target"
 
-Measured against master `9700e9ff` (2026-09-06).
+Measured against master `c6e8ec58` (2026-09-06).
 
 P2b made the daemon's row able to stream real pixels. It still advertises
 `permissions: ["no-gui-session"]`, so the dashboard renders it as *not a capture

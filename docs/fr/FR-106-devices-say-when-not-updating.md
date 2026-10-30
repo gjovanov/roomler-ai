@@ -1,10 +1,10 @@
 # FR-106: A device that stops taking updates says so on the devices page
 
 **Issue:** [#2314](https://github.com/gjovanov/roomler-ai/issues/2314) · **Status:** **closed 2026-10-16**. P1
-(#2315, `75d1cfe51`) is live since the promote of `hosted-20261016-377f1d4`, and all four criteria are field-verified
+(#2315, `2c0c01d22`) is live since the promote of `hosted-20261016-377f1d4`, and all four criteria are field-verified
 (§8). Spec and claim 2026-10-16, on the operator's "proceed" after FR-96 closed with its D3 open · **Owner:** the
 devices page (UI) ·
-**Anchors:** master `bdabde487` · **Builds on:** [FR-96](FR-96-per-user-linux-installs-update-themselves.md) (D3:
+**Anchors:** master `6c56efb17` · **Builds on:** [FR-96](FR-96-per-user-linux-installs-update-themselves.md) (D3:
 "say so where the operator looks"), [FR-103](FR-103-device-credentials-renew-themselves.md) (the credential chip
 this follows)
 
@@ -73,7 +73,7 @@ Pieces (all UI):
 
 | Phase | What | Kill switch | Proven on | Size |
 |---|---|---|---|---|
-| **P1** (#2315, `75d1cfe51`, live 2026-10-16) | the chip, its rule, its tooltip, the tests, the docs | none needed: it only reads, and the unknown case shows nothing | the vmtest org's devices page after a promote: the lab's stuck device shows it, and the healthy ones don't (§8) | S |
+| **P1** (#2315, `2c0c01d22`, live 2026-10-16) | the chip, its rule, its tooltip, the tests, the docs | none needed: it only reads, and the unknown case shows nothing | the vmtest org's devices page after a promote: the lab's stuck device shows it, and the healthy ones don't (§8) | S |
 
 ## 5. Acceptance criteria
 
@@ -107,7 +107,7 @@ Pieces (all UI):
 | date | build | host | result |
 |---|---|---|---|
 | 2026-10-16 11:58Z | production `hosted-20261016-32a9095` (before P1) | the vmtest org's devices page, rendered by Playwright from mars as the org's admin (`~/wt/fr106/fr106-run.sh`, which prints one line per device row) | 🔴 **RED: the chip does not exist.** The served `DevicesView` chunk carried FR-103's credential chip and nothing of FR-106. On the page, `vmtest-anchor` (v0.4.48, Linux, **online**) was in the table with no chip, and there was no stall chip anywhere. The other two online devices ran 0.4.139 |
-| 2026-10-16 16:13Z | production `hosted-20261016-377f1d4` (contains P1 `75d1cfe51`; promoted 16:11Z, both pods ready, 0 restarts) | the same pass | 🟢 **AC1.** The served `DevicesView` chunk now carries the chip, and the page shows exactly one. On `vmtest-anchor`, `v0.4.48 linux online=true \| chip=true \| "not updating"`, with the tooltip *"v0.4.48 is 64+ releases behind: 0.4.73 came out 40 d ago and this device, online, has not installed it. A per-user Linux install made before 0.4.138 cannot install updates by itself. Install the current release on it once (…), and it updates itself from then on. On a system install that stopped, check auto_update in 'roomler config ls' and the log …"*. **AC2 in this org:** the six other online devices (all 0.4.139, Windows and Linux) show no chip; nor do the offline rows, even those on 0.4.134–0.4.136, which is the online-only rule |
+| 2026-10-16 16:13Z | production `hosted-20261016-377f1d4` (contains P1 `2c0c01d22`; promoted 16:11Z, both pods ready, 0 restarts) | the same pass | 🟢 **AC1.** The served `DevicesView` chunk now carries the chip, and the page shows exactly one. On `vmtest-anchor`, `v0.4.48 linux online=true \| chip=true \| "not updating"`, with the tooltip *"v0.4.48 is 64+ releases behind: 0.4.73 came out 40 d ago and this device, online, has not installed it. A per-user Linux install made before 0.4.138 cannot install updates by itself. Install the current release on it once (…), and it updates itself from then on. On a system install that stopped, check auto_update in 'roomler config ls' and the log …"*. **AC2 in this org:** the six other online devices (all 0.4.139, Windows and Linux) show no chip; nor do the offline rows, even those on 0.4.134–0.4.136, which is the online-only rule |
 | 2026-10-16 16:15Z | the same | the operator's own org, its devices page in Chrome (the DOM read, not a screenshot) | 🟢 **AC2.** The release list loaded (64 releases), and there were 0 stall chips. `roomler devices` shows all 11 online devices on 0.4.139, so no chip was due anywhere in the org |
 
 ## 9. Related

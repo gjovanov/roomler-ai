@@ -1579,7 +1579,7 @@ jobs:
       # this very binary, neither feature-gated — ran on Windows nowhere, and
       # two Windows-only failures went unseen until #2889. The filter was the
       # only thing dropping them; removing it costs no compile. Measured by the
-      # FR-6 session on master 0831dd289: 5.5–7.2 min a run, about 8 s of it
+      # FR-6 session on master dfa9fa178: 5.5–7.2 min a run, about 8 s of it
       # tests — the rest is building the test binary from the restored cache.
       # Locally (32 threads) the full suite is 2422 tests in about 42 s.
       #

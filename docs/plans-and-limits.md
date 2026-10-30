@@ -7,7 +7,7 @@ billing (P1+P2), the concurrent-session cap (P3, counted cluster-wide by P3b sin
 2026-10-22 and on the regional PoPs' since 2026-10-23 (P4b-2). TURN has counted toward the
 allowance, and an over-allowance org's mesh has left TURN for the DERP floor (P4c), since
 2026-10-23, with the operator's own orgs exempt. Exit nodes are on every plan (P4d). Claims
-were checked against the code at `8ab970586`, and the relay allowance section at `d4eb310a9`
+were checked against the code at `09ed1474a`, and the relay allowance section at `f0f4a6df9`
 plus this change.
 
 The price list and the reasoning behind it are in [business-model.md](business-model.md) §4.

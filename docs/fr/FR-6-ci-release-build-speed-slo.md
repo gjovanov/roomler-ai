@@ -182,7 +182,7 @@ itself on the affected run's page. Baseline when the program started: releases t
       box is ticked when a tag lands under 10 min on the clock.
       **Met on agent-v0.4.174** (2026-10-26, run 40287645036): 07:44:29 → 07:51:43Z,
       **7.2 min** on the clock. All 8 build jobs reused rehearsal 40267019868's build (same
-      SHA `ff3290048`, no release dispatch between them), and the four daemon jobs
+      SHA `065e15308`, no release dispatch between them), and the four daemon jobs
       reported `roomlerd 0.4.174`. The longest jobs were the Windows companion (4.2 min)
       and the MSI (4.0); wave 30 takes the companions' remaining compile out.
 - [x] **Docs** — [`docs/build-caches.md`](../build-caches.md) describes what this FR built, in
@@ -422,7 +422,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   with the runner image ("already the newest version"). The composite costs ~21 s in a
   lane, against ~14 s for the raw step on a good day.
 - 2026-10-01: **Budget $10 (the operator); saves resume, and wave 16 in the field.**
-  Re-ran master CI at `0c3a74ed0` (run 36819352918, attempt 2, 7.8 min): all 11 salted
+  Re-ran master CI at `1dd1d08be` (run 36819352918, attempt 2, 7.8 min): all 11 salted
   `ci.yml` jobs restored the pre-salt generation (`full match: false`, none cold) and
   SAVED their salted one, every key the one PR #1784's run had computed, the first
   writes since 09-28 20:24Z. installer-smoke's Windows job (run 36899658523) did the
@@ -462,7 +462,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   caches are invisible to master. It installed in 40 s, the mirror having recovered, and
   saved on master at 22:40:57Z.
 - 2026-10-01: **agent-v0.4.115, the field test of waves 18 and 19** (run 36937794461,
-  tagged 22:54:13Z on `426150261`, published 23:08:48Z). 14.9 min end to end: MSI 13.9
+  tagged 22:54:13Z on `c2eaff8e1`, published 23:08:48Z). 14.9 min end to end: MSI 13.9
   (the pole), `.pkg` 10.4 (12.2 on 0.4.114, median 12.3 over the last 12 tags), Linux
   x86_64 9.9, aarch64 7.4, the companions 3.3 (macOS) and 6.1 (Windows).
   - Release: 28 assets, names identical to 0.4.114's apart from the version, each
@@ -592,7 +592,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   - A dry run in WSL caught one bug before any of this: without `zstd`, `tar` left 0-byte
     archives, and the first draft uploaded them over the good cache. `ci-seed-save` now
     refuses a failed pack.
-- 2026-10-11: **wave 22 on master** (`b928d563b`, #1954).
+- 2026-10-11: **wave 22 on master** (`f1f861c19`, #1954).
   - The first master runs (CI 38096524857, integration-tests 38096524893, installer-smoke
     38096524865) restored each of the six from the `seed-cache` release. Each saw the key
     change, since removing the validation clause changed each job's definition, and
@@ -603,7 +603,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   - The six families' old Actions-cache entries were deleted by hand (8 entries,
     ~6.4 GiB), along with the orphaned plain-recorder family. One more
     `installer-smoke-windows` entry appeared at 00:00:31Z, written by the last run on the
-    old workflow (38095828862, `a91171f26`, started before the merge), and was deleted.
+    old workflow (38095828862, `e4e3896bf`, started before the merge), and was deleted.
   - Settled pool: **7.48 GiB in 12 entries**, against the free 10 GiB.
 - 2026-10-19: **"the tests got slow": two causes, wave 23 (#2544).**
   - **CI lanes cold.** PR run 39288740822: lint 22.5 min, unit tests 19.2, profiles 10.1,
@@ -667,8 +667,8 @@ itself on the affected run's page. Baseline when the program started: releases t
   - The partition was dry-run first with two fake libtest binaries (103 tests): union ==
     listing, no duplicates, the skipped test excluded, a module's tests spread 8/8/9.
 - 2026-10-20, evening: **the shards on master, and the queue** (wave 25).
-  - ⚠️ The forecast above was wrong. Of the six master runs since wave 24 (f0bf3a958
-    through d6235e5ee), five took **11.7–15.3 min wall-clock**. Their shards ran 9.6–12.9
+  - ⚠️ The forecast above was wrong. Of the six master runs since wave 24 (36cb849ec
+    through 39de8fe41), five took **11.7–15.3 min wall-clock**. Their shards ran 9.6–12.9
     min: builds 1.9–3.8 min, suites 5.4–8.2. The sixth took 24.8 min: its shards queued
     3–7 min, and one shard's build ran 10.1 min. The build does not drop to ~2 min,
     because the cache holds third-party crates only and every shard rebuilds the workspace
@@ -837,13 +837,13 @@ itself on the affected run's page. Baseline when the program started: releases t
     (want 0.4.171): OK`. On macOS, codegen-units 4 took 494 s and 16 took 439 s, against
     766 s at 1, for +14.2% and +23.7% gzip size.
   - **The real workflow, before any release depended on it:**
-    - The post-merge master reseed (40244838141, `30f6aa5ca`) stamped all 8 build jobs
+    - The post-merge master reseed (40244838141, `5b55f04c2`) stamped all 8 build jobs
       (`tree=1a584f76… job=Release roomlerd/<job>`), the two Windows jobs included, so a
       fresh Windows checkout reads as clean.
-    - A same-tree dress rehearsal (40247220674, on a temporary branch at `30f6aa5ca`)
+    - A same-tree dress rehearsal (40247220674, on a temporary branch at `5b55f04c2`)
       then reused in all 8 jobs. The daemon build steps took 3–43 s, and all four version
       checks passed, the two Linux jobs that no probe had covered included.
-  - **0.4.173**, cut by roomler-ai-7e at `0040f6bb7` (tree `99bc30a6276b`), with no release
+  - **0.4.173**, cut by roomler-ai-7e at `ffffdacb7` (tree `99bc30a6276b`), with no release
     dispatch between rehearsal and tag:
     - Rehearsal 40249389321: every job found the reseed's stamp for another tree,
       rebuilt as before, and stamped its own: 8 of 8.
@@ -870,7 +870,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   - agent-v0.4.174 (tag run 40287645036) ran 07:44:29 → 07:51:43Z: **7.2 min** on the clock,
     so the ≤10 min criterion is met.
     - All 8 build jobs reused rehearsal 40267019868's build. It ran at the same SHA
-      `ff3290048`, 3.7 h earlier, with no release dispatch between them.
+      `065e15308`, 3.7 h earlier, with no release dispatch between them.
     - Daemon jobs: MSI 4.0 min, `.pkg` 3.1, `.deb` 1.6 and 1.5. The longest jobs were the
       companions: Windows 4.2, aarch64 4.0.
   - **Correction to the previous entry: `gen/schemas/` was not the cause.**
@@ -888,7 +888,7 @@ itself on the affected run's page. Baseline when the program started: releases t
     157–251 s before. A normal build still passes. The capability set is unchanged and
     empty: the parser loads only `*.json`/`*.toml` files.
 - 2026-10-26, midday: **agent-v0.4.175, cut by roomler-ai-df.** Rehearsal 40308879884 and tag
-  run 40312190685 were both at `027206d82`, with no dispatch between them.
+  run 40312190685 were both at `45d52aa36`, with no dispatch between them.
   - Reuse held in every job, as reported by df: MSI 5.3 min, `.pkg` 6.6, `.deb` aarch64
     1.6. The Linux x86_64 build step took 4 s.
   - The run was created at 11:03:40, but its jobs only started at 11:09:59, after 6 min
@@ -921,12 +921,12 @@ itself on the affected run's page. Baseline when the program started: releases t
       the OIDC token. A re-run of the failed jobs published it.
     - 0.4.178 (df) took 15.0 min from tag to publish, before wave 30: MSI 6.8 min,
       companion EXE 5.8.
-  - Next on this lane is FR-123 P2 (#2999, merged as `ae5ca6f6e`): the daemon compiles as
+  - Next on this lane is FR-123 P2 (#2999, merged as `de813b504`): the daemon compiles as
     one unit, measured −14 % on Windows and −30 % on macOS on the rehearsal's critical
     path. Its field check is 0.4.180's rehearsal.
 - 2026-10-27, evening: **agent-v0.4.180 (cut by roomler-ai-2e) published 5 min 28 s after its
   tag, the fastest yet. Also a correction to the 0.4.179 entry.**
-  - Rehearsal 40574588069 and tag run 40577974956 both ran at `9aab8f703`, the first release
+  - Rehearsal 40574588069 and tag run 40577974956 both ran at `317f2a6ab`, the first release
     with FR-123 P2. The run was created at 20:25:51Z and the release published at
     20:31:19Z.
     - All 8 build jobs carry the reuse notice. The four daemon jobs compiled nothing and
@@ -1036,7 +1036,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   - The diagnostic came out of the four steps again (#3037). To read a future recompile, put
     `CARGO_LOG=cargo::core::compiler::fingerprint=info` back on the step, or run `cargo build -v`.
 - 2026-10-28, afternoon: **agent-v0.4.182, cut by stardesk-teardown-roomler.** Wave 31 held on its
-  second release. Rehearsal 40723384188, tag run 40730055980 and the bump's squash `8e55985c0`
+  second release. Rehearsal 40723384188, tag run 40730055980 and the bump's squash `e0a445f9c`
   all had tree `8048f68fca0c`.
   - The rehearsal compiled `roomler-desktop` once in each companion job: the positive control.
   - **The tag run is clean.** All 8 jobs carry the reuse notice. The four daemon jobs compiled
@@ -1059,7 +1059,7 @@ itself on the affected run's page. Baseline when the program started: releases t
     the next rehearsal or reseed will likely drop them and compile those jobs cold once. A tag run
     skips that check ("tag run — skipping accretion GC"), so no release pays it.
 - 2026-10-28, evening: **agent-v0.4.183, cut by stardesk-teardown-roomler.** Wave 31 held on its
-  third release. Rehearsal 40742354169, tag run 40751997218 and the bump's squash `7d9040a82` all
+  third release. Rehearsal 40742354169, tag run 40751997218 and the bump's squash `4bbd94e5d` all
   had tree `7daedbf21ffd`.
   - The rehearsal compiled `roomler-desktop` once in each companion job: the positive control.
   - **The tag run is clean.** All 8 jobs carry the reuse notice and compiled nothing, and the four
@@ -1068,7 +1068,7 @@ itself on the affected run's page. Baseline when the program started: releases t
     queueing. The `.pkg` waited 8 min 12 s for a macOS runner (0.4.182's waited 8 min 09 s), then
     took 343 s, 10 s of it the build step. On both releases the ≤10 min mark failed on macOS runner
     queueing alone.
-  - The reseed (40754452329) ran on master `200a521c7`: a docs PR merged after the bump, so its tree
+  - The reseed (40754452329) ran on master `0a70ac83b`: a docs PR merged after the bump, so its tree
     differed from the tag's and every job compiled, as designed for a new tree. It dropped three
     seeds over the cap, the MSI's at 3,025 MB (the fourth reseed in a row), the `.pkg`'s at
     3,332 MB and the `.deb` aarch64's at 3,290 MB; those jobs compiled 574–580 crates cold, and the
@@ -1086,7 +1086,7 @@ itself on the affected run's page. Baseline when the program started: releases t
     26.3 min, where it could have reused. The other seven jobs kept their seeds and reused. It was
     the fifth reseed in a row to drop the Windows seed. The `.pkg` job's first attempt failed only
     in its Notarise step (Apple's stapler, `-1005`), after its seed had published; a re-run passed.
-- 2026-10-29, small hours: **wave 32 (#3068) merged as `847e2bf15`.** The reseed it dispatched
+- 2026-10-29, small hours: **wave 32 (#3068) merged as `5baaf79cb`.** The reseed it dispatched
   (40797998801) printed the cap in effect in every job: `(cap 4500)` on the four daemon jobs and
   `(cap 3000)` on the companions. The macOS runners had ~40 GB free, so a bigger seed is no disk
   risk there.
@@ -1115,4 +1115,4 @@ itself on the affected run's page. Baseline when the program started: releases t
     GC, and a rehearsal restores a seed the last reseed already checked, so a drop lands on a
     reseed. At ~390 MB a release, the `.deb` x86_64 seed should drop on 0.4.188's reseed and the
     MSI's about two releases later.
-- 2026-10-30: **closed**, with every criterion ticked and the docs merged in #3107 (`19c5773f6`).
+- 2026-10-30: **closed**, with every criterion ticked and the docs merged in #3107 (`d738146ad`).

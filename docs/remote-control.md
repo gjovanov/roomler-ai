@@ -2427,7 +2427,7 @@ the bare `error`, which the viewer retries as before. An agent without it fails
 Firefox 153 with no H.264 made one request and got one `error/no_common_codec`
 2.4 s after Connect, and the sentence was still on screen 75 s later. Agent
 0.4.138 had made 12 requests, each ending in a bare `error`. With prod at
-`6812dee`, before #2326, the sentence had been replaced by the generic one.
+`2f2cfa9`, before #2326, the sentence had been replaced by the generic one.
 
 ### 11.8 The post-session rating (FR-102 P9b)
 

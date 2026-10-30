@@ -6,7 +6,7 @@ run waits on that account's G and VT quota (§2). P0c (2026-10-30): the released
 610, and the g5g's image ships 595, so the box could not have opened NVENC on any release to date. The Linux trees
 now need 530.41, the oldest floor FFmpeg 9.0.1 builds against (D2, the operator); Windows needs 570 (§2, §3.2) ·
 **Owner:** the agent's encoder surface ·
-**Anchors:** master `b101fc456` · **Split from:** [FR-97](FR-97-os-feature-parity.md) P7a, by its D18 (the
+**Anchors:** master `01520c8af` · **Split from:** [FR-97](FR-97-os-feature-parity.md) P7a, by its D18 (the
 operator, 2026-10-25: "ship AAC now, GPU later")
 
 ## 1. Goal
