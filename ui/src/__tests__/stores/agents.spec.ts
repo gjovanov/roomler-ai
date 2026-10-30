@@ -913,6 +913,23 @@ describe('useAgentStore', () => {
     expect(body).toEqual({ fps_deny: 'hevc_qsv:120' })
   })
 
+  it('FR-130 — updateDesiredConfig sends a colour-description clear as an empty string', async () => {
+    // `''` asks the device to clear its key, back to the built-in default;
+    // dropped as falsy, it would become "not managed", and a device pushed
+    // `off` would stay off.
+    mockApi.put.mockResolvedValueOnce({
+      revision: 3,
+      desired: { revision: 3, color_description: '' },
+    })
+    const s = useAgentStore()
+    s.agents = [mkAgent()]
+    await s.updateDesiredConfig(TENANT_ID, 'a1', { color_description: '' })
+
+    const [, body] = mockApi.put.mock.calls.at(-1)!
+    expect(body).toEqual({ color_description: '' })
+    expect(s.agents[0]!.remote_config!.desired.color_description).toBe('')
+  })
+
   it('a saved request is optimistically PENDING, never applied', async () => {
     // The device has not spoken yet. Writing anything but `pending` would put
     // an answer on screen that no device has given — the exact lie the

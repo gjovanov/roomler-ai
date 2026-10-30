@@ -76,8 +76,9 @@ pub struct ColorDescription {
 
 /// **The** description: BT.601 matrix at limited range, which is what every
 /// converter produces, with the primaries and transfer of the sRGB desktop the
-/// pixels came from (the spec's set S, pending P0's measurement between it,
-/// set A = SMPTE 170M ×3, and set B = BT.709 primaries and transfer).
+/// pixels came from. It is the spec's set S, which P0 chose (open decision 1):
+/// Chrome decodes it exactly as set A (SMPTE 170M ×3) and set B (BT.709
+/// primaries and transfer), and of the three only S says what the desktop is.
 pub const DESCRIPTION: ColorDescription = ColorDescription {
     matrix: Matrix::Smpte170m,
     primaries: Primaries::Bt709,
