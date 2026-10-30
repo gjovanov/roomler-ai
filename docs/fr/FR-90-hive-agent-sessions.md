@@ -204,7 +204,7 @@ stream:
 P2 keeps the design's choice (§6.4): tunnel-core's QUIC transport, without the tunnel's flows and
 ACLs. Its pieces are a library already. An endpoint mints an ephemeral self-signed certificate whose
 fingerprint the dialer pins, over a plain socket, a TURN relay or the established `/derp` WebSocket
-(`crates/tunnel-core/src/transport/quic.rs:369`–`:479`), and the dialer presents a token the server
+(`crates/tunnel-core/src/transport/quic.rs:386`–`:496`), and the dialer presents a token the server
 minted (`:586`, `:605`). The serving half is the exit agent's
 (`agents/roomlerd/src/tunnel/quic_peer.rs:187` direct, `:229` TURN, `:272` DERP), the dialing half
 the tunnel client's (`crates/tunnel-core/src/driver.rs:1627` `establish_quic`). The signalling is
