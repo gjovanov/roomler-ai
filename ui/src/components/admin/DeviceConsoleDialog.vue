@@ -276,6 +276,11 @@ function close() {
   open.value = false
 }
 
+/** Clear the error and read the org's exec switch on every open. Immediate
+ *  (#3156): AgentsSection mounts this dialog with `v-if` and opens it in the
+ *  same tick, so the first open MOUNTS it open and a lazy watch never fired:
+ *  a closed org gate went unexplained until a command was refused. It runs
+ *  during setup, so it must stay below everything it reads. */
 watch(
   () => props.modelValue,
   (v) => {
@@ -285,6 +290,7 @@ watch(
       void agentStore.fetchOrgExecEnabled(props.tenantId)
     }
   },
+  { immediate: true },
 )
 </script>
 

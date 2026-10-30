@@ -225,6 +225,11 @@ const expiryLocal = computed({
   },
 })
 
+/** Fill the draft and the code from the device on every open. Immediate
+ *  (#3156): AgentsSection mounts this dialog with `v-if` and opens it in the
+ *  same tick, so the first open MOUNTS it open and a lazy watch never fired:
+ *  the draft stayed unapproved, and Save revoked a standing approval. It runs
+ *  during setup, so it must stay below everything it reads. */
 watch(
   () => props.modelValue,
   (v) => {
@@ -237,6 +242,7 @@ watch(
       void agentStore.fetchExternalAccess(props.tenantId)
     }
   },
+  { immediate: true },
 )
 
 async function rotate() {
