@@ -896,7 +896,7 @@ goodput, the FR-35 learner and pair memory, FR-59's floor relief / arrival clamp
 ([`fr/FR-63-one-delay-based-rate-controller.md`](fr/FR-63-one-delay-based-rate-controller.md))
 replaces them with **one** delay-based controller, `encode::ratectl::Controller`
 (`agents/roomlerd/src/encode/ratectl.rs`), and does it the way the rate-control
-plan requires — **shadow-first**. B1 (`agent-v0.4.187`+) builds the controller
+plan requires — **shadow-first**. B1 (`agent-v0.4.188`+) builds the controller
 and runs it beside the live governor, emitting what it *would* decide into six
 `shadow_*` heartbeat fields. It drives nothing; B2 flips it live on a fleet-log
 flip criterion, B3 deletes the eight.
@@ -963,9 +963,109 @@ never leaves `[floor, ceiling]`, and it never pauses on a direct cell.
 
 ⚠️ **B1 is the code, not the verdict.** Whether the shadow agrees with the live
 governor closely enough to flip (AC2) is a release plus a week of `agent_logs`
-read per `PathClass` — a field read, not a test. The config-surface tribool
+read per path class — a field read, not a test, and the instrument for it is the
+next section's. The config-surface tribool
 `ratectl = shadow|live|off` and the `live` apply seam are **B2**; B1 is env-only
 (`ROOMLERD_RATECTL`), so a B1 fleet cannot be made to let the shadow steer.
+
+### Reading the shadow — AC2's instrument (FR-63 B1b)
+
+`scripts/rc-shadow-report.cjs` measures the flip criterion. It does not decide it:
+whether the bar is right, and whether to flip, stay the operator's calls.
+
+> ≥ 20 constrained + ≥ 20 direct sessions, and shadow ≤ live in ≥ 90 % of the
+> elevated-age windows (and all four B0 fixtures green).
+
+```mermaid
+flowchart LR
+    HB["DC pump heartbeat<br/>(FFmpeg ≈2 s · VP9-444 ≈1 s)<br/>target_bps + six shadow_*"] -->|"INFO line"| DISK["the host's rolling log<br/>roomlerd.log.* · 14 days"]
+    HB -->|"uploader · 5 s batches"| AL[("agent_logs<br/>every daemon and RC worker,<br/>every org · 7-day TTL")]
+    AL -->|"FLEET read: mongosh inside the Mongo pod<br/>$match created_at (index) → $filter msg →<br/>$unwind → $project 12 fields"| CORE["ShadowReport<br/>counters + sparse histograms"]
+    DISK -->|"HOST read: node over text<br/>(evidence about that host only)"| CORE
+    CORE --> OUT["per-class table · the criterion<br/>MET / NOT MET / INCONCLUSIVE<br/>· B1's invariants"]
+```
+
+**One window is one DC-pump heartbeat.** A window without `shadow_state` came from a
+build before B1 and is counted, never compared; `shadow_state="off"` is the kill
+switch; an unopened shadow (`shadow_target_bps=None`) or a zero live rate is not
+compared. Every other window compares the shadow with `target_bps` (the governor's
+`applied_bps`, the same rate `shadow_disagree_pct` divides by): **shadow ≤ live is
+agreement**, the safe direction. A window is **elevated** when
+`viewer_age_ms − viewer_age_floor_ms ≥ 70 ms` — the controller's own level threshold
+(`ratectl::AGE_SLACK_MS`; the self-test fails if the two drift apart). The path class
+is the heartbeat's `constrained` flag, which the FFmpeg pump logs every window; the
+VP9-444 heartbeat has no such field, so a VP9 session takes the `relay=` of its
+"per-session ICE path detected" line and is `unknown` without one, never `direct`.
+Windows classed that way are counted apart, because `relay` misses one case the
+pump's flag catches (an overlay remote on a relay tier).
+
+| verdict | when |
+|---|---|
+| **MET** | both session clauses met and the pooled agreement ≥ 90 % over at least one elevated window |
+| **NOT MET** | any clause below its bar |
+| **INCONCLUSIVE** | no clause fails, but there is no elevated window to judge — zero evidence is never a pass |
+
+The agreement clause is pooled, as the criterion words it; each class's own agreement
+is printed beside it, and a class below 90 % on its own is flagged, so a pool that
+passes on the strength of one class cannot hide the other. The fixtures clause is
+CI's (`cargo test -p roomlerd --lib`), so the report says "not checked here" rather
+than claiming it. The same pass reads two of **B1's invariants off the field**: a
+`shadow_pauses` rise inside a DIRECT window (the "never on direct" rule — a count
+carried over from an earlier constrained stretch is not a rise), and a constrained
+shadow below its 200 kbps floor. Both must read 0.
+
+⚠️ **The criterion judges elevated windows only, and the first field read showed why
+that is not enough on its own.** On ten direct sessions on `agent-v0.4.188`
+(2026-10-30) every window carried the shadow, and in all 43 clean windows it asked
+for **96 % less** than the governor: it opens at the direct path's area floor
+(2.46 Mbps at 2560×1600) and climbs ×1.08 per window, while the governor opens at its
+content-generous ceiling (~90 Mbps). Asking for less passes the criterion. So the
+report prints the clean-window disagreement under its own heading, with no
+threshold of its own; the detail and the B2 question it raises are in the FR-63 spec
+(§ "Day 0").
+
+**Why the fleet read is server-side.** The plan assumed the API could serve it
+(`list_for_agent(?session_id=…)`). It cannot: `GET /api/tenant/{tid}/agent/{aid}/logs`
+takes only `limit`, clamped to 500 recent batches per agent — about 40 minutes of a
+session. An exec sweep of host logs is worse than incomplete: it reaches only
+exec-enabled, online hosts of one org, which is a biased sample of exactly the
+proportion AC2 asks for. `agent_logs` holds the whole population, because every
+daemon and every RC worker runs the uploader (a Windows host's RC pump runs in its
+console-session worker, `roomlerd run --supervisor scm`, which uploads like the service
+does).
+
+**The fleet read is bounded by construction**, because an unbounded read inside the
+Mongo container OOM-killed production Mongo once (2026-10-26):
+
+| bound | how |
+|---|---|
+| time | a window of at most 8 days (`agent_logs` keeps 7), read one day per query, each with `maxTimeMS` 240 s |
+| plan | `$match` on `created_at` + `$sort` served by an index — `IXSCAN created_at_1` for the fleet, `tenant_id_1_source_1_created_at_-1` (backward) for one org; `explain` shows no blocking SORT |
+| memory | only streaming stages after the index scan, `allowDiskUse: false`; mongosh holds one row at a time and folds it into counters and sparse histograms |
+| data | only 12 fields are projected — never an address, a name or another line |
+| credentials | read from the container's own environment, never argv |
+| consent | `--kubectl` / `--mars` refuse without `--yes`; the mongodb pod's restart count is printed before and after, and a restart fails the run (exit 3) |
+
+**Rehearsed, not assumed.** `--to-ejson` turns real log text into `agent_logs` batches
+exactly as the uploader stores them (an integer an Int64, a `?Debug` value its printed
+string, a lone quoted value its text), and `--docker NAME --seed FILE` runs the fleet
+read against a throwaway `mongo:7` — the image production runs. On 2,274 lines (a dev
+box's real 2026-10-29 heartbeats, all pre-B1, plus synthetic B1 lines) the Node read
+over the text, the mongosh read over the seeded batches, and the Node read over the
+fleet read's own `--rows` output agreed exactly on every class, the pool, the
+criterion and the invariants.
+
+```bash
+node scripts/rc-shadow-report.cjs --self-test                       # 33 cases, incl. the bar's edges and red runs
+node scripts/rc-shadow-report.cjs roomlerd.log.2026-10-30 …          # a host's logs: evidence about that host only
+bash scripts/rc-shadow-report.sh --mars --yes --since 2026-10-30T14:21:00Z   # the fleet read AC2 is judged by (--until: now)
+bash scripts/rc-shadow-report.sh --docker NAME --seed seed.ejson     # the rehearsal
+```
+
+⚠️ **The window starts at `agent-v0.4.188`** (published 2026-10-30 14:21Z), the first
+release with B1. `agent_logs` deletes a batch 7 days after it arrives, so a window
+anchored at the release loses its first hours the moment it turns 7 days old: read it
+during its 7th day (`--until` = the time of the read), not after.
 
 ## Config / env reference
 
@@ -1028,7 +1128,7 @@ behaviour is described under the validity gate at the top of this page.
 | 0.4.98 | FR-79 V3b — `encode::pipe::Pipe`, ONE belief split into a demonstrated FLOOR and a pushed-back CAPACITY, in SHADOW (`pipe_belief`, `pipe_belief_n` in the heartbeat; no consumer). | Three symptoms on three hosts and two carriers, one defect: no trustworthy, always-available estimate of what the path carries. |
 | 0.4.99 | FR-79 V3b-1 + V3b-2 — no single `believed_bps()` (`capacity_bps` for "am I over?", `ceiling_anchor_bps` for "what may the ceiling be?"); the floor is retired by evidence, not by time. | An idle relay session read 1.8 M from deliveries alone with nothing wrong; a host that had demonstrated 8.4 M read 12.8 kbps on a still screen hours later. |
 | 0.4.100 | FR-79 V3b-3 — a capacity sample is also a delivery, so it raises the floor and survives its own expiry. | A 13.16 M capacity expired after one TTL and the anchor fell to a 4.05 M content floor while the target ran to the 34.56 M constant. |
-| 0.4.187 | FR-63 B1 — the ONE delay-based controller (`encode::ratectl`) runs in SHADOW beside the governor, emitting six `shadow_*` heartbeat fields ([§ The shadow rate controller](#the-shadow-rate-controller-fr-63-b1)). It drives nothing; a containment test holds the line. | Eight estimators of one quantity glued with "the lower of" rules. Shadow-first per the rate-control plan: a release of `shadow_*` logs against the flip criterion (AC2) decides B2's flip, so the controller is never the fleet's own first trial. |
+| 0.4.188 | FR-63 B1 — the ONE delay-based controller (`encode::ratectl`) runs in SHADOW beside the governor, emitting six `shadow_*` heartbeat fields ([§ The shadow rate controller](#the-shadow-rate-controller-fr-63-b1)). It drives nothing; a containment test holds the line. (Merged after 0.4.187 was cut: 0.4.188, published 2026-10-30, is the first release that carries it.) | Eight estimators of one quantity glued with "the lower of" rules. Shadow-first per the rate-control plan: a release of `shadow_*` logs against the flip criterion (AC2) decides B2's flip, so the controller is never the fleet's own first trial. |
 
 ## The measured-rate closed loop
 
