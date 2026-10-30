@@ -689,6 +689,73 @@ The session reports which form it opened and why, on the heartbeat as
   measurement: its conversion and upload are 1.2 ms of a 4.1 ms encode stage, on
   the one 1600×900 virtual desktop that runs it (FR-118 open decision 6).
 
+## Colour: one conversion, and the description that names it (FR-130)
+
+Every converter in the agent produces **BT.601 YUV at limited range**: the CPU converters
+(`agents/roomlerd/src/encode/color.rs`), the D3D11 VideoProcessor of the GPU input path (above), and
+VideoToolbox, whose input is marked with the BT.601 matrix (FR-118 P5). Until
+[FR-130](fr/FR-130-colours-decode-true.md) no encoder said so. Chrome decodes an HD picture that says
+nothing as BT.709, so the greys came out exact and every saturated colour shifted: magenta 191/0/191
+arrived as 205/30/197 (#3049).
+
+```mermaid
+flowchart LR
+    CAP["captured BGRA"] -->|"BT.601, limited range<br/>(every converter)"| YUV["YUV"]
+    YUV --> ENC["encoder"]
+    ENC -->|"lever 1 (P1): set S in the bitstream<br/>color_description, default on"| BS["SPS VUI · AV1 color_config<br/>· VP9 header · MF attributes"]
+    BS --> V["&lt;video&gt; (RTP)<br/>reads the bitstream"]
+    BS --> W["WebCodecs workers<br/>(the data channel)"]
+    P2["lever 2 (P2): configure({colorSpace: set S})<br/>roomler-rc-colorspace"] -.->|"overrides the bitstream"| W
+    V --> RGB["RGB as captured"]
+    W --> RGB
+```
+
+**The description** is FR-130's set S, defined once (`agents/roomlerd/src/encode/color_desc.rs:82`):
+- the SMPTE 170M matrix (BT.601's coefficients, H.273 code 6);
+- limited range;
+- the BT.709 primaries and sRGB transfer of the desktop the pixels came from.
+
+The matrix and the range are what every converter produces, and a compile-time assertion keeps them that
+way. The primaries and the transfer describe the content. In Chrome, sets A (SMPTE 170M for all three), B
+(BT.709 primaries and transfer) and S decode identically. S is the truthful one for a player that
+colour-manages by primaries and transfer (FR-130 §2.5).
+
+| Family | Where it is written | What the bitstream carries (read on neo16 in P1) |
+|---|---|---|
+| FFmpeg, every backend | the codec context's four fields in `build_encoder` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1912`), before the open, for every cell, rebuild, probe, recording and GPU form | NVENC, D3D12 and Vulkan: set S exactly (H.264, HEVC and AV1; NVENC 4:4:4 too). `hevc_amf`: S's values, with the matrix under code 5 (BT.470 BG, the same coefficients). `h264_amf`: matrix 2 (unspecified), AMD's runtime's choice. `vp9_qsv`, `vp9_vaapi`: nothing, because FFmpeg 9.0.1 cannot tag VP9 there. QSV, VAAPI and VideoToolbox: not yet read |
+| Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES` and `MF_MT_TRANSFER_FUNCTION` on both media types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:600`), and again on the renegotiated output type | Microsoft's H.264 and HEVC encoders ignore the attributes and write no description. NVIDIA's and AMD's MF encoders did not open on neo16, so they are unread |
+| openh264, live | the SPS VUI (`agents/roomlerd/src/encode/openh264_backend.rs:116`) | set S |
+| libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:435`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
+| openh264, recording | its own VUI and the MP4 `colr` box, unchanged since FR-85 | SMPTE 170M at limited range |
+
+A vendor runtime that refuses the description opens the encoder without it rather than failing the open.
+While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:1833`).
+
+**Which lever reaches which path:**
+
+| Viewer path | Decodes true through | Notes |
+|---|---|---|
+| Data channel, VP9 (4:2:0 and 4:4:4) | lever 2 only | Chrome's WebCodecs ignores VP9's in-band colour space (FR-130 §2.5) |
+| Data channel, H.264, HEVC and AV1 | lever 2, and lever 1 where the encoder writes it | either alone decodes true, and together they agree |
+| RTP `<video>` | lever 1 only | lever 2 cannot reach it. Microsoft's MF H.264 and `h264_amf` still decode as BT.709 here (FR-130 open decision 6: accepted for now) |
+| a recording | lever 1 (FFmpeg-encoded) or the recorder's own openh264 VUI | |
+
+Read in the field on agent 0.4.188 ([FR-130 §8](fr/FR-130-colours-decode-true.md#8-field-verification-log)):
+lever 1 alone decodes `<video>` true from live openh264, and VP9 on the data channel decodes true through lever 2
+only, with or without the description in its header.
+
+**The switches.**
+- `color_description` turns lever 1 off on a device (*Configuration*, below). Since FR-130 P1b it can be
+  pushed through remote config ([remote-config.md](remote-config.md)). A push lands at the device's next
+  connect and applies at the restart after that.
+- `roomler-rc-colorspace=off` turns lever 2 off in one browser
+  ([remote-control.md §18.6.2](remote-control.md#1862-the-decoder-is-told-the-colour-space-fr-130-p2)).
+
+⚠️ A colour-managed capture is a different effect. On a wide-gamut panel the compositor hands the capture
+pixels that already differ from the page's CSS, and both input paths capture the same pixels. Compare a
+decoded picture with the pixels as captured (`roomlerd capture-smoke --dump`, a P6 PPM), not with the
+source's CSS values.
+
 ## Configuration
 
 | Key (config.toml / `roomler config set`) | Env | Default | What |
