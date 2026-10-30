@@ -361,51 +361,11 @@ impl SyntheticCapture {
     }
 
     /// [`Self::render_sized`], plus the last bench probe in the bottom-right
-    /// marker when there is one (FR-16 L4). Pure over its inputs.
+    /// marker when there is one (FR-16 L4). Pure over its inputs. The painter
+    /// is `capture::synthetic_scene::paint`, compiled into every build so the
+    /// L1 encoder bench paints these same pixels on a release build.
     pub fn render_frame(counter: u64, width: u32, height: u32, probe: Option<u16>) -> Vec<u8> {
-        let mut data = vec![0u8; (width * height * 4) as usize];
-        let shift = (counter % width as u64) as u32;
-        for y in 0..height {
-            for x in 0..width {
-                let i = ((y * width + x) * 4) as usize;
-                let gx = (x + shift) % width;
-                // Diagonal gradient that wraps — the shift gives motion.
-                let r = ((gx * 255) / width) as u8;
-                let g = ((y * 255) / height) as u8;
-                let b = (((gx + y) * 127) / (width + height)) as u8;
-                // BGRA byte order.
-                data[i] = b;
-                data[i + 1] = g;
-                data[i + 2] = r;
-                data[i + 3] = 0xFF;
-            }
-        }
-        // Counter strip: top-left 64×4 pixels, white = 1 bit, black = 0.
-        // 64 bits of counter, MSB at x=0. A test that wants the
-        // counter back reads the top-left 64 pixels' B channel.
-        for bit in 0..64u32.min(width) {
-            let on = (counter >> (63 - bit)) & 1 == 1;
-            let colour = if on { 0xFF } else { 0x00 };
-            for y in 0..4u32.min(height) {
-                let i = ((y * width + bit) * 4) as usize;
-                data[i] = colour;
-                data[i + 1] = colour;
-                data[i + 2] = colour;
-                data[i + 3] = 0xFF;
-            }
-        }
-        marker::paint_bgra(&mut data, width, height, width * 4, marker::seq_of(counter));
-        if let Some(seq) = probe {
-            marker::paint_bgra_at(
-                marker::Corner::BottomRight,
-                &mut data,
-                width,
-                height,
-                width * 4,
-                seq,
-            );
-        }
-        data
+        super::synthetic_scene::paint(counter, width, height, probe)
     }
 }
 
