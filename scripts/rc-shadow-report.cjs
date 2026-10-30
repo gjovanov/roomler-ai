@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 //
-// rc-shadow-report.js — FR-63 AC2's instrument: has the shadow rate controller
+// rc-shadow-report.cjs — FR-63 AC2's instrument: has the shadow rate controller
 // agreed with the live governor closely enough to be flipped live?
 //
 // WHY THIS EXISTS
@@ -55,13 +55,14 @@
 //
 // RUN
 //
-//   node scripts/rc-shadow-report.js --self-test
-//   node scripts/rc-shadow-report.js [--json] [--min-windows N] [--sessions] FILE...
+//   node scripts/rc-shadow-report.cjs --self-test
+//   node scripts/rc-shadow-report.cjs [--json] [--min-windows N] FILE...
 //   scripts/rc-shadow-report.sh --mars --yes [--since ISO] [--until ISO]   # the fleet read
 //
 // The core below runs unchanged under Node and under mongosh, so it uses no
 // Node-only API; the two runners at the bottom are the only environment-specific
-// code.
+// code. It is `.cjs` because it is CommonJS and the repo's root package.json
+// declares no module type.
 
 'use strict';
 
@@ -566,6 +567,21 @@ function render(r) {
     const st = Object.entries(x.states).map(([k, v]) => `${k} ${v}`).join(', ');
     L.push(`- ${c} shadow states: ${st}`);
   }
+  // The criterion judges elevated windows only, so a shadow that asks for far
+  // less on a CLEAN path passes it (the day-0 read found exactly that on direct
+  // sessions). Said plainly, with no threshold: what bar it needs is the
+  // operator's call.
+  L.push('');
+  L.push('**Clean windows (the criterion does not judge these)**');
+  L.push('');
+  for (const c of ['constrained', 'direct']) {
+    const x = r.classes[c];
+    if (!x.clean) continue;
+    L.push(
+      `- ${c}: the shadow asked for no more than live in ${x.cleanAgree} of ${x.clean} clean windows; ` +
+        `disagreement p50 ${fmtPct(x.disagreePct.clean.p50)}, p90 ${fmtPct(x.disagreePct.clean.p90)}`,
+    );
+  }
   return L.join('\n');
 }
 
@@ -731,6 +747,14 @@ function selfTest() {
   ok(k1.noShadow === 1 && k1.noLive === 1, 'an unopened shadow and a zero live rate are not compared');
   ok(k1.sign.neg === 2 && k1.sign.zero === 1 && k1.sign.pos === 1, 'the sign of (shadow − live)', k1.sign);
   ok(k1.disagreePct.elevated.p50 === -60 && k1.disagreePct.elevated.p90 === 20, 'percentiles are nearest-rank over the elevated windows', k1.disagreePct);
+  // The criterion ignores clean windows; the report must still say what the
+  // shadow did there (the day-0 read: -96 % on every clean direct window).
+  const out1 = render(r1);
+  ok(
+    /- constrained: the shadow asked for no more than live in 1 of 1 clean windows; disagreement p50 -6 %, p90 -6 %/.test(out1),
+    'the render states the clean windows the criterion does not judge',
+    out1.split('\n').filter((l) => /clean windows/.test(l)),
+  );
 
   // --- the boundary: exactly 70 ms over the floor IS elevated
   const r2 = run([FIX.ff(c1, { s: 1, c: true, live: 1000000, shadow: 900000, age: 110, floor: 40 })]);
@@ -927,9 +951,9 @@ function nodeMain(argv) {
     else if (a === '--tenant') tenantHex = argv[++i];
     else if (a === '-h' || a === '--help') {
       console.log(
-        'usage: rc-shadow-report.js [--json] [--min-windows N] FILE...\n' +
-          '       rc-shadow-report.js --to-ejson [--agent HEX] [--tenant HEX] FILE...   (a rehearsal seed)\n' +
-          '       rc-shadow-report.js --self-test',
+        'usage: rc-shadow-report.cjs [--json] [--min-windows N] FILE...\n' +
+          '       rc-shadow-report.cjs --to-ejson [--agent HEX] [--tenant HEX] FILE...   (a rehearsal seed)\n' +
+          '       rc-shadow-report.cjs --self-test',
       );
       return process.exit(0);
     } else opts.files.push(a);

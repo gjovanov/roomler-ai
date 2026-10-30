@@ -970,7 +970,7 @@ next section's. The config-surface tribool
 
 ### Reading the shadow — AC2's instrument (FR-63 B1b)
 
-`scripts/rc-shadow-report.js` measures the flip criterion. It does not decide it:
+`scripts/rc-shadow-report.cjs` measures the flip criterion. It does not decide it:
 whether the bar is right, and whether to flip, stay the operator's calls.
 
 > ≥ 20 constrained + ≥ 20 direct sessions, and shadow ≤ live in ≥ 90 % of the
@@ -1014,6 +1014,16 @@ than claiming it. The same pass reads two of **B1's invariants off the field**: 
 carried over from an earlier constrained stretch is not a rise), and a constrained
 shadow below its 200 kbps floor. Both must read 0.
 
+⚠️ **The criterion judges elevated windows only, and the first field read showed why
+that is not enough on its own.** On ten direct sessions on `agent-v0.4.188`
+(2026-10-30) every window carried the shadow, and in all 43 clean windows it asked
+for **96 % less** than the governor: it opens at the direct path's area floor
+(2.46 Mbps at 2560×1600) and climbs ×1.08 per window, while the governor opens at its
+content-generous ceiling (~90 Mbps). Asking for less passes the criterion. So the
+report prints the clean-window disagreement under its own heading, with no
+threshold of its own; the detail and the B2 question it raises are in the FR-63 spec
+(§ "Day 0").
+
 **Why the fleet read is server-side.** The plan assumed the API could serve it
 (`list_for_agent(?session_id=…)`). It cannot: `GET /api/tenant/{tid}/agent/{aid}/logs`
 takes only `limit`, clamped to 500 recent batches per agent — about 40 minutes of a
@@ -1046,8 +1056,8 @@ fleet read's own `--rows` output agreed exactly on every class, the pool, the
 criterion and the invariants.
 
 ```bash
-node scripts/rc-shadow-report.js --self-test                       # 32 cases, incl. the bar's edges and red runs
-node scripts/rc-shadow-report.js roomlerd.log.2026-10-30 …          # a host's logs: evidence about that host only
+node scripts/rc-shadow-report.cjs --self-test                       # 33 cases, incl. the bar's edges and red runs
+node scripts/rc-shadow-report.cjs roomlerd.log.2026-10-30 …          # a host's logs: evidence about that host only
 bash scripts/rc-shadow-report.sh --mars --yes --since 2026-10-30T14:21:00Z   # the fleet read AC2 is judged by (--until: now)
 bash scripts/rc-shadow-report.sh --docker NAME --seed seed.ejson     # the rehearsal
 ```

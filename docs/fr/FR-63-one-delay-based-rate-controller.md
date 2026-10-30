@@ -1,6 +1,6 @@
 # FR-63 — One delay-based rate controller for remote desktop
 
-**Issue:** [#1243](https://github.com/gjovanov/roomler-ai/issues/1243) · **Status:** in progress — B-opener shipped (default OFF); **B0 simulator shipped**, AC0b answered in simulation and still open in the field; **B1 shadow controller shipped in `agent-v0.4.188`** (2026-10-30; `encode::ratectl` beside the governor, six `shadow_*` heartbeat fields, observe-only — drives nothing); **B1b: AC2's instrument built** (`scripts/rc-shadow-report.js`, the bounded fleet read of `agent_logs`) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
+**Issue:** [#1243](https://github.com/gjovanov/roomler-ai/issues/1243) · **Status:** in progress — B-opener shipped (default OFF); **B0 simulator shipped**, AC0b answered in simulation and still open in the field; **B1 shadow controller shipped in `agent-v0.4.188`** (2026-10-30; `encode::ratectl` beside the governor, six `shadow_*` heartbeat fields, observe-only — drives nothing); **B1b: AC2's instrument built** (`scripts/rc-shadow-report.cjs`, the bounded fleet read of `agent_logs`) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 **Parent/siblings:** FR-59 (the regression that motivated the arc). This is one of three FRs from that plan (FR-62 encoder apply path, FR-63 the controller, FR-64 the data path).
 
@@ -24,7 +24,7 @@ Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodpu
 | **B-opener** | Slow-start for the session opener — `encode::slow_start` (pure law) + the governor cap on the opening ceiling **and floor** | `rate_slow_start` (default **OFF**) | shipped **inert** in 0.4.55 (#1262, #1265 capped only the ceiling, which `set_ceiling` raised back to the flat 1.5 M floor); fixed in 0.4.56 (#1275) and **field-verified engaging** — AC0a done, AC0b open |
 | B0 | `encode/sim.rs` — pipe/encoder/viewer simulator + the four scenario fixtures, driving the SHIPPED laws | n/a (test-only) | **shipped** — 11 tests in `cargo test -p roomlerd --lib` on the default build. CSV trace replay deferred (see below) |
 | B1 | `ratectl` shadow beside the governor, `shadow_*` heartbeat fields | `ROOMLERD_RATECTL` (env; `off` disables, default shadow) | **shipped in `agent-v0.4.188`** (#3102, published 2026-10-30 14:21Z; merged after 0.4.187 was cut) — `encode::ratectl::Controller` (pure, 13 unit tests) fed at the five live positions, six `shadow_*` fields on both pump heartbeats, a containment test (`the_shadow_never_moves_the_live_decision`, red-run confirmed) and a `RateLaw` adapter running it on the B0 cells. **Observe-only: it drives nothing.** AC2 (the fleet-log flip criterion) still needs a release + a week of logs |
-| B1b | AC2's instrument — `scripts/rc-shadow-report.js` (+ `.sh`): the flip criterion measured over `agent_logs` | n/a (a read; the prod targets refuse without `--yes`) | **built** — see "B1b — the shadow report" below. The plan's read path (`list_for_agent(?session_id=…)`) does not exist, so the fleet read runs as a bounded mongosh pass inside the Mongo pod; rehearsed on `mongo:7` with three-way parity. It measures; the operator runs the prod read and decides the flip |
+| B1b | AC2's instrument — `scripts/rc-shadow-report.cjs` (+ `.sh`): the flip criterion measured over `agent_logs` | n/a (a read; the prod targets refuse without `--yes`) | **built** — see "B1b — the shadow report" below. The plan's read path (`list_for_agent(?session_id=…)`) does not exist, so the fleet read runs as a bounded mongosh pass inside the Mongo pod; rehearsed on `mongo:7` with three-way parity. It measures; the operator runs the prod read and decides the flip |
 | B2 | Flip to `live` on the flip criterion | `ratectl = shadow\|live\|off` | not started |
 | B3 | Retire the eight estimators and their switches | `ratectl = off` for one release | not started |
 
@@ -240,7 +240,7 @@ the B0 cells are what B1 can prove; the fleet read is B2's.
 
 B1 shipped the controller and the plan named its judge — "`scripts/rc-shadow-report.py`
 reads a week of `agent_logs` by session" — but nothing had built it. B1b does:
-`scripts/rc-shadow-report.js` measures the flip criterion, and
+`scripts/rc-shadow-report.cjs` measures the flip criterion, and
 `scripts/rc-shadow-report.sh` runs it where the data lives. Its contract, the bounds
 and the commands are in `docs/rate-control.md` § "Reading the shadow".
 
@@ -282,7 +282,7 @@ prints "not checked here".
 
 ### Evidence
 
-- **The suite can fail.** 32 self-test cases, including both edges of the bar (18/20
+- **The suite can fail.** 33 self-test cases, including both edges of the bar (18/20
   = 90.0 % meets, 17/20 does not; 19 sessions do not) and three red runs. Five
   mutations were run against it: `≥ 70` → `> 70`, the pooled clause's denominator,
   the ICE merge, the mirrored constant (70 → 71) and agreement `≤` → `<`. The last one
@@ -304,6 +304,35 @@ Two defects in the wrapper surfaced only in the rehearsal, and both were Git-Bas
 path rewriting: a container path (`/tmp/…`) reached mongosh as `C:/Users/…`, and with
 the rewrite off, a host path reached `docker cp` as `C:\c\dev`. Neither touches the
 production targets, which run on Linux.
+
+### Day 0 — B1 in the field (2026-10-30)
+
+The first RC sessions on `agent-v0.4.188` the report could read without touching
+anyone's machine were ten short direct sessions a peer ran on a dev box (16:46–16:50Z,
+HEVC on NVENC, host ↔ host), read from that box's own log:
+
+| | live governor | shadow |
+|---|---|---|
+| opens at | 89.8 Mbps (76.3 in one session) — the content-generous ceiling (FR-74 P1) | **2.46 Mbps** — the governor's area floor for 2560×1600 (`area_min_bitrate_bps` = pixels × 3/5), the direct path's floor; the first heartbeat already shows one rise (2 654 208 = 2 457 600 × 1.08) |
+| after 6 s / 14 s | 101.1 / 123.7 Mbps | 3.34 / 4.55 Mbps — 4 / 8 rises of ×1.08 from the floor, one per 2-s window |
+| state | — | `startup` / `climbing` in all 44 windows |
+
+**B1 works in the field.** Every window carries all six fields, populated and
+consistent (`shadow_disagree_pct` = `(shadow − live)/live`), the climb runs at
+exactly the law's rate, and no pause was ordered on a direct path.
+
+🔑 **And the first thing it shows is a B2 question the flip criterion cannot see.**
+In all 43 clean windows the shadow asked for **96 % less** than the governor
+(p50 = p90 = −96 %). At the measured rate — one ×1.08 rise per window to half the
+ceiling, then ceiling/16 per step — reaching a ~100 Mbps live rate takes about 47 rises,
+roughly a minute and a half (a projection from the law at the measured rise rate,
+not a measurement). The criterion judges elevated windows only, where asking for less
+is the safe direction, so this behaviour passes it: flipped live as it is, every
+direct session would open near 2.5 Mbps. The report now prints the clean-window
+disagreement under its own heading, with no threshold. How B2 opens a direct session
+(at the ceiling or the remembered rate as the governor does, or a faster climb on clean
+direct windows) is B2's design call; whether the flip criterion needs a clean-window
+clause is the operator's.
 
 ⚠️ **B1b does not tick AC2.** It is the instrument. AC2 is the instrument run over a
 release of fleet logs: the window opens with `agent-v0.4.188` (2026-10-30 14:21Z) and
