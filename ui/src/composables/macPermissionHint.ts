@@ -23,8 +23,8 @@ export const LEGACY_MAC_PERMISSION_HINT_START = 'Grant Screen Recording to Rooml
  *  Reopen": on those agents that takes the device offline. */
 export const LEGACY_MAC_PERMISSION_ADVICE =
   'Turn on roomlerd in System Settings → Privacy & Security → Screen & System Audio Recording ' +
-  '(the Roomler entry there is the menu-bar app). macOS applies that grant only when the agent ' +
-  'restarts, so reconnecting alone does not help. On this agent version macOS’s own Quit & ' +
+  '(the Roomler entry there is the menu-bar app). macOS applies that grant only when roomlerd ' +
+  'restarts, so reconnecting alone does not help. On this roomlerd version macOS’s own Quit & ' +
   'Reopen takes the device offline: on the Mac, restart it with launchctl kickstart -k ' +
   'gui/$(id -u)/com.roomler.agent in Terminal, then reconnect.'
 

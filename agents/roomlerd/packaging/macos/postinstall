@@ -354,7 +354,7 @@ fi
 # "Quit & Reopen" restarts the agent instead of leaving it offline.
 echo "In System Settings > Privacy & Security, turn on 'roomlerd' under Screen &"
 echo "System Audio Recording and under Accessibility ('Roomler' is the menu-bar app)."
-echo "macOS applies Screen Recording after the agent restarts: choose Quit & Reopen"
+echo "macOS applies Screen Recording after roomlerd restarts: choose Quit & Reopen"
 echo "when macOS offers it, Restart in the Roomler menu-bar app, or run:"
 echo "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
 

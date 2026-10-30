@@ -699,7 +699,7 @@
     };
     try {
       const r = await R.restartDaemon('macOS permissions: Screen Recording applies after a restart', say);
-      say(r.ok ? 'The agent restarted.' : r.message);
+      say(r.ok ? 'roomlerd restarted.' : r.message);
       await refreshPermissions();
     } finally {
       permRestarting = false;

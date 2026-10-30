@@ -759,7 +759,7 @@ impl CaptureUnavailableCode {
 /// ⚠️ On the wire as a JSON literal, unescaped
 /// (`capture_unavailable_payload`): no double quote, no backslash.
 pub(crate) const MAC_PERMISSION_HINT: &str = "Turn on roomlerd in System Settings → Privacy & \
-     Security → Screen & System Audio Recording. macOS applies that grant only when the agent \
+     Security → Screen & System Audio Recording. macOS applies that grant only when roomlerd \
      restarts, so reconnecting alone does not help: on the Mac, choose Quit & Reopen when macOS \
      offers it, or Restart in the Roomler menu-bar app, then reconnect. A macOS update or a \
      change to the app's code signature invalidates an existing grant.";
@@ -3926,7 +3926,7 @@ mod wayland_reason_tests {
         let h = MAC_PERMISSION_HINT;
         assert!(h.contains("Turn on roomlerd"), "{h}");
         assert!(h.contains("Screen & System Audio Recording"), "{h}");
-        assert!(h.contains("only when the agent restarts"), "{h}");
+        assert!(h.contains("only when roomlerd restarts"), "{h}");
         assert!(
             h.contains("Quit & Reopen") && h.contains("Roomler menu-bar app"),
             "{h}"

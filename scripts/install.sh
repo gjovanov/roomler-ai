@@ -949,8 +949,8 @@ macos_permissions_notice() {
     say ""
     say "Without Screen Recording the remote screen is blank; without Accessibility the"
     say "remote keyboard and mouse do nothing. Neither reports an error. The 'Roomler'"
-    say "entry is the menu-bar app, not the agent. macOS applies Screen Recording only"
-    say "after the agent restarts:"
+    say "entry is the menu-bar app, not roomlerd. macOS applies Screen Recording only"
+    say "after roomlerd restarts:"
     say "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
 }
 

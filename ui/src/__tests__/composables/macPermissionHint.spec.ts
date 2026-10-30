@@ -15,7 +15,7 @@ const LEGACY =
 // What an agent with #3164 sends (`MAC_PERMISSION_HINT`).
 const CURRENT =
   'Turn on roomlerd in System Settings → Privacy & Security → Screen & System Audio Recording. ' +
-  'macOS applies that grant only when the agent restarts, so reconnecting alone does not help: ' +
+  'macOS applies that grant only when roomlerd restarts, so reconnecting alone does not help: ' +
   'on the Mac, choose Quit & Reopen when macOS offers it, or Restart in the Roomler menu-bar app, ' +
   "then reconnect. A macOS update or a change to the app's code signature invalidates an existing grant."
 
@@ -24,7 +24,10 @@ describe('#3164 — a Mac without Screen Recording is told about the restart', (
     expect(LEGACY.startsWith(LEGACY_MAC_PERMISSION_HINT_START)).toBe(true)
     const shown = mediaUnavailableHint('permission', LEGACY)
     expect(shown).toBe(LEGACY_MAC_PERMISSION_ADVICE)
-    expect(shown).toContain('only when the agent restarts')
+    expect(shown).toContain('only when roomlerd restarts')
+    // The operator, 2026-10-30: nothing a person reads calls the daemon an "agent".
+    // `com.roomler.agent` is the launchd label the kickstart names, not a word.
+    expect(shown).not.toMatch(/(?<!\.)\bagent\b/i)
     expect(shown).toContain('reconnecting alone does not help')
     expect(shown).toContain('Turn on roomlerd')
     expect(shown).not.toContain('Grant Screen Recording to Roomler')

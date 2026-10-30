@@ -168,9 +168,9 @@ pub(crate) fn decide(f: &Facts) -> InputReach {
                 // its injector again once the OS grants it (`Regrant`).
                 verdict(
                     Reach::None,
-                    "macOS Accessibility is not granted to this agent: turn on roomlerd in \
+                    "macOS Accessibility is not granted to roomlerd: turn it on in \
                      System Settings, Privacy & Security, Accessibility (the Roomler entry there \
-                     is the menu-bar app, not this agent). It applies from the next remote event, \
+                     is the menu-bar app, not roomlerd). It applies from the next remote event, \
                      with no restart"
                         .into(),
                 )
