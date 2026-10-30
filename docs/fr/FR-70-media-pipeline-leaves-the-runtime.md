@@ -1317,37 +1317,58 @@ documented D1 lag), named by the moved input, counted apart from the gate
 exactly as M3a.3 built it to be. Zero is the gate; this is the week **running
 clean so far**, not the week met — it runs to 2026-11-04 17:04Z at the earliest.
 
-**The three green checks the gate was owed, run against 0.4.182+:**
+**The three green checks the gate was owed, run against 0.4.182+.** The
+driven session is `zeus` on 0.4.187 (`hevc_vaapi`, rebuild-bound, headless,
+nobody at the screen), read back from the daemon's dated log file after the
+session; every number below is a log line, not a heartbeat summary.
 
 - **M3a.2 — a dims replacement opens at its own dims' ceiling** (the `zeus`
-  move, red on 0.4.148). Driven on 0.4.187 (`hevc_vaapi`, direct, headless):
-  `1600×900 → 1048×590` adopted in **3 ms** off the frame path (`dims swap
-  adopted — the picture never froze`, `dims_swaps=1`), the controller's first
-  tick landed on the new frame's ceiling (`set_bitrate ceiling=11 593 500`) with
-  **no second open and no `bitrate` divergence**; the move back up adopted the
-  same way (`dims_swaps=2`). The heartbeat read zero on every field across both,
-  `plan_epoch` 10 → 22. Red-first is the week-1 `zeus` read (plan 8 M vs inline
-  25 M). **Met.**
+  move, red on 0.4.148). `1600×900 → 1048×590`, with the controller sitting at
+  the old frame's full 27 M ceiling: the replacement **opened at the 12 M rung**
+  (`maxrate=12 000 000` — the ladder's rung for the new dims' ceiling,
+  11 593 500), where 0.4.148 had opened it at the 25 M rung; adopted in **3 ms**
+  off the frame path (`dims swap adopted — the picture never froze`,
+  `dims_swaps=1`); the controller's first tick named the same rung
+  (`set_bitrate ceiling=11 593 500 target=11 593 500`) and had **nothing to
+  re-rate — no swap followed** (none between 22:21:48 and the move back up).
+  The move back up opened at the same 12 M rung (the applied rate under the old
+  ceiling rides along, as designed), adopted in 8 ms (`dims_swaps=2`), and the
+  AIMD resumed its 5-s climb. Two inline rebuilds in the whole session (the
+  start and the flip below), none at either move; zero on every field
+  throughout, `plan_epoch` 10 → 22. **Met.**
 - **B1 — a persisted relay→direct flip opens at the post-flip target** (red on
-  0.4.151–179, week-1 cases #10 and #23). Six such flips occurred naturally in
-  the window, every one on `hevc_qsv` (a rebuild-bound backend — B1's worst
-  case, where the re-rate was a second open): each reopened capture at the new
-  60 fps profile and its encoder opened, then the controller's climb rode the
-  zero-stall background swap, and **not one produced a `bitrate` divergence**.
-  The instrument the fix was built to be judged by reads zero on the exact event
-  that was red a week ago. **Met, by the instrument on the natural events.**
+  0.4.151–179, week-1 cases #10 and #23). The driven session reproduced it on
+  a rebuild-bound backend: it **started relay-tier** (30 fps, ceiling 2.55 M —
+  this viewer's first nominated pair is a relay), **escaped** at the first 5-s
+  recheck (ceiling 13.5 M, target 3 393 750) and the flip **persisted** at the
+  second: the rebuild **opened at 3 393 750, the post-escape target** — before
+  the fix it opened at the old profile's 2.55 M and the same pass re-rated it.
+  The `set_bitrate` 141 ms after that open (target 5 081 250) is the AIMD's
+  5-s window step anchored at the escape (47.988 → 53.048), not a correction of
+  the open. Six such flips also occurred naturally in the window, every one on
+  `hevc_qsv`, each with its next step 5.0–5.06 s after the escape's — the
+  flip persists one recheck after the escape and the AIMD steps once a window,
+  so the two coincide by construction. **Not one produced a `bitrate`
+  divergence**, where the same event was red a week ago. **Met.**
 - **B3 — a relayed start that escapes to direct leaves no stale hold** (red on
   the pre-fix releases, week-1 case #24). Seven relay→direct escapes occurred in
-  the window with no stale hold and no divergence — but every one started with
-  **no thrift hold** (`deferred=0` at the start), so the exact red-shape (a
-  *held* target surviving the escape) did not recur naturally. No regression is
-  shown; the driven green that reproduces the hold is **still owed** — it needs a
-  relayed `hevc_qsv` start forced to form a hold, then an escape.
+  the window (the driven session's among them) with no stale hold and no
+  divergence — but every one started with **no thrift hold** (`deferred=false`
+  on the start's first tick), so the exact red-shape (a *held* target surviving
+  the escape) did not recur. The reason is in the tick's arms: `last_motion_at`
+  starts 60 s in the past, so a start whose screen is quiet takes the quiet
+  arm and applies at once; case #24's hold formed on a live desktop, where
+  motion inside `DEFER_QUIET` (1.2 s) at the first tick takes the holding arm.
+  No regression is shown; the driven green is **still owed**, and its recipe is
+  a relayed start on a rebuild-bound backend **with on-screen motion in its
+  first second**, then the escape (a reading of the arms, not yet measured).
 
-Still owed before AC10 can be ticked: the full week to elapse (the final read on
-or after 2026-11-04 17:04Z with the `remote_sessions` denominator), the B3
-driven green above, and two driven moves the interim read did not contain
-naturally — a geometry dims swap on a QSV host and a Priority move on a relay
+The window's 13 fleet dims swaps are all FR-119 refresh swaps at constant
+geometry (60 → 120/144 fps); the only geometry moves in it are the two driven
+ones above. Still owed before AC10 can be ticked: the full week to elapse (the
+final read on or after 2026-11-04 17:04Z with the `remote_sessions`
+denominator), the B3 driven green, and two driven moves the window did not
+contain — a geometry dims swap on a QSV host and a Priority move on a relay
 (both need a QSV / relay host that can be driven without interrupting a person at
 it; the headless Linux hosts are `vaapi`). M3b does not start before the week
 holds.
