@@ -330,7 +330,7 @@ impl Answer {
 
 /// Who a prompt came from: the user it is attributed to in the transcript
 /// (by name) and on the turn's stub (by id).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Author {
     pub user_id: ObjectId,
     pub name: String,

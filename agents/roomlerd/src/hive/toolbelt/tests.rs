@@ -6364,3 +6364,93 @@ async fn where_the_runs_worker_is_given_up_on_its_endpoint_is_refused() {
     assert_eq!(kept_for(sid, 5), 0, "nothing handed");
     super::super::worker::drop_run(sid, 5);
 }
+
+/// FR-90 P8-2c-2 — `Pending`'s own `Slot` bookkeeping in `remote` mode
+/// (the daemon's side of a handed-over toolbelt), without a real worker or
+/// channel: `note_remote_open`/`answer`/`withdraw`/`withdraw_all`'s return
+/// values and `ids()`, which must stay correct even though the real wait
+/// lives elsewhere. The forward itself (a `Link::call` to whatever worker
+/// `worker::link_of` finds, if any) is exercised by `handed::tests`
+/// instead, where a real `Serving` answers it.
+#[cfg(all(unix, worker_calls))]
+mod remote_pending {
+    use super::*;
+
+    fn remote() -> Pending {
+        Pending::remote(ObjectId::new(), 1, 42)
+    }
+
+    #[tokio::test]
+    async fn note_remote_open_respects_max_pending() {
+        let p = remote();
+        for i in 0..MAX_PENDING {
+            assert!(p.note_remote_open(&format!("a{i}")), "under the bound");
+        }
+        assert!(
+            !p.note_remote_open("one_too_many"),
+            "MAX_PENDING already open"
+        );
+        assert_eq!(p.ids().len(), MAX_PENDING);
+    }
+
+    #[tokio::test]
+    async fn ids_reflects_remote_opens_sorted() {
+        let p = remote();
+        p.note_remote_open("b");
+        p.note_remote_open("a");
+        assert_eq!(p.ids(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn answer_removes_a_remote_slot_and_reports_it_was_open() {
+        let p = remote();
+        p.note_remote_open("r1");
+        let answer = Answer {
+            decision: Decision::Allow,
+            by: Author {
+                user_id: ObjectId::new(),
+                name: "x".into(),
+            },
+        };
+        assert!(p.answer("r1", answer.clone()), "it was open");
+        assert!(p.ids().is_empty());
+        // A second answer of the same (now-closed) id reports it was not.
+        assert!(!p.answer("r1", answer));
+    }
+
+    #[tokio::test]
+    async fn answer_of_an_id_never_opened_reports_false() {
+        let p = remote();
+        let answer = Answer {
+            decision: Decision::Allow,
+            by: Author {
+                user_id: ObjectId::new(),
+                name: "x".into(),
+            },
+        };
+        assert!(!p.answer("never_opened", answer));
+    }
+
+    #[tokio::test]
+    async fn withdraw_removes_one_remote_slot_and_leaves_the_rest() {
+        let p = remote();
+        p.note_remote_open("w1");
+        p.note_remote_open("w2");
+        p.withdraw("w1");
+        assert_eq!(p.ids(), vec!["w2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn withdraw_all_clears_every_remote_slot() {
+        let p = remote();
+        p.note_remote_open("x1");
+        p.note_remote_open("x2");
+        p.withdraw_all();
+        assert!(p.ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn withdraw_all_on_an_already_empty_pending_does_not_panic() {
+        remote().withdraw_all();
+    }
+}
