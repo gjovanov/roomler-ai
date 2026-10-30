@@ -449,6 +449,34 @@ fn woke() {
     }
 }
 
+/// FR-55 P4 — the two halves of an OS hook, for a process that has no sleep
+/// to hook. The integration suite drives the real agent loop through them
+/// (`crates/tests/tests/sleep_announce_agent.rs`), from a test binary of its
+/// own, because the announcement is process-wide. The daemon never calls
+/// them.
+#[doc(hidden)]
+pub mod simulate {
+    use std::time::Duration;
+
+    /// The OS says this computer is going to sleep: what a hook does, within
+    /// the Linux hook's bound. Blocks the calling thread for at most that
+    /// bound, so never call it on a runtime thread.
+    pub fn will_sleep(runtime: &tokio::runtime::Handle) {
+        super::will_sleep(
+            runtime,
+            super::Budget {
+                tell: Duration::from_millis(1600),
+                announce: Duration::from_millis(1500),
+            },
+        );
+    }
+
+    /// The computer woke, or its sleep was cancelled.
+    pub fn woke() {
+        super::woke();
+    }
+}
+
 /// Whether the Linux watcher should hold its delay inhibitor at all: for
 /// P5h while a session is live, and for P4's goodbye while a control
 /// connection is, but only on a device whose `power_policy` is not `never`.
