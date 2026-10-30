@@ -324,11 +324,32 @@
           Postinstall hook: register the SCM service immediately
           after the EXE lands on disk. Runs deferred + non-
           impersonated (i.e. as LocalSystem since this is perMachine)
-          so it has the rights to call CreateService. Return="ignore"
-          so a registration failure (rare service-name collision,
-          weird group policy) doesn't sink the whole install -
-          operator can recover by running the equivalent
-          `service install` flag combination from elevated PS.
+          so it has the rights to call CreateService.
+
+          #3115: it never deletes the service. An existing entry (a
+          reinstall of the same version, a repair) is reconfigured in
+          place and keeps running; a missing one is created; one an
+          earlier delete still holds (1072: the old product's removal
+          in a major upgrade, whose binary waited 5 s for the stop) is
+          waited out first, within a bound derived from the host's own
+          shutdown (win_service/lifecycle.rs). Up to 0.4.189 it deleted
+          and re-created the service after waiting at most 5 s for the
+          stop, less than the worker's own 8 s graceful budget, and a
+          slow stop left the machine with no service at all.
+
+          Return="ignore", kept on purpose (reviewed in #3115). Under
+          "check" a failure here rolls the whole transaction back, and
+          nothing in a rollback re-creates a service: neither this CA
+          nor UnregisterService has a rollback partner, and the service
+          is not in the ServiceInstall table. A major upgrade rolled
+          back after the old product's removal (which deletes the
+          service) restores the old files with NO service. With
+          "ignore" the install goes on: the SystemContext action that
+          follows restarts the service, StartRoomlerSvc starts it, and
+          a failure here surfaces in EnableSystemContext ("check"),
+          which names the missing service. The operator can also
+          recover with `roomlerd service install as-service` from an
+          elevated shell (the flag takes two leading dashes).
         -->
         <CustomAction
             Id='RegisterService'
@@ -342,8 +363,11 @@
           Symmetric uninstall hook: tear down the SCM service before
           the EXE is removed from disk (the action shells out to the
           EXE itself, so it must still be present). Only fires during
-          full uninstall (REMOVE="ALL"); maintenance / repair leaves
-          the service registration alone.
+          full uninstall (REMOVE="ALL"), which includes this product's
+          removal by a later version's major upgrade; maintenance /
+          repair leaves the service registration alone. #3115: it waits
+          for the stop, and for the host process to exit, within a
+          bound derived from the host's own shutdown before it deletes.
         -->
         <CustomAction
             Id='UnregisterService'
@@ -462,8 +486,9 @@
           tell: the switch lives in the service's Environment, a
           REG_MULTI_SZ that AppSearch hands over with its NUL separators
           (a condition sees an empty string, measured), and by the time a
-          deferred action runs, RegisterService (and a major upgrade's
-          removal of the old product) has deleted the service with it. So
+          deferred action runs, a major upgrade's removal of the old
+          product has deleted the service with it (up to 0.4.189 every
+          RegisterService did too; since #3115 a reinstall keeps it). So
           the freshly laid binary decides, from the product's own record
           of the last enable/disable in %PROGRAMDATA%\roomler, which no
           install touches. It then runs the matching enable or disable, so

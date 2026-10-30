@@ -5578,14 +5578,25 @@ fn service_stop_as_service() -> Result<()> {
 #[cfg(target_os = "windows")]
 fn service_install_as_service() -> Result<()> {
     let exe = std::env::current_exe().context("locating current_exe for service install")?;
-    win_service::install(&exe).context("registering Roomler with the SCM")?;
-    println!(
-        "Service registered: {} ({}). Launching `sc start {}` will run the service \
-         under LocalSystem; AutoStart fires on next boot.",
-        win_service::NEW_SERVICE_NAME,
-        win_service::SERVICE_DISPLAY_NAME,
-        win_service::NEW_SERVICE_NAME
-    );
+    let registered = win_service::install(&exe).context("registering Roomler with the SCM")?;
+    match registered {
+        // #3115 — an existing service is reconfigured, never deleted: it keeps
+        // running on its old configuration until its next start.
+        win_service::lifecycle::Registered::Reconfigured => println!(
+            "Service reconfigured in place: {} ({}). A running service keeps running; \
+             the change applies from its next start.",
+            win_service::NEW_SERVICE_NAME,
+            win_service::SERVICE_DISPLAY_NAME
+        ),
+        win_service::lifecycle::Registered::Created
+        | win_service::lifecycle::Registered::CreatedAfterDelete => println!(
+            "Service registered: {} ({}). Launching `sc start {}` will run the service \
+             under LocalSystem; AutoStart fires on next boot.",
+            win_service::NEW_SERVICE_NAME,
+            win_service::SERVICE_DISPLAY_NAME,
+            win_service::NEW_SERVICE_NAME
+        ),
+    }
     // FR-84 D6 — the machine-wide companion login start (`HKLM\…\Run`),
     // written here because this is the elevated step every perMachine install
     // and upgrade runs (the MSI's RegisterService CA, as LocalSystem). A fresh
@@ -5770,10 +5781,11 @@ fn disable_system_context_cmd(_no_restart: bool) -> Result<()> {
 
 /// #1727 — the perMachine MSI's action when its command line does not
 /// name a mode. It cannot read the mode itself: the switch lives in the
-/// service's `Environment`, which RegisterService (and a major upgrade's
-/// removal of the old product) has already deleted by the time this runs,
-/// and an MSI condition cannot read a REG_MULTI_SZ at all. So it follows
-/// the product's own record of the last switch.
+/// service's `Environment`, which a major upgrade's removal of the old
+/// product has already deleted by the time this runs (up to 0.4.189 every
+/// RegisterService did too; since #3115 a reinstall keeps the entry), and an
+/// MSI condition cannot read a REG_MULTI_SZ at all. So it follows the
+/// product's own record of the last switch.
 ///
 /// An unreadable record reads as "off": that is what an install with no
 /// property always did, so no host is worse off than before.
