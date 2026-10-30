@@ -96,7 +96,7 @@ one line and the next rung is tried. Locked by tests
 | Windows x86_64 | the ten vendor encoders (`h264/hevc/av1 × nvenc/qsv/amf` + `vp9_qsv`) + `h264/hevc/av1_d3d12va` + `h264/hevc/av1_vulkan` (sixteen), plus the `h264` decoder and the `aac` encoder, an overlay port over the pinned vcpkg baseline; D3D12 and Vulkan are dlopen'd by FFmpeg (`d3d12.dll`, `vulkan-1.dll`), so the static tree carries no import for either | static (`x64-windows-static-md`) — see [`lgpl-relink.md`](lgpl-relink.md) |
 | Linux x86_64 | the same ten + `h264/hevc/av1/vp9_vaapi` + `h264/hevc/av1_vulkan` (seventeen), plus the `h264` decoder and the `aac` encoder, from source; **libva + libdrm built into the tree** and bundled with the libav* in the `.deb` (no `Depends` on the system's libva — why is under *Hardware frames*); `libvulkan.so.1` is dlopen'd, never a DT_NEEDED | shared, the agent's private lib dir via RPATH; the VA driver and the Vulkan ICD are the host's |
 | macOS arm64 | `h264/hevc/av1_videotoolbox`, plus the `h264` decoder and the `aac` encoder (~3.0 MB of dylibs), built with `--disable-autodetect` so nothing Homebrew is baked in | shared dylibs in the app bundle |
-| Linux arm64 | from 0.4.170 (FR-97 P7a): `h264/hevc/av1_nvenc` + `h264/hevc/av1/vp9_vaapi` + `h264/hevc/av1_vulkan` (ten), plus the `h264` decoder and the `aac` encoder, the Linux x86_64 tree built on an arm64 runner without qsv and amf (neither ships an arm64 Linux runtime); libva + libdrm in the tree, searching `/usr/lib/aarch64-linux-gnu/dri`. Where nothing opens (an Asahi Mac, a GPU-less server) the probe finds no hardware and video stays on OpenH264 + libvpx. No arm64 hardware cell has been proven in a session yet: [FR-122](fr/FR-122-arm64-linux-hardware-cell.md). Before 0.4.170: no FFmpeg | shared, bundled in the `.deb` and the tarball like x86_64's |
+| Linux arm64 | from 0.4.170 (FR-97 P7a): `h264/hevc/av1_nvenc` + `h264/hevc/av1/vp9_vaapi` + `h264/hevc/av1_vulkan` (ten), plus the `h264` decoder and the `aac` encoder, the Linux x86_64 tree built on an arm64 runner without qsv and amf (neither ships an arm64 Linux runtime); libva + libdrm in the tree, searching `/usr/lib/aarch64-linux-gnu/dri`. Where nothing opens (an Asahi Mac, a GPU-less server) the probe finds no hardware and video stays on OpenH264 + libvpx. **NVENC is proven on arm64** (FR-122, 0.4.189, an NVIDIA GB10): `h264_nvenc` and `hevc_nvenc` in 4:2:0 and 4:4:4 and `av1_nvenc`, sessions on H.264 4:4:4 and AV1, a recording in H.264 + AAC ([FR-122 §8](fr/FR-122-arm64-linux-hardware-cell.md#8-field-verification-log)); VAAPI and Vulkan on arm64 ship unproven. Before 0.4.170: no FFmpeg | shared, bundled in the `.deb` and the tarball like x86_64's |
 
 > [!IMPORTANT]
 > **NVENC needs NVIDIA driver 530.41 or newer on Linux, 570.0 on Windows.**
@@ -109,6 +109,17 @@ one line and the next rung is tried. Locked by tests
 > FR-122 P0c, which cost NVENC on NVIDIA's R580 long-term branch and on AWS's
 > G5g image (595). Each Linux vendor job now asserts the floor in the binary it
 > built ([FR-122 §3.2](fr/FR-122-arm64-linux-hardware-cell.md#32-the-nvenc-driver-floor-p0c)).
+
+> [!NOTE]
+> **In a container, NVENC also needs the driver's video libraries.** The NVIDIA
+> Container Toolkit mounts `libnvidia-encode.so.1` and `libnvcuvid.so.1` only for
+> the `video` driver capability (`NVIDIA_DRIVER_CAPABILITIES`; the toolkit's
+> default is `compute,utility`). Without them FFmpeg cannot load NVENC, so the
+> probe advertises no NVENC cell on a GPU that has one. Give the container
+> `compute,utility,video` (or `all`). Where that is not yours to set, as on a
+> rented GPU, the host driver's own packages at its exact version can supply the
+> two libraries ([FR-122 §3.1](fr/FR-122-arm64-linux-hardware-cell.md#31-the-rig),
+> found on a rented DGX Spark).
 
 ## The cell matrix a host advertises (FR-77 P1)
 
@@ -131,7 +142,7 @@ plus `probe_ms` and `probe_cached`.
 | AV1, AMF, VideoToolbox and Media Foundation are never asked for 4:4:4 | `av1_nvenc` hard-errors on it and every other AV1 backend lists 4:2:0 only; AMF has no 4:4:4 surface; VideoToolbox HEVC has only Main / Main10 / Main42210; `*_mf` takes NV12 — locked by a test against the vocabulary |
 
 What the fleet advertised on 0.4.88 (server records, 2026-09-08; the D3D12 and
-Vulkan cells are FR-78's):
+Vulkan cells are FR-78's; the arm64 row is FR-122's, on 0.4.189):
 
 | Host | Cells | Probe |
 |---|---|---|
@@ -142,6 +153,7 @@ Vulkan cells are FR-78's):
 | zeus (the same silicon, without the flag) | `h264/openh264` · `hevc/vaapi` · `h264/vaapi` · `vp9/libvpx` — RADV exposes Vulkan encode only under `RADV_PERFTEST=video_encode` | 0.2 s |
 | the WSL sibling (RTX through WSL's libcuda) | `h264/openh264` · `hevc/nvenc` 4:2:0+4:4:4 · `av1/nvenc` · `h264/nvenc` 4:2:0+4:4:4 · `vp9/libvpx` — its four software Vulkan ICDs open and refuse | 5.9 s |
 | mars (no GPU, Linux) | `h264/openh264` · `vp9/libvpx` | 0.5 s |
+| a rented DGX Spark (NVIDIA GB10, arm64 Linux, driver 580; 2026-10-30) | `h264/openh264` · `hevc/nvenc` 4:2:0+4:4:4 · `av1/nvenc` · `h264/nvenc` 4:2:0+4:4:4 · `vp9/libvpx` — sessions proven on `h264/nvenc` 4:4:4 and `av1/nvenc` | 3.0 s |
 
 The probe's cost grew with the device walk (the dev box 4.3 → 6.1 s, WSL 2.5 →
 5.9 s); the cache pays it once per build, driver and hardware.

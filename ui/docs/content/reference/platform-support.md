@@ -127,7 +127,7 @@ More on [Roomler SSH](/docs/network/ssh/).
 | An ephemeral device removes itself when it stops | ✅ | ✅ | ✅ |
 | The tunnel client (`roomler self-update`) updates itself | ✅ | ✅ from tunnel 0.4.149 | ✅ from tunnel 0.4.149 |
 | Processors the agent runs on | 🟡 x64; ❌ ARM | ✅ x86_64 and arm64 | 🟡 Apple silicon; ❌ Intel |
-| Hardware video encoding on Linux ARM | — | ❌ | — |
+| Hardware video encoding on Linux ARM | — | ✅ with an NVIDIA GPU and driver 530.41 or newer, from 0.4.188 | — |
 | The tunnel client and the wizard on Linux ARM | — | ✅ from 0.4.149: the wizard with the agent release, the tunnel client with the first tunnel release from then on | — |
 
 ## Where the operating system rules it out
