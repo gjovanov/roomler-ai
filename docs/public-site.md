@@ -291,7 +291,9 @@ from both branches (FR-87 §9).
   mounts `saas` (failing open, as the SPA does); live prices from `/api/stripe/plans`,
   over the fallback table the page ships; and, from `GET /api/setup/features` (FR-129
   B1-s), the Linux and macOS "Roomler Setup" buttons — shipped hidden in the Windows card's
-  markup, shown when the server advertises `wizard_unix_daemon` — and the pairing lead when
+  markup, each naming its OS (`data-wizard-unix="linux"`), and shown when the server
+  advertises that OS (`wizard_linux_daemon`, `wizard_macos_daemon`; an older server's
+  `wizard_unix_daemon` shows both) — and the pairing lead when
   it advertises both `pairing` (this server answers `/api/pair/*`) and `wizard_pairing` (the
   released wizard uses it). That one fails **closed**: anything but a JSON `true` (an older
   server's 404, a server without the fleet module, a proxy's error page) leaves the page as

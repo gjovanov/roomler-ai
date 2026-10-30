@@ -146,10 +146,10 @@ export const PILLARS: LandingPillar[] = [
 
 /** The install section's copy. Its cards, the wizard among them, come from
  *  `installCards` in `enrollCommands.ts`, which offers the wizard where it
- *  installs the agent: Windows (FR-97 D5), and Linux and macOS once the server
- *  advertises `wizard_unix_daemon` on `GET /api/setup/features` (FR-129
- *  B1-s). The lead follows the same endpoint's `pairing` AND `wizard_pairing`,
- *  both: `downloadLead`. */
+ *  installs the agent: Windows (FR-97 D5), and Linux and macOS each once the
+ *  server advertises that OS on `GET /api/setup/features` (FR-129 B1-s;
+ *  `wizard_linux_daemon`, `wizard_macos_daemon` since B1-s2). The lead follows
+ *  the same endpoint's `pairing` AND `wizard_pairing`, both: `downloadLead`. */
 export const DOWNLOAD = {
   title: 'Set up a device in minutes',
   lead: 'Paste one command, or on Windows run the graphical installer. Enrollment tokens come from your workspace (Devices → Enroll device).',

@@ -280,13 +280,14 @@ const pillars = PILLARS
 
 // One-line installs — same vitest-locked template source the in-app
 // enrollment dialog uses (token placeholder until they have one), and the
-// wizard only where it installs the agent: Windows (FR-97 D5), and Linux
-// and macOS once the server advertises `wizard_unix_daemon` (FR-129 B1-s).
-// The server also says whether the download signs the person in from the
-// browser — `pairing` (this server answers `/api/pair/*`) AND
-// `wizard_pairing` (the released wizard uses it), both, for the lead. Every
-// switch reads false until it has said true (`stores/setupFeatures.ts`), so
-// the first paint is the Windows-only page with the token lead.
+// wizard only where it installs the agent: Windows (FR-97 D5), and Linux and
+// macOS each once the server advertises that OS (FR-129 B1-s;
+// `wizard_linux_daemon`, `wizard_macos_daemon` since B1-s2, so Linux can go
+// live without macOS). The server also says whether the download signs the
+// person in from the browser — `pairing` (this server answers `/api/pair/*`)
+// AND `wizard_pairing` (the released wizard uses it), both, for the lead.
+// Every switch reads false until it has said true (`stores/setupFeatures.ts`),
+// so the first paint is the Windows-only page with the token lead.
 const osIcon: Record<string, string> = {
   windows: 'mdi-microsoft-windows',
   linux: 'mdi-linux',
@@ -294,7 +295,10 @@ const osIcon: Record<string, string> = {
 }
 const setupFeatures = useSetupFeaturesStore()
 const downloads = computed(() =>
-  installCards(window.location.origin, { wizardUnixDaemon: setupFeatures.wizardUnixDaemon }).map((card) => ({
+  installCards(window.location.origin, {
+    wizardLinuxDaemon: setupFeatures.wizardLinuxDaemon,
+    wizardMacosDaemon: setupFeatures.wizardMacosDaemon,
+  }).map((card) => ({
     ...card,
     icon: osIcon[card.os]!,
   })),

@@ -43,9 +43,15 @@ const buttons = (label: string) =>
 
 beforeEach(() => {
   setActivePinia(createPinia())
-  // The shipped default: pairing on, both claims about the released wizard off.
+  // The shipped default: pairing on, every claim about the released wizard off.
   mockApi.get.mockReset()
-  mockApi.get.mockResolvedValue({ pairing: true, wizard_unix_daemon: false, wizard_pairing: false })
+  mockApi.get.mockResolvedValue({
+    pairing: true,
+    wizard_linux_daemon: false,
+    wizard_macos_daemon: false,
+    wizard_unix_daemon: false,
+    wizard_pairing: false,
+  })
   vi.stubGlobal(
     'ResizeObserver',
     class {
@@ -187,13 +193,28 @@ describe('EnrollmentDialog — the anchor box (FR-104)', () => {
   })
 })
 
-// FR-129 B1-s — the wizard block off Windows follows the server's
-// `wizard_unix_daemon`, read when the dialog opens and false until it has
-// said true. The Linux tab is the one under test; the default tab follows
-// the visitor's platform.
+// FR-129 B1-s, B1-s2 — the wizard block off Windows follows the server's
+// switch for that OS (`wizard_linux_daemon`, `wizard_macos_daemon`, or an
+// older server's `wizard_unix_daemon` for both), read when the dialog opens
+// and false until it has said true. The default tab follows the visitor's
+// platform, so each test opens the dialog as a Linux or a Mac visitor.
 describe('EnrollmentDialog — the Linux and macOS wizard (FR-129 B1-s)', () => {
+  const UA = {
+    linux: 'Mozilla/5.0 (X11; Linux x86_64)',
+    macos: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
+  }
+  const LINUX_ONLY = {
+    pairing: true,
+    wizard_linux_daemon: true,
+    wizard_macos_daemon: false,
+    wizard_unix_daemon: false,
+    wizard_pairing: false,
+  }
   async function mountOnLinux(props: Record<string, unknown> = {}) {
-    vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Mozilla/5.0 (X11; Linux x86_64)')
+    return mountOn('linux', props)
+  }
+  async function mountOn(os: keyof typeof UA, props: Record<string, unknown> = {}) {
+    vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue(UA[os])
     const w = mount(EnrollmentDialog, {
       props: {
         modelValue: true,
@@ -223,13 +244,43 @@ describe('EnrollmentDialog — the Linux and macOS wizard (FR-129 B1-s)', () => 
     w.unmount()
   })
 
-  it('offers Roomler Setup on the Linux tab once the server advertises wizard_unix_daemon', async () => {
-    mockApi.get.mockResolvedValue({ pairing: true, wizard_unix_daemon: true, wizard_pairing: false })
+  it('offers Roomler Setup on the Linux tab once the server turns Linux on, alone (FR-129 B1-s2)', async () => {
+    mockApi.get.mockResolvedValue(LINUX_ONLY)
     const w = await mountOnLinux()
     const link = wizardLink('linux')
     expect(link).not.toBeNull()
     expect(link!.textContent).toContain('Download Roomler Setup')
     w.unmount()
+  })
+
+  it('keeps it off the macOS tab while only Linux is on, and offers it there on macOS’s own switch', async () => {
+    mockApi.get.mockResolvedValue(LINUX_ONLY)
+    const off = await mountOn('macos')
+    expect(wizardLink('macos')).toBeNull()
+    expect(document.body.textContent).toContain('/api/setup/install.sh')
+    off.unmount()
+    document.body.innerHTML = ''
+
+    setActivePinia(createPinia())
+    mockApi.get.mockResolvedValue({ ...LINUX_ONLY, wizard_linux_daemon: false, wizard_macos_daemon: true })
+    const on = await mountOn('macos')
+    expect(wizardLink('macos')).not.toBeNull()
+    on.unmount()
+  })
+
+  it('offers it on both tabs on an older server’s wizard_unix_daemon', async () => {
+    const OLDER_SERVER_ON = { pairing: true, wizard_unix_daemon: true, wizard_pairing: false }
+    mockApi.get.mockResolvedValue(OLDER_SERVER_ON)
+    const linux = await mountOnLinux()
+    expect(wizardLink('linux')).not.toBeNull()
+    linux.unmount()
+    document.body.innerHTML = ''
+
+    setActivePinia(createPinia())
+    mockApi.get.mockResolvedValue(OLDER_SERVER_ON)
+    const macos = await mountOn('macos')
+    expect(wizardLink('macos')).not.toBeNull()
+    macos.unmount()
   })
 
   it('keeps the Linux tab as it was when the request fails (an older server)', async () => {

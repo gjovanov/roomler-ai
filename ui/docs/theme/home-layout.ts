@@ -141,23 +141,27 @@ export function renderHome(ctx: HomeCtx): string {
   ).join('')
 
   // The wizard only where it installs the agent, as the SPA's copy: Windows
-  // (FR-97 D5), and Linux and macOS once the server advertises
-  // `wizard_unix_daemon` on `/api/setup/features` (FR-129 B1-s). This page is
+  // (FR-97 D5), and Linux and macOS each once the server advertises that OS on
+  // `/api/setup/features` (FR-129 B1-s; per OS since B1-s2). This page is
   // written at BUILD time, so it ships the Windows-only layout and carries the
   // other two cards' button hidden — the Windows card's markup exactly, with
-  // the URL the switch unlocks — for `home.js` to show when the server says
-  // so. With JavaScript off, or on an older server, the page is as it was.
+  // the URL the switch unlocks, and `data-wizard-unix` naming the OS whose
+  // switch shows it — for `home.js` to show when the server says so. With
+  // JavaScript off, or on an older server, the page is as it was.
   const unlocked = new Map(
-    installCards(SITE_ORIGIN, { wizardUnixDaemon: true }).map((card) => [card.os, card.wizardUrl]),
+    installCards(SITE_ORIGIN, { wizardLinuxDaemon: true, wizardMacosDaemon: true }).map((card) => [
+      card.os,
+      card.wizardUrl,
+    ]),
   )
-  const wizardButton = (url: string, gated: boolean) =>
-    `<p${gated ? ' data-wizard-unix hidden' : ''}><a class="btn btn--tonal" href="${escapeHtml(url)}">${icon('download', { size: 17 })}<span>Roomler Setup</span></a></p>`
+  const wizardButton = (url: string, gatedOn: string | null) =>
+    `<p${gatedOn ? ` data-wizard-unix="${gatedOn}" hidden` : ''}><a class="btn btn--tonal" href="${escapeHtml(url)}">${icon('download', { size: 17 })}<span>Roomler Setup</span></a></p>`
   const downloads = installCards(SITE_ORIGIN)
     .map((card) => {
       const gatedUrl = card.wizardUrl ? null : (unlocked.get(card.os) ?? null)
       return (
         `<div class="home-card home-card--os" data-os="${card.os}"><h3 class="home-card__title home-os">${icon(OS_ICON[card.os]!, { size: 22 })}<span>${escapeHtml(card.title)}</span></h3>` +
-        (card.wizardUrl ? wizardButton(card.wizardUrl, false) : gatedUrl ? wizardButton(gatedUrl, true) : '') +
+        (card.wizardUrl ? wizardButton(card.wizardUrl, null) : gatedUrl ? wizardButton(gatedUrl, card.os) : '') +
         (card.wizardUrl
           ? `<p class="home-muted">Or from a terminal:</p>`
           : `<p class="home-muted" data-terminal-label data-with-wizard="Or from a terminal:">From a terminal:</p>`) +

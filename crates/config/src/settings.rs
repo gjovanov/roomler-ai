@@ -89,13 +89,27 @@ pub struct Settings {
 /// that proves the client is on record.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct SetupSettings {
-    /// "The released Roomler Setup installs the full daemon on Linux and
-    /// macOS, and it is field-proven" (FR-129 B1; AC11). While `false`, the
-    /// SPA's enrollment dialog and both homepages offer the wizard for a
-    /// daemon on Windows only, as before FR-129, and a B1 wizard shows no
-    /// daemon card off Windows (AC14, key design B.6) — so the cards can be
-    /// turned off without a release. Default **off**: the wizard that can do
-    /// it has not shipped. Env: `ROOMLER__SETUP__WIZARD_UNIX_DAEMON`.
+    /// "The released Roomler Setup installs the full daemon on Linux, and it
+    /// is field-proven" (FR-129 B1; AC11). One switch per OS (B1-s2), so
+    /// Linux can go live while macOS still owes its field run. While off,
+    /// the SPA's enrollment dialog and both homepages offer no wizard for a
+    /// daemon on Linux, as before FR-129, and the wizard shows no Linux
+    /// daemon card (AC14, key design B.6) — so the cards can be turned off
+    /// without a release. Read it through [`Self::linux_daemon`], which adds
+    /// the legacy key. Default **off**.
+    /// Env: `ROOMLER__SETUP__WIZARD_LINUX_DAEMON`.
+    #[serde(default)]
+    pub wizard_linux_daemon: bool,
+    /// The same for macOS. Read it through [`Self::macos_daemon`].
+    /// Default **off**. Env: `ROOMLER__SETUP__WIZARD_MACOS_DAEMON`.
+    #[serde(default)]
+    pub wizard_macos_daemon: bool,
+    /// The legacy key, from before the switch was split per OS (B1-s): Linux
+    /// AND macOS. It keeps meaning that, so a deployment that set it keeps
+    /// both OSes' cards: it turns both per-OS switches on, and a per-OS key
+    /// set `false` beside it does not turn that OS back off (for one OS
+    /// alone, unset this and set that OS's key). Default **off**.
+    /// Env: `ROOMLER__SETUP__WIZARD_UNIX_DAEMON`.
     #[serde(default)]
     pub wizard_unix_daemon: bool,
     /// "The released Roomler Setup pairs — signs the person in from their
@@ -109,6 +123,20 @@ pub struct SetupSettings {
     /// Env: `ROOMLER__SETUP__WIZARD_PAIRING`.
     #[serde(default)]
     pub wizard_pairing: bool,
+}
+
+impl SetupSettings {
+    /// The Linux daemon cards' switch in effect (FR-129 B1-s2): its own key,
+    /// or the legacy `wizard_unix_daemon`.
+    pub fn linux_daemon(&self) -> bool {
+        self.wizard_linux_daemon || self.wizard_unix_daemon
+    }
+
+    /// The macOS daemon cards' switch in effect: its own key, or the legacy
+    /// `wizard_unix_daemon`.
+    pub fn macos_daemon(&self) -> bool {
+        self.wizard_macos_daemon || self.wizard_unix_daemon
+    }
 }
 
 /// FR-129 A1 — `[pairing]`, env `ROOMLER__PAIRING__*`: the RFC 8628-shaped
@@ -2098,28 +2126,55 @@ mod pairing_settings_tests {
 mod setup_settings_tests {
     use super::SetupSettings;
 
-    /// FR-129 B1-s — both claims about the released wizard ship OFF, where
+    /// FR-129 B1-s — every claim about the released wizard ships OFF, where
     /// the settings are built whole and where a file leaves the keys out;
-    /// only a file (or `ROOMLER__SETUP__WIZARD_UNIX_DAEMON=true`,
-    /// `ROOMLER__SETUP__WIZARD_PAIRING=true`) turns one on, and neither
-    /// implies the other. The default is the claim: the wizard that installs
-    /// the daemon off Windows, or pairs, has not shipped, and a card or a
-    /// lead the released wizard cannot honour is the failure the switches
-    /// exist to prevent.
+    /// only a file (or its `ROOMLER__SETUP__*` variable) turns one on, and no
+    /// daemon key implies pairing or pairing a daemon key. The default is the
+    /// claim: a card or a lead the released wizard cannot honour is the
+    /// failure the switches exist to prevent.
     #[test]
     fn the_wizard_claims_are_off_until_turned_on() {
         let d = SetupSettings::default();
-        assert!(!d.wizard_unix_daemon);
+        assert!(!d.wizard_linux_daemon && !d.wizard_macos_daemon && !d.wizard_unix_daemon);
+        assert!(!d.linux_daemon() && !d.macos_daemon());
         assert!(!d.wizard_pairing);
         let absent: SetupSettings = toml::from_str("").expect("every key defaults");
-        assert!(!absent.wizard_unix_daemon, "a file without the key");
+        assert!(!absent.linux_daemon(), "a file without the keys");
+        assert!(!absent.macos_daemon(), "a file without the keys");
         assert!(!absent.wizard_pairing, "a file without the key");
         let daemon: SetupSettings = toml::from_str("wizard_unix_daemon = true").unwrap();
-        assert!(daemon.wizard_unix_daemon);
-        assert!(!daemon.wizard_pairing, "each key on its own");
+        assert!(!daemon.wizard_pairing, "a daemon key is not pairing");
         let pairing: SetupSettings = toml::from_str("wizard_pairing = true").unwrap();
         assert!(pairing.wizard_pairing);
-        assert!(!pairing.wizard_unix_daemon, "each key on its own");
+        assert!(
+            !pairing.linux_daemon() && !pairing.macos_daemon(),
+            "pairing is not a daemon key"
+        );
+    }
+
+    /// FR-129 B1-s2 — one daemon switch per OS, so Linux goes live without
+    /// macOS: each OS's key turns that OS on alone, and the legacy
+    /// `wizard_unix_daemon`, which a deployment set before the split, still
+    /// turns both on.
+    #[test]
+    fn each_os_has_its_own_switch_and_the_legacy_key_turns_both_on() {
+        let linux: SetupSettings = toml::from_str("wizard_linux_daemon = true").unwrap();
+        assert!(linux.linux_daemon(), "Linux on its own key");
+        assert!(!linux.macos_daemon(), "Linux alone leaves macOS off");
+        let macos: SetupSettings = toml::from_str("wizard_macos_daemon = true").unwrap();
+        assert!(macos.macos_daemon(), "macOS on its own key");
+        assert!(!macos.linux_daemon(), "macOS alone leaves Linux off");
+        let both: SetupSettings =
+            toml::from_str("wizard_linux_daemon = true\nwizard_macos_daemon = true").unwrap();
+        assert!(both.linux_daemon() && both.macos_daemon());
+        let legacy: SetupSettings = toml::from_str("wizard_unix_daemon = true").unwrap();
+        assert!(legacy.linux_daemon(), "the legacy key turns Linux on");
+        assert!(legacy.macos_daemon(), "the legacy key turns macOS on");
+        // Explicitly off per OS does not override the legacy key: it meant
+        // both, and a deployment that set it keeps both.
+        let legacy_and_off: SetupSettings =
+            toml::from_str("wizard_unix_daemon = true\nwizard_macos_daemon = false").unwrap();
+        assert!(legacy_and_off.macos_daemon());
     }
 }
 
