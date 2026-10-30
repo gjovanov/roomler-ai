@@ -1355,6 +1355,12 @@ pub(crate) fn run_started(session: ObjectId, fence: u64, on: bool) {
             supervisor.stop(session, fence, why);
         }
     });
+    // FR-90 P8-2c-4 — a test's: a run a test named has its worker on a task
+    // of this process, since a test binary is no `roomlerd hive-worker`.
+    #[cfg(all(test, worker_calls, unix))]
+    if in_process_wanted(session) {
+        return run_in_process(session, fence, give_up);
+    }
     match Program::this_binary() {
         Ok(program) => run_started_with(
             session,
@@ -1384,7 +1390,14 @@ pub(crate) fn run_started_with(
 }
 
 /// FR-90 P8-2a-2 — whether the run has a worker: its device's owner turned
-/// workers on.
+/// workers on, and the run went live ([`run_started`]).
+///
+/// ⚠️ P8-2c-4 — never before that: a part bound as the run launches (the
+/// toolbelt, the sidecar, the egress fronts) is bound before its worker
+/// starts, and goes by the device's own setting instead. Asked this, the
+/// toolbelt and the sidecar answered no at every fresh launch, and were
+/// never handed. `vault_connect`'s endpoints, opened by a tool call while
+/// the run is live, are the ones this answers for.
 #[cfg(worker_calls)]
 pub(crate) fn has(session: ObjectId, fence: u64) -> bool {
     runs().contains_key(&(session, fence))
@@ -1446,6 +1459,33 @@ pub(crate) fn run_in_process(session: ObjectId, fence: u64, give_up: GiveUp) {
         Timing::default(),
         give_up,
     );
+}
+
+/// FR-90 P8-2c-4 — a test's: the sessions whose worker [`run_started`]
+/// runs in process ([`run_in_process`]), so a test drives a REAL launch
+/// (`Supervisor::start` with `hive_worker` on) to a worker that comes up
+/// and is handed the run's parts as a daemon's is. By session: tests that
+/// run at once never see each other's.
+#[cfg(all(test, worker_calls, unix))]
+static IN_PROCESS: std::sync::LazyLock<Mutex<std::collections::HashSet<ObjectId>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// FR-90 P8-2c-4 — a test's: `session`'s worker runs in process once its
+/// run goes live ([`IN_PROCESS`]).
+#[cfg(all(test, worker_calls, unix))]
+pub(crate) fn in_process_when_live(session: ObjectId) {
+    IN_PROCESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(session);
+}
+
+#[cfg(all(test, worker_calls, unix))]
+fn in_process_wanted(session: ObjectId) -> bool {
+    IN_PROCESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&session)
 }
 
 /// FR-90 P8-2a-2 — a test's: as [`run_in_process`], its first worker lost

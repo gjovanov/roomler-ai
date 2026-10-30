@@ -394,3 +394,77 @@ async fn the_real_worker_serves_a_credential_endpoint_handed_to_it() {
     send(&mut wr, &Msg::Bye).await.unwrap();
     worker.kill().await;
 }
+
+/// FR-90 P8-2c-4 — a sidecar kept as its run launches, before the run's
+/// worker exists (`sidecar::open` runs before `launch` starts the worker),
+/// is served by that worker once it is up: the worker's first `rehand`
+/// crosses the listener as protocol info targeting its pid, and a call on
+/// the session's port is answered by the worker with the daemon's word,
+/// asked over the pipe (`Call::SidecarAdmit`). The test's own listener is
+/// dropped, as `sidecar::open` drops its own, and a kept sidecar is served
+/// by nothing in the daemon: the answer can only be the worker's. No
+/// supervisor stands behind it here, so that word is "no such sidecar".
+#[cfg(worker_calls)]
+async fn a_sidecar_kept_before_its_worker_is_served_by_it(spawner: Arc<dyn Spawn>) {
+    use crate::hive::sidecar::handed::{forget, is_kept, prepare};
+    let session = ObjectId::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let kept = prepare(
+        session,
+        1,
+        &listener,
+        std::sync::Weak::new(),
+        "http://127.0.0.1:9".into(),
+        None,
+        true,
+    )
+    .expect("kept");
+    assert!(
+        kept.is_some() && is_kept(session, 1),
+        "kept before its worker exists"
+    );
+    drop(listener);
+    let nobody: GiveUp = Arc::new(|_| {});
+    super::super::run_started_with(session, 1, spawner, Timing::default(), nobody);
+    let call = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-api-key", "hive-test")
+        .body("{}")
+        .send();
+    let resp = tokio::time::timeout(WAIT, call)
+        .await
+        .expect("answered in time, by the worker")
+        .expect("the session's port is reachable");
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 503, "{body}");
+    assert!(
+        body.contains("no such sidecar"),
+        "the daemon's word, asked over the pipe by the worker: {body}"
+    );
+    forget(session, 1);
+    super::super::drop_run(session, 1);
+}
+
+#[cfg(worker_calls)]
+#[tokio::test]
+async fn a_sidecar_kept_before_its_worker_is_served_by_it_once_up() {
+    a_sidecar_kept_before_its_worker_is_served_by_it(Arc::new(OnPipe)).await;
+}
+
+/// [`a_sidecar_kept_before_its_worker_is_served_by_it_once_up`], its worker
+/// the real `roomlerd hive-worker`: the listener crosses to another process.
+/// `ROOMLERD_WORKER_EXE=… cargo test … -- --ignored`.
+#[cfg(worker_calls)]
+#[tokio::test]
+#[ignore = "needs a built roomlerd.exe with hive,vault, named in ROOMLERD_WORKER_EXE"]
+async fn the_real_worker_serves_a_sidecar_kept_before_it_started() {
+    let exe = std::env::var_os("ROOMLERD_WORKER_EXE").expect("ROOMLERD_WORKER_EXE");
+    let program = super::super::Program {
+        exe: exe.into(),
+        arg0: None,
+        args: vec![super::super::WORKER_SUBCOMMAND.to_string()],
+    };
+    a_sidecar_kept_before_its_worker_is_served_by_it(Arc::new(program)).await;
+}

@@ -888,7 +888,9 @@ impl Drop for Toolbelt {
 ///
 /// `owner` is the account the socket is handed to (`None` keeps the
 /// daemon's, for a session that runs as the daemon — tests only); `uid` is
-/// the one peer a connection is taken from.
+/// the one peer a connection is taken from. `in_worker` (FR-90 P8-2c-4):
+/// the run gets a worker beside it (`hive_worker`), which serves the socket
+/// in the daemon's place (`handed::prepare`).
 #[cfg(unix)]
 pub(crate) fn open(
     dir: &Path,
@@ -897,6 +899,7 @@ pub(crate) fn open(
     run: Run,
     events: mpsc::Sender<ApprovalEvent>,
     timing: Timing,
+    in_worker: bool,
 ) -> Result<Toolbelt, String> {
     let socket = dir.join(SOCKET);
     // A socket left by an earlier run of the same session is removed; anything
@@ -927,12 +930,24 @@ pub(crate) fn open(
         return Err(format!("{}: {e}", socket.display()));
     }
     let stop = CancellationToken::new();
-    // FR-90 P8-2c-2 — where this run's worker exists, the toolbelt is handed
+    // FR-90 P8-2c-2 — where this run gets a worker, the toolbelt is handed
     // to it instead of served here; `None` keeps today's behavior exactly.
+    // P8-2c-4 — told so (`in_worker`), never asked whether one exists yet:
+    // its worker starts only after this, as the launch goes live.
     #[cfg(worker_calls)]
-    let handed = handed::prepare(run.session, run.fence, uid, &listener, events.clone())?;
+    let handed = handed::prepare(
+        run.session,
+        run.fence,
+        uid,
+        &listener,
+        events.clone(),
+        in_worker,
+    )?;
     #[cfg(not(worker_calls))]
-    let handed: Option<(Arc<Pending>, u64)> = None;
+    let handed: Option<(Arc<Pending>, u64)> = {
+        let _ = in_worker;
+        None
+    };
     if let Some((pending, endpoint)) = handed {
         // `endpoint` is read only by the `handed` field below, which is
         // itself compiled out where `worker_calls` is off (the `vault`

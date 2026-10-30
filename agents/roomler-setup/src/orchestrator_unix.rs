@@ -9,8 +9,10 @@
 //! **The order** (B0's finding, recorded in the spec):
 //!
 //! 1. preflight — the role's scope on this OS, what is installed, and the
-//!    chosen server's `wizard_unix_daemon` switch, re-read now because the
-//!    server is picked after the role;
+//!    chosen server's daemon switch for this OS (`wizard_linux_daemon` or
+//!    `wizard_macos_daemon`, or an older server's `wizard_unix_daemon`;
+//!    [`crate::features::SetupFeatures::daemon_offered`]), re-read now
+//!    because the server is picked after the role;
 //! 2. **a root-owned config, when there is one:** enroll in-process, into a
 //!    private 0600 file in the scratch directory. That is the Linux system
 //!    scope's config, and — FR-129 B2 — the macOS **root half**'s, the root
@@ -321,9 +323,10 @@ async fn run_install_inner(
     if root_half {
         warn(on_event, two_devices_note(&device_name));
     }
-    // The server's word, for the server the person chose (after the role).
+    // The server's word for this OS, for the server the person chose (after
+    // the role).
     let features = crate::features::fetch(&server).await;
-    if !features.wizard_unix_daemon {
+    if !features.daemon_offered(os) {
         return Err(failed(
             ErrorCode::UnsupportedPlatform,
             format!(

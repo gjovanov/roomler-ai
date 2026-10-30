@@ -520,6 +520,11 @@ const accountOptions = [
 
 const dirty = computed(() => JSON.stringify(draft.value) !== original.value)
 
+/** Fill the draft from the device's desired config on every open. Immediate
+ *  (#3156): AgentsSection mounts this dialog with `v-if` and opens it in the
+ *  same tick, so the first open MOUNTS it open and a lazy watch never fired:
+ *  the draft started empty and a Request dropped every key already managed.
+ *  It runs during setup, so it must stay below everything it reads. */
 watch(
   () => props.modelValue,
   (v) => {
@@ -541,6 +546,7 @@ watch(
     if (agentStore.orgExecEnabled === null) void agentStore.fetchOrgExecEnabled(props.tenantId)
     if (agentStore.orgSshEnabled === null) void agentStore.fetchOrgSshEnabled(props.tenantId)
   },
+  { immediate: true },
 )
 
 async function submit(body: Draft) {

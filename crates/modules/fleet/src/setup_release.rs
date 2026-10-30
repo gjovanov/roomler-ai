@@ -89,8 +89,14 @@ pub struct SetupFeatures {
     /// `[pairing] enabled` (FR-129 A1): `/api/pair/*` is mounted, so a wizard
     /// may offer "sign in from your browser" instead of a pasted token.
     pub pairing: bool,
-    /// `[setup] wizard_unix_daemon` (FR-129 B1-s): the released Roomler Setup
-    /// installs the full daemon on Linux and macOS.
+    /// `[setup] wizard_linux_daemon`, or the legacy `wizard_unix_daemon`
+    /// (FR-129 B1-s2, `SetupSettings::linux_daemon`): the released Roomler
+    /// Setup installs the full daemon on Linux.
+    pub wizard_linux_daemon: bool,
+    /// The same for macOS (`SetupSettings::macos_daemon`).
+    pub wizard_macos_daemon: bool,
+    /// `wizard_linux_daemon && wizard_macos_daemon`: the one key the wizards
+    /// released before the split read, for both OSes (see [`setup_features`]).
     pub wizard_unix_daemon: bool,
     /// `[setup] wizard_pairing` (FR-129 B1-s): the released Roomler Setup
     /// pairs (A3), so a homepage may say "sign in from your browser" — with
@@ -100,22 +106,36 @@ pub struct SetupFeatures {
 
 /// `GET /api/setup/features` — the server-wide switches a client reads before
 /// offering an install path (FR-129 B1-s; AC14's server half). Public,
-/// unauthenticated, a plain JSON object:
+/// unauthenticated, a plain JSON object with every key always present:
 ///
 /// ```json
-/// {"pairing": true, "wizard_unix_daemon": false, "wizard_pairing": false}
+/// {"pairing": true, "wizard_linux_daemon": false, "wizard_macos_daemon": false,
+///  "wizard_unix_daemon": false, "wizard_pairing": false}
 /// ```
 ///
 /// * `pairing` mirrors `[pairing] enabled` — a fact about THIS SERVER:
 ///   whether `/api/pair/*` answers. It is what a wizard reads to offer "Set
 ///   up in the browser" up front rather than discover the empty 404 on
 ///   `start`.
-/// * The two `[setup]` switches are the operator's assertions about the
+/// * The `[setup]` switches are the operator's assertions about the
 ///   RELEASED wizard, each default off and flipped after its field run:
-///   - `wizard_unix_daemon`: it installs the full daemon on Linux and macOS
-///     (B1; AC11). The SPA's enrollment dialog, both homepages and a B1
-///     wizard show the Linux and macOS daemon cards only on `true`, so the
-///     cards can be turned off without a release (key design B.6).
+///   - `wizard_linux_daemon`, `wizard_macos_daemon` (B1-s2): it installs the
+///     full daemon on that OS (B1; AC11). The SPA's enrollment dialog, both
+///     homepages and a wizard carrying B1-s2 show that OS's daemon cards
+///     only on `true`, so each OS's cards can be turned off without a
+///     release (key design B.6), and Linux can go live while macOS still
+///     owes its field run. Each is the value in effect: its own key, or the
+///     legacy `[setup] wizard_unix_daemon`, which turns both on.
+///   - `wizard_unix_daemon` answers `wizard_linux_daemon &&
+///     wizard_macos_daemon`. It is the one key every wizard released before
+///     the split reads (`setup-v0.4.184` on, until the first `setup-v*`
+///     carrying B1-s2), for BOTH OSes, and their User-Agent
+///     (`roomler-setup/<version>`) carries no OS, so they cannot be answered
+///     per platform. One OS on alone therefore shows them nothing, the safe
+///     direction; both on shows them both. ⚠️ Never an OR: that would show
+///     those wizards the cards of an OS the operator left off. A client
+///     that knows the per-OS keys reads its OS's key OR this one, so a
+///     server from before the split, which sends only this key, still works.
 ///   - `wizard_pairing`: it pairs (A3), against this server. Both homepages
 ///     word the install lead as "sign in from your browser" only on
 ///     `pairing && wizard_pairing`: `pairing` alone is the server's fact, on
@@ -137,10 +157,15 @@ pub struct SetupFeatures {
 /// counted by `install_trace` either: the SPA reads it on every homepage
 /// view, which is not a fetch of anything installable.
 pub async fn setup_features(State(state): State<FleetState>) -> Json<SetupFeatures> {
+    let setup = &state.settings.setup;
+    let (linux, macos) = (setup.linux_daemon(), setup.macos_daemon());
     Json(SetupFeatures {
         pairing: state.settings.pairing.enabled,
-        wizard_unix_daemon: state.settings.setup.wizard_unix_daemon,
-        wizard_pairing: state.settings.setup.wizard_pairing,
+        wizard_linux_daemon: linux,
+        wizard_macos_daemon: macos,
+        // What the wizards released before the split read for both OSes.
+        wizard_unix_daemon: linux && macos,
+        wizard_pairing: setup.wizard_pairing,
     })
 }
 

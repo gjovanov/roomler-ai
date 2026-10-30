@@ -10,8 +10,14 @@ export interface SetupFeatures {
   /** `[pairing] enabled`: `/api/pair/*` answers — a fact about the SERVER,
    *  on by default. */
   pairing?: boolean
-  /** `[setup] wizard_unix_daemon`: the released Roomler Setup installs the
-   *  full daemon on Linux and macOS (FR-129 B1), so those cards may offer it. */
+  /** FR-129 B1-s2 — the released Roomler Setup installs the full daemon on
+   *  Linux (B1), so the Linux cards may offer it. */
+  wizard_linux_daemon?: boolean
+  /** FR-129 B1-s2 — the same for macOS. */
+  wizard_macos_daemon?: boolean
+  /** Both OSes at once: the one switch before B1-s2. A server from before
+   *  the split sends it alone; a split server sends `linux && macos`, the
+   *  answer the wizards released before the split read for both OSes. */
   wizard_unix_daemon?: boolean
   /** `[setup] wizard_pairing`: the released Roomler Setup pairs (FR-129 A3),
    *  so the homepages may say "sign in from your browser" — with `pairing`. */
@@ -35,7 +41,10 @@ export interface SetupFeatures {
  */
 export const useSetupFeaturesStore = defineStore('setupFeatures', () => {
   const pairing = ref(false)
-  const wizardUnixDaemon = ref(false)
+  /** FR-129 B1-s2 — the Linux cards may offer the daemon wizard. */
+  const wizardLinuxDaemon = ref(false)
+  /** FR-129 B1-s2 — the macOS cards may offer the daemon wizard. */
+  const wizardMacosDaemon = ref(false)
   const wizardPairing = ref(false)
   /** True once the server has answered, or refused to. */
   const loaded = ref(false)
@@ -57,7 +66,13 @@ export const useSetupFeaturesStore = defineStore('setupFeatures', () => {
   function apply(features: unknown): void {
     const f = (features && typeof features === 'object' ? features : {}) as Record<string, unknown>
     pairing.value = f.pairing === true
-    wizardUnixDaemon.value = f.wizard_unix_daemon === true
+    // FR-129 B1-s2 — each OS reads its own switch, or `wizard_unix_daemon`:
+    // a server from before the split sends that one key for both OSes, and a
+    // split server sends it as `linux && macos`, so it never turns on an OS
+    // whose own key the server left off.
+    const both = f.wizard_unix_daemon === true
+    wizardLinuxDaemon.value = f.wizard_linux_daemon === true || both
+    wizardMacosDaemon.value = f.wizard_macos_daemon === true || both
     wizardPairing.value = f.wizard_pairing === true
     loaded.value = true
     failed.value = false
@@ -94,12 +109,25 @@ export const useSetupFeaturesStore = defineStore('setupFeatures', () => {
   /** Test seam / logout reset. */
   function reset(): void {
     pairing.value = false
-    wizardUnixDaemon.value = false
+    wizardLinuxDaemon.value = false
+    wizardMacosDaemon.value = false
     wizardPairing.value = false
     loaded.value = false
     failed.value = false
     inflight = null
   }
 
-  return { pairing, wizardUnixDaemon, wizardPairing, wizardPairs, loaded, failed, load, ready, apply, reset }
+  return {
+    pairing,
+    wizardLinuxDaemon,
+    wizardMacosDaemon,
+    wizardPairing,
+    wizardPairs,
+    loaded,
+    failed,
+    load,
+    ready,
+    apply,
+    reset,
+  }
 })

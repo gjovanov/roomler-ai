@@ -19,7 +19,25 @@ import { api } from '@/api/client'
 
 const mockApi = vi.mocked(api)
 const ORIGIN = 'https://example.roomler.test'
-const ALL_ON = { pairing: true, wizard_unix_daemon: true, wizard_pairing: true }
+const ALL_ON = {
+  pairing: true,
+  wizard_linux_daemon: true,
+  wizard_macos_daemon: true,
+  wizard_unix_daemon: true,
+  wizard_pairing: true,
+}
+/** What a split server answers with Linux on alone: `wizard_unix_daemon`,
+ *  the key wizards released before the split read for both OSes, stays off. */
+const LINUX_ONLY = {
+  pairing: true,
+  wizard_linux_daemon: true,
+  wizard_macos_daemon: false,
+  wizard_unix_daemon: false,
+  wizard_pairing: false,
+}
+const MACOS_ONLY = { ...LINUX_ONLY, wizard_linux_daemon: false, wizard_macos_daemon: true }
+/** What a server from before the split answers with its one switch on. */
+const OLDER_SERVER_ON = { pairing: true, wizard_unix_daemon: true, wizard_pairing: false }
 
 /** A refusal as `api` throws it: an `Error` carrying the HTTP status. */
 const refused = (status: number) => Object.assign(new Error(`API error ${status}`), { status })
@@ -39,7 +57,8 @@ describe('useSetupFeaturesStore', () => {
     const store = useSetupFeaturesStore()
     expect(store.loaded).toBe(false)
     expect(store.pairing).toBe(false)
-    expect(store.wizardUnixDaemon).toBe(false)
+    expect(store.wizardLinuxDaemon).toBe(false)
+    expect(store.wizardMacosDaemon).toBe(false)
     expect(store.wizardPairing).toBe(false)
     expect(store.wizardPairs).toBe(false)
   })
@@ -52,17 +71,47 @@ describe('useSetupFeaturesStore', () => {
     expect(store.loaded).toBe(true)
     expect(store.failed).toBe(false)
     expect(store.pairing).toBe(true)
-    expect(store.wizardUnixDaemon).toBe(true)
+    expect(store.wizardLinuxDaemon).toBe(true)
+    expect(store.wizardMacosDaemon).toBe(true)
     expect(store.wizardPairing).toBe(true)
     expect(store.wizardPairs).toBe(true)
 
     store.reset()
-    mockApi.get.mockResolvedValueOnce({ pairing: true, wizard_unix_daemon: false, wizard_pairing: false })
+    mockApi.get.mockResolvedValueOnce({
+      pairing: true,
+      wizard_linux_daemon: false,
+      wizard_macos_daemon: false,
+      wizard_unix_daemon: false,
+      wizard_pairing: false,
+    })
     await store.load()
     expect(store.pairing).toBe(true)
-    expect(store.wizardUnixDaemon).toBe(false)
+    expect(store.wizardLinuxDaemon).toBe(false)
+    expect(store.wizardMacosDaemon).toBe(false)
     expect(store.wizardPairing).toBe(false)
     expect(store.wizardPairs).toBe(false)
+  })
+
+  /** FR-129 B1-s2 — the daemon switch per OS: Linux can go live without
+   *  macOS. Each OS reads its own key, or `wizard_unix_daemon`, which an older
+   *  server sends alone for both and a split server sends as `linux && macos`. */
+  it('turns each OS on by its own key, and an older server’s one key turns both on', async () => {
+    const store = useSetupFeaturesStore()
+    for (const [body, linux, macos] of [
+      [LINUX_ONLY, true, false],
+      [MACOS_ONLY, false, true],
+      [ALL_ON, true, true],
+      [OLDER_SERVER_ON, true, true],
+      [{ pairing: true, wizard_unix_daemon: false, wizard_pairing: false }, false, false],
+      [{ wizard_linux_daemon: true }, true, false],
+      [{ wizard_macos_daemon: true }, false, true],
+    ] as Array<[Record<string, unknown>, boolean, boolean]>) {
+      store.reset()
+      mockApi.get.mockResolvedValueOnce(body)
+      await store.load()
+      expect(store.wizardLinuxDaemon, `linux ${JSON.stringify(body)}`).toBe(linux)
+      expect(store.wizardMacosDaemon, `macos ${JSON.stringify(body)}`).toBe(macos)
+    }
   })
 
   /** The lead's gate: the server pairs AND the released wizard does. The
@@ -87,8 +136,17 @@ describe('useSetupFeaturesStore', () => {
   })
 
   it.each([
-    ['a string "true"', { pairing: 'true', wizard_unix_daemon: 'true', wizard_pairing: 'true' }],
-    ['a number', { pairing: 1, wizard_unix_daemon: 1, wizard_pairing: 1 }],
+    [
+      'a string "true"',
+      {
+        pairing: 'true',
+        wizard_linux_daemon: 'true',
+        wizard_macos_daemon: 'true',
+        wizard_unix_daemon: 'true',
+        wizard_pairing: 'true',
+      },
+    ],
+    ['a number', { pairing: 1, wizard_linux_daemon: 1, wizard_macos_daemon: 1, wizard_unix_daemon: 1, wizard_pairing: 1 }],
     ['missing keys', {}],
     ['a null body', null],
     ['an array', [true, true, true]],
@@ -99,7 +157,8 @@ describe('useSetupFeaturesStore', () => {
     await store.load()
     expect(store.loaded).toBe(true)
     expect(store.pairing).toBe(false)
-    expect(store.wizardUnixDaemon).toBe(false)
+    expect(store.wizardLinuxDaemon).toBe(false)
+    expect(store.wizardMacosDaemon).toBe(false)
     expect(store.wizardPairing).toBe(false)
     expect(store.wizardPairs).toBe(false)
   })
@@ -112,7 +171,8 @@ describe('useSetupFeaturesStore', () => {
     expect(store.loaded).toBe(true)
     expect(store.failed).toBe(true)
     expect(store.pairing).toBe(false)
-    expect(store.wizardUnixDaemon).toBe(false)
+    expect(store.wizardLinuxDaemon).toBe(false)
+    expect(store.wizardMacosDaemon).toBe(false)
     expect(store.wizardPairing).toBe(false)
     expect(warn).not.toHaveBeenCalled()
 
@@ -120,7 +180,8 @@ describe('useSetupFeaturesStore', () => {
     mockApi.get.mockRejectedValueOnce(refused(503)) // the fleet module unmounted
     await store.load()
     expect(store.failed).toBe(true)
-    expect(store.wizardUnixDaemon).toBe(false)
+    expect(store.wizardLinuxDaemon).toBe(false)
+    expect(store.wizardMacosDaemon).toBe(false)
     expect(warn).toHaveBeenCalledTimes(1)
 
     store.reset()
@@ -133,18 +194,21 @@ describe('useSetupFeaturesStore', () => {
   })
 
   /** The consumers' contract: a failed or absent fetch leaves today's output
-   *  — the cards and the lead exactly as before FR-129. */
+   *  — the cards and the lead exactly as before FR-129. The options are
+   *  passed as `LandingView.vue` and `EnrollmentDialog.vue` pass them. */
   it('a failed or absent fetch leaves the download cards and the lead as they were', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const before = installCards(ORIGIN)
     const store = useSetupFeaturesStore()
+    const cards = () =>
+      installCards(ORIGIN, { wizardLinuxDaemon: store.wizardLinuxDaemon, wizardMacosDaemon: store.wizardMacosDaemon })
     // Absent: nothing fetched yet (the first paint).
-    expect(installCards(ORIGIN, { wizardUnixDaemon: store.wizardUnixDaemon })).toEqual(before)
+    expect(cards()).toEqual(before)
     expect(downloadLead(store.wizardPairs)).toBe(DOWNLOAD.lead)
     // Failed.
     mockApi.get.mockRejectedValueOnce(refused(503))
     await store.load()
-    expect(installCards(ORIGIN, { wizardUnixDaemon: store.wizardUnixDaemon })).toEqual(before)
+    expect(cards()).toEqual(before)
     expect(downloadLead(store.wizardPairs)).toBe(DOWNLOAD.lead)
     expect(before.map((c) => [c.os, c.wizardUrl])).toEqual([
       ['windows', `${ORIGIN}/api/setup/windows`],
@@ -155,17 +219,26 @@ describe('useSetupFeaturesStore', () => {
     store.reset()
     mockApi.get.mockResolvedValueOnce(ALL_ON)
     await store.load()
-    expect(installCards(ORIGIN, { wizardUnixDaemon: store.wizardUnixDaemon }).map((c) => c.wizardUrl)).toEqual([
+    expect(cards().map((c) => c.wizardUrl)).toEqual([
       `${ORIGIN}/api/setup/windows`,
       `${ORIGIN}/api/setup/linux`,
       `${ORIGIN}/api/setup/macos`,
     ])
     expect(downloadLead(store.wizardPairs)).toBe(DOWNLOAD.leadPairing)
+    // FR-129 B1-s2 — Linux on alone: its card gains the button, macOS's not.
+    store.reset()
+    mockApi.get.mockResolvedValueOnce(LINUX_ONLY)
+    await store.load()
+    expect(cards().map((c) => [c.os, c.wizardUrl])).toEqual([
+      ['windows', `${ORIGIN}/api/setup/windows`],
+      ['linux', `${ORIGIN}/api/setup/linux`],
+      ['macos', null],
+    ])
     warn.mockRestore()
   })
 
   it('shares one in-flight request and does not refetch once loaded', async () => {
-    mockApi.get.mockResolvedValueOnce({ pairing: true, wizard_unix_daemon: false, wizard_pairing: false })
+    mockApi.get.mockResolvedValueOnce(LINUX_ONLY)
     const store = useSetupFeaturesStore()
     await Promise.all([store.load(), store.ready(), store.load()])
     await store.ready()
@@ -177,12 +250,14 @@ describe('useSetupFeaturesStore', () => {
     mockApi.get.mockResolvedValueOnce(ALL_ON)
     const store = useSetupFeaturesStore()
     await store.load()
-    expect(store.wizardUnixDaemon).toBe(true)
+    expect(store.wizardLinuxDaemon).toBe(true)
+    expect(store.wizardMacosDaemon).toBe(true)
     expect(store.wizardPairs).toBe(true)
     store.reset()
     expect(store.loaded).toBe(false)
     expect(store.pairing).toBe(false)
-    expect(store.wizardUnixDaemon).toBe(false)
+    expect(store.wizardLinuxDaemon).toBe(false)
+    expect(store.wizardMacosDaemon).toBe(false)
     expect(store.wizardPairing).toBe(false)
     expect(store.wizardPairs).toBe(false)
   })

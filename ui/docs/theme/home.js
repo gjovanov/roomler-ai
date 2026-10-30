@@ -24,10 +24,11 @@
  *    URL (it sets `data-source`; without it the source stays `home`).
  * 5. FR-129 B1-s: the install switches from `/api/setup/features`. The page
  *    is written at build time with Roomler Setup on the Windows card only
- *    (FR-97 D5) and the Linux and macOS buttons HIDDEN; the server says
- *    whether the released wizard installs the daemon there
- *    (`wizard_unix_daemon`) and whether the download signs the person in
- *    from the browser — `pairing` (the server answers `/api/pair/*`) AND
+ *    (FR-97 D5) and the Linux and macOS buttons HIDDEN; the server says, per
+ *    OS since B1-s2, whether the released wizard installs the daemon there
+ *    (`wizard_linux_daemon`, `wizard_macos_daemon`, or an older server's
+ *    `wizard_unix_daemon` for both) and whether the download signs the person
+ *    in from the browser — `pairing` (the server answers `/api/pair/*`) AND
  *    `wizard_pairing` (the released wizard uses it), both, or the section's
  *    lead keeps naming the token. Fail CLOSED, the
  *    opposite of the newsletter: anything but a JSON `true` — an older
@@ -183,11 +184,11 @@
   }
 
   // FR-129 B1-s — see 5. above. The markup carries everything: the hidden
-  // button with its URL (`[data-wizard-unix]`), the label's wording with a
-  // wizard (`[data-terminal-label]`'s `data-with-wizard`), and the pairing
-  // lead (`[data-download-lead]`'s `data-pairing-lead`), all from
-  // `enrollCommands.ts` and `landing.ts` at build time, so this reads only
-  // two booleans and never composes copy or a URL.
+  // button with its URL and its OS (`[data-wizard-unix="linux"]`), the
+  // label's wording with a wizard (`[data-terminal-label]`'s
+  // `data-with-wizard`), and the pairing lead (`[data-download-lead]`'s
+  // `data-pairing-lead`), all from `enrollCommands.ts` and `landing.ts` at
+  // build time, so this reads only booleans and never composes copy or a URL.
   function initSetupFeatures() {
     var buttons = document.querySelectorAll('[data-wizard-unix]')
     var lead = document.querySelector('[data-download-lead]')
@@ -198,14 +199,21 @@
       })
       .then(function (f) {
         if (!f || typeof f !== 'object') return
-        if (f.wizard_unix_daemon === true) {
-          Array.prototype.forEach.call(buttons, function (p) {
-            p.hidden = false
-            var label = p.parentNode && p.parentNode.querySelector('[data-terminal-label]')
-            var wording = label && label.getAttribute('data-with-wizard')
-            if (wording) label.textContent = wording
-          })
+        // B1-s2 — each button follows its own OS's switch, or
+        // `wizard_unix_daemon`: an older server sends that one key for both
+        // OSes, and a split server sends it as `linux && macos`.
+        var on = {
+          linux: f.wizard_linux_daemon === true || f.wizard_unix_daemon === true,
+          macos: f.wizard_macos_daemon === true || f.wizard_unix_daemon === true,
         }
+        Array.prototype.forEach.call(buttons, function (p) {
+          var os = p.getAttribute('data-wizard-unix')
+          if (!(os === 'linux' || os === 'macos') || !on[os]) return
+          p.hidden = false
+          var label = p.parentNode && p.parentNode.querySelector('[data-terminal-label]')
+          var wording = label && label.getAttribute('data-with-wizard')
+          if (wording) label.textContent = wording
+        })
         var pairingLead = lead && lead.getAttribute('data-pairing-lead')
         if (f.pairing === true && f.wizard_pairing === true && pairingLead) lead.textContent = pairingLead
       })

@@ -200,11 +200,11 @@ const scopeHint = computed(() => SCOPE_HINTS[scope.value])
 // FR-104 — only a machine-wide Windows install has a SYSTEM service to anchor.
 const anchorOffered = computed(() => props.kind === 'agent' && scope.value !== 'user')
 
-// FR-129 B1-s — the wizard block off Windows follows the server's
-// `wizard_unix_daemon` (`GET /api/setup/features`), fetched once, when the
-// dialog first opens, and read as false until the server has said true: the
-// Linux and macOS tabs then show the script and the manual path only, as
-// before FR-129.
+// FR-129 B1-s — the wizard block off Windows follows the server's switch for
+// that tab's OS (`wizard_linux_daemon`, `wizard_macos_daemon` since B1-s2;
+// `GET /api/setup/features`), fetched once, when the dialog first opens, and
+// read as false until the server has said true: a Linux or macOS tab then
+// shows the script and the manual path only, as before FR-129.
 const setupFeatures = useSetupFeaturesStore()
 watch(
   () => props.modelValue,
@@ -221,7 +221,7 @@ const commands = computed(() =>
     props.token,
     scope.value,
     props.anchor === true,
-    { wizardUnixDaemon: setupFeatures.wizardUnixDaemon },
+    { wizardLinuxDaemon: setupFeatures.wizardLinuxDaemon, wizardMacosDaemon: setupFeatures.wizardMacosDaemon },
   ),
 )
 

@@ -41,9 +41,10 @@
       <div class="card">
         <h2>What should this machine be?</h2>
         <!-- FR-129 B1: the daemon cards follow the OS (which roles it
-             implements) and, on Linux and macOS, the chosen server's
-             wizard_unix_daemon switch; app.js fills the copy per OS and
-             shows this note when no daemon card may appear. -->
+             implements) and, on Linux and macOS, the chosen server's switch
+             for this OS (B1-s2: wizard_linux_daemon, wizard_macos_daemon,
+             decided in Rust as daemonOffered); app.js fills the copy per OS
+             and shows this note when no daemon card may appear. -->
         <p id="platform-note" class="muted" hidden></p>
         <fieldset id="role-fieldset">
           <label class="radio role-daemon" data-role="daemon-system">

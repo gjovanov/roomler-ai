@@ -27,8 +27,9 @@
 //!   delivered as an archive + PATH integration. Every OS.
 //!
 //! Which daemon roles an OS implements is [`daemon_roles`]; whether a Linux
-//! or macOS card is *shown* also needs the chosen server's
-//! `wizard_unix_daemon` switch ([`crate::features`], key design B.6).
+//! or macOS card is *shown* also needs the chosen server's switch for that
+//! OS (`wizard_linux_daemon`, `wizard_macos_daemon`;
+//! [`crate::features::SetupFeatures::daemon_offered`], key design B.6).
 //!
 //! Role→action COMPOSITION (P4b): a daemon role ALSO delivers the
 //! CLI — not by running a second pipeline, but because the daemon
