@@ -646,9 +646,133 @@ pub fn device_key(config_path: &Path, tenant_id: &str) -> Result<Arc<DeviceKey>,
     // Read, or made and written, under the lock: two callers for one
     // enrollment can never each write a different key, leaving one of them
     // offering a key that is no longer on disk.
-    let key = Arc::new(load_or_make(&path)?);
+    let key = Arc::new(load_adopt_or_make(&path, || {
+        ADOPT_FROM
+            .get()
+            .and_then(|from| adoption_source(from, config_path, tenant_id))
+    })?);
     keys.insert(path, key.clone());
     Ok(key)
+}
+
+/// #3096 — the config a SystemContext worker's machine-global config was
+/// promoted from: the active user's, where every enrollment's key lived
+/// before the move. Set once, at start, by that worker alone.
+static ADOPT_FROM: OnceLock<PathBuf> = OnceLock::new();
+
+/// #3096 — a SystemContext worker that loaded the machine-global config names
+/// the config it may take an enrollment's key from, instead of minting one.
+///
+/// The machine-global config is a COPY of the person's own (the self-heal
+/// promotes it), and a copy made before [`promote`] existed carried no
+/// `peer-auth/`. So the first start that loaded it minted a new key for every
+/// enrollment, and every browser that had pinned the device refused it as
+/// `key-changed` — on a device whose identity had not changed at all
+/// (measured 2026-10-29). A sealed machine-global folder that turns readable
+/// again (#3073) does the same.
+pub fn adopt_keys_from(config_path: PathBuf) {
+    let _ = ADOPT_FROM.set(config_path);
+}
+
+/// #3096 — the key `tenant_id` has beside `from`, when `from` holds the SAME
+/// enrollment as `loaded`: the same machine, and the same agent id for this
+/// tenant. A key of anything else (another person's install, an enrollment
+/// replaced since) is never adopted; a new key is the honest answer then.
+///
+/// It asks for no new trust: the person's config is what this worker already
+/// runs on, keys included, whenever the machine-global one is absent.
+fn adoption_source(from: &Path, loaded: &Path, tenant_id: &str) -> Option<PathBuf> {
+    if from == loaded {
+        return None;
+    }
+    let key = key_path(from, tenant_id).ok()?;
+    if !key.is_file() {
+        return None;
+    }
+    let ours = crate::config::read_if_present(&loaded.to_path_buf());
+    let theirs = crate::config::read_if_present(&from.to_path_buf());
+    let same = matches!((&ours, &theirs), (Some(a), Some(b)) if same_enrollment(a, b, tenant_id));
+    if !same {
+        tracing::info!(
+            from = %from.display(), tenant = %tenant_id,
+            "peer-auth: the active user's config holds no matching enrollment, so its device key is not adopted"
+        );
+        return None;
+    }
+    Some(key)
+}
+
+/// Do `a` and `b` hold the same enrollment of `tenant_id`?
+fn same_enrollment(
+    a: &crate::config::AgentConfig,
+    b: &crate::config::AgentConfig,
+    tenant_id: &str,
+) -> bool {
+    fn agent_of<'c>(c: &'c crate::config::AgentConfig, tenant_id: &str) -> Option<&'c str> {
+        if c.tenant_id.eq_ignore_ascii_case(tenant_id) {
+            return Some(&c.agent_id);
+        }
+        c.orgs
+            .iter()
+            .find(|o| o.tenant_id.eq_ignore_ascii_case(tenant_id))
+            .map(|o| o.agent_id.as_str())
+    }
+    !a.machine_id.is_empty()
+        && a.machine_id == b.machine_id
+        && matches!(
+            (agent_of(a, tenant_id), agent_of(b, tenant_id)),
+            (Some(x), Some(y)) if !x.is_empty() && x == y
+        )
+}
+
+/// #3096 — carry every key and pin file beside `from_config` to the
+/// directory of `to_config`, BEFORE the config itself moves there (the
+/// SystemContext self-heal promotes a per-user config to the machine-global
+/// path). A key left behind is minted afresh by the next start that loads
+/// `to_config`, and every browser that pinned the device refuses it.
+///
+/// Never overwrites: a file already at the destination may hold a key that
+/// browsers have pinned since. Returns how many files it copied.
+pub fn promote(from_config: &Path, to_config: &Path) -> Result<usize, String> {
+    let dir_of = |p: &Path| -> Result<PathBuf, String> {
+        p.parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(|d| d.join(DIR_NAME))
+            .ok_or_else(|| format!("config path {} has no directory", p.display()))
+    };
+    let (src, dst) = (dir_of(from_config)?, dir_of(to_config)?);
+    let entries = match std::fs::read_dir(&src) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("reading {}: {e}", src.display())),
+    };
+    let mut copied = 0;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("reading {}: {e}", src.display()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|n| is_peer_auth_file(n)) else {
+            continue;
+        };
+        let to = dst.join(name);
+        match to.try_exists() {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => return Err(format!("checking {}: {e}", to.display())),
+        }
+        let bytes = std::fs::read(entry.path())
+            .map_err(|e| format!("reading {}: {e}", entry.path().display()))?;
+        write_private(&to, &bytes)?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
+/// `<24 hex>.json` (a key) or `<24 hex>.controllers.json` (its pins), and
+/// nothing else: never a write's `.tmp` sibling.
+fn is_peer_auth_file(name: &str) -> bool {
+    name.strip_suffix(".controllers.json")
+        .or_else(|| name.strip_suffix(".json"))
+        .is_some_and(|stem| stem.len() == 24 && stem.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Where `tenant_id`'s key lives: `<config dir>/peer-auth/<tenant id>.json`.
@@ -673,7 +797,18 @@ fn key_path(config_path: &Path, tenant_id: &str) -> Result<PathBuf, String> {
 
 /// Read the key at `path`, or make one and write it there. A key is returned
 /// only once it is on disk as the next start will read it.
+#[cfg(test)]
 fn load_or_make(path: &Path) -> Result<DeviceKey, String> {
+    load_adopt_or_make(path, || None)
+}
+
+/// [`load_or_make`], except that a key about to be made is first taken from
+/// `adopt()`, when that names this enrollment's key from before a config move
+/// (#3096). `adopt` runs only when there is no key to read.
+fn load_adopt_or_make(
+    path: &Path,
+    adopt: impl FnOnce() -> Option<PathBuf>,
+) -> Result<DeviceKey, String> {
     match std::fs::read(path) {
         Ok(bytes) => match parse(&bytes) {
             Read::Key(key) => return Ok(*key),
@@ -693,6 +828,11 @@ fn load_or_make(path: &Path) -> Result<DeviceKey, String> {
         // Present but unreadable (permissions, I/O): never overwrite a file
         // that may hold a good key this process merely cannot open.
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
+    }
+    if let Some(from) = adopt()
+        && let Some(key) = adopt_key(&from, path)
+    {
+        return Ok(key);
     }
     let rng = SystemRandom::new();
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
@@ -716,6 +856,54 @@ fn load_or_make(path: &Path) -> Result<DeviceKey, String> {
             path.display()
         )),
     }
+}
+
+/// #3096 — copy the key at `from` to `to` and read it back as the next start
+/// will, with its pins when `to` has none yet. `None` means "make a new one
+/// instead", with the reason logged: a key this build cannot read is never
+/// adopted, and neither is one that does not survive the copy.
+fn adopt_key(from: &Path, to: &Path) -> Option<DeviceKey> {
+    let bytes = match std::fs::read(from) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(from = %from.display(), %e, "peer-auth: the device key to adopt is unreadable, so a new one is made");
+            return None;
+        }
+    };
+    if !matches!(parse(&bytes), Read::Key(_)) {
+        tracing::warn!(from = %from.display(), "peer-auth: the device key to adopt is not one this build reads, so a new one is made");
+        return None;
+    }
+    if let Err(why) = write_private(to, &bytes) {
+        tracing::warn!(to = %to.display(), %why, "peer-auth: the device key could not be adopted, so a new one is made");
+        return None;
+    }
+    let Ok(Read::Key(key)) = std::fs::read(to).map(|b| parse(&b)) else {
+        tracing::warn!(to = %to.display(), "peer-auth: the adopted device key did not read back as written, so a new one is made");
+        return None;
+    };
+    // Its pins as well: without them every browser it knew reads `unknown`
+    // once more. Best effort, since the pins are only a cache of first
+    // sightings.
+    if let (Some(stem), Some(from_dir), Some(to_dir)) = (
+        to.file_stem().and_then(|s| s.to_str()),
+        from.parent(),
+        to.parent(),
+    ) {
+        let name = format!("{stem}.controllers.json");
+        let to_pins = to_dir.join(&name);
+        if !to_pins.exists()
+            && let Ok(pins) = std::fs::read(from_dir.join(&name))
+            && let Err(why) = write_private(&to_pins, &pins)
+        {
+            tracing::warn!(to = %to_pins.display(), %why, "peer-auth: the browser keys this device knew could not be carried over");
+        }
+    }
+    tracing::info!(
+        from = %from.display(), to = %to.display(),
+        "peer-auth: adopted this enrollment's device key from the config this one was promoted from, so browsers that pinned it still know the device"
+    );
+    Some(*key)
 }
 
 fn parse(bytes: &[u8]) -> Read {
@@ -1530,5 +1718,195 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    // ── #3096: a config that moves keeps its device keys ─────────────────
+
+    const AGENT_A: &str = "66f0c0ffee00000000000aa1";
+    const AGENT_B: &str = "66f0c0ffee00000000000bb2";
+    const PINS: &[u8] = br#"{"version":1,"users":{}}"#;
+
+    /// A config in `dir` holding `tenant`'s enrollment as `agent` on
+    /// `machine`, as the self-heal writes one.
+    fn enrolled(dir: &tempfile::TempDir, tenant: &str, agent: &str, machine: &str) -> PathBuf {
+        let mut cfg = crate::config::test_fixture();
+        cfg.tenant_id = tenant.into();
+        cfg.agent_id = agent.into();
+        cfg.machine_id = machine.into();
+        let path = config_in(dir);
+        crate::config::save(&path, &cfg).unwrap();
+        path
+    }
+
+    fn key_of(config: &Path, tenant: &str) -> String {
+        load_or_make(&key_path(config, tenant).unwrap())
+            .unwrap()
+            .public_b64()
+    }
+
+    #[test]
+    fn promote_carries_keys_and_pins_and_overwrites_nothing() {
+        let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a = key_of(&config_in(&user), TENANT_A);
+        key_of(&config_in(&user), TENANT_B);
+        let src = user.path().join(DIR_NAME);
+        std::fs::write(src.join(format!("{TENANT_A}.controllers.json")), PINS).unwrap();
+        std::fs::write(src.join("notes.txt"), b"x").unwrap();
+        std::fs::write(src.join(format!("{TENANT_A}.json.tmp")), b"x").unwrap();
+        // B already has a key at the destination, which browsers may have
+        // pinned since: it stays.
+        let b_there = key_of(&config_in(&mg), TENANT_B);
+
+        assert_eq!(promote(&config_in(&user), &config_in(&mg)), Ok(2));
+        assert_eq!(key_of(&config_in(&mg), TENANT_A), a);
+        assert_eq!(key_of(&config_in(&mg), TENANT_B), b_there);
+        let dst = mg.path().join(DIR_NAME);
+        assert!(dst.join(format!("{TENANT_A}.controllers.json")).exists());
+        assert!(!dst.join("notes.txt").exists());
+        assert!(!dst.join(format!("{TENANT_A}.json.tmp")).exists());
+        assert_eq!(promote(&config_in(&user), &config_in(&mg)), Ok(0));
+    }
+
+    #[test]
+    fn promote_without_keys_carries_nothing() {
+        let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        assert_eq!(promote(&config_in(&user), &config_in(&mg)), Ok(0));
+        assert!(!mg.path().join(DIR_NAME).exists());
+        assert!(promote(Path::new("config.toml"), &config_in(&mg)).is_err());
+    }
+
+    #[test]
+    fn only_a_key_or_its_pins_is_carried() {
+        assert!(is_peer_auth_file(&format!("{TENANT_A}.json")));
+        assert!(is_peer_auth_file(&format!("{TENANT_A}.controllers.json")));
+        assert!(!is_peer_auth_file(&format!("{TENANT_A}.json.tmp")));
+        assert!(!is_peer_auth_file(&format!("x{TENANT_A}.json")));
+        assert!(!is_peer_auth_file("notes.json"));
+    }
+
+    /// The field case (2026-10-29): the machine-global config was promoted
+    /// before `promote` existed, so no keys came with it. Its first start
+    /// takes the key the person's config holds instead of minting one.
+    #[test]
+    fn a_promoted_enrollment_adopts_its_own_key_and_pins() {
+        let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let from = enrolled(&user, TENANT_A, AGENT_A, "machine-1");
+        let loaded = enrolled(&mg, TENANT_A, AGENT_A, "machine-1");
+        let pinned = key_of(&from, TENANT_A);
+        std::fs::write(
+            user.path()
+                .join(DIR_NAME)
+                .join(format!("{TENANT_A}.controllers.json")),
+            PINS,
+        )
+        .unwrap();
+
+        let to = key_path(&loaded, TENANT_A).unwrap();
+        let key = load_adopt_or_make(&to, || adoption_source(&from, &loaded, TENANT_A)).unwrap();
+        assert_eq!(key.public_b64(), pinned, "the key browsers pinned, not a new one");
+        assert_eq!(key_of(&loaded, TENANT_A), pinned, "on disk for the next start");
+        assert!(
+            mg.path()
+                .join(DIR_NAME)
+                .join(format!("{TENANT_A}.controllers.json"))
+                .exists(),
+            "with its pins"
+        );
+    }
+
+    #[test]
+    fn a_secondary_org_adopts_its_key_by_its_own_agent_id() {
+        let with_org = |dir: &tempfile::TempDir| {
+            let mut cfg = crate::config::test_fixture();
+            cfg.tenant_id = TENANT_A.into();
+            cfg.agent_id = AGENT_A.into();
+            cfg.machine_id = "machine-1".into();
+            cfg.orgs.push(crate::config::OrgEntry {
+                label: "acme".into(),
+                server_url: "https://example.invalid".into(),
+                ws_url: None,
+                agent_token: "t2".into(),
+                agent_id: AGENT_B.into(),
+                tenant_id: TENANT_B.into(),
+                enabled: true,
+                overlay_mode: crate::config::OrgOverlayMode::Off,
+                overlay_wg_secret_key: None,
+                overlay_wg_key_epoch: 0,
+                overlay_advertised_routes: Vec::new(),
+                overlay_exit_node_enabled: false,
+                advertise_routes: Vec::new(),
+                netstack_socks_port: None,
+            });
+            let path = config_in(dir);
+            crate::config::save(&path, &cfg).unwrap();
+            path
+        };
+        let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (from, loaded) = (with_org(&user), with_org(&mg));
+        let pinned = key_of(&from, TENANT_B);
+        let to = key_path(&loaded, TENANT_B).unwrap();
+        let key = load_adopt_or_make(&to, || adoption_source(&from, &loaded, TENANT_B)).unwrap();
+        assert_eq!(key.public_b64(), pinned);
+    }
+
+    /// Same tenant under another agent id (an enrollment replaced since), and
+    /// the same agent id on another machine: neither key is this
+    /// enrollment's, so each start mints one of its own.
+    #[test]
+    fn another_enrollments_key_is_never_adopted() {
+        for (agent, machine) in [("66f0c0ffee000000000000ff", "machine-1"), (AGENT_A, "machine-2")] {
+            let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let from = enrolled(&user, TENANT_A, agent, machine);
+            let loaded = enrolled(&mg, TENANT_A, AGENT_A, "machine-1");
+            let theirs = key_of(&from, TENANT_A);
+            assert_eq!(adoption_source(&from, &loaded, TENANT_A), None);
+            let to = key_path(&loaded, TENANT_A).unwrap();
+            let made = load_adopt_or_make(&to, || adoption_source(&from, &loaded, TENANT_A)).unwrap();
+            assert_ne!(made.public_b64(), theirs, "{agent} on {machine}");
+        }
+    }
+
+    #[test]
+    fn a_key_already_there_is_kept_and_adoption_not_even_looked_at() {
+        let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let from = enrolled(&user, TENANT_A, AGENT_A, "machine-1");
+        let loaded = enrolled(&mg, TENANT_A, AGENT_A, "machine-1");
+        key_of(&from, TENANT_A);
+        let ours = key_of(&loaded, TENANT_A);
+        let mut asked = false;
+        let to = key_path(&loaded, TENANT_A).unwrap();
+        let key = load_adopt_or_make(&to, || {
+            asked = true;
+            adoption_source(&from, &loaded, TENANT_A)
+        })
+        .unwrap();
+        assert_eq!(key.public_b64(), ours);
+        assert!(!asked);
+    }
+
+    #[test]
+    fn a_corrupt_key_is_never_adopted() {
+        let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let from = enrolled(&user, TENANT_A, AGENT_A, "machine-1");
+        let loaded = enrolled(&mg, TENANT_A, AGENT_A, "machine-1");
+        let src = key_path(&from, TENANT_A).unwrap();
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(
+            &src,
+            b"{\"version\":1,\"alg\":\"ecdsa-p256-sha256\",\"pkcs8\":\"AAAA\"}",
+        )
+        .unwrap();
+        let to = key_path(&loaded, TENANT_A).unwrap();
+        let key = load_adopt_or_make(&to, || adoption_source(&from, &loaded, TENANT_A)).unwrap();
+        assert!(peer_auth_key_is_well_formed(&key.public_b64()));
+        assert_ne!(std::fs::read(&to).unwrap(), std::fs::read(&src).unwrap());
+    }
+
+    #[test]
+    fn a_config_never_adopts_from_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = enrolled(&dir, TENANT_A, AGENT_A, "machine-1");
+        key_of(&cfg, TENANT_A);
+        assert_eq!(adoption_source(&cfg, &cfg, TENANT_A), None);
     }
 }

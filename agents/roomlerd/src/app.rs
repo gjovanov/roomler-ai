@@ -1104,6 +1104,17 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
         );
         let machine_global = config::machine_global_config_path();
         let active_user = user_profile::active_user_config_path();
+        // #3096 — `exists()` reads "cannot open" as "absent". A machine-global
+        // config this worker cannot read (a folder that seals SYSTEM out,
+        // #3073) sends it to the person's config, and to that config's device
+        // keys, without a word, and back again once the folder is readable.
+        if is_sc && let Err(e) = machine_global.try_exists() {
+            tracing::warn!(
+                machine_global = %machine_global.display(), error = %e,
+                "config: the machine-global config cannot be read, so this SystemContext \
+                 worker falls back; it signs with the fallback config's device keys"
+            );
+        }
         let chosen = pick_config_path(
             explicit,
             is_sc,
@@ -1112,6 +1123,14 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
             active_user.as_deref(),
             |p| p.exists(),
         );
+        // #3096 — on the machine-global config, an enrollment with no key yet
+        // takes the one it had in the person's config before minting one.
+        if is_sc
+            && chosen == machine_global
+            && let Some(au) = active_user.as_ref()
+        {
+            roomlerd::peer_auth::adopt_keys_from(au.clone());
+        }
         tracing::info!(
             config_path = %chosen.display(),
             is_system_context = is_sc,
@@ -1177,6 +1196,25 @@ fn self_heal_machine_global_config(loaded_path: &std::path::Path, cfg: &config::
     let mg = config::machine_global_config_path();
     if !should_self_heal_config(is_sc, loaded_path, &mg, mg.exists()) {
         return;
+    }
+    // #3096 — the device keys go FIRST. The next start loads the
+    // machine-global config as soon as it exists, so it must never land there
+    // without the keys beside it: that start would mint new ones, and every
+    // browser that pinned this device would refuse it as `key-changed`.
+    match roomlerd::peer_auth::promote(loaded_path, &mg) {
+        Ok(0) => {}
+        Ok(files) => tracing::info!(
+            files,
+            "config: self-heal carried the device keys (peer-auth) to the machine-global path"
+        ),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "config: machine-global self-heal withheld: the device keys (peer-auth) \
+                 could not be copied (will retry next healthy run)"
+            );
+            return;
+        }
     }
     match config::save(&mg, cfg) {
         Ok(()) => tracing::info!(
