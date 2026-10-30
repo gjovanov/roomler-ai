@@ -116,10 +116,113 @@ T2b each had their own counter. `opening` was appended (P2b-8) and then
 `keyframe-burst` (P2b-13), so the earlier positions keep their meaning for a
 reader that parses them.
 
-⚠️ The classifier (`encode::pipe_state`, FR-71 T1a) stopped being a shadow the
-day the gate was built on it: `transit_classify` and `transit_hold` were
-**deleted** in V1, and a `transit_hold = true` left in a host's `config.toml`
-is an inert key.
+### The classifier the gate reads (FR-71 T1a) — which plane is the limiter
+
+Every loop below used to read one number, the viewer's paint age, and every one
+of them read an excursion as "the encoder produced too much". On 2026-09-04
+(CORPLAP-3 over DERP, session `6a9abaa8`) a head-of-line block held frames in
+transit for **4.9 s** while the sender's queue held **1,485 bytes**, the worst
+pump pass was 28 ms and the encoder averaged 14 ms — nothing sender-side was
+wrong, and the AIMD and the FR-15 age loop cut the rate into an 8 Mbps link
+(FR-71's finding 4, the FAIL on record in
+[`fr/FR-71-transport-stall-classification.md`](fr/FR-71-transport-stall-classification.md)).
+FR-70 M0 split the age into the three planes that can own it
+(`viewer_rate::split_age`, `viewer_rate.rs:314`: sender wait, transit, the
+browser's own share), and FR-71 T1a turns the split plus what the governor
+already knows about its own send queue into **one verdict per constrained
+viewer window** — `encode::pipe_state::PipeClassifier::classify`
+(`pipe_state.rs:159`). The gate reads that verdict, and the previous window's,
+as two of its facts (`WindowFacts::state` / `prev_state`, `evidence.rs:172`);
+the classifier itself acts on nothing. Pure, like the gate: no clock, no I/O,
+no switch — it unit-tests on the default build and runs inside the B0 simulator.
+
+```mermaid
+flowchart TB
+    W["a constrained viewer window closes<br/>governor.rs:1088 — WindowSignals from the<br/>summed pass stats and the viewer's reports"] --> O{"the sender pushing back?<br/>inflight ≥ budget · a byte-gate skip ·<br/>a blocked send · a wait ≥ 100 ms"}
+    O -- yes --> OP["Overproduced<br/>the sender is the limiter"]
+    O -- no --> SP{"an age split<br/>this window?"}
+    SP -- "no report, frames sent,<br/>and the viewer has reported before" --> GAP["TransitStalled (gap)<br/>pipe_gap_stalls += 1"]
+    SP -- "no split, otherwise" --> UNK["Unknown<br/>a pre-M0 viewer · the first report<br/>still on its way · an idle sender"]
+    SP -- yes --> FL["learn the floors — the smallest transit<br/>and viewer share seen (a stall never lowers them)"]
+    FL --> X{"transit ≥ floor + 200 ms?<br/>viewer ≥ floor + 100 ms, or struggling?"}
+    X -- "transit only, or both<br/>and transit grew more" --> TS["TransitStalled (split)<br/>the path is the limiter"]
+    X -- "viewer only, or both<br/>and viewer grew more" --> VL["ViewerLate<br/>the browser is the limiter"]
+    X -- neither --> CL["Clear"]
+    OP & GAP & UNK & TS & VL & CL --> HB["pipe_state · pipe_states[5] · pipe_gap_stalls<br/>and the gate's facts: state + prev_state (evidence.rs:172)"]
+```
+
+| verdict | says | the rule (`decide`, `pipe_state.rs:169`) | what the gate makes of it |
+|---|---|---|---|
+| `Overproduced` | the sender is the limiter | checked **first**: `inflight_bytes ≥ budget_bytes`, or a byte-budget skip, or a blocked send the goodput sink accepted, or `send_wait_max_ms ≥ SENDER_WAIT_MS` (100 ms, `:67`) — whatever the path is doing, a full queue is real back-pressure, the one case the loops were always right about | evidence: the window measures the pipe |
+| `TransitStalled` | the path is the limiter | the transit share sits `TRANSIT_SLACK_MS` (200 ms, `:63`) or more over its learned floor while the browser's share is under its own slack (both over: the larger excess names the limiter); **or a report gap** — no report this window, frames were sent, and the viewer has reported at least once this session (`:193`) | rejected (`Reason::TransitStalled`), and the window after it too (`StallShadow`); under V5 it is also the transport pushing back — the rate-limited ×0.85 fires only while `desired > 1.2 × pipe_bps` |
+| `ViewerLate` | the browser is the limiter | the viewer share sits `VIEWER_SLACK_MS` (100 ms, `:65`) or more over its floor, or the viewer reports `struggling` (`rc:decodestat`) | evidence (an open decision in FR-79); the viewer-rate cap sheds frames, nothing cuts the bitrate |
+| `Clear` | none of the above | | evidence |
+| `Unknown` | nothing to classify | no split and no gap: a pre-M0 viewer, a report without an age, silence **before** the first report, or a window the sender was idle in — and every direct window, because the classifier runs on constrained windows only (`governor.rs:1100`) | evidence; the loops behave as they did before FR-71 |
+
+Its inputs are `WindowSignals` (`pipe_state.rs:112`), assembled once at the
+window fold (`governor.rs:1088`):
+
+| input | where it comes from | note |
+|---|---|---|
+| `split` — sender / transit / viewer ms | `split_age` over the window's average age, the viewer's arrival stamp and the window's average send wait (`governor.rs:1072`) | `None` = no split this window |
+| `reported` | any report this window — an age, a link report, or the raw count (`governor.rs:1090`) | the gap rule's subject |
+| `inflight_bytes`, `budget_bytes`, `gate_skips`, `send_wait_max_ms`, `frames_sent` | `WindowSenderStats` (`governor.rs:341`), handed over by the pump on every pass and **summed per window** since FR-119 P2b-8 (`absorb`, `:372`) | ⚠️ until P2b-8 (2026-10-23) the governor kept only the last pass, so `frames_sent` and `gate_skips` read 0–2 where a window held 30–120, and a gate skip outside the final pass never made the window `overproduced`; every test fed whole windows, so the tests describe the classifier the field runs from then on |
+| `blocked_sends` | the goodput sink's samples, drained at the fold | the same samples the fold then accepts or drops |
+| `struggling` | the viewer's decode-backlog bit | |
+
+The floors are learned the way the FR-15 age loop learns its floor — the
+smallest share seen (`pipe_state.rs:202`) — so a permanently slow path is not
+a permanent stall, and a stall never lowers the floor it is measured against.
+
+**The heartbeat.** `pipe_state` is the last window's verdict, `pipe_states` the
+session's windows per verdict as `[unknown, clear, overproduced,
+transit-stalled, viewer-late]`, and `pipe_gap_stalls` the subset of the
+transit-stalled count that came from the gap rule (`peer.rs:9764`–`:9774` for
+the FFmpeg pump; `:5148`–`:5158` for VP9's, whose transit share is an upper
+bound because that pump keeps no send-wait figure). Three rules for reading them:
+
+- a heartbeat spans about two windows, so `pipe_state` and the histogram are
+  **offset by one window** when read side by side — count stalls from the
+  histogram's deltas, not from the current verdict (measured 2026-09-07);
+- the counters are per session: the governor is built with the session, so a
+  new `session_id` restarts them at zero;
+- on `0.4.67` every session showed one `transit-stalled` window at its start —
+  the viewer's first report had not arrived yet. The "has reported once" clause
+  (#1370) fixed it from `0.4.68`; nothing needs subtracting after that.
+
+**What the field taught**, with the record in FR-71's spec:
+
+- Finding 4 has **two shapes** on the corporate hosts, and the gate answers each
+  with a different fact. The post-ack kind — an age in the hundreds of
+  milliseconds to seconds with 0 B in flight and a 0.03 ms send wait (CORPLAP-2,
+  2026-09-07 and 09-08 08:48) — is the split rule's `TransitStalled`. The
+  blocked-send kind — a DC send blocked for 2.9 s and 7.4 s inside pump passes
+  the runtime had stalled (CORPLAP-1 on the Check Point VPN, 2026-09-08 12:15)
+  — is `AgentStalled`, the gate's first reason, whatever the classifier said of
+  the window. The B0 freeze fixtures model a third: a frozen drain that fills
+  the **sender's** queue, which the classifier rightly calls `Overproduced`
+  (`t1a_freeze_stalls_are_sender_visible`, `sim.rs:2181`); the simulator's
+  `transit_stalls` (acked on time, observed late) and the `finding4_transit_stall`
+  cell (`sim.rs:1716`) model the first.
+- **96 % of `transit-stalled` verdicts are report gaps**: 209 of 218 over four
+  days of the operator's sessions (2026-09-05 → 09-08, about 15,000 constrained
+  windows on `0.4.69` → `0.4.85`), one silent window every few minutes on a
+  healthy relay, and nothing was ever classified stalled while its queue was
+  over budget. A gap is still a rejected window; whether a hidden tab's silence
+  should count as a stall is an open decision in FR-71.
+- The cell that keeps the rate is `finding_4_keeps_the_rate_with_the_validity_gate`
+  (`sim.rs:2307`): no window below the pre-stall target and the path reading
+  clear within the stall's own length. Its FAIL arm,
+  `finding_4_cuts_the_rate_without_the_validity_gate` (`:2284`), keeps the
+  defect on record — the gate has no daemon switch, so the arm lives only in
+  the simulator — and the thin pipe, the LAN burst and a genuinely slow relay
+  trace **byte-identical** with the gate on and off
+  (`t1b_hold_is_inert_where_nothing_stalls`, `:2355`).
+
+⚠️ The classifier was a shadow for one release: `transit_classify` (T1a) and
+the hold behind `transit_hold` (T1b, default off) shipped in `0.4.67`, and
+FR-79 V1 **deleted** both the day the gate was built on the verdict. A
+`transit_hold = true` left in a host's `config.toml` is an inert key.
 
 ### What each consumer does with the verdict
 
@@ -178,6 +281,22 @@ three relay laptops' daemon logs for 2026-09-10 → 09-25 (24,013 heartbeats,
 at every one of the 193: the blocked-send source was live in 2 % of the
 constrained windows and the prior in none. That absence is the V3b finding,
 below.
+
+⚠️ **The 2026-10-29 fleet read found the inverse (FR-71).** Over 15 days and
+40,654 constrained windows on the corporate laptops (`0.4.137` → `0.4.184`), a
+transit stall on a session with no pipe estimate was held 433 times out of
+482 — but 49 clean stall episodes cut, every one on a session whose prior stood
+at 0.02–0.8 M: `stall_is_ours` compares against `pipe_bps`, whose last source
+is the prior's stand-in (`governor.rs:613`), and pushes that prior back without
+a measurement on every window it fires on (`:1377`), so each cut lowers the
+number the next stall is judged against. One 25-minute HEVC session over DERP
+went 3.63 → 0.94 M on 24 gap windows with 0 B in flight. A second edge: the
+viewer's congested report in a stall's **onset** window (transit still under
+the classifier's 200 ms slack, so the window is `clear` and valid) arms the P3
+clamp at the collapsed arrival rate — 3.0 → 0.62 M at 09:17:07 on 10-19, 13
+such drops in the fortnight. Both are recorded with their arcs in
+[`fr/FR-71-transport-stall-classification.md`](fr/FR-71-transport-stall-classification.md)
+(§Open decisions, field log); the law is not changed on this page.
 
 ### The ceiling learner (FR-35 P1) — growth above the nominal
 
