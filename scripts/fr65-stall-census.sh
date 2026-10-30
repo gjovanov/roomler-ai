@@ -2,7 +2,10 @@
 #
 # fr65-stall-census.sh — run the FR-65 stall census on Windows fleet hosts.
 #
-# usage: scripts/fr65-stall-census.sh [--days N] [--rows] <host> [<host> ...]
+# usage: scripts/fr65-stall-census.sh [--days N] [--rows] [--probes] <host> [<host> ...]
+#
+# --probes runs the caps-probe census instead (scripts/fr65-probe-census.ps1,
+# FR-65 AC6): probe runs per daemon start, and how many were at steady state.
 #
 # Runs scripts/fr65-stall-census.ps1 ON each host through `roomler exec`, as an
 # -EncodedCommand, so no quoting has to survive exec's argv re-split (it does
@@ -20,20 +23,22 @@ set -euo pipefail
 
 days=14
 rows=0
+which=stall
 hosts=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --days) days="${2:?--days needs a number}"; shift 2 ;;
     --rows) rows=1; shift ;;
-    -h|--help) sed -n '3,18p' "$0"; exit 0 ;;
+    --probes) which=probe; shift ;;
+    -h|--help) sed -n '3,21p' "$0"; exit 0 ;;
     *) hosts+=("$1"); shift ;;
   esac
 done
-[ ${#hosts[@]} -gt 0 ] || { echo "usage: $0 [--days N] [--rows] <host> ..." >&2; exit 2; }
+[ ${#hosts[@]} -gt 0 ] || { echo "usage: $0 [--days N] [--rows] [--probes] <host> ..." >&2; exit 2; }
 case "$days" in ''|*[!0-9]*) echo "--days must be a number" >&2; exit 2 ;; esac
 
 here="$(cd "$(dirname "$0")" && pwd)"
-script="$here/fr65-stall-census.ps1"
+script="$here/fr65-$which-census.ps1"
 [ -f "$script" ] || { echo "missing $script" >&2; exit 2; }
 
 prelude="\$Days = $days;"

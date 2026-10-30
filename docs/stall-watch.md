@@ -212,11 +212,11 @@ WARN FFmpeg DC pump STALL — one pass exceeded the budget session_id=… codec_
 ## 6. The 2026-10-30 census — what the logs of three hosts said
 
 Fourteen days of daemon logs (2026-10-17..30) on the three corporate laptops,
-read with the census of §7 before any of this shipped. 339 STALL lines:
+read with the census of §7 before any of this shipped. 344 STALL lines:
 
 | Class | CORPLAP-1 | CORPLAP-2 | CORPLAP-3 | Reading |
 |---|---|---|---|---|
-| `open` | 19 (mean 0.9 s, max 1.4 s) | 122 (0.24 s, 3.0 s) | 34 (0.61 s, 1.5 s) | the encoder open, every session |
+| `open` | 21 (mean 0.93 s, max 1.4 s) | 122 (0.24 s, 3.0 s) | 37 (0.60 s, 1.5 s) | the encoder open, every session |
 | `reset` | 7 (2.6 s, 3.6 s) | 51 (2.2 s, 4.1 s) | 26 (1.5 s, 4.1 s) | **the §3.1 artifact** — real stalls, attributed to nobody |
 | `untimed` | 4 (14.7 s, **30.0 s**) | 27 (0.34 s, 1.0 s) | 15 (0.31 s, 1.8 s) | time in no phase named at the time — §6.2, §6.3 |
 | `encode` | 10 (0.15 s, 0.23 s) | 0 | 19 (0.19 s, 0.55 s) | slow encodes |
@@ -281,6 +281,17 @@ daemon's dated logs and prints one summary row per class (§5's table).
   en-US, and a German culture would format 3586.0 as `3.586,0`.
 - `--rows` also prints, for a `reset` line, the heartbeat just before it —
   where the lost attribution can still be read.
+- ⚠️ **Today's file is open for writing, and a census must not skip it.** The
+  first version read the logs with `[IO.File]::ReadLines`, which the daemon's
+  open handle refuses (a sharing violation). PowerShell reports that as a
+  non-terminating error, `roomler exec` delivers stderr as CLIXML, the wrapper
+  drops CLIXML, and the census silently covered every day but today — five of
+  its 344 lines (2026-10-30) went uncounted on its first reading. The script now
+  opens each file the way a tail does (`FileShare 'ReadWrite, Delete'`), and its
+  summary line says how far it read (`read through …`) and `unreadable=N`, with
+  an `UNREADABLE` line per file it could not open. Read both before the counts.
+- `--probes` runs `scripts/fr65-probe-census.ps1` instead: the caps-probe runs
+  per daemon start and how many were at steady state (FR-65 AC6).
 - ⚠️ An exec sweep is a biased sample (hosts with exec on, reachable). Report
   per host; never a fleet-wide proportion.
 - It is FR-65 AC7's "same instrument": the before of a change to the watch is
@@ -333,7 +344,7 @@ passes.** The pump re-polls an idle screen every ~2 ms (rc.99), so it makes
 more passes than frames. The field's rate, bounded from the heartbeat's frame
 counters (`Δframes_empty + Δframes_encoded + Δframes_skipped_backpressure +
 Δdc_unopen_drops` per window, which over-counts a keepalive pass) over 14 days
-and 35 649 windows: at most **322 passes/s** (NEO16, 144 fps); 299, 314 and 296
+and 36 357 windows: at most **322 passes/s** (NEO16, 144 fps); 299, 314 and 296
 on the three CORPLAP hosts (p99 273–282), up to 10.5 passes per frame interval
 at 30 fps. At the worst cell's p90 that is 322 × 869 ns = **0.28 ms of watch per
 second, 0.028 % of the frame budget — 36× under the 1 % bar**, with every factor

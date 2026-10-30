@@ -69,7 +69,7 @@
 //! 🔑 It is not an edge case, because **a pass longer than the heartbeat
 //! interval always holds a heartbeat** — the long pass is what makes it due. The
 //! rule was blind to exactly the stalls worth finding. Read from the three
-//! CORPLAP hosts' logs over 2026-10-17..30: of 339 STALL lines, 84 were emitted
+//! CORPLAP hosts' logs over 2026-10-17..30: of 344 STALL lines, 84 were emitted
 //! within 5 ms of their session's heartbeat with all six reset phases at 0.0
 //! and `other ≈ iter`, and they were the longest (1.5–2.6 s mean per host,
 //! 4.1 s max). On CORPLAP-1, six of its seven came right after a heartbeat
@@ -514,7 +514,7 @@ impl PassWatch {
     /// 🔑 Without this the close computes `0 − mark` for every reset field,
     /// which saturates to 0, so the pass holding the heartbeat — and every pass
     /// longer than the heartbeat interval holds one — loses its capture,
-    /// encode and open time to `other` (see the module docs: 84 of 339 field
+    /// encode and open time to `other` (see the module docs: 84 of 344 field
     /// STALL lines). With it the pass keeps what it had accrued and its mark
     /// moves past the reset. Works for any subset of fields, so the heartbeat
     /// can reset what it likes as long as both snapshots are taken from the

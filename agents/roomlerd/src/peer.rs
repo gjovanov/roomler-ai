@@ -9889,7 +9889,7 @@ async fn media_pump_ffmpeg_dc(
             // zeroes. Without the rebase its close reads `0 − mark` = 0 for
             // each, and every pass longer than this interval — which always
             // holds a heartbeat — lost its capture, encode and open to `other`
-            // (84 of 339 STALL lines in the 2026-10-30 census; see
+            // (84 of 344 STALL lines in the 2026-10-30 census; see
             // `encode::stall`, "A window reset inside a pass").
             let before = watch.enabled().then_some(phase_accum!());
             heartbeat_frames_base = frames_encoded;
