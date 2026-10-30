@@ -150,7 +150,13 @@ jobs:
     # Wave 14: every lane runs well under 10 min warm; 30 leaves a cold lane
     # (after an eviction, a toolchain bump or a new cache family) room to
     # finish without letting a hung step idle for most of an hour.
-    timeout-minutes: 30
+    #
+    # Wave 36 (2026-10-30): 40. Wave 34's first master run (41107105820)
+    # built this lane cold and published its cache in 27 min 19 s, 91 % of
+    # the old ceiling. A cold run cut off before it publishes leaves the next
+    # run cold as well, so each ceiling is about 1.5 times its lane's measured
+    # cold run: 40 here, 45 for rust-unit.
+    timeout-minutes: 40
     runs-on: ubuntu-latest
     # Warm baseline is 4-5 min; the only step that can blow past it is an
     # Ubuntu-mirror stall inside apt (2026-08-18 evening: 14/19/20/29-min
@@ -460,7 +466,12 @@ jobs:
     name: Rust unit tests (server + crates)
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
-    timeout-minutes: 30
+    # FR-6 wave 36: 45, not 30. Cold (1,795 crates, then a 2.6 GB cache in two
+    # parts), wave 34's first master run (41107105820) was cut off at 30 min
+    # 15 s with its second part still uploading, and "Rust checks" failed.
+    # That part happened to land; one that does not leaves every later run
+    # cold too. See rust-lint.
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
     permissions:

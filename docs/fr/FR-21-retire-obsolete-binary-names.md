@@ -51,7 +51,7 @@ the field is still on the old segment, silently, at the next update:
 | legacy log prefix `roomler-agent.log` | `crates/agent-core/src/logging.rs:315,312,440`; `agents/roomlerd/src/logs_fetch.rs:56` | `rc:logs-fetch` returns "no log file" on an upgraded host that has not rolled yet |
 | `LEGACY_INSTALL_FOLDER_NAME = "roomler-agent"` | `agents/roomlerd/src/updater.rs:369` | the vacated install dir is never swept |
 | `%h/.config/roomler-agent` in `ReadWritePaths` | `agents/roomlerd/packaging/linux/roomler.service:44` | systemd denies the daemon its own legacy tree mid-migration |
-| **the macOS `.app` bundle** — see §5, D5 | `packaging/macos/com.roomler.{agent,daemon}.plist`; `.github/workflows/ci.yml:475` | **TCC grants are voided** — every Mac silently loses Screen Recording + Accessibility until a human re-grants them |
+| **the macOS `.app` bundle** — see §5, D5 | `packaging/macos/com.roomler.{agent,daemon}.plist`; `.github/workflows/ci.yml:486` | **TCC grants are voided** — every Mac silently loses Screen Recording + Accessibility until a human re-grants them |
 
 So the deliverable is not a diff. It is **a classifier plus a guard**: an inventory that assigns
 every occurrence to `migrate` / `freeze`, a CI job that fails on an unclassified occurrence, and
@@ -470,7 +470,7 @@ forever. That is ugly, and it is still right: the alternative asks every Mac use
 Screen Recording and Accessibility, and a missed re-grant is a device that looks enrolled and
 cannot be controlled. **RESOLVED: freeze** — revisit only with an installer that can re-register
 the bundle without a human. The lock already exists on both sides —
-`ui/src/__tests__/utils/enrollCommands.spec.ts:129-147` and `.github/workflows/ci.yml:475`.
+`ui/src/__tests__/utils/enrollCommands.spec.ts:129-147` and `.github/workflows/ci.yml:486`.
 
 **D6 — `roomler-tunnel`.** 269 hits, and the enroll-command test already treats it as retired
 (`enrollCommands.spec.ts:143`). **RESOLVED: fold in** — same sweep, same guard — but as its own
