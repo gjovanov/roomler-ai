@@ -18,7 +18,8 @@
 //! | a call | admitted and keyed by one round trip to the daemon ([`WorkerSource::admit`]), exactly as `wait_for_lease_word` + `sidecar_admit` + `model_key` run for a daemon-hosted one, in the same order |
 //! | the provider's 401 | [`Call::SidecarForgetKey`], so the daemon fetches the key again next time |
 //! | a new worker | the sidecar is handed again, on the same listener: a connection the lost worker held is gone, the port is not |
-//! | no worker up | `sidecar::open` serves it in the daemon itself, exactly as before this step |
+//! | the first worker | P8-2c-4 — kept as the start opens it, before the launch starts its worker, where the device runs workers (`hive_worker`); handed by the worker's own first `rehand` as it comes up, a connection waiting in the listener's backlog till then |
+//! | `hive_worker` off | `sidecar::open` serves it in the daemon itself, exactly as before this step |
 
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -82,15 +83,24 @@ fn next_endpoint() -> u64 {
 }
 
 /// Hand `listener` (already bound by the caller — `sidecar::open`) to
-/// `session` at `fence`'s worker: `None` where the run has none (the
-/// caller serves it in the daemon instead), the endpoint handed
-/// otherwise.
+/// `session` at `fence`'s worker: `None` where the run gets none
+/// (`in_worker` false: the caller serves it in the daemon instead), the
+/// endpoint handed otherwise.
+///
+/// FR-90 P8-2c-4 — `in_worker` is the device's own setting (`hive_worker`),
+/// the one `launch` hands `worker::run_started`. This runs as the start is
+/// decided, BEFORE the launch starts the worker, so whether a worker exists
+/// yet (`worker::has`) is false at every fresh launch: asked that, it
+/// handed nothing, ever.
 ///
 /// Synchronous, like `toolbelt::handed::prepare`: the actual hand-over
 /// (which must wait on a possibly-still-starting worker, then make one
 /// round trip) is spawned, not awaited, so a connection that arrives
 /// before it completes queues in the listener's own backlog rather than
 /// blocking the session's launch on a worker that may be slow to start.
+/// On a fresh launch the hand-over that counts is the worker's own first
+/// [`rehand`], as it comes up; the spawned one finds no worker yet, or the
+/// same one, and a hand-over answered twice is served once.
 pub(crate) fn prepare(
     session: ObjectId,
     fence: u64,
@@ -98,8 +108,9 @@ pub(crate) fn prepare(
     sup: Weak<Supervisor>,
     upstream: String,
     workspace: Option<String>,
+    in_worker: bool,
 ) -> Result<Option<u64>, String> {
-    if !crate::hive::worker::has(session, fence) {
+    if !in_worker {
         return Ok(None);
     }
     let failed = |e: std::io::Error| format!("the sidecar's listener: {e}");

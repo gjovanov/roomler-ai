@@ -226,3 +226,27 @@ async fn forget_makes_a_later_rehand_find_nothing_to_hand() {
     forget(session, fence);
     assert!(!is_kept(session, fence));
 }
+
+// ─── `prepare`'s gate ───────────────────────────────────────────────────────
+
+/// FR-90 P8-2c-4 — a fresh launch's own case: the device runs workers, and
+/// this run's has not started yet, as it never has when its toolbelt is
+/// opened. Kept for it all the same: asked whether a worker exists yet
+/// (`worker::has`), this answered no at every launch, and nothing was ever
+/// handed. Where the device runs none, the daemon serves it, as before.
+#[tokio::test]
+async fn prepare_keeps_it_for_a_worker_not_started_yet() {
+    let dir = tempfile::tempdir().expect("a temp dir for a test socket");
+    let listener = UnixListener::bind(dir.path().join("t.sock")).expect("a test socket binds");
+    let (tx, _rx) = mpsc::channel(4);
+    let session = ObjectId::new();
+    assert!(!crate::hive::worker::has(session, 1), "no worker yet");
+    let prepared = prepare(session, 1, 0, &listener, tx.clone(), true).expect("kept");
+    assert!(prepared.is_some(), "handed, not served by the daemon");
+    assert!(is_kept(session, 1), "kept for the worker to come");
+    forget(session, 1);
+
+    let off = prepare(session, 2, 0, &listener, tx, false).expect("no failure");
+    assert!(off.is_none(), "`hive_worker` off: the daemon serves it");
+    assert!(!is_kept(session, 2));
+}

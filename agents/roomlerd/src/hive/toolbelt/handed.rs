@@ -16,7 +16,8 @@
 //! | an approval closing | the worker's own word ([`Call::ToolbeltClosed`]), however it ended — the worker alone knows, since it alone holds the wait |
 //! | a driver's answer, or a withdrawal | the daemon's [`Pending`] forwards it to the worker ([`Call::ToolbeltAnswer`] / [`Call::ToolbeltWithdraw`] / [`Call::ToolbeltWithdrawAll`]), which resolves its own real wait |
 //! | a new worker | the toolbelt is handed again, on the same listener: a connection (and any approval mid-flight on it) the lost worker held is gone, the socket is not |
-//! | no worker up | `toolbelt::open` serves it in the daemon itself, exactly as before this step |
+//! | the first worker | P8-2c-4 — kept as the run launches, before its worker starts, where the device runs workers (`hive_worker`); handed by the worker's own first `rehand` as it comes up, a connection waiting in the listener's backlog till then |
+//! | `hive_worker` off | `toolbelt::open` serves it in the daemon itself, exactly as before this step |
 //!
 //! ⚠️ **Known gap, left open rather than silently patched over**: an
 //! approval open when its worker dies has no [`Call::ToolbeltClosed`] to
@@ -78,10 +79,16 @@ fn next_endpoint() -> u64 {
 
 /// Hand `listener` (already bound, owned and permissioned by the caller —
 /// `toolbelt::open`) to `session` at `fence`'s worker: `None` where the run
-/// has none (the caller serves it in the daemon instead), a `Pending` that
-/// forwards to the worker otherwise — the SAME one this module uses to note
-/// what the worker reports open, so [`Pending::ids`] and a double-answer's
-/// refusal stay correct.
+/// gets none (`in_worker` false: the caller serves it in the daemon
+/// instead), a `Pending` that forwards to the worker otherwise — the SAME
+/// one this module uses to note what the worker reports open, so
+/// [`Pending::ids`] and a double-answer's refusal stay correct.
+///
+/// FR-90 P8-2c-4 — `in_worker` is the device's own setting (`hive_worker`),
+/// the one `launch` hands `worker::run_started`. This runs inside `spawn`,
+/// BEFORE that starts the worker, so whether a worker exists yet
+/// (`worker::has`) is false at every fresh launch: asked that, it handed
+/// nothing, ever.
 ///
 /// Synchronous — `toolbelt::open` is, and its own callers up to `spawn`,
 /// `launch` are too — so the actual hand-over (which must wait on a
@@ -89,14 +96,18 @@ fn next_endpoint() -> u64 {
 /// records the toolbelt as kept and returns a `Pending` that already
 /// forwards correctly (it looks its worker up fresh at every resolution,
 /// never a link cached from here) before that spawned call has even run.
+/// On a fresh launch the hand-over that counts is the worker's own first
+/// [`rehand`], as it comes up; the spawned one finds no worker yet, or the
+/// same one, and a hand-over answered twice is served once.
 pub(crate) fn prepare(
     session: ObjectId,
     fence: u64,
     peer: u32,
     listener: &UnixListener,
     events: mpsc::Sender<ApprovalEvent>,
+    in_worker: bool,
 ) -> Result<Option<(Arc<Pending>, u64)>, String> {
-    if !crate::hive::worker::has(session, fence) {
+    if !in_worker {
         return Ok(None);
     }
     let failed = |e: std::io::Error| format!("the toolbelt's listener: {e}");

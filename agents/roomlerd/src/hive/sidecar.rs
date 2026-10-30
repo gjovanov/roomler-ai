@@ -427,7 +427,7 @@ pub(crate) struct Sidecar {
     stop: CancellationToken,
     /// This run and the endpoint it was handed as, where the sidecar is
     /// handed to its worker instead of served here. `None` where it is
-    /// served here (no worker up for this run yet, or `hive_worker` off).
+    /// served here (`hive_worker` off).
     #[cfg(worker_calls)]
     handed: Option<(ObjectId, u64, u64)>,
 }
@@ -462,8 +462,8 @@ impl Drop for Sidecar {
 }
 
 /// Bind `session`'s own sidecar and start serving it — handed to its
-/// worker where one exists for `(session, fence)` ([`handed::prepare`]),
-/// served here directly otherwise, exactly as
+/// worker where the run gets one ([`handed::prepare`]), served here
+/// directly otherwise, exactly as
 /// [`toolbelt::open`](super::toolbelt::open) does for the toolbelt's own
 /// listener. `upstream`/`workspace` are the device's config, read once
 /// here since neither changes while the daemon runs.
@@ -482,6 +482,9 @@ pub(crate) async fn open(
     // unused.
     #[cfg(not(worker_calls))]
     let _ = fence;
+    // FR-90 P8-2c-4 — whether the run gets a worker is the device's own
+    // setting (`hive_worker`), never whether one exists yet: this runs as
+    // the start is decided, and the launch starts the worker after it.
     #[cfg(worker_calls)]
     let prepared = handed::prepare(
         session,
@@ -490,6 +493,7 @@ pub(crate) async fn open(
         Arc::downgrade(sup),
         upstream.clone(),
         workspace.clone(),
+        sup.cfg.worker,
     )?;
     #[cfg(not(worker_calls))]
     let prepared: Option<u64> = None;

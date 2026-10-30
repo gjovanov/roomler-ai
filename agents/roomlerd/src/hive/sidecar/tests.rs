@@ -160,6 +160,16 @@ async fn provider() -> Provider {
 /// A rig whose sessions reach `provider` through the sidecar, with a key
 /// helper that counts its runs in `count`.
 async fn sidecar_rig(provider: &Provider, grace: Duration) -> (Rig, tempfile::TempDir) {
+    sidecar_rig_with(provider, grace, false).await
+}
+
+/// [`sidecar_rig`], on a device whose owner turned workers on
+/// (`hive_worker`) where `worker` says so (P8-2c-4).
+async fn sidecar_rig_with(
+    provider: &Provider,
+    grace: Duration,
+    worker: bool,
+) -> (Rig, tempfile::TempDir) {
     let count_dir = tempfile::tempdir().unwrap();
     let count = count_dir.path().join("helper-runs");
     let helper = format!(
@@ -170,7 +180,10 @@ async fn sidecar_rig(provider: &Provider, grace: Duration) -> (Rig, tempfile::Te
     let r = rig_with(
         true,
         4,
-        move |cfg| cfg.api_key_helper = Some(helper),
+        move |cfg| {
+            cfg.api_key_helper = Some(helper);
+            cfg.worker = worker;
+        },
         move |sup| sup.with_sidecar(upstream, grace),
     );
     std::fs::write(r.root.path().join("claude"), ENV_HARNESS).unwrap();
@@ -297,6 +310,64 @@ async fn a_session_reaches_the_provider_only_through_the_sidecar_with_its_own_to
     assert_eq!(seen[0].headers["anthropic-version"], "2023-06-01");
     assert_eq!(seen[0].headers["anthropic-beta"], "test-beta");
     assert_eq!(seen[0].body, br#"{"model":"m","messages":[]}"#);
+    r.sup.stop(sid, 1, "owner".into());
+}
+
+/// FR-90 P8-2c-4 — a FRESH launch with `hive_worker` on hands the session's
+/// sidecar to its worker, which carries a model call to the provider with
+/// the device's key. `sidecar::open` runs in `decide_and_launch`, before
+/// `launch` starts the worker, so whether a worker exists yet
+/// (`worker::has`) was false at every fresh launch and no sidecar was ever
+/// handed; it is told the device's own setting now. A sidecar kept for its
+/// worker is served by nothing in the daemon, so both answers below are
+/// the worker's, its admission and key asked of the daemon a call at a
+/// time (`Call::SidecarAdmit`).
+#[cfg(worker_calls)]
+#[tokio::test]
+async fn a_fresh_launch_hands_its_sidecar_to_its_worker_which_carries_a_model_call() {
+    use crate::hive::worker::{in_process_when_live, seen};
+    let p = provider().await;
+    let (mut r, _count) = sidecar_rig_with(&p, OFFLINE_GRACE, true).await;
+    let o = order(&r);
+    in_process_when_live(o.session_id);
+    let (sid, base, token) = started_with(&mut r, o).await;
+    assert!(
+        handed::is_kept(sid, 1),
+        "kept for the worker at the run's very first launch"
+    );
+
+    let refused = call(&format!("{base}/v1/messages"), None).await;
+    assert_eq!(
+        error_kind(refused).await,
+        (401, "authentication_error".to_string()),
+        "the daemon's refusal, rebuilt by the worker"
+    );
+    let resp = call(&format!("{base}/v1/messages?beta=true"), Some(&token)).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let mut stream = resp.bytes_stream();
+    let first = tokio::time::timeout(WAIT, stream.next())
+        .await
+        .expect("the first chunk while the provider still answers")
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("message_start"));
+    p.go.notify_one();
+    let mut rest = String::new();
+    while let Some(chunk) = tokio::time::timeout(WAIT, stream.next()).await.unwrap() {
+        rest.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    assert!(rest.contains("message_stop"), "{rest}");
+    let seen_by_provider = p.seen.lock().await.clone();
+    assert_eq!(seen_by_provider.len(), 1, "the refused call never left");
+    assert_eq!(
+        seen_by_provider[0].headers["x-api-key"], DEVICE_KEY,
+        "the device's key, asked of the daemon for this one call"
+    );
+    assert!(
+        seen(sid, 1).is_some_and(|s| s.up && s.starts == 1),
+        "one worker, up all along: {:?}",
+        seen(sid, 1)
+    );
     r.sup.stop(sid, 1, "owner".into());
 }
 
