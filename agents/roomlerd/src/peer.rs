@@ -6651,25 +6651,56 @@ async fn media_pump_ffmpeg_dc(
     let mut ctrl_us: u64 = 0;
     let mut swap_us: u64 = 0;
     let mut gate_us: u64 = 0;
-    // FR-65 P0 — worst single loop pass in the window, and how many overran.
-    let mut iter_us_max: u64 = 0;
-    let mut pump_stalls: u32 = 0;
-    // FR-79 — `pump_stalls` at the last PASS, so each pass hands the governor
+    // FR-65 (2026-10-30) — six more, from a 14-day census of the CORPLAP logs:
+    // the passes `other_ms` still dominated are shaped like these waits (see
+    // each field's docs on `encode::stall::PassTiming`). Watch-only, like the
+    // five above: `watch.start()` reads no clock when the watch is off.
+    let mut dc_lock_us: u64 = 0;
+    let mut enc_cmd_us: u64 = 0;
+    let mut close_us: u64 = 0;
+    let mut recapture_us: u64 = 0;
+    let mut poll_us: u64 = 0;
+    let mut heartbeat_us: u64 = 0;
+    // FR-65 P0 — the pass marks, the rate-limited STALL line, the window's worst
+    // pass and stall count, and the stall TOTAL the governor reads, in one type
+    // on the DEFAULT feature set: this pump is behind `ffmpeg-encoder`, so
+    // nothing written inline here is reachable by `cargo test -p roomlerd --lib`.
+    use crate::encode::stall::PassWatch;
+    let mut watch = PassWatch::new(
+        crate::encode::pump_stall_watch_enabled(),
+        Duration::from_millis(crate::encode::pump_stall_warn_ms()),
+    );
+    // FR-79 — the stall TOTAL at the last pass, so each pass hands the governor
     // a delta; the governor folds the passes into the viewer window
-    // (`WindowSenderStats::absorb`, FR-119 P2b-8 — until then it kept only the
-    // last pass, and these marks were read as if they were per window).
-    let mut win_stalls_last: u32 = 0;
-    let stall_watch = crate::encode::pump_stall_watch_enabled();
-    let stall_warn = Duration::from_millis(crate::encode::pump_stall_warn_ms());
-    // Measured at the TOP of the NEXT pass, so every `continue` path in this
-    // loop is covered without an RAII guard fighting the borrow checker.
-    // FR-65 — one struct rather than the old 7-tuple: with eleven phases a
-    // positional tuple is a mismatched-pair waiting to happen, and the
-    // subtraction now lives in `PhaseAccum::delta` where it is unit-tested.
-    let mut iter_mark: Option<(std::time::Instant, crate::encode::stall::PhaseAccum)> = None;
-    // ⚠️ Rate-limited: a stall storm that floods its own log is a second
-    // performance problem.
-    let mut last_stall_log = crate::clock::instant_before(Duration::from_secs(60));
+    // (`WindowSenderStats::absorb`, FR-119 P2b-8). ⚠️ Against the monotonic
+    // total, never the window count the heartbeat zeroes (FR-65, 2026-10-30).
+    let mut win_stalls_last: u64 = 0;
+    // FR-65 — every accumulator the watch reads, as one snapshot. ONE list, so
+    // the pass boundary and the heartbeat's rebase can never disagree about
+    // which counters a pass is made of.
+    macro_rules! phase_accum {
+        () => {
+            crate::encode::stall::PhaseAccum {
+                capture_us,
+                scale_us,
+                encode_us,
+                send_us,
+                apply_us,
+                open_us,
+                pace_us,
+                stats_us,
+                ctrl_us,
+                swap_us,
+                gate_us,
+                dc_lock_us,
+                enc_cmd_us,
+                close_us,
+                recapture_us,
+                poll_us,
+                heartbeat_us,
+            }
+        };
+    }
     // FR-65 P0 — time an apply in place. A macro rather than a closure because
     // it expands textually, so the body keeps its own `enc` mutable borrow.
     macro_rules! timed_apply {
@@ -7104,111 +7135,47 @@ async fn media_pump_ffmpeg_dc(
     }
 
     loop {
-        // FR-65 P0 — close out the PREVIOUS pass. Measuring here rather than at
-        // the tail is what makes every `continue` path in this loop count.
-        if stall_watch && let Some((started, mark)) = iter_mark.take() {
-            let took = started.elapsed();
-            let took_us = took.as_micros() as u64;
-            if took_us > iter_us_max {
-                iter_us_max = took_us;
-            }
-            // FR-65 P0 — judge the stall on time NOT spent WAITING FOR INPUT.
-            //
-            // Capture is change-driven, so a quiet screen makes the pass sleep
-            // inside capture, and `capture_us` accumulates that wait. At the
-            // original 250 ms bar those passes stayed invisible; at the 100 ms
-            // bar #1259 introduced they became the majority of the warnings —
-            // field 2026-09-03, a direct session logged seven in 45 s, every
-            // one shaped `iter_ms=111 capture_ms=101.9`, i.e. 9 ms of work and
-            // 102 ms of idling.
-            //
-            // 🔑 That is not a stall, and a watch that cries about idling is
-            // one people learn to ignore — which costs exactly the signal the
-            // watch exists for. The instrument's purpose is BLOCKING WORK on a
-            // shared runtime; waiting for a frame is the loop idling by design,
-            // and it genuinely IS idling: every capture backend hands the work
-            // to a thread that owns the `!Send` device and returns a future —
-            // oneshot-to-worker for scrap/drm/system-context, `Notify` for wgc.
-            //
-            // ⚠️ THE COST OF THIS RULE: a pathological capture — a wedged DXGI
-            // duplication, an EDR filter stalling the desktop, a driver hang —
-            // now CANNOT trip the stall watch, and `pump_stalls` under-counts
-            // by construction. `capture_ms` is still logged here and
-            // `avg_capture_ms` on the heartbeat, so it is visible to a reader,
-            // but nothing ALERTS on it any more. If capture ever needs its own
-            // alarm it needs its own threshold, not this one back.
-            //
-            // The verdict and the phase arithmetic live in
-            // `encode::stall::PassTiming` — a pure type on the DEFAULT feature
-            // set — because this pump is behind `ffmpeg-encoder`, so every rule
-            // written here is invisible to `cargo test -p roomlerd --lib`. Both
-            // subtractions below are field-paid judgements (see that module),
-            // and each reads like a simplification waiting to happen.
-            let pass = crate::encode::stall::PhaseAccum {
-                capture_us,
-                scale_us,
-                encode_us,
-                send_us,
-                apply_us,
-                open_us,
-                pace_us,
-                stats_us,
-                ctrl_us,
-                swap_us,
-                gate_us,
-            }
-            .delta(mark, took_us);
-            if pass.is_stall(stall_warn.as_micros() as u64) {
-                pump_stalls += 1;
-                if last_stall_log.elapsed() >= Duration::from_secs(2) {
-                    last_stall_log = std::time::Instant::now();
-                    // Phase deltas come from the accumulators the pump already
-                    // keeps, so the breakdown costs nothing extra. An overrun
-                    // whose phases all read ~0 is itself the finding: the time
-                    // went somewhere still untimed — which `other_ms` computes
-                    // rather than leaving for a reader to subtract by hand.
-                    warn!(
-                        %session_id,
-                        codec_label,
-                        constrained,
-                        iter_ms = took.as_secs_f64() * 1000.0,
-                        capture_ms = pass.capture_us as f64 / 1000.0,
-                        scale_ms = pass.scale_us as f64 / 1000.0,
-                        encode_ms = pass.encode_us as f64 / 1000.0,
-                        send_ms = pass.send_us as f64 / 1000.0,
-                        apply_ms = pass.apply_us as f64 / 1000.0,
-                        open_ms = pass.open_us as f64 / 1000.0,
-                        pace_ms = pass.pace_us as f64 / 1000.0,
-                        stats_ms = pass.stats_us as f64 / 1000.0,
-                        ctrl_ms = pass.ctrl_us as f64 / 1000.0,
-                        swap_ms = pass.swap_us as f64 / 1000.0,
-                        gate_ms = pass.gate_us as f64 / 1000.0,
-                        other_ms = pass.other_us() as f64 / 1000.0,
-                        work_ms = pass.work_us() as f64 / 1000.0,
-                        dominant = ?pass.dominant_phase(),
-                        target_bps = governor.applied_bps(),
-                        "FFmpeg DC pump STALL — one pass exceeded the budget"
-                    );
-                }
-            }
-        }
-        if stall_watch {
-            iter_mark = Some((
-                std::time::Instant::now(),
-                crate::encode::stall::PhaseAccum {
-                    capture_us,
-                    scale_us,
-                    encode_us,
-                    send_us,
-                    apply_us,
-                    open_us,
-                    pace_us,
-                    stats_us,
-                    ctrl_us,
-                    swap_us,
-                    gate_us,
-                },
-            ));
+        // FR-65 P0 — close the PREVIOUS pass and open this one. At the top
+        // rather than the tail, so every `continue` path in this loop counts.
+        //
+        // The verdict, its two field-paid subtractions and the bookkeeping live
+        // in `encode::stall` (`PassTiming`, `PassWatch`); read that module
+        // before "simplifying" any of it. In short: a stall is judged on time
+        // NOT spent waiting for input (`work = iter − capture − pace`), because
+        // a quiet screen sleeps inside capture and a watch that cries about
+        // idling is one people learn to ignore; and `other_ms` is computed,
+        // because an overrun whose named phases read ~0 is itself the finding.
+        // ⚠️ The cost of the first rule: a wedged capture cannot trip this
+        // watch — `capture_ms` shows it, nothing alerts on it.
+        if let Some(pass) = watch.turn_with(|| phase_accum!()) {
+            warn!(
+                %session_id,
+                codec_label,
+                constrained,
+                iter_ms = pass.iter_us as f64 / 1000.0,
+                capture_ms = pass.capture_us as f64 / 1000.0,
+                scale_ms = pass.scale_us as f64 / 1000.0,
+                encode_ms = pass.encode_us as f64 / 1000.0,
+                send_ms = pass.send_us as f64 / 1000.0,
+                apply_ms = pass.apply_us as f64 / 1000.0,
+                open_ms = pass.open_us as f64 / 1000.0,
+                pace_ms = pass.pace_us as f64 / 1000.0,
+                stats_ms = pass.stats_us as f64 / 1000.0,
+                ctrl_ms = pass.ctrl_us as f64 / 1000.0,
+                swap_ms = pass.swap_us as f64 / 1000.0,
+                gate_ms = pass.gate_us as f64 / 1000.0,
+                dc_lock_ms = pass.dc_lock_us as f64 / 1000.0,
+                enc_cmd_ms = pass.enc_cmd_us as f64 / 1000.0,
+                close_ms = pass.close_us as f64 / 1000.0,
+                recapture_ms = pass.recapture_us as f64 / 1000.0,
+                poll_ms = pass.poll_us as f64 / 1000.0,
+                heartbeat_ms = pass.heartbeat_us as f64 / 1000.0,
+                other_ms = pass.other_us() as f64 / 1000.0,
+                work_ms = pass.work_us() as f64 / 1000.0,
+                dominant = ?pass.dominant_phase(),
+                target_bps = governor.applied_bps(),
+                "FFmpeg DC pump STALL — one pass exceeded the budget"
+            );
         }
         // rc.443 — owner-liveness beat, FIRST statement of the loop (see
         // the vp9 twin): a wedged blocking encode is the one failure this
@@ -7219,7 +7186,11 @@ async fn media_pump_ffmpeg_dc(
         // arm holds a live `enc` borrow, so it can't touch `encoder`).
         if rebuild_after_encode_error {
             rebuild_after_encode_error = false;
+            // FR-65 — a threaded encoder's drop JOINS its thread, here, on the
+            // runtime worker: `close`.
+            let t = watch.start();
             encoder = None;
+            PassWatch::stop(t, &mut close_us);
             encoder_dims = None;
         }
         // P3 (2026-08-27) — background bitrate rebuild for rebuild-bound
@@ -7337,7 +7308,7 @@ async fn media_pump_ffmpeg_dc(
                 }
             }
         }
-        let swap_start = std::time::Instant::now();
+        let swap_start = watch.start();
         if bg_rebuild {
             if let Some((handle, _)) = pending_swap.as_ref()
                 && handle.is_finished()
@@ -7432,7 +7403,7 @@ async fn media_pump_ffmpeg_dc(
                 }
             }
         }
-        swap_us += swap_start.elapsed().as_micros() as u64;
+        PassWatch::stop(swap_start, &mut swap_us);
         // Relay-escape — twin of the VP9 pump's loop-top block: re-read the
         // selected ICE pair every TRANSPORT_RECHECK_INTERVAL and follow a
         // mid-session renomination. A flip flows into `ceiling` (recomputed
@@ -7451,9 +7422,9 @@ async fn media_pump_ffmpeg_dc(
                 // stats graph under locks the ICE agent and SCTP association
                 // also take, so it is slowest exactly when the session is
                 // busiest. Timed so it stops hiding in `other_ms`.
-                let stats_start = std::time::Instant::now();
+                let stats_start = watch.start();
                 let relay_now = current_pair_is_relay(&pc, session_id, constrained).await;
-                stats_us += stats_start.elapsed().as_micros() as u64;
+                PassWatch::stop(stats_start, &mut stats_us);
                 if let Some(relay) = relay_now {
                     if relay != constrained {
                         constrained = relay;
@@ -7484,14 +7455,20 @@ async fn media_pump_ffmpeg_dc(
                             // encoder-only rebuild would stay capped by the
                             // old pacing), then force the encoder rebuild;
                             // its first frame is a key-flagged IDR so the
-                            // viewer resyncs cleanly.
+                            // viewer resyncs cleanly. FR-65 — timed: the
+                            // reopen as `recapture`, the drop (a thread join)
+                            // as `close`.
+                            let t = watch.start();
                             capturer = capture::open_default_async(
                                 target_fps,
                                 downscale,
                                 media_waiting_hook(session_id, control_dc.clone()),
                             )
                             .await;
+                            PassWatch::stop(t, &mut recapture_us);
+                            let t = watch.start();
                             encoder = None;
+                            PassWatch::stop(t, &mut close_us);
                             encoder_dims = None;
                             flip_rebuild_pending = true;
                             if let Some(state) = fps_state.as_mut() {
@@ -7545,9 +7522,9 @@ async fn media_pump_ffmpeg_dc(
                 // 2026-09-04. It retries every 500 ms until `rc:video-info` is
                 // delivered, so on a session whose control DC is slow to open
                 // it runs many times; timed for the same reason as the first.
-                let stats_start = std::time::Instant::now();
+                let stats_start = watch.start();
                 let reason = lan_capture_reason(&pc, constrained).await;
-                stats_us += stats_start.elapsed().as_micros() as u64;
+                PassWatch::stop(stats_start, &mut stats_us);
                 // FR-70 P1 — the cap in force and why, so the viewer can say
                 // "Native selected, capped at 1280×800: slow link" instead of
                 // a generic "relay-limited" whose advice (switch to Sharper)
@@ -7593,13 +7570,13 @@ async fn media_pump_ffmpeg_dc(
                 // FR-65 — the control-DC lock and send both await; the lock is
                 // shared with every other control-plane writer, and a congested
                 // DC makes the send slow. Timed together so neither hides.
-                let ctrl_start = std::time::Instant::now();
+                let ctrl_start = watch.start();
                 let cdc = control_dc.lock().await.clone();
                 let delivered = match cdc {
                     Some(cdc) => cdc.send_text(payload.clone()).await.is_ok(),
                     None => false,
                 };
-                ctrl_us += ctrl_start.elapsed().as_micros() as u64;
+                PassWatch::stop(ctrl_start, &mut ctrl_us);
                 if delivered {
                     video_info_sent = true;
                     // P5 — followers' badges mirror the owner's (their
@@ -7815,7 +7792,7 @@ async fn media_pump_ffmpeg_dc(
         // spends lands in `other_ms`. That is exactly the shape CORPLAP-2
         // produced on 2026-09-04 (662 ms and 782 ms passes with both at zero),
         // and it is why this whole block is timed rather than just its sleep.
-        let gate_start = std::time::Instant::now();
+        let gate_start = watch.start();
         if send_tx.capacity() == 0 || pipeline.followers_congested() || byte_gate {
             if byte_gate && !constrained && !direct_gate_logged {
                 direct_gate_logged = true;
@@ -7900,12 +7877,12 @@ async fn media_pump_ffmpeg_dc(
                 }
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
-            gate_us += gate_start.elapsed().as_micros() as u64;
+            PassWatch::stop(gate_start, &mut gate_us);
             continue;
         }
         // Not congested: the gate cost only its own predicate, but record it so
         // the accounting is complete on every pass, not only on the skips.
-        gate_us += gate_start.elapsed().as_micros() as u64;
+        PassWatch::stop(gate_start, &mut gate_us);
 
         // P5 (FR-1) — cadence pacing: when the HW encoder can't hold
         // target_fps, consume frames on an even grid at the sustainable
@@ -7932,9 +7909,9 @@ async fn media_pump_ffmpeg_dc(
                 // is the loop idling on purpose, exactly like a capture wait,
                 // and counting it as work would re-create the warning storm the
                 // capture rule removed.
-                let pace_start = std::time::Instant::now();
+                let pace_start = watch.start();
                 tokio::time::sleep(due - now).await;
-                pace_us += pace_start.elapsed().as_micros() as u64;
+                PassWatch::stop(pace_start, &mut pace_us);
             }
             pace_due = Some(std::time::Instant::now() + interval);
         } else {
@@ -8023,8 +8000,10 @@ async fn media_pump_ffmpeg_dc(
                     // left during the wait left its pump running, holding
                     // the screencast (GNOME's sharing indicator up) and the
                     // shared pipeline, which took each new viewer on as a
-                    // follower of a pump that sent nothing.
+                    // follower of a pump that sent nothing. FR-65 — `poll`.
+                    let t = watch.start();
                     tokio::task::yield_now().await;
+                    PassWatch::stop(t, &mut poll_us);
                     continue;
                 }
                 if last_capture_at.elapsed() >= IDLE_KEEPALIVE
@@ -8147,7 +8126,11 @@ async fn media_pump_ffmpeg_dc(
                     // only fires when there's no new frame), so it does NOT
                     // regress the rc.93 fps win. ~2 ms adds negligible
                     // frame-catch latency vs a 60 Hz (16 ms) source.
+                    // FR-65 — `poll`, and WORK: a 2 ms sleep that comes back
+                    // late is the runtime not scheduling this task.
+                    let t = watch.start();
                     tokio::time::sleep(Duration::from_millis(2)).await;
+                    PassWatch::stop(t, &mut poll_us);
                     continue;
                 }
             }
@@ -8164,6 +8147,8 @@ async fn media_pump_ffmpeg_dc(
                     match end_stopped_at_screen(session_id, &rc_sessions, Some(&pipeline)).await {}
                 }
                 tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: capture error — rebuilding capturer");
+                // FR-65 — the backoff and the reopen together: `recapture`.
+                let t = watch.start();
                 tokio::time::sleep(reopen_backoff.delay()).await;
                 capturer = capture::open_default_async(
                     target_fps,
@@ -8171,6 +8156,7 @@ async fn media_pump_ffmpeg_dc(
                     media_waiting_hook(session_id, control_dc.clone()),
                 )
                 .await;
+                PassWatch::stop(t, &mut recapture_us);
                 // FR-119 P2b-2 — an open applies its own gate; a granted rate
                 // above the session's base runs the granted one.
                 if fps_state.is_some() && target_fps > base_fps {
@@ -8436,7 +8422,11 @@ async fn media_pump_ffmpeg_dc(
                     governor.applied_bps(),
                     governor.open_seed_bps(),
                 );
-                if let Some(spec) = enc.rebuild_spec_at(to_dims.0, to_dims.1, to_fps, bps).await {
+                // FR-65 — a round trip to the encoder thread: `enc_cmd`.
+                let t = watch.start();
+                let spec = enc.rebuild_spec_at(to_dims.0, to_dims.1, to_fps, bps).await;
+                PassWatch::stop(t, &mut enc_cmd_us);
+                if let Some(spec) = spec {
                     if dims_move {
                         info!(
                             %session_id,
@@ -8773,7 +8763,12 @@ async fn media_pump_ffmpeg_dc(
                             "FR-70 M1: encoder handed to its own thread"
                         );
                     }
+                    // FR-65 — on an inline dims rebuild the OLD encoder is still
+                    // here, and this assignment drops it (a thread join):
+                    // `close`, outside the `open_ms` above.
+                    let t = watch.start();
                     encoder = Some(handle);
+                    PassWatch::stop(t, &mut close_us);
                     encoder_dims = Some((w, h));
                     // FR-119 P2b-2 — opened at the capture's pace.
                     encoder_fps = target_fps;
@@ -8824,10 +8819,14 @@ async fn media_pump_ffmpeg_dc(
         // clears. (Gate semantics: the edge is consumed even when no
         // encoder exists this iteration — pre-extraction behaviour.)
         let is_locked_now = matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked);
+        // FR-65 — each keyframe request below is a round trip to the encoder
+        // thread (FR-70 M1): `enc_cmd`.
         if kf_gate.lock_edge(is_locked_now)
             && let Some(enc) = encoder.as_mut()
         {
+            let t = watch.start();
             enc.request_keyframe().await;
+            PassWatch::stop(t, &mut enc_cmd_us);
             force_keyframe_this_iter = true;
         }
 
@@ -8840,7 +8839,9 @@ async fn media_pump_ffmpeg_dc(
         if (own_kf || shared_kf)
             && let Some(enc) = encoder.as_mut()
         {
+            let t = watch.start();
             enc.request_keyframe().await;
+            PassWatch::stop(t, &mut enc_cmd_us);
             force_keyframe_this_iter = true;
         }
 
@@ -8849,7 +8850,9 @@ async fn media_pump_ffmpeg_dc(
         if kf_gate.backstop_due(std::time::Instant::now())
             && let Some(enc) = encoder.as_mut()
         {
+            let t = watch.start();
             enc.request_keyframe().await;
+            PassWatch::stop(t, &mut enc_cmd_us);
             force_keyframe_this_iter = true;
             if kf_gate.take_backstop_log() {
                 info!(
@@ -8877,7 +8880,9 @@ async fn media_pump_ffmpeg_dc(
                 pending_ms,
                 "FFmpeg DC pump: encoder ignored forced keyframe — rebuilding to emit a guaranteed IDR (vp9_qsv-class runtime-force bug)"
             );
+            let t = watch.start();
             encoder = None;
+            PassWatch::stop(t, &mut close_us);
             encoder_dims = None;
         }
 
@@ -8916,14 +8921,17 @@ async fn media_pump_ffmpeg_dc(
                 // FR-79 — the gate's first condition: was the agent's own loop
                 // free this window? A pass that overran its budget means the
                 // send task waited on something this window cannot attribute
-                // to the pipe.
-                stalled_passes: pump_stalls.saturating_sub(win_stalls_last),
+                // to the pipe. FR-65 — against the monotonic total: the window
+                // count reset under this mark and hid the heartbeat pass's own
+                // stall (`encode::stall`, "The governor's stall count").
+                stalled_passes: u32::try_from(watch.stalls_total().saturating_sub(win_stalls_last))
+                    .unwrap_or(u32::MAX),
                 // FR-119 P2b-8 — the opening is not evidence about the pipe:
                 // the first keyframe meeting a transport still ramping. A
                 // window any pass of which was in the opening is rejected.
                 opening: !opener_grace_done,
             });
-            win_stalls_last = pump_stalls;
+            win_stalls_last = watch.stalls_total();
             win_sent_last = sent_now;
             win_skips_last = frames_skipped_backpressure;
             win_sw_sum_last = sw_sum_now;
@@ -9487,7 +9495,12 @@ async fn media_pump_ffmpeg_dc(
         // emit zero packets for some inputs (buffered B-frame
         // equivalents); we set max_b_frames=0 so this is rare but
         // possible at GOP boundaries.
+        // FR-65 — `dc_lock`: the send task holds this mutex for a frame's
+        // whole chunked send (its `if let` scrutinee keeps the guard alive
+        // through the body), so this waits out the previous frame's send.
+        let t = watch.start();
         let dc_arc = video_bytes_dc.lock().await.clone();
+        PassWatch::stop(t, &mut dc_lock_us);
         let Some(dc) = dc_arc else {
             // rc.97 — DC not open yet (offer/answer/ICE/SCTP still setting
             // up). Force a keyframe so that whenever the DC *does* open, the
@@ -9615,6 +9628,9 @@ async fn media_pump_ffmpeg_dc(
         // counter. `_avg_*` are over frames encoded since the last
         // heartbeat.
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            // FR-65 — the heartbeat itself is a phase: it waits on the video-DC
+            // mutex, round-trips the encoder thread and formats a long line.
+            let hb_t = watch.start();
             last_heartbeat = std::time::Instant::now();
             // rc.106 — these three are owned by the send task now; snapshot
             // them for the log line.
@@ -9859,8 +9875,8 @@ async fn media_pump_ffmpeg_dc(
                 apply_ms_max = apply_us_max as f64 / 1000.0,
                 open_ms = open_us as f64 / 1000.0,
                 open_ms_max = open_us_max as f64 / 1000.0,
-                iter_ms_max = iter_us_max as f64 / 1000.0,
-                pump_stalls,
+                iter_ms_max = watch.window_iter_us_max() as f64 / 1000.0,
+                pump_stalls = watch.window_stalls(),
                 // FR-63 B1 — the ONE delay-based controller, in SHADOW: what it
                 // WOULD target beside what the governor applied, so a week of
                 // these across the fleet answers the flip criterion (AC2)
@@ -9878,6 +9894,15 @@ async fn media_pump_ffmpeg_dc(
                 shadow_reason = governor.shadow_reason(),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
+            // Stopped BEFORE the snapshot below, so the rebase carries it.
+            PassWatch::stop(hb_t, &mut heartbeat_us);
+            // FR-65 — the pass now open was marked against counters this block
+            // zeroes. Without the rebase its close reads `0 − mark` = 0 for
+            // each, and every pass longer than this interval — which always
+            // holds a heartbeat — lost its capture, encode and open to `other`
+            // (84 of 339 STALL lines in the 2026-10-30 census; see
+            // `encode::stall`, "A window reset inside a pass").
+            let before = watch.enabled().then_some(phase_accum!());
             heartbeat_frames_base = frames_encoded;
             capture_us = 0;
             scale_us = 0;
@@ -9890,8 +9915,10 @@ async fn media_pump_ffmpeg_dc(
             apply_us_max = 0;
             open_us = 0;
             open_us_max = 0;
-            iter_us_max = 0;
-            pump_stalls = 0;
+            watch.reset_window();
+            if let Some(before) = before {
+                watch.rebase(before, phase_accum!());
+            }
             qp_sum = 0;
             qp_max = 0;
             qp_n = 0;
