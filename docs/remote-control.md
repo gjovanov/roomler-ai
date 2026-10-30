@@ -866,6 +866,27 @@ flowchart TB
   keeps its D3D11 device when the device is alive and still on the primary
   output's adapter, so the encoder does not reopen and send a keyframe each
   time. A capture that does come back on a new device moves the encoder to it.
+
+On a 2880×1800 panel the readback is what caps the frame rate. Measured on a
+laptop whose Intel GPU drives the panel and runs QSV:
+
+| Measured: `av1_qsv` 2880×1800, 60 fps asked, a moving test pattern (FR-118 AC4) | Switch off | Switch on |
+|---|---|---|
+| encoded fps: median (highest) | 37.6–38.6 (42.8) | 60.0 (60.3) |
+| windows at ≥ 50 fps | 0 of 564 | 594 of 596 |
+| capture | 8.14–8.16 ms | 0.26 ms |
+| readback (inside capture on this arm) | 7.91–7.92 ms | 0 |
+| encode | 17.23–17.74 ms | 16.34 ms |
+| **capture + encode** | **25.12–25.88 ms** | **16.61 ms** |
+| worker CPU per encoded frame | 15.93 ms (58 % of a core) | 3.88 ms (23 %) |
+
+- **The frame rate reaches its target.** With the switch off, the 7.9 ms
+  readback sits in series with a 17 ms encode stage, so the host stops near
+  40 fps. With it on, a frame fits the 16.7 ms period at 60 fps.
+- **QSV's encode is the next bound.** `send_frame` takes about 16 ms a frame
+  on both paths, so removing copies cannot take this host far above 60 fps
+  ([FR-118 §9.10](fr/FR-118-gpu-resident-frames.md#910-ac4-the-slow-laptop-at-60-fps-2026-10-30)).
+
 WGC's GPU path, measured on a hybrid laptop whose panel is on the iGPU (WGC's
 device on the RTX 5090, the OS copying each frame across):
 
