@@ -43,7 +43,7 @@ opens. An encoder then opens the GPU form only for a cell the probe's `gpu` chil
 ### 2.3 The server cannot turn a cell off
 
 `DesiredConfig`, what remote config pushes, carries two keys of this family, `encoder_cells_deny` and `fps_deny`
-(`crates/remote_control/src/models.rs:2887-2901`), and the agent's `apply` handles exactly those two
+(`crates/remote_control/src/models.rs:2967-2981`), and the agent's `apply` handles exactly those two
 (`agents/roomlerd/src/remote_config.rs:308-332`). Neither `zero_copy` nor `zero_copy_deny` is there. Today that
 costs nothing, because the switch is off everywhere. With a default on, a cell that misbehaves on one driver could
 be turned off only one host at a time, over exec, and only on hosts that answer exec.

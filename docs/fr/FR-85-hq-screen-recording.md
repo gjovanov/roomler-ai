@@ -153,10 +153,10 @@ what it costs in installer size and ships with integration and e2e tests.
   default and remembered; the list (name, date, duration, size, origin, pending delivery) with Play, Edit, Show in
   folder and Delete; settings for the folder, "Allow remote recording" and "Include computer audio in remote
   recordings". The tray gets Start/Stop and a red REC dot.
-- LocalAPI verbs (`crates/localapi/src/lib.rs:1026`, the exhaustive `handle()` and `serve_connection`): `RecordStart`,
+- LocalAPI verbs (`crates/localapi/src/lib.rs:1049`, the exhaustive `handle()` and `serve_connection`): `RecordStart`,
   `RecordStop`, `RecordStatus`, `RecordingsList`, `RecordingDelete`.
   ⚠️ **They need a peer check the pipe does not have.** The pipe's DACL admits every Interactive User, RDP sessions
-  included (`lib.rs:1680`), and there is no peer-credential check, so a guest in an RDP session could start a local
+  included (`lib.rs:1703`), and there is no peer-credential check, so a guest in an RDP session could start a local
   recording of the console user's desktop. The new verbs, and `ConfigSet` of any `record_*` key, require
   `GetNamedPipeClientProcessId` → `ProcessIdToSessionId` to equal the worker's session (`SO_PEERCRED` on unix).
 - CLI: `roomler record start | stop | status | ls`.
@@ -198,7 +198,7 @@ Each refusal carries a named reason on the wire and in the UI.
    RECORD never reaches one.
 3. **Device gate.** `record_remote_enabled` and `record_remote_audio`, both default **OFF**, device-owned and
    **structurally absent from `DesiredConfig`** — a `record_` twin of `no_relay_key_is_server_pushable_via_desired_config`
-   (`crates/remote_control/src/models.rs:5256`). Capabilities are read once at hello, so ON takes effect at the next
+   (`crates/remote_control/src/models.rs:5367`). Capabilities are read once at hello, so ON takes effect at the next
    connect; **OFF is immediate** — new starts are refused and a running remote recording stops.
 4. **A `record` DataChannel**, attached only when the grant holds RECORD — the same attach-time gate as `files` and
    `input`. The control channel carries no permission context, so it cannot host this. Messages:

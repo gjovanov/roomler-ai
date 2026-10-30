@@ -47,7 +47,7 @@ Turn two overlay properties from **promises into properties**:
 
 - **The decoder pin.** No test feeds a P5d netmap *containing* `cidrs` into a pre-P5d
   decoder. `a_pre_p5d_netmap_still_decodes_and_carries_no_block_list`
-  (`crates/remote_control/src/signaling.rs:11194`) only tests old-server → new-decoder.
+  (`crates/remote_control/src/signaling.rs:11229`) only tests old-server → new-decoder.
   Copy `agent-v0.4.42`'s `OverlayNetworkInfo` verbatim as a local struct and decode a real
   grown-org netmap into it.
 - **Cross-tenant carve racing a grow.** `allocate`'s `DuplicateKey` arm
@@ -121,7 +121,7 @@ inside a live one) belongs to FR-47's reconciler, not here.
 There is **no counter** for route evictions or carrier revalidations. Both are log-only,
 throttled to **1 WARN/min/prefix** carrying `suppressed_since_last` — a naive `grep -c`
 under-reports by up to 40×. Three cumulative counters, following the canonical path
-`crates/tunnel-core/src/evidence.rs:36-37` → `crates/localapi/src/lib.rs:250` →
+`crates/tunnel-core/src/evidence.rs:36-37` → `crates/localapi/src/lib.rs:273` →
 `agents/roomler-cli/src/localclient.rs:1400-1406`:
 
 `ROUTE_EVICTIONS` (split `sibling` / `foreign`) · `ROUTE_WAVES` · `FORCED_REVALIDATIONS`
