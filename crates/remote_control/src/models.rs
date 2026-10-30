@@ -2122,6 +2122,76 @@ pub struct KeepBusyBrief {
     pub set_by: Option<String>,
 }
 
+/// FR-55 P4 — the device's power posture, as its keeper holds it: the
+/// standing `power_policy`, the power source, and whether the keeper is
+/// holding the machine awake right now. Reported on every heartbeat, and
+/// carried by the suspend announcement (`rc:agent.sleeping`).
+///
+/// A CLAIM by the device, like [`KeepBusyBrief`]: shown, never enforced on.
+/// `policy` is a string for the same additive-wire reason: a policy a newer
+/// agent knows must reach an older dashboard as a word it can print.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PowerBrief {
+    /// `never` · `on-ac` · `always`, as the keeper parsed `power_policy`. A
+    /// typo the keeper read as `never` therefore reads `never` here too.
+    pub policy: String,
+    /// `Some(true)` on mains, `Some(false)` on battery, `None` when the
+    /// device cannot tell. Three-valued for the keeper's own reason
+    /// (`agents/roomlerd/src/power.rs` `Inputs::on_ac`): "on battery" and
+    /// "unknown" must not collapse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_ac: Option<bool>,
+    /// The keeper holds a stay-awake request right now (an IOKit assertion,
+    /// a Windows power request, a logind block inhibitor), for the policy or
+    /// for a live session.
+    pub held: bool,
+}
+
+impl PowerBrief {
+    /// The OS was free to sleep the device: the keeper held nothing. That is
+    /// what "asleep by policy" means. A device that went to sleep with the
+    /// hold in place was put to sleep past it: a closed lid, a person, or the
+    /// OS overruling the hold (FR-55's AC-power finding, 2026-09-24).
+    pub fn by_policy(&self) -> bool {
+        !self.held
+    }
+}
+
+/// FR-55 P4 — the device announced it was going to sleep: when, and its
+/// power posture at that moment. Written on the [`Agent`] row only by the
+/// connection that wrote the row's hello, and removed by the next hello, so
+/// it is the device's LAST word for exactly as long as nothing newer was
+/// heard.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SleepNotice {
+    pub at: DateTime,
+    pub power: PowerBrief,
+}
+
+/// FR-55 P4 — a [`SleepNotice`] as the device lists show it, on a device
+/// that is not online: since when it has been asleep, and its posture when
+/// it went. RFC 3339, like every other time on a device row.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SleepView {
+    pub since: String,
+    pub power: PowerBrief,
+}
+
+impl SleepView {
+    /// The view of a row's notice, for a device whose presence is not
+    /// `online`. A device that is online again is not asleep, whatever its
+    /// row still says, so the caller passes its own presence verdict.
+    pub fn of(notice: Option<&SleepNotice>, online: bool) -> Option<Self> {
+        if online {
+            return None;
+        }
+        notice.map(|n| SleepView {
+            since: n.at.try_to_rfc3339_string().unwrap_or_default(),
+            power: n.power.clone(),
+        })
+    }
+}
+
 /// FR-92 P8 — the keep-busy patterns, by their exact wire names, as the
 /// agent spells them (`agents/roomlerd/src/keep_busy/patterns.rs`
 /// `Pattern::wire`) and the viewer lists them
@@ -2322,6 +2392,16 @@ pub struct Agent {
     /// speak for the GUI worker that runs it. So "unknown", never "off".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_busy: Option<KeepBusyBrief>,
+    /// FR-55 P4 — the device's power posture as its last heartbeat reported
+    /// it. `None` = it does not say (an agent that predates P4), so
+    /// "unknown", never "never".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<PowerBrief>,
+    /// FR-55 P4 — the device announced it was going to sleep and has not
+    /// said hello since. Read only through [`SleepView::of`], which drops it
+    /// for a device that is online again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<SleepNotice>,
     /// P6 — OpenSSH public half of the device's SSH host key, as reported on
     /// its last hello. Published so a caller can verify what it dialled
     /// instead of trusting it on first use.
@@ -3454,6 +3534,13 @@ pub struct VisibleDeviceRow {
     /// device dial it right now? `false` for a device with no overlay node.
     #[serde(default)]
     pub reachable: bool,
+    /// FR-55 P4 — the device is not online because it announced a sleep, at
+    /// this RFC 3339 time. Presence-class, like `last_seen_at`: the moment
+    /// and the fact only. Its power posture stays on the admin listing,
+    /// because a device's `power_policy` is a setting, and a peer sees the
+    /// netmap's view, never the fleet record (the note above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asleep_since: Option<String>,
     /// FR-51 — enrolled as temporary. Serialised only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
@@ -3512,9 +3599,33 @@ mod visible_device_tests {
             magic_dns_fqdn: None,
             tags: vec!["prod".into()],
             reachable: true,
+            asleep_since: None,
             ephemeral: false,
             is_self: false,
         }
+    }
+
+    /// FR-55 P4 — a peer learns THAT a device is asleep and since when, the
+    /// presence-class fact, and never its power posture: `power_policy` is a
+    /// device setting, and settings are the fleet record.
+    #[test]
+    fn a_visible_row_says_asleep_but_never_the_power_policy() {
+        let mut r = row();
+        r.presence = "offline".into();
+        r.is_online = false;
+        r.asleep_since = Some("2026-10-30T12:00:00Z".into());
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["asleep_since"], "2026-10-30T12:00:00Z");
+        for forbidden in ["power", "policy", "held", "on_ac", "sleep"] {
+            assert!(v.get(forbidden).is_none(), "{forbidden} leaked: {v}");
+        }
+        // Absent on a device that gave no such reason.
+        assert!(
+            serde_json::to_value(row())
+                .unwrap()
+                .get("asleep_since")
+                .is_none()
+        );
     }
 
     /// The fleet-record fields a device must never see have no slot on the
@@ -10318,5 +10429,45 @@ pub fn should_redeliver(
     match request.delivered_at {
         None => true,
         Some(at) => (now.timestamp_millis() - at.timestamp_millis()) / 1000 >= REDELIVER_AFTER_SECS,
+    }
+}
+
+#[cfg(test)]
+mod power_brief_tests {
+    use super::*;
+
+    fn notice(held: bool) -> SleepNotice {
+        SleepNotice {
+            at: DateTime::from_millis(1_793_000_000_000),
+            power: PowerBrief {
+                policy: "never".into(),
+                on_ac: Some(false),
+                held,
+            },
+        }
+    }
+
+    /// FR-55 P4 — a device that is online again is not asleep, whatever its
+    /// row still says: the hello clears the notice, but a read that lands
+    /// between the reconnect and that write must not show a stale "asleep".
+    #[test]
+    fn a_sleep_notice_shows_only_on_a_device_that_is_not_online() {
+        let n = notice(false);
+        assert_eq!(SleepView::of(Some(&n), true), None);
+        let shown = SleepView::of(Some(&n), false).expect("offline and announced");
+        assert!(shown.since.starts_with("2026-10-26T07:33:20"), "{shown:?}");
+        assert_eq!(shown.power, n.power);
+        assert_eq!(SleepView::of(None, false), None, "no notice, no reason");
+    }
+
+    /// FR-55 P4 — the row field is optional both ways: a pre-P4 row has
+    /// neither field, and a row with them round-trips.
+    #[test]
+    fn the_row_fields_are_optional_and_round_trip() {
+        let n = notice(true);
+        let b = bson::to_document(&n).expect("bson");
+        let back: SleepNotice = bson::from_document(b).expect("decode");
+        assert_eq!(back, n);
+        assert!(!back.power.by_policy(), "held: it slept past the hold");
     }
 }

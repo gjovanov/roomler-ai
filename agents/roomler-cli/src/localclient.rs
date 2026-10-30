@@ -1593,9 +1593,28 @@ pub async fn config_set(key: &str, value: Option<&str>) -> Result<()> {
     } else {
         println!("in effect now — no restart needed");
     }
+    // FR-55 AC6 — on a Mac, the one thing a person setting the power policy
+    // must not miss: a closed lid sleeps it anyway. In the daemon's own words
+    // (its description), so the warning has one source.
+    if let Some(note) = config_set_note(&entry.key, &entry.description, cfg!(target_os = "macos")) {
+        println!("{note}");
+    }
     // #2871 — and WHICH daemon's file just changed, when this host runs two.
     print_other_daemon_hint(CONFIG_IS_THE_PER_USER_HALFS).await;
     Ok(())
+}
+
+/// FR-55 AC6 — what `config set` adds for a key the platform overrides: the
+/// description's ⚠️ sentence, for `power_policy` on a Mac (clamshell sleep
+/// ignores it). `None` everywhere else, and for a daemon whose description
+/// carries no such sentence.
+pub(crate) fn config_set_note<'a>(key: &str, description: &'a str, macos: bool) -> Option<&'a str> {
+    if key != "power_policy" || !macos {
+        return None;
+    }
+    let rest = &description[description.find("⚠️")?..];
+    let end = rest.find(". ").map_or(rest.len(), |i| i + 1);
+    Some(&rest[..end])
 }
 
 /// How long `roomler restart` waits for the relaunched daemon to answer.
@@ -2414,6 +2433,32 @@ fn dark_orgs_line(dark: &[&str], from: Option<&tunnel_core::localapi::NetworkOri
     }
 }
 
+/// FR-55 P4 — `roomler status`'s power line: the standing policy, the power
+/// source, and whether the keeper holds the machine awake right now. A device
+/// that sleeps while nothing is held slept as its policy let it, and the
+/// device lists read it "asleep"; one that is held sleeps only past the hold
+/// (a closed lid, a person, the OS), and the lists say that too.
+pub(crate) fn power_line(p: &localapi::PowerStatus, macos: bool) -> String {
+    let source = match p.on_ac {
+        Some(true) => ", on mains",
+        Some(false) => ", on battery",
+        None => "",
+    };
+    let state = match (p.held, p.policy.as_str()) {
+        // `never` holds only for a live session (P1).
+        (true, "never") => "held awake for a live session",
+        (true, _) => "held awake",
+        (false, _) => "free to sleep (a sleep reads \"asleep\" in the device lists)",
+    };
+    // FR-55 AC6 — the one hold a Mac ignores.
+    let lid = if p.held && macos {
+        "; a closed lid still sleeps a Mac with no external display"
+    } else {
+        ""
+    };
+    format!("policy {}{source} — {state}{lid}", p.policy)
+}
+
 fn print_status(s: &NodeStatus) {
     let mode = mode_label(s.mode, s.privileged);
     println!("{} {}", up_glyph(s.connected), s.name);
@@ -2459,6 +2504,11 @@ fn print_status(s: &NodeStatus) {
         .and_then(|o| o.token_expires_at)
     {
         println!("  credential  {}", credential_expiry(exp, unix_now()));
+    }
+    // FR-55 P4 — what this device reads as when it sleeps. Printed only when
+    // the daemon reports it, so an older daemon's output is unchanged.
+    if let Some(p) = &s.power {
+        println!("  power       {}", power_line(p, cfg!(target_os = "macos")));
     }
     print_orgs(&s.orgs, lent);
     // P5/S4 — exit-node routing (only when this node is configured as a client).
@@ -3057,9 +3107,13 @@ fn peer_for_row<'a>(r: &localapi::DeviceRowLite, peers: &'a [PeerInfo]) -> Optio
 
 /// One `devices` table row — pure, so the column rules are unit-tested.
 fn fmt_device_row(r: &localapi::DeviceRowLite, peer: Option<&PeerInfo>, name_w: usize) -> String {
+    // FR-55 P4 — offline because it said it was going to sleep: STATUS says
+    // `asleep`, and only a device that is not online again can be.
+    let asleep = r.asleep_since.is_some() && r.presence != "online";
     let glyph = match r.presence.as_str() {
         "online" => '●',
         "stale" => '◐',
+        _ if asleep => '◌',
         _ => '○',
     };
     let mut name = device_name(r);
@@ -3102,11 +3156,16 @@ fn fmt_device_row(r: &localapi::DeviceRowLite, peer: Option<&PeerInfo>, name_w: 
             s.to_string()
         }
     };
+    let status = if asleep {
+        "asleep".to_string()
+    } else {
+        or_dash(&r.presence)
+    };
     format!(
         "{glyph} {name:<name_w$} {:<8} {:<9} {:<8} {:<15} {:<30} {conn}",
         or_dash(&r.os),
         or_dash(&r.version),
-        or_dash(&r.presence),
+        status,
         opt(r.overlay_ip.as_deref()),
         dns,
     )
@@ -4295,6 +4354,87 @@ mod devices_tests {
         let mut me = row("me");
         me.is_self = true;
         assert!(fmt_device_row(&me, None, 20).ends_with("self"));
+    }
+
+    /// FR-55 P4 — STATUS reads `asleep` for a device that is offline because
+    /// it said it was going to sleep, and `offline` for one that just went.
+    /// One that is online again is online, whatever its row still says.
+    #[test]
+    fn a_device_that_announced_its_sleep_reads_asleep_not_offline() {
+        let mut r = row("kilo");
+        r.presence = "offline".into();
+        r.is_online = false;
+        let gone = fmt_device_row(&r, None, 12);
+        assert!(
+            gone.starts_with('○') && gone.contains(" offline "),
+            "{gone}"
+        );
+
+        r.asleep_since = Some("2026-10-30T12:00:00Z".into());
+        let asleep = fmt_device_row(&r, None, 12);
+        assert!(
+            asleep.starts_with('◌') && asleep.contains(" asleep "),
+            "{asleep}"
+        );
+        assert!(!asleep.contains("offline"), "{asleep}");
+
+        r.presence = "online".into();
+        r.is_online = true;
+        let back = fmt_device_row(&r, None, 12);
+        assert!(back.starts_with('●') && back.contains(" online "), "{back}");
+    }
+
+    /// FR-55 P4 — `roomler status` says what this device reads as when it
+    /// sleeps. AC6 — on a Mac, a held device is told that a closed lid
+    /// sleeps it anyway.
+    #[test]
+    fn the_power_line_says_whether_a_sleep_would_be_by_policy() {
+        let mut p = localapi::PowerStatus {
+            policy: "never".into(),
+            on_ac: None,
+            held: false,
+        };
+        assert_eq!(
+            power_line(&p, false),
+            "policy never — free to sleep (a sleep reads \"asleep\" in the device lists)"
+        );
+        p.held = true;
+        assert_eq!(
+            power_line(&p, false),
+            "policy never — held awake for a live session"
+        );
+        p.policy = "on-ac".into();
+        p.on_ac = Some(true);
+        assert_eq!(power_line(&p, false), "policy on-ac, on mains — held awake");
+        assert_eq!(
+            power_line(&p, true),
+            "policy on-ac, on mains — held awake; a closed lid still sleeps a Mac with no external display"
+        );
+        p.on_ac = Some(false);
+        p.held = false;
+        assert!(power_line(&p, true).starts_with("policy on-ac, on battery — free to sleep"));
+    }
+
+    /// FR-55 AC6 — `config set power_policy` on a Mac prints the daemon's own
+    /// ⚠️ sentence about clamshell sleep, and nothing on any other OS or for
+    /// any other key.
+    #[test]
+    fn setting_the_power_policy_on_a_mac_names_the_clamshell_limit() {
+        let desc = "Ask the OS to stay awake (FR-55). ⚠️ macOS clamshell sleep (lid closed, \
+                    no external display) ignores it — an OS limit, not a setting. Default: never.";
+        assert_eq!(
+            config_set_note("power_policy", desc, true),
+            Some(
+                "⚠️ macOS clamshell sleep (lid closed, no external display) ignores it — an OS \
+                 limit, not a setting."
+            )
+        );
+        assert_eq!(config_set_note("power_policy", desc, false), None);
+        assert_eq!(config_set_note("exec_enabled", desc, true), None);
+        assert_eq!(
+            config_set_note("power_policy", "no warning here.", true),
+            None
+        );
     }
 
     /// A single-org daemon stamps no org on its peers — those are the

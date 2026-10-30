@@ -247,7 +247,7 @@ key, recording nothing (`pushed_tribool`,
 `crates/modules/fleet/src/remote_config.rs:155`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
-(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3005`), and a test
+(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3085`), and a test
 holds it to what `roomler config set` reads. A word that reaches a device anyway,
 from some other server, leaves its key as it is, logged, and never fails the
 keys beside it (`agents/roomlerd/src/remote_config.rs:340`).
@@ -459,7 +459,7 @@ which the daemon still refuses on the same terms as a local request.
    that `roomler exec` and `roomler ssh` talk to — measured on 0.4.169, the
    worker's file read `ssh_enabled = false` while the root half served SSH.
    The root daemon's socket is root-only and its person socket refuses every
-   config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3057`), so
+   config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3080`), so
    gate 4 on that daemon is an administrator's: `sudo roomler config set
    exec_enabled true`. The pane now says which file it edits and gives that
    command (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:828`;

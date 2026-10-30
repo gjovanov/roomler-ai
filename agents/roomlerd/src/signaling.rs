@@ -996,6 +996,15 @@ pub async fn run(
             info!("shutdown signalled; exiting signaling loop");
             return Ok(());
         }
+        // FR-55 P4 — after a goodbye before a sleep, no dial until the wake:
+        // one inside the window the OS gave the device to go to sleep would
+        // say hello again and erase the notice. Returns at once while awake.
+        tokio::select! {
+            _ = crate::sleep_notice::hold_while_asleep() => {},
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { return Ok(()); }
+            },
+        }
 
         // #2221 — how long this attempt runs decides whether its drop
         // restarts the ladder (see `ladder_after_drop`).
@@ -1705,6 +1714,11 @@ async fn connect_once(
     // immediately after upgrade.
     watchdog::tick(ctx.pump);
     info!("rc:agent.hello sent");
+    // FR-55 P4 — this connection says goodbye when the computer is going to
+    // sleep. After the hello, because the server keys the notice by the
+    // hello's connection; one that comes up inside an announced sleep is told
+    // at once (`sleep_notice::register_control`).
+    let (_sleep_goodbye, mut goodbye_rx) = crate::sleep_notice::register_control();
     // A5 — if this connect ended a ≥1 h outage, the fleet may have shipped a
     // fix (or a forced update push) we never saw; check now, not in ≤4 h.
     ctx.note_ws_up_and_maybe_recheck_update();
@@ -2006,6 +2020,32 @@ async fn connect_once(
                     let _ = send_frame(&mut ws, Message::Close(None)).await;
                     return Ok(());
                 }
+            }
+            // FR-55 P4 — the computer is going to sleep, and its viewers have
+            // been told (P5h runs first). The goodbye goes out, the hook hears
+            // it went, and then this connection closes like one the server
+            // closed: every peer closed, never just dropped, or its UDP
+            // sockets outlive it. `run` holds the next dial until the wake.
+            Some(goodbye) = goodbye_rx.recv() => {
+                let _stage = watchdog::enter(ctx.pump, "sleep");
+                let crate::sleep_notice::Goodbye { power, sent } = goodbye;
+                info!(
+                    policy = %power.policy,
+                    on_ac = ?power.on_ac,
+                    held = power.held,
+                    "the computer is going to sleep: saying goodbye to the server (FR-55 P4)"
+                );
+                match send_msg(&mut ws, &ClientMsg::AgentSleeping { power }).await {
+                    Ok(()) => {
+                        let _ = sent.send(());
+                    }
+                    Err(e) => warn!(%e, "the sleep goodbye did not go out (FR-55 P4)"),
+                }
+                close_all_peers(&mut peers, &indicator).await;
+                close_all_tunnel_peers(&mut tunnel_peers).await;
+                park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
+                let _ = send_frame(&mut ws, Message::Close(None)).await;
+                return Ok(());
             }
             _ = keepalive.tick() => {
                 let _stage = watchdog::enter(ctx.pump, "keepalive");
@@ -2379,6 +2419,8 @@ async fn connect_once(
                     caps,
                     // FR-92 P5b — where keep busy runs, for the device list.
                     keep_busy: crate::keep_busy::brief(),
+                    // FR-55 P4 — the power keeper's posture, for the same.
+                    power: crate::power::brief(),
                 };
                 watchdog::stage(ctx.pump, "heartbeat.send");
                 if let Err(e) = send_msg(&mut ws, &hb).await {

@@ -686,6 +686,8 @@ impl LocalApiState for DaemonState {
             // lends a Mac's per-user half the root half's and says so.
             network_from: None,
             connected: self.connected.load(Ordering::Relaxed),
+            // FR-55 P4 — what the power keeper holds right now.
+            power: crate::power::local_status(),
             // FR-51 P4 — the primary enrollment's nature, stamped at startup.
             ephemeral: self.ephemeral,
             // P5/S4 — exit-node routing status the overlay runtime published.

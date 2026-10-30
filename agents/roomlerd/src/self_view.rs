@@ -771,6 +771,7 @@ pub(crate) fn device_row_from_server(row: VisibleDeviceRow) -> DeviceRowLite {
         magic_dns_fqdn,
         tags,
         reachable,
+        asleep_since,
         ephemeral,
         is_self,
     } = row;
@@ -790,6 +791,7 @@ pub(crate) fn device_row_from_server(row: VisibleDeviceRow) -> DeviceRowLite {
         magic_dns_fqdn,
         tags,
         reachable,
+        asleep_since,
         ephemeral,
         is_self,
     }
@@ -828,6 +830,7 @@ mod tests {
             magic_dns_fqdn: Some("bravo-box.acme.roomler.net".into()),
             tags: vec!["lab".into(), "prod".into()],
             reachable: true,
+            asleep_since: Some("2026-10-30T12:00:00Z".into()),
             ephemeral: true,
             is_self: true,
         }
@@ -859,6 +862,7 @@ mod tests {
                 magic_dns_fqdn: Some("bravo-box.acme.roomler.net".into()),
                 tags: vec!["lab".into(), "prod".into()],
                 reachable: true,
+                asleep_since: Some("2026-10-30T12:00:00Z".into()),
                 ephemeral: true,
                 is_self: true,
             }

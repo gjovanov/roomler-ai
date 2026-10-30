@@ -399,7 +399,7 @@ the silent participants' audio packet rate returns to 50/s. A measurement whose 
 | `Some([])` read as `None` | `apply_view`, consume | the two-state type, a unit test for each, the CLAUDE.md invariant |
 | the viewer's pause shown as the owner's | P3b's gated pipes make B's consumers `producer_paused` | `producer_paused` read from the origin index only; AC2 across routers |
 | a key-frame storm on a speaker change | one producer, 49 PLIs | the worker's pending-request dedupe; `key_frame_request_delay` as the knob |
-| a join at N = 50 takes seconds | 98 serialised `media:consume` round trips (`conference.ts:392-394`, one `waitForMessage` per type, `ui/src/stores/ws.ts:381`) | measured in P4; a batched `media:consume_many` is the follow-up if it matters |
+| a join at N = 50 takes seconds | 98 serialised `media:consume` round trips (`conference.ts:392-394`, one `waitForMessage` per type, `ui/src/stores/ws.ts:389`) | measured in P4; a batched `media:consume_many` is the follow-up if it matters |
 | the 16-tile grid becomes a 49-tile grid | a viewer's "max tiles" | `view_max`; the budget table assumes 16 |
 | Safari and simulcast | SDP-level simulcast on Safari | a P2 field row on a Mac before P2 closes |
 | 4 workers on 2 CPUs | P3 spreads work the pod cannot run | the CFS-throttling reading in P4; decision 4 |

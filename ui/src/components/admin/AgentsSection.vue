@@ -1480,6 +1480,7 @@ import {
   type TunnelEnrollmentToken,
 } from '@/stores/tunnelClients'
 import { useDeviceStore, type DeviceRow } from '@/stores/devices'
+import { presenceColor, presenceIcon, presenceLabel, presenceTitle } from '@/utils/devicePresence'
 import { useAuthStore } from '@/stores/auth'
 import { useGridColumns } from '@/composables/useGridColumns'
 import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
@@ -1726,32 +1727,22 @@ const pageRangeText = computed(() => {
 })
 
 // Row-level presence rendering (DeviceRow carries presence directly).
+// FR-55 P4 — and why an offline agent is offline, when it said it was going
+// to sleep (`utils/devicePresence.ts`).
 function rowPresenceColor(r: DeviceRow): string {
-  return r.presence === 'online' ? 'success' : r.presence === 'stale' ? 'warning' : 'grey'
+  return presenceColor(r)
 }
 function rowPresenceIcon(r: DeviceRow): string {
-  return r.presence === 'online'
-    ? 'mdi-circle'
-    : r.presence === 'stale'
-      ? 'mdi-circle-half-full'
-      : 'mdi-circle-outline'
+  return presenceIcon(r)
 }
 function rowPresenceTitle(r: DeviceRow): string {
-  if (r.kind === 'tunnel_client')
-    return r.is_online ? 'Online (stored status)' : 'Offline (stored status)'
-  return r.presence === 'online'
-    ? 'Online — a control socket is registered'
-    : r.presence === 'stale'
-      ? 'Stale — heartbeat fresh but no socket registered (a half-open network leg or a ' +
-        'recent server roll). It should heal within minutes; otherwise restart the Roomler ' +
-        'service on the machine.'
-      : 'Offline'
+  return presenceTitle(r, fmtDate)
 }
 function rowStatusColor(r: DeviceRow): string {
   return rowPresenceColor(r)
 }
 function rowStatusLabel(r: DeviceRow): string {
-  return r.presence
+  return presenceLabel(r)
 }
 
 // ── Edit name & tags ─────────────────────────────────────────────
