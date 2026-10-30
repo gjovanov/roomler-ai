@@ -161,7 +161,9 @@ is listed, under `enforce` exactly the peers the netmap would ship. A device
 without a live overlay node lists itself alone (`overlay: "no_node"`; `"no_network"`
 when the org has no mesh yet, `"unavailable"` without the network module), and the
 GET never creates a network row. Rows carry `display_name`, `name`, `os`, `version`,
-`presence`, `overlay_ip`, MagicDNS, `tags`, `reachable` and `is_self` — never
+`presence`, `overlay_ip`, MagicDNS, `tags`, `reachable`, `is_self` and, on a device
+that is not online because it announced a sleep, `asleep_since` (FR-55 P4: the fact
+and the moment, never its power policy, [power.md](power.md) §3.4) — never
 `machine_id`, owner ids, keys, consent settings or codecs; those fields are blanked
 before the search runs, so `q` cannot probe them.
 
@@ -296,7 +298,8 @@ agent's session can change it.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `…/agent` | List enrolled devices (status, caps, overlay info) |
+| GET | `…/agent` | List enrolled devices (status, caps, overlay info). FR-55 P4: `power {policy, on_ac?, held}`, the posture the device last reported (absent from an agent that predates it: unknown, never `never`), and, on a device that is not online, `sleep {since, power}` when it announced a sleep ([power.md](power.md) §3) |
+| GET | `…/device` | The unified devices grid (agents and tunnel clients), searched, sorted and paged on the server. FR-55 P4: an agent that is not online and announced a sleep carries `sleep {since, power}`, which the dashboard reads as **asleep** ([power.md](power.md) §3.4) |
 | POST | `…/agent/enroll-token` | Mint an enrollment token (10 min, single-use) |
 | POST | `…/agent/update` · `…/agent/{aid}/update` | Operator-forced self-update (fleet / one device), `{pin?, force?}` (+ `agent_ids?` for the fleet). A push that would not be acted on is refused, never sent: FR-2's downgrade guard (`pin_downgrade`, unless `force`), and since FR-67 P7 a device whose caps say it ignores the push (`primary_org`, a secondary enrollment) or drops it (`auto_update_off`). `force` lifts only the first. One device answers **409** with the reason; the fleet route skips the device with a `refused` reason and its `refused_code`, and counts it in `refused` |
 | POST | `…/agent/{aid}/join-org` · GET `…/join-targets` | Add an enrolled device to a second org (multi-org) |

@@ -2,7 +2,11 @@
 # FR-55: A device stays reachable instead of quietly sleeping
 
 **Status:** P0 measured, P1 + P2 shipped (`agent-v0.4.45` / `0.4.46`), P3 deferred on
-evidence and then built under FR-97 P3b (2026-10-17, the last section), P4 + P5 open — and ⚠️ **P2's AC-power arm FAILS in the field**: a Mac that
+evidence and then built under FR-97 P3b (2026-10-17, the last section), **P4 built in
+[#3148](https://github.com/gjovanov/roomler-ai/pull/3148) (2026-10-30)**: a device going
+to sleep says so first and reads *asleep* instead of *offline* (§P4 design), proven
+through the real server and the real agent loop, with the real-suspend read still owed;
+P5 open — and ⚠️ **P2's AC-power arm FAILS in the field**: a Mac that
 falls asleep on battery and is then plugged in stays asleep all night with our
 assertion held (2026-09-24, field log). This line read "proposed" until then, with the
 field log empty, while P0–P2 had shipped and been measured — the record below restores
@@ -117,8 +121,57 @@ reported normally while a feature was dark.
 | P1 | An **active rc/ssh session** holds an assertion, on all three OSes. Narrow, always-correct, no policy needed. | per-OS: assertion failure is logged and non-fatal |
 | P2 | Standing policy `power_policy = never \| on-ac \| always`, default `never`, device-owned. macOS first. | the key itself; absent ⇒ today's behaviour |
 | P3 | Windows + Linux implementations of the same policy. | as P2 |
-| P4 | Report it: `roomler status` + the dashboard distinguish "asleep by policy" from "offline". | additive, read-only |
+| P4 | Report it: `roomler status` + the dashboard distinguish "asleep by policy" from "offline". **Built in #3148 (2026-10-30)**: the heartbeat's power posture, the `rc:agent.sleeping` goodbye from a hook on every OS, the server's record, and the *asleep* reading in `roomler status`, `roomler devices` and the dashboard (§P4 design). | additive, read-only; `ROOMLERD_SLEEP_ANNOUNCE=0` turns off the goodbye and the reconnect hold |
 | P5 | **Wake on LAN from a mesh peer** — an awake peer on the same L2 sends the magic packet on request. | server-side switch; off by default |
+
+## P4 design — asleep, not offline (2026-10-30, #3148)
+
+The full account is [`docs/power.md`](../power.md) §3. In short: the device reports its
+power posture on every heartbeat, and says goodbye just before the OS sleeps it, so the
+server marks it offline *with the reason* at once, instead of green until the receive
+deadline and then a bare "offline".
+
+```mermaid
+sequenceDiagram
+    participant OS as the OS
+    participant A as roomlerd
+    participant S as server
+    participant D as dashboard
+    OS->>A: going to sleep now
+    A->>S: rc:agent.sleeping with the posture
+    A->>S: every peer closed, then the socket
+    S->>D: device:presence offline, with sleep
+    Note over A: no dial until the wake
+    OS->>A: woke
+    A->>S: rc:agent.hello, which unsets sleep
+```
+
+| piece | where | what |
+|---|---|---|
+| the posture | `crates/remote_control/src/models.rs:2134` `PowerBrief`, on the heartbeat at `crates/remote_control/src/signaling.rs:704` | `policy`, `on_ac?`, `held`. `held: false` is "asleep by policy" (`by_policy`, `crates/remote_control/src/models.rs:2155`) |
+| the hooks | `agents/roomlerd/src/sleep_notice.rs:569` (logind), `:708` (Windows), `:783` (IOKit) | they listen only and take nothing; bounded at 3.2 s on Linux and 1.5 s elsewhere, never blocking on the runtime (`agents/roomlerd/src/sleep_notice.rs:392` `will_sleep`) |
+| the goodbye | `agents/roomlerd/src/signaling.rs:2029` | sends `rc:agent.sleeping`, closes every peer, then the socket. The run loop holds every dial until the wake (`agents/roomlerd/src/signaling.rs:1003`), 60 s at most (`agents/roomlerd/src/sleep_notice.rs:308`) |
+| the record | `crates/modules/fleet/src/socket.rs:729`, `crates/services/src/dao/agent.rs:529` `record_sleep` | recorded first, then the ordinary teardown. Keyed by the hello's `conn_id`, so a displaced connection cannot mark a reconnected device asleep |
+| the reading | `crates/remote_control/src/models.rs:2184` `SleepView::of` | a notice shows only on a device that is not online; the next hello unsets it (`crates/services/src/dao/agent.rs:517`) |
+| the surfaces | `agents/roomler-cli/src/localclient.rs:2441` and `:3112`, `ui/src/utils/devicePresence.ts:90` | `roomler status`'s power line, `roomler devices`'s `asleep`, the dashboard's chip and its title |
+
+Decided in the design review, before the code:
+
+- **No wire gate.** A server that cannot decode an agent frame ignores it (pinned for
+  #1886), and the agent closes its own socket right after, so an older server still sees
+  a clean close.
+- **The agent closes, and holds its next dial.** A dial inside the window the OS gives a
+  computer to go to sleep would say hello again and erase the notice.
+- **`never` stays byte-for-byte (AC3).** No hook takes an assertion, and on a `never`
+  device the Linux delay inhibitor keeps FR-93 P5h's scope, live sessions only (open
+  decision below).
+- **Every hook has a hard bound**, so a goodbye that hangs never holds a laptop awake in
+  a bag.
+- **Peers see the fact, never the policy.** The agent-facing list carries `asleep_since`
+  only (`crates/remote_control/src/models.rs:3493`): `power_policy` is a device setting,
+  and settings are the fleet record.
+
+The P4 anchors are verified against #3148's branch, on master `19a0eeca1`.
 
 ## Acceptance criteria
 
@@ -130,12 +183,23 @@ reported normally while a feature was dark.
       from us.
 - [ ] With `power_policy = on-ac`, a laptop on battery still sleeps and the same laptop on
       AC does not.
-- [ ] An operator looking at a device that is asleep by policy can tell that from the UI,
-      without reading a log.
-- [ ] ⚠️ The macOS **clamshell** limitation is documented in the UI where the policy is
-      set — not discovered by a user whose lid-closed Mac still vanishes.
+- [~] An operator looking at a device that is asleep by policy can tell that from the UI,
+      without reading a log. *2026-10-30, #3148: built and proven through the real server
+      (`sleep_announce_tests`) and the real agent loop (`sleep_announce_agent`, shown
+      failing first with the kill switch); the dashboard's and the CLI's words are
+      unit-tested. Owed: the read on a device that really suspends (field log).*
+- [~] ⚠️ The macOS **clamshell** limitation is documented in the UI where the policy is
+      set — not discovered by a user whose lid-closed Mac still vanishes. *2026-10-30,
+      #3148: the policy is set in two places, and both carry the key's ⚠️ clamshell
+      sentence. The companion's settings row renders the description (`settings.js:350`),
+      and `roomler config set power_policy` now prints the sentence on a Mac. A test pins
+      the sentence in the description. Owed: the read of both on a Mac.*
 - [ ] P5: a sleeping device on the same LAN as an awake peer can be woken from the
       dashboard, and the audit says who did it.
+- [x] Docs: the keeper and P4's report are documented in [`docs/power.md`](../power.md)
+      (mermaid, tables, `file:line` anchors) with a `docs/README.md` row, and
+      `docs/api.md`, `docs/data-model.md` and `docs/real-time.md` carry `power`, `sleep`,
+      `asleep_since` and `rc:agent.sleeping` (#3148, 2026-10-30).
 
 ## Open decisions
 
@@ -157,6 +221,15 @@ reported normally while a feature was dark.
   already chose once on "well understood" and it was wrong in the most ordinary case.
 - Should an **exec** run hold an assertion? A 40-minute build kicked off by `roomler exec`
   has the same problem as a session, and the same answer is not obvious.
+- **Should a `never` device on Linux hold the delay inhibitor while a control connection
+  is live?** (P4, put to the operator 2026-10-30.) Today it does not. On a `never` device
+  the inhibitor keeps FR-93 P5h's scope, live sessions only, so AC3 stays byte-for-byte
+  and `systemd-inhibit --list` shows nothing new. The cost: logind does not wait for a
+  `never` device's goodbye, so it goes out in whatever time the suspend leaves. Holding
+  the inhibitor while any control connection is live would make that goodbye reliable,
+  at the price of a Roomler delay inhibitor in `systemd-inhibit --list` on every Linux
+  device, permanently. `on-ac` and `always` devices already hold it while a control
+  connection is live.
 
 ## Out of scope
 
@@ -273,3 +346,29 @@ runs outside every login session, where logind's polkit policy grants only `idle
 (`inhibit-block-sleep` is `allow_any=no`), so it takes `idle` and logs why. The design
 and the field record are in FR-97 (`docs/fr/FR-97-os-feature-parity.md` §3.8, §8) and
 `docs/remote-control.md` §5.1d.
+
+### 2026-10-30 — P4 built (#3148): the server half and the agent loop proven, the real suspend owed
+
+All of it ran on #3148's branch (on master `19a0eeca1`), against a throwaway MongoDB and
+Redis:
+
+| # | what | result |
+|---|---|---|
+| 1 | the server's half through the real socket, a scripted agent (`crates/tests/src/sleep_announce_tests.rs`, 2 tests) | ✅ 2/2. The goodbye ends the connection at once; the agent row, the devices grid and the `device:presence` row carry `sleep`; the next hello erases it; a displaced connection cannot write it |
+| 2 | the REAL agent loop against a real server (`crates/tests/tests/sleep_announce_agent.rs`), told to sleep the way a hook tells it | ✅ 1/1 in 8.1 s. The agent logged its goodbye (`policy=on-ac held=false`), the server closed the socket as the goodbye, the dial waited, and `awake again: reconnecting` followed the wake 3 s later. After a stop the device read plain offline |
+| 3 | row 2 with `ROOMLERD_SLEEP_ANNOUNCE=0`, the pre-P4 behaviour (the negative control) | ❌ as it must: `said=0`, the row stayed `status: online`, and the test failed at `asleep: not within 5s` |
+| 4 | the composition baseline | moved by exactly two lines, `rc:agent.sleeping` and its owner `fleet`; re-recorded |
+| 5 | the unit tests: `remote_control`, `fleet`, `localapi`, `roomlerd` `sleep_notice` + `power`, `roomler-cli` `devices_tests`, the UI's `devicePresence.spec.ts` | ✅ locally; CI on #3148 runs every lane |
+
+Row 3 is the "shown failing first" this phase can show without sleeping anything: the
+kill switch restores what the current deploy does, a device that says nothing.
+
+Not proven yet:
+
+- **No real suspend.** The three hooks (logind, `PowerRegisterSuspendResumeNotification`,
+  IOKit) have run in no field test: rows 1 to 3 enter at `will_sleep`, one call below the
+  hook. A throwaway VM that really suspends is the next read, and it waits on the
+  operator's OK, because the rails forbid sleeping the dev box.
+- **The macOS hook** is compiled only by CI's macOS lane.
+- **A `never` device on Linux** sends its goodbye on a best-effort basis (the open
+  decision above).
