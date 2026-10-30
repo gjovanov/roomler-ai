@@ -202,7 +202,7 @@ installing it, and is also bound to the release it claims to be: the Windows
 | perUser + perMachine `.msi` | release-agent | sign-windows, before the size-budget/sha256 steps |
 | `roomler-desktop-<v>….exe` | release-agent | sign-windows |
 | `roomler-agent-<v>-aarch64-apple-darwin.pkg` | release-agent | inline codesign → productbuild → notarytool → staple → **verify** |
-| `roomler-setup.exe` (in the zip) | release-setup | sign-windows, before zipping |
+| `roomler-setup.exe`: its own asset `roomler-setup-<v>-x86_64-pc-windows-msvc.exe` (what `/api/setup/windows` serves, FR-129 C2) and the same file in the zip | release-setup | sign-windows, before zipping and staging; the staged EXE is checked byte for byte against the zip's, and `90-verify-release.ps1` checks both signatures, the `.exe.sha256` and that the two are one program |
 | `Roomler Setup.app` (in the macOS tarball) | release-setup | sign-macos: bundle → notarise → **staple** (ticket survives tar) |
 | `roomler.exe` (tunnel zip) | release-tunnel | sign-windows (was never signed before) |
 | `roomler` (macOS universal, tunnel tarball) | release-tunnel | sign-macos: bare binary → notarise, **no staple** (Apple can't staple a loose Mach-O; curl\|tar installs never set quarantine, so unaffected) |

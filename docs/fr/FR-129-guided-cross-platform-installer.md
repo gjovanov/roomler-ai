@@ -707,6 +707,172 @@ flowchart TB
    with `ROOMLER__SETUP__WIZARD_MACOS_DAEMON` once its remote-desktop session is on record
    (the B2 row).
 
+### C — The download, and the service by default
+
+#### What the operator reported (2026-10-30, anchors at master `60e589425`)
+
+Two reports, about 19:50Z, each measured before any fix:
+
+| Report | Measured | Mechanism |
+|---|---|---|
+| "`https://roomler.ai/api/setup/windows` downloads a zip, not the installer direct." | `Content-Type: application/zip`, `roomler-setup-0.4.188-x86_64-pc-windows-msvc.zip`, while the public install page promises "a signed EXE with a role picker" (`ui/docs/content/start/install/windows.md:40`) | the release lane signs `roomler-setup.exe` and publishes it only inside a zip (`.github/workflows/release-setup.yml:525-607`); `pick_setup_asset` serves only a `.zip` for `windows-x86_64` (`crates/modules/fleet/src/setup_release.rs:221-245`); `stream_asset` (`:402`) streams that asset unchanged |
+| "It installs a tunnel, not the daemon-system role (background service), which should be the default installation, with overlay and lock-screen control enabled. macOS and Linux should do the same." | on the operator's own machine the wizard's saved state (`crates/roomler-setup-core/src/wizard_state.rs:66`) held `{"step":"done","role":"tunnel-client"}` and an earlier test run's device name; the tunnel card came up selected, and a second, elevated run tried to enroll the machine under that test name | `loadPersistedState` restores the role and the device name whatever the saved step, and only moves the step back to Welcome (`agents/roomler-setup/src/front/app.js:179`); with no saved state nothing is selected at all (`state.role` starts `null`, `app.js:136`), and the Windows background service is "recommended" only in its card's title |
+
+Asked in the same exchange how the wizard could "automatically ask for sudo right or win run
+as admin": on Linux and macOS the install already asks through the desktop's own prompt
+(B.2). On Windows the one manual step left is #3116's note, which tells a limited wizard on a
+SystemContext reinstall to be closed and started again with "Run as administrator" — the
+operator did exactly that the same day, and C1's default sends more reinstalls to that note.
+
+#### C1 — The wizard preselects the background service
+
+**Rust decides, the SPA applies**, as for `daemonRoles`: `role::default_role`
+(`agents/roomler-setup/src/role.rs:211`), pure and unit-tested, is carried on the detection as
+`defaultRole` (`agents/roomler-setup/src/commands.rs:80`, `null` = no preselection). It
+chooses among what the OS offers right now — its daemon roles when `supported` (on Linux and
+macOS the server's switch), and the tunnel client:
+
+| `kind` | Windows | Linux (cards offered) | macOS (cards offered) | Linux / macOS, switch off |
+|---|---|---|---|---|
+| `clean` | `daemon-system` | `daemon-system` | `daemon-user` (+ the root half: the overlay box is ticked) | `tunnel-client`, the only card |
+| `peruser` | `daemon-user` | `daemon-user` | `daemon-user` | none |
+| `permachine`, `ambiguous` | the SystemContext switch: on → `daemon-system`, off or absent → `daemon-machine`, unreadable → none | `daemon-system` | `daemon-user` | none |
+
+- **An existing install keeps its flavour.** A default never switches a flavour (that is the
+  cross-flavour warning's to explain) and never changes a posture: SystemContext makes the lock
+  screen remotely controllable, so an attended service stays attended unless the person picks
+  otherwise. The switch is `ROOMLERD_ENABLE_SYSTEM_SWAP` in the `Roomler` service's SCM
+  Environment, read as the updater reads it
+  (`agents/roomler-setup/src/commands.rs:177`, `roomlerd::win_service::environment`), and on is
+  what the daemon itself reads as on (`role::system_context_switch`, `role.rs:173`: `1`, `true`,
+  `yes`, `on`) — the posture the device runs in. It is asked only for a Windows perMachine or
+  ambiguous install. A flavour the server does not offer right now gets no preselection: the
+  tunnel client would be another product than the one the device has. This supersedes B.4's
+  "Linux per-user (the default for a desktop)".
+- **The SPA** preselects `defaultRole` when nothing is picked and the card is shown
+  (`agents/roomler-setup/src/front/app.js:579`, `isOfferedRole` `:640`), never saves it (a
+  click does), and evaluates the Continue gate as before — the cross-flavour acknowledgement
+  and #3116's elevation note included. The overlay box keeps its per-OS default, already ticked
+  for every preselected daemon role.
+- **A run resumes only from the Server or the Token page** (`RESUMABLE_STEPS`, `app.js:190`):
+  there the saved role and device name come back with the step. A run that finished, stopped on
+  Welcome or was cut off during the install starts again at Welcome with no role and the
+  default device name. The server URL is the person's setting and is always kept.
+- **Copy.** "Recommended" marks the preselected card on every OS: the Linux system card
+  ("root, recommended") and the macOS card; the Linux per-user card loses "recommended for a
+  desktop", which would contradict it. The wizard's own text never calls the daemon an "agent"
+  (the operator, 2026-10-30): the token step names the dashboard's Devices → Enroll, the
+  checklist and the Done page say "device" and show a version (`roomlerd 0.4.188`), never a
+  release tag (`app.js:1790-1800`). Tags, API paths and wire strings stay as they are: they are
+  compatibility surfaces.
+
+#### C2 — `/api/setup/windows` serves the signed EXE
+
+- **The release lane** stages the same signed EXE as its own asset,
+  `roomler-setup-<v>-x86_64-pc-windows-msvc.exe`, with an `.exe.sha256` in the zip's format,
+  after checking it byte for byte against the zip's copy
+  (`.github/workflows/release-setup.yml:615`); the publish job copies `*.exe` too (`:684`), so
+  the GPG step signs it and the attestation covers it. ⚠️ A tag run executes the workflow as it
+  stood at the tag: the first EXE asset appears at the first `setup-v*` cut after this merges.
+- **The server** (`crates/modules/fleet/src/setup_release.rs:66`, `SetupFormat`; `:306`,
+  `pick_setup_asset`) prefers the `.exe` for `windows-x86_64` and falls back to the `.zip`, so a
+  release without the EXE (every one up to 0.4.189) is served exactly as before; a sidecar is
+  never a pick. `?format=zip` forces the zip — for a network whose proxy refuses an EXE —
+  on `/api/setup/{platform}` and `/health`, whose `uri` carries it; Linux and macOS ignore the
+  value; any other value is a 400 naming `exe` and `zip`. No route changes: the composition
+  baseline is byte-identical.
+- **`scripts/signing/90-verify-release.ps1`** checks every asset's `.sha256` sidecar and that
+  the EXE asset is the EXE inside the zip (`:231`), beside the Authenticode checks it already
+  made on both.
+- **C2b — a slow link is never cut.** The three asset proxies (`/api/setup/{platform}`,
+  `/api/agent/installer/{flavour}`, `/api/tunnel/installer/{platform}`) stream a GitHub asset at
+  the person's pace (`Body::from_stream`), and each built its client with reqwest's
+  `timeout(60 s)`, a TOTAL deadline that includes reading the body: every download longer than a
+  minute was cut mid-body — the 22.5 MB MSI below about 375 KB/s, C2's EXE below about 270
+  KB/s, a hotel, phone or throttled corporate link. They now share
+  `crates/modules/fleet/src/asset_stream.rs`: a 15 s connect deadline and a 60 s idle bound on
+  each read (`read_timeout`, which runs only while a read waits and resets with every chunk),
+  and no total. The release-list fetch keeps its `FETCH_TIMEOUT`. Measured on 2026-10-30
+  through a local proxy of `stream_asset`'s shape with `curl --limit-rate 150k` and a 16 MiB
+  body: master's client delivered 10,403,414 bytes and the stream ended at 67.9 s (curl exit 18,
+  a partial file); the branch's delivered all 16,777,216 in 109.0 s.
+- **A consumer outside this repository:** the FR-61 vmtest Windows wizard cell downloads
+  `/api/setup/windows` into `roomler-setup.zip` and runs `Expand-Archive` on it. It must ask for
+  `?format=zip` (an older server ignores the value, so the change can go first) before the first
+  release that publishes the EXE.
+
+#### C3 — The wizard asks for administrator rights itself
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Person
+    participant L as Limited wizard
+    participant U as UAC
+    participant E as Elevated wizard
+    L-->>P: Welcome, the background service picked, the elevation note
+    P->>L: Restart as administrator
+    L->>U: ShellExecuteExW runas on its own image, --role and --after-elevation pid
+    U-->>P: one prompt, naming the signed publisher
+    alt approved
+        U->>E: started elevated
+        L->>L: exits
+        E->>E: waits for that pid to exit, at most 15 s
+        E->>E: its own WebView2 folder, then the single-instance lock
+        E-->>P: Welcome with the role picked, the Continue gate as usual
+    else declined, ERROR_CANCELLED 1223
+        U-->>L: cancelled
+        L-->>P: one line, and the wizard as it was
+    end
+```
+
+- **Where.** #3116's note (`agents/roomler-setup/src/front/index.html:98`) carries a **Restart as
+  administrator** button inside it, so it shows exactly when the note does: the pre-logon role,
+  on a reinstall whose config folder a limited wizard cannot open. It runs
+  `cmd_relaunch_elevated` (`agents/roomler-setup/src/commands.rs:310`), Windows-only: `runas`
+  on `std::env::current_exe()`, one UAC prompt
+  (`crates/roomler-setup-core/src/elevation.rs:106`), with
+  `--role <role> [--server <url>] --after-elevation <pid>` — the server only when it is not the
+  default (`agents/roomler-setup/src/launch.rs:117`). The relaunch happens on Welcome, before a
+  token exists, so nothing secret is on the command line; every value is validated on both
+  sides, and an unknown argument is ignored. `SEE_MASK_NOZONECHECKS`, because the file is the
+  wizard's own running image, whose zone check ran when the person opened it.
+- **The wait.** The elevated copy waits, at most 15 s, for the limited one to exit
+  (`launch.rs:196`, called from `agents/roomler-setup/src/main.rs:65`) **before** Tauri's
+  single-instance plugin initialises: the plugin finds a running copy by its mutex and window
+  and would hand that dying copy the arguments and quit. Under over-the-shoulder credentials
+  (a standard user types an administrator's password) the elevated copy is another account,
+  whose `OpenProcess` on the limited copy can be refused; the wait then polls the process list
+  for that pid running this same image (`wizard_shared::elevation::poll_until_gone`), so a
+  reused id is not waited on. Read from the plugin's source (2.4.2), a mutex the elevated
+  account may not open is not a hand-off either: `CreateMutexW` fails with access denied
+  rather than "already exists", and the copy simply runs as its own instance.
+- **Over-the-shoulder credentials, otherwise.** The elevated copy then keeps that account's
+  `%LOCALAPPDATA%` (its saved state and log), which is why the role and server travel on the
+  command line, and "Open the page" on the Join step opens that account's browser. The Join step
+  shows the page and the code as text, so the person can type both into their own browser; the
+  copy does not name the effect, because the wizard does not tell such an elevation from an
+  administrator approving their own prompt, where it does not arise.
+- **WebView2.** An elevated run gives WebView2 a user-data folder of its own,
+  `%LOCALAPPDATA%\ai.roomler.setup\elevated` (`launch.rs:173`). WebView2 shares one browser
+  process among every host that names the same folder, and the limited copy's browser process
+  can outlive that copy by a moment; an elevated host joining a limited browser process is the
+  cross-integrity failure. **Through the API, not the environment:** an elevated WebView2 host
+  ignores every `WEBVIEW2_*` environment override and honours what the app passes through the
+  API (Microsoft's "Develop secure WebView2 apps"), so the folder goes to Tauri's
+  `WebviewWindowBuilder::data_directory`, the `userDataFolder` argument WebView2 receives. That
+  is why the main window is now created by the setup hook (`main.rs:103`) from its
+  `tauri.conf.json` entry, which says `"create": false`; a test holds the two together. (The
+  first cut of C3 set `WEBVIEW2_USER_DATA_FOLDER`, which an elevated host would have ignored;
+  the #3116 kit had already met the same rule for the CDP port, which an elevated wizard takes
+  only from machine policy.) Any elevated run does this, a hand-made "Run as administrator"
+  included; a limited run passes nothing and keeps Tauri's folder.
+- **The outcomes.** A declined prompt leaves the limited wizard as it was, with one line; any
+  other failure shows its reason and the right-click way; a started copy makes this one exit.
+  The elevated copy opens on Welcome with the handed role, which wins over C1's default
+  (`applyLaunchOptions`, `app.js:217`), and passes the Continue gate like any other pick.
+- **Nothing else self-elevates.** A fresh install still gets the MSI's own UAC prompt.
+
 ## The pairing API
 
 Shipped by A1 in the **fleet** module (`crates/modules/fleet/src/pairing.rs`; the row in
@@ -818,6 +984,9 @@ subject plain text: the machine name is the installer's own text.
 | B1-s2 | the daemon switch per OS, so Linux goes live without macOS (the operator, 2026-10-30). **Server:** `[setup] wizard_linux_daemon` (`ROOMLER__SETUP__WIZARD_LINUX_DAEMON`) and `wizard_macos_daemon` (`ROOMLER__SETUP__WIZARD_MACOS_DAEMON`), each default off; the legacy `wizard_unix_daemon` turns both on (`SetupSettings::linux_daemon`, `macos_daemon`, `crates/config/src/settings.rs:128-140`). `GET /api/setup/features` adds `wizard_linux_daemon` and `wizard_macos_daemon`, each the effective value, and answers `wizard_unix_daemon` as their AND (`crates/modules/fleet/src/setup_release.rs:159-170`): the one key the wizards released before the split read, for both OSes (B.6). **Wizard:** one helper picks this OS's switch, its own key OR `wizard_unix_daemon` (`SetupFeatures::daemon_offered`, `agents/roomler-setup/src/features.rs:73-79`), for the Welcome cards (`agents/roomler-setup/src/commands.rs:164`), the Server page (`:195`) and the re-check before installing (`agents/roomler-setup/src/orchestrator_unix.rs:329`); the page gets that one boolean (`daemonOffered`). **SPA and `/`:** the setup-features store (`ui/src/stores/setupFeatures.ts:73-75`) and `home.js` (`ui/docs/theme/home.js:205-211`) apply the same OR and still fail closed; each hidden button on the static page names its OS (`data-wizard-unix="linux"`) | the two settings, each off by default; a server from before the split sends its one key, read for both OSes | **PR open** — [#3162](https://github.com/gjovanov/roomler-ai/pull/3162), riding the next agent and setup release and the next server image. Red first on master: the wizard's per-OS pick, the integration test's five keys and its legacy key, and 22 Vitest checks (a Linux-only answer hid the Linux cards everywhere). Not field-run. **Turning Linux on** waits for the first `setup-v*` carrying it (the order in B.6) |
 | B2 | macOS root half from the GUI: the daemon role with "Join the overlay network" ticked (the macOS default now) adds the root half — one approval, two tokens (`halves: 2`), or two pasted tokens; the root half enrolled in-process under a machine id from the hardware, placed and folded by B1's `--config-from` / `adopt-enrollment`; Cancel, Retry and the late-start watch over two enrollments; the terminal's refusal kept (the decisions under "Decided by B2") | B1's macOS switch (`wizard_macos_daemon` since B1-s2, which the legacy `wizard_unix_daemon` also sets); untick the box for the per-user half alone | **merged** — [#3077](https://github.com/gjovanov/roomler-ai/pull/3077) (`f0c85a639`, 2026-10-29), rides agent 0.4.187 (the "B2" rows of the log). Unit-tested (the hardware id against two measured tart clones' facts; the halves, the tokens, the Retry state), the SPA driven in jsdom (27 checks, red on master's SPA), the device cap per half in an integration test. Field (2026-10-29, the log): red on `setup-v0.4.186`, green on `setup-v0.4.187`. Green covered a fresh install (one prompt, both rows online, the root half on the mesh), a reinstall (the same rows, key and machine id), and a Cancel after the password with a Retry that asked for no second prompt. The remote-desktop session ran on 2026-10-30 (the log): green, but only after a restart typed in Terminal. macOS's default "Quit & Reopen" leaves the agent offline, and nothing in the product restarts it ([#3164](https://github.com/gjovanov/roomler-ai/issues/3164)). **Owed:** #3164's fix and a re-run, before the macOS cards go on |
 | D | docs, vmtest cells (wizard × OS × daemon; pairing end to end), field log | — | `docs/device-pairing.md` merged ([#3051](https://github.com/gjovanov/roomler-ai/pull/3051)), its §13 terminal pairing too ([#3062](https://github.com/gjovanov/roomler-ai/pull/3062)); the stale `install.sh` anchors re-pointed ([#3069](https://github.com/gjovanov/roomler-ai/pull/3069)); B2's root half in `docs/installation.md`, and the `ship-it` skill on `install.sh` riding two trains (a promote and an agent release). Owed: the vmtest matrix and the acceptance criteria |
+| C1 | wizard: the Welcome page preselects the background service — `role::default_role` → `defaultRole` on the detection, the table under "C1" (an existing install keeps its flavour; Windows perMachine reads the SystemContext switch); the SPA applies it when nothing is picked and never saves it; a run resumes only from the Server or Token page; "recommended" on the Linux system and macOS cards; no "agent" in the wizard's own text, a version where a person reads a release (AC17) | none: a default the person can change before anything happens | **draft PR** [#3187](https://github.com/gjovanov/roomler-ai/pull/3187), rides 0.4.190. Unit-tested (the default per OS × kind, the switch read as the daemon reads it, read only where it decides); the SPA driven in jsdom with a mocked Tauri, red on master's SPA and green on the branch's (the log). **Owed, with C2, after the first release that carries them:** a fresh throwaway Win11 cell downloads `/api/setup/windows` → an EXE whose hash matches the release's `.exe.sha256` and whose signature is valid → the Welcome page preselects the background service → install → a remote-desktop session on the **lock screen** and an overlay ping |
+| C2 | release + server: `release-setup.yml` stages the same signed EXE as `roomler-setup-<v>-x86_64-pc-windows-msvc.exe` (+ `.exe.sha256`, GPG `.asc`, the attestation); `/api/setup/{platform}` and `/health` take `format` (`exe` default, `zip`), the Windows pick prefers the EXE and falls back to the zip; `90-verify-release.ps1` checks the sidecars and that the EXE asset is the zip's EXE (AC16) | the server falls back to the zip for a release without the EXE (every one up to 0.4.189), and `?format=zip` serves the zip whatever the release has | **draft PR** [#3187](https://github.com/gjovanov/roomler-ai/pull/3187), rides 0.4.190; the workflow change takes effect at the first `setup-v*` cut after the merge (a tag run runs the workflow as it stood at the tag). Unit-tested (the EXE preferred in either listing order, the zip fallback, `format=zip`, sidecars never picked, Linux and macOS unchanged, the param's values); the staging step's byte check dry-run on dummy bytes, both ways. **C2b** (same PR): the three asset proxies stream through one client with a 15 s connect deadline and a 60 s idle read bound instead of a 60 s total deadline, which cut every download longer than a minute; red/green measured at 150 KB/s on a 16 MiB body (10.4 MB and the stream ended at 67.9 s on master's client, all 16.8 MB in 109 s on the branch's), and unit-tested (a slow reader read whole, a silent upstream cut by the idle bound, a total deadline cutting the same reader). **Owed:** the released run in C1's row, and the vmtest Windows wizard cell asking for `?format=zip` before that release |
+| C3 | wizard: "Restart as administrator" in #3116's note — `cmd_relaunch_elevated` starts the wizard's own image through `runas` (one UAC prompt) with `--role [--server] --after-elevation <pid>` and exits; the elevated copy waits for that pid before the single-instance plugin (the process list when another account's process refuses a handle), gives WebView2 its own folder through the API, and opens on Welcome with the role (AC18) | none needed: the button exists only inside the note, which shows only where an elevated wizard is required; the right-click way still works | **draft PR** [#3187](https://github.com/gjovanov/roomler-ai/pull/3187), rides 0.4.190. Unit-tested (the arguments both ways, unknown ones ignored, bad values dropped; the C runtime's quoting against `CommandLineToArgvW`; the wait and the process-list fallback on real processes; the button's place and rule; the config's `"create": false` held to the setup hook); the SPA's button, its three outcomes and the elevated copy's preselection driven in jsdom (the log). **Owed, at release, red first, as a same-user administrator AND with over-the-shoulder credentials:** a limited wizard on a SystemContext reinstall stops on Welcome (red) → the button → UAC Yes → one elevated wizard (the limited one gone), the background service preselected, WebView2 on the `elevated` folder → the install succeeds; UAC No → still on Welcome with the line, no second process; no process left over |
 
 ## Acceptance criteria
 
@@ -869,6 +1038,30 @@ Each criterion's fail-first run is today's build, recorded in the log before its
       and the per-OS sections), `docs/api.md` (the routes), `docs/growth-observability.md`
       (pairing in the install trace) and the `ship-it` skill (the wizard's embedded
       `install.sh`, in lockstep) updated.
+- [ ] **AC16** — `GET /api/setup/windows` serves the signed wizard EXE itself
+      (`roomler-setup-<v>-x86_64-pc-windows-msvc.exe`,
+      `Content-Type: application/vnd.microsoft.portable-executable`) from the first `setup-v*`
+      release that publishes one; its bytes equal the release's `.exe.sha256`, its Authenticode
+      signature is valid, and it carries a GPG `.asc` like every other asset. `?format=zip`
+      still serves the zip (for networks whose proxy refuses an EXE download). A release with no
+      `.exe` asset (every one up to 0.4.189) keeps serving the zip, unchanged. Fail-first: the
+      measured zip (the log, 2026-10-30).
+- [ ] **AC17** — The wizard's Welcome page preselects the background service on every OS that
+      offers one, with "Join the overlay network" ticked: Windows `daemon-system` (perMachine +
+      SystemContext: the lock screen, UAC dialogs, admin apps); Linux `daemon-system` (the root
+      service) once the server offers the Linux daemon cards; macOS the daemon with its root half
+      once the server offers the macOS cards. An existing install keeps its own flavour as the
+      default (never an unasked flavour switch or a security posture change). A finished or
+      interrupted run's role and device name are never restored; a run interrupted on the Server
+      or Token page resumes as it was. Fail-first: the tunnel card preselected on the operator's
+      machine, and nothing preselected on a clean one (the log, 2026-10-30).
+- [ ] **AC18** — A wizard that needs administrator rights asks for them itself: one UAC prompt,
+      the chosen role kept. On a Windows reinstall over the pre-logon service, a limited
+      wizard's Welcome note offers "Restart as administrator"; after the one prompt the elevated
+      wizard opens on Welcome with that role preselected and the install succeeds. A declined
+      prompt leaves the limited wizard as it was, and nothing else in the wizard elevates itself.
+      Fail-first: today's note asks the person to close the wizard and use "Run as
+      administrator".
 
 ## Decisions (operator, 2026-10-28)
 
@@ -896,7 +1089,7 @@ All seven open decisions were resolved as the spec recommended
 | A4-5 | **the tunnel role does not pair from the scripts** (`--role tunnel --pair` and `-Role tunnel-client -Pair` are refused, naming `--token` and the wizard) | the `roomler` CLI's enroll is its own code (`agents/roomler-cli`) and has no `--pair` yet; a script cannot pair on its behalf without holding the token itself, which is the thing `--pair` exists to avoid. A CLI `--pair` is a follow-up. |
 | A4-6 | **`--pair-org` matches the approved slug byte for byte** — no case folding, no trimming of the server's value, no Unicode normalisation; only the person's own value is trimmed | the server takes a slug as sent (`crates/api/src/routes/tenant.rs:60-68` passes it straight to the DAO; only `ui/src/composables/useValidation.ts:10` constrains it) under the binary-collated unique index of `crates/db/src/indexes.rs:132`, so `ACME`, `acme ` and a Cyrillic `аcme` are three orgs anyone can create beside `acme`. The first A4 draft trimmed and case-folded the server's slug, which let `ACME` through with no question asked: the flag that was the guard would have been the bypass. |
 | A4-7 | **server-sent text is escaped on the terminal, and a lookalike handle is flagged** | the org's name and slug and the approver's name and username are typed by whoever made the org and the account. Printed raw, an ANSI sequence (cursor up, clear line) in an org's name can repaint the `Join …?` line with another org's; a bidi override can reorder it. Escaping controls and invisible characters keeps every byte visible, and the warnings catch what escaping cannot (a slug in capitals, a Cyrillic letter). On Windows the question goes out through `WriteConsoleW`, so the `«»` and a non-ASCII name are not garbled by the console's code page. |
-| A4-8 | **a failed poll is retried until the pairing's clock runs out**, at a doubling interval capped at 30 s | the first draft gave up after six failures in a row (about 30 s): a pod roll or a VPN reconnect mid-pairing would end the install although the approval was still coming. The wizard retries to the end (`agents/roomler-setup/src/front/app.js:1081-1093`), and RFC 8628 §3.5 asks a client to slow down after a failure, not to stop. |
+| A4-8 | **a failed poll is retried until the pairing's clock runs out**, at a doubling interval capped at 30 s | the first draft gave up after six failures in a row (about 30 s): a pod roll or a VPN reconnect mid-pairing would end the install although the approval was still coming. The wizard retries to the end (`agents/roomler-setup/src/front/app.js:1172-1184`), and RFC 8628 §3.5 asks a client to slow down after a failure, not to stop. |
 | A4-9 | **the existing config is read after the pairing, not before it** | the first draft read it before the wait and merged into that copy after: a running daemon's own writes in between (token renewal, remote configuration, the companion's settings) would be saved over. Reading after makes the paired enroll's read-to-save window the `--token` one, and every line of it the `--token` code. |
 | A4-10 | **`install.sh` gives the paired enroll `/dev/null` as stdin** | under `curl … \| sh` the shell's stdin is the rest of the script. Nothing reads it today — the daemon asks on `/dev/tty`, and sudo 1.9.15 passed a piped script through untouched by default and with `log_input` or `log_stdin` set (the log below) — so this is a belt, kept because the cost of being wrong is an install that silently stops halfway. |
 
@@ -975,3 +1168,7 @@ All seven open decisions were resolved as the spec recommended
 | 2026-10-30 | production `hosted-20261030-ff29120`; the deploy repo's #52 (`5bae922`) | **`wizard_pairing` on, with the "after".** The change: `ROOMLER__SETUP__WIZARD_PAIRING: "true"` in `roomler2-config`, plus a `config-rev` bump. `kubectl kustomize k8s/overlays/prod` before and after differed by exactly the key and the annotation. It merged at 16:11:10Z, and both pods rolled at 16:11:16Z and 16:11:29Z on the same image. `GET /api/setup/features` then answered `{"pairing": true, "wizard_unix_daemon": false, "wizard_pairing": true}`. On `https://roomler.ai/`, signed out, in a headless check, `home.js` replaced the install lead with "Run Roomler Setup and sign in from your browser, with no token to copy. Or paste one command with a token from your workspace (Devices → Enroll device)." The Windows card keeps its Roomler Setup button. The Linux and macOS cards keep only their terminal lines, because their daemon switches are off. |
 | 2026-10-30 | **`setup-v0.4.188`** (`universal-apple-darwin.tar.gz`, sha256 `925e55c3…`, equal to its `.sha256` and to the digest `/api/setup/macos/health` reports; Developer ID signed), agent **0.4.188** from the `.pkg` (sha256 `221cebc8…`). A fresh clone of the lab's macOS golden (macOS 15.7.7) driven over Virtualization.framework's VNC server; the wizard in the console user's Aqua session against B1's shim; two vmtest-org tokens typed over VNC from 0600 files | **AC11, macOS: the install, and the red before any grant.** The daemon card ("joins as two devices. Asks for your password once"), "Join the overlay network" ticked by default. The root half enrolled before the prompt (`from_hardware=true`), then one native prompt, "osascript wants to make changes", and `authd` granted `system.privilege.admin` at a single instant. Both rows came online: `<name>` (`wizard/per-user`, no WireGuard key, `permissions: []`) and `<name>-daemon` (`wizard/system`, a key, `["no-gui-session"]`). The root half was on the mesh: `peers` listed the vmtest anchor, direct, and a ping over the utun went 4/4 (about 41 ms). The clone carried no TCC row for any Roomler client before the install. At its first start the person's half logged "Screen Recording is NOT granted", "Accessibility is NOT granted" and "restart the agent: `launchctl kickstart -k …`", and opened System Settings on a list where the entry is called **roomlerd**. tccd attributed it to itself (`responsible=com.roomler.agent`, path `/Library/Roomler/roomlerd.app/…/roomlerd`, uid 501): the LaunchAgent is its own responsible process, not the wizard's and not SSH's. A session from the production viewer to `<name>` connected and showed the FR-80 overlay: "This device cannot capture its screen. Grant Screen Recording to Roomler … then reconnect … Reported by the device as `permission`". It also showed a banner, "Your mouse and keyboard do not reach this device's desktop … then restart the agent". The surface stayed unlit, with no fps. The agent logged `scrap capture unavailable … code="permission"`, `reach="none"` and `enigo init failed`, and the viewer's click and keystrokes never reached the screen. That first session raised two macOS prompts on the Mac: Screen Recording ("“roomlerd” would like to record this computer's screen and audio", with Deny as the default) and Local Network ("Allow “roomlerd” to find devices on local networks?"). Disconnect ended it as `ControllerHangup`. The wizard's Done page says only "enable 'Roomler Daemon' under both"; it does not mention a restart. |
 | 2026-10-30 | the same cell, after the red | **AC11, macOS: the grants, a restart, and green.** The grants were made by hand over VNC. First Local Network → Allow. Then the Screen Recording prompt → Open System Settings → the **roomlerd** toggle → one administrator password → the TCC row `kTCCServiceScreenCapture` for `com.roomler.agent` (bundle id) allowed. The Accessibility list shows two entries, **Roomler** (the companion, which asked for itself) and **roomlerd**. Only roomlerd was turned on, and it needed no second password. **A running worker picks up neither grant:** a new session still answered `permission` ("then reconnect" is not enough). The input banner disappeared, yet keystrokes were still dropped, because the injector the first session failed to build stays a no-op. The companion said "restart the agent for it to take effect" and offers no way to do it. **macOS's own restart takes the screen half offline.** The default answer to "“roomlerd” may not be able to record … until it is quit" is **Quit & Reopen**. It sent a Quit Apple Event, AppKit terminated the agent with exit 0, and launchd logged `service inactive: com.roomler.agent`: the LaunchAgent's `KeepAlive {SuccessfulExit: false}` does not relaunch a clean exit. Finder said "The application “roomlerd” is not open anymore", and `<name>` went offline. The documented `launchctl kickstart -k gui/$(id -u)/com.roomler.agent`, typed in Terminal, brought it back: the agent logged "Screen Recording + Accessibility both granted" and the row advertised `["screen-capture","input"]`. **Green:** the production viewer showed the Mac's real screen, `VP9 4:4:4 SW (libvpx) · direct`, 2048×1536 captured at 1920×1440, about 15 fps. Its frame matched a VNC frame: the TextEdit lines typed over VNC, the windows and the clock. A line typed through the viewer appeared in TextEdit. A click at the start of the first line put the next typing there, so the click had moved the caret. Disconnect ended each session as `ControllerHangup`. The first capture after the grant raised a fourth macOS prompt, "“roomlerd” is requesting to bypass the system private window picker and directly access your screen and audio". Capture went on while it waited. replayd stores the answer with a 30-day policy (`kScreenCapturePrivacyHintPolicy = 2592000`), so it comes back monthly. Afterwards the root half was untouched by all of this: the anchor was direct and a ping answered 4/4 (about 37 ms). The cell was deleted by name and both rows by id. |
+| 2026-10-30 | production, `setup-v0.4.188` as `roomler.ai` serves it | **C2 red: the download is a zip.** The operator: "`https://roomler.ai/api/setup/windows` downloads a zip, not the installer direct." Measured: `Content-Type: application/zip`, `roomler-setup-0.4.188-x86_64-pc-windows-msvc.zip`, where the public install page promises "a signed EXE with a role picker" (`ui/docs/content/start/install/windows.md:40` at master `60e589425`). The release lane publishes the signed EXE only inside the zip (`.github/workflows/release-setup.yml:525-607`), and `pick_setup_asset` takes only a `.zip` for Windows (`crates/modules/fleet/src/setup_release.rs:221-245`). The fail-first for AC16. |
+| 2026-10-30 | `setup-v0.4.188`, on the operator's own Windows machine | **C1 red: the tunnel card came up preselected.** The operator: "It installs a tunnel, not the daemon-system role (background service), which should be the default installation, with overlay and lock-screen control enabled. macOS and Linux should do the same." Measured on that machine: the wizard's saved state held `{"step":"done","role":"tunnel-client"}` and an earlier test run's device name; the SPA restores both whatever the step (`agents/roomler-setup/src/front/app.js:179` at master `60e589425`), so the tunnel card was selected and the test name offered again, under which a second, elevated run then tried to enroll the machine. With no saved state nothing is selected (`app.js:136`). The fail-first for AC17. |
+| 2026-10-30 | the wizard's SPA, master `60e589425` vs this branch (C1 + C3), driven in jsdom with a mocked `window.__TAURI__` (the harness is outside the repository; its 48 checks are in the PR) | **C1 and C3 in the SPA: red on master, green on the branch.** Master's SPA met 13 of the 48 checks. It selected the tunnel card from a finished tunnel run's state and offered that run's device name; selected nothing on a clean machine, a perUser, an attended or a SystemContext install, or a Linux or macOS one; restored a role from a run stopped on Welcome and from an interrupted install; showed the cards' old copy and the release tag (`Resolved tag agent-v0.4.188`, `Agent ID`); and had no relaunch button. The branch met all 48: the background service from that same state and on a clean machine (with the default device name, no save before a click, the overlay box ticked), `daemon-user` for a perUser install, `daemon-machine` for an attended one, nothing when the switch is unreadable, `daemon-system` with the cross-flavour acknowledgement still required for both flavours, on Linux the system card with the server's switch on and the tunnel card with it off, the macOS card; a run killed on the Token page resumed with its role and name; the relaunch button inside #3116's note, its call carrying the role and server, the cancelled and failed lines, the note gone with another role; the elevated copy's handed role over the default, its server, and Continue open; `Resolved roomlerd 0.4.188 (18.2 MB)`, `Device ID`, the version on Done. |
+| 2026-10-30 | the branch's `crates/modules/fleet/src/asset_stream.rs` compiled as it is in a scratch crate against the lockfile's reqwest 0.12.28, behind a local proxy of `stream_asset`'s shape (`Body::from_stream`, the upstream's Content-Length passed on) in front of a fast local asset host serving 16 MiB; the client `curl --limit-rate 150k` | **C2b: red on master's client, green on the branch's.** Master's (`timeout(60 s)`): HTTP 200, 10,403,414 of 16,777,216 bytes, the stream ended at 67.9 s, curl exit 18 (a partial file) — a download that needed 109 s was cut at the deadline. The branch's (`connect_timeout` 15 s, `read_timeout` 60 s, no total): all 16,777,216 bytes in 109.0 s, exit 0, at the same 153 KB/s. The module's own tests passed there too: a reader pausing 1.2 s mid-body is cut by a 400 ms total deadline and read whole through the shrunk client, and an upstream silent for 3 s is cut by the 400 ms idle bound. |

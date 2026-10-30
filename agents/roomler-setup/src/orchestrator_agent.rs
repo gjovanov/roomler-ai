@@ -592,7 +592,7 @@ async fn run_install_inner(
             ProgressEvent::PreflightWarning {
                 message: format!(
                     "could not restrict permissions on the machine-global \
-                     config directory ({e}); the Agent token file may be \
+                     config directory ({e}); the daemon's token file may be \
                      readable by non-admin users until corrected"
                 ),
             },

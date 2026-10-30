@@ -29,6 +29,9 @@ pub mod diagnostics;
 pub mod enroll_step;
 /// FR-129 B1 — `GET /api/setup/features`, read fail-closed.
 pub mod features;
+/// FR-129 C3 — the wizard's command line: what an elevated relaunch is
+/// handed, and the WebView2 folder an elevated run keeps apart.
+pub mod launch;
 pub mod orchestrator_agent;
 pub mod orchestrator_tunnel;
 /// FR-129 B1 — the Linux and macOS daemon pipeline: the embedded
@@ -103,6 +106,71 @@ mod front_tests {
         assert!(
             html.contains("class=\"radio role-daemon\""),
             "the role cards are still label.radio; re-check the rule if they change"
+        );
+    }
+
+    /// FR-129 C3 — "Restart as administrator" shows exactly when #3116's
+    /// note does: the button sits inside the note, the note follows
+    /// `needsElevatedWizard` alone, and nothing else un-hides the button.
+    #[test]
+    fn the_relaunch_button_shows_exactly_with_the_elevation_note() {
+        let html = include_str!("front/index.html");
+        let note = html
+            .find("<div id=\"elevation-note\"")
+            .expect("the elevation note");
+        let end = note + html[note..].find("</div>").expect("the note's end");
+        let inside = &html[note..end];
+        assert!(
+            inside.contains("id=\"elevation-relaunch\"")
+                && inside.contains("id=\"elevation-relaunch-status\""),
+            "the button and its line live inside the note"
+        );
+        assert!(
+            !inside["<div".len()..].contains("<div"),
+            "no nested block hides a second end"
+        );
+        let js = include_str!("front/app.js");
+        assert!(
+            js.contains("document.getElementById(\"elevation-note\").hidden = !needsElevation;"),
+            "the note follows needsElevatedWizard"
+        );
+        assert!(
+            js.contains(
+                "return role === \"daemon-system\" && state.systemContextNeedsElevation === true;"
+            ),
+            "only the pre-logon role on a reinstall a limited wizard cannot write"
+        );
+        assert!(
+            !js.contains("getElementById(\"elevation-relaunch\").hidden"),
+            "the button has no visibility of its own"
+        );
+        assert!(js.contains("invoke(\"cmd_relaunch_elevated\""));
+    }
+
+    /// FR-129 C1 — the operator, 2026-10-30: the wizard never calls the
+    /// daemon an "agent". The text a person sees in the page (comments and
+    /// markup aside) says `roomlerd`, "the daemon" or "device".
+    #[test]
+    fn the_page_text_never_says_agent() {
+        let html = include_str!("front/index.html");
+        let mut text = String::new();
+        let mut rest = html;
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix("<!--") {
+                rest = after.split_once("-->").map_or("", |(_, r)| r);
+            } else if rest.starts_with('<') {
+                rest = rest.split_once('>').map_or("", |(_, r)| r);
+                text.push(' ');
+            } else {
+                let next = rest.find('<').unwrap_or(rest.len());
+                text.push_str(&rest[..next]);
+                rest = &rest[next..];
+            }
+        }
+        assert!(
+            !text.to_ascii_lowercase().contains("agent"),
+            "visible text mentions an agent: {}",
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
         );
     }
 }

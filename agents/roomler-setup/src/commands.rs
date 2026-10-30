@@ -2,9 +2,10 @@
 // Copyright (C) 2026 G ROX EOOD
 //! Tauri invoke handlers for the unified setup wizard.
 //!
-//! 19 handlers — the union of the two legacy wizards' surfaces, the
-//! diagnostics pair (FR-102), the pairing four (FR-129 A3) and the two
-//! of the Linux/macOS daemon install (FR-129 B1) behind ONE command
+//! 22 handlers — the union of the two legacy wizards' surfaces, the
+//! diagnostics pair (FR-102), the pairing four (FR-129 A3), the two
+//! of the Linux/macOS daemon install (FR-129 B1), #3116's elevation probe
+//! and the elevated relaunch pair (FR-129 C3) behind ONE command
 //! vocabulary. Each handler returns `Result<T, String>` (or a
 //! plain value) so Tauri marshals errors as rejected promises the SPA
 //! renders verbatim. The raw enrollment token NEVER flows back from any
@@ -72,6 +73,11 @@ pub struct AgentDetect {
     /// `false` for anything but a JSON `true`, and on Windows, where no
     /// server is asked.
     pub daemon_offered: bool,
+    /// FR-129 C1 — the role the Welcome page preselects
+    /// ([`crate::role::default_role`]): the background service on a machine
+    /// with nothing installed, an existing install's own flavour otherwise.
+    /// `null` = no preselection (the person picks).
+    pub default_role: Option<Role>,
 }
 
 /// Tunnel-CLI probe half. Mirrors the legacy tunnel wizard's
@@ -113,8 +119,17 @@ pub async fn cmd_detect_install(server: Option<String>) -> Result<DetectResult, 
     Ok(DetectResult { agent, tunnel })
 }
 
-/// Windows: the MSI registry probe (`detect_existing_install`), unchanged.
+/// Windows: the MSI registry probe (`detect_existing_install`), and (FR-129
+/// C1) the role it makes the default.
 fn detect_windows(os: crate::role::HostOs) -> AgentDetect {
+    let mut d = detect_windows_install(os);
+    d.default_role =
+        crate::role::default_role(os, d.supported, &d.kind, read_system_context_switch);
+    d
+}
+
+/// The MSI registry probe (`detect_existing_install`), unchanged.
+fn detect_windows_install(os: crate::role::HostOs) -> AgentDetect {
     use roomlerd::install_detect::{ExistingInstall, detect_existing_install};
     let base = AgentDetect {
         supported: true,
@@ -126,6 +141,7 @@ fn detect_windows(os: crate::role::HostOs) -> AgentDetect {
         daemon_roles: crate::role::daemon_roles(os).to_vec(),
         features_server: None,
         daemon_offered: false,
+        default_role: None,
     };
     match detect_existing_install() {
         ExistingInstall::Clean => base,
@@ -152,6 +168,31 @@ fn detect_windows(os: crate::role::HostOs) -> AgentDetect {
     }
 }
 
+/// FR-129 C1 — the SystemContext switch of the installed service, read from
+/// the `Roomler` service's SCM Environment block as the updater reads it
+/// (`roomlerd::updater`, `preserve_system_context_property`). The service
+/// key is readable without elevation. A read error is
+/// [`crate::role::SystemContextSwitch::Unreadable`]: no preselection.
+#[cfg(target_os = "windows")]
+fn read_system_context_switch() -> crate::role::SystemContextSwitch {
+    match roomlerd::win_service::environment::read_service_env_var("ROOMLERD_ENABLE_SYSTEM_SWAP") {
+        Ok(value) => crate::role::system_context_switch(value.as_deref()),
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "could not read the service's SystemContext switch; no role is preselected"
+            );
+            crate::role::SystemContextSwitch::Unreadable
+        }
+    }
+}
+
+/// There is no SCM off Windows; `default_role` never asks there.
+#[cfg(not(target_os = "windows"))]
+fn read_system_context_switch() -> crate::role::SystemContextSwitch {
+    crate::role::SystemContextSwitch::Unreadable
+}
+
 /// Linux and macOS (FR-129 B1): the daemon binary and the two enrollments,
 /// and the server's switch for this OS — a card is shown only on its `true`.
 fn detect_unix(
@@ -168,8 +209,9 @@ fn detect_unix(
         (false, true) => "permachine",
         (false, false) => "clean",
     };
+    let supported = !roles.is_empty() && offered;
     AgentDetect {
-        supported: !roles.is_empty() && offered,
+        supported,
         kind: kind.to_string(),
         peruser_version: d
             .per_user_config
@@ -183,6 +225,8 @@ fn detect_unix(
         daemon_roles: roles.to_vec(),
         features_server: Some(server.to_string()),
         daemon_offered: offered,
+        // FR-129 C1: the switch is Windows-only and never asked here.
+        default_role: crate::role::default_role(os, supported, kind, read_system_context_switch),
     }
 }
 
@@ -212,6 +256,101 @@ pub fn cmd_privileged_half_done() -> Result<(), String> {
 #[tauri::command]
 pub fn cmd_system_context_needs_elevation() -> bool {
     crate::orchestrator_agent::system_context_needs_elevation()
+}
+
+// ─── FR-129 C3: the elevated relaunch ────────────────────────────────────────
+
+/// What `cmd_launch_options` answers: what this run was started with
+/// ([`crate::launch::LaunchArgs`]), for the Welcome page. An elevated
+/// relaunch carries the role the limited copy had picked, which the SPA
+/// preselects over the detected default.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchView {
+    pub role: Option<Role>,
+    pub server: Option<String>,
+    /// Started by "Restart as administrator" (it carried `--after-elevation`).
+    pub relaunched: bool,
+}
+
+/// FR-129 C3 — this run's own command line, parsed and validated.
+#[tauri::command]
+pub fn cmd_launch_options() -> LaunchView {
+    let args = crate::launch::LaunchArgs::from_env();
+    LaunchView {
+        role: args.role,
+        server: args.server,
+        relaunched: args.after_elevation.is_some(),
+    }
+}
+
+/// What "Restart as administrator" came to.
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum RelaunchView {
+    /// The elevated copy started; this one is exiting.
+    Started,
+    /// The person declined the UAC prompt: nothing changed.
+    Cancelled,
+    /// It could not be started; the text says why.
+    Failed { message: String },
+}
+
+/// FR-129 C3 — start this wizard again as administrator (one UAC prompt),
+/// handing it `role` and the Server page's `server`, and exit once it has
+/// started. The Welcome page offers it where #3116's note says an elevated
+/// wizard is needed — before any token exists, so nothing secret is on the
+/// command line. No other path elevates the wizard itself: a fresh install
+/// still gets the MSI's own UAC prompt.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn cmd_relaunch_elevated(
+    app: tauri::AppHandle,
+    role: Role,
+    server: Option<String>,
+) -> RelaunchView {
+    if crate::INSTALL_IN_PROGRESS.load(Ordering::SeqCst) {
+        return RelaunchView::Failed {
+            message: "An install is running; let it finish or cancel it first.".to_string(),
+        };
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            return RelaunchView::Failed {
+                message: format!("Roomler Setup could not find its own file ({e})."),
+            };
+        }
+    };
+    let args = crate::launch::relaunch_args(
+        role,
+        server.as_deref(),
+        &cmd_default_server_url(),
+        std::process::id(),
+    );
+    // The prompt blocks its caller until the person answers; off the async
+    // workers, so the window keeps painting meanwhile.
+    let started = tauri::async_runtime::spawn_blocking(move || {
+        wizard_shared::elevation::run_elevated(&exe, &args)
+    })
+    .await;
+    use wizard_shared::elevation::ElevationError;
+    match started {
+        Ok(Ok(pid)) => {
+            tracing::info!(pid, "started the elevated wizard; this one exits");
+            crate::unix_daemon::clear_kept();
+            app.exit(0);
+            RelaunchView::Started
+        }
+        Ok(Err(ElevationError::Cancelled)) => RelaunchView::Cancelled,
+        Ok(Err(ElevationError::Failed(message))) => RelaunchView::Failed { message },
+        Err(e) => RelaunchView::Failed {
+            message: format!("The administrator start did not complete ({e})."),
+        },
+    }
 }
 
 /// The legacy tunnel wizard's config.toml probe, verbatim: resolve
@@ -804,6 +943,7 @@ mod tests {
                 daemon_roles: vec![Role::DaemonSystem, Role::DaemonUser],
                 features_server: Some("https://example.invalid".to_string()),
                 daemon_offered: true,
+                default_role: Some(Role::DaemonUser),
             },
             tunnel: TunnelDetect {
                 installed: true,
@@ -812,6 +952,13 @@ mod tests {
             },
         };
         let json = serde_json::to_string(&r).unwrap();
+        // FR-129 C1 — the default, camelCase, the role in kebab-case; no
+        // preselection is a JSON null, never an absent key.
+        assert!(json.contains(r#""defaultRole":"daemon-user""#), "{json}");
+        let mut none = r.clone();
+        none.agent.default_role = None;
+        let json_none = serde_json::to_string(&none).unwrap();
+        assert!(json_none.contains(r#""defaultRole":null"#), "{json_none}");
         assert!(json.contains(r#""agent""#), "{json}");
         assert!(json.contains(r#""tunnel""#), "{json}");
         assert!(json.contains("peruserVersion"), "{json}");
@@ -849,19 +996,32 @@ mod tests {
             wizard_macos_daemon: true,
             wizard_unix_daemon: true,
         };
+        // FR-129 C1 — the default follows the same switch; the kind is
+        // whatever this box has, so the expectation is per kind.
+        let clean_or_none = |d: &AgentDetect, clean: Option<Role>| {
+            if d.kind == "clean" {
+                assert_eq!(d.default_role, clean, "{d:?}");
+            }
+        };
         let d = detect_unix(HostOs::Linux, "https://a.invalid", off);
         assert!(!d.supported, "the switch is off");
         assert_eq!(d.os, "linux");
         assert_eq!(d.daemon_roles, vec![Role::DaemonSystem, Role::DaemonUser]);
         assert_eq!(d.features_server.as_deref(), Some("https://a.invalid"));
         assert!(!d.daemon_offered);
+        clean_or_none(&d, Some(Role::TunnelClient));
+        if d.kind != "clean" {
+            assert_eq!(d.default_role, None, "a daemon the device has: no tunnel");
+        }
         let d = detect_unix(HostOs::Linux, "https://a.invalid", on);
         assert!(d.supported);
         assert!(d.daemon_offered);
+        clean_or_none(&d, Some(Role::DaemonSystem));
         let d = detect_unix(HostOs::Macos, "https://a.invalid", on);
         assert!(d.supported);
         assert!(d.daemon_offered);
         assert_eq!(d.daemon_roles, vec![Role::DaemonUser]);
+        assert_eq!(d.default_role, Some(Role::DaemonUser), "whatever the kind");
         // B1-s2 — the field the page binds is this OS's switch alone.
         let linux_only = SetupFeatures {
             pairing: true,
@@ -871,9 +1031,13 @@ mod tests {
         let d = detect_unix(HostOs::Macos, "https://a.invalid", linux_only);
         assert!(!d.supported, "Linux's switch is not the Mac's");
         assert!(!d.daemon_offered);
+        // FR-129 C1 — and the default follows it: no Mac card, so the tunnel
+        // client on a clean Mac, never a daemon role the page does not show.
+        clean_or_none(&d, Some(Role::TunnelClient));
         let d = detect_unix(HostOs::Other, "https://a.invalid", on);
         assert!(!d.supported, "no daemon role on this OS");
         assert!(d.daemon_roles.is_empty());
+        clean_or_none(&d, Some(Role::TunnelClient));
         // The kind is one of the SPA's four, whatever this box has.
         assert!(matches!(
             d.kind.as_str(),
@@ -1074,6 +1238,35 @@ mod tests {
 
         let json = serde_json::to_string(&PairStartView::Unavailable).unwrap();
         assert_eq!(json, r#"{"kind":"unavailable"}"#);
+    }
+
+    /// FR-129 C3 — the SPA reads `kind`, and the role in kebab-case.
+    #[test]
+    fn relaunch_and_launch_views_serialise_as_the_spa_reads_them() {
+        assert_eq!(
+            serde_json::to_string(&RelaunchView::Started).unwrap(),
+            r#"{"kind":"started"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&RelaunchView::Cancelled).unwrap(),
+            r#"{"kind":"cancelled"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&RelaunchView::Failed {
+                message: "no".into()
+            })
+            .unwrap(),
+            r#"{"kind":"failed","message":"no"}"#
+        );
+        let v = LaunchView {
+            role: Some(Role::DaemonSystem),
+            server: None,
+            relaunched: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&v).unwrap(),
+            r#"{"role":"daemon-system","server":null,"relaunched":true}"#
+        );
     }
 
     /// Only a web address is handed to the OS to open.

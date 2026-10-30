@@ -58,6 +58,12 @@ fn main() {
         .with_writer(std::io::stderr)
         .try_init();
 
+    // FR-129 C3 — an elevated relaunch waits for the limited copy that asked
+    // for it to exit BEFORE the single-instance plugin below looks for a
+    // running copy; otherwise it would hand its arguments to that dying copy
+    // and quit.
+    wizard_app::launch::wait_for_parent(&wizard_app::launch::LaunchArgs::from_env());
+
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Per the rc.28 plan's B9 fix: differentiate "install in
@@ -89,6 +95,28 @@ fn main() {
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        // FR-129 C3 — the one window, from its `tauri.conf.json` entry (which
+        // says `"create": false`), so that an ELEVATED wizard can hand
+        // WebView2 a user-data folder of its own: through the API, the only
+        // channel an elevated host honours (`launch::webview_data_directory`
+        // says why). A limited wizard passes nothing and keeps Tauri's folder.
+        .setup(|app| {
+            let config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == wizard_app::launch::MAIN_WINDOW)
+                .cloned()
+                .ok_or("tauri.conf.json has no main window")?;
+            let mut window = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?;
+            if let Some(dir) = wizard_app::launch::webview_data_directory() {
+                tracing::info!(dir = %dir.display(), "elevated: WebView2 keeps its own data folder");
+                window = window.data_directory(dir);
+            }
+            window.build()?;
+            Ok(())
+        })
         // FR-129 B1 — the window's own close button: whatever a Linux/macOS
         // daemon install left in the private scratch directory (an enrolled
         // system-scope config kept for a Retry) is shredded before the
@@ -143,6 +171,10 @@ fn main() {
             commands::cmd_privileged_half_done,
             // #3116 — the Welcome page's elevation gate.
             commands::cmd_system_context_needs_elevation,
+            // FR-129 C3 — "Restart as administrator", and what an elevated
+            // relaunch was handed.
+            commands::cmd_relaunch_elevated,
+            commands::cmd_launch_options,
         ])
         .run(tauri::generate_context!())
         .expect("error while running roomler-setup");
