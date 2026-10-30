@@ -102,14 +102,14 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3650`, `crates/agent-core/src/config.rs:4142`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
-| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:633`, `:958`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3669`, `crates/agent-core/src/config.rs:4153`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:633`, `:965`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
 administrator.** After its first healthy run the daemon hardens that config's
 folder to SYSTEM and Administrators (#3073), and a wizard that is not elevated
 cannot open it. The wizard says so on its first page, before a token is pasted
-or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1128`), and the
+or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1156`), and the
 install refuses it before anything is downloaded (`:290`). Before the enroll it
 also stops on a config it may not read (`:634`, never reported as a damaged
 config) or a folder it may not write (`:640`). The token is never spent on a
