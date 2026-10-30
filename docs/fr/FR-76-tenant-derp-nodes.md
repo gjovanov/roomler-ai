@@ -1,6 +1,6 @@
 # FR-76 — Tenant-owned DERP nodes: a floor the UDP-blocked population can reach *near them*
 
-**Issue:** [#1454](https://github.com/gjovanov/roomler-ai/issues/1454) · **Status:** P3 built ([#3158](https://github.com/gjovanov/roomler-ai/pull/3158), parked for review); P1, P2, P4 and P5 not started · **Opened:** 2026-09-06
+**Issue:** [#1454](https://github.com/gjovanov/roomler-ai/issues/1454) · **Status:** P3 built ([#3158](https://github.com/gjovanov/roomler-ai/pull/3158), merged 2026-10-30 as `b818020a3`); P1, P2, P4 and P5 not started · **Opened:** 2026-09-06
 
 ## Goal
 
