@@ -21,7 +21,7 @@ fleet, and what the watch itself costs (measured, FR-65 AC1).
 | The pump's sites | `peer.rs:6656` (the watch), `:6668` (the one phase list), `:7137` (the pass boundary), `:9909` (the heartbeat's rebase) |
 | Kill switch | `pump_stall_watch` / `ROOMLERD_PUMP_STALL_WATCH=0` (`encode/mod.rs:521`), restart required |
 | The bar | `pump_stall_warn_ms` / `ROOMLERD_PUMP_STALL_WARN_MS`, default 100 (`encode/mod.rs:609`) |
-| Its own cost | `roomlerd stall-watch-cost` (`stall.rs:590`, §8) |
+| Its own cost | `roomlerd stall-watch-cost` (`stall.rs:592`, §8) |
 | The census | `scripts/fr65-stall-census.sh` (§7) |
 
 ## 1. A pass, and where its time goes
@@ -306,7 +306,7 @@ daemon's dated logs and prints one summary row per class (§5's table).
 > `Instant::now()` is ~20–40 ns, and there are N of them") the switch's own
 > description used to quote.
 
-`roomlerd stall-watch-cost` (`stall.rs:590`, dispatched in `app.rs:1231` before
+`roomlerd stall-watch-cost` (`stall.rs:592`, dispatched in `app.rs:1231` before
 any runtime, config, log, lock or updater) runs the pump's per-pass watch work
 through the **real** `PassWatch`, once enabled and once disabled, rounds
 alternating which arm goes first. Everything else in a pass is the same in
@@ -324,20 +324,22 @@ both arms, so the difference is the watch.
 tops out at 144 fps, so 1 % of 6.94 ms = **69.4 µs a pass** — not the 167 µs a
 60 fps budget would give.
 
-**Measured on NEO16, 2026-10-30 02:29Z** — the dev box (Windows 11), a release
+**Measured on NEO16, 2026-10-30 04:54Z** — the dev box (Windows 11), a release
 build of this branch, the desktop in normal use (the interleaving absorbs that
 load). Four runs of 31 rounds:
 
 | Cell | Watch cost per pass, median (range of the four runs) | Worst p90 in any run | Worst p90, % of a 144 fps frame |
 |---|---|---|---|
-| `steady-warm` | 200 ns (183–210) | 224 ns | 0.0032 % |
-| `steady-cold` | 231 ns (204–250) | 276 ns | 0.0040 % |
-| `worst-warm` | 585 ns (573–629) | 695 ns | 0.0100 % |
-| `worst-cold` | 657 ns (607–739) | **869 ns** | **0.0125 %** |
-| `control` | 208.3 µs injected, 184–242 µs measured back (0.88–1.16×) | — | resolved in every run |
+| `steady-warm` | 225 ns (207–242) | 260 ns | 0.0037 % |
+| `steady-cold` | 300 ns (275–329) | 423 ns | 0.0061 % |
+| `worst-warm` | 693 ns (662–713) | 743 ns | 0.0107 % |
+| `worst-cold` | 854 ns (830–992) | **1 090 ns** | **0.0157 %** |
+| `control` | 208.3 µs injected, 208.9–209.2 µs measured back (1.00×) | — | resolved in every run |
 
-One `Instant::now()` costs 24–27 ns here, so the steady cell's seven clock
-reads are most of its 200 ns.
+One `Instant::now()` costs 28–30 ns here, so the steady cell's seven clock
+reads are most of its 225 ns. A first session at 02:29Z, with the box's clock
+read at 24–27 ns, put the worst p90 at 869 ns: the host's state moves these
+numbers more than the watch does.
 
 **Per second — what "1 % of the frame budget" means once a frame takes several
 passes.** The pump re-polls an idle screen every ~2 ms (rc.99), so it makes
@@ -346,14 +348,14 @@ counters (`Δframes_empty + Δframes_encoded + Δframes_skipped_backpressure +
 Δdc_unopen_drops` per window, which over-counts a keepalive pass) over 14 days
 and 36 357 windows: at most **322 passes/s** (NEO16, 144 fps); 299, 314 and 296
 on the three CORPLAP hosts (p99 273–282), up to 10.5 passes per frame interval
-at 30 fps. At the worst cell's p90 that is 322 × 869 ns = **0.28 ms of watch per
-second, 0.028 % of the frame budget — 36× under the 1 % bar**, with every factor
+at 30 fps. At the worst cell's p90 that is 322 × 1 090 ns = **0.35 ms of watch per
+second, 0.035 % of the frame budget — 28× under the 1 % bar**, with every factor
 measured on the host it describes. From this build on the heartbeat carries the
 rate itself (`passes`), so the next read needs no bound.
 
 **The positive control is the "fail first".** The current release cannot run
 this harness at all, so the failing run is the control: with 208 µs injected
-into the ON arm the same instrument reads 184–242 µs, three times the bar — a
+into the ON arm the same instrument reads 208.9–209.2 µs, three times the bar — a
 watch costing that much would FAIL (`the_verdict_needs_the_control_to_resolve`
 pins the verdict side).
 
@@ -362,7 +364,11 @@ as the warm cells do. A cold pass is ~80–280 µs of walking whose time varies 
 microseconds, so the watch came out at −6.4…+5.7 µs medians and p90s up to
 37 µs — a bound set by noise, which multiplied by 322 passes/s is 1.2 % of each
 second and proves nothing. The cold cells now bracket only the watch's own
-operations after each eviction walk (`pass_timed`, `stall.rs:820`).
+operations after each eviction walk (`pass_timed`, `stall.rs:822`). And the
+first control was a CALIBRATED LOOP COUNT: it came back at 0.83–1.16× over
+eight runs, because a core that changes its clock between calibration and run
+shrinks a step count — on a shared CI runner that is a flake waiting to happen.
+The control is now a busy-wait for a fixed wall-clock time, and reads 1.00×.
 
 ```bash
 roomlerd stall-watch-cost            # ~15 s, text; exit 0 PASS, 3 FAIL, 4 INVALID

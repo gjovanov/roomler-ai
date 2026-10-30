@@ -582,11 +582,13 @@ impl PassWatch {
 ///
 /// ⚠️ **The positive control is what makes a pass mean anything.** A harness
 /// that cannot resolve the quantity reports a small number for every cost. So
-/// the run repeats `steady-warm` with a calibrated spin INJECTED into the ON
-/// arm at three times the bar, and at least half of it must be measured back —
-/// which puts it over the bar. If it is not, the verdict is INVALID and nothing
-/// else in the report is evidence. The spin is calibrated immediately before
-/// that cell, so a clock that ramped during the run does not shrink it.
+/// the run repeats `steady-warm` with a busy-wait INJECTED into the ON arm at
+/// three times the bar, and at least half of it must be measured back — which
+/// puts it over the bar. If it is not, the verdict is INVALID and nothing else
+/// in the report is evidence. The wait is a fixed length of WALL-CLOCK time,
+/// not a count of loop steps: a core that changes its clock mid-run (a shared
+/// CI runner, a laptop's turbo) would shrink a step count, and the control
+/// would then fail on the machine rather than on the harness.
 pub mod cost {
     use super::{PassWatch, PhaseAccum};
     use std::hint::black_box;
@@ -853,22 +855,14 @@ pub mod cost {
         ns
     }
 
-    /// A busy loop of `iters` steps — the positive control's injected cost.
+    /// Busy-wait `ns` of wall-clock time — the positive control's injected
+    /// cost. Exact on any machine, whatever its clock does.
     #[inline(never)]
-    fn spin(iters: u64) {
-        let mut x = 0u64;
-        for i in 0..iters {
-            x = black_box(x.wrapping_add(i));
-        }
-        black_box(x);
-    }
-
-    fn spin_ns_per_iter() -> f64 {
-        const N: u64 = 20_000_000;
-        spin(N / 10);
+    fn busy_wait(ns: u64) {
         let t = Instant::now();
-        spin(N);
-        t.elapsed().as_nanos() as f64 / N as f64
+        while (t.elapsed().as_nanos() as u64) < ns {
+            std::hint::spin_loop();
+        }
     }
 
     fn clock_read_ns() -> f64 {
@@ -883,15 +877,15 @@ pub mod cost {
     struct Arm {
         watch: PassWatch,
         acc: PhaseAccum,
-        spin_iters: u64,
+        inject_ns: u64,
     }
 
     impl Arm {
-        fn new(enabled: bool, spin_iters: u64) -> Self {
+        fn new(enabled: bool, inject_ns: u64) -> Self {
             Self {
                 watch: black_box(PassWatch::new(enabled, Duration::from_millis(100))),
                 acc: PhaseAccum::default(),
-                spin_iters,
+                inject_ns,
             }
         }
 
@@ -909,8 +903,8 @@ pub mod cost {
             let t = Instant::now();
             for _ in 0..passes {
                 pass(&mut self.watch, &mut self.acc, profile, walker);
-                if self.spin_iters > 0 {
-                    spin(self.spin_iters);
+                if self.inject_ns > 0 {
+                    busy_wait(self.inject_ns);
                 }
             }
             t.elapsed().as_nanos() as f64 / f64::from(passes.max(1))
@@ -933,9 +927,9 @@ pub mod cost {
         passes: u32,
         rounds: u32,
         segment: usize,
-        inject_iters: u64,
+        inject_ns: u64,
     ) -> CellResult {
-        let mut on = Arm::new(true, inject_iters);
+        let mut on = Arm::new(true, inject_ns);
         let mut off = Arm::new(false, 0);
         let mut walker = Walker::new(segment);
         // One discarded block each: page faults, caches, frequency.
@@ -1006,9 +1000,6 @@ pub mod cost {
                 0,
             ),
         ];
-        // Calibrated HERE, after the cells: a core that ramped its clock during
-        // them would otherwise run the spin faster than it was calibrated at.
-        let inject_iters = (inject_ns as f64 / spin_ns_per_iter().max(0.01)).round() as u64;
         // The control injects ~208 us a pass, so it runs fewer passes than the
         // warm cells it copies or it would take minutes.
         let control_passes = (opts.warm_passes / 100).max(50);
@@ -1018,7 +1009,7 @@ pub mod cost {
             control_passes,
             opts.rounds,
             0,
-            inject_iters,
+            inject_ns,
         );
         Report {
             clock_read_ns: clock_read_ns(),

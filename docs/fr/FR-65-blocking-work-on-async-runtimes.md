@@ -1,6 +1,6 @@
 # FR-65 — Blocking work on async runtimes: measure first, then remove
 
-**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.028 % of the frame budget on NEO16 (AC1)**. **3 of 8 criteria ticked** — AC1, AC2, and AC6 (the caps-probe respawn, measured gone on four hosts) — AC8 (docs) `[~]`. Next: the census after-read on the release that carries #3138 (AC7), then P1. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
+**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.035 % of the frame budget on NEO16 (AC1)**. **3 of 8 criteria ticked** — AC1, AC2, and AC6 (the caps-probe respawn, measured gone on four hosts) — AC8 (docs) `[~]`. Next: the census after-read on the release that carries #3138 (AC7), then P1. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
 
 ## Goal
 
@@ -268,15 +268,15 @@ of each is to produce a number.
       ✅ **Measured 2026-10-30 on NEO16** ([`docs/stall-watch.md` §8](../stall-watch.md#8-what-the-watch-costs-fr-65-ac1), #3138):
       `roomlerd stall-watch-cost` runs an interleaved A/B of the REAL
       `PassWatch`, enabled against disabled. Four runs of 31 rounds: at most
-      **869 ns a pass** (the `worst-cold` p90 — every watch-only timer on every
-      pass, caches evicted between them; 200 ns in the steady warm cell)
+      **1 090 ns a pass** (the `worst-cold` p90 — every watch-only timer on
+      every pass, caches evicted between them; 225 ns in the steady warm cell)
       against a bar of **69.4 µs**, 1 % of a frame at 144 fps — the pump's top
       rate (`frame_rate::CHOICES`), not the 60 fps the design above assumed.
       The positive control, 208 µs injected into the ON arm, came back at
-      0.88–1.16× in every run: the instrument can fail. Per second, at the
+      1.00× in every run: the instrument can fail. Per second, at the
       field's busiest pass rate — measured, at most 322 passes/s over 36 357
-      heartbeat windows on NEO16 and the three CORPLAP hosts — that is **0.28 ms
-      a second, 0.028 % of the frame budget**. Every factor was timed on the
+      heartbeat windows on NEO16 and the three CORPLAP hosts — that is **0.35 ms
+      a second, 0.035 % of the frame budget**. Every factor was timed on the
       hardware it describes. ⚠️ Not a pair of sessions through the kill switch:
       since FR-79 the switch also blinds the governor's `agent_stalled` gate, so
       a session A/B would measure a different controller as well (§4 of the
@@ -431,9 +431,9 @@ _(every entry must carry a before/after from the stall watch.)_
     timed; `recapture`; `poll` — a 2 ms sleep that comes back late is runtime
     starvation, so it doubles as P2's canary; `heartbeat`. Naming never changes
     a verdict.
-  - **AC1** — see the criterion: at most 869 ns a pass on NEO16 against a
-    69.4 µs bar, at most 322 passes/s in the field, 0.028 % of the frame budget;
-    the control resolved at 0.88–1.16× in every run.
+  - **AC1** — see the criterion: at most 1 090 ns a pass on NEO16 against a
+    69.4 µs bar, at most 322 passes/s in the field, 0.035 % of the frame budget;
+    the control (a fixed wall-clock busy-wait) resolved at 1.00× in every run.
   - **AC6** — the caps-probe census (`--probes`): 0 steady-state probe runs on
     CORPLAP-1/-2/-3 over 317 h each and on NEO16 over 44 h; all 83/87/108/12
     probe lines within 60 s of a daemon start. See the criterion and P4.
