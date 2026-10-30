@@ -1,12 +1,13 @@
 # FR-6: CI + release build-speed SLO — every lane ≤10 min warm, self-healing
 
-**Status:** **reopened 2026-10-30** for a regression found the same day (wave 33): from #3125 on,
-`ci.yml`'s Windows clippy lane built cold on every run, because its cache was over its cap. It had
-been **closed 2026-10-30**, with every acceptance criterion field-verified and ticked through
-wave 32 (2026-10-29) and documented in [`docs/build-caches.md`](../build-caches.md). Since
-2026-10-30 the Actions cache also refuses downloads (Open decisions): wave 34 moves the Linux
-lanes off it, and wave 35 skips the heavy lanes on docs-only PRs. What is left after those is
-runner queueing. First shipped and field-verified 2026-08-26
+**Status:** **closed 2026-10-30**, with every acceptance criterion field-verified and ticked and
+documented in [`docs/build-caches.md`](../build-caches.md). It first closed that morning and
+reopened in the afternoon for wave 33: from #3125 on, `ci.yml`'s Windows clippy lane built cold on
+every run, because its cache was over its cap. The Actions cache had also started refusing
+downloads (Open decisions). Wave 34 moved the Linux lanes off it, wave 35 skips the heavy lanes on
+docs-only PRs, and wave 36 lets a cold unit or lint run finish its publish. Waves 33–35 are
+field-verified in the log; wave 36 shows only on the next cold run. What is left is runner
+queueing. First shipped and field-verified 2026-08-26
 (retroactive FR per the CLAUDE.md standing rule — the program ran 2026-07-13 → 2026-08-26 across
 ~20 PRs). Tracking issue: `FR-6` (#773) in gjovanov/roomler-ai/issues.
 
@@ -217,6 +218,8 @@ itself on the affected run's page. Baseline when the program started: releases t
   - **wave 35:** skip the Rust, Windows and macOS lanes on a docs-only change. That means
     fewer downloads, and fewer of the account's 20 concurrent job slots taken;
   - not chosen: a plan with more concurrent jobs (Pro 40, Team 60; macOS stays at 5).
+
+  Both chosen levers shipped and are field-verified (waves 34 and 35, in the log).
 
 - The warm Windows floor is the per-release rebuild of every path crate under the
   size-optimized `cgu=1` profile, plus Azure signing steps. **Measured 2026-10-01, now
@@ -1163,3 +1166,45 @@ itself on the affected run's page. Baseline when the program started: releases t
   restored `ci-windows-clippy-Windows-X64: target 4440 MB, key changed` and kept it, compiled or
   checked 98 units instead of ~1,740, and took 11.2 min against 17.0–22.6 cold. The wizard's step
   took 179 s, against 503 s cold. The macOS overlay check (13.8 min) is now each run's floor.
+- 2026-10-30, 16:00Z: **wave 33 holds.** Master run 41081498611 (attempt 1, at the merge)
+  restored `ci-windows-clippy-Windows-X64` at 4,440 MB and kept it under the new 6,000 MB cap,
+  compiled or checked 98 units, republished `pruned target: 5810 MB -> 4440 MB`, and its Windows
+  clippy job took 13.2 min. #3157's PR run (41085608470) then restored the same cache `same key`
+  in 10.4 min, against 17.0–22.6 min cold.
+- 2026-10-30, 18:07Z: **wave 34 (#3157) merged as `224c79615`.** The three master runs queued
+  behind the next merges were cancelled before they started, so the first to run it was
+  41107105820 (`ff0074175`, 18:27Z). Every Linux family started cold (`no ci-<family>-Linux-X64
+  cache on the seed-cache release yet`) and published:
+
+  | Family | Pruned target | Job |
+  |---|---|---|
+  | lint | 6,830 → 6,081 MB | 27 min 19 s |
+  | unit | 14,068 → 10,373 MB, two parts | cut off at 30 min 15 s (wave 36) |
+  | agent | 4,944 → 3,268 MB | 14 min 18 s |
+  | profiles | 2,588 → 2,445 MB | 9 min 1 s |
+  | recording-ffmpeg | 3,120 → 1,848 MB | 7 min 2 s |
+  | recorder-audio | 3,172 → 1,601 MB | 7 min 49 s |
+  | ffmpeg-encoder | 2,198 → 1,675 MB | 4 min 43 s |
+
+  - **The caps stand.** Every cache sits at 32–65 % of its cap, and no `CI cache over its cap`
+    warning fired.
+  - **The unit lane's publish raced its ceiling.** Its 2,587,763,998-byte archive went up as two
+    parts, and the 30-minute ceiling cut the job off with the second part still uploading. That
+    part landed 2 s later, but "Rust checks" failed on that master run. Wave 36 is the fix.
+  - **Restores:** the next master run (41111211419, `392f09635`) restored all seven `same key`
+    and published nothing new. The unit lane joined its two parts into 10,380 MB and took
+    8 min 34 s (73 units). The first PR run after it (41118044702) restored the same seven
+    `same key`: unit 7 min 31 s, lint 11 min 4 s, agent 8 min 13 s, the other five
+    2.5–7.5 min. Before wave 34, a refused Actions-cache download built the unit lane cold in
+    23–27 min.
+  - `Recorder tests (FR-85)` restores the shared `recorder-audio` cache under its own key, so it
+    always logs `key changed` and builds ~56 units on top. Only `rust-recorder-audio` publishes
+    that family, by design.
+- 2026-10-30, 20:41Z: **agent-v0.4.189 published 17.0 min after its tag run started, all of the
+  gap runner queueing.** The tag run (41122965565) reused its rehearsal in all eight jobs: no
+  daemon compiled, `roomler-desktop` compiled in no companion, `roomlerd 0.4.189` in 4 of 4.
+  Its build steps took 3–41 s. The MSI job waited 9 min 16 s for a Windows runner and the `.pkg`
+  6 min 28 s for a macOS one, against 0–100 s on 0.4.184–0.4.185.
+- 2026-10-30, 21:09Z: **waves 35 and 36 (#3170) merged as `ead2192c9`.** The PR's own run
+  (41124429682) was a code PR: `What changed` found `.github/workflows/ci.yml` outside the docs,
+  set `heavy=true`, and every job ran. The slowest took 10.7 min (Windows clippy).
