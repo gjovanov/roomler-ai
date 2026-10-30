@@ -67,6 +67,11 @@ pub struct AgentDetect {
     pub features_server: Option<String>,
     /// That server's answer (`false` for anything but a JSON `true`).
     pub wizard_unix_daemon: bool,
+    /// FR-129 C1 — the role the Welcome page preselects
+    /// ([`crate::role::default_role`]): the background service on a machine
+    /// with nothing installed, an existing install's own flavour otherwise.
+    /// `null` = no preselection (the person picks).
+    pub default_role: Option<Role>,
 }
 
 /// Tunnel-CLI probe half. Mirrors the legacy tunnel wizard's
@@ -107,8 +112,17 @@ pub async fn cmd_detect_install(server: Option<String>) -> Result<DetectResult, 
     Ok(DetectResult { agent, tunnel })
 }
 
-/// Windows: the MSI registry probe (`detect_existing_install`), unchanged.
+/// Windows: the MSI registry probe (`detect_existing_install`), and (FR-129
+/// C1) the role it makes the default.
 fn detect_windows(os: crate::role::HostOs) -> AgentDetect {
+    let mut d = detect_windows_install(os);
+    d.default_role =
+        crate::role::default_role(os, d.supported, &d.kind, read_system_context_switch);
+    d
+}
+
+/// The MSI registry probe (`detect_existing_install`), unchanged.
+fn detect_windows_install(os: crate::role::HostOs) -> AgentDetect {
     use roomlerd::install_detect::{ExistingInstall, detect_existing_install};
     let base = AgentDetect {
         supported: true,
@@ -120,6 +134,7 @@ fn detect_windows(os: crate::role::HostOs) -> AgentDetect {
         daemon_roles: crate::role::daemon_roles(os).to_vec(),
         features_server: None,
         wizard_unix_daemon: false,
+        default_role: None,
     };
     match detect_existing_install() {
         ExistingInstall::Clean => base,
@@ -146,6 +161,31 @@ fn detect_windows(os: crate::role::HostOs) -> AgentDetect {
     }
 }
 
+/// FR-129 C1 — the SystemContext switch of the installed service, read from
+/// the `Roomler` service's SCM Environment block as the updater reads it
+/// (`roomlerd::updater`, `preserve_system_context_property`). The service
+/// key is readable without elevation. A read error is
+/// [`crate::role::SystemContextSwitch::Unreadable`]: no preselection.
+#[cfg(target_os = "windows")]
+fn read_system_context_switch() -> crate::role::SystemContextSwitch {
+    match roomlerd::win_service::environment::read_service_env_var("ROOMLERD_ENABLE_SYSTEM_SWAP") {
+        Ok(value) => crate::role::system_context_switch(value.as_deref()),
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "could not read the service's SystemContext switch; no role is preselected"
+            );
+            crate::role::SystemContextSwitch::Unreadable
+        }
+    }
+}
+
+/// There is no SCM off Windows; `default_role` never asks there.
+#[cfg(not(target_os = "windows"))]
+fn read_system_context_switch() -> crate::role::SystemContextSwitch {
+    crate::role::SystemContextSwitch::Unreadable
+}
+
 /// Linux and macOS (FR-129 B1): the daemon binary and the two enrollments,
 /// and the server's switch — a card is shown only on its `true`.
 fn detect_unix(
@@ -161,8 +201,9 @@ fn detect_unix(
         (false, true) => "permachine",
         (false, false) => "clean",
     };
+    let supported = !roles.is_empty() && features.wizard_unix_daemon;
     AgentDetect {
-        supported: !roles.is_empty() && features.wizard_unix_daemon,
+        supported,
         kind: kind.to_string(),
         peruser_version: d
             .per_user_config
@@ -176,6 +217,8 @@ fn detect_unix(
         daemon_roles: roles.to_vec(),
         features_server: Some(server.to_string()),
         wizard_unix_daemon: features.wizard_unix_daemon,
+        // FR-129 C1: the switch is Windows-only and never asked here.
+        default_role: crate::role::default_role(os, supported, kind, read_system_context_switch),
     }
 }
 
@@ -793,6 +836,7 @@ mod tests {
                 daemon_roles: vec![Role::DaemonSystem, Role::DaemonUser],
                 features_server: Some("https://example.invalid".to_string()),
                 wizard_unix_daemon: true,
+                default_role: Some(Role::DaemonUser),
             },
             tunnel: TunnelDetect {
                 installed: true,
@@ -801,6 +845,13 @@ mod tests {
             },
         };
         let json = serde_json::to_string(&r).unwrap();
+        // FR-129 C1 — the default, camelCase, the role in kebab-case; no
+        // preselection is a JSON null, never an absent key.
+        assert!(json.contains(r#""defaultRole":"daemon-user""#), "{json}");
+        let mut none = r.clone();
+        none.agent.default_role = None;
+        let json_none = serde_json::to_string(&none).unwrap();
+        assert!(json_none.contains(r#""defaultRole":null"#), "{json_none}");
         assert!(json.contains(r#""agent""#), "{json}");
         assert!(json.contains(r#""tunnel""#), "{json}");
         assert!(json.contains("peruserVersion"), "{json}");
@@ -834,21 +885,35 @@ mod tests {
             pairing: true,
             wizard_unix_daemon: true,
         };
+        // FR-129 C1 — the default follows the same switch; the kind is
+        // whatever this box has, so the expectation is per kind.
+        let clean_or_none = |d: &AgentDetect, clean: Option<Role>| {
+            if d.kind == "clean" {
+                assert_eq!(d.default_role, clean, "{d:?}");
+            }
+        };
         let d = detect_unix(HostOs::Linux, "https://a.invalid", off);
         assert!(!d.supported, "the switch is off");
         assert_eq!(d.os, "linux");
         assert_eq!(d.daemon_roles, vec![Role::DaemonSystem, Role::DaemonUser]);
         assert_eq!(d.features_server.as_deref(), Some("https://a.invalid"));
         assert!(!d.wizard_unix_daemon);
+        clean_or_none(&d, Some(Role::TunnelClient));
+        if d.kind != "clean" {
+            assert_eq!(d.default_role, None, "a daemon the device has: no tunnel");
+        }
         let d = detect_unix(HostOs::Linux, "https://a.invalid", on);
         assert!(d.supported);
         assert!(d.wizard_unix_daemon);
+        clean_or_none(&d, Some(Role::DaemonSystem));
         let d = detect_unix(HostOs::Macos, "https://a.invalid", on);
         assert!(d.supported);
         assert_eq!(d.daemon_roles, vec![Role::DaemonUser]);
+        assert_eq!(d.default_role, Some(Role::DaemonUser), "whatever the kind");
         let d = detect_unix(HostOs::Other, "https://a.invalid", on);
         assert!(!d.supported, "no daemon role on this OS");
         assert!(d.daemon_roles.is_empty());
+        clean_or_none(&d, Some(Role::TunnelClient));
         // The kind is one of the SPA's four, whatever this box has.
         assert!(matches!(
             d.kind.as_str(),

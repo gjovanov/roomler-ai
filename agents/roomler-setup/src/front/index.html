@@ -74,7 +74,7 @@
             <div>
               <strong>Reach others only — tunnel client</strong>
               <p class="muted">Installs the <code>roomler</code> CLI and enrolls it,
-              so this machine can forward ports through enrolled agents. No daemon.</p>
+              so this machine can forward ports through enrolled devices. No daemon.</p>
             </div>
           </label>
         </fieldset>
@@ -253,7 +253,7 @@
            has no pairing. Live validation unchanged. -->
       <details id="paste-wrap" class="card">
         <summary id="paste-summary">I already have a token</summary>
-        <p class="muted" id="paste-lead">Paste a fresh enrollment token from Admin → Agents.</p>
+        <p class="muted" id="paste-lead">Paste a fresh enrollment token from the dashboard's Devices → Enroll → Device.</p>
         <label class="field">
           <span>Token</span>
           <textarea id="token-input" rows="4" autocomplete="off" spellcheck="false"
@@ -271,9 +271,9 @@
             <textarea id="root-token-input" rows="3" autocomplete="off" spellcheck="false"
                       placeholder="eyJhbGc..."></textarea>
             <small class="muted">On a Mac the private network runs in a second, root
-            service, enrolled as its own device with its own token — mint a second one in
-            Admin → Agents. Or untick the overlay network under Advanced options to install
-            screen sharing only.</small>
+            service, enrolled as its own device with its own token — mint a second one under
+            Devices → Enroll → Device. Or untick the overlay network under Advanced options to
+            install screen sharing only.</small>
           </label>
           <p id="root-token-status" class="muted" hidden></p>
         </div>
@@ -292,8 +292,8 @@
         <div id="token-warn-audience" class="warning" hidden>
           This is not a tunnel-enrollment token (token type is
           <code id="token-warn-aud-name"></code>). You'll get one from
-          <strong>Admin → Tunnels</strong>; the agent-enrollment token from
-          Admin → Agents is a different one.
+          <strong>Devices → Enroll → Tunnel client</strong>; a device's enrollment
+          token, from Devices → Enroll → Device, is a different one.
         </div>
         <div id="token-warn-expired" class="error" hidden>
           This token has already expired. Ask your admin to issue a new one.

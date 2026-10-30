@@ -58,14 +58,16 @@ const ROLE_COPY = {
       label: "This user only",
     },
   },
+  // FR-129 C1: "recommended" marks the card the Welcome page preselects on a
+  // machine with nothing installed (role::default_role), on every OS.
   linux: {
     "daemon-system": {
-      title: "Be accessed — system service (root, recommended for servers)",
+      title: "Be accessed — system service (root, recommended)",
       desc: "The root roomlerd service: on at boot before anyone signs in, the private network over its own TUN interface, updates installed by itself. Shows the desktop of whoever is signed in. Asks for your password once.",
       label: "System service (root)",
     },
     "daemon-user": {
-      title: "Be accessed — this user only (recommended for a desktop)",
+      title: "Be accessed — this user only",
       desc: "A service in your own session: screen sharing and the private network through a userspace stack, no root daemon. Asks for your password once, to place the package.",
       label: "This user only",
     },
@@ -74,7 +76,7 @@ const ROLE_COPY = {
     // FR-129 B2: the per-user half, and — with "Join the overlay network"
     // ticked, the default — the root half beside it, a second device.
     "daemon-user": {
-      title: "Be accessed — this Mac",
+      title: "Be accessed — this Mac (recommended)",
       desc: "Screen sharing and remote control in your session, and the private network in a root service beside it, so this Mac joins as two devices. Asks for your password once. Untick “Join the overlay network” under Advanced options for screen sharing only.",
       label: "This Mac",
     },
@@ -172,20 +174,30 @@ async function init() {
   await probeAndRender();
 }
 
+// FR-129 C1 — which persisted steps a new launch resumes: a run killed on the
+// Server or the Token page, with its role and device name. Any other step —
+// Welcome, an install that was interrupted or that finished — starts a new
+// run at Welcome with no role and the default device name, so the role the
+// detection recommends is preselected there and a test run's name is never
+// reused. (The field case: a finished tunnel-client run's state preselected
+// the tunnel card and its device name on the operator's own machine.)
+const RESUMABLE_STEPS = ["server", "token"];
+
 async function loadPersistedState() {
   try {
     const persisted = await invoke("cmd_load_state");
-    // Unknown / stale role strings re-prompt the picker on resume.
-    state.role = ROLES.includes(persisted.role) ? persisted.role : null;
+    // The server is the person's setting, not a run's: always kept.
     state.server = persisted.serverUrl ?? "";
-    state.device = persisted.deviceName ?? "";
-    // Step "install" or "done" on relaunch means the previous install
-    // was either interrupted or successful; either way, dump the
-    // operator back at Welcome so they can re-detect and decide.
-    if (persisted.step === "install" || persisted.step === "done") {
-      state.step = "welcome";
+    // Unknown / stale role strings re-prompt the picker on resume.
+    const role = ROLES.includes(persisted.role) ? persisted.role : null;
+    if (RESUMABLE_STEPS.includes(persisted.step) && role !== null) {
+      state.step = persisted.step;
+      state.role = role;
+      state.device = persisted.deviceName ?? "";
     } else {
-      state.step = STEPS.includes(persisted.step) ? persisted.step : "welcome";
+      state.step = "welcome";
+      state.role = null;
+      state.device = "";
     }
   } catch (err) {
     console.warn("load wizard state failed:", err);
@@ -229,6 +241,8 @@ async function probeAndRender() {
       agent: {
         supported: false, kind: "clean", peruserVersion: null, permachineVersion: null, ambiguous: false,
         os: "other", daemonRoles: [], featuresServer: null, wizardUnixDaemon: false,
+        // FR-129 C1: nothing is known, so nothing is preselected.
+        defaultRole: null,
       },
       tunnel: { installed: false, machineName: null, configPath: null },
     };
@@ -533,6 +547,13 @@ function renderWelcome() {
   if (state.role && state.role !== "tunnel-client" && !offered.has(state.role)) {
     state.role = null;
   }
+  // FR-129 C1 — nothing picked yet: preselect the role Rust recommends (the
+  // background service on a machine with nothing installed, the installed
+  // flavour otherwise) when this page offers it. Not persisted: a click
+  // persists, as before, and Continue persists whatever is selected.
+  if (state.role === null && isOfferedRole(a.defaultRole, offered)) {
+    state.role = a.defaultRole;
+  }
 
   // Restore radio selection.
   if (state.role) {
@@ -576,6 +597,13 @@ function renderWelcome() {
 // reinstall finds. A fresh install still works from a double-click.
 function needsElevatedWizard(role) {
   return role === "daemon-system" && state.systemContextNeedsElevation === true;
+}
+
+// FR-129 C1 — may `role` be preselected on this page? A role the SPA knows,
+// and one of the cards shown: a daemon card this OS and server offer, or the
+// tunnel client, which every OS has.
+function isOfferedRole(role, offered) {
+  return ROLES.includes(role) && (role === "tunnel-client" || offered.has(role));
 }
 
 // FR-129 B1 — why no daemon card is shown, in the person's terms. On Linux
@@ -847,11 +875,13 @@ function renderToken() {
   // The paste path's role-specific hint (the whole page's lead before
   // FR-129; now the line under "I already have a token").
   const rootHalf = wantsRootHalf();
+  // FR-129 C1: the dashboard's own names (Devices → Enroll → Device or
+  // Tunnel client); the daemon is never called an agent here.
   document.getElementById("paste-lead").textContent = state.role === "tunnel-client"
-    ? "Paste a tunnel-enrollment token from Admin → Tunnels."
+    ? "Paste a tunnel-enrollment token from the dashboard's Devices → Enroll → Tunnel client."
     : rootHalf
-      ? "Paste two fresh enrollment tokens from Admin → Agents: one for this Mac's screen, one for its private network."
-      : "Paste a fresh enrollment token from Admin → Agents.";
+      ? "Paste two fresh enrollment tokens from the dashboard's Devices → Enroll → Device: one for this Mac's screen, one for its private network."
+      : "Paste a fresh enrollment token from the dashboard's Devices → Enroll → Device.";
   // FR-129 B2: the second field is the macOS root half's, shown only when
   // this install adds it.
   document.getElementById("root-token-wrap").hidden = !rootHalf;
@@ -1664,16 +1694,16 @@ function checklistLabel(event) {
   if (t === "PreflightOk") return `Pre-flight: detected ${d.existing}`;
   if (t === "PreflightWarning") return `${base}: ${d.message}`;
   if (t === "AssetResolving") return `Resolving download URL (${d.artifact})`;
-  if (t === "AssetResolved") return `Resolved tag ${d.tag} (${(d.sizeBytes / 1_000_000).toFixed(1)} MB)`;
+  if (t === "AssetResolved") return `Resolved ${releaseLabel(d.tag)} (${(d.sizeBytes / 1_000_000).toFixed(1)} MB)`;
   if (t === "MsiSpawned") return `Running MSI installer (PID ${d.pid})`;
   if (t === "MsiCompleted") return `MSI installer finished (exit ${d.code}, ${d.decoded})`;
   if (t === "ExtractDone") return `Extracted. Binary at ${d.tunnelBinary}`;
   if (t === "IntegrationDone")
     return `Integration: PATH ${d.pathUpdated ? "updated" : "unchanged"}; shortcut ${d.shortcutCreated ? "created" : "skipped"}`;
   if (t === "EnrollOk" && d.principalKind === ROOT_HALF_KIND) {
-    return `Enrolled the private network's root half (agent ${d.principalId})`;
+    return `Enrolled the private network's root half (device ${d.principalId})`;
   }
-  if (t === "EnrollOk") return `Enrolled (${d.principalKind} ${d.principalId})`;
+  if (t === "EnrollOk") return `Enrolled (${principalKindLabel(d.principalKind)} ${d.principalId})`;
   if (t === "AnchorSkipped") return `Not anchored: ${d.reason}`;
   if (t === "DaemonRestartOk" && d.pid) return `${base} (PID ${d.pid})`;
   if (t === "DaemonRestartSkipped") return `${base}: ${d.reason}`;
@@ -1687,6 +1717,28 @@ function checklistLabel(event) {
     return `${stageLabel} failed: ${d.message}${d.hint ? " — " + d.hint : ""}`;
   }
   return base;
+}
+
+// FR-129 C1 — what a person reads for a release: the product and its
+// version, never the release tag (`agent-v0.4.188`), which stays a wire
+// value — the updater, the proxies and the DoneReport all key on it.
+function releaseVersion(tag) {
+  const m = /^(?:agent|tunnel|setup)-v(.+)$/.exec(tag ?? "");
+  return m ? m[1] : (tag ?? "");
+}
+
+function releaseLabel(tag) {
+  const version = releaseVersion(tag) || "(unknown version)";
+  if (/^agent-v/.test(tag ?? "")) return `roomlerd ${version}`;
+  if (/^tunnel-v/.test(tag ?? "")) return `the roomler CLI ${version}`;
+  return version;
+}
+
+// FR-129 C1 — the EnrollOk kind for a person (the wire keeps `agent`).
+function principalKindLabel(kind) {
+  if (kind === "agent") return "device";
+  if (kind === "tunnel_client") return "tunnel client";
+  return kind ?? "";
 }
 
 // ─── Step 5: Done ──────────────────────────────────────────────────────────
@@ -1756,7 +1808,7 @@ function renderDone() {
   }
 
   document.getElementById("done-principal-label").textContent =
-    isTunnel ? "Tunnel client ID" : "Agent ID";
+    isTunnel ? "Tunnel client ID" : "Device ID";
   document.getElementById("done-principal-id").textContent =
     done.principalId ?? "(unknown — install report missing)";
   document.getElementById("done-tenant-id").textContent = done.tenantId ?? "(unknown)";
@@ -1768,7 +1820,8 @@ function renderDone() {
     document.getElementById("done-root-half-id").textContent = rootHalf.principalId;
   }
   document.getElementById("done-role").textContent = roleLabel(done.role ?? state.role);
-  document.getElementById("done-tag").textContent = done.tag ?? "(unknown)";
+  // FR-129 C1: the version, not the release tag.
+  document.getElementById("done-tag").textContent = done.tag ? releaseVersion(done.tag) : "(unknown)";
 
   // Daemon extras: the MSI flavour on Windows, the scope on Linux/macOS.
   const flavour = done.flavour ?? (isTunnel ? null : roleFlavour(state.role));

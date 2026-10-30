@@ -145,6 +145,93 @@ pub fn root_half_name(device_name: &str) -> String {
     format!("{device_name}-daemon")
 }
 
+/// FR-129 C1 — what the Windows service's SystemContext switch says: the
+/// `ROOMLERD_ENABLE_SYSTEM_SWAP` entry in the `Roomler` service's SCM
+/// Environment block, the one the supervisor reads to run its worker as
+/// SYSTEM (the lock screen, UAC dialogs, admin apps) and the updater reads
+/// to keep that mode across an MSI (`roomlerd::updater`,
+/// `preserve_system_context_property`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemContextSwitch {
+    /// Set to a value the daemon reads as on.
+    On,
+    /// Absent, or set to a value the daemon reads as off: an attended
+    /// service.
+    Off,
+    /// The Environment could not be read (no service key, a registry
+    /// error): nobody can say which mode the device runs in.
+    Unreadable,
+}
+
+/// FR-129 C1 — the switch from the Environment value as read: `None` when the
+/// entry is absent. On is what the daemon itself reads as on (the supervisor's
+/// `system_swap_enabled`: `1`, `true`, `yes` or `on`, trimmed, any case),
+/// because the default exists to keep the posture the device RUNS in. The
+/// updater's stricter `"1"` decides what to hand the MSI's custom action,
+/// which is another question.
+pub fn system_context_switch(value: Option<&str>) -> SystemContextSwitch {
+    let on = value.is_some_and(|v| {
+        let v = v.trim();
+        ["1", "true", "yes", "on"]
+            .iter()
+            .any(|t| v.eq_ignore_ascii_case(t))
+    });
+    if on {
+        SystemContextSwitch::On
+    } else {
+        SystemContextSwitch::Off
+    }
+}
+
+/// FR-129 C1 — the role the Welcome page preselects, or `None` for no
+/// preselection (the person picks, as before C1).
+///
+/// Chosen among what this OS offers RIGHT NOW: its [`daemon_roles`] when
+/// `supported` (on Linux and macOS the chosen server's `wizard_unix_daemon`
+/// switch), and the tunnel client.
+///
+/// - Nothing installed (`kind` `"clean"`): the first daemon role offered —
+///   the background service (Windows `DaemonSystem`: perMachine +
+///   SystemContext; Linux `DaemonSystem`: the root service; macOS
+///   `DaemonUser`, which brings the root half with the overlay box ticked) —
+///   else the tunnel client, the only card there is.
+/// - An existing install keeps its own flavour, so a default never makes a
+///   flavour switch or a posture change the person did not ask for:
+///   `"peruser"` → `DaemonUser`; on Linux a system enrollment (`"permachine"`,
+///   or both, `"ambiguous"`) → `DaemonSystem`; on macOS, whose one daemon role
+///   it is, `DaemonUser`; on Windows a perMachine install reads the
+///   SystemContext switch — on → `DaemonSystem`, off or absent →
+///   `DaemonMachine` (an attended install stays attended: SystemContext makes
+///   the lock screen remotely controllable, which only the person may
+///   choose), unreadable → `None`. `system_context` is asked only there.
+/// - That flavour not offered right now (a Linux or macOS server with the
+///   switch off), or a `kind` this build does not know: `None`. The tunnel
+///   client would be a different product from the one the device has.
+pub fn default_role(
+    os: HostOs,
+    supported: bool,
+    kind: &str,
+    system_context: impl FnOnce() -> SystemContextSwitch,
+) -> Option<Role> {
+    let offered: &[Role] = if supported { daemon_roles(os) } else { &[] };
+    let keep = match kind {
+        "clean" => return Some(offered.first().copied().unwrap_or(Role::TunnelClient)),
+        "peruser" => Role::DaemonUser,
+        "permachine" | "ambiguous" => match os {
+            HostOs::Windows => match system_context() {
+                SystemContextSwitch::On => Role::DaemonSystem,
+                SystemContextSwitch::Off => Role::DaemonMachine,
+                SystemContextSwitch::Unreadable => return None,
+            },
+            HostOs::Linux => Role::DaemonSystem,
+            HostOs::Macos => Role::DaemonUser,
+            HostOs::Other => return None,
+        },
+        _ => return None,
+    };
+    offered.contains(&keep).then_some(keep)
+}
+
 /// Operator-selected role. Serialises kebab-case (`"daemon-system"` /
 /// `"daemon-user"` / `"daemon-machine"` / `"tunnel-client"`) — the
 /// same strings the SPA's role cards carry and the persisted
@@ -392,6 +479,112 @@ mod tests {
         assert_eq!(pair_halves(true), 2);
         assert_eq!(pair_halves(false), 1);
         assert_eq!(root_half_name("studio-mac"), "studio-mac-daemon");
+    }
+
+    /// FR-129 C1 — the default role per OS and install kind (the table in the
+    /// spec's design section C). Nothing installed preselects the background
+    /// service the OS offers; an existing install keeps its flavour; nothing
+    /// is preselected where that flavour is not offered or unknown.
+    #[test]
+    fn the_default_role_per_os_and_install_kind() {
+        use SystemContextSwitch::{Off, On, Unreadable};
+        // Windows offers its three daemon roles whatever the server says.
+        let win = |kind, sc| default_role(HostOs::Windows, true, kind, || sc);
+        assert_eq!(win("clean", Unreadable), Some(Role::DaemonSystem));
+        assert_eq!(win("peruser", On), Some(Role::DaemonUser));
+        assert_eq!(win("permachine", On), Some(Role::DaemonSystem));
+        assert_eq!(
+            win("permachine", Off),
+            Some(Role::DaemonMachine),
+            "an attended install stays attended"
+        );
+        assert_eq!(win("permachine", Unreadable), None, "the person picks");
+        assert_eq!(win("ambiguous", On), Some(Role::DaemonSystem));
+        assert_eq!(win("ambiguous", Off), Some(Role::DaemonMachine));
+        assert_eq!(win("ambiguous", Unreadable), None);
+        assert_eq!(win("kind-from-the-future", On), None);
+
+        // Linux with the server's switch on: the root service by default.
+        let linux = |kind| default_role(HostOs::Linux, true, kind, || Unreadable);
+        assert_eq!(linux("clean"), Some(Role::DaemonSystem));
+        assert_eq!(linux("peruser"), Some(Role::DaemonUser));
+        assert_eq!(linux("permachine"), Some(Role::DaemonSystem));
+        assert_eq!(linux("ambiguous"), Some(Role::DaemonSystem));
+
+        // macOS: its one daemon role (with the root half when the overlay box
+        // is ticked, the box's macOS default).
+        for kind in ["clean", "peruser", "permachine", "ambiguous"] {
+            assert_eq!(
+                default_role(HostOs::Macos, true, kind, || Unreadable),
+                Some(Role::DaemonUser),
+                "{kind}"
+            );
+        }
+
+        // The switch off (or an older server): only the tunnel card is shown.
+        for os in [HostOs::Linux, HostOs::Macos] {
+            assert_eq!(
+                default_role(os, false, "clean", || Unreadable),
+                Some(Role::TunnelClient),
+                "{os:?}: the only card"
+            );
+            for kind in ["peruser", "permachine", "ambiguous"] {
+                assert_eq!(
+                    default_role(os, false, kind, || Unreadable),
+                    None,
+                    "{os:?} {kind}: never the tunnel client over a daemon the device has"
+                );
+            }
+        }
+        assert_eq!(
+            default_role(HostOs::Other, true, "clean", || Unreadable),
+            Some(Role::TunnelClient)
+        );
+    }
+
+    /// FR-129 C1 — the switch is asked only where it decides: a Windows
+    /// perMachine (or ambiguous) install. Everywhere else a registry read
+    /// would be wasted, and on Linux and macOS there is no registry.
+    #[test]
+    fn the_system_context_switch_is_read_only_for_a_windows_permachine_install() {
+        let asked = std::cell::Cell::new(0);
+        let probe = || {
+            asked.set(asked.get() + 1);
+            SystemContextSwitch::On
+        };
+        for kind in ["clean", "peruser", "kind-from-the-future"] {
+            default_role(HostOs::Windows, true, kind, probe);
+        }
+        for os in [HostOs::Linux, HostOs::Macos, HostOs::Other] {
+            for kind in ["clean", "peruser", "permachine", "ambiguous"] {
+                default_role(os, true, kind, probe);
+            }
+        }
+        assert_eq!(asked.get(), 0);
+        default_role(HostOs::Windows, true, "permachine", probe);
+        default_role(HostOs::Windows, true, "ambiguous", probe);
+        assert_eq!(asked.get(), 2);
+    }
+
+    /// FR-129 C1 — on is what the daemon reads as on, so the default keeps
+    /// the posture the device runs in; anything else is an attended service.
+    #[test]
+    fn the_system_context_switch_reads_as_the_daemon_reads_it() {
+        for on in ["1", "true", "TRUE", "Yes", "on", " 1 ", "On\t"] {
+            assert_eq!(
+                system_context_switch(Some(on)),
+                SystemContextSwitch::On,
+                "{on:?}"
+            );
+        }
+        for off in ["0", "false", "no", "off", "", "2", "enabled"] {
+            assert_eq!(
+                system_context_switch(Some(off)),
+                SystemContextSwitch::Off,
+                "{off:?}"
+            );
+        }
+        assert_eq!(system_context_switch(None), SystemContextSwitch::Off);
     }
 
     #[test]

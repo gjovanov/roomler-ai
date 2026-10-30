@@ -105,4 +105,31 @@ mod front_tests {
             "the role cards are still label.radio; re-check the rule if they change"
         );
     }
+
+    /// FR-129 C1 — the operator, 2026-10-30: the wizard never calls the
+    /// daemon an "agent". The text a person sees in the page (comments and
+    /// markup aside) says `roomlerd`, "the daemon" or "device".
+    #[test]
+    fn the_page_text_never_says_agent() {
+        let html = include_str!("front/index.html");
+        let mut text = String::new();
+        let mut rest = html;
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix("<!--") {
+                rest = after.split_once("-->").map_or("", |(_, r)| r);
+            } else if rest.starts_with('<') {
+                rest = rest.split_once('>').map_or("", |(_, r)| r);
+                text.push(' ');
+            } else {
+                let next = rest.find('<').unwrap_or(rest.len());
+                text.push_str(&rest[..next]);
+                rest = &rest[next..];
+            }
+        }
+        assert!(
+            !text.to_ascii_lowercase().contains("agent"),
+            "visible text mentions an agent: {}",
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+    }
 }
