@@ -68,7 +68,7 @@ removed afterwards.
 | P1b | Claude Code 2.1.280 → 2.1.314, so that Sonnet 5.5 is first-class | done 2026-10-30 | Rename the kept 2.1.280 binary back. |
 | P2 | Hub view mod: list, counts, enter (tasks and conversation), answer, activate and deactivate, back. `hub-view` 0.2.0, 35 tests, shown live on 2.1.314 ([Step log](https://github.com/gjovanov/roomler-ai/issues/3127#issuecomment-6515103295)). | shipped 2026-10-30 | Remove the plugin's folder. |
 | P3 | First real backlog run, at least two workers in parallel on real FRs | in progress 2026-10-30 | ⏸ Pause in the hub issue. |
-| P4 | Docs: `docs/agent-hub.md` in house style, plus a `docs/README.md` row | in review, PR #PRNUM | Revert the PR; the tooling does not read the doc. |
+| P4 | Docs: `docs/agent-hub.md` in house style, plus a `docs/README.md` row | in review, PR #3144 | Revert the PR; the tooling does not read the doc. |
 
 ## Acceptance criteria
 
@@ -110,7 +110,7 @@ removed afterwards.
   Evidence: [`docs/agent-hub.md`](../agent-hub.md), with four mermaid diagrams (the hub and its spokes,
   the tick loop, a worker's states, the message sequence) and tables for the pieces, state, verbs,
   signals, tiers, rotation, the view and the traps; and its row in [`docs/README.md`](../README.md),
-  under 🧭 How the work is run, in the table and the map (PR #PRNUM).
+  under 🧭 How the work is run, in the table and the map (PR #3144).
 
 ## Open decisions
 
