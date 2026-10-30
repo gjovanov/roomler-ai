@@ -65,6 +65,9 @@ pub mod agent_exec;
 pub mod agent_log;
 pub mod agent_org;
 pub mod agent_release;
+/// FR-129 C2b — the client the three release-asset proxies stream through: a
+/// connect and an idle-read bound, never a total deadline.
+pub mod asset_stream;
 pub mod auth_agent;
 pub mod consent;
 pub mod consent_consumer;

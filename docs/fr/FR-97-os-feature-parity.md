@@ -313,7 +313,7 @@ and the consent chain's fallbacks.
 | A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2448-2454`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:80-81`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` in the arm64 build step before P7a; recordings write Opus, not AAC. *P7a (#2881):* the arm64 build carries the vendored FFmpeg (nvenc, vaapi, vulkan, AAC); a cell's proof is FR-122 | P7a |
-| A4 | Tunnel CLI and wizard on Linux arm64 | — | ❌ | — | x86_64 only (`release-tunnel.yml:127-131`, `release-setup.yml:189-194`). *P7b:* the aarch64 jobs (`.github/workflows/release-tunnel.yml:215`, `.github/workflows/release-setup.yml:260`) and the proxy's `linux-aarch64` (`crates/modules/fleet/src/tunnel_release.rs:197`), from 0.4.149 | P7b |
+| A4 | Tunnel CLI and wizard on Linux arm64 | — | ❌ | — | x86_64 only (`release-tunnel.yml:127-131`, `release-setup.yml:189-194`). *P7b:* the aarch64 jobs (`.github/workflows/release-tunnel.yml:215`, `.github/workflows/release-setup.yml:260`) and the proxy's `linux-aarch64` (`crates/modules/fleet/src/tunnel_release.rs:194`), from 0.4.149 | P7b |
 
 The server records `os` on every agent row but no architecture (`models.rs:14-18`, `:2075`), so it cannot count the
 devices A1 and A2 would serve. P0d adds the native machine architecture to the hello. On Windows that is
