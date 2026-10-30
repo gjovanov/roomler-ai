@@ -157,9 +157,11 @@ first master run built the unit lane cold (1,795 crates) and hit the 30-minute c
 seconds after the cut. The unit and lint lanes now allow 45 and 40 minutes (`ci.yml:474`,
 `:159`), about 1.5 times their measured cold runs (FR-6 wave 36).
 
-The Linux lanes' caps are first estimates, about 1.5 times each lane's old Actions-cache
-archive at the 4.3× unpack ratio the integration lane measures (its 1,181 MB asset restores to
-5,077 MB). The first master run's `pruned target: A MB -> B MB` line gives the real figure.
+The Linux lanes' caps began as estimates, about 1.5 times each lane's old Actions-cache archive
+at the 4.3× unpack ratio the integration lane measures (its 1,181 MB asset restores to
+5,077 MB). Wave 34's first master publish (run 41107105820) put every lane at 32–65 % of its
+cap: unit 10,373 MB of 16,000, lint 6,081 of 10,000, agent 3,268 of 7,000, and the four
+5,000 MB lanes at 1,601–2,445.
 
 **A seed grows per release, not per build.** Cargo names an artifact by the unit's name,
 version, features and profile, never by its source. So a rebuild of the same version
