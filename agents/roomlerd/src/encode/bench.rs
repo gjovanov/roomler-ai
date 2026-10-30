@@ -1015,12 +1015,16 @@ async fn run_cell(
             }
         };
         enc_ms.push(t.elapsed().as_secs_f64() * 1000.0);
-        for p in packets {
-            total_bytes += p.data.len() as u64;
-            if p.is_keyframe {
-                idr_sizes.push(p.data.len());
+        // A frame is everything one `encode()` returns: OpenH264 hands an IDR
+        // back as two packets (the parameter sets, then the slice), and a
+        // count of packets would count every IDR twice.
+        let bytes: usize = packets.iter().map(|p| p.data.len()).sum();
+        if bytes > 0 {
+            total_bytes += bytes as u64;
+            if packets.iter().any(|p| p.is_keyframe) {
+                idr_sizes.push(bytes);
             } else {
-                delta_sizes.push(p.data.len());
+                delta_sizes.push(bytes);
             }
         }
         if paced {
@@ -1617,7 +1621,8 @@ mod tests {
     }
 
     /// A fake encoder: a keyframe on its first frame and on every request,
-    /// fixed sizes otherwise.
+    /// returned as OpenH264 returns one (a 30-byte parameter-set packet, then
+    /// the 5 000-byte slice), and a 500-byte delta otherwise.
     struct FakeEncoder {
         name: &'static str,
         hw: bool,
@@ -1635,12 +1640,17 @@ mod tests {
             let key = self.frames == 0 || self.key_next;
             self.key_next = false;
             self.frames += 1;
-            Ok(vec![EncodedPacket {
-                data: vec![0; if key { 5_000 } else { 500 }],
+            let packet = |len: usize| EncodedPacket {
+                data: vec![0; len],
                 is_keyframe: key,
                 duration_us: 33_333,
                 qp: None,
-            }])
+            };
+            Ok(if key {
+                vec![packet(30), packet(5_000)]
+            } else {
+                vec![packet(500)]
+            })
         }
         fn request_keyframe(&mut self) {
             self.key_next = true;
@@ -1709,13 +1719,14 @@ mod tests {
         let rtp = &results[0];
         assert_eq!(rtp.opened.map(|o| o.name), Some("fake-sw"));
         assert_eq!(rtp.frames, 90);
-        // 90 frames at 30 fps: the opening keyframe and one at frames 30 and 60.
+        // 90 frames at 30 fps: the opening keyframe and one at frames 30 and
+        // 60, each counted once, at the size of both its packets.
         assert_eq!(rtp.idr.n, 3);
-        assert_eq!((rtp.idr.p50, rtp.idr.max), (5_000, 5_000));
+        assert_eq!((rtp.idr.p50, rtp.idr.max), (5_030, 5_030));
         assert_eq!((rtp.delta.n, rtp.delta.p50), (87, 500));
-        // 3 × 5000 + 87 × 500 bytes over 3 s.
+        // 3 × 5030 + 87 × 500 bytes over 3 s.
         let bps = rtp.produced_bps.unwrap();
-        assert!((bps - 156_000.0).abs() < 1e-6, "{bps}");
+        assert!((bps - 156_240.0).abs() < 1e-6, "{bps}");
         // The failing encode keeps the frames before it.
         assert_eq!(results[3].frames, 2);
 

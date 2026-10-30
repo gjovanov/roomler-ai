@@ -586,7 +586,7 @@ reads them by position, so a column is only ever appended, never renamed, moved 
 | `frames` | Frames encoded: fewer than asked when the budget ran out mid-row |
 | `enc_p50_ms` `enc_p95_ms` `enc_max_ms` | One `encode()` call each, the colour conversion included and the painting not. Nearest-rank percentiles |
 | `out_kbps` `rate` | The bytes produced over the content's own duration (frames ÷ fps, never the wall clock), and that over the target |
-| `idr_n` `idr_p50_B` `idr_max_B` | Keyframes: the first frame, and one requested every `fps` frames after it |
+| `idr_n` `idr_p50_B` `idr_max_B` | Keyframes: the first frame, and one requested every `fps` frames after it. A frame is everything one `encode()` returned: OpenH264 returns an IDR as two packets (the parameter sets, then the slice), and counted by packet every IDR would count twice |
 | `delta_p50_B` `delta_p95_B` `delta_max_B` | Every other frame |
 
 The verdict (`verdict()`, `bench.rs:601`) is always read from the encoder that opened, never
