@@ -738,7 +738,7 @@ While the switch is on, the hello says `color-described` (`agents/roomlerd/src/e
 | Data channel, VP9 (4:2:0 and 4:4:4) | lever 2 only | Chrome's WebCodecs ignores VP9's in-band colour space (FR-130 §2.5) |
 | Data channel, H.264, HEVC and AV1 | lever 2, and lever 1 where the encoder writes it | either alone decodes true, and together they agree |
 | RTP `<video>` | lever 1 only | lever 2 cannot reach it. Microsoft's MF H.264 and `h264_amf` still decode as BT.709 here (FR-130 open decision 6: accepted for now) |
-| a recording | lever 1 (FFmpeg-encoded) or the recorder's own openh264 VUI | |
+| a recording | lever 1 (FFmpeg-encoded) or the recorder's own openh264 VUI | the MP4's `colr` box says BT.601 limited whatever the switch says, and Chrome's `<video>` reads it: a recording made with the switch off plays true too (FR-130 §8). Lever 1 makes the elementary stream describe itself |
 
 Read in the field on agent 0.4.188 ([FR-130 §8](fr/FR-130-colours-decode-true.md#8-field-verification-log)):
 lever 1 alone decodes `<video>` true from live openh264, and VP9 on the data channel decodes true through lever 2
