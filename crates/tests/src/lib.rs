@@ -328,6 +328,10 @@ mod session_feedback_tests;
 /// setting, read by a guest and a member alike.
 #[cfg(test)]
 mod setup_features_tests;
+/// FR-55 P4 — a device that says it is going to sleep reads "asleep" until its
+/// next hello, and only the connection that said hello can say so.
+#[cfg(test)]
+mod sleep_announce_tests;
 #[cfg(test)]
 mod ssh_grant_ack_tests;
 #[cfg(test)]

@@ -7,6 +7,7 @@ import { useTenantStore } from '@/stores/tenant'
 import { canManageOrgSettings } from '@/utils/permissions'
 import { isKeepBusyPattern, type KeepBusyPattern } from '@/composables/keepBusy'
 import type { AgentReleaseBrief } from '@/utils/updateStall'
+import type { PowerBrief, SleepView } from '@/utils/devicePresence'
 
 /**
  * The three org-level switches (`exec-settings`, `ssh-settings`,
@@ -313,6 +314,14 @@ export interface Agent {
    *  Absent = the device does not say (no keep busy there, an older agent,
    *  or a supervised Mac's daemon): unknown, never "off". */
   keep_busy?: KeepBusyBrief
+  /** FR-55 P4 — the device's power posture as its last heartbeat reported
+   *  it: `power_policy`, the power source, whether its keeper holds it awake.
+   *  Absent = the device does not say (an agent before P4): unknown, never
+   *  `never`. */
+  power?: PowerBrief
+  /** FR-55 P4 — on a device that is not online: it announced a sleep, since
+   *  when, and its posture then. Absent = no reason given. */
+  sleep?: SleepView
   /** FR-51 — enrolled as temporary: the server reaps it after silence, and a
    *  clean stop removes it immediately. Removal is FINAL (hard delete) — a
    *  later enrollment is a NEW device. The grid badges it so nobody is
@@ -989,12 +998,16 @@ export const useAgentStore = defineStore('agents', () => {
    *  ACTIVE org. `status` is left alone (it's the Mongo lifecycle field);
    *  `presence`/`is_online` are the reachability truth the list renders.
    *  Unknown agent ids are ignored — the next fetch converges. */
-  function applyPresence(updates: Array<{ agent_id: string; presence: 'online' | 'stale' | 'offline' }>) {
+  function applyPresence(
+    updates: Array<{ agent_id: string; presence: 'online' | 'stale' | 'offline'; sleep?: SleepView }>,
+  ) {
     for (const u of updates) {
       const a = agents.value.find((x) => x.id === u.agent_id)
       if (!a) continue
       a.presence = u.presence
       a.is_online = u.presence === 'online'
+      // FR-55 P4 — the reason rides the offline row it came with.
+      a.sleep = u.presence === 'offline' ? u.sleep : undefined
     }
   }
 
