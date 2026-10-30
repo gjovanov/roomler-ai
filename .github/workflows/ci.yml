@@ -33,6 +33,61 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # ─── What a pull request changed (FR-6 wave 35, #773, 2026-10-30) ─────────
+  #
+  # A pull request that touches only docs skips the twelve heavy jobs: the
+  # five Rust lanes, the macOS overlay check, the three Windows jobs, both
+  # FFmpeg jobs and the profiles build. "Docs" is `docs/**`, a top-level
+  # `*.md` and `.claude/**`. No Rust build, test or link reads them. The jobs
+  # that do read them run on every PR: frontend builds the docs site and
+  # tests the UI that uses docs/assets, machine-names and commit-identity run
+  # .claude's self-tests, and the docs audits read docs/. 22 of the last 60
+  # runs on 2026-10-30 were docs by title, and each took all 20 jobs, ~10 GB
+  # of cache downloads and up to 44 min.
+  #
+  # It fails safe every way. A push to master skips this job, and the heavy
+  # jobs then run, so a superseded run can never leave a code commit
+  # unverified. A PR whose file list does not load in full (an API error, or
+  # 3,000 files or more) runs everything. A renamed file counts by its old
+  # path too. If this job fails, the heavy jobs skip and "Rust checks" fails,
+  # so a broken gate shows red, never green.
+  changes:
+    name: What changed
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      heavy: ${{ steps.files.outputs.heavy }}
+    steps:
+      - name: Docs only, or not
+        id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          # Every status is checked by hand: a grep that counts 0 exits 1.
+          set +e
+          set -uo pipefail
+          heavy=true
+          docs='^(docs/|\.claude/)|^[^/]+\.md$'
+          if files=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files?per_page=100" \
+                       --jq '.[] | .filename, (.previous_filename // empty)'); then
+            n=$(printf '%s\n' "$files" | grep -c .)
+            other=$(printf '%s\n' "$files" | grep . | grep -vE "$docs")
+            echo "${n} paths changed; outside the docs:"
+            printf '%s\n' "$other" | head -20
+            if [ "$n" -gt 0 ] && [ "$n" -lt 3000 ] && [ -z "$other" ]; then heavy=false; fi
+          else
+            echo "::warning::the PR's file list did not load, so every job runs"
+          fi
+          echo "heavy=${heavy}" >> "$GITHUB_OUTPUT"
+          if [ "$heavy" = false ]; then
+            echo "::notice title=Docs-only change::the Rust, macOS, Windows, FFmpeg and profiles jobs skip on this PR (FR-6 wave 35)"
+          fi
+
   # ─── The Rust lanes (FR-6 wave 14, #773, 2026-09-27) ──────────────────────
   #
   # These five jobs were ONE job, "Rust checks", until it grew to ~35 serial
@@ -62,6 +117,11 @@ jobs:
   #     Actions cache: rust-lint's restore step says why.
   rust-lint:
     name: Rust lint (fmt, clippy)
+    # FR-6 wave 35: skipped on a docs-only PR; see the `changes` job. On a
+    # push `changes` is skipped, and `!cancelled()` keeps that from skipping
+    # this job too. The same two lines head every heavy job.
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     # History of the single "Rust checks" job these lanes replaced (its
     # cache-key premise is corrected at the end):
     #
@@ -398,6 +458,8 @@ jobs:
 
   rust-unit:
     name: Rust unit tests (server + crates)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     timeout-minutes: 30
     runs-on: ubuntu-latest
     # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
@@ -548,6 +610,8 @@ jobs:
 
   rust-agent:
     name: Agent tests (vp9-444, overlay, kernel TUN)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     timeout-minutes: 30
     runs-on: ubuntu-latest
     # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
@@ -731,6 +795,8 @@ jobs:
 
   rust-recorder:
     name: Recorder tests (FR-85)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     timeout-minutes: 30
     runs-on: ubuntu-latest
     env:
@@ -1058,6 +1124,8 @@ jobs:
 
   rust-recorder-audio:
     name: Recorder tests with audio + X11 pointer (FR-85)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     timeout-minutes: 30
     runs-on: ubuntu-latest
     # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
@@ -1203,18 +1271,34 @@ jobs:
     # answers "is Rust green?" for people, `gh pr checks`, and the autopilot
     # board. `!cancelled()` rather than `always()`: a superseded PR run that
     # the concurrency group cancels should not start a runner just to fail.
+    # FR-6 wave 35: a docs-only PR skips every lane, and that passes. On a PR
+    # the `changes` job must have succeeded, so a broken gate can never turn
+    # the lanes' skips green.
     name: Rust checks
     if: ${{ !cancelled() }}
-    needs: [rust-lint, rust-unit, rust-agent, rust-recorder, rust-recorder-audio]
+    needs: [changes, rust-lint, rust-unit, rust-agent, rust-recorder, rust-recorder-audio]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Every Rust lane succeeded
+      - name: Every Rust lane succeeded, or a docs-only PR skipped them
         env:
           NEEDS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          bad=$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(" ")')
+          gate=$(echo "$NEEDS" | jq -r '.changes.result')
+          heavy=$(echo "$NEEDS" | jq -r '.changes.outputs.heavy // ""')
+          if [ "$EVENT" = pull_request ] && [ "$gate" != success ]; then
+            echo "::error::the changes job did not succeed ($gate), so nothing says the lanes may skip"
+            exit 1
+          fi
+          ok='"success"'
+          if [ "$EVENT" = pull_request ] && [ "$heavy" = false ]; then
+            ok='"success", "skipped"'
+            echo "a docs-only PR: the Rust lanes skip (FR-6 wave 35)"
+          fi
+          bad=$(echo "$NEEDS" | jq -r "[to_entries[] | select(.key != \"changes\")
+                 | select(.value.result | IN($ok) | not) | .key] | join(\" \")")
           if [ -n "$bad" ]; then
             echo "::error::Rust lanes that did not succeed: $bad"
             exit 1
@@ -1233,6 +1317,8 @@ jobs:
     # not a full build — the goal is "does the cfg tree compile on this
     # target", which is the entire class of break this catches.
     name: macOS overlay compile check
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: macos-latest
     timeout-minutes: 25
     # FR-6 wave 22 (#773): this job's cargo cache lives on the seed-cache
@@ -1479,6 +1565,8 @@ jobs:
     # `--all-targets`/`--tests` included: test-only code is where the
     # first fix wave's lints lived (constant asserts, guard-across-await).
     name: Windows overlay clippy
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 40
     # FR-6 wave 22: the cache publishes as a release asset; see macos-overlay-check.
@@ -1580,6 +1668,8 @@ jobs:
     # step. Its own cache family, since it builds a test binary whose
     # dependencies the clippy job's check builds do not share.
     name: Windows agent sessions (FR-90 P1i)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 40
     # A master push publishes this job's cargo cache as a release asset
@@ -1689,6 +1779,8 @@ jobs:
     # openh264 build does not spend that job's timeout, and without `audio`:
     # audiopus pulls cmake, which is why the Windows lanes avoid it.
     name: Windows recorder identity (FR-85)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 45
     # FR-6 wave 22: the cache publishes as a release asset; see macos-overlay-check.
@@ -1788,6 +1880,8 @@ jobs:
     # Bolting a from-source FFmpeg-linked compile onto it would spend that
     # headroom and make the timeout meaningless.
     name: ffmpeg-encoder compile + dispatch locks
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
@@ -1957,6 +2051,8 @@ jobs:
     # Until P4c flips the release assets, this lane is the only thing that
     # runs the AAC path, or FFmpeg's H.264 decoder, at all.
     name: Recording with FFmpeg — AAC and H.264 decode (FR-85 P4)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
@@ -2440,6 +2536,8 @@ jobs:
   # same result.
   profiles:
     name: Build profiles (FR-69)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
