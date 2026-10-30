@@ -220,8 +220,9 @@ the next version.
 ```bash
 # Verify a lockstep roll — both must hold
 git ls-remote origin 'refs/tags/setup-v<V>^{}' 'refs/tags/agent-v<V>^{}'   # the SAME commit (the release's targetCommitish now reads `master`)
-gh release view setup-v<V> --json assets   # 3 platforms + sidecars
-for p in windows linux macos; do curl -sI https://roomler.ai/api/setup/$p | grep -i content-disposition; done   # every filename carries <V>
+gh release view setup-v<V> --json assets   # 4 platform archives + the Windows .exe (FR-129 C2), each with .sha256 + .asc
+for p in windows linux macos; do curl -sI https://roomler.ai/api/setup/$p | grep -i content-disposition; done   # every filename carries <V>; windows is the .exe
+curl -sI 'https://roomler.ai/api/setup/windows?format=zip' | grep -i content-disposition   # the zip, for a proxy that refuses an EXE
 
 # Re-run after a failure (the tag already exists at the agent commit; idempotent)
 gh workflow run release-setup.yml --ref setup-v<V> -f version=<V> -f publish_release=true
@@ -242,7 +243,7 @@ the backstop.
 
 ⚠️ **`scripts/install.sh` ships on two trains (FR-129 B1).** The server compiles
 it in and serves it as `/api/setup/install.sh`
-(`crates/modules/fleet/src/setup_release.rs:258`), so the **terminal's** copy
+(`crates/modules/fleet/src/setup_release.rs:314`), so the **terminal's** copy
 changes with a **promote**. The wizard compiles in its own for the Linux and macOS
 daemon installs (`agents/roomler-setup/src/unix_daemon.rs:78`), so the **GUI's**
 copy changes with an **agent release** (its `setup-v<V>` twin). A fix reaches each

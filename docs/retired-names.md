@@ -52,7 +52,7 @@ flowchart TD
 |---|---|---|---|
 | **ANCHOR** | `RETIRED-NAME-ANCHOR` followed by `:` or `(N):`, or a `-BEGIN` … `-END` pair | code that resolves, matches or writes the retired name at runtime — a read-fallback over a pre-rename tree, a sweep that deletes the old unit, a wire value a deployed peer still sends | `anchors` must equal the baseline in both directions (`:562`, `:580`): a deleted anchor and a stale floor both fail |
 | **RECORD** | `RETIRED-NAME-RECORD` followed by `:` or `(N):`, or a `-BEGIN` … `-END` pair | prose and fixtures that name the retired thing *in order to explain it* — a field log quoting real output, a migration note, the table above | `records` must equal the baseline in both directions (`:594`) |
-| unclassified | none | nobody has decided | `--check --strict` requires 0 (`:608`); the `name-audit` job in `.github/workflows/ci.yml:2169` runs it on every PR (`:2211`) |
+| unclassified | none | nobody has decided | `--check --strict` requires 0 (`:608`); the `name-audit` job in `.github/workflows/ci.yml:2172` runs it on every PR (`:2214`) |
 
 🔑 **The falsifiable rule**: *if deleting the live code would also delete this
 occurrence, it is an ANCHOR; if the occurrence would survive, it is a RECORD.*
@@ -70,7 +70,7 @@ comment would otherwise have exempted the regression.
 Both counts move only with `scripts/name-audit.sh --update-baseline`, committed
 in the same PR, whose body says which anchor retired (and which field state no
 longer exists) or which record was added (and what it records). The CI job
-prints the summary beside its verdict (`ci.yml:2214`), so a reviewer can diff
+prints the summary beside its verdict (`ci.yml:2217`), so a reviewer can diff
 the number against the claim. A marker that covers nothing fails `--check`
 (`:555`): an empty exemption is the one that silently widens.
 

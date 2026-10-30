@@ -33,11 +33,43 @@ flowchart TB
 ```
 
 Everything needs an **enrollment token** — minted in the admin UI
-(**Admin → Agents → Enroll** for daemons, **Tunnel clients → Enroll** for CLIs),
-valid 10 minutes, single-use — or, for a daemon, a **pairing** (FR-129): the
-wizard's "Set up in the browser", and `--pair` on the terminal installers
-([below](#pairing-from-a-terminal)), mint that same token into the installing
-process after you approve a code at `/pair`, so nothing is copied or pasted.
+(**Devices → Enroll → Device** for daemons, **Devices → Enroll → Tunnel client**
+for CLIs), valid 10 minutes, single-use — or, for a daemon, a **pairing**
+(FR-129): the wizard's "Set up in the browser", and `--pair` on the terminal
+installers ([below](#pairing-from-a-terminal)), mint that same token into the
+installing process after you approve a code at `/pair`, so nothing is copied or
+pasted.
+
+### The wizard's first page: the background service by default (FR-129 C1)
+
+The Welcome page opens with a role already picked, which the person can change
+before anything happens: the background service on a machine with nothing
+installed, and an existing install's own flavour otherwise, so a default never
+switches a flavour or changes a device's security posture. Rust decides
+(`agents/roomler-setup/src/role.rs:210`, `default_role`, carried as
+`defaultRole` on the detection); the SPA only applies it, when nothing is picked
+yet, and never saves it (a click does). The "Join the overlay network" box keeps
+its per-OS default, ticked for every preselected daemon role.
+
+| OS | nothing installed | a per-user install | a machine-wide install (or both) |
+|---|---|---|---|
+| Windows | **background service** (perMachine + SystemContext: the lock screen, UAC dialogs, admin apps) | this user only | the service's SystemContext switch (`ROOMLERD_ENABLE_SYSTEM_SWAP` in the `Roomler` service's SCM Environment, read as the daemon reads it): on → background service; off or absent → attended service (SystemContext would make the lock screen remotely controllable, a choice left to the person); unreadable → nothing preselected |
+| Linux | **system service** (root), once the server offers the Linux daemon cards; the tunnel client while it does not | this user only | system service |
+| macOS | **this Mac** (with the root half, the overlay box being ticked), once the server offers the macOS cards; the tunnel client while it does not | this Mac | this Mac |
+
+Where an installed flavour is not offered (a Linux or macOS server with the
+switch off), nothing is preselected: the tunnel client would be another product
+than the one the device has. An installed tunnel client does not change the
+default; the daemon roles carry the `roomler` CLI too.
+
+**A new launch resumes a run only from the Server or the Token page.** The
+wizard's saved state (`%LOCALAPPDATA%\roomler\roomler-setup\data\wizard-state.json`
+on Windows) restores its role and device name only when the run was killed on
+one of those two pages; a run that finished, stopped on Welcome, or was cut off
+during the install starts a new run at Welcome, with the default device name.
+The server URL is kept either way. Before FR-129 C1 a finished run's role and
+name came back: a test run's tunnel-client role preselected the tunnel card on
+the operator's own machine, and its device name was offered again.
 
 ## Enrollment — what every path does
 
@@ -115,6 +147,32 @@ also stops on a config it may not read (`:634`, never reported as a damaged
 config) or a folder it may not write (`:640`). The token is never spent on a
 config that cannot be written. A **fresh** install of that role still works
 from a double-click: the folder is not hardened yet.
+
+**The wizard asks for those rights itself** (FR-129 C3). The note on its first
+page carries a **Restart as administrator** button: the wizard starts its own
+image again through the shell's `runas` verb (one UAC prompt,
+`crates/roomler-setup-core/src/elevation.rs`) with
+`--role <role> [--server <url>] --after-elevation <its pid>`, and exits once the
+elevated copy has started. Nothing secret is on that command line: it happens on
+Welcome, before a token exists. The elevated copy
+(`agents/roomler-setup/src/launch.rs`):
+
+1. waits, at most 15 s, for the limited copy to exit, **before** Tauri's
+   single-instance plugin looks for a running copy — otherwise it would find
+   the dying copy's lock, hand it its arguments and quit;
+2. keeps its WebView2 data in its own folder
+   (`%LOCALAPPDATA%\ai.roomler.setup\elevated`, through the documented
+   `WEBVIEW2_USER_DATA_FOLDER` override): WebView2 shares one browser process
+   among every host naming the same folder, the limited copy's can outlive it by
+   a moment, and an elevated host must not join a limited browser process. Any
+   elevated run does this, a hand-made "Run as administrator" included; a
+   limited run keeps Tauri's folder unchanged;
+3. opens on Welcome with the handed role preselected, over the detected
+   default, and the Continue gate as usual.
+
+A declined prompt leaves the limited wizard as it was, with one line saying so;
+any other failure shows its reason and the right-click way. Nothing else in the
+wizard elevates itself: a fresh install still gets the MSI's own UAC prompt.
 
 **The enroll says how it was installed** (FR-102 P3, the install trace in
 [growth-observability.md](growth-observability.md)): the device row records
@@ -338,9 +396,14 @@ remove one today.
 
 ## Windows
 
-**Recommended: the `roomler-setup` wizard** (signed EXE, downloadable from the
-admin UI or `https://roomler.ai/api/setup/windows-x86_64`). One wizard, four
-roles:
+**Recommended: the `roomler-setup` wizard**, downloadable from the admin UI or
+`https://roomler.ai/api/setup/windows`. From the first `setup-v*` release that
+publishes it (FR-129 C2), that link serves the **signed EXE itself**,
+`roomler-setup-<v>-x86_64-pc-windows-msvc.exe`, whose bytes equal the release's
+`.exe.sha256` and carry a GPG `.asc` like every other asset;
+`https://roomler.ai/api/setup/windows?format=zip` serves the same EXE in a zip,
+for a proxy that refuses an EXE download. A release without the EXE asset keeps
+serving its zip. One wizard, four roles:
 
 | Wizard role | What it installs | Runs as |
 |---|---|---|
@@ -518,9 +581,11 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 
 The same `roomler-setup` wizard that installs the daemon on Windows installs it
 on a Linux desktop, with two daemon cards — **this user only** (the systemd user
-unit, the overlay through the userspace netstack; the default for a desktop)
-and **system service** (the root `roomlerd.service`, the TUN overlay, config at
-`/etc/roomler/config.toml` — the terminal path's `--system`). It is a GUI front
+unit, the overlay through the userspace netstack) and **system service** (the
+root `roomlerd.service`, the TUN overlay, config at `/etc/roomler/config.toml` —
+the terminal path's `--system`; the card preselected on a machine with nothing
+installed, [FR-129 C1](#the-wizards-first-page-the-background-service-by-default-fr-129-c1)).
+It is a GUI front
 end to the **embedded `install.sh`**, never a second implementation of its steps
 (`agents/roomler-setup/src/unix_daemon.rs`, `orchestrator_unix.rs`):
 

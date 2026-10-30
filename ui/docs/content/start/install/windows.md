@@ -41,6 +41,9 @@ change the service mode.
 
 [Roomler Setup for Windows](https://roomler.ai/api/setup/windows)
 
+If your network's proxy refuses to download an EXE, take
+[the same signed EXE in a zip](https://roomler.ai/api/setup/windows?format=zip) instead.
+
 **Already installed and just need to enroll?**
 
 ```powershell
