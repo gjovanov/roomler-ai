@@ -12,7 +12,9 @@
 //! `GET /api/setup/{latest-release,{platform}/health,{platform}}` —
 //! latest-release returns the `setup-v*`-filtered list; health
 //! resolves a platform asset manifest; the bare platform route
-//! streams the artifact bytes. `GET /api/setup/features` (FR-129 B1-s)
+//! streams the artifact bytes — on Windows the signed wizard EXE itself
+//! from the first release that publishes one, the zip with `?format=zip`
+//! (FR-129 C2, [`SetupFormat`]). `GET /api/setup/features` (FR-129 B1-s)
 //! is the server's word on which install paths a client may offer.
 //!
 //! Parallel to [`crate::tunnel_release`] (bare CLI tarball)
@@ -40,10 +42,49 @@ use crate::{
 pub struct InstallerQuery {
     #[serde(default = "default_version_latest")]
     pub version: String,
+    /// FR-129 C2 — `exe` (the default) or `zip`: which Windows download. See
+    /// [`SetupFormat`].
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 fn default_version_latest() -> String {
     "latest".to_string()
+}
+
+/// FR-129 C2 — which Windows download `/api/setup/{platform}` serves.
+///
+/// The download page promises "a signed EXE with a role picker", and from the
+/// first `setup-v*` release that publishes one, `exe` (the default) serves that
+/// EXE itself: `roomler-setup-<v>-x86_64-pc-windows-msvc.exe`, the same signed
+/// bytes the zip carries. A release without one (every release up to 0.4.189)
+/// still serves its zip, so the default can never 404 where it used to answer.
+/// `zip` serves the zip whatever the release has — for a network whose proxy
+/// refuses an EXE download. Linux and macOS have one download each and ignore
+/// the value. Anything else is a 400 naming the two, never a silent guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupFormat {
+    Exe,
+    Zip,
+}
+
+impl SetupFormat {
+    fn parse(value: Option<&str>) -> Result<SetupFormat, ApiError> {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("exe") => Ok(SetupFormat::Exe),
+            Some("zip") => Ok(SetupFormat::Zip),
+            Some(other) => Err(ApiError::BadRequest(format!(
+                "unknown format {other:?}; expected exe or zip"
+            ))),
+        }
+    }
+
+    fn wire(self) -> &'static str {
+        match self {
+            SetupFormat::Exe => "exe",
+            SetupFormat::Zip => "zip",
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -145,14 +186,16 @@ pub async fn setup_features(State(state): State<FleetState>) -> Json<SetupFeatur
 }
 
 /// `GET /api/setup/{platform}/health` — manifest for the unified
-/// wizard EXE matching the requested platform + version. 404s until
-/// P4c tags the first `setup-v*` release.
+/// wizard download matching the requested platform + version (+ the FR-129
+/// C2 `format`, which the `uri` carries on). 404s until P4c tags the first
+/// `setup-v*` release.
 pub async fn setup_installer_health(
     State(state): State<FleetState>,
     Path(platform): Path<String>,
     Query(params): Query<InstallerQuery>,
 ) -> Result<Json<InstallerHealth>, ApiError> {
     let normalised = normalise_platform(&platform)?;
+    let format = SetupFormat::parse(params.format.as_deref())?;
     let releases = releases::cached(&state).await?;
     let release = pick_release_for(&releases, &params.version, "setup-v").ok_or_else(|| {
         ApiError::NotFound(format!(
@@ -160,23 +203,35 @@ pub async fn setup_installer_health(
             params.version
         ))
     })?;
-    let asset = pick_setup_asset(&release.assets, normalised).ok_or_else(|| {
+    let asset = pick_setup_asset(&release.assets, normalised, format).ok_or_else(|| {
         ApiError::NotFound(format!(
             "no setup asset for platform {} in tag {}",
             normalised, release.tag_name
         ))
     })?;
+    // The `format` a caller named rides on, so the download resolves as this
+    // manifest did; without one the default resolves the same way anyway.
+    let format_param = if params.format.is_some() {
+        format!("&format={}", format.wire())
+    } else {
+        String::new()
+    };
     Ok(Json(InstallerHealth {
         tag: release.tag_name.clone(),
         platform: normalised.to_string(),
         filename: asset.name.clone(),
         size: asset.size,
         digest: asset.digest.clone(),
-        uri: format!("/api/setup/{}?version={}", normalised, params.version),
+        uri: format!(
+            "/api/setup/{}?version={}{}",
+            normalised, params.version, format_param
+        ),
     }))
 }
 
-/// `GET /api/setup/{platform}` — streams the unified wizard bytes.
+/// `GET /api/setup/{platform}` — streams the unified wizard bytes: on
+/// Windows the signed EXE itself (FR-129 C2), or the zip with `format=zip`
+/// or from a release that has no EXE asset.
 pub async fn setup_installer_proxy(
     State(state): State<FleetState>,
     Path(platform): Path<String>,
@@ -185,6 +240,7 @@ pub async fn setup_installer_proxy(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let normalised = normalise_platform(&platform)?;
+    let format = SetupFormat::parse(params.format.as_deref())?;
     // FR-102 P3 — the wizard archive itself, usually a browser on the site.
     install_trace::count_fetch(
         &state,
@@ -199,7 +255,7 @@ pub async fn setup_installer_proxy(
             params.version
         ))
     })?;
-    let asset = pick_setup_asset(&release.assets, normalised).ok_or_else(|| {
+    let asset = pick_setup_asset(&release.assets, normalised, format).ok_or_else(|| {
         ApiError::NotFound(format!(
             "no setup asset for platform {} in tag {}",
             normalised, release.tag_name
@@ -214,34 +270,34 @@ pub async fn setup_installer_proxy(
 ///   - linux-x86_64 — `roomler-setup-*-x86_64-unknown-linux-gnu.tar.gz`
 ///   - linux-aarch64 — `roomler-setup-*-aarch64-unknown-linux-gnu.tar.gz` (FR-97 P7b)
 ///   - macos — `roomler-setup-*-universal-apple-darwin.tar.gz`
-///   - windows-x86_64 — `roomler-setup-*-x86_64-pc-windows-msvc.zip`
+///   - windows-x86_64 — `roomler-setup-*-x86_64-pc-windows-msvc.exe`, the signed
+///     EXE (FR-129 C2), else `roomler-setup-*-x86_64-pc-windows-msvc.zip`; with
+///     [`SetupFormat::Zip`] the zip only
 ///
 /// Each arm names its own target triple, so neither Linux arm can take the
-/// other's tarball whatever order GitHub lists them in.
+/// other's tarball whatever order GitHub lists them in, and the Windows
+/// preference does not depend on that order either. A sidecar (`.sha256`,
+/// `.asc`) is never a pick.
 pub fn pick_setup_asset<'a>(
     assets: &'a [AgentReleaseAsset],
     platform: &str,
+    format: SetupFormat,
 ) -> Option<&'a AgentReleaseAsset> {
-    assets.iter().find(|a| {
-        let name = a.name.to_ascii_lowercase();
-        if name.ends_with(".sha256") {
-            return false;
-        }
-        if !name.starts_with("roomler-setup-") {
-            return false;
-        }
-        match platform {
-            "linux-x86_64" => {
-                name.contains("x86_64-unknown-linux-gnu") && name.ends_with(".tar.gz")
-            }
-            "linux-aarch64" => {
-                name.contains("aarch64-unknown-linux-gnu") && name.ends_with(".tar.gz")
-            }
-            "macos" => name.contains("universal-apple-darwin") && name.ends_with(".tar.gz"),
-            "windows-x86_64" => name.contains("x86_64-pc-windows-msvc") && name.ends_with(".zip"),
-            _ => false,
-        }
-    })
+    let named = |triple: &str, ext: &str| {
+        assets.iter().find(|a| {
+            let name = a.name.to_ascii_lowercase();
+            name.starts_with("roomler-setup-") && name.contains(triple) && name.ends_with(ext)
+        })
+    };
+    match (platform, format) {
+        ("linux-x86_64", _) => named("x86_64-unknown-linux-gnu", ".tar.gz"),
+        ("linux-aarch64", _) => named("aarch64-unknown-linux-gnu", ".tar.gz"),
+        ("macos", _) => named("universal-apple-darwin", ".tar.gz"),
+        ("windows-x86_64", SetupFormat::Exe) => named("x86_64-pc-windows-msvc", ".exe")
+            .or_else(|| named("x86_64-pc-windows-msvc", ".zip")),
+        ("windows-x86_64", SetupFormat::Zip) => named("x86_64-pc-windows-msvc", ".zip"),
+        _ => None,
+    }
 }
 
 /// The terminal-driven installers (scripts/install.sh + install.ps1),
@@ -547,17 +603,174 @@ mod tests {
         let arm = "roomler-setup-0.4.148-aarch64-unknown-linux-gnu.tar.gz";
         for order in [[arm, x86], [x86, arm]] {
             let assets: Vec<_> = order.iter().map(|n| asset(n)).collect();
-            assert_eq!(pick_setup_asset(&assets, "linux-x86_64").unwrap().name, x86);
             assert_eq!(
-                pick_setup_asset(&assets, "linux-aarch64").unwrap().name,
+                pick_setup_asset(&assets, "linux-x86_64", SetupFormat::Exe)
+                    .unwrap()
+                    .name,
+                x86
+            );
+            assert_eq!(
+                pick_setup_asset(&assets, "linux-aarch64", SetupFormat::Exe)
+                    .unwrap()
+                    .name,
                 arm
             );
         }
         // A release from before P7b has no aarch64 wizard: a clean 404, never
         // the x86_64 tarball.
         let before = vec![asset(x86)];
-        assert!(pick_setup_asset(&before, "linux-aarch64").is_none());
-        assert!(pick_setup_asset(&[asset(arm)], "linux-x86_64").is_none());
+        assert!(pick_setup_asset(&before, "linux-aarch64", SetupFormat::Exe).is_none());
+        assert!(pick_setup_asset(&[asset(arm)], "linux-x86_64", SetupFormat::Exe).is_none());
+    }
+
+    /// FR-129 C2 — the release-setup.yml asset set from the first release that
+    /// stages the EXE: every platform archive, the EXE beside the zip, and the
+    /// sidecars GPG and the checksum step add.
+    fn release_with_the_exe(order_exe_last: bool) -> Vec<AgentReleaseAsset> {
+        let mut names = vec![
+            "roomler-setup-0.4.190-x86_64-unknown-linux-gnu.tar.gz",
+            "roomler-setup-0.4.190-x86_64-unknown-linux-gnu.tar.gz.sha256",
+            "roomler-setup-0.4.190-x86_64-unknown-linux-gnu.tar.gz.asc",
+            "roomler-setup-0.4.190-aarch64-unknown-linux-gnu.tar.gz",
+            "roomler-setup-0.4.190-universal-apple-darwin.tar.gz",
+            "roomler-setup-0.4.190-universal-apple-darwin.tar.gz.asc",
+            "roomler-setup-0.4.190-x86_64-pc-windows-msvc.zip",
+            "roomler-setup-0.4.190-x86_64-pc-windows-msvc.zip.sha256",
+            "roomler-setup-0.4.190-x86_64-pc-windows-msvc.zip.asc",
+            "roomler-setup-0.4.190-x86_64-pc-windows-msvc.exe.sha256",
+            "roomler-setup-0.4.190-x86_64-pc-windows-msvc.exe.asc",
+            "roomler-release-pubkey.asc",
+        ];
+        let exe = "roomler-setup-0.4.190-x86_64-pc-windows-msvc.exe";
+        if order_exe_last {
+            names.push(exe);
+        } else {
+            names.insert(0, exe);
+        }
+        names.into_iter().map(asset).collect()
+    }
+
+    /// FR-129 C2 — the default is the signed EXE itself, wherever GitHub lists
+    /// it; `format=zip` is the zip; the health's file is what the download
+    /// streams.
+    #[test]
+    fn windows_prefers_the_exe_and_zip_forces_the_zip() {
+        for exe_last in [true, false] {
+            let assets = release_with_the_exe(exe_last);
+            assert_eq!(
+                pick_setup_asset(&assets, "windows-x86_64", SetupFormat::Exe)
+                    .unwrap()
+                    .name,
+                "roomler-setup-0.4.190-x86_64-pc-windows-msvc.exe"
+            );
+            assert_eq!(
+                pick_setup_asset(&assets, "windows-x86_64", SetupFormat::Zip)
+                    .unwrap()
+                    .name,
+                "roomler-setup-0.4.190-x86_64-pc-windows-msvc.zip"
+            );
+        }
+        assert_eq!(
+            content_type_for("roomler-setup-0.4.190-x86_64-pc-windows-msvc.exe"),
+            "application/vnd.microsoft.portable-executable"
+        );
+    }
+
+    /// FR-129 C2 — every release up to 0.4.189 has no EXE asset: the default
+    /// keeps serving its zip, exactly as before.
+    #[test]
+    fn a_release_without_the_exe_keeps_serving_the_zip() {
+        let assets: Vec<_> = [
+            "roomler-setup-0.4.188-x86_64-pc-windows-msvc.zip",
+            "roomler-setup-0.4.188-x86_64-pc-windows-msvc.zip.sha256",
+            "roomler-setup-0.4.188-x86_64-pc-windows-msvc.zip.asc",
+        ]
+        .into_iter()
+        .map(asset)
+        .collect();
+        for format in [SetupFormat::Exe, SetupFormat::Zip] {
+            assert_eq!(
+                pick_setup_asset(&assets, "windows-x86_64", format)
+                    .unwrap()
+                    .name,
+                "roomler-setup-0.4.188-x86_64-pc-windows-msvc.zip",
+                "{format:?}"
+            );
+        }
+        // An EXE-only release (a hypothetical): format=zip is a clean 404,
+        // never the EXE under a zip's name.
+        let exe_only = vec![asset("roomler-setup-0.4.190-x86_64-pc-windows-msvc.exe")];
+        assert!(pick_setup_asset(&exe_only, "windows-x86_64", SetupFormat::Zip).is_none());
+    }
+
+    /// FR-129 C2 — a sidecar is never served as the download, whatever is
+    /// left once the real assets are gone.
+    #[test]
+    fn a_sidecar_is_never_picked() {
+        let sidecars: Vec<_> = release_with_the_exe(true)
+            .into_iter()
+            .filter(|a| a.name.ends_with(".sha256") || a.name.ends_with(".asc"))
+            .collect();
+        assert!(!sidecars.is_empty());
+        for platform in ["windows-x86_64", "linux-x86_64", "linux-aarch64", "macos"] {
+            for format in [SetupFormat::Exe, SetupFormat::Zip] {
+                assert!(
+                    pick_setup_asset(&sidecars, platform, format).is_none(),
+                    "{platform} {format:?}"
+                );
+            }
+        }
+    }
+
+    /// FR-129 C2 — Linux and macOS have one download each; `format` changes
+    /// nothing there.
+    #[test]
+    fn the_linux_and_macos_picks_ignore_the_format() {
+        let assets = release_with_the_exe(true);
+        for format in [SetupFormat::Exe, SetupFormat::Zip] {
+            for (platform, want) in [
+                (
+                    "linux-x86_64",
+                    "roomler-setup-0.4.190-x86_64-unknown-linux-gnu.tar.gz",
+                ),
+                (
+                    "linux-aarch64",
+                    "roomler-setup-0.4.190-aarch64-unknown-linux-gnu.tar.gz",
+                ),
+                (
+                    "macos",
+                    "roomler-setup-0.4.190-universal-apple-darwin.tar.gz",
+                ),
+            ] {
+                assert_eq!(
+                    pick_setup_asset(&assets, platform, format).unwrap().name,
+                    want,
+                    "{platform} {format:?}"
+                );
+            }
+        }
+    }
+
+    /// FR-129 C2 — `exe` is the default, the value is read without case or
+    /// padding, and an unknown one is a 400 naming the two.
+    #[test]
+    fn the_format_param() {
+        for v in [None, Some(""), Some("exe"), Some("EXE"), Some(" exe ")] {
+            assert_eq!(SetupFormat::parse(v).unwrap(), SetupFormat::Exe, "{v:?}");
+        }
+        for v in [Some("zip"), Some("ZIP"), Some(" Zip")] {
+            assert_eq!(SetupFormat::parse(v).unwrap(), SetupFormat::Zip, "{v:?}");
+        }
+        for v in ["tar.gz", "msi", "exe.zip", "1"] {
+            match SetupFormat::parse(Some(v)) {
+                Err(ApiError::BadRequest(m)) => {
+                    assert!(m.contains("expected exe or zip"), "{m}")
+                }
+                other => panic!("{v}: {other:?}"),
+            }
+        }
+        assert_eq!(SetupFormat::Exe.wire(), "exe");
+        assert_eq!(SetupFormat::Zip.wire(), "zip");
     }
 
     #[test]
@@ -627,22 +840,30 @@ mod tests {
             asset("roomler-setup-0.3.0-universal-apple-darwin.tar.gz"),
         ];
         assert_eq!(
-            pick_setup_asset(&assets, "windows-x86_64").unwrap().name,
+            pick_setup_asset(&assets, "windows-x86_64", SetupFormat::Exe)
+                .unwrap()
+                .name,
             "roomler-setup-0.3.0-x86_64-pc-windows-msvc.zip"
         );
         assert_eq!(
-            pick_setup_asset(&assets, "linux-x86_64").unwrap().name,
+            pick_setup_asset(&assets, "linux-x86_64", SetupFormat::Exe)
+                .unwrap()
+                .name,
             "roomler-setup-0.3.0-x86_64-unknown-linux-gnu.tar.gz"
         );
         assert_eq!(
-            pick_setup_asset(&assets, "macos").unwrap().name,
+            pick_setup_asset(&assets, "macos", SetupFormat::Exe)
+                .unwrap()
+                .name,
             "roomler-setup-0.3.0-universal-apple-darwin.tar.gz"
         );
         // The legacy wizard asset must never satisfy the setup pick.
         let legacy_only = vec![asset(
             "roomler-tunnel-installer-0.3.0-x86_64-pc-windows-msvc.zip",
         )];
-        assert!(pick_setup_asset(&legacy_only, "windows-x86_64").is_none());
+        for format in [SetupFormat::Exe, SetupFormat::Zip] {
+            assert!(pick_setup_asset(&legacy_only, "windows-x86_64", format).is_none());
+        }
     }
 
     #[test]
