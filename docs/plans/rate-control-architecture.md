@@ -71,7 +71,7 @@ mean_bytes/(rung/fps/8)`. **Pass** = 0 key packets after the opener, `set_bitrat
 ±25 % by frame 10, burst ≤ 2×. Hosts: CORPLAP-1 (`hevc_qsv`, `low_power` 1 and 0), an
 Arc/Meteor-Lake host (`av1_qsv`), the RTX box (`hevc/av1_nvenc`), one Apple Silicon Mac
 (`hevc_videotoolbox`); AMD recorded as unmeasured. Add a defaulted trait method
-`VideoEncoder::rate_stats()` (`encode/mod.rs:932`) so the sweep reads counters. The sweep bypasses
+`VideoEncoder::rate_stats()` (`encode/mod.rs:934`) so the sweep reads counters. The sweep bypasses
 the coarsen gate (:1591–1594).
 
 **A1 — in-place applies, gated.** Replace `supports_dynamic_bitrate = name.contains("nvenc")`
@@ -238,7 +238,7 @@ before B2).
 3. **Remote candidates** in `add_remote_candidate` (`peer.rs:1273–1320`), after mDNS resolution:
    drop non-relay candidates whose address equals a LocalAPI `peers()` overlay IP or our own (same
    query as :1644–1651, 400 ms timeout, fail-open); relay-typed exempt (keeps the loopback TURN,
-   `rc_local_turn.rs`, `relay_addr_is_fast_local` `encode/mod.rs:691–690`).
+   `rc_local_turn.rs`, `relay_addr_is_fast_local` `encode/mod.rs:693–690`).
 
 Plus **PathClass-lite**: the class in the `per-session ICE path detected` line (`peer.rs:1513–1513`)
 and in the FR-35 memory key (`peer.rs:4608` → `"{ip}|{class}"`, which fixes "a fast day carried

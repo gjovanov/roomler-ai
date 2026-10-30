@@ -51,7 +51,7 @@ The pump already has the fast path this needs. `peer.rs:2156` logs
 counts `frames_empty`. **That path exists, is named, and is simply
 unreachable on Linux.** P1 is about making it reachable, not about inventing it.
 
-`Damage` (`capture/mod.rs:79`) likewise already distinguishes the two empty
+`Damage` (`capture/mod.rs:83`) likewise already distinguishes the two empty
 states — `Unknown` ("no information, assume all dirty") vs `Tracked(vec![])`
 ("provably nothing changed"). Only the producer is missing.
 
