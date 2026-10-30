@@ -15,13 +15,13 @@
 #
 #   So the read runs INSIDE the Mongo container, as mongosh, with the
 #   container's own credentials. It is bounded by construction; see
-#   `runMongosh` in rc-shadow-report.js. An unbounded read inside that same
+#   `runMongosh` in rc-shadow-report.cjs. An unbounded read inside that same
 #   container OOM-killed production Mongo once (2026-10-26).
 #
 # TARGETS (pick one)
 #
 #   --docker NAME [--seed FILE]  a throwaway local mongo:7 container: the
-#                                rehearsal. --seed loads `rc-shadow-report.js
+#                                rehearsal. --seed loads `rc-shadow-report.cjs
 #                                --to-ejson` output (real log lines, stored the
 #                                way the uploader stores them) before the read.
 #   --kubectl --yes              where kubectl reaches namespace roomler-ai
@@ -36,7 +36,7 @@
 #   --min-windows N              windows a session needs to count toward a class
 #   --json                       the machine-readable result instead of Markdown
 #   --rows                       print the projected rows (NDJSON) instead of a
-#                                report; `rc-shadow-report.js FILE` re-reads them
+#                                report; `rc-shadow-report.cjs FILE` re-reads them
 #
 # A production read (--kubectl / --mars) is refused without --yes: it is a
 # bounded read of the live database, and still the operator's to start. The
@@ -50,7 +50,10 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-JS="$HERE/rc-shadow-report.js"
+JS="$HERE/rc-shadow-report.cjs"
+# Inside a container the copy is named .js on purpose: mongosh runs a positional
+# argument as a script only when it ends in .js (anything else is a connection
+# string).
 NS="roomler-ai"
 POD="mongodb-0"
 
@@ -146,7 +149,7 @@ case "$TARGET" in
   mars)
     [ "$YES" = 1 ] || die "this reads PRODUCTION agent_logs; re-run with --yes to start it"
     command -v roomler >/dev/null || die "roomler is not on PATH"
-    roomler ssh mars -- 'mkdir -p ~/fr63-shadow && cat > ~/fr63-shadow/rc-shadow-report.js' < "$JS"
+    roomler ssh mars -- 'mkdir -p ~/fr63-shadow && cat > ~/fr63-shadow/rc-shadow-report.cjs' < "$JS"
     roomler ssh mars -- 'cat > ~/fr63-shadow/rc-shadow-report.sh' < "$HERE/rc-shadow-report.sh"
     rc=0
     roomler ssh mars -- "bash ~/fr63-shadow/rc-shadow-report.sh --kubectl --yes $(printf '%q ' "${PASS[@]+"${PASS[@]}"}")" || rc=$?
