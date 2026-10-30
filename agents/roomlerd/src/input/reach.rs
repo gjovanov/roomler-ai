@@ -162,10 +162,16 @@ pub(crate) fn decide(f: &Facts) -> InputReach {
             } else if accessibility {
                 verdict(Reach::Full, "CGEvent, with Accessibility granted".into())
             } else {
+                // #3164 — the pane lists this agent as `roomlerd`, beside the
+                // menu-bar app's own "Roomler" entry, which changes nothing
+                // here. No restart: the grant is live, and the arbiter opens
+                // its injector again once the OS grants it (`Regrant`).
                 verdict(
                     Reach::None,
-                    "macOS Accessibility is not granted to this agent: grant it in System \
-                     Settings, Privacy & Security, Accessibility, then restart the agent"
+                    "macOS Accessibility is not granted to this agent: turn on roomlerd in \
+                     System Settings, Privacy & Security, Accessibility (the Roomler entry there \
+                     is the menu-bar app, not this agent). It applies from the next remote event, \
+                     with no restart"
                         .into(),
                 )
             };
@@ -860,6 +866,10 @@ mod tests {
         let r = decide(&mac(false));
         assert_eq!(r.reach, Reach::None);
         assert!(r.reason.contains("Accessibility"), "{}", r.reason);
+        // #3164 — the entry the pane shows, and no restart: the grant is live
+        // and the injector opens again once it lands.
+        assert!(r.reason.contains("roomlerd"), "{}", r.reason);
+        assert!(!r.reason.contains("restart the agent"), "{}", r.reason);
     }
 
     #[test]

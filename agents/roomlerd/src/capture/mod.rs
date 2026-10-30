@@ -718,9 +718,7 @@ impl CaptureUnavailableCode {
         match self {
             Self::Permission => {
                 if cfg!(target_os = "macos") {
-                    "Grant Screen Recording to Roomler in System Settings → Privacy & Security, \
-                     then reconnect. A macOS update or a change to the app's code signature \
-                     invalidates an existing grant."
+                    MAC_PERMISSION_HINT
                 } else {
                     "The host denied this agent permission to capture the screen. Grant it on \
                      the host, then reconnect."
@@ -749,6 +747,22 @@ impl CaptureUnavailableCode {
         }
     }
 }
+
+/// #3164 — the macOS `permission` sentence. It names the entry the pane shows
+/// (`roomlerd`, the bundle's file name, beside the menu-bar app's own
+/// "Roomler"), and the restart: macOS applies a Screen Recording grant to a
+/// freshly started process only, so a reconnect alone found the same process
+/// and the same `permission` (field, agent 0.4.188). Up to 0.4.188 this said
+/// "Grant Screen Recording to Roomler … then reconnect"; the viewer corrects
+/// that older sentence itself (`ui/src/composables/macPermissionHint.ts`).
+///
+/// ⚠️ On the wire as a JSON literal, unescaped
+/// (`capture_unavailable_payload`): no double quote, no backslash.
+pub(crate) const MAC_PERMISSION_HINT: &str = "Turn on roomlerd in System Settings → Privacy & \
+     Security → Screen & System Audio Recording. macOS applies that grant only when the agent \
+     restarts, so reconnecting alone does not help: on the Mac, choose Quit & Reopen when macOS \
+     offers it, or Restart in the Roomler menu-bar app, then reconnect. A macOS update or a \
+     change to the app's code signature invalidates an existing grant.";
 
 /// FR-113 P2 — the `x11_not_enabled` sentence, by install type. A root daemon
 /// reads it when its automatic capture did not switch on for the X11 session
@@ -3639,8 +3653,9 @@ mod frame_tests {
 mod wayland_reason_tests {
     use super::CaptureUnavailableCode::{self, *};
     use super::{
-        SeatKind, linux_no_pixels_code, wayland_hint, wayland_not_enabled_detail, x11_hint,
-        x11_hint_with, x11_not_enabled_detail, xwayland_verdict,
+        MAC_PERMISSION_HINT, SeatKind, linux_no_pixels_code, wayland_hint,
+        wayland_not_enabled_detail, x11_hint, x11_hint_with, x11_not_enabled_detail,
+        xwayland_verdict,
     };
 
     fn seat(answer: Option<SeatKind>) -> impl FnOnce() -> Option<SeatKind> {
@@ -3879,6 +3894,8 @@ mod wayland_reason_tests {
             X11NotEnabled,
         ];
         let mut hints: Vec<&str> = codes.iter().map(|c| c.hint()).collect();
+        // #3164 — the macOS sentence, checked on every platform.
+        hints.push(MAC_PERMISSION_HINT);
         hints.push(wayland_hint(true));
         hints.push(wayland_hint(false));
         hints.push(x11_hint(true));
@@ -3898,6 +3915,26 @@ mod wayland_reason_tests {
                 "a hint would break the payload: {hint}"
             );
         }
+    }
+
+    /// #3164 — a Mac is told the entry the pane shows and that macOS applies
+    /// the grant only to a restarted agent, by the two restarts that bring it
+    /// back (master said "Grant Screen Recording to Roomler … then reconnect",
+    /// and a reconnect reached the same process and the same `permission`).
+    #[test]
+    fn the_mac_permission_hint_names_roomlerd_and_the_restart() {
+        let h = MAC_PERMISSION_HINT;
+        assert!(h.contains("Turn on roomlerd"), "{h}");
+        assert!(h.contains("Screen & System Audio Recording"), "{h}");
+        assert!(h.contains("only when the agent restarts"), "{h}");
+        assert!(
+            h.contains("Quit & Reopen") && h.contains("Roomler menu-bar app"),
+            "{h}"
+        );
+        assert!(
+            !h.contains("to Roomler in"),
+            "names the menu-bar app's entry: {h}"
+        );
     }
 
     /// Each install type is told the keys it can actually use: only root can

@@ -112,8 +112,10 @@ impl ScrapCapture {
         if !crate::tcc::screen_recording_granted() && !crate::tcc::request_screen_recording() {
             tracing::warn!(
                 "macOS Screen Recording permission MISSING — capture will deliver blank/wallpaper-only frames. \
-                 Grant it under System Settings → Privacy & Security → Screen Recording, then restart the agent \
-                 (launchctl kickstart -k gui/$UID/com.roomler.agent)"
+                 Turn on roomlerd under System Settings → Privacy & Security → Screen & System Audio Recording, \
+                 then restart the agent: macOS applies it to a freshly started process only (its own Quit & \
+                 Reopen, Restart in the Roomler menu-bar app, or launchctl kickstart -k \
+                 gui/$UID/com.roomler.agent) (#3164)"
             );
         }
 

@@ -24,6 +24,16 @@
 //! [`pump`], which takes a `MainThreadMarker` — so the rule is enforced by the
 //! type system rather than by remembering it.
 //!
+//! ## The application delegate (#3164)
+//!
+//! Because this process is an `NSApplication`, macOS can ask it to quit with a
+//! Quit AppleEvent, and does: System Settings' "Quit & Reopen" after a Screen
+//! Recording grant. AppKit's own answer is exit 0, which launchd never
+//! relaunches. The one delegate method here ([`AppDelegate`],
+//! `applicationShouldTerminate:`) turns such a quit into the daemon's graceful
+//! restart and keeps a log-out's quit AppKit's (`crate::macos_quit` has the
+//! table).
+//!
 //! ⚠️ **The panel WILL appear in the captured stream.** `NSWindowSharingNone`
 //! is honoured by ScreenCaptureKit and `CGWindowListCreateImage`, but NOT by
 //! `CGDisplayStream`, which is what `capture/scrap_backend.rs` uses. It is set
@@ -40,18 +50,24 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
 // `MainThreadOnly` is what provides `NSWindow::alloc` — an inherent-looking
 // call that is actually a trait method, so the import is load-bearing.
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezelStyle, NSButton,
-    NSButtonType, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSEventMask, NSFont,
-    NSScreen, NSScreenSaverWindowLevel, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+    NSApplicationTerminateReply, NSBackingStoreType, NSBezelStyle, NSButton, NSButtonType, NSColor,
+    NSControlStateValueOff, NSControlStateValueOn, NSEventMask, NSFont, NSScreen,
+    NSScreenSaverWindowLevel, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior,
     NSWindowSharingType, NSWindowStyleMask,
 };
-use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    NSAppleEventDescriptor, NSAppleEventManager, NSDate, NSDefaultRunLoopMode, NSObject,
+    NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+};
 
 use super::{ConsentSender, PromptView};
+use crate::macos_quit::{self, QuitReply};
 
 const W: f64 = 480.0;
 const H: f64 = 240.0;
@@ -166,6 +182,125 @@ impl Inner {
     }
 }
 
+define_class!(
+    // SAFETY:
+    // - The superclass NSObject has no subclassing requirements.
+    // - `AppDelegate` does not implement `Drop`, and has no ivars.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RoomlerAppDelegate"]
+    struct AppDelegate;
+
+    // SAFETY: `NSObjectProtocol` has no safety requirements.
+    unsafe impl NSObjectProtocol for AppDelegate {}
+
+    // SAFETY: `NSApplicationDelegate` has no safety requirements, and the one
+    // method below has the protocol's signature. Every other method stays
+    // unimplemented, so AppKit's defaults hold for all of them.
+    unsafe impl NSApplicationDelegate for AppDelegate {
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn application_should_terminate(
+            &self,
+            _sender: &NSApplication,
+        ) -> NSApplicationTerminateReply {
+            should_terminate()
+        }
+    }
+);
+
+impl AppDelegate {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: NSObject's designated initialiser, on a freshly allocated
+        // instance (it has no ivars to set).
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// #3164 — `applicationShouldTerminate:`. A Quit AppleEvent that is not a
+/// session ending restarts the daemon under its supervisor instead of letting
+/// AppKit exit 0, which launchd's `KeepAlive {SuccessfulExit: false}` never
+/// relaunches. The table is `macos_quit`'s; this is only its AppKit end.
+fn should_terminate() -> NSApplicationTerminateReply {
+    let (event, reason) = current_apple_event();
+    let intent = macos_quit::classify(event, reason);
+    let reason_text = reason.map_or_else(|| "none".to_string(), macos_quit::fourcc_text);
+    let mut armed = None;
+    let reply = macos_quit::decide(intent, || {
+        armed = macos_quit::arm_restart_for_quit(&format!(
+            "macOS asked roomlerd to quit (a Quit AppleEvent, quit reason {reason_text})"
+        ));
+        armed.is_some()
+    });
+    match (reply, armed) {
+        (QuitReply::RestartLater, Some(code)) => {
+            tracing::warn!(
+                quit_reason = %reason_text,
+                exit_code = code,
+                "a Quit AppleEvent (System Settings' Quit & Reopen, the Dock, Activity Monitor, a \
+                 script): restarting under the supervisor instead of exiting 0, which launchd \
+                 would not relaunch (#3164)"
+            );
+            // The graceful path is bounded; this makes the relaunch certain
+            // even if something on it hangs while AppKit waits.
+            let _ = std::thread::Builder::new()
+                .name("roomlerd-quit-backstop".into())
+                .spawn(move || {
+                    std::thread::sleep(macos_quit::QUIT_RESTART_BACKSTOP);
+                    tracing::error!(
+                        exit_code = code,
+                        "the restart a Quit AppleEvent started has not finished in time — leaving \
+                         now with the supervisor's code (#3164)"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    std::process::exit(code);
+                });
+            NSApplicationTerminateReply::TerminateLater
+        }
+        _ => {
+            tracing::info!(
+                ?intent,
+                quit_reason = %reason_text,
+                "terminating the way AppKit does: exit 0, which launchd does not relaunch (#3164)"
+            );
+            // AppKit exits as soon as this returns; the log's file layer
+            // writes from its own thread, so give it a moment to keep this
+            // line (a log-out's quit is diagnosed from it).
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            NSApplicationTerminateReply::TerminateNow
+        }
+    }
+}
+
+/// The Apple Event AppKit is handling right now, as (class, id), and its
+/// `kAEQuitReason`. `AERegistry.h` calls the reason a parameter and Apple's
+/// samples read it as an attribute, so both are asked. `msg_send!` because
+/// objc2-foundation gates these four methods on its `objc2-core-services`
+/// feature, a crate this lockfile does not carry; each is a FourCharCode in or
+/// out.
+fn current_apple_event() -> (Option<(u32, u32)>, Option<u32>) {
+    let Some(event) = NSAppleEventManager::sharedAppleEventManager().currentAppleEvent() else {
+        return (None, None);
+    };
+    // SAFETY: `eventClass` and `eventID` take nothing and return an
+    // `AEEventClass` / `AEEventID`, each a FourCharCode (UInt32).
+    let class: u32 = unsafe { msg_send![&*event, eventClass] };
+    let id: u32 = unsafe { msg_send![&*event, eventID] };
+    let keyword = macos_quit::QUIT_REASON_KEYWORD;
+    // SAFETY: both take an `AEKeyword` (a FourCharCode) and return a
+    // descriptor, or nil when the event has no such key.
+    let attribute: Option<Retained<NSAppleEventDescriptor>> =
+        unsafe { msg_send![&*event, attributeDescriptorForKeyword: keyword] };
+    let parameter: Option<Retained<NSAppleEventDescriptor>> =
+        unsafe { msg_send![&*event, paramDescriptorForKeyword: keyword] };
+    let reason = attribute.or(parameter).map(|d| {
+        // A type code, or an enumerated one: whichever the sender used.
+        let code = d.typeCodeValue();
+        if code != 0 { code } else { d.enumCodeValue() }
+    });
+    (Some((class, id)), reason)
+}
+
 /// Hand the calling thread to AppKit. Never returns.
 ///
 /// Called from `main` on the MAIN thread only. `Accessory` keeps the daemon
@@ -176,6 +311,11 @@ pub fn run_main_loop() -> ! {
         .expect("indicator::mac::run_main_loop must be called on the main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    // #3164 — before `finishLaunching`, so AppKit consults it from the first
+    // event. `setDelegate` does not retain: this local lives as long as the
+    // loop below, which is the process.
+    let delegate = AppDelegate::new(mtm);
+    app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     PUMPING.store(true, Ordering::SeqCst);
 
     // `NSApp.run()` would never give control back, so this is the manual pump

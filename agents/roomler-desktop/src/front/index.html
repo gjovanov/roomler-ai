@@ -95,6 +95,9 @@
           the product looks broken rather than blocked: the remote screen is
           wallpaper-only and every injected click vanishes, with no error
           anywhere. This is the one place that says so before you find out.
+          #3164: the grants shown are the AGENT's (`roomlerd`), as it reports
+          them; this app's own never mattered. Screen Recording reaches a
+          freshly started agent only, hence the Restart beside it.
         -->
         <div id="ov-permissions" class="banner banner-warn" hidden>
           <div>
@@ -102,18 +105,27 @@
             <p class="muted small" style="margin: 4px 0 8px">
               macOS does not report an error when these are missing — the screen
               streams as wallpaper only, and remote clicks and keys do nothing.
+              In System Settings, turn on <strong>roomlerd</strong>. The
+              <strong>Roomler</strong> entry there is this menu-bar app, and
+              turning it on changes nothing.
             </p>
             <div id="ov-perm-screen" class="row" hidden style="margin-bottom: 6px">
               <span>Screen Recording — the remote screen will be blank</span>
-              <button type="button" class="primary" id="ov-btn-perm-screen">Grant</button>
+              <button type="button" class="primary" id="ov-btn-perm-screen">Open Settings</button>
             </div>
             <div id="ov-perm-input" class="row" hidden>
               <span>Accessibility — remote keyboard and mouse will do nothing</span>
-              <button type="button" class="primary" id="ov-btn-perm-input">Grant</button>
+              <button type="button" class="primary" id="ov-btn-perm-input">Open Settings</button>
             </div>
-            <p class="muted small" style="margin: 8px 0 0">
-              After enabling a toggle, restart the agent for it to take effect.
-            </p>
+            <div id="ov-perm-restart" class="row" hidden style="margin-top: 8px">
+              <span class="muted small">
+                macOS applies Screen Recording only after the agent restarts:
+                restart it here, or choose Quit &amp; Reopen when macOS offers
+                it. Accessibility applies at once.
+              </span>
+              <button type="button" id="ov-btn-perm-restart">Restart the agent</button>
+            </div>
+            <p id="ov-perm-restart-result" class="muted small" style="margin: 6px 0 0" hidden></p>
           </div>
         </div>
 

@@ -383,6 +383,77 @@ impl RestartHandle {
         );
         Ok(plan)
     }
+
+    /// #3164 — macOS asked this process to quit with a Quit AppleEvent: System
+    /// Settings' "Quit & Reopen" after a Screen Recording grant, the Dock,
+    /// Activity Monitor, a script (`crate::macos_quit` has the table). Under a
+    /// supervisor that relaunches it, that is a restart: armed here with that
+    /// supervisor's code and recorded as the verb records one; the caller then
+    /// [`Self::commit`]s it, so it leaves through the same graceful door (no
+    /// crash counted, no ephemeral unenroll).
+    ///
+    /// Not the verb's gates. The process quits either way (AppKit exits 0 when
+    /// this returns `None`), so the only choice here is whether the device comes
+    /// back. `local_restart_enabled` is the owner's switch for restarts LOCAL
+    /// CLIENTS ask for, and the 30 s window bounds a client's re-sends; a quit
+    /// is neither, and refusing it would be the offline device #3164 is about.
+    /// Only something outside the daemon sends a quit, and launchd's own
+    /// `ThrottleInterval` (10 s) spaces any relaunches it causes.
+    ///
+    /// Synchronous: AppKit calls it on the main thread. `None` when nothing
+    /// relaunches this process ([`Supervision::None`]): there a quit is a stop.
+    ///
+    /// [`Supervision::None`]: crate::supervision::Supervision::None
+    pub fn arm_for_quit(&self, reason: &str) -> Option<i32> {
+        use crate::supervision as sup;
+        let inner = &self.inner;
+        if !inner.supervision.is_supervised() {
+            return None;
+        }
+        // A restart already accepted (the verb's, or an earlier quit's) keeps
+        // its code; the commit after this is idempotent.
+        let exit_code = *inner
+            .accepted
+            .get_or_init(|| inner.supervision.restart_exit_code());
+        let reason = sup::sanitize_reason(reason);
+        let record = sup::RestartRecord {
+            at_ms: unix_now_ms(),
+            pid: std::process::id(),
+            supervisor: inner.supervision.wire().to_string(),
+            reason: reason.clone(),
+        };
+        // Recorded for "why did it restart" and the verb's window; a failure
+        // costs only that, never the restart.
+        if let Err(e) = sup::write_record(&inner.record_path, &record) {
+            tracing::warn!(error = %e, "restart for a quit: not recorded; restarting anyway");
+        }
+        tracing::info!(
+            %reason,
+            supervisor = inner.supervision.wire(),
+            exit_code,
+            "restart armed for a Quit AppleEvent (#3164)"
+        );
+        Some(exit_code)
+    }
+}
+
+/// #3164 — the two macOS grants as this process holds them
+/// ([`NodeStatus::macos_grants`]). `None` off macOS, and in a process with no
+/// GUI session (a Mac's root half), where neither grant could do anything.
+/// Three cheap TCC/WindowServer reads, made only when a client asks.
+fn macos_grants_now() -> Option<tunnel_core::localapi::MacosGrants> {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::tcc;
+        tcc::has_gui_session().then(|| tunnel_core::localapi::MacosGrants {
+            screen_recording: tcc::screen_recording_granted(),
+            accessibility: tcc::accessibility_trusted(),
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 /// Wall-clock ms since the epoch — the restart record is compared across
@@ -873,6 +944,8 @@ impl LocalApiState for DaemonState {
             // refreshed off this thread — this is a sync read on the async
             // dispatch, and the honest answer needs the disk.
             files_dir: crate::files::effective_files_dir(),
+            // #3164 — this process's own grants, for the menu-bar app's card.
+            macos_grants: macos_grants_now(),
         }
     }
 
@@ -2985,6 +3058,76 @@ mod tests {
         );
         let why = refusal(st.restart_daemon("again").await);
         assert!(why.contains("already under way"), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3164 — a Quit AppleEvent under launchd: armed with the code launchd
+    /// relaunches (never 0, which `KeepAlive {SuccessfulExit: false}` reads as
+    /// "stay down"), recorded, and the commit starts the same internal
+    /// shutdown as the verb's. Against master's code there was no such arm:
+    /// AppKit's quit ended the process with 0.
+    #[tokio::test]
+    async fn a_quit_under_launchd_is_armed_with_the_code_launchd_relaunches() {
+        let dir = restart_dir("quit-launchd", true);
+        let (_st, restart, shutdown) = restart_state(&dir, Supervision::Launchd);
+        let code = restart.arm_for_quit("macOS asked roomlerd to quit (a Quit AppleEvent)");
+        assert_eq!(code, Some(crate::watchdog::RESTART_REQUESTED_EXIT_CODE));
+        assert_ne!(code, Some(0), "launchd never relaunches a 0");
+        assert_eq!(restart.accepted_exit_code(), code);
+        let record = std::fs::read_to_string(dir.join(RESTART_RECORD_FILE)).unwrap();
+        assert!(record.contains("Quit AppleEvent"), "{record}");
+        assert!(!*shutdown.borrow(), "armed, not yet committed");
+        restart.commit();
+        assert!(
+            *shutdown.borrow(),
+            "the commit starts the internal shutdown"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3164 — a quit is honoured where a client's restart is refused: the
+    /// owner's `local_restart_enabled = false`, the 30 s window after another
+    /// restart, a young FR-43 worker. The process quits either way, so a
+    /// refusal would only leave the device offline.
+    #[tokio::test]
+    async fn a_quit_restarts_where_the_verb_would_refuse() {
+        let dir = restart_dir("quit-gates", false);
+        // A restart moments ago, by the verb's record.
+        crate::supervision::write_record(
+            &dir.join(RESTART_RECORD_FILE),
+            &crate::supervision::RestartRecord {
+                at_ms: unix_now_ms(),
+                pid: 1,
+                supervisor: "macos-supervisor".into(),
+                reason: "earlier".into(),
+            },
+        )
+        .unwrap();
+        let (st, restart, shutdown) = restart_state(&dir, Supervision::MacosSupervisor);
+        let why = refusal(st.restart_daemon("apply").await);
+        assert!(why.contains("local_restart_enabled = false"), "{why}");
+        let code = restart.arm_for_quit("quit");
+        assert_eq!(code, Some(crate::watchdog::RESTART_REQUESTED_EXIT_CODE));
+        restart.commit();
+        assert!(*shutdown.borrow());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3164 — nothing relaunches a hand-run `roomlerd run`: a quit stays the
+    /// stop it always was there, and nothing is armed, recorded or shut down
+    /// by this path (AppKit ends the process itself).
+    #[tokio::test]
+    async fn a_quit_nothing_relaunches_arms_nothing() {
+        let dir = restart_dir("quit-orphan", true);
+        let (_st, restart, shutdown) = restart_state(&dir, Supervision::None);
+        assert_eq!(restart.arm_for_quit("quit"), None);
+        assert_eq!(restart.accepted_exit_code(), None);
+        assert!(!dir.join(RESTART_RECORD_FILE).exists());
+        restart.commit();
+        assert!(
+            !*shutdown.borrow(),
+            "nothing was accepted, so nothing commits"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
