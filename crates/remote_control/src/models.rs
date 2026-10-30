@@ -3570,7 +3570,12 @@ mod visible_device_tests {
             assert!(v.get(forbidden).is_none(), "{forbidden} leaked: {v}");
         }
         // Absent on a device that gave no such reason.
-        assert!(serde_json::to_value(row()).unwrap().get("asleep_since").is_none());
+        assert!(
+            serde_json::to_value(row())
+                .unwrap()
+                .get("asleep_since")
+                .is_none()
+        );
     }
 
     /// The fleet-record fields a device must never see have no slot on the

@@ -3358,7 +3358,10 @@ mod tests {
         let d = m.description;
         let warning = &d[d.find("⚠️").expect("a ⚠️ sentence")..];
         assert!(warning.starts_with("⚠️ macOS clamshell sleep"), "{d}");
-        assert!(warning.contains("lid closed") && warning.contains("ignores it"), "{d}");
+        assert!(
+            warning.contains("lid closed") && warning.contains("ignores it"),
+            "{d}"
+        );
         // `config_set_note` cuts the sentence at its ". ".
         assert!(warning.contains(". "), "{d}");
     }

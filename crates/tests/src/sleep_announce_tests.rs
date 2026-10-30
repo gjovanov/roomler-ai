@@ -78,13 +78,10 @@ async fn presence_row(user_ws: &mut Ws, agent_id: &str, presence: &str) -> Value
         if v["type"] != "device:presence" {
             continue;
         }
-        if let Some(row) = v["data"]["agents"]
-            .as_array()
-            .and_then(|rows| {
-                rows.iter()
-                    .find(|r| r["agent_id"] == agent_id && r["presence"] == presence)
-            })
-        {
+        if let Some(row) = v["data"]["agents"].as_array().and_then(|rows| {
+            rows.iter()
+                .find(|r| r["agent_id"] == agent_id && r["presence"] == presence)
+        }) {
             return row.clone();
         }
     }
@@ -133,8 +130,14 @@ async fn a_device_that_announces_its_sleep_reads_asleep_until_its_next_hello() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(row["power"]["policy"], "on-ac", "the heartbeat's posture: {row}");
-    assert!(row.get("sleep").is_none(), "online: no reason to show: {row}");
+    assert_eq!(
+        row["power"]["policy"], "on-ac",
+        "the heartbeat's posture: {row}"
+    );
+    assert!(
+        row.get("sleep").is_none(),
+        "online: no reason to show: {row}"
+    );
 
     // The goodbye before a sleep ends the connection NOW: the device reads
     // offline at once, not after the receive deadline reaps a silent socket.
@@ -160,7 +163,9 @@ async fn a_device_that_announces_its_sleep_reads_asleep_until_its_next_hello() {
     assert_eq!(ev["sleep"]["power"]["on_ac"], false, "{ev}");
     assert_eq!(ev["sleep"]["power"]["held"], false, "{ev}");
     assert!(
-        ev["sleep"]["since"].as_str().is_some_and(|s| s.contains('T')),
+        ev["sleep"]["since"]
+            .as_str()
+            .is_some_and(|s| s.contains('T')),
         "RFC 3339: {ev}"
     );
 
@@ -188,9 +193,17 @@ async fn a_device_that_announces_its_sleep_reads_asleep_until_its_next_hello() {
         row.get("sleep").is_none(),
         "the hello erased the old reason: {row}"
     );
-    assert!(device_row(&app, &seeded, &agent_id).await.get("sleep").is_none());
+    assert!(
+        device_row(&app, &seeded, &agent_id)
+            .await
+            .get("sleep")
+            .is_none()
+    );
     let ev = presence_row(&mut user_ws, &agent_id, "offline").await;
-    assert!(ev.get("sleep").is_none(), "no reason given, none sent: {ev}");
+    assert!(
+        ev.get("sleep").is_none(),
+        "no reason given, none sent: {ev}"
+    );
 }
 
 /// The notice is keyed by the connection that wrote the row's hello, like the

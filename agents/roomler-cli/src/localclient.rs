@@ -1596,11 +1596,7 @@ pub async fn config_set(key: &str, value: Option<&str>) -> Result<()> {
     // FR-55 AC6 — on a Mac, the one thing a person setting the power policy
     // must not miss: a closed lid sleeps it anyway. In the daemon's own words
     // (its description), so the warning has one source.
-    if let Some(note) = config_set_note(
-        &entry.key,
-        &entry.description,
-        cfg!(target_os = "macos"),
-    ) {
+    if let Some(note) = config_set_note(&entry.key, &entry.description, cfg!(target_os = "macos")) {
         println!("{note}");
     }
     // #2871 — and WHICH daemon's file just changed, when this host runs two.
@@ -4369,11 +4365,17 @@ mod devices_tests {
         r.presence = "offline".into();
         r.is_online = false;
         let gone = fmt_device_row(&r, None, 12);
-        assert!(gone.starts_with('○') && gone.contains(" offline "), "{gone}");
+        assert!(
+            gone.starts_with('○') && gone.contains(" offline "),
+            "{gone}"
+        );
 
         r.asleep_since = Some("2026-10-30T12:00:00Z".into());
         let asleep = fmt_device_row(&r, None, 12);
-        assert!(asleep.starts_with('◌') && asleep.contains(" asleep "), "{asleep}");
+        assert!(
+            asleep.starts_with('◌') && asleep.contains(" asleep "),
+            "{asleep}"
+        );
         assert!(!asleep.contains("offline"), "{asleep}");
 
         r.presence = "online".into();
@@ -4429,7 +4431,10 @@ mod devices_tests {
         );
         assert_eq!(config_set_note("power_policy", desc, false), None);
         assert_eq!(config_set_note("exec_enabled", desc, true), None);
-        assert_eq!(config_set_note("power_policy", "no warning here.", true), None);
+        assert_eq!(
+            config_set_note("power_policy", "no warning here.", true),
+            None
+        );
     }
 
     /// A single-org daemon stamps no org on its peers — those are the

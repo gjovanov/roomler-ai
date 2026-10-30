@@ -783,8 +783,7 @@ mod mac {
             notifier: *mut u32,
         ) -> u32;
         fn IOAllowPowerChange(kernel_port: u32, notification_id: isize) -> i32;
-        fn IONotificationPortGetRunLoopSource(notify: IoNotificationPortRef)
-        -> CfRunLoopSourceRef;
+        fn IONotificationPortGetRunLoopSource(notify: IoNotificationPortRef) -> CfRunLoopSourceRef;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -851,7 +850,12 @@ mod mac {
     /// after at most [`BUDGET`]: an unanswered one delays the sleep by 30 s,
     /// with the lid closed. And it never unwinds into IOKit: a panic across
     /// `extern "C"` aborts the daemon.
-    extern "C" fn on_power(refcon: *mut c_void, _service: u32, message: u32, argument: *mut c_void) {
+    extern "C" fn on_power(
+        refcon: *mut c_void,
+        _service: u32,
+        message: u32,
+        argument: *mut c_void,
+    ) {
         match message {
             CAN_SYSTEM_SLEEP => allow(argument),
             SYSTEM_WILL_SLEEP => {
@@ -907,15 +911,36 @@ mod tests {
     #[test]
     fn the_inhibitor_covers_sessions_always_and_connections_only_off_never() {
         // (sessions, connections, policy_never, notice, announce)
-        assert!(inhibitor_wanted(1, 0, true, true, true), "a session, on never");
+        assert!(
+            inhibitor_wanted(1, 0, true, true, true),
+            "a session, on never"
+        );
         assert!(inhibitor_wanted(1, 3, true, true, true));
-        assert!(!inhibitor_wanted(0, 1, true, true, true), "never: connections add nothing");
-        assert!(inhibitor_wanted(0, 1, false, true, true), "on-ac / always: a connection");
+        assert!(
+            !inhibitor_wanted(0, 1, true, true, true),
+            "never: connections add nothing"
+        );
+        assert!(
+            inhibitor_wanted(0, 1, false, true, true),
+            "on-ac / always: a connection"
+        );
         assert!(!inhibitor_wanted(0, 0, false, true, true), "nothing live");
-        assert!(!inhibitor_wanted(0, 1, false, true, false), "ROOMLERD_SLEEP_ANNOUNCE=0");
-        assert!(inhibitor_wanted(1, 0, true, true, false), "the notice keeps its own");
-        assert!(!inhibitor_wanted(1, 0, true, false, true), "ROOMLERD_SLEEP_NOTICE=0");
-        assert!(inhibitor_wanted(0, 1, false, false, true), "the goodbye keeps its own");
+        assert!(
+            !inhibitor_wanted(0, 1, false, true, false),
+            "ROOMLERD_SLEEP_ANNOUNCE=0"
+        );
+        assert!(
+            inhibitor_wanted(1, 0, true, true, false),
+            "the notice keeps its own"
+        );
+        assert!(
+            !inhibitor_wanted(1, 0, true, false, true),
+            "ROOMLERD_SLEEP_NOTICE=0"
+        );
+        assert!(
+            inhibitor_wanted(0, 1, false, false, true),
+            "the goodbye keeps its own"
+        );
     }
 
     /// P5h — a session is told for exactly as long as it is registered. By
