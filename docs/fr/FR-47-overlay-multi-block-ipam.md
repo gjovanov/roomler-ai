@@ -1,7 +1,7 @@
 # FR-47: One address space per org — carve by default, grow without renumbering
 
 **Issue:** [#1071](https://github.com/gjovanov/roomler-ai/issues/1071) ·
-**Status:** shipped — P0–P6 complete; the isolation half **field-verified in production**, the growth half (P5a–e) shipped **dark** behind `overlay.multi_block_enabled` · **Owner:** overlay/networking
+**Status:** shipped — P0–P6 complete; **every criterion an agent can reach is field-verified** (AC1, AC2, AC6, AC7 on prod 2026-08-31; AC3 on a throwaway stack 2026-10-30; the docs). Open, and the operator's: AC4–AC5, the growth half (P5a–e) that ships **dark** behind `overlay.multi_block_enabled` (FR-68 P7 decides the flag), and AC8's page, which nothing wires yet (`[~]`) · **Owner:** overlay/networking
 
 ## Goal
 
@@ -193,7 +193,7 @@ leak is purely historical or still active.
 | **P5c** | A full network grows instead of refusing | ✅ shipped, **dark** | `overlay.multi_block_enabled`, default off |
 | **P5d** | The wire: `cidrs` + per-recipient `cidr` | ✅ shipped, **dark** | same flag |
 | **P5e** | Per-block NAT scope (Linux + Windows) | ✅ shipped, **dark** | same flag |
-| **P6** | Docs | ✅ this file + `multi-org.md` §4.2 | — |
+| **P6** | Docs | ✅ this file + `multi-org.md` §4.2; the 2026-10-30 close-out added the P2 refusal (`multi-org.md` §4.2) and the P3 reconcile (`overlay-communication.md`, `api.md`), which no doc covered | — |
 
 ### What is NOT field-verified
 
@@ -210,17 +210,68 @@ phase of it is behind one flag that is off.
 
 ## 5. Acceptance criteria
 
-- [ ] A newly created organization receives a disjoint block with no operator action.
-- [ ] Two organizations can never be issued overlapping ranges — asserted by test, and by
+Ticked by the 2026-10-30 close-out, each against the evidence it names. The prod reads of
+2026-08-31 were first ticked only in issue comments. AC4 and AC5 are the dark growth half
+and the operator's call: FR-68 P7 decides the flag.
+
+- [x] **AC1** A newly created organization receives a disjoint block with no operator action.
+      Prod 2026-08-31: the registry's `end_slot` pinned the next org to `100.65.8.0/22`
+      before the deploy, and it landed there
+      ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486110349)).
+      CI pins the default: `the_shipped_default_carves_a_block_for_a_new_org`
+      (`crates/tests/src/overlay_tests.rs:1860`).
+- [x] **AC2** Two organizations can never be issued overlapping ranges — asserted by test, and by
       the absence of any `100.64.0.0/10` network in production.
-- [ ] A device that cannot be allocated an address receives a stated reason, and
+      Tests: `blocks_are_disjoint_across_tenants` (`crates/tests/src/overlay_tests.rs:1622`)
+      and `aligned_starts_are_never_partially_overlapping`
+      (`crates/remote_control/src/models.rs:9395`). Prod 2026-08-31: no network left on the
+      `/10` ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486110349)),
+      and the P3 dry run that listed every network found all four on `100.65.x`
+      ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486189495)).
+- [x] **AC3** A device that cannot be allocated an address receives a stated reason, and
       `roomler status` shows it.
-- [ ] An org that fills its block is given a second one; no device changes address.
-- [ ] A pre-P5 agent meshes correctly against a multi-block org — verified with a real old
+      2026-10-30, on a throwaway stack running the server image prod ran that day and the
+      released agent 0.4.187: with the org's block exhausted, a joining node's
+      `roomler status` printed `join REFUSED 17s ago — address_space_exhausted (retrying
+      will not help; an operator has to act)` and the server's detail, and the server
+      logged the matching `alert="overlay_join_refused"`. The control, a node of the same
+      org that joined before the exhaustion, prints no `join` line. Reads in §8.
+- [ ] **AC4** An org that fills its block is given a second one; no device changes address.
+      Operator: shipped dark behind `overlay.multi_block_enabled`; the flip is FR-68 P7.
+- [ ] **AC5** A pre-P5 agent meshes correctly against a multi-block org — verified with a real old
       binary, not a decoder test alone.
-- [ ] The ~17 orphaned ordinals in `100.65.4.0/22` are returned to its pool.
-- [ ] Both legacy networks are migrated; `100.64.0.0/10` holds no live node.
-- [ ] Registry `headroom` is alerted on, and the shared-`/10` carve-failure fallback pages.
+      Operator: the same test as FR-68 AC2, deferred as the operator's call.
+- [x] **AC6** The ~17 orphaned ordinals in `100.65.4.0/22` are returned to its pool.
+      Prod 2026-08-31: `reconcile-hosts` released exactly 17 (`[1,3,5,8–13,16–23]`) and
+      refused 0. The pool then held 18, no pooled ordinal was held by a live node, and a
+      second dry run read `orphaned: []`
+      ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486189495)).
+- [x] **AC7** Both legacy networks are migrated; `100.64.0.0/10` holds no live node.
+      As it happened, one was migrated and one was deleted. `demo` was renumbered onto
+      `100.65.12.0/22`, every node keeping its ordinal
+      ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486110349)).
+      The other belonged to a tenant row that no longer existed, so there was no org to
+      migrate. It was deleted by operator decision after a backup
+      ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5485248072)).
+      Prod 2026-08-31: 0 live nodes on `100.64.x`.
+- [~] **AC8** Registry `headroom` is alerted on, and the shared-`/10` carve-failure fallback pages.
+      Met: both conditions emit a structured alert line. The carve-failure fallback logs
+      at ERROR with `alert = "overlay_block_carve_failed"`
+      (`crates/services/src/dao/overlay_network.rs:187-193`). Registry pressure logs at
+      WARN with `alert = "overlay_block_registry_pressure"` once a carve takes the slot
+      cursor to 80 % or more (`crates/services/src/dao/overlay_block.rs:62`, `:71-84`), a
+      threshold pinned by `registry_pressure_crosses_at_the_documented_threshold`
+      (`:572`). Missing: nothing routes either line to a page. No alerting rule for them
+      exists in this repository, the deploy repository or the cluster repository
+      (searched 2026-10-30). The 2026-08-31 comment ticked this box on the log lines
+      alone.
+- [x] **AC9 — Docs** updated, with diagrams, linked from `docs/README.md`:
+      [`multi-org.md`](../multi-org.md) §4.2 (the registry, carve-on-create, both alert
+      lines, growth and its races, with a sequence diagram, and the refused join with its
+      `roomler status` line and lifecycle diagram) and the §4.3 renumber runbook;
+      [`overlay-communication.md`](../overlay-communication.md) (the leaked ordinals and
+      `reconcile-hosts`); [`api.md`](../api.md) (the route); the P6 row above. The
+      close-out found P2 and P3 documented nowhere outside this spec, and added both.
 
 ## 6. Open decisions
 
@@ -242,6 +293,74 @@ phase of it is behind one flag that is off.
 | date | version | what was verified | result |
 |---|---|---|---|
 | 2026-08-31 | prod | Carving off; 2 of 4 networks on the shared `/10` with overlapping addresses; ~17 orphaned ordinals in the oldest carved org | recorded in §1 |
+| 2026-10-30 | server image `hosted-20261030-b101fc4` (prod's that day) + released agent 0.4.187, throwaway stack | AC3: a node refused an address says why in `roomler status`. Control first, then the exhausted block (reads below) | **AC3 met** |
+| 2026-10-30 | — | Close-out: AC1, AC2, AC6 and AC7 ticked against the 2026-08-31 prod reads; AC8 → `[~]` (the alert lines exist, nothing pages); the docs criterion added, with the P2 and P3 docs it found missing | spec + docs |
+
+### AC3 — `roomler status` names a refused join (2026-10-30)
+
+The stack ran on a private container network with no route out: MongoDB, Redis, the
+server from the image production ran that day (`ghcr.io/gjovanov/roomler-ai:hosted-20261030-b101fc4`,
+`/health` → `0.4.187`, with the shipped defaults: carving on, `multi_block_enabled` off),
+and two containers running the released `roomlerd` 0.4.187 linux build with
+`ROOMLERD_AUTO_UPDATE=0`. Each agent reached the server through a loopback relay inside
+its own container. The stack has no TLS, and the agent refuses to send an enrollment
+token in plaintext to a host that is not loopback (FR-101 P1b).
+
+1. **Control.** Agent A joins a fresh org. The server logs `overlay blocks: carved a
+   tenant block … cidr=100.65.0.0/22 slot=64` and leases it `.1`. Its `roomler status`
+   carries no `join` line:
+
+   ```
+   ● fr47w3-agent-a
+     node id     6ae47f9af860…
+     version     0.4.187
+     mode        service (root)
+     tenant      6ae47f31f8603e6bdfbba5fc
+     overlay ip  100.65.0.1
+     overlay ip6 fd72:6f6f:6d6c::6441:1
+     server      connected
+     credential  expires in 364 days
+     lan         clear (own prefixes route on-link)
+     srflx       NONE — cannot hole-punch (no public candidate)
+     route guard evicted=0 spared=0 waves=1 [tick=0 pulled=0 event=1] revalidations=0
+                (cumulative — DIFF two readings, never judge the absolute)
+     direct sock 172.25.0.5:43824  rx=0 last_rx=never
+     direct sock 0.0.0.0:44080 (public-dial)  rx=0 last_rx=never
+   ```
+
+2. **Exhaust.** In the throwaway database the org's cursor moves past its block's
+   ceiling: `next_host` 2 → 1023, `free_hosts` empty. Only the scale is faked, as in
+   `overlay_growth_tests`; the allocator's refusal is the real one.
+3. **Refused.** Agent B, a second machine in the same org, joins. The server logs:
+
+   ```
+   ERROR roomler_ai_mod_network::overlay: overlay.join: refused node_ref=Agent { agent_id: ObjectId("6ae47fd6f8603e6bdfbba60d") } reason=AddressSpaceExhausted detail=Validation: overlay network 6ae47fa7f8603e6bdfbba607 exhausted: every host ordinal up to 1022 is leased (grow the tenant's block or release unused devices) alert="overlay_join_refused"
+   ```
+
+   Agent B's daemon logs `ERROR overlay: the server REFUSED our join … retryable=false`,
+   and its `roomler status` reads:
+
+   ```
+   ● fr47w3-agent-b
+     node id     6ae47fd6f860…
+     version     0.4.187
+     mode        service (root)
+     tenant      6ae47f31f8603e6bdfbba5fc
+     overlay ip  —
+     overlay ip6 —
+     server      connected
+     credential  expires in 364 days
+     lan         clear (own prefixes route on-link)
+     join        REFUSED 17s ago — address_space_exhausted (retrying will not help; an operator has to act)
+                 Validation: overlay network 6ae47fa7f8603e6bdfbba607 exhausted: every host ordinal up to 1022 is leased (grow the tenant's block or release unused devices)
+   ```
+
+   `roomler status --json` carries the same as `join_refusal { reason:
+   "address_space_exhausted", detail, at_unix, retryable: false }`. Agent A, read again
+   afterwards, still has no `join` line.
+
+`server connected` with no overlay address is the shape §1b found indistinguishable from
+an offline node. It now states its reason.
 
 ### The state this FR opened on, and the state now
 

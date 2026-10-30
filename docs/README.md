@@ -66,6 +66,10 @@ flowchart TB
         RCM["relay-cost-metering.md"]
     end
 
+    subgraph work["🧭 How the work is run"]
+        AHUB["agent-hub.md"]
+    end
+
     REF["api.md · permissions.md · data-model.md · testing.md · vmtest.md"]
 
     UC --> rd & net & collab
@@ -119,12 +123,12 @@ port forwards, SOCKS5, SSH without sshd, and exit nodes on top.*
 
 | Doc | What it covers |
 |---|---|
-| [overlay-communication.md](overlay-communication.md) | **Start here for the overlay** — every carrier path (LAN, public, hole-punch, relay, DERP), inside and outside a corporate VPN, with field-proof; the direct carrier's socket buffers (FR-110: 116 → 543 Mbit/s into a Linux host on 0.4.141); the node's own firewall (FR-97 P3i): carriers pass firewalld through conntrack, services on the overlay address do not unless the zone admits them, and `roomler status` names the zone instead of changing it |
+| [overlay-communication.md](overlay-communication.md) | **Start here for the overlay** — every carrier path (LAN, public, hole-punch, relay, DERP), inside and outside a corporate VPN, with field-proof; the direct carrier's socket buffers (FR-110: 116 → 543 Mbit/s into a Linux host on 0.4.141); the DERP carrier's queue discipline (FR-18): a 100 ms age bound, and a kernel send-buffer cap read back per OS, because a stock Linux kernel before 6.18 applies 208 KiB of the 256 asked and reports success; the node's own firewall (FR-97 P3i): carriers pass firewalld through conntrack, services on the overlay address do not unless the zone admits them, and `roomler status` names the zone instead of changing it |
 | [overlay-nat-traversal.md](overlay-nat-traversal.md) | The carrier cascade mechanics: NAT-type probing, srflx hole-punch, cooldowns, PathMonitor |
 | [peer-relays.md](peer-relays.md) | The org relay (FR-19): one of the org's own devices forwarding its peers' WireGuard ciphertext over UDP 3478, so relayed pairs stop crossing the API pod — why it is a relay kind and not a tier, the five default-deny gates and who owns each, the mint and its audit vocabulary, the two-key bind, revocation as a push, **what the relay operator can still see**, and the measured ~74× pod offload |
 | [overlay-exit-nodes.md](overlay-exit-nodes.md) | Tailscale-style exit nodes: full-egress routing (v4+v6+DNS) with the never-self-wedge safety model; what each OS can do as client and as exit, and how a Mac pins its exemptions (FR-97 P1a); a netstack client, whose exit carries only its SOCKS5 front's IPv4 dials, never steers the host's DNS and never serves as an exit (FR-97 P0c-3) |
 | [overlay-wfp.md](overlay-wfp.md) | Windows: surviving a Group-Policy-locked firewall via the Windows Filtering Platform — and the daemon's own Defender rule, written by the service host before the worker's first bind (#1698) |
-| [multi-org.md](multi-org.md) | One device in N organizations: `[[orgs]]`, address blocks, growth and the allocator's two races, the shared carrier plane, an adapter per organization (the shared-TUN mux and its NAT are history since W7c), the sibling route defence's counters, overlap WARN and stress cells (FR-68) |
+| [multi-org.md](multi-org.md) | One device in N organizations: `[[orgs]]`, address blocks, a join refused for want of an address (and the `roomler status` line that says so), growth and the allocator's two races, the shared carrier plane, an adapter per organization (the shared-TUN mux and its NAT are history since W7c), the sibling route defence's counters, overlap WARN and stress cells (FR-68) |
 | [overlay-key-rotation.md](overlay-key-rotation.md) | Retiring a device's overlay (WireGuard) key from the device grid (FR-40): an **order, never a delivery** — the device mints locally, persists first, reports with public keys only and re-joins, the join is the proof, and the server never sees a private key; the four cells of the route's decision (`pushed` · `queued` · 409 `rate_limited` · 409 `agent_unsupported`), the server-resolved states the chip names, reconcile-on-connect and the three field-run races it must not re-run, the device kill switch, what is deliberately not rotated |
 | [tunnels.md](tunnels.md) | Concepts & protocol: forwards, SOCKS5 (TCP+UDP), mesh mode, declared routes, transports, the flow-owned listener + carriers (FR-86), an agent session's grant on its own tunnel, bound only from the device and toward the exit it names, its flows the session's and held to it (FR-90 P3-7-2a), the device asking for it and presenting it at every open, the flow ended for good when the server refuses it or opens without its echo (P3-7-3a), its listener serving the session's account alone, RFC 1929 for SOCKS, and gone at the grant's end (P3-7-3b), and the session's tools `net_socks` and `net_forward`, offered where the device's owner turns on `hive_net`, asked of a driver at every call, each one grant and one listener, ended with the run (P3-7-3c), LocalAPI, CLI |
 | [tunnel-install.md](tunnel-install.md) | Step-by-step runbook: install, enroll, ACL policy, open and test a forward from a corporate network |
@@ -183,6 +187,15 @@ transcript stays on the device; the server keeps the record.*
 | [permissions.md](permissions.md) | The `u64` bit catalogue and the `ADMINISTRATOR` bypass; the five system-managed roles, seeded from ONE table and **reconciled** to it at boot so a permission bit reaches orgs that already exist (FR-82 — 63 of 72 prod orgs were frozen at their creation-day masks); the splits that are deliberately not implied (`MANAGE_AGENTS` ⇏ `EXEC_DEVICE` ⇏ `SSH_DEVICE`); and what a `403` means — **a permission refusal is not a logout**, only `not_a_member` navigates, and an unclassified 403 does nothing |
 | [security-baseline.md](security-baseline.md) | The server and web security controls and **why each is shaped the way it is**: identity and session handling, the email-ownership invariant that closes the nOAuth class, object-level tenant scoping (`is_member` is not an authorization check), the device plane (the remote-desktop transport hardening, a device that reaches its server over TLS whatever its config says, the session-policy floor no server can lift, the session limits, and where FR-101's audit rows are written), SSRF/CORS/CSP and the loopback origins the remote-desktop viewer needs, content sniffing and the message-HTML allowlist, the four-layer publishing-identity allowlist, and the open gaps |
 | [data-model.md](data-model.md) | Every MongoDB collection with ER diagrams, indexes, TTLs |
+
+## 🧭 How the work is run
+
+*How the FR backlog is worked: Claude Code sessions in parallel, each claim checked on GitHub, CI
+or the fleet, and every merge, close and deploy left to the operator.*
+
+| Doc | What it covers |
+|---|---|
+| [agent-hub.md](agent-hub.md) | The agent hub (FR-131): one coordinator session hands FR phases, bugs, specs and research to worker sessions (`claude --bg`, each in its own worktree) and tracks them on one board. Why workers are sessions and not subagents or agent teams; the pieces (the `/hub` skill, the worker protocol, the `hub.mjs` helper, the hub view) and where their state lives; the tick loop and a worker's states; the message verbs both ways; the signal table; the tiers, with CLAUDE.md §3 work pinned to max, and why the effort goes through `--settings` (the project env beats `--effort`); context rotation at 40 and 60% and the budget hold at 85%, which is why a worker rotates before the hold; the hub view's keys and answer routes, and why an answer counts only once it shows in the worker's transcript; the measured traps (matching permission modes, `--bg --resume` forking a copy, `state: blocked`, `<synthetic>` replies, cron prompts as plain text); the rails |
 
 ## ⚖️ Licensing
 
