@@ -208,14 +208,14 @@ in an unfiltered module was invisible until someone ran the suite on a Windows b
 > sees nothing passes every absence check. The pattern: `Logs::capture` in
 > [`tests.rs:746`](../agents/roomlerd/src/hive/view/tests.rs#L746).
 
-Three flakes fixed on 2026-10-30, and what each one teaches:
+Flakes fixed on 2026-10-30, and what each one teaches:
 
 > [!WARNING]
 > **Two in-process webrtc-rs peers swap SDPs after gathering completes, never by trickle.**
 > `add_ice_candidate` refuses a candidate that arrives before the far side's remote
 > description (`ErrNoRemoteDescription`), and a test that ignores the refusal and loses every
-> candidate both ways never connects. `privacy_dc` hit its 30 s `on_data_channel` timeout that
-> way in CI. The pattern: `exchange` in
+> candidate both ways never connects. `privacy_dc` (10-30) and `control_dc_record` (10-28) hit
+> their 30 s `on_data_channel` timeout that way in CI. The pattern: `exchange` in
 > [`privacy_dc.rs:416`](../agents/roomlerd/tests/privacy_dc.rs#L416), as `dc_throughput.rs`'s
 > `connect` always did; `control_dc_record` and `file_dc` follow it too.
 
@@ -231,7 +231,10 @@ Three flakes fixed on 2026-10-30, and what each one teaches:
 > `thread_dump`'s own-process test gave macOS's `/usr/bin/sample` 20 s, while ~830 other tests
 > ran on a 3-CPU runner and `sample` read the whole test binary's symbols. It failed 26 times
 > in three days. It now allows 120 s and a second try, and its panic prints how long each try
-> took ([`thread_dump.rs:854`](../agents/roomlerd/src/thread_dump.rs#L854)).
+> took ([`thread_dump.rs:854`](../agents/roomlerd/src/thread_dump.rs#L854)). `exec`'s
+> open-feed test is the same shape. Its "well before the deadline" was half of 60 s, and the
+> busy Windows runner once needed 35.3 s to start PowerShell and echo, so it now runs under a
+> deadline four times the others'.
 
 ## CI & special lanes
 
