@@ -614,6 +614,15 @@ The session reports which form it opened and why, on the heartbeat as
   readback leaves the capture stage. `send_frame` grows by 1.9 ms, because it
   now waits for the GPU's conversion before QSV reads the surface. The pattern
   decodes identically on both paths.
+- **Measured on a 2880×1800 laptop**
+  ([FR-118 §9.10](fr/FR-118-gpu-resident-frames.md#910-ac4-the-slow-laptop-at-60-fps-2026-10-30),
+  `av1_qsv` with 60 fps asked, the same pattern, the same arm): the encoded
+  rate rose from 38 fps to the 60 fps target. With the switch off, the
+  capture thread's 7.9 ms readback runs in series with a 17 ms encode stage,
+  so a frame took 25 ms. With it on, a frame takes 16.61 ms, the period at
+  60 fps. QSV's own `send_frame`, about 16 ms a frame on both paths, is what
+  bounds this host now. The worker's CPU fell from 15.93 to 3.88 ms per
+  encoded frame.
 - **Measured on the WGC arm with NVENC**
   ([FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29),
   `av1_nvenc` at 2560×1600 and 60 fps on the same pattern, a hybrid laptop with
@@ -649,7 +658,9 @@ The session reports which form it opened and why, on the heartbeat as
   with both NVENC and QSV, a codec NVENC lacks opens on QSV on the other adapter
   and reads `adapter_mismatch`: CPU frames, the picture unchanged.
 - **Field-verified and released:** the QSV cell on the DXGI arm (0.4.181,
-  [FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28)),
+  [FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28);
+  at 2880×1800 on 0.4.187,
+  [§9.10](fr/FR-118-gpu-resident-frames.md#910-ac4-the-slow-laptop-at-60-fps-2026-10-30)),
   the NVENC cell on the WGC arm (0.4.183,
   [FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29))
   and the VideoToolbox cells on macOS (0.4.187,
@@ -899,11 +910,11 @@ flowchart LR
 - **Software paths target 60, paced to what they sustain** (P2). `SoftwarePace` (`encode/encode_pressure.rs:242`)
   runs FR-1's `FpsPace` over its own encode EWMA. It is its own EWMA so that `ROOMLERD_ENCODE_PRESSURE=0`, the
   hardware path's switch, cannot turn the software pace off as a side effect. The pace is never below 30
-  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:741`), so a host that cannot sustain 30 runs exactly as it did before.
+  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:758`), so a host that cannot sustain 30 runs exactly as it did before.
   The RTP pump starts at 60 under the tier (`target_fps_with_tier`, `peer.rs:123`). The auto-fps-cap that drops
   a software encoder to 30 applies only where the tier is off: Windows and macOS by default, where the WGC
   readback it was written for lives.
-  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:734`). On a host whose clock was
+  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:751`). On a host whose clock was
     never the limit, 60 frames cost twice the CPU of 30, and an attended desktop pays for it, so Windows and
     macOS opt in with `ROOMLERD_SW_FPS_60=1` until P3. `ROOMLERD_SW_FPS_60=0` gives back 30 everywhere.
   - ⚠️ **A step up waits for headroom** (P2d, `SW_PACE_UP_MARGIN_FPS`, `encode/encode_pressure.rs:255`).
@@ -914,7 +925,7 @@ flowchart LR
     found it, window for window. The hardware pace keeps margin 0 until it is measured on hardware
     ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
 - **The bitrate base follows the rate the pump runs at**, by √(fps/30) (`bitrate_base_for_fps`,
-  `encode/mod.rs:719`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
+  `encode/mod.rs:736`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
   measured.
 
 ### OpenH264's runtime settings (FR-112 P2b)
