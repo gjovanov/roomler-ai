@@ -2529,8 +2529,9 @@ How to read it:
 - **The residual is a share, not a stage time.** It is L4's p50 less the host's per-window medians.
 - **L4 stops at the viewer's paint stamp.** The display's own latency comes after it: a vsync or two, and
   the panel. None of these numbers include it, and AC4 cross-checks it once against a 240 fps camera.
-- **Cell 3's p95 is the viewer's Wi-Fi.** Every probe over 80 ms fell inside a background-scan burst of the
-  viewer's own link, which arrive every ~33 s and last a few seconds. Outside them, cell 3's p95 is 49 ms.
+- **Cell 3's p95 is the viewer's Wi-Fi.** In the run with a gateway ping beside it, every probe over 80 ms fell
+  inside a latency burst of the viewer's own link. The bursts arrive every ~33 s and last a few seconds, the
+  pattern a Wi-Fi adapter's background scans produce. Outside them, cell 3's p95 is 49 ms.
 - **On the relay, the network is most of it.** The input leg rides the same relay as the video, so its
   ~40 ms half of the 80 ms RTT sits inside the residual.
 - Cell 1 (NVENC, the headline cell) and cell 2 (a VideoToolbox host) are not measured yet. Until they are,
@@ -2541,7 +2542,7 @@ Each cut is its own switch, A/B'd on these cells and reverted if it moves nothin
 
 | Cut | Switch | Default | State |
 |---|---|---|---|
-| C1 slot-first capture gate | `ROOMLERD_CAPTURE_GATE=slot_first`, environment only | `legacy` | built; L0 moves 19.9 ms in CI; the L4 field A/B is owed |
+| C1 slot-first capture gate | `ROOMLERD_CAPTURE_GATE=slot_first`, environment only, read by the WGC backend | `legacy` at 60 fps and below; above 60, slot-first whatever the switch says (FR-119 P2b) | built; L0 moves 19.9 ms in CI. The L4 field A/B is owed on a WGC host at 60 fps; the system-context DXGI arm (`scrap`) never reads the switch |
 | C2 GPU clock pin, NVENC | `ROOMLERD_GPU_CLOCK_PIN`: `1` pins every session, `0` never | unset pins only above 60 fps (FR-119 P2b-16) | the 60 fps A/B is owed |
 | C3 pointer-move coalescing gap | `localStorage['roomler-rc-input-gap']`, 0–16 ms | 8 ms | knob built; L4's target mode cannot read it |
 | C4 cursor poller period | `ROOMLERD_CURSOR_POLL_MS`, 2–50 ms | 8 ms | knob built; L4's target mode cannot read it |

@@ -534,8 +534,9 @@ synthetic-source build.
 
 What FR-98's first baseline cells (2026-10-30) learned about running L4 against a remote host:
 
-1. **Start the window through `roomler exec`** where exec runs as the signed-in user (an attended
-   install). Stop it the same way, by its command line:
+1. **Start the window through `roomler exec`** where exec runs as the signed-in user: on a device
+   no administrator has anchored, the console-session worker answers it. Stop it the same way, by
+   its command line:
 
    ```bash
    roomler exec <host> -- 'Start-Process -FilePath "C:\Program Files\Roomler\roomlerd.exe" -ArgumentList "probe-target","--seconds","2400" -WindowStyle Minimized'
@@ -555,8 +556,8 @@ What FR-98's first baseline cells (2026-10-30) learned about running L4 against 
    250 ms `setTimeout` chain beside the prober that records every gap, and drop each batch that
    overlaps a gap over 400 ms.
 4. **Attribute the tail.** Run a 10 Hz ping from the viewer to its own gateway for the whole run.
-   On Wi-Fi the viewer's background scans come in bursts about every 33 s, and in FR-98's cell 3
-   every probe over 80 ms fell inside one. The host's pump heartbeat sees it too: its `age_split`
+   On the dev box's Wi-Fi it showed latency bursts about every 33 s, the pattern background scans
+   produce, and in FR-98's cell 3 every probe over 80 ms fell inside one. The host's pump heartbeat sees it too: its `age_split`
    puts the spike in `transit`.
 5. **Force a relay cell** with the viewer's peer connection built with
    `iceTransportPolicy: 'relay'`, minus any loopback relay. A corporate laptop at home with its
