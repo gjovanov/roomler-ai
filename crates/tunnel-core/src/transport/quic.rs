@@ -48,18 +48,20 @@ use super::{Capabilities, TRANSPORT_QUIC_V1, Transport};
 /// ALPN id for the tunnel's QUIC connections. Both ends must match or
 /// the TLS handshake fails (a cheap version/role guard).
 ///
-/// FR-46 P4, step 1 of 3. The wire value cannot be renamed in one release: the
+/// FR-46 P4, step 2 of 3. The wire value cannot be renamed in one release: the
 /// ALPN travels in the ClientHello and a peer that offers only the new name to
 /// a server that knows only the old one gets a clean handshake failure, i.e. a
-/// silently dead carrier. So the SERVER learns the new name first and keeps
-/// accepting the old, the CLIENT keeps offering the old until every peer can
-/// answer it, and only then does the old one go.
-// RETIRED-NAME-ANCHOR(2): WIRE VALUE — this is what deployed peers offer today,
-// and it stays until the client half has flipped everywhere. docs/fr/FR-46
+/// silently dead carrier. So the SERVER learned the new name first and kept
+/// accepting the old (step 1, agent-v0.4.45); the CLIENT offers only the new
+/// one from this release, once the server's own rows showed every exit that
+/// could answer a dial above step 1 (step 2); the old one goes when no client
+/// can still offer it (step 3).
+// RETIRED-NAME-ANCHOR(2): WIRE VALUE — what a client from before step 2 still
+// offers. The server answers it until step 3 retires it. docs/fr/FR-46
 const ALPN_LEGACY: &[u8] = b"roomler-tunnel-quic-v1";
 
-/// The ALPN the tunnel is moving TO. Accepted by the server from this release;
-/// not yet offered by the client (see [`ALPN_LEGACY`]).
+/// The ALPN the tunnel moved to: accepted by the server since agent-v0.4.45
+/// (step 1), the only one the client offers from this release (step 2).
 const ALPN: &[u8] = b"roomlerd-quic-v1";
 
 /// ALPN id for the overlay's WG-over-QUIC **datagram** carrier. Distinct from
@@ -81,6 +83,17 @@ const SNI: &str = "roomlerd";
 /// value the agent advertises over signaling and the client pins.
 pub fn cert_fingerprint(cert_der: &[u8]) -> String {
     hex::encode(Sha256::digest(cert_der))
+}
+
+/// The ALPN a completed handshake agreed on, as text. `-` when the TLS layer
+/// reports none — which a handshake between two of our own configs never
+/// produces, since both ends require one.
+pub fn negotiated_alpn(conn: &Connection) -> String {
+    conn.handshake_data()
+        .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|d| d.protocol)
+        .map(|p| String::from_utf8_lossy(&p).into_owned())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 /// Phase 2 (Tier 1): gather dialable **host candidates** for a QUIC
@@ -278,10 +291,10 @@ fn build_server_config() -> Result<(ServerConfig, String)> {
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key)
         .context("quic server: single cert")?;
-    // FR-46 P4 step 1: the SERVER learns the new ALPN and keeps accepting the
-    // old one. Order is preference — a peer offering both gets the new name, a
-    // deployed peer offering only the old one still completes. The CLIENT below
-    // deliberately does NOT offer the new one yet.
+    // FR-46 P4: the SERVER answers both names. Order is preference — a client
+    // from step 2 on offers only the new one and gets it; a client from before
+    // step 2 offers only the old one and still completes. The legacy arm is
+    // step 3's to remove, once no client can still offer it.
     tls.alpn_protocols = vec![ALPN.to_vec(), ALPN_LEGACY.to_vec()];
     let qsc = QuicServerConfig::try_from(tls).context("quic server config from rustls")?;
     let mut server_config = ServerConfig::with_crypto(Arc::new(qsc));
@@ -293,15 +306,19 @@ fn build_server_config() -> Result<(ServerConfig, String)> {
 /// ALPN) shared by [`QuicPeer::client`] and
 /// [`QuicPeer::client_from_socket`].
 fn build_client_config(pinned_fingerprint_hex: &str) -> Result<ClientConfig> {
-    // FR-46 P4 step 1: the CLIENT keeps offering ONLY the legacy ALPN until every
-    // peer can answer the new one. Flipping this before then turns an upgraded
-    // client dialling an older exit into a clean handshake failure — a carrier
-    // that is simply dead, with the ladder falling back to DERP and nothing said.
-    build_client_config_with_alpn(pinned_fingerprint_hex, vec![ALPN_LEGACY.to_vec()])
+    // FR-46 P4 step 2: the CLIENT offers ONLY the current ALPN. A client that
+    // dials an exit from before step 1 (agent-v0.4.45) gets a clean handshake
+    // failure for that dial — so this flipped only once the server's own
+    // `agents` rows, bucketed by `last_seen_at`, showed every exit seen in the
+    // last week above step 1 and the four rows below it offline and in the
+    // class the operator ruled losable (2026-10-26, docs/fr/FR-46). An exec
+    // sweep could not have said so: it reaches only the well-maintained hosts.
+    build_client_config_with_alpn(pinned_fingerprint_hex, vec![ALPN.to_vec()])
 }
 
-/// Split out so a test can offer the NEW ALPN and prove the server already
-/// answers it — otherwise step 2 of the rename is a leap rather than a flip.
+/// Split out so a test can offer the LEGACY ALPN on purpose and prove the
+/// server still answers a client from before step 2 — step 3 removes that arm,
+/// and until then "we stopped offering it" must not become "it stopped working".
 fn build_client_config_with_alpn(
     pinned_fingerprint_hex: &str,
     alpn: Vec<Vec<u8>>,
@@ -531,6 +548,10 @@ impl QuicPeer {
             .context("quic connect")?
             .await
             .context("quic handshake")?;
+        // FR-46 P4: name the ALPN the handshake settled on. On a live pair it
+        // is the one reading that tells a step-2 client from a step-1 one, and
+        // nothing else on either end logs it.
+        tracing::info!(%addr, alpn = %negotiated_alpn(&conn), "quic: handshake complete");
         Ok(conn)
     }
 
@@ -894,12 +915,13 @@ mod tests {
         conn.close(0u32.into(), b"done");
         let _ = srv.await;
     }
-    /// FR-46 P4 step 1, proven rather than reasoned: the server already answers
-    /// the NEW ALPN, so step 2 (flipping the client) is a flip and not a leap.
-    ///
-    /// The sibling loopback tests cover the other direction — they run a client
-    /// that offers only the LEGACY name against this same dual server — so
-    /// between them both arms of the changeover are exercised.
+    /// FR-46 P4, proven rather than reasoned: the server answers BOTH names.
+    /// Written at step 1 to show step 2 would be a flip and not a leap; kept
+    /// after step 2 because it is now the only place a client offering the
+    /// LEGACY name is exercised at all — every sibling test goes through the
+    /// default client config, which offers the current name. Step 3 removes
+    /// the legacy arm and this test with it; until then "we stopped offering
+    /// it" and "it stopped working" must stay distinguishable.
     #[tokio::test]
     async fn the_server_answers_both_the_new_and_the_legacy_alpn() {
         for (label, offered) in [
@@ -934,6 +956,35 @@ mod tests {
             );
             drop(accepted);
         }
+    }
+
+    /// FR-46 P4 step 2: the DEFAULT client config — the one every tunnel dial
+    /// goes through — settles on the current ALPN against the dual server, and
+    /// both ends report the same name. A flip back to the legacy offer fails
+    /// this by name; so would a server that quietly preferred its legacy arm.
+    #[tokio::test]
+    async fn the_default_client_settles_on_the_current_alpn() {
+        let (server, fingerprint) = QuicPeer::server(loopback()).expect("server endpoint");
+        let server_addr = server.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            server
+                .accept()
+                .await
+                .expect("incoming")
+                .expect("handshake must complete")
+        });
+
+        let client = QuicPeer::client(loopback(), &fingerprint).expect("client endpoint");
+        let conn = client.connect(server_addr).await.expect("connect");
+        assert_eq!(negotiated_alpn(&conn), "roomlerd-quic-v1", "client side");
+
+        let accepted = srv.await.expect("server task");
+        assert_eq!(
+            negotiated_alpn(&accepted),
+            "roomlerd-quic-v1",
+            "server side"
+        );
+        drop(accepted);
     }
 
     /// A client that pins the WRONG fingerprint must fail the handshake

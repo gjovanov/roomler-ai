@@ -348,6 +348,7 @@ before it leaves the host.
 | GET/PUT | `…/magic-dns` | Tenant MagicDNS domain + upstream resolvers |
 | GET | `…/overlay-block` | The tenant's overlay address block |
 | POST | `…/overlay-block/renumber` | Migrate onto a disjoint block (**dry-run by default**; cycles agent connections) |
+| POST | `…/overlay-block/reconcile-hosts` | FR-47 P3: return leaked host ordinals to the tenant's recycle pool, each through `release_host`. Platform operator only (anyone else gets 404); **dry-run by default** ([overlay-communication.md](overlay-communication.md), *Pre-release gaps*) |
 
 ### Agent sessions (FR-90, module `hive` — mounted only with `[modules] hive = true` or a `hive.tenants` list)
 
