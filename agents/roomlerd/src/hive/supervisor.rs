@@ -4516,13 +4516,24 @@ impl Supervisor {
             #[cfg(all(feature = "vault", feature = "ssh-server"))]
             ssh,
         };
-        let toolbelt = toolbelt::open(&dir, owner, uid, run, approvals, self.approval_timing)
-            .map_err(|e| {
-                (
-                    HiveRefusal::LaunchFailed,
-                    format!("opening the session's toolbelt: {e}"),
-                )
-            })?;
+        // FR-90 P8-2c-4 — whether this run gets a worker is the device's own
+        // setting, the one `launch` hands `run_started` once the run is live:
+        // the toolbelt is bound here, before that worker exists.
+        let toolbelt = toolbelt::open(
+            &dir,
+            owner,
+            uid,
+            run,
+            approvals,
+            self.approval_timing,
+            self.cfg.worker,
+        )
+        .map_err(|e| {
+            (
+                HiveRefusal::LaunchFailed,
+                format!("opening the session's toolbelt: {e}"),
+            )
+        })?;
         let mcp = toolbelt_mcp_config(
             &relay,
             &[
@@ -12663,6 +12674,65 @@ done
             Some("stopped (owner)")
         );
         assert_eq!(seen(sid, 1), None, "gone with the run");
+    }
+
+    /// FR-90 P8-2c-4 — a FRESH launch with `hive_worker` on hands the run's
+    /// toolbelt to its worker, and the approval every other tool call waits
+    /// behind crosses both ways. `toolbelt::open` runs inside `spawn`, before
+    /// `launch` starts the worker (`run_started`), so whether a worker
+    /// exists yet (`worker::has`) was false at every fresh launch and no
+    /// toolbelt was ever handed; it is told the device's own setting now. A
+    /// toolbelt kept for its worker is served by nothing in the daemon, so
+    /// an answer on its socket is the worker's.
+    #[cfg(worker_calls)]
+    #[tokio::test]
+    async fn a_fresh_launch_hands_its_toolbelt_to_its_worker_and_an_approval_crosses_both_ways() {
+        use super::super::toolbelt::handed::is_kept;
+        use super::super::worker::{in_process_when_live, seen};
+        let mut r = rig_with(true, 4, |c| c.worker = true, |s| s);
+        let o = order(&r);
+        let sid = o.session_id;
+        in_process_when_live(sid);
+        assert!(r.sup.start(o, true).await.refused.is_none());
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        assert!(
+            is_kept(sid, 1),
+            "kept for the worker at the run's very first launch"
+        );
+        r.sup.prompt(sid, dev(&r), "hold".into()).unwrap();
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Running);
+
+        let mut c = harness_asks(&r, sid, 2, "whoami").await;
+        let approval = until_awaiting(&mut r, sid).await;
+        let by = Author {
+            user_id: r.user,
+            name: "Dev".into(),
+        };
+        r.sup
+            .answer_approval(sid, &approval, toolbelt::Decision::Allow, by)
+            .unwrap();
+        assert_eq!(
+            c.verdict(2).await,
+            json!({"behavior": "allow", "updatedInput": {"command": "whoami"}}),
+            "the driver's answer, forwarded to the wait the worker holds"
+        );
+        assert_eq!(
+            next_state(&mut r, sid).await.0,
+            HiveRunState::Running,
+            "the worker's word that it closed"
+        );
+        assert!(
+            seen(sid, 1).is_some_and(|s| s.up && s.starts == 1),
+            "one worker, up all along: {:?}",
+            seen(sid, 1)
+        );
+
+        release(&r);
+        assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Idle);
+        r.sup.stop(sid, 1, "owner".into());
+        until_ended(&mut r, sid).await;
+        assert!(!is_kept(sid, 1), "forgotten with the run");
+        assert_eq!(seen(sid, 1), None, "its worker gone with it");
     }
 }
 

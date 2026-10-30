@@ -46,7 +46,7 @@ fn belt_running(peer: PeerId, run: Run, timing: Timing) -> Belt {
     let dir = tempfile::tempdir().unwrap();
     let (tx, events) = mpsc::channel(64);
     #[cfg(unix)]
-    let toolbelt = open(dir.path(), None, peer, run, tx, timing).unwrap();
+    let toolbelt = open(dir.path(), None, peer, run, tx, timing, false).unwrap();
     #[cfg(windows)]
     let toolbelt = open(peer, run, tx, timing).unwrap();
     Belt {
@@ -443,12 +443,12 @@ async fn the_socket_is_the_sessions_alone() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("toolbelt.sock"), b"not a socket").unwrap();
     let (tx, _rx) = mpsc::channel(4);
-    let refused = open(dir.path(), None, me(), run(), tx.clone(), quick());
+    let refused = open(dir.path(), None, me(), run(), tx.clone(), quick(), false);
     assert!(refused.is_err(), "a file in the socket's place is refused");
     std::fs::remove_file(dir.path().join("toolbelt.sock")).unwrap();
-    let first = open(dir.path(), None, me(), run(), tx.clone(), quick()).unwrap();
+    let first = open(dir.path(), None, me(), run(), tx.clone(), quick(), false).unwrap();
     std::mem::forget(first); // leaves a stale socket, as a crash would
-    let again = open(dir.path(), None, me(), run(), tx, quick());
+    let again = open(dir.path(), None, me(), run(), tx, quick(), false);
     assert!(again.is_ok(), "a stale socket is replaced");
 }
 
