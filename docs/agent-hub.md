@@ -141,7 +141,9 @@ by absolute path; the route to field verification; what is out of scope; and the
 operator's daily driver, so a worker there runs no tc/netem, restarts no `roomlerd`, and leaves no
 remote-control page open in the shared Chrome.
 
-A worker's life, as the hub's `state.json` records it:
+A worker's life, as the board shows it. `handing_off` comes from the worker's own `status.json`; every
+other state is the worker's row in the hub's `state.json`, which `hub.mjs` writes on `add`, `spawn`,
+`stop`, `respawn` and `set`:
 
 ```mermaid
 stateDiagram-v2
