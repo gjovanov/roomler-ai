@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest'
 import { frameRateAnswerOf } from '@/composables/frameRate'
 
 // Pure helpers exported for testing. We can't import the full composable
@@ -151,6 +151,8 @@ import {
   LOCAL_RELAY_PROBE_PORTS,
   clipboardBridgeUrl,
   storedDecodePref,
+  storedColorSpaceOverride,
+  COLORSPACE_STORAGE_KEY,
   storedCtxMode,
   storedPerFrameMsg,
   storedFlowParams,
@@ -186,6 +188,7 @@ import {
   DEFAULT_RCAS_SHARPNESS,
 } from '@/workers/rc-fsr-render'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
+import { RC_DECODER_COLOR_SPACE, rcDecoderConfig } from '@/workers/rc-decoder-config'
 import { parseFrameHeader, isKeyframe, shouldDecodeFrame } from '@/workers/rc-vp9-444-worker'
 import { shouldDecodeFrame as shouldDecodeFrameHevc, classifyCrop } from '@/workers/rc-hevc-worker'
 import {
@@ -5092,6 +5095,55 @@ describe('storedDecodePref (2026-07-24 decode-stall A/B)', () => {
     expect(storedDecodePref()).toBe('no-preference')
     localStorage.setItem('roomler-rc-decode-pref', 'banana')
     expect(storedDecodePref()).toBe('no-preference')
+  })
+})
+
+describe('FR-130 P2 — the decoder colour space and its kill switch', () => {
+  const base: VideoDecoderConfig = { codec: 'vp09.01.10.08', optimizeForLatency: true, hardwareAcceleration: 'no-preference' }
+
+  afterEach(() => {
+    localStorage.removeItem(COLORSPACE_STORAGE_KEY)
+  })
+
+  it('is the key the spec names', () => {
+    expect(COLORSPACE_STORAGE_KEY).toBe('roomler-rc-colorspace')
+  })
+
+  it('tells the decoder set S by default', () => {
+    expect(storedColorSpaceOverride()).toBe(true)
+    expect(rcDecoderConfig(base, storedColorSpaceOverride())).toEqual({
+      ...base,
+      colorSpace: { matrix: 'smpte170m', primaries: 'bt709', transfer: 'iec61966-2-1', fullRange: false },
+    })
+    expect(rcDecoderConfig(base, true).colorSpace).toEqual(RC_DECODER_COLOR_SPACE)
+  })
+
+  it('carries no colorSpace once the kill switch says off, in any case', () => {
+    for (const raw of ['off', 'OFF', ' Off ']) {
+      localStorage.setItem(COLORSPACE_STORAGE_KEY, raw)
+      expect(storedColorSpaceOverride(), raw).toBe(false)
+      const cfg = rcDecoderConfig(base, storedColorSpaceOverride())
+      expect('colorSpace' in cfg, raw).toBe(false)
+      expect(cfg).toEqual(base)
+    }
+  })
+
+  it('leaves the override on for anything else', () => {
+    for (const raw of ['on', '1', '0', 'false', 'banana', '']) {
+      localStorage.setItem(COLORSPACE_STORAGE_KEY, raw)
+      expect(storedColorSpaceOverride(), raw).toBe(true)
+    }
+  })
+
+  it('leaves it on when storage cannot be read', () => {
+    const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new Error('SecurityError')
+    })
+    try {
+      expect(storedColorSpaceOverride()).toBe(true)
+    } finally {
+      spy.mockRestore()
+    }
   })
 })
 
