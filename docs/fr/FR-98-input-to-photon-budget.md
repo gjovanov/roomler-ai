@@ -3,7 +3,7 @@
 **Issue:** [#2090](https://github.com/gjovanov/roomler-ai/issues/2090) · **Status:** proposed 2026-10-13 — spec
 and claim; P1 (C1, the slot-first gate) built behind its switch, field A/B owed; P5 (C6) field-measured
 2026-10-16 and on by default after it (§9) · **Owner:** the agent's capture and encode path, the viewer's input and paint path · **Anchors:**
-master `4fc8ea7bb` · **Program:** [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 1 ·
+master `c689d26a0` · **Program:** [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 1 ·
 **Builds on:** [FR-16](FR-16-rc-quality-benchmark.md) (L0 and L4, the instrument this FR is accepted on),
 [FR-1](FR-1-remote-desktop-drag-smoothness.md), [FR-70](FR-70-media-pipeline-leaves-the-runtime.md),
 [FR-74](FR-74-text-clarity-on-direct-paths.md)
@@ -20,7 +20,7 @@ L4 builds the measurement. This FR spends it.
 The target is set from the L4 baseline, not before it. The expected shape is a direct LAN pair at 60 fps
 with p50 ≤ 50 ms and p95 ≤ 80 ms, and no regression on a relay pair.
 
-## 2. Evidence (master `4fc8ea7bb`)
+## 2. Evidence (master `c689d26a0`)
 
 | What | Where | Consequence |
 |---|---|---|
@@ -105,7 +105,7 @@ property. It belongs to [FR-17](FR-17-partial-reliability-video.md) stage C, who
 C6's A/B (§9, 2026-10-16) ran the RTP track against a vmtest guest and turned up two faults on that track
 that no cut in §4 covers. Each is its own issue, because each is a one-PR fix:
 
-| Fault | Where (master `69ec6ad67`) | Measured | Issue |
+| Fault | Where (master `434a8cd0a`) | Measured | Issue |
 |---|---|---|---|
 | A Windows host with no H.264 hardware encodes the track on Microsoft's software MFT, the cascade's last Media Foundation fallback, and logs it as `mf-h264 (hardware)` | `encode/mf/activate.rs` L279, `encode/mod.rs` L1241 | L4 p50 ~850 ms and a quarter of probes unanswered in 2 s, against 37 ms on OpenH264 on the same guest. C6 empties Chrome's buffer and leaves L4 where it was | [#2283](https://github.com/gjovanov/roomler-ai/issues/2283) |
 | The track's timestamps run one frame behind: a sample's `duration` is the gap *before* it, and the packetizer stamps a sample before advancing by it | `peer.rs` L3055–3075; `crates/vendored/rtp/src/packetizer/mod.rs` L127, L135 | The lag is measured: L0's `cadence` cell (§9) read each frame's RTP step 158.8 ms (p50) off its arrival step before the fix and 0.9 ms after. Its share of Chrome's hold (193 ms on average with C6 off, growing to 326, against Chrome's own ~53 ms target) is suspected, not proven, until the field A/B on a release carrying the fix | [#2284](https://github.com/gjovanov/roomler-ai/issues/2284) |
