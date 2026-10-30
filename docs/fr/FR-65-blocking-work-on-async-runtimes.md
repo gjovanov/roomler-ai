@@ -1,6 +1,6 @@
 # FR-65 — Blocking work on async runtimes: measure first, then remove
 
-**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#PR-FR65-P0, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.028 % of the frame budget on NEO16 (AC1)**. **2 of 8 criteria ticked**, AC8 (docs) `[~]`. Next: the census after-read on the release that carries #PR-FR65-P0 (AC7), then P1. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
+**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.028 % of the frame budget on NEO16 (AC1)**. **2 of 8 criteria ticked**, AC8 (docs) `[~]`. Next: the census after-read on the release that carries #3138 (AC7), then P1. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
 
 ## Goal
 
@@ -255,7 +255,7 @@ of each is to produce a number.
       them"*): that is an argument, not a measurement, and this FR's first rule is
       that inference does not count. Arithmetic over a constant nobody timed on
       the hardware in question is exactly what AC7 refuses.
-      ✅ **Measured 2026-10-30 on NEO16** ([`docs/stall-watch.md` §8](../stall-watch.md#8-what-the-watch-costs-fr-65-ac1), #PR-FR65-P0):
+      ✅ **Measured 2026-10-30 on NEO16** ([`docs/stall-watch.md` §8](../stall-watch.md#8-what-the-watch-costs-fr-65-ac1), #3138):
       `roomlerd stall-watch-cost` runs an interleaved A/B of the REAL
       `PassWatch`, enabled against disabled. Four runs of 31 rounds: at most
       **869 ns a pass** (the `worst-cold` p90 — every watch-only timer on every
@@ -317,12 +317,12 @@ of each is to produce a number.
 - [ ] **AC6** — caps-probe spawns at steady state are 0/hour on a measured host.
 - [ ] **AC7** — every fix carries a before/after from the **same** instrument on
       this issue. A fix with no measurement does not count as shipped.
-      *2026-10-30:* P0's two fixes (#PR-FR65-P0: the window-reset rebase and the
+      *2026-10-30:* P0's two fixes (#3138: the window-reset rebase and the
       governor's monotonic stall count) have their **before** —
       `scripts/fr65-stall-census.sh` over 2026-10-17..30 on CORPLAP-1/-2/-3: 84
       `reset`-class lines (7/51/26) and 46 `untimed` (4/27/15). The **after** is
       owed: the same script, the same hosts, a 14-day window on the release that
-      carries #PR-FR65-P0. `reset` must read 0 with those long passes attributed
+      carries #3138. `reset` must read 0 with those long passes attributed
       (`open`, `encode`, …), and `untimed` must shrink by what the six newly
       named phases take.
 - [~] **AC8** — Docs: [`docs/stall-watch.md`](../stall-watch.md) in the house
@@ -385,7 +385,7 @@ _(every entry must carry a before/after from the stall watch.)_
     computed `0 − mark`, which saturates to 0. The same shape one level over:
     FR-79's gate was fed `pump_stalls − win_stalls_last` against a count the
     heartbeat zeroes, which hid the heartbeat pass's own stall after any window
-    that held one. Fixed in #PR-FR65-P0 (`PassWatch::rebase`, a monotonic
+    that held one. Fixed in #3138 (`PassWatch::rebase`, a monotonic
     `stalls_total`); the bookkeeping moved into `encode::stall::PassWatch`, with
     two negative controls that reproduce the field line exactly without the fix.
     **After:** owed (AC7).
