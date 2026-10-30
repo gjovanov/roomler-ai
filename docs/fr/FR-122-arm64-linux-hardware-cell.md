@@ -118,8 +118,9 @@ What P0c changes: both Linux jobs clone n13.0.19.0
 built, because nvenc.c compiles in exactly one minimum-driver string
 ([`:443`](../../.github/workflows/vendor-ffmpeg-windows.yml#L443),
 [`:617`](../../.github/workflows/vendor-ffmpeg-windows.yml#L617)). Nothing is lost by going back from 13.1. FFmpeg
-9.0.1 gates two things on 13.1: an internal counter type, and AV1's hierarchical B-frame reference mode
-(`NVENC_HAVE_AV1_HGOP_SUPPORT`). The agent opens every FFmpeg encoder with no B-frames
+9.0.1 gates two things on 13.1: the layout of the SMPTE timecode SEI's counting-type field
+(`NVENC_NEW_COUNTING_TYPE`, which writes 0 either way, on frames carrying a timecode, which the agent never sends),
+and AV1's hierarchical B-frame reference mode (`NVENC_HAVE_AV1_HGOP_SUPPORT`). The agent opens every FFmpeg encoder with no B-frames
 ([`encoder.rs:1888`](../../agents/roomlerd/src/encode/ffmpeg/encoder.rs#L1888), and `bf=0` in NVENC's options,
 [`encoder.rs:367`](../../agents/roomlerd/src/encode/ffmpeg/encoder.rs#L367)), and the Windows build's NVENC cells
 have run on 13.0 since FFmpeg 9.0.1 arrived (FR-77 P0, #1472). A newer driver still opens an older SDK: the dev
