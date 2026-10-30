@@ -22,7 +22,8 @@ inputs:
       A restored `target` larger than this is dropped whole, and the run builds
       cold and publishes a lean one. Old dependency versions otherwise accrete
       across lockfile changes. Whole, never file by file: cargo fingerprints
-      outlive outputs.
+      outlive outputs. A cold build's pruned target must fit under it, or every
+      run builds cold; `ci-seed-save` warns when it publishes one that does not.
     required: false
     default: "4000"
 
@@ -75,6 +76,8 @@ runs:
           } | git hash-object --stdin
         )
         echo "key=$key" >> "$GITHUB_OUTPUT"
+        # For ci-seed-save, which warns when it publishes a target this cap would drop.
+        echo "CI_SEED_MAX_TARGET_MB=$MAX_MB" >> "$GITHUB_ENV"
         # Written once, on every exit path (a name written twice is ambiguous).
         exact=false
         trap 'echo "exact=$exact" >> "$GITHUB_OUTPUT"' EXIT

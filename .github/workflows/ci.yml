@@ -1452,6 +1452,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         with:
           family: windows-clippy
+          # #3116's wizard step took its pruned target to 4,440 MB, over the
+          # default 4000: every restore dropped it and every run built cold.
+          max-target-mb: "6000"
       - name: Clippy tunnel-core (overlay-l3 + overlay-netstack, all targets)
         run: cargo clippy -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --all-targets -- -D warnings
       # `ssh-server` is in the set because this is the ONLY lane that lints the

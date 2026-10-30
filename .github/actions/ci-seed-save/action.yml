@@ -87,6 +87,13 @@ runs:
         printf '%s\n' "$KEY" > target/.ci-seed-key
         after=$(du -sm target 2>/dev/null | cut -f1)
         echo "pruned target: ${before:-?} MB -> ${after:-?} MB (third-party dependencies only)"
+        # FR-6 wave 33: a target over the restore's cap is dropped by every later restore, so
+        # every run of this job builds cold and the next master run publishes the same size
+        # again. The restore step exports the cap it applied.
+        cap="${CI_SEED_MAX_TARGET_MB:-}"
+        if [ -n "$cap" ] && [ -n "${after:-}" ] && [ "$after" -gt "$cap" ]; then
+          echo "::warning title=CI cache over its cap::'${FAM}' publishes a ${after} MB target, over the ${cap} MB its restore keeps, so every run of this job builds cold. Raise the job's max-target-mb (ci-seed-restore) above ${after}."
+        fi
 
         home="${CARGO_HOME:-$HOME/.cargo}"
         if command -v cygpath >/dev/null 2>&1; then home=$(cygpath -u "$home"); fi

@@ -1,8 +1,11 @@
 # FR-6: CI + release build-speed SLO — every lane ≤10 min warm, self-healing
 
-**Status:** **closed 2026-10-30.** Every acceptance criterion is field-verified and ticked, through
-wave 32 (2026-10-29), and documented in [`docs/build-caches.md`](../build-caches.md). What is left
-is runner queueing, not compiling (Open decisions). First shipped and field-verified 2026-08-26
+**Status:** **reopened 2026-10-30** for a regression found the same day (wave 33): from #3125 on,
+`ci.yml`'s Windows clippy lane built cold on every run, because its cache was over its cap. It had
+been **closed 2026-10-30**, with every acceptance criterion field-verified and ticked through
+wave 32 (2026-10-29) and documented in [`docs/build-caches.md`](../build-caches.md). What is left
+is runner queueing and, since 2026-10-30, the Actions cache refusing downloads (Open decisions).
+First shipped and field-verified 2026-08-26
 (retroactive FR per the CLAUDE.md standing rule — the program ran 2026-07-13 → 2026-08-26 across
 ~20 PRs). Tracking issue: `FR-6` (#773) in gjovanov/roomler-ai/issues.
 
@@ -128,6 +131,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 30 | 10-26 | **The companion jobs reuse too.** `tauri_build::build()` declares `cargo:rerun-if-changed=capabilities` whether or not the directory exists, and cargo treats a missing watched path as changed. `roomler-desktop` had no `capabilities/`, so every build re-ran its build script and recompiled it, including a reused tag run (114–149 s per companion job). An `agents/roomler-desktop/capabilities/README.md` makes the directory exist. The capability parser loads only `*.json`/`*.toml`, so the app's ACL is unchanged (still no capability). **And the release lane's two cached-apt steps are bounded.** One hung 23+ min on 0.4.175's tag run where it takes ~37 s. Each now has `timeout-minutes: 8` + `continue-on-error`, and falls through to the existing verify/apt-get fallback, which first repairs an interrupted dpkg | #2940 |
 | 31 | 10-28 | **A release's first build no longer makes its tag run recompile.** Tauri's `generate_context!` writes `out/tauri-codegen-assets/<hash>` into `roomler-desktop`'s OUT_DIR *while that crate compiles*, only when the file is missing, and lists it as an input. So the first build of a new version (a release's rehearsal) left an input newer than the build itself, and the tag run, plus the reseed after it, recompiled `roomler-desktop` once. That cost about 2.5 min on macOS every release, and on Windows whenever the write and the compile's start fell in different seconds (the seed's tar keeps whole seconds). Two things found it: `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the four companion build steps (#3024, diagnostic), and a probe that bumps only `roomler-desktop`'s version. On a same-tree reuse, `seed-tree-reuse` now marks the build's OUT_DIR files unchanged, as it already does the sources. Field-verified on 0.4.181: no companion recompiled on the tag run or the reseed after it, and the diagnostic came out again (#3037) | #3024, #3030, #3037 |
 | 32 | 10-28 | **The daemon lanes' seed cap rises to 4,500 MB.** The accretion GC drops a seed's `target` whole once it passes `SEED_TARGET_MAX_MB`, 3,000 MB by default. A daemon seed restarts at ~2.2–2.7 GB after a cold build and grows ~350–400 MB with each release. Only a new version adds artifacts: cargo names them by name, version, features and profile, never by source, so a rebuild of the same version overwrites in place. The default therefore dropped a seed again within one or two releases: the Windows seed on four post-release reseeds in a row (0.4.180–0.4.183), and 0.4.183's reseed the `.pkg` and `.deb` aarch64 seeds too (574–580 crates cold, a 31 min run). The four daemon jobs' restore steps now set the cap to 4,500 MB, release-setup's macOS job already running at 5,000. That lasts about four releases, and a compressed seed (535–790 MiB) stays far under the 2 GiB asset limit. The GC line also prints the cap in effect and the volume's free space, so a bigger target's disk headroom shows on every run. The operator chose this over pruning stale units, the riskier change: rc.422–424's seed died on a deleted output whose fingerprint survived. Field-verified on 0.4.185's post-release reseed: at the tag's tree it kept the MSI seed at 3,037 MB and the `.deb` x86_64 seed at 3,367 MB and reused the build, with 0 compiles in all 8 jobs. The same run on 0.4.184 had dropped the MSI seed at 3,082 MB and compiled 586 crates cold | #3068 |
+| 33 | 10-30 | **The Windows clippy lane's CI cache fits its cap again.** #3125 (for #3116) added the setup wizard's clippy and unit tests to `windows-overlay-clippy`, and the job's cold build then pruned to 4,440 MB, over `ci-seed-restore`'s default cap of 4,000 MB. Every restore dropped the cache whole (`restored target is 4440 MB (> 4000) — dropping it whole`), every run compiled or checked ~1,740 units cold, and each master run published the same 4,440 MB again. The GC's promise that "the next master run publishes a lean one" cannot hold once a lean one is over the cap. The lane took 7.4–8.3 min in the three runs before #3125 and 17.0–22.6 min in all 20 runs checked after it, the floor of each run's wall clock. The job now sets `max-target-mb: "6000"`, as the macOS overlay check and the integration shards already did. And a master run that publishes a cache its own restore would drop warns `CI cache over its cap` (the restore exports the cap it applied as `CI_SEED_MAX_TARGET_MB`) | this PR |
 
 ## Acceptance criteria
 
@@ -191,6 +195,24 @@ itself on the affected run's page. Baseline when the program started: releases t
       a row in `docs/README.md`'s index (2026-10-29).
 
 ## Open decisions / residual levers (all trade-offs, not waste)
+
+- **The Actions cache refuses downloads under load (from 2026-10-30).** A restore finds its key
+  (`Cache hit for: v0-rust-ci-unit-…`), sits at `Received 0 of 2852032394` for 36–68 s, then
+  fails with `Failed to restore: Egress is over the account limit.` Swatinem reports
+  `No cache found`, and the lane compiles every dependency. `Rust unit tests` compiled 1,795
+  crates instead of 73 and took 23.4 and 27.0 min instead of 6.5–9.6 (runs 41056324624 and
+  41063619620). The second was the 0.4.188 bump PR's CI, 37.5 min end to end. Six of the twelve
+  CI runs sampled between 12:03 and 14:07Z had a refused restore, most of them the apt sets,
+  which fall back to the mirror. The limit is GitHub's, on the account's downloads, not the
+  pool's 10 GB; other projects report the same message from 2026-10-24. The `seed-cache` release
+  assets are not behind it: the Windows and macOS lanes restored from them in every run checked.
+  Levers, posed to the operator:
+  - move the Linux lanes' cargo caches to `seed-cache`, as wave 22 did for the rest. The unit
+    lane's archive is 2.85 GB, so its target may need splitting across assets under the
+    2 GiB cap;
+  - skip the Rust, Windows and macOS lanes on a docs-only change. That means fewer downloads,
+    and fewer of the account's 20 concurrent job slots taken;
+  - a plan with more concurrent jobs (Pro 40, Team 60; macOS stays at 5).
 
 - The warm Windows floor is the per-release rebuild of every path crate under the
   size-optimized `cgu=1` profile, plus Azure signing steps. **Measured 2026-10-01, now
@@ -1116,3 +1138,18 @@ itself on the affected run's page. Baseline when the program started: releases t
     reseed. At ~390 MB a release, the `.deb` x86_64 seed should drop on 0.4.188's reseed and the
     MSI's about two releases later.
 - 2026-10-30: **closed**, with every criterion ticked and the docs merged in #3107 (`d738146ad`).
+- 2026-10-30, afternoon: **reopened for wave 33.** The operator flagged the 0.4.188 bump PR's CI
+  (run 41063619620, 37.5 min), which held the release. The bump PR opened at 13:29Z, its CI was
+  green at 14:06, and the release published at 14:21:22, 12 min after the tag.
+  - **Its long pole was the Actions cache refusing a download** (Open decisions). `Rust unit
+    tests` waited 9.4 min for a runner, got `Failed to restore: Egress is over the account
+    limit.`, and compiled 1,795 crates cold in 27.0 min. The same lane went cold the same way in
+    run 41056324624 (12:46Z, 23.4 min).
+  - **Behind it sat a regression in this FR's own caches.** From #3125 (10:46Z) on, `Windows
+    overlay clippy` restored `ci-windows-clippy-Windows-X64` at 4,440 MB, over its 4,000 MB
+    cap, dropped it and built cold: 297 + 329 + 42 + 821 + 252 units across its five steps,
+    the wizard's step alone 503 s. Each master run then published `pruned target: 5809 MB ->
+    4440 MB` again (41063266842, 41069134834). The lane took 7.4–8.3 min in the three runs before #3125
+    (41041779768, 41042348489, 41042618394) and 17.0–22.6 min in all 20 runs checked after it.
+    So even without the refused download, the bump PR's CI would have taken ~22 min. Wave 33 is
+    the fix.
