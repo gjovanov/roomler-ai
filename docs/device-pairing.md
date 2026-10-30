@@ -1,10 +1,10 @@
 # Device pairing — an installer joins an organization with nothing to copy
 
-**Anchors:** master `c5a9e480b` (FR-129 A1 [#3040](https://github.com/gjovanov/roomler-ai/pull/3040),
+**Anchors:** master `f44058c8f` (FR-129 A1 [#3040](https://github.com/gjovanov/roomler-ai/pull/3040),
 A2 [#3026](https://github.com/gjovanov/roomler-ai/pull/3026), A3
 [#3027](https://github.com/gjovanov/roomler-ai/pull/3027) and B1-s
 [#3044](https://github.com/gjovanov/roomler-ai/pull/3044) merged; §13, terminal pairing: master
-`f37b2c74a`, A4 [#3045](https://github.com/gjovanov/roomler-ai/pull/3045)) ·
+`fa8ce1147`, A4 [#3045](https://github.com/gjovanov/roomler-ai/pull/3045)) ·
 **Spec:** [FR-129](fr/FR-129-guided-cross-platform-installer.md)
 ([#3022](https://github.com/gjovanov/roomler-ai/issues/3022)) · **Routes:** [api.md](api.md) ·
 **Collections:** [data-model.md](data-model.md)
@@ -469,7 +469,7 @@ whether the server pairs from `start`'s answer.
 
 ## 13 · Terminal pairing
 
-*Anchors in this section: master `f37b2c74a` (A4,
+*Anchors in this section: master `fa8ce1147` (A4,
 [#3045](https://github.com/gjovanov/roomler-ai/pull/3045)).*
 
 The same flow without a GUI — a server, an SSH session, a script. `roomlerd enroll --pair` runs

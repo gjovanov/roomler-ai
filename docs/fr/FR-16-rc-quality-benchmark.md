@@ -90,7 +90,7 @@ photon**. Age starts at capture, so input coalescing, injection, the host compos
 capture gate are invisible to it. Every perf FR of the
 [StarDesk teardown program](../plans/stardesk-teardown-program.md) needs a red-first number
 before its first change, so the order of this FR is inverted: **L0 and L4 first**, then
-L1–L3. Anchors are master `4fc8ea7bb`.
+L1–L3. Anchors are master `c689d26a0`.
 
 ### L0 — an in-process harness that CI runs
 
@@ -199,7 +199,7 @@ competitors". Engineering may use the numbers; the public pages never print them
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | **merged** #2097 (`0db6f451f`): `agents/roomlerd/tests/l4_latency.rs` + the marker and clock in `capture/synthetic_backend.rs` + the `peer::l0` seam; local and CI runs in the field log |
+| L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | **merged** #2097 (`67d3ca9e8`): `agents/roomlerd/tests/l4_latency.rs` + the marker and clock in `capture/synthetic_backend.rs` + the `peer::l0` seam; local and CI runs in the field log |
 | L4 | The probe, the worker sampler, the upload, `probe-target`, the nightly spec; baselines on a direct and a relay pair | `ROOMLERD_BENCH` unset; the build feature; the viewer knob `roomler-rc-bench` | **agent half built**: `synthetic_backend::probe` + the bottom-right marker, the input-handler hook in `peer.rs`, `bench` in `AgentCaps.video`, the `probe`/`probe50` cells. **Viewer half built**: the TS marker decoder, the worker sampler in all three decode workers, the `<video>` sampler, the jittered prober, the `rc.l4` upload, the server's parse lock. **`probe-target` built**: the window (`probe_target.rs`) and the viewer's `target` mode. **End to end on a release build: done** against `probe-target` on vmtest guests (the field log, 2026-10-13; FR-98 P5's cells used it on 2026-10-16, on the RTP track and the DataChannel). Owed: the nightly spec, which needs the agent-e2e pods in bench mode (`ROOMLERD_BENCH=1` in `scripts/e2e-k8s/overlay-template/statefulset-agent-e2e.yaml`, and an agent-e2e image from 0.4.133 or later, built by hand on the build host), and the baselines on real hosts |
 | T | The StarDesk comparison cell on the spare box (private results) | — | — |
 | L1–L3 | As designed above | — | — |
@@ -219,7 +219,7 @@ competitors". Engineering may use the numbers; the public pages never print them
 - [ ] The FR-17 before/after is reported as a distribution from this harness.
 - [x] **L0** runs in CI as a named `--test`. It is green on clean links, and **red** under
       the planted 50 ms capture gate (the run that proves it can fail is linked).
-      Evidence: CI's recorder job names `--test l4_latency` since #2097 (`0db6f451f`); green
+      Evidence: CI's recorder job names `--test l4_latency` since #2097 (`67d3ca9e8`); green
       on the runner (field log); red with the gate zeroed (field log, `gate50: p50 rose by
       0.4 ms, want ≥ 20`).
 - [ ] **L4** puts a known-bad relay pair (CORPLAP-1 → neo16) and a known-good direct pair
@@ -247,7 +247,7 @@ competitors". Engineering may use the numbers; the public pages never print them
 | 2026-10-13 | — | Amended: L0 and L4 first, as the instrument of the StarDesk teardown program. Nothing built yet. |
 | 2026-10-13 | L0, unoptimised build, neo16 (Windows) | **First run, green:** `clean` 30.2 fps decoded, p50 10.2 ms, p95 14.8 ms, 0 freezes · `delay100` p50 122.3 ms (+112) · `gate50` p50 63.3 ms (+53); the hold also halves the frame rate to 15.1, because it sits in the capture loop · `lossy` 25.2 fps, p50 46.6 ms, p95 62.1 ms, **3 freezes, 7 IDRs** against clean's 4. So loss is visible as freezes and keyframes even with NACK repair on. |
 | 2026-10-13 | L0, the same build | **Negative control, red:** `gate50` with its hold set to 0 failed `gate50: p50 rose by 0.4 ms, want ≥ 20` (exit 101); restored. A repeat of `clean` read p50 10.2 ms again. |
-| 2026-10-13 | L0, CI runner (Linux), merged head `2d9e63851` | **Green in CI** (#2097, merged `0db6f451f`): `clean` 30.2 fps, p50 12.7 ms, p95 15.5 ms · `delay100` p50 113.9 ms (+101) · `gate50` p50 64.6 ms (+52), 15.3 fps · `lossy` 26.3 fps, p50 38.4 ms, 1 freeze, 7 IDRs. The `clean` fps floor started at 0.9× and is now 0.75×, after a local run under a parallel repo-wide grep decoded 20 fps; a gate that flakes under load gets ignored. |
+| 2026-10-13 | L0, CI runner (Linux), merged head `82da2e5e4` | **Green in CI** (#2097, merged `67d3ca9e8`): `clean` 30.2 fps, p50 12.7 ms, p95 15.5 ms · `delay100` p50 113.9 ms (+101) · `gate50` p50 64.6 ms (+52), 15.3 fps · `lossy` 26.3 fps, p50 38.4 ms, 1 freeze, 7 IDRs. The `clean` fps floor started at 0.9× and is now 0.75×, after a local run under a parallel repo-wide grep decoded 20 fps; a gate that flakes under load gets ignored. |
 | 2026-10-13 | L4 in process, unoptimised, neo16 (Windows) | **First probe run, green:** `probe` 64 round trips, p50 48.1 ms · `probe50` p50 171.1 ms (+123). That is more than the 100 ms two directions should cost. The first suspect was the probe period: 100 ms is exactly three frames, so every probe landed on the same phase of the capture clock. The probes now go out at a jittered interval. **Wrong turn:** with the jitter, `probe` read 43 round trips, p50 45.6 ms, and `probe50` p50 169.4 ms (+124), so the phase was not the extra. Windows timer overshoot in the vnet router is the likely cause: L0's `delay100` reads +112 on this box and +101 on the Linux runner. The jitter stays, because the phase-lock is real. |
 | 2026-10-13 | L4 in process, the same build | **Negative control, red:** with a probe dropped in the input handler before it reaches the source (one marked line), the test failed `probe: 0 round trips measured, want ≥ 20` (exit 101), with every L0 cell unaffected. Restored from the commit; the diff was that one line. |
 | 2026-10-13 | L4 viewer half, headless Chromium 151 (Playwright), the real TS modules bundled | **The browser's reader on frames Chromium decoded itself.** Two markers painted on a canvas: the frame's own number bottom-left, a probe bottom-right. Each case went through `readProbe`, the worker sampler's real `copyTo({rect})` path. A canvas-backed BGRA frame read correctly. Through Chromium's WebCodecs encode → decode: VP9 640×360 at 500 kbps 12/12 I420 frames, VP9 at 150 kbps 12/12, VP9 1280×720 scaled 2× to 640×360 12/12 (the k=2 path), H.264 at 500 kbps 12/12. A canvas played through `<video>` and read in `requestVideoFrameCallback` by `readVideoProbe`: 20/20. Every copy was the 144×48 corner, never the whole picture. |

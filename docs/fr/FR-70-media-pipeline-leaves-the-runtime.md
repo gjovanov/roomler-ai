@@ -519,7 +519,7 @@ reason the open belongs there), no controller change (M4).
 
 ## M3 — the plan handoff, as designed (2026-09-08)
 
-Anchors verified against master `93b346eb9`.
+Anchors verified against master `c4cc3b9fc`.
 
 **What the pump is today, after M1 and M2.** The encoder lives on its own OS
 thread behind a command channel (`encode::thread`: `encode`, `set_bitrate`,
@@ -613,7 +613,7 @@ a session whose heartbeat is indistinguishable from the release before it.
 
 ### ⚠️ Re-scoped 2026-09-09 — two assumptions in the design above do not hold
 
-Anchors re-verified against master `a21c02684`; the pump is now
+Anchors re-verified against master `fb7c3079e`; the pump is now
 `media_pump_ffmpeg_dc` at `peer.rs:4888` and its frame loop opens at `:5744`.
 
 **1. There is no control-plane task to publish from.** The design says the plan
@@ -694,7 +694,7 @@ reach fleet-zero and would gate nothing.
 
 ## M3a — the plan in SHADOW, as built (2026-10-18)
 
-Anchors verified against branch `fr70-m3a` (master `d07485a9d` + this PR).
+Anchors verified against branch `fr70-m3a` (master `6822126ea` + this PR).
 Nothing the pump decides changed; every number below is computed beside the
 inline one and compared, never read.
 
@@ -875,7 +875,7 @@ counter counts; a zero from it is a measurement, not a default.
 ## M3a.1 — a stale replacement counted apart, and the shadow's first genuine finding (2026-10-21)
 
 Anchors verified against branch `fr70-m3a-swap-judged-at-spawn` (master
-`e476f3e13` + this change). The 2026-10-18 section above keeps its own anchors.
+`268a74508` + this change). The 2026-10-18 section above keeps its own anchors.
 
 ### The field's first read (interim)
 
@@ -1054,7 +1054,7 @@ be decided on.
 ## M3a.2 — a dims replacement opens at the ceiling of the dims it is opened for (2026-10-21)
 
 Anchors verified against branch `fr70-m3a2-dims-replacement-target-ceiling`
-(master `67fef0a36`, which carries #2662, + this change). The sections above
+(master `03ae2483e`, which carries #2662, + this change). The sections above
 keep their own anchors.
 
 This is the fix §"M3a.1" named, done before M3b as that section requires.
@@ -1175,7 +1175,7 @@ move is its first driven check. Still owed: the full read with the
 
 ## M3a.3 — lags counted apart, the first tick after an adoption, and the flip's open (2026-10-28)
 
-Anchors verified against branch `fr70-m3a3` (master `886ad79b1` + this change).
+Anchors verified against branch `fr70-m3a3` (master `0c839df87` + this change).
 The sections above keep their own anchors.
 
 ### What the week found

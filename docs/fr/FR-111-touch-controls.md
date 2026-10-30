@@ -5,7 +5,7 @@ field-verified: P1–P4 merged and live (P4a #2413, P4b #2418; promoted 2026-10-
 every open decision settled by the operator (1–4 on 2026-10-17, 5–6 on 2026-10-18); P5 (native touch) not
 built, by decision 3 · **Owner:** the viewer's input path
 (`useRemoteControl.ts`, the stage, `MobileKeyboard.vue`), and from P4a the `remote` module's
-`touch_presets`; the agent only from P5 · **Anchors:** master `9d9eb94c9` · **Program:**
+`touch_presets`; the agent only from P5 · **Anchors:** master `b351a5978` · **Program:**
 [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 3 (§3 "Touch controls", row P11) ·
 **Builds on:** [FR-109](FR-109-relative-mouse.md) (`mouse_rel`, for the trackpad mode)
 
@@ -21,7 +21,7 @@ The first touch work (G1, phases P1–P3) is **viewer-only**. Every control emit
 understands (`mouse_button`, `mouse_move`, `mouse_wheel`, `key`, and FR-109's `mouse_rel` where
 advertised), so it works with every deployed agent and needs no release.
 
-## 2. Evidence (master `9d9eb94c9`)
+## 2. Evidence (master `b351a5978`)
 
 | What | Where |
 |---|---|

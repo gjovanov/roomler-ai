@@ -1,7 +1,7 @@
 # FR-130: Colours decode true — every encoder tells the decoder the BT.601 it converted with
 
 **Issue:** [#3120](https://github.com/gjovanov/roomler-ai/issues/3120) · **Status:** proposed 2026-10-30 — spec and
-claim · **Owner:** the agent's encoders and the viewer's decoders · **Anchors:** master `e604328a6` ·
+claim · **Owner:** the agent's encoders and the viewer's decoders · **Anchors:** master `caeb7f7ad` ·
 **Promotes:** [#3049](https://github.com/gjovanov/roomler-ai/issues/3049) · **Builds on:**
 [FR-118](FR-118-gpu-resident-frames.md) (open decision 3; P5's BT.601 mark), [FR-77](FR-77-encoder-chroma-matrix.md)
 (cells and the probe), [FR-85](FR-85-hq-screen-recording.md) (the recorder)
@@ -15,7 +15,7 @@ D3D11 VideoProcessor and VideoToolbox's attached matrix. No encoder writes a col
 bitstream says "unspecified", the browser decodes an HD picture as **BT.709**, and every saturated colour shifts.
 Greys come out exact, so the fault hides in a desktop of black text on white.
 
-## 2. Evidence (master `e604328a6`)
+## 2. Evidence (master `caeb7f7ad`)
 
 ### 2.1 The red record is BT.601 read as BT.709, value for value
 

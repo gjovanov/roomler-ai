@@ -3,7 +3,7 @@
 **Issue:** [#2947](https://github.com/gjovanov/roomler-ai/issues/2947) · **Status:** on production since
 2026-10-26 13:45Z (`hosted-20261026-6257ff2`). AC1–AC5 and AC7 are field-verified there (§8); open for AC6, the
 operator's own phones ·
-**Owner:** the web app (UI) · **Anchors:** master `a350082a8` · **Builds on:**
+**Owner:** the web app (UI) · **Anchors:** master `7b576a6ac` · **Builds on:**
 [FR-116](FR-116-phone-and-tablet-parity.md) (its D3), [FR-120](FR-120-phone-parity-part-2.md) (D3 carried, D1's
 36 px targets, D4's full-screen Settings) and [FR-111](FR-111-touch-controls.md) (the touch presets)
 
