@@ -118,7 +118,7 @@ DataChannel cell wherever one exists. A browser without the extension is left wi
 ### 4.3 What P0's baseline cells found
 
 The first two baseline cells (§9, 2026-10-30) turned up five things the cut list above did not expect.
-Anchors are against master `787f03200`.
+Anchors are against master `4161e12f0`.
 
 | Finding | Where | Consequence |
 |---|---|---|
