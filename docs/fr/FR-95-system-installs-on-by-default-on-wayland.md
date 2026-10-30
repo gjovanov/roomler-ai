@@ -33,9 +33,9 @@ Where an indicator exists today, by install:
 
 | host | "being viewed" banner + Disconnect | source |
 |---|---|---|
-| Debian family, x86_64, system | ✅ the companion (FR-27 P11) | the companion ships as **one x86_64 `.deb`** (`release-agent.yml:892`) |
-| any non-Debian (Fedora, Arch, openSUSE), system | ❌ none | `install.sh` skips it: "no dpkg here, the desktop companion ships as a .deb only" (`scripts/install.sh:794`) |
-| aarch64, any distro | ❌ none | no `.deb` for the arch (`scripts/install.sh:801`) |
+| Debian family, x86_64, system | ✅ the companion (FR-27 P11) | the companion ships as **one x86_64 `.deb`** (`release-agent.yml:912`) |
+| any non-Debian (Fedora, Arch, openSUSE), system | ❌ none | `install.sh` skips it: "no dpkg here, the desktop companion ships as a .deb only" (`scripts/install.sh:621`, at master `88897bff6`) |
+| aarch64, any distro | ❌ none | no `.deb` for the arch (`scripts/install.sh:628`, at master `88897bff6`) |
 | the greeter and the lock screen, anywhere | ❌ none | FR-93 D1b (`FR-93-wayland-out-of-the-box.md:559`), deferred |
 
 A root daemon whose prompt has nowhere to show already says so: `no_prompt_surface`
@@ -57,7 +57,7 @@ flowchart TD
 ```
 
 1. **Default-on where the person can see it, not per distro.** The root branch of `capture::wayland_plan`
-   (`agents/roomlerd/src/capture/mod.rs:793`, `root` ⇒ `AsConfigured`) gains a third answer. If FR-27's chain
+   (`agents/roomlerd/src/capture/mod.rs:867`, `root` ⇒ `AsConfigured`) gains a third answer. If FR-27's chain
    finds a surface for the session a controller would see, DRM + uinput switch themselves on, the way the keys
    would. If not, nothing changes. A Debian x86_64 host then goes default-on the day this ships, and every other
    host the day it gets a surface.

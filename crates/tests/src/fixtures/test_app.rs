@@ -94,6 +94,13 @@ impl TestApp {
         if let Ok(url) = std::env::var("ROOMLER__DATABASE__URL") {
             settings.database.url = url;
         }
+        // FR-127 P1 — Redis too: a dev box whose `:6379` is another project's
+        // password-protected instance runs the cluster tests against a
+        // throwaway one on another port (`NOAUTH` on the directory read made
+        // every two-pod media test build a second island). CI sets neither.
+        if let Ok(url) = std::env::var("ROOMLER__REDIS__URL") {
+            settings.redis.url = url;
+        }
         settings.database.name = db_name.clone();
 
         let mut client_options = ClientOptions::parse(&settings.database.url)
@@ -199,6 +206,13 @@ impl TestApp {
         if let Ok(url) = std::env::var("ROOMLER__DATABASE__URL") {
             settings.database.url = url;
         }
+        // FR-127 P1 — Redis too: a dev box whose `:6379` is another project's
+        // password-protected instance runs the cluster tests against a
+        // throwaway one on another port (`NOAUTH` on the directory read made
+        // every two-pod media test build a second island). CI sets neither.
+        if let Ok(url) = std::env::var("ROOMLER__REDIS__URL") {
+            settings.redis.url = url;
+        }
         settings.database.name = db_name.clone();
 
         // Apply caller's customizations
@@ -274,6 +288,13 @@ impl TestApp {
         let mut settings = Settings::load().unwrap_or_else(|_| test_settings());
         if let Ok(url) = std::env::var("ROOMLER__DATABASE__URL") {
             settings.database.url = url;
+        }
+        // FR-127 P1 — Redis too: a dev box whose `:6379` is another project's
+        // password-protected instance runs the cluster tests against a
+        // throwaway one on another port (`NOAUTH` on the directory read made
+        // every two-pod media test build a second island). CI sets neither.
+        if let Ok(url) = std::env::var("ROOMLER__REDIS__URL") {
+            settings.redis.url = url;
         }
         settings.database.name = db_name.clone();
 
@@ -512,6 +533,12 @@ fn test_settings() -> Settings {
         // FR-115 P4a — the relay allowance OFF, as a deployment without
         // `[relay_allowance]`; its tests switch it on and drive the job by hand.
         relay_allowance: roomler_ai_config::RelayAllowanceSettings::default(),
+        // FR-129 A1 — device pairing ON with its defaults, as a deployment
+        // without `[pairing]`; `pairing_tests` shortens the clocks per test.
+        pairing: roomler_ai_config::PairingSettings::default(),
+        // FR-129 B1-s — the setup switches OFF, as a deployment without
+        // `[setup]`; `setup_features_tests` flips them per test.
+        setup: roomler_ai_config::SetupSettings::default(),
         // P2b — blocks OFF by default, exactly like a fresh deployment. The
         // renumber tests carve explicitly; the block-carve test flips the
         // flag via `spawn_with_settings`.

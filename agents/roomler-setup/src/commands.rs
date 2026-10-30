@@ -2,12 +2,14 @@
 // Copyright (C) 2026 G ROX EOOD
 //! Tauri invoke handlers for the unified setup wizard.
 //!
-//! 11 handlers — the union of the two legacy wizards' surfaces
-//! behind ONE command vocabulary. Each handler returns
-//! `Result<T, String>` (or a plain value) so Tauri marshals errors as
-//! rejected promises the SPA renders verbatim. The raw enrollment
-//! token NEVER flows back from any command — only parsed metadata
-//! (H5, inherited from both legacy wizards).
+//! 19 handlers — the union of the two legacy wizards' surfaces, the
+//! diagnostics pair (FR-102), the pairing four (FR-129 A3) and the two
+//! of the Linux/macOS daemon install (FR-129 B1) behind ONE command
+//! vocabulary. Each handler returns `Result<T, String>` (or a
+//! plain value) so Tauri marshals errors as rejected promises the SPA
+//! renders verbatim. The raw enrollment token NEVER flows back from any
+//! command — only parsed metadata (H5, inherited from both legacy
+//! wizards); a paired token never reaches the webview at all.
 //!
 //! All payload structs serialise camelCase so the SPA binds
 //! `view.expiresAtUnix` / `report.principalId` etc. without a
@@ -31,17 +33,21 @@ pub struct DetectResult {
     pub tunnel: TunnelDetect,
 }
 
-/// Daemon (MSI) probe half. Mirrors the legacy agent wizard's
-/// `DetectResult` fields — flat string discriminator for JS
-/// consumption — plus the `supported` flag the unified SPA uses to
-/// hide the daemon role cards on non-Windows hosts.
+/// Daemon probe half. Mirrors the legacy agent wizard's `DetectResult`
+/// fields — flat string discriminator for JS consumption — plus the
+/// `supported` flag the unified SPA uses to hide the daemon role cards, and
+/// (FR-129 B1) what this OS implements and what the server allows.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDetect {
-    /// `false` on non-Windows: the daemon roles are MSI-only, so the
-    /// SPA shows only the tunnel-client card.
+    /// Whether a daemon card may be shown at all. Windows: always. Linux
+    /// and macOS (FR-129 B1): this OS implements a daemon role AND the
+    /// server named to `cmd_detect_install` answered `wizard_unix_daemon:
+    /// true` on `GET /api/setup/features` — anything else is `false`.
     pub supported: bool,
-    /// `"clean" | "peruser" | "permachine" | "ambiguous"`.
+    /// `"clean" | "peruser" | "permachine" | "ambiguous"`. On Linux and
+    /// macOS `permachine` is the system (root) daemon's enrollment, and
+    /// `peruser` the person's own.
     pub kind: String,
     /// perUser version when present, else None.
     pub peruser_version: Option<String>,
@@ -51,6 +57,16 @@ pub struct AgentDetect {
     /// happen post-rc.18 but is surfaced explicitly so the wizard
     /// can refuse to proceed until the operator cleans up.
     pub ambiguous: bool,
+    /// `windows` · `linux` · `macos` · `other`: which card copy to show.
+    pub os: String,
+    /// The daemon roles this OS implements, in card order
+    /// ([`crate::role::daemon_roles`]); the SPA hides every other daemon card.
+    pub daemon_roles: Vec<Role>,
+    /// The server whose `wizard_unix_daemon` switch `supported` reflects, on
+    /// Linux and macOS; `None` on Windows, where no server is asked.
+    pub features_server: Option<String>,
+    /// That server's answer (`false` for anything but a JSON `true`).
+    pub wizard_unix_daemon: bool,
 }
 
 /// Tunnel-CLI probe half. Mirrors the legacy tunnel wizard's
@@ -66,51 +82,125 @@ pub struct TunnelDetect {
     pub config_path: Option<String>,
 }
 
-/// Probe the registry (daemon MSI flavours) + the tunnel CLI config
-/// path. `detect_existing_install` is itself cfg-gated in the agent
-/// crate (always `Clean` on non-Windows), so the call is
-/// unconditional here — only the `supported` flag needs the
-/// compile-time platform check.
-#[tauri::command]
-pub fn cmd_detect_install() -> Result<DetectResult, String> {
+/// Probe the host: the registry (the daemon MSI flavours) on Windows, the
+/// daemon binary and the two config paths on Linux and macOS, plus the
+/// tunnel CLI's config path everywhere. `server` is the Server page's URL as
+/// the SPA has it when the Welcome page loads (its persisted or default
+/// value): on Linux and macOS the daemon cards appear only when THAT server
+/// says `wizard_unix_daemon: true` (FR-129 B1, key design B.6), and the
+/// SPA asks again ([`cmd_setup_features`]) when the URL changes. The
+/// orchestrator asks once more, for the chosen server, before installing.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn cmd_detect_install(server: Option<String>) -> Result<DetectResult, String> {
+    let os = crate::role::HostOs::current();
+    let agent = match os {
+        crate::role::HostOs::Windows => detect_windows(os),
+        _ => {
+            let server = server
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(cmd_default_server_url);
+            let features = crate::features::fetch(&server).await;
+            detect_unix(os, &server, features)
+        }
+    };
+    let tunnel = probe_tunnel_install();
+    Ok(DetectResult { agent, tunnel })
+}
+
+/// Windows: the MSI registry probe (`detect_existing_install`), unchanged.
+fn detect_windows(os: crate::role::HostOs) -> AgentDetect {
     use roomlerd::install_detect::{ExistingInstall, detect_existing_install};
-    let agent = match detect_existing_install() {
-        ExistingInstall::Clean => AgentDetect {
-            supported: cfg!(target_os = "windows"),
-            kind: "clean".to_string(),
-            peruser_version: None,
-            permachine_version: None,
-            ambiguous: false,
-        },
+    let base = AgentDetect {
+        supported: true,
+        kind: "clean".to_string(),
+        peruser_version: None,
+        permachine_version: None,
+        ambiguous: false,
+        os: os.wire().to_string(),
+        daemon_roles: crate::role::daemon_roles(os).to_vec(),
+        features_server: None,
+        wizard_unix_daemon: false,
+    };
+    match detect_existing_install() {
+        ExistingInstall::Clean => base,
         ExistingInstall::PerUser(info) => AgentDetect {
-            supported: cfg!(target_os = "windows"),
             kind: "peruser".to_string(),
             peruser_version: info.version,
-            permachine_version: None,
-            ambiguous: false,
+            ..base
         },
         ExistingInstall::PerMachine(info) => AgentDetect {
-            supported: cfg!(target_os = "windows"),
             kind: "permachine".to_string(),
-            peruser_version: None,
             permachine_version: info.version,
-            ambiguous: false,
+            ..base
         },
         ExistingInstall::Ambiguous {
             peruser,
             permachine,
         } => AgentDetect {
-            supported: cfg!(target_os = "windows"),
             kind: "ambiguous".to_string(),
             peruser_version: peruser.version,
             permachine_version: permachine.version,
             ambiguous: true,
+            ..base
         },
+    }
+}
+
+/// Linux and macOS (FR-129 B1): the daemon binary and the two enrollments,
+/// and the server's switch — a card is shown only on its `true`.
+fn detect_unix(
+    os: crate::role::HostOs,
+    server: &str,
+    features: crate::features::SetupFeatures,
+) -> AgentDetect {
+    let d = crate::unix_daemon::detect(os);
+    let roles = crate::role::daemon_roles(os);
+    let kind = match (d.per_user_config, d.system_config) {
+        (true, true) => "ambiguous",
+        (true, false) => "peruser",
+        (false, true) => "permachine",
+        (false, false) => "clean",
     };
+    AgentDetect {
+        supported: !roles.is_empty() && features.wizard_unix_daemon,
+        kind: kind.to_string(),
+        peruser_version: d
+            .per_user_config
+            .then(|| d.daemon_version.clone())
+            .flatten(),
+        permachine_version: d.system_config.then(|| d.daemon_version.clone()).flatten(),
+        // Two enrollments on a Linux box are two daemons, not an MSI
+        // mix-up: said on the Welcome page, never a refusal.
+        ambiguous: false,
+        os: os.wire().to_string(),
+        daemon_roles: roles.to_vec(),
+        features_server: Some(server.to_string()),
+        wizard_unix_daemon: features.wizard_unix_daemon,
+    }
+}
 
-    let tunnel = probe_tunnel_install();
+/// FR-129 B1 — the server's switches, for the Server page: when the URL
+/// changes, the SPA asks here whether the daemon role it holds is still
+/// offered there. Never cached; anything but a JSON `true` is `false`.
+#[tauri::command]
+pub async fn cmd_setup_features(server: String) -> crate::features::SetupFeatures {
+    crate::features::fetch(&server).await
+}
 
-    Ok(DetectResult { agent, tunnel })
+/// FR-129 B1 — the terminal fallback's "I've run it": the privileged half
+/// could not be prompted for, the SPA showed the command, and the person
+/// says it ran. Wakes the waiting pipeline, which then checks.
+#[tauri::command]
+pub fn cmd_privileged_half_done() -> Result<(), String> {
+    crate::unix_daemon::confirm_fire()
+}
+
+/// #3116 — must the pre-logon service role run from an elevated wizard here?
+/// The Welcome page asks before a token is pasted or paired: on a reinstall a
+/// limited wizard cannot write that role's config. `false` off Windows.
+#[tauri::command]
+pub fn cmd_system_context_needs_elevation() -> bool {
+    crate::orchestrator_agent::system_context_needs_elevation()
 }
 
 /// The legacy tunnel wizard's config.toml probe, verbatim: resolve
@@ -287,6 +377,22 @@ pub struct DoneReport {
     /// page then shows the manual command), `None` it did not apply (a plain
     /// token, a per-user or tunnel install, non-Windows).
     pub anchored: Option<bool>,
+    /// FR-129 B2 — the macOS root half this install enrolled beside the
+    /// person's device: its own device row, the one that owns the overlay.
+    /// `None` everywhere else.
+    pub root_half: Option<RootHalfReport>,
+}
+
+/// FR-129 B2 — the device the macOS root half enrolled as, for the Done page.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RootHalfReport {
+    pub principal_id: String,
+    pub tenant_id: String,
+    /// Its device name (`<name>-daemon`).
+    pub name: String,
+    /// `/etc/roomler/config.toml` — root's, 0600.
+    pub config_path: String,
 }
 
 /// Drive the full install pipeline end-to-end for the picked role:
@@ -307,34 +413,133 @@ pub struct DoneReport {
 /// perMachine install ran end-to-end but the Done page rendered
 /// blank because the Channel was null + the orchestrator received
 /// `device_name = ""`.
+///
+/// FR-129 A3 — `usePaired: true` installs with the token the pairing
+/// delivered ([`crate::pairing::PairStore::tokens_for`]) instead of the
+/// pasted one; the SPA then passes `token: ""`. Everything from the
+/// orchestrators on is the same call with the same token argument — a
+/// paired token is an ordinary single-use enrollment token. The session
+/// is cleared only when the install SUCCEEDS, so a Retry after a failure
+/// before the enroll reads the same token again. Absent or `false` is the
+/// pasted path, byte for byte as before.
+///
+/// FR-129 B2 — on macOS the daemon role with the private-network box ticked
+/// also installs the ROOT HALF, a second device with a token of its own: the
+/// pairing's second token, or on the pasted path `rootToken`, the second
+/// token the person pasted (required then, and never the first one again).
 #[tauri::command(rename_all = "camelCase")]
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_install(
     role: Role,
     server: String,
     token: String,
+    root_token: Option<String>,
     device_name: String,
     advanced: Option<crate::orchestrator_agent::AdvancedOptions>,
+    use_paired: Option<bool>,
     on_event: tauri::ipc::Channel<wizard_shared::progress::ProgressEvent>,
 ) -> Result<DoneReport, String> {
-    match role {
+    let store = crate::pairing::PairStore::global();
+    let root_half = crate::role::wants_root_half(
+        crate::role::HostOs::current(),
+        role,
+        advanced.as_ref().and_then(|a| a.overlay_enabled),
+    );
+    let (tokens, paired) = resolve_install_tokens(
+        store, role, &server, token, root_token, use_paired, root_half,
+    )?;
+    let crate::pairing::InstallTokens {
+        main: token,
+        root_half: root_token,
+    } = tokens;
+    let report = match role {
         Role::TunnelClient => {
             // Advanced options are daemon-config keys — the SPA hides the
             // section for this role; ignore whatever arrives.
             crate::orchestrator_tunnel::run_install(role, server, token, device_name, on_event)
                 .await
         }
+        // FR-129 B1 — the MSI pipeline on Windows; the embedded `install.sh`
+        // halves on Linux and macOS (which refuse a role their OS does not
+        // implement, and a server that does not allow it).
         Role::DaemonSystem | Role::DaemonUser | Role::DaemonMachine => {
-            crate::orchestrator_agent::run_install(
-                role,
-                server,
-                token,
-                device_name,
-                advanced.unwrap_or_default(),
-                on_event,
-            )
-            .await
+            if crate::role::HostOs::current() == crate::role::HostOs::Windows {
+                crate::orchestrator_agent::run_install(
+                    role,
+                    server,
+                    token,
+                    device_name,
+                    advanced.unwrap_or_default(),
+                    on_event,
+                )
+                .await
+            } else {
+                crate::orchestrator_unix::run_install(
+                    role,
+                    server,
+                    token,
+                    root_token,
+                    device_name,
+                    advanced.unwrap_or_default(),
+                    on_event,
+                )
+                .await
+            }
         }
+    };
+    if paired && report.is_ok() {
+        store.finish();
     }
+    report
+}
+
+/// Which tokens `cmd_install` enrolls with: the pasted ones as given, or —
+/// `use_paired` — the ones the pairing delivered for this role and server,
+/// cloned out of the store. `root_half` (FR-129 B2): the install adds the
+/// macOS root half, which needs a second token — the pairing's second, or
+/// the second one pasted. Returns the tokens and whether they came from the
+/// pairing (so a success can close the session). A pasted call never reads
+/// the store, so a pairing left behind cannot leak into a paste.
+fn resolve_install_tokens(
+    store: &crate::pairing::PairStore,
+    role: Role,
+    server: &str,
+    pasted: String,
+    pasted_root: Option<String>,
+    use_paired: Option<bool>,
+    root_half: bool,
+) -> Result<(crate::pairing::InstallTokens, bool), String> {
+    if use_paired.unwrap_or(false) {
+        return Ok((store.tokens_for(role, server, root_half)?, true));
+    }
+    let root_half = if root_half {
+        let root = pasted_root
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| {
+                "the private network on a Mac is a second device with an enrollment token of its \
+                 own: paste a second token, or untick \"Join the overlay network\" to install \
+                 screen sharing only"
+                    .to_string()
+            })?;
+        if root == pasted.trim() {
+            return Err(
+                "the two tokens are the same token — each enrolls one device and works once, so \
+                 the private network needs a second, different one"
+                    .to_string(),
+            );
+        }
+        Some(root)
+    } else {
+        None
+    };
+    Ok((
+        crate::pairing::InstallTokens {
+            main: pasted,
+            root_half,
+        },
+        false,
+    ))
 }
 
 /// Pre-spawn cancel: flips the process-wide
@@ -399,7 +604,149 @@ pub fn cmd_diagnostics_page(step: String, outcome: String, elapsed_ms: u64) {
 /// shuts the runtime down deterministically.
 #[tauri::command]
 pub fn cmd_exit_wizard(app: tauri::AppHandle) {
+    // FR-129 B1 — an enrolled system-scope config kept for a Retry never
+    // outlives the wizard: shredded before the process goes.
+    crate::unix_daemon::clear_kept();
     app.exit(0);
+}
+
+// ─── FR-129 A3: device pairing ───────────────────────────────────────────────
+
+/// What `cmd_pair_start` answers the SPA: the user code, the page to open,
+/// and the clock — never the device code, which stays in
+/// [`crate::pairing::PairStore`]. `unavailable` is the server's 404 (the
+/// `[pairing] enabled = false` switch, or a server from before FR-129): the
+/// SPA then hides the pairing action and shows the paste box alone.
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PairStartView {
+    Started {
+        user_code: String,
+        verification_uri: String,
+        expires_in: u64,
+        interval: u64,
+    },
+    Unavailable,
+}
+
+/// Open a pairing against `server` for `role`, named `device_name`. The
+/// device code the server answers is held in the store; the SPA gets the
+/// rest. A pairing already held is replaced (its token dropped) — a Start
+/// again is this call.
+///
+/// `rootHalf` (FR-129 B2) is the private-network box as the SPA shows it:
+/// on macOS the daemon role with it ticked adds the root half, so the
+/// pairing asks for `halves: 2` — one approval, two tokens. Anywhere else it
+/// changes nothing ([`crate::role::wants_root_half`]).
+///
+/// The verification URI must be a web address: the wizard opens it with
+/// the shell plugin, and a server that answered anything else is refused
+/// here rather than handed to the OS.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn cmd_pair_start(
+    server: String,
+    role: Role,
+    device_name: String,
+    root_half: Option<bool>,
+) -> Result<PairStartView, String> {
+    use roomlerd::pairing::{StartOutcome, StartRequest, host_arch, host_os};
+    let halves = crate::role::pair_halves(crate::role::wants_root_half(
+        crate::role::HostOs::current(),
+        role,
+        root_half,
+    ));
+    let request = StartRequest {
+        machine_name: device_name,
+        os: host_os(),
+        arch: host_arch(),
+        role: role.pair_role(),
+        halves,
+        client: "wizard".to_string(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let outcome = roomlerd::pairing::start(&server, &request)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let started = match outcome {
+        StartOutcome::Unavailable => return Ok(PairStartView::Unavailable),
+        StartOutcome::Started(s) => s,
+    };
+    if !is_web_address(&started.verification_uri) {
+        return Err(
+            "the server's pairing page is not a web address; paste a token instead".to_string(),
+        );
+    }
+    let view = PairStartView::Started {
+        user_code: started.user_code.clone(),
+        verification_uri: started.verification_uri.clone(),
+        expires_in: started.expires_in,
+        interval: started.interval,
+    };
+    crate::pairing::PairStore::global().begin(server, role, halves, started);
+    Ok(view)
+}
+
+/// One poll of the held pairing. The device code is copied out of the
+/// store before the request and the answer applied after it — the lock is
+/// never held across the await ([`crate::pairing`]). With no pairing held
+/// the call refuses, which ends a loop that outlived its session.
+///
+/// `interval_secs` is what the SPA polled with; a `slow_down` or a 429
+/// answers the next interval from it (never shorter), so the back-off
+/// arithmetic lives — and is tested — on this side.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn cmd_pair_poll(interval_secs: u64) -> Result<crate::pairing::PairPollView, String> {
+    let store = crate::pairing::PairStore::global();
+    let snapshot = store
+        .snapshot()
+        .ok_or_else(|| "no pairing in progress".to_string())?;
+    let outcome = roomlerd::pairing::poll(&snapshot.server, &snapshot.device_code)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(store.apply_poll(snapshot.generation, outcome, interval_secs))
+}
+
+/// Open the held pairing's page in the default browser. The URL comes from
+/// the store, never from the SPA, and carries no code (operator decision
+/// 1): the person types the code the wizard shows.
+#[tauri::command]
+pub fn cmd_pair_open(app: tauri::AppHandle) -> Result<(), String> {
+    let uri = crate::pairing::PairStore::global()
+        .verification_uri()
+        .ok_or_else(|| "no pairing in progress".to_string())?;
+    open_in_browser(&app, &uri)
+}
+
+/// Forget the held pairing: its device code and any delivered token. The
+/// Cancel on the approval card, Back, and a paste-path install call this.
+/// There is nothing to tell the server — the row expires on its own.
+#[tauri::command]
+pub fn cmd_pair_cancel() {
+    crate::pairing::PairStore::global().cancel();
+}
+
+/// `http://` or `https://` — the only schemes the wizard hands to the OS.
+fn is_web_address(uri: &str) -> bool {
+    let lower = uri.trim().to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && lower.len() > "https://".len()
+}
+
+/// The default browser through the shell plugin, as the desktop companion
+/// opens its links (`shell::open` is deprecated for tauri-plugin-opener,
+/// but the shell plugin is already shipped and initialised here).
+fn open_in_browser(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+    #[allow(deprecated)]
+    {
+        use tauri_plugin_shell::ShellExt;
+        app.shell()
+            .open(url, None)
+            .map_err(|e| format!("opening the browser: {e}"))
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +789,10 @@ mod tests {
                 peruser_version: Some("0.3.0-rc.190".to_string()),
                 permachine_version: None,
                 ambiguous: false,
+                os: "linux".to_string(),
+                daemon_roles: vec![Role::DaemonSystem, Role::DaemonUser],
+                features_server: Some("https://example.invalid".to_string()),
+                wizard_unix_daemon: true,
             },
             tunnel: TunnelDetect {
                 installed: true,
@@ -459,6 +810,50 @@ mod tests {
         assert!(json.contains(r#""supported":true"#), "{json}");
         assert!(!json.contains("peruser_version"), "{json}");
         assert!(!json.contains("machine_name"), "{json}");
+        // FR-129 B1 — the per-OS fields, camelCase, the roles in kebab-case.
+        assert!(json.contains(r#""os":"linux""#), "{json}");
+        assert!(
+            json.contains(r#""daemonRoles":["daemon-system","daemon-user"]"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""featuresServer":"https://example.invalid""#),
+            "{json}"
+        );
+        assert!(json.contains(r#""wizardUnixDaemon":true"#), "{json}");
+    }
+
+    /// FR-129 B1 — on Linux and macOS a daemon card needs the server's
+    /// `true`; the kind reads the two enrollments; Windows never asks.
+    #[test]
+    fn unix_detection_follows_the_server_switch() {
+        use crate::features::SetupFeatures;
+        use crate::role::HostOs;
+        let off = SetupFeatures::default();
+        let on = SetupFeatures {
+            pairing: true,
+            wizard_unix_daemon: true,
+        };
+        let d = detect_unix(HostOs::Linux, "https://a.invalid", off);
+        assert!(!d.supported, "the switch is off");
+        assert_eq!(d.os, "linux");
+        assert_eq!(d.daemon_roles, vec![Role::DaemonSystem, Role::DaemonUser]);
+        assert_eq!(d.features_server.as_deref(), Some("https://a.invalid"));
+        assert!(!d.wizard_unix_daemon);
+        let d = detect_unix(HostOs::Linux, "https://a.invalid", on);
+        assert!(d.supported);
+        assert!(d.wizard_unix_daemon);
+        let d = detect_unix(HostOs::Macos, "https://a.invalid", on);
+        assert!(d.supported);
+        assert_eq!(d.daemon_roles, vec![Role::DaemonUser]);
+        let d = detect_unix(HostOs::Other, "https://a.invalid", on);
+        assert!(!d.supported, "no daemon role on this OS");
+        assert!(d.daemon_roles.is_empty());
+        // The kind is one of the SPA's four, whatever this box has.
+        assert!(matches!(
+            d.kind.as_str(),
+            "clean" | "peruser" | "permachine" | "ambiguous"
+        ));
     }
 
     #[test]
@@ -479,8 +874,20 @@ mod tests {
             cli_included: None,
             desktop_installed: None,
             anchored: None,
+            root_half: Some(RootHalfReport {
+                principal_id: "507f1f77bcf86cd799439012".to_string(),
+                tenant_id: "507f191e810c19729de860ea".to_string(),
+                name: "lab-daemon".to_string(),
+                config_path: "/etc/roomler/config.toml".to_string(),
+            }),
         };
         let json = serde_json::to_string(&r).unwrap();
+        // FR-129 B2: the root half's report binds camelCase too.
+        assert!(
+            json.contains(r#""rootHalf":{"principalId":"507f1f77bcf86cd799439012""#),
+            "{json}"
+        );
+        assert!(!json.contains("root_half"), "{json}");
         assert!(
             json.contains(r#""principalKind":"tunnel_client""#),
             "{json}"
@@ -574,18 +981,250 @@ mod tests {
         assert!(!n.is_empty());
     }
 
+    // ---- FR-129 A3: pairing ------------------------------------------------
+
+    /// The SPA binds `kind` plus camelCase fields; `unavailable` is a bare
+    /// tag. Neither variant has a place for the device code.
+    #[test]
+    fn pair_start_view_serialises_camel_case_with_a_kind_tag() {
+        let v = PairStartView::Started {
+            user_code: "BCDF-GHJK".into(),
+            verification_uri: "https://roomler.ai/pair".into(),
+            expires_in: 900,
+            interval: 5,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(json.contains(r#""kind":"started""#), "{json}");
+        assert!(json.contains(r#""userCode":"BCDF-GHJK""#), "{json}");
+        assert!(
+            json.contains(r#""verificationUri":"https://roomler.ai/pair""#),
+            "{json}"
+        );
+        assert!(json.contains(r#""expiresIn":900"#), "{json}");
+        assert!(json.contains(r#""interval":5"#), "{json}");
+        assert!(!json.contains("user_code"), "{json}");
+        assert!(!json.contains("device"), "{json}");
+
+        let json = serde_json::to_string(&PairStartView::Unavailable).unwrap();
+        assert_eq!(json, r#"{"kind":"unavailable"}"#);
+    }
+
+    /// Only a web address is handed to the OS to open.
+    #[test]
+    fn pair_page_must_be_a_web_address() {
+        assert!(is_web_address("https://roomler.ai/pair"));
+        assert!(is_web_address("http://127.0.0.1:3000/pair"));
+        assert!(is_web_address(" HTTPS://Example.invalid/pair "));
+        assert!(!is_web_address("file:///etc/passwd"));
+        assert!(!is_web_address("javascript:alert(1)"));
+        assert!(!is_web_address("roomler.ai/pair"));
+        assert!(!is_web_address("https://"));
+        assert!(!is_web_address(""));
+    }
+
+    /// One token, no root half: what `cmd_install` enrolls with.
+    fn resolve_install_token(
+        store: &crate::pairing::PairStore,
+        role: Role,
+        server: &str,
+        pasted: String,
+        use_paired: Option<bool>,
+    ) -> Result<(String, bool), String> {
+        resolve_install_tokens(store, role, server, pasted, None, use_paired, false).map(
+            |(t, paired)| {
+                assert!(t.root_half.is_none());
+                (t.main, paired)
+            },
+        )
+    }
+
+    fn started_pairing() -> roomlerd::pairing::Started {
+        roomlerd::pairing::Started {
+            device_code: roomlerd::pairing::DeviceCode::new("dc"),
+            user_code: "BCDF-GHJK".into(),
+            verification_uri: "https://example.invalid/pair".into(),
+            expires_in: 900,
+            interval: 5,
+        }
+    }
+
+    fn approved_with(tokens: &[&str]) -> roomlerd::pairing::PollOutcome {
+        roomlerd::pairing::PollOutcome::Approved(roomlerd::pairing::Approved {
+            tokens: tokens.iter().map(|t| t.to_string()).collect(),
+            org_name: "Acme".into(),
+            org_slug: Some("acme".into()),
+            approver_name: "Dana".into(),
+            approver_username: Some("dana".into()),
+        })
+    }
+
+    /// `cmd_install`'s token choice: a pasted call never touches the store
+    /// (a pairing left behind cannot leak into a paste), and a paired call
+    /// reads the delivered token for its role and server — or refuses.
+    #[test]
+    fn install_token_resolution_keeps_the_paths_apart() {
+        let store = crate::pairing::PairStore::new();
+        let server = "https://example.invalid";
+
+        // Pasted, with no pairing at all: the pasted token, untouched.
+        let (t, paired) =
+            resolve_install_token(&store, Role::DaemonSystem, server, "pasted".into(), None)
+                .unwrap();
+        assert_eq!((t.as_str(), paired), ("pasted", false));
+        let (t, paired) = resolve_install_token(
+            &store,
+            Role::DaemonSystem,
+            server,
+            "pasted".into(),
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!((t.as_str(), paired), ("pasted", false));
+
+        // Paired, with nothing delivered: refused, and the pasted argument
+        // is not used as a fallback.
+        let e = resolve_install_token(&store, Role::DaemonSystem, server, "".into(), Some(true))
+            .unwrap_err();
+        assert!(e.contains("no pairing in progress"), "{e}");
+
+        let generation = store.begin(server.to_string(), Role::DaemonSystem, 1, started_pairing());
+        let e = resolve_install_token(&store, Role::DaemonSystem, server, "".into(), Some(true))
+            .unwrap_err();
+        assert!(e.contains("not been approved"), "{e}");
+
+        store.apply_poll(generation, approved_with(&["eyJ.paired.sig"]), 5);
+        let (t, paired) =
+            resolve_install_token(&store, Role::DaemonSystem, server, "".into(), Some(true))
+                .unwrap();
+        assert_eq!((t.as_str(), paired), ("eyJ.paired.sig", true));
+
+        // A pasted call beside a delivered pairing still takes the paste.
+        let (t, paired) = resolve_install_token(
+            &store,
+            Role::DaemonSystem,
+            server,
+            "pasted".into(),
+            Some(false),
+        )
+        .unwrap();
+        assert_eq!((t.as_str(), paired), ("pasted", false));
+
+        // The role and the server must be the pairing's.
+        assert!(
+            resolve_install_token(&store, Role::TunnelClient, server, "".into(), Some(true))
+                .is_err()
+        );
+        assert!(
+            resolve_install_token(
+                &store,
+                Role::DaemonSystem,
+                "https://other.invalid",
+                "".into(),
+                Some(true)
+            )
+            .is_err()
+        );
+    }
+
+    /// FR-129 B2 — the root half's token. Paired: the approval's second
+    /// token, from a pairing started for two halves. Pasted: the second
+    /// token the person pasted — required, and never the first one again (a
+    /// token works once; the second enroll would be refused after the first
+    /// had made its device). Without the root half a second paste is ignored.
+    #[test]
+    fn the_root_half_takes_a_token_of_its_own() {
+        let store = crate::pairing::PairStore::new();
+        let server = "https://example.invalid";
+
+        let (t, paired) = resolve_install_tokens(
+            &store,
+            Role::DaemonUser,
+            server,
+            "eyJ.user.sig".into(),
+            Some(" eyJ.root.sig\n".into()),
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(!paired);
+        assert_eq!(t.main, "eyJ.user.sig");
+        assert_eq!(t.root_half.as_deref(), Some("eyJ.root.sig"));
+
+        for missing in [None, Some(String::new()), Some("  \n".into())] {
+            let e = resolve_install_tokens(
+                &store,
+                Role::DaemonUser,
+                server,
+                "eyJ.user.sig".into(),
+                missing,
+                None,
+                true,
+            )
+            .unwrap_err();
+            assert!(
+                e.contains("paste a second token") && e.contains("Join the overlay network"),
+                "{e}"
+            );
+        }
+        let e = resolve_install_tokens(
+            &store,
+            Role::DaemonUser,
+            server,
+            "eyJ.same.sig".into(),
+            Some("eyJ.same.sig ".into()),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(e.contains("same token"), "{e}");
+
+        // No root half: a second paste goes nowhere.
+        let (t, _) = resolve_install_tokens(
+            &store,
+            Role::DaemonUser,
+            server,
+            "eyJ.user.sig".into(),
+            Some("eyJ.root.sig".into()),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(t.root_half.is_none());
+
+        // Paired: the two the approval delivered, in order.
+        let generation = store.begin(server.to_string(), Role::DaemonUser, 2, started_pairing());
+        store.apply_poll(generation, approved_with(&["eyJ.p1.sig", "eyJ.p2.sig"]), 5);
+        let (t, paired) = resolve_install_tokens(
+            &store,
+            Role::DaemonUser,
+            server,
+            String::new(),
+            None,
+            Some(true),
+            true,
+        )
+        .unwrap();
+        assert!(paired);
+        assert_eq!(t.main, "eyJ.p1.sig");
+        assert_eq!(t.root_half.as_deref(), Some("eyJ.p2.sig"));
+    }
+
     #[test]
     fn default_server_url_is_roomler_ai() {
         assert_eq!(cmd_default_server_url(), "https://roomler.ai");
     }
 
-    #[test]
-    fn detect_install_returns_consistent_shape() {
+    #[tokio::test]
+    async fn detect_install_returns_consistent_shape() {
         // Real probe on whatever host runs the tests: contract is a
         // valid discriminator + `supported` matching the compile
         // target — NOT a specific install state (dev boxes may have
-        // real installs).
-        let r = cmd_detect_install().unwrap();
+        // real installs). The server named is a closed loopback port, so
+        // off Windows the features fetch fails at once and the switch reads
+        // off, as it must (FR-129 B1): no test reaches the network.
+        let r = cmd_detect_install(Some("http://127.0.0.1:9".to_string()))
+            .await
+            .unwrap();
         assert!(
             matches!(
                 r.agent.kind.as_str(),
@@ -595,6 +1234,7 @@ mod tests {
             r.agent.kind
         );
         assert_eq!(r.agent.supported, cfg!(target_os = "windows"));
+        assert_eq!(r.agent.os, crate::role::HostOs::current().wire());
         if !r.tunnel.installed {
             assert!(r.tunnel.config_path.is_none());
         }

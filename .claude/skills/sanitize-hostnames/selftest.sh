@@ -77,6 +77,9 @@ IGNORED=("WIN""HOST-A" "CORP""LAP-2" "Mac""Book-1" "ARGB""2101010" "XRGB""8888"
          # an X11 font string and is allowlisted. If any of these ever trips,
          # the shape has been loosened and a real GUID will start crying wolf.
          "DEF""012345678" "dbf""342009340" "iso""10646" "ISO""10646"
+         # The sRGB transfer's standard number, as WebCodecs and FFmpeg spell it
+         # (FR-130). Allowlisted as IEC[0-9]+, asserted here in both casings.
+         "iec""61966" "IEC""61966"
          # The RETIRED canary (rotated 2026-09-06). It is allowlisted because
          # writing up the guard published it, so it now appears only in
          # documentation -- and it lives HERE so that exemption is asserted
@@ -227,7 +230,115 @@ if [ -x "$HOOK" ] && command -v python3 >/dev/null 2>&1; then
 
   r=$(hook_says 0)
   [ "${r%%|*}" = "0" ]              || { echo "hook: a clean guard must allow the commit (got ${r%%|*})"; fail=1; }
+
+  # The hook hands the guard a sanitize map only when one is configured, the
+  # file exists, and the guard HAS the map gate. A guard from before the gate
+  # would answer --map with argparse's exit 2 -- "could not run" -- and take the
+  # shape check down with it, in every worktree on an older branch.
+  hook_map() {   # $1 = env:<file> | cfg:<file> | none; $2 = 1 if the stub has the gate
+    ( unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE ROOMLER_SANITIZE_MAP
+      export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+      t=$(mktemp -d) || exit 1
+      git init -q "$t" || { rm -rf "$t"; exit 1; }
+      mkdir -p "$t/.githooks" "$t/.claude/skills/sanitize-hostnames"
+      cp "$HOOK" "$t/.githooks/pre-commit"; chmod +x "$t/.githooks/pre-commit"
+      { printf '#!/usr/bin/env python3\nimport sys\n'
+        [ "$2" != 1 ] || printf '# class MapGate -- this stub stands in for a guard that has it\n'
+        printf 'print("ARGV " + " ".join(sys.argv[1:]))\nsys.exit(1)\n'
+      } > "$t/.claude/skills/sanitize-hostnames/check_shapes.py"
+      cd "$t" || exit 1
+      : > map.txt
+      case "$1" in
+        env:*) export ROOMLER_SANITIZE_MAP="${1#env:}" ;;
+        cfg:*) git config roomler.sanitizeMap "${1#cfg:}" ;;
+      esac
+      echo ordinary-prose > a.txt
+      git add a.txt || { rm -rf "$t"; exit 1; }
+      o=$(.githooks/pre-commit 2>&1); rc=$?
+      printf '%s|%s' "$rc" "$o"
+      cd / && rm -rf "$t" )
+  }
+
+  # ⚠️ Match the stub's ARGV line, never a bare `--map`: the hook's own refusal
+  # text quotes `sanitize.py --map <path-to-map>`, so a bare match is always true.
+  case "$(hook_map env:map.txt 1)" in *"ARGV --root "*" --staged --map map.txt"*) :;;
+    *) echo "hook: a map set in the environment was not handed to the guard"; fail=1;; esac
+  case "$(hook_map cfg:map.txt 1)" in *"ARGV --root "*" --staged --map map.txt"*) :;;
+    *) echo "hook: a map set in git config was not handed to the guard"; fail=1;; esac
+  r=$(hook_map env:missing.txt 1)
+  case "$r" in *"--staged --map"*) echo "hook: handed the guard a map that does not exist"; fail=1;; esac
+  case "$r" in *"configured but not found"*) :;; *) echo "hook: a missing map must say so"; fail=1;; esac
+  r=$(hook_map env:map.txt 0)
+  case "$r" in *"--staged --map"*) echo "hook: handed --map to a guard without the gate"; fail=1;; esac
+  case "$r" in *"predates the map gate"*) :;; *) echo "hook: a guard without the gate must say so"; fail=1;; esac
+  r=$(hook_map none 1)
+  case "$r" in *"ARGV --root "*" --staged"*) :;; *) echo "hook: the stub guard did not run"; fail=1;; esac
+  case "$r" in *"--staged --map"*) echo "hook: passed --map with no map configured"; fail=1;; esac
 fi
+
+# --- the MAP gate (--staged --map): names with no shape ----------------------
+#
+# A name the map knows and no shape describes -- a laptop called after its
+# owner -- passed this guard, CI and the hook until 2026-10-30, and cost the
+# fifth whole-history rewrite. These canaries pin the gate the hook now runs on
+# a machine that has the map. An ADDED mapped name is refused in any casing and
+# in a NEW path. The sweep's boundaries hold (a digit key ends at `_`, a word key
+# does not), and so does `!keep`. A name already committed is left to the sweep.
+# A `++ ` line (a quoted diff) is still content, not a header. Nothing changes
+# without --map. And the mapped name itself is NEVER printed.
+GUARD_ABS="$PWD/$GUARD"
+mg=$(mktemp -d)
+K1="QV8""NB4471"; k1="qv8""nb4471"        # a digit key: a generated tag
+K2="Wombat""ridge"; k2="wombat""ridge"; U2="WOMBAT""RIDGE"   # a word key; k2 is kept
+printf '# synthetic\n%s = MAP-ALIAS-1\n%s = map-alias-2\n!keep %s\n' "$K1" "$K2" "$k2" > "$mg/map.txt"
+printf 'no equals sign, %s\n' "$K2" > "$mg/bad.txt"
+printf '# only a comment\n' > "$mg/empty.txt"
+( unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+  export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+  git init -q "$mg/repo" && cd "$mg/repo" || exit 1
+  printf 'one\nan old %s stays put\nthree\n' "$K1" > old.md
+  git add old.md || exit 1
+  git -c core.hooksPath=/dev/null -c user.name=st -c user.email=st@example.invalid \
+    commit -q -m init || exit 1
+  printf 'four\n' >> old.md
+  printf '%s\n' "a $K1 standing alone" "fn ${K1}_layout() {}" "${K1}9 is a longer run" \
+    "a $k1 in lower case" "the $U2 shouted" "the $k2 kept spelling" "let ${K2}_cfg = 1;" \
+    "++ b/$K1" > new.md
+  echo ordinary-prose > "notes-$K1.md"
+  git add old.md new.md "notes-$K1.md" ) || { echo "map gate: scratch repo setup failed"; fail=1; }
+
+mapgate() {   # echoes "<rc>|<output>" of the real guard, run in the scratch repo
+  ( unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+    cd "$mg/repo" || exit 1
+    o=$(python3 "$GUARD_ABS" --root . "$@" 2>&1); rc=$?
+    printf '%s|%s' "$rc" "$o" )
+}
+
+r=$(mapgate --staged --map "$mg/map.txt"); out=${r#*|}
+[ "${r%%|*}" = 1 ] || { echo "map gate: an added mapped name must exit 1 (got ${r%%|*})"; fail=1; }
+for n in "  new.md:1  -> MAP-ALIAS-1" "  new.md:2  -> MAP-ALIAS-1" "  new.md:4  -> MAP-ALIAS-1" \
+         "  new.md:5  -> map-alias-2" "  new.md:8  -> MAP-ALIAS-1" \
+         "  notes-<MAP-ALIAS-1>.md:name  -> MAP-ALIAS-1"; do
+  grep -qxF -- "$n" <<<"$out" || { echo "map gate MISSED:$n"; fail=1; }
+done
+for n in "new.md:3" "new.md:6" "new.md:7" "old.md:"; do
+  grep -qF -- "  $n" <<<"$out" && { echo "map gate FALSE POSITIVE: $n"; fail=1; }
+done
+for n in "$K1" "$K2"; do
+  grep -qiF -- "$n" <<<"$out" && { echo "map gate PRINTED a mapped name"; fail=1; }
+done
+
+r=$(mapgate --staged)
+[ "${r%%|*}" = 0 ] || { echo "map gate: without --map the map must not apply (got ${r%%|*})"; fail=1; }
+r=$(mapgate --map "$mg/map.txt")
+[ "${r%%|*}" = 2 ] || { echo "map gate: --map without --staged must exit 2 (got ${r%%|*})"; fail=1; }
+r=$(mapgate --staged --map "$mg/bad.txt")
+[ "${r%%|*}" = 20 ] || { echo "map gate: a malformed map must exit 20, never 1 (got ${r%%|*})"; fail=1; }
+grep -qiF -- "$K2" <<<"${r#*|}" && { echo "map gate: PRINTED a line of a malformed map"; fail=1; }
+r=$(mapgate --staged --map "$mg/empty.txt")
+[ "${r%%|*}" = 0 ] || { echo "map gate: a map with no rows must find nothing (got ${r%%|*})"; fail=1; }
+rm -rf "$mg"
 
 # --- the SWEEP's rules (sanitize.py): glued tags, identifiers, paths ----------
 #

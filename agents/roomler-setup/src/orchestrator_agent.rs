@@ -72,9 +72,38 @@ pub struct AdvancedOptions {
     pub overlay_advertised_routes: Option<String>,
     /// Comma-separated CIDRs → `advertise_routes` (tunnel/SOCKS mesh).
     pub advertise_routes: Option<String>,
+    /// #2338 — the config keys the person touched on the Server page
+    /// (`overlay_enabled`, `auto_grant_session`, …). On a config that already
+    /// exists only these land; the untouched boxes keep the device's own
+    /// values. An absent list (an older SPA) means nothing was touched.
+    pub touched: Vec<String>,
 }
 
 impl AdvancedOptions {
+    /// The config keys the person touched, deduplicated, in the registry's
+    /// spelling — for the fold here and for a merge that runs elsewhere
+    /// (the privileged half's `--config-take`).
+    pub(crate) fn touched_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .touched
+            .iter()
+            .map(|k| k.trim().to_string())
+            .filter(|k| {
+                matches!(
+                    k.as_str(),
+                    "overlay_enabled"
+                        | "advertise_local_subnets"
+                        | "auto_grant_session"
+                        | "overlay_advertised_routes"
+                        | "advertise_routes"
+                )
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     /// The two free-text route lists, with empties normalised away —
     /// shared by pre-MSI validation and the post-enroll apply.
     fn route_fields(&self) -> [(&'static str, Option<&str>); 2] {
@@ -92,7 +121,7 @@ impl AdvancedOptions {
 
     /// Fail fast on bad route CIDRs (called pre-MSI). Bool options
     /// can't be invalid.
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         for (key, val) in self.route_fields() {
             if let Some(v) = val {
                 roomlerd::config_surface::validate_cidr_list(v)
@@ -102,34 +131,48 @@ impl AdvancedOptions {
         Ok(())
     }
 
-    /// FR-84 S2 — resolve the options the SPA left unset from the install
-    /// flavour, before [`Self::apply_to`]. Today that is one key: the
-    /// overlay follows the flavour (see [`overlay_enabled_default`]). The
-    /// SPA sends the box as the operator saw it, so this is a belt for a
-    /// caller that never sent the field — and a second place the default
-    /// is written down, next to the one that consumes it.
-    fn with_flavour_defaults(mut self, flavour: WindowsInstallFlavour) -> Self {
-        self.overlay_enabled = overlay_enabled_default(self.overlay_enabled, flavour);
+    /// FR-84 S2 — the overlay box resolved from a role's default when the
+    /// SPA sent nothing for it, before [`Self::apply_to`] on a fresh config.
+    /// The SPA sends the box as the operator saw it, so this is a belt for
+    /// a caller that never sent the field — and a second place the default
+    /// is written down, next to the one that consumes it: the one default
+    /// the roles disagree on (`overlay_enabled_default` on Windows; the
+    /// Linux and macOS roles' in [`crate::orchestrator_unix`]).
+    pub(crate) fn with_overlay_default(mut self, default: Option<bool>) -> Self {
+        self.overlay_enabled = self.overlay_enabled.or(default);
         self
     }
 
-    /// Write the selected options into the freshly-enrolled config via
-    /// the same per-key registry the desktop editor uses.
-    fn apply_to(&self, cfg: &mut roomlerd::config::AgentConfig) -> Result<(), String> {
+    /// Write the selected options into the enrolled config via the same
+    /// per-key registry the desktop editor uses. With `only_touched` (a
+    /// config that already existed, #2338) a key lands only if the person
+    /// touched its box; an untouched box must not overwrite what the device
+    /// already had.
+    pub(crate) fn apply_to(
+        &self,
+        cfg: &mut roomlerd::config::AgentConfig,
+        only_touched: bool,
+    ) -> Result<(), String> {
         use roomlerd::config_surface::apply;
+        let touched = self.touched_keys();
+        let lands = |key: &str| !only_touched || touched.iter().any(|t| t == key);
         let bools = [
             ("overlay_enabled", self.overlay_enabled),
             ("advertise_local_subnets", self.advertise_local_subnets),
             ("auto_grant_session", self.auto_grant_session),
         ];
         for (key, val) in bools {
-            if let Some(v) = val {
+            if let Some(v) = val
+                && lands(key)
+            {
                 apply(cfg, key, Some(if v { "true" } else { "false" }))
                     .map_err(|e| format!("advanced option {key}: {e}"))?;
             }
         }
         for (key, val) in self.route_fields() {
-            if let Some(v) = val {
+            if let Some(v) = val
+                && lands(key)
+            {
                 apply(cfg, key, Some(v)).map_err(|e| format!("advanced option {key}: {e}"))?;
             }
         }
@@ -193,7 +236,7 @@ pub async fn run_install(
 /// FR-102 P3b — the origin the diagnostics are posted to: the server as the
 /// enroll will reach it (a remote `http://` is upgraded to `https://`, a
 /// loopback one left alone), without a trailing slash.
-fn diagnostics_server(server: &str) -> String {
+pub(crate) fn diagnostics_server(server: &str) -> String {
     roomler_ai_remote_control::server_url::secure(server, false)
         .url
         .trim_end_matches('/')
@@ -236,6 +279,17 @@ async fn run_install_inner(
         .to_string();
     let (wfx, is_system_context) =
         flavour_parts(role).map_err(|e| failed(ErrorCode::UnsupportedPlatform, e))?;
+
+    // #3116 — SystemContext keeps its config in the machine-global directory,
+    // which the daemon hardens to SYSTEM and Administrators (#3073). A wizard
+    // that is not elevated still gets the MSI, through the MSI's own UAC
+    // prompt; on a reinstall it then cannot write the config, after the
+    // enroll has spent the single-use token. So that case is refused here,
+    // before anything is downloaded, installed or spent. (The Welcome page
+    // asks first; this is the gate that holds.)
+    if is_system_context && system_context_needs_elevation() {
+        return Err(failed(ErrorCode::Preflight, needs_elevation()));
+    }
 
     emit(on_event, ProgressEvent::PreflightStarted);
     let detected = detect_existing_install();
@@ -544,7 +598,6 @@ async fn run_install_inner(
             },
         );
     }
-    let machine_id = roomlerd::machine::derive_machine_id(&config_path);
     // FR-102 P3 — the wizard says so itself, in-process: `wizard`, with the
     // scope its role installs (`Role::install_scope`). A daemon role always
     // has one; the `None` arm is the tunnel role, which never reaches here.
@@ -557,33 +610,87 @@ async fn run_install_inner(
             .unwrap_or(roomlerd::enrollment::InstallScope::Unknown),
     );
     install.run = diag.run_id();
-    let inputs = roomlerd::enrollment::EnrollInputs {
-        server_url: &server,
-        enrollment_token: &token,
-        machine_id: &machine_id,
-        machine_name: &device_name,
-        install: Some(install),
-    };
-    let mut cfg = roomlerd::enrollment::enroll(inputs)
-        .await
-        .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
-    // FR-99 decision 3 — the SystemContext flavour is a Windows service
-    // install, and the wizard always writes a fresh config: it starts at
-    // `lock_on_end = auto` (`enrollment::apply_service_install_defaults`).
-    if is_system_context {
-        roomlerd::enrollment::apply_service_install_defaults(&mut cfg);
+    // #2338 — a config already at the path is the base: the fresh identity
+    // is folded into it (`crate::enroll_step`), as `roomlerd enroll` does,
+    // so a reinstall keeps the mesh, the routes and every other
+    // operator-owned key. FR-99 decision 3's `lock_on_end = auto` and the
+    // flavour's overlay default (FR-84 S2) apply to a FRESH config only; the
+    // boxes the person touched land either way, the untouched ones only on
+    // a fresh config. F4: a config there that does not load is said,
+    // recovered from its last good copy when it can be, and kept aside —
+    // never read as absent and silently written over.
+    //
+    // #3116 — a config this process may not read, or a path it may not write,
+    // stops the install HERE: the enroll below spends the token, and the save
+    // after it would fail. Before this a limited wizard enrolled, then failed
+    // on "creating parent dir", and first read the access-denied as a damaged
+    // config whose settings were lost.
+    //
+    // #3116 — and on a perMachine reinstall the config is read only once the
+    // daemon the MSI restarted onto it answers on its LocalAPI, which it serves
+    // after its startup writes. Up to 0.4.187 one of those wrote the copy it
+    // had loaded back over this wizard's, a second after it.
+    let settled = settle_daemon(wfx, &config_path).await;
+    let existing = crate::enroll_step::read_existing(&config_path).map_err(|said| {
+        failed(
+            ErrorCode::ConfigWrite,
+            format!("{said} {RUN_AS_ADMINISTRATOR} {NOTHING_SPENT}"),
+        )
+    })?;
+    if let Err(e) = roomlerd::config::probe_writable(&config_path) {
+        return Err(failed(
+            ErrorCode::ConfigWrite,
+            config_unwritable(&config_path, &e),
+        ));
     }
-    // S2 — fold the wizard's advanced options into the enrolled config
-    // before it's written (route lists already validated pre-MSI). An
-    // overlay choice the SPA did not send follows the flavour (FR-84 S2).
-    advanced
-        .with_flavour_defaults(wfx)
-        .apply_to(&mut cfg)
-        .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
-    let agent_id = cfg.agent_id.clone();
-    let tenant_id = cfg.tenant_id.clone();
+    if let Some(message) = existing.warning {
+        emit(on_event, ProgressEvent::PreflightWarning { message });
+    }
+    // #3116 — a config was already here: a reinstall, whose MSI restarted the
+    // service onto it before the write below (step 7a).
+    let had_config = existing.cfg.is_some();
+    let crate::enroll_step::Enrolled {
+        mut cfg,
+        outcome,
+        previous_row,
+    } = crate::enroll_step::enroll_folded(
+        &config_path,
+        existing.cfg,
+        &server,
+        &token,
+        &device_name,
+        install,
+    )
+    .await
+    .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
+    // F3: the machine id was read back from the config, so the server reuses
+    // the row — unless it no longer can; then the old key is retired and said.
+    if let Some(row) = &previous_row {
+        emit(
+            on_event,
+            ProgressEvent::PreflightWarning {
+                message: roomlerd::enrollment::describe_previous_row(row, &cfg.agent_id),
+            },
+        );
+    }
+    let note = crate::enroll_step::finish(
+        &mut cfg,
+        &outcome,
+        is_system_context,
+        &advanced,
+        overlay_enabled_default(None, wfx),
+    )
+    .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
+    if let Some(message) = note {
+        emit(on_event, ProgressEvent::PreflightWarning { message });
+    }
+    // The device this install enrolled: on an org added beside the primary,
+    // that org's row, never the primary's (the config's top-level ids).
+    let (agent_id, tenant_id) = roomlerd::enrollment::enrolled_identity(&cfg, &outcome);
+    let added_org = roomlerd::enrollment::is_added_org(&outcome);
     roomlerd::config::save(&config_path, &cfg)
         .map_err(|e| failed(ErrorCode::ConfigWrite, format!("write config.toml: {e}")))?;
+    let written_at_ms = unix_now_ms();
     emit(
         on_event,
         ProgressEvent::EnrollOk {
@@ -593,6 +700,21 @@ async fn run_install_inner(
         },
     );
     diag.ok();
+
+    // --- Step 7a: the daemon onto the new enrollment (#3116) -------------
+    // A reinstall's MSI restarted the service BEFORE the write above, so the
+    // daemon now running loaded the config from before it. It would run the
+    // old enrollment until its next start, and up to 0.4.187 its first startup
+    // save wrote that copy back over this one. So it is asked to restart onto
+    // the file, as `install.sh` restarts the Linux unit: through its own
+    // LocalAPI, the companion's Apply now. That is the internal arm, so the
+    // restart is neither counted as a crash nor, on an ephemeral device, taken
+    // for the OS stop that unenrolls it. A fresh install has no daemon on an
+    // older config. Best-effort, like the steps after it: the config is
+    // written either way.
+    if had_config {
+        restart_onto_new_enrollment(&config_path, written_at_ms, settled, on_event).await;
+    }
 
     // --- Step 7b: place the roomler-desktop GUI companion (GAP-A / P6) ---
     // The desktop EXE is NOT in the MSI (it's a standalone release
@@ -612,7 +734,17 @@ async fn run_install_inner(
     // companion step: a declined prompt or a failure leaves an enrolled
     // install, and the Done page carries the manual command.
     diag.begin(Step::Anchor);
-    let anchored = anchor_device(role, wfx, &server, &token, &agent_id, on_event).await;
+    let anchored = if added_org {
+        // Not the step at all, so the Done page offers no manual command for
+        // it: that command would move the machine's anchor to this org.
+        if let Some(reason) = added_org_anchor_note(role, &token) {
+            tracing::warn!(%reason, "FR-104: the device was not anchored");
+            emit(on_event, ProgressEvent::AnchorSkipped { reason });
+        }
+        None
+    } else {
+        anchor_device(role, wfx, &server, &token, &agent_id, on_event).await
+    };
     best_effort_outcome(diag, anchored, ErrorCode::Anchor);
 
     // --- Step 7c: start a per-user daemon now (FR-84 D6) -----------------
@@ -652,6 +784,8 @@ async fn run_install_inner(
         cli_included,
         desktop_installed,
         anchored,
+        // FR-129 B2 — the root half is macOS's; Windows has none.
+        root_half: None,
     })
 }
 
@@ -670,6 +804,23 @@ fn best_effort_outcome(diag: &Diagnostics, report: Option<bool>, code: ErrorCode
 /// for? The two machine-wide Windows roles; a per-user install has none.
 pub fn role_anchors(role: Role) -> bool {
     cfg!(target_os = "windows") && matches!(role, Role::DaemonSystem | Role::DaemonMachine)
+}
+
+/// FR-104 on an install whose enrollment was ADDED beside the machine's
+/// primary one (another org): the step does not run. The anchor is one per
+/// machine (`exec_service.rs`: one `anchor.json`, and only the anchored
+/// device's connection advertises `exec-system`), so anchoring this org's row
+/// would take SYSTEM exec away from the primary organization on another
+/// organization's token, the rule peer relays keep too (primary-org only).
+/// `Some(reason)` when the token asked for an anchor, so the person is told;
+/// `None` when the step would not have applied anyway.
+pub(crate) fn added_org_anchor_note(role: Role, token: &str) -> Option<String> {
+    (role_anchors(role) && wizard_shared::token_peek::parse_anchor_claim(token)).then(|| {
+        "this install added another organization beside the machine's primary enrollment, \
+         and the machine's one SYSTEM anchor belongs to the primary organization, so this \
+         device was not anchored"
+            .to_string()
+    })
 }
 
 /// How long the elevated anchor step may take, the administrator prompt
@@ -752,6 +903,320 @@ async fn anchor_device(
         )),
         Err(e) => skipped(format!("waiting for the anchor step: {e}")),
     }
+}
+
+/// #3116 — how long a reinstall waits for the daemon the MSI restarted to
+/// answer on its LocalAPI before it gives up restarting it: the SCM host spawns
+/// the worker, and the worker's start, its network preflight alone up to 15 s,
+/// comes before its LocalAPI.
+#[cfg(target_os = "windows")]
+const DAEMON_ANSWER_BUDGET: Duration = Duration::from_secs(90);
+
+/// #3116 — how long the daemon that answered before the write may take to
+/// answer again after it.
+#[cfg(target_os = "windows")]
+const DAEMON_REANSWER_BUDGET: Duration = Duration::from_secs(10);
+
+/// #3116 — the least time to wait for the restarted daemon to answer again:
+/// `roomler restart`'s floor.
+#[cfg(target_os = "windows")]
+const RESTART_BACK_FLOOR: Duration = Duration::from_secs(60);
+
+/// #3116 — how long one LocalAPI exchange may take. The client reads its
+/// answer with no deadline of its own, and a daemon that took the connection
+/// and never answered (wedged, or mid-shutdown) would hold the install short
+/// of its Done page forever.
+#[cfg(target_os = "windows")]
+const LOCALAPI_EXCHANGE: Duration = Duration::from_secs(15);
+
+/// #3116 — on a perMachine reinstall, wait for the daemon the MSI restarted
+/// onto `config_path` to answer on its LocalAPI. It serves that only after its
+/// startup writes, so the config read after this is the one it left. `None`
+/// when there is nothing to wait for: a fresh install, or a perUser one, whose
+/// daemon only this wizard starts (step 7c). Otherwise whether a daemon
+/// answered within [`DAEMON_ANSWER_BUDGET`].
+#[cfg(target_os = "windows")]
+async fn settle_daemon(
+    flavour: WindowsInstallFlavour,
+    config_path: &std::path::Path,
+) -> Option<bool> {
+    if !matches!(flavour, WindowsInstallFlavour::PerMachine) || !config_path.exists() {
+        return None;
+    }
+    Some(daemon_status(DAEMON_ANSWER_BUDGET).await.is_some())
+}
+
+/// The daemon roles exist only on Windows.
+#[cfg(not(target_os = "windows"))]
+async fn settle_daemon(
+    _flavour: WindowsInstallFlavour,
+    _config_path: &std::path::Path,
+) -> Option<bool> {
+    None
+}
+
+/// #3116 — restart the daemon that runs `config_path` onto the enrollment
+/// written to it at `written_at_ms`, when it loaded the file before that.
+/// `settled` is [`settle_daemon`]'s answer from before the write: a perMachine
+/// daemon that answered then is given a moment to answer again, and one that
+/// did not is not waited for twice. perUser (`None`): only a task daemon
+/// already running is restarted; with none, step 7c starts it on the new file.
+#[cfg(target_os = "windows")]
+async fn restart_onto_new_enrollment(
+    config_path: &std::path::Path,
+    written_at_ms: u64,
+    settled: Option<bool>,
+    on_event: &Channel<ProgressEvent>,
+) {
+    use roomler_localapi as localapi;
+    let skipped = |why: String| {
+        let reason = format!(
+            "{why}. The new enrollment is written, and the daemon runs on it from its next \
+             start: restart the Roomler service, or the computer"
+        );
+        tracing::warn!(%reason, "#3116: the daemon was not restarted onto the new enrollment");
+        emit(on_event, ProgressEvent::DaemonRestartSkipped { reason });
+    };
+    let budget = if settled == Some(true) {
+        DAEMON_REANSWER_BUDGET
+    } else {
+        Duration::ZERO
+    };
+    let Some(status) = daemon_status(budget).await else {
+        match settled {
+            Some(false) if cancel_requested() => {
+                skipped("the wait for the Roomler service was cancelled".to_string())
+            }
+            Some(false) => skipped(format!(
+                "the Roomler service did not answer within {} s",
+                DAEMON_ANSWER_BUDGET.as_secs()
+            )),
+            Some(true) => skipped("the Roomler service stopped answering".to_string()),
+            None => {}
+        }
+        return;
+    };
+    match needs_restart(
+        status.config_path.as_deref(),
+        status.started_at_ms,
+        config_path,
+        written_at_ms,
+    ) {
+        Err(why) => return skipped(why),
+        Ok(false) => {
+            emit(on_event, ProgressEvent::DaemonRestartOk { pid: status.pid });
+            return;
+        }
+        Ok(true) => {}
+    }
+    emit(on_event, ProgressEvent::DaemonRestartStarted);
+    let ask = async {
+        let mut client = localapi::connect().await?;
+        client
+            .restart_daemon("setup: a reinstall wrote a new enrollment")
+            .await
+    };
+    let answer = tokio::time::timeout(LOCALAPI_EXCHANGE, ask)
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no answer within {} s", LOCALAPI_EXCHANGE.as_secs()),
+            ))
+        });
+    match answer {
+        Ok(localapi::RestartAnswer::Accepted {
+            restart_by,
+            leaving,
+            restart_within_s,
+            ..
+        }) => {
+            let wait = localapi::restart_wait(restart_within_s, RESTART_BACK_FLOOR);
+            // `caller`: the Scheduled Task's daemon, which the caller starts.
+            let start = || async { roomlerd::service::start().map_err(|e| format!("{e:#}")) };
+            // Bounded from outside as well: each of its probes reads an answer
+            // with no deadline of its own.
+            let back = tokio::time::timeout(
+                wait + LOCALAPI_EXCHANGE,
+                localapi::wait_for_restart(leaving, restart_by == "caller", start, wait),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "no new daemon answered within {} s",
+                    wait.as_secs()
+                ))
+            });
+            match back {
+                Ok(pid) => emit(on_event, ProgressEvent::DaemonRestartOk { pid }),
+                Err(why) => skipped(format!("the daemon accepted the restart, but {why}")),
+            }
+        }
+        Ok(localapi::RestartAnswer::Refused(why)) => {
+            skipped(format!("the daemon declined to restart ({why})"))
+        }
+        Ok(localapi::RestartAnswer::Unsupported(_)) => {
+            skipped("the running daemon predates restarting on request".to_string())
+        }
+        Err(e) => skipped(format!("the daemon could not be asked to restart ({e})")),
+    }
+}
+
+/// #3116 — the status of the daemon answering the LocalAPI: polled until one
+/// answers or `budget` runs out (one attempt when it is zero), or the person
+/// cancels. Only the daemon's own run serves the pipe, after its startup
+/// saves, so an answer also says those are behind it.
+#[cfg(target_os = "windows")]
+async fn daemon_status(budget: Duration) -> Option<roomler_localapi::NodeStatus> {
+    let begun = std::time::Instant::now();
+    loop {
+        let ask = async {
+            let mut client = roomler_localapi::connect().await.ok()?;
+            client.status().await.ok()
+        };
+        if let Ok(Some(status)) = tokio::time::timeout(LOCALAPI_EXCHANGE, ask).await {
+            return Some(status);
+        }
+        if begun.elapsed() >= budget || crate::CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            return None;
+        }
+        tokio::time::sleep(roomler_localapi::RESTART_POLL).await;
+    }
+}
+
+/// The daemon roles exist only on Windows.
+#[cfg(not(target_os = "windows"))]
+async fn restart_onto_new_enrollment(
+    _config_path: &std::path::Path,
+    _written_at_ms: u64,
+    _settled: Option<bool>,
+    _on_event: &Channel<ProgressEvent>,
+) {
+}
+
+/// #3116 — does the daemon that answered need a restart to run the enrollment
+/// written to `ours` at `written_at_ms`? `Err` when it runs another config
+/// (a plain perMachine worker signed in as someone other than the person
+/// running Setup): restarting it would not load this one. `Ok(false)` when it
+/// started after the write, so it loaded this one. A daemon that does not say
+/// when it started is restarted; one restart too many costs a few seconds.
+#[cfg(any(target_os = "windows", test))]
+fn needs_restart(
+    theirs: Option<&str>,
+    started_at_ms: Option<u64>,
+    ours: &std::path::Path,
+    written_at_ms: u64,
+) -> Result<bool, String> {
+    if let Some(theirs) = theirs
+        && !same_config_path(theirs, ours)
+    {
+        return Err(format!(
+            "the running daemon uses {theirs}, not {}, so restarting it would not load this \
+             enrollment",
+            ours.display()
+        ));
+    }
+    Ok(started_at_ms.is_none_or(|t| t < written_at_ms))
+}
+
+/// Two spellings of one Windows path: case, separators and a verbatim `\\?\`
+/// prefix aside.
+#[cfg(any(target_os = "windows", test))]
+fn same_config_path(theirs: &str, ours: &std::path::Path) -> bool {
+    let norm = |s: &str| {
+        let s = s.replace('/', "\\");
+        s.strip_prefix(r"\\?\").unwrap_or(&s).to_ascii_lowercase()
+    };
+    norm(theirs) == norm(&ours.display().to_string())
+}
+
+/// #3116 — what to do about an install that needs an elevated wizard.
+const RUN_AS_ADMINISTRATOR: &str =
+    "Close Roomler Setup, then right-click it and choose Run as administrator.";
+
+/// #3116 — said by every refusal that comes before the enroll.
+const NOTHING_SPENT: &str = "Nothing was enrolled, and the enrollment token is still unused.";
+
+/// #3116 — the SystemContext preflight's refusal.
+pub(crate) fn needs_elevation() -> String {
+    format!(
+        "This device's background service keeps its settings in a folder that only \
+         administrators may open, and Roomler Setup is not running as administrator. \
+         {RUN_AS_ADMINISTRATOR} Nothing was installed, and no enrollment token was used."
+    )
+}
+
+/// #3116 — must a SystemContext install run from an elevated wizard on this
+/// machine? Only when the wizard could not write the machine-global config.
+/// An elevated wizard always can. A limited one can on a machine where the
+/// folder was never hardened: on a fresh install the MSI makes it, the wizard
+/// writes into it (its own `icacls` fails, and says so), and the daemon
+/// hardens it after its first healthy run. Once hardened (#3073), which is
+/// what a reinstall finds, only SYSTEM and Administrators may open it.
+pub(crate) fn system_context_needs_elevation() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        !wizard_is_elevated()
+            && !config_open_to_this_process(&roomlerd::config::machine_global_config_path())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// #3116 — may this process read the config at `path`, when one is there, and
+/// create a file in its folder, or in the folder above when that one does not
+/// exist yet? Nothing is created where neither exists (a fresh machine), and
+/// a probe file is removed at once. Only a refusal is a no: any other failure
+/// is left to the checks that run before the enroll.
+#[cfg(any(target_os = "windows", test))]
+fn config_open_to_this_process(path: &std::path::Path) -> bool {
+    if matches!(
+        roomlerd::config::read_merge_base(&path.to_path_buf()),
+        roomlerd::config::MergeBase::Denied { .. }
+    ) {
+        return false;
+    }
+    let Some(dir) = path.ancestors().skip(1).take(2).find(|d| d.is_dir()) else {
+        return true;
+    };
+    let probe = dir.join(format!(".roomler-setup-probe.{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(e) => e.kind() != std::io::ErrorKind::PermissionDenied,
+    }
+}
+
+/// #3116 — the refusal for a config path the write probe could not write.
+fn config_unwritable(path: &std::path::Path, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "{} may not be written by this process ({e}). {RUN_AS_ADMINISTRATOR} {NOTHING_SPENT}",
+            path.display()
+        )
+    } else {
+        format!(
+            "{} cannot be written ({e}). {NOTHING_SPENT}",
+            path.display()
+        )
+    }
+}
+
+/// #3116 — is the wizard elevated? Read from its own token.
+#[cfg(target_os = "windows")]
+fn wizard_is_elevated() -> bool {
+    roomlerd::win_identity::process_is_elevated()
+}
+
+/// Wall-clock milliseconds, the unit a daemon reports its start in.
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// FR-104 — the daemon roles exist only on Windows.
@@ -1019,6 +1484,31 @@ fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String
         })?;
     std::fs::create_dir_all(roomler_dir)
         .map_err(|e| format!("create {}: {e}", roomler_dir.display()))?;
+    // #3073 — the owner first. Only the owner keeps WRITE_DAC once
+    // `/inheritance:r` has removed every ACE, so a directory someone else
+    // owns (the daemon hardening it later runs as SYSTEM) must belong to
+    // Administrators before inheritance goes. Abort rather than strip it
+    // from a directory we could not take.
+    //
+    // ⚠️ Then ONE call drops inheritance and grants: icacls writes the new
+    // DACL once, so each child inherits SYSTEM and Administrators while it
+    // still holds the ACEs that let them in. Split into two calls
+    // (inheritance first), a child someone else owns comes out with an
+    // empty DACL — measured on the daemon's copy in 0.4.185, which now
+    // grants before it drops inheritance (`roomler_node_core::config`).
+    let owner = std::process::Command::new("icacls")
+        .arg(roomler_dir)
+        .arg("/setowner")
+        .arg("*S-1-5-32-544")
+        .output()
+        .map_err(|e| format!("spawn icacls: {e}"))?;
+    if !owner.status.success() {
+        return Err(format!(
+            "icacls /setowner exited {}: {}",
+            owner.status,
+            String::from_utf8_lossy(&owner.stderr).trim()
+        ));
+    }
     let output = std::process::Command::new("icacls")
         .arg(roomler_dir)
         .arg("/inheritance:r")
@@ -1375,19 +1865,24 @@ mod tests {
     fn overlay_flavour_default_lands_in_the_enrolled_config() {
         // Through the real apply path on a real config: the belt is only
         // worth having if the key actually reaches config.toml.
+        let for_flavour = |sent: AdvancedOptions, flavour| {
+            let default = overlay_enabled_default(None, flavour);
+            sent.with_overlay_default(default)
+        };
         let mut cfg = roomlerd::config::test_fixture();
         cfg.overlay_enabled = false;
-        AdvancedOptions::default()
-            .with_flavour_defaults(WindowsInstallFlavour::PerMachine)
-            .apply_to(&mut cfg)
-            .expect("apply");
+        for_flavour(
+            AdvancedOptions::default(),
+            WindowsInstallFlavour::PerMachine,
+        )
+        .apply_to(&mut cfg, false)
+        .expect("apply");
         assert!(cfg.overlay_enabled, "perMachine + no choice → overlay on");
 
         let mut cfg = roomlerd::config::test_fixture();
         cfg.overlay_enabled = false;
-        AdvancedOptions::default()
-            .with_flavour_defaults(WindowsInstallFlavour::PerUser)
-            .apply_to(&mut cfg)
+        for_flavour(AdvancedOptions::default(), WindowsInstallFlavour::PerUser)
+            .apply_to(&mut cfg, false)
             .expect("apply");
         assert!(
             !cfg.overlay_enabled,
@@ -1396,16 +1891,196 @@ mod tests {
 
         let mut cfg = roomlerd::config::test_fixture();
         cfg.overlay_enabled = false;
-        AdvancedOptions {
-            overlay_enabled: Some(false),
-            ..Default::default()
-        }
-        .with_flavour_defaults(WindowsInstallFlavour::PerMachine)
-        .apply_to(&mut cfg)
+        for_flavour(
+            AdvancedOptions {
+                overlay_enabled: Some(false),
+                ..Default::default()
+            },
+            WindowsInstallFlavour::PerMachine,
+        )
+        .apply_to(&mut cfg, false)
         .expect("apply");
         assert!(
             !cfg.overlay_enabled,
             "an explicit off on perMachine is respected"
         );
+    }
+
+    /// #2338 — with `only_touched`, a box the person never touched does not
+    /// overwrite the device's value, and a touched one does. The SPA names
+    /// the touched keys; an unknown name is ignored.
+    #[test]
+    fn only_touched_keys_land_on_an_existing_config() {
+        let mut cfg = roomlerd::config::test_fixture();
+        cfg.overlay_enabled = true;
+        cfg.auto_grant_session = false;
+        let sent = AdvancedOptions {
+            overlay_enabled: Some(false),
+            auto_grant_session: Some(true),
+            touched: vec!["auto_grant_session".into(), "no_such_key".into()],
+            ..Default::default()
+        };
+        assert_eq!(sent.touched_keys(), vec!["auto_grant_session".to_string()]);
+        sent.apply_to(&mut cfg, true).expect("apply");
+        assert!(cfg.overlay_enabled, "untouched: kept");
+        assert!(cfg.auto_grant_session, "touched: landed");
+        // Without the flag every sent value lands (a fresh config).
+        sent.apply_to(&mut cfg, false).expect("apply");
+        assert!(!cfg.overlay_enabled);
+    }
+
+    /// An older SPA sends no `touched` list: it deserialises as empty.
+    #[test]
+    fn advanced_options_without_touched_deserialise() {
+        let v: AdvancedOptions =
+            serde_json::from_str(r#"{"overlayEnabled": true}"#).expect("parse");
+        assert_eq!(v.overlay_enabled, Some(true));
+        assert!(v.touched.is_empty());
+        let v: AdvancedOptions = serde_json::from_str(
+            r#"{"overlayEnabled": true, "touched": ["overlay_enabled", "overlay_enabled"]}"#,
+        )
+        .expect("parse");
+        assert_eq!(v.touched_keys(), vec!["overlay_enabled".to_string()]);
+    }
+
+    /// An install whose enrollment was added beside the machine's primary
+    /// one is never anchored: the machine's one SYSTEM anchor stays the
+    /// primary organization's. The person is told when the token asked for an
+    /// anchor (a machine-wide role, on Windows); otherwise there is nothing to
+    /// say. Before this the step ran with the primary's device id and the new
+    /// org's token, and the server refused it as "no such device".
+    #[test]
+    fn an_added_org_is_never_anchored() {
+        // Unsigned test JWTs: only the payload is read.
+        let anchoring = "h.eyJ0b2tlbl90eXBlIjoiZW5yb2xsbWVudCIsImFuY2hvciI6dHJ1ZX0.s";
+        let plain = "h.eyJ0b2tlbl90eXBlIjoiZW5yb2xsbWVudCJ9.s";
+        assert!(wizard_shared::token_peek::parse_anchor_claim(anchoring));
+        assert_eq!(
+            added_org_anchor_note(Role::DaemonUser, anchoring),
+            None,
+            "a per-user role has no SYSTEM service"
+        );
+        assert_eq!(
+            added_org_anchor_note(Role::DaemonSystem, plain),
+            None,
+            "a plain token asked for no anchor"
+        );
+        let note = added_org_anchor_note(Role::DaemonSystem, anchoring);
+        assert_eq!(note.is_some(), cfg!(target_os = "windows"));
+        if let Some(note) = note {
+            assert!(note.contains("primary organization"), "{note}");
+        }
+    }
+
+    /// #3116 — the daemon the MSI restarted is restarted onto the new
+    /// enrollment exactly when it loaded the file before the write; one on
+    /// another config is left alone and said, since restarting it would not
+    /// load this enrollment.
+    #[test]
+    fn a_daemon_is_restarted_only_when_it_loaded_the_old_config() {
+        let ours = std::path::Path::new(r"C:\ProgramData\roomler\roomler\config.toml");
+        let written = 1_000_000;
+        assert_eq!(
+            needs_restart(
+                Some(r"C:\ProgramData\roomler\roomler\config.toml"),
+                Some(written - 1),
+                ours,
+                written
+            ),
+            Ok(true),
+            "started before the write: it runs the old enrollment"
+        );
+        assert_eq!(
+            needs_restart(
+                Some(r"c:/programdata/Roomler/roomler/CONFIG.toml"),
+                Some(written),
+                ours,
+                written
+            ),
+            Ok(false),
+            "started at or after the write: it loaded the new one (case and separators aside)"
+        );
+        assert_eq!(
+            needs_restart(None, None, ours, written),
+            Ok(true),
+            "an older daemon says neither: restarted, the cheap mistake"
+        );
+        let other = needs_restart(
+            Some(r"C:\Users\someone\AppData\Roaming\roomler\roomler\config.toml"),
+            Some(written - 1),
+            ours,
+            written,
+        )
+        .expect_err("another config");
+        assert!(other.contains("would not load this enrollment"), "{other}");
+        assert!(same_config_path(
+            r"\\?\C:\ProgramData\roomler\roomler\config.toml",
+            ours
+        ));
+    }
+
+    /// #3116 — a limited wizard may install the pre-logon service where the
+    /// config folder is open to it (a fresh machine, where nothing is created
+    /// by asking) and not where the folder refuses it (a reinstall's hardened
+    /// folder). Root writes past any mode, so as root there is nothing to see.
+    #[test]
+    fn the_config_folder_is_open_unless_it_refuses_this_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir
+            .path()
+            .join("roomler")
+            .join("roomler")
+            .join("config.toml");
+        assert!(config_open_to_this_process(&fresh));
+        assert!(
+            !dir.path().join("roomler").exists(),
+            "a fresh machine: nothing is created by asking"
+        );
+        assert!(config_open_to_this_process(&dir.path().join("config.toml")));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "the probe leaves nothing behind"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let closed = dir.path().join("closed");
+            std::fs::create_dir(&closed).unwrap();
+            let mode =
+                |m: u32| std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(m));
+            mode(0o500).unwrap();
+            let root = std::fs::File::create(closed.join("x")).is_ok();
+            let verdict = config_open_to_this_process(&closed.join("config.toml"));
+            mode(0o700).unwrap();
+            if !root {
+                assert!(!verdict, "a folder that refuses a new file is closed");
+            }
+        }
+    }
+
+    /// #3116 — every refusal before the enroll says the token was not spent,
+    /// and the ones about rights say how to get them.
+    #[test]
+    fn refusals_before_the_enroll_say_the_token_is_unused() {
+        let elevation = needs_elevation();
+        assert!(elevation.contains("Run as administrator"), "{elevation}");
+        assert!(
+            elevation.contains("no enrollment token was used"),
+            "{elevation}"
+        );
+        let path = std::path::Path::new(r"C:\ProgramData\roomler\roomler\config.toml");
+        let denied = config_unwritable(
+            path,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(denied.contains("Run as administrator"), "{denied}");
+        assert!(denied.contains("still unused"), "{denied}");
+        let full = config_unwritable(path, &std::io::Error::other("the disk is full"));
+        assert!(
+            !full.contains("administrator"),
+            "not a rights problem: {full}"
+        );
+        assert!(full.contains("still unused"), "{full}");
     }
 }

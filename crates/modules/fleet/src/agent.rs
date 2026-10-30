@@ -21,7 +21,9 @@ use roomler_core::{ApiError, extractors::auth::AuthUser};
 
 use crate::FleetState;
 
-const ENROLLMENT_TTL_SECS: u64 = 600; // 10 minutes per §11.1
+// FR-129 A1 — `pairing` mints the same token with the same life, so the
+// constant is the crate's, not this file's.
+pub(crate) const ENROLLMENT_TTL_SECS: u64 = 600; // 10 minutes per §11.1
 
 /// Require a `role::permissions` bit for `user_id` in `tenant_id`. Doubles as
 /// the membership check — `get_member_permissions` returns `Forbidden` for a
@@ -976,6 +978,10 @@ pub struct DesiredConfigView {
     pub encoder_cells_deny: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fps_deny: Option<String>,
+    /// FR-130 P1b — `on`, `off`, or `""` (a request to clear the device's
+    /// key). Absent = not managed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1001,6 +1007,7 @@ impl From<roomler_ai_remote_control::models::DesiredConfig> for DesiredConfigVie
             ssh_port: d.ssh_port,
             encoder_cells_deny: d.encoder_cells_deny,
             fps_deny: d.fps_deny,
+            color_description: d.color_description,
             updated_by: d.updated_by.map(|i| i.to_hex()),
             updated_at: d.updated_at.map(fmt_dt),
         }

@@ -128,13 +128,66 @@ icacls "C:\ProgramData\roomler"
 
 If `Users` appears, the wizard's `harden_machine_global_dir` step never
 ran (typical for an auto-update path rather than a fresh wizard
-install). Apply it manually — one command:
+install). Apply it manually, from an elevated shell, the owner FIRST:
 
 ```powershell
+icacls "C:\ProgramData\roomler" /setowner "*S-1-5-32-544"
 icacls "C:\ProgramData\roomler" /inheritance:r `
        /grant:r "*S-1-5-18:(OI)(CI)F" `
        /grant:r "*S-1-5-32-544:(OI)(CI)F"
 ```
+
+> ⚠️ **Never `/inheritance:r` a directory you do not own, or before the
+> grant** (#3073). Once inherited ACEs are gone, SYSTEM reaches an object
+> only through an ACE of its own or by owning it:
+> - A directory that belongs to someone else, for example the signed-in
+>   user because the desktop companion created it, refuses a grant made
+>   after that: `Access is denied`. It is left with an empty protected DACL
+>   that SYSTEM itself cannot open.
+> - A child someone else owns gets SYSTEM back only by inheriting it, and
+>   inheritance cannot rewrite a child that has already lost its inherited
+>   ACEs. Dropped before the grant, inheritance leaves each such child with
+>   an empty DACL. Measured on 0.4.185, which took the directory first but
+>   still granted after.
+>
+> The second command above drops inheritance and grants in one call, so
+> every child inherits SYSTEM and Administrators while it can still be
+> rewritten. The daemon's hardening (`crates/agent-core/src/config.rs:3501`,
+> steps at `:3523`) takes the directory for Administrators, grants, and only
+> then drops inheritance. The wizard's
+> (`agents/roomler-setup/src/orchestrator_agent.rs:1501`) takes it, then
+> runs that one call. Both stop if they cannot take the directory.
+
+### If SYSTEM is locked out of `C:\ProgramData\roomler\roomler` (#3073)
+
+Before the fix, a SystemContext host's first healthy run could seal this
+directory. On 0.4.185 it could still seal each child in it that the user
+owned. Nothing fails at that moment: the daemon keeps writing through the
+handles it already has. From the next restart on (usually an update), it
+can open nothing that was sealed.
+
+| What you see | Why |
+|---|---|
+| The service and worker logs stop at the restart, and `roomler logs` answers `no log file for source "daemon"` | the daemon cannot create its log in `service-logs`. A daemon with the fix logs instead into SYSTEM's own profile, and its first line names the reason (`crates/agent-core/src/logging.rs:254`) |
+| `icacls C:\ProgramData\roomler\roomler` lists **no** entries | the DACL is protected and empty (`icacls … /save` shows `D:PAI`) |
+| a leftover `config.toml.tmp.<pid>` in that directory | the config save whose hardening sealed it could not rename its file into place |
+| the directory lists SYSTEM and Administrators, but a child such as `crashes`, `service-logs` or `config.toml.prev` lists **no** entries; the log says `crash_recorder: read_dir failed … Access is denied`, or the daemon logs into SYSTEM's own profile because `service-logs` refused it | 0.4.185 hardened the directory for the first time, and dropped inheritance before it granted. Each child the user owned was left with an empty DACL. The same repair below heals it |
+
+Repair it as SYSTEM (`roomler exec <device> -- "…"`) or from an elevated
+shell. Own the top, give it back its DACL, then let each pass reach one
+level deeper:
+
+```powershell
+$d = 'C:\ProgramData\roomler\roomler'
+takeown /F $d /A
+icacls $d /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
+foreach ($i in 1..3) { takeown /F $d /A /R /D Y; icacls "$d\*" /reset /T /C /Q }
+```
+
+`takeown /R` stops at every directory it cannot list yet, which is why
+the passes repeat. Its `/D` answer is localized: `/D J` on German Windows.
+Then `roomler restart`: a running daemon only reopens its log when it
+starts.
 
 Verify a non-admin user truly cannot read it:
 

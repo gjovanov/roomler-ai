@@ -95,7 +95,7 @@ already held the stale row, so a VPN reconnect does not cure it.
 
 That case is repaired, not reported
 (`crates/tunnel-core/src/overlay/lan_repair.rs:165`, run from the network-state
-sample before the capture probe at `netstate.rs:537`):
+sample before the capture probe at `netstate.rs:650`):
 
 ```mermaid
 flowchart TD
@@ -519,31 +519,49 @@ DERP→TURN regrade (`derp_regrade_due`, break-before-make) fired on the prober
 alone. That left the follower with no carrier for 18 s, and the pair back on DERP
 by demote-follow anyway.
 ⚠️ The forget also clears a slot the move would otherwise leave behind. A peer that
-followed us abandoned the TURN leg, so the health sweep usually convicts our TURN
-carrier in the tick that promotes the probe, and on any relay death it re-requests.
+followed us abandoned the TURN leg, so a health sweep that runs before the probe is
+promoted can convict our TURN carrier, and on any relay death it re-requests.
 That request's slot outlived the promotion: a tracked peer is skipped by the stamp
 and the regrade alike, and a later build from it would have installed over the
 carrier the probe had just proved.
-⚠️ The move costs one direction up to one sweep tick (≤ 5 s, the runtime's
-`FALLBACK_TICK`), because a probe is promoted on the next tick after it latches,
-not when it latches. Which direction depends on who probes:
-- **The peer follows** (an older agent, or one whose stamp has not arrived yet):
-  the follower drops its TURN leg on the nudge, so the **prober's** outbound is
-  lost until its promotion. The follower's traffic flows through the probe
-  session meanwhile.
-- **Both ends probe** (both on 0.4.175 or later, so the stamp reaches them in the
-  same fan, the common case once a fleet has updated): each end promotes on its
-  own tick. The first to promote drops its TURN carrier
-  (`WgDevice::promote_direct_probe` replaces the peer, and the old peer's drop
-  aborts its receive task), so the **other** end's outbound is lost until it
-  promotes too.
+⚠️ The move costs one direction a short window. Promoting drops the old carrier
+(`WgDevice::promote_direct_probe` replaces the peer, and the old peer's drop aborts
+its receive task), so whatever the other end still sends over TURN is lost until it
+moves too. **A probe is promoted the moment its handshake latches** (#2952): the
+latch on the receive path wakes the runtime (`PeerStats::latch_wake`, armed on every
+probe by `WgDevice::insert_probe`), which runs the same post-promote steps as the
+fallback tick. The tick (`FALLBACK_TICK`, 5 s) still sweeps, for deadlines and as
+the floor. Which direction pays depends on who probes:
+- **Both ends probe:** the two latches are about a round trip apart, and so is the
+  loss, on the later end's outbound.
+- **The peer follows:** the follower drops its TURN leg on the nudge, so the
+  **prober's** outbound is lost until its probe latches: the 500 ms the initiation
+  waits, plus a round trip. The follower's traffic flows through the probe session
+  meanwhile. An older agent always follows. Two agents with #2952 can land here too:
+  the stamp reaches both in one fan, and if one end's nudge arrives before the other
+  end has acted on its own stamp, that end follows instead of probing. Which case a
+  pair gets is that race.
+- **One end on 0.4.175–0.4.177**, which still promotes on its tick: both probe,
+  and the gap is however far that end's tick falls behind the latch, up to 5 s.
 
-Field 2026-10-26, on the published 0.4.175, both ends probing: the stamp reached
-both in the same millisecond and they promoted 2.6 s apart (`probe_ms` 1641 and
-4274). A ping every 200 ms across the move lost exactly that window, once.
-Promoting on the latch instead of the tick would shrink the both-probe case to
-about one round trip, and the follower case to the 500 ms the initiation waits
-plus one (#2952).
+Field, on two nodes holding a live TURN pair, with a ping across the move (every 200 ms
+on 2026-10-26, every 50 ms on 2026-10-27):
+
+| Build | Case | Promotions | Lost |
+|---|---|---|---|
+| published 0.4.175 (2026-10-26) | both probe, on their ticks | 2.6 s apart (`probe_ms` 1641, 4274) | 2.6 s |
+| published 0.4.177 (2026-10-27) | both probe, on their ticks | 0.73 s apart (916, 1644) | 0.70 s |
+| a tick-promoting prober (#2820 case C, 2026-10-26) | the peer follows | the prober's next tick (`probe_ms` 5002) | ≈ 5 s, from the logs (no ping that run) |
+| #2952 (2026-10-27) | both probe, at the latch (`via="latch"`) | 1.4 ms apart (503, 503) | **nothing** |
+| #2952 (2026-10-27) | one end's nudge won the race; the peer follows | the prober at its latch (504) | **0.57 s** |
+
+Sending the initiation sooner (or again, early) would shrink the follower case
+toward a round trip as well. The 500 ms exists so a follower's DERP carrier is up
+before the initiation arrives; a dropped initiation waits out boringtun's 5 s
+retransmit.
+
+The same applies to every make-before-break upgrade: a relay → direct probe was
+also promoted on the tick, and now promotes at its latch.
 
 ## Worker co-location — one pick, everywhere (invariant I6)
 

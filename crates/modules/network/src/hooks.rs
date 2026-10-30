@@ -12,6 +12,7 @@
 use async_trait::async_trait;
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::models::NodeRef;
+use roomler_ai_remote_control::signaling::CapVectorWire;
 use roomler_core::hooks::{
     FleetLifecycle, ReleasedLease, RenamePropagation, TenantArchived, TenantLifecycle,
 };
@@ -100,6 +101,43 @@ impl FleetLifecycle for NetworkHooks {
             None
         }
     }
+
+    /// FR-128 — both devices' far-TURN reach, from each live overlay node's
+    /// last netcheck behind the same freshness gate every consumer uses. A
+    /// device with no live node, or no fresh vector, is not measured; a
+    /// lookup that fails reads the same way, never as "dead".
+    async fn far_turn_udp(&self, tenant_id: ObjectId, a: ObjectId, b: ObjectId) -> Option<bool> {
+        let mut ends = Vec::with_capacity(2);
+        for agent_id in [a, b] {
+            let node = self
+                .state
+                .overlay_nodes
+                .find_live_by_agent(tenant_id, agent_id)
+                .await
+                .ok()
+                .flatten();
+            ends.push(node.as_ref().and_then(crate::overlay::fresh_caps));
+        }
+        far_turn_verdict(ends[0].as_ref(), ends[1].as_ref())
+    }
+}
+
+/// FR-128 — one device reaches the far TURN over UDP when its netcheck found
+/// a public mapping (`stun_udp`) and did not measure the relay band blocked.
+/// `relay_band_udp: None` is "not measured", never "blocked": netcheck leaves
+/// it unmeasured whenever it has no credentials or no mapping to permit.
+fn reaches_far_turn(caps: &CapVectorWire) -> bool {
+    caps.stun_udp && caps.relay_band_udp != Some(false)
+}
+
+/// FR-128 — the pair's verdict: `Some(false)` when either end measured the
+/// far TURN dead, `Some(true)` when both measured it alive, else `None`.
+fn far_turn_verdict(a: Option<&CapVectorWire>, b: Option<&CapVectorWire>) -> Option<bool> {
+    match (a.map(reaches_far_turn), b.map(reaches_far_turn)) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
 }
 
 /// Network's side of the tenant cascade (P7b, from the host's archive
@@ -167,5 +205,45 @@ impl TenantLifecycle for NetworkTenantHooks {
             nodes_released,
             block_quarantined,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps(stun_udp: bool, relay_band_udp: Option<bool>) -> CapVectorWire {
+        CapVectorWire {
+            stun_udp,
+            relay_band_udp,
+            ..Default::default()
+        }
+    }
+
+    /// FR-128 — the far-TURN verdict for a pair. One end measured dead
+    /// decides `false` whatever the other says; both alive is `true`; any end
+    /// not measured, with the other alive, is `None`, which the agent reads
+    /// as "it works". An unmeasured relay band is not a blocked one.
+    #[test]
+    fn far_turn_verdict_is_dead_if_either_end_measured_it_dead() {
+        let alive = caps(true, Some(true));
+        let unmeasured_band = caps(true, None);
+        let band_blocked = caps(true, Some(false));
+        let no_udp = caps(false, None);
+
+        assert_eq!(far_turn_verdict(Some(&alive), Some(&alive)), Some(true));
+        assert_eq!(
+            far_turn_verdict(Some(&alive), Some(&unmeasured_band)),
+            Some(true),
+            "a band netcheck could not measure is not a blocked band"
+        );
+        assert_eq!(
+            far_turn_verdict(Some(&alive), Some(&band_blocked)),
+            Some(false)
+        );
+        assert_eq!(far_turn_verdict(Some(&no_udp), Some(&alive)), Some(false));
+        assert_eq!(far_turn_verdict(None, Some(&band_blocked)), Some(false));
+        assert_eq!(far_turn_verdict(Some(&alive), None), None);
+        assert_eq!(far_turn_verdict(None, None), None);
     }
 }

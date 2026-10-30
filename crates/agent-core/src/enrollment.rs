@@ -441,6 +441,9 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         fps_high: None,
         encoder_cells_deny: None,
         fps_deny: None,
+        zero_copy: None,
+        color_description: None,
+        zero_copy_deny: None,
         nvenc_split: None,
         vaapi_device: None,
         d3d12_adapter: None,
@@ -707,6 +710,136 @@ pub fn preserve_operator_config(fresh: AgentConfig, existing: AgentConfig) -> Ag
     }
 }
 
+/// The device row an enrollment replaced ([`retire_key_of_previous_row`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviousRow {
+    /// The previous row's agent id (hex), for the operator to find it.
+    pub agent_id: String,
+    /// `primary`, or the `[[orgs]]` label the enrollment refreshed.
+    pub org_label: String,
+}
+
+/// FR-129 B1 — an enrollment of a (server, org) this config already holds
+/// that the server answered with ANOTHER device row.
+///
+/// The server keys a row on `(tenant, machine_id)`, and the machine id is
+/// derived from the host name ([`crate::machine::derive_machine_id`]) whenever
+/// the enrolling process cannot read the config it is about to replace — the
+/// setup wizard enrolling a system scope as the person, beside a root config
+/// only root can read. So a renamed host, or a VM cloned together with its
+/// config, enrolls as a NEW device, and the fold keeps the existing WireGuard
+/// key: a key the PREVIOUS row still claims. The new row's overlay join is then
+/// refused (`wg_key_taken_by_other` fails closed, and tells the device
+/// nothing), and its mesh never comes up.
+///
+/// This retires that key from the folded config — the daemon mints a fresh one
+/// at its next start, as on a first install (`overlay_wg_key_epoch` back to 0,
+/// the first key of the new row) — and returns the previous row for the caller
+/// to name. It does nothing when the row is the same one (an ordinary
+/// reinstall keeps its key: no rotation) and for a fresh config or another
+/// org. A refreshed secondary org gets the same treatment for its own key.
+/// Both mints are the daemon's own: the primary's at its first overlay-enabled
+/// start, a secondary's when its overlay is on (`roomlerd`'s
+/// `org_join::heal_org_keys`). Before that heal a secondary was minted only
+/// when it was appended, so a key retired here left that org off its mesh.
+///
+/// It never folds into the previous row instead. That would need the previous
+/// machine id, and on a cloned VM the previous row is the ORIGINAL machine's,
+/// still in use: taking it over would make two machines one device.
+pub fn retire_key_of_previous_row(
+    previous: Option<&AgentConfig>,
+    merged: &mut AgentConfig,
+    outcome: &EnrollOutcome,
+) -> Option<PreviousRow> {
+    let previous = previous?;
+    match outcome {
+        EnrollOutcome::RefreshedPrimary | EnrollOutcome::ReplacedPrimary => {
+            // A rebind to ANOTHER org moves the key to another network, where
+            // the previous row claims nothing: only the same org collides.
+            let same_org = previous.is_primary_identity(&merged.server_url, &merged.tenant_id);
+            if !same_org
+                || previous.agent_id.trim().is_empty()
+                || previous.agent_id == merged.agent_id
+            {
+                return None;
+            }
+            merged.overlay_wg_secret_key = None;
+            merged.overlay_wg_key_epoch = 0;
+            Some(PreviousRow {
+                agent_id: previous.agent_id.clone(),
+                org_label: crate::config::PRIMARY_ORG_LABEL.to_string(),
+            })
+        }
+        EnrollOutcome::RefreshedOrg { label } => {
+            let before = previous.orgs.iter().find(|o| &o.label == label)?;
+            let after = merged.orgs.iter_mut().find(|o| &o.label == label)?;
+            if before.agent_id.trim().is_empty() || before.agent_id == after.agent_id {
+                return None;
+            }
+            after.overlay_wg_secret_key = None;
+            after.overlay_wg_key_epoch = 0;
+            Some(PreviousRow {
+                agent_id: before.agent_id.clone(),
+                org_label: label.clone(),
+            })
+        }
+        EnrollOutcome::FreshPrimary | EnrollOutcome::AppendedOrg { .. } => None,
+    }
+}
+
+/// What to tell the operator when [`retire_key_of_previous_row`] retired a key:
+/// a new device row exists, which one is the old one, and what to do about it
+/// for each of the two ways this happens. One wording for every caller.
+pub fn describe_previous_row(previous: &PreviousRow, new_agent_id: &str) -> String {
+    let org = if previous.org_label == crate::config::PRIMARY_ORG_LABEL {
+        "this organization".to_string()
+    } else {
+        format!("the organization enrolled as \"{}\"", previous.org_label)
+    };
+    // FR-129 B2: a Mac's root half takes its fingerprint from the hardware,
+    // so for it the cause is a clone, or a root half first enrolled under the
+    // host-name fingerprint (from a terminal) and now under the hardware's.
+    format!(
+        "this machine was enrolled in {org} as device {old}, and the server has now enrolled it \
+         as a NEW device, {new}: the machine's fingerprint changed since then (a renamed \
+         computer, a VM cloned together with its config, or a Mac's private-network half that \
+         now takes its fingerprint from the hardware instead of the host name). The new device \
+         gets a private-network key of its own, and the device {old} stays in the Devices list, \
+         offline. If it was this machine before the change, remove it there; if it is the \
+         machine this one was cloned from, leave it.",
+        old = previous.agent_id,
+        new = new_agent_id,
+    )
+}
+
+/// The device an enrollment landed on, `(agent_id, tenant_id)`: the primary's
+/// for a fresh, refreshed or replaced primary, the org entry's for an org
+/// refreshed or appended beside it. A caller that reports or acts on "the
+/// device just enrolled" reads this, never the folded config's top-level ids:
+/// those are the PRIMARY's, and an install into another org would otherwise
+/// name — and anchor — a device of the wrong org.
+pub fn enrolled_identity(cfg: &AgentConfig, outcome: &EnrollOutcome) -> (String, String) {
+    match outcome {
+        EnrollOutcome::RefreshedOrg { label } | EnrollOutcome::AppendedOrg { label } => cfg
+            .find_org(label)
+            .map(|o| (o.agent_id.clone(), o.tenant_id.clone()))
+            .unwrap_or_else(|| (cfg.agent_id.clone(), cfg.tenant_id.clone())),
+        EnrollOutcome::FreshPrimary
+        | EnrollOutcome::RefreshedPrimary
+        | EnrollOutcome::ReplacedPrimary => (cfg.agent_id.clone(), cfg.tenant_id.clone()),
+    }
+}
+
+/// Did the enrollment land on an org BESIDE the primary (refreshed or
+/// appended)? Then everything host-global stays the primary's: its options,
+/// its exec anchor.
+pub fn is_added_org(outcome: &EnrollOutcome) -> bool {
+    matches!(
+        outcome,
+        EnrollOutcome::RefreshedOrg { .. } | EnrollOutcome::AppendedOrg { .. }
+    )
+}
+
 /// FR-99 decision 3 — does this enrollment write a fresh Windows service
 /// install's defaults ([`apply_service_install_defaults`])? Only a fresh
 /// primary written to the machine-global config, the one the SystemContext
@@ -744,7 +877,10 @@ pub fn apply_service_install_defaults(cfg: &mut AgentConfig) {
 /// loopback (the integration `TestApp` binds `http://127.0.0.1:<port>`). Forcing
 /// TLS there just breaks the enroll POST with a `wrong version number` SSL error.
 /// A remote host (the production case) is still upgraded.
-fn normalize_server_url(raw: &str) -> String {
+///
+/// `pub(crate)`: FR-129's pairing client ([`crate::pairing`]) posts the
+/// pairing's secret the same way, and must apply the same rule.
+pub(crate) fn normalize_server_url(raw: &str) -> String {
     // FR-101 P1b — the same rule every reader of a server URL applies now
     // (`roomler_ai_remote_control::server_url`), which reads the URL as
     // reqwest will: `HTTP:roomler.ai` is plaintext too. No plaintext escape
@@ -759,7 +895,9 @@ fn normalize_server_url(raw: &str) -> String {
     secured.url.trim_end_matches('/').to_string()
 }
 
-fn detect_os() -> OsKind {
+/// `pub(crate)`: the pairing start names the OS with the same spelling the
+/// enroll does ([`crate::pairing::StartRequest`]).
+pub(crate) fn detect_os() -> OsKind {
     match std::env::consts::OS {
         "linux" => OsKind::Linux,
         "macos" => OsKind::Macos,
@@ -1127,6 +1265,172 @@ mod tests {
         assert_eq!(cfg.orgs[0].agent_id, "aid-t-acme");
         // The primary identity is untouched.
         assert_eq!(cfg.agent_token, "tok");
+    }
+
+    /// FR-129 B1 — a refresh of the same org that the server answered with
+    /// ANOTHER device row (a renamed host or a cloned VM: the machine id was
+    /// derived anew) must not carry the previous row's WireGuard key, which
+    /// that row still claims and the overlay join refuses to share. Every
+    /// other operator-owned key stays. The same row keeps its key, as every
+    /// reinstall does.
+    #[test]
+    fn a_new_row_for_the_same_org_retires_the_previous_rows_key() {
+        let mut existing = crate::config::test_fixture(); // example.invalid / tid / aid / mid
+        existing.overlay_enabled = true;
+        existing.overlay_wg_secret_key = Some("OLD-WG-KEY".into());
+        existing.overlay_wg_key_epoch = 3;
+        existing.advertise_routes = vec!["10.9.0.0/16".into()];
+
+        // The same row (the machine id was read back): the key stays.
+        let mut same = crate::config::test_fixture();
+        same.agent_token = "NEW-TOK".into();
+        let (mut cfg, outcome) =
+            apply_enrollment(Some(existing.clone()), same, None, false).unwrap();
+        assert_eq!(outcome, EnrollOutcome::RefreshedPrimary);
+        assert_eq!(
+            retire_key_of_previous_row(Some(&existing), &mut cfg, &outcome),
+            None
+        );
+        assert_eq!(cfg.overlay_wg_secret_key.as_deref(), Some("OLD-WG-KEY"));
+        assert_eq!(cfg.overlay_wg_key_epoch, 3);
+
+        // Another row (a machine id derived from a new host name).
+        let mut renamed = crate::config::test_fixture();
+        renamed.agent_token = "NEW-TOK".into();
+        renamed.agent_id = "aid-new".into();
+        renamed.machine_id = "mid-new".into();
+        let (mut cfg, outcome) =
+            apply_enrollment(Some(existing.clone()), renamed, None, false).unwrap();
+        assert_eq!(outcome, EnrollOutcome::RefreshedPrimary);
+        let previous = retire_key_of_previous_row(Some(&existing), &mut cfg, &outcome)
+            .expect("the server made a new row");
+        assert_eq!(
+            previous,
+            PreviousRow {
+                agent_id: "aid".into(),
+                org_label: "primary".into()
+            }
+        );
+        assert_eq!(cfg.overlay_wg_secret_key, None, "minted anew at start");
+        assert_eq!(cfg.overlay_wg_key_epoch, 0, "the new row's first key");
+        assert_eq!(cfg.agent_id, "aid-new");
+        assert_eq!(cfg.machine_id, "mid-new");
+        assert!(cfg.overlay_enabled, "the operator state stays");
+        assert_eq!(cfg.advertise_routes, vec!["10.9.0.0/16"]);
+        let said = describe_previous_row(&previous, &cfg.agent_id);
+        assert!(
+            said.contains("device aid,")
+                && said.contains("aid-new")
+                && said.contains("cloned")
+                && said.contains("remove it"),
+            "{said}"
+        );
+
+        // A fresh config, or another org appended beside: nothing to retire.
+        let (mut cfg, outcome) =
+            apply_enrollment(None, fresh_for("https://a.invalid", "t1", "x"), None, false).unwrap();
+        assert_eq!(retire_key_of_previous_row(None, &mut cfg, &outcome), None);
+        let other = fresh_for("https://b.invalid", "t2", "T2");
+        let (mut cfg, outcome) =
+            apply_enrollment(Some(existing.clone()), other, None, false).unwrap();
+        assert!(matches!(outcome, EnrollOutcome::AppendedOrg { .. }));
+        assert_eq!(
+            retire_key_of_previous_row(Some(&existing), &mut cfg, &outcome),
+            None
+        );
+        assert_eq!(cfg.overlay_wg_secret_key.as_deref(), Some("OLD-WG-KEY"));
+    }
+
+    /// FR-129 B1 — the device an enrollment landed on. For the primary
+    /// outcomes it is the primary's; for an org appended or refreshed beside
+    /// it, the org entry's — never the folded config's top-level ids, which
+    /// stay the primary's. Before this the setup wizard reported an install
+    /// into org B with org A's device and org, and passed org A's device to
+    /// the FR-104 anchor step with org B's token.
+    #[test]
+    fn the_enrolled_identity_is_the_orgs_when_it_lands_beside_the_primary() {
+        let existing = crate::config::test_fixture(); // example.invalid / tid / aid
+
+        let (cfg, outcome) = apply_enrollment(
+            Some(existing.clone()),
+            fresh_for("https://b.invalid", "t2", "T2"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(outcome, EnrollOutcome::AppendedOrg { .. }));
+        assert!(is_added_org(&outcome));
+        assert_eq!(cfg.agent_id, "aid", "the primary stays the primary");
+        assert_eq!(
+            enrolled_identity(&cfg, &outcome),
+            ("aid-t2".to_string(), "t2".to_string())
+        );
+
+        // That org refreshed: still its own row, not the primary's.
+        let (cfg, outcome) = apply_enrollment(
+            Some(cfg),
+            fresh_for("https://b.invalid", "t2", "T2-again"),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(outcome, EnrollOutcome::RefreshedOrg { .. }));
+        assert!(is_added_org(&outcome));
+        assert_eq!(
+            enrolled_identity(&cfg, &outcome),
+            ("aid-t2".to_string(), "t2".to_string())
+        );
+
+        // The primary refreshed, and a fresh config: the top-level ids.
+        let mut same = crate::config::test_fixture();
+        same.agent_token = "NEW".into();
+        let (cfg, outcome) = apply_enrollment(Some(existing), same, None, false).unwrap();
+        assert!(!is_added_org(&outcome));
+        assert_eq!(
+            enrolled_identity(&cfg, &outcome),
+            ("aid".to_string(), "tid".to_string())
+        );
+        let (cfg, outcome) =
+            apply_enrollment(None, fresh_for("https://a.invalid", "t1", "x"), None, false).unwrap();
+        assert!(!is_added_org(&outcome));
+        assert_eq!(
+            enrolled_identity(&cfg, &outcome),
+            ("aid-t1".to_string(), "t1".to_string())
+        );
+    }
+
+    /// FR-129 B1 — the same for a refreshed secondary org: its own key goes,
+    /// the primary's stays.
+    #[test]
+    fn a_new_row_for_a_secondary_org_retires_that_orgs_key() {
+        let mut existing = crate::config::test_fixture();
+        existing.overlay_wg_secret_key = Some("PRIMARY-KEY".into());
+        let mut acme = org("acme", "https://b.invalid", "t-acme"); // aid-acme
+        acme.overlay_wg_secret_key = Some("ACME-KEY".into());
+        acme.overlay_wg_key_epoch = 2;
+        existing.orgs = vec![acme];
+        let fresh = fresh_for("https://b.invalid", "t-acme", "ROTATED"); // aid-t-acme
+        let (mut cfg, outcome) =
+            apply_enrollment(Some(existing.clone()), fresh, None, false).unwrap();
+        assert_eq!(
+            outcome,
+            EnrollOutcome::RefreshedOrg {
+                label: "acme".into()
+            }
+        );
+        let previous = retire_key_of_previous_row(Some(&existing), &mut cfg, &outcome)
+            .expect("a new row in that org");
+        assert_eq!(
+            previous,
+            PreviousRow {
+                agent_id: "aid-acme".into(),
+                org_label: "acme".into()
+            }
+        );
+        assert_eq!(cfg.orgs[0].overlay_wg_secret_key, None);
+        assert_eq!(cfg.orgs[0].overlay_wg_key_epoch, 0);
+        assert_eq!(cfg.overlay_wg_secret_key.as_deref(), Some("PRIMARY-KEY"));
+        assert!(describe_previous_row(&previous, "aid-t-acme").contains("\"acme\""));
     }
 
     #[test]

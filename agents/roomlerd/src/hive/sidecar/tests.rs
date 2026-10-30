@@ -237,9 +237,11 @@ async fn a_session_reaches_the_provider_only_through_the_sidecar_with_its_own_to
     let (mut r, _count) = sidecar_rig(&p, OFFLINE_GRACE).await;
     let (sid, base, token) = started(&mut r).await;
 
+    // P8-2c-3 — this session's own port is the whole address now: no
+    // `/s/<sid>` to route within a shared one.
     assert!(
-        base.starts_with("http://127.0.0.1:") && base.ends_with(&format!("/s/{}", sid.to_hex())),
-        "the harness points at the loopback sidecar: {base}"
+        base.starts_with("http://127.0.0.1:") && !base.contains("/s/"),
+        "the harness points at the loopback sidecar, this session's own port: {base}"
     );
     assert!(token.starts_with("hive-"), "a session token: {token}");
     assert_ne!(
@@ -326,18 +328,31 @@ async fn a_call_that_is_not_this_live_session_s_never_reaches_the_provider() {
     );
 
     // Stopped: its token is dead with it (once the session has ended — until
-    // then it is still the session's).
+    // then it is still the session's). P8-2c-3 — its own sidecar closes
+    // with it too, so the terminal state is either an HTTP 401 (the task
+    // ended its run but has not yet dropped the listener) or the
+    // connection refused outright (it has): either answers "this session
+    // no longer serves this token", which is what this asserts.
     r.sup.stop(sid, 1, "owner".into());
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
         p.go.notify_one();
-        let resp = call(&url, Some(&token)).await;
-        if resp.status().as_u16() == 401 {
-            let (_, kind) = error_kind(resp).await;
-            assert_eq!(kind, "authentication_error");
-            break;
+        let attempt = reqwest::Client::new()
+            .post(&url)
+            .header("anthropic-version", "2023-06-01")
+            .header("x-api-key", &token)
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await;
+        match attempt {
+            Err(_) => break,
+            Ok(resp) if resp.status().as_u16() == 401 => {
+                let (_, kind) = error_kind(resp).await;
+                assert_eq!(kind, "authentication_error");
+                break;
+            }
+            Ok(resp) => drop(resp),
         }
-        drop(resp);
         assert!(
             tokio::time::Instant::now() < deadline,
             "the token outlived its session"
@@ -407,8 +422,12 @@ while :; do sleep 1; done
 /// P2k-7 — AC4's stale-fence half, captured at the provider: a run demoted
 /// to a newer fence makes no model call. Its harness does not listen, so the
 /// run holds on through the stop grace with its token still live, and the
-/// fence alone refuses the call before anything leaves the host. Once the run
-/// has ended, its token is gone too.
+/// fence alone refuses the call before anything leaves the host. P8-2c-3 —
+/// once the run has ended, its OWN sidecar is gone with it (no longer the
+/// one shared listener the whole daemon used to keep forever), so a stale
+/// call past that point finds nothing listening at all: a stronger
+/// guarantee than the `authentication_error` a lingering listener answered
+/// with before this step.
 #[tokio::test]
 async fn a_demoted_run_makes_no_model_call() {
     let p = provider().await;
@@ -443,11 +462,19 @@ async fn a_demoted_run_makes_no_model_call() {
     assert!(r.sup.holds_live(sid), "refused while the run still held on");
 
     assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Ended);
-    let (status, kind) = error_kind(call(&url, Some(&token)).await).await;
-    assert_eq!(
-        (status, kind.as_str()),
-        (401, "authentication_error"),
-        "and once it has ended"
+    // P8-2c-3 — this run's own sidecar closed with it: a stale call now
+    // finds nothing listening, rather than an `authentication_error` from
+    // a lingering shared one.
+    let refused = reqwest::Client::new()
+        .post(&url)
+        .header("anthropic-version", "2023-06-01")
+        .header("x-api-key", &token)
+        .body(r#"{"model":"m","messages":[]}"#)
+        .send()
+        .await;
+    assert!(
+        refused.is_err(),
+        "the run's own sidecar is gone with it: {refused:?}"
     );
     assert_eq!(
         p.hits.load(Ordering::SeqCst),
@@ -944,16 +971,6 @@ fn revoking_one_run_s_token_leaves_another_run_s_alone() {
         Some((session, 1)),
         "the run that started as the other ended keeps its token"
     );
-}
-
-#[test]
-fn a_session_path_splits_into_its_id_and_the_provider_path() {
-    assert_eq!(
-        split_session("/s/abc/v1/messages"),
-        Some(("abc", "/v1/messages"))
-    );
-    assert_eq!(split_session("/s/abc"), Some(("abc", "/")));
-    assert_eq!(split_session("/v1/messages"), None);
 }
 
 /// FR-90 P2e-6a — the server waits a primary out for `UNREACHABLE_SECS`

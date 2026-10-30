@@ -32,6 +32,7 @@ use dashmap::DashMap;
 use roomler_ai_config::Settings;
 use roomler_ai_db::indexes::{
     IndexOp, IndexSet, index, index_ttl, index_unique, index_unique_partial,
+    index_unique_partial_named,
 };
 use roomler_ai_mod_fleet::FleetState;
 use roomler_ai_remote_control::signaling::ServerMsg;
@@ -369,8 +370,22 @@ impl Module for NetworkState {
                     for sid in dead {
                         tunnel_tokens.remove(&sid);
                     }
-                    for entry in tunnel_tokens.iter() {
-                        let (sid, token) = (*entry.key(), entry.value().clone());
+                    // The KEYS, snapshotted; never the live iterator: it holds
+                    // its shard's guard across the Redis await below, and a
+                    // session opening or closing meanwhile (a write to that
+                    // shard) would park a tokio worker THREAD for the round
+                    // trip. Two of them on a 2-CPU pod and the runtime stops
+                    // (FR-127 P1.1; `clippy.toml` at the root holds the rule).
+                    let sessions: Vec<ObjectId> =
+                        tunnel_tokens.iter().map(|entry| *entry.key()).collect();
+                    for sid in sessions {
+                        // Read live, right before its refresh, as the iterator
+                        // read it: `refresh_if_mine` re-sets a missing key, so
+                        // a token released since the snapshot would resurrect
+                        // its record.
+                        let Some(token) = tunnel_tokens.get(&sid).map(|t| t.value().clone()) else {
+                            continue;
+                        };
                         let key = roomler_core::cluster::directory::tunnel_key(&sid.to_hex());
                         if let Err(e) = dir.refresh_if_mine(&key, &token, 90).await {
                             tracing::debug!(session = %sid, %e, "tunnel directory refresh failed");
@@ -389,8 +404,15 @@ impl Module for NetworkState {
                     for k in dead {
                         derp_tokens.remove(&k);
                     }
-                    for entry in derp_tokens.iter() {
-                        let ((net, pk), token) = (*entry.key(), entry.value().clone());
+                    // The keys, snapshotted, and each token read live, for the
+                    // reasons the tunnel loop above gives.
+                    let registrations: Vec<derp_types::DerpKey> =
+                        derp_tokens.iter().map(|entry| *entry.key()).collect();
+                    for (net, pk) in registrations {
+                        let Some(token) = derp_tokens.get(&(net, pk)).map(|t| t.value().clone())
+                        else {
+                            continue;
+                        };
                         let key = roomler_core::cluster::directory::derp_key(
                             &net.to_hex(),
                             &derp_cluster::pk_hex(&pk),
@@ -625,8 +647,6 @@ impl Module for NetworkState {
             // The allocator's "highest end" probe — one indexed sort+limit.
             index(bson::doc! { "end_slot": -1 }),
             index(bson::doc! { "tenant_id": 1 }),
-            // Multi-block reads a network's blocks in allocation order.
-            index(bson::doc! { "network_id": 1, "seq": 1 }),
         ];
         let mut overlay_block_ops = Vec::new();
         if multi_block {
@@ -642,7 +662,32 @@ impl Module for NetworkState {
                 index: "network_id_1",
                 why: "multi-block schema — one-block-per-network guard removed",
             });
+            // FR-68 AC4 — what replaces that guard. A network's address
+            // space is its assigned blocks concatenated in `seq` order, so
+            // two ASSIGNED blocks at one position would silently re-point
+            // every ordinal above them. Single-block never needed this (one
+            // assigned block per network, so one position); multi-block
+            // makes it the structural half of the guarantee: a concurrent
+            // carve or grow of the same network collides on this index, and
+            // the allocator's re-read of the position returns the winner's
+            // row instead of inserting a twin. The plain read index it
+            // replaces has the same key pattern, so it is dropped first —
+            // under a DISTINCT name below, or the drop would find the
+            // replacement on every later boot.
+            overlay_block_ops.push(IndexOp::DropIndexIfPresent {
+                index: "network_id_1_seq_1",
+                why: "multi-block schema — the plain (network_id, seq) read index is \
+                      replaced by the assigned-unique position guard",
+            });
+            overlay_block_indexes.push(index_unique_partial_named(
+                bson::doc! { "network_id": 1, "seq": 1 },
+                bson::doc! { "state": "assigned" },
+                "network_id_1_seq_1_assigned",
+            ));
         } else {
+            // Multi-block reads a network's blocks in allocation order; under
+            // single-block there is one, so this is a plain read index.
+            overlay_block_indexes.push(index(bson::doc! { "network_id": 1, "seq": 1 }));
             overlay_block_indexes.push(index_unique_partial(
                 bson::doc! { "network_id": 1 },
                 bson::doc! { "state": "assigned" },

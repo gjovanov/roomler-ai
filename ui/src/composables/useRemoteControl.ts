@@ -54,6 +54,7 @@ import {
   DEFAULT_RCAS_SHARPNESS,
   type SharpenMode,
 } from '@/workers/rc-fsr-render'
+import { colorSpaceLabel } from '@/workers/rc-decoder-config'
 
 /**
  * Remote-control session state machine driven from the controller browser.
@@ -3786,11 +3787,71 @@ export const LOCAL_RELAY_PROBE_PORT = 47989
  *  FALLBACK band (`41989+`) covers hosts whose Hyper-V/WSL/HNS
  *  reservations swallow the whole primary band (`47989+` sits at the
  *  edge of that reservation zone; the fallback lives well below it).
- *  First match wins. MUST match the agent's `PROBE_PORT` +
+ *  Every answer counts, not the first (FR-121 P3b, #2774: each agent
+ *  answers on its own port with its own relay, and their overlay paths
+ *  differ). MUST match the agent's `PROBE_PORT` +
  *  `PROBE_PORT_FALLBACK` + `PROBE_PORT_BAND` in `rc_local_turn.rs`. */
 export const LOCAL_RELAY_PROBE_PORTS = [
   47989, 47990, 47991, 47992, 47993, 41989, 41990, 41991, 41992, 41993,
 ]
+
+/** FR-121 P3b (#2774) — the most relays one session carries. One computer can
+ *  run several enrolled agents (Windows and WSL, a container), each with its
+ *  own relay and its own overlay path to the target: a WSL agent can sit on
+ *  DERP while the Windows one is direct, and the first to answer is no better
+ *  than the rest. Every one goes in, and ICE checks a pair through each
+ *  (Chrome ranks them in the order given: FR-121 open decision 4). MUST match
+ *  `LOCAL_RELAYS_MAX` in `crates/remote_control/src/signaling.rs`, where the
+ *  server stops. */
+export const LOCAL_RELAYS_MAX = 4
+
+/** FR-121 P3b (#2774) — the probe's answers, in port order: the failures
+ *  dropped, one per relay (the first of each `overlay_ip` + `turn_port`), at
+ *  most `LOCAL_RELAYS_MAX`. Pure + exported for tests. */
+export function distinctLocalRelays(
+  answers: readonly (LocalRelayDescriptor | null)[],
+): LocalRelayDescriptor[] {
+  const kept: LocalRelayDescriptor[] = []
+  for (const d of answers) {
+    if (!d || kept.length === LOCAL_RELAYS_MAX) continue
+    if (!kept.some((k) => k.turn_port === d.turn_port && k.overlay_ip === d.overlay_ip)) {
+      kept.push(d)
+    }
+  }
+  return kept
+}
+
+/** Probe every port of the band at once for the loopback TURN of each enrolled
+ *  agent on this computer. `[]` on any failure (no local agent, feature off,
+ *  the local-network permission refused, non-2xx, timeout), all graceful, so a
+ *  host WITHOUT a local agent silently keeps the normal coturn path. Loopback
+ *  fetch is exempt from mixed-content blocking; the agent's endpoint must
+ *  answer the PNA CORS preflight for HTTPS to localhost on newer Chrome.
+ *  FR-121 P3b (#2774) — every agent's relay, not the first one's: two agents
+ *  on one computer reach the target by different paths, and only ICE can tell
+ *  which one works. At once, so a connect waits one timeout, not one per port.
+ *  Exported (with `fetch` passed in) for tests. */
+export async function probeLocalRelays(
+  fetchImpl: typeof fetch = (...args) => fetch(...args),
+): Promise<LocalRelayDescriptor[]> {
+  const answers = await Promise.all(
+    LOCAL_RELAY_PROBE_PORTS.map(async (port) => {
+      const ctl = new AbortController()
+      const timer = setTimeout(() => ctl.abort(), 800)
+      try {
+        const res = await fetchImpl(`http://127.0.0.1:${port}/rc-local-turn`, {
+          signal: ctl.signal,
+        })
+        return res.ok ? parseLocalRelayDescriptor(await res.json()) : null
+      } catch {
+        return null // nothing on this port
+      } finally {
+        clearTimeout(timer)
+      }
+    }),
+  )
+  return distinctLocalRelays(answers)
+}
 
 /** Validate an untrusted JSON blob from the loopback probe into a
  *  [`LocalRelayDescriptor`], or `null`. Pure + exported for tests. */
@@ -3817,72 +3878,269 @@ export function parseLocalRelayDescriptor(raw: unknown): LocalRelayDescriptor | 
 }
 
 /** FR-121 — which of the signed-in person's own devices this browser runs on,
- *  per browser: an agent id, `'none'` (it is none of them), or unset (never
- *  said; a successful probe may suggest one). */
-const THIS_DEVICE_STORAGE_KEY = 'roomler-rc-this-device'
+ *  per browser: their agent ids, `'none'` (it is none of them), or null (never
+ *  said; a successful probe may suggest them). P3b (#2774) — a list, because
+ *  one computer can run several enrolled agents, each with its own relay. */
+export type ThisDevices = string[] | 'none' | null
 
-export function readStoredThisDevice(): string | null {
+/** FR-121 — the key one device was stored under: an agent id or `'none'`. P3b
+ *  keeps writing it (the first device) for a tab still on an older bundle, and
+ *  reads it only while the list below is absent. */
+const THIS_DEVICE_STORAGE_KEY = 'roomler-rc-this-device'
+/** FR-121 P3b (#2774) — the list: `'none'`, or agent ids joined by commas. */
+const THIS_DEVICES_STORAGE_KEY = 'roomler-rc-this-devices'
+
+const AGENT_ID = /^[0-9a-f]{24}$/
+
+/** FR-121 P3b (#2774) — agent ids, each once, at most `LOCAL_RELAYS_MAX`; an
+ *  empty list is "never said". */
+function normalizeThisDevices(v: ThisDevices): ThisDevices {
+  if (!Array.isArray(v)) return v
+  const ids = [...new Set(v.filter((d) => AGENT_ID.test(d)))].slice(0, LOCAL_RELAYS_MAX)
+  return ids.length > 0 ? ids : null
+}
+
+/** FR-121 P3b (#2774) — where this browser was told it runs, from the two
+ *  stored values. `legacy`: one device stored before P3b that no probe has
+ *  looked past; on a computer with several agents it is whichever happened to
+ *  answer first. The list holds only while the single key still echoes it
+ *  (its first device, or `none`): a tab on an older bundle that changed the
+ *  choice since wrote the single key alone, and the newer write wins. Pure +
+ *  exported for tests. */
+export function parseStoredThisDevices(
+  list: string | null,
+  single: string | null,
+): { devices: ThisDevices; legacy: boolean } {
+  const listed = list === 'none' ? 'none' : normalizeThisDevices((list ?? '').split(','))
+  if (listed !== null && single === (listed === 'none' ? 'none' : listed[0])) {
+    return { devices: listed, legacy: false }
+  }
+  if (single === 'none') return { devices: 'none', legacy: false }
+  if (single !== null && AGENT_ID.test(single)) return { devices: [single], legacy: true }
+  return { devices: null, legacy: false }
+}
+
+export function readStoredThisDevices(): { devices: ThisDevices; legacy: boolean } {
   try {
-    const v = globalThis.localStorage?.getItem(THIS_DEVICE_STORAGE_KEY) ?? null
-    return v === 'none' || (v !== null && /^[0-9a-f]{24}$/.test(v)) ? v : null
+    const store = globalThis.localStorage
+    return parseStoredThisDevices(
+      store?.getItem(THIS_DEVICES_STORAGE_KEY) ?? null,
+      store?.getItem(THIS_DEVICE_STORAGE_KEY) ?? null,
+    )
   } catch {
-    return null
+    return { devices: null, legacy: false }
   }
 }
 
-function persistThisDevice(v: string | null) {
+/** Exported for tests. */
+export function persistThisDevices(v: ThisDevices) {
   try {
-    if (v === null) globalThis.localStorage?.removeItem(THIS_DEVICE_STORAGE_KEY)
-    else globalThis.localStorage?.setItem(THIS_DEVICE_STORAGE_KEY, v)
+    const store = globalThis.localStorage
+    const next = normalizeThisDevices(v)
+    if (next === null) {
+      store?.removeItem(THIS_DEVICES_STORAGE_KEY)
+      store?.removeItem(THIS_DEVICE_STORAGE_KEY)
+    } else {
+      store?.setItem(THIS_DEVICES_STORAGE_KEY, next === 'none' ? 'none' : next.join(','))
+      // A tab still on an older bundle reads the one key it knows.
+      store?.setItem(THIS_DEVICE_STORAGE_KEY, next === 'none' ? 'none' : next[0])
+    }
   } catch {
     /* best-effort */
   }
 }
 
-/** FR-121 — how a connect finds the relay of the device this browser runs on.
- *  `from`: name the device and let the server hand its relay over, so the
+/** FR-121 — how a connect finds the relays of the devices this browser runs
+ *  on. `from`: name them and let the server hand their relays over, so the
  *  browser never fetches 127.0.0.1 (which Chrome gates behind its
  *  local-network permission). `probe`: the loopback probe, as before FR-121,
  *  while no device is named. `none`: switched off, an external session, a
  *  browser that is on none of its owner's devices, or one looking at the very
- *  device it runs on. Pure + exported for tests. */
+ *  device it runs on. P3b (#2774) — the device being viewed is left out of the
+ *  ones named (the server would refuse it, `same_device`), and the others on
+ *  the same computer are still named. Pure + exported for tests. */
 export function localRelayPlan(opts: {
   enabled: boolean
   external: boolean
-  thisDevice: string | null
+  thisDevices: ThisDevices
   target: string
-}): { kind: 'from'; device: string } | { kind: 'probe' } | { kind: 'none' } {
-  if (!opts.enabled || opts.external || opts.thisDevice === 'none') return { kind: 'none' }
-  if (opts.thisDevice === null) return { kind: 'probe' }
-  if (opts.thisDevice === opts.target) return { kind: 'none' }
-  return { kind: 'from', device: opts.thisDevice }
+}): { kind: 'from'; devices: string[] } | { kind: 'probe' } | { kind: 'none' } {
+  if (!opts.enabled || opts.external || opts.thisDevices === 'none') return { kind: 'none' }
+  if (opts.thisDevices === null) return { kind: 'probe' }
+  const devices = opts.thisDevices.filter((d) => d !== opts.target)
+  return devices.length > 0 ? { kind: 'from', devices } : { kind: 'none' }
 }
 
-/** FR-121 — the device a successful probe pairs this browser with, or null.
- *  Only an unanswered browser pairs, and only with the person's own device:
- *  on someone else's machine the server would refuse to hand that device's
- *  relay over (`not_your_device`), so pairing there would trade a working
- *  probe for a refusal on every later connect. Pure + exported for tests. */
-export function deviceToPairFromProbe(
-  probedAgentId: string | undefined,
-  thisDevice: string | null,
-  ownsDevice: ((agentId: string) => boolean) | undefined,
-): string | null {
-  if (!probedAgentId || thisDevice !== null) return null
-  return ownsDevice?.(probedAgentId) === true ? probedAgentId : null
-}
-
-/** FR-121 — `cfg` with the handed-over relay as its first ICE server; every
- *  other setting kept, because `setConfiguration` refuses to change them.
+/** FR-121 — the devices a probe pairs this browser with, or null to leave it
+ *  as it is. Only an unanswered browser pairs, and only with the person's own
+ *  devices: on someone else's machine the server would refuse to hand that
+ *  device's relay over (`not_your_device`), so pairing there would trade a
+ *  working probe for a refusal on every later connect. P3b (#2774) — every
+ *  one of the person's own among the relays found, in probe order, not just
+ *  the first to answer; and a device stored before P3b (`legacy`) widens to
+ *  them, kept even when it did not answer (its agent may only be restarting).
+ *  It has no claim to the top rank: it too was whichever answered first.
  *  Pure + exported for tests. */
-export function withLocalRelay(
+export function devicesToPairFromProbe(opts: {
+  thisDevices: ThisDevices
+  legacy: boolean
+  probed: readonly LocalRelayDescriptor[]
+  ownsDevice: ((agentId: string) => boolean) | undefined
+}): string[] | null {
+  if (opts.thisDevices !== null && !opts.legacy) return null
+  const own = opts.probed
+    .map((d) => d.agent_id)
+    .filter((id): id is string => id !== undefined && opts.ownsDevice?.(id) === true)
+  if (own.length === 0) return null
+  const kept = opts.legacy && Array.isArray(opts.thisDevices) ? opts.thisDevices : []
+  const paired = normalizeThisDevices([...own, ...kept])
+  return Array.isArray(paired) ? paired : null
+}
+
+/** FR-121 P3b (#2774) — whether this connect may take the one look at a pre-P3b
+ *  pairing: it names devices, the pairing is legacy, and the person's device
+ *  list in view vouches for a stored device as theirs. Without that the look
+ *  could not tell the person's own devices from anyone else's (another
+ *  organization in view, a list that failed to load), and would be spent for
+ *  nothing; it waits for a connect that can. The permission check comes after
+ *  (`loopbackProbeIsSilent`). Pure + exported for tests. */
+export function mayLookAgain(opts: {
+  planKind: 'from' | 'probe' | 'none'
+  legacy: boolean
+  thisDevices: ThisDevices
+  ownsDevice: ((agentId: string) => boolean) | undefined
+}): boolean {
+  return (
+    opts.planKind === 'from' &&
+    opts.legacy &&
+    Array.isArray(opts.thisDevices) &&
+    opts.thisDevices.some((d) => opts.ownsDevice?.(d) === true)
+  )
+}
+
+/** FR-121 P3b (#2774) — what a connect does with the probe it ran: the pairing
+ *  to store (`store`; `undefined` leaves it as it is), and the relays it sends
+ *  (`probed`) or the devices it names (`named`). An unanswered browser's probe
+ *  sends what it found, as before P3b. The one look at a pre-P3b pairing
+ *  (`lookAgain`) names the devices instead, so the Hub checks each (owner,
+ *  organization, the device being viewed) in the order every later connect
+ *  uses; found or not, the pairing is stored the new way, so the look happens
+ *  once. Pure + exported for tests. */
+export function relayChoiceAfterProbe(opts: {
+  lookAgain: boolean
+  thisDevices: ThisDevices
+  legacy: boolean
+  found: readonly LocalRelayDescriptor[]
+  ownsDevice: ((agentId: string) => boolean) | undefined
+  target: string
+}): { store: ThisDevices | undefined; probed: LocalRelayDescriptor[]; named: string[] } {
+  const pair = devicesToPairFromProbe({
+    thisDevices: opts.thisDevices,
+    legacy: opts.legacy,
+    probed: opts.found,
+    ownsDevice: opts.ownsDevice,
+  })
+  if (!opts.lookAgain) return { store: pair ?? undefined, probed: [...opts.found], named: [] }
+  const store = pair ?? opts.thisDevices
+  const plan = localRelayPlan({
+    enabled: true,
+    external: false,
+    thisDevices: store,
+    target: opts.target,
+  })
+  return { store, probed: [], named: plan.kind === 'from' ? plan.devices : [] }
+}
+
+/** FR-121 P3b (#2774) — whether this page can fetch 127.0.0.1 without a prompt:
+ *  it already holds Chrome's permission for loopback. Chrome 156 asks
+ *  `loopback-network` for it (`local-network` is the LAN's, a separate
+ *  permission); before that split it asked `local-network-access`, which 156
+ *  still answers too. `false` whenever it cannot be known, so the one look a
+ *  pre-P3b pairing takes never costs anybody a prompt. Pure (the query is
+ *  passed in) + exported for tests. */
+export async function loopbackProbeIsSilent(
+  query: (name: string) => Promise<PermissionState>,
+): Promise<boolean> {
+  for (const name of ['loopback-network', 'local-network-access']) {
+    try {
+      return (await query(name)) === 'granted'
+    } catch {
+      // This browser does not know the name; ask by the older one.
+    }
+  }
+  return false
+}
+
+/** `navigator.permissions.query` by name: throws where the name is unknown. */
+function queryPermission(name: string): Promise<PermissionState> {
+  return navigator.permissions
+    .query({ name } as unknown as PermissionDescriptor)
+    .then((status) => status.state)
+}
+
+/** FR-121 — `cfg` with the handed-over relays as its first ICE servers, in the
+ *  order given; every other setting kept, because `setConfiguration` refuses
+ *  to change them. Pure + exported for tests. */
+export function withLocalRelays(
   cfg: RTCConfiguration,
-  desc: LocalRelayDescriptor,
+  descs: readonly LocalRelayDescriptor[],
 ): RTCConfiguration {
   return {
     ...cfg,
-    iceServers: [localRelayIceServer(desc) as RTCIceServer, ...(cfg.iceServers ?? [])],
+    iceServers: [
+      ...descs.map((d) => localRelayIceServer(d) as RTCIceServer),
+      ...(cfg.iceServers ?? []),
+    ],
   }
+}
+
+/** FR-121 — the relays `rc:session.created` hands over: `local_relay`, then
+ *  `local_relay_also` (P3b), each checked as the untrusted descriptor it is.
+ *  Pure + exported for tests. */
+export function handedLocalRelays(msg: {
+  local_relay?: unknown
+  local_relay_also?: unknown
+}): LocalRelayDescriptor[] {
+  const also: unknown[] = Array.isArray(msg.local_relay_also) ? msg.local_relay_also : []
+  return distinctLocalRelays([msg.local_relay, ...also].map(parseLocalRelayDescriptor))
+}
+
+/** FR-121 — what `rc:session.request` carries about this computer's relays:
+ *  the probed descriptors (the first as `local_relay`, the rest as
+ *  `local_relay_also`), or else the devices named (`local_relay_from`, then
+ *  `local_relay_from_also`). An older server reads the first of each alone.
+ *  Pure + exported for tests. */
+export function localRelayRequestFields(
+  probed: readonly LocalRelayDescriptor[],
+  named: readonly string[],
+): Record<string, unknown> {
+  if (probed.length > 0) {
+    return {
+      local_relay: probed[0],
+      ...(probed.length > 1 ? { local_relay_also: probed.slice(1) } : {}),
+    }
+  }
+  if (named.length > 0) {
+    return {
+      local_relay_from: named[0],
+      ...(named.length > 1 ? { local_relay_from_also: named.slice(1) } : {}),
+    }
+  }
+  return {}
+}
+
+/** FR-121 P3b (#2774) — "This browser runs on" as the picker now holds it
+ *  (`next`) after holding `prev`: `''` (not set) or `'none'` just picked wins
+ *  over everything else; otherwise the devices picked, and not set when none
+ *  is. Pure + exported for tests. */
+export function thisDevicesFromPick(
+  prev: readonly string[],
+  next: readonly string[],
+): ThisDevices {
+  const added = (v: string) => next.includes(v) && !prev.includes(v)
+  if (added('')) return null
+  if (added('none')) return 'none'
+  return normalizeThisDevices(next.filter((v) => v !== '' && v !== 'none'))
 }
 
 /** 2026-07-24 decode-stall A/B Ã¢ÂÂ experimental override for the DC decode
@@ -3904,6 +4162,24 @@ export function storedDecodePref(): 'prefer-software' | 'prefer-hardware' | 'no-
     /* privacy mode Ã¢ÂÂ default */
   }
   return 'no-preference'
+}
+
+/** FR-130 P2 — the per-browser kill switch for the decoder colour space.
+ *  `localStorage.setItem('roomler-rc-colorspace', 'off')` (any case), then
+ *  reconnect: the decoders are no longer told set S, and each stream's own
+ *  description decides again (an undescribed one Chrome decodes as BT.709,
+ *  the colour shift of #3049). Anything else, or no value, leaves the override
+ *  on, and so does storage that cannot be read. Read once per connect, like
+ *  every `roomler-rc-*` knob. Pure + exported for tests. */
+export const COLORSPACE_STORAGE_KEY = 'roomler-rc-colorspace'
+
+export function storedColorSpaceOverride(): boolean {
+  try {
+    const raw = globalThis.localStorage?.getItem(COLORSPACE_STORAGE_KEY)
+    return (raw ?? '').trim().toLowerCase() !== 'off'
+  } catch {
+    return true
+  }
 }
 
 /** The browser's ICE-server entry for the loopback TURN (dialled over loopback,
@@ -4480,15 +4756,19 @@ export const VP9_444_DC_LABEL = 'video-bytes'
  * backlog has no bound — measured `send_wait_max` 10,263 ms on an agent
  * whose encoder was idle at 8-12 ms/frame.
  *
- * `maxRetransmits: 0` rather than a bounded retransmit is deliberate and
- * is coupled to the RECEIVER. Stage A's assembler treats a chunk-index
- * jump as an unrecoverable gap: it drops the frame and asks for an IDR.
- * That is exactly right when a lost chunk never arrives, and WRONG the
- * moment retransmits are allowed — a chunk that arrives one RTT late
- * would be discarded as a gap, converting a recoverable frame into a
- * lost one plus a keyframe request. Testing 1-2 retransmits (stage C)
- * therefore requires a reorder buffer in the worker first; it is not a
- * number that can be turned up on its own.
+ * `maxRetransmits: 0` rather than a bounded retransmit was chosen for
+ * stage B because it was coupled to the RECEIVER of the day. Stage A's
+ * assembler treated a chunk-index jump as an unrecoverable gap: it
+ * dropped the frame and asked for an IDR. That is exactly right when a
+ * lost chunk never arrives, and WRONG the moment retransmits are allowed
+ * — a chunk that arrives one RTT late would be discarded as a gap,
+ * converting a recoverable frame into a lost one plus a keyframe request.
+ * Stage C's reorder buffer (FR-59 P7, #1169, `rc-chunk-framing.ts`)
+ * removed that coupling: a late chunk lands in its slot while its frame
+ * is still open. The number is still 0 because 1-2 (or the
+ * `maxPacketLifeTime` deadline FR-17 prefers) has not been MEASURED on a
+ * relay-locked pair — it is now a measurement that can be run, not a
+ * number that can be turned up without one.
  *
  * ⚠️ Unordered is only legal WITH framing. An unframed stream is a bare
  * byte sequence whose reassembly depends entirely on arrival order, so
@@ -5304,8 +5584,12 @@ export function useRemoteControl(
    *  `connect()` probes the local agent's loopback TURN and relays through it
    *  if present Ã¢ÂÂ bypasses the capped far-coturn relay on corp networks. */
   const localRelayEnabled = ref<boolean>(readStoredLocalRelay())
-  /** FR-121 — the device this browser runs on (see `readStoredThisDevice`). */
-  const thisDeviceId = ref<string | null>(readStoredThisDevice())
+  /** FR-121 — the devices this browser runs on (see `readStoredThisDevices`). */
+  const storedThisDevices = readStoredThisDevices()
+  const thisDevices = ref<ThisDevices>(storedThisDevices.devices)
+  /** FR-121 P3b (#2774) — the stored device predates P3b and no probe has
+   *  looked past it yet (`parseStoredThisDevices`). */
+  let thisDevicesLegacy = storedThisDevices.legacy
   /** FR-121 — why the last session got no relay from the server, in the
    *  server's word (`not_your_device`, `rc_overlay_off`, …); `null` when it got
    *  one or did not ask. */
@@ -5368,6 +5652,12 @@ export function useRemoteControl(
    *  its `init-canvas`, which carries `sessionBench`. */
   let sessionBenchMode: BenchMode | null = null
   let sessionBench = false
+  /** FR-130 P2 — true when THIS session's decoders are told the colour space
+   *  the agent converted with (set S: BT.601 matrix, limited range;
+   *  `workers/rc-decoder-config.ts`). Resolved beside `sessionChunkFraming`,
+   *  before any worker is started: the data-channel workers get it in their
+   *  `init-canvas`, the RTP WebCodecs worker in its transform's options. */
+  let sessionColorSpace = false
   let benchProber: BenchProber | null = null
   let videoBench: VideoBenchSampler | null = null
   /** The element `attachInput` was given: the `<video>` the bench sampler
@@ -6985,6 +7275,21 @@ export function useRemoteControl(
     }
   }
 
+  /** FR-130 P2 — a decode worker gave up the decoder colour space and decodes
+   *  without it: the browser refused it at configure(), or the decoder failed
+   *  before its first frame with it set (the worker then tries once more
+   *  without it). The worker reports this at most once a session. */
+  function warnColorSpaceDropped(path: string, msg: Record<string, unknown>) {
+    const why = msg.stage === 'configure'
+      ? 'configure() refused it'
+      : 'the decoder failed before its first frame with it set'
+    console.warn(
+      `[rc] ${path} decoder colour space dropped (FR-130 P2): ${why}; decoding without it, as before FR-130 -`,
+      msg.codec,
+      msg.error,
+    )
+  }
+
   function sendQualityPreference() {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
@@ -7305,40 +7610,14 @@ export function useRemoteControl(
     persistLocalRelay(on)
   }
 
-  /** FR-121 — say which of its owner's devices this browser runs on (an agent
-   *  id), that it is none of them (`'none'`), or forget (`null`). Takes effect
+  /** FR-121 — say which of its owner's devices this browser runs on (agent
+   *  ids), that it is none of them (`'none'`), or forget (`null`). Takes effect
    *  on the next `connect()`. */
-  function setThisDevice(v: string | null) {
-    thisDeviceId.value = v
-    persistThisDevice(v)
-  }
-
-  /** Probe the local enrolled agent's loopback TURN endpoint. Returns its
-   *  descriptor, or `null` on any failure (no local agent, feature off,
-   *  Private-Network-Access blocked, non-2xx, timeout) Ã¢ÂÂ all graceful, so a
-   *  host WITHOUT a local agent silently keeps the normal coturn path. Loopback
-   *  fetch is exempt from mixed-content blocking; the agent's endpoint must
-   *  answer the PNA CORS preflight for HTTPSÃ¢ÂÂlocalhost on newer Chrome. */
-  async function probeLocalRelay(): Promise<LocalRelayDescriptor | null> {
-    // Walk the candidate range Ã¢ÂÂ with multiple agents on the host the
-    // descriptor may be served on a fallback port. First valid
-    // descriptor wins (any agent's local TURN works for the relay).
-    for (const port of LOCAL_RELAY_PROBE_PORTS) {
-      const ctl = new AbortController()
-      const timer = setTimeout(() => ctl.abort(), 800)
-      try {
-        const res = await fetch(`http://127.0.0.1:${port}/rc-local-turn`, { signal: ctl.signal })
-        if (res.ok) {
-          const desc = parseLocalRelayDescriptor(await res.json())
-          if (desc) return desc
-        }
-      } catch {
-        // Nothing on this port Ã¢ÂÂ next.
-      } finally {
-        clearTimeout(timer)
-      }
-    }
-    return null
+  function setThisDevices(v: ThisDevices) {
+    const next = normalizeThisDevices(v)
+    thisDevices.value = next
+    thisDevicesLegacy = false
+    persistThisDevices(next)
   }
 
   /** The unified Codec picker as a computed over the four underlying refs.
@@ -7437,12 +7716,21 @@ export function useRemoteControl(
         onBenchProbe(msg.seq, msg.paintedAt, 'webcodecs')
         return
       }
+      if (msg.type === 'request-keyframe') {
+        // FR-130 P2 — the worker rebuilt its decoder without the colour
+        // space and waits for a key frame to start it.
+        requestKeyframe()
+        return
+      }
       if (msg.type === 'first-frame' && typeof msg.width === 'number' && typeof msg.height === 'number') {
         mediaIntrinsicW.value = msg.width
         mediaIntrinsicH.value = msg.height
         markConnect('first_frame')
         logConnectTiming('first-frame')
-        console.info('[rc] webcodecs first frame', msg.width, 'x', msg.height)
+        // FR-130 P2 — what the decoder says it produced (P3 reads it per session).
+        console.info('[rc] webcodecs first frame', msg.width, 'x', msg.height, '| decoded colour space', colorSpaceLabel(msg.colorSpace))
+      } else if (msg.type === 'colorspace-dropped') {
+        warnColorSpaceDropped('webcodecs', msg)
       } else if (msg.type === 'transform-active') {
         console.info('[rc] webcodecs transform active', msg)
       } else if (msg.type === 'first-encoded-frame' || msg.type === 'early-encoded-frame') {
@@ -7481,7 +7769,10 @@ export function useRemoteControl(
     try {
       ;(receiver as unknown as { transform: unknown }).transform = new TransformCtor(
         worker,
-        { codec },
+        // FR-130 P2 — `colorSpace` rides the options, not `init-canvas`: the
+        // worker configures its decoder when the transform starts, which can
+        // be before the canvas mounts. See `sessionColorSpace`.
+        { codec, colorSpace: sessionColorSpace },
       )
     } catch (err) {
       console.warn('[rc] setting receiver.transform failed', err)
@@ -7750,7 +8041,10 @@ export function useRemoteControl(
         vp9_444FramesDecoded.value = Math.max(vp9_444FramesDecoded.value, 1)
         markConnect('first_frame')
         logConnectTiming('first-frame')
-        console.info('[rc] vp9-444 first frame', msg.width, 'x', msg.height)
+        // FR-130 P2 — what the decoder says it produced (P3 reads it per session).
+        console.info('[rc] vp9-444 first frame', msg.width, 'x', msg.height, '| decoded colour space', colorSpaceLabel(msg.colorSpace))
+      } else if (msg.type === 'colorspace-dropped') {
+        warnColorSpaceDropped('vp9-444', msg)
       } else if (msg.type === 'decoder-configured') {
         // `pref` (round 3) = the hardwareAcceleration ACTUALLY passed to
         // configure() Ã¢ÂÂ proves whether the roomler-rc-decode-pref A/B took.
@@ -7758,7 +8052,8 @@ export function useRemoteControl(
         // the truth (this worker decodes VP9, AV1 and H.264). The pill reads
         // it until the agent names its encoder.
         dcDecoderCodec.value = typeof msg.codec === 'string' ? msg.codec : null
-        console.info('[rc] vp9-444 decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference')
+        // FR-130 P2 — `colorSpace`: what configure() was told (none: the stream decides).
+        console.info('[rc] vp9-444 decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference', '| colour space', colorSpaceLabel(msg.colorSpace))
       } else if (msg.type === 'decoder-error'
         || msg.type === 'decoder-configure-error'
         || msg.type === 'decode-error') {
@@ -7902,6 +8197,8 @@ export function useRemoteControl(
           chunkFraming: sessionChunkFraming,
           // FR-16 L4 — resolved per session; see `sessionBench`.
           bench: sessionBench,
+          // FR-130 P2 — resolved per session; see `sessionColorSpace`.
+          colorSpace: sessionColorSpace,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -8040,11 +8337,16 @@ export function useRemoteControl(
           '[rc] hevc first frame', msg.width, 'x', msg.height,
           '| coded', msg.coded, 'display', msg.display, 'visible', msg.visible,
           '| crop', msg.crop, 'rewrapped', msg.rewrapped,
+          // FR-130 P2 — what the decoder says it produced (P3 reads it per session).
+          '| decoded colour space', colorSpaceLabel(msg.colorSpace),
         )
+      } else if (msg.type === 'colorspace-dropped') {
+        warnColorSpaceDropped('hevc', msg)
       } else if (msg.type === 'decoder-configured') {
         // `pref` (round 3) Ã¢ÂÂ see the vp9-444 handler.
         dcDecoderCodec.value = typeof msg.codec === 'string' ? msg.codec : null
-        console.info('[rc] hevc decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference')
+        // FR-130 P2 — `colorSpace`: what configure() was told (none: the stream decides).
+        console.info('[rc] hevc decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference', '| colour space', colorSpaceLabel(msg.colorSpace))
       } else if (msg.type === 'decoder-error'
         || msg.type === 'decoder-configure-error'
         || msg.type === 'decode-error') {
@@ -8160,6 +8462,8 @@ export function useRemoteControl(
           chunkFraming: sessionChunkFraming,
           // FR-16 L4 — resolved per session; see `sessionBench`.
           bench: sessionBench,
+          // FR-130 P2 — resolved per session; see `sessionColorSpace`.
+          colorSpace: sessionColorSpace,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -8428,16 +8732,19 @@ export function useRemoteControl(
       // #2810 — and who its consent asks, so the wait and a consent end are
       // worded for the person actually asked.
       consentAsks.value = parseConsentAsks(msg.consent_asks)
-      // FR-121 — the relay of the device this browser runs on, handed over
-      // because the request named it. Added before the offer, which waits for
-      // `rc:ready`, so the first gathering already includes it.
+      // FR-121 — the relays of the devices this browser runs on, handed over
+      // because the request named them. Added before the offer, which waits
+      // for `rc:ready`, so the first gathering already includes them.
       localRelayRefused.value =
         typeof msg.local_relay_refused === 'string' ? msg.local_relay_refused : null
-      const handed = parseLocalRelayDescriptor(msg.local_relay)
-      if (handed && pc) {
+      const handed = handedLocalRelays(msg)
+      if (handed.length > 0 && pc) {
         try {
-          pc.setConfiguration(withLocalRelay(pc.getConfiguration(), handed))
-          console.info('[rc] local-relay TURN handed over by the server', handed.overlay_ip)
+          pc.setConfiguration(withLocalRelays(pc.getConfiguration(), handed))
+          console.info(
+            '[rc] local-relay TURN handed over by the server',
+            handed.map((d) => d.overlay_ip).join(', '),
+          )
         } catch (e) {
           console.warn('[rc] could not add the handed-over local relay', e)
         }
@@ -9297,40 +9604,55 @@ export function useRemoteControl(
     // (loopback is never firewall-blocked, unlike this corp browser's direct/
     // coturn UDP) and forward its descriptor to the server (below) so the REMOTE
     // agent relays through it too. Graceful no-op on any host without one.
-    let localRelay: LocalRelayDescriptor | null = null
+    let localRelays: LocalRelayDescriptor[] = []
     // FR-52 P4e — never for an external session: its frame cannot carry a
     // relay descriptor (F4), and a relay on THIS host's mesh could not reach a
     // device in someone else's organization anyway.
     // FR-121 — and once this browser knows which of its owner's devices it
-    // runs on, it names the device and the server hands the relay over on
+    // runs on, it names them and the server hands their relays over on
     // `rc:session.created`: no request to 127.0.0.1, so nothing for Chrome's
     // local-network permission to prompt for or refuse.
     const relayPlan = localRelayPlan({
       enabled: localRelayEnabled.value,
       external: externalMode,
-      thisDevice: thisDeviceId.value,
+      thisDevices: thisDevices.value,
       target: agentId,
     })
-    const localRelayFrom = relayPlan.kind === 'from' ? relayPlan.device : null
+    let localRelayFrom = relayPlan.kind === 'from' ? relayPlan.devices : []
     localRelayRefused.value = null
-    if (relayPlan.kind === 'probe') {
-      localRelay = await probeLocalRelay()
-      if (localRelay) {
-        iceServers = [localRelayIceServer(localRelay), ...iceServers]
+    // FR-121 P3b (#2774) — a browser paired before P3b names one device: on a
+    // computer with several agents, whichever happened to answer first. It
+    // looks once for the others, only where the device list in view vouches
+    // for its device and looking cannot prompt.
+    const lookAgain =
+      mayLookAgain({
+        planKind: relayPlan.kind,
+        legacy: thisDevicesLegacy,
+        thisDevices: thisDevices.value,
+        ownsDevice: opts?.ownsDevice,
+      }) && (await loopbackProbeIsSilent(queryPermission))
+    if (relayPlan.kind === 'probe' || lookAgain) {
+      const found = await probeLocalRelays()
+      // FR-121 — a probe that found the person's own devices answers the
+      // question for good: the next connect names them and does not probe.
+      const choice = relayChoiceAfterProbe({
+        lookAgain,
+        thisDevices: thisDevices.value,
+        legacy: thisDevicesLegacy,
+        found,
+        ownsDevice: opts?.ownsDevice,
+        target: agentId,
+      })
+      if (choice.store !== undefined) setThisDevices(choice.store)
+      localRelays = choice.probed
+      localRelayFrom = choice.named
+      if (localRelays.length > 0) {
+        iceServers = [...localRelays.map(localRelayIceServer), ...iceServers]
         console.info(
-          '[rc] local-relay TURN discovered on this host Ã¢ÂÂ relaying via local agent overlay',
-          localRelay.overlay_ip,
+          '[rc] local-relay TURN discovered on this host, relaying via local agent overlay',
+          localRelays.map((d) => d.overlay_ip).join(', '),
         )
       }
-      // FR-121 — a probe that named one of the person's own devices answers
-      // the question for good: the next connect names the device and does
-      // not probe.
-      const pair = deviceToPairFromProbe(
-        localRelay?.agent_id,
-        thisDeviceId.value,
-        opts?.ownsDevice,
-      )
-      if (pair) setThisDevice(pair)
     }
     // #1631 - the last suspension before the peer exists. A disconnect()
     // during any wait above must never leave a peer that nothing will close
@@ -10694,6 +11016,21 @@ export function useRemoteControl(
     // will answer it, decided before any worker is told.
     sessionBenchMode = benchSessionMode(storedBenchMode(), agent?.value?.capabilities?.video)
     sessionBench = sessionBenchMode !== null
+    // FR-130 P2 — tell the decoders the colour space the agent converted with,
+    // on every session from every agent (open decision 2): every agent so far
+    // converts the captured BGRA with BT.601 at limited range and advertises
+    // nothing about it, and for VP9 the decoder config is the only fix
+    // (Chrome's WebCodecs ignores VP9's own description). Off only under this
+    // browser's kill switch, `roomler-rc-colorspace=off`.
+    // ⚠️ The hook: an agent that ever converts otherwise would advertise a
+    // token in `AgentCaps.video` (FR-130 adds none), and it would be read
+    // into `agentConvertsBt601Limited` here, turning the override off for
+    // that agent so its stream's own description decides.
+    const agentConvertsBt601Limited = true
+    sessionColorSpace = agentConvertsBt601Limited && storedColorSpaceOverride()
+    if (!sessionColorSpace) {
+      console.info('[rc] decoder colour space: not set this session (roomler-rc-colorspace=off) - each stream\'s own description decides (FR-130 P2)')
+    }
     if (sessionBenchMode === 'probe') {
       console.info('[rc] bench mode: the agent advertised `bench`; probing once the input channel opens (FR-16 L4)')
     } else if (sessionBenchMode === 'target') {
@@ -10770,16 +11107,15 @@ export function useRemoteControl(
             permissions: withPrivacyAsked(permissions, askedCaps),
             browser_caps: browserCaps,
           }
-    // loopback-TURN corp-relay (Phase 2): forward the probed descriptor so the
-    // Hub adds `turn:{overlay_ip}:{turn_port}` to the REMOTE agent's ICE servers
-    // Ã¢ÂÂ it reaches that TURN over the overlay (WFP-permitted). Absent Ã¢ÂÂ the Hub
-    // pushes nothing extra, so old servers/agents are unaffected.
-    if (localRelay) {
-      requestPayload.local_relay = localRelay
-    } else if (localRelayFrom && !externalMode) {
-      // FR-121 — or name this browser's device; the server answers on
-      // `rc:session.created`. An older server ignores the field.
-      requestPayload.local_relay_from = localRelayFrom
+    // loopback-TURN corp-relay (Phase 2): forward the probed descriptors so the
+    // Hub adds `turn:{overlay_ip}:{turn_port}` to the REMOTE agent's ICE
+    // servers; it reaches each TURN over the overlay (WFP-permitted). FR-121 -
+    // or name this browser's devices, and the server answers on
+    // `rc:session.created`. Absent, the Hub pushes nothing extra, so old
+    // servers/agents are unaffected; an older server reads the first of each
+    // list alone (P3b). Never on an external session's frame (F4).
+    if (!externalMode) {
+      Object.assign(requestPayload, localRelayRequestFields(localRelays, localRelayFrom))
     }
     sessionDcTransport = preferredTransport
     // FR-77 — which chroma cell this session runs in (mirrors the chroma_pref
@@ -13439,8 +13775,8 @@ export function useRemoteControl(
      *  through it Ã¢ÂÂ bypasses the capped far-coturn relay on corp networks. */
     localRelayEnabled,
     setLocalRelayEnabled,
-    thisDeviceId,
-    setThisDevice,
+    thisDevices,
+    setThisDevices,
     localRelayRefused,
     vp9_444Supported,
     vp9_444Active,

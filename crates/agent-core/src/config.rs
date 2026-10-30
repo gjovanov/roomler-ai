@@ -1601,6 +1601,31 @@ pub struct AgentConfig {
     /// `encoder_cells_deny`: it only ever REMOVES rates.
     #[serde(default)]
     pub fps_deny: Option<String>,
+    /// FR-118 — keep a captured frame on the GPU until the encoder takes it
+    /// (`ROOMLERD_ZERO_COPY`): the SystemContext DXGI arm's frames go to QSV,
+    /// the WGC arm's to NVENC, and on macOS the display stream's IOSurfaces to
+    /// VideoToolbox, each without a CPU copy once the capability probe has
+    /// proven that encoder's GPU-input form. Built-in: off. Read when a capture
+    /// or an encoder opens and by the probe, so a change needs a restart. On a
+    /// supervised Mac the root's value binds the GUI worker.
+    #[serde(default)]
+    pub zero_copy: Option<bool>,
+    /// FR-130 — every encoder writes the colour description it converted
+    /// with (the BT.601 matrix at limited range) into its stream
+    /// (`ROOMLERD_COLOR_DESCRIPTION`), so a decoder stops guessing BT.709 for
+    /// an HD picture and shifting every saturated colour. Built-in: on;
+    /// `false` writes the undescribed stream every earlier agent sent. Read at
+    /// every encoder open and by the probe, so a change needs a restart. On a
+    /// supervised Mac the root's value binds the GUI worker.
+    #[serde(default)]
+    pub color_description: Option<bool>,
+    /// FR-118 — GPU-input cells this device must not open, comma-separated
+    /// `name:gpu` (`hevc_qsv:gpu`). Unset or `none` = deny nothing. Env
+    /// `ROOMLERD_ZERO_COPY_DENY`, read by the probe and at every encoder open.
+    /// Local only for now: the fleet's kill switch is `zero_copy` itself,
+    /// which is off unless a device owner turns it on.
+    #[serde(default)]
+    pub zero_copy_deny: Option<String>,
     /// FR-119 P2b-10 — how NVENC splits a frame across its engines above
     /// 60 fps: `auto` (unset; the driver picks the number of strips), `off`
     /// (never ask, as before P2b-10), or a strip count `2`–`4` (applied only
@@ -3004,6 +3029,9 @@ pub fn test_fixture() -> AgentConfig {
         fps_high: None,
         encoder_cells_deny: None,
         fps_deny: None,
+        zero_copy: None,
+        color_description: None,
+        zero_copy_deny: None,
         nvenc_split: None,
         vaapi_device: None,
         d3d12_adapter: None,
@@ -3126,7 +3154,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 90] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 92] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -3230,6 +3258,8 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 90]
         ("TEXT_MOD_NEUTRALIZE", cfg.text_mod_neutralize),
         ("CAPS_CACHE", cfg.caps_cache),
         ("FPS_HIGH", cfg.fps_high),
+        ("ZERO_COPY", cfg.zero_copy),
+        ("COLOR_DESCRIPTION", cfg.color_description),
     ]
 }
 
@@ -3362,6 +3392,11 @@ pub fn env_fallbacks(cfg: &AgentConfig) -> std::collections::HashMap<String, Str
     if let Some(v) = &cfg.fps_deny {
         fallbacks.insert("FPS_DENY".to_string(), v.clone());
     }
+    // FR-118 — the GPU-input denylist, read by the probe child and at every
+    // encoder open (the bool switch rides `env_bridge_bools`).
+    if let Some(v) = &cfg.zero_copy_deny {
+        fallbacks.insert("ZERO_COPY_DENY".to_string(), v.clone());
+    }
     // FR-119 P2b-10 — NVENC's split-frame encoding above 60 fps, read at
     // every encoder open.
     if let Some(v) = &cfg.nvenc_split {
@@ -3443,26 +3478,49 @@ pub fn default_config_path() -> Result<PathBuf> {
 /// new exposure. Closing the remaining pre-planted-CONTENT hole (verify
 /// the file's OWNER at SystemContext load) is tracked for the Track-A
 /// config unification.
+///
+/// ⚠️ #3073 — the OWNER goes first and the GRANT second ([`HARDEN_STEPS`]),
+/// and nothing that removes access runs unless both took. The daemon never
+/// enables the privileges that override a DACL, so once inherited ACEs are
+/// gone, SYSTEM reaches an object only through an ACE of its own or by
+/// owning it. Whatever a user-mode process created (the desktop companion,
+/// an earlier per-user install) belongs to that user:
+/// - with inheritance dropped first, the directory itself came out sealed
+///   against SYSTEM: the grant failed `Access is denied`, and every later
+///   daemon start ran with no log, no crash records and no machine-global
+///   config. Administrators as the owner fixed the directory;
+/// - but each CHILD the user owned still came out with an empty DACL
+///   (0.4.185, measured: `crashes`, `service-logs`, `config.toml.prev`). The
+///   grant reaches a child only by inheritance, and inheritance can rewrite
+///   only a child SYSTEM can still write. Granted first, the explicit
+///   SYSTEM and Administrators ACEs are already on every child when the
+///   inherited ones go.
+///
+/// A child keeps its owner: only the directory is taken for Administrators.
 #[cfg(windows)]
 fn harden_machine_global_dir(dir: &std::path::Path) {
     let d = dir.display().to_string();
-    let steps: [&[&str]; 3] = [
-        &["/inheritance:r"],
-        &["/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"],
-        &["/remove", "*S-1-5-32-545", "*S-1-5-11", "/T"],
-    ];
-    for args in steps {
+    for (i, args) in HARDEN_STEPS.iter().enumerate() {
         match std::process::Command::new("icacls")
             .arg(&d)
-            .args(args)
+            .args(*args)
             .output()
         {
             Ok(o) if o.status.success() => {}
-            Ok(o) => tracing::warn!(
-                dir = %d, ?args,
-                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-                "config: machine-global dir ACL hardening step failed"
-            ),
+            Ok(o) => {
+                tracing::warn!(
+                    dir = %d, ?args,
+                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                    "config: machine-global dir ACL hardening step failed"
+                );
+                // Steps 0 and 1, the owner and the grant: never strip
+                // inheritance unless both took. Inheritance is still intact
+                // at either point, so stopping leaves the directory as open
+                // as it was.
+                if i < 2 {
+                    return;
+                }
+            }
             Err(e) => {
                 tracing::warn!(dir = %d, %e, "config: icacls spawn failed; dir ACL unhardened");
                 return;
@@ -3470,6 +3528,17 @@ fn harden_machine_global_dir(dir: &std::path::Path) {
         }
     }
 }
+
+/// The `icacls` steps of [`harden_machine_global_dir`], in order (#3073):
+/// take ownership for Administrators, grant SYSTEM and Administrators, drop
+/// inheritance, then remove Users and Authenticated Users down the tree.
+#[cfg(any(windows, test))]
+const HARDEN_STEPS: [&[&str]; 4] = [
+    &["/setowner", "*S-1-5-32-544"],
+    &["/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"],
+    &["/inheritance:r"],
+    &["/remove", "*S-1-5-32-545", "*S-1-5-11", "/T"],
+];
 
 #[cfg(target_os = "windows")]
 pub fn machine_global_config_path() -> PathBuf {
@@ -3484,7 +3553,12 @@ fn prev_path(path: &std::path::Path) -> PathBuf {
 
 pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     let err = match try_load(path) {
-        Ok(cfg) => return Ok(cfg),
+        Ok(cfg) => {
+            // Here, not in `try_load`: that also serves the optional probe and
+            // `save`'s rotation check, which have nothing to tell an owner.
+            note_unknown_keys(path);
+            return Ok(cfg);
+        }
         Err(e) => e,
     };
 
@@ -3506,10 +3580,13 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
                 "config unreadable — RECOVERED from the previous good copy; \
                  the live file was likely truncated by an unclean shutdown"
             );
-            // Reinstate it as the live file so the next save has a base.
-            if let Err(e) = save(path, &cfg) {
+            // Reinstate it as the live file so the next save has a base. The
+            // keys this build does not know are the copy's to keep (#2078):
+            // the live file, which a save reads them from, parses as nothing.
+            if let Err(e) = save_with_base(path, &prev, &cfg) {
                 tracing::warn!(error = %format!("{e:#}"), "could not reinstate recovered config");
             }
+            note_unknown_keys(path);
             Ok(cfg)
         }
         Err(prev_err) => {
@@ -3562,6 +3639,191 @@ pub fn read_if_present(path: &PathBuf) -> Option<AgentConfig> {
     }
 }
 
+/// FR-129 B1 — what is at a config path that an enrollment is about to be
+/// folded into, or written over ([`read_merge_base`]).
+#[derive(Debug)]
+pub enum MergeBase {
+    /// Nothing at the path: a first install.
+    Absent,
+    /// The config loads: the enrollment folds into it.
+    Loaded(AgentConfig),
+    /// Something is at the path and does not load. `recovered` is its last
+    /// good copy (`.prev`) when that one loads — what [`load`] itself would
+    /// run on at the daemon's next start — else `None`, and the merge writes
+    /// a fresh config.
+    Unreadable {
+        /// Why, on one line, for the person.
+        reason: String,
+        recovered: Option<AgentConfig>,
+    },
+    /// #3116 — this process may not read the path at all: a setup wizard
+    /// that is not elevated, against the machine-global config only SYSTEM
+    /// and Administrators may open (#3073). Neither absent nor damaged — the
+    /// file may be perfectly good — so nothing may be decided about it, and a
+    /// merge must stop before it spends an enrollment token on a config it
+    /// could not write either ([`describe_denied`]).
+    Denied {
+        /// Why, on one line, for the person.
+        reason: String,
+    },
+}
+
+impl MergeBase {
+    /// The config to fold the enrollment into, if there is one. `Denied` has
+    /// none to give; a caller stops on it before it gets here.
+    pub fn into_config(self) -> Option<AgentConfig> {
+        match self {
+            MergeBase::Absent | MergeBase::Denied { .. } => None,
+            MergeBase::Loaded(cfg) => Some(cfg),
+            MergeBase::Unreadable { recovered, .. } => recovered,
+        }
+    }
+}
+
+/// FR-129 B1 (#2338) — read a config that an enrollment is about to be folded
+/// into, or written over.
+///
+/// [`read_if_present`] is a probe: absent, unreadable and unparseable all
+/// collapse to `None`, which is right for a caller asking whether an optional
+/// file happens to exist and wrong for one about to WRITE the path. A merge
+/// that read a damaged config as absent would write a fresh one over it — the
+/// device's private network, routes and lock policy gone and nobody told,
+/// #2338 by another road — and [`save`] would not even keep the damaged file:
+/// its `.prev` rotation runs only for a file that still parses, so that a
+/// broken file never overwrites the last good copy. This tells the three apart
+/// and, for a file that does not load, recovers from `.prev` exactly as
+/// [`load`] does, without [`load`]'s side effects (it rewrites the live file
+/// and logs "must be re-enrolled" at ERROR): the caller is about to write the
+/// path itself, and says what it found ([`describe_unreadable`]).
+///
+/// #3116 — and a file this process may not read is told apart from both: it
+/// is [`MergeBase::Denied`], never `Unreadable`, whose wording ("a fresh
+/// config is written, and this device's earlier settings do not carry over")
+/// would be false about a file that is only closed to the reader.
+pub fn read_merge_base(path: &PathBuf) -> MergeBase {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MergeBase::Absent,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return MergeBase::Denied {
+                reason: one_line(&e.to_string()),
+            };
+        }
+        _ => {}
+    }
+    match try_load(path) {
+        Ok(cfg) => MergeBase::Loaded(cfg),
+        Err(e) if permission_denied(&e) => MergeBase::Denied {
+            reason: one_line(&format!("{e:#}")),
+        },
+        Err(e) => MergeBase::Unreadable {
+            reason: one_line(&format!("{e:#}")),
+            recovered: try_load(&prev_path(path)).ok(),
+        },
+    }
+}
+
+/// #3116 — does an error chain hold an I/O "permission denied"? Windows'
+/// `ERROR_ACCESS_DENIED` (5) maps to it too.
+fn permission_denied(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
+/// #3116 — what to tell the person about a config this process may not read
+/// ([`MergeBase::Denied`]). The caller adds what to do about it, which is
+/// per platform (run the wizard elevated; fix a file's owner).
+pub fn describe_denied(path: &std::path::Path, reason: &str) -> String {
+    format!(
+        "{} is there, but this process may not read it ({reason}). It is not damaged, and \
+         nothing was written over it.",
+        path.display()
+    )
+}
+
+/// #3116 — can a [`save`] at `path` create its file? Creates the parent
+/// directory, as a save would, then creates and removes the same sibling temp
+/// file a save writes first. For a caller that is about to spend something it
+/// cannot get back, such as a single-use enrollment token, on a write that
+/// would fail: the setup wizard ran unelevated against the machine-global
+/// directory, enrolled, and only then failed on "creating parent dir".
+pub fn probe_writable(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    std::fs::File::create(&tmp)?;
+    std::fs::remove_file(&tmp)
+}
+
+/// Where [`keep_unreadable`] keeps a config that did not load:
+/// `config.toml.unreadable` beside it. Never `.prev`, which holds the last
+/// copy that DID load and is what a recovery reads.
+pub fn unreadable_copy_path(path: &std::path::Path) -> PathBuf {
+    path.with_extension("toml.unreadable")
+}
+
+/// Copy a config that does not load aside ([`unreadable_copy_path`]) before it
+/// is written over, so whatever the person can still read out of it by hand
+/// is not lost. 0600 on Unix: a damaged config can still hold a bearer token.
+pub fn keep_unreadable(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let dest = unreadable_copy_path(path);
+    std::fs::copy(path, &dest)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(dest)
+}
+
+/// What to tell the person about a config that did not load, once it has been
+/// (or could not be) kept aside: the path, the reason, whether its last good
+/// copy carries the device's settings over, and where the damaged file went.
+/// One wording for every caller (the setup wizard, `roomlerd
+/// adopt-enrollment`).
+pub fn describe_unreadable(
+    path: &std::path::Path,
+    reason: &str,
+    recovered: bool,
+    kept: &Result<PathBuf, String>,
+) -> String {
+    let what = if recovered {
+        format!(
+            "{} could not be read ({reason}). Its last good copy, {}, is used instead, so this \
+             device's settings carry over.",
+            path.display(),
+            prev_path(path).display()
+        )
+    } else {
+        format!(
+            "{} could not be read ({reason}) and has no usable previous copy: a fresh config is \
+             written, and this device's earlier settings (its private network, routes, lock \
+             policy …) do not carry over.",
+            path.display()
+        )
+    };
+    match kept {
+        Ok(copy) => format!("{what} The unreadable file is kept as {}.", copy.display()),
+        Err(e) => format!("{what} The unreadable file could not be kept ({e})."),
+    }
+}
+
+/// An error chain on one line, bounded: a TOML parse error carries a source
+/// snippet over several lines, which a progress row or a terminal line cannot
+/// show.
+fn one_line(text: &str) -> String {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() > 300 {
+        let cut: String = joined.chars().take(300).collect();
+        format!("{cut}…")
+    } else {
+        joined
+    }
+}
+
 fn try_load(path: &PathBuf) -> Result<AgentConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config at {}", path.display()))?;
@@ -3592,12 +3854,360 @@ fn try_load(path: &PathBuf) -> Result<AgentConfig> {
     Ok(cfg)
 }
 
+/// One step to a key in the config document, as `serde_ignored` reports where
+/// a key it skipped sits: a table key, or an entry of an array of tables
+/// (`[[orgs]]`, `[[tunnel_routes]]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyStep {
+    Key(String),
+    Index(usize),
+}
+
+/// #2078 — the keys in `raw` that this build's [`AgentConfig`] does not model,
+/// each as the steps to it: a key a newer build added, set ahead of the update
+/// that knows it or left behind by a rollback. Paths only, never values: the
+/// file holds the agent token and the overlay keys.
+///
+/// `Err` when `raw` does not parse as a config at all.
+fn unknown_keys(raw: &str) -> Result<Vec<Vec<KeyStep>>> {
+    let mut found = Vec::new();
+    let de = toml::de::Deserializer::parse(raw)?;
+    let _: AgentConfig = serde_ignored::deserialize(de, |path| found.push(key_steps(&path)))?;
+    Ok(found)
+}
+
+fn key_steps(path: &serde_ignored::Path<'_>) -> Vec<KeyStep> {
+    use serde_ignored::Path;
+    match path {
+        Path::Root => Vec::new(),
+        Path::Seq { parent, index } => {
+            let mut steps = key_steps(parent);
+            steps.push(KeyStep::Index(*index));
+            steps
+        }
+        Path::Map { parent, key } => {
+            let mut steps = key_steps(parent);
+            steps.push(KeyStep::Key(key.clone()));
+            steps
+        }
+        Path::Some { parent }
+        | Path::NewtypeStruct { parent }
+        | Path::NewtypeVariant { parent } => key_steps(parent),
+    }
+}
+
+/// `orgs.0.future_key`, for the log.
+fn dotted(steps: &[KeyStep]) -> String {
+    steps
+        .iter()
+        .map(|s| match s {
+            KeyStep::Key(k) => k.clone(),
+            KeyStep::Index(i) => i.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The key that names an entry of the array of tables `array`: an org's
+/// `tenant_id`, a route's `id`. THIS build's, per array — never a key read off
+/// the entry on disk, which a newer build wrote: an `id` it added to an org's
+/// entry looks like an identity and no org this build writes carries one, so
+/// keying on it finds nothing, and every key on the entry is lost — the old
+/// behaviour, in exactly the array the merge exists for. `tenant_id` and not
+/// `label` for an org: `promote_org_to_primary` puts the demoted primary under
+/// the promoted org's label. A route's `id` may be empty (`#[serde(default)]`),
+/// and an empty one is no identity: [`same_entry`] finds nothing by it.
+/// An array not named here (`forward_acl.allowlist`) has no identity, and a
+/// key inside one of its entries is dropped, with the WARN. A test holds every
+/// array of tables this build writes to naming its identity, or its lack of one.
+fn entry_identity(array: &str) -> Option<&'static str> {
+    match array {
+        "orgs" => Some("tenant_id"),
+        "tunnel_routes" => Some("id"),
+        _ => None,
+    }
+}
+
+/// Where `entry`, from the file being replaced, sits in `out` now — the array
+/// `array` as the save writes it: found by its identity, never by its
+/// position. A save that adds or removes an org moves the entries, and
+/// promoting one puts the demoted primary at the promoted org's index
+/// (`promote_org_to_primary`), so the same index can hold another org with the
+/// array's length unchanged. A key copied onto another org would be worse than
+/// a key lost. `None` when the array has no identity, the entry's is absent
+/// or empty, or not exactly one entry in `out` carries the same.
+fn same_entry(array: &str, entry: &toml::Table, out: &[toml::Value]) -> Option<usize> {
+    let key = entry_identity(array)?;
+    let want = entry
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let mut hits = out
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.get(key).and_then(toml::Value::as_str) == Some(want));
+    let (i, _) = hits.next()?;
+    hits.next().is_none().then_some(i)
+}
+
+/// Copies the key at `steps` from `disk` into `out`, which must already hold
+/// every table on the way; an entry of an array of tables is found by
+/// [`same_entry`]. `false` = not kept.
+fn copy_key(disk: &toml::Table, out: &mut toml::Table, steps: &[KeyStep]) -> bool {
+    match steps {
+        [KeyStep::Key(k)] => match disk.get(k) {
+            Some(value) => {
+                if !out.contains_key(k) {
+                    out.insert(k.clone(), value.clone());
+                }
+                true
+            }
+            None => false,
+        },
+        [KeyStep::Key(k), KeyStep::Index(n), rest @ ..] => {
+            let (Some(toml::Value::Array(d)), Some(toml::Value::Array(o))) =
+                (disk.get(k), out.get_mut(k))
+            else {
+                return false;
+            };
+            let Some(toml::Value::Table(entry)) = d.get(*n) else {
+                return false;
+            };
+            let Some(i) = same_entry(k, entry, o) else {
+                return false;
+            };
+            match o.get_mut(i) {
+                Some(toml::Value::Table(o)) => copy_key(entry, o, rest),
+                _ => false,
+            }
+        }
+        [KeyStep::Key(k), rest @ ..] => match (disk.get(k), out.get_mut(k)) {
+            (Some(toml::Value::Table(d)), Some(toml::Value::Table(o))) => copy_key(d, o, rest),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// #2078 — `plain` (the struct's own serialisation) plus every key of `raw`
+/// (the file being replaced) at `unknown`, each where it was. Read back, the
+/// result must serialise to exactly `plain`: the merge may only ADD what this
+/// build ignores and never change a key it knows, so a key it cleared stays
+/// cleared. Returns the text and the keys it could not keep.
+///
+/// The errors are fixed strings on purpose: a TOML error quotes the line it
+/// stopped at, and these lines hold the agent token and the overlay keys.
+fn merge_unknown_keys(
+    raw: &str,
+    plain: &str,
+    unknown: &[Vec<KeyStep>],
+) -> std::result::Result<(String, Vec<String>), &'static str> {
+    let disk: toml::Table =
+        toml::from_str(raw).map_err(|_| "the file being replaced did not parse as a table")?;
+    let mut out: toml::Table =
+        toml::from_str(plain).map_err(|_| "the config being saved did not parse as a table")?;
+    let mut lost = Vec::new();
+    for steps in unknown {
+        if !copy_key(&disk, &mut out, steps) {
+            lost.push(dotted(steps));
+        }
+    }
+    let merged = toml::to_string_pretty(&out).map_err(|_| "the merged table did not serialise")?;
+    let back: AgentConfig =
+        toml::from_str(&merged).map_err(|_| "the merged text did not read back as a config")?;
+    let again = toml::to_string_pretty(&back).map_err(|_| "the merged config did not serialise")?;
+    if again != plain {
+        return Err("the merged text changed a key this build knows");
+    }
+    Ok((merged, lost))
+}
+
+/// #2078 — the text [`save`] writes over `path`: `cfg`, plus every key `base`
+/// holds that this build does not model. `base` is the file being replaced:
+/// `path` itself, or on [`load`]'s recovery the `.prev` copy it loaded, since
+/// the live file it then writes over parses as nothing. Before this, every
+/// save erased them: a key set ahead of the update that knows it was gone by
+/// the old daemon's stop, and a rollback erased every newer key for good.
+///
+/// A base with no such key is written exactly as before, byte for byte, and
+/// any failure to keep them saves `cfg` alone and says so: the worst case is
+/// the old behaviour. Comments are still lost; that needs an in-place editor.
+fn serialise_for(
+    path: &std::path::Path,
+    base: &std::path::Path,
+    cfg: &AgentConfig,
+) -> Result<String> {
+    let plain = toml::to_string_pretty(cfg).context("serialising config")?;
+    let raw = match std::fs::read_to_string(base) {
+        Ok(raw) => raw,
+        // No file yet: a first save, nothing to keep.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(plain),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                base = %base.display(),
+                error = %e,
+                "the config being replaced could not be read: keys this build does not know \
+                 in it, if any, are NOT kept through this save"
+            );
+            return Ok(plain);
+        }
+    };
+    // Said with a fixed string: a parse error quotes the line it stopped at,
+    // and the file holds the agent token and the overlay keys. A live file
+    // that does not parse is what `load` recovers from `.prev`, and a save
+    // over it keeps the copy's keys only when its caller names the copy.
+    let Ok(unknown) = unknown_keys(&raw) else {
+        tracing::warn!(
+            path = %path.display(),
+            base = %base.display(),
+            "the config being replaced does not parse: keys this build does not know in it, \
+             if any, are NOT kept through this save"
+        );
+        return Ok(plain);
+    };
+    if unknown.is_empty() {
+        return Ok(plain);
+    }
+    match merge_unknown_keys(&raw, &plain, &unknown) {
+        Ok((merged, lost)) => {
+            if !lost.is_empty() {
+                tracing::warn!(
+                    path = %path.display(),
+                    base = %base.display(),
+                    keys = %lost.join(", "),
+                    "config keys this build does not know were NOT kept through this save: \
+                     the org, route or table that held them is not in it"
+                );
+            }
+            Ok(merged)
+        }
+        Err(why) => {
+            let keys: Vec<String> = unknown.iter().map(|s| dotted(s)).collect();
+            tracing::warn!(
+                path = %path.display(),
+                base = %base.display(),
+                keys = %keys.join(", "),
+                why,
+                "config keys this build does not know were NOT kept through this save"
+            );
+            Ok(plain)
+        }
+    }
+}
+
+/// #2078 — names the keys this build ignores in the config it runs on, once per
+/// process and file: after a rollback, or a key set ahead of the update that
+/// knows it, "my setting did nothing" has its answer in the log. Key paths
+/// only; the file holds secrets.
+fn note_unknown_keys(path: &PathBuf) {
+    static NOTED: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(unknown) = unknown_keys(&raw) else {
+        return;
+    };
+    if unknown.is_empty() {
+        return;
+    }
+    let keys = unknown
+        .iter()
+        .map(|s| dotted(s))
+        .collect::<Vec<_>>()
+        .join(", ");
+    {
+        let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
+        if noted.iter().any(|(p, k)| p == path && *k == keys) {
+            return;
+        }
+        noted.push((path.clone(), keys.clone()));
+    }
+    tracing::warn!(
+        path = %path.display(),
+        keys = %keys,
+        "config keys this build does not know: ignored here, and kept in the file through every save"
+    );
+}
+
 pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
+    save_with_base(path, path, cfg)
+}
+
+/// #3116 — the saves a daemon makes while it starts. They write the copy it
+/// LOADED (a migration stamp, a minted WireGuard or SSH key, the crash
+/// bookkeeping), where every later writer reloads the file under the
+/// daemon-wide write lock first (the clean-run promotion, the LocalAPI, remote
+/// configuration, `org join`). So these are the only writes that can put an
+/// older copy back over a newer one, and on Windows one did: the MSI restarts
+/// the service before the setup wizard writes the enrollment it folded, the
+/// worker loads the file from before the reinstall, and its first save, a
+/// second after the wizard's, wrote that copy back. The reinstall's new
+/// enrollment never took.
+///
+/// A startup save therefore replaces the file only while it is still the one
+/// this daemon loaded or last wrote itself. Once another process has written
+/// it, the save is refused: this run keeps its in-memory copy, and the next
+/// start runs on the newer file. The writer restarts the daemon onto it, as
+/// the setup wizard and `install.sh` do.
+pub struct StartupWrites {
+    path: PathBuf,
+    /// The file as this daemon last knew it: read right after the load, then
+    /// after each of its own saves. `None` when it could not be read, which
+    /// leaves the saves unguarded, as they all were before.
+    seen: Option<Vec<u8>>,
+}
+
+impl StartupWrites {
+    /// Call right after [`load`] has returned the config this daemon runs on.
+    /// The file is read again here, so a write landing between the load's read
+    /// and this one, microseconds apart, would pass for the daemon's own copy.
+    /// The setup wizard never writes there: it waits for the daemon's LocalAPI,
+    /// which comes up after every startup save.
+    pub fn after_load(path: &std::path::Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            seen: std::fs::read(path).ok(),
+        }
+    }
+
+    /// [`save`] `cfg`, unless another process has written the file since this
+    /// daemon loaded it or last wrote it. A file that is gone, or cannot be
+    /// read back, is not written either: an uninstall or an unenroll removed
+    /// it, and a startup save must not bring the enrollment back.
+    pub fn save(&mut self, cfg: &AgentConfig) -> Result<()> {
+        if let Some(seen) = &self.seen {
+            let now = std::fs::read(&self.path).with_context(|| {
+                format!(
+                    "{} could not be read back before a startup save, so it is not written",
+                    self.path.display()
+                )
+            })?;
+            if &now != seen {
+                anyhow::bail!(
+                    "{} changed on disk after this daemon loaded it: another process wrote it \
+                     (a re-enrollment, an installer). This run's copy is not written over it, \
+                     and the next start runs on the newer file",
+                    self.path.display()
+                );
+            }
+        }
+        save(&self.path, cfg)?;
+        self.seen = std::fs::read(&self.path).ok();
+        Ok(())
+    }
+}
+
+/// [`save`], keeping the keys this build does not know of `base` rather than
+/// of the file at `path` (#2078): [`load`]'s recovery reinstates the `.prev`
+/// copy it loaded over a live file that does not parse, and the keys to keep
+/// are the copy's.
+fn save_with_base(path: &PathBuf, base: &std::path::Path, cfg: &AgentConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir {}", parent.display()))?;
     }
-    let serialised = toml::to_string_pretty(cfg).context("serialising config")?;
+    let serialised = serialise_for(path, base, cfg)?;
 
     // ATOMIC (P6 hardening): write a sibling temp file, then rename over
     // the target. The file holds `agent_token` — a torn `fs::write`
@@ -3709,10 +4319,17 @@ mod tests {
         cfg.overlay_pathmon = Some("shadow".into());
         cfg.encoder_cells_deny = Some("h264/nvenc".into());
         cfg.fps_deny = Some("hevc_qsv:120".into());
+        cfg.zero_copy = Some(true);
+        cfg.zero_copy_deny = Some("hevc_qsv:gpu".into());
         cfg.nvenc_split = Some("off".into());
+        // FR-130 — default ON, so the direction worth bridging is the off.
+        cfg.color_description = Some(false);
         let m = env_fallbacks(&cfg);
         let get = |k: &str| m.get(k).map(String::as_str);
         assert_eq!(get("FPS_DENY"), Some("hevc_qsv:120"));
+        assert_eq!(get("ZERO_COPY"), Some("1"));
+        assert_eq!(get("COLOR_DESCRIPTION"), Some("0"));
+        assert_eq!(get("ZERO_COPY_DENY"), Some("hevc_qsv:gpu"));
         assert_eq!(get("NVENC_SPLIT"), Some("off"));
         assert_eq!(get("DRM_CAPTURE"), Some("1"));
         assert_eq!(
@@ -3875,6 +4492,645 @@ machine_name = "devbox"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn unknown_names(path: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = unknown_keys(&std::fs::read_to_string(path).unwrap())
+            .unwrap()
+            .iter()
+            .map(|s| dotted(s))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn saved_table(path: &std::path::Path) -> toml::Table {
+        toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// #2078 / #2972 — what the running build does not model survives its
+    /// saves: a top-level key (the field cases were `mutter_input` under 0.4.131
+    /// and `hive_worker` under 0.4.177), a whole table, and a key inside a table
+    /// this build does know. The change the save was for is made, and a second
+    /// save keeps them too: the field defect showed at the NEXT start.
+    #[test]
+    fn keys_this_build_does_not_know_survive_its_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = format!(
+            "a_key_from_a_newer_build = true\n{}\n[forward_acl]\nenabled = true\n\
+             rule_from_a_newer_build = \"strict\"\n\n[a_table_from_a_newer_build]\nlimit = 7\n",
+            minimal_toml()
+        );
+        std::fs::write(&path, raw).unwrap();
+        let want = [
+            "a_key_from_a_newer_build",
+            "a_table_from_a_newer_build",
+            "forward_acl.rule_from_a_newer_build",
+        ];
+        assert_eq!(unknown_names(&path), want);
+
+        let mut cfg = load(&path).expect("a file with keys this build does not know still loads");
+        cfg.machine_name = "renamed".into();
+        save(&path, &cfg).unwrap();
+        let table = saved_table(&path);
+        assert_eq!(table["a_key_from_a_newer_build"].as_bool(), Some(true));
+        assert_eq!(
+            table["forward_acl"]["rule_from_a_newer_build"].as_str(),
+            Some("strict")
+        );
+        assert_eq!(
+            table["a_table_from_a_newer_build"]["limit"].as_integer(),
+            Some(7)
+        );
+        let back = try_load(&path).unwrap();
+        assert_eq!(back.machine_name, "renamed", "the change the save was for");
+        assert_eq!(back.agent_token, "tok");
+
+        save(&path, &back).unwrap();
+        assert_eq!(unknown_names(&path), want, "and through the next save");
+        assert_eq!(try_load(&path).unwrap().machine_name, "renamed");
+    }
+
+    /// #2078 — only keys this build IGNORES are carried over. One it knows and
+    /// the save cleared stays cleared, though the file being replaced had it.
+    #[test]
+    fn a_known_key_the_save_cleared_stays_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = format!(
+            "zero_copy = true\na_key_from_a_newer_build = 1\n{}",
+            minimal_toml()
+        );
+        std::fs::write(&path, raw).unwrap();
+        let mut cfg = load(&path).unwrap();
+        assert_eq!(cfg.zero_copy, Some(true));
+        cfg.zero_copy = None;
+        save(&path, &cfg).unwrap();
+        let table = saved_table(&path);
+        assert!(
+            !table.contains_key("zero_copy"),
+            "a cleared key came back: {table:?}"
+        );
+        assert_eq!(table["a_key_from_a_newer_build"].as_integer(), Some(1));
+    }
+
+    /// #2078 — a file with nothing unknown in it is written exactly as before
+    /// the fix, byte for byte: the merge runs only when there is something to
+    /// keep.
+    #[test]
+    fn a_file_with_nothing_unknown_is_written_exactly_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture();
+        cfg.orgs = vec![org_fixture("acme", "tid-acme")];
+        save(&path, &cfg).unwrap();
+        save(&path, &cfg).unwrap(); // reads the first save: nothing unknown in it
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            toml::to_string_pretty(&cfg).unwrap()
+        );
+    }
+
+    /// #2078 — a key a newer build wrote into an org's entry follows THAT org,
+    /// found by its `tenant_id`, through a save that moves it, and is dropped
+    /// (with a WARN) once the org is gone. Never by position and never by label:
+    /// promoting an org puts the demoted primary at the promoted org's index,
+    /// under the promoted org's label, with the array's length unchanged.
+    #[test]
+    fn an_org_entrys_unknown_key_follows_its_org() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture(); // primary tenant: "tid"
+        cfg.orgs = vec![
+            org_fixture("zeta", "tid-z"),
+            org_fixture("acme", "tid-acme"),
+            org_fixture("beta", "tid-beta"),
+        ];
+        save(&path, &cfg).unwrap();
+        // A newer build wrote a key into acme's entry and into beta's.
+        let mut table = saved_table(&path);
+        for i in [1usize, 2] {
+            table
+                .get_mut("orgs")
+                .and_then(|v| v.as_array_mut())
+                .and_then(|orgs| orgs.get_mut(i))
+                .and_then(|org| org.as_table_mut())
+                .unwrap()
+                .insert(
+                    "org_key_from_a_newer_build".into(),
+                    toml::Value::Integer(i as i64),
+                );
+        }
+        std::fs::write(&path, toml::to_string_pretty(&table).unwrap()).unwrap();
+        assert_eq!(
+            unknown_names(&path),
+            [
+                "orgs.1.org_key_from_a_newer_build",
+                "orgs.2.org_key_from_a_newer_build"
+            ]
+        );
+
+        // Removing zeta moves acme and beta down one: each key goes with its org.
+        let mut moved = load(&path).unwrap();
+        moved.orgs.remove(0);
+        save(&path, &moved).unwrap();
+        let orgs = saved_table(&path)["orgs"].as_array().unwrap().clone();
+        assert_eq!(orgs[0]["tenant_id"].as_str(), Some("tid-acme"));
+        assert_eq!(orgs[0]["org_key_from_a_newer_build"].as_integer(), Some(1));
+        assert_eq!(orgs[1]["tenant_id"].as_str(), Some("tid-beta"));
+        assert_eq!(orgs[1]["org_key_from_a_newer_build"].as_integer(), Some(2));
+
+        // Promoting acme puts the demoted primary at acme's index, under acme's
+        // label. acme's key does not pass to it, and beta's stays on beta.
+        let mut promoted = load(&path).unwrap();
+        promote_org_to_primary(&mut promoted, "acme", None).unwrap();
+        save(&path, &promoted).unwrap();
+        let orgs = saved_table(&path)["orgs"].as_array().unwrap().clone();
+        assert_eq!(orgs.len(), 2);
+        assert_eq!(
+            orgs[0]["tenant_id"].as_str(),
+            Some("tid"),
+            "the demoted primary"
+        );
+        assert_eq!(
+            orgs[0]["label"].as_str(),
+            Some("acme"),
+            "under acme's label"
+        );
+        assert!(
+            orgs[0].get("org_key_from_a_newer_build").is_none(),
+            "acme's key went to another org: {orgs:?}"
+        );
+        assert_eq!(orgs[1]["org_key_from_a_newer_build"].as_integer(), Some(2));
+    }
+
+    /// #2078 — a file that carries one unknown key is not re-sorted around it:
+    /// the merged text keeps the struct's own order (`preserve_order`).
+    #[test]
+    fn a_merged_file_keeps_the_structs_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture();
+        cfg.orgs = vec![org_fixture("acme", "tid-acme")];
+        save(&path, &cfg).unwrap();
+        let plain = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("a_key_from_a_newer_build = true\n{plain}")).unwrap();
+        save(&path, &cfg).unwrap();
+        let merged = std::fs::read_to_string(&path).unwrap();
+        let lines = |text: &str| -> Vec<String> {
+            text.lines()
+                .map(|l| l.split(" = ").next().unwrap_or("").trim().to_string())
+                .filter(|k| !k.is_empty() && k != "a_key_from_a_newer_build")
+                .collect()
+        };
+        assert_eq!(lines(&merged), lines(&plain), "{merged}");
+        assert!(
+            merged.contains("a_key_from_a_newer_build = true"),
+            "{merged}"
+        );
+    }
+
+    /// The merge's own guard. Were the unknown-key scan ever to name a key this
+    /// build knows, the read-back check refuses the merge, and `save` writes the
+    /// plain struct, rather than bring a cleared value back.
+    #[test]
+    fn the_merge_refuses_to_change_a_key_this_build_knows() {
+        let mut cfg: AgentConfig = toml::from_str(&minimal_toml()).unwrap();
+        cfg.zero_copy = None;
+        let plain = toml::to_string_pretty(&cfg).unwrap();
+        let raw = format!("zero_copy = true\n{}", minimal_toml());
+        let wrong = [vec![KeyStep::Key("zero_copy".into())]];
+        assert_eq!(
+            merge_unknown_keys(&raw, &plain, &wrong).unwrap_err(),
+            "the merged text changed a key this build knows"
+        );
+    }
+
+    /// A declared route for the save tests; `id` is the identity an entry is
+    /// found by, and may be empty.
+    fn route_fixture(id: &str, local: u16) -> roomler_localapi::RouteDescriptor {
+        roomler_localapi::RouteDescriptor {
+            id: id.to_string(),
+            kind: roomler_localapi::FlowKind::Forward,
+            node: "aid".into(),
+            local,
+            remote: Some("127.0.0.1:80".into()),
+            transport: String::new(),
+            enabled: true,
+            org: None,
+        }
+    }
+
+    /// Writes `key = value` into entry `i` of the array of tables `array` in
+    /// the file at `path`, as a newer build would.
+    fn write_entry_key(
+        path: &std::path::Path,
+        array: &str,
+        i: usize,
+        key: &str,
+        value: toml::Value,
+    ) {
+        let mut table = saved_table(path);
+        table
+            .get_mut(array)
+            .and_then(|v| v.as_array_mut())
+            .and_then(|entries| entries.get_mut(i))
+            .and_then(|entry| entry.as_table_mut())
+            .unwrap()
+            .insert(key.into(), value);
+        std::fs::write(path, toml::to_string_pretty(&table).unwrap()).unwrap();
+    }
+
+    /// What a capturing test holds: its scoped subscriber, and a SECOND
+    /// registered dispatcher, never one alone. With exactly one registered,
+    /// tracing-core rebuilds a callsite's interest from the default of
+    /// whichever thread reaches it first (`Rebuilder::JustOne`) and caches it
+    /// for every thread: a parallel test with no subscriber of its own makes
+    /// it `never`, and the capture misses that line for good, though this
+    /// thread emitted it. Measured in CI on two of the save tests. With two,
+    /// every registered dispatcher is asked, as `pairing_terminal`'s and the
+    /// hive tests' captures hold. The scope ends first, then the second.
+    struct CaptureGuard {
+        _scoped: tracing::dispatcher::DefaultGuard,
+        _second: tracing::Dispatch,
+    }
+
+    /// Everything this thread logs while the guard lives, as text.
+    fn captured() -> (Captured, CaptureGuard) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let cap = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(cap.clone())
+                .with_ansi(false),
+        );
+        let scoped = tracing::subscriber::set_default(subscriber);
+        (
+            cap,
+            CaptureGuard {
+                _scoped: scoped,
+                _second: second,
+            },
+        )
+    }
+
+    /// #2078 — the identity an entry is found by is THIS build's (an org's
+    /// `tenant_id`), never read off the entry on disk. A newer build added an
+    /// `id` to the org's entry: read off the entry, that was the identity, no
+    /// org this build writes has one, and the entry was found nowhere — so
+    /// both `id` and the key beside it were lost at the first save, with a
+    /// WARN, in exactly the array the merge exists for.
+    #[test]
+    fn an_identity_key_this_build_does_not_know_does_not_lose_the_entrys_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture();
+        cfg.orgs = vec![org_fixture("acme", "tid-acme")];
+        save(&path, &cfg).unwrap();
+        write_entry_key(
+            &path,
+            "orgs",
+            0,
+            "id",
+            toml::Value::String("org-row-id".into()),
+        );
+        write_entry_key(
+            &path,
+            "orgs",
+            0,
+            "org_key_from_a_newer_build",
+            toml::Value::Integer(7),
+        );
+        assert_eq!(
+            unknown_names(&path),
+            ["orgs.0.id", "orgs.0.org_key_from_a_newer_build"]
+        );
+
+        let (cap, _guard) = captured();
+        save(&path, &load(&path).unwrap()).unwrap();
+        let orgs = saved_table(&path)["orgs"].as_array().unwrap().clone();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0]["tenant_id"].as_str(), Some("tid-acme"));
+        assert_eq!(
+            orgs[0].get("id").and_then(toml::Value::as_str),
+            Some("org-row-id"),
+            "{orgs:?}"
+        );
+        assert_eq!(
+            orgs[0]
+                .get("org_key_from_a_newer_build")
+                .and_then(toml::Value::as_integer),
+            Some(7),
+            "{orgs:?}"
+        );
+        let log = cap.text();
+        assert!(!log.contains("NOT kept"), "{log}");
+    }
+
+    /// #2078 — a recovery from `.prev` keeps the copy's keys this build does
+    /// not know. `load` reinstates the copy over a live file that does not
+    /// parse, and the keys to keep are the copy's: read off the live file,
+    /// the base every other save reads, there was nothing to parse, so the
+    /// recovered host was written without them and nothing said so — at the
+    /// one save that follows the event a `.prev` exists for.
+    #[test]
+    fn a_recovery_from_prev_keeps_the_keys_this_build_does_not_know() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg: AgentConfig = toml::from_str(&minimal_toml()).unwrap();
+        std::fs::write(
+            &path,
+            format!("a_key_from_a_newer_build = true\n{}", minimal_toml()),
+        )
+        .unwrap();
+        // Rotates the hand-written file into .prev, and keeps its key.
+        save(&path, &cfg).unwrap();
+        assert_eq!(
+            unknown_names(&prev_path(&path)),
+            ["a_key_from_a_newer_build"]
+        );
+        assert_eq!(unknown_names(&path), ["a_key_from_a_newer_build"]);
+
+        // An unclean shutdown: the live file is the right length and all NUL.
+        let len = std::fs::metadata(&path).unwrap().len() as usize;
+        std::fs::write(&path, vec![0u8; len]).unwrap();
+
+        let (cap, _guard) = captured();
+        let healed = load(&path).expect("recovers from .prev");
+        assert_eq!(healed.agent_token, "tok");
+        let table = saved_table(&path);
+        assert_eq!(
+            table
+                .get("a_key_from_a_newer_build")
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "the reinstated file lost the copy's key: {table:?}"
+        );
+        assert_eq!(unknown_names(&path), ["a_key_from_a_newer_build"]);
+        let log = cap.text();
+        assert!(log.contains("RECOVERED"), "{log}");
+        assert!(
+            log.contains("kept in the file through every save"),
+            "a recovered config's unknown keys are named, as every load's are; got: {log}"
+        );
+        assert!(!log.contains("NOT kept"), "{log}");
+    }
+
+    /// #2078 — a key a newer build wrote into a route's entry follows THAT
+    /// route, found by its `id`, through a save that reorders them.
+    #[test]
+    fn a_route_entrys_unknown_key_follows_its_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture();
+        cfg.tunnel_routes = vec![route_fixture("r1", 18080), route_fixture("r2", 18081)];
+        save(&path, &cfg).unwrap();
+        for (i, port) in [(0usize, 18080i64), (1, 18081)] {
+            write_entry_key(
+                &path,
+                "tunnel_routes",
+                i,
+                "route_key_from_a_newer_build",
+                toml::Value::Integer(port),
+            );
+        }
+        assert_eq!(
+            unknown_names(&path),
+            [
+                "tunnel_routes.0.route_key_from_a_newer_build",
+                "tunnel_routes.1.route_key_from_a_newer_build"
+            ]
+        );
+
+        let mut moved = load(&path).unwrap();
+        moved.tunnel_routes.reverse();
+        save(&path, &moved).unwrap();
+        let routes = saved_table(&path)["tunnel_routes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(routes[0]["id"].as_str(), Some("r2"));
+        assert_eq!(
+            routes[0]["route_key_from_a_newer_build"].as_integer(),
+            Some(18081)
+        );
+        assert_eq!(routes[1]["id"].as_str(), Some("r1"));
+        assert_eq!(
+            routes[1]["route_key_from_a_newer_build"].as_integer(),
+            Some(18080)
+        );
+    }
+
+    /// #2078 — a route's `id` can be empty (`#[serde(default)]`), and an empty
+    /// id is no identity: two such routes, reordered, each lose their key,
+    /// with the WARN naming both, and neither key lands on the other route.
+    #[test]
+    fn routes_without_an_id_have_no_identity_and_their_keys_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture();
+        cfg.tunnel_routes = vec![route_fixture("", 18080), route_fixture("", 18081)];
+        save(&path, &cfg).unwrap();
+        for (i, port) in [(0usize, 18080i64), (1, 18081)] {
+            write_entry_key(
+                &path,
+                "tunnel_routes",
+                i,
+                "route_key_from_a_newer_build",
+                toml::Value::Integer(port),
+            );
+        }
+
+        let (cap, _guard) = captured();
+        let mut moved = load(&path).unwrap();
+        moved.tunnel_routes.reverse();
+        save(&path, &moved).unwrap();
+        let routes = saved_table(&path)["tunnel_routes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0]["local"].as_integer(), Some(18081));
+        for route in &routes {
+            assert!(
+                route.get("route_key_from_a_newer_build").is_none(),
+                "a key landed on a route it may not belong to: {routes:?}"
+            );
+        }
+        let log = cap.text();
+        assert!(log.contains("NOT kept"), "{log}");
+        assert!(
+            log.contains("tunnel_routes.0.route_key_from_a_newer_build")
+                && log.contains("tunnel_routes.1.route_key_from_a_newer_build"),
+            "{log}"
+        );
+    }
+
+    /// #2078 — an empty route `id` is no identity even when exactly one route
+    /// has it: a 1:1 pair of empty ids is not a match. Its key is dropped, with
+    /// the WARN naming that key alone, while the key on the route beside it,
+    /// found by its `id`, is kept.
+    #[test]
+    fn a_route_with_an_empty_id_has_no_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = fixture();
+        cfg.tunnel_routes = vec![route_fixture("", 18080), route_fixture("r1", 18081)];
+        save(&path, &cfg).unwrap();
+        for (i, port) in [(0usize, 18080i64), (1, 18081)] {
+            write_entry_key(
+                &path,
+                "tunnel_routes",
+                i,
+                "route_key_from_a_newer_build",
+                toml::Value::Integer(port),
+            );
+        }
+
+        let (cap, _guard) = captured();
+        // Same order, same index: the one pairing an empty id could match.
+        save(&path, &load(&path).unwrap()).unwrap();
+        let routes = saved_table(&path)["tunnel_routes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(routes[0]["id"].as_str(), Some(""));
+        assert!(
+            routes[0].get("route_key_from_a_newer_build").is_none(),
+            "an empty id matched a route: {routes:?}"
+        );
+        assert_eq!(
+            routes[1]["route_key_from_a_newer_build"].as_integer(),
+            Some(18081)
+        );
+        let log = cap.text();
+        let lost = log
+            .lines()
+            .find(|l| l.contains("NOT kept"))
+            .unwrap_or_default();
+        assert!(
+            lost.contains("tunnel_routes.0.route_key_from_a_newer_build")
+                && !lost.contains("tunnel_routes.1."),
+            "{log}"
+        );
+    }
+
+    /// #2078 — every kind of value TOML can hold is kept as written through
+    /// two saves: a datetime, a float, an inline table, a mixed array, a
+    /// quoted key, a whole `[[array]]` of tables and an empty table. Two
+    /// saves, because the field defect showed at the NEXT start.
+    #[test]
+    fn every_kind_of_value_survives_two_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = format!(
+            "when = 2026-10-28T10:00:00Z\nratio = 0.5\nextra = {{ a = 1, b = \"two\" }}\n\
+             \"a.quoted.key\" = true\nmixed = [1, \"a\"]\n{}\n\
+             [[things_from_a_newer_build]]\nname = \"x\"\n\n\
+             [[things_from_a_newer_build]]\nname = \"y\"\n\n\
+             [an_empty_table_from_a_newer_build]\n",
+            minimal_toml()
+        );
+        std::fs::write(&path, raw).unwrap();
+        let want = [
+            "a.quoted.key",
+            "an_empty_table_from_a_newer_build",
+            "extra",
+            "mixed",
+            "ratio",
+            "things_from_a_newer_build",
+            "when",
+        ];
+        assert_eq!(unknown_names(&path), want);
+        let check = |table: toml::Table| {
+            assert_eq!(
+                table["when"]
+                    .as_datetime()
+                    .map(ToString::to_string)
+                    .as_deref(),
+                Some("2026-10-28T10:00:00Z")
+            );
+            assert_eq!(table["ratio"].as_float(), Some(0.5));
+            assert_eq!(table["extra"]["a"].as_integer(), Some(1));
+            assert_eq!(table["extra"]["b"].as_str(), Some("two"));
+            assert_eq!(table["a.quoted.key"].as_bool(), Some(true));
+            assert_eq!(table["mixed"][0].as_integer(), Some(1));
+            assert_eq!(table["mixed"][1].as_str(), Some("a"));
+            let things = table["things_from_a_newer_build"].as_array().unwrap();
+            assert_eq!(things.len(), 2);
+            assert_eq!(things[1]["name"].as_str(), Some("y"));
+            assert_eq!(
+                table["an_empty_table_from_a_newer_build"]
+                    .as_table()
+                    .map(|t| t.len()),
+                Some(0)
+            );
+        };
+
+        let mut cfg = load(&path).unwrap();
+        cfg.machine_name = "renamed".into();
+        save(&path, &cfg).unwrap();
+        check(saved_table(&path));
+        let back = try_load(&path).unwrap();
+        assert_eq!(back.machine_name, "renamed", "the change the save was for");
+        save(&path, &back).unwrap();
+        check(saved_table(&path));
+        assert_eq!(unknown_names(&path), want, "and through the next save");
+    }
+
+    /// Every array of tables this build writes either names the key its
+    /// entries are found by (`entry_identity`) or is listed here as having
+    /// none — a key inside an entry of such an array is dropped, with the
+    /// WARN, at every save. A new `Vec<SomeTable>` field has to choose.
+    #[test]
+    fn every_array_of_tables_this_build_writes_names_its_identity() {
+        const NO_IDENTITY: [&str; 1] = ["forward_acl.allowlist"];
+        let raw = format!(
+            "{}\n[[forward_acl.allowlist]]\n\
+             host_pattern = {{ kind = \"exact\", value = \"db.intranet\" }}\n\
+             port_range = {{ low = 5432, high = 5432 }}\n",
+            minimal_toml()
+        );
+        let mut cfg: AgentConfig = toml::from_str(&raw).expect("a rule parses");
+        cfg.orgs = vec![org_fixture("acme", "tid-acme")];
+        cfg.tunnel_routes = vec![route_fixture("r1", 18080)];
+        let written: toml::Table = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+
+        fn arrays_of_tables(prefix: &str, table: &toml::Table, found: &mut Vec<(String, String)>) {
+            for (key, value) in table {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                match value {
+                    toml::Value::Array(items) if items.iter().any(toml::Value::is_table) => {
+                        found.push((path, key.clone()));
+                    }
+                    toml::Value::Table(inner) => arrays_of_tables(&path, inner, found),
+                    _ => {}
+                }
+            }
+        }
+        let mut found = Vec::new();
+        arrays_of_tables("", &written, &mut found);
+        let mut paths: Vec<&str> = found.iter().map(|(p, _)| p.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            ["forward_acl.allowlist", "orgs", "tunnel_routes"],
+            "the arrays of tables this build writes changed: give the new one an identity in \
+             entry_identity or list it in NO_IDENTITY, and add it here"
+        );
+        for (path, key) in &found {
+            assert!(
+                entry_identity(key).is_some() || NO_IDENTITY.contains(&path.as_str()),
+                "[[{path}]] names no identity for its entries (entry_identity) and is not \
+                 listed as having none"
+            );
+        }
     }
 
     #[test]
@@ -4766,15 +6022,7 @@ tenant_id = "tid2"
     /// BOOLEAN while telling every healthy host to re-enroll.
     #[test]
     fn a_probe_is_silent_but_load_still_demands_re_enrollment() {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        let cap = Captured::default();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(cap.clone())
-                .with_ansi(false),
-        );
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (cap, _guard) = captured();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("config.toml");
@@ -4812,5 +6060,389 @@ tenant_id = "tid2"
             load_log.contains("ERROR"),
             "load must still report at ERROR; got: {load_log}"
         );
+    }
+
+    /// FR-129 B1 — a merge reads the three cases apart, where the probe
+    /// ([`read_if_present`]) sees `None` for every one of them: nothing there,
+    /// a config that loads, and a file that is there and does not load.
+    #[test]
+    fn a_merge_tells_absent_loaded_and_unreadable_apart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        assert!(matches!(read_merge_base(&path), MergeBase::Absent));
+
+        let mut cfg = test_fixture();
+        cfg.overlay_enabled = true;
+        save(&path, &cfg).expect("save");
+        match read_merge_base(&path) {
+            MergeBase::Loaded(c) => assert!(c.overlay_enabled),
+            other => panic!("{other:?}"),
+        }
+
+        // A hand edit with a typo: the probe calls it absent.
+        std::fs::write(&path, "overlay_enabled = ture\n").expect("write");
+        assert!(read_if_present(&path).is_none(), "the probe's view");
+        match read_merge_base(&path) {
+            MergeBase::Unreadable { reason, recovered } => {
+                assert!(reason.contains("parsing config"), "{reason}");
+                assert!(!reason.contains('\n'), "one line: {reason}");
+                assert!(recovered.is_none(), "no .prev was ever written");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// FR-129 B1 — a damaged config whose last good copy loads is recovered
+    /// from it, as `load` would at the daemon's next start, and nothing is
+    /// written by the read; the damaged file is kept aside, never over `.prev`.
+    #[test]
+    fn a_damaged_config_recovers_from_prev_and_is_kept_aside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut first = test_fixture();
+        first.overlay_enabled = true;
+        save(&path, &first).expect("first save");
+        let mut second = first.clone();
+        second.machine_name = "second".into();
+        save(&path, &second).expect("second save: rotates the first to .prev");
+        // An unclean shutdown: the live file is the right length and all NUL.
+        let len = std::fs::metadata(&path).unwrap().len() as usize;
+        std::fs::write(&path, vec![0u8; len]).expect("zero it");
+        let damaged = std::fs::read(&path).unwrap();
+
+        let base = read_merge_base(&path);
+        let (reason, recovered) = match base {
+            MergeBase::Unreadable { reason, recovered } => (reason, recovered),
+            other => panic!("{other:?}"),
+        };
+        assert!(reason.contains("NUL"), "{reason}");
+        let recovered = recovered.expect("the .prev copy loads");
+        assert!(recovered.overlay_enabled, "the operator state is there");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            damaged,
+            "a read writes nothing"
+        );
+
+        let kept = keep_unreadable(&path).map_err(|e| e.to_string());
+        let copy = kept.clone().expect("kept");
+        assert_eq!(copy, unreadable_copy_path(&path));
+        assert_eq!(std::fs::read(&copy).unwrap(), damaged);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "it can still hold a bearer token");
+        }
+        assert!(
+            try_load(&prev_path(&path)).is_ok(),
+            ".prev is still the last good copy"
+        );
+
+        let said = describe_unreadable(&path, &reason, true, &kept);
+        assert!(said.contains("config.toml.prev"), "{said}");
+        assert!(said.contains("config.toml.unreadable"), "{said}");
+        assert!(said.contains("carry over"), "{said}");
+        let said = describe_unreadable(&path, &reason, false, &Err("denied".into()));
+        assert!(said.contains("do not carry over"), "{said}");
+        assert!(said.contains("could not be kept (denied)"), "{said}");
+
+        // The fold's view: the recovered config.
+        assert!(
+            read_merge_base(&path)
+                .into_config()
+                .is_some_and(|c| c.overlay_enabled)
+        );
+    }
+
+    /// #3116 — a read this process is refused is `Denied`, never `Unreadable`:
+    /// the file is closed to the reader, not damaged, and the wizard that read
+    /// it as damaged told the person their settings were lost.
+    #[test]
+    fn a_refused_read_is_denied_not_damaged() {
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("reading config at C:\\ProgramData\\roomler\\roomler\\config.toml");
+        assert!(permission_denied(&denied));
+        let parse = anyhow::anyhow!("expected a value").context("parsing config");
+        assert!(!permission_denied(&parse));
+        let said = describe_denied(
+            std::path::Path::new("C:/ProgramData/roomler/roomler/config.toml"),
+            "Access is denied. (os error 5)",
+        );
+        assert!(said.contains("may not read it"), "{said}");
+        assert!(said.contains("not damaged"), "{said}");
+        assert!(
+            !said.contains("do not carry over"),
+            "never the damaged wording: {said}"
+        );
+    }
+
+    /// #3116 — the same on a real file system: a config in a directory this
+    /// process may not open is `Denied`, and a directory it may not write fails
+    /// the probe that runs before an enrollment token is spent. Root reads and
+    /// writes past any mode, so as root there is nothing to see.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_directory_is_denied_and_fails_the_write_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = dir.path().join("roomler");
+        let path = sub.join("config.toml");
+        save(&path, &test_fixture()).expect("save");
+        assert!(probe_writable(&path).is_ok(), "an open directory");
+
+        let mode = |m: u32| std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(m));
+        mode(0o000).unwrap();
+        let root = std::fs::read(&path).is_ok();
+        let base = read_merge_base(&path);
+        mode(0o500).unwrap();
+        let probe = probe_writable(&path);
+        mode(0o700).unwrap();
+        if root {
+            return;
+        }
+        assert!(matches!(base, MergeBase::Denied { .. }), "{base:?}");
+        assert_eq!(
+            probe.expect_err("no write").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::read_dir(&sub).unwrap().count(),
+            1,
+            "the probe leaves nothing behind"
+        );
+    }
+
+    /// #3116 — a startup save lands while the file is the daemon's own copy,
+    /// and is refused once another process has written it. The setup wizard
+    /// wrote the folded enrollment a second after the MSI restarted the
+    /// service; the worker's first startup save put the copy it had loaded
+    /// before the reinstall back over it.
+    #[test]
+    fn a_startup_save_never_writes_over_a_newer_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut before = test_fixture();
+        before.agent_token = "OLD".into();
+        save(&path, &before).expect("the install before the reinstall");
+
+        // The daemon loads it and saves its own changes twice: both land.
+        let mut cfg = load(&path).expect("load");
+        let mut writes = StartupWrites::after_load(&path);
+        mark_run_starting(&mut cfg);
+        writes.save(&cfg).expect("the daemon's first save");
+        cfg.overlay_wg_secret_key = Some("KEY".into());
+        writes.save(&cfg).expect("its second, over its own first");
+        assert_eq!(
+            load(&path).unwrap().overlay_wg_secret_key.as_deref(),
+            Some("KEY")
+        );
+
+        // The wizard writes the folded enrollment.
+        let mut folded = load(&path).unwrap();
+        folded.agent_token = "NEW".into();
+        save(&path, &folded).expect("the wizard's write");
+        let wizard = std::fs::read(&path).unwrap();
+
+        // The daemon's next startup save is refused; the file stays the wizard's.
+        let err = writes.save(&cfg).expect_err("refused");
+        assert!(format!("{err:#}").contains("changed on disk"), "{err:#}");
+        assert_eq!(std::fs::read(&path).unwrap(), wizard);
+        assert_eq!(load(&path).unwrap().agent_token, "NEW");
+    }
+
+    /// #3116 — a config removed while the daemon starts (an unenroll, an
+    /// uninstall) is not brought back by a startup save.
+    #[test]
+    fn a_startup_save_never_recreates_a_removed_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        save(&path, &test_fixture()).expect("save");
+        let cfg = load(&path).expect("load");
+        let mut writes = StartupWrites::after_load(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(writes.save(&cfg).is_err());
+        assert!(!path.exists());
+    }
+
+    /// #3073 — ownership and the grant come before anything that can remove
+    /// access: once `/inheritance:r` has run, SYSTEM keeps the directory by
+    /// owning it, and a child it does not own only through an ACE the
+    /// directory already hands down.
+    #[test]
+    fn harden_takes_ownership_and_grants_before_it_drops_inheritance() {
+        assert_eq!(HARDEN_STEPS[0], &["/setowner", "*S-1-5-32-544"][..]);
+        let step = |flag: &str| {
+            HARDEN_STEPS
+                .iter()
+                .position(|s| s.contains(&flag))
+                .unwrap_or_else(|| panic!("{flag} is a step"))
+        };
+        assert_eq!(
+            step("/grant:r"),
+            1,
+            "harden_machine_global_dir stops on a failed step 0 or 1"
+        );
+        assert!(
+            step("/inheritance:r") > step("/grant:r"),
+            "never before SYSTEM and Administrators hold ACEs of their own"
+        );
+    }
+
+    /// The DACL of `path` in SDDL, through `icacls /save` (a UTF-16 file: the
+    /// object's name, then its descriptor). `None` when it cannot be read.
+    #[cfg(windows)]
+    fn dacl_of(path: &std::path::Path) -> Option<String> {
+        let out = tempfile::NamedTempFile::new().ok()?;
+        let saved = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/save")
+            .arg(out.path())
+            .output()
+            .ok()?;
+        if !saved.status.success() {
+            return None;
+        }
+        let bytes = std::fs::read(out.path()).ok()?;
+        let wide: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let text = String::from_utf16_lossy(&wide);
+        text.lines()
+            .nth(1)
+            .map(|l| l.trim().trim_start_matches('\u{feff}').to_string())
+    }
+
+    /// #3073 — put this process where the daemon is: SeBackup, SeRestore and
+    /// SeTakeOwnership held but DISABLED, as in a service's SYSTEM token. A
+    /// Cygwin or OpenSSH shell hands its children a token with them enabled,
+    /// and then the inheritance an `icacls` call sets off rewrites children
+    /// the daemon cannot reach: 0.4.185's order passed from such a shell.
+    /// Every `icacls` the test spawns afterwards inherits the result; one that
+    /// needs a privilege (`/setowner`) still enables it for itself.
+    #[cfg(windows)]
+    fn disable_dacl_override_privileges() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+            TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: this process's pseudo-handle; `token` is written on success.
+        let opened =
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) };
+        assert_ne!(
+            opened,
+            0,
+            "OpenProcessToken: {}",
+            std::io::Error::last_os_error()
+        );
+        for name in [
+            "SeBackupPrivilege",
+            "SeRestorePrivilege",
+            "SeTakeOwnershipPrivilege",
+        ] {
+            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let mut luid = LUID {
+                LowPart: 0,
+                HighPart: 0,
+            };
+            // SAFETY: a NUL-terminated name, and a LUID to write.
+            let found =
+                unsafe { LookupPrivilegeValueW(std::ptr::null(), wide.as_ptr(), &mut luid) };
+            assert_ne!(found, 0, "{name}: {}", std::io::Error::last_os_error());
+            // Attributes 0: disabled, still held. A token that does not hold
+            // the privilege reports ERROR_NOT_ALL_ASSIGNED, and is already
+            // where the test wants it.
+            let state = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: 0,
+                }],
+            };
+            // SAFETY: a token opened for TOKEN_ADJUST_PRIVILEGES, one entry,
+            // and no previous state asked for.
+            let adjusted = unsafe {
+                AdjustTokenPrivileges(
+                    token,
+                    0,
+                    &state,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(adjusted, 0, "{name}: {}", std::io::Error::last_os_error());
+        }
+        // SAFETY: opened above, closed once.
+        unsafe { CloseHandle(token) };
+    }
+
+    /// #3073 — hardening a tree someone else owns keeps SYSTEM in, on the
+    /// directory and on every child. The field case was SYSTEM hardening a
+    /// tree the signed-in user owned. Here an administrator hardens one
+    /// SYSTEM owns: the same shape, a caller that owns none of it.
+    /// - Before the owner went first, step 1 emptied the DACL, the grant
+    ///   failed `Access is denied`, and the directory came out `D:PAI`, open
+    ///   to nobody.
+    /// - With the owner first but inheritance dropped before the grant
+    ///   (0.4.185), the directory came out right and each child came out with
+    ///   an empty DACL: inheritance could no longer rewrite them.
+    ///
+    /// The hardening runs with the override privileges disabled, as the
+    /// daemon's does; otherwise the second case passes from a Cygwin shell.
+    #[cfg(windows)]
+    #[test]
+    fn hardening_a_tree_someone_else_owns_keeps_system_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), "x").unwrap();
+        let crashes = dir.path().join("crashes");
+        std::fs::create_dir(&crashes).unwrap();
+        std::fs::write(crashes.join("a.json"), "x").unwrap();
+        // Hand the tree to SYSTEM. That takes an elevated token
+        // (SeRestorePrivilege); a plain one cannot set the case up, so the
+        // test says so and stops.
+        let handed = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/setowner", "*S-1-5-18", "/T"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !handed {
+            // The CI lane runs elevated on purpose; there, skipping would
+            // pass without proving anything.
+            assert!(
+                std::env::var_os("ROOMLERD_TEST_REQUIRE_ELEVATED").is_none(),
+                "this lane must run elevated for #3073's case to be set up"
+            );
+            eprintln!(
+                "skipped: this token cannot hand a directory to SYSTEM; run elevated to cover #3073"
+            );
+            return;
+        }
+        disable_dacl_override_privileges();
+        harden_machine_global_dir(dir.path());
+        let dacl = dacl_of(dir.path()).expect("the hardened directory is still readable");
+        assert!(dacl.starts_with("D:P"), "protected: {dacl}");
+        assert!(
+            dacl.contains("(A;OICI;FA;;;SY)"),
+            "SYSTEM keeps full control: {dacl}"
+        );
+        assert!(
+            dacl.contains("(A;OICI;FA;;;BA)"),
+            "Administrators keep full control: {dacl}"
+        );
+        // The children SYSTEM owns inherit both ACEs, so neither is sealed.
+        for (child, inherited) in [(&crashes, "OICIID"), (&crashes.join("a.json"), "ID")] {
+            let dacl =
+                dacl_of(child).unwrap_or_else(|| panic!("{} is still readable", child.display()));
+            for sid in ["SY", "BA"] {
+                let ace = format!("(A;{inherited};FA;;;{sid})");
+                assert!(dacl.contains(&ace), "{}: {ace} in {dacl}", child.display());
+            }
+        }
     }
 }

@@ -30,6 +30,7 @@ fn bearer(port: u16, ca: &str) -> Spec {
         user: None,
         ca: Some(ca.into()),
         at: At::Loopback { peer: me() },
+        through: None,
     }
 }
 
@@ -44,7 +45,7 @@ struct Daemon {
 async fn daemon(token: String, held: Arc<AtomicBool>) -> Daemon {
     let (ours, theirs) = UnixStream::pair().unwrap();
     let (ours_d, theirs_d) = UnixStream::pair().unwrap();
-    tokio::spawn(crate::hive::worker::serve(theirs, Some(theirs_d)));
+    tokio::spawn(crate::hive::worker::serve(theirs, Some(theirs_d), None));
     let (mut rd, wr) = ours.into_split();
     let link = Arc::new(Link::daemon(wr, ours_d));
     let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -103,7 +104,7 @@ async fn a_handed_endpoint_is_served_with_the_values_the_daemon_answers() {
                 endpoint: 11,
                 spec: Box::new(bearer(port, &ca)),
             },
-            Some(OwnedFd::from(listener)),
+            vec![OwnedFd::from(listener)],
         )
         .await
         .unwrap();
@@ -132,7 +133,7 @@ async fn a_handed_endpoint_is_served_with_the_values_the_daemon_answers() {
 
     let closed = d
         .link
-        .call(Call::Close { endpoint: 11 }, None)
+        .call(Call::Close { endpoint: 11 }, Vec::new())
         .await
         .unwrap();
     assert_eq!(closed, Answer::Done);
@@ -162,7 +163,7 @@ async fn an_endpoint_handed_twice_is_served_once() {
                     endpoint: 12,
                     spec: Box::new(bearer(port, &ca)),
                 },
-                Some(OwnedFd::from(listener)),
+                vec![OwnedFd::from(listener)],
             )
             .await
             .unwrap();
@@ -175,7 +176,7 @@ async fn an_endpoint_handed_twice_is_served_once() {
         TcpStream::connect(("127.0.0.1", ports[1])).await.is_err(),
         "the second listener is not served"
     );
-    let _ = d.link.call(Call::Close { endpoint: 12 }, None).await;
+    let _ = d.link.call(Call::Close { endpoint: 12 }, Vec::new()).await;
 }
 
 /// Two hand-overs of one endpoint answered at once, each on a task of its
@@ -201,7 +202,7 @@ async fn two_hand_overs_of_one_endpoint_at_once_serve_it_once() {
                     endpoint: 14,
                     spec: Box::new(spec),
                 };
-                link.call(serve, Some(OwnedFd::from(l))).await
+                link.call(serve, vec![OwnedFd::from(l)]).await
             })
         })
         .collect();
@@ -215,7 +216,7 @@ async fn two_hand_overs_of_one_endpoint_at_once_serve_it_once() {
         }
     }
     assert_eq!(served, 1, "one of the two listeners, never both");
-    let _ = d.link.call(Call::Close { endpoint: 14 }, None).await;
+    let _ = d.link.call(Call::Close { endpoint: 14 }, Vec::new()).await;
 }
 
 /// A hand-over that crossed its endpoint's close (a new worker's, listed
@@ -227,7 +228,7 @@ async fn a_hand_over_that_crosses_its_close_is_not_served() {
     let d = daemon(made(), Arc::new(AtomicBool::new(true))).await;
     let closed = d
         .link
-        .call(Call::Close { endpoint: 13 }, None)
+        .call(Call::Close { endpoint: 13 }, Vec::new())
         .await
         .unwrap();
     assert_eq!(closed, Answer::Done);
@@ -240,7 +241,7 @@ async fn a_hand_over_that_crosses_its_close_is_not_served() {
                 endpoint: 13,
                 spec: Box::new(bearer(port, &ca)),
             },
-            Some(OwnedFd::from(listener)),
+            vec![OwnedFd::from(listener)],
         )
         .await
         .unwrap();
@@ -383,6 +384,32 @@ fn a_spec_crosses_whole_and_an_unknown_one_is_refused() {
         ..bearer(443, "")
     };
     assert!(Conf::of_spec(&unknown_auth).is_err(), "an auth not known");
+}
+
+/// P8-2a-6 — a spec through another device carries the flow's end, and
+/// crosses whole; the worker dials that end, and an end off this host is no
+/// flow's and is refused. A spec without one dials the upstream itself.
+#[test]
+fn a_spec_through_a_flow_names_its_end_and_only_one_on_this_host() {
+    let direct = Spec {
+        ca: None,
+        ..bearer(443, "")
+    };
+    let end = SocketAddr::from(([127, 0, 0, 1], 41_234));
+    let through = Spec {
+        through: Some(end),
+        ..direct.clone()
+    };
+    let wire = serde_json::to_string(&through).unwrap();
+    assert_eq!(serde_json::from_str::<Spec>(&wire).unwrap(), through);
+    assert_eq!(Conf::of_spec(&through).unwrap().dial, Dial::Through(end));
+    assert_eq!(Conf::of_spec(&direct).unwrap().dial, Dial::Direct);
+    let off = Spec {
+        through: Some(SocketAddr::from(([192, 0, 2, 7], 41_234))),
+        ..direct
+    };
+    let refused = Conf::of_spec(&off).map(|_| ()).unwrap_err();
+    assert!(refused.contains("off this host"), "{refused}");
 }
 
 /// A value never shows in a log line: `Debug` names none.

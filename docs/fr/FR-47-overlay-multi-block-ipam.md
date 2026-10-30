@@ -98,11 +98,11 @@ Anchors verified against master at `201e3f5a`:
 
 | Mechanism | Where |
 |---|---|
-| Lock-free global slot registry — monotonic, buddy-aligned, unique `slot`, `DuplicateKey` retry | `crates/services/src/dao/overlay_block.rs:81-150` |
+| Lock-free global slot registry — monotonic, buddy-aligned, unique `slot`, `DuplicateKey` retry | `crates/services/src/dao/overlay_block.rs:212-379` (`allocate`, and since FR-68 its two halves `next_free_slot` / `claim_slot`) |
 | Variable width `/16` to `/22`; 4 032 slots above the legacy `/16` reserve | `crates/remote_control/src/models.rs` (`block_slots_for_prefix`, `OVERLAY_BLOCK_FIRST_SLOT`) |
-| `Quarantined` to `Reclaimed`; `take_reclaimed` as the **exhaustion fallback only** | `dao/overlay_block.rs:170-250` |
+| `Quarantined` to `Reclaimed`; `take_reclaimed` as the **exhaustion fallback only** | `dao/overlay_block.rs:232-250` (the `Exhausted` arm), `:407` (`take_reclaimed`) |
 | `POST /api/admin/overlay-block/reclaim` — dry-run, age gate, live-occupancy gate | `crates/api/src/routes/overlay_block.rs:866+` |
-| `headroom { total, used, burned, reclaimed }`, with two readers | `dao/overlay_block.rs:300` |
+| `headroom { total, used, burned, reclaimed }`, with two readers | `dao/overlay_block.rs:525` |
 | Renumber planner — ordinal preservation, capacity refusal, version floor, WS cycle | `routes/overlay_block.rs:183-255`, `:374+` |
 | Per-address v6 derivation, so blocks follow for free | `overlay::router::derive_overlay_v6(Ipv4Addr)` |
 
@@ -136,7 +136,7 @@ is not an assumption: `pre_rc53_server_msg_rejects_goodbye_so_agent_err_arm_fire
 The trap that *does* need a forward-compat pre-roll is a new variant of a **nested** enum
 inside a frame the old agent already parses — the `RelayStrategyWire` case, where an unknown
 tag fails the *whole enclosing `ServerMsg`* and the agent silently drops entire netmaps
-(`signaling.rs:5589-5605`, `relay_strategy_lenient`). `OverlayJoinRefused` is not that shape.
+(`signaling.rs:5654-5670`, `relay_strategy_lenient`). `OverlayJoinRefused` is not that shape.
 
 ### 3c. Multi-block per org (P5) — the growth mechanism
 

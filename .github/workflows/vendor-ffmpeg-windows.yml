@@ -272,9 +272,17 @@ jobs:
           # `--user` install is invisible there (measured: the first run died
           # in `meson install` with "No module named 'mesonbuild'").
           sudo python3 -m pip install -q meson
-          # nvenc: header-only SDK, versioned; 12.1 supports Blackwell-era
-          # drivers while keeping the driver floor reasonable.
-          git clone --depth 1 --branch n13.1.15.0 https://github.com/FFmpeg/nv-codec-headers.git /tmp/nvh
+          # nvenc: header-only SDK, versioned, and its API version IS the
+          # driver floor: FFmpeg refuses to open NVENC on a driver whose
+          # highest API is older (SDK 13.1 → 610.00, 13.0 → 570.0, 12.1 →
+          # 530.41.03; nvenc.c's nvenc_print_driver_requirement). 12.1.14.0
+          # is the oldest FFmpeg 9.0.1's configure accepts, so Linux reaches
+          # the R535 and R550 branches too; Windows stays on its vcpkg
+          # baseline's 13.0.19.0 (570.0). FR-122: until 2026-10-30 this
+          # pinned 13.1.15.0, so every Linux host below driver 610 (the R580
+          # branch; AWS's G5g image ships 595) lost NVENC with nothing in the
+          # hello to say why. Asserted below.
+          git clone --depth 1 --branch n12.1.14.0 https://github.com/FFmpeg/nv-codec-headers.git /tmp/nvh
           sudo make -C /tmp/nvh install PREFIX=/usr/local
           # qsv: Intel oneVPL dispatcher (thin; the runtime comes from the
           # host's intel-media stack). ffmpeg wants libvpl >= 2.6.
@@ -430,6 +438,11 @@ jobs:
           for l in /opt/ffout/lib/libavcodec.so /opt/ffout/lib/libavutil.so; do
             ldd "$l" | grep -q "libvulkan" && { echo "::error::$(basename "$l") links libvulkan — the backend must stay dlopen'd"; exit 1; } || true
           done
+          # FR-122 — the NVENC driver floor, read from the binary: nvenc.c
+          # compiles in exactly one minimum-driver string, the SDK's. A count,
+          # never `grep -q`: on a 2 MB library an early exit SIGPIPEs strings,
+          # and pipefail reads that as "absent".
+          [ "$(strings /opt/ffout/lib/libavcodec.so | grep -cx '530.41.03')" -ge 1 ] || { echo "::error::libavcodec's NVENC driver floor is not 530.41.03 — the nv-codec-headers pin moved (FR-122)"; exit 1; }
           du -sh /opt/ffout/lib | cut -f1
 
       - name: Package + upload the minimal shared tree
@@ -505,7 +518,8 @@ jobs:
           # NEON with the system toolchain.
           sudo apt-get install -y pkg-config cmake ninja-build python3-pip
           sudo python3 -m pip install -q meson
-          git clone --depth 1 --branch n13.1.15.0 https://github.com/FFmpeg/nv-codec-headers.git /tmp/nvh
+          # The x86_64 job's pin, for its reason: the SDK is the driver floor (FR-122).
+          git clone --depth 1 --branch n12.1.14.0 https://github.com/FFmpeg/nv-codec-headers.git /tmp/nvh
           sudo make -C /tmp/nvh install PREFIX=/usr/local
           sudo ldconfig
           # libdrm + libva built into the tree (FR-77 P4, see the x86_64 job
@@ -602,6 +616,7 @@ jobs:
             ldd "$l" | grep -q "libnvidia\|libcuda" && { echo "::error::$(basename "$l") links the NVIDIA driver — nvenc must stay dlopen'd"; exit 1; } || true
           done
           file /opt/ffout/lib/libavcodec.so.* | grep -q "ARM aarch64" || { echo "::error::libavcodec is not an aarch64 object"; exit 1; }
+          [ "$(strings /opt/ffout/lib/libavcodec.so | grep -cx '530.41.03')" -ge 1 ] || { echo "::error::libavcodec's NVENC driver floor is not 530.41.03 — the nv-codec-headers pin moved (FR-122)"; exit 1; }
           du -sh /opt/ffout/lib | cut -f1
 
       - name: Package + upload the minimal shared tree (aarch64)

@@ -34,6 +34,22 @@
 //! Kill switch: `macos_supervise_gui_worker`, default **off**. Off, this
 //! module does nothing at all and the two halves behave byte-for-byte as they
 //! do today.
+//!
+//! ## A worker never outlives its daemon (#2987)
+//!
+//! The worker chain runs in a process group of its own, so launchd's teardown
+//! of the daemon never reaches it, and only `stop_worker` stops it.
+//! A daemon that dies any other way (the watchdog's `exit(STALL_EXIT_CODE)`, a
+//! crash, a SIGKILL) used to leave its worker running. That worker kept the
+//! person's single-instance lock, so every later worker exited 0 at once: the
+//! GUI half stayed on the old release through two updates, and its delegation
+//! was refused (field-measured on the operator's MacBook, 2026-10-26). Two
+//! mechanisms close it:
+//!
+//! | mechanism | catches |
+//! |---|---|
+//! | **the lifeline**: the daemon keeps its end of the worker's stdin open for the worker's life ([`LIFELINE_LINE`]), and the worker stops when it closes | a worker of this release, whatever ended its daemon |
+//! | **the reap**: a daemon with no worker of its own stops every process running exactly `<exe> run --supervised` as a person ([`stale_workers`]), at start and after a worker exits 0 at once | workers from older releases, and any lifeline that leaked |
 
 use std::time::Duration;
 
@@ -300,6 +316,14 @@ pub const WORKER_ENV_FORWARD: &[&str] = &[
     // The encoder-cells kill switch: a gate applies at every entry point, and
     // the worker is where a session's encoders open.
     "ENCODER_CELLS_DENY",
+    // FR-118 P5 — GPU-resident frames and their kill switch, for the same
+    // reason: the worker captures, runs the probe whose `gpu` child proves
+    // VideoToolbox's IOSurface form, and opens the session's encoders.
+    "ZERO_COPY",
+    "ZERO_COPY_DENY",
+    // FR-130 — the colour description's switch: the worker's encoders write
+    // it, and its probe says `color-described` in the hello it computes.
+    "COLOR_DESCRIPTION",
 ];
 
 /// The worker's `ROOMLERD_<suffix>=<value>` assignments: every
@@ -311,6 +335,166 @@ pub fn worker_env_args(lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
         .iter()
         .filter_map(|suffix| lookup(suffix).map(|v| format!("ROOMLERD_{suffix}={v}")))
         .collect()
+}
+
+/// #2987 — the line the supervisor writes on a worker's stdin AFTER the
+/// secret. It means "I hold my end of this pipe for as long as you live", so
+/// from then on the pipe's end-of-file means the daemon is gone, however it
+/// ended: the watchdog's `exit(STALL_EXIT_CODE)`, a crash, a SIGKILL. None of
+/// those reach `stop_worker`, and a worker that outlived its daemon kept the
+/// person's single-instance lock, so no later daemon's worker could start
+/// (field-measured on the operator's MacBook, 2026-10-26).
+///
+/// ⚠️ It is a line of its own, never part of the secret's. A worker from
+/// before #2987 uses ALL of its first line as the secret, and the supervisor
+/// cannot tell which release is on disk when it spawns, because an update
+/// replaces the binary under a running daemon. An old worker never reads this
+/// line, and a new worker under an old supervisor reads end-of-file where it
+/// would be, so it arms nothing. The `/1` makes a future change a new line,
+/// which today's worker does not know and so does not arm on.
+pub const LIFELINE_LINE: &str = "roomler-lifeline/1";
+
+/// What the supervisor writes on a worker's stdin, in ONE write, so the
+/// secret never arrives without the offer behind it. About 80 bytes, well
+/// under the pipe's atomic-write size.
+pub fn stdin_handoff(secret: &str) -> String {
+    format!("{secret}\n{LIFELINE_LINE}\n")
+}
+
+/// #2987 — how long a worker whose daemon is gone gives its own graceful stop
+/// before it forces the exit. That stop takes a few seconds at most (the
+/// runtime alone has a 3 s budget). Nothing else will ever stop the process,
+/// because its supervisor is what is gone.
+pub const LIFELINE_BACKSTOP: Duration = Duration::from_secs(15);
+
+/// #2987 — how long the reap waits after its SIGTERM before a SIGKILL. Longer
+/// than [`LIFELINE_BACKSTOP`] on purpose. When the next daemon reaps a worker
+/// of this release, that worker is already in its own clean stop, and it does
+/// not hear the SIGTERM, because the select that listened for it has ended.
+/// Killing it before that stop writes the clean-run mark would count a crash
+/// on the person's own config, and three crashes in ten minutes start a
+/// rollback there.
+pub const REAP_GRACE: Duration = Duration::from_secs(LIFELINE_BACKSTOP.as_secs() + 5);
+const _: () = assert!(REAP_GRACE.as_secs() > LIFELINE_BACKSTOP.as_secs());
+
+/// How a worker's watch over its stdin ended (#2987).
+#[derive(Debug)]
+pub enum LinkEnd {
+    /// No secret: end-of-file first, a blank line, or a read error.
+    NoSecret,
+    /// The secret, then end-of-file: a supervisor from before #2987, which
+    /// closes its end after the secret. There is nothing to watch.
+    NotOffered,
+    /// The secret, then a line this worker does not know: a newer
+    /// supervisor's offer. Left unwatched, as before #2987, rather than misread.
+    Unknown,
+    /// Watching, then the pipe failed. Stop watching and keep running.
+    Lost(std::io::Error),
+    /// Watching, then end-of-file: the daemon that held the other end is gone.
+    Cut,
+}
+
+/// One handoff line is about 80 bytes. Anything that writes megabytes without
+/// a newline must not grow the worker.
+const HANDOFF_LINE_MAX: u64 = 4096;
+
+fn handoff_line<R: std::io::BufRead>(r: &mut R) -> std::io::Result<Option<String>> {
+    use std::io::{BufRead, Read};
+    let mut line = String::new();
+    let n = r.by_ref().take(HANDOFF_LINE_MAX).read_line(&mut line)?;
+    Ok((n > 0).then(|| line.trim().to_string()))
+}
+
+/// The worker's side of the stdin handoff (#2987). It reads the secret and
+/// passes it to `on_secret` straight away, so the attach never waits on what
+/// follows. Then it reads the lifeline offer and, if there is one, blocks
+/// until the pipe closes. It takes any reader so a test can drive it with a
+/// real pipe; the worker passes its locked stdin, on a thread of its own.
+pub fn stdin_link<R: std::io::BufRead>(
+    mut r: R,
+    on_secret: impl FnOnce(Option<String>),
+) -> LinkEnd {
+    let secret = match handoff_line(&mut r) {
+        Ok(Some(s)) if !s.is_empty() => Some(s),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "delegation: could not read the secret from stdin");
+            None
+        }
+    };
+    let got_secret = secret.is_some();
+    on_secret(secret);
+    if !got_secret {
+        return LinkEnd::NoSecret;
+    }
+    match handoff_line(&mut r) {
+        Ok(None) => return LinkEnd::NotOffered,
+        Ok(Some(line)) if line == LIFELINE_LINE => {}
+        Ok(Some(_)) => return LinkEnd::Unknown,
+        Err(e) => return LinkEnd::Lost(e),
+    }
+    let mut buf = [0u8; 64];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => return LinkEnd::Cut,
+            // Nothing more is sent today, and a newer supervisor may send
+            // more. Only the end of the pipe means anything here.
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return LinkEnd::Lost(e),
+        }
+    }
+}
+
+/// #2987 — a supervised worker's command line, as `ps` prints it: the argv
+/// `spawn_worker` builds (`/usr/bin/env` execs into the agent, so it is not
+/// part of it).
+pub fn worker_command(exe: &str) -> String {
+    format!("{exe} run --supervised")
+}
+
+/// #2987 — the workers a previous daemon left behind, out of
+/// `ps -axww -o pid= -o uid= -o command=`: every process that runs exactly
+/// `command` as a person (uid ≠ 0), other than `own_pid`. Returns
+/// `(pid, uid)` pairs.
+///
+/// Exact match only, because each match gets a SIGTERM from root.
+/// `--supervised` appears on no command line except the one `spawn_worker`
+/// builds, so a hand-run `roomlerd run`, launchd's own worker (`… run`) and
+/// the daemon (`… --config … run`) never match.
+pub fn stale_workers(ps: &str, command: &str, own_pid: u32) -> Vec<(u32, u32)> {
+    ps.lines()
+        .filter_map(|line| {
+            let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
+            let (uid, cmd) = rest.trim_start().split_once(char::is_whitespace)?;
+            let pid: u32 = pid.parse().ok()?;
+            let uid: u32 = uid.parse().ok()?;
+            (cmd.trim() == command && uid != 0 && pid != own_pid).then_some((pid, uid))
+        })
+        .collect()
+}
+
+/// #2987 — why the supervisor stopped spawning, read off how the last worker
+/// ended. On a Mac, a worker that finds another roomlerd holding this
+/// person's single-instance lock exits **0** (`already_running_exit`: 0 is
+/// launchd's "don't relaunch me"). A missing per-user enrollment ends in an
+/// error, which is code 1. Before #2987 the give-up named only the second, so
+/// the first was misreported as an enrollment problem.
+pub fn gave_up_reason(last: Option<WorkerEnd>) -> &'static str {
+    match last {
+        Some(WorkerEnd::Code(0)) => {
+            "each worker exited 0 at once: another roomlerd holds this person's \
+             single-instance lock, and it is not a worker this supervisor can identify \
+             (a hand-run `roomlerd run`, say). Find it with: pgrep -lU <uid> roomlerd. \
+             Once it is gone, restart this daemon: \
+             launchctl kickstart -k system/com.roomler.daemon"
+        }
+        _ => {
+            "almost always this Mac has no per-user enrollment: the worker runs AS the \
+             console user and loads THAT user's config. Check with: \
+             launchctl asuser <uid> sudo -u '#<uid>' roomlerd caps"
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -344,6 +528,21 @@ mod imp {
     /// The LaunchAgent label the postinstall bootstraps. If this is loaded,
     /// we stand down — see the module docs.
     const AGENT_LABEL: &str = "com.roomler.agent";
+
+    /// #2987 — our end of the current worker's stdin: its lifeline
+    /// ([`LIFELINE_LINE`]). It lives here, for as long as the daemon PROCESS
+    /// does, and not in the supervisor task's `Child`. A panic in that task
+    /// would drop the `Child`, close the pipe and stop the person's GUI half,
+    /// with nothing left to spawn another. [`stop_worker`] releases it, so
+    /// does the reap of a worker that ended, and so does the next spawn.
+    static LIFELINE: std::sync::Mutex<Option<std::process::ChildStdin>> =
+        std::sync::Mutex::new(None);
+
+    fn hold_lifeline(stdin: Option<std::process::ChildStdin>) {
+        *LIFELINE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = stdin;
+    }
 
     /// The console user's uid, or `None` when nobody is logged in.
     ///
@@ -419,6 +618,11 @@ mod imp {
             );
             cmd.arg("/usr/bin/env").args(&forward);
         }
+        // #3080 — the chain lives as long as the worker, so it must not keep a
+        // pipe it inherited from a spawn on another thread (macOS has no
+        // `pipe2`): that pipe's reader would never see EOF. It keeps its
+        // stdio, the lifeline on stdin, and nothing else.
+        tunnel_core::child::inherit_only_stdio(&mut cmd);
         let mut child = cmd
             .arg(exe)
             .arg("run")
@@ -439,21 +643,35 @@ mod imp {
             .stdin(Stdio::piped())
             // Own process group, so `stop_worker` can take the whole
             // launchctl -> sudo -> agent chain down instead of orphaning it.
+            // That is also why the chain outlives a daemon that dies without
+            // `stop_worker`: launchd's teardown of our job never reaches it
+            // (#2987), hence the lifeline below.
             .process_group(0)
             .spawn()?;
-        // Write it and immediately drop the handle: the worker reads ONE line
-        // and the EOF is what tells it there is no more. Holding the pipe open
-        // would leave a worker that read a partial line waiting forever.
-        if let Some(mut stdin) = child.stdin.take() {
+        // #2987 — write the secret AND the lifeline offer, then KEEP our end
+        // open. The pipe then closes only when this daemon is gone or stops
+        // the worker, and either way the worker stops itself. Before #2987 the
+        // handle was dropped right after the secret, so a daemon that died
+        // without `stop_worker` left a worker running that kept the person's
+        // single-instance lock. A worker that reads a partial line does not
+        // wait forever: it gives up on the secret after 5 s
+        // (`delegate_worker`), and the offer never arrives without it.
+        let lifeline = child.stdin.take().and_then(|mut stdin| {
             use std::io::Write;
-            if let Err(e) = writeln!(stdin, "{secret}") {
-                // Not fatal: the worker will time out waiting, log loudly, and
-                // simply not attach. It is still a fully enrolled agent that
-                // serves its own sessions, so the remote-desktop half keeps
-                // working — degrading to P1 behaviour is the right failure.
-                tracing::warn!(error = %e, "macOS supervisor: could not hand the worker its delegation secret");
+            match stdin.write_all(stdin_handoff(secret).as_bytes()) {
+                Ok(()) => Some(stdin),
+                Err(e) => {
+                    // Not fatal: the worker will time out waiting, log loudly,
+                    // and simply not attach. It is still a fully enrolled agent
+                    // that serves its own sessions, so the remote-desktop half
+                    // keeps working — degrading to P1 behaviour is the right
+                    // failure.
+                    tracing::warn!(error = %e, "macOS supervisor: could not hand the worker its delegation secret");
+                    None
+                }
             }
-        }
+        });
+        hold_lifeline(lifeline);
         Ok(child)
     }
 
@@ -584,6 +802,148 @@ mod imp {
             libc::kill(-pgid, libc::SIGKILL);
         }
         let _ = child.wait();
+        // #2987 — then our end of its stdin. Only now: closed before the
+        // SIGTERM, it would race the signal into a second, differently
+        // classified stop. Closing it promptly beats keeping a dead pipe open
+        // until the next spawn.
+        hold_lifeline(None);
+    }
+
+    /// #2987 — stop every supervised worker a previous daemon left behind.
+    ///
+    /// A daemon that dies without its clean shutdown (the watchdog's
+    /// `exit(STALL_EXIT_CODE)`, a crash, a SIGKILL) never reaches
+    /// [`stop_worker`]. A worker from before #2987 does not notice. It keeps
+    /// the person's single-instance lock, so every worker the next daemon
+    /// spawns exits 0 at once. Field-measured on the operator's MacBook,
+    /// 2026-10-26: a 0.4.174 worker outlived two updates and its new daemon's
+    /// give-up. A worker of this release stops itself when its stdin closes
+    /// ([`LIFELINE_LINE`]). This catches what that cannot: older workers, and
+    /// a lifeline a concurrent spawn inherited before `std` set `FD_CLOEXEC`
+    /// on it.
+    ///
+    /// Called only while this daemon holds no worker of its own: at start,
+    /// and right after reaping ours. Every match is then someone else's.
+    /// Returns how many it stopped.
+    async fn reap_stale_workers(exe: &std::path::Path) -> usize {
+        let Some(exe) = exe.to_str() else {
+            return 0;
+        };
+        // #3080 — `ps` blocks, so it runs on the blocking pool, never on a
+        // runtime worker.
+        let command = worker_command(exe);
+        let stale = tokio::task::spawn_blocking(move || find_processes(&command))
+            .await
+            .unwrap_or_default();
+        for &(pid, uid) in &stale {
+            tracing::warn!(
+                pid,
+                uid,
+                "macOS supervisor: stopping a GUI worker a previous daemon left behind — it \
+                 holds the person's single-instance lock, so no worker of ours could start \
+                 (#2987)"
+            );
+        }
+        let pids: Vec<u32> = stale.iter().map(|(pid, _)| *pid).collect();
+        stop_processes(&pids).await;
+        pids.len()
+    }
+
+    /// #2987 — the reap, plus what it owes launchd. While a stale worker held
+    /// the lock, launchd's own worker may have exited 0, and
+    /// `KeepAlive{SuccessfulExit=false}` never retries that. With the
+    /// LaunchAgent loaded, the next poll is `LaunchdOwns`, which kickstarts
+    /// only a debt. So a reap that stopped anything owes one.
+    async fn reap_and_owe(exe: &std::path::Path, kickstart_debt: &mut u32) {
+        if reap_stale_workers(exe).await > 0 && console_uid().is_some_and(launch_agent_loaded) {
+            *kickstart_debt = KICKSTART_RETRIES;
+        }
+    }
+
+    /// #3080 — how long `ps` may take. It answers in well under a second; past
+    /// this the reap is skipped, exactly as when `ps` fails.
+    const PS_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// `ps` once, read through [`stale_workers`]. If `ps` fails, nothing is
+    /// found, which leaves things as they were before #2987.
+    fn find_processes(command: &str) -> Vec<(u32, u32)> {
+        // One `-o` per column: BSD `ps` lets only the LAST keyword of an `-o`
+        // carry `=`, and `pid=,uid=` would make `,uid=` pid's header.
+        let mut ps = Command::new("/bin/ps");
+        ps.args(["-axww", "-o", "pid=", "-o", "uid=", "-o", "command="]);
+        find_processes_via(&mut ps, command)
+    }
+
+    /// The read half of [`find_processes`], with the `ps` to run given, so a
+    /// test can hand it one whose pipe another process holds.
+    ///
+    /// #3080 — read until `ps` EXITS, not until EOF, within [`PS_DEADLINE`].
+    /// macOS has no `pipe2`, so a long-lived child spawned on another thread
+    /// while `ps`'s pipe was new keeps a copy of its write end. Field, 0.4.184:
+    /// `route -n monitor` did, `Command::output()` waited on a runtime worker
+    /// for an EOF that never came, and the supervisor never reached its loop.
+    /// The Mac had no GUI worker, so no capture or input, until a restart.
+    fn find_processes_via(ps: &mut Command, command: &str) -> Vec<(u32, u32)> {
+        match tunnel_core::child::output_bounded(ps, PS_DEADLINE) {
+            Ok(out) if out.status.success() => stale_workers(
+                &String::from_utf8_lossy(&out.stdout),
+                command,
+                std::process::id(),
+            ),
+            Ok(out) => {
+                tracing::warn!(
+                    status = ?out.status.code(),
+                    "macOS supervisor: `ps` failed; not looking for a stale GUI worker"
+                );
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "macOS supervisor: could not run `ps`, or it did not exit in time; not \
+                     looking for a stale GUI worker"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// SIGTERM, then up to [`REAP_GRACE`], then SIGKILL for whatever is left.
+    /// These processes are not our children, so we cannot wait for them:
+    /// `kill(pid, 0)` tells us whether they are alive.
+    async fn stop_processes(pids: &[u32]) {
+        // SAFETY: signal 0 delivers nothing; it only asks whether the pid
+        // exists.
+        let alive = |pid: u32| unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        for &pid in pids {
+            // SAFETY: one signal to one pid `stale_workers` matched exactly.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        for _ in 0..REAP_GRACE.as_millis() / 100 {
+            if !pids.iter().any(|&p| alive(p)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for &pid in pids.iter().filter(|&&p| alive(p)) {
+            tracing::warn!(
+                pid,
+                grace_secs = REAP_GRACE.as_secs(),
+                "macOS supervisor: a stale GUI worker outlived SIGTERM; killing it"
+            );
+            // SAFETY: as above.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        for _ in 0..10 {
+            if !pids.iter().any(|&p| alive(p)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Supervise for the process lifetime. Never returns an error to the
@@ -619,10 +979,11 @@ mod imp {
             exe = %exe.display(),
             "macOS GUI-worker supervisor ON (FR-43 P1) — stands down whenever the LaunchAgent is loaded"
         );
-
         let mut worker: Option<(u32, Child, Instant)> = None;
         let mut backoff = BACKOFF_MIN;
         let mut fast_exits: u32 = 0;
+        // How the last worker ended. The give-up's diagnosis reads it (#2987).
+        let mut last_end: Option<WorkerEnd> = None;
         let mut wait_until: Option<Instant> = None;
         let mut last_action: Option<Action> = None;
         // Polls left to keep re-trying launchd's own worker after a hand-back
@@ -630,6 +991,11 @@ mod imp {
         // comment on a `let` is an `unused_doc_comments` warning, and this
         // module compiles only in the macOS lane, where warnings are denied.)
         let mut kickstart_debt: u32 = 0;
+        // #2987 — a worker a previous daemon left behind holds the person's
+        // single-instance lock, and every worker we spawn would exit 0 at once.
+        // We hold none yet, so every supervised worker running now is someone
+        // else's.
+        reap_and_owe(&exe, &mut kickstart_debt).await;
 
         loop {
             // Reap first, so `worker_uid` reflects reality this tick.
@@ -664,15 +1030,28 @@ mod imp {
                 // drains (`WriterContext::Supervisor`), so it reaches the
                 // server on the daemon's enrollment. Ends this supervisor
                 // causes never get here: `stop_worker` reaps its own child.
-                if let Some(summary) = worker_end(status).and_then(|e| crash_summary(e, uid, ran)) {
+                let end = worker_end(status);
+                if let Some(summary) = end.and_then(|e| crash_summary(e, uid, ran)) {
                     crate::crash_recorder::record(
                         crate::crash_recorder::Reason::SupervisorDetected,
                         &summary,
                         crate::crash_recorder::WriterContext::Supervisor,
                     );
                 }
-                wait_until = Some(Instant::now() + backoff);
                 worker = None;
+                hold_lifeline(None);
+                // #2987 — a worker that exits 0 at once found another roomlerd
+                // holding the person's single-instance lock. If that one is a
+                // worker a previous daemon left behind, stop it, so the next
+                // spawn finds the lock free. The exit still counts towards
+                // giving up: resetting the count after a reap would let two
+                // spawners of `run --supervised` (two root daemons on
+                // different configs) stop each other's workers forever.
+                if ran < HEALTHY_RUN && end == Some(WorkerEnd::Code(0)) {
+                    reap_and_owe(&exe, &mut kickstart_debt).await;
+                }
+                last_end = end;
+                wait_until = Some(Instant::now() + backoff);
             }
 
             let uid_now = console_uid();
@@ -694,10 +1073,10 @@ mod imp {
                         console_uid = ?uid_now,
                         fast_exits,
                         max = MAX_FAST_EXITS,
+                        last_end = ?last_end,
                         "macOS supervisor: the GUI worker died on arrival too many times — \
-                         NOT retrying. Almost always this Mac has no per-user enrollment: \
-                         the worker runs AS the console user and loads THAT user's config. \
-                         Check with: launchctl asuser <uid> sudo -u '#<uid>' roomlerd caps"
+                         NOT retrying: {}",
+                        gave_up_reason(last_end)
                     );
                 } else {
                     tracing::info!(?action, console_uid = ?uid_now, "macOS supervisor state");
@@ -814,6 +1193,170 @@ mod imp {
             }
         }
     }
+
+    /// #2987 — the reap's two system halves on a real Mac, the only place
+    /// this module compiles: BSD `ps` prints the rows `stale_workers` parses,
+    /// and a process we did not spawn is found by its exact command line and
+    /// stopped. Runs in the macOS CI lane (`macos_supervisor::`).
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn a_process_left_behind_is_found_by_its_exact_command_and_stopped() {
+            // SAFETY: `getuid` takes no arguments and cannot fail.
+            if unsafe { libc::getuid() } == 0 {
+                // `stale_workers` never matches root's processes, by design.
+                eprintln!("skipped: running as root");
+                return;
+            }
+            // A command line nothing else on the runner has. Detached by the
+            // shell, so it is not our child, the same as a stale worker.
+            let command = format!("/bin/sleep {}", 29_870 + std::process::id() % 1000);
+            let status = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("{command} </dev/null >/dev/null 2>&1 &"))
+                .status()
+                .expect("sh");
+            assert!(status.success());
+            let mut found = Vec::new();
+            for _ in 0..50 {
+                found = find_processes(&command);
+                if !found.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert_eq!(found.len(), 1, "found {found:?}");
+            // SAFETY: as above.
+            assert_eq!(found[0].1, unsafe { libc::getuid() });
+            stop_processes(&[found[0].0]).await;
+            assert!(
+                find_processes(&command).is_empty(),
+                "still running after stop_processes"
+            );
+        }
+
+        /// A file the shell below writes its background holder's pid to.
+        fn pid_file(tag: &str) -> std::path::PathBuf {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos());
+            std::env::temp_dir().join(format!(
+                "roomler-3080-{tag}-{}-{nanos}.pid",
+                std::process::id()
+            ))
+        }
+
+        /// #3080's end state: the shell prints one row shaped like `ps`
+        /// output and exits, while the `sleep` it started in the background
+        /// still holds the write end of its stdout, as `route -n monitor`
+        /// held the real `ps`'s.
+        fn pinned_ps(pid_file: &std::path::Path, row: &str) -> Command {
+            let mut c = Command::new("/bin/sh");
+            c.arg("-c")
+                .arg(format!("sleep 30 & echo $! > \"$PIDFILE\"; echo '{row}'"))
+                .env("PIDFILE", pid_file);
+            c
+        }
+
+        /// End the holder [`pinned_ps`] started.
+        fn end_holder(pid_file: &std::path::Path) {
+            for _ in 0..250 {
+                if let Some(pid) = std::fs::read_to_string(pid_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<libc::pid_t>().ok())
+                {
+                    // SAFETY: one signal to the `sleep` this test started.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    let _ = std::fs::remove_file(pid_file);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("the holder never wrote its pid to {}", pid_file.display());
+        }
+
+        /// #3080 — the reap answers as soon as `ps` exits, while another
+        /// process still holds `ps`'s pipe.
+        #[test]
+        fn the_reap_answers_once_ps_exits_though_its_pipe_is_held() {
+            let pid_file = pid_file("ps");
+            let command = worker_command("/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd");
+            let started = Instant::now();
+            let found = find_processes_via(
+                &mut pinned_ps(&pid_file, &format!("  4242   501 {command}")),
+                &command,
+            );
+            let took = started.elapsed();
+            end_holder(&pid_file);
+            assert_eq!(found, vec![(4242, 501)]);
+            assert!(
+                took < Duration::from_secs(5),
+                "waited {took:?} on the holder"
+            );
+        }
+
+        /// The positive control on a Mac: `Command::output()`, the read
+        /// `find_processes` made before #3080, waits as long as the holder
+        /// lives.
+        #[test]
+        fn before_3080_the_reap_waited_as_long_as_the_holder_lived() {
+            let pid_file = pid_file("std");
+            let mut cmd = pinned_ps(&pid_file, "  4242   501 x");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let _ = tx.send(cmd.output());
+            });
+            let early = rx.recv_timeout(Duration::from_millis(1500));
+            end_holder(&pid_file);
+            assert!(
+                early.is_err(),
+                "output() returned while the holder lived: {early:?}"
+            );
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("output() returns once the holder is gone")
+                .expect("ran");
+            reader.join().unwrap();
+        }
+
+        /// Whether the program a child execs still has descriptor 9 open, when
+        /// the child got 9 the way the race hands one over: a copy made after
+        /// the fork, open and without close-on-exec. (`tunnel_core::child`'s
+        /// own tests run in a Linux lane; the macOS lane runs this module's.)
+        /// In a quiet process 9 may be std's own exec-error pipe; replacing it
+        /// is harmless here, because `/bin/sh` always execs.
+        fn fd9_after_exec(sweep: bool) -> String {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c")
+                .arg("if true 2>/dev/null >&9; then echo open; else echo closed; fi");
+            // SAFETY: `dup2` only, which is async-signal-safe.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::dup2(2, 9) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            if sweep {
+                tunnel_core::child::inherit_only_stdio(&mut cmd);
+            }
+            let out =
+                tunnel_core::child::output_bounded(&mut cmd, Duration::from_secs(10)).expect("ran");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        }
+
+        /// #3080 — the other side of the race, on a Mac: without the sweep the
+        /// program keeps the descriptor (the positive control), with it the
+        /// program keeps only its stdio. The worker chain and the route monitor
+        /// are spawned with the sweep.
+        #[test]
+        fn a_long_lived_child_keeps_only_its_stdio() {
+            assert_eq!(fd9_after_exec(false), "open");
+            assert_eq!(fd9_after_exec(true), "closed");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -829,6 +1372,11 @@ mod tests {
             "FPS_DENY" => Some("*:144".to_string()),
             "CLIPBOARD_MAC_WATCH" => Some("0".to_string()),
             "ENCODER_CELLS_DENY" => Some("hevc_videotoolbox:yuv444".to_string()),
+            // FR-118 P5 — the switch and its denylist bind the worker too.
+            "ZERO_COPY" => Some("1".to_string()),
+            "ZERO_COPY_DENY" => Some("hevc_videotoolbox:gpu".to_string()),
+            // FR-130 — the root's `color_description = false` binds the worker.
+            "COLOR_DESCRIPTION" => Some("0".to_string()),
             // FR-97 P2c — the root's `[virtual_desktop_apps] enabled = false`.
             "APPS" => Some("0".to_string()),
             // Set on the root, but root-only: never forwarded.
@@ -842,6 +1390,9 @@ mod tests {
                 "ROOMLERD_APPS=0",
                 "ROOMLERD_FPS_DENY=*:144",
                 "ROOMLERD_ENCODER_CELLS_DENY=hevc_videotoolbox:yuv444",
+                "ROOMLERD_ZERO_COPY=1",
+                "ROOMLERD_ZERO_COPY_DENY=hevc_videotoolbox:gpu",
+                "ROOMLERD_COLOR_DESCRIPTION=0",
             ]
         );
         assert!(
@@ -1204,5 +1755,169 @@ mod tests {
             worker_end(ExitStatus::from_raw(11 | 0x80)),
             Some(WorkerEnd::Signal(11))
         );
+    }
+
+    // #2987 — the stdin handoff and the lifeline it carries.
+
+    /// A worker from before #2987 reads ONE line and uses all of it as the
+    /// secret. The offer must not change that line, or every such worker the
+    /// new supervisor spawns (a downgrade, a half-applied update) would be
+    /// refused its attach.
+    #[test]
+    fn the_offer_is_a_line_of_its_own_after_the_secret() {
+        let secret = "a1b2c3";
+        let handoff = stdin_handoff(secret);
+        assert_eq!(handoff, "a1b2c3\nroomler-lifeline/1\n");
+        assert_eq!(handoff.lines().next().map(str::trim), Some(secret));
+        // A real secret is 32 bytes in hex (`delegate::SECRET_BYTES`).
+        assert!(
+            stdin_handoff(&"ab".repeat(32)).len() < 512,
+            "one write under PIPE_BUF, so it is atomic"
+        );
+    }
+
+    fn link(input: &str) -> (Option<String>, LinkEnd) {
+        let mut got = None;
+        let end = stdin_link(std::io::Cursor::new(input.as_bytes().to_vec()), |s| got = s);
+        (got, end)
+    }
+
+    #[test]
+    fn a_supervisor_from_before_the_lifeline_arms_nothing() {
+        // The old supervisor closed its end after the secret: end-of-file
+        // where the offer would be. The worker attaches as it always did and
+        // must NOT read that EOF as its daemon ending.
+        let (secret, end) = link("a1b2c3\n");
+        assert_eq!(secret.as_deref(), Some("a1b2c3"));
+        assert!(matches!(end, LinkEnd::NotOffered), "{end:?}");
+    }
+
+    #[test]
+    fn an_offer_this_worker_does_not_know_arms_nothing() {
+        let (secret, end) = link("a1b2c3\nroomler-lifeline/2\n");
+        assert_eq!(secret.as_deref(), Some("a1b2c3"));
+        assert!(matches!(end, LinkEnd::Unknown), "{end:?}");
+        let (_, end) = link("a1b2c3\n\n");
+        assert!(
+            matches!(end, LinkEnd::Unknown),
+            "a blank second line: {end:?}"
+        );
+    }
+
+    #[test]
+    fn no_secret_is_no_secret_and_no_watch() {
+        for input in ["", "\n", "   \n"] {
+            let (secret, end) = link(input);
+            assert_eq!(secret, None, "{input:?}");
+            assert!(matches!(end, LinkEnd::NoSecret), "{input:?}: {end:?}");
+        }
+    }
+
+    #[test]
+    fn the_offer_then_end_of_file_is_the_daemon_gone() {
+        // A daemon that died right after the spawn: the bytes it wrote are
+        // still read, then the pipe ends.
+        let (secret, end) = link("a1b2c3\nroomler-lifeline/1\n");
+        assert_eq!(secret.as_deref(), Some("a1b2c3"));
+        assert!(matches!(end, LinkEnd::Cut), "{end:?}");
+    }
+
+    /// The property itself, over a real OS pipe: the secret arrives at once,
+    /// the watch holds for as long as the writer does, whatever else it
+    /// writes, and ends the moment the writer's end closes. Closing the write
+    /// end is all a dying process does to the pipe, whatever killed it.
+    #[test]
+    fn the_watch_holds_while_the_daemon_does_and_ends_when_it_goes() {
+        use std::io::Write;
+        use std::sync::mpsc;
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let (secret_tx, secret_rx) = mpsc::channel();
+        let (end_tx, end_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let end = stdin_link(std::io::BufReader::new(reader), |s| {
+                let _ = secret_tx.send(s);
+            });
+            let _ = end_tx.send(end);
+        });
+        writer
+            .write_all(stdin_handoff("a1b2c3").as_bytes())
+            .expect("handoff");
+        assert_eq!(
+            secret_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the secret arrives without waiting for the pipe to end"),
+            Some("a1b2c3".to_string())
+        );
+        assert!(
+            end_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the watch ended while the daemon still holds its end"
+        );
+        // More bytes are not an end: a newer supervisor may say more.
+        writer.write_all(b"anything\n").expect("write");
+        assert!(end_rx.recv_timeout(Duration::from_millis(300)).is_err());
+        drop(writer);
+        let end = end_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the watch ends when the writer's end closes");
+        assert!(matches!(end, LinkEnd::Cut), "{end:?}");
+    }
+
+    const EXE: &str = "/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd";
+
+    /// The shape `ps -axww -o pid= -o uid= -o command=` prints, with the
+    /// processes a supervised Mac actually runs: the 10-26 orphan was pid
+    /// 68123, its `sudo` 68122.
+    const PS: &str = "    1     0 /sbin/launchd
+  412     0 /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd --config /etc/roomler/config.toml run
+68122     0 sudo -u #501 /usr/bin/env ROOMLERD_FPS_DENY=*:144 /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd run --supervised
+68123   501 /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd run --supervised
+70001   501 /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd run
+70002   501 /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd run --supervised --extra
+70003   501 /Users/someone/dev/target/debug/roomlerd run --supervised
+70004     0 /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd run --supervised
+70005   502 /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd run --supervised
+";
+
+    /// Each match gets a SIGTERM from root, so only an exact supervised
+    /// worker of THIS install, run as a person, matches: not the daemon, not
+    /// launchd's worker (`… run`), not the `sudo` above a worker, not another
+    /// build, not a root process.
+    #[test]
+    fn only_a_supervised_worker_of_this_install_is_stale() {
+        let command = worker_command(EXE);
+        assert_eq!(command, format!("{EXE} run --supervised"));
+        assert_eq!(
+            stale_workers(PS, &command, 412),
+            vec![(68123, 501), (70005, 502)]
+        );
+        // Never this process.
+        assert_eq!(stale_workers(PS, &command, 70005), vec![(68123, 501)]);
+        assert!(stale_workers("", &command, 412).is_empty());
+        assert!(stale_workers("  PID   UID COMMAND\nnot a row\n", &command, 412).is_empty());
+    }
+
+    #[test]
+    fn an_install_path_with_spaces_still_matches_exactly() {
+        let exe = "/Applications/Roomler Beta.app/Contents/MacOS/roomlerd";
+        let ps = format!("  555   501 {exe} run --supervised\n  556   501 {exe} run\n");
+        assert_eq!(
+            stale_workers(&ps, &worker_command(exe), 1),
+            vec![(555, 501)]
+        );
+    }
+
+    /// The 10-26 MacBook gave up naming "no per-user enrollment" while every
+    /// worker had exited 0 on a held lock. The exit code tells them apart.
+    #[test]
+    fn the_give_up_names_the_lock_when_workers_exit_cleanly() {
+        let lock = gave_up_reason(Some(WorkerEnd::Code(0)));
+        assert!(lock.contains("single-instance lock"), "{lock}");
+        assert!(!lock.contains("enrollment"), "{lock}");
+        for end in [Some(WorkerEnd::Code(1)), Some(WorkerEnd::Signal(9)), None] {
+            assert!(
+                gave_up_reason(end).contains("per-user enrollment"),
+                "{end:?}"
+            );
+        }
     }
 }

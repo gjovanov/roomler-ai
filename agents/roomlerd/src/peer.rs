@@ -5140,11 +5140,11 @@ async fn media_pump_vp9_444_dc(
                 // FR-70 M0 — the fused age split by plane (transit is an
                 // upper bound here: this pump keeps no send-wait figure).
                 age_split = ?governor.viewer_age_split(None),
-                // FR-71 T1a — which plane was the limiter last window, in
-                // SHADOW (nothing acts on it until T1b), and windows per
-                // verdict: [unknown, clear, overproduced, transit_stalled,
-                // viewer_late]. A repeat of finding 4 reads `transit-stalled`
-                // here while `target_bps` shows the cut T1b will remove.
+                // FR-71 T1a — which plane was the limiter last window (the
+                // verdict FR-79's gate reads; `evidence_rejected` below says
+                // what it rejected), and windows per verdict: [unknown, clear,
+                // overproduced, transit_stalled, viewer_late]. A repeat of
+                // finding 4 reads `transit-stalled` here, with no cut after it.
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
                 evidence_rejected = ?governor.evidence_rejected(),
@@ -5170,6 +5170,15 @@ async fn media_pump_vp9_444_dc(
                 // FR-59 P3/P4 — (congested windows, drains ordered, live
                 // queue-depth estimate in ms) from the viewer-side loop.
                 link_stats = ?governor.link_stats(),
+                // FR-63 B1 — the shadow controller beside this pump too (see the
+                // FFmpeg heartbeat for the fields' meaning). Pure telemetry;
+                // nothing live reads it.
+                shadow_target_bps = ?governor.shadow_target_bps(),
+                shadow_state = governor.shadow_state(),
+                shadow_measured_bps = ?governor.shadow_measured_bps(),
+                shadow_disagree_pct = ?governor.shadow_disagree_pct(),
+                shadow_pauses = governor.shadow_pauses(),
+                shadow_reason = governor.shadow_reason(),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
             qp_sum = 0;
@@ -6335,6 +6344,10 @@ async fn media_pump_ffmpeg_dc(
     // behaviour.
     let mut flip_tracker = crate::encode::rate_profile::FlipTracker::new(constrained);
     let rate_profile_rebuild = node_env("RATE_PROFILE_REBUILD").as_deref() != Some("0");
+    // FR-70 M3a.3 — a persisted flip dropped the encoder, and the inline open
+    // that replaces it has not run yet: that open ticks the controller under
+    // the new transport FIRST (the field's B1, see the open below).
+    let mut flip_rebuild_pending = false;
 
     // rc.93 — target fps. Pre-rc.93 this was hardcoded 30, which capped the
     // scrap backend's internal pacer (`scrap_backend::next_frame` sleeps to
@@ -7306,7 +7319,7 @@ async fn media_pump_ffmpeg_dc(
                         %session_id,
                         codec_label,
                         opened_fps,
-                        "FR-119: the replacement at the granted rate did not open — back to the session's rate for this session"
+                        "FR-119: the replacement at the granted rate did not open — that rate is out for this session, and the grant steps down"
                     );
                 }
             }
@@ -7467,6 +7480,7 @@ async fn media_pump_ffmpeg_dc(
                             .await;
                             encoder = None;
                             encoder_dims = None;
+                            flip_rebuild_pending = true;
                             if let Some(state) = fps_state.as_mut() {
                                 state.running_at(target_fps);
                             }
@@ -7859,9 +7873,14 @@ async fn media_pump_ffmpeg_dc(
                 // DIRECT only — on a relay a swap's IDR is a multi-second
                 // lump through the thin pipe; field 2026-08-27, CORPLAP-3 +
                 // CORPLAP-2 got WORSE) or defer (see `deferred_bps`).
+                // FR-70 M3a.3 (B3) — the newest target supersedes any held one,
+                // here as at the tick: an older hold left in place would be
+                // flushed at the next quiet, over this decrease.
                 if enc.supports_dynamic_bitrate() {
+                    deferred_bps = None;
                     timed_apply!(enc.set_bitrate(applied.bps).await);
                 } else if bg_rebuild && !constrained {
+                    deferred_bps = None;
                     swap_wanted = Some(applied.bps);
                 } else {
                     deferred_bps = Some(applied.bps);
@@ -8178,7 +8197,7 @@ async fn media_pump_ffmpeg_dc(
         // rung; the encode-bound auto rung fills the soft slot (an explicit
         // controller pick bypasses it by construction).
         let user_target = pipeline.merged_target(*target_resolution.lock().unwrap());
-        let dims_plan = crate::encode::policy::plan_dims(&crate::encode::policy::DimsInputs {
+        let inline_dims_inputs = crate::encode::policy::DimsInputs {
             native_w: cap_native_w,
             native_h: cap_native_h,
             merged_target: user_target,
@@ -8199,19 +8218,24 @@ async fn media_pump_ffmpeg_dc(
             refined: idle_refine.refined(),
             refined_cap: crate::encode::idle_refine_cap_long_edge(),
             soft_cap: governor.auto_res_cap(),
-        });
+        };
+        let dims_plan = crate::encode::policy::plan_dims(&inline_dims_inputs);
         let plan_target = dims_plan.effective_target;
         // FR-70 M3a — the geometry, against the plan: the dims this frame's
         // target produces, pin-independent (the pin below is the loop's — which
-        // encoder is live — not the plan's).
+        // encoder is live — not the plan's). M3a.3: with the inputs the inline
+        // arithmetic read, so a difference whose inputs moved since the plan's
+        // snapshot (a mode switch, a resolution or Priority write, a viewer
+        // joining) is a lag, logged once and counted apart.
         log_plan_divergences(
             &session_id,
             codec_label,
-            plan_shadow.check_dims(crate::encode::resample::target_dims(
-                frame.native_dims(),
-                plan_target,
-            )),
+            plan_shadow.check_dims(
+                crate::encode::resample::target_dims(frame.native_dims(), plan_target),
+                &inline_dims_inputs,
+            ),
         );
+        log_plan_lag(&session_id, codec_label, plan_shadow.take_lag());
         // FR-119 P2b-2 — the frame rate: decided again when the ask, the base
         // rate, the transport or the class (capture backend, encoder,
         // geometry) moves, and once a second for the pipe's belief. The
@@ -8236,9 +8260,9 @@ async fn media_pump_ffmpeg_dc(
                 fps_decided_on = Some(on);
                 fps_decided_at = std::time::Instant::now();
                 let above = asked.filter(|&a| a > base_fps);
-                // The ceiling the asked rate would get here, by the chain the
-                // replacement opens at, against what the pipe pushed back.
-                let ceiling_at_ask = above.map(|a| {
+                // The ceiling at a rate (P2b-18: each rate from the ask down),
+                // by the chain the replacement opens at.
+                let ceiling_at = |a: u32| {
                     crate::encode::policy::rate_plan(
                         enc_dims.0,
                         enc_dims.1,
@@ -8258,10 +8282,9 @@ async fn media_pump_ffmpeg_dc(
                         ),
                     )
                     .ceiling_bps
-                });
+                };
                 let capacity_bps = governor.belief_bps(std::time::Instant::now()).2;
-                let pipe_covers = ceiling_at_ask
-                    .is_none_or(|c| crate::encode::frame_rate::pipe_covers(capacity_bps, c));
+                let ceiling_at_ask = above.map(ceiling_at);
                 let class = crate::encode::frame_rate::ClassKey {
                     backend: capturer.backend().to_string(),
                     // P2b-3 — unknown is 0, and decides nothing.
@@ -8275,11 +8298,12 @@ async fn media_pump_ffmpeg_dc(
                     cap: base_fps,
                     constrained,
                     refresh_hz: capturer.refresh_hz(),
-                    denied: above.is_some_and(|a| {
-                        crate::encode::frame_rate::fps_denied(&fps_deny, enc.name(), a)
-                    }),
-                    verdict: None,
-                    pipe_covers,
+                    rates: crate::encode::frame_rate::rate_facts(
+                        asked,
+                        base_fps,
+                        |r| crate::encode::frame_rate::fps_denied(&fps_deny, enc.name(), r),
+                        |r| crate::encode::frame_rate::pipe_covers(capacity_bps, ceiling_at(r)),
+                    ),
                 };
                 if state.decide_with_retry(inputs, class, viewer_report.take_retrial()) {
                     // FR-119 P2b-12 — the decision's refusal, not the
@@ -8583,8 +8607,30 @@ async fn media_pump_ffmpeg_dc(
             }
             continue;
         }
+        // FR-70 M3a.3 — set when this pass's inline open already ticked the
+        // controller, so the pass's own tick below is skipped: one tick a pass.
+        let mut ticked_before_open = false;
         if need_rebuild {
             let cq_bias = rate.cq_bias;
+            // FR-70 M3a.3 (the field's B1, AC10 cases #10 and #23) — a
+            // persisted transport flip dropped the encoder, and the controller
+            // has not ticked under the new transport yet: `applied_bps` is the
+            // OLD profile's target. An open at it was re-rated on the very next
+            // tick, under the new ceiling — a second open on QSV/AMF, a few ms
+            // after the first. So the controller ticks HERE, first, with the
+            // pass's own arguments, and the encoder opens at what it decides.
+            // A target held for the dropped encoder is superseded by the open.
+            if std::mem::take(&mut flip_rebuild_pending) {
+                let _ = governor.pre_encode_tick(
+                    ceiling,
+                    aimd_floor,
+                    constrained,
+                    send_tx.capacity(),
+                    std::time::Instant::now(),
+                );
+                ticked_before_open = true;
+                deferred_bps = None;
+            }
             // Open at the AIMD's current target when it sits below the
             // ceiling — a fresh encoder at the full ceiling would be
             // rebuilt AGAIN one frame later by the governor's forced
@@ -8638,17 +8684,22 @@ async fn media_pump_ffmpeg_dc(
             // ⚠️ Timed around the AWAIT, not the call, so `open_ms` stays the
             // honest wall-clock cost of getting an encoder.
             let __open_t = std::time::Instant::now();
+            // FR-118 P2-2 — a GPU frame names its capture device, and a QSV
+            // encoder opened in its scope takes GPU frames from it.
+            let gpu_device = crate::encode::ffmpeg::gpu_hint::device_of(&frame);
             let __opened = match tokio::task::spawn_blocking(move || {
-                codec.open(
-                    w,
-                    h,
-                    target_fps,
-                    open_rate as usize,
-                    cq_bias,
-                    cell_444,
-                    constrained,
-                    last_encoder_name,
-                )
+                crate::encode::ffmpeg::gpu_hint::opening_on(gpu_device, || {
+                    codec.open(
+                        w,
+                        h,
+                        target_fps,
+                        open_rate as usize,
+                        cq_bias,
+                        cell_444,
+                        constrained,
+                        last_encoder_name,
+                    )
+                })
             })
             .await
             {
@@ -9060,13 +9111,20 @@ async fn media_pump_ffmpeg_dc(
         // link down under congestion / back up on recovery. `set_bitrate`
         // coarsens the target to a ladder before reconfiguring, so applying it
         // every frame is cheap (a no-op unless the coarse bucket moved).
-        if let Some(applied) = governor.pre_encode_tick(
-            ceiling,
-            aimd_floor,
-            constrained,
-            send_tx.capacity(),
-            std::time::Instant::now(),
-        ) {
+        // FR-70 M3a.3 — skipped when the inline open above already ticked (a
+        // persisted flip's rebuild): the encoder was built at that target.
+        let tick = if ticked_before_open {
+            None
+        } else {
+            governor.pre_encode_tick(
+                ceiling,
+                aimd_floor,
+                constrained,
+                send_tx.capacity(),
+                std::time::Instant::now(),
+            )
+        };
+        if let Some(applied) = tick {
             // P3 — rebuild-bound applies (QSV/AMF) go through the
             // background swap so rate moves land DURING motion with zero
             // stall; NVENC still reconfigures in place. DIRECT only:
@@ -9102,6 +9160,13 @@ async fn media_pump_ffmpeg_dc(
                 timed_apply!(enc.set_bitrate(applied.bps).await);
             } else if bg_rebuild && !constrained {
                 swap_wanted = Some(applied.bps);
+                // FR-70 M3a.3 (the field's B3, AC10 case #24) — the swap carries
+                // the controller's NEWEST target, so a target still held from
+                // before (a relay start's thrift hold, surviving the
+                // relay-escape) is superseded. Kept, the quiet flush below
+                // rebuilt the encoder at that stale rate seconds later, and the
+                // next tick re-rated it: two opens for nothing.
+                deferred_bps = None;
             } else if last_motion_at.elapsed() >= DEFER_QUIET {
                 // FR-10 follow-up (field 2026-08-28): the spacing below
                 // guarded only the DEFERRED flush, so this arm — "the
@@ -9217,12 +9282,18 @@ async fn media_pump_ffmpeg_dc(
         // against it: was it built at the plan's rate and the plan's dims? A
         // `bitrate` divergence here is an encoder the controller re-rates on
         // its very next tick. A replacement adopted after the plan moved while
-        // it opened is a stale adoption, counted apart and not judged.
+        // it opened is a stale adoption, counted apart and not judged. M3a.3:
+        // so is a replacement this very tick re-rated within the ceiling the
+        // loop planned the frame at (the controller's own move, one tick after
+        // the adoption), and an inline open built from geometry inputs that
+        // moved since the plan's snapshot is a lag on its dims.
         log_plan_divergences(
             &session_id,
             codec_label,
-            plan_shadow.after_tick(governor.applied_bps()),
+            plan_shadow.after_tick(governor.applied_bps(), ceiling),
         );
+        log_plan_stale_tick(&session_id, codec_label, plan_shadow.take_stale_tick());
+        log_plan_lag(&session_id, codec_label, plan_shadow.take_lag());
 
         let encode_start = std::time::Instant::now();
         // P5 (FR-1) — the 20-30 ms HW encode (including the BGRA→NV12
@@ -9501,9 +9572,13 @@ async fn media_pump_ffmpeg_dc(
                     // background (P3, direct only — see the loop-top block)
                     // or defer.
                     if let Some(applied) = governor.on_send_overflow(std::time::Instant::now()) {
+                        // FR-70 M3a.3 (B3) — as at the tick: the newest target
+                        // supersedes any held one.
                         if enc.supports_dynamic_bitrate() {
+                            deferred_bps = None;
                             timed_apply!(enc.set_bitrate(applied.bps).await);
                         } else if bg_rebuild && !constrained {
+                            deferred_bps = None;
                             swap_wanted = Some(applied.bps);
                         } else {
                             deferred_bps = Some(applied.bps);
@@ -9652,7 +9727,7 @@ async fn media_pump_ffmpeg_dc(
                 frames_skipped_backpressure, frames_empty, settle_kf_suppressed,
                 avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
                 avg_convert_ms, avg_upload_ms, avg_submit_ms, avg_drain_ms,
-                avg_readback_ms,
+                avg_readback_ms, input_path = rate_stats.input.path(), input_reason = rate_stats.input.reason,
                 send_wait_avg_ms, send_wait_max_ms,
                 learned_ceiling_bps = governor.learned_ceiling_bps(),
                 send_stalls,
@@ -9690,11 +9765,11 @@ async fn media_pump_ffmpeg_dc(
                 // iter_max 28 ms) reads here as transit ≈ 4.9 s. None = a
                 // pre-M0 viewer, or a window with no age report.
                 age_split = ?governor.viewer_age_split(Some(send_wait_avg_ms)),
-                // FR-71 T1a — which plane was the limiter last window, in
-                // SHADOW (nothing acts on it until T1b), and windows per
-                // verdict: [unknown, clear, overproduced, transit_stalled,
-                // viewer_late]. A repeat of finding 4 reads `transit-stalled`
-                // here while `target_bps` shows the cut T1b will remove.
+                // FR-71 T1a — which plane was the limiter last window (the
+                // verdict FR-79's gate reads; `evidence_rejected` below says
+                // what it rejected), and windows per verdict: [unknown, clear,
+                // overproduced, transit_stalled, viewer_late]. A repeat of
+                // finding 4 reads `transit-stalled` here, with no cut after it.
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
                 evidence_rejected = ?governor.evidence_rejected(),
@@ -9749,6 +9824,13 @@ async fn media_pump_ffmpeg_dc(
                 // — a make-before-break lag on a rebuild-bound backend, not a
                 // divergence. The first one logs with its three rates.
                 plan_stale_swaps = plan_shadow.stale_swaps(),
+                // FR-70 M3a.3 — counted apart from the divergences, like the
+                // stale swaps: replacements the controller re-rated on its
+                // first tick after the adoption within the ceiling, and
+                // geometry differences whose inputs moved between the plan's
+                // snapshot and the inline read. The first of each logs once.
+                plan_stale_ticks = plan_shadow.stale_ticks(),
+                plan_lags = plan_shadow.lags(),
                 idr_count = rate_stats.idr_count,
                 // FR-62 A2 — whether the pump is still rationing this encoder's
                 // constrained increases. false ⇒ moves land live (NVENC,
@@ -9766,6 +9848,21 @@ async fn media_pump_ffmpeg_dc(
                 open_ms_max = open_us_max as f64 / 1000.0,
                 iter_ms_max = iter_us_max as f64 / 1000.0,
                 pump_stalls,
+                // FR-63 B1 — the ONE delay-based controller, in SHADOW: what it
+                // WOULD target beside what the governor applied, so a week of
+                // these across the fleet answers the flip criterion (AC2)
+                // without the controller having steered a single session.
+                // `shadow_disagree_pct` is (shadow − live)/live: NEGATIVE means
+                // the shadow asked for less, the safe direction. `shadow_state`
+                // reads `off` when `ROOMLERD_RATECTL=off`. Nothing here is read
+                // by any live decision — it is pure telemetry (FR-63 B2 flips
+                // it live on the flip criterion).
+                shadow_target_bps = ?governor.shadow_target_bps(),
+                shadow_state = governor.shadow_state(),
+                shadow_measured_bps = ?governor.shadow_measured_bps(),
+                shadow_disagree_pct = ?governor.shadow_disagree_pct(),
+                shadow_pauses = governor.shadow_pauses(),
+                shadow_reason = governor.shadow_reason(),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
@@ -9835,6 +9932,56 @@ fn log_plan_stale_swap(
         now_w = s.now_dims.0,
         now_h = s.now_dims.1,
         "FR-70 M3a: a replacement was adopted after the plan moved while it opened (built at the plan of its spawn; first time this session)"
+    );
+}
+
+/// FR-70 M3a.3 — log the session's FIRST stale tick: a replacement adopted
+/// while the plan held, whose rate the controller moved on its very next tick
+/// within the ceiling the loop planned the frame at (`spawned_bps` is the
+/// plan's rate at the adoption). Not a divergence; the heartbeat's
+/// `plan_stale_ticks` carries the count.
+#[cfg(feature = "ffmpeg-encoder")]
+fn log_plan_stale_tick(
+    session_id: &bson::oid::ObjectId,
+    codec_label: &str,
+    stale: Option<crate::encode::plan::StaleSwap>,
+) {
+    let Some(s) = stale else {
+        return;
+    };
+    info!(
+        %session_id,
+        codec_label,
+        kind = s.kind,
+        built_bps = s.built_bps,
+        adopted_plan_bps = s.spawned_bps,
+        now_bps = s.now_bps,
+        "FR-70 M3a.3: the controller re-rated a replacement on its first tick after the adoption, within the ceiling (the plan's own move a tick on; first time this session)"
+    );
+}
+
+/// FR-70 M3a.3 — log the session's FIRST geometry lag: the plan and the
+/// inline arithmetic disagreed on the dims because an input moved between the
+/// plan's snapshot and the inline read (`moved` names it). Not a divergence;
+/// the heartbeat's `plan_lags` carries the count.
+#[cfg(feature = "ffmpeg-encoder")]
+fn log_plan_lag(
+    session_id: &bson::oid::ObjectId,
+    codec_label: &str,
+    lag: Option<crate::encode::plan::PlanLag>,
+) {
+    let Some(l) = lag else {
+        return;
+    };
+    info!(
+        %session_id,
+        codec_label,
+        moved = l.moved,
+        plan_w = l.plan_dims.0,
+        plan_h = l.plan_dims.1,
+        inline_w = l.inline_dims.0,
+        inline_h = l.inline_dims.1,
+        "FR-70 M3a.3: the plan's geometry lagged an input that moved between its snapshot and the inline read (first time this session)"
     );
 }
 

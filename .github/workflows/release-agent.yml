@@ -322,6 +322,13 @@ jobs:
         # patchelf for the FFmpeg bundling step. Bump `version:` whenever this
         # list changes, in BOTH jobs: they must stay byte-identical to share one
         # cache entry.
+        #
+        # Bounded (FR-6 wave 30). In 0.4.175's tag run (40312190685, attempt 1)
+        # this step hung 23+ min where it takes ~37 s, and only the job's 60 min
+        # would have ended it. A timeout or an error now falls through to the
+        # verify step below, which installs whatever did not land.
+        timeout-minutes: 8
+        continue-on-error: true
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
           packages: libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev pkg-config libvpx-dev libasound2-dev libglib2.0-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev patchelf
@@ -350,6 +357,8 @@ jobs:
           }
           if ! check; then
             echo "::warning::the cached apt set did not deliver the release build deps; installing directly"
+            # A cached step killed by its timeout can leave dpkg mid-install.
+            sudo dpkg --configure -a || true
             sudo apt-get update -qq
             # shellcheck disable=SC2086
             sudo apt-get install -y $pkgs
@@ -376,6 +385,12 @@ jobs:
         # of it — the old actions/cache restore needed no token).
         env:
           GH_TOKEN: ${{ github.token }}
+          # FR-6 wave 32: a daemon seed restarts at ~2.2-2.7 GB after a cold
+          # build and grows ~340-390 MB per warm one, so the 3,000 MB default
+          # dropped the Windows seed on four reseeds in a row (0.4.180-0.4.183).
+          # 4,500 allows four to six warm builds; compressed, a seed is
+          # 535-790 MiB, far under the 2 GiB release-asset limit.
+          SEED_TARGET_MAX_MB: "4500"
         with:
           shared-key: agent-linux
 
@@ -776,7 +791,10 @@ jobs:
         # ⚠️ Byte-identical `packages` and `version` to build-linux, so both
         # jobs restore ONE cache entry and this job never meets the mirror on
         # its own (FR-6 wave 19). The companion uses only the GTK/WebKit +
-        # ayatana part; the rest costs nothing on a cache hit.
+        # ayatana part; the rest costs nothing on a cache hit. Bounded as in
+        # build-linux (FR-6 wave 30).
+        timeout-minutes: 8
+        continue-on-error: true
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
           packages: libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev pkg-config libvpx-dev libasound2-dev libglib2.0-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev patchelf
@@ -796,6 +814,8 @@ jobs:
           }
           if ! check; then
             echo "::warning::the cached apt set did not deliver the companion's build deps; installing directly"
+            # A cached step killed by its timeout can leave dpkg mid-install.
+            sudo dpkg --configure -a || true
             sudo apt-get update -qq
             # shellcheck disable=SC2086
             sudo apt-get install -y $pkgs
@@ -1106,6 +1126,7 @@ jobs:
         # of it — the old actions/cache restore needed no token).
         env:
           GH_TOKEN: ${{ github.token }}
+          SEED_TARGET_MAX_MB: "4500" # FR-6 wave 32: see build-linux
         with:
           shared-key: agent-linux-arm64
 
@@ -1580,6 +1601,7 @@ jobs:
         # of it — the old actions/cache restore needed no token).
         env:
           GH_TOKEN: ${{ github.token }}
+          SEED_TARGET_MAX_MB: "4500" # FR-6 wave 32: see build-linux
         with:
           shared-key: agent-windows-vp9-444
 
@@ -2550,6 +2572,7 @@ jobs:
         # of it — the old actions/cache restore needed no token).
         env:
           GH_TOKEN: ${{ github.token }}
+          SEED_TARGET_MAX_MB: "4500" # FR-6 wave 32: see build-linux
         with:
           shared-key: agent-macos
 

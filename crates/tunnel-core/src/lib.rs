@@ -29,6 +29,12 @@
 //! locks this; do not relax it.
 
 pub mod auth;
+/// #3080 — child processes on Unix: a short command read until it EXITS, never
+/// until EOF, and a long-lived child that keeps only its own stdio. macOS has
+/// no `pipe2`, so a new pipe there is briefly inheritable by any child spawned
+/// on another thread.
+#[cfg(unix)]
+pub mod child;
 /// Node env-var reads: `ROOMLERD_*`, then the older `ROOMLER_NODE_*`.
 /// #2187 — the daemon's own control-plane names, resolved so that no caller
 /// ever waits on a resolver that has stopped answering for a name it has

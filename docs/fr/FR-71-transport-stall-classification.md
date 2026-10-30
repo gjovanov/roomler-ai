@@ -1,6 +1,6 @@
 # FR-71 — Transport stall classification: a transit stall is not an over-production signal
 
-**Issue:** [#1362](https://github.com/gjovanov/roomler-ai/issues/1362) · **Status:** proposed 2026-09-05; T1a+T1b+T1c shipped (hold default off); AC2 days 1–4 read (96 % gaps); **AC3 field hold-on half FAILED 2026-09-08 — the hold masks the wrong mover; deletion proposed (§Open decisions)**; **T1b, T2 and T2b were superseded 2026-09-08 by [FR-79](FR-79-one-validity-gate.md)'s one validity gate, which deleted all three and their switches** ·
+**Issue:** [#1362](https://github.com/gjovanov/roomler-ai/issues/1362) · **Status:** proposed 2026-09-05; T1a+T1b+T1c shipped (hold default off); AC2 days 1–4 read (96 % gaps); **AC3 field hold-on half FAILED 2026-09-08 — the hold masks the wrong mover; deletion proposed (§Open decisions)**; **T1b, T2 and T2b were superseded 2026-09-08 by [FR-79](FR-79-one-validity-gate.md)'s one validity gate, which deleted all three and their switches**; **2026-10-29**: the classifier documented (AC7) and a 15-day fleet read of 40,654 constrained windows against the gate — AC2 met; the hold's property holds where nothing is measured and **fails through FR-79 V5's `stall_is_ours` loop** (AC3–AC6 `[~]`, §Open decisions) ·
 **Parent:** split out of FR-70 (#1330) on its own open question; FR-70's M0 is this FR's instrument.
 
 ## Goal
@@ -219,6 +219,23 @@ outside a window's final pass never made it `overproduced`. The governor now sum
 the passes ([FR-119](FR-119-high-refresh-streaming.md) §4.10). The tests here always
 fed whole windows, so they describe the classifier the field runs from then on.
 
+### Where FR-79 left each phase (2026-10-29)
+
+FR-79 V1 (`agent-v0.4.93`, #1525) deleted T1b, T2 and T2b with their switches and
+counters, and built its gate on T1a's verdict. Read this FR's criteria against the
+replacement, not the original — each row names what now answers the phase:
+
+| phase here | what replaced it | where |
+|---|---|---|
+| T1a — the classifier | unchanged, and no longer a shadow: `evidence::rejected` reads this window's verdict and the previous one's as two of its facts; `transit_classify` is gone | `pipe_state.rs:159`, `evidence.rs:172`, `governor.rs:1088` |
+| T1b — the hold (`transit_hold`) | a `TransitStalled` window is **rejected** as evidence: the goodput fold drops it, the hard ×0.5 does not apply, the ramp neither steps nor ends, the age loop learns but does not fire, the P3 clamp is neither armed nor released, the prior does not move — unless V5's `stall_is_ours` (`desired > 1.2 × pipe_bps`), which cuts ×0.85, ends the ramp, keeps the age streak and pushes the prior back | `evidence.rs:194`, `governor.rs:1103`, `:1154`, `:1356`, `:1377` |
+| T2 — the deferred hard stall | `Reason::AgentStalled`: a pump pass that overran its stall budget rejects the window outright, whatever the classifier said, and the ×0.5 is applied at the fold only on a valid window | `evidence.rs:194`, `governor.rs:1180` |
+| T2b — the stall's shadow | `Reason::StallShadow`: the window after a `transit-stalled` one is rejected too | `evidence.rs:194` |
+| the counters | `evidence_rejected=[agent-stalled, transit-stalled, stall-shadow, carrier-changed, opening, keyframe-burst]` beside `pipe_state` / `pipe_states` / `pipe_gap_stalls` | `peer.rs:9764`–`:9774` |
+
+The docs for the classifier live with the gate's, as the section it feeds:
+[`docs/rate-control.md`](../rate-control.md) § "The classifier the gate reads".
+
 ## Phases
 
 | Phase | What | Kill switch | Status |
@@ -228,6 +245,7 @@ fed whole windows, so they describe the classifier the field runs from then on.
 | **T1c** | the cells: `finding4_transit_stall` in B0 (the law), then the corp-VPN DERP path (the field), each shown to FAIL with the hold off first | — | **sim half done 2026-09-05**: the FAIL recorded (`t1c_finding_4_cuts_the_rate_with_the_hold_off`), the hold's cell green (`t1b_finding_4_hold_keeps_the_rate`), the no-stall cells byte-identical with the hold on and off; the field half waits for the release |
 | **T2** | a hard stall is a deferred verdict: a blocked send ≥ 1 s is quarantined and the ×0.5 held pending until the next REPORTED window — sends still blocking confirm it (fold + halve, one window late), nothing blocking is a pause (discard, no move) | — (the next window's own measurement gates it) | **built 2026-09-08**, test-first on the 12:15 numbers; field gate on the release carrying it |
 | **T2b** | the stall's shadow: the first window after a `transit-stalled` one is still the stall's — the viewer link report landing there neither arms nor releases the arrival-rate clamp; heartbeat `stall_shadowed` | — (T1a's verdict gates it) | **built 2026-09-08**, test-first on the 14:52 numbers; field gate on the release carrying it |
+| **Docs** | the classifier documented beside the gate it feeds: the decision, the five verdicts, the inputs and the whole-window rule, the heartbeat fields and how to read them, the two field shapes of finding 4; the stale "shadow" / "T1b" wording in `pipe_state.rs` and the two heartbeat comments in `peer.rs` corrected | — | **done 2026-10-29** (AC7), in the PR that carries the 2026-10-29 fleet read |
 
 ## Acceptance criteria
 
@@ -242,7 +260,7 @@ fed whole windows, so they describe the classifier the field runs from then on.
       `t1a_freeze_stalls_are_sender_visible`; `ViewerLate` and `Unknown` in
       the unit tests — the sim's viewer decodes instantly, so it cannot
       produce a decode backlog.)*
-- [ ] **AC2** — one release of shadow classification across the fleet, reviewed
+- [x] **AC2** — one release of shadow classification across the fleet, reviewed
       from `agent_logs`: no constrained session classified `TransitStalled`
       while its send queue was over budget, and finding 4's shape classifies
       as `TransitStalled` in replay. *(First session read 2026-09-05 on
@@ -276,7 +294,28 @@ fed whole windows, so they describe the classifier the field runs from then on.
       was a report gap and the split rule fired zero times on a healthy
       relay; CORPLAP-1 read 4 of 4. So far the hold would only ever have
       acted on gaps.)*
-- [ ] **AC3** — with `transit_hold` on, a repeat of finding 4 shows **no rate
+      *(**Met 2026-10-29**, read from the three corporate laptops' own worker
+      logs over Fleet RPC — `service-logs\roomlerd.log.<date>`, 2026-10-15 →
+      10-29, builds `agent-v0.4.137` → `0.4.184`: 67 constrained sessions,
+      20,782 heartbeats, **40,654 constrained windows**; 812 `transit-stalled`
+      (2.0 %), 579 of them report gaps (71 %), 240 `overproduced`, 74
+      `agent-stalled` rejections. Never a stall verdict with the queue over
+      budget: across the 429 heartbeats whose last window read
+      `transit-stalled` the most in flight was 27.8 KB against a ~169 KB
+      budget, and the 19 that also carried a wait ≥ 100 ms, a gate skip or a
+      hard stall are the one-window offset — the blocked send's own window read
+      `overproduced` and the next, carrying the viewer's late age,
+      `transit-stalled` (10-19 08:55:19–21: a 1.7 s block, then age 3,257 =
+      transit 2,546 + viewer 711). Finding 4's shape classified itself 22 times
+      with a clean sender and a paint age ≥ 1 s — 2,028 ms as transit 2,024 /
+      viewer 4 with 0 B in flight (10-19 08:24), 2,125 ms (10-26 00:18),
+      12,099 ms as transit 9,113 / viewer 2,986 (10-19 10:42). The replay half
+      is `finding_4_is_transit_stalled_in_every_window` (`pipe_state.rs`) and
+      `t1a_finding_4_stall_windows_classify_as_transit_stalled` (`sim.rs:2104`).
+      The gap share fell from September's 96 % because these were worse relay
+      days, not because the rule changed; FR-119 P2b-8's whole-window inputs
+      ran from 10-23.)*
+- [~] **AC3** — with `transit_hold` on, a repeat of finding 4 shows **no rate
       cut** during the stall and recovery within the stall's own length; the
       same cell with the hold off still cuts — the FAIL recorded first.
       *(Sim half met 2026-09-05: hold off — the AIMD cuts 1.98 → 1.5 Mbps on
@@ -306,7 +345,29 @@ fed whole windows, so they describe the classifier the field runs from then on.
       FR-59 P6's seed contradiction and P1's floor relief fed by the goodput
       measured FROM those blocked sends, and the over-budget ×0.85. See the
       field log and the open decision below.)*
-- [ ] **AC4** — no regression on the LAN, direct and thin-pipe cells (peak
+      *(**2026-10-29, read against FR-79's gate, which replaced the hold** —
+      PARTLY met. The half that holds: with no pipe estimate standing, a transit
+      stall does not cut. 433 of the 482 stall episodes whose sender was clean
+      (no blocked send, no gate skip, no hard stall, no agent-stalled window,
+      < 50 KB in flight) kept the target, 14 of the 22 with a paint age ≥ 1 s
+      among them: 2,125 ms held at 4.92 M (CORPLAP-2 10-26 00:18:29, four
+      windows, `goodput=None`), 2,028 ms at 3.25 M (10-19 08:24:07), 2,329 ms at
+      3.00 M (09:33:23), 1,891 ms at 2.47 M (CORPLAP-3 10-18 21:03:39), and the
+      path read `clear` again within 2–10 s of each. The half that FAILS: **49
+      clean episodes cut** — 55 drops of exactly ×0.85 (×0.72 where two fell in
+      one heartbeat) on gap or split windows with nothing sender-side — every one
+      on a session whose prior stood at 0.02–0.8 M. The mover is V5's
+      `stall_is_ours` (`governor.rs:1154`): it compares `desired` with `pipe_bps`
+      (`:607`), whose last source is the prior's stand-in (`:613`), and on every
+      window it fires on it pushes that prior back with no measurement attached
+      (`:1377`, `RatePrior::on_window(None, true)`: one step down per two dirty
+      windows, `prior.rs:85`, one step up per ten clean ones, `:66`) — so the
+      comparison's own output lowers its input. CORPLAP-2 10-20 13:53–14:19
+      (`6ad77273…`, HEVC over `relay:derp/tcp`): prior 17.8–23.7 kbps, 24 gap
+      windows each answered ×0.85, 3.63 → 0.94 M with a 3.1 s paint age; the
+      session after it 2.55 → 0.20 M. The hold-off FAIL stands from 2026-09-06
+      and 09-08; the pass needs the loop broken first — §Open decisions.)*
+- [~] **AC4** — no regression on the LAN, direct and thin-pipe cells (peak
       paint, settle time, over-drive integral unchanged within noise).
       *(Sim half met 2026-09-05: the thin pipe, the LAN burst and the genuinely
       slow relay trace **byte-identical** with the hold on and off and hold
@@ -314,14 +375,90 @@ fed whole windows, so they describe the classifier the field runs from then on.
       point, the same day on 0.4.68: a healthy pinned-relay session with the
       hold ON climbed 2.55 → 3.0 Mbps exactly as the hold-off session had,
       with one benign gap-hold — see the field log.)*
-- [ ] **AC5** — FR-70's AC5 closes here, and FR-63 B1's controller consumes
+      *(2026-10-29: the LAN and direct cells are untouched by construction — the
+      classifier runs on constrained windows only (`governor.rs:1100`) and
+      CORPLAP-1 ran direct for the whole fortnight (17 constrained windows in 15
+      days); the healthy-relay cell held — CORPLAP-2 10-20 06:04, 64 min, 3,729
+      windows, 67 stalls, 5.38 M kept throughout; 10-15 08:45, 30 min, 1,783
+      windows, 42 gap stalls, 3.30 → 3.51 M. The thin-pipe field cell is the one
+      FR-79's AC9 still waits for, and on the thin afternoons this read did catch
+      (10-20 13:22–14:56) the V5 loop was running, so "unchanged within noise"
+      cannot be claimed there yet.)*
+- [~] **AC5** — FR-70's AC5 closes here, and FR-63 B1's controller consumes
       `PipeState` rather than re-deriving it.
-- [ ] **AC6** — with T2 live, a repeat of the 2026-09-08 12:15 shape (a blocked send ≥ 1 s inside a rekey storm on the corp-VPN relay, the pipe intact after) shows `hard_stalls_paused` counting, no ×0.5, the learned ceiling kept and the floor unrelieved — and a genuinely thin pipe (the FR-59 hotspot cell or its B0 fixture) still confirms and halves one window late.
+      *(2026-10-29: the first half is AC3's — the response holds where nothing
+      is measured and fails through the V5 loop. The second half is NOT met as
+      B1 is proposed: FR-63 B1's shadow controller (#3102, open)
+      `ratectl::Controller::fold_window(&ShadowWindow)` reads the fused
+      `age_avg_ms` / `age_min_ms`, the arrival rate and the goodput — no
+      `PipeState` and no gate verdict — on every window, and `on_stall` halves
+      at once on a blocked send ≥ 1 s (`a_hard_stall_halves_at_once`): it
+      re-derives the verdict this FR built the classifier to replace, and would
+      re-create both the 12:15 cut and the finding-4 age cut in shadow; its
+      `shadow_disagree_pct` will say how often. Named for the FR-63 worker and
+      the operator; nothing changed from this card.)*
+- [~] **AC6** — with T2 live, a repeat of the 2026-09-08 12:15 shape (a blocked send ≥ 1 s inside a rekey storm on the corp-VPN relay, the pipe intact after) shows `hard_stalls_paused` counting, no ×0.5, the learned ceiling kept and the floor unrelieved — and a genuinely thin pipe (the FR-59 hotspot cell or its B0 fixture) still confirms and halves one window late.
+      *(2026-10-29, read against V1's `AgentStalled`, which replaced T2: the
+      counting half is met — 74 `agent-stalled` rejections in 15 days on the
+      three hosts, 12 of the 16 blocked-send-≥ 1 s episodes inside one. The
+      no-×0.5 half cannot be read from the heartbeat: 30 target drops sat in
+      heartbeats holding both an agent-stalled rejection and a blocked send
+      ≥ 1 s; 9 were ×0.85 and 4 ×0.72 with an `overproduced` window beside the
+      stalled one (the occupancy ladder, which T2 always let run), and 2 were
+      ×0.50 (10-19 08:56:44, 3.00 → 1.50 M after a 2.1 s block; 09:23:58,
+      2.08 → 1.04 M after 1.2 s) — a heartbeat spans two windows and the daemon
+      writes no per-window record of the fold's hard-MD verdict, so whether the
+      halving's window was the stalled one or the free one beside it is not
+      decidable from the logs; an instrument is owed (the fold logging the hard
+      MD with the gate's reason). The thin-pipe half is met: a blocked send on a
+      free loop still halves at its own window — 46 such drops, four of them
+      ×0.50/0.51, e.g. 10-22 09:43:01–03 a 1,235 ms block in an `overproduced`
+      window, then `set_bitrate target_bps=1636632` = ×0.5 of 3,273,265, one
+      window after.)*
+- [x] **AC7 — Docs** — `docs/rate-control.md` carries the classifier as a
+      section of the gate it feeds: the decision (mermaid), the five verdicts
+      with their rules and what the gate makes of each, the inputs and their
+      whole-window rule since FR-119 P2b-8, the heartbeat fields and the three
+      rules for reading them, the two field shapes of finding 4 and the cells
+      that keep the FAIL on record; the page's `docs/README.md` row names it.
+      *(2026-10-29, in the PR that carries this read; the stale "shadow" and
+      "T1b" wording in `pipe_state.rs` and the two heartbeat comments in
+      `peer.rs` corrected in the same PR.)*
 
 
 ## Open decisions
 
-- **Whether T1b's hold should be deleted, and what replaces it (2026-09-08).** The
+- **The V5 loop — a stall is "ours" because the last stall said so
+  (2026-10-29).** `stall_is_ours` (`governor.rs:1154`) is the one rule that lets
+  a rejected `TransitStalled` window cut, gated on `desired > 1.2 × pipe_bps`.
+  `pipe_bps` (`:607`) falls through to the prior's stand-in (`:613`) when neither
+  the blocked-send goodput nor the viewer's arrival rate is live, and the same
+  branch that cuts pushes the prior back without a measurement (`:1377`), one
+  step down per two dirty windows (`prior.rs:85`), climbing back only one step
+  per ten clean ones (`:66`). On a relay that gaps every few windows the prior
+  never climbs, every gap is "ours", and the target is cut ×0.85 per gap: 55
+  such drops in 15 days, 24 of them in one 25-minute session that ended at
+  0.94 M with 0 B in flight and a 3.1 s paint age — the inverse of FR-79 AC9's
+  failing run (there nothing could lower the rate; here nothing can stop
+  lowering it). Direction, in the gate's own words ("with nothing measured there
+  is no claim to contradict"): `stall_is_ours` compares against a MEASURED
+  source only — the goodput, or the viewer's arrival rate inside its TTL —
+  never the stand-in; and a push-back that carries no number must not move the
+  number the next push-back is judged against. Home: FR-79 (it is V5's rule) or
+  a T3 here — the operator's call. The fail-first cell is the 10-20 14:16 arc:
+  prior 19,578, three gap windows, target 1.17 → 1.00 → 0.85 → 0.61 M.
+- **The stall's onset (2026-10-29).** `StallShadow` covers the window after a
+  `transit-stalled` one; nothing covers the window before it. Transit climbs
+  through the 200 ms slack over one or two windows, and the viewer's report in
+  the window where it is still under the slack — a growing queue at the
+  collapsed arrival rate, `link_congested=true` — passes the gate as the pipe's
+  rate and arms the P3 clamp: 10-19 09:17:07 `age_ms=232 age_floor_ms=46
+  link_ceiling_bps=Some(620298)` in a `clear` window, `set_bitrate
+  target_bps=620298` from 3.0 M 0.7 s later, the next window `transit-stalled`
+  at 555 ms; 13 such drops in 15 days, two of them to 0.20 M. The
+  make-before-break answer T2 used fits: a congested report arms the clamp one
+  window late, if the window after it is not stalled.
+- **Whether T1b's hold should be deleted, and what replaces it (2026-09-08).** **DECIDED 2026-09-08: FR-79 V1 deleted it, T2 and T2b, and kept T1a's classifier as the gate's instrument.** The
   field's finding-4 shape on the corp-VPN host is not the simulated one (post-ack
   paint age with a tiny queue): it is a pump pass stalled in `other` by the overlay's
   rekey storm and probe waits, during which the DC send blocks for seconds — and
@@ -388,5 +525,8 @@ consumes `PipeState`), FR-64 #1244, FR-19 #805.
 | 2026-09-07 (read 16:12 UTC) | **0.4.79** (classify on, hold off on this host), the operator's sessions | CORPLAP-2 relay, av1_nvenc, `constrained=true`: a 66-min session (3,816 windows) and a 7.8-min one (454) | **AC2 day 3**: 53 `transit-stalled` of 3,816, **52 report gaps**; 24 of 454, 20 gaps. The 4–5 non-gap stalls are viewer-age spikes (~50 → 390 ms) with the sender idle — inflight 0, send wait ≤ 0.7 ms — i.e. finding 4's shape beyond the ack point, and the target held 3.0 M through them: the split rule classified them and the AIMD did not cut. ⚠️ The heartbeat's `pipe_state` (current window) and the `pipe_states` histogram are offset by one window when read side by side — count from the histogram deltas. Days 1–3: gaps are 94 % of classified stalls. CORPLAP-1 (hold on) ran direct all day, so AC3's hold-on repeat still needs a relay day there. |
 | 2026-09-08 07:48–09:13 UTC (read 09:20) | **0.4.85** (classify on, hold off on this host), the operator's sessions | CORPLAP-2 relay, hevc_nvenc, `constrained=true`: 8 sessions, six of 2.5–23 min (685 / 345 / 302 / 265 / 633 / 76 heartbeats) | **AC2 day 4**: 86 `transit-stalled` verdicts, **82 report gaps**, 4 by the split rule. Days 1–4: 209 of 218 (96 %) are gaps. **The split-rule verdicts include a natural repeat of finding 4 with the hold off** (`6a9fca12`, 08:48:11–21): age 50 → 127 → 368 ms with the sender idle (0 bytes in flight, send wait 0.03 ms; split transit 342 / viewer 26 ms), `transit-stalled` at :13 → the AIMD cut 3.0 → 2.55 M at :14; two silent windows (gaps); +187.5 k at :19 (the additive increase through the stall); then cuts to 2.33 M at :20.5 and 1.98 M at :21.5 on a second split-rule verdict (age 256 → 230, transit 229, still 0 in flight) — **−34 % in 7 s for a transit spike the classifier had named, and a 30 s climb back** (3.0 M again at 08:48:52). That is AC3's FAIL in the age-cut flavour, on the split-present host; with the hold on, each of those windows was a hold. Two side notes. `6a9fc69f` (08:26) opened **unconstrained** for 4 s (`c=false`, target 54.9 M) before the relay verdict set 3.0 M — the opening burst took 7.7 s to drain (age 7,679 ms, send wait max 434 ms) and the `overproduced` verdict cut, correctly: a transport-known-late class, one instance. And `6a9fca12` opened at 200 k from a pair remembered at 145 k (`5.9.157.226`), reached 3.0 M in 130 s, and closed the memory at 3.0 M (`rate_memory.json`, 08:49:50) — FR-70 P1's decay plus FR-35 P3's growth working; the seven neo16-pair sessions opened at 2.7–6.8 M and were at ≥ 2.9 M within 6 s. CORPLAP-1 (hold on) ran direct all day again. |
 | 2026-09-08 12:15:18–12:16:03 UTC | **0.4.87** (classify on, **hold on**), my view-only session `6a9fed1d` (a hidden automation tab) | CORPLAP-1 on the Check Point VPN, HEVC hevc_qsv, pill `relay · VPN captures the host's LAN`, steady at age 50 ms with the learned ceiling at 6.60 M and 0 B in flight | **AC3's field repeat with the hold on — FAIL.** An overlay `REKEY_TIMEOUT` storm (≈20 lines 12:15:21–12:16:16) with make-before-break LAN probes waiting 8–12 s stalled two pump passes with every timed phase at 0 ms (`other_ms` 2,884 at :21 and 7,386 at :55); the send task's blocked sends read 2,900 / 7,404 / 1,872 ms; viewer age 1.5 s / 1.25 s / 2.2 s (8.7 s by the viewer's own report at :58); 170 frames skipped at the budget gate. The rate: 6.60 → **3.30 M** at :21 (a blocked send ≥ 1 s is a HARD stall — `note_send_stall` → `apply_hard_md`, ×0.5 at once, `deferred=false`) → **3.00 M** 16 ms later (FR-59 P6: the goodput measured FROM those blocked sends, 1.58 M, "contradicts the learned ceiling — abandoning it"; the learner's step-ups to 3.19 M at :32, :37 and :42 were each abandoned within 30 ms while that goodput stood) → 2.55 M at :46 (over-budget ×0.85) → **1,345,142** at :55 (the second hard halving, pinned at the RELIEVED FLOOR = 85 % of the same goodput, FR-59 P1) → **677,760** at :57 (a third blocked send ≥ 1 s) — **−90 % from 6.6 M in 36 s**, then +12.5 % per 5 s from 762 k, 3.0 M again only at ~12:19 and the 6.6 M ceiling gone for the rest of the session. The hold engaged on its three windows (`transit_holds` 24 → 27: one gap, two split verdicts with age 1,253 and 2,172 ms) and prevented nothing — every cut came from a mover the hold does not mask. Earlier in the same session and the one before it (10:41–12:15, both hold on): 35 report-gap verdicts, 35 holds, zero cuts from them; one −15 % age-loop cut at 10:59:46 on a 151 ms age blip with 0 B in flight, below the classifier's 200 ms stall rule, back in 15 s. |
-| 2026-09-08 13:35–14:14 UTC | **0.4.90** | release | T2 (#1513 → `94003411`). The tag `agent-v0.4.90` is the FR-77 session's (bump #1514 → `283361e7`, tagged 13:45 UTC from a master that already carried T2; my own bump #1515 → `39617cfd` landed after it as a no-op duplicate). 28 assets, published 13:58. CORPLAP-3 self-updated at 14:01:31; CORPLAP-1 (pid 20528, 14:11:54) and CORPLAP-2 (pid 4604, 14:13:01) updated by the idle one-shot task while their pumps had been quiet for an hour. Field gate open (AC6): a rekey-storm repeat on CORPLAP-1 over the relay with `hard_stalls_paused` counting and no ×0.5. |
+| 2026-09-08 13:35–14:14 UTC | **0.4.90** | release | T2 (#1513 → `df9fe74f`). The tag `agent-v0.4.90` is the FR-77 session's (bump #1514 → `5c8cd845`, tagged 13:45 UTC from a master that already carried T2; my own bump #1515 → `5b82b3ed` landed after it as a no-op duplicate). 28 assets, published 13:58. CORPLAP-3 self-updated at 14:01:31; CORPLAP-1 (pid 20528, 14:11:54) and CORPLAP-2 (pid 4604, 14:13:01) updated by the idle one-shot task while their pumps had been quiet for an hour. Field gate open (AC6): a rekey-storm repeat on CORPLAP-1 over the relay with `hard_stalls_paused` counting and no ×0.5. |
 | 2026-09-08 14:52:37–14:53:25 UTC | **0.4.90 (T2 live, hold on)**, my view-only session `6aa01ab8` on auto (HEVC-DC, hevc_qsv, relay) | CORPLAP-1 on the Check Point VPN, steady at age 64 ms with the learned ceiling at 7.45 M and 0 B in flight | **AC6 read — FAIL, through a third input.** 14:52:37 the overlay demoted the carrier to the viewer's peer onto DERP ("following it onto DERP now"); :39 a gap, :41 age 2,135 ms (transit 2,134), :43 age 3,626 ms (transit 3,624) — three `transit-stalled` windows, all held, **the target stayed at 7.45 M through them** (T1b doing its job; on 12:15 the hard halving had cut here). No send blocked ≥ 1 s (max 278 ms; the byte-budget gate skipped 83 frames instead), so T2's deferral never engaged (`hard_stalls_paused`/`confirmed` 0). The cut came through the viewer: its link report at :43 read 70,340 bps of arrivals with a growing queue (`link_ceiling_bps=70340`, not yet congested), the next at :44.16 `link_congested=true link_ceiling_bps=834800`, and at :44.84 the P3 arrival-rate clamp set **834,800** (ceiling 7.45 M, `deferred=true`) — the :45 window's verdict was `overproduced` (250 frames skipped, inflight over budget), so the hold was off and `link_acts` went through; 30 ms later P6 abandoned the learned ceiling on the widened measurement (goodput 4.29 M from the drain vs 7.45 M). :45.85 target 1.5 M (the floor, once the clamp lifted with `link_ceiling_bps=20 M`), then +187.5 k per 5 s: 3.0 M at 14:53:25, the learner re-stepping from the nominal (3.19 → 3.39 → 3.60 M …), 3.82 M by 14:56, 4.06 M by 15:11 — **the 7.45 M ceiling lost for the session, −89 % for one report that described the stall.** T2b written from it. |
+| 2026-10-29 (logs of 2026-10-15 → 10-29) | **agent-v0.4.137 → 0.4.184** (FR-79's gate + V5 throughout; FR-119 P2b-8's whole windows from 10-23) | the three corporate laptops' worker logs over Fleet RPC, 256 KiB a reply (`MAX_OUTPUT_BYTES`), projected to the heartbeat's rate fields: 67 constrained sessions, 20,782 heartbeats, 40,654 windows — CORPLAP-2 59 sessions / 39,031 windows (AV1 and HEVC NVENC over `relay:derp/tcp`), CORPLAP-3 7 / 1,606 (av1_qsv, 10-18 and 10-19), CORPLAP-1 1 / 17 (direct all fortnight) | **AC2 met**: 812 `transit-stalled` (2.0 %), 579 gaps (71 %), 240 `overproduced`, 74 `agent-stalled`; no stall verdict with the queue over budget (27.8 KB in flight at most on a stalled heartbeat); finding 4's shape 22 times with a clean sender and an age ≥ 1 s. **AC3 against the gate**: 433 of 482 clean-sender stall episodes held, 14 of 22 with an age ≥ 1 s among them; **49 cut**, all through V5's `stall_is_ours` on a pushed-down prior (§Open decisions). **AC6**: 74 agent-stalled windows; 30 drops in heartbeats holding both an agent-stalled window and a blocked send ≥ 1 s — ×0.85 / ×0.72 beside an `overproduced` window (the occupancy ladder), 2 of ×0.50 not attributable per window; the free-loop control intact (46 drops, four ×0.50). Every target drop ≥ 10 % attributed (237): 82 sender-side, 46 hard MD on a free loop, 30 blocked inside agent-stalled, 55 clean gap/split stalls (V5), 13 viewer reports in a stall's onset window (P3 clamp), 11 unexplained by the heartbeat. ⚠️ A heartbeat spans two windows and the daemon writes no per-window verdict for the movers, so attribution is by the heartbeat's own counters and the drop's ratio |
+| 2026-10-20 13:53–14:19 UTC (read 10-29) | **0.4.146** | CORPLAP-2 `6ad77273…`, HEVC over `relay:derp/tcp`, 25 min, 1,446 windows, 76 stalls (52 gaps) | **AC3's FAIL under the gate, the loop in one arc**: `prior_bps` 17.8–23.7 kbps, `goodput_bps=None` throughout, 0 B in flight, send waits ≤ 0.5 ms; every gap window `stall_is_ours` ⇒ ×0.85 — 14:16:52–57 three stalled windows, target 1.17 → 1.00 → 0.85 → 0.61 M while the prior stepped 23,688 → 21,535 → 19,578; the session 3.63 → 0.94 M with a paint age to 3.1 s |
+| 2026-10-19 09:17:07 UTC (read 10-29) | **0.4.144** | CORPLAP-2 `6ad5d369…`, AV1 over `relay:derp/tcp`, the 202-minute session (11,533 windows, 293 stalls) | **the onset edge**: `viewer-rate fps cap … age_ms=232 age_floor_ms=46 link_congested=true link_ceiling_bps=Some(620298)` in a `clear` window, then `set_bitrate target_bps=620298` from 3.0 M (−79 %) 0.7 s later, the next window `transit-stalled` at 555 ms, 0 B in flight throughout; the same session held 2,028 / 2,329 / 1,734 ms stalls at 3.0–3.25 M when no report landed in the onset window |

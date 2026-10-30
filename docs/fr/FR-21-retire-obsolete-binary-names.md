@@ -48,7 +48,7 @@ the field is still on the old segment, silently, at the next update:
 | `OLD_APP = "roomler-agent"` | `crates/agent-core/src/appdirs.rs:40` | a pre-rename host's enrolled `config.toml` is orphaned — the device drops off the mesh and re-enrolls as a stranger |
 | `LEGACY_SERVICE_NAME = "RoomlerAgentService"` | `agents/roomlerd/src/win_service/mod.rs:80` | the takeover install cannot find the running service to retire; two services, or none |
 | `LEGACY_TASK_NAME = "RoomlerAgent"` | `agents/roomlerd/src/service.rs:394` | the pre-rename scheduled task survives forever → two daemons |
-| legacy log prefix `roomler-agent.log` | `crates/agent-core/src/logging.rs:245,312,440`; `agents/roomlerd/src/logs_fetch.rs:56` | `rc:logs-fetch` returns "no log file" on an upgraded host that has not rolled yet |
+| legacy log prefix `roomler-agent.log` | `crates/agent-core/src/logging.rs:315,312,440`; `agents/roomlerd/src/logs_fetch.rs:56` | `rc:logs-fetch` returns "no log file" on an upgraded host that has not rolled yet |
 | `LEGACY_INSTALL_FOLDER_NAME = "roomler-agent"` | `agents/roomlerd/src/updater.rs:369` | the vacated install dir is never swept |
 | `%h/.config/roomler-agent` in `ReadWritePaths` | `agents/roomlerd/packaging/linux/roomler.service:44` | systemd denies the daemon its own legacy tree mid-migration |
 | **the macOS `.app` bundle** — see §5, D5 | `packaging/macos/com.roomler.{agent,daemon}.plist`; `.github/workflows/ci.yml:412` | **TCC grants are voided** — every Mac silently loses Screen Recording + Accessibility until a human re-grants them |
@@ -276,7 +276,7 @@ order and it is wrong, because in a rename the docs are only wrong *after* the c
 **What P1 actually found and fixed** — the most valuable single line in the FR so far:
 
 ```rust
--#[command(name = "roomlerd", version, about, long_about = None)]   // agents/roomlerd/src/main.rs:39
+-#[command(name = "roomlerd", version, about, long_about = None)]   // agents/roomlerd/src/app.rs:40
 +#[command(name = "roomlerd",      version, about, long_about = None)]
 -#[command(name = "roomler-cli", ...)]                                // agents/roomler-cli/src/cli.rs:60
 +#[command(name = "roomler",        ...)]
@@ -289,7 +289,7 @@ not by reading the diff: `Usage: roomlerd.exe` where it previously said `roomler
 ### 7b. Two hazards found while executing, both blocking their phase
 
 1. **P2a would silently rename the Debian package.** `[package.metadata.deb]` in
-   `agents/roomlerd/Cargo.toml:596` sets no `name`, so cargo-deb derives `Package:` from the
+   `agents/roomlerd/Cargo.toml:964` sets no `name`, so cargo-deb derives `Package:` from the
    crate name — and `docs/installation.md:240` documents `apt remove roomler-agent`, confirming
    it. Renaming the crate therefore makes dpkg see a *different* package: the old one stays
    installed beside the new one, or the upgrade simply does not happen. **P2a must either pin

@@ -697,4 +697,61 @@ mod tests {
             "the nominal step above the floor is unchanged"
         );
     }
+
+    // (14) FR-59 P8 — the ladder has no kill switch (it is a table), and this
+    // is why it needs none: every rung P8 added sits BELOW the nominal floor,
+    // so with `slow_link_floor=0` — the AIMD pinned at `MIN_BITRATE_BPS`, see
+    // the governor's `a_measured_slow_pipe_lets_the_floor_and_the_target_descend`
+    // — no target can reach one, and at or above the floor the coarsening is
+    // the pre-P8 table's, value for value. Pinned against that table and the
+    // same nearest-rung walk verbatim (`170d18473^`), so a rung added or moved
+    // ABOVE the floor fails here instead of in the field as a changed
+    // rebuild/IDR cadence (AC6).
+    #[test]
+    fn the_ladder_extension_is_inert_at_or_above_the_nominal_floor() {
+        const PRE_P8_LADDER_BPS: &[u32] = &[
+            1_500_000, 2_000_000, 3_000_000, 4_500_000, 6_000_000, 8_000_000, 12_000_000,
+            16_000_000, 20_000_000, 25_000_000,
+        ];
+        fn pre_p8_coarsen(bps: u32) -> u32 {
+            let first = PRE_P8_LADDER_BPS[0];
+            let last = PRE_P8_LADDER_BPS[PRE_P8_LADDER_BPS.len() - 1];
+            if bps <= first {
+                return first;
+            }
+            if bps >= last {
+                return last;
+            }
+            let mut best = first;
+            let mut best_dist = bps.abs_diff(best);
+            for &rung in &PRE_P8_LADDER_BPS[1..] {
+                let d = bps.abs_diff(rung);
+                if d < best_dist {
+                    best = rung;
+                    best_dist = d;
+                }
+            }
+            best
+        }
+        let floor = super::super::MIN_BITRATE_BPS;
+        assert_eq!(
+            PRE_P8_LADDER_BPS[0], floor,
+            "the old bottom rung WAS the floor"
+        );
+        let added = BITRATE_LADDER_BPS.len() - PRE_P8_LADDER_BPS.len();
+        assert_eq!(
+            &BITRATE_LADDER_BPS[added..],
+            PRE_P8_LADDER_BPS,
+            "every rung at or above the nominal floor is the pre-P8 one"
+        );
+        for &rung in &BITRATE_LADDER_BPS[..added] {
+            assert!(
+                rung < floor,
+                "an added rung ({rung}) must sit below the floor"
+            );
+        }
+        for bps in (floor..=26_000_000).step_by(1_000) {
+            assert_eq!(coarsen_bitrate(bps), pre_p8_coarsen(bps), "at {bps} bps");
+        }
+    }
 }

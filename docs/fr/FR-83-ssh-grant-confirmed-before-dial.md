@@ -62,7 +62,7 @@ ordering, and that a losable race is presented to the user as a terminal key ref
 never for others, which is the hardest shape to diagnose from a report. The grant that
 arrived 4.4 s late still had ~50 s of its 60 s life left — the window was there to use.
 
-## The mechanism, in the code (master `5008895cd`)
+## The mechanism, in the code (master `477ee57b7`)
 
 | step | where | what it does |
 |---|---|---|
@@ -131,7 +131,7 @@ REFUSAL (`other`), and only an absent or `null` field means recorded.
 ### 2. The capability — `ssh-grant-ack`, read from the LIVE connection
 
 `RpcCap::SshGrantAck` = `ssh-grant-ack`, advertised only by `ssh-server` builds, next to
-`ssh` and `ssh-consent` (`agents/roomlerd/src/encode/caps.rs:1745`).
+`ssh` and `ssh-consent` (`agents/roomlerd/src/encode/caps.rs:2285`).
 
 ⚠️ **Equality-matched**, like every verb: `ssh` is a prefix of `ssh-grant-ack` exactly as it
 is of `ssh-consent`, and `starts_with` would mark every `ssh` agent ack-capable — the
@@ -166,20 +166,20 @@ The waiter table lives in `NetworkState` — `network` owns SSH; the Hub only ow
 socket. A guard deregisters on every exit path, as `ExecWaiterGuard` does for exec.
 
 **The 10 s bound**: 2× the worst lag observed (4.4 s); inside the originating device's own
-30 s wait for `rc:ssh.response` (`agents/roomlerd/src/localapi_state.rs:1883`), so the
+30 s wait for `rc:ssh.response` (`agents/roomlerd/src/localapi_state.rs:1902`), so the
 caller hears the server's reason rather than its own timeout; and it leaves ≥ 50 s of the
 60 s grant TTL (`ssh_limits::GRANT_TTL_SECS`) to dial in.
 
 ### 4. The agent — acknowledge after recording, and every refusal
 
-The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4076`) acknowledges **after**
+The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4086`) acknowledges **after**
 `record_grant` returns: the grant is in `GRANTS` — the table the auth path reads — before
 the frame leaves, so "confirmed" means "redeemable". `record_grant`'s `Result<(), String>`
 becomes a typed rejection so the arm can say *which* refusal it was; the log text is
 unchanged.
 
 The ack is sent unconditionally by an ack-capable build. An older server cannot parse the
-frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:742`) — harmless, and
+frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:747`) — harmless, and
 one small frame per grant.
 
 ### Compatibility, both directions
@@ -203,9 +203,9 @@ one small frame per grant.
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P0 | spec + ledger row + issue | — | **merged** #1602 `b48f13f90` |
-| P1 | wire, capability, server wait, agent ack, tests, docs | promote the previous server image (`promote.yml`) — an old server never waits, and the ack is dropped at `debug!` | **merged** #1607 `64488d3d5` |
-| P2 | agent release + server image promoted; field verification (AC7, AC8) | as P1 — `hosted-20260910-4114dc7` was live before | **shipped** `agent-v0.4.101` (#1609 `e8f48bcc0`) + `hosted-20260924-531fde8`; field-verified — see the log |
+| P0 | spec + ledger row + issue | — | **merged** #1602 `bdd9f1f60` |
+| P1 | wire, capability, server wait, agent ack, tests, docs | promote the previous server image (`promote.yml`) — an old server never waits, and the ack is dropped at `debug!` | **merged** #1607 `d8902ccdb` |
+| P2 | agent release + server image promoted; field verification (AC7, AC8) | as P1 — `hosted-20260910-4114dc7` was live before | **shipped** `agent-v0.4.101` (#1609 `ccba972f4`) + `hosted-20260924-531fde8`; field-verified — see the log |
 
 ## Acceptance criteria
 

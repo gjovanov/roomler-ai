@@ -346,8 +346,8 @@ run the command as root:
 |---|---|---|
 | The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:965`](../crates/modules/fleet/src/agent_exec.rs#L965) |
 | Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:361`](../crates/modules/fleet/src/agent_exec.rs#L361) |
-| The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3563`](../crates/modules/fleet/src/hub.rs#L3563) |
-| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5080`](../agents/roomlerd/src/signaling.rs#L5080) |
+| The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3695`](../crates/modules/fleet/src/hub.rs#L3695) |
+| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5090`](../agents/roomlerd/src/signaling.rs#L5090) |
 
 The word is kept per connection, never read from the stored row, for the reason
 `ssh-grant-ack` is: after a rollback the row still promises what the running
@@ -388,6 +388,17 @@ unbounded run (`models::exec_limits`):
   above, because its answer is one persisted `exec_audit` row, and the two
   paths share the identity model, the permit, the redactor and the tree kill —
   only the shape of the output differs.
+- ⚠️ **A command can outlive its answer, and the daemon's stop must not wait
+  for it** (#2718). On Windows, tokio reads a command's stdout and stderr
+  through its blocking pool, and a read stays in flight until every holder of
+  the pipe is gone. That includes a process the command started and left
+  running, such as `roomlerd self-update`'s installer and watcher, or
+  `start /b`. Dropping the runtime waited on such a read with no end. Under a
+  service stop that meant the host's 8 s budget and then a terminate, on every
+  exec-driven update. Under the daemon's own restart it meant 71.6 s offline,
+  measured, until the watchdog forced `exit(2)`. The daemon now shuts its runtime down
+  within `runtime_exit::SHUTDOWN_BUDGET` (3 s) and logs `runtime shut down at
+  its budget` when it leaves such a read behind.
 
 Output is swept for the agent token(s), `Bearer …` headers and JWT-shaped
 strings **before it leaves the host** — results are persisted in `exec_audit`
@@ -422,7 +433,7 @@ Exit status mirrors the remote command's, so `roomler exec` composes in a
 script: a refusal or failure is non-zero here too, never a silent 0.
 
 The target is a device name or a hex agent id, resolved by the server within
-the caller's org (`crates/modules/fleet/src/socket.rs:1115` `resolve_exec_target`:
+the caller's org (`crates/modules/fleet/src/socket.rs:1125` `resolve_exec_target`:
 hex id → exact name → case-insensitive name). A dashboard **display name** is
 turned into the hex id by the CLI before the request leaves — only when no
 device name matches it, and refused when two devices share it

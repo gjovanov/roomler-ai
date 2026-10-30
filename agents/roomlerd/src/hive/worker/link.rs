@@ -12,46 +12,47 @@
 //! | the end | every call still waiting fails at once, as the channel goes, and every later one at its start |
 //! | lost | a call that cannot be sent, or that goes unanswered within its bound, takes the link for lost, with why ([`Link::lost`]): the daemon's side then ends that worker's life, as a channel that failed ends it, rather than hand it what it can no longer serve |
 
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 use std::collections::HashMap;
-#[cfg(feature = "vault")]
+#[cfg(all(worker_calls, unix))]
 use std::os::fd::{AsRawFd, OwnedFd};
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 use std::sync::Mutex;
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 use std::time::Duration;
 
-#[cfg(feature = "vault")]
+use tokio::io::AsyncWrite;
+#[cfg(all(worker_calls, unix))]
 use tokio::net::UnixStream;
-use tokio::net::unix::OwnedWriteHalf;
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 use super::{Answer, Call};
 use super::{Msg, send};
 
 /// How long a call waits for its answer.
-#[cfg(feature = "vault")]
+#[cfg(worker_calls)]
 pub(crate) const CALL_WAIT: Duration = Duration::from_secs(10);
 
-/// What one side writes with: its half of the channel and, the daemon's,
-/// the second channel, the one descriptors go on.
+/// What one side writes with: its half of the channel and, the daemon's, the
+/// second channel, the one descriptors go on. Windows has no second channel
+/// (P8-2b-3): a listener rides inside the call's own frame there.
 struct Writer {
-    frames: OwnedWriteHalf,
-    #[cfg(feature = "vault")]
+    frames: Box<dyn AsyncWrite + Send + Unpin>,
+    #[cfg(all(worker_calls, unix))]
     descriptors: Option<UnixStream>,
 }
 
 /// One side's end of a worker's channel.
 pub(crate) struct Link {
     writer: tokio::sync::Mutex<Writer>,
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     waiting: Mutex<Option<HashMap<u64, oneshot::Sender<Answer>>>>,
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     next: AtomicU64,
     /// Cancelled as a call takes the link for lost, `why` set first.
     lost: CancellationToken,
@@ -61,18 +62,21 @@ pub(crate) struct Link {
 impl Link {
     /// The daemon's side: its writing half and (with the vault) the second
     /// channel.
-    pub(crate) fn daemon(frames: OwnedWriteHalf, descriptors: tokio::net::UnixStream) -> Self {
-        #[cfg(not(feature = "vault"))]
+    pub(crate) fn daemon(
+        frames: impl AsyncWrite + Send + Unpin + 'static,
+        #[cfg(unix)] descriptors: tokio::net::UnixStream,
+    ) -> Self {
+        #[cfg(all(unix, not(all(worker_calls, unix))))]
         drop(descriptors);
         Self {
             writer: tokio::sync::Mutex::new(Writer {
-                frames,
-                #[cfg(feature = "vault")]
+                frames: Box::new(frames),
+                #[cfg(all(worker_calls, unix))]
                 descriptors: Some(descriptors),
             }),
-            #[cfg(feature = "vault")]
+            #[cfg(worker_calls)]
             waiting: Mutex::new(Some(HashMap::new())),
-            #[cfg(feature = "vault")]
+            #[cfg(worker_calls)]
             next: AtomicU64::new(1),
             lost: CancellationToken::new(),
             why: std::sync::Mutex::new(None),
@@ -80,16 +84,16 @@ impl Link {
     }
 
     /// A worker's side: it writes frames alone.
-    pub(crate) fn worker(frames: OwnedWriteHalf) -> Self {
+    pub(crate) fn worker(frames: impl AsyncWrite + Send + Unpin + 'static) -> Self {
         Self {
             writer: tokio::sync::Mutex::new(Writer {
-                frames,
-                #[cfg(feature = "vault")]
+                frames: Box::new(frames),
+                #[cfg(all(worker_calls, unix))]
                 descriptors: None,
             }),
-            #[cfg(feature = "vault")]
+            #[cfg(worker_calls)]
             waiting: Mutex::new(Some(HashMap::new())),
-            #[cfg(feature = "vault")]
+            #[cfg(worker_calls)]
             next: AtomicU64::new(1),
             lost: CancellationToken::new(),
             why: std::sync::Mutex::new(None),
@@ -108,7 +112,7 @@ impl Link {
     }
 
     /// Take the link for lost: the first reason stays.
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     fn lose(&self, why: &str) {
         self.why
             .lock()
@@ -122,40 +126,27 @@ impl Link {
         send(&mut self.writer.lock().await.frames, m).await
     }
 
-    /// `call`, and its answer: an error once the channel is gone, and past
-    /// [`CALL_WAIT`]. `descriptor` goes on the second channel just before the
-    /// call's frame (the daemon's side alone has one). A call that cannot be
-    /// sent, or goes unanswered within the bound, takes the link for lost.
-    #[cfg(feature = "vault")]
-    pub(crate) async fn call(
-        &self,
-        call: Call,
-        descriptor: Option<OwnedFd>,
-    ) -> Result<Answer, String> {
+    /// A call's id, registered among those awaiting an answer: `None` where
+    /// the channel is already gone.
+    #[cfg(worker_calls)]
+    fn register(&self) -> Option<(u64, oneshot::Receiver<Answer>)> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        {
-            let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(waiting) = waiting.as_mut() else {
-                return Err("the worker's channel is gone".into());
-            };
-            waiting.insert(id, tx);
-        }
-        // A descriptor sent and its frame not would leave the next call's
-        // frame naming it: the channel is gone then, and so is this link.
-        let sent = {
-            let mut w = self.writer.lock().await;
-            let descriptor_sent = match (&descriptor, &w.descriptors) {
-                (Some(fd), Some(ch)) => super::fds::send(ch, fd.as_raw_fd()).await,
-                (Some(_), None) => Err(std::io::Error::other("no channel for descriptors here")),
-                (None, _) => Ok(()),
-            };
-            match descriptor_sent {
-                Ok(()) => send(&mut w.frames, &Msg::Call { id, call }).await,
-                Err(e) => Err(e),
-            }
-        };
-        drop(descriptor);
+        let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        waiting.as_mut()?.insert(id, tx);
+        Some((id, rx))
+    }
+
+    /// Once a call's frame is sent (or failed): its answer, within
+    /// [`CALL_WAIT`]. A failed send, or one unanswered in time, takes the
+    /// link for lost.
+    #[cfg(worker_calls)]
+    async fn finish_call(
+        &self,
+        id: u64,
+        rx: oneshot::Receiver<Answer>,
+        sent: std::io::Result<()>,
+    ) -> Result<Answer, String> {
         if let Err(e) = sent {
             self.forget(id);
             let why = format!("the worker's channel refused a call: {e}");
@@ -174,9 +165,61 @@ impl Link {
         }
     }
 
+    /// `call`, and its answer: an error once the channel is gone, and past
+    /// [`CALL_WAIT`]. `descriptors` go on the second channel just before the
+    /// call's frame, in order (the daemon's side alone has one). A call that
+    /// cannot be sent, or goes unanswered within the bound, takes the link
+    /// for lost.
+    #[cfg(all(worker_calls, unix))]
+    pub(crate) async fn call(
+        &self,
+        call: Call,
+        descriptors: Vec<OwnedFd>,
+    ) -> Result<Answer, String> {
+        let Some((id, rx)) = self.register() else {
+            return Err("the worker's channel is gone".into());
+        };
+        // A descriptor sent and its frame not would leave the next call's
+        // frame naming it: the channel is gone then, and so is this link.
+        let sent = {
+            let mut w = self.writer.lock().await;
+            let mut descriptors_sent = Ok(());
+            for fd in &descriptors {
+                descriptors_sent = match &w.descriptors {
+                    Some(ch) => super::fds::send(ch, fd.as_raw_fd()).await,
+                    None => Err(std::io::Error::other("no channel for descriptors here")),
+                };
+                if descriptors_sent.is_err() {
+                    break;
+                }
+            }
+            match descriptors_sent {
+                Ok(()) => send(&mut w.frames, &Msg::Call { id, call }).await,
+                Err(e) => Err(e),
+            }
+        };
+        drop(descriptors);
+        self.finish_call(id, rx, sent).await
+    }
+
+    /// FR-90 P8-2b-3 — [`call`](Self::call) on Windows: no second channel, so
+    /// what a Unix call hands across as a descriptor rides inside `call`
+    /// itself (a listener's `WSAPROTOCOL_INFOW`, in its `Spec`).
+    #[cfg(all(worker_calls, windows))]
+    pub(crate) async fn call(&self, call: Call) -> Result<Answer, String> {
+        let Some((id, rx)) = self.register() else {
+            return Err("the worker's channel is gone".into());
+        };
+        let sent = {
+            let mut w = self.writer.lock().await;
+            send(&mut w.frames, &Msg::Call { id, call }).await
+        };
+        self.finish_call(id, rx, sent).await
+    }
+
     /// The answer to call `id`, as it arrives: `false` when nothing waits
     /// for it (it timed out, or was never made).
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     pub(crate) fn answered(&self, id: u64, answer: Answer) -> bool {
         let tx = self
             .waiting
@@ -188,7 +231,7 @@ impl Link {
     }
 
     /// Answer the other side's call `id`.
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     pub(crate) async fn answer(&self, id: u64, answer: Answer) -> std::io::Result<()> {
         self.send(&Msg::Answer { id, answer }).await
     }
@@ -197,14 +240,14 @@ impl Link {
     /// later one at its start.
     pub(crate) fn end(&self) {
         // Dropping each waiter's sender is what fails it.
-        #[cfg(feature = "vault")]
+        #[cfg(worker_calls)]
         self.waiting
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
     }
 
-    #[cfg(feature = "vault")]
+    #[cfg(worker_calls)]
     fn forget(&self, id: u64) {
         if let Some(w) = self
             .waiting
@@ -217,5 +260,8 @@ impl Link {
     }
 }
 
-#[cfg(all(test, feature = "vault"))]
+/// Unix: a real end-to-end harness over `UnixStream`, descriptors included.
+/// Windows has no in-process stand-in yet (P8-2b-3, as `worker.rs`'s
+/// `run_in_process` does not either); it leans on the real-binary tests.
+#[cfg(all(test, worker_calls, unix))]
 mod tests;

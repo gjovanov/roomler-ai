@@ -38,7 +38,7 @@ opaque desynchronized canvas, `pointerrawupdate` sampling, the Keyboard Lock API
 ## 1. The teardown: StarDesk's claims against the code
 
 Sources: stardesk.net (home, /help, /blog, /games) and its Grokipedia entry, read 2026-10-13. Roomler anchors
-are master `4fc8ea7bb`.
+are master `c689d26a0`.
 
 | # | StarDesk claims | Roomler today | Verdict |
 |---|---|---|---|
@@ -95,7 +95,7 @@ flowchart TB
 | 1 | [FR-99](../fr/FR-99-privacy-mode.md) privacy mode, lock on end, host mute | — |
 | 1 | [FR-100](../fr/FR-100-controller-identity.md) controller identity | FR-52's binding seam |
 | 1 | [FR-101](../fr/FR-101-rc-session-hygiene.md) session hygiene | — |
-| 2 | [FR-118](../fr/FR-118-gpu-resident-frames.md) GPU frame path (zero-copy) | L4, FR-70's media thread |
+| 2 | [FR-118](../fr/FR-118-gpu-resident-frames.md) GPU frame path (zero-copy); closed 2026-10-30, and its default, one cell at a time, is [FR-132](../fr/FR-132-zero-copy-by-default.md) | L4, FR-70's media thread |
 | 2 | [FR-119](../fr/FR-119-high-refresh-streaming.md) high refresh: D1 (≤ 1440p at 120, direct paths), then D2 (4K at 144) | L4; on QSV and NVENC, D1 needs FR-118 too (measured 2026-10-21, below); above 60 on relays waits for FR-17 stage C, FR-74 P5 or FR-63 B1, FR-70 M3 |
 | 2 | Display follows the viewer: a guard for the person at the screen, Linux, several displays | — |
 | 2 | Virtual display (IddCx) | the operator's signing decision |

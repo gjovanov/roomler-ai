@@ -94,7 +94,7 @@ head-of-line-blocking layer *below* the SCTP one FR-17 is about, on top of the 5
    (`crates/tunnel-core/src/overlay/netcheck.rs:205`). Marked as such because this spec's
    own §8 rule is that absence of measurement is never evidence of absence of capability.
 3. **A high UDP port is a real risk** on the corp-managed hosts, and the codebase already
-   says so: `crates/remote_control/src/signaling.rs:5753` — *"a corp egress that whitelists
+   says so: `crates/remote_control/src/signaling.rs:5818` — *"a corp egress that whitelists
    STUN:3478 still drops the ~10-13k relay band."*
 
 **NOT established — the port choice is a hypothesis, not a finding.** ⚠️ An earlier draft
@@ -170,7 +170,7 @@ first draft's claim that demux is *"unambiguous without a magic number"*; it is 
 | `0x01`–`0x04` (Opt Len 1–4) | **WireGuard types 1–4, every one of them** |
 
 What actually keeps WireGuard disjoint on the existing plane is a **four**-byte test —
-`is_wg_shaped` (`crates/tunnel-core/src/overlay/wg.rs:2460`) requires `pkt[1..4] == 0`, and
+`is_wg_shaped` (`crates/tunnel-core/src/overlay/wg.rs:2514`) requires `pkt[1..4] == 0`, and
 Geneve's bytes 2–3 carry a nonzero Protocol Type. One byte is not enough, and
 `payload_is_wg_or_disco` (`crates/remote_control/src/derp_frame.rs:39`) classifies on the
 first byte alone.
@@ -198,7 +198,7 @@ two bound `addr:port`s selected by VNI.
 
 **This is the one change that can break the fleet silently. It ships first, alone, as P0.**
 
-`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:3282`) documents itself as safe
+`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:3299`) documents itself as safe
 to extend — *"an unknown/absent value ⇒ the client falls back to its local computation, so
 adding a variant later is forward-compatible"* (`:2005-2007`). **The comment is wrong about
 the "unknown" half and the code does not implement it.** The enum is a plain
@@ -214,7 +214,7 @@ installing peers — a fleet-wide outage delivered by the server, visible only a
 Four requirements, all in P0:
 
 1. A **`supports_org_relay` hello bit** (`#[serde(default)] bool`, the shape of
-   `supports_server_relay_strategy`, `signaling.rs:2457`), gated at the existing both-ends
+   `supports_server_relay_strategy`, `signaling.rs:2474`), gated at the existing both-ends
    gate in `server_relay_verdict` (`crates/api/src/ws/overlay.rs:1877`). The gate is
    **permanent**, not "until everyone upgrades".
 2. `#[serde(other)] Unknown` (or a `deserialize_with` mapping unknown → `None`), making the
@@ -292,7 +292,7 @@ this, a customer's HQ box is a DDoS reflector at roughly 3×.
 
 Plus a **per-source bind-attempt limiter** modelled on `unknown_init_fresh`
 (`crates/tunnel-core/src/overlay/carrier_plane.rs:705`; `UNKNOWN_INIT_MIN_INTERVAL = 2 s`,
-`UNKNOWN_INIT_MAX_SOURCES = 64`, `wg.rs:716`), with a counter and a reader.
+`UNKNOWN_INIT_MAX_SOURCES = 64`, `wg.rs:725`), with a counter and a reader.
 
 ### Construction details that are security-relevant
 
@@ -318,7 +318,7 @@ Plus a **per-source bind-attempt limiter** modelled on `unknown_init_fresh`
   serialise identically (IPv4 vs IPv6 forms; digits sliding into the adjacent field).
 - **Constant-time comparison, using `subtle`.** ⚠️ Every MAC compare in this tree today is a
   plain slice compare — `disco.rs:222` (whose comment says *"Constant-time-ish"* and is not),
-  `wg.rs:2499`, `derp.rs:351`. For WireGuard's `mac1` that is defensible; its own doc calls it
+  `wg.rs:2553`, `derp.rs:351`. For WireGuard's `mac1` that is defensible; its own doc calls it
   *"a ROUTER's pre-filter … not an authenticator"*. Here the MAC **is** the authenticator, so
   "model it on the existing one" would propagate the defect.
 - **Membership.** A node may bind only into a session naming its own key in `members`.
@@ -358,7 +358,7 @@ decide."*
 1. A node opts in locally (`relay_server_enabled`, `relay_server_port`) and advertises the
    capability verb `relay-server` through `models::RpcCap` — variant → `wire()` arm → `ALL`
    entry. ⚠️ Equality matching only: `relay` is a prefix of `relay-server`, the
-   `ssh`/`ssh-consent` trap. (`RpcCap::ALL` is `[RpcCap; 6]` at `models.rs:326`, a
+   `ssh`/`ssh-consent` trap. (`RpcCap::ALL` is `[RpcCap; 6]` at `models.rs:333`, a
    fixed-size array — the **compiler** forces the entry, not a test.)
 2. An admin approves the device — the offer is not the grant (§2, gate 3).
 3. The **server** mints the session and pushes it to both nodes plus the relay.
@@ -371,7 +371,7 @@ Verdict machinery to extend, verified against master:
 | Server verdict entry point | `crates/api/src/ws/overlay.rs:1851` `server_relay_verdict` |
 | …delegating to the pure decision | `overlay.rs:2020` `relay_verdict_core` |
 | Measured caps supersede presence | `overlay.rs:1969-1978` (in `verdict_from_nodes`, `:1948`) |
-| Wire verdict enum | `crates/remote_control/src/signaling.rs:3284` `RelayStrategyWire` |
+| Wire verdict enum | `crates/remote_control/src/signaling.rs:3301` `RelayStrategyWire` |
 | Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1125` `relay_strategy` |
 
 ### 2. Gates — and an honest account of which are actually armed
@@ -409,7 +409,7 @@ is 24 bits, so two `u32`s differing above bit 23 would alias to one session.
 
 ⚠️ **Gate 2's default is not "deny" — it is "off, and permits everything."** The first draft
 claimed four default-deny gates; there are three. `OverlayAclMode` derives `#[default] Off`
-(`crates/remote_control/src/models.rs:1893`), documented as *"every node sees every peer…
+(`crates/remote_control/src/models.rs:1978`), documented as *"every node sees every peer…
 The default, so enabling the feature never breaks a live mesh"*; `Warn` *"ship[s] the
 permissive netmap"*; and `CLAUDE.md`'s own open-issues list records that **nothing has ever
 run under `enforce` in the field**. Tailscale's `cap/relay` is an *affirmative grant*; a
@@ -525,7 +525,7 @@ Three results, in order of consequence:
 3. **41641 is not a viable alternative**, so the high-port fallback is dead for this
    population.
 
-⚠️ **This narrows the codebase's own claim.** `signaling.rs:5776` says a corp egress
+⚠️ **This narrows the codebase's own claim.** `signaling.rs:5841` says a corp egress
 *"whitelists STUN:3478 still drops the ~10-13k relay band"*. Measured, CORPLAP-3 drops **11000
 and 41641** — it whitelists *only* 3478, so the constraint is "one allowed port", not "all
 but the relay band".
@@ -623,8 +623,8 @@ So the design is:
   over Turn/Derp when a session exists.
 
 ⚠️ **What this avoids is the whole point.** The first draft's §9 named
-`send_ip_packet` (`wg.rs:929`) as *"the send path that must learn 'via peer X'"*. It is not:
-relay carriers already get a dedicated per-peer recv task (`wg.rs:1498`) and never touch the
+`send_ip_packet` (`wg.rs:938`) as *"the send path that must learn 'via peer X'"*. It is not:
+relay carriers already get a dedicated per-peer recv task (`wg.rs:1542`) and never touch the
 carrier plane's shape demux. `send_ip_packet`, `send_to_peer`, `SendPeer` and the `Router`
 need **zero changes**. The first draft also pointed the receive arm at
 `CarrierPlane::route_by_index` (`carrier_plane.rs:738`) — which takes a WireGuard receiver
@@ -636,10 +636,10 @@ A new tier would additionally have required navigating four hazards, three of th
 
 | hazard | anchor | why it fails silently |
 |---|---|---|
-| `is_direct()` = `!matches!(self, Relay)` | `lifecycle.rs:96` | a new variant reads as **direct** everywhere: `rx_stale_deadline` gives it the 60 s direct deadline (`:146`), `establish.rs:2779` makes **both ends initiate** the WG handshake, `:2745` books a direct-tier failure on demote-follow |
+| `is_direct()` = `!matches!(self, Relay)` | `lifecycle.rs:96` | a new variant reads as **direct** everywhere: `rx_stale_deadline` gives it the 60 s direct deadline (`:146`), `establish.rs:2804` makes **both ends initiate** the WG handshake, `:2770` books a direct-tier failure on demote-follow |
 | `is_sticky` `_ =>` catch-all | `path.rs:825` | silently inherits LAN/public's 2-strike escalation |
 | `suppression_half_life` `_ =>` catch-all | `path.rs:285` | same |
-| `PathAction` / `Incumbent` | `path.rs:440`, `:428` | neither can represent an org relay; `decide` (`:1021`) iterates `DIRECT_TIERS` and its executor dials directly (`establish.rs:1409`, `:1497`, `:1569`) — an org relay needs a server mint plus an async 3-way bind, so `Install(OrgRelay)` would be handed to a direct-dial executor |
+| `PathAction` / `Incumbent` | `path.rs:440`, `:428` | neither can represent an org relay; `decide` (`:1021`) iterates `DIRECT_TIERS` and its executor dials directly (`establish.rs:1431`, `:1519`, `:1591`) — an org relay needs a server mint plus an async 3-way bind, so `Install(OrgRelay)` would be handed to a direct-dial executor |
 
 ⚠️ **And one of the first draft's own "blockers" was a misreading, retracted here.** It
 claimed the eligibility floor `base(tier) - penalty >= B_RELAY - ELIGIBILITY_EPS`
@@ -666,7 +666,7 @@ evidence that justifies it.
   `relay_max_bitrate_per_session`; the relay's own carriers are exempt from its forwarding
   budget. An org must not be able to cost its HQ box its own remote access.
 - **Failure is a downgrade, never a black hole**, convicted by `sweep_carrier_health`
-  (`runtime/establish.rs:283`). ⚠️ FR-9's lesson: the dangerous bug was never "the carrier
+  (`runtime/establish.rs:305`). ⚠️ FR-9's lesson: the dangerous bug was never "the carrier
   failed", it was *"both ends held a hold-down and went mutually deaf"* (#746).
 - **Revocation is a push, not an expiry.** ⚠️ The first draft had no unmint at all, so
   flipping `peer_relay_mode` to `off` would have left live sessions forwarding indefinitely
@@ -719,19 +719,19 @@ Verified against `origin/master`, 2026-08-28.
 | Mint + ACL gate + rate limit | `overlay.rs:700` `handle_overlay_relay_request` (cross-tenant `:712-724`, ACL `:726-750`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
 | **The mint itself (P3c)** | `crates/api/src/ws/org_relay.rs` — `maybe_mint` (gate 1 + idempotency + audit), `plan_mint` (gates 2–5, candidate ranking by probe reports), `revoke_where` + the four trigger wrappers, `reconcile_acl` (on every policy refan), `handle_relay_probe`; `OrgRelayState` holds sessions / per-relay VNI cursors / the Lamport clock / join extras / probes, pod-local |
 | Netmap shaping | `overlay.rs:2058` `shape_peer` |
-| Wire model | `crates/remote_control/src/signaling.rs:3304` `NetmapPeer`; `:3282` `RelayStrategyWire` |
+| Wire model | `crates/remote_control/src/signaling.rs:3321` `NetmapPeer`; `:3299` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
-| Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:283` `sweep_carrier_health` |
-| Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2460`; fix `payload_is_wg_or_disco` `remote_control/src/derp_frame.rs:39` |
+| Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:305` `sweep_carrier_health` |
+| Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2514`; fix `payload_is_wg_or_disco` `remote_control/src/derp_frame.rs:39` |
 | Anti-amplification standard | `overlay/disco.rs:69-70` (`FRAME_LEN = 85`) |
-| Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:716-717` |
+| Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:725-726` |
 | SSRF validator to reuse | `crates/api/src/routes/push.rs:20` `validate_push_endpoint` |
 | Permission bits + `ALL` bump | `crates/db/src/models/role.rs:104`, `:146` |
 | CLI surfaces | `agents/roomler-cli/src/localclient.rs:1047` (`relay_qualified_label`), `:271` (`print_why`), `:160` (`netcheck`) |
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:36-38`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3129`),
+(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3139`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 

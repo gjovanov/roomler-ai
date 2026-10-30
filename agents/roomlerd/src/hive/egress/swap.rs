@@ -14,7 +14,7 @@
 //! | a request | for this host and port alone (its `Host`, and an absolute form's authority), else `421`; sent on in origin form, less what is one leg's (hop-by-hop). An upgrade is not carried (`501`) |
 //! | the swap | in `Authorization` alone: each placeholder of this audience the run holds, as written, and inside `Basic`'s credentials, decoded and encoded again. Never the URL, another header or the body, where a placeholder goes out as itself (decision 32); nor an AWS signature, which is signed again; nor, anywhere, an AWS secret key's placeholder, which signs and goes nowhere |
 //! | an AWS signature | one naming a placeholder of this audience: checked with the placeholder pair and signed again with the value ([`aws`], P3b-4-2), before the swap; refused, and never sent, where it is not |
-//! | the value | read from its lease as each request goes ([`super::Values`]): a lease let go swaps nothing |
+//! | the value | read from its lease as each request goes, once for a request with an `Authorization` and for no other ([`super::Bindings::valued`]): a lease let go swaps nothing |
 //! | the response | streamed back as it came, less what is one leg's |
 //! | its end | the client's, or the run's. An upstream that closes is dialed again for the next request |
 //!
@@ -56,8 +56,8 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
-use super::super::placeholder::{self, Bound, PREFIX, RANDOM_CHARS};
-use super::{DIAL_SECS, Front, HANDSHAKE_SECS, Refusal, RunKey, RunState, Seams, lock};
+use super::super::placeholder::{Bound, PREFIX, RANDOM_CHARS};
+use super::{DIAL_SECS, Front, HANDSHAKE_SECS, Refusal, RunKey, RunState, Seams, Valued, lock};
 use crate::vault_proxy::http::{Body, BoxError, answer, hop_by_hop};
 use crate::vault_proxy::tls;
 
@@ -204,10 +204,11 @@ pub(super) async fn carry(
         }
         return;
     }
-    let made = state
-        .ca
-        .leaf_for(&target.host)
-        .and_then(|leaf| acceptor(&leaf));
+    // FR-90 P8-2a-4a — the leaf from the run's CA, wherever its key is kept.
+    let made = match seams.leaves.leaf(run, &target.host).await {
+        Ok(leaf) => acceptor(&leaf),
+        Err(why) => Err(why),
+    };
     let acceptor = match made {
         Ok(acceptor) => acceptor,
         Err(why) => {
@@ -483,14 +484,23 @@ async fn forward(req: Request<Incoming>, conn: &Conn) -> Response<Body> {
         Ok(req) => req,
         Err((status, why)) => return answer(status, &why),
     };
+    // FR-90 P8-2a-4a — this audience's placeholders and their values, read
+    // once for the request, and only for one with an `Authorization`, the one
+    // header a value goes into or signs: no other request reads a value.
+    let valued = if req.headers().contains_key(header::AUTHORIZATION) {
+        let (host, port) = (&conn.target.host, conn.target.port);
+        conn.seams.bindings.valued(conn.run, host, port).await
+    } else {
+        Vec::new()
+    };
     // P3b-4-2 — AWS's signature, where it names a placeholder this audience
     // holds, checked and signed again with the value; any other request as
     // it came.
-    let req = match aws::resign(req, conn).await {
+    let req = match aws::resign(req, conn, &valued).await {
         Ok(req) => req,
         Err((status, why)) => return answer(status, &why),
     };
-    let req = match swap(req, conn) {
+    let req = match swap(req, conn, &valued) {
         Ok(req) => req,
         Err(why) => return answer(StatusCode::BAD_GATEWAY, &why),
     };
@@ -647,21 +657,22 @@ fn inbound(resp: Response<Incoming>) -> Response<Body> {
 /// Each of this audience's placeholders in the request's `Authorization`,
 /// swapped for its value, read now (decision 32). Err where a value is not
 /// one the header can carry: the request is then never sent.
-fn swap<B>(mut req: Request<B>, conn: &Conn) -> Result<Request<B>, String> {
+fn swap<B>(mut req: Request<B>, conn: &Conn, valued: &[Valued]) -> Result<Request<B>, String> {
     if !req.headers().contains_key(header::AUTHORIZATION) {
         return Ok(req);
     }
     // P3b-4-2 — an AWS secret key signs and is never sent: its placeholder
     // is swapped nowhere ([`aws::resign`] takes it, as a key alone).
-    let bound: Vec<Bound> =
-        placeholder::bound(conn.run.0, conn.run.1, &conn.target.host, conn.target.port)
-            .into_iter()
-            .filter(|b| !aws::signs_only(b))
-            .collect();
+    let bound: Vec<Bound> = valued
+        .iter()
+        .map(|(b, _)| b)
+        .filter(|b| !aws::signs_only(b))
+        .cloned()
+        .collect();
     if bound.is_empty() {
         return Ok(req);
     }
-    let value_of = |lease: &str| super::Values::value(&*conn.seams.values, lease);
+    let value_of = |lease: &str| value_in(valued, lease);
     let mut used = Vec::new();
     let mut swapped = Vec::new();
     for value in req.headers().get_all(header::AUTHORIZATION) {
@@ -682,6 +693,14 @@ fn swap<B>(mut req: Request<B>, conn: &Conn) -> Result<Request<B>, String> {
         );
     }
     Ok(req)
+}
+
+/// FR-90 P8-2a-4a — `lease`'s value as it was read for this request.
+fn value_in(valued: &[Valued], lease: &str) -> Option<Zeroizing<Vec<u8>>> {
+    valued
+        .iter()
+        .find(|(b, _)| b.lease_id == lease)
+        .and_then(|(_, v)| v.clone())
 }
 
 /// One `Authorization` value with each placeholder of `bound` in it swapped
@@ -800,4 +819,4 @@ fn header_of(bytes: &[u8]) -> Result<HeaderValue, String> {
 mod aws;
 
 #[cfg(test)]
-mod tests;
+pub(in crate::hive::egress) mod tests;

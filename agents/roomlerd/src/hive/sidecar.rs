@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! FR-90 P0e — the model sidecar: a loopback HTTP endpoint inside the daemon
-//! that every session's Claude Code talks to instead of the provider
-//! (`docs/roomler-hive-design.md` §11.2).
+//! FR-90 P0e — the model sidecar: a loopback HTTP endpoint that a session's
+//! Claude Code talks to instead of the provider (`docs/roomler-hive-design.md`
+//! §11.2). P8-2c-3 gives each session its own port, served in the daemon
+//! directly or (where the device's owner turned workers on) handed to the
+//! session's own worker — [`handed`], mirroring
+//! [`toolbelt::handed`](super::toolbelt::handed)'s own shape.
 //!
 //! # What it is for
 //!
 //! The provider key never reaches the session. The daemon runs the device's
 //! `hive_api_key_helper` itself (as SYSTEM/root) and keeps what it prints; the
-//! harness gets `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/s/<sid>` and a
-//! per-session TOKEN in `ANTHROPIC_API_KEY`. Each call is checked, then sent
-//! on with the real key:
+//! harness gets `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` — this session's
+//! own port is the whole address, since P8-2c-3 there is no longer a shared
+//! one to route within — and a per-session TOKEN in `ANTHROPIC_API_KEY`. Each
+//! call is checked, then sent on with the real key:
 //!
 //! 1. the token names THIS session, at the fence it was minted for, and the
 //!    session still runs here at that fence — a stopped session's token is
@@ -57,9 +61,13 @@ use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::supervisor::Supervisor;
+
+#[cfg(worker_calls)]
+pub(crate) mod handed;
 
 /// Where model calls go when nothing else is configured.
 pub const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
@@ -123,6 +131,43 @@ impl Refusal {
             kind,
             message: message.into(),
         }
+    }
+
+    /// FR-90 P8-2c-3 — this refusal, narrowed to a kind that crosses the
+    /// worker's channel: a fixed, closed set, so a worker rebuilds the
+    /// exact status and error vocabulary [`sidecar_admit`] and
+    /// [`Supervisor::wait_for_lease_word`] already chose, never a generic
+    /// one. An unrecognized `kind` (there should be none) falls back to
+    /// `api_error`'s 503, never a guess that could read as a client error.
+    fn into_wire(self) -> (AdmitRefusalKind, String) {
+        let kind = match self.kind {
+            "authentication_error" => AdmitRefusalKind::Authentication,
+            "overloaded_error" => AdmitRefusalKind::Overloaded,
+            _ => AdmitRefusalKind::Api,
+        };
+        (kind, self.message)
+    }
+}
+
+/// FR-90 P8-2c-3 — why an admit call was refused, narrow enough to cross
+/// the worker's channel and rebuild [`Refusal`]'s exact status and error
+/// kind on the other side (never a raw [`StatusCode`]/`&'static str` pair,
+/// neither of which round-trips through serde cleanly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum AdmitRefusalKind {
+    Authentication,
+    Overloaded,
+    Api,
+}
+
+impl AdmitRefusalKind {
+    fn into_refusal(self, message: String) -> Refusal {
+        let (status, kind) = match self {
+            Self::Authentication => (StatusCode::UNAUTHORIZED, "authentication_error"),
+            Self::Overloaded => (StatusCode::SERVICE_UNAVAILABLE, "overloaded_error"),
+            Self::Api => (StatusCode::SERVICE_UNAVAILABLE, "api_error"),
+        };
+        Refusal::new(status, kind, message)
     }
 }
 
@@ -211,6 +256,30 @@ impl Supervisor {
             }
         }
     }
+
+    /// FR-90 P8-2c-3 — [`wait_for_lease_word`](Self::wait_for_lease_word),
+    /// [`sidecar_admit`](Self::sidecar_admit) and
+    /// [`model_key`](Self::model_key), in that order, as one call: what a
+    /// worker's [`handed::admit`](super::sidecar::handed::admit) asks of
+    /// the daemon for one sidecar request, and what [`DaemonSource`] asks
+    /// of `self` directly where there is no worker. The refusal crosses
+    /// the channel as [`AdmitRefusalKind`]; a worker-hosted call rebuilds
+    /// the same status and error kind this returns a daemon-hosted one
+    /// directly.
+    pub(crate) async fn sidecar_admit_and_key(
+        &self,
+        session: ObjectId,
+        token: Option<&str>,
+    ) -> Result<String, (AdmitRefusalKind, String)> {
+        self.wait_for_lease_word(session, token)
+            .await
+            .map_err(Refusal::into_wire)?;
+        self.sidecar_admit(session, token)
+            .map_err(Refusal::into_wire)?;
+        self.model_key()
+            .await
+            .map_err(|e| (AdmitRefusalKind::Api, e))
+    }
 }
 
 /// Run the device's key helper and return the first line it prints. Never
@@ -276,8 +345,188 @@ pub(crate) async fn bind() -> Result<(TcpListener, u16), String> {
     Ok((listener, port))
 }
 
-/// Serve the sidecar until the supervisor is gone.
-pub(crate) fn serve(listener: TcpListener, sup: Weak<Supervisor>) {
+/// FR-90 P8-2c-3 — where [`handle`] asks admission of, and gets the
+/// provider's key from: the daemon's own [`Supervisor`] directly where no
+/// worker serves this session ([`DaemonSource`]), or a worker's channel to
+/// it otherwise ([`handed::WorkerSource`]). Every sidecar is one session's
+/// now (P8-2c-3 drops the old shared port's `/s/<sid>` multiplexing: the
+/// port itself is the session boundary), so neither impl takes a session
+/// id at call time — each already knows its own.
+pub(crate) trait Source: Clone + Send + Sync + 'static {
+    /// Whether `token` may call the model now, and if so, the device's
+    /// key for this one call — never retained past it. A plain `String`:
+    /// [`Source`] must compile with no `vault` feature at all (a
+    /// daemon-hosted sidecar needs none of it), so it cannot name
+    /// `vault_connect::handed::Secret`, `vault`-gated. The zeroizing
+    /// wrapper stays where it earns its keep — crossing the worker's
+    /// channel ([`handed::WorkerSource::admit`](super::sidecar::handed)) —
+    /// and is unwrapped before it reaches here, exactly as `model_key`
+    /// was already a plain, unzeroized `String` before this trait existed.
+    fn admit(
+        &self,
+        token: Option<&str>,
+    ) -> impl std::future::Future<Output = Result<String, Refusal>> + Send;
+    /// The provider refused the key: fetch it again next time.
+    fn forget_key(&self) -> impl std::future::Future<Output = ()> + Send;
+    fn upstream(&self) -> &str;
+    fn workspace(&self) -> Option<&str>;
+    /// Tracing only.
+    fn session(&self) -> ObjectId;
+}
+
+/// A sidecar's [`Source`] where no worker serves its session: the
+/// daemon's own [`Supervisor`], called directly. `upstream`/`workspace`
+/// are read once, at [`bind_for`]'s own call, since neither changes while
+/// the daemon runs.
+#[derive(Clone)]
+struct DaemonSource {
+    sup: Weak<Supervisor>,
+    session: ObjectId,
+    upstream: String,
+    workspace: Option<String>,
+}
+
+impl Source for DaemonSource {
+    async fn admit(&self, token: Option<&str>) -> Result<String, Refusal> {
+        let Some(sup) = self.sup.upgrade() else {
+            return Err(Refusal::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                "this device is shutting down",
+            ));
+        };
+        sup.sidecar_admit_and_key(self.session, token)
+            .await
+            .map_err(|(kind, message)| kind.into_refusal(message))
+    }
+
+    async fn forget_key(&self) {
+        if let Some(sup) = self.sup.upgrade() {
+            sup.forget_model_key().await;
+        }
+    }
+
+    fn upstream(&self) -> &str {
+        &self.upstream
+    }
+
+    fn workspace(&self) -> Option<&str> {
+        self.workspace.as_deref()
+    }
+
+    fn session(&self) -> ObjectId {
+        self.session
+    }
+}
+
+/// A session's own sidecar, bound and serving — in the daemon directly,
+/// or (P8-2c-3) handed to the session's worker. Mirrors
+/// [`Toolbelt`](super::toolbelt::Toolbelt)'s own shape exactly.
+pub(crate) struct Sidecar {
+    port: u16,
+    stop: CancellationToken,
+    /// This run and the endpoint it was handed as, where the sidecar is
+    /// handed to its worker instead of served here. `None` where it is
+    /// served here (no worker up for this run yet, or `hive_worker` off).
+    #[cfg(worker_calls)]
+    handed: Option<(ObjectId, u64, u64)>,
+}
+
+impl Sidecar {
+    /// The loopback port `sidecar_base_url` names.
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        // Handed to a worker: forgotten here (so a later `rehand` finds
+        // nothing), and told to stop — on a task of its own, since `Drop`
+        // cannot await it. Mirrors `Toolbelt`'s own `Drop`.
+        #[cfg(worker_calls)]
+        if let Some((session, fence, endpoint)) = self.handed {
+            handed::forget(session, fence);
+            tokio::spawn(async move {
+                if let Some(link) = crate::hive::worker::link_of(session, fence) {
+                    let call = super::vault_connect::handed::Call::SidecarClose { endpoint };
+                    #[cfg(unix)]
+                    let _ = link.call(call, Vec::new()).await;
+                    #[cfg(windows)]
+                    let _ = link.call(call).await;
+                }
+            });
+        }
+    }
+}
+
+/// Bind `session`'s own sidecar and start serving it — handed to its
+/// worker where one exists for `(session, fence)` ([`handed::prepare`]),
+/// served here directly otherwise, exactly as
+/// [`toolbelt::open`](super::toolbelt::open) does for the toolbelt's own
+/// listener. `upstream`/`workspace` are the device's config, read once
+/// here since neither changes while the daemon runs.
+pub(crate) async fn open(
+    sup: &Arc<Supervisor>,
+    session: ObjectId,
+    fence: u64,
+    upstream: String,
+    workspace: Option<String>,
+) -> Result<Sidecar, String> {
+    let (listener, port) = bind().await?;
+    let stop = CancellationToken::new();
+    // `fence` is read only by `handed::prepare` and the `handed` field
+    // below, both compiled out where `worker_calls` is off (the `vault`
+    // feature) — without this, that configuration sees the parameter as
+    // unused.
+    #[cfg(not(worker_calls))]
+    let _ = fence;
+    #[cfg(worker_calls)]
+    let prepared = handed::prepare(
+        session,
+        fence,
+        &listener,
+        Arc::downgrade(sup),
+        upstream.clone(),
+        workspace.clone(),
+    )?;
+    #[cfg(not(worker_calls))]
+    let prepared: Option<u64> = None;
+    if let Some(endpoint) = prepared {
+        // `endpoint` is read only by the `handed` field below, itself
+        // compiled out where `worker_calls` is off — without this, that
+        // configuration sees the binding as unused (mirrors
+        // `toolbelt::open`'s own identical guard).
+        #[cfg(not(worker_calls))]
+        let _ = endpoint;
+        return Ok(Sidecar {
+            port,
+            stop,
+            #[cfg(worker_calls)]
+            handed: Some((session, fence, endpoint)),
+        });
+    }
+    let source = DaemonSource {
+        sup: Arc::downgrade(sup),
+        session,
+        upstream,
+        workspace,
+    };
+    serve(listener, source, stop.clone());
+    Ok(Sidecar {
+        port,
+        stop,
+        #[cfg(worker_calls)]
+        handed: None,
+    })
+}
+
+/// Serve `source`'s sidecar on `listener` until `stop`. `source` is
+/// cloned once a connection, never shared mutable state across one: each
+/// request asks it afresh, so a device whose key rotated mid-connection
+/// still gets the new one on its next request.
+pub(crate) fn serve<S: Source>(listener: TcpListener, source: S, stop: CancellationToken) {
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .build()
@@ -290,21 +539,24 @@ pub(crate) fn serve(listener: TcpListener, sup: Weak<Supervisor>) {
     };
     tokio::spawn(async move {
         loop {
-            let stream = match listener.accept().await {
-                Ok((s, _)) => s,
-                Err(e) => {
-                    debug!(%e, "hive: the model sidecar's accept failed");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
+            let stream = tokio::select! {
+                () = stop.cancelled() => return,
+                accepted = listener.accept() => match accepted {
+                    Ok((s, _)) => s,
+                    Err(e) => {
+                        debug!(%e, "hive: the model sidecar's accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                },
             };
-            let Some(sup) = sup.upgrade() else { return };
+            let source = source.clone();
             let client = client.clone();
             tokio::spawn(async move {
                 let svc = hyper::service::service_fn(move |req| {
-                    let sup = Arc::clone(&sup);
+                    let source = source.clone();
                     let client = client.clone();
-                    async move { Ok::<_, Infallible>(handle(req, &sup, &client).await) }
+                    async move { Ok::<_, Infallible>(handle(req, &source, &client).await) }
                 });
                 if let Err(e) = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), svc)
@@ -315,16 +567,6 @@ pub(crate) fn serve(listener: TcpListener, sup: Weak<Supervisor>) {
             });
         }
     });
-}
-
-/// `/s/<session id><rest>` → the session and the path to forward.
-fn split_session(path: &str) -> Option<(&str, &str)> {
-    let rest = path.strip_prefix("/s/")?;
-    let (sid, tail) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    Some((sid, tail))
 }
 
 /// Whether a session may make this provider call: inference and token
@@ -446,57 +688,36 @@ fn refusal(r: Refusal) -> Response<Body> {
     resp
 }
 
-async fn handle(
+async fn handle<S: Source>(
     req: Request<Incoming>,
-    sup: &Arc<Supervisor>,
+    source: &S,
     client: &reqwest::Client,
 ) -> Response<Body> {
-    let Some((sid_hex, rest)) = split_session(req.uri().path()) else {
-        return refusal(Refusal::new(
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            "not a session path",
-        ));
-    };
-    let Ok(session) = ObjectId::parse_str(sid_hex) else {
-        return refusal(Refusal::new(
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            "not a session path",
-        ));
-    };
-    if !forwarded(req.method(), rest) {
-        debug!(session = %session, method = %req.method(), path = rest, "hive: a model call to a path the sidecar does not forward");
+    let session = source.session();
+    let path = req.uri().path();
+    if !forwarded(req.method(), path) {
+        debug!(%session, method = %req.method(), path, "hive: a model call to a path the sidecar does not forward");
         return refusal(Refusal::new(
             StatusCode::NOT_FOUND,
             "not_found_error",
             "the model sidecar forwards only POST /v1/messages and /v1/messages/count_tokens",
         ));
     }
-    let rest = rest.to_string();
+    let path = path.to_string();
     let query = req
         .uri()
         .query()
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
     let token = presented_token(req.headers());
-    // P2e-2 — a leased run waits for the server's word first.
-    if let Err(r) = sup.wait_for_lease_word(session, token.as_deref()).await {
-        debug!(session = %session, "hive: a leased run's model call had no word from the server");
-        return refusal(r);
-    }
-    if let Err(r) = sup.sidecar_admit(session, token.as_deref()) {
-        debug!(session = %session, status = r.status.as_u16(), "hive: a model call was refused");
-        return refusal(r);
-    }
-    let key = match sup.model_key().await {
+    // P2e-2's lease wait, `sidecar_admit`'s checks and the device's key,
+    // in one round trip — the daemon directly, or (P8-2c-3) its worker's
+    // channel to it.
+    let key = match source.admit(token.as_deref()).await {
         Ok(k) => k,
-        Err(e) => {
-            return refusal(Refusal::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "api_error",
-                e,
-            ));
+        Err(r) => {
+            debug!(%session, status = r.status.as_u16(), "hive: a model call was refused");
+            return refusal(r);
         }
     };
 
@@ -511,7 +732,7 @@ async fn handle(
         }
         headers.append(name.clone(), value.clone());
     }
-    if let Err(r) = put_credential(&mut headers, &key, sup.model_workspace()) {
+    if let Err(r) = put_credential(&mut headers, &key, source.workspace()) {
         return refusal(r);
     }
     let method = req.method().clone();
@@ -529,7 +750,7 @@ async fn handle(
         }
     };
 
-    let url = format!("{}{rest}{query}", sup.upstream().trim_end_matches('/'));
+    let url = format!("{}{path}{query}", source.upstream().trim_end_matches('/'));
     let upstream = match client
         .request(method, &url)
         .headers(headers)
@@ -539,7 +760,7 @@ async fn handle(
     {
         Ok(r) => r,
         Err(e) => {
-            warn!(session = %session, %e, "hive: the model provider could not be reached");
+            warn!(%session, %e, "hive: the model provider could not be reached");
             return refusal(Refusal::new(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
@@ -550,8 +771,8 @@ async fn handle(
     let status = upstream.status();
     if status == StatusCode::UNAUTHORIZED {
         // The key may have rotated: ask the helper again next time.
-        sup.forget_model_key().await;
-        info!(session = %session, "hive: the provider refused the device's key — it will be fetched again");
+        source.forget_key().await;
+        info!(%session, "hive: the provider refused the device's key — it will be fetched again");
     }
     let mut resp = Response::builder().status(status);
     if let Some(h) = resp.headers_mut() {

@@ -330,6 +330,27 @@ impl RemoteConfigServices {
                     applied.needs_restart.push("fps_deny");
                 }
             }
+            // FR-130 P1b — the colour-description switch, a tribool pushed as
+            // a word: `off` / `on` set it, a blank push clears it back to the
+            // built-in default (on). It reaches the encoders through the
+            // config fallbacks, registered once per process, hence
+            // `needs_restart`. A word this build cannot read leaves the key
+            // as it is and never fails the keys beside it; the server
+            // refuses such a word, so only another server could send one.
+            if let Some(want) = desired.color_description.as_deref() {
+                match roomler_ai_remote_control::models::parse_pushed_tribool(want) {
+                    Ok(next) => {
+                        if cfg.color_description != next {
+                            cfg.color_description = next;
+                            applied.needs_restart.push("color_description");
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "rc:agent.config — color_description left as it is"
+                    ),
+                }
+            }
 
             if applied.is_noop() {
                 return Ok(applied);
@@ -547,6 +568,70 @@ mod tests {
         assert!(svc.apply(&push("hevc_qsv:120")).await.unwrap().is_noop());
         svc.apply(&push("")).await.unwrap();
         assert_eq!(crate::config::load(&path).unwrap().fps_deny, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-130 P1b — a pushed `color_description` is written and reported as
+    /// needing a restart, and the same push again changes nothing. Leaving
+    /// the key unmanaged keeps what the device has (it is not a revert); a
+    /// blank push is the revert, back to the built-in default; a word this
+    /// build cannot read leaves the key as it is and does not stop a key
+    /// beside it.
+    #[tokio::test]
+    async fn a_pushed_colour_description_is_written_and_a_blank_clears_it() {
+        let dir = std::env::temp_dir().join(format!("fr130-color-desc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        );
+        let push = |v: &str| DesiredConfig {
+            color_description: Some(v.to_string()),
+            ..Default::default()
+        };
+        let on_disk = || crate::config::load(&path).unwrap().color_description;
+        assert_eq!(on_disk(), None, "the fixture leaves the key unset");
+
+        let applied = svc.apply(&push("off")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["color_description"]);
+        assert!(applied.live.is_empty(), "read once per process: never live");
+        assert_eq!(on_disk(), Some(false));
+        assert!(svc.apply(&push("off")).await.unwrap().is_noop());
+
+        // Not managed: the device keeps its `off`.
+        assert!(
+            svc.apply(&DesiredConfig::default())
+                .await
+                .unwrap()
+                .is_noop()
+        );
+        assert_eq!(on_disk(), Some(false), "unmanaged is not a revert");
+
+        // A word it cannot read: the key stays, and the key beside it lands.
+        let mixed = DesiredConfig {
+            color_description: Some("maybe".into()),
+            fps_deny: Some("hevc_qsv:120".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            svc.apply(&mixed).await.unwrap().needs_restart,
+            vec!["fps_deny"]
+        );
+        assert_eq!(on_disk(), Some(false), "never guessed");
+
+        let applied = svc.apply(&push("on")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["color_description"]);
+        assert_eq!(on_disk(), Some(true));
+
+        // The revert: cleared, so the built-in default (on) decides again.
+        let applied = svc.apply(&push("")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["color_description"]);
+        assert_eq!(on_disk(), None);
+        assert!(svc.apply(&push("")).await.unwrap().is_noop());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

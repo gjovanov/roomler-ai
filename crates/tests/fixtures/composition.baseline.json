@@ -333,6 +333,26 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/pair/approve",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/pair/deny",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/pair/lookup",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/pair/poll",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/pair/start",
+      "methods": "POST"
+    },
+    {
       "path": "/api/push/config",
       "methods": "GET,HEAD"
     },
@@ -359,6 +379,10 @@
     {
       "path": "/api/setup/diagnostics",
       "methods": "POST"
+    },
+    {
+      "path": "/api/setup/features",
+      "methods": "GET,HEAD"
     },
     {
       "path": "/api/setup/install.ps1",
@@ -1475,6 +1499,32 @@
         ]
       },
       {
+        "collection": "device_pairings",
+        "indexes": [
+          {
+            "key": {
+              "device_code_hash": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "user_code": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "status": "pending"
+            }
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
         "collection": "enroll_token_issued",
         "indexes": [
           {
@@ -2339,6 +2389,35 @@
           {
             "key": {
               "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "pairing_audit",
+        "indexes": [
+          {
+            "key": {
+              "pairing_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
             },
             "expireAfterSeconds": 7776000
           }
@@ -3855,6 +3934,32 @@
         ]
       },
       {
+        "collection": "device_pairings",
+        "indexes": [
+          {
+            "key": {
+              "device_code_hash": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "user_code": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "status": "pending"
+            }
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
         "collection": "enroll_token_issued",
         "indexes": [
           {
@@ -4591,6 +4696,11 @@
             "op": "drop_index_if_present",
             "index": "network_id_1",
             "why": "multi-block schema — one-block-per-network guard removed"
+          },
+          {
+            "op": "drop_index_if_present",
+            "index": "network_id_1_seq_1",
+            "why": "multi-block schema — the plain (network_id, seq) read index is replaced by the assigned-unique position guard"
           }
         ],
         "indexes": [
@@ -4614,6 +4724,11 @@
             "key": {
               "network_id": 1,
               "seq": 1
+            },
+            "name": "network_id_1_seq_1_assigned",
+            "unique": true,
+            "partialFilterExpression": {
+              "state": "assigned"
             }
           }
         ]
@@ -4717,6 +4832,35 @@
           {
             "key": {
               "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "pairing_audit",
+        "indexes": [
+          {
+            "key": {
+              "pairing_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
             },
             "expireAfterSeconds": 7776000
           }

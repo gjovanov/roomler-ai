@@ -585,7 +585,10 @@ pub async fn activate(
             .find_by_id(user_id)
             .await
             .map_err(|e| ApiError::Internal(format!("User not found: {}", e)))?;
-        let login_url = format!("{}/auth/login", state.settings.app.frontend_url);
+        // #3029 — the SPA's sign-in page is `/login`; this linked `/auth/login`,
+        // which never existed, so the "you can now sign in" email 404'd. The SPA
+        // keeps `/auth/login` as a redirect for the emails already sent.
+        let login_url = format!("{}/login", state.settings.app.frontend_url);
         let to_email = user.email.clone();
         let display_name = user.display_name.clone();
         tokio::spawn(async move {

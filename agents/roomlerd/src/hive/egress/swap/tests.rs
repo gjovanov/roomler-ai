@@ -19,25 +19,26 @@ use tokio::net::TcpListener;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
 
+use super::super::super::placeholder;
 use super::super::{
-    Admit, Decide, Decision, Dial, Fronts, Roots, Seams, Values, ca_of, drop_run, socks5,
-    start_admitting,
+    Admit, Decide, Decision, Dial, Fronts, Roots, RunBindings, RunLeaves, Seams, Values, ca_of,
+    drop_run, socks5, start_admitting,
 };
 use super::*;
 
 /// The audience's host, and another name its certificate also carries.
-const HOST: &str = "api.test";
+pub(in crate::hive::egress) const HOST: &str = "api.test";
 const OTHER: &str = "other.test";
 /// What a client offers, as curl and Go do.
-const H1: &[&[u8]] = &[b"h2", b"http/1.1"];
+pub(in crate::hive::egress) const H1: &[&[u8]] = &[b"h2", b"http/1.1"];
 
 /// One request, as the audience was sent it.
 #[derive(Debug, Clone)]
-struct Seen {
+pub(in crate::hive::egress) struct Seen {
     method: Method,
     target: String,
     host: String,
-    authorization: Vec<String>,
+    pub(in crate::hive::egress) authorization: Vec<String>,
     api_key: Option<String>,
     agent: Option<String>,
     /// Every header, as AWS would read them (P3b-4-2).
@@ -48,15 +49,15 @@ struct Seen {
 /// A test audience: TLS under a CA of its own, for both names; HTTP/1.1,
 /// each request recorded and answered `200`, its connection closed after
 /// each where `close` says so.
-struct Audience {
-    addr: SocketAddr,
-    ca: CertificateDer<'static>,
+pub(in crate::hive::egress) struct Audience {
+    pub(in crate::hive::egress) addr: SocketAddr,
+    pub(in crate::hive::egress) ca: CertificateDer<'static>,
     seen: Arc<Mutex<Vec<Seen>>>,
     connections: Arc<AtomicUsize>,
 }
 
 impl Audience {
-    async fn start(close: bool) -> Self {
+    pub(in crate::hive::egress) async fn start(close: bool) -> Self {
         let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -112,7 +113,7 @@ impl Audience {
         }
     }
 
-    fn seen(&self) -> Vec<Seen> {
+    pub(in crate::hive::egress) fn seen(&self) -> Vec<Seen> {
         lock(&self.seen).clone()
     }
 
@@ -165,7 +166,7 @@ async fn answered(
 }
 
 /// Allows every host.
-struct AllowAll;
+pub(in crate::hive::egress) struct AllowAll;
 
 #[async_trait::async_trait]
 impl Decide for AllowAll {
@@ -175,7 +176,7 @@ impl Decide for AllowAll {
 }
 
 /// Dials the audience, whatever the host.
-struct ToAudience(SocketAddr);
+pub(in crate::hive::egress) struct ToAudience(pub(in crate::hive::egress) SocketAddr);
 
 #[async_trait::async_trait]
 impl Dial for ToAudience {
@@ -186,12 +187,16 @@ impl Dial for ToAudience {
     }
 }
 
-/// Each lease's value.
+/// Each lease's value, and (P8-2a-4a) how many times one was read.
 #[derive(Default)]
-struct Leases(Mutex<HashMap<String, Vec<u8>>>);
+pub(in crate::hive::egress) struct Leases(
+    pub(in crate::hive::egress) Mutex<HashMap<String, Vec<u8>>>,
+    pub(in crate::hive::egress) AtomicUsize,
+);
 
 impl Values for Leases {
     fn value(&self, lease_id: &str) -> Option<Zeroizing<Vec<u8>>> {
+        self.1.fetch_add(1, Ordering::SeqCst);
         lock(&self.0)
             .get(lease_id)
             .map(|v| Zeroizing::new(v.clone()))
@@ -204,7 +209,7 @@ struct Rig {
     fronts: Fronts,
     leases: Arc<Leases>,
     /// The run's CA.
-    ca: CertificateDer<'static>,
+    pub(in crate::hive::egress) ca: CertificateDer<'static>,
 }
 
 impl Rig {
@@ -216,7 +221,8 @@ impl Rig {
         let seams = Seams {
             decide: Arc::new(AllowAll),
             dial: Arc::new(ToAudience(audience.addr)),
-            values: leases.clone(),
+            bindings: Arc::new(RunBindings(leases.clone())),
+            leaves: Arc::new(RunLeaves),
             roots: Roots::Given(Arc::new(roots)),
         };
         let admit: Admit = Arc::new(|_: &TcpStream, _: SocketAddr| Ok(()));
@@ -273,7 +279,7 @@ async fn status_line<S: AsyncRead + Unpin>(tcp: &mut S) -> String {
 /// Through the HTTP front (`CONNECT connect`), then TLS as `name`, trusting
 /// `trust` alone and offering `alpn`: the stream, or the front's status line
 /// or TLS's error.
-async fn through(
+pub(in crate::hive::egress) async fn through(
     front: SocketAddr,
     connect: &str,
     name: &str,
@@ -334,7 +340,7 @@ async fn socks_connect(front: SocketAddr, host: &str, port: u16) -> (u8, TcpStre
 }
 
 /// HTTP/1.1 over `tls`, its connection driven aside.
-async fn http(tls: TlsStream<TcpStream>) -> SendRequest<Full<Bytes>> {
+pub(in crate::hive::egress) async fn http(tls: TlsStream<TcpStream>) -> SendRequest<Full<Bytes>> {
     let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
         .await
         .unwrap();
@@ -345,7 +351,7 @@ async fn http(tls: TlsStream<TcpStream>) -> SendRequest<Full<Bytes>> {
 }
 
 /// One request: its status, and its body.
-async fn ask(
+pub(in crate::hive::egress) async fn ask(
     send: &mut SendRequest<Full<Bytes>>,
     req: Request<Full<Bytes>>,
 ) -> (StatusCode, String) {
@@ -360,7 +366,11 @@ async fn ask(
 }
 
 /// `GET path`, its `Host`, and its `Authorization` where it has one.
-fn get(path: &str, host: &str, authorization: Option<&str>) -> Request<Full<Bytes>> {
+pub(in crate::hive::egress) fn get(
+    path: &str,
+    host: &str,
+    authorization: Option<&str>,
+) -> Request<Full<Bytes>> {
     let mut req = Request::get(path).header(header::HOST, host);
     if let Some(a) = authorization {
         req = req.header(header::AUTHORIZATION, a);
@@ -409,6 +419,40 @@ async fn an_audiences_placeholder_is_swapped_in_authorization_under_the_runs_ca(
         1,
         "one connection to the audience carried both"
     );
+}
+
+/// FR-90 P8-2a-4a — a value is read only for a request with an
+/// `Authorization`, the one header it goes into or signs: a request to the
+/// placeholder's audience without one reads none, and one with it reads it
+/// once.
+#[tokio::test]
+async fn a_value_is_read_only_for_a_request_with_an_authorization() {
+    let audience = Audience::start(false).await;
+    let rig = Rig::new(&audience, &audience.ca).await;
+    let token = rig.hold(HOST, b"the-value");
+    let tls = through(rig.fronts.http, "api.test:443", HOST, &rig.ca, H1)
+        .await
+        .expect("terminated under the run's CA");
+    let mut send = http(tls).await;
+    let (status, _) = ask(&mut send, get("/user", HOST, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        rig.leases.1.load(Ordering::SeqCst),
+        0,
+        "no value read for a request without an Authorization"
+    );
+    let (status, _) = ask(
+        &mut send,
+        get("/user", HOST, Some(&format!("token {token}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        rig.leases.1.load(Ordering::SeqCst),
+        1,
+        "read once, for the request that carries one"
+    );
+    assert_eq!(audience.seen()[1].authorization, ["token the-value"]);
 }
 
 /// A placeholder anywhere but `Authorization` (the URL, another header, the

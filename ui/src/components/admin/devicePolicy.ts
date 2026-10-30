@@ -9,7 +9,7 @@
  * carry their own copies of every control, and copies drift: the phone card
  * ended up showing a different name and a shorter menu than the grid.
  */
-import type { AccessPolicy, ConsentMode, LockOnEnd } from '@/stores/agents'
+import type { AccessPolicy, ConsentMode, LockOnEnd, RcOverlayMode } from '@/stores/agents'
 
 // Per-device consent mode. Email/Push route the request to the device OWNER
 // (approve-link) for unattended hosts. `prompt_then_email` runs BOTH legs in
@@ -78,13 +78,39 @@ export const LOCK_ON_END_HINT =
   'Linux, where a session can unlock the screen again; a per-user install, or an agent that ' +
   'predates it, does not take it. Applies to the next session.'
 
-/** #1882 — what the "Remote desktop over the mesh" switch does, for its
- *  tooltip. */
+/** #1882 / FR-128 — the three ways a session to this device may use the mesh. */
+export const RC_OVERLAY_ITEMS: { title: string; value: RcOverlayMode }[] = [
+  { title: 'Mesh: off', value: 'off' },
+  { title: 'Mesh: auto (direct links only)', value: 'auto' },
+  { title: 'Mesh: on', value: 'on' },
+]
+
+/** #1882 / FR-128 — what the "Remote desktop over the mesh" choice does, for
+ *  its tooltip. */
 export const RC_OVERLAY_HINT =
   'Off (default): remote desktop never rides the WireGuard mesh; it connects ' +
-  'over the LAN, a direct path or a TURN relay. On: it may take the mesh when ' +
-  'that is the best path, and inherits the mesh’s outages. Applies to the ' +
-  'next session.'
+  'over the LAN, a direct path or a TURN relay. Auto: a session takes the mesh ' +
+  'only when the browser runs on one of your Roomler devices and that device’s ' +
+  'mesh link to this one is direct; an agent that predates Auto reads it as Off. ' +
+  'On: it may take the mesh whenever that is the best path, and inherits the ' +
+  'mesh’s outages. Applies to the next session.'
+
+/** FR-128 — the stored pair read as one choice: `on` wins, then `auto`. */
+export function rcOverlayMode(
+  policy: Pick<AccessPolicy, 'rc_overlay' | 'rc_overlay_auto'>,
+): RcOverlayMode {
+  if (policy.rc_overlay) return 'on'
+  if (policy.rc_overlay_auto) return 'auto'
+  return 'off'
+}
+
+/** FR-128 — the pair a choice is stored as. Both fields are always written,
+ *  so a row never says `on` and `auto` at once. */
+export function rcOverlayFields(
+  mode: RcOverlayMode,
+): Pick<AccessPolicy, 'rc_overlay' | 'rc_overlay_auto'> {
+  return { rc_overlay: mode === 'on', rc_overlay_auto: mode === 'auto' }
+}
 
 /** The label says what is TRUE right now, not what the checkbox is called —
  *  "you own this device, so consent is currently skipped" is the fact an
@@ -127,6 +153,8 @@ export function policySummary(policy: AccessPolicy | null | undefined, ownedByMe
   if (typeof idle === 'number' && idle > 0) out.push(`idle ${idle} min`)
   if (policy.lock_on_end === 'auto') out.push('lock if locked at start')
   if (policy.lock_on_end === 'always') out.push('lock at end')
-  if (policy.rc_overlay) out.push('over the mesh')
+  const mesh = rcOverlayMode(policy)
+  if (mesh === 'on') out.push('over the mesh')
+  if (mesh === 'auto') out.push('mesh when direct')
   return out
 }

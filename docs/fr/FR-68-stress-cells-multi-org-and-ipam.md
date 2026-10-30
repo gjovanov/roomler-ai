@@ -1,8 +1,12 @@
 # FR-68: Stress cells for multi-org guard contention and IPAM growth
 
-**Status**: shipped and field-verified — **every AC met except AC2**, which is
-deliberately deferred (see "Is AC2 worth its cost?"). All PRs merged, both
-repos. · **Owner**: overlay/networking ·
+**Status**: **every AC met except AC2**, which is deliberately deferred and is
+the operator's call to build or drop (see "Is AC2 worth its cost?"). The P1 tail
+(AC3, AC4, AC9's emitted WARN) is in review as
+[#3097](https://github.com/gjovanov/roomler-ai/pull/3097), each test shown RED on
+the shipped behaviour and GREEN on the fix (field log 2026-10-29);
+AC6 was re-read 2026-10-29 on two two-org hosts running the released 0.4.185.
+· **Owner**: overlay/networking ·
 **Issue**: [#1272](https://github.com/gjovanov/roomler-ai/issues/1272)
 
 ## Goal
@@ -43,7 +47,7 @@ Turn two overlay properties from **promises into properties**:
 
 - **The decoder pin.** No test feeds a P5d netmap *containing* `cidrs` into a pre-P5d
   decoder. `a_pre_p5d_netmap_still_decodes_and_carries_no_block_list`
-  (`crates/remote_control/src/signaling.rs:10993`) only tests old-server → new-decoder.
+  (`crates/remote_control/src/signaling.rs:11194`) only tests old-server → new-decoder.
   Copy `agent-v0.4.42`'s `OverlayNetworkInfo` verbatim as a local struct and decode a real
   grown-org netmap into it.
 - **Cross-tenant carve racing a grow.** `allocate`'s `DuplicateKey` arm
@@ -147,22 +151,52 @@ the next reader does not assume back-off exists.
 
 ## Acceptance criteria
 
-- [ ] **AC1** A pre-P5d `OverlayNetworkInfo` decodes a real grown-org netmap without error
+- [x] **AC1** A pre-P5d `OverlayNetworkInfo` decodes a real grown-org netmap without error
       and ignores `cidrs` — proven with the struct copied verbatim from `agent-v0.4.42`.
+      (`a_grown_org_netmap_decodes_on_a_pinned_pre_p5d_agent`, unit, RED-first `a35720b6`;
+      `overlay_growth_tests` against a server-produced netmap, `182a4121`; both re-run
+      2026-10-29 — field log below.)
 - [ ] **AC2** A real `agent-v0.4.42` daemon meshes in a grown org, and its **subnet-router**
       limitation is demonstrated rather than assumed (block-1 → block-0-router LAN).
-- [ ] **AC3** A cross-tenant carve racing a grow does not silently refuse the joiner.
-- [ ] **AC4** Renumber against a grown org does not duplicate a `seq`.
-- [ ] **AC5** `ensure_indexes(db, false)` after growth fails loudly.
-- [~] **AC6** (half — counters live and read on 3 hosts; the `spared` half needs a multi-org host) `ROUTE_EVICTIONS` / `ROUTE_WAVES` / `FORCED_REVALIDATIONS` are live and were
-      read on two real multi-org hosts, **as a diff of two readings**.
+      (**Deferred — the operator's call**: the population it protects is zero while
+      `multi_block_enabled` is off everywhere; see "Is AC2 worth its cost?".)
+- [x] **AC3** A cross-tenant carve racing a grow does not silently refuse the joiner.
+      (`a_cross_tenant_carve_racing_a_grow_is_retried_above_the_winner`, RED on the
+      shipped discriminator, GREEN on the `seq`-scoped one — field log 2026-10-29.)
+- [x] **AC4** Renumber against a grown org does not duplicate a `seq`.
+      (`renumber_refuses_a_grown_network_before_touching_it` + the `(network_id, seq)`
+      assigned-unique guard, `flipping_multi_block_on_installs_the_position_guard`, each
+      RED with its fix flipped back — field log 2026-10-29.)
+- [x] **AC5** `ensure_indexes(db, false)` after growth fails loudly.
+      (`turning_multi_block_off_after_a_grow_fails_the_boot_loudly`, RED-first `044f08f2`,
+      re-run 2026-10-29 — and green under every RED-run flip, since the door is the
+      `network_id_1` index, which none of them touches.)
+- [x] **AC6** `ROUTE_EVICTIONS` / `ROUTE_WAVES` / `FORCED_REVALIDATIONS` are live and were
+      read on two real multi-org hosts, **as a diff of two readings**. (2026-09-04 on
+      0.4.63 — neo16 + CORPLAP-1, #1272; re-read 2026-10-29 on the released 0.4.185 —
+      neo16 + CORPLAP-1, both `primary` + `jovanov` on `overlay tun`, two readings
+      5 min 28 s apart, no decrease — field log below. A 2026-10-27 "re-read" recorded
+      here earlier is retracted: no fleet read stands behind it.)
 - [x] **AC7** With C2(a)+C2(b), a two-org Windows guest shows **zero sibling evictions**
-      over a sustained window.
+      over a sustained window. (`multiorg` cell, 2026-09-04: `evicted +0` over 80 waves.)
 - [x] **AC8** The negative control (`OVERLAY_SIBLING_EXEMPT=0`) **reproduces** the war —
-      i.e. AC7 is not passing vacuously.
-- [ ] **AC9** A nested-block pair (legacy `/10` primary + carved `/22` secondary) emits the
-      overlap WARN.
+      i.e. AC7 is not passing vacuously. (`multiorg-war` cell, 2026-09-04: `evicted +67`,
+      `+66` in the full matrix.)
+- [x] **AC9** A nested-block pair (legacy `/10` primary + carved `/22` secondary) emits the
+      overlap WARN. (The decision: `nested_blocks_count_as_overlapping` and the
+      `overlapping_sibling` vectors, #1303. The emitted line, captured:
+      `a_nested_legacy_and_carved_pair_emits_the_overlap_warn`, RED with the WARN
+      suppressed and GREEN restored, 2026-10-29. The field condition is unreachable on
+      today's fleet by construction — every org is carved — so a test is the strongest
+      evidence available, stated as such.)
 - [x] **AC10** The 18 pre-existing vmtest cells are unchanged by the two-tenant plumbing.
+      (Full 20-cell matrix 2026-09-04: `pass=92 fail=0`.)
+- [x] **AC11** Docs updated, with diagrams, and linked from `docs/README.md`:
+      `docs/multi-org.md` §4.2 "Growth, and the allocator's two races" (sequence diagram)
+      and § "The sibling route defence — counters, the overlap WARN, the stress cells"
+      (flowchart, the counters table, the three cells, the overlap WARN); the
+      `overlay_blocks` and unique-identity rows in `docs/data-model.md`; the
+      `multi-org.md` row in `docs/README.md`'s index — all in the P1-tail PR.
 
 ## Open decisions
 
@@ -177,6 +211,34 @@ the next reader does not assume back-off exists.
 - The structural fix for nested blocks (FR-47 reconciler).
 - The pump-loop stall detector and the other items from the blocking-work analysis.
 - Anything that mutates grox / demo / jovanov: the fleet arm is **read-only**.
+
+## Where this stands — 2026-10-29
+
+Everything agent-reachable is done once the P1-tail PR merges (the ticks above
+ride in it); the card is parked at *ready* for two operator decisions, neither
+of which a worker may take:
+
+1. **AC2** — build the IPAM VM cell (a disposable `roomler-ai-ipam` namespace
+   with `MULTI_BLOCK_ENABLED`, an org, an anchor, a pinned `agent-v0.4.42`
+   acting as a block-0 subnet router, a block-1 node) or drop the criterion.
+   The recommendation below ("Is AC2 worth its cost?") stands: the population
+   it protects is zero until an org approaches 1 022 devices, and the L1 tests
+   now cover the decoder, the netmask, the door and both allocator races.
+2. **`multi_block_enabled`** — flip it for an org that needs it, or leave it
+   dark. The P1 tail closed the two allocator races the flip would have
+   exposed (a lost slot race on a grow refusing the joiner; twin blocks at one
+   position), and the renumber route now refuses a grown network instead of
+   corrupting its list — so the door is safer to walk through than it was, but
+   it is still one-way.
+
+What the P1 tail changed, and why the 09-03 handover's "resists a
+deterministic test" no longer holds: the allocator is now two halves
+(`next_free_slot` / `claim_slot`, `crates/services/src/dao/overlay_block.rs`),
+so the interleaving — another tenant's carve landing on the slot a grow just
+read — is staged by calling the read, letting a stranger carve, then calling
+the write. The hook the handover said did not exist is the seam the test
+needed, and the seam made the bug plain: the collision arm re-read "any
+assigned block of this network", which on a grow is always block 0.
 
 ## Where this stands — handover, 2026-09-03
 
@@ -473,3 +535,81 @@ minutes later: its daemon had restarted, and counters reset at process start.
 "Diff two readings" is necessary but not sufficient — **a decrease invalidates
 the diff**, and computing it anyway yields a confident negative rate. Check for
 a decrease before trusting any delta.
+
+### 2026-10-27 — an AC6 "re-read" that is RETRACTED
+
+The first autopilot attempt on this card wrote a three-host table of 0.4.179
+readings here and ticked AC6 on it. The session that reviewed its transcript
+found no `roomler exec` or `roomler ssh` call behind the numbers, so they are
+withdrawn rather than kept: a counter table nobody can trace to a read is worse
+than no table, because it looks exactly like evidence. AC6 stood on the
+2026-09-04 pair until the read below. Recorded so the next reader does not
+re-derive it from the issue's history.
+
+### 2026-10-29 — AC6 re-read on the released 0.4.185: two two-org hosts, diffed, no decrease
+
+Every online device in the org runs 0.4.185 (`roomler devices`), the release
+that carries the counters. `roomler status` on each two-org host lists
+`primary … connected, overlay tun (primary)` and `jovanov … connected, overlay
+tun`. Two readings 5 min 28 s apart — neo16 locally, CORPLAP-1 and CORPLAP-3
+through `roomler exec <host> -- "roomler status"` (read-only, the operator's own
+devices):
+
+| host | orgs | 09:13:23Z | 09:18:51Z | Δevicted | Δspared | Δwaves `[tick/pulled/event]` | Δreval |
+|---|---|---|---|---|---|---|---|
+| neo16 | 2 | `ev=0 sp=0 w=1348 [1294/8/54] rv=384` | `ev=0 sp=0 w=1370 [1316/8/54] rv=384` | **0** | **0** | +22 `[+22/0/0]` | 0 |
+| CORPLAP-1 | 2 | `ev=0 sp=0 w=1331 [1317/3/14] rv=8` | `ev=0 sp=0 w=1353 [1339/3/14] rv=8` | **0** | **0** | +22 `[+22/0/0]` | 0 |
+| CORPLAP-3 | 1 | `ev=145 sp=0 w=834 [762/157/72] rv=470 yielded=60` | `ev=145 sp=0 w=846 [774/158/72] rv=475 yielded=60` | 0 | 0 | +12 `[+12/+1/0]` | +5 |
+
+No counter went down on any host, so no daemon restarted inside the window and
+every diff is valid. The two two-org hosts show the healthy **pair** — evictions
+flat *and* spares static — which is what C2(a)+C2(b) predict: narrowing keeps
+the per-org prefixes disjoint, so the sibling exemption is never consulted. Both
+climbed at the same tick rate (+22 waves each, all on the `tick` arm, no
+events), so the counters are measuring rather than printing a constant.
+CORPLAP-3 (single-org, AnyConnect) carries the known foreign war's history
+(`evicted=145`) with `yielded=60` and no new eviction inside the window — the
+#1328 brake holding on a quiet corporate network. `revalidations` moved only
+there (+5, with `pulled` +1), which is route churn on that laptop, not a sibling
+war, and not this FR's.
+
+### 2026-10-29 — the P1 tail's tests, RED on the shipped behaviour and GREEN on the fix (#3097)
+
+`origin/master` (`4fe9fe0dc`) was merged into the branch first (`4c96334b1`, a
+clean merge; `composition_tests::composition_matches_baseline` passes on the
+merged tree, so the baseline the branch re-recorded needed no second
+re-record). Then each fix was flipped back to the shipped behaviour in place,
+the tests run, the flips reverted with the restore asserted (`git diff --quiet
+HEAD` → 0, no flip marker left in any file, fresh mtimes so cargo rebuilt — a
+`cp -p` restore keeps the mutated build), and the tests run again. Each flip
+fails only the test written for it:
+
+| flipped back to | test | RED (flipped) | GREEN (restored) |
+|---|---|---|---|
+| `claim_slot` re-reads "any assigned block of the network" | `a_cross_tenant_carve_racing_a_grow_is_retried_above_the_winner` | FAILED — `the lost race came back as 100.65.0.0/22 (position 0) — the grow would report success with a block A already holds, and the joiner would be refused` | ok |
+| the multi-block plan keeps the plain `(network_id, seq)` index, no position guard | `flipping_multi_block_on_installs_the_position_guard` | FAILED — `the position guard is installed, got ["_id_", "slot_1", "end_slot_-1", "tenant_id_1", "network_id_1_seq_1"]` | ok |
+| same | `a_second_grow_at_the_same_position_returns_the_first_block` | FAILED — the loser inserted a twin (two `_id`s at position 1) | ok |
+| same | `composition_tests::composition_matches_baseline` | FAILED — `index plan: differs` | ok |
+| renumber without gate 0 | `renumber_refuses_a_grown_network_before_touching_it` | FAILED — `dry_run=true: left 200, right 400` | ok |
+| `own_adapters::register` never emits the WARN (`&& false`) | `a_nested_legacy_and_carved_pair_emits_the_overlap_warn` (Windows) | FAILED — `no WARN named the nested adapter` | ok |
+
+Controls: `turning_multi_block_off_after_a_grow_fails_the_boot_loudly` stayed
+green under every flip (the door is the `network_id_1` index, which no flip
+touches), and `two_carved_disjoint_blocks_emit_no_overlap_warn` stayed green
+with the WARN suppressed. Whole-module GREEN on the merged tree:
+`overlay_tests` 43 + `overlay_growth_tests` 1 + `composition_tests` 1 = **45
+passed, 0 failed**; `own_adapters` 9/9 on Windows; AC1's two decoder units
+re-run green.
+
+Commands — WSL: `ROOMLER__DATABASE__URL` / `ROOMLER__REDIS__URL` at a throwaway
+Mongo 7.0.40 + Redis 7, `RUST_MIN_STACK=8388608`, `cargo test -p
+roomler-ai-tests --locked -- <the six names>`. Windows: `cargo test -p
+roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --lib --
+own_adapters`.
+
+🔑 Checked on Mongo 7.0.40 before trusting the plan: a plain `{network_id: 1,
+seq: 1}` and the partial-unique `network_id_1_seq_1_assigned` **coexist** (a
+different `partialFilterExpression` is a different index signature), so a
+database that booted multi-block once and is flipped back without a grow still
+boots, with the guard left beside the plain index. The door closes on the first
+**grow**, as AC5 says — not on the first boot with the flag on.

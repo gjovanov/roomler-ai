@@ -6,7 +6,7 @@ criterion ticked**. Proposed 2026-10-18, spec and claim, on the operator's go-ah
 AC4, AC5, AC6 and AC7. On 0.4.144 AC3 passed lock, unlock and both user switches but failed the logout, because the
 seat guard read a `closing` session as on screen. **P4** (#2516) fixed that, shipped in **0.4.145**, and AC3 passed
 there on the released bytes (§8) · **Owner:** remote desktop (agent) · **Anchors:** master
-`c7a306e47` · **Builds on:** [FR-95](FR-95-system-installs-on-by-default-on-wayland.md) (the system plan, its seat guard),
+`7ed4091e0` · **Builds on:** [FR-95](FR-95-system-installs-on-by-default-on-wayland.md) (the system plan, its seat guard),
 [FR-36](FR-36-wayland-capture.md) (DRM + uinput), [FR-93](FR-93-wayland-out-of-the-box.md) (the idle skip P3d, the desktop
 brief P2b), FR-80 (the reason codes)
 

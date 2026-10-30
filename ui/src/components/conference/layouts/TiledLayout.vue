@@ -20,6 +20,7 @@
       @request-pip="$emit('request-pip', p.streamKey)"
       @spotlight="$emit('spotlight', p.streamKey)"
       @picture-black="$emit('picture-black', p.streamKey, $event)"
+      @visible="$emit('visible', p.streamKey, $event)"
     />
 
     <!-- Floating self-view -->
@@ -49,6 +50,7 @@
 import { computed, ref } from 'vue'
 import VideoTile from '@/components/conference/VideoTile.vue'
 import type { LayoutParticipant, SelfViewMode } from '@/composables/useConferenceLayout'
+import type { TileVisibility } from '@/utils/viewReport'
 
 const props = defineProps<{
   participants: LayoutParticipant[]
@@ -64,6 +66,10 @@ defineEmits<{
   spotlight: [streamKey: string]
   /** FR-124 — a tile's picture turned black (or stopped being black). */
   'picture-black': [streamKey: string, black: boolean]
+  /** FR-127 P1 — a remote tile came on screen or left it. The grid never
+      scrolls, so a rendered tile is on screen; the floating self-view is
+      local and never reports. */
+  visible: [streamKey: string, report: TileVisibility]
 }>()
 
 const visibleParticipants = computed(() => props.participants)

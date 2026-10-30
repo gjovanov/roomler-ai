@@ -229,6 +229,64 @@ message names the consequence and why a fresh carve WARNs
 | `overlay.blocks_enabled` | `ROOMLER__OVERLAY__BLOCKS_ENABLED` | `true` (FR-47; `false` = kill switch) |
 | `overlay.block_prefix` | `ROOMLER__OVERLAY__BLOCK_PREFIX` | `22` (1022 devices; 4032 tenants fit) |
 | `overlay.block_version_floor` | `ROOMLER__OVERLAY__BLOCK_VERSION_FLOOR` | `0.3.0-rc.301` |
+| `overlay.multi_block_enabled` | `ROOMLER__OVERLAY__MULTI_BLOCK_ENABLED` | `false` (FR-47 P5c growth; **a one-way door** — see below) |
+
+#### Growth, and the allocator's two races (FR-47 P5c · FR-68)
+
+With `multi_block_enabled` a network that fills its block **grows**: a second
+block is appended at the tail of its list (`seq` 1, 2, …), the ordinal space is
+the blocks concatenated in `seq` order, so nothing already leased moves — no
+renumber, no cycled sockets, no version floor. Each node's netmap carries the
+block *it* lives in as `cidr`, which is why a pre-P5d daemon still sizes its
+netmask correctly (FR-68 P1 pinned `agent-v0.4.42`'s decoder against a real
+grown netmap). It ships **dark** because flipping it is a one-way door for that
+database: once any network holds two assigned blocks the one-block-per-network
+index can no longer be created, and a boot with the flag back off **refuses**
+(`turning_multi_block_off_after_a_grow_fails_the_boot_loudly`). No production
+database has walked through it (largest org: 17 devices against 1 022).
+
+The allocator is two halves — `next_free_slot` (the read: the highest `end_slot`
+in the registry, rounded up to the block's alignment) and `claim_slot` (the
+write, which decides what a `DuplicateKey` means) — so the race between them can
+be staged by a test. Two unique indexes can refuse the write, and they mean
+different things:
+
+```mermaid
+sequenceDiagram
+    participant A as tenant A's grow (seq 1)
+    participant R as overlay_blocks
+    participant B as tenant B's carve
+    A->>R: next_free_slot → slot 65
+    B->>R: next_free_slot → slot 65 (same highest end)
+    B->>R: insert slot 65 — WON
+    A->>R: insert slot 65 — DuplicateKey (slot index)
+    A->>R: re-read: does A hold an ASSIGNED block at seq 1?
+    R-->>A: none → Taken
+    A->>R: next_free_slot → slot 66, insert — WON (seq 1)
+    Note over A,R: before FR-68 the re-read asked "ANY assigned block of A",<br/>found block 0, and handed it back as the grow's result:<br/>the space never grew and the joiner was refused AddressSpaceExhausted
+```
+
+- **`slot` fires** (another tenant won the slot between read and write): the
+  re-read of **this position** finds nothing → `Taken` → retry above the winner.
+  ⚠️ The re-read is scoped to `seq`, not to the network: a growing network
+  holds block 0 by definition, so "any assigned block" was always block 0, and
+  a lost race on a grow silently returned it — the joiner it was growing for was
+  refused (FR-68 AC3).
+- **the per-network guard fires** (a concurrent carve or grow of the *same*
+  network won): the re-read finds the winner's row at that position →
+  `AlreadyHeld(winner)`. Under single-block the guard is the partial-unique
+  `network_id`; under multi-block it is `(network_id, seq)` **unique over
+  assigned rows** (`network_id_1_seq_1_assigned`), which replaces the plain read
+  index by a one-time `DropIndexIfPresent` — named distinctly so the drop finds
+  the legacy index once and the guard never again. Without it two joiners
+  tripping one grow inserted twins at position 1, and every ordinal above was
+  ambiguous.
+- **Renumber against a grown network is refused** — 400 before any read or
+  write, dry run included (FR-68 AC4). The route is single-block-shaped end to
+  end (one block read, retired, replaced at position 0, every node planned out
+  of block 0); against a grown network it would leave two assigned blocks at
+  one position and plan block-1 nodes as ordinal-less. A multi-block renumber
+  must retire every block and re-plan across the list: FR-47's reconciler.
 
 ### 4.3 The renumber runbook
 
@@ -417,6 +475,90 @@ shared-TUN mux of §4.4 and §4b) went with the mux in W7c.
 `overlay_shared_carrier` (§4a) still composes independently and is still on by
 default.
 
+### The sibling route defence — counters, the overlap WARN, the stress cells (FR-68)
+
+Two adapters on one host means two route guards, and #1237 is what happens
+when they fight: each per-org runtime evicted the other's
+`fd72:6f6f:6d6c::/96` on every wave — ~100 carrier revalidations/min, **718
+evictions/day on neo16** — for weeks, with nothing failing. #1246 closed it
+(narrowed prefixes + a sibling exemption, above). FR-68 made it *measurable*,
+and then catchable before the field. The per-row decision of one guard wave,
+on Windows (`defend_self_route`, `crates/tunnel-core/src/overlay/tun.rs`):
+
+```mermaid
+flowchart TD
+    W[route-guard wave<br/>ROUTE_WAVES += 1<br/>tick · event · pulled] --> R{a route for OUR<br/>derived-ULA prefix<br/>on a FOREIGN interface?}
+    R -- no --> OK[nothing to do]
+    R -- yes --> S{that interface is a<br/>SIBLING org adapter of ours?<br/>own_adapters registry}
+    S -- yes --> SP[spare it<br/>ROUTE_SIBLING_SPARES += 1]
+    S -- no --> EV[evict it<br/>ROUTE_EVICTIONS += 1]
+    EV --> Y{same prefix keeps<br/>re-appearing?}
+    Y -- yes, past the strike cap --> YL[yield the prefix<br/>ROUTE_YIELDS += 1<br/>issue 1328 — at ANY metric]
+    NC[network change<br/>PathMonitor event] --> RV[forced rekey poke:<br/>every peer re-keyed, a healthy<br/>direct carrier can demote<br/>FORCED_REVALIDATIONS += 1]
+    REG[adapter bring-up<br/>own_adapters::register] --> OV{its v4 block overlaps<br/>a registered sibling's?}
+    OV -- nested, e.g. legacy /10 + carved /22 --> WARN[WARN: OVERLAPPING v4 blocks<br/>names both blocks + the sibling<br/>a detector, not a fix]
+    OV -- disjoint carved blocks --> QUIET[silent — the shipped fleet shape]
+```
+
+**The counters** (`crates/tunnel-core/src/evidence.rs`, surfaced by
+`roomler status` as the `route guard` line) exist because the eviction WARN is
+throttled to 1/min/prefix, so counting log lines under-reports by up to 40×:
+
+```
+route guard evicted=0 spared=0 waves=1348 [tick=1294 pulled=8 event=54] revalidations=384
+           (cumulative — DIFF two readings, never judge the absolute)
+```
+
+| Counter | Climbs when | Read it as |
+|---|---|---|
+| `evicted` | a foreign route for our prefix was deleted | a route war in progress if it climbs per wave; `0` is healthy |
+| `spared` | the foreign route belonged to a sibling org adapter and was left alone | the exemption being consulted. ⚠️ On a healthy multi-org host it is **static, not climbing**: narrowing makes the per-org prefixes disjoint, so the exemption is never reached. It climbs only when narrowing is OFF (`OVERLAY_V6_DEFEND_NARROW=0`) — then exactly one spare per wave |
+| `waves [tick · pulled · event]` | every guard pass, attributed to its arm (#1282) | the rate is tick-driven and the same in a storm and at rest; a war lives in evictions **per wave**, not in waves |
+| `revalidations` | a network change forced a rekey poke — every peer re-keyed, a healthy direct carrier possibly demoted | the cost of route churn, whatever causes it; ~100/min was the #1237 signature, but it is not by itself a sibling war (a quiet neo16 on 2026-10-29 read `revalidations` flat at 384 across a 5½-minute window with `evicted=0` and `waves` +22 — the counter moves with network churn, not with waves) |
+| `yielded` | a prefix hit the strike cap and the guard stopped re-asserting it | the brake (#1328); `evicted` goes flat while it holds |
+
+⚠️ **Diff two readings ≥ 30 s apart, and check for a DECREASE first.** The
+counters reset at process start, so a reading that went down means the daemon
+restarted and the diff is void — computing it anyway yields a confident negative
+rate (CORPLAP-1, 2026-09-03: `waves 112 → 56`). The healthy multi-org signature
+is the **pair**: `Δevicted = 0` *and* `spared` static.
+
+**The stress cells** (FR-61's matrix, `roomler-ai-deploy` `vmtest/`, lane
+`win11`, because the defence is Windows-only and an Ubuntu cell would pass
+vacuously). Each enrolls a throwaway Win11 guest into **two** orgs (the second
+by a standard single-use token — an ephemeral enrollment is refused once a
+config exists — with `roomlerd org overlay <label> tun` before the daemon's ONE
+clean start) and reads the counters over a 120 s window:
+
+| Cell | Knobs | Establishes | Measured 2026-09-04 (Δ over the window) |
+|---|---|---|---|
+| `multiorg` | defaults | the healthy pair — no eviction, no spare, two adapters with disjoint `/118`s and **no `/96` row** | `evicted +0 · spared +0 · waves +80` |
+| `multiorg-narrow` | `OVERLAY_V6_DEFEND_NARROW=0` | the exemption is load-bearing: two `::/96` rows, one per adapter, both surviving — one spare per wave | `evicted +0 · spared +80 · waves +80` |
+| `multiorg-war` | `…NARROW=0` + `OVERLAY_SIBLING_EXEMPT=0` | the negative control: the pre-#1246 war reproduces — the two adapters delete each other's `/96` every wave, so one row survives | `evicted +67 · spared +0 · waves +80` |
+
+🔑 The negative control is a **PASS when the eviction counter climbs**, never an
+expected failure — a cell whose control does not reproduce the war is not
+measuring anything. It is also what caught the first `multiorg` PASS being
+vacuous (one adapter: `enroll` writes every secondary with `overlay_mode: Off`,
+and the driver had not switched it on). Both controls are separate guests, not
+in-guest restarts: a running service's environment cannot change, and restarting
+an ephemeral daemon unenrolls it.
+
+**The overlap WARN** (FR-64 C2, implemented by FR-68 C2(b)): `defended_ula_prefix`
+derives each adapter's defended v6 prefix FROM its v4 block, so nested blocks —
+a legacy `/10` primary beside a carved `/22` — give nested prefixes and the war
+can silently re-open. `own_adapters::register` WARNs with both blocks and the
+sibling's name. It is a detector, not a fix: the structural answer (refuse to
+carve a block inside a live one) is FR-47's reconciler. The condition is
+unreachable on today's fleet (every org is carved, and the registry hands out
+disjoint blocks), so it is locked by tests rather than a field read: the
+decision (`overlapping_sibling`) and the emitted line, captured through a
+thread-scoped subscriber (`a_nested_legacy_and_carved_pair_emits_the_overlap_warn`).
+
+Kill switches, env-only (not config-bridged): `OVERLAY_SIBLING_EXEMPT=0`
+(sibling rows are evicted like any foreign row), `OVERLAY_V6_DEFEND_NARROW=0`
+(each adapter asserts the whole `/96`). Both default ON.
+
 ---
 
 ## 4b. Cross-org egress source normalization — the mux NAT (rc.328) — deleted in W7c
@@ -582,6 +724,10 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
 | Redis down | Presence sweeper aborts rather than mass-emitting from a partial view; per-pod fan-out degrades to pod-local; the UI's slow poll is the belt | P4 |
 | Agent crash mid-renumber | Node rows are written before the network row, so the worst case is nodes already on new addresses with the network still describing the old range — re-running the renumber is idempotent from there | P2b |
 | Renumber loses the block-allocation race | The old block is already quarantined and the network keeps its old CIDR — safe, and the retry allocates above | P2b |
+| Another tenant's carve wins the slot a GROW was about to claim | The write collides on `slot`; the re-read is scoped to the grow's position, finds nothing, and the retry lands above the winner — the joiner gets an address. Before: the re-read returned block 0, the grow was a silent no-op and the joiner was refused `AddressSpaceExhausted` | FR-68 AC3 |
+| Two joiners trip the same grow at once | The loser's insert collides on the `(network_id, seq)` assigned-unique guard and it is handed the winner's row — one block per position | FR-68 |
+| Renumber requested against a grown network | Refused 400 before any read or write, dry run included; the message names the blocks. A multi-block renumber is FR-47's reconciler | FR-68 AC4 |
+| Two of our adapters serve nested blocks (legacy `/10` + carved `/22`) | `own_adapters::register` WARNs with both blocks and the sibling's name; the prefixes stay nested (a detector, not a fix) — renumber one org | FR-68 C2(b) |
 | A device misses a renumber (offline) | It rejoins with a stale `self_ip`; peers already hold its new `/32`, so it is unreachable until it reconnects. Its old range is quarantined, so nothing else can claim it | P2b |
 | An agent below the version floor is force-migrated | Its boot reconciler purges its own on-link route ⇒ that host's mesh blackholes until it updates | P2b |
 | Two viewers, one host, mixed versions | An agent without `AgentCaps.input` keeps the P3 single-INPUT strip; only arbiter-capable agents go free-for-all | P6 |
@@ -597,7 +743,9 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
 - **Block space.** `/22` blocks give 4032 tenants × 1022 devices. A tenant that
   outgrows its block renumbers into a wider one (`prefix: 20` → 4094, `16` →
   65 534); the old block is quarantined, so growth costs address space rather
-  than risking a collision.
+  than risking a collision. Under `multi_block_enabled` (dark, §4.2) it instead
+  **grows** in place — a block appended, nothing renumbered — after which the
+  renumber route refuses it (FR-68 AC4).
 - **Sessions per host.** `rc_max_sessions` defaults to 2. P5 makes additional
   same-profile viewers nearly free (one capture + one encoder); different
   profiles still cost a pipeline each, bounded at 2.
@@ -608,9 +756,11 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
 |---|---|
 | Config v2 + enrollment dispatch | `agents/roomlerd/src/config.rs`, `enrollment.rs` units; the two-tenant integration test driving ONE agent lib into TWO TestApps |
 | Block grid + allocator | `crates/remote_control/src/models.rs` units (grid rendering, prefix→width, buddy-alignment property, in-block leases) |
-| Renumber planner + version floor | `crates/api/src/routes/overlay_block.rs` units (preservation, compaction ordering, determinism, capacity refusal, numeric rc compare, fail-closed unknowns) |
+| Renumber planner + version floor | `crates/modules/network/src/routes/overlay_block.rs` units (preservation, compaction ordering, determinism, capacity refusal, numeric rc compare, fail-closed unknowns) |
 | Renumber end-to-end | `crates/tests/src/overlay_tests.rs` — inert dry run, apply + invertibility + next lease, double renumber ⇒ quarantine trail, cross-tenant disjointness over mixed widths, floor refusal + force, permission gate, carve-new-networks-only |
 | IPAM ceiling (P2a) | `allocate_host_stops_at_the_block_ceiling` |
+| Growth + the allocator's races (FR-47 P5c · FR-68) | `crates/tests/src/overlay_tests.rs` — the one-way door (`turning_multi_block_off_after_a_grow_fails_the_boot_loudly`), a cross-tenant carve racing a grow (`a_cross_tenant_carve_racing_a_grow_is_retried_above_the_winner`), twin grows at one position, renumber refused on a grown network, the door flip installing the position guard; `overlay_growth_tests.rs` — a real join past the ceiling, and `agent-v0.4.42`'s decoder (verbatim) against the netmap it produces |
+| Sibling route defence (FR-68) | `crates/tunnel-core/src/overlay/tun.rs` `own_adapters::tests` — the overlap decision's vectors and the captured WARN line; the counters are read in the field (`roomler status`), and the `multiorg` / `multiorg-narrow` / `multiorg-war` vmtest cells |
 | Presence | sweeper claim/dedupe + payload `tenant_id` contract locks |
 | InputArbiter | pure state-machine units incl. `close_leaves_no_residue_for_the_next_session` |
 | Shared encoder | floor-merge, joiner-on-IDR, spill hysteresis |
@@ -674,7 +824,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
   netstack`. FR-49 had made netstack the default for `enroll --overlay`, which
   made this the common case, and #2493 measured it on 0.4.143: no listener on
   the port, no peers, no log line. Now `for_org` turns a netstack secondary on
-  when it has its own port and key (`crates/agent-core/src/config.rs:2193-2195`),
+  when it has its own port and key (`crates/agent-core/src/config.rs:2218-2220`),
   and `derived_netstack` sends it to its stack rather than to the per-org TUN
   that the device-wide `overlay_multi_org` would pick
   (`agents/roomlerd/src/overlay.rs:311`). A port that is unset is **picked**:

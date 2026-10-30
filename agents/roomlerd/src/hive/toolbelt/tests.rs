@@ -2687,6 +2687,15 @@ async fn vault_connect_serves_an_http_upstream_on_a_loopback_port() {
     assert!(ended.is_ok(), "the connection ended with the lease");
 }
 
+/// A port nothing listens on, held while what it returns lives: bound and
+/// never listening, so no test beside this one is given it meanwhile.
+#[cfg(feature = "vault")]
+fn closed_port() -> (u16, tokio::net::TcpSocket) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    (socket.local_addr().unwrap().port(), socket)
+}
+
 /// FR-90 P4-6-1b-2 — an endpoint `roomler_connect` opens through another
 /// device: its upstream connections dial the flow's end, never the
 /// upstream's own address, while TLS is verified against the upstream's host
@@ -2700,11 +2709,7 @@ async fn an_endpoint_through_a_flow_dials_its_end_and_a_call_cannot_say_where() 
     let token = made();
     let (ca, port, mut saw) = fake_http().await;
     // The upstream's own address answers nobody: only the flow's end does.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let (closed, _held) = closed_port();
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("run")).unwrap();
     let vault = Arc::new(FakeVault {
@@ -2774,6 +2779,86 @@ async fn an_endpoint_through_a_flow_dials_its_end_and_a_call_cannot_say_where() 
         .unwrap();
     assert_eq!(s.values("authorization"), [format!("Bearer {token}")]);
     assert_eq!(s.values("host"), [format!("localhost:{closed}")]);
+}
+
+/// FR-90 P8-2a-6 — where the run has a worker, an endpoint through another
+/// device is handed to it as a direct one is, and the worker dials the
+/// flow's end the daemon holds: the upstream's own address answers nobody,
+/// so only that end reaches it, with the secret's token and the host the
+/// call named.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn where_the_run_has_a_worker_an_endpoint_through_a_flow_is_served_there() {
+    use super::super::vault_connect::handed::kept_for;
+    use crate::vault_proxy::testing::{fake_http, made};
+    let token = made();
+    let (ca, port, mut saw) = fake_http().await;
+    let (closed, _held) = closed_port();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("run")).unwrap();
+    let vault = Arc::new(FakeVault {
+        values: [
+            ("git/bot#token".to_string(), token.as_bytes().to_vec()),
+            ("pki/git-ca".to_string(), ca.as_bytes().to_vec()),
+        ]
+        .into_iter()
+        .collect(),
+        ..FakeVault::default()
+    });
+    let target = super::super::vault_exec::ExecTarget {
+        account: None,
+        home: dir.path().to_path_buf(),
+        folder: dir.path().to_path_buf(),
+        session_dir: dir.path().join("run"),
+        owner: None,
+    };
+    let end = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let args = json!({
+        "handle": "git/bot",
+        "engine": "http",
+        "upstream": format!("https://localhost:{closed}"),
+        "auth": "bearer",
+        "ca": "pki/git-ca",
+        "ttl_s": 60,
+    });
+    let sid = ObjectId::new();
+    super::super::worker::run_in_process(sid, 5, Arc::new(|_| {}));
+    let answer = super::super::vault_connect::call_through(
+        vault,
+        sid,
+        5,
+        Some(&target),
+        &me(),
+        &args,
+        crate::vault_proxy::Dial::Through(end),
+    )
+    .await
+    .expect("an endpoint through a flow, from the run's worker");
+    assert_eq!(
+        kept_for(sid, 5),
+        1,
+        "one through a flow, handed to the worker"
+    );
+    let at = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    let mut h = tokio::net::TcpStream::connect(("127.0.0.1", at))
+        .await
+        .unwrap();
+    h.write_all(b"GET /api/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let response = http_response(&mut h).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "through the flow's end, from the worker: {response}"
+    );
+    let s = tokio::time::timeout(WAIT, saw.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.values("authorization"), [format!("Bearer {token}")]);
+    assert_eq!(s.values("host"), [format!("localhost:{closed}")]);
+    drop(h);
+    super::super::worker::drop_run(sid, 5);
 }
 
 /// FR-90 P4-6-1b-2 — which refusals of a path through another device the
@@ -2999,9 +3084,11 @@ async fn the_hub_is_reached_through_its_seam_which_says_who_it_admits() {
     .await
     .unwrap();
     assert_eq!(flow.end, std::net::SocketAddr::from(([127, 0, 0, 1], 4000)));
-    // The session's own account, exactly, for net_forward; this daemon for a
-    // connect's flow; each checked before the vault was asked.
+    // The session's own account, exactly, for net_forward; this daemon (at
+    // this session and fence, P8-2b-4) for a connect's flow; each checked
+    // before the vault was asked.
     let account = format!("{:?}", Admits::Account(me()));
+    let daemon = format!("{:?}", Admits::Daemon(session, fence));
     let said = egress.said();
     assert_eq!(said.len(), 4, "{said:?}");
     assert_eq!(said[0], format!("admits {account}"), "{said:?}");
@@ -3009,9 +3096,9 @@ async fn the_hub_is_reached_through_its_seam_which_says_who_it_admits() {
         said[1].starts_with("open Static") && said[1].ends_with(&account),
         "{said:?}"
     );
-    assert_eq!(said[2], "admits Daemon", "{said:?}");
+    assert_eq!(said[2], format!("admits {daemon}"), "{said:?}");
     assert!(
-        said[3].starts_with("open Static") && said[3].ends_with("Daemon"),
+        said[3].starts_with("open Static") && said[3].ends_with(&daemon),
         "{said:?}"
     );
     assert_eq!(vault.nets.lock().unwrap().len(), 2, "one grant a flow");
@@ -3060,7 +3147,10 @@ async fn the_hub_is_reached_through_its_seam_which_says_who_it_admits() {
     );
     assert_eq!(
         refusing.said(),
-        [format!("admits {account}"), "admits Daemon".to_string()],
+        [
+            format!("admits {account}"),
+            format!("admits {:?}", Admits::Daemon(session, fence))
+        ],
         "only the admits were asked: no flow opened"
     );
 }
@@ -4980,6 +5070,270 @@ async fn the_relay_pipes_both_ways_and_ends_with_the_harness() {
     assert!(gone.is_err());
 }
 
+/// A fake worker the test fully controls — one accepted connection, read and
+/// written as raw lines — so a relay test can assert exactly what crossed
+/// without the real toolbelt's own dispatch (its own tests already cover
+/// that) in the way.
+struct FakeWorker {
+    lines: LineReader<BufReader<Box<dyn AsyncRead + Unpin + Send>>>,
+    wr: Box<dyn AsyncWrite + Unpin + Send>,
+}
+
+#[cfg(unix)]
+type RawListener = UnixListener;
+#[cfg(windows)]
+type RawListener = tokio::net::windows::named_pipe::NamedPipeServer;
+
+/// Binds `addr` right now, synchronously — before the relay under test gets
+/// a chance to dial it — so [`accept`]ing later never races a connect that
+/// arrived before anything was listening.
+#[cfg(unix)]
+fn bind(addr: &Path) -> RawListener {
+    let _ = std::fs::remove_file(addr);
+    UnixListener::bind(addr).unwrap()
+}
+
+#[cfg(windows)]
+fn bind(addr: &str) -> RawListener {
+    tokio::net::windows::named_pipe::ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(addr)
+        .unwrap()
+}
+
+#[cfg(unix)]
+async fn accept(listener: RawListener) -> FakeWorker {
+    let (stream, _) = listener.accept().await.unwrap();
+    let (rd, wr) = stream.into_split();
+    let rd: Box<dyn AsyncRead + Unpin + Send> = Box::new(rd);
+    FakeWorker {
+        lines: LineReader::new(BufReader::new(rd), MAX_MESSAGE),
+        wr: Box::new(wr),
+    }
+}
+
+#[cfg(windows)]
+async fn accept(server: RawListener) -> FakeWorker {
+    server.connect().await.unwrap();
+    let (rd, wr) = tokio::io::split(server);
+    let rd: Box<dyn AsyncRead + Unpin + Send> = Box::new(rd);
+    FakeWorker {
+        lines: LineReader::new(BufReader::new(rd), MAX_MESSAGE),
+        wr: Box::new(wr),
+    }
+}
+
+impl FakeWorker {
+    async fn recv(&mut self) -> Value {
+        let line = tokio::time::timeout(WAIT, self.lines.next_line())
+            .await
+            .expect("a line in time")
+            .unwrap()
+            .expect("the relay's connection, not closed");
+        serde_json::from_slice(&line).unwrap()
+    }
+
+    async fn send(&mut self, v: &Value) {
+        self.wr.write_all(v.to_string().as_bytes()).await.unwrap();
+        self.wr.write_all(b"\n").await.unwrap();
+    }
+}
+
+#[cfg(unix)]
+fn relay_test_address(dir: &tempfile::TempDir) -> PathBuf {
+    dir.path().join(SOCKET)
+}
+
+#[cfg(windows)]
+fn relay_test_address(_dir: &tempfile::TempDir) -> String {
+    format!(
+        r"\\.\pipe\roomler-relay-test-{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    )
+}
+
+/// P8-0's point 1 — a worker's restart: the connection it held drops, a call
+/// already in flight is failed at once (never left hanging), the relay
+/// replays the run's own handshake onto the worker that replaces it WITHOUT
+/// forwarding that replay's own `initialize` answer, and resumes serving new
+/// calls — all without Claude Code ever seeing this process exit.
+#[tokio::test]
+async fn a_dropped_worker_is_recovered_without_the_harness_seeing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = relay_test_address(&dir);
+    let bound = bind(&addr);
+    let (mut harness_in, relay_in) = tokio::io::duplex(1024);
+    let (relay_out, harness_out) = tokio::io::duplex(1024);
+    let addr_for_relay = addr.clone();
+    let relay =
+        tokio::spawn(
+            async move { relay_io(Path::new(&addr_for_relay), relay_in, relay_out).await },
+        );
+    let mut first = accept(bound).await;
+    let mut out = BufReader::new(harness_out).lines();
+
+    // The run's own handshake, exactly once, as Claude Code sends it.
+    harness_in
+        .write_all(br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#)
+        .await
+        .unwrap();
+    harness_in.write_all(b"\n").await.unwrap();
+    assert_eq!(first.recv().await["method"], "initialize");
+    first
+        .send(&json!({"jsonrpc":"2.0","id":0,"result":"first"}))
+        .await;
+    let init_reply = tokio::time::timeout(WAIT, out.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&init_reply).unwrap()["result"],
+        "first"
+    );
+    harness_in
+        .write_all(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+        .await
+        .unwrap();
+    harness_in.write_all(b"\n").await.unwrap();
+    assert_eq!(first.recv().await["method"], "notifications/initialized");
+
+    // A call that will still be waiting when the worker dies under it.
+    harness_in
+        .write_all(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .await
+        .unwrap();
+    harness_in.write_all(b"\n").await.unwrap();
+    assert_eq!(first.recv().await["method"], "ping");
+    drop(first); // the worker dies: its connection goes with it.
+
+    let failed = tokio::time::timeout(WAIT, out.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let failed: Value = serde_json::from_str(&failed).unwrap();
+    assert_eq!(failed["id"], 1);
+    assert_eq!(failed["error"]["code"], RESTARTED);
+    assert!(
+        failed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("call again")
+    );
+
+    // A fresh worker at the same address, same as the daemon handing the
+    // same listener to the worker that replaces the dead one.
+    let mut second = accept(bind(&addr)).await;
+    assert_eq!(second.recv().await["id"], 0, "the replayed initialize");
+    // A distinctive answer the relay must NEVER forward: the harness
+    // already has its first run's reply (asserted above as "first").
+    second
+        .send(&json!({"jsonrpc":"2.0","id":0,"result":"replayed, never seen"}))
+        .await;
+    assert_eq!(
+        second.recv().await["method"],
+        "notifications/initialized",
+        "replayed before anything new"
+    );
+
+    harness_in
+        .write_all(br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#)
+        .await
+        .unwrap();
+    harness_in.write_all(b"\n").await.unwrap();
+    assert_eq!(second.recv().await["id"], 2);
+    second
+        .send(&json!({"jsonrpc":"2.0","id":2,"result":"pong"}))
+        .await;
+
+    let answered = tokio::time::timeout(WAIT, out.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let answered: Value = serde_json::from_str(&answered).unwrap();
+    assert_eq!(answered["id"], 2);
+    assert_eq!(
+        answered["result"], "pong",
+        "the replayed initialize's answer must never reach the harness"
+    );
+
+    drop(harness_in);
+    drop(second);
+    tokio::time::timeout(WAIT, relay)
+        .await
+        .expect("the relay ends with the harness")
+        .unwrap()
+        .unwrap();
+}
+
+/// P8-0's point 1 — a line that arrives while the relay is reconnecting, and
+/// the worker never comes back, waits [`RECONNECT_GIVE_UP`] and no longer:
+/// it is failed the same way an already-in-flight call is, rather than left
+/// to hang forever.
+#[tokio::test(start_paused = true)]
+async fn a_request_that_outwaits_the_reconnect_window_is_failed_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = relay_test_address(&dir);
+    let bound = bind(&addr);
+    let (mut harness_in, relay_in) = tokio::io::duplex(1024);
+    let (relay_out, harness_out) = tokio::io::duplex(1024);
+    let addr_for_relay = addr.clone();
+    let relay =
+        tokio::spawn(
+            async move { relay_io(Path::new(&addr_for_relay), relay_in, relay_out).await },
+        );
+    let mut first = accept(bound).await;
+    let mut out = BufReader::new(harness_out).lines();
+
+    harness_in
+        .write_all(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .await
+        .unwrap();
+    harness_in.write_all(b"\n").await.unwrap();
+    assert_eq!(first.recv().await["id"], 1);
+    drop(first);
+    // Nothing ever replaces it: every dial from here on fails.
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&addr);
+
+    let failed_inflight = tokio::time::timeout(WAIT, out.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&failed_inflight).unwrap()["id"],
+        1
+    );
+
+    // Arrives while reconnecting. Not yet failed well short of the window.
+    harness_in
+        .write_all(br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#)
+        .await
+        .unwrap();
+    harness_in.write_all(b"\n").await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(8), out.next_line())
+            .await
+            .is_err(),
+        "id 2 must not be failed before the reconnect window closes"
+    );
+    // The window closes within the next couple of seconds.
+    let failed_waiter = tokio::time::timeout(Duration::from_secs(5), out.next_line())
+        .await
+        .expect("id 2 failed once RECONNECT_GIVE_UP elapsed")
+        .unwrap()
+        .unwrap();
+    let failed_waiter: Value = serde_json::from_str(&failed_waiter).unwrap();
+    assert_eq!(failed_waiter["id"], 2);
+    assert_eq!(failed_waiter["error"]["code"], RESTARTED);
+
+    drop(harness_in);
+    let _ = tokio::time::timeout(WAIT, relay).await;
+}
+
 /// FR-90 P3-4e-2 — what the model is told when a lease needed a person: a
 /// card nobody answered in time names its approval and says to ask again
 /// once someone can answer it; a `denied` says a driver may have said no.
@@ -6009,4 +6363,94 @@ async fn where_the_runs_worker_is_given_up_on_its_endpoint_is_refused() {
     assert!(why.contains("worker"), "{why}");
     assert_eq!(kept_for(sid, 5), 0, "nothing handed");
     super::super::worker::drop_run(sid, 5);
+}
+
+/// FR-90 P8-2c-2 — `Pending`'s own `Slot` bookkeeping in `remote` mode
+/// (the daemon's side of a handed-over toolbelt), without a real worker or
+/// channel: `note_remote_open`/`answer`/`withdraw`/`withdraw_all`'s return
+/// values and `ids()`, which must stay correct even though the real wait
+/// lives elsewhere. The forward itself (a `Link::call` to whatever worker
+/// `worker::link_of` finds, if any) is exercised by `handed::tests`
+/// instead, where a real `Serving` answers it.
+#[cfg(all(unix, worker_calls))]
+mod remote_pending {
+    use super::*;
+
+    fn remote() -> Pending {
+        Pending::remote(ObjectId::new(), 1, 42)
+    }
+
+    #[tokio::test]
+    async fn note_remote_open_respects_max_pending() {
+        let p = remote();
+        for i in 0..MAX_PENDING {
+            assert!(p.note_remote_open(&format!("a{i}")), "under the bound");
+        }
+        assert!(
+            !p.note_remote_open("one_too_many"),
+            "MAX_PENDING already open"
+        );
+        assert_eq!(p.ids().len(), MAX_PENDING);
+    }
+
+    #[tokio::test]
+    async fn ids_reflects_remote_opens_sorted() {
+        let p = remote();
+        p.note_remote_open("b");
+        p.note_remote_open("a");
+        assert_eq!(p.ids(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn answer_removes_a_remote_slot_and_reports_it_was_open() {
+        let p = remote();
+        p.note_remote_open("r1");
+        let answer = Answer {
+            decision: Decision::Allow,
+            by: Author {
+                user_id: ObjectId::new(),
+                name: "x".into(),
+            },
+        };
+        assert!(p.answer("r1", answer.clone()), "it was open");
+        assert!(p.ids().is_empty());
+        // A second answer of the same (now-closed) id reports it was not.
+        assert!(!p.answer("r1", answer));
+    }
+
+    #[tokio::test]
+    async fn answer_of_an_id_never_opened_reports_false() {
+        let p = remote();
+        let answer = Answer {
+            decision: Decision::Allow,
+            by: Author {
+                user_id: ObjectId::new(),
+                name: "x".into(),
+            },
+        };
+        assert!(!p.answer("never_opened", answer));
+    }
+
+    #[tokio::test]
+    async fn withdraw_removes_one_remote_slot_and_leaves_the_rest() {
+        let p = remote();
+        p.note_remote_open("w1");
+        p.note_remote_open("w2");
+        p.withdraw("w1");
+        assert_eq!(p.ids(), vec!["w2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn withdraw_all_clears_every_remote_slot() {
+        let p = remote();
+        p.note_remote_open("x1");
+        p.note_remote_open("x2");
+        p.withdraw_all();
+        assert!(p.ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn withdraw_all_on_an_already_empty_pending_does_not_panic() {
+        remote().withdraw_all();
+    }
 }

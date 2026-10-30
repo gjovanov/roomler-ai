@@ -5,7 +5,8 @@ description: >-
   reuses that build instead of recompiling our crates. Any other case changes
   nothing. seed-cache-restore runs this right after unpacking a seed. Kill
   switch: SEED_REUSE_SAME_TREE=off in the environment (release-agent.yml maps
-  the repository variable of that name). FR-6 wave 29.
+  the repository variable of that name). FR-6 wave 29; the build's OUT_DIR
+  files are marked unchanged too since wave 31.
 runs:
   using: composite
   steps:
@@ -55,9 +56,31 @@ runs:
         # mtime). -c: never create a path; -h: a link's own time. A partial
         # failure is still correct: every file here is identical to the one
         # the seed was built from, so any subset may be marked old.
+        #
+        # The build's own OUT_DIR files too (FR-6 wave 31). A unit can list as
+        # inputs files that its OWN compile wrote into an OUT_DIR after that
+        # compile started: tauri's generate_context! writes
+        # out/tauri-codegen-assets/<hash> while roomler-desktop compiles, and
+        # only when the file is missing. The first build of a new version (a
+        # release's rehearsal) therefore leaves an input newer than the build,
+        # and every tag run recompiled roomler-desktop once: ~2.5 min on macOS,
+        # and on Windows whenever the write and the compile's start fell in
+        # different seconds (the seed's tar keeps whole seconds). On a
+        # same-tree reuse these files are this tree's outputs exactly as the
+        # sources are its inputs. A build script that does rerun, because an
+        # env var it watches changed, rewrites its OUT_DIR, which is new again.
         old=200001010000
+        outdirs_old() {
+          local b
+          for b in target/*/build target/*/*/build; do
+            [ -d "$b" ] || continue
+            find "$b" -mindepth 2 \( -path "$b/*/out" -o -path "$b/*/out/*" \) \
+              -exec touch -c -h -t "$old" {} + || return 1
+          done
+        }
         if git ls-files -z | xargs -0 touch -c -h -t "$old" \
-           && git ls-tree -r -d -z --name-only HEAD | xargs -0 touch -c -h -t "$old"; then
+           && git ls-tree -r -d -z --name-only HEAD | xargs -0 touch -c -h -t "$old" \
+           && outdirs_old; then
           echo "ROOMLER_SEED_REUSED_TREE=${tree}" >> "$GITHUB_ENV"
           echo "::notice title=Reusing a same-tree build::the seed was built from tree ${tree:0:12} by this job; sources are marked unchanged, so cargo reuses that build"
         else

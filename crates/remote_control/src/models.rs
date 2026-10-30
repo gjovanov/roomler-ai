@@ -259,6 +259,13 @@ pub struct AgentCaps {
     ///   to photon. Only a build with the synthetic frame source, running
     ///   it, with `ROOMLERD_BENCH=1`, ever advertises it; a viewer sends no
     ///   probe to an agent without it.
+    /// * `color-described` — FR-130: every encoder of this agent that can
+    ///   carry a colour description writes the one it converted with (the
+    ///   BT.601 matrix at limited range, in the SPS VUI, the AV1 sequence
+    ///   header or the VP9 header). Absent on older agents and with the
+    ///   agent's `color_description` switch off: their streams are
+    ///   undescribed, and a decoder guessing BT.709 for HD shifts every
+    ///   saturated colour.
     ///
     /// Empty / unset (older agents) deserialises to `[]` and the browser
     /// keeps the legacy unframed format. The capability is what makes the
@@ -1275,6 +1282,15 @@ pub enum RpcCap {
     /// (`ROOMLERD_LOCAL_TURN`, default on); a device with no overlay yet
     /// still advertises it and reports `None`.
     LocalRelay,
+    /// FR-128 — this device decides `rc_overlay = auto` for each session at
+    /// the offer (`Request.rc_overlay_auto`): the overlay when its mesh link
+    /// to the viewer's own device is direct, and not otherwise. The hub sends
+    /// `auto`, and hands out the viewer's relay under it, only to a
+    /// connection advertising this; to any other the policy reads as `off`,
+    /// which is D1's answer for an older agent. Advertised while the decision
+    /// is switched on (`ROOMLERD_RC_OVERLAY_AUTO`, default on). Not a prefix
+    /// of another verb, nor another of it.
+    RcOverlayAuto,
 }
 
 impl RpcCap {
@@ -1328,11 +1344,12 @@ impl RpcCap {
             Self::KnowhowTools => "knowhow-tools",
             Self::KnowhowProbe => "knowhow-probe",
             Self::LocalRelay => "local-relay",
+            Self::RcOverlayAuto => "rc-overlay-auto",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 42] = [
+    pub const ALL: [RpcCap; 43] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1375,6 +1392,7 @@ impl RpcCap {
         Self::KnowhowTools,
         Self::KnowhowProbe,
         Self::LocalRelay,
+        Self::RcOverlayAuto,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -1599,6 +1617,17 @@ pub struct AccessPolicy {
     /// carries over DERP/TCP reads as a direct host pair.
     #[serde(default)]
     pub rc_overlay: Option<bool>,
+    /// FR-128 — `auto`: each session decides for itself, at the agent's
+    /// offer. It takes the overlay when the mesh link to the viewer's own
+    /// device is direct, and not otherwise. `rc_overlay: true` wins over
+    /// it ([`Self::rc_overlay_mode`]). `None`/`false` (the default, and every
+    /// row older than the field) is not `auto`.
+    ///
+    /// A separate field rather than a third value of `rc_overlay`, so a pod
+    /// or a page older than it reads an `auto` row as `off`, never as a row
+    /// it cannot parse.
+    #[serde(default)]
+    pub rc_overlay_auto: Option<bool>,
     /// FR-99 P3b — what this device's sessions ask of it when the last one
     /// ends: `auto` (lock again if the screen was locked, or nobody was at it,
     /// when the session started) or `always`. Set by a `MANAGE_AGENTS` admin.
@@ -1624,10 +1653,66 @@ pub fn stricter_idle_limit(org_secs: Option<u32>, device_secs: Option<u32>) -> O
     }
 }
 
+/// FR-128 — how a device's remote-desktop sessions may use the overlay: its
+/// [`AccessPolicy::rc_overlay_mode`], carried from the authz gate to the hub
+/// that builds the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RcOverlayMode {
+    /// #1882's default: the agent keeps every overlay address out of the
+    /// session's ICE.
+    #[default]
+    Off,
+    /// The agent decides at its offer, from its mesh carrier to the viewer's
+    /// own device. `far_turn`: did both devices' last netcheck reach the far
+    /// TURN over UDP? `None` = not measured, which the agent reads as "it
+    /// works".
+    Auto { far_turn: Option<bool> },
+    /// Whichever pair ICE finds best, the overlay included.
+    On,
+}
+
+impl RcOverlayMode {
+    /// The `rc_overlay` bool of `rc:request`: only `on` says yes. `auto`
+    /// rides beside a `false`, so an agent that knows only the bool reads
+    /// `off` (FR-128 D1).
+    pub fn is_on(self) -> bool {
+        self == Self::On
+    }
+
+    /// May the hub hand the viewer's loopback relay to this session (FR-121)?
+    /// Under `auto` as under `on`: the relay is an overlay path, and under
+    /// `auto` the agent may yet decide to take it.
+    pub fn hands_out_relay(self) -> bool {
+        self != Self::Off
+    }
+
+    /// For a log line.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto { .. } => "auto",
+            Self::On => "on",
+        }
+    }
+}
+
 impl AccessPolicy {
     /// #1882 — [`Self::rc_overlay`] resolved: off unless explicitly on.
     pub fn rc_overlay_allowed(&self) -> bool {
         self.rc_overlay.unwrap_or(false)
+    }
+
+    /// FR-128 — [`Self::rc_overlay`] and [`Self::rc_overlay_auto`] resolved:
+    /// `on` wins, then `auto`, else `off`. The far-TURN hint is the authz
+    /// gate's to fill in; a policy row has none.
+    pub fn rc_overlay_mode(&self) -> RcOverlayMode {
+        if self.rc_overlay_allowed() {
+            RcOverlayMode::On
+        } else if self.rc_overlay_auto.unwrap_or(false) {
+            RcOverlayMode::Auto { far_turn: None }
+        } else {
+            RcOverlayMode::Off
+        }
     }
 
     /// FR-101 P4b-2 — [`Self::auto_terminate_idle_minutes`] as seconds. `0`
@@ -2814,6 +2899,18 @@ pub struct DesiredConfig {
     /// per process, which the device reports as `needs_restart`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fps_deny: Option<String>,
+    /// FR-130 P1b — the colour-description switch (`color_description`). A
+    /// tribool on the device, so a push carries a word: `on`, `off`, or
+    /// blank, which CLEARS the device's key back to its built-in default (on),
+    /// as a blank `encoder_cells_deny` clears that list. Pushable with
+    /// `MANAGE_AGENTS` alone, like the two denylists: it is not a gate and
+    /// grants nothing either way. `off` only removes metadata from the
+    /// stream, and `on` writes what the built-in default writes. The server
+    /// stores the word [`parse_pushed_tribool`] reads, spelled as
+    /// [`pushed_tribool_wire`] spells it; the daemon reads the key once per
+    /// process, which the device reports as `needs_restart`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_description: Option<String>,
     /// Bumped on every write. The agent reports the revision it has applied,
     /// so "asked for" and "actually running" can be told apart in the UI —
     /// without it, a device that refused the config and one that never heard
@@ -2837,6 +2934,7 @@ impl DesiredConfig {
             && self.ssh_port.is_none()
             && self.encoder_cells_deny.is_none()
             && self.fps_deny.is_none()
+            && self.color_description.is_none()
     }
 
     /// Whether this request touches the Fleet-RPC grant. Drives the
@@ -2882,6 +2980,9 @@ impl DesiredConfig {
             encoder_cells_deny: _,
             // FR-119 P2b — the same for the frame-rate denylist: it only removes.
             fps_deny: _,
+            // FR-130 P1b — neither: the colour description grants nothing,
+            // whichever way it is pushed.
+            color_description: _,
             revision: _,
             updated_by: _,
             updated_at: _,
@@ -2890,6 +2991,40 @@ impl DesiredConfig {
             && *ssh_authorized_keys == other.ssh_authorized_keys
             && *ssh_account_mode == other.ssh_account_mode
             && *ssh_port == other.ssh_port
+    }
+}
+
+/// FR-130 P1b — the ONE reading of a tribool pushed through [`DesiredConfig`]
+/// (`color_description`). The server refuses a word this cannot read, and the
+/// device applies a push through it, so the two cannot disagree about a word.
+///
+/// Blank CLEARS the device's key, back to its built-in default. `on` and
+/// `off`, or the words `roomler config set` takes for them (`true`/`false`,
+/// `1`/`0`, `yes`/`no`, in any case), set it. Anything else is `Err`: a device
+/// must never guess which way a word it cannot read was meant.
+pub fn parse_pushed_tribool(v: &str) -> Result<Option<bool>, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "on" | "true" | "1" | "yes" => Ok(Some(true)),
+        "off" | "false" | "0" | "no" => Ok(Some(false)),
+        other => {
+            // Echoed into a 400 and a device's log: a short prefix is enough
+            // to recognise, and a pushed megabyte must not become a log line.
+            let shown: String = other.chars().take(32).collect();
+            Err(format!(
+                "{shown:?} is not on, off, or blank (the device's built-in default)"
+            ))
+        }
+    }
+}
+
+/// The spelling the server stores and pushes for what [`parse_pushed_tribool`]
+/// read: `on`, `off`, or blank (clear the key).
+pub fn pushed_tribool_wire(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "",
     }
 }
 
@@ -7108,6 +7243,80 @@ mod tests {
         assert!(!off.rc_overlay_allowed());
     }
 
+    /// FR-128 — the tri-state from the two fields: every row older than
+    /// `rc_overlay_auto` is `off` (or `on`, as before), `auto` survives the
+    /// round trip, and `on` wins over `auto` on a row that says both.
+    #[test]
+    fn rc_overlay_mode_reads_on_then_auto_then_off() {
+        let old: AccessPolicy = bson::from_document(bson::doc! {
+            "consent_mode": "auto",
+            "allowed_role_ids": [],
+            "allowed_user_ids": [],
+            "rc_overlay": null,
+        })
+        .expect("a pre-FR-128 row deserialises");
+        assert_eq!(old.rc_overlay_auto, None);
+        assert_eq!(old.rc_overlay_mode(), RcOverlayMode::Off);
+        assert_eq!(
+            AccessPolicy::default().rc_overlay_mode(),
+            RcOverlayMode::Off
+        );
+
+        let auto = AccessPolicy {
+            rc_overlay: Some(false),
+            rc_overlay_auto: Some(true),
+            ..Default::default()
+        };
+        let back: AccessPolicy = bson::from_document(bson::to_document(&auto).expect("serialises"))
+            .expect("round-trips");
+        assert_eq!(
+            back.rc_overlay_mode(),
+            RcOverlayMode::Auto { far_turn: None }
+        );
+        assert!(
+            !back.rc_overlay_allowed(),
+            "auto is not on to a reader of the bool"
+        );
+
+        let both = AccessPolicy {
+            rc_overlay: Some(true),
+            rc_overlay_auto: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(both.rc_overlay_mode(), RcOverlayMode::On);
+
+        let auto_off = AccessPolicy {
+            rc_overlay_auto: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(auto_off.rc_overlay_mode(), RcOverlayMode::Off);
+    }
+
+    /// FR-128 — what each mode tells the agent and the relay: only `on` sets
+    /// the `rc:request` bool, and `auto` hands out the viewer's relay as `on`
+    /// does.
+    #[test]
+    fn rc_overlay_mode_on_is_the_only_bool_and_auto_hands_out_the_relay() {
+        let auto = RcOverlayMode::Auto {
+            far_turn: Some(false),
+        };
+        assert!(RcOverlayMode::On.is_on());
+        assert!(!auto.is_on());
+        assert!(!RcOverlayMode::Off.is_on());
+        assert!(RcOverlayMode::On.hands_out_relay());
+        assert!(auto.hands_out_relay());
+        assert!(!RcOverlayMode::Off.hands_out_relay());
+        assert_eq!(RcOverlayMode::default(), RcOverlayMode::Off);
+        assert_eq!(
+            [
+                RcOverlayMode::Off.wire(),
+                auto.wire(),
+                RcOverlayMode::On.wire()
+            ],
+            ["off", "auto", "on"]
+        );
+    }
+
     /// FR-99 P3b — every row written before `lock_on_end` asks nothing, a
     /// stored `null` asks nothing (the `Option` sees it before `LockOnEnd`'s
     /// unknown-reads-as-`always` rule can), `never` asks nothing, and an ask
@@ -7325,6 +7534,7 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7370,6 +7580,7 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7399,6 +7610,7 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7448,6 +7660,7 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7490,6 +7703,7 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7648,6 +7862,7 @@ mod tests {
         assert_eq!(RpcCap::KnowhowTools.wire(), "knowhow-tools");
         assert_eq!(RpcCap::KnowhowProbe.wire(), "knowhow-probe");
         assert_eq!(RpcCap::LocalRelay.wire(), "local-relay");
+        assert_eq!(RpcCap::RcOverlayAuto.wire(), "rc-overlay-auto");
     }
 
     /// FR-90 P4-4-1 — `knowhow-tools` and `knowhow-scan` are two verbs: a
@@ -9292,6 +9507,7 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
             revision: 1,
             updated_by: Some(ObjectId::new()),
             updated_at: Some(DateTime::now()),
@@ -9422,6 +9638,47 @@ mod tests {
         }))
         .expect("unknown keys are ignored, not fatal");
         assert_eq!(pushed.ssh_enabled, Some(true));
+    }
+
+    /// FR-130 P1b — a pushed tribool has one reading, shared by the server
+    /// (which refuses what it cannot read) and the device (which applies it).
+    /// Blank is a request to CLEAR, never "not managed": that is an absent
+    /// key. A word it cannot read is refused rather than guessed.
+    #[test]
+    fn a_pushed_tribool_takes_the_config_set_words_and_blank_clears() {
+        for on in ["on", "ON", " true ", "1", "Yes"] {
+            assert_eq!(parse_pushed_tribool(on), Ok(Some(true)), "{on:?}");
+        }
+        for off in ["off", "Off", "false", "0", " no "] {
+            assert_eq!(parse_pushed_tribool(off), Ok(Some(false)), "{off:?}");
+        }
+        for clear in ["", "   "] {
+            assert_eq!(parse_pushed_tribool(clear), Ok(None), "{clear:?}");
+        }
+        for unread in ["maybe", "default", "2", "o n", "onn"] {
+            assert!(parse_pushed_tribool(unread).is_err(), "{unread:?}");
+        }
+        let long = "x".repeat(10_000);
+        let err = parse_pushed_tribool(&long).unwrap_err();
+        assert!(err.len() < 120, "the echo is capped: {} bytes", err.len());
+
+        // What the server stores reads back as what it read.
+        for v in [None, Some(true), Some(false)] {
+            assert_eq!(parse_pushed_tribool(pushed_tribool_wire(v)), Ok(v));
+        }
+        // And it travels: a clear survives the round trip as a clear, and
+        // an absent key stays absent ("not managed").
+        let clear = DesiredConfig {
+            color_description: Some(pushed_tribool_wire(None).into()),
+            ..Default::default()
+        };
+        assert!(!clear.is_empty(), "a clear is a request");
+        let json = serde_json::to_string(&clear).unwrap();
+        assert!(json.contains(r#""color_description":"""#), "{json}");
+        let back: DesiredConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.color_description.as_deref(), Some(""));
+        let unmanaged = serde_json::to_string(&DesiredConfig::default()).unwrap();
+        assert!(!unmanaged.contains("color_description"), "{unmanaged}");
     }
 
     // ── #1630: an audit row must read back through the driver's own pair ───

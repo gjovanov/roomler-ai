@@ -7,7 +7,7 @@ billing (P1+P2), the concurrent-session cap (P3, counted cluster-wide by P3b sin
 2026-10-22 and on the regional PoPs' since 2026-10-23 (P4b-2). TURN has counted toward the
 allowance, and an over-allowance org's mesh has left TURN for the DERP floor (P4c), since
 2026-10-23, with the operator's own orgs exempt. Exit nodes are on every plan (P4d). Claims
-were checked against the code at `8ab970586`, and the relay allowance section at `d4eb310a9`
+were checked against the code at `09ed1474a`, and the relay allowance section at `f0f4a6df9`
 plus this change.
 
 The price list and the reasoning behind it are in [business-model.md](business-model.md) §4.
@@ -90,7 +90,7 @@ staged by the mode.
 | storage | upload (`crates/modules/chat/src/file.rs:312`) | 403; the check is `current + incoming`, so a file that exactly fills the quota fits |
 | meeting participants | `media:join` on the owner pod (`crates/modules/conference/src/ws_media.rs:286`) | `media:error`; a rejoining participant keeps their seat |
 | meeting length | the sweep (`crates/modules/conference/src/meeting_cap.rs:100`) | `room:call_ending_soon` at 55, `room:call_ended {reason: plan_limit}` at 60 |
-| concurrent sessions | the hub, after its coalesce (`crates/modules/fleet/src/hub.rs:1621`); with `rc.session_slots` on, a cluster-wide slot claimed on the pod that owns the device before the hub runs (`crates/modules/remote/src/slots.rs`) | `org_session_limit`, naming who holds the slot and where; an external session gets `session_limit` |
+| concurrent sessions | the hub, after its coalesce (`crates/modules/fleet/src/hub.rs:1702`); with `rc.session_slots` on, a cluster-wide slot claimed on the pod that owns the device before the hub runs (`crates/modules/remote/src/slots.rs`) | `org_session_limit`, naming who holds the slot and where; an external session gets `session_limit` |
 | relay past the month's allowance | the DERP forward path, on the API pods (`crates/modules/network/src/derp.rs:620`) and on every PoP (`crates/derp-relay/src/main.rs:148`) | **never refused**: bulk frames are held to the plan's rate (*The relay allowance* below) |
 | recordings, exit nodes, MagicDNS | `require_feature` at each route | 403 in feature wording ("not available on the Free plan"). Every plan has exit nodes (since P4d) and MagicDNS, so of these three only recordings is refused today |
 
@@ -216,7 +216,7 @@ org anything. `Core::plans_sold` (`crates/core/src/state.rs:131`) is true only w
 hosted `saas` module is compiled in and switched on (`crates/api/src/state.rs:323`); the
 published self-host image and the compose build both leave it out. With it false,
 `roomler_core::quota` refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and
-the session cap (`crates/modules/remote/src/controller.rs:745`) and the meeting sweep
+the session cap (`crates/modules/remote/src/controller.rs:799`) and the meeting sweep
 (`crates/modules/conference/src/meeting_cap.rs:104`) stand down.
 
 ⚠️ Until FR-115 found it, nothing exempted a self-hosted server: the device cap had always

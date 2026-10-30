@@ -31,6 +31,28 @@ const STAMP_PROBE_INITIATE_AFTER: Duration = Duration::from_millis(500);
 /// initiation is not a verdict.
 const STAMP_PROBE_DEADLINE: Duration = Duration::from_secs(15);
 
+/// #2952 — what ran [`OverlayRuntime::sweep_upgrade_probes`], logged as `via`
+/// on every promotion. A tick that happens to fall just after a latch looks
+/// like a latch promotion by its timing alone, so the field log could not
+/// otherwise tell the wake path from luck.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SweepCause {
+    /// The 5 s fallback tick, which sweeps whatever the latch did.
+    Tick,
+    /// A probe's handshake latched and woke the runtime
+    /// (`PeerStats::latch_wake`).
+    Latch,
+}
+
+impl SweepCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tick => "tick",
+            Self::Latch => "latch",
+        }
+    }
+}
+
 /// rc.131/132/143 — direct LAN carrier context: one UDP socket per LAN
 /// interface (each bound to that interface IP — rc.143), this node's LAN IPs
 /// across ALL interfaces (for the same-subnet test), and the `IP:port`
@@ -2078,6 +2100,7 @@ impl OverlayRuntime {
         tun: &Arc<dyn TunIo>,
         upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
         relay_bq: &mut RelayBuildQueue,
+        cause: SweepCause,
     ) {
         if upgrade_probes.is_empty() {
             return;
@@ -2123,6 +2146,7 @@ impl OverlayRuntime {
                         info!(
                             peer = %nid,
                             probe_ms = now.saturating_duration_since(p.since).as_millis() as u64,
+                            via = cause.as_str(),
                             "overlay relay: the peer answered over /derp — the pair moved off its live TURN carrier onto DERP (make-before-break: TURN carried it until now)"
                         );
                     }
@@ -2205,6 +2229,7 @@ impl OverlayRuntime {
                     info!(
                         peer = %nid, overlay_ip = %p.overlay_ip, tier = ?p.tier,
                         probe_ms = now.saturating_duration_since(p.since).as_millis() as u64,
+                        via = cause.as_str(),
                         "overlay: make-before-break — direct carrier promoted (relay held throughout; zero stall)"
                     );
                 } else {
