@@ -435,6 +435,9 @@ struct Spawned {
     token: Option<String>,
     /// P1a — owned by the task, so it ends exactly when the session does.
     toolbelt: Toolbelt,
+    /// P8-2c-3 — the same, for this run's own sidecar. `None` where the
+    /// device has no model credential configured.
+    sidecar: Option<super::sidecar::Sidecar>,
     /// P1d-2 — launched with `--resume`: the harness has its history.
     history: bool,
     /// P2b-3b — the session's checkpoints, taken while it is replicated.
@@ -590,10 +593,10 @@ pub struct Supervisor {
     approval_timing: toolbelt::Timing,
     /// The viewer peers this device serves (P0d-2).
     viewers: super::view::Viewers,
-    /// P0e — the model sidecar: its port once bound, the session tokens it
-    /// honours, the provider key the helper printed, and when the primary
-    /// connection was lost (the `offline_grace` clock).
-    sidecar_port: tokio::sync::OnceCell<u16>,
+    /// P0e — the model sidecar: the session tokens it honours (P8-2c-3:
+    /// each session has its own sidecar and port now, kept with the run
+    /// itself, not here), the provider key the helper printed, and when
+    /// the primary connection was lost (the `offline_grace` clock).
     tokens: super::sidecar::Tokens,
     model_key: tokio::sync::Mutex<Option<(String, Instant)>>,
     offline_since: Mutex<Option<Instant>>,
@@ -1625,7 +1628,6 @@ impl Supervisor {
             approvals: broadcast::channel(64).0,
             approval_timing: toolbelt::Timing::default(),
             viewers: Default::default(),
-            sidecar_port: tokio::sync::OnceCell::new(),
             tokens: Default::default(),
             model_key: tokio::sync::Mutex::new(None),
             offline_since: Mutex::new(None),
@@ -2162,10 +2164,20 @@ impl Supervisor {
         }
         // P0e — with a model credential configured, the harness reaches the
         // provider only through the loopback sidecar, with a session token;
-        // the key itself never enters the session.
+        // the key itself never enters the session. P8-2c-3 — this session's
+        // own sidecar: handed to its worker where one exists, served here
+        // otherwise.
         let sidecar = if self.cfg.api_key_helper.is_some() {
-            match self.sidecar_port().await {
-                Ok(port) => Some(port),
+            match super::sidecar::open(
+                self,
+                order.session_id,
+                order.fence,
+                self.upstream().to_string(),
+                self.model_workspace().map(str::to_string),
+            )
+            .await
+            {
+                Ok(s) => Some(s),
                 Err(e) => return Answer::refused(HiveRefusal::LaunchFailed, e),
             }
         } else {
@@ -2781,8 +2793,10 @@ impl Supervisor {
         {
             return Answer::refused(r, detail);
         }
+        // A sanity check, not a real bind: P8-2c-3's sidecar is bound fresh
+        // per session at launch, so there is no shared port here to probe.
         if self.cfg.api_key_helper.is_some()
-            && let Err(e) = self.sidecar_port().await
+            && let Err(e) = super::sidecar::bind().await
         {
             return Answer::refused(HiveRefusal::LaunchFailed, e);
         }
@@ -3896,19 +3910,6 @@ impl Supervisor {
 
     // ─── The model sidecar's side of the supervisor (P0e) ───────────────
 
-    /// The sidecar's port, binding it on first use.
-    async fn sidecar_port(self: &Arc<Self>) -> Result<u16, String> {
-        self.sidecar_port
-            .get_or_try_init(|| async {
-                let (listener, port) = super::sidecar::bind().await?;
-                super::sidecar::serve(listener, Arc::downgrade(self));
-                info!(port, "hive: the model sidecar listens on loopback");
-                Ok::<u16, String>(port)
-            })
-            .await
-            .copied()
-    }
-
     pub(crate) fn tokens(&self) -> &super::sidecar::Tokens {
         &self.tokens
     }
@@ -4162,7 +4163,7 @@ impl Supervisor {
         account: &str,
         folder: &Path,
         store: StoreHandle,
-        sidecar: Option<u16>,
+        sidecar: Option<super::sidecar::Sidecar>,
         moved: Option<&Moved>,
         note: Option<&str>,
         // P2f-4a — a terminal session made a managed one counts on from the
@@ -4183,6 +4184,7 @@ impl Supervisor {
             child,
             token,
             toolbelt,
+            sidecar,
             history,
             checkpoints,
         } = self.spawn(order, account, folder, sidecar, approvals_tx, shown, note)?;
@@ -4338,6 +4340,7 @@ impl Supervisor {
                 waiting,
                 approvals: approvals_rx,
                 toolbelt,
+                sidecar,
                 checkpoints,
                 replicated,
             };
@@ -4363,7 +4366,7 @@ impl Supervisor {
         order: &StartOrder,
         account: &str,
         folder: &Path,
-        sidecar: Option<u16>,
+        sidecar: Option<super::sidecar::Sidecar>,
         approvals: mpsc::Sender<ApprovalEvent>,
         memory: Option<&CoreMemory>,
         note: Option<&str>,
@@ -4541,7 +4544,11 @@ impl Supervisor {
             state_dir: session_state_dir(&home, &sid),
             settings,
             mcp_config: Some(mcp_config),
-            sidecar_base_url: sidecar.map(|port| format!("http://127.0.0.1:{port}/s/{sid}")),
+            // P8-2c-3 — this session's own port, its whole address: there is
+            // no longer a shared one to route within by `/s/<sid>`.
+            sidecar_base_url: sidecar
+                .as_ref()
+                .map(|s| format!("http://127.0.0.1:{}", s.port())),
             resume: order.resume,
             fork_of: None,
             permission_prompt_tool: Some(APPROVE_TOOL.to_string()),
@@ -4629,7 +4636,9 @@ impl Supervisor {
         // session at this fence, through the sidecar, and nothing else.
         // Minted last, and taken back if the start fails, so no launch that
         // did not happen leaves one behind.
-        let token = sidecar.map(|_| self.tokens.mint(order.session_id, order.fence));
+        let token = sidecar
+            .as_ref()
+            .map(|_| self.tokens.mint(order.session_id, order.fence));
         if let Some(token) = &token {
             cmd.env("ANTHROPIC_API_KEY", token);
         }
@@ -4642,6 +4651,7 @@ impl Supervisor {
                     child,
                     token,
                     toolbelt,
+                    sidecar,
                     // P2f-3a — a fork's first launch resumes its parent's.
                     history: spec.resume || spec.fork_of.is_some(),
                     checkpoints,
@@ -4673,7 +4683,7 @@ impl Supervisor {
         order: &StartOrder,
         account: &str,
         folder: &Path,
-        sidecar: Option<u16>,
+        sidecar: Option<super::sidecar::Sidecar>,
         approvals: mpsc::Sender<ApprovalEvent>,
         memory: Option<&CoreMemory>,
         note: Option<&str>,
@@ -4792,7 +4802,11 @@ impl Supervisor {
             state_dir: session_state_dir(&home, &sid),
             settings,
             mcp_config: Some(mcp_config),
-            sidecar_base_url: sidecar.map(|port| format!("http://127.0.0.1:{port}/s/{sid}")),
+            // P8-2c-3 — this session's own port, its whole address: there is
+            // no longer a shared one to route within by `/s/<sid>`.
+            sidecar_base_url: sidecar
+                .as_ref()
+                .map(|s| format!("http://127.0.0.1:{}", s.port())),
             resume: order.resume,
             fork_of: None,
             permission_prompt_tool: Some(APPROVE_TOOL.to_string()),
@@ -4829,7 +4843,9 @@ impl Supervisor {
         prepared.map_err(|e| failed("preparing the session as its account", e))?;
         let job = JobObject::kill_on_close()
             .map_err(|e| failed("making the harness's job", format!("{e:#}")))?;
-        let token = sidecar.map(|_| self.tokens.mint(order.session_id, order.fence));
+        let token = sidecar
+            .as_ref()
+            .map(|_| self.tokens.mint(order.session_id, order.fence));
         let mut env = spec.env_overrides();
         if let Some(token) = &token {
             env.push(("ANTHROPIC_API_KEY".into(), token.into()));
@@ -4863,6 +4879,7 @@ impl Supervisor {
                     child: hive_win::HarnessChild::new(child, job),
                     token,
                     toolbelt,
+                    sidecar,
                     // P2f-3a — a fork's first launch resumes its parent's.
                     history: spec.resume || spec.fork_of.is_some(),
                     checkpoints,
@@ -5594,6 +5611,10 @@ struct Inputs {
     /// P1a — the toolbelt's approvals as they open and close.
     approvals: mpsc::Receiver<ApprovalEvent>,
     toolbelt: Toolbelt,
+    /// P8-2c-3 — kept only so it drops, and so its worker is told to
+    /// close it, exactly when the session's task does. Never otherwise
+    /// read: a session's model calls never reach this struct.
+    sidecar: Option<super::sidecar::Sidecar>,
     /// P2b-3b — the session's checkpoints, taken while it is replicated.
     checkpoints: super::checkpointer::Checkpoints,
     /// P2c-4 — whether it is replicated now ([`Live::replicated`]).
@@ -6041,6 +6062,9 @@ async fn run(
         waiting,
         mut approvals,
         toolbelt,
+        // Kept alive, read by nothing: its `Drop` closes the sidecar (and
+        // tells its worker to) exactly when this function returns.
+        sidecar: _sidecar,
         checkpoints,
         replicated,
     } = inputs;
