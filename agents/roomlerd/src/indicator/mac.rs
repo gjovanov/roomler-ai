@@ -222,13 +222,22 @@ impl AppDelegate {
 /// AppKit exit 0, which launchd's `KeepAlive {SuccessfulExit: false}` never
 /// relaunches. The table is `macos_quit`'s; this is only its AppKit end.
 fn should_terminate() -> NSApplicationTerminateReply {
-    let (event, reason) = current_apple_event();
-    let intent = macos_quit::classify(event, reason);
-    let reason_text = reason.map_or_else(|| "none".to_string(), macos_quit::fourcc_text);
+    let quit = current_apple_event();
+    let sender = macos_quit::sender_of(quit.sender_path.as_deref());
+    let intent = macos_quit::classify(quit.event, quit.reason, sender);
+    let reason_text = quit
+        .reason
+        .map_or_else(|| "none".to_string(), macos_quit::fourcc_text);
+    let sender_text = match (quit.sender_pid, quit.sender_path.as_deref()) {
+        (Some(pid), Some(path)) => format!("{path} (pid {pid})"),
+        (Some(pid), None) => format!("pid {pid}"),
+        _ => "not named".to_string(),
+    };
     let mut armed = None;
     let reply = macos_quit::decide(intent, || {
         armed = macos_quit::arm_restart_for_quit(&format!(
-            "macOS asked roomlerd to quit (a Quit AppleEvent, quit reason {reason_text})"
+            "macOS asked roomlerd to quit (a Quit AppleEvent from {sender_text}, quit reason \
+             {reason_text})"
         ));
         armed.is_some()
     });
@@ -236,6 +245,7 @@ fn should_terminate() -> NSApplicationTerminateReply {
         (QuitReply::RestartLater, Some(code)) => {
             tracing::warn!(
                 quit_reason = %reason_text,
+                sender = %sender_text,
                 exit_code = code,
                 "a Quit AppleEvent (System Settings' Quit & Reopen, the Dock, Activity Monitor, a \
                  script): restarting under the supervisor instead of exiting 0, which launchd \
@@ -261,6 +271,7 @@ fn should_terminate() -> NSApplicationTerminateReply {
             tracing::info!(
                 ?intent,
                 quit_reason = %reason_text,
+                sender = %sender_text,
                 "terminating the way AppKit does: exit 0, which launchd does not relaunch (#3164)"
             );
             // AppKit exits as soon as this returns; the log's file layer
@@ -272,15 +283,29 @@ fn should_terminate() -> NSApplicationTerminateReply {
     }
 }
 
-/// The Apple Event AppKit is handling right now, as (class, id), and its
-/// `kAEQuitReason`. `AERegistry.h` calls the reason a parameter and Apple's
-/// samples read it as an attribute, so both are asked. `msg_send!` because
-/// objc2-foundation gates these four methods on its `objc2-core-services`
-/// feature, a crate this lockfile does not carry; each is a FourCharCode in or
-/// out.
-fn current_apple_event() -> (Option<(u32, u32)>, Option<u32>) {
+/// What [`current_apple_event`] read off the event AppKit is handling.
+#[derive(Default)]
+struct QuitEvent {
+    /// (class, id); `None` when no Apple Event is being handled.
+    event: Option<(u32, u32)>,
+    /// `kAEQuitReason`, as an attribute or a parameter.
+    reason: Option<u32>,
+    /// `keySenderPIDAttr`.
+    sender_pid: Option<i32>,
+    /// That pid's executable (`proc_pidpath`), which says whether it is
+    /// loginwindow.
+    sender_path: Option<String>,
+}
+
+/// The Apple Event AppKit is handling right now: (class, id), its
+/// `kAEQuitReason`, and who sent it. `AERegistry.h` calls the reason a
+/// parameter and Apple's samples read it as an attribute, so both are asked.
+/// `msg_send!` because objc2-foundation gates these methods on its
+/// `objc2-core-services` feature, a crate this lockfile does not carry; each
+/// takes or returns a FourCharCode.
+fn current_apple_event() -> QuitEvent {
     let Some(event) = NSAppleEventManager::sharedAppleEventManager().currentAppleEvent() else {
-        return (None, None);
+        return QuitEvent::default();
     };
     // SAFETY: `eventClass` and `eventID` take nothing and return an
     // `AEEventClass` / `AEEventID`, each a FourCharCode (UInt32).
@@ -298,7 +323,31 @@ fn current_apple_event() -> (Option<(u32, u32)>, Option<u32>) {
         let code = d.typeCodeValue();
         if code != 0 { code } else { d.enumCodeValue() }
     });
-    (Some((class, id)), reason)
+    let sender_keyword = macos_quit::SENDER_PID_KEYWORD;
+    // SAFETY: as above; the attribute is a typeSInt32 when present.
+    let sender: Option<Retained<NSAppleEventDescriptor>> =
+        unsafe { msg_send![&*event, attributeDescriptorForKeyword: sender_keyword] };
+    let sender_pid = sender.map(|d| d.int32Value()).filter(|pid| *pid > 0);
+    QuitEvent {
+        event: Some((class, id)),
+        reason,
+        sender_pid,
+        sender_path: sender_pid.and_then(process_path),
+    }
+}
+
+/// A process's executable path, or `None` when it cannot be read (gone, or
+/// not ours to see).
+fn process_path(pid: i32) -> Option<String> {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `proc_pidpath` writes at most `buffersize` bytes into `buf`,
+    // which is that long, and returns how many it wrote (0 or less on error).
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    String::from_utf8(buf).ok()
 }
 
 /// Hand the calling thread to AppKit. Never returns.

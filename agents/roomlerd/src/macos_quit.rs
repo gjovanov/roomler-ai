@@ -19,16 +19,23 @@
 //! “roomlerd” is not open anymore.").
 //!
 //! So the delegate `indicator::mac` installs answers `applicationShouldTerminate:`
-//! by [`classify`] and [`decide`]:
+//! by [`classify`] and [`decide`], from WHO sent the quit
+//! (`keySenderPIDAttr`, resolved to the sender's executable):
 //!
-//! | the quit | sent by | the answer |
+//! | the quit's sender | when | the answer |
 //! |---|---|---|
-//! | no quit reason | System Settings' Quit & Reopen, the Dock, Activity Monitor's Quit, `osascript … to quit` | a restart, through the graceful path FR-84 D3's `RestartDaemon` takes, leaving with the supervisor's code ([`crate::supervision::Supervision::restart_exit_code`]); AppKit is told to wait (`NSTerminateLater`) and never reaches its `exit(0)` |
-//! | a session-ending reason ([`SESSION_ENDING_REASONS`]) | loginwindow, at a log-out, restart or shut-down | AppKit's own: exit 0 |
+//! | `loginwindow` | a log-out, restart or shut-down: it quits the session's apps, then launchd tears the `gui/<uid>` domain down | AppKit's own: exit 0 |
+//! | anything else | System Settings' Quit & Reopen, the Dock, Activity Monitor's Quit, `osascript … to quit` | a restart, through the graceful path FR-84 D3's `RestartDaemon` takes, leaving with the supervisor's code ([`crate::supervision::Supervision::restart_exit_code`]); AppKit is told to wait (`NSTerminateLater`) and never reaches its `exit(0)` |
+//! | not named by the event | — | its `kAEQuitReason`: a session-ending one ([`SESSION_ENDING_REASONS`]) is AppKit's exit 0, none is a restart |
 //! | any quit, under no supervisor (a `roomlerd run` started by hand) | — | AppKit's own: there a quit is a stop |
 //! | not a Quit AppleEvent at all | — | AppKit's own |
 //!
-//! ⚠️ The session-ending row is load-bearing. A log-out quits every app of the
+//! ⚠️ **The reason alone cannot decide.** System Settings' Quit & Reopen sends
+//! its quit WITH `kAEQuitReason = 'rlgo'` (kAEReallyLogOut), the very reason a
+//! log-out carries (field, 2026-10-30, macOS 15.7: a classifier by reason left
+//! the agent down exactly as before). Only the sender tells them apart.
+//!
+//! ⚠️ The `loginwindow` row is load-bearing. A log-out quits every app of the
 //! session BEFORE launchd tears the `gui/<uid>` domain down, so a restart there
 //! would put the agent back into a session that is ending, once per quit, until
 //! the domain went. AppKit's exit 0 is what the agent has always done there,
@@ -73,10 +80,20 @@ pub const QUIT_APPLICATION: u32 = fourcc(b"quit");
 /// `indicator::mac` reads both.
 pub const QUIT_REASON_KEYWORD: u32 = fourcc(b"why?");
 
+/// `keySenderPIDAttr` (`AEDataModel.h`): "read only, returned as typeSInt32.
+/// Will be the pid of the sender of this event."
+pub const SENDER_PID_KEYWORD: u32 = fourcc(b"spid");
+
+/// The executable that quits a session's apps when the session (or the
+/// machine) is going away.
+pub const LOGINWINDOW: &str = "loginwindow";
+
 /// Every quit reason that means the session, or the machine, is going away:
 /// the four `AERegistry.h` names as a quit's possible reasons (`quia`, `shut`,
 /// `rest`, `rlgo`), and the log-out and dialog variants beside them in the same
-/// header (`logo`, `rrst`, `rsdn`). Checked against the macOS 27 SDK.
+/// header (`logo`, `rrst`, `rsdn`). Checked against the macOS 27 SDK. Consulted
+/// only when the event names no sender ([`Sender::Unknown`]): System Settings'
+/// Quit & Reopen says `rlgo` too.
 pub const SESSION_ENDING_REASONS: [u32; 7] = [
     fourcc(b"quia"), // kAEQuitAll
     fourcc(b"shut"), // kAEShutDown
@@ -92,18 +109,38 @@ pub const SESSION_ENDING_REASONS: [u32; 7] = [
 /// FR-46 P5b kept it on purpose when the bundle was renamed.
 pub const BUNDLE_ID: &str = "com.roomler.agent";
 
+/// Who sent the quit, as far as the event says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sender {
+    /// `loginwindow`: the session, or the machine, is going away.
+    Loginwindow,
+    /// Any other process: System Settings, the Dock, Activity Monitor, a script.
+    Other,
+    /// The event named no sender, or its executable could not be read.
+    Unknown,
+}
+
+/// The sender, from its executable's path (`proc_pidpath` of the event's
+/// `keySenderPIDAttr`): `loginwindow` by its file name, exactly.
+pub fn sender_of(path: Option<&str>) -> Sender {
+    match path {
+        Some(p) if p.rsplit('/').next() == Some(LOGINWINDOW) => Sender::Loginwindow,
+        Some(p) if !p.is_empty() => Sender::Other,
+        _ => Sender::Unknown,
+    }
+}
+
 /// What asked the application to terminate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuitIntent {
     /// No Quit AppleEvent is being handled: AppKit's `terminate:` came from
     /// somewhere else.
     NotAQuitEvent,
-    /// loginwindow is quitting the session's apps: a log-out, restart or
-    /// shut-down. Carries the reason code.
+    /// The session's apps are being quit: a log-out, restart or shut-down.
+    /// Carries the reason code (`0` when there was none).
     SessionEnding(u32),
     /// Somebody asked this app to quit: System Settings' "Quit & Reopen", the
-    /// Dock, Activity Monitor, a script. Carries the reason code when the event
-    /// had one this module does not know.
+    /// Dock, Activity Monitor, a script. Carries the reason code, if any.
     Quit(Option<u32>),
 }
 
@@ -119,14 +156,18 @@ pub enum QuitReply {
 
 /// Classify the Apple Event being handled. `event` is its (class, id), `None`
 /// when there is none; `reason` is its `kAEQuitReason`, as an attribute or a
-/// parameter.
-pub fn classify(event: Option<(u32, u32)>, reason: Option<u32>) -> QuitIntent {
-    match event {
-        Some((CORE_EVENT_CLASS, QUIT_APPLICATION)) => match reason {
+/// parameter; `sender` is who sent it ([`sender_of`]).
+pub fn classify(event: Option<(u32, u32)>, reason: Option<u32>, sender: Sender) -> QuitIntent {
+    if event != Some((CORE_EVENT_CLASS, QUIT_APPLICATION)) {
+        return QuitIntent::NotAQuitEvent;
+    }
+    match sender {
+        Sender::Loginwindow => QuitIntent::SessionEnding(reason.unwrap_or(0)),
+        Sender::Other => QuitIntent::Quit(reason),
+        Sender::Unknown => match reason {
             Some(r) if SESSION_ENDING_REASONS.contains(&r) => QuitIntent::SessionEnding(r),
             other => QuitIntent::Quit(other),
         },
-        _ => QuitIntent::NotAQuitEvent,
     }
 }
 
@@ -207,6 +248,7 @@ mod tests {
         assert_eq!(CORE_EVENT_CLASS, 0x6165_7674);
         assert_eq!(QUIT_APPLICATION, 0x7175_6974);
         assert_eq!(QUIT_REASON_KEYWORD, 0x7768_793f);
+        assert_eq!(SENDER_PID_KEYWORD, fourcc(b"spid"));
         // The four `AERegistry.h` lists as a quit's possible reasons, with the
         // hex values the header prints beside three of them.
         assert!(SESSION_ENDING_REASONS.contains(&0x7175_6961)); // kAEQuitAll 'quia'
@@ -216,37 +258,91 @@ mod tests {
         assert!(!SESSION_ENDING_REASONS.contains(&fourcc(b"slep"))); // kAESleep is no quit
     }
 
-    /// The table in the module docs, row by row.
+    const RLGO: u32 = fourcc(b"rlgo");
+
+    /// The field case first: System Settings' "Quit & Reopen" quits with
+    /// `kAEQuitReason = 'rlgo'`, a log-out's reason, from a sender that is not
+    /// loginwindow (macOS 15.7, 2026-10-30). It must restart. A classifier by
+    /// reason (this branch's first draft, and every reading of Apple's samples)
+    /// called it a session end and left the agent down exactly as before.
     #[test]
-    fn a_bare_quit_is_a_restart_and_a_session_end_is_not() {
-        // System Settings' "Quit & Reopen", the Dock, a script: no reason.
-        assert_eq!(classify(QUIT, None), QuitIntent::Quit(None));
+    fn system_settings_quit_and_reopen_is_a_restart_although_it_says_rlgo() {
+        let intent = classify(QUIT, Some(RLGO), Sender::Other);
+        assert_eq!(intent, QuitIntent::Quit(Some(RLGO)));
+        assert_eq!(decide(intent, || true), QuitReply::RestartLater);
+        // The Dock, Activity Monitor, a script: no reason at all.
         assert_eq!(
-            decide(classify(QUIT, None), || true),
+            decide(classify(QUIT, None, Sender::Other), || true),
             QuitReply::RestartLater
         );
-        // A log-out, a restart, a shut-down: AppKit's own exit, whatever the
-        // daemon would do.
-        for code in SESSION_ENDING_REASONS {
-            let intent = classify(QUIT, Some(code));
+    }
+
+    /// loginwindow quits a session's apps only when the session, or the
+    /// machine, is going away: AppKit's own exit, whatever the reason says,
+    /// and the daemon is never asked to arm a restart.
+    #[test]
+    fn loginwindow_s_quit_is_a_session_end_whatever_its_reason() {
+        for reason in [
+            Some(RLGO),
+            Some(fourcc(b"shut")),
+            Some(fourcc(b"rest")),
+            None,
+        ] {
+            let intent = classify(QUIT, reason, Sender::Loginwindow);
+            assert_eq!(intent, QuitIntent::SessionEnding(reason.unwrap_or(0)));
             assert_eq!(
-                intent,
+                decide(intent, || panic!("a session end must never arm a restart")),
+                QuitReply::TerminateNow,
+                "{reason:?}"
+            );
+        }
+    }
+
+    /// With no sender to tell by, the reason decides, as Apple's samples have
+    /// it: every session-ending reason is AppKit's exit, none is a restart, and
+    /// a reason this module does not know is still a quit.
+    #[test]
+    fn with_no_sender_the_reason_decides() {
+        for code in SESSION_ENDING_REASONS {
+            assert_eq!(
+                classify(QUIT, Some(code), Sender::Unknown),
                 QuitIntent::SessionEnding(code),
                 "{}",
                 fourcc_text(code)
             );
-            assert_eq!(
-                decide(intent, || panic!("a session end must never arm a restart")),
-                QuitReply::TerminateNow,
-                "{}",
-                fourcc_text(code)
-            );
         }
-        // A reason this module does not know is still a quit: the field log
-        // names it (`fourcc_text`), and a session that really ends tears the
-        // domain down after it.
+        assert_eq!(
+            classify(QUIT, None, Sender::Unknown),
+            QuitIntent::Quit(None)
+        );
         let odd = fourcc(b"zzzz");
-        assert_eq!(classify(QUIT, Some(odd)), QuitIntent::Quit(Some(odd)));
+        assert_eq!(
+            classify(QUIT, Some(odd), Sender::Unknown),
+            QuitIntent::Quit(Some(odd))
+        );
+    }
+
+    /// loginwindow by its file name exactly; any other executable is someone
+    /// else; no path is unknown.
+    #[test]
+    fn the_sender_is_loginwindow_by_its_exact_name() {
+        assert_eq!(
+            sender_of(Some(
+                "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
+            )),
+            Sender::Loginwindow
+        );
+        for other in [
+            "/System/Applications/System Settings.app/Contents/MacOS/System Settings",
+            "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock",
+            "/usr/bin/osascript",
+            "/tmp/loginwindow-lookalike",
+            "/tmp/notloginwindow",
+        ] {
+            assert_eq!(sender_of(Some(other)), Sender::Other, "{other}");
+        }
+        assert_eq!(sender_of(Some("")), Sender::Unknown);
+        assert_eq!(sender_of(None), Sender::Unknown);
     }
 
     /// No supervisor, or no daemon in this process: the hook arms nothing, and
@@ -254,7 +350,7 @@ mod tests {
     #[test]
     fn a_quit_nothing_would_relaunch_stays_a_stop() {
         assert_eq!(
-            decide(classify(QUIT, None), || false),
+            decide(classify(QUIT, Some(RLGO), Sender::Other), || false),
             QuitReply::TerminateNow
         );
     }
@@ -269,15 +365,19 @@ mod tests {
             Some((CORE_EVENT_CLASS, fourcc(b"odoc"))), // open documents
             Some((fourcc(b"misc"), QUIT_APPLICATION)),
         ] {
-            assert_eq!(
-                classify(event, None),
-                QuitIntent::NotAQuitEvent,
-                "{event:?}"
-            );
-            assert_eq!(
-                decide(classify(event, None), || panic!("asked for {event:?}")),
-                QuitReply::TerminateNow
-            );
+            for sender in [Sender::Loginwindow, Sender::Other, Sender::Unknown] {
+                assert_eq!(
+                    classify(event, None, sender),
+                    QuitIntent::NotAQuitEvent,
+                    "{event:?} {sender:?}"
+                );
+                assert_eq!(
+                    decide(classify(event, None, sender), || panic!(
+                        "asked for {event:?}"
+                    )),
+                    QuitReply::TerminateNow
+                );
+            }
         }
     }
 
