@@ -19,7 +19,7 @@ run page rather than silently going cold. The program's full history, wave by wa
 |---|---|---|---|
 | `release-agent.yml`, 8 build jobs | `seed-cache` release assets | `seed-<shared-key>-<os>-<arch>`, e.g. `seed-agent-windows-vp9-444-Windows-X64` | non-tag runs: rehearsals, post-release reseeds, the Monday 03:17 UTC cron |
 | `release-setup.yml`, 4 build jobs | `seed-cache` release assets | `seed-setup-<platform>-…` | non-tag runs |
-| `ci.yml`'s integration shards, installer smokes, macOS lanes | `seed-cache` release assets (`ci-<family>-…`, through `ci-seed-restore` / `ci-seed-save`) | one per lane | master only |
+| `integration-tests.yml`'s shards, `installer-smoke.yml`, `ci.yml`'s macOS and Windows lanes | `seed-cache` release assets (`ci-<family>-…`, through `ci-seed-restore` / `ci-seed-save`) | one per lane | master only |
 | `ci.yml`'s five Rust lanes | the Actions cache (Swatinem), salted per job | one per lane | master only (`save-if`) |
 
 **Why a release and not the Actions cache.** The 10 GB cache pool kept evicting the seeds.
@@ -134,6 +134,15 @@ days. So before every non-tag build, `seed-cache-restore` runs a GC step
 | Default (companions, everything else) | 3,000 MB | `seed-cache-restore/action.yml:85` |
 | The four daemon jobs (`.deb` ×2, MSI, `.pkg`) | 4,500 MB | `release-agent.yml:393`, `:1129`, `:1604`, `:2575` |
 | The wizard's macOS universal job (two triples) | 5,000 MB | `release-setup.yml:396` |
+| CI caches in the release-asset store (`ci-seed-restore`), default | 4,000 MB | `ci-seed-restore/action.yml:28` |
+| The integration shards, `ci.yml`'s macOS overlay check and its Windows clippy lane | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1212`, `:1457` |
+
+**A cold build has to fit under its cap.** If it does not, every restore drops the cache, every
+run builds cold, and each master run publishes the same size again, so the GC never recovers.
+#3116's wizard step put the Windows clippy lane there on 2026-10-30: its cold build pruned to
+4,440 MB against the default 4,000, and the lane took 17–23 min on every CI run instead of
+~8 (FR-6 wave 33). A master run that publishes a CI cache over its cap now warns
+`CI cache over its cap` on the run page (`ci-seed-save/action.yml:95`).
 
 **A seed grows per release, not per build.** Cargo names an artifact by the unit's name,
 version, features and profile, never by its source. So a rebuild of the same version
@@ -189,6 +198,7 @@ closes it (`:3742`).
 | 30 (#2940) | the companion's `capabilities/` exists, cached-apt steps bounded | the Linux companions stop recompiling |
 | 31 (#3030) | reuse marks OUT_DIR files unchanged | no companion recompiles on a tag run since 0.4.181 |
 | 32 (#3068) | the daemon seeds' cap rises to 4,500 MB, and the GC line reports free disk | a reseed reuses instead of a 26-minute cold MSI |
+| 33 (#3153) | the Windows clippy lane's CI cache cap rises to 6,000 MB, and a master run warns when it publishes a cache over its cap | ends a cold build of that lane on every CI run since #3125 (17–23 min, against 7.4–8.3 before it) |
 
 What is left is runner queueing, not compiling. On 0.4.182 and 0.4.183 the `.pkg` waited
 about 8 minutes for a macOS runner, and tag to publish took 13–16 minutes. On 0.4.184 and
