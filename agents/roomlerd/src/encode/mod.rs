@@ -81,6 +81,14 @@ pub(crate) mod plan;
 pub mod prior;
 /// FR-35 P2 — per-peer rate memory (one JSON file in the data dir).
 pub mod rate_memory;
+/// FR-63 B1 — ONE delay-based rate controller, run in SHADOW beside the
+/// governor (pure; no clock, no I/O). Replaces eight estimators of one
+/// quantity; shadow-first, so it drives nothing until B2's flip criterion.
+/// No `dead_code` allowance, deliberately: the governor constructs and feeds it
+/// on EVERY build, so nothing in it is legitimately dead — and an allowance here
+/// once hid an unused test helper from the default lane while the
+/// `ffmpeg-encoder` lane (no `-A dead_code`) caught it (PR #3102's first CI run).
+pub mod ratectl;
 /// FR-63 B0 — the deterministic rate-law simulator. TEST-ONLY: it ships zero
 /// bytes, and it exists so the cells the field cannot summon (a genuinely thin
 /// pipe, a link that stalls on cue) can still be run against the SHIPPED laws.
@@ -524,6 +532,49 @@ pub fn pump_stall_watch_enabled() -> bool {
 /// measuring.
 pub fn rate_slow_start_enabled() -> bool {
     tunnel_core::env::node_env("RATE_SLOW_START").as_deref() == Some("1")
+}
+
+/// FR-63 B1 — whether the shadow controller (`encode::ratectl`) runs beside the
+/// governor.
+///
+/// ⚠️ B1 has exactly two modes, and NEITHER drives the encoder: the shadow
+/// observes and emits `shadow_*` heartbeat fields, nothing more. `live` — the
+/// controller actually steering the rate — is **FR-63 B2**, which adds the
+/// config-surface tribool and the one apply seam; it is deliberately not a value
+/// B1 understands, so there is no way to turn the shadow into a driver by a
+/// config edit on a B1 fleet. This mirrors FR-70 M3a's shadow plan, which also
+/// ships with no live path and no config key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RatectlMode {
+    /// The shadow does not run (the kill switch, for a host where the extra
+    /// per-window bookkeeping is ever suspected — it should never be).
+    Off,
+    /// The shipped B1 posture: the controller runs, emits `shadow_*`, drives
+    /// nothing.
+    Shadow,
+}
+
+impl RatectlMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RatectlMode::Off => "off",
+            RatectlMode::Shadow => "shadow",
+        }
+    }
+}
+
+/// Default ON (`Shadow`): the shadow is the point of B1. `ROOMLERD_RATECTL=off`
+/// is the only value that stops it; any other value is `shadow`. Env-only in
+/// B1 — the config-surface key lands with `live` in B2.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn ratectl_mode() -> RatectlMode {
+    match tunnel_core::env::node_env("RATECTL").as_deref() {
+        Some("off") => RatectlMode::Off,
+        _ => RatectlMode::Shadow,
+    }
 }
 
 /// FR-70 M1 — the FFmpeg encoder lives on its own OS thread per session

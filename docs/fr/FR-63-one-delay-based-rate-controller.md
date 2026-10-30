@@ -1,12 +1,12 @@
 # FR-63 — One delay-based rate controller for remote desktop
 
-**Issue:** [#1243](https://github.com/gjovanov/roomler-ai/issues/1243) · **Status:** in progress — B-opener shipped (default OFF); **B0 simulator shipped**, AC0b answered in simulation and still open in the field · **Plan:** `rate-control-architecture` (approved 2026-09-02)
+**Issue:** [#1243](https://github.com/gjovanov/roomler-ai/issues/1243) · **Status:** in progress — B-opener shipped (default OFF); **B0 simulator shipped**, AC0b answered in simulation and still open in the field; **B1 shadow controller built** (`encode::ratectl` beside the governor, six `shadow_*` heartbeat fields, observe-only — drives nothing) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 **Parent/siblings:** FR-59 (the regression that motivated the arc). This is one of three FRs from that plan (FR-62 encoder apply path, FR-63 the controller, FR-64 the data path).
 
 ## Goal
 
-Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodput, the FR-35 learner and rate memory, FR-59's floor relief / arrival clamp / drain / seed contradiction / remembered-rate opener, the FR-15 age loop — composed with "the lower of" rules in `RateGovernor::pre_encode_tick` (`agents/roomlerd/src/encode/governor.rs:518`) and `tick_viewer_window` (:708), with **one** pure, delay-based controller that runs in **shadow** for a release before it drives anything, and is verified against a deterministic simulator replaying recorded field traces rather than against the fleet.
+Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodput, the FR-35 learner and rate memory, FR-59's floor relief / arrival clamp / drain / seed contradiction / remembered-rate opener, the FR-15 age loop — composed with "the lower of" rules in `RateGovernor::pre_encode_tick` (`agents/roomlerd/src/encode/governor.rs:547`) and `tick_viewer_window` (:708), with **one** pure, delay-based controller that runs in **shadow** for a release before it drives anything, and is verified against a deterministic simulator replaying recorded field traces rather than against the fleet.
 
 ## Key design
 
@@ -23,7 +23,7 @@ Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodpu
 |---|---|---|---|
 | **B-opener** | Slow-start for the session opener — `encode::slow_start` (pure law) + the governor cap on the opening ceiling **and floor** | `rate_slow_start` (default **OFF**) | shipped **inert** in 0.4.55 (#1262, #1265 capped only the ceiling, which `set_ceiling` raised back to the flat 1.5 M floor); fixed in 0.4.56 (#1275) and **field-verified engaging** — AC0a done, AC0b open |
 | B0 | `encode/sim.rs` — pipe/encoder/viewer simulator + the four scenario fixtures, driving the SHIPPED laws | n/a (test-only) | **shipped** — 11 tests in `cargo test -p roomlerd --lib` on the default build. CSV trace replay deferred (see below) |
-| B1 | `ratectl` shadow beside the governor, `shadow_*` heartbeat fields | `ratectl = shadow` (default) | not started |
+| B1 | `ratectl` shadow beside the governor, `shadow_*` heartbeat fields | `ROOMLERD_RATECTL` (env; `off` disables, default shadow) | **built** — `encode::ratectl::Controller` (pure, 13 unit tests) fed at the five live positions, six `shadow_*` fields on both pump heartbeats, a containment test (`the_shadow_never_moves_the_live_decision`, red-run confirmed) and a `RateLaw` adapter running it on the B0 cells. **Observe-only: it drives nothing.** AC2 (the fleet-log flip criterion) still needs a release + a week of logs |
 | B2 | Flip to `live` on the flip criterion | `ratectl = shadow\|live\|off` | not started |
 | B3 | Retire the eight estimators and their switches | `ratectl = off` for one release | not started |
 
@@ -160,6 +160,81 @@ confirmation rather than a search.
    instead of ending, or a floor that stayed down while the ramp ran, is the
    next lever.
 
+## B1 — the shadow controller, as built
+
+`encode::ratectl::Controller` is the ONE delay-based controller this FR exists
+to build. B1 ships it **in shadow**: it runs beside the live `RateGovernor`,
+computes what it would decide, and emits that into six `shadow_*` heartbeat
+fields. **It drives nothing.** B2 flips it live on the flip criterion; B3
+deletes the eight estimators it replaces.
+
+### Containment — the whole safety property of this phase
+
+The governor owns the controller as `shadow: Option<ratectl::Controller>`, fed
+only through the controller's own methods and read only by the `shadow_*`
+accessors. No live decision, counter or field is a function of anything the
+controller computes. This is held by a test, not a comment:
+`governor::tests::the_shadow_never_moves_the_live_decision` drives two governors
+identical but for `ratectl` (Off vs the shipped Shadow) through the same frames,
+events and windows and asserts the live outputs — `applied_bps`, the relieved
+floor, the pipe-state tally, the link stats, the goodput samples, the viewer age
+— are byte-identical at every step. ⚠️ **Red-run confirmed (2026-10-29):** making
+the shadow's window fold write `self.applied_bps` fails exactly this test
+(`applied_bps diverged: 255000 vs 200000`); reverted.
+
+### The controller (pure, `encode::ratectl`)
+
+A GCC-shaped machine on the viewer's delay LEVEL, loss, goodput and the send
+channel's own back-pressure, with explicit `Instant` (no clock, no I/O) so it
+unit-tests on the default build and runs inside B0:
+
+| state | what it does |
+|---|---|
+| **Startup** | opens at the constrained floor (200 k — NOT the governor's flat 1.5 M pin) or, for a remembered pair, at `0.85 × remembered` as a 10-s soft cap; climbs ×1.08/window below half the ceiling, additive above |
+| **OverUse** | the decrease: `0.85 × measured`, never cutting more than half a window, floored at the path floor. Fires on a sustained full channel or a hard stall at once, or on two running windows of an elevated age level / loss ≥ 2 % / goodput < 0.9×target |
+| **Hold** | holds while the age LEVEL is elevated (not the derivative — the lesson FR-59 paid for twice); a deep level on a constrained path counts one bounded pause, **never on direct** |
+| **UnderUse** | two clean windows reopen the climb |
+
+`measured` is the viewer's arrival rate on a constrained path, `min(goodput, rx)`
+on a direct one; an `fps == 0` window (a DERP stall) is no evidence at all. The
+output passes a deadband (decreases ≤ 1/500 ms, increases ≤ 1/2 s, |Δ| ≥ 5 %), so
+it converges just under the ceiling without chatter.
+
+### Wired at the five live positions, reads what the governor already holds
+
+`pre_encode_tick` (per frame → `set_domain` + `observe_frame`, after the live
+floor/ceiling resolve), `on_backpressure_skip` → `on_budget_skip`,
+`on_send_overflow` → `on_overflow`, `note_send_stall` → `on_stall`, and
+`tick_viewer_window` → `fold_window`. No hot-path signature changed: the shadow
+is fed from locals the live loops already computed. (The per-frame byte-budget
+granularity the plan sketched is reached instead through `on_budget_skip` and the
+window's figures — a B2 fidelity refinement if the shadow report asks for it.)
+
+### The six fields, and the kill switch
+
+The heartbeat (both pumps) carries `shadow_target_bps`, `shadow_state`
+(`startup`/`normal`/`overuse`/`hold`/`underuse`, or `off`), `shadow_measured_bps`,
+`shadow_disagree_pct` (`(shadow − live)/live`; **negative = the shadow asked for
+less**, the safe direction, and the quantity the flip criterion counts),
+`shadow_pauses` and `shadow_reason`. `ROOMLERD_RATECTL=off` stops the shadow;
+default is on. This is **env-only in B1** — the config-surface tribool and the
+`live` value land in B2 with the one apply seam, so there is no way to turn the
+shadow into a driver by a config edit on a B1 fleet.
+
+### Reuses B0, becomes B2's baseline
+
+A `RateLaw` adapter (`sim::tests::RatectlLaw`) runs the controller on the same
+recorded cells as the shipped `GovernorLaw`, so its numbers are the baseline B2
+must beat rather than a separate exercise: on the recorded 213 kbps cell the
+controller's peak commitment is under half arm A's 2.55 M (it opens at its 200 k
+floor and ramps), it never leaves `[floor, ceiling]` on any cell, and it never
+counts a pause on a direct one.
+
+⚠️ **This does not tick AC2.** B1 is the code; AC2 is a release of shadow logs
+across the fleet meeting the flip criterion — a release plus a week of
+`agent_logs`, which no unit test or simulation reaches. The containment test and
+the B0 cells are what B1 can prove; the fleet read is B2's.
+
 ## Acceptance criteria
 
 - [x] AC0a — **the ramp engages and opens where it says.** Field-verified 2026-09-03 on 0.4.56, CORPLAP-1: `FR-63 slow-start armed open_bps=300000 ceiling_bps=2550000`, against an arm-A opener of `2_550_000` on the same host and build — an 8.5× smaller opening commitment. `slf=Some(600000)` on the first window with `gp=None` proves the **floor descent** did it, since the P1 relief cannot fire without a measurement; on 0.4.55, which capped only the ceiling, the opener was pinned at the flat 1.5 M and the ramp was inert.
@@ -172,6 +247,7 @@ confirmation rather than a search.
 - [ ] AC3 — Field A/B (`scripts/rc-ab.sh`) on CORPLAP-1 (QSV, corp VPN) and CORPLAP-2 (real relay): paint age p90 ≤ 0.4.50's and no window with a standing queue while the encoder tracks (FR-62).
 - [ ] AC4 — FR-59 AC4 (< 600 ms sustained on the airport-class link) closes here.
 - [ ] AC5 — The eight replaced estimators and their six switches are deleted; `ratectl = off` restores the prior behaviour for one release.
+- [x] AC6 — **docs.** `docs/rate-control.md` documents the shadow controller — its state machine (mermaid), the six `shadow_*` heartbeat fields, the `ROOMLERD_RATECTL` kill switch and the containment property — and `docs/README.md`'s rate-control row names it. (FR-63's issue opened after the docs-before-close rule reached master, so it carries this criterion; ticked with the docs shipped in the B1 PR.)
 
 ## The ramp-exit rule — measured, not argued
 

@@ -222,7 +222,7 @@ path says `true` (`:264`). The flag stays once per MESSAGE while the counter say
 frames died. Nothing changes on the ordered default (a test over an in-order stream of
 mixed chunk counts pins it), and the forced-IDR rate stays bounded where it was — the
 worker's 250 ms debounce and the agent's 500 ms `MIN_KF_GAP` on `rc:keyframe`
-(`agents/roomlerd/src/peer.rs:10723`), at most 2/s per session — now reachable under
+(`agents/roomlerd/src/peer.rs:10747`), at most 2/s per session — now reachable under
 heavy loss instead of never. Unit evidence, red then green: master's spec was 15/15 green
 against the defective module; the new spec failed 4 of 19 against it (the overtaken-frame
 test, completion on the last chunk, the collision, and the seeded property at
