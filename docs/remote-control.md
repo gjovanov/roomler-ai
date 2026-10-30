@@ -1222,7 +1222,7 @@ The agent does **not** render the cursor into the captured frame (it tells the O
 ### 6.3 One owner per key — the soft keyboard beside a hardware keyboard (#2888)
 
 The viewer has two places a key can enter the host from. The window-level
-CAPTURE listener (`attachInput`, `useRemoteControl.ts:12272`) sees every key
+CAPTURE listener (`attachInput`, `useRemoteControl.ts:12276`) sees every key
 first and forwards it — `key_text` for a printable character, a HID `key` frame
 otherwise. The soft keyboard (`MobileKeyboard.vue`) is an off-screen textarea
 whose focus brings up the OS keyboard; its typing arrives as `input` events
@@ -1265,7 +1265,7 @@ pre-fix run.
 | Ctrl+Alt+End | End forwarded, no SAS | SAS (derived) | SAS once, no End |
 | sticky toolbar Ctrl, then `c` | `L text:"c"` + `S` Ctrl+C — **twice, and the host's text first** | same | `S` Ctrl+C — once, the modifier cleared |
 
-The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14452`, pure)
+The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14456`, pure)
 and carried out by `applyKeyRoute` (`:14269`): a key whose target is the soft
 keyboard's textarea (`isSoftKeyboardTarget`, `:14010` — the same
 `data-rc-capture` attribute `isViewerOwnInput` exempts) is **driving**, like a
@@ -1334,13 +1334,13 @@ composition.
 ⚠️ **A paste has one owner too** (#2910). Two `paste` listeners sit on
 `window`: the files drawer's `onWindowPasteForDrawer`
 (`RemoteControl.vue:3398`), registered at mount (`:5630`), and the deferred
-Ctrl+V's `onPaste` (`useRemoteControl.ts:12018`), registered later by
+Ctrl+V's `onPaste` (`useRemoteControl.ts:12022`), registered later by
 `attachInput` (`:12006`). Same node, same phase, so the drawer's runs
 **first** — and `preventDefault` stops no other listener on the same node.
 With the drawer open, a Ctrl+V over the stage with files on the clipboard
 uploaded every file twice: into the drawer's directory, then again into the
 default folder. Now each half steps aside for the other: `drawerPasteFiles`
-(`useRemoteControl.ts:14661`) returns nothing for a paste already consumed,
+(`useRemoteControl.ts:14665`) returns nothing for a paste already consumed,
 and `routeDeferredPaste` (`:14362`) answers `taken` for one the drawer
 consumed — the deferred chord is dropped, with no keystroke and no second
 upload (`:11778`). Whichever listener runs first owns the paste, so a future
@@ -2548,7 +2548,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:8942`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:8946`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark
@@ -2651,7 +2651,7 @@ leaves **no server row at all** (the request never reached a hub), and
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
-the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4807`)
+the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4811`)
 posts **one record**: the console line, persisted.
 
 ```jsonc
@@ -3306,10 +3306,10 @@ to-activate, so the browser never sees a bait-and-switch.
   together therefore both failed. The field saw it 9 ms apart, and a drop
   while a long upload runs does the same. Every upload source ends in
   `uploadOne`, so it takes a place in the session's queue there
-  ([`useRemoteControl.ts:12680`](../ui/src/composables/useRemoteControl.ts#L12680),
-  `createUploadQueue` at `useRemoteControl.ts:14693`). The transfer shows
+  ([`useRemoteControl.ts:12684`](../ui/src/composables/useRemoteControl.ts#L12684),
+  `createUploadQueue` at `useRemoteControl.ts:14697`). The transfer shows
   as `queued` at once, and its `files:begin` waits until every earlier
-  upload has settled (`useRemoteControl.ts:12930`). ⚠️ The next place
+  upload has settled (`useRemoteControl.ts:12934`). ⚠️ The next place
   waits for this one's turn AND its settle.
   So an upload cancelled while queued cannot let the one behind it start
   while an earlier one is still on the wire.
@@ -3318,10 +3318,10 @@ to-activate, so the browser never sees a bait-and-switch.
   outside the active user's profile (FR-84 D4), a path that is not a
   directory, or the agent's own state. It says why only in its own log. The
   viewer learns of the fallback from the completed `path`
-  (`uploadLandedIn`, `useRemoteControl.ts:14728`, which compares whole segments:
+  (`uploadLandedIn`, `useRemoteControl.ts:14732`, which compares whole segments:
   `/tmp/x` does not hold `/tmp/xy`). A file that landed outside the folder
   the person chose is a warning that names where it went
-  (`uploadOutcomeMessage`, `useRemoteControl.ts:14751`), not "Uploaded".
+  (`uploadOutcomeMessage`, `useRemoteControl.ts:14755`), not "Uploaded".
 - **Remote Apps on the control DC** (FR-56, [`remote-apps.md`](remote-apps.md)):
   `rc:apps.list` / `rc:apps.focus` / `rc:apps.launch` and their `*.reply`,
   id-correlated like `rc:logs-fetch`, handled off-thread in
