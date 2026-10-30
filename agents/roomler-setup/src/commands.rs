@@ -195,6 +195,14 @@ pub fn cmd_privileged_half_done() -> Result<(), String> {
     crate::unix_daemon::confirm_fire()
 }
 
+/// #3116 — must the pre-logon service role run from an elevated wizard here?
+/// The Welcome page asks before a token is pasted or paired: on a reinstall a
+/// limited wizard cannot write that role's config. `false` off Windows.
+#[tauri::command]
+pub fn cmd_system_context_needs_elevation() -> bool {
+    crate::orchestrator_agent::system_context_needs_elevation()
+}
+
 /// The legacy tunnel wizard's config.toml probe, verbatim: resolve
 /// the platform-default path, read + TOML-parse best-effort for the
 /// machine_name.

@@ -3656,13 +3656,24 @@ pub enum MergeBase {
         reason: String,
         recovered: Option<AgentConfig>,
     },
+    /// #3116 — this process may not read the path at all: a setup wizard
+    /// that is not elevated, against the machine-global config only SYSTEM
+    /// and Administrators may open (#3073). Neither absent nor damaged — the
+    /// file may be perfectly good — so nothing may be decided about it, and a
+    /// merge must stop before it spends an enrollment token on a config it
+    /// could not write either ([`describe_denied`]).
+    Denied {
+        /// Why, on one line, for the person.
+        reason: String,
+    },
 }
 
 impl MergeBase {
-    /// The config to fold the enrollment into, if there is one.
+    /// The config to fold the enrollment into, if there is one. `Denied` has
+    /// none to give; a caller stops on it before it gets here.
     pub fn into_config(self) -> Option<AgentConfig> {
         match self {
-            MergeBase::Absent => None,
+            MergeBase::Absent | MergeBase::Denied { .. } => None,
             MergeBase::Loaded(cfg) => Some(cfg),
             MergeBase::Unreadable { recovered, .. } => recovered,
         }
@@ -3684,18 +3695,67 @@ impl MergeBase {
 /// [`load`] does, without [`load`]'s side effects (it rewrites the live file
 /// and logs "must be re-enrolled" at ERROR): the caller is about to write the
 /// path itself, and says what it found ([`describe_unreadable`]).
+///
+/// #3116 — and a file this process may not read is told apart from both: it
+/// is [`MergeBase::Denied`], never `Unreadable`, whose wording ("a fresh
+/// config is written, and this device's earlier settings do not carry over")
+/// would be false about a file that is only closed to the reader.
 pub fn read_merge_base(path: &PathBuf) -> MergeBase {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MergeBase::Absent,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return MergeBase::Denied {
+                reason: one_line(&e.to_string()),
+            };
+        }
         _ => {}
     }
     match try_load(path) {
         Ok(cfg) => MergeBase::Loaded(cfg),
+        Err(e) if permission_denied(&e) => MergeBase::Denied {
+            reason: one_line(&format!("{e:#}")),
+        },
         Err(e) => MergeBase::Unreadable {
             reason: one_line(&format!("{e:#}")),
             recovered: try_load(&prev_path(path)).ok(),
         },
     }
+}
+
+/// #3116 — does an error chain hold an I/O "permission denied"? Windows'
+/// `ERROR_ACCESS_DENIED` (5) maps to it too.
+fn permission_denied(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
+/// #3116 — what to tell the person about a config this process may not read
+/// ([`MergeBase::Denied`]). The caller adds what to do about it, which is
+/// per platform (run the wizard elevated; fix a file's owner).
+pub fn describe_denied(path: &std::path::Path, reason: &str) -> String {
+    format!(
+        "{} is there, but this process may not read it ({reason}). It is not damaged, and \
+         nothing was written over it.",
+        path.display()
+    )
+}
+
+/// #3116 — can a [`save`] at `path` create its file? Creates the parent
+/// directory, as a save would, then creates and removes the same sibling temp
+/// file a save writes first. For a caller that is about to spend something it
+/// cannot get back, such as a single-use enrollment token, on a write that
+/// would fail: the setup wizard ran unelevated against the machine-global
+/// directory, enrolled, and only then failed on "creating parent dir".
+pub fn probe_writable(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    std::fs::File::create(&tmp)?;
+    std::fs::remove_file(&tmp)
 }
 
 /// Where [`keep_unreadable`] keeps a config that did not load:
@@ -4072,6 +4132,70 @@ fn note_unknown_keys(path: &PathBuf) {
 
 pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
     save_with_base(path, path, cfg)
+}
+
+/// #3116 — the saves a daemon makes while it starts. They write the copy it
+/// LOADED (a migration stamp, a minted WireGuard or SSH key, the crash
+/// bookkeeping), where every later writer reloads the file under the
+/// daemon-wide write lock first (the clean-run promotion, the LocalAPI, remote
+/// configuration, `org join`). So these are the only writes that can put an
+/// older copy back over a newer one, and on Windows one did: the MSI restarts
+/// the service before the setup wizard writes the enrollment it folded, the
+/// worker loads the file from before the reinstall, and its first save, a
+/// second after the wizard's, wrote that copy back. The reinstall's new
+/// enrollment never took.
+///
+/// A startup save therefore replaces the file only while it is still the one
+/// this daemon loaded or last wrote itself. Once another process has written
+/// it, the save is refused: this run keeps its in-memory copy, and the next
+/// start runs on the newer file. The writer restarts the daemon onto it, as
+/// the setup wizard and `install.sh` do.
+pub struct StartupWrites {
+    path: PathBuf,
+    /// The file as this daemon last knew it: read right after the load, then
+    /// after each of its own saves. `None` when it could not be read, which
+    /// leaves the saves unguarded, as they all were before.
+    seen: Option<Vec<u8>>,
+}
+
+impl StartupWrites {
+    /// Call right after [`load`] has returned the config this daemon runs on.
+    /// The file is read again here, so a write landing between the load's read
+    /// and this one, microseconds apart, would pass for the daemon's own copy.
+    /// The setup wizard never writes there: it waits for the daemon's LocalAPI,
+    /// which comes up after every startup save.
+    pub fn after_load(path: &std::path::Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            seen: std::fs::read(path).ok(),
+        }
+    }
+
+    /// [`save`] `cfg`, unless another process has written the file since this
+    /// daemon loaded it or last wrote it. A file that is gone, or cannot be
+    /// read back, is not written either: an uninstall or an unenroll removed
+    /// it, and a startup save must not bring the enrollment back.
+    pub fn save(&mut self, cfg: &AgentConfig) -> Result<()> {
+        if let Some(seen) = &self.seen {
+            let now = std::fs::read(&self.path).with_context(|| {
+                format!(
+                    "{} could not be read back before a startup save, so it is not written",
+                    self.path.display()
+                )
+            })?;
+            if &now != seen {
+                anyhow::bail!(
+                    "{} changed on disk after this daemon loaded it: another process wrote it \
+                     (a re-enrollment, an installer). This run's copy is not written over it, \
+                     and the next start runs on the newer file",
+                    self.path.display()
+                );
+            }
+        }
+        save(&self.path, cfg)?;
+        self.seen = std::fs::read(&self.path).ok();
+        Ok(())
+    }
 }
 
 /// [`save`], keeping the keys this build does not know of `base` rather than
@@ -6029,6 +6153,116 @@ tenant_id = "tid2"
                 .into_config()
                 .is_some_and(|c| c.overlay_enabled)
         );
+    }
+
+    /// #3116 — a read this process is refused is `Denied`, never `Unreadable`:
+    /// the file is closed to the reader, not damaged, and the wizard that read
+    /// it as damaged told the person their settings were lost.
+    #[test]
+    fn a_refused_read_is_denied_not_damaged() {
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("reading config at C:\\ProgramData\\roomler\\roomler\\config.toml");
+        assert!(permission_denied(&denied));
+        let parse = anyhow::anyhow!("expected a value").context("parsing config");
+        assert!(!permission_denied(&parse));
+        let said = describe_denied(
+            std::path::Path::new("C:/ProgramData/roomler/roomler/config.toml"),
+            "Access is denied. (os error 5)",
+        );
+        assert!(said.contains("may not read it"), "{said}");
+        assert!(said.contains("not damaged"), "{said}");
+        assert!(
+            !said.contains("do not carry over"),
+            "never the damaged wording: {said}"
+        );
+    }
+
+    /// #3116 — the same on a real file system: a config in a directory this
+    /// process may not open is `Denied`, and a directory it may not write fails
+    /// the probe that runs before an enrollment token is spent. Root reads and
+    /// writes past any mode, so as root there is nothing to see.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_directory_is_denied_and_fails_the_write_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = dir.path().join("roomler");
+        let path = sub.join("config.toml");
+        save(&path, &test_fixture()).expect("save");
+        assert!(probe_writable(&path).is_ok(), "an open directory");
+
+        let mode = |m: u32| std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(m));
+        mode(0o000).unwrap();
+        let root = std::fs::read(&path).is_ok();
+        let base = read_merge_base(&path);
+        mode(0o500).unwrap();
+        let probe = probe_writable(&path);
+        mode(0o700).unwrap();
+        if root {
+            return;
+        }
+        assert!(matches!(base, MergeBase::Denied { .. }), "{base:?}");
+        assert_eq!(
+            probe.expect_err("no write").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::read_dir(&sub).unwrap().count(),
+            1,
+            "the probe leaves nothing behind"
+        );
+    }
+
+    /// #3116 — a startup save lands while the file is the daemon's own copy,
+    /// and is refused once another process has written it. The setup wizard
+    /// wrote the folded enrollment a second after the MSI restarted the
+    /// service; the worker's first startup save put the copy it had loaded
+    /// before the reinstall back over it.
+    #[test]
+    fn a_startup_save_never_writes_over_a_newer_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut before = test_fixture();
+        before.agent_token = "OLD".into();
+        save(&path, &before).expect("the install before the reinstall");
+
+        // The daemon loads it and saves its own changes twice: both land.
+        let mut cfg = load(&path).expect("load");
+        let mut writes = StartupWrites::after_load(&path);
+        mark_run_starting(&mut cfg);
+        writes.save(&cfg).expect("the daemon's first save");
+        cfg.overlay_wg_secret_key = Some("KEY".into());
+        writes.save(&cfg).expect("its second, over its own first");
+        assert_eq!(
+            load(&path).unwrap().overlay_wg_secret_key.as_deref(),
+            Some("KEY")
+        );
+
+        // The wizard writes the folded enrollment.
+        let mut folded = load(&path).unwrap();
+        folded.agent_token = "NEW".into();
+        save(&path, &folded).expect("the wizard's write");
+        let wizard = std::fs::read(&path).unwrap();
+
+        // The daemon's next startup save is refused; the file stays the wizard's.
+        let err = writes.save(&cfg).expect_err("refused");
+        assert!(format!("{err:#}").contains("changed on disk"), "{err:#}");
+        assert_eq!(std::fs::read(&path).unwrap(), wizard);
+        assert_eq!(load(&path).unwrap().agent_token, "NEW");
+    }
+
+    /// #3116 — a config removed while the daemon starts (an unenroll, an
+    /// uninstall) is not brought back by a startup save.
+    #[test]
+    fn a_startup_save_never_recreates_a_removed_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        save(&path, &test_fixture()).expect("save");
+        let cfg = load(&path).expect("load");
+        let mut writes = StartupWrites::after_load(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(writes.save(&cfg).is_err());
+        assert!(!path.exists());
     }
 
     /// #3073 — ownership and the grant come before anything that can remove

@@ -1211,17 +1211,15 @@ mod win {
     };
     use windows_sys::Win32::Security::{
         ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
-        GetAce, GetAclInformation, GetTokenInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
+        GetAce, GetAclInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-        SetFileSecurityW, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-        WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        SetFileSecurityW, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_WRITE_DATA, OPEN_EXISTING,
         READ_CONTROL, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use super::{Anchor, AnchorAction, DoorbellReply, DoorbellRequest, RingLimiter};
 
@@ -1589,29 +1587,7 @@ mod win {
     /// Is this process elevated (or SYSTEM)? Only such a process may write
     /// the anchor, and saying so up front beats an access-denied halfway.
     fn process_is_elevated() -> bool {
-        if crate::win_identity::process_is_local_system() {
-            return true;
-        }
-        let mut token: HANDLE = std::ptr::null_mut();
-        // SAFETY: our own process's pseudo-handle; the token is closed below.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-            return false;
-        }
-        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
-        let mut len = 0u32;
-        // SAFETY: a live token; `elevation` is sized for TokenElevation.
-        let ok = unsafe {
-            GetTokenInformation(
-                token,
-                TokenElevation,
-                (&raw mut elevation).cast(),
-                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                &mut len,
-            )
-        };
-        // SAFETY: the handle OpenProcessToken gave us, closed once.
-        unsafe { CloseHandle(token) };
-        ok != 0 && elevation.TokenIsElevated != 0
+        crate::win_identity::process_is_elevated()
     }
 
     /// Is the doorbell's server end owned by SYSTEM? A standard user cannot

@@ -99,15 +99,16 @@ one line and the next rung is tried. Locked by tests
 | Linux arm64 | from 0.4.170 (FR-97 P7a): `h264/hevc/av1_nvenc` + `h264/hevc/av1/vp9_vaapi` + `h264/hevc/av1_vulkan` (ten), plus the `h264` decoder and the `aac` encoder, the Linux x86_64 tree built on an arm64 runner without qsv and amf (neither ships an arm64 Linux runtime); libva + libdrm in the tree, searching `/usr/lib/aarch64-linux-gnu/dri`. Where nothing opens (an Asahi Mac, a GPU-less server) the probe finds no hardware and video stays on OpenH264 + libvpx. No arm64 hardware cell has been proven in a session yet: [FR-122](fr/FR-122-arm64-linux-hardware-cell.md). Before 0.4.170: no FFmpeg | shared, bundled in the `.deb` and the tarball like x86_64's |
 
 > [!IMPORTANT]
-> **NVENC needs NVIDIA driver 570.0 or newer, on every OS.** FFmpeg opens NVENC
-> only when the driver's highest NVENC API is at least the SDK the build was
-> compiled against, so the header pin *is* the floor. Every tree takes
-> `nv-codec-headers` 13.0.19.0: Windows through the vcpkg baseline's `ffnvcodec`,
-> Linux by the vendor jobs' pin. Below the floor the probe advertises no NVENC
-> cell and the cascade's next rung serves. The Linux trees pinned 13.1 (driver
-> 610.00) until FR-122 P0c, which cost NVENC on NVIDIA's R580 long-term branch
-> and on AWS's G5g image (595). Each Linux vendor job now asserts the floor in
-> the binary it built ([FR-122 §3.2](fr/FR-122-arm64-linux-hardware-cell.md#32-the-nvenc-driver-floor-p0c)).
+> **NVENC needs NVIDIA driver 530.41 or newer on Linux, 570.0 on Windows.**
+> FFmpeg opens NVENC only when the driver's highest NVENC API is at least the
+> SDK the build was compiled against, so the header pin *is* the floor. Linux
+> takes `nv-codec-headers` 12.1.14.0 (the vendor jobs' pin, the oldest FFmpeg
+> 9.0.1 builds against); Windows takes 13.0.19.0 (the vcpkg baseline's
+> `ffnvcodec`). Below the floor the probe advertises no NVENC cell and the
+> cascade's next rung serves. The Linux trees pinned 13.1 (driver 610.00) until
+> FR-122 P0c, which cost NVENC on NVIDIA's R580 long-term branch and on AWS's
+> G5g image (595). Each Linux vendor job now asserts the floor in the binary it
+> built ([FR-122 §3.2](fr/FR-122-arm64-linux-hardware-cell.md#32-the-nvenc-driver-floor-p0c)).
 
 ## The cell matrix a host advertises (FR-77 P1)
 
@@ -832,7 +833,7 @@ rung, never the target.
 | `idr_count` | every keyframe the encoder emitted. Read against `dims_swaps` and the session's `PLI/FIR → forcing keyframe` lines (`peer.rs:836`) to isolate the rate-caused ones |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
-**The read for any host** — the FR-62 A0 sweep (`app.rs:6146`):
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6159`):
 
 ```
 roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
@@ -845,11 +846,11 @@ bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
 reads taught it:
 
 - **The rate change is charged with the keyframe on the rung's first output frame**
-  (`sweep_attribute_idrs`, `app.rs:6407`), not on frame 0. AMF answers the frame that
+  (`sweep_attribute_idrs`, `app.rs:6420`), not on frame 0. AMF answers the frame that
   fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
   "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
   for a backend that rebuilds on every move.
-- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6436`). Every
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6449`). Every
   backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
   CBR (`select_rc_mode` takes the CBR branch because the session opens with
   `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst

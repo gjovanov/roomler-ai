@@ -558,8 +558,24 @@ async fn run_install_inner(
         }
         emit(on_event, ProgressEvent::EnrollStarted);
         // F4 — a config there that does not load is said, recovered from its
-        // last good copy when it can be, and kept aside.
-        let existing = crate::enroll_step::read_existing(&config_path);
+        // last good copy when it can be, and kept aside. #3116 — one this
+        // person may not read (left root's by an old `sudo` install) stops
+        // the install here, before the enroll spends the token.
+        let existing = match crate::enroll_step::read_existing(&config_path) {
+            Ok(existing) => existing,
+            Err(said) => {
+                keep_after_privileged(&made);
+                return Err(failed(
+                    ErrorCode::ConfigWrite,
+                    format!(
+                        "{said} It belongs to another account: give it back to yours (sudo chown \
+                         \"$USER\" '{}') or remove it, then retry. Nothing was enrolled, and the \
+                         enrollment token is still unused.",
+                        config_path.display()
+                    ),
+                ));
+            }
+        };
         if let Some(message) = existing.warning.clone() {
             warn(on_event, message);
         }

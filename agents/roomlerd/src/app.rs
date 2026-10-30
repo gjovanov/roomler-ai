@@ -2949,6 +2949,13 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
             eprintln!("WARNING: {said}");
             recovered
         }
+        // #3116 — closed to this process, not damaged: folding into nothing
+        // would write a fresh config over the device's settings.
+        config::MergeBase::Denied { reason } => bail!(
+            "{} The enrollment is not adopted; run this as root (on Windows, from an elevated \
+             prompt).",
+            config::describe_denied(&target, &reason)
+        ),
     };
     let previous = existing.clone();
     let new_agent_id = fresh.agent_id.clone();
@@ -3654,6 +3661,12 @@ async fn run_cmd(
     // never reaches `default.target` twice. Per-user only, on its own thread.
     roomlerd::service::repair_session_wants_at_start();
     let mut cfg = config::load(config_path).context("loading config")?;
+    // #3116 — every save below, up to the LocalAPI coming up, writes THIS
+    // copy, so each goes through `startup_writes`: it refuses to write over a
+    // file another process wrote after this load (the setup wizard's folded
+    // enrollment, a second after the MSI restarted the service). The runtime
+    // writers after it reload under the write lock instead.
+    let mut startup_writes = config::StartupWrites::after_load(config_path);
     // FR-90 P2k-4 (F4) — an archive replica enrolled before its posture
     // joined the mesh joins it at its first start in a newer image, before
     // anything reads the overlay keys (the WG key is minted below from them).
@@ -3661,7 +3674,7 @@ async fn run_cmd(
         &mut cfg,
         std::env::var(roomlerd::archive_replica::IMAGE_ENV).is_ok_and(|v| v == "1"),
     ) {
-        match config::save(config_path, &cfg) {
+        match startup_writes.save(&cfg) {
             Ok(()) => tracing::info!(
                 "archive replica: joined the mesh, in the userspace stack (FR-90 P2k-4)"
             ),
@@ -3760,7 +3773,7 @@ async fn run_cmd(
     // server_url, resets cross-branch crash counters, and signals the
     // caller (us, here) to persist if anything actually changed.
     if config::migrate(&mut cfg) {
-        if let Err(e) = config::save(config_path, &cfg) {
+        if let Err(e) = startup_writes.save(&cfg) {
             tracing::warn!(error = %e, "config migration succeeded but persist failed; in-memory config still up-to-date");
         } else {
             tracing::info!(
@@ -3800,7 +3813,7 @@ async fn run_cmd(
     if cfg.overlay_enabled && cfg.overlay_wg_secret_key.is_none() {
         let kp = tunnel_core::overlay::WgKeypair::generate();
         cfg.overlay_wg_secret_key = Some(kp.secret_base64());
-        match config::save(config_path, &cfg) {
+        match startup_writes.save(&cfg) {
             Ok(()) => tracing::info!("overlay: generated + persisted node WireGuard key"),
             Err(e) => tracing::warn!(error = %e, "overlay: failed to persist WG key"),
         }
@@ -3811,7 +3824,7 @@ async fn run_cmd(
     // whose key a new device row retired, has none and would join nothing.
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     if roomlerd::org_join::heal_org_keys(&mut cfg)
-        && let Err(e) = config::save(config_path, &cfg)
+        && let Err(e) = startup_writes.save(&cfg)
     {
         tracing::warn!(error = %e, "overlay: failed to persist the orgs' WG keys");
     }
@@ -3821,7 +3834,7 @@ async fn run_cmd(
     // it gets the first free port now, persisted like the key above.
     #[cfg(feature = "overlay-netstack")]
     if roomlerd::org_join::heal_netstack_ports(&mut cfg)
-        && let Err(e) = config::save(config_path, &cfg)
+        && let Err(e) = startup_writes.save(&cfg)
     {
         tracing::warn!(error = %e, "overlay: failed to persist the netstack orgs' SOCKS ports");
     }
@@ -3862,7 +3875,7 @@ async fn run_cmd(
         match roomlerd::ssh::generate_host_key() {
             Ok(pem) => {
                 cfg.ssh_host_key = Some(pem);
-                match config::save(config_path, &cfg) {
+                match startup_writes.save(&cfg) {
                     Ok(()) => tracing::info!("ssh: generated + persisted node SSH host key"),
                     Err(e) => {
                         cfg.ssh_host_key = None;
@@ -3990,8 +4003,8 @@ async fn run_cmd(
         );
     }
     config::mark_run_starting(&mut cfg);
-    if let Err(e) = config::save(config_path, &cfg) {
-        tracing::warn!(error = %e, "could not persist crash-tracking state");
+    if let Err(e) = startup_writes.save(&cfg) {
+        tracing::warn!(error = %format!("{e:#}"), "could not persist crash-tracking state");
     }
 
     // If the crash counter has tripped the rollback threshold AND we
@@ -4017,7 +4030,7 @@ async fn run_cmd(
         // rollback fetch / install fails, the operator still gets
         // the attention sentinel below and can act manually.
         config::mark_rollback_attempted(&mut cfg);
-        let _ = config::save(config_path, &cfg);
+        let _ = startup_writes.save(&cfg);
 
         let outcome = updater::pin_version(&target_tag).await;
         match outcome {

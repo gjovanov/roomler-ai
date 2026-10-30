@@ -87,6 +87,16 @@
             token from my administrator.
           </label>
         </div>
+
+        <!-- #3116: on a reinstall the pre-logon service's config is in a
+             folder only administrators may open, so a wizard that is not
+             elevated stops here, before a token is pasted or paired. -->
+        <div id="elevation-note" class="warning" hidden>
+          <p>This device already has the background service, and its settings are
+          in a folder only administrators may open. To install it again, close
+          Roomler Setup, then right-click it and choose <strong>Run as
+          administrator</strong>. Or pick another option above.</p>
+        </div>
       </div>
 
       <!-- FR-102 P3b: opt-in setup diagnostics. Unticked by default, held in
@@ -408,6 +418,14 @@
         <p>The install itself is complete. To anchor this device later, run this from an
         elevated shell, with a fresh enrollment token from the dashboard:</p>
         <pre class="code" id="done-anchor-command"></pre>
+      </div>
+
+      <!-- #3116: a reinstall whose daemon was not restarted onto the new
+           enrollment. The config is written; the daemon takes it at its next
+           start. -->
+      <div id="done-restart-note" class="warning" hidden>
+        <strong>The Roomler service still runs the previous enrollment.</strong>
+        <p id="done-restart-reason"></p>
       </div>
 
       <!-- FR-129 B1: what the daemon on Linux / macOS still needs from the
