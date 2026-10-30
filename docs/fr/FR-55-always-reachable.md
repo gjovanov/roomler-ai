@@ -171,7 +171,7 @@ Decided in the design review, before the code:
   only (`crates/remote_control/src/models.rs:3493`): `power_policy` is a device setting,
   and settings are the fleet record.
 
-The P4 anchors are verified against #3148's branch, on master `19a0eeca1`.
+The P4 anchors are verified against #3148's branch, on master `7e7a862ad`.
 
 ## Acceptance criteria
 
