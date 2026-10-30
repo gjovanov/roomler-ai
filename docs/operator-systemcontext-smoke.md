@@ -75,6 +75,10 @@ If **False**, populate it via one of:
    config: self-healed perUser config to machine-global path
        (machine_id preserved; next boot is pre-logon-controllable)
    ```
+   When the person's config has device keys, the line before it is
+   `config: self-heal carried the device keys (peer-auth) to the machine-global path`.
+   The keys go first (#3096), so browsers that pinned the device keep
+   knowing it after the move.
 4. Recheck step 2.
 
 ### 2b. Direct write via `enroll --machine-global` (no logon required)
@@ -256,6 +260,9 @@ connects — no respawn churn.
 | `supervisor: worker has failed N times in a row` after a reboot, never recovering | machine-global config missing | step 2 |
 | `enroll --machine-global` → "requires elevated terminal" | not running as admin | re-open PowerShell as Administrator |
 | Worker starts post-logon but crash-loops pre-logon | self-heal hasn't run yet (needs one ≥5 min healthy logged-in run) OR use step 2b directly | step 2a wait, or step 2b explicit |
+| `config: machine-global self-heal withheld: the device keys (peer-auth) could not be copied` | the machine-global `peer-auth\` folder is not writable by the worker | fix the DACL (step 3); the self-heal retries after the next healthy run |
+| `config: the machine-global config cannot be read, so this SystemContext worker falls back` | the machine-global folder shuts SYSTEM out (#3073) | fix the DACL (step 3). Until then the worker runs on the person's config and signs with its device keys |
+| Browsers say `key-changed` after the move, and the log has `peer-auth: made this enrollment's device key` | the config was promoted without its `peer-auth\` (before #3096), and nobody was signed in at its first start, so there was no person's config to take the key from | the device's identity did not change. Its owner either trusts the new key in the viewer, or puts the old key file back from the person's `peer-auth\` |
 | `Users` appears in `icacls` output | rc.52 dir-DACL wasn't applied (typical for auto-update path) | run the manual `icacls` from step 3 |
 | `crash_recorder: malformed sidecar moved aside` (once) | a crash sidecar torn by a power loss or OS crash, usually NUL-filled (#2955). It now sits in `crashes\malformed\`; the crash it described is lost | nothing to fix; read the file there if the crash matters |
 | `crash_recorder: suppressed sidecar write … reason=HardCapReached` flooding the log | `%PROGRAMDATA%\roomler\roomler\crashes\` filled up (100 file cap) while crash-looping; uploader can't drain because worker never starts | step 2 first (fixes the loop), then `Remove-Item C:\ProgramData\roomler\roomler\crashes\*.json` to clear the backlog |
