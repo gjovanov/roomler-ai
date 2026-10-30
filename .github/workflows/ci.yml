@@ -58,6 +58,8 @@ jobs:
   #     the key run 36331413828 restored with a full match at 15:58 returned
   #     `No cache found` at 18:15 (run 36339984289, 36.8 min). PR runs now
   #     restore master's caches read-only.
+  #   * since wave 34, keeps that cache on the seed-cache release, not in the
+  #     Actions cache: rust-lint's restore step says why.
   rust-lint:
     name: Rust lint (fmt, clippy)
     # History of the single "Rust checks" job these lanes replaced (its
@@ -81,8 +83,9 @@ jobs:
     #
     # ⚠️ Correction (2026-09-28): the premise above is wrong. rust-cache
     # ignores `key` when `shared-key` is set, so an edit to this file never
-    # rotated the key, and those cold runs had another cause. The cache step
-    # below says what does rotate it, and what starts a lane cold.
+    # rotated the key, and those cold runs had another cause. Since wave 34
+    # the key is ci-seed-restore's, which a step change here does rotate (the
+    # salt step), and the restore step below says what starts a lane cold.
     #
     # Wave 14: every lane runs well under 10 min warm; 30 leaves a cold lane
     # (after an eviction, a toolchain bump or a new cache family) room to
@@ -95,6 +98,13 @@ jobs:
     # caches below take the mirror out of the hot path; this timeout turns
     # any residual pathological stall into a fast, loud, retryable failure
     # instead of a silent half-hour merge blocker.
+    # FR-6 wave 34: the cargo cache publishes as a release asset, which needs
+    # `contents: write`; see macos-overlay-check.
+    permissions:
+      contents: write
+    env:
+      # rust-cache set this for the job; with it gone, set it here.
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -130,56 +140,29 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Rust cache
-        # Swatinem prunes workspace-member artifacts + stale registry
-        # entries before saving — ~1–1.5 GB instead of the ~4 GB
-        # actions/cache tars (full ~/.cargo + target) this step used to
-        # write per Cargo.lock hash. Two of those were standing at once,
-        # blowing the repo's 10 GB Actions-cache budget and LRU-evicting
-        # the release lane's caches (agent-v0.3.0-rc.176 rebuilt FFmpeg
-        # from source for 29 min because of it).
-        #
-        # FR-6 wave 14: one family per lane, and only a master push saves
-        # (`save-if`). The note above this lane says why.
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34 (#773): the Linux lanes' cargo caches live on the
+        # seed-cache release, as the Windows and macOS lanes' have since wave
+        # 22, no longer in the Actions cache (Swatinem). On 2026-10-30 the
+        # Actions cache began refusing downloads ("Failed to restore: Egress
+        # is over the account limit."), and a refused restore built the whole
+        # lane cold: the unit lane compiled 1,795 crates in 27 min against
+        # ~8. Release assets are not behind that limit. One family per lane;
+        # only a master push publishes (this job's last step); the key, the
+        # prune and the parts over 2 GiB are .github/actions/ci-seed-restore's
+        # and ci-seed-save's. The salt step above still rotates the key when
+        # this job's steps change. Each lane's cap is ~1.5x its expected
+        # pruned target (the Actions-cache archive x the integration lane's
+        # 4.3 unpack ratio); a cold build over its cap would rebuild cold on
+        # every run (wave 33), and the save warns if one does.
+        id: seed
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: ci-lint
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-          # ⚠️ What rotates this key (corrected 2026-09-28, FR-6 #773). It is
-          # `v0-rust-<shared-key>-<os>-<arch>-<env hash>-<lockfile hash>`:
-          #   * the lockfile hash moves when a member crate's Cargo.toml
-          #     changes (a dependency, a feature), when Cargo.lock's
-          #     third-party entries change, or with rust-toolchain.toml or a
-          #     .cargo/config.toml. A version bump does NOT move it:
-          #     rust-cache blanks member versions and skips the workspace's
-          #     own Cargo.lock entries. On master on 09-27/28, four bumps
-          #     (0.4.108 → 0.4.113) kept one key, while three member-manifest
-          #     edits each rotated it (#1741 and #1752 added a dependency,
-          #     #1744 changed a feature);
-          #   * the env hash moves on the rustc version or any CARGO*, RUST*,
-          #     CC*, CFLAGS*, CXX* or CMAKE* env var (the job's environment,
-          #     not the workflow file's text). The rustc version is that of
-          #     EVERY installed toolchain, the runner image's own `stable`
-          #     included, so the salt step removes all but the pinned one
-          #     (wave 23): an image rollout that moved it made each family
-          #     flip between two keys, and every flip built cold.
-          # A new lockfile hash restores the newest older generation (the
-          # prefix match) and compiles only the delta. A new env hash,
-          # shared-key or prefix-key starts the lane cold.
-          # A `key:` input used to sit here with `hashFiles(ci.yml)`, claiming
-          # an edit to this file rotated the key. rust-cache reads `key` only
-          # when `shared-key` is unset (its src/config.ts, v2.9.2), so it was
-          # ignored: #1728, #1735 (+95 lines) and #1736 each edited this file
-          # on 09-27, and each master run restored the same key with a full
-          # match and saved nothing, so a new step's dependency builds stayed
-          # out of the cache. Since wave 16 the salt step above does what that
-          # input claimed, per job and without going cold: it writes one of
-          # the `.cargo/config.toml` files the lockfile hash covers, holding a
-          # hash of this job's own definition. A changed or added step here
-          # rotates this key; a comment edit or another job's edit does not.
+          family: lint
+          max-target-mb: "10000"
 
       - name: Check formatting
         run: cargo fmt --check --all
@@ -400,10 +383,28 @@ jobs:
         # default --workspace clippy never sees it. Lint it explicitly.
         run: cargo clippy -p roomlerd --features overlay-l3 -- -D warnings
 
+      # FR-6 wave 34 (#773): the job's LAST step. Only a master push
+      # publishes, and an unchanged cache is not re-uploaded; see the action.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: lint
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
   rust-unit:
     name: Rust unit tests (server + crates)
     timeout-minutes: 30
     runs-on: ubuntu-latest
+    # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -417,16 +418,17 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Rust cache
-        # rust-lint's cache step carries the notes: this lane's own family,
-        # saved only from a master push, keyed on Cargo.lock + the env.
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34: rust-lint's restore step carries the notes. This
+        # family is the largest, ~2.5 GB packed, so its target goes up in parts.
+        id: seed
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: ci-unit
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: unit
+          max-target-mb: "16000"
 
       # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
       # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
@@ -532,10 +534,27 @@ jobs:
       - name: Test the desktop companion (roomler-desktop)
         run: cargo test -p roomler-desktop --bins
 
+      # FR-6 wave 34: the job's LAST step; see rust-lint's.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: unit
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
   rust-agent:
     name: Agent tests (vp9-444, overlay, kernel TUN)
     timeout-minutes: 30
     runs-on: ubuntu-latest
+    # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -549,16 +568,16 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Rust cache
-        # rust-lint's cache step carries the notes: this lane's own family,
-        # saved only from a master push, keyed on Cargo.lock + the env.
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34: rust-lint's restore step carries the notes.
+        id: seed
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: ci-agent
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: agent
+          max-target-mb: "7000"
 
       # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
       # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
@@ -698,10 +717,25 @@ jobs:
           cat derp-tests.txt
           grep -E 'test result: ok\. [1-9][0-9]* passed' derp-tests.txt
 
+      # FR-6 wave 34: the job's LAST step; see rust-lint's.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: agent
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
   rust-recorder:
     name: Recorder tests (FR-85)
     timeout-minutes: 30
     runs-on: ubuntu-latest
+    env:
+      # rust-cache set this for the job; with it gone, set it here.
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -715,7 +749,7 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Rust cache
+      - name: Restore the cargo cache (release-asset store)
         # FR-6 wave 21 (#773): restores rust-recorder-audio's family and never
         # saves one of its own; a second copy cost ~600 MB of the free 10 GB
         # pool. That lane builds these features plus `audio`, and `cargo tree`
@@ -725,15 +759,16 @@ jobs:
         # `cargo build -p roomlerd` (no dev-dependency features under resolver
         # v2) needs tokio and ~25 dependents in a variant the audio lane never
         # builds, and rebuilds them. Measured on #1939: 273 s for the lane
-        # against 221-295 s on master, off the CI critical path. Same workflow
-        # env ⇒ same env hash ⇒ the prefix restore finds the family.
-        # rust-lint's cache step carries the general notes.
+        # against 221-295 s on master, off the CI critical path. Since wave 34
+        # the family is a seed-cache asset that restores by name, so this job
+        # has no publish step; rust-lint's restore step carries the notes.
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: ci-recorder-audio
-          save-if: false
+          family: recorder-audio
+          max-target-mb: "5000"
 
       # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
       # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
@@ -1025,6 +1060,11 @@ jobs:
     name: Recorder tests with audio + X11 pointer (FR-85)
     timeout-minutes: 30
     runs-on: ubuntu-latest
+    # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -1038,16 +1078,17 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Rust cache
-        # rust-lint's cache step carries the notes: this lane's own family,
-        # saved only from a master push, keyed on Cargo.lock + the env.
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34: rust-lint's restore step carries the notes. The plain
+        # recorder lane restores this family too and never publishes it.
+        id: seed
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: ci-recorder-audio
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: recorder-audio
+          max-target-mb: "5000"
 
       # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
       # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
@@ -1143,6 +1184,18 @@ jobs:
           grep -q "x11-real: the X11 pointer reached the cursor channel" /tmp/x11-tests.log
           grep -q "x11-real: the layouts .* read back, and the switch to de-DE and back took" /tmp/x11-tests.log
           grep -q "x11-real: the clipboard gate counted an owner change" /tmp/x11-tests.log
+
+      # FR-6 wave 34: the job's LAST step; see rust-lint's.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: recorder-audio
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
 
   rust:
     # The name the five lanes above shared when they were one job. It builds
@@ -1737,8 +1790,11 @@ jobs:
     name: ffmpeg-encoder compile + dispatch locks
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
     permissions:
-      contents: read
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -1747,12 +1803,16 @@ jobs:
         # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34: rust-lint's restore step carries the notes.
+        id: seed
         continue-on-error: true
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          shared-key: ci-ffmpeg-encoder
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: ffmpeg-encoder
+          max-target-mb: "5000"
       # Same ordering requirement as the Rust lanes' system-deps composite
       # (./.github/actions/ci-linux-system-deps): the index must be fresh
       # BEFORE the cached-apt step, or a cache miss resolves superseded
@@ -1864,6 +1924,18 @@ jobs:
         # They need the library present, not a GPU.
         run: cargo test -p roomlerd --features ffmpeg-encoder --lib
 
+      # FR-6 wave 34: the job's LAST step; see rust-lint's.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: ffmpeg-encoder
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
   recording-ffmpeg:
     # FR-85 P4 — the recorder and the export engine against the vendored
     # FFmpeg that carries the AAC encoder and the H.264 decoder (the
@@ -1887,9 +1959,11 @@ jobs:
     name: Recording with FFmpeg — AAC and H.264 decode (FR-85 P4)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
     permissions:
-      contents: read
+      contents: write
     env:
+      CARGO_INCREMENTAL: 0
       # ⚠️ `vp9-444` rides along ON PURPOSE, as in `ffmpeg-encoder-check`:
       # every shipped build that has `ffmpeg-encoder` has it, and without it
       # clippy reports `dead_code` on items that ARE used — from call sites
@@ -1907,12 +1981,16 @@ jobs:
         # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34: rust-lint's restore step carries the notes.
+        id: seed
         continue-on-error: true
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          shared-key: ci-recording-ffmpeg
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: recording-ffmpeg
+          max-target-mb: "5000"
       - name: Configure apt retries and refresh the index
         run: |
           echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
@@ -1978,6 +2056,18 @@ jobs:
           cargo test -p roomlerd --features "$REC_FEATURES" --lib recording::
           cargo test -p roomlerd --features "$REC_FEATURES" --test recorder
           cargo test -p roomlerd --features "$REC_FEATURES" --test export
+
+      # FR-6 wave 34: the job's LAST step; see rust-lint's.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: recording-ffmpeg
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
 
   fr-registry:
     name: FR registry integrity
@@ -2352,6 +2442,11 @@ jobs:
     name: Build profiles (FR-69)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -2363,14 +2458,16 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Rust cache
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34: rust-lint's restore step carries the notes.
+        id: seed
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: ci-profiles
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: profiles
+          max-target-mb: "5000"
 
       # `collab` is the only reduced profile that links mediasoup, whose worker
       # build wants cmake + libclang; the others need nothing beyond the
@@ -2413,3 +2510,15 @@ jobs:
           printf '%s\n' "$F" | grep -qx 'mediasoup' || { echo "::error::positive control failed: full does not list mediasoup"; fail=1; }
           printf '%s\n' "$F" | grep -qx 'roomler-ai-tunnel-core' || { echo "::error::positive control failed: full does not list roomler-ai-tunnel-core"; fail=1; }
           exit $fail
+
+      # FR-6 wave 34: the job's LAST step; see rust-lint's.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: profiles
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}

@@ -127,8 +127,27 @@ runs:
           exit 0
         fi
         ls -l "$pk" | tail -n +2
-        # A release asset is capped at 2 GiB.
-        for f in "$pk"/*.tar.zst; do
+        # A release asset is capped at 2 GiB. A target archive over the 1.9 GiB margin goes up as
+        # numbered 1,900 MiB parts, `<fam>-target.tar.zst.part00`, `.part01`, …, which
+        # ci-seed-restore concatenates (FR-6 wave 34: the Linux unit lane's runs ~2.5 GB).
+        # `dd`, not `split`: one spelling on GNU, BSD and Git Bash.
+        t="$pk/${FAM}-target.tar.zst"
+        tsz=$(wc -c < "$t")
+        if [ "$tsz" -gt 2040109465 ]; then
+          n=0
+          while [ $((n * 1992294400)) -lt "$tsz" ]; do
+            if ! dd if="$t" of="$(printf '%s.part%02d' "$t" "$n")" bs=1048576 \
+                   skip=$((n * 1900)) count=1900 2>/dev/null; then
+              echo "::warning::${FAM}: splitting the target archive failed — not publishing (the existing cache stays)"
+              rm -rf "$pk"
+              exit 0
+            fi
+            n=$((n + 1))
+          done
+          rm -f "$t"
+          echo "target archive is ${tsz} bytes: publishing it in ${n} parts"
+        fi
+        for f in "$pk"/*; do
           sz=$(wc -c < "$f")
           if [ "$sz" -gt 2040109465 ]; then
             echo "::warning::${FAM}: $(basename "$f") is ${sz} bytes, over the 1.9 GiB margin of the asset cap — not publishing"
@@ -138,16 +157,36 @@ runs:
         done
 
         ok=1
-        for f in "$pk/${FAM}-cargo.tar.zst" "$pk/${FAM}-target.tar.zst"; do
-          [ -f "$f" ] || continue
+        want=""
+        for f in "$pk"/*; do
+          want="$want $(basename "$f")"
           gh release upload seed-cache "$f" --repo "${GITHUB_REPOSITORY}" --clobber || ok=0
         done
         rm -rf "$pk"
+        # The target goes up whole or in parts, never both. Retire this family's target assets
+        # that this publish did not write (the other form, or parts past the new count). A
+        # restore prefers a whole asset, and parts from two publishes fail to unpack. Only after
+        # every upload landed: a half-published set must not retire the old cache that works.
+        if [ "$ok" = "1" ]; then
+          names=$(gh release view seed-cache --repo "${GITHUB_REPOSITORY}" --json assets \
+                    --jq '.assets[].name' 2>/dev/null) || ok=0
+          for a in $names; do
+            case "$a" in "${FAM}-target.tar.zst"|"${FAM}-target.tar.zst.part"*) ;; *) continue ;; esac
+            case " $want " in *" $a "*) continue ;; esac
+            gh release delete-asset seed-cache "$a" --repo "${GITHUB_REPOSITORY}" --yes \
+              && echo "retired ${a}" || ok=0
+          done
+        fi
+        # Every asset this publish wrote must be there.
         have=$(gh release view seed-cache --repo "${GITHUB_REPOSITORY}" --json assets \
-                 --jq "[.assets[].name] | map(select(startswith(\"${FAM}-\"))) | length" 2>/dev/null || echo 0)
-        if [ "$ok" = "1" ] && [ "${have:-0}" -ge 2 ]; then
-          echo "cache published: ${FAM} (both assets on seed-cache)"
+                 --jq '.assets[].name' 2>/dev/null)
+        missing=""
+        for w in $want; do
+          printf '%s\n' "$have" | grep -qxF "$w" || missing="$missing $w"
+        done
+        if [ "$ok" = "1" ] && [ -n "$want" ] && [ -z "$missing" ]; then
+          echo "cache published: ${FAM} (${want# })"
         else
-          echo "::warning title=CI cache did not publish::'${FAM}' assets are incomplete on the seed-cache release (upload ok=${ok}, assets present=${have}) — the next run of this job builds cold"
+          echo "::warning title=CI cache did not publish::'${FAM}' assets are incomplete on the seed-cache release (upload ok=${ok}, missing:${missing:- none}) — the next run of this job may build cold"
         fi
         exit 0
