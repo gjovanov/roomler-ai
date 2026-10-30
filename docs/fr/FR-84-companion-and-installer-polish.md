@@ -72,7 +72,7 @@ it. Do not shift these anchors with code that moved later.*
 | swallowed errors | `agents/roomler-desktop/src/commands.rs:1143-1147`, `:1188-1193` | `Err(_) => Vec::new()` — any failure renders as "no routes" |
 | empty paint | `tunnels.js:126-129`, `:176-179` | `paintRoutes([])` hides the table; `paintFlows([])` hides the card |
 | pipe server | `crates/localapi/src/lib.rs:1796-1871` | ONE listening instance; the next is created only after `connect()` returns |
-| pipe client | `crates/localapi/src/lib.rs:2156-2176` | retries `ERROR_PIPE_BUSY` once, after 50 ms |
+| pipe client | `crates/localapi/src/lib.rs:2133-2153` | retries `ERROR_PIPE_BUSY` once, after 50 ms |
 | settings list | `crates/agent-core/src/config_surface.rs:42-876` | 150 `(key, kind, description)` tuples, no grouping; `restart_required` hard-coded `true` (`:21, :827, :841`) |
 | live keys | `agents/roomler-desktop/src/front/settings.js:60-63` | a hand-kept `LIVE_KEYS` list the daemon does not know about |
 | restart | — | nothing in the desktop or on the LocalAPI can restart the daemon |
