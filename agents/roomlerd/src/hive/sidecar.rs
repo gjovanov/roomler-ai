@@ -68,6 +68,7 @@ use zeroize::Zeroizing;
 use super::supervisor::Supervisor;
 use super::vault_connect::handed::Secret;
 
+#[cfg(worker_calls)]
 pub(crate) mod handed;
 
 /// Where model calls go when nothing else is configured.
@@ -471,6 +472,12 @@ pub(crate) async fn open(
 ) -> Result<Sidecar, String> {
     let (listener, port) = bind().await?;
     let stop = CancellationToken::new();
+    // `fence` is read only by `handed::prepare` and the `handed` field
+    // below, both compiled out where `worker_calls` is off (the `vault`
+    // feature) — without this, that configuration sees the parameter as
+    // unused.
+    #[cfg(not(worker_calls))]
+    let _ = fence;
     #[cfg(worker_calls)]
     let prepared = handed::prepare(
         session,
@@ -483,6 +490,12 @@ pub(crate) async fn open(
     #[cfg(not(worker_calls))]
     let prepared: Option<u64> = None;
     if let Some(endpoint) = prepared {
+        // `endpoint` is read only by the `handed` field below, itself
+        // compiled out where `worker_calls` is off — without this, that
+        // configuration sees the binding as unused (mirrors
+        // `toolbelt::open`'s own identical guard).
+        #[cfg(not(worker_calls))]
+        let _ = endpoint;
         return Ok(Sidecar {
             port,
             stop,

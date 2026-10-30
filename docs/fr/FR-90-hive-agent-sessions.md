@@ -392,12 +392,12 @@ sequenceDiagram
 | The owner promotes, holding `HIVE_RUN` | a promotion starts the session on a device, as one of its accounts | P2e-3: `crates/modules/hive/src/promote.rs:445` (`authorize`) |
 | Prepare first, the CAS last: the target passes every start gate, as it is configured now, before anything moves, and the lease moves only when the target's own tip equals the drained one | a refusal or a stalled sync leaves the session where it was (design §6.2) | P2e-3: `crates/modules/hive/src/promote.rs:1288` (`on_prepare_ack`), `:1805` (`sync_of`), `crates/modules/hive/src/dao.rs:793` (`move_lease`); the target's gates, P2e-5a: `agents/roomlerd/src/hive/supervisor.rs:2582` (`prepare`: a start's gates without its side effects, and the copy, `:2770`) |
 | The drain waits for the turn to end, at most 60 s, then cuts it. Open approvals are withdrawn with it, and the resume note names the last tool call that has no result | a turn waiting on a person could not end, and the lease must not move while the old primary may still be calling the model | P2e-4: `agents/roomlerd/src/hive/supervisor.rs:5541` (`take_up_drain`: the approvals withdrawn at once, and one that opens meanwhile, `:5681`), `:5939` (`on_drain_deadline`: the cut, with Claude Code's own interrupt, `:5588`), `:6365` (`finish_drain`: the last checkpoint and the tip); the resume note, P2e-7; the server waits 75 s (`crates/config/src/settings.rs:237`, `hive.promote_drain_secs`) and withdraws on the record what is still open at the move (`promote.rs:1839`) |
-| ⚠️ An unreachable primary is waited out. The server promotes away from a primary whose control connection it lost only `WS_RX_DEADLINE + OFFLINE_GRACE + 30 s` (230 s) after it lost it, and closes the socket of one that ignores a drain, to start that clock | by then at the latest, the device's own sidecar has stopped serving the session (`agents/roomlerd/src/signaling.rs:61`, `agents/roomlerd/src/hive/sidecar.rs:78`, `:199`). Before it, two executors could both call the model | P2e-6a: `crates/modules/hive/src/promote.rs:355` (`unreachable_reach`: 230 s, and `hive-lease` in the last hello), `:1621` (`move_from_unreachable`: to the member's own tip); the 230 s held to the device's two clocks by `agents/roomlerd/src/hive/sidecar/tests.rs:985`. As built, no socket is closed (the P2e-6a note below) |
+| ⚠️ An unreachable primary is waited out. The server promotes away from a primary whose control connection it lost only `WS_RX_DEADLINE + OFFLINE_GRACE + 30 s` (230 s) after it lost it, and closes the socket of one that ignores a drain, to start that clock | by then at the latest, the device's own sidecar has stopped serving the session (`agents/roomlerd/src/signaling.rs:61`, `agents/roomlerd/src/hive/sidecar.rs:79`, `:199`). Before it, two executors could both call the model | P2e-6a: `crates/modules/hive/src/promote.rs:355` (`unreachable_reach`: 230 s, and `hive-lease` in the last hello), `:1621` (`move_from_unreachable`: to the member's own tip); the 230 s held to the device's two clocks by `agents/roomlerd/src/hive/sidecar/tests.rs:985`. As built, no socket is closed (the P2e-6a note below) |
 | Every member's floor is the new fence before the new primary writes: the target's with its join, the others' with theirs, an offline member's before anything else it hears when it connects | the old primary's late events are then refused everywhere (`chain.rs:195`) | P2e-3: every join at the move, the old primary demoted first, the target's as the primary before its move and start (`promote.rs:1839`, `:1956`); a member behind the drained tip keeps the old fence's events up to where it ended (`crates/modules/hive/src/model.rs:191`, `fences`), P2e-5b: every join carries them (`crates/modules/hive/src/replica.rs:129`, `push_join`) and the member's store takes an older fence's events up to its end (`crates/hive-node/src/chain.rs:210`, `check_next_with_ends`); P2e-5c: the target takes that join up ahead of its start, raising its copy's floor (`agents/roomlerd/src/hive/supervisor/replica.rs:394`, `ahead_of_start`) |
 | The new primary counts turns on from the record's last, which `rc:hive.move` carries with who moved the session and from where | the server ignores a stub older than its newest (`crates/modules/hive/src/dao.rs:524`) | P2e-3: `promote.rs:1949` (`before_start`); the count, P2e-5a: `agents/roomlerd/src/hive/supervisor.rs:1705` (`receive_move`), `:4296` (what the device hosts) |
 | A start at a newer fence on a device that still runs an older one stops that run first, and `finish` and `let_go` remove only their own fence's entry | §3d ⚠️: before P2e-1, `decide_and_launch` was idempotent on one fence only and `finish` and `let_go` removed by session, so a second harness would have started, and the old run's end would have taken the new run's model access | P2e-1: `agents/roomlerd/src/hive/supervisor.rs:2051` (`decide_and_launch`), `:3180` (`supersede`), `:4056` (`unlive`) |
 | A start refused after the CAS moves the lease back (fence n+2, to the old primary, which holds the copy) | a session is never left on a device that refused it | P2e-3: `promote.rs:2100` (`on_start_refused`), `dao.rs:845` (`move_lease_back`) |
-| ⚠️ A replicated session is never launched, nor let call the model, after a start, a restart or a reconnect, until the server has said on THAT connection that this device holds it at that fence: `rc:hive.lease` lets it run (as built in P2e-2: its own frame, not the primary's join, which the replicaset's switch gates), `rc:hive.demote` ends it here. A session with no other member keeps P1's behaviour | before P2e-2, a reconnect cleared the `offline_grace` clock at once and P1d-2's resume launched before the server had said anything: a demoted primary that came back could call the model until the demote landed. AC4 says zero | P2e-2: `agents/roomlerd/src/hive/sidecar.rs:226` (`wait_for_lease_word`), `agents/roomlerd/src/hive/supervisor.rs:3542` (the resume held back), `crates/modules/hive/src/agent_socket.rs:894` (`answer_manifest`) |
+| ⚠️ A replicated session is never launched, nor let call the model, after a start, a restart or a reconnect, until the server has said on THAT connection that this device holds it at that fence: `rc:hive.lease` lets it run (as built in P2e-2: its own frame, not the primary's join, which the replicaset's switch gates), `rc:hive.demote` ends it here. A session with no other member keeps P1's behaviour | before P2e-2, a reconnect cleared the `offline_grace` clock at once and P1d-2's resume launched before the server had said anything: a demoted primary that came back could call the model until the demote landed. AC4 says zero | P2e-2: `agents/roomlerd/src/hive/sidecar.rs:227` (`wait_for_lease_word`), `agents/roomlerd/src/hive/supervisor.rs:3542` (the resume held back), `crates/modules/hive/src/agent_socket.rs:894` (`answer_manifest`) |
 | A report from a device that is no longer the session's location is answered with `rc:hive.demote` | before P2e-1, `stop_if_over` returned for any device but the location, so an old primary would never have been told | P2e-1: `crates/modules/hive/src/agent_socket.rs:943` (`demote_if_elsewhere`), from `stop_if_over` (`:844`), the turn and approval reports (`:666`, `:693`) and the manifest (`:918`) |
 | The old primary forgets the session in `hosted.json` only at the demote, and stays a member if its `hive_replica` is on (else it leaves, once `min` holds elsewhere), so moving back is a promotion | a crash during a move leaves the session where it was | the forgetting, P2e-1: `agents/roomlerd/src/hive/supervisor.rs:3117` (`demote`); the membership, P2e-3: a member where placement's rules let it hold a copy, else `leaving` (`crates/modules/hive/src/placement.rs:177`, `eligible_role`) |
 
@@ -984,9 +984,9 @@ Demoted to a newer fence, its next call, made while the run has not let go yet, 
 | A second primary would come from | What stops it | Where |
 |---|---|---|
 | two promotions at once | the CAS on `{_id, fence: n}`: one moves the lease, the other matches nothing | every device transition is such a CAS (`dao.rs:148`, `:222`); P2e-3: a promotion begins only where none is in flight, and the lease moves only for the record's own (`crates/modules/hive/src/dao.rs:568`, `:793`) |
-| a partitioned primary still running | its own sidecar stops `offline_grace` after its connection closed, and the server waits that out before the CAS | `sidecar.rs:199` |
-| the old primary reconnecting or restarting | a replicated session runs only on the server's word on that connection | `sidecar.rs:180`, `supervisor.rs:3470` (P2e-2) |
-| a demoted run's model calls | the sidecar forwards a call only while the session runs here at its token's fence, and a demote ends that at once | `sidecar.rs:179`; at the provider, `a_demoted_run_makes_no_model_call` (P2k-7) |
+| a partitioned primary still running | its own sidecar stops `offline_grace` after its connection closed, and the server waits that out before the CAS | `sidecar.rs:200` |
+| the old primary reconnecting or restarting | a replicated session runs only on the server's word on that connection | `sidecar.rs:227`, `supervisor.rs:3470` (P2e-2) |
+| a demoted run's model calls | the sidecar forwards a call only while the session runs here at its token's fence, and a demote ends that at once | `sidecar.rs:180`; at the provider, `a_demoted_run_makes_no_model_call` (P2k-7) |
 | its late events | every member's floor | `chain.rs:195` |
 | its reports | the server's CAS ignores them, and answers with a demote | `dao.rs:256`, `agent_socket.rs:943` (P2e-1) |
 | its viewers and approvals | the session's grants on the old device end at the CAS (`crates/modules/hive/src/view.rs:863` `end_grants`), and an approval is answered only over a grant | §3c; P2e-3: every view and stream of the session ends at the move, and what the old run had open is withdrawn (`crates/modules/hive/src/promote.rs:1839`) |
@@ -1454,7 +1454,7 @@ Found while building it, for P1i-2: two more Unix-shaped points the table above 
 replica store's directory is locked with mode `0700` (`hive/supervisor.rs` `private_dir`). On
 Windows that is a protected DACL of SYSTEM and Administrators, set as the directory is made, and
 the runtime directory under `%ProgramData%` needs its own, because a directory there inherits
-read for Users. And the sidecar runs `hive_api_key_helper` through `/bin/sh -c` (`hive/sidecar.rs:294`),
+read for Users. And the sidecar runs `hive_api_key_helper` through `/bin/sh -c` (`hive/sidecar.rs:295`),
 which on Windows is `cmd.exe /d /c`.
 
 Nine negative controls each fail their test: the job without `KILL_ON_JOB_CLOSE`; the assignment
@@ -1513,7 +1513,7 @@ flowchart LR
 | the stop | `hive/supervisor.rs:3309`: stdin closed, then the job ended after the grace. No signal reaches a console-less process | — |
 | the toolbelt | `hive/toolbelt.rs:990`: a named pipe, `FILE_FLAG_FIRST_PIPE_INSTANCE`, no remote client, with `hive_win.rs:990`'s DACL: SYSTEM and Administrators, and the session's account to read and write (`0x12008b`) but not to make an instance. The relay opens it with exactly that mask (`hive_win.rs:1131`); each client's account is checked again by SID (`toolbelt.rs:1067`) | every approval test, over the pipe; another account's connection dropped unanswered; a name in use never taken as the first |
 | a crash's leftover | `hive/procs.rs:120`, `:248`: creation times by `GetProcessTimes`, and an ended process reads as none even while a handle holds it open | an ended process has no start time; `take_down` ends what it is given |
-| the key helper | `hive/sidecar.rs:300`: `cmd.exe /d /s /c "<helper>"`, by its full path, passed raw | — |
+| the key helper | `hive/sidecar.rs:301`: `cmd.exe /d /s /c "<helper>"`, by its full path, passed raw | — |
 | adopting | `hive/gates.rs:79`: `hive_adopt` reads off on Windows, so the device never advertises `hive-adopt` | the owner's word on Unix, off on Windows. Since FR-97 P4c, the owner's word on Windows too, through a named pipe (`docs/hive.md` §8, *On Windows*) |
 
 ⚠️ **What ends a session's harness on Windows, and what does not.** A session's harness lives in
@@ -1995,7 +1995,7 @@ the design document's §7 and §8; what follows binds it to the code as it stand
     elevation cannot pass for it.
 
 **A session's identity to the vault.** The token the sidecar mints is the device's own, bound to the
-session and its fence (`agents/roomlerd/src/hive/sidecar.rs:103`). To the server, a session is its
+session and its fence (`agents/roomlerd/src/hive/sidecar.rs:104`). To the server, a session is its
 record. So a vault request is a frame from the device that runs the session, naming the session and
 its fence. The vault believes it only from the record's location at that fence, as hive's frames
 are (`crates/modules/hive/src/agent_socket.rs:943`), and with the role the session assumed at its
@@ -4536,7 +4536,7 @@ socket, so it crosses the same way `vault_connect`'s own loopback endpoints alre
 The sidecar's port joins the listeners a worker is handed (P8-0's point 2) — the second of the two
 point 2 names, closing P8-2c's own scope. Decision 68 (the operator's, 2026-10-30, §6): a per-session
 port, not folded into P8-2d's planned device-wide worker. Each session now binds its own loopback
-listener in [`sidecar::open`](../../agents/roomlerd/src/hive/sidecar.rs#L465) — mirroring
+listener in [`sidecar::open`](../../agents/roomlerd/src/hive/sidecar.rs#L466) — mirroring
 [`toolbelt::open`](../../agents/roomlerd/src/hive/toolbelt.rs#L893)'s own shape exactly — in place of
 the one shared, device-wide listener `sidecar.rs` bound once and kept for the daemon's whole life
 since P0e, multiplexing every session by a `/s/<sid>` path prefix. `ANTHROPIC_BASE_URL` is now this
@@ -4544,14 +4544,14 @@ session's own port, its whole address: nothing left to route within once the por
 session's boundary, so `split_session` and the path prefix are gone, not left as dead weight. The
 daemon keeps the listener it bound; a copy crosses to the worker (Unix `SCM_RIGHTS`, Windows
 `WSADuplicateSocketW`'s protocol info), which runs the real HTTP dispatch —
-[`serve`](../../agents/roomlerd/src/hive/sidecar.rs#L512) and
-[`handle`](../../agents/roomlerd/src/hive/sidecar.rs#L674), UNCHANGED — against it.
+[`serve`](../../agents/roomlerd/src/hive/sidecar.rs#L525) and
+[`handle`](../../agents/roomlerd/src/hive/sidecar.rs#L687), UNCHANGED — against it.
 
 ⚠️ **Only the listener moved — never the admission, and never the key in bulk.**
 `sidecar_admit`'s fence check, `wait_for_lease_word`'s lease wait and `model_key`'s
 helper-fetched credential all still run in the daemon only, in the same order a
 daemon-hosted call already ran them in, now behind one new method,
-[`sidecar_admit_and_key`](../../agents/roomlerd/src/hive/sidecar.rs#L270), that both paths call —
+[`sidecar_admit_and_key`](../../agents/roomlerd/src/hive/sidecar.rs#L271), that both paths call —
 so a worker-hosted session and a daemon-hosted one cannot drift apart. A worker asks for the
 key fresh, one call's worth at a time; it is never held past the request that asked for it, and
 crosses as [`Secret`](../../agents/roomlerd/src/hive/vault_connect/handed.rs#L56) — the same
@@ -4560,11 +4560,11 @@ zeroizing wrapper `vault_connect`'s own leased values already cross as.
 | Piece | As built |
 |---|---|
 | the listener | [`handed::prepare`](../../agents/roomlerd/src/hive/sidecar/handed.rs#L94), called from `sidecar::open` where a worker serves this run — synchronous, mirroring `toolbelt::handed::prepare`'s own sync-then-spawn split and for the same reason: a connection that arrives before the hand-over's round trip completes queues in the listener's own backlog, rather than the session's launch blocking on a worker that may be slow to start |
-| a call | one round trip, [`WorkerSource::admit`](../../agents/roomlerd/src/hive/sidecar/handed.rs#L392): the worker asks [`Call::SidecarAdmit`](../../agents/roomlerd/src/hive/vault_connect/handed.rs#L193) `{endpoint, token}`, the daemon's [`admit`](../../agents/roomlerd/src/hive/sidecar/handed.rs#L265) answers `Answer::SidecarKey {key}` or `Answer::SidecarRefused {kind, message}` — a narrow [`AdmitRefusalKind`](../../agents/roomlerd/src/hive/sidecar.rs#L158) enum, not a raw status code, so the worker rebuilds the exact status and error vocabulary `sidecar_admit`/`wait_for_lease_word` chose, never a generic one |
+| a call | one round trip, [`WorkerSource::admit`](../../agents/roomlerd/src/hive/sidecar/handed.rs#L392): the worker asks [`Call::SidecarAdmit`](../../agents/roomlerd/src/hive/vault_connect/handed.rs#L193) `{endpoint, token}`, the daemon's [`admit`](../../agents/roomlerd/src/hive/sidecar/handed.rs#L265) answers `Answer::SidecarKey {key}` or `Answer::SidecarRefused {kind, message}` — a narrow [`AdmitRefusalKind`](../../agents/roomlerd/src/hive/sidecar.rs#L159) enum, not a raw status code, so the worker rebuilds the exact status and error vocabulary `sidecar_admit`/`wait_for_lease_word` chose, never a generic one |
 | the provider's 401 | [`Call::SidecarForgetKey`](../../agents/roomlerd/src/hive/vault_connect/handed.rs#L199), so the daemon's cached key is fetched again next time — exactly what a daemon-hosted call's own 401 already does, now also reachable from a worker |
 | a new worker | [`rehand`](../../agents/roomlerd/src/hive/sidecar/handed.rs#L145) hands the kept listener again, both OSes, the same shape `vault_connect`'s own `rehand` already has |
-| no worker up | `sidecar::open` serves it in the daemon directly — [`DaemonSource`](../../agents/roomlerd/src/hive/sidecar.rs#L376), calling the `Supervisor`'s own methods straight, no channel at all |
-| the session's end | the per-session [`Sidecar`](../../agents/roomlerd/src/hive/sidecar.rs#L420), held only by `Inputs` and read by nothing else, drops with the run's task exactly as `Toolbelt` already does: its `stop` cancels the accept loop, and where handed, a `Call::SidecarClose` on a task of its own (`Drop` cannot await) tells the worker |
+| no worker up | `sidecar::open` serves it in the daemon directly — [`DaemonSource`](../../agents/roomlerd/src/hive/sidecar.rs#L377), calling the `Supervisor`'s own methods straight, no channel at all |
+| the session's end | the per-session [`Sidecar`](../../agents/roomlerd/src/hive/sidecar.rs#L421), held only by `Inputs` and read by nothing else, drops with the run's task exactly as `Toolbelt` already does: its `stop` cancels the accept loop, and where handed, a `Call::SidecarClose` on a task of its own (`Drop` cannot await) tells the worker |
 
 The trade decision 68 takes knowingly: a stale call past a session's own end now finds the
 connection refused outright, where a lingering shared listener used to answer `401
@@ -4945,7 +4945,7 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
   partition the session had been moved away through. Each time it logged "a newer fence took the
   session — its run here stops". After the partition nothing on the device called the model, by
   its sidecar's log and its process list. The sidecar admits a call only from a run at the live
-  fence (`agents/roomlerd/src/hive/sidecar.rs:194`), and
+  fence (`agents/roomlerd/src/hive/sidecar.rs:195`), and
   `a_demote_fences_the_run_out_at_once_and_nothing_resumes_it` holds that a demote ends that at
   once. The capture is P2k-7's (#2353): `a_demoted_run_makes_no_model_call` sends a demoted run's
   call through the sidecar to a mock provider. The call is made while the run still holds its live
