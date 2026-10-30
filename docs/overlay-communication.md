@@ -734,8 +734,9 @@ Windows.
 ⚠️ **To read the cap on a host, grep its log for `overlay derp: send buffer`.**
 A node writes the line each time its `/derp` socket connects. Since the
 always-on floor (`ROOMLERD_OVERLAY_DERP_FLOOR`, default on since rc.400) opens
-the central `/derp` socket at startup, that is every node, and a regional
-relay's socket logs a line of its own under its `relay` name. Expect
+the central `/derp` socket at startup (see the lazy connection below), that is
+every node, and a regional relay's socket logs a line of its own under its
+`relay` name. Expect
 `clamped=true applied=212992` on a stock Linux kernel before 6.18, and
 `applied=262144` on Windows and macOS. On Linux, `ss -tmp` shows the same
 socket's `tb` as twice `applied`.
@@ -746,6 +747,13 @@ so that a transient overflow never latches the carrier dead. FR-18's design
 also named a `dropped_full` counter, and it was never built.
 
 ### Lazy connection
+
+⚠️ **Since rc.400 the always-on floor opens `/derp` on every node at startup**
+(`ROOMLERD_OVERLAY_DERP_FLOOR`, default on;
+`crates/tunnel-core/src/overlay/runtime.rs:2576`), so that DERP can carry every
+fresh pair from birth while better tiers upgrade over it. A server's force-DERP
+push can open it mid-run too. The lazy rule below is what a node does with the
+floor switched off.
 
 DERP is default-ON, but the `/derp` WS is opened **only when the node is itself
 UDP-blocked** — that is, when its own srflx gather came back empty, the same
@@ -930,6 +938,7 @@ prefix is still honoured.
 | `…_SRFLX_KEEPALIVE_SECS` | 20 | STUN keepalive holding the mapping open |
 | `…_RELAY_SINGLE` | on | single-relay tier |
 | `…_DERP` | **on** since rc.203 | DERP tier |
+| `…_DERP_FLOOR` | **on** since rc.400 | the always-on floor: every node opens its central `/derp` socket at startup, and DERP carries each fresh pair while better tiers upgrade over it (§6); off = open `/derp` only when UDP-blocked, or when a force-DERP push asks |
 | `…_ORG_RELAY` | off | ride a tenant-owned org relay when the server mints a session for a pair (FR-19 P4b); serving is `RELAY_SERVER_ENABLED` |
 | `…_PATHMON` | **on** | path-monitor telemetry (`on`/`shadow`/`off`). Selection is always monitor-driven since rc.282 — non-`on` values only silence the 10-min decision summaries |
 | `…_ROUTE_EVENTS` | **on** | event-driven route guard: OS route-change subscription driving immediate re-asserts; off = 2 s blind tick only |
