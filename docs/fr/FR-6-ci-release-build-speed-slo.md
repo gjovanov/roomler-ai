@@ -1208,3 +1208,12 @@ itself on the affected run's page. Baseline when the program started: releases t
 - 2026-10-30, 21:09Z: **waves 35 and 36 (#3170) merged as `ead2192c9`.** The PR's own run
   (41124429682) was a code PR: `What changed` found `.github/workflows/ci.yml` outside the docs,
   set `heavy=true`, and every job ran. The slowest took 10.7 min (Windows clippy).
+- 2026-10-30, 21:18Z: **wave 35 holds on this close-out PR (#3184), the first docs-only PR after
+  it.** In its run (41130010043), `What changed` read 3 paths, none outside the docs, set
+  `heavy=false` and posted the skip notice. The twelve heavy jobs skipped, and the other nine
+  passed, "Rust checks" included. The nine ran 3 s to 2 min 40 s each, yet the run took 22 min,
+  nearly all of it waiting for runners: `What changed` waited 6 min, the last audits 21. The
+  twelve jobs it skipped had taken 84 runner-minutes on #3170's code-PR run, three Windows jobs
+  and the macOS one among them.
+- 2026-10-30, evening: **closed again**, waves 33–36 shipped; #773's Result comment carries the
+  evidence.
