@@ -322,10 +322,13 @@ flowchart LR
   - The rule is `far_turn_verdict` (`:135`): either end measured dead is `false`; both measured alive is `true`; anything else is not measured.
   - The gate waits at most 500 ms, then sends no hint. A slow read costs the hint, never the session.
 - **Which device is the viewer's** follows the Hub's own precedence (`viewer_device_of`, `controller.rs:663`): a probed descriptor's device wins over a named one.
+- ⚠️ **The hint has two blind spots** (FR-128 D8, open):
+  - **A Mac target is never measured.** The hook finds nodes by agent id (`find_live_by_agent`, `crates/services/src/dao/overlay_node.rs:413`). A Mac's RC target is its GUI worker's row, which has no overlay node; the node belongs to the daemon's row. So for a Mac target the hint reads `false` only when the viewer's device measured the far TURN dead.
+  - **Only the browser's first device counts** (`local_relay: probed[0]`, `ui/src/composables/useRemoteControl.ts:4118`). On a Windows computer that is whichever agent holds the first loopback port. A WSL agent there can measure the far TURN dead while Windows reaches it.
 - **The Hub** reads `auto` as `off` for an agent that does not advertise `rc-overlay-auto` (`effective_rc_overlay`, `crates/modules/fleet/src/hub.rs:2767`). It decides this once per request, for the relay and the session alike.
 - **Under `auto` the Hub hands out the browser's relays** to both ends, as under `on` (`resolve_local_relay`, `hub.rs:3461`; `forward_offer`, `:2316`). The agent may yet take them, and it filters out itself whichever it leaves off the mesh.
 - **Across pods** the relay envelope carries `rc_overlay_auto` and `rc_overlay_far_turn` beside the bool (`rc_overlay_to_relay`, `crates/modules/remote/src/relay.rs:585`; `rc_overlay_from_relay`, `:598`). An older pod reads only the bool, so `auto` reaches it as `off`.
-- **Status:** the agent (P1) and the server and page (P2) are built. A session takes this path once an agent from the release carrying P1 meets a server image carrying P2.
+- **Status:** live since 2026-10-29, on agents from 0.4.185 and server images from `hosted-20261029-2ae4ffd`. The field record is FR-128 §8.
 
 > ⚠️ **Never "decide while gathering" by holding overlay candidates back.** A candidate that is held has still been gathered, and webrtc-rs pairs every gathered candidate. On a weak-host OS, checks from the overlay-bound socket to a browser's LAN address can come back over the mesh as a peer-reflexive pair. The session would then ride a relayed mesh exactly when `auto` had said no.
 
