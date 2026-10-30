@@ -89,8 +89,9 @@ pub struct BenchArgs {
     )]
     pub bench_fps: u32,
     /// Feed frames at `--bench-fps` instead of back to back. Back to back
-    /// measures the encoder's own cost; paced shows what a session's cadence
-    /// costs on a host whose CPU clocks down between frames.
+    /// measures the encoder's own cost; paced runs at a session's cadence,
+    /// where a CPU that clocks down between frames shows (the preamble's
+    /// `clock=` says whether the bench's thread holds its clock).
     #[arg(long, requires = "bench")]
     pub bench_paced: bool,
     /// Start no cell after this many seconds; the rest print as `skipped`.
@@ -1104,32 +1105,61 @@ pub async fn run_plan(
     Ok(results)
 }
 
+/// What the bench's thread got when it asked for its clock, for the preamble.
+pub fn clock_label(outcome: super::clock::Outcome) -> String {
+    use super::clock::Outcome;
+    match outcome {
+        Outcome::Clamped => "clamped".into(),
+        Outcome::Off => "off".into(),
+        Outcome::Refused(errno) => format!("refused:{errno}"),
+        Outcome::NotLinux => "n/a".into(),
+    }
+}
+
 /// `encoder-smoke --bench`: plan, print the run's settings, run every row.
+///
+/// Every cell opens, encodes and drops on ONE thread of the bench's own, the
+/// way a session's encoder lives on its thread (`encode::thread`): the thread
+/// asks for its clock first (FR-112 P1, Linux), so the threads an encoder
+/// creates inherit it, and a thread-affine encoder (QSV) never changes threads
+/// between frames, which a paced row's sleeps would allow on the runtime.
 pub async fn run(args: &BenchArgs, pref_raw: &str, name: Option<&str>) -> anyhow::Result<()> {
     let pref: EncoderPreference = pref_raw
         .parse()
         .map_err(|e| anyhow::anyhow!("bad encoder preference {pref_raw:?}: {e}"))?;
     let build = BuildCaps::this_build();
     let bench = plan(args, pref, name, build).map_err(|e| anyhow::anyhow!("encoder bench: {e}"))?;
-    let mut out = std::io::stdout();
-    writeln!(
-        out,
-        "{PREFIX}# FR-16 L1 encoder bench roomlerd={} os={} arch={} build={} encoder={} fps={} \
-         frames={} pace={} budget_s={} rows={}",
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        build.label(),
-        pref.wire(),
-        bench.fps,
-        bench.frames,
-        if bench.paced { "paced" } else { "back-to-back" },
-        bench.budget.as_secs(),
-        bench.plans.len()
-    )?;
-    let mut opener = SessionOpener { pref };
-    run_plan(&bench, &mut opener, &mut out).await?;
-    Ok(())
+    let worker = std::thread::Builder::new()
+        .name("rc-enc-l1-bench".into())
+        .spawn(move || -> anyhow::Result<()> {
+            let clock = super::clock::ask_for_this_thread("bench");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()?;
+            let mut out = std::io::stdout();
+            writeln!(
+                out,
+                "{PREFIX}# FR-16 L1 encoder bench roomlerd={} os={} arch={} build={} encoder={} \
+                 fps={} frames={} pace={} budget_s={} rows={} clock={}",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                build.label(),
+                pref.wire(),
+                bench.fps,
+                bench.frames,
+                if bench.paced { "paced" } else { "back-to-back" },
+                bench.budget.as_secs(),
+                bench.plans.len(),
+                clock_label(clock)
+            )?;
+            let mut opener = SessionOpener { pref };
+            rt.block_on(run_plan(&bench, &mut opener, &mut out))?;
+            Ok(())
+        })?;
+    tokio::task::spawn_blocking(move || worker.join())
+        .await?
+        .map_err(|_| anyhow::anyhow!("encoder bench: the bench thread panicked"))?
 }
 
 #[cfg(test)]
@@ -1721,5 +1751,16 @@ mod tests {
         assert_eq!(smoke_mode(false, false), SmokeMode::Smoke);
         assert_eq!(smoke_mode(true, false), SmokeMode::Sweep);
         assert_eq!(smoke_mode(false, true), SmokeMode::Bench);
+    }
+
+    /// The preamble's `clock=` spellings, which a fleet run reads beside its
+    /// paced rows.
+    #[test]
+    fn the_clock_says_what_the_bench_thread_got() {
+        use crate::encode::clock::Outcome;
+        assert_eq!(clock_label(Outcome::Clamped), "clamped");
+        assert_eq!(clock_label(Outcome::Off), "off");
+        assert_eq!(clock_label(Outcome::Refused(22)), "refused:22");
+        assert_eq!(clock_label(Outcome::NotLinux), "n/a");
     }
 }

@@ -502,6 +502,142 @@ The console and `rc.l4` records then read as they do for the probe.
 no key reading (FR-92). It is Windows-only for now; a Linux or macOS host is benched with a
 synthetic-source build.
 
+## The L1 encoder bench (FR-16)
+
+L0 and L4 measure a session. L1 measures a host's encoders alone, with no network and no
+session: what each one costs, and **which one actually opened**. Before it, a host that
+advertised a hardware encoder and silently ran a software one could not be seen from anywhere
+([FR-16](fr/FR-16-rc-quality-benchmark.md) L1). It is `roomlerd encoder-smoke --bench`, a mode of
+the smoke that every build already carries, so the fleet profiles itself through `roomler exec`.
+
+```mermaid
+flowchart LR
+    A["encoder-smoke --bench<br/>flags → plan()"] --> B["rows: cell × size × rate × motion<br/>(the cells this build can open)"]
+    B --> C["SessionOpener<br/>the constructor a session calls"]
+    C -- "the opened encoder: name(),<br/>is_hardware(), codec, chroma" --> D["verdict()<br/>asked for vs opened"]
+    C --> E["the bench's own thread:<br/>Scene::render → encode(),<br/>a keyframe each second of content"]
+    D --> F["one L1 row,<br/>printed when its cell ends"]
+    E --> F
+```
+
+**Run it.** The default profile fits `roomler exec`'s 30 s default timeout, so it needs no flag
+there. A Windows target takes the command as one quoted argument, because `roomler exec`
+re-splits argv.
+
+```bash
+roomlerd encoder-smoke --bench                                   # on the host
+roomler exec <device> -- roomlerd encoder-smoke --bench          # through Fleet RPC
+roomler exec <device> -- "roomlerd encoder-smoke --bench"        # a Windows target
+roomler exec <device> --timeout 300 -- roomlerd encoder-smoke --bench --bench-full
+roomlerd encoder-smoke --bench --bench-cells rtp:h264 --bench-motions static,drag,pan
+roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg encoder, past every cascade
+```
+
+| Flag | Default | |
+|---|---|---|
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1774`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7295`) |
+| `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
+| `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
+| `--bench-sizes` | `1280x720` | `WxH`, even sides |
+| `--bench-bitrates` | `auto` | `auto` is what a session's encoder opens at for the size and rate (`initial_bitrate_for_fps`); or kbps: `3000`, `3000k`, `3M` |
+| `--bench-motions` | `drag` (1000 px/s) | `static` (an idle desktop), `drag[:px/s]` (a text window crossing the frame at a set speed), `pan` (every pixel moves) |
+| `--bench-frames` | 90 | Frames a row, 10 to 3600 |
+| `--bench-fps` | 30 | The rate the encoder is told it runs at, 1 to 240 |
+| `--bench-paced` | off | Feed frames at `--bench-fps` instead of back to back |
+| `--bench-budget-secs` | 25, or 280 with `--bench-full` | Start no cell after this; the rest print `skipped` |
+| `--encoder` | `hardware` | The smoke's own flag: what the RTP rows ask for |
+| `--name` | — | One FFmpeg encoder by name (FR-78 P2), as path `named` |
+
+**What each cell opens.** The bench opens every cell through the constructor a session calls for
+it (`SessionOpener`, `agents/roomlerd/src/encode/bench.rs:808`), so the encoder that answers is the
+one a session would get. The quick profile is the seven cells a session opens by default (the
+VP9 DataChannel is 4:4:4 by default), less what the build cannot open (`BuildCaps`, `bench.rs:329`).
+
+| Cell | Opens through | Hardware on its path when the build has |
+|---|---|---|
+| `rtp:h264` | `encode::open_for_codec`: Media Foundation's cascade on Windows, then OpenH264 | `mf-encoder` (Windows) |
+| `rtp:h265` | FFmpeg's HEVC cascade, then MF's | FFmpeg or MF |
+| `rtp:av1` | MF's AV1 | MF |
+| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5234`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
+| `dc:vp9`, `dc:vp9:444` | the session's quick probe at 480×270, then FFmpeg's VP9 if it opened, else libvpx | FFmpeg |
+| `named` | `encode::open_named`, past every cascade and the denylist | FFmpeg |
+
+⚠️ The DataChannel rows **mirror** the pump's open; they do not call it, because `FfmpegDcCodec`
+is private to `peer.rs`. A change to how a session opens its encoder needs the same change in
+`SessionOpener`, or the bench measures an encoder no session opens.
+
+**Reading it.** Every line starts `L1 `, because the console log shares stdout: `grep '^L1 '` is
+the table. An `L1 #` preamble (version, OS, build, encoder, fps, frames, pace, budget, rows,
+clock) comes first, then the header, then one row per cell as each one finishes, so a run that
+`roomler exec` cuts off keeps the rows it finished. An `L1 # done` line counts the verdicts.
+
+The columns (`COLUMNS`, `bench.rs:694`) are a contract: a fleet run splits rows on whitespace and
+reads them by position, so a column is only ever appended, never renamed, moved or dropped
+(pinned by `the_header_is_the_contract`). An empty field is `-`.
+
+| Column | |
+|---|---|
+| `path` `codec` `chroma` `size` `motion` `target_kbps` | What the row asked for |
+| `opened` | The opened encoder's own `name()` |
+| `hw` | Its `is_hardware()`. `mf-h264` names both Microsoft's hardware and software MFTs, and only this column tells them apart |
+| `got` | The codec and chroma it produces: `h265:420` in a 4:4:4 row is a demotion |
+| `verdict` | Below |
+| `open_ms` | The open, cascade and probes included |
+| `frames` | Frames encoded: fewer than asked when the budget ran out mid-row |
+| `enc_p50_ms` `enc_p95_ms` `enc_max_ms` | One `encode()` call each, the colour conversion included and the painting not. Nearest-rank percentiles |
+| `out_kbps` `rate` | The bytes produced over the content's own duration (frames ÷ fps, never the wall clock), and that over the target |
+| `idr_n` `idr_p50_B` `idr_max_B` | Keyframes: the first frame, and one requested every `fps` frames after it |
+| `delta_p50_B` `delta_p95_B` `delta_max_B` | Every other frame |
+
+The verdict (`verdict()`, `bench.rs:601`) is always read from the encoder that opened, never
+from what was requested or advertised:
+
+| Verdict | When |
+|---|---|
+| `ok` | It opened as asked |
+| `fallback` | Hardware was asked for on a path that has a hardware encoder in this build, and software answered. **The class L1 exists to see** |
+| `sw-only` | Hardware was asked for on a path with no hardware encoder in this build: the RTP track's H.264 off Windows, or VP9 from a build with libvpx and no FFmpeg. That is the build, not a fallback |
+| `demoted` | It opened, and produces another codec or chroma |
+| `none` | Nothing opened, or only the no-op encoder |
+| `error` | It opened and an encode failed. The frames before the failure are kept |
+| `skipped` | The budget ran out before the cell started |
+
+The RTP rows ask for hardware only under `--encoder hardware`, the smoke's default; under `auto`
+or `software` whatever opened reads `ok`, and `hw` still says which it was. The DataChannel
+cascades and `--name` are hardware by construction, so they always ask.
+
+- ⚠️ **`rate` is read against the encoder's rate control.** A CBR encoder (QSV, libvpx's realtime
+  CBR) is held near 1.00. A quality-driven encoder under a cap (NVENC, AMF, VAAPI) sits below it on
+  easy content, which is headroom, not a miss, as the FR-62 sweep found. The DataChannel rows get
+  the target as their cap.
+- ⚠️ **The table does not read the hello or the capability cache.** FR-16 AC1's "advertised" half
+  is the device's record on the server (its hello's hardware encoders), which a fleet run joins
+  to these rows. A row says what this build opened on this host when it ran.
+- ⚠️ The bench does not drain an encoder at the end of a row, so a frame an encoder still holds
+  is not counted in `out_kbps`.
+- `roomlerd encoder-smoke` is its own process, not the daemon: a driver that faults takes the
+  bench down, never the daemon. On a host with a per-user install its log lines land in the live
+  daemon's log, as every hand-run subcommand's do.
+
+**Pacing and the clock.**
+
+- **Back to back by default.** A frame starts when the last one's `encode()` returns, which
+  measures the encoder's own cost on a CPU running flat out. `--bench-paced` feeds frames at
+  `--bench-fps`, a session's cadence.
+- **One thread, holding its clock.** Every cell opens, encodes and is dropped on one thread of the
+  bench's own, the way a session's encoder lives on its thread (`encode::thread`). So a
+  thread-affine encoder (QSV) never changes threads between frames. On Linux that thread asks
+  for its clock first, as a session's encoder thread does
+  ([FR-112](encoders.md#software-encoders-the-clock-and-60-fps-fr-112) P1), and the threads an
+  encoder starts inherit it. Without it, energy-aware scheduling clocks a periodic encoder down
+  until its work fills the frame period: the same OpenH264 frame took 6 ms back to back and
+  16–20 ms at a 30 fps cadence on an Apple M2 Pro. The preamble's `clock=` says what the thread
+  got: `clamped`, `refused:<errno>` (a kernel without `CONFIG_UCLAMP_TASK`, or a cgroup limit),
+  `off` (`ROOMLERD_ENCODER_CLOCK=0`) or `n/a` (not Linux). A paced row well above its back-to-back
+  twin, on a host that did not answer `clamped`, is the CPU's clock, not the encoder.
+- ⚠️ **Noise.** These are wall-clock times on a host doing other things. Run a cell twice and read
+  the spread before comparing two hosts: the reference run below did, on a busy machine.
+
 ## The overlay stress lane (FR-81)
 
 Everything the mesh promises is a **latency and stability** claim, and before this lane nothing

@@ -2,6 +2,11 @@
 
 Status: **proposed** (2026-08-27); **amended 2026-10-13**, so that L0 (an in-process
 harness) and L4 (input-to-photon) come first ([§ Amendment](#amendment-2026-10-13--l0-and-l4-come-first)).
+L0 merged; L4's agent and viewer halves built and run end to end on a release build. **L1
+built 2026-10-30**: `roomlerd encoder-smoke --bench` prints a per-host encoder cost table
+whose verdict reads `fallback` when hardware was asked for and software answered
+([testing.md](../testing.md#the-l1-encoder-bench-fr-16)). Its fleet run through `roomler exec`
+waits for a release that carries it.
 Tracking issue: `FR-16` (#798). Sibling of FR-17 (#799, the architectural fix); the
 measurement half of the FR-1 program, and the instrument of the
 [StarDesk teardown program](../plans/stardesk-teardown-program.md).
@@ -202,8 +207,9 @@ competitors". Engineering may use the numbers; the public pages never print them
 | L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | **merged** #2097 (`67d3ca9e8`): `agents/roomlerd/tests/l4_latency.rs` + the marker and clock in `capture/synthetic_backend.rs` + the `peer::l0` seam; local and CI runs in the field log |
 | L4 | The probe, the worker sampler, the upload, `probe-target`, the nightly spec; baselines on a direct and a relay pair | `ROOMLERD_BENCH` unset; the build feature; the viewer knob `roomler-rc-bench` | **agent half built**: `synthetic_backend::probe` + the bottom-right marker, the input-handler hook in `peer.rs`, `bench` in `AgentCaps.video`, the `probe`/`probe50` cells. **Viewer half built**: the TS marker decoder, the worker sampler in all three decode workers, the `<video>` sampler, the jittered prober, the `rc.l4` upload, the server's parse lock. **`probe-target` built**: the window (`probe_target.rs`) and the viewer's `target` mode. **End to end on a release build: done** against `probe-target` on vmtest guests (the field log, 2026-10-13; FR-98 P5's cells used it on 2026-10-16, on the RTP track and the DataChannel). Owed: the nightly spec, which needs the agent-e2e pods in bench mode (`ROOMLERD_BENCH=1` in `scripts/e2e-k8s/overlay-template/statefulset-agent-e2e.yaml`, and an agent-e2e image from 0.4.133 or later, built by hand on the build host), and the baselines on real hosts |
 | T | The StarDesk comparison cell on the spare box (private results) | — | — |
-| L1–L3 | As designed above | — | — |
-| D | Docs | — | — |
+| L1 | `roomlerd encoder-smoke --bench`: each cell opened through the constructor a session calls, a synthetic motion profile encoded on one thread holding its clock, one row per cell with encode ms p50/p95, produced vs target bitrate, IDR and delta sizes and the encoder that opened; the `fallback` verdict | the flag: `--bench` is opt-in, and every `--bench-*` flag requires it, so the release lane's `encoder-smoke --encoder hardware` runs the plain smoke as before | **built** (2026-10-30): `agents/roomlerd/src/encode/bench.rs`, the painter moved to the always-compiled `capture/synthetic_scene.rs` with its motion profiles, the flags flattened into `EncoderSmoke` (`app.rs:451`) and dispatched by `smoke_mode` (`app.rs:1924`). The container run is in the field log. Owed: the fleet run through `roomler exec` once a release carries it (AC1) |
+| L2–L3 | As designed above | — | — |
+| D | Docs | — | L0 and L4: `docs/testing.md`, done. L1: `docs/testing.md` § The L1 encoder bench, done |
 
 ## Acceptance criteria
 
@@ -228,9 +234,20 @@ competitors". Engineering may use the numbers; the public pages never print them
       display latency.
 - [ ] The StarDesk comparison cell is recorded in the private docs repo, with method and
       date, and never published (compare rule 3).
-- [ ] **Docs:** `docs/testing.md` gains the L0 harness and the L4 bench (a mermaid diagram
+- [x] **Docs:** `docs/testing.md` gains the L0 harness and the L4 bench (a mermaid diagram
       of the probe → marker → sample loop, how to run each, how to read `rc.l4` in
       `agent_logs`), linked from `docs/README.md`.
+      Evidence, read on master `4f2bccc53` (2026-10-30): § The L0 latency harness
+      (`docs/testing.md:271`, its mermaid `:278`, how to run it `:321`); § L4 in process: the
+      bench probe (`:349`, its sequence `:356`); § L4 in the real viewer (`:398`, the probe →
+      marker → sample sequence `:404`, how to run it `:417`, mining `rc.l4` in `agent_logs`
+      `:439`); § L4 on a release build: `roomlerd probe-target` (`:460`, its sequence `:469`,
+      how to run it `:488`); the index row `docs/README.md:173` links the L0 section.
+- [x] **Docs (L1):** `docs/testing.md` gains the L1 encoder bench: how to run it on a host and
+      through `roomler exec`, what each cell opens, the table's columns, the verdicts and what
+      `fallback` means, how it paces frames and holds its clock, with a mermaid diagram, linked
+      from `docs/README.md`. Evidence: § The L1 encoder bench (`docs/testing.md:505`, its
+      mermaid `:513`) and the index row `docs/README.md:173`.
 
 ## Out of scope
 
