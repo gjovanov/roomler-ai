@@ -2899,6 +2899,18 @@ pub struct DesiredConfig {
     /// per process, which the device reports as `needs_restart`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fps_deny: Option<String>,
+    /// FR-130 P1b — the colour-description switch (`color_description`). A
+    /// tribool on the device, so a push carries a word: `on`, `off`, or
+    /// blank, which CLEARS the device's key back to its built-in default (on),
+    /// as a blank `encoder_cells_deny` clears that list. Pushable with
+    /// `MANAGE_AGENTS` alone, like the two denylists: it is not a gate and
+    /// grants nothing either way. `off` only removes metadata from the
+    /// stream, and `on` writes what the built-in default writes. The server
+    /// stores the word [`parse_pushed_tribool`] reads, spelled as
+    /// [`pushed_tribool_wire`] spells it; the daemon reads the key once per
+    /// process, which the device reports as `needs_restart`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_description: Option<String>,
     /// Bumped on every write. The agent reports the revision it has applied,
     /// so "asked for" and "actually running" can be told apart in the UI —
     /// without it, a device that refused the config and one that never heard
@@ -2922,6 +2934,7 @@ impl DesiredConfig {
             && self.ssh_port.is_none()
             && self.encoder_cells_deny.is_none()
             && self.fps_deny.is_none()
+            && self.color_description.is_none()
     }
 
     /// Whether this request touches the Fleet-RPC grant. Drives the
@@ -2967,6 +2980,9 @@ impl DesiredConfig {
             encoder_cells_deny: _,
             // FR-119 P2b — the same for the frame-rate denylist: it only removes.
             fps_deny: _,
+            // FR-130 P1b — neither: the colour description grants nothing,
+            // whichever way it is pushed.
+            color_description: _,
             revision: _,
             updated_by: _,
             updated_at: _,
@@ -2975,6 +2991,40 @@ impl DesiredConfig {
             && *ssh_authorized_keys == other.ssh_authorized_keys
             && *ssh_account_mode == other.ssh_account_mode
             && *ssh_port == other.ssh_port
+    }
+}
+
+/// FR-130 P1b — the ONE reading of a tribool pushed through [`DesiredConfig`]
+/// (`color_description`). The server refuses a word this cannot read, and the
+/// device applies a push through it, so the two cannot disagree about a word.
+///
+/// Blank CLEARS the device's key, back to its built-in default. `on` and
+/// `off`, or the words `roomler config set` takes for them (`true`/`false`,
+/// `1`/`0`, `yes`/`no`, in any case), set it. Anything else is `Err`: a device
+/// must never guess which way a word it cannot read was meant.
+pub fn parse_pushed_tribool(v: &str) -> Result<Option<bool>, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "on" | "true" | "1" | "yes" => Ok(Some(true)),
+        "off" | "false" | "0" | "no" => Ok(Some(false)),
+        other => {
+            // Echoed into a 400 and a device's log: a short prefix is enough
+            // to recognise, and a pushed megabyte must not become a log line.
+            let shown: String = other.chars().take(32).collect();
+            Err(format!(
+                "{shown:?} is not on, off, or blank (the device's built-in default)"
+            ))
+        }
+    }
+}
+
+/// The spelling the server stores and pushes for what [`parse_pushed_tribool`]
+/// read: `on`, `off`, or blank (clear the key).
+pub fn pushed_tribool_wire(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "",
     }
 }
 
@@ -7484,6 +7534,7 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7529,6 +7580,7 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7558,6 +7610,7 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7607,6 +7660,7 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7649,6 +7703,7 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -9452,6 +9507,7 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
             revision: 1,
             updated_by: Some(ObjectId::new()),
             updated_at: Some(DateTime::now()),
@@ -9582,6 +9638,47 @@ mod tests {
         }))
         .expect("unknown keys are ignored, not fatal");
         assert_eq!(pushed.ssh_enabled, Some(true));
+    }
+
+    /// FR-130 P1b — a pushed tribool has one reading, shared by the server
+    /// (which refuses what it cannot read) and the device (which applies it).
+    /// Blank is a request to CLEAR, never "not managed": that is an absent
+    /// key. A word it cannot read is refused rather than guessed.
+    #[test]
+    fn a_pushed_tribool_takes_the_config_set_words_and_blank_clears() {
+        for on in ["on", "ON", " true ", "1", "Yes"] {
+            assert_eq!(parse_pushed_tribool(on), Ok(Some(true)), "{on:?}");
+        }
+        for off in ["off", "Off", "false", "0", " no "] {
+            assert_eq!(parse_pushed_tribool(off), Ok(Some(false)), "{off:?}");
+        }
+        for clear in ["", "   "] {
+            assert_eq!(parse_pushed_tribool(clear), Ok(None), "{clear:?}");
+        }
+        for unread in ["maybe", "default", "2", "o n", "onn"] {
+            assert!(parse_pushed_tribool(unread).is_err(), "{unread:?}");
+        }
+        let long = "x".repeat(10_000);
+        let err = parse_pushed_tribool(&long).unwrap_err();
+        assert!(err.len() < 120, "the echo is capped: {} bytes", err.len());
+
+        // What the server stores reads back as what it read.
+        for v in [None, Some(true), Some(false)] {
+            assert_eq!(parse_pushed_tribool(pushed_tribool_wire(v)), Ok(v));
+        }
+        // And it travels: a clear survives the round trip as a clear, and
+        // an absent key stays absent ("not managed").
+        let clear = DesiredConfig {
+            color_description: Some(pushed_tribool_wire(None).into()),
+            ..Default::default()
+        };
+        assert!(!clear.is_empty(), "a clear is a request");
+        let json = serde_json::to_string(&clear).unwrap();
+        assert!(json.contains(r#""color_description":"""#), "{json}");
+        let back: DesiredConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.color_description.as_deref(), Some(""));
+        let unmanaged = serde_json::to_string(&DesiredConfig::default()).unwrap();
+        assert!(!unmanaged.contains("color_description"), "{unmanaged}");
     }
 
     // ── #1630: an audit row must read back through the driver's own pair ───

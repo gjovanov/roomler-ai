@@ -560,6 +560,11 @@ export interface ConfigReport {
   reported_at: string
 }
 
+/** FR-130 P1b — how a pushed tribool travels: the server stores one of these
+ *  three words (`remote_config::pushed_tribool`), and the device reads them
+ *  as `roomler config set` would. `''` clears the device's key. */
+export type PushedTribool = 'on' | 'off' | ''
+
 /** The keys under management. `undefined` means NOT MANAGED — the device
  *  keeps whatever it has locally — which is a different thing from `false`.
  *
@@ -578,6 +583,10 @@ export interface DesiredConfig {
   /** FR-119 P2b — the frame-rate denylist (`name:fps` list, `*` for every
    *  encoder, or `none`); MANAGE_AGENTS only. */
   fps_deny?: string
+  /** FR-130 P1b — the colour-description switch; MANAGE_AGENTS only. `''` is
+   *  a request to CLEAR the device's key (back to its built-in default, on),
+   *  which is not the same as leaving it unmanaged (`undefined`). */
+  color_description?: PushedTribool
   updated_by?: string
   updated_at?: string
 }
