@@ -530,6 +530,42 @@ The console and `rc.l4` records then read as they do for the probe.
 no key reading (FR-92). It is Windows-only for now; a Linux or macOS host is benched with a
 synthetic-source build.
 
+#### A field run that holds up
+
+What FR-98's first baseline cells (2026-10-30) learned about running L4 against a remote host:
+
+1. **Start the window through `roomler exec`** where exec runs as the signed-in user: on a device
+   no administrator has anchored, the console-session worker answers it. Stop it the same way, by
+   its command line:
+
+   ```bash
+   roomler exec <host> -- 'Start-Process -FilePath "C:\Program Files\Roomler\roomlerd.exe" -ArgumentList "probe-target","--seconds","2400" -WindowStyle Minimized'
+   ```
+
+   Don't redirect its output. A child started with `-RedirectStandardOutput` inherits exec's pipe,
+   and exec then waits it out ("no answer within 45 s"), although the window started. Send plain
+   PowerShell: an encoded payload (base64 plus `Invoke-Expression`) is the shape endpoint
+   protection flags.
+2. **Keep the host at its native mode.** Set display match off for the bench device,
+   `localStorage['roomler-rc-display-match.v2:<agent id>'] = '0'`, and put back what was there
+   afterwards. Left on, it switches the host to the largest mode that fits the viewer on connect.
+   The window was placed for the old mode, so it is no longer in the corner.
+3. **Keep the viewer's page visible, and prove it.** An automation-driven tab went `hidden` about
+   20 s after the last call into it, and Chrome then ran its timers once a second. The prober is
+   a timer chain, so it probed at 1 Hz and read 3–8 ms high. Keep calling into the page, run a
+   250 ms `setTimeout` chain beside the prober that records every gap, and drop each batch that
+   overlaps a gap over 400 ms.
+4. **Attribute the tail.** Run a 10 Hz ping from the viewer to its own gateway for the whole run.
+   On the dev box's Wi-Fi it showed latency bursts about every 33 s, the pattern background scans
+   produce, and in FR-98's cell 3 every probe over 80 ms fell inside one. The host's pump heartbeat sees it too: its `age_split`
+   puts the spike in `transit`.
+5. **Force a relay cell** with the viewer's peer connection built with
+   `iceTransportPolicy: 'relay'`, minus any loopback relay. A corporate laptop at home with its
+   VPN down goes direct otherwise.
+6. **Count freezes** as the viewer's arrival gaps over 200 ms: sample the `video-bytes` channel's
+   `bytesReceived` from `getStats()` every 50 ms. The sampler runs on the page's main thread, so a
+   stall of that thread also reads as a gap; check it against the timer-gap monitor.
+
 ## The L1 encoder bench (FR-16)
 
 L0 and L4 measure a session. L1 measures a host's encoders alone, with no network and no
