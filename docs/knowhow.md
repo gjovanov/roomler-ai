@@ -406,7 +406,7 @@ the device row as the fleet keeps it.
 | `overlay.ipv4` | the address the device leases on the organization's overlay | while it holds a live overlay node |
 | `overlay.name` | its name there, the MagicDNS label, as the device list shows it | while the node has a label (every node since names) |
 | `overlay.magicdns` | `<label>.<domain>`, the name the device list shows ([`mirror`](../crates/modules/knowhow/src/sync.rs#L222)) | while the organization has a MagicDNS domain |
-| `overlay.routes` | the subnets it carries for its peers: approved by an admin **and** still offered by the device ([`effective_routes`](../crates/remote_control/src/models.rs#L6768)), the default route apart; at most 64 | while it holds a node (`[]` for none) |
+| `overlay.routes` | the subnets it carries for its peers: approved by an admin **and** still offered by the device ([`effective_routes`](../crates/remote_control/src/models.rs#L6879)), the default route apart; at most 64 | while it holds a node (`[]` for none) |
 | `overlay.exit` | whether it carries the default route `0.0.0.0/0` for the peers that choose it, approved and still offered | while it holds a node |
 | `tunnel.routes` | the subnets it is a gateway for in the tunnel mesh, as an admin set them | always (`[]` for none); at most 64 |
 | `ssh.server` | whether its build serves roomler SSH: the `ssh` verb it advertises, matched whole | always |
@@ -661,7 +661,7 @@ flowchart TD
 | the key | `knowhow_scan_roots`: comma-separated absolute paths, set in the device's config or over the LocalAPI, `roomler config set knowhow_scan_roots …` ([`config_surface`](../crates/agent-core/src/config_surface.rs#L552)). A folder is walked for its checkouts; a file is read as a kubeconfig (decision 46) |
 | empty | nothing is read: the answer is `no_roots` |
 | live | read from the config file again at each scan, under the LocalAPI's write lock ([`read_config`](../agents/roomlerd/src/hive/knowhow/mod.rs#L523)): an edit takes the next scan, with no restart |
-| whose | the device's: absent from `DesiredConfig`, and named in the test that keeps every device-owned key out of it ([`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9499)) |
+| whose | the device's: absent from `DesiredConfig`, and named in the test that keeps every device-owned key out of it ([`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9610)) |
 | the listeners | P4-3b-3: `knowhow_scan_listeners`, off by default, live and the device's like the roots ([`config_surface`](../crates/agent-core/src/config_surface.rs#L562)). Nothing listed at all, neither a root nor the listeners, is `no_roots` |
 
 **Whose eyes** ([`whose`](../agents/roomlerd/src/hive/knowhow/owner.rs#L78)).
@@ -894,7 +894,7 @@ five tools in a session's toolbelt, `mcp__roomler__knowhow_search`,
 | the tools | `knowhow_search {q?, kind?, env?, limit?}`, `knowhow_get {kind, key}` and `knowhow_propose {entity \| fact \| link, why}` (§12.2), each argument checked before anything is asked: a proposal names exactly one of the three, an object, with a `why` of at most 500 characters. The answer is the map's JSON as text (for a proposal, what it wrote, its id, `proposed`, and the proposals left), a refusal an error in words the model can act on. `knowhow_get`'s description says what a card's `verified` and (P4-5-4) `probes` mean: the last probe's word on a fact, and each device's last finding of each kind (§13.5) |
 | a proposal unanswered | asked and never answered within its 15 s, it may have been written all the same. The model is told so, and that `knowhow_get` shows whether it was: proposing it again is safe, since one already there is refused `exists` |
 | a verify (P4-5-2b) | `knowhow_verify {kind, key, probe?}`, `probe` `tcp` or `tls` and `tcp` when absent. The first answer (`rc:knowhow.verifying`) names the probe, and the tool waits 30 s more for what it measured (`rc:knowhow.verified`), matched by the probe's id, which may come back before the first answer is read: one kept for a waiter yet to come, up to 16 ([`Client::verify`](../agents/roomlerd/src/hive/knowhow_tools.rs#L307)). The model reads the outcome and what it means, where the probe went, how, and what it found ([`measured`](../agents/roomlerd/src/hive/knowhow_tools.rs#L648)); a probe past the 30 s is `pending`, recorded on the facts when it ends, and so is one whose connection went |
-| a connect (P4-6-1b-1) | `roomler_connect {kind, key}`, routed apart from the reads, since it needs the run's vault, its command target and its account ([`reach_entity`](../agents/roomlerd/src/hive/toolbelt.rs#L1522)). It asks `rc:knowhow.connect` ([`Client::connect`](../agents/roomlerd/src/hive/knowhow_tools.rs#L335)) and opens the access from this device, or (P4-6-1b-2) through another device that reached it, as §13.7 says |
+| a connect (P4-6-1b-1) | `roomler_connect {kind, key}`, routed apart from the reads, since it needs the run's vault, its command target and its account ([`reach_entity`](../agents/roomlerd/src/hive/toolbelt.rs#L1537)). It asks `rc:knowhow.connect` ([`Client::connect`](../agents/roomlerd/src/hive/knowhow_tools.rs#L335)) and opens the access from this device, or (P4-6-1b-2) through another device that reached it, as §13.7 says |
 
 > [!WARNING]
 > **A tool the server did not name is an unknown tool.** A newer agent may know
@@ -1419,7 +1419,7 @@ Reserved fact paths, read only when the fact is `active` or `stale`
 | `user` | `ssh`'s: the one account the key signs in as | in `options`, and in the `ssh` upstream (`ssh://user@host`) |
 
 **The access** (`rc:knowhow.access {req_id, access}`,
-[`signaling.rs`](../crates/remote_control/src/signaling.rs#L5241)):
+[`signaling.rs`](../crates/remote_control/src/signaling.rs#L5270)):
 
 | Field | Holds |
 |---|---|

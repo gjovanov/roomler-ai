@@ -565,7 +565,7 @@ impl Module for FleetState {
         let public_setup = Router::new()
             .route("/latest-release", get(setup_release::setup_latest_release))
             // FR-129 B1-s — the switches a client reads before offering an
-            // install path (`pairing`, `wizard_unix_daemon`, `wizard_pairing`);
+            // install path (`pairing`, the daemon switch per OS, `wizard_pairing`);
             // static, so it wins over `/{platform}` like the others.
             .route("/features", get(setup_release::setup_features))
             .route("/install.sh", get(setup_release::install_script_sh))
@@ -631,7 +631,7 @@ impl Module for FleetState {
             // partial index), so a code is free again once its pairing is
             // decided, and `start` regenerates on a collision. The TTL on
             // `expires_at` only tidies: every read compares the clock itself,
-            // because the monitor runs about a minute late.
+            // because the monitor passes every 60 s (a row lingers up to 60 s).
             IndexSet {
                 collection: roomler_ai_db::models::DevicePairing::COLLECTION,
                 pre_ops: Vec::new(),

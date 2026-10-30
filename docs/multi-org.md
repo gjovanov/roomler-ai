@@ -268,9 +268,9 @@ either case: its signalling loop reconnects on its own ladder, and a retry at th
 refusal would race it.
 
 - **The wire.** `rc:overlay.join_refused { reason, detail }`
-  ([`signaling.rs:4335-4341`](../crates/remote_control/src/signaling.rs#L4335-L4341)) goes only to a
+  ([`signaling.rs:4364-4370`](../crates/remote_control/src/signaling.rs#L4364-L4370)) goes only to a
   node whose join set `supports_join_refusal`
-  ([`signaling.rs:2488`](../crates/remote_control/src/signaling.rs#L2488)). An older node keeps the
+  ([`signaling.rs:2514`](../crates/remote_control/src/signaling.rs#L2514)). An older node keeps the
   old silence, and the server's ERROR line, `alert = "overlay_join_refused"`
   ([`overlay.rs:278-295`](../crates/modules/network/src/overlay.rs#L278-L295)), is then the only
   trace. The frame is a new top-level variant, which an old agent drops as an unknown
@@ -280,7 +280,7 @@ refusal would race it.
   ([`overlay.rs:1060-1070`](../agents/roomlerd/src/overlay.rs#L1060-L1070)). No overlay runtime
   exists to hold it, because the runtime is exactly what never came up.
 - **`roomler status`** prints it
-  ([`localclient.rs:2546-2568`](../agents/roomler-cli/src/localclient.rs#L2546-L2568)):
+  ([`localclient.rs:2596-2618`](../agents/roomler-cli/src/localclient.rs#L2596-L2618)):
 
   ```
     overlay ip  —
@@ -293,7 +293,7 @@ refusal would race it.
   The line stays for the daemon's lifetime, even after a later join succeeds: "refused
   twenty minutes ago" is the only trace left once the log rotates, and `server` already
   says what is true now. A daemon that predates the field sends no `join_refusal`
-  ([`lib.rs:261`](../crates/localapi/src/lib.rs#L261)), and then nothing is printed, never a
+  ([`lib.rs:284`](../crates/localapi/src/lib.rs#L284)), and then nothing is printed, never a
   false "clear". `roomler status --json` carries it as
   `join_refusal { reason, detail, at_unix, retryable }`.
 

@@ -1,8 +1,11 @@
 # FR-131: Hub — one coordinator session runs the backlog through parallel worker sessions (`/hub` skill + hub view)
 
-**Status: P1 and P2 shipped 2026-10-30. P3 (the first real backlog run) in progress. P4 (the docs) in review.**
+**Status: P1, P2, P3 and P4 done 2026-10-30. Every acceptance criterion is met, so FR-131 is ready to
+close: once the P3 close-out PR merges, the hub ticks AC10 in #3127's body, posts the Result comment and
+closes the issue, under the operator's rule of 2026-10-30 19:50Z.**
 P1 is the skill, the worker protocol and the helper, with the mechanics measured live. P2 is the hub view mod,
-`hub-view` 0.2.0. The engineering doc is [`docs/agent-hub.md`](../agent-hub.md).
+`hub-view` 0.2.0. P3 is the first real backlog run, hub `bl1`. P4 is the engineering doc,
+[`docs/agent-hub.md`](../agent-hub.md), which also holds the operating lessons from P3.
 
 ## Problem / Goal
 
@@ -67,8 +70,8 @@ removed afterwards.
 | P1 | Skill, worker protocol, templates and helper. Mechanics measured with five throwaway workers. An independent review found 12 defects, all fixed and retested. | shipped 2026-10-30 | Don't invoke `/hub`; delete `~/.claude/skills/hub/`. |
 | P1b | Claude Code 2.1.280 → 2.1.314, so that Sonnet 5.5 is first-class | done 2026-10-30 | Rename the kept 2.1.280 binary back. |
 | P2 | Hub view mod: list, counts, enter (tasks and conversation), answer, activate and deactivate, back. `hub-view` 0.2.0, 35 tests, shown live on 2.1.314 ([Step log](https://github.com/gjovanov/roomler-ai/issues/3127#issuecomment-6515103295)). | shipped 2026-10-30 | Remove the plugin's folder. |
-| P3 | First real backlog run, at least two workers in parallel on real FRs | in progress 2026-10-30 | ⏸ Pause in the hub issue. |
-| P4 | Docs: `docs/agent-hub.md` in house style, plus a `docs/README.md` row | in review, PR #3144 | Revert the PR; the tooling does not read the doc. |
+| P3 | First real backlog run, at least two workers in parallel on real FRs. Hub `bl1`: ten workers, up to three at once, four PRs merged by the hub, five rotations ([field log](#field-log)). | done 2026-10-30 | ⏸ Pause in the hub issue. |
+| P4 | Docs: `docs/agent-hub.md` in house style, plus a `docs/README.md` row | shipped 2026-10-30, [#3144](https://github.com/gjovanov/roomler-ai/pull/3144) (`2418e0940`); P3's operating lessons added in the close-out PR | Revert the PR; the tooling does not read the doc. |
 
 ## Acceptance criteria
 
@@ -103,9 +106,23 @@ removed afterwards.
   follows. Evidence: a deactivate left `state.json` at `paused` with the stop stamped, and an activate
   respawned the same job, not a fork, with `state.json` back at `running` and the RESUME acknowledged
   ([Step log](https://github.com/gjovanov/roomler-ai/issues/3127#issuecomment-6515103295)).
-- [ ] **AC10 — real run.** At least two workers in parallel each park one phase of a real FR with PRs the
+- [x] **AC10 — real run.** At least two workers in parallel each park one phase of a real FR with PRs the
   hub has verified. The board and the hub issue track them, and at least one rotation happens on a
-  context or cache signal.
+  context or cache signal. Evidence (hub `bl1`, 2026-10-30, [field log](#field-log)):
+  - **In parallel, parked, hub-verified, then merged by the hub.** FR-131 P4
+    ([#3144](https://github.com/gjovanov/roomler-ai/pull/3144), merged as `2418e0940`) and the FR-47
+    close-out ([#3145](https://github.com/gjovanov/roomler-ai/pull/3145), `0ae408c87`) ran side by side from
+    about 11:00Z and parked hub-verified at 13:12Z and 13:00Z. FR-18 AC4
+    ([#3151](https://github.com/gjovanov/roomler-ai/pull/3151), `1734dd6b1`) parked verified at 15:17Z with
+    FR-55 P4 and FR-16 L1 running beside it. FR-76 P3
+    ([#3158](https://github.com/gjovanov/roomler-ai/pull/3158), `b818020a3`) was merged at 17:21Z. The hub
+    merged the first three at 16:29–16:31Z.
+  - **Tracked.** The hub redrew the board on the hub issue (in the private docs repo) on every tick, with
+    each worker's plan, state, PR and verification.
+  - **Rotations on a context signal.** FR-55 P4's worker went g1→g2 on `CTX_SOFT` at 45% (11:39Z),
+    g2→g3 on `CTX_SOFT` (12:20Z) and g3→g4 at 49% (13:40Z). FR-16 L1's worker went g1→g2 on `CTX_SOFT`
+    at 44% (14:45Z), and g2→g3 at 43% once its evidence run was done (15:46Z). Each handoff stood on its
+    own, and each next generation's `STARTED` continued the plan instead of restarting it.
 - [x] **AC11 — docs.** `docs/agent-hub.md` in house style (mermaid, tables) and a `docs/README.md` row.
   Evidence: [`docs/agent-hub.md`](../agent-hub.md), with four mermaid diagrams (the hub and its spokes,
   the tick loop, a worker's states, the message sequence) and tables for the pieces, state, verbs,
@@ -135,7 +152,11 @@ All three were resolved on 2026-10-30.
 
 - Agent teams (they can't nest and don't survive `/resume`) and in-process subagents as workers (they
   can't be entered and die with their parent's `/clear`).
-- The hub merging, closing, tagging, promoting or deploying: those stay with the operator.
+- The hub deciding scope, priority, money or accounts: those stay with the operator. Merging, deploying
+  and closing were out of scope too, until two standing rules the operator set during P3 on 2026-10-30.
+  From 16:28Z the hub merges and deploys a PR as soon as it is ready. From 19:50Z it also closes an FR
+  once every criterion is `[x]` with its evidence and the docs are merged
+  ([`docs/agent-hub.md` §11](../agent-hub.md#11-operating-lessons-from-the-first-real-run)).
 - Cloud and remote-machine workers.
 
 ## Field log
@@ -167,3 +188,27 @@ All three were resolved on 2026-10-30.
     offset.
   - **Dead hypothesis:** the hub relay can submit from the `/hub` hook. The engine refuses a submit from
     a `command.run` hook that holds the turn, so route b submits from a timer.
+- **2026-10-30 — P3, hub `bl1`, the first real run.** It started at 09:58Z and ran ten workers through the
+  day, at most three at once, all on Opus. The work was FR-131 P4, a triage of the free FR cards, the FR-47
+  close-out, FR-100 P3a, FR-55 P4, FR-18 AC4, FR-16 L1, FR-76 P3, a release worker and this close-out. By
+  17:40Z the hub had verified and merged four PRs:
+  - [#3144](https://github.com/gjovanov/roomler-ai/pull/3144) and
+    [#3145](https://github.com/gjovanov/roomler-ai/pull/3145), which had parked in parallel;
+  - [#3151](https://github.com/gjovanov/roomler-ai/pull/3151);
+  - [#3158](https://github.com/gjovanov/roomler-ai/pull/3158).
+
+  Two code PRs, FR-55 P4 and FR-16 L1, were still in their merge rounds. FR-100 P3a parked with no PR, by
+  the operator's decision: the edit at its core stays the operator's to write. There were five rotations,
+  and every one stood on its own handoff (AC10). FR-55 P4's g4 handed off at 53%, and its g5 waits on the
+  budget reset. The hub deferred `CTX_SOFT` three times, for workers two or three steps from parking,
+  because there a rotation costs more than it saves. Each worker was told to hand off past a higher mark
+  instead. The operating lessons are in
+  [`docs/agent-hub.md` §11](../agent-hub.md#11-operating-lessons-from-the-first-real-run).
+  - **Dead hypothesis:** a stopped worker stays stopped until the hub respawns it. A message, an
+    operator's keystroke and (likely) a viewer opening the session each bring it back. A revived rotated
+    generation then wrote into the live generation's handoff and status files.
+  - **Dead hypothesis:** a verified PR can wait for the operator's merge. Master kept moving under it, and
+    FR-55 P4's PR needed five merge rounds in one afternoon. Since 16:28Z the hub merges a ready PR
+    itself.
+  - **Dead hypothesis:** `hub.mjs stop` stops a worker. It stops only the latest generation, so an older
+    one that a message revived needs `claude stop <short>`.

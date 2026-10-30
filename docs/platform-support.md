@@ -155,10 +155,10 @@ and never outliving the daemon (FR-97 P0e).
 |---|---|---|---|---|
 | The desktop companion | ✅ | 🟡 a `.deb` and an `.rpm` for x86_64 and, since 0.4.138, arm64 (FR-93 P6d, P6e); none for a host with neither dpkg nor rpm, such as Arch (FR-97 D17) | ✅ in the `.pkg` | `.github/workflows/release-agent.yml:764-775`, `:863-868`, `:955` |
 | Its pages on a system install | ✅ | 🟡 the safety pages; Devices, the mesh and the live links (no endpoints) since 0.4.150 (FR-97 P2g, P2h) | 🟡 a two-half Mac: Devices, the mesh, the Connection column and Overview's network fields from the root half since 0.4.150 (FR-97 P2g, P2h) | `docs/desktop-companion.md` §6, §12 |
-| The host stays awake during a session | ✅ `PowerCreateRequest` | ✅ a logind block inhibitor | ✅ `IOPMAssertion`; a closed lid with no external display sleeps anyway (§8) | `agents/roomlerd/src/power.rs:643-656` |
+| The host stays awake during a session | ✅ `PowerCreateRequest` | ✅ a logind block inhibitor | ✅ `IOPMAssertion`; a closed lid with no external display sleeps anyway (§8) | `agents/roomlerd/src/power.rs:731-744` |
 | A received file lands as the signed-in person | ✅ | ✅ the person at seat0's Downloads | ✅ | `agents/roomlerd/src/files.rs:209-227` |
 | Hive: adopt a terminal session | ✅ a named pipe | ✅ | ✅ | `agents/roomlerd/src/hive/supervisor/adopt.rs:562` |
-| The setup wizard installs the daemon | ✅ | ❌ | ❌ | it installs the tunnel client there, so the enroll dialog and both homepages offer it for agents on Windows only (FR-97 D5) — until the server advertises `wizard_unix_daemon` on `GET /api/setup/features` (FR-129 B1-s: `ROOMLER__SETUP__WIZARD_UNIX_DAEMON`, default off, flipped once the B1 wizard is released and field-proven), which the dialog, the landing page and the static `/` follow, failing closed (`ui/src/utils/enrollCommands.ts:161-162`) |
+| The setup wizard installs the daemon | ✅ | ❌ | ❌ | it installs the tunnel client there, so the enroll dialog and both homepages offer it for agents on Windows only (FR-97 D5) — until the server advertises that OS on `GET /api/setup/features` (FR-129 B1-s, one switch per OS since B1-s2: `ROOMLER__SETUP__WIZARD_LINUX_DAEMON` and `ROOMLER__SETUP__WIZARD_MACOS_DAEMON`, each default off and flipped once a released wizard is field-proven there; the legacy `ROOMLER__SETUP__WIZARD_UNIX_DAEMON` turns both on), which the dialog, the landing page and the static `/` follow, failing closed (`ui/src/utils/enrollCommands.ts:165-170`) |
 
 ## 7. Install, update, architectures
 

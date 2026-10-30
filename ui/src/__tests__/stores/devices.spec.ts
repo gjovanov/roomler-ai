@@ -122,6 +122,26 @@ describe('devices store', () => {
     expect(s.items[1]!.presence).toBe('online')
   })
 
+  it('FR-55 P4 — keeps an announced sleep on the offline row it rode, and only there', () => {
+    const s = useDeviceStore()
+    s.items = [makeRow({ id: 'a1' })]
+    const sleep = {
+      since: '2026-10-30T12:00:00Z',
+      power: { policy: 'never', on_ac: false, held: false },
+    }
+    s.applyPresence([{ agent_id: 'a1', presence: 'offline', sleep }])
+    expect(s.items[0]!.sleep).toEqual(sleep)
+    // The device woke and said hello: the reason is over.
+    s.applyPresence([{ agent_id: 'a1', presence: 'online' }])
+    expect(s.items[0]!.sleep).toBeUndefined()
+    // Gone again without a word: plain offline, no stale reason.
+    s.items[0]!.sleep = sleep
+    s.applyPresence([{ agent_id: 'a1', presence: 'stale' }])
+    expect(s.items[0]!.sleep).toBeUndefined()
+    s.applyPresence([{ agent_id: 'a1', presence: 'offline' }])
+    expect(s.items[0]!.sleep).toBeUndefined()
+  })
+
   it('patchRow merges fields into the matching row', () => {
     const s = useDeviceStore()
     s.items = [makeRow({ id: 'a1', name: 'Old' })]

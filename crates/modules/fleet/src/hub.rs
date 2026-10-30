@@ -4259,13 +4259,15 @@ impl Hub {
                 _,
                 ClientMsg::AgentHello { .. }
                 | ClientMsg::AgentHeartbeat { .. }
+                | ClientMsg::AgentSleeping { .. }
                 | ClientMsg::RelayProbeReport { .. }
                 | ClientMsg::SessionStats { .. }
                 | ClientMsg::DerpTicketRequest {},
             ) => {
-                // Hello is handled at registration time; heartbeat and
-                // session stats are consumed by the WS layer (they need
-                // AppState/Mongo, which the Hub deliberately doesn't hold).
+                // Hello is handled at registration time; heartbeat, the sleep
+                // notice (FR-55 P4) and session stats are consumed by the WS
+                // layer (they need AppState/Mongo, which the Hub deliberately
+                // doesn't hold).
                 Ok(())
             }
             (role, msg) => {

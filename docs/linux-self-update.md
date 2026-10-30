@@ -131,8 +131,8 @@ its own updater's next check installed the release a second time.
 
 Since #2724, on Linux, the command restarts the daemon running beside it once its
 install has completed, the way `roomler restart` does
-(`restart_daemon_beside_self_update`, `agents/roomlerd/src/app.rs:6031`, called
-at `app.rs:6008`):
+(`restart_daemon_beside_self_update`, `agents/roomlerd/src/app.rs:6034`, called
+at `app.rs:6011`):
 
 ```mermaid
 sequenceDiagram
@@ -157,7 +157,7 @@ sequenceDiagram
   (`beside_daemon_after_install`, `agents/roomlerd/src/post_install.rs:1002`).
   Otherwise the service keeps its image: P2b's rule for the same question.
 - **The daemon's refusals stand** (FR-84 D3, `roomler restart`'s client,
-  `agents/roomler-cli/src/localclient.rs:1614`): `local_restart_enabled = false`,
+  `agents/roomler-cli/src/localclient.rs:1633`): `local_restart_enabled = false`,
   a recording, a restart in the last 30 s, no supervisor it can prove. A refusal,
   a daemon older than the verb, or a binary that did not answer each end in one
   line: what still runs, and `sudo systemctl restart roomlerd` (a per-user install:

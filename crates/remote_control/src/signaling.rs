@@ -695,7 +695,33 @@ pub enum ClientMsg {
         /// speak for its GUI worker). Additive like `companion_version`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         keep_busy: Option<crate::models::KeepBusyBrief>,
+        /// FR-55 P4 — the device's power posture: its `power_policy`, its
+        /// power source, and whether its keeper holds the machine awake.
+        /// Shown on the device list, never enforced on. `None` = nothing to
+        /// report (a pre-P4 agent, or a keeper that has not decided yet).
+        /// Additive like `keep_busy`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        power: Option<crate::models::PowerBrief>,
     },
+
+    /// FR-55 P4 — this device is going to sleep NOW: the OS said so (logind's
+    /// `PrepareForSleep`, Windows' `PBT_APMSUSPEND`, macOS'
+    /// `kIOMessageSystemWillSleep`). Sent on every live org connection, and
+    /// followed at once by the agent closing that connection, so a server
+    /// that cannot decode it still sees a clean close. A server that can
+    /// records it ([`crate::models::SleepNotice`]) and treats it as the
+    /// goodbye: the device reads offline at once, with the reason, instead
+    /// of green until the receive deadline reaps a socket nobody answers.
+    ///
+    /// `power` is the posture at that moment, so the reader can tell a sleep
+    /// the policy allowed (`held: false`) from one that happened past the
+    /// hold (`held: true`: a closed lid, a person, the OS).
+    ///
+    /// ⚠️ A notice is a promise, not a fact: a suspend can still fail or be
+    /// cancelled. The connection closes either way, and the agent reconnects
+    /// at the wake or the cancel, whose hello clears the record.
+    #[serde(rename = "rc:agent.sleeping")]
+    AgentSleeping { power: crate::models::PowerBrief },
 
     /// Multi-region relay PoPs: the agent's timed STUN probe results for the
     /// regions last pushed in [`ServerMsg::RelayRegions`]. The server derives
@@ -2804,6 +2830,7 @@ impl ClientMsg {
         match self {
             ClientMsg::AgentHello { .. } => "rc:agent.hello",
             ClientMsg::AgentHeartbeat { .. } => "rc:agent.heartbeat",
+            ClientMsg::AgentSleeping { .. } => "rc:agent.sleeping",
             ClientMsg::RelayProbeReport { .. } => "rc:relay.probe_report",
             ClientMsg::SessionStats { .. } => "rc:session.stats",
             ClientMsg::DerpTicketRequest { .. } => "rc:relay.derp_ticket_request",
@@ -2901,6 +2928,7 @@ impl ClientMsg {
         match self {
             ClientMsg::AgentHello { .. }
             | ClientMsg::AgentHeartbeat { .. }
+            | ClientMsg::AgentSleeping { .. }
             | ClientMsg::RpcResult { .. }
             | ClientMsg::RpcExecRequest { .. }
             | ClientMsg::ConfigStatus { .. }
@@ -3004,6 +3032,7 @@ impl ClientMsg {
 pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:agent.hello", Owner::Fleet),
     ("rc:agent.heartbeat", Owner::Fleet),
+    ("rc:agent.sleeping", Owner::Fleet),
     ("rc:relay.probe_report", Owner::Network),
     ("rc:session.stats", Owner::Remote),
     ("rc:recording.activity", Owner::Remote),
@@ -9984,6 +10013,7 @@ mod tests {
             warm_relay: Some("5.9.157.221:12586".into()),
             companion_version: Some("0.4.16".into()),
             keep_busy: None,
+            power: None,
             // FR-43 P2c — absent means "no news", which is the steady state.
             caps: None,
         };
@@ -10008,6 +10038,7 @@ mod tests {
                 companion_version,
                 caps,
                 keep_busy,
+                power,
             } => {
                 // FR-43 P2c — the steady state is ABSENT, and that is the
                 // property worth asserting: caps ride the heartbeat only when
@@ -10017,6 +10048,9 @@ mod tests {
                 // busy says nothing: the key is absent on the wire.
                 assert!(keep_busy.is_none());
                 assert!(!s.contains("keep_busy"), "{s}");
+                // FR-55 P4 — nor about power.
+                assert!(power.is_none());
+                assert!(!s.contains("\"power\""), "{s}");
                 assert_eq!(rss_mb, 142);
                 assert!((cpu_pct - 3.25).abs() < f32::EPSILON);
                 assert_eq!(active_sessions, 2);
@@ -10116,6 +10150,7 @@ mod tests {
             // mean "nothing to show").
             companion_version: None,
             keep_busy: None,
+            power: None,
             caps: None,
         };
         let s = serde_json::to_string(&m).unwrap();
@@ -11645,6 +11680,7 @@ mod tests {
             caps: None,
             companion_version: None,
             keep_busy: Some(brief.clone()),
+            power: None,
         };
         let v: serde_json::Value = serde_json::to_value(&hb).unwrap();
         assert_eq!(v["keep_busy"]["phase"], "paused");
@@ -11664,6 +11700,92 @@ mod tests {
             serde_json::to_string(&off).unwrap(),
             r#"{"on":false,"phase":"off"}"#
         );
+    }
+
+    /// FR-55 P4 — the power brief rides the heartbeat both ways, and a
+    /// heartbeat from an agent that predates it still parses, as "nothing to
+    /// say". An unknown power source is absent from the wire, never `false`:
+    /// "on battery" and "cannot tell" stay two answers.
+    #[test]
+    fn power_brief_rides_the_heartbeat_and_is_optional() {
+        use crate::models::PowerBrief;
+        let old = r#"{"t":"rc:agent.heartbeat","rss_mb":0,"cpu_pct":0.0,"active_sessions":0}"#;
+        match serde_json::from_str::<ClientMsg>(old).unwrap() {
+            ClientMsg::AgentHeartbeat { power, .. } => assert!(power.is_none()),
+            other => panic!("expected a heartbeat, got {other:?}"),
+        }
+        let brief = PowerBrief {
+            policy: "on-ac".into(),
+            on_ac: Some(true),
+            held: true,
+        };
+        let hb = ClientMsg::AgentHeartbeat {
+            rss_mb: 0,
+            cpu_pct: 0.0,
+            active_sessions: 0,
+            sys: None,
+            srflx_count: None,
+            warm_relay: None,
+            caps: None,
+            companion_version: None,
+            keep_busy: None,
+            power: Some(brief.clone()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&hb).unwrap();
+        assert_eq!(v["power"]["policy"], "on-ac");
+        assert_eq!(v["power"]["on_ac"], true);
+        assert_eq!(v["power"]["held"], true);
+        match serde_json::from_value::<ClientMsg>(v).unwrap() {
+            ClientMsg::AgentHeartbeat { power, .. } => assert_eq!(power, Some(brief)),
+            other => panic!("expected a heartbeat, got {other:?}"),
+        }
+        let unknown = PowerBrief {
+            policy: "never".into(),
+            on_ac: None,
+            held: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&unknown).unwrap(),
+            r#"{"policy":"never","held":false}"#
+        );
+    }
+
+    /// FR-55 P4 — the suspend announcement: one fixed tag, the posture at the
+    /// moment of sleep, owned by fleet (whose socket loop treats it as the
+    /// goodbye). `by_policy` is the reading the dashboard words: nothing held
+    /// means the policy let the device sleep.
+    #[test]
+    fn the_sleep_announcement_carries_the_posture_and_belongs_to_fleet() {
+        use crate::models::PowerBrief;
+        let m = ClientMsg::AgentSleeping {
+            power: PowerBrief {
+                policy: "never".into(),
+                on_ac: Some(false),
+                held: false,
+            },
+        };
+        assert_eq!(m.wire_tag(), "rc:agent.sleeping");
+        assert_eq!(m.namespace(), Owner::Fleet);
+        let s = serde_json::to_string(&m).unwrap();
+        assert_eq!(
+            s,
+            r#"{"t":"rc:agent.sleeping","power":{"policy":"never","on_ac":false,"held":false}}"#
+        );
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::AgentSleeping { power } => {
+                assert!(power.by_policy(), "nothing held: the policy let it sleep");
+                assert_eq!(power.on_ac, Some(false));
+            }
+            other => panic!("expected the sleep announcement, got {other:?}"),
+        }
+        // A sleep past the hold (a closed lid, a person, the OS) is not one
+        // the policy allowed.
+        let past_the_hold = PowerBrief {
+            policy: "on-ac".into(),
+            on_ac: Some(true),
+            held: true,
+        };
+        assert!(!past_the_hold.by_policy());
     }
 
     #[test]
@@ -12728,6 +12850,7 @@ mod tests {
             warm_relay: None,
             companion_version: None,
             keep_busy: None,
+            power: None,
             caps: None,
         };
         let s = serde_json::to_string(&quiet).unwrap();
@@ -12746,6 +12869,7 @@ mod tests {
             warm_relay: None,
             companion_version: None,
             keep_busy: None,
+            power: None,
             caps: Some(Box::new(AgentCaps {
                 permissions: Some(vec!["screen-capture".into(), "input".into()]),
                 has_input_permission: true,

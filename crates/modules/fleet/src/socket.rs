@@ -549,6 +549,10 @@ pub async fn handle_agent_socket(
     ));
     liveness.tick().await; // arm; first tick fires immediately
     let mut last_rx = std::time::Instant::now();
+    // FR-55 P4 — the device's goodbye before a sleep, when it said one: the
+    // teardown's offline transition carries it, so a dashboard learns why the
+    // device went in the same event that tells it the device went.
+    let mut announced_sleep: Option<roomler_ai_remote_control::models::SleepView> = None;
 
     // Read loop. rc.53: wrapped in `tokio::select!` so the Hub's
     // displacement-cancel notify exits this loop within milliseconds
@@ -705,6 +709,50 @@ pub async fn handle_agent_socket(
                                     });
                                     continue;
                                 }
+                                // FR-55 P4 — the device is going to sleep. It is
+                                // a goodbye: record why, then leave the loop so
+                                // the ordinary teardown runs NOW (the Hub
+                                // unregistration, the Offline write, the offline
+                                // transition), instead of the device reading
+                                // online until the receive deadline reaps a
+                                // socket nobody will answer. The agent closes its
+                                // side as well, so a server that cannot decode
+                                // the notice still sees the close.
+                                //
+                                // Inline, not spawned: the record must be on the
+                                // row before the offline event tells a dashboard
+                                // to look. ⚠️ `agent_id` is the authenticated
+                                // socket's, and the write is keyed by this
+                                // connection's hello (`conn_id`): a displaced
+                                // connection cannot mark a reconnected device
+                                // asleep.
+                                ClientMsg::AgentSleeping { power } => {
+                                    info!(
+                                        %agent_id,
+                                        policy = %power.policy,
+                                        on_ac = ?power.on_ac,
+                                        held = power.held,
+                                        "agent is going to sleep — closing its socket as the goodbye (FR-55 P4)"
+                                    );
+                                    let notice = roomler_ai_remote_control::models::SleepNotice {
+                                        at: bson::DateTime::now(),
+                                        power,
+                                    };
+                                    match state.agents.record_sleep(agent_id, &conn_id, &notice).await {
+                                        Ok(true) => {
+                                            announced_sleep = roomler_ai_remote_control::models::SleepView::of(
+                                                Some(&notice),
+                                                false,
+                                            );
+                                        }
+                                        Ok(false) => debug!(
+                                            %agent_id,
+                                            "sleep notice from a connection that no longer holds the row — not recorded"
+                                        ),
+                                        Err(e) => warn!(%agent_id, %e, "agent record_sleep failed"),
+                                    }
+                                    break;
+                                }
                                 other => other,
                             };
                             // Phase 7: refresh last_seen_at on every heartbeat. Hub
@@ -725,6 +773,7 @@ pub async fn handle_agent_socket(
                                 companion_version,
                                 caps,
                                 keep_busy,
+                                power,
                                 ..
                             } = &parsed
                             {
@@ -735,7 +784,7 @@ pub async fn handle_agent_socket(
                                     warm_relay.clone(),
                                     companion_version.clone(),
                                     caps.clone(),
-                                    keep_busy.clone(),
+                                    (keep_busy.clone(), power.clone()),
                                 ))
                             } else {
                                 None
@@ -750,7 +799,7 @@ pub async fn handle_agent_socket(
                                 warm_relay,
                                 companion_version,
                                 caps,
-                                keep_busy,
+                                (keep_busy, power),
                             )) = heartbeat_sessions
                             {
                                 // FR-43 P2c — an agent announces changed
@@ -859,6 +908,7 @@ pub async fn handle_agent_socket(
                                         warm_relay.as_deref(),
                                         companion_version.as_deref(),
                                         keep_busy.as_ref(),
+                                        power.as_ref(),
                                     )
                                     .await
                                 {
@@ -1035,12 +1085,14 @@ pub async fn handle_agent_socket(
                 .remove_if(&agent_id, |_, stored| stored == token);
         }
         if !foreign_claim {
-            crate::presence::note_transition(
+            // FR-55 P4 — with the reason, when the device gave one.
+            crate::presence::note_transition_with(
                 &state,
                 tenant_id,
                 agent_id,
                 &machine_name,
                 crate::presence::OFFLINE,
+                announced_sleep,
             )
             .await;
         }

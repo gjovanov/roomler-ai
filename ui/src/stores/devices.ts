@@ -3,6 +3,9 @@
 import { ref } from 'vue'
 import { defineStore } from 'pinia'
 import { api } from '@/api/client'
+import type { DevicePresence, SleepView } from '@/utils/devicePresence'
+
+export type { DevicePresence } from '@/utils/devicePresence'
 
 /**
  * The unified devices-grid feed (`GET /tenant/{tid}/device`): agents +
@@ -14,8 +17,6 @@ import { api } from '@/api/client'
  * `useAgentStore` — the grid looks them up by id when it needs the rich
  * fields (consent selects, codec chips).
  */
-
-export type DevicePresence = 'online' | 'stale' | 'offline'
 
 export interface DeviceRow {
   kind: 'agent' | 'tunnel_client'
@@ -43,6 +44,10 @@ export interface DeviceRow {
   /** FR-51 — enrolled as temporary: reaped after silence, removed outright on
    *  a clean stop; a later enrollment is a NEW device. Present only when true. */
   ephemeral?: boolean
+  /** FR-55 P4 — on an agent that is not online: it announced it was going to
+   *  sleep, since when, and its power posture then (`utils/devicePresence.ts`).
+   *  Absent = no reason given, which is every other way a device goes. */
+  sleep?: SleepView
 }
 
 interface DeviceListResponse {
@@ -105,14 +110,19 @@ export const useDeviceStore = defineStore('devices', () => {
 
   /** Patch presence in place from the `device:presence` WS event (agents
    *  only — tunnel clients never appear in it). Unknown ids are ignored;
-   *  the next fetch converges. */
-  function applyPresence(updates?: Array<{ agent_id: string; presence?: DevicePresence }>) {
+   *  the next fetch converges. FR-55 P4 — an `offline` row says why when the
+   *  device announced a sleep, and every other transition clears the reason:
+   *  it belongs to the offline row it rode. */
+  function applyPresence(
+    updates?: Array<{ agent_id: string; presence?: DevicePresence; sleep?: SleepView }>,
+  ) {
     if (!updates?.length) return
     for (const u of updates) {
       const row = items.value.find((r) => r.kind === 'agent' && r.id === u.agent_id)
       if (row && u.presence) {
         row.presence = u.presence
         row.is_online = u.presence === 'online'
+        row.sleep = u.presence === 'offline' ? u.sleep : undefined
       }
     }
   }

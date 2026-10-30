@@ -738,7 +738,7 @@ While the switch is on, the hello says `color-described` (`agents/roomlerd/src/e
 | Data channel, VP9 (4:2:0 and 4:4:4) | lever 2 only | Chrome's WebCodecs ignores VP9's in-band colour space (FR-130 §2.5) |
 | Data channel, H.264, HEVC and AV1 | lever 2, and lever 1 where the encoder writes it | either alone decodes true, and together they agree |
 | RTP `<video>` | lever 1 only | lever 2 cannot reach it. Microsoft's MF H.264 and `h264_amf` still decode as BT.709 here (FR-130 open decision 6: accepted for now) |
-| a recording | lever 1 (FFmpeg-encoded) or the recorder's own openh264 VUI | |
+| a recording | lever 1 (FFmpeg-encoded) or the recorder's own openh264 VUI | the MP4's `colr` box says BT.601 limited whatever the switch says, and Chrome's `<video>` reads it: a recording made with the switch off plays true too (FR-130 §8). Lever 1 makes the elementary stream describe itself |
 
 Read in the field on agent 0.4.188 ([FR-130 §8](fr/FR-130-colours-decode-true.md#8-field-verification-log)):
 lever 1 alone decodes `<video>` true from live openh264, and VP9 on the data channel decodes true through lever 2
@@ -904,7 +904,7 @@ rung, never the target.
 | `idr_count` | every keyframe the encoder emitted. Read against `dims_swaps` and the session's `PLI/FIR → forcing keyframe` lines (`peer.rs:836`) to isolate the rate-caused ones |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
-**The read for any host** — the FR-62 A0 sweep (`app.rs:6209`):
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6212`):
 
 ```
 roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
@@ -917,11 +917,11 @@ bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
 reads taught it:
 
 - **The rate change is charged with the keyframe on the rung's first output frame**
-  (`sweep_attribute_idrs`, `app.rs:6470`), not on frame 0. AMF answers the frame that
+  (`sweep_attribute_idrs`, `app.rs:6473`), not on frame 0. AMF answers the frame that
   fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
   "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
   for a backend that rebuilds on every move.
-- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6499`). Every
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6502`). Every
   backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
   CBR (`select_rc_mode` takes the CBR branch because the session opens with
   `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst

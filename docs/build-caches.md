@@ -138,10 +138,10 @@ days. So before every non-tag build, `seed-cache-restore` runs a GC step
 |---|---|---|
 | Default (companions, everything else) | 3,000 MB | `seed-cache-restore/action.yml:85` |
 | The four daemon jobs (`.deb` ×2, MSI, `.pkg`) | 4,500 MB | `release-agent.yml:393`, `:1129`, `:1604`, `:2575` |
-| The wizard's macOS universal job (two triples) | 5,000 MB | `release-setup.yml:401` |
+| The wizard's macOS universal job (two triples) | 5,000 MB | `release-setup.yml:396` |
 | CI caches in the release-asset store (`ci-seed-restore`), default | 4,000 MB | `ci-seed-restore/action.yml:29` |
-| The integration shards, `ci.yml`'s macOS overlay check and its Windows clippy lane | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1265`, `:1510` |
-| `ci.yml`'s Linux lanes (wave 34): unit, lint, agent; recorder-audio, ffmpeg-encoder, recording-ffmpeg, profiles | 16,000, 10,000, 7,000; 5,000 each | `ci.yml:431`, `:165`, `:580`; `:1091`, `:1818`, `:1996`, `:2473` |
+| The integration shards, `ci.yml`'s macOS overlay check and its Windows clippy lane | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1362`, `:1609` |
+| `ci.yml`'s Linux lanes (wave 34): unit, lint, agent; recorder-audio, ffmpeg-encoder, recording-ffmpeg, profiles | 16,000, 10,000, 7,000; 5,000 each | `ci.yml:504`, `:231`, `:655`; `:1170`, `:1920`, `:2100`, `:2592` |
 
 **A cold build has to fit under its cap.** If it does not, every restore drops the cache, every
 run builds cold, and each master run publishes the same size again, so the GC never recovers.
@@ -150,9 +150,18 @@ run builds cold, and each master run publishes the same size again, so the GC ne
 ~8 (FR-6 wave 33). A master run that publishes a CI cache over its cap now warns
 `CI cache over its cap` on the run page (`ci-seed-save/action.yml:95`).
 
-The Linux lanes' caps are first estimates, about 1.5 times each lane's old Actions-cache
-archive at the 4.3× unpack ratio the integration lane measures (its 1,181 MB asset restores to
-5,077 MB). The first master run's `pruned target: A MB -> B MB` line gives the real figure.
+**A cold build also has to fit its job's ceiling, publish included.** A run cut off before
+it publishes leaves the next run cold as well, and that one is cut off the same way. Wave 34's
+first master run built the unit lane cold (1,795 crates) and hit the 30-minute ceiling at
+30 min 15 s, with the second part of its 2.6 GB archive still uploading. That part landed two
+seconds after the cut. The unit and lint lanes now allow 45 and 40 minutes (`ci.yml:474`,
+`:159`), about 1.5 times their measured cold runs (FR-6 wave 36).
+
+The Linux lanes' caps began as estimates, about 1.5 times each lane's old Actions-cache archive
+at the 4.3× unpack ratio the integration lane measures (its 1,181 MB asset restores to
+5,077 MB). Wave 34's first master publish (run 41107105820) put every lane at 32–65 % of its
+cap: unit 10,373 MB of 16,000, lint 6,081 of 10,000, agent 3,268 of 7,000, and the four
+5,000 MB lanes at 1,601–2,445.
 
 **A seed grows per release, not per build.** Cargo names an artifact by the unit's name,
 version, features and profile, never by its source. So a rebuild of the same version
@@ -210,6 +219,8 @@ closes it (`:3742`).
 | 32 (#3068) | the daemon seeds' cap rises to 4,500 MB, and the GC line reports free disk | a reseed reuses instead of a 26-minute cold MSI |
 | 33 (#3153) | the Windows clippy lane's CI cache cap rises to 6,000 MB, and a master run warns when it publishes a cache over its cap | ends a cold build of that lane on every CI run since #3125 (17–23 min, against 7.4–8.3 before it) |
 | 34 (#3157) | `ci.yml`'s seven Linux cargo caches move from the Actions cache to `seed-cache`, the largest in parts | a download the Actions cache refuses ("Egress is over the account limit") no longer builds a lane cold (the unit lane: 27 min against ~8) |
+| 35 (#3170) | a docs-only PR skips the twelve heavy jobs; a push to master still runs every job | a docs PR's CI runs the audits and the frontend build, not 20 jobs (22 of 60 runs on 2026-10-30 were docs, each running all 20 jobs, up to 44 min) |
+| 36 (#3170) | the unit and lint lanes' job ceilings rise from 30 to 45 and 40 min | a cold run of either lane finishes its publish (wave 34's first cold unit run was cut off mid-upload at 30 min 15 s) |
 
 What is left is runner queueing, not compiling. On 0.4.182 and 0.4.183 the `.pkg` waited
 about 8 minutes for a macOS runner, and tag to publish took 13–16 minutes. On 0.4.184 and

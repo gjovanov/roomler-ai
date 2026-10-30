@@ -5,8 +5,9 @@ hands each piece of work (an FR phase, a bug, a spec, a piece of research) to a 
 background Claude Code session (`claude --bg`) in a git worktree of its own. The hub measures
 every worker on each tick, answers or routes its questions, rotates its context before it
 degrades, and checks each claim it makes on GitHub, CI or the fleet before that claim counts.
-The operator watches one board, can enter any worker and leave it again, and keeps every
-merge, close, release and deploy.
+The operator watches one board and can enter any worker and leave it again. Since
+2026-10-30 the hub merges and deploys a PR as soon as it is ready, and closes an FR once every
+criterion is ticked with its evidence (§11). The operator keeps every decision that is theirs.
 
 This page is the engineering reference. The decisions and their evidence are in the spec,
 [FR-131](fr/FR-131-hub-coordinator.md) (#3127). The FR rules that every FR worker follows are in
@@ -155,7 +156,7 @@ stateDiagram-v2
     handing_off --> running: spawn --rotate starts the next generation
     running --> parked: PARKED, verified on the surface
     running --> done: DONE, verified, nothing to merge
-    parked --> done: the operator merges and closes
+    parked --> done: the hub merges it once ready
     running --> failed: reports failed
     failed --> running: rotate or re-tier
     failed --> cancelled: noted on its issue
@@ -223,8 +224,9 @@ The verbs are defined once, in `worker.md §Messages`:
 | `PARKED W-n:` · `DONE W-n:` | the agent part is done, with the claims to verify and what the operator owes |
 
 **Who decides.** The hub answers what it can from the spec, the rails, master and GitHub. A
-merge, a close, a release, a change of scope, risk to a live host, an operator-only AC, and a
-design choice the spec leaves open go to the operator. The hub escalates with a first line that
+change of scope or priority, money or accounts, risk to a live host, an operator-only AC, and a
+design choice the spec leaves open go to the operator. Merging, deploying, testing, ticking and
+closing complete work are the hub's since 2026-10-30 (§10). The hub escalates with a first line that
 stands alone and the exact commands to answer (in the hub's terminal, from the view, or by entering
 the worker with `claude attach <short>`). A message from the hub view reads
 `(the operator, from the hub view)` on its second line, and the worker treats it as the operator's
@@ -412,7 +414,7 @@ until it breaks a run.
 | **Git Bash rewrites a leading `/`** | An argument that starts with `/` becomes a Windows path before a native exe sees it: `/plugin-types` arrived as a path under the Git install folder. | Prefix such a command with `MSYS_NO_PATHCONV=1`. `hub.mjs` starts `claude` through Node, so its own arguments are safe. |
 | **Trust** | 2.1.314 refuses `claude --bg` in an untrusted folder ("Workspace not trusted"). A worktree of a trusted repo, and any subfolder of a trusted folder, inherit the trust. | Every worker, research ones included, gets a worktree of this repo. |
 | **What a worktree session misses** | It shares auto-memory, `CLAUDE.md`, the rules, the project env and the hooks, but not `settings.local.json`, `permissions.defaultMode` or the untracked skills. | `spawn` forwards `GH_CONFIG_DIR` and sets the mode; briefs pass untracked skills by absolute path. |
-| **A cron prompt arrives as plain text** | `/hub tick <id>` from a cron reaches the model as bare text, not as a skill invocation, so it works only while the skill is already in context. A session cron survives `/clear`, and fires that queued up while the session was busy arrive as one message. | The heartbeat prompt says how to load the skill if it is missing. The hub runs `CronList` before any `CronCreate`, so a second cron never doubles the tick. |
+| **A cron prompt arrives as plain text** | `/hub tick <id>` from a cron reaches the model as bare text, not as a skill invocation, so it works only while the skill is already in context. A session cron survives `/clear`. Fires that queued up while the session was busy arrive as one message, or back to back, which reads like a doubled cron (§11). | The heartbeat prompt says how to load the skill if it is missing. The hub runs `CronList` before any `CronCreate`, so a second cron never doubles the tick. |
 | **`claude rm` keeps the transcript** | It removes a session from the registry but keeps its transcript, so an earlier generation stays readable. It also deletes a worktree that Claude itself made for the session; a hub-made worktree stays. | The view opens earlier generations from their transcripts. |
 | **Reading `claude logs`** | It is a stream of full-screen frames. Each starts with ESC[H, and its rows wrap at the terminal width with no line breaks, so stripping the ANSI garbles the layout. | `node ~/.claude/skills/hub/vt.mjs <capture> 200 60` replays it and prints the last screen; a docked pane reads as the right-hand columns. |
 
@@ -420,7 +422,7 @@ until it breaks a run.
 
 | Rail | Why |
 |---|---|
-| **The operator merges, closes, tags, promotes, deploys and edits prod config.** The hub and its workers park the work for them. | Each of those is a decision about the product, and a worker's report is a claim until someone has looked. |
+| **The hub merges and deploys a READY PR, and closes an FR once it is complete; workers never merge or close.** The operator keeps scope, priority, money and accounts, risk to a host they use, operator-only ACs, and the design choices a spec leaves open. | A ready PR that waits goes stale as master moves (§11, lesson 2). Ready means verified on the surface, because a worker's report is a claim until someone has looked. Complete means every criterion `[x]` with its evidence and the docs merged; a `[~]`, an open AC or an operator-only AC keeps the issue open. The rest are decisions about the product. |
 | **`Refs #n` only**, never `close`, `fix` or `resolve #n`, in a PR body or a commit | GitHub closes the issue the moment the PR merges. On 2026-09-25 "close #819" in a worker's PR body closed FR-22 with two criteria still open ([`.claude/agents/fr-worker.md:57-61`](../.claude/agents/fr-worker.md)). |
 | **The only commit the hub pushes to master is an FR claim**: the spec and its ledger row in one commit, made back to back with the issue, and only while no release-bump PR is open | Only master arbitrates a number ([`fr/README.md`](fr/README.md)). Only the hub claims, one claim at a time, so its workers never race each other for N. |
 | **Public text names no hostnames, local paths, session ids or account names** | The repo is public. A name edited out later stays in the edit history. The hub issue lives in the private docs repo for this reason. |
@@ -430,8 +432,91 @@ until it breaks a run.
 | **GitHub is polled no faster than every 60 s, with one watcher per PR** | About 34 sessions share the account. |
 | **A worktree is removed only** if it is a `hub-` worktree recorded in state, its issue is closed and its PR merged, with `git worktree remove` and no `--force`, together with its target folder; branches stay | A name alone is no proof of who made a worktree, and each target folder runs to several GB. |
 
-## 11. Field log
+## 11. Operating lessons from the first real run
 
+Hub `bl1` worked the backlog on 2026-10-30 (FR-131 P3,
+[field log](fr/FR-131-hub-coordinator.md#field-log)). It ran ten workers, at most three at once, and
+the hub merged four PRs. Six lessons came out of it. The last column says where each rule lives now:
+four are in the generic skill, and two are specific to this repo and are kept here.
+
+| # | Lesson | What bl1 measured | The rule | Where it lives |
+|---|---|---|---|---|
+| 1 | **A message respawns a stopped background worker.** So does the operator typing into it, and likely a viewer opening its session. | A peer session's release broadcasts went to the workers' session names. They revived two parked workers and FR-55 P4's rotated g3, which then wrote into the live g4's handoff and status files: two generations on one worktree. The operator's `go`, typed into the retired g3, revived it again. A parked worker also came back with no turn in its transcript, likely when a viewer opened it. | Peers send a hub's notices to the hub, never to a worker. On every tick, after `hub.mjs status`, the hub runs `claude agents --json --all`. A generation that should be stopped but shows a `status` first has its transcript tail read (what woke it, and whether it touched the worktree), then gets `claude stop <short>`. `hub.mjs stop` reaches only the latest generation, so an older one is stopped by its short id. | `SKILL.md §Tick` (Measure), `§Messages` |
+| 2 | **Merge and deploy as soon as a PR is ready.** This is the operator's standing rule, from 2026-10-30 16:28Z. | Verified PRs that waited for the operator's merge kept conflicting as master moved. FR-55 P4's PR ([#3148](https://github.com/gjovanov/roomler-ai/pull/3148)) needed five merge rounds in one afternoon, and each round cost its worker a rebuild. | §11.1. Ready means verified by the hub on the surface. From 19:50Z the same holds for a close: once an FR is complete, the hub ticks the issue body, posts the Result and closes it. | `SKILL.md §Rails` (Merge, Close when complete) |
+| 3 | **Anchor churn.** PRs that move a heavily anchored file conflict with each other, and with master, in many docs at once. | 24 docs anchor into `agents/roomlerd/src/app.rs`. After one merge to master, FR-16 L1's PR ([#3155](https://github.com/gjovanov/roomler-ai/pull/3155)) conflicted in 16 docs. FR-55 P4's conflicted in 4 to 11 docs a round. Every hunk differed only in anchor numbers. | One of the two methods in §11.2, each with its cross-check. Merging soon after green (lesson 2) keeps the rounds few. | here (repo-specific) |
+| 4 | **Disk.** Container target volumes grow fast. | One worker held about 72 GB: a 39 GB target volume, a 30 GB native target and a 3 GB image. The hub read C: falling 21 GB in 11 minutes. | Every brief tells the worker to run `df` before each build, build one feature set at a time, send `BLOCKED: disk` under 45 GB free, and tear down its containers, volumes and images at park. Under pressure, the hub may delete a parked or done worker's regenerable target cache, never a running one's. One such cache gave back 16 GB. The budget hold starts nothing under 40 GB free (§7). | `SKILL.md §Rails` |
+| 5 | **Missed cron fires can arrive back to back.** | While the hub was busy, the heartbeat's missed fires came in one after another, which reads like a doubled cron. | It is not a second cron: `CronList` shows one. Never add another. | `SKILL.md §Start` (Heartbeat) |
+| 6 | **Known flakes are not the worker's failure.** | The macOS lane's `thread_dump` test failed on three of the run's PRs ([#3148](https://github.com/gjovanov/roomler-ai/pull/3148), [#3151](https://github.com/gjovanov/roomler-ai/pull/3151), #3155). On the loaded dev box, `exec::tests::concurrency_cap_refuses_rather_than_queues` ([`agents/roomlerd/src/exec.rs:2731`](../agents/roomlerd/src/exec.rs#L2731)) failed a native Windows `cargo test -p roomlerd --lib` for two workers. | Re-run the macOS job (`gh run rerun <run> --failed`) until it is green, and never merge red. The exec test passes alone. It also still fails with the PR's own tests skipped, which rules the PR out, and CI's Windows lane is the gate of record. | here (repo-specific) |
+
+### 11.1 Merge and deploy, once a PR is ready
+
+```mermaid
+flowchart TB
+    P["a worker reports MILESTONE or PARKED"] --> V{"verified on the surface?<br/>the stated head · every check green · MERGEABLE<br/>Refs only · docs in the PR · no leaks"}
+    V -- "only a known flake is red" --> RR["gh run rerun --failed"]
+    RR --> V
+    V -- "no" --> VF["VERIFY-FAILED to the worker"]
+    V -- "yes" --> B{"an open bump PR?"}
+    B -- "yes: a release freeze" --> WT["wait for the release to publish"]
+    B -- "no" --> M["merge: squash, pinned to the verified head"]
+    M --> RC["fetch master · re-check every other ready PR"]
+    RC --> D{"what changed?"}
+    D -- "docs only" --> NO["nothing to deploy"]
+    D -- "server or UI" --> PR["promote the image built from the merge"]
+    D -- "agent code" --> AR["the next agent release, agreed with its owner"]
+    PR --> FV["field-verify from the fleet"]
+    AR --> FV
+    NO --> C{"is the FR complete?<br/>every AC [x] with its evidence · docs merged"}
+    FV --> C
+    C -- "yes" --> CL["tick the issue body · post the Result · close"]
+    C -- "no: a [~], an open AC or an operator-only AC" --> OPEN["the issue stays open"]
+```
+
+The gate and the merge run in **one** shell call, so a freeze stops the merge itself and does not
+just get printed beside it:
+
+```bash
+N=$(gh pr list -R gjovanov/roomler-ai --state open --search 'bump in:title' --json number -q length)
+[ "$N" = 0 ] || exit 1
+gh pr merge <n> -R gjovanov/roomler-ai --squash --match-head-commit <verified sha>
+```
+
+One merge at a time. The branch is kept (no `--delete-branch`). After each merge the hub posts the FR's
+`## Step log` row, brings the issue body's ticks in line with the merged spec, and fetches master, because
+every other ready PR may conflict now. If that leaves the FR complete, the hub posts its
+`## Result — field-verified on <version>` and closes the issue in the same pass; it never ticks a box
+in order to close. Merging and closing are the hub's alone, and a worker does neither.
+
+### 11.2 Anchor churn: two ways through a conflict
+
+Both methods start from a merge of master **pinned to a SHA**, not to `origin/master`, because a
+parallel fetch once moved that ref in the middle of a merge. Both end the same way:
+
+- the anchor cross-check, both ways: every shifted number lands on the same code text it named before;
+- the pin scan, down to 0: a line under an anchor pin keeps its day's number;
+- `bash scripts/anchor-range-audit.sh`, and the other CI docs audits.
+
+| Method | Steps | Use it when |
+|---|---|---|
+| **(a) master's side, then both deltas** | 1. Show with a diff3 view that every conflicting hunk differs only in digits. 2. `git merge -X theirs <sha>`; in a merge of master into the branch, *theirs* is master. 3. Re-apply both anchor deltas: the PR's code moves onto the hunks that took master's side, and master's code moves onto the PR's own docs. | the conflicts sit in docs the PR touched only to shift anchors |
+| **(b) master's text, plus the PR's delta once** | For each conflicting doc, take master's text and shift it once for the code files the PR moves. For the PR's own docs, keep its text and shift it once for master's moved files. | the PR had already shifted hunks that master also changed, where (a) would shift them twice |
+
+FR-55 P4's worker used (a) on rounds of 4 to 11 docs. FR-16 L1's used (b) on a 16-doc round, where all 60
+of its conflicting changes were digits only. Both cross-checks came back clean.
+
+## 12. Field log
+
+- **2026-10-30 — P3, the first real run, hub `bl1`.** Ten workers in all, at most three at once, all on
+  Opus. The hub merged [#3144](https://github.com/gjovanov/roomler-ai/pull/3144) (FR-131 P4) and
+  [#3145](https://github.com/gjovanov/roomler-ai/pull/3145) (the FR-47 close-out), which had parked in
+  parallel, then [#3151](https://github.com/gjovanov/roomler-ai/pull/3151) (FR-18 AC4) and
+  [#3158](https://github.com/gjovanov/roomler-ai/pull/3158) (FR-76 P3). There were five rotations on
+  context signals, across FR-55 P4's worker (g1→g4) and FR-16 L1's (g1→g3). Each handoff stood on its
+  own. The hub deferred `CTX_SOFT` three times, for workers two or three steps from parking, because a
+  rotation that close to the end costs more than it saves. It gave each of them a higher mark to hand
+  off at instead. Late in the day the account's 5-hour window reached 72%, and the hub moved the next
+  rotation and the server promote past the window's reset: under the hold it could not have started the
+  rotation, and it would not promote what it could not then field-verify. The lessons are in §11.
 - **2026-10-30 — P2, the hub view, under its own first hub.** One worker built `hub-view` across
   three generations. g1 handed off to g2 at 35% context, after reading the function-hooks API
   declarations had grown it by about 80k tokens in nine minutes. g2 handed off to g3 across a

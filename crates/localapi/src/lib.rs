@@ -151,6 +151,21 @@ pub struct NetworkOrigin {
     pub name: String,
 }
 
+/// FR-55 P4 — the power keeper's posture, as `roomler status` shows it. The
+/// leaf mirror of the server wire's `PowerBrief` (this crate depends on no
+/// wire crate): the same three fields, the same omission rule.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PowerStatus {
+    /// `never` · `on-ac` · `always`, as the keeper parsed `power_policy`.
+    pub policy: String,
+    /// `Some(true)` on mains, `Some(false)` on battery, `None` = cannot tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_ac: Option<bool>,
+    /// The keeper holds the machine awake right now (the policy, or a live
+    /// session).
+    pub held: bool,
+}
+
 /// Snapshot of the local node.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct NodeStatus {
@@ -186,6 +201,14 @@ pub struct NodeStatus {
     pub network_from: Option<NetworkOrigin>,
     /// Connected to the coordination server.
     pub connected: bool,
+    /// FR-55 P4 — this device's power posture: the standing `power_policy`,
+    /// the power source, and whether the keeper holds the machine awake.
+    /// What tells an operator, before it happens, whether this device will
+    /// read "asleep by policy" when it sleeps. `None` from a daemon that
+    /// predates the field, or whose keeper has not decided yet; an older CLI
+    /// ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<PowerStatus>,
     /// FR-51 P4 — this daemon's PRIMARY enrollment is ephemeral: the server
     /// reaps the device after silence, and the daemon de-enrolls itself on a
     /// clean stop. Additive both ways: an older daemon omits it (⇒ false),
@@ -5662,6 +5685,7 @@ mod tests {
                 overlay_ip6: None,
                 network_from: None,
                 connected: true,
+                power: None,
                 ephemeral: false,
                 exit_node: None,
                 route_offer_withheld: None,

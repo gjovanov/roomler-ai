@@ -69,18 +69,22 @@ export const DEVICE_ID_PLACEHOLDER = '<device-id>'
 
 /**
  * FR-129 B1-s — what the server advertises on `GET /api/setup/features`
- * (`stores/setupFeatures.ts`), as far as the commands care.
+ * (`stores/setupFeatures.ts`), as far as the commands care: one switch per
+ * OS (B1-s2), so Linux can go live without macOS.
  */
 export interface EnrollOptions {
   /**
-   * `wizard_unix_daemon`: the released Roomler Setup installs the full daemon
-   * on Linux and macOS (FR-129 B1), so the wizard block is offered for an
-   * agent there too. `false` or absent — the server has not answered, failed
-   * to, or is older — keeps the FR-97 D5 rule: for an agent, the wizard on
-   * Windows only. The output is then exactly what it was before the option
-   * existed.
+   * The released Roomler Setup installs the full daemon on Linux (FR-129
+   * B1), so the Linux wizard block is offered for an agent too: the store's
+   * `wizardLinuxDaemon`, which reads `wizard_linux_daemon` or an older
+   * server's `wizard_unix_daemon`. `false` or absent — the server has not
+   * answered, failed to, or said no — keeps the FR-97 D5 rule: for an agent,
+   * no wizard on Linux. The output is then exactly what it was before the
+   * option existed.
    */
-  wizardUnixDaemon?: boolean
+  wizardLinuxDaemon?: boolean
+  /** The same for macOS: the store's `wizardMacosDaemon`. */
+  wizardMacosDaemon?: boolean
 }
 
 /**
@@ -97,10 +101,10 @@ export interface EnrollOptions {
  * FR-97 D5: Roomler Setup installed the agent on Windows only — on Linux and
  * macOS it installed the tunnel client (`agents/roomler-setup`), so an agent
  * enrollment there offered the script and the manual path, never the wizard.
- * FR-129 B1 teaches it the daemon there, and the SERVER says when the
- * released wizard is that one: `options.wizardUnixDaemon`, from
- * `wizard_unix_daemon` on `GET /api/setup/features`, off by default and
- * read as false whenever it is not a JSON `true`.
+ * FR-129 B1 teaches it the daemon there, and the SERVER says, per OS, when
+ * the released wizard is that one: `options.wizardLinuxDaemon` and
+ * `options.wizardMacosDaemon`, from `GET /api/setup/features` (B1-s2), off by
+ * default and read as false whenever the server did not send a JSON `true`.
  */
 export function enrollCommands(
   kind: EnrollKind,
@@ -155,11 +159,15 @@ export function enrollCommands(
   })
   // FR-97 D5 — off Windows the wizard had no agent role to install, so an
   // agent got the script and the manual path only. FR-129 B1-s: the server
-  // says when the released wizard installs the daemon there
-  // (`wizard_unix_daemon`); until it has said `true`, the D5 rule stands. A
-  // tunnel client it always installed everywhere.
-  const wizardWhereItInstalls = (os: EnrollOs, platform: string): CommandBlock[] =>
-    kind === 'agent' && !options.wizardUnixDaemon ? [] : [wizard(os, platform)]
+  // says when the released wizard installs the daemon there, and since B1-s2
+  // it says so per OS; until it has said `true` for this OS, the D5 rule
+  // stands. A tunnel client it always installed everywhere.
+  const serverOffersDaemon: Record<'linux' | 'macos', boolean> = {
+    linux: options.wizardLinuxDaemon === true,
+    macos: options.wizardMacosDaemon === true,
+  }
+  const wizardWhereItInstalls = (os: 'linux' | 'macos', platform: string): CommandBlock[] =>
+    kind === 'agent' && !serverOffersDaemon[os] ? [] : [wizard(os, platform)]
 
   return [
     {
@@ -229,19 +237,19 @@ export interface InstallCard {
    * The graphical installer where it installs the agent, else null — read
    * from the same blocks as the enroll dialog. Windows always (FR-97 D5: off
    * Windows Roomler Setup had only the tunnel client to install); Linux and
-   * macOS once the server advertises `wizard_unix_daemon` on
-   * `GET /api/setup/features` (FR-129 B1-s), which decides it now. The
-   * homepages kept their own per-OS map until P0c-4, so they offered a
-   * visitor on a Mac or Linux a wizard that could not set up the device they
-   * came for — the same mistake the server switch now prevents while the B1
-   * wizard is unreleased.
+   * macOS each once the server advertises that OS on
+   * `GET /api/setup/features` (FR-129 B1-s, per OS since B1-s2), which
+   * decides it now. The homepages kept their own per-OS map until P0c-4, so
+   * they offered a visitor on a Mac or Linux a wizard that could not set up
+   * the device they came for — the same mistake the server's switches now
+   * prevent while a released wizard is not field-proven on that OS.
    */
   wizardUrl: string | null
 }
 
 /** The homepages' install cards, one per OS, from the agent's commands. With
- *  no `options` (the server unknown or older) the cards are exactly what they
- *  were before FR-129. */
+ *  no `options` (the server unknown, or every switch off) the cards are
+ *  exactly what they were before FR-129. */
 export function installCards(origin: string, options: EnrollOptions = {}): InstallCard[] {
   return enrollCommands('agent', origin, null, 'system', false, options).map((os) => ({
     os: os.os,

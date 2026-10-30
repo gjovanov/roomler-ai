@@ -43,8 +43,8 @@ pub struct DetectResult {
 pub struct AgentDetect {
     /// Whether a daemon card may be shown at all. Windows: always. Linux
     /// and macOS (FR-129 B1): this OS implements a daemon role AND the
-    /// server named to `cmd_detect_install` answered `wizard_unix_daemon:
-    /// true` on `GET /api/setup/features` — anything else is `false`.
+    /// server named to `cmd_detect_install` offers it on this OS
+    /// ([`Self::daemon_offered`]) — anything else is `false`.
     pub supported: bool,
     /// `"clean" | "peruser" | "permachine" | "ambiguous"`. On Linux and
     /// macOS `permachine` is the system (root) daemon's enrollment, and
@@ -63,11 +63,16 @@ pub struct AgentDetect {
     /// The daemon roles this OS implements, in card order
     /// ([`crate::role::daemon_roles`]); the SPA hides every other daemon card.
     pub daemon_roles: Vec<Role>,
-    /// The server whose `wizard_unix_daemon` switch `supported` reflects, on
+    /// The server whose daemon switch for this OS `supported` reflects, on
     /// Linux and macOS; `None` on Windows, where no server is asked.
     pub features_server: Option<String>,
-    /// That server's answer (`false` for anything but a JSON `true`).
-    pub wizard_unix_daemon: bool,
+    /// That server's daemon switch for this OS (FR-129 B1-s2,
+    /// [`crate::features::SetupFeatures::daemon_offered`]):
+    /// `wizard_linux_daemon` on Linux, `wizard_macos_daemon` on macOS, each
+    /// OR the `wizard_unix_daemon` a server from before the split sends.
+    /// `false` for anything but a JSON `true`, and on Windows, where no
+    /// server is asked.
+    pub daemon_offered: bool,
     /// FR-129 C1 — the role the Welcome page preselects
     /// ([`crate::role::default_role`]): the background service on a machine
     /// with nothing installed, an existing install's own flavour otherwise.
@@ -93,9 +98,10 @@ pub struct TunnelDetect {
 /// tunnel CLI's config path everywhere. `server` is the Server page's URL as
 /// the SPA has it when the Welcome page loads (its persisted or default
 /// value): on Linux and macOS the daemon cards appear only when THAT server
-/// says `wizard_unix_daemon: true` (FR-129 B1, key design B.6), and the
-/// SPA asks again ([`cmd_setup_features`]) when the URL changes. The
-/// orchestrator asks once more, for the chosen server, before installing.
+/// offers the daemon on this OS (FR-129 B1, key design B.6; one switch per OS
+/// since B1-s2), and the SPA asks again ([`cmd_setup_features`]) when the URL
+/// changes. The orchestrator asks once more, for the chosen server, before
+/// installing.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn cmd_detect_install(server: Option<String>) -> Result<DetectResult, String> {
     let os = crate::role::HostOs::current();
@@ -134,7 +140,7 @@ fn detect_windows_install(os: crate::role::HostOs) -> AgentDetect {
         os: os.wire().to_string(),
         daemon_roles: crate::role::daemon_roles(os).to_vec(),
         features_server: None,
-        wizard_unix_daemon: false,
+        daemon_offered: false,
         default_role: None,
     };
     match detect_existing_install() {
@@ -188,7 +194,7 @@ fn read_system_context_switch() -> crate::role::SystemContextSwitch {
 }
 
 /// Linux and macOS (FR-129 B1): the daemon binary and the two enrollments,
-/// and the server's switch — a card is shown only on its `true`.
+/// and the server's switch for this OS — a card is shown only on its `true`.
 fn detect_unix(
     os: crate::role::HostOs,
     server: &str,
@@ -196,13 +202,14 @@ fn detect_unix(
 ) -> AgentDetect {
     let d = crate::unix_daemon::detect(os);
     let roles = crate::role::daemon_roles(os);
+    let offered = features.daemon_offered(os);
     let kind = match (d.per_user_config, d.system_config) {
         (true, true) => "ambiguous",
         (true, false) => "peruser",
         (false, true) => "permachine",
         (false, false) => "clean",
     };
-    let supported = !roles.is_empty() && features.wizard_unix_daemon;
+    let supported = !roles.is_empty() && offered;
     AgentDetect {
         supported,
         kind: kind.to_string(),
@@ -217,7 +224,7 @@ fn detect_unix(
         os: os.wire().to_string(),
         daemon_roles: roles.to_vec(),
         features_server: Some(server.to_string()),
-        wizard_unix_daemon: features.wizard_unix_daemon,
+        daemon_offered: offered,
         // FR-129 C1: the switch is Windows-only and never asked here.
         default_role: crate::role::default_role(os, supported, kind, read_system_context_switch),
     }
@@ -225,10 +232,14 @@ fn detect_unix(
 
 /// FR-129 B1 — the server's switches, for the Server page: when the URL
 /// changes, the SPA asks here whether the daemon role it holds is still
-/// offered there. Never cached; anything but a JSON `true` is `false`.
+/// offered there, on this OS (B1-s2: `daemonOffered`, the per-OS rule applied
+/// here, not in the page). Never cached; anything but a JSON `true` is
+/// `false`.
 #[tauri::command]
-pub async fn cmd_setup_features(server: String) -> crate::features::SetupFeatures {
-    crate::features::fetch(&server).await
+pub async fn cmd_setup_features(server: String) -> crate::features::FeaturesView {
+    crate::features::fetch(&server)
+        .await
+        .view(crate::role::HostOs::current())
 }
 
 /// FR-129 B1 — the terminal fallback's "I've run it": the privileged half
@@ -931,7 +942,7 @@ mod tests {
                 os: "linux".to_string(),
                 daemon_roles: vec![Role::DaemonSystem, Role::DaemonUser],
                 features_server: Some("https://example.invalid".to_string()),
-                wizard_unix_daemon: true,
+                daemon_offered: true,
                 default_role: Some(Role::DaemonUser),
             },
             tunnel: TunnelDetect {
@@ -967,11 +978,13 @@ mod tests {
             json.contains(r#""featuresServer":"https://example.invalid""#),
             "{json}"
         );
-        assert!(json.contains(r#""wizardUnixDaemon":true"#), "{json}");
+        assert!(json.contains(r#""daemonOffered":true"#), "{json}");
+        assert!(!json.contains("wizardUnixDaemon"), "{json}");
     }
 
     /// FR-129 B1 — on Linux and macOS a daemon card needs the server's
-    /// `true`; the kind reads the two enrollments; Windows never asks.
+    /// `true` for that OS; the kind reads the two enrollments; Windows never
+    /// asks.
     #[test]
     fn unix_detection_follows_the_server_switch() {
         use crate::features::SetupFeatures;
@@ -979,6 +992,8 @@ mod tests {
         let off = SetupFeatures::default();
         let on = SetupFeatures {
             pairing: true,
+            wizard_linux_daemon: true,
+            wizard_macos_daemon: true,
             wizard_unix_daemon: true,
         };
         // FR-129 C1 — the default follows the same switch; the kind is
@@ -993,19 +1008,32 @@ mod tests {
         assert_eq!(d.os, "linux");
         assert_eq!(d.daemon_roles, vec![Role::DaemonSystem, Role::DaemonUser]);
         assert_eq!(d.features_server.as_deref(), Some("https://a.invalid"));
-        assert!(!d.wizard_unix_daemon);
+        assert!(!d.daemon_offered);
         clean_or_none(&d, Some(Role::TunnelClient));
         if d.kind != "clean" {
             assert_eq!(d.default_role, None, "a daemon the device has: no tunnel");
         }
         let d = detect_unix(HostOs::Linux, "https://a.invalid", on);
         assert!(d.supported);
-        assert!(d.wizard_unix_daemon);
+        assert!(d.daemon_offered);
         clean_or_none(&d, Some(Role::DaemonSystem));
         let d = detect_unix(HostOs::Macos, "https://a.invalid", on);
         assert!(d.supported);
+        assert!(d.daemon_offered);
         assert_eq!(d.daemon_roles, vec![Role::DaemonUser]);
         assert_eq!(d.default_role, Some(Role::DaemonUser), "whatever the kind");
+        // B1-s2 — the field the page binds is this OS's switch alone.
+        let linux_only = SetupFeatures {
+            pairing: true,
+            wizard_linux_daemon: true,
+            ..SetupFeatures::default()
+        };
+        let d = detect_unix(HostOs::Macos, "https://a.invalid", linux_only);
+        assert!(!d.supported, "Linux's switch is not the Mac's");
+        assert!(!d.daemon_offered);
+        // FR-129 C1 — and the default follows it: no Mac card, so the tunnel
+        // client on a clean Mac, never a daemon role the page does not show.
+        clean_or_none(&d, Some(Role::TunnelClient));
         let d = detect_unix(HostOs::Other, "https://a.invalid", on);
         assert!(!d.supported, "no daemon role on this OS");
         assert!(d.daemon_roles.is_empty());
@@ -1015,6 +1043,48 @@ mod tests {
             d.kind.as_str(),
             "clean" | "peruser" | "permachine" | "ambiguous"
         ));
+    }
+
+    /// FR-129 B1-s2 — each OS's cards follow that OS's switch, read from the
+    /// server's answer as the wizard parses it. A split server with Linux on
+    /// alone sends `wizard_unix_daemon: false`, the key every wizard released
+    /// before the split reads for both OSes: this one shows the Linux cards
+    /// and still hides the macOS ones. A server from before the split sends
+    /// `wizard_unix_daemon` alone, and it still turns both on.
+    #[test]
+    fn each_os_follows_its_own_switch_and_an_older_server_still_works() {
+        use crate::features::parse;
+        use crate::role::HostOs;
+        let server = "https://a.invalid";
+        let supported = |os, body: &[u8]| detect_unix(os, server, parse(200, body)).supported;
+
+        let linux_only = br#"{"pairing": true, "wizard_linux_daemon": true, "wizard_macos_daemon": false, "wizard_unix_daemon": false, "wizard_pairing": false}"#;
+        assert!(supported(HostOs::Linux, linux_only), "Linux is on");
+        assert!(!supported(HostOs::Macos, linux_only), "macOS stays off");
+
+        let macos_only = br#"{"pairing": true, "wizard_linux_daemon": false, "wizard_macos_daemon": true, "wizard_unix_daemon": false, "wizard_pairing": false}"#;
+        assert!(!supported(HostOs::Linux, macos_only), "Linux stays off");
+        assert!(supported(HostOs::Macos, macos_only), "macOS is on");
+
+        // A split server with both on: all three keys.
+        let both = br#"{"pairing": true, "wizard_linux_daemon": true, "wizard_macos_daemon": true, "wizard_unix_daemon": true, "wizard_pairing": false}"#;
+        assert!(supported(HostOs::Linux, both));
+        assert!(supported(HostOs::Macos, both));
+
+        // A server from before the split: one key, both OSes.
+        let older_on = br#"{"pairing": true, "wizard_unix_daemon": true, "wizard_pairing": false}"#;
+        assert!(supported(HostOs::Linux, older_on));
+        assert!(supported(HostOs::Macos, older_on));
+        let older_off =
+            br#"{"pairing": true, "wizard_unix_daemon": false, "wizard_pairing": false}"#;
+        assert!(!supported(HostOs::Linux, older_off));
+        assert!(!supported(HostOs::Macos, older_off));
+
+        // Off by default, and no OS without a daemon role is offered one.
+        let off = br#"{"pairing": true, "wizard_linux_daemon": false, "wizard_macos_daemon": false, "wizard_unix_daemon": false, "wizard_pairing": false}"#;
+        assert!(!supported(HostOs::Linux, off));
+        assert!(!supported(HostOs::Macos, off));
+        assert!(!supported(HostOs::Other, both));
     }
 
     #[test]

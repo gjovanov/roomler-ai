@@ -323,11 +323,15 @@ mod session_carrier_tests;
 /// switch's empty 404, `purge_user`, and the digest's `quality.ratings`.
 #[cfg(test)]
 mod session_feedback_tests;
-/// FR-129 B1-s — `GET /api/setup/features`: the Phase B kill switch
-/// (`wizard_unix_daemon`, default off) and `pairing`, each following its
-/// setting, read by a guest and a member alike.
+/// FR-129 B1-s — `GET /api/setup/features`: the Phase B kill switch (one per
+/// OS since B1-s2, the legacy `wizard_unix_daemon` for both; default off) and
+/// `pairing`, each following its setting, read by a guest and a member alike.
 #[cfg(test)]
 mod setup_features_tests;
+/// FR-55 P4 — a device that says it is going to sleep reads "asleep" until its
+/// next hello, and only the connection that said hello can say so.
+#[cfg(test)]
+mod sleep_announce_tests;
 #[cfg(test)]
 mod ssh_grant_ack_tests;
 #[cfg(test)]

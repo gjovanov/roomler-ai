@@ -94,7 +94,7 @@ mod front_tests {
     /// A role card is a `label.radio` (`display: flex`), so without the
     /// global rule a hidden card stayed on screen: on Linux and macOS the
     /// Windows daemon cards showed (the released wizard measured in a field
-    /// cell), and the server's `wizard_unix_daemon` switch hid nothing — AC14.
+    /// cell), and the server's daemon switch hid nothing — AC14.
     #[test]
     fn hidden_wins_over_every_display_rule() {
         let css = include_str!("front/styles.css").replace("\r\n", "\n");

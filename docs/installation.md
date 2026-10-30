@@ -24,8 +24,8 @@ flowchart TB
     OS1 -->|macOS| MGUI{"GUI or terminal?"}
     MGUI -->|"GUI (FR-129 B1, B2)"| MWIZ["roomler-setup wizard<br/>per-user daemon + the root half<br/>(the overlay box) → install.sh halves,<br/>one osascript admin prompt"]
     MGUI -->|terminal| PKG["install.sh --role daemon (.pkg, arm64)"]
-    LWIZ -.->|"only when the server says<br/>wizard_unix_daemon: true"| LGUI
-    MWIZ -.->|"same switch"| MGUI
+    LWIZ -.->|"only when the server says<br/>wizard_linux_daemon: true"| LGUI
+    MWIZ -.->|"only on<br/>wizard_macos_daemon: true"| MGUI
 
     TC --> OS2{"OS?"}
     OS2 -->|Windows| TCW["wizard (tunnel-client role)<br/>or the zip"]
@@ -617,11 +617,27 @@ sequenceDiagram
 
 - **The cards appear only when the chosen server says so**: the wizard reads
   `GET /api/setup/features` and shows the Linux cards on a JSON
-  `wizard_unix_daemon: true` and on nothing else — a 404 (an older server), a
-  503, a timeout, a string `"true"` all mean the tunnel-client card alone
-  (`ROOMLER__SETUP__WIZARD_UNIX_DAEMON`, default off; B1-s). The server is picked
-  after the role, so the Server page asks again when the URL changes and the
-  pipeline once more before it installs.
+  `wizard_linux_daemon: true`, or on `wizard_unix_daemon: true`, which a server
+  from before the per-OS split (B1-s2) sends for both OSes, and on nothing
+  else — a 404 (an older server), a 503, a timeout, a string `"true"` all mean
+  the tunnel-client card alone (`ROOMLER__SETUP__WIZARD_LINUX_DAEMON`, default
+  off; the legacy `ROOMLER__SETUP__WIZARD_UNIX_DAEMON` turns Linux and macOS
+  on together). One helper decides it for the Welcome cards, the Server page
+  and the pipeline (`SetupFeatures::daemon_offered`,
+  `agents/roomler-setup/src/features.rs:73-79`). The server is picked after the role, so the
+  Server page asks again when the URL changes and the pipeline once more before
+  it installs.
+- **Turning the Linux cards on** (the operator). The homepages' Linux button
+  downloads the **latest** `setup-v*`, and a wizard released before the split
+  reads only `wizard_unix_daemon`, which the server answers as Linux AND macOS,
+  so a Linux-only server shows it no daemon card. The switch therefore waits
+  for the first `setup-v*` that carries B1-s2 and its Linux field run. Then set
+  `ROOMLER__SETUP__WIZARD_LINUX_DAEMON: "true"` in the deploy repo's
+  `roomler2-config` ConfigMap and bump the deployment's `roomler.ai/config-rev`
+  annotation in the same change: the pods read the ConfigMap through `envFrom`,
+  which does not roll them, and the annotation does. `GET /api/setup/features`
+  then answers `wizard_linux_daemon: true` with `wizard_macos_daemon` and
+  `wizard_unix_daemon` still `false`.
 - **One prompt, through the desktop's own agent.** `pkexec` is launched from
   the wizard's process, which GNOME and Plasma put in the user manager; polkit
   resolves it to the seat session and GNOME Shell or `polkit-kde-agent` shows
@@ -812,8 +828,9 @@ finished, so the root shell writes its output to files the wizard tails as
 they grow, and its exit status to a third. A cancel closes the dialog while it
 is up; once the password is accepted, killing `osascript` would no longer stop
 the root shell — `installer -pkg` would run on — so the wizard waits it out
-and says so instead. The card appears only when the server's `wizard_unix_daemon`
-switch is on, like the Linux cards.
+and says so instead. The card appears only when the server's `wizard_macos_daemon`
+switch is on (`ROOMLER__SETUP__WIZARD_MACOS_DAEMON`, or the legacy
+`wizard_unix_daemon` for both OSes), independently of the Linux cards' switch.
 
 **The root half from the wizard (FR-129 B2).** With "Join the overlay network"
 ticked, which is the macOS default, the wizard adds the root half beside the
@@ -979,13 +996,13 @@ Device configuration card carries a banner naming both files
 `config set` print the "a second roomler daemon is running" note that `status`
 and `peers` already printed — a note that had gone silent for the console user,
 because the root socket's `0700` directory refuses their `stat`; the root half's
-person socket is the evidence now (`crates/localapi/src/lib.rs:4548`).
+person socket is the evidence now (`crates/localapi/src/lib.rs:4571`).
 
 The root half's switches are **root's to set by design**, not by omission: its
 LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person socket it
 serves the console user admits the safety surface only — status, sessions,
 consent, the Devices view — never a config verb (`localapi::person_may`,
-`crates/localapi/src/lib.rs:3057`). Whether the console user should flip the
+`crates/localapi/src/lib.rs:3080`). Whether the console user should flip the
 root half's gates from the app is the decision left open on #2871; until it is
 taken, the gate stays with `sudo`.
 

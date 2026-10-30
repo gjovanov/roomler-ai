@@ -124,8 +124,9 @@ describe('the static homepage', () => {
   })
 
   // FR-129 B1-s — the page is written at build time, when the server's
-  // `wizard_unix_daemon` cannot be known, so it ships the FR-97 D5 layout and
-  // carries the Linux and macOS buttons hidden for home.js (below).
+  // switches cannot be known, so it ships the FR-97 D5 layout and carries the
+  // Linux and macOS buttons hidden for home.js (below), each naming its OS
+  // (B1-s2: each OS has its own switch).
   it('ships the Linux and macOS wizard buttons hidden, in the Windows card’s markup, for home.js to show', () => {
     const html = render()
     // Windows: the button as always, nothing gated, nothing to swap.
@@ -135,7 +136,7 @@ describe('the static homepage', () => {
     // Linux and macOS: the same button, hidden, with the URL the switch
     // unlocks; the label carries its wording-with-a-wizard for home.js.
     for (const os of ['linux', 'macos']) {
-      expect(html).toContain(`<p data-wizard-unix hidden><a class="btn btn--tonal" href="${SITE_ORIGIN}/api/setup/${os}">`)
+      expect(html).toContain(`<p data-wizard-unix="${os}" hidden><a class="btn btn--tonal" href="${SITE_ORIGIN}/api/setup/${os}">`)
     }
     expect(html.match(/data-wizard-unix/g)).toHaveLength(2)
     expect(html.match(/<p class="home-muted" data-terminal-label data-with-wizard="Or from a terminal:">From a terminal:<\/p>/g)).toHaveLength(2)
@@ -449,7 +450,17 @@ describe('home.js — live prices', () => {
 // but a JSON `true`.
 describe('home.js — the install switches (FR-129 B1-s)', () => {
   const base = { '/api/capabilities': SAAS, '/api/stripe/plans': PLANS_404 }
-  const FEATURES_ON = { ok: true, body: { pairing: true, wizard_unix_daemon: true, wizard_pairing: true } }
+  const ALL_ON = {
+    pairing: true,
+    wizard_linux_daemon: true,
+    wizard_macos_daemon: true,
+    wizard_unix_daemon: true,
+    wizard_pairing: true,
+  }
+  const FEATURES_ON = { ok: true, body: ALL_ON }
+  /** A split server with Linux on alone (FR-129 B1-s2): `wizard_unix_daemon`,
+   *  the key wizards released before the split read for both OSes, stays off. */
+  const LINUX_ONLY = { ...ALL_ON, wizard_macos_daemon: false, wizard_unix_daemon: false, wizard_pairing: false }
   const button = (doc: Document, os: string) => doc.querySelector(`[data-os="${os}"] [data-wizard-unix]`) as HTMLElement
   const label = (doc: Document, os: string) => doc.querySelector(`[data-os="${os}"] .home-muted`)!.textContent
   const lead = (doc: Document) => doc.querySelector('[data-download-lead]')!.textContent
@@ -476,15 +487,17 @@ describe('home.js — the install switches (FR-129 B1-s)', () => {
   })
 
   it('reads each switch on its own, and the lead needs both pairing switches', async () => {
+    const DAEMONS_OFF = { wizard_linux_daemon: false, wizard_macos_daemon: false, wizard_unix_daemon: false }
     // The buttons off, the lead on.
-    const a = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: { pairing: true, wizard_unix_daemon: false, wizard_pairing: true } } })
+    const a = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: { ...ALL_ON, ...DAEMONS_OFF } } })
     await settle()
     expect(button(a.doc, 'linux').hidden).toBe(true)
+    expect(button(a.doc, 'macos').hidden).toBe(true)
     expect(label(a.doc, 'linux')).toBe('From a terminal:')
     expect(lead(a.doc)).toBe(DOWNLOAD.leadPairing)
 
     // The buttons on; the released wizard pairs but this server does not.
-    const b = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: { pairing: false, wizard_unix_daemon: true, wizard_pairing: true } } })
+    const b = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: { ...ALL_ON, pairing: false } } })
     await settle()
     expect(button(b.doc, 'macos').hidden).toBe(false)
     expect(label(b.doc, 'macos')).toBe('Or from a terminal:')
@@ -492,19 +505,69 @@ describe('home.js — the install switches (FR-129 B1-s)', () => {
 
     // The buttons on; this server pairs but the released wizard does not —
     // the shipped default of `pairing`, and the lead must keep the token.
-    const c = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: { pairing: true, wizard_unix_daemon: true, wizard_pairing: false } } })
+    const c = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: { ...ALL_ON, wizard_pairing: false } } })
     await settle()
     expect(button(c.doc, 'linux').hidden).toBe(false)
     expect(lead(c.doc)).toBe(DOWNLOAD.lead)
+  })
+
+  // FR-129 B1-s2 — Linux goes live without macOS.
+  it('shows each OS’s button on that OS’s own switch: Linux on alone leaves the Mac’s hidden', async () => {
+    const { doc } = runHomeJs({ ...base, '/api/setup/features': { ok: true, body: LINUX_ONLY } })
+    await settle()
+    expect(button(doc, 'linux').hidden).toBe(false)
+    expect(label(doc, 'linux')).toBe('Or from a terminal:')
+    expect(button(doc, 'macos').hidden).toBe(true)
+    expect(label(doc, 'macos')).toBe('From a terminal:')
+
+    const mac = runHomeJs({
+      ...base,
+      '/api/setup/features': { ok: true, body: { ...LINUX_ONLY, wizard_linux_daemon: false, wizard_macos_daemon: true } },
+    })
+    await settle()
+    expect(button(mac.doc, 'linux').hidden).toBe(true)
+    expect(label(mac.doc, 'linux')).toBe('From a terminal:')
+    expect(button(mac.doc, 'macos').hidden).toBe(false)
+    expect(label(mac.doc, 'macos')).toBe('Or from a terminal:')
+  })
+
+  it('shows both buttons on an older server’s answer, which has wizard_unix_daemon alone', async () => {
+    const { doc } = runHomeJs({
+      ...base,
+      '/api/setup/features': { ok: true, body: { pairing: true, wizard_unix_daemon: true, wizard_pairing: false } },
+    })
+    await settle()
+    for (const os of ['linux', 'macos']) {
+      expect(button(doc, os).hidden, os).toBe(false)
+      expect(label(doc, os), os).toBe('Or from a terminal:')
+    }
   })
 
   it.each([
     ['an older server (404)', { ok: false, status: 404 }],
     ['a server without the fleet module (503)', { ok: false, status: 503 }],
     ['unreachable', new Error('offline')],
-    ['saying every switch is off', { ok: true, body: { pairing: false, wizard_unix_daemon: false, wizard_pairing: false } }],
-    ['saying the server pairs but the released wizard does neither (the shipped default)', { ok: true, body: { pairing: true, wizard_unix_daemon: false, wizard_pairing: false } }],
-    ['sending strings, not booleans', { ok: true, body: { pairing: 'true', wizard_unix_daemon: 'true', wizard_pairing: 'true' } }],
+    [
+      'saying every switch is off',
+      {
+        ok: true,
+        body: { pairing: false, wizard_linux_daemon: false, wizard_macos_daemon: false, wizard_unix_daemon: false, wizard_pairing: false },
+      },
+    ],
+    [
+      'saying the server pairs but the released wizard does neither (the shipped default)',
+      {
+        ok: true,
+        body: { pairing: true, wizard_linux_daemon: false, wizard_macos_daemon: false, wizard_unix_daemon: false, wizard_pairing: false },
+      },
+    ],
+    [
+      'sending strings, not booleans',
+      {
+        ok: true,
+        body: { pairing: 'true', wizard_linux_daemon: 'true', wizard_macos_daemon: 'true', wizard_unix_daemon: 'true', wizard_pairing: 'true' },
+      },
+    ],
     ['sending no object', { ok: true, body: null }],
     ['sending an array', { ok: true, body: [true, true] }],
   ] as Array<[string, Answer]>)('fails CLOSED — the page exactly as built — with the endpoint %s', async (_, answer) => {

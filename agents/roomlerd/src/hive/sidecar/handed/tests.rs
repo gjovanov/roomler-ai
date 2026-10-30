@@ -25,10 +25,45 @@ fn prepare_answers_none_where_the_run_has_no_worker() {
         .block_on(TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)))
         .expect("a listener binds");
     let session = ObjectId::new();
-    let prepared = prepare(session, 1, &listener, Weak::new(), "https://x".into(), None)
-        .expect("prepare does not fail just because there is no worker");
+    let prepared = prepare(
+        session,
+        1,
+        &listener,
+        Weak::new(),
+        "https://x".into(),
+        None,
+        false,
+    )
+    .expect("prepare does not fail just because there is no worker");
     assert!(prepared.is_none());
     assert!(!is_kept(session, 1));
+}
+
+/// FR-90 P8-2c-4 — a fresh launch's own case: the device runs workers, and
+/// this run's has not started yet, as it never has when its sidecar is
+/// opened. Kept for it all the same: asked whether a worker exists yet
+/// (`worker::has`), this answered no at every launch, and nothing was
+/// ever handed.
+#[tokio::test]
+async fn prepare_keeps_it_for_a_worker_not_started_yet() {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("a listener binds");
+    let session = ObjectId::new();
+    assert!(!crate::hive::worker::has(session, 1), "no worker yet");
+    let prepared = prepare(
+        session,
+        1,
+        &listener,
+        Weak::new(),
+        "https://x".into(),
+        None,
+        true,
+    )
+    .expect("kept");
+    assert!(prepared.is_some(), "handed, not served by the daemon");
+    assert!(is_kept(session, 1), "kept for the worker to come");
+    forget(session, 1);
 }
 
 #[tokio::test]
@@ -56,8 +91,10 @@ async fn a_hand_over_answered_twice_serves_it_once() {
     // `close_handed` on the same endpoint cancels the real stop this
     // "first answer" claimed — proving `serve_handed`'s own
     // double-claim guard is reachable, without needing a real listener
-    // to exercise the rest of it (covered by the real-worker Windows
-    // harness and the Unix end-to-end one in `sidecar::tests`).
+    // to exercise the rest of it (P8-2c-4: covered end to end by
+    // `sidecar::tests`' fresh launch on Unix and by `worker::win::tests`'
+    // kept-before-its-worker pair on Windows, which before it nothing
+    // covered).
     let answer = close_handed(&serving, endpoint);
     assert!(matches!(answer, Answer::Done));
     assert!(!serving.endpoints.lock().unwrap().contains_key(&endpoint));

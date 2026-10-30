@@ -3343,6 +3343,29 @@ mod tests {
         }
     }
 
+    /// FR-55 AC6 — the macOS clamshell limit is said where the policy is set.
+    /// This description is what the companion's settings row shows
+    /// (`settings.js` renders `entry.description`) and what
+    /// `roomler config set power_policy` prints its ⚠️ sentence from on a Mac
+    /// (`config_set_note`). A rewrite that drops the warning fails here, not
+    /// on a Mac whose lid-closed sleep seems to ignore the setting.
+    #[test]
+    fn the_power_policy_says_a_closed_lid_still_sleeps_a_mac() {
+        let m = KEYS
+            .iter()
+            .find(|m| m.key == "power_policy")
+            .expect("power_policy is listed");
+        let d = m.description;
+        let warning = &d[d.find("⚠️").expect("a ⚠️ sentence")..];
+        assert!(warning.starts_with("⚠️ macOS clamshell sleep"), "{d}");
+        assert!(
+            warning.contains("lid closed") && warning.contains("ignores it"),
+            "{d}"
+        );
+        // `config_set_note` cuts the sentence at its ". ".
+        assert!(warning.contains(". "), "{d}");
+    }
+
     /// FR-84 D2 — `restart_required` is the truth PER KEY, not a blanket.
     /// The keys the daemon applies without a restart are the two gate-4
     /// flags `RemoteConfigServices::adopt_local` re-seeds after a

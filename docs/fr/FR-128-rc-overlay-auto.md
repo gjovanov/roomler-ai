@@ -1,6 +1,6 @@
 # FR-128: Remote desktop over the mesh, automatically — the overlay path only while the mesh link is direct, or when it is the only path
 
-**Issue:** [#2989](https://github.com/gjovanov/roomler-ai/issues/2989) · **Status:** proposed 2026-10-27, on the operator's choice of an "auto" mode after a same-network session relayed. **§2.1's premise was corrected 2026-10-28**: those sessions measured a worker that #2987 had orphaned, not `rc_overlay=off`. **D6 and D7 decided 2026-10-28**: §2.2 was re-measured (Chrome on a Mac still relays; the cause is found). P1 and P2 merged 2026-10-29 (#3079, #3088) and are live: agents from 0.4.185, server images from `hosted-20261029-2ae4ffd`. **Field verification (P4) began 2026-10-30**: AC1's Windows → Mac half holds 10 of 10; AC4, AC5 and AC6 are met; and the far-TURN hint has two blind spots (D8), which P2c closes · **Related:** #1882 (the switch), FR-64 ([#1244](https://github.com/gjovanov/roomler-ai/issues/1244)), FR-121 ([#2862](https://github.com/gjovanov/roomler-ai/issues/2862)), [#2781](https://github.com/gjovanov/roomler-ai/issues/2781), [#2774](https://github.com/gjovanov/roomler-ai/issues/2774)
+**Issue:** [#2989](https://github.com/gjovanov/roomler-ai/issues/2989) · **Status:** proposed 2026-10-27, on the operator's choice of an "auto" mode after a same-network session relayed. **§2.1's premise was corrected 2026-10-28**: those sessions measured a worker that #2987 had orphaned, not `rc_overlay=off`. **D6 and D7 decided 2026-10-28**: §2.2 was re-measured (Chrome on a Mac still relays; the cause is found). P1 and P2 merged 2026-10-29 (#3079, #3088) and are live: agents from 0.4.185, server images from `hosted-20261029-2ae4ffd`. **Field verification (P4) began 2026-10-30**: AC1 holds in both directions, 10 of 10 each way; AC2 holds since P2b went live; AC4, AC5 and AC6 are met; and the far-TURN hint had two blind spots (D8), which P2c closes (AC7 met). Only AC3 is owed · **Related:** #1882 (the switch), FR-64 ([#1244](https://github.com/gjovanov/roomler-ai/issues/1244)), FR-121 ([#2862](https://github.com/gjovanov/roomler-ai/issues/2862)), [#2781](https://github.com/gjovanov/roomler-ai/issues/2781), [#2774](https://github.com/gjovanov/roomler-ai/issues/2774)
 
 ## 1. Goal
 
@@ -94,8 +94,8 @@ flowchart TD
 
 - **The carriers.** One LocalAPI `peers` call, the one the relay-tier guard makes, bounded at 400 ms the same way, read for each of the viewer's devices by its overlay address (`mesh_carriers_of`, `agents/roomlerd/src/rc_overlay.rs:310`). `Direct` reads direct. `Relay` and `Tunnel` read relayed. `Blocked`, `Offline` and no answer read unknown (`MeshCarrier`, `:257`). The best carrier among the viewer's devices decides. When the session rides the mesh, every device on a worse link stays out of its ICE (`exclude`, `:57`).
 - **The viewer's devices** (D3, option B): the **server names them** in `rc:request` (`RcOverlayAutoWire.viewers`, `crates/remote_control/src/signaling.rs:5522`). Each is the `overlay_ip` of a loopback-relay descriptor the Hub hands the browser (FR-121, `resolve_local_relay`, `crates/modules/fleet/src/hub.rs:3461`), which the Hub has already checked lies in the overlay range. Since FR-121 P3b there is one per agent on the viewer's computer, at most four. Windows and WSL each run a relay, and their mesh links can differ completely: on neo16 the Windows agent is direct to every peer while the WSL one rides DERP.
-- **Far TURN availability** (D5, alternative): also from the server, `RcOverlayAutoWire.far_turn`. It is true only when **both** devices' last netcheck reached the far TURN over UDP: `stun_udp` (`crates/remote_control/src/signaling.rs:5288`). Until P2b it also required `relay_band_udp` (`:5292`) not to be `Some(false)`. The lab showed that misreads a working far TURN as dead (§8, 2026-10-30), because a relay↔relay pair needs only coturn's listening port. The netcheck itself says so: its STUN target is coturn's own UDP address (`stun_urls_from_turn`, `crates/modules/network/src/overlay.rs:2859`), and it probes the band only through a UDP-only allocation on coturn that has already succeeded (`crates/tunnel-core/src/overlay/runtime.rs:4095`, `crates/tunnel-core/src/overlay/netcheck.rs:207`). So `stun_udp=true` with the band `Some(false)` is a node that did allocate on the far TURN over UDP. Since P2c (D8) the browser's end is the best of all its devices, and the target folds its own netcheck in at its offer, which is how a Mac's GUI worker is measured at all. `None` means not measured, and is read as "it works", so a relayed mesh stays off. #2781's viewer sits behind exactly such an egress drop, which the agent's own gathering could never see.
-- **Where it runs.** `RcOverlay::decide` (`rc_overlay.rs:112`), called by the `rc:sdp.offer` handler (`agents/roomlerd/src/signaling.rs:4078`). That handler also runs in a delegated macOS GUI worker. The inputs cross to that worker inside `RcOverlay`, which already carries the decision there, so whichever process builds the peer decides. The server sends the offer only after the request is answered, so the decision never races the consent.
+- **Far TURN availability** (D5, alternative): also from the server, `RcOverlayAutoWire.far_turn`. It is true only when **both** devices' last netcheck reached the far TURN over UDP: `stun_udp` (`crates/remote_control/src/signaling.rs:5317`). Until P2b it also required `relay_band_udp` (`:5321`) not to be `Some(false)`. The lab showed that misreads a working far TURN as dead (§8, 2026-10-30), because a relay↔relay pair needs only coturn's listening port. The netcheck itself says so: its STUN target is coturn's own UDP address (`stun_urls_from_turn`, `crates/modules/network/src/overlay.rs:2859`), and it probes the band only through a UDP-only allocation on coturn that has already succeeded (`crates/tunnel-core/src/overlay/runtime.rs:4095`, `crates/tunnel-core/src/overlay/netcheck.rs:207`). So `stun_udp=true` with the band `Some(false)` is a node that did allocate on the far TURN over UDP. Since P2c (D8) the browser's end is the best of all its devices, and the target folds its own netcheck in at its offer, which is how a Mac's GUI worker is measured at all. `None` means not measured, and is read as "it works", so a relayed mesh stays off. #2781's viewer sits behind exactly such an egress drop, which the agent's own gathering could never see.
+- **Where it runs.** `RcOverlay::decide` (`rc_overlay.rs:112`), called by the `rc:sdp.offer` handler (`agents/roomlerd/src/signaling.rs:4120`). That handler also runs in a delegated macOS GUI worker. The inputs cross to that worker inside `RcOverlay`, which already carries the decision there, so whichever process builds the peer decides. The server sends the offer only after the request is answered, so the decision never races the consent.
 
 ⚠️ **Why not the proposed defaults (decide while gathering, holding the overlay candidates).** Holding a candidate means gathering it, and webrtc-rs pairs every candidate it gathered, trickled or not. On a weak-host OS (Linux, macOS), checks from the overlay-bound host candidate to a browser's LAN address can come back over the mesh as a peer-reflexive pair. That would put the session on a relayed mesh exactly when `auto` had decided against it. Deciding before gathering keeps the proven `off` filters intact. It also needs no candidate buffering in `peer.rs` at all.
 
@@ -122,20 +122,20 @@ The guard keeps clamping a carrier that degrades during a session. Moving such a
 | P0 | **Measure before building**: same network, Mac ↔ Windows both directions, `off` vs `on` vs a mesh forced onto DERP, plus #2781's topology. Carrier, fps and Mbit/s per cell | — | **in progress.** Windows browser → Mac measured on 2026-10-28: direct with a working agent (§2.1). Mac browser → Windows re-measured the same day (D6): Safari direct, Chrome relayed, cause found (§2.2). Still owed: a mesh forced onto DERP, and #2781's topology |
 | P1 | Agent: the `auto` decision (§3.1, §3.2 as built), its log line naming the inputs and the outcome, the wire field `rc_overlay_auto`, and the `rc-overlay-auto` verb (§3.3) | `ROOMLERD_RC_OVERLAY_AUTO=0`: `auto` behaves as `off`, and the verb is not advertised | **merged** 2026-10-29 (#3079, `de8403167`), released in agent 0.4.185 |
 | P2 | Server + UI: the tri-state on the device policy (Off / Auto / On). The Hub hands out the viewer's loopback relay under `auto` as under `on`. Wire compatibility per D1 | P1's switch, plus the policy itself | **merged** 2026-10-29 (#3088, `15a7cabe6`), on prod since `hosted-20261029-2ae4ffd` (10:26Z). Stored, carried and shown as §3.3 says; the far-TURN hint comes through a core hook that `network` answers. ⚠️ The hint cannot measure a Mac's GUI worker, and it reads only the browser's first device (D8) |
-| P2b | Server: the far-TURN hint reads `stun_udp` alone (`reaches_far_turn`, `crates/modules/network/src/hooks.rs:145`). The relay band stays the overlay dialer's bit (§8, 2026-10-30) | P1's switch, plus the policy itself | **merged** 2026-10-30 (#3134, `729ed7222`), D5 confirmed by the operator. Live with the next promote |
-| P2c | D8's two blind spots. **Server:** the gate names every device the browser runs on, in the Hub's own order (`viewer_devices_of`, `crates/modules/remote/src/controller.rs:666`), and the browser's end is its best device (`browser_reach`, `crates/modules/network/src/hooks.rs:154`). **Agent:** the target folds its own netcheck into the hint at its offer (`own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:351`), and a Mac's per-user half lends its root daemon's netcheck (`with_machine_network`, `agents/roomlerd/src/person_socket.rs:223`) | P1's switch, plus the policy itself | **in review** (2026-10-30). The server half rides a promote, the agent half the next agent release |
+| P2b | Server: the far-TURN hint reads `stun_udp` alone (`reaches_far_turn`, `crates/modules/network/src/hooks.rs:145`). The relay band stays the overlay dialer's bit (§8, 2026-10-30) | P1's switch, plus the policy itself | **merged** 2026-10-30 (#3134, `729ed7222`), D5 confirmed by the operator. Live since `hosted-20261030-ff00741` (19:43Z) |
+| P2c | D8's two blind spots. **Server:** the gate names every device the browser runs on, in the Hub's own order (`viewer_devices_of`, `crates/modules/remote/src/controller.rs:666`), and the browser's end is its best device (`browser_reach`, `crates/modules/network/src/hooks.rs:154`). **Agent:** the target folds its own netcheck into the hint at its offer (`own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:351`), and a Mac's per-user half lends its root daemon's netcheck (`with_machine_network`, `agents/roomlerd/src/person_socket.rs:223`) | P1's switch, plus the policy itself | **merged** 2026-10-30 (#3159, `ff0074175`). The server half is live since `hosted-20261030-ff00741` (19:43Z), the agent half since agent 0.4.189. AC7 met (§8) |
 | P3 | (D4) Move a session off an overlay that degrades to a relay mid-session, when a far TURN path exists | its own env switch | — |
-| P4 | Docs + field verification (AC1–AC6) | — | **in progress** since 2026-10-30. AC1's Windows → Mac half: 10 of 10 direct and unconstrained (§8). AC4, AC5 and AC6 met. Owed: AC1's Mac → Windows half, AC2, AC3 |
+| P4 | Docs + field verification (AC1–AC7) | — | **in progress** since 2026-10-30. AC1 met in both directions: 10 of 10 direct and unconstrained each way (§8). AC2 met in the lab on prod after P2b went live, including the relay band measured blocked (§8). AC4, AC5, AC6 and AC7 met. Owed: AC3 |
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1 (P1+P2):** same network, mesh direct, `auto`, in both directions (a Windows browser → a Mac agent, a Mac browser → a Windows agent): `session carrier recorded` shows a direct pair (the overlay, or the LAN host pair that ICE preferred over it in §2.1's control), and the session runs `constrained=false`, in at least 9 sessions of 10. The Windows → Mac half already holds under `off` with a working agent (10 of 10 since 2026-10-27 10:00Z, §2.1), so for that half AC1 is a non-regression check.
-- [ ] **AC2:** the mesh forced onto DERP, far TURN reachable, `auto`: the session's carrier is `turn` and never the overlay. The log names why.
+- [x] **AC1 (P1+P2):** same network, mesh direct, `auto`, in both directions (a Windows browser → a Mac agent, a Mac browser → a Windows agent): `session carrier recorded` shows a direct pair (the overlay, or the LAN host pair that ICE preferred over it in §2.1's control), and the session runs `constrained=false`, in at least 9 sessions of 10. The Windows → Mac half already holds under `off` with a working agent (10 of 10 since 2026-10-27 10:00Z, §2.1), so for that half AC1 is a non-regression check.
+- [x] **AC2:** the mesh forced onto DERP, far TURN reachable, `auto`: the session's carrier is `turn` and never the overlay. The log names why.
 - [ ] **AC3:** #2781's topology (UDP blocked, TLS inspected), `auto`: the session connects over the overlay, clamped. With `off` it fails: record that RED first.
 - [x] **AC4:** compatibility: an older agent given `auto` behaves per D1, and an older server never sends `auto`.
 - [x] **AC5:** `ROOMLERD_RC_OVERLAY_AUTO=0` makes `auto` behave as `off`, verified on one device.
 - [x] **AC6 (docs):** `docs/remote-control.md` §4.4 documents `auto`: the decision table, a mermaid diagram of it, `file:line` anchors, linked from `docs/README.md`.
-- [ ] **AC7 (P2c, D8):** a session to a Mac under `auto` logs the Mac's own reach (`own_far_turn=Some(..)` on its decision line), and a browser whose first device has no UDP out (NEO16 with its WSL agent first) still reads the far TURN as usable when another of its devices reaches it.
+- [x] **AC7 (P2c, D8):** a session to a Mac under `auto` logs the Mac's own reach (`own_far_turn=Some(..)` on its decision line), and a browser whose first device has no UDP out (NEO16 with its WSL agent first) still reads the far TURN as usable when another of its devices reaches it.
 
 ## 6. Open decisions (defaults in bold)
 
@@ -244,3 +244,54 @@ One throwaway Ubuntu 24.04 VM in the lab org, 01:32–01:39Z, in three phases. E
 **The reach.** Five of the 21 live nodes with a fresh netcheck read `stun_udp=true, relay_band_udp=false`. One is CORPLAP-3, a corp laptop.
 
 **The fix.** P2b: the hint reads `stun_udp` alone. Posted on [#2989](https://github.com/gjovanov/roomler-ai/issues/2989#issuecomment-6513246164). AC2 waits on P2b being promoted and a re-run.
+
+### 2026-10-30 — AC1, Mac browser → Windows agent: 10 of 10 direct
+
+**Setup:**
+- **The viewer:** Chrome 156 on MacBook-1 (macOS), driven through the Claude extension.
+- **The target:** NEO16 on 0.4.188, with `rc_overlay=auto` and consent `auto`.
+- **The mesh:** NEO16 ↔ MacBook-1-Daemon direct, about 7 ms, on one network.
+- **Each session:** Connect, about 9 s with the picture on the canvas (2560×1600), Disconnect.
+
+**The decision.** All 10 sessions logged the same line on NEO16: `the session may ride the mesh`, with one viewer device (the Mac's daemon, which the browser's loopback probe found), `carriers=[Direct]`, `far_turn=Some(true)`, `allow=true`, and nothing in `exclude`.
+
+**The outcome.** On NEO16's `session carrier recorded`, cross-checked against the server's `remote_sessions.carrier`:
+
+| sessions | carrier | the pair |
+|---|---|---|
+| 3 | `overlay_direct` | Host↔Host, both on the overlay |
+| 7 | `direct` | Srflx↔Host, the Mac's LAN address |
+
+Every heartbeat read `constrained=false` at a 144 fps target (HEVC on NVENC). Each session connected in 143–386 ms and ended `controller_hangup`. With the Windows → Mac half (10 of 10, above), **AC1 is met.** Posted on [#2989](https://github.com/gjovanov/roomler-ai/issues/2989#issuecomment-6528390985).
+
+**Not explained.** On 2026-10-28, under `off`, Chrome on this Mac relayed 3 of 3 (§2.2: macOS denied Chrome's network helper the LAN). Today 7 of 10 sessions took a direct pair to the Mac's LAN address, the path that denial blocked. What changed on the Mac is not established.
+
+### 2026-10-30 evening — AC2 after P2b went live: met, including the relay band measured blocked
+
+**Setup:** the lab of the AC2 entry above (the viewer's device in a container on one lab host, the target a VM on another, the mesh between them relayed over DERP), against prod on `hosted-20261030-ff00741`. One change to the kit: the phases now wait until both agents hold a netcheck vector. A phase run before that reads the hint as `None`, which the agent takes as "it works", so it proves nothing about the hint.
+
+| run | the hint's inputs | phase | the decision | the session's carrier |
+|---|---|---|---|---|
+| 3 | neither node had reported a netcheck yet | `auto` | stays off the mesh, `far_turn=None` | `direct` |
+| 3 | | `auto`, the target's UDP to the viewer's host dropped | stays off the mesh, `far_turn=None` | `turn` |
+| 4 | both nodes: `stun_udp=true`, band open | `auto` | stays off the mesh, `far_turn=Some(true)` | `direct` (Srflx↔Srflx) |
+| 4 | | `auto`, the drop | stays off the mesh, `far_turn=Some(true)` | **`turn`** (Host↔Relay) |
+| 4 | | `on`, the drop (the RED) | overlay allowed | **`derp`**: the overlay over DERP |
+| 5 | the target: `stun_udp=true`, **`relay_band_udp=false`** | `auto` | stays off the mesh, **`far_turn=Some(true)`** | `direct` (Srflx↔Srflx) |
+| 5 | | `auto`, the drop | stays off the mesh, **`far_turn=Some(true)`** | `direct` (Host↔Prflx) |
+| 5 | | `on`, the drop (the RED) | overlay allowed | **`derp`** |
+
+**Run 5 is run 2's failing condition, rebuilt on purpose.** Before its first netcheck the target dropped its UDP to coturn's addresses on every port but 3478. STUN and the TURN allocation still worked; a raw send into the relay band did not. Its vector then read `stun_udp=true, relay_band_udp=false`, the reading that made the old hint say "far TURN dead" and put run 2's session on DERP. With P2b the hint read `Some(true)`, and the session stayed off the mesh.
+
+**AC2 is met:** with the mesh on DERP and `auto`, the session never took the overlay, and the log names why (`carriers=[Relayed]`, `far_turn=Some(true)`). Where UDP to the viewer's host was dropped, it rode the far TURN (run 4). Under `on` the same session rode the overlay over DERP, which is what `auto` refuses. Posted on [#2989](https://github.com/gjovanov/roomler-ai/issues/2989#issuecomment-6532511332).
+
+### 2026-10-30 21:00Z — AC7 (P2c, D8): both halves in one session
+
+**Setup:** Chrome 156 on NEO16 → MacBook-1 (the Mac's GUI-worker row) under `auto`, after agent 0.4.189 reached all three machines. The browser's device list ("This browser runs on") was set to **NEO16-WSL first**, then NEO16, and restored straight after. On the server: NEO16-WSL's netcheck read `stun_udp=false`, NEO16's `stun_udp=true`, and the GUI-worker row has no overlay node.
+
+**The Mac worker's decision line:** `the session may ride the mesh`, with `viewers=[NEO16-WSL, NEO16]`, `carriers=[Relayed, Direct]`, `far_turn=None`, `own_far_turn=Some(true)`, `allow=true` and NEO16-WSL in `exclude`. The session rode `overlay_direct` (Host↔Host) and ended `controller_hangup`.
+
+- **The browser half.** Before P2c the gate read only the first device, NEO16-WSL, so the hint would have read `Some(false)`, "far TURN dead", for every target. The browser's best device now counts, and with the Mac's row unmeasured the hint is `None`.
+- **The Mac half.** `own_far_turn=Some(true)` is the Mac's own netcheck, read at the offer from its daemon, which the per-user half now lends. The server's hint can never measure this row.
+
+**AC7 is met.** An attempt at 20:57Z landed while 0.4.189 was restarting NEO16 and NEO16-WSL: the Hub held neither relay yet (`viewers=[]`), and `decide` made no lookups. Posted on [#2989](https://github.com/gjovanov/roomler-ai/issues/2989#issuecomment-6533385211).
