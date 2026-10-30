@@ -1,6 +1,6 @@
 # FR-128: Remote desktop over the mesh, automatically — the overlay path only while the mesh link is direct, or when it is the only path
 
-**Issue:** [#2989](https://github.com/gjovanov/roomler-ai/issues/2989) · **Status:** proposed 2026-10-27, on the operator's choice of an "auto" mode after a same-network session relayed. **§2.1's premise was corrected 2026-10-28**: those sessions measured a worker that #2987 had orphaned, not `rc_overlay=off`. **D6 and D7 decided 2026-10-28**: §2.2 was re-measured (Chrome on a Mac still relays; the cause is found). P1 and P2 merged 2026-10-29 (#3079, #3088) and are live: agents from 0.4.185, server images from `hosted-20261029-2ae4ffd`. **Field verification (P4) began 2026-10-30**: AC1's Windows → Mac half holds 10 of 10, and the far-TURN hint has two blind spots (D8) · **Related:** #1882 (the switch), FR-64 ([#1244](https://github.com/gjovanov/roomler-ai/issues/1244)), FR-121 ([#2862](https://github.com/gjovanov/roomler-ai/issues/2862)), [#2781](https://github.com/gjovanov/roomler-ai/issues/2781), [#2774](https://github.com/gjovanov/roomler-ai/issues/2774)
+**Issue:** [#2989](https://github.com/gjovanov/roomler-ai/issues/2989) · **Status:** proposed 2026-10-27, on the operator's choice of an "auto" mode after a same-network session relayed. **§2.1's premise was corrected 2026-10-28**: those sessions measured a worker that #2987 had orphaned, not `rc_overlay=off`. **D6 and D7 decided 2026-10-28**: §2.2 was re-measured (Chrome on a Mac still relays; the cause is found). P1 and P2 merged 2026-10-29 (#3079, #3088) and are live: agents from 0.4.185, server images from `hosted-20261029-2ae4ffd`. **Field verification (P4) began 2026-10-30**: AC1's Windows → Mac half holds 10 of 10; AC4, AC5 and AC6 are met; and the far-TURN hint has two blind spots (D8) · **Related:** #1882 (the switch), FR-64 ([#1244](https://github.com/gjovanov/roomler-ai/issues/1244)), FR-121 ([#2862](https://github.com/gjovanov/roomler-ai/issues/2862)), [#2781](https://github.com/gjovanov/roomler-ai/issues/2781), [#2774](https://github.com/gjovanov/roomler-ai/issues/2774)
 
 ## 1. Goal
 
@@ -123,15 +123,15 @@ The guard keeps clamping a carrier that degrades during a session. Moving such a
 | P1 | Agent: the `auto` decision (§3.1, §3.2 as built), its log line naming the inputs and the outcome, the wire field `rc_overlay_auto`, and the `rc-overlay-auto` verb (§3.3) | `ROOMLERD_RC_OVERLAY_AUTO=0`: `auto` behaves as `off`, and the verb is not advertised | **merged** 2026-10-29 (#3079, `410977c14`), released in agent 0.4.185 |
 | P2 | Server + UI: the tri-state on the device policy (Off / Auto / On). The Hub hands out the viewer's loopback relay under `auto` as under `on`. Wire compatibility per D1 | P1's switch, plus the policy itself | **merged** 2026-10-29 (#3088, `5cc182c75`), on prod since `hosted-20261029-2ae4ffd` (10:26Z). Stored, carried and shown as §3.3 says; the far-TURN hint comes through a core hook that `network` answers. ⚠️ The hint cannot measure a Mac's GUI worker, and it reads only the browser's first device (D8) |
 | P3 | (D4) Move a session off an overlay that degrades to a relay mid-session, when a far TURN path exists | its own env switch | — |
-| P4 | Docs + field verification (AC1–AC6) | — | **in progress** since 2026-10-30. AC1's Windows → Mac half: 10 of 10 direct and unconstrained (§8). AC6 met. Owed: AC1's Mac → Windows half, AC2–AC5 |
+| P4 | Docs + field verification (AC1–AC6) | — | **in progress** since 2026-10-30. AC1's Windows → Mac half: 10 of 10 direct and unconstrained (§8). AC4, AC5 and AC6 met. Owed: AC1's Mac → Windows half, AC2, AC3 |
 
 ## 5. Acceptance criteria
 
 - [ ] **AC1 (P1+P2):** same network, mesh direct, `auto`, in both directions (a Windows browser → a Mac agent, a Mac browser → a Windows agent): `session carrier recorded` shows a direct pair (the overlay, or the LAN host pair that ICE preferred over it in §2.1's control), and the session runs `constrained=false`, in at least 9 sessions of 10. The Windows → Mac half already holds under `off` with a working agent (10 of 10 since 2026-10-27 10:00Z, §2.1), so for that half AC1 is a non-regression check.
 - [ ] **AC2:** the mesh forced onto DERP, far TURN reachable, `auto`: the session's carrier is `turn` and never the overlay. The log names why.
 - [ ] **AC3:** #2781's topology (UDP blocked, TLS inspected), `auto`: the session connects over the overlay, clamped. With `off` it fails: record that RED first.
-- [ ] **AC4:** compatibility: an older agent given `auto` behaves per D1, and an older server never sends `auto`.
-- [ ] **AC5:** `ROOMLERD_RC_OVERLAY_AUTO=0` makes `auto` behave as `off`, verified on one device.
+- [x] **AC4:** compatibility: an older agent given `auto` behaves per D1, and an older server never sends `auto`.
+- [x] **AC5:** `ROOMLERD_RC_OVERLAY_AUTO=0` makes `auto` behave as `off`, verified on one device.
 - [x] **AC6 (docs):** `docs/remote-control.md` §4.4 documents `auto`: the decision table, a mermaid diagram of it, `file:line` anchors, linked from `docs/README.md`.
 
 ## 6. Open decisions (defaults in bold)
@@ -201,3 +201,22 @@ Every one of those 13 decisions logged `far_turn=None`. A bounded read of `overl
 **Only the browser's first device counts.** The hint uses `viewer_device_of` (`crates/modules/remote/src/controller.rs:663`), and the browser sends `probed[0]` (`ui/src/composables/useRemoteControl.ts:4118`). On NEO16 the first device is whichever agent holds the first loopback port, 47989: NEO16 itself that night, NEO16-WSL on 10-23. NEO16-WSL measures the far TURN dead (`stun_udp=false`, relay band blocked), while Windows reaches it.
 
 **What it affects.** AC1 is untouched, because a direct carrier allows the mesh whatever the hint says. #2781's row with a Mac as the blocked end is affected: its hint reads `None`, and the session stays off the mesh. Posted on [#2989](https://github.com/gjovanov/roomler-ai/issues/2989#issuecomment-6512346739). The options are D8.
+
+### 2026-10-30 — AC4 and AC5 on a lab device
+
+One throwaway Ubuntu 24.04 VM in the lab org, 01:32–01:39Z, in three phases. Each phase was a fresh ephemeral enrollment, because a stopped ephemeral daemon unenrolls itself. Every phase did the same three things:
+- set the policy to **Mesh: auto** the way the Devices page writes it, and read it back as `rc_overlay=false, rc_overlay_auto=true`;
+- ran one remote-desktop session from the lab's Playwright viewer, which decoded frames;
+- read the session from the daemon's own log.
+
+| phase | agent | `rc-overlay-auto` advertised | the session's log |
+|---|---|---|---|
+| a | 0.4.184, before P1 | no | `rc ICE: overlay excluded (device policy rc_overlay=off, the default)` |
+| b | 0.4.187 with `ROOMLERD_RC_OVERLAY_AUTO=0`, read back from the process's environment | no | `rc ICE: overlay excluded (device policy rc_overlay=off, the default)` |
+| c | 0.4.187, the control | yes | `rc ICE: overlay auto (FR-128) — the session stays off the mesh`, then `overlay excluded (device policy rc_overlay=auto, decided for this session)` |
+
+**AC5.** Phases b and c differ only in the kill switch. With it set, the device does not advertise the verb, and its session runs as a plain `off`.
+
+**AC4.** An agent from before P1, given `auto`, behaves as `off` (phase a): that is D1. A server from before P2 has no `rc_overlay_auto` to send. It reads `rc_overlay`, which every phase stored as `false` beside `rc_overlay_auto=true`, so it reads such a device as `off`. The new server's half is the CI test `auto_reaches_only_a_device_that_decides_it` (#3088). The older-server half rests on the stored row and the code, not on a run against an old server image.
+
+**The control said "stays off"** because the lab viewer has no relay of its own in the lab org: `viewers=[]` reads the carrier as unknown (§3.1). A control that rides the mesh needs a viewer-side relay. AC2 needs one too. The VM, its disks and all three device rows are gone. Posted on [#2989](https://github.com/gjovanov/roomler-ai/issues/2989#issuecomment-6512839286).
