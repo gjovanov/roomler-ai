@@ -720,9 +720,9 @@ way. The primaries and the transfer describe the content. In Chrome, sets A (SMP
 (BT.709 primaries and transfer) and S decode identically. S is the truthful one for a player that
 colour-manages by primaries and transfer (FR-130 §2.5).
 
-| Family | Where it is written | What the bitstream carries (read on neo16 in P1) |
+| Family | Where it is written | What the bitstream carries (read on neo16 in P1, and in the field in P3) |
 |---|---|---|
-| FFmpeg, every backend | the codec context's four fields in `build_encoder` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1912`), before the open, for every cell, rebuild, probe, recording and GPU form | NVENC, D3D12 and Vulkan: set S exactly (H.264, HEVC and AV1; NVENC 4:4:4 too). `hevc_amf`: S's values, with the matrix under code 5 (BT.470 BG, the same coefficients). `h264_amf`: matrix 2 (unspecified), AMD's runtime's choice. `vp9_qsv`, `vp9_vaapi`: nothing, because FFmpeg 9.0.1 cannot tag VP9 there. QSV, VAAPI and VideoToolbox: not yet read |
+| FFmpeg, every backend | the codec context's four fields in `build_encoder` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1912`), before the open, for every cell, rebuild, probe, recording and GPU form | NVENC, D3D12 and Vulkan: set S exactly (H.264, HEVC and AV1; NVENC 4:4:4 too). QSV (AV1, H.264) and VideoToolbox (HEVC, H.264): set S, as Chrome's decoder reads it in the field when it is told nothing. `hevc_amf`: S's values, with the matrix under code 5 (BT.470 BG, the same coefficients). `h264_amf`: matrix 2 (unspecified), AMD's runtime's choice. `vp9_qsv`, `vp9_vaapi`: nothing, because FFmpeg 9.0.1 cannot tag VP9 there. VAAPI: not yet read |
 | Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES` and `MF_MT_TRANSFER_FUNCTION` on both media types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:600`), and again on the renegotiated output type | Microsoft's H.264 and HEVC encoders ignore the attributes and write no description. NVIDIA's and AMD's MF encoders did not open on neo16, so they are unread |
 | openh264, live | the SPS VUI (`agents/roomlerd/src/encode/openh264_backend.rs:116`) | set S |
 | libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:435`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
@@ -742,7 +742,11 @@ While the switch is on, the hello says `color-described` (`agents/roomlerd/src/e
 
 Read in the field on agent 0.4.188 ([FR-130 §8](fr/FR-130-colours-decode-true.md#8-field-verification-log)):
 lever 1 alone decodes `<video>` true from live openh264, and VP9 on the data channel decodes true through lever 2
-only, with or without the description in its header.
+only, with or without the description in its header. From NVENC, QSV and VideoToolbox, H.264, HEVC and AV1 decode
+true on the data channel from the encoder's own description alone (read on blit), and HEVC and AV1 also with both
+levers, on blit and FSR. H.264 on `<video>` comes from the RTP track's own
+cascade, Media Foundation and then openh264, never from FFmpeg. From openh264 it decodes true; from Microsoft's
+software MF it still shifts (open decision 6).
 
 **The switches.**
 - `color_description` turns lever 1 off on a device (*Configuration*, below). Since FR-130 P1b it can be
