@@ -136,7 +136,7 @@ against the same hosts' CPU-path week before it, from the heartbeats and `rc:ses
 |---|---|---|
 | decode errors per session-hour | `rc:session.stats` (3b) | no rise (open decision 3) |
 | keyframe requests per session-hour | `rc:session.stats` | no rise |
-| `input_reason` | the DC heartbeat (`agents/roomlerd/src/peer.rs:9716-9730`) | `gpu` on every session of the cell; no `open_failed` that persists |
+| `input_reason` | the DC heartbeat (`agents/roomlerd/src/peer.rs:9729-9743`) | `gpu` on every session of the cell; no `open_failed` that persists |
 | capture + encode, CPU per frame | the heartbeat; the process's CPU time | FR-118's saving for that cell, roughly |
 
 A clean week puts the cell on the default list in the next agent release. A fleet week after that release verifies

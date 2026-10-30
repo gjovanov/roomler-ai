@@ -285,7 +285,7 @@ cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
 pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
 or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
 guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
-`crates/remote_control/src/models.rs:9530`); a prefix match would refuse the
+`crates/remote_control/src/models.rs:9641`); a prefix match would refuse the
 kill switch along with the switch.
 
 ⚠️ **A push lands on connect, and takes effect at the restart after it.** A

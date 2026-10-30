@@ -112,12 +112,12 @@ Anchors verified against master `b4d12871`.
 **What the pump is today.** `media_pump_ffmpeg_dc` (`agents/roomlerd/src/peer.rs:4725–7506`,
 27 await points) runs on a tokio worker and does everything in one loop: the
 budget gate and rate applies (`:5762`, `:6638`, `:6676`, `:6739`, `:6990`), pacing
-(`:5811`), capture (`:5825`, already a handoff to capture's own thread), the
-encoder open (`:6249`, a `spawn_blocking` since FR-65), keyframe requests
-(`:6338`, `:6351`, `:6360`, `:6988`), the background rebuild's adoption
-(`:5422`, `adopt_rebuilt`), **the encode itself as
-`tokio::task::block_in_place(|| enc.encode_sync(&frame))` (`:6771`)**, and the
-hand-off to the dedicated send task (`:6904`). Scaling is inside the encoder
+(`:5798`), capture (`:5812`, already a handoff to capture's own thread), the
+encoder open (`:6236`, a `spawn_blocking` since FR-65), keyframe requests
+(`:6325`, `:6338`, `:6347`, `:6975`), the background rebuild's adoption
+(`:5409`, `adopt_rebuilt`), **the encode itself as
+`tokio::task::block_in_place(|| enc.encode_sync(&frame))` (`:6758`)**, and the
+hand-off to the dedicated send task (`:6891`). Scaling is inside the encoder
 (`encode/ffmpeg/encoder.rs`), not a stage of the loop. The encoder is therefore
 driven from whichever worker thread the pump task happens to be polled on, held
 there by `block_in_place`, and every `enc.*` call is a direct method call from
@@ -773,10 +773,10 @@ value`, `peer.rs:9672`):
 | field | the plan's value vs | at | `plan.rs` |
 |---|---|---|---|
 | `budget`, `hard_budget`, `lag_bound` | the pump's `queue_budget`, `hard_budget`, and the lag bound its gate used (`(b, b, 0)` on a constrained path) | the gate, every pass (`peer.rs:7697`) | `check_budget` `:401` |
-| `gate` | the plan's triple through `direct_gate_trips` vs the verdict the pump's two arms reached from the same `inflight_now` and `measured_wait_ms` | the gate, every pass (`:7533`) | `check_gate_verdict` `:439` |
-| `fps` | `governor.paced_fps().unwrap_or(target_fps)` | the pacer, every pass that reaches it (`:7640`) | `check_fps` `:461` |
-| `dims` | `resample::target_dims(frame.native_dims(), plan_target)` — pin-independent | after capture, every frame (`:7955`); skipped while the plan has no geometry | `check_dims` `:472` |
-| `dims`, `bitrate` | the dims and rate of every encoder the loop BUILT — the inline open (`:8289`), a dims swap adopted (`:7072`), a rate swap adopted (`:7136`) — judged after the controller's next tick (`:8775`): was it built at the plan's rate (on the ladder) and the plan's dims? | `note_built` `:487`, `after_tick` `:497` |
+| `gate` | the plan's triple through `direct_gate_trips` vs the verdict the pump's two arms reached from the same `inflight_now` and `measured_wait_ms` | the gate, every pass (`:7520`) | `check_gate_verdict` `:435` |
+| `fps` | `governor.paced_fps().unwrap_or(target_fps)` | the pacer, every pass that reaches it (`:7627`) | `check_fps` `:457` |
+| `dims` | `resample::target_dims(frame.native_dims(), plan_target)` — pin-independent | after capture, every frame (`:7942`); skipped while the plan has no geometry | `check_dims` `:468` |
+| `dims`, `bitrate` | the dims and rate of every encoder the loop BUILT — the inline open (`:8276`), a dims swap adopted (`:7059`), a rate swap adopted (`:7123`) — judged after the controller's next tick (`:8762`): was it built at the plan's rate (on the ladder) and the plan's dims? | `note_built` `:483`, `after_tick` `:493` |
 
 The `bitrate` check is the honest version of the rate half. The loop takes the
 controller's number at every `set_bitrate` site by construction (those five
