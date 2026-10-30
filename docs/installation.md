@@ -46,7 +46,7 @@ The Welcome page opens with a role already picked, which the person can change
 before anything happens: the background service on a machine with nothing
 installed, and an existing install's own flavour otherwise, so a default never
 switches a flavour or changes a device's security posture. Rust decides
-(`agents/roomler-setup/src/role.rs:210`, `default_role`, carried as
+(`agents/roomler-setup/src/role.rs:211`, `default_role`, carried as
 `defaultRole` on the detection); the SPA only applies it, when nothing is picked
 yet, and never saves it (a click does). The "Join the overlay network" box keeps
 its per-OS default, ticked for every preselected daemon role.
