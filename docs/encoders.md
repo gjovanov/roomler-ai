@@ -614,6 +614,15 @@ The session reports which form it opened and why, on the heartbeat as
   readback leaves the capture stage. `send_frame` grows by 1.9 ms, because it
   now waits for the GPU's conversion before QSV reads the surface. The pattern
   decodes identically on both paths.
+- **Measured on a 2880×1800 laptop**
+  ([FR-118 §9.10](fr/FR-118-gpu-resident-frames.md#910-ac4-the-slow-laptop-at-60-fps-2026-10-30),
+  `av1_qsv` with 60 fps asked, the same pattern, the same arm): the encoded
+  rate rose from 38 fps to the 60 fps target. With the switch off, the
+  capture thread's 7.9 ms readback runs in series with a 17 ms encode stage,
+  so a frame took 25 ms. With it on, a frame takes 16.61 ms, the period at
+  60 fps. QSV's own `send_frame`, about 16 ms a frame on both paths, is what
+  bounds this host now. The worker's CPU fell from 15.93 to 3.88 ms per
+  encoded frame.
 - **Measured on the WGC arm with NVENC**
   ([FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29),
   `av1_nvenc` at 2560×1600 and 60 fps on the same pattern, a hybrid laptop with
@@ -649,7 +658,9 @@ The session reports which form it opened and why, on the heartbeat as
   with both NVENC and QSV, a codec NVENC lacks opens on QSV on the other adapter
   and reads `adapter_mismatch`: CPU frames, the picture unchanged.
 - **Field-verified and released:** the QSV cell on the DXGI arm (0.4.181,
-  [FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28)),
+  [FR-118 §9.3](fr/FR-118-gpu-resident-frames.md#93-ac3s-pairs-2026-10-28);
+  at 2880×1800 on 0.4.187,
+  [§9.10](fr/FR-118-gpu-resident-frames.md#910-ac4-the-slow-laptop-at-60-fps-2026-10-30)),
   the NVENC cell on the WGC arm (0.4.183,
   [FR-118 §9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29))
   and the VideoToolbox cells on macOS (0.4.187,
