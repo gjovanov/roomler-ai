@@ -127,7 +127,7 @@ already polls every 30 s; the poller resolves network → tenant and writes the 
 | another `boot`: the PoP restarted, or a late sample from the old process | nothing | restarts at this sample |
 | none: the first sample, or the PoP was unreachable for 7 days | nothing | starts at this sample |
 
-`boot` names the PoP process in `/stats` (`crates/derp-relay/src/main.rs:283`, the same id
+`boot` names the PoP process in `/stats` (`crates/derp-relay/src/main.rs:289`, the same id
 `turn_usage.boot` carries), and it is what tells a restart from a stale sample. Every row
 but the first **under-reports and never double-counts**, the same trade the host-total
 `net_*_bytes` columns make: a missing byte is recoverable, an invented one is a refund.
@@ -188,7 +188,7 @@ flowchart LR
 | Path | Where |
 |---|---|
 | The cluster's coturn (P4b-1) | every pod subscribes, `crates/modules/network/src/turn_usage.rs:81` |
-| Each PoP's coturn (P4b-2) | derp-relay keeps an hour of totals (`crates/derp-relay/src/main.rs:256`), and every pod pulls them with a request signed for that region (`crates/core/src/relay_load.rs:314`) |
+| Each PoP's coturn (P4b-2) | derp-relay keeps an hour of totals (`crates/derp-relay/src/main.rs:262`), and every pod pulls them with a request signed for that region (`crates/core/src/relay_load.rs:314`) |
 | The booking | `crates/core/src/turn_bytes.rs:86`: the first pod to claim a leg books it, and a username naming no org is counted as unattributed |
 
 > ⚠️ **`turn_bytes` is monitored only behind `relay_allowance.turn_attribution`**, which
