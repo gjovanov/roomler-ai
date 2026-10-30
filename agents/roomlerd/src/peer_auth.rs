@@ -1803,8 +1803,16 @@ mod tests {
 
         let to = key_path(&loaded, TENANT_A).unwrap();
         let key = load_adopt_or_make(&to, || adoption_source(&from, &loaded, TENANT_A)).unwrap();
-        assert_eq!(key.public_b64(), pinned, "the key browsers pinned, not a new one");
-        assert_eq!(key_of(&loaded, TENANT_A), pinned, "on disk for the next start");
+        assert_eq!(
+            key.public_b64(),
+            pinned,
+            "the key browsers pinned, not a new one"
+        );
+        assert_eq!(
+            key_of(&loaded, TENANT_A),
+            pinned,
+            "on disk for the next start"
+        );
         assert!(
             mg.path()
                 .join(DIR_NAME)
@@ -1854,14 +1862,18 @@ mod tests {
     /// enrollment's, so each start mints one of its own.
     #[test]
     fn another_enrollments_key_is_never_adopted() {
-        for (agent, machine) in [("66f0c0ffee000000000000ff", "machine-1"), (AGENT_A, "machine-2")] {
+        for (agent, machine) in [
+            ("66f0c0ffee000000000000ff", "machine-1"),
+            (AGENT_A, "machine-2"),
+        ] {
             let (user, mg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
             let from = enrolled(&user, TENANT_A, agent, machine);
             let loaded = enrolled(&mg, TENANT_A, AGENT_A, "machine-1");
             let theirs = key_of(&from, TENANT_A);
             assert_eq!(adoption_source(&from, &loaded, TENANT_A), None);
             let to = key_path(&loaded, TENANT_A).unwrap();
-            let made = load_adopt_or_make(&to, || adoption_source(&from, &loaded, TENANT_A)).unwrap();
+            let made =
+                load_adopt_or_make(&to, || adoption_source(&from, &loaded, TENANT_A)).unwrap();
             assert_ne!(made.public_b64(), theirs, "{agent} on {machine}");
         }
     }
