@@ -247,7 +247,7 @@ key, recording nothing (`pushed_tribool`,
 `crates/modules/fleet/src/remote_config.rs:155`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
-(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3005`), and a test
+(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3085`), and a test
 holds it to what `roomler config set` reads. A word that reaches a device anyway,
 from some other server, leaves its key as it is, logged, and never fails the
 keys beside it (`agents/roomlerd/src/remote_config.rs:340`).

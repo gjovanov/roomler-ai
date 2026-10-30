@@ -168,7 +168,7 @@ Decided in the design review, before the code:
 - **Every hook has a hard bound**, so a goodbye that hangs never holds a laptop awake in
   a bag.
 - **Peers see the fact, never the policy.** The agent-facing list carries `asleep_since`
-  only (`crates/remote_control/src/models.rs:3493`): `power_policy` is a device setting,
+  only (`crates/remote_control/src/models.rs:3543`): `power_policy` is a device setting,
   and settings are the fleet record.
 
 The P4 anchors are verified against #3148's branch, on master `7e7a862ad`.
