@@ -10,11 +10,11 @@
 //! "not ours".
 
 use bson::oid::ObjectId;
-use roomler_ai_mod_fleet::hub::{DispatchCtx, OrgPolicy};
+use roomler_ai_mod_fleet::hub::{DispatchCtx, OrgPolicy, bounded_relays, named_devices};
 use roomler_ai_mod_fleet::nudge::{note_agent_offline_evidence, spawn_agent_nudge};
 use roomler_ai_remote_control::{
     models::{ConsentMode, RcOverlayMode},
-    signaling::{ClientMsg, Role, ServerMsg},
+    signaling::{ClientMsg, LocalRelayDescriptor, Role, ServerMsg},
 };
 use tracing::{info, warn};
 
@@ -656,20 +656,36 @@ pub(crate) fn org_session_cap_of(t: &roomler_ai_db::models::Tenant) -> Option<u3
     (n != u32::MAX).then_some(n)
 }
 
-/// FR-128 — the device the browser runs on, by the hub's own precedence
-/// (FR-121): a probed descriptor wins and names its device, otherwise the
-/// device the request named. `None` when neither says, which leaves `auto`
-/// with no far-TURN hint.
-fn viewer_device_of(
-    probed: Option<&roomler_ai_remote_control::signaling::LocalRelayDescriptor>,
+/// FR-128 — the devices the browser runs on, by the hub's own precedence
+/// (FR-121): probed descriptors win and name their devices, otherwise the
+/// devices the request named. D8: every one whose relay the hub hands out
+/// (P3b: one per agent on the browser's computer), not only the first. A
+/// probe from an agent too old to say its id, or one that says garbage,
+/// names nobody. Empty when nothing says, which leaves `auto` with no
+/// far-TURN hint.
+fn viewer_devices_of(
+    probed: Option<LocalRelayDescriptor>,
+    probed_also: Vec<LocalRelayDescriptor>,
     named: Option<ObjectId>,
-) -> Option<ObjectId> {
-    match probed {
-        Some(d) => d
-            .agent_id
-            .as_deref()
-            .and_then(|hex| ObjectId::parse_str(hex).ok()),
-        None => named,
+    named_also: Vec<ObjectId>,
+) -> Vec<ObjectId> {
+    match (probed, named) {
+        (Some(first), _) => {
+            let mut devices: Vec<ObjectId> = Vec::new();
+            for relay in bounded_relays(std::iter::once(first).chain(probed_also)) {
+                if let Some(device) = relay
+                    .agent_id
+                    .as_deref()
+                    .and_then(|hex| ObjectId::parse_str(hex).ok())
+                    && !devices.contains(&device)
+                {
+                    devices.push(device);
+                }
+            }
+            devices
+        }
+        (None, Some(first)) => named_devices(first, named_also),
+        (None, None) => Vec::new(),
     }
 }
 
@@ -678,18 +694,19 @@ fn viewer_device_of(
 /// costs the hint, never the session.
 const FAR_TURN_HINT_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// FR-128 — do both devices reach the far TURN over UDP, by their last
-/// netcheck? Asked of the hook registry, which `network` answers; `None` when
-/// nothing is measured or no `network` is mounted.
+/// FR-128 — do both ends reach the far TURN over UDP, by their last
+/// netcheck: the target, and the browser through its best device (D8)?
+/// Asked of the hook registry, which `network` answers; `None` when nothing
+/// is measured or no `network` is mounted.
 async fn far_turn_hint(
     state: &RemoteState,
     tenant_id: ObjectId,
     target: ObjectId,
-    viewer: ObjectId,
+    viewers: &[ObjectId],
 ) -> Option<bool> {
     tokio::time::timeout(
         FAR_TURN_HINT_BUDGET,
-        state.hooks.far_turn_udp(tenant_id, target, viewer),
+        state.hooks.far_turn_udp(tenant_id, target, viewers),
     )
     .await
     .ok()
@@ -717,17 +734,25 @@ pub async fn resolve_session_authz(
     use roomler_ai_db::models::role::permissions;
     use roomler_ai_remote_control::models::AgentStatus;
 
-    let (agent_id, override_reason, viewer_device) = match serde_json::from_str::<ClientMsg>(text) {
+    let (agent_id, override_reason, viewer_devices) = match serde_json::from_str::<ClientMsg>(text)
+    {
         Ok(ClientMsg::SessionRequest {
             agent_id,
             override_reason,
             local_relay,
             local_relay_from,
+            local_relay_also,
+            local_relay_from_also,
             ..
         }) => (
             agent_id,
             override_reason,
-            viewer_device_of(local_relay.as_ref(), local_relay_from),
+            viewer_devices_of(
+                local_relay,
+                local_relay_also,
+                local_relay_from,
+                local_relay_from_also,
+            ),
         ),
         // Not a session request → the mode is unused; allow through.
         _ => return Ok(SessionAuthz::allow(ConsentMode::Prompt)),
@@ -749,11 +774,11 @@ pub async fn resolve_session_authz(
     let input_mode = agent.access_policy.input_mode;
     // #1882 — and so does whether its sessions may use the overlay. FR-128 —
     // under `auto`, with the hint the agent decides a relayed mesh by.
-    let rc_overlay = match (agent.access_policy.rc_overlay_mode(), viewer_device) {
-        (RcOverlayMode::Auto { .. }, Some(viewer)) => RcOverlayMode::Auto {
-            far_turn: far_turn_hint(state, agent.tenant_id, agent_id, viewer).await,
+    let rc_overlay = match agent.access_policy.rc_overlay_mode() {
+        RcOverlayMode::Auto { .. } if !viewer_devices.is_empty() => RcOverlayMode::Auto {
+            far_turn: far_turn_hint(state, agent.tenant_id, agent_id, &viewer_devices).await,
         },
-        (mode, _) => mode,
+        mode => mode,
     };
     // FR-99 P3b — and what its sessions ask of their end. The device takes
     // the stricter of this and its own setting, so it can only tighten.
@@ -980,36 +1005,90 @@ fn error_session_id(e: &roomler_ai_remote_control::Error) -> Option<bson::oid::O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roomler_ai_remote_control::signaling::LocalRelayDescriptor;
+    use roomler_ai_remote_control::signaling::LOCAL_RELAYS_MAX;
 
     fn probed(agent_id: Option<String>) -> LocalRelayDescriptor {
+        relay_at("100.64.0.9", agent_id)
+    }
+
+    fn relay_at(overlay_ip: &str, agent_id: Option<String>) -> LocalRelayDescriptor {
         LocalRelayDescriptor {
             turn_port: 47989,
-            overlay_ip: "100.64.0.9".into(),
+            overlay_ip: overlay_ip.into(),
             username: "1700000600:uid".into(),
             credential: "abcd1234".into(),
             agent_id,
         }
     }
 
-    /// FR-128 — the far-TURN hint asks about the device whose relay the hub
-    /// hands out: a probed descriptor's own device wins over a named one, as
-    /// it does in the hub (FR-121). A probe from an agent too old to say its
+    /// FR-128 — the far-TURN hint asks about the devices whose relays the hub
+    /// hands out: probed descriptors' own devices win over named ones, as
+    /// they do in the hub (FR-121). A probe from an agent too old to say its
     /// id, or one that says garbage, names nobody rather than the named
     /// device, whose relay the hub will not use.
     #[test]
-    fn the_viewer_device_follows_the_hubs_precedence() {
+    fn the_viewer_devices_follow_the_hubs_precedence() {
         let (mine, named) = (ObjectId::new(), ObjectId::new());
-        assert_eq!(viewer_device_of(None, Some(named)), Some(named));
-        assert_eq!(viewer_device_of(None, None), None);
+        let of = |probed: Option<LocalRelayDescriptor>, named: Option<ObjectId>| {
+            viewer_devices_of(probed, Vec::new(), named, Vec::new())
+        };
+        assert_eq!(of(None, Some(named)), vec![named]);
+        assert!(of(None, None).is_empty());
         assert_eq!(
-            viewer_device_of(Some(&probed(Some(mine.to_hex()))), Some(named)),
-            Some(mine)
+            of(Some(probed(Some(mine.to_hex()))), Some(named)),
+            vec![mine]
         );
-        assert_eq!(viewer_device_of(Some(&probed(None)), Some(named)), None);
+        assert!(of(Some(probed(None)), Some(named)).is_empty());
+        assert!(of(Some(probed(Some("not-hex".into()))), None).is_empty());
+    }
+
+    /// FR-128 D8 — every device of the browser's computer counts, in the
+    /// hub's order, each once, at most [`LOCAL_RELAYS_MAX`]: NEO16 runs a
+    /// Windows agent and a WSL agent, and either one can answer the probe
+    /// first.
+    #[test]
+    fn every_device_the_browser_runs_on_counts() {
+        let (windows, wsl, other) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
         assert_eq!(
-            viewer_device_of(Some(&probed(Some("not-hex".into()))), None),
-            None
+            viewer_devices_of(
+                Some(relay_at("100.64.0.33", Some(wsl.to_hex()))),
+                vec![
+                    relay_at("100.64.0.2", Some(windows.to_hex())),
+                    relay_at("100.64.0.40", None),
+                ],
+                None,
+                Vec::new(),
+            ),
+            vec![wsl, windows]
+        );
+        assert_eq!(
+            viewer_devices_of(
+                Some(relay_at("100.64.0.40", None)),
+                vec![relay_at("100.64.0.2", Some(windows.to_hex()))],
+                None,
+                Vec::new(),
+            ),
+            vec![windows],
+            "a first relay too old to name its device no longer hides the rest"
+        );
+        assert_eq!(
+            viewer_devices_of(None, Vec::new(), Some(wsl), vec![windows, wsl]),
+            vec![wsl, windows]
+        );
+        assert_eq!(
+            viewer_devices_of(
+                Some(relay_at("100.64.0.2", Some(windows.to_hex()))),
+                Vec::new(),
+                Some(other),
+                vec![wsl],
+            ),
+            vec![windows],
+            "beside a probe, the named devices do not count: the hub uses no relay of theirs"
+        );
+        let many: Vec<ObjectId> = (0..LOCAL_RELAYS_MAX + 2).map(|_| ObjectId::new()).collect();
+        assert_eq!(
+            viewer_devices_of(None, Vec::new(), Some(many[0]), many[1..].to_vec()),
+            many[..LOCAL_RELAYS_MAX].to_vec()
         );
     }
 }

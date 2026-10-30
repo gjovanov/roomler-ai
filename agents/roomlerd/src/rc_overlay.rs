@@ -102,37 +102,48 @@ impl RcOverlay {
     }
 
     /// FR-128 — make an `auto` session's decision, at its offer: the live
-    /// carrier to each of the viewer's devices ([`mesh_carriers_of`]) and the
-    /// server's far-TURN hint. The best carrier decides ([`auto_allows`]); a
+    /// carrier to each of the viewer's devices ([`mesh_carriers_of`]), the
+    /// server's far-TURN hint, and this machine's own reach (D8,
+    /// [`own_far_turn`]). The best carrier decides ([`auto_allows`]); a
     /// session that rides the mesh then leaves off every viewer device whose
     /// carrier is worse (`exclude`), so ICE cannot pick a relay behind it.
     /// Anything that is not `auto` comes back as it went in. One line in the
     /// log names the inputs.
     pub async fn decide(self, session: impl std::fmt::Display) -> Self {
-        self.decide_with(session, mesh_carriers_of).await
+        self.decide_with(session, mesh_carriers_of, own_far_turn)
+            .await
     }
 
-    /// [`Self::decide`] with the carrier lookup passed in, for tests. The
-    /// lookup answers one carrier per address, in order.
-    pub async fn decide_with<F, Fut>(self, session: impl std::fmt::Display, lookup: F) -> Self
+    /// [`Self::decide`] with both lookups passed in, for tests. The carrier
+    /// lookup answers one carrier per address, in order; `own` answers this
+    /// machine's own far-TURN reach. They run side by side.
+    pub async fn decide_with<F, Fut, G, GFut>(
+        self,
+        session: impl std::fmt::Display,
+        lookup: F,
+        own: G,
+    ) -> Self
     where
         F: FnOnce(Vec<IpAddr>) -> Fut,
         Fut: std::future::Future<Output = Vec<MeshCarrier>>,
+        G: FnOnce() -> GFut,
+        GFut: std::future::Future<Output = Option<bool>>,
     {
         if !self.auto {
             return self;
         }
-        let carriers = if self.viewers.is_empty() {
-            Vec::new()
+        let (carriers, own_far_turn) = if self.viewers.is_empty() {
+            (Vec::new(), None)
         } else {
-            lookup(self.viewers.clone()).await
+            tokio::join!(lookup(self.viewers.clone()), own())
         };
         let best = carriers
             .iter()
             .copied()
             .max_by_key(|c| c.rank())
             .unwrap_or(MeshCarrier::Unknown);
-        let allow = auto_allows(best, self.far_turn.unwrap_or(true));
+        let far_turn = with_own_reach(self.far_turn, own_far_turn);
+        let allow = auto_allows(best, far_turn.unwrap_or(true));
         let exclude: Vec<IpAddr> = if allow {
             self.viewers
                 .iter()
@@ -148,6 +159,7 @@ impl RcOverlay {
             viewers = ?self.viewers,
             ?carriers,
             far_turn = ?self.far_turn,
+            ?own_far_turn,
             allow,
             ?exclude,
             "rc ICE: overlay auto (FR-128) — {}",
@@ -322,6 +334,45 @@ pub async fn mesh_carriers_of(addrs: Vec<IpAddr>) -> Vec<MeshCarrier> {
             )
         })
         .collect()
+}
+
+/// FR-128 D8 — how old this machine's netcheck may be and still count: the
+/// gate every consumer uses (tunnel-core's `FRESHNESS_MAX_AGE`, the server's
+/// `fresh_caps`), three times its 20-minute cadence.
+const NETCHECK_FRESH_S: u64 = 60 * 60;
+
+/// FR-128 D8 — this machine's own far-TURN reach, by its daemon's last
+/// netcheck: `stun_udp` alone (P2b), behind the freshness gate. ONE LocalAPI
+/// `status` call within the 400 ms the carrier lookup has, run beside it. A
+/// Mac's GUI worker runs no overlay, and its row has no node the server's
+/// hint could measure, so it reads its daemon's vector here (the per-user
+/// half lends it, `person_socket::with_machine_network`). No answer in time,
+/// or no fresh vector, is `None`: not measured.
+pub async fn own_far_turn() -> Option<bool> {
+    let query = async {
+        let mut client = tunnel_core::localapi::connect().await.ok()?;
+        client.status().await.ok()
+    };
+    let status = tokio::time::timeout(std::time::Duration::from_millis(400), query)
+        .await
+        .ok()
+        .flatten()?;
+    status
+        .netcheck
+        .filter(|n| n.age_s < NETCHECK_FRESH_S)
+        .map(|n| n.stun_udp)
+}
+
+/// FR-128 D8 — the server's hint with this machine's own reach folded in: a
+/// target whose netcheck found no UDP out reaches no far TURN, whatever the
+/// server could see. Anything else leaves the hint as the server sent it,
+/// which already holds this machine's vector wherever the server found one.
+fn with_own_reach(hint: Option<bool>, own: Option<bool>) -> Option<bool> {
+    if own == Some(false) {
+        Some(false)
+    } else {
+        hint
+    }
 }
 
 /// The connection address of an ICE candidate line, if it is an IP literal.
@@ -576,9 +627,11 @@ mod tests {
     #[tokio::test]
     async fn the_offer_decides_from_the_carrier_and_the_far_turn_hint() {
         let decided = |p: RcOverlay, c: MeshCarrier| async move {
-            p.decide_with("s", move |addrs: Vec<IpAddr>| async move {
-                vec![c; addrs.len()]
-            })
+            p.decide_with(
+                "s",
+                move |addrs: Vec<IpAddr>| async move { vec![c; addrs.len()] },
+                || async { None },
+            )
             .await
         };
         // The same-network Mac Chrome case: a direct mesh carries it.
@@ -608,13 +661,57 @@ mod tests {
         );
     }
 
-    /// No viewer named: unknown, off, and the lookup is never asked.
+    /// No viewer named: unknown, off, and neither lookup is ever asked.
     #[tokio::test]
     async fn no_viewer_is_off_without_a_lookup() {
         let d = auto(&[], Some(false))
-            .decide_with("s", |_| async { panic!("no viewer, no lookup") })
+            .decide_with(
+                "s",
+                |_| async { panic!("no viewer, no lookup") },
+                || async { panic!("no viewer, no netcheck") },
+            )
             .await;
         assert!(!d.allow && d.auto);
+    }
+
+    /// FR-128 D8 — the target's own netcheck, read at the offer. One that
+    /// found no UDP out makes a relayed mesh the only path, whatever the
+    /// server could see: for a Mac's GUI worker, whose row has no node, the
+    /// server's hint reads `None`. Anything else leaves the hint as sent.
+    #[tokio::test]
+    async fn the_targets_own_netcheck_folds_into_the_hint() {
+        let decided = |c: MeshCarrier, hint: Option<bool>, own: Option<bool>| async move {
+            auto(&["100.65.4.33"], hint)
+                .decide_with(
+                    "s",
+                    move |addrs: Vec<IpAddr>| async move { vec![c; addrs.len()] },
+                    move || async move { own },
+                )
+                .await
+                .allow
+        };
+        use MeshCarrier::*;
+        assert!(
+            decided(Relayed, None, Some(false)).await,
+            "a Mac target with no UDP out: the mesh is the only path"
+        );
+        assert!(
+            decided(Relayed, Some(true), Some(false)).await,
+            "its own read wins toward dead"
+        );
+        assert!(!decided(Relayed, None, Some(true)).await);
+        assert!(
+            !decided(Relayed, None, None).await,
+            "nothing measured: the far TURN is assumed"
+        );
+        assert!(
+            decided(Relayed, Some(false), Some(true)).await,
+            "the browser's end measured dead stands"
+        );
+        assert!(decided(Direct, Some(true), Some(true)).await);
+        assert!(!decided(Unknown, None, Some(false)).await, "fail safe");
+        assert_eq!(with_own_reach(Some(true), None), Some(true));
+        assert_eq!(with_own_reach(None, Some(true)), None);
     }
 
     /// FR-121 P3b — one computer, two agents, two relays: Windows direct to
@@ -625,10 +722,14 @@ mod tests {
         use MeshCarrier::*;
         let (win, wsl) = ("100.65.4.33", "100.65.4.40");
         let decided = |p: RcOverlay, cs: Vec<MeshCarrier>| async move {
-            p.decide_with("s", move |addrs: Vec<IpAddr>| async move {
-                assert_eq!(addrs.len(), cs.len(), "one carrier per viewer");
-                cs
-            })
+            p.decide_with(
+                "s",
+                move |addrs: Vec<IpAddr>| async move {
+                    assert_eq!(addrs.len(), cs.len(), "one carrier per viewer");
+                    cs
+                },
+                || async { None },
+            )
             .await
         };
         let d = decided(auto(&[win, wsl], None), vec![Direct, Relayed]).await;
@@ -696,7 +797,11 @@ mod tests {
         for p in [off(), on()] {
             let d = p
                 .clone()
-                .decide_with("s", |_| async { panic!("not auto, no lookup") })
+                .decide_with(
+                    "s",
+                    |_| async { panic!("not auto, no lookup") },
+                    || async { panic!("not auto, no netcheck") },
+                )
                 .await;
             assert_eq!(d, p);
         }
