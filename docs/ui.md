@@ -94,7 +94,10 @@ flowchart TB
 ```
 
 - **Decode workers** (`ui/src/workers/`): `rc-webcodecs-worker`, `rc-hevc-worker`,
-  `rc-vp9-444-worker`, with `rc-hop-stats` shared hop-timing instrumentation.
+  `rc-vp9-444-worker`, with `rc-hop-stats` shared hop-timing instrumentation. Each
+  tells its decoder the agent's BT.601 limited colour space through
+  `rc-decoder-config` (FR-130 P2; kill switch `roomler-rc-colorspace=off`):
+  [remote-control.md §18.6.2](remote-control.md#1862-the-decoder-is-told-the-colour-space-fr-130-p2).
 - **Support probes** per codec (H.264/HEVC/AV1/VP9): software + hardware decode
   detection; HEVC-over-DC is offered only when *agent hardware encode × viewer
   hardware decode* both hold.
@@ -148,7 +151,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   60 Hz").
 - **The pick** is stored per browser (`roomler-rc-fps`,
   `composables/frameRate.ts:30`) and sent again each time the control channel
-  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7473`), so
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7513`), so
   a reload asks again without a click.
 - **The hint under it is the agent's answer**, from `rc:video-info`
   (`frameRateSummary`, `composables/frameRate.ts:147`): "120 fps"; "120 fps, on
