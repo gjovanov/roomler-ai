@@ -117,6 +117,11 @@ const state = {
                        // WizardState, so a relaunch re-derives it from the
                        // role instead of replaying a stale click.
   anchorSkipReason: null, // FR-104: why the anchor step did not anchor
+  restartSkipReason: null, // #3116: why the daemon was not restarted onto
+                       // a reinstall's new enrollment
+  systemContextNeedsElevation: false, // #3116: a limited wizard on a device
+                       // whose pre-logon service config it cannot write (a
+                       // reinstall); from cmd_system_context_needs_elevation
   diagOptIn: false,    // FR-102 P3b: the Welcome page's diagnostics box.
                        // Memory only — deliberately NOT in the persisted
                        // WizardState and never defaulted from an earlier
@@ -230,6 +235,14 @@ async function probeAndRender() {
     showSnackbar(`Detection failed: ${err}`);
   }
   state.os = state.detection.agent.os ?? "windows";
+  // #3116 — on a reinstall the pre-logon service needs an elevated wizard; the
+  // Welcome page says so before a token is pasted or paired. A failed probe
+  // leaves no gate here, and the install's preflight still holds.
+  try {
+    state.systemContextNeedsElevation = await invoke("cmd_system_context_needs_elevation");
+  } catch (err) {
+    console.warn("elevation probe failed:", err);
+  }
   if (state.detection.agent.featuresServer) {
     state.features = {
       server: state.detection.agent.featuresServer,
@@ -539,8 +552,15 @@ function renderWelcome() {
     warningEl.hidden = true;
   }
 
+  // #3116 — the pre-logon service keeps its config where only administrators
+  // may write, so a wizard that is not elevated stops here instead of after
+  // the enroll has spent the token.
+  const needsElevation = needsElevatedWizard(state.role);
+  document.getElementById("elevation-note").hidden = !needsElevation;
+
   // Continue button gate.
-  const canContinue = state.role !== null && (warning === null || state.roleAck);
+  const canContinue =
+    state.role !== null && (warning === null || state.roleAck) && !needsElevation;
   document.getElementById("welcome-continue").disabled = !canContinue;
 
   // FR-102 P3b: the box shows the in-memory state (unticked on every
@@ -548,6 +568,14 @@ function renderWelcome() {
   // enrollment goes to, as the Server page currently has it.
   document.getElementById("diag-opt-in").checked = state.diagOptIn;
   document.getElementById("diag-server").textContent = state.server || "https://roomler.ai";
+}
+
+// #3116 — does `role` need a wizard that runs as administrator, which this one
+// is not? Only Windows' pre-logon service (SystemContext), and only once the
+// daemon has hardened its config folder to SYSTEM and Administrators, which a
+// reinstall finds. A fresh install still works from a double-click.
+function needsElevatedWizard(role) {
+  return role === "daemon-system" && state.systemContextNeedsElevation === true;
 }
 
 // FR-129 B1 — why no daemon card is shown, in the person's terms. On Linux
@@ -1263,6 +1291,10 @@ const STEP_LABELS = {
   AnchorStarted: "Anchoring for SYSTEM exec (administrator prompt)",
   AnchorOk: "Anchored for SYSTEM exec",
   AnchorSkipped: "Not anchored",
+  // #3116 (Windows reinstall): the daemon onto the new enrollment.
+  DaemonRestartStarted: "Restarting the Roomler service onto the new enrollment",
+  DaemonRestartOk: "The Roomler service runs the new enrollment",
+  DaemonRestartSkipped: "The Roomler service was not restarted",
   // FR-129 B1 (Linux/macOS): the install.sh halves.
   ScriptHalfStarted: "Running the install steps",
   ScriptHalfDone: "Install steps finished",
@@ -1362,6 +1394,7 @@ async function runInstall() {
   state.totalBytes = 0;
   state.scriptLines = [];
   state.elevation = null;
+  state.restartSkipReason = null;
   document.getElementById("install-systemcontext-error").hidden = true;
   document.getElementById("force-kill-confirm").hidden = true;
   await gotoStep("install");
@@ -1484,6 +1517,10 @@ function handleProgress(event, live) {
   if (type === "AnchorSkipped") {
     state.anchorSkipReason = data.reason ?? null;
   }
+  // #3116 — likewise.
+  if (type === "DaemonRestartSkipped") {
+    state.restartSkipReason = data.reason ?? null;
+  }
 
   // FR-129 B1 — a line a half printed: the output panel, not a row.
   if (type === "ScriptLine") {
@@ -1596,9 +1633,14 @@ function checklistClass(event) {
   const d = event.data ?? {};
   if (t === "Error" || t === "SystemContextError" || t === "ElevationCancelled") return "error";
   if (t === "ScriptHalfDone" && d.code !== 0) return "error";
-  if (t === "PreflightWarning" || t === "AnchorSkipped" || t === "ElevationUnavailable") return "warning";
   if (
-    t === "Done" || t === "EnrollOk" || t === "AnchorOk" || t === "MsiCompleted" ||
+    t === "PreflightWarning" || t === "AnchorSkipped" || t === "ElevationUnavailable" ||
+    t === "DaemonRestartSkipped"
+  ) {
+    return "warning";
+  }
+  if (
+    t === "Done" || t === "EnrollOk" || t === "AnchorOk" || t === "DaemonRestartOk" || t === "MsiCompleted" ||
     t === "ExtractDone" || t === "IntegrationDone" || t === "ScriptHalfDone" ||
     t === "DownloadVerified" || t === "PreflightOk" || t === "AssetResolved"
   ) {
@@ -1633,6 +1675,8 @@ function checklistLabel(event) {
   }
   if (t === "EnrollOk") return `Enrolled (${d.principalKind} ${d.principalId})`;
   if (t === "AnchorSkipped") return `Not anchored: ${d.reason}`;
+  if (t === "DaemonRestartOk" && d.pid) return `${base} (PID ${d.pid})`;
+  if (t === "DaemonRestartSkipped") return `${base}: ${d.reason}`;
   if (t === "Error") return `Error at ${d.step}: ${d.message}`;
   if (t === "SystemContextError") {
     const stageLabel = {
@@ -1701,6 +1745,14 @@ function renderDone() {
     document.getElementById("done-anchor-command").textContent =
       `roomlerd anchor create --server ${server} --token <fresh token> ` +
       `--device ${done.principalId ?? "<device id>"}`;
+  }
+
+  // #3116 — a reinstall's daemon that was not restarted onto the new
+  // enrollment: it takes it at its next start, and the reason says how.
+  const restartSkipped = !isTunnel && !!state.restartSkipReason;
+  document.getElementById("done-restart-note").hidden = !restartSkipped;
+  if (restartSkipped) {
+    document.getElementById("done-restart-reason").textContent = state.restartSkipReason;
   }
 
   document.getElementById("done-principal-label").textContent =

@@ -108,8 +108,11 @@ tempfile = { workspace = true }
 
 # FR-129 B1 (F3) — the root daemon's own identity, read over the person
 # socket a Linux root daemon serves the console user (`root_identity.rs`).
-# The protocol leaf crate only: the companion links the same one.
-[target.'cfg(target_os = "linux")'.dependencies]
+# #3116 — and on Windows, a reinstall's restart onto the enrollment it just
+# wrote: `RestartDaemon` over the daemon's pipe, as the companion's Apply now
+# (`orchestrator_agent.rs`). The protocol leaf crate only: the companion
+# links the same one.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 roomler-localapi = { path = "../../crates/localapi" }
 
 [dev-dependencies]
