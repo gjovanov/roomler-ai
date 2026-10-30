@@ -5,7 +5,7 @@ operator's own AWS account); the rig is built and rehearsed end to end on a GPU-
 run waits on that account's G and VT quota (§2). P0c (2026-10-30): the released Linux trees needed NVIDIA driver
 610, and the g5g's image ships 595, so the box could not have opened NVENC on any release to date; the Linux trees
 now take Windows' NVENC SDK, driver 570 (§2, §3.2) · **Owner:** the agent's encoder surface ·
-**Anchors:** master `589373574` · **Split from:** [FR-97](FR-97-os-feature-parity.md) P7a, by its D18 (the
+**Anchors:** master `787f03200` · **Split from:** [FR-97](FR-97-os-feature-parity.md) P7a, by its D18 (the
 operator, 2026-10-25: "ship AAC now, GPU later")
 
 ## 1. Goal
@@ -90,7 +90,7 @@ sequenceDiagram
 | The box | `up.sh`: a VPC of its own, port 22 from the dev box and mars only, a key made for the run, a systemd timer that powers it off (= terminates it) at the deadline; `down.sh` deletes by id and sweeps by tag | `DOWN OK … nothing tagged … is left` |
 | The agent | the **released** build through the served `install.sh --role daemon --system`, `ROOMLERD_VIRTUAL_DESKTOP=1` (Xvfb 1920×1080, openbox, a ticking clock, `top`), `ROOMLERD_AUTO_UPDATE=0`. Enrolled with the vmtest org's ephemeral key, which goes from mars to the box on stdin, so the row deletes itself when the daemon stops | `roomlerd --version`, the agent row |
 | AC1 | the daemon's `caps probe: child reported … hw_encoders=[…]` ([`caps.rs:400-407`](../../agents/roomlerd/src/encode/caps.rs#L400-L407)), and `roomlerd caps-probe` run again for the cell list | `guest-roomlerd.sh caps` |
-| AC2 | the vmtest remote-desktop spec from mars, steered onto the cell: `E2E_RC_CODEC=h264` seeds the picker's per-agent override ([`useRemoteControl.ts:2269`](../../ui/src/composables/useRemoteControl.ts#L2269)), which maps an explicit H.264 to `data-channel-h264` ([`peer.rs:2492`](../../agents/roomlerd/src/peer.rs#L2492)), an FFmpeg cascade with `h264_nvenc` first ([`peer.rs:5266`](../../agents/roomlerd/src/peer.rs#L5266)); `E2E_RC_EXPECT_ENCODER=h264_nvenc` fails the run unless the viewer's codec pill names it. Headless Chromium decodes H.264 in software; HEVC needs a viewer with hardware HEVC decode | the agent's `media pump:` line, the pill, decoded frames |
+| AC2 | the vmtest remote-desktop spec from mars, steered onto the cell: `E2E_RC_CODEC=h264` seeds the picker's per-agent override ([`useRemoteControl.ts:2269`](../../ui/src/composables/useRemoteControl.ts#L2269)), which maps an explicit H.264 to `data-channel-h264` ([`peer.rs:2492`](../../agents/roomlerd/src/peer.rs#L2492)), an FFmpeg cascade with `h264_nvenc` first ([`peer.rs:5275`](../../agents/roomlerd/src/peer.rs#L5275)); `E2E_RC_EXPECT_ENCODER=h264_nvenc` fails the run unless the viewer's codec pill names it. Headless Chromium decodes H.264 in software; HEVC needs a viewer with hardware HEVC decode | the agent's `media pump:` line, the pill, decoded frames |
 | AC3 | `roomlerd record --encoder hardware --system-audio` on a private Xvfb with a null sink: `hardware` is the FFmpeg H.264 cascade or a refusal, never a quiet software fallback ([`child.rs:315`](../../agents/roomlerd/src/recording/child.rs#L315)) | the `started` event's `encoder`, the MP4's `mp4a`/`esds` |
 
 ### 3.2 The NVENC driver floor (P0c)
