@@ -6040,6 +6040,7 @@
   "wire": [
     "rc:agent.hello",
     "rc:agent.heartbeat",
+    "rc:agent.sleeping",
     "rc:relay.probe_report",
     "rc:session.stats",
     "rc:relay.derp_ticket_request",
@@ -6233,6 +6234,7 @@
     "rc:agent.hello": "fleet",
     "rc:agent.key_rotated": "network",
     "rc:agent.local_relay": "remote",
+    "rc:agent.sleeping": "fleet",
     "rc:consent": "fleet",
     "rc:consent.pending": "fleet",
     "rc:extauth.finish": "remote",
