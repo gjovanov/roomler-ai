@@ -1293,6 +1293,86 @@ fail it. The week restarts on the release carrying M3a.3, agent 0.4.182
 (published 2026-10-28 17:04Z). Its read keeps the `remote_sessions`
 denominator, and a divergence there is a bug by construction: its inputs held.
 
+### The restarted week — interim read and the owed green checks (2026-10-29)
+
+The fleet ran onto 0.4.182 and climbed to 0.4.187 over the next day (the grox
+fleet is wholly on 0.4.187). An interim read 29 hours into the week, 2026-10-28
+17:04:30Z → 2026-10-29 22:13Z, bounded at both ends, server-side counts only:
+
+| | Count |
+|---|---|
+| sessions started (`remote_sessions`) | 53 |
+| … with any agent log | 53 |
+| … FFmpeg DC sessions with heartbeats (≥ 0.4.182) | **46**, on 9 hosts, 10 953 heartbeats |
+| … every `plan_divergences` field zero at the last heartbeat | **46** |
+| … with a divergence | **0** |
+| first-divergence WARN lines | **0** |
+| counted apart, not in the gate | 18 `plan_lags` (every one `native`), 0 `plan_stale_ticks`, 0 `plan_stale_swaps`, 13 dims swaps |
+
+By encoder the 46 are `hevc_qsv` 15, `av1_nvenc` 11, `hevc_videotoolbox` 9,
+`av1_qsv` 5, `hevc_nvenc` 3, `h264_nvenc` 3. The one pre-0.4.182 session in the
+window (0.4.181) also read zero. Every `plan_lags` line is a `native` change
+(FR-108's display match switching the host mode under a live session — M3a's
+documented D1 lag), named by the moved input, counted apart from the gate
+exactly as M3a.3 built it to be. Zero is the gate; this is the week **running
+clean so far**, not the week met — it runs to 2026-11-04 17:04Z at the earliest.
+
+**The three green checks the gate was owed, run against 0.4.182+.** The
+driven session is `zeus` on 0.4.187 (`hevc_vaapi`, rebuild-bound, headless,
+nobody at the screen), read back from the daemon's dated log file after the
+session; every number below is a log line, not a heartbeat summary.
+
+- **M3a.2 — a dims replacement opens at its own dims' ceiling** (the `zeus`
+  move, red on 0.4.148). `1600×900 → 1048×590`, with the controller sitting at
+  the old frame's full 27 M ceiling: the replacement **opened at the 12 M rung**
+  (`maxrate=12 000 000` — the ladder's rung for the new dims' ceiling,
+  11 593 500), where 0.4.148 had opened it at the 25 M rung; adopted in **3 ms**
+  off the frame path (`dims swap adopted — the picture never froze`,
+  `dims_swaps=1`); the controller's first tick named the same rung
+  (`set_bitrate ceiling=11 593 500 target=11 593 500`) and had **nothing to
+  re-rate — no swap followed** (none between 22:21:48 and the move back up).
+  The move back up opened at the same 12 M rung (the applied rate under the old
+  ceiling rides along, as designed), adopted in 8 ms (`dims_swaps=2`), and the
+  AIMD resumed its 5-s climb. Two inline rebuilds in the whole session (the
+  start and the flip below), none at either move; zero on every field
+  throughout, `plan_epoch` 10 → 22. **Met.**
+- **B1 — a persisted relay→direct flip opens at the post-flip target** (red on
+  0.4.151–179, week-1 cases #10 and #23). The driven session reproduced it on
+  a rebuild-bound backend: it **started relay-tier** (30 fps, ceiling 2.55 M —
+  this viewer's first nominated pair is a relay), **escaped** at the first 5-s
+  recheck (ceiling 13.5 M, target 3 393 750) and the flip **persisted** at the
+  second: the rebuild **opened at 3 393 750, the post-escape target** — before
+  the fix it opened at the old profile's 2.55 M and the same pass re-rated it.
+  The `set_bitrate` 141 ms after that open (target 5 081 250) is the AIMD's
+  5-s window step anchored at the escape (47.988 → 53.048), not a correction of
+  the open. Six such flips also occurred naturally in the window, every one on
+  `hevc_qsv`, each with its next step 5.0–5.06 s after the escape's — the
+  flip persists one recheck after the escape and the AIMD steps once a window,
+  so the two coincide by construction. **Not one produced a `bitrate`
+  divergence**, where the same event was red a week ago. **Met.**
+- **B3 — a relayed start that escapes to direct leaves no stale hold** (red on
+  the pre-fix releases, week-1 case #24). Seven relay→direct escapes occurred in
+  the window (the driven session's among them) with no stale hold and no
+  divergence — but every one started with **no thrift hold** (`deferred=false`
+  on the start's first tick), so the exact red-shape (a *held* target surviving
+  the escape) did not recur. The reason is in the tick's arms: `last_motion_at`
+  starts 60 s in the past, so a start whose screen is quiet takes the quiet
+  arm and applies at once; case #24's hold formed on a live desktop, where
+  motion inside `DEFER_QUIET` (1.2 s) at the first tick takes the holding arm.
+  No regression is shown; the driven green is **still owed**, and its recipe is
+  a relayed start on a rebuild-bound backend **with on-screen motion in its
+  first second**, then the escape (a reading of the arms, not yet measured).
+
+The window's 13 fleet dims swaps are all FR-119 refresh swaps at constant
+geometry (60 → 120/144 fps); the only geometry moves in it are the two driven
+ones above. Still owed before AC10 can be ticked: the full week to elapse (the
+final read on or after 2026-11-04 17:04Z with the `remote_sessions`
+denominator), the B3 driven green, and two driven moves the window did not
+contain — a geometry dims swap on a QSV host and a Priority move on a relay
+(both need a QSV / relay host that can be driven without interrupting a person at
+it; the headless Linux hosts are `vaapi`). M3b does not start before the week
+holds.
+
 ## Acceptance criteria
 
 - [ ] **AC1** — capture/scale/encode run on a dedicated thread; the async runtime
@@ -1360,7 +1440,11 @@ denominator, and a divergence there is a bug by construction: its inputs held.
       in §"M3a.3", which also counts the lags and the first-tick re-rates apart.
       The final read of the week found 62 of 426, every one in `dims` or
       `bitrate`, so the week fails (§"What the week found"). The week restarts
-      on the release carrying M3a.3, 0.4.182.)*
+      on the release carrying M3a.3, 0.4.182. 2026-10-29: 29 h into the restarted
+      week, 46 of 46 FFmpeg DC sessions on 0.4.182–187 read zero on every field
+      (the fleet is wholly on 0.4.187); the M3a.2 and B1 green checks the gate
+      was owed are met, B3's and two driven moves are still owed, and the week
+      runs to 2026-11-04 17:04Z — §"The restarted week".)*
 
 ## P1 — as built (2026-09-04, PR #1333)
 
