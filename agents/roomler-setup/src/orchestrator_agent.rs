@@ -922,6 +922,13 @@ const DAEMON_REANSWER_BUDGET: Duration = Duration::from_secs(10);
 #[cfg(target_os = "windows")]
 const RESTART_BACK_FLOOR: Duration = Duration::from_secs(60);
 
+/// #3116 — how long one LocalAPI exchange may take. The client reads its
+/// answer with no deadline of its own, and a daemon that took the connection
+/// and never answered (wedged, or mid-shutdown) would hold the install short
+/// of its Done page forever.
+#[cfg(target_os = "windows")]
+const LOCALAPI_EXCHANGE: Duration = Duration::from_secs(15);
+
 /// #3116 — on a perMachine reinstall, wait for the daemon the MSI restarted
 /// onto `config_path` to answer on its LocalAPI. It serves that only after its
 /// startup writes, so the config read after this is the one it left. `None`
@@ -1003,14 +1010,20 @@ async fn restart_onto_new_enrollment(
         Ok(true) => {}
     }
     emit(on_event, ProgressEvent::DaemonRestartStarted);
-    let answer = match localapi::connect().await {
-        Ok(mut client) => {
-            client
-                .restart_daemon("setup: a reinstall wrote a new enrollment")
-                .await
-        }
-        Err(e) => Err(e),
+    let ask = async {
+        let mut client = localapi::connect().await?;
+        client
+            .restart_daemon("setup: a reinstall wrote a new enrollment")
+            .await
     };
+    let answer = tokio::time::timeout(LOCALAPI_EXCHANGE, ask)
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no answer within {} s", LOCALAPI_EXCHANGE.as_secs()),
+            ))
+        });
     match answer {
         Ok(localapi::RestartAnswer::Accepted {
             restart_by,
@@ -1021,7 +1034,20 @@ async fn restart_onto_new_enrollment(
             let wait = localapi::restart_wait(restart_within_s, RESTART_BACK_FLOOR);
             // `caller`: the Scheduled Task's daemon, which the caller starts.
             let start = || async { roomlerd::service::start().map_err(|e| format!("{e:#}")) };
-            match localapi::wait_for_restart(leaving, restart_by == "caller", start, wait).await {
+            // Bounded from outside as well: each of its probes reads an answer
+            // with no deadline of its own.
+            let back = tokio::time::timeout(
+                wait + LOCALAPI_EXCHANGE,
+                localapi::wait_for_restart(leaving, restart_by == "caller", start, wait),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "no new daemon answered within {} s",
+                    wait.as_secs()
+                ))
+            });
+            match back {
                 Ok(pid) => emit(on_event, ProgressEvent::DaemonRestartOk { pid }),
                 Err(why) => skipped(format!("the daemon accepted the restart, but {why}")),
             }
@@ -1044,9 +1070,11 @@ async fn restart_onto_new_enrollment(
 async fn daemon_status(budget: Duration) -> Option<roomler_localapi::NodeStatus> {
     let begun = std::time::Instant::now();
     loop {
-        if let Ok(mut client) = roomler_localapi::connect().await
-            && let Ok(status) = client.status().await
-        {
+        let ask = async {
+            let mut client = roomler_localapi::connect().await.ok()?;
+            client.status().await.ok()
+        };
+        if let Ok(Some(status)) = tokio::time::timeout(LOCALAPI_EXCHANGE, ask).await {
             return Some(status);
         }
         if begun.elapsed() >= budget || crate::CANCEL_REQUESTED.load(Ordering::SeqCst) {
