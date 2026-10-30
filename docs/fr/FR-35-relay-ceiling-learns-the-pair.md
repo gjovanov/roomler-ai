@@ -1,6 +1,30 @@
 # FR-35: The constrained ceiling learns the pair — grow the relay cap on delivery evidence, remember it per peer
 
 Status: **P1 + P2 + P2b shipped (0.4.21 / 0.4.23); P3 (opener growth, opener grace, held NVENC increases) + P3b (grace-until-drained, measured growth, stable==0 write-back) + P3c (stuck detector so a hot seed cannot freeze the opener, + applied_bps self-correction) shipped 0.4.27 → 0.4.30 (#986/#988/#996/#1001/#1004). Field: IDR pulses gone; opener sharp from frame 1 with a healthy seed; no spurious freeze on a fast path (maxGap <130 ms at the 8 M ceiling). REMAINING: the stuck detector needs a path that cannot carry the seed to exercise — handed to the operator as a neo16→overlay A/B (100.65.4.2 reseeded to the 7 M froze-value).** (2026-08-30). Tracking issue: `FR-35` (#922).
+
+**Re-read on the current code (2026-10-27/28 sessions on agent 0.4.177, 0.4.178 and 0.4.181;
+the FR-35 surface — `ceiling_learn.rs`, `rate_memory.rs`, `governor.rs`, `goodput.rs`,
+`encode/mod.rs` — is byte-identical from `agent-v0.4.177` through `agent-v0.4.185` and master; verified
+2026-10-29).** Code-complete; the learner + memory surface was reworked since by FR-59 P3/P6/P8,
+FR-70 P1 and FR-79 V2/V4 (carrier-keyed memory, measured-not-max write-back) — see
+`docs/rate-control.md` § The ceiling learner / § The write-back and the seed. Field (read-only
+`roomler exec` of CORPLAP-2's own daemon log and `rate_memory.json`, seven sessions on
+`100.65.4.2|relay:derp/tcp`): **P1 + P2 are live** — every session opened at 0.85 × the remembered rate
+(4.40–4.76 M ⇒ opener maxrate 3.74–4.05 M vs the 2.55 M cold), the learner stepped on windows that
+carried ≥ 70 % of the ceiling (to 5.15 M in the one 79 s session with motion; one to three times in
+the 11–19 s sessions; never on the idle one) and the ceiling never passed 5.15 M under `hi` 8 M;
+`send_stalls=0` in every heartbeat of the four sessions read in full. **Three corrections to the first
+(unverified) read of these sessions:** (1) none of them ran 0.4.179; (2) the CARRIED gate counts bytes
+*written* to the data channel and does not read the FR-79
+verdict, so one step per session can land inside the opener burst (10-28 07:57:43, 0.36 s before the
+grace ended, after a 164 ms blocked send); (3) the pair is not "settling at a sustainable ~5 M" — the
+memory sits at 4.4–4.8 M because an **idle** session writes its own seed back as evidence
+(`stable_bps()` is a target hold, not a measurement) and V4's `damp` takes half of that gap (−7.5 %
+per idle session), while a proving session moves it a tenth of its gap (+0.2 %). The 09:23 session
+carried 6–7.6 Mbps windows with sub-ms send waits. **Open for close:** AC1 (the write-back question
+above, then a driven measurement), AC2/AC6 (a relay-locked pair — none reachable from neo16 on
+2026-10-29, CORPLAP-1/2/3 all ride `direct` — plus a kill-switch daemon restart for AC6), AC3 (a
+60 s drag), AC4 (a ~2 Mbps relay-locked host on the current code).
 Child of the RC-quality program. Follows FR-31 (every opening and repair number on an NVENC relay
 session is proportional to `maxrate`, and nothing ffmpeg exposes changes that) and the parked
 measured-rate line (#678: a sender cannot see capacity it is not using). Operator's directive
@@ -72,15 +96,41 @@ shipped defaults:
 
 - [ ] opening keyframe ≥ 2.5× today's bytes (≥ 14 KB at 1920×1200, today 5.6 KB) and first-light
       sharpness ≥ 70 % of the 8 s steady state (today 47 %)
-- [ ] time-to-crisp ≤ 0.6 s (today 1.2 s)
-- [ ] a 60 s drag: no send wait > 1 s, viewer-age p99 not worse than the FR-18 numbers, and the
-      ceiling never above `hi`
-- [x] a ~2 Mbps relay (CORPLAP-3, `av1_qsv`): `target_bps` never exceeds the nominal unless every growth
+- [ ] time-to-crisp ≤ 0.6 s (today 1.2 s) — needs a relay-locked pair and a driven instrumented
+      viewer session (a cold-vs-seeded A/B); not measurable from the agent-side heartbeat. No pair
+      from neo16 relayed on 2026-10-29 (CORPLAP-1/2/3 all `direct`)
+- [~] a 60 s drag: no send wait > 1 s, viewer-age p99 not worse than the FR-18 numbers, and the
+      ceiling never above `hi` — **the ceiling half is met**: never above 5,146,238 across seven
+      sessions (10-27/28, CORPLAP-2 `relay:derp/tcp`, 0.4.177–0.4.181) and bounded by construction
+      (`ceiling_learn.rs:237`, `.min(hi)`); **the drag itself was never driven**, so the send-wait
+      and viewer-age halves are unexercised — what was seen without a drag (four sessions read in
+      full): `send_stalls=0`, `send_wait_max_ms` ≤ 163.9 (the opener), paint age p50 66–68 /
+      p95 103–117 / max 775 ms. The FR-18 numbers to beat under drag (0.4.10, CORPLAP-3 relay):
+      `send_wait` p99 200 ms / max 1 778 ms, viewer age max 2 185 ms — the undriven sessions sit
+      under them, but that is not the same test
+- [ ] a ~2 Mbps relay (CORPLAP-3, `av1_qsv`): `target_bps` never exceeds the nominal unless every growth
       gate passed — read from its heartbeats; the session must not get worse than today
-      (0.4.21, 2026-08-29: no learner steps, `learned_ceiling_bps=0`, target ≤ 3.0 Mbps, 65–78 ms)
+      (0.4.21, 2026-08-29: no learner steps, `learned_ceiling_bps=0`, target ≤ 3.0 Mbps, 65–78 ms).
+      The 0.4.21 control predates the FR-59/70/79 rework and CORPLAP-3 rides `direct` on 2026-10-29;
+      a current-code control also has to read the CARRIED gate against the opener burst (see the
+      2026-10-28 field row: one step inside the grace)
 - [x] the learned rate survives a daemon restart and expires after 7 days (unit-tested; the file is
-      `…systemprofileAppDataRoamingoomleroomlerdataate_memory.json` for the SYSTEM service)
-- [ ] `relay_ceiling_learn=false` restores today's numbers byte-for-byte
+      `…\config\systemprofile\AppData\Roaming\roomler\roomler\data\rate_memory.json` for the SYSTEM
+      service). **Restart survival field-read 2026-10-29** on CORPLAP-2: the seed chain 4,750,677 →
+      4,759,961 → 4,402,963 → 4,411,567 was written at one session's end and read back at the next
+      across the 13:41Z (0.4.177 → 0.4.178), 18:01Z, 22:56Z (10-27) and 06:56Z (10-28, → 0.4.181)
+      service restarts; the file at that path holds carrier-keyed entries with `at_unix`. The 7-day
+      expiry is the unit test the criterion names (`rate_memory.rs`:
+      `round_trips_through_the_file_and_seeds_fresh_entries_only`, `record_replaces_and_prunes`); not
+      observed in the field
+- [ ] `relay_ceiling_learn=false` restores today's numbers byte-for-byte — needs a kill-switch A/B that
+      restarts a relay-locked host's daemon (config `relay_ceiling_learn` applies on restart): an
+      operator-scheduled run on a host nobody is using
+- [x] **Docs** — the ceiling learner (P1) and the per-peer memory (P2) are documented in
+      `docs/rate-control.md` (§ The ceiling learner / § The write-back and the seed) with a mermaid of
+      the learner's per-window decision, a gate/anchor table, what CARRIED and DECREASE actually
+      measure, the config rows and the 2026-10-27/28 field rows, and the page's `docs/README.md` row
+      names the section (#3013; operator rule, 2026-09-05: docs before close)
 
 ## Open decisions
 
@@ -121,3 +171,5 @@ levers); the direct path's measured clamp.
 | 2026-08-29 | agent 0.4.18 (CORPLAP-2), env `FFMPEG_MAXRATE_KBPS=25500`, web `v20260829-40e8fc071129` | P0: the table above. Two daemon restarts on CORPLAP-2 (apply, restore) via a scheduled task; env cleared afterwards. |
 | 2026-08-29 | agent 0.4.21 (CORPLAP-2 `av1_nvenc`, CORPLAP-3 `av1_qsv`), web `v20260829-0da90b766dc0` | **First field run.** P1 steps logged and gated on CORPLAP-2: `3.0 → 3.19 → 3.39 Mbps` (marquee), `3.0 → 3.19 → 3.39 → 3.60` (window drag, carried 2.1–2.8 Mbps at 66–80 ms); ≈3 steps per minute of sustained drag. P2 seeds: next session opened at `maxrate = 0.85 × remembered` (3.386 → 2.879, 3.598 → 3.059). Opening keyframe on the seeded sessions: 8.0 / 8.4 / 22.9 / 19.5 KB vs 5.7–6.4 KB baseline — but two later seeded sessions at 2.6 Mbps opened at 5.9 KB, so the opener also tracks screen content and the criterion is not yet met. **Defect**: a 14-s idle session wrote its own seed back as the "stable rate" (3.598 → 3.059) — the memory decays 15 % per idle session; fixed in P2b (`record_session`: a lower value needs a decrease). Age gate 1.5× vetoed the evidence windows (66–80 ms over a 43 ms floor) → 2×. CORPLAP-3 negative control clean. |
 | 2026-08-30 08:19–08:21 UTC | agent 0.4.26 (CORPLAP-2 `av1_nvenc`, DERP relay), web `v20260830-6a166a1ec9f7` | **Seeded-opener A/B, same screen a minute apart** (memory hand-seeded at 7 Mbps from P0). Baseline 3.0 Mbps: a ~0 KB black keyframe, the desktop as ONE 221 KB inter frame at +176 ms, first painted sample already at steady sharpness, one keyframe in 12 s. Seeded 5.95 Mbps: 30 KB keyframe (50 % sharpness) → 172 KB P → first light 200 ms earlier, 90 % of steady within ~190 ms — but a **×0.85 decrease inside 1.8 s** (`send_wait_max 367 ms`, 73 backpressure skips — the opener draining) and then **three AIMD climb-back steps at 5-s spacing, each an in-place NVENC reconfigure = a starved IDR** (166 KB at +0.3 s, 222 KB at +5.3 s; sharpness dipped to 91 % at +5.4 s). Also measured: the opener burst drained at ≈ 8 Mbps — the P0 number, now free. ⚠️ Windows PowerShell's `Set-Content -Encoding UTF8` writes a BOM that serde rejects (the memory read as EMPTY until rewritten BOM-free). |
+| 2026-10-27 09:23, 15:27, 16:31 UTC | agent **0.4.177** (09:23) and **0.4.178** (15:27, 16:31) — CORPLAP-2 `av1_nvenc` 1920×1200 over `relay:derp/tcp` (DERP rtt 106–258 ms); read 2026-10-29, read-only `roomler exec` of the host's log | **Current-code re-read, corrected** (the first read of these sessions, made 10-27, labelled them 0.4.179; the host took 0.4.178 at 13:41Z and 0.4.179 at 18:01Z — service log). **09:23 (79 s, motion then idle):** seed 4,750,677 ⇒ opener 4,038,075; opener burst 496,887 B at 0 ms wait; steps 4.04 → 4.29 (09:23:26.0) → 4.56 (:31.1) → 4.84 (:37.2) while the 2 s heartbeats carried 6.2 / 6.3 / 4.4 / 7.6 Mbps at 32–53 fps; then 45 s of an idle desktop at 0.28–0.35 Mbps / 18 fps with the ceiling held at 4.84 M (not carried ⇒ no step); 09:24:25 the FR-59 P3 viewer bound clamped `target_bps` 4,843,519 → 4,116,975 (90 % of a 4.57 M arrival report) with `learned_ceiling_bps` unchanged — a `set_ceiling` clamp counts as no decrease (`aimd.rs:188`), so the learner's 10 s clean window did not restart; the AIMD climbed back +302,719 per 5 s and the learner stepped to 5.15 M at 09:24:34.8 on a 6.4 Mbps window. `send_stalls=0`; `send_wait_max_ms` 52.444 in the heartbeat holding the opener's tail and the first step, 0.057–0.50 in all 36 others; paint age p50 68 / p95 117 / max 130 ms over a 45–50 ms floor. Write-back `Some(4843519) → kept 4759961` (+0.2 %, `ALPHA_UP`). **15:27 (130 s, idle):** seed 4,759,961 ⇒ opener 4,045,966; a 405-byte opener, then 0.16–0.25 Mbps at 18 fps (`max_qp` 14); no step, no decrease; write-back `Some(4045966) → kept 4402963`: **the session's own seed written back as evidence, −7.5 %** (`stable_bps()` = the target hold, V4 `ALPHA_DOWN`). **16:31 (13 s):** seed 4,402,963 ⇒ opener 3,742,518; one step to 3.98 M; `None → 4402963` (nothing held 10 s). The memory survived the 13:41Z service restart between the first two sessions (AC5). |
+| 2026-10-28 07:57, 12:38, 16:46, 16:46 UTC | agent **0.4.181** (service started 06:56Z) — same pair; read 2026-10-29 | Four more sessions, all seeded 4,402,963 ⇒ opener 3,742,518. **07:57 (19 s):** opener 697,527 B that blocked a send **163.9 ms**; the first step 3.74 → 3.98 M logged at 07:57:43.33 — **0.36 s before "opener grace over" (07:57:43.69)**: the CARRIED gate counts bytes written to the channel (`governor.rs:1004`) and `on_window` does not read the FR-79 verdict (`governor.rs:1388`), so the opener burst was the carrying window; two more steps to 4.49 M on 4.7–7.3 Mbps windows; `None` written. **12:38 (11 s), 16:46:11 (13 s):** one step each, `None`. **16:46:31 (90 s):** steps 3.74 → 3.98 → 4.22 → 4.49 M during 12 s of motion (3.1–7.4 Mbps), then 60 s idle at 0.35–0.77 Mbps with no step; `send_wait_max_ms` ≤ 0.57, `send_stalls=0`, paint age p50 67 / p95 111 ms (one 438 ms first report); write-back `Some(4489010) → kept 4411567` (+0.2 %). `rate_memory.json` on 2026-10-29: `100.65.4.2\|relay:derp/tcp` = 4,411,567 at `at_unix` 1793206081 (2026-10-28T16:48:01Z), plus three bare-address entries from browser-viewer sessions. **Reading for AC1:** the memory is held at 4.4–4.8 M by the write-back's dynamics (an idle session −7.5 %, a proving session +10 % of its gap), not by a measured limit — these sessions carried 6–7.6 Mbps windows at sub-ms send wait and P0 measured 6–9 M sustained. No daemon restarted, no input driven; the operator's console was signed in. On 2026-10-29 the pair rides `direct`, so no relay read is possible until it relays again. |

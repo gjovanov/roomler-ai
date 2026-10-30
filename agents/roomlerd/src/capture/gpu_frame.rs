@@ -45,23 +45,9 @@ use windows::core::Interface;
 /// in flight; a texture beyond it is released rather than kept.
 const POOL_KEEP: usize = 6;
 
-/// FR-118 P2 — the kill switch: `ROOMLERD_ZERO_COPY` (config `zero_copy`),
-/// default OFF. A capture backend reads it once, when it opens, and delivers
-/// GPU frames only while it is on.
-pub fn zero_copy_enabled() -> bool {
-    zero_copy_from(tunnel_core::env::node_env("ZERO_COPY").as_deref())
-}
-
-/// `1`, `true`, `yes` or `on`, in any case, turn it on; anything else leaves
-/// it off.
-fn zero_copy_from(value: Option<&str>) -> bool {
-    value.is_some_and(|v| {
-        let v = v.trim();
-        ["1", "true", "yes", "on"]
-            .iter()
-            .any(|on| v.eq_ignore_ascii_case(on))
-    })
-}
+/// FR-118 P2 — the kill switch, `ROOMLERD_ZERO_COPY` (config `zero_copy`). It
+/// lives in `capture` since P5 gave macOS the same switch.
+pub use super::zero_copy_enabled;
 
 /// FR-118 P3 — the encoders whose GPU-input form the capability probe proved,
 /// as the capture side sees them: the same list `encode::ffmpeg::gpu_input`
@@ -442,19 +428,6 @@ mod tests {
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice,
     };
-
-    /// The switch is off unless it says on: unset, empty, `0` and anything
-    /// unrecognised all leave a host on today's path.
-    #[test]
-    fn the_zero_copy_switch_is_off_unless_it_says_on() {
-        for on in ["1", "true", "TRUE", "yes", "On", " on "] {
-            assert!(zero_copy_from(Some(on)), "{on:?} turns it on");
-        }
-        for off in ["0", "false", "no", "off", "", "2", "enabled"] {
-            assert!(!zero_copy_from(Some(off)), "{off:?} leaves it off");
-        }
-        assert!(!zero_copy_from(None));
-    }
 
     /// P3 — the capture's device goes where the first proven GPU-input cell
     /// lives, in the order every codec's cascade opens backends: NVENC, QSV,

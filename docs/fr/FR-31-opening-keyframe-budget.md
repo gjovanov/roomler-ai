@@ -60,7 +60,7 @@ Two things this is NOT, both refuted by data rather than assumed:
    driver. That is what the A/B has to establish.
 
 The runtime side already works: the agent's `set_bitrate`
-(`encoder.rs:1724-1761`) writes `rc_max_rate` / `rc_buffer_size` on the open context and
+(`encoder.rs:1736-1773`) writes `rc_max_rate` / `rc_buffer_size` on the open context and
 ffmpeg's reconfigure path (`nvenc.c:2985-3001`) applies both via `NvEncReconfigureEncoder`
 before the next frame — the `if (avctx->rc_buffer_size > 0 && vbvBufferSize != rc_buffer_size)`
 branch is unconditional on `cq`. Consequence worth writing down: **from the first AIMD step
@@ -75,7 +75,7 @@ faster, so the same starvation is over in ~0.3 s.
 
 **P1 — make the intended reservoir reach the driver before frame 0 (NVENC).** Right after
 `build_encoder` returns an opened NVENC context (the constructor funnel at
-`encoder.rs:1077-1123`, the `Ok(encoder)` arm), write `rc_buffer_size = open_vbv_bits` on the
+`encoder.rs:1085-1131`, the `Ok(encoder)` arm), write `rc_buffer_size = open_vbv_bits` on the
 context, exactly as `set_bitrate` does; ffmpeg's reconfigure applies it on the first
 `send_frame`, before the opening IDR is encoded. `open_vbv_bits = buf × pct / 100`, where `buf`
 is the same HRD window `encoder_options` already computes (`maxrate × hrd_pct / 100`; AV1 is

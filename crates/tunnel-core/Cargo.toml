@@ -228,3 +228,6 @@ overlay-netstack = ["overlay", "dep:smoltcp"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+# FR-68 AC9 — captures the overlap WARN `own_adapters::register` emits, so the
+# test asserts the line an operator would read rather than only the decision.
+tracing-subscriber = { workspace = true }
