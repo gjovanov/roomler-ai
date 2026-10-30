@@ -116,8 +116,10 @@ case "$TARGET" in
       docker exec "$CONTAINER" rm -f /tmp/rc-shadow-seed.ejson
     fi
     mapfile -d '' EARGS < <(docker_env_args)
-    docker exec "${EARGS[@]+"${EARGS[@]}"}" "$CONTAINER" mongosh --nodb --quiet /tmp/rc-shadow-report.js
-    docker exec "$CONTAINER" rm -f /tmp/rc-shadow-report.js
+    rc=0
+    docker exec "${EARGS[@]+"${EARGS[@]}"}" "$CONTAINER" mongosh --nodb --quiet /tmp/rc-shadow-report.js || rc=$?
+    docker exec "$CONTAINER" rm -f /tmp/rc-shadow-report.js || true
+    exit "$rc"
     ;;
 
   kubectl)
