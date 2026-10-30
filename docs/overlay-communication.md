@@ -162,25 +162,28 @@ Two consequences worth knowing:
   with a *different* address. To remove a device for good, delete it. There is
   deliberately no per-machine overlay denylist.
 
-### Pre-release gaps are ACCEPTED — don't "fix" them
+### Pre-release gaps: reclaimed through `release_host`, never by hand (FR-47 P3)
 
 Every device removed *before* the release mechanism shipped (2026-07-29) burned
 its host number with nothing to hand it back, so a long-lived tenant's cursor
-sits above its live-node count with holes below. The fleet tenant is the worked
+sits above its live-node count with holes below. The fleet tenant was the worked
 example: `next_host = 33`, 14 live nodes, and 16 numbers (`.3 .5 .8–.13
-.16–.23`) that belong to no row at all.
+.16–.23`) that belonged to no row at all.
 
-**This is expected and deliberately not reclaimed.** Those numbers aren't
-attached to any document, so eviction cannot reach them — recovering them means
-writing `free_hosts` directly, which bypasses every guard in `release_host` (the
-`next_host: {$gt: host}` sanity filter, the `$addToSet` dedup, the CAS release
-token) for a `/10` that holds 4.19 M addresses. The pool already stops *new*
-leaks, so the win is cosmetic.
-
-If a tenant ever does churn enough for the cursor to matter, do it properly: an
-admin-triggered reconcile that computes `(1..next_host) − live − pooled`
-server-side and returns each number through `release_host`, so the guards still
-apply. Not a hand-rolled database update.
+Those numbers aren't attached to any document, so eviction cannot reach them,
+and writing `free_hosts` directly would bypass every guard in `release_host`:
+the `next_host: {$gt: host}` sanity filter, the `$addToSet` dedup and the
+pool's size cap. On a carved `/22` (1 022 addresses, not the `/10`'s 4.19 M)
+the holes are no longer cosmetic, so FR-47 P3 recovers them the guarded way.
+`POST /api/tenant/{tid}/overlay-block/reconcile-hosts`
+([`overlay_block.rs:1139`](../crates/modules/network/src/routes/overlay_block.rs#L1139))
+computes `(1..next_host) − live − pooled` server-side and returns each number
+through `release_host`, so every guard still applies. It is platform-operator
+only, and anyone else gets a 404. It is a dry run unless the body says
+`{"dry_run": false}`. Run on production on 2026-08-31, it released exactly 17
+ordinals in the oldest org and refused none, and a second dry run read
+`orphaned: []` ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486189495)).
+Run it again a month later to tell a historical leak from a live one.
 
 Because addresses are reused, the client keys every routing teardown by
 **pubkey**, never by address, and drops an OS `/32` only when no surviving peer
