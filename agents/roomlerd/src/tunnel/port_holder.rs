@@ -90,7 +90,7 @@ pub fn note_ok(route: &str) {
 /// Who holds a listening port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Holder {
-    /// This very process — a listener no flow owns.
+    /// This very process — one of its own listeners (on 0.4.189, a flow its route lost: #1035).
     ThisDaemon { pid: u32 },
     /// A live process (`image` when it could be read).
     Alive { pid: u32, image: Option<String> },
@@ -105,8 +105,8 @@ pub enum Holder {
 pub fn describe(h: &Holder) -> String {
     match h {
         Holder::ThisDaemon { pid } => format!(
-            "held by this daemon itself (pid {pid}) — a listener no flow owns; restarting the \
-             service frees it (#1035)"
+            "held by this daemon itself (pid {pid}) — one of its own listeners (`roomler flows` \
+             names the flow if one is bound there); restarting the service frees it (#1035)"
         ),
         Holder::Alive { pid, image } => {
             let name = image.as_deref().unwrap_or("(image not readable)");

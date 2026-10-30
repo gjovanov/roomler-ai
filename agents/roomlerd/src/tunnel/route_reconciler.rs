@@ -580,8 +580,27 @@ impl RouteReconciler {
         {
             let mut runtime = self.inner.runtime.lock().unwrap();
             if enabled {
-                // A re-enable resets Failed/backoff to a fresh Pending.
-                runtime.insert(id.to_string(), RouteRuntime::fresh());
+                // A re-enable resets Failed/backoff to a fresh Pending, but
+                // never resets over a HEALTHY `Live` entry (#1035). One is
+                // there when the route was already enabled and live, and when
+                // a reconcile pass ran during the persist above: the flag
+                // flipped before it, so the pass created the route's flow.
+                // Resetting over it orphans that flow — the hub keeps it and
+                // its bound port, every later create is refused the port
+                // (10048), and only a daemon restart clears it. A `Live` entry
+                // whose flow failed permanently reads `Failed`, so the
+                // re-enable clears it like one: retire the flow, start fresh.
+                let healthy_live = matches!(
+                    runtime.get(id),
+                    Some(RouteRuntime::Live { flow_id })
+                        if self.inner.hub.flow_fatal(flow_id).is_none()
+                );
+                if !healthy_live {
+                    let previous = runtime.insert(id.to_string(), RouteRuntime::fresh());
+                    if let Some(RouteRuntime::Live { flow_id }) = previous {
+                        self.inner.hub.kill_flow(&flow_id);
+                    }
+                }
             } else if let Some(RouteRuntime::Live { flow_id }) = runtime.remove(id) {
                 self.inner.hub.kill_flow(&flow_id);
             }
@@ -1142,5 +1161,118 @@ mod tests {
         // …re-enable → fresh Pending (Failed cleared).
         assert!(r.set_enabled("a", true).await.unwrap());
         assert_eq!(r.list()[0].state, RouteState::Pending { flow_id: None });
+    }
+
+    /// #1035 — `route enable` on a route that is already enabled and live
+    /// keeps its flow. It used to reset the entry to a fresh `Pending` over
+    /// the flow: the hub kept the flow and its bound port, the next pass made
+    /// a second flow for the same port (refused with 10048 on a real host,
+    /// where the first one holds it), and the route read `backoff` until the
+    /// daemon restarted.
+    #[tokio::test]
+    async fn reenabling_a_live_route_keeps_its_flow() {
+        let [p] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p, true)]);
+        r.reconcile_pass().await;
+        let flow = route_flow(&r, "a");
+
+        assert!(r.set_enabled("a", true).await.unwrap());
+        r.reconcile_pass().await;
+
+        assert_eq!(route_flow(&r, "a"), flow, "the route still owns its flow");
+        let flows = r.inner.hub.flows_snapshot();
+        assert_eq!(flows.len(), 1, "no second flow for the port: {flows:?}");
+    }
+
+    /// #1035, the field shape: a watchdog's bounce (`disable`, 2 s,
+    /// `enable`), which orphaned a flow twice in 45 minutes on 0.4.189. The
+    /// enable flips the in-memory flag BEFORE it persists, so a pass that
+    /// runs while the persist waits on the config lock creates the route's
+    /// flow, and the enable must keep that flow when it resumes. The field
+    /// log had `reconciled into a live flow` BEFORE `enabled=true`, then a
+    /// 10048 on every create.
+    #[tokio::test]
+    async fn a_pass_during_a_reenable_does_not_orphan_the_flow_it_creates() {
+        let [p] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p, true)]);
+        r.reconcile_pass().await;
+        let before = route_flow(&r, "a");
+        assert!(r.set_enabled("a", false).await.unwrap());
+        assert!(!r.inner.hub.has_flow(&before));
+
+        // Hold the config write lock, so the re-enable parks inside persist().
+        let held = r.inner.cfg_lock.lock().await;
+        let enabling = {
+            let r = r.clone();
+            tokio::spawn(async move { r.set_enabled("a", true).await })
+        };
+        for _ in 0..1000 {
+            if r.inner.routes.lock().unwrap()[0].enabled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            r.inner.routes.lock().unwrap()[0].enabled,
+            "the re-enable flipped the flag before persisting"
+        );
+        assert!(!enabling.is_finished(), "and is parked on the config lock");
+
+        // The tick lands in that window: the pass creates the route's flow.
+        r.reconcile_pass().await;
+        let created = route_flow(&r, "a");
+
+        drop(held);
+        assert!(enabling.await.unwrap().unwrap());
+        r.reconcile_pass().await;
+
+        assert_eq!(
+            route_flow(&r, "a"),
+            created,
+            "the route kept the flow the pass created"
+        );
+        let flows = r.inner.hub.flows_snapshot();
+        assert_eq!(
+            flows.len(),
+            1,
+            "one flow for the port, no orphan: {flows:?}"
+        );
+        assert_eq!(flows[0].id, created);
+        assert!(
+            crate::config::load(&r.inner.config_path)
+                .unwrap()
+                .tunnel_routes[0]
+                .enabled,
+            "and the re-enable was persisted"
+        );
+    }
+
+    /// #1035's guard keeps only a HEALTHY `Live` entry. A route whose flow
+    /// failed permanently reads `Failed`, and re-enabling it still clears
+    /// that: the failed flow is retired and the route starts fresh.
+    #[tokio::test]
+    async fn reenabling_a_route_whose_flow_failed_retires_the_flow() {
+        let [p] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p, true)]);
+        r.reconcile_pass().await;
+        let failed = route_flow(&r, "a");
+        r.inner
+            .hub
+            .flow_live_for_test(&failed)
+            .unwrap()
+            .note_fatal("enrollment revoked".into());
+        assert!(matches!(r.list()[0].state, RouteState::Failed { .. }));
+
+        assert!(r.set_enabled("a", true).await.unwrap());
+        assert!(!r.inner.hub.has_flow(&failed), "the failed flow is retired");
+        assert_eq!(r.list()[0].state, RouteState::Pending { flow_id: None });
+
+        r.reconcile_pass().await;
+        assert_ne!(
+            route_flow(&r, "a"),
+            failed,
+            "a new flow, not the failed one"
+        );
+        assert_eq!(r.inner.hub.flows_snapshot().len(), 1);
     }
 }

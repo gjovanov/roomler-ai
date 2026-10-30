@@ -722,6 +722,20 @@ Locked by lib tests, each shown red with a one-line negative control (`// NC86A`
 | `tunnel::client_mgr::tests::a_client_connecting_before_any_carrier_is_held_and_released_by_kill_flow` | the daemon path: `create_forward` binds before any session; a client is held while the flow reads `connecting`; `kill_flow` releases it and unbinds | NC86B · NC86E |
 | `tunnel_tests::agent_daemon_originated_forward_reaches_target` (integration) | the real daemon-originated flow accepts a client while its open is in flight, and `kill_flow` releases it | NC86B |
 
+⚠️ **A route never drops a flow it still has (#1035).** Because the listener belongs to the
+flow, a route that loses track of its flow leaves the port bound with nothing managing it.
+Every later create is refused the port (10048), `route disable` cannot stop the flow, and
+only a daemon restart frees it. `route enable` used to reset the route's entry to a fresh
+`Pending` unconditionally. That reset landed over a healthy flow when the route was already
+live. It also landed over the flow a reconcile pass had just created, when that pass ran
+inside the enable's own config persist; the in-memory flag flips before the persist. On
+0.4.189 a watchdog's disable → 2 s → enable hit that second case twice in 45 minutes. The
+re-enable now keeps a healthy `Live` entry, and retires only a flow that failed permanently
+(`RouteReconciler::set_enabled`). Locked by `route_reconciler::tests::reenabling_a_live_route_keeps_its_flow`,
+`…a_pass_during_a_reenable_does_not_orphan_the_flow_it_creates` (which holds `cfg_lock` to
+open the window) and `…reenabling_a_route_whose_flow_failed_retires_the_flow`. Each fails
+on the old code; the second ends in the field's exact `backoff … os error 10048`.
+
 ### Re-upgrade: probe → promote → drain (FR-86 P2)
 
 P1 makes a second carrier able to open beside the first. P2 uses that: a **declared

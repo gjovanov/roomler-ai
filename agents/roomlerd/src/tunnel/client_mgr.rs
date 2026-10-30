@@ -3065,4 +3065,13 @@ mod tests {
         }
         assert!(rebound, "its port is unbound");
     }
+
+    /// Test seam: the supervisor's P6 stop on a PERMANENT failure, which sets
+    /// `fatal` and leaves the retry loop (the route reconciler's tests). At
+    /// the end of the test module, so it moves no line a doc anchors to.
+    impl FlowLive {
+        pub(crate) fn note_fatal(&self, reason: String) {
+            *self.fatal.lock().unwrap() = Some(reason);
+        }
+    }
 }
