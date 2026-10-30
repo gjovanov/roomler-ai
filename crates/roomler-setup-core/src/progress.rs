@@ -139,6 +139,22 @@ pub enum ProgressEvent {
     #[serde(rename_all = "camelCase")]
     AnchorSkipped { reason: String },
 
+    /// #3116 — a Windows reinstall: the daemon the installer restarted loaded
+    /// the config from before it, so it is asked to restart onto the one this
+    /// install just wrote, as `install.sh` restarts the Linux unit. A remote
+    /// session to the device drops for a few seconds.
+    DaemonRestartStarted,
+    /// #3116 — the daemon runs on the new enrollment; `pid` is the process
+    /// that answered, when it said.
+    #[serde(rename_all = "camelCase")]
+    DaemonRestartOk { pid: Option<u32> },
+    /// #3116 — the daemon was not restarted onto the new enrollment. Never
+    /// fatal: the config is written, and no startup save of the running daemon
+    /// writes over it (`config::StartupWrites`), so the enrollment takes effect
+    /// at its next start. `reason` says why, and what to do.
+    #[serde(rename_all = "camelCase")]
+    DaemonRestartSkipped { reason: String },
+
     /// FR-129 B1 — a half of the embedded `install.sh` started (a daemon
     /// role on Linux or macOS). `half` is `privileged` or `user`; `tool` is
     /// what runs it: `pkexec` or `osascript` (the desktop's own administrator
@@ -347,6 +363,27 @@ mod tests {
         );
         assert!(
             skipped.contains(r#""reason":"the administrator prompt was declined""#),
+            "got {skipped}"
+        );
+    }
+
+    /// #3116 — the restart onto a reinstall's enrollment, as the SPA reads it.
+    #[test]
+    fn daemon_restart_events_serialise_as_the_spa_reads_them() {
+        let ok =
+            serde_json::to_string(&ProgressEvent::DaemonRestartOk { pid: Some(4242) }).unwrap();
+        assert!(ok.contains(r#""type":"DaemonRestartOk""#), "got {ok}");
+        assert!(ok.contains(r#""pid":4242"#), "got {ok}");
+        let skipped = serde_json::to_string(&ProgressEvent::DaemonRestartSkipped {
+            reason: "the service declined".to_string(),
+        })
+        .unwrap();
+        assert!(
+            skipped.contains(r#""type":"DaemonRestartSkipped""#),
+            "got {skipped}"
+        );
+        assert!(
+            skipped.contains(r#""reason":"the service declined""#),
             "got {skipped}"
         );
     }

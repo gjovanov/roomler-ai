@@ -44,6 +44,9 @@
 //! 5. A refresh of the same org that the server answered with ANOTHER device
 //!    row does not keep the WireGuard key the previous row still claims
 //!    ([`Enrolled::previous_row`], F3).
+//! 6. A config this process may not read at all is closed to it, not
+//!    damaged: the fold stops there, before the enroll spends the token
+//!    ([`read_existing`]'s `Err`, #3116).
 
 use std::path::Path;
 
@@ -74,25 +77,35 @@ pub struct Existing {
 /// load is recovered from its last good copy when that one loads, kept aside
 /// either way, and said — never silently "absent", which would write a fresh
 /// config over the device's settings ([`roomlerd::config::read_merge_base`]).
-pub fn read_existing(path: &Path) -> Existing {
+///
+/// #3116 — `Err` when this process may not read the path at all: the file is
+/// closed to it, not damaged, so it is neither recovered nor kept aside, and
+/// the caller stops before the enroll spends the token on a config it could
+/// not write either. The text says what was found; the caller adds what to do,
+/// which is per platform.
+pub fn read_existing(path: &Path) -> Result<Existing, String> {
     match roomlerd::config::read_merge_base(&path.to_path_buf()) {
-        MergeBase::Absent => Existing {
+        MergeBase::Absent => Ok(Existing {
             cfg: None,
             warning: None,
-        },
-        MergeBase::Loaded(cfg) => Existing {
+        }),
+        MergeBase::Loaded(cfg) => Ok(Existing {
             cfg: Some(cfg),
             warning: None,
-        },
+        }),
         MergeBase::Unreadable { reason, recovered } => {
             let kept = roomlerd::config::keep_unreadable(path).map_err(|e| e.to_string());
             let warning =
                 roomlerd::config::describe_unreadable(path, &reason, recovered.is_some(), &kept);
             tracing::warn!(path = %path.display(), %reason, recovered = recovered.is_some(), "the existing config does not load");
-            Existing {
+            Ok(Existing {
                 cfg: recovered,
                 warning: Some(warning),
-            }
+            })
+        }
+        MergeBase::Denied { reason } => {
+            tracing::warn!(path = %path.display(), %reason, "the existing config may not be read by this process");
+            Err(roomlerd::config::describe_denied(path, &reason))
         }
     }
 }
@@ -334,16 +347,16 @@ mod tests {
         let path = dir.path().join("config.toml");
 
         // Nothing there, and a config that loads: no word.
-        let none = read_existing(&path);
+        let none = read_existing(&path).unwrap();
         assert!(none.cfg.is_none() && none.warning.is_none());
         roomlerd::config::save(&path, &existing()).unwrap();
-        let fine = read_existing(&path);
+        let fine = read_existing(&path).unwrap();
         assert!(fine.cfg.is_some() && fine.warning.is_none());
 
         // A second save keeps the first as `.prev`; then a hand edit breaks it.
         roomlerd::config::save(&path, &existing()).unwrap();
         std::fs::write(&path, "overlay_enabled = ture\n").unwrap();
-        let broken = read_existing(&path);
+        let broken = read_existing(&path).unwrap();
         let warning = broken.warning.expect("said");
         assert!(warning.contains("could not be read"), "{warning}");
         assert!(warning.contains("config.toml.prev"), "{warning}");
@@ -359,7 +372,7 @@ mod tests {
 
         // No last good copy: said, kept, and nothing to fold into.
         std::fs::remove_file(dir.path().join("config.toml.prev")).unwrap();
-        let lost = read_existing(&path);
+        let lost = read_existing(&path).unwrap();
         assert!(lost.cfg.is_none());
         assert!(
             lost.warning.expect("said").contains("do not carry over"),

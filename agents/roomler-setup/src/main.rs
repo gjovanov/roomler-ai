@@ -141,6 +141,8 @@ fn main() {
             // "I've run it".
             commands::cmd_setup_features,
             commands::cmd_privileged_half_done,
+            // #3116 — the Welcome page's elevation gate.
+            commands::cmd_system_context_needs_elevation,
         ])
         .run(tauri::generate_context!())
         .expect("error while running roomler-setup");
