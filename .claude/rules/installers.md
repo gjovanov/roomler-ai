@@ -8,6 +8,10 @@ paths:
   - "agents/roomler-desktop/packaging/**"
   - "crates/modules/fleet/src/setup_release.rs"
   - "crates/modules/fleet/src/agent_release.rs"
+  - "agents/roomlerd/Cargo.toml"
+  - "agents/roomler-desktop/Cargo.toml"
+  - "scripts/install.sh"
+  - "scripts/deb-bare-check.sh"
 ---
 
 # Installation and packaging
@@ -41,3 +45,16 @@ off the UAC prompt.
 `agents/roomler-tunnel-installer` (rc.59) were retired in P4c-2. The tunnel CLI's
 `self-update` is **kept** — it is the sole updater for tunnel-only hosts ("one
 updater" is per-role; daemon hosts get `roomler.exe` refreshed by the MSI).
+
+⚠️ **A `.deb` can install cleanly and not start** (#3204). Any edit to a package's
+`depends` goes through `scripts/deb-bare-check.sh` on the real package; a hand-written
+package list proves nothing about what `depends` resolves to. The ALSA dependency is
+`libasound2t64 (>= 1.0.29) | libasound2 (>= 1.0.29)`, and it is not a candidate for
+simplifying: unversioned, a stub that lacks the daemon's symbols satisfies it, and
+`libasound2 (>= …)` alone cannot replace that stub. Every spelling was measured
+(`docs/installation.md`, "What a bare host needs").
+
+⚠️ **Never a bare `apt-get -f install` on the daemon's path.** When it cannot reach a
+dependency it removes the package and exits 0: over a working install that deletes a
+running daemon. `deb_install` in `scripts/install.sh` names the package, so apt
+refuses instead.

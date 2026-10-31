@@ -654,8 +654,13 @@ jobs:
         # The binary is a 22.04 build (glibc 2.34) that links libvpx.so.7; 24.04
         # ships only libvpx.so.9, so this proves the bundled libvpx.so.7 + FFmpeg
         # make the .deb self-contained on 24.04 (22.04 works trivially — native
-        # libvpx7 + lower glibc). Only the declared `depends` are installed; the
-        # bundle is reached via LD_LIBRARY_PATH (the .deb wires it via RPATH).
+        # libvpx7 + lower glibc). The bundle is reached via LD_LIBRARY_PATH (the
+        # .deb wires it via RPATH).
+        # ⚠️ This proves the BUNDLE, not the package. The list below is written by
+        # hand, so it says nothing about what the .deb's `depends` resolve to: it
+        # named the real ALSA library and passed while apt gave a bare 24.04 a stub
+        # the daemon cannot start on (#3204). verify-linux-debs installs the
+        # finished packages.
         run: |
           set -euo pipefail
           docker run --rm -v "$PWD:/w" ubuntu:24.04 bash -euc '
@@ -1306,6 +1311,51 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         with:
           shared-key: agent-linux-arm64
+
+  # ---------------------------------------------------------------------------
+  # 1c. Every Linux package on bare images, before anything is published (#3204)
+  # ---------------------------------------------------------------------------
+  # The real packages, through apt and through install.sh, with no package list
+  # of ours in the way, then started: what a host with nothing on it gets. Every
+  # other check here runs on a desktop image or a hand-written list, and a package
+  # can install cleanly and not start. A job of its own so a red re-runs in
+  # minutes, not after another build, and `release` needs it, so a package that
+  # fails here is never published. deb-bare-image.yml runs the same script on a
+  # PR that changes what the packages declare.
+  verify-linux-debs:
+    name: Bare-image install (${{ matrix.triple }})
+    needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            daemon: linux-deb
+            companion: linux-companion-deb
+          - runner: ubuntu-22.04-arm
+            triple: aarch64-unknown-linux-gnu
+            daemon: linux-deb-arm64
+            companion: linux-companion-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the daemon package
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.daemon }}
+          path: debs
+
+      - name: Download the companion package
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.companion }}
+          path: debs
+
+      - name: Install them on bare images and start them
+        run: bash scripts/deb-bare-check.sh --install-sh scripts/install.sh debs/*.deb
 
   # ---------------------------------------------------------------------------
   # 2. Windows — MSI via cargo-wix. The MSI PAYLOAD (roomlerd.exe + the
@@ -3541,7 +3591,7 @@ jobs:
   release:
     name: Publish GitHub Release
     if: needs.validate-version.outputs.is_release == 'true'
-    needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
+    needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64, verify-linux-debs, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write      # create the release
@@ -3685,11 +3735,12 @@ jobs:
        needs.build-linux-companion.result == 'failure' ||
        needs.build-linux-companion-arm64.result == 'failure' ||
        needs.build-linux-arm64.result == 'failure' ||
+       needs.verify-linux-debs.result == 'failure' ||
        needs.build-windows.result == 'failure' ||
        needs.build-windows-companions.result == 'failure' ||
        needs.build-macos-companion.result == 'failure' ||
        needs.build-macos.result == 'failure')
-    needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
+    needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64, verify-linux-debs, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -3748,11 +3799,12 @@ jobs:
       needs.build-linux-companion.result == 'success' &&
       needs.build-linux-companion-arm64.result == 'success' &&
       needs.build-linux-arm64.result == 'success' &&
+      needs.verify-linux-debs.result == 'success' &&
       needs.build-windows.result == 'success' &&
       needs.build-windows-companions.result == 'success' &&
       needs.build-macos-companion.result == 'success' &&
       needs.build-macos.result == 'success'
-    needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64, build-windows, build-windows-companions, build-macos-companion, build-macos]
+    needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64, verify-linux-debs, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
       issues: write
