@@ -137,6 +137,11 @@ describe('LoginView — attribution (FR-88)', () => {
     expect(plain.find('a[href^="/register"]').attributes('href')).toBe('/register')
   })
 
+  it('offers the way back to an account that never activated (#3199)', async () => {
+    const w = await mountAt('/login')
+    expect(w.find('[data-test="login-activation-help"]').attributes('href')).toBe('/auth/activate')
+  })
+
   it('writes nothing to the device', async () => {
     await clickProvider(await mountAt('/login?utm_source=youtube&utm_campaign=c1'), 'Google')
     expect(setItem).not.toHaveBeenCalled()

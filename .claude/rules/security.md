@@ -61,6 +61,12 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   one-sided `email_verified` check — that state left both the reservation and the
   unactivated-signup paths open. ⚠️ Microsoft is the only provider that is *always*
   unverified.
+- **An open form that mails whoever its body names answers before it looks.**
+  `POST /api/auth/resend-activation` gives one 202 for every address, and
+  `accept_resend` is deliberately not `async`, so neither the bytes nor the latency
+  can depend on the row. The per-account cooldown is silent: a 429 there would fire
+  only for an address with an account. Detaching just the mail is not enough, because
+  a known address also costs more Mongo round trips.
 - **Agent tokens are status-checked on every use** via
   `crates/api/src/extractors/agent.rs::AuthAgent`. ⚠️ A lookup **failure is 500, not
   401** — a Mongo blip must not tell a healthy fleet its credentials were revoked,

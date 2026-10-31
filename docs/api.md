@@ -73,12 +73,60 @@ the device cap, the archived-org refusal — is unchanged. The routes are in the
 user-scoped tables below; the contract is in
 [the spec](fr/FR-129-guided-cross-platform-installer.md#the-pairing-api).
 
+### Email sign-up and activation
+
+A password sign-up creates the account unverified and mails a link, which lands on the
+SPA's `/auth/activate` page. `login` refuses the account until the page has redeemed that
+link. The row keeps holding the address the whole time, because `users.email` is a unique
+index, so registering the same address again answers 409. The way back from a link that
+ran out is a new link, not a new account (#3199):
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant S as API
+    participant M as Mailbox
+
+    B->>S: POST /api/auth/register {email, username, display_name, password}
+    S-->>B: 201 {message}
+    S-->>M: a link, good for email.activation_token_ttl_minutes
+    Note over B,M: the link runs out
+    M-->>B: the person opens it anyway
+    B->>S: POST /api/auth/activate {user_id, token}
+    S-->>B: 400 Invalid or expired activation token
+    Note over B: the page offers a new link
+    B->>S: POST /api/auth/resend-activation {email}
+    S-->>B: 202 {message}, the same for every address
+    S-->>M: a new link, if the account is waiting and outside the cooldown
+    M-->>B: the person opens the new one
+    B->>S: POST /api/auth/activate {user_id, token}
+    S-->>B: 200, and sign-in works
+```
+
+| Rule | Where | Why |
+|---|---|---|
+| One answer for every address: unknown, waiting, active, inside the cooldown, malformed | `accept_resend`, `crates/api/src/routes/auth.rs:387` | a difference is an oracle for `users.email`, the key account-linking resolves against |
+| The answer does not wait for the lookup | the same function, deliberately not `async` | a known address costs more Mongo round trips than an unknown one, which is the same oracle in the latency |
+| Per client address: 5, then one every 3 minutes, a 429 with `Retry-After` | `ip_rate_limit`, `crates/api/src/middleware/auth_rate_limit.rs:157` | the route mails whoever its body names, so the budget must not reset per address |
+| Per account: one new link every 15 minutes, silently | `ACTIVATION_RESEND_COOLDOWN_SECS`, `crates/services/src/dao/user.rs:28` | a 429 here would only ever fire for an address that has an account |
+| Only a password sign-up still waiting is mailed: never an active account, a tombstone or a `.invalid` placeholder | `claim_activation_resend`, `crates/services/src/dao/user.rs:189` | it is one atomic update, so two pods cannot both send |
+
+⚠️ Sign-up does not start the cooldown. At a 5-minute link, a person back at minute 6 would
+otherwise be told a new one is coming and get nothing until minute 15. So the first resend
+is immediate at any TTL, and the stamp lives on the `users` row because `activation_codes`
+is TTL-reaped.
+
+⚠️ The address must match the sign-up's as typed, as it must for `login`: the index is
+case-sensitive, so `Alice@x` and `alice@x` can be two accounts.
+
 ### Rate limiting
 
 Everything under `/api` sits behind a per-client-IP governor (trusted-proxy-aware —
 it will not believe a client-supplied `X-Forwarded-For`). `POST /api/auth/login` and
-`/register` carry an additional per-(IP, account) brute-force gate. `/health`,
-`/ws`, `/derp`, and the Stripe webhook are deliberately outside the governor.
+`/register` carry an additional per-(IP, account) brute-force gate.
+`/resend-activation` has a stricter bucket of its own, keyed on the client address alone
+([above](#email-sign-up-and-activation)). `/health`, `/ws`, `/derp`, and the Stripe
+webhook are deliberately outside the governor.
 
 ## Public routes (no user JWT)
 
@@ -87,11 +135,12 @@ capability URLs, webhook signatures).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/auth/register` | Create account (+ optionally a tenant, or accept `invite_code`) |
+| POST | `/api/auth/register` | Create account (+ optionally a tenant, or accept `invite_code`). A taken address or username answers 409, in words (#3199) |
 | POST | `/api/auth/login` | Password login (`email` or `username`) |
 | POST | `/api/auth/logout` | Invalidate session |
 | POST | `/api/auth/refresh` | Rotate the access token |
 | POST | `/api/auth/activate` | Redeem an email activation code (`{user_id, token}`); the SPA's `/auth/activate` page, where the activation email's link lands, posts it (#3029) |
+| POST | `/api/auth/resend-activation` | Ask for a new activation link (`{email}`). Always 202 with the same sentence; the lookup and the mail happen after the answer ([rules](#email-sign-up-and-activation), #3199) |
 | GET/PUT | `/api/auth/me` | Current user (read / update) |
 | GET | `/api/oauth/{provider}` | OAuth redirect (google, facebook, github, linkedin, microsoft) |
 | GET | `/api/oauth/callback/{provider}` | OAuth callback |

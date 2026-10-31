@@ -49,14 +49,14 @@ decision).
 - **List** (`user.rs:43-94`): becomes the devices-style in-memory compose
   (members per tenant are tens): fetch the tenant's members + batch the user
   rows (display_name/username/**email** — widen the projection beside
-  `dao/user.rs:362-395`), filter `q` over name+username+email, sort whitelist
+  `dao/user.rs:420-453`), filter `q` over name+username+email, sort whitelist
   `name | email | joined_at` (default joined_at asc, as today), slice,
   envelope. Flat `MemberListQuery` — never `#[serde(flatten)]`
   (`device.rs:30-34` postmortem). `MemberResponse` (`user.rs:11-21`) gains
   `email`.
 - **Add by email, no invite**: `AddMemberRequest` (`invite.rs:73-78`) gains
   `email: Option<String>` (exactly one of user_id/email); resolved via
-  `users.find_by_email` (`dao/user.rs:87-92` — the address is a *proven
+  `users.find_by_email` (`dao/user.rs:97-102` — the address is a *proven
   reservation*, so adding by it is adding a verified account). Unknown
   address → 404 with "no account with that address — use Invites". Gate
   unchanged: `INVITE_MEMBERS` + `check_grant_roles` (`invite.rs:441`).

@@ -552,23 +552,7 @@ consent prompt.</p>
         activation_url: &str,
         ttl_minutes: u64,
     ) -> anyhow::Result<()> {
-        let subject = "Activate your Roomler account".to_string();
-        let html = format!(
-            r#"<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
-<h2>Welcome, {name}!</h2>
-<p>Please activate your account by clicking the button below. This link expires in {ttl} minutes.</p>
-<p style="margin: 32px 0;">
-  <a href="{url}" style="background: #1976d2; color: #fff; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold;">
-    Activate Account
-  </a>
-</p>
-<p style="color: #666; font-size: 13px;">Or copy this link: <a href="{url}">{url}</a></p>
-<p style="color: #999; font-size: 12px; margin-top: 32px;">If you did not create an account, please ignore this email.</p>
-</div>"#,
-            name = display_name,
-            url = activation_url,
-            ttl = ttl_minutes,
-        );
+        let (subject, html) = render_activation(display_name, activation_url, ttl_minutes);
         self.send(to_email, &subject, &html).await
     }
 
@@ -586,7 +570,7 @@ consent prompt.</p>
 <p>Your Roomler account is now active. You can <a href="{url}">sign in here</a>.</p>
 <p style="color: #999; font-size: 12px; margin-top: 32px;">— The Roomler Team</p>
 </div>"#,
-            name = display_name,
+            name = crate::newsletter::escape_html(display_name),
             url = login_url,
         );
         self.send(to_email, &subject, &html).await
@@ -682,6 +666,38 @@ pub fn render_device_paired_notice(n: &DevicePairedNotice) -> (String, String) {
     (subject, html)
 }
 
+/// The activation mail's `(subject, html)`. Pure, so the escaping is a unit
+/// test.
+///
+/// ⚠️ `display_name` is whatever the sign-up typed, and #3199's resend lets a
+/// stranger have this mail sent again. Unescaped, that is their HTML in a mail
+/// from our own domain, on demand. The URL stays raw: the server built it, and
+/// mail clients and the e2e helpers read it back as written.
+pub fn render_activation(
+    display_name: &str,
+    activation_url: &str,
+    ttl_minutes: u64,
+) -> (String, String) {
+    let subject = "Activate your Roomler account".to_string();
+    let html = format!(
+        r#"<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">
+<h2>Welcome, {name}!</h2>
+<p>Please activate your account by clicking the button below. This link expires in {ttl} minutes. If it runs out, open it anyway: the page will offer you a new one.</p>
+<p style="margin: 32px 0;">
+  <a href="{url}" style="background: #1976d2; color: #fff; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold;">
+    Activate Account
+  </a>
+</p>
+<p style="color: #666; font-size: 13px;">Or copy this link: <a href="{url}">{url}</a></p>
+<p style="color: #999; font-size: 12px; margin-top: 32px;">If you did not create an account, please ignore this email.</p>
+</div>"#,
+        name = crate::newsletter::escape_html(display_name),
+        url = activation_url,
+        ttl = ttl_minutes,
+    );
+    (subject, html)
+}
+
 #[cfg(test)]
 mod device_paired_notice_tests {
     use super::*;
@@ -749,6 +765,22 @@ mod tests {
             smtp_host: smtp_host.map(|s| s.to_string()),
             smtp_port,
         }
+    }
+
+    /// #3199 — the name is the sign-up's own text, and a stranger can now have
+    /// this mail sent again, so it must arrive as text.
+    #[test]
+    fn the_activation_mail_escapes_the_name_and_keeps_the_link_readable() {
+        let url = "https://roomler.ai/auth/activate?userId=ab&token=cd";
+        let (subject, html) =
+            render_activation("<a href=\"https://evil.example\">a prize</a>", url, 5);
+
+        assert_eq!(subject, "Activate your Roomler account");
+        assert!(!html.contains("https://evil.example\">"), "{html}");
+        assert!(html.contains("&lt;a href="), "{html}");
+        assert!(html.contains(&format!("<a href=\"{url}\"")), "{html}");
+        assert!(html.contains("expires in 5 minutes"), "{html}");
+        assert!(html.contains("offer you a new one"), "{html}");
     }
 
     #[test]

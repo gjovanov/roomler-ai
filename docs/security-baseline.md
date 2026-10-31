@@ -143,6 +143,48 @@ lane, because CI does not run this crate.
 `mail`/UPN are tenant-settable); its `id` (the `oid`) stays trusted and is the
 provider-identity key.
 
+### The activation resend (#3199)
+
+`POST /api/auth/resend-activation` is an open form that mails whoever its body
+names, keyed on the same reservation. It changes none of the three rules above: it
+never writes `email`, never sets `is_verified`, and a row it reaches stays unproven
+until a link is redeemed. It exists because a re-registration that replaced an
+unverified row would have reopened exactly those rules. What binds it:
+
+- **One answer.** A 202 and one sentence for an address that is unknown, waiting,
+  active or inside the cooldown (`accept_resend`). `subscribe` draws the same line;
+  see its module note.
+- **The answer does not wait for the lookup.** `subscribe` detaches its mail, and
+  that is not enough here, because a known address also costs more Mongo round trips
+  than an unknown one. `accept_resend` is deliberately not `async`, so it cannot await
+  the row. ⚠️ Moving the lookup back into the handler is a timing oracle, and
+  `the_answer_does_not_wait_for_the_lookup` fails if it does.
+- **Two limits, and only one of them is visible.** Per client address, a 429 that
+  cannot depend on the address. Per account, a 15-minute cooldown that sends nothing
+  and says nothing, because a 429 would fire only for an address with an account.
+  ⚠️ Keep the cooldown's stamp on the `users` row: `activation_codes` is TTL-reaped,
+  so at a 5-minute link a stamp kept there is gone before it has run.
+- **Only a password sign-up that is still waiting is mailed**
+  (`UserDao::claim_activation_resend`). Never an active account, a tombstone or a
+  `.invalid` placeholder. An evicted row keeps its password, so the address is what
+  excludes it.
+- **The mail carries the sign-up's own text**, so `display_name` is escaped
+  (`render_activation`). Unescaped, this route would be a way to send a stranger's
+  HTML from our domain on demand.
+- **The token is 21 characters, up from 7.** Redeeming it is what proves an address,
+  and each resend opens a new window to guess it in.
+
+Two residuals, neither of them new:
+
+- `POST /api/auth/register`'s 409 still says an address is taken. Closing that would
+  mean answering 201 for a taken address and mailing its owner instead, which is a
+  separate change.
+- A stranger who registered someone else's address can have the activation mail sent
+  again, at the cooldown's pace, and whoever clicks it hands that stranger a password
+  login. Registering a case variant of the address could already do this, because the
+  index is case-sensitive. The mail's "if you did not create an account, please ignore
+  this email" is what stands in the way of both.
+
 ### OAuth CSRF
 
 `oauth_redirect` binds its random `state` to the browser in a short-lived
