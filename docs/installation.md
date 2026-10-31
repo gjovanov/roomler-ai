@@ -63,12 +63,12 @@ wizard's and `install.ps1`'s) and the tunnel CLI's installers do
 which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
-- `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:381`);
+- `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:396`);
 - every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1555`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
-(`scripts/install.ps1:164`).
+(`scripts/install.ps1:173`).
 
 `machine_id` is a stable hardware hash and `(tenant_id, machine_id)` is unique —
 re-running an installer on a known machine reuses its identity instead of
@@ -353,6 +353,22 @@ Details worth knowing:
 
 - **Two MSI flavours** exist (`peruser`, `permachine`) — the wizard maps roles
   onto them and flips SystemContext separately (`roomlerd enable-system-context`).
+- **What Apps & Features lists** (FR-133 P1): the per-user MSI as **Roomler**
+  and the per-machine one as **Roomler (per-Machine)**; the Start-menu entry of
+  the per-user MSI is **Roomler** too, and a signed MSI's UAC prompt reads
+  *Roomler installer*.
+  <!-- RETIRED-NAME-ANCHOR: the names a machine installed before FR-133 P1 still
+       lists until its next update replaces the entry; they go once no machine
+       can still carry one. -->
+  A machine installed before P1 lists **Roomler Agent** / **Roomler Agent (per-Machine)**
+  until its next update. The name is display only: Windows Installer matches an
+  upgrade by the MSI's UpgradeCode, and so does `roomlerd`'s `install_detect`
+  (`agents/roomlerd/src/install_detect/mod.rs:324`), so an update leaves one
+  entry, under the new name. `install.ps1 -Uninstall` matches both names,
+  exactly (`scripts/install.ps1:109`). An IT detection rule (Intune, Configuration
+  Manager) written against a name has to follow it; one written against the
+  UpgradeCode never moves (`agents/roomlerd/src/install_detect/upgrade_codes.rs:14`,
+  `:17`).
 - **Running the perMachine MSI by hand** (`msiexec /i roomlerd-<v>-perMachine-….msi /qn`):
   `ENABLE_SYSTEM_CONTEXT=1` turns SystemContext on, `=0` turns it off, and
   **leaving it out keeps the mode the machine was last switched to** (#1727).
@@ -409,7 +425,7 @@ Details worth knowing:
 
 Every perMachine MSI run that is not an uninstall runs **RegisterService**
 (`roomlerd service install --as-service`, deferred, as LocalSystem,
-`agents/roomlerd/wix-perMachine/main.wxs:355`). One of the SystemContext actions
+`agents/roomlerd/wix-perMachine/main.wxs:361`). One of the SystemContext actions
 follows it (Enable, Disable or Keep), which restarts the service, and then the
 MSI's own StartServices. What happens to the service depends on the run (#3115):
 
@@ -417,8 +433,8 @@ MSI's own StartServices. What happens to the service depends on the run (#3115):
 |---|---|---|
 | A fresh install | nothing is running | created (`agents/roomlerd/src/win_service/lifecycle.rs:436`, `register`) |
 | A **reinstall** of the installed version: a maintenance run, such as the wizard over the same release or a hand-run `msiexec /i` of the same MSI | the SystemContext action's restart | **reconfigured in place**: `ChangeServiceConfigW`, the description and the recovery actions. It keeps running until that restart, and its `Environment` (the SystemContext switch) survives |
-| A **major upgrade** to a newer release: the auto-updater, the wizard, a hand-run install | Windows Installer's Restart Manager, at InstallValidate: `roomlerd.exe` is in use and the run has no UI, so it shuts down what holds it. Where Restart Manager is off (the "Prohibit use of Restart Manager" policy), the OLD product's `UnregisterService` does, because `MajorUpgrade` is `afterInstallInitialize` (`main.wxs:84`) and the old product is removed before the new files land | retired by the old binary, then created by the new one. If the old binary deleted it while it was still stopping (1072), the new one waits for the entry to go first |
-| An uninstall | `UnregisterService` (`main.wxs:547`) | retired (`lifecycle.rs:384`, `retire`) |
+| A **major upgrade** to a newer release: the auto-updater, the wizard, a hand-run install | Windows Installer's Restart Manager, at InstallValidate: `roomlerd.exe` is in use and the run has no UI, so it shuts down what holds it. Where Restart Manager is off (the "Prohibit use of Restart Manager" policy), the OLD product's `UnregisterService` does, because `MajorUpgrade` is `afterInstallInitialize` (`main.wxs:90`) and the old product is removed before the new files land | retired by the old binary, then created by the new one. If the old binary deleted it while it was still stopping (1072), the new one waits for the entry to go first |
+| An uninstall | `UnregisterService` (`main.wxs:553`) | retired (`lifecycle.rs:384`, `retire`) |
 
 **The waits are derived from the host's own shutdown**, so the two cannot drift
 apart (`lifecycle.rs:81`, pinned by the test
@@ -445,7 +461,7 @@ Win11 laptop in the field, 3.4–6.2 s on a vmtest cell) went like this:
 
 An MSI rollback never re-creates the service. No action has a rollback partner
 that would, and the service is not in the MSI's `ServiceInstall` table. So
-`RegisterService` stays `Return="ignore"` on purpose (`main.wxs:340`): under
+`RegisterService` stays `Return="ignore"` on purpose (`main.wxs:346`): under
 `"check"`, a failure there would roll a major upgrade back to the old files
 with no service at all.
 
@@ -607,6 +623,94 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   display, so "Connect" drops you into a live console.
 - Design notes for the tarball/self-update path: [linux-self-update.md](linux-self-update.md).
 
+### What a bare host needs (#3204)
+
+The daemon's `.deb` has to start on a host with nothing on it: a bare server, a
+container, a cluster node. FFmpeg, libvpx and libva ride in the package, so
+`depends` is short (`agents/roomlerd/Cargo.toml:1024`), and every name in it backs
+a library the binary links directly:
+
+| `Depends` | Why it reads this way |
+|---|---|
+| `libasound2t64 (>= 1.0.29) \| libasound2 (>= 1.0.29)` | ALSA, for the Opus system-audio track. The binary binds its symbols at load, so it must be the real library. See below |
+| `libssl3t64 (>= 3.0.0) \| libssl3 (>= 3.0.0)` | `libssl.so.3` and `libcrypto.so.3`. The first name is Ubuntu 24.04's and Debian 13's, the second Ubuntu 22.04's and Debian 12's. Debian 12's base image has neither |
+| `libc6`, `libxcb1`, `libxcb-shm0`, `libxcb-randr0` | One name on every release we support |
+
+⚠️ **The ALSA line looks over-specified, and every part of it is load-bearing.** From
+Ubuntu 24.04 and Debian 13 the library is `libasound2t64`, and `libasound2` is a
+virtual name. Ubuntu's other provider of that name is `liboss4-salsa-asound2`, a
+stub without the symbols the daemon binds: the package installs with exit 0, and
+the daemon dies with `undefined symbol: snd_device_name_get_hint`. The real
+packages' `Provides` carry a version and the stub's do not, so only a versioned
+dependency refuses it. Measured on the released binary:
+
+| Spelling | Fresh 24.04 | 24.04 with the stub already installed |
+|---|---|---|
+| `libasound2` (0.4.191 and earlier) | **the stub**: cannot start | stays on the stub: cannot start |
+| `libasound2t64 \| libasound2` | the real library | **stays on the stub**: cannot start |
+| `libasound2 (>= 1.0.29)` | the real library | **apt exits 100**, and `dpkg -i` plus `apt-get -f install` **removes the package** |
+| `libasound2t64 (>= 1.0.29) \| libasound2 (>= 1.0.29)` | the real library | **replaced by the real library**, through apt, `install.sh` and the updater |
+
+On Ubuntu 26.04 the stub provides `libasound2t64` as well, so an unversioned first
+alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives from
+the binary's symbols.
+
+Neither floor can strand a running daemon on the updater's offline `dpkg --install`
+rung (`agents/roomlerd/src/updater.rs:2299`), which is the reason libva and
+`iproute2` stay out of `depends`. A host where the daemon runs already has the real
+library and OpenSSL, because without them it cannot start. A healthy install
+upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,
+and loses nothing: its daemon could not start before either, so no updater runs
+there, and re-running the install heals it.
+
+**`install.sh` installs a `.deb` in two steps** (`deb_install`,
+`scripts/install.sh:1328`), and the wizard's root half is the same code:
+
+```mermaid
+flowchart TD
+    A["dpkg -i pkg.deb"] -->|"the dependencies are here"| OK["installed, no mirror needed"]
+    A -->|"one is missing: dpkg leaves the package half-configured"| B["apt-get update<br/>(a failure only warns)"]
+    B --> C["apt-get install -y --fix-broken pkg.deb"]
+    C -->|resolved| OK
+    C -->|"cannot fetch it"| F["exit 100, and the script stops.<br/>Nothing is removed, and what dpkg unpacked stays"]
+```
+
+⚠️ **Never `apt-get -f install` with no package named.** When it cannot reach a
+dependency it "fixes" the host by removing the package it was meant to finish, and
+exits 0. Naming the package keeps it in apt's solution, so apt refuses instead.
+`--fix-broken` has to stay as well: without it apt will not touch a package dpkg
+left half-configured.
+
+| State | `dpkg -i \|\| apt-get -f install -y` (until #3204) | `deb_install` |
+|---|---|---|
+| a fresh image, no package lists | **package removed**, exit 0 | fetches the lists and installs |
+| a working daemon, nothing reachable, and a new package that wants something this host lacks | **daemon deleted**, exit 0 | exit 100, and the daemon still runs |
+| Ubuntu 26.04 with the stub installed | **package removed**, exit 0 | replaces the stub and starts |
+
+The companion takes the same two steps and comes off again if they fail, because a
+half-configured companion blocks apt for the whole host. The CLI's arm keeps
+`apt-get -f install` on purpose: it checks the result and falls back to the tarball
+(`scripts/install.sh:1062`, #2472).
+
+**What checks all this.** `scripts/deb-bare-check.sh` installs the finished packages
+on Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13, with
+`--no-install-recommends`, because a Recommends can carry a library a Depends forgot
+(that is how `libssl3` hid on Debian 12: apt's default install started there, and
+`install.sh`'s path did not). It installs them again through the real `install.sh`
+on an image with no package lists. Then it starts what they ship: every library
+resolves under `ldd`, and `roomlerd --version`, `roomler --version` and
+`roomlerd encoder-smoke` run. The companion needs a display to get past `main`, so
+the loader check is all a bare image can ask of it.
+
+| Lane | What goes through it |
+|---|---|
+| `release-agent.yml`, `verify-linux-debs` (`.github/workflows/release-agent.yml:1325`) | The packages about to be published, x86_64 and aarch64. `release` needs it, so a package that fails here is never published |
+| `deb-bare-image.yml` | A PR that changes what a package declares: the latest release's binaries under the checkout's control file, through the lane's own `cargo deb`. A control step proves the check still refuses agent-v0.4.190 |
+
+⚠️ The lane's earlier "Verify the bundled agent loads" step proves the **bundle**,
+not the package. Its package list is written by hand, so it named the real ALSA
+library and passed while a bare 24.04 got the stub.
+
 ### The wizard on Linux (FR-129 B1)
 
 The same `roomler-setup` wizard that installs the daemon on Windows installs it
@@ -627,7 +731,7 @@ sequenceDiagram
     W->>P: pkexec /bin/sh #lt;script#gt; --privileged-steps --role daemon --server … --name … --desktop [--system --config-from #lt;file#gt;]
     P-->>W: ONE password dialog (GNOME Shell / KDE)
     P->>R: as root, its stdout and stderr to files in the scratch dir
-    R->>R: resolve · sha256 (REQUIRED) · dpkg -i / tarball · FR-96 helper · companion .deb/.rpm
+    R->>R: resolve · sha256 (REQUIRED) · deb_install / tarball · FR-96 helper · companion .deb/.rpm
     R->>R: --system: roomlerd adopt-enrollment folds the file into an existing config (#35;2338), then enable or RESTART roomlerd.service
     R-->>W: lines tailed as written · exit 0 (file shredded) · before its first line: 126 = cancelled, 127 = no prompt → the terminal command · after it: the script's own exit
     Note over W: per-user scope: enroll in-process now, folded into ~/.config/roomler/config.toml, then make the unit's folders
@@ -635,6 +739,9 @@ sequenceDiagram
     U->>U: systemctl --user enable --now roomler.service (restarted beside an enabled helper)
 ```
 
+- **The wizard needs WebKitGTK 4.1.** The Fedora KDE lab image lacked it
+  (`sudo dnf install webkit2gtk4.1`). On Debian and Ubuntu the package is
+  `libwebkit2gtk-4.1-0`.
 - **The cards appear only when the chosen server says so**: the wizard reads
   `GET /api/setup/features` and shows the Linux cards on a JSON
   `wizard_linux_daemon: true`, or on `wizard_unix_daemon: true`, which a server
@@ -647,17 +754,18 @@ sequenceDiagram
   `agents/roomler-setup/src/features.rs:73-79`). The server is picked after the role, so the
   Server page asks again when the URL changes and the pipeline once more before
   it installs.
-- **Turning the Linux cards on** (the operator). The homepages' Linux button
-  downloads the **latest** `setup-v*`, and a wizard released before the split
-  reads only `wizard_unix_daemon`, which the server answers as Linux AND macOS,
-  so a Linux-only server shows it no daemon card. The switch therefore waits
-  for the first `setup-v*` that carries B1-s2 and its Linux field run. Then set
-  `ROOMLER__SETUP__WIZARD_LINUX_DAEMON: "true"` in the deploy repo's
-  `roomler2-config` ConfigMap and bump the deployment's `roomler.ai/config-rev`
-  annotation in the same change: the pods read the ConfigMap through `envFrom`,
-  which does not roll them, and the annotation does. `GET /api/setup/features`
-  then answers `wizard_linux_daemon: true` with `wizard_macos_daemon` and
-  `wizard_unix_daemon` still `false`.
+- **On production, both OSes since 2026-10-30 (22:33Z).** The deploy repo's
+  `roomler2-config` ConfigMap sets the legacy
+  `ROOMLER__SETUP__WIZARD_UNIX_DAEMON: "true"`, with a bump of the deployment's
+  `roomler.ai/config-rev` annotation in the same change: the pods read the
+  ConfigMap through `envFrom`, which does not roll them, and the annotation
+  does. `GET /api/setup/features` answers every key `true`.
+- **Taking one OS off** (the operator). Delete the legacy key and set the other
+  OS's, `ROOMLER__SETUP__WIZARD_LINUX_DAEMON: "true"` to leave Linux on, with
+  the same annotation bump. A wizard from `setup-v0.4.190` on reads its own OS's
+  key and keeps its cards (field-measured 2026-10-31). A wizard released before
+  the split reads only `wizard_unix_daemon`, which the server answers as Linux
+  AND macOS, so it then shows no daemon card until it is downloaded again.
 - **One prompt, through the desktop's own agent.** `pkexec` is launched from
   the wizard's process, which GNOME and Plasma put in the user manager; polkit
   resolves it to the seat session and GNOME Shell or `polkit-kde-agent` shows
@@ -897,7 +1005,46 @@ install, and `daemon (3)` on an older one. The update helper keeps the default: 
 They cannot share one enrollment: the hub keys sessions on `agent_id`, so a
 second control-WS connection displaces the first. **Each half is its own
 enrollment, so a Mac appears as two devices** — the second named
-`<name>-daemon`.
+`<name>-daemon`. Two processes are forced by macOS; two rows are not, and
+[FR-43](fr/FR-43-macos-single-enrollment.md) P3 removes the second one.
+
+With `macos_supervise_gui_worker = true` in the daemon's config, the daemon's row
+serves remote desktop as well:
+
+```mermaid
+flowchart TB
+    subgraph server["roomler.ai"]
+        U["row: name"]
+        D["row: name-daemon"]
+    end
+    subgraph mac["The Mac"]
+        subgraph root["root, from boot"]
+            DAEMON["com.roomler.daemon: overlay, SSH, exec"]
+        end
+        subgraph gui["the console user's session"]
+            WORKER["roomlerd run --supervised: capture, input, clipboard"]
+        end
+        DAEMON -- "spawns: launchctl asuser, sudo -u" --> WORKER
+        DAEMON <-- "rc messages and caps: /var/run/roomler-delegate" --> WORKER
+    end
+    D -- "control WS" --- DAEMON
+    U -- "control WS" --- WORKER
+```
+
+| | Switch off, the default | Switch on |
+|---|---|---|
+| Who owns the GUI half | launchd, `com.roomler.agent` | the root daemon, `macos_supervisor.rs` |
+| A session on `<name>-daemon` | no pixels: the agent logs `no_display` | delegated to the worker: pixels and input |
+| What `<name>-daemon` reports | `no-gui-session` | the worker's permissions, on the next heartbeat; `no-gui-session` again within a heartbeat of the worker leaving |
+| A package update | keeps the LaunchAgent | removes it and keeps the worker (`postinstall`) |
+| The GUI half killed | launchd restarts it | the supervisor respawns it; the control WS stays up |
+| Nobody logged in | `<name>` offline, `<name>-daemon` online on the mesh | the same |
+
+⚠️ **On a supervised Mac, don't delete the `<name>` row as a duplicate.** The worker
+runs on that enrollment, so it is what the daemon's row streams through until P3.
+Measured on 0.4.191: with `<name>` deleted, the worker exits 7 at every spawn, the
+supervisor backs off and stops, and `<name>-daemon` reads `no-gui-session`. A Mac
+enrolled with one root token and no per-user enrollment has no worker at all.
 
 ```bash
 # Screen sharing only (one token, one device row):
@@ -978,18 +1125,23 @@ on macOS 15.7). Restart it in any of three ways:
 
 | how | what happens |
 |---|---|
-| **Quit & Reopen** — the button macOS offers when you turn the toggle on | System Settings sends the agent a Quit AppleEvent (with a log-out's reason, `'rlgo'`); the agent tells it from a real log-out by its sender (only `loginwindow` quits a session that is ending), leaves with its restart code, and launchd relaunches it within milliseconds. Finder may still say "The application “roomlerd” is not open anymore": its *Reopen* looks for the process that quit, while launchd has already brought the agent back. ⚠️ Agents up to 0.4.188 exited 0 instead, which launchd does not relaunch: the device stayed **offline** until a `kickstart` |
+| **Quit & Reopen** — the button macOS offers when you turn the toggle on | System Settings sends the agent a Quit AppleEvent (with a log-out's reason, `'rlgo'`); the agent tells it from a real log-out by its sender (only `loginwindow` quits a session that is ending), leaves with its restart code, and launchd relaunches it within milliseconds. Finder may still say "The application “roomlerd” is not open anymore": its *Reopen* looks for the process that quit, while launchd has already brought the agent back. ⚠️ Agents up to 0.4.189 exited 0 instead, which launchd does not relaunch: the device stayed **offline** until a `kickstart`. Fixed in 0.4.190 (2026-10-31), field-verified on that release |
 | **Restart roomlerd** in the menu-bar app's permission card | the LocalAPI `RestartDaemon` verb (the same as Settings' *Apply now*) |
 | `launchctl kickstart -k gui/$(id -u)/com.roomler.agent` in Terminal | the restart that works on every version |
 
 Accessibility is read live: input works from the next remote event, with no
-restart (up to 0.4.188 the first session's failed input backend was kept until
+restart (up to 0.4.189 the first session's failed input backend was kept until
 the agent restarted, so typed input was dropped while the viewer no longer
 warned).
 
 A log-out, restart or shut-down still ends the agent with exit 0 (those quits
 come from `loginwindow`), so nothing relaunches it into a session that is going
 away; `RunAtLoad` starts it again at the next login.
+
+Activity Monitor's **Quit** is a stop, and that is deliberate (#3195). It sends a
+signal rather than a Quit AppleEvent, so `roomlerd` exits 0 and stays down, and the
+device stays offline, until the next login, a reboot, or opening `roomlerd.app`.
+That leaves a person at the Mac a plain way to stop it.
 
 **Two more prompts, and what to answer:**
 
@@ -1074,7 +1226,7 @@ and a supervised Mac — whose LaunchAgent FR-43 P2d boots out by design — rea
 
 The supervisor starts the GUI worker as `launchctl asuser <uid> sudo -u '#<uid>'
 … roomlerd run --supervised`, in a process group of its own, so that it can stop
-the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:595`). The same
+the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:612`). The same
 group is why launchd's teardown of the daemon never reaches the worker. Before
 #2987, a daemon that ended any way other than its clean shutdown (the watchdog's
 `exit(2)` after a stall, a crash, a `kill -9`) left its worker running. That
@@ -1101,9 +1253,9 @@ sequenceDiagram
 
 | Mechanism | How | Catches |
 |---|---|---|
-| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:659`, `:538`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). | A worker of this release, however its daemon ended |
-| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:828`, `:465`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
-| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:483`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
+| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:676`, `:555`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). | A worker of this release, however its daemon ended |
+| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:845`, `:482`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
+| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:500`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
 
 ⚠️ **Mixed versions are safe in both directions.** The offer is a line of its
 own after the secret. A worker from before #2987 reads one line, as it always
@@ -1182,8 +1334,8 @@ sequenceDiagram
 
 | Side of the race | Since #3080 | Where |
 |---|---|---|
-| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:886`, `:835`; `crates/tunnel-core/src/child.rs:75` |
-| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:625` |
+| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:903`, `:852`; `crates/tunnel-core/src/child.rs:75` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:642` |
 | **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:927` |
 
 ⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own
@@ -1336,8 +1488,9 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ## Uninstall: every platform
 
-- **Windows**: uninstall the MSI (per-user or per-machine) from Apps, or run
-  `install.ps1 -Uninstall`; the agent's version sweep also removes older
+- **Windows**: uninstall **Roomler** (per-user) or **Roomler (per-Machine)** from
+  Apps (the names [above](#windows)), or run
+  `install.ps1 -Uninstall`; the daemon's version sweep also removes older
   same-flavour MSIs after upgrades. `roomlerd service uninstall` removes a
   manually-installed service/task.
 - **Linux and macOS** (FR-97 P6d): one command, whatever put Roomler there —
@@ -1356,7 +1509,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1261` (the section) — `uninstall_linux` at `:1687`,
+`scripts/install.sh:1270` (the section) — `uninstall_linux` at `:1714`,
 `uninstall_macos` at `:1494`.
 
 ```mermaid

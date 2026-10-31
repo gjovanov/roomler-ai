@@ -3,6 +3,27 @@
 use crate::fixtures::test_app::TestApp;
 use serde_json::Value;
 
+/// `tenants.slug` is the collision here, and no route words it. The status and
+/// the code stay what the UI reads; the text is one sentence, in place of
+/// MongoDB's, which named the database, the index and the slug.
+#[tokio::test]
+async fn a_taken_slug_answers_a_fixed_sentence() {
+    let app = TestApp::spawn().await;
+    let acme = app.seed_tenant("acme").await;
+
+    let resp = app
+        .auth_post("/api/tenant", &acme.admin.access_token)
+        .json(&serde_json::json!({ "name": "Other", "slug": "acme" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status().as_u16(), 409);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "conflict");
+    assert_eq!(body["message"], "That already exists");
+}
+
 #[tokio::test]
 async fn tenant_isolation_rooms_not_visible_cross_tenant() {
     let app = TestApp::spawn().await;

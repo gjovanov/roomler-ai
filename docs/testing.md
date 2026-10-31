@@ -26,7 +26,7 @@ flowchart TB
 | Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux |
 | Agent overlay tests | add `--features overlay-l3` | ⚠️ feature-gated — the default `--lib` run silently skips them |
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
-| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2541`) |
+| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2543`) |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
 | Phone-width smoke | `cd ui && bun run test:phone` | nothing — the built SPA with every `/api` call mocked (`ui/e2e-phone/`) |
@@ -142,7 +142,7 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   character, so the `input` event the soft keyboard types through never fires
   and a key's second owner is invisible. `softkbd.html` mounts the real
   `MobileKeyboard.vue` and a window-level capture listener running the real
-  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14601`,
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14639`,
   `:14334`), both recording what the host would get and WHO sent it.
   `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
   OS keyboard does (`insertText`: an `input` event and no keydown), composes
@@ -243,6 +243,7 @@ Flakes fixed on 2026-10-30, and what each one teaches:
 |---|---|
 | `ci.yml` | fmt + clippy (`--workspace --all-targets --all-features -D warnings`) + tests + frontend build on every push to master and every PR. A **docs-only PR** (every changed path under `docs/`, a top-level `*.md` or `.claude/`, renames by both paths) skips the twelve heavy jobs: the Rust lanes, the macOS and Windows jobs, both FFmpeg jobs and the profiles build. The docs audits and the frontend build, which builds the docs site, still run (FR-6 wave 35, the `changes` job at `ci.yml:54`, its path rule at `:75`). "Rust checks" passes a docs PR whose lanes all skipped, and fails if the `changes` job did not succeed (`:1309`). A push to master always runs everything |
 | `installer-smoke.yml` | Installs and uninstalls the freshly-built per-user MSI on a Windows runner |
+| `deb-bare-image.yml` | On a PR that changes what a `.deb` declares: packages the latest release's binaries with the checkout's control file through the lane's own `cargo deb`, installs them on five bare images on both arches, by apt and by the real `install.sh`, and starts them. A control proves the check still refuses agent-v0.4.190. The release lane runs the same script on what it is about to publish (`verify-linux-debs`) — [installation.md](installation.md#what-a-bare-host-needs-3204) |
 | `integration-tests.yml` | The integration suite against a real MongoDB and Redis, as **four shards** (FR-6 waves 24 and 27). Each shard lists the same test binaries, sorts the (test, binary) pairs and runs every fourth with `--exact`, so between them the shards run each test once. Each shard must report every test it was handed, and the whole listing must clear a floor. 2 threads per shard, each with its own mongod: at 4 threads against one mongod, the dropped test databases' files reached the 64,000-descriptor ceiling and mongod aborted. Dispatch inputs: `filter`, `threads`, `mongo_tmpfs`, `report_time` (per-test durations and the slowest tests, in the step summary) |
 | k8s e2e (`scripts/e2e-k8s.sh`, `Dockerfile.agent-e2e`) | The suite against a standing cluster namespace — validates the real multi-pod topology |
 | Nightly (`scripts/e2e-nightly.sh`) | Full E2E against the current prod tag, **with the specs from the commit that image was built from** (master's can run ahead of the image: #2573), diffed against an expected-failures list; regressions file an issue. With the **agent-e2e harness** up, its six remote-session specs run against three synthetic-frame agents — [below](#the-agent-e2e-lane-fr-114) |
@@ -531,6 +532,42 @@ The console and `rc.l4` records then read as they do for the probe.
 no key reading (FR-92). It is Windows-only for now; a Linux or macOS host is benched with a
 synthetic-source build.
 
+#### A field run that holds up
+
+What FR-98's first baseline cells (2026-10-30) learned about running L4 against a remote host:
+
+1. **Start the window through `roomler exec`** where exec runs as the signed-in user: on a device
+   no administrator has anchored, the console-session worker answers it. Stop it the same way, by
+   its command line:
+
+   ```bash
+   roomler exec <host> -- 'Start-Process -FilePath "C:\Program Files\Roomler\roomlerd.exe" -ArgumentList "probe-target","--seconds","2400" -WindowStyle Minimized'
+   ```
+
+   Don't redirect its output. A child started with `-RedirectStandardOutput` inherits exec's pipe,
+   and exec then waits it out ("no answer within 45 s"), although the window started. Send plain
+   PowerShell: an encoded payload (base64 plus `Invoke-Expression`) is the shape endpoint
+   protection flags.
+2. **Keep the host at its native mode.** Set display match off for the bench device,
+   `localStorage['roomler-rc-display-match.v2:<agent id>'] = '0'`, and put back what was there
+   afterwards. Left on, it switches the host to the largest mode that fits the viewer on connect.
+   The window was placed for the old mode, so it is no longer in the corner.
+3. **Keep the viewer's page visible, and prove it.** An automation-driven tab went `hidden` about
+   20 s after the last call into it, and Chrome then ran its timers once a second. The prober is
+   a timer chain, so it probed at 1 Hz and read 3–8 ms high. Keep calling into the page, run a
+   250 ms `setTimeout` chain beside the prober that records every gap, and drop each batch that
+   overlaps a gap over 400 ms.
+4. **Attribute the tail.** Run a 10 Hz ping from the viewer to its own gateway for the whole run.
+   On the dev box's Wi-Fi it showed latency bursts about every 33 s, the pattern background scans
+   produce, and in FR-98's cell 3 every probe over 80 ms fell inside one. The host's pump heartbeat sees it too: its `age_split`
+   puts the spike in `transit`.
+5. **Force a relay cell** with the viewer's peer connection built with
+   `iceTransportPolicy: 'relay'`, minus any loopback relay. A corporate laptop at home with its
+   VPN down goes direct otherwise.
+6. **Count freezes** as the viewer's arrival gaps over 200 ms: sample the `video-bytes` channel's
+   `bytesReceived` from `getStats()` every 50 ms. The sampler runs on the page's main thread, so a
+   stall of that thread also reads as a gap; check it against the timer-gap monitor.
+
 ## The L1 encoder bench (FR-16)
 
 L0 and L4 measure a session. L1 measures a host's encoders alone, with no network and no
@@ -564,7 +601,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1774`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7419`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1824`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7419`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |
@@ -641,7 +678,10 @@ cascades and `--name` are hardware by construction, so they always ask.
   the target as their cap.
 - ⚠️ **The table does not read the hello or the capability cache.** FR-16 AC1's "advertised" half
   is the device's record on the server (its hello's hardware encoders), which a fleet run joins
-  to these rows. A row says what this build opened on this host when it ran.
+  to these rows. A row says what this build opened on this host when it ran. Read `video_cells`
+  beside `hw_encoders` for that join: the legacy label is enumeration-only
+  (`agents/roomlerd/src/encode/caps.rs:1883`), so on Windows it says `mf-h264-hw` even where the
+  cascade lands on Microsoft's software MFT.
 - ⚠️ The bench does not drain an encoder at the end of a row, so a frame an encoder still holds
   is not counted in `out_kbps`.
 - `roomlerd encoder-smoke` is its own process, not the daemon: a driver that faults takes the
@@ -655,17 +695,25 @@ cascades and `--name` are hardware by construction, so they always ask.
   `--bench-fps`, a session's cadence.
 - **One thread, holding its clock.** Every cell opens, encodes and is dropped on one thread of the
   bench's own, the way a session's encoder lives on its thread (`encode::thread`). So a
-  thread-affine encoder (QSV) never changes threads between frames. On Linux that thread asks
-  for its clock first, as a session's encoder thread does
-  ([FR-112](encoders.md#software-encoders-the-clock-and-60-fps-fr-112) P1), and the threads an
-  encoder starts inherit it. Without it, energy-aware scheduling clocks a periodic encoder down
-  until its work fills the frame period: the same OpenH264 frame took 6 ms back to back and
-  16–20 ms at a 30 fps cadence on an Apple M2 Pro. The preamble's `clock=` says what the thread
-  got: `clamped`, `refused:<errno>` (a kernel without `CONFIG_UCLAMP_TASK`, or a cgroup limit),
-  `off` (`ROOMLERD_ENCODER_CLOCK=0`) or `n/a` (not Linux). A paced row well above its back-to-back
-  twin, on a host that did not answer `clamped`, is the CPU's clock, not the encoder.
+  thread-affine encoder (QSV) never changes threads between frames. That thread asks for its
+  clock first, as a session's encoder thread does
+  ([FR-112](encoders.md#software-encoders-the-clock-and-60-fps-fr-112) P1, P3), and on Linux the
+  threads an encoder starts inherit it. Without it, energy-aware scheduling clocks a periodic
+  encoder down until its work fills the frame period: the same OpenH264 frame took 6 ms back to
+  back and 16–20 ms at a 30 fps cadence on an Apple M2 Pro. The preamble's `clock=` says what the
+  thread got: `clamped` (Linux), `qos-user-interactive` (macOS), `unthrottled` (Windows),
+  `refused:<errno>` (on Linux, a kernel without `CONFIG_UCLAMP_TASK`, or a cgroup limit), `off`
+  (`ROOMLERD_ENCODER_CLOCK=0`, or unset on macOS and Windows, where the request is
+  [opt-in](encoders.md#the-clock-on-macos-and-windows-fr-112-p3)) or `n/a` (no request on this
+  OS). A paced row well above its back-to-back twin, on a host that answered `off` or `refused`,
+  is the CPU's clock, not the encoder.
 - ⚠️ **Noise.** These are wall-clock times on a host doing other things. Run a cell twice and read
   the spread before comparing two hosts: the reference run below did, on a busy machine.
+- ⚠️ **One frame rate and one size to a comparison.** At `--bench-fps 60` a frame carries half the
+  motion of one at 30, so it costs less whatever the clock does: set a paced row against a
+  back-to-back row at the same `--bench-fps`. Run one size per process: on a Windows laptop an
+  H.264 row that followed a VP9-444 row at a smaller size read about twice as slow, on any core
+  ([FR-112 §9](fr/FR-112-software-encoding-at-60-fps.md#9-field-verification-log)).
 
 **Reference run** (2026-10-30). A release build with the Linux release lane's features
 (`release-agent.yml:552`) ran in an Ubuntu 24.04 container on a busy Windows dev box, with no GPU
@@ -688,6 +736,21 @@ p50s were 3.7 and 4.7 ms (static), 8.1 and 7.5 (drag), 7.6 and 6.4 (pan), and it
 apart (27.8 and 17.2 ms on pan). So compare p50s across hosts, and p95s only between runs on a quiet
 host. `pan` cost OpenH264 a fifth of `drag`'s bitrate (676 against 3383 kbps): a uniform shift is
 what motion compensation predicts, and the dragged text's edges are what costs.
+
+**A fleet run** ([the table](fr/FR-16-rc-quality-benchmark.md#l1-fleet-run-2026-10-31)). The bench
+loads a machine someone may be using, so the live-use check goes inside the command, where it can
+stop the run. A check beside the run only tells you afterwards. Prove it before the first bench:
+once with an echo in the bench's place, and once with a limit nobody can pass, which must print a
+skip and run nothing. Send plain text: an encoded payload is the shape endpoint protection flags.
+
+| Stop on | Linux | Windows | macOS (read, not yet run) |
+|---|---|---|---|
+| A live session | `roomlerd rc` | `roomlerd rc` | `sudo -u <user> roomlerd rc`: the per-user half holds the sessions |
+| A person within 15 minutes | The newest tty access of `who`: `stat -c %X /dev/<tty>` | `user32!GetLastInputInfo` through `Add-Type`, which in session 1 reads the console session | `CGEventSourceSecondsSinceLastEventType` |
+| A busy host | `/proc/loadavg` at 3/4 of the CPUs | `LoadPercentage` at 50 | |
+
+Match the whole sentence `nobody is viewing this device`, so a daemon that does not answer stops
+the run too. Take the denominator from the server's device list, not from who answered exec.
 
 ## The overlay stress lane (FR-81)
 

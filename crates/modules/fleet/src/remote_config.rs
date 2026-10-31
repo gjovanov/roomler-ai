@@ -44,6 +44,11 @@ pub struct DesiredConfigBody {
     /// key). Passed on unread, as the two denylists above are.
     #[serde(default)]
     pub zero_copy_deny: Option<String>,
+    /// Every other key in the body, kept only to be refused if it is a device
+    /// owner's ([`names_a_device_owned_key`]). Dropped silently, an `external_*`
+    /// key would answer 200 as if the push had taken. Never stored or logged.
+    #[serde(flatten)]
+    pub rest: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// ⚠️ `desired` is the SAME projection the listing returns
@@ -73,6 +78,8 @@ pub enum ConfigDenyReason {
     CannotGrantExec,
     /// Asked to change SSH without holding `SSH_DEVICE`.
     CannotGrantSsh,
+    /// FR-52 — the body names an `external_*` key, which no server may push.
+    DeviceOwnedKey,
 }
 
 impl ConfigDenyReason {
@@ -81,6 +88,7 @@ impl ConfigDenyReason {
             Self::NotDeviceAdmin => "not_device_admin",
             Self::CannotGrantExec => "cannot_grant_exec",
             Self::CannotGrantSsh => "cannot_grant_ssh",
+            Self::DeviceOwnedKey => "device_owned_key",
         }
     }
 
@@ -94,6 +102,10 @@ impl ConfigDenyReason {
             Self::CannotGrantSsh => {
                 "Changing SSH access on a device requires SSH_DEVICE — you cannot open a door \
                  you cannot walk through"
+            }
+            Self::DeviceOwnedKey => {
+                "External access is the device owner's to set, on the device: no server can \
+                 push an external_* key"
             }
         }
     }
@@ -147,6 +159,17 @@ pub fn decide(
         return Err(ConfigDenyReason::CannotGrantSsh);
     }
     Ok(())
+}
+
+/// FR-52 — does a desired-config body name an `external_*` key?
+///
+/// [`DesiredConfig`] cannot hold one (`no_external_key_is_server_pushable_via_desired_config`),
+/// so nothing here could reach a device either way. This is the honest answer
+/// to whoever asked: gate 3 is the device owner's opt-in, and a 200 would say a
+/// push took that never will. The prefix, not a list: the key that matters is
+/// the one added after this was written.
+fn names_a_device_owned_key(rest: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
+    rest.keys().any(|k| k.starts_with("external_"))
 }
 
 /// FR-130 P1b — a pushed tribool, spelled the one way the device and the
@@ -212,7 +235,13 @@ pub async fn set_desired_config(
     // ONE call site records both arms. `decide` returning a Result rather than
     // a bool is what makes "a new refusal that forgets to audit itself"
     // unrepresentable — the same shape as `agent_ssh::dispatch`.
-    let verdict = decide(perms, &agent.desired_config, &requested);
+    let verdict = decide(perms, &agent.desired_config, &requested).and_then(|()| {
+        if names_a_device_owned_key(&body.rest) {
+            Err(ConfigDenyReason::DeviceOwnedKey)
+        } else {
+            Ok(())
+        }
+    });
     if let Err(e) = state
         .config_audit
         .record(
@@ -230,6 +259,12 @@ pub async fn set_desired_config(
     }
 
     if let Err(reason) = verdict {
+        if reason == ConfigDenyReason::DeviceOwnedKey {
+            tracing::warn!(
+                tenant = %tenant_id, agent = %agent_id, admin = %auth.user_id,
+                "desired-config: an external_* key was pushed — refused, it is the device's"
+            );
+        }
         return Err(ApiError::Forbidden(reason.message().to_string()));
     }
 

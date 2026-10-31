@@ -269,6 +269,10 @@
       "methods": "POST"
     },
     {
+      "path": "/api/auth/resend-activation",
+      "methods": "POST"
+    },
+    {
       "path": "/api/capabilities",
       "methods": "GET,HEAD"
     },
@@ -486,7 +490,7 @@
     },
     {
       "path": "/api/tenant/{tenant_id}/agent/{agent_id}/connect-code",
-      "methods": "POST"
+      "methods": "GET,HEAD,POST"
     },
     {
       "path": "/api/tenant/{tenant_id}/agent/{agent_id}/crash",

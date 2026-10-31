@@ -17,6 +17,16 @@ use super::base::{BaseDao, DaoError, DaoResult};
 /// mail to it cannot leave the building.
 const UNPROVEN_EMAIL_DOMAIN: &str = "unverified.invalid";
 
+/// #3199 — how long before a new activation link may be sent to the same
+/// account again. The same value as `dao::subscriber`'s cooldown, for the same
+/// reason: the per-IP limiter does not cover a distributed loop, and the victim
+/// of that loop is the address, not the endpoint.
+///
+/// ⚠️ Sign-up does not start this clock. At a 5-minute link, a person back with
+/// the expired link at minute 6 would be told a new one is coming and get
+/// nothing until minute 15, so the first resend is always immediate, at any TTL.
+const ACTIVATION_RESEND_COOLDOWN_SECS: i64 = 15 * 60;
+
 /// Placeholder `email` for an account created from an OAuth identity whose
 /// address the provider did not verify.
 ///
@@ -140,6 +150,7 @@ impl UserDao {
             notification_preferences: NotificationPrefs::default(),
             tutorial: TutorialState::default(),
             signup_attribution: attribution,
+            activation_resent_at: None,
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -154,6 +165,53 @@ impl UserDao {
             .find_one(doc! { "email": email, "deleted_at": null })
             .await?
             .ok_or(DaoError::NotFound)
+    }
+
+    /// #3199 — claim the next activation mail for an address.
+    ///
+    /// `Some(user)` means this caller, and no other, may mail that account a
+    /// new link. `None` covers everything else: an unknown address, an account
+    /// that already proved it, a tombstone, a placeholder, an account with no
+    /// password to activate, and a link sent inside the cooldown.
+    ///
+    /// ⚠️ Those arms must stay one `None`, and it must never reach the HTTP
+    /// response (`routes::auth::resend_activation`).
+    ///
+    /// One atomic update rather than a read and a write: the cooldown is all
+    /// that stands between a public form and a mail bomb, and with two pods a
+    /// read would let both of them see "cooled" and both send.
+    ///
+    /// `is_verified` is `$ne: true` because the field defaults to false on
+    /// read, so a row without it is unactivated to `login` too. The match on
+    /// `email` is exact, as it is in [`Self::find_by_email`]: the index is
+    /// case-sensitive, so `Alice@x` and `alice@x` can be two accounts, and
+    /// folding case here could mail one person's request to the other's claim.
+    pub async fn claim_activation_resend(&self, email: &str) -> DaoResult<Option<User>> {
+        // A placeholder is matched by nothing a person would type, but an
+        // evicted row keeps its password, so the filter below would pass it.
+        if email.ends_with(UNPROVEN_EMAIL_DOMAIN) {
+            return Ok(None);
+        }
+        let now = DateTime::now();
+        let cooled =
+            DateTime::from_millis(now.timestamp_millis() - ACTIVATION_RESEND_COOLDOWN_SECS * 1000);
+        Ok(self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! {
+                    "email": email,
+                    "is_verified": { "$ne": true },
+                    "deleted_at": null,
+                    "password_hash": { "$type": "string" },
+                    "$or": [
+                        { "activation_resent_at": null },
+                        { "activation_resent_at": { "$lte": cooled } },
+                    ],
+                },
+                doc! { "$set": { "activation_resent_at": now } },
+            )
+            .await?)
     }
 
     pub async fn find_by_username(&self, username: &str) -> DaoResult<User> {
@@ -342,7 +400,7 @@ impl UserDao {
         //     unique index, so this adds no new exposure — but don't extend the
         //     pattern to a surface where it would.)
         if self.find_by_email(email).await.is_ok() {
-            return Err(DaoError::DuplicateKey(format!(
+            return Err(DaoError::Conflict(format!(
                 "an account already exists for {email} and {provider} did not \
                  verify the address — sign in with your existing credentials"
             )));
@@ -399,6 +457,7 @@ impl UserDao {
             notification_preferences: NotificationPrefs::default(),
             tutorial: TutorialState::default(),
             signup_attribution: attribution.clone(),
+            activation_resent_at: None,
             created_at: now,
             updated_at: now,
             deleted_at: None,

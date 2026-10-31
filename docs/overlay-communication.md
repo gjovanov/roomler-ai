@@ -742,7 +742,8 @@ every node, and a regional relay's socket logs a line of its own under its
 `relay` name. Expect
 `clamped=true applied=212992` on a stock Linux kernel before 6.18, and
 `applied=262144` on Windows and macOS. On Linux, `ss -tmp` shows the same
-socket's `tb` as twice `applied`.
+socket's `tb` as twice `applied`. All three OSes read that way on the fleet on
+0.4.191 ([FR-18's field log](fr/FR-18-carrier-queue-discipline.md#field-log)).
 
 ⚠️ **A full outbound queue drops the frame uncounted.** `DerpConn::send_to`
 answers `Ok` when the queue is full (`crates/tunnel-core/src/transport/derp.rs:323`)
@@ -781,8 +782,40 @@ UDP-blocked — moving onto a restrictive network — opens `/derp` at that poin
 `/derp` is served by the same API pods behind the same nginx as `/ws`, on its own
 `location` block with 86400 s idle timeouts. It is a **separate** endpoint from
 `/ws` on purpose: WireGuard data at line rate would head-of-line-block the JSON
-control channel. The registry is in-memory on a single-replica deployment, so a
-web deploy severs DERP links — they simply rebuild via the carrier's dead-latch.
+control channel. The registry is in-memory and per pod, and the front nginx pins a
+tenant to one pod (`hash … consistent`, `max_fails=0`, `proxy_next_upstream off`),
+so a roll closes each pod's sockets in turn and they rebuild via the dead-latch.
+
+### What a pod roll costs (FR-28)
+
+Read on 15 production rolls in October 2026
+([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#where-it-stands-2026-10-31)):
+
+```mermaid
+flowchart LR
+    T["SIGTERM"] --> X["old pod exits<br/>+0.5 to 0.85 s"]
+    X --> B["every redial answers 502<br/>the pin has no process behind it"]
+    B --> L["replacement listens<br/>+5.3 to 6.3 s"]
+    L --> R["next ladder step<br/>+7, +15 or +25 s"]
+    R --> C["socket back, carriers rebuild"]
+```
+
+| Measure | Value |
+|---|---|
+| `/derp` down, per socket | p50 7.6 s, p90 15.9 s, p99 26.2 s (310 sockets) |
+| A whole roll | 33.9 s on the live read: two waves about 17 s apart, each hitting one pod's tenants |
+| `relay carrier send hard-errored` | 14–73 lines per roll on 10–15 hosts. The line marks a close, not a fault |
+| An RC session | Ends on the control WS on any carrier, 9 of 9. A new one is Active 8.4–18.6 s after the cut |
+
+⚠️ **Make-before-break has no pod to dial here.** The strict pin sends a second dial to the
+same dying pod, and with hostNetwork and `maxSurge: 0` the replacement cannot exist until
+that pod is gone. The pin is deliberate: a ring that walked to the survivor parked
+long-lived sockets on the wrong pod after a roll.
+
+⚠️ **The downtime is mostly Kubernetes, the image and the agent's ladder.** The binary listens
+under 0.4 s after its container starts. The rest is scheduling (about 1.5 s), the image pull
+(3–4 s), and the wait for the next backoff step (`agents/roomlerd/src/derp.rs:49`), which is
+why per-roll medians land on 7.5, 15 and 25 s.
 
 ---
 

@@ -160,6 +160,69 @@ printf '{"tool_name":"Read","tool_input":{"file_path":"gh issue create"}}' \
   | GH_CONFIG_DIR="$tmp/wrong" bash "$HOOK" >/dev/null 2>&1 \
   || bad "a Read tool call was blocked"
 
+# ── 7. the script that writes the file this hook reads ─────────────────────
+# scripts/gh-scoped-config.sh is the only writer of the scoped hosts.yml, and
+# the label in it is what this hook compares. So a bad run of that script IS
+# this hook blocking every session's writes: `--print-dir` on 2026-10-30 and
+# `--help` on 2026-10-31 each became the account name, and each was written
+# before it was checked.
+#
+# A stub `gh` answers for the API, so nothing here needs a network, a keyring
+# or the real config. HOME moves too, because the default DEST lives under it.
+SCRIPT="scripts/gh-scoped-config.sh"
+mkdir -p "$tmp/bin" "$tmp/scoped"
+cat > "$tmp/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+# `gh api user` answers as $STUB_LOGIN. Nothing else succeeds, which is also
+# what a one-account config answers to a switch.
+[ "$1 ${2-}" = "api user" ] && { echo "$STUB_LOGIN"; exit 0; }
+exit 1
+STUB
+chmod +x "$tmp/bin/gh"
+
+scoped() {  # $1 = the hosts.yml DEST starts from, the rest = args -> exit status
+  cp "$1" "$tmp/scoped/hosts.yml"; shift
+  PATH="$tmp/bin:$PATH" HOME="$tmp" STUB_LOGIN="${LOGIN-gjovanov}" GH_CONFIG_DIR="$tmp/right" \
+    bash "$SCRIPT" "$@" >"$tmp/scoped.out" 2>&1
+}
+untouched() { cmp -s "$tmp/right/hosts.yml" "$tmp/scoped/hosts.yml"; }
+
+# Both incidents. Asking for help must still get help.
+scoped "$tmp/right/hosts.yml" --help "$tmp/scoped"; rc=$?
+[ "$rc" -eq 0 ] || bad "script --help: expected 0, got $rc"
+grep -q '^Usage:' "$tmp/scoped.out" || bad "script --help printed no usage"
+untouched || bad "script --help rewrote hosts.yml"
+
+scoped "$tmp/right/hosts.yml" --print-dir "$tmp/scoped"; rc=$?
+[ "$rc" -eq 2 ] || bad "script --print-dir: expected 2, got $rc"
+untouched || bad "script --print-dir rewrote hosts.yml"
+
+# In second place a flag would be the destination, which is no better.
+scoped "$tmp/right/hosts.yml" gjovanov --print-dir; rc=$?
+[ "$rc" -eq 2 ] || bad "a flag as DEST: expected 2, got $rc"
+
+# Not a flag, but not who the API says it is: refused, with the file left alone.
+scoped "$tmp/right/hosts.yml" someone-else "$tmp/scoped"; rc=$?
+[ "$rc" -eq 1 ] || bad "an owner the API denies: expected 1, got $rc"
+untouched || bad "an owner the API denies was written before it was verified"
+
+# ⚠️ Nobody answering is not an answer. An empty OWNER (an unset variable in the
+# caller) equals the empty answer of a `gh` that cannot reach the API, and the
+# blank `user:` that wrote is the one label this hook lets through: it reads as
+# "no account found", so a failed run would switch the guard off.
+LOGIN= scoped "$tmp/right/hosts.yml" "" "$tmp/scoped"; rc=$?
+[ "$rc" -eq 1 ] || bad "an empty owner with no answer: expected 1, got $rc"
+untouched || bad "an empty owner with no answer was written"
+
+# ⚠️ The positive control: everything above also passes for a script that never
+# writes at all. This is the repair, from the state both incidents left behind,
+# and the hook must then allow a write again.
+printf 'github.com:\n    git_protocol: https\n    user: --help\n' > "$tmp/junk.yml"
+scoped "$tmp/junk.yml" gjovanov "$tmp/scoped"; rc=$?
+[ "$rc" -eq 0 ] || bad "repairing a junk label: expected 0, got $rc"
+run "$tmp/scoped" 'gh issue create --title x' || bad "the repaired config is still blocked"
+[ "$(ls -A "$tmp/scoped")" = "hosts.yml" ] || bad "the script left something behind in DEST"
+
 if [ "$fail" -eq 0 ]; then echo "gh-account-guard selftest: ok"; else
   echo "gh-account-guard selftest: FAILED"; fi
 exit "$fail"

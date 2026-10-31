@@ -54,6 +54,16 @@ These do not error. They make every device quietly stop updating.
 | The GPG sidecar job | Non-Windows `download_asset` **requires** `<asset-url>.asc` and refuses fail-closed. A release whose GPG job skipped freezes every Linux/macOS agent. `release-agent.yml` now hard-fails on a tag when `GPG_PRIVATE_KEY` is absent (graceful skip only on a branch dispatch), plus a post-signing assertion that every `.deb`/`.pkg`/`.msi` got a sidecar |
 | The version scheme (rolling `0.4.<counter>`) | Six coupled MSI-mapping copies. Agents ≤ rc.483 **refuse** 0.4.x MSIs |
 | Asset ORDER in a release | A frozen agent's picker takes the **first** `.deb` matching its arch, and `/api/agent/latest-release` forwards GitHub's order. Publishing the Linux companion `.deb` into the agent release froze every pre-0.4.16 Linux agent — they apt-installed the companion *as* their daemon update. Fixed server-side (`agent_release::order_assets_daemon_first`) **because a frozen agent cannot receive an agent-side fix** |
+| `depends` in `agents/roomlerd/Cargo.toml` **vs** what a bare host resolves it to | `apt-get install` exits 0 whichever provider it picks, so a package can install and not start: 0.4.190 and 0.4.191 on a bare Ubuntu 24.04 (#3204). `verify-linux-debs` installs the finished packages on five bare images, on both arches, and `release` needs it. Read a red before re-running it: a failed fetch in the log is a mirror, and anything else is a package that does not start. Why the ALSA line reads as it does: `docs/installation.md`, "What a bare host needs" |
+
+⚠️ **The MSI's `Name` (what Apps & Features lists) is a display name**, not a fleet
+coupling: upgrades, `install_detect`, the version sweep and the updater's own MSI
+reader never read it (FR-133 P1). Its one consumer is `install.ps1`, which matches
+exact names (`$MsiNamesPerUser`, `$MsiNamesPerMachine`), and that script is served
+by the **server image**, not by the release. So a change to the name ships in this
+order: the script learns the new name, **promote that image**, and only then publish
+a release with it. The other way round, the served `install.ps1 -Uninstall` removes
+nothing and exits 0 (measured 2026-10-31: `done.`, and the product stayed installed).
 
 ⚠️ **A tag can publish nothing.** Always check `gh release view <tag>` assets
 before believing a release shipped; re-cut on a **fresh** number rather than

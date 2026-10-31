@@ -737,7 +737,7 @@ import {
 import { useRoomStore, type Room } from '@/stores/rooms'
 import { useAgentStore } from '@/stores/agents'
 import { useCappedSearchList } from '@/composables/useCappedSearchList'
-import { api } from '@/api/client'
+import { api, ApiError } from '@/api/client'
 import { useNotificationStore } from '@/stores/notification'
 import { useOrgBadgesStore } from '@/stores/orgBadges'
 import { useConferenceStore } from '@/stores/conference'
@@ -1187,9 +1187,9 @@ async function handleCreateOrg() {
     router.push(`/tenant/${tenant.id}`)
   } catch (e) {
     const msg = e instanceof Error ? e.message : 'Failed to create organization'
-    // tenants.slug is globally unique — surface the dup-key case in words.
+    // tenants.slug is globally unique, and a taken slug is the only 409 here.
     showCreateOrgError(
-      msg.includes('duplicate') || msg.includes('E11000')
+      e instanceof ApiError && e.status === 409
         ? 'That slug is already taken — pick another'
         : msg,
     )

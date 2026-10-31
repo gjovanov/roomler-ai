@@ -240,7 +240,7 @@ word from a newer device is still a refusal (`other`), never "accepted"
 Every one is the device owner's, read once when the daemon starts (a change needs a
 restart), and none can be pushed:
 `the_device_owned_refusals_are_not_pushable`
-([`models.rs:9659`](../crates/remote_control/src/models.rs#L9659)) asserts that no
+([`models.rs:9711`](../crates/remote_control/src/models.rs#L9711)) asserts that no
 Hive key appears in a serialised `DesiredConfig`. The user-facing reference is
 [`configuration.md`](../ui/docs/content/reference/configuration.md).
 
@@ -1339,7 +1339,7 @@ moved, the config files are not placed, and the materialize says so.
 
 Before any frame of the replicaset exists, the device's own refusals do (§3g). Three
 keys, each the device owner's, default off, never pushable, and in the lock test's list
-([`models.rs:9659`](../crates/remote_control/src/models.rs#L9659)):
+([`models.rs:9711`](../crates/remote_control/src/models.rs#L9711)):
 
 | Key | What it is | Where |
 |---|---|---|

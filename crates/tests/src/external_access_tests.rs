@@ -395,6 +395,83 @@ async fn a_connect_code_is_minted_on_demand_and_never_reaches_the_device_list() 
     assert!(!raw.contains(&bare), "nor the ungrouped form of one: {raw}");
 }
 
+/// #3197 — one device's code reads back whether or not the device is approved.
+///
+/// The settings view lists approved devices only, while approval and the code
+/// are independent. A code minted before any approval, or one left behind when
+/// an approval is withdrawn, has to be readable here, or the dialog says the
+/// device has none and its Create replaces the code.
+///
+/// ⚠️ And the gates: the code is the address a stranger dials, so this takes
+/// what the settings view takes, and a foreign id is a 404 rather than a read.
+#[tokio::test]
+async fn a_device_code_reads_back_whether_or_not_the_device_is_approved() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extread").await;
+    let owner = &seeded.admin.access_token;
+    let cfg = enrol(&app, &seeded, "mach-ext-read").await;
+    mark_supported(&app, &cfg.agent_id).await;
+    let code = url(&seeded, &format!("/agent/{}/connect-code", cfg.agent_id));
+    let policy = url(
+        &seeded,
+        &format!("/agent/{}/external-access-policy", cfg.agent_id),
+    );
+
+    // No code yet is an answer, not an error: it is what offers Create.
+    let (s, body) = get(&app, &code, owner).await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["connect_code"], Value::Null);
+    assert_eq!(body["connect_code_rotated_at"], Value::Null);
+
+    // Minted before any approval, so the approved list cannot hold it.
+    let (s, body) = post(&app, &code, owner).await;
+    assert_eq!(s, 200, "{body}");
+    let minted = body["connect_code"].as_str().unwrap().to_string();
+    let (_, body) = get(&app, &url(&seeded, "/external-access"), owner).await;
+    assert_eq!(
+        body["devices"],
+        json!([]),
+        "not approved, so not in the list"
+    );
+    let (s, body) = get(&app, &code, owner).await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["connect_code"], json!(minted), "the display form");
+    assert!(body["connect_code_rotated_at"].is_string(), "{body}");
+
+    // Approved, then withdrawn: the code stays on the row, and still reads.
+    let (s, _) = put(&app, &policy, owner, json!({ "approved": true })).await;
+    assert_eq!(s, 200);
+    let (s, _) = put(&app, &policy, owner, json!({ "approved": false })).await;
+    assert_eq!(s, 200);
+    let (s, body) = get(&app, &code, owner).await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["connect_code"], json!(minted));
+
+    // A plain member may not read it: the ordinary device list hides it from
+    // them on purpose.
+    let (s, _) = get(&app, &code, &seeded.member.access_token).await;
+    assert_eq!(s, 403);
+
+    // Another org's admin, naming this device from their own tenant.
+    let other = app.seed_tenant("extread2").await;
+    let foreign = url(&other, &format!("/agent/{}/connect-code", cfg.agent_id));
+    let (s, _) = get(&app, &foreign, &other.admin.access_token).await;
+    assert_eq!(s, 404, "a foreign device id must not resolve");
+
+    // A removed device: its tombstone keeps the code, and must not answer (#1821).
+    let resp = app
+        .auth_delete(
+            &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, cfg.agent_id),
+            owner,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let (s, _) = get(&app, &code, owner).await;
+    assert_eq!(s, 404, "a removed device must not read back");
+}
+
 /// The replace-on-save hazard, locked end to end.
 ///
 /// The dialog PUTs the WHOLE policy, so if `AgentResponse` did not carry the

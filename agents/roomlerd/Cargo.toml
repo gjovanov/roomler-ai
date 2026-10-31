@@ -4,7 +4,7 @@ license = "MPL-2.0"
 publish = false
 version.workspace = true
 edition.workspace = true
-description = "Roomler AI remote-control agent — runs on the controlled host, connects to the Roomler API."
+description = "Roomler daemon (roomlerd): remote desktop, private WireGuard mesh and tunnels"
 
 [lib]
 name = "roomlerd"
@@ -995,8 +995,25 @@ peer-to-peer; the server never sees raw pixels or keystrokes."""
 # libvpx.so.9 — the bundled .so.7 is exactly what makes 24.04 work). Hence NO
 # libvpx dep and no raised glibc floor: `libvpx9` was a lie (the binary needs
 # .so.7, not .so.9) and `libc6 (>= 2.39)` wrongly blocked 22.04 (binary is glibc
-# 2.34). `libasound2` backs the Opus system-audio capture track; libxcb* are the
+# 2.34). ALSA backs the Opus system-audio capture track; libxcb* are the
 # always-present X11 client libs.
+# #3204 — ALSA is named twice and versioned, and all of that is load-bearing. From
+# Ubuntu 24.04 and Debian 13 the library is `libasound2t64`, and `libasound2` is
+# virtual. Ubuntu's other provider is `liboss4-salsa-asound2`, a stub without the
+# symbols this binary binds at load, so `roomlerd` installs cleanly and cannot start
+# (`undefined symbol: snd_device_name_get_hint`). The real packages' Provides are
+# versioned and the stub's are not, so only `(>= …)` refuses the stub:
+#   * bare `libasound2` chose the stub on a fresh 24.04;
+#   * `libasound2t64 | libasound2` leaves a stub that is already installed in place,
+#     so the daemon stays dead (on 26.04 the stub provides `libasound2t64` too);
+#   * `libasound2 (>= …)` alone cannot replace an installed stub: apt exits 100.
+# 1.0.29 is what dpkg-shlibdeps derives from the binary. The floor cannot strand a
+# running daemon on the updater's offline rung below: a host where it runs has the
+# real library, because on the stub it cannot start.
+# `libssl.so.3` and `libcrypto.so.3` are NEEDED too, and went undeclared until #3204:
+# Debian 12's base image has neither, so a `dpkg -i` plus dependency fix, which skips
+# recommends, installed a daemon that could not load them. Both names, as in the CLI
+# (#2472). A running daemon has them, so this adds nothing for that rung to fail on.
 # FR-77 P4 — VAAPI adds NO `depends`: libva/libva-drm/libdrm ride in the bundle
 # with the libav* (a `Depends: libva2` is unsatisfiable on the updater's offline
 # `dpkg --install` path, which replaces the binary BEFORE the dependency
@@ -1004,7 +1021,7 @@ peer-to-peer; the server never sees raw pixels or keystrokes."""
 # DRIVER stays the host's, and it is a `suggests`, not `recommends`: apt
 # installs recommends by default, and Mesa's VA driver drags LLVM (~100 MB)
 # onto every headless server on the next agent update.
-depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0, libasound2"
+depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0, libasound2t64 (>= 1.0.29) | libasound2 (>= 1.0.29), libssl3t64 (>= 3.0.0) | libssl3 (>= 3.0.0)"
 # `ip` (iproute2) is how a Linux node gives its TUN the overlay IPv6; without it
 # the node stays v4-only and an exit cannot serve IPv6 (FR-97 §8, 2026-10-16: a
 # minimal container). A `recommends`, NOT a `depends`, for the reason above: the

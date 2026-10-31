@@ -199,6 +199,16 @@ decision function should return `Result<Applied, Reason>` and one call site
 should record both arms, so "a new refusal that forgets to audit itself" stays
 unrepresentable.
 
+**Keys that are never the server's (FR-52).** Every `external_*` key is the device
+owner's: gate 3 of cross-org access, and the password record behind it. `DesiredConfig`
+cannot hold one, under a prefix test, so the key that matters is also the one added
+after the test was written. The route says so instead of answering 200 for a key it
+dropped: a body naming one is refused with a 403 and audited as `device_owned_key`
+(`names_a_device_owned_key`, `crates/modules/fleet/src/remote_config.rs:171`). That
+refusal is a courtesy to the admin who asked. What stops a compromised server is the
+device, whose frame type drops the key whatever a frame carries
+(`a_pushed_external_key_never_reaches_the_device`,
+`agents/roomlerd/src/remote_config.rs:567`).
 
 **A non-security key on the same surface (FR-77 P3).** `encoder_cells_deny`
 — the cell matrix's denylist, comma-separated `name:chroma` entries or `none`
@@ -244,7 +254,7 @@ Unlike the two denylists, the server reads the word. It takes the words
 `roomler config set` takes (`true`/`false`, `1`/`0`, `yes`/`no`, in any case),
 stores the spelling above, and refuses anything else with a 400 that names the
 key, recording nothing (`pushed_tribool`,
-`crates/modules/fleet/src/remote_config.rs:159`). A tribool has no entries a
+`crates/modules/fleet/src/remote_config.rs:182`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
 (`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3104`), and a test
@@ -269,7 +279,7 @@ it only ever *removes* a GPU form a device would otherwise open. It reports
 `needs_restart`, because the probe reads it once per process and the encoders
 read it through the config fallbacks
 (`agents/roomlerd/src/remote_config.rs:354`). The server passes it on unread
-(`crates/modules/fleet/src/remote_config.rs:206`): an entry the gate cannot read
+(`crates/modules/fleet/src/remote_config.rs:229`): an entry the gate cannot read
 denies nothing, because `gpu_hint::is_denied` matches only an exact `name:gpu`.
 It exists so that a GPU-input cell can be turned off from the server before any
 cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
@@ -285,7 +295,7 @@ cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
 pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
 or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
 guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
-`crates/remote_control/src/models.rs:9641`); a prefix match would refuse the
+`crates/remote_control/src/models.rs:9693`); a prefix match would refuse the
 kill switch along with the switch.
 
 ⚠️ **A push lands on connect, and takes effect at the restart after it.** A
@@ -294,6 +304,12 @@ reconnect. Restarting it before it has reported the push only reconnects it:
 the new daemon starts on the old value, then writes the pushed one and reports
 `needs_restart`, so it takes a second restart. Restart once the device reports
 `needs_restart`. The same holds for every `needs_restart` key here.
+
+On a device that stays connected, the first restart is the reconnect, so it
+takes two. `roomler restart` at the device does both, with no `roomler exec` and
+no elevation, at least 30 s apart. Taking a deny off costs the same two steps:
+`none` lands at the next reconnect, and the deny holds until the restart after
+it ([FR-132](fr/FR-132-zero-copy-by-default.md) §8).
 
 ## 7. What this does not do
 

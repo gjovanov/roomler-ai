@@ -665,6 +665,7 @@ mod tests {
             notification_preferences: NotificationPrefs::default(),
             tutorial: TutorialState::default(),
             signup_attribution: attribution,
+            activation_resent_at: None,
             created_at: now,
             updated_at: now,
             deleted_at: None,
