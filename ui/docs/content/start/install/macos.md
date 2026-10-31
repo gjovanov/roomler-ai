@@ -48,10 +48,11 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   --server https://roomler.ai --name "$(hostname)"
 ```
 
-:::note The graphical installer cannot install the agent on a Mac
-On macOS, [Roomler Setup](https://roomler.ai/api/setup/macos) installs only
-`roomler`, the tunnel client. Install either half of the agent with one of the
-commands above.
+:::note Or use the graphical installer, with no token to copy
+Since 2026-10-30, [Roomler Setup](https://roomler.ai/api/setup/macos) installs
+both halves behind one administrator password: you approve the device in your
+browser, and the Mac joins as the two devices above. Untick **Join the overlay
+network** under Advanced options for screen sharing alone.
 :::
 
 `--daemon-token` is what installs the root LaunchDaemon *and* turns the overlay

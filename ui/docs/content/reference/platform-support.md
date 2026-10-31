@@ -115,7 +115,7 @@ More on [Roomler SSH](/docs/network/ssh/).
 | The desktop app | ✅ | 🟡 a `.deb` and an `.rpm`, for x86_64 and arm64; nothing for a computer with neither package manager, such as Arch | ✅ |
 | The computer stays awake during a session | ✅ | ✅ | ✅ except a closed laptop with no external display |
 | A received file lands in your own Downloads | ✅ | ✅ | ✅ |
-| The setup wizard installs the agent | ✅ | ❌ use the one-line install | ❌ use the one-line install |
+| The setup wizard installs the agent | ✅ | ✅ since 2026-10-30 | ✅ since 2026-10-30 |
 
 ## Installs and updates
 
