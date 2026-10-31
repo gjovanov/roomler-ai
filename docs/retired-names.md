@@ -52,7 +52,7 @@ flowchart TD
 |---|---|---|---|
 | **ANCHOR** | `RETIRED-NAME-ANCHOR` followed by `:` or `(N):`, or a `-BEGIN` … `-END` pair | code that resolves, matches or writes the retired name at runtime — a read-fallback over a pre-rename tree, a sweep that deletes the old unit, a wire value a deployed peer still sends | `anchors` must equal the baseline in both directions (`:562`, `:580`): a deleted anchor and a stale floor both fail |
 | **RECORD** | `RETIRED-NAME-RECORD` followed by `:` or `(N):`, or a `-BEGIN` … `-END` pair | prose and fixtures that name the retired thing *in order to explain it* — a field log quoting real output, a migration note, the table above | `records` must equal the baseline in both directions (`:594`) |
-| unclassified | none | nobody has decided | `--check --strict` requires 0 (`:608`); the `name-audit` job in `.github/workflows/ci.yml:2372` runs it on every PR (`:2414`) |
+| unclassified | none | nobody has decided | `--check --strict` requires 0 (`:608`); the `name-audit` job in `.github/workflows/ci.yml:2374` runs it on every PR (`:2416`) |
 
 🔑 **The falsifiable rule**: *if deleting the live code would also delete this
 occurrence, it is an ANCHOR; if the occurrence would survive, it is a RECORD.*
@@ -70,7 +70,7 @@ comment would otherwise have exempted the regression.
 Both counts move only with `scripts/name-audit.sh --update-baseline`, committed
 in the same PR, whose body says which anchor retired (and which field state no
 longer exists) or which record was added (and what it records). The CI job
-prints the summary beside its verdict (`ci.yml:2417`), so a reviewer can diff
+prints the summary beside its verdict (`ci.yml:2419`), so a reviewer can diff
 the number against the claim. A marker that covers nothing fails `--check`
 (`:555`): an empty exemption is the one that silently widens.
 
@@ -86,7 +86,8 @@ on a *condition*, each one named:
 | appdirs read-fallback | `crates/agent-core/src/appdirs.rs:85`, `:175` | **kept on purpose** — `migrate_legacy_trees` skips whenever the desktop companion is running, and the daemon respawns that companion, so on a GUI host the fallback is the *primary* path, not a safety net |
 | already-published release assets | `agents/roomlerd/src/updater.rs:988`, `agents/roomler-cli/src/update.rs:391` | no picker matches them. The daemon lane has published `roomlerd-*` since 0.4.38 (field-proven across the rename on 0.4.40). The **tunnel lane still publishes the retired prefix** (`.github/workflows/release-tunnel.yml:165`), and the CLI's updater refuses a tarball whose inner directory is not that spelling — so that rename is its own two-release migration: a CLI that accepts both first, the rename once no tunnel-only host runs an older one |
 | sweeps that delete the old thing | `agents/roomlerd/src/win_service/mod.rs:105`, `agents/roomlerd/packaging/macos/postinstall`, `scripts/install.sh --uninstall` | no host can still have the thing swept — a sweep must *name* what it removes |
-| MSI installer identity | the WiX ARP entry, FileKey and ProductName | a major-upgrade decision, not a rename |
+| MSI installer identity | the WiX FileKeys, the Component and Feature Ids and the UpgradeCodes | a major-upgrade decision, not a rename. The ProductName (what Apps & Features lists) was only ever a display name, since an upgrade matches the UpgradeCode: FR-133 P1 renamed it |
+| the Apps & Features names from before FR-133 P1 | `scripts/install.ps1:109`, `agents/roomlerd/scripts/m3-a1-verify-win11.ps1:387` | no machine still carries an install from before P1: its next update replaces the entry, under the new name |
 | wire values | `crates/tunnel-core/src/transport/quic.rs:61` | **step 2 of 3 shipped with this page**: the server has answered both ALPNs since 0.4.45; the client now offers only the current one; the legacy arm goes once no client can still offer it |
 | env fallbacks | `crates/tunnel-core/src/env.rs:215`, `:225` | the retired prefix is **searched, never read** — a host that still sets one is told at startup and on `roomler status` — and the arm goes once no host can have one |
 | a Windows rendezvous path | `agents/roomlerd/src/system_context/peer_presence.rs:82` | written today by the SystemContext worker and read by the supervisor, which can be different versions mid-update: a dual-read window first, then the rename |

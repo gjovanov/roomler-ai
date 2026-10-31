@@ -26,7 +26,7 @@ flowchart TB
 | Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux |
 | Agent overlay tests | add `--features overlay-l3` | ⚠️ feature-gated — the default `--lib` run silently skips them |
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
-| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2541`) |
+| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2543`) |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
 | Phone-width smoke | `cd ui && bun run test:phone` | nothing — the built SPA with every `/api` call mocked (`ui/e2e-phone/`) |
@@ -691,17 +691,25 @@ cascades and `--name` are hardware by construction, so they always ask.
   `--bench-fps`, a session's cadence.
 - **One thread, holding its clock.** Every cell opens, encodes and is dropped on one thread of the
   bench's own, the way a session's encoder lives on its thread (`encode::thread`). So a
-  thread-affine encoder (QSV) never changes threads between frames. On Linux that thread asks
-  for its clock first, as a session's encoder thread does
-  ([FR-112](encoders.md#software-encoders-the-clock-and-60-fps-fr-112) P1), and the threads an
-  encoder starts inherit it. Without it, energy-aware scheduling clocks a periodic encoder down
-  until its work fills the frame period: the same OpenH264 frame took 6 ms back to back and
-  16–20 ms at a 30 fps cadence on an Apple M2 Pro. The preamble's `clock=` says what the thread
-  got: `clamped`, `refused:<errno>` (a kernel without `CONFIG_UCLAMP_TASK`, or a cgroup limit),
-  `off` (`ROOMLERD_ENCODER_CLOCK=0`) or `n/a` (not Linux). A paced row well above its back-to-back
-  twin, on a host that did not answer `clamped`, is the CPU's clock, not the encoder.
+  thread-affine encoder (QSV) never changes threads between frames. That thread asks for its
+  clock first, as a session's encoder thread does
+  ([FR-112](encoders.md#software-encoders-the-clock-and-60-fps-fr-112) P1, P3), and on Linux the
+  threads an encoder starts inherit it. Without it, energy-aware scheduling clocks a periodic
+  encoder down until its work fills the frame period: the same OpenH264 frame took 6 ms back to
+  back and 16–20 ms at a 30 fps cadence on an Apple M2 Pro. The preamble's `clock=` says what the
+  thread got: `clamped` (Linux), `qos-user-interactive` (macOS), `unthrottled` (Windows),
+  `refused:<errno>` (on Linux, a kernel without `CONFIG_UCLAMP_TASK`, or a cgroup limit), `off`
+  (`ROOMLERD_ENCODER_CLOCK=0`, or unset on macOS and Windows, where the request is
+  [opt-in](encoders.md#the-clock-on-macos-and-windows-fr-112-p3)) or `n/a` (no request on this
+  OS). A paced row well above its back-to-back twin, on a host that answered `off` or `refused`,
+  is the CPU's clock, not the encoder.
 - ⚠️ **Noise.** These are wall-clock times on a host doing other things. Run a cell twice and read
   the spread before comparing two hosts: the reference run below did, on a busy machine.
+- ⚠️ **One frame rate and one size to a comparison.** At `--bench-fps 60` a frame carries half the
+  motion of one at 30, so it costs less whatever the clock does: set a paced row against a
+  back-to-back row at the same `--bench-fps`. Run one size per process: on a Windows laptop an
+  H.264 row that followed a VP9-444 row at a smaller size read about twice as slow, on any core
+  ([FR-112 §9](fr/FR-112-software-encoding-at-60-fps.md#9-field-verification-log)).
 
 **Reference run** (2026-10-30). A release build with the Linux release lane's features
 (`release-agent.yml:552`) ran in an Ubuntu 24.04 container on a busy Windows dev box, with no GPU

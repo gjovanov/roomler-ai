@@ -1945,7 +1945,7 @@ jobs:
           files: |
             ${{ steps.locate.outputs.artifact }}
             ${{ steps.locate_pm.outputs.artifact }}
-          description:              'Roomler Agent installer'
+          description:              'Roomler installer'
           mode:                     ${{ github.event.inputs.signing_mode || 'auto' }}
           require:                  ${{ needs.validate-version.outputs.is_release == 'true' || github.event.inputs.require_signing == 'true' }}
           expect-subject-contains:  ${{ vars.AZURE_SIGNING_EXPECT_SUBJECT }}

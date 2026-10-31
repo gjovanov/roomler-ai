@@ -482,7 +482,7 @@ off while the machine stayed up (FR-55's keeper holds
 `PreventUserIdleSystemSleep`, which keeps the **machine** reachable and lets the
 display sleep, on purpose). The capture worker now takes
 `power::DisplayAwake` for its whole life
-(`agents/roomlerd/src/capture/scrap_backend.rs:154`,
+(`agents/roomlerd/src/capture/scrap_backend.rs:160`,
 `agents/roomlerd/src/power.rs:372`): `IOPMAssertionDeclareUserActivity` wakes
 the display (`caffeinate -u`), and `PreventUserIdleDisplaySleep` keeps it on,
 so a view-only session, which injects no input to count as activity, does not
@@ -2996,7 +2996,7 @@ system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
 So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1749`) asks for a trim, and
 `agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
 `mem-trim` thread, **5 s after the last session ended**. The delay lets the
-encoder thread finish freeing (`encode/thread.rs:265` joins it), and sessions
+encoder thread finish freeing (`encode/thread.rs:266` joins it), and sessions
 ending together cost one trim. A trim takes each arena's lock in turn and nobody
 waits for it. "glibc holds" does not fall after a trim, because the pages are
 released with `MADV_DONTNEED` while the arena keeps the address space. RSS is the

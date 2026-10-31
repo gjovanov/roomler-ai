@@ -379,10 +379,12 @@ function Action-Rollback {
     # Locate the installed product code via msiexec query — perMachine
     # MSI's UpgradeCode is the one in wix-perMachine/main.wxs.
     $upgradeCode = '{2A8E9C2D-3F1A-5E3F-C2B4-7C2F3D8F5E02}'
-    # RETIRED-NAME-ANCHOR: "Roomler Agent (per-Machine)" IS the ARP
-    # DisplayName (wix-perMachine/main.wxs). Changing it here finds
-    # nothing; changing it THERE orphans every installed agent.
-    $product = Get-CimInstance Win32_Product -Filter "Name LIKE '%Roomler Agent (per-Machine)%'" -ErrorAction SilentlyContinue
+    # The ARP name is wix-perMachine/main.wxs's Name: 'Roomler (per-Machine)'
+    # since FR-133 P1. An install from before P1 keeps the old name until
+    # its next upgrade, so match both, exactly.
+    # RETIRED-NAME-ANCHOR: the pre-FR-133 per-Machine ARP name; it goes once
+    # no machine can still carry an install from before P1.
+    $product = Get-CimInstance Win32_Product -Filter "Name = 'Roomler (per-Machine)' OR Name = 'Roomler Agent (per-Machine)'" -ErrorAction SilentlyContinue
     if (-not $product) {
         Write-Host 'No perMachine Roomler install found. Nothing to roll back.' -ForegroundColor Yellow
         return
