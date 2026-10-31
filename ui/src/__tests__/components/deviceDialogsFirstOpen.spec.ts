@@ -13,6 +13,10 @@
 // #3182, in External access: it copied the connect code from the store at the
 // open, before its own fetch landed, so a fresh page load showed "Not yet
 // created" and offered Create, which rotates the code the device already has.
+//
+// #3197, also in External access: the list it read holds approved devices only,
+// so a code on an unapproved device still read as none. It now asks for the
+// device's own code.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { reactive } from 'vue'
@@ -77,6 +81,7 @@ function agentStore() {
     fetchOrgSshEnabled: vi.fn(),
     fetchTenantMembers: vi.fn(),
     fetchExternalAccess: vi.fn(),
+    fetchConnectCode: vi.fn().mockResolvedValue(null),
     rotateConnectCode: vi.fn(),
     updateExecPolicy: vi.fn().mockResolvedValue(undefined),
     updateSshPolicy: vi.fn().mockResolvedValue(undefined),
@@ -277,8 +282,7 @@ describe('ExternalAccessDialog on its first open (#3156)', () => {
     device({ external_access_policy: STORED, capabilities: caps('external-access') })
 
   it('shows the standing approval and its connect code, not a revoked one', async () => {
-    // The code where the org's Settings page leaves it in the store.
-    store.externalDevices = [{ id: AGENT_ID, connect_code: 'K7QX-2M9P-4HTD' }]
+    store.fetchConnectCode.mockResolvedValue('K7QX-2M9P-4HTD')
     const w = track(mount(ExternalAccessDialog, opened(approved())))
     await flushPromises()
     expect(switchOn('Allow people outside this organization to control this device')).toBe(true)
@@ -286,6 +290,7 @@ describe('ExternalAccessDialog on its first open (#3156)', () => {
     expect(document.body.querySelector('code.text-h6')?.textContent?.trim()).toBe('K7QX-2M9P-4HTD')
     // It reads what every later open reads, and writes nothing.
     expect(store.fetchExternalAccess).toHaveBeenCalledWith(TID)
+    expect(store.fetchConnectCode).toHaveBeenCalledWith(TID, AGENT_ID)
     expect(store.updateExternalAccessPolicy).not.toHaveBeenCalled()
     expect(w.emitted('update:modelValue')).toBeUndefined()
   })
@@ -299,23 +304,14 @@ describe('ExternalAccessDialog on its first open (#3156)', () => {
   })
 })
 
-describe('ExternalAccessDialog reads the connect code its own fetch brings (#3182)', () => {
+describe("ExternalAccessDialog reads the device's own connect code (#3182, #3197)", () => {
   const CODE = 'K7QX-2M9P-4HTD'
   const approved = () =>
     device({
       external_access_policy: { approved: true, max_permissions: null, expires_at: null },
       capabilities: caps('external-access'),
     })
-
-  /** What the real fetch does: the org switch and the approved devices land
-   *  together, a tick after the call. */
-  function listLands(devices: { id: string; connect_code: string | null }[]) {
-    store.fetchExternalAccess.mockImplementation(async () => {
-      await Promise.resolve()
-      store.orgExternalAccessEnabled = true
-      store.externalDevices = devices
-    })
-  }
+  const unapproved = () => device({ capabilities: caps('external-access') })
 
   /** The code row's one button, labelled Rotate or Create. */
   function codeButton(): HTMLButtonElement | undefined {
@@ -326,19 +322,18 @@ describe('ExternalAccessDialog reads the connect code its own fetch brings (#318
   const shownCode = () => document.body.querySelector('code.text-h6')?.textContent?.trim()
   const textShown = (text: string) => document.body.textContent?.includes(text) ?? false
 
-  it('on a fresh page load, shows the code once the list lands, and offers Rotate', async () => {
-    // Nothing has filled the store: the org Settings page was not opened.
-    listLands([{ id: AGENT_ID, connect_code: CODE }])
+  it('on a fresh page load, shows the code once its read lands, and offers Rotate', async () => {
+    store.fetchConnectCode.mockResolvedValue(CODE)
     track(mount(ExternalAccessDialog, opened(approved())))
     await flushPromises()
-    expect(store.fetchExternalAccess).toHaveBeenCalledWith(TID)
+    expect(store.fetchConnectCode).toHaveBeenCalledWith(TID, AGENT_ID)
     expect(shownCode()).toBe(CODE)
     expect(codeButton()?.textContent?.trim()).toBe('Rotate')
     expect(store.rotateConnectCode).not.toHaveBeenCalled()
   })
 
-  it('offers no Create while the list is still being read', async () => {
-    store.fetchExternalAccess.mockImplementation(() => new Promise(() => {}))
+  it('offers no Create while the code is still being read', async () => {
+    store.fetchConnectCode.mockImplementation(() => new Promise(() => {}))
     track(mount(ExternalAccessDialog, opened(approved())))
     await flushPromises()
     expect(shownCode()).toBeUndefined()
@@ -348,8 +343,7 @@ describe('ExternalAccessDialog reads the connect code its own fetch brings (#318
   })
 
   it('says it could not read the code when the read fails, and still offers no Create', async () => {
-    // The real fetch leaves the store unread on any failure; it never throws.
-    store.fetchExternalAccess.mockResolvedValue(undefined)
+    store.fetchConnectCode.mockRejectedValue(new Error('503'))
     track(mount(ExternalAccessDialog, opened(approved())))
     await flushPromises()
     expect(textShown('Could not read the code.')).toBe(true)
@@ -357,11 +351,10 @@ describe('ExternalAccessDialog reads the connect code its own fetch brings (#318
     expect(codeButton()?.disabled).toBe(true)
   })
 
-  it('offers Create once the list is read without the device, and shows the code it mints', async () => {
-    // Not approved, so the list of approved devices does not hold it.
-    listLands([])
+  it('offers Create only once the read says there is no code, and shows the code it mints', async () => {
+    store.fetchConnectCode.mockResolvedValue(null)
     store.rotateConnectCode.mockResolvedValue(CODE)
-    track(mount(ExternalAccessDialog, opened(device({ capabilities: caps('external-access') }))))
+    track(mount(ExternalAccessDialog, opened(unapproved())))
     await flushPromises()
     expect(textShown('Not yet created')).toBe(true)
     expect(codeButton()?.textContent?.trim()).toBe('Create')
@@ -371,6 +364,108 @@ describe('ExternalAccessDialog reads the connect code its own fetch brings (#318
     expect(store.rotateConnectCode).toHaveBeenCalledWith(TID, AGENT_ID)
     expect(shownCode()).toBe(CODE)
     expect(codeButton()?.textContent?.trim()).toBe('Rotate')
+  })
+
+  it('shows the code of a device that is not approved, and offers Rotate, not Create', async () => {
+    // Approval withdrawn: the code stayed on the row, and the approved list,
+    // which is all the dialog used to read, does not hold the device.
+    store.orgExternalAccessEnabled = true
+    store.externalDevices = []
+    store.fetchConnectCode.mockResolvedValue(CODE)
+    track(mount(ExternalAccessDialog, opened(unapproved())))
+    await flushPromises()
+    expect(shownCode()).toBe(CODE)
+    expect(textShown('Not yet created')).toBe(false)
+    expect(codeButton()?.textContent?.trim()).toBe('Rotate')
+  })
+
+  it('still shows a code minted before approval on the next open', async () => {
+    store.orgExternalAccessEnabled = true
+    store.fetchConnectCode.mockResolvedValueOnce(null)
+    store.rotateConnectCode.mockResolvedValue(CODE)
+    const w = track(mount(ExternalAccessDialog, opened(unapproved())))
+    await flushPromises()
+    codeButton()!.click()
+    await flushPromises()
+
+    // Closed without approving, then opened again.
+    store.fetchConnectCode.mockResolvedValueOnce(CODE)
+    await w.setProps({ modelValue: false } as unknown as Parameters<typeof w.setProps>[0])
+    await w.setProps({ modelValue: true } as unknown as Parameters<typeof w.setProps>[0])
+    await flushPromises()
+    expect(shownCode()).toBe(CODE)
+    expect(codeButton()?.textContent?.trim()).toBe('Rotate')
+  })
+
+  it("does not show one device's code on another when a read lands late", async () => {
+    let answerFirst: (code: string) => void = () => {}
+    store.fetchConnectCode.mockImplementationOnce(
+      () => new Promise<string>((resolve) => (answerFirst = resolve)),
+    )
+    const w = track(mount(ExternalAccessDialog, opened(unapproved())))
+    await flushPromises()
+
+    // The dialog moves to another device, which has none, before the first
+    // device's answer lands.
+    store.fetchConnectCode.mockResolvedValueOnce(null)
+    await w.setProps({ modelValue: false } as unknown as Parameters<typeof w.setProps>[0])
+    await w.setProps({
+      modelValue: true,
+      agent: device({ id: 'c00000000000000000000002', capabilities: caps('external-access') }),
+    } as unknown as Parameters<typeof w.setProps>[0])
+    await flushPromises()
+    answerFirst(CODE)
+    await flushPromises()
+    expect(shownCode()).toBeUndefined()
+    expect(textShown('Not yet created')).toBe(true)
+  })
+
+  it('does not put a replaced code back when an old read lands after a mint', async () => {
+    const OLD = 'ABCD-EFGH-JKMN'
+    let answerFirst: (code: string) => void = () => {}
+    store.fetchConnectCode.mockImplementationOnce(
+      () => new Promise<string>((resolve) => (answerFirst = resolve)),
+    )
+    const w = track(mount(ExternalAccessDialog, opened(unapproved())))
+    await flushPromises()
+
+    // Closed and opened on the same device with the first read still out, so
+    // comparing device ids cannot tell the two reads apart.
+    store.fetchConnectCode.mockResolvedValueOnce(OLD)
+    await w.setProps({ modelValue: false } as unknown as Parameters<typeof w.setProps>[0])
+    await w.setProps({ modelValue: true } as unknown as Parameters<typeof w.setProps>[0])
+    await flushPromises()
+    expect(shownCode()).toBe(OLD)
+
+    store.rotateConnectCode.mockResolvedValue(CODE)
+    codeButton()!.click()
+    await flushPromises()
+    answerFirst(OLD)
+    await flushPromises()
+    expect(shownCode()).toBe(CODE)
+  })
+
+  it("does not show a code minted for one device on another when the mint lands late", async () => {
+    let answerMint: (code: string) => void = () => {}
+    store.rotateConnectCode.mockImplementationOnce(
+      () => new Promise<string>((resolve) => (answerMint = resolve)),
+    )
+    const w = track(mount(ExternalAccessDialog, opened(unapproved())))
+    await flushPromises()
+    codeButton()!.click()
+    await flushPromises()
+
+    // The dialog moves to another device, which has none, with the mint out.
+    await w.setProps({ modelValue: false } as unknown as Parameters<typeof w.setProps>[0])
+    await w.setProps({
+      modelValue: true,
+      agent: device({ id: 'c00000000000000000000002', capabilities: caps('external-access') }),
+    } as unknown as Parameters<typeof w.setProps>[0])
+    await flushPromises()
+    answerMint(CODE)
+    await flushPromises()
+    expect(shownCode()).toBeUndefined()
+    expect(textShown('Not yet created')).toBe(true)
   })
 })
 

@@ -1619,6 +1619,17 @@ export const useAgentStore = defineStore('agents', () => {
     if (idx !== -1) agents.value[idx]!.external_access_policy = policy
   }
 
+  /** Read one device's connect code, approved or not: `null` when it has none.
+   *  This one throws, unlike `fetchExternalAccess`. "Could not read it" and
+   *  "there is none" must stay different answers, because the second is what
+   *  offers Create, and Create replaces a code. */
+  async function fetchConnectCode(tenantId: string, agentId: string): Promise<string | null> {
+    const resp = await api.get<{ connect_code: string | null }>(
+      `/tenant/${tenantId}/agent/${agentId}/connect-code`,
+    )
+    return resp.connect_code
+  }
+
   /** Mint or rotate a device's connect code. One call for both, because
    *  rotation IS the revocation story for a leaked code. */
   async function rotateConnectCode(tenantId: string, agentId: string): Promise<string> {
@@ -1941,6 +1952,7 @@ export const useAgentStore = defineStore('agents', () => {
     fetchExternalAccess,
     setOrgExternalAccessEnabled,
     updateExternalAccessPolicy,
+    fetchConnectCode,
     rotateConnectCode,
     orgEphemeralKeysEnabled,
     fetchOrgEphemeralKeysEnabled,
