@@ -426,6 +426,9 @@ mod tests {
     #[test]
     fn serialises_camel_case() {
         let json = serde_json::to_string(&ON.view(HostOs::Linux)).unwrap();
-        assert_eq!(json, r#"{"pairing":true,"daemonOffered":true}"#);
+        assert_eq!(
+            json,
+            r#"{"pairing":true,"pairingOff":false,"daemonOffered":true}"#
+        );
     }
 }
