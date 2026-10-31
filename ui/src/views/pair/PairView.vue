@@ -226,7 +226,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useDisplay } from 'vuetify'
 import { useI18n } from 'vue-i18n'
-import { api } from '@/api/client'
+import { api, ApiError } from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
 import { useTenantStore } from '@/stores/tenant'
 import { useBrand } from '@/composables/useBrand'
@@ -405,9 +405,9 @@ async function createOrg() {
     orgId.value = tenant.id
   } catch (e) {
     const msg = e instanceof Error ? e.message : ''
-    // tenants.slug is globally unique — put the dup-key case in words.
+    // tenants.slug is globally unique, and a taken slug is the only 409 here.
     orgError.value =
-      msg.includes('duplicate') || msg.includes('E11000') ? t('pair.orgSlugTaken') : msg || t('pair.orgCreateFailed')
+      e instanceof ApiError && e.status === 409 ? t('pair.orgSlugTaken') : msg || t('pair.orgCreateFailed')
   } finally {
     creatingOrg.value = false
   }
