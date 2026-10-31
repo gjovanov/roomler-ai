@@ -38,11 +38,11 @@ may restart; a VM cannot prove it. FR-63 B3 deletes this code, so new learner be
 question for the operator, not a phase of this FR.
 
 **Driven 2026-10-31 evening, on 0.4.191, CORPLAP-2 on its natural relay. This replaces the
-paragraph above for AC1, AC2, AC3 and AC6.** **AC1, AC2 and AC3 are met.** Two things go with
-those ticks. On H.265 4:4:4, this pair's default cell now, a cold opener clears AC1 and AC2 too, so
-they record that the opening is no longer starved, not that the memory is why. And the note above
-that 2.5× needs a 7.5 M memory was wrong: the keyframe does not follow `maxrate` in a straight line
-([the A/B](#the-opener-ab-2026-10-31)). **AC4** waits on CORPLAP-1, whose RC rows are not ours to
+paragraph above for AC1, AC2, AC3 and AC6.** **AC3 is met. AC1 and AC2 are `[~]`:** their numbers
+pass, but on H.265 4:4:4, this pair's default cell now, a cold opener passes them too, so the run
+does not show that the learned rate improved the opener. Which reading counts is the operator's
+call. The note above that 2.5× needs a 7.5 M memory was also wrong: the keyframe does not follow
+`maxrate` in a straight line ([the A/B](#the-opener-ab-2026-10-31)). **AC4** waits on CORPLAP-1, whose RC rows are not ours to
 clear. **AC6** has its host now, jupiter, and needs one operator OK. The memory stood at 4,326,752
 at 22:41 after three writes, one of them an evidence of 13.04 M, above `hi`, from a 45 s session
 ([field log](#field-log)); that belongs with FR-79's open hold question.
@@ -116,18 +116,22 @@ lumpiness, governor.rs:256-262 — the AIMD's own stable target is the robust si
 Measured with the FR-31 harness on `neo16 → CORPLAP-2`, N ≥ 5 sessions after ≥ 1 learning session,
 shipped defaults:
 
-- [x] opening keyframe ≥ 2.5× today's bytes (≥ 14 KB at 1920×1200, today 5.6 KB) and first-light
-      sharpness ≥ 70 % of the 8 s steady state (today 47 %) — **met 2026-10-31, 0.4.191.** Five
-      sessions after the learning drag with nothing overridden, on a dense screen: 23.1–23.3 KB, first
-      light 104–107 %. **The bar is August's 5.6 KB and 47 %, and a cold opener clears it as well:**
-      23.4–63.3 KB and 106–107 % on the same screen and cell, 13.6–37.8 KB and 89–107 % on AV1. Against a
-      cold opener on the same cell, the pair's keyframe is 1× or less. So this box says the opening
-      is no longer starved, not that the memory did it ([the A/B](#the-opener-ab-2026-10-31))
-- [x] time-to-crisp ≤ 0.6 s (today 1.2 s) — **met 2026-10-31**, with the cold-vs-seeded A/B this
-      criterion asks for. Time-to-crisp is FR-31's, ≥ 90 % of steady. It read 0 ms in every H.265
-      session of every arm, and at most 185 ms on AV1. A cold opener passes too, at 155 ms at worst.
-      The memory's effect shows only nearer the top: on AV1 on the wallpaper, 97 % of steady took
-      994–1,312 ms cold, 756–948 ms at the pair's rate and 302–743 ms at 4.55 M
+- [~] opening keyframe ≥ 2.5× today's bytes (≥ 14 KB at 1920×1200, today 5.6 KB) and first-light
+      sharpness ≥ 70 % of the 8 s steady state (today 47 %) — **measured 2026-10-31, 0.4.191; which
+      reading counts is the operator's call.** Five sessions after the learning drag with nothing
+      overridden, on a dense screen: 23.1–23.3 KB, first light 104–107 %. **Against the numbers it
+      names, 14 KB and 70 %, this passes. As a test that the learned rate improves the opener, it
+      shows nothing,** because a cold opener passes as well: 23.4–63.3 KB and 106–107 % on the same
+      screen and cell, 13.6–37.8 KB and 89–107 % on AV1. Against a cold opener on the same cell, the
+      pair's keyframe is 1× or less. The criterion was also written on AV1, not on today's default
+      H.265 4:4:4 cell ([the A/B](#the-opener-ab-2026-10-31))
+- [~] time-to-crisp ≤ 0.6 s (today 1.2 s) — **measured 2026-10-31, with the cold-vs-seeded A/B
+      this criterion asks for; the same two readings as AC1.** Time-to-crisp is FR-31's, ≥ 90 % of
+      steady. **Against the number it names, this passes:** 0 ms in every H.265 session of every arm,
+      at most 185 ms on AV1. **As a test that the learned rate improves it, it shows nothing:** a cold
+      opener passes too, at 155 ms at worst, and August's 1.2 s did not reproduce. The memory's
+      effect shows only nearer the top: on AV1 on the wallpaper, 97 % of steady took 994–1,312 ms
+      cold, 756–948 ms at the pair's rate and 302–743 ms at 4.55 M
 - [x] a 60 s drag: no send wait > 1 s, viewer-age p99 not worse than the FR-18 numbers, and the
       ceiling never above `hi` — **met 2026-10-31**, 0.4.191, CORPLAP-2 on `relay:derp/tcp`: a real
       Explorer window dragged by its title bar for 60 s, 1,136 pointer moves, 2.94 Mbps mean, 4.35

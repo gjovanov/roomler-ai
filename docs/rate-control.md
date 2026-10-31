@@ -447,8 +447,9 @@ cannot prove that switch (FR-35 AC6).
 >   the memory +0.2 % (`ALPHA_UP` 0.10 of the gap), the next idle session moved
 >   it −7.5 % (its own seed written back as evidence). Nothing in these reads
 >   measured a sustainable limit; the memory's level is the write-back's
->   dynamics, not the pipe's. (FR-35 AC1 was met on 2026-10-31 without moving
->   this: [the opener A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-opener-ab-2026-10-31).)
+>   dynamics, not the pipe's. (FR-35 AC1's numbers passed on 2026-10-31 without
+>   moving this, and a cold opener passes them too:
+>   [the opener A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-opener-ab-2026-10-31).)
 
 ### The write-back and the seed (V2 + V4) — the pair memory
 
@@ -548,9 +549,10 @@ of 7.5 M, on the assumption that the keyframe follows `maxrate`. It does not
 follow it in a straight line ([the opener
 A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-opener-ab-2026-10-31)): on a
 dense screen on AV1, 1.6× the maxrate gave 3.5–5.8× the keyframe, and on H.265
-4:4:4, the same 2.55 M gave 23 to 63 KB. FR-35 AC1 is met at the pair's own
-2.85–3.0 M, on a bar a cold opener clears too. So the hold question is worth
-deciding for what the memory buys on AV1, and AC1 no longer depends on it.
+4:4:4, the same 2.55 M gave 23 to 63 KB. FR-35 AC1's numbers pass at the pair's
+own 2.85–3.0 M, on a bar a cold opener clears too, so AC1 stays `[~]` until the
+operator says which reading counts. The hold question is worth deciding for what
+the memory buys on AV1, and AC1's numbers do not depend on it.
 
 **Three writes in one night (2026-10-31, CORPLAP-2).** Evidence is
 `stable_bps()`, else `pipe_bps()` (`peer.rs:8988`), and nothing clamps the
