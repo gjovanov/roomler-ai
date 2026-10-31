@@ -648,7 +648,7 @@ and loses nothing: its daemon could not start before either, so no updater runs
 there, and re-running the install heals it.
 
 **`install.sh` installs a `.deb` in two steps** (`deb_install`,
-`scripts/install.sh:1326`), and the wizard's root half is the same code:
+`scripts/install.sh:1328`), and the wizard's root half is the same code:
 
 ```mermaid
 flowchart TD
@@ -1444,7 +1444,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1269` (the section) — `uninstall_linux` at `:1712`,
+`scripts/install.sh:1270` (the section) — `uninstall_linux` at `:1714`,
 `uninstall_macos` at `:1494`.
 
 ```mermaid

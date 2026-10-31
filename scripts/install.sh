@@ -1160,10 +1160,11 @@ desktop_install() {
     case "$1" in
         *.deb)
             # apt pulls webkit2gtk / GTK / appindicator when dpkg reports them
-            # missing, which on a fresh desktop it usually will. A companion that
-            # cannot finish comes off again: half-configured, it blocks apt for
-            # the whole host, the daemon's next update included.
-            deb_install "$1" || {
+            # missing, which on a fresh desktop it usually will, and without
+            # their Recommends, which run to ImageMagick and speech recognition.
+            # A companion that cannot finish comes off again: half-configured,
+            # it blocks apt for the whole host, the daemon's next update included.
+            deb_install "$1" --no-install-recommends || {
                 as_root dpkg --remove roomler-desktop || true
                 return 1
             }
@@ -1323,11 +1324,12 @@ as_root() {
 # package keeps it in the solution, so apt refuses instead and what dpkg unpacked
 # stays. --fix-broken has to stay too: without it apt will not touch a package
 # dpkg left half-configured, and stops before it looks for a dependency.
+# $2, optional, is one more apt-get option.
 deb_install() {
     as_root dpkg -i "$1" && return 0
     as_root apt-get update -qq ||
         warn "apt-get update failed: resolving the dependencies from the package lists this host already has"
-    as_root apt-get install -y --fix-broken -o DPkg::Lock::Timeout=60 "$1"
+    as_root apt-get install -y --fix-broken -o DPkg::Lock::Timeout=60 ${2:-} "$1"
 }
 
 # Relay a privileged helper's report: every line said, every FAILED line
