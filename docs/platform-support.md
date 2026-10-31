@@ -170,7 +170,7 @@ and never outliving the daemon (FR-97 P0e).
 | One verb registers the system service | ✅ | ✅ | ✅ | `service install --as-service` (alias `--system`, `agents/roomlerd/src/service.rs:413-420`) |
 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | ✅ `install.sh --uninstall` | ✅ the same | `docs/installation.md`, Uninstall |
 | An ephemeral device removes itself on a clean stop | ✅ | ✅ | ✅ | `docs/ephemeral-nodes.md` |
-| A crash in a worker is recorded by its supervisor | ✅ | ⛔ systemd | ✅ from 0.4.149, where the root daemon supervises the GUI worker (`macos_supervise_gui_worker`) | a signal, or an exit the agent did not choose; the record rides the root daemon's enrollment (`agents/roomlerd/src/macos_supervisor.rs:254-278`, FR-97 P6e-2) |
+| A crash in a worker is recorded by its supervisor | ✅ | ⛔ systemd | ✅ from 0.4.149, where the root daemon supervises the GUI worker (`macos_supervise_gui_worker`) | a signal, or an exit the agent did not choose; the record rides the root daemon's enrollment (`agents/roomlerd/src/macos_supervisor.rs:271-295`, FR-97 P6e-2) |
 | The daemon survives a log sink it cannot write | ✅ | ✅ | ✅ | #1538 |
 | An update's outcome is recorded | 🟡 written, never read | ❌ | ❌ | FR-67 |
 | The tunnel client updates itself (`roomler self-update`) | ✅ | ✅ from tunnel-v0.4.149: the tarball, or the `.deb` where dpkg owns the binary (field-verified on its release) | ✅ from tunnel-v0.4.149 (field-verified on its release) | every OS checks the release's `.asc` against the pinned key (`agents/roomler-cli/src/update.rs:227`); FR-97 P6b |

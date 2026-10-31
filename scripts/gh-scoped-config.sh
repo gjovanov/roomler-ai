@@ -101,8 +101,12 @@ EOF
 # and account, so a hand-written hosts.yml that names an account whose token
 # was never stored produces a directory that looks perfectly correct and
 # authenticates as nobody. Ask the API who it is.
+#
+# ⚠️ No answer fails even when OWNER is empty too, which an unset variable in the
+# caller makes it. Empty equals empty, and a blank `user:` is the one label the
+# guard hook lets through: it reads as "no account found".
 got="$(GH_CONFIG_DIR="$TMP" gh api user --jq .login 2>/dev/null || true)"
-if [ "$got" != "$OWNER" ]; then
+if [ -z "$got" ] || [ "$got" != "$OWNER" ]; then
   echo "FAILED: the scoped config authenticates as '${got:-nobody}', not '$OWNER'." >&2
   echo "        $DEST/hosts.yml was left as it was." >&2
   echo "        Run: GH_CONFIG_DIR=$DEST gh auth login   (then re-run this script)" >&2

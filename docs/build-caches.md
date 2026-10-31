@@ -161,6 +161,19 @@ its 6,000 MB cap, against a 25-minute ceiling (FR-6 wave 37). Every other `ci.ym
 cold run on record allows about 1.5 times it or more. Windows sessions and the FR-85 recorder
 lane have none.
 
+**A cache that grows past its cap is the GC at work, not that failure.** The bump to 0.4.191
+published the macOS overlay cache at 6,440 MB, over its 6,000, and the warning fired. The next
+three macOS jobs dropped it and built cold, in 9.2, 20.9 and 22.1 min, inside the 35-minute
+ceiling. The master run among them published 4,664 MB 23 minutes after the oversize publish,
+and the job after that was warm. So after that warning, read the next master publish. Under the
+cap, nothing is owed. Only a cold build that publishes over the cap again calls for raising it.
+
+**A macOS job's time does not say whether it ran cold.** Two of those jobs built the same 976
+crates and started 88 s apart: one took 9.2 min, the other 22.1. Warm jobs on that lane took
+6.9–17.3 min. Read the job's log instead: `restored target is N MB (> C) — dropping it whole`
+is a cold run, and `restored <family>: target N MB, same key` or `key changed` is a warm one.
+A warm job compiled 41 crates against the cold job's 976.
+
 The Linux lanes' caps began as estimates, about 1.5 times each lane's old Actions-cache archive
 at the 4.3× unpack ratio the integration lane measures (its 1,181 MB asset restores to
 5,077 MB). Wave 34's first master publish (run 41107105820) put every lane at 32–65 % of its
