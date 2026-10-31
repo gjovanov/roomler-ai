@@ -742,7 +742,8 @@ every node, and a regional relay's socket logs a line of its own under its
 `relay` name. Expect
 `clamped=true applied=212992` on a stock Linux kernel before 6.18, and
 `applied=262144` on Windows and macOS. On Linux, `ss -tmp` shows the same
-socket's `tb` as twice `applied`.
+socket's `tb` as twice `applied`. All three OSes read that way on the fleet on
+0.4.191 ([FR-18's field log](fr/FR-18-carrier-queue-discipline.md#field-log)).
 
 ⚠️ **A full outbound queue drops the frame uncounted.** `DerpConn::send_to`
 answers `Ok` when the queue is full (`crates/tunnel-core/src/transport/derp.rs:323`)

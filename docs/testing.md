@@ -678,7 +678,10 @@ cascades and `--name` are hardware by construction, so they always ask.
   the target as their cap.
 - ⚠️ **The table does not read the hello or the capability cache.** FR-16 AC1's "advertised" half
   is the device's record on the server (its hello's hardware encoders), which a fleet run joins
-  to these rows. A row says what this build opened on this host when it ran.
+  to these rows. A row says what this build opened on this host when it ran. Read `video_cells`
+  beside `hw_encoders` for that join: the legacy label is enumeration-only
+  (`agents/roomlerd/src/encode/caps.rs:1883`), so on Windows it says `mf-h264-hw` even where the
+  cascade lands on Microsoft's software MFT.
 - ⚠️ The bench does not drain an encoder at the end of a row, so a frame an encoder still holds
   is not counted in `out_kbps`.
 - `roomlerd encoder-smoke` is its own process, not the daemon: a driver that faults takes the
@@ -733,6 +736,21 @@ p50s were 3.7 and 4.7 ms (static), 8.1 and 7.5 (drag), 7.6 and 6.4 (pan), and it
 apart (27.8 and 17.2 ms on pan). So compare p50s across hosts, and p95s only between runs on a quiet
 host. `pan` cost OpenH264 a fifth of `drag`'s bitrate (676 against 3383 kbps): a uniform shift is
 what motion compensation predicts, and the dragged text's edges are what costs.
+
+**A fleet run** ([the table](fr/FR-16-rc-quality-benchmark.md#l1-fleet-run-2026-10-31)). The bench
+loads a machine someone may be using, so the live-use check goes inside the command, where it can
+stop the run. A check beside the run only tells you afterwards. Prove it before the first bench:
+once with an echo in the bench's place, and once with a limit nobody can pass, which must print a
+skip and run nothing. Send plain text: an encoded payload is the shape endpoint protection flags.
+
+| Stop on | Linux | Windows | macOS (read, not yet run) |
+|---|---|---|---|
+| A live session | `roomlerd rc` | `roomlerd rc` | `sudo -u <user> roomlerd rc`: the per-user half holds the sessions |
+| A person within 15 minutes | The newest tty access of `who`: `stat -c %X /dev/<tty>` | `user32!GetLastInputInfo` through `Add-Type`, which in session 1 reads the console session | `CGEventSourceSecondsSinceLastEventType` |
+| A busy host | `/proc/loadavg` at 3/4 of the CPUs | `LoadPercentage` at 50 | |
+
+Match the whole sentence `nobody is viewing this device`, so a daemon that does not answer stops
+the run too. Take the denominator from the server's device list, not from who answered exec.
 
 ## The overlay stress lane (FR-81)
 
