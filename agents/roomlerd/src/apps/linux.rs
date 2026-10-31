@@ -484,8 +484,7 @@ fn is_safe_session(s: &str) -> bool {
 ///    population using this feature today, and it must stay byte-for-byte
 ///    unchanged — a "smarter" probe that reordered this would change behaviour
 ///    for the one set of hosts already relying on it.
-/// 2. Otherwise, whoever is at the screen ([`crate::companion::graphical_session`],
-///    already built for FR-27's consent prompt and FR-45's capture helper).
+/// 2. Otherwise, the person signed in at the screen ([`desktop_session`]).
 ///    A Wayland session counts: mutter runs **Xwayland** even headless, so X11
 ///    tooling reaches its windows.
 ///
@@ -504,10 +503,22 @@ pub fn discover() -> Result<Target, Unavailable> {
         // the daemon started that Xvfb and owns it.
         return Ok(Target::Daemon { display });
     }
-    discover_with(
-        crate::companion::graphical_session().map_err(|e| format!("{e:#}")),
-        probe,
-    )
+    discover_with(desktop_session(&crate::companion::loginctl_stdout), probe)
+}
+
+/// The session this backend may act in: a person's (`Class=user`).
+///
+/// ⚠️ NOT [`crate::companion::graphical_session`], which also answers with a
+/// display manager's greeter because the consent path wants one. GDM's greeter
+/// IS an active graphical session, owned by the service account `gdm`, so a
+/// host parked at the login screen read as *"gdm has a graphical session but
+/// no X display on it answered: a Wayland compositor without Xwayland"* — false
+/// twice, since nobody is signed in and that greeter's Xwayland runs at `:1024`,
+/// a display the candidates below never try. Measured on GNOME Wayland, 0.4.190.
+fn desktop_session(
+    loginctl: &dyn Fn(&[&str]) -> anyhow::Result<String>,
+) -> Result<crate::companion::GraphicalSession, String> {
+    crate::companion::graphical_session_via(None, true, loginctl).map_err(|e| format!("{e:#}"))
 }
 
 /// The session arm of [`discover`] with its two inputs injected — what
@@ -1030,6 +1041,59 @@ mod tests {
                 assert!(xauthority.is_none(), "no runtime dir for a uid nobody has");
             }
             other => panic!("expected a Session target on :1, got {other:?}"),
+        }
+    }
+
+    // ── FR-56 P7 — the login screen, through the lookup `discover` really
+    // uses. `wmctrl -m` is scripted to ANSWER: on an X11 greeter it does, which
+    // is how a host nobody had signed in to read as a complete, empty desktop
+    // owned by `gdm`, with launch on offer.
+
+    /// A `loginctl` with exactly one session, as `show-session` prints it.
+    fn one_session(show: &'static str) -> impl Fn(&[&str]) -> anyhow::Result<String> {
+        move |args: &[&str]| {
+            Ok(match args {
+                ["list-sessions", ..] => "1 0 someone seat0\n".to_string(),
+                ["show-session", ..] => show.to_string(),
+                other => panic!("unexpected loginctl {other:?}"),
+            })
+        }
+    }
+
+    #[test]
+    fn the_login_screen_is_no_session_and_never_probes() {
+        for show in [
+            "Id=c1\nName=gdm\nUser=124\nSeat=seat0\nType=x11\nClass=greeter\nActive=yes\n",
+            "Id=c1\nName=gdm\nUser=124\nSeat=seat0\nType=wayland\nClass=greeter\nActive=yes\n",
+        ] {
+            let probes = RefCell::new(0u32);
+            let out = discover_with(desktop_session(&one_session(show)), |_| {
+                *probes.borrow_mut() += 1;
+                Probe::Answered
+            });
+            match out {
+                Err(why @ Unavailable::NoSession { .. }) => {
+                    assert_eq!(why.code(), "no_session");
+                    let reason = why.reason();
+                    assert!(reason.contains("the login screen is showing"), "{reason}");
+                }
+                other => panic!("expected NoSession, got {other:?}"),
+            }
+            assert_eq!(*probes.borrow(), 0, "a greeter is nothing to probe");
+        }
+    }
+
+    #[test]
+    fn a_persons_session_stays_the_desktop() {
+        // The uid is one no host has: no runtime dir, no cookie, as `session`.
+        let show =
+            "Id=2\nName=ana\nUser=4294967288\nSeat=seat0\nType=wayland\nClass=user\nActive=yes\n";
+        match discover_with(desktop_session(&one_session(show)), |_| Probe::Answered) {
+            Ok(Target::Session { user, wayland, .. }) => {
+                assert_eq!(user, "ana");
+                assert!(wayland);
+            }
+            other => panic!("expected ana's session, got {other:?}"),
         }
     }
 }

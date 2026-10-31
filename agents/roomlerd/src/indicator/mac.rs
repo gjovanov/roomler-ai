@@ -247,9 +247,8 @@ fn should_terminate() -> NSApplicationTerminateReply {
                 quit_reason = %reason_text,
                 sender = %sender_text,
                 exit_code = code,
-                "a Quit AppleEvent (System Settings' Quit & Reopen, the Dock, Activity Monitor, a \
-                 script): restarting under the supervisor instead of exiting 0, which launchd \
-                 would not relaunch (#3164)"
+                "a Quit AppleEvent (System Settings' Quit & Reopen, a script): restarting under \
+                 the supervisor instead of exiting 0, which launchd would not relaunch (#3164)"
             );
             // The graceful path is bounded; this makes the relaunch certain
             // even if something on it hangs while AppKit waits.
