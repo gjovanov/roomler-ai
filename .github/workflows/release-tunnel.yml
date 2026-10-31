@@ -130,7 +130,11 @@ jobs:
   build-linux:
     name: Build (Linux x86_64)
     needs: validate-version
-    runs-on: ubuntu-latest
+    # 22.04, not latest, for the reason on the arm64 job below: the oldest
+    # supported base sets the glibc floor. tunnel-v0.4.149 was built on
+    # ubuntu-latest, so its binary needs glibc 2.39, and both its .deb and its
+    # tarball stop at load on Ubuntu 22.04 and Debian 12.
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -141,7 +145,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
-          shared-key: tunnel-linux
+          # Not the old `tunnel-linux`: its tools and build scripts were linked on
+          # glibc 2.39 and would not run on this host. The key does not name the
+          # runner's Ubuntu version, so only a new name keeps them out.
+          shared-key: tunnel-linux-2204
           # Tag-ref cache saves can never be restored by a future tag run
           # (GH cache isolation: own ref or default branch only) — only
           # non-tag runs (dispatch rehearsals on master) save.
@@ -151,6 +158,12 @@ jobs:
         # the tool present; a plain install hard-errors on it (rc.383's
         # agent release died on exactly this).
         run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
+      - name: Install the OpenSSL headers
+        # The CLI links libssl.so.3. Named here so the build does not depend on
+        # what this runner image happens to carry.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libssl-dev pkg-config
       - name: Build roomler-tunnel (release)
         run: cargo build -p roomler-cli --release
       - name: Strip binary
@@ -287,6 +300,38 @@ jobs:
             ${{ steps.deb.outputs.artifact }}
             ${{ steps.deb.outputs.artifact }}.sha256
           retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 1c. The .deb on bare images, before anything is published
+  # ---------------------------------------------------------------------------
+  # A build host's own smoke says nothing about an older base: tunnel-v0.4.149
+  # passed every check here and stopped at load on Ubuntu 22.04 and Debian 12.
+  # `publish-release` needs this. What the script proves, and why:
+  # docs/installation.md, "What a bare host needs".
+  verify-linux-debs:
+    name: Bare-image install (${{ matrix.triple }})
+    needs: [validate-version, build-linux, build-linux-arm64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            artifact: linux-x86_64
+          - runner: ubuntu-22.04-arm
+            triple: aarch64-unknown-linux-gnu
+            artifact: linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the package
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: debs
+      - name: Install it on bare images and start it
+        run: bash scripts/deb-bare-check.sh debs/*.deb
 
   # ---------------------------------------------------------------------------
   # 2. macOS — universal binary (x86_64 + aarch64 lipo'd) + tarball
@@ -464,7 +509,7 @@ jobs:
   # ---------------------------------------------------------------------------
   publish-release:
     name: Publish GitHub Release
-    needs: [validate-version, build-linux, build-linux-arm64, build-macos, build-windows]
+    needs: [validate-version, build-linux, build-linux-arm64, verify-linux-debs, build-macos, build-windows]
     if: needs.validate-version.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     permissions:
