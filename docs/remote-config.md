@@ -244,10 +244,10 @@ Unlike the two denylists, the server reads the word. It takes the words
 `roomler config set` takes (`true`/`false`, `1`/`0`, `yes`/`no`, in any case),
 stores the spelling above, and refuses anything else with a 400 that names the
 key, recording nothing (`pushed_tribool`,
-`crates/modules/fleet/src/remote_config.rs:155`). A tribool has no entries a
+`crates/modules/fleet/src/remote_config.rs:159`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
-(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3085`), and a test
+(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3104`), and a test
 holds it to what `roomler config set` reads. A word that reaches a device anyway,
 from some other server, leaves its key as it is, logged, and never fails the
 keys beside it (`agents/roomlerd/src/remote_config.rs:340`).
@@ -260,6 +260,33 @@ default, off and on (`ui/src/utils/managedTribool.ts`). An agent from before
 P1b ignores the key and reports the push applied, as it does any key it
 predates; no released agent before it writes a description at all, because P1
 ships with P1b.
+
+**A fourth (FR-132 P1).** `zero_copy_deny`, the GPU-input denylist and
+[FR-118](fr/FR-118-gpu-resident-frames.md)'s kill switch (comma-separated
+`name:gpu` entries such as `hevc_qsv:gpu`, or `none`), rides the same document
+on the terms of the two other denylists. It needs `MANAGE_AGENTS` alone, because
+it only ever *removes* a GPU form a device would otherwise open. It reports
+`needs_restart`, because the probe reads it once per process and the encoders
+read it through the config fallbacks
+(`agents/roomlerd/src/remote_config.rs:354`). The server passes it on unread
+(`crates/modules/fleet/src/remote_config.rs:206`): an entry the gate cannot read
+denies nothing, because `gpu_hint::is_denied` matches only an exact `name:gpu`.
+It exists so that a GPU-input cell can be turned off from the server before any
+cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
+
+| pushed `zero_copy_deny` | what the device's key becomes |
+|---|---|
+| absent | not managed: left as it is |
+| `""` | cleared: deny nothing |
+| `none` | `none`: deny nothing |
+| `hevc_qsv:gpu, av1_nvenc:gpu` | that list: those encoders take CPU frames, reason `denied` |
+
+⚠️ **`zero_copy` itself, the switch that turns the GPU path on, is NOT
+pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
+or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
+guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
+`crates/remote_control/src/models.rs:9641`); a prefix match would refuse the
+kill switch along with the switch.
 
 ⚠️ **A push lands on connect, and takes effect at the restart after it.** A
 device that was online when the push was made picks it up at its next

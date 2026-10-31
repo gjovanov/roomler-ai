@@ -179,7 +179,7 @@ sleep would say hello again and erase the reason.
 | `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3112`](../agents/roomler-cli/src/localclient.rs#L3112)) |
 | the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
 | the admin agent API | `power`, `sleep` ([`agent.rs:629`](../crates/modules/fleet/src/agent.rs#L629)) | the posture as last reported, and the notice on a device that is not online |
-| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3543`](../crates/remote_control/src/models.rs#L3543)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
+| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3562`](../crates/remote_control/src/models.rs#L3562)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
 
 The dashboard's words, for a device that announced a sleep:
 

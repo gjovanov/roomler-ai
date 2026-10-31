@@ -142,8 +142,8 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   character, so the `input` event the soft keyboard types through never fires
   and a key's second owner is invisible. `softkbd.html` mounts the real
   `MobileKeyboard.vue` and a window-level capture listener running the real
-  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14536`,
-  `:14269`), both recording what the host would get and WHO sent it.
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14601`,
+  `:14334`), both recording what the host would get and WHO sent it.
   `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
   OS keyboard does (`insertText`: an `input` event and no keydown), composes
   through the IME (CDP `Input.imeSetComposition`), pastes, and asserts one
@@ -587,7 +587,7 @@ VP9 DataChannel is 4:4:4 by default), less what the build cannot open (`BuildCap
 | `rtp:h264` | `encode::open_for_codec`: Media Foundation's cascade on Windows, then OpenH264 | `mf-encoder` (Windows) |
 | `rtp:h265` | FFmpeg's HEVC cascade, then MF's | FFmpeg or MF |
 | `rtp:av1` | MF's AV1 | MF |
-| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5234`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
+| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5247`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
 | `dc:vp9`, `dc:vp9:444` | the session's quick probe at 480×270, then FFmpeg's VP9 if it opened, else libvpx | FFmpeg |
 | `named` | `encode::open_named`, past every cascade and the denylist | FFmpeg |
 

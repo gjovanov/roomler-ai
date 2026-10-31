@@ -2417,6 +2417,45 @@ export function decodeStatWireMessage(
     // window cannot wrap into its own sign.
     msg.queue_ms = Math.min(Math.max(Math.round(link.queueMs), -32768), 32767)
   }
+  // FR-132 P1 — this viewer counts its decode errors (one `rc:decode-error`
+  // each, `decodeErrorWireMessage`), so the agent reports the session's count
+  // and a zero is a measured one. An older viewer sends no `de`, and its
+  // session's decode errors read as not counted.
+  msg.de = 1
+  return msg
+}
+
+/** FR-132 P1 (§3b) — the stage a decode worker's error message names: the
+ *  decoder's `configure()` (`configure`), a frame it could not decode
+ *  (`decode`: the decoder's error callback, or `decode()` throwing), or the
+ *  stream feeding it (`pipe`: the RTP transform's reader or pipe). The agent
+ *  matches these spellings by equality. */
+export type DecodeErrorStage = 'configure' | 'decode' | 'pipe'
+
+export function decodeErrorStage(type: string): DecodeErrorStage {
+  if (type === 'decoder-configure-error') return 'configure'
+  if (type === 'reader-error' || type === 'pipe-error') return 'pipe'
+  return 'decode'
+}
+
+/** FR-132 P1 (§3b) — the ONE control message a decode error sends the agent,
+ *  before the viewer falls back to `<video>`: the agent counts it for the
+ *  session's `rc:session.stats` (`decode_errors`), which is how a fleet week
+ *  of a GPU-input cell can be read for decode errors without anyone watching
+ *  a viewer. `path` is the decode worker (`webcodecs` = the RTP transform,
+ *  `vp9-444` and `hevc` = the data-channel workers). The codec and the
+ *  decoder's message are cut short; the agent bounds them again. Pure so the
+ *  wire shape is unit-tested. */
+export function decodeErrorWireMessage(
+  path: 'webcodecs' | 'vp9-444' | 'hevc',
+  type: string,
+  error?: unknown,
+  codec?: unknown,
+): Record<string, unknown> {
+  const msg: Record<string, unknown> = { t: 'rc:decode-error', stage: decodeErrorStage(type), path }
+  if (typeof codec === 'string' && codec !== '') msg.codec = codec.slice(0, 64)
+  const text = typeof error === 'string' ? error : error == null ? '' : String(error)
+  if (text !== '') msg.error = text.slice(0, 160)
   return msg
 }
 
@@ -7290,6 +7329,26 @@ export function useRemoteControl(
     )
   }
 
+  /** FR-132 P1 (§3b) — tell the agent the active decode worker failed, before
+   *  the path falls back to `<video>` (`decodeErrorWireMessage`). One message
+   *  per error the worker posts; the fallback right after stops the worker,
+   *  so a failed decoder reports once. The control channel is the session's,
+   *  not the video's, so it is still open here. No-op while it is closed. */
+  function reportDecodeError(
+    path: 'webcodecs' | 'vp9-444' | 'hevc',
+    type: string,
+    error: unknown,
+    codec: unknown,
+  ) {
+    const ch = channels.control
+    if (!ch || ch.readyState !== 'open') return
+    try {
+      ch.send(JSON.stringify(decodeErrorWireMessage(path, type, error, codec)))
+    } catch {
+      /* channel closed between check and send - drop */
+    }
+  }
+
   function sendQualityPreference() {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
@@ -7756,6 +7815,8 @@ export function useRemoteControl(
         || msg.type === 'reader-error'
         || msg.type === 'pipe-error'
       ) {
+        // FR-132 P1 — counted on the agent, before the fallback below.
+        reportDecodeError('webcodecs', msg.type, msg.error, msg.codec ?? codec)
         // rc.43 Ã¢ÂÂ pre-rc.43 we only logged. Decoder errors after a
         // successful configure() (Chrome 148 VP9 profile-1 path,
         // mid-session codec change) would leave the canvas blank with
@@ -8072,6 +8133,8 @@ export function useRemoteControl(
         // av1 AND h264 DC transports - ban whichever THIS session
         // negotiated, `sessionDcTransport`). Post-first-frame errors stay
         // transient and keep today's behaviour.
+        // FR-132 P1 — counted on the agent, before the teardown below.
+        reportDecodeError('vp9-444', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
         const vp9NeverDecoded = vp9_444FramesDecoded.value === 0
         const failedTransport = sessionDcTransport
         stopVp9_444Path()
@@ -8364,6 +8427,8 @@ export function useRemoteControl(
         // <video> has no parallel RTP samples, so this fallback renders
         // nothing). A post-first-frame error is a transient (driver
         // hiccup) - the same codec may work again on reconnect.
+        // FR-132 P1 — counted on the agent, before the teardown below.
+        reportDecodeError('hevc', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
         const hevcNeverDecoded = hevcFramesDecoded.value === 0
         stopHevcPath()
         if (hevcNeverDecoded) {

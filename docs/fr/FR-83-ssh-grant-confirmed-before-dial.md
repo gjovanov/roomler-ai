@@ -172,7 +172,7 @@ caller hears the server's reason rather than its own timeout; and it leaves ≥ 
 
 ### 4. The agent — acknowledge after recording, and every refusal
 
-The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4128`) acknowledges **after**
+The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4133`) acknowledges **after**
 `record_grant` returns: the grant is in `GRANTS` — the table the auth path reads — before
 the frame leaves, so "confirmed" means "redeemable". `record_grant`'s `Result<(), String>`
 becomes a typed rejection so the arm can say *which* refusal it was; the log text is

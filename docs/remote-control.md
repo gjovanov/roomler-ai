@@ -239,9 +239,9 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 | How the overlay gets in | Filter (off) | Where |
 |---|---|---|
-| A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:386` |
-| An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:409`, `crates/modules/fleet/src/hub.rs:1825` |
-| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1515`, `peer.rs:1557`, `peer.rs:1483` |
+| A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:390` |
+| An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:413`, `crates/modules/fleet/src/hub.rs:1825` |
+| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1526`, `peer.rs:1568`, `peer.rs:1494` |
 
 "Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2148`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
 
@@ -258,7 +258,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 | Server | Agent | Result |
 |---|---|---|
-| Older (no field) | New | Absent reads **off** (`signaling.rs:3478`, `serde(default)`) |
+| Older (no field) | New | Absent reads **off** (`signaling.rs:3488`, `serde(default)`) |
 | New | Older | The old agent ignores the field and keeps its old behaviour, except the loopback-TURN relay, which the Hub now withholds |
 | New, policy `auto` (FR-128) | Older than `rc-overlay-auto` | The Hub reads `auto` as `off` for it: no `rc_overlay_auto`, and no relay handed out |
 | Cross-pod | | The relay envelope carries `rc_overlay`; absent reads **off** |
@@ -291,14 +291,14 @@ flowchart TD
 | Input | Where it comes from |
 |---|---|
 | that the agent decides at all | the `rc-overlay-auto` verb in `AgentCaps.rpc` (`crates/remote_control/src/models.rs:1293`), advertised while the kill switch is on (`agents/roomlerd/src/encode/caps.rs:2630`). The Hub sends `auto` to no other agent |
-| that the policy is `auto` | `rc:request`'s `rc_overlay_auto`, sent with `rc_overlay: false`, so an agent older than the field reads off (`crates/remote_control/src/signaling.rs:3486`) |
-| the viewer's devices | `RcOverlayAutoWire.viewers` (`crates/remote_control/src/signaling.rs:5551`): the `overlay_ip` of every loopback relay the Hub hands the browser, at most `LOCAL_RELAYS_MAX`, since FR-121 P3b hands over one relay per agent on the viewer's computer. The Hub fills it from the relays in the overlay range (`rc_overlay_auto_wire`, `crates/modules/fleet/src/hub.rs:144`) |
+| that the policy is `auto` | `rc:request`'s `rc_overlay_auto`, sent with `rc_overlay: false`, so an agent older than the field reads off (`crates/remote_control/src/signaling.rs:3496`) |
+| the viewer's devices | `RcOverlayAutoWire.viewers` (`crates/remote_control/src/signaling.rs:5561`): the `overlay_ip` of every loopback relay the Hub hands the browser, at most `LOCAL_RELAYS_MAX`, since FR-121 P3b hands over one relay per agent on the viewer's computer. The Hub fills it from the relays in the overlay range (`rc_overlay_auto_wire`, `crates/modules/fleet/src/hub.rs:144`) |
 | the far TURN | `RcOverlayAutoWire.far_turn`: the last netcheck (`stun_udp`, since P2b alone) of the target and of the browser's best device, read by the server (below). The target folds its own netcheck in at the offer (D8, `own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:351`). `None` = not measured, read as usable |
 | the carriers | `mesh_carriers_of` (`agents/roomlerd/src/rc_overlay.rs:310`), one LocalAPI `peers` call for every viewer device: `Direct` direct, `Relay`/`Tunnel` relayed, anything else unknown. The best of them decides |
 | the rule | `auto_allows` (`rc_overlay.rs:292`) |
 
 Notes on the implementation:
-- **It runs where the peer is built.** `RcOverlay::decide` (`rc_overlay.rs:112`) is called by the offer handler (`agents/roomlerd/src/signaling.rs:4120`), which a delegated macOS GUI worker runs too. The inputs cross to the worker inside `RcOverlay`.
+- **It runs where the peer is built.** `RcOverlay::decide` (`rc_overlay.rs:112`) is called by the offer handler (`agents/roomlerd/src/signaling.rs:4125`), which a delegated macOS GUI worker runs too. The inputs cross to the worker inside `RcOverlay`.
 - **A viewer device on a worse link stays off** (`exclude`, `rc_overlay.rs:57`). One computer can run several agents, each with its own relay: Windows and WSL, where the Windows agent is direct to its peers and the WSL one rides DERP (FR-121 P3b). A session that rides the mesh through the best one keeps every other one out of its ICE servers, its remote candidates and the offer's SDP. Otherwise ICE, which ranks relays by the order of their TURN servers, could pick the relay behind DERP.
 - **It logs one line:** `rc ICE: overlay auto (FR-128) — the session may ride the mesh` (or `stays off`), with `viewers`, `carriers`, `far_turn` (the server's hint), `own_far_turn` (D8), `allow` and `exclude`.
 - **Kill switch:** `ROOMLERD_RC_OVERLAY_AUTO=0` (`rc_overlay.rs:66`) makes `auto` behave as `off`. The device then stops advertising `rc-overlay-auto`, so the Hub reads its policy as `off` too.
@@ -322,7 +322,7 @@ flowchart LR
   - **The browser's end is its best device** (`browser_reach`, `crates/modules/network/src/hooks.rs:154`). One that measured the far TURN alive decides, because a WSL agent with no UDP out says nothing about the Windows browser beside it. Otherwise one that measured it dead decides, so a device that was not measured cannot hide a dead one.
   - **The rule** is `far_turn_verdict` (`crates/modules/network/src/hooks.rs:168`): either end measured dead is `false`; both measured alive is `true`; anything else is not measured.
   - The gate waits at most 500 ms, then sends no hint. A slow read costs the hint, never the session.
-- **Which devices are the browser's** follows the Hub's own precedence (`viewer_devices_of`, `controller.rs:666`). Probed descriptors win over named devices, and every one the Hub hands out counts, through the Hub's own `bounded_relays` and `named_devices` (`crates/modules/fleet/src/hub.rs:104`, `:125`). The browser sends them all: the first as `local_relay`, the rest as `local_relay_also` (`ui/src/composables/useRemoteControl.ts:4119`).
+- **Which devices are the browser's** follows the Hub's own precedence (`viewer_devices_of`, `controller.rs:666`). Probed descriptors win over named devices, and every one the Hub hands out counts, through the Hub's own `bounded_relays` and `named_devices` (`crates/modules/fleet/src/hub.rs:104`, `:125`). The browser sends them all: the first as `local_relay`, the rest as `local_relay_also` (`ui/src/composables/useRemoteControl.ts:4158`).
 - **The target folds in its own netcheck** at the offer (D8): one LocalAPI `status` call beside the `peers` call (`own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:351`). If that netcheck found no UDP out, the far TURN is dead whatever the server saw (`with_own_reach`, `:370`). This is what measures a Mac: its RC target is the GUI worker's row, and that row has no overlay node for the hook to find (`find_live_by_agent`, `crates/services/src/dao/overlay_node.rs:413`). The per-user half answers `status` itself, so it lends the root daemon's netcheck along with the rest of the machine's network fields (`with_machine_network`, `agents/roomlerd/src/person_socket.rs:223`).
 - **The Hub** reads `auto` as `off` for an agent that does not advertise `rc-overlay-auto` (`effective_rc_overlay`, `crates/modules/fleet/src/hub.rs:2767`). It decides this once per request, for the relay and the session alike.
 - **Under `auto` the Hub hands out the browser's relays** to both ends, as under `on` (`resolve_local_relay`, `hub.rs:3461`; `forward_offer`, `:2316`). The agent may yet take them, and it filters out itself whichever it leaves off the mesh.
@@ -335,12 +335,12 @@ flowchart LR
 
 The loopback relay the Hub appends is the viewer's OWN device's: a TURN server its agent hosts on loopback and on its
 overlay address. The viewer learns of it one of two ways, chosen per connect by `localRelayPlan`
-(`ui/src/composables/useRemoteControl.ts:3962`):
+(`ui/src/composables/useRemoteControl.ts:4001`):
 
 | | how | needs |
 |---|---|---|
 | **named** (FR-121) | Settings → "This browser runs on" names the person's own devices that advertise `local-relay`, one or more; the request carries `local_relay_from` (and `local_relay_from_also` for the rest), and the Hub answers on `rc:session.created` with the relay it holds from each device's `rc:agent.local_relay` report (`local_relay`, then `local_relay_also`), which the viewer adds with `setConfiguration` before its offer | nothing from the browser: no request to 127.0.0.1 |
-| **probed** (before FR-121) | while no device is named, `fetch http://127.0.0.1:<port>/rc-local-turn` on every port of the band at once (`probeLocalRelays`, `ui/src/composables/useRemoteControl.ts:3834`); every descriptor that names one of the person's own devices fills the choice in, so the next connect is named (someone else's device keeps the probe: its relay would be refused as `not_your_device`) | Chrome's per-origin local-network permission, which a managed browser may forbid |
+| **probed** (before FR-121) | while no device is named, `fetch http://127.0.0.1:<port>/rc-local-turn` on every port of the band at once (`probeLocalRelays`, `ui/src/composables/useRemoteControl.ts:3873`); every descriptor that names one of the person's own devices fills the choice in, so the next connect is named (someone else's device keeps the probe: its relay would be refused as `not_your_device`) | Chrome's per-origin local-network permission, which a managed browser may forbid |
 
 ```mermaid
 flowchart TD
@@ -370,7 +370,7 @@ credential, minted by the device and re-minted every 30 minutes, so nothing logs
 > ⚠️ **On Chrome 156, a TURN server on 127.0.0.1 is no path from roomler.ai** (measured on neo16, 2026-10-29). There
 > is no candidate and no error. Yet example.com reaches the same server, and roomler.ai reaches it on the device's
 > overlay address (FR-121 §3.7). A named device's relay is handed over and the target allocates on it, but the browser
-> gathers nothing from `turn:127.0.0.1:<port>` (`localRelayIceServer`, `ui/src/composables/useRemoteControl.ts:4187`),
+> gathers nothing from `turn:127.0.0.1:<port>` (`localRelayIceServer`, `ui/src/composables/useRemoteControl.ts:4226`),
 > and the session rides the far TURN. Which address to hand the browser is FR-121's open decision 5.
 
 **More than one agent on one computer (FR-121 P3b, #2774).** Windows and WSL under mirrored networking share
@@ -396,11 +396,11 @@ is told only when no named device got a relay, and then it is the first one's.
 A browser paired with one device before P3b holds whichever agent answered first. On a later connect it looks once
 more for the others, but only where Chrome says the loopback permission is already granted (`loopback-network`, or
 `local-network-access` before Chrome split it), so the look never costs a prompt (`loopbackProbeIsSilent`,
-`ui/src/composables/useRemoteControl.ts:4061`). It also waits for a connect whose device list vouches for the stored
-device as the person's own (`mayLookAgain`, `ui/src/composables/useRemoteControl.ts:4007`): with another
+`ui/src/composables/useRemoteControl.ts:4100`). It also waits for a connect whose device list vouches for the stored
+device as the person's own (`mayLookAgain`, `ui/src/composables/useRemoteControl.ts:4046`): with another
 organization in view, it could not tell the person's devices from anyone else's. The pairing widens to every own
 device found, in probe order, and that connect names them, so the Hub checks each (`relayChoiceAfterProbe`,
-`ui/src/composables/useRemoteControl.ts:4029`).
+`ui/src/composables/useRemoteControl.ts:4068`).
 
 ## 5. Capture & encode pipeline
 
@@ -673,10 +673,10 @@ sequenceDiagram
     V-->>V: a snackbar once, and the reason<br/>on the audio control's title
 ```
 
-The pump ([`peer.rs:13168`](../agents/roomlerd/src/peer.rs#L13168)) sends it
+The pump ([`peer.rs:13272`](../agents/roomlerd/src/peer.rs#L13272)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
-[`peer.rs:5508`](../agents/roomlerd/src/peer.rs#L5508); the viewer parses it
+[`peer.rs:5521`](../agents/roomlerd/src/peer.rs#L5521); the viewer parses it
 at [`useRemoteControl.ts:1621`](../ui/src/composables/useRemoteControl.ts#L1621)
 and puts it on the toggle's title
 ([`RemoteControl.vue:3683`](../ui/src/views/remote/RemoteControl.vue#L3683)).
@@ -713,7 +713,7 @@ machine awake while a session is live, per OS:
 |---|---|---|---|
 | The lock signal | the input desktop moves to `winsta0\Winlogon` (`lock_state`) | logind's `LockedHint` for seat0's active session, polled every 2 s ([`lock_state.rs:347`](../agents/roomlerd/src/lock_state.rs#L347)); GNOME, KDE and light-locker set it | the session dictionary's `CGSSessionScreenIsLocked`, or another user on the console, polled every 2 s ([`lock_state.rs:357`](../agents/roomlerd/src/lock_state.rs#L357)); only the GUI session's half can ask, so the root half says nothing |
 | What the session does | paints the "Host locked" overlay and suppresses input: the worker can neither capture nor inject there | **nothing**: the lock screen is captured like any other screen, and input reaches it | **nothing**: no overlay, and input is not suppressed |
-| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:10195`](../agents/roomlerd/src/peer.rs#L10195)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
+| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:10208`](../agents/roomlerd/src/peer.rs#L10208)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
 | The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" | "The remote host is on its lock screen.", claiming neither way ([`useRemoteControl.ts:1478`](../ui/src/composables/useRemoteControl.ts#L1478) `hostLockedChipTitle`) |
 | A request that waits for consent | `rc:consent.pending{host_locked}` (FR-34, §11.2) | not yet: the read is a `loginctl` run, which does not belong on the signalling loop | `rc:consent.pending{host_locked}`, from the same session dictionary ([`lock_state.rs:301-320`](../agents/roomlerd/src/lock_state.rs#L301-L320)) |
 | Holding the machine awake while a session is live (FR-55) | `PowerCreateRequest` | a logind **block** inhibitor ([`power.rs:758`](../agents/roomlerd/src/power.rs#L758)): `sleep:idle` for a root daemon, `idle` only for a per-user one | `IOPMAssertion` |
@@ -784,7 +784,7 @@ sequenceDiagram
 - **The decision is one pure function**
   ([`sas.rs:97`](../agents/roomlerd/src/input/sas.rs#L97)), compiled on every
   OS so the lanes that never run Windows tests check it. It is made at every
-  announcement ([`signaling.rs:7237`](../agents/roomlerd/src/signaling.rs#L7237)),
+  announcement ([`signaling.rs:7245`](../agents/roomlerd/src/signaling.rs#L7245)),
   and the heartbeat re-announces the moment its answer changes, so a policy a
   GPO refresh changes reaches the server within a beat. Where it says no, the
   `keys-only` entry stays and its reason names the half that is missing.
@@ -991,11 +991,11 @@ Without them the viewer never offers above 60 and never sends `rc:fps`.
 | Message | Direction | Fields |
 |---|---|---|
 | `rc:fps` | viewer → agent, control channel | `fps`: 60, 120 or 144 ([`frame_rate.rs:36`](../agents/roomlerd/src/encode/frame_rate.rs#L36)); anything else is dropped. `retry: true`, a literal `true` only, asks to trial a refused rate again (`fps-retry`, [`frame_rate.rs:30`](../agents/roomlerd/src/encode/frame_rate.rs#L30)) |
-| `rc:video-info` | agent → viewer | `fps`, what the stream runs at; `fps_asked` and `fps_reason` once it runs below the ask; `fps_trial` while a trial runs; `refresh_hz` when the host could read its screen's rate ([`peer.rs:5350`](../agents/roomlerd/src/peer.rs#L5350)) |
+| `rc:video-info` | agent → viewer | `fps`, what the stream runs at; `fps_asked` and `fps_reason` once it runs below the ask; `fps_trial` while a trial runs; `refresh_hz` when the host could read its screen's rate ([`peer.rs:5363`](../agents/roomlerd/src/peer.rs#L5363)) |
 
 **The grant** ([`frame_rate.rs:286`](../agents/roomlerd/src/encode/frame_rate.rs#L286)).
 It runs in the FFmpeg data-channel pump
-([`peer.rs:8239`](../agents/roomlerd/src/peer.rs#L8239)) whenever the ask, the
+([`peer.rs:8252`](../agents/roomlerd/src/peer.rs#L8252)) whenever the ask, the
 base rate, the transport or the class moves, and once a second for the pipe's
 belief. Each rate is checked in the order a viewer can see and act on
 ([`frame_rate.rs:229`](../agents/roomlerd/src/encode/frame_rate.rs#L229)):
@@ -1012,7 +1012,7 @@ A refused ask **steps down one rate at a time** (P2b-18): the highest offered
 rate below the ask that nothing refuses runs instead, and the viewer is still
 told why the ask was refused, as "120 fps (144 fps not granted: …)". The pump
 checks each of those rates against its own deny entry and its own ceiling
-([`peer.rs:8301`](../agents/roomlerd/src/peer.rs#L8301)).
+([`peer.rs:8314`](../agents/roomlerd/src/peer.rs#L8314)).
 
 ```mermaid
 flowchart TD
@@ -1059,7 +1059,7 @@ from the top. A proven rate stays proven.
 every Windows session ran at about 58 fps. An NVENC session holds the GPU clock
 pin, graphics and memory, from the moment the grant wants the rate
 ([`gpu_clock.rs:506`](../agents/roomlerd/src/gpu_clock.rs#L506),
-[`peer.rs:8339`](../agents/roomlerd/src/peer.rs#L8339)). Under an encoder-only
+[`peer.rs:8352`](../agents/roomlerd/src/peer.rs#L8352)). Under an encoder-only
 load the driver otherwise drops the memory clock, and NVENC's time per frame
 doubles.
 
@@ -1242,7 +1242,7 @@ The agent does **not** render the cursor into the captured frame (it tells the O
 ### 6.3 One owner per key — the soft keyboard beside a hardware keyboard (#2888)
 
 The viewer has two places a key can enter the host from. The window-level
-CAPTURE listener (`attachInput`, `useRemoteControl.ts:12356`) sees every key
+CAPTURE listener (`attachInput`, `useRemoteControl.ts:12421`) sees every key
 first and forwards it — `key_text` for a printable character, a HID `key` frame
 otherwise. The soft keyboard (`MobileKeyboard.vue`) is an off-screen textarea
 whose focus brings up the OS keyboard; its typing arrives as `input` events
@@ -1285,9 +1285,9 @@ pre-fix run.
 | Ctrl+Alt+End | End forwarded, no SAS | SAS (derived) | SAS once, no End |
 | sticky toolbar Ctrl, then `c` | `L text:"c"` + `S` Ctrl+C — **twice, and the host's text first** | same | `S` Ctrl+C — once, the modifier cleared |
 
-The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14536`, pure)
-and carried out by `applyKeyRoute` (`:14269`): a key whose target is the soft
-keyboard's textarea (`isSoftKeyboardTarget`, `:14010` — the same
+The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14601`, pure)
+and carried out by `applyKeyRoute` (`:14334`): a key whose target is the soft
+keyboard's textarea (`isSoftKeyboardTarget`, `:14075` — the same
 `data-rc-capture` attribute `isViewerOwnInput` exempts) is **driving**, like a
 key over the stage or under keyboard lock, and has one owner — which one
 depends on the key.
@@ -1354,16 +1354,16 @@ composition.
 ⚠️ **A paste has one owner too** (#2910). Two `paste` listeners sit on
 `window`: the files drawer's `onWindowPasteForDrawer`
 (`RemoteControl.vue:3402`), registered at mount (`:5634`), and the deferred
-Ctrl+V's `onPaste` (`useRemoteControl.ts:12102`), registered later by
+Ctrl+V's `onPaste` (`useRemoteControl.ts:12167`), registered later by
 `attachInput` (`:12006`). Same node, same phase, so the drawer's runs
 **first** — and `preventDefault` stops no other listener on the same node.
 With the drawer open, a Ctrl+V over the stage with files on the clipboard
 uploaded every file twice: into the drawer's directory, then again into the
 default folder. Now each half steps aside for the other: `drawerPasteFiles`
-(`useRemoteControl.ts:14745`) returns nothing for a paste already consumed,
-and `routeDeferredPaste` (`:14362`) answers `taken` for one the drawer
+(`useRemoteControl.ts:14810`) returns nothing for a paste already consumed,
+and `routeDeferredPaste` (`:14427`) answers `taken` for one the drawer
 consumed — the deferred chord is dropped, with no keystroke and no second
-upload (`:11778`). Whichever listener runs first owns the paste, so a future
+upload (`:11843`). Whichever listener runs first owns the paste, so a future
 change to the registration order cannot bring the double back. With the
 drawer open, a files paste that does reach `onPaste` — one aimed at the soft
 keyboard's textarea, which the drawer leaves to it as a form field — uploads
@@ -2414,8 +2414,8 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:13504`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:13482`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4134`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:13513`) |
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:13608`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:13586`). An offer with no `m=video` is answered without the track |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4139`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:13617`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:668`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:319`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:757`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:411`, #2326) |
@@ -2477,9 +2477,9 @@ where the server still holds the session live: on the device-ended path (sent ah
 own `rc:terminate`), not on the controller-ended one, where `ended_at` is already set when the agent
 hears the terminate and `merge_live_stats` matches nothing. So a session with no tick after the
 observation — overwhelmingly a short one — recorded none, which the freeze reads as `unknown`. Since
-P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:944`)
+P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:948`)
 and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2516`), by the
-same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:7123`) queues the sample on
+same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:7131`) queues the sample on
 **the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:285`) — the loop's outbound
 queue for its own session, flushed to the WS one hop later, or the delegation channel for a delegated
 session, so a supervised Mac's sample reaches the server under the daemon's identity, the one the
@@ -2493,6 +2493,46 @@ must stay ahead of the terminate written directly after it. On a supervised Mac 
 delegation channel connection-wide, so a worker's **own** session's last sample is dropped as another
 device's — a pre-existing follow-up; a fix needs the terminate on the same queue, or a per-session
 delegation marker.
+
+### 11.10 The viewer's decode errors (FR-132 P1)
+
+Before FR-132 a decode error in the viewer's worker reached nobody: the page tore the WebCodecs
+path down and fell back to `<video>`, so a fleet week of a GPU-input cell could not be read for
+decode errors unless someone was watching a viewer. Now the viewer sends **one control message per
+decode error, before the fallback**, and the agent counts it into `rc:session.stats`.
+
+```mermaid
+sequenceDiagram
+    participant W as Decode worker
+    participant V as Viewer page
+    participant A as Agent (control DC)
+    participant S as Server
+    V->>A: rc:decodestat {fps, struggling, de: 1} (every window)
+    Note over A: first de → the session is counted (Some(0))
+    A->>S: rc:session.stats {decode_errors: 0} (at once)
+    W->>V: decoder-error / decode-error / decoder-configure-error / pipe-error
+    V->>A: rc:decode-error {stage, path, codec, error}
+    V->>V: fall back to <video>
+    Note over A: count += 1, logged with its stage (first 8)
+    A->>S: rc:session.stats {decode_errors: 1} (at once)
+    Note over S: stats.decode_errors written only when present
+```
+
+| Piece | What it does | Where |
+|---|---|---|
+| the message | `{t: 'rc:decode-error', stage, path, codec, error}`: `stage` is `configure` (the decoder's `configure()`), `decode` (its error callback, or `decode()` throwing) or `pipe` (the RTP transform's reader or pipe); `path` is `webcodecs`, `vp9-444` or `hevc`; the codec and the message are cut to 64 and 160 characters | `decodeErrorWireMessage`, `ui/src/composables/useRemoteControl.ts:2449`; sent by `reportDecodeError` (`:7337`) from all three worker handlers |
+| the counted marker | every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts and a zero is a measured one | `useRemoteControl.ts:2424`; read by `viewer_counts_decode_errors`, `agents/roomlerd/src/peer.rs:10321` |
+| the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:10835`; `viewer_decode_error`, `peer.rs:10296` |
+| the count | per session, saturating; `None` until the viewer counts, so absent means **not counted**; carried to a new peer when a re-offer replaces one, as the clipboard tallies are | `SessionCounters::note_decode_error` / `decode_errors` / `carry_decode_errors`, `agents/roomlerd/src/session_telemetry.rs:162` |
+| the early samples | the first `de` and each of the first eight errors send one `rc:session.stats` at once, by the carrier's road (§11.9): a session someone leaves right after a black screen still records its count, and a short clean one its zero | the FR-102 P9d channel, `peer.rs` `attach_control_handler` |
+| the wire | `decode_errors: Option<u32>` on `rc:session.stats`, absent unless counted; an older server ignores it | `crates/remote_control/src/signaling.rs:782` |
+| the row | `remote_sessions.stats.decode_errors`, `$set` only from a sample that counted: a sample without it never writes a zero over a stored count | `merge_live_stats`, `crates/services/src/dao/remote_session.rs:148` |
+
+⚠️ **Absent is not counted, never zero.** An older viewer sends no `de` and no `rc:decode-error`;
+an older agent ignores both (its control arm drops an unknown `t`); a session that never decoded in
+a worker has nothing to count. Each reads as an absent field, so a fleet read (FR-132 §3d) compares
+only sessions that counted. **Record, never decide**: nothing on the agent changes because a viewer
+reported an error; the fallback is the viewer's own, as before.
 
 ## 12. Performance targets & budget
 
@@ -2578,7 +2618,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:9011`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:9076`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark
@@ -2681,7 +2721,7 @@ leaves **no server row at all** (the request never reached a hub), and
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
-the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4830`)
+the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4869`)
 posts **one record**: the console line, persisted.
 
 ```jsonc
@@ -2714,9 +2754,9 @@ posts **one record**: the console line, persisted.
 | outcome | means | snackbar |
 |---|---|---|
 | `first_frame` | the attempt painted; `ttff_ms` is set | per the rules above |
-| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:4484`) | stall warning |
+| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:4523`) | stall warning |
 | `closed` | the operator hung up, the view unmounted, or a terminal `rc:error` failed it (`error_code` says which) | none |
-| `retried` | the ladder advanced past a live attempt for another reason — a transient `rc:error` it rides, an ICE failure, dead air before the first frame (`scheduleReconnect`, `:7157`) | none |
+| `retried` | the ladder advanced past a live attempt for another reason — a transient `rc:error` it rides, an ICE failure, dead air before the first frame (`scheduleReconnect`, `:7196`) | none |
 
 ⚠️ **`retried` closed a hole the console never had a line for.** Before part 4
 such an attempt's recorder was replaced by the next `beginAttempt()` with no
@@ -2897,7 +2937,7 @@ system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
 | session 3 | 303 MB | 256 MB | 290 MB | **9.2 MB** | 32 |
 | one `malloc_trim(0)` | **89 MB** | **42 MB** | 290 MB | 9.2 MB | 32 |
 
-So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1738`) asks for a trim, and
+So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1749`) asks for a trim, and
 `agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
 `mem-trim` thread, **5 s after the last session ended**. The delay lets the
 encoder thread finish freeing (`encode/thread.rs:265` joins it), and sessions
@@ -3336,10 +3376,10 @@ to-activate, so the browser never sees a bait-and-switch.
   together therefore both failed. The field saw it 9 ms apart, and a drop
   while a long upload runs does the same. Every upload source ends in
   `uploadOne`, so it takes a place in the session's queue there
-  ([`useRemoteControl.ts:12764`](../ui/src/composables/useRemoteControl.ts#L12764),
-  `createUploadQueue` at `useRemoteControl.ts:14777`). The transfer shows
+  ([`useRemoteControl.ts:12829`](../ui/src/composables/useRemoteControl.ts#L12829),
+  `createUploadQueue` at `useRemoteControl.ts:14842`). The transfer shows
   as `queued` at once, and its `files:begin` waits until every earlier
-  upload has settled (`useRemoteControl.ts:13014`). ⚠️ The next place
+  upload has settled (`useRemoteControl.ts:13079`). ⚠️ The next place
   waits for this one's turn AND its settle.
   So an upload cancelled while queued cannot let the one behind it start
   while an earlier one is still on the wire.
@@ -3348,10 +3388,10 @@ to-activate, so the browser never sees a bait-and-switch.
   outside the active user's profile (FR-84 D4), a path that is not a
   directory, or the agent's own state. It says why only in its own log. The
   viewer learns of the fallback from the completed `path`
-  (`uploadLandedIn`, `useRemoteControl.ts:14812`, which compares whole segments:
+  (`uploadLandedIn`, `useRemoteControl.ts:14877`, which compares whole segments:
   `/tmp/x` does not hold `/tmp/xy`). A file that landed outside the folder
   the person chose is a warning that names where it went
-  (`uploadOutcomeMessage`, `useRemoteControl.ts:14835`), not "Uploaded".
+  (`uploadOutcomeMessage`, `useRemoteControl.ts:14900`), not "Uploaded".
 - **Remote Apps on the control DC** (FR-56, [`remote-apps.md`](remote-apps.md)):
   `rc:apps.list` / `rc:apps.focus` / `rc:apps.launch` and their `*.reply`,
   id-correlated like `rc:logs-fetch`, handled off-thread in
@@ -3439,7 +3479,7 @@ to drop straight to VK_PACKET (which conhost ignores). Now
   anyone but the floor holder, as keep busy's switch does
   (`agents/roomlerd/src/input/arbiter.rs:810`). Before, a view-only session
   could switch the host's layout. And the current snapshot goes out once when
-  the control DC opens (`agents/roomlerd/src/peer.rs:1259`): the emitter
+  the control DC opens (`agents/roomlerd/src/peer.rs:1269`): the emitter
   starts before the channel does, so the snapshot it starts with found no
   channel, and went out again only on the next change.
 
@@ -3448,8 +3488,8 @@ to drop straight to VK_PACKET (which conhost ignores). Now
 The same chip and picker on an X11 desktop, through the same two messages. On
 Linux `input::layout` *is* `input::layout_x11`
 (`agents/roomlerd/src/input/mod.rs:97`), so the peer's emitter
-(`agents/roomlerd/src/peer.rs:1550`) and its `rc:layout.set` arm
-(`agents/roomlerd/src/peer.rs:10795`) serve both platforms.
+(`agents/roomlerd/src/peer.rs:1561`) and its `rc:layout.set` arm
+(`agents/roomlerd/src/peer.rs:10899`) serve both platforms.
 
 ```mermaid
 sequenceDiagram
@@ -3695,8 +3735,8 @@ from (`ui/src/workers/rc-decoder-config.ts:38`). The override wins over whatever
 | | |
 |---|---|
 | **Paths** | the three decode workers: `rc-vp9-444-worker` (VP9, AV1 and H.264 over the data channel), `rc-hevc-worker`, and `rc-webcodecs-worker` (the RTP transform; its flag rides the transform's options, because the transform can start before the canvas arrives). The `<video>` element has no such control and decodes true once the agent describes its stream (FR-130 P1) |
-| **Sessions** | every one, from every agent (`ui/src/composables/useRemoteControl.ts:11030`). Every agent so far converts with BT.601 limited, the oldest included. For VP9 this is the only fix: Chrome's WebCodecs ignores VP9's own colour space ([FR-130 §2.5](fr/FR-130-colours-decode-true.md#25-p0-what-chrome-does-with-each-description-2026-10-30)) |
-| **Kill switch** | `localStorage.setItem('roomler-rc-colorspace', 'off')`, then reconnect (`ui/src/composables/useRemoteControl.ts:4176`). The decoders are no longer told, and the console says so at connect |
+| **Sessions** | every one, from every agent (`ui/src/composables/useRemoteControl.ts:11095`). Every agent so far converts with BT.601 limited, the oldest included. For VP9 this is the only fix: Chrome's WebCodecs ignores VP9's own colour space ([FR-130 §2.5](fr/FR-130-colours-decode-true.md#25-p0-what-chrome-does-with-each-description-2026-10-30)) |
+| **Kill switch** | `localStorage.setItem('roomler-rc-colorspace', 'off')`, then reconnect (`ui/src/composables/useRemoteControl.ts:4215`). The decoders are no longer told, and the console says so at connect |
 | **A browser that refuses it** | keeps its picture (`ui/src/workers/rc-decoder-config.ts:93`). A `configure()` that throws on the colour space goes again without it. A decoder that fails before its first frame with it set is rebuilt once without it, and it waits for a key frame, which it asks the agent for. One console line names the case: `decoder colour space dropped (FR-130 P2)` |
 | **Reading it** | each worker's `decoder configured` line in the console names the colour space `configure()` was told, and its `first frame` line the one the decoder says it produced. With the override, that is `matrix=smpte170m primaries=bt709 transfer=iec61966-2-1 range=limited` |
 | **In the field** | on a capture with no colour management ([FR-130 §8](fr/FR-130-colours-decode-true.md#8-field-verification-log)). A VP9 4:4:4 session from a 0.4.187 agent, which writes no description, reads within 1 code value of the source with the override, on the blit and FSR paths, and shows #3049's shift with the kill switch on. From 0.4.188, which describes its stream, the same session reads the same with the override and still shifts without it: Chrome ignores VP9's own colour space. H.264 into `<video>`, which the override cannot reach, decodes true from 0.4.188 and shifts from 0.4.187 or with `color_description = off`. From the hardware encoders on 0.4.188 (NVENC, QSV, VideoToolbox), HEVC and AV1 read within 1 of the pixels as captured with the override, on blit and FSR, and without it on blit; H.264 was read without it (`h264_nvenc` 4:4:4 within 2, from quantization). The decoder reports the same set S either way, so the two levers agree and nothing is corrected twice |
@@ -3816,7 +3856,7 @@ is silent while it waits.
   Only the loop waiting for its next event reads `select`.
 - A `ws.text` arm is refined to the message it is handling, read
   from the JSON's `t` (`ws.text:rc:ssh.response`; `server_msg_tag`,
-  `agents/roomlerd/src/signaling.rs:6834`). The dispatch awaits per
+  `agents/roomlerd/src/signaling.rs:6839`). The dispatch awaits per
   message, so that is where a stall inside it shows.
 - The `StageGuard` (`watchdog.rs:448`) puts the pump back to
   `select` when the arm's scope ends, however it ends. An arm that

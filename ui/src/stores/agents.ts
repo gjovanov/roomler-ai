@@ -596,6 +596,11 @@ export interface DesiredConfig {
    *  a request to CLEAR the device's key (back to its built-in default, on),
    *  which is not the same as leaving it unmanaged (`undefined`). */
   color_description?: PushedTribool
+  /** FR-132 P1 — the GPU-input denylist (`name:gpu` list, or `none`), the kill
+   *  switch of FR-118's GPU-input cells; MANAGE_AGENTS only. `''` is a request
+   *  to clear the device's key (deny nothing). `zero_copy` itself is never
+   *  pushable (FR-132 decision 1). */
+  zero_copy_deny?: string
   updated_by?: string
   updated_at?: string
 }
