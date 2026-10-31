@@ -87,12 +87,12 @@ runs:
         printf '%s\n' "$KEY" > target/.ci-seed-key
         after=$(du -sm target 2>/dev/null | cut -f1)
         echo "pruned target: ${before:-?} MB -> ${after:-?} MB (third-party dependencies only)"
-        # FR-6 wave 33: a target over the restore's cap is dropped by every later restore, so
-        # every run of this job builds cold and the next master run publishes the same size
-        # again. The restore step exports the cap it applied.
+        # FR-6 wave 33: the next restore drops a target over its cap and builds cold. If that
+        # cold build fits the cap, this was the GC. If not, every run stays cold and each master
+        # run publishes the same size again. The restore step exports the cap it applied.
         cap="${CI_SEED_MAX_TARGET_MB:-}"
         if [ -n "$cap" ] && [ -n "${after:-}" ] && [ "$after" -gt "$cap" ]; then
-          echo "::warning title=CI cache over its cap::'${FAM}' publishes a ${after} MB target, over the ${cap} MB its restore keeps, so every run of this job builds cold. Raise the job's max-target-mb (ci-seed-restore) above ${after}."
+          echo "::warning title=CI cache over its cap::'${FAM}' publishes a ${after} MB target, over the ${cap} MB its restore keeps, so the next run drops it and builds cold. If the master run after that publishes under ${cap} MB, this was the GC and nothing is owed. If it publishes over again, every run stays cold: raise the job's max-target-mb (ci-seed-restore)."
         fi
 
         home="${CARGO_HOME:-$HOME/.cargo}"

@@ -182,7 +182,7 @@ chmod +x "$tmp/bin/gh"
 
 scoped() {  # $1 = the hosts.yml DEST starts from, the rest = args -> exit status
   cp "$1" "$tmp/scoped/hosts.yml"; shift
-  PATH="$tmp/bin:$PATH" HOME="$tmp" STUB_LOGIN=gjovanov GH_CONFIG_DIR="$tmp/right" \
+  PATH="$tmp/bin:$PATH" HOME="$tmp" STUB_LOGIN="${LOGIN-gjovanov}" GH_CONFIG_DIR="$tmp/right" \
     bash "$SCRIPT" "$@" >"$tmp/scoped.out" 2>&1
 }
 untouched() { cmp -s "$tmp/right/hosts.yml" "$tmp/scoped/hosts.yml"; }
@@ -205,6 +205,14 @@ scoped "$tmp/right/hosts.yml" gjovanov --print-dir; rc=$?
 scoped "$tmp/right/hosts.yml" someone-else "$tmp/scoped"; rc=$?
 [ "$rc" -eq 1 ] || bad "an owner the API denies: expected 1, got $rc"
 untouched || bad "an owner the API denies was written before it was verified"
+
+# ⚠️ Nobody answering is not an answer. An empty OWNER (an unset variable in the
+# caller) equals the empty answer of a `gh` that cannot reach the API, and the
+# blank `user:` that wrote is the one label this hook lets through: it reads as
+# "no account found", so a failed run would switch the guard off.
+LOGIN= scoped "$tmp/right/hosts.yml" "" "$tmp/scoped"; rc=$?
+[ "$rc" -eq 1 ] || bad "an empty owner with no answer: expected 1, got $rc"
+untouched || bad "an empty owner with no answer was written"
 
 # ⚠️ The positive control: everything above also passes for a script that never
 # writes at all. This is the repair, from the state both incidents left behind,
