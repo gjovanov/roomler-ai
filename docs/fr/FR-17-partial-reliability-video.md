@@ -257,7 +257,7 @@ that could not tolerate reordering; what unordered delivery costs or buys on thi
 not been measured.
 
 ⚠️ **The default flip is NOT taken, and its criterion is written down.** `videoDcOptions`
-(`useRemoteControl.ts:4815`) still opens `{ ordered: false, maxRetransmits: 0 }` (`:4820`)
+(`useRemoteControl.ts:4840`) still opens `{ ordered: false, maxRetransmits: 0 }` (`:4845`)
 only behind `roomler-rc-unordered-video=1` (`storedUnorderedVideo`, `:4808`). FR-59's
 criterion for the flip: an airport-class session with the opt-in ON showing
 `chunkStragglers` climbing while `chunkGaps` stays flat and fps holds — both counters are

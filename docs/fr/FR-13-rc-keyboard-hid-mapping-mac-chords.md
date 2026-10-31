@@ -15,7 +15,7 @@
 ## Bug A — the `Key::Other` fallback reinterprets HID usages as native keycodes
 
 The viewer maps `KeyboardEvent.code` → USB-HID usage
-(`kbdCodeToHid`, `ui/src/composables/useRemoteControl.ts:10993` —
+(`kbdCodeToHid`, `ui/src/composables/useRemoteControl.ts:11031` —
 `CapsLock → 0x39` is **correct**, locked by
 `useRemoteControl.spec.ts:313`). The agent maps HID → enigo `Key` in
 `hid_to_key` (`agents/roomlerd/src/input/enigo_backend.rs:514-595`) —
@@ -42,7 +42,7 @@ enigo 0.6.1 + core-graphics 0.25): `Pause` → **changes host volume** (mac),
 `Numpad3`/`Numpad5` → **opens the Start menu** (`VK_LWIN`/`VK_RWIN`, Windows),
 `Numpad7` → **VK_SLEEP sleeps the host** (Windows), NumLock/ScrollLock/
 PrintScreen and the whole numpad type wrong letters/digits on both.
-The composable's comment at `useRemoteControl.ts:10683-10685` ("works enough")
+The composable's comment at `useRemoteControl.ts:10721-10723` ("works enough")
 encodes the wrong assumption.
 
 ### Fix A (agent — one release)
@@ -67,7 +67,7 @@ SIGINT in a terminal and `pageDown:` in Cocoa text views, not copy/paste.
 There is no Ctrl→Cmd translation anywhere in the path.
 
 Key finding that shrinks the fix: **the hard half already works.** The
-deferred Ctrl+V flow (`useRemoteControl.ts:8709-8750`) pushes the browser
+deferred Ctrl+V flow (`useRemoteControl.ts:8734-8775`) pushes the browser
 clipboard to the host over the clipboard DC (arboard → NSPasteboard on mac,
 ack-gated) *before* replaying the chord — only the final replayed chord is
 wrong. Ctrl+C's only mechanism is the keystroke itself, so the host clipboard
