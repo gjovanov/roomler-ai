@@ -269,6 +269,10 @@
       "methods": "POST"
     },
     {
+      "path": "/api/auth/resend-activation",
+      "methods": "POST"
+    },
+    {
       "path": "/api/capabilities",
       "methods": "GET,HEAD"
     },

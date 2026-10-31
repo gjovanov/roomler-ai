@@ -143,6 +143,10 @@
           <v-card-text class="text-center">
             {{ $t('auth.hasAccount') }}
             <router-link :to="{ path: '/login', query: onward }">{{ $t('auth.login') }}</router-link>
+            <div class="mt-2">
+              {{ $t('auth.activationHelp') }}
+              <router-link to="/auth/activate" data-test="register-activation-help">{{ $t('auth.activationHelpLink') }}</router-link>
+            </div>
           </v-card-text>
         </v-card>
       </v-col>

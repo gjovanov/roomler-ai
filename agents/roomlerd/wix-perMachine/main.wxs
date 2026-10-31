@@ -60,9 +60,15 @@
   [hyphen][hyphen]as-service" two-step.
 -->
 <Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+    <!-- FR-133 P1: Name is what Apps & Features lists, and it is a DISPLAY name
+         only, exactly as in wix/main.wxs: an upgrade is matched by the
+         UpgradeCode (the MajorUpgrade below), never by this name, and
+         scripts/install.ps1 finds the entry under its old or its new name. The
+         UpgradeCode, the Component and Feature Ids and the FileKeys are
+         installer IDENTITY and never change. -->
     <Product
         Id='*'
-        Name='Roomler Agent (per-Machine)'
+        Name='Roomler (per-Machine)'
         UpgradeCode='2A8E9C2D-3F1A-5E3F-C2B4-7C2F3D8F5E02'
         Manufacturer='G ROX LTD'
         Language='1033'
@@ -95,7 +101,7 @@
         -->
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' />
-        <Property Id='DiskPrompt' Value='Roomler Agent Installation' />
+        <Property Id='DiskPrompt' Value='Roomler Installation' />
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <!-- Per-Machine install under %ProgramFiles%\Roomler (P4b:
@@ -299,7 +305,7 @@
 
         <Feature
             Id='Complete'
-            Title='Roomler Agent (per-Machine)'
+            Title='Roomler (per-Machine)'
             Description='Roomler Daemon — keeps this device on your private Roomler mesh network and available for secure remote control (all-users install, auto-start service).'
             Display='expand'
             Level='1'

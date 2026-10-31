@@ -457,7 +457,7 @@ root half with no GUI session) shows no card.
 
 macOS's own **Quit & Reopen** restarts the agent too (`agents/roomlerd/src/macos_quit.rs`): a
 Quit AppleEvent from anyone but `loginwindow` ends it with the supervisor's restart code instead
-of AppKit's exit 0. Up to 0.4.188 that button left the agent offline (`docs/installation.md`,
+of AppKit's exit 0. Up to 0.4.189 that button left the agent offline (`docs/installation.md`,
 the macOS grants).
 
 ## 8. What this device can encode
@@ -836,7 +836,7 @@ step differently:
 
 | OS | How the companion ships | What moves it with the daemon |
 |---|---|---|
-| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1139`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
+| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1162`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
 | macOS | inside the daemon's `.pkg` (`/Applications/Roomler.app`) | the same `.pkg`: one install moves both |
 | Linux | its own `.deb`, or `.rpm` (§10.1) | FR-117 P1: the root update owner moves the package (`companion/package_sync.rs`) |
 

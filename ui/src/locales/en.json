@@ -83,6 +83,8 @@
     "forgotPassword": "Forgot password?",
     "noAccount": "Don't have an account?",
     "hasAccount": "Already have an account?",
+    "activationHelp": "Activation link expired or lost?",
+    "activationHelpLink": "Get a new one",
     "orRegisterWith": "Or register with",
     "heardAbout": "How did you hear about Roomler?",
     "heardAboutHint": "Optional. It tells us which channels work.",
@@ -676,8 +678,16 @@
     "doneText": "Sign in to get started.",
     "signIn": "Sign in",
     "invalidTitle": "This activation link is invalid or has expired",
-    "invalidText": "If you have already activated your account, just sign in. Otherwise, register again to get a new link.",
-    "register": "Register again",
+    "invalidText": "If your account is already active, just sign in. If not, enter the address you signed up with and we'll send you a new link.",
+    "askTitle": "Get a new activation link",
+    "askText": "Enter the address you signed up with and we'll send you a new link.",
+    "email": "Email",
+    "send": "Send a new link",
+    "resend": {
+      "sent": "If that address is waiting for activation, a new link is on its way. Check your spam folder too. If nothing arrives, you can ask again in 15 minutes.",
+      "throttled": "Too many requests from this network. Try again in a few minutes.",
+      "error": "That didn't go through. Check your connection and try again."
+    },
     "errorTitle": "Could not reach the server",
     "errorText": "Nothing was changed. Check your connection and try again.",
     "retry": "Try again"

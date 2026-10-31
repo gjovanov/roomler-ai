@@ -104,7 +104,9 @@ jobs:
   windows-msi-install-uninstall:
     name: per-User MSI install + uninstall (windows-latest)
     runs-on: windows-latest
-    timeout-minutes: 30
+    # 40, not 30: FR-133 P1's upgrade cells add three released-MSI installs and
+    # two more MSI builds (about 6 min) to a job that runs ~10 min warm.
+    timeout-minutes: 40
     # FR-6 wave 22 (#773): a master push publishes this job's cargo cache as a
     # release asset (ci-seed-save), which needs `contents: write`.
     permissions:
@@ -331,6 +333,11 @@ jobs:
           # scope-flip guard rc.279 wanted is PRESERVED, just re-pointed: a
           # genuine perMachine regression shows up under S-1-5-18 and still
           # fails this step.
+          #
+          # FR-133 P1: the product registers as exactly 'Roomler' (the wxs
+          # Name), so the match is EXACT and also asserts the rename. It used
+          # to match roomler.*agent, which the new name no longer contains: a
+          # loose filter that a rename turns into a silent no-op.
           $sid    = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
           $udRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData'
           function Find-RoomlerProduct($scopeSid) {
@@ -340,7 +347,7 @@ jobs:
               ForEach-Object {
                 Get-ItemProperty (Join-Path $_.PSPath 'InstallProperties') -ErrorAction SilentlyContinue
               } |
-              Where-Object { $_.DisplayName -and $_.DisplayName -match '(?i)roomler.*agent' } |
+              Where-Object { $_.DisplayName -ceq 'Roomler' } |
               Select-Object -First 1
           }
           $perUser    = Find-RoomlerProduct $sid
@@ -381,7 +388,7 @@ jobs:
           ) | Where-Object { Test-Path $_ } |
               ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue } |
               Get-ItemProperty -ErrorAction SilentlyContinue |
-              Where-Object { $_.DisplayName -and $_.DisplayName -match '(?i)roomler.*agent' } |
+              Where-Object { $_.DisplayName -ceq 'Roomler' } |
               Select-Object -First 1
           if ($arp) {
             'INSTALLED_PRODUCT_CODE=' + $arp.PSChildName | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -558,21 +565,22 @@ jobs:
             'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
             'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
           )
-          # Same loose filter as the post-install step — match either
-          # "Roomler Agent" (WiX DisplayName) or "roomler-agent"
-          # (Cargo package name) so a future WiX rename in either
-          # direction doesn't silently turn this assert into a no-op.
+          # Deliberately LOOSER than the post-install step: any record whose
+          # name starts with Roomler counts as a straggler, so a rename in
+          # either direction cannot turn this assert into a no-op (the old
+          # roomler.*agent filter would have, at FR-133 P1's rename). A fresh
+          # runner has no other product by that name.
           $stragglers = @()
           foreach ($root in $uninstallRoots) {
             if (-not (Test-Path $root)) { continue }
             $stragglers += Get-ChildItem $root -ErrorAction SilentlyContinue |
                              Get-ItemProperty -ErrorAction SilentlyContinue |
                              Where-Object {
-                               $_.DisplayName -and $_.DisplayName -match '(?i)roomler.*agent'
+                               $_.DisplayName -and $_.DisplayName -like 'Roomler*'
                              }
           }
           if ($stragglers.Count -gt 0) {
-            throw "roomler-agent install record still present after uninstall: $($stragglers.DisplayName -join ', ')"
+            throw "a Roomler install record is still present after uninstall: $($stragglers.DisplayName -join ', ')"
           }
           # P4b canonical layout: every component-managed payload must
           # be gone from Programs\Roomler (all files are component-
@@ -859,6 +867,199 @@ jobs:
           Invoke-Msi '/x' (Join-Path $out 'pm-4.msi') (Join-Path $logDir 'pm-uninstall.log') ''
           if (Get-Service Roomler -ErrorAction SilentlyContinue) { throw 'the Roomler service survived the uninstall' }
           Write-Host 'per-Machine uninstall removed the service'
+
+      - name: An upgrade from the released MSIs leaves ONE entry, under the new name (FR-133 P1)
+        # FR-133 P1 renamed what Apps & Features lists: "Roomler" and
+        # "Roomler (per-Machine)". An upgrade is matched by the UpgradeCode,
+        # never by that name, and this step proves it on real released bytes:
+        # install the NEWEST published release of each flavour, then this
+        # branch's MSI over it, built one patch version above so it is a real
+        # major upgrade, and count what a person would see: exactly one entry,
+        # under the new name. The per-Machine cell also keeps the SystemContext
+        # switch (#1727) and ends with the service Running.
+        #
+        # scripts/install.ps1 -Uninstall then has to find every name, run as
+        # the field runs it (Windows PowerShell 5.1): both upgraded products (an
+        # install made after P1) and a PINNED pre-P1 release (an install made
+        # before it). The pin keeps that case honest once the newest release
+        # carries the new name too; the newest is only logged as one or the other.
+        #
+        # Negative control: on master the per-User asserts fail, because
+        # master's MSI still registers the pre-P1 name.
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # A release whose MSIs register the pre-P1 names. Fixed on purpose: it
+          # must never follow the newest release. If it is ever deleted, pin any
+          # other release from before FR-133 P1.
+          PRE_P1_TAG: agent-v0.4.189
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $out = Join-Path $env:RUNNER_TEMP 'fr133'
+          $logDir = Join-Path $env:RUNNER_TEMP 'msi-logs'
+          New-Item -ItemType Directory -Path $out, $logDir -Force | Out-Null
+
+          # What each flavour registers now, and what every MSI before P1 did.
+          $new = @{ pu = 'Roomler'; pm = 'Roomler (per-Machine)' }
+          $old = @{ pu = 'Roomler Agent'; pm = 'Roomler Agent (per-Machine)' }
+
+          function Get-ReleaseJson([string]$path) {
+            $json = gh api "repos/$env:GITHUB_REPOSITORY/$path"
+            if ($LASTEXITCODE -ne 0) { throw "gh api $path failed" }
+            ($json -join "`n") | ConvertFrom-Json
+          }
+          function Save-Msi($rel, [string]$flavour) {
+            $msis = @($rel.assets | Where-Object { $_.name -like '*.msi' })
+            if ($flavour -eq 'pm') { $a = @($msis | Where-Object { $_.name -like '*-perMachine-*' }) }
+            else { $a = @($msis | Where-Object { $_.name -notlike '*-perMachine-*' }) }
+            if ($a.Count -ne 1) { throw "$($rel.tag_name): want one $flavour MSI, found $($a.Count)" }
+            $dst = Join-Path $out "$($rel.tag_name)-$flavour.msi"
+            if (-not (Test-Path $dst)) {
+              Invoke-WebRequest -UseBasicParsing -Uri $a[0].browser_download_url -OutFile $dst
+            }
+            $want = ([string]$a[0].digest -replace '^sha256:', '').ToLower()
+            $got = (Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower()
+            if (-not $want -or $got -ne $want) { throw "$($a[0].name): sha256 $got, the release says '$want'" }
+            Write-Host "released $flavour MSI: $($a[0].name) (sha256 verified)"
+            $dst
+          }
+          function Invoke-Msi([string]$verb, [string]$msi, [string]$log, [string]$props) {
+            $a = "$verb `"$msi`" /qn /norestart /l*v `"$log`" $props"
+            $p = Start-Process msiexec.exe -ArgumentList $a -Wait -PassThru
+            if ($p.ExitCode -ne 0) {
+              Get-Content $log -Tail 120
+              throw "msiexec $verb $(Split-Path $msi -Leaf) [$props] exited $($p.ExitCode)"
+            }
+          }
+          # Every product Apps & Features would show under a Roomler name, one row
+          # per ProductCode (a per-User record can sit in more than one hive).
+          function Get-Entries {
+            $rows = @('HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+                      'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+                      'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') |
+              Where-Object { Test-Path $_ } |
+              ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue } |
+              Get-ItemProperty -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -like 'Roomler*' -and $_.PSChildName -like '{*}' }
+            @($rows) | Group-Object PSChildName | ForEach-Object {
+              $hives = @($_.Group | ForEach-Object { if ($_.PSPath -match 'HKEY_CURRENT_USER') { 'HKCU' } else { 'HKLM' } }) | Sort-Object -Unique
+              [pscustomobject]@{ Code = $_.Name; Name = $_.Group[0].DisplayName; Version = $_.Group[0].DisplayVersion; Hives = $hives -join '+' }
+            }
+          }
+          # $names empty = want none. Returns the one entry's name.
+          function Assert-Entries([string]$label, [string[]]$names, [string]$version) {
+            $e = @(Get-Entries)
+            $seen = ($e | ForEach-Object { "'$($_.Name)' $($_.Version) [$($_.Hives)]" }) -join '; '
+            Write-Host "${label}: $($e.Count) Apps & Features entries: $seen"
+            if ($names.Count -eq 0) {
+              if ($e.Count -ne 0) { throw "${label}: want NO Roomler entry, found: $seen" }
+              return
+            }
+            if ($e.Count -ne 1) { throw "${label}: want exactly ONE Roomler entry, found $($e.Count): $seen" }
+            if ($names -cnotcontains $e[0].Name) { throw "${label}: the entry is '$($e[0].Name)', want $($names -join ' or ')" }
+            if ($version -and $e[0].Version -ne $version) { throw "${label}: the entry is at $($e[0].Version), want $version" }
+            $e[0].Name
+          }
+          function Get-Swap {
+            $block = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Roomler' -Name Environment -ErrorAction SilentlyContinue).Environment
+            [bool](@($block) -contains 'ROOMLERD_ENABLE_SYSTEM_SWAP=1')
+          }
+          function Wait-Running([string]$label) {
+            $svc = $null
+            foreach ($i in 1..60) {
+              $svc = Get-Service Roomler -ErrorAction SilentlyContinue
+              if ($svc -and $svc.Status -eq 'Running') { return }
+              Start-Sleep -Seconds 1
+            }
+            throw "${label}: the Roomler service is $($svc.Status), want Running"
+          }
+          # The served script, in the shell the field runs it in.
+          function Invoke-UninstallScript([string]$label) {
+            $o = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall 2>&1
+            $rc = $LASTEXITCODE
+            $o | Out-File -FilePath (Join-Path $logDir "install-ps1-uninstall-$label.log") -Encoding utf8
+            $o | ForEach-Object { Write-Host "  install.ps1 | $_" }
+            if ($rc -ne 0) { throw "${label}: install.ps1 -Uninstall exited $rc" }
+          }
+
+          # This branch's MSIs, one patch version above the newest release.
+          $newest = (Get-ReleaseJson 'releases?per_page=100') |
+            Where-Object { $_.tag_name -like 'agent-v*' -and -not $_.draft -and -not $_.prerelease } |
+            Sort-Object { [datetime]$_.published_at } -Descending | Select-Object -First 1
+          if (-not $newest) { throw 'no published agent-v* release to upgrade from' }
+          $base = [version]($newest.tag_name -replace '^agent-v', '')
+          $next = '{0}.{1}.{2}' -f $base.Major, $base.Minor, ($base.Build + 1)
+          $nextMsi = "$next.1"
+          Write-Host "newest release $($newest.tag_name); this branch's MSIs are built at $next-smoke.1 (MSI $nextMsi)"
+          $pu = Join-Path $out "branch-$nextMsi-peruser.msi"
+          $pm = Join-Path $out "branch-$nextMsi-permachine.msi"
+          Remove-Item target\wix\*.msi -Force -ErrorAction SilentlyContinue
+          cargo wix -p roomlerd --nocapture --no-build --install-version "$next-smoke.1"
+          if ($LASTEXITCODE -ne 0) { throw 'cargo wix (per-User) failed' }
+          Move-Item (Get-ChildItem 'target/wix/*.msi' | Select-Object -First 1).FullName $pu -Force
+          $wixDir = "agents\roomlerd\wix"
+          Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
+          Copy-Item "agents\roomlerd\wix-perMachine\main.wxs" "$wixDir\main.wxs" -Force
+          try {
+            cargo wix -p roomlerd --nocapture --no-build --install-version "$next-smoke.1"
+            if ($LASTEXITCODE -ne 0) { throw 'cargo wix (per-Machine) failed' }
+          } finally {
+            Move-Item "$wixDir\main.wxs.bak" "$wixDir\main.wxs" -Force
+          }
+          Move-Item (Get-ChildItem 'target/wix/*.msi' | Select-Object -First 1).FullName $pm -Force
+
+          # 1. An install from BEFORE P1 (the pinned release): install.ps1 finds it.
+          $pre = Get-ReleaseJson "releases/tags/$env:PRE_P1_TAG"
+          Invoke-Msi '/i' (Save-Msi $pre 'pu') (Join-Path $logDir 'fr133-pre-p1-peruser.log') ''
+          $null = Assert-Entries "$($pre.tag_name) per-User installed" @($old.pu) ''
+          Invoke-UninstallScript 'pre-p1-peruser'
+          $null = Assert-Entries "$($pre.tag_name) per-User after install.ps1 -Uninstall" @() ''
+
+          # 2. per-User: the newest release, then this branch over it.
+          Invoke-Msi '/i' (Save-Msi $newest 'pu') (Join-Path $logDir 'fr133-newest-peruser.log') ''
+          $was = Assert-Entries "$($newest.tag_name) per-User installed" @($old.pu, $new.pu) ''
+          if ($was -cne $new.pu) { Write-Host "the newest release registers the pre-P1 name: this cell is the rename upgrade" }
+          else { Write-Host "::notice::the newest release already registers '$was'; cell 1 above is the pre-P1 case" }
+          Invoke-Msi '/i' $pu (Join-Path $logDir 'fr133-branch-peruser.log') ''
+          $null = Assert-Entries 'per-User upgraded to this branch' @($new.pu) $nextMsi
+          # The Start-menu entry follows the name, and the old one leaves with
+          # the old product (MajorUpgrade runs afterInstallInitialize).
+          $menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Roomler'
+          if (-not (Test-Path -LiteralPath (Join-Path $menu "$($new.pu).lnk"))) { throw "no $($new.pu).lnk in $menu after the upgrade" }
+          if (Test-Path -LiteralPath (Join-Path $menu "$($old.pu).lnk")) { throw "the pre-P1 shortcut survived the upgrade in $menu" }
+          Invoke-UninstallScript 'branch-peruser'
+          $null = Assert-Entries 'per-User after install.ps1 -Uninstall' @() ''
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\Roomler\roomlerd.exe'
+          if (Test-Path $exe) { throw "$exe survived install.ps1 -Uninstall" }
+
+          # 3. per-Machine + SystemContext: the newest release, then a hand-run
+          #    upgrade to this branch with NO property, which must keep the switch.
+          Invoke-Msi '/i' (Save-Msi $newest 'pm') (Join-Path $logDir 'fr133-newest-permachine.log') 'ENABLE_SYSTEM_CONTEXT=1'
+          Wait-Running "$($newest.tag_name) per-Machine"
+          if (-not (Get-Swap)) { throw "$($newest.tag_name) per-Machine installed with ENABLE_SYSTEM_CONTEXT=1, but the swap is off" }
+          $null = Assert-Entries "$($newest.tag_name) per-Machine installed" @($old.pm, $new.pm) ''
+          Invoke-Msi '/i' $pm (Join-Path $logDir 'fr133-branch-permachine.log') ''
+          Wait-Running 'per-Machine upgraded to this branch'
+          if (-not (Get-Swap)) { throw 'per-Machine upgraded to this branch: the SystemContext switch was not kept' }
+          $null = Assert-Entries 'per-Machine upgraded to this branch' @($new.pm) $nextMsi
+          Invoke-UninstallScript 'branch-permachine'
+          $null = Assert-Entries 'per-Machine after install.ps1 -Uninstall' @() ''
+          if (Get-Service Roomler -ErrorAction SilentlyContinue) { throw 'the Roomler service survived install.ps1 -Uninstall' }
+          Write-Host 'FR-133 P1: each upgrade left one entry under the new name, and install.ps1 -Uninstall removed both names'
+
+      # The MSIs the step above built one version above the newest release: what
+      # a vmtest field cell installs over a released one. CI builds, unsigned:
+      # never ship them. Not on a master push: nobody field-tests those, and at
+      # 40 MB a run they would only fill the account's Actions storage.
+      - name: Upload this branch's MSIs (FR-133 field cell)
+        if: ${{ !cancelled() && github.event_name != 'push' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-msis
+          path: ${{ runner.temp }}/fr133/branch-*.msi
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload MSI logs on failure
         if: failure()

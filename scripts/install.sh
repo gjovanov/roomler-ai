@@ -196,8 +196,8 @@ usage() {
     echo "                  macOS needs TWO processes: a per-user LaunchAgent for screen"
     echo "                  capture and input (they only work inside a GUI login session)"
     echo "                  and a root LaunchDaemon for the overlay (creating a utun needs"
-    echo "                  root). They cannot share one enrollment — the hub keys on"
-    echo "                  agent_id and the second connection displaces the first — so"
+    echo "                  root). They cannot share one enrollment — the hub keys on the"
+    echo "                  device id, and the second connection displaces the first — so"
     echo "                  this takes a SECOND single-use enrollment token and the Mac"
     echo "                  appears as two devices."
     exit 1
@@ -386,7 +386,7 @@ if [ "$OS" = Darwin ] && [ "$UNINSTALL" != 1 ]; then
     CONSOLE_USER="$(stat -f "%Su" /dev/console 2>/dev/null || echo "")"
     if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = root ]; then
         echo "error: no GUI session is logged in (console user is '${CONSOLE_USER:-unknown}')." >&2
-        echo "       The macOS agent runs inside a login session — screen capture and input" >&2
+        echo "       On macOS roomlerd runs inside a login session — screen capture and input" >&2
         echo "       do not work from a LaunchDaemon. Log in on the Mac and re-run this." >&2
         exit 1
     fi
@@ -605,7 +605,7 @@ restart_old_user_daemon() {
 
 install_daemon_linux() {
     releases="$STAGE/releases.json"
-    say "resolving latest agent release via $SERVER/api/agent/latest-release"
+    say "resolving the latest roomlerd release from $SERVER"
     curl -fsSL -o "$releases" "$SERVER/api/agent/latest-release"
 
     # Two axes, same rules as the agent's own updater
@@ -637,7 +637,7 @@ install_daemon_linux() {
         url="$(asset_field_for "$releases" "$pattern" browser_download_url)"
         digest="$(asset_field_for "$releases" "$pattern" digest)"
     fi
-    [ -n "$url" ] || { echo "error: no linux/${arch} .${fmt} asset in the latest agent release" >&2; exit 1; }
+    [ -n "$url" ] || { echo "error: no linux/${arch} .${fmt} asset in the latest roomlerd release" >&2; exit 1; }
     deb="$STAGE/roomlerd.${fmt}"
     download "$url" "$deb"
     verify_sha256 "$deb" "$digest"
@@ -802,11 +802,11 @@ place_system_config() {
 
 install_daemon_macos() {
     releases="$STAGE/releases.json"
-    say "resolving latest agent release via $SERVER/api/agent/latest-release"
+    say "resolving the latest roomlerd release from $SERVER"
     curl -fsSL -o "$releases" "$SERVER/api/agent/latest-release"
     url="$(asset_field_for "$releases" 'aarch64-apple-darwin[^"]*\.pkg' browser_download_url)"
     digest="$(asset_field_for "$releases" 'aarch64-apple-darwin[^"]*\.pkg' digest)"
-    [ -n "$url" ] || { echo "error: no macOS .pkg asset in the latest agent release" >&2; exit 1; }
+    [ -n "$url" ] || { echo "error: no macOS .pkg asset in the latest roomlerd release" >&2; exit 1; }
     pkg="$STAGE/roomlerd.pkg"
     download "$url" "$pkg"
     verify_sha256 "$pkg" "$digest"
@@ -839,7 +839,7 @@ install_daemon_macos() {
         as_root touch "$MACOS_DAEMON_MARKER"
     fi
 
-    say "installing the roomler agent (.pkg — sudo required)"
+    say "installing roomlerd (.pkg — sudo required)"
     as_root installer -pkg "$pkg" -target /
 
     [ -x "$daemon_bin" ] || {
@@ -884,7 +884,7 @@ install_daemon_macos() {
 kickstart_user_agent() {
     say "restarting the LaunchAgent so it picks up the enrollment"
     launchctl kickstart -k "gui/$1/com.roomler.agent" 2>/dev/null \
-        || warn "launchctl kickstart failed — the agent will pick up the config at next login"
+        || warn "launchctl kickstart failed — roomlerd will pick up the config at next login"
 }
 
 # FR-129 B0 — `--user-steps` on macOS.
@@ -991,7 +991,7 @@ enroll_daemon() {
     fi
     if [ "$NO_ENROLL" = 1 ] || { [ -z "$TOKEN" ] && [ "$PAIR" != 1 ]; }; then
         [ "$NO_ENROLL" = 1 ] || warn "no --token or --pair given — skipping enrollment"
-        say "enroll later with: $enroll_sudo $enroll_bin enroll --server $SERVER --token <agent-enrollment-jwt> --name \"$NAME\"   (or --pair in place of --token)"
+        say "enroll later with: $enroll_sudo $enroll_bin enroll --server $SERVER --token <enrollment-jwt> --name \"$NAME\"   (or --pair in place of --token)"
         return 0
     fi
     if [ "$PAIR" = 1 ]; then
