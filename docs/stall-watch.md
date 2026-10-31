@@ -2,7 +2,7 @@
 
 The instrument at the heart of [FR-65](fr/FR-65-blocking-work-on-async-runtimes.md):
 every pass of the FFmpeg DataChannel pump (`media_pump_ffmpeg_dc`,
-`agents/roomlerd/src/peer.rs:6167`) is timed, broken into named phases, and
+`agents/roomlerd/src/peer.rs:6180`) is timed, broken into named phases, and
 judged. A pass whose **work** reaches the bar (100 ms) is a **stall**: it is
 logged once with its breakdown, counted on the heartbeat, and handed to the rate
 governor, whose FR-79 validity gate refuses to learn from a window in which the
@@ -18,7 +18,7 @@ fleet, and what the watch itself costs (measured, FR-65 AC1).
 | | |
 |---|---|
 | Verdict + bookkeeping | `encode::stall` (`agents/roomlerd/src/encode/stall.rs`) — a pure module on the **default** feature set, so `cargo test -p roomlerd --lib` covers it although the pump is behind `ffmpeg-encoder` |
-| The pump's sites | `peer.rs:6656` (the watch), `:6668` (the one phase list), `:7137` (the pass boundary), `:9909` (the heartbeat's rebase) |
+| The pump's sites | `peer.rs:6669` (the watch), `:6681` (the one phase list), `:7150` (the pass boundary), `:9922` (the heartbeat's rebase) |
 | Kill switch | `pump_stall_watch` / `ROOMLERD_PUMP_STALL_WATCH=0` (`encode/mod.rs:530`), restart required |
 | The bar | `pump_stall_warn_ms` / `ROOMLERD_PUMP_STALL_WARN_MS`, default 100 (`encode/mod.rs:618`) |
 | Its own cost | `roomlerd stall-watch-cost` (`stall.rs:592`, §8) |
@@ -63,7 +63,7 @@ eleven exist only for the watch and cost nothing when it is off.
 
 | Phase | What it times | Work? | Timed when the watch is off? | Since |
 |---|---|---|---|---|
-| `capture` | `capturer.next_frame().await` (`peer.rs:7913`) — mostly **waiting for the screen to change** | no | yes (heartbeat average) | rc.88 |
+| `capture` | `capturer.next_frame().await` (`peer.rs:7926`) — mostly **waiting for the screen to change** | no | yes (heartbeat average) | rc.88 |
 | `scale` | the downscale to the plan's box (`:8509`) | yes | yes | P7 |
 | `encode` | the encode round trip (`:9306`) | yes | yes | rc.88 |
 | `send` | framing and the hand-off to the send task (`:9535`) | yes | yes | rc.88 |
@@ -146,7 +146,7 @@ counted as work, its encoder open as nothing, and the pass went to `other`.
 🔑 A pass longer than the heartbeat interval **always** holds a heartbeat — the
 long pass is what makes it due — so the rule was blind to exactly the stalls
 worth finding. `PassWatch::rebase` (`stall.rs:522`) carries what the open pass
-had accrued and moves its mark past the reset (`peer.rs:9909`). The census that
+had accrued and moves its mark past the reset (`peer.rs:9922`). The census that
 found it is §6.
 
 ### 3.2 The governor reads a total that never resets (fixed 2026-10-30)
@@ -157,7 +157,7 @@ FR-79's gate asks whether the agent's own loop was free in a window
 the mark: after a window that held a stall, the next verdict read `1 − N`,
 which saturates to 0. The first verdict after a reset is the heartbeat pass's
 own — the long one. It now reads `PassWatch::stalls_total` (`stall.rs:556`,
-`peer.rs:8914`), which only grows.
+`peer.rs:8927`), which only grows.
 
 **What the two fixes change for the controller**, since a stall verdict gates
 every rate estimator: a heartbeat pass whose overrun was only a capture wait is
@@ -253,7 +253,7 @@ correlation stands, unexplained.
 Forty of the 46 `untimed` lines (CORPLAP-1 2 of 4, CORPLAP-2 23 of 27,
 CORPLAP-3 all 15) have a normal capture and a normal encode and the rest in
 `other` — a pass that encoded a frame, then waited. The send task
-takes the video DC's mutex in an `if let` scrutinee (`peer.rs:7032`), and Rust
+takes the video DC's mutex in an `if let` scrutinee (`peer.rs:7045`), and Rust
 2024 keeps a scrutinee's temporaries alive through the whole body, so the guard
 is held across every chunk of a frame's flow-controlled send. The pump's own
 `video_bytes_dc.lock().await` after each encode then waits out the previous

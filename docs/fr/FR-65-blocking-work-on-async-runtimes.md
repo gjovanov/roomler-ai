@@ -363,7 +363,7 @@ of each is to produce a number.
 - Whether `apply_ms` belongs in the heartbeat permanently or only under the watch.
 - **The send task's DataChannel guard** (2026-10-30). The send task holds the
   video DC's mutex across a frame's whole send (a Rust 2024 `if let` scrutinee
-  temporary, `peer.rs:7032`), so the pump's `dc_lock` waits out the previous
+  temporary, `peer.rs:7045`), so the pump's `dc_lock` waits out the previous
   frame. Narrowing it is a one-line change; it waits for the `dc_lock` numbers
   the next release brings, then ships with its before/after (AC7).
 - **Should the verdict survive its own kill switch?** Since FR-79,
