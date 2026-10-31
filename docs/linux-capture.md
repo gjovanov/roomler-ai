@@ -568,6 +568,19 @@ probe and every capture, and captures it with the unchanged scrap + damage
 path. This is the hardware-encode test bed on the WSL2 dev host, and the
 remote-apps surface of FR-56 rides on it.
 
+⚠️ **A startup app can map before the window manager is listening.** `start`
+launches the WM and the apps back to back, and a window that maps while openbox
+is still starting stays unmapped, with no `WM_STATE`, until X traffic next wakes
+openbox. The root stays black and so does every session. A rented DGX Spark's
+first session came up that way (FR-122 §8). Measured on Xvfb: apps launched
+50 ms after openbox stayed unmapped in 30 runs of 30, and waiting for the WM's
+`_NET_SUPPORTING_WM_CHECK` first was no cure (22 of 25), because openbox sets it
+as its startup begins. So `start` nudges the WM for 8 s after the apps launch:
+it sets and finally deletes a root property, `_ROOMLER_WM_NUDGE`, and every
+window manager listens to root property changes (`WM_NUDGE_AT_MS` in
+`virtual_desktop.rs`; none left unmapped in 75 runs). The CI Xvfb lane proves
+the nudge reaches a root listener (`virtual_desktop::wm_nudge_tests`).
+
 The children are spawned into their **own process group**, and on any graceful
 exit the daemon tears the whole tree down —
 `virtual_desktop::teardown` — SIGTERM → 2 s grace → SIGKILL, reaching

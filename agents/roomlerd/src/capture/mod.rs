@@ -2378,7 +2378,7 @@ fn x_has_xwayland_monitor(
     target_os = "linux",
     any(feature = "scrap-capture", feature = "enigo-input")
 ))]
-fn x_server_query(
+pub(crate) fn x_server_query(
     display: &str,
     ask: impl FnOnce(&x11rb::rust_connection::RustConnection, x11rb::protocol::xproto::Window) -> bool,
 ) -> Option<bool> {
