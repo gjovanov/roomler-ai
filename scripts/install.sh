@@ -662,7 +662,10 @@ install_daemon_linux() {
 
     if [ "$fmt" = deb ]; then
         say "installing the roomlerd daemon (.deb — sudo required)"
-        as_root dpkg -i "$deb" || as_root apt-get -f install -y
+        deb_install "$deb" || {
+            echo "error: the daemon package did not install: apt could not fetch its dependencies (see above)" >&2
+            exit 1
+        }
     else
         say "installing the roomlerd daemon (tarball — sudo required)"
         # --strip-components=1 drops the versioned prefix dir so the payload
@@ -1156,9 +1159,14 @@ desktop_rpm_tool() {
 desktop_install() {
     case "$1" in
         *.deb)
-            # `apt-get -f install` pulls webkit2gtk / GTK / appindicator when
-            # dpkg reports them missing, which on a fresh desktop it usually will.
-            as_root dpkg -i "$1" || as_root apt-get -f install -y
+            # apt pulls webkit2gtk / GTK / appindicator when dpkg reports them
+            # missing, which on a fresh desktop it usually will. A companion that
+            # cannot finish comes off again: half-configured, it blocks apt for
+            # the whole host, the daemon's next update included.
+            deb_install "$1" || {
+                as_root dpkg --remove roomler-desktop || true
+                return 1
+            }
             ;;
         *.rpm)
             # The package is ours and its sha256 is checked by the caller;
@@ -1303,6 +1311,23 @@ uninstall_failed() {
 # no sudo), else through sudo.
 as_root() {
     if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi
+}
+
+# Install a local .deb and what it depends on. `dpkg -i` alone is enough where
+# the dependencies are already here, and it needs no mirror.
+#
+# ⚠️ Never `apt-get -f install` with no package named. When it cannot reach a
+# dependency it "fixes" the host by REMOVING the package and exits 0. A fresh
+# image has no package lists, so that removed the daemon it had just been handed,
+# and over a working install it deleted a running daemon (#3204). Naming the
+# package keeps it in the solution, so apt refuses instead and what dpkg unpacked
+# stays. --fix-broken has to stay too: without it apt will not touch a package
+# dpkg left half-configured, and stops before it looks for a dependency.
+deb_install() {
+    as_root dpkg -i "$1" && return 0
+    as_root apt-get update -qq ||
+        warn "apt-get update failed: resolving the dependencies from the package lists this host already has"
+    as_root apt-get install -y --fix-broken -o DPkg::Lock::Timeout=60 "$1"
 }
 
 # Relay a privileged helper's report: every line said, every FAILED line
