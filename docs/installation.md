@@ -63,12 +63,12 @@ wizard's and `install.ps1`'s) and the tunnel CLI's installers do
 which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
-- `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:381`);
+- `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:396`);
 - every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1555`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
-(`scripts/install.ps1:164`).
+(`scripts/install.ps1:173`).
 
 `machine_id` is a stable hardware hash and `(tenant_id, machine_id)` is unique —
 re-running an installer on a known machine reuses its identity instead of
@@ -353,6 +353,19 @@ Details worth knowing:
 
 - **Two MSI flavours** exist (`peruser`, `permachine`) — the wizard maps roles
   onto them and flips SystemContext separately (`roomlerd enable-system-context`).
+- **What Apps & Features lists** (FR-133 P1): the per-user MSI as **Roomler**
+  and the per-machine one as **Roomler (per-Machine)**; the Start-menu entry of
+  the per-user MSI is **Roomler** too, and a signed MSI's UAC prompt reads
+  *Roomler installer*.
+  <!-- RETIRED-NAME-ANCHOR: the names a machine installed before FR-133 P1 still
+       lists until its next update replaces the entry; they go once no machine
+       can still carry one. -->
+  A machine installed before P1 lists **Roomler Agent** / **Roomler Agent (per-Machine)**
+  until its next update. The name is display only: Windows Installer matches an
+  upgrade by the MSI's UpgradeCode, and so does `roomlerd`'s `install_detect`
+  (`agents/roomlerd/src/install_detect/mod.rs:324`), so an update leaves one
+  entry, under the new name. `install.ps1 -Uninstall` matches both names,
+  exactly (`scripts/install.ps1:109`).
 - **Running the perMachine MSI by hand** (`msiexec /i roomlerd-<v>-perMachine-….msi /qn`):
   `ENABLE_SYSTEM_CONTEXT=1` turns SystemContext on, `=0` turns it off, and
   **leaving it out keeps the mode the machine was last switched to** (#1727).
@@ -1336,8 +1349,9 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ## Uninstall: every platform
 
-- **Windows**: uninstall the MSI (per-user or per-machine) from Apps, or run
-  `install.ps1 -Uninstall`; the agent's version sweep also removes older
+- **Windows**: uninstall **Roomler** (per-user) or **Roomler (per-Machine)** from
+  Apps (the names [above](#windows)), or run
+  `install.ps1 -Uninstall`; the daemon's version sweep also removes older
   same-flavour MSIs after upgrades. `roomlerd service uninstall` removes a
   manually-installed service/task.
 - **Linux and macOS** (FR-97 P6d): one command, whatever put Roomler there —

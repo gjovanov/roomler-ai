@@ -1,6 +1,6 @@
 # FR-133: Nothing a person reads calls the daemon an "agent" — it is `roomlerd`
 
-**Issue:** [#3177](https://github.com/gjovanov/roomler-ai/issues/3177) · **Status:** proposed 2026-10-30 — spec and claim ·
+**Issue:** [#3177](https://github.com/gjovanov/roomler-ai/issues/3177) · **Status:** P1 in review 2026-10-31 (D1–D3 decided 2026-10-30); spec and claim 2026-10-30 ·
 **Related:** FR-46 ([#1051](https://github.com/gjovanov/roomler-ai/issues/1051), the retired `roomler-agent` names; its "MSI installer identity — its own program" row is this FR's P1) ·
 FR-21 (the retired-name guard, `scripts/name-audit.sh`) · FR-129 ([#3022](https://github.com/gjovanov/roomler-ai/issues/3022), the wizard; its phase C renames the wizard's own words)
 
@@ -13,6 +13,9 @@ the CLI prints say it. "Agent" survives only where it is a wire or operating-sys
 rename would break, and each of those is listed below with its reason.
 
 ## Evidence
+
+Anchors in this section are master `4bc9a9fc8` (the claim). P1 moved the
+installer ones; the P1 row under Phases has where they are now.
 
 The operator, 2026-10-30, after running the released 0.4.188 wizard: "the installer uses agent
 instead of roomlerd, which was renamed agent to roomlerd originally. We shouldn't use anywhere
@@ -54,11 +57,11 @@ and needs those lookups to accept both names.
 | phase | what | kill switch | status |
 |---|---|---|---|
 | P0 | spec + ledger row + issue | — | this commit |
-| P1 | the install surfaces: the MSI ProductName, shortcut and title (both flavours), the Authenticode description, the `.deb`/`.rpm` summary; `install.ps1`'s two lookups and the verify script accept both names; `install.sh`/`install.ps1` output. The wizard's own words ride FR-129 phase C, and the macOS grant notices ride #3164 | copy: a revert. The lookups match both names, so an older or a newer MSI is always found | proposed |
+| P1 | the install surfaces: the MSI ProductName, shortcut and title (both flavours), the Authenticode description, the `.deb`/`.rpm` summary; `install.ps1`'s two lookups and the verify script accept both names; `install.sh`/`install.ps1` output. The wizard's own words ride FR-129 phase C, and the macOS grant notices ride #3164. **Where it landed:** `agents/roomlerd/wix/main.wxs:63` (Name), `:304` (shortcut), `:324` (title); `agents/roomlerd/wix-perMachine/main.wxs:71`, `:308`; `.github/workflows/release-agent.yml:1950`; `agents/roomlerd/Cargo.toml:9` (roomlerd ships no `.rpm`: only the companion does, and its summary never said "agent"); `scripts/install.ps1:109` (the exact names, old and new, per flavour), `:294`, `:476`; `agents/roomlerd/scripts/m3-a1-verify-win11.ps1:387`. Proved by `.github/workflows/installer-smoke.yml:726` | copy: a revert. The lookups match both names, so an older or a newer MSI is always found | in review (draft PR, 2026-10-31) |
 | P2 | the companion and the web app, the viewer's banners included | a revert | proposed |
 | P3 | the docs site (`ui/docs/content`) | a revert | proposed |
 | P4 | a guard in CI: person-facing strings may not say "agent" except the listed identities (an allowlist, in the shape of `name-audit.sh`) | the guard's own baseline | proposed |
-| D | docs: `docs/installation.md` (what Windows lists), the `ship-it` skill (the signing description), this spec's log | — | owed |
+| D | docs: `docs/installation.md` (what Windows lists), the `ship-it` skill (the signing description), this spec's log | — | `docs/installation.md` § Windows rides P1's PR. The `ship-it` skill and `docs/code-signing.md` never named the signing description (checked 2026-10-31), so they have nothing to rename. This log, as phases land |
 
 ## Acceptance criteria
 
@@ -68,6 +71,8 @@ and needs those lookups to accept both names.
       leaves ONE entry, under the new name, and keeps the service and its SystemContext mode.
 - [ ] **AC3** — `install.ps1 -Uninstall` removes an install made before P1 and one made after it.
 - [ ] **AC4** — `apt show roomlerd` and `dnf info roomlerd` print a summary without "agent".
+      (Found 2026-10-31: roomlerd ships no `.rpm` at all, so `dnf info roomlerd` has nothing
+      to show; only the companion ships one, and its `summary` never said "agent".)
 - [ ] **AC5** — Every page, progress line and Done text of the released wizard, every companion
       page and the web app's person-facing strings contain no "agent" outside the allowlist
       (asserted by tests, then by P4's guard).
@@ -77,11 +82,11 @@ and needs those lookups to accept both names.
 
 ## Open decisions
 
-| # | question | recommendation |
+| # | question | decision |
 |---|---|---|
-| D1 | the Apps & Features name: "Roomler", "Roomler Daemon", or "roomlerd"? | **"Roomler"** (and "Roomler (per-Machine)"): the MSI installs the product — the daemon, the `roomler` CLI and the companion — not the daemon alone; the service is already displayed as "Roomler" |
-| D2 | does the web app's Devices page keep any "agent" column or filter word? | no: "daemon version", "daemon" vs "tunnel client" |
-| D3 | rename the `agent-v*` tag family? | no: every deployed updater polls it; a dual-accept migration is weeks of fleet turnover for a name no person should see once versions replace tags |
+| D1 | the Apps & Features name: "Roomler", "Roomler Daemon", or "roomlerd"? | **DECIDED 2026-10-30 by the operator, as recommended: "Roomler"** (and "Roomler (per-Machine)"): the MSI installs the product — the daemon, the `roomler` CLI and the companion — not the daemon alone; the service is already displayed as "Roomler" |
+| D2 | does the web app's Devices page keep any "agent" column or filter word? | **DECIDED 2026-10-30 by the operator, as recommended: no**: "daemon version", "daemon" vs "tunnel client" |
+| D3 | rename the `agent-v*` tag family? | **DECIDED 2026-10-30 by the operator, as recommended: no**: every deployed updater polls it; a dual-accept migration is weeks of fleet turnover for a name no person should see once versions replace tags |
 
 ## Out of scope
 
@@ -94,3 +99,4 @@ and needs those lookups to accept both names.
 | date | build | result |
 |---|---|---|
 | 2026-10-30 | released 0.4.188 (wizard + MSI), Windows 11 | ❌ the operator's run: the wizard's progress said "Resolved tag agent-v0.4.188"; the MSI's Windows Installer events name the product "Roomler Agent (per-Machine)"; the operator: "We shouldn't use anywhere agent" |
+| 2026-10-31 | released 0.4.189 per-Machine MSI, Windows 11 (a dev machine; a read of the Uninstall keys, nothing installed) | ❌ as expected before P1: exactly one Roomler entry in Apps & Features, `'Roomler Agent (per-Machine)' 0.4.189`, in HKLM |
