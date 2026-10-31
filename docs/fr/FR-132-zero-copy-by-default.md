@@ -1,6 +1,6 @@
 # FR-132: Zero-copy by default — each GPU-input cell turns on for the fleet after a clean week of its own
 
-**Issue:** [#3141](https://github.com/gjovanov/roomler-ai/issues/3141) · **Status:** P1 built 2026-10-30, unreleased;
+**Issue:** [#3141](https://github.com/gjovanov/roomler-ai/issues/3141) · **Status:** P1 released in 0.4.191 on 2026-10-31;
 the four decisions taken 2026-10-30 (§6); proposed 2026-10-30 · **Owner:** the agent's capture and encode path, and
 remote config · **Anchors:** master `01520c8af` (§2); the as-built notes in §3a and §3b, master `ff29120ed` + P1 ·
 **Takes over:** [FR-118](FR-118-gpu-resident-frames.md) open decision 2 (the default) · **Builds on:**
@@ -146,8 +146,8 @@ the flip on every host that runs the cell, canary or not.
 
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
-| P0 | The red record: a fleet week of heartbeats read per cell (encoder × capture arm), counting the sessions that could have opened a GPU form and read `switch_off`, and naming the hosts that run each cell | — | not started |
-| P1 | 3a and 3b: `zero_copy_deny` in `DesiredConfig` and the agent's `apply`; the viewer's decode-error message and its count in `rc:session.stats` | the push is absent (no change); a viewer without the message sends nothing | **built 2026-10-30** ([#3154](https://github.com/gjovanov/roomler-ai/pull/3154), unreleased). 3a: `MANAGE_AGENTS` alone, passed on unread, written by the device with `needs_restart`, end to end in `agent_tests` (AC2's integration half). 3b: `rc:decode-error` per error before the fallback, `de: 1` on every `rc:decodestat`, `decode_errors` on `rc:session.stats` (absent = not counted), the first `de` and the first eight errors sent at once, end to end through a real agent and viewer peer in `session_decode_errors_tests` (AC3's integration half). AC2's and AC3's field halves wait for a release |
+| P0 | The red record: a fleet week of heartbeats read per cell (encoder × capture arm), counting the sessions that could have opened a GPU form and read `switch_off`, and naming the hosts that run each cell | — | **done 2026-10-30** (§8, AC1) |
+| P1 | 3a and 3b: `zero_copy_deny` in `DesiredConfig` and the agent's `apply`; the viewer's decode-error message and its count in `rc:session.stats` | the push is absent (no change); a viewer without the message sends nothing | **built 2026-10-30, released 2026-10-31** ([#3154](https://github.com/gjovanov/roomler-ai/pull/3154), in 0.4.191 and `hosted-20261031-28dfd72`). 3a: `MANAGE_AGENTS` alone, passed on unread, written by the device with `needs_restart`, end to end in `agent_tests` (AC2's integration half). 3b: `rc:decode-error` per error before the fallback, `de: 1` on every `rc:decodestat`, `decode_errors` on `rc:session.stats` (absent = not counted), the first `de` and the first eight errors sent at once, end to end through a real agent and viewer peer in `session_decode_errors_tests` (AC3's integration half). AC3's field half is met; AC2's is pushed and waits on the device (§8) |
 | P2 | 3c: the three-valued reading, the default list (empty), `default_off`, at both entry points | `zero_copy = off`; the list empty | not started |
 | P3 | QSV: the canary week, then the flip (if open decision 4 orders it first) | `zero_copy_deny` pushed; the cell off the list in the next release | not started |
 | P4 | NVENC on the WGC arm: the same | the same | not started |
@@ -156,11 +156,11 @@ the flip on every host that runs the cell, canary or not.
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1 (red first):** a fleet week of heartbeats counts the sessions that ran on a cell with a proven GPU form
+- [x] **AC1 (red first):** a fleet week of heartbeats counts the sessions that ran on a cell with a proven GPU form
   and read `input_reason=switch_off`, per cell, with the hosts that ran them.
 - [ ] **AC2 (the kill switch):** a `zero_copy_deny` push reaches a device, the device reports `needs_restart`, and
   after the restart that cell's sessions read `input_reason=denied`. Integration-tested, and seen in the field.
-- [ ] **AC3 (decode errors counted):** a decode error forced in the viewer shows up in that session's
+- [x] **AC3 (decode errors counted):** a decode error forced in the viewer shows up in that session's
   `rc:session.stats`, and a session with none reads zero.
 - [ ] **AC4 (a default per cell):** with `zero_copy` unset, a listed cell opens GPU input and an unlisted one reads
   `default_off`; `on` and `off` keep their meaning; with the list empty, every input form matches `off`'s. Tested at
@@ -199,7 +199,66 @@ All four were decided by the operator on 2026-10-30, each as recommended
 
 ## 8. Field-verification log
 
-Nothing yet. P0 is the first entry.
+### 2026-10-30: P0, a fleet week of heartbeats (AC1)
+
+Production `agent_logs` for the seven days before the read, grouped per day by host, encoder, `input_path` and
+`input_reason`. 99 sessions read `switch_off`, the first gate, so the switch stopped them before any of the cell's
+own checks.
+
+| Family | Encoder | `switch_off` sessions | Hosts | Sessions on `input_path=gpu` |
+|---|---|---|---|---|
+| QSV | `hevc_qsv` | 36 | three PCs at a client office (29), CORPLAP-1 (7) | 0 |
+| QSV | `av1_qsv` | 13 | the 2880×1800 laptop (10), CORPLAP-3 (3) | 19 |
+| QSV | `h264_qsv` | 0 | none | 1 |
+| NVENC | `av1_nvenc` | 23 | CORPLAP-2 (21), NEO16 (2) | 2 |
+| NVENC | `h264_nvenc` | 3 | NEO16 | 0 |
+| NVENC | `hevc_nvenc` | 3 | NEO16 | 0 |
+| VideoToolbox | `hevc_videotoolbox` | 20 | MacBook-1 | 2 |
+| VideoToolbox | `h264_videotoolbox` | 1 | MacBook-1 | 0 |
+
+The heartbeat carries no capture arm, so the arm comes from the capture-backend read beside it. Every QSV host
+captures through the SystemContext DXGI arm. NVENC takes GPU frames only on the WGC arm, so CORPLAP-2's 21 sessions,
+on that same DXGI arm, would likely read `adapter_mismatch` with the switch on. NVENC's count is an upper bound.
+
+### 2026-10-31: AC3, decode errors counted, on 0.4.191
+
+CORPLAP-3, `av1_qsv`, direct. The viewer was Chrome on NEO16, on `hosted-20261031-28dfd72`.
+
+| Session | Device | What the viewer sent | `remote_sessions.stats.decode_errors` |
+|---|---|---|---|
+| clean, 24 s | 0.4.191 | `de: 1` on all 23 reports, no error | `0` |
+| forced, 15 s | 0.4.191 | one `rc:decode-error` | `1` |
+| the viewer's own reconnect, 16 s | 0.4.191 | one `rc:decode-error` | `1` |
+| control, 21 s | 0.4.190 | `de: 1` on all 20 reports | absent |
+
+The error was the decoder's own. The page wrapped its decode worker so that the worker's 100th `decode()` received a
+2 KB random key chunk, and Chrome's `VideoDecoder` answered `Decoding error.`. The viewer sent `rc:decode-error`, and
+the agent logged it with `stage=decode path=vp9-444 codec=av01.0.13M.08` and counted it. The wrapper was still armed
+when the viewer reconnected, so the second session failed the same way and counted its own one.
+
+The control is the state a promote leaves until the agents update: a 0.4.190 agent ignored `de`, the session ran
+normally, and its row carries no count, which reads as not counted, not as zero.
+
+Seen on the way: a mid-session decode error on this data-channel path froze the picture ("video stalled") for about
+10 s, 9.4 s and 10.2 s from the error to the next session, and then a new session started by itself. So a real
+failure reads in a fleet week as one row with a count and a clean row right after it, and the person at the viewer
+sees a 10 s freeze.
+
+### 2026-10-31: AC2's field half, pushed and open
+
+The integration half is in `agent_tests` (P1). In the field the host is CORPLAP-3, which has the switch on and the
+remote-config opt-in, and whose sessions read `encoder=av1_qsv input_path=gpu` before the push. The deny is
+`h264_qsv:gpu`, not its everyday `av1_qsv`, so it costs the host's sessions nothing while it waits. It went through
+the Device configuration dialog as revision 2 with `encoder_cells_deny` kept, and the device row reads `pending`.
+
+A push lands on connect and takes effect at the restart after it
+([`remote-config.md`](../remote-config.md) §6), and a restart can only be forced remotely with `roomler exec`, which
+a corporate laptop does not take. Owed, in order:
+
+1. The device's next reconnect, from a pod roll or the laptop waking: the row reads `needs_restart`.
+2. The restart after that, from the next release's push: an `h264_qsv` session reads `input_reason=denied`, and AC2
+   is met.
+3. `none` pushed in place of the deny, so the cell is free again from the restart that follows.
 
 ## 9. Related
 
