@@ -7400,6 +7400,23 @@ impl BlockList {
 mod tests {
     use super::*;
 
+    /// FR-52 P5 — the stored spelling of the newest action, and an action from a
+    /// newer server read as `Other`, through BSON, which is how a page of the log
+    /// is read. One new kind of row must not fail the page on an older pod.
+    #[test]
+    fn an_audit_action_this_build_does_not_know_is_read_not_refused() {
+        assert_eq!(
+            bson::to_bson(&ExternalRcAuditAction::Principal).unwrap(),
+            bson::Bson::String("principal".into())
+        );
+        #[derive(Deserialize)]
+        struct Row {
+            action: ExternalRcAuditAction,
+        }
+        let row: Row = bson::from_document(bson::doc! { "action": "quorum_reached" }).unwrap();
+        assert_eq!(row.action, ExternalRcAuditAction::Other);
+    }
+
     /// #1882 — every policy row written before `rc_overlay` existed must read
     /// OFF: the default is the whole point, and it has to hold for the rows
     /// already in Mongo, not just for `AccessPolicy::default()`.

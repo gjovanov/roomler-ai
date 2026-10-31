@@ -70,6 +70,10 @@ mod tests {
             bson::to_bson(&NotificationType::ApprovalRequest).unwrap(),
             bson::Bson::String("approval_request".into())
         );
+        assert_eq!(
+            bson::to_bson(&NotificationType::ExternalAccess).unwrap(),
+            bson::Bson::String("external_access".into())
+        );
         let doc = bson::doc! { "t": "quorum_reached" };
         #[derive(Deserialize)]
         struct T {

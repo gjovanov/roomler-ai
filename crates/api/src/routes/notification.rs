@@ -118,11 +118,21 @@ async fn emit_unread_count(state: &Core, user_id: ObjectId) {
     .await;
 }
 
+/// A notification's kind as it is stored and as the socket sends it
+/// (`ws_type_label`), so a list read after a reload matches a live frame. The
+/// lowercased `Debug` form read `approvalrequest`, which no client matched.
+fn kind_of(kind: &roomler_ai_db::models::NotificationType) -> String {
+    match bson::to_bson(kind) {
+        Ok(bson::Bson::String(kind)) => kind,
+        _ => "other".to_string(),
+    }
+}
+
 fn to_response(n: roomler_ai_db::models::Notification) -> NotificationResponse {
     NotificationResponse {
         id: n.id.unwrap().to_hex(),
         tenant_id: n.tenant_id.to_hex(),
-        notification_type: format!("{:?}", n.notification_type).to_lowercase(),
+        notification_type: kind_of(&n.notification_type),
         title: n.title,
         body: n.body,
         link: n.link,
