@@ -4,7 +4,9 @@ license = "MPL-2.0"
 publish = false
 version.workspace = true
 edition.workspace = true
-description = "Roomler AI remote-control agent — runs on the controlled host, connects to the Roomler API."
+# FR-133 P1: the .deb's summary line (`apt show roomlerd`) and the `about` line of
+# `roomlerd --help`. Kept under 80 characters, the Debian limit for a synopsis.
+description = "Roomler daemon (roomlerd): remote desktop, private WireGuard mesh and tunnels"
 
 [lib]
 name = "roomlerd"
