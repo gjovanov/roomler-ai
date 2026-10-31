@@ -5,9 +5,9 @@ documented in [`docs/build-caches.md`](../build-caches.md). It first closed that
 reopened in the afternoon for wave 33: from #3125 on, `ci.yml`'s Windows clippy lane built cold on
 every run, because its cache was over its cap. The Actions cache had also started refusing
 downloads (Open decisions). Wave 34 moved the Linux lanes off it, wave 35 skips the heavy lanes on
-docs-only PRs, and wave 36 lets a cold unit or lint run finish its publish. Waves 33–35 are
-field-verified in the log; wave 36 shows only on the next cold run. What is left is runner
-queueing. First shipped and field-verified 2026-08-26
+docs-only PRs, and wave 36 lets a cold unit or lint run finish its publish. Waves 33–35 and 37 are
+field-verified in the log; wave 36 shows only on the next cold unit or lint run. What is left is
+runner queueing. First shipped and field-verified 2026-08-26
 (retroactive FR per the CLAUDE.md standing rule — the program ran 2026-07-13 → 2026-08-26 across
 ~20 PRs). Tracking issue: `FR-6` (#773) in gjovanov/roomler-ai/issues.
 
@@ -1228,3 +1228,47 @@ itself on the affected run's page. Baseline when the program started: releases t
     41072792020, after its cache crossed its cap.
 
   Windows sessions and the FR-85 recorder lane have no cold run on record.
+- 2026-10-31, 18:37–19:14Z: **the first cold macOS runs since wave 37, and the GC recovered by
+  itself.** The bump to 0.4.191 changed the lane's key, so master run 41229495094 built on the
+  5,821 MB it restored and published 6,440 MB at 18:36:49Z, over the 6,000 MB cap.
+  `CI cache over its cap` fired. The next three macOS jobs dropped that cache and compiled 976
+  crates, against a warm job's 41:
+
+  | Run | Kind | Started | Took |
+  |---|---|---|---|
+  | 41230117636 | PR | 18:37:20Z | 20.9 min |
+  | 41229869004 | master | 18:50:29Z | 9.2 min |
+  | 41230762929 | PR | 18:51:57Z | 22.1 min |
+
+  All three fit the 35-minute ceiling, and the old 25 too. The master run pruned 5,767 MB to
+  4,664 MB and published at 18:59:39Z, 23 minutes after the oversize publish, and the next job
+  (41230851548) restored it and compiled 41. Those were the only 3 cold jobs among the 44 macOS
+  jobs that ran from wave 36's merge to 19:28Z.
+
+  Two things follow:
+  - **A job's time does not say cold or warm on this lane.** The 9.2 and 22.1 min jobs built the
+    same crates and started 88 s apart, and the 41 warm jobs took 6.9–17.3 min. Read the job's
+    `restored` line or its compile count instead.
+  - **The warning was wrong about this case.** It said every run would build cold and to raise
+    the cap, which is wave 33's stuck cache, where the cold build itself is over the cap. This
+    cache came back lean, so the cap stays at 6,000 MB, and `ci-seed-save/action.yml:95` now
+    names both cases.
+
+  This lane's published size rose with each version bump, 5,289 to 5,831 MB at 0.4.190 and 5,888
+  to 6,440 MB at 0.4.191, while unit, lint and Windows sessions published the same size across
+  both bumps. The cause is not established. At that rate a 4,664 MB cache crosses 6,000 MB on the
+  third bump from here, 0.4.194.
+- 2026-10-31, 19:50Z: **wave 35 holds on every docs-only PR that ran the gate.** Of the 28 PRs
+  merged from #3170 on, nine were docs-only with the gate in their run: #3137, #3184, #3189,
+  #3196, #3200, #3201, #3206, #3211 and #3212. All nine skipped the twelve heavy jobs, and each
+  `What changed` log shows the skip notice. #3179 and #3183 were docs-only too, but their runs
+  started before #3170 merged, so they ran every job. The other 17 each have a path outside the
+  docs, and none skipped anything. The PR page counts 14 skipped: the twelve, plus the CLA check
+  listed twice.
+- 2026-10-31, 20:54Z: **wave 36 is still unproven: neither unit nor lint has run cold since it
+  merged.** A drop lasts until a master run publishes, so reading the master runs finds every
+  one. All 17 finished master jobs per lane, through the run created at 19:31Z, compiled the usual
+  few crates: unit 73, lint 15, the FR-85 recorder 56, Windows sessions 18–19. Unit published
+  10,380 MB and lint 6,088 MB on every publish, 65 % and 61 % of their caps, so the GC will not
+  reach them and a cold run needs a lost cache. Windows sessions and the FR-85 recorder lane
+  still have no cold run on record.
