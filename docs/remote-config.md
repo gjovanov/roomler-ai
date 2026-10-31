@@ -295,6 +295,12 @@ the new daemon starts on the old value, then writes the pushed one and reports
 `needs_restart`, so it takes a second restart. Restart once the device reports
 `needs_restart`. The same holds for every `needs_restart` key here.
 
+On a device that stays connected, the first restart is the reconnect, so it
+takes two. `roomler restart` at the device does both, with no `roomler exec` and
+no elevation, at least 30 s apart. Taking a deny off costs the same two steps:
+`none` lands at the next reconnect, and the deny holds until the restart after
+it ([FR-132](fr/FR-132-zero-copy-by-default.md) §8).
+
 ## 7. What this does not do
 
 - **No bootstrapping problem.** Enabling `exec_enabled` remotely does not
