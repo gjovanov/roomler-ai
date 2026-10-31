@@ -1673,6 +1673,90 @@ async fn a_closed_code_answers_like_one_that_does_not_exist() {
     let _ = gate_2_off.stop.send(true);
 }
 
+/// An answer at the floor is its arm's LAST act. On a single-threaded runtime an
+/// arm that answered and then audited read 1 ms late at every percentile (spec
+/// §12), because the spawned write ran ahead of the reply. Two idle workers hide
+/// that, a busy pod may not have one, and the floor test above cannot see it at
+/// all: every answer still leaves after the floor.
+///
+/// A row is stamped as it is made, so the stamp says which came first: one later
+/// than half the floor came from an arm that answered first. Each arm has three
+/// tries, so a stall on a busy runner does not read as that; an arm that really
+/// answers first fails all three.
+#[tokio::test]
+async fn an_audit_row_is_made_before_the_answer_it_explains() {
+    use roomler_ai_mod_remote::extauth::ANSWER_FLOOR;
+    use roomler_ai_services::dao::base::PaginationParams;
+
+    let app = TestApp::spawn().await;
+    let (_id, mut ws) = outsider(&app, "extorder").await;
+    let seeded = app.seed_tenant("extauth-order").await;
+    let dev = device(&app, &seeded, "mach-extauth-order", &pw("device")).await;
+    assert_eq!(
+        put(
+            &app,
+            &url(&seeded, "/external-access"),
+            &seeded.admin.access_token,
+            json!({"enabled": false})
+        )
+        .await,
+        200
+    );
+
+    // Offline with the switch off: the one state in which all three arms write
+    // a row. On an online device a made-up attempt is refused without one.
+    let _ = dev.stop.send(true);
+    let tenant = bson::oid::ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let agent = bson::oid::ObjectId::parse_str(&dev.agent_id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.state.fleet().rc_hub.is_agent_online(agent) {
+        assert!(Instant::now() < deadline, "the device never went offline");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (_, ke1) = client_ke1(&pw("device"));
+    const MADE_UP: &str = "66f0c0ffee0000000000abcd";
+    let code = dev.code.as_str();
+    let arms = [
+        (
+            "start",
+            json!({"t": "rc:extauth.start", "connect_code": code, "ke1": ke1}),
+        ),
+        (
+            "finish",
+            json!({"t": "rc:extauth.finish", "connect_code": code, "attempt_id": MADE_UP, "ke3": "AAAA"}),
+        ),
+        (
+            "session",
+            json!({"t": "rc:extauth.session", "connect_code": code, "attempt_id": MADE_UP, "permissions": "VIEW"}),
+        ),
+    ];
+    let early = 0..(ANSWER_FLOOR.as_millis() as i64 / 2);
+    for (arm, frame) in arms {
+        let mut delays = Vec::new();
+        for _ in 0..3 {
+            let since = bson::DateTime::now().timestamp_millis();
+            send(&mut ws, frame.clone()).await;
+            next_of(&mut ws, &["rc:extauth.result", "rc:session.created"]).await;
+            let rows = app
+                .state
+                .fleet()
+                .external_rc_audit
+                .list_for_agent(tenant, agent, &PaginationParams::default())
+                .await
+                .unwrap();
+            let delay = rows.items[0].at.timestamp_millis() - since;
+            delays.push(delay);
+            if early.contains(&delay) {
+                break;
+            }
+        }
+        assert!(
+            delays.iter().any(|d| early.contains(d)),
+            "{arm}: the row came after the answer, {delays:?} ms after the knock"
+        );
+    }
+}
+
 /// `rc:extauth.finish` and `rc:extauth.session` need no start and no password,
 /// and carry a connect code. So a stranger with a made-up attempt id must learn
 /// from them exactly what no such code tells them, whatever the code's device is

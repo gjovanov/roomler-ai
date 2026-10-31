@@ -15,11 +15,14 @@
 //!    closed or expired, offline, too old. The org's audit log is where they
 //!    are told apart (`login_detail`); the outsider never sees the difference.
 //!    And the same LATENCY: an answer given without the device leaves at
-//!    [`ANSWER_FLOOR`] after the knock, whatever was read to reach it, and the
-//!    reply goes out BEFORE the audit write (a write only resolvable codes
-//!    trigger). Padding the reads cannot do this: a hit and a miss differ by
-//!    0.4 ms at every percentile (spec §12), and a rate limit only slows the
-//!    averaging down.
+//!    [`ANSWER_FLOOR`] after the knock, whatever was read to reach it. ⚠️ Such
+//!    an answer leaves from ONE place, [`at_floor`], after its arm has RETURNED.
+//!    Work behind it is work only a resolvable code triggers, and it can show:
+//!    on a single-threaded runtime an arm that answered and then spawned its
+//!    audit write read 1 ms late at every percentile, because the write ran
+//!    ahead of the reply. Two idle workers hide that (spec §12), and a busy pod
+//!    may not have one. So the row is spawned, the arm returns, the deadline
+//!    passes, the answer leaves. A rate limit only slows the averaging down.
 //! 2. **Park before the push.** The device can answer faster than this
 //!    function gets back from `send_to_agent`; the waiter is registered first,
 //!    so an early answer finds somewhere to land (FR-83's rule).
@@ -339,8 +342,14 @@ fn unavailable(attempt_id: Option<String>) -> ServerMsg {
     result(attempt_id, Some(ExtauthRefusal::Unavailable), None)
 }
 
-/// Send `answer` at [`ANSWER_FLOOR`] after `knocked`, or at once if that passed.
-async fn answer_at_floor(tx: &ClientTx, knocked: Instant, answer: ServerMsg) {
+/// Send what an arm left, at [`ANSWER_FLOOR`] after `knocked`, or at once if that
+/// passed. `None`: the arm answered itself, or handed the frame on.
+///
+/// ⚠️ The handlers call this AFTER their arm returned, so nothing an arm spawned,
+/// or holds and must drop, can run behind the answer (rule 1 above). An arm that
+/// waits out the floor itself has put that timing back.
+async fn at_floor(tx: &ClientTx, knocked: Instant, answer: Option<ServerMsg>) {
+    let Some(answer) = answer else { return };
     tokio::time::sleep_until((knocked + ANSWER_FLOOR).into()).await;
     let _ = tx.try_send(answer);
 }
@@ -527,23 +536,36 @@ pub async fn handle_start(
     ke1: String,
     hop: Hop,
 ) {
+    let knocked = Instant::now();
+    let answer = start(state, principal, actor, tx, connect_code, ke1, hop, knocked).await;
+    at_floor(tx, knocked, answer).await;
+}
+
+/// [`handle_start`]'s arms. What they return leaves through [`at_floor`].
+#[allow(clippy::too_many_arguments)]
+async fn start(
+    state: &RemoteState,
+    principal: ObjectId,
+    actor: &str,
+    tx: &ClientTx,
+    connect_code: &str,
+    ke1: String,
+    hop: Hop,
+    now: Instant,
+) -> Option<ServerMsg> {
     let relay = &state.extauth;
-    let now = Instant::now();
     relay.prune(now);
     if !relay.allow_start(principal, now) {
         let _ = tx.try_send(result(None, Some(ExtauthRefusal::RateLimited), None));
-        return;
+        return None;
     }
     let Some(agent) = resolve(state, connect_code).await else {
-        answer_at_floor(tx, now, unavailable(None)).await;
-        return;
+        return Some(unavailable(None));
     };
     let Some(agent_id) = agent.id else {
-        answer_at_floor(tx, now, unavailable(None)).await;
-        return;
+        return Some(unavailable(None));
     };
     if let Err(detail) = gates(state, &agent).await {
-        answer_at_floor(tx, now, unavailable(None)).await;
         info!(%principal, agent = %agent_id, detail, "extauth: start refused");
         audit(
             state,
@@ -555,19 +577,18 @@ pub async fn handle_start(
             Some(ExtauthRefusal::Unavailable),
             Some(detail),
         );
-        return;
+        return Some(unavailable(None));
     }
     if !state.fleet.rc_hub.is_agent_online(agent_id) {
         // Not here. If another pod holds the device, hand the frame over once;
         // its replies reach the browser over the conn-addressed lane.
         if forward(state, &hop, agent_id, principal, actor).await {
-            return;
+            return None;
         }
         let detail = match hop {
             Hop::Origin { .. } => "the device is offline (no pod holds it)",
             Hop::Relayed => "forwarded here, but the device is no longer on this pod",
         };
-        answer_at_floor(tx, now, unavailable(None)).await;
         audit(
             state,
             &agent,
@@ -578,7 +599,7 @@ pub async fn handle_start(
             Some(ExtauthRefusal::Unavailable),
             Some(detail),
         );
-        return;
+        return Some(unavailable(None));
     }
 
     let attempt_id = ObjectId::new().to_hex();
@@ -604,7 +625,6 @@ pub async fn handle_start(
         .is_err()
     {
         relay.attempts.remove(&attempt_id);
-        answer_at_floor(tx, now, unavailable(None)).await;
         audit(
             state,
             &agent,
@@ -615,7 +635,7 @@ pub async fn handle_start(
             Some(ExtauthRefusal::Unavailable),
             Some("the device went away before KE1 could be sent"),
         );
-        return;
+        return Some(unavailable(None));
     }
 
     match pending.wait(DEVICE_ANSWER_BOUND).await {
@@ -631,26 +651,25 @@ pub async fn handle_start(
             // ⚠️ "Verified" in answer to a KE1 is protocol nonsense — nothing
             // has been proven yet. Relayed as a refusal, never as a login.
             let refused = Some(refused.unwrap_or(ExtauthRefusal::Other));
-            // ⚠️ The device's `unavailable` is the server's, to the byte: an
-            // attempt id here would say the code resolved, the org's gates
-            // are open and the device is online, which is the configuration
-            // this one answer exists to hide. The floor covers a device nearer
-            // than it; a farther one still shows its round trip.
-            if refused == Some(ExtauthRefusal::Unavailable) {
-                answer_at_floor(tx, now, unavailable(None)).await;
-            } else {
-                let _ = tx.try_send(result(Some(attempt_id.clone()), refused, retry_after_secs));
-            }
             audit(
                 state,
                 &agent,
                 agent_id,
                 principal,
                 actor,
-                Some(attempt_id),
+                Some(attempt_id.clone()),
                 refused,
                 None,
             );
+            // ⚠️ The device's `unavailable` is the server's, to the byte: an
+            // attempt id here would say the code resolved, the org's gates
+            // are open and the device is online, which is the configuration
+            // this one answer exists to hide. The floor covers a device nearer
+            // than it; a farther one still shows its round trip.
+            if refused == Some(ExtauthRefusal::Unavailable) {
+                return Some(unavailable(None));
+            }
+            let _ = tx.try_send(result(Some(attempt_id), refused, retry_after_secs));
         }
         None => {
             relay.attempts.remove(&attempt_id);
@@ -667,6 +686,7 @@ pub async fn handle_start(
             );
         }
     }
+    None
 }
 
 /// `rc:extauth.finish` — relay KE3, relay the verdict.
@@ -681,8 +701,36 @@ pub async fn handle_finish(
     ke3: String,
     hop: Hop,
 ) {
-    let relay = &state.extauth;
     let knocked = Instant::now();
+    let answer = finish(
+        state,
+        principal,
+        actor,
+        tx,
+        connect_code,
+        attempt_id,
+        ke3,
+        hop,
+        knocked,
+    )
+    .await;
+    at_floor(tx, knocked, answer).await;
+}
+
+/// [`handle_finish`]'s arms. What they return leaves through [`at_floor`].
+#[allow(clippy::too_many_arguments)]
+async fn finish(
+    state: &RemoteState,
+    principal: ObjectId,
+    actor: &str,
+    tx: &ClientTx,
+    connect_code: &str,
+    attempt_id: String,
+    ke3: String,
+    hop: Hop,
+    knocked: Instant,
+) -> Option<ServerMsg> {
+    let relay = &state.extauth;
     relay.prune(knocked);
     let unknown =
         |attempt_id: String| result(Some(attempt_id), Some(ExtauthRefusal::UnknownAttempt), None);
@@ -690,19 +738,17 @@ pub async fn handle_finish(
     // on, an attempt that was started cross-pod lives on the OTHER pod, and a
     // local lookup would wrongly answer "no such attempt".
     let Some(agent) = resolve(state, connect_code).await else {
-        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
-        return;
+        return Some(unknown(attempt_id));
     };
     let Some(device) = agent.id else {
-        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
-        return;
+        return Some(unknown(attempt_id));
     };
     // The gates BEFORE any forward: a frame sent on to another pod comes back a
     // relay hop later, which would mark a closed org's code as one that exists.
     let gate = gates(state, &agent).await;
     if !state.fleet.rc_hub.is_agent_online(device) {
         if gate.is_ok() && forward(state, &hop, device, principal, actor).await {
-            return;
+            return None;
         }
         // ⚠️ This frame needs no `rc:extauth.start` first and has no rate limit
         // of its own, so a stranger can send it with any code. `unavailable` is
@@ -720,7 +766,6 @@ pub async fn handle_finish(
         } else {
             unknown(attempt_id.clone())
         };
-        answer_at_floor(tx, knocked, answer).await;
         // A closed gate is still a refusal the org can read. Under the start
         // limit, because anyone holding the code can repeat this.
         if let Err(detail) = gate
@@ -737,7 +782,7 @@ pub async fn handle_finish(
                 Some(detail),
             );
         }
-        return;
+        return Some(answer);
     }
     // Taken, not read: whatever happens next, this attempt ends here. Only its
     // own principal can take it — anyone else leaves it in place and is told
@@ -746,14 +791,12 @@ pub async fn handle_finish(
         .attempts
         .remove_if(&attempt_id, |_, a| a.principal == principal)
     else {
-        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
-        return;
+        return Some(unknown(attempt_id));
     };
     // The code must still name the attempt's device, and the gates must still
     // be open: an admin who revokes mid-login must not see it complete.
     if attempt.agent_id != device {
-        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
-        return;
+        return Some(unknown(attempt_id));
     }
     let agent_id = attempt.agent_id;
     if let Err(detail) = gate {
@@ -768,7 +811,7 @@ pub async fn handle_finish(
             Some(ExtauthRefusal::Unavailable),
             Some(detail),
         );
-        return;
+        return None;
     }
 
     let pending = relay.expect(&attempt_id, agent_id);
@@ -794,7 +837,7 @@ pub async fn handle_finish(
             Some(ExtauthRefusal::Unavailable),
             Some("the device went away before KE3 could be sent"),
         );
-        return;
+        return None;
     }
 
     match pending.wait(DEVICE_ANSWER_BOUND).await {
@@ -856,6 +899,7 @@ pub async fn handle_finish(
             );
         }
     }
+    None
 }
 
 /// P4 — what `rc:extauth.session` asks for.
@@ -976,8 +1020,22 @@ pub async fn handle_session(
     ask: SessionAsk,
     hop: Hop,
 ) {
-    let relay = &state.extauth;
     let knocked = Instant::now();
+    let answer = open_session(state, principal, actor, tx, ask, hop, knocked).await;
+    at_floor(tx, knocked, answer).await;
+}
+
+/// [`handle_session`]'s arms. What they return leaves through [`at_floor`].
+async fn open_session(
+    state: &RemoteState,
+    principal: ObjectId,
+    actor: &str,
+    tx: &ClientTx,
+    ask: SessionAsk,
+    hop: Hop,
+    knocked: Instant,
+) -> Option<ServerMsg> {
+    let relay = &state.extauth;
     let attempt_id = ask.attempt_id;
     let unknown =
         |attempt_id: String| result(Some(attempt_id), Some(ExtauthRefusal::UnknownAttempt), None);
@@ -988,11 +1046,15 @@ pub async fn handle_session(
     // one answer whether it does or not, so this arm tells nothing about a code,
     // and at the pod the frame arrived on, the only one that can see the key.
     if ask.named_a_relay {
-        warn!(%principal, %attempt_id, "extauth: a local_relay on an external session — refused (F4)");
+        // The log line and the audit row are both under the start limit: this
+        // frame has none of its own, and the id in it is the caller's text.
+        let recorded = relay.allow_start(principal, knocked);
+        if recorded {
+            warn!(%principal, ?attempt_id, "extauth: a local_relay on an external session — refused (F4)");
+        }
         let agent = resolve(state, &ask.connect_code).await;
-        answer_at_floor(tx, knocked, unavailable(Some(attempt_id.clone()))).await;
         if let Some((agent, device)) = agent.and_then(|a| a.id.map(|id| (a, id)))
-            && relay.allow_start(principal, knocked)
+            && recorded
         {
             audit_session(
                 state,
@@ -1000,29 +1062,27 @@ pub async fn handle_session(
                 device,
                 principal,
                 actor,
-                attempt_id,
+                attempt_id.clone(),
                 Some(ExtauthRefusal::Unavailable),
                 Some("the request named a relay (F4): an outsider has no overlay presence"),
                 None,
             );
         }
-        return;
+        return Some(unavailable(Some(attempt_id)));
     }
     // The code FIRST, as in `finish`: a login verified cross-pod is held on the
     // pod that holds the device, and a local lookup here would miss it.
     let Some(agent) = resolve(state, &ask.connect_code).await else {
-        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
-        return;
+        return Some(unknown(attempt_id));
     };
     let Some(device) = agent.id else {
-        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
-        return;
+        return Some(unknown(attempt_id));
     };
     // Before any forward, for `finish`'s reason.
     let gate = gates(state, &agent).await;
     if !state.fleet.rc_hub.is_agent_online(device) {
         if gate.is_ok() && forward(state, &hop, device, principal, actor).await {
-            return;
+            return None;
         }
         // `finish`'s rule too: `unavailable` only for a login this principal
         // really holds here.
@@ -1032,7 +1092,6 @@ pub async fn handle_session(
         } else {
             unknown(attempt_id.clone())
         };
-        answer_at_floor(tx, knocked, answer).await;
         let detail = match gate {
             Err(detail) => Some(detail),
             Ok(_) if held => Some("the device is offline (no pod holds it)"),
@@ -1053,14 +1112,13 @@ pub async fn handle_session(
                 None,
             );
         }
-        return;
+        return Some(answer);
     }
     // Spent, not read: one verified login opens one session, whatever happens
     // below — a refusal here sends the outsider back to log in again, which is
     // the cheap direction to be wrong in.
     if !relay.take_verified(&attempt_id, principal, device, knocked) {
-        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
-        return;
+        return Some(unknown(attempt_id));
     }
     // Gates 1 and 2 again: an admin who revokes between the login and the
     // session must not see the session open.
@@ -1083,7 +1141,7 @@ pub async fn handle_session(
         Ok(tenant) => tenant,
         Err(detail) => {
             refuse(detail, attempt_id);
-            return;
+            return None;
         }
     };
     // ⚠️ A device that cannot bind a session to its login would take
@@ -1095,7 +1153,7 @@ pub async fn handle_session(
             "the device's agent can verify an external login but is too old to admit the session",
             attempt_id,
         );
-        return;
+        return None;
     }
     // Gate 2's ceiling. The device applies its own on top; the grant only
     // ever narrows.
@@ -1106,7 +1164,7 @@ pub async fn handle_session(
             "nothing the outsider asked for is within the org's ceiling for this device",
             attempt_id,
         );
-        return;
+        return None;
     }
     // FR-101 / FR-99 — what binds every controller of this device binds an
     // outsider too, read off the row gate 1 just read, exactly as
@@ -1163,7 +1221,7 @@ pub async fn handle_session(
                     Some("every concurrent-session slot of the payer is held"),
                     None,
                 );
-                return;
+                return None;
             }
         }
     }
@@ -1248,6 +1306,7 @@ pub async fn handle_session(
             );
         }
     }
+    None
 }
 
 /// Route a controller frame here if it is an `rc:extauth.*` frame. `None` =
