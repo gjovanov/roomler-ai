@@ -204,7 +204,7 @@ const loading = ref(false)
 const message = ref<string | null>(null)
 const report = ref<ContentReport | null>(null)
 const landingNote =
-  'sign-ups whose first touch landed on the post — campaign links only until FR-91 P3 carries organic arrivals'
+  'sign-ups whose first touch landed on the post, by a campaign link or from another site; a reader with no referrer carries none'
 
 function pct(v: number): string {
   return `${Math.round(v * 1000) / 10}%`

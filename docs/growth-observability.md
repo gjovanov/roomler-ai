@@ -1274,9 +1274,10 @@ flowchart LR
   `not_measured` ("no Search Console key configured", "no final Search Console day pulled yet");
   a post nobody inspected yet says so. A post that had none of it in the window is a measured 0.
 
-> ⚠️ **Sign-ups by landing path are a lower bound.** The site writes `landing_path` only on a
-> journey that began on a campaign link (FR-88's carry, `ui/docs/theme/attribution.js`); an
-> organic reader of a post who signs up carries none until FR-91 P3 builds the organic carry.
+> ⚠️ **Sign-ups by landing path are a lower bound.** The site writes `landing_path` on a journey
+> that began on a campaign link (FR-88's carry, `ui/docs/theme/attribution.js`) or on the blog,
+> from another site (FR-91's organic carry, [public-site.md §9.5](public-site.md)). A reader
+> whose browser sent no referrer carries none.
 > Every sign-up cell carries that note, and the tab says it in text under the table and in the
 > column's own header ("Sign-ups (lower bound)"), not only on hover.
 
@@ -2145,7 +2146,7 @@ everyone, and the viewer has no strip.
 | Cost & usage | per-org metered cost and the list-price MRR estimate ([relay-cost-metering.md](relay-cost-metering.md)) | `/api/admin/stats/cost` |
 | Orgs, machines, calls, users | platform-wide inventories and series | `/api/admin/stats/{orgs,machines,calls,users}` |
 | Usage | per-user minutes and bytes across every org | `/api/admin/stats/usage*` |
-| Attribution (FR-88) | sign-ups by campaign key and how many activated | `/api/admin/stats/attribution` |
+| Attribution (FR-88) | sign-ups by campaign key and by blog landing page, and how many activated | `/api/admin/stats/attribution` |
 | **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the machine keys (P8, P10), the Newsletter tab (P5), the Revenue tab (P4), the Quality tab (P9a), the Weekly tab and the Alerts panel (P10); the digest's `quality.ratings` from the viewer's post-session prompt (P9b); the digest's and the weekly's `github` section (P7a); the Content tab and the digest's and the weekly's `search` section (P7c) | `/api/admin/growth/*` |
 
 ## Field verification
