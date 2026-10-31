@@ -1050,9 +1050,10 @@ jobs:
 
       # The MSIs the step above built one version above the newest release: what
       # a vmtest field cell installs over a released one. CI builds, unsigned:
-      # never ship them.
+      # never ship them. Not on a master push: nobody field-tests those, and at
+      # 40 MB a run they would only fill the account's Actions storage.
       - name: Upload this branch's MSIs (FR-133 field cell)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.event_name != 'push' }}
         uses: actions/upload-artifact@v4
         with:
           name: installer-smoke-msis
