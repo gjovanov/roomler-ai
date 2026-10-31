@@ -342,7 +342,7 @@ impl UserDao {
         //     unique index, so this adds no new exposure — but don't extend the
         //     pattern to a surface where it would.)
         if self.find_by_email(email).await.is_ok() {
-            return Err(DaoError::DuplicateKey(format!(
+            return Err(DaoError::Conflict(format!(
                 "an account already exists for {email} and {provider} did not \
                  verify the address — sign in with your existing credentials"
             )));

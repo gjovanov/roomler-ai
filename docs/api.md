@@ -9,7 +9,10 @@ source of truth.
 - **Base URL**: `https://roomler.ai` (or your deployment). All JSON.
 - **IDs** are MongoDB ObjectIds serialized as 24-char hex strings.
 - **Errors** are JSON with an HTTP status; 404 is also used to *hide* resources the
-  caller may not see (platform-admin routes).
+  caller may not see (platform-admin routes). The body is `{error, message}`: `error`
+  is the code to branch on, and `message` is for reading. A collision no route put in
+  words answers `409 conflict` with `That already exists`
+  ([security-baseline.md](security-baseline.md) §5).
 
 ## Authentication
 
