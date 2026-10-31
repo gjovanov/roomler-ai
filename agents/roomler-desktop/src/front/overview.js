@@ -670,7 +670,41 @@
     const inputRow = $('ov-perm-input');
     if (screenRow) screenRow.hidden = p.screen_recording;
     if (inputRow) inputRow.hidden = p.accessibility;
+    // #3164 — Screen Recording reaches a freshly started agent only, so its
+    // row comes with the restart that applies it. Accessibility is live.
+    const restartRow = $('ov-perm-restart');
+    if (restartRow) restartRow.hidden = p.screen_recording;
     show(banner);
+  }
+
+  /*
+   * #3164 — the restart a Screen Recording grant needs, through the app's one
+   * restart flow (settings.js, `window.Roomler.restartDaemon`: LocalAPI
+   * `RestartDaemon`, the agent's own supervisor relaunches it, no crash
+   * counted). Before this the card said "restart the agent" with no way to,
+   * and the one way macOS offers, Quit & Reopen, left an agent that predates
+   * #3164 offline. A refusal is shown verbatim.
+   */
+  let permRestarting = false;
+  async function restartForPermissions(btn) {
+    const R = window.Roomler || {};
+    if (permRestarting || typeof R.restartDaemon !== 'function') return;
+    permRestarting = true;
+    btn.disabled = true;
+    const out = $('ov-perm-restart-result');
+    const say = (text) => {
+      if (!out) return;
+      out.textContent = text || '';
+      out.hidden = !text;
+    };
+    try {
+      const r = await R.restartDaemon('macOS permissions: Screen Recording applies after a restart', say);
+      say(r.ok ? 'roomlerd restarted.' : r.message);
+      await refreshPermissions();
+    } finally {
+      permRestarting = false;
+      btn.disabled = false;
+    }
   }
 
   document.addEventListener('DOMContentLoaded', () => {
@@ -726,6 +760,10 @@
           pushOutput('Could not open the permission pane: ' + e);
         }
       });
+    }
+    const permRestart = $('ov-btn-perm-restart');
+    if (permRestart) {
+      permRestart.addEventListener('click', () => void restartForPermissions(permRestart));
     }
 
     $('ov-btn-onboard').addEventListener('click', () => navigate('onboarding'));

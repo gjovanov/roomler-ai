@@ -991,6 +991,10 @@ pub struct DesiredConfigView {
     /// key). Absent = not managed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color_description: Option<String>,
+    /// FR-132 P1 — the GPU-input denylist as pushed; `""` is a request to
+    /// clear the device's key. Absent = not managed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zero_copy_deny: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1017,6 +1021,7 @@ impl From<roomler_ai_remote_control::models::DesiredConfig> for DesiredConfigVie
             encoder_cells_deny: d.encoder_cells_deny,
             fps_deny: d.fps_deny,
             color_description: d.color_description,
+            zero_copy_deny: d.zero_copy_deny,
             updated_by: d.updated_by.map(|i| i.to_hex()),
             updated_at: d.updated_at.map(fmt_dt),
         }

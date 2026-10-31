@@ -166,7 +166,7 @@ envelope relay, an extension host inside `roomlerd`, an import-map SPA loader �
 Hive outside core. FR-69 provides each of those already: modules mount behind one
 `Module` contract (`crates/core/src/module.rs:23`), the SPA gates on
 `/api/capabilities` (`ui/src/stores/capabilities.ts:30`), every wire variant names its
-owner (`crates/remote_control/src/signaling.rs:2361`), and an unmounted module answers
+owner (`crates/remote_control/src/signaling.rs:2371`), and an unmounted module answers
 503 (`docs/modular-monolith.md`). Hive becomes three modules:
 
 ```mermaid
@@ -881,7 +881,7 @@ One MCP server per session, reached through `roomler mcp` (a stdio shim the harn
 starts) over a **per-session endpoint**: a Unix socket owned by the mapped account
 (`0600` under a `0700` directory) or a named pipe whose DACL names only that account's
 SID. It can't be the main LocalAPI endpoint: on a root daemon that socket is root-only
-(`crates/localapi/src/lib.rs:4105-4123`), and on Windows the pipe admits every
+(`crates/localapi/src/lib.rs:4126-4144`), and on Windows the pipe admits every
 interactive user and most verbs trust the pipe alone (`lib.rs:1127-1129`).
 
 | Tool or resource | Does | Gate |
@@ -929,7 +929,7 @@ even under allow rules. Because that is UX, the daemon asks again where it matte
 | Need | Primitive | What decides it |
 |---|---|---|
 | a peer's port | on a TUN host, the overlay address or MagicDNS name directly; on a netstack host, `socks5h://` to the netstack front | the netstack front resolves peer names from the netmap and needs no DNS (`crates/tunnel-core/src/overlay/netstack_socks.rs:3-32`), but reaches overlay peers only — not subnets, not exits (`netstack.rs:1249-1253`) |
-| a private subnet behind a device | a session-scoped forward or SOCKS5 **through that device** (`CreateSocks5{node}` semantics) | the exit dials with its own resolver (`agents/roomlerd/src/tunnel/dialer.rs:20-52`); `tunnel_policies` authorize it (`crates/remote_control/src/models.rs:3856-3873`) and `tunnel_audit` records it |
+| a private subnet behind a device | a session-scoped forward or SOCKS5 **through that device** (`CreateSocks5{node}` semantics) | the exit dials with its own resolver (`agents/roomlerd/src/tunnel/dialer.rs:20-52`); `tunnel_policies` authorize it (`crates/remote_control/src/models.rs:3875-3892`) and `tunnel_audit` records it |
 | the internet from a chosen place (an office IP a cloud API allow-lists) | SOCKS5 through that device | ⚠️ **not** an overlay exit node — those are host-wide, primary-org only and reroute the whole machine (`docs/overlay-exit-nodes.md`) |
 
 The daemon needs three changes for this, named here so they aren't discovered in the
@@ -956,7 +956,7 @@ field:
 ### 7.3 `ssh` by default, `exec` by exception
 
 `fleet_exec` runs as SYSTEM/root on the target — fleet RPC always uses
-`RunAs::Daemon` (`agents/roomlerd/src/signaling.rs:4691`) and run-as-user is explicitly
+`RunAs::Daemon` (`agents/roomlerd/src/signaling.rs:4696`) and run-as-user is explicitly
 deferred (`docs/fleet-rpc.md:197`). So agents get `ssh_run`, which runs as whatever
 account the **target** maps under SSH's gates and single-use grants, and `fleet_exec`
 only with a policy permit **and** a person's approval on each call. Both keep every gate
@@ -1540,7 +1540,7 @@ open (§18).
 | Threat | Controls |
 |---|---|
 | A session is remote code execution on a device | four gates, shaped like exec and SSH: `HIVE_RUN` (no managed role below `ADMINISTRATOR`); `role:assume` (default deny); per-(user, device) limits applied after the identity gates so a refusal is attributable; device-local `hive_enabled` with the account map and roots. Never SYSTEM/root. A consent prompt (`PromptKind::Hive`, floored by `consent::strictest_of`, `agents/roomlerd/src/consent.rs:153`) when the starter doesn't own the device |
-| A compromised server starts sessions everywhere | gate 4 belongs to the device. `hive_enabled` and `hive_replica` join `DesiredConfig` (`crates/remote_control/src/models.rs:2956`) and so can be pushed only to devices that opted into remote config; `hive_accounts`, `hive_roots` and `hive_archive` are never pushable, locked the way `the_device_owned_refusals_are_not_pushable` (`:9627`) locks `remote_config_enabled` |
+| A compromised server starts sessions everywhere | gate 4 belongs to the device. `hive_enabled` and `hive_replica` join `DesiredConfig` (`crates/remote_control/src/models.rs:2956`) and so can be pushed only to devices that opted into remote config; `hive_accounts`, `hive_roots` and `hive_archive` are never pushable, locked the way `the_device_owned_refusals_are_not_pushable` (`:9659`) locks `remote_config_enabled` |
 | A compromised server reads sessions | it holds no transcripts. It holds metadata, stubs, cards (if enabled), the brain and audit. It can mint a view grant for itself and open a viewer peer, as it could initiate remote control — the same trust in signalling RC already has, and every view grant is audited |
 | A replica's disk is stolen, or its device compromised | the store is daemon-owned and unreadable by other local users; placement policy keeps sensitive roles on tagged devices; purge tombstones; encryption at rest with per-session keys (P7). Until then a stolen disk exposes the sessions it held |
 | A viewer reads a session it shouldn't | view grants list session ids and expire; the replica checks the grant before serving; peers close on expiry |

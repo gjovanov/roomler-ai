@@ -1774,7 +1774,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "string",
-        description: "FR-118 - GPU-input cells this device must not open, by the probe or by a session: comma-separated name:gpu entries (e.g. hevc_qsv:gpu). Empty or `none` = deny nothing. Env: ROOMLERD_ZERO_COPY_DENY. Restart required.",
+        description: "FR-118 - GPU-input cells this device must not open, by the probe or by a session: comma-separated name:gpu entries (e.g. hevc_qsv:gpu). Empty or `none` = deny nothing. Env: ROOMLERD_ZERO_COPY_DENY. Pushable through remote config (FR-132). Restart required.",
     },
     KeyMeta {
         key: "nvenc_split",

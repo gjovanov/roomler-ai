@@ -938,15 +938,19 @@ install_macos_privileged_half() {
 macos_permissions_notice() {
     say ""
     say "ONE MANUAL STEP REMAINS — macOS will not grant these without you:"
-    # The panes list the bundle's CFBundleName, `Roomler Daemon` (FR-46 P5b,
-    # 0.4.41) — the same words the .pkg postinstall prints. Until 0.4.41 this
-    # named the pre-rename bundle, and from 0.4.41 to this fix it kept naming
-    # it: an entry that no longer exists in either pane.
-    say "  System Settings → Privacy & Security → Screen & System Audio Recording → enable 'Roomler Daemon'"
-    say "  System Settings → Privacy & Security → Accessibility                   → enable 'Roomler Daemon'"
+    # #3164 — the panes list the agent as `roomlerd`, the bundle's FILE name,
+    # and its prompts say "“roomlerd” would like to…" (measured on macOS 15.7),
+    # not its CFBundleName `Roomler Daemon`, which this named from FR-46 P5b
+    # until #3164. The menu-bar app's own entry, `Roomler`, changes nothing.
+    # The restart is the kickstart, on purpose: this script ships with the
+    # server, and an agent before #3164 goes OFFLINE on macOS's "Quit & Reopen".
+    say "  System Settings → Privacy & Security → Screen & System Audio Recording → turn on 'roomlerd'"
+    say "  System Settings → Privacy & Security → Accessibility                   → turn on 'roomlerd'"
     say ""
     say "Without Screen Recording the remote screen is blank; without Accessibility the"
-    say "remote keyboard and mouse do nothing. Neither reports an error. After granting:"
+    say "remote keyboard and mouse do nothing. Neither reports an error. The 'Roomler'"
+    say "entry is the menu-bar app, not roomlerd. macOS applies Screen Recording only"
+    say "after roomlerd restarts:"
     say "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
 }
 

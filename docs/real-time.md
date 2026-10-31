@@ -305,7 +305,9 @@ sequenceDiagram
 Once the P2P link is up, everything else is **DataChannel traffic that never
 touches the server**: input events, clipboard chunks, file transfers, the apps
 menu, cursor shapes, decoder statistics (`rc:decodestat` feedback that drives the
-agent's rate control), and — on the DC render paths — the video bitstream itself.
+agent's rate control), decode-error reports (`rc:decode-error`, one per error, counted
+into the session's stats: FR-132, [remote-control.md §11.10](remote-control.md#1110-the-viewers-decode-errors-fr-132-p1)),
+and — on the DC render paths — the video bitstream itself.
 
 ### Tunnel flow open
 
