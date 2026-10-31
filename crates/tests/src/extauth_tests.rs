@@ -2674,6 +2674,59 @@ async fn a_bar_that_crossed_an_opening_session_ends_it() {
     let _ = dev.stop.send(true);
 }
 
+/// A second bar changes no row and writes nothing to the log, and it still ends
+/// the session: the first call may have raced it. The bar here is the state such
+/// a race leaves, with the row revoked and the session live.
+#[tokio::test]
+async fn a_repeated_bar_still_ends_the_session() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-repeat").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-repeat",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws) = outsider(&app, "extrepeat").await;
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    noted(&app, &seeded, &dev, &principal, None).await;
+
+    let barred = app
+        .state
+        .fleet()
+        .external_principals
+        .set_revoked(
+            oid(&seeded.tenant_id),
+            oid(&dev.agent_id),
+            oid(&principal),
+            oid(&seeded.admin.id),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(barred, Some(true));
+    let standing = url(
+        &seeded,
+        &format!("/agent/{}/external-principals/{principal}", dev.agent_id),
+    );
+    assert_eq!(
+        put(
+            &app,
+            &standing,
+            &seeded.admin.access_token,
+            json!({ "revoked": true })
+        )
+        .await,
+        200
+    );
+    let end = next_of(&mut ws, &["rc:terminate"]).await;
+    assert_eq!(end["session_id"], json!(session), "{end}");
+    let _ = dev.stop.send(true);
+}
+
 /// A bar stops this person's external standing on this device. The session the
 /// same account holds as a member came through the other door, with gates of its
 /// own, and it stands.
@@ -2697,6 +2750,15 @@ async fn a_bar_leaves_a_session_the_account_holds_as_a_member() {
     let (ordinary, _rx) = mint_session(&app, oid(&dev.agent_id), oid(&principal), None);
     assert_ne!(ordinary.to_hex(), external, "two sessions");
 
+    // A ctrl envelope naming another org ends nothing.
+    let hub = &app.state.fleet().rc_hub;
+    let foreign = bson::oid::ObjectId::new();
+    assert_eq!(
+        hub.terminate_external_of(oid(&dev.agent_id), oid(&principal), foreign),
+        0
+    );
+    assert!(hub.session_snapshot(oid(&external)).is_some());
+
     let standing = url(
         &seeded,
         &format!("/agent/{}/external-principals/{principal}", dev.agent_id),
@@ -2714,7 +2776,6 @@ async fn a_bar_leaves_a_session_the_account_holds_as_a_member() {
     let end = next_of(&mut ws, &["rc:terminate"]).await;
     assert_eq!(end["session_id"], json!(external), "{end}");
     tokio::time::sleep(SETTLE).await;
-    let hub = &app.state.fleet().rc_hub;
     assert!(hub.session_snapshot(oid(&external)).is_none());
     assert!(
         hub.session_snapshot(ordinary).is_some(),
