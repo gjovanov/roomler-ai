@@ -32,10 +32,10 @@ The wizard's step 3 is a text box: "Paste a fresh token from the Roomler admin U
 signup page or says where a token comes from. To get one, a new person must:
 
 1. register — production answers with a message and **no session**
-   (`crates/api/src/routes/auth.rs:311-324`);
-2. open the activation email — `login` refuses an unactivated account (`auth.rs:366-370`);
+   (`crates/api/src/routes/auth.rs:287-300`);
+2. open the activation email — `login` refuses an unactivated account (`auth.rs:450-454`);
 3. log in;
-4. create an org, unless they filled the optional org fields at signup (`auth.rs:250-255`);
+4. create an org, unless they filled the optional org fields at signup (`auth.rs:226-231`);
 5. find Devices → Enroll device, which mints a **10-minute single-use** token
    (`crates/modules/fleet/src/agent.rs:24`, `:90-140`, behind `MANAGE_AGENTS`);
 6. copy it — the dialog says "then paste the token into the wizard"
