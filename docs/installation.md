@@ -1099,6 +1099,11 @@ A log-out, restart or shut-down still ends the agent with exit 0 (those quits
 come from `loginwindow`), so nothing relaunches it into a session that is going
 away; `RunAtLoad` starts it again at the next login.
 
+Activity Monitor's **Quit** is a stop, and that is deliberate (#3195). It sends a
+signal rather than a Quit AppleEvent, so `roomlerd` exits 0 and stays down, and the
+device stays offline, until the next login, a reboot, or opening `roomlerd.app`.
+That leaves a person at the Mac a plain way to stop it.
+
 **Two more prompts, and what to answer:**
 
 - **"Allow “roomlerd” to find devices on local networks?"** — at the first
