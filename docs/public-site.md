@@ -3,7 +3,9 @@
 **Audience:** whoever changes `ui/docs/`, `ui/blog/`, the landing copy, the pod's nginx config,
 or anything a search engine sees. Built by [FR-60](fr/FR-60-public-docs-site.md) (#1165, the
 docs generator) and [FR-87](fr/FR-87-blog-and-google-indexing.md) (#1776, the blog, honest
-dates, hashed assets, the head and the static homepage).
+dates, hashed assets, the head and the static homepage). What promotion brings is measured
+here too: [FR-88](fr/FR-88-promotion-attribution-and-site-video.md) (#1790) added the video
+facade (§7), the campaign's carry (§9) and the link hub (§10).
 
 The product is a single-page app that a crawler reads as one empty `<div id="app">`.
 Everything a search engine should find (the homepage, the user documentation, the blog) is
@@ -383,6 +385,132 @@ property from it. Review the coverage at +3, +14 and +28 days after a launch (FR
 > Indexing API (Google limits it to job postings and livestreams), and a `SoftwareApplication`
 > rich result, which requires ratings.
 
+## 9. What a campaign link carries
+
+[FR-88](fr/FR-88-promotion-attribution-and-site-video.md) makes one campaign id travel from a
+post's link to the account it produced, and on to that account's first enrolled device. The
+rule is **carry, don't store**: nothing about it is written to the visitor's device, not a
+cookie, not localStorage, not sessionStorage. Storing on a terminal for a non-essential purpose
+needs consent under ePrivacy Art. 5(3), and the site has no consent banner and must not need
+one. The keys live in links, and only in links.
+
+```mermaid
+sequenceDiagram
+  participant V as Visitor
+  participant S as A static page
+  participant A as The SPA
+  participant API as /api
+  participant R as Redis
+  participant P as OAuth provider
+  V->>S: /blog/x/?utm_source=youtube&utm_campaign=c1
+  S->>S: attribution.js copies the keys onto the page's own links
+  V->>A: a carried link: /register?utm_source=youtube&utm_campaign=c1&landing_path=/blog/x/
+  alt the email form
+    A->>API: POST /api/auth/register with attribution
+  else a provider button, on /register or /login
+    A->>API: GET /api/oauth/google?utm_source=youtube&utm_campaign=c1
+    API->>R: park under the CSRF state, 600 s
+    API->>P: 307 to the provider, carrying none of it
+    P->>API: GET /api/oauth/callback/google?code&state
+    API->>R: read and delete
+  end
+  API->>API: a NEW account keeps signup_attribution, once
+```
+
+| Hop | What happens | Where |
+|---|---|---|
+| A static page | With `utm_source`, `utm_medium`, `utm_campaign`, `utm_content`, `utm_term` or `ref` on its URL, it copies those keys onto its own links to `/register`, `/login`, the installer downloads and the install pages, and adds `landing_path` and the referring site's host. With none of them it changes nothing. The homepage's newsletter form gets the campaign as its `source` | [`attribution.js`](../ui/docs/theme/attribution.js), with the install pages written in from `INSTALL_PAGES` by [`carry.ts`](../ui/docs/theme/carry.ts) |
+| The SPA | `/register` reads its own URL at the moment of sending, asks "How did you hear about Roomler?" (optional), and sends one `attribution` object. The provider buttons on `/register` and `/login` put the same keys on the OAuth start URL | [`attribution.ts`](../ui/src/utils/attribution.ts), [`RegisterView.vue`](../ui/src/views/auth/RegisterView.vue), [`LoginView.vue`](../ui/src/views/auth/LoginView.vue) |
+| OAuth | `oauth_redirect` parks the keys in Redis under the CSRF state it already mints, for that cookie's 600 s, and sets no cookie of its own. `complete_sign_in` reads and deletes them. ⚠️ A missing or expired key means "no attribution", never a failed sign-in | [`routes/oauth.rs`](../crates/api/src/routes/oauth.rs), [`core/attribution.rs`](../crates/core/src/attribution.rs) |
+| The account | `sanitize` keeps printable ASCII up to 64 characters, drops anything else and any unknown key, keeps a referrer's bare host and a landing page's path, and normalises `source` and `medium`. The result is stored once, at creation, as `users.signup_attribution`. No user-facing endpoint returns it, and it is not logged at `info` | [`core/attribution.rs`](../crates/core/src/attribution.rs), [`routes/auth.rs`](../crates/api/src/routes/auth.rs) |
+
+**Conversions** are purestat goals. Each fires once, `signup` and `subscribe` only after the
+server said yes, and none does anything when `window.purestat` is absent:
+
+| Goal | Fires on | Where |
+|---|---|---|
+| `signup` | a successful register, or an OAuth callback whose redirect says `#signup=1` (this sign-in created the account) | [`RegisterView.vue`](../ui/src/views/auth/RegisterView.vue), [`OAuthCallbackView.vue`](../ui/src/views/auth/OAuthCallbackView.vue) |
+| `subscribe` | the newsletter form's 202 | [`home.js`](../ui/docs/theme/home.js), [`StayInTouch.vue`](../ui/src/components/landing/StayInTouch.vue) |
+| `install-copy` | the copy button on an install or enroll command | [`docs.js`](../ui/docs/theme/docs.js), [`EnrollmentDialog.vue`](../ui/src/components/enroll/EnrollmentDialog.vue) |
+| `github-outbound` | a click or a middle click on a link into the repository | [`docs.js`](../ui/docs/theme/docs.js) |
+
+**The activation view** is `GET /api/admin/stats/attribution?since=&until=`
+([`routes/attribution.rs`](../crates/api/src/routes/attribution.rs)), platform admin only and a
+404 to anyone else. It returns counts, never a user list: sign-ups by source, medium, campaign
+and self-reported answer, and how many *activated*, meaning an org the person belongs to
+enrolled a device within 7 days of the account's creation. The Campaigns tab of
+[growth observability](growth-observability.md) shows the same account plane beside purestat's
+web plane. Read either with these in mind:
+
+> ⚠️ **`activated` is meaningful for an email sign-up only from 2026-10-29.** Until
+> `hosted-20261029-2ae4ffd` took #3041 to production, the activation link had no page (#3029), so
+> an email sign-up could never sign in, make an org or enroll a device. Before that date only an
+> OAuth sign-up could activate. An email sign-up that misses its 5-minute link is still locked
+> out: [#3199](https://github.com/gjovanov/roomler-ai/issues/3199).
+
+- **`pending` is not a failure.** A sign-up with no device whose 7 days are still running is
+  `pending`, and `settled` (`signups − pending`) is the only valid denominator for a rate.
+  Without `fleet`, all three are `null`, never `0`: "cannot see devices" is a different answer
+  from "nobody enrolled one".
+- **A count by source is what the links said, not a measurement.** Any link can set any value,
+  `referrer_host` and `landing_path` included. The server clamps them, and nothing checks them.
+- **The two planes can disagree, by design.** purestat credits a visit to the key it landed with
+  ([growth-observability.md](growth-observability.md)), so a visitor who lands untagged and then
+  follows a tagged link counts as untagged there and under the campaign on the account.
+- **"An org the person belongs to" is any org at query time**, one they were invited into
+  included. That definition is FR-88's open decision 4.
+- ⚠️ **Every bucket key is text chosen by whoever built the link.** An admin UI renders it as text
+  (`{{ key }}`), never as markup (`v-html`).
+
+**An organic landing** carries nothing: no campaign key, no change to any link, so that sign-up
+has no source at all. [FR-91 §3e](fr/FR-91-scheduled-blog-publishing.md) extends the carry to a
+post reached from another site.
+
+**Kill switches:** `ATTRIBUTION_ENABLED = false` in
+[`attribution.ts`](../ui/src/utils/attribution.ts) stops the carry everywhere: the register view
+sends nothing and hides its question, the provider buttons carry nothing, the newsletter keeps
+its own `source`, and the build leaves out the carry script. `ANALYTICS = null` in
+[`site.ts`](../ui/docs/site.ts) leaves the tracker off every static page, which silences the
+goals there.
+
+## 10. The link hub and the short paths
+
+A profile bio, or a URL said out loud in a video, cannot carry parameters. So each channel has a
+short path, and every short path lands on `/links/` with the campaign already on it:
+
+```mermaid
+flowchart LR
+    BIO["A profile bio,<br/>or a URL said in a video"] --> SHORT["/yt /tt /x /fb"]
+    SHORT -->|"302 from nginx, relative"| HUB["/links/ with utm_source=youtube,<br/>utm_medium=bio, utm_campaign=profile"]
+    HUB -->|"attribution.js (§9)"| CTA["/register, the install pages,<br/>carrying the campaign"]
+    HUB --> REST["the docs, the blog, the repository,<br/>the channel profiles"]
+```
+
+- **`/links/`** is a static page from the same generator
+  ([`links-layout.ts`](../ui/docs/theme/links-layout.ts)), held to the homepage's link gate. It is
+  `noindex, follow` and left out of the sitemap: it repeats the homepage for people who arrive
+  from a profile, so it is not a page to rank.
+- **`CHANNELS`** in [`site.ts`](../ui/docs/site.ts) is the one list of profiles. The hub lists
+  them, and `ORG.sameAs` names them to search engines next to the repository.
+- **The short paths** are one `location = /yt { return 302 … }` line each in
+  [`files/nginx-pod.conf`](../files/nginx-pod.conf). `utm_medium=bio&utm_campaign=profile` is what
+  every profile link of the program carries, so a visit through a bio is one source whichever way
+  it came.
+- **302, not 301:** a browser keeps a 301 for good, and where a short path points may change.
+- **No `add_header` in these locations** (§5), and the redirect stays relative
+  (`absolute_redirect off`).
+- ⚠️ **A short path lives only as long as its channel.**
+  [`links-page.spec.ts`](../ui/docs/__tests__/links-page.spec.ts) checks the nginx lines against
+  `CHANNELS` both ways, and the SPA's route table for a collision, so `/ig` left when X took
+  Instagram's place on 2026-10-11. To add a channel, add its `CHANNELS` row and its `location`
+  line in one PR.
+- **The SPA's old marketing routes keep a campaign too.** `/pricing?utm_source=x` is a 301 to
+  `/?utm_source=x#pricing`, `/landing?…` to `/?…`, and without a query both answer as they always
+  did (§5).
+
+The smoke's redirect block and its §5c check the redirects and the hub on the served site, after
+every promote (§6). Removing the locations and the page is the kill switch.
+
 ## Code map
 
 | File | What it owns |
@@ -393,6 +521,9 @@ property from it. Review the coverage at +3, +14 and +28 days after a launch (FR
 | [`ui/docs/theme/render.ts`](../ui/docs/theme/render.ts) | markdown → HTML: containers, images, headings, code |
 | [`ui/docs/theme/shell.ts`](../ui/docs/theme/shell.ts) | the `<head>`, top bar, footer, search dialog |
 | [`ui/docs/theme/analytics.js`](../ui/docs/theme/analytics.js) · [`ui/src/utils/analytics.ts`](../ui/src/utils/analytics.ts) | the hosted-only analytics loader (FR-102), and the SPA's rule it mirrors |
+| [`ui/docs/theme/attribution.js`](../ui/docs/theme/attribution.js) · [`carry.ts`](../ui/docs/theme/carry.ts) · [`ui/src/utils/attribution.ts`](../ui/src/utils/attribution.ts) · [`ui/src/utils/goals.ts`](../ui/src/utils/goals.ts) | the campaign's carry (FR-88): the static pages, the install list, the SPA, and the purestat goals |
+| [`crates/core/src/attribution.rs`](../crates/core/src/attribution.rs) · [`crates/api/src/routes/attribution.rs`](../crates/api/src/routes/attribution.rs) | the sanitiser and the OAuth parking spot · the activation view |
+| [`ui/docs/theme/links-layout.ts`](../ui/docs/theme/links-layout.ts) | the link hub (FR-88 P2) |
 | [`ui/docs/theme/layout.ts`](../ui/docs/theme/layout.ts) | a docs page |
 | [`ui/docs/theme/blog-layout.ts`](../ui/docs/theme/blog-layout.ts) | a post, the index, tag pages |
 | [`ui/docs/theme/posts.ts`](../ui/docs/theme/posts.ts) | the post contract, ordering, backlinks |
