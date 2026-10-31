@@ -1988,7 +1988,7 @@ Now the viewer keeps a `host_sleep` notice through the redial
 deadline is spent, so the stall watchdog is not held: a new session that stays
 silent is still re-created on the usual clock. The stage shows the notice in
 every redial phase, with that phase's own words beneath it
-(`RemoteControl.vue:1091`). A session that connects ends it
+(`RemoteControl.vue:1098`). A session that connects ends it
 (`isKeptSleepNotice`, `:872`), and the new session's own report or first frame
 replaces it.
 

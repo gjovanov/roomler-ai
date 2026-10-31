@@ -735,7 +735,9 @@ impl Companion {
     /// The wait before a recorder may start, if this one has any.
     fn banner_wait(self) -> Option<(Duration, Duration)> {
         match self {
-            Self::System => Some((BANNER_POLL, BANNER_READ_CEILING)),
+            // `ROOMLERD_RECORD_WAITS_FOR_BANNER=0` — start at once, as before P3d.
+            Self::System => tunnel_core::env::flag("RECORD_WAITS_FOR_BANNER", true)
+                .then_some((BANNER_POLL, BANNER_READ_CEILING)),
             Self::Fixed(_) => None,
             Self::Timed { poll, ceiling } => Some((poll, ceiling)),
         }

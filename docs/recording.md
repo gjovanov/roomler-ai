@@ -991,6 +991,7 @@ then one more turn of the slowest poll.
 | What the viewer shows meanwhile | `rc:record.state announcing`: "Telling the person at the device first…". An older viewer shows nothing new |
 | A slow companion | records. Any read within the 5 s counts, however late |
 | A companion that reads nothing | refused `no_indicator_surface`, in words that say it did not answer |
+| The kill switch | `ROOMLERD_RECORD_WAITS_FOR_BANNER=0`: the start goes straight on, as before P3d |
 
 A read proves the companion was told, not that the window painted: the daemon has
 no word back from it. The Windows badge redraws from a posted message rather than a
