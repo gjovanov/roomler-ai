@@ -25,7 +25,7 @@
 //! | the quit's sender | when | the answer |
 //! |---|---|---|
 //! | `loginwindow` | a log-out, restart or shut-down: it quits the session's apps, then launchd tears the `gui/<uid>` domain down | AppKit's own: exit 0 |
-//! | anything else | System Settings' Quit & Reopen, the Dock, Activity Monitor's Quit, `osascript … to quit` | a restart, through the graceful path FR-84 D3's `RestartDaemon` takes, leaving with the supervisor's code ([`crate::supervision::Supervision::restart_exit_code`]); AppKit is told to wait (`NSTerminateLater`) and never reaches its `exit(0)` |
+//! | anything else | System Settings' Quit & Reopen, `osascript … to quit` | a restart, through the graceful path FR-84 D3's `RestartDaemon` takes, leaving with the supervisor's code ([`crate::supervision::Supervision::restart_exit_code`]); AppKit is told to wait (`NSTerminateLater`) and never reaches its `exit(0)` |
 //! | not named by the event | — | its `kAEQuitReason`: a session-ending one ([`SESSION_ENDING_REASONS`]) is AppKit's exit 0, none is a restart |
 //! | any quit, under no supervisor (a `roomlerd run` started by hand) | — | AppKit's own: there a quit is a stop |
 //! | not a Quit AppleEvent at all | — | AppKit's own |
@@ -40,6 +40,16 @@
 //! would put the agent back into a session that is ending, once per quit, until
 //! the domain went. AppKit's exit 0 is what the agent has always done there,
 //! and `RunAtLoad` starts it again at the next login.
+//!
+//! **Activity Monitor's Quit is a stop, and stays one (#3195).** It sends a
+//! signal, not a Quit AppleEvent, so nothing above runs: the daemon's ordinary
+//! SIGTERM path ends it with exit 0, and launchd leaves it down until the next
+//! login, a reboot, or an open of `roomlerd.app` (field, 2026-10-31, agent
+//! 0.4.190 on macOS 15.7.7). That keeps one explicit "make it go away" for the
+//! person at the Mac. A restart there would need the signal path to tell that
+//! person from a log-out, a `launchctl bootout`, the update helper and an
+//! uninstall, none of which may relaunch. The Dock sends nothing here:
+//! `roomlerd` has no Dock tile (`LSUIElement`).
 //!
 //! ## LaunchServices' own launch
 //!
@@ -114,7 +124,7 @@ pub const BUNDLE_ID: &str = "com.roomler.agent";
 pub enum Sender {
     /// `loginwindow`: the session, or the machine, is going away.
     Loginwindow,
-    /// Any other process: System Settings, the Dock, Activity Monitor, a script.
+    /// Any other process: System Settings, a script.
     Other,
     /// The event named no sender, or its executable could not be read.
     Unknown,
@@ -139,8 +149,8 @@ pub enum QuitIntent {
     /// The session's apps are being quit: a log-out, restart or shut-down.
     /// Carries the reason code (`0` when there was none).
     SessionEnding(u32),
-    /// Somebody asked this app to quit: System Settings' "Quit & Reopen", the
-    /// Dock, Activity Monitor, a script. Carries the reason code, if any.
+    /// Somebody asked this app to quit: System Settings' "Quit & Reopen", a
+    /// script. Carries the reason code, if any.
     Quit(Option<u32>),
 }
 
@@ -270,7 +280,7 @@ mod tests {
         let intent = classify(QUIT, Some(RLGO), Sender::Other);
         assert_eq!(intent, QuitIntent::Quit(Some(RLGO)));
         assert_eq!(decide(intent, || true), QuitReply::RestartLater);
-        // The Dock, Activity Monitor, a script: no reason at all.
+        // A script: no reason at all.
         assert_eq!(
             decide(classify(QUIT, None, Sender::Other), || true),
             QuitReply::RestartLater
