@@ -51,15 +51,12 @@
 #                   no console to ask on (a remote shell, a scheduler) it is
 #                   the only way to enroll.
 #   -SkipDesktop    daemon roles: don't fetch roomler-desktop.exe.
-# RETIRED-NAME-ANCHOR-BEGIN
-# 'Roomler Agent' IS the MSI ARP DisplayName, so the uninstall lookups below
-# must match it exactly or they find nothing and silently do nothing. The
-# roomler-tunnel paths and probes are the install layout on hosts that predate
-# the rename; the script has to keep finding what is actually there.
-#   -Uninstall      remove Roomler from this box: every 'Roomler Agent' MSI
-#                   product registered for this user (HKCU) or machine-wide
-#                   (HKLM; needs elevation), plus the tunnel-client archive
-#                   install and script-copied leftovers. Ignores -Role.
+#   -Uninstall      remove Roomler from this box: every Roomler MSI product
+#                   (either flavour, under its current name or the one it had
+#                   before FR-133) registered for this user (HKCU) or
+#                   machine-wide (HKLM; needs elevation), plus the
+#                   tunnel-client archive install and script-copied leftovers.
+#                   Ignores -Role.
 #   -AllowElevated  skip the elevated-shell refusal for the per-user roles.
 #                   A per-user install from an elevated shell registers in
 #                   the ELEVATING account's profile (HKCU + %LOCALAPPDATA%):
@@ -99,6 +96,18 @@ $ErrorActionPreference = 'Stop'
 
 function Say([string]$msg)  { Write-Host "==> $msg" }
 function Warn([string]$msg) { Write-Host "WARNING: $msg" -ForegroundColor Yellow }
+
+# FR-133 P1 -- the name Apps & Features lists each MSI under (its ARP
+# DisplayName). Both lookups below match these EXACT names: a 'Roomler*'
+# wildcard would also catch another product. An upgrade replaces the entry --
+# Windows Installer matches it by the MSI's UpgradeCode, never by this name --
+# but a machine installed before FR-133 P1 keeps its old entry until then, so
+# each flavour lists its old name too.
+# RETIRED-NAME-ANCHOR(2): the second name in each list is the one every MSI
+# before FR-133 P1 registered, one per flavour across the whole wxs history.
+# It goes once no machine can still carry an install from before P1.
+$MsiNamesPerUser    = @('Roomler', 'Roomler Agent')
+$MsiNamesPerMachine = @('Roomler (per-Machine)', 'Roomler Agent (per-Machine)')
 
 function Test-Elevated {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -237,10 +246,12 @@ function Install-Daemon {
     if (-not $DownloadOnly) { Ensure-VcRuntime }
     $flavour = 'permachine'
     if ($Role -eq 'daemon-user') { $flavour = 'peruser' }
-    Say "resolving the $flavour MSI via $Server/api/agent/installer/$flavour/health"
+    Say "resolving the latest $flavour MSI from $Server"
     $health = Invoke-RestMethod -UseBasicParsing "$Server/api/agent/installer/$flavour/health?version=latest"
     $msi = Join-Path $stage $health.filename
-    Say ("downloading " + $health.filename + " (tag " + $health.tag + ")")
+    # The file name carries the version; the release tag is a wire name, not
+    # something to show (FR-133).
+    Say ("downloading " + $health.filename)
     Invoke-WebRequest -UseBasicParsing ($Server + $health.uri) -OutFile $msi
     Assert-Sha256 -File $msi -Digest $health.digest
 
@@ -273,24 +284,28 @@ function Install-Daemon {
     # HKCU, so print the product code here -- removal must never depend on
     # the user finding an entry in Settings > Apps.
     $uninstRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
-    if ($Role -eq 'daemon-user') { $uninstRoot = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' }
+    $msiNames = $MsiNamesPerMachine
+    if ($Role -eq 'daemon-user') {
+        $uninstRoot = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+        $msiNames = $MsiNamesPerUser
+    }
     $arp = Get-ChildItem $uninstRoot -ErrorAction SilentlyContinue |
         ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
-        Where-Object { $_.DisplayName -like 'Roomler Agent*' } |
+        Where-Object { $msiNames -contains $_.DisplayName } |
         Select-Object -First 1
     if ($arp) {
         $hive = ($uninstRoot -split ':')[0]
         Say ("registered: '" + $arp.DisplayName + "' " + $arp.DisplayVersion + " in " + $hive + " (account: " + $env:USERNAME + ")")
         Say ("uninstall later with: msiexec /x " + $arp.PSChildName + "  (or re-run this script with -Uninstall)")
     } else {
-        Warn "no 'Roomler Agent' record found in $uninstRoot after install -- uninstall via: install.ps1 -Uninstall"
+        Warn "no Roomler entry found in $uninstRoot after install -- uninstall via: install.ps1 -Uninstall"
     }
 
     if (-not $SkipDesktop) { Install-Desktop -InstallDir $installDir }
 
     if ($NoEnroll -or (-not $Token -and -not $Pair)) {
         if (-not $NoEnroll) { Warn "no -Token or -Pair given -- skipping enrollment" }
-        Say "enroll later with: & '$daemon' enroll --server $Server --token <agent-enrollment-jwt> --name '$Name'$mgFlag   (or --pair in place of --token)"
+        Say "enroll later with: & '$daemon' enroll --server $Server --token <enrollment-jwt> --name '$Name'$mgFlag   (or --pair in place of --token)"
         return
     }
 
@@ -364,7 +379,7 @@ function Install-Daemon {
 # Placing it BESIDE roomlerd.exe is the supported layout -- the tray
 # resolves the daemon as a sibling of its own EXE.
 function Install-Desktop([string]$InstallDir) {
-    Say "resolving roomler-desktop from $Server/api/agent/latest-release"
+    Say "resolving roomler-desktop from $Server"
     try {
         $releases = Invoke-RestMethod -UseBasicParsing "$Server/api/agent/latest-release"
         $asset = $null
@@ -375,7 +390,7 @@ function Install-Desktop([string]$InstallDir) {
             } | Select-Object -First 1
             if ($asset) { break }
         }
-        if (-not $asset) { Warn "no roomler-desktop asset found in recent agent releases -- skipped"; return }
+        if (-not $asset) { Warn "no roomler-desktop asset found in the recent roomlerd releases -- skipped"; return }
         $exe = Join-Path $stage 'roomler-desktop.exe'
         Say ("downloading " + $asset.name)
         Invoke-WebRequest -UseBasicParsing $asset.browser_download_url -OutFile $exe
@@ -387,6 +402,10 @@ function Install-Desktop([string]$InstallDir) {
     }
 }
 
+# RETIRED-NAME-ANCHOR-BEGIN
+# The roomler-tunnel paths and probes from here on are the install layout on
+# hosts that predate the rename; the script has to keep finding what is
+# actually there.
 # --- tunnel-client role: CLI zip + user PATH --------------------------------
 
 function Install-TunnelClient {
@@ -446,17 +465,21 @@ function Uninstall-Roomler {
         @{ Hive = 'HKCU'; Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' },
         @{ Hive = 'HKLM'; Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' }
     )
+    #    Either flavour, under its current name or its pre-FR-133 one (the
+    #    $MsiNames* lists at the top): a machine installed before FR-133 P1
+    #    still lists the old name.
+    $msiNames = $MsiNamesPerUser + $MsiNamesPerMachine
     $found = @()
     foreach ($r in $roots) {
         Get-ChildItem $r.Path -ErrorAction SilentlyContinue |
             ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
-            Where-Object { $_.DisplayName -like 'Roomler Agent*' -and $_.PSChildName -like '{*}' } |
+            Where-Object { ($msiNames -contains $_.DisplayName) -and $_.PSChildName -like '{*}' } |
             ForEach-Object {
                 $found += @{ Hive = $r.Hive; Code = $_.PSChildName; Name = $_.DisplayName; Version = $_.DisplayVersion }
             }
     }
     if ($found.Count -eq 0) {
-        Say "no 'Roomler Agent' MSI products registered for this account or machine-wide."
+        Say "no Roomler MSI registered for this account or machine-wide."
     }
     foreach ($p in $found) {
         if ($p.Hive -eq 'HKLM' -and -not (Test-Elevated)) {
@@ -467,7 +490,12 @@ function Uninstall-Roomler {
         # Best-effort pre-stop so msiexec's FilesInUse never wedges a /qn
         # uninstall (the rc.236 self-update lesson): the MSI's own custom
         # actions also stop these, this just makes it deterministic.
-        if ($p.Hive -eq 'HKCU') { schtasks /End /TN Roomler 2>$null | Out-Null }
+        # The try matters on Windows PowerShell 5.1: under
+        # $ErrorActionPreference = 'Stop', a native command whose stderr is
+        # redirected turns that stderr into a TERMINATING error, so a
+        # schtasks that complains (a task not running, or already gone)
+        # aborted the whole uninstall before msiexec ran (measured, FR-133).
+        if ($p.Hive -eq 'HKCU') { try { schtasks /End /TN Roomler 2>$null | Out-Null } catch {} }
         else { try { Stop-Service -Name Roomler -Force -ErrorAction SilentlyContinue } catch {} }
         Say ("uninstalling '" + $p.Name + "' " + $p.Version + " (" + $p.Code + ", " + $p.Hive + ")")
         $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList ("/x " + $p.Code + " /qn /norestart") -Wait -PassThru

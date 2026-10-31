@@ -63,12 +63,12 @@ wizard's and `install.ps1`'s) and the tunnel CLI's installers do
 which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
-- `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:381`);
+- `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:396`);
 - every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1555`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
-(`scripts/install.ps1:164`).
+(`scripts/install.ps1:173`).
 
 `machine_id` is a stable hardware hash and `(tenant_id, machine_id)` is unique —
 re-running an installer on a known machine reuses its identity instead of
@@ -353,6 +353,22 @@ Details worth knowing:
 
 - **Two MSI flavours** exist (`peruser`, `permachine`) — the wizard maps roles
   onto them and flips SystemContext separately (`roomlerd enable-system-context`).
+- **What Apps & Features lists** (FR-133 P1): the per-user MSI as **Roomler**
+  and the per-machine one as **Roomler (per-Machine)**; the Start-menu entry of
+  the per-user MSI is **Roomler** too, and a signed MSI's UAC prompt reads
+  *Roomler installer*.
+  <!-- RETIRED-NAME-ANCHOR: the names a machine installed before FR-133 P1 still
+       lists until its next update replaces the entry; they go once no machine
+       can still carry one. -->
+  A machine installed before P1 lists **Roomler Agent** / **Roomler Agent (per-Machine)**
+  until its next update. The name is display only: Windows Installer matches an
+  upgrade by the MSI's UpgradeCode, and so does `roomlerd`'s `install_detect`
+  (`agents/roomlerd/src/install_detect/mod.rs:324`), so an update leaves one
+  entry, under the new name. `install.ps1 -Uninstall` matches both names,
+  exactly (`scripts/install.ps1:109`). An IT detection rule (Intune, Configuration
+  Manager) written against a name has to follow it; one written against the
+  UpgradeCode never moves (`agents/roomlerd/src/install_detect/upgrade_codes.rs:14`,
+  `:17`).
 - **Running the perMachine MSI by hand** (`msiexec /i roomlerd-<v>-perMachine-….msi /qn`):
   `ENABLE_SYSTEM_CONTEXT=1` turns SystemContext on, `=0` turns it off, and
   **leaving it out keeps the mode the machine was last switched to** (#1727).
@@ -409,7 +425,7 @@ Details worth knowing:
 
 Every perMachine MSI run that is not an uninstall runs **RegisterService**
 (`roomlerd service install --as-service`, deferred, as LocalSystem,
-`agents/roomlerd/wix-perMachine/main.wxs:355`). One of the SystemContext actions
+`agents/roomlerd/wix-perMachine/main.wxs:361`). One of the SystemContext actions
 follows it (Enable, Disable or Keep), which restarts the service, and then the
 MSI's own StartServices. What happens to the service depends on the run (#3115):
 
@@ -417,8 +433,8 @@ MSI's own StartServices. What happens to the service depends on the run (#3115):
 |---|---|---|
 | A fresh install | nothing is running | created (`agents/roomlerd/src/win_service/lifecycle.rs:436`, `register`) |
 | A **reinstall** of the installed version: a maintenance run, such as the wizard over the same release or a hand-run `msiexec /i` of the same MSI | the SystemContext action's restart | **reconfigured in place**: `ChangeServiceConfigW`, the description and the recovery actions. It keeps running until that restart, and its `Environment` (the SystemContext switch) survives |
-| A **major upgrade** to a newer release: the auto-updater, the wizard, a hand-run install | Windows Installer's Restart Manager, at InstallValidate: `roomlerd.exe` is in use and the run has no UI, so it shuts down what holds it. Where Restart Manager is off (the "Prohibit use of Restart Manager" policy), the OLD product's `UnregisterService` does, because `MajorUpgrade` is `afterInstallInitialize` (`main.wxs:84`) and the old product is removed before the new files land | retired by the old binary, then created by the new one. If the old binary deleted it while it was still stopping (1072), the new one waits for the entry to go first |
-| An uninstall | `UnregisterService` (`main.wxs:547`) | retired (`lifecycle.rs:384`, `retire`) |
+| A **major upgrade** to a newer release: the auto-updater, the wizard, a hand-run install | Windows Installer's Restart Manager, at InstallValidate: `roomlerd.exe` is in use and the run has no UI, so it shuts down what holds it. Where Restart Manager is off (the "Prohibit use of Restart Manager" policy), the OLD product's `UnregisterService` does, because `MajorUpgrade` is `afterInstallInitialize` (`main.wxs:90`) and the old product is removed before the new files land | retired by the old binary, then created by the new one. If the old binary deleted it while it was still stopping (1072), the new one waits for the entry to go first |
+| An uninstall | `UnregisterService` (`main.wxs:553`) | retired (`lifecycle.rs:384`, `retire`) |
 
 **The waits are derived from the host's own shutdown**, so the two cannot drift
 apart (`lifecycle.rs:81`, pinned by the test
@@ -445,7 +461,7 @@ Win11 laptop in the field, 3.4–6.2 s on a vmtest cell) went like this:
 
 An MSI rollback never re-creates the service. No action has a rollback partner
 that would, and the service is not in the MSI's `ServiceInstall` table. So
-`RegisterService` stays `Return="ignore"` on purpose (`main.wxs:340`): under
+`RegisterService` stays `Return="ignore"` on purpose (`main.wxs:346`): under
 `"check"`, a failure there would roll a major upgrade back to the old files
 with no service at all.
 
@@ -635,6 +651,9 @@ sequenceDiagram
     U->>U: systemctl --user enable --now roomler.service (restarted beside an enabled helper)
 ```
 
+- **The wizard needs WebKitGTK 4.1.** The Fedora KDE lab image lacked it
+  (`sudo dnf install webkit2gtk4.1`). On Debian and Ubuntu the package is
+  `libwebkit2gtk-4.1-0`.
 - **The cards appear only when the chosen server says so**: the wizard reads
   `GET /api/setup/features` and shows the Linux cards on a JSON
   `wizard_linux_daemon: true`, or on `wizard_unix_daemon: true`, which a server
@@ -647,17 +666,18 @@ sequenceDiagram
   `agents/roomler-setup/src/features.rs:73-79`). The server is picked after the role, so the
   Server page asks again when the URL changes and the pipeline once more before
   it installs.
-- **Turning the Linux cards on** (the operator). The homepages' Linux button
-  downloads the **latest** `setup-v*`, and a wizard released before the split
-  reads only `wizard_unix_daemon`, which the server answers as Linux AND macOS,
-  so a Linux-only server shows it no daemon card. The switch therefore waits
-  for the first `setup-v*` that carries B1-s2 and its Linux field run. Then set
-  `ROOMLER__SETUP__WIZARD_LINUX_DAEMON: "true"` in the deploy repo's
-  `roomler2-config` ConfigMap and bump the deployment's `roomler.ai/config-rev`
-  annotation in the same change: the pods read the ConfigMap through `envFrom`,
-  which does not roll them, and the annotation does. `GET /api/setup/features`
-  then answers `wizard_linux_daemon: true` with `wizard_macos_daemon` and
-  `wizard_unix_daemon` still `false`.
+- **On production, both OSes since 2026-10-30 (22:33Z).** The deploy repo's
+  `roomler2-config` ConfigMap sets the legacy
+  `ROOMLER__SETUP__WIZARD_UNIX_DAEMON: "true"`, with a bump of the deployment's
+  `roomler.ai/config-rev` annotation in the same change: the pods read the
+  ConfigMap through `envFrom`, which does not roll them, and the annotation
+  does. `GET /api/setup/features` answers every key `true`.
+- **Taking one OS off** (the operator). Delete the legacy key and set the other
+  OS's, `ROOMLER__SETUP__WIZARD_LINUX_DAEMON: "true"` to leave Linux on, with
+  the same annotation bump. A wizard from `setup-v0.4.190` on reads its own OS's
+  key and keeps its cards (field-measured 2026-10-31). A wizard released before
+  the split reads only `wizard_unix_daemon`, which the server answers as Linux
+  AND macOS, so it then shows no daemon card until it is downloaded again.
 - **One prompt, through the desktop's own agent.** `pkexec` is launched from
   the wizard's process, which GNOME and Plasma put in the user manager; polkit
   resolves it to the seat session and GNOME Shell or `polkit-kde-agent` shows
@@ -1017,12 +1037,12 @@ on macOS 15.7). Restart it in any of three ways:
 
 | how | what happens |
 |---|---|
-| **Quit & Reopen** — the button macOS offers when you turn the toggle on | System Settings sends the agent a Quit AppleEvent (with a log-out's reason, `'rlgo'`); the agent tells it from a real log-out by its sender (only `loginwindow` quits a session that is ending), leaves with its restart code, and launchd relaunches it within milliseconds. Finder may still say "The application “roomlerd” is not open anymore": its *Reopen* looks for the process that quit, while launchd has already brought the agent back. ⚠️ Agents up to 0.4.188 exited 0 instead, which launchd does not relaunch: the device stayed **offline** until a `kickstart` |
+| **Quit & Reopen** — the button macOS offers when you turn the toggle on | System Settings sends the agent a Quit AppleEvent (with a log-out's reason, `'rlgo'`); the agent tells it from a real log-out by its sender (only `loginwindow` quits a session that is ending), leaves with its restart code, and launchd relaunches it within milliseconds. Finder may still say "The application “roomlerd” is not open anymore": its *Reopen* looks for the process that quit, while launchd has already brought the agent back. ⚠️ Agents up to 0.4.189 exited 0 instead, which launchd does not relaunch: the device stayed **offline** until a `kickstart`. Fixed in 0.4.190 (2026-10-31), field-verified on that release |
 | **Restart roomlerd** in the menu-bar app's permission card | the LocalAPI `RestartDaemon` verb (the same as Settings' *Apply now*) |
 | `launchctl kickstart -k gui/$(id -u)/com.roomler.agent` in Terminal | the restart that works on every version |
 
 Accessibility is read live: input works from the next remote event, with no
-restart (up to 0.4.188 the first session's failed input backend was kept until
+restart (up to 0.4.189 the first session's failed input backend was kept until
 the agent restarted, so typed input was dropped while the viewer no longer
 warned).
 
@@ -1375,8 +1395,9 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ## Uninstall: every platform
 
-- **Windows**: uninstall the MSI (per-user or per-machine) from Apps, or run
-  `install.ps1 -Uninstall`; the agent's version sweep also removes older
+- **Windows**: uninstall **Roomler** (per-user) or **Roomler (per-Machine)** from
+  Apps (the names [above](#windows)), or run
+  `install.ps1 -Uninstall`; the daemon's version sweep also removes older
   same-flavour MSIs after upgrades. `roomlerd service uninstall` removes a
   manually-installed service/task.
 - **Linux and macOS** (FR-97 P6d): one command, whatever put Roomler there —

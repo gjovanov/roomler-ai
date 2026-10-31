@@ -482,7 +482,7 @@ off while the machine stayed up (FR-55's keeper holds
 `PreventUserIdleSystemSleep`, which keeps the **machine** reachable and lets the
 display sleep, on purpose). The capture worker now takes
 `power::DisplayAwake` for its whole life
-(`agents/roomlerd/src/capture/scrap_backend.rs:154`,
+(`agents/roomlerd/src/capture/scrap_backend.rs:160`,
 `agents/roomlerd/src/power.rs:372`): `IOPMAssertionDeclareUserActivity` wakes
 the display (`caffeinate -u`), and `PreventUserIdleDisplaySleep` keeps it on,
 so a view-only session, which injects no input to count as activity, does not
@@ -2536,6 +2536,62 @@ reported an error; the fallback is the viewer's own, as before.
 
 ## 12. Performance targets & budget
 
+### 12.0 Input to photon, measured (FR-98)
+
+[FR-98](fr/FR-98-input-to-photon-budget.md) measures the budget with FR-16's L4 instead of assuming it. L4
+stamps a pointer move in the viewer and stops the clock when the first decoded frame that carries that move
+is painted. On a release build the move lands on `roomlerd probe-target`, a window in the host's corner, so
+injection, the host's compositor and the capture are all inside the round trip ([testing.md](testing.md#l4-on-a-release-build-roomlerd-probe-target)).
+The stage split below comes from the host's own pump heartbeat for the same sessions.
+
+Baseline cells, measured on agent and server 0.4.187 (2026-10-30), with no cut switched; the viewer is
+Chrome 156 on neo16, on Wi-Fi. Cell 3 is the direct QSV cell, the shape of the "under 50 ms" claim:
+
+```mermaid
+flowchart LR
+    S["pointer move sent<br/>(viewer)"] -->|"~19 ms, 48 %<br/>input leg, injection, the window's paint,<br/>compositor vsync, capture gate and copy"| C["frame at the encoder"]
+    C -->|"10.8 ms, 27 %<br/>encode, av1_qsv"| E["encoded, queued to send"]
+    E -->|"9 ms, 22 %<br/>send queue and transit<br/>(DataChannel, Wi-Fi LAN)"| A["arrived in the<br/>decode worker"]
+    A -->|"1 ms, 3 %<br/>decode and paint"| P["painted: L4 stops<br/>p50 40.1 ms"]
+```
+
+| Stage | Cell 3: direct LAN, `av1_qsv`, 60 fps | Cell 4: forced relay, `hevc_qsv`, 30 fps | Read from |
+|---|---|---|---|
+| **L4 p50**, outside the viewer's Wi-Fi bursts | **40.1 ms** | **130.2 ms** | `rc.l4` batches, with a 10 Hz ping from the viewer to its gateway beside them |
+| input leg, injection, the window's paint, compositor, capture gate and copy | ~19 ms (48 %) | ~77 ms (59 %) | the residual |
+| encode | 10.8 ms (27 %) | 7.9 ms (6 %) | pump heartbeat, `avg_encode_ms` |
+| send queue and transit | 9 ms (22 %) | 44 ms (34 %) | pump heartbeat, `age_split` |
+| decode and paint | 1 ms (3 %) | 1 ms (1 %) | pump heartbeat, `age_split` |
+| L4 p95 / p99, every probe | 90.1 / 149.9 ms | 206.0 / 304.5 ms | `rc.l4` |
+
+How to read it:
+
+- **The residual is a share, not a stage time.** It is L4's p50 less the host's per-window medians.
+- **L4 stops at the viewer's paint stamp.** The display's own latency comes after it: a vsync or two, and
+  the panel. None of these numbers include it, and AC4 cross-checks it once against a 240 fps camera.
+- **Cell 3's p95 is the viewer's Wi-Fi.** In the run with a gateway ping beside it, every probe over 80 ms fell
+  inside a latency burst of the viewer's own link. The bursts arrive every ~33 s and last a few seconds, the
+  pattern a Wi-Fi adapter's background scans produce. Outside them, cell 3's p95 is 49 ms.
+- **On the relay, the network is most of it.** The input leg rides the same relay as the video, so its
+  ~40 ms half of the 80 ms RTT sits inside the residual.
+- Cell 1 (NVENC, the headline cell) and cell 2 (a VideoToolbox host) are not measured yet. Until they are,
+  the design targets below stay as the table to beat.
+
+Each cut is its own switch, A/B'd on these cells and reverted if it moves nothing
+([FR-98 §4](fr/FR-98-input-to-photon-budget.md#4-design-cuts-each-one-attributed-by-l4)):
+
+| Cut | Switch | Default | State |
+|---|---|---|---|
+| C1 slot-first capture gate | `ROOMLERD_CAPTURE_GATE=slot_first`, environment only, read by the WGC backend | `legacy` at 60 fps and below; above 60, slot-first whatever the switch says (FR-119 P2b) | built; L0 moves 19.9 ms in CI. The L4 field A/B is owed on a WGC host at 60 fps; the system-context DXGI arm (`scrap`) never reads the switch |
+| C2 GPU clock pin, NVENC | `ROOMLERD_GPU_CLOCK_PIN`: `1` pins every session, `0` never | unset pins only above 60 fps (FR-119 P2b-16) | the 60 fps A/B is owed |
+| C3 pointer-move coalescing gap | `localStorage['roomler-rc-input-gap']`, 0–16 ms | 8 ms | knob built; L4's target mode cannot read it |
+| C4 cursor poller period | `ROOMLERD_CURSOR_POLL_MS`, 2–50 ms | 8 ms | knob built; L4's target mode cannot read it |
+| C5 NVENC preset and tune | `ROOMLERD_FFMPEG_PRESET`, `ROOMLERD_FFMPEG_TUNE` | `p4`, `ll` | the A/B is owed |
+| C6 `playout-delay` 0/0 on the RTP track | `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO=0` turns it off | on since 0.4.139 | done: Chrome's jitter buffer 193 → 0.1 ms |
+
+**The design targets**, written before anything measured them. The measured cells above replace them
+column by column:
+
 | Stage | Target (LAN) | Target (WAN, RTT 30 ms) |
 |---|---|---|
 | Capture (frame ready → encoder in) | 2 ms | 2 ms |
@@ -2940,7 +2996,7 @@ system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
 So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1749`) asks for a trim, and
 `agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
 `mem-trim` thread, **5 s after the last session ended**. The delay lets the
-encoder thread finish freeing (`encode/thread.rs:265` joins it), and sessions
+encoder thread finish freeing (`encode/thread.rs:266` joins it), and sessions
 ending together cost one trim. A trim takes each arena's lock in turn and nobody
 waits for it. "glibc holds" does not fall after a trim, because the pages are
 released with `MADV_DONTNEED` while the arena keeps the address space. RSS is the

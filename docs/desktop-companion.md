@@ -457,7 +457,7 @@ root half with no GUI session) shows no card.
 
 macOS's own **Quit & Reopen** restarts the agent too (`agents/roomlerd/src/macos_quit.rs`): a
 Quit AppleEvent from anyone but `loginwindow` ends it with the supervisor's restart code instead
-of AppKit's exit 0. Up to 0.4.188 that button left the agent offline (`docs/installation.md`,
+of AppKit's exit 0. Up to 0.4.189 that button left the agent offline (`docs/installation.md`,
 the macOS grants).
 
 ## 8. What this device can encode

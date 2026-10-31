@@ -1,17 +1,13 @@
 # RETIRED-NAME-ANCHOR-BEGIN
-# Every retired name left in this file is ACCURATE and must stay:
-#   * "Roomler Agent" IS the MSI ARP DisplayName (wix/main.wxs Name=)
-#   * roomler-agent-<version>-…msi ARE the published asset filenames
-#   * roomler-agent.exe IS the compatibility alias the MSI installs
-# The service name, task name and config paths in here were NOT accurate and
-# were corrected; this file ships to operators, so a wrong instruction here is
-# a support ticket.
-# INVARIANT: a retired name here must be one a user can actually see on their
-# machine. docs/fr/FR-21
-Roomler Agent — README
-======================
+# The one retired name left in this file is the Apps & Features entry's name
+# before FR-133 P1, which a machine installed then still shows until its next
+# update (see Uninstall). This file ships to operators, so a wrong instruction
+# here is a support ticket. INVARIANT: a retired name here must be one a user
+# can actually see on their machine. docs/fr/FR-21, docs/fr/FR-133
+Roomler — README
+================
 
-The Roomler AI remote-control agent runs on this machine, maintains an
+roomlerd, the Roomler daemon, runs on this machine, maintains an
 outbound WebSocket connection to the Roomler API, and (on demand) serves
 a WebRTC peer directly to a browser controller. All screen video and
 input events travel on that P2P channel — the Roomler server never sees
@@ -19,8 +15,7 @@ them.
 
 Installation
 ------------
-This installer placed the daemon `roomlerd.exe` (plus a
-`roomler-agent.exe` compatibility alias and the `roomler` tunnel CLI)
+This installer placed the daemon `roomlerd.exe` and the `roomler` CLI
 at:
 
     %LOCALAPPDATA%\Programs\Roomler\roomlerd.exe
@@ -37,30 +32,30 @@ First-time setup
 ----------------
 Open PowerShell (no need to run as administrator) and run:
 
-    $agent = "$env:LOCALAPPDATA\Programs\Roomler\roomlerd.exe"
+    $roomlerd = "$env:LOCALAPPDATA\Programs\Roomler\roomlerd.exe"
 
-    # 1. Generate an enrollment JWT in the admin UI at
-    #    http://roomler.ai/ (Admin -> Agents -> New agent).
+    # 1. Get an enrollment token at https://roomler.ai/
+    #    (Devices -> Enroll -> Device).
     #    It is valid for 10 minutes and can only be used once.
     #
     # 2. Enroll this machine:
-    & $agent enroll `
-        --server http://roomler.ai/ `
+    & $roomlerd enroll `
+        --server https://roomler.ai/ `
         --token <paste-enrollment-jwt> `
         --name $env:COMPUTERNAME
 
-    # 3. Run the agent (foreground — confirm capture + signalling work):
+    # 3. Run the daemon (foreground — confirm capture + signalling work):
     $env:RUST_LOG = "roomlerd=debug,webrtc=info"
-    & $agent run
+    & $roomlerd run
 
 You should see log lines like:
     agent starting
     signalling connected
     awaiting session
 
-At that point this machine appears (online) in the admin UI at
-http://roomler.ai/ under Admin -> Agents. A controller can click
-"Connect" to open a remote desktop session.
+At that point this machine appears (online) on the Devices page at
+https://roomler.ai/. A controller can click "Connect" to open a remote
+desktop session.
 
 Autostart on logon (registered automatically since 0.1.54)
 ----------------------------------------------------------
@@ -75,9 +70,9 @@ with:
 If you ever need to manage the hook manually (e.g. after restoring a
 backup or recovering from the rare Win11 ACL-locked-task scenario):
 
-    & $agent service install     # register / re-register
-    & $agent service uninstall   # tear down
-    & $agent service status      # query state
+    & $roomlerd service install     # register / re-register
+    & $roomlerd service uninstall   # tear down
+    & $roomlerd service status      # query state
 
 Earlier versions (0.1.49 and below) used a simpler `schtasks /Create
 /SC ONLOGON` registration without the resilience settings — those
@@ -93,7 +88,7 @@ then re-run `service install` from a normal shell.
 
 Auto-update
 -----------
-On every start and every 6 hours, the agent checks GitHub Releases
+On every start and every 6 hours, roomlerd checks GitHub Releases
 for a newer version. If one is available, it downloads the MSI and
 spawns `msiexec` to install it, then exits so the installer can
 overwrite the binary. The Scheduled Task registered by
@@ -105,13 +100,13 @@ Disable for air-gapped deployments with:
 
 Manual check without installing:
 
-    & $agent self-update --check-only
+    & $roomlerd self-update --check-only
 
 Optional: Windows Service mode (since 0.1.58)
 ---------------------------------------------
 For fleet / unattended deployments where the host needs to be reachable
 *before* anyone logs in (e.g. driving the lock screen for remote
-login), the agent ships an opt-in alternative to the per-user
+login), roomlerd ships an opt-in alternative to the per-user
 Scheduled Task: it can register itself with the Service Control
 Manager as `Roomler`, running under LocalSystem with
 AutoStart at boot.
@@ -120,8 +115,8 @@ Two ways to get there:
 
   Option A: download the **per-Machine MSI** (since 0.2.x). The
   release page on GitHub publishes two MSIs side-by-side:
-      roomler-agent-<version>-x86_64-pc-windows-msvc.msi
-      roomler-agent-<version>-perMachine-x86_64-pc-windows-msvc.msi
+      roomlerd-<version>-x86_64-pc-windows-msvc.msi
+      roomlerd-<version>-perMachine-x86_64-pc-windows-msvc.msi
   The per-Machine MSI installs files under %ProgramFiles%
   \Roomler and auto-registers the SCM service via a deferred
   custom action. UAC fires once during install. Single
@@ -148,24 +143,24 @@ the worker is replaced; on Stop the worker is terminated.
 
 Service-mode and Scheduled-Task-mode are independent — installing the
 service does not remove the Scheduled Task. To avoid both auto-launching
-the same agent, uninstall the Scheduled Task first:
+the same daemon, uninstall the Scheduled Task first:
 
-    & $agent service uninstall                # remove Scheduled Task
-    & $agent service install --as-service     # register SCM service
+    & $roomlerd service uninstall                # remove Scheduled Task
+    & $roomlerd service install --as-service     # register SCM service
 
 Inspect / manage:
 
-    & $agent service status --as-service      # NotInstalled / Stopped / Running
+    & $roomlerd service status --as-service      # NotInstalled / Stopped / Running
     Get-Service Roomler           # PowerShell native
     sc.exe stop Roomler           # explicit stop
 
-Pre-logon SYSTEM-context capture (the agent itself running capture +
+Pre-logon SYSTEM-context capture (the daemon itself running capture +
 input under SYSTEM when no user is logged in) is planned for a future
 release; today, service mode idles until the first user login.
 
 Note on privileges
 ------------------
-The agent intentionally runs un-elevated:
+The daemon intentionally runs un-elevated:
 
  * Windows UIPI blocks input injection into elevated windows from a
    non-elevated process. That is by design — a connected controller
@@ -179,7 +174,10 @@ that window un-elevated, or use the Windows Security Attention Sequence
 
 Uninstall
 ---------
-Settings -> Apps -> Installed apps -> Roomler Agent -> Uninstall.
+Settings -> Apps -> Installed apps -> Roomler -> Uninstall. The
+per-Machine MSI is listed as "Roomler (per-Machine)". A machine
+installed by an older release still lists
+"Roomler Agent" / "Roomler Agent (per-Machine)" until its next update.
 
 NOTE (per-User MSI): the Add/Remove record lives ONLY in the HKCU hive
 of the account that ran the install. If the install ran from an
@@ -195,15 +193,17 @@ From PowerShell (either finds the product code for you):
     # or manually:
     Get-ChildItem HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall,
                   HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall |
-        Get-ItemProperty | Where-Object DisplayName -like 'Roomler Agent*' |
+        Get-ItemProperty |
+        Where-Object DisplayName -in 'Roomler', 'Roomler (per-Machine)',
+                                     'Roomler Agent', 'Roomler Agent (per-Machine)' |
         Select-Object DisplayName, DisplayVersion, PSChildName
     msiexec /x {product-code-from-PSChildName}
 
 Logs
 ----
-The agent writes to stderr. To capture a log file for troubleshooting:
+roomlerd writes to stderr. To capture a log file for troubleshooting:
 
-    & $agent run 2>&1 | Tee-Object -FilePath "$env:TEMP\roomlerd.log"
+    & $roomlerd run 2>&1 | Tee-Object -FilePath "$env:TEMP\roomlerd.log"
 
 Set `RUST_LOG=roomlerd=debug,webrtc=debug` for verbose output.
 
