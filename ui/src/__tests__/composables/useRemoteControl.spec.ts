@@ -117,6 +117,8 @@ import {
   appsFocusWireMessage,
   appsLaunchWireMessage,
   decodeStatWireMessage,
+  decodeErrorWireMessage,
+  decodeErrorStage,
   displayMatchWireMessage,
   HeldRequest,
   pickAutoTransport,
@@ -3971,12 +3973,21 @@ describe('decodeStatWireMessage (rc.188 viewer-rate feedback)', () => {
       t: 'rc:decodestat',
       fps: 59,
       struggling: true,
+      de: 1,
     })
     expect(decodeStatWireMessage(30, false)).toEqual({
       t: 'rc:decodestat',
       fps: 30,
       struggling: false,
+      de: 1,
     })
+  })
+
+  it('FR-132 P1: says on every window that this viewer counts its decode errors', () => {
+    // The agent's `viewer_counts_decode_errors` reads exactly `de: 1`; without
+    // it the session's decode errors read as "not counted", never as zero.
+    expect(decodeStatWireMessage(30, false).de).toBe(1)
+    expect(decodeStatWireMessage(0, true, null, null, null, null).de).toBe(1)
   })
 
   it('FR-15: carries the paint-age window when the clock probe has locked', () => {
@@ -3986,6 +3997,7 @@ describe('decodeStatWireMessage (rc.188 viewer-rate feedback)', () => {
       struggling: false,
       age_ms: 123,
       age_min_ms: 62,
+      de: 1,
     })
   })
 
@@ -4009,6 +4021,7 @@ describe('decodeStatWireMessage (rc.188 viewer-rate feedback)', () => {
       struggling: false,
       rx_bps: 395_122,
       queue_ms: 240,
+      de: 1,
     })
     // A DRAINING queue must survive as a negative number; clamping it at 0
     // would make recovery indistinguishable from stability.
@@ -4093,6 +4106,41 @@ describe('decodeStatWireMessage (rc.188 viewer-rate feedback)', () => {
     expect(tiny.arr_ms).toBe(1)
     // Pre-M0 callers omit it entirely.
     expect('arr_ms' in decodeStatWireMessage(30, false, { avgMs: 5, minMs: 2 })).toBe(false)
+  })
+})
+
+describe('decodeErrorWireMessage (FR-132 P1, decode errors counted)', () => {
+  it('names the stage the agent matches by equality, for every worker error type', () => {
+    expect(decodeErrorStage('decoder-configure-error')).toBe('configure')
+    expect(decodeErrorStage('decoder-error')).toBe('decode')
+    expect(decodeErrorStage('decode-error')).toBe('decode')
+    expect(decodeErrorStage('reader-error')).toBe('pipe')
+    expect(decodeErrorStage('pipe-error')).toBe('pipe')
+  })
+
+  it('builds the one rc:decode-error a failed decoder sends before the fallback', () => {
+    expect(
+      decodeErrorWireMessage('hevc', 'decoder-error', 'Decoding error.', 'hev1.1.6.L153.B0'),
+    ).toEqual({
+      t: 'rc:decode-error',
+      stage: 'decode',
+      path: 'hevc',
+      codec: 'hev1.1.6.L153.B0',
+      error: 'Decoding error.',
+    })
+    expect(decodeErrorWireMessage('webcodecs', 'decoder-configure-error', undefined, null)).toEqual({
+      t: 'rc:decode-error',
+      stage: 'configure',
+      path: 'webcodecs',
+    })
+  })
+
+  it('cuts the codec and the message short, and stringifies a non-string error', () => {
+    const m = decodeErrorWireMessage('vp9-444', 'decode-error', 'x'.repeat(1000), 'c'.repeat(200))
+    expect((m.error as string).length).toBe(160)
+    expect((m.codec as string).length).toBe(64)
+    expect(decodeErrorWireMessage('hevc', 'decode-error', 42).error).toBe('42')
+    expect('codec' in decodeErrorWireMessage('hevc', 'decode-error', 'e', '')).toBe(false)
   })
 })
 

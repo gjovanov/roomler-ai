@@ -73,6 +73,13 @@ on:
       # #1727 — the per-Machine MSI runs `roomlerd keep-system-context`, which
       # decides from this module; a change to it changes what an install does.
       - 'agents/roomlerd/src/win_service/system_context_attempt.rs'
+      # #3115 — what RegisterService / UnregisterService do to the service (its
+      # waits, the in-place reconfigure) and the SystemContext actions' env
+      # writes and restart. `win_service/mod.rs` is left out on purpose: its
+      # install()/uninstall() are thin wrappers over lifecycle.rs, and the host
+      # code that shares the file changes far more often than the installer.
+      - 'agents/roomlerd/src/win_service/lifecycle.rs'
+      - 'agents/roomlerd/src/win_service/environment.rs'
       - '.github/workflows/installer-smoke.yml'
       - 'scripts/macos-productbuild-gated.sh'
   workflow_dispatch: {}
@@ -622,7 +629,7 @@ jobs:
           if (-not $msi) { throw 'per-Machine MSI not produced by cargo-wix' }
           Write-Host "per-Machine MSI compiles clean: $($msi.Name) ($([math]::Round($msi.Length / 1MB, 2)) MiB)"
 
-      - name: A hand-run per-Machine upgrade keeps the SystemContext mode (#1727)
+      - name: "A hand-run per-Machine upgrade or reinstall keeps the service and the SystemContext mode (#1727, #3115)"
         # The per-Machine MSI's first INSTALL coverage. A person running
         # `msiexec /i` with no ENABLE_SYSTEM_CONTEXT used to switch
         # SystemContext OFF: the property defaulted to "0", and every install
@@ -643,6 +650,15 @@ jobs:
         # "not in scope"), which needs a real interactive session.
         #
         # Negative control: on master the v2 cell fails (the swap is gone).
+        #
+        # #3115 — and a REINSTALL of the same MSI (a maintenance run, what the
+        # wizard does over an installed release) while the service runs, with a
+        # stop that takes the field's 7.8 s. A hosted runner's daemon is not
+        # enrolled and cannot be relied on to stop slower than the 5 s the old
+        # RegisterService waited, so the slow stop is made from outside, with
+        # no hook in the product: the host's supervisor thread is held suspended.
+        # Negative control: before #3115 that cell exits 1603 and leaves the
+        # runner with no Roomler service.
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -696,9 +712,138 @@ jobs:
             }
           }
 
+          # #3115 — a stop slower than the 5 s RegisterService used to wait,
+          # made from OUTSIDE the product (no hook in it): the service host's
+          # supervisor thread is held suspended, so a Stop leaves the host
+          # STOP_PENDING until the thread is let go, a fixed time after the
+          # stop arrived. The SCM sees exactly what it saw in the field: a
+          # healthy host that takes 7.8 s to stop. The status is polled with a
+          # fresh handle each time, as a monitoring tool would: a held handle
+          # would keep a deleted entry alive and blur what is measured.
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Diagnostics;
+          using System.Runtime.InteropServices;
+          using System.Threading;
+
+          public sealed class SlowStop {
+            [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenThread(uint access, bool inherit, uint tid);
+            [DllImport("kernel32.dll", SetLastError = true)] static extern uint SuspendThread(IntPtr h);
+            [DllImport("kernel32.dll", SetLastError = true)] static extern uint ResumeThread(IntPtr h);
+            [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+            [DllImport("kernel32.dll")] static extern int GetThreadDescription(IntPtr h, out IntPtr desc);
+            [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
+            [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr OpenSCManagerW(string machine, string db, uint access);
+            [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr OpenServiceW(IntPtr scm, string name, uint access);
+            [DllImport("advapi32.dll", SetLastError = true)] static extern bool QueryServiceStatus(IntPtr svc, out SvcStatus st);
+            [DllImport("advapi32.dll")] static extern bool CloseServiceHandle(IntPtr h);
+            [StructLayout(LayoutKind.Sequential)] struct SvcStatus { public uint Type, State, Accepted, Win32Exit, SpecificExit, CheckPoint, WaitHint; }
+
+            IntPtr thread = IntPtr.Zero;
+            Thread watcher;
+            volatile bool engaged;
+            volatile bool released;
+            long heldMs;
+            public bool Engaged { get { return engaged; } }
+            public long HeldMs { get { return Interlocked.Read(ref heldMs); } }
+
+            // The thread whose description is `name` in process `pid`, opened
+            // to suspend and resume it; IntPtr.Zero when there is none.
+            static IntPtr FindThread(int pid, string name) {
+              foreach (ProcessThread t in Process.GetProcessById(pid).Threads) {
+                IntPtr h = OpenThread(0x0002 | 0x0800, false, (uint)t.Id);
+                if (h == IntPtr.Zero) continue;
+                IntPtr d;
+                string found = null;
+                if (GetThreadDescription(h, out d) >= 0 && d != IntPtr.Zero) { found = Marshal.PtrToStringUni(d); LocalFree(d); }
+                if (found == name) return h;
+                CloseHandle(h);
+              }
+              return IntPtr.Zero;
+            }
+
+            static bool StopPending(string service) {
+              IntPtr scm = OpenSCManagerW(null, null, 0x0001);
+              if (scm == IntPtr.Zero) return false;
+              try {
+                IntPtr svc = OpenServiceW(scm, service, 0x0004);
+                if (svc == IntPtr.Zero) return false;
+                try { SvcStatus st; return QueryServiceStatus(svc, out st) && st.State == 3; }
+                finally { CloseServiceHandle(svc); }
+              } finally { CloseServiceHandle(scm); }
+            }
+
+            public static SlowStop Hold(int pid, string threadName, string service, int holdMs, int maxMs) {
+              var s = new SlowStop();
+              s.thread = FindThread(pid, threadName);
+              if (s.thread == IntPtr.Zero) throw new InvalidOperationException("no thread named '" + threadName + "' in pid " + pid);
+              if (SuspendThread(s.thread) == uint.MaxValue) {
+                int err = Marshal.GetLastWin32Error();
+                CloseHandle(s.thread);
+                throw new InvalidOperationException("SuspendThread failed: " + err);
+              }
+              s.watcher = new Thread(() => {
+                var total = Stopwatch.StartNew();
+                Stopwatch since = null;
+                try {
+                  while (total.ElapsedMilliseconds < maxMs) {
+                    if (since == null && StopPending(service)) { since = Stopwatch.StartNew(); s.engaged = true; }
+                    if (since == null && s.released) break;
+                    if (since != null && since.ElapsedMilliseconds >= holdMs) break;
+                    Thread.Sleep(50);
+                  }
+                } finally {
+                  Interlocked.Exchange(ref s.heldMs, since == null ? 0 : since.ElapsedMilliseconds);
+                  ResumeThread(s.thread);
+                  CloseHandle(s.thread);
+                }
+              });
+              s.watcher.IsBackground = true;
+              s.watcher.Start();
+              return s;
+            }
+
+            // No stop came while the installer ran: stop waiting for one. A
+            // hold already under way still runs to its end.
+            public void Release() { released = true; }
+            public void Join() { watcher.Join(); }
+          }
+          '@
+          [System.Diagnostics.Process]::EnterDebugMode()
+          function Start-SlowStop([int]$holdMs) {
+            # The host's pid, fresh: every restart of the service is a new host.
+            $hostPid = (Get-CimInstance Win32_Service -Filter "Name='Roomler'").ProcessId
+            if (-not $hostPid) { throw 'slow stop: the Roomler service has no host process' }
+            # The supervisor thread is spawned a moment after RUNNING (the
+            # firewall prep runs first): look for it for a while.
+            foreach ($i in 1..60) {
+              try { return [SlowStop]::Hold([int]$hostPid, 'roomler-svc-supervisor', 'Roomler', $holdMs, 180000) }
+              catch { if ($i -eq 60) { throw "slow stop: $($_.Exception.Message)" }; Start-Sleep -Milliseconds 500 }
+            }
+          }
+
           try {
             Invoke-Msi '/i' (Join-Path $out 'pm-1.msi') (Join-Path $logDir 'pm-1.log') 'ENABLE_SYSTEM_CONTEXT=1'
             Assert-Mode 'v1, installed with =1' $true '0.0.1.1'
+            # #3115 — THE regression cell for the field case: a reinstall of the
+            # SAME MSI (a maintenance run) over a running SystemContext service
+            # whose stop takes the field's 7.8 s. Up to 0.4.189 RegisterService
+            # deleted it after 5 s: a host still stopping is only MARKED, the
+            # create answered 1072, EnableSystemContext failed on the missing
+            # service, the MSI rolled back (1603), and the machine was left with
+            # no service. The fix reconfigures the entry in place.
+            $hold = Start-SlowStop 7800
+            try {
+              Invoke-Msi '/i' (Join-Path $out 'pm-1.msi') (Join-Path $logDir 'pm-1-reinstall.log') 'ENABLE_SYSTEM_CONTEXT=1'
+            } finally {
+              $hold.Release()
+              $hold.Join()
+            }
+            # The positive control: the slow stop really happened, or this cell
+            # proves nothing.
+            if (-not $hold.Engaged) { throw 'slow stop: the service never went STOP_PENDING while its supervisor was held' }
+            Write-Host "slow stop: the host stayed STOP_PENDING for $($hold.HeldMs) ms, then was let go"
+            Assert-Mode 'v1, reinstalled over a running service that took 7.8 s to stop' $true '0.0.1.1'
             # THE regression cell: a person upgrading by hand, no property.
             Invoke-Msi '/i' (Join-Path $out 'pm-2.msi') (Join-Path $logDir 'pm-2.log') ''
             Assert-Mode 'v2, hand-run upgrade with no property' $true '0.0.2.1'

@@ -446,6 +446,27 @@ pub struct NodeStatus {
     /// "Change…" / "Use default".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_dir: Option<String>,
+    /// #3164 — the two macOS grants as THIS daemon process holds them, for the
+    /// menu-bar app's permission card. That card used to ask TCC about its own
+    /// process (`ai.roomler.agent-tray`), so it never saw the agent's grants:
+    /// it kept asking for both after the person had granted them, and its
+    /// Grant button registered the menu-bar app itself in the pane (the
+    /// "Roomler" entry that changes nothing). `None` off macOS, from a daemon
+    /// with no GUI session (a Mac's root half), and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_grants: Option<MacosGrants>,
+}
+
+/// #3164 — what [`NodeStatus::macos_grants`] reports.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacosGrants {
+    /// Screen Recording, as this process can use it. macOS applies a new grant
+    /// to a freshly started process only, so this stays `false` after the
+    /// person turns it on, until the daemon restarts.
+    pub screen_recording: bool,
+    /// Accessibility, read live: a grant shows here at once, and input works
+    /// from the next event without a restart.
+    pub accessibility: bool,
 }
 
 /// FR-19 — the org-relay probe responder's live state (see
@@ -5714,6 +5735,7 @@ mod tests {
                 netcheck: None,
                 pid: None,
                 started_at_ms: None,
+                macos_grants: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
@@ -6747,6 +6769,34 @@ mod tests {
         );
         let back: NodeStatus = serde_json::from_str(&without).unwrap();
         assert_eq!(back.files_dir, None);
+    }
+
+    /// #3164 — `NodeStatus.macos_grants` is additive both ways: an older
+    /// daemon's status (and every non-Mac one) parses to `None`, the field is
+    /// left out when there is nothing to say, and a Mac's per-user half's two
+    /// grants round-trip as written.
+    #[test]
+    fn node_status_macos_grants_is_additive() {
+        let mut st = Mock.status();
+        let without = serde_json::to_string(&st).unwrap();
+        assert!(!without.contains("macos_grants"), "{without}");
+        assert_eq!(
+            serde_json::from_str::<NodeStatus>(&without)
+                .unwrap()
+                .macos_grants,
+            None
+        );
+        st.macos_grants = Some(MacosGrants {
+            screen_recording: false,
+            accessibility: true,
+        });
+        let with = serde_json::to_string(&st).unwrap();
+        assert!(
+            with.contains(r#""macos_grants":{"screen_recording":false,"accessibility":true}"#),
+            "{with}"
+        );
+        let back: NodeStatus = serde_json::from_str(&with).unwrap();
+        assert_eq!(back.macos_grants, st.macos_grants);
     }
 
     #[tokio::test]

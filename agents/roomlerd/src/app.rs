@@ -1647,6 +1647,21 @@ async fn daemon_main() -> Result<()> {
         );
     }
 
+    // #3164 — LaunchServices' own launch of the bundle (System Settings'
+    // "Reopen" after a quit, Finder, Spotlight) never runs the daemon: launchd
+    // does. Before anything reads the config or takes the lock (`macos_quit`
+    // has the race this closes).
+    #[cfg(target_os = "macos")]
+    if cli.command.is_none()
+        && roomlerd::macos_quit::launched_by_launchservices(
+            std::env::var("XPC_SERVICE_NAME").ok().as_deref(),
+            roomlerd::macos_quit::BUNDLE_ID,
+        )
+    {
+        defer_to_launch_agent();
+        return Ok(());
+    }
+
     let config_path = resolve_config_path(cli.config.clone())?;
 
     let cmd = cli.command.unwrap_or(Command::Run {
@@ -3621,25 +3636,67 @@ fn macos_permission_preflight() {
         return;
     }
 
+    // #3164 — the panes list this agent by its bundle's file name, `roomlerd`
+    // (the prompts say "“roomlerd” would like to…" too); the menu-bar app is a
+    // separate entry, "Roomler", whose grant changes nothing here.
     if !capture {
         tracing::warn!(
             "macOS Screen Recording is NOT granted — the remote screen will be blank \
-             (macOS delivers wallpaper-only frames rather than failing). Grant it under \
-             System Settings → Privacy & Security → Screen Recording."
+             (macOS delivers wallpaper-only frames rather than failing). Turn on roomlerd \
+             under System Settings → Privacy & Security → Screen & System Audio Recording, \
+             then restart the agent: macOS applies that grant to a freshly started process \
+             only. Its own Quit & Reopen restarts it, as does Restart in the Roomler \
+             menu-bar app, or launchctl kickstart -k gui/$(id -u)/com.roomler.agent."
         );
         tcc::open_settings_pane(tcc::PANE_SCREEN_RECORDING);
     }
     if !input {
         tracing::warn!(
             "macOS Accessibility is NOT granted — remote keyboard and mouse will do nothing \
-             (macOS drops injected events rather than failing). Grant it under \
-             System Settings → Privacy & Security → Accessibility."
+             (macOS drops injected events rather than failing). Turn on roomlerd under \
+             System Settings → Privacy & Security → Accessibility; it applies from the next \
+             remote event, no restart needed."
         );
         tcc::open_settings_pane(tcc::PANE_ACCESSIBILITY);
     }
-    tracing::warn!(
-        "after granting, restart the agent: launchctl kickstart -k gui/$(id -u)/com.roomler.agent"
-    );
+}
+
+/// #3164 — LaunchServices started the bundle by itself: System Settings'
+/// "Reopen" after a quit, a double-click in Finder, Spotlight. launchd runs
+/// this agent (`com.roomler.agent`), so ask it to start that job — `kickstart`
+/// WITHOUT `-k` leaves a running job alone — and leave without the
+/// single-instance lock. A daemon LaunchServices started has no supervisor, and
+/// launchd's own would exit 0 at that lock and stay down (`macos_quit` has the
+/// race). Where the job is not loaded (the root daemon supervises the person's
+/// half, FR-43), there is nothing to start, and this still leaves.
+#[cfg(target_os = "macos")]
+fn defer_to_launch_agent() {
+    // SAFETY: `getuid` reads the caller's own credentials; it cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{uid}/{}", roomlerd::macos_quit::BUNDLE_ID);
+    match std::process::Command::new("/bin/launchctl")
+        .args(["kickstart", &target])
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        Ok(out) if out.status.success() => tracing::info!(
+            %target,
+            "started by LaunchServices (Reopen, Finder, Spotlight): asked launchd to start the \
+             agent's own job, and leaving (#3164)"
+        ),
+        Ok(out) => tracing::warn!(
+            %target,
+            status = %out.status,
+            launchctl = %String::from_utf8_lossy(&out.stderr).trim(),
+            "started by LaunchServices: launchd has no such job to start here; leaving anyway — \
+             the agent is started by launchd or by the root daemon, never by LaunchServices (#3164)"
+        ),
+        Err(e) => tracing::warn!(
+            %target,
+            error = %e,
+            "started by LaunchServices: could not ask launchd to start the agent; leaving anyway (#3164)"
+        ),
+    }
 }
 
 /// The daemon. `Ok(Some(code))` = it ended through the graceful path a
@@ -4691,6 +4748,20 @@ async fn run_cmd(
         process_started,
         roomlerd::supervision::restart_record_path(config_path),
     );
+    // #3164 — and macOS's own door: a Quit AppleEvent (System Settings' "Quit &
+    // Reopen" after a Screen Recording grant) restarts this daemon through the
+    // same graceful path, leaving with the code its supervisor relaunches,
+    // where AppKit alone would exit 0 and launchd would leave the device down.
+    // `macos_quit` has the table, a log-out's quit included.
+    #[cfg(target_os = "macos")]
+    {
+        let restart = restart.clone();
+        roomlerd::macos_quit::set_quit_hook(move |reason| {
+            let code = restart.arm_for_quit(reason)?;
+            restart.commit();
+            Some(code)
+        });
+    }
     let daemon_state = localapi_state::DaemonState::new(
         cfg.agent_id.clone(),
         cfg.machine_name.clone(),
@@ -5578,14 +5649,25 @@ fn service_stop_as_service() -> Result<()> {
 #[cfg(target_os = "windows")]
 fn service_install_as_service() -> Result<()> {
     let exe = std::env::current_exe().context("locating current_exe for service install")?;
-    win_service::install(&exe).context("registering Roomler with the SCM")?;
-    println!(
-        "Service registered: {} ({}). Launching `sc start {}` will run the service \
-         under LocalSystem; AutoStart fires on next boot.",
-        win_service::NEW_SERVICE_NAME,
-        win_service::SERVICE_DISPLAY_NAME,
-        win_service::NEW_SERVICE_NAME
-    );
+    let registered = win_service::install(&exe).context("registering Roomler with the SCM")?;
+    match registered {
+        // #3115 — an existing service is reconfigured, never deleted: it keeps
+        // running on its old configuration until its next start.
+        win_service::lifecycle::Registered::Reconfigured => println!(
+            "Service reconfigured in place: {} ({}). A running service keeps running; \
+             the change applies from its next start.",
+            win_service::NEW_SERVICE_NAME,
+            win_service::SERVICE_DISPLAY_NAME
+        ),
+        win_service::lifecycle::Registered::Created
+        | win_service::lifecycle::Registered::CreatedAfterDelete => println!(
+            "Service registered: {} ({}). Launching `sc start {}` will run the service \
+             under LocalSystem; AutoStart fires on next boot.",
+            win_service::NEW_SERVICE_NAME,
+            win_service::SERVICE_DISPLAY_NAME,
+            win_service::NEW_SERVICE_NAME
+        ),
+    }
     // FR-84 D6 — the machine-wide companion login start (`HKLM\…\Run`),
     // written here because this is the elevated step every perMachine install
     // and upgrade runs (the MSI's RegisterService CA, as LocalSystem). A fresh
@@ -5770,10 +5852,11 @@ fn disable_system_context_cmd(_no_restart: bool) -> Result<()> {
 
 /// #1727 — the perMachine MSI's action when its command line does not
 /// name a mode. It cannot read the mode itself: the switch lives in the
-/// service's `Environment`, which RegisterService (and a major upgrade's
-/// removal of the old product) has already deleted by the time this runs,
-/// and an MSI condition cannot read a REG_MULTI_SZ at all. So it follows
-/// the product's own record of the last switch.
+/// service's `Environment`, which a major upgrade's removal of the old
+/// product has already deleted by the time this runs (up to 0.4.189 every
+/// RegisterService did too; since #3115 a reinstall keeps the entry), and an
+/// MSI condition cannot read a REG_MULTI_SZ at all. So it follows the
+/// product's own record of the last switch.
 ///
 /// An unreadable record reads as "off": that is what an install with no
 /// property always did, so no host is worse off than before.

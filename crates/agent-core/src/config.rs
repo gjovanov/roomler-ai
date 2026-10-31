@@ -1622,8 +1622,10 @@ pub struct AgentConfig {
     /// FR-118 — GPU-input cells this device must not open, comma-separated
     /// `name:gpu` (`hevc_qsv:gpu`). Unset or `none` = deny nothing. Env
     /// `ROOMLERD_ZERO_COPY_DENY`, read by the probe and at every encoder open.
-    /// Local only for now: the fleet's kill switch is `zero_copy` itself,
-    /// which is off unless a device owner turns it on.
+    /// Pushable through remote config (FR-132 P1) for the reason the two
+    /// denylists above are: it only ever REMOVES a GPU form, so it is the
+    /// fleet's kill switch for a GPU-input cell once a cell is on by default.
+    /// `zero_copy` itself is NOT pushable (FR-132 decision 1).
     #[serde(default)]
     pub zero_copy_deny: Option<String>,
     /// FR-119 P2b-10 — how NVENC splits a frame across its engines above

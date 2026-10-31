@@ -31,7 +31,7 @@ what it costs in installer size and ships with integration and e2e tests.
   `--disable-everything` plus hardware encoders only: static in `roomlerd.exe`, shared `libavcodec.so` in the .deb,
   dylibs in `roomlerd.app`. No decoders, demuxers, muxers, filters or swscale. **Linux arm64 has no FFmpeg at all**
   (openh264 + libvpx).
-- **The parts that do exist:** the capture cascade `capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2252`)
+- **The parts that do exist:** the capture cascade `capture::open_default` (`agents/roomlerd/src/capture/mod.rs:2266`)
   and a synthetic source with a decodable 64-bit counter strip (`capture/synthetic_backend.rs:41`); `EncoderThread`
   (`encode/thread.rs:125`); the cells, denylist and probe cache; the child-process probe pattern (`encode/caps.rs`); the
   uid drop used by the portal helper (`capture/portal/mod.rs`); cpal loopback audio + audiopus Opus (`audio/`); the
@@ -153,7 +153,7 @@ what it costs in installer size and ships with integration and e2e tests.
   default and remembered; the list (name, date, duration, size, origin, pending delivery) with Play, Edit, Show in
   folder and Delete; settings for the folder, "Allow remote recording" and "Include computer audio in remote
   recordings". The tray gets Start/Stop and a red REC dot.
-- LocalAPI verbs (`crates/localapi/src/lib.rs:1026`, the exhaustive `handle()` and `serve_connection`): `RecordStart`,
+- LocalAPI verbs (`crates/localapi/src/lib.rs:1047`, the exhaustive `handle()` and `serve_connection`): `RecordStart`,
   `RecordStop`, `RecordStatus`, `RecordingsList`, `RecordingDelete`.
   ⚠️ **They need a peer check the pipe does not have.** The pipe's DACL admits every Interactive User, RDP sessions
   included (`lib.rs:1680`), and there is no peer-credential check, so a guest in an RDP session could start a local

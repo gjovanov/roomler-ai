@@ -166,13 +166,13 @@ The waiter table lives in `NetworkState` — `network` owns SSH; the Hub only ow
 socket. A guard deregisters on every exit path, as `ExecWaiterGuard` does for exec.
 
 **The 10 s bound**: 2× the worst lag observed (4.4 s); inside the originating device's own
-30 s wait for `rc:ssh.response` (`agents/roomlerd/src/localapi_state.rs:1904`), so the
+30 s wait for `rc:ssh.response` (`agents/roomlerd/src/localapi_state.rs:1977`), so the
 caller hears the server's reason rather than its own timeout; and it leaves ≥ 50 s of the
 60 s grant TTL (`ssh_limits::GRANT_TTL_SECS`) to dial in.
 
 ### 4. The agent — acknowledge after recording, and every refusal
 
-The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4128`) acknowledges **after**
+The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4133`) acknowledges **after**
 `record_grant` returns: the grant is in `GRANTS` — the table the auth path reads — before
 the frame leaves, so "confirmed" means "redeemable". `record_grant`'s `Result<(), String>`
 becomes a typed rejection so the arm can say *which* refusal it was; the log text is
