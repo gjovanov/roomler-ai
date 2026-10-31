@@ -891,7 +891,7 @@ sequenceDiagram
   session user's and which that user has just written to. For an administrator approving their
   own prompt it is the same folder as before. Rejected: finding the folder through Explorer's
   token (`OpenProcessToken` is denied without `SeDebug`), and a folder everyone can write in
-  `%ProgramData%` (one user could tamper with another's). **By hand it stays broken:** a
+  `%ProgramData%` (one user could tamper with another's). **By hand it stays broken (#3229):** a
   right-click "Run as administrator" with another account's password has no limited copy to
   ask, so it fails as it does on the release.
 - **In front.** The limited copy held the foreground and exits, so Windows hands it to the next

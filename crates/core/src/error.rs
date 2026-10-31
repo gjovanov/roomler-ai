@@ -6,8 +6,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use roomler_ai_services::auth::AuthError;
-use roomler_ai_services::dao::base::DaoError;
+use roomler_ai_services::dao::base::{DaoError, duplicate_key_site};
 use serde::Serialize;
+
+/// The answer to a collision no route put in words. A route that knows what
+/// collided says so itself; every other one answers this, in place of MongoDB's
+/// text, which names the database, the collection, the index and the value.
+const DUPLICATE_KEY_ANSWER: &str = "That already exists";
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -103,7 +108,14 @@ impl From<DaoError> for ApiError {
     fn from(err: DaoError) -> Self {
         match err {
             DaoError::NotFound => ApiError::NotFound("Resource not found".to_string()),
-            DaoError::DuplicateKey(msg) => ApiError::Conflict(msg),
+            DaoError::DuplicateKey(msg) => {
+                tracing::info!(
+                    site = duplicate_key_site(&msg),
+                    "DaoError::DuplicateKey -> 409"
+                );
+                ApiError::Conflict(DUPLICATE_KEY_ANSWER.to_string())
+            }
+            DaoError::Conflict(msg) => ApiError::Conflict(msg),
             DaoError::Forbidden(msg) => ApiError::Forbidden(msg),
             DaoError::NotAMember => ApiError::NotAMember,
             DaoError::Validation(msg) => ApiError::Validation(msg),
@@ -141,5 +153,42 @@ impl From<roomler_ai_services::oauth::OAuthError> for ApiError {
             }
             other => ApiError::Internal(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RAW: &str = "E11000 duplicate key error collection: roomler.users \
+index: email_1 dup key: { email: \"victim@corp.example\" }";
+
+    fn conflict_text(err: DaoError) -> String {
+        match ApiError::from(err) {
+            ApiError::Conflict(msg) => msg,
+            other => panic!("expected a 409, got {other}"),
+        }
+    }
+
+    #[test]
+    fn mongos_text_never_becomes_the_answer() {
+        assert_eq!(
+            conflict_text(DaoError::DuplicateKey(RAW.to_string())),
+            DUPLICATE_KEY_ANSWER
+        );
+        // A sentence that embeds it is no different: the OAuth retry loop's.
+        let wrapped = format!("no username after 5 attempts; last collision: {RAW}");
+        assert_eq!(
+            conflict_text(DaoError::DuplicateKey(wrapped)),
+            DUPLICATE_KEY_ANSWER
+        );
+    }
+
+    #[test]
+    fn a_sentence_written_for_the_person_is_their_answer() {
+        assert_eq!(
+            conflict_text(DaoError::Conflict("Already reacted".to_string())),
+            "Already reacted"
+        );
     }
 }

@@ -385,12 +385,12 @@ impl RestartHandle {
     }
 
     /// #3164 — macOS asked this process to quit with a Quit AppleEvent: System
-    /// Settings' "Quit & Reopen" after a Screen Recording grant, the Dock,
-    /// Activity Monitor, a script (`crate::macos_quit` has the table). Under a
-    /// supervisor that relaunches it, that is a restart: armed here with that
-    /// supervisor's code and recorded as the verb records one; the caller then
-    /// [`Self::commit`]s it, so it leaves through the same graceful door (no
-    /// crash counted, no ephemeral unenroll).
+    /// Settings' "Quit & Reopen" after a Screen Recording grant, or a script
+    /// (`crate::macos_quit` has the table, and why Activity Monitor's Quit is
+    /// not here). Under a supervisor that relaunches it, that is a restart:
+    /// armed here with that supervisor's code and recorded as the verb records
+    /// one; the caller then [`Self::commit`]s it, so it leaves through the same
+    /// graceful door (no crash counted, no ephemeral unenroll).
     ///
     /// Not the verb's gates. The process quits either way (AppKit exits 0 when
     /// this returns `None`), so the only choice here is whether the device comes
