@@ -25,6 +25,18 @@ carried 6–7.6 Mbps windows with sub-ms send waits. **Open for close:** AC1 (th
 above, then a driven measurement), AC2/AC6 (a relay-locked pair — none reachable from neo16 on
 2026-10-29, CORPLAP-1/2/3 all ride `direct` — plus a kill-switch daemon restart for AC6), AC3 (a
 60 s drag), AC4 (a ~2 Mbps relay-locked host on the current code).
+
+**Re-read 2026-10-31, fleet on 0.4.191.** The surface is identical from `agent-v0.4.190` through
+`agent-v0.4.191` and master; 0.4.188 differs by one `pub mod bench` line, and 0.4.187 also lacks
+FR-63's shadow controller, which no live decision reads. No box moved. Each open criterion is
+measured or named for what stops it. **AC1** and **AC2** need a relayed NVENC pair and a driven
+viewer, which means an operator window on CORPLAP-2; the memory stands at 3,379,312 (an opener
+1.13× cold), and the replay in the field log shows that counting only carried holds reaches about
+1.9× at best, against the 2.5× AC1 asks. **AC3** stays `[~]`: natural motion read, no drag. **AC4**
+waits on CORPLAP-3 relaying. **AC6** needs a hardware encoder, on a relay, on a host whose daemon
+may restart; a VM cannot prove it. FR-63 B3 deletes this code, so new learner behaviour is a
+question for the operator, not a phase of this FR.
+
 Child of the RC-quality program. Follows FR-31 (every opening and repair number on an NVENC relay
 session is proportional to `maxrate`, and nothing ffmpeg exposes changes that) and the parked
 measured-rate line (#678: a sender cannot see capacity it is not using). Operator's directive
@@ -95,10 +107,20 @@ Measured with the FR-31 harness on `neo16 → CORPLAP-2`, N ≥ 5 sessions after
 shipped defaults:
 
 - [ ] opening keyframe ≥ 2.5× today's bytes (≥ 14 KB at 1920×1200, today 5.6 KB) and first-light
-      sharpness ≥ 70 % of the 8 s steady state (today 47 %)
+      sharpness ≥ 70 % of the 8 s steady state (today 47 %) — **not measurable on 2026-10-31**: it
+      needs a relayed NVENC pair and a driven viewer, and no pair from neo16 relayed. What the memory
+      allows can be read without one: `100.65.4.2|relay:derp/tcp` stands at 3,379,312, an opener of
+      2.87 M, 1.13× cold. If the keyframe follows `maxrate` (FR-31; the 2026-08-29 row follows it only
+      loosely), 2.5× needs a 6.4 M opener, so a memory of at least 7.5 M, in the last 6 % under `hi`.
+      FR-79's open hold question does not get there alone: the 2026-10-31 replay in the field log puts
+      a carried-only rule at 1.84–1.93× cold at best
 - [ ] time-to-crisp ≤ 0.6 s (today 1.2 s) — needs a relay-locked pair and a driven instrumented
       viewer session (a cold-vs-seeded A/B); not measurable from the agent-side heartbeat. No pair
-      from neo16 relayed on 2026-10-29 (CORPLAP-1/2/3 all `direct`)
+      from neo16 relayed on 2026-10-29 (CORPLAP-1/2/3 all `direct`). **2026-10-31:** the same again,
+      and neither connected browser relays by itself (Chrome 16 host candidates + srflx, Edge one
+      mDNS + srflx), so a browser setting does not give a relayed session either. The viewer
+      harness is rewritten and proven on a real session, so the A/B now waits only on a relayed
+      NVENC pair: an operator window on CORPLAP-2, the only NVENC host not excluded
 - [~] a 60 s drag: no send wait > 1 s, viewer-age p99 not worse than the FR-18 numbers, and the
       ceiling never above `hi` — **the ceiling half is met**: never above 5,146,238 across seven
       sessions (10-27/28, CORPLAP-2 `relay:derp/tcp`, 0.4.177–0.4.181) and bounded by construction
@@ -107,13 +129,22 @@ shipped defaults:
       full): `send_stalls=0`, `send_wait_max_ms` ≤ 163.9 (the opener), paint age p50 66–68 /
       p95 103–117 / max 775 ms. The FR-18 numbers to beat under drag (0.4.10, CORPLAP-3 relay):
       `send_wait` p99 200 ms / max 1 778 ms, viewer age max 2 185 ms — the undriven sessions sit
-      under them, but that is not the same test
+      under them, but that is not the same test. **2026-10-31, natural motion, still no drag:** the
+      best run on the named pair (2026-10-30 12:23:00–12:25:19, 0.4.187) held 139 s at a median
+      2.74 Mbps with send waits ≤ 1.13 ms and paint age ≤ 122 ms, but its load sat under the
+      4.05–4.30 M ceiling, so it does not stand in for the drag. Across the week's 24 sessions no
+      heartbeat reached a 1 s send wait (max 824.7 ms); one session passed FR-18's age max, 3,364 ms
+      (2026-10-30 11:48, the stand-in session FR-79 reads on #1524)
 - [ ] a ~2 Mbps relay (CORPLAP-3, `av1_qsv`): `target_bps` never exceeds the nominal unless every growth
       gate passed — read from its heartbeats; the session must not get worse than today
       (0.4.21, 2026-08-29: no learner steps, `learned_ceiling_bps=0`, target ≤ 3.0 Mbps, 65–78 ms).
       The 0.4.21 control predates the FR-59/70/79 rework and CORPLAP-3 rides `direct` on 2026-10-29;
       a current-code control also has to read the CARRIED gate against the opener burst (see the
-      2026-10-28 field row: one step inside the grace)
+      2026-10-28 field row: one step inside the grace). **2026-10-31:** still open. CORPLAP-3 rode
+      `direct` in all 41 of its sessions with a carrier this week, so the named host gives no read.
+      CORPLAP-1's five relayed sessions are recorded in the field log; nothing shows that pipe is
+      ~2 Mbps. On the opener: 1 of the 19 sessions that stepped on the CORPLAP-2 pair took its first
+      step inside the grace, that same 2026-10-28 session
 - [x] the learned rate survives a daemon restart and expires after 7 days (unit-tested; the file is
       `…\config\systemprofile\AppData\Roaming\roomler\roomler\data\rate_memory.json` for the SYSTEM
       service). **Restart survival field-read 2026-10-29** on CORPLAP-2: the seed chain 4,750,677 →
@@ -125,7 +156,12 @@ shipped defaults:
       observed in the field
 - [ ] `relay_ceiling_learn=false` restores today's numbers byte-for-byte — needs a kill-switch A/B that
       restarts a relay-locked host's daemon (config `relay_ceiling_learn` applies on restart): an
-      operator-scheduled run on a host nobody is using
+      operator-scheduled run on a host nobody is using. **2026-10-31: a VM or a container with no GPU
+      cannot answer this.** The learner exists only in `media_pump_ffmpeg_dc` (`peer.rs:6290`, the
+      one caller of `relay_max_hi_bps()`), the VP9-444 pump passes `hi = 0` (`peer.rs:4153`), and the
+      FFmpeg pump needs a hardware encoder. So on a host with no GPU the switch reads the same on and
+      off, and a pass there proves nothing. It needs a session on a hardware encoder, on a relay, on a
+      host whose daemon may restart
 - [x] **Docs** — the ceiling learner (P1) and the per-peer memory (P2) are documented in
       `docs/rate-control.md` (§ The ceiling learner / § The write-back and the seed) with a mermaid of
       the learner's per-window decision, a gate/anchor table, what CARRIED and DECREASE actually
@@ -173,3 +209,7 @@ levers); the direct path's measured clamp.
 | 2026-08-30 08:19–08:21 UTC | agent 0.4.26 (CORPLAP-2 `av1_nvenc`, DERP relay), web `v20260830-6a166a1ec9f7` | **Seeded-opener A/B, same screen a minute apart** (memory hand-seeded at 7 Mbps from P0). Baseline 3.0 Mbps: a ~0 KB black keyframe, the desktop as ONE 221 KB inter frame at +176 ms, first painted sample already at steady sharpness, one keyframe in 12 s. Seeded 5.95 Mbps: 30 KB keyframe (50 % sharpness) → 172 KB P → first light 200 ms earlier, 90 % of steady within ~190 ms — but a **×0.85 decrease inside 1.8 s** (`send_wait_max 367 ms`, 73 backpressure skips — the opener draining) and then **three AIMD climb-back steps at 5-s spacing, each an in-place NVENC reconfigure = a starved IDR** (166 KB at +0.3 s, 222 KB at +5.3 s; sharpness dipped to 91 % at +5.4 s). Also measured: the opener burst drained at ≈ 8 Mbps — the P0 number, now free. ⚠️ Windows PowerShell's `Set-Content -Encoding UTF8` writes a BOM that serde rejects (the memory read as EMPTY until rewritten BOM-free). |
 | 2026-10-27 09:23, 15:27, 16:31 UTC | agent **0.4.177** (09:23) and **0.4.178** (15:27, 16:31) — CORPLAP-2 `av1_nvenc` 1920×1200 over `relay:derp/tcp` (DERP rtt 106–258 ms); read 2026-10-29, read-only `roomler exec` of the host's log | **Current-code re-read, corrected** (the first read of these sessions, made 10-27, labelled them 0.4.179; the host took 0.4.178 at 13:41Z and 0.4.179 at 18:01Z — service log). **09:23 (79 s, motion then idle):** seed 4,750,677 ⇒ opener 4,038,075; opener burst 496,887 B at 0 ms wait; steps 4.04 → 4.29 (09:23:26.0) → 4.56 (:31.1) → 4.84 (:37.2) while the 2 s heartbeats carried 6.2 / 6.3 / 4.4 / 7.6 Mbps at 32–53 fps; then 45 s of an idle desktop at 0.28–0.35 Mbps / 18 fps with the ceiling held at 4.84 M (not carried ⇒ no step); 09:24:25 the FR-59 P3 viewer bound clamped `target_bps` 4,843,519 → 4,116,975 (90 % of a 4.57 M arrival report) with `learned_ceiling_bps` unchanged — a `set_ceiling` clamp counts as no decrease (`aimd.rs:188`), so the learner's 10 s clean window did not restart; the AIMD climbed back +302,719 per 5 s and the learner stepped to 5.15 M at 09:24:34.8 on a 6.4 Mbps window. `send_stalls=0`; `send_wait_max_ms` 52.444 in the heartbeat holding the opener's tail and the first step, 0.057–0.50 in all 36 others; paint age p50 68 / p95 117 / max 130 ms over a 45–50 ms floor. Write-back `Some(4843519) → kept 4759961` (+0.2 %, `ALPHA_UP`). **15:27 (130 s, idle):** seed 4,759,961 ⇒ opener 4,045,966; a 405-byte opener, then 0.16–0.25 Mbps at 18 fps (`max_qp` 14); no step, no decrease; write-back `Some(4045966) → kept 4402963`: **the session's own seed written back as evidence, −7.5 %** (`stable_bps()` = the target hold, V4 `ALPHA_DOWN`). **16:31 (13 s):** seed 4,402,963 ⇒ opener 3,742,518; one step to 3.98 M; `None → 4402963` (nothing held 10 s). The memory survived the 13:41Z service restart between the first two sessions (AC5). |
 | 2026-10-28 07:57, 12:38, 16:46, 16:46 UTC | agent **0.4.181** (service started 06:56Z) — same pair; read 2026-10-29 | Four more sessions, all seeded 4,402,963 ⇒ opener 3,742,518. **07:57 (19 s):** opener 697,527 B that blocked a send **163.9 ms**; the first step 3.74 → 3.98 M logged at 07:57:43.33 — **0.36 s before "opener grace over" (07:57:43.69)**: the CARRIED gate counts bytes written to the channel (`governor.rs:1004`) and `on_window` does not read the FR-79 verdict (`governor.rs:1388`), so the opener burst was the carrying window; two more steps to 4.49 M on 4.7–7.3 Mbps windows; `None` written. **12:38 (11 s), 16:46:11 (13 s):** one step each, `None`. **16:46:31 (90 s):** steps 3.74 → 3.98 → 4.22 → 4.49 M during 12 s of motion (3.1–7.4 Mbps), then 60 s idle at 0.35–0.77 Mbps with no step; `send_wait_max_ms` ≤ 0.57, `send_stalls=0`, paint age p50 67 / p95 111 ms (one 438 ms first report); write-back `Some(4489010) → kept 4411567` (+0.2 %). `rate_memory.json` on 2026-10-29: `100.65.4.2\|relay:derp/tcp` = 4,411,567 at `at_unix` 1793206081 (2026-10-28T16:48:01Z), plus three bare-address entries from browser-viewer sessions. **Reading for AC1:** the memory is held at 4.4–4.8 M by the write-back's dynamics (an idle session −7.5 %, a proving session +10 % of its gap), not by a measured limit — these sessions carried 6–7.6 Mbps windows at sub-ms send wait and P0 measured 6–9 M sustained. No daemon restarted, no input driven; the operator's console was signed in. On 2026-10-29 the pair rides `direct`, so no relay read is possible until it relays again. |
+| 2026-10-31 | fleet on 0.4.191, prod `hosted-20261031-28dfd72`; bounded `agent_logs` and `remote_sessions` reads, one RC session | **No relayed pair from neo16 today.** Candidate probe in both connected browsers: Chrome 16 host + srflx, Edge one mDNS + srflx, so a browser no longer relays every session by itself. One RC session to a fleet server on a virtual desktop (no input) rode srflx ↔ host at 33 ms, unrelayed; the `relay=true` rows those servers logged on 10-29/30 did not reproduce from this browser, and that desktop is too empty for AC1 anyway (a 6.9 KB keyframe, steady sharpness 0.14). Carrier census of the last 7 days: CORPLAP-2 `derp` ×24 (last 10-30 19:43), `turn` ×5, `direct` ×13; CORPLAP-1 `turn` ×5; CORPLAP-3 `direct` ×41. The named pair still relays, just not today. |
+| 2026-10-25 → 10-30, read 2026-10-31 | agents 0.4.171–0.4.188, CORPLAP-2 `av1_nvenc`, `100.65.4.2\|relay:derp/tcp` | **The pair's week, 24 sessions and 5,645 heartbeats, and a replay of the memory.** `damp` reproduces every logged `kept` to within 2 bps. The memory fell 5,906,129 → 3,379,312 over 18 writes. All 18 lie within 0.2 % of a rung, 0.85 × memory × (17/16)^k: k = 0 ×6, 1 ×2, 2 ×3, 3 ×4, 4 ×2, 9 ×1. A write moves the memory −7.50 / −4.84 / −2.02 / +0.20 / +0.83 % at k = 0…4 and +4.7 % at k = 9, a mean of −2.98 % here, so a session raises the memory only if it climbs at least 3 rungs and then holds 10 s. **Only 6 of the 18 held a target that a 2 s window carried at ≥ 70 %.** Replay of the same sessions, each rule as end value with the logged evidence / end value had the same rungs been climbed from the higher opener (an upper bound: CARRIED gets harder at a higher ceiling): a window at the held target carried (6 writes) 4.13 / 5.79 M; the session's peak window ≥ 70 % of the evidence (11 writes) 3.78 / 5.51 M; only rungs above the seed (7 writes) 4.23 / 6.25 M. Openers from the upper bounds are 1.93×, 1.84× and 2.08× cold, against 1.13× today. **Reading for AC1:** the hold question matters, nearly doubling the opener at best, but no rule reaches the 7.5 M a 2.5× opener needs, and the week's highest learned ceiling was 6,397,901 (a session that opened at 5.02 M). **Health:** max `send_wait_max_ms` 824.7, no heartbeat ≥ 1 s, `send_stalls` ≤ 3 per session, ceiling under `hi` throughout. **Steps:** 58 in 19 sessions; one session's first step fell inside the grace (10-28 07:57). **Natural motion for AC3:** 10-30 12:23:00–12:25:19, 0.4.187, 139 s at 2.61 / 2.74 / 3.78 / 7.57 Mbps (p10/p50/p90/max), send wait ≤ 1.128 ms, age ≤ 122 ms, ceiling 3.37 → 4.30 M. Not a drag: the load sat under the ceiling. |
+| 2026-10-30, read 2026-10-31 | agents 0.4.187 ×3 and 0.4.189 ×2, CORPLAP-1 `hevc_qsv`, relayed | **A sibling relay, recorded for AC4. Not the named host, and nothing here shows a ~2 Mbps pipe.** Five sessions of 2–286 s, peak 2 s windows 1.59–3.15 Mbps. Four: no learner step, `learned_ceiling_bps=0`, target ≤ 3.0 M. The fifth (22:16, 29 s) stepped three times to 3.60 M, at 18.6, 23.7 and 28.8 s with the opener grace over at 0.9 s, so no step rode the opener. Send wait ≤ 45.4 ms, `send_stalls=0`, age p95 ≤ 98 ms, 890 backpressure skips in one session (02:16). |
+| 2026-10-31 | code at master; two days of the vmtest org's heartbeats | **Why a VM cannot prove AC6, and the lab legs that went with it.** The plan was a kill-switch A/B on a throwaway VM on a forced relay, plus shaped lab legs for AC3 and AC4. Reading the code first stopped it: `relay_max_hi_bps()` has one caller, in `media_pump_ffmpeg_dc` (`peer.rs:6290`), the VP9-444 pump passes `hi = 0` (`peer.rs:4153`), no software FFmpeg encoder exists, and the heartbeats agree: 142 VP9-444 rows from guests with no GPU, FFmpeg rows only on NVENC. On such a host `relay_ceiling_learn` reads the same on and off. The one throwaway with a hardware encoder would be a second daemon on a fleet host, against "one daemon per enrolled machine", so that was decided against (hub, 2026-10-31). No VM or container was started. |

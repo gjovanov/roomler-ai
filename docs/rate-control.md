@@ -408,6 +408,13 @@ plan ceiling verbatim and no memory) and `relay_max_hi_kbps`
 (`crates/agent-core/src/config_surface.rs:1236`, `:1348`; `mod.rs:933`). Direct
 sessions never touch the learner (`governor.rs:572` gates on `constrained`).
 
+⚠️ **Only the FFmpeg DC pump runs the learner.** `relay_max_hi_bps()` has one
+caller (`peer.rs:6290`, `media_pump_ffmpeg_dc`), the VP9-444 pump builds its
+governor with `hi = 0` (`peer.rs:4153`), and the RTP pump has no governor. There
+is no software FFmpeg encoder, so a host with no hardware encoder never reaches
+the learner, and `relay_ceiling_learn` reads the same on and off there. A VM
+cannot prove that switch (FR-35 AC6).
+
 > **Field, `CORPLAP-2` over `relay:derp/tcp`, 2026-10-27/28 — agent 0.4.177,
 > 0.4.178 and 0.4.181** (the FR-35 surface is byte-identical from
 > `agent-v0.4.177` through `agent-v0.4.185` and master; the host took 0.4.178 at
@@ -506,6 +513,39 @@ with the governor (`peer.rs:8985`: require the hold to have been *carried*, or
 route the first-choice evidence through the gate); nothing here is changed yet.
 The 2026-10-25 → 10-30 row is the same defect at scale: every write on that pair,
 not only the idle sessions.
+
+**That week, replayed (2026-10-31).** `damp` reproduces all 24 sessions' logged
+`kept` to within 2 bps, so the replay is the write-back itself. All 18 writes lie
+within 0.2 % of a rung of the session's own opener, `0.85 × memory × (17/16)^k`,
+which fixes what a write can do:
+
+| rungs climbed `k` | evidence ÷ memory | the memory moves | writes that week |
+|---|---|---|---|
+| 0 | 0.850 | −7.50 % | 6 |
+| 1 | 0.903 | −4.84 % | 2 |
+| 2 | 0.960 | −2.02 % | 3 |
+| 3 | 1.020 | +0.20 % | 4 |
+| 4 | 1.083 | +0.83 % | 2 |
+| 9 | 1.467 | +4.67 % | 1 |
+
+A session raises the memory only by climbing at least three rungs and then
+holding ten seconds; the week's mean was −2.98 % per write. Only 6 of the 18 held
+a target that a 2 s window carried at ≥ 70 %. Counting only carried holds helps,
+but it does not reach what FR-35 AC1 asks:
+
+| rule | writes that count | end value, evidence as logged | end value, same rungs from the higher opener | opener, × the cold 2.55 M |
+|---|---|---|---|---|
+| today | 18 | 3.38 M | 3.38 M | 1.13× |
+| the session's peak window reached 70 % of the evidence | 11 | 3.78 M | 5.51 M | 1.26–1.84× |
+| a window at the held target reached 70 % of it | 6 | 4.13 M | 5.79 M | 1.38–1.93× |
+| only rungs above the seed (`k ≥ 3`) | 7 | 4.23 M | 6.25 M | 1.41–2.08× |
+
+The fourth column is an upper bound, because CARRIED is harder to pass under a
+higher ceiling. A 2.5× opener needs a memory of 7.5 M, the last 6 % under `hi`,
+and the week's highest learned ceiling was 6.40 M. (AC1 asks for 2.5× the
+keyframe's bytes, which FR-31 ties to `maxrate` and the 2026-08-29 field rows
+follow only loosely.) So the hold question is worth deciding, but AC1 does not
+follow from it alone.
 
 ### V3b — ONE belief about the path (SHADOW since `agent-v0.4.98`)
 
