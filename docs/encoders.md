@@ -947,7 +947,7 @@ drops `resetEncoder = forceIDR = 1` from `nvenc.c`'s bitrate-only reconfigure.
 `vendor-ffmpeg-windows.yml` applies it to the Windows and both Linux assets and
 writes `ROOMLER-PATCHES.txt` (sha256 per patch) into each; `release-agent.yml`
 refuses to tag when an asset's manifest differs from the committed patches
-(`.github/workflows/release-agent.yml:449-471`, `:1167` for arm64). The pump reads
+(`.github/workflows/release-agent.yml:449-471`, `:1172` for arm64). The pump reads
 one const, `NVENC_RECONFIG_FORCES_IDR` (`encoder.rs:893`), so the binary and the
 FFmpeg it links cannot disagree. The macOS builder carries no patch today.
 

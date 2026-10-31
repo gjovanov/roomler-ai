@@ -137,7 +137,7 @@ days. So before every non-tag build, `seed-cache-restore` runs a GC step
 | Jobs | Cap | Set at |
 |---|---|---|
 | Default (companions, everything else) | 3,000 MB | `seed-cache-restore/action.yml:85` |
-| The four daemon jobs (`.deb` ×2, MSI, `.pkg`) | 4,500 MB | `release-agent.yml:393`, `:1129`, `:1604`, `:2575` |
+| The four daemon jobs (`.deb` ×2, MSI, `.pkg`) | 4,500 MB | `release-agent.yml:393`, `:1134`, `:1654`, `:2625` |
 | The wizard's macOS universal job (two triples) | 5,000 MB | `release-setup.yml:396` |
 | CI caches in the release-asset store (`ci-seed-restore`), default | 4,000 MB | `ci-seed-restore/action.yml:29` |
 | The integration shards, `ci.yml`'s macOS overlay check and its Windows clippy lane | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1368`, `:1617` |
@@ -222,7 +222,7 @@ grep -oE 'target is [0-9]+ MB.*' job.log                          # GC line, non
 | `::warning title=Seed publish did not land::` | the save's own check failed; the next run may build cold |
 | `tag run — skipping accretion GC` | expected on every tag run |
 
-A failed rehearsal opens a GitHub issue (`release-agent.yml:3679`), and the next green one
+A failed rehearsal opens a GitHub issue (`release-agent.yml:3729`), and the next green one
 closes it (`:3742`).
 
 ## 6. The waves that built this
