@@ -37,6 +37,16 @@ waits on CORPLAP-3 relaying. **AC6** needs a hardware encoder, on a relay, on a 
 may restart; a VM cannot prove it. FR-63 B3 deletes this code, so new learner behaviour is a
 question for the operator, not a phase of this FR.
 
+**Driven 2026-10-31 evening, on 0.4.191, CORPLAP-2 on its natural relay. This replaces the
+paragraph above for AC1, AC2, AC3 and AC6.** **AC1, AC2 and AC3 are met.** Two things go with
+those ticks. On H.265 4:4:4, this pair's default cell now, a cold opener clears AC1 and AC2 too, so
+they record that the opening is no longer starved, not that the memory is why. And the note above
+that 2.5× needs a 7.5 M memory was wrong: the keyframe does not follow `maxrate` in a straight line
+([the A/B](#the-opener-ab-2026-10-31)). **AC4** waits on CORPLAP-1, whose RC rows are not ours to
+clear. **AC6** has its host now, jupiter, and needs one operator OK. The memory stood at 4,326,752
+at 22:41 after three writes, one of them an evidence of 13.04 M, above `hi`, from a 45 s session
+([field log](#field-log)); that belongs with FR-79's open hold question.
+
 Child of the RC-quality program. Follows FR-31 (every opening and repair number on an NVENC relay
 session is proportional to `maxrate`, and nothing ffmpeg exposes changes that) and the parked
 measured-rate line (#678: a sender cannot see capacity it is not using). Operator's directive
@@ -106,35 +116,30 @@ lumpiness, governor.rs:256-262 — the AIMD's own stable target is the robust si
 Measured with the FR-31 harness on `neo16 → CORPLAP-2`, N ≥ 5 sessions after ≥ 1 learning session,
 shipped defaults:
 
-- [ ] opening keyframe ≥ 2.5× today's bytes (≥ 14 KB at 1920×1200, today 5.6 KB) and first-light
-      sharpness ≥ 70 % of the 8 s steady state (today 47 %) — **not measurable on 2026-10-31**: it
-      needs a relayed NVENC pair and a driven viewer, and no pair from neo16 relayed. What the memory
-      allows can be read without one: `100.65.4.2|relay:derp/tcp` stands at 3,379,312, an opener of
-      2.87 M, 1.13× cold. If the keyframe follows `maxrate` (FR-31; the 2026-08-29 row follows it only
-      loosely), 2.5× needs a 6.4 M opener, so a memory of at least 7.5 M, in the last 6 % under `hi`.
-      FR-79's open hold question does not get there alone: the 2026-10-31 replay in the field log puts
-      a carried-only rule at 1.84–1.93× cold at best
-- [ ] time-to-crisp ≤ 0.6 s (today 1.2 s) — needs a relay-locked pair and a driven instrumented
-      viewer session (a cold-vs-seeded A/B); not measurable from the agent-side heartbeat. No pair
-      from neo16 relayed on 2026-10-29 (CORPLAP-1/2/3 all `direct`). **2026-10-31:** the same again,
-      and neither connected browser relays by itself (Chrome 16 host candidates + srflx, Edge one
-      mDNS + srflx), so a browser setting does not give a relayed session either. The viewer
-      harness is rewritten and proven on a real session, so the A/B now waits only on a relayed
-      NVENC pair: an operator window on CORPLAP-2, the only NVENC host not excluded
-- [~] a 60 s drag: no send wait > 1 s, viewer-age p99 not worse than the FR-18 numbers, and the
-      ceiling never above `hi` — **the ceiling half is met**: never above 5,146,238 across seven
-      sessions (10-27/28, CORPLAP-2 `relay:derp/tcp`, 0.4.177–0.4.181) and bounded by construction
-      (`ceiling_learn.rs:237`, `.min(hi)`); **the drag itself was never driven**, so the send-wait
-      and viewer-age halves are unexercised — what was seen without a drag (four sessions read in
-      full): `send_stalls=0`, `send_wait_max_ms` ≤ 163.9 (the opener), paint age p50 66–68 /
-      p95 103–117 / max 775 ms. The FR-18 numbers to beat under drag (0.4.10, CORPLAP-3 relay):
-      `send_wait` p99 200 ms / max 1 778 ms, viewer age max 2 185 ms — the undriven sessions sit
-      under them, but that is not the same test. **2026-10-31, natural motion, still no drag:** the
-      best run on the named pair (2026-10-30 12:23:00–12:25:19, 0.4.187) held 139 s at a median
-      2.74 Mbps with send waits ≤ 1.13 ms and paint age ≤ 122 ms, but its load sat under the
-      4.05–4.30 M ceiling, so it does not stand in for the drag. Across the week's 24 sessions no
-      heartbeat reached a 1 s send wait (max 824.7 ms); one session passed FR-18's age max, 3,364 ms
-      (2026-10-30 11:48, the stand-in session FR-79 reads on #1524)
+- [x] opening keyframe ≥ 2.5× today's bytes (≥ 14 KB at 1920×1200, today 5.6 KB) and first-light
+      sharpness ≥ 70 % of the 8 s steady state (today 47 %) — **met 2026-10-31, 0.4.191.** Five
+      sessions after the learning drag with nothing overridden, on a dense screen: 23.1–23.3 KB, first
+      light 104–107 %. **The bar is August's 5.6 KB and 47 %, and a cold opener clears it as well:**
+      23.4–63.3 KB and 106–107 % on the same screen and cell, 13.6–37.8 KB and 89–107 % on AV1. Against a
+      cold opener on the same cell, the pair's keyframe is 1× or less. So this box says the opening
+      is no longer starved, not that the memory did it ([the A/B](#the-opener-ab-2026-10-31))
+- [x] time-to-crisp ≤ 0.6 s (today 1.2 s) — **met 2026-10-31**, with the cold-vs-seeded A/B this
+      criterion asks for. Time-to-crisp is FR-31's, ≥ 90 % of steady. It read 0 ms in every H.265
+      session of every arm, and at most 185 ms on AV1. A cold opener passes too, at 155 ms at worst.
+      The memory's effect shows only nearer the top: on AV1 on the wallpaper, 97 % of steady took
+      994–1,312 ms cold, 756–948 ms at the pair's rate and 302–743 ms at 4.55 M
+- [x] a 60 s drag: no send wait > 1 s, viewer-age p99 not worse than the FR-18 numbers, and the
+      ceiling never above `hi` — **met 2026-10-31**, 0.4.191, CORPLAP-2 on `relay:derp/tcp`: a real
+      Explorer window dragged by its title bar for 60 s, 1,136 pointer moves, 2.94 Mbps mean, 4.35
+      peak. Inside the drag `send_wait_max_ms` stayed ≤ 0.383 and paint age ≤ 132 ms. Across the
+      session's 95 heartbeats: send wait max 0.787 ms, age p99 195 ms, `send_stalls=0`, no
+      backpressure skip. The FR-18 numbers (0.4.10, CORPLAP-3 relay): `send_wait` p99 200 ms / max
+      1,778 ms, viewer age max 2,185 ms. The learner stepped eight times, 3.00 → 4.87 M, under `hi`
+      8 M, and bounded by construction (`ceiling_learn.rs:237`, `.min(hi)`). The load was the
+      screen's, not the pipe's: QP sat at 15 in all but two of the drag's heartbeats and the ceiling
+      climbed past the load, so the drag did not push this pair to its limit. Without a drag the week's 24 sessions
+      had one heartbeat near a second (824.7 ms) and one past FR-18's age max, 3,364 ms (2026-10-30
+      11:48, the stand-in session FR-79 reads on #1524)
 - [ ] a ~2 Mbps relay (CORPLAP-3, `av1_qsv`): `target_bps` never exceeds the nominal unless every growth
       gate passed — read from its heartbeats; the session must not get worse than today
       (0.4.21, 2026-08-29: no learner steps, `learned_ceiling_bps=0`, target ≤ 3.0 Mbps, 65–78 ms).
@@ -144,7 +149,11 @@ shipped defaults:
       `direct` in all 41 of its sessions with a carrier this week, so the named host gives no read.
       CORPLAP-1's five relayed sessions are recorded in the field log; nothing shows that pipe is
       ~2 Mbps. On the opener: 1 of the 19 sessions that stepped on the CORPLAP-2 pair took its first
-      step inside the grace, that same 2026-10-28 session
+      step inside the grace, that same 2026-10-28 session. **2026-10-31, evening:** a viewer can now
+      put CORPLAP-3 on a relay from its own tab, but that gives a relay, not a ~2 Mbps pipe, so it
+      would not answer this. CORPLAP-1 (`hevc_qsv`, with no `av1_qsv`) rides `relay:derp/tcp` and is
+      the nearest candidate. It showed two RC rows still `active` (21:18 and 21:51) that nobody here
+      can account for, so it was left alone
 - [x] the learned rate survives a daemon restart and expires after 7 days (unit-tested; the file is
       `…\config\systemprofile\AppData\Roaming\roomler\roomler\data\rate_memory.json` for the SYSTEM
       service). **Restart survival field-read 2026-10-29** on CORPLAP-2: the seed chain 4,750,677 →
@@ -161,12 +170,51 @@ shipped defaults:
       one caller of `relay_max_hi_bps()`), the VP9-444 pump passes `hi = 0` (`peer.rs:4153`), and the
       FFmpeg pump needs a hardware encoder. So on a host with no GPU the switch reads the same on and
       off, and a pass there proves nothing. It needs a session on a hardware encoder, on a relay, on a
-      host whose daemon may restart
+      host whose daemon may restart. **2026-10-31, evening: that host exists.** A relay pinned in the
+      viewer's tab put jupiter in the FFmpeg DC pump on `h264_vaapi`, `constrained=true`, opening at
+      2.55 M (22:44:59, no input). What is left is the operator's OK for one change on jupiter:
+      `relay_ceiling_learn=false`, a daemon restart, the A/B, the revert, a second restart
 - [x] **Docs** — the ceiling learner (P1) and the per-peer memory (P2) are documented in
       `docs/rate-control.md` (§ The ceiling learner / § The write-back and the seed) with a mermaid of
       the learner's per-window decision, a gate/anchor table, what CARRIED and DECREASE actually
       measure, the config rows and the 2026-10-27/28 field rows, and the page's `docs/README.md` row
       names the section (#3013; operator rule, 2026-09-05: docs before close)
+
+## The opener A/B (2026-10-31)
+
+The memory key is the nominated remote address (`peer.rs:6298`, `rate_memory.rs:65`). So a viewer
+that offers one TURN address lands on that address's entry, with nothing changed on the device.
+`coturn.roomler.ai` has three addresses, and CORPLAP-2's memory held a different state for each,
+all from real sessions. That gave three openers on one held screen, in interleaved rounds, each
+session's `seed_bps` and `maxrate_bps` confirmed from the host's own log:
+
+| screen · cell (steady sharpness) | cold, 2.55 M | the pair, 2.85–2.87 M | a 10-26 entry, 4.55 M |
+|---|---|---|---|
+| wallpaper · H.265 4:4:4 (3.23–3.25) | 25.1–60.0 KB, 98–100 % | 25.2–27.3 KB, 97–99 % | 42.7–60.0 KB, 99–100 % |
+| wallpaper · AV1 4:2:0 (3.36–3.40) | 16.6–32.1 KB, 91–95 % | 17.6–20.5 KB, 92–95 % | 39.98 KB ×3, 94 % |
+| dense text · H.265 4:4:4 (6.14–6.19) | 23.4–63.3 KB, 106–107 % | 23.2–23.4 KB, 102–104 % | 32.9–69.2 KB, 105–107 % |
+| dense text · AV1 4:2:0 (6.14–6.19) | 13.6, 37.8 KB; 89, 107 % | 14.9, 15.1 KB; 87, 90 % | 52.6, 86.5 KB; 104, 109 % |
+
+Each cell is the first keyframe and first-light sharpness, three sessions per arm, two on dense AV1,
+all 1920×1200 with display match off in the tab. H.265 4:4:4 is the shipped default here
+(`useRemoteControl.ts:3620` returns `sharper`). AV1 was forced in the tab, because it is the
+cell the criteria were written on and the one this pair rode all week. Dense text is an Explorer
+window maximized on `C:\Windows`. First light above 100 % means no blur, not a sharper picture: the
+metric counts edges, and compression ringing on text most likely adds to them.
+
+**The keyframe does not follow `maxrate` in a straight line.** On H.265 the same 2.55 M gave 23 to
+63 KB, and 60.02 KB came back to within 6 bytes at two different maxrates, which points at a limit
+this read did not find. On dense AV1, 1.6× the maxrate gave 3.5–5.8× the keyframe. **The whole opener
+is small:** 215–524 KB in its 2 s grace with display match off, about 0.9–2.1 Mbps, under even the
+cold cap, which is why the ceiling matters so little here. **The August numbers did not reproduce:** no cold opener on
+either screen or cell came near 5.6 KB and 47 %. That screen is gone, so this is not like for like,
+and nothing here says what changed.
+
+**Shipped defaults, unfiltered:** H.265 4:4:4 opens at 1920×1200, then display match can reopen the
+encoder at 1920×1080 within 3 s. Seven such sessions before the drag gave 19.9–25.3 KB, except one
+that opened on a blank 675 B frame with the picture 1 s later in a 47 KB keyframe. Natural ICE also
+chooses: 2 of 24 unfiltered sessions took a TURN key rather than the pair's, so read each session's
+`seed_bps`. This is two screens on one idle desktop and a few sessions per arm.
 
 ## Open decisions
 
@@ -213,3 +261,4 @@ levers); the direct path's measured clamp.
 | 2026-10-25 → 10-30, read 2026-10-31 | agents 0.4.171–0.4.188, CORPLAP-2 `av1_nvenc`, `100.65.4.2\|relay:derp/tcp` | **The pair's week, 24 sessions and 5,645 heartbeats, and a replay of the memory.** `damp` reproduces every logged `kept` to within 2 bps. The memory fell 5,906,129 → 3,379,312 over 18 writes. All 18 lie within 0.2 % of a rung, 0.85 × memory × (17/16)^k: k = 0 ×6, 1 ×2, 2 ×3, 3 ×4, 4 ×2, 9 ×1. A write moves the memory −7.50 / −4.84 / −2.02 / +0.20 / +0.83 % at k = 0…4 and +4.7 % at k = 9, a mean of −2.98 % here, so a session raises the memory only if it climbs at least 3 rungs and then holds 10 s. **Only 6 of the 18 held a target that a 2 s window carried at ≥ 70 %.** Replay of the same sessions, each rule as end value with the logged evidence / end value had the same rungs been climbed from the higher opener (an upper bound: CARRIED gets harder at a higher ceiling): a window at the held target carried (6 writes) 4.13 / 5.79 M; the session's peak window ≥ 70 % of the evidence (11 writes) 3.78 / 5.51 M; only rungs above the seed (7 writes) 4.23 / 6.25 M. Openers from the upper bounds are 1.93×, 1.84× and 2.08× cold, against 1.13× today. **Reading for AC1:** the hold question matters, nearly doubling the opener at best, but no rule reaches the 7.5 M a 2.5× opener needs, and the week's highest learned ceiling was 6,397,901 (a session that opened at 5.02 M). **Health:** max `send_wait_max_ms` 824.7, no heartbeat ≥ 1 s, `send_stalls` ≤ 3 per session, ceiling under `hi` throughout. **Steps:** 58 in 19 sessions; one session's first step fell inside the grace (10-28 07:57). **Natural motion for AC3:** 10-30 12:23:00–12:25:19, 0.4.187, 139 s at 2.61 / 2.74 / 3.78 / 7.57 Mbps (p10/p50/p90/max), send wait ≤ 1.128 ms, age ≤ 122 ms, ceiling 3.37 → 4.30 M. Not a drag: the load sat under the ceiling. |
 | 2026-10-30, read 2026-10-31 | agents 0.4.187 ×3 and 0.4.189 ×2, CORPLAP-1 `hevc_qsv`, relayed | **A sibling relay, recorded for AC4. Not the named host, and nothing here shows a ~2 Mbps pipe.** Five sessions of 2–286 s, peak 2 s windows 1.59–3.15 Mbps. Four: no learner step, `learned_ceiling_bps=0`, target ≤ 3.0 M. The fifth (22:16, 29 s) stepped three times to 3.60 M, at 18.6, 23.7 and 28.8 s with the opener grace over at 0.9 s, so no step rode the opener. Send wait ≤ 45.4 ms, `send_stalls=0`, age p95 ≤ 98 ms, 890 backpressure skips in one session (02:16). |
 | 2026-10-31 | code at master; two days of the vmtest org's heartbeats | **Why a VM cannot prove AC6, and the lab legs that went with it.** The plan was a kill-switch A/B on a throwaway VM on a forced relay, plus shaped lab legs for AC3 and AC4. Reading the code first stopped it: `relay_max_hi_bps()` has one caller, in `media_pump_ffmpeg_dc` (`peer.rs:6290`), the VP9-444 pump passes `hi = 0` (`peer.rs:4153`), no software FFmpeg encoder exists, and the heartbeats agree: 142 VP9-444 rows from guests with no GPU, FFmpeg rows only on NVENC. On such a host `relay_ceiling_learn` reads the same on and off. The one throwaway with a hardware encoder would be a second daemon on a fleet host, against "one daemon per enrolled machine", so that was decided against (hub, 2026-10-31). No VM or container was started. |
+| 2026-10-31 evening | 0.4.191, CORPLAP-2 `hevc_nvenc` and `av1_nvenc`, `100.65.4.2\|relay:derp/tcp`, Chrome on neo16; bounded `agent_logs` reads, no exec, no device change | **AC1, AC2, AC3 driven: [the A/B](#the-opener-ab-2026-10-31).** **The drag** (session 22:24:43–22:27:42, 95 heartbeats): seed 3,379,312, opener 2,872,415, learner 3.19 → 3.39 → 3.60 → 3.82 → 4.06 → 4.32 → 4.59 → 4.87 M in 60 s on 2.1–3.8 Mbps heartbeats, all figures in AC3. After the drag, 14 sessions on the key at seed 3,528,631 gave 22.6–27.5 KB, first light 97–102 %, time-to-crisp 0 ms. **The memory, three writes in one night:** the drag `Some(4872507)` → 3,528,631 (+4.4 %); a session that opened and maximized an Explorer window `Some(3187500)` → 3,358,065 (−4.8 %); a 45 s session that closed one `Some(13044940)` → 4,326,752 (+28.9 %), six times the drag's move on an evidence above `hi`. That one came from `pipe_bps` (`peer.rs:8988`, `governor.rs:634`), which nothing clamps. Below a memory of about 3.53 M the opener sits under the plan's 3 M, so an idle session has no `stable_bps()` (`ceiling_learn.rs:266`) and writes nothing: an 8 min idle session read `evidence=None`. That is where the week's decay stopped. **AC6's host:** jupiter on a pinned relay, 22:44:59, no input, read in AC6. **Wrong turns:** g1's six sessions read as a pass until the agent side showed the cell had moved to `hevc_nvenc` and every session shared one seed, so none was cold. A marquee drag delivered 0.31–0.36 Mbps and a drag on the docked Sticky Notes moved nothing, so neither counts. A synthetic press needs `setPointerCapture` shimmed on `Element.prototype`, not on `.video-frame`. The arrow in the extension's screenshots is its own pointer at the viewport centre, not the host's cursor. Display match set off once stays off in that page until a reload. |
