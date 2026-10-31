@@ -254,7 +254,7 @@ Unlike the two denylists, the server reads the word. It takes the words
 `roomler config set` takes (`true`/`false`, `1`/`0`, `yes`/`no`, in any case),
 stores the spelling above, and refuses anything else with a 400 that names the
 key, recording nothing (`pushed_tribool`,
-`crates/modules/fleet/src/remote_config.rs:159`). A tribool has no entries a
+`crates/modules/fleet/src/remote_config.rs:182`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
 (`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3104`), and a test
@@ -279,7 +279,7 @@ it only ever *removes* a GPU form a device would otherwise open. It reports
 `needs_restart`, because the probe reads it once per process and the encoders
 read it through the config fallbacks
 (`agents/roomlerd/src/remote_config.rs:354`). The server passes it on unread
-(`crates/modules/fleet/src/remote_config.rs:206`): an entry the gate cannot read
+(`crates/modules/fleet/src/remote_config.rs:229`): an entry the gate cannot read
 denies nothing, because `gpu_hint::is_denied` matches only an exact `name:gpu`.
 It exists so that a GPU-input cell can be turned off from the server before any
 cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).

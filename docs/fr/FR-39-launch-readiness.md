@@ -69,7 +69,7 @@ account** — so that interest which does not convert immediately is not lost pe
 
 5. **Email capture** — new `subscribers` collection + three public routes, mirroring the
    shape of the existing token-capability routes (`public_consent_routes`,
-   `crates/api/src/lib.rs:463`), which take no auth extractor because an unguessable token
+   `crates/api/src/lib.rs:480`), which take no auth extractor because an unguessable token
    *is* the capability:
    - `POST /api/subscribe` — `{ email, source }`. **Always answers 202**, whether the
      address is new, already subscribed or malformed-but-plausible: a response that

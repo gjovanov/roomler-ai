@@ -371,7 +371,7 @@ Two properties of the resolution endpoint, both easy to get wrong:
 > showed at every percentile (§12). Padding the reads cannot close that, and a
 > rate limit only slows an attacker's averaging down. So every answer given without the
 > device leaves at `ANSWER_FLOOR`, 300 ms after the knock
-> (`crates/modules/remote/src/extauth.rs:90`). It is a deadline, not a pad after the
+> (`crates/modules/remote/src/extauth.rs:91`). It is a deadline, not a pad after the
 > work, so what was read to reach the answer cannot show. It sits above the 250 ms
 > presence probe `forward` may wait out, so a stalled Redis does not mark an offline
 > device either. Only refusals pay it: a login the device answers is as fast as the

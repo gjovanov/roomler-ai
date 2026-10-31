@@ -39,6 +39,15 @@ const MAX_AUTH_BODY: usize = 64 * 1024;
 /// can't grow the map without bound.
 const IDLE_EVICTION: Duration = Duration::from_secs(15 * 60);
 
+/// #3199 — one token every 3 minutes, burst 5: [`ip_rate_limit`]'s budget on
+/// `POST /api/auth/resend-activation`.
+///
+/// ⚠️ `period × burst` must stay at or under [`IDLE_EVICTION`]. An idle bucket
+/// is dropped and comes back full, so anything longer would hand back budget
+/// that refilling had not yet earned.
+pub const RESEND_PERIOD_MS: u64 = 3 * 60 * 1000;
+pub const RESEND_BURST: u32 = 5;
+
 #[derive(Debug)]
 struct Bucket {
     tokens: f64,
@@ -124,7 +133,7 @@ fn account_key(body: &Bytes) -> String {
         .unwrap_or_default()
 }
 
-fn too_many_requests(retry_after: u64) -> Response {
+fn too_many_requests(retry_after: u64, what: &str) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
         [
@@ -132,10 +141,36 @@ fn too_many_requests(retry_after: u64) -> Response {
             (header::CONTENT_TYPE, "application/json".to_string()),
         ],
         format!(
-            r#"{{"error":"too_many_requests","message":"Too many attempts for this account. Try again in {retry_after}s."}}"#
+            r#"{{"error":"too_many_requests","message":"{what} Try again in {retry_after}s."}}"#
         ),
     )
         .into_response()
+}
+
+/// #3199 — the per-address gate for a route that mails whoever its body names.
+///
+/// [`auth_rate_limit`]'s (address, account) key is wrong here: it exists so one
+/// person's guessing can't lock out their office, and on this route it would
+/// give a client walking a list of addresses a fresh budget for each one. So
+/// this charges the client address alone and never reads the body. The answer
+/// is the same whatever the body names, so a 429 cannot say anything about it.
+pub async fn ip_rate_limit(
+    State(state): State<AuthRateLimitState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let ip =
+        client_ip(&req, state.trusted_hops).unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    if let Err(retry_after) = state.limiter.check(ip, "") {
+        tracing::warn!(
+            %ip,
+            path = %req.uri().path(),
+            retry_after,
+            "ip rate limit hit"
+        );
+        return too_many_requests(retry_after, "Too many requests from this address.");
+    }
+    next.run(req).await
 }
 
 pub async fn auth_rate_limit(
@@ -170,7 +205,7 @@ pub async fn auth_rate_limit(
             retry_after,
             "auth rate limit hit"
         );
-        return too_many_requests(retry_after);
+        return too_many_requests(retry_after, "Too many attempts for this account.");
     }
 
     next.run(Request::from_parts(parts, Body::from(bytes)))
@@ -233,6 +268,12 @@ mod tests {
             rl.check(a, "alice").is_ok(),
             "bucket should have refilled after the period elapsed"
         );
+    }
+
+    #[test]
+    fn the_resend_budget_refills_before_an_idle_bucket_is_dropped() {
+        let refill_all = Duration::from_millis(RESEND_PERIOD_MS) * RESEND_BURST;
+        assert!(refill_all <= IDLE_EVICTION, "{refill_all:?}");
     }
 
     #[test]

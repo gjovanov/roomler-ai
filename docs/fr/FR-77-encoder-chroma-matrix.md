@@ -116,7 +116,7 @@ Two structural facts shape the design: Chromium keeps **one** `HEVCPROFILE_REXT`
 every RExt chroma form, so `isConfigSupported` cannot tell 4:4:4 from 4:2:2 (the
 mismatch surfaces at the first SPS); and no browser API says whether hardware or software
 decoded. Only a real-bytes trial proves a cell, and the page-scoped transport ban
-(`useRemoteControl.ts:4493`) already is that trial.
+(`useRemoteControl.ts:4518`) already is that trial.
 
 **The honest 4:4:4 cells** are therefore: HEVC 4:4:4 (hardware both ends on modern
 NVIDIA and Intel; not on Linux Chrome), VP9 4:4:4 (software or Intel hardware encode,
