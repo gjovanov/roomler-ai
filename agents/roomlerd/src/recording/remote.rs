@@ -694,6 +694,18 @@ fn file_name(path: Option<&str>) -> Option<String> {
 
 // ── One session's handler ──────────────────────────────────────────────────
 
+/// FR-85 P3d — one turn of the banner's slowest poll, and a margin. The
+/// banner's text is polled once a second (`panel-viewing.js`) and the window
+/// behind it every 750 ms, so this long after a first read both have had theirs.
+const BANNER_POLL: Duration = Duration::from_millis(1100);
+
+/// FR-85 P3d — how long a companion that is up gets to read the flag at all.
+/// Generous on purpose: a slow companion on a busy desktop still records, and
+/// only one that reads nothing is refused. With [`BANNER_POLL`] and the start
+/// budget, a remote start waits 9.1 s at the very most, and about 1.5 s when
+/// the companion is already running.
+const BANNER_READ_CEILING: Duration = Duration::from_secs(5);
+
 /// Whether the desktop companion can show this session's prompt and banner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Companion {
@@ -702,6 +714,8 @@ pub enum Companion {
     System,
     /// A fixed answer — for tests, which must never launch the real app.
     Fixed(bool),
+    /// Up, and waited for as [`Self::System`] is, on a test's own clock.
+    Timed { poll: Duration, ceiling: Duration },
 }
 
 impl Companion {
@@ -714,7 +728,43 @@ impl Companion {
             .await
             .unwrap_or(false),
             Self::Fixed(up) => up,
+            Self::Timed { .. } => true,
         }
+    }
+
+    /// The wait before a recorder may start, if this one has any.
+    fn banner_wait(self) -> Option<(Duration, Duration)> {
+        match self {
+            Self::System => Some((BANNER_POLL, BANNER_READ_CEILING)),
+            Self::Fixed(_) => None,
+            Self::Timed { poll, ceiling } => Some((poll, ceiling)),
+        }
+    }
+}
+
+/// FR-85 P3d — has the banner had its turn? A flag on the registry is not yet
+/// on the screen: the companion finds out on its next poll. So wait for the
+/// first read, then for one more turn of the slowest poll. `false` = nothing
+/// read it within `ceiling`.
+///
+/// ⚠️ A read proves the companion is alive and was told, not that the banner
+/// painted: the daemon has no word back from the window.
+async fn banner_had_its_turn(
+    indicator: &crate::indicator::ViewerIndicator,
+    session: &ObjectId,
+    poll: Duration,
+    ceiling: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + ceiling;
+    loop {
+        if let Some(read) = indicator.recording_read_at(session) {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(read + poll)).await;
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -1167,6 +1217,25 @@ impl Handler {
                             .into(),
                     ),
                 ));
+            }
+            // FR-85 P3d — a native badge has painted by now. A companion holds
+            // a flag it has not read, and a recorder started here would write
+            // its first frames under "Being viewed", with no Stop on screen.
+            if !shown.native
+                && let Some((poll, ceiling)) = self.ctx.companion.banner_wait()
+            {
+                send(&self.dc, &StateMsg::new(id, "announcing")).await;
+                if !banner_had_its_turn(&self.ctx.indicator, &sid, poll, ceiling).await {
+                    self.ctx.indicator.end_recording(sid);
+                    return Some((
+                        "no_indicator_surface",
+                        Some(
+                            "nothing on this device can show that it is being recorded (the \
+                             Roomler desktop app is running but did not answer)"
+                                .into(),
+                        ),
+                    ));
+                }
             }
         }
 
