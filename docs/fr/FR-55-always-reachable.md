@@ -395,7 +395,7 @@ against production's `hosted-20261031-28dfd72`.
 | # | the guest | what production read | result |
 |---|---|---|---|
 | RED | the released `0.4.188`, before P4 (2026-10-30) | The daemon logged `viewers told (FR-93 P5h) sessions=0 told=0` and said nothing to the server; `PM: suspend entry (s2idle)` followed 1 s later. The row read `online` for 1 min 46 s, with `last_seen_at` frozen at the last heartbeat, then a bare `offline`: no `sleep`, no reason. After the wake it read `online` again within a second of the hello | ❌ as it must: "offline" for a computer that is only asleep |
-| GREEN 1 | the released `0.4.190`, asleep 79 s | `saying goodbye to the server … policy=never on_ac=None held=false` and `connections=1 said=1` at 18:01:16.919, the second of `PM: suspend entry`. The server's `sleep.since` is 18:01:16.925: `presence: offline` with `sleep { policy: never, held: false }` on `/device` and `/agent`. The peer read `◌ … asleep`. The open grid's chip turned `asleep` by itself within 3 s, with no reload, and a fresh load agreed. A tap on it showed: *Asleep since 10/31/2026, 6:01:16 PM, as its power policy allows: nothing was holding it awake (power policy "never"). It reconnects by itself when it wakes. To keep it reachable, set power_policy to on-ac or always on the device.* Hello 1 s after the wake, `sleep` gone, `online` on all three | ✅ |
+| GREEN 1 | the released `0.4.190`, asleep 79 s | `saying goodbye to the server … policy=never on_ac=None held=false` and `connections=1 said=1` at 18:01:16.919, the second of `PM: suspend entry`. The server's `sleep.since` is 18:01:16.925: `presence: offline` with `sleep { policy: never, held: false }` on `/device` and `/agent`. The peer read `◌ … asleep`. The open grid's chip turned `asleep` by itself within 3 s, with no reload, and a fresh load agreed. A tap on it showed: *Asleep since 10/31/2026, 6:01:16 PM, as its power policy allows: nothing was holding it awake (power policy “never”). It reconnects by itself when it wakes. To keep it reachable, set power_policy to on-ac or always on the device.* Hello 1 s after the wake, `sleep` gone, `online` on all three | ✅ |
 | GREEN 2 | the same, asleep 35 s | the same reads, and `awake again: reconnecting (FR-55 P4)` at the wake; hello 1 s later | ✅ |
 | GREEN 3 | the same, asleep 20 s | the same reads, the same line; hello 1 s later | ✅ |
 | CONTROL | the same device and build, its virtual link taken down: no OS notice, and nothing it says gets out | `online` for 1 min 41 s, until the server's 2:00 receive deadline after the last heartbeat, then `offline` with `sleep: null`. The chip read `offline` and the peer `○ … offline`, never `asleep`. `online` within 2 s of the link coming back | ✅ as it must: a device that gave no reason still reads `offline` |
@@ -410,8 +410,8 @@ the device lists)` on the released build.
 HEADLESS matters for the open decision on the Linux inhibitor. The desktop guest's own delay
 inhibitors (GNOME, UPower, NetworkManager, ModemManager) hold the suspend back for everyone,
 the goodbye included. With none of them, the goodbye had only the time logind leaves it, and
-it still arrived every time it was read. That is one idle VM a few milliseconds from nothing
-in its way, not a fleet rate: a loaded host could still lose the race.
+it still arrived every time it was read. That is one idle VM, not a fleet rate: a loaded host
+could still lose the race.
 
 Dead ends, kept so nobody repeats them:
 
