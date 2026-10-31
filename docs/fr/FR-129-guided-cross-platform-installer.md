@@ -71,7 +71,7 @@ them:
 | the per-user half as the console user | `scripts/install.sh:199-210` | a root run re-targets the per-user enroll at the console user; a root-owned config is the documented failure mode |
 | the macOS second enrollment | `scripts/install.sh:570-600` | the overlay needs root, and the hub keys sessions on `agent_id`, so the root half is a separate device with its own token (FR-43 P2c/P3 have not collapsed it yet) |
 | the FR-96 update helper | `scripts/install.sh:324-342` | a per-user Linux install cannot write `/usr`; the root helper installs its updates |
-| the desktop companion | `scripts/install.sh:840`, header `:36-40` | the companion is the device's consent **prompt surface**; a "Prompt on host" device without one cannot ask anybody |
+| the desktop companion | `scripts/install.sh:843`, header `:36-40` | the companion is the device's consent **prompt surface**; a "Prompt on host" device without one cannot ask anybody |
 | digest verification | `scripts/install.sh:219-228` | soft-skips when a release publishes no digest — tolerable in a terminal, **not** for a GUI that elevates to root (Phase B fails closed instead) |
 
 ## The mechanism, in the code (master `b4e72ff0d`)
@@ -325,7 +325,7 @@ flowchart TB
 
 1. **The seam is decided by a spike (B0), then recorded here before B1.** The candidates:
    - **(i)** Run the whole script elevated. This breaks the per-user Linux path, which runs
-     `systemctl --user` as the invoking user (`install.sh:733`); under `pkexec` that is root's
+     `systemctl --user` as the invoking user (`install.sh:736`); under `pkexec` that is root's
      user manager.
    - **(ii)** Give `install.sh` a privileged-steps entry point and a user-steps entry point.
      The terminal path calls both in order and does not change; the wizard elevates only the

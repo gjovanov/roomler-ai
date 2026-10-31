@@ -623,6 +623,94 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   display, so "Connect" drops you into a live console.
 - Design notes for the tarball/self-update path: [linux-self-update.md](linux-self-update.md).
 
+### What a bare host needs (#3204)
+
+The daemon's `.deb` has to start on a host with nothing on it: a bare server, a
+container, a cluster node. FFmpeg, libvpx and libva ride in the package, so
+`depends` is short (`agents/roomlerd/Cargo.toml:1024`), and every name in it backs
+a library the binary links directly:
+
+| `Depends` | Why it reads this way |
+|---|---|
+| `libasound2t64 (>= 1.0.29) \| libasound2 (>= 1.0.29)` | ALSA, for the Opus system-audio track. The binary binds its symbols at load, so it must be the real library. See below |
+| `libssl3t64 (>= 3.0.0) \| libssl3 (>= 3.0.0)` | `libssl.so.3` and `libcrypto.so.3`. The first name is Ubuntu 24.04's and Debian 13's, the second Ubuntu 22.04's and Debian 12's. Debian 12's base image has neither |
+| `libc6`, `libxcb1`, `libxcb-shm0`, `libxcb-randr0` | One name on every release we support |
+
+⚠️ **The ALSA line looks over-specified, and every part of it is load-bearing.** From
+Ubuntu 24.04 and Debian 13 the library is `libasound2t64`, and `libasound2` is a
+virtual name. Ubuntu's other provider of that name is `liboss4-salsa-asound2`, a
+stub without the symbols the daemon binds: the package installs with exit 0, and
+the daemon dies with `undefined symbol: snd_device_name_get_hint`. The real
+packages' `Provides` carry a version and the stub's do not, so only a versioned
+dependency refuses it. Measured on the released binary:
+
+| Spelling | Fresh 24.04 | 24.04 with the stub already installed |
+|---|---|---|
+| `libasound2` (0.4.191 and earlier) | **the stub**: cannot start | stays on the stub: cannot start |
+| `libasound2t64 \| libasound2` | the real library | **stays on the stub**: cannot start |
+| `libasound2 (>= 1.0.29)` | the real library | **apt exits 100**, and `dpkg -i` plus `apt-get -f install` **removes the package** |
+| `libasound2t64 (>= 1.0.29) \| libasound2 (>= 1.0.29)` | the real library | **replaced by the real library**, through apt, `install.sh` and the updater |
+
+On Ubuntu 26.04 the stub provides `libasound2t64` as well, so an unversioned first
+alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives from
+the binary's symbols.
+
+Neither floor can strand a running daemon on the updater's offline `dpkg --install`
+rung (`agents/roomlerd/src/updater.rs:2299`), which is the reason libva and
+`iproute2` stay out of `depends`. A host where the daemon runs already has the real
+library and OpenSSL, because without them it cannot start. A healthy install
+upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,
+and loses nothing: its daemon could not start before either, so no updater runs
+there, and re-running the install heals it.
+
+**`install.sh` installs a `.deb` in two steps** (`deb_install`,
+`scripts/install.sh:1328`), and the wizard's root half is the same code:
+
+```mermaid
+flowchart TD
+    A["dpkg -i pkg.deb"] -->|"the dependencies are here"| OK["installed, no mirror needed"]
+    A -->|"one is missing: dpkg leaves the package half-configured"| B["apt-get update<br/>(a failure only warns)"]
+    B --> C["apt-get install -y --fix-broken pkg.deb"]
+    C -->|resolved| OK
+    C -->|"cannot fetch it"| F["exit 100, and the script stops.<br/>Nothing is removed, and what dpkg unpacked stays"]
+```
+
+⚠️ **Never `apt-get -f install` with no package named.** When it cannot reach a
+dependency it "fixes" the host by removing the package it was meant to finish, and
+exits 0. Naming the package keeps it in apt's solution, so apt refuses instead.
+`--fix-broken` has to stay as well: without it apt will not touch a package dpkg
+left half-configured.
+
+| State | `dpkg -i \|\| apt-get -f install -y` (until #3204) | `deb_install` |
+|---|---|---|
+| a fresh image, no package lists | **package removed**, exit 0 | fetches the lists and installs |
+| a working daemon, nothing reachable, and a new package that wants something this host lacks | **daemon deleted**, exit 0 | exit 100, and the daemon still runs |
+| Ubuntu 26.04 with the stub installed | **package removed**, exit 0 | replaces the stub and starts |
+
+The companion takes the same two steps and comes off again if they fail, because a
+half-configured companion blocks apt for the whole host. The CLI's arm keeps
+`apt-get -f install` on purpose: it checks the result and falls back to the tarball
+(`scripts/install.sh:1062`, #2472).
+
+**What checks all this.** `scripts/deb-bare-check.sh` installs the finished packages
+on Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13, with
+`--no-install-recommends`, because a Recommends can carry a library a Depends forgot
+(that is how `libssl3` hid on Debian 12: apt's default install started there, and
+`install.sh`'s path did not). It installs them again through the real `install.sh`
+on an image with no package lists. Then it starts what they ship: every library
+resolves under `ldd`, and `roomlerd --version`, `roomler --version` and
+`roomlerd encoder-smoke` run. The companion needs a display to get past `main`, so
+the loader check is all a bare image can ask of it.
+
+| Lane | What goes through it |
+|---|---|
+| `release-agent.yml`, `verify-linux-debs` (`.github/workflows/release-agent.yml:1325`) | The packages about to be published, x86_64 and aarch64. `release` needs it, so a package that fails here is never published |
+| `deb-bare-image.yml` | A PR that changes what a package declares: the latest release's binaries under the checkout's control file, through the lane's own `cargo deb`. A control step proves the check still refuses agent-v0.4.190 |
+
+⚠️ The lane's earlier "Verify the bundled agent loads" step proves the **bundle**,
+not the package. Its package list is written by hand, so it named the real ALSA
+library and passed while a bare 24.04 got the stub.
+
 ### The wizard on Linux (FR-129 B1)
 
 The same `roomler-setup` wizard that installs the daemon on Windows installs it
@@ -643,7 +731,7 @@ sequenceDiagram
     W->>P: pkexec /bin/sh #lt;script#gt; --privileged-steps --role daemon --server … --name … --desktop [--system --config-from #lt;file#gt;]
     P-->>W: ONE password dialog (GNOME Shell / KDE)
     P->>R: as root, its stdout and stderr to files in the scratch dir
-    R->>R: resolve · sha256 (REQUIRED) · dpkg -i / tarball · FR-96 helper · companion .deb/.rpm
+    R->>R: resolve · sha256 (REQUIRED) · deb_install / tarball · FR-96 helper · companion .deb/.rpm
     R->>R: --system: roomlerd adopt-enrollment folds the file into an existing config (#35;2338), then enable or RESTART roomlerd.service
     R-->>W: lines tailed as written · exit 0 (file shredded) · before its first line: 126 = cancelled, 127 = no prompt → the terminal command · after it: the script's own exit
     Note over W: per-user scope: enroll in-process now, folded into ~/.config/roomler/config.toml, then make the unit's folders
@@ -1424,7 +1512,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1261` (the section) — `uninstall_linux` at `:1687`,
+`scripts/install.sh:1270` (the section) — `uninstall_linux` at `:1714`,
 `uninstall_macos` at `:1494`.
 
 ```mermaid

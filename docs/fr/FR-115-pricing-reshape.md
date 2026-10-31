@@ -212,7 +212,7 @@ session ending or Business. Kill switch `rc.org_session_cap = false`.
 session of the device's org, so the count is complete for a same-org session. A cross-org
 session breaks that assumption: the org that pays is the controller's, and its sessions live
 on whichever pods hold the devices they reach. Today FR-52's external path opens its session
-uncapped (`crates/modules/remote/src/extauth.rs:305`), waiting for this phase. P3's own count
+uncapped (`crates/modules/remote/src/extauth.rs:318`), waiting for this phase. P3's own count
 also has a documented race: the count and the insert are two steps, so two starts in the same
 instant can both pass (`hub.rs:1666`).
 
@@ -271,7 +271,7 @@ sequenceDiagram
   P3's hub count stays as the fallback.
 
 **Whose quota an external session uses (O6 + O7, decided by the operator 2026-10-20).** FR-52's
-outsider is an account (`docs/fr/FR-52-cross-org-remote-access.md:388`). That account is not a
+outsider is an account (`docs/fr/FR-52-cross-org-remote-access.md:421`). That account is not a
 member of the device's org, and it may belong to several orgs of its own, or to none.
 
 - **No paid org is needed (O7).** Any account that may start an external session today still may.
