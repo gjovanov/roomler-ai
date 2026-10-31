@@ -1,8 +1,78 @@
 # FR-62 — Encoder rate changes without an IDR
 
-**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; **both** recorded causes are REFUTED (the second by measurement on 0.4.62); patch 0004 is what is left; A1 shipped inert; A2 + const flip shipped (0.4.51) · **A3 — AMF measured** on the Radeon 610M (0.4.187, 2026-10-29): a rebuild on every rung, **41–55 ms, 20/20 IDRs** — the 0.4.187 harness filed them as periodic, fixed in the same PR; VideoToolbox still unmeasured · NVENC re-read on the released 0.4.187: **0/20** · docs: [`encoders.md` § A rate move, per backend](../encoders.md#a-rate-move-per-backend-fr-62) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
+**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; **both** recorded causes are REFUTED (the second by measurement on 0.4.62); patch 0004 is what is left; A1 shipped inert; A2 + const flip shipped (0.4.51) · **A3 — AMF measured** on the Radeon 610M (0.4.187, 2026-10-29): a rebuild on every rung, **41–55 ms, 20/20 IDRs** — the 0.4.187 harness filed them as periodic, fixed in the same PR; VideoToolbox still unmeasured · NVENC re-read on the released 0.4.187: **0/20** · docs: [`encoders.md` § A rate move, per backend](../encoders.md#a-rate-move-per-backend-fr-62) · the kill-switch registry (AC4's instrument): [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 ## Progress
+
+- **2026-10-31 — AC2/AC3's read corrected, AC4's registry built, AC4's sequencing recorded.**
+  - 🔑 **On NVENC the default build already moves the rate in place, with no IDR.**
+    `resolve_rate_mode` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:869`) returns
+    `InPlaceVbr` for every `*_nvenc` whatever `encoder_inplace_rate` says, and
+    `NVENC_RECONFIG_FORCES_IDR` (`:893`) has been `false` since patch 0001 shipped
+    (0.4.51). On NVENC the flag only sizes the VBV window that a move writes
+    (`inplace_rate_bufsize`, `encode/mod.rs:355`). So a constrained NVENC session needs
+    no config change to be read for AC2/AC3, and flipping the flag off does not produce
+    a RED (no IDR per rate step). The read's RED is a **positive control**: a viewer
+    resize that moves `dims_swaps` by one must move `idr_count` by exactly one. That
+    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7263`), which
+    keeps the encoder's counters. A read that cannot see that IDR cannot vouch for the
+    absence of the others.
+  - 🔑 **AC3's read, as written, could fail with no rate-caused IDR at all.** Its
+    inequality names two sources, and its read counted viewer requests from
+    `PLI/FIR → forcing keyframe` lines, which only the RTP path prints (`peer.rs:840`).
+    Every NVENC HEVC or AV1 session is on the DataChannel, where a viewer asks with
+    `rc:keyframe`. The FFmpeg DC pump has these sources:
+
+    | IDR source | Site (`peer.rs`) | What shows it |
+    |---|---|---|
+    | the opener, and one force per frame while the DC is not open yet | `:9502`, `:9508` | `dc_unopen_drops`. Baseline the read after the first heartbeat |
+    | a dims swap | `:7291` | `dims_swaps` |
+    | the viewer's `rc:keyframe`, sent when its decode queue backs up | `:10831` | `keyframe_requests` on `rc:session.stats`, every 30 s. Its log line is `debug!` |
+    | a drop-burst resync: the send channel filled, so the next enqueue forces an IDR | `:9579`, then `:9570` | nothing of its own. `frames_dropped_backpressure` shows the burst |
+    | a lock or unlock | `:8827` | the session's lock state |
+    | a settle keyframe | `:8053` | suppressed on a constrained session (`settle_kf_suppressed`) |
+    | a force unanswered for 4 s | `:8849` | one log line per episode |
+
+    The drop-burst resync is the one that matters: it is what a congested relay does,
+    and it is neither a dims change nor a viewer request. So the read is per window, on
+    the heartbeat's cumulative counters: **every Δ`idr_count` must have a Δ`dims_swaps`, a
+    Δ`frames_dropped_backpressure`, a `keyframe_requests` tick or a lock edge beside it.
+    An unexplained IDR in a window with Δ`rate_moves` > 0 is the RED.** The session must
+    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:8776`)
+    builds a new encoder whose counters restart at zero, so a window across one is not
+    diffed.
+  - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
+    - `target_bps` is `governor.applied_bps()`, the raw target. The encoder's maxrate
+      is that target's nearest rung (`coarsen_bitrate`, `encode/aimd.rs:317`, applied in
+      `set_bitrate`, `encoder.rs:3006`). So the read is against `coarsen_bitrate(target_bps)
+      ÷ target_fps ÷ 8`. Against the raw target a perfect encoder reads off by the rung's
+      distance.
+    - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung
+      and move nothing. Δ`rate_moves` marks a real move. The read judges the first
+      complete 2 s heartbeat window (`peer.rs:6717`) after a Δ`rate_moves`, on
+      Δ`bytes_written` ÷ Δ`frames_encoded`. A window that starts at most 2 s after the
+      move and holds the ratio shows the encoder had tracked by then.
+    - ≈ 1.0 is a CBR's contract. NVENC is quality-capped VBR and sits under its cap on
+      compressible content, the same reason the A0 sweep gates only QSV on the ratio. The
+      session needs motion that saturates the cap. Outside such windows the read is
+      one-sided: no overshoot.
+  - **The cell.** Of the org's test hosts, only two have NVENC: the dev box (the
+    operator's own machine, never a test target) and CORPLAP-2, a corporate laptop
+    whose `av1_nvenc` sessions relay over its VPN without any pin. So AC2/AC3 wait for
+    the operator to choose the cell. The other test hosts are QSV laptops, AMD VAAPI
+    servers, a VideoToolbox Mac and a server with no GPU.
+  - **AC4's instrument exists.** Plan rule 4's table is now
+    [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4).
+    It lists 18 switches with the evidence that retires each and the phase that
+    deletes it, plus the four A4 heuristics that have no switch of their own, each
+    with its plan precondition and its state. Nothing has been deleted.
+  - **Why A4 does not start now.** The plan sequences A4's deletions after FR-63's B2
+    flip plus one release soak (Sequencing row 5), and every A4 row's precondition is
+    unmet: row 1 needs "A0 passes on QSV", which failed; row 2 needs VideoToolbox
+    measured, and QSV still needs the ladder; row 3 is marked "a behavioral decision for
+    the post-soak pass" in the code (`encode/governor.rs:1017`). Found on the way:
+    B3b deletes `aimd.rs` whole, the coarsen ladder included, and the plan predates
+    A0-QSV. Whatever replaces the AIMD must carry QSV's rationing forward.
 
 - **2026-10-29 — A3 (AMF), the released-build re-read, and the harness's attribution fix.**
   - `hevc_nvenc` on the released **0.4.187** (RTX 5090 Laptop, the same GPU as the 2026-09-02 read):
@@ -155,18 +225,25 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
       Not read yet: it needs a **relayed** NVENC pair (`constrained=true` in the heartbeat, a public
       relay candidate in the nominated pair) for five minutes with real desktop motion. The only
       sessions the dev box's agent saw on 2026-10-29 were direct (`constrained=false`), and a direct
-      path at a 25 M rung is not the cell. The read: per heartbeat window, `bytes_written` ÷
-      `frames_encoded` against `target_bps ÷ target_fps ÷ 8`, judged at the first window after each
-      `DC pump set_bitrate (AIMD)` line.
+      path at a 25 M rung is not the cell. The read: per heartbeat window, Δ`bytes_written` ÷
+      Δ`frames_encoded` against `coarsen_bitrate(target_bps) ÷ target_fps ÷ 8`, judged at the first
+      complete window after each Δ`rate_moves`, under motion that saturates the cap (the corrected
+      read, 2026-10-31 above). The default build is the arm under test: NVENC applies in place with
+      no flag. The only NVENC test host that is not the dev box is CORPLAP-2 over its VPN, so the
+      operator picks the cell.
 - [ ] AC3 — A 5-minute constrained session's `idr_count` ≤ dims changes + viewer keyframe requests.
-      Same session as AC2: `idr_count` against `dims_swaps` plus the session's `PLI/FIR → forcing
-      keyframe` lines. (The 2026-10-29 direct session read `idr_count=2` with `dims_swaps=1` and the
-      opener — consistent, but direct, so not this criterion's cell.)
+      Same session as AC2, read per window: every Δ`idr_count` needs a Δ`dims_swaps`, a
+      Δ`frames_dropped_backpressure`, a `keyframe_requests` tick or a lock edge beside it, and an
+      unexplained IDR beside a Δ`rate_moves` is the RED (the corrected read, 2026-10-31 above). (The
+      2026-10-29 direct session read `idr_count=2` with `dims_swaps=1` and the opener — consistent,
+      but direct, so not this criterion's cell.) The positive control comes first: a viewer resize
+      that moves `dims_swaps` by one must move `idr_count` by exactly one.
 - [ ] AC4 — Every deleted heuristic's kill switch is retired through the registry table with its evidence.
-      No heuristic has been deleted yet (A4 has not started), and the registry table the plan names
-      (`rate-control-architecture.md`, rule 4: switch, default, evidence to flip, retire-by release,
-      deletion PR) does not exist. `encoders.md` § "A rate move, per backend" carries this FR's
-      three switches with their retirement conditions as the seed for it.
+      No heuristic has been deleted yet (A4 has not started). The registry table the plan names
+      (`rate-control-architecture.md`, rule 4) exists since 2026-10-31:
+      [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4),
+      18 switches plus the four A4 heuristics with no switch. Blocked on FR-63's B2 flip plus one
+      release soak, where the plan sequences every deletion, and on each row's own precondition.
 - [x] AC5 — `encoder_inplace_rate = false` restores today's behaviour byte-for-byte (unit test + field check).
       Unit: `encoder::tests::rate_mode_resolves_per_backend_and_flag` (OFF ⇒ `Rebuild` for QSV,
       `InPlaceVbr` for NVENC) and `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window`
@@ -193,6 +270,11 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
 
 ## Open decisions
 
+- **The AC2/AC3 cell** (the operator's): CORPLAP-2 over its VPN, a rented NVIDIA host, or an
+  operator-run session against the read above.
+- **AC2 and AC3's wording.** AC3's inequality omits the opener and the drop-burst resync, and AC2's
+  ≈ 1.0 is a CBR's contract. Both keep their wording until the read is in hand; the 2026-10-31 entry
+  above says what the read will judge. The operator decides whether they are amended.
 - VideoToolbox: patch 0002 vs. "rebuild at settle, ≥ 15 s apart" (A0 on a Mac decides).
 - Whether to attach `mfxExtEncoderResetOption{StartNewSequence=OFF}` (patch 0004) if any QSV driver starts a new sequence on Reset.
 

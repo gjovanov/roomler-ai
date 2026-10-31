@@ -913,7 +913,7 @@ rung, never the target.
 | `rebuilds` | synchronous reopens, the inline arm |
 | `swaps` | background-rebuilt encoders adopted. Read it beside the two above: on a direct QSV session every rate move lands here and only here (FR-65) |
 | `dims_swaps` | reopens for a resolution change (FR-70 M2) |
-| `idr_count` | every keyframe the encoder emitted. Read against `dims_swaps` and the session's `PLI/FIR → forcing keyframe` lines (`peer.rs:840`) to isolate the rate-caused ones |
+| `idr_count` | every keyframe the encoder emitted. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:840`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
 **The read for any host** — the FR-62 A0 sweep (`app.rs:6295`):
@@ -956,12 +956,16 @@ FFmpeg it links cannot disagree. The macOS builder carries no patch today.
 | Switch | Default | What it does | Retires when |
 |---|---|---|---|
 | `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:342`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:355`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
-| `ROOMLERD_ENCODER_NVENC_ASSUME_IDR` (`:354`) | off | reverts NVENC to the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` |
-| `bg_rebuild_constrained` (`:498`) | on | a constrained session's rebuild runs off-thread (#1254), adopted at quiet | never while a rebuild backend exists |
+| `ROOMLERD_ENCODER_NVENC_ASSUME_IDR` (`:371`) | off | reverts NVENC to the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` |
+| `bg_rebuild_constrained` (`:515`) | on | a constrained session's rebuild runs off-thread (#1254), adopted at quiet | never while a rebuild backend exists |
 
 **Open**: QSV's `mfxExtEncoderResetOption` (patch 0004, an FFmpeg-level change),
 VideoToolbox's A0 on a Mac, and A4's per-backend retirements — NVENC can shed its
 rationing, QSV keeps `coarsen_bitrate`, and AMF, D3D12 and Vulkan keep it for the IDR.
+
+Every rate-control switch, with the evidence that retires it and the phase that
+deletes it, is in the registry:
+[`rate-control.md` § Kill switches](rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4).
 
 ## Software encoders: the clock and 60 fps (FR-112)
 
