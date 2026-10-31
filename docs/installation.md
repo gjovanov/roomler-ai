@@ -635,6 +635,9 @@ sequenceDiagram
     U->>U: systemctl --user enable --now roomler.service (restarted beside an enabled helper)
 ```
 
+- **The wizard needs WebKitGTK 4.1.** The Fedora KDE lab image lacked it
+  (`sudo dnf install webkit2gtk4.1`). On Debian and Ubuntu the package is
+  `libwebkit2gtk-4.1-0`.
 - **The cards appear only when the chosen server says so**: the wizard reads
   `GET /api/setup/features` and shows the Linux cards on a JSON
   `wizard_linux_daemon: true`, or on `wizard_unix_daemon: true`, which a server
