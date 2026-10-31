@@ -363,7 +363,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 
 ### 2.9 Equal on all three: not parity, recorded so nobody files them here
 
-Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:10466`), a curtain or
+Multi-monitor streaming and switching (the viewer always sends `mon: 0`, `useRemoteControl.ts:10504`), a curtain or
 privacy mode, touch injection, a live microphone (two-way audio), OS toast notifications
 (`crates/agent-core/src/notify.rs:21-24`), file copy-paste through the clipboard, minidumps, and SSH agent and X11
 forwarding. Several deserve FRs of their own; none is a platform gap.

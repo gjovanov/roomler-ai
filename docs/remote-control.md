@@ -322,7 +322,7 @@ flowchart LR
   - **The browser's end is its best device** (`browser_reach`, `crates/modules/network/src/hooks.rs:154`). One that measured the far TURN alive decides, because a WSL agent with no UDP out says nothing about the Windows browser beside it. Otherwise one that measured it dead decides, so a device that was not measured cannot hide a dead one.
   - **The rule** is `far_turn_verdict` (`crates/modules/network/src/hooks.rs:168`): either end measured dead is `false`; both measured alive is `true`; anything else is not measured.
   - The gate waits at most 500 ms, then sends no hint. A slow read costs the hint, never the session.
-- **Which devices are the browser's** follows the Hub's own precedence (`viewer_devices_of`, `controller.rs:666`). Probed descriptors win over named devices, and every one the Hub hands out counts, through the Hub's own `bounded_relays` and `named_devices` (`crates/modules/fleet/src/hub.rs:104`, `:125`). The browser sends them all: the first as `local_relay`, the rest as `local_relay_also` (`ui/src/composables/useRemoteControl.ts:4158`).
+- **Which devices are the browser's** follows the Hub's own precedence (`viewer_devices_of`, `controller.rs:666`). Probed descriptors win over named devices, and every one the Hub hands out counts, through the Hub's own `bounded_relays` and `named_devices` (`crates/modules/fleet/src/hub.rs:104`, `:125`). The browser sends them all: the first as `local_relay`, the rest as `local_relay_also` (`ui/src/composables/useRemoteControl.ts:4183`).
 - **The target folds in its own netcheck** at the offer (D8): one LocalAPI `status` call beside the `peers` call (`own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:351`). If that netcheck found no UDP out, the far TURN is dead whatever the server saw (`with_own_reach`, `:370`). This is what measures a Mac: its RC target is the GUI worker's row, and that row has no overlay node for the hook to find (`find_live_by_agent`, `crates/services/src/dao/overlay_node.rs:413`). The per-user half answers `status` itself, so it lends the root daemon's netcheck along with the rest of the machine's network fields (`with_machine_network`, `agents/roomlerd/src/person_socket.rs:223`).
 - **The Hub** reads `auto` as `off` for an agent that does not advertise `rc-overlay-auto` (`effective_rc_overlay`, `crates/modules/fleet/src/hub.rs:2767`). It decides this once per request, for the relay and the session alike.
 - **Under `auto` the Hub hands out the browser's relays** to both ends, as under `on` (`resolve_local_relay`, `hub.rs:3461`; `forward_offer`, `:2316`). The agent may yet take them, and it filters out itself whichever it leaves off the mesh.
@@ -370,7 +370,7 @@ credential, minted by the device and re-minted every 30 minutes, so nothing logs
 > ⚠️ **On Chrome 156, a TURN server on 127.0.0.1 is no path from roomler.ai** (measured on neo16, 2026-10-29). There
 > is no candidate and no error. Yet example.com reaches the same server, and roomler.ai reaches it on the device's
 > overlay address (FR-121 §3.7). A named device's relay is handed over and the target allocates on it, but the browser
-> gathers nothing from `turn:127.0.0.1:<port>` (`localRelayIceServer`, `ui/src/composables/useRemoteControl.ts:4226`),
+> gathers nothing from `turn:127.0.0.1:<port>` (`localRelayIceServer`, `ui/src/composables/useRemoteControl.ts:4251`),
 > and the session rides the far TURN. Which address to hand the browser is FR-121's open decision 5.
 
 **More than one agent on one computer (FR-121 P3b, #2774).** Windows and WSL under mirrored networking share
@@ -1242,7 +1242,7 @@ The agent does **not** render the cursor into the captured frame (it tells the O
 ### 6.3 One owner per key — the soft keyboard beside a hardware keyboard (#2888)
 
 The viewer has two places a key can enter the host from. The window-level
-CAPTURE listener (`attachInput`, `useRemoteControl.ts:12421`) sees every key
+CAPTURE listener (`attachInput`, `useRemoteControl.ts:12459`) sees every key
 first and forwards it — `key_text` for a printable character, a HID `key` frame
 otherwise. The soft keyboard (`MobileKeyboard.vue`) is an off-screen textarea
 whose focus brings up the OS keyboard; its typing arrives as `input` events
@@ -1285,7 +1285,7 @@ pre-fix run.
 | Ctrl+Alt+End | End forwarded, no SAS | SAS (derived) | SAS once, no End |
 | sticky toolbar Ctrl, then `c` | `L text:"c"` + `S` Ctrl+C — **twice, and the host's text first** | same | `S` Ctrl+C — once, the modifier cleared |
 
-The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14601`, pure)
+The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14639`, pure)
 and carried out by `applyKeyRoute` (`:14334`): a key whose target is the soft
 keyboard's textarea (`isSoftKeyboardTarget`, `:14075` — the same
 `data-rc-capture` attribute `isViewerOwnInput` exempts) is **driving**, like a
@@ -1354,13 +1354,13 @@ composition.
 ⚠️ **A paste has one owner too** (#2910). Two `paste` listeners sit on
 `window`: the files drawer's `onWindowPasteForDrawer`
 (`RemoteControl.vue:3402`), registered at mount (`:5634`), and the deferred
-Ctrl+V's `onPaste` (`useRemoteControl.ts:12167`), registered later by
+Ctrl+V's `onPaste` (`useRemoteControl.ts:12205`), registered later by
 `attachInput` (`:12006`). Same node, same phase, so the drawer's runs
 **first** — and `preventDefault` stops no other listener on the same node.
 With the drawer open, a Ctrl+V over the stage with files on the clipboard
 uploaded every file twice: into the drawer's directory, then again into the
 default folder. Now each half steps aside for the other: `drawerPasteFiles`
-(`useRemoteControl.ts:14810`) returns nothing for a paste already consumed,
+(`useRemoteControl.ts:14848`) returns nothing for a paste already consumed,
 and `routeDeferredPaste` (`:14427`) answers `taken` for one the drawer
 consumed — the deferred chord is dropped, with no keystroke and no second
 upload (`:11843`). Whichever listener runs first owns the paste, so a future
@@ -2520,7 +2520,7 @@ sequenceDiagram
 
 | Piece | What it does | Where |
 |---|---|---|
-| the message | `{t: 'rc:decode-error', stage, path, codec, error}`: `stage` is `configure` (the decoder's `configure()`), `decode` (its error callback, or `decode()` throwing) or `pipe` (the RTP transform's reader or pipe); `path` is `webcodecs`, `vp9-444` or `hevc`; the codec and the message are cut to 64 and 160 characters | `decodeErrorWireMessage`, `ui/src/composables/useRemoteControl.ts:2449`; sent by `reportDecodeError` (`:7337`) from all three worker handlers |
+| the message | `{t: 'rc:decode-error', stage, path, codec, error}`: `stage` is `configure` (the decoder's `configure()`), `decode` (its error callback, or `decode()` throwing) or `pipe` (the RTP transform's reader or pipe); `path` is `webcodecs`, `vp9-444` or `hevc`; the codec and the message are cut to 64 and 160 characters | `decodeErrorWireMessage`, `ui/src/composables/useRemoteControl.ts:2449`; sent by `reportDecodeError` (`:7362`) from all three worker handlers |
 | the counted marker | every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts and a zero is a measured one | `useRemoteControl.ts:2424`; read by `viewer_counts_decode_errors`, `agents/roomlerd/src/peer.rs:10321` |
 | the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:10835`; `viewer_decode_error`, `peer.rs:10296` |
 | the count | per session, saturating; `None` until the viewer counts, so absent means **not counted**; carried to a new peer when a re-offer replaces one, as the clipboard tallies are | `SessionCounters::note_decode_error` / `decode_errors` / `carry_decode_errors`, `agents/roomlerd/src/session_telemetry.rs:162` |
@@ -2674,7 +2674,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:9076`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:9112`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark
@@ -2777,7 +2777,7 @@ leaves **no server row at all** (the request never reached a hub), and
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
-the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4869`)
+the ladder advancing past it — `logConnectTiming` (`useRemoteControl.ts:4894`)
 posts **one record**: the console line, persisted.
 
 ```jsonc
@@ -2810,7 +2810,7 @@ posts **one record**: the console line, persisted.
 | outcome | means | snackbar |
 |---|---|---|
 | `first_frame` | the attempt painted; `ttff_ms` is set | per the rules above |
-| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:4523`) | stall warning |
+| `abandoned` | a phase bound fired (`armSignalingTimeout`, `useRemoteControl.ts:4548`) | stall warning |
 | `closed` | the operator hung up, the view unmounted, or a terminal `rc:error` failed it (`error_code` says which) | none |
 | `retried` | the ladder advanced past a live attempt for another reason — a transient `rc:error` it rides, an ICE failure, dead air before the first frame (`scheduleReconnect`, `:7196`) | none |
 
@@ -3432,10 +3432,10 @@ to-activate, so the browser never sees a bait-and-switch.
   together therefore both failed. The field saw it 9 ms apart, and a drop
   while a long upload runs does the same. Every upload source ends in
   `uploadOne`, so it takes a place in the session's queue there
-  ([`useRemoteControl.ts:12829`](../ui/src/composables/useRemoteControl.ts#L12829),
-  `createUploadQueue` at `useRemoteControl.ts:14842`). The transfer shows
+  ([`useRemoteControl.ts:12867`](../ui/src/composables/useRemoteControl.ts#L12867),
+  `createUploadQueue` at `useRemoteControl.ts:14880`). The transfer shows
   as `queued` at once, and its `files:begin` waits until every earlier
-  upload has settled (`useRemoteControl.ts:13079`). ⚠️ The next place
+  upload has settled (`useRemoteControl.ts:13117`). ⚠️ The next place
   waits for this one's turn AND its settle.
   So an upload cancelled while queued cannot let the one behind it start
   while an earlier one is still on the wire.
@@ -3444,10 +3444,10 @@ to-activate, so the browser never sees a bait-and-switch.
   outside the active user's profile (FR-84 D4), a path that is not a
   directory, or the agent's own state. It says why only in its own log. The
   viewer learns of the fallback from the completed `path`
-  (`uploadLandedIn`, `useRemoteControl.ts:14877`, which compares whole segments:
+  (`uploadLandedIn`, `useRemoteControl.ts:14915`, which compares whole segments:
   `/tmp/x` does not hold `/tmp/xy`). A file that landed outside the folder
   the person chose is a warning that names where it went
-  (`uploadOutcomeMessage`, `useRemoteControl.ts:14900`), not "Uploaded".
+  (`uploadOutcomeMessage`, `useRemoteControl.ts:14938`), not "Uploaded".
 - **Remote Apps on the control DC** (FR-56, [`remote-apps.md`](remote-apps.md)):
   `rc:apps.list` / `rc:apps.focus` / `rc:apps.launch` and their `*.reply`,
   id-correlated like `rc:logs-fetch`, handled off-thread in
@@ -3791,8 +3791,8 @@ from (`ui/src/workers/rc-decoder-config.ts:38`). The override wins over whatever
 | | |
 |---|---|
 | **Paths** | the three decode workers: `rc-vp9-444-worker` (VP9, AV1 and H.264 over the data channel), `rc-hevc-worker`, and `rc-webcodecs-worker` (the RTP transform; its flag rides the transform's options, because the transform can start before the canvas arrives). The `<video>` element has no such control and decodes true once the agent describes its stream (FR-130 P1) |
-| **Sessions** | every one, from every agent (`ui/src/composables/useRemoteControl.ts:11095`). Every agent so far converts with BT.601 limited, the oldest included. For VP9 this is the only fix: Chrome's WebCodecs ignores VP9's own colour space ([FR-130 §2.5](fr/FR-130-colours-decode-true.md#25-p0-what-chrome-does-with-each-description-2026-10-30)) |
-| **Kill switch** | `localStorage.setItem('roomler-rc-colorspace', 'off')`, then reconnect (`ui/src/composables/useRemoteControl.ts:4215`). The decoders are no longer told, and the console says so at connect |
+| **Sessions** | every one, from every agent (`ui/src/composables/useRemoteControl.ts:11133`). Every agent so far converts with BT.601 limited, the oldest included. For VP9 this is the only fix: Chrome's WebCodecs ignores VP9's own colour space ([FR-130 §2.5](fr/FR-130-colours-decode-true.md#25-p0-what-chrome-does-with-each-description-2026-10-30)) |
+| **Kill switch** | `localStorage.setItem('roomler-rc-colorspace', 'off')`, then reconnect (`ui/src/composables/useRemoteControl.ts:4240`). The decoders are no longer told, and the console says so at connect |
 | **A browser that refuses it** | keeps its picture (`ui/src/workers/rc-decoder-config.ts:93`). A `configure()` that throws on the colour space goes again without it. A decoder that fails before its first frame with it set is rebuilt once without it, and it waits for a key frame, which it asks the agent for. One console line names the case: `decoder colour space dropped (FR-130 P2)` |
 | **Reading it** | each worker's `decoder configured` line in the console names the colour space `configure()` was told, and its `first frame` line the one the decoder says it produced. With the override, that is `matrix=smpte170m primaries=bt709 transfer=iec61966-2-1 range=limited` |
 | **In the field** | on a capture with no colour management ([FR-130 §8](fr/FR-130-colours-decode-true.md#8-field-verification-log)). A VP9 4:4:4 session from a 0.4.187 agent, which writes no description, reads within 1 code value of the source with the override, on the blit and FSR paths, and shows #3049's shift with the kill switch on. From 0.4.188, which describes its stream, the same session reads the same with the override and still shifts without it: Chrome ignores VP9's own colour space. H.264 into `<video>`, which the override cannot reach, decodes true from 0.4.188 and shifts from 0.4.187 or with `color_description = off`. From the hardware encoders on 0.4.188 (NVENC, QSV, VideoToolbox), HEVC and AV1 read within 1 of the pixels as captured with the override, on blit and FSR, and without it on blit; H.264 was read without it (`h264_nvenc` 4:4:4 within 2, from quantization). The decoder reports the same set S either way, so the two levers agree and nothing is corrected twice |

@@ -4133,6 +4133,31 @@ export function withLocalRelays(
   }
 }
 
+/** FR-52 P5 (F3) — `cfg` with the ICE servers `rc:ready` carried in place of
+ *  the pre-fetch's; every other setting kept, because `setConfiguration`
+ *  refuses to change them. An outsider's pre-fetch cannot be charged (they are
+ *  no member of the device's org and never learn its ids), so relay bytes on
+ *  it would be nobody's. The Hub issues `rc:ready`'s under the session's org,
+ *  the device's. A frame with no usable TURN server leaves `cfg` as it is:
+ *  connecting uncharged beats not connecting. Pure + exported for tests. */
+export function withSessionIceServers(cfg: RTCConfiguration, servers: unknown): RTCConfiguration {
+  if (!Array.isArray(servers)) return cfg
+  const usable = servers.filter(
+    (s): s is IceServer =>
+      typeof s === 'object' &&
+      s !== null &&
+      Array.isArray((s as IceServer).urls) &&
+      (s as IceServer).urls.length > 0,
+  )
+  const hasTurn = usable.some(
+    (s) =>
+      typeof s.username === 'string' &&
+      typeof s.credential === 'string' &&
+      s.urls.some((u) => /^turns?:/.test(u)),
+  )
+  return hasTurn ? { ...cfg, iceServers: usable as RTCIceServer[] } : cfg
+}
+
 /** FR-121 — the relays `rc:session.created` hands over: `local_relay`, then
  *  `local_relay_also` (P3b), each checked as the untrusted descriptor it is.
  *  Pure + exported for tests. */
@@ -8880,6 +8905,17 @@ export function useRemoteControl(
       markConnect('ready')
       phase.value = 'negotiating'
       armSignalingTimeout()
+      // FR-52 P5 (F3) — an external session's relay is charged to the device's
+      // org, on the credentials this frame carries. Before the offer, whose
+      // gathering is the first to use them, so no allocation is ever made on
+      // the uncharged pre-fetch.
+      if (externalMode) {
+        try {
+          livePc.setConfiguration(withSessionIceServers(livePc.getConfiguration(), msg.ice_servers))
+        } catch (e) {
+          console.warn('[rc] could not take the session TURN credentials', e)
+        }
+      }
       try {
         const offer = await livePc.createOffer()
         await livePc.setLocalDescription(offer)
@@ -9648,7 +9684,9 @@ export function useRemoteControl(
 
     // Pull TURN creds before creating the PC so the first gather uses them.
     // FR-115 P4b — charged to the device's org; an external session names
-    // neither id (its device is a connect code here), so it stays uncharged.
+    // neither id (its device is a connect code here), so this one stays
+    // uncharged and `rc:ready` replaces it before the first gathering (FR-52
+    // P5, F3).
     let iceServers: IceServer[] = []
     try {
       const creds = await api.get<TurnCredsResponse>(
