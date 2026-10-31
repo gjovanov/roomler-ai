@@ -671,8 +671,8 @@ cascades and `--name` are hardware by construction, so they always ask.
   the spread before comparing two hosts: the reference run below did, on a busy machine.
 - ⚠️ **One frame rate and one size to a comparison.** At `--bench-fps 60` a frame carries half the
   motion of one at 30, so it costs less whatever the clock does: set a paced row against a
-  back-to-back row at the same `--bench-fps`. Run one size per process: on a Windows laptop the
-  H.264 rows of a run's second, larger size read about twice as slow, on any core
+  back-to-back row at the same `--bench-fps`. Run one size per process: on a Windows laptop an
+  H.264 row that followed a VP9-444 row at a smaller size read about twice as slow, on any core
   ([FR-112 §9](fr/FR-112-software-encoding-at-60-fps.md#9-field-verification-log)).
 
 **Reference run** (2026-10-30). A release build with the Linux release lane's features

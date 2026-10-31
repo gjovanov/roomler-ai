@@ -1082,8 +1082,8 @@ flowchart LR
   A paced row well above its back-to-back twin is the trap. ⚠️ A flat row speaks for its own size only, so read a
   size that leaves the thread mostly idle: on the same Mac a 1920×1080 frame doubles at a 30 fps cadence and a
   3024×1964 frame does not move. ⚠️ Compare rows at one `--bench-fps` only: at 60 a frame carries half the motion, so
-  it costs less whatever the clock does. ⚠️ Run one size per process: on a Windows laptop the H.264 rows of a run's
-  second, larger size read about twice as slow on any core, for a reason not yet found.
+  it costs less whatever the clock does. ⚠️ Run one size per process: on a Windows laptop an H.264 row that followed
+  a VP9-444 row at a smaller size read about twice as slow on any core, for a reason not yet found.
 
   `ROOMLERD_ENCODER_CLOCK=1` in front of the same two lines gives the other arm (on Windows,
   `$env:ROOMLERD_ENCODER_CLOCK='1'` first). Each is a one-shot process, so no daemon restarts, and a release carries

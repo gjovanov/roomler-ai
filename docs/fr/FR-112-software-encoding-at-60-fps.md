@@ -536,8 +536,9 @@ ran at one `--bench-fps`.
   both hosts (18–26 ms where the row is clean), so there the pace, not the clock, decides the frame rate.
 - **Not measured:** what the request does (no release carries it yet), a live session, and a laptop on battery, the
   one case Microsoft documents. This laptop stayed on AC. No default moves on this.
-- ⚠️ **Wrong turn: a run's second size.** In runs with two sizes, the laptop's H.264 rows for the second, larger size
-  read about twice as slow: 1080p took 14–17 ms where a one-size run took 6–7. That looked like core placement, and
-  it is not. Pinned to the fast cores the row still read 13.4 ms, where one fast core reads 5.7 ms in a one-size run.
-  The desktop does not do it, and the cause was not found. The tables keep to rows that ran first, and the bench's
-  method is now one size per process.
+- ⚠️ **Wrong turn: an H.264 row after a smaller VP9-444 row.** In runs with both codecs and two sizes, the laptop's
+  H.264 rows for the larger size read about twice as slow: 1080p took 14–17 ms where a one-size run took 6–7. That
+  looked like core placement, and it is not. Pinned to the fast cores the row still read 13.4 ms, where one fast core
+  reads 5.7 ms in a one-size run. It takes both conditions: H.264 alone at two sizes stays near 6.2 ms, and VP9-444
+  then H.264 at one size does too. The desktop does not do it, and the cause was not found. The tables keep to rows
+  that ran clean, and the bench's method is now one size per process.
