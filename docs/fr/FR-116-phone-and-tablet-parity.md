@@ -48,7 +48,7 @@ At 820 px (a portrait tablet) the same one-column cards stretched every select t
 ### 2.2 Every page: a 4 px sideways scroll
 
 The house padding is `pa-2` (8 px) on phones (`docs/ui.md` § Responsive page padding), and a default `v-row` pulls
-12 px past it on each side. `v-main` scrolls (`AppLayout.vue:1231-1237`, `overflow-y: auto`), so it also scrolls
+12 px past it on each side. `v-main` scrolls (`AppLayout.vue:1241-1247`, `overflow-y: auto`), so it also scrolls
 **sideways by 4 px** on every page that has a row: measured on the tenant dashboard, the org list, Billing and
 Observability, and on the sign-in pages.
 
@@ -120,13 +120,13 @@ The high and medium findings, by phase; anchors at `7c95d26f4`. Each phase lists
 
 | finding | where | fix |
 |---|---|---|
-| the page scrolls sideways by 4 px (§2.2) | `AppLayout.vue:1227-1233` | `overflow-x: hidden` on `v-main`; `v-row dense` where a page needs edge-to-edge |
-| app bar overflow: with the unread and call buttons up, the avatar menu — and **Logout** — go off-screen | `AppLayout.vue:431-540` | a phone budget: `?` and the theme toggle into the avatar menu below 600 px, the text buttons icon-only with a badge |
-| a page opens at the previous page's scroll offset (`v-main` is the scroller, nothing resets it) | `AppLayout.vue:563-567` | reset on path change |
-| a running call leaves no visible controls once you leave its page | `AppLayout.vue:406-420`, `:706-710` | an in-call control in the app bar on phones (D5) |
+| the page scrolls sideways by 4 px (§2.2) | `AppLayout.vue:1237-1243` | `overflow-x: hidden` on `v-main`; `v-row dense` where a page needs edge-to-edge |
+| app bar overflow: with the unread and call buttons up, the avatar menu — and **Logout** — go off-screen | `AppLayout.vue:437-546` | a phone budget: `?` and the theme toggle into the avatar menu below 600 px, the text buttons icon-only with a badge |
+| a page opens at the previous page's scroll offset (`v-main` is the scroller, nothing resets it) | `AppLayout.vue:569-573` | reset on path change |
+| a running call leaves no visible controls once you leave its page | `AppLayout.vue:412-426`, `:712-716` | an in-call control in the app bar on phones (D5) |
 | other-org activity and the current org's name are drawer-only | `AppLayout.vue:57-65` | a dot on the nav icon |
 | dialogs never go full screen on a phone | 20+ dialogs | a `useResponsiveDialog()` (`fullscreen` on `xs`), with a toolbar close |
-| rail state from a wide window leaks into the phone drawer | `AppLayout.vue:49`, `:176`, `:271`, `:412` | `railActive = !mobile && rail` |
+| rail state from a wide window leaks into the phone drawer | `AppLayout.vue:49`, `:176`, `:271`, `:418` | `railActive = !mobile && rail` |
 
 **P3 — admin, network, audit, and the device dialogs**
 

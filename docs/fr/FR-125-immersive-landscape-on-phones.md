@@ -40,7 +40,7 @@ What it must not do:
 | small Android, with its bar | 740 × 304 | 105 px | 190 px | **146 px** |
 
 Above the stage sit three bars:
-- the app shell's compact app bar, 48 px (`AppLayout.vue:431`);
+- the app shell's compact app bar, 48 px (`AppLayout.vue:437`);
 - the viewer's toolbar row, a compact `v-toolbar` (`RemoteControl.vue:15`);
 - in a session, the tools strip (`RemoteControl.vue:916`).
 
@@ -85,7 +85,7 @@ The tallest page a phone held sideways leaves is about 430 px. A tablet held sid
 
 ### 3.2 What changes in the mode
 
-- **The app bar hides.** The viewer tells the app shell through one shared flag. The shell binds `v-app-bar`'s `model-value` to it (`AppLayout.vue:431`), and Vuetify's layout gives `v-main` (`:661`) the freed 48 px.
+- **The app bar hides.** The viewer tells the app shell through one shared flag. The shell binds `v-app-bar`'s `model-value` to it (`AppLayout.vue:437`), and Vuetify's layout gives `v-main` (`:667`) the freed 48 px.
 - **The toolbar row and the tools strip become an overlay above the stage** (`position: absolute`, translated out of view). They are **not** unmounted. The strip is the Teleport target the session tools render into (`#rc-tb-strip`), and the toolbar holds live state: the soft keyboard toggle, the clipboard buttons, the stats.
 - **The stage takes the whole page**: 340–412 px where it had 182–254, and 304 px on the smallest page with its bar.
 

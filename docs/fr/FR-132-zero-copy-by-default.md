@@ -85,7 +85,7 @@ read denies nothing (`crates/modules/fleet/src/remote_config.rs:206`). The agent
 it, and it reports `needs_restart` (`agents/roomlerd/src/remote_config.rs:354`). A test chains the pushed value
 through the restarted daemon's config fallbacks to the exact `name:gpu` entry `gpu_hint::is_denied` matches.
 Decision 1 is held by `the_device_owned_refusals_are_not_pushable`, which compares whole keys
-(`crates/remote_control/src/models.rs:9530`). The dialog gets the field, and
+(`crates/remote_control/src/models.rs:9599`). The dialog gets the field, and
 [`remote-config.md`](../remote-config.md) §6 the key, with its value table.
 
 ### 3b. Decode errors become countable (P1)

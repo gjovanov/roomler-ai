@@ -81,13 +81,13 @@ it. Do not shift these anchors with code that moved later.*
 
 | Surface | Where | What it does today |
 |---|---|---|
-| token mint | `crates/modules/fleet/src/agent.rs:90-140`; route `crates/modules/fleet/src/lib.rs:386` | `POST /api/tenant/{tid}/agent/enroll-token`: `AuthUser` + `MANAGE_AGENTS`; 600 s single-use JWT (`:24`); FR-102 issuance recorded (`:114-124`); FR-104 `anchor` from an optional body (`:52-85`) |
+| token mint | `crates/modules/fleet/src/agent.rs:90-140`; route `crates/modules/fleet/src/lib.rs:391` | `POST /api/tenant/{tid}/agent/enroll-token`: `AuthUser` + `MANAGE_AGENTS`; 600 s single-use JWT (`:24`); FR-102 issuance recorded (`:115-125`); FR-104 `anchor` from an optional body (`:52-86`) |
 | token claims | `crates/services/src/auth/mod.rs:82-96`, `:530-563` | `EnrollmentClaims { sub = issuing admin, tenant_id, jti, anchor }`; ten audiences in `TokenType` (`:37-78`) |
-| token redeem | `crates/modules/fleet/src/agent.rs:180-260`; route `fleet/src/lib.rs:477-478`, `:564` | public `POST /api/agent/enroll`: archived org refused (`:192-207`), plan device cap before the single-use claim (`:222-242`), the claim fails closed (`:244-260`) |
+| token redeem | `crates/modules/fleet/src/agent.rs:180-260`; route `fleet/src/lib.rs:488-489`, `:576` | public `POST /api/agent/enroll`: archived org refused (`:196-211`), plan device cap before the single-use claim (`:226-246`), the claim fails closed (`:248-264`) |
 | tunnel token | `crates/modules/network/src/routes/tunnel.rs:53-75`; mint `crates/services/src/auth/mod.rs:731` | any member (`is_member`) mints a `TunnelEnrollment` token |
 | registration | `crates/api/src/routes/auth.rs:167-325` | creates the user; the org inline only with `tenant_name` + `tenant_slug` (`:250-255`); production returns no session (`:311-324`) |
 | login gate | `crates/api/src/routes/auth.rs:366-370` | an unactivated account is refused |
-| return path | `ui/src/plugins/router.ts:385-411` | `pending_redirect` in **sessionStorage** — one tab only; same-origin paths only |
+| return path | `ui/src/plugins/router.ts:386-412` | `pending_redirect` in **sessionStorage** — one tab only; same-origin paths only |
 | short-lived capability row | `crates/db/src/models/consent_request.rs:13-37` | an unguessable `token`, a status enum, an `expires_at` TTL, redeemed by a public token-keyed route — the shape a pairing row needs |
 | rate limits | `crates/api/src/lib.rs:111-127`, `:143-145`, `:393`; `crates/core/src/rate_limit.rs:37-66` | per-IP governor on `/api`; `AuthRateLimiter` on register/login; a per-(caller, resource) sliding window for exec, SSH and relay mints |
 | decision log | `crates/services/src/dao/peer_relay_audit.rs:3-10` | one collection per decision kind; the refused rows are the point |
@@ -204,7 +204,7 @@ The invariants, each closing a specific failure:
    - **No account:** register with the org inline (`register` already takes `tenant_name` and
      `tenant_slug`). An OAuth signup stays in one tab, so `pending_redirect` carries it. An
      email signup opens the activation link in a **new tab**, where sessionStorage is empty
-     (`ui/src/plugins/router.ts:389`). The page therefore also keeps the pending pairing in
+     (`ui/src/plugins/router.ts:390`). The page therefore also keeps the pending pairing in
      localStorage with its expiry, under the guard's same-origin rules, and the guard routes
      any signed-in tab back to `/pair` while it lives.
    - **Fallback, always:** the wizard keeps showing the code with an "Open the page again"
