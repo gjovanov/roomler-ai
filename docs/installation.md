@@ -786,6 +786,9 @@ Disconnect and its consent prompt. As that user:
 - `roomler devices` answers too (FR-97 P2g): the devices this machine's private
   network reaches, as the companion's Devices page shows them. So does `roomler
   peers` (P2h), the links to them, without any endpoint (`sudo roomler peers` has those);
+- `roomler record start|stop|status|ls|rm` answers (FR-85 P2e), and so does the
+  companion's Recordings view. The recorder runs as that user, into their folder.
+  Choosing the folder, and allowing remote recording, stay `sudo roomler config set`;
 - anything administrative (`flows`, routes, `config`, …) is refused with a pointer
   to `sudo roomler …`.
 

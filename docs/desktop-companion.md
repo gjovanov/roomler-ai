@@ -676,7 +676,9 @@ tries first:
 - it serves the safety surface: status, the sessions viewing the screen, their Disconnect,
   consent, the recording state and keep busy (FR-92); and, since FR-97 P2g, the Devices page
   and the mesh, read-only (§6); since P2h, the peers too, without the endpoints of either end
-  or of a relay, the carrier snapshot, the path decision or the probes (`localapi::person_view`).
+  or of a relay, the carrier snapshot, the path decision or the probes (`localapi::person_view`);
+  and since FR-85 P2e, recording: the Recordings view's start, stop, list and delete, and the
+  **Stop recording** on the banner and the tray.
 
 Everything else on it is refused with a pointer to `sudo roomler …`, so the companion's other
 views show that refusal on a system install. The kill switch is `ROOMLERD_PERSON_SOCKET=0`.

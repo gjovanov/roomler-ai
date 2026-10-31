@@ -366,7 +366,18 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
 - it serves exactly `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`,
   `ConsentDecide` and `RecordStatus`; `KeepBusyStatus`, `KeepBusyOff` and
   `KeepBusyOn` (FR-92 P10, the start gated again on the peer); since FR-97 P2g,
-  `Devices` and `Mesh`; and since P2h, `Peers`, served through `person_view`.
+  `Devices` and `Mesh`; since P2h, `Peers`, served through `person_view`; and
+  since FR-85 P2e, `RecordStart`, `RecordStop`, `RecordingsList` and
+  `RecordingDelete`, the start, stop and delete gated again on the peer.
+
+The recording verbs (P2e) are the second widening past the safety surface, and
+**Stop** is safety on its own: without `RecordStop` the host could not end a remote
+recording of their own screen from the banner. They reach nothing the person could not
+reach already. The recorder runs as the person at the seat, the daemon lists and deletes
+with that person's filesystem identity (`FsIdentity`), never in the unattended folder,
+and `ConfigSet` stays refused, so `record_dir` and the remote switches remain root's. The
+socket follows a user switch within 5 s, so a background user's client can act for that
+long, as the consent verbs can; it acts as the person now at the seat, whose folder it is.
 
 `Devices` and `Mesh` were the first widening for a read rather than a safety control,
 and they are bounded the same way the companion's page is everywhere else. They only

@@ -408,6 +408,16 @@ sequenceDiagram
   console session. Unix: the peer's uid must be the daemon's, or root. An
   unidentified peer fails the check. The same gate covers `ConfigSet` of any
   `record_*` key.
+- ⚠️ **On a Linux system install the person comes in on their own socket**
+  (P2e, `peer_may_record`). The daemon is root there, so the comparison above
+  can never admit them. Their person socket serves `RecordStart`, `RecordStop`,
+  `RecordingsList` and `RecordingDelete`, and its listener has already matched
+  the peer's uid to the person at the seat, or root, from `SO_PEERCRED`. A
+  peer it could not name is refused. Without these the Recordings view is
+  dead, and the banner's and the tray's **Stop recording** answer nothing:
+  the host could not stop a remote recording of their own screen. `ConfigSet`
+  stays refused on that socket, so where recordings go and the two remote
+  switches are `sudo roomler config set`.
 - ⚠️ **The recorder runs as the person signed in at the device, at normal
   integrity, whatever the daemon runs as** (P1e, `recording/launch.rs`, see
   "Who the recorder runs as" below). Where there is nobody to record as —
@@ -516,7 +526,14 @@ into the daemon's log: a service has no stderr of its own to share.
   session is active, reading only `Type` and `Active` (`launch::unix::Seat`):
   a greeter or root's own desktop is a **login screen** (`NoPerson`), no
   active session is `Empty`, and a `loginctl` that cannot be asked is
-  `Unknown`, never "no session". The answer is reused for 5 s, since the
+  `Unknown`, never "no session". ⚠️ logind's `Display=` is empty on GNOME on
+  X11 under GDM, which starts Xorg as the person with `-displayfd`. The display
+  then comes from the X socket the person owns (`launch::unix::x_display`, the
+  lowest one in `/tmp/.X11-unix`). Without it the recorder has no `DISPLAY` and
+  refuses `no_frame`, which is how P2e found every start failing on that
+  desktop, local and remote. A Wayland session stays out of this: its display
+  would be Xwayland's, and capture refuses that empty root. The answer is
+  reused for 5 s, since the
   Recordings view polls every second while a recording runs; the unattended
   guards ask fresh.
 - ⚠️ **A login screen is not "nobody" (decision 6, `Refusal::LoginScreen`).**
@@ -1492,6 +1509,9 @@ the music in the preview.
 | `tests/control_dc_record.rs`, unattended (P1f); `tests/recorder.rs`; `recording::launch::unix` | a service with nobody signed in refuses a LOCAL start, then records a remote session with NO indicator surface at all (companion down, session unlisted), says `unattended: true`, and writes into the daemon's own folder (0700 on unix), never the person's `record_dir`. When someone signs in, it stops `session_changed` (red without the watch: it ran on, bannerless), and the controller still lists and downloads it. A fresh ask for who is signed in sees a sign-in the 5 s cache would hide (red when `fresh` is ignored). The identity is decided once: a remote start decided unattended is refused when someone is signed in by the time the recorder launches (red without the check) | "Test the recorder (FR-85)" (`--test control_dc_record`, `--test recorder`) |
 | `tests/control_dc_record.rs`, a login screen (decision 6); `recording::launch` | a device at its login screen still advertises `available` and `remote`, refuses a local start, and refuses a remote one `login_screen` with the words, reported as a refusal, before the host is asked (no prompt stands), and with nothing at all to show a banner still `login_screen`, never an unattended recording, no file anywhere. An unattended recording stops `session_changed` when a login screen comes up, and at that login screen the controller still lists and downloads it. The decision table: SYSTEM or root at a login screen is `LoginScreen`, someone signed in wins over it, an identity that is not the service's never asks. The Linux seat (from review): any ACTIVE graphical session counts, whoever's, read from `loginctl`'s own output (a greeter, a Wayland greeter; not a text console, not an inactive desktop); a `loginctl` that cannot be asked is `Unknown`, never `Empty`; the whole `shows_a_screen` table (a greeter refuses whatever the recorder could reach; an empty or unknown seat refuses with a `DISPLAY` or DRM; the host's own virtual desktop and the synthetic source never refuse). A login screen found at the launch re-check is `StartError::Unavailable(LoginScreen)`, `login_screen` on the wire. Red, each on its own: the login screen read as nobody (it records unattended), the early refusal removed (the prompt stands), the code folded into `unavailable`, the capability tied to who is signed in (nothing advertised), the watch stopping only for a sign-in (it runs on), the unattended folder listed only while unattended recording is possible (the file leaves the list), the reach ignored, the second walk skipped | "Test the recorder (FR-85)" (`--test control_dc_record`, `--test recorder`, `--lib recording::`) |
 | `crates/remote_control` | `no_record_key_is_server_pushable_via_desired_config`; `remote_recording_does_not_imply_remote_audio` (equality, an old agent's hello advertises nothing, a newer word is ignored, the wire words are pinned); `a_recorder_being_available_is_not_permission_to_record` (P3c-2); `rc:recording.activity` owned by `remote` | same |
+| `crates/localapi` (P2e) | `person_may_is_exactly_the_safety_surface` holds the four recording verbs on the person socket. `the_recording_decision_table`: the person at a system install's seat passes where the console gate refuses them, root passes, and the daemon's own endpoints keep the console gate. `the_person_at_the_seat_records_on_their_own_socket` reaches the state past both gates, and a peer the listener could not name is refused. Red, each on its own: an unnamed peer admitted, the console gate kept (the field's refusal), any named peer admitted on the daemon's own socket | every `cargo test -p roomler-localapi --lib` lane |
+| `recording::launch::unix` (P2e) | `the_display_is_logind_s_word_then_the_person_s_own_server`, and never Xwayland for a Wayland session; `the_x_display_is_the_lowest_socket_the_person_owns`: a plain file, a link, a name that is no display and someone else's server are not theirs | "Test the recorder (FR-85)" (`--lib recording::`) |
+| `tests/recorder.rs`, a capturer that could not open (P2e) | `a_capturer_that_could_not_open_says_why`: refused at once in the backend's own words. Red with the check off: the start waits out the first-frame timeout and says only "no frame" | "Test the recorder (FR-85)", `--test recorder` |
 | `crates/db` (P3a) | `RECORD_REMOTE_SCREEN` is named, inside `ALL`, in no managed row below `ADMINISTRATOR`, and outside `DEFAULT_ADMIN` | same |
 | `crates/modules/fleet` (P3a) | `record_grant`'s table: kept only when the controller may AND the device serves it, each refusal with its reason, a grant without RECORD untouched; P3c-2: a device with no recorder is `device_cannot_record` whoever asks, and the caps words read by equality (`available` alone is not serving, `remote` alone is, `remote-audio` alone is nothing); the hub strips RECORD from the effective grant and names why in `SessionCreated` (no recorder, then not opted in, then served); a coalesced duplicate repeats the reason | "Run fleet module unit tests" |
 | `crates/tests/src/remote_recording_tests.rs` (P3a) | Real servers, WebSockets and MongoDB, one controller connection per request (a second request on one socket coalesces). The owner on an opted-in device keeps RECORD, on a device with a recorder that never opted in gets `device_not_opted_in`, and on a device with no recorder `device_cannot_record` (P3c-2; so does a member, before their own refusal). A member with `REMOTE_CONTROL` gets `controller_not_allowed`; the same member with `RECORD_REMOTE_SCREEN` keeps it (the positive control). A non-owner `ADMINISTRATOR` keeps it; under break-glass it is stripped. A heartbeat re-announcing caps opts the device in and out without a reconnect, and one without caps changes nothing; one announcing no recorder reads as `device_cannot_record`. Activity is kept for a RECORD session of the sending device only (not for a session without RECORD, not from another device). The route answers RFC 3339 times and refuses a caller without `VIEW_REMOTE_AUDIT` | `integration-tests.yml` |
