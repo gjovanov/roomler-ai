@@ -22,7 +22,7 @@ to 10-31, plus a 15th watched live (2026-10-31 20:50Z, mostly 0.4.191).
 | Does a session ride out a roll? | **No: 9 of 9** sessions Active at a roll ended `agent_disconnect`, 7 on `direct` and 2 on `derp`. A new session was Active 8.4–18.6 s after the cut (median 10.9 s): `direct` 8.4–17.1 s, `derp` 17.6 s and 18.6 s. |
 | Does `/derp` still drop? | Every socket, once per roll. 310 sockets: down p50 7.6 s, p90 15.9 s, p99 26.2 s. Live roll: p50 7.2 s, p90 9.4 s. |
 | `relay carrier send hard-errored`? | 14–73 lines per roll on 10–15 hosts, every one a DERP carrier. Live roll: 34 lines on 15 hosts. |
-| `/derp` close to `control-WS reattached`? | p50 7.7 s, p90 32 s. Live roll: p50 8.7 s, p90 9.3 s. The oldest agent on the fleet (0.4.48) takes about 60 s. |
+| `/derp` close to `control-WS reattached`? | p50 7.7 s, p90 32 s. Live roll: p50 8.7 s, p90 9.3 s. The oldest version in these logs (0.4.48) takes about 60 s. |
 | How long is a roll? | Live roll: 33.9 s from the first SIGTERM to the second replacement Ready. |
 | How much rides a pod's `/derp`? | Nearly all DERP: 751 of 754 registrations in 3 days were on the pods, and regional PoPs only serve server-forced pins. That is about 47 % of metered relay bytes over 8 days (the rest is TURN) and about 5 % of RC sessions. |
 
@@ -80,8 +80,8 @@ socket in each wave. That accounts for the 6–8 hosts per roll that log two clo
 
 1. **It cannot save the session.** The session ends on the control WS, before `/derp` closes: on
    2026-10-30 at 19:43:07.882 the Hub ended a `direct` and a `derp` session in the same millisecond,
-   and both agents' `/derp` sockets closed about a second later. A perfect `/derp` swap leaves AC1
-   where it is.
+   and both agents' `/derp` sockets closed within about a second after that. A perfect `/derp` swap
+   leaves AC1 where it is.
 2. **There is no second pod to dial.** The front nginx pins `/ws` and `/derp` by tenant:
    `hash … consistent`, `max_fails=0`, `proxy_next_upstream off`. That is deliberate, since a ring
    that walked to the survivor parked long-lived sockets on the wrong pod after a roll (the
@@ -101,8 +101,8 @@ socket in each wave. That accounts for the 6–8 hosts per roll that log two clo
 
 ### What an old agent does with an unknown frame
 
-For whoever puts the next frame on this socket: agents back to 0.4.48, the oldest on the fleet,
-ignore a Text frame (the `Some(Ok(_))` arm, `agents/roomlerd/src/derp.rs:506`) and drop a Binary frame
+For whoever puts the next frame on this socket: agents back to 0.4.48, the oldest version in these
+logs, ignore a Text frame (the `Some(Ok(_))` arm, `agents/roomlerd/src/derp.rs:506`) and drop a Binary frame
 under 32 bytes (`crates/tunnel-core/src/transport/derp.rs:559-562`). A Binary frame of 32 bytes or
 more reads as a peer's frame and raises `Unrouted`. So a server-to-agent signal needs no capability
 gate as long as it is Text. This was read at the tags `agent-v0.4.48` and `agent-v0.4.154`, not run.
@@ -117,8 +117,9 @@ gate as long as it is Text. This was read at the tags `agent-v0.4.48` and `agent
 | A per-pod `/derp` route plus dual-send | front nginx and agent | Overlay pairs keep moving through a roll. RC sessions still end | Changes the floor and undoes the strict pin for this path |
 | The floor on a regional PoP | later | A roll never touches the carrier | Both peers need the PoP, and today only forced pins use one |
 
-The first two together would put a reattach at about 2–3 s. That is an estimate from the live roll,
-not a measurement.
+The first two together would put a reattach at about 3 s: the old pod's exit and the rescheduling
+take about 1.7 s, the start about 0.4 s, and a flat redial up to 1 s more. That is an estimate from
+the live roll, not a measurement.
 
 ## The measurement
 
