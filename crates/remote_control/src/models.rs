@@ -8345,6 +8345,58 @@ mod tests {
         }
     }
 
+    /// FR-85 AC10 — a `recording_activity` row is the device's claim about a
+    /// recording, never the recording: the fact, sizes and reasons, and no
+    /// frames, no sound, no link to either. The stored keys are pinned
+    /// exactly, so a new field fails here first and whoever adds it reads
+    /// "What the server holds" in `docs/recording.md` §10 before re-pinning.
+    /// No value nests a document, an array or binary, either: a renamed key
+    /// cannot carry a payload in.
+    #[test]
+    fn a_recording_activity_row_holds_no_content() {
+        let every_field = RecordingActivityEvent {
+            id: Some(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            agent_id: ObjectId::new(),
+            session_id: ObjectId::new(),
+            controller_user_id: ObjectId::new(),
+            kind: RecordingActivityKind::Stopped,
+            name: Some("Roomler Recording 2026-10-31 00-12-00.mp4".into()),
+            bytes: Some(5_759_995),
+            duration_ms: Some(26_000),
+            reason: Some("requested".into()),
+            at: DateTime::now(),
+        };
+        let row = bson::to_document(&every_field).unwrap();
+        let keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "_id",
+                "tenant_id",
+                "agent_id",
+                "session_id",
+                "controller_user_id",
+                "kind",
+                "name",
+                "bytes",
+                "duration_ms",
+                "reason",
+                "at"
+            ],
+            "a recording_activity row may hold the claim only"
+        );
+        for (k, v) in &row {
+            assert!(
+                !matches!(
+                    v,
+                    bson::Bson::Binary(_) | bson::Bson::Document(_) | bson::Bson::Array(_)
+                ),
+                "{k} holds {v:?}"
+            );
+        }
+    }
+
     /// FR-101 P3 — the stored kinds are read by the activity route and by
     /// anyone querying the collection; a rename strands every row before it.
     #[test]

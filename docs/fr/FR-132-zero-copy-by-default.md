@@ -147,7 +147,7 @@ the flip on every host that runs the cell, canary or not.
 | P | Scope | Kill switch | Status |
 |---|---|---|---|
 | P0 | The red record: a fleet week of heartbeats read per cell (encoder × capture arm), counting the sessions that could have opened a GPU form and read `switch_off`, and naming the hosts that run each cell | — | **done 2026-10-30** (§8, AC1) |
-| P1 | 3a and 3b: `zero_copy_deny` in `DesiredConfig` and the agent's `apply`; the viewer's decode-error message and its count in `rc:session.stats` | the push is absent (no change); a viewer without the message sends nothing | **built 2026-10-30, released 2026-10-31** ([#3154](https://github.com/gjovanov/roomler-ai/pull/3154), in 0.4.191 and `hosted-20261031-28dfd72`). 3a: `MANAGE_AGENTS` alone, passed on unread, written by the device with `needs_restart`, end to end in `agent_tests` (AC2's integration half). 3b: `rc:decode-error` per error before the fallback, `de: 1` on every `rc:decodestat`, `decode_errors` on `rc:session.stats` (absent = not counted), the first `de` and the first eight errors sent at once, end to end through a real agent and viewer peer in `session_decode_errors_tests` (AC3's integration half). AC3's field half is met; AC2's is pushed and waits on the device (§8) |
+| P1 | 3a and 3b: `zero_copy_deny` in `DesiredConfig` and the agent's `apply`; the viewer's decode-error message and its count in `rc:session.stats` | the push is absent (no change); a viewer without the message sends nothing | **built 2026-10-30, released 2026-10-31** ([#3154](https://github.com/gjovanov/roomler-ai/pull/3154), in 0.4.191 and `hosted-20261031-28dfd72`). 3a: `MANAGE_AGENTS` alone, passed on unread, written by the device with `needs_restart`, end to end in `agent_tests` (AC2's integration half). 3b: `rc:decode-error` per error before the fallback, `de: 1` on every `rc:decodestat`, `decode_errors` on `rc:session.stats` (absent = not counted), the first `de` and the first eight errors sent at once, end to end through a real agent and viewer peer in `session_decode_errors_tests` (AC3's integration half). The field halves of AC2 and AC3 are met (§8) |
 | P2 | 3c: the three-valued reading, the default list (empty), `default_off`, at both entry points | `zero_copy = off`; the list empty | not started |
 | P3 | QSV: the canary week, then the flip (if open decision 4 orders it first) | `zero_copy_deny` pushed; the cell off the list in the next release | not started |
 | P4 | NVENC on the WGC arm: the same | the same | not started |
@@ -158,7 +158,7 @@ the flip on every host that runs the cell, canary or not.
 
 - [x] **AC1 (red first):** a fleet week of heartbeats counts the sessions that ran on a cell with a proven GPU form
   and read `input_reason=switch_off`, per cell, with the hosts that ran them.
-- [ ] **AC2 (the kill switch):** a `zero_copy_deny` push reaches a device, the device reports `needs_restart`, and
+- [x] **AC2 (the kill switch):** a `zero_copy_deny` push reaches a device, the device reports `needs_restart`, and
   after the restart that cell's sessions read `input_reason=denied`. Integration-tested, and seen in the field.
 - [x] **AC3 (decode errors counted):** a decode error forced in the viewer shows up in that session's
   `rc:session.stats`, and a session with none reads zero.
@@ -259,6 +259,36 @@ a corporate laptop does not take. Owed, in order:
 2. The restart after that, from the next release's push: an `h264_qsv` session reads `input_reason=denied`, and AC2
    is met.
 3. `none` pushed in place of the deny, so the cell is free again from the restart that follows.
+
+### 2026-10-31: AC2 met on CORPLAP-3, and the cell freed again
+
+This did not need the release the entry above expected. `roomler restart` at the device is the verb behind the
+companion's Apply now, and it takes no `roomler exec` and no elevation, so the entry overstated the constraint. Every
+session below is on 0.4.191, direct, with the codec forced to H.264 (`data-channel-h264`) unless the row says
+otherwise, and the device row is the server's.
+
+| Step | Device row | The session reads |
+|---|---|---|
+| Deny stored as revision 2 at 19:02:48Z, not delivered | `pending`, last report revision 1 | `encoder=h264_qsv input_path=gpu` |
+| Restart 1, 20:13:58Z: the reconnect delivers it | `needs_restart` (`zero_copy_deny`) at 20:14:06Z | `input_path=gpu`: this process started on the old value |
+| Restart 2, 20:16:36Z | `applied` at 20:16:53Z | `encoder=h264_qsv input_path=cpu input_reason=denied` |
+| The same deny, codec on auto | `applied` | `encoder=av1_qsv input_path=gpu` |
+| `none` stored as revision 3 at 20:20:46Z, restart 3 at 20:22:36Z delivers it | `needs_restart` (`zero_copy_deny`) at 20:22:43Z | `input_path=cpu input_reason=denied`: the deny holds |
+| Restart 4, 20:24:36Z | `applied` at 20:24:54Z | `encoder=h264_qsv input_path=gpu` |
+
+The third row is AC2. The fourth is the switch's scope: under the same deny, the host's everyday `av1_qsv` kept its
+GPU input. The last two show that taking a deny off costs what putting one on does. `encoder_cells_deny` stayed as it
+was throughout. Each restart went through the service manager (`exits with code 0; scm relaunches it`) and answered
+again in 6.6 to 7.6 s, and the viewer rejoined without a click.
+
+**The switch's reach, for P3.** The deny sat undelivered on an online device for 71 minutes and would have sat longer.
+Reconcile-on-connect is the only delivery path, deliberately
+(`crates/modules/fleet/src/socket.rs:410`), and no server message restarts a daemon
+([`remote-config.md`](../remote-config.md) §7b). So a cell that goes bad stays open on an online host until that host
+has reconnected and then restarted, which across a fleet means a pod roll followed by a release's push. With someone
+at the device, two `roomler restart`s do it in about a minute. A canary week should be planned on that reach.
+Whether the server should also send a changed document to a connected device is a decision for before P3, and was not
+taken here.
 
 ## 9. Related
 
