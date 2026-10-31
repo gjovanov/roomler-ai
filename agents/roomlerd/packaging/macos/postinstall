@@ -52,9 +52,10 @@ if [ -d /Library/Roomler/roomler-agent.app ]; then
   echo "removed the pre-rename /Library/Roomler/roomler-agent.app (now roomlerd.app)"
   echo "  ⚠️  Screen Recording and Accessibility were granted to the OLD bundle."
   echo "     macOS does not carry a grant across a rename, so approve the new"
-  echo "     entry in System Settings > Privacy & Security:"
-  echo "       Screen & System Audio Recording -> Roomler Daemon"
-  echo "       Accessibility                   -> Roomler Daemon"
+  echo "     entry in System Settings > Privacy & Security (#3164: the panes list"
+  echo "     it by the bundle's file name):"
+  echo "       Screen & System Audio Recording -> roomlerd"
+  echo "       Accessibility                   -> roomlerd"
   echo "     and remove the stale 'Roomler Agent' entry if it is still listed."
 fi
 
@@ -348,9 +349,14 @@ else
   echo "NOTE: the menu-bar companion is not in this package; skipping"
 fi
 
-echo "Grant Screen Recording + Accessibility permissions in System Settings, then:"
+# #3164 — the panes list the agent as `roomlerd` (the bundle's file name); the
+# menu-bar app's own "Roomler" entry changes nothing. Since #3164 macOS's own
+# "Quit & Reopen" restarts the agent instead of leaving it offline.
+echo "In System Settings > Privacy & Security, turn on 'roomlerd' under Screen &"
+echo "System Audio Recording and under Accessibility ('Roomler' is the menu-bar app)."
+echo "macOS applies Screen Recording after roomlerd restarts: choose Quit & Reopen"
+echo "when macOS offers it, Restart in the Roomler menu-bar app, or run:"
 echo "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
-echo "(the Roomler menu-bar app shows which of the two is missing, with a button for each)"
 
 # ---------------------------------------------------------------------------
 # The privileged half — OPT-IN.

@@ -118,6 +118,9 @@ pub mod lock_on_end;
 pub mod lock_overlay;
 pub mod lock_state;
 pub mod logs_fetch;
+/// #3164 — a Quit AppleEvent restarts the agent; LaunchServices' own launch of
+/// the bundle never becomes a second daemon. Pure halves on every platform.
+pub mod macos_quit;
 /// FR-97 P2f-2 — start a child that is its own responsible process, so macOS
 /// asks the person about the microphone a supervised Mac's recorder opens.
 #[cfg(target_os = "macos")]
