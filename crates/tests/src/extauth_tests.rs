@@ -2115,16 +2115,21 @@ fn oid(hex: &str) -> bson::oid::ObjectId {
 /// "none" is only read after a positive sign that the path ran, plus this.
 const SETTLE: Duration = Duration::from_millis(500);
 
+/// How often these helpers look. ⚠️ The API allows a burst of 60 from one address
+/// and refills at one a second, and a body that is a 429 reads as a JSON error. A
+/// poll that hits that fails for the wrong reason, on a slow runner in a healthy
+/// run too, so a poll that runs out its 10 s stays well under it.
+const POLL: Duration = Duration::from_millis(500);
+
 /// The FR-52 notices this token's owner holds.
 async fn notices(app: &TestApp, token: &str) -> Vec<Value> {
-    let body: Value = app
+    let resp = app
         .auth_get("/api/notification", token)
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the notification list");
+    let body: Value = resp.json().await.unwrap();
     body["items"]
         .as_array()
         .unwrap()
@@ -2146,7 +2151,7 @@ async fn wait_for_notices(app: &TestApp, token: &str, count: usize) -> Vec<Value
             "{} of {count} notices: {got:#?}",
             got.len()
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(POLL).await;
     }
 }
 
@@ -2188,7 +2193,7 @@ async fn noted(
             return row;
         }
         assert!(Instant::now() < deadline, "the session was never noted");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(POLL).await;
     }
 }
 
@@ -2215,7 +2220,7 @@ async fn wait_for_row(
             return row.clone();
         }
         assert!(Instant::now() < deadline, "no such row: {body:#}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(POLL).await;
     }
 }
 
