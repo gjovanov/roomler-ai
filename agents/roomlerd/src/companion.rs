@@ -1059,7 +1059,7 @@ pub(crate) fn graphical_session_via(
         });
     }
     if login_screen {
-        anyhow::bail!("the login screen is showing — nobody is signed in at this machine")
+        anyhow::bail!("the login screen is showing — nobody is signed in at this machine's screen")
     }
     anyhow::bail!("no active graphical session — nobody is at this machine's screen")
 }
