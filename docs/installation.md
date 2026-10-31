@@ -102,7 +102,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3719`, `crates/agent-core/src/config.rs:4153`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3776`, `crates/agent-core/src/config.rs:4155`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:633`, `:965`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -208,8 +208,8 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3554`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3598`) |
-| `config::read_if_present` (`:3615`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3556`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3600`) |
+| `config::read_if_present` (`:3617`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
 flowchart TD
@@ -244,9 +244,9 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2620`, `:2642`), at the clean-run promotion
-(`record_clean_run_at`, `:2618`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4060`). Each save
+`crates/agent-core/src/config.rs:2622`, `:2644`), at the clean-run promotion
+(`record_clean_run_at`, `:2620`), at every `ConfigSet`, and at enrollment. The daemon, the
+desktop app and the setup wizard all write it through `config::save` (`:4062`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -358,8 +358,10 @@ Details worth knowing:
   **leaving it out keeps the mode the machine was last switched to** (#1727).
   The installer runs `roomlerd keep-system-context`, which follows the product's
   own record of the last `enable-system-context` / `disable-system-context`
-  (`%PROGRAMDATA%\roomler\last-system-context-attempt.json`). Every install
-  recreates the service, so the switch itself never survives one.
+  (`%PROGRAMDATA%\roomler\last-system-context-attempt.json`). A major upgrade
+  re-creates the service, so the switch itself does not survive one; since
+  #3115 a reinstall of the same version keeps the service, switch included
+  ([below](#what-an-msi-run-does-to-the-roomler-service)).
   ⚠️ Before #1727, leaving it out switched SystemContext **off**: the service
   kept running, the worker could no longer find its enrollment and exited in a
   loop, and the device went offline. To rescue a host in that state, run
@@ -402,6 +404,97 @@ Details worth knowing:
   placed deliberately is left alone — #1698,
   [`overlay-wfp.md`](./overlay-wfp.md)). The perUser flavour cannot elevate
   and is unchanged.
+
+### What an MSI run does to the `Roomler` service
+
+Every perMachine MSI run that is not an uninstall runs **RegisterService**
+(`roomlerd service install --as-service`, deferred, as LocalSystem,
+`agents/roomlerd/wix-perMachine/main.wxs:355`). One of the SystemContext actions
+follows it (Enable, Disable or Keep), which restarts the service, and then the
+MSI's own StartServices. What happens to the service depends on the run (#3115):
+
+| The run | What stops the service first | What happens to the `Roomler` entry |
+|---|---|---|
+| A fresh install | nothing is running | created (`agents/roomlerd/src/win_service/lifecycle.rs:436`, `register`) |
+| A **reinstall** of the installed version: a maintenance run, such as the wizard over the same release or a hand-run `msiexec /i` of the same MSI | the SystemContext action's restart | **reconfigured in place**: `ChangeServiceConfigW`, the description and the recovery actions. It keeps running until that restart, and its `Environment` (the SystemContext switch) survives |
+| A **major upgrade** to a newer release: the auto-updater, the wizard, a hand-run install | Windows Installer's Restart Manager, at InstallValidate: `roomlerd.exe` is in use and the run has no UI, so it shuts down what holds it. Where Restart Manager is off (the "Prohibit use of Restart Manager" policy), the OLD product's `UnregisterService` does, because `MajorUpgrade` is `afterInstallInitialize` (`main.wxs:84`) and the old product is removed before the new files land | retired by the old binary, then created by the new one. If the old binary deleted it while it was still stopping (1072), the new one waits for the entry to go first |
+| An uninstall | `UnregisterService` (`main.wxs:547`) | retired (`lifecycle.rs:384`, `retire`) |
+
+**The waits are derived from the host's own shutdown**, so the two cannot drift
+apart (`lifecycle.rs:81`, pinned by the test
+`the_stop_wait_covers_the_hosts_whole_shutdown`):
+
+| Bound | Value | What it covers |
+|---|---|---|
+| `HOST_STOP_BOUND` | 14.5 s | the supervisor's whole shutdown (`agents/roomlerd/src/win_service/supervisor.rs:671`: a 0.5 s poll tick, the worker's 8 s graceful budget at `:659`, the terminate and netd's reap at 1.5 s each), then the 3 s the host process gives its runtime after it reports STOPPED (`agents/roomlerd/src/runtime_exit.rs:30`) |
+| `STOP_WAIT_BOUND` | 29 s | twice that, for a loaded box. A retire waits this long for STOPPED **and** for the host process to exit (`lifecycle.rs:275`), and only then deletes |
+| `GONE_WAIT_BOUND` | 10 s | after the delete, for the SCM to answer 1060. A handle held elsewhere (services.msc on the service's properties) outlasts it, and the retire says so |
+| `MARKED_WAIT_BOUND` | 39 s | how long an install waits for an entry that an earlier delete marked (1072) before it creates the service |
+
+⚠️ Up to 0.4.189, every run but an uninstall deleted the service and created it
+again, after waiting at most **5 s** for its stop. That is less than the
+worker's own 8 s graceful budget. A healthy stop that took longer (7.8 s on a
+Win11 laptop in the field, 3.4–6.2 s on a vmtest cell) went like this:
+
+1. `DeleteService` only *marked* the service, which was still stopping;
+2. `CreateService` answered 1072 (`ERROR_SERVICE_MARKED_FOR_DELETE`);
+3. EnableSystemContext failed on the missing service, and the MSI rolled back
+   (1603);
+4. when the host finally exited, the SCM removed the marked entry. The machine
+   had **no service and no daemon** until someone installed again.
+
+An MSI rollback never re-creates the service. No action has a rollback partner
+that would, and the service is not in the MSI's `ServiceInstall` table. So
+`RegisterService` stays `Return="ignore"` on purpose (`main.wxs:340`): under
+`"check"`, a failure there would roll a major upgrade back to the old files
+with no service at all.
+
+The env-block paths now name the service that is actually missing (`the Roomler
+service is not registered`, or `… is marked for deletion (1072)`). They used to
+fall back to the service's pre-rename name whenever `Roomler` was missing, and
+failed on the registry key of a service retired months before
+(`agents/roomlerd/src/win_service/environment.rs:179`,
+`agents/roomlerd/src/win_service/mod.rs:116`).
+
+```mermaid
+sequenceDiagram
+    participant W as worker (updater)
+    participant M as msiexec
+    participant Old as old roomlerd.exe
+    participant New as new roomlerd.exe
+    participant S as SCM
+    W->>M: msiexec /i new.msi /qn, the service still running
+    Note over W: the worker exits 0, the host stays up and spawns a fresh worker
+    M->>S: InstallValidate, Restart Manager stops it (roomlerd.exe is in use)
+    M->>Old: UnregisterService, the old product's removal
+    Old->>S: wait for STOPPED (5 s up to 0.4.189, 29 s after), delete
+    M->>New: RegisterService
+    New->>S: open answers 1072 while the old host still stops
+    New->>S: wait for 1060 (up to 39 s), then create
+    M->>New: EnableSystemContext writes the Environment and restarts it
+    M->>S: StartServices
+```
+
+**Auto-updates and upgrades** (the open question in #3115). The updater does
+not stop the service before it runs msiexec. `spawn_installer_with_watch`
+(`agents/roomlerd/src/updater.rs:1891`) launches `msiexec /i … /qn` elevated
+(`:2236`, `:2636`) while the service runs; the worker that launched it exits 0,
+and its host stays up (`:593`). Measured on a vmtest Win11 cell, released code,
+with each stop held to the field's 7.8 s:
+
+| Run | The first Stop came from | Released code |
+|---|---|---|
+| a major upgrade, Restart Manager on | Restart Manager at InstallValidate, 10.3 s before the old product's `UnregisterService` | completed |
+| a major upgrade, Restart Manager off by policy | the old `UnregisterService`, which deleted the service 6.5 s before its host stopped | completed by about 40 ms: the new RegisterService's own 5 s wait covered the rest |
+| a reinstall of the same version | `RegisterService`, after its 5 s | **1603, and no service**: the field case |
+
+So an upgrade had a head start that a reinstall lacked: it survived stops of
+about 11 s (Restart Manager off) to 15 s (on), where a reinstall survived 5 s.
+Since #3115 no run deletes a service before it has stopped and its host has
+exited, and an install waits out an entry that an older binary deleted early.
+⚠️ `OpenService` can succeed on such a marked entry (the upgrade above opened
+one); only a change is refused with 1072. So the install asks with a change that
+changes nothing (`lifecycle.rs:242`, `is_marked`), never by the open alone.
 
 ## Linux
 
@@ -857,25 +950,64 @@ are silently dropped.
      LaunchDaemon plist passes as its config. It is not — the plist passes
      /etc/roomler/config.toml, and the old dir survives only as a migration
      source in the .pkg postinstall. Corrected 2026-09-02. -->
-- System Settings → Privacy & Security → **Screen & System Audio Recording** → enable **Roomler Daemon**
-- System Settings → Privacy & Security → **Accessibility** → enable **Roomler Daemon**
+- System Settings → Privacy & Security → **Screen & System Audio Recording** → turn on **roomlerd**
+- System Settings → Privacy & Security → **Accessibility** → turn on **roomlerd**
+
+The panes list the agent by its bundle's file name, **`roomlerd`** (with a
+generic icon), and its prompts say "“roomlerd” would like to…" — not its
+`CFBundleName`, "Roomler Daemon", which this page named until #3164. An entry
+called **Roomler** (the brand icon) is the menu-bar app; turning it on changes
+nothing.
 
 If a stale **Roomler Agent** entry is still listed from a pre-rename install,
 remove it — macOS does not carry a grant across a bundle rename, and the `.pkg`
 postinstall prints the same instruction when it detects one.
+<!-- RETIRED-NAME-ANCHOR-END -->
 
 You do not have to hunt for this: the **Roomler menu-bar app** names whichever
-grant is missing and gives you a button per permission that opens the right
-pane. The agent also probes both at startup, says what is missing in its log,
-and reports the state to the server — so the device list shows "No screen
-access" / "No input access" instead of letting you discover it by connecting to
-a black screen.
+grant the agent is missing, as the agent itself reports it, and gives you a
+button per permission that opens the right pane. The agent also probes both at
+startup, says what is missing in its log, and reports the state to the server —
+so the device list shows "No screen access" / "No input access" instead of
+letting you discover it by connecting to a black screen.
 
-Then restart it: `launchctl kickstart -k gui/$(id -u)/com.roomler.agent`
+**Screen Recording needs a restart; Accessibility does not.** macOS applies a
+Screen Recording grant only to a freshly started process, so a session after the
+grant still reports `permission` until the agent restarts (#3164, field-measured
+on macOS 15.7). Restart it in any of three ways:
 
-⚠️ Grants are keyed to the binary's code signature. Until Apple notarisation is
-finished the `.pkg` is unsigned, so **an agent update invalidates them** and
-both toggles need re-enabling.
+| how | what happens |
+|---|---|
+| **Quit & Reopen** — the button macOS offers when you turn the toggle on | System Settings sends the agent a Quit AppleEvent (with a log-out's reason, `'rlgo'`); the agent tells it from a real log-out by its sender (only `loginwindow` quits a session that is ending), leaves with its restart code, and launchd relaunches it within milliseconds. Finder may still say "The application “roomlerd” is not open anymore": its *Reopen* looks for the process that quit, while launchd has already brought the agent back. ⚠️ Agents up to 0.4.188 exited 0 instead, which launchd does not relaunch: the device stayed **offline** until a `kickstart` |
+| **Restart roomlerd** in the menu-bar app's permission card | the LocalAPI `RestartDaemon` verb (the same as Settings' *Apply now*) |
+| `launchctl kickstart -k gui/$(id -u)/com.roomler.agent` in Terminal | the restart that works on every version |
+
+Accessibility is read live: input works from the next remote event, with no
+restart (up to 0.4.188 the first session's failed input backend was kept until
+the agent restarted, so typed input was dropped while the viewer no longer
+warned).
+
+A log-out, restart or shut-down still ends the agent with exit 0 (those quits
+come from `loginwindow`), so nothing relaunches it into a session that is going
+away; `RunAtLoad` starts it again at the next login.
+
+**Two more prompts, and what to answer:**
+
+- **"Allow “roomlerd” to find devices on local networks?"** — at the first
+  remote-control session (macOS 15's Local Network privacy, raised as the
+  session gathers its network paths). Allow it: it is the agent's own request,
+  and macOS limits what the agent may reach on the local network until it is
+  answered.
+- **"“roomlerd” is requesting to bypass the system private window picker and
+  directly access your screen and audio"** — macOS 15 asks this again every 30
+  days (`kScreenCapturePrivacyHintPolicy`). Capture keeps flowing while it waits,
+  so a session is not interrupted; answer **Allow** when you are at the Mac.
+
+<!-- RETIRED-NAME-ANCHOR-BEGIN — the layout below is still FR-21 D5's frozen one. -->
+
+⚠️ Grants are keyed to the bundle's code signature. A release's Developer ID
+signature keeps them across updates; a re-signed or locally built agent gets
+entries of its own, to grant again.
 
 ### What the package installs
 
@@ -923,13 +1055,13 @@ Device configuration card carries a banner naming both files
 `config set` print the "a second roomler daemon is running" note that `status`
 and `peers` already printed — a note that had gone silent for the console user,
 because the root socket's `0700` directory refuses their `stat`; the root half's
-person socket is the evidence now (`crates/localapi/src/lib.rs:4571`).
+person socket is the evidence now (`crates/localapi/src/lib.rs:4592`).
 
 The root half's switches are **root's to set by design**, not by omission: its
 LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person socket it
 serves the console user admits the safety surface only — status, sessions,
 consent, the Devices view — never a config verb (`localapi::person_may`,
-`crates/localapi/src/lib.rs:3080`). Whether the console user should flip the
+`crates/localapi/src/lib.rs:3101`). Whether the console user should flip the
 root half's gates from the app is the decision left open on #2871; until it is
 taken, the gate stays with `sudo`.
 
@@ -1009,11 +1141,11 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3373`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3388`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2670`).
+back to the version that is running (`crates/agent-core/src/config.rs:2672`).
 
 ### No pipe can stall the supervisor (#3080)
 
@@ -1224,7 +1356,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1257` (the section) — `uninstall_linux` at `:1683`,
+`scripts/install.sh:1261` (the section) — `uninstall_linux` at `:1687`,
 `uninstall_macos` at `:1494`.
 
 ```mermaid
@@ -1249,7 +1381,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2136`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2151`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

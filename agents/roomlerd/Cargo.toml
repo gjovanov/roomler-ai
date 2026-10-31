@@ -503,6 +503,11 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSWindow",
 ] }
 objc2-foundation = { version = "0.3", optional = true, features = [
+    # #3164 — the Apple Event a quit arrives in, read by the application
+    # delegate (`indicator::mac`): a log-out's quit from System Settings'
+    # "Quit & Reopen". No new crate: `bitflags` is already this crate's edge.
+    "NSAppleEventDescriptor",
+    "NSAppleEventManager",
     "NSDate",
     "NSGeometry",
     # `NSDefaultRunLoopMode`, the mode the pump runs events in.
@@ -601,6 +606,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Com",                  # CoTaskMemFree — frees SHGetKnownFolderPath's buffer (FR-84 D6: the SCM host reads the console user's config)
     "Win32_NetworkManagement_IpHelper",  # GetExtendedTcpTable — who holds a port a route cannot bind (FR-84 D6 / #1035)
     "Win32_System_Registry",             # SHELLEXECUTEINFOW carries an HKEY field; struct gated on this
+    "Win32_System_Services",             # QueryServiceStatusEx — #3115: the host's pid in every state (windows-service reports it only while RUNNING), so a retire can wait for the process to exit
     "Win32_System_ApplicationInstallationAndServicing", # Msi* database reads — the self-updater binds an MSI's own ProductVersion to the release the manifest claimed it is (msi.dll ships in System32, so the installer-smoke import audit passes it)
     "Win32_Security_WinTrust",           # WinVerifyTrust — the self-updater refuses to run an installer it cannot attribute to us
     "Win32_Security_Cryptography",       # CryptQueryObject/CertGetNameStringW — WHO signed it, which WinVerifyTrust alone does not tell you

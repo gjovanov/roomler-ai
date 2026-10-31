@@ -351,6 +351,22 @@ impl RemoteConfigServices {
                     ),
                 }
             }
+            // FR-132 P1 — the GPU-input denylist, FR-118's kill switch, the
+            // shape of the two above: a blank push clears it (deny nothing),
+            // `none` denies nothing, and an entry the gate cannot read denies
+            // nothing either (`cells::parse_denylist` keeps it, `is_denied`
+            // never matches it). The probe reads it once per process and the
+            // encoders through the config fallbacks, registered once per
+            // process, hence `needs_restart`.
+            if let Some(want) = desired.zero_copy_deny.as_deref() {
+                let next = Some(want.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                if cfg.zero_copy_deny != next {
+                    cfg.zero_copy_deny = next;
+                    applied.needs_restart.push("zero_copy_deny");
+                }
+            }
 
             if applied.is_noop() {
                 return Ok(applied);
@@ -630,6 +646,85 @@ mod tests {
         // The revert: cleared, so the built-in default (on) decides again.
         let applied = svc.apply(&push("")).await.unwrap();
         assert_eq!(applied.needs_restart, vec!["color_description"]);
+        assert_eq!(on_disk(), None);
+        assert!(svc.apply(&push("")).await.unwrap().is_noop());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-132 P1 — a pushed GPU-input denylist is written and reported as
+    /// needing a restart, the same push again changes nothing, an unmanaged
+    /// key is left alone, and a blank push clears it. And it reaches the gate:
+    /// the restarted daemon's config fallbacks carry it as
+    /// `ROOMLERD_ZERO_COPY_DENY`, which parses to the exact `name:gpu` entry
+    /// `gpu_hint::is_denied` matches — the step AC2's field read takes after
+    /// the restart (`input_reason=denied`).
+    #[tokio::test]
+    async fn a_pushed_gpu_input_denylist_is_written_reaches_the_gate_and_a_blank_clears_it() {
+        let dir = std::env::temp_dir().join(format!("fr132-zc-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        );
+        let push = |v: &str| DesiredConfig {
+            zero_copy_deny: Some(v.to_string()),
+            ..Default::default()
+        };
+        let on_disk = || crate::config::load(&path).unwrap().zero_copy_deny;
+        assert_eq!(on_disk(), None, "the fixture denies nothing");
+
+        let applied = svc
+            .apply(&push(" hevc_qsv:gpu, av1_nvenc:gpu "))
+            .await
+            .unwrap();
+        assert_eq!(applied.needs_restart, vec!["zero_copy_deny"]);
+        assert!(applied.live.is_empty(), "read once per process: never live");
+        assert_eq!(on_disk().as_deref(), Some("hevc_qsv:gpu, av1_nvenc:gpu"));
+        assert!(
+            svc.apply(&push("hevc_qsv:gpu, av1_nvenc:gpu"))
+                .await
+                .unwrap()
+                .is_noop()
+        );
+
+        // What the next process reads: the fallback, then the gate's parse.
+        let restarted = crate::config::load(&path).unwrap();
+        let fallbacks = crate::config::env_fallbacks(&restarted);
+        let raw = fallbacks
+            .get("ZERO_COPY_DENY")
+            .expect("the pushed denylist rides the config fallbacks");
+        let deny = crate::encode::cells::parse_denylist(raw);
+        assert!(deny.iter().any(|d| d == "hevc_qsv:gpu"), "{deny:?}");
+        assert!(deny.iter().any(|d| d == "av1_nvenc:gpu"), "{deny:?}");
+        #[cfg(feature = "ffmpeg-encoder")]
+        {
+            use crate::encode::ffmpeg::gpu_hint::is_denied;
+            assert!(is_denied(&deny, "hevc_qsv") && is_denied(&deny, "av1_nvenc"));
+            assert!(!is_denied(&deny, "h264_qsv"), "only the named cells");
+        }
+
+        // Not managed: the device keeps its list.
+        assert!(
+            svc.apply(&DesiredConfig::default())
+                .await
+                .unwrap()
+                .is_noop()
+        );
+        assert_eq!(on_disk().as_deref(), Some("hevc_qsv:gpu, av1_nvenc:gpu"));
+
+        // `none` is stored as written (the gate reads it as deny nothing)...
+        let applied = svc.apply(&push("none")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["zero_copy_deny"]);
+        assert_eq!(on_disk().as_deref(), Some("none"));
+        assert!(crate::encode::cells::parse_denylist("none").is_empty());
+
+        // ...and a blank clears the key.
+        let applied = svc.apply(&push("  ")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["zero_copy_deny"]);
         assert_eq!(on_disk(), None);
         assert!(svc.apply(&push("")).await.unwrap().is_noop());
         let _ = std::fs::remove_dir_all(&dir);

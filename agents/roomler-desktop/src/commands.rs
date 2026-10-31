@@ -1955,41 +1955,54 @@ fn spawn_no_inherit_and_wait(
 /// That is the entire reason this panel exists.
 #[derive(serde::Serialize)]
 pub struct PermissionState {
-    /// False on platforms with no permission model, so the UI can hide the
-    /// whole panel rather than showing two permanently-green rows.
+    /// False where there is nothing to show: a platform with no permission
+    /// model, and (#3164) a Mac whose agent did not say what it holds.
     pub applicable: bool,
     pub screen_recording: bool,
     pub accessibility: bool,
 }
 
-#[tauri::command]
-pub fn cmd_permissions() -> PermissionState {
-    #[cfg(target_os = "macos")]
-    {
-        use roomler_node_core::tcc;
-        PermissionState {
+/// #3164 — the AGENT's grants, as its own status reports them
+/// (`NodeStatus::macos_grants`). This used to ask TCC about THIS process,
+/// `ai.roomler.agent-tray`, which never holds either grant and never needs to,
+/// so the card asked for both after the person had granted them to `roomlerd`.
+/// No answer (an agent that predates the field, one not running, a root half
+/// with no GUI session) shows no card: this app's own grants say nothing about
+/// the agent's, and "Service offline" already says the rest.
+pub(crate) fn permission_state(grants: Option<roomler_localapi::MacosGrants>) -> PermissionState {
+    match grants {
+        Some(g) => PermissionState {
             applicable: true,
-            screen_recording: tcc::screen_recording_granted(),
-            accessibility: tcc::accessibility_trusted(),
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        PermissionState {
+            screen_recording: g.screen_recording,
+            accessibility: g.accessibility,
+        },
+        None => PermissionState {
             applicable: false,
             screen_recording: true,
             accessibility: true,
-        }
+        },
     }
 }
 
-/// Ask for a permission: pop the system prompt if it has never been answered,
-/// and open the Settings pane either way.
+/// ASYNC: it asks the agent over the LocalAPI, which must stay off the UI
+/// thread (`cmd_status`'s reason).
+#[tauri::command]
+pub async fn cmd_permissions() -> PermissionState {
+    let grants = if cfg!(target_os = "macos") {
+        daemon_node_status().await.and_then(|s| s.macos_grants)
+    } else {
+        None
+    };
+    permission_state(grants)
+}
+
+/// Open the Settings pane where the agent's permission is switched on.
 ///
-/// Both are needed. The prompt only ever appears ONCE per binary — after a
-/// denial macOS never shows it again — and the pane is the only route back,
-/// but landing the user on the right pane with the app already listed is the
-/// difference between one toggle and a hunt through Settings.
+/// #3164 — only the pane. This used to ask for the permission first, FROM THIS
+/// APP: that registered the menu-bar app itself in the pane (the "Roomler"
+/// entry, whose grant changes nothing), beside the agent's own `roomlerd`
+/// entry, which the agent registers itself when it starts
+/// (`macos_permission_preflight`). One entry to switch on is the whole point.
 ///
 /// `which` is `"screen"` or `"input"`.
 #[tauri::command]
@@ -1999,12 +2012,10 @@ pub fn cmd_request_permission(which: String) -> Result<(), String> {
         use roomler_node_core::tcc;
         match which.as_str() {
             "screen" => {
-                let _ = tcc::request_screen_recording();
                 tcc::open_settings_pane(tcc::PANE_SCREEN_RECORDING);
                 Ok(())
             }
             "input" => {
-                let _ = tcc::request_accessibility();
                 tcc::open_settings_pane(tcc::PANE_ACCESSIBILITY);
                 Ok(())
             }
@@ -3156,6 +3167,57 @@ mod tests {
                           "primary":true,"enabled":true,"connected":true}}]}}"#
         ))
         .expect("a NodeStatus the daemon could send")
+    }
+
+    /// #3164 — the card shows the AGENT's grants, as its status reports them.
+    /// No answer (an agent that predates the field, none running, a root half
+    /// with no GUI session) shows no card: this app's own TCC state is not the
+    /// agent's, and reading it asked for both grants after the person had
+    /// given them to `roomlerd`.
+    #[test]
+    fn the_permission_card_reads_the_agents_own_grants() {
+        let st: NodeStatus = serde_json::from_str(
+            r#"{"node_id":"n","name":"mac","version":"0.4.189","mode":"service","connected":true,
+                "macos_grants":{"screen_recording":false,"accessibility":true}}"#,
+        )
+        .unwrap();
+        let p = permission_state(st.macos_grants);
+        assert!(p.applicable);
+        assert!(
+            !p.screen_recording,
+            "not yet in force: the agent restarts first"
+        );
+        assert!(p.accessibility, "live, no restart");
+        let older = daemon_status("n", Some("t"));
+        assert!(!permission_state(older.macos_grants).applicable);
+        assert!(!permission_state(None).applicable);
+    }
+
+    /// #3164 — the card's Restart sits beside the Screen Recording row and
+    /// goes through the app's one restart flow (`restartDaemon`, LocalAPI
+    /// `RestartDaemon`), and its words name the entry the pane shows. Master
+    /// said "restart the agent for it to take effect" with no control at all.
+    #[test]
+    fn the_permission_card_restarts_the_agent_and_names_roomlerd() {
+        let html = include_str!("front/index.html");
+        let js = include_str!("front/overview.js");
+        assert!(
+            html.contains(r#"id="ov-btn-perm-restart""#),
+            "no restart control"
+        );
+        assert!(html.contains(r#"id="ov-perm-restart""#));
+        assert!(html.contains("turn on <strong>roomlerd</strong>"));
+        assert!(html.contains("Quit &amp; Reopen"));
+        assert!(!html.contains("restart the agent for it to take effect"));
+        assert!(
+            js.contains("$('ov-btn-perm-restart')"),
+            "the control is not wired"
+        );
+        assert!(
+            js.contains("R.restartDaemon("),
+            "not the app's restart flow"
+        );
+        assert!(js.contains("restartRow.hidden = p.screen_recording"));
     }
 
     fn report(enrolled: bool) -> StatusReport {

@@ -206,8 +206,9 @@
               'enrollment (it appears among your devices with "-daemon" after its name). ' +
               'There is nothing to turn on here.'
           : "On a Mac the private network runs in Roomler's system service, which the " +
-              'installer adds when given a second enrollment token (install.sh --daemon-token). ' +
-              'Screen sharing works without it.',
+              'setup wizard adds when "Join the overlay network" is ticked, and install.sh ' +
+              'when given a second enrollment token (--daemon-token). Screen sharing works ' +
+              'without it.',
       );
       userBox.hidden = false;
       btn.hidden = true;
@@ -368,7 +369,14 @@
     paintProgress();
     const name = STEPS[step];
     if (name === 'device') paintDevice();
-    else if (name === 'network') paintNetwork();
+    else if (name === 'network') {
+      // #3164 — asked again here, not only at load: the .pkg postinstall
+      // starts this app BEFORE it places the root half's LaunchDaemon, so the
+      // answer read at load said "Not installed on this Mac" on a Mac whose
+      // private network was running.
+      await refreshPlatform();
+      paintNetwork();
+    }
     else if (name === 'consent') paintConsent();
     else if (name === 'files') await refreshFiles();
     else if (name === 'login') await paintLogin();
@@ -597,15 +605,22 @@
     await paintStep();
   }
 
-  async function refreshWelcomePending() {
+  /* The platform facts, read afresh (cheap: a file test). `null` when the
+   * command failed, and then the last answer stands. */
+  async function refreshPlatform() {
     try {
       const st = await invoke('cmd_desktop_state');
-      window.Roomler.welcomePending = !st.first_run_done;
       platform.name = st.platform || null;
       platform.macosPrivilegedHalf = !!st.macos_privileged_half;
+      return st;
     } catch (e) {
-      window.Roomler.welcomePending = false;
+      return null;
     }
+  }
+
+  async function refreshWelcomePending() {
+    const st = await refreshPlatform();
+    window.Roomler.welcomePending = !!st && !st.first_run_done;
   }
 
   document.addEventListener('roomler:view', (ev) => {

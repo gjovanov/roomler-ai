@@ -9,6 +9,10 @@
 // Save (a full replace, with no dirty check) wrote that default over it: exec
 // or SSH switched off, an external-access approval revoked. The console never
 // read the org's exec switch, so a closed org gate went unexplained.
+//
+// #3182, in External access: it copied the connect code from the store at the
+// open, before its own fetch landed, so a fresh page load showed "Not yet
+// created" and offered Create, which rotates the code the device already has.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { reactive } from 'vue'
@@ -73,6 +77,7 @@ function agentStore() {
     fetchOrgSshEnabled: vi.fn(),
     fetchTenantMembers: vi.fn(),
     fetchExternalAccess: vi.fn(),
+    rotateConnectCode: vi.fn(),
     updateExecPolicy: vi.fn().mockResolvedValue(undefined),
     updateSshPolicy: vi.fn().mockResolvedValue(undefined),
     updateExternalAccessPolicy: vi.fn().mockResolvedValue(undefined),
@@ -291,6 +296,81 @@ describe('ExternalAccessDialog on its first open (#3156)', () => {
     button('Save')!.click()
     await flushPromises()
     expect(store.updateExternalAccessPolicy).toHaveBeenCalledWith(TID, AGENT_ID, STORED)
+  })
+})
+
+describe('ExternalAccessDialog reads the connect code its own fetch brings (#3182)', () => {
+  const CODE = 'K7QX-2M9P-4HTD'
+  const approved = () =>
+    device({
+      external_access_policy: { approved: true, max_permissions: null, expires_at: null },
+      capabilities: caps('external-access'),
+    })
+
+  /** What the real fetch does: the org switch and the approved devices land
+   *  together, a tick after the call. */
+  function listLands(devices: { id: string; connect_code: string | null }[]) {
+    store.fetchExternalAccess.mockImplementation(async () => {
+      await Promise.resolve()
+      store.orgExternalAccessEnabled = true
+      store.externalDevices = devices
+    })
+  }
+
+  /** The code row's one button, labelled Rotate or Create. */
+  function codeButton(): HTMLButtonElement | undefined {
+    return [...document.body.querySelectorAll<HTMLButtonElement>('.v-card-text button')].find(
+      (b) => ['Rotate', 'Create'].includes(b.textContent?.trim() ?? ''),
+    )
+  }
+  const shownCode = () => document.body.querySelector('code.text-h6')?.textContent?.trim()
+  const textShown = (text: string) => document.body.textContent?.includes(text) ?? false
+
+  it('on a fresh page load, shows the code once the list lands, and offers Rotate', async () => {
+    // Nothing has filled the store: the org Settings page was not opened.
+    listLands([{ id: AGENT_ID, connect_code: CODE }])
+    track(mount(ExternalAccessDialog, opened(approved())))
+    await flushPromises()
+    expect(store.fetchExternalAccess).toHaveBeenCalledWith(TID)
+    expect(shownCode()).toBe(CODE)
+    expect(codeButton()?.textContent?.trim()).toBe('Rotate')
+    expect(store.rotateConnectCode).not.toHaveBeenCalled()
+  })
+
+  it('offers no Create while the list is still being read', async () => {
+    store.fetchExternalAccess.mockImplementation(() => new Promise(() => {}))
+    track(mount(ExternalAccessDialog, opened(approved())))
+    await flushPromises()
+    expect(shownCode()).toBeUndefined()
+    expect(textShown('Reading…')).toBe(true)
+    expect(textShown('Not yet created')).toBe(false)
+    expect(codeButton()?.disabled).toBe(true)
+  })
+
+  it('says it could not read the code when the read fails, and still offers no Create', async () => {
+    // The real fetch leaves the store unread on any failure; it never throws.
+    store.fetchExternalAccess.mockResolvedValue(undefined)
+    track(mount(ExternalAccessDialog, opened(approved())))
+    await flushPromises()
+    expect(textShown('Could not read the code.')).toBe(true)
+    expect(textShown('Not yet created')).toBe(false)
+    expect(codeButton()?.disabled).toBe(true)
+  })
+
+  it('offers Create once the list is read without the device, and shows the code it mints', async () => {
+    // Not approved, so the list of approved devices does not hold it.
+    listLands([])
+    store.rotateConnectCode.mockResolvedValue(CODE)
+    track(mount(ExternalAccessDialog, opened(device({ capabilities: caps('external-access') }))))
+    await flushPromises()
+    expect(textShown('Not yet created')).toBe(true)
+    expect(codeButton()?.textContent?.trim()).toBe('Create')
+    expect(codeButton()?.disabled).toBe(false)
+    codeButton()!.click()
+    await flushPromises()
+    expect(store.rotateConnectCode).toHaveBeenCalledWith(TID, AGENT_ID)
+    expect(shownCode()).toBe(CODE)
+    expect(codeButton()?.textContent?.trim()).toBe('Rotate')
   })
 })
 

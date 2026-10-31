@@ -930,6 +930,21 @@ describe('useAgentStore', () => {
     expect(s.agents[0]!.remote_config!.desired.color_description).toBe('')
   })
 
+  it('FR-132 — updateDesiredConfig carries the GPU-input denylist as given, and keeps what the server stored', async () => {
+    mockApi.put.mockResolvedValueOnce({
+      revision: 4,
+      desired: { revision: 4, zero_copy_deny: 'hevc_qsv:gpu, av1_nvenc:gpu' },
+    })
+    const s = useAgentStore()
+    s.agents = [mkAgent()]
+    await s.updateDesiredConfig(TENANT_ID, 'a1', { zero_copy_deny: 'hevc_qsv:gpu, av1_nvenc:gpu' })
+
+    const [, body] = mockApi.put.mock.calls.at(-1)!
+    expect(body).toEqual({ zero_copy_deny: 'hevc_qsv:gpu, av1_nvenc:gpu' })
+    expect('zero_copy' in (body as object)).toBe(false)
+    expect(s.agents[0]!.remote_config!.desired.zero_copy_deny).toBe('hevc_qsv:gpu, av1_nvenc:gpu')
+  })
+
   it('a saved request is optimistically PENDING, never applied', async () => {
     // The device has not spoken yet. Writing anything but `pending` would put
     // an answer on screen that no device has given — the exact lie the

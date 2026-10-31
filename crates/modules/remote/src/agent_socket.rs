@@ -49,6 +49,7 @@ impl AgentMsgHandler for RemoteAgentSocket {
                 mixed_dial_seconds,
                 transfers,
                 carrier,
+                decode_errors,
             } => {
                 let sid = ObjectId::parse_str(&session_id).ok();
                 // FR-101 P3 — an audit, not a statistic: kept whether or not
@@ -70,6 +71,8 @@ impl AgentMsgHandler for RemoteAgentSocket {
                         input_events,
                         shared_seconds,
                         mixed_dial_seconds,
+                        // FR-132 P1 — absent stays absent (not counted).
+                        decode_errors,
                     };
                     // FR-102 P9c — the carrier, when the agent named one and
                     // it is a code: anything else is dropped and the row
