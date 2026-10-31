@@ -1358,8 +1358,11 @@
         <div v-if="rc.mediaUnavailable.value" class="no-media-overlay">
           <v-icon size="72" color="warning">mdi-monitor-off</v-icon>
           <p class="text-body-1 mt-3">This device cannot capture its screen.</p>
+          <!-- #3164 — the agent's sentence, except the one every agent up to
+               0.4.188 sends for a Mac's Screen Recording, which said "then
+               reconnect" (macOS applies the grant to a restarted agent only). -->
           <p v-if="rc.mediaUnavailable.value.hint" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
-            {{ rc.mediaUnavailable.value.hint }}
+            {{ mediaUnavailableHint(rc.mediaUnavailable.value.code, rc.mediaUnavailable.value.hint) }}
           </p>
           <p class="text-caption text-medium-emphasis mt-2">
             Reported by the device as
@@ -2590,6 +2593,7 @@ import type { KeepBusyPattern } from '@/composables/keepBusy'
 import { displayMatchSummary } from '@/composables/displayMatch'
 import { agentSupportsRelativeMouse, relativeMouseSwitchedOff } from '@/composables/relativeMouse'
 import { agentSendsSas } from '@/composables/ctrlAltDel'
+import { mediaUnavailableHint } from '@/composables/macPermissionHint'
 import { pictureOverflows, stageTouchAction } from '@/composables/touchInput'
 import {
   BUILTIN_PRESETS,

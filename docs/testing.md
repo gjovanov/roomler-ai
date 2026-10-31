@@ -26,7 +26,7 @@ flowchart TB
 | Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux |
 | Agent overlay tests | add `--features overlay-l3` | ⚠️ feature-gated — the default `--lib` run silently skips them |
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
-| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2535`) |
+| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2541`) |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
 | Phone-width smoke | `cd ui && bun run test:phone` | nothing — the built SPA with every `/api` call mocked (`ui/e2e-phone/`) |
@@ -142,8 +142,8 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   character, so the `input` event the soft keyboard types through never fires
   and a key's second owner is invisible. `softkbd.html` mounts the real
   `MobileKeyboard.vue` and a window-level capture listener running the real
-  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14536`,
-  `:14269`), both recording what the host would get and WHO sent it.
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14601`,
+  `:14334`), both recording what the host would get and WHO sent it.
   `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
   OS keyboard does (`insertText`: an `input` event and no keydown), composes
   through the IME (CDP `Input.imeSetComposition`), pastes, and asserts one
@@ -241,7 +241,7 @@ Flakes fixed on 2026-10-30, and what each one teaches:
 
 | Lane | What it does |
 |---|---|
-| `ci.yml` | fmt + clippy (`--workspace --all-targets --all-features -D warnings`) + tests + frontend build on every push to master and every PR. A **docs-only PR** (every changed path under `docs/`, a top-level `*.md` or `.claude/`, renames by both paths) skips the twelve heavy jobs: the Rust lanes, the macOS and Windows jobs, both FFmpeg jobs and the profiles build. The docs audits and the frontend build, which builds the docs site, still run (FR-6 wave 35, the `changes` job at `ci.yml:54`, its path rule at `:75`). "Rust checks" passes a docs PR whose lanes all skipped, and fails if the `changes` job did not succeed (`:1308`). A push to master always runs everything |
+| `ci.yml` | fmt + clippy (`--workspace --all-targets --all-features -D warnings`) + tests + frontend build on every push to master and every PR. A **docs-only PR** (every changed path under `docs/`, a top-level `*.md` or `.claude/`, renames by both paths) skips the twelve heavy jobs: the Rust lanes, the macOS and Windows jobs, both FFmpeg jobs and the profiles build. The docs audits and the frontend build, which builds the docs site, still run (FR-6 wave 35, the `changes` job at `ci.yml:54`, its path rule at `:75`). "Rust checks" passes a docs PR whose lanes all skipped, and fails if the `changes` job did not succeed (`:1309`). A push to master always runs everything |
 | `installer-smoke.yml` | Installs and uninstalls the freshly-built per-user MSI on a Windows runner |
 | `integration-tests.yml` | The integration suite against a real MongoDB and Redis, as **four shards** (FR-6 waves 24 and 27). Each shard lists the same test binaries, sorts the (test, binary) pairs and runs every fourth with `--exact`, so between them the shards run each test once. Each shard must report every test it was handed, and the whole listing must clear a floor. 2 threads per shard, each with its own mongod: at 4 threads against one mongod, the dropped test databases' files reached the 64,000-descriptor ceiling and mongod aborted. Dispatch inputs: `filter`, `threads`, `mongo_tmpfs`, `report_time` (per-test durations and the slowest tests, in the step summary) |
 | k8s e2e (`scripts/e2e-k8s.sh`, `Dockerfile.agent-e2e`) | The suite against a standing cluster namespace — validates the real multi-pod topology |
@@ -564,7 +564,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1774`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7336`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1774`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7419`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |
@@ -587,7 +587,7 @@ VP9 DataChannel is 4:4:4 by default), less what the build cannot open (`BuildCap
 | `rtp:h264` | `encode::open_for_codec`: Media Foundation's cascade on Windows, then OpenH264 | `mf-encoder` (Windows) |
 | `rtp:h265` | FFmpeg's HEVC cascade, then MF's | FFmpeg or MF |
 | `rtp:av1` | MF's AV1 | MF |
-| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5234`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
+| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5247`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
 | `dc:vp9`, `dc:vp9:444` | the session's quick probe at 480×270, then FFmpeg's VP9 if it opened, else libvpx | FFmpeg |
 | `named` | `encode::open_named`, past every cascade and the denylist | FFmpeg |
 

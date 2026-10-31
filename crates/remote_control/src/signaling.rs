@@ -770,6 +770,16 @@ pub enum ClientMsg {
         /// direct**. Additive: an older server ignores the key.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         carrier: Option<String>,
+        /// FR-132 P1 (§3b) — the decode errors the viewer reported in this
+        /// session (`rc:decode-error` on the control channel, one per error,
+        /// sent before the viewer falls back to `<video>`). Cumulative, like
+        /// `keyframe_requests`. `Some` once the viewer has said it counts (its
+        /// `rc:decodestat` carries `de`, or it reported an error), so `Some(0)`
+        /// is a measured zero; absent is **not counted**, never zero: an older
+        /// viewer or agent, or a session that never decoded in a worker.
+        /// Additive: an older server ignores the key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decode_errors: Option<u32>,
     },
 
     /// Multi-region DERP: request an EdDSA admission ticket for the regional
@@ -12929,8 +12939,48 @@ mod tests {
             mixed_dial_seconds: 0,
             transfers: Transfers::default(),
             carrier: None,
+            decode_errors: None,
         };
         assert!(!serde_json::to_string(&none).unwrap().contains("carrier"));
+    }
+
+    /// FR-132 P1 — the decode-error count is additive both ways, and a zero
+    /// the viewer measured is not the same as no count: a sample from an
+    /// agent older than the field parses with none, a sample whose viewer did
+    /// not count serialises without the key (an older server never sees it),
+    /// and a counted zero travels as a zero.
+    #[test]
+    fn session_stats_decode_errors_tell_a_counted_zero_from_no_count() {
+        let older = r#"{"t":"rc:session.stats","session_id":"a","bytes_sent":1,"bytes_recv":2,
+            "fps":30.0,"rtt_ms":4.0,"keyframe_requests":0,"input_events":0}"#;
+        match serde_json::from_str::<ClientMsg>(older).unwrap() {
+            ClientMsg::SessionStats { decode_errors, .. } => assert_eq!(decode_errors, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let sample = |decode_errors: Option<u32>| ClientMsg::SessionStats {
+            session_id: "a".into(),
+            bytes_sent: 0,
+            bytes_recv: 0,
+            fps: 0.0,
+            rtt_ms: 0.0,
+            keyframe_requests: 0,
+            input_events: 0,
+            shared_seconds: 0,
+            mixed_dial_seconds: 0,
+            transfers: Transfers::default(),
+            carrier: None,
+            decode_errors,
+        };
+        let s = serde_json::to_string(&sample(None)).unwrap();
+        assert!(!s.contains("decode_errors"), "{s}");
+        for n in [0, 3] {
+            let s = serde_json::to_string(&sample(Some(n))).unwrap();
+            assert!(s.contains(&format!(r#""decode_errors":{n}"#)), "{s}");
+            match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+                ClientMsg::SessionStats { decode_errors, .. } => assert_eq!(decode_errors, Some(n)),
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
     }
 
     /// has none, parses with none; and the wire names are a compatibility
@@ -12956,6 +13006,7 @@ mod tests {
             mixed_dial_seconds: 0,
             transfers: Transfers::default(),
             carrier: None,
+            decode_errors: None,
         };
         let s = serde_json::to_string(&quiet).unwrap();
         assert!(!s.contains("transfers"), "{s}");
@@ -12983,6 +13034,7 @@ mod tests {
                 }],
             },
             carrier: None,
+            decode_errors: None,
         };
         let v = serde_json::to_value(&busy).unwrap();
         let t = &v["transfers"];

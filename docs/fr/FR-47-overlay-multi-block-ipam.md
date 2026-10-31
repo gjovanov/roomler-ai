@@ -136,7 +136,7 @@ is not an assumption: `pre_rc53_server_msg_rejects_goodbye_so_agent_err_arm_fire
 The trap that *does* need a forward-compat pre-roll is a new variant of a **nested** enum
 inside a frame the old agent already parses — the `RelayStrategyWire` case, where an unknown
 tag fails the *whole enclosing `ServerMsg`* and the agent silently drops entire netmaps
-(`signaling.rs:5683-5699`, `relay_strategy_lenient`). `OverlayJoinRefused` is not that shape.
+(`signaling.rs:5693-5709`, `relay_strategy_lenient`). `OverlayJoinRefused` is not that shape.
 
 ### 3c. Multi-block per org (P5) — the growth mechanism
 
@@ -224,7 +224,7 @@ and the operator's call: FR-68 P7 decides the flag.
       the absence of any `100.64.0.0/10` network in production.
       Tests: `blocks_are_disjoint_across_tenants` (`crates/tests/src/overlay_tests.rs:1622`)
       and `aligned_starts_are_never_partially_overlapping`
-      (`crates/remote_control/src/models.rs:9506`). Prod 2026-08-31: no network left on the
+      (`crates/remote_control/src/models.rs:9537`). Prod 2026-08-31: no network left on the
       `/10` ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486110349)),
       and the P3 dry run that listed every network found all four on `100.65.x`
       ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486189495)).

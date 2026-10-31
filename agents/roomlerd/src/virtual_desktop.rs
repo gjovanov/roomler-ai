@@ -722,6 +722,11 @@ pub fn start(cfg: &Config) -> Result<VirtualDesktop> {
             Err(e) => warn!(%app, %e, "virtual-desktop: startup app failed to launch"),
         }
     }
+    // An app that maps while openbox is still starting can stay unmanaged,
+    // and so invisible, until X traffic next wakes it (`WM_NUDGE_AT_MS`).
+    if !cfg.startup.is_empty() {
+        nudge_wm_after_startup(&dpy);
+    }
     info!(display = dpy.as_str(), wm = %cfg.wm, apps = cfg.startup.len(), ?pgid, "virtual-desktop ready");
     // Record the tree so `teardown` can reach it without the handle, on the
     // graceful exit paths that run as free functions. One desktop per daemon,
@@ -947,6 +952,182 @@ fn wait_display_ready(display: &str, timeout: Duration) -> Result<()> {
         std::thread::sleep(Duration::from_millis(200));
     }
     bail!("virtual-desktop: X server display {display} did not become ready within {timeout:?}")
+}
+
+/// When `start` nudges the window manager, counted from the startup apps'
+/// launch.
+///
+/// ⚠️ A window that maps while openbox is still starting is left UNMAPPED,
+/// with no `WM_STATE`, until X traffic next wakes openbox: its startup reads
+/// the MapRequest, and its main loop then sleeps in `poll()` on a socket with
+/// nothing new on it. The desktop is a black root and a session shows nothing,
+/// which is how the first session on a rented DGX Spark came up (FR-122 §8).
+/// Measured with Xvfb, openbox, xclock and xterm in the order `start` uses:
+/// apps launched 50 ms after the WM stayed unmapped in 30 runs of 30, and one
+/// root-property change mapped every one of them. Starting the apps once the
+/// WM sets `_NET_SUPPORTING_WM_CHECK` made it worse (22 of 25), because openbox
+/// sets it as its startup begins, which is exactly that window. Nudges at
+/// 0.25, 0.5, 1 and 2 s left none unmapped, 0 of 75 at 0, 20 and 50 ms; the
+/// 4 and 8 s ones cover a WM that starts slowly on a loaded host. A WM that is awake
+/// ignores the property.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "scrap-capture", feature = "enigo-input")
+))]
+const WM_NUDGE_AT_MS: [u64; 6] = [250, 500, 1_000, 2_000, 4_000, 8_000];
+
+/// The root-window property a nudge sets, and the last one deletes. Nothing
+/// reads it: a window manager selects `PropertyChangeMask` on the root, so the
+/// `PropertyNotify` is what wakes it.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "scrap-capture", feature = "enigo-input")
+))]
+const WM_NUDGE_ATOM: &[u8] = b"_ROOMLER_WM_NUDGE";
+
+/// Run [`WM_NUDGE_AT_MS`] on a thread of its own, so `start` does not wait for
+/// it. A display that no Unix socket reaches any more (the desktop was torn
+/// down) ends the schedule.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "scrap-capture", feature = "enigo-input")
+))]
+fn nudge_wm_after_startup(display: &str) {
+    let display = display.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("vd-wm-nudge".into())
+        .spawn(move || {
+            let launched = Instant::now();
+            let last = WM_NUDGE_AT_MS.len() - 1;
+            for (i, at) in WM_NUDGE_AT_MS.iter().enumerate() {
+                if let Some(wait) = Duration::from_millis(*at).checked_sub(launched.elapsed()) {
+                    std::thread::sleep(wait);
+                }
+                if nudge_wm(&display, i as u32, i == last).is_none() {
+                    break;
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        warn!(%e, "virtual-desktop: the window-manager nudges did not start");
+    }
+}
+
+/// A build with no X11 client cannot nudge, and captures nothing from the
+/// desktop either.
+#[cfg(not(all(
+    target_os = "linux",
+    any(feature = "scrap-capture", feature = "enigo-input")
+)))]
+fn nudge_wm_after_startup(_display: &str) {}
+
+/// Set [`WM_NUDGE_ATOM`] on `display`'s root window to `n`, or with `remove`
+/// delete it; either one is a `PropertyNotify` to every client listening on the
+/// root. `Some(true)` once the server has taken the request, `None` when no
+/// Unix socket reaches the display.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "scrap-capture", feature = "enigo-input")
+))]
+fn nudge_wm(display: &str, n: u32, remove: bool) -> Option<bool> {
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+    use x11rb::wrapper::ConnectionExt as _;
+    crate::capture::x_server_query(display, |conn, root| {
+        let Some(atom) = conn
+            .intern_atom(false, WM_NUDGE_ATOM)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| r.atom)
+        else {
+            return false;
+        };
+        let sent = if remove {
+            conn.delete_property(root, atom).map(|c| c.check())
+        } else {
+            conn.change_property32(PropMode::REPLACE, root, atom, AtomEnum::CARDINAL, &[n])
+                .map(|c| c.check())
+        };
+        matches!(sent, Ok(Ok(())))
+    })
+}
+
+/// The nudge against a real X server: the CI Xvfb lane runs these with
+/// `ROOMLERD_TEST_X11=1` and its `DISPLAY` (`.github/workflows/ci.yml`).
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(feature = "scrap-capture", feature = "enigo-input")
+))]
+mod wm_nudge_tests {
+    use super::*;
+
+    #[test]
+    fn the_schedule_runs_forward_for_seconds() {
+        assert!(WM_NUDGE_AT_MS.windows(2).all(|w| w[0] < w[1]));
+        // Early enough for an app that maps at once, long enough for a WM
+        // that starts slowly on a loaded host.
+        assert!(WM_NUDGE_AT_MS[0] <= 500);
+        assert!(WM_NUDGE_AT_MS[WM_NUDGE_AT_MS.len() - 1] >= 4_000);
+    }
+
+    /// A window manager selects `PropertyChangeMask` on the root. Listen the
+    /// same way and require both nudges' events, the set and the delete: an
+    /// event that never arrives wakes nobody.
+    #[test]
+    fn a_nudge_wakes_a_root_listener() {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::Event;
+        use x11rb::protocol::xproto::{
+            ChangeWindowAttributesAux, ConnectionExt as _, EventMask, Property,
+        };
+        if std::env::var("ROOMLERD_TEST_X11").as_deref() != Ok("1") {
+            eprintln!("ROOMLERD_TEST_X11 unset — skipping (the Xvfb lane sets it)");
+            return;
+        }
+        let display = std::env::var("DISPLAY").expect("ROOMLERD_TEST_X11=1 but DISPLAY is unset");
+        let (conn, screen) = x11rb::connect(Some(&display)).expect("the Xvfb");
+        let root = conn.setup().roots[screen].root;
+        conn.change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        let atom = conn
+            .intern_atom(false, WM_NUDGE_ATOM)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        assert_eq!(
+            nudge_wm(&display, 7, false),
+            Some(true),
+            "the nudge did not reach {display}"
+        );
+        assert_eq!(
+            nudge_wm(&display, 8, true),
+            Some(true),
+            "the last nudge did not reach {display}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while seen.len() < 2 && Instant::now() < deadline {
+            match conn.poll_for_event().unwrap() {
+                Some(Event::PropertyNotify(e)) if e.window == root && e.atom == atom => {
+                    seen.push(e.state)
+                }
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![Property::NEW_VALUE, Property::DELETE],
+            "a root listener was not woken by each nudge"
+        );
+        println!("x11-real: a nudge woke a root listener");
+    }
 }
 
 #[cfg(test)]

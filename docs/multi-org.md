@@ -268,9 +268,9 @@ either case: its signalling loop reconnects on its own ladder, and a retry at th
 refusal would race it.
 
 - **The wire.** `rc:overlay.join_refused { reason, detail }`
-  ([`signaling.rs:4364-4370`](../crates/remote_control/src/signaling.rs#L4364-L4370)) goes only to a
+  ([`signaling.rs:4374-4380`](../crates/remote_control/src/signaling.rs#L4374-L4380)) goes only to a
   node whose join set `supports_join_refusal`
-  ([`signaling.rs:2514`](../crates/remote_control/src/signaling.rs#L2514)). An older node keeps the
+  ([`signaling.rs:2524`](../crates/remote_control/src/signaling.rs#L2524)). An older node keeps the
   old silence, and the server's ERROR line, `alert = "overlay_join_refused"`
   ([`overlay.rs:278-295`](../crates/modules/network/src/overlay.rs#L278-L295)), is then the only
   trace. The frame is a new top-level variant, which an old agent drops as an unknown
@@ -893,7 +893,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
   netstack`. FR-49 had made netstack the default for `enroll --overlay`, which
   made this the common case, and #2493 measured it on 0.4.143: no listener on
   the port, no peers, no log line. Now `for_org` turns a netstack secondary on
-  when it has its own port and key (`crates/agent-core/src/config.rs:2218-2220`),
+  when it has its own port and key (`crates/agent-core/src/config.rs:2220-2222`),
   and `derived_netstack` sends it to its stack rather than to the per-org TUN
   that the device-wide `overlay_multi_org` would pick
   (`agents/roomlerd/src/overlay.rs:311`). A port that is unset is **picked**:

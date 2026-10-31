@@ -39,7 +39,7 @@ flowchart LR
 ```
 
 ⚠️ The LocalAPI is the trust boundary. On Windows its SDDL grants **SYSTEM, Administrators
-and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:2019`): any person
+and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:2040`): any person
 logged in at the machine can call it, a sandboxed low-integrity process cannot. Everything
 below that lets the companion *change* something is therefore something any interactive user
 can do — which is why the device-side rules (the `files_dir` SYSTEM rule, the visibility rule
@@ -110,7 +110,7 @@ sequenceDiagram
    flow id (`routeRows`, `:48`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
    one rolled generation).
-2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2112`)
+2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2133`)
    binds the first instance (retrying while another process holds the name), then runs a
    pool of accept tasks (`accept_pipe`, `:1976`), each owning one listening instance and
    re-creating it before handing a connected one off. Default 4
@@ -353,7 +353,7 @@ sequenceDiagram
   `ConfigSet` are refused on the person socket, so Settings edits the per-user half's own
   file — and says so (§5). The same socket does tell the companion, and the CLI's
   `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:4571`), that a root half exists: `/var/run/roomler` is
+  `crates/localapi/src/lib.rs:4592`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
@@ -364,7 +364,7 @@ sequenceDiagram
 Most settings are read once at startup, so saving one is not the same as applying it. The
 Settings page collects the saved restart-required keys in a bar with an **Apply now** button;
 `roomler restart` is the same thing from a terminal. Both send `Request::RestartDaemon`
-(`crates/localapi/src/lib.rs:1407`), and **the daemon decides**.
+(`crates/localapi/src/lib.rs:1428`), and **the daemon decides**.
 
 It restarts only when it can prove that something will start it again — exiting an
 unsupervised `roomlerd run` would take the device offline for good:
@@ -399,7 +399,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:1759`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:1774`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -438,6 +438,27 @@ sequenceDiagram
 - ⚠️ **This is local only.** Remote configuration never restarts a daemon: a server push is
   persisted and reported as *applied-pending-restart*, and there is no server message that
   restarts anything (`docs/remote-config.md` §7b).
+
+### 7.1 The macOS permission card's Restart (#3164)
+
+macOS applies a Screen Recording grant to a freshly started process only, so a Mac's card offers
+**Restart roomlerd** beside its Screen Recording row: the same flow as *Apply now*
+(`window.Roomler.restartDaemon`, the LocalAPI `RestartDaemon` verb, the agent's own supervisor
+relaunches it). Accessibility needs none: the agent reads it live and opens its input backend
+again once it is granted.
+
+The card shows the **agent's** grants, as the agent reports them in its status
+(`NodeStatus.macos_grants`, read from its own process). Before #3164 it asked TCC about the
+menu-bar app's own process, `ai.roomler.agent-tray`, which never holds either grant: the card
+kept asking for both after the person had granted them to `roomlerd`, and its button registered
+the menu-bar app itself in the pane, as the "Roomler" entry that changes nothing. The buttons now
+only open the pane. An agent that does not report its grants (older than #3164, not running, or a
+root half with no GUI session) shows no card.
+
+macOS's own **Quit & Reopen** restarts the agent too (`agents/roomlerd/src/macos_quit.rs`): a
+Quit AppleEvent from anyone but `loginwindow` ends it with the supervisor's restart code instead
+of AppKit's exit 0. Up to 0.4.188 that button left the agent offline (`docs/installation.md`,
+the macOS grants).
 
 ## 8. What this device can encode
 
@@ -684,9 +705,9 @@ registered the moment it connects, and the banner used to come up then. It said 
 while nothing was shared yet. On a desktop that centres new windows, it also sat right over the
 dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat beside the
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
-dialog is the wait (`agents/roomlerd/src/peer.rs:5599`, `AskingMark`
+dialog is the wait (`agents/roomlerd/src/peer.rs:5612`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:42`). The LocalAPI row carries the mark (`asking`,
-`crates/localapi/src/lib.rs:1186`), and the banner comes up only for a session that sees the
+`crates/localapi/src/lib.rs:1207`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:325`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.

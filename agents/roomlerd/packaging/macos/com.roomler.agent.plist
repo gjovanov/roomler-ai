@@ -9,7 +9,13 @@
   First run will trigger two permission prompts:
    - Screen Recording (System Settings -> Privacy & Security)
    - Accessibility       (System Settings -> Privacy & Security)
-  Grant both, then `launchctl kickstart -k gui/$UID/com.roomler.agent`.
+  Turn on `roomlerd` under both. Screen Recording applies after a restart:
+  macOS's own "Quit & Reopen", or `launchctl kickstart -k gui/$UID/com.roomler.agent`.
+
+  #3164: that "Quit & Reopen" is a Quit AppleEvent, which AppKit ends with
+  exit 0, and KeepAlive below relaunches only a NON-zero exit. So the agent
+  answers it by exiting with the restart code (`macos_quit.rs`) — except at a
+  log-out, restart or shut-down, when AppKit's exit 0 keeps it down.
 -->
 <plist version="1.0">
 <dict>

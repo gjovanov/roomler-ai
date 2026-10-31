@@ -24,7 +24,7 @@ someone has named a device, the machine-reported name is usually noise.
 | Surface | Where the checkbox is | What it hides |
 |---|---|---|
 | Devices grid (`/tenant/{tid}/device`) | the column picker (`AgentsSection.vue:1142`) | the fleet name in the Name cell's caption line (`:342`) |
-| Remote control (`/tenant/{tid}/agent/{id}/remote`) | Settings › Display (`RemoteControl.vue:1468`) | the fleet name in the header subtitle, before OS · version (`:47`) |
+| Remote control (`/tenant/{tid}/agent/{id}/remote`) | Settings › Display (`RemoteControl.vue:1471`) | the fleet name in the header subtitle, before OS · version (`:47`) |
 
 Both surfaces use the same composable (`ui/src/composables/useHideDeviceName.ts:48`),
 so a flip on one shows on the other at once, including a surface open in
@@ -45,7 +45,7 @@ equal.
 selector reaches knows a display name: the server's exec/SSH target resolver
 (`crates/modules/fleet/src/socket.rs:1177` `resolve_exec_target`: hex id → exact
 `agents.name` → case-insensitive `agents.name`) or the daemon's ping resolver
-(`agents/roomlerd/src/localapi_state.rs:485` `resolve_overlay`: literal address
+(`agents/roomlerd/src/localapi_state.rs:556` `resolve_overlay`: literal address
 → mesh label, whole or first label). The CLI closes the gap **on the client**,
 by joining the device list the daemon already fetches for this device
 (`roomler devices`, FR-84 D5b) onto the peer list — the same two join keys the
@@ -60,8 +60,8 @@ rule are pure functions (`names.rs:101` `name_peers`, `:124` `filter_by_names`,
 |---|---|---|
 | `roomler peers --display-name` | NAME shows the display name where one is set, else the mesh name (the column widens to fit and is cut at 34, like `devices`); `--json` gains a `display_name` per peer, `null` when unknown — without the flag the JSON is the wire verbatim | each printed org section's own; `--org` narrows (`localclient.rs:333` `device_lists_for`) |
 | `roomler peers NAME…` | only the peers whose mesh name **or** display name equals an argument, case-insensitively, in argument order; an argument that matches nothing is one stderr warning, and the exit is non-zero only when none matched | same |
-| `roomler ping <display name>` | sent as the device's overlay IPv4 — with `-6`, the derived IPv6 the local peer view publishes for it; the output line keeps the **typed** target (`localclient.rs:442` `ping_target`) | the primary's: the daemon's `ping` reads only the primary's mesh (`localapi_state.rs:485`) |
-| `roomler exec` / `roomler ssh` / `roomler diag <display name>` | sent as the device's hex agent id (`localclient.rs:423` `agent_selector`) | the primary's: both ride the primary enrollment's control WS — `DaemonState.tunnel_hub` is the ONE hub `agents/roomlerd/src/app.rs:4177` shares with the primary loop, while every secondary loop gets an isolated one (`app.rs:4562`) — so the server resolves within that org |
+| `roomler ping <display name>` | sent as the device's overlay IPv4 — with `-6`, the derived IPv6 the local peer view publishes for it; the output line keeps the **typed** target (`localclient.rs:442` `ping_target`) | the primary's: the daemon's `ping` reads only the primary's mesh (`localapi_state.rs:556`) |
+| `roomler exec` / `roomler ssh` / `roomler diag <display name>` | sent as the device's hex agent id (`localclient.rs:423` `agent_selector`) | the primary's: both ride the primary enrollment's control WS — `DaemonState.tunnel_hub` is the ONE hub `agents/roomlerd/src/app.rs:4234` shares with the primary loop, while every secondary loop gets an isolated one (`app.rs:4619`) — so the server resolves within that org |
 
 ### The selector rule — a display name never shadows what works today
 

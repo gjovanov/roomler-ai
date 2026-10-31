@@ -126,7 +126,7 @@ Two records, written by two parties, as for recordings and transfers
 | Record | Written by | Says | Where |
 |---|---|---|---|
 | `session_requested` in `remote_audit` | the server, from its own decision | whether `PRIVACY` was granted, and if not why (`privacy_stripped`) | P1a |
-| `privacy_activity` | the device, reporting (FR-99 P1d) | what it then did: each curtain up, each take-down and why, each "on" it refused | `rc:privacy.activity` ([`agent_socket.rs:203`](../crates/modules/remote/src/agent_socket.rs#L203)) |
+| `privacy_activity` | the device, reporting (FR-99 P1d) | what it then did: each curtain up, each take-down and why, each "on" it refused | `rc:privacy.activity` ([`agent_socket.rs:206`](../crates/modules/remote/src/agent_socket.rs#L206)) |
 
 ```mermaid
 sequenceDiagram

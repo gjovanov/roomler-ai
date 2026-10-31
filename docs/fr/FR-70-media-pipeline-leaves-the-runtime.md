@@ -915,7 +915,7 @@ every rate move is a background open and a swap):
 **It is not a plan bug.** The loop built that replacement at exactly the plan's
 rate at the moment it decided it: `rebuild_spec(bps)` coarsens the controller's
 applied rate onto the ladder, and `after_tick` folds the same
-`governor.applied_bps()` into the plan (`peer.rs:9198`). What the counter
+`governor.applied_bps()` into the plan (`peer.rs:9211`). What the counter
 measured is the plan MOVING during a build that takes seconds — which is what
 make-before-break is, with one swap in flight and an encoder that cannot re-rate
 in place. M3b's loop, reading the plan, would do the same thing. The check
@@ -940,7 +940,7 @@ viewer's Fit mode and the stage shrunk below the DPR-1.5 native box:
 | 11:03:04 | Priority Balanced → Smoother | `rc:priority updated`; no geometry move on a direct path with the dial's dims caps at their default (off); no divergence |
 
 **The plan held** through that 4 ms open — this is not a stale adoption. The dims
-replacement was opened at `min(last_ceiling, applied)` (`peer.rs:8369`): the
+replacement was opened at `min(last_ceiling, applied)` (`peer.rs:8382`): the
 **old** 1600×900 frame's ceiling and the applied 22.95 M, the 25 M rung. The plan
 already aimed at 1050×590. The controller's first tick after adoption clamped the
 target to the smaller frame's ceiling — 9.87 M, which is 0.43 × 23 M, the pixel
@@ -976,19 +976,19 @@ been lost.
 
 - `Shadow::swap_spawn` (`plan.rs:552`) captures the plan's rate and dims when a
   replacement spawns, and the pump carries it beside the handle: `pending_swap`
-  is now `(handle, spawn)` (`peer.rs:7413`), and `PendingDimsOpen` gains a fifth
-  field (`peer.rs:8396`).
+  is now `(handle, spawn)` (`peer.rs:7426`), and `PendingDimsOpen` gains a fifth
+  field (`peer.rs:8409`).
 - At adoption, `judge_swap` (`plan.rs:601`, through `note_rate_swap_adopted`
-  `:563` and `note_dims_swap_adopted` `:573`, wired at `peer.rs:7364` and
-  `:7116`) asks one question: **did the plan move while it opened?**
+  `:563` and `note_dims_swap_adopted` `:573`, wired at `peer.rs:7377` and
+  `:7129`) asks one question: **did the plan move while it opened?**
   - **It held** — the common case; opens are milliseconds on most backends: the
     replacement is judged exactly as an inline open is, against the
     controller's first target after adoption (`after_tick`, `plan.rs:527`).
     Re-rated there although the plan did not move is a divergence — the `zeus`
     finding above.
   - **It moved**: a **stale adoption**, counted apart — `plan_stale_swaps` on
-    the heartbeat (`peer.rs:9725`), and the session's first logs once at INFO
-    with its three rates (`log_plan_stale_swap`, `peer.rs:9792`): *`FR-70 M3a: a
+    the heartbeat (`peer.rs:9738`), and the session's first logs once at INFO
+    with its three rates (`log_plan_stale_swap`, `peer.rs:9805`): *`FR-70 M3a: a
     replacement was adopted after the plan moved while it opened (built at the
     plan of its spawn; first time this session)`*. Not judged at the tick. That
     is the lag M4 will trade against an IDR per adoption.
@@ -1095,7 +1095,7 @@ sequenceDiagram
 | Where | What |
 |---|---|
 | `policy::replacement_open_bps` (`policy.rs:211`) | the applied rate (or, before the controller has applied one, the remembered seed), never above the ceiling of the dims the replacement is opened FOR |
-| the dims spawn (`peer.rs:8369`, the rate at `:8406`) | computes that ceiling at the plan dims with the same chain as the per-frame ceiling (`peer.rs:8533`–`8231`): `rate_plan` with the same native dims, fps, codec, chroma, encode factor, user-pick and dial factor → the learner's lift → the shared-pipeline split, floored at the plan dims' area floor |
+| the dims spawn (`peer.rs:8382`, the rate at `:8419`) | computes that ceiling at the plan dims with the same chain as the per-frame ceiling (`peer.rs:8546`–`8231`): `rate_plan` with the same native dims, fps, codec, chroma, encode factor, user-pick and dial factor → the learner's lift → the shared-pipeline split, floored at the plan dims' area floor |
 | `CeilingLearner::ceiling_for` (`ceiling_learn.rs:138`), `RateGovernor::ceiling_for` (`governor.rs:584`) | asks the learner instead of telling it: `effective_ceiling` without recording the nominal, so the learner's judgements stay on the frame actually encoded. `effective_ceiling` now delegates to it, so the two cannot drift |
 
 - **A move up changes nothing.** The applied rate already sits under the old
@@ -1235,12 +1235,12 @@ flowchart TD
 | Where | What |
 |---|---|
 | `DimsInputs` gains `PartialEq` (`policy.rs:42`) | the shadow compares the inputs it was produced from with the ones the inline arithmetic read |
-| `Shadow::check_dims` takes the inline inputs (`plan.rs:604`), the pump passes them (`peer.rs:8233`) | a geometry difference whose inputs moved is a lag (`moved_input`, `plan.rs:375`, names the first that moved). One whose inputs held is still a `dims` divergence. The pump binds the inline `DimsInputs` once (`peer.rs:8200`), so the plan dims and the check read the same struct |
+| `Shadow::check_dims` takes the inline inputs (`plan.rs:604`), the pump passes them (`peer.rs:8246`) | a geometry difference whose inputs moved is a lag (`moved_input`, `plan.rs:375`, names the first that moved). One whose inputs held is still a `dims` divergence. The pump binds the inline `DimsInputs` once (`peer.rs:8213`), so the plan dims and the check read the same struct |
 | `Shadow::note_built` (`plan.rs:660`) | an inline open records whether it was built from moved inputs, so its dims at the tick are a lag too, not a divergence |
-| `Shadow::after_tick` takes the frame's ceiling (`plan.rs:683`, `peer.rs:9293`) | a REPLACEMENT this very tick re-rated, built within that ceiling, is a stale tick (`note_stale_tick`, `plan.rs:722`) |
-| the heartbeat (`peer.rs:9833`) | `plan_stale_ticks` and `plan_lags` beside `plan_stale_swaps`. The first of each logs once (`log_plan_stale_tick`, `peer.rs:9944`; `log_plan_lag`, `peer.rs:9968`) |
-| the flip's open (`flip_rebuild_pending`, `peer.rs:6350`, set at `:7483`; the open at `:8623`; the pass's tick at `:9116`) | **B1's fix.** On the rebuild a persisted flip forced, the controller ticks FIRST, with the pass's own arguments, and the encoder opens at what it decides. The pass's own tick is then skipped, so a pass still ticks once. A target deferred for the dropped encoder is cleared: the open supersedes it |
-| the tick's direct background-swap arm (`peer.rs:9161`), and both arms of the two congestion decreases (the backpressure skip, `peer.rs:7882`; the send overflow, `:9580`) | **B3's fix.** Applying or scheduling the controller's newest target clears any target still held, as the tick's in-place arm already did. The quiet flush can no longer apply a superseded rate, over a decrease or anywhere else. Only an arm that HOLDS sets the hold |
+| `Shadow::after_tick` takes the frame's ceiling (`plan.rs:683`, `peer.rs:9306`) | a REPLACEMENT this very tick re-rated, built within that ceiling, is a stale tick (`note_stale_tick`, `plan.rs:722`) |
+| the heartbeat (`peer.rs:9846`) | `plan_stale_ticks` and `plan_lags` beside `plan_stale_swaps`. The first of each logs once (`log_plan_stale_tick`, `peer.rs:9957`; `log_plan_lag`, `peer.rs:9981`) |
+| the flip's open (`flip_rebuild_pending`, `peer.rs:6363`, set at `:7496`; the open at `:8636`; the pass's tick at `:9129`) | **B1's fix.** On the rebuild a persisted flip forced, the controller ticks FIRST, with the pass's own arguments, and the encoder opens at what it decides. The pass's own tick is then skipped, so a pass still ticks once. A target deferred for the dropped encoder is cleared: the open supersedes it |
+| the tick's direct background-swap arm (`peer.rs:9174`), and both arms of the two congestion decreases (the backpressure skip, `peer.rs:7895`; the send overflow, `:9593`) | **B3's fix.** Applying or scheduling the controller's newest target clears any target still held, as the tick's in-place arm already did. The quiet flush can no longer apply a superseded rate, over a decrease or anywhere else. Only an arm that HOLDS sets the hold |
 
 - **Why only a replacement can be a stale tick.** The inline open runs in the
   same pass as the tick, so the loop can consult the controller before it

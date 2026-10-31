@@ -2991,6 +2991,22 @@ pub struct DesiredConfig {
     /// process, which the device reports as `needs_restart`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_description: Option<String>,
+    /// FR-132 P1 — the GPU-input denylist (`zero_copy_deny`): comma-separated
+    /// `name:gpu` entries (`hevc_qsv:gpu`) or `none`, the kill switch of
+    /// FR-118's GPU-input cells. Pushable for the reason the two denylists
+    /// above are: it only ever REMOVES a GPU form a device would otherwise
+    /// open, so `MANAGE_AGENTS` is enough, and the server passes it on
+    /// unread, because a device skips an entry it cannot parse. Blank clears
+    /// the device's key (deny nothing). The probe and the config fallbacks
+    /// read it once per process, which the device reports as `needs_restart`.
+    ///
+    /// ⚠️ `zero_copy` ITSELF, the switch that turns the GPU path on, is
+    /// ABSENT and stays absent (FR-132 decision 1): turning a cell ON is a
+    /// decision made on the device, or by a release. `zero_copy` is a PREFIX
+    /// of `zero_copy_deny`, so the test guarding it compares whole keys
+    /// (`the_device_owned_refusals_are_not_pushable`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_copy_deny: Option<String>,
     /// Bumped on every write. The agent reports the revision it has applied,
     /// so "asked for" and "actually running" can be told apart in the UI —
     /// without it, a device that refused the config and one that never heard
@@ -3015,6 +3031,7 @@ impl DesiredConfig {
             && self.encoder_cells_deny.is_none()
             && self.fps_deny.is_none()
             && self.color_description.is_none()
+            && self.zero_copy_deny.is_none()
     }
 
     /// Whether this request touches the Fleet-RPC grant. Drives the
@@ -3063,6 +3080,8 @@ impl DesiredConfig {
             // FR-130 P1b — neither: the colour description grants nothing,
             // whichever way it is pushed.
             color_description: _,
+            // FR-132 P1 — neither: the GPU-input denylist only removes.
+            zero_copy_deny: _,
             revision: _,
             updated_by: _,
             updated_at: _,
@@ -5856,6 +5875,13 @@ pub struct SessionStats {
     /// go/no-go dataset — see the signalling twin's doc).
     #[serde(default)]
     pub mixed_dial_seconds: u64,
+    /// FR-132 P1 (§3b) — the viewer's decode errors in this session, as the
+    /// agent counted them (see the signalling twin's doc). **Absent is "not
+    /// counted", never zero**: a session whose viewer or agent predates the
+    /// count, or that never decoded in a worker, carries no such field, so a
+    /// fleet read can compare only sessions that counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_errors: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -7646,6 +7672,7 @@ mod tests {
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
             color_description: Some("off".into()),
+            zero_copy_deny: Some("hevc_qsv:gpu".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7692,6 +7719,7 @@ mod tests {
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
             color_description: Some("off".into()),
+            zero_copy_deny: Some("hevc_qsv:gpu".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7722,6 +7750,7 @@ mod tests {
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
             color_description: Some("off".into()),
+            zero_copy_deny: Some("hevc_qsv:gpu".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7772,6 +7801,7 @@ mod tests {
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
             color_description: Some("off".into()),
+            zero_copy_deny: Some("hevc_qsv:gpu".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7815,6 +7845,7 @@ mod tests {
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
             color_description: Some("off".into()),
+            zero_copy_deny: Some("hevc_qsv:gpu".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -9619,6 +9650,7 @@ mod tests {
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
             color_description: Some("off".into()),
+            zero_copy_deny: Some("hevc_qsv:gpu".into()),
             revision: 1,
             updated_by: Some(ObjectId::new()),
             updated_at: Some(DateTime::now()),
@@ -9727,6 +9759,16 @@ mod tests {
                  refusal, and a server that can set it can set everything. Got keys: {keys:?}"
             );
         }
+        // FR-132 decision 1 — nor the GPU path's ON switch: only its denylist,
+        // the half that removes, is pushable. `zero_copy` is a PREFIX of
+        // `zero_copy_deny`, so both checks compare whole keys; a prefix match
+        // would refuse the kill switch along with the switch.
+        assert!(
+            !keys.contains(&"zero_copy"),
+            "zero_copy must never be pushable by the server: turning a GPU-input cell on \
+             is the device's decision, or a release's. Got keys: {keys:?}"
+        );
+        assert!(keys.contains(&"zero_copy_deny"), "{keys:?}");
         assert!(
             !keys.iter().any(|k| k.contains("restart")),
             "remote configuration never restarts a daemon (docs/remote-config.md §7b): {keys:?}"
@@ -9790,6 +9832,46 @@ mod tests {
         assert_eq!(back.color_description.as_deref(), Some(""));
         let unmanaged = serde_json::to_string(&DesiredConfig::default()).unwrap();
         assert!(!unmanaged.contains("color_description"), "{unmanaged}");
+    }
+
+    /// FR-132 P1 — the GPU-input denylist travels as the text the device
+    /// reads, a blank (clear) is a request rather than "not managed", and it
+    /// is neither an exec nor an SSH change, so pushing it needs no grant bit.
+    /// A frame from a server older than the key reads as not managed.
+    #[test]
+    fn a_pushed_zero_copy_denylist_is_a_request_that_grants_nothing() {
+        let deny = DesiredConfig {
+            zero_copy_deny: Some("hevc_qsv:gpu, av1_nvenc:gpu".into()),
+            ..Default::default()
+        };
+        assert!(!deny.is_empty());
+        assert!(!deny.touches_exec() && !deny.touches_ssh());
+        assert!(
+            deny.same_ssh_as(&DesiredConfig::default()),
+            "the denylist is not part of the SSH family"
+        );
+        let json = serde_json::to_string(&deny).unwrap();
+        assert!(
+            json.contains(r#""zero_copy_deny":"hevc_qsv:gpu, av1_nvenc:gpu""#),
+            "{json}"
+        );
+        let back: DesiredConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, deny);
+
+        let clear = DesiredConfig {
+            zero_copy_deny: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(!clear.is_empty(), "a clear is a request");
+        let back: DesiredConfig =
+            serde_json::from_str(&serde_json::to_string(&clear).unwrap()).unwrap();
+        assert_eq!(back.zero_copy_deny.as_deref(), Some(""));
+
+        let old: DesiredConfig =
+            serde_json::from_str(r#"{"fps_deny":"*:144","revision":3}"#).unwrap();
+        assert_eq!(old.zero_copy_deny, None, "absent = not managed");
+        let unmanaged = serde_json::to_string(&DesiredConfig::default()).unwrap();
+        assert!(!unmanaged.contains("zero_copy"), "{unmanaged}");
     }
 
     // ── #1630: an audit row must read back through the driver's own pair ───

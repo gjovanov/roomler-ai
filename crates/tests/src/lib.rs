@@ -318,6 +318,13 @@ mod room_visibility_tests;
 /// overwritten by a later sample with none.
 #[cfg(test)]
 mod session_carrier_tests;
+/// FR-132 P1 (§3b) — the viewer's decode errors: a real viewer peer reports
+/// one on the control channel, the real agent counts it and sends a sample at
+/// once, and the server stores `remote_sessions.stats.decode_errors`; a
+/// counted zero is stored as zero, and a sample that did not count never
+/// overwrites a stored count.
+#[cfg(test)]
+mod session_decode_errors_tests;
 /// FR-102 P9b — the post-session rating's server half: a party stores one
 /// rating with codes only, everyone else is refused with a code, the kill
 /// switch's empty 404, `purge_user`, and the digest's `quality.ratings`.

@@ -460,9 +460,9 @@ area. Its boundary, measured on master, is a short list of small edges, each wit
 | Edge out of the plane | Sites | Inversion |
 |---|---|---|
 | `encode::caps` reads Hive's switches (`adopt_enabled`, `replica_enabled`, `archive_enabled`, `stream_enabled`) | `encode/caps.rs:2114-2143` | `caps::detect` takes a `HostWords` value the hub fills from Hive, `files::is_remote_browse_enabled` (`:1961`), `rc_local_turn::enabled` (`:2041`) and `apps` (`:1916-1926`, `:3285`) |
-| `capture` asks `companion` which graphical session is live | `capture/mod.rs:2163`, `capture/portal/mod.rs:1316-1318` | the session lookup moves to a leaf both can see (`roomler-node-host`, P3) or is passed in by the pump's caller |
-| `capture`, `input` ask `system_context::worker_role` and `desktop_rebind` | `capture/mod.rs:2807-2810`, `input/system_context_backend.rs:84`, `:380`, `input/sas.rs:194`, `input/mod.rs:576` | `worker_role` (pure: SYSTEM / worker / user) goes to the host leaf; the SystemContext capture pump is a capture backend and moves with `capture/` |
-| `capture::scrap_backend` takes `power::DisplayAwake` | `capture/scrap_backend.rs:143` | `power` goes to the host leaf |
+| `capture` asks `companion` which graphical session is live | `capture/mod.rs:2177`, `capture/portal/mod.rs:1316-1318` | the session lookup moves to a leaf both can see (`roomler-node-host`, P3) or is passed in by the pump's caller |
+| `capture`, `input` ask `system_context::worker_role` and `desktop_rebind` | `capture/mod.rs:2821-2824`, `input/system_context_backend.rs:84`, `:380`, `input/sas.rs:194`, `input/mod.rs:591` | `worker_role` (pure: SYSTEM / worker / user) goes to the host leaf; the SystemContext capture pump is a capture backend and moves with `capture/` |
+| `capture::scrap_backend` takes `power::DisplayAwake` | `capture/scrap_backend.rs:145` | `power` goes to the host leaf |
 | `keep_busy` reads `win_identity`, `lock_state`, `presence` | `keep_busy/state.rs:135-248`, `keep_busy/host_win.rs:28`, `:67` | `win_identity`, `win_token` to the host leaf; `lock_state`/`lock_on_end`/`presence` move with the plane |
 | `indicator` owns `rc_sessions::RcSessionRegistry` and calls `companion::ensure_running` | `indicator/mod.rs:100-606`, `indicator/notify.rs:212`, `:526` | `rc_sessions` moves with the plane (it is the indicator's registry; `peer.rs` reads it from above); the companion start becomes a callback the hub installs |
 | `encode` names `peer::TargetResolution` | `encode/resample.rs:43`, `encode/plan.rs:645`, `encode/policy.rs:28`, `encode/sim.rs:2958` | the type moves into the plane and `peer.rs` re-exports it |
@@ -497,7 +497,7 @@ v2 runners (§2.4):
 | binary | **−5.5 % Windows, −11.5 % macOS (measured)**: the duplicated generics vanish | today's: two units still instantiate the same generics twice |
 | packages | none change; `roomlerd` keeps its lib and bin | the lib and the bin must sit in different packages (a package's bin may not depend on a crate that depends on the package's lib) |
 | the lane | untouched | layout (ii) below leaves it untouched; (i) changes four build lines |
-| what else | `main.rs`'s tests (`agents/roomlerd/src/app.rs:6800` after the rename) start running under `--lib`; 59 anchors in 30 docs take the new file name at the same numbers (FR-28's two `main.rs:N` are the API's and stay) | the same, plus the layout's CI edits |
+| what else | `main.rs`'s tests (`agents/roomlerd/src/app.rs:6871` after the rename) start running under `--lib`; 59 anchors in 30 docs take the new file name at the same numbers (FR-28's two `main.rs:N` are the API's and stay) | the same, plus the layout's CI edits |
 
 **A first, then B if more time is needed.** A is one moved file, no package change, and the only
 option that improves both axes — it buys 1.2 MB of MSI headroom on Windows against a 22.00 MB
@@ -521,7 +521,7 @@ How A is cut, so that it is the measured shape and nothing else:
   file keeps its `roomlerd::` spelling (219 sites) behind `extern crate self as roomlerd;` in
   `lib.rs`, so an edit in flight on the old file still applies *and compiles* when its branch
   rebases. The `crate::` respelling is a later, quiet commit once the open PRs have landed.
-- **Its tests run for the first time.** `app::tests` (`agents/roomlerd/src/app.rs:6800`) — the CLI
+- **Its tests run for the first time.** `app::tests` (`agents/roomlerd/src/app.rs:6871`) — the CLI
   parses the wizard's snippets rely on, the config-path ladder, the self-heal predicate, the
   retired-spelling guard — ran in no lane while they were a bin's; under `--lib` the Linux, Windows
   and macOS unit steps now run them. They are pure (clap parses, pure predicates, a process-env

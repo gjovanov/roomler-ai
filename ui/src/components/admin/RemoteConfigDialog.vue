@@ -179,6 +179,26 @@
           <code>none</code> = deny nothing. It only ever removes rates, so no
           extra permission bit; takes effect at the next daemon restart.
         </div>
+        <v-text-field
+          v-model="zeroCopyDenyText"
+          label="GPU-input cells to deny (zero_copy_deny)"
+          placeholder="hevc_qsv:gpu, av1_nvenc:gpu"
+          density="compact"
+          variant="outlined"
+          hide-details
+          persistent-placeholder
+          class="mb-1"
+        />
+        <div class="text-caption text-medium-emphasis mb-4 ml-1">
+          Comma-separated <code>name:gpu</code> entries: encoders that must not
+          take captured frames straight from the GPU, and take them through
+          memory as before. The kill switch for a GPU-input cell that misbehaves
+          on a driver. Blank = not managed (the device keeps its own, which
+          denies nothing unless set there); <code>none</code> = deny nothing.
+          It only ever removes, so no extra permission bit; takes effect at the
+          next daemon restart. Turning the GPU path on is the device's own
+          setting, and cannot be pushed.
+        </div>
         <!-- FR-130 P1b — four states, because a tribool key has three and a
              request adds "not managed". Cleared and "default" differ: the
              first leaves the device's value alone, the second clears it. -->
@@ -500,6 +520,15 @@ const fpsDenyText = computed({
     draft.value.fps_deny = t === '' ? undefined : t
   },
 })
+/** FR-132 P1 — the GPU-input denylist, the same shape again: a blank box is
+ *  "not managed", and `none` says "deny nothing". */
+const zeroCopyDenyText = computed({
+  get: () => draft.value.zero_copy_deny ?? '',
+  set: (v: string) => {
+    const t = v.trim()
+    draft.value.zero_copy_deny = t === '' ? undefined : t
+  },
+})
 /** FR-130 P1b — the colour-description switch. A cleared select is "not
  *  managed"; "default" sends `''`, which clears the device's key. */
 const colorDescriptionChoice = computed({
@@ -541,6 +570,7 @@ watch(
       encoder_cells_deny: d?.encoder_cells_deny,
       fps_deny: d?.fps_deny,
       color_description: d?.color_description,
+      zero_copy_deny: d?.zero_copy_deny,
     }
     original.value = JSON.stringify(draft.value)
     if (agentStore.orgExecEnabled === null) void agentStore.fetchOrgExecEnabled(props.tenantId)
