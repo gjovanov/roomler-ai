@@ -4045,9 +4045,14 @@ async fn handle_server_msg(
                 // old one's drop forgets its counters: carry the transfer
                 // readings across, so the cumulative tallies never go back.
                 let carried = crate::session_telemetry::counters(session_id).take_transfers();
+                // FR-132 P1 — and the decode-error count, for the same reason.
+                let carried_decode_errors =
+                    crate::session_telemetry::counters(session_id).decode_errors();
                 close_within_budget(old.close(), session_id, "replaced_by_offer").await;
                 drop(old);
                 crate::session_telemetry::counters(session_id).carry_transfers(carried);
+                crate::session_telemetry::counters(session_id)
+                    .carry_decode_errors(carried_decode_errors);
             }
 
             // Read back the codec picked by `rc:session.request`. If
@@ -7083,6 +7088,9 @@ fn session_stats_msg(
         // server never sees the key and a sample before `Connected` carries
         // nothing to misread.
         carrier: t.carrier.map(|c| c.as_str().to_string()),
+        // FR-132 P1 — absent until the viewer said it counts decode errors,
+        // so a zero on the wire is always a measured one.
+        decode_errors: t.decode_errors,
     }
 }
 
@@ -7505,6 +7513,7 @@ mod tests {
             shared_seconds: 0,
             mixed_dial_seconds: 0,
             carrier: Some(crate::session_carrier::SessionCarrier::OverlayTurn),
+            decode_errors: Some(2),
         };
         match session_stats_msg(sid, &t, Default::default()) {
             ClientMsg::SessionStats {
@@ -7515,8 +7524,11 @@ mod tests {
                 keyframe_requests,
                 input_events,
                 carrier,
+                decode_errors,
                 ..
             } => {
+                // FR-132 P1 — the viewer's decode errors ride it too.
+                assert_eq!(decode_errors, Some(2));
                 assert_eq!(session_id, sid.to_hex());
                 assert_eq!(bytes_sent, 1_234);
                 assert_eq!(bytes_recv, 5_678);

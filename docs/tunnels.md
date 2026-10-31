@@ -598,7 +598,7 @@ so tests drive it directly:
 | While a setup is in flight… | Rule | Where |
 |---|---|---|
 | `rc:tunnel.quic.candidate` for the session | **buffered** on the entry (≤ 16), permitted on the peer the moment it lands, **before** the ready goes out — without its TURN permission coturn drops the client's opening Initials, so a dropped candidate is a session that silently never connects | `signaling.rs:3882`, `quic_setup.rs:243` |
-| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `signaling.rs:4088`, `quic_setup.rs:258` |
+| `rc:tunnel.terminate` for the session | **cancel**: the result is `close()`d, never inserted (a peer in no map is closed by nobody — the #1754 class) | `signaling.rs:4093`, `quic_setup.rs:258` |
 | the result belongs to an attempt this connection does not hold — it finished after the control WS reconnected, or after a cancel-and-retry | **late**: `close()`d. Every attempt carries a process-unique id, checked on completion, so a stale result never evicts a newer attempt for the same session | `quic_setup.rs:272`, `signaling.rs:2105` |
 | a second `rc:tunnel.quic.setup` for a session whose first is live | **refused** (`AlreadyPending`, a warn, no ready): the server sends one setup per open, the first attempt already answers the session, and a second ~20 s allocation per duplicate would be an amplifier. After a cancel a new attempt may start; the old one's result is late | `quic_setup.rs:210` |
 | more than 64 setups in flight on one connection | **refused** (`AtCapacity`, a warn, no ready — the client soft-falls back exactly as after a failed allocation). Each in-flight setup is one task and one allocation, so the cap is a socket bound: above the largest legitimate burst (every client daemon re-opening every declared route to this exit after a server roll), two orders of magnitude under the port-range exhaustion above | `quic_setup.rs:61` |
@@ -924,11 +924,11 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the wire | `net_grant` on `rc:tunnel.open` ([`signaling.rs:2196`](../crates/remote_control/src/signaling.rs#L2196)), `net_grant_id` on `rc:tunnel.opened` ([`:4010`](../crates/remote_control/src/signaling.rs#L4010)) |
+| the wire | `net_grant` on `rc:tunnel.open` ([`signaling.rs:2206`](../crates/remote_control/src/signaling.rs#L2206)), `net_grant_id` on `rc:tunnel.opened` ([`:4020`](../crates/remote_control/src/signaling.rs#L4020)) |
 | the binding | `bind_net_grant` ([`tunnel.rs:547`](../crates/modules/network/src/tunnel.rs#L547)), at step 3c of the open ([`:820`](../crates/modules/network/src/tunnel.rs#L820)) |
 | each flow | `SessionGrant::admits` ([`tunnel.rs:517`](../crates/modules/network/src/tunnel.rs#L517)), first in `handle_forward_request` ([`:1184`](../crates/modules/network/src/tunnel.rs#L1184)) |
 | the principal | `Principal::Session` ([`policy.rs:48`](../crates/tunnel-core/src/policy.rs#L48)), `subject_matches` ([`:143`](../crates/tunnel-core/src/policy.rs#L143)) |
-| the audit | `TunnelAuditEvent.session_id` and `grant_id` ([`models.rs:4955`](../crates/remote_control/src/models.rs#L4955)) |
+| the audit | `TunnelAuditEvent.session_id` and `grant_id` ([`models.rs:4974`](../crates/remote_control/src/models.rs#L4974)) |
 | tests | `tunnel::tests` in the network module (3), `policy::tests::a_session_matches_no_subject_yet`, `signaling::tests::tunnel_open_carries_a_grant_and_opened_echoes_its_id`, and end to end [`tunnel_grant_tests.rs`](../crates/tests/src/tunnel_grant_tests.rs) (3) |
 
 #### The device's half: asking, and opening under the grant (P3-7-3a)
@@ -971,7 +971,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| asking | `vault::net` ([`vault.rs:884`](../agents/roomlerd/src/vault.rs#L884)) and its answer `on_net_granted` ([`:1049`](../agents/roomlerd/src/vault.rs#L1049)), held to what was asked by `net_granted` ([`:389`](../agents/roomlerd/src/vault.rs#L389)); the answer's own arm in the daemon's signalling ([`signaling.rs:6514`](../agents/roomlerd/src/signaling.rs#L6514)) |
+| asking | `vault::net` ([`vault.rs:884`](../agents/roomlerd/src/vault.rs#L884)) and its answer `on_net_granted` ([`:1049`](../agents/roomlerd/src/vault.rs#L1049)), held to what was asked by `net_granted` ([`:389`](../agents/roomlerd/src/vault.rs#L389)); the answer's own arm in the daemon's signalling ([`signaling.rs:6519`](../agents/roomlerd/src/signaling.rs#L6519)) |
 | presenting | `SessionParams.net_grant` ([`driver.rs:413`](../crates/tunnel-core/src/driver.rs#L413)), sent at the open ([`:1024`](../crates/tunnel-core/src/driver.rs#L1024)); a refusal typed ([`:1076`](../crates/tunnel-core/src/driver.rs#L1076)); the echo checked after the guard ([`:1102`](../crates/tunnel-core/src/driver.rs#L1102)); `SessionGrantRef` and `GrantError` ([`:2315`](../crates/tunnel-core/src/driver.rs#L2315), [`:2332`](../crates/tunnel-core/src/driver.rs#L2332)) |
 | the flow | `FlowLive.net_grant` ([`client_mgr.rs:201`](../agents/roomlerd/src/tunnel/client_mgr.rs#L201)), permanent by its type in `permanent_session_error` ([`:1737`](../agents/roomlerd/src/tunnel/client_mgr.rs#L1737)) |
 | the code | `NET_GRANT_REFUSED` ([`vault.rs:575`](../crates/remote_control/src/vault.rs#L575)), shared by the server and the device |
@@ -1085,7 +1085,7 @@ Four parties each say yes, and each for itself:
 | the tools | `net_tools` ([`toolbelt.rs:1331`](../agents/roomlerd/src/hive/toolbelt.rs#L1331)), offered in `tools/list` ([`:1885`](../agents/roomlerd/src/hive/toolbelt.rs#L1885)) and answered in `ask_vault` ([`:1730`](../agents/roomlerd/src/hive/toolbelt.rs#L1730)); their names in the settings, `NET_TOOLS` ([`:625`](../agents/roomlerd/src/hive/toolbelt.rs#L625)) |
 | a call | `net_tools::call` ([`net_tools.rs:192`](../agents/roomlerd/src/hive/net_tools.rs#L192)), its arguments `parse` ([`:144`](../agents/roomlerd/src/hive/net_tools.rs#L144)), the run's end `drop_run` ([`:336`](../agents/roomlerd/src/hive/net_tools.rs#L336)), called as the run's leases go ([`supervisor.rs:4069`](../agents/roomlerd/src/hive/supervisor.rs#L4069)) |
 | the owner's gate | `hive_net` ([`config.rs:596`](../crates/agent-core/src/config.rs#L596)), `HiveConfig.net` ([`gates.rs:55`](../agents/roomlerd/src/hive/gates.rs#L55)), `Supervisor::net_hub` ([`supervisor.rs:1562`](../agents/roomlerd/src/hive/supervisor.rs#L1562)); the settings' `ask`, `vault_use_tools` ([`:5076`](../agents/roomlerd/src/hive/supervisor.rs#L5076)) |
-| the hub | `TunnelClientHub::set_primary` ([`client_mgr.rs:289`](../agents/roomlerd/src/tunnel/client_mgr.rs#L289)), called as the daemon builds it ([`app.rs:4465`](../agents/roomlerd/src/app.rs#L4465)) |
+| the hub | `TunnelClientHub::set_primary` ([`client_mgr.rs:289`](../agents/roomlerd/src/tunnel/client_mgr.rs#L289)), called as the daemon builds it ([`app.rs:4522`](../agents/roomlerd/src/app.rs#L4522)) |
 | tests | `hive::toolbelt::tests` (6), `hive::net_tools::tests` (6: the call's arguments, its capability, the place it holds, a listener made after its run ended), `hive::supervisor::tests` (2: the settings' `ask`, `net_hub`), `hive::gates::tests::hive_net_is_the_owners_word`, `config_surface::tests::hive_net_defaults_off_and_clears_off`: 16, and 17 negative controls |
 
 ## LocalAPI

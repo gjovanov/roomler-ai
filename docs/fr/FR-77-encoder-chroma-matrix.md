@@ -23,12 +23,12 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
 - `AgentCaps` (`crates/remote_control/src/models.rs:40-186`) carries chroma as a
   transport name (`data-channel-vp9-444`, `:59` — used even when libvpx emits 4:2:0), a
   string `vp9_chroma` (`:165`) and a list `hevc_chroma` (`:177`). The session request
-  carries `preferred_transport` + `chroma_pref` (`crates/remote_control/src/signaling.rs:1004,679`).
+  carries `preferred_transport` + `chroma_pref` (`crates/remote_control/src/signaling.rs:1014,679`).
 - The agent hard-wires `yuv420` for the VP9/AV1/H.264 data-channel codecs
-  (`agents/roomlerd/src/peer.rs:5319-5326`); the ONLY hardware 4:4:4 path is
+  (`agents/roomlerd/src/peer.rs:5332-5339`); the ONLY hardware 4:4:4 path is
   `hevc_nvenc` with the RExt profile (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:770-787`),
   advertised by `hevc_chroma` iff the name is `hevc_nvenc` (`agents/roomlerd/src/encode/caps.rs:612-615`).
-- The picker (`ui/src/views/remote/RemoteControl.vue:2985-2993`) is a hard-coded list
+- The picker (`ui/src/views/remote/RemoteControl.vue:2989-2997`) is a hard-coded list
   — `auto / av1 / hevc / hevc-444 / vp9-444 / vp9-420 / h264` — English literals, no
   i18n, chroma inside the value. Its per-agent override allow-list omitted `hevc-444`
   (fixed in #1468 by making the list the single source the type derives from).
@@ -39,7 +39,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
   (`release-agent.yml:2343-2366`) — several docs still say it does not.
 - There is **no video decoder anywhere on the agent side** (grep-confirmed). The
   browser decodes, through WebCodecs, and probes per codec string
-  (`ui/src/composables/useRemoteControl.ts:2919-2949`).
+  (`ui/src/composables/useRemoteControl.ts:2958-2988`).
 
 ### The size question, measured
 
@@ -116,7 +116,7 @@ Two structural facts shape the design: Chromium keeps **one** `HEVCPROFILE_REXT`
 every RExt chroma form, so `isConfigSupported` cannot tell 4:4:4 from 4:2:2 (the
 mismatch surfaces at the first SPS); and no browser API says whether hardware or software
 decoded. Only a real-bytes trial proves a cell, and the page-scoped transport ban
-(`useRemoteControl.ts:4454`) already is that trial.
+(`useRemoteControl.ts:4493`) already is that trial.
 
 **The honest 4:4:4 cells** are therefore: HEVC 4:4:4 (hardware both ends on modern
 NVIDIA and Intel; not on Linux Chrome), VP9 4:4:4 (software or Intel hardware encode,
@@ -161,7 +161,7 @@ flowchart LR
    format, i18n keys, each impossible entry greyed with the reason as its subtitle.
    Auto chroma follows Priority (sharper ⇒ 4:4:4 when a cell exists; latency and
    balanced ⇒ 4:2:0). Auto codec under 4:4:4 ranks HEVC → VP9 → H.264 → libvpx; under
-   4:2:0 it keeps today's rank (`useRemoteControl.ts:2397-2463`). Explicit chroma
+   4:2:0 it keeps today's rank (`useRemoteControl.ts:2397-2502`). Explicit chroma
    overrides Priority; Priority only ever fills an Auto. The backend is never in the
    picker: it is a host fact, shown in the pill (FR-26 format).
 6. **Decode gating.** Pessimistic on the agent (probed cells only), optimistic on the

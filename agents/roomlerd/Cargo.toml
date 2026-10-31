@@ -503,6 +503,11 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSWindow",
 ] }
 objc2-foundation = { version = "0.3", optional = true, features = [
+    # #3164 — the Apple Event a quit arrives in, read by the application
+    # delegate (`indicator::mac`): a log-out's quit from System Settings'
+    # "Quit & Reopen". No new crate: `bitflags` is already this crate's edge.
+    "NSAppleEventDescriptor",
+    "NSAppleEventManager",
     "NSDate",
     "NSGeometry",
     # `NSDefaultRunLoopMode`, the mode the pump runs events in.

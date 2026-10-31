@@ -1901,7 +1901,10 @@ function renderDone() {
   unixNote.hidden = isTunnel || !isUnix();
   if (!isTunnel && isUnix()) {
     document.getElementById("done-unix-text").textContent = state.os === "macos"
-      ? "One manual step remains: macOS grants Screen Recording and Accessibility by hand. In System Settings → Privacy & Security, enable 'Roomler Daemon' under both — without them the remote screen is blank and the remote keyboard does nothing, and macOS reports no error. The menu-bar app shows which is missing."
+      // #3164 — the panes list the agent as `roomlerd` (the bundle's file
+      // name), beside the menu-bar app's own "Roomler"; and Screen Recording
+      // reaches a restarted agent only.
+      ? "One manual step remains: macOS grants Screen Recording and Accessibility by hand. In System Settings → Privacy & Security, turn on 'roomlerd' under Screen & System Audio Recording and under Accessibility (the 'Roomler' entry is the menu-bar app, and turning it on changes nothing). Without them the remote screen is blank and the remote keyboard does nothing, and macOS reports no error. macOS applies Screen Recording after roomlerd restarts: choose Quit & Reopen when it offers it, or Restart in the menu-bar app, which shows which grant is missing. At the first remote session macOS asks whether roomlerd may find devices on local networks: allow it."
       : (flavour === "system"
         ? "The daemon runs as root (roomlerd.service): logs with `sudo journalctl -u roomlerd.service -f`, status with `sudo roomler status`. Its updates install by themselves."
         : "The daemon runs in your session (`systemctl --user status roomler.service`); the root update helper installs its updates. On a machine nobody stays signed in to, run `sudo loginctl enable-linger $USER` so it runs without an open session.");
