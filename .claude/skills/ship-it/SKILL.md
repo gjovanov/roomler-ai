@@ -55,6 +55,15 @@ These do not error. They make every device quietly stop updating.
 | The version scheme (rolling `0.4.<counter>`) | Six coupled MSI-mapping copies. Agents ≤ rc.483 **refuse** 0.4.x MSIs |
 | Asset ORDER in a release | A frozen agent's picker takes the **first** `.deb` matching its arch, and `/api/agent/latest-release` forwards GitHub's order. Publishing the Linux companion `.deb` into the agent release froze every pre-0.4.16 Linux agent — they apt-installed the companion *as* their daemon update. Fixed server-side (`agent_release::order_assets_daemon_first`) **because a frozen agent cannot receive an agent-side fix** |
 
+⚠️ **The MSI's `Name` (what Apps & Features lists) is a display name**, not a fleet
+coupling: upgrades, `install_detect`, the version sweep and the updater's own MSI
+reader never read it (FR-133 P1). Its one consumer is `install.ps1`, which matches
+exact names (`$MsiNamesPerUser`, `$MsiNamesPerMachine`), and that script is served
+by the **server image**, not by the release. So a change to the name ships in this
+order: the script learns the new name, **promote that image**, and only then publish
+a release with it. The other way round, the served `install.ps1 -Uninstall` silently
+removes nothing.
+
 ⚠️ **A tag can publish nothing.** Always check `gh release view <tag>` assets
 before believing a release shipped; re-cut on a **fresh** number rather than
 re-pushing a tag.

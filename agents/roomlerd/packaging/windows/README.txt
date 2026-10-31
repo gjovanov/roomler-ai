@@ -46,7 +46,7 @@ Open PowerShell (no need to run as administrator) and run:
 
     # 3. Run the daemon (foreground — confirm capture + signalling work):
     $env:RUST_LOG = "roomlerd=debug,webrtc=info"
-    & $roomlerdrun
+    & $roomlerd run
 
 You should see log lines like:
     agent starting
@@ -70,9 +70,9 @@ with:
 If you ever need to manage the hook manually (e.g. after restoring a
 backup or recovering from the rare Win11 ACL-locked-task scenario):
 
-    & $roomlerdservice install     # register / re-register
-    & $roomlerdservice uninstall   # tear down
-    & $roomlerdservice status      # query state
+    & $roomlerd service install     # register / re-register
+    & $roomlerd service uninstall   # tear down
+    & $roomlerd service status      # query state
 
 Earlier versions (0.1.49 and below) used a simpler `schtasks /Create
 /SC ONLOGON` registration without the resilience settings — those
@@ -100,7 +100,7 @@ Disable for air-gapped deployments with:
 
 Manual check without installing:
 
-    & $roomlerdself-update --check-only
+    & $roomlerd self-update --check-only
 
 Optional: Windows Service mode (since 0.1.58)
 ---------------------------------------------
@@ -145,12 +145,12 @@ Service-mode and Scheduled-Task-mode are independent — installing the
 service does not remove the Scheduled Task. To avoid both auto-launching
 the same daemon, uninstall the Scheduled Task first:
 
-    & $roomlerdservice uninstall                # remove Scheduled Task
-    & $roomlerdservice install --as-service     # register SCM service
+    & $roomlerd service uninstall                # remove Scheduled Task
+    & $roomlerd service install --as-service     # register SCM service
 
 Inspect / manage:
 
-    & $roomlerdservice status --as-service      # NotInstalled / Stopped / Running
+    & $roomlerd service status --as-service      # NotInstalled / Stopped / Running
     Get-Service Roomler           # PowerShell native
     sc.exe stop Roomler           # explicit stop
 
@@ -175,9 +175,9 @@ that window un-elevated, or use the Windows Security Attention Sequence
 Uninstall
 ---------
 Settings -> Apps -> Installed apps -> Roomler -> Uninstall. The
-per-Machine MSI is listed as "Roomler (per-Machine)". On a machine
-installed before FR-133 the entries still read
-"Roomler Agent" / "Roomler Agent (per-Machine)" until the next update.
+per-Machine MSI is listed as "Roomler (per-Machine)". A machine
+installed by an older release still lists
+"Roomler Agent" / "Roomler Agent (per-Machine)" until its next update.
 
 NOTE (per-User MSI): the Add/Remove record lives ONLY in the HKCU hive
 of the account that ran the install. If the install ran from an
@@ -203,7 +203,7 @@ Logs
 ----
 roomlerd writes to stderr. To capture a log file for troubleshooting:
 
-    & $roomlerdrun 2>&1 | Tee-Object -FilePath "$env:TEMP\roomlerd.log"
+    & $roomlerd run 2>&1 | Tee-Object -FilePath "$env:TEMP\roomlerd.log"
 
 Set `RUST_LOG=roomlerd=debug,webrtc=debug` for verbose output.
 

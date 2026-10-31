@@ -1023,6 +1023,11 @@ jobs:
           else { Write-Host "::notice::the newest release already registers '$was'; cell 1 above is the pre-P1 case" }
           Invoke-Msi '/i' $pu (Join-Path $logDir 'fr133-branch-peruser.log') ''
           $null = Assert-Entries 'per-User upgraded to this branch' @($new.pu) $nextMsi
+          # The Start-menu entry follows the name, and the old one leaves with
+          # the old product (MajorUpgrade runs afterInstallInitialize).
+          $menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Roomler'
+          if (-not (Test-Path -LiteralPath (Join-Path $menu "$($new.pu).lnk"))) { throw "no $($new.pu).lnk in $menu after the upgrade" }
+          if (Test-Path -LiteralPath (Join-Path $menu "$($old.pu).lnk")) { throw "the pre-P1 shortcut survived the upgrade in $menu" }
           Invoke-UninstallScript 'branch-peruser'
           $null = Assert-Entries 'per-User after install.ps1 -Uninstall' @() ''
           $exe = Join-Path $env:LOCALAPPDATA 'Programs\Roomler\roomlerd.exe'
