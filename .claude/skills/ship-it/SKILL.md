@@ -61,8 +61,8 @@ reader never read it (FR-133 P1). Its one consumer is `install.ps1`, which match
 exact names (`$MsiNamesPerUser`, `$MsiNamesPerMachine`), and that script is served
 by the **server image**, not by the release. So a change to the name ships in this
 order: the script learns the new name, **promote that image**, and only then publish
-a release with it. The other way round, the served `install.ps1 -Uninstall` silently
-removes nothing.
+a release with it. The other way round, the served `install.ps1 -Uninstall` removes
+nothing and exits 0 (measured 2026-10-31: `done.`, and the product stayed installed).
 
 ⚠️ **A tag can publish nothing.** Always check `gh release view <tag>` assets
 before believing a release shipped; re-cut on a **fresh** number rather than

@@ -365,7 +365,10 @@ Details worth knowing:
   upgrade by the MSI's UpgradeCode, and so does `roomlerd`'s `install_detect`
   (`agents/roomlerd/src/install_detect/mod.rs:324`), so an update leaves one
   entry, under the new name. `install.ps1 -Uninstall` matches both names,
-  exactly (`scripts/install.ps1:109`).
+  exactly (`scripts/install.ps1:109`). An IT detection rule (Intune, Configuration
+  Manager) written against a name has to follow it; one written against the
+  UpgradeCode never moves (`agents/roomlerd/src/install_detect/upgrade_codes.rs:14`,
+  `:17`).
 - **Running the perMachine MSI by hand** (`msiexec /i roomlerd-<v>-perMachine-….msi /qn`):
   `ENABLE_SYSTEM_CONTEXT=1` turns SystemContext on, `=0` turns it off, and
   **leaving it out keeps the mode the machine was last switched to** (#1727).
