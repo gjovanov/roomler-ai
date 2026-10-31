@@ -819,14 +819,14 @@ sequenceDiagram
     participant E as Elevated wizard
     L-->>P: Welcome, the background service picked, the elevation note
     P->>L: Restart as administrator
-    L->>U: ShellExecuteExW runas on its own image, --role and --after-elevation pid
+    L->>U: ShellExecuteExW runas on its own image, --role, --session-data and --after-elevation pid
     U-->>P: one prompt, naming the signed publisher
     alt approved
         U->>E: started elevated
         L->>L: exits
-        E->>E: waits for that pid to exit, at most 15 s
-        E->>E: its own WebView2 folder, then the single-instance lock
-        E-->>P: Welcome with the role picked, the Continue gate as usual
+        E->>E: waits for that pid to exit, at most 30 s
+        E->>E: its own WebView2 folder under --session-data, then the single-instance lock
+        E-->>P: Welcome in front, the role picked, the Continue gate as usual
     else declined, ERROR_CANCELLED 1223
         U-->>L: cancelled
         L-->>P: one line, and the wizard as it was
@@ -838,14 +838,15 @@ sequenceDiagram
   on a reinstall whose config folder a limited wizard cannot open. It runs
   `cmd_relaunch_elevated` (`agents/roomler-setup/src/commands.rs:310`), Windows-only: `runas`
   on `std::env::current_exe()`, one UAC prompt
-  (`crates/roomler-setup-core/src/elevation.rs:106`), with
-  `--role <role> [--server <url>] --after-elevation <pid>` — the server only when it is not the
-  default (`agents/roomler-setup/src/launch.rs:117`). The relaunch happens on Welcome, before a
+  (`crates/roomler-setup-core/src/elevation.rs:112`), with
+  `--role <role> [--server <url>] [--session-data <folder>] --after-elevation <pid>` — the server
+  only when it is not the default, the folder being the limited copy's `%LOCALAPPDATA%`
+  (`agents/roomler-setup/src/launch.rs:150`). The relaunch happens on Welcome, before a
   token exists, so nothing secret is on the command line; every value is validated on both
   sides, and an unknown argument is ignored. `SEE_MASK_NOZONECHECKS`, because the file is the
   wizard's own running image, whose zone check ran when the person opened it.
-- **The wait.** The elevated copy waits, at most 15 s, for the limited one to exit
-  (`launch.rs:196`, called from `agents/roomler-setup/src/main.rs:65`) **before** Tauri's
+- **The wait.** The elevated copy waits, at most 30 s, for the limited one to exit
+  (`launch.rs:254`, called from `agents/roomler-setup/src/main.rs:70`) **before** Tauri's
   single-instance plugin initialises: the plugin finds a running copy by its mutex and window
   and would hand that dying copy the arguments and quit. Under over-the-shoulder credentials
   (a standard user types an administrator's password) the elevated copy is another account,
@@ -853,27 +854,62 @@ sequenceDiagram
   for that pid running this same image (`wizard_shared::elevation::poll_until_gone`), so a
   reused id is not waited on. Read from the plugin's source (2.4.2), a mutex the elevated
   account may not open is not a hand-off either: `CreateMutexW` fails with access denied
-  rather than "already exists", and the copy simply runs as its own instance.
+  rather than "already exists", and the copy simply runs as its own instance. The bound was
+  15 s until the field run met one limited copy that took 12.2 s to exit, on a cell's first
+  relaunch, unexplained (the repeats left in under 0.3 s): past the bound the elevated copy
+  hands off to the dying one and quits, and a generous bound costs nothing when the copy leaves
+  at once.
 - **Over-the-shoulder credentials, otherwise.** The elevated copy then keeps that account's
-  `%LOCALAPPDATA%` (its saved state and log), which is why the role and server travel on the
+  `%LOCALAPPDATA%` for its saved state and log, which is why the role and server travel on the
   command line, and "Open the page" on the Join step opens that account's browser. The Join step
   shows the page and the code as text, so the person can type both into their own browser; the
   copy does not name the effect, because the wizard does not tell such an elevation from an
   administrator approving their own prompt, where it does not arise.
 - **WebView2.** An elevated run gives WebView2 a user-data folder of its own,
-  `%LOCALAPPDATA%\ai.roomler.setup\elevated` (`launch.rs:173`). WebView2 shares one browser
+  `<the limited copy's %LOCALAPPDATA%>\ai.roomler.setup\elevated` (`launch.rs:203`, `:230`).
+  WebView2 shares one browser
   process among every host that names the same folder, and the limited copy's browser process
   can outlive that copy by a moment; an elevated host joining a limited browser process is the
   cross-integrity failure. **Through the API, not the environment:** an elevated WebView2 host
   ignores every `WEBVIEW2_*` environment override and honours what the app passes through the
   API (Microsoft's "Develop secure WebView2 apps"), so the folder goes to Tauri's
   `WebviewWindowBuilder::data_directory`, the `userDataFolder` argument WebView2 receives. That
-  is why the main window is now created by the setup hook (`main.rs:103`) from its
+  is why the main window is now created by the setup hook (`main.rs:112`) from its
   `tauri.conf.json` entry, which says `"create": false`; a test holds the two together. (The
   first cut of C3 set `WEBVIEW2_USER_DATA_FOLDER`, which an elevated host would have ignored;
   the #3116 kit had already met the same rule for the CDP port, which an elevated wizard takes
-  only from machine policy.) Any elevated run does this, a hand-made "Run as administrator"
-  included; a limited run passes nothing and keeps Tauri's folder.
+  only from machine policy.) A limited run passes nothing and keeps Tauri's folder.
+- **Whose folder.** WebView2's browser process de-elevates to the user of the session, whoever
+  the host runs as. The G3 field run showed what that does under over-the-shoulder credentials
+  (`msedgewebview2.exe` as the standard user, the host as the administrator): with the folder in
+  the administrator's profile the browser could not open it, the window stayed white, went away
+  after about 65 s and left a stuck process. The released `setup-v0.4.191` fails the same way by
+  right-click, with Edge's own "We couldn't create the data directory", so C3 inherited this
+  rather than caused it. So the limited copy names its own `%LOCALAPPDATA%` on the command line
+  (`--session-data`, a local absolute path, checked on both sides by `safe_folder`,
+  `launch.rs:133`; a folder that is not there falls back to this process's own), which is the
+  session user's and which that user has just written to. For an administrator approving their
+  own prompt it is the same folder as before. Rejected: finding the folder through Explorer's
+  token (`OpenProcessToken` is denied without `SeDebug`), and a folder everyone can write in
+  `%ProgramData%` (one user could tamper with another's). **By hand it stays broken:** a
+  right-click "Run as administrator" with another account's password has no limited copy to
+  ask, so it fails as it does on the release.
+- **In front.** The limited copy held the foreground and exits, so Windows hands it to the next
+  window; started from a browser's Open that is the browser, and the elevated window came up
+  behind it, with only a taskbar button to show for it (2 of 2; from Explorer it came up in front,
+  2 of 2). So `run_elevated` passes its right on with `AllowSetForegroundWindow`
+  (`elevation.rs:112`), and a relaunched copy asks for the foreground once its window exists
+  (`main.rs:128`), which is tao's `SetForegroundWindow` with its Alt-key fallback.
+- **DLLs.** C2 puts the EXE in the person's Downloads and C3 has the same image elevate itself,
+  so a DLL left beside it would load into both copies, the elevated one behind a UAC prompt
+  naming our publisher. Before C the EXE ran from a folder freshly unzipped, so this is C's to
+  close. The field's plant test on C's first build: a copy of the EXE beside copies of 19
+  System32 DLLs loaded seven from its own folder, limited and elevated alike (`dwmapi`,
+  `secur32`, `sspicli`, `cryptbase`, `version`, `propsys`, `bcrypt`). So the linker sets
+  `/DEPENDENTLOADFLAG:0x800` for the imports the loader resolves before `main`
+  (`agents/roomler-setup/build.rs:55`), and the first thing `main` does is
+  `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)` for whatever loads later
+  (`elevation.rs:177`). The wizard ships no DLL of its own and WebView2's loads by full path.
 - **The outcomes.** A declined prompt leaves the limited wizard as it was, with one line; any
   other failure shows its reason and the right-click way; a started copy makes this one exit.
   The elevated copy opens on Welcome with the handed role, which wins over C1's default
@@ -994,7 +1030,7 @@ subject plain text: the machine name is the installer's own text.
 | D | docs, vmtest cells (wizard × OS × daemon; pairing end to end), field log | — | `docs/device-pairing.md` merged ([#3051](https://github.com/gjovanov/roomler-ai/pull/3051)), its §13 terminal pairing too ([#3062](https://github.com/gjovanov/roomler-ai/pull/3062)); the stale `install.sh` anchors re-pointed ([#3069](https://github.com/gjovanov/roomler-ai/pull/3069)); B2's root half in `docs/installation.md`, and the `ship-it` skill on `install.sh` riding two trains (a promote and an agent release). Owed: the vmtest matrix and the acceptance criteria |
 | C1 | wizard: the Welcome page preselects the background service — `role::default_role` → `defaultRole` on the detection, the table under "C1" (an existing install keeps its flavour; Windows perMachine reads the SystemContext switch); the SPA applies it when nothing is picked and never saves it; a run resumes only from the Server or Token page; "recommended" on the Linux system and macOS cards; no "agent" in the wizard's own text, a version where a person reads a release (AC17) | none: a default the person can change before anything happens | **draft PR** [#3187](https://github.com/gjovanov/roomler-ai/pull/3187), rides 0.4.190. Unit-tested (the default per OS × kind, the switch read as the daemon reads it, read only where it decides); the SPA driven in jsdom with a mocked Tauri, red on master's SPA and green on the branch's (the log). **Owed, with C2, after the first release that carries them:** a fresh throwaway Win11 cell downloads `/api/setup/windows` → an EXE whose hash matches the release's `.exe.sha256` and whose signature is valid → the Welcome page preselects the background service → install → a remote-desktop session on the **lock screen** and an overlay ping |
 | C2 | release + server: `release-setup.yml` stages the same signed EXE as `roomler-setup-<v>-x86_64-pc-windows-msvc.exe` (+ `.exe.sha256`, GPG `.asc`, the attestation); `/api/setup/{platform}` and `/health` take `format` (`exe` default, `zip`), the Windows pick prefers the EXE and falls back to the zip; `90-verify-release.ps1` checks the sidecars and that the EXE asset is the zip's EXE (AC16) | the server falls back to the zip for a release without the EXE (every one up to 0.4.189), and `?format=zip` serves the zip whatever the release has | **draft PR** [#3187](https://github.com/gjovanov/roomler-ai/pull/3187), rides 0.4.190; the workflow change takes effect at the first `setup-v*` cut after the merge (a tag run runs the workflow as it stood at the tag). Unit-tested (the EXE preferred in either listing order, the zip fallback, `format=zip`, sidecars never picked, Linux and macOS unchanged, the param's values); the staging step's byte check dry-run on dummy bytes, both ways. **C2b** (same PR): the three asset proxies stream through one client with a 15 s connect deadline and a 60 s idle read bound instead of a 60 s total deadline, which cut every download longer than a minute; red/green measured at 150 KB/s on a 16 MiB body (10.4 MB and the stream ended at 67.9 s on master's client, all 16.8 MB in 109 s on the branch's), and unit-tested (a slow reader read whole, a silent upstream cut by the idle bound, a total deadline cutting the same reader). **Owed:** the released run in C1's row, and the vmtest Windows wizard cell asking for `?format=zip` before that release |
-| C3 | wizard: "Restart as administrator" in #3116's note — `cmd_relaunch_elevated` starts the wizard's own image through `runas` (one UAC prompt) with `--role [--server] --after-elevation <pid>` and exits; the elevated copy waits for that pid before the single-instance plugin (the process list when another account's process refuses a handle), gives WebView2 its own folder through the API, and opens on Welcome with the role (AC18) | none needed: the button exists only inside the note, which shows only where an elevated wizard is required; the right-click way still works | **draft PR** [#3187](https://github.com/gjovanov/roomler-ai/pull/3187), rides 0.4.190. Unit-tested (the arguments both ways, unknown ones ignored, bad values dropped; the C runtime's quoting against `CommandLineToArgvW`; the wait and the process-list fallback on real processes; the button's place and rule; the config's `"create": false` held to the setup hook); the SPA's button, its three outcomes and the elevated copy's preselection driven in jsdom (the log). **Owed, at release, red first, as a same-user administrator AND with over-the-shoulder credentials:** a limited wizard on a SystemContext reinstall stops on Welcome (red) → the button → UAC Yes → one elevated wizard (the limited one gone), the background service preselected, WebView2 on the `elevated` folder → the install succeeds; UAC No → still on Welcome with the line, no second process; no process left over |
+| C3 | wizard: "Restart as administrator" in #3116's note — `cmd_relaunch_elevated` starts the wizard's own image through `runas` (one UAC prompt) with `--role [--server] [--session-data <folder>] --after-elevation <pid>` and exits; the elevated copy waits for that pid before the single-instance plugin (the process list when another account's process refuses a handle), gives WebView2 its own folder under the limited copy's `%LOCALAPPDATA%` through the API, takes the foreground, and opens on Welcome with the role (AC18); from C on, the EXE loads DLLs from System32 alone | none needed: the button exists only inside the note, which shows only where an elevated wizard is required; the right-click way still works | **draft PR** [#3187](https://github.com/gjovanov/roomler-ai/pull/3187), rides 0.4.190. Unit-tested (the arguments both ways, unknown ones ignored, bad values dropped; the C runtime's quoting against `CommandLineToArgvW`; the wait and the process-list fallback on real processes; the button's place and rule; the config's `"create": false` held to the setup hook); the SPA's button, its three outcomes and the elevated copy's preselection driven in jsdom (the log). **Owed, at release, red first, as a same-user administrator AND with over-the-shoulder credentials:** a limited wizard on a SystemContext reinstall stops on Welcome (red) → the button → UAC Yes → one elevated wizard (the limited one gone), the background service preselected, WebView2 on the `elevated` folder → the install succeeds; UAC No → still on Welcome with the line, no second process; no process left over |
 
 ## Acceptance criteria
 

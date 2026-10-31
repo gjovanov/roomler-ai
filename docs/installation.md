@@ -152,20 +152,21 @@ from a double-click: the folder is not hardened yet.
 page carries a **Restart as administrator** button: the wizard starts its own
 image again through the shell's `runas` verb (one UAC prompt,
 `crates/roomler-setup-core/src/elevation.rs`) with
-`--role <role> [--server <url>] --after-elevation <its pid>`, and exits once the
-elevated copy has started. Nothing secret is on that command line: it happens on
-Welcome, before a token exists. The elevated copy
+`--role <role> [--server <url>] [--session-data <folder>] --after-elevation <its pid>`
+(the folder is its own `%LOCALAPPDATA%`), and exits once the elevated copy has started,
+handing it the right to take the foreground. Nothing secret is on that command line:
+it happens on Welcome, before a token exists. The elevated copy
 (`agents/roomler-setup/src/launch.rs`):
 
-1. waits, at most 15 s, for the limited copy to exit, **before** Tauri's
+1. waits, at most 30 s, for the limited copy to exit, **before** Tauri's
    single-instance plugin looks for a running copy — otherwise it would find
    the dying copy's lock, hand it its arguments and quit. With over-the-shoulder
    credentials (a standard user typing an administrator's password) the copy is
    another account, may be refused a handle on the limited one, and polls the
    process list instead; it also runs in that account's profile, which is why
    the role travels on the command line rather than in the saved state;
-2. keeps its WebView2 data in its own folder
-   (`%LOCALAPPDATA%\ai.roomler.setup\elevated`): WebView2 shares one browser
+2. keeps its WebView2 data in its own folder, under the LIMITED copy's
+   `%LOCALAPPDATA%` (`...\ai.roomler.setup\elevated`): WebView2 shares one browser
    process among every host naming the same folder, the limited copy's can
    outlive it by a moment, and an elevated host must not join a limited browser
    process. The folder goes through the API (Tauri's `data_directory`, so the
@@ -173,10 +174,25 @@ Welcome, before a token exists. The elevated copy
    `"create": false`), never through `WEBVIEW2_USER_DATA_FOLDER`: an elevated
    WebView2 host ignores every `WEBVIEW2_*` environment variable — for the same
    reason an elevated wizard's debugging port comes only from the HKLM policy.
-   Any elevated run does this, a hand-made "Run as administrator" included; a
-   limited run keeps Tauri's folder unchanged;
-3. opens on Welcome with the handed role preselected, over the detected
+   It sits in the limited copy's profile because WebView2's browser process
+   de-elevates to the session's user, who cannot open an administrator's
+   profile: with the folder there, over-the-shoulder credentials give a white
+   window that goes away after about a minute. A limited run keeps Tauri's folder
+   unchanged;
+3. comes to the front, or it would open behind the browser the wizard was
+   started from;
+4. opens on Welcome with the handed role preselected, over the detected
    default, and the Continue gate as usual.
+
+A right-click **Run as administrator** by a person who is an administrator works
+as it always has, in that account's own folder. **With another account's password
+it does not** (the white window above, or Edge's "We couldn't create the data
+directory"): that start has no limited copy to name the session's folder. Start the
+wizard normally and use the button.
+
+The wizard EXE loads DLLs from System32 alone, never from the folder it sits in
+(the linker's `/DEPENDENTLOADFLAG:0x800` and `SetDefaultDllDirectories`): that
+folder is usually Downloads, and the same image goes on to run elevated.
 
 A declined prompt leaves the limited wizard as it was, with one line saying so;
 any other failure shows its reason and the right-click way. Nothing else in the

@@ -325,10 +325,12 @@ pub async fn cmd_relaunch_elevated(
             };
         }
     };
+    let session_data = crate::launch::local_app_data();
     let args = crate::launch::relaunch_args(
         role,
         server.as_deref(),
         &cmd_default_server_url(),
+        session_data.as_deref().and_then(std::path::Path::to_str),
         std::process::id(),
     );
     // The prompt blocks its caller until the person answers; off the async

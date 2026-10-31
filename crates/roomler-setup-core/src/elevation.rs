@@ -21,6 +21,8 @@
 //!   find the dying copy's lock, hand its arguments to that copy and quit.
 //! - [`command_line`]: one parameter string with the C runtime's quoting
 //!   rules, so what the elevated copy reads back is exactly what was sent.
+//! - [`restrict_dll_search`]: no DLL comes from the folder the EXE sits in,
+//!   which is the person's Downloads, ahead of a start that elevates.
 
 use std::path::Path;
 use std::time::Duration;
@@ -102,6 +104,10 @@ fn quote_arg(arg: &str) -> String {
 /// ran when the person opened it, and a second warning on top of the UAC
 /// prompt (which names the publisher) would be noise, not a check. Not for
 /// any other file: callers pass `std::env::current_exe()`.
+///
+/// The caller holds the foreground and is about to exit, so the new process
+/// gets its right to take it (`AllowSetForegroundWindow`): best effort, the
+/// call fails only where the caller had no such right to pass on.
 #[cfg(target_os = "windows")]
 pub fn run_elevated(file: &Path, args: &[String]) -> Result<u32, ElevationError> {
     use std::os::windows::ffi::OsStrExt;
@@ -111,6 +117,7 @@ pub fn run_elevated(file: &Path, args: &[String]) -> Result<u32, ElevationError>
         SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SEE_MASK_NOZONECHECKS, SHELLEXECUTEINFOW,
         ShellExecuteExW,
     };
+    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
     fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
         s.encode_wide().chain(std::iter::once(0)).collect()
@@ -150,8 +157,34 @@ pub fn run_elevated(file: &Path, args: &[String]) -> Result<u32, ElevationError>
     // ours to close.
     let pid = unsafe { GetProcessId(sei.hProcess) };
     unsafe { CloseHandle(sei.hProcess) };
+    // SAFETY: takes a process id and touches no memory.
+    unsafe { AllowSetForegroundWindow(pid) };
     Ok(pid)
 }
+
+/// From here on this process loads a DLL named without a path from System32
+/// only, never from the folder the EXE sits in. That folder is usually the
+/// person's Downloads, where a site can leave a file beside it, and the same
+/// image goes on to run elevated, so a `version.dll` left there would load into
+/// the elevated copy behind a UAC prompt naming our publisher. The wizard ships
+/// no DLL of its own, and WebView2's is loaded by its full path.
+///
+/// The first thing `main` does. It cannot reach the EXE's own imports, which
+/// the loader resolves before `main` runs: `build.rs` sets those with the
+/// linker's `/DEPENDENTLOADFLAG:0x800`, the same flag this passes. Best
+/// effort: there is nothing to do about a failure but go on.
+#[cfg(target_os = "windows")]
+pub fn restrict_dll_search() {
+    use windows_sys::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+    };
+    // SAFETY: takes a flag and touches no memory.
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
+}
+
+/// Windows's search order is the concern; nothing to do elsewhere.
+#[cfg(not(target_os = "windows"))]
+pub fn restrict_dll_search() {}
 
 /// Off Windows there is no UAC; the wizard's halves ask through `pkexec` or
 /// the macOS administrator prompt instead, and nothing calls this.

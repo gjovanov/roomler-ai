@@ -8,15 +8,16 @@
 //! `runas` (`wizard_shared::elevation::run_elevated`, one UAC prompt) with
 //!
 //! ```text
-//! --role <kebab role> [--server <url>] --after-elevation <the limited copy's pid>
+//! --role <kebab role> [--server <url>] [--session-data <folder>]
+//!     --after-elevation <the limited copy's pid>
 //! ```
 //!
 //! and exits. The elevated copy reads them back here: it waits for that pid to
 //! be gone before Tauri's single-instance plugin looks for a running copy
 //! (`main.rs`), opens on Welcome with the role preselected (the SPA asks
 //! [`crate::commands::cmd_launch_options`]; the role wins over the detected
-//! default) and keeps its WebView2 data apart from the limited copy's
-//! ([`webview_data_directory`]).
+//! default) and keeps its WebView2 data apart from the limited copy's, in a
+//! folder the session's user can open ([`webview_data_directory`]).
 //!
 //! Nothing secret is on this command line: the relaunch happens on Welcome,
 //! before a token is pasted or paired. Every value is validated on both
@@ -29,19 +30,25 @@ use crate::role::Role;
 pub const ROLE_FLAG: &str = "--role";
 /// The Server page's URL, when it is not the default.
 pub const SERVER_FLAG: &str = "--server";
+/// The limited copy's local app-data folder ([`elevated_webview_folder`]).
+pub const SESSION_DATA_FLAG: &str = "--session-data";
 /// The limited copy's process id, to wait for.
 pub const AFTER_ELEVATION_FLAG: &str = "--after-elevation";
 
 /// How long the elevated copy waits for the limited one to exit. The limited
 /// copy exits as soon as the shell reports the elevated start, which is after
 /// the person approved the prompt, so this is a bound for a stuck exit only.
-pub const PARENT_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// A generous one: the wait ends the moment the copy is gone, past the bound
+/// the elevated copy hands its arguments to the dying one and quits, and one
+/// exit in the field took 12.2 s.
+pub const PARENT_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What the wizard was started with.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaunchArgs {
     pub role: Option<Role>,
     pub server: Option<String>,
+    pub session_data: Option<String>,
     pub after_elevation: Option<u32>,
 }
 
@@ -71,7 +78,14 @@ impl LaunchArgs {
                 Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
                 _ => (arg.as_str(), None),
             };
-            if ![ROLE_FLAG, SERVER_FLAG, AFTER_ELEVATION_FLAG].contains(&flag) {
+            if ![
+                ROLE_FLAG,
+                SERVER_FLAG,
+                SESSION_DATA_FLAG,
+                AFTER_ELEVATION_FLAG,
+            ]
+            .contains(&flag)
+            {
                 continue;
             }
             let value = match inline {
@@ -87,6 +101,7 @@ impl LaunchArgs {
             match flag {
                 ROLE_FLAG => out.role = Role::from_state_str(&value),
                 SERVER_FLAG => out.server = safe_server(&value).map(str::to_string),
+                SESSION_DATA_FLAG => out.session_data = safe_folder(&value).map(str::to_string),
                 _ => out.after_elevation = value.parse::<u32>().ok().filter(|p| *p != 0),
             }
         }
@@ -111,13 +126,32 @@ pub fn safe_server(value: &str) -> Option<&str> {
     fit.then_some(value)
 }
 
+/// A folder fit for the command line and for WebView2: an absolute path on a
+/// local drive (`X:\...`, so no share and no device path), at most 1024
+/// characters, with no `..`, no control character and nothing a Windows file
+/// name cannot hold. Spaces are fine: `elevation::command_line` quotes them.
+pub fn safe_folder(value: &str) -> Option<&str> {
+    let rest = value
+        .strip_prefix(|c: char| c.is_ascii_alphabetic())?
+        .strip_prefix(":\\")?;
+    let fit = !rest.is_empty()
+        && value.len() <= 1024
+        && !rest
+            .chars()
+            .any(|c| c.is_control() || "\"<>|?*:/".contains(c))
+        && !rest.split('\\').any(|part| part == "..");
+    fit.then_some(value)
+}
+
 /// The arguments the limited copy hands the elevated one: the role, the
-/// server only when it is a fit one that differs from `default_server`, and
-/// the limited copy's own pid.
+/// server only when it is a fit one that differs from `default_server`, the
+/// limited copy's local app-data folder when it is a fit one, and the limited
+/// copy's own pid.
 pub fn relaunch_args(
     role: Role,
     server: Option<&str>,
     default_server: &str,
+    session_data: Option<&str>,
     pid: u32,
 ) -> Vec<String> {
     let mut args = vec![ROLE_FLAG.to_string(), role.wire().to_string()];
@@ -131,9 +165,18 @@ pub fn relaunch_args(
         args.push(SERVER_FLAG.to_string());
         args.push(server.to_string());
     }
+    if let Some(folder) = session_data.and_then(safe_folder) {
+        args.push(SESSION_DATA_FLAG.to_string());
+        args.push(folder.to_string());
+    }
     args.push(AFTER_ELEVATION_FLAG.to_string());
     args.push(pid.to_string());
     args
+}
+
+/// This process's own `%LOCALAPPDATA%`.
+pub fn local_app_data() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new().map(|b| b.data_local_dir().to_path_buf())
 }
 
 /// The WebView2 user-data folder of an ELEVATED wizard: beside the limited
@@ -142,13 +185,27 @@ pub fn relaunch_args(
 /// same folder ("Manage user data folders", Microsoft Learn), and the limited
 /// copy's can still be running for a moment after that copy has exited; an
 /// elevated host joining a limited browser process is the cross-integrity
-/// failure. `None` when there is no local app-data folder to put it in.
-pub fn elevated_webview_folder() -> Option<std::path::PathBuf> {
-    directories::BaseDirs::new().map(|b| {
-        b.data_local_dir()
-            .join(crate::launch::TAURI_IDENTIFIER)
-            .join("elevated")
-    })
+/// failure.
+///
+/// Under `session_data`, the limited copy's `%LOCALAPPDATA%`, when the
+/// relaunch carried it and the folder is there, because WebView2's browser
+/// process de-elevates to the user of the SESSION, whoever the host runs as.
+/// Under over-the-shoulder credentials the host is the administrator who typed
+/// the password and the browser is the standard user, who cannot open the
+/// administrator's profile: the browser cannot make its data directory and the
+/// wizard is a white window that goes away after about a minute. The limited
+/// copy's folder is one that user can write, and for an administrator approving
+/// their own prompt it is the same folder as this process's.
+///
+/// Without it, this process's own: "Run as administrator" by hand has no limited
+/// copy to ask, so over-the-shoulder credentials still fail that way there.
+/// `None` when there is no local app-data folder to put it in.
+pub fn elevated_webview_folder(session_data: Option<&str>) -> Option<std::path::PathBuf> {
+    session_data
+        .map(std::path::PathBuf::from)
+        .filter(|folder| folder.is_dir())
+        .or_else(local_app_data)
+        .map(|folder| folder.join(TAURI_IDENTIFIER).join("elevated"))
 }
 
 /// `tauri.conf.json`'s `identifier`, the folder Tauri keeps the limited
@@ -170,16 +227,17 @@ pub const MAIN_WINDOW: &str = "main";
 /// honours what the app passes through the API ("Develop secure WebView2
 /// apps", Microsoft Learn), which is why an elevated wizard's CDP port also
 /// comes only from machine policy, never from the environment.
-pub fn webview_data_directory() -> Option<std::path::PathBuf> {
+pub fn webview_data_directory(args: &LaunchArgs) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
         if !roomlerd::win_identity::process_is_elevated() {
             return None;
         }
-        elevated_webview_folder()
+        elevated_webview_folder(args.session_data.as_deref())
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = args;
         None
     }
 }
@@ -221,6 +279,7 @@ mod tests {
             Role::DaemonSystem,
             Some("https://self-hosted.example:8443"),
             "https://roomler.ai",
+            Some(r"C:\Users\Two Words\AppData\Local"),
             4242,
         );
         assert_eq!(
@@ -230,6 +289,8 @@ mod tests {
                 "daemon-system",
                 "--server",
                 "https://self-hosted.example:8443",
+                "--session-data",
+                r"C:\Users\Two Words\AppData\Local",
                 "--after-elevation",
                 "4242"
             ]
@@ -239,9 +300,23 @@ mod tests {
             LaunchArgs {
                 role: Some(Role::DaemonSystem),
                 server: Some("https://self-hosted.example:8443".to_string()),
+                session_data: Some(r"C:\Users\Two Words\AppData\Local".to_string()),
                 after_elevation: Some(4242),
             }
         );
+    }
+
+    /// An unfit folder is not sent, and the relaunch goes on without it.
+    #[test]
+    fn the_session_folder_is_sent_only_when_it_is_fit() {
+        for folder in [None, Some(r"\\share\home\me"), Some("relative")] {
+            let sent = relaunch_args(Role::DaemonMachine, None, "https://roomler.ai", folder, 7);
+            assert_eq!(
+                sent,
+                ["--role", "daemon-machine", "--after-elevation", "7"],
+                "{folder:?}"
+            );
+        }
     }
 
     /// The default server is not sent (the elevated copy has it anyway), in
@@ -256,7 +331,7 @@ mod tests {
             Some("not a url"),
             Some("https://bad\"quote.example"),
         ] {
-            let sent = relaunch_args(Role::DaemonMachine, server, "https://roomler.ai", 7);
+            let sent = relaunch_args(Role::DaemonMachine, server, "https://roomler.ai", None, 7);
             assert_eq!(
                 sent,
                 ["--role", "daemon-machine", "--after-elevation", "7"],
@@ -276,6 +351,8 @@ mod tests {
             "not-a-pid",
             "--server",
             "ftp://wrong.example",
+            "--session-data",
+            r"\\share\home\me",
             "--unknown=1",
         ]);
         assert_eq!(parsed, LaunchArgs::default());
@@ -336,6 +413,42 @@ mod tests {
         assert_eq!(safe_server(&long), None);
     }
 
+    #[test]
+    fn a_fit_folder() {
+        for ok in [
+            r"C:\Users\me\AppData\Local",
+            r"d:\Profiles\Two Words\AppData\Local",
+            r"C:\Users\ćirilica\AppData\Local",
+            r"C:\Users\first.last (corp)\AppData\Local",
+            r"C:\Users\a=b\AppData\Local",
+        ] {
+            assert_eq!(safe_folder(ok), Some(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "C:",
+            r"C:\",
+            "relative",
+            r"relative\folder",
+            r"\Users\me",
+            r"\\server\share\me",
+            r"\\?\C:\Users\me",
+            r"\\.\pipe\me",
+            "C:/Users/me",
+            r"C:\Users\..\Windows",
+            r"C:\Users\me\..",
+            r"C:\Users\me\file:stream",
+            r#"C:\Users\quo"te"#,
+            "C:\\Users\\new\nline",
+            r"C:\Users\star*",
+            "--role",
+        ] {
+            assert_eq!(safe_folder(bad), None, "{bad:?}");
+        }
+        let long = format!(r"C:\{}", "a".repeat(1024));
+        assert_eq!(safe_folder(&long), None);
+    }
+
     /// The elevated folder sits under Tauri's own, and the identifier it is
     /// named from is the one `tauri.conf.json` carries.
     #[test]
@@ -343,9 +456,34 @@ mod tests {
         let conf: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         assert_eq!(conf["identifier"], TAURI_IDENTIFIER);
-        if let Some(dir) = elevated_webview_folder() {
-            assert!(dir.ends_with(std::path::Path::new(TAURI_IDENTIFIER).join("elevated")));
-        }
+        let leaf = std::path::Path::new(TAURI_IDENTIFIER).join("elevated");
+        assert_eq!(
+            elevated_webview_folder(None),
+            local_app_data().map(|d| d.join(&leaf))
+        );
+    }
+
+    /// Over-the-shoulder credentials: the folder the session's user can open,
+    /// the one the limited copy named, wins over this process's own.
+    #[test]
+    fn the_limited_copys_folder_roots_the_elevated_one() {
+        let leaf = std::path::Path::new(TAURI_IDENTIFIER).join("elevated");
+        let session = std::env::temp_dir();
+        assert_eq!(
+            elevated_webview_folder(session.to_str()),
+            Some(session.join(&leaf))
+        );
+    }
+
+    /// A named folder that is not there changes nothing.
+    #[test]
+    fn a_missing_session_folder_falls_back_to_this_process() {
+        let missing = std::env::temp_dir().join("roomler-setup-no-such-folder");
+        assert!(!missing.exists());
+        assert_eq!(
+            elevated_webview_folder(missing.to_str()),
+            elevated_webview_folder(None)
+        );
     }
 
     /// The main window is ours to create: with `"create": false` Tauri leaves
@@ -362,23 +500,64 @@ mod tests {
         assert_eq!(windows[0]["create"], false);
         let main = include_str!("main.rs");
         assert!(main.contains("WebviewWindowBuilder::from_config"));
-        assert!(main.contains("webview_data_directory()"));
+        assert!(main.contains("webview_data_directory(&launch)"));
     }
 
-    /// A limited process never names a folder of its own: Tauri's default
-    /// stays exactly what it was. (This test runs limited unless the shell
-    /// that ran it was elevated; then it checks the elevated answer.)
+    /// No DLL comes from the folder the EXE sits in: the search is restricted
+    /// before anything else in `main`, and the linker does the same for the
+    /// imports the loader resolves before `main` runs. The plant test in the
+    /// field log is what proves the pair; this keeps either half from going.
+    #[test]
+    fn dlls_come_from_system32_alone() {
+        let body = include_str!("main.rs")
+            .split("fn main() {")
+            .nth(1)
+            .expect("main");
+        let first = body
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("//"))
+            .unwrap();
+        assert_eq!(first, "wizard_shared::elevation::restrict_dll_search();");
+        let build = include_str!("../build.rs");
+        assert!(build.contains("rustc-link-arg-bin=roomler-setup=/DEPENDENTLOADFLAG:0x800"));
+    }
+
+    /// A relaunch comes to the front. Windows otherwise leaves it behind
+    /// whatever took the foreground as the limited copy exited, which is the
+    /// browser that offered the download.
+    #[test]
+    fn a_relaunch_takes_the_foreground() {
+        let main = include_str!("main.rs");
+        let setup = main.split(".setup(").nth(1).expect("the setup hook");
+        let hook = setup.split(".on_window_event(").next().unwrap();
+        assert!(hook.contains("launch.after_elevation.is_some()"));
+        assert!(hook.contains("set_focus()"));
+    }
+
+    /// A limited process never names a folder of its own, whatever its command
+    /// line says: Tauri's default stays exactly what it was. (This test runs
+    /// limited unless the shell that ran it was elevated; then it checks the
+    /// elevated answer.)
     #[test]
     fn only_an_elevated_wizard_names_its_own_folder() {
+        let session = std::env::temp_dir();
+        let args = LaunchArgs {
+            session_data: session.to_str().map(str::to_string),
+            ..LaunchArgs::default()
+        };
         #[cfg(target_os = "windows")]
         {
             let elevated = roomlerd::win_identity::process_is_elevated();
-            assert_eq!(webview_data_directory().is_some(), elevated);
+            assert_eq!(webview_data_directory(&args).is_some(), elevated);
             if elevated {
-                assert_eq!(webview_data_directory(), elevated_webview_folder());
+                assert_eq!(
+                    webview_data_directory(&args),
+                    elevated_webview_folder(session.to_str())
+                );
             }
         }
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(webview_data_directory(), None);
+        assert_eq!(webview_data_directory(&args), None);
     }
 }
