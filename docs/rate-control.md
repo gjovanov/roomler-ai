@@ -231,14 +231,14 @@ onward). `valid` is the gate's `None`; `stall_is_ours` is V5's exception, below.
 
 | consumer | on a valid window | on a rejected window | site |
 |---|---|---|---|
-| goodput fold (`GoodputEstimator::observe_window`) | folds the window's blocked sends | samples **dropped**, not quarantined; the next valid window is measured on its own merits | `governor.rs:1216` |
-| FR-35 hard ×0.5 (a send blocked ≥ `HARD_STALL` = 1 s, `ceiling_learn.rs:64`) | `apply_hard_md` | nothing — only the window boundary knows whether the block was the pipe (12:15: 2.9 s and 7.4 s blocked sends inside stalled passes, on a path that carried 6.6 M twenty seconds later) | `governor.rs:1233` |
-| FR-63 opener ramp | doubles on a clean window, ends on congestion | neither — unless `stall_is_ours`, which ENDS it | `governor.rs:1243` |
-| FR-15 age loop | fires on a streak over the learned floor; always learns the floor | learns, does not fire, and the streak resets — unless `stall_is_ours`, which keeps both | `governor.rs:1283` |
-| FR-59 P3 arrival-rate clamp | armed / released by the viewer's report | **neither armed nor released** — whatever it held, it still holds (14:52: the report *for* the stall set 834,800 on a path that had just carried 7.45 M) | `governor.rs:1313` |
-| the rate-limited ×0.85 (`aimd.rs:180`, ≥ 500 ms apart, `aimd.rs:84`) | on `age_over` or `link_over` | on `stall_is_ours` | `governor.rs:1405` |
-| FR-70 P1 prior | re-anchors on a live measurement, decays on a clean window | does not move — unless `stall_is_ours`, which pushes it back with no value attached | `governor.rs:1421`, `:1430` |
-| FR-79 V3b belief (shadow) | a delivery every window; a capacity when the fold accepted, or the viewer's queue grew | the delivery is still recorded; no capacity | `governor.rs:1091`, `:1224`, `:1338` |
+| goodput fold (`GoodputEstimator::observe_window`) | folds the window's blocked sends | samples **dropped**, not quarantined; the next valid window is measured on its own merits | `governor.rs:1225` |
+| FR-35 hard ×0.5 (a send blocked ≥ `HARD_STALL` = 1 s, `ceiling_learn.rs:64`) | `apply_hard_md` | nothing — only the window boundary knows whether the block was the pipe (12:15: 2.9 s and 7.4 s blocked sends inside stalled passes, on a path that carried 6.6 M twenty seconds later) | `governor.rs:1241` |
+| FR-63 opener ramp | doubles on a clean window, ends on congestion | neither — unless `stall_is_ours`, which ENDS it | `governor.rs:1247` |
+| FR-15 age loop | fires on a streak over the learned floor; always learns the floor | learns, does not fire, and the streak resets — unless `stall_is_ours`, which keeps both | `governor.rs:1287` |
+| FR-59 P3 arrival-rate clamp | armed / released by the viewer's report | **neither armed nor released** — whatever it held, it still holds (14:52: the report *for* the stall set 834,800 on a path that had just carried 7.45 M) | `governor.rs:1317` |
+| the rate-limited ×0.85 (`aimd.rs:180`, ≥ 500 ms apart, `aimd.rs:84`) | on `age_over` or `link_over` | on `stall_is_ours` | `governor.rs:1409` |
+| FR-70 P1 prior | re-anchors on a live measurement, decays on a clean window | does not move — unless `stall_is_ours`, which pushes it back with no value attached | `governor.rs:1425`, `:1434` |
+| FR-79 V3b belief (shadow) | a delivery every window; a capacity when the fold accepted, or the viewer's queue grew | the delivery is still recorded; no capacity | `governor.rs:1095`, `:1228`, `:1342` |
 | pair-memory write-back (V2 + V4) | the session's belief, else the opener's measurement | nothing measured ⇒ nothing written | `peer.rs:2098` |
 
 ### V5 — a rejected window is not a measurement, but a stall is still push-back
@@ -261,9 +261,9 @@ downstream of the agent, it is the only push-back there is.
 | half | rule | anchor |
 |---|---|---|
 | which rejection also speaks about the rate | `Reason::is_congestion()` is true **only** for `TransitStalled`. `AgentStalled` would re-create the 12:15 defect, `StallShadow` double-counts one stall, `CarrierChanged` cuts for a path the session has left, `Opening` cuts for the opener draining into a transport still ramping | `evidence.rs:143` |
-| whose fault the stall is | `stall_is_ours` = congestion **and** `desired > pipe_bps × 1.2`. Above the measured pipe the stall is the rate's doing; at or below it, the transport's (FR-71's finding 4: an 8 Mbps leg head-of-line-blocked for 4.9 s with 1485 bytes queued, where a cut costs quality for an event the sender did not cause); **with nothing measured there is no claim to contradict, so no cut** | `governor.rs:1203` |
-| what it reaches | only the rate-limited ×0.85, the ramp's end, the age streak and the prior's push-back. **Never `apply_hard_md`** — it has no spacing and would halve once per stalled window. Everything that sets a *number* still reads `valid` | `governor.rs:1243`, `:1283`, `:1405`, `:1430` |
-| which estimate | `pipe_bps` (`governor.rs:630`: blocked-send goodput → the viewer's arrival rate while its queue grows, 15 s TTL → the decaying prior), **never** `blocked_send_bps` (`:613`). `0.4.96` shipped on the wrong accessor: the agent's sends block only when the queue is LOCAL, and CORPLAP-3 read `goodput_bps=None` with `goodput_samples=(0, 5)` for a whole relay session — V5 inert on that host. Fixed in **V5a, `agent-v0.4.97`** | `governor.rs:1192`–`1098` |
+| whose fault the stall is | `stall_is_ours` = congestion **and** `desired > pipe_bps × 1.2`. Above the measured pipe the stall is the rate's doing; at or below it, the transport's (FR-71's finding 4: an 8 Mbps leg head-of-line-blocked for 4.9 s with 1485 bytes queued, where a cut costs quality for an event the sender did not cause); **with nothing measured there is no claim to contradict, so no cut** | `governor.rs:1207` |
+| what it reaches | only the rate-limited ×0.85, the ramp's end, the age streak and the prior's push-back. **Never `apply_hard_md`** — it has no spacing and would halve once per stalled window. Everything that sets a *number* still reads `valid` | `governor.rs:1247`, `:1287`, `:1409`, `:1434` |
+| which estimate | `pipe_bps` (`governor.rs:634`: blocked-send goodput → the viewer's arrival rate while its queue grows, 15 s TTL → the decaying prior), **never** `blocked_send_bps` (`:617`). `0.4.96` shipped on the wrong accessor: the agent's sends block only when the queue is LOCAL, and CORPLAP-3 read `goodput_bps=None` with `goodput_samples=(0, 5)` for a whole relay session — V5 inert on that host. Fixed in **V5a, `agent-v0.4.97`** | `governor.rs:1196`–`1216` |
 
 ⚠️ The control that must stay green is
 `finding_4_keeps_the_rate_with_the_validity_gate`. Its field twin is every
@@ -287,8 +287,8 @@ below.
 transit stall on a session with no pipe estimate was held 433 times out of
 482 — but 49 clean stall episodes cut, every one on a session whose prior stood
 at 0.02–0.8 M: `stall_is_ours` compares against `pipe_bps`, whose last source
-is the prior's stand-in (`governor.rs:642`), and pushes that prior back without
-a measurement on every window it fires on (`:1377`), so each cut lowers the
+is the prior's stand-in (`governor.rs:648`), and pushes that prior back without
+a measurement on every window it fires on (`:1439`), so each cut lowers the
 number the next stall is judged against. One 25-minute HEVC session over DERP
 went 3.63 → 0.94 M on 24 gap windows with 0 B in flight. A second edge: the
 viewer's congested report in a stall's **onset** window (transit still under
@@ -297,6 +297,15 @@ clamp at the collapsed arrival rate — 3.0 → 0.62 M at 09:17:07 on 10-19, 13
 such drops in the fortnight. Both are recorded with their arcs in
 [`fr/FR-71-transport-stall-classification.md`](fr/FR-71-transport-stall-classification.md)
 (§Open decisions, field log); the law is not changed on this page.
+
+⚠️ **The fix for the first is FR-79's to make (V5b, proposed 2026-10-30).**
+`stall_is_ours` would compare only against a *measured* source (the goodput, or
+the viewer's arrival rate inside its 15 s TTL, `governor.rs:415`), never against
+the stand-in, and a stall that carries no number would stop walking the prior.
+Until the operator decides it, a convergence caught in the field may be toward
+the stand-in rather than a measurement, so it cannot count as AC9. The options
+and the rig AC8 and AC9 still need are in
+[`fr/FR-79-one-validity-gate.md`](fr/FR-79-one-validity-gate.md) §Open decisions.
 
 ### The ceiling learner (FR-35 P1) — growth above the nominal
 
