@@ -985,6 +985,31 @@ pub(crate) fn graphical_session_matching(
     want_uid: Option<u32>,
     users_only: bool,
 ) -> Result<GraphicalSession> {
+    graphical_session_via(want_uid, users_only, &loginctl_stdout)
+}
+
+/// `loginctl <args> --no-pager`'s stdout. The exit status is not read: a
+/// `show-session` of a session that ended mid-walk prints nothing, and the walk
+/// goes on to the next one.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn loginctl_stdout(args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("loginctl")
+        .args(args)
+        .arg("--no-pager")
+        .output()
+        .with_context(|| format!("spawning loginctl {}", args.join(" ")))?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// [`graphical_session_matching`] with `loginctl` injected: which session wins
+/// is a decision, and one that needs a real greeter to exercise is one nobody
+/// re-checks.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn graphical_session_via(
+    want_uid: Option<u32>,
+    users_only: bool,
+    loginctl: &dyn Fn(&[&str]) -> Result<String>,
+) -> Result<GraphicalSession> {
     // ⚠️ NOT `-o value -p Id`. Those are `show-*` options; `list-sessions`
     // rejects them with `Unknown output 'value'` and exits 1, which this
     // function then read as an empty session list — i.e. "nobody is at the
@@ -993,16 +1018,10 @@ pub(crate) fn graphical_session_matching(
     // than regressing. The visible symptom was the FR-27 consent companion
     // silently never starting, which only shows up where the companion is the
     // chosen surface — GNOME/KDE Wayland, exactly the hosts FR-45 targets.
-    let out = std::process::Command::new("loginctl")
-        .args(["list-sessions", "--no-legend", "--no-pager"])
-        .output()
-        .context("spawning loginctl")?;
-    for id in session_ids(&String::from_utf8_lossy(&out.stdout)) {
-        let show = std::process::Command::new("loginctl")
-            .args(["show-session", id, "--no-pager"])
-            .output()
-            .context("loginctl show-session")?;
-        let text = String::from_utf8_lossy(&show.stdout);
+    let list = loginctl(&["list-sessions", "--no-legend"])?;
+    let mut login_screen = false;
+    for id in session_ids(&list) {
+        let text = loginctl(&["show-session", id])?;
         let field = |k: &str| show_field(&text, k);
         let ty = field("Type").unwrap_or_default();
         if ty != "x11" && ty != "wayland" {
@@ -1012,6 +1031,7 @@ pub(crate) fn graphical_session_matching(
             continue;
         }
         if users_only && field("Class").as_deref() != Some("user") {
+            login_screen |= field("Class").as_deref() == Some("greeter");
             continue;
         }
         let Some(uid) = field("User").and_then(|u| u.parse::<u32>().ok()) else {
@@ -1037,6 +1057,9 @@ pub(crate) fn graphical_session_matching(
                 "wayland-0".to_string()
             }),
         });
+    }
+    if login_screen {
+        anyhow::bail!("the login screen is showing — nobody is signed in at this machine")
     }
     anyhow::bail!("no active graphical session — nobody is at this machine's screen")
 }
@@ -1746,7 +1769,65 @@ mod swap_tests {
 
 #[cfg(all(test, unix, not(target_os = "macos")))]
 mod tests {
-    use super::session_ids;
+    use super::{graphical_session_via, session_ids, show_field};
+
+    const GREETER: &str =
+        "Id=c1\nName=gdm\nUser=124\nSeat=seat0\nType=wayland\nClass=greeter\nActive=yes\n";
+    const PERSON: &str =
+        "Id=2\nName=ana\nUser=1000\nSeat=seat0\nType=wayland\nClass=user\nActive=yes\n";
+
+    /// A `loginctl` that knows these `show-session` outputs, listed in order.
+    fn loginctl<'a>(sessions: &'a [&'a str]) -> impl Fn(&[&str]) -> anyhow::Result<String> + 'a {
+        move |args: &[&str]| {
+            Ok(match args {
+                ["list-sessions", ..] => sessions
+                    .iter()
+                    .filter_map(|s| show_field(s, "Id"))
+                    .map(|id| format!("{id} 0 someone seat0\n"))
+                    .collect(),
+                ["show-session", id, ..] => sessions
+                    .iter()
+                    .find(|s| show_field(s, "Id").as_deref() == Some(*id))
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+                other => panic!("unexpected loginctl {other:?}"),
+            })
+        }
+    }
+
+    /// FR-56 P7 — a greeter answers the lookup that wants one (consent), never
+    /// one that asks for a person, and being the reason nobody qualifies is
+    /// said out loud. A person's session wins beside it in either order.
+    #[test]
+    fn a_greeter_answers_only_the_lookup_that_wants_one() {
+        let session = graphical_session_via(None, false, &loginctl(&[GREETER])).unwrap();
+        assert_eq!(session.name, "gdm");
+
+        let e = graphical_session_via(None, true, &loginctl(&[GREETER]))
+            .map(|s| s.name)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("the login screen is showing"), "{e}");
+
+        for order in [[GREETER, PERSON], [PERSON, GREETER]] {
+            let session = graphical_session_via(None, true, &loginctl(&order)).unwrap();
+            assert_eq!(session.name, "ana");
+        }
+    }
+
+    /// Only an ACTIVE greeter is what the screen shows; with no greeter at all
+    /// the sentence stays the one a headless server has always had.
+    #[test]
+    fn no_login_screen_keeps_the_headless_sentence() {
+        let hidden = GREETER.replace("Active=yes", "Active=no");
+        for sessions in [vec![], vec![hidden.as_str()]] {
+            let e = graphical_session_via(None, true, &loginctl(&sessions))
+                .map(|s| s.name)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("no active graphical session"), "{e}");
+        }
+    }
 
     /// FR-84 D6 — the companion runs as its OWN transient unit, never in the
     /// daemon's cgroup; a root daemon targets the session's uid, a per-user
