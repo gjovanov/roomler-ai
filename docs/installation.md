@@ -920,7 +920,46 @@ install, and `daemon (3)` on an older one. The update helper keeps the default: 
 They cannot share one enrollment: the hub keys sessions on `agent_id`, so a
 second control-WS connection displaces the first. **Each half is its own
 enrollment, so a Mac appears as two devices** — the second named
-`<name>-daemon`.
+`<name>-daemon`. Two processes are forced by macOS; two rows are not, and
+[FR-43](fr/FR-43-macos-single-enrollment.md) P3 removes the second one.
+
+With `macos_supervise_gui_worker = true` in the daemon's config, the daemon's row
+serves remote desktop as well:
+
+```mermaid
+flowchart TB
+    subgraph server["roomler.ai"]
+        U["row: name"]
+        D["row: name-daemon"]
+    end
+    subgraph mac["The Mac"]
+        subgraph root["root, from boot"]
+            DAEMON["com.roomler.daemon: overlay, SSH, exec"]
+        end
+        subgraph gui["the console user's session"]
+            WORKER["roomlerd run --supervised: capture, input, clipboard"]
+        end
+        DAEMON -- "spawns: launchctl asuser, sudo -u" --> WORKER
+        DAEMON <-- "rc messages and caps: /var/run/roomler-delegate" --> WORKER
+    end
+    D -- "control WS" --- DAEMON
+    U -- "control WS" --- WORKER
+```
+
+| | Switch off, the default | Switch on |
+|---|---|---|
+| Who owns the GUI half | launchd, `com.roomler.agent` | the root daemon, `macos_supervisor.rs` |
+| A session on `<name>-daemon` | no pixels: the agent logs `no_display` | delegated to the worker: pixels and input |
+| What `<name>-daemon` reports | `no-gui-session` | the worker's permissions, on the next heartbeat; `no-gui-session` again within a heartbeat of the worker leaving |
+| A package update | keeps the LaunchAgent | removes it and keeps the worker (`postinstall`) |
+| The GUI half killed | launchd restarts it | the supervisor respawns it; the control WS stays up |
+| Nobody logged in | `<name>` offline, `<name>-daemon` online on the mesh | the same |
+
+⚠️ **On a supervised Mac, don't delete the `<name>` row as a duplicate.** The worker
+runs on that enrollment, so it is what the daemon's row streams through until P3.
+Measured on 0.4.191: with `<name>` deleted, the worker exits 7 at every spawn, the
+supervisor backs off and stops, and `<name>-daemon` reads `no-gui-session`. A Mac
+enrolled with one root token and no per-user enrollment has no worker at all.
 
 ```bash
 # Screen sharing only (one token, one device row):
@@ -1102,7 +1141,7 @@ and a supervised Mac — whose LaunchAgent FR-43 P2d boots out by design — rea
 
 The supervisor starts the GUI worker as `launchctl asuser <uid> sudo -u '#<uid>'
 … roomlerd run --supervised`, in a process group of its own, so that it can stop
-the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:595`). The same
+the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:612`). The same
 group is why launchd's teardown of the daemon never reaches the worker. Before
 #2987, a daemon that ended any way other than its clean shutdown (the watchdog's
 `exit(2)` after a stall, a crash, a `kill -9`) left its worker running. That
@@ -1129,9 +1168,9 @@ sequenceDiagram
 
 | Mechanism | How | Catches |
 |---|---|---|
-| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:659`, `:538`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). | A worker of this release, however its daemon ended |
-| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:828`, `:465`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
-| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:483`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
+| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:676`, `:555`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). | A worker of this release, however its daemon ended |
+| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:845`, `:482`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
+| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:500`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
 
 ⚠️ **Mixed versions are safe in both directions.** The offer is a line of its
 own after the secret. A worker from before #2987 reads one line, as it always
@@ -1210,8 +1249,8 @@ sequenceDiagram
 
 | Side of the race | Since #3080 | Where |
 |---|---|---|
-| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:886`, `:835`; `crates/tunnel-core/src/child.rs:75` |
-| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:625` |
+| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:903`, `:852`; `crates/tunnel-core/src/child.rs:75` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:642` |
 | **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:927` |
 
 ⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own

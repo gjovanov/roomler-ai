@@ -16,8 +16,16 @@ pub enum DaoError {
     BsonDe(#[from] bson::de::Error),
     #[error("Entity not found")]
     NotFound,
+    /// MongoDB's refusal in MongoDB's words, which name the database, the
+    /// collection, the index and the value that collided. [`duplicate_key_index`]
+    /// and [`duplicate_key_is_on`] read it here; it never reaches a client, and a
+    /// message that embeds it stays this variant.
     #[error("Duplicate key: {0}")]
     DuplicateKey(String),
+    /// A collision already put in words for the person who caused it. The one
+    /// variant whose text goes to the client as it is.
+    #[error("Conflict: {0}")]
+    Conflict(String),
     #[error("Forbidden: {0}")]
     Forbidden(String),
     /// FR-82 — "not in this tenant", distinct from a permission refusal all
@@ -58,6 +66,16 @@ pub fn duplicate_key_index(message: &str) -> Option<&str> {
     }
     .trim();
     (!name.is_empty()).then_some(name)
+}
+
+/// Where a `DuplicateKey` collided, for a log: everything before the `dup key`
+/// document, because that document holds the value, and the value is somebody's
+/// address or username. A message without one answers `"unknown"`: its value
+/// could sit anywhere in it, so none of it is kept.
+pub fn duplicate_key_site(message: &str) -> &str {
+    message
+        .split_once(" dup key")
+        .map_or("unknown", |(site, _)| site)
 }
 
 /// Whether a `DuplicateKey` collided on `field`.
@@ -426,6 +444,26 @@ index: tenant_id_1_machine_id_1 dup key: { tenant_id: ObjectId('68a1'), machine_
             Some("tenant_id_1_machine_id_1")
         );
         assert_eq!(duplicate_key_index("something else entirely"), None);
+    }
+
+    /// A log says which index refused, and never whose value it was.
+    #[test]
+    fn the_site_keeps_the_index_and_drops_the_value() {
+        assert_eq!(
+            duplicate_key_site(EMAIL),
+            "E11000 duplicate key error collection: roomler.users index: email_1"
+        );
+        assert_eq!(
+            duplicate_key_site(COMPOUND),
+            "E11000 duplicate key error collection: roomler.agents \
+index: tenant_id_1_machine_id_1"
+        );
+        let wrapped = format!("no username after 5 attempts; last collision: {USERNAME}");
+        assert!(!duplicate_key_site(&wrapped).contains("victim_a1b2c3"));
+        assert_eq!(
+            duplicate_key_site("victim@corp.example collided"),
+            "unknown"
+        );
     }
 
     /// The regression that matters: an EMAIL collision must not read as a
