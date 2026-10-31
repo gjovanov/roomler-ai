@@ -311,7 +311,7 @@ and the consent chain's fallbacks.
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:1180-1189` | P6f |
 | O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`app.rs:3530`, `session_end.rs:220`) | P4d |
 | A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2448-2454`); the CLI and the wizard are universal | D6 |
-| A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:80-81`); behaviour under emulation unverified | D6 |
+| A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:86-87`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` in the arm64 build step before P7a; recordings write Opus, not AAC. *P7a (#2881):* the arm64 build carries the vendored FFmpeg (nvenc, vaapi, vulkan, AAC); a cell's proof is FR-122 | P7a |
 | A4 | Tunnel CLI and wizard on Linux arm64 | — | ❌ | — | x86_64 only (`release-tunnel.yml:127-131`, `release-setup.yml:184-189`). *P7b:* the aarch64 jobs (`.github/workflows/release-tunnel.yml:215`, `.github/workflows/release-setup.yml:255`) and the proxy's `linux-aarch64` (`crates/modules/fleet/src/tunnel_release.rs:197`), from 0.4.149 | P7b |
 
