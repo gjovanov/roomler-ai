@@ -199,6 +199,16 @@ decision function should return `Result<Applied, Reason>` and one call site
 should record both arms, so "a new refusal that forgets to audit itself" stays
 unrepresentable.
 
+**Keys that are never the server's (FR-52).** Every `external_*` key is the device
+owner's: gate 3 of cross-org access, and the password record behind it. `DesiredConfig`
+cannot hold one, under a prefix test, so the key that matters is also the one added
+after the test was written. The route says so instead of answering 200 for a key it
+dropped: a body naming one is refused with a 403 and audited as `device_owned_key`
+(`names_a_device_owned_key`, `crates/modules/fleet/src/remote_config.rs:171`). That
+refusal is a courtesy to the admin who asked. What stops a compromised server is the
+device, whose frame type drops the key whatever a frame carries
+(`a_pushed_external_key_never_reaches_the_device`,
+`agents/roomlerd/src/remote_config.rs:567`).
 
 **A non-security key on the same surface (FR-77 P3).** `encoder_cells_deny`
 — the cell matrix's denylist, comma-separated `name:chroma` entries or `none`

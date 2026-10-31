@@ -1,7 +1,7 @@
 # FR-52: Cross-org remote access — an outsider, a device password, and a server that cannot use it
 
 **Issue:** [#1100](https://github.com/gjovanov/roomler-ai/issues/1100) ·
-**Status:** in progress — P1 · P2a–c · P3a–d · P4a–f shipped: an outsider proves the password to a device through the server, from any pod, and opens ONE session bound to that login by MACs over both DTLS fingerprints — decided by the device, proven against the real agent, and in a real browser through the `/connect` page. **P4f's first run on an installed daemon (2026-10-20) found the one bug none of P1–P4e's CI could see** — the controller tore down its own external session as a "ghost" the instant it was created — fixed in #2612 and re-verified green end to end: a real outsider reached `connected` with live frames through the real `/connect` page against production. §12 ·
+**Status:** in progress — P1 · P2a–c · P3a–d · P4a–f shipped: an outsider proves the password to a device through the server, from any pod, and opens ONE session bound to that login by MACs over both DTLS fingerprints — decided by the device, proven against the real agent, and in a real browser through the `/connect` page. **P4f's first run on an installed daemon (2026-10-20) found the one bug none of P1–P4e's CI could see** — the controller tore down its own external session as a "ghost" the instant it was created — fixed in #2612 and re-verified green end to end: a real outsider reached `connected` with live frames through the real `/connect` page against production. **P5a built (2026-10-31)**: the open criteria each got a real refusal and a real proof, and three of them turned out not to be met as written. All but AC7's field half are ticked; that half needs a promote and a real relayed session. §12 ·
 **Owner:** remote-control (pillar 1) + control plane ·
 **Anchors verified against master `b94793e77`** (re-derived 2026-10-18, after the stack merged)
 
@@ -366,6 +366,43 @@ Two properties of the resolution endpoint, both easy to get wrong:
   `(caller, device)`; this needs a second keying that works *before* a caller is
   known — per source IP and per code globally.
 
+> **As built (P5a, 2026-10-31).** The first property did not hold on the shipped code: a
+> miss and a hit make the same two reads, but only a hit has rows to decode, and 0.4 ms
+> showed at every percentile (§12). Padding the reads cannot close that, and a
+> rate limit only slows an attacker's averaging down. So every answer given without the
+> device leaves at `ANSWER_FLOOR`, 300 ms after the knock
+> (`crates/modules/remote/src/extauth.rs:90`). It is a deadline, not a pad after the
+> work, so what was read to reach the answer cannot show. It sits above the 250 ms
+> presence probe `forward` may wait out, so a stalled Redis does not mark an offline
+> device either. Only refusals pay it: a login the device answers is as fast as the
+> device.
+>
+> ⚠️ **What ran behind the answer was the second half of it.** The shipped rule was
+> "reply first, audit after". Under a floor that rule read 1 ms late at every percentile
+> on a single-threaded runtime, more than the gap it set out to close, because the
+> spawned audit write ran ahead of the reply, on the one arm that writes a row. Two idle
+> workers hide that (§12), and a busy pod may not have one. So an answer at the floor
+> leaves from one place, `at_floor`, after its arm has returned: its row is spawned and
+> everything it held is dropped, and no arm can do anything behind the answer. Locked by
+> `an_audit_row_is_made_before_the_answer_it_explains`: a row is stamped as it is made,
+> so the stamp says which came first, where the floor test cannot.
+>
+> `rc:extauth.finish` and `rc:extauth.session` were the sharper probes: no password, no
+> start, no rate limit of their own, any code. Both answered `unavailable` for an
+> offline device's code where a made-up code answers `unknown_attempt`. Both now say
+> `unavailable` only to a principal really holding a login on that device, read the
+> gates before any forward (a frame sent on to another pod comes back a relay hop
+> later), and keep their audit rows behind the start limit. The cost is one word: a
+> revocation seen on the other pod mid-login reads `unknown_attempt`.
+>
+> ⚠️ What this does not hide, so nobody reads more into it:
+>
+> | Still visible | Why |
+> |---|---|
+> | A code whose gates are open and whose device is online | It answers with a challenge. That is how a login starts |
+> | A device's own `unavailable` (gate 3 off) from a device more than 300 ms away | Its round trip is longer than the floor. Outside this criterion, which is about the org's switch |
+> | The org's id, to an outsider who reached `rc:ready` | The TURN username carries `org-<id>`. A foreign id 404s, so it opens nothing |
+
 The capability verb is `RpcCap::ExternalAccess` (`crates/remote_control/src/models.rs:1144`),
 matched by **equality, never prefix** — the `ssh` / `ssh-consent` rule. A device that
 does not advertise it cannot be gate-2 approved, which is what keeps §3's
@@ -399,6 +436,14 @@ relay-heavy by construction (the outsider is not on the mesh). If FR-20's ledger
 on the controller's tenant, every external session meters to nothing. **Verify before
 P5, do not assume.**
 
+> **Verified in P5a: the gap was real, on one leg.** The device's allocation was already
+> charged to the session's org (`Hub::turn_user`, FR-115 P4b). The browser's was not: it
+> used a pre-fetch that names no device, because an outsider is no member of the org and
+> never learns its ids, so its bytes were charged to nobody. The viewer now takes the
+> credentials `rc:ready` carries before its first gathering (`withSessionIceServers`),
+> which the Hub issues under the session's org, the device's. A frame with no usable
+> TURN server leaves the pre-fetch in place: connecting uncharged beats not connecting.
+
 ### F4 — `local_relay` is validated as *an* overlay address, not as *the caller's*
 
 `is_overlay_relay_ip` (`crates/modules/fleet/src/hub.rs:65`) accepts any
@@ -406,6 +451,15 @@ P5, do not assume.**
 TURN URL. An external controller has no overlay presence, so for them the field must
 be **rejected outright** — otherwise it is a probe into the org's mesh, dialled by
 the agent, from outside the org.
+
+> **Closed in P5a, by a refusal as well as a type.** P4's frame has no `local_relay`
+> field, so the relay never reached the Hub, but serde dropped the key without a word:
+> a frame naming one opened its session as if nothing had happened, and nobody could
+> tell it had been tried. `names_a_relay` now reads the raw frame, by prefix, at the pod
+> it arrived on, the only one that can see the key. The session is refused before the
+> code resolves, in one answer whether it does or not, so this arm tells nothing about
+> a code. The log line and the audit row are both under the start limit, because the
+> frame has no limit of its own.
 
 ### F5 — the unauthenticated capability route already exists
 
@@ -432,13 +486,24 @@ CAS. P6 follows it rather than inventing one.
 | P4d | **The proof, against the real agent**: a sealed session end to end with the browser's half written from the spec; three forged offers each ENDED by the device; one login, one session, one principal; and the same session across two pods with both MACs crossing the PR-2 relay intact. | same | **SHIPPED** |
 | P4e | **The `/connect` page** (`ui/src/views/remote/ConnectView.vue`, `useExternalLogin.ts`, `utils/extauth.ts`): an org-less account types the connect code and the device's password; `@serenity-kit/opaque@1.1.0` (pinned exact — a wire surface, §4-0) runs the login in a LAZY chunk, so no other page pays for the WASM; WebCrypto derives the AppKey and both MACs (KATs shared with the device's); the key is handed to the viewer in memory, once, and never touches storage. The viewer's external mode (`useRemoteControl(…, { external: true })`): asks by connect code, seals its offer, checks the answer's MAC BEFORE `setRemoteDescription` and ends the session on a missing or wrong one, never probes a local relay, and turns a reconnect into "log in again" (decision 10). A grant without CLIPBOARD closes the clipboard channel before it is negotiated (decision 9). `'wasm-unsafe-eval'` added to the CSP (decision 12). | `external-access` is in no release agent build, so every device answers `unavailable` | **SHIPPED** |
 | P4f | Turn it on: `external-access` into the release feature sets; the first field run on an installed daemon with a real second account; `vs-teamviewer.md`. | gate 3 per device, default off | **SHIPPED** — `external-access` in `full` (decision 11); field-verified 2026-10-20 on 0.4.146/0.4.147 against production (§12): a real outsider account reached `connected` with live frames through the real `/connect` page, after fixing the one bug the run found (#2612) |
-| P5 | Visibility + accounting: owner notification on a first-ever external session by a principal and on repeated failures; audit UI beside `SshAuditSection`; per-principal revocation; relay bytes metered to the device's tenant (F3); a plan limit. | n/a — read-only surfaces | not started |
+| P5a | **The open criteria get real refusals and real proofs.** `ANSWER_FLOOR` and the `finish`/`session` oracle (§5); a `DesiredConfig` push naming an `external_*` key refused and audited as `device_owned_key`, by prefix; an external `local_relay` refused with a log line (F4); the viewer's TURN leg charged to the device's org (F3); the Hub's mint path driven directly at a real agent; the password captured across two pods and on the page itself. | `external_rc_enabled = false` (default) | **BUILT** — §8, §12. F3's field half follows the promote |
+| P5 | Visibility + accounting: owner notification on a first-ever external session by a principal and on repeated failures; audit UI beside `SshAuditSection`; per-principal revocation; a plan limit. (Relay bytes metered to the device's tenant, F3, moved to P5a.) | n/a — read-only surfaces | not started |
 | P6 | Ad-hoc attended support: host generates a short one-time code from tray/CLI. **Same wire** — the one-time secret takes the password's place. | separate `external_rc_mode` value; independent of unattended access | not started |
 
 ## 8. Acceptance criteria
 
-- [ ] With `external_rc_mode = off` (the default), a valid connect code + correct
+- [x] With `external_rc_mode = off` (the default), a valid connect code + correct
       password yields the **same response and latency** as a code that does not exist.
+      **P5a** — as built the switch is `external_rc_enabled = false`, and the password
+      plays no part: the server answers before KE1 leaves it, so the right one and a wrong
+      one are the same frame. Same response: `a_closed_code_answers_like_one_that_does_not_exist`,
+      to the byte, and no answer before `ANSWER_FLOOR`. Same latency, N=600 per arm with a
+      second no-such-code arm as an A/A control: the closed code reads p50 301.585 ms against
+      301.565 ms on one thread and 301.636 ms against 301.637 ms on two workers, KS 0.032 and
+      0.050 against a 1% critical value of 0.094, at the level of the A/A's 0.025 and 0.037.
+      The shipped code read 0.4 ms apart at every percentile. Equality can only be bounded,
+      so the claim is **indistinguishable at N=600**, in process, on an unsaturated runtime.
+      Falsified, §12.
 - [x] With gates 1 and 2 open but `external_access_enabled = false`, the session is
       refused **by the device**, and the refusal is audited. **P4f field run,
       2026-10-20** — flipped gate 3 off via a console-user scheduled task on an
@@ -448,26 +513,52 @@ CAS. P6 follows it rather than inventing one.
       `external-rc-audit` carries the row: `{"action":"login",
       "login_refused":"unavailable", "actor":"FR-52 outsider test (do not use)",
       "at":"2026-10-20T18:42:06.748Z"}`. Gate 3 restored after. §12.
-- [ ] A server that is asked to start an external session **without** a client proof
+- [x] A server that is asked to start an external session **without** a client proof
       cannot: demonstrated by driving the mint path directly against a real agent.
-- [ ] The password never appears in any server-side log, request body, or collection.
+      **P5a** — `a_server_cannot_mint_a_session_the_device_never_logged_in` calls the Hub
+      the way a compromised server would, past every check the server's own code makes,
+      at a real agent with every gate open and `auto` consent. A made-up attempt, another
+      principal's login and a spent login were each ended by the device (`agent_hangup`);
+      the same call on the principal's own login was admitted, so the refusals are the
+      device's doing. Falsified, §12. ⚠️ The claim stops at a session marked external. A
+      server that mints an ORDINARY session names no login, and the device cannot tell it
+      from a colleague's: that is the trust FR-100 removes.
+- [x] The password never appears in any server-side log, request body, or collection.
       Demonstrated by a capture of the full exchange. **The device-side half is
       done (P2c)**: `an_external_password_persists_and_never_lands_in_the_config_file`
       asserts it against the config file's RAW bytes, and
       `a_password_never_prints_itself_through_debug` covers the daemon log by
-      making `Request`'s derived `Debug` safe. Both falsified. The *server*-side
-      half needs the P3 exchange to exist before it can be captured.
+      making `Request`'s derived `Debug` safe. Both falsified. **The server's half, P5a**:
+      `the_password_is_in_no_log_no_frame_and_no_collection` runs a wrong guess and a whole
+      session across two pods, and searches every TRACE log line of the server and the
+      device, every frame both ways and the raw BSON of every collection, in five
+      spellings, with a canary down each lane that must be found. **The page's half,
+      P5a**: `useExternalLogin.spec.ts` drives the real `externalLogin` and the real WASM
+      client: the two frames' keys are pinned, KE1 and KE3 are RFC 9807's fixed 96 and 64
+      bytes, and a wrong guess sends one frame. Four leaks into the page went red, §12.
 - [x] A password cannot be SET from anywhere but the device. **P2c** — no server
       route writes it, `config set` refuses both credential keys, and
       `no_external_credential_key_is_editable_through_the_config_surface`
       allowlists the editable `external_*` keys so the next one added has to be
       defended rather than inherited. Falsified by registering the verifier.
-- [ ] An SDP offer whose DTLS fingerprint is not authenticated under `K` is refused
+- [x] An SDP offer whose DTLS fingerprint is not authenticated under `K` is refused
       by the agent (negative arm run explicitly — a pass with no failing arm proves
-      nothing).
-- [ ] A `DesiredConfig` push carrying any `external_*` key is rejected, and a test
-      asserts the fields cannot be serialised into one.
-- [ ] An external controller's `local_relay` is rejected (F4), with a log line.
+      nothing). **P4d** — `an_offer_the_login_did_not_seal_ends_the_session`: three forged
+      offers (another key, no MAC, a genuine tag over a swapped certificate) each ENDED
+      by the real agent, and with the check removed the forged offer was ANSWERED (M1,
+      §12, 2026-09-25). P5a reran it on the current code.
+- [x] A `DesiredConfig` push carrying any `external_*` key is rejected, and a test
+      asserts the fields cannot be serialised into one. **P5a** — the route used to
+      answer 200 and drop the key. It now answers 403 and audits `device_owned_key`, by
+      prefix (`a_desired_config_push_with_an_external_key_is_refused`). The refusal that
+      survives this server is the device's: a raw frame through the real decode and the
+      real `apply` leaves gate 3 and every `external_*` value as the owner set them
+      (`a_pushed_external_key_never_reaches_the_device`). The type cannot hold one
+      (`no_external_key_is_server_pushable_via_desired_config`, P2a). Falsified, §12.
+- [x] An external controller's `local_relay` is rejected (F4), with a log line. **P5a** —
+      `an_external_local_relay_is_refused_and_logged`: three relay keys on a real login
+      each refused, the same answer on a code that does not exist, the log line, an audit
+      row, and the same login opening its session once the key is gone. Falsified, §12.
 - [x] The host consent prompt names the controller as **outside the organization**,
       verified on a real device with a real second account. **P4f field run,
       2026-10-20** — a real Windows installed daemon (0.4.147) showed: "Remote
@@ -480,8 +571,14 @@ CAS. P6 follows it rather than inventing one.
       gated on `VIEW_REMOTE_AUDIT`. **P1** — `approval_is_compound_clearing_is_not_and_both_arms_are_audited`
       asserts 2 refusals + 1 approve + 1 clear = 4 rows, and that a plain member gets 403
       from the reader. Falsified: dropping half the gate turns it red.
-- [ ] Relay bytes from an external session appear against the **device's** org in the
-      FR-20 ledger (F3), with a direct-path arm metering zero.
+- [~] Relay bytes from an external session appear against the **device's** org in the
+      FR-20 ledger (F3), with a direct-path arm metering zero. **Met in code, P5a**:
+      `an_external_sessions_relay_is_charged_to_the_devices_org` takes the username out
+      of the real `rc:ready`, plays coturn with it, and finds the bytes on the device's
+      org and none on the outsider's own, with the booking at zero until coturn reports.
+      **Missing, the field half**: a real relayed session and a real direct one after the
+      promote, reading the ledger for both. No unit test reaches the call site in the
+      viewer, so that run also reads `getConfiguration()` on `/connect`'s peer.
 - [x] Rotating a connect code invalidates the old one immediately. **P1** — one route
       mints and rotates, and the row holds exactly one code, so the old value is gone
       rather than retired (`a_connect_code_is_minted_on_demand_…`).
@@ -656,3 +753,34 @@ CAS. P6 follows it rather than inventing one.
 | 2026-10-20 | 0.4.146, installed daemon (`vmtest-w-ins-sys-133940`, Windows) | **P4f's first run on an installed daemon — RED.** Operator-authorized outsider account (`fr52-outsider-*@roomler-ai.invalid`, no org membership). Red→green agent pair confirmed first (`roomler rc password status`: 0.4.145 "unsupported" → a real server-pushed update → 0.4.146 "build support yes"). All five gates opened on one device: 3 (`external_access_enabled`) and 4 (device password) via a console-user scheduled task (`schtasks /IT /RL LIMITED` — an SSH session is not the interactive session these keys require); 1 and 2 via the admin API. A connect code minted, then the real `/connect` page driven by Playwright from mars against **production**. Every attempt (3/3) was torn down by the controller itself the instant the session was created: `[rc] rc:session.created for agent 000000000000000000000000 while requesting ext:<code> - releasing the ghost session`, then an endless "stuck in requesting" retry loop — no error ever reached the page. | **FAIL** |
 | 2026-10-20 | same | **Cause and fix.** `sessionCreatedAction()` (`ui/src/composables/useRemoteControl.ts`, added for #1631) guards a device-switch race by comparing the server's `rc:session.created.agent_id` against the client's tracked request id. An external session's `agent_id` is ALWAYS the all-zero placeholder — the outsider never learns the device's real id — while the client tracks its own request as `ext:<connectCode>`. The two can never be equal, so the guard terminated every external session unconditionally. P1–P4e were all SHIPPED and none of them exercise this file; this is the first time the real frontend was driven through the real `/connect` page against a real backend with a real outsider. **Fixed** in #2612: an `isExternal` flag, threaded from the composable's existing `externalMode`, skips the foreign-agent check while `phase==='requesting'` — the device-switch race it guards against has no external equivalent (only one external request is ever in flight per composable, and a late create from an abandoned earlier attempt is the separate abandoned-requests registry's job, not this check's). **Negative-control tested**: temporarily disabled the new branch, confirmed the new unit test fails exactly as the field bug did (`expected 'terminate' to be 'adopt'`), restored. Full unit suite (148 files / 2409 tests) and `bun run build` green. Merged `31773e0dff`; promoted `hosted-20261020-9ba8a27`. | **FIXED** |
 | 2026-10-20 | `hosted-20261020-9ba8a27`/0.4.147, same installed daemon | **The three P4f arms, all green, against production.** *(1) happy*: real connect code + real device password → the native consent prompt — "Remote control request from OUTSIDE your organization… FR-52 outsider test (do not use) is requesting to control this device. On behalf of Outside your organization. This person is not a member of your organization. They proved this device's exte[rnal password]. Permissions: VIEW \| INPUT." — approved via a QMP click on the guest's own console (independent of every Roomler input path, per the harness's design) → `ready` → `offer_sent` → `answer` → `pc_connected` → **`phase: connected`**, "H.264 SW", a live fps counter, and a captured screenshot of the actual remote desktop rendering through the connected viewer. *(2) wrong-password*: refused client-side at KE2 — "That password did not work. Attempts are limited, so check it before trying again." — no navigation past `/connect`, matching §4b's "a guess is spent when KE2 leaves the device". *(3) gate3-off*: `external_access_enabled` flipped off via the same console-user scheduled-task mechanism (gates 1/2/4 untouched); the real device password was refused — "This device is not available for outside access. Check the code, or ask the device owner." — and `external-rc-audit` carries the row `{"action":"login","login_refused":"unavailable","actor":"FR-52 outsider test (do not use)","at":"2026-10-20T18:42:06.748Z"}`, confirming AC2's "refused by the device, and the refusal is audited". Gate 3 restored after. | **PASS** |
+| 2026-10-31 | shipped code, `53b316e80` | **AC1, RED.** `handle_start` called directly, N=600 alternating, sequential, on an idle database. No such code p10/p50/p90/p99 = 1.18 / 1.55 / 2.06 / 2.62 ms; gate 1 off = 1.50 / 1.94 / 2.59 / 3.26 ms. 0.4 ms at every quantile. The start limit slows the averaging down and stops nothing: accounts are free. | **FAIL** |
+| 2026-10-31 | same, read before writing a test | **Found: three of the seven open criteria were not met as written.** (1) AC5: the route answered 200 and dropped an `external_*` key without a word, so a stolen admin's attempt looked like a change that took. (2) AC6: serde dropped `local_relay`, so a frame naming one opened its session as if nothing had happened, with no refusal and no log line. (3) AC7: the browser's TURN leg used a pre-fetch that names no device, so its bytes were charged to nobody. The first two were the type doing the safe thing silently. Each is now a refusal, or a charge, with a test. | **FIXED** |
+| 2026-10-31 | same | **Found: `rc:extauth.finish` and `rc:extauth.session` were sharper probes than `start`.** No password, no start, no rate limit of their own, any code: an offline device's code answered `unavailable` where a made-up one answers `unknown_attempt`. `a_made_up_attempt_tells_nothing_about_the_code` holds them equal. The first draft of the F4 refusal put the same oracle back (resolve, then refuse), so it now refuses before the code matters. | **FIXED** |
+| 2026-10-31 | `a21a4c09b` | **AC1, GREEN, and a second cause found on the way.** The table below. The floor absorbs the 0.4 ms. An arm that answered and then spawned its audit write read 1 ms late on one thread, more than the gap being closed, so an answer at the floor now leaves from one place after its arm has returned (§5). | **PASS** |
+| 2026-10-31 | `a21a4c09b`, the page | **AC3, the page's half.** `useExternalLogin.spec.ts` drives the real `externalLogin` with the real `@serenity-kit/opaque` WASM, and the library's own server half plays the device, so a wrong password is decided where it is in production. Frame keys pinned; KE1 is 96 bytes and KE3 is 64; a wrong guess sends one frame; the password is in no frame and no console line in five spellings, with a canary down each lane that must be found. 7/7. **Falsified, four leaks into the page, each RED**: a new frame field; the password in `connect_code` as base64; a debug line; a wrong password that keeps talking. | PASS |
+| 2026-10-31 | `a21a4c09b` | **Found while reviewing the F4 refusal: its log line was a flood lane.** The frame has no limit of its own, and the attempt id in it is the caller's text. The line and the audit row now sit under the start limit, and the id prints escaped, so a newline in it cannot forge a log line. | **FIXED** |
+| 2026-10-31 | `a21a4c09b` | **Falsification of P5a, twelve mutations, each RED on its own guard, then reverted.** One build, six at once, the other twelve `extauth_tests::` green: (a) the gate-closed arm answers without the floor → `a_closed_code_answers_like_one_that_does_not_exist`, "answered in 5.1 ms, under the floor"; (b) `in_flight` always true → `a_made_up_attempt_tells_nothing_about_the_code`, `unavailable` where `unknown_attempt` belongs; (c) the device's `unavailable` keeps its attempt id → `every_server_refusal_looks_the_same_to_the_outsider`; (d) `names_a_relay` false → `an_external_local_relay_is_refused_and_logged`, `rc:session.created` where the refusal belongs; (e) the route's prefix check false → `a_desired_config_push_with_an_external_key_is_refused`, 200 where 403 belongs; (h) `turn_user` charges the principal → `an_external_sessions_relay_is_charged_to_the_devices_org`. One run each: (i1, i2, i3) an arm waits out the floor itself before its audit → `an_audit_row_is_made_before_the_answer_it_explains`, "the row came after the answer" in `start`, `finish` and `session`. (g) The device's `take_verified` ignores the principal → `a_server_cannot_mint_a_session_the_device_never_logged_in`, arm 2: `rc:ready` where `rc:terminate` belongs. (f) `DesiredConfig` gains `external_access_enabled`, in two stages: seven compile errors (six struct literals and `same_ssh_as`'s destructure), then, with all seven satisfied, the runtime assert of `no_external_key_is_server_pushable_via_desired_config`. The viewer: `withSessionIceServers` keeps the pre-fetch → 3 of its 12 tests. | PASS |
+
+### AC1: the N=600 runs
+
+`handle_start` called directly, a fresh principal per knock, round-robin across three arms: a code that does not exist, a code whose org has gate 1 off, and a second no-such-code arm. N=600 per arm, in ms. The second no-such-code arm is an A/A control: without it, a spread means nothing. The Kolmogorov–Smirnov statistic's 1% critical value at this N is 0.094.
+
+| Run | Runtime | No such code p50 | Gate 1 off p50 | No such code B p50 | KS closed vs none / vs none B | KS A/A |
+|---|---|---|---|---|---|---|
+| Floor, reply first, audit after | one thread | 301.455 | 302.496 | 301.485 | **0.745 / 0.723** | 0.057 |
+| Control: floor 0, the login audit removed | one thread | 1.407 | 1.837 | 1.395 | **0.433 / 0.432** | 0.037 |
+| Floor, the arm's audit before the answer | one thread | 301.499 | 301.546 | 301.511 | 0.063 / 0.067 | 0.032 |
+| **One exit**, `at_floor` after the arm returned | one thread | 301.565 | 301.585 | 301.559 | 0.032 / 0.042 | 0.025 |
+| **One exit** | **two workers** | 301.637 | 301.636 | 301.609 | **0.050 / 0.057** | 0.037 |
+| Floor alone, reply first | two workers | 301.655 | 301.642 | 301.609 | 0.038 / 0.040 | 0.052 |
+
+What each row shows:
+
+- A hit costs about 0.4 ms more than a miss. The control keeps that with no audit and no floor: both make the same two reads, and only a hit has rows to decode. The floor absorbs it, which is the fix AC1 needed.
+- Separately, on a single-threaded runtime an arm that answered and then spawned its audit write read +1.05 ms at every percentile: `block_on`'s future runs after the local queue drains, so the spawned write goes first. On two idle workers that vanishes (the last row). It is real for a runtime with nobody free and invisible otherwise, and no measurement here says how often a production pod is that busy.
+- The one-exit shape stays on those terms whatever the runtime: each handler's arms return what to send, and `at_floor` runs after they have, so no arm can do anything behind the answer. It costs nothing at runtime. It also took out a +50 µs residual the audit-first run still showed on one thread.
+- The one-thread one-exit run has a long tail (p99 306.7 / 309.6 / 313.9 ms). All three arms have it, the A/A pair included, so it is the box and not an arm.
+
+What this does not say: equality can only be bounded, so the claim is "indistinguishable at N=600". The path measured is in process. A network adds noise and no signal, but a saturated pod was not measured.
+
+Wrong turns, kept because each was plausible: (a) sync work after the answer: no, `audit_row` is a `tokio::spawn`, microseconds. (b) The red's 0.4 ms IS that audit: no, the control kept it with the audit removed. (c) "The floor did not fix it", which was written up before the two-worker run existed: only on one thread. Decide what a measurement would falsify before writing up what it means. And a test passing could not have told any of this apart: `a_closed_code_answers_like_one_that_does_not_exist` was green throughout the +1 ms bug. Its job is the deterministic half, no answer before the floor. The guard for the second cause is `an_audit_row_is_made_before_the_answer_it_explains`: a row is stamped as it is made, so the stamp says which came first.
