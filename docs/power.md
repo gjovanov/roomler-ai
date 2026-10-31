@@ -178,7 +178,8 @@ sleep would say hello again and erase the reason.
 | `roomler status` | `power` ([`lib.rs:211`](../crates/localapi/src/lib.rs#L211)) | `policy on-ac, on mains — held awake`, `policy never — held awake for a live session`, or `policy never — free to sleep (a sleep reads "asleep" in the device lists)`. On a Mac a held line adds `; a closed lid still sleeps a Mac with no external display` ([`localclient.rs:2441`](../agents/roomler-cli/src/localclient.rs#L2441)) |
 | `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3112`](../agents/roomler-cli/src/localclient.rs#L3112)) |
 | the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
-| the admin agent API | `power`, `sleep` ([`agent.rs:629`](../crates/modules/fleet/src/agent.rs#L629)) | the posture as last reported, and the notice on a device that is not online |
+| the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
+| the admin agent API | `power`, `sleep` ([`agent.rs:629`](../crates/modules/fleet/src/agent.rs#L629)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
 | peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3562`](../crates/remote_control/src/models.rs#L3562)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
 
 The dashboard's words, for a device that announced a sleep:
@@ -190,6 +191,13 @@ The dashboard's words, for a device that announced a sleep:
 | `held: true` | Asleep since …, past its hold: a closed lid, a person or the OS put it to sleep anyway. On a Mac, it adds the clamshell sentence. |
 
 An offline row without `sleep` gave no reason and still reads `offline`.
+
+⚠️ **`presence` never reads `asleep`.** A sleeping device is `presence: offline`
+with `sleep` beside it (`asleep_since` on the agent-facing list), and each surface
+draws the word from that. To find sleeping devices, filter on the field: a filter
+on `presence` matches nothing and looks like a fleet that never sleeps. P4 first
+shipped in `0.4.190`: an older agent says no goodbye, and an older CLI has no
+`asleep_since` to show.
 
 ### 3.5 Invariants
 
@@ -205,13 +213,18 @@ An offline row without `sleep` gave no reason and still reads `offline`.
   announcement, not just one wait: an announcement that outlived it would hand
   every new connection its goodbye at once. On Linux and macOS the monotonic
   clock stops while the computer sleeps, so 60 s bounds awake time, not the nap.
+  Not in every guest: a KVM guest's s2idle kept it running, a 79 s sleep used up
+  the hold, and the wake logged `no wake reported within the hold: reconnecting
+  anyway` 40 ms before logind's wake. Harmless, because both paths reconnect, but
+  in such a guest that `WARN` does not mean a wake went missing.
 - ⚠️ **No hook takes an assertion**, so `pmset -g assertions` and
   `powercfg /requests` show nothing new and `never` stays byte-for-byte (AC3).
   The Linux delay inhibitor keeps FR-93 P5h's scope on a `never` device, live
   sessions only, and covers the control connections only under `on-ac` and
   `always` ([`sleep_notice.rs:489`](../agents/roomlerd/src/sleep_notice.rs#L489)
   `inhibitor_wanted`). So a `never` device's goodbye on Linux is best effort,
-  sent in whatever time logind leaves (an open decision in the spec).
+  sent in whatever time logind leaves. The operator chose that on 2026-10-30
+  (the spec's open decisions), and it held in the field (§3.8).
 - ⚠️ **Peers are closed, never dropped.** The goodbye closes every WebRTC peer
   before the socket. A dropped peer keeps its UDP sockets
   (`docs/tunnels.md`).
@@ -237,6 +250,18 @@ An offline row without `sleep` gave no reason and still reads `offline`.
 | [`sleep_announce_tests.rs:104`](../crates/tests/src/sleep_announce_tests.rs#L104) | the server's half through the real socket: the goodbye ends the connection at once, the agent row, the grid and the presence event carry the reason, the next hello erases it |
 | [`sleep_announce_tests.rs:213`](../crates/tests/src/sleep_announce_tests.rs#L213) | only the connection that said hello can mark the device asleep |
 | [`sleep_announce_agent.rs:158`](../crates/tests/tests/sleep_announce_agent.rs#L158) | the agent's half: the real signalling loop says goodbye, does not redial during the sleep, comes back at the wake, and then reads plain offline after a stop. Its own test binary, because the announcement is process-wide |
+
+### 3.8 Seen in the field
+
+On production, on the released `0.4.190`, on Linux only. **The Windows and macOS
+hooks have not run in a field test yet.** The full record is in the
+[spec's field log](fr/FR-55-always-reachable.md#field-verification-log).
+
+| the read | what it showed |
+|---|---|
+| a real suspend on a desktop guest, `never`, 3 of 3 | the goodbye in the same second as `PM: suspend entry`, `sleep` on both admin routes, `◌ … asleep` in a peer's `roomler devices`, and the chip on an open dashboard page turning `asleep` within 3 s with no reload. `online` 1 s after the wake |
+| the same with no delay inhibitor on the host | 7 goodbyes written. All 4 suspends whose row was read arrived as `asleep`; the other 3 went unread |
+| the same device with its link taken down | nothing said, `online` until the server's 2:00 receive deadline, then plain `offline` with no `sleep`, never `asleep` |
 
 ## 4. What this does not cover
 

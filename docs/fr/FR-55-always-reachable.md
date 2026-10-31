@@ -4,8 +4,9 @@
 **Status:** P0 measured, P1 + P2 shipped (`agent-v0.4.45` / `0.4.46`), P3 deferred on
 evidence and then built under FR-97 P3b (2026-10-17, the last section), **P4 built in
 [#3148](https://github.com/gjovanov/roomler-ai/pull/3148) (2026-10-30)**: a device going
-to sleep says so first and reads *asleep* instead of *offline* (§P4 design), proven
-through the real server and the real agent loop, with the real-suspend read still owed;
+to sleep says so first and reads *asleep* instead of *offline* (§P4 design),
+**field-verified on Linux on the released `0.4.190`** (2026-10-31, field log), with the
+same read owed on Windows and on a Mac;
 P5 open — and ⚠️ **P2's AC-power arm FAILS in the field**: a Mac that
 falls asleep on battery and is then plugged in stays asleep all night with our
 assertion held (2026-09-24, field log). This line read "proposed" until then, with the
@@ -121,7 +122,7 @@ reported normally while a feature was dark.
 | P1 | An **active rc/ssh session** holds an assertion, on all three OSes. Narrow, always-correct, no policy needed. | per-OS: assertion failure is logged and non-fatal |
 | P2 | Standing policy `power_policy = never \| on-ac \| always`, default `never`, device-owned. macOS first. | the key itself; absent ⇒ today's behaviour |
 | P3 | Windows + Linux implementations of the same policy. | as P2 |
-| P4 | Report it: `roomler status` + the dashboard distinguish "asleep by policy" from "offline". **Built in #3148 (2026-10-30)**: the heartbeat's power posture, the `rc:agent.sleeping` goodbye from a hook on every OS, the server's record, and the *asleep* reading in `roomler status`, `roomler devices` and the dashboard (§P4 design). | additive, read-only; `ROOMLERD_SLEEP_ANNOUNCE=0` turns off the goodbye and the reconnect hold |
+| P4 | Report it: `roomler status` + the dashboard distinguish "asleep by policy" from "offline". **Built in #3148 (2026-10-30)**: the heartbeat's power posture, the `rc:agent.sleeping` goodbye from a hook on every OS, the server's record, and the *asleep* reading in `roomler status`, `roomler devices` and the dashboard (§P4 design). **Field-verified on Linux on the released `0.4.190` (2026-10-31)**; Windows and macOS owed (field log). | additive, read-only; `ROOMLERD_SLEEP_ANNOUNCE=0` turns off the goodbye and the reconnect hold |
 | P5 | **Wake on LAN from a mesh peer** — an awake peer on the same L2 sends the magic packet on request. | server-side switch; off by default |
 
 ## P4 design — asleep, not offline (2026-10-30, #3148)
@@ -184,10 +185,14 @@ The P4 anchors are verified against #3148's branch, on master `7e7a862ad`.
 - [ ] With `power_policy = on-ac`, a laptop on battery still sleeps and the same laptop on
       AC does not.
 - [~] An operator looking at a device that is asleep by policy can tell that from the UI,
-      without reading a log. *2026-10-30, #3148: built and proven through the real server
-      (`sleep_announce_tests`) and the real agent loop (`sleep_announce_agent`, shown
-      failing first with the kill switch); the dashboard's and the CLI's words are
-      unit-tested. Owed: the read on a device that really suspends (field log).*
+      without reading a log. *2026-10-31: proven on Linux, on the released `0.4.190`
+      against production. Real suspends read `asleep` on the dashboard, in a peer's
+      `roomler devices` and on the API, and the same device read plain `offline` when it
+      lost its network instead (field log). Owed: the same read on Windows and on a Mac,
+      whose hooks have not run in a field test. The box stays partial until they do: those
+      are the devices that sleep. 2026-10-30, #3148: built and proven through the real
+      server (`sleep_announce_tests`) and the real agent loop (`sleep_announce_agent`,
+      shown failing first with the kill switch).*
 - [~] ⚠️ The macOS **clamshell** limitation is documented in the UI where the policy is
       set — not discovered by a user whose lid-closed Mac still vanishes. *2026-10-30,
       #3148: the policy is set in two places, and both carry the key's ⚠️ clamshell
@@ -229,7 +234,10 @@ The P4 anchors are verified against #3148's branch, on master `7e7a862ad`.
   the inhibitor while any control connection is live would make that goodbye reliable,
   at the price of a Roomler delay inhibitor in `systemd-inhibit --list` on every Linux
   device, permanently. `on-ac` and `always` devices already hold it while a control
-  connection is live.
+  connection is live. **Answered by the operator, 2026-10-30: no, live sessions only, as
+  built.** Measured since (2026-10-31, field log): with no delay inhibitor on the host at
+  all, the goodbye reached the server on all 4 suspends whose row was read. That is one
+  idle VM, not a fleet rate.
 
 ## Out of scope
 
@@ -372,3 +380,68 @@ Not proven yet:
 - **The macOS hook** is compiled only by CI's macOS lane.
 - **A `never` device on Linux** sends its goodbye on a best-effort basis (the open
   decision above).
+
+### 2026-10-31 — the real suspend, on production: RED on `0.4.188`, GREEN on the released `0.4.190`
+
+The read the last section owed, for Linux. A throwaway vmtest guest (Ubuntu 24.04, a system
+install, ephemeral, in the vmtest org, `power_policy` at its default, `never`) really
+suspends: `systemctl suspend`, which is s2idle there. A key press wakes it; an RTC alarm does
+not wake s2idle in this guest. Production's device row is read every 15 s as the vmtest
+admin. For GREEN, a throwaway peer in the same org reads `roomler devices`, and a real browser
+stays open on the devices grid across the suspend. GREEN installs the published `.deb`
+(sidecar hash matched, good signature from the release key), the first release carrying P4,
+against production's `hosted-20261031-28dfd72`.
+
+| # | the guest | what production read | result |
+|---|---|---|---|
+| RED | the released `0.4.188`, before P4 (2026-10-30) | The daemon logged `viewers told (FR-93 P5h) sessions=0 told=0` and said nothing to the server; `PM: suspend entry (s2idle)` followed 1 s later. The row read `online` for 1 min 46 s, with `last_seen_at` frozen at the last heartbeat, then a bare `offline`: no `sleep`, no reason. After the wake it read `online` again within a second of the hello | ❌ as it must: "offline" for a computer that is only asleep |
+| GREEN 1 | the released `0.4.190`, asleep 79 s | `saying goodbye to the server … policy=never on_ac=None held=false` and `connections=1 said=1` at 18:01:16.919, the second of `PM: suspend entry`. The server's `sleep.since` is 18:01:16.925: `presence: offline` with `sleep { policy: never, held: false }` on `/device` and `/agent`. The peer read `◌ … asleep`. The open grid's chip turned `asleep` by itself within 3 s, with no reload, and a fresh load agreed. A tap on it showed: *Asleep since 10/31/2026, 6:01:16 PM, as its power policy allows: nothing was holding it awake (power policy “never”). It reconnects by itself when it wakes. To keep it reachable, set power_policy to on-ac or always on the device.* Hello 1 s after the wake, `sleep` gone, `online` on all three | ✅ |
+| GREEN 2 | the same, asleep 35 s | the same reads, and `awake again: reconnecting (FR-55 P4)` at the wake; hello 1 s later | ✅ |
+| GREEN 3 | the same, asleep 20 s | the same reads, the same line; hello 1 s later | ✅ |
+| CONTROL | the same device and build, its virtual link taken down: no OS notice, and nothing it says gets out | `online` for 1 min 41 s, until the server's 2:00 receive deadline after the last heartbeat, then `offline` with `sleep: null`. The chip read `offline` and the peer `○ … offline`, never `asleep`. `online` within 2 s of the link coming back | ✅ as it must: a device that gave no reason still reads `offline` |
+| HEADLESS | the same build, rebooted to `multi-user.target` with `gdm`, `upower`, `NetworkManager` and `ModemManager` gone. `systemd-inhibit --list` reads `No inhibitors.`, and the same list does show a test inhibitor | 7 suspends, 7 `said=1`, 7 hellos after the wakes. The server's answer was read on 4 of them, twice on the API and twice in the peer's list, and all 4 arrived as `asleep`. The other 3 went unread because the rig's own polling hit a rate limit, and `said=1` says only that the frame was written | ✅ 4 of 4 read |
+
+RED to GREEN: 1 min 46 s of a false `online` followed by a reason-free `offline` became an
+`asleep` that names its reason within seconds. The CONTROL is what makes that a distinction
+and not a new word for every drop: the same device reads differently for the two causes.
+`roomler status` on the guest read `policy never — free to sleep (a sleep reads "asleep" in
+the device lists)` on the released build.
+
+HEADLESS matters for the open decision on the Linux inhibitor. The desktop guest's own delay
+inhibitors (GNOME, UPower, NetworkManager, ModemManager) hold the suspend back for everyone,
+the goodbye included. With none of them, the goodbye had only the time logind leaves it, and
+it still arrived every time it was read. That is one idle VM, not a fleet rate: a loaded host
+could still lose the race.
+
+Dead ends, kept so nobody repeats them:
+
+- **`virsh suspend` is no control on the lab host.** Its VM watchdog un-paused the domain
+  after 83 s, before the 2:00 deadline, so the row never left `online`. That run is not a
+  result. `virsh domif-setlink` replaced it.
+- **Stopping `gdm` on the running guest was the wrong way to go headless.** Logins then hung
+  for minutes and `systemd-inhibit --list` printed nothing, while the daemon stayed online.
+  That empty list meant nothing. A real headless boot replaced it, and a hard reset needs a
+  `sync` first: the first try lost its `set-default` to the reset 1 s later.
+- **A read of `power` on `/device` always says `null`.** That route carries `sleep` and no
+  `power`, by design; `/agent` has both. It looked like a missing posture until the right
+  route read `{ policy: never, held: false }`.
+- **A read filtering on `presence == asleep` finds nothing, whatever the fleet is doing.**
+  `presence` stays `offline`; asleep is the `sleep` field (`docs/power.md` §3.4).
+
+What the run showed that nobody had asked:
+
+- **The hold can end before the wake.** GREEN 1 logged `no wake reported within the hold:
+  reconnecting anyway` 40 ms before logind's wake. The monotonic clock kept running through
+  this guest's s2idle, so a 79 s sleep used up the 60 s hold. Both paths reconnect; the `WARN`
+  is harmless here, and `docs/power.md` §3.5 now says so.
+- **Where a sleeping device still reads like an offline one:** the sidebar's grey dot, the
+  dialogs for a queued action, and the remote page's `agent_offline` message, which says to
+  check that the device is powered on. Each is true as far as it goes. None says why; the
+  grid does. The last two are read from the code, not from a live session.
+
+Still owed:
+
+- **Windows and macOS.** `PowerRegisterSuspendResumeNotification` and the IOKit hook have run
+  in no field test, and laptops on those two systems are the devices that sleep. Putting one
+  on `0.4.190` or newer to sleep and reading the grid is the whole test. AC5 stays partial
+  until then.
