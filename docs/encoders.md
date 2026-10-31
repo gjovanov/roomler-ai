@@ -1075,10 +1075,19 @@ flowchart LR
   roomlerd encoder-smoke --encoder software --bench --bench-cells rtp:h264 --bench-sizes 1920x1080 --bench-frames 150 --bench-paced
   ```
 
-  A paced row well above its back-to-back twin is the trap. A flat one means this OS is not clocking the thread
-  down, and the request has nothing to fix. `ROOMLERD_ENCODER_CLOCK=1` in front of the same two lines gives the
-  other arm. Each is a one-shot process, so no daemon restarts, and a release carries both arms, so no test binary
-  has to reach the host.
+  A paced row well above its back-to-back twin is the trap. ⚠️ A flat row speaks for its own size only, so read a
+  size that leaves the thread mostly idle: on the same Mac a 1920×1080 frame doubles at a 30 fps cadence and a
+  3024×1964 frame does not move.
+
+  `ROOMLERD_ENCODER_CLOCK=1` in front of the same two lines gives the other arm (on Windows,
+  `$env:ROOMLERD_ENCODER_CLOCK='1'` first). Each is a one-shot process, so no daemon restarts, and a release carries
+  both arms, so no test binary has to reach the host. Through `roomler exec` on a Mac, call
+  `/usr/local/bin/roomlerd`: exec's `PATH` does not hold it.
+- **macOS, before the request.** MacBook-1 (Apple M5 Pro, AC, 0.4.190) has the trap in a milder form. A 1080p frame
+  goes from about 3.1 ms back to back to about 6.4 ms at a 30 fps cadence on H.264 and VP9-444, and to about 3.7 ms
+  at 60 fps. Every row at a 60 fps cadence fits its 16.7 ms, so here it costs about 3 ms of latency and no frames.
+  What the request does is still owed, on macOS and on Windows
+  ([FR-112 §9](fr/FR-112-software-encoding-at-60-fps.md#9-field-verification-log)).
 
 ### OpenH264's runtime settings (FR-112 P2b)
 
