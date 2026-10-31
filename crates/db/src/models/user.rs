@@ -55,6 +55,13 @@ pub struct User {
     /// seam that proves it). Never logged at `info`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signup_attribution: Option<SignupAttribution>,
+    /// #3199 — when a new activation link was last sent to this account, the
+    /// per-address cooldown's clock (`UserDao::claim_activation_resend`). On
+    /// this row and not on `activation_codes`, because that collection is
+    /// TTL-reaped: at a 5-minute link a cooldown kept with the code would be
+    /// gone before it had run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_resent_at: Option<DateTime>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub deleted_at: Option<DateTime>,

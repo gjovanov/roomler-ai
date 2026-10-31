@@ -2,6 +2,10 @@
 // Copyright (C) 2026 G ROX EOOD
 pub mod fixtures;
 
+/// #3199 — the way back from an expired activation link: one answer for every
+/// address, both rate limits, and who can ever be mailed.
+#[cfg(test)]
+mod activation_resend_tests;
 #[cfg(test)]
 mod auth_tests;
 #[cfg(test)]
