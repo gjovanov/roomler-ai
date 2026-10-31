@@ -1114,9 +1114,11 @@ pub fn clock_label(outcome: super::clock::Outcome) -> String {
     use super::clock::Outcome;
     match outcome {
         Outcome::Clamped => "clamped".into(),
+        Outcome::QosClass => "qos-user-interactive".into(),
+        Outcome::Unthrottled => "unthrottled".into(),
         Outcome::Off => "off".into(),
         Outcome::Refused(errno) => format!("refused:{errno}"),
-        Outcome::NotLinux => "n/a".into(),
+        Outcome::Unsupported => "n/a".into(),
     }
 }
 
@@ -1124,7 +1126,7 @@ pub fn clock_label(outcome: super::clock::Outcome) -> String {
 ///
 /// Every cell opens, encodes and drops on ONE thread of the bench's own, the
 /// way a session's encoder lives on its thread (`encode::thread`): the thread
-/// asks for its clock first (FR-112 P1, Linux), so the threads an encoder
+/// asks for its clock first (FR-112 P1, P3), so on Linux the threads an encoder
 /// creates inherit it, and a thread-affine encoder (QSV) never changes threads
 /// between frames, which a paced row's sleeps would allow on the runtime.
 pub async fn run(args: &BenchArgs, pref_raw: &str, name: Option<&str>) -> anyhow::Result<()> {
@@ -1770,8 +1772,10 @@ mod tests {
     fn the_clock_says_what_the_bench_thread_got() {
         use crate::encode::clock::Outcome;
         assert_eq!(clock_label(Outcome::Clamped), "clamped");
+        assert_eq!(clock_label(Outcome::QosClass), "qos-user-interactive");
+        assert_eq!(clock_label(Outcome::Unthrottled), "unthrottled");
         assert_eq!(clock_label(Outcome::Off), "off");
         assert_eq!(clock_label(Outcome::Refused(22)), "refused:22");
-        assert_eq!(clock_label(Outcome::NotLinux), "n/a");
+        assert_eq!(clock_label(Outcome::Unsupported), "n/a");
     }
 }
