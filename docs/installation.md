@@ -635,6 +635,9 @@ sequenceDiagram
     U->>U: systemctl --user enable --now roomler.service (restarted beside an enabled helper)
 ```
 
+- **The wizard needs WebKitGTK 4.1.** The Fedora KDE lab image lacked it
+  (`sudo dnf install webkit2gtk4.1`). On Debian and Ubuntu the package is
+  `libwebkit2gtk-4.1-0`.
 - **The cards appear only when the chosen server says so**: the wizard reads
   `GET /api/setup/features` and shows the Linux cards on a JSON
   `wizard_linux_daemon: true`, or on `wizard_unix_daemon: true`, which a server
@@ -647,17 +650,18 @@ sequenceDiagram
   `agents/roomler-setup/src/features.rs:73-79`). The server is picked after the role, so the
   Server page asks again when the URL changes and the pipeline once more before
   it installs.
-- **Turning the Linux cards on** (the operator). The homepages' Linux button
-  downloads the **latest** `setup-v*`, and a wizard released before the split
-  reads only `wizard_unix_daemon`, which the server answers as Linux AND macOS,
-  so a Linux-only server shows it no daemon card. The switch therefore waits
-  for the first `setup-v*` that carries B1-s2 and its Linux field run. Then set
-  `ROOMLER__SETUP__WIZARD_LINUX_DAEMON: "true"` in the deploy repo's
-  `roomler2-config` ConfigMap and bump the deployment's `roomler.ai/config-rev`
-  annotation in the same change: the pods read the ConfigMap through `envFrom`,
-  which does not roll them, and the annotation does. `GET /api/setup/features`
-  then answers `wizard_linux_daemon: true` with `wizard_macos_daemon` and
-  `wizard_unix_daemon` still `false`.
+- **On production, both OSes since 2026-10-30 (22:33Z).** The deploy repo's
+  `roomler2-config` ConfigMap sets the legacy
+  `ROOMLER__SETUP__WIZARD_UNIX_DAEMON: "true"`, with a bump of the deployment's
+  `roomler.ai/config-rev` annotation in the same change: the pods read the
+  ConfigMap through `envFrom`, which does not roll them, and the annotation
+  does. `GET /api/setup/features` answers every key `true`.
+- **Taking one OS off** (the operator). Delete the legacy key and set the other
+  OS's, `ROOMLER__SETUP__WIZARD_LINUX_DAEMON: "true"` to leave Linux on, with
+  the same annotation bump. A wizard from `setup-v0.4.190` on reads its own OS's
+  key and keeps its cards (field-measured 2026-10-31). A wizard released before
+  the split reads only `wizard_unix_daemon`, which the server answers as Linux
+  AND macOS, so it then shows no daemon card until it is downloaded again.
 - **One prompt, through the desktop's own agent.** `pkexec` is launched from
   the wizard's process, which GNOME and Plasma put in the user manager; polkit
   resolves it to the seat session and GNOME Shell or `polkit-kde-agent` shows
@@ -978,12 +982,12 @@ on macOS 15.7). Restart it in any of three ways:
 
 | how | what happens |
 |---|---|
-| **Quit & Reopen** — the button macOS offers when you turn the toggle on | System Settings sends the agent a Quit AppleEvent (with a log-out's reason, `'rlgo'`); the agent tells it from a real log-out by its sender (only `loginwindow` quits a session that is ending), leaves with its restart code, and launchd relaunches it within milliseconds. Finder may still say "The application “roomlerd” is not open anymore": its *Reopen* looks for the process that quit, while launchd has already brought the agent back. ⚠️ Agents up to 0.4.188 exited 0 instead, which launchd does not relaunch: the device stayed **offline** until a `kickstart` |
+| **Quit & Reopen** — the button macOS offers when you turn the toggle on | System Settings sends the agent a Quit AppleEvent (with a log-out's reason, `'rlgo'`); the agent tells it from a real log-out by its sender (only `loginwindow` quits a session that is ending), leaves with its restart code, and launchd relaunches it within milliseconds. Finder may still say "The application “roomlerd” is not open anymore": its *Reopen* looks for the process that quit, while launchd has already brought the agent back. ⚠️ Agents up to 0.4.189 exited 0 instead, which launchd does not relaunch: the device stayed **offline** until a `kickstart`. Fixed in 0.4.190 (2026-10-31), field-verified on that release |
 | **Restart roomlerd** in the menu-bar app's permission card | the LocalAPI `RestartDaemon` verb (the same as Settings' *Apply now*) |
 | `launchctl kickstart -k gui/$(id -u)/com.roomler.agent` in Terminal | the restart that works on every version |
 
 Accessibility is read live: input works from the next remote event, with no
-restart (up to 0.4.188 the first session's failed input backend was kept until
+restart (up to 0.4.189 the first session's failed input backend was kept until
 the agent restarted, so typed input was dropped while the viewer no longer
 warned).
 
