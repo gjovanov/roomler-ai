@@ -4884,6 +4884,7 @@ mod external_access_tests {
             login_refused: None,
             login_detail: None,
             session_id: None,
+            principal: None,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert!(json.get("approved").is_none());
