@@ -273,14 +273,16 @@ three-hour CORPLAP-2 session over `relay:derp/tcp` held its target through
 locally blocked send inside an agent-stalled window — the AIMD's own occupancy
 loop, not the gate) at a paint age of p50 76 ms / p95 99 ms / max 988 ms.
 
-⚠️ **Open (AC9)**: the positive half — the target *converging* toward the
-measurement across repeated stalls — has not been caught in the field yet. It
-needs a stall inside a **measured** minute on a thin relay, and a sweep of the
-three relay laptops' daemon logs for 2026-09-10 → 09-25 (24,013 heartbeats,
-7,442 constrained windows, 193 transit stalls) found the pipe estimate absent
-at every one of the 193: the blocked-send source was live in 2 % of the
-constrained windows and the prior in none. That absence is the V3b finding,
-below.
+⚠️ **AC9, partly met 2026-10-31**: the positive half — the target *converging*
+toward the measurement across repeated stalls — needs a stall inside a
+**measured** minute. A sweep of the three relay laptops' daemon logs for
+2026-09-10 → 09-25 (24,013 heartbeats, 7,442 constrained windows, 193 transit
+stalls) found the pipe estimate absent at every one of the 193: the
+blocked-send source was live in 2 % of the constrained windows and the prior in
+none. That absence is the V3b finding, below. The first sustained run came on
+2026-10-30 on CORPLAP-2, `0.4.187`: 27 stalls in 56 s at a live
+`goodput_bps=180,484`, the target held at 1.11–1.40× it, bounded by the 200 kbps
+floor. The weak point is the reading it converges to (the A/B below).
 
 ⚠️ **The 2026-10-29 fleet read found the inverse (FR-71).** Over 15 days and
 40,654 constrained windows on the corporate laptops (`0.4.137` → `0.4.184`), a
@@ -306,6 +308,22 @@ Until the operator decides it, a convergence caught in the field may be toward
 the stand-in rather than a measurement, so it cannot count as AC9. The options
 and the rig AC8 and AC9 still need are in
 [`fr/FR-79-one-validity-gate.md`](fr/FR-79-one-validity-gate.md) §Open decisions.
+
+⚠️ That prior's size did not come from the walk. The session's stand-in moved on
+the measured ×11/10 ladder (`prior.rs:80`, `:167`) above a base of at most 17,799
+bps, so a live reading anchored it, and the walk only moved it between rungs. A
+congested viewer report stores the arrival rate with no floor (`governor.rs:1343`),
+and the same window re-anchors the prior on it (`:1433`). V5b would stop the cuts,
+but the anchor would stay in `pipe_bps` until it climbs back.
+
+⚠️ **The field A/B (2026-10-30 11:48–12:19, CORPLAP-2, `0.4.187`,
+`relay:derp/tcp`).** Over one session, stalls cut the target 13 times of 16 while
+a stand-in stood and 0 of 26 while nothing did, which is V5b's case. The same
+session shows V5b is not enough. One 102 ms blocked send folded into a live
+`goodput_bps=223,794`, because a window needs only 60 ms of blocked time
+(`goodput.rs:82`), on a path that delivered 5.39 M. While it stood the target
+fell 3.0 → 0.68 M in 22 s, most of it through the queue budget, which is
+denominated in the same `pipe_bps`.
 
 ### The ceiling learner (FR-35 P1) — growth above the nominal
 
@@ -452,7 +470,7 @@ flowchart LR
 |---|---|---|
 | the key | `remote_addr\|carrier` — `direct`, `tunnel`, `relay:<kind>/<transport>` from the LocalAPI peer record; a mid-churn carrier (`blocked` / `offline`) leaves the bare pre-FR-79 key. DERP-over-TLS and a UDP relay are different pipes on the same address, four times apart in capacity | `rate_memory.rs:42`, `:65`; `peer.rs:2054` |
 | the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:9077` (`opener_measured_bps`) |
-| the evidence | first choice `RateGovernor::stable_bps()` — the highest AIMD target that held 10 s with no decrease, when above the nominal; then `pipe_bps` (the belief the gate accepted); else 0 = nothing. ⚠️ The first is a hold of the *target*, not a measurement: an idle session holds the opener's seed for its whole length and writes 0.85 × the memory back as evidence (field rows below) | `peer.rs:8985`; `governor.rs:599` |
+| the evidence | first choice `RateGovernor::stable_bps()` — the highest AIMD target that held 10 s with no decrease, when above the nominal; then `pipe_bps`; else 0 = nothing. ⚠️ The first is a hold of the *target*, not a measurement: an idle session holds the opener's seed for its whole length and writes 0.85 × the memory back as evidence (field rows below). ⚠️ The second is the belief the gate accepted only while a measurement is live: its last source is the prior's stand-in (`governor.rs:648`), so a prior that stands low can be written back too (field rows below) | `peer.rs:8985`; `governor.rs:599` |
 | the write | `record_session(peer, evidence, now)`: `None` or 0 ⇒ **no write**; first evidence ⇒ adopted outright; otherwise `damp` with the goodput estimator's own asymmetry (`ALPHA_DOWN` 0.50 / `ALPHA_UP` 0.10, `goodput.rs:94`, `:98`). The maximum rule, `had_decrease`, the unqueued ×1.5 step and its constants are gone | `rate_memory.rs:147`, `:79`; `peer.rs:2111` |
 | the file | `rate_memory.json` in the daemon's data dir (`appdirs::project_dirs().data_dir()` — on a Windows SYSTEM service `…\config\systemprofile\AppData\Roaming\roomler\roomler\data\`); whole-file atomic write; a missing or corrupt file is an empty memory; an entry older than 7 days never seeds and is pruned on the next write | `rate_memory.rs:185`, `:22` |
 | the log line | `FR-79 V4 rate memory: … peer=… evidence_bps=… kept_bps=…` at every session end that had a key. **`kept` lies between the old value and the evidence**, so `kept > evidence` on one line proves the entry moved DOWN — no old value needed | `peer.rs:2120` |
@@ -469,6 +487,8 @@ Field reads of the write-back so far (key `100.65.4.2\|relay:derp/tcp` unless no
 | 2026-10-27 15:29:46 | CORPLAP-2 · 0.4.178 | `Some(4045966) → 4402963` from 4,759,961 | **the P2b decay, in V4 form**: a 130 s session on an idle desktop (0.16–0.25 Mbps at 18 fps, a 405-byte opener) never stepped and never decreased, so `stable_bps()` was its own `opener_maxrate_bps` — 0.85 × the memory — and `damp` took half the gap: **−7.5 % for having measured nothing**. Ten such sessions halve the memory; one proving session restores a tenth of its gap |
 | 2026-10-27 16:31 · 10-28 07:58, 12:38, 16:46 | CORPLAP-2 · 0.4.178 / 0.4.181 | `None → kept 4402963`, four times | sessions of 11–19 s: nothing held 10 s, nothing written — not the value, not the timestamp (as designed) |
 | 2026-10-28 16:48:01 | CORPLAP-2 · 0.4.181 | `Some(4489010) → 4411567` from 4,402,963 | the 90 s session's stable rate (4.49 M after three steps) moved the entry **+0.2 %**; the file now holds `100.65.4.2\|relay:derp/tcp` = 4,411,567 at `at_unix` 1793206081 |
+| 2026-10-30 12:22:06 | CORPLAP-2 · 0.4.187 | `Some(84195) → 84195`, a new entry | **the prior's stand-in written as evidence**: anchored at 180,484, it walked eight rungs in 28 s once the goodput expired, and `pipe_bps`'s last source wrote it. Nobody measured 84,195 |
+| 2026-10-25 → 10-30 | CORPLAP-2 · up to 0.4.188 | 18 writes with evidence, `5955306 → 3379312` | **every one a rung of the session's own opener**, 0.85 × the memory × (17/16)^k, six at k = 0. 17 of the 18 sessions held no live measurement in any heartbeat, and the entry lost 43 % while they delivered up to 10.2 M |
 
 ⚠️ An entry written before V2 is keyed by the bare address, never matches
 again and ages out. An entry that ages out is *replaced* by the next session's
@@ -484,6 +504,8 @@ that protects against a flooded opener (believe a drop fast) then compounds it:
 the pair that carried 6–7.6 Mbps windows is remembered at 4.4 M. A fix belongs
 with the governor (`peer.rs:8985`: require the hold to have been *carried*, or
 route the first-choice evidence through the gate); nothing here is changed yet.
+The 2026-10-25 → 10-30 row is the same defect at scale: every write on that pair,
+not only the idle sessions.
 
 ### V3b — ONE belief about the path (SHADOW since `agent-v0.4.98`)
 

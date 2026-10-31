@@ -1,6 +1,6 @@
 # FR-79: One validity gate — a window is evidence about the pipe, or it is not
 
-**Issue:** [#1524](https://github.com/gjovanov/roomler-ai/issues/1524) · **Status:** proposed 2026-09-08; V1–V5a shipped (`agent-v0.4.93` → `0.4.97`), V3b in SHADOW (`0.4.98` → `0.4.100`), docs 2026-09-25; AC8 half-met, AC9 open; **V5b proposed 2026-10-30** for the V5 loop FR-71's 2026-10-29 fleet read found, waiting on the operator ·
+**Issue:** [#1524](https://github.com/gjovanov/roomler-ai/issues/1524) · **Status:** proposed 2026-09-08; V1–V5a shipped (`agent-v0.4.93` → `0.4.97`), V3b in SHADOW (`0.4.98` → `0.4.100`), docs 2026-09-25; AC8 half-met, AC9 partly met 2026-10-31; **V5b proposed 2026-10-30** for the V5 loop FR-71's 2026-10-29 fleet read found, waiting on the operator ·
 **Parent:** the consolidation FR-70's AC4 asks for (8 estimators → 1) and the rule
 FR-71's three field events wrote by induction. Deletes rather than adds:
 `transit_hold`, `transit_classify`, T2's quarantine and T2b's shadow all go.
@@ -199,7 +199,7 @@ direct sessions on the MacBook:
 | **V4** | the memory keeps what was MEASURED, damped down-fast/up-slow, and writes nothing when a session measured nothing; deletes the `max` rule, `had_decrease`, the opener arithmetic and its three constants | — | **built 2026-09-08** (net −159 lines), shipped `agent-v0.4.95` (#1542); AC8 half-met |
 | **V5** | the gate answers *is this a MEASUREMENT*, which V1 let every consumer read as *does this window say anything at all*. A transit stall above the measured pipe still reaches the rate-limited MD, the ramp verdict, the age streak and the prior's push-back; everything that sets a NUMBER still reads `valid` | — | **built 2026-09-09**, shipped `agent-v0.4.96` (#1552); AC9 open |
 | **V5a** | `stall_is_ours` compares the target against the composed `pipe_bps` (goodput → the viewer's arrival rate → the prior), not `blocked_send_bps`: the agent's sends block only when the queue is LOCAL, and on a relay it is downstream | — | **built 2026-09-09**, shipped `agent-v0.4.97` (#1566) — `0.4.96` was inert on CORPLAP-3 (`goodput_samples=(0, 5)`) |
-| **V5b** | `stall_is_ours` compares only against a MEASURED source: the blocked-send goodput, or the viewer's arrival rate inside its 15 s TTL. Never against the prior's stand-in, and a stall that carries no number stops walking the prior. Test-first on the 2026-10-20 14:16 arc (§Open decisions, *The V5 loop*) | — | **proposed 2026-10-30**, waiting on the operator; agent code, so it rides the release after `0.4.190` |
+| **V5b** | `stall_is_ours` compares only against a MEASURED source: the blocked-send goodput, or the viewer's arrival rate inside its 15 s TTL. Never against the prior's stand-in, and a stall that carries no number stops walking the prior. Test-first on the 2026-10-20 14:16 arc (§Open decisions, *The V5 loop*) | — | **proposed 2026-10-30**, waiting on the operator; agent code, so it rides the release after `0.4.191` |
 | **Docs** | `docs/rate-control.md` opens with the gate: the verdict, every consumer, V5's exception, the write-back and the seed, and the V3b belief labelled as the shadow it is; `docs/README.md` row updated | — | **2026-09-25** (AC7), in the PR that carries these corrections |
 
 ## Acceptance criteria
@@ -304,18 +304,22 @@ direct sessions on the MacBook:
       *2026-10-30, classified: **needs a field pair.** The magnitude needs a
       carrier measured WELL below the memory, which is a thin relay, and a thin
       relay cannot be produced on demand without traffic shaping (§Open
-      decisions, *The rig*). ⚠️ Read from the code the same day: the V5 loop
-      (§Open decisions) reaches this criterion too. When the learner holds no
-      above-nominal stable rate, the write-back's evidence falls back to
-      `pipe_bps` (`peer.rs:8972`–`8981`), and `pipe_bps`'s last source is the
-      prior's stand-in (`governor.rs:648`). So a prior that the loop walked
-      down with no measurement can be written into the pair memory as the
-      session's evidence, and the next session then opens from it. That would
-      be a down-move this criterion must not count. It has not been seen in
-      the field: FR-71's read did not pull the write-back's log line
-      (`peer.rs:2098`–`2105`).*
+      decisions, *The rig*).*
+      *2026-10-31, read from the server's `agent_logs`: **the entry moves, but
+      not on evidence, so this criterion cannot be proved from `kept < old`.**
+      On CORPLAP-2's `100.65.4.2|relay:derp/tcp`, 2026-10-25 → 10-30, all 18
+      writes with evidence are rungs of the session's own opener: 0.85 × the
+      memory × (17/16)^k, six of them at k = 0. 17 of those 18 sessions held no
+      live measurement in any heartbeat, and the session that held one for 60
+      heartbeats wrote nothing. The entry fell 5,955,306 → 3,379,312 (−43 %)
+      while those sessions delivered up to 10.2 M. So the sessions that
+      measured nothing are the ones writing, the reverse of V4's rule. The
+      2026-09-08 read above held because that opener sat at the nominal, where
+      `stable_bps()` returns `None` (`ceiling_learn.rs:266`). A second path is
+      field-seen too: at 2026-10-30 12:22:06 a session wrote the prior's
+      stand-in as its evidence (§Open decisions, *The V5 loop*).*
 
-- [ ] **AC9 (V5)** — field: on a session whose transport stalls repeatedly while
+- [~] **AC9 (V5)** — field: on a session whose transport stalls repeatedly while
       the target sits above the measured pipe, the target CONVERGES toward the
       measurement instead of climbing through every stall. Read `target_bps`
       against `goodput_bps` across a window drag on CORPLAP-2.
@@ -343,10 +347,28 @@ direct sessions on the MacBook:
       13:53–14:19, the prior read 17.8–23.7 kbps against a 3.63 M target, so
       every stall read as "ours", and the target fell 3.63 → 0.94 M with 0 B
       in flight and a 3.1 s paint age. That is not this criterion: the
-      criterion asks for convergence toward a MEASUREMENT. Until V5b is
-      decided and shipped (§Open decisions, *The V5 loop*), a convergence
-      caught in the field cannot be told apart from the loop. After that, it
-      needs the same thin measured relay as AC8.*
+      criterion asks for convergence toward a MEASUREMENT, and what tells the
+      two apart is a live `goodput_bps` in the stalled window.*
+      *2026-10-31, **partly met**, read from the server's `agent_logs`: the
+      first sustained run of stalls above a live measurement since V5 shipped.
+      CORPLAP-2, 2026-10-30
+      12:19:52–12:20:48, `agent-v0.4.187`, a constrained session on a genuinely
+      bad path (27 transit stalls at ≤ 253 kbps, paint age to 6.1 s):
+      `goodput_bps=180,484` live throughout, target 200,000–253,125, so
+      1.11–1.40× the measurement. It did not climb through them. A stall
+      landing above 1.2× the measurement took the target back to the 200 kbps
+      floor (231,370 → 200,000; 225,000 → 200,000), and from 12:20:18 it left
+      the floor for one step only. Compare 1.6–2.1× and rising at 07:41. The
+      control held 15 minutes earlier: at 12:04:10–14 three stalls under a live
+      709,460, with the target at 494,314, did not cut.
+      ⚠️ Why this stays `[~]`: (a) the floor bounds the convergence, so it never
+      reached the measurement; (b) this session's key is a bare public address,
+      not a tagged carrier; (c) the same rule, the same morning, over DERP,
+      converged toward a reading the path had already disproved: at 11:49:14 it
+      cut 3.0 → 2.55 M against a live 223,794 taken from one 102 ms block, on a
+      path that delivered 1.2 M before that and 5.39 M after. That is the open
+      risk this issue recorded on 2026-09-09, now observed (§Open decisions,
+      *The V5 loop*).*
       ⚠️ **The control is FR-71's finding 4**: a transit stall on a path the
       session is NOT overdriving must still not cut — that is what
       `stall_is_ours` gates on, and
@@ -364,8 +386,8 @@ own starvation.
 ## Open decisions
 
 - **The V5 loop: a stall is "ours" because the last stall said so.** FR-71's
-  2026-10-29 fleet read found it; it was put to the operator on #1524 on
-  2026-10-30. Anchors printed from master that day:
+  2026-10-29 fleet read found it. It was put to the operator on 2026-10-30 and
+  is not answered yet. Anchors printed from master on 2026-10-31:
   - `stall_is_ours` (`governor.rs:1207`–`1216`) lets a `TransitStalled`
     window cut ×0.85 when `desired > 1.2 × pipe_bps`.
   - `pipe_bps` (`:634`) falls back to the prior's stand-in (`:648`) when
@@ -399,13 +421,84 @@ own starvation.
   where a measurement stands and the stall still cuts) and
   `finding_4_keeps_the_rate_with_the_validity_gate` (`sim.rs:2452`).
 
-  ⚠️ An older tension sits next to this one and is not part of the decision.
-  The write-back takes `pipe_bps` when the learner holds no above-nominal
-  stable rate (`peer.rs:8972`–`8981`). FR-70 P1 chose that on purpose: the
-  decayed prior is its way out of a stale low memory. Under V4's rule, though,
-  only evidence moves the memory. V5b's second half removes the loop's path
-  into the memory, because the prior no longer walks down on a stall with no
-  number. Whether a stand-in should be written back at all stays open.
+  **The field A/B behind A.** CORPLAP-2, 2026-10-30 11:48–12:19,
+  `agent-v0.4.187`, `relay:derp/tcp`, read from `agent_logs`. One session, one
+  path, one build, sorted by what `pipe_bps` held at each stall:
+
+  | while the session held | stalls | cut | not cut |
+  |---|---|---|---|
+  | a stand-in, nothing measured | 16 | **13**, ×0.85 each | 1 under the 1.2× line; 2 where an additive step landed in the same heartbeat |
+  | nothing at all | 26 | **0** | 26, the target flat at 2.55–3.19 M |
+  | a live measurement | 6 | 2 | 3 with the target under the measurement; 1 the heartbeat cannot explain |
+
+  Around the first row's cuts the session read healthy, with a paint age of at
+  most 107 ms bar one 203 ms and at most 43 KB in flight. The target still spent
+  3 min 12 s under 1 M on a path that delivered 5.39 M.
+
+  ⚠️ **A is necessary, not sufficient: a live measurement can be wrong.** At
+  11:48:36 one 102 ms blocked send folded into `goodput_bps=223,794`, because a
+  window needs only 60 ms of blocked time (`goodput.rs:82`), and it stood for
+  its 60 s TTL (`:85`). V3b's delivered floor read 1.2 M eight seconds later
+  and 5.39 M seven minutes later. While that reading stood the target fell
+  3.0 → 0.68 M in 22 s at a paint age of 50–104 ms. V5 accounts for two of those
+  cuts at most. The rest read `overproduced`, the classifier's verdict for the
+  queue budget's gate, which is denominated in the same `pipe_bps`
+  (`peer.rs:7713`): the door FR-70 P1 was written for, opened this time by a
+  measurement rather than a seed. At 12:04:06 the shape repeated: one 106 ms
+  block, 709,460, the arrival-rate clamp at 3.19 → 0.52 M, and 4.66 M delivered
+  two seconds later. A does not touch this, because a blocked-send number is a
+  measured source. What would is V3b's own rule, `believed = max(capacity,
+  floor)`: a reading below what the path just delivered is the reading being
+  wrong. That makes the floor a consumer for the first time, so it is a second
+  decision, recorded here and not bundled into A.
+
+  ⚠️ **The walk is not what made that prior small (worked out 2026-10-31 from
+  FR-71's numbers).** The arithmetic is firm; the last step is an inference.
+  - FR-71's arc has the stand-in at 23,688 → 21,535 → 19,578. Those values lie
+    on the ×11/10 ladder (`prior.rs:80`), which `stand_in_bps` uses only when
+    the prior holds a measured anchor (`prior.rs:167`).
+  - The seed's ×5/4 ladder gives 24,472 from 19,578, and a walk below the base
+    from 23,688 gives 21,534 and 19,576, so neither fits.
+  - 17,799 → 19,578 → 21,535 → 23,688 reproduces the read's whole 17.8–23.7
+    kbps range. The walk only moved the prior between four rungs above a
+    measured base of at most 17,799 bps.
+  - That session read `goodput_bps=None` throughout, which leaves the viewer's
+    arrival rate as the likely source. A congested report stores it with no
+    floor (`governor.rs:1343`), and the same window re-anchors the prior on it
+    (`:1433`, `prior.rs:128`).
+  - FR-71's second open decision, the stall's onset, is the likeliest way so
+    low a rate gets reported. It is not proven for this arc: the read did not
+    pull the report that set the anchor. Readings that low are field-seen,
+    though: at 2026-10-30 12:19:52 `pipe_belief`'s capacity read 12,070 bps
+    while `goodput_bps` read 180,484, so that number came from a congested
+    report.
+
+  So what cut the rate is the comparison reading the stand-in, and that is
+  what V5b fixes. V5b does not remove the anchor. Until it climbs back, at
+  ×1.1 per ten clean windows, `pipe_bps` still offers it to FR-59 P6's
+  contradiction (`governor.rs:777`), the encoder plan (`peer.rs:7686`), the
+  queue budget (`peer.rs:7713`) and the write-back. V5b also still reads the
+  arrival rate itself for its 15 s TTL. That is why the onset decision may
+  belong beside this one.
+
+  ⚠️ **The stand-in reaches the pair memory: field-seen once.** When the learner
+  holds no above-nominal stable rate, the write-back takes `pipe_bps` as the
+  session's evidence (`peer.rs:8985`–`8994`), and `pipe_bps`'s last source is
+  the stand-in (`governor.rs:648`). The 2026-10-30 12:19 session anchored at
+  180,484, lost its goodput to the TTL at 12:20:50, and walked eight rungs down
+  in 28 s: 180,484 → 164,076 → … → 84,195, the last one exact to the unit. It
+  ended with `prior_bps=84195` and `goodput_bps=None`, and at 12:22:06 wrote
+  `evidence=Some(84195) kept=84195` as a new entry. Nobody measured 84,195.
+  FR-71's "next session 2.55 → 0.20 M" stays unconfirmed: its read did not pull
+  the write-back's line (`peer.rs:2111`–`2118`). V5b's second half closes the
+  stall's path into the memory.
+
+  It does not settle an older tension, which is not part of this decision.
+  FR-70 P1 writes the decayed prior on purpose, as its way out of a stale low
+  memory, while V4's rule is that only evidence moves the memory. The
+  write-back's first choice is the larger gap: `stable_bps()` is a held target,
+  not a measurement, and AC8's 18 of 18 rungs are that (the question FR-35 AC1
+  turns on; `docs/rate-control.md`, the write-back's field rows).
 - **The rig AC8 and AC9 need (2026-10-30).** Both need a relay that is thin
   AND measured, on demand. The fleet's relays cannot be summoned thin: the
   same carrier measured 1.06 M at 07:41 and 4.41 M at 14:42 on 2026-09-09.
@@ -426,8 +519,7 @@ own starvation.
      below it and the write-back lowers the entry; the next shaped session
      opens inside the measured range (AC8's magnitude half).
 
-  It is not built until the hub says so. It costs two VMs' disk, and C: was
-  under its build floor when this was written.
+  It is not built. It costs two VMs and waits for a go.
 - Whether a `ViewerLate` window is evidence about the pipe. Today it is (only
   `TransitStalled` rejects); the viewer being the limiter says nothing about the
   path's capacity, but the goodput estimator only counts blocked sends anyway.
@@ -465,4 +557,5 @@ own starvation.
 | 2026-09-10 08:38–08:39 UTC (read 2026-09-25) | **agent-v0.4.97** (V1–V5a) | CORPLAP-2, AV1 over `relay:derp/tcp`, a 61 s session; read from the host's own `roomlerd.log.2026-09-10` over Fleet RPC | **AC8, second half — the mechanism observed, the magnitude not.** Seeded from `100.65.4.2\|relay:derp/tcp` = **3,233,525**; the opener queued (440 KB, 133 ms worst wait, `opener_measured_bps=Some(3201927)`), the goodput held 3,201,927 for 30 windows, the learner proved 3,187,500, and the write-back logged `evidence_bps=Some(3187500) kept_bps=3210512`. That is `damp(3,233,525, 3,187,500)` to the unit (3,233,525 − 0.5 × 46,025 = 3,210,512.5 → 3,210,512), and the first field write that lowered an entry: the pre-V4 rule, `max(stable 3,187,500, old 3,233,525, growth 3,201,927)`, would have kept 3,233,525. 🔑 One line suffices as proof — `kept` lies between the old value and the evidence, so `kept > evidence` means the entry moved DOWN. ⚠️ Honest bound: a 0.7 % move on a carrier measured 1.4 % below the memory is the rule working, not the "measured well below" scenario the criterion describes, and no seeded opener followed inside the TTL — the entry expired on 09-17 and the next relay session (09-24 08:26) adopted its own 3,386,718 outright. |
 | 2026-09-10 12:51–14:03 UTC (read 2026-09-25) | **agent-v0.4.97** | CORPLAP-1, HEVC over `relay:derp/tcp`, 72 min, 2,124 constrained windows | **The 6,131,302 question, answered: it moved UP, damped, on a measurement.** The session opened from the 6,131,302 seed at 5,211,606 (85 %), the opener queued 514 ms but the estimator had no confidence (`opener_measured_bps=None`), and then the relay was fast: goodput **11,550,209–17,044,136** in 88 windows, the learner at the 8 M `hi` cap, and the write-back `evidence_bps=Some(8000000) kept_bps=6318171` — one `ALPHA_UP` step (6,131,302 + 0.1 × 1,868,698 = 6,318,171.8). 69 transit stalls with the target (≤ 8 M) UNDER the measured pipe: no V5 cut is attributable and none should be; the cuts that did happen (12:57:48 8.0 → 5.78 M with `send_wait_max_ms=181`, age 3,435; 13:02:52 5.77 → 3.55 M with `send_wait_max_ms=504`, `bytes_inflight=229397`, age 2,132) are the local queue filling — the AIMD's own occupancy loop and the age loop, in windows the gate did not reject. No relay session has written that key since; it expired on 09-17. |
 | 2026-09-25 (logs of 2026-09-10 → 09-25) | **agent-v0.4.97 → 0.4.101** (V5a + V3b shadow throughout) | AC9 sweep of the three relay laptops' daemon **log files** over Fleet RPC — not `roomler logs`, whose 64 KiB tail ages a finished session out; `KEEP_DAYS = 14` had already pruned the 09-09 files (V5's first day and the 14:41 control run) | **AC9 — no natural occurrence; coverage recorded so that "none" is a count.** 20 worker logs (`service-logs\roomlerd.log.<date>`), **24,013 heartbeats, 7,442 constrained windows in 8 relay sessions**: CORPLAP-1 5 sessions / 2,171 windows (09-10, 09-11), CORPLAP-2 3 sessions / 5,271 windows (09-10, 09-24), CORPLAP-3 0 constrained in 14,373 heartbeats (every session direct — `av1_qsv` at a 34.56 M target; the zero positive-controlled by counting `constrained=false`). Transit stalls in those sessions: 118 + 69 + 6 = **193**, and at every one of them the session held **no pipe estimate**: `goodput_bps` was live in 147 constrained windows in total (2 %: one accepted sample per long session, held for its 60 s TTL), never in a stalled window, and `prior_bps` was `None` in every window pulled (7,395 of the 7,442 — no seed in force, or a measurement at the band leaving nothing to stand in). The detector's verdict function (`analyse`, kept outside the repo because it names hosts; its selftest had been lost, so it was re-validated the same day: `NONE` on these rows, `did NOT converge — ratio 1.89x → 1.82x` on an arc shaped like the 07:41 failure, `CONVERGED` on one that steps ×0.85 per stall) reads **NONE**. What the sweep does show is the negative-control half at scale: the three-hour CORPLAP-2 session (`6ab4de94`, 09-24 08:26–11:21, AV1 over `relay:derp/tcp`, `0.4.100`) held its target at the learned 3,386,718 through **117 of 118** transit stalls — the exception, 10:33:30–34, is an 800 ms locally blocked send inside an `agent-stalled` window (the AIMD's own loop, not the gate) — at a paint age of p50 76 / p95 99 / max 988 ms, `bytes_inflight` ≤ 71 KB, and `pipe_belief_n=(9912, 1)`: one push-back with a number in three hours. ⚠️ The condition AC9 needs — a stall INSIDE a measured minute on a thin relay — did not happen in two weeks of fleet traffic, and nothing here can summon it; the 07:41 arc stays the baseline. |
-| 2026-10-15 → 10-29 (read 2026-10-29 for FR-71; re-read against this FR 2026-10-30) | **agent-v0.4.137 → 0.4.184**; the code path is unchanged on master `92aa56697` | The three corporate laptops' worker logs over Fleet RPC: 67 constrained sessions, 40,654 constrained windows, 812 `transit-stalled` | **AC9: V5 caught converging, but toward the stand-in, not a measurement — the V5 loop, and not the criterion.** 55 drops of exactly ×0.85 on clean gap or split windows, every one on a session whose prior stood at 0.02–0.8 M. Worst: CORPLAP-2, 10-20 13:53–14:19, HEVC over `relay:derp/tcp`, a prior of 17.8–23.7 kbps under a 3.63 M target, 24 gap windows, 3.63 → 0.94 M, 0 B in flight, 3.1 s paint age; the next session 2.55 → 0.20 M. The half that must not regress held where nothing was measured: 433 of 482 clean stall episodes kept the target. Read on master the same day: the comparison falls through `pipe_bps` to the stand-in (`governor.rs:648`), and the cutting branch walks the prior down with no number (`:1439`). **AC8 was not read**: the write-back's line (`peer.rs:2098`–`2105`) was not part of the pull. ⚠️ No fresh read was taken: exec is off-limits on the corporate laptops, and `agent_logs` keeps 7 days. Decision and rig: §Open decisions. |
+| 2026-10-15 → 10-29 (read 2026-10-29 for FR-71; re-read against this FR 2026-10-30) | **agent-v0.4.137 → 0.4.184**; no line of the comparison or the prior's walk changed from `agent-v0.4.137` to master `dfca419fe` (tag diffs, 2026-10-31) | The three corporate laptops' worker logs over Fleet RPC: 67 constrained sessions, 40,654 constrained windows, 812 `transit-stalled` | **AC9: V5 caught converging, but toward the stand-in, not a measurement — the V5 loop, and not the criterion.** 55 drops of exactly ×0.85 on clean gap or split windows, every one on a session whose prior stood at 0.02–0.8 M. Worst: CORPLAP-2, 10-20 13:53–14:19, HEVC over `relay:derp/tcp`, a prior of 17.8–23.7 kbps under a 3.63 M target, 24 gap windows, 3.63 → 0.94 M, 0 B in flight, 3.1 s paint age; the next session 2.55 → 0.20 M. The half that must not regress held where nothing was measured: 433 of 482 clean stall episodes kept the target. Read on master the same day: the comparison falls through `pipe_bps` to the stand-in (`governor.rs:648`), and the cutting branch walks the prior down with no number (`:1439`). The stand-in's values show what set it: 23,688 → 21,535 → 19,578 lie on the measured ×11/10 ladder, above a base of at most 17,799 bps (§Open decisions). **AC8 was not read**: the write-back's line (`peer.rs:2111`–`2118`) was not part of the pull. Decision and rig: §Open decisions. |
+| 2026-10-24 → 10-31 (read 2026-10-31) | **agent-v0.4.187** and **0.4.188** on the sessions traced | The server's `agent_logs`, not the hosts (exec is off-limits on the corporate laptops): CORPLAP-1 2,203 heartbeats, 312 constrained, no prior in any; CORPLAP-2 8,040 heartbeats, 7,766 constrained, 308 with a prior, 30 write-backs. Bounded: one agent and one day per query; Mongo's restart count stayed 1 | **AC9, partly met; the V5 loop on `0.4.187`; AC8's rule reversed.** All three are in §Acceptance criteria and §Open decisions with their numbers. The A/B: over one DERP session stalls cut 13 of 16 times with a stand-in and 0 of 26 with nothing. The measured minute: 2026-10-30 12:19:52–12:20:48, 27 stalls at a live 180,484, the target held at 1.11–1.40×. The write-backs: 18 of 18 on the pair are rungs of the session's own opener, 17 with nothing measured, −43 % in six days; one wrote the stand-in, 84,195. New on the same trace: a live goodput of 223,794 from one 102 ms block on a path that delivered 5.39 M, the open risk of 2026-09-09. ⚠️ Scope: two laptops of the three, a heartbeat spans two windows so a cut is attributed by its heartbeat's counters, `agent_logs` drops lines under load so every count is a lower bound, and the upload keeps 7 days, so these numbers are the record. |
