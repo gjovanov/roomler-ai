@@ -135,6 +135,7 @@ import {
   localRelayIceServer,
   localRelayPlan,
   withLocalRelays,
+  withSessionIceServers,
   parseStoredThisDevices,
   readStoredThisDevices,
   persistThisDevices,
@@ -6715,5 +6716,60 @@ describe('the record channel (FR-85 P3c)', () => {
     expect(opened).toEqual(['record'])
     // No PeerConnection (a create racing teardown): nothing to open it on.
     expect(openRecordChannel(null, {}, 'VIEW | RECORD')).toBeNull()
+  })
+})
+
+// FR-52 P5 (F3): an outsider's pre-fetch cannot be charged, because they are no
+// member of the device's org and never learn its ids. Relay bytes on those
+// credentials were counted as nobody's. `rc:ready` carries credentials the Hub
+// charged to the session's org, the device's, so an external viewer takes them
+// before the offer's first gathering.
+describe('withSessionIceServers', () => {
+  const preFetch: RTCConfiguration = {
+    iceServers: [
+      { urls: ['stun:stun.example:3478'] },
+      { urls: ['turn:coturn.example:3478'], username: '1792000000:uid', credential: 'uncharged' },
+    ],
+    bundlePolicy: 'max-bundle',
+  }
+  const charged = {
+    urls: ['turn:worker-b.example:3478', 'turn:worker-a.example:3478'],
+    username: '1792000000:uid:org-6a975e17971e2d55ddcdedb2',
+    credential: 'charged',
+  }
+
+  it("takes the session's credentials in place of the pre-fetch's and keeps every other setting", () => {
+    const stun = { urls: ['stun:stun.example:3478'] }
+    const out = withSessionIceServers(preFetch, [stun, charged])
+    expect(out.iceServers).toEqual([stun, charged])
+    expect(out.bundlePolicy).toBe('max-bundle')
+    expect(preFetch.iceServers).toHaveLength(2)
+  })
+
+  it('reads a turns: URL as TURN too', () => {
+    const tls = { ...charged, urls: ['turns:coturn.example:443?transport=tcp'] }
+    expect(withSessionIceServers(preFetch, [tls]).iceServers).toEqual([tls])
+  })
+
+  // Connecting uncharged beats not connecting: a frame that cannot relay must
+  // never take away the pre-fetch's TURN server.
+  it.each([
+    ['no list at all', undefined],
+    ['null', null],
+    ['not a list', { urls: ['turn:x'] }],
+    ['an empty list', []],
+    ['STUN only', [{ urls: ['stun:stun.example:3478'] }]],
+    ['TURN with no credential', [{ urls: ['turn:coturn.example:3478'], username: 'u' }]],
+    ['TURN with no username', [{ urls: ['turn:coturn.example:3478'], credential: 'c' }]],
+    ['an entry with no URLs', [{ urls: [], username: 'u', credential: 'c' }]],
+    ['entries that are not servers', ['turn:coturn.example:3478', null, 7]],
+  ])('leaves the pre-fetch in place on %s', (_name, servers) => {
+    expect(withSessionIceServers(preFetch, servers)).toBe(preFetch)
+  })
+
+  it('drops an unusable entry beside a usable one', () => {
+    expect(withSessionIceServers(preFetch, [null, charged, { urls: 'turn:x' }]).iceServers).toEqual([
+      charged,
+    ])
   })
 })

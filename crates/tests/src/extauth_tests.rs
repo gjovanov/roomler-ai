@@ -137,9 +137,20 @@ fn spawn_agent(
 struct Device {
     code: String,
     agent_id: String,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     stop: tokio::sync::watch::Sender<bool>,
     _task: tokio::task::JoinHandle<()>,
+}
+
+impl Device {
+    /// Gate 3, in the config FILE, as the person at the machine sets it. The
+    /// device reads it at every knock.
+    fn set_gate_3(&self, open: bool) {
+        let path = self.dir.path().join("config.toml");
+        let mut cfg = roomlerd::config::load(&path).unwrap();
+        cfg.external_access_enabled = open;
+        roomlerd::config::save(&path, &cfg).unwrap();
+    }
 }
 
 async fn device(app: &TestApp, seeded: &SeededTenant, machine: &str, password: &str) -> Device {
@@ -216,7 +227,7 @@ async fn device_with(
     Device {
         code: body["connect_code"].as_str().unwrap().to_string(),
         agent_id,
-        _dir: dir,
+        dir,
         stop,
         _task: task,
     }
@@ -464,6 +475,23 @@ async fn every_server_refusal_looks_the_same_to_the_outsider() {
     send(&mut ws, knock(dev.code.clone())).await;
     answers.push(next_of(&mut ws, &["rc:extauth.challenge", "rc:extauth.result"]).await);
 
+    // 4. Gate 2 back, and the DEVICE says no (gate 3). Its `unavailable` must
+    //    not carry the attempt id: that would say the code resolved, the org's
+    //    gates are open and the device is online.
+    assert_eq!(
+        put(
+            &app,
+            &url(&seeded, &format!("/agent/{cfg_id}/external-access-policy")),
+            owner,
+            json!({"approved": true})
+        )
+        .await,
+        200
+    );
+    dev.set_gate_3(false);
+    send(&mut ws, knock(dev.code.clone())).await;
+    answers.push(next_of(&mut ws, &["rc:extauth.challenge", "rc:extauth.result"]).await);
+
     for a in &answers {
         assert_eq!(
             a,
@@ -705,6 +733,18 @@ async fn browser_offer() -> (
 /// and `rc:ready` (the device consents by itself: `external_consent_mode =
 /// auto`). Returns the session id.
 async fn open_session(ws: &mut Ws, code: &str, attempt_id: &str, permissions: &str) -> String {
+    open_session_ready(ws, code, attempt_id, permissions)
+        .await
+        .0
+}
+
+/// [`open_session`], with the `rc:ready` frame too: its ICE servers.
+async fn open_session_ready(
+    ws: &mut Ws,
+    code: &str,
+    attempt_id: &str,
+    permissions: &str,
+) -> (String, Value) {
     send(
         ws,
         json!({
@@ -727,7 +767,7 @@ async fn open_session(ws: &mut Ws, code: &str, attempt_id: &str, permissions: &s
         ready["t"], "rc:ready",
         "the device admitted the session and consented: {ready}"
     );
-    session_id
+    (session_id, ready)
 }
 
 /// The device's terms for the tests that open a session.
@@ -1072,5 +1112,889 @@ async fn an_outsider_on_the_other_pod_opens_a_sealed_session() {
         "the seal survived the relay"
     );
     let _ = pc.close().await;
+    let _ = dev.stop.send(true);
+}
+
+// ─── The criteria P4 left open: each against the real agent ──────────────────
+
+/// Every `tracing` line this thread emits while the guard lives, at TRACE.
+///
+/// A `#[tokio::test]` runs the server, the agent and the test on one thread, so
+/// the thread's default subscriber sees all three. Every use asserts a line of
+/// the server's and of the device's is in here, so a capture that saw nothing
+/// fails rather than passes.
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+    fn make_writer(&'a self) -> LogCapture {
+        self.clone()
+    }
+}
+
+impl LogCapture {
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(self.clone())
+                .finish(),
+        )
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes()).into_owned()
+    }
+}
+
+/// The spellings of a secret a log line, a frame or a stored field could hold.
+fn spellings(secret: &str) -> Vec<Vec<u8>> {
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    let hex: String = secret.bytes().map(|b| format!("{b:02x}")).collect();
+    vec![
+        secret.as_bytes().to_vec(),
+        STANDARD.encode(secret).into_bytes(),
+        URL_SAFE_NO_PAD.encode(secret).into_bytes(),
+        hex.into_bytes(),
+        secret.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+    ]
+}
+
+fn holds(haystack: &[u8], secret: &str) -> bool {
+    spellings(secret)
+        .iter()
+        .any(|needle| haystack.windows(needle.len()).any(|w| w == needle))
+}
+
+/// Every document of every collection in the test's database, as stored: the raw
+/// BSON, so a binary field is searched too. Answers the collection names as well.
+async fn dump_collections(app: &TestApp) -> (Vec<String>, Vec<u8>) {
+    use futures::TryStreamExt as _;
+    let names = app.db.list_collection_names().await.unwrap();
+    let mut raw = Vec::new();
+    for name in &names {
+        let mut cursor = app
+            .db
+            .collection::<bson::RawDocumentBuf>(name)
+            .find(bson::doc! {})
+            .await
+            .unwrap();
+        while let Some(doc) = cursor.try_next().await.unwrap() {
+            raw.extend_from_slice(doc.as_bytes());
+        }
+    }
+    (names, raw)
+}
+
+/// An outsider's socket that keeps every frame in both directions, for the
+/// capture: what the server received, and what it said.
+struct TappedSocket<'a> {
+    ws: &'a mut Ws,
+    frames: Vec<u8>,
+}
+
+impl TappedSocket<'_> {
+    async fn send(&mut self, frame: Value) {
+        self.frames.extend_from_slice(frame.to_string().as_bytes());
+        send(self.ws, frame).await;
+    }
+
+    async fn next(&mut self, tags: &[&str]) -> Value {
+        let frame = next_of(self.ws, tags).await;
+        self.frames.extend_from_slice(frame.to_string().as_bytes());
+        frame
+    }
+}
+
+/// AC: the password never appears in any server-side log, request body or
+/// collection. The whole exchange, from the first frame to a sealed answer,
+/// across two pods when a bus is there so the relay's path is in it, with every
+/// `tracing` line of the server and the device at TRACE, every frame, and every
+/// collection as stored.
+///
+/// A capture that finds nothing proves nothing unless it could have found it, so
+/// a canary goes down each of the three lanes and must be found.
+///
+/// The client here is opaque-ke standing in for the browser library, the same
+/// code compiled to WebAssembly. The real page's frames have their own capture in
+/// `ui/src/__tests__/composables/useExternalLogin.spec.ts`.
+#[tokio::test]
+async fn the_password_is_in_no_log_no_frame_and_no_collection() {
+    const CANARY: &str = "fr52-capture-canary-8c1f";
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    let two_pods = app1.state.cluster_bus.is_some();
+    if !two_pods {
+        eprintln!("the capture runs on one pod: no bus, so the relay's path is not in it");
+    }
+    let outsiders_pod = if two_pods { &app2 } else { &app1 };
+
+    let capture = LogCapture::default();
+    let _logs = capture.install();
+
+    let seeded = app1.seed_tenant("extauth-capture").await;
+    let password = pw("captured-device-password-3e7d");
+    let dev = device_with(
+        &app1,
+        &seeded,
+        "mach-extauth-capture",
+        &password,
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws) = outsider(outsiders_pod, "extcapture").await;
+    let mut tap = TappedSocket {
+        ws: &mut ws,
+        frames: Vec::new(),
+    };
+
+    // A wrong guess first: the path that fails is a path too.
+    let (wrong, ke1) = client_ke1(&pw("a-wrong-guess"));
+    tap.send(json!({"t": "rc:extauth.start", "connect_code": dev.code, "ke1": ke1}))
+        .await;
+    let challenge = tap
+        .next(&["rc:extauth.challenge", "rc:extauth.result"])
+        .await;
+    assert_eq!(challenge["t"], "rc:extauth.challenge", "{challenge}");
+    assert!(
+        client_ke3(
+            wrong,
+            &pw("a-wrong-guess"),
+            challenge["ke2"].as_str().unwrap()
+        )
+        .is_none()
+    );
+
+    // The real login.
+    let started = ClientLogin::<Suite>::start(&mut OsRng, password.as_bytes()).unwrap();
+    let ke1 = b64url().encode(started.message.serialize());
+    tap.send(json!({"t": "rc:extauth.start", "connect_code": dev.code, "ke1": ke1}))
+        .await;
+    let challenge = tap
+        .next(&["rc:extauth.challenge", "rc:extauth.result"])
+        .await;
+    assert_eq!(challenge["t"], "rc:extauth.challenge", "{challenge}");
+    let attempt_id = challenge["attempt_id"].as_str().unwrap().to_string();
+    let ke2 = b64url().decode(challenge["ke2"].as_str().unwrap()).unwrap();
+    let done = started
+        .state
+        .finish(
+            &mut OsRng,
+            password.as_bytes(),
+            CredentialResponse::<Suite>::deserialize(&ke2).unwrap(),
+            ClientLoginFinishParameters::default(),
+        )
+        .expect("the right password opens the device's KE2");
+    tap.send(json!({
+        "t": "rc:extauth.finish",
+        "connect_code": dev.code,
+        "attempt_id": attempt_id,
+        "ke3": b64url().encode(done.message.serialize()),
+    }))
+    .await;
+    let verdict = tap.next(&["rc:extauth.result"]).await;
+    assert!(verdict.get("refused").is_none(), "{verdict}");
+    let key = app_key(&done.session_key, &attempt_id, &principal);
+
+    // The session the login opens, up to the sealed answer.
+    tap.send(json!({
+        "t": "rc:extauth.session",
+        "connect_code": dev.code,
+        "attempt_id": attempt_id,
+        "permissions": "VIEW | INPUT",
+    }))
+    .await;
+    let created = tap
+        .next(&["rc:session.created", "rc:extauth.result", "rc:error"])
+        .await;
+    assert_eq!(created["t"], "rc:session.created", "{created}");
+    let session_id = created["session_id"].as_str().unwrap().to_string();
+    let ready = tap.next(&["rc:ready", "rc:terminate", "rc:error"]).await;
+    assert_eq!(ready["t"], "rc:ready", "{ready}");
+    let (pc, offer) = browser_offer().await;
+    tap.send(json!({
+        "t": "rc:sdp.offer",
+        "session_id": session_id,
+        "sdp": offer,
+        "extauth_mac": transport_mac(&key, "offer", &fingerprint(&offer)),
+    }))
+    .await;
+    let answer = tap
+        .next(&["rc:sdp.answer", "rc:terminate", "rc:error"])
+        .await;
+    assert_eq!(answer["t"], "rc:sdp.answer", "{answer}");
+    let frames = std::mem::take(&mut tap.frames);
+    let _ = pc.close().await;
+
+    // The audit rows are written after the replies.
+    let audit = url(&seeded, "/external-rc-audit");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let body: Value = app1
+            .auth_get(&audit, &seeded.admin.access_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let rows = body["items"].as_array().unwrap();
+        if rows.iter().any(|r| r["action"] == "session") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no `session` audit row: {body}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The canaries: one down each lane the assertions below read.
+    app1.db
+        .collection::<bson::Document>("fr52_capture_canary")
+        .insert_one(bson::doc! { "note": CANARY })
+        .await
+        .unwrap();
+    tokio::spawn(async move { tracing::info!(canary = CANARY, "the capture's own line") })
+        .await
+        .unwrap();
+    let mut frames_with_canary = frames.clone();
+    frames_with_canary.extend_from_slice(CANARY.as_bytes());
+
+    let (names, stored) = dump_collections(&app1).await;
+    let logs = capture.bytes();
+    assert!(holds(&stored, CANARY), "the collection scan is blind");
+    assert!(holds(&logs, CANARY), "the log capture is blind");
+    assert!(
+        holds(&frames_with_canary, CANARY),
+        "the frame scan is blind"
+    );
+
+    // And they read the real thing, not an empty room.
+    for collection in ["agents", "users", "external_rc_audit", "tenants"] {
+        assert!(
+            names.iter().any(|n| n == collection),
+            "{collection} is not among {names:?}"
+        );
+    }
+    let text = capture.text();
+    for line in [
+        "extauth: login VERIFIED by the device",
+        "extauth: KE1 answered (one guess spent)",
+        "extauth: session opened",
+    ] {
+        assert!(text.contains(line), "the capture missed {line:?}");
+    }
+    assert!(String::from_utf8_lossy(&frames).contains("rc:extauth.finish"));
+
+    assert!(!holds(&logs, &password), "the password is in a log line");
+    assert!(!holds(&frames, &password), "the password is in a frame");
+    assert!(
+        !holds(&stored, &password),
+        "the password is stored in a collection"
+    );
+    let _ = dev.stop.send(true);
+}
+
+/// AC: a server asked to start an external session WITHOUT a client proof
+/// cannot. This drives the mint path itself, the Hub call `extauth::handle_session`
+/// makes, the way a compromised server would, past every check the server's own
+/// code applies, at a real agent with every gate open and `auto` consent. The
+/// device binds the session to a login IT verified or ends it.
+///
+/// The arm that passes is the proof the others are the device's doing: the same
+/// call on a login the device verified is admitted, and the refusals before it
+/// left that login unspent.
+///
+/// Out of this test: a server that mints an ORDINARY session names no login and
+/// the device cannot tell it from a colleague's. That is the trust FR-100 removes.
+#[tokio::test]
+async fn a_server_cannot_mint_a_session_the_device_never_logged_in() {
+    use bson::oid::ObjectId;
+    use roomler_ai_mod_fleet::hub::OrgPolicy;
+    use roomler_ai_remote_control::models::{ConsentMode, RcOverlayMode, SessionPolicy};
+    use roomler_ai_remote_control::permissions::Permissions;
+    use roomler_ai_remote_control::signaling::{ExternalGrant, ServerMsg};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-mint").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-mint",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let device = ObjectId::parse_str(&dev.agent_id).unwrap();
+    let (principal, mut ws) = outsider(&app, "extmint").await;
+    let principal = ObjectId::parse_str(&principal).unwrap();
+    let (stranger, _stranger_ws) = outsider(&app, "extmintb").await;
+    let stranger = ObjectId::parse_str(&stranger).unwrap();
+
+    // What `handle_session` calls, minus everything that decides whether to.
+    let mint = |who: ObjectId, attempt_id: &str| {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let session = app
+            .state
+            .fleet()
+            .rc_hub
+            .create_session_full(
+                device,
+                who,
+                "minted by the server".to_string(),
+                tx,
+                Permissions::VIEW | Permissions::INPUT,
+                Vec::new(),
+                None,
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                Vec::new(),
+                RcOverlayMode::Off,
+                None,
+                None,
+                false,
+                OrgPolicy::Read(SessionPolicy::default()),
+                None,
+                None,
+                None,
+                Some(ExternalGrant {
+                    attempt_id: attempt_id.to_string(),
+                }),
+                None,
+                None,
+                None,
+            )
+            .expect("the Hub takes the request: the DEVICE is what refuses it");
+        (session, rx)
+    };
+    // The session's outcome as the controller's channel hears it.
+    async fn outcome(mut rx: tokio::sync::mpsc::Receiver<ServerMsg>) -> Value {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+                .await
+                .expect("an outcome within 15 s")
+                .expect("the channel stays open");
+            let frame = serde_json::to_value(&msg).unwrap();
+            if matches!(frame["t"].as_str(), Some("rc:ready" | "rc:terminate")) {
+                return frame;
+            }
+        }
+    }
+
+    // 1. No login at all: an attempt id made up by the server.
+    let (session, rx) = mint(principal, "66f0c0ffee0000000000abcd");
+    let end = outcome(rx).await;
+    assert_eq!(end["t"], "rc:terminate", "no proof, no session: {end}");
+    assert_eq!(end["reason"], "agent_hangup", "the device's own act: {end}");
+    assert_eq!(end["session_id"], json!(session.to_hex()), "{end}");
+
+    // 2. A real login, verified by the device, handed to someone else.
+    let (attempt_id, _key) = login(&mut ws, &dev.code, &pw("device"), &principal.to_hex()).await;
+    let (_, rx) = mint(stranger, &attempt_id);
+    let end = outcome(rx).await;
+    assert_eq!(end["t"], "rc:terminate", "another principal's login: {end}");
+    assert_eq!(end["reason"], "agent_hangup", "{end}");
+
+    // 3. The control: the same call, on the principal's own verified login.
+    let (session, rx) = mint(principal, &attempt_id);
+    let ready = outcome(rx).await;
+    assert_eq!(
+        ready["t"], "rc:ready",
+        "the mint path works, and arm 2 did not spend the login: {ready}"
+    );
+    assert_eq!(ready["session_id"], json!(session.to_hex()), "{ready}");
+    let _ = app
+        .state
+        .fleet()
+        .rc_hub
+        .terminate(session, roomler_ai_remote_control::models::EndReason::Error);
+
+    // 4. One login, one session: the replay of a spent login.
+    let (_, rx) = mint(principal, &attempt_id);
+    let end = outcome(rx).await;
+    assert_eq!(end["t"], "rc:terminate", "a spent login: {end}");
+    assert_eq!(end["reason"], "agent_hangup", "{end}");
+    let _ = dev.stop.send(true);
+}
+
+/// One `rc:extauth.start` straight into the handler, as a socket's frame would
+/// arrive, under a fresh principal so the per-principal limit is not what gets
+/// measured: how long until the answer left, and the answer.
+async fn knock_timed(app: &TestApp, code: &str, ke1: &str) -> (Duration, Value) {
+    let remote = app.state.modules.remote.clone().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let (code, ke1) = (code.to_string(), ke1.to_string());
+    let started = Instant::now();
+    tokio::spawn(async move {
+        let hop = roomler_ai_mod_remote::extauth::Hop::Origin {
+            connection_id: "knock".to_string(),
+            frame: json!({}),
+        };
+        roomler_ai_mod_remote::extauth::handle_start(
+            &remote,
+            bson::oid::ObjectId::new(),
+            "knock",
+            &tx,
+            &code,
+            ke1,
+            hop,
+        )
+        .await;
+    });
+    let answer = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+        .await
+        .expect("an answer within 15 s")
+        .expect("an answer");
+    (started.elapsed(), serde_json::to_value(&answer).unwrap())
+}
+
+fn percentile(sorted: &[Duration], p: f64) -> Duration {
+    sorted[((sorted.len() - 1) as f64 * p).round() as usize]
+}
+
+/// AC: with the org's switch off, a valid code and the correct password get the
+/// same response and the same latency as a code that does not exist (§5: the
+/// resolution is not an existence oracle). So do a withdrawn approval and an
+/// offline device.
+///
+/// Before `ANSWER_FLOOR` a hit and a miss differed by 0.4 ms at every percentile
+/// (§12), which sampling recovers. What makes this deterministic is the lower
+/// bound on EVERY answer: an arm that skips the floor fails it at once. The
+/// medians are the sanity check on top, wide enough for a loaded runner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_code_answers_like_one_that_does_not_exist() {
+    use roomler_ai_mod_remote::extauth::ANSWER_FLOOR;
+    let app = TestApp::spawn().await;
+
+    let closed = app.seed_tenant("extauth-floor-a").await;
+    let gate_1_off = device(&app, &closed, "mach-extauth-floor-a", &pw("device")).await;
+    assert_eq!(
+        put(
+            &app,
+            &url(&closed, "/external-access"),
+            &closed.admin.access_token,
+            json!({"enabled": false})
+        )
+        .await,
+        200
+    );
+
+    let withdrawn = app.seed_tenant("extauth-floor-b").await;
+    let gate_2_off = device(&app, &withdrawn, "mach-extauth-floor-b", &pw("device")).await;
+    assert_eq!(
+        put(
+            &app,
+            &url(
+                &withdrawn,
+                &format!("/agent/{}/external-access-policy", gate_2_off.agent_id)
+            ),
+            &withdrawn.admin.access_token,
+            json!({"approved": false})
+        )
+        .await,
+        200
+    );
+
+    let open = app.seed_tenant("extauth-floor-c").await;
+    let offline = device(&app, &open, "mach-extauth-floor-c", &pw("device")).await;
+    let _ = offline.stop.send(true);
+    let offline_id = bson::oid::ObjectId::parse_str(&offline.agent_id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.state.fleet().rc_hub.is_agent_online(offline_id) {
+        assert!(Instant::now() < deadline, "the device never went offline");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The correct password, for all of them: it must make no difference.
+    let (_, ke1) = client_ke1(&pw("device"));
+    let arms = [
+        ("no such code", "0000-0000-0000"),
+        ("gate 1 off", gate_1_off.code.as_str()),
+        ("gate 2 withdrawn", gate_2_off.code.as_str()),
+        ("device offline", offline.code.as_str()),
+    ];
+    const ROUNDS: usize = 30;
+    let mut timings: Vec<Vec<Duration>> = vec![Vec::new(); arms.len()];
+    let want = json!({"t": "rc:extauth.result", "refused": "unavailable"});
+    for _ in 0..ROUNDS {
+        // All four at once, so a stall lands on all of them.
+        let (a, b, c, d) = tokio::join!(
+            knock_timed(&app, arms[0].1, &ke1),
+            knock_timed(&app, arms[1].1, &ke1),
+            knock_timed(&app, arms[2].1, &ke1),
+            knock_timed(&app, arms[3].1, &ke1),
+        );
+        for (i, (took, answer)) in [a, b, c, d].into_iter().enumerate() {
+            assert_eq!(answer, want, "{}: the answer differs", arms[i].0);
+            assert!(
+                took >= ANSWER_FLOOR,
+                "{}: answered in {took:?}, under the floor: this arm tells a code apart",
+                arms[i].0
+            );
+            timings[i].push(took);
+        }
+    }
+    let mut medians = Vec::new();
+    for (i, t) in timings.iter_mut().enumerate() {
+        t.sort();
+        println!(
+            "AC1 {:17} n={} p10={:?} p50={:?} p90={:?} p99={:?}",
+            arms[i].0,
+            t.len(),
+            percentile(t, 0.10),
+            percentile(t, 0.50),
+            percentile(t, 0.90),
+            percentile(t, 0.99),
+        );
+        medians.push(percentile(t, 0.50));
+    }
+    let spread = *medians.iter().max().unwrap() - *medians.iter().min().unwrap();
+    assert!(
+        spread < Duration::from_millis(25),
+        "the arms' medians differ by {spread:?}: {medians:?}"
+    );
+    let _ = gate_1_off.stop.send(true);
+    let _ = gate_2_off.stop.send(true);
+}
+
+/// `rc:extauth.finish` and `rc:extauth.session` need no start and no password,
+/// and carry a connect code. So a stranger with a made-up attempt id must learn
+/// from them exactly what no such code tells them, whatever the code's device is
+/// doing: online, the org's switch off, or offline, which used to answer
+/// `unavailable` where a bogus code answers `unknown_attempt`.
+#[tokio::test]
+async fn a_made_up_attempt_tells_nothing_about_the_code() {
+    let app = TestApp::spawn().await;
+    let (_id, mut ws) = outsider(&app, "extprobe").await;
+
+    let on = app.seed_tenant("extauth-probe-a").await;
+    let online = device(&app, &on, "mach-extauth-probe-a", &pw("device")).await;
+    let closed = app.seed_tenant("extauth-probe-b").await;
+    let gate_off = device(&app, &closed, "mach-extauth-probe-b", &pw("device")).await;
+    assert_eq!(
+        put(
+            &app,
+            &url(&closed, "/external-access"),
+            &closed.admin.access_token,
+            json!({"enabled": false})
+        )
+        .await,
+        200
+    );
+    let gone = app.seed_tenant("extauth-probe-c").await;
+    let offline = device(&app, &gone, "mach-extauth-probe-c", &pw("device")).await;
+    let _ = offline.stop.send(true);
+    let offline_id = bson::oid::ObjectId::parse_str(&offline.agent_id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.state.fleet().rc_hub.is_agent_online(offline_id) {
+        assert!(Instant::now() < deadline, "the device never went offline");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    const MADE_UP: &str = "66f0c0ffee0000000000abcd";
+    let want = json!({
+        "t": "rc:extauth.result",
+        "attempt_id": MADE_UP,
+        "refused": "unknown_attempt",
+    });
+    for (arm, code) in [
+        ("no such code", "0000-0000-0000"),
+        ("online", online.code.as_str()),
+        ("gate 1 off", gate_off.code.as_str()),
+        ("offline", offline.code.as_str()),
+    ] {
+        send(
+            &mut ws,
+            json!({"t": "rc:extauth.finish", "connect_code": code, "attempt_id": MADE_UP, "ke3": "AAAA"}),
+        )
+        .await;
+        let finish = next_of(&mut ws, &["rc:extauth.result"]).await;
+        assert_eq!(finish, want, "finish, {arm}");
+        send(
+            &mut ws,
+            json!({"t": "rc:extauth.session", "connect_code": code, "attempt_id": MADE_UP, "permissions": "VIEW"}),
+        )
+        .await;
+        let session = next_of(&mut ws, &["rc:extauth.result", "rc:session.created"]).await;
+        assert_eq!(session, want, "session, {arm}");
+    }
+    let _ = online.stop.send(true);
+    let _ = gate_off.stop.send(true);
+}
+
+/// AC (F4): an external controller's `local_relay` is rejected, with a log line.
+/// The frame's type has no such field, which kept the relay out of the session
+/// but said nothing to anyone: serde dropped the key. Now the raw frame is read:
+/// the ask is refused, the org's log and the server's log say why, and no device
+/// is asked.
+///
+/// Two controls. The same login opens its session without the key, so the
+/// refusal came from the key alone. And the same frame on a code that does not
+/// exist gets the same answer, so this arm is no oracle either.
+#[tokio::test]
+async fn an_external_local_relay_is_refused_and_logged() {
+    let capture = LogCapture::default();
+    let _logs = capture.install();
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-f4").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-f4",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws) = outsider(&app, "extfour").await;
+    let (attempt_id, _key) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+
+    let relay = json!({
+        "overlay_ip": "100.64.0.9",
+        "turn_port": 47989,
+        "username": "1792000000:u",
+        "credential": "c",
+    });
+    let ask = |code: &str, key: &str| {
+        let mut frame = json!({
+            "t": "rc:extauth.session",
+            "connect_code": code,
+            "attempt_id": attempt_id,
+            "permissions": "VIEW",
+        });
+        frame[key] = relay.clone();
+        frame
+    };
+    let refused = json!({
+        "t": "rc:extauth.result",
+        "attempt_id": attempt_id,
+        "refused": "unavailable",
+    });
+
+    for key in ["local_relay", "local_relay_from", "local_relay_also"] {
+        send(&mut ws, ask(&dev.code, key)).await;
+        let answer = next_of(
+            &mut ws,
+            &["rc:extauth.result", "rc:session.created", "rc:error"],
+        )
+        .await;
+        assert_eq!(answer, refused, "{key}");
+    }
+    send(&mut ws, ask("0000-0000-0000", "local_relay")).await;
+    let answer = next_of(&mut ws, &["rc:extauth.result", "rc:session.created"]).await;
+    assert_eq!(answer, refused, "the same answer, whether the code exists");
+
+    assert!(
+        capture
+            .text()
+            .contains("a local_relay on an external session"),
+        "the log line"
+    );
+    let audit = url(&seeded, "/external-rc-audit");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let body: Value = app
+            .auth_get(&audit, &seeded.admin.access_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let row = body["items"].as_array().unwrap().iter().find(|i| {
+            i["action"] == "session" && i["login_detail"].as_str().is_some_and(|d| d.contains("F4"))
+        });
+        if let Some(row) = row {
+            assert_eq!(row["login_refused"], "unavailable", "{row}");
+            assert_eq!(row["attempt_id"], json!(attempt_id), "{row}");
+            assert!(row.get("session_id").is_none(), "no session: {row}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "no F4 audit row: {body}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The control: the login survived, and the page's own frame opens the session.
+    let _session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW").await;
+    let _ = dev.stop.send(true);
+}
+
+/// AC (F3): relay bytes from an external session land on the DEVICE's org in the
+/// FR-20 ledger. An outsider's `/turn/credentials` pre-fetch cannot be charged:
+/// they are no member of that org and never learn its ids. `rc:ready` can, because
+/// the Hub knows the session's org, and it is what the viewer now builds its peer
+/// from. This takes the username out of the real frame and plays coturn with it,
+/// so the test fails if the frame stops being charged.
+///
+/// The outsider here has an org of their own, whose concurrent-session slot the
+/// session takes (FR-115 O6). The relay is still the device's: its owner let
+/// them in, and the outsider's org must see none of it.
+///
+/// `turn_bytes` staying 0 until coturn reports is the direct-path arm as far as
+/// loopback can show it: no allocation, nothing booked. The field half is a real
+/// relayed session and a real direct one.
+#[tokio::test]
+async fn an_external_sessions_relay_is_charged_to_the_devices_org() {
+    use crate::turn_usage_tests::{channels, turn_bytes};
+    use bson::oid::ObjectId;
+    use roomler_ai_remote_control::turn_creds::org_of_username;
+
+    let app = TestApp::spawn_with_settings(|s| {
+        s.relay_allowance.turn_attribution = true;
+        s.turn.url = Some("turn:coturn.example:3478".into());
+        s.turn.shared_secret = Some(ObjectId::new().to_hex());
+    })
+    .await;
+    let Some(redis) = app.state.redis_pubsub.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let home = app.seed_tenant("extauth-meter-a").await;
+    let home_org = ObjectId::parse_str(&home.tenant_id).unwrap();
+    let dev = device_with(
+        &app,
+        &home,
+        "mach-extauth-meter",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+
+    // An outsider with an org of their own.
+    let theirs = app.seed_tenant("extauth-meter-b").await;
+    let their_org = ObjectId::parse_str(&theirs.tenant_id).unwrap();
+    let ws_url = format!("ws://{}/ws?token={}", app.addr, theirs.admin.access_token);
+    let (mut ws, _) = connect_async(&ws_url).await.expect("user socket");
+    let _ = tokio::time::timeout(Duration::from_millis(500), ws.next()).await;
+
+    // What the viewer's pre-fetch gets: uncharged, which is the gap.
+    let body: Value = app
+        .auth_get("/api/turn/credentials", &theirs.admin.access_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let prefetch = body["ice_servers"][1]["username"].as_str().unwrap();
+    assert_eq!(org_of_username(prefetch), None, "{prefetch}");
+
+    let (attempt_id, _key) = login(&mut ws, &dev.code, &pw("device"), &theirs.admin.id).await;
+    let (_session, ready) = open_session_ready(&mut ws, &dev.code, &attempt_id, "VIEW").await;
+    let username = ready["ice_servers"][1]["username"]
+        .as_str()
+        .unwrap_or_else(|| panic!("rc:ready carries a TURN server: {ready}"));
+    assert_eq!(
+        org_of_username(username),
+        Some(home.tenant_id.as_str()),
+        "the device's org pays, not the outsider's: {username}"
+    );
+    assert_eq!(
+        turn_bytes(&app, home_org).await,
+        0,
+        "nothing relayed, nothing booked"
+    );
+
+    // coturn reports the allocation made on those credentials.
+    let (client, peer) = channels(username, 5252);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while turn_bytes(&app, home_org).await < 61_000 && Instant::now() < deadline {
+        redis
+            .publish_to(&client, "rcvp=10, rcvb=1000, sentp=20, sentb=60000")
+            .await
+            .unwrap();
+        redis
+            .publish_to(&peer, "rcvp=20, rcvb=60000, sentp=10, sentb=1000")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert_eq!(
+        turn_bytes(&app, home_org).await,
+        61_000,
+        "both legs, once, on the device's org"
+    );
+    assert_eq!(
+        turn_bytes(&app, their_org).await,
+        0,
+        "none of it on the outsider's"
+    );
+    let _ = dev.stop.send(true);
+}
+
+/// AC: a `DesiredConfig` push carrying any `external_*` key is rejected. The
+/// route refuses it out loud and audits it, rather than answering 200 for a key
+/// it dropped, and nothing is recorded for the device to reconcile. The device's
+/// own refusal, the one that survives this server, is
+/// `a_pushed_external_key_never_reaches_the_device`.
+#[tokio::test]
+async fn a_desired_config_push_with_an_external_key_is_refused() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-push").await;
+    let dev = device(&app, &seeded, "mach-extauth-push", &pw("device")).await;
+    let path = url(&seeded, &format!("/agent/{}/desired-config", dev.agent_id));
+    let owner = &seeded.admin.access_token;
+
+    for key in [
+        "external_access_enabled",
+        "external_access_verifier",
+        "external_consent_mode",
+        "external_max_permissions",
+        "external_added_next_year",
+    ] {
+        let resp = app
+            .auth_put(&path, owner)
+            .json(&json!({ "exec_enabled": true, key: true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "{key}");
+    }
+    let agent_id = bson::oid::ObjectId::parse_str(&dev.agent_id).unwrap();
+    let row = app
+        .db
+        .collection::<bson::Document>("agents")
+        .find_one(bson::doc! { "_id": agent_id })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.get_document("desired_config")
+            .map_or(true, |d| d.get_i64("revision").unwrap_or(0) == 0
+                && d.get_i32("revision").unwrap_or(0) == 0),
+        "a refused push records nothing: {row:?}"
+    );
+    let refused = app
+        .db
+        .collection::<bson::Document>("config_audit")
+        .count_documents(bson::doc! { "agent_id": agent_id, "denied": "device_owned_key" })
+        .await
+        .unwrap();
+    assert_eq!(refused, 5, "every refusal is on the record");
+
+    // The control: the same body without the key is the push it always was.
+    let resp = app
+        .auth_put(&path, owner)
+        .json(&json!({ "exec_enabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
     let _ = dev.stop.send(true);
 }

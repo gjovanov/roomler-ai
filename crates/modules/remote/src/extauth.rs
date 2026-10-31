@@ -14,9 +14,12 @@
 //!    [`ExtauthRefusal::Unavailable`] for no-such-code, gate 1 off, gate 2
 //!    closed or expired, offline, too old. The org's audit log is where they
 //!    are told apart (`login_detail`); the outsider never sees the difference.
-//!    And the same LATENCY as far as that is cheap to buy: the reply goes out
-//!    BEFORE the audit write (a write only resolvable codes trigger), and an
-//!    unresolvable code still pays the tenant read a resolvable one does.
+//!    And the same LATENCY: an answer given without the device leaves at
+//!    [`ANSWER_FLOOR`] after the knock, whatever was read to reach it, and the
+//!    reply goes out BEFORE the audit write (a write only resolvable codes
+//!    trigger). Padding the reads cannot do this: a hit and a miss differ by
+//!    0.4 ms at every percentile (spec §12), and a rate limit only slows the
+//!    averaging down.
 //! 2. **Park before the push.** The device can answer faster than this
 //!    function gets back from `send_to_agent`; the waiter is registered first,
 //!    so an early answer finds somewhere to land (FR-83's rule).
@@ -76,6 +79,13 @@ pub const ATTEMPT_TTL: Duration = Duration::from_secs(90);
 /// limit (§4b). The device's budget is the one that protects the password;
 /// this one bounds relay traffic and audit rows per account.
 pub const STARTS_PER_MINUTE: u32 = 10;
+/// How soon an answer given WITHOUT the device may leave, counted from the
+/// knock (FR-52 §5: the resolution is not an existence oracle). A deadline
+/// rather than a pad after the work, so what was read to reach the answer
+/// cannot show. Above the 250 ms presence probe [`forward`] may wait out, so a
+/// stalled Redis does not mark an offline device either. Only refusals pay it:
+/// a login the device answers is as fast as the device.
+pub const ANSWER_FLOOR: Duration = Duration::from_millis(300);
 /// How long a VERIFIED login may wait here for its `rc:extauth.session`.
 /// Longer than the device's own hold on it (120 s): the device holds the key,
 /// so it should be the party that lets a login lapse.
@@ -329,6 +339,23 @@ fn unavailable(attempt_id: Option<String>) -> ServerMsg {
     result(attempt_id, Some(ExtauthRefusal::Unavailable), None)
 }
 
+/// Send `answer` at [`ANSWER_FLOOR`] after `knocked`, or at once if that passed.
+async fn answer_at_floor(tx: &ClientTx, knocked: Instant, answer: ServerMsg) {
+    tokio::time::sleep_until((knocked + ANSWER_FLOOR).into()).await;
+    let _ = tx.try_send(answer);
+}
+
+/// FR-52 F4 — does this `rc:extauth.session` frame name a relay? The prefix, so
+/// the key that matters is also the one added after this was written.
+///
+/// Read off the RAW frame: the variant has no such field, so serde drops the key
+/// and the decoded message cannot say it was ever there.
+fn names_a_relay(frame: &serde_json::Value) -> bool {
+    frame
+        .as_object()
+        .is_some_and(|o| o.keys().any(|k| k.starts_with("local_relay")))
+}
+
 /// Gates 1 and 2, plus "can this device do it at all". `Err` carries what the
 /// org's audit log records; the outsider sees only `unavailable`.
 ///
@@ -372,9 +399,8 @@ async fn gates(
 
 /// Resolve a connect code to its live device.
 ///
-/// ⚠️ An unresolvable code still pays one tenant read, so it costs roughly
-/// what a resolvable-but-gated code costs before the reply goes out. Cheap to
-/// buy, and it keeps "no such code" from being the one fast answer.
+/// An unresolvable code still pays one tenant read, so a stalled tenant read
+/// slows both alike; [`ANSWER_FLOOR`] is what makes the answers equal.
 async fn resolve(state: &RemoteState, typed: &str) -> Option<Agent> {
     let found = match connect_code::normalize(typed) {
         Some(code) => state
@@ -509,15 +535,15 @@ pub async fn handle_start(
         return;
     }
     let Some(agent) = resolve(state, connect_code).await else {
-        let _ = tx.try_send(unavailable(None));
+        answer_at_floor(tx, now, unavailable(None)).await;
         return;
     };
     let Some(agent_id) = agent.id else {
-        let _ = tx.try_send(unavailable(None));
+        answer_at_floor(tx, now, unavailable(None)).await;
         return;
     };
     if let Err(detail) = gates(state, &agent).await {
-        let _ = tx.try_send(unavailable(None));
+        answer_at_floor(tx, now, unavailable(None)).await;
         info!(%principal, agent = %agent_id, detail, "extauth: start refused");
         audit(
             state,
@@ -541,7 +567,7 @@ pub async fn handle_start(
             Hop::Origin { .. } => "the device is offline (no pod holds it)",
             Hop::Relayed => "forwarded here, but the device is no longer on this pod",
         };
-        let _ = tx.try_send(unavailable(None));
+        answer_at_floor(tx, now, unavailable(None)).await;
         audit(
             state,
             &agent,
@@ -578,7 +604,7 @@ pub async fn handle_start(
         .is_err()
     {
         relay.attempts.remove(&attempt_id);
-        let _ = tx.try_send(unavailable(None));
+        answer_at_floor(tx, now, unavailable(None)).await;
         audit(
             state,
             &agent,
@@ -605,7 +631,16 @@ pub async fn handle_start(
             // ⚠️ "Verified" in answer to a KE1 is protocol nonsense — nothing
             // has been proven yet. Relayed as a refusal, never as a login.
             let refused = Some(refused.unwrap_or(ExtauthRefusal::Other));
-            let _ = tx.try_send(result(Some(attempt_id.clone()), refused, retry_after_secs));
+            // ⚠️ The device's `unavailable` is the server's, to the byte: an
+            // attempt id here would say the code resolved, the org's gates
+            // are open and the device is online, which is the configuration
+            // this one answer exists to hide. The floor covers a device nearer
+            // than it; a farther one still shows its round trip.
+            if refused == Some(ExtauthRefusal::Unavailable) {
+                answer_at_floor(tx, now, unavailable(None)).await;
+            } else {
+                let _ = tx.try_send(result(Some(attempt_id.clone()), refused, retry_after_secs));
+            }
             audit(
                 state,
                 &agent,
@@ -619,7 +654,7 @@ pub async fn handle_start(
         }
         None => {
             relay.attempts.remove(&attempt_id);
-            let _ = tx.try_send(unavailable(Some(attempt_id.clone())));
+            let _ = tx.try_send(unavailable(None));
             audit(
                 state,
                 &agent,
@@ -647,25 +682,61 @@ pub async fn handle_finish(
     hop: Hop,
 ) {
     let relay = &state.extauth;
-    relay.prune(Instant::now());
+    let knocked = Instant::now();
+    relay.prune(knocked);
     let unknown =
         |attempt_id: String| result(Some(attempt_id), Some(ExtauthRefusal::UnknownAttempt), None);
     // The code FIRST, before the attempt table: on the pod the browser landed
     // on, an attempt that was started cross-pod lives on the OTHER pod, and a
     // local lookup would wrongly answer "no such attempt".
     let Some(agent) = resolve(state, connect_code).await else {
-        let _ = tx.try_send(unknown(attempt_id));
+        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
         return;
     };
     let Some(device) = agent.id else {
-        let _ = tx.try_send(unknown(attempt_id));
+        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
         return;
     };
+    // The gates BEFORE any forward: a frame sent on to another pod comes back a
+    // relay hop later, which would mark a closed org's code as one that exists.
+    let gate = gates(state, &agent).await;
     if !state.fleet.rc_hub.is_agent_online(device) {
-        if forward(state, &hop, device, principal, actor).await {
+        if gate.is_ok() && forward(state, &hop, device, principal, actor).await {
             return;
         }
-        let _ = tx.try_send(unavailable(Some(attempt_id)));
+        // ⚠️ This frame needs no `rc:extauth.start` first and has no rate limit
+        // of its own, so a stranger can send it with any code. `unavailable` is
+        // only for a login this principal really has in flight, who already
+        // knows the code resolves. For anyone else it would be an existence
+        // oracle: no such code answers `unknown`.
+        let in_flight = relay
+            .attempts
+            .remove_if(&attempt_id, |_, a| {
+                a.principal == principal && a.agent_id == device
+            })
+            .is_some();
+        let answer = if in_flight {
+            unavailable(Some(attempt_id.clone()))
+        } else {
+            unknown(attempt_id.clone())
+        };
+        answer_at_floor(tx, knocked, answer).await;
+        // A closed gate is still a refusal the org can read. Under the start
+        // limit, because anyone holding the code can repeat this.
+        if let Err(detail) = gate
+            && relay.allow_start(principal, knocked)
+        {
+            audit(
+                state,
+                &agent,
+                device,
+                principal,
+                actor,
+                Some(attempt_id),
+                Some(ExtauthRefusal::Unavailable),
+                Some(detail),
+            );
+        }
         return;
     }
     // Taken, not read: whatever happens next, this attempt ends here. Only its
@@ -675,17 +746,17 @@ pub async fn handle_finish(
         .attempts
         .remove_if(&attempt_id, |_, a| a.principal == principal)
     else {
-        let _ = tx.try_send(unknown(attempt_id));
+        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
         return;
     };
     // The code must still name the attempt's device, and the gates must still
     // be open: an admin who revokes mid-login must not see it complete.
     if attempt.agent_id != device {
-        let _ = tx.try_send(unknown(attempt_id));
+        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
         return;
     }
     let agent_id = attempt.agent_id;
-    if let Err(detail) = gates(state, &agent).await {
+    if let Err(detail) = gate {
         let _ = tx.try_send(unavailable(Some(attempt_id.clone())));
         audit(
             state,
@@ -800,6 +871,9 @@ pub struct SessionAsk {
     /// FR-115 P3b (O6) — the org the outsider says the session is for (hex),
     /// honoured only when they belong to it ([`charge_scope`]).
     pub charge_org: Option<String>,
+    /// F4 — the raw frame named a relay ([`names_a_relay`]). Known only where
+    /// the frame arrived: forwarded and decoded on another pod, the key is gone.
+    pub named_a_relay: bool,
 }
 
 /// FR-115 P3b (O6 + O7, decided 2026-10-20) — whose concurrent-session
@@ -903,42 +977,89 @@ pub async fn handle_session(
     hop: Hop,
 ) {
     let relay = &state.extauth;
+    let knocked = Instant::now();
     let attempt_id = ask.attempt_id;
     let unknown =
         |attempt_id: String| result(Some(attempt_id), Some(ExtauthRefusal::UnknownAttempt), None);
+    // F4 — a relay descriptor is validated as AN overlay address, not the
+    // caller's, so from outside the org it would be a probe into its mesh,
+    // dialled by the device. The page never sends one (`useRemoteControl`), so
+    // a frame that does is not the page's. Refused before the code resolves, in
+    // one answer whether it does or not, so this arm tells nothing about a code,
+    // and at the pod the frame arrived on, the only one that can see the key.
+    if ask.named_a_relay {
+        warn!(%principal, %attempt_id, "extauth: a local_relay on an external session — refused (F4)");
+        let agent = resolve(state, &ask.connect_code).await;
+        answer_at_floor(tx, knocked, unavailable(Some(attempt_id.clone()))).await;
+        if let Some((agent, device)) = agent.and_then(|a| a.id.map(|id| (a, id)))
+            && relay.allow_start(principal, knocked)
+        {
+            audit_session(
+                state,
+                &agent,
+                device,
+                principal,
+                actor,
+                attempt_id,
+                Some(ExtauthRefusal::Unavailable),
+                Some("the request named a relay (F4): an outsider has no overlay presence"),
+                None,
+            );
+        }
+        return;
+    }
     // The code FIRST, as in `finish`: a login verified cross-pod is held on the
     // pod that holds the device, and a local lookup here would miss it.
     let Some(agent) = resolve(state, &ask.connect_code).await else {
-        let _ = tx.try_send(unknown(attempt_id));
+        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
         return;
     };
     let Some(device) = agent.id else {
-        let _ = tx.try_send(unknown(attempt_id));
+        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
         return;
     };
+    // Before any forward, for `finish`'s reason.
+    let gate = gates(state, &agent).await;
     if !state.fleet.rc_hub.is_agent_online(device) {
-        if forward(state, &hop, device, principal, actor).await {
+        if gate.is_ok() && forward(state, &hop, device, principal, actor).await {
             return;
         }
-        let _ = tx.try_send(unavailable(Some(attempt_id.clone())));
-        audit_session(
-            state,
-            &agent,
-            device,
-            principal,
-            actor,
-            attempt_id,
-            Some(ExtauthRefusal::Unavailable),
-            Some("the device is offline (no pod holds it)"),
-            None,
-        );
+        // `finish`'s rule too: `unavailable` only for a login this principal
+        // really holds here.
+        let held = relay.take_verified(&attempt_id, principal, device, knocked);
+        let answer = if held {
+            unavailable(Some(attempt_id.clone()))
+        } else {
+            unknown(attempt_id.clone())
+        };
+        answer_at_floor(tx, knocked, answer).await;
+        let detail = match gate {
+            Err(detail) => Some(detail),
+            Ok(_) if held => Some("the device is offline (no pod holds it)"),
+            Ok(_) => None,
+        };
+        if let Some(detail) = detail
+            && relay.allow_start(principal, knocked)
+        {
+            audit_session(
+                state,
+                &agent,
+                device,
+                principal,
+                actor,
+                attempt_id,
+                Some(ExtauthRefusal::Unavailable),
+                Some(detail),
+                None,
+            );
+        }
         return;
     }
     // Spent, not read: one verified login opens one session, whatever happens
     // below — a refusal here sends the outsider back to log in again, which is
     // the cheap direction to be wrong in.
-    if !relay.take_verified(&attempt_id, principal, device, Instant::now()) {
-        let _ = tx.try_send(unknown(attempt_id));
+    if !relay.take_verified(&attempt_id, principal, device, knocked) {
+        answer_at_floor(tx, knocked, unknown(attempt_id)).await;
         return;
     }
     // Gates 1 and 2 again: an admin who revokes between the login and the
@@ -958,7 +1079,7 @@ pub async fn handle_session(
             None,
         );
     };
-    let tenant = match gates(state, &agent).await {
+    let tenant = match gate {
         Ok(tenant) => tenant,
         Err(detail) => {
             refuse(detail, attempt_id);
@@ -1236,6 +1357,7 @@ fn dispatch(
             audio_enabled,
             charge_org,
         } => {
+            let named_a_relay = matches!(&hop, Hop::Origin { frame, .. } if names_a_relay(frame));
             let ask = SessionAsk {
                 connect_code,
                 attempt_id,
@@ -1246,6 +1368,7 @@ fn dispatch(
                 chunk_framing,
                 audio_enabled,
                 charge_org,
+                named_a_relay,
             };
             tokio::spawn(async move {
                 handle_session(&state, principal, &actor, &tx, ask, hop).await;
@@ -1306,6 +1429,38 @@ mod tests {
         let pending = relay.expect("a1", ObjectId::new());
         assert!(pending.wait(SHORT).await.is_none());
         assert!(relay.waiters.is_empty());
+    }
+
+    /// F4 is read off the raw frame, by prefix: every relay key
+    /// `rc:session.request` has, and the one added after this was written. A
+    /// frame that names none is the page's, and it is untouched.
+    #[test]
+    fn a_relay_key_is_seen_on_the_raw_frame_by_its_prefix() {
+        let base = serde_json::json!({
+            "t": "rc:extauth.session",
+            "connect_code": "0000-0000-0000",
+            "attempt_id": "a1",
+            "permissions": "VIEW",
+            "browser_caps": ["h264"],
+            "charge_org": "665f1c2a9b3e4d5f6a7b8c9d",
+        });
+        assert!(!names_a_relay(&base));
+        for key in [
+            "local_relay",
+            "local_relay_from",
+            "local_relay_also",
+            "local_relay_from_also",
+            "local_relay_added_next_year",
+        ] {
+            let mut frame = base.clone();
+            frame[key] = serde_json::json!({"overlay_ip": "100.64.0.9"});
+            assert!(names_a_relay(&frame), "{key}");
+            // Presence, not content: a page that sends the key at all is not
+            // the page this repo ships.
+            frame[key] = serde_json::Value::Null;
+            assert!(names_a_relay(&frame), "{key}: null");
+        }
+        assert!(!names_a_relay(&serde_json::json!("local_relay")));
     }
 
     #[test]
