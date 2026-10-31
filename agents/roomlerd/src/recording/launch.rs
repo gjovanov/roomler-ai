@@ -1722,13 +1722,14 @@ pub(crate) mod unix {
             let dir = tempfile::tempdir().unwrap();
             // SAFETY: reads our own credentials.
             let me = unsafe { libc::geteuid() };
-            let _session = UnixListener::bind(dir.path().join("X1")).unwrap();
-            let _vnc = UnixListener::bind(dir.path().join("X3")).unwrap();
-            // None of these is a display of theirs.
+            let _session = UnixListener::bind(dir.path().join("X5")).unwrap();
+            let _vnc = UnixListener::bind(dir.path().join("X7")).unwrap();
+            // None of these is a display of theirs, and the two that would
+            // parse sort below the real one, so taking either shows.
             std::fs::write(dir.path().join("X0"), b"").unwrap();
+            std::os::unix::fs::symlink(dir.path().join("X5"), dir.path().join("X1")).unwrap();
             let _named = UnixListener::bind(dir.path().join("Xother")).unwrap();
-            std::os::unix::fs::symlink(dir.path().join("X1"), dir.path().join("X-1")).unwrap();
-            assert_eq!(x_display_owned_by(dir.path(), me).as_deref(), Some(":1"));
+            assert_eq!(x_display_owned_by(dir.path(), me).as_deref(), Some(":5"));
             assert_eq!(
                 x_display_owned_by(dir.path(), me.wrapping_add(1)),
                 None,

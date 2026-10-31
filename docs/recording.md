@@ -1330,7 +1330,7 @@ recording, as reviewed on 2026-10-31:
 | Remote configuration, `DesiredConfig` | An administrator, through the server | No `record_*` key can be pushed | `no_record_key_is_server_pushable_via_desired_config` |
 | The fleet RPC verbs, `RpcCap` | An administrator, through the server | None of them is a recording verb | `rpc_cap_wire_strings_are_locked` |
 | The words of `AgentCaps.record` | The hub, reading what a device offers | `remote`, `remote-audio` and `available`, and nothing about a microphone | `remote_recording_does_not_imply_remote_audio` |
-| `RecordStart` on the LocalAPI, behind `roomler record start --microphone` and the Recordings view | The person at the console | Theirs to choose | `the_console_user_decision_table`, `an_unidentified_peer_cannot_start_stop_delete_or_move_recordings` |
+| `RecordStart` on the LocalAPI, behind `roomler record start --microphone` and the Recordings view | The person at the console; on a Linux system install, on their own socket (§6) | Theirs to choose | `the_console_user_decision_table`, `the_recording_decision_table`, `an_unidentified_peer_cannot_start_stop_delete_or_move_recordings` |
 | `roomlerd record --microphone`, run by hand | Whoever runs it, as themselves | That account's | Nothing remote starts it |
 
 ⚠️ **This is about the recording feature, not about control of the device.** Four
@@ -1343,9 +1343,12 @@ one:
 - `roomler exec` arrives as root on Linux, as SYSTEM in the console session on a
   SystemContext host, and as the person on an attended Windows install. All three
   pass the console-user gate. An anchored service, SYSTEM in session 0, does not.
-- `roomler ssh` in `console_user` mode on Windows runs in the console session.
+- `roomler ssh` in `console_user` mode runs in the console session on Windows. On
+  Linux it drops to the person at the screen, and on a system install that person's
+  socket serves it (P2e).
 - A Hive session (default off) runs as its mapped account, which passes the gate
-  where that account is the daemon's or root.
+  where that account is the daemon's or root, and on a Linux system install where
+  it is the person at the seat.
 
 Each has its own gates: the host's consent to `INPUT`, `EXEC_DEVICE` or
 `SSH_DEVICE` (`ADMINISTRATOR` only) with the owner's `exec_enabled` or

@@ -353,7 +353,7 @@ sequenceDiagram
   `ConfigSet` are refused on the person socket, so Settings edits the per-user half's own
   file — and says so (§5). The same socket does tell the companion, and the CLI's
   `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:4592`), that a root half exists: `/var/run/roomler` is
+  `crates/localapi/src/lib.rs:4627`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the

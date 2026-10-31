@@ -492,7 +492,7 @@ which the daemon still refuses on the same terms as a local request.
    that `roomler exec` and `roomler ssh` talk to — measured on 0.4.169, the
    worker's file read `ssh_enabled = false` while the root half served SSH.
    The root daemon's socket is root-only and its person socket refuses every
-   config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3101`), so
+   config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3129`), so
    gate 4 on that daemon is an administrator's: `sudo roomler config set
    exec_enabled true`. The pane now says which file it edits and gives that
    command (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:828`;
