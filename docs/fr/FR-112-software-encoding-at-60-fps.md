@@ -10,7 +10,8 @@ criterion field-verified on a release (§9).
   (11 moves in 40 s).
 - P4's docs: [#2425](https://github.com/gjovanov/roomler-ai/pull/2425).
 - P3 (macOS, Windows) moved to [#2430](https://github.com/gjovanov/roomler-ai/issues/2430), and the hardware
-  pace's own flaw to [#2432](https://github.com/gjovanov/roomler-ai/issues/2432).
+  pace's own flaw to [#2432](https://github.com/gjovanov/roomler-ai/issues/2432). P3's requests are written and
+  opt-in (§4); its numbers, and each OS's defaults, are owed there.
 Spec and claim 2026-10-17, on the operator's *"why is asahi having
 less than 30fps, cant it reach 60?"* and, after the answer, *"yes do it"* · **Owner:** remote desktop (the software
 encode paths) · **Anchors:** master `391f114a7` ·
@@ -161,6 +162,12 @@ flowchart LR
   carry the DataChannel (SCTP, DTLS), added nothing: 56.3 fps with the clamp on everything, 56.2 with it on the
   runtime alone, 56.3 with only the encode and capture threads (§9). Clamping the runtime would also clock up
   every timer the daemon wakes for, on every host, with no session open.
+- **macOS and Windows ask differently (P3, [#2430](https://github.com/gjovanov/roomler-ai/issues/2430)).** macOS
+  sets the thread's QoS class (`QOS_CLASS_USER_INTERACTIVE`), and Windows takes the thread out of power throttling
+  (`SetThreadInformation`, Microsoft's "HighQoS"). Neither passes to the threads it starts (§9), so each request
+  covers OpenH264's worker wholly and libvpx's workers not at all. Both stay opt-in (`ROOMLERD_ENCODER_CLOCK=1`,
+  `DEFAULT_ON`) until each OS's own hardware has measured them: nothing says the trap exists there, or that these
+  requests lift it.
 - **The encode is timed** on the VP9-444 pump (today only `avg_scale_ms`), as the RTP pump already does, and the
   heartbeat says it (`avg_encode_ms`). The tier below steers by it.
 - **Software paths target 60, and FR-1's `FpsPace` paces them down.** `FpsPace` already does exactly this for
@@ -227,7 +234,7 @@ flowchart LR
 | **P2b** | the H.264 RTP pump's tier: target 60 on Linux, the same pace (`SoftwarePace`, shared with P2a) and ceiling, OpenH264's frame rate following the rate it runs at, its runtime settings held until its first frame and its max bitrate moving with the target, the auto-fps-cap left to Windows | `ROOMLERD_SW_FPS_60=0` | ✅ released in 0.4.142, field-verified on the Asahi host (§9) | M |
 | **P2d** | the software pace's steps up wait for headroom: down at once, up only once the estimate clears the higher step by 2.5 fps (`SW_PACE_UP_MARGIN_FPS`); the hardware pace keeps margin 0 until it is measured ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)) | `ROOMLERD_SW_PACE_UP_MARGIN=0` (0.4.142's pace) | ✅ released in **0.4.143**, field-verified on it (§9): no pace change in 38 and 43 windows where 0.4.142 flapped, and the switch gives the flapping back. Before it: a candidate on the Asahi host (0.4.142's pace 14 moves in 40 s, the margin 2); unit: margin 0 replays 0.4.142's logged field trace window for window | S |
 | ~~**P2c**~~ | ~~software H.264's ≤ 1280-px cap decided by the measured encode~~ — dropped: the viewer's default `original` already overrides the cap (§3), and the host encodes 2048×1080 in 5.5 ms | — | — | — |
-| ~~**P3**~~ | ~~the clock elsewhere: macOS (the encoder threads' QoS class) and Windows (no power throttling for the encode thread), each measured on its own hardware first~~ — moved to [#2430](https://github.com/gjovanov/roomler-ai/issues/2430), so this FR can close on what Linux measured | per OS | → #2430 | S |
+| **P3** | the clock elsewhere, moved to [#2430](https://github.com/gjovanov/roomler-ai/issues/2430) so this FR could close on what Linux measured: macOS (`QOS_CLASS_USER_INTERACTIVE` on the encoder thread, OpenH264's worker and the capture worker) and Windows (the encoder thread and OpenH264's worker out of power throttling); each OS's default for this and for the 60 fps tier follows its own measurement | `ROOMLERD_ENCODER_CLOCK`: `0` never asks, `1` asks on macOS and Windows, off there by default | 🟡 the requests and their unit tests are written, opt-in until measured; the before/after on each OS's own hardware is owed on #2430 | S |
 | **P4** | docs: `docs/rate-control.md` (the software tier, the ceiling), `docs/encoders.md` (the clock, why one slice), the `docs/README.md` index row | — | ✅ `encoders.md` § Software encoders (the clock, the tier, OpenH264's settings), `rate-control.md` § Software encoders and two config rows, both index rows | S |
 
 ## 5. Test plan
@@ -444,3 +451,15 @@ waited for the per-session live check.
   session, the session dropped at 10:02Z, and the script died with it before its cleanup, which left the clock-off
   drop-in on the host. It was found and removed at 10:16Z, with no live session and the service restarted on the
   release's bytes. Long runs now go in a transient unit, which outlives the session.
+
+**P3, 2026-10-31: what each OS does with the request.** Not a measurement of any clock: those are owed on
+[#2430](https://github.com/gjovanov/roomler-ai/issues/2430). The documentation left two questions open, and P3's
+design rests on both.
+
+| Question | Windows 11, build 26300 | macOS |
+|---|---|---|
+| Can a thread read the request back? | Yes. `GetThreadInformation(ThreadPowerThrottling)` answers, though its documentation does not list that class: `ControlMask`, `StateMask` read 0, 0 before the request, 1, 0 after it, and 1, 1 under EcoQoS | Yes: `pthread_get_qos_class_np` |
+| Does a thread it starts inherit it? | No. A child started after the request reads 0, 0, and one started under EcoQoS reads 0, 0 too | No. `sys/qos.h`: threads `pthread_create` starts without a QoS attribute "will default to `QOS_CLASS_DEFAULT`", and libpthread never reads the creator's class |
+
+The Windows row is a scratch test of `encode/clock.rs` run on the day. The unit tests keep both rows true on CI's
+Windows and Mac runners.
