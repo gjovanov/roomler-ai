@@ -751,7 +751,7 @@ sequenceDiagram
   off; the legacy `ROOMLER__SETUP__WIZARD_UNIX_DAEMON` turns Linux and macOS
   on together). One helper decides it for the Welcome cards, the Server page
   and the pipeline (`SetupFeatures::daemon_offered`,
-  `agents/roomler-setup/src/features.rs:73-79`). The server is picked after the role, so the
+  `agents/roomler-setup/src/features.rs:77-79`). The server is picked after the role, so the
   Server page asks again when the URL changes and the pipeline once more before
   it installs.
 - **On production, both OSes since 2026-10-30 (22:33Z).** The deploy repo's
