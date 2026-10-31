@@ -589,6 +589,34 @@ warning. The restrictive branch enumerates methods/headers because
 
 `tower_governor`, 60 req/min per IP.
 
+### What an error may say (#3216)
+
+A write that hit a unique index used to answer with MongoDB's own text, which names
+the database, the collection, the index and the value: `DaoError::DuplicateKey(msg)`
+became `ApiError::Conflict(msg)` unchanged. That variant carried two different
+things, and `DaoError` now says which:
+
+| Variant | Holds | The client reads |
+|---|---|---|
+| `DuplicateKey` | MongoDB's text, or a message that embeds it | `That already exists` |
+| `Conflict` | a sentence written for the person | that sentence |
+
+- **It fails closed.** A new raw path needs no care, and a new sentence has to say it
+  is one. Matching `E11000` at the seam would fail open: that text is not a contract,
+  and `duplicate_key_index` already allows for servers that phrase it differently.
+- **The raw text is still read below the seam.** `duplicate_key_is_on` and
+  `duplicate_key_index` work on it, so a route that can say what collided does
+  (`name_taken` on the touch presets).
+- **The log keeps where, not what.** `duplicate_key_site` stops before the `dup key`
+  document, because its value is somebody's address or username.
+- ⚠️ **A client reads the status or a code, never the words.** Three organization
+  forms matched `duplicate` or `E11000` to say a slug was taken, which is the text
+  this change removed. `POST /api/tenant` has one 409, so the status is enough; a
+  route with several causes needs a code, as `not_a_member` has.
+
+A `500` is not covered: `ApiError::Internal(msg)` still sends `msg` to the client
+(§9).
+
 ### Security headers and CSP (`files/nginx-pod.conf`)
 
 `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`,
@@ -763,6 +791,7 @@ Re-run: `bun audit` (ui) + `cargo audit` (buildhost, `~/.cargo/bin`).
 | Sev | Since | Gap |
 |---|---|---|
 | MEDIUM | 2026-08-23 | **User sessions are irrevocable** — no `token_epoch`, no password-change route, no refresh rotation (§1) |
+| LOW | 2026-10-31 | A `500` carries its cause as `message`, a database driver's text included (§5, #3216) |
 | LOW | 2026-03-10 | No secret scanner in CI, no pre-commit lint hooks (§8) |
 | — | 2026-07-29 | Four Rust advisories + one JS advisory deferred as unreachable (§8) |
 

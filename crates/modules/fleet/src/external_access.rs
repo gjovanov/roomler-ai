@@ -391,6 +391,15 @@ pub struct ConnectCodeResponse {
     pub rotated_at: DateTime,
 }
 
+/// One device's connect code, as its External access dialog reads it.
+#[derive(Debug, Serialize)]
+pub struct DeviceConnectCode {
+    /// Display form, `XXXX-XXXX-XXXX`. `None` when no code has been minted.
+    pub connect_code: Option<String>,
+    /// RFC3339, never a raw `bson::DateTime` — see [`fmt_dt`].
+    pub connect_code_rotated_at: Option<String>,
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Org switch (gate 1)
 // ────────────────────────────────────────────────────────────────────────────
@@ -552,6 +561,47 @@ pub async fn set_policy(
 // Connect code (§5)
 // ────────────────────────────────────────────────────────────────────────────
 
+/// `GET /api/tenant/{tenant_id}/agent/{agent_id}/connect-code` — read one
+/// device's code, approved or not.
+///
+/// ⚠️ `get_settings` lists approved devices only, and approval and the code are
+/// independent acts: withdrawing an approval leaves the code on the row, and a
+/// code can be minted before any approval. A dialog that read only that list
+/// said such a device had no code, and offered Create, which replaces it.
+///
+/// `MANAGE_AGENTS`, the gate `get_settings` puts on the same value. It stays out
+/// of the ordinary device list, which needs only tenant membership.
+pub async fn get_connect_code(
+    State(state): State<FleetState>,
+    auth: AuthUser,
+    Path((tenant_id, agent_id)): Path<(String, String)>,
+) -> Result<Json<DeviceConnectCode>, ApiError> {
+    let tid = tenant_of(&tenant_id)?;
+    let aid = agent_of(&agent_id)?;
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
+    // Live and tenant-scoped, like the list this stands in for: a foreign id or
+    // a removed device 404s. A tombstone still holds its code.
+    let agent = state
+        .agents
+        .base
+        .find_live_by_id_in_tenant(tid, aid)
+        .await?;
+    Ok(Json(DeviceConnectCode {
+        connect_code: agent
+            .connect_code
+            .as_deref()
+            .map(connect_code::format_grouped),
+        connect_code_rotated_at: agent.connect_code_rotated_at.map(fmt_dt),
+    }))
+}
+
 /// `POST /api/tenant/{tenant_id}/agent/{agent_id}/connect-code` — mint or
 /// rotate.
 ///
@@ -619,9 +669,10 @@ pub async fn rotate_connect_code(
                     warn!(%e, "external access: audit write failed");
                 }
                 // ⚠️ The code is returned ONCE per rotation in display form.
-                // It is readable again from `get_settings`, which is behind
-                // `MANAGE_AGENTS` — deliberately not from the ordinary device
-                // list, which needs only tenant membership.
+                // It is readable again from `get_settings` and
+                // `get_connect_code`, both behind `MANAGE_AGENTS` — deliberately
+                // not from the ordinary device list, which needs only tenant
+                // membership.
                 return Ok(Json(ConnectCodeResponse {
                     connect_code: connect_code::format_grouped(&code),
                     rotated_at: DateTime::now(),

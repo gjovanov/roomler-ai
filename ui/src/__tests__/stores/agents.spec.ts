@@ -685,6 +685,21 @@ describe('useAgentStore', () => {
     )
   })
 
+  it("reads one device's connect code, and lets a failed read throw", async () => {
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce({ connect_code: 'K7Q2-9XM4-TB3F' })
+    await expect(s.fetchConnectCode(TENANT_ID, 'a1')).resolves.toBe('K7Q2-9XM4-TB3F')
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/agent/a1/connect-code`)
+
+    mockApi.get.mockResolvedValueOnce({ connect_code: null })
+    await expect(s.fetchConnectCode(TENANT_ID, 'a1')).resolves.toBeNull()
+
+    // "Could not read it" must not look like "there is none": that one offers
+    // Create, and Create replaces a code.
+    mockApi.get.mockRejectedValueOnce(new Error('503'))
+    await expect(s.fetchConnectCode(TENANT_ID, 'a1')).rejects.toThrow('503')
+  })
+
   it('saving an external-access policy writes it back onto the agent row', async () => {
     // The dialog PUTs the WHOLE shape, so the store must keep the saved policy
     // — a stale row would reopen the dialog on the old ceiling and the next

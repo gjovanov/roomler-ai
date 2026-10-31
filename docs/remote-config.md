@@ -295,7 +295,7 @@ cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
 pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
 or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
 guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
-`crates/remote_control/src/models.rs:9641`); a prefix match would refuse the
+`crates/remote_control/src/models.rs:9693`); a prefix match would refuse the
 kill switch along with the switch.
 
 ⚠️ **A push lands on connect, and takes effect at the restart after it.** A
@@ -304,6 +304,12 @@ reconnect. Restarting it before it has reported the push only reconnects it:
 the new daemon starts on the old value, then writes the pushed one and reports
 `needs_restart`, so it takes a second restart. Restart once the device reports
 `needs_restart`. The same holds for every `needs_restart` key here.
+
+On a device that stays connected, the first restart is the reconnect, so it
+takes two. `roomler restart` at the device does both, with no `roomler exec` and
+no elevation, at least 30 s apart. Taking a deny off costs the same two steps:
+`none` lands at the next reconnect, and the deny holds until the restart after
+it ([FR-132](fr/FR-132-zero-copy-by-default.md) §8).
 
 ## 7. What this does not do
 

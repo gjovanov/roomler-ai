@@ -462,11 +462,11 @@ impl Module for FleetState {
                 "/{agent_id}/external-access-policy",
                 put(external_access::set_policy),
             )
-            // FR-52 §5 — mint or rotate the connect code an outsider names
-            // this device by. Rotation IS the revocation story for a leak.
+            // FR-52 §5 — read, mint or rotate the connect code an outsider
+            // names this device by. Rotation IS the revocation story for a leak.
             .route(
                 "/{agent_id}/connect-code",
-                post(external_access::rotate_connect_code),
+                get(external_access::get_connect_code).post(external_access::rotate_connect_code),
             )
             // FR-52 P5 — bar a person from this device, or let them back.
             // MANAGE_AGENTS to bar, + REMOTE_CONTROL to let back (gate 2's rule).

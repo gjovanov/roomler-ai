@@ -173,6 +173,23 @@ pub fn next_backoff(current: Duration, ran: Duration) -> Duration {
     }
 }
 
+/// How long to sleep before the next tick: [`POLL`], or what is left of a
+/// respawn's backoff when that ends sooner. `retry_in` is `None` with no respawn
+/// pending and zero once its backoff is over.
+///
+/// A backoff only came due on a tick, so a worker's 1 s floor waited out a whole
+/// [`POLL`]: FR-43 AC11 measured 10.09 s from `kill -9` to the channel attached
+/// on 0.4.191, where a tick that lands on the backoff makes it about 6 s.
+///
+/// ⚠️ A zero is a plain tick, never a zero sleep. The arms that do not spawn
+/// leave `wait_until` set, so the loop would spin on one that has passed.
+pub fn next_tick_in(retry_in: Option<Duration>) -> Duration {
+    match retry_in {
+        Some(left) if !left.is_zero() => left.min(POLL),
+        _ => POLL,
+    }
+}
+
 /// FR-97 P6e-2 — how a worker ended, read off its wait status.
 ///
 /// The child the supervisor reaps is `sudo`, not the agent: `launchctl asuser`
@@ -1180,8 +1197,10 @@ mod imp {
                 }
             }
 
+            let tick =
+                next_tick_in(wait_until.map(|t| t.saturating_duration_since(Instant::now())));
             tokio::select! {
-                _ = tokio::time::sleep(POLL) => {}
+                _ = tokio::time::sleep(tick) => {}
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         if let Some((uid, child, _)) = worker.take() {
@@ -1587,6 +1606,31 @@ mod tests {
         );
         // The boundary itself counts as healthy.
         assert_eq!(next_backoff(BACKOFF_MAX, HEALTHY_RUN), BACKOFF_MIN);
+    }
+
+    /// FR-43 AC11: a healthy worker's 1 s floor is the whole wait. Rounded up to
+    /// the next poll, a worst-phase `kill -9` took 10.09 s to come back.
+    #[test]
+    fn a_backoff_shorter_than_a_poll_sets_the_next_tick() {
+        assert_eq!(next_tick_in(Some(BACKOFF_MIN)), BACKOFF_MIN);
+        assert_eq!(
+            next_tick_in(None),
+            POLL,
+            "nothing pending: an ordinary tick"
+        );
+        assert_eq!(
+            next_tick_in(Some(BACKOFF_MAX)),
+            POLL,
+            "a long backoff still reads the world every poll"
+        );
+    }
+
+    /// The arms that do not spawn leave `wait_until` behind, so a backoff that
+    /// is over must not become a zero sleep: the loop would spin at full speed
+    /// for as long as the Mac sits at the login window.
+    #[test]
+    fn a_backoff_already_over_is_an_ordinary_tick_not_a_spin() {
+        assert_eq!(next_tick_in(Some(Duration::ZERO)), POLL);
     }
 
     /// The 2026-08-30 outage in one assertion: a worker that dies on arrival
