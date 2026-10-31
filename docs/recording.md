@@ -614,10 +614,12 @@ into the daemon's log: a service has no stderr of its own to share.
   like any X session.
 - macOS is not a drop (P1e-mac): a root daemon has no WindowServer and
   refuses, and a SUPERVISED Mac records in its GUI worker, which is the
-  person already ("A supervised Mac" below). On a GNOME or
-  KDE **Wayland** session a recorder launched into it opens its own
-  ScreenCast portal session, so the portal may ask the person first (P0's
-  restore-token question).
+  person already ("A supervised Mac" below). On **GNOME Wayland** a recorder
+  launched into the session opens `org.gnome.Mutter.ScreenCast` itself, and
+  the person is asked nothing: read on Ubuntu 24.04 on 2026-10-31, as the
+  person and as root, `pointer: in_frame`, with GNOME's own sharing indicator
+  up. On **KDE Wayland** it opens its own ScreenCast portal session, so the
+  portal may ask the person first (P0's restore-token question, not read).
 
 ## 7. roomler-desktop — the Recordings view and the tray (P2b)
 
