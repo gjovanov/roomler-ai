@@ -126,6 +126,7 @@ describe('tutorial chapters (FR-12 content contract)', () => {
     'audit-exec',
     'audit-ssh',
     'audit-ssh-activity',
+    'audit-external',
     'tutorial',
   ])
 
