@@ -1081,17 +1081,24 @@ flowchart LR
 
   A paced row well above its back-to-back twin is the trap. ⚠️ A flat row speaks for its own size only, so read a
   size that leaves the thread mostly idle: on the same Mac a 1920×1080 frame doubles at a 30 fps cadence and a
-  3024×1964 frame does not move.
+  3024×1964 frame does not move. ⚠️ Compare rows at one `--bench-fps` only: at 60 a frame carries half the motion, so
+  it costs less whatever the clock does. ⚠️ Run one size per process: on a Windows laptop the H.264 rows of a run's
+  second, larger size read about twice as slow on any core, for a reason not yet found.
 
   `ROOMLERD_ENCODER_CLOCK=1` in front of the same two lines gives the other arm (on Windows,
   `$env:ROOMLERD_ENCODER_CLOCK='1'` first). Each is a one-shot process, so no daemon restarts, and a release carries
   both arms, so no test binary has to reach the host. Through `roomler exec` on a Mac, call
   `/usr/local/bin/roomlerd`: exec's `PATH` does not hold it.
 - **macOS, before the request.** MacBook-1 (Apple M5 Pro, AC, 0.4.190) has the trap in a milder form. A 1080p frame
-  goes from about 3.1 ms back to back to about 6.4 ms at a 30 fps cadence on H.264 and VP9-444, and to about 3.7 ms
-  at 60 fps. Every row at a 60 fps cadence fits its 16.7 ms, so here it costs about 3 ms of latency and no frames.
-  What the request does is still owed, on macOS and on Windows
-  ([FR-112 §9](fr/FR-112-software-encoding-at-60-fps.md#9-field-verification-log)).
+  goes from about 3.1 ms back to back to about 6.4 ms at a 30 fps cadence on H.264 and VP9-444. At a 60 fps cadence
+  every row still fits its 16.7 ms, so here it costs about 3 ms of latency and no frames.
+- **Windows, before the request.** On AC the gap is smaller again, and it is not core placement. At 1280×720 and a
+  30 fps cadence H.264 goes from 3.3 to 4.6 ms on a hybrid laptop and from 3.8 to 4.0 ms on a desktop, and VP9-444
+  from 3.7 to 6.8 ms and from 4.5 to 6.0 ms. At 1080p no p50 rises by more than about 10 %. The laptop's free-running
+  rows match the same rows pinned to its fast cores, so nothing parks the encoder on its slow cores on AC. A laptop
+  on battery is the case Microsoft documents, and it is not measured yet.
+- **What is owed:** what each request does, a laptop on battery, and a live session. Both before halves are in
+  [FR-112 §9](fr/FR-112-software-encoding-at-60-fps.md#9-field-verification-log).
 
 ### OpenH264's runtime settings (FR-112 P2b)
 
