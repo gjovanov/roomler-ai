@@ -8519,6 +8519,56 @@ mod tests {
         assert_eq!(back, on, "an absent reason stays absent");
     }
 
+    /// FR-85 AC10 — what a device may say about a remote recording is the
+    /// claim, never the recording. A frame that smuggles content beside the
+    /// claim (the bytes, a frame, a link to either) decodes to the claim
+    /// alone: the extra keys are dropped at the wire, before any handler, and
+    /// the server builds its row from these six fields only
+    /// (`agent_socket.rs`, `RecordingActivityEvent`).
+    #[test]
+    fn a_recording_activity_frame_carries_the_claim_and_nothing_else() {
+        let smuggled = serde_json::json!({
+            "t": "rc:recording.activity",
+            "session_id": "6ad0e0359836bb5de09f59f4",
+            "kind": "stopped",
+            "name": "Roomler Recording 2026-10-31 00-12-00.mp4",
+            "bytes": 5_759_995,
+            "duration_ms": 26_000,
+            "reason": "requested",
+            "content": "AAAAGGZ0eXBpc29t",
+            "data": [0, 0, 0, 24],
+            "frames": ["AAAAAWdkAB+s"],
+            "url": "https://example.invalid/r.mp4",
+            "recording_url": "https://example.invalid/r.mp4",
+        });
+        let msg: ClientMsg = serde_json::from_value(smuggled).unwrap();
+        assert!(
+            matches!(msg, ClientMsg::RecordingActivity { .. }),
+            "{msg:?}"
+        );
+        let back = serde_json::to_value(&msg).unwrap();
+        let mut keys: Vec<&str> = back
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "bytes",
+                "duration_ms",
+                "kind",
+                "name",
+                "reason",
+                "session_id",
+                "t"
+            ],
+            "only the claim crosses: {back}"
+        );
+    }
+
     #[test]
     fn ssh_response_carries_the_host_key_on_the_device_leg() {
         // `roomler ssh` originates on THIS leg, and the dialling device has no
