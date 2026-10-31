@@ -98,6 +98,7 @@
 <script setup lang="ts">
 import { computed, ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { ApiError } from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
 import { useTenantStore } from '@/stores/tenant'
 import { useNewsletterPref } from '@/composables/useNewsletterPref'
@@ -170,9 +171,9 @@ async function handleCreate() {
     router.push(`/tenant/${tenant.id}`)
   } catch (e) {
     const msg = e instanceof Error ? e.message : 'Failed to create workspace'
-    // tenants.slug is globally unique — put the dup-key case in words.
+    // tenants.slug is globally unique, and a taken slug is the only 409 here.
     showError(
-      msg.includes('duplicate') || msg.includes('E11000')
+      e instanceof ApiError && e.status === 409
         ? 'That slug is already taken — pick another'
         : msg,
     )

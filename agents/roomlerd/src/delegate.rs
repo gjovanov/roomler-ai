@@ -2067,6 +2067,33 @@ mod params_tests {
         }
     }
 
+    /// FR-85 AC7 — the supervised Mac's relay is one of the ways into a remote
+    /// recording, and it carries no sound choice at all: who is recording,
+    /// and the prompt window. The controller's computer-audio choice reaches
+    /// the worker over the `record` channel, whose start has no microphone
+    /// (`recording::remote`), and the worker starts it with `start_remote`,
+    /// which has no microphone parameter. A `microphone` written into this
+    /// frame is dropped on the worker's side.
+    #[test]
+    fn the_mac_relay_carries_no_sound_choice() {
+        let smuggled = serde_json::json!({
+            "controller_user_id": bson::oid::ObjectId::new().to_hex(),
+            "prompt_window_ms": 30_000,
+            "microphone": true,
+            "audio": true,
+        });
+        let r: DelegatedRecord = serde_json::from_value(smuggled).unwrap();
+        let back = serde_json::to_value(&r).unwrap();
+        let mut keys: Vec<&str> = back
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["controller_user_id", "prompt_window_ms"], "{back}");
+    }
+
     fn activity(session_id: bson::oid::ObjectId) -> ClientMsg {
         ClientMsg::RecordingActivity {
             session_id,
