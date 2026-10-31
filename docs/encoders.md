@@ -913,7 +913,7 @@ rung, never the target.
 | `rebuilds` | synchronous reopens, the inline arm |
 | `swaps` | background-rebuilt encoders adopted. Read it beside the two above: on a direct QSV session every rate move lands here and only here (FR-65) |
 | `dims_swaps` | reopens for a resolution change (FR-70 M2) |
-| `idr_count` | every keyframe the encoder emitted. Read against `dims_swaps` and the session's `PLI/FIR → forcing keyframe` lines (`peer.rs:840`) to isolate the rate-caused ones |
+| `idr_count` | every keyframe the encoder emitted. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:840`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
 **The read for any host** — the FR-62 A0 sweep (`app.rs:6295`):
