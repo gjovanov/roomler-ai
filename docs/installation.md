@@ -422,7 +422,7 @@ Details worth knowing:
 
 Every perMachine MSI run that is not an uninstall runs **RegisterService**
 (`roomlerd service install --as-service`, deferred, as LocalSystem,
-`agents/roomlerd/wix-perMachine/main.wxs:355`). One of the SystemContext actions
+`agents/roomlerd/wix-perMachine/main.wxs:361`). One of the SystemContext actions
 follows it (Enable, Disable or Keep), which restarts the service, and then the
 MSI's own StartServices. What happens to the service depends on the run (#3115):
 
@@ -430,8 +430,8 @@ MSI's own StartServices. What happens to the service depends on the run (#3115):
 |---|---|---|
 | A fresh install | nothing is running | created (`agents/roomlerd/src/win_service/lifecycle.rs:436`, `register`) |
 | A **reinstall** of the installed version: a maintenance run, such as the wizard over the same release or a hand-run `msiexec /i` of the same MSI | the SystemContext action's restart | **reconfigured in place**: `ChangeServiceConfigW`, the description and the recovery actions. It keeps running until that restart, and its `Environment` (the SystemContext switch) survives |
-| A **major upgrade** to a newer release: the auto-updater, the wizard, a hand-run install | Windows Installer's Restart Manager, at InstallValidate: `roomlerd.exe` is in use and the run has no UI, so it shuts down what holds it. Where Restart Manager is off (the "Prohibit use of Restart Manager" policy), the OLD product's `UnregisterService` does, because `MajorUpgrade` is `afterInstallInitialize` (`main.wxs:84`) and the old product is removed before the new files land | retired by the old binary, then created by the new one. If the old binary deleted it while it was still stopping (1072), the new one waits for the entry to go first |
-| An uninstall | `UnregisterService` (`main.wxs:547`) | retired (`lifecycle.rs:384`, `retire`) |
+| A **major upgrade** to a newer release: the auto-updater, the wizard, a hand-run install | Windows Installer's Restart Manager, at InstallValidate: `roomlerd.exe` is in use and the run has no UI, so it shuts down what holds it. Where Restart Manager is off (the "Prohibit use of Restart Manager" policy), the OLD product's `UnregisterService` does, because `MajorUpgrade` is `afterInstallInitialize` (`main.wxs:90`) and the old product is removed before the new files land | retired by the old binary, then created by the new one. If the old binary deleted it while it was still stopping (1072), the new one waits for the entry to go first |
+| An uninstall | `UnregisterService` (`main.wxs:553`) | retired (`lifecycle.rs:384`, `retire`) |
 
 **The waits are derived from the host's own shutdown**, so the two cannot drift
 apart (`lifecycle.rs:81`, pinned by the test
@@ -458,7 +458,7 @@ Win11 laptop in the field, 3.4–6.2 s on a vmtest cell) went like this:
 
 An MSI rollback never re-creates the service. No action has a rollback partner
 that would, and the service is not in the MSI's `ServiceInstall` table. So
-`RegisterService` stays `Return="ignore"` on purpose (`main.wxs:340`): under
+`RegisterService` stays `Return="ignore"` on purpose (`main.wxs:346`): under
 `"check"`, a failure there would roll a major upgrade back to the old files
 with no service at all.
 
