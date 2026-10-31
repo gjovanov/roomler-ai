@@ -50,6 +50,10 @@ pub const ROUTE: &str = "/api/setup/features";
 pub struct SetupFeatures {
     /// `/api/pair/*` is mounted: the browser pairing may be offered.
     pub pairing: bool,
+    /// The server said `"pairing": false` in so many words (AC10). Unlike a
+    /// `false` in [`Self::pairing`], never an older server, a timeout or an
+    /// error page, so this and only this takes the pairing card away.
+    pub pairing_off: bool,
     /// B1-s2 — the released wizard installs the full daemon on Linux, and
     /// the operator has said so: the Linux daemon cards may appear.
     pub wizard_linux_daemon: bool,
@@ -83,6 +87,7 @@ impl SetupFeatures {
     pub fn view(self, os: HostOs) -> FeaturesView {
         FeaturesView {
             pairing: self.pairing,
+            pairing_off: self.pairing_off,
             daemon_offered: self.daemon_offered(os),
         }
     }
@@ -95,6 +100,8 @@ impl SetupFeatures {
 pub struct FeaturesView {
     /// `/api/pair/*` is mounted.
     pub pairing: bool,
+    /// [`SetupFeatures::pairing_off`].
+    pub pairing_off: bool,
     /// [`SetupFeatures::daemon_offered`] for this OS.
     pub daemon_offered: bool,
 }
@@ -121,6 +128,7 @@ pub fn parse(status: u16, body: &[u8]) -> SetupFeatures {
     let flag = |key: &str| object.get(key).and_then(serde_json::Value::as_bool) == Some(true);
     SetupFeatures {
         pairing: flag("pairing"),
+        pairing_off: object.get("pairing").and_then(serde_json::Value::as_bool) == Some(false),
         wizard_linux_daemon: flag("wizard_linux_daemon"),
         wizard_macos_daemon: flag("wizard_macos_daemon"),
         wizard_unix_daemon: flag("wizard_unix_daemon"),
@@ -178,6 +186,7 @@ mod tests {
 
     const ON: SetupFeatures = SetupFeatures {
         pairing: true,
+        pairing_off: false,
         wizard_linux_daemon: true,
         wizard_macos_daemon: true,
         wizard_unix_daemon: true,
@@ -314,6 +323,7 @@ mod tests {
             linux_only.view(HostOs::Linux),
             FeaturesView {
                 pairing: true,
+                pairing_off: false,
                 daemon_offered: true
             }
         );
@@ -321,6 +331,7 @@ mod tests {
             linux_only.view(HostOs::Macos),
             FeaturesView {
                 pairing: true,
+                pairing_off: false,
                 daemon_offered: false
             }
         );
@@ -328,6 +339,30 @@ mod tests {
             SetupFeatures::default().view(HostOs::Linux),
             FeaturesView::default()
         );
+    }
+
+    /// AC10 — only the server's own `false` takes the pairing card away. An
+    /// answer that says nothing about pairing leaves the start to decide, so a
+    /// blink of the network never hides it from a server that has it.
+    #[test]
+    fn only_the_server_s_own_word_turns_pairing_off() {
+        assert!(parse(200, br#"{"pairing": false}"#).pairing_off);
+        assert!(
+            parse(200, br#"{"pairing": false}"#)
+                .view(HostOs::Windows)
+                .pairing_off
+        );
+        let not_its_word: [(u16, &[u8]); 6] = [
+            (200, br#"{"pairing": true}"#),
+            (200, br#"{"wizard_linux_daemon": true}"#),
+            (200, br#"{"pairing": "false"}"#),
+            (200, b"not json"),
+            (404, br#"{"pairing": false}"#),
+            (503, b""),
+        ];
+        for (status, body) in not_its_word {
+            assert!(!parse(status, body).pairing_off, "{status}");
+        }
     }
 
     /// Absent, unmounted, an error page, not JSON, not an object: every one

@@ -887,7 +887,7 @@ pub async fn poll(
         now.timestamp_millis(),
     ) {
         PollDecision::Denied => status_json("access_denied"),
-        PollDecision::Gone => status_json("expired_token"),
+        PollDecision::Gone => gone(&state, &row, ip).await,
         PollDecision::Expired => {
             expire_once(&state, &row).await;
             status_json("expired_token")
@@ -1359,6 +1359,22 @@ pub async fn deny(
         .record(&state)
         .await;
     Json(json!({ "denied": true })).into_response()
+}
+
+/// A poll of a pairing that is over. After a delivery it is the refusal the
+/// loser of `deliver`'s CAS gets, on the trail once per source per hour; the
+/// answer stays the one a swept row gets. An expired row wrote its `expire`.
+async fn gone(state: &FleetState, row: &DevicePairing, ip: Option<IpAddr>) -> Response {
+    if matches!(row.status, PairingStatus::Delivered) {
+        Audit::new("refuse")
+            .refused("already_delivered")
+            .anonymous()
+            .pairing(row)
+            .ip(ip)
+            .record(state)
+            .await;
+    }
+    status_json("expired_token")
 }
 
 #[cfg(test)]
