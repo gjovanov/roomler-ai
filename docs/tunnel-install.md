@@ -167,14 +167,19 @@ sudo dpkg -i /tmp/roomler-cli.deb
 > `linux-aarch64`. The arm64 build is made on Ubuntu 22.04, so it needs glibc
 > 2.35 or later, as the x86_64 agent does.
 
-> ⚠️ **On Debian 12 and Ubuntu 22.04 this `.deb` cannot install** (#2472).
-> `tunnel-v0.3.0-rc.266` depends on `libssl3t64`, the name Debian 13 and
-> Ubuntu 24.04 use; these two call it `libssl3`. `dpkg -i` leaves the package
-> unconfigured, and `apt-get -f install` removes it again. Use the plain tarball
-> below. `install.sh --role tunnel` checks that `roomler` runs and falls back
-> to the tarball on its own. The CLI now declares both names
-> (`agents/roomler-cli/Cargo.toml`), so from tunnel-v0.4.149 on, the `.deb` is
-> built to install on both generations.
+> ⚠️ **On x86_64 Debian 12 and Ubuntu 22.04 the published CLI does not start**
+> (#3217). tunnel-v0.4.149 was built on Ubuntu 24.04, so its binary needs glibc
+> 2.39: the `.deb` installs, and `roomler` stops with `version 'GLIBC_2.39' not
+> found`. The tarball below is the same binary, so neither it nor
+> `install.sh --role tunnel`'s fallback helps. The arm64 build is not affected.
+> The next tunnel release is built on Ubuntu 22.04, as the arm64 one is. Built
+> there it needs glibc 2.34, which its package declares, and it starts on both.
+
+> ⚠️ **On those two, `tunnel-v0.3.0-rc.266` cannot install at all** (#2472). It
+> depends on `libssl3t64`, the name Debian 13 and Ubuntu 24.04 use; these two
+> call it `libssl3`. `dpkg -i` leaves the package unconfigured, and
+> `apt-get -f install` removes it again. The CLI has declared both names since
+> tunnel-v0.4.149 (`agents/roomler-cli/Cargo.toml`).
 
 **Linux (plain tarball):**
 
