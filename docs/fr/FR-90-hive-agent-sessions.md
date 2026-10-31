@@ -57,7 +57,7 @@ it.
 - **The gaps are measured, not guessed.** `RunAs` sets no working directory and only `TERM`
   (`agents/roomlerd/src/pty/unix.rs:150`); on Windows it reaches only the console user and will not
   ask for credentials (`agents/roomlerd/src/exec.rs:509-514`); a root daemon's LocalAPI socket is
-  `0600`, so a non-root process can't reach it (`crates/localapi/src/lib.rs:4059-4077`); tunnel SOCKS5
+  `0600`, so a non-root process can't reach it (`crates/localapi/src/lib.rs:4094-4112`); tunnel SOCKS5
   has no authentication (`crates/tunnel-core/src/socks5.rs:3`) and a daemon-originated flow is
   attributed to the device owner (`crates/tunnel-core/src/policy.rs:29-63`); `SplitTun` intercepts one
   port and SSH is its only caller (`crates/tunnel-core/src/overlay/split_tun.rs:92-126`); fleet exec
@@ -2662,7 +2662,7 @@ sequenceDiagram
 
 | Piece | Design |
 |---|---|
-| who asks | the person, through the daemon's own LocalAPI endpoint, never the person socket. `Connect` is an administrative verb like `CreateForward` (`crates/localapi/src/lib.rs:3133`), put on the refusing side of `person_may`'s exhaustive match by hand (`:3101`) |
+| who asks | the person, through the daemon's own LocalAPI endpoint, never the person socket. `Connect` is an administrative verb like `CreateForward` (`crates/localapi/src/lib.rs:3172`), put on the refusing side of `person_may`'s exhaustive match by hand (`:3129`) |
 | who it acts as | **the device's owner** (decision 23, decided). The vault reads the owner from the device's row, never from the frame, as `rc:ssh.request` does (`crates/modules/network/src/agent_arms.rs:161`, `:211`). A device whose row is gone or removed has no principal and gets nothing |
 | which organization | the device's primary enrollment's, where the lease client lives, as for every vault ask. A secondary organization's secrets are out of reach this way |
 | the call | `roomler connect <handle> --engine <e> --upstream <u> [--ca <handle>] [--ttl <s>]`, the arguments a session's `vault_connect` takes (`docs/vault.md` §19): a structured secret by its path or this organization's RRN, an engine, and the upstream exactly as the secret's `audiences` names it |
@@ -2688,7 +2688,7 @@ sequenceDiagram
   names, and a new action would escape it. So P3-9-1 seeds its twin for `secret:connect`, in
   the same change as the action.
 - ⚠️ **Never on the person socket.** A system install's person socket serves whoever sits at the
-  screen (`crates/localapi/src/lib.rs:3080`), who need not be the device's owner. Serving
+  screen (`crates/localapi/src/lib.rs:3106`), who need not be the device's owner. Serving
   `roomler connect` there would lend the owner's vault to anyone at the seat. On a system install
   it takes the daemon's own endpoint: an administrator, or root.
 - ⚠️ **The owner from the row, never from the frame.** A compromised device can ask for what its
@@ -2745,7 +2745,7 @@ design above:
   (`HiveUpdateHold`). `roomler connect`'s foreground is that connection, so Ctrl-C, a killed
   command or a closed terminal ends the endpoint with no verb of its own. The command asks every
   5 s on the same connection where its endpoint stands, and only that connection may ask
-  (`crates/localapi/src/lib.rs:3563`).
+  (`crates/localapi/src/lib.rs:3598`).
 - **Who may ask is decision 26**, found writing P3-9-2a. The design's "an administrator, or root"
   does not hold on Windows, where the daemon's pipe admits every interactive user. Built as
   recommended, pending the operator's word.
@@ -5667,7 +5667,7 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
     the daemon's own endpoint: an administrator, or root" (§3e "P3-9, `roomler connect`, as
     designed"), holds where the system daemon's socket is root's, as on Linux and macOS. It does
     not hold on Windows. There the daemon's pipe admits every interactive user, an RDP session's
-    included (`crates/localapi/src/lib.rs:3727`, `(A;;GA;;;IU)`), and `roomler exec`,
+    included (`crates/localapi/src/lib.rs:3762`, `(A;;GA;;;IU)`), and `roomler exec`,
     `roomler ssh` and `config set` act for them today. Nothing in P3-9-2a depends on the answer;
     P3-9-2b's verb does.
     - *Recommended: hold `roomler connect` to what the design said.* On Windows that is SYSTEM, an
@@ -5685,7 +5685,7 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       - What it costs: an administrator over RDP cannot, and whoever sits at a shared machine's
         screen can.
     - *Built in P3-9-2b as recommended, pending the operator's word.* A wider answer changes one
-      gate, `peer_may_connect` (`crates/localapi/src/lib.rs:2347`), and its test.
+      gate, `peer_may_connect` (`crates/localapi/src/lib.rs:2353`), and its test.
 27. **What a session's egress proxy allows, before knowhow** (P3b-1), for the operator to confirm
     (P3b-0, §3e "P3b, `placeholder` egress, as designed"). The design's §7.2 takes the allowlist
     from the session's role and the knowhow audiences it may reach, and knowhow is P4. Nothing in

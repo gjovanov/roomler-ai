@@ -881,7 +881,7 @@ One MCP server per session, reached through `roomler mcp` (a stdio shim the harn
 starts) over a **per-session endpoint**: a Unix socket owned by the mapped account
 (`0600` under a `0700` directory) or a named pipe whose DACL names only that account's
 SID. It can't be the main LocalAPI endpoint: on a root daemon that socket is root-only
-(`crates/localapi/src/lib.rs:4126-4144`), and on Windows the pipe admits every
+(`crates/localapi/src/lib.rs:4161-4179`), and on Windows the pipe admits every
 interactive user and most verbs trust the pipe alone (`lib.rs:1127-1129`).
 
 | Tool or resource | Does | Gate |

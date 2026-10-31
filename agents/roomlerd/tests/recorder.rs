@@ -21,7 +21,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use roomlerd::capture::pointer::{PointerSample, PointerShape, PointerSource, RecordedPointer};
-use roomlerd::capture::{Damage, Frame, PixelFormat, ScreenCapture};
+use roomlerd::capture::{
+    CaptureUnavailable, CaptureUnavailableCode, Damage, Frame, NoopCapture, PixelFormat,
+    ScreenCapture,
+};
 use roomlerd::encode::VideoEncoder;
 use roomlerd::encode::openh264_backend::Openh264Encoder;
 use roomlerd::recording::annexb::length_prefixed_to_annexb;
@@ -628,6 +631,34 @@ async fn no_frame_refuses_the_start() {
         err.downcast_ref::<StartError>().unwrap().refusal,
         StartRefusal::NoFrame
     );
+}
+
+/// FR-85 P2e — a capturer that could not open knows why, and the start says so
+/// at once. Waiting for a frame that cannot come hid it: a recorder launched
+/// with no `DISPLAY` answered "no frame from the capture backend" ten seconds
+/// later, and the reason stayed in the child's own log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capturer_that_could_not_open_says_why() {
+    let dir = scratch();
+    let mut opts = options(dir.path());
+    opts.first_frame_timeout = Duration::from_secs(60);
+    let fps = opts.fps;
+    let cap = NoopCapture::unavailable(CaptureUnavailable::new(
+        CaptureUnavailableCode::NoDisplay,
+        "no primary display: connection refused",
+    ));
+    let (_stop_tx, stop_rx) = watch::channel(None);
+    let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        recorder::run(opts, Box::new(cap), openh264_factory(fps), stop_rx, ev_tx),
+    )
+    .await
+    .expect("refused at once, not after the wait for a first frame");
+    let err = result.unwrap_err();
+    let start = err.downcast_ref::<StartError>().unwrap();
+    assert_eq!(start.refusal, StartRefusal::NoFrame);
+    assert!(start.detail.contains("connection refused"), "{start}");
 }
 
 // ── audio (FR-85 P1c) ────────────────────────────────────────────────────────
