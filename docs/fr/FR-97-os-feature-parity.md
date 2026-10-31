@@ -1044,7 +1044,7 @@ test of the SIGKILL property itself.
     until the clean shutdown is on disk (`session_end.rs:220`). A console handler hears no sign-out once `user32` is
     loaded.
   - Restart Manager's `ENDSESSION_CLOSEAPP`, `WM_CLOSE` and `service uninstall` are never a leave (D15).
-  - `service stop --as-service` stops the SCM service (`environment.rs:355`).
+  - `service stop --as-service` stops the SCM service (`environment.rs:440`).
   - Kill switch: `ROOMLERD_SESSION_END=0`.
   - The design is not the companion setting the event, as first planned (D15). `docs/ephemeral-nodes.md` has the
     per-user section.
@@ -1268,7 +1268,7 @@ model on Windows, so the three agree on what the mode means.
 
 - Unit tests wherever the logic can run on every OS (FR-43's practice: keep `decide()` out of `cfg(macos)`), and a
   macOS `cargo test` lane for `tunnel-core` with `overlay-l3`. Today macOS only compiles, plus the real-utun kernel
-  test (`ci.yml:1491-1518`).
+  test (`ci.yml:1496-1523`).
 - Extend `macos_kernel_tests` on the runner's real utun: an exemption pinned and read back, the pf anchor loaded and
   flushed, the resolver keys installed and purged.
 - Field: the `vmtest` macOS, Win11 (Home and Pro) and Ubuntu cells; one exit cell per (client OS × exit OS) pair;

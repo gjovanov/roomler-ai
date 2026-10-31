@@ -916,7 +916,7 @@ rung, never the target.
 | `idr_count` | every keyframe the encoder emitted. Read against `dims_swaps` and the session's `PLI/FIR → forcing keyframe` lines (`peer.rs:840`) to isolate the rate-caused ones |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
-**The read for any host** — the FR-62 A0 sweep (`app.rs:6283`):
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6295`):
 
 ```
 roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
@@ -929,11 +929,11 @@ bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
 reads taught it:
 
 - **The rate change is charged with the keyframe on the rung's first output frame**
-  (`sweep_attribute_idrs`, `app.rs:6544`), not on frame 0. AMF answers the frame that
+  (`sweep_attribute_idrs`, `app.rs:6556`), not on frame 0. AMF answers the frame that
   fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
   "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
   for a backend that rebuilds on every move.
-- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6573`). Every
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6585`). Every
   backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
   CBR (`select_rc_mode` takes the CBR branch because the session opens with
   `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst

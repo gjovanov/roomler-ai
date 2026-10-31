@@ -140,8 +140,8 @@ days. So before every non-tag build, `seed-cache-restore` runs a GC step
 | The four daemon jobs (`.deb` ×2, MSI, `.pkg`) | 4,500 MB | `release-agent.yml:393`, `:1129`, `:1604`, `:2575` |
 | The wizard's macOS universal job (two triples) | 5,000 MB | `release-setup.yml:401` |
 | CI caches in the release-asset store (`ci-seed-restore`), default | 4,000 MB | `ci-seed-restore/action.yml:29` |
-| The integration shards, `ci.yml`'s macOS overlay check and its Windows clippy lane | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1363`, `:1610` |
-| `ci.yml`'s Linux lanes (wave 34): unit, lint, agent; recorder-audio, ffmpeg-encoder, recording-ffmpeg, profiles | 16,000, 10,000, 7,000; 5,000 each | `ci.yml:504`, `:231`, `:655`; `:1170`, `:1924`, `:2104`, `:2596` |
+| The integration shards, `ci.yml`'s macOS overlay check and its Windows clippy lane | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1368`, `:1615` |
+| `ci.yml`'s Linux lanes (wave 34): unit, lint, agent; recorder-audio, ffmpeg-encoder, recording-ffmpeg, profiles | 16,000, 10,000, 7,000; 5,000 each | `ci.yml:504`, `:231`, `:655`; `:1170`, `:1929`, `:2109`, `:2602` |
 
 **A cold build has to fit under its cap.** If it does not, every restore drops the cache, every
 run builds cold, and each master run publishes the same size again, so the GC never recovers.
@@ -155,7 +155,11 @@ it publishes leaves the next run cold as well, and that one is cut off the same 
 first master run built the unit lane cold (1,795 crates) and hit the 30-minute ceiling at
 30 min 15 s, with the second part of its 2.6 GB archive still uploading. That part landed two
 seconds after the cut. The unit and lint lanes now allow 45 and 40 minutes (`ci.yml:474`,
-`:159`), about 1.5 times their measured cold runs (FR-6 wave 36).
+`:159`), about 1.5 times their measured cold runs (FR-6 wave 36). The macOS overlay check
+allows 35 (`ci.yml:1340`): its cold run took 22 min 33 s on 2026-10-30, after its cache crossed
+its 6,000 MB cap, against a 25-minute ceiling (FR-6 wave 37). Every other `ci.yml` lane with a
+cold run on record allows about 1.5 times it or more. Windows sessions and the FR-85 recorder
+lane have none.
 
 The Linux lanes' caps began as estimates, about 1.5 times each lane's old Actions-cache archive
 at the 4.3× unpack ratio the integration lane measures (its 1,181 MB asset restores to
@@ -221,6 +225,7 @@ closes it (`:3742`).
 | 34 (#3157) | `ci.yml`'s seven Linux cargo caches move from the Actions cache to `seed-cache`, the largest in parts | a download the Actions cache refuses ("Egress is over the account limit") no longer builds a lane cold (the unit lane: 27 min against ~8) |
 | 35 (#3170) | a docs-only PR skips the twelve heavy jobs; a push to master still runs every job | a docs PR's CI runs the audits and the frontend build, not 20 jobs (22 of 60 runs on 2026-10-30 were docs, each running all 20 jobs, up to 44 min) |
 | 36 (#3170) | the unit and lint lanes' job ceilings rise from 30 to 45 and 40 min | a cold run of either lane finishes its publish (wave 34's first cold unit run was cut off mid-upload at 30 min 15 s) |
+| 37 (#3192) | the macOS overlay check's ceiling rises from 25 to 35 min | its cold run (22 min 33 s, measured) finishes its publish |
 
 What is left is runner queueing, not compiling. On 0.4.182 and 0.4.183 the `.pkg` waited
 about 8 minutes for a macOS runner, and tag to publish took 13–16 minutes. On 0.4.184 and

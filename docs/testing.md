@@ -26,7 +26,7 @@ flowchart TB
 | Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux |
 | Agent overlay tests | add `--features overlay-l3` | ⚠️ feature-gated — the default `--lib` run silently skips them |
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
-| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2539`) |
+| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2544`) |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
 | Phone-width smoke | `cd ui && bun run test:phone` | nothing — the built SPA with every `/api` call mocked (`ui/e2e-phone/`) |
@@ -564,7 +564,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1774`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7407`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1774`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7419`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |

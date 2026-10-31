@@ -429,8 +429,10 @@ Details worth knowing:
   **leaving it out keeps the mode the machine was last switched to** (#1727).
   The installer runs `roomlerd keep-system-context`, which follows the product's
   own record of the last `enable-system-context` / `disable-system-context`
-  (`%PROGRAMDATA%\roomler\last-system-context-attempt.json`). Every install
-  recreates the service, so the switch itself never survives one.
+  (`%PROGRAMDATA%\roomler\last-system-context-attempt.json`). A major upgrade
+  re-creates the service, so the switch itself does not survive one; since
+  #3115 a reinstall of the same version keeps the service, switch included
+  ([below](#what-an-msi-run-does-to-the-roomler-service)).
   ⚠️ Before #1727, leaving it out switched SystemContext **off**: the service
   kept running, the worker could no longer find its enrollment and exited in a
   loop, and the device went offline. To rescue a host in that state, run
@@ -473,6 +475,97 @@ Details worth knowing:
   placed deliberately is left alone — #1698,
   [`overlay-wfp.md`](./overlay-wfp.md)). The perUser flavour cannot elevate
   and is unchanged.
+
+### What an MSI run does to the `Roomler` service
+
+Every perMachine MSI run that is not an uninstall runs **RegisterService**
+(`roomlerd service install --as-service`, deferred, as LocalSystem,
+`agents/roomlerd/wix-perMachine/main.wxs:355`). One of the SystemContext actions
+follows it (Enable, Disable or Keep), which restarts the service, and then the
+MSI's own StartServices. What happens to the service depends on the run (#3115):
+
+| The run | What stops the service first | What happens to the `Roomler` entry |
+|---|---|---|
+| A fresh install | nothing is running | created (`agents/roomlerd/src/win_service/lifecycle.rs:436`, `register`) |
+| A **reinstall** of the installed version: a maintenance run, such as the wizard over the same release or a hand-run `msiexec /i` of the same MSI | the SystemContext action's restart | **reconfigured in place**: `ChangeServiceConfigW`, the description and the recovery actions. It keeps running until that restart, and its `Environment` (the SystemContext switch) survives |
+| A **major upgrade** to a newer release: the auto-updater, the wizard, a hand-run install | Windows Installer's Restart Manager, at InstallValidate: `roomlerd.exe` is in use and the run has no UI, so it shuts down what holds it. Where Restart Manager is off (the "Prohibit use of Restart Manager" policy), the OLD product's `UnregisterService` does, because `MajorUpgrade` is `afterInstallInitialize` (`main.wxs:84`) and the old product is removed before the new files land | retired by the old binary, then created by the new one. If the old binary deleted it while it was still stopping (1072), the new one waits for the entry to go first |
+| An uninstall | `UnregisterService` (`main.wxs:547`) | retired (`lifecycle.rs:384`, `retire`) |
+
+**The waits are derived from the host's own shutdown**, so the two cannot drift
+apart (`lifecycle.rs:81`, pinned by the test
+`the_stop_wait_covers_the_hosts_whole_shutdown`):
+
+| Bound | Value | What it covers |
+|---|---|---|
+| `HOST_STOP_BOUND` | 14.5 s | the supervisor's whole shutdown (`agents/roomlerd/src/win_service/supervisor.rs:671`: a 0.5 s poll tick, the worker's 8 s graceful budget at `:659`, the terminate and netd's reap at 1.5 s each), then the 3 s the host process gives its runtime after it reports STOPPED (`agents/roomlerd/src/runtime_exit.rs:30`) |
+| `STOP_WAIT_BOUND` | 29 s | twice that, for a loaded box. A retire waits this long for STOPPED **and** for the host process to exit (`lifecycle.rs:275`), and only then deletes |
+| `GONE_WAIT_BOUND` | 10 s | after the delete, for the SCM to answer 1060. A handle held elsewhere (services.msc on the service's properties) outlasts it, and the retire says so |
+| `MARKED_WAIT_BOUND` | 39 s | how long an install waits for an entry that an earlier delete marked (1072) before it creates the service |
+
+⚠️ Up to 0.4.189, every run but an uninstall deleted the service and created it
+again, after waiting at most **5 s** for its stop. That is less than the
+worker's own 8 s graceful budget. A healthy stop that took longer (7.8 s on a
+Win11 laptop in the field, 3.4–6.2 s on a vmtest cell) went like this:
+
+1. `DeleteService` only *marked* the service, which was still stopping;
+2. `CreateService` answered 1072 (`ERROR_SERVICE_MARKED_FOR_DELETE`);
+3. EnableSystemContext failed on the missing service, and the MSI rolled back
+   (1603);
+4. when the host finally exited, the SCM removed the marked entry. The machine
+   had **no service and no daemon** until someone installed again.
+
+An MSI rollback never re-creates the service. No action has a rollback partner
+that would, and the service is not in the MSI's `ServiceInstall` table. So
+`RegisterService` stays `Return="ignore"` on purpose (`main.wxs:340`): under
+`"check"`, a failure there would roll a major upgrade back to the old files
+with no service at all.
+
+The env-block paths now name the service that is actually missing (`the Roomler
+service is not registered`, or `… is marked for deletion (1072)`). They used to
+fall back to the service's pre-rename name whenever `Roomler` was missing, and
+failed on the registry key of a service retired months before
+(`agents/roomlerd/src/win_service/environment.rs:179`,
+`agents/roomlerd/src/win_service/mod.rs:116`).
+
+```mermaid
+sequenceDiagram
+    participant W as worker (updater)
+    participant M as msiexec
+    participant Old as old roomlerd.exe
+    participant New as new roomlerd.exe
+    participant S as SCM
+    W->>M: msiexec /i new.msi /qn, the service still running
+    Note over W: the worker exits 0, the host stays up and spawns a fresh worker
+    M->>S: InstallValidate, Restart Manager stops it (roomlerd.exe is in use)
+    M->>Old: UnregisterService, the old product's removal
+    Old->>S: wait for STOPPED (5 s up to 0.4.189, 29 s after), delete
+    M->>New: RegisterService
+    New->>S: open answers 1072 while the old host still stops
+    New->>S: wait for 1060 (up to 39 s), then create
+    M->>New: EnableSystemContext writes the Environment and restarts it
+    M->>S: StartServices
+```
+
+**Auto-updates and upgrades** (the open question in #3115). The updater does
+not stop the service before it runs msiexec. `spawn_installer_with_watch`
+(`agents/roomlerd/src/updater.rs:1891`) launches `msiexec /i … /qn` elevated
+(`:2236`, `:2636`) while the service runs; the worker that launched it exits 0,
+and its host stays up (`:593`). Measured on a vmtest Win11 cell, released code,
+with each stop held to the field's 7.8 s:
+
+| Run | The first Stop came from | Released code |
+|---|---|---|
+| a major upgrade, Restart Manager on | Restart Manager at InstallValidate, 10.3 s before the old product's `UnregisterService` | completed |
+| a major upgrade, Restart Manager off by policy | the old `UnregisterService`, which deleted the service 6.5 s before its host stopped | completed by about 40 ms: the new RegisterService's own 5 s wait covered the rest |
+| a reinstall of the same version | `RegisterService`, after its 5 s | **1603, and no service**: the field case |
+
+So an upgrade had a head start that a reinstall lacked: it survived stops of
+about 11 s (Restart Manager off) to 15 s (on), where a reinstall survived 5 s.
+Since #3115 no run deletes a service before it has stopped and its host has
+exited, and an install waits out an entry that an older binary deleted early.
+⚠️ `OpenService` can succeed on such a marked entry (the upgrade above opened
+one); only a change is refused with 1072. So the install asks with a change that
+changes nothing (`lifecycle.rs:242`, `is_marked`), never by the open alone.
 
 ## Linux
 
