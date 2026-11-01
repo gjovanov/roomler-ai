@@ -39,7 +39,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
   (`release-agent.yml:2393-2416`) — several docs still say it does not.
 - There is **no video decoder anywhere on the agent side** (grep-confirmed). The
   browser decodes, through WebCodecs, and probes per codec string
-  (`ui/src/composables/useRemoteControl.ts:2958-2988`).
+  (`ui/src/composables/useRemoteControl.ts:2960-2990`).
 
 ### The size question, measured
 
@@ -161,7 +161,7 @@ flowchart LR
    format, i18n keys, each impossible entry greyed with the reason as its subtitle.
    Auto chroma follows Priority (sharper ⇒ 4:4:4 when a cell exists; latency and
    balanced ⇒ 4:2:0). Auto codec under 4:4:4 ranks HEVC → VP9 → H.264 → libvpx; under
-   4:2:0 it keeps today's rank (`useRemoteControl.ts:2397-2502`). Explicit chroma
+   4:2:0 it keeps today's rank (`useRemoteControl.ts:2399-2504`). Explicit chroma
    overrides Priority; Priority only ever fills an Auto. The backend is never in the
    picker: it is a host fact, shown in the pill (FR-26 format).
 6. **Decode gating.** Pessimistic on the agent (probed cells only), optimistic on the

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { AgentCapabilities } from '@/stores/agents'
 import {
@@ -16,10 +18,15 @@ import {
   rememberCellFailure,
   rememberedCellFailures,
   resolveChroma,
+  transportForSession,
   PICKER_CHROMAS,
   PICKER_CODECS,
 } from '@/composables/videoCells'
-import { RC_CODEC_CHOICES } from '@/composables/useRemoteControl'
+import {
+  RC_CODEC_CHOICES,
+  codecChoiceToSettings,
+  pickAutoTransport,
+} from '@/composables/useRemoteControl'
 
 const base: AgentCapabilities = {
   codecs: [],
@@ -327,5 +334,114 @@ describe('FR-77 P3b — H.264 4:4:4 and hardware VP9 4:4:4 cells', () => {
     expect(choiceFromPicker('h264', 'yuv444')).toBe('h264-444')
     expect(choiceFromPicker('h264', 'yuv420')).toBe('h264')
     expect(pickerFromChoice('h264-444')).toEqual({ codec: 'h264', chroma: 'yuv444' })
+  })
+})
+
+// #3167 — the agent drops a transport it does not offer to the RTP track and
+// tells nobody, and the viewer ignores that track while it holds a DataChannel
+// transport: a connected session, a hidden <video> playing, a black canvas.
+describe('transportForSession (#3167)', () => {
+  /** The hello of the Intel laptop the issue was found on. */
+  const INTEL_NO_HEVC = {
+    transports: ['data-channel-av1', 'data-channel-h264', 'data-channel-vp9-444'],
+    hw_encoders: [
+      'openh264-sw',
+      'mf-h264-hw',
+      'ffmpeg-vp9_qsv',
+      'ffmpeg-av1_qsv',
+      'ffmpeg-h264_qsv',
+      'libvpx-vp9-444-sw',
+    ],
+  }
+  /** A VAAPI lab host: HEVC and H.264, no AV1. */
+  const VAAPI_NO_AV1 = {
+    transports: ['data-channel-hevc', 'data-channel-h264', 'data-channel-vp9-444'],
+    hw_encoders: ['openh264-sw', 'ffmpeg-hevc_vaapi', 'ffmpeg-h264_vaapi', 'libvpx-vp9-444-sw'],
+  }
+  /** A server with software encoders only. */
+  const SOFTWARE_ONLY = {
+    transports: ['data-channel-vp9-444'],
+    hw_encoders: ['openh264-sw', 'libvpx-vp9-444-sw'],
+  }
+
+  it('keeps a pick the device offers', () => {
+    expect(transportForSession('data-channel-av1', INTEL_NO_HEVC)).toBe('data-channel-av1')
+    expect(transportForSession('data-channel-hevc', VAAPI_NO_AV1)).toBe('data-channel-hevc')
+    expect(transportForSession('data-channel-vp9-444', SOFTWARE_ONLY)).toBe('data-channel-vp9-444')
+  })
+
+  it('runs the auto rank for a pick the device does not offer, whichever codec', () => {
+    expect(transportForSession('data-channel-hevc', INTEL_NO_HEVC)).toBe('auto')
+    expect(transportForSession('data-channel-hevc', SOFTWARE_ONLY)).toBe('auto')
+    expect(transportForSession('data-channel-av1', VAAPI_NO_AV1)).toBe('auto')
+    expect(transportForSession('data-channel-av1', SOFTWARE_ONLY)).toBe('auto')
+    expect(
+      transportForSession('data-channel-vp9-444', {
+        transports: ['data-channel-h264'],
+        hw_encoders: ['openh264-sw'],
+      }),
+    ).toBe('auto')
+  })
+
+  it('lands on a codec the host can do, not on the RTP track', () => {
+    // RTP is why this is not H.264's fallback: an unfiltered offer lets the
+    // agent bind the track to AV1, and this host's AV1 is FFmpeg only, which
+    // the RTP path cannot open. The session would be just as black.
+    expect(transportForSession('data-channel-hevc', INTEL_NO_HEVC)).toBe('auto')
+    const rank = pickAutoTransport({
+      agentTransports: INTEL_NO_HEVC.transports,
+      agentHwEncoders: INTEL_NO_HEVC.hw_encoders,
+      viewerAv1Hw: true,
+      viewerHevcHw: true,
+      viewerHevcDecodable: true,
+      viewerVp9Hw: true,
+      viewerVp9Decodable: true,
+      viewerH264Hw: true,
+    })
+    expect(rank.transport).toBe('data-channel-av1')
+  })
+
+  it('reads the transport, not the cell: a Media Foundation HEVC has no data channel', () => {
+    const mfHevc = { transports: ['data-channel-h264'], hw_encoders: ['openh264-sw', 'mf-h265-hw'] }
+    expect(cellsFromCaps({ ...base, ...mfHevc }).some((c) => c.codec === 'hevc')).toBe(true)
+    expect(transportForSession('data-channel-hevc', mfHevc)).toBe('auto')
+  })
+
+  it('leaves H.264 to its own fallback, which is safe where these are not', () => {
+    expect(transportForSession('data-channel-h264', SOFTWARE_ONLY)).toBe('data-channel-h264')
+    // The RTP track is H.264 for that pick because the pick says so.
+    expect(codecChoiceToSettings('h264').preferredCodec).toBe('h264')
+    expect(codecChoiceToSettings('hevc').preferredCodec).toBeNull()
+    expect(codecChoiceToSettings('av1').preferredCodec).toBeNull()
+    expect(codecChoiceToSettings('vp9').preferredCodec).toBeNull()
+  })
+
+  it('has nothing to say about auto or the RTP track', () => {
+    expect(transportForSession('auto', SOFTWARE_ONLY)).toBe('auto')
+    expect(transportForSession('webrtc', SOFTWARE_ONLY)).toBe('webrtc')
+  })
+
+  it('keeps the pick until the device record has arrived, as the picker does', () => {
+    expect(transportForSession('data-channel-hevc', null)).toBe('data-channel-hevc')
+    expect(transportForSession('data-channel-hevc', undefined)).toBe('data-channel-hevc')
+  })
+
+  it('reads a row saved before `transports` by its encoders, as the auto rank does', () => {
+    expect(transportForSession('data-channel-hevc', { hw_encoders: ['ffmpeg-hevc_nvenc'] })).toBe(
+      'data-channel-hevc',
+    )
+    expect(transportForSession('data-channel-av1', { hw_encoders: ['ffmpeg-av1_qsv'] })).toBe(
+      'data-channel-av1',
+    )
+    expect(transportForSession('data-channel-vp9-444', { hw_encoders: ['libvpx-vp9-444-sw'] })).toBe(
+      'data-channel-vp9-444',
+    )
+    expect(transportForSession('data-channel-hevc', { hw_encoders: ['openh264-sw'] })).toBe('auto')
+  })
+
+  it('is what connect() branches on: no branch reads the stored pick itself', () => {
+    const src = readFileSync(resolve(process.cwd(), 'src/composables/useRemoteControl.ts'), 'utf8')
+    expect(src).toMatch(/transportForSession\(videoTransport\.value, agent\?\.value\?\.capabilities\)/)
+    expect(src).not.toMatch(/videoTransport\.value === '/)
   })
 })

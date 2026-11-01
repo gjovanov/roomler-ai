@@ -146,12 +146,12 @@ each absolute move as a large jump. In relative mode the same probe read the del
   gets plain Pointer Lock ([`useRemoteControl.ts:6887`](../ui/src/composables/useRemoteControl.ts#L6887)
   `enterRelativeMouse`).
 - **While locked**, every pointer move is a delta into the accumulator
-  ([`useRemoteControl.ts:11477`](../ui/src/composables/useRemoteControl.ts#L11477)), and a hint at the
+  ([`useRemoteControl.ts:11486`](../ui/src/composables/useRemoteControl.ts#L11486)), and a hint at the
   bottom of the picture says how to get the pointer back.
 - **Leaving** is Esc, the browser's own rule. Under Keyboard Lock in fullscreen, Esc reaches the host, so
   the browser wants it held, and the hint says so. Leaving sends the motion still gathered and lets go of
   any held button where the pointer is, before moves turn absolute again
-  ([`useRemoteControl.ts:12398`](../ui/src/composables/useRemoteControl.ts#L12398)). An absolute button-up
+  ([`useRemoteControl.ts:12407`](../ui/src/composables/useRemoteControl.ts#L12407)). An absolute button-up
   there would throw the host's cursor to an old position.
 - A blur or a hidden tab releases held buttons with `mouse_release` in relative mode, never with a
   position.
@@ -175,7 +175,7 @@ stateDiagram-v2
 ```
 
 - **The click that switches is the gesture, not input**
-  ([`useRemoteControl.ts:11540`](../ui/src/composables/useRemoteControl.ts#L11540)). Forwarded as an
+  ([`useRemoteControl.ts:11549`](../ui/src/composables/useRemoteControl.ts#L11549)). Forwarded as an
   absolute press, it would first jump the captured pointer to where the click happened. Its button-up is
   swallowed too.
 - **The cursor coming back** is the next `cursor:pos` after a `cursor:hide`, not `cursor:shape`, which
@@ -183,7 +183,7 @@ stateDiagram-v2
   `onHostCursorShown`). It ends a lock the auto-switch took. A lock the person took from the toolbar stays
   theirs until Esc.
 - **Esc while the cursor stays hidden** leaves relative mode and holds it off until the cursor shows again
-  ([`useRemoteControl.ts:12412`](../ui/src/composables/useRemoteControl.ts#L12412)). Otherwise a host that
+  ([`useRemoteControl.ts:12421`](../ui/src/composables/useRemoteControl.ts#L12421)). Otherwise a host that
   keeps its cursor hidden, fullscreen video for one, would trap the person on every click.
 - ⚠️ **Never while the host is locked.** The lock screen hides the cursor too
   ([`relativeMouse.ts:108`](../ui/src/composables/relativeMouse.ts#L108) `shouldAutoEnterRelative`
