@@ -7091,6 +7091,9 @@ fn session_stats_msg(
         // FR-132 P1 — absent until the viewer said it counts decode errors,
         // so a zero on the wire is always a measured one.
         decode_errors: t.decode_errors,
+        // FR-132 P1d — absent until the pump's first heartbeat, and from a
+        // pump with no input form to name.
+        video: t.video.clone(),
     }
 }
 
@@ -7514,6 +7517,12 @@ mod tests {
             mixed_dial_seconds: 0,
             carrier: Some(crate::session_carrier::SessionCarrier::OverlayTurn),
             decode_errors: Some(2),
+            video: Some(roomler_ai_remote_control::models::SessionVideo {
+                encoder: "h264_qsv".into(),
+                capture: "system-context".into(),
+                input_path: "cpu".into(),
+                input_reason: Some("denied".into()),
+            }),
         };
         match session_stats_msg(sid, &t, Default::default()) {
             ClientMsg::SessionStats {
@@ -7525,10 +7534,13 @@ mod tests {
                 input_events,
                 carrier,
                 decode_errors,
+                video,
                 ..
             } => {
                 // FR-132 P1 — the viewer's decode errors ride it too.
                 assert_eq!(decode_errors, Some(2));
+                // FR-132 P1d — and what the video ran on.
+                assert_eq!(video, t.video);
                 assert_eq!(session_id, sid.to_hex());
                 assert_eq!(bytes_sent, 1_234);
                 assert_eq!(bytes_recv, 5_678);

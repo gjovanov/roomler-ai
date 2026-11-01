@@ -5884,6 +5884,53 @@ pub struct SessionStats {
     pub decode_errors: Option<u32>,
 }
 
+/// FR-132 P1d — what a session's video ran on, as the agent last sampled it:
+/// the source a canary week reads per session (decision 8). The heartbeat
+/// carries the encoder and the input form but no capture backend, and reading a
+/// week from it means grepping `agent_logs`.
+///
+/// One reading, the newest: an encoder that swaps mid-session reports where it
+/// ended. Absent is **not reported**, never "CPU": a session on an older agent,
+/// a follower on a shared pipeline (its owner's row has the reading), or a pump
+/// without an input form to name.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionVideo {
+    /// The encoder's own name: `h264_qsv`, `av1_nvenc`, `hevc_videotoolbox`.
+    pub encoder: String,
+    /// The capturer's own name, its `backend()`: `wgc`, `scrap`,
+    /// `system-context`, `portal`, `mutter`, `drm`.
+    pub capture: String,
+    /// `gpu` or `cpu`, the heartbeat's `input_path`.
+    pub input_path: String,
+    /// Why the frames came through memory, the heartbeat's `input_reason`.
+    /// Absent on GPU input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_reason: Option<String>,
+}
+
+impl SessionVideo {
+    /// The longest name a field may hold. The agent's are all well under it.
+    pub const MAX_NAME: usize = 32;
+
+    /// The reading if every field is a short lowercase name, else `None`.
+    /// Checked on receipt: the reporting side is the untrusted one, and a row
+    /// is no place for whatever a host chose to send. Dropped whole, so the row
+    /// keeps the last reading it could trust, as a bad carrier does.
+    pub fn checked(self) -> Option<Self> {
+        let name = |s: &str| {
+            !s.is_empty()
+                && s.len() <= Self::MAX_NAME
+                && s.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        };
+        (name(&self.encoder)
+            && name(&self.capture)
+            && name(&self.input_path)
+            && self.input_reason.as_deref().is_none_or(name))
+        .then_some(self)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RemoteSession {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -5915,6 +5962,11 @@ pub struct RemoteSession {
     /// session that ended before the observation landed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carrier: Option<String>,
+    /// FR-132 P1d — what the session's video ran on. Set by the live stats
+    /// merge and beside `stats`, for the carrier's reason. **Absent is not
+    /// reported, never CPU.**
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<SessionVideo>,
 }
 
 impl RemoteSession {
@@ -10118,6 +10170,7 @@ mod tests {
             recording_url: None,
             stats: SessionStats::default(),
             carrier: None,
+            video: None,
         };
         let names = bson::to_document(&row).unwrap();
         assert_eq!(
@@ -10603,5 +10656,100 @@ mod power_brief_tests {
         let back: SleepNotice = bson::from_document(b).expect("decode");
         assert_eq!(back, n);
         assert!(!back.power.by_policy(), "held: it slept past the hold");
+    }
+}
+
+#[cfg(test)]
+mod session_video_tests {
+    use super::*;
+
+    fn reading() -> SessionVideo {
+        SessionVideo {
+            encoder: "hevc_videotoolbox".into(),
+            capture: "system-context".into(),
+            input_path: "cpu".into(),
+            input_reason: Some("adapter_mismatch".into()),
+        }
+    }
+
+    /// FR-132 P1d — every name the agent sends passes, `system-context`'s
+    /// hyphen included, and GPU input has no reason to give.
+    #[test]
+    fn the_agents_own_names_are_kept() {
+        assert_eq!(reading().checked(), Some(reading()));
+        let gpu = SessionVideo {
+            input_path: "gpu".into(),
+            input_reason: None,
+            ..reading()
+        };
+        assert_eq!(gpu.clone().checked(), Some(gpu));
+        for capture in ["wgc", "scrap", "portal", "mutter", "drm"] {
+            let named = SessionVideo {
+                capture: capture.into(),
+                ..reading()
+            };
+            assert!(named.checked().is_some(), "{capture}");
+        }
+    }
+
+    /// The device is the only writer, so a compromised one must not get a
+    /// string field to fill. Any field that is not a short lowercase name
+    /// drops the reading whole.
+    #[test]
+    fn a_reading_that_is_not_names_is_dropped_whole() {
+        let long = "x".repeat(SessionVideo::MAX_NAME + 1);
+        let bad = [
+            SessionVideo {
+                encoder: String::new(),
+                ..reading()
+            },
+            SessionVideo {
+                encoder: long.clone(),
+                ..reading()
+            },
+            SessionVideo {
+                encoder: "H264".into(),
+                ..reading()
+            },
+            SessionVideo {
+                input_path: "c p u".into(),
+                ..reading()
+            },
+            SessionVideo {
+                capture: String::new(),
+                ..reading()
+            },
+            SessionVideo {
+                capture: "<b>".into(),
+                ..reading()
+            },
+            SessionVideo {
+                input_reason: Some(long),
+                ..reading()
+            },
+        ];
+        for b in bad {
+            assert_eq!(b.clone().checked(), None, "{b:?}");
+        }
+        let at_the_limit = SessionVideo {
+            encoder: "x".repeat(SessionVideo::MAX_NAME),
+            ..reading()
+        };
+        assert!(at_the_limit.checked().is_some());
+    }
+
+    /// GPU input's missing reason stays absent on the row and on the wire.
+    #[test]
+    fn no_reason_is_absent_on_the_row_and_the_wire() {
+        let gpu = SessionVideo {
+            input_reason: None,
+            ..reading()
+        };
+        let d = bson::to_document(&gpu).unwrap();
+        assert!(d.get("input_reason").is_none());
+        let back: SessionVideo = bson::from_document(d).unwrap();
+        assert_eq!(back, gpu);
+        let s = serde_json::to_string(&gpu).unwrap();
+        assert!(!s.contains("input_reason"), "{s}");
     }
 }

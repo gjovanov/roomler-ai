@@ -2534,6 +2534,34 @@ a worker has nothing to count. Each reads as an absent field, so a fleet read (F
 only sessions that counted. **Record, never decide**: nothing on the agent changes because a viewer
 reported an error; the fallback is the viewer's own, as before.
 
+### 11.11 What a session's video ran on (FR-132 P1d)
+
+A canary week (FR-132 §3d) is read per encoder and capture backend, because a cell's GPU input
+depends on both, and the pump's heartbeat carries no capture backend. So `rc:session.stats` names
+what the video ran on, and the session's row keeps the newest reading. A week reads per session,
+with no grep of `agent_logs`.
+
+| Piece | What it does | Where |
+|---|---|---|
+| the reading | taken at the pump's 2 s heartbeat: the encoder's name, the capturer's `backend()` (`wgc`, `scrap`, `system-context`, `portal`, `mutter`, `drm`), and the input form's path and reason. Only the FFmpeg DC pump has an input form to name | `media_pump_ffmpeg_dc`, `agents/roomlerd/src/peer.rs:9755` |
+| a failed read | a heartbeat whose `rate_stats` failed reads `InputForm`'s default, CPU with no reason. A real CPU form always names its reason, so this one is dropped and the reading before it stands | `SessionCounters::note_video`, `agents/roomlerd/src/session_telemetry.rs:126` |
+| the early sample | a new reading sends one `rc:session.stats` at once, by the carrier's road (§11.9), so the row has it within a heartbeat and follows a form that moves in the session's first seconds | same |
+| the wire | `video: Option<SessionVideo>` on `rc:session.stats`, absent until the pump's first heartbeat; an older server ignores it | `crates/remote_control/src/signaling.rs:789` |
+| the check | the device is the only writer, so a reading with any field that is not a short lowercase name is dropped whole, and the row keeps its last | `SessionVideo::checked`, `crates/remote_control/src/models.rs:5919` |
+| the row | `remote_sessions.video`, beside `stats`, so `mark_ended`'s whole-`stats` write cannot reset it | `merge_live_stats`, `crates/services/src/dao/remote_session.rs:152` |
+
+⚠️ **The reading cannot wait for the session's last sample.** When the viewer hangs up, the server
+has set `ended_at` before that sample arrives, and `merge_live_stats` writes only while `ended_at`
+is null (`crates/services/src/dao/remote_session.rs:162`), so it never reaches the row. Taking one
+for every session would also put `peer.telemetry()`'s 3 s budget
+(`agents/roomlerd/src/signaling.rs:89`) on every teardown, and a wedged peer is the case that budget
+exists for.
+
+⚠️ **Absent is not reported, never CPU.** A session on an older agent, one that ended before its
+first heartbeat, a follower on a shared pipeline (its owner's row has the reading) and a pump with
+no input form each read as an absent field, so a fleet read compares only sessions that reported.
+**Record, never decide**: nothing on the agent or the server changes because of a reading.
+
 ## 12. Performance targets & budget
 
 ### 12.0 Input to photon, measured (FR-98)

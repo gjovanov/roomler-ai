@@ -780,6 +780,13 @@ pub enum ClientMsg {
         /// Additive: an older server ignores the key.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         decode_errors: Option<u32>,
+        /// FR-132 P1d — what the session's video ran on, the pump's newest
+        /// reading. Absent from an older agent, from a pump with no input form
+        /// to name, and from a sample before the pump's first heartbeat;
+        /// absent is **not reported**, never CPU. Additive: an older server
+        /// ignores the key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        video: Option<crate::models::SessionVideo>,
     },
 
     /// Multi-region DERP: request an EdDSA admission ticket for the regional
@@ -12990,6 +12997,7 @@ mod tests {
             transfers: Transfers::default(),
             carrier: None,
             decode_errors: None,
+            video: None,
         };
         assert!(!serde_json::to_string(&none).unwrap().contains("carrier"));
     }
@@ -13020,6 +13028,7 @@ mod tests {
             transfers: Transfers::default(),
             carrier: None,
             decode_errors,
+            video: None,
         };
         let s = serde_json::to_string(&sample(None)).unwrap();
         assert!(!s.contains("decode_errors"), "{s}");
@@ -13057,6 +13066,7 @@ mod tests {
             transfers: Transfers::default(),
             carrier: None,
             decode_errors: None,
+            video: None,
         };
         let s = serde_json::to_string(&quiet).unwrap();
         assert!(!s.contains("transfers"), "{s}");
@@ -13085,6 +13095,7 @@ mod tests {
             },
             carrier: None,
             decode_errors: None,
+            video: None,
         };
         let v = serde_json::to_value(&busy).unwrap();
         let t = &v["transfers"];

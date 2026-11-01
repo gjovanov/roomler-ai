@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use bson::oid::ObjectId;
 use dashmap::DashMap;
+use roomler_ai_remote_control::models::SessionVideo;
 use roomler_ai_remote_control::signaling::{FileNote, Tally, TransferDirection, Transfers};
 use sha2::{Digest, Sha256};
 
@@ -94,9 +95,53 @@ pub struct SessionCounters {
     /// "did it move" by the idle limit (`session_idle`), so a transfer that
     /// runs for longer than the limit is never ended as idle.
     pub transfer_activity: AtomicU64,
+    /// FR-132 P1d — what the session's video ran on, the pump's newest
+    /// reading ([`Self::note_video`]). `None` before its first heartbeat, and
+    /// on a pump with no input form to name.
+    video: std::sync::Mutex<Option<VideoForm>>,
+}
+
+/// FR-132 P1d — one pump reading, in the names the heartbeat logs. `'static`
+/// on purpose: a heartbeat should not allocate on the media path to say what
+/// it said two seconds ago.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoForm {
+    pub encoder: &'static str,
+    /// The capturer's `backend()`.
+    pub capture: &'static str,
+    pub input_path: &'static str,
+    /// Empty on GPU input, as `InputForm::reason` is.
+    pub input_reason: &'static str,
 }
 
 impl SessionCounters {
+    /// FR-132 P1d — the pump's newest reading, for `rc:session.stats`. True
+    /// when it differs from the last one, and the pump then asks for a sample
+    /// at once: a session can end before the next 30 s tick, and the last
+    /// sample of one the server ended arrives too late to reach its row.
+    ///
+    /// A CPU form always says why, so CPU with no reason is `InputForm`'s
+    /// default, from a heartbeat whose `rate_stats` failed. That says nothing
+    /// about the session, and must not replace a reading that does.
+    pub fn note_video(&self, form: VideoForm) -> bool {
+        if form.input_path == "cpu" && form.input_reason.is_empty() {
+            return false;
+        }
+        let mut video = self.video.lock().unwrap_or_else(|p| p.into_inner());
+        video.replace(form) != Some(form)
+    }
+
+    /// FR-132 P1d — what `rc:session.stats` carries.
+    pub fn video(&self) -> Option<SessionVideo> {
+        let form = (*self.video.lock().unwrap_or_else(|p| p.into_inner()))?;
+        Some(SessionVideo {
+            encoder: form.encoder.to_string(),
+            capture: form.capture.to_string(),
+            input_path: form.input_path.to_string(),
+            input_reason: (!form.input_reason.is_empty()).then(|| form.input_reason.to_string()),
+        })
+    }
+
     /// FR-101 P3 — one completed file transfer. Only a SHA-256 of `name`
     /// is kept.
     pub fn note_file(&self, dir: TransferDirection, name: &str, bytes: u64) {
@@ -355,6 +400,100 @@ mod tests {
         assert_eq!(counters(u).note_decode_error(), u32::MAX);
         assert_eq!(counters(u).decode_errors(), Some(u32::MAX));
         forget(u);
+    }
+
+    /// FR-132 P1d — a session's video reads as not reported until the pump
+    /// says, then as its newest reading. GPU input has no reason to give, so
+    /// none is sent.
+    #[test]
+    fn a_sessions_video_is_the_pumps_newest_reading() {
+        let s = ObjectId::new();
+        assert_eq!(counters(s).video(), None, "not reported, never CPU");
+
+        counters(s).note_video(VideoForm {
+            encoder: "h264_qsv",
+            capture: "system-context",
+            input_path: "cpu",
+            input_reason: "denied",
+        });
+        assert_eq!(
+            counters(s).video(),
+            Some(SessionVideo {
+                encoder: "h264_qsv".into(),
+                capture: "system-context".into(),
+                input_path: "cpu".into(),
+                input_reason: Some("denied".into()),
+            })
+        );
+
+        counters(s).note_video(VideoForm {
+            encoder: "av1_qsv",
+            capture: "wgc",
+            input_path: "gpu",
+            input_reason: "",
+        });
+        assert_eq!(
+            counters(s).video(),
+            Some(SessionVideo {
+                encoder: "av1_qsv".into(),
+                capture: "wgc".into(),
+                input_path: "gpu".into(),
+                input_reason: None,
+            }),
+            "the newest reading"
+        );
+        forget(s);
+    }
+
+    /// FR-132 P1d — the pump asks for a sample only when the reading is new,
+    /// or every session would send one each heartbeat.
+    #[test]
+    fn only_a_new_reading_asks_for_a_sample() {
+        let s = ObjectId::new();
+        let cpu = VideoForm {
+            encoder: "h264_qsv",
+            capture: "wgc",
+            input_path: "cpu",
+            input_reason: "cpu_frames",
+        };
+        let gpu = VideoForm {
+            input_path: "gpu",
+            input_reason: "",
+            ..cpu
+        };
+        assert!(counters(s).note_video(cpu), "the first reading");
+        assert!(!counters(s).note_video(cpu), "the same one again");
+        assert!(counters(s).note_video(gpu), "the form moved");
+        assert!(!counters(s).note_video(gpu));
+        forget(s);
+    }
+
+    /// FR-132 P1d — a heartbeat whose `rate_stats` failed reads `InputForm`'s
+    /// default, CPU with no reason. It says nothing about the session, so a
+    /// reading stands through it, and no sample goes for it.
+    #[test]
+    fn a_failed_stats_read_replaces_no_reading() {
+        let s = ObjectId::new();
+        let gpu = VideoForm {
+            encoder: "h264_qsv",
+            capture: "wgc",
+            input_path: "gpu",
+            input_reason: "",
+        };
+        let failed = VideoForm {
+            input_path: "cpu",
+            ..gpu
+        };
+        assert!(!counters(s).note_video(failed));
+        assert_eq!(counters(s).video(), None, "not reported, never CPU");
+
+        assert!(counters(s).note_video(gpu));
+        assert!(!counters(s).note_video(failed));
+        assert_eq!(
+            counters(s).video().map(|v| v.input_path).as_deref(),
+            Some("gpu")
+        );
+        forget(s);
     }
 
     // FR-101 P3 — the clipboard tallies are cumulative (a sample never
