@@ -588,6 +588,13 @@
             <div v-else-if="rec.state.value === 'pending_consent'" class="text-body-2">
               Waiting for the person at the device to allow it…
             </div>
+            <div
+              v-else-if="rec.state.value === 'announcing'"
+              class="text-body-2"
+              data-testid="rc-record-announcing"
+            >
+              Telling the person at the device first…
+            </div>
             <div v-else>
               <!-- #1760 — where the device says computer audio cannot go into
                    a remote recording (a Mac; the owner has not allowed it),

@@ -106,6 +106,8 @@ describe('useRemoteRecording (FR-85 P3c)', () => {
 
     ch.deliver({ t: 'rc:record.state', id: start.id, state: 'pending_consent' })
     expect(r.state.value).toBe('pending_consent')
+    ch.deliver({ t: 'rc:record.state', id: start.id, state: 'announcing' })
+    expect(r.state.value).toBe('announcing')
     ch.deliver({
       t: 'rc:record.state',
       id: start.id,

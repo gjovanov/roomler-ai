@@ -22,7 +22,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use bson::oid::ObjectId;
@@ -131,6 +131,16 @@ fn the_gates_refuse_by_name_before_anything_runs() -> Result<()> {
 #[test]
 fn no_indicator_surface_means_no_recording() -> Result<()> {
     rt().block_on(no_indicator_surface_means_no_recording_cell())
+}
+
+#[test]
+fn a_slow_banner_still_records_and_comes_first() -> Result<()> {
+    rt().block_on(a_slow_banner_still_records_and_comes_first_cell())
+}
+
+#[test]
+fn a_companion_that_never_reads_is_refused() -> Result<()> {
+    rt().block_on(a_companion_that_never_reads_is_refused_cell())
 }
 
 #[test]
@@ -258,6 +268,8 @@ struct Opts {
     /// The companion's answer (the only indicator surface in these tests:
     /// the native badge is not built here).
     companion: bool,
+    /// P3d — a companion that is up and waited for, on this clock.
+    timed: Option<(Duration, Duration)>,
     /// The session is on the banner (the registry) at all.
     listed: bool,
     /// P3b-3 — the device this session is on (a fresh one when `None`).
@@ -275,6 +287,7 @@ impl Default for Opts {
             granted: true,
             prompt_window: None,
             companion: true,
+            timed: None,
             listed: true,
             device: None,
             controller: None,
@@ -475,7 +488,10 @@ async fn rig(opts: Opts) -> Result<Rig> {
         consent: broker.clone(),
         indicator: indicator.clone(),
         outbound: activity_tx,
-        companion: Companion::Fixed(opts.companion),
+        companion: match opts.timed {
+            Some((poll, ceiling)) => Companion::Timed { poll, ceiling },
+            None => Companion::Fixed(opts.companion),
+        },
     };
 
     let browser_dc = browser_pc
@@ -734,6 +750,89 @@ async fn no_indicator_surface_means_no_recording_cell() -> Result<()> {
     r.send(json!({"t": "rc:record.start", "id": "i2"})).await?;
     let v = r.state(START).await?;
     assert_eq!(v["reason"], "no_indicator_surface", "{v}");
+    Ok(())
+}
+
+/// FR-85 P3d — frame 0 of a field recording still said "Being viewed": the
+/// recorder started on a flag no client had read. The start now waits for the
+/// read and one more poll. A companion that is merely slow must still record,
+/// so its first read comes late here, well past what a healthy one takes, and
+/// the recording must not start until a poll after it.
+async fn a_slow_banner_still_records_and_comes_first_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    let (device, _kill) = Device::new();
+    let registry = device.registry.clone();
+    let poll = Duration::from_millis(400);
+    let mut r = rig(Opts {
+        timed: Some((poll, Duration::from_secs(20))),
+        device: Some(device),
+        ..Default::default()
+    })
+    .await?;
+    r.send(json!({"t": "rc:record.start", "id": "slow"}))
+        .await?;
+    let v = r.state(START).await?;
+    assert_eq!(v["state"], "announcing", "{v}");
+    assert!(!s.manager.state().active, "no read yet: {v}");
+
+    // A companion that took its time.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!s.manager.state().active, "started before anything read it");
+    let read = Instant::now();
+    assert!(
+        registry.list_for_client().iter().any(|e| e.recording),
+        "the client is told"
+    );
+
+    let v = r.state(START).await?;
+    assert_eq!(v["state"], "recording", "{v}");
+    assert!(
+        read.elapsed() >= poll,
+        "started {:?} after the first read, inside a poll",
+        read.elapsed()
+    );
+    r.send(json!({"t": "rc:record.stop", "id": "slow"})).await?;
+    let v = r.until_not_recording(STOP).await?;
+    assert_eq!(v["state"], "stopped", "{v}");
+    Ok(())
+}
+
+/// FR-85 P3d — a companion that is up and tells nobody is no surface. The
+/// recording is refused by the name a missing companion gets, in words that
+/// say which of the two this is, and no recorder ever ran.
+async fn a_companion_that_never_reads_is_refused_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    let before = mp4s(&s.out).len();
+    gates(true, false);
+    let mut r = rig(Opts {
+        timed: Some((Duration::from_millis(50), Duration::from_millis(600))),
+        ..Default::default()
+    })
+    .await?;
+    r.send(json!({"t": "rc:record.start", "id": "mute"}))
+        .await?;
+    let v = r.state(START).await?;
+    assert_eq!(v["state"], "announcing", "{v}");
+    let v = r.state(START).await?;
+    assert_eq!(v["reason"], "no_indicator_surface", "{v}");
+    assert!(
+        v["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("did not answer"),
+        "{v}"
+    );
+    assert!(
+        !r.banner_says_recording(),
+        "the mark was not taken back down"
+    );
+    assert!(!s.manager.state().active, "a recorder is running anyway");
+    assert_eq!(mp4s(&s.out).len(), before);
     Ok(())
 }
 

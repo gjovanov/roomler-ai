@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 
 use bson::oid::ObjectId;
 use tunnel_core::localapi::RcSessionInfo;
@@ -92,6 +93,9 @@ struct Entry {
     kill: KillSender,
     /// FR-85 P3 — this controller is recording the screen.
     recording: bool,
+    /// FR-85 P3d — when a client first read `recording`. The flag reaches the
+    /// screen only by being read ([`RcSessionRegistry::list_for_client`]).
+    recording_read: Option<Instant>,
     /// FR-85 P3b-3 — the session ended while recording, and the entry stays
     /// for the recording's re-attach grace: the banner says "reconnecting".
     detached: bool,
@@ -136,6 +140,7 @@ impl RcSessionRegistry {
                 started_at_ms,
                 kill,
                 recording,
+                recording_read: None,
                 detached: false,
             },
         );
@@ -188,10 +193,33 @@ impl RcSessionRegistry {
         match self.inner.lock().unwrap().get_mut(session) {
             Some(e) => {
                 e.recording = recording;
+                e.recording_read = None;
                 true
             }
             None => false,
         }
+    }
+
+    /// FR-85 P3d — [`Self::list`], for a client over the LocalAPI, and the
+    /// moment a recording's flag leaves the daemon. The companion learns of
+    /// it only here, so this is what proves it has been told.
+    pub fn list_for_client(&self) -> Vec<RcSessionInfo> {
+        let now = Instant::now();
+        for e in self.inner.lock().unwrap().values_mut() {
+            if e.recording && e.recording_read.is_none() {
+                e.recording_read = Some(now);
+            }
+        }
+        self.list()
+    }
+
+    /// FR-85 P3d — when a client first read `session` as recording.
+    pub fn recording_read_at(&self, session: &ObjectId) -> Option<Instant> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(session)
+            .and_then(|e| e.recording_read)
     }
 
     /// Snapshot for the LocalAPI, oldest first — a banner listing several
