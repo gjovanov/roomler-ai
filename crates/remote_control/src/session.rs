@@ -118,6 +118,12 @@ pub struct LiveSession {
     /// idle_secs`): set only when the device keeps it. Kept for a coalesced
     /// duplicate request, exactly as [`Self::record_refused`].
     pub idle_secs: Option<u32>,
+
+    /// FR-52 P5 — opened by an external login (`Request.external`), so a
+    /// revocation ends this session and leaves one the same account holds as a
+    /// member of the org alone. The device binds the login; this only tells the
+    /// Hub's own sessions apart.
+    pub external: bool,
 }
 
 impl LiveSession {
@@ -156,6 +162,7 @@ impl LiveSession {
             features_refused: Default::default(),
             max_duration: None,
             idle_secs: None,
+            external: false,
         };
         (s, waiter)
     }

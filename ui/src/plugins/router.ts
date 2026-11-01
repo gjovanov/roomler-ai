@@ -373,6 +373,7 @@ const routes: RouteRecordRaw[] = [
               { path: 'exec',         name: 'audit-exec',         props: true, meta: { module: 'fleet' },   component: () => import('@/components/admin/ExecAuditSection.vue') },
               { path: 'ssh',          name: 'audit-ssh',          props: true, meta: { module: 'network' }, component: () => import('@/components/admin/SshAuditSection.vue') },
               { path: 'ssh-activity', name: 'audit-ssh-activity', props: true, meta: { module: 'network' }, component: () => import('@/components/admin/SshActivitySection.vue') },
+              { path: 'external',     name: 'audit-external',     props: true, meta: { module: 'fleet' },   component: () => import('@/components/admin/ExternalAuditSection.vue') },
             ],
           },
           {

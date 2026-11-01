@@ -185,6 +185,7 @@
     "audit": "Audit",
     "execAudit": "Command audit",
     "sshAudit": "SSH audit",
+    "externalAudit": "External access",
     "sshActivity": "SSH activity"
   },
   "room": {

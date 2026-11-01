@@ -4070,9 +4070,9 @@ const codecChoice = rc.codecChoice
 // FR-77 — the validity matrix behind the two dropdowns: the agent's cells
 // (one derivation for new and old agents) crossed with this browser's decode
 // probes and the decode failures remembered for this device. 4:2:0 cells stay
-// optimistic until the device record arrives (the rc.190 contract — the agent
-// falls back when it cannot honour a pick); every 4:4:4 cell demands proof
-// from both ends, because a chroma mismatch is a black screen.
+// optimistic until the device record arrives (connect() holds the pick to that
+// record, #3167); every 4:4:4 cell demands proof from both ends, because a
+// chroma mismatch is a black screen.
 const cellAvail = computed<Availability>(() =>
   cellAvailability({
     cells: cellsFromCaps(agent.value?.capabilities),

@@ -1,6 +1,6 @@
 # FR-43: One macOS device row — a supervising daemon and an unenrolled GUI worker
 
-**Status:** P0, P1, P2, P2c and P2d are shipped and field-verified (0.4.33 → 0.4.191): the daemon's row streams real pixels, accepts input and reports the worker's permissions, and a package update no longer undoes that. **P3 is not built**, so a Mac is still two rows. It waits on the three decisions under [Open decisions](#open-decisions). A worst-phase `kill -9` took 10.09 s on 0.4.191; the fix is on master, and its field half rides the next release. Tracking issue: `FR-43`.
+**Status:** P0, P1, P2, P2c and P2d are shipped and field-verified (0.4.33 → 0.4.192): the daemon's row streams real pixels, accepts input and reports the worker's permissions, and a package update no longer undoes that. **P3 is not built**, so a Mac is still two rows. It waits on the three decisions under [Open decisions](#open-decisions). A worst-phase `kill -9` of the worker takes 6.19 s on 0.4.192, down from 10.09 s on 0.4.191. Tracking issue: `FR-43`.
 
 ⚠️ Anchors RE-VERIFIED against master `c6e8ec58` on 2026-09-06, when this record was
 landed 27 releases after the field run. `remote_control`'s hub moved to
@@ -581,12 +581,12 @@ The stand-in still has to handle:
       package, and the job was gone, the plist removed, and the worker `--supervised`.
       ⚠️ `enroll` and the daemon's own saves write the key as `false`, so a real Mac that
       never touched it reads `false`, not absent.)*
-- [~] `kill -9` on the GUI worker respawns it within 10 s **without** the control WS
+- [x] `kill -9` on the GUI worker respawns it within 10 s **without** the control WS
       dropping (measured: the device row never goes offline).
-      *(2026-10-31, 0.4.191, tart Mac, 10 kills phase-locked to the supervisor's tick. The WS
-      half is met: 0 offline samples in 116, no reconnect. The 10 s half was missed at the worst
-      phase: 5.29–10.09 s from the kill to the channel attached. The fix wakes on the backoff
-      (`next_tick_in`), for a worst case of about 6 s. Its field half rides the next release.)*
+      *(2026-11-01, released 0.4.192, tart Mac, 10 kills phase-locked to the supervisor's tick:
+      1.36–6.19 s from the kill to the channel attached, 0 offline samples in 108, no reconnect.
+      RED on 0.4.191, same rig and phases: 5.29–10.09 s, so the worst phase missed the 10 s. The
+      fix wakes on the backoff (`next_tick_in`).)*
 - [ ] An existing two-row Mac migrates to one row keeping its overlay address, and the
       retired row is tombstoned per `release_overlay_node`'s ordering (never re-issued).
 - [x] With the kill switch off, behaviour is byte-for-byte today's.
@@ -1052,3 +1052,26 @@ word reached the page is not checked here.
 `user_active` on MacBook-1 read 19:05:57Z with `paused_by="local"`, which looked like someone at
 the Mac. It was the worker starting: the line sits beside `restored from the per-person store`,
 and keep busy read `running` 30 s later.
+
+### 2026-11-01 — AC11 on released 0.4.192: the worst kill is 6.19 s
+
+The same tart rig and the same ten phases as the 0.4.191 RED above, on `agent-v0.4.192`. The
+`.pkg`'s SHA-256 starts `81ca6fcefc8714c6` and matches its published sidecar. The guest went from
+0.4.191 to 0.4.192 by `installer` with the key `true`, so the fix arrived the way it reaches a
+real Mac. Times are from the kill:
+
+| Kill, after the last tick | Exit seen | Spawned | Channel attached | Attached on 0.4.191 |
+|---|---|---|---|---|
+| 4.7–4.9 s (2 kills) | 0.08–0.28 s | 1.13–1.33 s | 1.36–1.54 s | 5.29–5.56 s |
+| 1.1–4.1 s (4 kills) | 0.87–3.90 s | 1.92–4.95 s | 2.16–5.16 s | 6.12–9.14 s |
+| 0.1–0.4 s (4 kills) | 4.64–4.93 s | 5.70–5.98 s | **5.91–6.19 s** | 9.88–10.09 s |
+
+The exit is still seen on the 5 s tick, as before. From there a spawn took 1.04–1.06 s at every
+phase, which is the backoff, where it took 5 s on 0.4.191. The channel attached 0.21–0.24 s later.
+One kill aimed at 0.15 s came 95 s after its spawn, by when the tick had drifted 0.23 s, so it
+landed just before a tick and sits in the first row.
+
+The control WS held: 0 offline samples of 108, and no reconnect. The root log's two
+`rc:agent.hello sent` lines are the daemon's own connects, at 02:16:04Z and 02:17:14Z, and the
+first kill came at 02:18:49Z. One heartbeat fell inside a gap, at 02:22:14.9Z: the row read
+`no-gui-session` for that heartbeat and `screen-capture` again at the next. That is AC7's revert.

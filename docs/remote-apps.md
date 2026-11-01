@@ -25,7 +25,7 @@ The rest of the design follows from taking that sentence seriously.
 
 Everything is P2P over the session's existing `control` data channel — no
 server change, and the server never sees a window title. `peer.rs` routes three
-envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:10872`),
+envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:10901`),
 runs it on `spawn_blocking` because every backend shells out or calls FFI, and
 sends the returned reply back on the same channel. The request/reply shape and
 the id correlation are `rc:logs-fetch`'s.
@@ -215,7 +215,7 @@ caps-probe child (§4.3).
 | **`wmctrl` missing**, Xvfb arm | `list · focus · launch` | same actionable `error` | yes | **unchanged** — AC3 freezes the Daemon arm; recorded rather than "tidied" |
 | **Wayland session, no Xwayland** | absent | never asked; if asked, bare `supported:false` | **NO** — one `debug!` line | `status` + `unavailable{no_x_display}` |
 | **nobody logged in** (headless, no Xvfb) | absent | bare `supported:false` | **NO** — `graphical_session`'s sentence was thrown away by `.ok()?` | `status` + `unavailable{no_session}`, rendered in the dialog (field-read 2026-10-31) |
-| **parked at the login screen** (a greeter, `Class=greeter`) | absent | the audit counted this as the row above. Field-read on 0.4.190: a Wayland greeter answered `unavailable{no_x_display}` naming `gdm`; an X11 greeter answered `supported:true`, nothing unlisted, launch offered | yes, and **wrong** both ways | P7: `status` + `unavailable{no_session}` with *the login screen is showing — nobody is signed in at this machine's screen*. Rides the release after 0.4.191 |
+| **parked at the login screen** (a greeter, `Class=greeter`) | absent | the audit counted this as the row above. Field-read on 0.4.190: a Wayland greeter answered `unavailable{no_x_display}` naming `gdm`; an X11 greeter answered `supported:true`, nothing unlisted, launch offered | yes, and **wrong** both ways | P7: `status` + `unavailable{no_session}` with *the login screen is showing — nobody is signed in at this machine's screen*. Field-read 2026-11-01 on 0.4.192, on both greeters |
 | **privilege drop failed** | absent | bare `supported:false` | **NO** — swallowed, then the log blamed Xwayland | `unavailable{cannot_run_as}`, and discovery stops at the first |
 | **disabled in config** | absent | bare `supported:false` | **NO** — one `info!` at boot | `status` + `unavailable{disabled}` |
 | **macOS** | absent | bare `supported:false` | no — and nothing to change: there is no backend | unchanged by design: no `status`, no button; `platform` answers a stray request. **Since FR-97 P2c** (§2b): `status · list · focus · launch` from a per-user agent or a supervised Mac's GUI worker, and on the root's row while its worker is attached; `quartz` lists every window, so nothing is unlisted (only the titles, without the Screen Recording grant) |
@@ -335,7 +335,7 @@ restart changes it. That is why P6 added a fourth value:
   unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
   The viewer names that as such (*"this agent did not say why"*,
-  `useRemoteControl.ts:1466`) rather than papering over it — inventing a reason
+  `useRemoteControl.ts:1468`) rather than papering over it — inventing a reason
   would be the same lie in the other direction.
 
 ## 5. Launch, and the tmux session model
@@ -450,7 +450,8 @@ Three limits, stated rather than discovered:
 | 2026-10-31 | the same guest, logged out to GDM's Wayland greeter | **RED** on 0.4.190 | *gdm has a graphical session but no X display on it answered (tried :0, :1): a Wayland compositor without Xwayland…*, over a live picture of the login screen, with that greeter's Xwayland running at `:1024` |
 | 2026-10-31 | the same guest, GDM on X11 (`WaylandEnable=false`) | **RED** on 0.4.190 | `supported: true`, `NOT listed: (nothing…)`, `windows: 0`, as `gdm`; *New bash session* started tmux and xterm as `gdm`. GNOME's greeter draws no application windows, so nobody at the screen sees them |
 | 2026-10-31 | the same guest with a person's session; `portal_capture` + `window_capture`; the picker answered at the guest's console | AC7 | *Calculator* (native Wayland) alone in the browser; the next session, *FR56-WINDOW-B* (Xwayland) whole, though the calculator covers it on the real screen; with *Remember* ticked the session after that restored it 71 ms after the request, no dialog |
-| owed | the release carrying P7, at a greeter | AC10's last read | the dialog shows the `no_session` reason with *the login screen is showing* |
+| 2026-11-01 | a fresh guest on released 0.4.192, a person signed in, one X window of theirs open | AC10, the control | the dialog listed *FR56-CONTROL* and offered *New bash session*, the hello still `["status"]` |
+| 2026-11-01 | the same daemon at GDM's Wayland greeter, then on X11 with `wmctrl` still answering as `gdm` | AC10, **GREEN** | both dialogs: *No active graphical login session on this host — … (the login screen is showing — nobody is signed in at this machine's screen)*, and no *Launch new* |
 
 Still unbuilt: native enumeration on a wlroots host (none exists in the fleet).
 
@@ -488,7 +489,7 @@ label    = "Safari"
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1284`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:6617`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:6643`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the

@@ -840,7 +840,7 @@ sequenceDiagram
   off; the legacy `ROOMLER__SETUP__WIZARD_UNIX_DAEMON` turns Linux and macOS
   on together). One helper decides it for the Welcome cards, the Server page
   and the pipeline (`SetupFeatures::daemon_offered`,
-  `agents/roomler-setup/src/features.rs:77-79`). The server is picked after the role, so the
+  `agents/roomler-setup/src/features.rs:77-83`). The server is picked after the role, so the
   Server page asks again when the URL changes and the pipeline once more before
   it installs.
 - **On production, both OSes since 2026-10-30 (22:33Z).** The deploy repo's
@@ -877,7 +877,9 @@ sequenceDiagram
   end is not run again (no second password), and a system scope is not enrolled
   twice with a token already spent.
 - **A missing digest is an error here**, where the terminal path only warns:
-  a GUI that elevated to root places nothing it cannot verify (AC12).
+  a GUI that elevated to root places nothing it cannot verify (AC12). A system
+  scope has enrolled by then, so the refusal leaves an offline device row and a
+  spent token on the server, and Retry reuses them.
 - **The token never leaves the wizard's process** — not in argv, a URL or a
   line. A system scope enrolls *before* the prompt into a private file the half
   places root-owned 0600; the file is shredded once placed, kept for a Retry
@@ -1129,7 +1131,7 @@ flowchart TB
 | A session on `<name>-daemon` | no pixels: the agent logs `no_display` | delegated to the worker: pixels and input |
 | What `<name>-daemon` reports | `no-gui-session` | the worker's permissions, on the next heartbeat; `no-gui-session` again within a heartbeat of the worker leaving |
 | A package update | keeps the LaunchAgent | removes it and keeps the worker (`postinstall`) |
-| The GUI half killed | launchd restarts it | the supervisor respawns it; the control WS stays up |
+| The GUI half killed | launchd restarts it | the supervisor respawns it within about 6 s; the control WS stays up |
 | Nobody logged in | `<name>` offline, `<name>-daemon` online on the mesh | the same |
 
 ⚠️ **On a supervised Mac, don't delete the `<name>` row as a duplicate.** The worker
@@ -1385,7 +1387,7 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3388`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3414`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
@@ -1626,7 +1628,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2151`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2177`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

@@ -31,7 +31,11 @@ vi.mock('@/api/client', () => ({
 
 import SshAuditSection from '@/components/admin/SshAuditSection.vue'
 import ExecAuditSection from '@/components/admin/ExecAuditSection.vue'
+import ExternalAuditSection from '@/components/admin/ExternalAuditSection.vue'
+import { useTenantStore } from '@/stores/tenant'
 import type { ExecAuditEntry, SshAuditEntry } from '@/stores/agents'
+import type { ExternalAuditEntry, ExternalPrincipal } from '@/utils/externalAudit'
+import { PERMISSION_FLAGS } from '@/utils/permissions'
 import { api } from '@/api/client'
 
 const mockApi = vi.mocked(api)
@@ -220,5 +224,158 @@ describe('the exec audit on a phone (FR-116 P3d)', () => {
     expect(cell.find('button').exists()).toBe(false)
     expect(cell.get('code').attributes('title')).toBe(long)
     expect(w.findAll('tbody tr td').map((td) => td.attributes('data-label'))).toEqual(['When', 'Device', 'Who', 'Via', 'Command', 'Result'])
+  })
+})
+
+describe('the external access audit (FR-52 P5)', () => {
+  const logRow = (i: number, over: Partial<ExternalAuditEntry> = {}): ExternalAuditEntry => ({
+    id: `e${i}`,
+    action: 'login',
+    agent_id: 'a1',
+    user_id: 'aaaaaaaaaaaaaaaaaa000001',
+    actor: 'Alice from IT',
+    at: new Date(1_700_000_000_000 - i * 60_000).toISOString(),
+    ...over,
+  })
+  const person = (over: Partial<ExternalPrincipal> = {}): ExternalPrincipal => ({
+    agent_id: 'a1',
+    user_id: 'aaaaaaaaaaaaaaaaaa000001',
+    name: 'Alice from IT',
+    first_session_at: '2026-10-30T10:00:00Z',
+    last_session_at: '2026-10-31T10:00:00Z',
+    revoked_at: null,
+    ...over,
+  })
+  function serveExternal(log: ExternalAuditEntry[], people: ExternalPrincipal[] = []) {
+    mockApi.get.mockImplementation(async (url: string) => {
+      if (url.includes('external-rc-audit')) return { items: log, total: log.length } as never
+      if (url.includes('external-principals')) return { items: people, total: people.length } as never
+      return { items: [] } as never
+    })
+  }
+  /** Who is reading, by their permission mask. */
+  const readAs = (permissions: number) => useTenantStore().$patch({ myPermissions: permissions })
+  const externalAt = (width: number) =>
+    mount(ExternalAuditSection, {
+      props: { tenantId: 't1' },
+      global: { plugins: [vuetifyAt(width)] },
+    })
+  const logRows = (w: ReturnType<typeof externalAt>) =>
+    w.findAll('tbody tr').filter((r) => r.attributes('data-testid') !== 'external-person')
+
+  const MANAGE_AGENTS = PERMISSION_FLAGS.find((f) => f.key === 'MANAGE_AGENTS')!.bit
+  const REMOTE_CONTROL = PERMISSION_FLAGS.find((f) => f.key === 'REMOTE_CONTROL')!.bit
+
+  it('shows 20 cards a time on a phone, and every row on a wider screen', async () => {
+    const rows = Array.from({ length: 45 }, (_, i) => logRow(i))
+    serveExternal(rows)
+    readAs(MANAGE_AGENTS)
+    const phone = externalAt(360)
+    await flushPromises()
+    expect(logRows(phone)).toHaveLength(20)
+    await phone.get('[data-testid="audit-show-more"]').trigger('click')
+    expect(logRows(phone)).toHaveLength(40)
+
+    serveExternal(rows)
+    const wide = externalAt(1300)
+    await flushPromises()
+    expect(logRows(wide)).toHaveLength(45)
+  })
+
+  it('a refused login never reads as one that went through', async () => {
+    serveExternal([
+      logRow(0, {
+        login_refused: 'unavailable',
+        login_detail: 'an admin of the org barred this person from the device',
+      }),
+    ])
+    readAs(MANAGE_AGENTS)
+    const w = externalAt(1300)
+    await flushPromises()
+    const result = w.get('td[data-label="Result"]')
+    expect(result.text()).toBe('refused')
+    expect(result.get('.v-chip').attributes('title')).toContain('barred this person')
+  })
+
+  it('a bar says who it was about, and the account behind a name', async () => {
+    serveExternal(
+      [logRow(0, { action: 'principal', approved: false, actor: 'An Admin', principal: 'bbbbbbbbbbbbbbbbbb000002' })],
+      [person(), person({ agent_id: 'a2', user_id: 'cccccccccccccccccc000003', name: 'Alice from IT' })],
+    )
+    readAs(MANAGE_AGENTS)
+    const w = externalAt(1300)
+    await flushPromises()
+    expect(w.text()).toContain('about · 000002')
+    expect(w.text()).toContain('outside · 000001')
+    expect(w.text()).toContain('outside · 000003')
+  })
+
+  it('Bar asks the server, and the log reads again after', async () => {
+    serveExternal([], [person()])
+    readAs(MANAGE_AGENTS)
+    mockApi.put.mockResolvedValue({ revoked: true } as never)
+    const w = externalAt(1300)
+    await flushPromises()
+    mockApi.get.mockClear()
+    await w.get('[data-testid="external-bar"]').trigger('click')
+    await flushPromises()
+    expect(mockApi.put).toHaveBeenCalledWith(
+      '/tenant/t1/agent/a1/external-principals/aaaaaaaaaaaaaaaaaa000001',
+      { revoked: true },
+    )
+    const reads = mockApi.get.mock.calls.map(([url]) => url as string)
+    expect(reads.some((u) => u.includes('external-principals'))).toBe(true)
+    expect(reads.some((u) => u.includes('external-rc-audit'))).toBe(true)
+  })
+
+  it('a refusal shows its message and leaves the page where it is', async () => {
+    serveExternal([], [person({ revoked_at: '2026-10-31T11:00:00Z' })])
+    readAs(MANAGE_AGENTS | REMOTE_CONTROL)
+    mockApi.put.mockRejectedValue(new Error('granting external access also requires REMOTE_CONTROL'))
+    const w = externalAt(1300)
+    await flushPromises()
+    await w.get('[data-testid="external-let-back"]').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('also requires REMOTE_CONTROL')
+    expect(w.findAll('[data-testid="external-person"]')).toHaveLength(1)
+  })
+
+  it('only offers what this reader may do', async () => {
+    serveExternal([], [person(), person({ agent_id: 'a2', revoked_at: '2026-10-31T11:00:00Z' })])
+
+    readAs(0)
+    const reader = externalAt(1300)
+    await flushPromises()
+    expect(reader.find('[data-testid="external-bar"]').exists()).toBe(false)
+    expect(reader.find('[data-testid="external-let-back"]').exists()).toBe(false)
+
+    readAs(MANAGE_AGENTS)
+    const admin = externalAt(1300)
+    await flushPromises()
+    expect(admin.find('[data-testid="external-bar"]').exists()).toBe(true)
+    expect(admin.find('[data-testid="external-let-back"]').exists()).toBe(false)
+
+    readAs(MANAGE_AGENTS | REMOTE_CONTROL)
+    const both = externalAt(1300)
+    await flushPromises()
+    expect(both.find('[data-testid="external-let-back"]').exists()).toBe(true)
+  })
+
+  it('says what a bar stops, so nobody takes it for a locked door', async () => {
+    serveExternal([], [person()])
+    readAs(MANAGE_AGENTS)
+    const w = externalAt(1300)
+    await flushPromises()
+    expect(w.text()).toContain('It stops an account, not a person')
+    expect(w.text()).toContain('change the password on the device')
+  })
+
+  it('names an account that has gone, and a device it cannot name by its id', async () => {
+    serveExternal([], [person({ name: null })])
+    readAs(MANAGE_AGENTS)
+    const w = externalAt(1300)
+    await flushPromises()
+    expect(w.text()).toContain('Account removed')
+    expect(w.get('[data-testid="external-person"] td[data-label="Device"]').text()).toBe('a1')
   })
 })

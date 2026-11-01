@@ -1423,9 +1423,6 @@ async fn the_password_is_in_no_log_no_frame_and_no_collection() {
 #[tokio::test]
 async fn a_server_cannot_mint_a_session_the_device_never_logged_in() {
     use bson::oid::ObjectId;
-    use roomler_ai_mod_fleet::hub::OrgPolicy;
-    use roomler_ai_remote_control::models::{ConsentMode, RcOverlayMode, SessionPolicy};
-    use roomler_ai_remote_control::permissions::Permissions;
     use roomler_ai_remote_control::signaling::{ExternalGrant, ServerMsg};
 
     let app = TestApp::spawn().await;
@@ -1444,44 +1441,15 @@ async fn a_server_cannot_mint_a_session_the_device_never_logged_in() {
     let (stranger, _stranger_ws) = outsider(&app, "extmintb").await;
     let stranger = ObjectId::parse_str(&stranger).unwrap();
 
-    // What `handle_session` calls, minus everything that decides whether to.
     let mint = |who: ObjectId, attempt_id: &str| {
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let session = app
-            .state
-            .fleet()
-            .rc_hub
-            .create_session_full(
-                device,
-                who,
-                "minted by the server".to_string(),
-                tx,
-                Permissions::VIEW | Permissions::INPUT,
-                Vec::new(),
-                None,
-                None,
-                None,
-                false,
-                ConsentMode::Prompt,
-                None,
-                Vec::new(),
-                RcOverlayMode::Off,
-                None,
-                None,
-                false,
-                OrgPolicy::Read(SessionPolicy::default()),
-                None,
-                None,
-                None,
-                Some(ExternalGrant {
-                    attempt_id: attempt_id.to_string(),
-                }),
-                None,
-                None,
-                None,
-            )
-            .expect("the Hub takes the request: the DEVICE is what refuses it");
-        (session, rx)
+        mint_session(
+            &app,
+            device,
+            who,
+            Some(ExternalGrant {
+                attempt_id: attempt_id.to_string(),
+            }),
+        )
     };
     // The session's outcome as the controller's channel hears it.
     async fn outcome(mut rx: tokio::sync::mpsc::Receiver<ServerMsg>) -> Value {
@@ -1537,6 +1505,66 @@ async fn a_server_cannot_mint_a_session_the_device_never_logged_in() {
 /// arrive, under a fresh principal so the per-principal limit is not what gets
 /// measured: how long until the answer left, and the answer.
 async fn knock_timed(app: &TestApp, code: &str, ke1: &str) -> (Duration, Value) {
+    knock_as(app, bson::oid::ObjectId::new(), code, ke1).await
+}
+
+/// What `handle_session` calls, minus everything that decides whether to. With
+/// no grant, the session is an ordinary one, as an org member's is.
+fn mint_session(
+    app: &TestApp,
+    device: bson::oid::ObjectId,
+    who: bson::oid::ObjectId,
+    external: Option<roomler_ai_remote_control::signaling::ExternalGrant>,
+) -> (
+    bson::oid::ObjectId,
+    tokio::sync::mpsc::Receiver<roomler_ai_remote_control::signaling::ServerMsg>,
+) {
+    use roomler_ai_mod_fleet::hub::OrgPolicy;
+    use roomler_ai_remote_control::models::{ConsentMode, RcOverlayMode, SessionPolicy};
+    use roomler_ai_remote_control::permissions::Permissions;
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let session = app
+        .state
+        .fleet()
+        .rc_hub
+        .create_session_full(
+            device,
+            who,
+            "minted by the server".to_string(),
+            tx,
+            Permissions::VIEW | Permissions::INPUT,
+            Vec::new(),
+            None,
+            None,
+            None,
+            false,
+            ConsentMode::Prompt,
+            None,
+            Vec::new(),
+            RcOverlayMode::Off,
+            None,
+            None,
+            false,
+            OrgPolicy::Read(SessionPolicy::default()),
+            None,
+            None,
+            None,
+            external,
+            None,
+            None,
+            None,
+        )
+        .expect("the Hub takes the request: the DEVICE is what refuses it");
+    (session, rx)
+}
+
+/// [`knock_timed`], as one person.
+async fn knock_as(
+    app: &TestApp,
+    principal: bson::oid::ObjectId,
+    code: &str,
+    ke1: &str,
+) -> (Duration, Value) {
     let remote = app.state.modules.remote.clone().unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
     let (code, ke1) = (code.to_string(), ke1.to_string());
@@ -1547,13 +1575,7 @@ async fn knock_timed(app: &TestApp, code: &str, ke1: &str) -> (Duration, Value) 
             frame: json!({}),
         };
         roomler_ai_mod_remote::extauth::handle_start(
-            &remote,
-            bson::oid::ObjectId::new(),
-            "knock",
-            &tx,
-            &code,
-            ke1,
-            hop,
+            &remote, principal, "knock", &tx, &code, ke1, hop,
         )
         .await;
     });
@@ -2080,5 +2102,689 @@ async fn a_desired_config_push_with_an_external_key_is_refused() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
+    let _ = dev.stop.send(true);
+}
+
+// ─── P5: who came in, who hears of it, and who is barred ─────────────────────
+
+fn oid(hex: &str) -> bson::oid::ObjectId {
+    bson::oid::ObjectId::parse_str(hex).unwrap()
+}
+
+/// How long a notice that should not exist gets to appear. They are spawned, so
+/// "none" is only read after a positive sign that the path ran, plus this.
+const SETTLE: Duration = Duration::from_millis(500);
+
+/// How often these helpers look. ⚠️ The API allows a burst of 60 from one address
+/// and refills at one a second, and a body that is a 429 reads as a JSON error. A
+/// poll that hits that fails for the wrong reason, on a slow runner in a healthy
+/// run too, so a poll that runs out its 10 s stays well under it.
+const POLL: Duration = Duration::from_millis(500);
+
+/// The FR-52 notices this token's owner holds.
+async fn notices(app: &TestApp, token: &str) -> Vec<Value> {
+    let resp = app
+        .auth_get("/api/notification", token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the notification list");
+    let body: Value = resp.json().await.unwrap();
+    body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["notification_type"] == "external_access")
+        .cloned()
+        .collect()
+}
+
+async fn wait_for_notices(app: &TestApp, token: &str, count: usize) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = notices(app, token).await;
+        if got.len() >= count {
+            return got;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} of {count} notices: {got:#?}",
+            got.len()
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// This person's row on the org's people list, once a session has made it.
+async fn person(app: &TestApp, seeded: &SeededTenant, dev: &Device, who: &str) -> Option<Value> {
+    let body: Value = app
+        .auth_get(
+            &url(seeded, "/external-principals"),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["agent_id"] == json!(dev.agent_id) && p["user_id"] == json!(who))
+        .cloned()
+}
+
+/// Wait for a session to be noted: the write is spawned behind the session, so a
+/// row whose `last_session_at` is past `since` is the sign that it ran.
+async fn noted(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    dev: &Device,
+    who: &str,
+    since: Option<&Value>,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(row) = person(app, seeded, dev, who).await
+            && Some(&row["last_session_at"]) != since
+        {
+            return row;
+        }
+        assert!(Instant::now() < deadline, "the session was never noted");
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The first row of the org's log that `found` accepts. Rows are spawned too.
+async fn wait_for_row(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    found: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let body: Value = app
+            .auth_get(
+                &url(seeded, "/external-rc-audit"),
+                &seeded.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(row) = body["items"].as_array().unwrap().iter().find(|r| found(r)) {
+            return row.clone();
+        }
+        assert!(Instant::now() < deadline, "no such row: {body:#}");
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// End a session from the server's side, and read the end on the outsider's
+/// socket, so the next one is a session of its own.
+async fn end_session(app: &TestApp, ws: &mut Ws, session: &str) {
+    use roomler_ai_remote_control::models::EndReason;
+    app.state
+        .fleet()
+        .rc_hub
+        .terminate(oid(session), EndReason::Error)
+        .unwrap();
+    let end = next_of(ws, &["rc:terminate"]).await;
+    assert_eq!(end["session_id"], json!(session), "{end}");
+}
+
+/// Both pods' subscribers up, so a ctrl event published now is heard.
+async fn wait_for_bus(app1: &TestApp, app2: &TestApp) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for _ in 0..40 {
+        let (a, b) = (
+            app1.state.cluster_bus.as_ref().unwrap(),
+            app2.state.cluster_bus.as_ref().unwrap(),
+        );
+        if a.sub_alive.load(Relaxed) && b.sub_alive.load(Relaxed) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The org hears of a person's first session on a device, and only that one. The
+/// log says nothing about it: "first ever" outlives the log's 90 days, or it would
+/// come round every quarter. Whoever manages the org's devices hears, and the
+/// device's owner, and a member who is neither does not. Nobody is told about
+/// themselves, so an admin coming in from outside is news to the others alone.
+#[tokio::test]
+async fn the_org_hears_of_a_persons_first_session_once() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-first").await;
+    let (admin, member) = (&seeded.admin.access_token, &seeded.member.access_token);
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-first",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+
+    // Their first.
+    let (first, mut ws) = outsider(&app, "extfirst").await;
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &first).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    let told = wait_for_notices(&app, admin, 1).await;
+    assert_eq!(told.len(), 1, "{told:#?}");
+    assert_eq!(
+        told[0]["link"],
+        json!(format!("/tenant/{}/audit/external", seeded.tenant_id)),
+        "{told:#?}"
+    );
+    let (title, body) = (
+        told[0]["title"].as_str().unwrap(),
+        told[0]["body"].as_str().unwrap(),
+    );
+    assert!(title.contains("mach-extauth-first"), "{title}");
+    assert!(
+        body.contains("calling itself \"An Outsider\""),
+        "the name is quoted as the claim it is: {body}"
+    );
+    let row = noted(&app, &seeded, &dev, &first, None).await;
+    assert_eq!(row["first_session_at"], row["last_session_at"], "{row}");
+    assert_eq!(row["name"], "An Outsider", "{row}");
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        notices(&app, member).await.is_empty(),
+        "a member who neither manages devices nor owns this one is not told"
+    );
+
+    // Their second: the row moves and nobody hears.
+    end_session(&app, &mut ws, &session).await;
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &first).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    let second = noted(
+        &app,
+        &seeded,
+        &dev,
+        &first,
+        Some(&row["last_session_at"].clone()),
+    )
+    .await;
+    assert_eq!(second["first_session_at"], row["first_session_at"]);
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(notices(&app, admin).await.len(), 1, "the same person again");
+
+    // Their third, with the log empty as its TTL would leave it.
+    app.db
+        .collection::<bson::Document>("external_rc_audit")
+        .delete_many(bson::doc! {})
+        .await
+        .unwrap();
+    end_session(&app, &mut ws, &session).await;
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &first).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    noted(
+        &app,
+        &seeded,
+        &dev,
+        &first,
+        Some(&second["last_session_at"].clone()),
+    )
+    .await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        notices(&app, admin).await.len(),
+        1,
+        "it must not rest on the log, which forgets"
+    );
+    end_session(&app, &mut ws, &session).await;
+
+    // The device changes hands, and a second person is a new fact.
+    app.db
+        .collection::<bson::Document>("agents")
+        .update_one(
+            bson::doc! { "_id": oid(&dev.agent_id) },
+            bson::doc! { "$set": { "owner_user_id": oid(&seeded.member.id) } },
+        )
+        .await
+        .unwrap();
+    let (next, mut next_ws) = outsider(&app, "extfirstb").await;
+    let (attempt_id, _) = login(&mut next_ws, &dev.code, &pw("device"), &next).await;
+    let session = open_session(&mut next_ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    assert_eq!(wait_for_notices(&app, admin, 2).await.len(), 2);
+    assert_eq!(
+        wait_for_notices(&app, member, 1).await.len(),
+        1,
+        "the device's owner hears, with no role that says so"
+    );
+    end_session(&app, &mut next_ws, &session).await;
+
+    // Someone the notice would otherwise go to comes in from outside.
+    let ws_url = format!("ws://{}/ws?token={admin}", app.addr);
+    let (mut own_ws, _) = connect_async(&ws_url).await.expect("user socket");
+    let (attempt_id, _) = login(&mut own_ws, &dev.code, &pw("device"), &seeded.admin.id).await;
+    open_session(&mut own_ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    assert_eq!(wait_for_notices(&app, member, 2).await.len(), 2);
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        notices(&app, admin).await.len(),
+        2,
+        "nobody is told about themselves"
+    );
+    let _ = dev.stop.send(true);
+}
+
+/// A wrong guess leaves nothing on the server, because the client stops at KE2
+/// (§4b). The device starting to refuse is the first anyone sees of it, and it is
+/// said once, however many accounts keep at it.
+#[tokio::test]
+async fn the_org_hears_once_that_a_password_is_being_guessed() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-guessing").await;
+    let (admin, member) = (&seeded.admin.access_token, &seeded.member.access_token);
+    let dev = device(&app, &seeded, "mach-extauth-guessing", &pw("device")).await;
+    let (_id, mut ws) = outsider(&app, "extguessing").await;
+
+    async fn guess(ws: &mut Ws, code: &str) -> Value {
+        let (_, ke1) = client_ke1(&pw("guess"));
+        send(
+            ws,
+            json!({"t": "rc:extauth.start", "connect_code": code, "ke1": ke1}),
+        )
+        .await;
+        next_of(ws, &["rc:extauth.challenge", "rc:extauth.result"]).await
+    }
+
+    for n in 0..5 {
+        let answer = guess(&mut ws, &dev.code).await;
+        assert_eq!(answer["t"], "rc:extauth.challenge", "guess {n}: {answer}");
+    }
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        notices(&app, admin).await.is_empty(),
+        "the budget is the device's to spend, and nothing has been refused yet"
+    );
+
+    let refused = guess(&mut ws, &dev.code).await;
+    assert_eq!(refused["refused"], "throttled", "{refused}");
+    let told = wait_for_notices(&app, admin, 1).await;
+    let (title, body) = (
+        told[0]["title"].as_str().unwrap(),
+        told[0]["body"].as_str().unwrap(),
+    );
+    assert!(title.contains("mach-extauth-guessing"), "{title}");
+    assert!(
+        body.contains("rotate the device's connect code"),
+        "it says what ends it: {body}"
+    );
+
+    // More of the same, and from another account.
+    let refused = guess(&mut ws, &dev.code).await;
+    assert_eq!(refused["refused"], "throttled", "{refused}");
+    let (_other, mut other_ws) = outsider(&app, "extguessingb").await;
+    let refused = guess(&mut other_ws, &dev.code).await;
+    assert_eq!(refused["refused"], "throttled", "{refused}");
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(notices(&app, admin).await.len(), 1, "one notice a window");
+    assert!(notices(&app, member).await.is_empty());
+    let _ = dev.stop.send(true);
+}
+
+/// A bar puts a person out and keeps them out. The session they are in ends, a
+/// login they have verified and one still in flight both die, and a new knock
+/// answers what a code that does not exist answers, at the floor. The org's log
+/// says why, and letting them back opens the door again.
+#[tokio::test]
+async fn a_barred_person_is_put_out_and_kept_out_until_let_back() {
+    use roomler_ai_mod_remote::extauth::ANSWER_FLOOR;
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-bar").await;
+    let admin = &seeded.admin.access_token;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-bar",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws) = outsider(&app, "extbar").await;
+    let standing = url(
+        &seeded,
+        &format!("/agent/{}/external-principals/{principal}", dev.agent_id),
+    );
+
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    noted(&app, &seeded, &dev, &principal, None).await;
+
+    // What they hold as the bar lands: a login the device has verified, and one
+    // with only its KE3 left to send.
+    let (verified, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let (state, ke1) = client_ke1(&pw("device"));
+    send(
+        &mut ws,
+        json!({"t": "rc:extauth.start", "connect_code": dev.code, "ke1": ke1}),
+    )
+    .await;
+    let challenge = next_of(&mut ws, &["rc:extauth.challenge", "rc:extauth.result"]).await;
+    assert_eq!(challenge["t"], "rc:extauth.challenge", "{challenge}");
+    let in_flight = challenge["attempt_id"].as_str().unwrap().to_string();
+    let ke3 = client_ke3(state, &pw("device"), challenge["ke2"].as_str().unwrap()).unwrap();
+
+    assert_eq!(
+        put(&app, &standing, admin, json!({ "revoked": true })).await,
+        200
+    );
+
+    let end = next_of(&mut ws, &["rc:terminate"]).await;
+    assert_eq!(end["session_id"], json!(session), "{end}");
+    assert_eq!(end["reason"], "admin_terminated", "{end}");
+
+    send(
+        &mut ws,
+        json!({
+            "t": "rc:extauth.finish",
+            "connect_code": dev.code,
+            "attempt_id": in_flight,
+            "ke3": ke3,
+        }),
+    )
+    .await;
+    let refused = next_of(&mut ws, &["rc:extauth.result"]).await;
+    assert_eq!(
+        refused["refused"], "unavailable",
+        "a login in flight: {refused}"
+    );
+
+    send(
+        &mut ws,
+        json!({
+            "t": "rc:extauth.session",
+            "connect_code": dev.code,
+            "attempt_id": verified,
+            "permissions": "VIEW | INPUT",
+        }),
+    )
+    .await;
+    let refused = next_of(&mut ws, &["rc:session.created", "rc:extauth.result"]).await;
+    assert_eq!(refused["t"], "rc:extauth.result", "{refused}");
+    assert_eq!(
+        refused["refused"], "unavailable",
+        "a verified login: {refused}"
+    );
+
+    let (_, ke1) = client_ke1(&pw("device"));
+    let (took, barred) = knock_as(&app, oid(&principal), &dev.code, &ke1).await;
+    let (_, no_such_code) = knock_timed(&app, "0000-0000-0000", &ke1).await;
+    assert_eq!(
+        barred.to_string(),
+        no_such_code.to_string(),
+        "to the outsider, the same closed door"
+    );
+    assert!(
+        took >= ANSWER_FLOOR,
+        "answered in {took:?}, under the floor"
+    );
+
+    // The org's log tells them apart, at all three steps.
+    for (action, step) in [
+        ("login", in_flight.as_str()),
+        ("session", verified.as_str()),
+    ] {
+        let row = wait_for_row(&app, &seeded, |r| {
+            r["action"] == action && r["attempt_id"] == json!(step)
+        })
+        .await;
+        assert_eq!(row["login_refused"], "unavailable", "{row}");
+        assert_eq!(
+            row["login_detail"], "an admin of the org barred this person from the device",
+            "{row}"
+        );
+    }
+    wait_for_row(&app, &seeded, |r| {
+        r["action"] == "login"
+            && r["attempt_id"].is_null()
+            && r["login_detail"] == "an admin of the org barred this person from the device"
+    })
+    .await;
+    let row = person(&app, &seeded, &dev, &principal).await.unwrap();
+    assert!(row["revoked_at"].is_string(), "{row}");
+
+    // Let back, and the door opens.
+    assert_eq!(
+        put(&app, &standing, admin, json!({ "revoked": false })).await,
+        200
+    );
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    let row = person(&app, &seeded, &dev, &principal).await.unwrap();
+    assert!(row["revoked_at"].is_null(), "{row}");
+
+    for approved in [false, true] {
+        let row = wait_for_row(&app, &seeded, |r| {
+            r["action"] == "principal" && r["approved"] == json!(approved)
+        })
+        .await;
+        assert_eq!(row["principal"], json!(principal), "{row}");
+        assert_eq!(row["user_id"], json!(seeded.admin.id), "{row}");
+    }
+    let _ = dev.stop.send(true);
+}
+
+/// The admin's request lands on one pod and the session lives on the other: only
+/// the ctrl event can reach it.
+#[tokio::test]
+async fn a_bar_on_the_other_pod_ends_the_session() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_bus.is_none() {
+        eprintln!("SKIPPED a_bar_on_the_other_pod_ends_the_session: no Redis");
+        return;
+    }
+    wait_for_bus(&app1, &app2).await;
+
+    let seeded = app1.seed_tenant("extauth-xpod-bar").await;
+    let dev = device_with(
+        &app1,
+        &seeded,
+        "mach-extauth-xpod-bar",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws) = outsider(&app2, "extxpodbar").await;
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    noted(&app1, &seeded, &dev, &principal, None).await;
+    let hub1 = &app1.state.fleet().rc_hub;
+    assert!(
+        hub1.session_snapshot(oid(&session)).is_some()
+            && app2
+                .state
+                .fleet()
+                .rc_hub
+                .session_snapshot(oid(&session))
+                .is_none(),
+        "the session lives with the device, on pod 1"
+    );
+
+    let standing = url(
+        &seeded,
+        &format!("/agent/{}/external-principals/{principal}", dev.agent_id),
+    );
+    assert_eq!(
+        put(
+            &app2,
+            &standing,
+            &seeded.admin.access_token,
+            json!({ "revoked": true })
+        )
+        .await,
+        200
+    );
+    let end = next_of(&mut ws, &["rc:terminate"]).await;
+    assert_eq!(end["session_id"], json!(session), "{end}");
+    assert_eq!(end["reason"], "admin_terminated", "{end}");
+    assert!(hub1.session_snapshot(oid(&session)).is_none());
+    let _ = dev.stop.send(true);
+}
+
+/// The crossing. The gates read the row, an admin bars the person and finds no
+/// session yet, and the Hub opens one. Played here by writing the bar through
+/// the DAO, which ends nothing, under a live session: what `session_opened` then
+/// reads back is all that stands between that session and the bar.
+#[tokio::test]
+async fn a_bar_that_crossed_an_opening_session_ends_it() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-crossing").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-crossing",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws) = outsider(&app, "extcrossing").await;
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    noted(&app, &seeded, &dev, &principal, None).await;
+
+    let fleet = app.state.fleet();
+    let (tenant, device, who) = (oid(&seeded.tenant_id), oid(&dev.agent_id), oid(&principal));
+    fleet
+        .external_principals
+        .set_revoked(tenant, device, who, oid(&seeded.admin.id), true)
+        .await
+        .unwrap();
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        fleet.rc_hub.session_snapshot(oid(&session)).is_some(),
+        "the DAO ends nothing: this is the state the race leaves"
+    );
+
+    let agent = fleet
+        .agents
+        .base
+        .find_by_id_in_tenant(tenant, device)
+        .await
+        .unwrap();
+    let remote = app.state.modules.remote.clone().unwrap();
+    roomler_ai_mod_remote::extauth::session_opened(&remote, &agent, device, who, "crossing").await;
+
+    let end = next_of(&mut ws, &["rc:terminate"]).await;
+    assert_eq!(end["session_id"], json!(session), "{end}");
+    let _ = dev.stop.send(true);
+}
+
+/// A second bar changes no row and writes nothing to the log, and it still ends
+/// the session: the first call may have raced it. The bar here is the state such
+/// a race leaves, with the row revoked and the session live.
+#[tokio::test]
+async fn a_repeated_bar_still_ends_the_session() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-repeat").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-repeat",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws) = outsider(&app, "extrepeat").await;
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    noted(&app, &seeded, &dev, &principal, None).await;
+
+    let barred = app
+        .state
+        .fleet()
+        .external_principals
+        .set_revoked(
+            oid(&seeded.tenant_id),
+            oid(&dev.agent_id),
+            oid(&principal),
+            oid(&seeded.admin.id),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(barred, Some(true));
+    let standing = url(
+        &seeded,
+        &format!("/agent/{}/external-principals/{principal}", dev.agent_id),
+    );
+    assert_eq!(
+        put(
+            &app,
+            &standing,
+            &seeded.admin.access_token,
+            json!({ "revoked": true })
+        )
+        .await,
+        200
+    );
+    let end = next_of(&mut ws, &["rc:terminate"]).await;
+    assert_eq!(end["session_id"], json!(session), "{end}");
+    let _ = dev.stop.send(true);
+}
+
+/// A bar stops this person's external standing on this device. The session the
+/// same account holds as a member came through the other door, with gates of its
+/// own, and it stands.
+#[tokio::test]
+async fn a_bar_leaves_a_session_the_account_holds_as_a_member() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-member").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-member",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws) = outsider(&app, "extmember").await;
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let external = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    noted(&app, &seeded, &dev, &principal, None).await;
+
+    let (ordinary, _rx) = mint_session(&app, oid(&dev.agent_id), oid(&principal), None);
+    assert_ne!(ordinary.to_hex(), external, "two sessions");
+
+    // A ctrl envelope naming another org ends nothing.
+    let hub = &app.state.fleet().rc_hub;
+    let foreign = bson::oid::ObjectId::new();
+    assert_eq!(
+        hub.terminate_external_of(oid(&dev.agent_id), oid(&principal), foreign),
+        0
+    );
+    assert!(hub.session_snapshot(oid(&external)).is_some());
+
+    let standing = url(
+        &seeded,
+        &format!("/agent/{}/external-principals/{principal}", dev.agent_id),
+    );
+    assert_eq!(
+        put(
+            &app,
+            &standing,
+            &seeded.admin.access_token,
+            json!({ "revoked": true })
+        )
+        .await,
+        200
+    );
+    let end = next_of(&mut ws, &["rc:terminate"]).await;
+    assert_eq!(end["session_id"], json!(external), "{end}");
+    tokio::time::sleep(SETTLE).await;
+    assert!(hub.session_snapshot(oid(&external)).is_none());
+    assert!(
+        hub.session_snapshot(ordinary).is_some(),
+        "the session held as a member stands"
+    );
     let _ = dev.stop.send(true);
 }

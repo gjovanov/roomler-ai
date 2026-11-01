@@ -557,7 +557,7 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3385`,
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3411`,
 `virtual_desktop.rs:685`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
@@ -1984,7 +1984,7 @@ Measured on the released 0.4.142 with S3 in the lab: 48 s that named no reason,
 the last 19 of them after the wake.
 
 Now the viewer keeps a `host_sleep` notice through the redial
-(`waitKeptAcrossReconnect`, `ui/src/composables/useRemoteControl.ts:1013`). Its
+(`waitKeptAcrossReconnect`, `ui/src/composables/useRemoteControl.ts:1015`). Its
 deadline is spent, so the stall watchdog is not held: a new session that stays
 silent is still re-created on the usual clock. The stage shows the notice in
 every redial phase, with that phase's own words beneath it

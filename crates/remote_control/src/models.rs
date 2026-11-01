@@ -4510,6 +4510,15 @@ pub enum ExternalRcAuditAction {
     /// session" is one join. What the DEVICE then decides — its own consent,
     /// its own ceiling — is the session's own audit trail, not this row.
     Session,
+    /// FR-52 P5 — an admin barred a person from a device (`approved:
+    /// Some(false)`) or let them back (`Some(true)`). `user_id` is the admin,
+    /// `principal` the person; a refused attempt carries `denied`.
+    Principal,
+    /// An action this build does not know, a newer server's. Read as itself,
+    /// so one new kind of row cannot fail a whole page of the log on an older
+    /// pod mid-roll.
+    #[serde(other)]
+    Other,
 }
 
 /// One external-access decision, granted or refused. TTL-expired after 90 days
@@ -4571,10 +4580,52 @@ pub struct ExternalRcAuditEvent {
     /// then decided.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<ObjectId>,
+    /// `principal` — the person the admin acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<ObjectId>,
 }
 
 impl ExternalRcAuditEvent {
     pub const COLLECTION: &'static str = "external_rc_audit";
+}
+
+/// FR-52 P5 — one person from outside, on one device: the org's lasting memory
+/// of who came in, and the row a revocation sits on.
+///
+/// It exists because [`ExternalRcAuditEvent`]s TTL out at 90 days: a "first
+/// session ever" read off them would come round every quarter. Per device, not
+/// per org, because the password is the device's, so a person proving a second
+/// device's password is a new fact.
+///
+/// ⚠️ A session makes the row and nothing else does. The people list joins
+/// `users` for a name at read time, so a route that could make a row for any id
+/// would read any account's name to any org admin.
+///
+/// No name of its own: the row has no TTL, and a name is the account's to
+/// change.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ExternalPrincipal {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub agent_id: ObjectId,
+    /// The outsider's own account.
+    pub user_id: ObjectId,
+    pub first_session_at: DateTime,
+    pub last_session_at: DateTime,
+    /// While set, this person is barred from this device (`gates` in the
+    /// extauth relay). A server gate, like the org's switch and the device's
+    /// approval: it stops an account, and it does not survive a compromised
+    /// server. Changing the device's password does both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<DateTime>,
+    /// The admin who barred them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_by: Option<ObjectId>,
+}
+
+impl ExternalPrincipal {
+    pub const COLLECTION: &'static str = "external_principals";
 }
 
 /// FR-52 P3 — why an external-access login step was refused.
@@ -4833,6 +4884,7 @@ mod external_access_tests {
             login_refused: None,
             login_detail: None,
             session_id: None,
+            principal: None,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert!(json.get("approved").is_none());
@@ -7348,6 +7400,23 @@ impl BlockList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-52 P5 — the stored spelling of the newest action, and an action from a
+    /// newer server read as `Other`, through BSON, which is how a page of the log
+    /// is read. One new kind of row must not fail the page on an older pod.
+    #[test]
+    fn an_audit_action_this_build_does_not_know_is_read_not_refused() {
+        assert_eq!(
+            bson::to_bson(&ExternalRcAuditAction::Principal).unwrap(),
+            bson::Bson::String("principal".into())
+        );
+        #[derive(Deserialize)]
+        struct Row {
+            action: ExternalRcAuditAction,
+        }
+        let row: Row = bson::from_document(bson::doc! { "action": "quorum_reached" }).unwrap();
+        assert_eq!(row.action, ExternalRcAuditAction::Other);
+    }
 
     /// #1882 — every policy row written before `rc_overlay` existed must read
     /// OFF: the default is the whole point, and it has to hold for the rows

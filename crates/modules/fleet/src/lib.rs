@@ -50,8 +50,9 @@ use roomler_ai_services::dao::{
     config_audit::ConfigAuditDao, consent_request::ConsentRequestDao,
     device_pairing::DevicePairingDao, enroll_token_issued::EnrollTokenIssuedDao,
     enrollment_key::EnrollmentKeyDao, exec_audit::ExecAuditDao, exec_pending::ExecPendingDao,
-    external_rc_audit::ExternalRcAuditDao, keep_busy_event::KeepBusyEventDao,
-    pairing_audit::PairingAuditDao, setup_diagnostics::SetupDiagnosticsDao,
+    external_principal::ExternalPrincipalDao, external_rc_audit::ExternalRcAuditDao,
+    keep_busy_event::KeepBusyEventDao, pairing_audit::PairingAuditDao,
+    setup_diagnostics::SetupDiagnosticsDao,
 };
 use roomler_core::{
     Capabilities, Core, Module, TenantCtx,
@@ -141,6 +142,9 @@ pub struct FleetState {
     /// outsiders, and every refusal. The server's own record, never the
     /// session's.
     pub external_rc_audit: Arc<ExternalRcAuditDao>,
+    /// FR-52 P5 — who has come in from outside, per device, for as long as the
+    /// org lasts: "first ever" and a revocation both outlive the audit's TTL.
+    pub external_principals: Arc<ExternalPrincipalDao>,
     /// Remote-config decisions (`docs/remote-config.md`): what was ASKED for
     /// on a device, granted or refused — never what the device did.
     pub config_audit: Arc<ConfigAuditDao>,
@@ -322,6 +326,7 @@ impl Module for FleetState {
             exec_audit: Arc::new(ExecAuditDao::new(db)),
             exec_pending: Arc::new(ExecPendingDao::new(db)),
             external_rc_audit: Arc::new(ExternalRcAuditDao::new(db)),
+            external_principals: Arc::new(ExternalPrincipalDao::new(db)),
             config_audit: Arc::new(ConfigAuditDao::new(db)),
             keep_busy_events: Arc::new(KeepBusyEventDao::new(db)),
             rc_hub,
@@ -466,6 +471,12 @@ impl Module for FleetState {
                 "/{agent_id}/connect-code",
                 get(external_access::get_connect_code).post(external_access::rotate_connect_code),
             )
+            // FR-52 P5 — bar a person from this device, or let them back.
+            // MANAGE_AGENTS to bar, + REMOTE_CONTROL to let back (gate 2's rule).
+            .route(
+                "/{agent_id}/external-principals/{user_id}",
+                put(external_access::set_principal),
+            )
             // Remote config — records an INTENT for the device to reconcile.
             .route(
                 "/{agent_id}/desired-config",
@@ -484,6 +495,7 @@ impl Module for FleetState {
             get(external_access::get_settings).put(external_access::set_enabled),
         );
         let external_rc_audit = Router::new().route("/", get(external_access::audit));
+        let external_principals = Router::new().route("/", get(external_access::principals));
         let exec_settings = Router::new().route(
             "/",
             get(agent_exec::get_org_settings).put(agent_exec::set_org_settings),
@@ -602,6 +614,10 @@ impl Module for FleetState {
             .nest("/tenant/{tenant_id}/exec-audit", exec_audit)
             .nest("/tenant/{tenant_id}/external-access", external_access)
             .nest("/tenant/{tenant_id}/external-rc-audit", external_rc_audit)
+            .nest(
+                "/tenant/{tenant_id}/external-principals",
+                external_principals,
+            )
             .nest("/tenant/{tenant_id}/exec-settings", exec_settings)
             .nest("/tenant/{tenant_id}/keep-busy-settings", keep_busy_settings)
             .nest("/tenant/{tenant_id}/keep-busy-history", keep_busy_history)
@@ -764,6 +780,17 @@ impl Module for FleetState {
                     index(bson::doc! { "agent_id": 1, "at": -1 }),
                     index(bson::doc! { "tenant_id": 1, "user_id": 1, "at": -1 }),
                     index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+                ],
+            },
+            // FR-52 P5 — one row per person per device, and no TTL: "first ever"
+            // must outlive the audit log. The unique index is what arbitrates
+            // two first sessions on two pods.
+            IndexSet {
+                collection: "external_principals",
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index_unique(bson::doc! { "agent_id": 1, "user_id": 1 }),
+                    index(bson::doc! { "tenant_id": 1, "last_session_at": -1 }),
                 ],
             },
             IndexSet {

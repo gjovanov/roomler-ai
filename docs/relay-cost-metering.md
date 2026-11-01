@@ -55,6 +55,12 @@ flowchart LR
 > signalling; metering it would invert the growth model and charge for exactly the outcome
 > the whole NAT-traversal program exists to produce. The cheapest customer to serve is the
 > one whose peers connect directly, and the meter must say so.
+>
+> **Measured 2026-11-01:** a remote-control session that ends direct is close to that, not at
+> it. It books about 380 KB of `turn_bytes` while ICE settles, flat across one minute and
+> three, and nothing for the bytes on the direct pair. A viewer offering no relay candidate
+> booked 10 KB. Those bytes did cross a relay, so the meter is right. The numbers are in
+> [FR-52, decision 17](fr/FR-52-cross-org-remote-access.md#9-open-decisions).
 
 ## One ledger, and why it needs no lock
 
