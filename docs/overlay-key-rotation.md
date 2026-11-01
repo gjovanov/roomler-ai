@@ -232,7 +232,7 @@ standing (`fleet/src/socket.rs:275-281`).
 ## Reconcile on connect — and the three races it must not re-run
 
 At agent register, where `ConfigPush` reconciles, a standing order is pushed again
-if the hello advertises `key-rotate` (`crates/modules/fleet/src/socket.rs:366-382`,
+if the hello advertises `key-rotate` (`crates/modules/fleet/src/socket.rs:372-388`,
 `:440-461`) — the offline case, through the same path as the online one, so it runs
 on every connect rather than only when nobody is watching. Three field cycles on
 2026-08-30 each found a way for that to go wrong; each left a rule:
@@ -310,7 +310,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:3287`, `:1008`; owner `network` (`:2463`, `modular-monolith.md`) |
 | models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:1867`, `:1893`, `:1918`, `:1949`, `:3606`, `:6247`, `:6262` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
-| reconcile-on-connect | `crates/modules/fleet/src/socket.rs:366-382`, `:445-466` |
+| reconcile-on-connect | `crates/modules/fleet/src/socket.rs:372-388`, `:453-474` |
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
 | identity stamp at the join | `crates/modules/network/src/overlay.rs:543-566`; `crates/services/src/dao/agent.rs:990` |
 | the conditional report write | `crates/services/src/dao/agent.rs:1044-1074` |

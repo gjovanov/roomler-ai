@@ -218,7 +218,7 @@ owner's: gate 3 of cross-org access, and the password record behind it. `Desired
 cannot hold one, under a prefix test, so the key that matters is also the one added
 after the test was written. The route says so instead of answering 200 for a key it
 dropped: a body naming one is refused with a 403 and audited as `device_owned_key`
-(`names_a_device_owned_key`, `crates/modules/fleet/src/remote_config.rs:171`). That
+(`names_a_device_owned_key`, `crates/modules/fleet/src/remote_config.rs:172`). That
 refusal is a courtesy to the admin who asked. What stops a compromised server is the
 device, whose frame type drops the key whatever a frame carries
 (`a_pushed_external_key_never_reaches_the_device`,
@@ -268,7 +268,7 @@ Unlike the two denylists, the server reads the word. It takes the words
 `roomler config set` takes (`true`/`false`, `1`/`0`, `yes`/`no`, in any case),
 stores the spelling above, and refuses anything else with a 400 that names the
 key, recording nothing (`pushed_tribool`,
-`crates/modules/fleet/src/remote_config.rs:182`). A tribool has no entries a
+`crates/modules/fleet/src/remote_config.rs:183`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
 (`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3104`), and a test
@@ -293,7 +293,7 @@ it only ever *removes* a GPU form a device would otherwise open. It reports
 `needs_restart`, because the probe reads it once per process and the encoders
 read it through the config fallbacks
 (`agents/roomlerd/src/remote_config.rs:354`). The server passes it on unread
-(`crates/modules/fleet/src/remote_config.rs:229`): an entry the gate cannot read
+(`crates/modules/fleet/src/remote_config.rs:283`): an entry the gate cannot read
 denies nothing, because `gpu_hint::is_denied` matches only an exact `name:gpu`.
 It exists so that a GPU-input cell can be turned off from the server before any
 cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
