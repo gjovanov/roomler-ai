@@ -183,7 +183,7 @@ code and the password cover that case.
 | | Charged to | How |
 |---|---|---|
 | Session slots | The org the session is **for**: the one the outsider named on `/connect` and belongs to, else their only org, else the account itself at Free's one session. No paid org is needed | `charge_scope` (`extauth.rs:990`), FR-115 O6 + O7. With slots off, or Redis unable to answer, the session runs uncounted, never refused on a guess |
-| Relay bytes | The **device's** org, on both legs | The Hub issues the TURN credentials under the session's org, and the viewer takes the ones `rc:ready` carries before its first gathering (FR-52 F3). A frame with no usable server leaves the pre-fetch in place: connecting uncharged beats not connecting |
+| Relay bytes | The **device's** org, on both legs | The Hub issues the TURN credentials under the session's org, and the viewer takes the ones `rc:ready` carries before its first gathering (FR-52 F3). A frame with no usable server leaves the pre-fetch in place: connecting uncharged beats not connecting. A session that ends direct books none of its direct bytes, and about 380 KB for what ICE spent on relays first (FR-52, decision 17) |
 
 ## 7. Operating it
 
