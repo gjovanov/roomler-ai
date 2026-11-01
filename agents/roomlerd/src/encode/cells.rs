@@ -52,7 +52,7 @@ pub(crate) const DEFAULT_DENIED_CELLS: &[&str] = &[
     // FR-78 — as unproven as every other non-NVENC 4:4:4 form: denied
     // until a driver survives the open on a fleet host.
     "hevc_vulkan:yuv444",
-    // FR-78 P3 (the dev box, RTX 5090, 2026-09-08) — the one 4:2:0 entry.
+    // FR-78 P3 (the dev box, RTX 5090, 2026-09-08).
     // The cell opens, encodes and reports nothing wrong, and its frames
     // cannot be decoded: dav1d fails every frame header ("Error parsing
     // frame header"), libaom aborts, Chrome paints garbage where the picture
@@ -62,6 +62,15 @@ pub(crate) const DEFAULT_DENIED_CELLS: &[&str] = &[
     // ours to fix, and is). Leaves the list when a driver or FFmpeg release
     // decodes; the read is on the FR-78 spec.
     "av1_vulkan:yuv420",
+    // #3267 (the dev box, Radeon 610M, 2026-11-01): from driver 32.0.21043
+    // AMD's `amdenc64.dll` faults on this open. The fault lands in the base
+    // probe's child, and a base child that dies costs the host every hardware
+    // cell, NVENC on another GPU included. `h264_vulkan` opens on the same
+    // driver, and on 32.0.13034 this cell did too. Windows only: the fault is
+    // that driver's, jupiter's RADV opens the cell on Linux, and on Windows
+    // every vendor's own cell sits ahead of this one in the cascade.
+    #[cfg(windows)]
+    "hevc_vulkan:yuv420",
 ];
 
 /// The value that means "deny nothing". An EMPTY override means the same
@@ -201,6 +210,15 @@ mod tests {
         );
         assert!(!cell_denied(&deny, "hevc_qsv", ChromaFormat::Yuv420));
         assert!(!cell_denied(&deny, "hevc_nvenc", ChromaFormat::Yuv444));
+        assert_eq!(
+            cell_denied(&deny, "hevc_vulkan", ChromaFormat::Yuv420),
+            cfg!(windows),
+            "#3267: AMD's driver faults in this open on Windows, and only there"
+        );
+        assert!(
+            !cell_denied(&deny, "h264_vulkan", ChromaFormat::Yuv420),
+            "#3267: the same driver opens the H.264 form"
+        );
 
         unsafe {
             tunnel_core::env::test_env::set(
