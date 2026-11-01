@@ -79,7 +79,7 @@ it. Do not shift these anchors with code that moved later.*
 | encoder caps | `agents/roomlerd/src/encode/caps.rs:37, 548-559` | a process OnceLock filled at the first `rc:agent.hello`; never on the LocalAPI |
 | drop folder | `agents/roomlerd/src/files.rs:1966-2030` | SystemContext → the active user's Downloads; else the process owner's; Windows fallback `%PROGRAMDATA%\roomler\<segment>\uploads`; not configurable |
 | devices | `agents/roomler-desktop/src/front/devices.js:60, 179` | LocalAPI `Peers` (netmap) every 2 s, `p.name` only, no `display_name`, orgs mixed |
-| agent-token routes | `crates/modules/fleet/src/lib.rs:336-345` | crash / self-unenroll / logs; nothing lists devices; the web grid and mesh are `AuthUser` |
+| agent-token routes | `crates/modules/fleet/src/lib.rs:331-340` | crash / self-unenroll / logs; nothing lists devices; the web grid and mesh are `AuthUser` |
 | launch after install | `scripts/install.ps1:283-305`; `agents/roomler-setup/src/orchestrator_agent.rs:501-610`; `agents/roomlerd/wix*/main.wxs` | copy the EXE, launch nothing, register nothing |
 | first launch | `agents/roomler-desktop/src/main.rs:57-75`; `tauri.conf.json:26` | `--view=` handled only in the single-instance callback; the window starts hidden |
 | companion spawn | `agents/roomlerd/src/companion.rs:689` | `std::process::Command` (inherits handles) on the user-session path; the SYSTEM path already passes `bInheritHandles = FALSE` |
