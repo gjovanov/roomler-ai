@@ -27,7 +27,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
 - The agent hard-wires `yuv420` for the VP9/AV1/H.264 data-channel codecs
   (`agents/roomlerd/src/peer.rs:5332-5339`); the ONLY hardware 4:4:4 path is
   `hevc_nvenc` with the RExt profile (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:770-787`),
-  advertised by `hevc_chroma` iff the name is `hevc_nvenc` (`agents/roomlerd/src/encode/caps.rs:612-615`).
+  advertised by `hevc_chroma` iff the name is `hevc_nvenc` (`agents/roomlerd/src/encode/caps.rs:954-957`).
 - The picker (`ui/src/views/remote/RemoteControl.vue:2989-2997`) is a hard-coded list
   — `auto / av1 / hevc / hevc-444 / vp9-444 / vp9-420 / h264` — English literals, no
   i18n, chroma inside the value. Its per-agent override allow-list omitted `hevc-444`
@@ -150,7 +150,7 @@ flowchart LR
    hardware-only device, so a software implementation fails the open. (FR-16's
    "advertises hardware, runs software" case.)
 3. **The probe is eager, in the child, bounded.** One timeout per open; the probe's
-   duration reported in the hello. Today's probe (`caps.rs:51-318`) opens the first
+   duration reported in the hello. Today's probe (`caps.rs:51-652`) opens the first
    working backend per codec in ~2.6 s on the dev box; the matrix prunes to roughly
    16–18 opens on a Windows host. A cache keyed by GPU + driver version is added only if
    fleet p95 crosses ~3 s.

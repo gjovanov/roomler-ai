@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
 //! FR-77 — the cell matrix's shared vocabulary: which FFmpeg encoders are
-//! ever ASKED for 4:4:4, and the denylist that is the matrix's kill switch.
+//! ever ASKED for 4:4:4, and the denylist that is the matrix's kill switch,
+//! with the cells this host learned to deny on top of it (#3267).
 //!
 //! Shared by the caps probe (what the hello advertises) and the session pump
 //! (what a session may open), so the two can never disagree: a cell the probe
@@ -97,13 +98,110 @@ pub(crate) fn parse_denylist(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// The effective denylist: the env/config override when set (it REPLACES
-/// the built-in, it does not add to it), else the built-in.
-pub(crate) fn denied_cells() -> Vec<String> {
+/// #3267 — the names the denylist knows a cell by when no FFmpeg table carries
+/// it: `<codec>_<backend>` in the cell vocabulary's own spellings, which is
+/// also what `encoder_cells_deny` validates. The probe opens these in its
+/// `base` child and a session opens them in the daemon, so a fault in one has
+/// to be able to cost that cell like any other.
+pub const MF_H264: &str = "h264_mf";
+pub const MF_HEVC: &str = "hevc_mf";
+pub const MF_AV1: &str = "av1_mf";
+pub const LIBVPX_VP9: &str = "vp9_libvpx";
+
+/// #3267 — one cell this host taught itself not to open, because a `base`
+/// probe child died inside it. Never written to the config: it lives in this
+/// process and, when `confirmed`, in the probe cache, whose key is what makes
+/// it heal (`caps_cache`).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct LearnedDeny {
+    /// `name:chroma`, the spelling `encoder_cells_deny` takes.
+    pub cell: String,
+    /// How the child ended, for the log and the hello's reason.
+    pub why: String,
+    /// Two children in a row ended inside this open with a driver fault's
+    /// status. Only a confirmed cell may be cached; any other (a hang, a kill)
+    /// is denied for this process's life and tested again at the next start.
+    pub confirmed: bool,
+}
+
+/// What this process learned. `RwLock`, not `OnceLock`: the probe adds to it
+/// between runs of its child, and a test has to be able to take it back.
+static LEARNED: std::sync::RwLock<Vec<LearnedDeny>> = std::sync::RwLock::new(Vec::new());
+
+/// The suffix of the variable that hands [`learned_for_child`]'s list to a
+/// process this daemon starts. It has no config key: an operator's list is
+/// `encoder_cells_deny`, and this one must never be mistaken for it.
+const LEARNED_ENV: &str = "ENCODER_CELLS_LEARNED";
+
+/// Replace this process's learned list.
+pub(crate) fn install_learned(learned: Vec<LearnedDeny>) {
+    *LEARNED.write().unwrap_or_else(|e| e.into_inner()) = learned;
+}
+
+/// What this process learned, with why.
+pub fn learned() -> Vec<LearnedDeny> {
+    LEARNED.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The learned cells in force here: this process's own, and those its parent
+/// handed down. A `caps-probe` child or a recorder runs no probe of its own to
+/// learn them from, and it opens the same drivers.
+fn learned_names() -> Vec<String> {
+    let mut names: Vec<String> = learned().into_iter().map(|l| l.cell).collect();
+    if let Some(v) = tunnel_core::env::node_env(LEARNED_ENV) {
+        for name in parse_denylist(&v) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// The environment that hands the learned cells to a process this daemon
+/// starts. `std::env::set_var` is not an option in a process this threaded.
+pub(crate) fn learned_for_child() -> Vec<(String, String)> {
+    let names = learned_names();
+    if names.is_empty() {
+        return Vec::new();
+    }
+    vec![(format!("ROOMLERD_{LEARNED_ENV}"), names.join(","))]
+}
+
+/// #3267 — `ROOMLERD_CAPS_LEARN_DENY=0` / `caps_learn_deny = false` puts back
+/// what came before: one `base` child, and a death in it means no hardware.
+pub(crate) fn learning_enabled() -> bool {
+    tunnel_core::env::node_env("CAPS_LEARN_DENY")
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
+/// The list an operator controls: the env/config override when set (it
+/// REPLACES the built-in, it does not add to it), else the built-in.
+fn configured_denied_cells() -> Vec<String> {
     match tunnel_core::env::node_env("ENCODER_CELLS_DENY") {
         Some(v) => parse_denylist(&v),
         None => DEFAULT_DENIED_CELLS.iter().map(|s| s.to_string()).collect(),
     }
+}
+
+/// The effective denylist: the operator's list, plus what this host learned.
+/// The learned cells add to whichever list is in force and replace nothing, so
+/// `encoder_cells_deny` keeps meaning what it says: it still replaces the
+/// built-in, and clearing it still goes back to the built-in.
+pub(crate) fn denied_cells() -> Vec<String> {
+    let mut deny = configured_denied_cells();
+    for cell in learned_names() {
+        if !deny.contains(&cell) {
+            deny.push(cell);
+        }
+    }
+    deny
 }
 
 pub(crate) fn cell_denied(deny: &[String], name: &str, chroma: ChromaFormat) -> bool {
@@ -115,13 +213,23 @@ pub(crate) fn cell_denied(deny: &[String], name: &str, chroma: ChromaFormat) -> 
 /// every backend the source matrix can open in 4:4:4, minus the denylist.
 /// Empty when no backend of this codec does 4:4:4 (AV1) or every one is
 /// denied — the caller then runs the 4:2:0 cascade and reports the truth.
+///
+/// #3267 — a cell whose 4:2:0 open ended a probe child takes its 4:4:4 form
+/// with it. The `444` child only asks for what `base` opened, so that form has
+/// not been tested, and `chroma_pref` is the controller's word, which nothing
+/// checks against the hello. An operator's entry still names one form.
 #[cfg(feature = "ffmpeg-encoder")]
 pub(crate) fn names_444(codec: roomler_ai_remote_control::models::VideoCodec) -> Vec<&'static str> {
     let deny = denied_cells();
+    let learned = learned_names();
     crate::encode::ffmpeg::FfmpegEncoder::cascade_names(codec)
         .iter()
         .copied()
-        .filter(|name| ffmpeg_444_capable(name) && !cell_denied(&deny, name, ChromaFormat::Yuv444))
+        .filter(|name| {
+            ffmpeg_444_capable(name)
+                && !cell_denied(&deny, name, ChromaFormat::Yuv444)
+                && !cell_denied(&learned, name, ChromaFormat::Yuv420)
+        })
         .collect()
 }
 
@@ -243,6 +351,251 @@ mod tests {
         assert!(denied_cells().is_empty(), "`none` denies nothing, any case");
     }
 
+    /// Clears this process's learned list when a test ends, pass or fail.
+    struct LearnedGuard;
+    impl Drop for LearnedGuard {
+        fn drop(&mut self) {
+            install_learned(Vec::new());
+        }
+    }
+
+    fn learned_cell(cell: &str) -> LearnedDeny {
+        LearnedDeny {
+            cell: cell.to_string(),
+            why: "exit code: 0xc0000005".to_string(),
+            confirmed: true,
+        }
+    }
+
+    /// #3267 — a learned cell adds to whichever list is in force and replaces
+    /// nothing. `encoder_cells_deny` keeps meaning what it always meant: it
+    /// still REPLACES the built-in, and clearing it (`roomler config clear`)
+    /// still goes back to the built-in. A learned cell must never read as an
+    /// override, or `none` would start denying what the operator allowed by
+    /// accident of a fault, and clearing would not clear.
+    #[test]
+    fn a_learned_cell_adds_to_the_list_in_force_and_replaces_nothing() {
+        use tunnel_core::env::test_env::{Saved, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _deny = Saved::cleared("ENCODER_CELLS_DENY");
+        let _handed = Saved::cleared(LEARNED_ENV);
+        let _learned = LearnedGuard;
+        install_learned(vec![learned_cell("h264_nvenc:yuv420")]);
+
+        // The built-in stands, and the learned cell is on top of it.
+        let deny = denied_cells();
+        assert!(cell_denied(&deny, "h264_nvenc", ChromaFormat::Yuv420));
+        assert!(cell_denied(&deny, "hevc_qsv", ChromaFormat::Yuv444));
+        assert_eq!(
+            configured_denied_cells(),
+            DEFAULT_DENIED_CELLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "nothing learned ever reaches the list an operator controls"
+        );
+
+        // An override replaces the built-in and not the learned cell.
+        // SAFETY: serialised by DENY_ENV_LOCK; the guards restore both.
+        unsafe { set("ENCODER_CELLS_DENY", "vp9_qsv:yuv420") };
+        let deny = denied_cells();
+        assert!(cell_denied(&deny, "vp9_qsv", ChromaFormat::Yuv420));
+        assert!(cell_denied(&deny, "h264_nvenc", ChromaFormat::Yuv420));
+        assert!(
+            !cell_denied(&deny, "hevc_qsv", ChromaFormat::Yuv444),
+            "the override still REPLACES the built-in"
+        );
+
+        // `none` denies nothing an operator can name; the driver's fault is
+        // not theirs to wave away by that word.
+        unsafe { set("ENCODER_CELLS_DENY", "none") };
+        assert_eq!(denied_cells(), vec!["h264_nvenc:yuv420".to_string()]);
+
+        // The same entry on both lists is one entry.
+        unsafe { set("ENCODER_CELLS_DENY", "h264_nvenc:yuv420") };
+        assert_eq!(denied_cells(), vec!["h264_nvenc:yuv420".to_string()]);
+
+        // A forgotten list leaves exactly the operator's.
+        install_learned(Vec::new());
+        unsafe { set("ENCODER_CELLS_DENY", "none") };
+        assert!(denied_cells().is_empty());
+    }
+
+    /// #3267 — a process the daemon starts honours the daemon's list: the probe
+    /// child that must not open the cell again, and a recorder that opens the
+    /// same drivers. It reaches them as real env (`learned_for_child`), the only
+    /// way across a process boundary, and nothing at all when there is nothing.
+    #[test]
+    fn the_learned_list_crosses_into_a_child_process() {
+        use tunnel_core::env::test_env::{Saved, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _deny = Saved::cleared("ENCODER_CELLS_DENY");
+        let _handed = Saved::cleared(LEARNED_ENV);
+        let _learned = LearnedGuard;
+        assert!(learned_for_child().is_empty(), "nothing to hand over");
+
+        install_learned(vec![
+            learned_cell("hevc_vulkan:yuv420"),
+            learned_cell("h264_amf:yuv420"),
+        ]);
+        assert_eq!(
+            learned_for_child(),
+            vec![(
+                "ROOMLERD_ENCODER_CELLS_LEARNED".to_string(),
+                "hevc_vulkan:yuv420,h264_amf:yuv420".to_string()
+            )]
+        );
+
+        // The child's side: nothing installed, the list in its environment.
+        install_learned(Vec::new());
+        // SAFETY: serialised by DENY_ENV_LOCK; the guard restores it.
+        unsafe { set(LEARNED_ENV, "hevc_vulkan:yuv420,h264_amf:yuv420") };
+        let deny = denied_cells();
+        assert!(cell_denied(&deny, "hevc_vulkan", ChromaFormat::Yuv420));
+        assert!(cell_denied(&deny, "h264_amf", ChromaFormat::Yuv420));
+        assert_eq!(
+            learned_for_child().len(),
+            1,
+            "and a child can hand it on to one of its own"
+        );
+    }
+
+    /// #3267 — the kill switch reads the usual spellings, default on.
+    #[test]
+    fn the_learning_switch_reads_the_usual_spellings() {
+        use tunnel_core::env::test_env::{Saved, set};
+        let _saved = Saved::cleared("CAPS_LEARN_DENY");
+        assert!(learning_enabled(), "default on");
+        for off in ["0", "false", "OFF", "no"] {
+            // SAFETY: no other test touches this suffix.
+            unsafe { set("CAPS_LEARN_DENY", off) };
+            assert!(!learning_enabled(), "{off} must switch it off");
+        }
+        unsafe { set("CAPS_LEARN_DENY", "1") };
+        assert!(learning_enabled());
+    }
+
+    /// #3267 — requirement 3: a session opens encoders in the daemon, where the
+    /// fault that ended the probe's child would end the daemon. Every entry a
+    /// session has honours a learned cell: both cascades, and the single-name
+    /// rebuild, which refuses before it touches a driver. `hevc_vaapi` so that
+    /// no other test on a Windows box is affected while the lock is held.
+    #[cfg(feature = "ffmpeg-encoder")]
+    #[test]
+    fn a_session_cannot_reach_a_learned_cell() {
+        use crate::encode::ffmpeg::FfmpegEncoder;
+        use tunnel_core::env::test_env::Saved;
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _deny = Saved::cleared("ENCODER_CELLS_DENY");
+        let _handed = Saved::cleared(LEARNED_ENV);
+        let _learned = LearnedGuard;
+        assert!(names_420(VideoCodec::Hevc).contains(&"hevc_vaapi"));
+
+        install_learned(vec![
+            learned_cell("hevc_vaapi:yuv420"),
+            learned_cell("hevc_nvenc:yuv444"),
+        ]);
+        let hevc = names_420(VideoCodec::Hevc);
+        assert!(!hevc.contains(&"hevc_vaapi"), "{hevc:?}");
+        assert!(
+            hevc.contains(&"hevc_nvenc"),
+            "a deny names one form: {hevc:?}"
+        );
+        assert!(
+            !names_444(VideoCodec::Hevc).contains(&"hevc_nvenc"),
+            "the 4:4:4 cascade reads it too"
+        );
+
+        let refused =
+            FfmpegEncoder::new_preferred("hevc_vaapi", 480, 270, 30, 3_000_000, 0, false).err();
+        assert!(
+            refused
+                .as_ref()
+                .is_some_and(|e| e.to_string().contains("denylist")),
+            "a rebuild must refuse it, not open it: {refused:?}"
+        );
+    }
+
+    /// #3267 — the hello leaves a learned cell out, and a controller may ask for
+    /// 4:4:4 regardless: nothing checks `chroma_pref` against the hello. The 4:4:4
+    /// form of a cell whose 4:2:0 open killed a process has never been opened, so
+    /// the daemon must not be the first to try it. An operator's entry still
+    /// names one form.
+    #[cfg(feature = "ffmpeg-encoder")]
+    #[test]
+    fn a_learned_420_cell_takes_its_444_form_with_it() {
+        use tunnel_core::env::test_env::{Saved, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _deny = Saved::cleared("ENCODER_CELLS_DENY");
+        let _handed = Saved::cleared(LEARNED_ENV);
+        let _learned = LearnedGuard;
+        assert_eq!(names_444(VideoCodec::H264), vec!["h264_nvenc"]);
+
+        install_learned(vec![learned_cell("h264_nvenc:yuv420")]);
+        assert!(names_444(VideoCodec::H264).is_empty());
+        assert_eq!(
+            names_444(VideoCodec::Hevc),
+            vec!["hevc_nvenc"],
+            "another codec's cell is another cell"
+        );
+
+        install_learned(Vec::new());
+        // SAFETY: serialised by DENY_ENV_LOCK; the guard restores it.
+        unsafe { set("ENCODER_CELLS_DENY", "h264_nvenc:yuv420") };
+        assert_eq!(
+            names_444(VideoCodec::H264),
+            vec!["h264_nvenc"],
+            "an operator's entry names one form"
+        );
+    }
+
+    /// #3267 — Media Foundation opens through one constructor, and a session
+    /// opens it in the daemon. `av1_mf`: no other test opens it.
+    #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+    #[test]
+    fn a_media_foundation_cell_can_be_denied() {
+        use tunnel_core::env::test_env::Saved;
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _deny = Saved::cleared("ENCODER_CELLS_DENY");
+        let _handed = Saved::cleared(LEARNED_ENV);
+        let _learned = LearnedGuard;
+        install_learned(vec![learned_cell("av1_mf:yuv420")]);
+        let refused = crate::encode::mf::MfEncoder::new_av1(480, 270).err();
+        assert!(
+            refused
+                .as_ref()
+                .is_some_and(|e| e.to_string().contains("denylist")),
+            "the open must be refused before it reaches a driver: {refused:?}"
+        );
+    }
+
+    /// The names the probe announces for its non-FFmpeg cells are ones
+    /// `encoder_cells_deny` can name, so a learned entry and an operator's mean
+    /// the same thing (the config validates lowercase, digits, underscores).
+    #[test]
+    fn the_non_ffmpeg_cell_names_are_plain_deny_names() {
+        for name in [MF_H264, MF_HEVC, MF_AV1, LIBVPX_VP9] {
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{name}"
+            );
+            let (codec, backend) = name.split_once('_').expect("codec_backend");
+            assert!(VideoCodec::from_wire(codec).is_some(), "{name}");
+            assert!(["mf", "libvpx"].contains(&backend), "{name}");
+        }
+    }
+
     #[test]
     fn parse_denylist_trims_and_drops_blanks() {
         assert_eq!(
@@ -298,10 +651,17 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _saved = Saved::cleared("ENCODER_CELLS_DENY");
         for codec in [VideoCodec::Hevc, VideoCodec::H264, VideoCodec::Vp9] {
+            // #3267 — apart from Windows' `hevc_vulkan`. The lane that runs this
+            // is Linux's, so only a native Windows run sees that entry.
+            let expected: Vec<&str> = FfmpegEncoder::cascade_names(codec)
+                .iter()
+                .copied()
+                .filter(|name| !(cfg!(windows) && *name == "hevc_vulkan"))
+                .collect();
             assert_eq!(
                 names_420(codec),
-                FfmpegEncoder::cascade_names(codec).to_vec(),
-                "the built-in denylist names no 4:2:0 cell of this codec"
+                expected,
+                "the built-in denylist names no other 4:2:0 cell of this codec"
             );
         }
         let av1 = names_420(VideoCodec::Av1);

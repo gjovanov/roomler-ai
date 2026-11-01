@@ -7101,6 +7101,19 @@ async fn caps_cmd() -> Result<()> {
         );
     }
     println!("denied_cells: {:?}", summary.denied);
+    // #3267 — which of those this host learned from a dead probe child, and why.
+    for learned in roomlerd::encode::cells::learned() {
+        println!(
+            "learned_deny: {} ({}){}",
+            learned.cell,
+            learned.why,
+            if learned.confirmed {
+                ""
+            } else {
+                " this process only"
+            }
+        );
+    }
     println!(
         "probe_ms: {} ({})",
         summary
