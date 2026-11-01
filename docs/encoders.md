@@ -167,6 +167,20 @@ fail. Everything the viewer knows about cells goes through ONE derivation,
 `ui/src/composables/videoCells.ts` — the codec picker and the admin codec chips
 read the same functions.
 
+A stored pick is held to the device again at connect, because the picker only greys
+what a person is about to choose. A choice also becomes this browser's default for
+every other device, and a per-device override outlives an agent losing a cell. The
+agent answers a `preferred_transport` it does not offer by dropping to the RTP track
+and telling nobody (`agents/roomlerd/src/signaling.rs:3501`), and the viewer ignores
+that track while it holds a DataChannel transport
+(`ui/src/composables/useRemoteControl.ts:9811`). The session reads connected, with a
+hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
+watchdog quiet. So `transportForSession` (`ui/src/composables/videoCells.ts:437`)
+runs the auto rank for that session and leaves the pick stored (#3167). H.264 keeps
+its own fallback to the RTP track, which is safe only because that pick also forces
+`preferredCodec: 'h264'`. HEVC, AV1 and VP9 carry no codec, so their RTP track would
+take the best codec both ends list, whether or not the host can open it there.
+
 ```mermaid
 flowchart TB
     subgraph agent["agent side"]
