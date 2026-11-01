@@ -25,9 +25,10 @@
 //! decides (the grant gates, run state, the control connection, config and
 //! its lock, the DERP mux, every spawn as a session's account).
 //!
-//! ⚠️ **Nothing a seam carries is a closure, and only one is a handle.** A
-//! worker holds a [`Conn`]'s number, never the connection. The exception is
-//! [`DeviceSeams::derp_handle`]: the DERP mux itself, which the stream rides
+//! ⚠️ **Nothing a seam carries is a closure, and one thing is a handle.** A
+//! [`Conn`] is its number to a worker; in process it also keeps its
+//! connection open, as the frame's own sender did (its note). The handle is
+//! [`DeviceSeams::derp_handle`]'s: the DERP mux itself, which the stream rides
 //! until P8-2d-3 carries its datagrams across the channel instead, tagged by
 //! grant (decision 75).
 //!
@@ -105,11 +106,11 @@ pub(crate) enum Unsent {
 
 /// FR-90 P8-2d-0 — whether `msg` is one the device's parts speak themselves:
 /// what [`ControlLink`] carries, and all it carries (decision 69). The
-/// viewer's peer answers a browser's offer and trickles its candidates; the
-/// stream answers a grant, sends its relayed address, asks for a stream,
-/// says where its copy ends, and ends one. Every other frame is the daemon's
-/// to speak: a narrow link is one a worker cannot speak the daemon's words
-/// on.
+/// viewer's peer answers a browser's offer, trickles its candidates, and
+/// says why it closed; the stream answers a grant, sends its relayed
+/// address, asks for a stream, says where its copy ends, and ends one. Every
+/// other frame is the daemon's to speak: a narrow link is one a worker cannot
+/// speak the daemon's words on.
 pub(crate) fn speaks(msg: &ClientMsg) -> bool {
     matches!(
         msg,
