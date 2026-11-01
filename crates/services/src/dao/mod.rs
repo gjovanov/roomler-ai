@@ -12,6 +12,7 @@ pub mod enroll_token_issued;
 pub mod enrollment_key;
 pub mod exec_audit;
 pub mod exec_pending;
+pub mod external_principal;
 pub mod external_rc_audit;
 pub mod file;
 pub mod growth;

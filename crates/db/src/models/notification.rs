@@ -36,6 +36,10 @@ pub enum NotificationType {
     /// `link` points at the session's room; nothing in it says which tool or
     /// what it would do.
     ApprovalRequest,
+    /// FR-52 P5 — someone from outside the org reached a device for the first
+    /// time, or keeps guessing its password. `link` points at the org's external
+    /// access log.
+    ExternalAccess,
     /// A type this build does not know — a newer server's — read as itself
     /// rather than refused, so one new kind of notification cannot fail a
     /// user's whole list on an older pod mid-roll.
@@ -65,6 +69,10 @@ mod tests {
         assert_eq!(
             bson::to_bson(&NotificationType::ApprovalRequest).unwrap(),
             bson::Bson::String("approval_request".into())
+        );
+        assert_eq!(
+            bson::to_bson(&NotificationType::ExternalAccess).unwrap(),
+            bson::Bson::String("external_access".into())
         );
         let doc = bson::doc! { "t": "quorum_reached" };
         #[derive(Deserialize)]

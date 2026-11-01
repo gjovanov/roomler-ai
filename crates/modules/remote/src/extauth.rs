@@ -93,6 +93,10 @@ pub const ANSWER_FLOOR: Duration = Duration::from_millis(300);
 /// Longer than the device's own hold on it (120 s): the device holds the key,
 /// so it should be the party that lets a login lapse.
 pub const VERIFIED_TTL: Duration = Duration::from_secs(150);
+/// P5 — how often an org hears that one device's password is being guessed at.
+/// A device that keeps refusing guesses would otherwise repeat itself for as long
+/// as anyone keeps trying, and one notice says what there is to say.
+pub const GUESSING_NOTICE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// What the device said about one login step.
 #[derive(Debug)]
@@ -131,6 +135,8 @@ pub struct ExtauthRelay {
     verified: DashMap<String, Verified>,
     /// principal → (window start, starts in it).
     starts: std::sync::Mutex<HashMap<ObjectId, (Instant, u32)>>,
+    /// P5 — device → when its org last heard it is being guessed at.
+    guessing_told: std::sync::Mutex<HashMap<ObjectId, Instant>>,
 }
 
 impl ExtauthRelay {
@@ -180,6 +186,23 @@ impl ExtauthRelay {
             return false;
         }
         entry.1 += 1;
+        true
+    }
+
+    /// P5 — may the org be told that `device` is being guessed at? Per device,
+    /// not per person, or many accounts would mean many notices. Pod-local: a
+    /// device's guesses all land on the pod that holds it, and a roll that
+    /// forgets this costs one extra notice.
+    fn tell_of_guessing(&self, device: ObjectId, now: Instant) -> bool {
+        let mut told = self
+            .guessing_told
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        told.retain(|_, at| now.saturating_duration_since(*at) < GUESSING_NOTICE_EVERY);
+        if told.contains_key(&device) {
+            return false;
+        }
+        told.insert(device, now);
         true
     }
 
@@ -373,6 +396,8 @@ fn names_a_relay(frame: &serde_json::Value) -> bool {
 async fn gates(
     state: &RemoteState,
     agent: &Agent,
+    device: ObjectId,
+    principal: ObjectId,
 ) -> Result<roomler_ai_db::models::tenant::Tenant, &'static str> {
     // The two refusals the org's OWN session gate applies before anything
     // else (`controller::resolve_session_authz`) — an outsider must not get
@@ -396,6 +421,16 @@ async fn gates(
             "gate 2: the device is not approved for external access, or the approval expired",
         );
     }
+    // P5 — this person, on this device. In `start`, `finish` and `session` alike,
+    // so a login in flight ends with the rest. The org's refusal like the two
+    // above, in the same one word to the outsider; the audit row says which.
+    standing(
+        state
+            .fleet
+            .external_principals
+            .is_revoked(device, principal)
+            .await,
+    )?;
     // The same source gate 2's APPROVAL read (P1): the capabilities the agent
     // reported on its last hello. A device downgraded since then still claims
     // the verb here; it then never answers, and the bound below turns that into
@@ -404,6 +439,17 @@ async fn gates(
         return Err("the device's agent is too old to be sent an external login");
     }
     Ok(tenant)
+}
+
+/// P5 — a person's standing on a device, from the read of it. ⚠️ A read that
+/// failed refuses, as a tenant that cannot be read does: this gate opens only on
+/// an answer it has seen.
+fn standing<E>(read: Result<bool, E>) -> Result<(), &'static str> {
+    match read {
+        Ok(false) => Ok(()),
+        Ok(true) => Err("an admin of the org barred this person from the device"),
+        Err(_) => Err("this person's standing on the device could not be read"),
+    }
 }
 
 /// Resolve a connect code to its live device.
@@ -516,6 +562,7 @@ fn audit_row(
         login_refused: refused,
         login_detail: detail.map(str::to_string),
         session_id,
+        principal: None,
     };
     let dao = Arc::clone(&state.fleet.external_rc_audit);
     tokio::spawn(async move {
@@ -565,7 +612,7 @@ async fn start(
     let Some(agent_id) = agent.id else {
         return Some(unavailable(None));
     };
-    if let Err(detail) = gates(state, &agent).await {
+    if let Err(detail) = gates(state, &agent, agent_id, principal).await {
         info!(%principal, agent = %agent_id, detail, "extauth: start refused");
         audit(
             state,
@@ -661,6 +708,12 @@ async fn start(
                 refused,
                 None,
             );
+            // P5 — a wrong guess leaves no row and no failure anywhere (§4b): the
+            // client stops at KE2. The device starting to refuse guesses is the
+            // first thing the server ever sees of it.
+            if refused == Some(ExtauthRefusal::Throttled) && relay.tell_of_guessing(agent_id, now) {
+                crate::extauth_notice::spawn_guessing(state, &agent, agent_id, principal, actor);
+            }
             // ⚠️ The device's `unavailable` is the server's, to the byte: an
             // attempt id here would say the code resolved, the org's gates
             // are open and the device is online, which is the configuration
@@ -745,7 +798,7 @@ async fn finish(
     };
     // The gates BEFORE any forward: a frame sent on to another pod comes back a
     // relay hop later, which would mark a closed org's code as one that exists.
-    let gate = gates(state, &agent).await;
+    let gate = gates(state, &agent, device, principal).await;
     if !state.fleet.rc_hub.is_agent_online(device) {
         if gate.is_ok() && forward(state, &hop, device, principal, actor).await {
             return None;
@@ -1079,7 +1132,7 @@ async fn open_session(
         return Some(unknown(attempt_id));
     };
     // Before any forward, for `finish`'s reason.
-    let gate = gates(state, &agent).await;
+    let gate = gates(state, &agent, device, principal).await;
     if !state.fleet.rc_hub.is_agent_online(device) {
         if gate.is_ok() && forward(state, &hop, device, principal, actor).await {
             return None;
@@ -1285,6 +1338,10 @@ async fn open_session(
                 None,
                 Some(session_id),
             );
+            let (state, agent, actor) = (state.clone(), agent.clone(), actor.to_string());
+            tokio::spawn(async move {
+                session_opened(&state, &agent, device, principal, &actor).await;
+            });
         }
         Err(e) => {
             let refused = match e {
@@ -1307,6 +1364,44 @@ async fn open_session(
         }
     }
     None
+}
+
+/// P5 — what follows a session the Hub opened: spawned, and best-effort, so a
+/// failure here never costs the session.
+///
+/// One write records the session, and the row as it stood before it answers both
+/// questions. No row: this person's first session ever on this device, so the org
+/// hears of it. A revocation: it crossed this open, after the gates read the row
+/// and before the session existed for `set_principal` to find, so it ends here.
+/// A revoke written after this read finds the session in the Hub. Either way
+/// nobody slips between the two.
+pub async fn session_opened(
+    state: &RemoteState,
+    agent: &Agent,
+    device: ObjectId,
+    principal: ObjectId,
+    actor: &str,
+) {
+    let before = state
+        .fleet
+        .external_principals
+        .note_session(agent.tenant_id, device, principal)
+        .await;
+    match before {
+        Ok(None) => {
+            crate::extauth_notice::first_session(state, agent, device, principal, actor).await;
+        }
+        Ok(Some(row)) if row.revoked_at.is_some() => {
+            let ended =
+                state
+                    .fleet
+                    .rc_hub
+                    .terminate_external_of(device, principal, agent.tenant_id);
+            info!(%principal, agent = %device, ended, "extauth: a revocation crossed this session; ended");
+        }
+        Ok(Some(_)) => {}
+        Err(e) => warn!(%e, %principal, agent = %device, "extauth: the session could not be noted"),
+    }
 }
 
 /// Route a controller frame here if it is an `rc:extauth.*` frame. `None` =
@@ -1537,6 +1632,34 @@ mod tests {
         );
         assert!(
             relay.allow_start(a, t0 + Duration::from_secs(61)),
+            "a new window"
+        );
+    }
+
+    /// P5 — this gate opens only on an answer it has seen. A read that failed is
+    /// a refusal, or a Mongo blip would let a barred person back in.
+    #[test]
+    fn a_standing_that_cannot_be_read_refuses() {
+        assert_eq!(standing::<()>(Ok(false)), Ok(()));
+        assert!(standing::<()>(Ok(true)).is_err());
+        assert!(standing(Err("the read failed")).is_err());
+    }
+
+    /// P5 — one notice per device per window, however many accounts are guessing,
+    /// and each device its own.
+    #[test]
+    fn guessing_is_told_once_a_window_per_device() {
+        let relay = ExtauthRelay::new();
+        let (a, b) = (ObjectId::new(), ObjectId::new());
+        let t0 = Instant::now();
+        assert!(relay.tell_of_guessing(a, t0));
+        assert!(!relay.tell_of_guessing(a, t0 + Duration::from_secs(60)));
+        assert!(
+            relay.tell_of_guessing(b, t0),
+            "another device, another notice"
+        );
+        assert!(
+            relay.tell_of_guessing(a, t0 + GUESSING_NOTICE_EVERY),
             "a new window"
         );
     }

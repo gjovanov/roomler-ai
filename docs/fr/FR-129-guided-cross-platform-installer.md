@@ -204,7 +204,7 @@ The invariants, each closing a specific failure:
    - **No account:** register with the org inline (`register` already takes `tenant_name` and
      `tenant_slug`). An OAuth signup stays in one tab, so `pending_redirect` carries it. An
      email signup opens the activation link in a **new tab**, where sessionStorage is empty
-     (`ui/src/plugins/router.ts:389`). The page therefore also keeps the pending pairing in
+     (`ui/src/plugins/router.ts:390`). The page therefore also keeps the pending pairing in
      localStorage with its expiry, under the guard's same-origin rules, and the guard routes
      any signed-in tab back to `/pair` while it lives.
    - **Fallback, always:** the wizard keeps showing the code with an "Open the page again"
