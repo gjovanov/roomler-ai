@@ -403,6 +403,113 @@ const fn windows_mf_version() -> u32 {
 /// FR-130 P1 — what each Media Foundation encoder on this host writes about
 /// colour, read from its own output.
 #[cfg(test)]
+mod lifecycle_tests {
+    use super::{MfEncoder, VideoEncoder};
+    use crate::capture::{Damage, Frame, FrameData, PixelFormat};
+    use std::mem::{size_of, zeroed};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentProcessId, GetProcessHandleCount,
+    };
+
+    fn threads() -> u32 {
+        // SAFETY: the snapshot is ours and closed below, and `entry` carries
+        // its own size, as the walk requires.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            assert_ne!(snapshot, INVALID_HANDLE_VALUE);
+            let me = GetCurrentProcessId();
+            let mut entry: THREADENTRY32 = zeroed();
+            entry.dwSize = size_of::<THREADENTRY32>() as u32;
+            let mut count = 0;
+            let mut more = Thread32First(snapshot, &mut entry);
+            while more != 0 {
+                if entry.th32OwnerProcessID == me {
+                    count += 1;
+                }
+                more = Thread32Next(snapshot, &mut entry);
+            }
+            CloseHandle(snapshot);
+            count
+        }
+    }
+
+    fn handles() -> u32 {
+        let mut count = 0;
+        // SAFETY: the pseudo-handle is always valid and `count` outlives the call.
+        unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+        count
+    }
+
+    fn black_frame() -> Arc<Frame> {
+        let (width, height) = (1280, 720);
+        Arc::new(Frame {
+            width,
+            height,
+            stride: width * 4,
+            pixel_format: PixelFormat::Bgra,
+            data: FrameData::Cpu(vec![0; (width * height * 4) as usize]),
+            monotonic_us: 0,
+            monitor: 0,
+            damage: Damage::Unknown,
+            source: None,
+        })
+    }
+
+    /// Opens an encoder, encodes through it and closes it, then gives its
+    /// worker time to end. The frames matter: the cascade ends its losers as
+    /// it returns, after its own probe, so only a frame sent now shows that the
+    /// winner survived that.
+    async fn cycle() -> bool {
+        let Ok(mut encoder) = MfEncoder::new_h264(1280, 720) else {
+            return false;
+        };
+        let mut encoded = 0;
+        for _ in 0..3 {
+            let packets = encoder.encode(black_frame()).await.expect("encode");
+            encoded += packets.iter().map(|p| p.data.len()).sum::<usize>();
+        }
+        assert!(encoded > 0, "the winner took frames and produced nothing");
+        drop(encoder);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        true
+    }
+
+    /// Every resolution change opens an encoder, so a session runs this cycle
+    /// several times. Ignored because it counts the whole process: run it alone,
+    /// on a host with the drivers to show it, with
+    /// `cargo test -p roomlerd --lib --features mf-encoder -- --ignored closed_encoder`.
+    #[tokio::test]
+    #[ignore = "counts the process's threads, so it needs the binary to itself"]
+    async fn a_closed_encoder_leaves_no_threads_behind() {
+        const CYCLES: usize = 6;
+        // The first open loads the drivers and their long-lived pools.
+        if !cycle().await {
+            eprintln!("no MF H.264 encoder here — nothing to measure");
+            return;
+        }
+        let (threads_before, handles_before) = (threads(), handles());
+        eprintln!("after the first cycle: {threads_before} threads, {handles_before} handles");
+        for i in 0..CYCLES {
+            assert!(
+                cycle().await,
+                "the encoder opened once and then stopped opening"
+            );
+            eprintln!("cycle {i}: {} threads, {} handles", threads(), handles());
+        }
+        let threads_grew = threads().saturating_sub(threads_before);
+        let handles_grew = handles().saturating_sub(handles_before);
+        assert!(threads_grew <= 8, "{threads_grew} threads left behind");
+        assert!(handles_grew <= 120, "{handles_grew} handles left behind");
+    }
+}
+
+#[cfg(test)]
 mod colour_tests {
     use super::activate::for_each_pipeline;
     use super::sync_pipeline::{MfPipeline, OutputCodec};
