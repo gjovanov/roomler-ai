@@ -1078,7 +1078,7 @@ impl LocalApiState for DaemonState {
     fn rc_sessions(&self) -> Vec<tunnel_core::localapi::RcSessionInfo> {
         self.rc_sessions
             .as_ref()
-            .map(|r| r.list())
+            .map(|r| r.list_for_client())
             .unwrap_or_default()
     }
 

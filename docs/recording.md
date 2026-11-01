@@ -930,7 +930,12 @@ sequenceDiagram
         H-->>D: approve / deny / no answer
     end
     D->>H: banner: "Recording your screen for Alice" + Stop recording
-    Note over D,H: nothing can show it ⇒ refused {no_indicator_surface}
+    opt the surface is the companion's banner
+        D-->>V: rc:record.state announcing
+        H-->>D: the companion reads the flag, on its next poll
+        Note over D: one more turn of the slowest poll, 1.1 s
+    end
+    Note over D,H: nothing can show it, or nothing read it in 5 s ⇒ refused {no_indicator_surface}
     D->>R: start_remote (never the microphone)
     D-->>V: rc:record.state recording {name}, then progress each second
     V->>D: rc:record.stop
@@ -971,6 +976,28 @@ else the companion's banner reads "Recording your screen for …" and has a
 **Stop recording** button that keeps the session. On X11 and macOS that banner
 is not capture-excluded and appears in the recording. With no surface at all the
 start is refused.
+
+⚠️ **A flag is not a banner (P3d).** The companion learns of a recording by reading
+the session list: its window every 750 ms, the banner's text once a second. A
+recorder started as soon as the flag was set wrote its first frames under "Being
+viewed", with no Stop on screen, 0.7 s of them in the field recording that showed
+it. So where the companion is the surface, the start waits for the first read and
+then one more turn of the slowest poll.
+
+| | |
+|---|---|
+| The usual wait | about 1.5 s: the first read within 750 ms, then 1.1 s |
+| The ceiling | 9.1 s: up to 3 s for a companion that was not running to start, 5 s for the first read, 1.1 s after it |
+| What the viewer shows meanwhile | `rc:record.state announcing`: "Telling the person at the device first…". An older viewer shows nothing new |
+| A slow companion | records. Any read within the 5 s counts, however late |
+| A companion that reads nothing | refused `no_indicator_surface`, in words that say it did not answer |
+| The kill switch | `ROOMLERD_RECORD_WAITS_FOR_BANNER=0`: the start goes straight on, as before P3d |
+
+A read proves the companion was told, not that the window painted: the daemon has
+no word back from it. The Windows badge redraws from a posted message rather than a
+poll, so it is not waited for. A SystemContext host with no badge and a Mac's worker
+take the companion's path through this same code. That path was field-read on Linux
+only, so on those two it is inferred.
 
 ⚠️ **The unattended exception (P1f).** A service with no screen anyone could
 be at (its own virtual desktop, or no graphical session and no real screen its
@@ -1589,6 +1616,7 @@ the music in the preview.
 | `tests/control_dc_record.rs`, a login screen (decision 6); `recording::launch` | a device at its login screen still advertises `available` and `remote`, refuses a local start, and refuses a remote one `login_screen` with the words, reported as a refusal, before the host is asked (no prompt stands), and with nothing at all to show a banner still `login_screen`, never an unattended recording, no file anywhere. An unattended recording stops `session_changed` when a login screen comes up, and at that login screen the controller still lists and downloads it. The decision table: SYSTEM or root at a login screen is `LoginScreen`, someone signed in wins over it, an identity that is not the service's never asks. The Linux seat (from review): any ACTIVE graphical session counts, whoever's, read from `loginctl`'s own output (a greeter, a Wayland greeter; not a text console, not an inactive desktop); a `loginctl` that cannot be asked is `Unknown`, never `Empty`; the whole `shows_a_screen` table (a greeter refuses whatever the recorder could reach; an empty or unknown seat refuses with a `DISPLAY` or DRM; the host's own virtual desktop and the synthetic source never refuse). A login screen found at the launch re-check is `StartError::Unavailable(LoginScreen)`, `login_screen` on the wire. Red, each on its own: the login screen read as nobody (it records unattended), the early refusal removed (the prompt stands), the code folded into `unavailable`, the capability tied to who is signed in (nothing advertised), the watch stopping only for a sign-in (it runs on), the unattended folder listed only while unattended recording is possible (the file leaves the list), the reach ignored, the second walk skipped | "Test the recorder (FR-85)" (`--test control_dc_record`, `--test recorder`, `--lib recording::`) |
 | `crates/remote_control` | `no_record_key_is_server_pushable_via_desired_config`; `remote_recording_does_not_imply_remote_audio` (equality, an old agent's hello advertises nothing, a newer word is ignored, the wire words are pinned); `a_recorder_being_available_is_not_permission_to_record` (P3c-2); `rc:recording.activity` owned by `remote`. "What the server holds" (§10): `a_recording_activity_row_holds_no_content` and `a_recording_activity_frame_carries_the_claim_and_nothing_else`. Red, each on its own: a field added to the row, an array under an existing key, a field added to the frame | same |
 | `delegate::params_tests` (P1e-mac) | `the_mac_relay_carries_no_sound_choice`: a `microphone` or `audio` written into the frame that hands a session to a Mac's worker is dropped. Red with a `microphone` field added to `DelegatedRecord` | every unfiltered `--lib` run |
+| `tests/control_dc_record.rs`, the banner first (P3d) | `a_slow_banner_still_records_and_comes_first`: a companion whose first read comes 1.5 s late still records, the viewer told `announcing`, and not until a poll after that read. `a_companion_that_never_reads_is_refused`: `no_indicator_surface`, "did not answer", the mark taken down, no recorder. Red with the wait gone, with no turn after the first read, and with a silent companion let through | "Test the recorder (FR-85)" |
 | `crates/localapi` (P2e) | `person_may_is_exactly_the_safety_surface` holds the four recording verbs on the person socket. `the_recording_decision_table`: the person at a system install's seat passes where the console gate refuses them, root passes, and the daemon's own endpoints keep the console gate. `the_person_at_the_seat_records_on_their_own_socket` reaches the state past both gates, and a peer the listener could not name is refused. Red, each on its own: an unnamed peer admitted, the console gate kept (the field's refusal), any named peer admitted on the daemon's own socket | every `cargo test -p roomler-localapi --lib` lane |
 | `recording::launch::unix` (P2e) | `the_display_is_logind_s_word_then_the_person_s_own_server`, and never Xwayland for a Wayland session; `the_x_display_is_the_lowest_socket_the_person_owns`: a plain file, a link, a name that is no display and someone else's server are not theirs | "Test the recorder (FR-85)" (`--lib recording::`) |
 | `tests/recorder.rs`, a capturer that could not open (P2e) | `a_capturer_that_could_not_open_says_why`: refused at once in the backend's own words. Red with the check off: the start waits out the first-frame timeout and says only "no frame" | "Test the recorder (FR-85)", `--test recorder` |
