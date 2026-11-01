@@ -710,6 +710,94 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   display, so "Connect" drops you into a live console.
 - Design notes for the tarball/self-update path: [linux-self-update.md](linux-self-update.md).
 
+### What a bare host needs (#3204)
+
+The daemon's `.deb` has to start on a host with nothing on it: a bare server, a
+container, a cluster node. FFmpeg, libvpx and libva ride in the package, so
+`depends` is short (`agents/roomlerd/Cargo.toml:1024`), and every name in it backs
+a library the binary links directly:
+
+| `Depends` | Why it reads this way |
+|---|---|
+| `libasound2t64 (>= 1.0.29) \| libasound2 (>= 1.0.29)` | ALSA, for the Opus system-audio track. The binary binds its symbols at load, so it must be the real library. See below |
+| `libssl3t64 (>= 3.0.0) \| libssl3 (>= 3.0.0)` | `libssl.so.3` and `libcrypto.so.3`. The first name is Ubuntu 24.04's and Debian 13's, the second Ubuntu 22.04's and Debian 12's. Debian 12's base image has neither |
+| `libc6`, `libxcb1`, `libxcb-shm0`, `libxcb-randr0` | One name on every release we support |
+
+⚠️ **The ALSA line looks over-specified, and every part of it is load-bearing.** From
+Ubuntu 24.04 and Debian 13 the library is `libasound2t64`, and `libasound2` is a
+virtual name. Ubuntu's other provider of that name is `liboss4-salsa-asound2`, a
+stub without the symbols the daemon binds: the package installs with exit 0, and
+the daemon dies with `undefined symbol: snd_device_name_get_hint`. The real
+packages' `Provides` carry a version and the stub's do not, so only a versioned
+dependency refuses it. Measured on the released binary:
+
+| Spelling | Fresh 24.04 | 24.04 with the stub already installed |
+|---|---|---|
+| `libasound2` (0.4.191 and earlier) | **the stub**: cannot start | stays on the stub: cannot start |
+| `libasound2t64 \| libasound2` | the real library | **stays on the stub**: cannot start |
+| `libasound2 (>= 1.0.29)` | the real library | **apt exits 100**, and `dpkg -i` plus `apt-get -f install` **removes the package** |
+| `libasound2t64 (>= 1.0.29) \| libasound2 (>= 1.0.29)` | the real library | **replaced by the real library**, through apt, `install.sh` and the updater |
+
+On Ubuntu 26.04 the stub provides `libasound2t64` as well, so an unversioned first
+alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives from
+the binary's symbols.
+
+Neither floor can strand a running daemon on the updater's offline `dpkg --install`
+rung (`agents/roomlerd/src/updater.rs:2299`), which is the reason libva and
+`iproute2` stay out of `depends`. A host where the daemon runs already has the real
+library and OpenSSL, because without them it cannot start. A healthy install
+upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,
+and loses nothing: its daemon could not start before either, so no updater runs
+there, and re-running the install heals it.
+
+**`install.sh` installs a `.deb` in two steps** (`deb_install`,
+`scripts/install.sh:1328`), and the wizard's root half is the same code:
+
+```mermaid
+flowchart TD
+    A["dpkg -i pkg.deb"] -->|"the dependencies are here"| OK["installed, no mirror needed"]
+    A -->|"one is missing: dpkg leaves the package half-configured"| B["apt-get update<br/>(a failure only warns)"]
+    B --> C["apt-get install -y --fix-broken pkg.deb"]
+    C -->|resolved| OK
+    C -->|"cannot fetch it"| F["exit 100, and the script stops.<br/>Nothing is removed, and what dpkg unpacked stays"]
+```
+
+⚠️ **Never `apt-get -f install` with no package named.** When it cannot reach a
+dependency it "fixes" the host by removing the package it was meant to finish, and
+exits 0. Naming the package keeps it in apt's solution, so apt refuses instead.
+`--fix-broken` has to stay as well: without it apt will not touch a package dpkg
+left half-configured.
+
+| State | `dpkg -i \|\| apt-get -f install -y` (until #3204) | `deb_install` |
+|---|---|---|
+| a fresh image, no package lists | **package removed**, exit 0 | fetches the lists and installs |
+| a working daemon, nothing reachable, and a new package that wants something this host lacks | **daemon deleted**, exit 0 | exit 100, and the daemon still runs |
+| Ubuntu 26.04 with the stub installed | **package removed**, exit 0 | replaces the stub and starts |
+
+The companion takes the same two steps and comes off again if they fail, because a
+half-configured companion blocks apt for the whole host. The CLI's arm keeps
+`apt-get -f install` on purpose: it checks the result and falls back to the tarball
+(`scripts/install.sh:1062`, #2472).
+
+**What checks all this.** `scripts/deb-bare-check.sh` installs the finished packages
+on Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13, with
+`--no-install-recommends`, because a Recommends can carry a library a Depends forgot
+(that is how `libssl3` hid on Debian 12: apt's default install started there, and
+`install.sh`'s path did not). It installs them again through the real `install.sh`
+on an image with no package lists. Then it starts what they ship: every library
+resolves under `ldd`, and `roomlerd --version`, `roomler --version` and
+`roomlerd encoder-smoke` run. The companion needs a display to get past `main`, so
+the loader check is all a bare image can ask of it.
+
+| Lane | What goes through it |
+|---|---|
+| `release-agent.yml`, `verify-linux-debs` (`.github/workflows/release-agent.yml:1325`) | The packages about to be published, x86_64 and aarch64. `release` needs it, so a package that fails here is never published |
+| `deb-bare-image.yml` | A PR that changes what a package declares: the latest release's binaries under the checkout's control file, through the lane's own `cargo deb`. A control step proves the check still refuses agent-v0.4.190 |
+
+⚠️ The lane's earlier "Verify the bundled agent loads" step proves the **bundle**,
+not the package. Its package list is written by hand, so it named the real ALSA
+library and passed while a bare 24.04 got the stub.
+
 ### The wizard on Linux (FR-129 B1)
 
 The same `roomler-setup` wizard that installs the daemon on Windows installs it
@@ -732,7 +820,7 @@ sequenceDiagram
     W->>P: pkexec /bin/sh #lt;script#gt; --privileged-steps --role daemon --server … --name … --desktop [--system --config-from #lt;file#gt;]
     P-->>W: ONE password dialog (GNOME Shell / KDE)
     P->>R: as root, its stdout and stderr to files in the scratch dir
-    R->>R: resolve · sha256 (REQUIRED) · dpkg -i / tarball · FR-96 helper · companion .deb/.rpm
+    R->>R: resolve · sha256 (REQUIRED) · deb_install / tarball · FR-96 helper · companion .deb/.rpm
     R->>R: --system: roomlerd adopt-enrollment folds the file into an existing config (#35;2338), then enable or RESTART roomlerd.service
     R-->>W: lines tailed as written · exit 0 (file shredded) · before its first line: 126 = cancelled, 127 = no prompt → the terminal command · after it: the script's own exit
     Note over W: per-user scope: enroll in-process now, folded into ~/.config/roomler/config.toml, then make the unit's folders
@@ -875,6 +963,9 @@ Disconnect and its consent prompt. As that user:
 - `roomler devices` answers too (FR-97 P2g): the devices this machine's private
   network reaches, as the companion's Devices page shows them. So does `roomler
   peers` (P2h), the links to them, without any endpoint (`sudo roomler peers` has those);
+- `roomler record start|stop|status|ls|rm` answers (FR-85 P2e), and so does the
+  companion's Recordings view. The recorder runs as that user, into their folder.
+  Choosing the folder, and allowing remote recording, stay `sudo roomler config set`;
 - anything administrative (`flows`, routes, `config`, …) is refused with a pointer
   to `sudo roomler …`.
 
@@ -1006,7 +1097,46 @@ install, and `daemon (3)` on an older one. The update helper keeps the default: 
 They cannot share one enrollment: the hub keys sessions on `agent_id`, so a
 second control-WS connection displaces the first. **Each half is its own
 enrollment, so a Mac appears as two devices** — the second named
-`<name>-daemon`.
+`<name>-daemon`. Two processes are forced by macOS; two rows are not, and
+[FR-43](fr/FR-43-macos-single-enrollment.md) P3 removes the second one.
+
+With `macos_supervise_gui_worker = true` in the daemon's config, the daemon's row
+serves remote desktop as well:
+
+```mermaid
+flowchart TB
+    subgraph server["roomler.ai"]
+        U["row: name"]
+        D["row: name-daemon"]
+    end
+    subgraph mac["The Mac"]
+        subgraph root["root, from boot"]
+            DAEMON["com.roomler.daemon: overlay, SSH, exec"]
+        end
+        subgraph gui["the console user's session"]
+            WORKER["roomlerd run --supervised: capture, input, clipboard"]
+        end
+        DAEMON -- "spawns: launchctl asuser, sudo -u" --> WORKER
+        DAEMON <-- "rc messages and caps: /var/run/roomler-delegate" --> WORKER
+    end
+    D -- "control WS" --- DAEMON
+    U -- "control WS" --- WORKER
+```
+
+| | Switch off, the default | Switch on |
+|---|---|---|
+| Who owns the GUI half | launchd, `com.roomler.agent` | the root daemon, `macos_supervisor.rs` |
+| A session on `<name>-daemon` | no pixels: the agent logs `no_display` | delegated to the worker: pixels and input |
+| What `<name>-daemon` reports | `no-gui-session` | the worker's permissions, on the next heartbeat; `no-gui-session` again within a heartbeat of the worker leaving |
+| A package update | keeps the LaunchAgent | removes it and keeps the worker (`postinstall`) |
+| The GUI half killed | launchd restarts it | the supervisor respawns it; the control WS stays up |
+| Nobody logged in | `<name>` offline, `<name>-daemon` online on the mesh | the same |
+
+⚠️ **On a supervised Mac, don't delete the `<name>` row as a duplicate.** The worker
+runs on that enrollment, so it is what the daemon's row streams through until P3.
+Measured on 0.4.191: with `<name>` deleted, the worker exits 7 at every spawn, the
+supervisor backs off and stops, and `<name>-daemon` reads `no-gui-session`. A Mac
+enrolled with one root token and no per-user enrollment has no worker at all.
 
 ```bash
 # Screen sharing only (one token, one device row):
@@ -1169,13 +1299,13 @@ Device configuration card carries a banner naming both files
 `config set` print the "a second roomler daemon is running" note that `status`
 and `peers` already printed — a note that had gone silent for the console user,
 because the root socket's `0700` directory refuses their `stat`; the root half's
-person socket is the evidence now (`crates/localapi/src/lib.rs:4592`).
+person socket is the evidence now (`crates/localapi/src/lib.rs:4627`).
 
 The root half's switches are **root's to set by design**, not by omission: its
 LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person socket it
 serves the console user admits the safety surface only — status, sessions,
 consent, the Devices view — never a config verb (`localapi::person_may`,
-`crates/localapi/src/lib.rs:3101`). Whether the console user should flip the
+`crates/localapi/src/lib.rs:3129`). Whether the console user should flip the
 root half's gates from the app is the decision left open on #2871; until it is
 taken, the gate stays with `sudo`.
 
@@ -1188,7 +1318,7 @@ and a supervised Mac — whose LaunchAgent FR-43 P2d boots out by design — rea
 
 The supervisor starts the GUI worker as `launchctl asuser <uid> sudo -u '#<uid>'
 … roomlerd run --supervised`, in a process group of its own, so that it can stop
-the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:595`). The same
+the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:612`). The same
 group is why launchd's teardown of the daemon never reaches the worker. Before
 #2987, a daemon that ended any way other than its clean shutdown (the watchdog's
 `exit(2)` after a stall, a crash, a `kill -9`) left its worker running. That
@@ -1215,9 +1345,9 @@ sequenceDiagram
 
 | Mechanism | How | Catches |
 |---|---|---|
-| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:659`, `:538`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). | A worker of this release, however its daemon ended |
-| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:828`, `:465`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
-| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:483`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
+| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:676`, `:555`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). | A worker of this release, however its daemon ended |
+| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:845`, `:482`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
+| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:500`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
 
 ⚠️ **Mixed versions are safe in both directions.** The offer is a line of its
 own after the secret. A worker from before #2987 reads one line, as it always
@@ -1296,8 +1426,8 @@ sequenceDiagram
 
 | Side of the race | Since #3080 | Where |
 |---|---|---|
-| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:886`, `:835`; `crates/tunnel-core/src/child.rs:75` |
-| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:625` |
+| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:903`, `:852`; `crates/tunnel-core/src/child.rs:75` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:642` |
 | **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:927` |
 
 ⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own
@@ -1471,7 +1601,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1261` (the section) — `uninstall_linux` at `:1687`,
+`scripts/install.sh:1270` (the section) — `uninstall_linux` at `:1714`,
 `uninstall_macos` at `:1494`.
 
 ```mermaid

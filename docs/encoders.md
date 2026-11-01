@@ -901,8 +901,8 @@ retires heuristics per backend rather than deleting them.
 ⚠️ **Above the ladder the controller moves nothing.** The top rung is 25 Mbps. A
 direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climbed
 `target_bps` 34 → 65 Mbps in eight AIMD steps while `rate_moves` stayed 0: every step
-coarsened to the top rung and `set_bitrate` returned. The encoder's maxrate is the
-rung, never the target.
+coarsened to the top rung and `set_bitrate` returned. Until its first rung crossing the
+encoder runs at the maxrate it opened with, and after that at the rung, never at the target.
 
 **What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:9819-9852`):
 
@@ -913,7 +913,7 @@ rung, never the target.
 | `rebuilds` | synchronous reopens, the inline arm |
 | `swaps` | background-rebuilt encoders adopted. Read it beside the two above: on a direct QSV session every rate move lands here and only here (FR-65) |
 | `dims_swaps` | reopens for a resolution change (FR-70 M2) |
-| `idr_count` | every keyframe the encoder emitted. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:840`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
+| `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:840`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
 **The read for any host** — the FR-62 A0 sweep (`app.rs:6295`):
@@ -947,7 +947,7 @@ drops `resetEncoder = forceIDR = 1` from `nvenc.c`'s bitrate-only reconfigure.
 `vendor-ffmpeg-windows.yml` applies it to the Windows and both Linux assets and
 writes `ROOMLER-PATCHES.txt` (sha256 per patch) into each; `release-agent.yml`
 refuses to tag when an asset's manifest differs from the committed patches
-(`.github/workflows/release-agent.yml:449-471`, `:1167` for arm64). The pump reads
+(`.github/workflows/release-agent.yml:449-471`, `:1172` for arm64). The pump reads
 one const, `NVENC_RECONFIG_FORCES_IDR` (`encoder.rs:893`), so the binary and the
 FFmpeg it links cannot disagree. The macOS builder carries no patch today.
 

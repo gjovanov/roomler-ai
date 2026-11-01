@@ -447,7 +447,9 @@ cannot prove that switch (FR-35 AC6).
 >   the memory +0.2 % (`ALPHA_UP` 0.10 of the gap), the next idle session moved
 >   it −7.5 % (its own seed written back as evidence). Nothing in these reads
 >   measured a sustainable limit; the memory's level is the write-back's
->   dynamics, not the pipe's. (FR-35 AC1 is open on exactly this.)
+>   dynamics, not the pipe's. (FR-35 AC1's numbers passed on 2026-10-31 without
+>   moving this, and a cold opener passes them too:
+>   [the opener A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-opener-ab-2026-10-31).)
 
 ### The write-back and the seed (V2 + V4) — the pair memory
 
@@ -502,7 +504,7 @@ again and ages out. An entry that ages out is *replaced* by the next session's
 first evidence, not damped toward it — the damping only ever acts inside the
 7-day window.
 
-⚠️ The 2026-10-27 15:29 row is the open question FR-35 AC1 now turns on. V4
+⚠️ The 2026-10-27 15:29 row is the open question FR-79 q3 turns on. V4
 dropped `had_decrease` because "the gate can tell a measurement from a
 non-measurement" — but `stable_bps()` is not gated: a target that nothing pushed
 is a hold, not a measurement, and on the connect-look-leave sessions this fleet
@@ -530,8 +532,7 @@ which fixes what a write can do:
 
 A session raises the memory only by climbing at least three rungs and then
 holding ten seconds; the week's mean was −2.98 % per write. Only 6 of the 18 held
-a target that a 2 s window carried at ≥ 70 %. Counting only carried holds helps,
-but it does not reach what FR-35 AC1 asks:
+a target that a 2 s window carried at ≥ 70 %. Counting only carried holds helps:
 
 | rule | writes that count | end value, evidence as logged | end value, same rungs from the higher opener | opener, × the cold 2.55 M |
 |---|---|---|---|---|
@@ -541,11 +542,36 @@ but it does not reach what FR-35 AC1 asks:
 | only rungs above the seed (`k ≥ 3`) | 7 | 4.23 M | 6.25 M | 1.41–2.08× |
 
 The fourth column is an upper bound, because CARRIED is harder to pass under a
-higher ceiling. A 2.5× opener needs a memory of 7.5 M, the last 6 % under `hi`,
-and the week's highest learned ceiling was 6.40 M. (AC1 asks for 2.5× the
-keyframe's bytes, which FR-31 ties to `maxrate` and the 2026-08-29 field rows
-follow only loosely.) So the hold question is worth deciding, but AC1 does not
-follow from it alone.
+higher ceiling.
+
+**Corrected 2026-10-31.** This section used to say a 2.5× opener needs a memory
+of 7.5 M, on the assumption that the keyframe follows `maxrate`. It does not
+follow it in a straight line ([the opener
+A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-opener-ab-2026-10-31)): on a
+dense screen on AV1, 1.6× the maxrate gave 3.5–5.8× the keyframe, and on H.265
+4:4:4, the same 2.55 M gave 23 to 63 KB. FR-35 AC1's numbers pass at the pair's
+own 2.85–3.0 M, on a bar a cold opener clears too, so AC1 stays `[~]` until the
+operator says which reading counts. The hold question is worth deciding for what
+the memory buys on AV1, and AC1's numbers do not depend on it.
+
+**Three writes in one night (2026-10-31, CORPLAP-2).** Evidence is
+`stable_bps()`, else `pipe_bps()` (`peer.rs:8988`), and nothing clamps the
+second to `hi`:
+
+| session | evidence | the memory |
+|---|---|---|
+| a 60 s drag, eight learner steps | 4,872,507 | 3,379,312 → 3,528,631, +4.4 % |
+| opened and maximized an Explorer window | 3,187,500 | → 3,358,065, −4.8 % |
+| 45 s, closed that window | 13,044,940 | → 4,326,752, +28.9 % |
+
+One burst moved the memory six times further than a minute of real load. That
+is the same question as the hold, from the other side: which sessions measured
+the pair.
+
+Below a memory of about 3.53 M the opener sits under the plan's 3 M, so an idle
+session has no `stable_bps()` above the nominal (`ceiling_learn.rs:266`) and, with
+nothing measured, writes nothing: an 8 min idle session read `evidence=None`. That
+is where the week's decay stopped, at 3.38 M.
 
 ### V3b — ONE belief about the path (SHADOW since `agent-v0.4.98`)
 

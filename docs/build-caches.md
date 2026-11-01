@@ -137,7 +137,7 @@ days. So before every non-tag build, `seed-cache-restore` runs a GC step
 | Jobs | Cap | Set at |
 |---|---|---|
 | Default (companions, everything else) | 3,000 MB | `seed-cache-restore/action.yml:85` |
-| The four daemon jobs (`.deb` ×2, MSI, `.pkg`) | 4,500 MB | `release-agent.yml:393`, `:1129`, `:1604`, `:2575` |
+| The four daemon jobs (`.deb` ×2, MSI, `.pkg`) | 4,500 MB | `release-agent.yml:393`, `:1134`, `:1654`, `:2625` |
 | The wizard's macOS universal job (two triples) | 5,000 MB | `release-setup.yml:401` |
 | CI caches in the release-asset store (`ci-seed-restore`), default | 4,000 MB | `ci-seed-restore/action.yml:29` |
 | The integration shards, `ci.yml`'s macOS overlay check and its Windows clippy lane | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1368`, `:1617` |
@@ -160,6 +160,19 @@ allows 35 (`ci.yml:1340`): its cold run took 22 min 33 s on 2026-10-30, after it
 its 6,000 MB cap, against a 25-minute ceiling (FR-6 wave 37). Every other `ci.yml` lane with a
 cold run on record allows about 1.5 times it or more. Windows sessions and the FR-85 recorder
 lane have none.
+
+**A cache that grows past its cap is the GC at work, not that failure.** The bump to 0.4.191
+published the macOS overlay cache at 6,440 MB, over its 6,000, and the warning fired. The next
+three macOS jobs dropped it and built cold, in 9.2, 20.9 and 22.1 min, inside the 35-minute
+ceiling. The master run among them published 4,664 MB 23 minutes after the oversize publish,
+and the job after that was warm. So after that warning, read the next master publish. Under the
+cap, nothing is owed. Only a cold build that publishes over the cap again calls for raising it.
+
+**A macOS job's time does not say whether it ran cold.** Two of those jobs built the same 976
+crates and started 88 s apart: one took 9.2 min, the other 22.1. Warm jobs on that lane took
+6.9–17.3 min. Read the job's log instead: `restored target is N MB (> C) — dropping it whole`
+is a cold run, and `restored <family>: target N MB, same key` or `key changed` is a warm one.
+A warm job compiled 41 crates against the cold job's 976.
 
 The Linux lanes' caps began as estimates, about 1.5 times each lane's old Actions-cache archive
 at the 4.3× unpack ratio the integration lane measures (its 1,181 MB asset restores to
@@ -209,7 +222,7 @@ grep -oE 'target is [0-9]+ MB.*' job.log                          # GC line, non
 | `::warning title=Seed publish did not land::` | the save's own check failed; the next run may build cold |
 | `tag run — skipping accretion GC` | expected on every tag run |
 
-A failed rehearsal opens a GitHub issue (`release-agent.yml:3679`), and the next green one
+A failed rehearsal opens a GitHub issue (`release-agent.yml:3729`), and the next green one
 closes it (`:3742`).
 
 ## 6. The waves that built this

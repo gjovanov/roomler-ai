@@ -112,8 +112,13 @@ commitment end to end).
   bug.
 - **jupiter carries the prod storage node** — the orchestrator refuses it without
   an explicit override, in an announced window only. zeus first, mars overflow.
-- **Sequential scheduling** (one guest per host, ≤ 8 GiB): `vmtest-audit` runs
-  before every cell and the k8s VMs never need shrinking in normal operation.
+- **Sequential scheduling** (one guest per host, ≤ 8 GiB). zeus also carries
+  production's k8s VMs, so `vmtest-audit` counts what running guests are allocated,
+  not what is free. It runs before every cell and refuses a guest that doesn't fit.
+  On 2026-10-31 a lab boot got `k8s-worker-2`'s qemu OOM-killed while `free` looked
+  fine, and one production pod was down for about 16 minutes. A kit that boots its
+  own guest runs the audit first, and a lane whose second guest boots late holds
+  its room in `/var/lib/libvirt/vmtest/reserved.d/<lane>`.
 
 ## Results, verdict and the regression-issue lifecycle
 

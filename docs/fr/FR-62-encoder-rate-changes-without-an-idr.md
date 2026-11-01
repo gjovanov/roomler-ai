@@ -1,8 +1,32 @@
 # FR-62 — Encoder rate changes without an IDR
 
-**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; **both** recorded causes are REFUTED (the second by measurement on 0.4.62); patch 0004 is what is left; A1 shipped inert; A2 + const flip shipped (0.4.51) · **A3 — AMF measured** on the Radeon 610M (0.4.187, 2026-10-29): a rebuild on every rung, **41–55 ms, 20/20 IDRs** — the 0.4.187 harness filed them as periodic, fixed in the same PR; VideoToolbox still unmeasured · NVENC re-read on the released 0.4.187: **0/20** · docs: [`encoders.md` § A rate move, per backend](../encoders.md#a-rate-move-per-backend-fr-62) · the kill-switch registry (AC4's instrument): [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
+**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; **both** recorded causes are REFUTED (the second by measurement on 0.4.62); patch 0004 is what is left; A1 shipped inert; A2 + const flip shipped (0.4.51) · **A3 — AMF measured** on the Radeon 610M (0.4.187, 2026-10-29): a rebuild on every rung, **41–55 ms, 20/20 IDRs** — the 0.4.187 harness filed them as periodic, fixed in the same PR; VideoToolbox still unmeasured · NVENC re-read on the released 0.4.187: **0/20** · AC2/AC3: a passive relayed session on 0.4.191 made no rate move, so neither is proven · docs: [`encoders.md` § A rate move, per backend](../encoders.md#a-rate-move-per-backend-fr-62) · the kill-switch registry (AC4's instrument): [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 ## Progress
+
+- **2026-10-31 22:47Z — the first relayed NVENC read: the cell works, and nothing was tested.**
+  CORPLAP-2 on 0.4.191, `hevc_nvenc` 1920×1200, `constrained=true` on all 158 heartbeats over
+  318 s, the viewer's pair local `srflx`, remote `relay`, UDP. One session from a viewer tab, no
+  config change, read through the agent-log API.
+  - **`rate_moves` stayed 0, so AC2 and AC3 are not proven.** Four target changes (3.13–3.68 M)
+    all stayed on one rung. The 3 M rung spans 2.5–3.75 M, and on a held screen nothing drives
+    the target out of it. By the arithmetic the Priority dial's 70 % lands on the same rung at
+    this ceiling, and the FFmpeg DC pump does not read `rc:quality`. Rate moves on this cell
+    need real desktop motion.
+  - **`idr_count` read 18 at the first heartbeat:** the opener plus 17 forced while the DC was not
+    open (`dc_unopen_drops=17`). It stayed 18 for the rest of the session, and the wire carried 1
+    keyframe in 6,006 frames. So the read's baseline is load-bearing: without it, `idr_count`
+    breaks AC3's inequality before the first picture arrives.
+  - **Bytes per frame ran at p50 0.063, max 0.491, of the cap.** An idle desktop, no overshoot.
+  - 🔑 **The encoder's maxrate is not always the rung.** It held the 3,677,739 it opened with:
+    `set_bitrate` compares the two values' rungs and returns when they match
+    (`encode/ffmpeg/encoder.rs:3007`), so the opening value stands until the first rung crossing.
+    The read's denominator follows it.
+  - **Not run:** the positive controls and the motion. A scripted timeline (one keyframe request,
+    one resize and back, a window drag, dial moves) was refused by the automation's permission
+    check as a write to the remote host, so the session stayed passive apart from one pointer
+    move with no press. They need the operator (Open decisions). VideoToolbox's A0 did not run
+    either: lab VMs were live on the Mac.
 
 - **2026-10-31 — AC2/AC3's read corrected, AC4's registry built, AC4's sequencing recorded.**
   - 🔑 **On NVENC the default build already moves the rate in place, with no IDR.**
@@ -42,11 +66,11 @@
     builds a new encoder whose counters restart at zero, so a window across one is not
     diffed.
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
-    - `target_bps` is `governor.applied_bps()`, the raw target. The encoder's maxrate
-      is that target's nearest rung (`coarsen_bitrate`, `encode/aimd.rs:317`, applied in
-      `set_bitrate`, `encoder.rs:3006`). So the read is against `coarsen_bitrate(target_bps)
-      ÷ target_fps ÷ 8`. Against the raw target a perfect encoder reads off by the rung's
-      distance.
+    - `target_bps` is `governor.applied_bps()`, the raw target. The encoder runs at the maxrate
+      it opened with until the first rung crossing, then at that target's nearest rung
+      (`coarsen_bitrate`, `encode/aimd.rs:317`, applied in `set_bitrate`, `encoder.rs:3006`).
+      So the read is against that maxrate ÷ `target_fps` ÷ 8. Against the raw target a
+      perfect encoder reads off by the rung's distance.
     - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung
       and move nothing. Δ`rate_moves` marks a real move. The read judges the first
       complete 2 s heartbeat window (`peer.rs:6717`) after a Δ`rate_moves`, on
@@ -226,7 +250,7 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
       relay candidate in the nominated pair) for five minutes with real desktop motion. The only
       sessions the dev box's agent saw on 2026-10-29 were direct (`constrained=false`), and a direct
       path at a 25 M rung is not the cell. The read: per heartbeat window, Δ`bytes_written` ÷
-      Δ`frames_encoded` against `coarsen_bitrate(target_bps) ÷ target_fps ÷ 8`, judged at the first
+      Δ`frames_encoded` against the encoder's maxrate ÷ `target_fps` ÷ 8, judged at the first
       complete window after each Δ`rate_moves`, under motion that saturates the cap (the corrected
       read, 2026-10-31 above). The default build is the arm under test: NVENC applies in place with
       no flag. The only NVENC test host that is not the dev box is CORPLAP-2 over its VPN, so the
@@ -267,11 +291,13 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
 | 2026-10-29 22:12 | **0.4.187** (released) | Radeon 610M, `hevc_amf` via `--name` | 20 rebuilds, 41–55 ms each, an IDR on every rung (`first3_max` 1.4–5.4 KB vs 250–690 B trailing); reported as `periodic_idr` by the frame-0 rule |
 | 2026-10-29 10:17 | 0.4.186 | dev box, `av1_nvenc` 1916×1198 @ 144, **direct** | eight AIMD steps 34 → 65 Mbps, `rate_moves=0`: the 25 M top rung swallows every step; `idr_count=2`, `dims_swaps=1` |
 | 2026-10-29 22:36 | this PR's tree, built natively on the same FFmpeg pin | RTX 5090 Laptop `hevc_nvenc`, Radeon 610M `hevc_amf` | the corrected harness, same silicon, same session of readings: NVENC **`pass:true`** (0/20, 0.003–0.004 ms, `basis:idr+apply`, both HRD arms); AMF **`total_rate_idr:20, total_periodic_idr:0`**, `max_set_ms` 54.4, `pass:false` — every rung `rate_idr:1` |
+| 2026-10-31 22:47 | **0.4.191** (released) | CORPLAP-2 `hevc_nvenc` 1920×1200, **relayed**, passive | `constrained=true` on 158 of 158 heartbeats over 318 s; `rate_moves=0`, `rebuilds=0`, `swaps=0`, `dims_swaps=0`; `idr_count` 18 (the opener + `dc_unopen_drops=17`), flat after the first heartbeat; 1 keyframe on the wire in 6,006 frames; bytes per frame p50 0.063, max 0.491 of the cap. No rate move, so it proves neither AC2 nor AC3 |
 
 ## Open decisions
 
-- **The AC2/AC3 cell** (the operator's): CORPLAP-2 over its VPN, a rented NVIDIA host, or an
-  operator-run session against the read above.
+- **AC2/AC3's motion** (the operator's): CORPLAP-2 over its VPN is the cell, and a read needs rate
+  moves, which need desktop motion. Either the operator plays a video there while an agent only
+  reads, or the operator gives an explicit OK for a synthetic window drag and the positive controls.
 - **AC2 and AC3's wording.** AC3's inequality omits the opener and the drop-burst resync, and AC2's
   ≈ 1.0 is a CBR's contract. Both keep their wording until the read is in hand; the 2026-10-31 entry
   above says what the read will judge. The operator decides whether they are amended.

@@ -1598,7 +1598,10 @@ pub(crate) mod unix {
                 format!("unix:path=/run/user/{uid}/bus"),
             ),
         ];
-        if let Some(d) = session.display {
+        let wayland = session.wayland_display.is_some();
+        if let Some(d) = x_display(session.display, wayland, || {
+            x_display_owned_by(Path::new(X_SOCKETS), uid)
+        }) {
             session_env.push(("DISPLAY".to_string(), d));
         }
         if let Some(w) = session.wayland_display {
@@ -1608,6 +1611,51 @@ pub(crate) mod unix {
             session_env.push(("XAUTHORITY".to_string(), xa.to_string_lossy().into_owned()));
         }
         spawn_as_account(&session.name, &session_env, exe, args, env)
+    }
+
+    /// Where X servers put their sockets.
+    const X_SOCKETS: &str = "/tmp/.X11-unix";
+
+    /// FR-85 P2e — the `DISPLAY` for a session: logind's word, else the X
+    /// server the person is running.
+    ///
+    /// ⚠️ Measured on Ubuntu 24.04, GNOME on X11: GDM starts Xorg as the
+    /// person, with `-displayfd`, and logind never hears the number, so
+    /// `Display=` is empty for a session that has a display. A recorder
+    /// launched from that word has no `DISPLAY` and never reads a frame.
+    ///
+    /// A Wayland session stays out of this: its `DISPLAY` would be Xwayland's,
+    /// and capture refuses that empty root.
+    fn x_display(
+        logind: Option<String>,
+        wayland: bool,
+        find: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        logind.or_else(|| if wayland { None } else { find() })
+    }
+
+    /// The lowest display whose socket `uid` owns. A server started as the
+    /// person leaves its socket in their name, and the one their login started
+    /// comes first: a VNC server or an Xvfb of theirs takes a higher number.
+    fn x_display_owned_by(dir: &Path, uid: u32) -> Option<String> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            // `DirEntry::metadata` does not follow a link: a link is no server.
+            .filter(|e| {
+                e.metadata()
+                    .is_ok_and(|m| m.file_type().is_socket() && m.uid() == uid)
+            })
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()?
+                    .strip_prefix('X')?
+                    .parse::<u32>()
+                    .ok()
+            })
+            .min()
+            .map(|n| format!(":{n}"))
     }
 
     /// The launch itself, apart from the session lookup, so a test can run
@@ -1646,6 +1694,48 @@ pub(crate) mod unix {
 
         fn nobody() -> Account {
             Account::by_name("nobody").expect("the `nobody` account")
+        }
+
+        /// FR-85 P2e — logind's word first, then the person's own server,
+        /// and never Xwayland for a Wayland session.
+        #[test]
+        fn the_display_is_logind_s_word_then_the_person_s_own_server() {
+            let found = || Some(":7".to_string());
+            assert_eq!(
+                x_display(Some(":1".into()), false, found).as_deref(),
+                Some(":1")
+            );
+            assert_eq!(
+                x_display(None, false, found).as_deref(),
+                Some(":7"),
+                "GNOME on X11 under GDM: logind's Display= is empty"
+            );
+            assert_eq!(x_display(None, true, found), None, "a Wayland session");
+            assert_eq!(x_display(None, false, || None), None);
+        }
+
+        /// FR-85 P2e — only a socket this person owns, named for a display,
+        /// is theirs, and the lowest of them is the one their login started.
+        #[test]
+        fn the_x_display_is_the_lowest_socket_the_person_owns() {
+            use std::os::unix::net::UnixListener;
+            let dir = tempfile::tempdir().unwrap();
+            // SAFETY: reads our own credentials.
+            let me = unsafe { libc::geteuid() };
+            let _session = UnixListener::bind(dir.path().join("X5")).unwrap();
+            let _vnc = UnixListener::bind(dir.path().join("X7")).unwrap();
+            // None of these is a display of theirs, and the two that would
+            // parse sort below the real one, so taking either shows.
+            std::fs::write(dir.path().join("X0"), b"").unwrap();
+            std::os::unix::fs::symlink(dir.path().join("X5"), dir.path().join("X1")).unwrap();
+            let _named = UnixListener::bind(dir.path().join("Xother")).unwrap();
+            assert_eq!(x_display_owned_by(dir.path(), me).as_deref(), Some(":5"));
+            assert_eq!(
+                x_display_owned_by(dir.path(), me.wrapping_add(1)),
+                None,
+                "someone else's server"
+            );
+            assert_eq!(x_display_owned_by(&dir.path().join("absent"), me), None);
         }
 
         /// Work done as the person gets only the person's rights: a folder

@@ -18,6 +18,9 @@ import { ref } from 'vue'
 export type RecordState =
   | 'idle'
   | 'pending_consent'
+  /** P3d — the device is waiting for its banner to say so. At most seconds,
+   *  and a device older than this goes straight to `recording`. */
+  | 'announcing'
   | 'recording'
   /** P3b-3 — the session dropped mid-recording. The device goes on recording
    *  for up to a minute for this controller's next session, which picks it
