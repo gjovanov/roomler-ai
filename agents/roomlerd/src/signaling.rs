@@ -3483,14 +3483,7 @@ async fn handle_server_msg(
                     &ctx.label,
                 )
             };
-            // Pick the best codec for this session from the
-            // intersection of (browser-advertised, agent-supported).
-            // Stashed per session_id so the rc:sdp.offer handler can
-            // read it back when building the peer: that's where the
-            // track codec + encoder backend are actually bound.
             let our_caps = crate::encode::caps::detect();
-            let chosen = crate::encode::caps::pick_best_codec(&browser_caps, &our_caps.codecs);
-            pending_codecs.insert(session_id, chosen.clone());
 
             // Phase Y.3: figure out which video transport this
             // session will use. Honour `preferred_transport` only if
@@ -3505,6 +3498,18 @@ async fn handle_server_msg(
                     None
                 }
             });
+            // Pick the codec for this session. #3245 — after the transport,
+            // because the transport decides what can open it: the RTP track's
+            // opener knows fewer encoders than `our_caps.codecs` advertises.
+            // Stashed per session_id so the rc:sdp.offer handler can read it
+            // back when building the peer: that's where the track codec +
+            // encoder backend are actually bound.
+            let chosen = crate::peer::session_codec(
+                &browser_caps,
+                &our_caps,
+                negotiated_transport.as_deref(),
+            );
+            pending_codecs.insert(session_id, chosen.clone());
             // Stash for the upcoming SdpOffer handler — that's where
             // AgentPeer::new is called and the media pump is built.
             // Without this stash the negotiation result was logged but

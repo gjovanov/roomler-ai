@@ -2385,8 +2385,8 @@ up there.
 On the WebRTC track (the RTP transport, no DataChannel) the track **is** the
 picture: it sends the encoder's codec, and the browser must have offered it. A
 browser that decodes none of the codecs the RTP track sends offers VP8, VP9 and
-AV1 while the track sends H.264 (`pick_best_codec`'s fallback when nothing
-intersects), HEVC or AV1. That is mainly a Firefox without its OpenH264 plugin:
+AV1 while the track sends H.264 (`session_codec`'s fallback when nothing it can
+open is listed), HEVC or AV1. That is mainly a Firefox without its OpenH264 plugin:
 Playwright and CI builds, a plugin disabled by policy, an offline install.
 `create_answer` then fails ("RTPSender created with no codecs").
 
@@ -2401,7 +2401,7 @@ sequenceDiagram
     participant A as roomlerd
     V->>S: rc:session.request browser_caps=[vp8, vp9, av1]
     S->>A: rc:request
-    Note over A: pick_best_codec: nothing in common, so H.264
+    Note over A: session_codec: nothing it can open is listed, so H.264
     A->>S: consent granted
     S->>V: rc:ready
     V->>S: rc:sdp.offer (m=video: VP8, VP9, AV1)
@@ -2425,7 +2425,7 @@ sequenceDiagram
 ⚠️ **The consent prompt has already been answered** by the time the offer
 arrives, so the person at the device approved a session that then cannot start.
 The viewer could refuse before it asks, from its own `browser_caps` and the
-device's codecs, but only with a second copy of `pick_best_codec` in the
+device's cells, but only with a second copy of `session_codec` in the
 browser. The agent's check stays the authority either way, because an older
 viewer will still ask.
 

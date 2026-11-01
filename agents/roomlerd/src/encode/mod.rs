@@ -1610,6 +1610,32 @@ pub fn open_named(
     }
 }
 
+/// #3245 — could [`open_for_codec`] open `codec` on this host, by the cells the
+/// probe opened? Beside the opener because it states what the opener knows, and
+/// `AgentCaps.codecs` cannot say that: it lists AV1 for an FFmpeg cell the opener
+/// never tries. AV1 opens through Media Foundation alone. HEVC opens through
+/// whichever backend has a cell, since `open_for_codec_hevc` walks FFmpeg's
+/// cascade and then MF. VP8 and VP9 do not open at all: the opener's fallback arm
+/// would put H.264 bytes on their track. H.264 is the opener's own fallback and
+/// needs no cell.
+///
+/// A cell proves an open at the probe's size, not at a session's, so a `true`
+/// here can still end in a Noop; the RTP pump ends that session by name.
+pub fn rtp_opener_opens(
+    codec: &str,
+    cells: &[roomler_ai_remote_control::models::VideoCell],
+) -> bool {
+    use roomler_ai_remote_control::models::{VideoBackend, VideoCodec};
+    match codec.to_ascii_lowercase().as_str() {
+        "h264" => true,
+        "av1" => cells.iter().any(|c| {
+            c.codec == VideoCodec::Av1.wire() && c.backend == VideoBackend::MediaFoundation.wire()
+        }),
+        "h265" | "hevc" => cells.iter().any(|c| c.codec == VideoCodec::Hevc.wire()),
+        _ => false,
+    }
+}
+
 pub fn open_for_codec(
     codec: &str,
     width: u32,

@@ -8,8 +8,8 @@
 //! The browser is a webrtc-rs peer whose media engine registers VP8 alone,
 //! offering a recvonly video transceiver and asking for no DataChannel
 //! transport: a Firefox without OpenH264 on the WebRTC track. This build's
-//! agent encodes nothing, so `pick_best_codec` falls back to H.264 for it, as
-//! it did for the field's agents (0.4.136: `create_answer` failed, the session
+//! agent encodes nothing, so `session_codec` falls back to H.264 for it, as
+//! `pick_best_codec` did for the field's agents (0.4.136: `create_answer` failed, the session
 //! ended as a bare `error`, and the viewer asked again). The control is the
 //! same agent and controller with H.264 in the offer: answered.
 

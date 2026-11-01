@@ -1654,6 +1654,7 @@ impl AgentPeer {
             viewer_report.clone(),
             priority,
             rc_sessions,
+            outbound.clone(),
         ));
 
         // FR-93 P5h — told when this computer goes to sleep.
@@ -2365,6 +2366,10 @@ async fn media_pump(
     // FR-93 P6c — where a pump ends its session when the person at the screen
     // stops the share (`end_stopped_at_screen`).
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
+    // #3245 — where the RTP pump ends a session it cannot produce video for
+    // (`end_no_video`). The peer's own sender, so a delegated session's end
+    // reaches the server under the identity its row carries.
+    outbound: mpsc::Sender<ClientMsg>,
 ) {
     // `pc` is consumed only by the VP9-444 DC pump's per-session transport
     // detection (feature-gated); keep the signalling-only / non-vp9 build
@@ -3067,13 +3072,17 @@ async fn media_pump(
             // but nothing works" footgun in the stack. Shout at
             // session-build time so field reports land on a log
             // line that explains the symptom in one read.
+            //
+            // #3245 — and end it: the viewer showed that session as
+            // connected, with a black picture and nothing to read.
             if encoder.as_ref().map(|e| e.name()) == Some("noop") {
                 warn!(
                     %session_id,
                     codec = %chosen_codec,
                     w = frame.width, h = frame.height,
-                    "encoder resolved to NoopEncoder — NO VIDEO WILL SHIP for this session. Cascade above tells you why. Workarounds: toggle codec override to H.264 + reconnect, or switch Quality to `low` to force a smaller profile."
+                    "encoder resolved to NoopEncoder — NO VIDEO CAN SHIP for this session, ending it. Cascade above tells you why."
                 );
+                match end_no_video(session_id, &outbound).await {}
             }
 
             // Auto-downscale heuristic. SW HEVC (MS's
@@ -5988,6 +5997,37 @@ async fn end_stopped_at_screen(
             p.beat();
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// #3245 — how long an end the hub has not acted on waits before it is said
+/// again.
+const NO_VIDEO_END_EVERY: Duration = Duration::from_secs(5);
+
+/// #3245 — the end of an RTP session whose encoder opened as a Noop. The track
+/// is bound to its codec and cannot take another's bitstream, so nothing can
+/// ever reach the browser. It says `no_common_codec`, the one end the viewer does
+/// not retry, since a retry would make the same offer and land here again.
+///
+/// Said again until the session goes, because a frame lost in a control-socket
+/// redial would otherwise leave the very session this exists to end, and
+/// `Terminate` is idempotent at the hub. Never returns: the session's teardown
+/// aborts the pump, whose task this is.
+async fn end_no_video(
+    session_id: bson::oid::ObjectId,
+    outbound: &mpsc::Sender<ClientMsg>,
+) -> std::convert::Infallible {
+    loop {
+        let _ = outbound
+            .send(ClientMsg::Terminate {
+                session_id,
+                reason: roomler_ai_remote_control::models::EndReason::Error,
+                limit: Some(
+                    roomler_ai_remote_control::signaling::LIMIT_NO_COMMON_CODEC.to_string(),
+                ),
+            })
+            .await;
+        tokio::time::sleep(NO_VIDEO_END_EVERY).await;
     }
 }
 
@@ -13599,6 +13639,40 @@ fn codec_params_for(codec: &str) -> webrtc::rtp_transceiver::rtp_codec::RTCRtpCo
     }
 }
 
+/// #3245 — the codec a session is bound to, once its transport is known.
+///
+/// A DataChannel pump opens its encoder through its own cascade, so the best
+/// common codec stands (`pick_best_codec`). On the RTP track the picture IS this
+/// codec, bound before the encoder opens, and its opener knows fewer encoders
+/// than the host advertises: a browser listing AV1 on an FFmpeg-only AV1 host
+/// got a track no encoder could feed, and a session that read connected and
+/// stayed black.
+///
+/// So on the RTP track, H.264 whenever the browser lists it, or lists nothing
+/// (a controller from before the list): every host opens it, and it is the path
+/// the viewer already assumes. Only a browser without H.264 takes something
+/// else, and only a codec the opener can open, by the probe's cells. With no
+/// such codec H.264 stays, and the offer decides: `rtp_track_unanswerable`
+/// refuses it by name, where a pick of anything else would have been black.
+pub fn session_codec(
+    browser_caps: &[String],
+    caps: &roomler_ai_remote_control::models::AgentCaps,
+    transport: Option<&str>,
+) -> String {
+    if on_data_channel(transport) {
+        return crate::encode::caps::pick_best_codec(browser_caps, &caps.codecs);
+    }
+    let browser_lists = |c: &str| browser_caps.iter().any(|b| b.eq_ignore_ascii_case(c));
+    if browser_caps.is_empty() || browser_lists("h264") {
+        return "h264".to_string();
+    }
+    ["av1", "h265"]
+        .into_iter()
+        .find(|c| browser_lists(c) && encode::rtp_opener_opens(c, &caps.video_cells))
+        .unwrap_or("h264")
+        .to_string()
+}
+
 /// #2231 — the codec the RTP video track is created and pinned with.
 ///
 /// On a DataChannel transport the track carries no frame (the DC pump owns the
@@ -13704,8 +13778,121 @@ fn offer_carries_track(offer_sdp: &str, codec: &str) -> bool {
 mod codec_cap_tests {
     use super::{
         build_video_codec_cap, codec_params_for, offered_video_codecs, rtp_track_codec,
-        rtp_track_unanswerable,
+        rtp_track_unanswerable, session_codec,
     };
+    use roomler_ai_remote_control::models::{
+        AgentCaps, ChromaFormat, VideoBackend, VideoCell, VideoCodec,
+    };
+
+    fn list(codecs: &[&str]) -> Vec<String> {
+        codecs.iter().map(|c| c.to_string()).collect()
+    }
+
+    fn host(codecs: &[&str], cells: &[(VideoCodec, VideoBackend)]) -> AgentCaps {
+        AgentCaps {
+            codecs: list(codecs),
+            video_cells: cells
+                .iter()
+                .map(|&(c, b)| VideoCell::new(c, b, &[ChromaFormat::Yuv420], true))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The #3245 host: AV1 and HEVC through FFmpeg, none through MF.
+    fn ffmpeg_only() -> AgentCaps {
+        host(
+            &["h264", "h265", "av1"],
+            &[
+                (VideoCodec::H264, VideoBackend::Openh264),
+                (VideoCodec::Hevc, VideoBackend::Qsv),
+                (VideoCodec::Av1, VideoBackend::Qsv),
+            ],
+        )
+    }
+
+    /// #3245 — with no transport a browser that lists H.264 gets H.264, whatever
+    /// the host could also do: the bound track is what a host without the
+    /// opener's encoder stayed black on.
+    #[test]
+    fn the_rtp_track_takes_h264_whenever_the_browser_lists_it() {
+        let chrome = list(&["av1", "h265", "vp9", "h264", "vp8"]);
+        assert_eq!(session_codec(&chrome, &ffmpeg_only(), None), "h264");
+        let mf_av1 = host(
+            &["h264", "av1"],
+            &[(VideoCodec::Av1, VideoBackend::MediaFoundation)],
+        );
+        assert_eq!(session_codec(&chrome, &mf_av1, None), "h264");
+        assert_eq!(session_codec(&list(&["H264"]), &mf_av1, None), "h264");
+        // A controller from before the list.
+        assert_eq!(session_codec(&[], &ffmpeg_only(), None), "h264");
+    }
+
+    /// #3245 — a browser without H.264 takes a codec the opener can open, read
+    /// from the cells rather than from `codecs`; with none, H.264 stays and the
+    /// offer refuses it by name. Never a codec bound to a Noop.
+    #[test]
+    fn a_browser_without_h264_takes_only_what_the_opener_opens() {
+        let firefox = list(&["vp8", "vp9", "av1"]);
+        let mf_av1 = host(
+            &["h264", "av1"],
+            &[(VideoCodec::Av1, VideoBackend::MediaFoundation)],
+        );
+        assert_eq!(session_codec(&firefox, &mf_av1, None), "av1");
+        assert!(!rtp_track_unanswerable("av1", None, FIREFOX_NO_H264));
+
+        // The same browser on the #3245 host: the AV1 cell is FFmpeg's.
+        let refused = session_codec(&firefox, &ffmpeg_only(), None);
+        assert_eq!(refused, "h264");
+        assert!(rtp_track_unanswerable(&refused, None, FIREFOX_NO_H264));
+
+        // HEVC opens through FFmpeg's cascade as well as MF's.
+        let hevc_only = list(&["h265", "vp8"]);
+        for backend in [VideoBackend::Qsv, VideoBackend::MediaFoundation] {
+            let hevc = host(&["h265"], &[(VideoCodec::Hevc, backend)]);
+            assert_eq!(session_codec(&hevc_only, &hevc, None), "h265");
+        }
+        // `codecs` says h265 and no cell does: the probe opened nothing.
+        assert_eq!(
+            session_codec(&hevc_only, &host(&["h265"], &[]), None),
+            "h264"
+        );
+        // AV1 first, as `pick_best_codec` ranks them.
+        let both = host(
+            &["h265", "av1"],
+            &[
+                (VideoCodec::Hevc, VideoBackend::MediaFoundation),
+                (VideoCodec::Av1, VideoBackend::MediaFoundation),
+            ],
+        );
+        assert_eq!(session_codec(&list(&["h265", "av1"]), &both, None), "av1");
+        // VP9 and VP8 never bind: the opener would put H.264 bytes on the track.
+        let vp9 = host(&["vp9"], &[(VideoCodec::Vp9, VideoBackend::Libvpx)]);
+        assert_eq!(session_codec(&list(&["vp9", "vp8"]), &vp9, None), "h264");
+    }
+
+    /// #3245 — a DataChannel session keeps the best common codec: its pump opens
+    /// through its own cascade, and its track is only a placeholder.
+    #[test]
+    fn a_data_channel_session_keeps_the_best_common_codec() {
+        let chrome = list(&["av1", "h265", "vp9", "h264", "vp8"]);
+        for transport in [
+            "data-channel-av1",
+            "data-channel-hevc",
+            "data-channel-h264",
+            "data-channel-vp9-444",
+        ] {
+            assert_eq!(
+                session_codec(&chrome, &ffmpeg_only(), Some(transport)),
+                "av1",
+                "{transport}"
+            );
+        }
+        assert_eq!(
+            session_codec(&[], &ffmpeg_only(), Some("data-channel-hevc")),
+            "h264"
+        );
+    }
 
     /// A Firefox without OpenH264, as it offers: VP8, VP9 and AV1 (+ rtx/fec),
     /// with Opus on the audio line.
@@ -15518,6 +15705,37 @@ mod stopped_at_screen_tests {
             "org".into(),
             kill,
         );
+    }
+
+    /// #3245 — a pump with a Noop encoder names the end the viewer does not
+    /// retry, says it again in case a redial lost it, and never returns.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_with_no_encoder_ends_by_name_until_it_goes() {
+        let sid = ObjectId::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let pump = tokio::spawn(async move { end_no_video(sid, &tx).await });
+        for _ in 0..2 {
+            let said = tokio::time::timeout(NO_VIDEO_END_EVERY * 2, rx.recv())
+                .await
+                .expect("said within its period")
+                .expect("the pump still holds the sender");
+            let ClientMsg::Terminate {
+                session_id,
+                reason,
+                limit,
+            } = said
+            else {
+                panic!("not a Terminate: {said:?}");
+            };
+            assert_eq!(session_id, sid);
+            assert!(matches!(
+                reason,
+                roomler_ai_remote_control::models::EndReason::Error
+            ));
+            assert_eq!(limit.as_deref(), Some("no_common_codec"));
+        }
+        assert!(!pump.is_finished(), "only the teardown ends the pump");
+        pump.abort();
     }
 
     /// FR-93 P6c — a pump whose capture the person at the screen stopped ends
