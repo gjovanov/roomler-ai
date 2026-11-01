@@ -1437,3 +1437,208 @@ async fn a_device_admin_pushes_the_gpu_input_denylist_and_the_device_awaits_a_re
         "and nothing pushed touched the switch itself"
     );
 }
+
+/// A device that is ALREADY connected, for FR-132 P1b's tests: everything a
+/// save has to reach, with nothing sent to it yet. `opted_in` is the device's
+/// own gate 4, set where only someone at the machine can set it.
+struct ConnectedDevice {
+    cfg: AgentConfig,
+    path: std::path::PathBuf,
+    desired: String,
+    stop_tx: tokio::sync::watch::Sender<bool>,
+    sig_task: tokio::task::JoinHandle<()>,
+    _dir: tempfile::TempDir,
+}
+
+impl ConnectedDevice {
+    async fn on(
+        app: &TestApp,
+        seeded: &crate::fixtures::seed::SeededTenant,
+        name: &str,
+        opted_in: bool,
+    ) -> Self {
+        let mut cfg = enrol_via_agent_lib(app, seeded, &format!("mach-{name}"), name).await;
+        cfg.remote_config_enabled = opted_in;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        roomlerd::config::save(&path, &cfg).unwrap();
+        let desired = format!(
+            "/api/tenant/{}/agent/{}/desired-config",
+            seeded.tenant_id, cfg.agent_id
+        );
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let sig_task = spawn_agent_signaling_on(
+            signaling::OrgCtx::primary(roomlerd::token_slot::TokenSlot::new(
+                cfg.agent_token.clone(),
+            )),
+            cfg.clone(),
+            path.clone(),
+            stop_rx,
+        );
+        let aid = bson::oid::ObjectId::parse_str(&cfg.agent_id).unwrap();
+        for _ in 0..100 {
+            if app.state.fleet().rc_hub.is_agent_online(aid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            app.state.fleet().rc_hub.is_agent_online(aid),
+            "the device never connected"
+        );
+        Self {
+            cfg,
+            path,
+            desired,
+            stop_tx,
+            sig_task,
+            _dir: dir,
+        }
+    }
+
+    /// Save through `app` and return the row once the device has answered
+    /// about this revision. The agent stays connected throughout, so an
+    /// answer here can only have come over the standing socket.
+    async fn save(
+        &self,
+        app: &TestApp,
+        seeded: &crate::fixtures::seed::SeededTenant,
+        body: Value,
+    ) -> Value {
+        let (s, resp) = put_json(app, &self.desired, &seeded.admin.access_token, body).await;
+        assert_eq!(s, 200, "{resp}");
+        let revision = resp["revision"].as_u64().expect("a revision");
+        let mut row = Value::Null;
+        for _ in 0..50 {
+            row = agent_row(app, seeded, &self.cfg.agent_id).await;
+            if row["remote_config"]["report"]["revision"].as_u64() == Some(revision) {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!(
+            "revision {revision} never reached the connected device: a save reaches it only at \
+             its next reconnect again? Row: {row}"
+        );
+    }
+
+    async fn stop(self) {
+        let _ = self.stop_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.sig_task).await;
+    }
+}
+
+/// FR-132 P1b — a saved config reaches a device that is already connected.
+/// On 2026-10-31 a deny pushed to an online laptop sat undelivered for 71
+/// minutes, because the connect path was the only one that sent it, and a kill
+/// switch that waits for a socket to drop is not much of a switch.
+///
+/// The second save is the proof. By then the connect path has long finished,
+/// so nothing but the nudge can carry it. The device still only writes the key
+/// and asks for a restart: nothing about a save makes it restart.
+#[tokio::test]
+async fn a_saved_config_reaches_a_connected_device_without_a_reconnect() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("rcfglive").await;
+    let device = ConnectedDevice::on(&app, &seeded, "rcfglive", true).await;
+
+    let row = device
+        .save(&app, &seeded, json!({ "zero_copy_deny": "hevc_qsv:gpu" }))
+        .await;
+    let rc = &row["remote_config"];
+    assert_eq!(rc["report"]["outcome"].as_str(), Some("applied"), "{rc}");
+    assert_eq!(rc["report"]["needs_restart"], json!(["zero_copy_deny"]));
+    assert_eq!(rc["state"].as_str(), Some("needs_restart"), "{rc}");
+    assert_eq!(
+        roomlerd::config::load(&device.path)
+            .unwrap()
+            .zero_copy_deny
+            .as_deref(),
+        Some("hevc_qsv:gpu"),
+        "the device wrote it while connected"
+    );
+
+    let row = device
+        .save(&app, &seeded, json!({ "zero_copy_deny": "none" }))
+        .await;
+    let rc = &row["remote_config"];
+    assert_eq!(rc["report"]["outcome"].as_str(), Some("applied"), "{rc}");
+    assert_eq!(rc["state"].as_str(), Some("needs_restart"), "{rc}");
+    assert_eq!(
+        roomlerd::config::load(&device.path)
+            .unwrap()
+            .zero_copy_deny
+            .as_deref(),
+        Some("none"),
+        "and the save after it, on the same connection"
+    );
+
+    device.stop().await;
+}
+
+/// The PUT can land on either pod, and a tenant's sockets live on one: on a
+/// two-replica deployment this is every other save. The pod that took the PUT
+/// does not hold the socket, so the save crosses the ctrl lane, and the pod
+/// that does sends it.
+#[tokio::test]
+async fn a_saved_config_reaches_a_device_connected_to_another_pod() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.redis_pubsub.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let seeded = app1.seed_tenant("rcfgpods").await;
+    let device = ConnectedDevice::on(&app1, &seeded, "rcfgpods", true).await;
+    let aid = bson::oid::ObjectId::parse_str(&device.cfg.agent_id).unwrap();
+    assert!(
+        !app2.state.fleet().rc_hub.is_agent_online(aid),
+        "the socket is on pod 1 only"
+    );
+
+    let row = device
+        .save(&app2, &seeded, json!({ "zero_copy_deny": "hevc_qsv:gpu" }))
+        .await;
+    assert_eq!(
+        row["remote_config"]["state"].as_str(),
+        Some("needs_restart"),
+        "saved through pod 2: {row}"
+    );
+    assert_eq!(
+        roomlerd::config::load(&device.path)
+            .unwrap()
+            .zero_copy_deny
+            .as_deref(),
+        Some("hevc_qsv:gpu")
+    );
+
+    device.stop().await;
+}
+
+/// A nudge changes when a device hears, and nothing about whether it agrees:
+/// the opt-in is the device's, and a connected device that has not taken it
+/// refuses a save at once, in the words it refuses one in on connect, with
+/// nothing written.
+#[tokio::test]
+async fn a_connected_device_that_has_not_opted_in_refuses_a_save() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("rcfgliveno").await;
+    let device = ConnectedDevice::on(&app, &seeded, "rcfgliveno", false).await;
+
+    let row = device
+        .save(&app, &seeded, json!({ "zero_copy_deny": "hevc_qsv:gpu" }))
+        .await;
+    let rc = &row["remote_config"];
+    assert_eq!(
+        rc["report"]["outcome"].as_str(),
+        Some("not_opted_in"),
+        "{rc}"
+    );
+    assert_eq!(rc["state"].as_str(), Some("refused"), "{rc}");
+    assert_eq!(
+        roomlerd::config::load(&device.path).unwrap().zero_copy_deny,
+        None,
+        "gate 4 is the device's to keep: nothing was written"
+    );
+
+    device.stop().await;
+}

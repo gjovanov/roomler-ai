@@ -2559,8 +2559,8 @@ pub struct Agent {
     /// the valid one?" has to be answerable from the row as well as the audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_code_rotated_at: Option<DateTime>,
-    /// Device config an operator has ASKED for, reconciled by the agent when
-    /// it next connects (`docs/remote-config.md` step 2).
+    /// Device config an operator has ASKED for, reconciled by the agent on
+    /// connect or on a save's nudge (`docs/remote-config.md` step 2).
     ///
     /// Desired state, not applied state: writing here records an intent, and
     /// the device remains free to refuse it — a device without

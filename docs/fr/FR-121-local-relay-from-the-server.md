@@ -32,7 +32,7 @@ overlay address and loopback. It answers a probe on `127.0.0.1:47989` (`:44`), w
 viewer probes the whole range before every session (`probeLocalRelay`, `ui/src/composables/useRemoteControl.ts:7446`,
 called at `:9168`). It adds `turn:127.0.0.1:<port>` to its own ICE servers (`localRelayIceServer`, `:3810`) and
 forwards the descriptor on `rc:session.request` (`:10620`; the wire field is `signaling.rs:2049`). The Hub stores it
-on the session (`crates/modules/fleet/src/hub.rs:1803`) and hands the remote agent `turn:<overlay>:<port>` with the
+on the session (`crates/modules/fleet/src/hub.rs:1818`) and hands the remote agent `turn:<overlay>:<port>` with the
 offer (`forward_offer`, `:2133`, the relay at `:2173`), only for an overlay address (`is_overlay_relay_ip`, `:65`) and
 only when the device lets remote desktop use the overlay (#1882's `rc_overlay`).
 

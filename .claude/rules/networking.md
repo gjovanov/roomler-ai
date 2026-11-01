@@ -160,8 +160,14 @@ would hang the caller until its deadline.
 the device remotely configurable without making it server-configurable**.
 Resolution: a device-owned `remote_config_enabled`, default OFF, **structurally
 absent from `DesiredConfig`** (a test asserts it never appears in a serialised
-request). Delivery is **reconcile-on-connect only**, so an offline device converges
-by the same code path as an online one.
+request). A device **converges on connect**, so an offline device takes the same code
+path as an online one; a save also nudges a connected device with the same frame,
+best effort (FR-132 P1b).
+⚠️ **The device has no revision check**: `apply` writes whatever frame arrived last,
+in every released agent. So every `rc:agent.config` goes through
+`Hub::push_desired_config`, which never sends a connection a revision at or below one
+it already carried. Never `try_send` this frame directly: a stale connect-path read
+would put the device back on a config the operator replaced.
 ⚠️ **The device REPORTS BACK** — without it, *applied / applied-pending-restart /
 refused-not-opted-in / refused-secondary-org / never-arrived* are ONE state on
 screen, and each has a different fix. **Compare revisions, not just outcomes.**

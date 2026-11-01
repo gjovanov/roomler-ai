@@ -2,7 +2,8 @@
 // Copyright (C) 2026 G ROX EOOD
 //! `PUT /api/tenant/{tenant_id}/agent/{agent_id}/desired-config` — record the
 //! device config an operator wants, for the agent to reconcile when it next
-//! connects. Step 2 of `docs/remote-config.md`.
+//! connects, and nudge it now if it is connected. Step 2 of
+//! `docs/remote-config.md`.
 //!
 //! This route writes an INTENT, never a fact. The device is free to ignore it
 //! (and does, unless it has opted in via `remote_config_enabled`), so nothing
@@ -185,6 +186,59 @@ fn pushed_tribool(key: &str, v: &str) -> Result<String, ApiError> {
         .map_err(|e| ApiError::BadRequest(format!("{key}: {e}")))
 }
 
+/// FR-132 P1b — tell a connected device about a save now, with the frame the
+/// connect path sends, so a kill switch does not wait for the socket to drop.
+///
+/// Called after the document is stored, which is what makes a miss harmless: a
+/// device that connects at any point after that reads this revision. Best
+/// effort for the same reason. Reconcile-on-connect is still what a device
+/// converges by, so a lost nudge costs only the wait for it, and nothing here
+/// changes what the device will accept: gate 4 is its own to keep, and the
+/// report still comes back over its socket.
+///
+/// Local first; the ctrl lane covers a device homed on another pod, as for a
+/// cross-org join. Only "not on this pod" goes that way: a connection that
+/// does not read the frame says so here as it does on every connect.
+async fn nudge_connected_device(
+    state: &FleetState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    desired: &DesiredConfig,
+) {
+    // The connect path's rule: a cleared form is nothing to reconcile.
+    if desired.is_empty() {
+        return;
+    }
+    match state
+        .rc_hub
+        .push_desired_config(agent_id, tenant_id, desired.clone())
+    {
+        Err(roomler_ai_remote_control::error::Error::AgentOffline(_)) => {
+            let desired = match serde_json::to_value(desired) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(%e, "desired config did not serialise for the ctrl lane");
+                    return;
+                }
+            };
+            crate::ctrl::publish_rc_ctrl(
+                state,
+                "config_push",
+                serde_json::json!({
+                    "agent_id": agent_id.to_hex(),
+                    "tenant_id": tenant_id.to_hex(),
+                    "desired": desired,
+                }),
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::info!(agent = %agent_id, %e, "desired config not pushed on save");
+        }
+        Ok(()) => {}
+    }
+}
+
 pub async fn set_desired_config(
     State(state): State<FleetState>,
     auth: AuthUser,
@@ -275,6 +329,7 @@ pub async fn set_desired_config(
         .base
         .update_by_id(aid, doc! { "$set": { "desired_config": bson } })
         .await?;
+    nudge_connected_device(&state, tid, aid, &requested).await;
 
     Ok(Json(DesiredConfigResponse {
         revision: requested.revision,

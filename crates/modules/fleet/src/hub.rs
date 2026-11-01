@@ -29,8 +29,8 @@ use roomler_ai_remote_control::consent::{
 };
 use roomler_ai_remote_control::error::{Error, Result};
 use roomler_ai_remote_control::models::{
-    AgentCaps, AuditKind, ConsentMode, EndReason, ExecOutcome, FeaturePolicy, LockOnEnd, OsKind,
-    RcOverlayMode, RecordCap, RpcCap, SessionPhase, SessionPolicy,
+    AgentCaps, AuditKind, ConsentMode, DesiredConfig, EndReason, ExecOutcome, FeaturePolicy,
+    LockOnEnd, OsKind, RcOverlayMode, RecordCap, RpcCap, SessionPhase, SessionPolicy,
 };
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::session::{ClientTx, LiveSession};
@@ -271,6 +271,15 @@ pub struct ConnectedAgent {
     /// parses `rc:agent.keep_busy_policy`. Per CONNECTION; a pre-FR-92 agent
     /// would log every policy frame as an unknown `rc:*` at WARN.
     pub supports_keep_busy: bool,
+    /// FR-132 P1b — the agent advertises `config` in `AgentCaps.rpc`: it
+    /// parses `rc:agent.config`. Per CONNECTION; a frame sent to a build
+    /// before that vanishes at its parser, and the dashboard would show a
+    /// change that never landed.
+    pub supports_config: bool,
+    /// FR-132 P1b — the newest desired-config revision sent on THIS
+    /// connection, and the reason a stale one is never sent after it
+    /// ([`Hub::push_desired_config`]).
+    pub config_revision_sent: Option<u64>,
     /// FR-90 — the agent advertises `hive`: it answers `rc:hive.start` with
     /// `rc:hive.start_ack` and reports sessions with `rc:hive.state`. Per
     /// CONNECTION, for [`Self::supports_ssh_grant_ack`]'s reason — a stored
@@ -975,6 +984,12 @@ impl Hub {
             // FR-92 — set by `set_agent_keep_busy_support`; `false` = no
             // policy frame is ever pushed to this connection.
             supports_keep_busy: false,
+            // FR-132 P1b — set by `set_agent_config_support`; `false` = no
+            // desired config is ever pushed to this connection.
+            supports_config: false,
+            // FR-132 P1b — nothing sent yet, so a new connection takes
+            // whichever revision the connect path reads.
+            config_revision_sent: None,
             // FR-90 — set by `set_agent_hive_support`; `false` = no session
             // frame is ever pushed to this connection.
             supports_hive: false,
@@ -2828,6 +2843,74 @@ impl Hub {
                     .is_ok()
             })
             .count()
+    }
+
+    /// FR-132 P1b — record whether this connection parses `rc:agent.config`
+    /// (`config` in its hello's `AgentCaps.rpc`, equality-matched). Set right
+    /// after registration and BEFORE the connect path reads the row: a save
+    /// that finds `false` here stored its revision before that read, so the
+    /// connect path carries it.
+    pub fn set_agent_config_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_config = supports;
+        }
+    }
+
+    /// FR-132 P1b — send a desired config down an agent's socket. The one way
+    /// `rc:agent.config` leaves the server: the connect path's reconcile and a
+    /// save's nudge both come through here.
+    ///
+    /// ⚠️ The revision check is load-bearing, and it lives HERE because the
+    /// device has none: `apply` writes whatever frame arrived last, and every
+    /// released agent behaves that way. Two frames can race on one connection.
+    /// The connect path reads the row, a save stores a newer revision and
+    /// pushes it, and the older read goes out second; and two pods can deliver
+    /// a pair of saves out of order. So a connection never carries a revision
+    /// at or below one it already carried: a lower one would put the device
+    /// back on a config the operator replaced, and an equal one would draw a
+    /// `noop` over the `needs_restart` the first frame earned.
+    ///
+    /// The check and the send are one step under the entry's lock, which is
+    /// why this calls `try_send` itself: [`Self::send_to_agent`] would take the
+    /// same shard's lock again. `try_send` never waits.
+    ///
+    /// A skipped frame is `Ok`, since the connection already holds a document
+    /// at least this new. Offline or another tenant's is
+    /// [`Error::AgentOffline`]; a connection without `config` is
+    /// [`Error::ExecUnsupported`] and receives nothing.
+    pub fn push_desired_config(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        desired: DesiredConfig,
+    ) -> Result<()> {
+        let mut entry = self
+            .inner
+            .agents
+            .get_mut(&agent_id)
+            .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+        if entry.tenant_id != tenant_id {
+            return Err(Error::AgentOffline(agent_id.to_hex()));
+        }
+        if !entry.supports_config {
+            return Err(Error::ExecUnsupported(agent_id.to_hex()));
+        }
+        let revision = desired.revision;
+        if entry
+            .config_revision_sent
+            .is_some_and(|sent| sent >= revision)
+        {
+            return Ok(());
+        }
+        entry
+            .tx
+            .try_send(ServerMsg::ConfigPush { revision, desired })
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => Error::SendFailed,
+                mpsc::error::TrySendError::Closed(_) => Error::AgentOffline(agent_id.to_hex()),
+            })?;
+        entry.config_revision_sent = Some(revision);
+        Ok(())
     }
 
     /// FR-90 — record whether this connection runs Hive sessions (`hive`),
@@ -8595,6 +8678,196 @@ mod tests {
             true,
         );
         assert_eq!(hub.agent_supports_hive_purge_on(agent_id, &tx), None);
+    }
+
+    /// FR-132 P1b — the document a test pushes: a managed key at `revision`,
+    /// provenance included, because the ctrl lane carries it as JSON.
+    fn desired_at(revision: u64, deny: &str) -> DesiredConfig {
+        DesiredConfig {
+            zero_copy_deny: Some(deny.to_string()),
+            revision,
+            updated_by: Some(ObjectId::new()),
+            updated_at: Some(bson::DateTime::now()),
+            ..DesiredConfig::default()
+        }
+    }
+
+    /// What the connection received, in order: (revision, deny).
+    fn config_frames(rx: &mut mpsc::Receiver<ServerMsg>) -> Vec<(u64, Option<String>)> {
+        let mut frames = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let ServerMsg::ConfigPush { revision, desired } = msg {
+                frames.push((revision, desired.zero_copy_deny));
+            }
+        }
+        frames
+    }
+
+    /// FR-132 P1b — the device has no revision check of its own: `apply` writes
+    /// whatever arrived last. So the connection carries each revision once, and
+    /// never one below a revision it already carried.
+    ///
+    /// The order below is the race itself. A device connects and the connect
+    /// path reads revision 1; a save stores revision 2 and pushes it; then the
+    /// connect path sends what it read. The device must stay on 2, and it must
+    /// hear 2 only once: a second frame would answer `noop` and overwrite the
+    /// `needs_restart` the first one earned.
+    #[tokio::test]
+    async fn a_connection_never_goes_back_to_an_older_desired_config() {
+        let hub = test_hub().await;
+        let tenant = ObjectId::new();
+        let agent_id = ObjectId::new();
+        let (_tx, _cancel, mut rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        hub.set_agent_config_support(agent_id, true);
+
+        hub.push_desired_config(agent_id, tenant, desired_at(2, "new"))
+            .expect("the save's push");
+        hub.push_desired_config(agent_id, tenant, desired_at(1, "old"))
+            .expect("skipped, not an error: the connection holds something newer");
+        hub.push_desired_config(agent_id, tenant, desired_at(2, "new"))
+            .expect("the same revision again, skipped");
+        assert_eq!(
+            config_frames(&mut rx),
+            vec![(2, Some("new".to_string()))],
+            "one frame, the newest"
+        );
+
+        hub.push_desired_config(agent_id, tenant, desired_at(3, "newer"))
+            .expect("a newer save still goes out");
+        assert_eq!(config_frames(&mut rx), vec![(3, Some("newer".to_string()))]);
+    }
+
+    /// A reconnect is a new connection, and reconcile-on-connect re-delivers
+    /// the standing document on every one: the record of what was sent cannot
+    /// outlive the socket it describes.
+    #[tokio::test]
+    async fn a_new_connection_takes_the_standing_desired_config_again() {
+        let hub = test_hub().await;
+        let tenant = ObjectId::new();
+        let agent_id = ObjectId::new();
+        let register = || {
+            hub.register_agent(
+                agent_id,
+                tenant,
+                ObjectId::new(),
+                OsKind::Linux,
+                3,
+                false,
+                true,
+            )
+        };
+        let (_tx, _cancel, mut rx) = register();
+        hub.set_agent_config_support(agent_id, true);
+        hub.push_desired_config(agent_id, tenant, desired_at(2, "deny"))
+            .expect("first connection");
+        assert_eq!(config_frames(&mut rx).len(), 1);
+
+        let (_tx2, _cancel2, mut rx2) = register();
+        hub.set_agent_config_support(agent_id, true);
+        hub.push_desired_config(agent_id, tenant, desired_at(2, "deny"))
+            .expect("second connection");
+        assert_eq!(config_frames(&mut rx2).len(), 1, "delivered again");
+    }
+
+    /// A device on another tenant, one that is offline here and one that
+    /// never said it reads the frame all receive nothing, and the two kinds
+    /// of "no" stay apart: the save goes on to the ctrl lane only for the
+    /// first, because another pod may hold that socket.
+    #[tokio::test]
+    async fn a_desired_config_goes_only_to_its_tenants_connection_that_reads_it() {
+        let hub = test_hub().await;
+        let tenant = ObjectId::new();
+        let agent_id = ObjectId::new();
+        let (_tx, _cancel, mut rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+
+        let err = hub
+            .push_desired_config(agent_id, tenant, desired_at(1, "deny"))
+            .expect_err("no `config` advertised");
+        assert!(matches!(err, Error::ExecUnsupported(_)), "got {err:?}");
+
+        hub.set_agent_config_support(agent_id, true);
+        let err = hub
+            .push_desired_config(agent_id, ObjectId::new(), desired_at(1, "deny"))
+            .expect_err("another tenant's");
+        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
+        let err = hub
+            .push_desired_config(ObjectId::new(), tenant, desired_at(1, "deny"))
+            .expect_err("not on this pod");
+        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
+        assert!(config_frames(&mut rx).is_empty(), "nothing was sent");
+
+        // The refusals recorded nothing: the real frame still goes out.
+        hub.push_desired_config(agent_id, tenant, desired_at(1, "deny"))
+            .expect("the device's own tenant");
+        assert_eq!(config_frames(&mut rx).len(), 1);
+    }
+
+    /// FR-132 P1b — fleet's `config_push` control event, as every pod applies
+    /// it: the PUT can land on a pod that does not hold the socket. The
+    /// document survives the JSON round trip, another tenant's envelope pushes
+    /// nothing, and a late envelope cannot undo a newer revision.
+    #[tokio::test]
+    async fn a_desired_config_from_another_pod_reaches_its_tenants_connection() {
+        let hub = test_hub().await;
+        let tenant = ObjectId::new();
+        let agent_id = ObjectId::new();
+        let (_tx, _cancel, mut rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        hub.set_agent_config_support(agent_id, true);
+        let envelope = |tid: ObjectId, desired: &DesiredConfig| {
+            serde_json::json!({
+                "class": "rc",
+                "evt": "config_push",
+                "agent_id": agent_id.to_hex(),
+                "tenant_id": tid.to_hex(),
+                "desired": desired,
+            })
+        };
+
+        crate::ctrl::apply_rc_ctrl(&hub, &envelope(ObjectId::new(), &desired_at(1, "deny")));
+        assert!(
+            config_frames(&mut rx).is_empty(),
+            "another tenant's envelope pushes nothing"
+        );
+
+        let sent = desired_at(2, "deny");
+        crate::ctrl::apply_rc_ctrl(&hub, &envelope(tenant, &sent));
+        match rx.try_recv() {
+            Ok(ServerMsg::ConfigPush { revision, desired }) => {
+                assert_eq!(revision, 2);
+                assert_eq!(desired, sent, "unchanged by the trip through JSON");
+            }
+            other => panic!("expected the frame, got {other:?}"),
+        }
+
+        crate::ctrl::apply_rc_ctrl(&hub, &envelope(tenant, &desired_at(1, "old")));
+        assert!(
+            config_frames(&mut rx).is_empty(),
+            "a late envelope cannot undo a newer revision"
+        );
     }
 
     /// FR-90 P2g-3b — fleet's `hive_purge` control event, as every pod
