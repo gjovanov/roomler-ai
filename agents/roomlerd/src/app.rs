@@ -4539,7 +4539,9 @@ async fn run_cmd(
         cfg_write_lock.clone(),
         cfg.exec_enabled,
         cfg.remote_config_enabled,
-    );
+    )
+    // FR-132 P1c — what this process runs, for the `needs_restart` it reports.
+    .running_on(&cfg);
     // FR-100 P1c — and every other live key it holds (`peer_auth`), from the
     // same config: a fresh `new` judges offers under `audit` until told.
     remote_cfg.adopt_local(&cfg);

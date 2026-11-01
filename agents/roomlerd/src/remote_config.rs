@@ -41,7 +41,8 @@ use roomler_ai_remote_control::models::DesiredConfig;
 pub struct Applied {
     /// Keys that changed and are ALREADY in force.
     pub live: Vec<&'static str>,
-    /// Keys that changed on disk but need a daemon restart to take effect.
+    /// Keys on disk that need a daemon restart to take effect: changed now, or
+    /// changed earlier and still not what this process runs.
     pub needs_restart: Vec<&'static str>,
 }
 
@@ -51,10 +52,99 @@ impl Applied {
     }
 }
 
+/// FR-132 P1c — the keys the daemon reads once per process, as THIS process
+/// read them. It is what separates "written" from "in force": a key the file
+/// holds and this process does not is waiting on a restart, however many
+/// reconnects have since found the file already matching.
+#[derive(Debug, PartialEq, Eq)]
+struct RunningKeys {
+    ssh_enabled: bool,
+    ssh_authorized_keys: Vec<String>,
+    ssh_account_mode: Option<String>,
+    ssh_port: Option<u16>,
+    encoder_cells_deny: Option<String>,
+    fps_deny: Option<String>,
+    color_description: Option<bool>,
+    zero_copy_deny: Option<String>,
+}
+
+impl RunningKeys {
+    fn of(cfg: &crate::config::AgentConfig) -> Self {
+        Self {
+            ssh_enabled: cfg.ssh_enabled,
+            ssh_authorized_keys: cfg.ssh_authorized_keys.clone(),
+            ssh_account_mode: cfg.ssh_account_mode.clone(),
+            ssh_port: cfg.ssh_port,
+            encoder_cells_deny: cfg.encoder_cells_deny.clone(),
+            fps_deny: cfg.fps_deny.clone(),
+            color_description: cfg.color_description,
+            zero_copy_deny: cfg.zero_copy_deny.clone(),
+        }
+    }
+
+    /// The keys `desired` manages whose value in `cfg`, the file, this process
+    /// is not running. A key nobody pushed is left out: a local edit waiting
+    /// on a restart is the owner's, and this report is about the push.
+    fn waiting_on_restart(
+        &self,
+        desired: &DesiredConfig,
+        cfg: &crate::config::AgentConfig,
+    ) -> Vec<&'static str> {
+        [
+            (
+                "ssh_enabled",
+                desired.ssh_enabled.is_some(),
+                cfg.ssh_enabled != self.ssh_enabled,
+            ),
+            (
+                "ssh_authorized_keys",
+                desired.ssh_authorized_keys.is_some(),
+                cfg.ssh_authorized_keys != self.ssh_authorized_keys,
+            ),
+            (
+                "ssh_account_mode",
+                desired.ssh_account_mode.is_some(),
+                cfg.ssh_account_mode != self.ssh_account_mode,
+            ),
+            (
+                "ssh_port",
+                desired.ssh_port.is_some(),
+                cfg.ssh_port != self.ssh_port,
+            ),
+            (
+                "encoder_cells_deny",
+                desired.encoder_cells_deny.is_some(),
+                cfg.encoder_cells_deny != self.encoder_cells_deny,
+            ),
+            (
+                "fps_deny",
+                desired.fps_deny.is_some(),
+                cfg.fps_deny != self.fps_deny,
+            ),
+            (
+                "color_description",
+                desired.color_description.is_some(),
+                cfg.color_description != self.color_description,
+            ),
+            (
+                "zero_copy_deny",
+                desired.zero_copy_deny.is_some(),
+                cfg.zero_copy_deny != self.zero_copy_deny,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, managed, differs)| *managed && *differs)
+        .map(|(key, _, _)| key)
+        .collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct RemoteConfigServices {
     path: PathBuf,
     lock: crate::config::WriteLock,
+    /// FR-132 P1c — what this process started on ([`Self::running_on`]).
+    running: Option<Arc<RunningKeys>>,
     /// The LIVE `exec_enabled`, read by the `rc:rpc.exec` gate. Seeded from
     /// the startup config and the only copy that decides anything.
     exec_enabled: Arc<AtomicBool>,
@@ -117,6 +207,7 @@ impl RemoteConfigServices {
         Self {
             path,
             lock,
+            running: None,
             exec_enabled: Arc::new(AtomicBool::new(exec_enabled)),
             remote_config_enabled: Arc::new(AtomicBool::new(remote_config_enabled)),
             #[cfg(feature = "external-access")]
@@ -126,6 +217,16 @@ impl RemoteConfigServices {
                 crate::peer_auth::PeerAuthPolicy::Audit,
             ))),
         }
+    }
+
+    /// FR-132 P1c — record what this process started on, from the config it
+    /// loaded. Called once, where the daemon starts, and deliberately not by
+    /// [`Self::adopt_local`]: a local save writes a value this process still
+    /// does not run. Without it there is no process to speak for, and
+    /// `needs_restart` says only that the file changed.
+    pub fn running_on(mut self, cfg: &crate::config::AgentConfig) -> Self {
+        self.running = Some(Arc::new(RunningKeys::of(cfg)));
+        self
     }
 
     /// FR-100 P1c — the device's `peer_auth` policy at this moment.
@@ -255,11 +356,15 @@ impl RemoteConfigServices {
     /// live keys into force.
     ///
     /// Idempotent by construction: a desired state that already matches writes
-    /// NOTHING and returns an empty [`Applied`]. That matters more than it
-    /// looks — delivery is reconcile-on-connect, so this runs on every single
-    /// reconnect, and a version that wrote unconditionally would rewrite
-    /// config.toml (and later, restart the daemon) every time a flaky link
-    /// bounced.
+    /// NOTHING. That matters more than it looks — delivery is
+    /// reconcile-on-connect, so this runs on every single reconnect, and a
+    /// version that wrote unconditionally would rewrite config.toml (and later,
+    /// restart the daemon) every time a flaky link bounced.
+    ///
+    /// A matching FILE is not yet a matching daemon, though: until this process
+    /// runs a key, the key stays in `needs_restart`, so a reconnect cannot turn
+    /// a device waiting on a restart into one that reports itself converged
+    /// (FR-132 P1c). The returned [`Applied`] is empty only when both match.
     ///
     /// Reloads from DISK rather than mutating the startup snapshot: another
     /// writer (the CLI, the desktop companion) may have changed the file since
@@ -269,6 +374,7 @@ impl RemoteConfigServices {
         let path = self.path.clone();
         let desired = desired.clone();
         let exec_flag = self.exec_enabled.clone();
+        let running = self.running.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut cfg =
@@ -368,15 +474,25 @@ impl RemoteConfigServices {
                 }
             }
 
-            if applied.is_noop() {
-                return Ok(applied);
+            if !applied.is_noop() {
+                crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
+                // AFTER the durable write, never before: a live flag that is on
+                // while the file says off would survive a crash as a device
+                // running exec that its own config denies.
+                if applied.live.contains(&"exec_enabled") {
+                    exec_flag.store(cfg.exec_enabled, Ordering::Relaxed);
+                }
             }
-            crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
-            // AFTER the durable write, never before: a live flag that is on
-            // while the file says off would survive a crash as a device
-            // running exec that its own config denies.
-            if applied.live.contains(&"exec_enabled") {
-                exec_flag.store(cfg.exec_enabled, Ordering::Relaxed);
+            // FR-132 P1c — the lists above say what changed in the FILE. On a
+            // later frame nothing does, and the report used to go out as
+            // `noop`, which reads `applied` while the daemon still runs the
+            // old value. A pod roll did that to every such device at once.
+            if let Some(running) = running.as_deref() {
+                for key in running.waiting_on_restart(&desired, &cfg) {
+                    if !applied.needs_restart.contains(&key) {
+                        applied.needs_restart.push(key);
+                    }
+                }
             }
             Ok(applied)
         })
@@ -774,6 +890,119 @@ mod tests {
         assert_eq!(applied.needs_restart, vec!["zero_copy_deny"]);
         assert_eq!(on_disk(), None);
         assert!(svc.apply(&push("")).await.unwrap().is_noop());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-132 P1c — `needs_restart` says the daemon is not on the value, and a
+    /// reconnect does not change that. The document is re-delivered on every
+    /// connect, the file already matches, and this used to read as nothing to
+    /// do: the row went from `needs_restart` to `applied` while the daemon
+    /// still ran the old value. For a kill switch that is the wrong way to be
+    /// wrong, and a pod roll did it to every such device at once.
+    #[tokio::test]
+    async fn a_pushed_key_waits_for_a_restart_across_reconnects() {
+        let dir = std::env::temp_dir().join(format!("fr132-p1c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let started = crate::config::test_fixture();
+        crate::config::save(&path, &started).unwrap();
+        let process = |cfg: &crate::config::AgentConfig| {
+            RemoteConfigServices::new(
+                path.clone(),
+                Arc::new(tokio::sync::Mutex::new(())),
+                false,
+                true,
+            )
+            .running_on(cfg)
+        };
+        let svc = process(&started);
+        let deny = DesiredConfig {
+            zero_copy_deny: Some("hevc_qsv:gpu".to_string()),
+            ..Default::default()
+        };
+
+        let delivered = svc.apply(&deny).await.unwrap();
+        assert_eq!(delivered.needs_restart, vec!["zero_copy_deny"]);
+        let written = std::fs::read(&path).unwrap();
+
+        // A reconnect: the same document to the same process.
+        let reconnect = svc.apply(&deny).await.unwrap();
+        assert_eq!(
+            reconnect.needs_restart,
+            vec!["zero_copy_deny"],
+            "the file matches, the daemon does not"
+        );
+        assert!(reconnect.live.is_empty());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            written,
+            "and a reconnect still writes nothing"
+        );
+
+        // A key the document stopped managing is not this report's to raise.
+        assert!(
+            svc.apply(&DesiredConfig::default())
+                .await
+                .unwrap()
+                .is_noop()
+        );
+
+        // The restart: a process that loaded the file.
+        let restarted = process(&crate::config::load(&path).unwrap());
+        assert!(
+            restarted.apply(&deny).await.unwrap().is_noop(),
+            "in force now, so nothing is waiting"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every key `apply` calls `needs_restart` is one this process tracks, in
+    /// the order `apply` lists them, so the first report and a reconnect's
+    /// read the same. `exec_enabled` is live: once in force it is not waiting.
+    #[tokio::test]
+    async fn every_read_once_key_waits_and_a_live_key_does_not() {
+        let dir = std::env::temp_dir().join(format!("fr132-p1c-all-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let started = crate::config::test_fixture();
+        crate::config::save(&path, &started).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            started.exec_enabled,
+            true,
+        )
+        .running_on(&started);
+        let desired = DesiredConfig {
+            exec_enabled: Some(!started.exec_enabled),
+            ssh_enabled: Some(!started.ssh_enabled),
+            ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA test".to_string()]),
+            ssh_account_mode: Some("console_user".to_string()),
+            ssh_port: Some(2222),
+            encoder_cells_deny: Some("hevc_qsv:yuv444".to_string()),
+            fps_deny: Some("hevc_qsv:120".to_string()),
+            color_description: Some("off".to_string()),
+            zero_copy_deny: Some("hevc_qsv:gpu".to_string()),
+            ..Default::default()
+        };
+        let every_key = vec![
+            "ssh_enabled",
+            "ssh_authorized_keys",
+            "ssh_account_mode",
+            "ssh_port",
+            "encoder_cells_deny",
+            "fps_deny",
+            "color_description",
+            "zero_copy_deny",
+        ];
+
+        let first = svc.apply(&desired).await.unwrap();
+        assert_eq!(first.needs_restart, every_key);
+        assert_eq!(first.live, vec!["exec_enabled"]);
+
+        let reconnect = svc.apply(&desired).await.unwrap();
+        assert_eq!(reconnect.needs_restart, every_key);
+        assert!(reconnect.live.is_empty(), "exec is in force, not waiting");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
