@@ -1432,4 +1432,175 @@ mod tests {
         // enumeration. Lock against panic, not a specific outcome.
         let _ = DxgiDirectBackend::primary();
     }
+
+    /// One arm of [`a_waiting_acquire_and_a_readback_share_one_device`]: what a
+    /// reader on another thread saw while `hold` ran over and over on its own.
+    struct Arm {
+        /// `ID3D11Multithread::Enter` + `Leave`, microseconds, sorted.
+        lock_us: Vec<u64>,
+        /// A whole `GpuFrame::cpu()`: the copy, the `Map` and the row copy.
+        readback_us: Vec<u64>,
+        /// Samples that began and ended inside one and the same `hold`: if the
+        /// holder has the lock, this is zero, whatever the screen does.
+        inside_one_hold: u32,
+        holds: u32,
+    }
+
+    impl Arm {
+        fn print(&self, name: &str) {
+            let pct = |v: &[u64], p: usize| v[(v.len() - 1) * p / 100];
+            println!(
+                "#3272 {name}: samples={} inside_one_hold={} holds={} lock_us p50={} p99={} max={} readback_us p50={} p99={} max={}",
+                self.lock_us.len(),
+                self.inside_one_hold,
+                self.holds,
+                pct(&self.lock_us, 50),
+                pct(&self.lock_us, 99),
+                pct(&self.lock_us, 100),
+                pct(&self.readback_us, 50),
+                pct(&self.readback_us, 99),
+                pct(&self.readback_us, 100),
+            );
+        }
+    }
+
+    /// #3272 AC1 — does a thread waiting in `AcquireNextFrame` hold the device's
+    /// multithread lock? A zero-copy frame is read back on another thread of
+    /// this device (`gpu_frame::TexturePool::new`), so if the wait holds it,
+    /// every readback stalls for as long as the screen is still, and on such a
+    /// host the capture thread cannot wait at all.
+    ///
+    /// Three arms on one device, read by the same sampler: nothing else on the
+    /// device; a control that holds the lock itself for 300 ms, which the
+    /// sampler has to see, or it could not see the third; and a thread in
+    /// `AcquireNextFrame(1000)`. Prints, decides nothing: a person reads it.
+    ///
+    /// `cargo test -p roomlerd --lib --features mf-encoder,scrap-capture,system-context -- --ignored a_waiting_acquire --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "needs a real desktop, and a person reads the result"]
+    fn a_waiting_acquire_and_a_readback_share_one_device() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D11::ID3D11Multithread;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SetErrorMode,
+        };
+
+        // SAFETY: this process's own error mode. A fault in a driver under this
+        // test must end the test, not put a dialog on someone's desktop.
+        unsafe { SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX) };
+
+        let backend = DxgiDirectBackend::primary()
+            .unwrap_or_else(|e| panic!("no duplication on this desktop: {e:?}"));
+        let device = backend.device.clone();
+        let (w, h) = backend.dimensions();
+        // The pool turns the protection on, as it does in a session.
+        let pool = TexturePool::new(&device).expect("a multithread-protected device");
+        // SAFETY: plain COM calls on a live device.
+        let multithread: ID3D11Multithread = unsafe {
+            device
+                .GetImmediateContext()
+                .unwrap()
+                .cast::<ID3D11Multithread>()
+                .unwrap()
+        };
+
+        let inside = AtomicBool::new(false);
+        let seq = AtomicU32::new(0);
+        let stop = AtomicBool::new(false);
+
+        let sample = |for_how_long: Duration, hold: Option<&(dyn Fn() + Sync)>| -> Arm {
+            stop.store(false, Ordering::SeqCst);
+            inside.store(false, Ordering::SeqCst);
+            let holds_at_start = seq.load(Ordering::SeqCst);
+            std::thread::scope(|s| {
+                if let Some(hold) = hold {
+                    s.spawn(|| {
+                        while !stop.load(Ordering::SeqCst) {
+                            seq.fetch_add(1, Ordering::SeqCst);
+                            inside.store(true, Ordering::SeqCst);
+                            hold();
+                            inside.store(false, Ordering::SeqCst);
+                        }
+                    });
+                }
+                let (mut lock_us, mut readback_us) = (Vec::new(), Vec::new());
+                let mut inside_one_hold = 0;
+                let started = Instant::now();
+                while started.elapsed() < for_how_long {
+                    let before = (seq.load(Ordering::SeqCst), inside.load(Ordering::SeqCst));
+                    let t = Instant::now();
+                    // SAFETY: Enter and Leave pair on a live device's context.
+                    unsafe {
+                        multithread.Enter();
+                        multithread.Leave();
+                    }
+                    lock_us.push(t.elapsed().as_micros() as u64);
+                    let t = Instant::now();
+                    let frame = pool.frame(pool.take(w, h).unwrap(), w, h);
+                    std::hint::black_box(frame.cpu().len());
+                    readback_us.push(t.elapsed().as_micros() as u64);
+                    let after = (seq.load(Ordering::SeqCst), inside.load(Ordering::SeqCst));
+                    if before.1 && after.1 && before.0 == after.0 {
+                        inside_one_hold += 1;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                stop.store(true, Ordering::SeqCst);
+                lock_us.sort_unstable();
+                readback_us.sort_unstable();
+                Arm {
+                    lock_us,
+                    readback_us,
+                    inside_one_hold,
+                    holds: seq.load(Ordering::SeqCst) - holds_at_start,
+                }
+            })
+        };
+
+        sample(Duration::from_secs(3), None).print("alone");
+
+        let hold_the_lock = || {
+            // SAFETY: as above; the sleep is the point.
+            unsafe {
+                multithread.Enter();
+                std::thread::sleep(Duration::from_millis(300));
+                multithread.Leave();
+            }
+        };
+        sample(Duration::from_secs(5), Some(&hold_the_lock)).print("control, the lock held 300 ms");
+
+        let (frames, timeouts, others) = (AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0));
+        let duplication = backend.duplication.clone();
+        let acquire = || {
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource: Option<IDXGIResource> = None;
+            // SAFETY: valid out-params on a live duplication, which only this
+            // thread acquires from; a frame it got goes straight back.
+            match unsafe { duplication.AcquireNextFrame(1000, &mut info, &mut resource) } {
+                Ok(()) => {
+                    frames.fetch_add(1, Ordering::SeqCst);
+                    drop(resource);
+                    // SAFETY: pairs with the acquire that just succeeded.
+                    let _ = unsafe { duplication.ReleaseFrame() };
+                }
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                    timeouts.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    others.fetch_add(1, Ordering::SeqCst);
+                    println!("#3272 acquire: {e}");
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        };
+        sample(Duration::from_secs(15), Some(&acquire)).print("in AcquireNextFrame(1000)");
+        println!(
+            "#3272 the acquires: frames={} timeouts={} other={} adapter dims {w}x{h} kind={}",
+            frames.load(Ordering::SeqCst),
+            timeouts.load(Ordering::SeqCst),
+            others.load(Ordering::SeqCst),
+            backend.kind(),
+        );
+    }
 }
