@@ -1040,7 +1040,7 @@ flowchart TB
 | A session on `<name>-daemon` | no pixels: the agent logs `no_display` | delegated to the worker: pixels and input |
 | What `<name>-daemon` reports | `no-gui-session` | the worker's permissions, on the next heartbeat; `no-gui-session` again within a heartbeat of the worker leaving |
 | A package update | keeps the LaunchAgent | removes it and keeps the worker (`postinstall`) |
-| The GUI half killed | launchd restarts it | the supervisor respawns it; the control WS stays up |
+| The GUI half killed | launchd restarts it | the supervisor respawns it within about 6 s; the control WS stays up |
 | Nobody logged in | `<name>` offline, `<name>-daemon` online on the mesh | the same |
 
 ⚠️ **On a supervised Mac, don't delete the `<name>` row as a duplicate.** The worker
