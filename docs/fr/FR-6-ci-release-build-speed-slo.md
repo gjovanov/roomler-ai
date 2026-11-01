@@ -5,9 +5,9 @@ documented in [`docs/build-caches.md`](../build-caches.md). It first closed that
 reopened in the afternoon for wave 33: from #3125 on, `ci.yml`'s Windows clippy lane built cold on
 every run, because its cache was over its cap. The Actions cache had also started refusing
 downloads (Open decisions). Wave 34 moved the Linux lanes off it, wave 35 skips the heavy lanes on
-docs-only PRs, and wave 36 lets a cold unit or lint run finish its publish. Waves 33–35 and 37 are
-field-verified in the log; wave 36 shows only on the next cold unit or lint run. What is left is
-runner queueing. First shipped and field-verified 2026-08-26
+docs-only PRs, and wave 36 lets a cold unit or lint run finish its publish. Waves 33–37 are
+field-verified in the log, and wave 38 stops the macOS overlay cache growing with each version.
+What is left is runner queueing. First shipped and field-verified 2026-08-26
 (retroactive FR per the CLAUDE.md standing rule — the program ran 2026-07-13 → 2026-08-26 across
 ~20 PRs). Tracking issue: `FR-6` (#773) in gjovanov/roomler-ai/issues.
 
@@ -138,6 +138,7 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 35 | 10-30 | **A docs-only PR skips the heavy jobs.** 22 of the last 60 CI runs on 2026-10-30 were docs by title, and each took all 20 jobs, ~10 GB of cache downloads and up to 44 min. A new `changes` job reads the PR's file list (`pulls/N/files`, old paths of renames included). When every path is under `docs/`, a top-level `*.md` or `.claude/`, the twelve heavy jobs skip: the five Rust lanes, the macOS overlay check, the three Windows jobs, both FFmpeg jobs and the profiles build. No Rust build, test or link reads those paths. Every job that does read them still runs: frontend builds the docs site and tests the UI that uses `docs/assets`, machine-names and commit-identity run `.claude`'s self-tests, and the docs audits read `docs/`. It fails safe every way. A push to master skips the gate, so every heavy job runs, and a superseded run can never leave a code commit unverified. A file list that does not load, or one at the API's 3,000-file limit, runs everything. "Rust checks" passes a docs PR whose lanes all skipped, and fails when the gate did not succeed. A local harness passed 18 of 18 cases: nine classifications against a fake `gh`, and nine aggregate outcomes over push, code-PR and docs-PR inputs | #3170 |
 | 36 | 10-30 | **A cold unit or lint run fits its job's ceiling, publish included.** Wave 34's first master run to start (41107105820) found no `ci-unit` cache and built the lane cold: 1,795 crates, the tests, a prune from 14,068 to 10,373 MB, then a 2,587,763,998-byte archive published in two parts. The 30-minute ceiling cut the job off at 30 min 15 s with part 2 still uploading, and "Rust checks" failed on master. The part landed two seconds after the runner began its cleanup, so the next run restored the cache whole. Had it not landed, every later run would have built cold and been cut off the same way. The lint lane's cold run in that master run took 27 min 19 s, 91 % of its ceiling. `rust-unit` now allows 45 minutes and `rust-lint` 40 (`ci.yml:474`, `:159`), about 1.5 times each lane's measured cold run. Warm runs take 8–11 min, so only a cold or hung run comes near either | #3170 |
 | 37 | 10-30 | **The macOS overlay check's cold run fits its ceiling too.** Wave 36's audit of every `ci.yml` lane's ceiling against its slowest measured cold run found one more lane well under 1.5×. On 2026-10-30, master run 41069134834 republished the macOS cache at 6,159 MB, over its 6,000 MB cap (before wave 33's warning existed). The next master run (41072792020) dropped it and built cold: 1,954 units in 22 min 33 s, 90 % of the job's 25-minute ceiling. The ceiling is now 35 (`ci.yml:1340`). The same change corrects #3185's history in the bun-runtime vue-tsc step: the image broke six times, not four | #3192 |
+| 38 | 11-01 | **The prune removes local crates' macOS object files.** The macOS overlay cache grew 525–552 MB with each version bump while unit, lint and Windows sessions stayed flat, which put it over its cap and cold every third bump. macOS's default `split-debuginfo=unpacked` leaves `<crate>-<hash>.<cgu>-cgu.N.rcgu.o` beside each unit, and `ci-seed-save` read a unit's name at its last dash, which in those names is not the one before the hash. So 602 MB of local objects survived in a one-version cache. Those names are now read at the first dash (`ci-seed-save/action.yml:85`), and a cold prune lands at 4,039 MB, not 4,664 | #3251 |
 
 ## Acceptance criteria
 
@@ -1272,3 +1273,37 @@ itself on the affected run's page. Baseline when the program started: releases t
   10,380 MB and lint 6,088 MB on every publish, 65 % and 61 % of their caps, so the GC will not
   reach them and a cold run needs a lost cache. Windows sessions and the FR-85 recorder lane
   still have no cold run on record.
+- 2026-11-01, 01:29–01:56Z: **a forced cold run of five lanes, and all five fit.** Run
+  41261253426, on a branch that was never merged, gave lint, unit, the FR-85 recorder, Windows
+  sessions and macOS fresh `probe-*` cache families, so each logged `no … cache … building cold`.
+  A read-only token stopped every upload with HTTP 403, and no probe asset reached `seed-cache`.
+  The publish step still pruned and packed, so these times leave out only the upload, about 90 s
+  for unit:
+
+  | Lane | Cold | Ceiling | Crates compiled | Pruned to |
+  |---|---|---|---|---|
+  | Unit | 27.3 min | 45 | 1,795 | 10,373 MB |
+  | Lint | 18.0 min | 40 | 624 | 6,082 MB |
+  | macOS | 14.3 min | 35 | 976 | 4,039 MB |
+  | Windows sessions | 11.1 min | 40 | 508 | 1,612 MB |
+  | FR-85 recorder | 8.9 min | 30 | 460 | no publish step |
+
+  So wave 36's ceilings hold, and Windows sessions and the recorder lane have cold runs on
+  record. The recorder lane restores `recorder-audio`'s cache read-only, which is why it never
+  publishes.
+
+  A cap lowered to 1,000 MB on Windows sessions made the rewritten warning print: the run page
+  shows `CI cache over its cap` on that lane and no other, with the two cases spelled out.
+- 2026-11-01, 02:10Z: **wave 38: the macOS cache's growth was a prune bug.** The third bump
+  measured it again: 0.4.192's run (41260502582) compiled its usual 41 crates and still grew the
+  cache from 4,723 to 5,248 MB. Reading the published asset's tar headers found 602 MB of
+  `.rcgu.o` files from local crates (`roomlerd` 315, `tunnel_core` 121, the vendored `webrtc_*`
+  too), whose `.rlib` and `.rmeta` had gone. macOS's default `split-debuginfo=unpacked` leaves
+  those files, and the prune read their names at the last dash, which is not the one before the
+  hash.
+
+  The fix reads them at the first dash. Run against the real listing, it took the cache from
+  4,591 to 3,989 MB. On a real Mac, the probe's cold prune went 5,753 to 4,039 MB against master
+  41229869004's 5,767 to 4,664 MB, 625 MB less. That supersedes the 0.4.194 forecast above: the
+  cap should stop dropping this cache. Still to read: the next macOS publish should shrink, and
+  the next version bump should add nothing.
