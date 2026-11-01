@@ -955,6 +955,101 @@ flowchart TB
   [§9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29)
   and [§9.9](fr/FR-118-gpu-resident-frames.md#99-ac7-videotoolbox-on-the-macbook-2026-10-29).
 
+### 5.1g The capture waits (#3272)
+
+`ScreenCapture::next_frame` has a contract: **the backend owns its pace, and an
+`Ok(None)` comes after a bounded wait for a frame**. A pump loops straight back
+on one and sleeps on nothing. WGC, the portal, scrap and DRM always did this.
+The SYSTEM-context capture did not: it polled and returned at once, and the two
+DataChannel pumps slept on an empty themselves, while the RTP pump, which had no
+sleep, asked about 90,000 times a second on a still screen.
+
+Measured on 0.4.195 on one host, worker CPU over 30 s, as a share of one CPU:
+2.3 % with no session, 17.1 % on a DataChannel session, **191.8 % on an RTP
+session**. Its idle line ran at 362 lines a second, which crowded its heartbeats
+out of the log uploader (16 on disk, 10 in `agent_logs`).
+
+A pump asks for the contract once after each open, with `pace_capture()`. Only
+the RTP pump does so far, and the request travels on each `CaptureCmd`, so a
+pump that does not ask keeps the old path byte for byte.
+
+```mermaid
+flowchart TB
+    ASK["the RTP pump asks for a frame<br/>(CaptureCmd with a pace)"] --> ARM{"which arm"}
+    ARM -->|"DXGI direct,<br/>zero-copy off"| WAIT["AcquireNextFrame(16 ms):<br/>a new frame ends the wait at once"]
+    ARM -->|"DXGI direct, zero-copy on"| POLL["AcquireNextFrame(0):<br/>a waiting acquire holds the<br/>device's lock, and the encoder<br/>reads frames back on that device"]
+    ARM -->|"scrap"| POLL2["a fixed 0 inside scrap"]
+    ARM -->|"GDI"| GATE["the slot-first bucket holds it to<br/>the target; a failed BitBlt takes no slot"]
+    WAIT --> EMPTY{"Ok(None)?"}
+    POLL --> EMPTY
+    POLL2 --> EMPTY
+    GATE --> EMPTY
+    EMPTY -->|"yes, under 2 ms"| FLOOR["sleep the rest of 2 ms<br/>on the capture thread"]
+    EMPTY -->|"a frame, or a wait that ran out"| REPLY["reply to the pump"]
+    FLOOR --> REPLY
+```
+
+| Arm | A still screen costs | What it adds to a frame |
+|---|---|---|
+| DXGI direct, zero-copy off (the default) | about 62 asks a second | nothing: an event wake replaces the poll |
+| DXGI direct, zero-copy on (`dxgi_direct.rs` `frame`) | about 450 asks a second | up to one 2 ms floor, as the FFmpeg DC pump's sleep does |
+| scrap | about 450 asks a second | the same |
+| GDI | the target rate, full work on each | the bucket's wait, once it is out of credit |
+
+Why zero-copy polls: a thread waiting in `AcquireNextFrame` holds the D3D11
+multithread lock for its wait. Measured on one driver with a test in
+`dxgi_direct.rs` (`a_waiting_acquire_and_a_readback_share_one_device`): taking the lock went from 1 µs to 22 ms,
+and a readback from 6 ms to 67 ms.
+
+⚠️ **The RTP heartbeat changes meaning at this release.** Don't compare these
+across it:
+
+- `avg_capture_ms` counts the asks that brought a frame. Each now includes its
+  wait in the acquire, and on GDI the bucket's wait: a frame that arrives 10 ms
+  into a wait reads 10 ms plus its readback, where it used to read the readback
+  alone, because the polls before it were not counted. It is waiting, not work.
+  The work is `avg_readback_ms`.
+- `worker_avg_capture_ms` counts every ask, so on a still screen on the waiting
+  arm it reads about 16 ms. The floor and the bucket's wait stay outside its clock.
+- `frames_empty` drops about 1,000-fold, and `calls=` with it. A rate read off
+  them from before and after the release is measuring this change.
+
+The rest of the change:
+
+- **The auto-fps-cap moves the rate in place.** It used to reopen the capture
+  while the old one still held the output, so `DuplicateOutput` answered
+  `0x80070057`, and 15 of 16 sessions on one host in a day spent their first 5 s
+  on GDI (`set_target_fps`, as the DC pumps do on a grant).
+- **That error has a name now.** `BackendBail::SeatBusy`, at the `DuplicateOutput`
+  call alone: the capture that is ending lets go within one in-flight capture, so
+  an open waits up to 5 × 40 ms before going on to scrap and GDI. A second viewer,
+  who really is locked out, pays that once, and then re-climbs quietly every 5 s.
+- **The auto-downscale re-feeds its frame.** It drops the first frame to build
+  the encoder at the smaller size, and the reopen used to bring another by
+  accident. Now the next empty re-encodes the last frame, or a still screen would
+  wait a second for its first picture.
+- **The encoder open left the runtime worker** (`spawn_blocking`, as the FFmpeg DC
+  pump's). The MF cascade waits on each candidate's own thread, about 0.6 s a go.
+- **The idle line runs on time, once per 5 s**, on every OS. The FR-29 line on an
+  idle Linux host used to run once per 150 empties.
+- **`capture::pace::EmptyGuard`** watches the pump's empties: three instant ones in
+  a row with no frame between them warn once and cost 2 ms each. One alone is
+  normal, because a pull backend's next ask is already due after a slow encode.
+- **The log uploader counts what it drops** and says `dropped=N` in its next batch
+  (`crates/agent-core/src/logs_upload.rs`), so a read off `agent_logs` can tell a
+  quiet host from a host whose lines never arrived.
+
+**What this does not do.** On DXGI a motion source above the target still delivers
+at the display's rate. A session at a 30 fps target that encodes faster than that
+stamps each frame at least 33 ms on (`frame_duration_floor`), so its RTP clock runs
+ahead of wall time. Only the GDI arm holds to the target here.
+
+The kill switch is `ROOMLERD_RTP_CAPTURE_WAIT=0`: environment only, read once per
+pump. Off, the pump does not ask and the guard is not armed, so the capture spins
+as it did. The reopen, the seat retry, the time-gated line and the blocking open do
+not come back with it. [FR-98 C7](fr/FR-98-input-to-photon-budget.md#4-design-cuts-each-one-attributed-by-l4)
+moves the other pumps over and retires the opt-in, the switch and their sleeps.
+
 ### 5.2 Encoder selection
 
 Picked at agent startup, redetected on GPU change:
@@ -2583,7 +2678,7 @@ Each cut is its own switch, A/B'd on these cells and reverted if it moves nothin
 
 | Cut | Switch | Default | State |
 |---|---|---|---|
-| C1 slot-first capture gate | `ROOMLERD_CAPTURE_GATE=slot_first`, environment only, read by the WGC backend | `legacy` at 60 fps and below; above 60, slot-first whatever the switch says (FR-119 P2b) | built; L0 moves 19.9 ms in CI. The L4 field A/B is owed on a WGC host at 60 fps; the system-context DXGI arm (`scrap`) never reads the switch |
+| C1 slot-first capture gate | `ROOMLERD_CAPTURE_GATE=slot_first`, environment only, read by the WGC backend | `legacy` at 60 fps and below; above 60, slot-first whatever the switch says (FR-119 P2b) | built; L0 moves 19.9 ms in CI. The L4 field A/B is owed on a WGC host at 60 fps; the system-context DXGI arm never reads the switch |
 | C2 GPU clock pin, NVENC | `ROOMLERD_GPU_CLOCK_PIN`: `1` pins every session, `0` never | unset pins only above 60 fps (FR-119 P2b-16) | the 60 fps A/B is owed |
 | C3 pointer-move coalescing gap | `localStorage['roomler-rc-input-gap']`, 0–16 ms | 8 ms | knob built; L4's target mode cannot read it |
 | C4 cursor poller period | `ROOMLERD_CURSOR_POLL_MS`, 2–50 ms | 8 ms | knob built; L4's target mode cannot read it |
