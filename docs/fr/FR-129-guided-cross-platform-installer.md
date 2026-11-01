@@ -840,9 +840,10 @@ Each criterion's fail-first run is today's build, recorded in the log before its
         who typed their account details, the org's name and the code, and on Ubuntu and macOS the
         OS's own password at the one native prompt.
       - *On a throwaway server, not production:* no agent may create an account on production, so
-        the person ran against the production image on a lab server, with its real mail, rate
-        limits and activation clock. Every wizard run on production itself was approved by an
-        existing admin, so a brand-new account there has not been run.
+        the person ran against the production image on a lab server, with activation mail
+        through a local mail catcher, production's rate limits and its 5-minute activation clock.
+        Every wizard run on production itself was approved by an existing admin, so a brand-new
+        account there has not been run.
       - *Beside the straight path:* [#3247](https://github.com/gjovanov/roomler-ai/issues/3247).
 - [x] **AC2** — A signed-in admin of two orgs pairs a device into the org they pick. The device
       row shows `install.method = wizard`, and the FR-102 ledger records the issuance.
@@ -857,7 +858,7 @@ Each criterion's fail-first run is today's build, recorded in the log before its
         polls in each of a pairing's three states retrieved nothing, each answer byte-identical
         in all three, and the real code's answer byte-identical to that of a code naming nothing.
         The scans are "AC3 and the token, scanned" (the dev stack) and "A4 on production" (the
-        client side), and that row found no device code or token in either pod's log.
+        client side), and the forged-poll run found no device code or token in either pod's log.
 - [x] **AC4** — `/pair` never approves from a link alone: the code must be typed, and the
       device's name, OS, version, country and start time are shown before Approve.
       - *Evidence:* the log, 2026-10-30, "A3 paired against production": a link, even one
