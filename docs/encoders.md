@@ -430,6 +430,29 @@ Key properties:
 | WSL2 | `libcuda.so.1` is a stub: `hevc_nvenc` **dlopens successfully** and then SEGVs when `cuInit(0)` fails on a box without the NVIDIA driver — contained by the child process. With the driver, NVENC works. There is no VAAPI: no `/dev/dri`, and libva refuses `/dev/dxg` |
 | Apple silicon | `h264/hevc_videotoolbox` open; `av1_videotoolbox` is in the table but not in the registry on current SDKs — measured, not assumed |
 
+### Ending a Media Foundation encoder
+
+`IMFActivate::ActivateObject` leaves the caller to end what it made, and releasing the pointers
+does not end it. An MFT left activated keeps its device and its driver's threads until the process
+exits. Nothing ended them until 2026-11-01: on a laptop with an AMD and an NVIDIA GPU every encoder
+open lost **72 threads and 1,210 handles**, and a session opens one per resolution change. Fourteen
+opens left 896 threads inside `amdxx64.dll`, AMD's D3D11 driver, in a worker with about 80 of its
+own, and only a restart freed them.
+
+`HwMftCandidate`'s `Drop` now calls `ShutdownObject` (`encode/mf/activate.rs:90`).
+
+- ⚠️ **Candidates end when the cascade ends, never between adapters.** Until `ShutdownObject`,
+  `ActivateObject` returns the same instance, which is why the second adapter's pass takes
+  microseconds. Ending one between adapters would make the next adapter build a new instance, and
+  so change what wins on every host with two GPUs.
+- ⚠️ **The winner's activation moves into its pipeline**, in the field declared first
+  (`encode/mf/sync_pipeline.rs:96`), so the MFT ends while its transform and device are still held.
+- `cargo test -p roomlerd --lib --features mf-encoder -- --ignored closed_encoder` measures it. It
+  needs a host's real drivers, so no CI lane runs it. It encodes after the cascade returns, because
+  the cascade's own probe runs before the losers end. With `ROOMLERD_MF_SHUTDOWN=0` it fails the way
+  the old code did, which is its positive control.
+- About 3 handles per open remain, unattributed, and they had not levelled off after 40 opens.
+
 ## The new cells (FR-77 P3b)
 
 ```mermaid
@@ -749,7 +772,7 @@ colour-manages by primaries and transfer (FR-130 §2.5).
 | Family | Where it is written | What the bitstream carries (read on neo16 in P1, and in the field in P3) |
 |---|---|---|
 | FFmpeg, every backend | the codec context's four fields in `build_encoder` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1912`), before the open, for every cell, rebuild, probe, recording and GPU form | NVENC, D3D12 and Vulkan: set S exactly (H.264, HEVC and AV1; NVENC 4:4:4 too). QSV (AV1, H.264) and VideoToolbox (HEVC, H.264): set S, as Chrome's decoder reads it in the field when it is told nothing. `hevc_amf`: S's values, with the matrix under code 5 (BT.470 BG, the same coefficients). `h264_amf`: matrix 2 (unspecified), AMD's runtime's choice. `vp9_qsv`, `vp9_vaapi`: nothing, because FFmpeg 9.0.1 cannot tag VP9 there. VAAPI: not yet read |
-| Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES` and `MF_MT_TRANSFER_FUNCTION` on both media types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:600`), and again on the renegotiated output type | Microsoft's H.264 and HEVC encoders ignore the attributes and write no description. NVIDIA's and AMD's MF encoders did not open on neo16, so they are unread |
+| Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES` and `MF_MT_TRANSFER_FUNCTION` on both media types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:610`), and again on the renegotiated output type | Microsoft's H.264 and HEVC encoders ignore the attributes and write no description. NVIDIA's and AMD's MF encoders did not open on neo16, so they are unread |
 | openh264, live | the SPS VUI (`agents/roomlerd/src/encode/openh264_backend.rs:116`) | set S |
 | libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:435`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
 | openh264, recording | its own VUI and the MP4 `colr` box, unchanged since FR-85 | SMPTE 170M at limited range |
@@ -801,6 +824,7 @@ source's CSS values.
 | `vulkan_device` | `ROOMLERD_VULKAN_DEVICE` | unset | pin the Vulkan physical device by index or name; unset = the loader's default |
 | `rate_factor_{h264,hevc,vp9}_444` | `ROOMLERD_RATE_FACTOR_<CODEC>_444` | 150 | the 4:4:4 ceiling factor (%), 50–400 |
 | — | `ROOMLERD_HW_AUTO=0` | — | `auto` becomes software-first |
+| — | `ROOMLERD_MF_SHUTDOWN=0` | — | a kill switch, not a setting: Media Foundation encoders are released without being ended, which [leaks their threads](#ending-a-media-foundation-encoder) |
 | — | `ROOMLERD_USE_FFMPEG=0` | — | no FFmpeg backends at all |
 | — | `ROOMLERD_DC_H264=0` | — | no H.264-over-DataChannel advertisement (its cells are then not probed either) |
 | — | `LIBVA_DRIVERS_PATH` | the distros' `dri` dirs | where the bundled libva looks for the host's VA driver |
