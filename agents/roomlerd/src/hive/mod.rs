@@ -85,6 +85,10 @@ mod child;
 /// organization's map says reaching an entity takes, opened from this device
 /// when a probe from here found it.
 mod connect_tool;
+/// FR-90 P8-2d-0 — the device's own parts (the replica store and stream, the
+/// viewer's peer, the prober's measure), and the seams they reach the daemon
+/// through, ahead of their worker.
+mod device;
 /// FR-90 P3b-1b-1 — a session's egress proxy: the fronts Claude Code's
 /// sandbox sends its commands through, each host decided by the vault. No
 /// run starts one before P3b-1b-2.
