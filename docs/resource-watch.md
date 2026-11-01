@@ -22,8 +22,8 @@ half: a Windows peer probe that starts no process.
 | Its kill switch | `ROOMLERD_PING_SUBPROCESS=1` goes back to `ping.exe` |
 | The fleet read | `scripts/resource-watch-read.js` (§3) |
 
-All three variables are read at start, and none has a config key, so none can be
-pushed through remote configuration.
+All three are environment variables with no config key, so none can be pushed
+through remote configuration, and changing one takes a restart.
 
 ## 1. What it reports
 
@@ -159,6 +159,6 @@ Measured 2026-11-01 on 0.4.194.
 | Linux | 36 to 39 descriptors |
 | macOS | 20 to 33 descriptors |
 | The fleet read against 406,843 batches | one line per device, no restart |
-| `PING.EXE` started by the daemon, Windows, 17 peers | 0 in 610 s, with a positive control; 0.4.193 started 249 in 300 s |
+| `PING.EXE` started by the daemon, Windows | 0 in 610 s, with a positive control; 0.4.193 started 249 in 300 s |
 | The RTT column against a hand `ping`, median of 16 pairs | within 1 ms on a server and three LAN peers |
 | The same on a Wi-Fi peer, 40 pairs | minimum 4 and 4 ms, quartiles 5 to 54 and 6 to 63 ms: the same distribution, no offset |
