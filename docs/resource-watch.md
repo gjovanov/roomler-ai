@@ -20,7 +20,7 @@ half: a Windows peer probe that starts no process.
 | A lower bar, for a field test | `ROOMLERD_RESOURCE_WATCH_MIN_RISE=<n>` |
 | The Windows prober | `agents/roomlerd/src/icmp_win.rs`, called by `OsPinger` (`agents/roomlerd/src/localapi_state.rs:61`) |
 | Its kill switch | `ROOMLERD_PING_SUBPROCESS=1` goes back to `ping.exe` |
-| The fleet read | `scripts/resource-watch-read.js` (§3) |
+| The fleet read | `scripts/resource-watch-read.cjs` (§3) |
 
 All three are environment variables with no config key, so none can be pushed
 through remote configuration, and changing one takes a restart.
@@ -94,7 +94,7 @@ have as few as 1,024 descriptors.
 
 ```bash
 roomler ssh mars -- 'kubectl -n roomler-ai exec -i mongodb-0 -- mongosh --nodb --quiet' \
-  < scripts/resource-watch-read.js | grep -o 'OUT .*'
+  < scripts/resource-watch-read.cjs | grep -o 'OUT .*'
 kubectl -n roomler-ai get pod mongodb-0     # RESTARTS must not have moved
 ```
 

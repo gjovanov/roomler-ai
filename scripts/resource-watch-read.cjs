@@ -5,7 +5,7 @@
 // the batches, $limit caps them, and only the matching lines leave the server.
 //
 //   roomler ssh mars -- 'kubectl -n roomler-ai exec -i mongodb-0 -- mongosh --nodb --quiet' \
-//     < scripts/resource-watch-read.js | grep -o 'OUT .*'
+//     < scripts/resource-watch-read.cjs | grep -o 'OUT .*'
 //
 // Prints one line per reading, then a count. `agent_logs` keeps 7 days.
 //
