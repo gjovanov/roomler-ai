@@ -12,6 +12,7 @@ import {
   CAMPAIGN_KEYS,
   CARRIED_KEYS,
   MAX_VALUE_CHARS,
+  ORGANIC_PREFIX,
   SELF_REPORTED_OPTIONS,
   carriedQuery,
   externalHost,
@@ -30,6 +31,7 @@ describe('the contract', () => {
     expect([...CAMPAIGN_KEYS]).toEqual(['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'ref'])
     expect([...CARRIED_KEYS]).toEqual([...CAMPAIGN_KEYS, 'referrer_host', 'landing_path'])
     expect(MAX_VALUE_CHARS).toBe(64)
+    expect(ORGANIC_PREFIX).toBe('/blog/')
   })
 
   it('offers the spec’s answers to "How did you hear about Roomler?"', () => {
@@ -102,8 +104,30 @@ describe('signupAttribution', () => {
     )
   })
 
-  it('ignores carried journey keys without a campaign: a bare link says nothing', () => {
+  it('ignores carried journey keys without a campaign when the journey did not begin on the blog', () => {
     expect(signupAttribution({ referrer_host: 'evil.example', landing_path: '/x' }, landing)).toBeUndefined()
+    expect(signupAttribution({ referrer_host: 'www.google.com', landing_path: '/docs/x/' }, landing)).toBeUndefined()
+    // The prefix is the blog's directory, not any path that starts with "/blog".
+    expect(signupAttribution({ referrer_host: 'www.google.com', landing_path: '/blogx/' }, landing)).toBeUndefined()
+  })
+
+  // FR-91 (#1880) §3e: a reader who found a post in search and signs up.
+  it('sends an organic journey from the blog: referrer_host and landing_path, nothing else', () => {
+    const fromPost = { referrer: 'https://roomler.ai/blog/x/', host: HOST, path: '/register' }
+    const organic = { referrer_host: 'www.google.com', landing_path: '/blog/x/', invite: 'abc' }
+    expect(signupAttribution(organic, fromPost)).toEqual({ referrer_host: 'www.google.com', landing_path: '/blog/x/' })
+    expect(signupAttribution(organic, fromPost, 'search')).toEqual({
+      referrer_host: 'www.google.com',
+      landing_path: '/blog/x/',
+      self_reported: 'search',
+    })
+    // Both halves are needed: the blog without another site, or another site without the blog, is not it.
+    expect(signupAttribution({ landing_path: '/blog/x/' }, fromPost)).toBeUndefined()
+    expect(signupAttribution({ referrer_host: 'www.google.com' }, fromPost)).toBeUndefined()
+    // ...and the OAuth start URL carries it the same way.
+    expect(oauthStartUrl('google', signupAttribution(organic, fromPost))).toBe(
+      '/api/oauth/google?referrer_host=www.google.com&landing_path=%2Fblog%2Fx%2F',
+    )
   })
 
   it('sends only non-empty values, trimmed and capped at 64 characters', () => {
@@ -134,9 +158,12 @@ describe('signupAttribution', () => {
 })
 
 describe('carriedQuery — what a link onward from an SPA page carries', () => {
-  it('is empty without a campaign, whatever else the URL holds', () => {
+  it('is empty without a campaign, unless the journey began on the blog from another site', () => {
     expect(carriedQuery({}, landing)).toEqual({})
     expect(carriedQuery({ invite: 'abc', referrer_host: 'x', landing_path: '/y' }, landing)).toEqual({})
+    const q = carriedQuery({ invite: 'abc', landing_path: '/blog/x/', referrer_host: 'www.google.com' }, landing)
+    expect(q).toEqual({ referrer_host: 'www.google.com', landing_path: '/blog/x/' })
+    expect(Object.keys(q)).toEqual(['referrer_host', 'landing_path'])
   })
 
   it('carries the campaign as it came, then where the journey began, in the static script’s order', () => {

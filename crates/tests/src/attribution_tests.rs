@@ -149,6 +149,63 @@ async fn register_with_attribution_stores_the_sanitised_values() {
 }
 
 /// The control: no attribution, no key — not an empty subdocument.
+/// FR-91 §3e: a reader who found a post in search and signs up. The register
+/// view sends `referrer_host` and `landing_path` alone, with no campaign key.
+#[tokio::test]
+async fn an_organic_journey_from_the_blog_is_stored_and_counted_by_its_post() {
+    let admin_id = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(admin_id.to_hex());
+    })
+    .await;
+    let admin = app
+        .state
+        .auth
+        .generate_tokens(admin_id, "padmin@test.io", "padmin")
+        .unwrap();
+
+    register_and_login(
+        &app,
+        "organic@test.io",
+        "organic",
+        json!({ "attribution": { "referrer_host": "www.google.com", "landing_path": "/blog/x/" } }),
+    )
+    .await;
+    register_and_login(&app, "direct@test.io", "direct", json!({})).await;
+
+    let stored = user_doc(&app, "organic@test.io").await;
+    let attr = stored
+        .get_document("signup_attribution")
+        .expect("an organic journey is stored");
+    assert_eq!(attr.get_str("referrer_host").unwrap(), "www.google.com");
+    assert_eq!(attr.get_str("landing_path").unwrap(), "/blog/x/");
+    for key in ["source", "medium", "campaign", "content", "term"] {
+        assert!(attr.get(key).is_none(), "{key} in {attr}");
+    }
+
+    let body: Value = app
+        .auth_get("/api/admin/stats/attribution", &admin.access_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["signups"], json!(2), "{body}");
+    assert_eq!(body["attributed"], json!(1), "{body}");
+    let bucket = |key: Value| -> Value {
+        body["by_landing_path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["key"] == key)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {key} in by_landing_path: {body}"))
+    };
+    assert_eq!(bucket(json!("/blog/x/"))["signups"], json!(1), "{body}");
+    assert_eq!(bucket(Value::Null)["signups"], json!(1), "{body}");
+}
+
 #[tokio::test]
 async fn register_without_attribution_stores_no_key() {
     let app = TestApp::spawn().await;

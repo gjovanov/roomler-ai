@@ -10,7 +10,7 @@
         </router-link>
 
         <h1 class="text-h4 text-md-h3 font-weight-bold mb-2">Privacy Policy</h1>
-        <p class="text-body-2 legal-muted mb-8">Last updated: October 2026</p>
+        <p class="text-body-2 legal-muted mb-8">Last updated: November 2026</p>
 
         <section class="mb-8">
           <h2 class="text-h5 font-weight-bold mb-3">1. Introduction</h2>
@@ -232,6 +232,14 @@
             analytics records that full address, as your browser reports it (2.15).
           </p>
           <p class="text-body-1 legal-muted mb-4">
+            You can also reach a page of our blog from another website with no campaign tag, for example from a
+            search engine. Our pages then pass on two things, in the same links and in the same way: that
+            website's name and the path of the blog page. Our analytics sees them in those addresses too. If you
+            then create an account, those two are what we store with it. A visit with no campaign tag that does not
+            start on our blog, or that your browser does not report as coming from another website, passes on
+            nothing.
+          </p>
+          <p class="text-body-1 legal-muted mb-4">
             The sign-up form also asks "How did you hear about Roomler?". Answering is optional; if you choose an
             answer, we store it with the account in the same way. If you sign up through Google or another
             provider, these details wait on our server for at most ten minutes while you sign in there, and are
@@ -239,14 +247,14 @@
           </p>
           <p class="text-body-1 legal-muted mb-4">
             We use this for one purpose: to learn which of our channels bring people to Roomler, and we look at it
-            as counts per channel. It is recorded once, when the account is created, and never changed. It is not
+            as counts per channel and per page. It is recorded once, when the account is created, and never changed. It is not
             shown on your profile or to anyone in your workspace, and it is deleted together with your account. The
             legal basis is our legitimate interest in knowing which of our channels work (Art. 6(1)(f) GDPR); you
             can object to it at any time (section 9).
           </p>
           <p class="text-body-1 legal-muted mb-4">
             <strong>Nothing about this is stored on your device</strong>: no cookie, no local storage, no session
-            storage. The tags travel only in the links you follow.
+            storage. These details travel only in the links you follow.
           </p>
 
           <h3 class="text-h6 font-weight-bold mb-2">2.17 YouTube</h3>

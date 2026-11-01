@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { CARRIED_KEYS } from '../../src/utils/attribution.ts'
+import { CARRIED_KEYS, carriedQuery, queryOf } from '../../src/utils/attribution.ts'
 import { AUTHORS, BASE, INSTALL_PAGES } from '../site.ts'
 import { renderPost } from '../theme/blog-layout.ts'
 import { carryScript, INSTALL_PAGES_PLACEHOLDER, installPageErrors } from '../theme/carry.ts'
@@ -174,12 +174,24 @@ describe('attribution.js — without a campaign', () => {
   it.each([
     ['the homepage', homeHtml, 'https://roomler.ai/'],
     ['a docs page', docsHtml, 'https://roomler.ai/docs/start/quickstart/'],
-    ['a blog post', postHtml, 'https://roomler.ai/blog/x/'],
-  ])('leaves every link on %s untouched', (_, html, url) => {
-    // An external referrer and unrelated parameters are not a campaign.
-    const doc = run(html(), `${url}?q=vpn&landing_path=/x&referrer_host=evil.example`, 'https://www.google.com/')
+  ])('leaves every link on %s untouched, even from another site', (_, html, url) => {
+    // An external referrer and unrelated parameters are not a campaign, and
+    // this journey did not begin on the blog (FR-91 §3e).
+    const doc = run(html(), `${url}?q=vpn`, 'https://www.google.com/')
     expect(changed(html(), doc)).toEqual([])
     expect(doc.querySelector('form[data-subscribe]')?.hasAttribute('data-source') ?? false).toBe(false)
+    expectNoStorage()
+  })
+
+  it.each([
+    ['the homepage', homeHtml, 'https://roomler.ai/'],
+    ['a docs page', docsHtml, 'https://roomler.ai/docs/start/quickstart/'],
+    ['a blog post', postHtml, 'https://roomler.ai/blog/x/'],
+  ])('leaves every link on %s untouched when the carried journey did not begin on the blog', (_, html, url) => {
+    // Journey keys on the URL are passed on as given, so a planted landing
+    // outside the blog is not an organic journey from it, whatever the referrer.
+    const doc = run(html(), `${url}?q=vpn&landing_path=/x&referrer_host=evil.example`, 'https://www.google.com/')
+    expect(changed(html(), doc)).toEqual([])
     expectNoStorage()
   })
 
@@ -319,6 +331,89 @@ describe('attribution.js — with a campaign', () => {
     // stripped first: the header says what the script does NOT use.
     const code = SCRIPT.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
     expect(code).not.toMatch(/localStorage|sessionStorage|indexedDB|cookie/i)
+  })
+})
+
+// FR-91 (#1880) §3e — a reader who found a post in search and signs up.
+describe('attribution.js — an organic journey from another site to the blog', () => {
+  const POST = 'https://roomler.ai/blog/x/'
+  const register = (doc: Document) =>
+    new URL(doc.querySelector('a[href^="/register"]')!.getAttribute('href')!, 'https://roomler.ai').searchParams
+
+  it('carries referrer_host and landing_path, and nothing else, onto exactly the allowlisted links', () => {
+    const doc = run(postHtml(), POST, 'https://www.google.com/search?q=private')
+    const diff = changed(postHtml(), doc)
+    expect(diff.length).toBeGreaterThan(0)
+    for (const [before] of diff) expect(allowed(before, POST), `${before} is not a CTA`).toBe(true)
+    const before = hrefs(new DOMParser().parseFromString(postHtml(), 'text/html'))
+    const after = hrefs(doc)
+    expect(before.filter((h, i) => allowed(h, POST) && after[i] === h)).toEqual([])
+    // The host only, never the search query, and in the register view's order.
+    expect([...register(doc).keys()]).toEqual(['referrer_host', 'landing_path'])
+    expect(Object.fromEntries(register(doc))).toEqual({ referrer_host: 'www.google.com', landing_path: '/blog/x/' })
+    expectNoStorage()
+  })
+
+  it('needs another site: a post reached from this site, or from nowhere, changes nothing', () => {
+    for (const referrer of ['https://roomler.ai/docs/', '']) {
+      expect(changed(postHtml(), run(postHtml(), POST, referrer)), referrer || '(no referrer)').toEqual([])
+    }
+  })
+
+  it('counts the blog index and its tag pages as the blog', () => {
+    for (const url of ['https://roomler.ai/blog/', 'https://roomler.ai/blog/tag/remote-desktop/']) {
+      expect(register(run(postHtml(), url, 'https://www.bing.com/')).get('landing_path'), url).toBe(new URL(url).pathname)
+    }
+  })
+
+  it('keeps the journey through a second page: the install guide a post links to carries it on', () => {
+    const doc = run(
+      docsHtml(),
+      'https://roomler.ai/docs/start/quickstart/?referrer_host=www.google.com&landing_path=%2Fblog%2Fx%2F',
+      POST,
+    )
+    expect(Object.fromEntries(register(doc))).toEqual({ referrer_host: 'www.google.com', landing_path: '/blog/x/' })
+  })
+
+  it('leaves the newsletter form its own source: an organic visit has no campaign to give it', () => {
+    const doc = run(homeHtml(), 'https://roomler.ai/?referrer_host=www.google.com&landing_path=%2Fblog%2Fx%2F', POST)
+    expect(register(doc).get('landing_path')).toBe('/blog/x/')
+    expect(doc.querySelector('form[data-subscribe]')!.hasAttribute('data-source')).toBe(false)
+  })
+})
+
+// The static script cannot import the register view's rule, so both run on
+// the same visits here: what a page carries onto its sign-up link is exactly
+// what the register view would send from it.
+describe('the static pages and the register view carry by one rule', () => {
+  it.each([
+    ['a campaign', homeHtml, `https://roomler.ai/?${CAMPAIGN}`, 'https://www.youtube.com/'],
+    ['an organic reader of a post', postHtml, 'https://roomler.ai/blog/x/', 'https://www.google.com/'],
+    ['an organic reader of the homepage', homeHtml, 'https://roomler.ai/', 'https://www.google.com/'],
+    ['a post reached from this site', postHtml, 'https://roomler.ai/blog/x/', 'https://roomler.ai/docs/'],
+    [
+      'the second page of a journey from the blog',
+      docsHtml,
+      'https://roomler.ai/docs/start/quickstart/?referrer_host=www.google.com&landing_path=%2Fblog%2Fx%2F',
+      'https://roomler.ai/blog/x/',
+    ],
+    [
+      'a planted journey that did not begin on the blog',
+      postHtml,
+      'https://roomler.ai/blog/x/?referrer_host=evil.example&landing_path=%2Fx',
+      'https://www.google.com/',
+    ],
+    [
+      'a landing that only starts like the blog',
+      postHtml,
+      'https://roomler.ai/blog/x/?referrer_host=www.google.com&landing_path=%2Fblogroll%2F',
+      'https://roomler.ai/docs/',
+    ],
+  ])('%s', (_, html, url, referrer) => {
+    const doc = run(html(), url, referrer)
+    const sent = new URL(doc.querySelector('a[href^="/register"]')!.getAttribute('href')!, 'https://roomler.ai').searchParams
+    const u = new URL(url)
+    expect(Object.fromEntries(sent)).toEqual(carriedQuery(queryOf(u.search), { referrer, host: u.host, path: u.pathname }))
   })
 })
 

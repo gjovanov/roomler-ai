@@ -4,7 +4,8 @@
 //! promotion brought, as COUNTS.
 //!
 //! Sign-ups in a window, grouped by where they said they came from
-//! (`source`, `medium`, `campaign`, `self_reported`), and how many of them
+//! (`source`, `medium`, `campaign`, `self_reported`) and the blog page they
+//! landed on (`landing_path`, FR-91 §3e), and how many of them
 //! ACTIVATED — the person's org enrolled at least one device within
 //! [`ACTIVATION_WINDOW_DAYS`] of the account's creation. Never a user list:
 //! the projection the query reads has no name or address in it, and the
@@ -53,6 +54,9 @@ const DEFAULT_WINDOW_DAYS: i64 = 30;
 /// Buckets kept per dimension, most sign-ups first. A campaign list longer
 /// than this is a tagging problem, not a dashboard one.
 const MAX_BUCKETS: usize = 100;
+/// A landing path under this prefix gets a bucket of its own in
+/// `by_landing_path` (FR-91 §3e): the blog's index, tag pages and posts.
+const BLOG_PREFIX: &str = "/blog/";
 
 #[derive(Debug, Deserialize)]
 pub struct AttributionQuery {
@@ -106,6 +110,11 @@ pub struct AttributionReport {
     pub by_medium: Vec<Bucket>,
     pub by_campaign: Vec<Bucket>,
     pub by_self_reported: Vec<Bucket>,
+    /// FR-91 §3e: which blog page a journey began on, organic or from a
+    /// campaign. `null` is every other sign-up: one that landed elsewhere, or
+    /// recorded no landing page. FR-102's funnel breaks down every landing
+    /// path (`by=landing_path`); this answers "which post brought them".
+    pub by_landing_path: Vec<Bucket>,
 }
 
 /// GET /api/admin/stats/attribution?since=&until=
@@ -285,7 +294,7 @@ pub(crate) fn tally(
         }
     }
     // BTreeMap so equal counts render in a stable order.
-    let mut by: [BTreeMap<Option<String>, Tallies>; 4] = Default::default();
+    let mut by: [BTreeMap<Option<String>, Tallies>; 5] = Default::default();
     let mut total = Tallies::default();
     let mut attributed = 0u64;
 
@@ -301,6 +310,8 @@ pub(crate) fn tally(
             attr.and_then(|a| a.medium.clone()),
             attr.and_then(|a| a.campaign.clone()),
             attr.and_then(|a| a.self_reported.clone()),
+            attr.and_then(|a| a.landing_path.clone())
+                .filter(|p| p.starts_with(BLOG_PREFIX)),
         ];
         for (dim, key) in keys.into_iter().enumerate() {
             by[dim].entry(key).or_default().add(fate);
@@ -322,7 +333,7 @@ pub(crate) fn tally(
         out.truncate(MAX_BUCKETS);
         out
     };
-    let [source, medium, campaign, self_reported] = by;
+    let [source, medium, campaign, self_reported, landing_path] = by;
 
     AttributionReport {
         enabled: true,
@@ -339,6 +350,7 @@ pub(crate) fn tally(
         by_medium: render(medium),
         by_campaign: render(campaign),
         by_self_reported: render(self_reported),
+        by_landing_path: render(landing_path),
     }
 }
 
@@ -530,6 +542,49 @@ mod tests {
             (Some(0), Some(0), Some(1))
         );
         assert_eq!(bucket(&r.by_source, Some("tiktok")).activated, Some(0));
+    }
+
+    /// FR-91 §3e: a blog page that brought sign-ups has its own bucket, for an
+    /// organic journey and a campaign's alike. Everything else is the `null`
+    /// bucket, so the buckets still add up to `signups`.
+    #[test]
+    fn by_landing_path_names_blog_pages_and_folds_the_rest_into_null() {
+        let landed = |id, source: Option<&str>, path: &str| SignupRow {
+            id,
+            created_at: DateTime::from_millis(T0),
+            signup_attribution: Some(SignupAttribution {
+                source: source.map(str::to_string),
+                referrer_host: Some("www.google.com".to_string()),
+                landing_path: Some(path.to_string()),
+                ..Default::default()
+            }),
+        };
+        let (a, b, c) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let org = ObjectId::new();
+        let rows = vec![
+            landed(a, None, "/blog/x/"),
+            landed(b, Some("youtube"), "/blog/x/"),
+            landed(c, None, "/blog/"),
+            landed(ObjectId::new(), None, "/docs/start/quickstart/"),
+            // Starts like the blog, and is not it.
+            landed(ObjectId::new(), None, "/blogroll/"),
+            row(ObjectId::new(), T0, Some("tiktok"), None),
+        ];
+        let enrollments = vec![(org, DateTime::from_millis(T0 + DAY))];
+        let r = settled_tally(&rows, &[(a, org)], Some(&enrollments));
+        assert_eq!(r.signups, 6);
+        // An organic sign-up recorded something, so it counts as attributed.
+        assert_eq!(r.attributed, 6);
+        let post = bucket(&r.by_landing_path, Some("/blog/x/"));
+        assert_eq!((post.signups, post.activated), (2, Some(1)));
+        assert_eq!(bucket(&r.by_landing_path, Some("/blog/")).signups, 1);
+        assert_eq!(bucket(&r.by_landing_path, None).signups, 3);
+        assert_eq!(r.by_landing_path.len(), 3, "{:?}", r.by_landing_path);
+        // Most sign-ups first; an organic journey has no `source`.
+        assert_eq!(r.by_landing_path[0].key, None);
+        assert_eq!(bucket(&r.by_source, None).signups, 4);
+        let total: u64 = r.by_landing_path.iter().map(|b| b.signups).sum();
+        assert_eq!(total, r.signups);
     }
 
     #[test]

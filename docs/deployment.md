@@ -26,6 +26,11 @@ flowchart TB
     BIN -.->|"Ed25519 tickets"| DERP
 ```
 
+**The blog is not on this path.** The edge sends `/blog/` and `/sitemap-blog.xml` to `roomler-blog`,
+nginx ×2 in the same namespace, fed from a MinIO bucket by a private publisher (FR-91). Rolling it
+touches no long-lived socket, and publishing a post never rolls `roomler2`:
+[public-site.md §9](public-site.md).
+
 ## The server image
 
 One multi-stage `Dockerfile`:
