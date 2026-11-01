@@ -571,6 +571,56 @@ own, and only a restart freed them.
   the old code did, which is its positive control.
 - About 3 handles per open remain, unattributed, and they had not levelled off after 40 opens.
 
+### Reading RTP's reach (#3272)
+
+`rc:session.stats` carries neither the transport nor the encoder, so how far the RTP path reaches,
+and how it behaves, can only be read from `agent_logs`. `scripts/rtp-reach-read.cjs` does that, bounded
+by construction, with no exec on any host:
+
+```bash
+roomler ssh mars -- 'kubectl -n roomler-ai exec -i mongodb-0 -- mongosh --nodb --quiet' \
+  < scripts/rtp-reach-read.cjs | grep -o 'OUT .*'
+```
+
+```mermaid
+flowchart LR
+    REQ["incoming session request<br/>browser_caps, chosen_codec,<br/>requested and negotiated transport"] --> JOIN["one line per RTP session"]
+    HB["media pump heartbeat<br/>(the RTP pump's alone)<br/>backend, frames_empty, frames_encoded, bytes_written"] --> JOIN
+    ROW["agents row<br/>ephemeral, video_cells"] --> JOIN
+    JOIN --> TOT["totals: sessions, no-video,<br/>backends, empties/s,<br/>RTP H.264 on a hardware cell"]
+```
+
+| Read | What it answers |
+|---|---|
+| `OUT sessions N dc D rtp R agents A` | How much of the fleet's remote desktop runs on this path |
+| `OUT no-video N` | Sessions that wrote no bytes: `backend=noop`, the failure #3245 ends. It should read **zero** once every host has the pick, and a session with a `limit` no longer reaches it |
+| `OUT backends …` | Which encoder those sessions got |
+| `OUT empties/s p50 … p90 … max …` | The spin #3272's waiting capture ends: about 90,000 a second before it, with a bar of 80 on a waiting arm and 520 on a floor arm after it |
+| `OUT rtp-h264-on-a-hardware-cell-not-ephemeral N` | The reach an H.264 hardware rung would have on this path. #3272 decided against building one, and more than 10 a week is what would reopen that |
+
+**Baseline, the 7 days to 2026-11-01:** 730 sessions, 672 on a DataChannel and 58 on RTP (7.9 %), on
+13 agents.
+
+| RTP class | Sessions | Encoder |
+|---|---|---|
+| One host whose caps probe had collapsed, so every transport was gone (#3267) | 15 | Microsoft's H.264 MFT |
+| Throwaway hosts with no hardware (5) | 19 | OpenH264 |
+| A stale transport pick the agent dropped | 11 | **Noop AV1 × 7**, `hevc_qsv`, `hevc_vaapi`, OpenH264 |
+| Explicit H.264 | 8 | OpenH264, Microsoft's H.264 MFT |
+| Other | 5 | `hevc_*`, OpenH264 |
+
+⚠️ **The host's facts are today's.** `ephemeral` and `h264hw` come from the agents row as it reads now,
+not at the session, so a host whose probe has since recovered reads as having had its hardware cell.
+Read `backend=` and the date beside them, and take the hardware count as a ceiling. A row that has
+been reaped reads `?`.
+
+⚠️ **`chosen=?` is a lost line, not a missing pick.** Before #3272 the idle flood overran the log
+uploader, so a session's request line can be gone while its heartbeats landed. Counters are cumulative,
+so its rates still hold.
+
+⚠️ **`avg_capture_ms` changed meaning at the waiting capture**, so this read's history does not compare
+across that release for capture time. Empties a second is what compares.
+
 ## The new cells (FR-77 P3b)
 
 ```mermaid
