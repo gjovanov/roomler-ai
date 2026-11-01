@@ -45,6 +45,10 @@ use tauri::{Emitter, Manager};
 use wizard_app::{INSTALL_IN_PROGRESS, commands};
 
 fn main() {
+    // FR-129 C — before anything can load a DLL by name: the EXE sits in the
+    // person's Downloads and goes on to run elevated.
+    wizard_shared::elevation::restrict_dll_search();
+
     // Stderr-only tracing. The wizard is a foreground EXE the
     // operator launches manually; persistent logging is the daemon's
     // job, not ours. Operators who want wizard-side logs run from a
@@ -57,6 +61,13 @@ fn main() {
         .with_target(false)
         .with_writer(std::io::stderr)
         .try_init();
+
+    // FR-129 C3 — an elevated relaunch waits for the limited copy that asked
+    // for it to exit BEFORE the single-instance plugin below looks for a
+    // running copy; otherwise it would hand its arguments to that dying copy
+    // and quit.
+    let launch = wizard_app::launch::LaunchArgs::from_env();
+    wizard_app::launch::wait_for_parent(&launch);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -89,6 +100,35 @@ fn main() {
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        // FR-129 C3 — the one window, from its `tauri.conf.json` entry (which
+        // says `"create": false`), so that an ELEVATED wizard can hand
+        // WebView2 a user-data folder of its own: through the API, the only
+        // channel an elevated host honours (`launch::webview_data_directory`
+        // says why). A limited wizard passes nothing and keeps Tauri's folder.
+        // A relaunch then takes the foreground: the limited copy held it and
+        // has exited, so Windows gave it to the window behind (a browser, when
+        // that is where the download was opened), and a new window stays
+        // behind that unless it asks. `run_elevated` left it the right to.
+        .setup(move |app| {
+            let config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == wizard_app::launch::MAIN_WINDOW)
+                .cloned()
+                .ok_or("tauri.conf.json has no main window")?;
+            let mut window = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?;
+            if let Some(dir) = wizard_app::launch::webview_data_directory(&launch) {
+                tracing::info!(dir = %dir.display(), "elevated: WebView2 keeps its own data folder");
+                window = window.data_directory(dir);
+            }
+            let window = window.build()?;
+            if launch.after_elevation.is_some() {
+                let _ = window.set_focus();
+            }
+            Ok(())
+        })
         // FR-129 B1 — the window's own close button: whatever a Linux/macOS
         // daemon install left in the private scratch directory (an enrolled
         // system-scope config kept for a Retry) is shredded before the
@@ -143,6 +183,10 @@ fn main() {
             commands::cmd_privileged_half_done,
             // #3116 — the Welcome page's elevation gate.
             commands::cmd_system_context_needs_elevation,
+            // FR-129 C3 — "Restart as administrator", and what an elevated
+            // relaunch was handed.
+            commands::cmd_relaunch_elevated,
+            commands::cmd_launch_options,
         ])
         .run(tauri::generate_context!())
         .expect("error while running roomler-setup");

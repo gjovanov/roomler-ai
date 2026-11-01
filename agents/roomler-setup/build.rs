@@ -48,5 +48,11 @@ fn write_if_missing(path: &Path, bytes: &[u8]) {
 fn main() {
     write_if_missing(Path::new("icons/icon.ico"), PLACEHOLDER_ICO);
     write_if_missing(Path::new("icons/icon.png"), PLACEHOLDER_PNG);
+    // FR-129 C — the EXE's own imports come from System32, never from the
+    // folder it sits in, which is the person's Downloads: `main.rs` says why,
+    // and sets the same rule for what loads after this. MSVC's `link.exe` only.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bin=roomler-setup=/DEPENDENTLOADFLAG:0x800");
+    }
     tauri_build::build()
 }

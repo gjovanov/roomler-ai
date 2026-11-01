@@ -75,7 +75,7 @@
             <div>
               <strong>Reach others only — tunnel client</strong>
               <p class="muted">Installs the <code>roomler</code> CLI and enrolls it,
-              so this machine can forward ports through enrolled agents. No daemon.</p>
+              so this machine can forward ports through enrolled devices. No daemon.</p>
             </div>
           </label>
         </fieldset>
@@ -91,12 +91,19 @@
 
         <!-- #3116: on a reinstall the pre-logon service's config is in a
              folder only administrators may open, so a wizard that is not
-             elevated stops here, before a token is pasted or paired. -->
+             elevated stops here, before a token is pasted or paired.
+             FR-129 C3: the button is INSIDE the note, so it shows exactly
+             when the note does; it restarts the wizard through Windows'
+             administrator prompt with the role kept (cmd_relaunch_elevated). -->
         <div id="elevation-note" class="warning" hidden>
           <p>This device already has the background service, and its settings are
-          in a folder only administrators may open. To install it again, close
-          Roomler Setup, then right-click it and choose <strong>Run as
-          administrator</strong>. Or pick another option above.</p>
+          in a folder only administrators may open. To install it again, Roomler
+          Setup has to run as administrator: restart it that way (Windows asks you
+          to approve it once), or pick another option above.</p>
+          <footer class="actions">
+            <button id="elevation-relaunch" type="button">Restart as administrator</button>
+          </footer>
+          <p id="elevation-relaunch-status" class="muted" aria-live="polite" hidden></p>
         </div>
       </div>
 
@@ -254,7 +261,7 @@
            has no pairing. Live validation unchanged. -->
       <details id="paste-wrap" class="card">
         <summary id="paste-summary">I already have a token</summary>
-        <p class="muted" id="paste-lead">Paste a fresh enrollment token from Admin → Agents.</p>
+        <p class="muted" id="paste-lead">Paste a fresh enrollment token from the dashboard's Devices → Enroll → Device.</p>
         <label class="field">
           <span>Token</span>
           <textarea id="token-input" rows="4" autocomplete="off" spellcheck="false"
@@ -272,9 +279,9 @@
             <textarea id="root-token-input" rows="3" autocomplete="off" spellcheck="false"
                       placeholder="eyJhbGc..."></textarea>
             <small class="muted">On a Mac the private network runs in a second, root
-            service, enrolled as its own device with its own token — mint a second one in
-            Admin → Agents. Or untick the overlay network under Advanced options to install
-            screen sharing only.</small>
+            service, enrolled as its own device with its own token — mint a second one under
+            Devices → Enroll → Device. Or untick the overlay network under Advanced options to
+            install screen sharing only.</small>
           </label>
           <p id="root-token-status" class="muted" hidden></p>
         </div>
@@ -293,8 +300,8 @@
         <div id="token-warn-audience" class="warning" hidden>
           This is not a tunnel-enrollment token (token type is
           <code id="token-warn-aud-name"></code>). You'll get one from
-          <strong>Admin → Tunnels</strong>; the agent-enrollment token from
-          Admin → Agents is a different one.
+          <strong>Devices → Enroll → Tunnel client</strong>; a device's enrollment
+          token, from Devices → Enroll → Device, is a different one.
         </div>
         <div id="token-warn-expired" class="error" hidden>
           This token has already expired. Ask your admin to issue a new one.

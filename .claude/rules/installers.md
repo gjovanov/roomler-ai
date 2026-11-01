@@ -37,6 +37,19 @@ and cargo derives test-binary names from the **lib** crate, so wizard lib target
 must dodge those substrings (`wizard_app`, `wizard_shared`). The user-facing bin
 keeps the marketing name; `[[bin]] test = false` keeps `cargo test -p roomler-setup`
 off the UAC prompt.
+
+⚠️ **The wizard EXE loads DLLs from System32 alone.** It sits in the person's Downloads
+and the same image goes on to run elevated, so a DLL left beside it would load behind a
+UAC prompt naming our publisher. `restrict_dll_search()` is `main`'s first line and
+`build.rs` sets `/DEPENDENTLOADFLAG:0x800`: the first covers what loads later, the
+second the EXE's own imports, and neither does the other's job. A DLL shipped beside
+the EXE will not load.
+
+⚠️ **WebView2's browser process runs as the session's user, not as the wizard.** Under
+over-the-shoulder credentials an elevated wizard is the administrator and its browser
+the standard user, so the data folder must be one that user can open
+(`launch::elevated_webview_folder`). Otherwise the window stays white and goes away
+after about a minute (`docs/fr/FR-129-guided-cross-platform-installer.md`, C3).
 <!-- RETIRED-NAME-ANCHOR(2): these two directories were DELETED under their
      retired names. A history line has to name what actually existed; an
      earlier path sweep rewrote one of them into agents/roomler-cli-installer,

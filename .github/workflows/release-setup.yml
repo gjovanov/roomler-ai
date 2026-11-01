@@ -5,7 +5,8 @@ name: Release roomler-setup
 #   - Linux x86_64 (gtk + webkit2gtk) — packaged as `.tar.gz`
 #   - Linux aarch64 (the same, built on the arm64 runner; FR-97 P7b) — `.tar.gz`
 #   - macOS universal (x86_64 + aarch64 lipo'd) — packaged as `.tar.gz`
-#   - Windows x86_64 (msvc + webview2 auto-bootstrap) — SIGNED EXE in a `.zip`
+#   - Windows x86_64 (msvc + webview2 auto-bootstrap) — the SIGNED EXE itself
+#     (`.exe`, FR-129 C2) and the same EXE in a `.zip`
 #
 # The unified wizard superseded the two legacy wizard EXEs, retired
 # RETIRED-NAME-ANCHOR(3): names the two wizards RETIRED in P4c-2. A history line has to
@@ -25,7 +26,11 @@ name: Release roomler-setup
 # enforces it). The api's `/api/setup/<platform>` proxy
 # (routes/setup_release.rs) serves the published assets via its 1h cache;
 # `pick_setup_asset` requires the exact `roomler-setup-<v>-<triple>.<ext>`
-# names produced below (windows→.zip, linux→.tar.gz, macos→.tar.gz).
+# names produced below (windows→.exe, else .zip, and `?format=zip`→.zip;
+# linux→.tar.gz, macos→.tar.gz). ⚠️ A tag run executes this file as it
+# stood at the tag, so the Windows `.exe` asset first appears on the first
+# `setup-v*` cut after FR-129 C2 merged; until then the proxy keeps serving
+# the zip.
 #
 # Windows signing is REQUIRED (the wizard downloads MSIs + invokes
 # msiexec — corporate ESET/Defender quarantine an unsigned downloader
@@ -522,7 +527,8 @@ jobs:
           shared-key: setup-macos
 
   # ---------------------------------------------------------------------------
-  # 3. Windows x86_64 — SIGN the EXE, then zip it (pick_setup_asset wants .zip)
+  # 3. Windows x86_64 — SIGN the EXE, then publish it twice: as itself (what
+  #    `/api/setup/windows` serves, FR-129 C2) and zipped (`?format=zip`)
   # ---------------------------------------------------------------------------
   build-windows:
     name: Build wizard (Windows x86_64)
@@ -563,10 +569,11 @@ jobs:
         env:
           RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build -p roomler-setup --release
-      # Sign BEFORE zipping, so the EXE the operator extracts is the signed
-      # one. This is the artifact rc.28 BLOCKER-10 was about: a downloader
-      # that fetches MSIs and shells out to msiexec is exactly the shape
-      # corporate ESET/Defender quarantine when it has no publisher.
+      # Sign BEFORE zipping and staging, so both the EXE the operator
+      # downloads and the one they extract are the signed one. This is the
+      # artifact rc.28 BLOCKER-10 was about: a downloader that fetches MSIs and
+      # shells out to msiexec is exactly the shape corporate ESET/Defender
+      # quarantine when it has no publisher.
       - name: Sign the wizard EXE
         id: sign
         uses: ./.github/actions/sign-windows
@@ -605,6 +612,27 @@ jobs:
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File "$name.zip.sha256" -Encoding ascii
           "artifact=$name.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Stage the signed EXE
+        # FR-129 C2 — the SAME signed bytes the zip carries, published as an
+        # asset of their own: `/api/setup/windows` serves this EXE (the
+        # download the docs promise, "a signed EXE with a role picker") and
+        # keeps the zip for `?format=zip` (a proxy that refuses an EXE) and for
+        # every release that predates this step. Copied from the signed file
+        # after signing, and checked byte for byte against the zip's copy, so
+        # the two downloads can never be different programs. The publish job
+        # GPG-signs it and the attestation covers it, like every other asset.
+        id: exe
+        shell: pwsh
+        run: |
+          $name = "roomler-setup-$env:VERSION-x86_64-pc-windows-msvc.exe"
+          Copy-Item target\release\roomler-setup.exe $name
+          $inner = Join-Path $env:RUNNER_TEMP 'exe-vs-zip'
+          Expand-Archive -Path "${{ steps.zip.outputs.artifact }}" -DestinationPath $inner -Force
+          $a = (Get-FileHash $name -Algorithm SHA256).Hash
+          $b = (Get-FileHash (Join-Path $inner 'roomler-setup.exe') -Algorithm SHA256).Hash
+          if ($a -ne $b) { Write-Error "the staged EXE ($a) is not the zip's EXE ($b)"; exit 1 }
+          "$($a.ToLower())  $name" | Out-File "$name.sha256" -Encoding ascii
+          "artifact=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
       - name: Upload Windows wizard artifact
         uses: actions/upload-artifact@v4
         with:
@@ -612,6 +640,8 @@ jobs:
           path: |
             ${{ steps.zip.outputs.artifact }}
             ${{ steps.zip.outputs.artifact }}.sha256
+            ${{ steps.exe.outputs.artifact }}
+            ${{ steps.exe.outputs.artifact }}.sha256
           retention-days: 30
       - name: Publish cargo seed (rehearsals only)
         # After the signing step, and it builds nothing: it packs `target`
@@ -649,7 +679,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} release/ \;
+          # FR-129 C2: `*.exe` is the Windows wizard's own asset — the GPG step
+          # below signs it and the attestation covers it, as for the archives.
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.sha256' \) -exec cp {} release/ \;
           ls -la release/
       # GPG + provenance: same pattern as release-agent.yml -- .asc detached
       # signatures when the key is configured, SLSA provenance always.
@@ -707,7 +739,9 @@ jobs:
             [release-setup.yml](.github/workflows/release-setup.yml).
 
             **Download / run:**
-            - Windows x86_64: `.zip` containing a signed `roomler-setup.exe` — extract + double-click.
+            - Windows x86_64: the signed `.exe` — download + double-click (it is what
+              `roomler.ai/api/setup/windows` serves). The `.zip` holds the same signed EXE, for a
+              network whose proxy refuses an EXE download (`roomler.ai/api/setup/windows?format=zip`).
             - Linux x86_64: `.tar.gz` — extract, run `./roomler-setup`.
             - Linux aarch64: `.tar.gz` — extract, run `./roomler-setup`.
             - macOS universal (x86_64 + aarch64): `.tar.gz` — extract, then open `Roomler Setup.app`
@@ -716,7 +750,7 @@ jobs:
 
             **What the wizard does:** pick a role, detect existing installs, paste an enrollment token, and it
             resolves → downloads → verifies → installs → enrolls the node. On Windows the daemon roles
-            (be-accessed: perMachine-SCM / perUser / perMachine + SystemContext) run the agent MSI (which
+            (be-accessed: perMachine-SCM / perUser / perMachine + SystemContext) run the `roomlerd` MSI (which
             carries the `roomler` CLI); every OS offers the tunnel-client role (reach-others). A terminal
             equivalent is served at `roomler.ai/api/setup/install.sh` (Linux/macOS) and
             `roomler.ai/api/setup/install.ps1` (Windows).

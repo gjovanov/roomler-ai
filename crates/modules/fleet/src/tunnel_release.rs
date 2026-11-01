@@ -24,7 +24,6 @@ use axum::{
     response::Response,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 use roomler_core::ApiError;
 
@@ -124,11 +123,9 @@ pub async fn installer_proxy(
         ))
     })?;
 
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| ApiError::Internal(format!("reqwest client build: {e}")))?;
+    // FR-129 C2b — a connect and an idle-read bound, never a total deadline:
+    // the archive streams at the person's pace (`crate::asset_stream` says why).
+    let client = crate::asset_stream::client()?;
     let upstream = client
         .get(&asset.browser_download_url)
         .send()

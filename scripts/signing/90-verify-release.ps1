@@ -15,10 +15,13 @@
 #         the payload EXEs inside (extracted via an administrative install) --
 #         an MSI whose wrapper is signed but whose payload is not still drops
 #         unsigned binaries onto disk, which is what AV and AppLocker see
-#   .exe  chain, timestamp, subject
+#   .exe  chain, timestamp, subject (the setup wizard's own EXE asset since
+#         FR-129 C2 among them: it must also be byte-identical to the EXE
+#         inside the same release's zip)
+#   .zip  the EXEs inside: chain, timestamp, subject
 #   .pkg  reported only; run the .sh variant on a Mac for pkgutil/spctl
-#   *     GitHub build provenance attestation, and a .asc detached signature
-#         when one was published
+#   *     GitHub build provenance attestation, a .asc detached signature
+#         when one was published, and its .sha256 sidecar when one was
 #
 # Windows-only for the Authenticode half. Run 90-verify-release.sh on macOS
 # for the Gatekeeper half.
@@ -70,6 +73,10 @@ Ok "$($assets.Count) asset(s)"
 
 $failures = New-Object System.Collections.Generic.List[string]
 $notes    = New-Object System.Collections.Generic.List[string]
+# FR-129 C2 -- the setup wizard publishes one signed EXE twice: as its own
+# asset and inside the zip. Both hashes are kept to prove they are one program.
+$exeAssetHash = @{}   # asset name -> SHA-256 of a top-level .exe asset
+$zipInnerHash = @{}   # zip asset name -> SHA-256 of the roomler-setup.exe inside
 
 function Test-Authenticode {
     param([string]$Path, [string]$Label)
@@ -163,13 +170,21 @@ foreach ($a in $assets) {
                 }
             }
         }
-        '.exe' { Test-Authenticode -Path $a.FullName -Label 'EXE' }
+        '.exe' {
+            Test-Authenticode -Path $a.FullName -Label 'EXE'
+            $exeAssetHash[$a.Name] = (Get-FileHash $a.FullName -Algorithm SHA256).Hash
+        }
         '.zip' {
             $unzip = Join-Path $stage ("unzip-" + $a.BaseName)
             Expand-Archive -Path $a.FullName -DestinationPath $unzip -Force
             $inner = Get-ChildItem $unzip -Recurse -Include '*.exe' -File
             if ($inner.Count -eq 0) { Warn '  no EXE inside the zip'; $notes.Add("no EXE inside $($a.Name)") }
-            foreach ($f in $inner) { Test-Authenticode -Path $f.FullName -Label "inside $($a.Name)" }
+            foreach ($f in $inner) {
+                Test-Authenticode -Path $f.FullName -Label "inside $($a.Name)"
+                if ($f.Name -ieq 'roomler-setup.exe') {
+                    $zipInnerHash[$a.Name] = (Get-FileHash $f.FullName -Algorithm SHA256).Hash
+                }
+            }
         }
         '.pkg' {
             Warn '  macOS package -- run 90-verify-release.sh on a Mac for pkgutil / stapler / spctl'
@@ -178,6 +193,16 @@ foreach ($a in $assets) {
         default {
             Info '  no Authenticode expectation for this type'
         }
+    }
+
+    # The .sha256 sidecar, when one was published: what the server's health
+    # route and the docs tell people to compare against.
+    $sum = "$($a.FullName).sha256"
+    if (Test-Path $sum) {
+        $want = ((Get-Content $sum -Raw).Trim() -split '\s+')[0].ToLower()
+        $got  = (Get-FileHash $a.FullName -Algorithm SHA256).Hash.ToLower()
+        if ($want -eq $got) { Write-Host '      OK  .sha256 sidecar' -ForegroundColor Green }
+        else { $failures.Add(".sha256 sidecar does not match: $($a.Name)"); Write-Host '      SHA256 MISMATCH' -ForegroundColor Red }
     }
 
     # Detached GPG signature, when one was published alongside.
@@ -201,6 +226,22 @@ foreach ($a in $assets) {
     $ErrorActionPreference = $prev
     if ($attCode -eq 0) { Write-Host '      OK  build provenance attestation' -ForegroundColor Green }
     else { $notes.Add("no build provenance attestation for $($a.Name)") }
+}
+
+# FR-129 C2 -- the wizard's EXE asset and the EXE in its zip are one program.
+foreach ($exeName in $exeAssetHash.Keys) {
+    if ($exeName -notlike 'roomler-setup-*.exe') { continue }
+    $zipName = $exeName -replace '\.exe$', '.zip'
+    if (-not $zipInnerHash.ContainsKey($zipName)) {
+        $notes.Add("$exeName has no $zipName (with a roomler-setup.exe) to compare with")
+        continue
+    }
+    if ($exeAssetHash[$exeName] -eq $zipInnerHash[$zipName]) {
+        Write-Host "      OK  $exeName is the EXE inside $zipName" -ForegroundColor Green
+    } else {
+        $failures.Add("$exeName is not the EXE inside $zipName")
+        Write-Host "      DIFFERENT  $exeName vs the EXE inside $zipName" -ForegroundColor Red
+    }
 }
 
 Write-Host ''
