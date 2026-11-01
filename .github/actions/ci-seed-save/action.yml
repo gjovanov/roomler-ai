@@ -76,9 +76,13 @@ runs:
                -exec rm -rf {} + 2>/dev/null
           for sub in build .fingerprint deps; do
             [ -d "$prof/$sub" ] || continue
+            # macOS's default `split-debuginfo=unpacked` leaves <crate>-<hash>.<cgu>-cgu.N.rcgu.o
+            # beside a unit. The last dash in that name is not the one before the hash, so read
+            # it at the first: a crate name in `deps/` has none. FR-6 wave 38: ~600 MB a version.
             ls -1A "$prof/$sub" | awk -v L="$local_names" '
               BEGIN { while ((getline m < L) > 0) local[m] = 1 }
               { base = $0; i = match(base, /-[^-]*$/); if (i > 0) base = substr(base, 1, i - 1)
+                if ($0 ~ /\.rcgu\.o$/) base = substr($0, 1, index($0, "-") - 1)
                 if (base in local) print }' \
             | while IFS= read -r unit; do rm -rf "$prof/$sub/$unit"; done
           done
