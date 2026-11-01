@@ -64,6 +64,14 @@ The 0.4.84 roll found the cost of one child: a laptop's Intel media runtime died
 with `0xc0000005` on the first `vp9_qsv` 4:4:4 open and the daemon advertised
 **no hardware at all**. A dying 4:4:4 child now costs only the 4:4:4 forms.
 
+⚠️ **`base` is still one process, and it announces no opens** (#3267). AMD's
+driver from 32.0.21043 faults on `hevc_vulkan`, so a Radeon laptop lost its RTX
+5090's NVENC too, with `last_open` empty and a viewer that looked healthy. When a
+host advertises no hardware, read the WER event's faulting module, then run
+`roomlerd caps-probe` by hand with `ROOMLERD_CAPS_CHILD=1 ROOMLERD_CAPS_PHASE=base`
+and read its last line: that reproduces it in seconds. The session itself is no
+tell, because an MF H.264 session plays without the probe.
+
 ⚠️ **The child's stderr reaches no log on a service host.** It announces every
 open on stdout (`ROOMLER_CAPS_PROGRESS:<name>:yuv444`, line-buffered so it
 survives the crash) and the parent quotes the last one — *that* is the
@@ -122,8 +130,7 @@ lacking one (`with_av1_temporal_delimiter`), for every AV1 backend — **necessa
 not sufficient**: the repaired build still showed correct keyframes and corrupt
 inter frames, and the FFmpeg CLI's own `av1_vulkan` on the same GPU emits frames
 dav1d cannot parse. That is an FFmpeg 9.0.1 / NVIDIA driver defect with no
-roomler code in the loop, so `av1_vulkan:yuv420` is the built-in denylist's one
-4:2:0 entry.
+roomler code in the loop, so `av1_vulkan:yuv420` is on the built-in denylist.
 
 Diagnostic that attributed it in one run:
 `encoder-smoke --name <x> --dump <file>` + the FFmpeg CLI's dav1d.
@@ -143,6 +150,7 @@ rebuild.
 | **QSV** | 4:4:4 is packed **VUYX**, never planar (this is why the FR-77 P1 `vp9_qsv` 4:4:4 open failed). Profile (`rext` / `profile1`) set explicitly in the `base` tier. `hw: true` only on the oneVPL build (`qsv_is_hardware_by_construction`) |
 | **VAAPI** | Takes **hardware frames**; `encode/ffmpeg/vaapi.rs` holds the raw `ffmpeg_sys_next` calls. Device opens ONCE per process; each encoder gets a frame pool whose ref goes onto `hw_frames_ctx` **before** `open`. libva + libdrm are **bundled**, with **no `Depends`** — a `Depends: libva2` only holds where apt reaches a mirror, and the updater's offline `dpkg --install` replaces the binary *before* the dependency failure |
 | **D3D12 / Vulkan** | `dlopen`'d by FFmpeg itself — the vendor jobs assert **no link directive / DT_NEEDED**, so a host without them loses cells, never the daemon. Set `bf=0` (both default to `bf=2`). `rc_mode` constants are **UPPERCASE** for d3d12va (`VBR`), lowercase for Vulkan (`vbr`) |
+| **Media Foundation** | `ActivateObject`'s caller must end what it made, and a release does not: `HwMftCandidate`'s `Drop` calls `ShutdownObject`, or each open leaves 72 threads behind on a host with an AMD GPU. ⚠️ Candidates end when the cascade ends, **never between adapters**: until then `ActivateObject` returns the same instance, and a new one would change what wins (`docs/encoders.md`) |
 | **VideoToolbox** | macOS ships **no FFmpeg at all**. Wiring it needs BOTH the `*_videotoolbox` names in the tables **and** a re-run of `vendor-ffmpeg-macos.yml` — restoring the feature alone re-ships a dyld crash on every end-user Mac |
 
 ⚠️ **The OPEN decides the device** (`open_on_some_device`: preferred first, then

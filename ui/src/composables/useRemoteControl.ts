@@ -26,11 +26,13 @@ import {
 } from '@/utils/peerAuth'
 import { friendlyExtauthRefusal } from './useExternalLogin'
 import {
+  agentOffersDcTransport,
   cellCodecOfTransport,
   cellsFromCaps,
   rememberCellFailure,
   rememberedCellFailures,
   resolveChroma,
+  transportForSession,
 } from '@/composables/videoCells'
 import {
   bestClockSample,
@@ -3473,11 +3475,9 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
 } {
   const t = inputs.agentTransports
   const enc = inputs.agentHwEncoders
-  // Transport advertisement, with hw_encoders-derived fallback for agent
-  // rows saved before `transports` serialization existed.
-  const hasAv1Dc = t.includes('data-channel-av1') || enc.some((e) => e.startsWith('ffmpeg-av1_'))
-  const hasHevcDc = t.includes('data-channel-hevc') || enc.some((e) => e.startsWith('ffmpeg-hevc_'))
-  const hasVp9Dc = t.includes('data-channel-vp9-444') || enc.includes('libvpx-vp9-444-sw')
+  const hasAv1Dc = agentOffersDcTransport('data-channel-av1', t, enc)
+  const hasHevcDc = agentOffersDcTransport('data-channel-hevc', t, enc)
+  const hasVp9Dc = agentOffersDcTransport('data-channel-vp9-444', t, enc)
   const agentVp9Hw = enc.includes('ffmpeg-vp9_qsv')
   // P2 Ã¢ÂÂ transport-advertisement ONLY (no hw_encoders fallback like AV1/HEVC:
   // `ffmpeg-h264_*` entries and the transport shipped in the same release, so
@@ -10844,7 +10844,13 @@ export function useRemoteControl(
     const hevc444Remembered = remembered.has('hevc:yuv444')
     const vp9_444Remembered = remembered.has('vp9:yuv444')
     const h264_444Remembered = remembered.has('h264:yuv444')
-    if (videoTransport.value === 'auto') {
+    const sessionTransport = transportForSession(videoTransport.value, agent?.value?.capabilities)
+    if (sessionTransport !== videoTransport.value) {
+      console.info(
+        `[rc] ${videoTransport.value} not advertised by this agent — running the auto rank for this session.`,
+      )
+    }
+    if (sessionTransport === 'auto') {
       // rc.190 (A3) Ã¢ÂÂ HWÃÂHW auto-rank. A codec is only smooth when it's
       // hardware on BOTH ends (field: VP9 is SW-encoded on non-Intel
       // hosts; HEVC/AV1 can be SW-decoded on weak viewers). Cross the
@@ -10934,7 +10940,7 @@ export function useRemoteControl(
                 ? (h264_444Pick ? false : h264Hw)
                 : null
       console.info(`[rc] auto transport Ã¢ÂÂ ${pick.transport ?? 'webrtc'} (${pick.reason})`)
-    } else if (videoTransport.value === 'data-channel-h264') {
+    } else if (sessionTransport === 'data-channel-h264') {
       // P2 Ã¢ÂÂ explicit H.264 pick. Prefer the DC + WebCodecs pipeline when
       // BOTH ends support it: the agent must advertise the transport (old
       // agents don't Ã¢ÂÂ the legacy RTP track + <video> is exactly what they
@@ -10984,7 +10990,7 @@ export function useRemoteControl(
             : '[rc] data-channel-h264 not advertised by this agent Ã¢ÂÂ using the legacy RTP track.',
         )
       }
-    } else if (videoTransport.value === 'data-channel-av1') {
+    } else if (sessionTransport === 'data-channel-av1') {
       // rc.190 Ã¢ÂÂ explicit AV1 pick. Chromium always has dav1d SW decode,
       // so gate only on decodability; the badge surfaces HW vs SW truth.
       const decodable = av1Supported.value || (await probeAv1Dec())
@@ -11001,7 +11007,7 @@ export function useRemoteControl(
           '[rc] preferred_transport=data-channel-av1 dropped Ã¢ÂÂ WebCodecs AV1 decode unsupported here. Falling back to webrtc.',
         )
       }
-    } else if (videoTransport.value === 'data-channel-vp9-444') {
+    } else if (sessionTransport === 'data-channel-vp9-444') {
       const supported = vp9_444Supported.value || (await probeVp9_444())
       vp9_444Supported.value = supported
       // #2231 — profile 0 only (Firefox): the DataChannel still runs, at 4:2:0.
@@ -11031,7 +11037,7 @@ export function useRemoteControl(
           '[rc] preferred_transport=data-channel-vp9-444 dropped Ã¢ÂÂ VideoDecoder.isConfigSupported(vp09.01.10.08) returned false. Falling back to webrtc.',
         )
       }
-    } else if (videoTransport.value === 'data-channel-hevc') {
+    } else if (sessionTransport === 'data-channel-hevc') {
       // rc.78 Ã¢ÂÂ HEVC over DataChannel (Option B). rc.186 Ã¢ÂÂ require
       // HARDWARE + real-time-smooth decode, not just "decodable":
       // `isConfigSupported` returns true even for software / too-slow HEVC,
@@ -11080,7 +11086,10 @@ export function useRemoteControl(
         vp9_444Supported.value = profile1
         // #2231 — this fallback always runs at 4:2:0, so profile 0 is enough.
         const vp9Ok = profile1 || (await probeVp9_420())
-        const fallback = vp9Ok && !failedDcTransports.has('data-channel-vp9-444')
+        // #3167 — a fallback the agent does not offer is the same black session.
+        const fallback = vp9Ok
+          && !failedDcTransports.has('data-channel-vp9-444')
+          && transportForSession('data-channel-vp9-444', agent?.value?.capabilities) !== 'auto'
         if (fallback) {
           console.info(
             decodable

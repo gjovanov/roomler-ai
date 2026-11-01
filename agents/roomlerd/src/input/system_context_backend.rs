@@ -20,10 +20,10 @@
 //!    enigo's lazy keyboard-layout cache (HKL) is loaded against the
 //!    right desktop's window-station ACL.
 //! 4. Re-runs `try_change_desktop` before every inject. The cost is
-//!    one `OpenInputDesktop` syscall (microseconds); cheap enough at
-//!    1000+ events/s during fast typing. `try_change_desktop` is
-//!    self-deduping — only fires `SetThreadDesktop` when the input
-//!    desktop actually differs from the thread's current binding.
+//!    a few syscalls (microseconds); cheap enough at 1000+ events/s
+//!    during fast typing. `try_change_desktop` rebinds on every call,
+//!    even to the same desktop, so the thread always holds the rights
+//!    of a fresh handle (its own comment says why).
 //!
 //! ## Why a dedicated thread
 //!
@@ -171,8 +171,8 @@ impl SystemContextInjector {
 }
 
 /// Worker loop. Receives `InputMsg` commands; rebinds the thread's
-/// desktop on each one (cheap; self-deduping); dispatches via the
-/// shared enigo dispatcher.
+/// desktop on each one (cheap); dispatches via the shared enigo
+/// dispatcher.
 fn run_worker(mut enigo: Enigo, rx: std_mpsc::Receiver<Job>) {
     let mut events_since_log: u64 = 0;
     let mut consec_dispatch_errors: u64 = 0;

@@ -751,7 +751,7 @@ sequenceDiagram
   off; the legacy `ROOMLER__SETUP__WIZARD_UNIX_DAEMON` turns Linux and macOS
   on together). One helper decides it for the Welcome cards, the Server page
   and the pipeline (`SetupFeatures::daemon_offered`,
-  `agents/roomler-setup/src/features.rs:77-79`). The server is picked after the role, so the
+  `agents/roomler-setup/src/features.rs:77-83`). The server is picked after the role, so the
   Server page asks again when the URL changes and the pipeline once more before
   it installs.
 - **On production, both OSes since 2026-10-30 (22:33Z).** The deploy repo's
@@ -788,7 +788,9 @@ sequenceDiagram
   end is not run again (no second password), and a system scope is not enrolled
   twice with a token already spent.
 - **A missing digest is an error here**, where the terminal path only warns:
-  a GUI that elevated to root places nothing it cannot verify (AC12).
+  a GUI that elevated to root places nothing it cannot verify (AC12). A system
+  scope has enrolled by then, so the refusal leaves an offline device row and a
+  spent token on the server, and Retry reuses them.
 - **The token never leaves the wizard's process** — not in argv, a URL or a
   line. A system scope enrolls *before* the prompt into a private file the half
   places root-owned 0600; the file is shredded once placed, kept for a Retry
@@ -1040,7 +1042,7 @@ flowchart TB
 | A session on `<name>-daemon` | no pixels: the agent logs `no_display` | delegated to the worker: pixels and input |
 | What `<name>-daemon` reports | `no-gui-session` | the worker's permissions, on the next heartbeat; `no-gui-session` again within a heartbeat of the worker leaving |
 | A package update | keeps the LaunchAgent | removes it and keeps the worker (`postinstall`) |
-| The GUI half killed | launchd restarts it | the supervisor respawns it; the control WS stays up |
+| The GUI half killed | launchd restarts it | the supervisor respawns it within about 6 s; the control WS stays up |
 | Nobody logged in | `<name>` offline, `<name>-daemon` online on the mesh | the same |
 
 ⚠️ **On a supervised Mac, don't delete the `<name>` row as a duplicate.** The worker
