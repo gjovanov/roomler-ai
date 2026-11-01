@@ -298,6 +298,12 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_keep_busy_support(agent_id, supports_keep_busy);
+    // FR-132 P1b — whether a saved desired config can be pushed to it. Before
+    // the row read below, so a save that finds this unset is one that read
+    // carries. Equality-matched through `has_rpc`.
+    state
+        .rc_hub
+        .set_agent_config_support(agent_id, caps.has_rpc(RpcCap::Config));
     state.rc_hub.set_agent_hive_support(agent_id, runs_hive);
     state
         .rc_hub
@@ -407,17 +413,19 @@ pub async fn handle_agent_socket(
         let _ = registered_tx.try_send(ServerMsg::RelayRegions { regions, rev });
     }
 
-    // Remote config (docs/remote-config.md) — RECONCILE-ON-CONNECT is the only
-    // delivery path, deliberately: a device that was offline for a week and one
-    // that was online when an admin hit save converge through the same code,
-    // so the offline case is exercised on every connect rather than only when
-    // nobody is watching.
+    // Remote config (docs/remote-config.md) — RECONCILE-ON-CONNECT is what a
+    // device converges by, deliberately: a device that was offline for a week
+    // and one that missed a save converge through the same code, so the offline
+    // case is exercised on every connect rather than only when nobody is
+    // watching. FR-132 P1b — a save also nudges a connected device with this
+    // same frame (`remote_config::set_desired_config`), through the same hub
+    // call, which keeps the two from racing. A nudge that is lost costs nothing
+    // but the wait for this one.
     if let Some(desired) = desired_config {
         if caps.has_rpc(RpcCap::Config) {
-            let _ = registered_tx.try_send(ServerMsg::ConfigPush {
-                revision: desired.revision,
-                desired,
-            });
+            let _ = state
+                .rc_hub
+                .push_desired_config(agent_id, tenant_id, desired);
         } else {
             // Unlike `Goodbye`/`UpdateNow`, this one must not be sent blind.
             // A pre-feature agent drops the unknown tag in its `debug!` branch

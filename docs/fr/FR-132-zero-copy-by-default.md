@@ -1,7 +1,7 @@
 # FR-132: Zero-copy by default — each GPU-input cell turns on for the fleet after a clean week of its own
 
 **Issue:** [#3141](https://github.com/gjovanov/roomler-ai/issues/3141) · **Status:** P1 released in 0.4.191 on 2026-10-31;
-the four decisions taken 2026-10-30 (§6); proposed 2026-10-30 · **Owner:** the agent's capture and encode path, and
+the decisions taken 2026-10-30 and 2026-10-31 (§6); proposed 2026-10-30 · **Owner:** the agent's capture and encode path, and
 remote config · **Anchors:** master `01520c8af` (§2); the as-built notes in §3a and §3b, master `ff29120ed` + P1 ·
 **Takes over:** [FR-118](FR-118-gpu-resident-frames.md) open decision 2 (the default) · **Builds on:**
 [FR-118](FR-118-gpu-resident-frames.md) (the GPU-input cells), [FR-77](FR-77-encoder-chroma-matrix.md) (cells, the
@@ -88,6 +88,21 @@ Decision 1 is held by `the_device_owned_refusals_are_not_pushable`, which compar
 (`crates/remote_control/src/models.rs:9530`). The dialog gets the field, and
 [`remote-config.md`](../remote-config.md) §6 the key, with its value table.
 
+**P1b, the push reaches a connected device.** AC2's field run (§8) showed what the push cost a kill switch: reconcile
+on connect was the only delivery path, so a device that stayed connected never heard it, and the deny sat undelivered
+for 71 minutes. A save now nudges a connected device with the same frame, from the pod that holds its socket or over
+the rc ctrl lane (decision 5). That is the nudge [`remote-config.md`](../remote-config.md) §6 always described.
+Reconcile on connect stays what a device converges by, so a lost nudge costs only the wait for the next connect, and
+nothing about a save restarts a daemon. The device has no revision check of its own, so one hub call sends every
+`rc:agent.config` and never gives a connection a revision at or below one it carried.
+
+**P1c, `needs_restart` stays true.** Reading P1b's code found a false `applied`. A report is last-write-wins, and
+`apply` compares the desired value with the FILE, so once a value is written, any later frame on any reconnect answers
+`noop` and the row reads `applied`, though the daemon still runs the old value. A pod roll does that to a whole fleet,
+and a kill switch that says it is in force when it is not is worse than a slow one. The server cannot tell a reconnect
+from a restart, since no process identity crosses the wire, so this is the agent's to fix: a key stays in
+`needs_restart` until the running process holds the value.
+
 ### 3b. Decode errors become countable (P1)
 
 The viewer sends one control message per decode error, with the stage that failed (configure, decode, the pipe),
@@ -148,6 +163,9 @@ the flip on every host that runs the cell, canary or not.
 |---|---|---|---|
 | P0 | The red record: a fleet week of heartbeats read per cell (encoder × capture arm), counting the sessions that could have opened a GPU form and read `switch_off`, and naming the hosts that run each cell | — | **done 2026-10-30** (§8, AC1) |
 | P1 | 3a and 3b: `zero_copy_deny` in `DesiredConfig` and the agent's `apply`; the viewer's decode-error message and its count in `rc:session.stats` | the push is absent (no change); a viewer without the message sends nothing | **built 2026-10-30, released 2026-10-31** ([#3154](https://github.com/gjovanov/roomler-ai/pull/3154), in 0.4.191 and `hosted-20261031-28dfd72`). 3a: `MANAGE_AGENTS` alone, passed on unread, written by the device with `needs_restart`, end to end in `agent_tests` (AC2's integration half). 3b: `rc:decode-error` per error before the fallback, `de: 1` on every `rc:decodestat`, `decode_errors` on `rc:session.stats` (absent = not counted), the first `de` and the first eight errors sent at once, end to end through a real agent and viewer peer in `session_decode_errors_tests` (AC3's integration half). The field halves of AC2 and AC3 are met (§8) |
+| P1b | 3a: a save nudges a connected device with the same frame, and one hub call sends every `rc:agent.config` | the previous image: the connect path never left, so a device still converges | in progress |
+| P1c | 3a: `needs_restart` holds until the daemon runs the value | the previous agent: a reconnect reads `applied` again | not started |
+| P1d | 3d: `rc:session.stats` carries the encoder, the capture arm and the input form (decision 8) | absent from an older agent, and the week reads the heartbeats | not started |
 | P2 | 3c: the three-valued reading, the default list (empty), `default_off`, at both entry points | `zero_copy = off`; the list empty | not started |
 | P3 | QSV: the canary week, then the flip (if open decision 4 orders it first) | `zero_copy_deny` pushed; the cell off the list in the next release | not started |
 | P4 | NVENC on the WGC arm: the same | the same | not started |
@@ -172,6 +190,13 @@ the flip on every host that runs the cell, canary or not.
   and the per-frame saving FR-118 measured for the cell.
 - [ ] **AC7 (docs):** `docs/encoders.md` (the default per cell and the record of each flip), `docs/remote-config.md`
   (the pushable deny list) and `docs/remote-control.md` §5.1f, with a row in `docs/README.md`'s index.
+- [ ] **AC8 (the switch's reach):** a `zero_copy_deny` saved for a connected device reports `needs_restart` within
+  seconds, with no reconnect, whichever pod takes the save; a device offline at the save converges on connect; and a
+  connection never receives a revision after a newer one. Integration-tested, and seen in the field.
+- [ ] **AC9 (`needs_restart` is true):** a reconnect without a restart leaves the row on `needs_restart`, and it reads
+  `applied` only once the daemon runs the value. Tested, and seen in the field.
+- [ ] **AC10 (the week's source):** a session's `rc:session.stats` names its encoder, capture arm and input form on an
+  agent that sends them, and they are absent on one that does not. Seen in the field.
 
 ## 6. Decisions
 
@@ -189,6 +214,22 @@ All four were decided by the operator on 2026-10-30, each as recommended
    floor of one event in the week, since a single host's week can be all zeros.
 4. **The order of the flips.** **Decided: by the hosts each cell covers**, read from P0. QSV is likely first: every
    QSV host captures through the DXGI arm (FR-118 §9, 2026-10-27).
+
+The next four were decided by the operator on 2026-10-31, each as recommended.
+
+5. **Should a save reach a connected device, or wait for its next reconnect?** **Decided: reach it.** A kill switch
+   that waits for a socket to drop is not much of a switch (§8). The server sends the same frame on a save, and
+   restarts stay out of its hands ([`remote-config.md`](../remote-config.md) §7b).
+6. **The canary hosts, by decision 2's rule.** **Decided:** QSV on CORPLAP-1 and CORPLAP-3. NVENC on NEO16, in a window
+   its owner agrees to, and on CORPLAP-2 as a negative canary, whose SystemContext DXGI arm should read
+   `adapter_mismatch`. VideoToolbox on MacBook-1. Each starts with a CPU week, because decode errors are counted only
+   from 0.4.191.
+7. **Should the probe prove a GPU form on a host with the switch off**, so the fleet knows which hosts hold a proven
+   cell before any of them runs one? **Decided: no.** A canary's own week proves its cell, and P0's list is enough to
+   pick the canaries.
+8. **Where a canary week is read from.** **Decided: an extended `rc:session.stats`**, with the encoder, the capture arm
+   and the input form on it. The heartbeat carries no capture arm, and a week read per session from `remote_sessions`
+   does not depend on a grep of `agent_logs`.
 
 ## 7. Out of scope
 

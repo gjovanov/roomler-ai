@@ -543,8 +543,9 @@ export type RemoteConfigState =
   | 'refused'
   /** The device tried and failed; `report.detail` says why. */
   | 'failed'
-  /** Waiting on the device to answer about THIS revision (includes "it has
-   *  not reconnected yet" — delivery is reconcile-on-connect). */
+  /** Waiting on the device to answer about THIS revision. A connected device
+   *  answers within seconds; an offline one when it next connects, which is
+   *  how every device converges (reconcile-on-connect). */
   | 'pending'
   /** The agent applies pushed config but predates `config-report`, so it will
    *  never say what it did. Distinct from `pending` because waiting is futile
@@ -1774,9 +1775,10 @@ export const useAgentStore = defineStore('agents', () => {
 
   /** Record the device config an operator wants (`docs/remote-config.md`).
    *
-   *  This writes an INTENT, never a fact. The device reconciles it when it
-   *  next connects and is free to refuse — so the response must NOT be read
-   *  back as "this device now has exec on". Re-fetch and read
+   *  This writes an INTENT, never a fact. A connected device hears at once,
+   *  an offline one when it next connects, and either is free to refuse — so
+   *  the response must NOT be read back as "this device now has exec on".
+   *  Re-fetch and read
    *  `remote_config.state` for that; until the device answers, the honest
    *  answer is `pending`.
    *

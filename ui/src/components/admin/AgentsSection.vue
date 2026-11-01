@@ -1116,7 +1116,7 @@
     v-model="remoteConfigDialogOpen"
     :tenant-id="tenantId"
     :agent="remoteConfigTarget"
-    @saved="agentStore.fetchAgents(tenantId); fetchGrid()"
+    @saved="onRemoteConfigSaved"
   />
 
   <!-- FR-40 — rotate-overlay-key confirmation -->
@@ -2270,6 +2270,20 @@ const remoteConfigTarget = ref<Agent | null>(null)
 function openRemoteConfig(a: Agent) {
   remoteConfigTarget.value = a
   remoteConfigDialogOpen.value = true
+}
+
+/** How long after a save the row is read again. A connected device answers
+ *  within a second or two, after the read the save itself triggers, so without
+ *  a second read the row would say `pending` until the next page load. */
+const REMOTE_CONFIG_ANSWER_MS = 3000
+
+function onRemoteConfigSaved() {
+  const refresh = () => {
+    agentStore.fetchAgents(props.tenantId)
+    fetchGrid()
+  }
+  refresh()
+  window.setTimeout(refresh, REMOTE_CONFIG_ANSWER_MS)
 }
 
 /** The row badge for a device with a pending / refused / failed config
