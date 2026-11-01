@@ -994,6 +994,7 @@ mod tests {
         let off = SetupFeatures::default();
         let on = SetupFeatures {
             pairing: true,
+            pairing_off: false,
             wizard_linux_daemon: true,
             wizard_macos_daemon: true,
             wizard_unix_daemon: true,

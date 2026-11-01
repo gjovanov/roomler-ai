@@ -143,6 +143,7 @@ const state = {
                        // here — see src/pairing.rs.
     phase: "idle",     // idle | starting | waiting | approved | ended
     unavailableFor: null, // the server whose start answered 404: paste only
+    offerReadFor: null,   // the server readPairingOffer asked already
     userCode: null,    // "BCDF-GHJK"
     uri: null,         // the page to open; carries no code
     expiresAt: 0,      // Date.now() ms when the code runs out
@@ -352,10 +353,31 @@ async function gotoStep(name) {
   // caller's decision — Back cancels it, a paired Install keeps it for
   // cmd_install — but the timer stops on every step change, whoever made it.
   if (name !== "token" && state.pair.ticker) stopPairingLoop();
+  if (name === "token") await readPairingOffer();
   state.step = name;
   state.pageEnteredAt = performance.now();
   await persistState();
   render();
+}
+
+// AC10: a server that says it has no pairing never shows the card. Only its
+// own word hides it: a blink of the network or an older server leaves the card
+// up, and the start's 404 decides, as it always has. Once per server.
+async function readPairingOffer() {
+  const p = state.pair;
+  const server = state.server;
+  if (p.offerReadFor === server || !/^https?:\/\/[^\s]+$/i.test(server)) return;
+  p.offerReadFor = server;
+  let view;
+  try {
+    view = await invoke("cmd_setup_features", { server });
+  } catch (err) {
+    console.warn("[features] not read:", err);
+    return;
+  }
+  if (server !== state.server || view.pairingOff !== true) return;
+  p.unavailableFor = server;
+  if (state.step === "token") render();
 }
 
 // ─── FR-102 P3b: opt-in setup diagnostics ──────────────────────────────────
@@ -935,6 +957,7 @@ function rootTokenProblem() {
 }
 
 function renderToken() {
+  readPairingOffer(); // a run resumed on this page never came through gotoStep
   renderPairing();
 
   // The paste path's role-specific hint (the whole page's lead before
