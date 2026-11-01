@@ -253,8 +253,9 @@ shipped in `0.4.190`: an older agent says no goodbye, and an older CLI has no
 
 ### 3.8 Seen in the field
 
-On production, on the released `0.4.190`, on Linux only. **The Windows and macOS
-hooks have not run in a field test yet.** The full record is in the
+On production: Linux driven by hand on the released `0.4.190`, Windows from real
+laptops' own sleeps on `0.4.190`–`0.4.195`. **The macOS hook has not run in a field
+test yet.** The full record is in the
 [spec's field log](fr/FR-55-always-reachable.md#field-verification-log).
 
 | the read | what it showed |
@@ -262,6 +263,7 @@ hooks have not run in a field test yet.** The full record is in the
 | a real suspend on a desktop guest, `never`, 3 of 3 | the goodbye in the same second as `PM: suspend entry`, `sleep` on both admin routes, `◌ … asleep` in a peer's `roomler devices`, and the chip on an open dashboard page turning `asleep` within 3 s with no reload. `online` 1 s after the wake |
 | the same with no delay inhibitor on the host | 7 goodbyes written. All 4 suspends whose row was read arrived as `asleep`; the other 3 went unread |
 | the same device with its link taken down | nothing said, `online` until the server's 2:00 receive deadline, then plain `offline` with no `sleep`, never `asleep` |
+| three Windows laptops nobody staged, 7 days of `agent_logs` | 11 goodbyes, each uploaded after its wake. One laptop asleep at the read, with `sleep` on its row 29 ms before its `last_seen_at`: policy `never`, on mains, nothing held. The chip was not read by eye on a Windows row |
 
 ## 4. What this does not cover
 
