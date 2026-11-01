@@ -63,6 +63,9 @@ pub mod synthetic_backend;
 /// slot-first (look, and pace only a source that outruns the target).
 pub mod gate;
 
+/// #3272 — the pump's side of [`ScreenCapture::next_frame`]'s contract.
+pub mod pace;
+
 /// FR-119 P2b-3 — the captured display's refresh rate, per OS.
 pub mod refresh;
 
@@ -495,7 +498,31 @@ pub fn readback_window_ms(now: (u64, u64), base: (u64, u64)) -> f64 {
 
 #[async_trait::async_trait]
 pub trait ScreenCapture: Send {
+    /// The next frame, or `Ok(None)` when none arrived.
+    ///
+    /// #3272 — the contract:
+    /// - **The backend owns its pace.** A pump loops straight back on an
+    ///   `Ok(None)` and sleeps on nothing. So an `Ok(None)` comes after a bounded
+    ///   wait for a frame (an event, a timer, an acquire with a timeout), not at
+    ///   once. WGC, the portal, scrap and DRM wait in here.
+    /// - **The wait is bounded.** A pump reads its keepalive, its teardown and
+    ///   its pending settings between calls, so nothing here waits for long.
+    /// - **Stray instant empties are fine.** A pull backend's next ask can be
+    ///   already due after a slow encode, and the ask after it sleeps. A stream
+    ///   of them is a spin: [`pace::EmptyGuard`] warns once and floors each.
+    ///
+    /// ⚠️ One backend meets this only when asked: the SYSTEM-context capture,
+    /// through [`Self::pace_capture`]. The two DataChannel pumps do not ask, and
+    /// sleep on an empty themselves. FR-98 C7 moves them over and deletes the
+    /// opt-in.
     async fn next_frame(&mut self) -> Result<Option<Frame>>;
+
+    /// #3272 — hold this capture to [`Self::next_frame`]'s contract, and to its
+    /// target rate where nothing else holds it (GDI). Called once after an open,
+    /// by the RTP pump only. The default does nothing, and every backend but the
+    /// SYSTEM-context one already keeps the contract.
+    fn pace_capture(&mut self) {}
+
     fn monitor_count(&self) -> u8;
     /// HW-downscale Phase B — the pump's CURRENT effective encode box
     /// (aspect-preserved, even dims), so a GPU-capable backend can scale

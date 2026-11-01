@@ -2681,12 +2681,21 @@ async fn media_pump(
         target_fps,
         "media pump starting"
     );
+    // #3272 — read once per pump (FR-70). On, this pump's capture keeps
+    // `next_frame`'s contract and the guard below watches it. Off is the kill
+    // switch for the first release: the capture spins as it did. The DC pumps
+    // do not ask yet (FR-98 C7).
+    let pace_capture = capture::pace::rtp_capture_wait_enabled();
+    let mut empty_guard = capture::pace::EmptyGuard::new(pace_capture);
     let mut capturer = capture::open_default_async(
         target_fps,
         downscale,
         media_waiting_hook(session_id, control_dc.clone()),
     )
     .await;
+    if pace_capture {
+        capturer.pace_capture();
+    }
     // FR-80 — a capturer that cannot capture says so, and the controller is
     // told once, here, instead of the operator reading a stall. Every real
     // backend answers `None`, so a healthy session sends nothing.
@@ -2763,6 +2772,8 @@ async fn media_pump(
     // stall in capture or encode is indistinguishable from a working pump.
     let mut frames_captured: u64 = 0;
     let mut frames_empty: u64 = 0;
+    // #3272 — when the idle line was last written.
+    let mut idle_line_at = std::time::Instant::now();
     // FR-29 P2 — damage observability. Without these the backend can report
     // perfect dirty rects and nothing on the host can tell: both would-be
     // consumers (`set_roi_hints`, `note_real_frame_area`) are inert today, so
@@ -2852,6 +2863,7 @@ async fn media_pump(
                 frames_captured += 1;
                 last_capture_at = std::time::Instant::now();
                 capture_wait.on_frame();
+                empty_guard.on_frame();
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
                 // FR-101 P4b-2 — a real capture, never a keepalive: the idle limit's
@@ -2861,6 +2873,7 @@ async fn media_pump(
             }
             Ok(None) => {
                 frames_empty += 1;
+                let empty_took = capture_started.elapsed();
                 // FR-93 P3e — the display is off (P5f: this user's session is
                 // in the background): the controller is told, and no keepalive
                 // re-encodes the last frame (a decoded frame would clear the
@@ -2876,10 +2889,19 @@ async fn media_pump(
                     tokio::task::yield_now().await;
                     continue;
                 }
-                // Log every ~5s worth of empty polls so an idle desktop is
-                // visible without flooding. DXGI only fires on screen change,
-                // so this can spike briefly then settle.
-                if frames_empty.is_multiple_of(150) {
+                // #3272 — a backend that answers at once breaks `next_frame`'s
+                // contract: it costs a warning and 2 ms, not a core.
+                let owed = empty_guard.on_empty(empty_took, capturer.backend());
+                if !owed.is_zero() {
+                    tokio::time::sleep(owed).await;
+                }
+                // #3272 — every 5 s of time. It used to count empties, so the
+                // line ran as fast as the capture did: 362 lines a second on a
+                // spinning host, which crowded the heartbeats out of the log
+                // uploader.
+                let now = std::time::Instant::now();
+                if capture::pace::idle_line_due(idle_line_at, now) {
+                    idle_line_at = now;
                     // FR-29 — this log is now the ONLY periodic signal an idle
                     // Linux host emits. The media heartbeat fires per 30
                     // ENCODED frames, and once the damage tracker starts
@@ -2934,6 +2956,10 @@ async fn media_pump(
                     match end_stopped_at_screen(session_id, &rc_sessions, None).await {}
                 }
                 warn!(%session_id, %e, "capture error — rebuilding capturer");
+                // #3272 — let go first: a capture thread still holding the
+                // output's duplication is what makes the new open answer
+                // 0x80070057, and that open would land on GDI for 5 s.
+                drop(capturer);
                 tokio::time::sleep(reopen_backoff.delay()).await;
                 capturer = capture::open_default_async(
                     target_fps,
@@ -2941,6 +2967,9 @@ async fn media_pump(
                     media_waiting_hook(session_id, control_dc.clone()),
                 )
                 .await;
+                if pace_capture {
+                    capturer.pace_capture();
+                }
                 // Force the encoder to rebuild on the next frame — new
                 // capturer may come back at a different resolution (e.g.
                 // after a DPI change) and openh264 can't be resized
@@ -3026,12 +3055,29 @@ async fn media_pump(
                 codec = %chosen_codec,
                 "initialising encoder for frame dims"
             );
-            let (enc, actual) = encode::open_for_codec(
-                &chosen_codec,
-                frame.width,
-                frame.height,
-                encoder_preference,
-            );
+            // #3272 — off the runtime worker, as the FFmpeg DC pump's open is
+            // (FR-65, which says why at length). The cascade waits on each
+            // candidate's worker: about 0.6 s a go, several times a session,
+            // half the runtime on a 2-vCPU host. The session has nothing to do
+            // in the meantime, and overlay, DERP and the control socket do.
+            let (enc, actual) = {
+                let codec = chosen_codec.clone();
+                let (w, h) = (frame.width, frame.height);
+                match tokio::task::spawn_blocking(move || {
+                    encode::open_for_codec(&codec, w, h, encoder_preference)
+                })
+                .await
+                {
+                    Ok(opened) => opened,
+                    // The blocking pool panicked or was shut down: an encoder
+                    // that ships nothing, which the shout below names.
+                    Err(e) => {
+                        warn!(%session_id, %e, "encoder open task failed");
+                        let noop: Box<dyn encode::VideoEncoder> = Box::new(encode::NoopEncoder);
+                        (noop, "noop")
+                    }
+                }
+            };
             if actual != chosen_codec {
                 // Runtime demotion (e.g. HEVC cascade failed at actual
                 // dims despite enumeration passing). The track was
@@ -3195,16 +3241,16 @@ async fn media_pump(
                         new_fps,
                         codec = %chosen_codec,
                         encoder = enc_ref.name(),
-                        "auto-fps-cap: SW backend at >30 fps target — rebuilding capturer at 30 fps to clear the capture-bottleneck drop rate"
+                        "auto-fps-cap: SW backend at >30 fps target — moving the capture to 30 fps to clear the capture-bottleneck drop rate"
                     );
                     target_fps = new_fps;
                     frame_duration_floor = Duration::from_micros(1_000_000 / target_fps as u64);
-                    capturer = capture::open_default_async(
-                        target_fps,
-                        downscale,
-                        media_waiting_hook(session_id, control_dc.clone()),
-                    )
-                    .await;
+                    // #3272 — in place, as the DC pumps move it on an FR-119 grant.
+                    // This used to be a reopen, which ran while the old capturer
+                    // still held the output: `DuplicateOutput` answered
+                    // 0x80070057, and 15 of 16 sessions in a day spent their
+                    // first 5 s on GDI.
+                    capturer.set_target_fps(new_fps);
                 }
 
                 // rc.38 — when auto-downscale changes target_resolution
@@ -3233,6 +3279,14 @@ async fn media_pump(
                         %session_id,
                         "auto-downscale fired on first encoder build — dropping native-dim encoder so the track's first frame is at the downscaled dims (avoids browser videoWidth resize race)"
                     );
+                    // #3272 — and re-feed this picture on the next empty. Nothing
+                    // else would bring one: on a still screen a capture has no
+                    // new frame, and the keepalive is a second away. The reopen
+                    // this branch used to fall through to re-delivered it by
+                    // accident (a new duplication, or GDI).
+                    last_capture_at = std::time::Instant::now()
+                        .checked_sub(IDLE_KEEPALIVE)
+                        .unwrap_or(last_capture_at);
                     continue;
                 }
             }
@@ -6540,12 +6594,12 @@ async fn media_pump_ffmpeg_dc(
     const STALE_FRAME_SKIPS: u32 = 3;
     let mut stale_skips_left: u32 = 0;
     // rc.93 — single keepalive clock, mirroring `media_pump`. The rc.92
-    // pacing clock + pump-side floor sleep were REMOVED: the capture
-    // backend is the single pacer (scrap sleeps to `1000/target_fps`;
-    // SystemContext capture delivers at display rate), so a second
-    // pump-side floor just halved fps and amplified idle Nones — that was
-    // the real vp9_qsv ~15 fps bug (rc.92's timer theory was a red herring;
-    // timeBeginPeriod(1) landed but didn't move fps).
+    // pacing clock + pump-side floor sleep were REMOVED: a floor on every
+    // frame just halved fps and amplified idle Nones — that was the real
+    // vp9_qsv ~15 fps bug (rc.92's timer theory was a red herring;
+    // timeBeginPeriod(1) landed but didn't move fps). rc.99 put a sleep back
+    // on the EMPTIES alone, because the SystemContext capture does not pace
+    // an unpaced ask (`next_frame`'s contract, #3272; FR-98 C7 moves it there).
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
     // FR-93 P3e — a capture waiting on its host (a display switched off).

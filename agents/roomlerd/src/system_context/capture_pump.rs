@@ -41,6 +41,16 @@
 //! soon as it recovers (driver reset, hybrid GPU re-enumeration). On
 //! GDI-also-failing, return `Err(...)` and let `media_pump` rebuild
 //! the entire pump.
+//!
+//! ## Pace (#3272)
+//!
+//! A pump that called [`ScreenCapture::pace_capture`] gets
+//! [`ScreenCapture::next_frame`]'s contract, carried on every [`CaptureCmd`]:
+//! the DXGI arm waits in the acquire, an empty faster than the floor sleeps the
+//! rest on this thread, and GDI (which has no "nothing new", so every ask is a
+//! whole capture) holds to the target rate. A pump that did not ask keeps the
+//! old behaviour, byte for byte, and sleeps on its own empties. FR-98 C7 moves
+//! every pump over and removes the choice.
 
 #![cfg(all(feature = "system-context", target_os = "windows"))]
 
@@ -52,6 +62,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
+use crate::capture::gate::SlotFirst;
+use crate::capture::pace::floor_remaining;
 use crate::capture::{DownscalePolicy, Frame, PixelFormat, ScreenCapture};
 
 use super::desktop_rebind;
@@ -154,6 +166,14 @@ fn first_frame_should_prime(
 #[cfg(feature = "scrap-capture")]
 const DXGI_RECLIMB_INTERVAL: Duration = Duration::from_secs(5);
 
+/// #3272 — how long a paced DXGI acquire waits for a frame. A display frame or
+/// so: long enough that a still screen costs about 62 asks a second, against
+/// 90,000, and short enough that the pump still reads its keepalive and its
+/// teardown promptly. A frame that arrives ends the wait at once, so this is not
+/// a latency: an event wake replaces the poll.
+#[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
+const ACQUIRE_WAIT_MS: u32 = 16;
+
 /// Active capture backend. Starts as DXGI; swaps to GDI on persistent
 /// HardError; can climb back to DXGI when it recovers. The DXGI variant is
 /// boxed behind [`DxgiCapture`] so it can hold either the adapter-bound
@@ -178,6 +198,38 @@ type CaptureReply = Result<Option<Frame>>;
 struct CaptureCmd {
     reply: oneshot::Sender<CaptureReply>,
     output_cap: Option<(u32, u32)>,
+    /// #3272 — `None`: the pump did not ask for a pace, so this capture does
+    /// exactly what it did before.
+    pace: Option<Pace>,
+}
+
+/// #3272 — what a paced capture holds to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pace {
+    target_fps: u32,
+}
+
+impl CaptureCmd {
+    /// How long this request's DXGI acquire may wait for a frame.
+    #[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
+    fn acquire_wait_ms(&self) -> u32 {
+        if self.pace.is_some() {
+            ACQUIRE_WAIT_MS
+        } else {
+            0
+        }
+    }
+}
+
+/// #3272 — the GDI arm's bucket at `fps`: kept while the rate holds, fresh when
+/// it moves. GDI has no "nothing new", so every ask is a whole BitBlt and a
+/// whole encode, and left alone it ran 58-61 frames a second at a 30 target, one
+/// thread fully busy (`SlotFirst`'s period is the target's, to the microsecond).
+fn gdi_gate_at(gate: &mut Option<(u32, SlotFirst)>, fps: u32) -> &mut SlotFirst {
+    if matches!(gate, Some((at, _)) if *at != fps) {
+        *gate = None;
+    }
+    &mut gate.get_or_insert_with(|| (fps, SlotFirst::new(fps))).1
 }
 
 /// FR-118 P0 — the DXGI arm's copies of the desktop surface into CPU memory,
@@ -217,6 +269,12 @@ pub struct SystemContextCapture {
     /// subsequent request.
     output_cap: Option<(u32, u32)>,
     readback: Arc<ReadbackTotals>,
+    /// #3272 — the pump called `pace_capture`.
+    paced: bool,
+    /// The rate the open asked for, or `set_target_fps`'s since. It reaches the
+    /// worker only through a paced request: FR-119's grants call the setter on
+    /// the DC pumps too, and those must keep running at the display's rate.
+    target_fps: u32,
 }
 
 impl SystemContextCapture {
@@ -224,7 +282,7 @@ impl SystemContextCapture {
     /// Surfaces init failures synchronously via a ready-ack channel —
     /// if both DXGI and GDI fail at startup the caller decides how to
     /// degrade (typically falls back to `NoopCapture`).
-    pub fn primary(_target_fps: u32, _downscale: DownscalePolicy) -> Result<Self> {
+    pub fn primary(target_fps: u32, _downscale: DownscalePolicy) -> Result<Self> {
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(u32, u32)>>();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<CaptureCmd>();
         let readback = Arc::new(ReadbackTotals::default());
@@ -247,6 +305,8 @@ impl SystemContextCapture {
             height,
             output_cap: None,
             readback,
+            paced: false,
+            target_fps,
         })
     }
 
@@ -255,6 +315,12 @@ impl SystemContextCapture {
     }
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    fn pace(&self) -> Option<Pace> {
+        self.paced.then_some(Pace {
+            target_fps: self.target_fps,
+        })
     }
 }
 
@@ -266,6 +332,7 @@ impl ScreenCapture for SystemContextCapture {
             .send(CaptureCmd {
                 reply: tx,
                 output_cap: self.output_cap,
+                pace: self.pace(),
             })
             .map_err(|_| anyhow!("system-context capture worker thread is gone"))?;
         match rx.await {
@@ -280,9 +347,17 @@ impl ScreenCapture for SystemContextCapture {
         self.output_cap = target;
     }
 
-    /// FR-119 P2b — nothing to move: this backend has no pacer of its own and
-    /// delivers at the display's rate (the open ignores its target too).
-    fn set_target_fps(&mut self, _fps: u32) {}
+    /// #3272 — see [`ScreenCapture::pace_capture`] and the module's "Pace".
+    fn pace_capture(&mut self) {
+        self.paced = true;
+    }
+
+    /// FR-119 P2b — DXGI has nothing to move: it delivers at the display's rate.
+    /// #3272 — a paced capture's GDI arm holds to this, and nothing else reads
+    /// it: unpaced, this backend delivers at the rate it always did.
+    fn set_target_fps(&mut self, fps: u32) {
+        self.target_fps = fps;
+    }
 
     fn backend(&self) -> &'static str {
         "system-context"
@@ -402,9 +477,21 @@ fn worker_main(
     let mut worker_capture_calls: u64 = 0;
     let mut worker_timing_logged_at = Instant::now();
     const WORKER_TIMING_LOG_EVERY: Duration = Duration::from_secs(30);
+    // #3272 — the GDI arm's bucket; see `gdi_gate_at`. Debited on a delivered
+    // frame only, so a BitBlt that failed takes no frame's slot.
+    let mut gdi_gate: Option<(u32, SlotFirst)> = None;
 
     while let Ok(cmd) = cmd_rx.recv() {
-        let res_tx = cmd.reply;
+        // #3272 — before the clock below starts: the GDI gate and the floor are
+        // pace, and `worker_avg_capture_ms` stays the capture and its wait.
+        if let Some(pace) = cmd.pace
+            && matches!(backend, ActiveBackend::Gdi(_))
+        {
+            let wait = gdi_gate_at(&mut gdi_gate, pace.target_fps).wait(Instant::now());
+            if !wait.is_zero() {
+                thread::sleep(wait);
+            }
+        }
         let cap_start = Instant::now();
         let reply = capture_one_blocking(
             &mut backend,
@@ -416,10 +503,11 @@ fn worker_main(
             &mut delivered_since_build,
             &mut first_frame_primed,
             start,
-            cmd.output_cap,
+            &cmd,
             &readback,
         );
-        worker_capture_us += cap_start.elapsed().as_micros() as u64;
+        let took = cap_start.elapsed();
+        worker_capture_us += took.as_micros() as u64;
         worker_capture_calls += 1;
         if worker_capture_calls >= 150
             && worker_timing_logged_at.elapsed() >= WORKER_TIMING_LOG_EVERY
@@ -435,9 +523,28 @@ fn worker_main(
             worker_capture_calls = 0;
             worker_timing_logged_at = Instant::now();
         }
+        if let Some(pace) = cmd.pace {
+            match &reply {
+                // The backend AFTER the call, so a frame from a DXGI that just
+                // climbed back takes no slot from a bucket it does not use.
+                Ok(Some(_)) if matches!(backend, ActiveBackend::Gdi(_)) => {
+                    gdi_gate_at(&mut gdi_gate, pace.target_fps).took(Instant::now());
+                }
+                // Everything that returns an empty at once: a zero-copy host's
+                // poll, the scrap arm, a pointer-only update, a desktop rebind,
+                // an AccessLost, a failed BitBlt. A timed-out wait owes nothing.
+                Ok(None) => {
+                    let floor = floor_remaining(took);
+                    if !floor.is_zero() {
+                        thread::sleep(floor);
+                    }
+                }
+                _ => {}
+            }
+        }
         // Best-effort send; if the async side dropped its rx the next
         // recv() above will error out and we exit cleanly.
-        let _ = res_tx.send(reply);
+        let _ = cmd.reply.send(reply);
     }
     tracing::info!("system-context capture worker thread exiting (cmd channel closed)");
 }
@@ -472,6 +579,16 @@ fn build_initial_backend() -> Result<ActiveBackend> {
 const DXGI_INIT_MAX_ATTEMPTS: u32 = 8;
 #[cfg(feature = "scrap-capture")]
 const DXGI_INIT_RETRY_BACKOFF: Duration = Duration::from_millis(120);
+
+/// #3272 — the bounded wait for a [`BackendBail::SeatBusy`] at DXGI build. The
+/// capture of a session that is ending lets go within one in-flight capture, a
+/// few tens of ms at most, and the open used to run straight into it: 15 of 16
+/// fell to GDI for 5 s on one host in a day. 5 × 40 ms covers that. A second
+/// viewer, who really is locked out of the seat, pays this once at the open.
+#[cfg(feature = "scrap-capture")]
+const DXGI_SEAT_MAX_ATTEMPTS: u32 = 5;
+#[cfg(feature = "scrap-capture")]
+const DXGI_SEAT_RETRY_BACKOFF: Duration = Duration::from_millis(40);
 
 /// One DXGI build attempt: rebind the worker thread to the CURRENT input
 /// desktop, then try the adapter-bound direct backend (rc.108 hybrid-GPU fix),
@@ -517,6 +634,9 @@ fn attempt_build_dxgi() -> Result<Box<dyn DxgiCapture>, BackendBail> {
             // the retry loop; the scrap backend would only hit the same denial
             // on this desktop, so there's nothing to gain from trying it now.
             Err(BackendBail::DesktopMismatch) => return Err(BackendBail::DesktopMismatch),
+            // #3272 — likewise while the seat may free up. The caller decides
+            // when to stop waiting and go on to scrap.
+            Err(BackendBail::SeatBusy) => return Err(BackendBail::SeatBusy),
             Err(e) => {
                 tracing::warn!(
                     ?e,
@@ -525,6 +645,12 @@ fn attempt_build_dxgi() -> Result<Box<dyn DxgiCapture>, BackendBail> {
             }
         }
     }
+    build_scrap_dxgi()
+}
+
+/// The `scrap` auto-adapter backend, the rung after the direct one.
+#[cfg(feature = "scrap-capture")]
+fn build_scrap_dxgi() -> Result<Box<dyn DxgiCapture>, BackendBail> {
     match DxgiDupBackend::primary() {
         Ok(b) => {
             tracing::info!("system-context capture: backend=DXGI (scrap auto-adapter)");
@@ -551,6 +677,16 @@ fn try_build_dxgi() -> Option<Box<dyn DxgiCapture>> {
             );
             None
         }
+        // #3272 — not logged at warn either: a second viewer sits here for its
+        // whole session, and these two lines came every 5 s. It still tries
+        // scrap, in case this `E_INVALIDARG` is a host's real cross-adapter one.
+        Err(BackendBail::SeatBusy) => match build_scrap_dxgi() {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::debug!(?e, "DXGI re-climb: the seat is taken — staying on GDI");
+                None
+            }
+        },
         Err(e) => {
             tracing::warn!(?e, "scrap DXGI backend init also failed");
             None
@@ -566,23 +702,64 @@ fn try_build_dxgi() -> Option<Box<dyn DxgiCapture>> {
 /// denied after the full retry budget — the caller then drops to GDI.
 #[cfg(feature = "scrap-capture")]
 fn build_dxgi_with_retry() -> Option<Box<dyn DxgiCapture>> {
-    for attempt in 1..=DXGI_INIT_MAX_ATTEMPTS {
-        match attempt_build_dxgi() {
-            Ok(b) => return Some(b),
-            Err(BackendBail::DesktopMismatch) if attempt < DXGI_INIT_MAX_ATTEMPTS => {
+    retry_dxgi_build(attempt_build_dxgi, build_scrap_dxgi, thread::sleep)
+}
+
+/// [`build_dxgi_with_retry`]'s decisions, with the opens and the sleep passed
+/// in so a test can walk them. #3272 — `next_rung` is what a seat that stayed
+/// taken goes on to: today's order (direct, scrap, GDI), for a host whose
+/// `E_INVALIDARG` turns out not to be the seat at all.
+#[cfg(feature = "scrap-capture")]
+fn retry_dxgi_build<T>(
+    mut attempt: impl FnMut() -> Result<T, BackendBail>,
+    next_rung: impl FnOnce() -> Result<T, BackendBail>,
+    mut sleep: impl FnMut(Duration),
+) -> Option<T> {
+    let (mut denied, mut seat_taken) = (0u32, 0u32);
+    loop {
+        match attempt() {
+            Ok(b) => {
+                if seat_taken > 0 {
+                    tracing::info!(
+                        seat_taken,
+                        "DXGI init: the seat freed up while retrying (a capture that was ending) — no GDI fallback"
+                    );
+                }
+                return Some(b);
+            }
+            Err(BackendBail::DesktopMismatch) => {
+                denied += 1;
+                if denied >= DXGI_INIT_MAX_ATTEMPTS {
+                    tracing::warn!(
+                        attempts = DXGI_INIT_MAX_ATTEMPTS,
+                        "DXGI init: still E_ACCESSDENIED after retries — conceding to GDI for now (5 s re-climb will keep trying)"
+                    );
+                    return None;
+                }
                 tracing::info!(
-                    attempt,
+                    attempt = denied,
                     max = DXGI_INIT_MAX_ATTEMPTS,
                     "DXGI init: E_ACCESSDENIED (desktop/session transition) — rebinding + retrying before GDI fallback"
                 );
-                thread::sleep(DXGI_INIT_RETRY_BACKOFF);
+                sleep(DXGI_INIT_RETRY_BACKOFF);
             }
-            Err(BackendBail::DesktopMismatch) => {
-                tracing::warn!(
-                    attempts = DXGI_INIT_MAX_ATTEMPTS,
-                    "DXGI init: still E_ACCESSDENIED after retries — conceding to GDI for now (5 s re-climb will keep trying)"
-                );
-                return None;
+            Err(BackendBail::SeatBusy) => {
+                seat_taken += 1;
+                if seat_taken < DXGI_SEAT_MAX_ATTEMPTS {
+                    sleep(DXGI_SEAT_RETRY_BACKOFF);
+                    continue;
+                }
+                return match next_rung() {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        tracing::warn!(
+                            ?e,
+                            attempts = DXGI_SEAT_MAX_ATTEMPTS,
+                            "DXGI init: the output's seat stayed taken (a second viewer?) — this capture runs on GDI BitBlt, and the 5 s re-climb will keep trying"
+                        );
+                        None
+                    }
+                };
             }
             Err(e) => {
                 tracing::warn!(
@@ -593,7 +770,6 @@ fn build_dxgi_with_retry() -> Option<Box<dyn DxgiCapture>> {
             }
         }
     }
-    None
 }
 
 #[cfg(not(feature = "scrap-capture"))]
@@ -637,7 +813,7 @@ fn backend_name(b: &ActiveBackend) -> &'static str {
 ///   HardError — `media_pump`'s idle-keepalive path covers the gap.
 /// * `Err(e)` on terminal failure (SessionGone or GDI also failing) —
 ///   `media_pump` will rebuild the pump.
-// Nine parameters, and they are the loop state this single capture iteration
+// Eleven parameters, and they are the loop state this single capture iteration
 // both reads and advances (three counters, two timers, a delivered flag). A
 // struct would only move the same fields behind one name while the caller
 // still threads every one of them through `media_pump`, so the allow buys
@@ -664,11 +840,9 @@ fn capture_one_blocking(
     #[cfg_attr(not(feature = "scrap-capture"), allow(unused_variables))]
     first_frame_primed: &mut bool,
     start: Instant,
-    // Phase B — forwarded to GPU-capable DXGI backends; GDI ignores it.
-    #[cfg_attr(not(feature = "scrap-capture"), allow(unused_variables))] output_cap: Option<(
-        u32,
-        u32,
-    )>,
+    // Phase B — its cap goes to GPU-capable DXGI backends; GDI ignores it.
+    // #3272 — and its pace sets how long the acquire may wait.
+    #[cfg_attr(not(feature = "scrap-capture"), allow(unused_variables))] cmd: &CaptureCmd,
     // FR-118 P0 — where a DXGI frame's measured readback is counted.
     #[cfg_attr(not(feature = "scrap-capture"), allow(unused_variables))] readback: &ReadbackTotals,
 ) -> CaptureReply {
@@ -702,7 +876,7 @@ fn capture_one_blocking(
 
     match backend {
         #[cfg(feature = "scrap-capture")]
-        ActiveBackend::Dxgi(b) => match b.frame(output_cap) {
+        ActiveBackend::Dxgi(b) => match b.frame(cmd.output_cap, cmd.acquire_wait_ms()) {
             Ok(frame) => {
                 *consecutive_hard = 0;
                 *consecutive_access_lost = 0;
@@ -711,7 +885,9 @@ fn capture_one_blocking(
                 readback.record(frame.readback_us);
                 Ok(Some(dxgi_to_frame(frame, start)))
             }
-            Err(BackendBail::Transient) => {
+            // `SeatBusy` comes from an open and `frame` opens nothing. Were it
+            // ever to come here it would mean what Transient means: not now.
+            Err(BackendBail::Transient | BackendBail::SeatBusy) => {
                 *consecutive_hard = 0;
                 *consecutive_access_lost = 0;
                 *consecutive_empty = consecutive_empty.saturating_add(1);
@@ -1065,6 +1241,182 @@ mod tests {
         // — and a stuck DXGI still trips `capture_is_stuck` (prime does not set
         // `delivered_since_build`).
         assert!(FIRST_FRAME_GDI_AFTER < STUCK_CAPTURE_RECOVERY_AFTER);
+    }
+
+    /// #3272 — a request carries a wait only when its pump asked for a pace.
+    /// The DC pumps do not, and their acquire must stay at 0 until FR-98 C7.
+    #[test]
+    fn only_a_paced_request_waits_in_the_acquire() {
+        let cmd = |pace| CaptureCmd {
+            reply: oneshot::channel().0,
+            output_cap: None,
+            pace,
+        };
+        assert_eq!(cmd(None).acquire_wait_ms(), 0);
+        assert_eq!(
+            cmd(Some(Pace { target_fps: 30 })).acquire_wait_ms(),
+            ACQUIRE_WAIT_MS
+        );
+    }
+
+    /// #3272 — the GDI arm as a field session ran it: a BitBlt of 10 ms and an
+    /// encode of 6 ms, nothing else holding it back, ran 58-61 frames a second
+    /// at a 30 fps target. The bucket holds the same loop to the target, and
+    /// the failed BitBlts take no frame's slot.
+    #[test]
+    fn the_gdi_gate_holds_a_full_work_loop_to_its_target() {
+        let run = |every_nth_fails: Option<u32>| {
+            let t0 = Instant::now();
+            let mut now = t0;
+            let mut gate = None;
+            let mut delivered = 0u32;
+            let mut asks = 0u32;
+            while now < t0 + Duration::from_secs(10) {
+                now += gdi_gate_at(&mut gate, 30).wait(now);
+                asks += 1;
+                now += Duration::from_millis(10);
+                let failed = every_nth_fails.is_some_and(|n| asks.is_multiple_of(n));
+                if failed {
+                    // The floor, and no debit.
+                    now += crate::capture::pace::EMPTY_FLOOR;
+                } else {
+                    gdi_gate_at(&mut gate, 30).took(now);
+                    delivered += 1;
+                    now += Duration::from_millis(6);
+                }
+            }
+            delivered as f64 / 10.0
+        };
+        let rate = run(None);
+        assert!((29.0..=33.0).contains(&rate), "{rate} frames a second");
+        let rate = run(Some(2));
+        assert!((29.0..=33.0).contains(&rate), "{rate} with failures");
+    }
+
+    /// #3272 — a `set_target_fps` moves the gate at once: the first frames of a
+    /// session run at 60 until the auto-fps-cap moves it to 30.
+    #[test]
+    fn the_gdi_gate_follows_the_target() {
+        let t0 = Instant::now();
+        let mut gate = None;
+        let at = |fps, gate: &mut Option<(u32, SlotFirst)>| gdi_gate_at(gate, fps).period();
+        assert_eq!(at(60, &mut gate), Duration::from_micros(16_666));
+        // Spend the 60 fps bucket, then move: a fresh bucket has its credit back.
+        let g = gdi_gate_at(&mut gate, 60);
+        for _ in 0..3 {
+            g.took(t0);
+        }
+        assert!(!gdi_gate_at(&mut gate, 60).wait(t0).is_zero());
+        assert_eq!(at(30, &mut gate), Duration::from_micros(33_333));
+        assert!(gdi_gate_at(&mut gate, 30).wait(t0).is_zero());
+    }
+
+    /// `retry_dxgi_build` on a scripted run of answers. Returns what it built,
+    /// the sleeps it asked for, how many attempts it made and whether it went on
+    /// to the next rung.
+    #[cfg(feature = "scrap-capture")]
+    fn walk_build(
+        mut answers: Vec<Result<u32, BackendBail>>,
+        next_rung: Result<u32, BackendBail>,
+    ) -> (Option<u32>, Vec<Duration>, usize, bool) {
+        answers.reverse();
+        let mut attempts = 0;
+        let mut climbed = false;
+        let mut sleeps = Vec::new();
+        let built = retry_dxgi_build(
+            || {
+                attempts += 1;
+                answers.pop().expect("more attempts than scripted")
+            },
+            || {
+                climbed = true;
+                next_rung
+            },
+            |d| sleeps.push(d),
+        );
+        (built, sleeps, attempts, climbed)
+    }
+
+    /// #3272 — the field's `0x80070057`: the capture before this one has not let
+    /// go yet. The retry waits for it and DXGI comes up, no GDI on the way. On
+    /// the current release this fell to GDI for 5 s, 15 times in 16.
+    #[cfg(feature = "scrap-capture")]
+    #[test]
+    fn a_seat_that_frees_up_is_waited_for() {
+        let (built, sleeps, attempts, climbed) = walk_build(
+            vec![
+                Err(BackendBail::SeatBusy),
+                Err(BackendBail::SeatBusy),
+                Ok(7),
+            ],
+            Ok(99),
+        );
+        assert_eq!(built, Some(7));
+        assert_eq!(attempts, 3);
+        assert_eq!(sleeps, vec![DXGI_SEAT_RETRY_BACKOFF; 2]);
+        assert!(!climbed, "scrap was never needed");
+    }
+
+    /// A second viewer: the seat stays taken. The wait is bounded, and the open
+    /// then keeps today's order, scrap and then GDI, so a host whose
+    /// `E_INVALIDARG` is a real cross-adapter one still gets scrap.
+    #[cfg(feature = "scrap-capture")]
+    #[test]
+    fn a_seat_that_stays_taken_goes_on_to_the_next_rung_after_the_budget() {
+        let budget = DXGI_SEAT_MAX_ATTEMPTS as usize;
+        let taken = || (0..budget).map(|_| Err(BackendBail::SeatBusy)).collect();
+
+        let (built, sleeps, attempts, climbed) = walk_build(taken(), Ok(9));
+        assert_eq!(built, Some(9), "a cross-adapter host lands on scrap");
+        assert_eq!(attempts, budget);
+        assert_eq!(sleeps.len(), budget - 1, "no sleep after the last attempt");
+        assert!(climbed);
+        assert!(sleeps.iter().sum::<Duration>() <= Duration::from_millis(200));
+
+        let (built, _, _, climbed) = walk_build(
+            taken(),
+            Err(BackendBail::HardError(std::io::Error::other("scrap too"))),
+        );
+        assert_eq!(built, None, "and a real second viewer on GDI");
+        assert!(climbed);
+    }
+
+    /// The rc.110 retry stays as it was: a desktop race gets its own 8 × 120 ms,
+    /// and a hard error goes straight to GDI with no scrap attempt here (the
+    /// attempt itself already tried scrap).
+    #[cfg(feature = "scrap-capture")]
+    #[test]
+    fn the_desktop_race_retry_and_a_hard_error_are_unchanged() {
+        let max = DXGI_INIT_MAX_ATTEMPTS as usize;
+        let denied = (0..max)
+            .map(|_| Err(BackendBail::DesktopMismatch))
+            .collect();
+        let (built, sleeps, attempts, climbed) = walk_build(denied, Ok(99));
+        assert_eq!(built, None);
+        assert_eq!(attempts, max);
+        assert_eq!(sleeps, vec![DXGI_INIT_RETRY_BACKOFF; max - 1]);
+        assert!(!climbed);
+
+        let (built, sleeps, attempts, climbed) = walk_build(
+            vec![Err(BackendBail::HardError(std::io::Error::other("x")))],
+            Ok(99),
+        );
+        assert_eq!(
+            (built, sleeps.len(), attempts, climbed),
+            (None, 0, 1, false)
+        );
+
+        // A race that clears on the third look.
+        let (built, sleeps, _, _) = walk_build(
+            vec![
+                Err(BackendBail::DesktopMismatch),
+                Err(BackendBail::DesktopMismatch),
+                Ok(5),
+            ],
+            Ok(99),
+        );
+        assert_eq!(built, Some(5));
+        assert_eq!(sleeps.len(), 2);
     }
 
     #[test]

@@ -15,6 +15,8 @@
 //! - Channel full (uploader too slow / network dead) → newest events
 //!   dropped at the layer (`try_send` returns Err). Acceptable for
 //!   diagnostic data; the rolling on-disk file logs retain everything.
+//!   #3272 — but counted, and the next batch carries a `dropped=N` line, so a
+//!   fleet read can tell a quiet host from one whose lines never arrived.
 //! - 401 / 403 from server → batch dropped, longer backoff (likely
 //!   JWT expired / agent unenrolled).
 //! - #2512: the control socket heard the server refuse this enrollment's
@@ -26,6 +28,7 @@
 use bson::{DateTime, Document};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Wire types — mirror the shape in `crates/db/src/models/agent_log.rs`
 // so the agent doesn't need a `roomler-ai-db` dependency (which would
@@ -103,6 +106,13 @@ pub const INITIAL_RETRY_BACKOFF_SECS: u64 = 5;
 
 pub const MAX_RETRY_BACKOFF_SECS: u64 = 60;
 
+/// #3272 — lines the layer has dropped since the last batch said so. One
+/// process has one layer and one uploader, so a static joins them without
+/// changing what either hands over. A flood skews every fleet read off
+/// `agent_logs`: one spinning host had 52 heartbeats on disk and 15 uploaded,
+/// and nothing said so.
+static LINES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
 /// Tracing layer that captures events and forwards them to the
 /// uploader task via an mpsc channel. Construct with [`new`] which
 /// returns the layer + the consumer end of the channel; pass the
@@ -119,6 +129,34 @@ impl LogUploadLayer {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         (Self { tx }, rx)
     }
+
+    /// Non-blocking send — drop on a full channel, and count it. The on-disk
+    /// file log retains everything regardless.
+    fn forward(&self, line: LogLine, dropped: &AtomicU64) {
+        if self.tx.try_send(line).is_err() {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The line that tells a reader how many went missing, added to `buf` if any
+/// did. Taken from the counter (it restarts at zero) only as it goes into a
+/// batch, and a batch always has room: the buffer starts every flush under
+/// [`MAX_BATCH_LINES`].
+fn note_dropped_lines(buf: &mut Vec<LogLine>, dropped: &AtomicU64) {
+    let n = dropped.swap(0, Ordering::Relaxed);
+    if n == 0 {
+        return;
+    }
+    let mut fields = Document::new();
+    fields.insert("dropped", i64::try_from(n).unwrap_or(i64::MAX));
+    buf.push(LogLine {
+        ts: DateTime::now(),
+        level: LogLevel::Warn,
+        target: "roomlerd::logs_upload".to_string(),
+        msg: "log upload channel was full: lines dropped since the last batch".to_string(),
+        fields,
+    });
 }
 
 impl<S> Layer<S> for LogUploadLayer
@@ -153,9 +191,7 @@ where
             msg: visitor.message,
             fields: visitor.fields,
         };
-        // Non-blocking send — drop on full channel. The on-disk file
-        // log retains everything regardless.
-        let _ = self.tx.try_send(line);
+        self.forward(line, &LINES_DROPPED);
     }
 }
 
@@ -281,6 +317,8 @@ async fn run_uploader_paced(mut rx: mpsc::Receiver<LogLine>, config: UploadConfi
 
     loop {
         tokio::time::sleep(pace.flush).await;
+
+        note_dropped_lines(&mut buf, &LINES_DROPPED);
 
         // Drain up to MAX_BATCH_LINES from the channel without
         // blocking on an empty channel.
@@ -468,7 +506,71 @@ mod tests {
         ));
     }
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    /// #3272 — a full channel loses the line and counts it. `forward` takes the
+    /// counter by reference, so this test does not touch the process's own.
+    #[tokio::test]
+    async fn a_full_channel_counts_what_it_drops() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let layer = LogUploadLayer { tx };
+        let dropped = AtomicU64::new(0);
+        let line = || LogLine {
+            ts: DateTime::now(),
+            level: LogLevel::Info,
+            target: "test".into(),
+            msg: "x".into(),
+            fields: Document::new(),
+        };
+        for _ in 0..5 {
+            layer.forward(line(), &dropped);
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 3);
+        assert!(rx.try_recv().is_ok());
+        layer.forward(line(), &dropped);
+        assert_eq!(dropped.load(Ordering::Relaxed), 3, "room again, none lost");
+    }
+
+    /// #3272 — the count reaches a batch as one line, with the count in its
+    /// fields, and restarts. No drops, no line: a healthy host's batches do not
+    /// change at all.
+    #[test]
+    fn the_count_goes_into_the_batch_once_and_only_when_there_is_one() {
+        let dropped = AtomicU64::new(0);
+        let mut buf = Vec::new();
+        note_dropped_lines(&mut buf, &dropped);
+        assert!(buf.is_empty());
+
+        dropped.store(1234, Ordering::Relaxed);
+        note_dropped_lines(&mut buf, &dropped);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0].level, LogLevel::Warn);
+        assert_eq!(buf[0].fields.get_i64("dropped"), Ok(1234));
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+
+        note_dropped_lines(&mut buf, &dropped);
+        assert_eq!(buf.len(), 1, "a count is said once");
+    }
+
+    /// A batch stays within the server's cap with the line in it. The buffer
+    /// starts every flush below the cap, because a failed POST sheds a full
+    /// buffer, so the one line always fits before the drain tops it up.
+    #[test]
+    fn the_line_never_pushes_a_batch_over_the_cap() {
+        let line = LogLine {
+            ts: DateTime::now(),
+            level: LogLevel::Info,
+            target: "test".into(),
+            msg: "x".into(),
+            fields: Document::new(),
+        };
+        let mut buf = vec![line; MAX_BATCH_LINES];
+        shed_oldest_half_if_full(&mut buf);
+        assert!(buf.len() < MAX_BATCH_LINES);
+        let dropped = AtomicU64::new(7);
+        note_dropped_lines(&mut buf, &dropped);
+        assert!(buf.len() <= MAX_BATCH_LINES);
+    }
+
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     /// The production pace scaled down 100×: flush every 50 ms, back off

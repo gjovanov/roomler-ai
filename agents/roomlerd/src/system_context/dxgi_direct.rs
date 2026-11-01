@@ -67,7 +67,7 @@
 
 use std::io;
 
-use windows::Win32::Foundation::{E_ACCESSDENIED, E_FAIL, HMODULE, RECT};
+use windows::Win32::Foundation::{E_ACCESSDENIED, E_FAIL, E_INVALIDARG, HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
     D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -130,6 +130,17 @@ fn map_dxgi_err(e: windows::core::Error) -> BackendBail {
         BackendBail::DesktopMismatch
     } else {
         BackendBail::HardError(io::Error::other(format!("DXGI-direct: {e}")))
+    }
+}
+
+/// #3272 — [`map_dxgi_err`] for `DuplicateOutput` alone: there, `E_INVALIDARG`
+/// is the output's seat being taken ([`BackendBail::SeatBusy`]). Anywhere else it
+/// means what it says, so this must not move into `map_dxgi_err`.
+fn map_duplicate_output_err(e: windows::core::Error) -> BackendBail {
+    if e.code() == E_INVALIDARG {
+        BackendBail::SeatBusy
+    } else {
+        map_dxgi_err(e)
     }
 }
 
@@ -430,7 +441,7 @@ impl DxgiDirectBackend {
 
             // Each step maps to a distinct HRESULT on failure (create:
             // DXGI_ERROR_UNSUPPORTED on an idle Optimus adapter; DuplicateOutput:
-            // E_INVALIDARG cross-adapter / E_ACCESSDENIED on the secure desktop),
+            // E_INVALIDARG the seat taken / E_ACCESSDENIED on the secure desktop),
             // and try_build_dxgi logs the whole error before falling back to
             // scrap — so the message is self-disambiguating without per-step logs.
             let (device, context, gpu_pool) = match keep.filter(|k| k.fits(&adapter)) {
@@ -449,7 +460,9 @@ impl DxgiDirectBackend {
 
             // Desktop Duplication lives on IDXGIOutput1.
             let output1: IDXGIOutput1 = output.cast().map_err(map_dxgi_err)?;
-            let duplication = output1.DuplicateOutput(&device).map_err(map_dxgi_err)?;
+            let duplication = output1
+                .DuplicateOutput(&device)
+                .map_err(map_duplicate_output_err)?;
 
             // IDXGIOutputDuplication::GetDesc returns the desc by value
             // (no out-param) in windows-rs 0.58.
@@ -1141,7 +1154,11 @@ impl DxgiDirectBackend {
 }
 
 impl DxgiCapture for DxgiDirectBackend {
-    fn frame(&mut self, output_cap: Option<(u32, u32)>) -> Result<DxgiFrame, BackendBail> {
+    fn frame(
+        &mut self,
+        output_cap: Option<(u32, u32)>,
+        wait_ms: u32,
+    ) -> Result<DxgiFrame, BackendBail> {
         // Phase B field fix (2026-08-21, winhost-a/corplap): a refine Up flips the
         // cap Some→None while the desktop is AT REST — but every real frame
         // delivered under the rung was GPU-scaled, so the pump's keepalive
@@ -1165,13 +1182,20 @@ impl DxgiCapture for DxgiDirectBackend {
         self.output_cap = output_cap;
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        // timeout=0 → non-blocking: returns DXGI_ERROR_WAIT_TIMEOUT
-        // immediately on a static desktop (mapped to Transient). The
-        // capture pump owns cadence; we never block the worker thread.
+        // #3272 — the wait is safe here: this is the capture's own thread, so
+        // nothing on the runtime waits with it. A timeout is
+        // DXGI_ERROR_WAIT_TIMEOUT on a static desktop (mapped to Transient).
+        //
+        // ⚠️ Not on a zero-copy device. A thread waiting in AcquireNextFrame
+        // holds that device's multithread lock (measured on #3272: taking the
+        // lock went from 1 µs to 22 ms, and a readback from 6 ms to 67 ms), and
+        // the encoder reads GPU frames back on the same device. That host polls
+        // with 0 and rests on the worker's 2 ms floor.
+        let wait_ms = if self.zero_copy { 0 } else { wait_ms };
         // SAFETY: out-params are valid; duplication is live.
         unsafe {
             self.duplication
-                .AcquireNextFrame(0, &mut frame_info, &mut resource)
+                .AcquireNextFrame(wait_ms, &mut frame_info, &mut resource)
         }
         .map_err(map_dxgi_err)?;
 
@@ -1412,6 +1436,31 @@ mod tests {
         ));
         assert!(matches!(
             map_dxgi_err(windows::core::Error::from(E_FAIL)),
+            BackendBail::HardError(_)
+        ));
+    }
+
+    /// #3272 — the seat is `E_INVALIDARG` from `DuplicateOutput` and nowhere
+    /// else: from any other call it is a real bad argument, and a retry would
+    /// only hide it. The HRESULT is the one measured in the field, 0x80070057.
+    #[test]
+    fn only_duplicate_output_reads_e_invalidarg_as_the_seat() {
+        assert_eq!(E_INVALIDARG.0 as u32, 0x8007_0057);
+        assert!(matches!(
+            map_duplicate_output_err(windows::core::Error::from(E_INVALIDARG)),
+            BackendBail::SeatBusy
+        ));
+        assert!(matches!(
+            map_dxgi_err(windows::core::Error::from(E_INVALIDARG)),
+            BackendBail::HardError(_)
+        ));
+        // Every other answer from that call keeps its meaning.
+        assert!(matches!(
+            map_duplicate_output_err(windows::core::Error::from(E_ACCESSDENIED)),
+            BackendBail::DesktopMismatch
+        ));
+        assert!(matches!(
+            map_duplicate_output_err(windows::core::Error::from(E_FAIL)),
             BackendBail::HardError(_)
         ));
     }
