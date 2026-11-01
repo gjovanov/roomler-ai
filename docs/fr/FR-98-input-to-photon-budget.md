@@ -72,6 +72,7 @@ are not a result.
 | C4 | **Cursor poller 8 → 4 ms**, or event-driven where the OS offers it | `peer.rs` L9019 | `ROOMLERD_CURSOR_POLL_MS` (2–50 ms) |
 | C5 | **NVENC preset `p1`–`p3` × tune `ull`** | `encoder.rs` L329–330 | the existing `ROOMLERD_FFMPEG_PRESET` / `_TUNE`; bake the winner per backend |
 | C6 | **`playout-delay` min = max = 0 on the RTP fallback track.** `register_header_extension` on the media engine, `write_sample_with_extensions`, and the SDP echo checked | `peer.rs` L2913 | `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO` (off for 0.4.134–0.4.138; on after P5's A/B, `=0` turns it off) |
+| C7 | **`next_frame`'s contract on every pump.** The capture waits for a frame and no pump sleeps on an empty, which takes the up-to-3.8 ms poll off the DC path. A contract and a CPU cut, so unlike the others it stays if L4 does not regress, whether or not L4 moves ([#3275](https://github.com/gjovanov/roomler-ai/issues/3275)) | `capture/mod.rs` `next_frame`, `capture/pace.rs`; the empties in `media_pump_ffmpeg_dc` and `media_pump_vp9_444_dc` | its own, for the DC pumps; the RTP half is `ROOMLERD_RTP_CAPTURE_WAIT` (default on, [#3272](https://github.com/gjovanov/roomler-ai/issues/3272)). All of them go when it is done |
 
 ⚠️ **No new per-frame reads in the pump.** FR-70 M3 makes the media thread read an immutable plan. Until
 then, every switch above is read once per open (`peer.rs` L5353–5391), never per frame.
@@ -144,6 +145,7 @@ above 60 fps; `1` pins every session, and `0` never pins (`gpu_clock.rs` L25–2
 | P4 | C5, the NVENC preset/tune A/B, baked per backend | `ROOMLERD_FFMPEG_PRESET` / `_TUNE` | — |
 | P5 | C6, `playout-delay` on the RTP fallback, and the Known-Issue verdict | `ROOMLERD_RTP_PLAYOUT_DELAY_ZERO=0` | **built**, and **on by default** after its A/B (`agents/roomlerd/src/rtp_playout.rs`; off for 0.4.134–0.4.138). Off, the extension is not registered, so the answer and every packet stay byte-identical. On, it is negotiated wherever the browser offers it and written on every video packet. L0's `playout0` cell (the switch unset) proves the default on the wire; every other cell forces it off and proves the off state. **Field-measured 2026-10-16** (§9): on the RTP track with OpenH264, Chrome's jitter buffer 193 → 0.1 ms and L4 p50 78–362 → 35–40 ms. **Field-checked on agent 0.4.139** (§9): with no switch set, the extension is negotiated on every session, Chrome's buffer is 0.1 ms and L4 p50 37 ms (median of 12 batches); the Known Issue is closed (AC6) |
 | P6 | Docs, and the final field table | — | — |
+| P7 | C7, `next_frame`'s contract on the DC pumps, after FR-70 AC10's week and a clean read of #3272's release. Then the opt-in, the switches and the pump sleeps go | its own switch | **not started** ([#3275](https://github.com/gjovanov/roomler-ai/issues/3275)). The RTP pump took the contract first, in [#3272](https://github.com/gjovanov/roomler-ai/issues/3272) (`remote-control.md` §5.1g) |
 
 ## 6. Acceptance criteria
 
