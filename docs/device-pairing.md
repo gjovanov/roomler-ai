@@ -21,7 +21,7 @@ applications and an inbox, with a ten-minute clock on the last two (the spec's
 [field evidence](fr/FR-129-guided-cross-platform-installer.md#the-field-evidence)).
 
 Pairing turns the token step around. The installer asks the server for a pairing, shows an
-eight-letter code and opens the browser on `/pair`. The person signs in or creates an account
+eight-letter code and a button that opens the browser on `/pair`. The person signs in or creates an account
 (and their organization) there, types the code, sees which device is asking, and approves it.
 The installer's next poll receives the ordinary enrollment token, says which organization it
 was approved into and by whom, and installs on the person's click. Nothing is copied: not a
