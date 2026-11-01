@@ -83,8 +83,12 @@ none started after 90 s:
   last child (`software`) still proves libvpx, which needs no driver. Only if that
   dies too is the answer `compute_caps(false)`.
 - ⚠️ A report the child printed stands however it ended afterwards.
-- ⚠️ 255 counts as a fault on Windows because the field says so: 2 of 7 AMD deaths
-  read it. Don't "tidy" `windows_fault_code` down to the exception codes.
+- ⚠️ `windows_fault_code` is a list of what counts, because an unknown NTSTATUS must
+  not cache a healthy cell out. Don't widen it back to "any error severity": that
+  polarity let `0xffffffff` through until a field kill test found it. 255 stays on the
+  list because the field says so: 2 of 7 AMD deaths read it.
+- ⚠️ A cell learned in 4:2:0 takes its 4:4:4 form with it (`names_444`): the `444`
+  child never tested that form, and nothing checks `chroma_pref` against the hello.
 
 When a host is missing a cell, read `learned_deny` in the log or
 `capabilities.unavailable["encoder-cells"]`, then the WER event's faulting module.

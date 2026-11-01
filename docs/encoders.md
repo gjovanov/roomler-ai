@@ -372,7 +372,7 @@ last one cost a Radeon laptop its RTX 5090's three NVENC cells and all four
 DataChannel transports for 4 h 22 min, and the viewer looked healthy throughout.
 So `base` announces every open (`ROOMLER_CAPS_PROGRESS:<name>:<chroma>`, and
 `ROOMLER_CAPS_PROGRESS:-` once it has ended, its teardown included), and the
-parent runs it again ([`run_base`](../agents/roomlerd/src/encode/caps.rs#L539)).
+parent runs it again ([`run_base`](../agents/roomlerd/src/encode/caps.rs#L544)).
 
 ```mermaid
 sequenceDiagram
@@ -408,23 +408,26 @@ have been dying. Only if that child dies as well is the answer the driver-free c
 
 A **fault's status** ([`is_fault`](../agents/roomlerd/src/encode/caps.rs#L338)) is
 what a driver leaves when it faults, and not what someone else leaves when they end
-the process. On Windows that is an exit code with an NTSTATUS severity of "error"
-(`0xC0000005`, `0xC000001D`, `0xC0000374`, `0xC0000409`, `0xC00000FD`), minus the ones
-that are about the host and not the open: Ctrl+C, out of memory or commit, an image
-that was refused or would not load. And 255, because 2 of the 7 AMD deaths read
-`exit code: 255` with an Application Error event for the same fault behind each; that
-Windows Error Reporting's termination is the source is a guess. On Linux and macOS it
-is SIGSEGV, SIGBUS, SIGILL, SIGFPE or SIGABRT, never SIGKILL (the OOM killer, an EDR)
-or SIGTERM.
+the process. On Windows that is a short list of exception codes a thread raises on
+itself: access violation, illegal instruction, the arithmetic traps, stack overflow,
+heap corruption, a fast fail, an uncaught C++ exception (`windows_fault_code`). The
+list names what counts, so an NTSTATUS nobody has met cannot keep a healthy cell out
+for a day, and missing a real fault costs only a re-test at the next start. And 255,
+because 2 of the 7 AMD deaths read `exit code: 255` with an Application Error event
+for the same fault behind each; that Windows Error Reporting's termination is the
+source is a guess. On Linux and macOS it is SIGSEGV, SIGBUS, SIGILL, SIGFPE or SIGABRT,
+never SIGKILL (the OOM killer, an EDR) or SIGTERM.
 
-⚠️ **Two faults in a row are good evidence, not proof.** A GPU reset can land on both.
-So an answer with a learned deny stands for a day where a clean one stands for a week
+⚠️ **Two faults in a row are good evidence, not proof.** A GPU reset can land on both, and
+so can a driver that dereferences a failed allocation on a host short of memory. So an
+answer with a learned deny stands for a day where a clean one stands for a week
 (`MAX_AGE_LEARNED_SECS`), and any key mismatch throws the list away with the file. The
 next probe starts with nothing denied and tests the cell again. A driver update
 changes the hardware fingerprint, so a vendor's fix heals with nobody acting. A new
-build does the same, and so does any `ROOMLERD_*` knob, which is how an operator forces
-a re-test (`roomler config clear encoder_cells_deny` keeps its effect, and a restart
-then re-probes).
+build does the same, and so does any change to a `ROOMLERD_*` knob, which is how an
+operator forces a re-test: set or clear any config key that feeds one, then restart.
+The day is read at a start, so a daemon that stays up keeps its list until it restarts,
+as it keeps the rest of its probe.
 
 ⚠️ **The learned list is not `encoder_cells_deny`.** That key still REPLACES the
 built-in list, and still goes back to it when cleared. The learned cells add to
@@ -435,8 +438,10 @@ caps, as before.
 
 ⚠️ **A session honours the same list, because the same fault would end the worker.**
 The FFmpeg cascades read it through `cells::names_420` / `names_444`, the rebuild
-through `new_preferred`. Media Foundation (`h264_mf`, `hevc_mf`, `av1_mf`) and libvpx
-(`vp9_libvpx`) refuse in their constructors, so the names work in
+through `new_preferred`. A cell learned in 4:2:0 takes its 4:4:4 form with it: the
+`444` child never tested that form, and `chroma_pref` is the controller's word, which
+nothing checks against the hello. Media Foundation (`h264_mf`, `hevc_mf`, `av1_mf`) and
+libvpx (`vp9_libvpx`) refuse in their constructors, so the names work in
 `encoder_cells_deny` too. A process the worker starts gets the list as
 `ROOMLERD_ENCODER_CELLS_LEARNED` (`learned_for_child`): the probe's next child and a
 recorder. A `roomlerd record` run by hand and the recording editor's `media export` do
@@ -449,7 +454,11 @@ is therefore 90 s plus one 60 s timeout, 150 s against 60 s before; with the 4:4
 children, 270 s against 180 s. Giving up adds the software child (60 s at most) and takes
 those two away, so that path tops out at 210 s. It needs a host whose children each take a minute. The
 probe runs before the worker connects (#2551), with the watchdog's pump gated off, so
-this is time the device is offline, and only on a cache miss. Measured on the dev box
+this is time the device is offline, and only on a cache miss. Nothing reads that time as
+a hang: the pump is gated off, a service manager watches for an exit and not for a
+hello, and the crash-loop detector counts unclean exits. ⚠️ These bounds assume the kill
+lands. A child stuck in a kernel call cannot be ended, and `run_child` then waits for it
+with no bound, the device offline (#3273). Measured on the dev box
 with AMD's real fault (a debug build, run by hand from Git Bash): two deaths and a report
 in 7.2–7.8 s, against 3.4–3.8 s for the same probe with the cell denied from the start. A
 hung child (suspended, standing in for a driver) cost 63 s, and two of them, which is
@@ -887,7 +896,7 @@ colour-manages by primaries and transfer (FR-130 §2.5).
 | openh264, recording | its own VUI and the MP4 `colr` box, unchanged since FR-85 | SMPTE 170M at limited range |
 
 A vendor runtime that refuses the description opens the encoder without it rather than failing the open.
-While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:2252`).
+While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:2263`).
 
 **Which lever reaches which path:**
 

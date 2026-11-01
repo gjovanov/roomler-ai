@@ -213,13 +213,23 @@ pub(crate) fn cell_denied(deny: &[String], name: &str, chroma: ChromaFormat) -> 
 /// every backend the source matrix can open in 4:4:4, minus the denylist.
 /// Empty when no backend of this codec does 4:4:4 (AV1) or every one is
 /// denied — the caller then runs the 4:2:0 cascade and reports the truth.
+///
+/// #3267 — a cell whose 4:2:0 open ended a probe child takes its 4:4:4 form
+/// with it. The `444` child only asks for what `base` opened, so that form has
+/// not been tested, and `chroma_pref` is the controller's word, which nothing
+/// checks against the hello. An operator's entry still names one form.
 #[cfg(feature = "ffmpeg-encoder")]
 pub(crate) fn names_444(codec: roomler_ai_remote_control::models::VideoCodec) -> Vec<&'static str> {
     let deny = denied_cells();
+    let learned = learned_names();
     crate::encode::ffmpeg::FfmpegEncoder::cascade_names(codec)
         .iter()
         .copied()
-        .filter(|name| ffmpeg_444_capable(name) && !cell_denied(&deny, name, ChromaFormat::Yuv444))
+        .filter(|name| {
+            ffmpeg_444_capable(name)
+                && !cell_denied(&deny, name, ChromaFormat::Yuv444)
+                && !cell_denied(&learned, name, ChromaFormat::Yuv420)
+        })
         .collect()
 }
 
@@ -509,6 +519,41 @@ mod tests {
                 .as_ref()
                 .is_some_and(|e| e.to_string().contains("denylist")),
             "a rebuild must refuse it, not open it: {refused:?}"
+        );
+    }
+
+    /// #3267 — the hello leaves a learned cell out, and a controller may ask for
+    /// 4:4:4 regardless: nothing checks `chroma_pref` against the hello. The 4:4:4
+    /// form of a cell whose 4:2:0 open killed a process has never been opened, so
+    /// the daemon must not be the first to try it. An operator's entry still
+    /// names one form.
+    #[cfg(feature = "ffmpeg-encoder")]
+    #[test]
+    fn a_learned_420_cell_takes_its_444_form_with_it() {
+        use tunnel_core::env::test_env::{Saved, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _deny = Saved::cleared("ENCODER_CELLS_DENY");
+        let _handed = Saved::cleared(LEARNED_ENV);
+        let _learned = LearnedGuard;
+        assert_eq!(names_444(VideoCodec::H264), vec!["h264_nvenc"]);
+
+        install_learned(vec![learned_cell("h264_nvenc:yuv420")]);
+        assert!(names_444(VideoCodec::H264).is_empty());
+        assert_eq!(
+            names_444(VideoCodec::Hevc),
+            vec!["hevc_nvenc"],
+            "another codec's cell is another cell"
+        );
+
+        install_learned(Vec::new());
+        // SAFETY: serialised by DENY_ENV_LOCK; the guard restores it.
+        unsafe { set("ENCODER_CELLS_DENY", "h264_nvenc:yuv420") };
+        assert_eq!(
+            names_444(VideoCodec::H264),
+            vec!["h264_nvenc"],
+            "an operator's entry names one form"
         );
     }
 

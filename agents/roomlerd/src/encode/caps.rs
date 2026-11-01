@@ -353,10 +353,15 @@ mod child {
     }
 
     /// #3267 — on Windows a process's exit code is the exception code that
-    /// ended it, with an NTSTATUS severity of "error" in the top two bits:
-    /// `0xC0000005` access violation, `0xC000001D` illegal instruction,
-    /// `0xC0000374` heap corruption, `0xC0000409` a fast fail (`abort`),
-    /// `0xC00000FD` stack overflow.
+    /// ended it. These are the ones a thread raises on itself by faulting.
+    ///
+    /// The list names what counts, and everything else does not. NTSTATUS has
+    /// hundreds of error codes, and many are about the host rather than the
+    /// open: out of resources (`0xC000009A`), a page that could not be read
+    /// (`0xC0000006`), desktop heap (`0xC0000142`), an antivirus's verdict
+    /// (`0xC0000906`). A code nobody has met yet must not be able to keep a
+    /// healthy cell out for a day. Missing a real fault costs far less: the
+    /// cell is denied for this process and tested again at the next start.
     ///
     /// 255 counts too, because the field says so: 2 of the 7 AMD deaths on the
     /// dev box (2026-11-01) read `exit code: 255`, and each lined up with an
@@ -364,22 +369,22 @@ mod child {
     /// own termination is the likely source; that part is unmeasured.
     #[cfg(windows)]
     fn windows_fault_code(code: u32) -> bool {
-        const CONTROL_C_EXIT: u32 = 0xC000_013A;
-        const NO_MEMORY: u32 = 0xC000_0017;
-        const COMMITMENT_LIMIT: u32 = 0xC000_012D;
-        const ACCESS_DENIED: u32 = 0xC000_0022;
-        const DLL_NOT_FOUND: u32 = 0xC000_0135;
-        const DLL_INIT_FAILED: u32 = 0xC000_0142;
-        // `TerminateProcess(h, -1)`: .NET's `Process.Kill`, so `Stop-Process`.
-        const TERMINATED_MINUS_ONE: u32 = 0xFFFF_FFFF;
-        match code {
-            255 => true,
-            // Someone ended it, the host is out of memory or desktop heap, or
-            // the image would not load: nothing here is about the open.
-            CONTROL_C_EXIT | NO_MEMORY | COMMITMENT_LIMIT | ACCESS_DENIED | DLL_NOT_FOUND
-            | DLL_INIT_FAILED | TERMINATED_MINUS_ONE => false,
-            c => c >> 30 == 0b11,
-        }
+        const FAULTS: &[u32] = &[
+            0xC000_0005, // access violation: the AMD fault
+            0xC000_001D, // illegal instruction
+            0xC000_0025, // a handler resumed what cannot be resumed
+            0xC000_0094, // integer division by zero
+            0xC000_0095, // integer overflow
+            0xC000_0096, // privileged instruction
+            0xC000_00FD, // stack overflow
+            0xC000_0374, // heap corruption
+            0xC000_0409, // fast fail: what `abort` leaves
+            0xC000_041D, // a fault inside a user callback
+            0xC000_0602, // fail fast
+            0xE06D_7363, // an uncaught C++ exception
+            255,         // the field's, above
+        ];
+        FAULTS.contains(&code)
     }
 
     /// #3267 — the signals a faulting driver raises on itself. Never SIGKILL
@@ -400,8 +405,8 @@ mod child {
     /// base phase's worst case is therefore this plus one [`TIMEOUT`]: 150 s,
     /// against 60 s before, and it is only reached by a host whose children
     /// take a minute each. Long enough for one hang to get its retry, and for
-    /// the three runs one fault costs on a host where a run takes 45 s. The
-    /// dev box's slowest run on record is 24 s.
+    /// the three runs one fault costs on a host where a run takes under 45 s.
+    /// The dev box's slowest run on record is 24 s.
     pub(super) const BASE_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
     /// What a death in `base` means for the next run.
@@ -1520,7 +1525,13 @@ fn with_learned_word(mut caps: AgentCaps, learned: &[super::cells::LearnedDeny])
     }
     let cells = learned
         .iter()
-        .map(|l| format!("{} ({})", l.cell, l.why))
+        .map(|l| {
+            if l.confirmed {
+                format!("{} ({})", l.cell, l.why)
+            } else {
+                format!("{} ({}, until the next start)", l.cell, l.why)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     caps.unavailable.insert(
@@ -5363,9 +5374,12 @@ mod tests {
         for code in [
             0xC000_0005u32, // access violation: the AMD fault
             0xC000_001D,    // illegal instruction
+            0xC000_0094,    // integer division by zero
             0xC000_00FD,    // stack overflow
             0xC000_0374,    // heap corruption
             0xC000_0409,    // fast fail, what `abort` leaves
+            0xC000_0602,    // fail fast
+            0xE06D_7363,    // an uncaught C++ exception
             255,            // 2 of the 7 AMD deaths read this
         ] {
             assert!(
@@ -5385,6 +5399,11 @@ mod tests {
             0xC000_0022, // the image was refused
             0xC000_0135, // a DLL is missing
             0xC000_0142, // DLL init failed: desktop heap
+            0xC000_0006, // a page could not be read: the disk, or memory
+            0xC000_009A, // out of resources
+            0xC000_026B, // the session is logging off
+            0xC000_0906, // an antivirus's verdict
+            0xC000_0001, // an error nobody has named: an unknown code proves nothing
             0xFFFF_FFFF, // `Stop-Process`, and whatever else terminates with -1
             0x4000_0000, // not an error's severity
         ] {
@@ -5514,6 +5533,22 @@ mod tests {
         // The seam still assigns what it always did.
         assert!(c.unavailable.contains_key("sas"));
         assert!(!c.files.is_empty(), "with_config_lists still runs");
+
+        // A cell denied on a hang comes back at the next start, whatever day
+        // that is, and the word says so.
+        let hung = vec![crate::encode::cells::LearnedDeny {
+            cell: "hevc_nvenc:yuv420".into(),
+            why: "hung".into(),
+            confirmed: false,
+        }];
+        let c = assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &hung);
+        assert!(
+            c.unavailable[LEARNED_WORD]
+                .reason
+                .contains("hevc_nvenc:yuv420 (hung, until the next start)"),
+            "{}",
+            c.unavailable[LEARNED_WORD].reason
+        );
 
         let none = assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &[]);
         assert!(!none.unavailable.contains_key(LEARNED_WORD));

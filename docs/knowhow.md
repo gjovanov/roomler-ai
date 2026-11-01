@@ -783,7 +783,7 @@ each root not read and why, and counts what was dropped.
 > A scan runs off the signaling loop, one at a time, and the last 16 answers are kept, so a scan
 > delivered again after a lost connection is answered from what it found, never run twice. The
 > verb is advertised by every Linux and macOS build carrying `hive`
-> ([`rpc_caps`](../agents/roomlerd/src/encode/caps.rs#L3024)), whatever its roots say: an empty
+> ([`rpc_caps`](../agents/roomlerd/src/encode/caps.rs#L3035)), whatever its roots say: an empty
 > list is an answer.
 
 ## 12. A session's questions (P4-4-1)
