@@ -78,6 +78,10 @@ const MAX_OPEN_FILES: libc::rlim_t = 4096;
 #[cfg(worker_calls)]
 const UP_WAIT: Duration = Duration::from_secs(10);
 
+/// FR-90 P8-2d-0 — the device's worker's calls (P8-2d-1), a type of their
+/// own beside a session worker's ([`link::Role`]).
+#[cfg(worker_calls)]
+pub(crate) use super::device::{DeviceAnswer, DeviceCall};
 #[cfg(worker_calls)]
 pub(crate) use super::vault_connect::handed::{Answer, Call};
 
@@ -109,6 +113,14 @@ pub(crate) enum Msg {
     Call { id: u64, call: Call },
     #[cfg(worker_calls)]
     Answer { id: u64, answer: Answer },
+    /// FR-90 P8-2d-0 — the device's worker's: a call, answered by the
+    /// `device_answer` of the same id ([`link::DeviceLink`]). Never on a
+    /// session's channel: nothing sends one before P8-2d-1 starts the
+    /// device's worker.
+    #[cfg(worker_calls)]
+    DeviceCall { id: u64, call: DeviceCall },
+    #[cfg(worker_calls)]
+    DeviceAnswer { id: u64, answer: DeviceAnswer },
 }
 
 /// Write one frame, its length and its body in one write. The buffers are
@@ -484,6 +496,11 @@ async fn serve_halves(
                 link.answered(id, answer);
                 Ok(())
             }
+            // FR-90 P8-2d-0 — the device's worker's frames: none comes on a
+            // session's channel, whose link takes a session's calls alone.
+            // P8-2d-1's device worker serves them.
+            #[cfg(worker_calls)]
+            Msg::DeviceCall { .. } | Msg::DeviceAnswer { .. } => Ok(()),
         };
         if let Err(e) = sent {
             break Err(e);

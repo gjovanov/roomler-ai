@@ -229,6 +229,19 @@ pub(super) async fn tip_of(
     })
 }
 
+/// `rc:hive.replica.tip`, saying where a copy ends: the daemon's, for a
+/// session it runs ([`Supervisor::report_tip`]), and (P8-2d-0) the device's
+/// parts', for a copy their stream moves.
+pub(super) fn tip_msg(tip: HiveReplicaManifestEntry) -> ClientMsg {
+    ClientMsg::HiveReplicaTip {
+        session_id: tip.session_id,
+        fence: tip.fence,
+        seq: tip.seq,
+        hash: tip.hash,
+        checkpoint: tip.checkpoint,
+    }
+}
+
 impl Supervisor {
     /// The device's answer to a join, from its config and store, logged. A
     /// primary's (P2c-4) is about a session it runs, not a copy it holds, so
@@ -511,13 +524,7 @@ impl Supervisor {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let Some(tx) = tx {
-            let _ = tx.try_send(ClientMsg::HiveReplicaTip {
-                session_id: tip.session_id,
-                fence: tip.fence,
-                seq: tip.seq,
-                hash: tip.hash,
-                checkpoint: tip.checkpoint,
-            });
+            let _ = tx.try_send(tip_msg(tip));
         }
     }
 }

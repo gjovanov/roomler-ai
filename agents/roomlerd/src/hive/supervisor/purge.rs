@@ -25,6 +25,7 @@ use roomler_hive_node::store::WorkplaceRecord;
 use tracing::{info, warn};
 
 use super::{Input, SUPERSEDE_WAIT, Supervisor};
+use crate::hive::device::Device;
 use crate::hive::purger;
 
 impl Supervisor {
@@ -200,9 +201,9 @@ impl Supervisor {
 
     /// What the device keeps of `session` in memory: its moves, memory and
     /// teleport prepares kept for a start, the server's lease words, the
-    /// reports and frames held for a reconnect, its replica streams and its
-    /// follow.
-    fn forget_in_memory(&self, session: ObjectId) {
+    /// reports and frames held for a reconnect, and (P8-2d-0, the device's
+    /// parts') its replica streams and its follow.
+    fn forget_in_memory(self: &Arc<Self>, session: ObjectId) {
         fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
             m.lock().unwrap_or_else(|e| e.into_inner())
         }
@@ -213,15 +214,7 @@ impl Supervisor {
         lock(&self.reports).remove(&session);
         lock(&self.turns).remove(&session);
         lock(&self.approval_frames).remove(&session);
-        lock(&self.follows).forget(session);
-        let grants: Vec<ObjectId> = lock(&self.streams)
-            .iter()
-            .filter(|(_, s)| s.session_id == session)
-            .map(|(g, _)| *g)
-            .collect();
-        for grant in grants {
-            self.end_stream(grant, "purged");
-        }
+        self.device().forget(session);
     }
 
     /// The account's part: run as the account the workplace record names,
@@ -235,6 +228,29 @@ impl Supervisor {
             folder: w.folder.clone().into(),
         };
         purger::purge(&self.checkpoint_runner(), &who, &req).await
+    }
+}
+
+impl Device {
+    /// FR-90 P8-2d-0 — the device's parts' part of a purge: no ask, follow or
+    /// wait is kept for `session`, none is queued, and each of its streams
+    /// ends here, the server told (`purged`).
+    pub(super) fn forget(&self, session: ObjectId) {
+        self.follows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget(session);
+        let grants: Vec<ObjectId> = self
+            .streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, s)| s.session_id == session)
+            .map(|(g, _)| *g)
+            .collect();
+        for grant in grants {
+            self.end_stream(grant, "purged");
+        }
     }
 }
 

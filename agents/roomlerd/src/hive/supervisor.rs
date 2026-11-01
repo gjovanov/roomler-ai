@@ -68,7 +68,7 @@ use roomler_node_core::config::AgentConfig;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 
 /// P1i-2 — on Windows a harness is a [`crate::hive_win::HarnessChild`]: started
 /// into its Job Object as the console user, with the part of tokio's `Child`
@@ -561,11 +561,13 @@ enum Launcher {
 
 /// P1j — terminal sessions adopted on this device.
 mod adopt;
-mod follow;
+pub(super) mod follow;
 mod purge;
 mod replica;
 mod retain;
-mod stream;
+/// FR-90 P8-2d-0 — the daemon's side of the device's seams.
+mod seams;
+pub(super) mod stream;
 
 pub struct Supervisor {
     pub(crate) cfg: HiveConfig,
@@ -584,15 +586,16 @@ pub struct Supervisor {
     /// would leave the room's stub saying "needs approval" for ever.
     approval_frames: Mutex<HashMap<ObjectId, Vec<(String, ClientMsg)>>>,
     reporter: Mutex<Option<mpsc::Sender<ClientMsg>>>,
-    /// Every state as it is reported, for the viewers of that session.
-    states: broadcast::Sender<(ObjectId, HiveRunState)>,
-    /// P1a — a session's open approvals each time they change, for its
-    /// viewers: a driver's card shows its buttons only while it is open.
-    approvals: broadcast::Sender<(ObjectId, Vec<String>)>,
+    /// FR-90 P8-2d-0 — the primary connections the device's parts answer a
+    /// frame on, numbered ([`seams::Conns`]).
+    conns: seams::Conns,
+    /// FR-90 P8-2d-0 — the device's own parts: the replica store's handle,
+    /// the streams and their follows, the viewer peers, and the states and
+    /// approvals those viewers hear ([`super::device`]). What they hold; they
+    /// reach this supervisor only through its seams ([`Self::device`]).
+    parts: Arc<super::device::Parts>,
     /// How long an approval waits for a person (shorter in the tests).
     approval_timing: toolbelt::Timing,
-    /// The viewer peers this device serves (P0d-2).
-    viewers: super::view::Viewers,
     /// P0e — the model sidecar: the session tokens it honours (P8-2c-3:
     /// each session has its own sidecar and port now, kept with the run
     /// itself, not here), the provider key the helper printed, and when
@@ -642,17 +645,6 @@ pub struct Supervisor {
     adopted: Mutex<adopt::AdoptedFile>,
     /// P1j — adopt offers waiting for the server's word, by offer id.
     adopt_offers: Mutex<HashMap<String, tokio::sync::oneshot::Sender<adopt::OfferAnswer>>>,
-    /// P2d — the replica streams this device is a side of, by grant: the
-    /// ones it serves as a source and the ones it follows as a member.
-    streams: Mutex<HashMap<ObjectId, stream::Stream>>,
-    /// P2d-3 — what the streams this device follows hold in memory, across
-    /// all of them: event bytes, and blob bytes, each taken before it is
-    /// read ([`stream::EVENT_BUDGET`], [`stream::BLOB_BUDGET`]).
-    replica_events: tokio::sync::Semaphore,
-    replica_blobs: tokio::sync::Semaphore,
-    /// P2d-3b — what this device does about each session it holds a copy of
-    /// as a member: the ask in flight, the stream followed, the wait.
-    follows: Mutex<follow::Follows>,
     /// P2e-2 — the server's word for each leased session it holds here, by
     /// (session, fence): the connection it came on, held weakly. It counts
     /// only while that connection is the latest one (`reporter`).
@@ -1613,6 +1605,7 @@ impl Supervisor {
     ) -> Self {
         let to_resume = hosted.sessions().to_vec();
         let adopted = adopt::AdoptedFile::load(adopt::adopted_path(hosted.path()), hosted.agent());
+        let parts = Arc::new(super::device::Parts::new(store.clone()));
         Self {
             cfg,
             runtime,
@@ -1624,10 +1617,9 @@ impl Supervisor {
             turns: Mutex::new(HashMap::new()),
             approval_frames: Mutex::new(HashMap::new()),
             reporter: Mutex::new(None),
-            states: broadcast::channel(64).0,
-            approvals: broadcast::channel(64).0,
+            conns: seams::Conns::default(),
+            parts,
             approval_timing: toolbelt::Timing::default(),
-            viewers: Default::default(),
             tokens: Default::default(),
             model_key: tokio::sync::Mutex::new(None),
             offline_since: Mutex::new(None),
@@ -1648,10 +1640,6 @@ impl Supervisor {
             ssh_runner: None,
             adopted: Mutex::new(adopted),
             adopt_offers: Mutex::new(HashMap::new()),
-            streams: Mutex::new(HashMap::new()),
-            replica_events: tokio::sync::Semaphore::new(stream::EVENT_BUDGET),
-            replica_blobs: tokio::sync::Semaphore::new(stream::BLOB_BUDGET),
-            follows: Mutex::new(follow::Follows::default()),
             lease_words: Mutex::new(HashMap::new()),
             lease_heard: tokio::sync::Notify::new(),
             awaiting_word: Mutex::new(HashMap::new()),
@@ -3779,7 +3767,7 @@ impl Supervisor {
                 },
             );
         // Viewers of the session hear it too (P0d-2); nobody watching is fine.
-        let _ = self.states.send((session, state));
+        self.parts.run_state_changed(session, state);
         let tx = self
             .reporter
             .lock()
@@ -3835,14 +3823,13 @@ impl Supervisor {
             .map(|r| r.state)
     }
 
-    /// Every state reported from now on, of every session.
-    pub(crate) fn subscribe_states(&self) -> broadcast::Receiver<(ObjectId, HiveRunState)> {
-        self.states.subscribe()
-    }
-
-    /// P1a — every change to any session's open approvals, from now on.
-    pub(crate) fn subscribe_approvals(&self) -> broadcast::Receiver<(ObjectId, Vec<String>)> {
-        self.approvals.subscribe()
+    /// P1a — every change to any session's open approvals, from now on: what
+    /// the device's viewers hear (P8-2d-0, [`super::device::Parts`]).
+    #[cfg(all(test, unix))]
+    pub(crate) fn subscribe_approvals(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<(ObjectId, Vec<String>)> {
+        self.parts.subscribe_approvals()
     }
 
     /// The approvals open in `session` now; none for a session not live here.
@@ -3883,29 +3870,10 @@ impl Supervisor {
         }
     }
 
+    /// The viewer peers this device serves (P0d-2): the device's parts'
+    /// (P8-2d-0).
     pub(crate) fn viewers(&self) -> &super::view::Viewers {
-        &self.viewers
-    }
-
-    /// Send a frame on the primary connection that is up NOW. Not replayed:
-    /// a viewer's handshake that loses a frame times out, and the browser
-    /// asks again.
-    pub(crate) fn send(&self, msg: ClientMsg) {
-        let tx = self
-            .reporter
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        match tx {
-            Some(tx) => {
-                if tx.try_send(msg).is_err() {
-                    debug!(
-                        "hive: the control connection's queue is full — a view frame was dropped"
-                    );
-                }
-            }
-            None => debug!("hive: no control connection — a view frame was dropped"),
-        }
+        &self.parts.viewers
     }
 
     // ─── The model sidecar's side of the supervisor (P0e) ───────────────
@@ -5696,10 +5664,9 @@ impl Task<'_> {
             self.save_open_approvals();
         }
         self.settle_state();
-        let _ = self
-            .sup
-            .approvals
-            .send((self.session, self.open_approvals.clone()));
+        self.sup
+            .parts
+            .approvals_changed(self.session, self.open_approvals.clone());
         if let Some(id) = withdraw {
             self.pending.withdraw(&id);
         }
@@ -5723,7 +5690,7 @@ impl Task<'_> {
             );
             self.report_approval(id, HiveApprovalStatus::Withdrawn, None);
         }
-        let _ = self.sup.approvals.send((self.session, Vec::new()));
+        self.sup.parts.approvals_changed(self.session, Vec::new());
     }
 
     fn report_approval(
