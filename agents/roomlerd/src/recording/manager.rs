@@ -469,6 +469,9 @@ impl RecordingManager {
     /// the capability probe does, or the gate would be a courtesy.
     fn child_env(&self) -> Vec<(String, String)> {
         let mut env = tunnel_core::env::config_fallbacks_for_child();
+        // #3267 — and a cell this host learned kills its process: a recorder
+        // opens the same drivers from the same cascade.
+        env.extend(crate::encode::cells::learned_for_child());
         env.extend(self.child_env.iter().cloned());
         // FR-97 P2f-1b — a supervised Mac's GUI worker was started by the ROOT
         // daemon, which stays its recorder's responsible process unless the

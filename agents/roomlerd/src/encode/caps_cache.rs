@@ -27,6 +27,11 @@
 //!   in clear — an env block can carry a token.
 //! - **`ROOMLERD_CAPS_CACHE=0`** (config `caps_cache = false`) disables the
 //!   read AND the write; the `caps-probe` child never touches the file.
+//! - **A cell the probe learned to deny (#3267) lives here and nowhere else**,
+//!   and only when two faults confirmed it. It goes with the file: a driver
+//!   update, a new build, any knob change or a day's age is a miss, the next
+//!   probe starts with nothing denied, and the cell is tested again. That is
+//!   the whole of the healing: nobody has to act when a vendor ships a fix.
 
 use roomler_ai_remote_control::models::AgentCaps;
 use serde::{Deserialize, Serialize};
@@ -37,6 +42,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// A probe older than this is repeated even under an unchanged key: the
 /// safety net for a dependency the key does not model.
 pub(crate) const MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+/// #3267 — how long an answer that learned to deny a cell stands under an
+/// unchanged key. Two faults in a row are good evidence and not proof: a GPU
+/// reset can land on both. A day bounds what such a pair can cost a host, and
+/// a host where the cell really faults pays two child deaths at most once a
+/// day, and only if its daemon restarts.
+pub(crate) const MAX_AGE_LEARNED_SECS: u64 = 24 * 3600;
 pub(crate) const FILE_NAME: &str = "caps-cache.json";
 /// Bumped when the file's meaning changes; an older file is a miss, not an
 /// error.
@@ -67,6 +78,12 @@ pub(crate) struct CacheFile {
     /// that form. A file without it reads as "none proven".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpu_input: Vec<String>,
+    /// #3267 — the cells this probe had to deny to get an answer. `caps` was
+    /// computed without them, so a hit that installs this list keeps a session
+    /// out of what the matrix already leaves out. A key mismatch throws it away
+    /// with the rest of the file, which is what tests the cell again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub learned_deny: Vec<super::cells::LearnedDeny>,
 }
 
 impl CacheFile {
@@ -85,12 +102,22 @@ impl CacheFile {
             caps,
             vp9_qsv_idr,
             gpu_input: Vec::new(),
+            learned_deny: Vec::new(),
         }
     }
 
     /// FR-118 P2-3 — with the GPU-input forms the probe proved.
     pub(crate) fn with_gpu_input(mut self, gpu_input: Vec<String>) -> Self {
         self.gpu_input = gpu_input;
+        self
+    }
+
+    /// #3267 — with the cells the probe learned to deny.
+    pub(crate) fn with_learned_deny(
+        mut self,
+        learned_deny: Vec<super::cells::LearnedDeny>,
+    ) -> Self {
+        self.learned_deny = learned_deny;
         self
     }
 }
@@ -105,7 +132,13 @@ pub(crate) enum Miss {
     Build,
     Hardware,
     Knobs,
-    Stale { age_secs: u64 },
+    Stale {
+        age_secs: u64,
+    },
+    /// #3267 — it carries learned denies and is older than a day.
+    StaleLearned {
+        age_secs: u64,
+    },
 }
 
 impl Miss {
@@ -122,6 +155,10 @@ impl Miss {
             Miss::Stale { age_secs } => {
                 format!("cached probe is {age_secs} s old (max {MAX_AGE_SECS})")
             }
+            Miss::StaleLearned { age_secs } => format!(
+                "cached probe learned to deny a cell and is {age_secs} s old (max \
+                 {MAX_AGE_LEARNED_SECS}): testing that cell again"
+            ),
         }
     }
 }
@@ -265,6 +302,9 @@ pub(crate) fn load_matching(path: &Path, key: &CacheKey, now_unix: u64) -> Resul
     if age_secs > MAX_AGE_SECS {
         return Err(Miss::Stale { age_secs });
     }
+    if !file.learned_deny.is_empty() && age_secs > MAX_AGE_LEARNED_SECS {
+        return Err(Miss::StaleLearned { age_secs });
+    }
     Ok(file)
 }
 
@@ -380,6 +420,94 @@ mod tests {
         assert!(load_matching(&path, &key(), 1_000 + MAX_AGE_SECS).is_ok());
         // A clock that went backwards is not stale.
         assert!(load_matching(&path, &key(), 10).is_ok());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    fn learned_vulkan() -> Vec<crate::encode::cells::LearnedDeny> {
+        vec![crate::encode::cells::LearnedDeny {
+            cell: "hevc_vulkan:yuv420".into(),
+            why: "exit code: 0xc0000005".into(),
+            confirmed: true,
+        }]
+    }
+
+    /// #3267 — a learned deny rides the cache with the caps it produced, so a
+    /// restart under the same key neither re-pays the deaths nor lets a session
+    /// open what the matrix leaves out.
+    #[test]
+    fn a_learned_deny_round_trips_with_the_caps() {
+        let path = tmp_path("learned-rt");
+        let file = CacheFile::new(key(), 1_000, 15_000, hw_caps(), None)
+            .with_learned_deny(learned_vulkan());
+        store(&path, &file).unwrap();
+        let back = load_matching(&path, &key(), 1_000 + 60).expect("hit");
+        assert_eq!(back.learned_deny, learned_vulkan());
+        assert_eq!(back.caps.video_cells, hw_caps().video_cells);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// #3267 — the healing. A driver update, a new build or any knob change is
+    /// a miss, and with the file goes the list: the next probe starts with
+    /// nothing denied and tests the cell again, with nobody acting. The driver
+    /// is the one that matters: AMD ships a fix, this host takes it, and the
+    /// cell comes back by itself.
+    #[test]
+    fn a_learned_deny_does_not_survive_a_changed_key() {
+        let path = tmp_path("learned-heal");
+        store(
+            &path,
+            &CacheFile::new(key(), 1_000, 1, hw_caps(), None).with_learned_deny(learned_vulkan()),
+        )
+        .unwrap();
+        assert!(load_matching(&path, &key(), 1_001).is_ok(), "the control");
+        let mut k = key();
+        k.hardware = "windows;os=26100.1;hw=AMD|32.0.99999.1|PCI\\VEN_1002".into();
+        assert_eq!(load_matching(&path, &k, 1_001).unwrap_err(), Miss::Hardware);
+        let mut k = key();
+        k.build = "0.4.196/1/1".into();
+        assert_eq!(load_matching(&path, &k, 1_001).unwrap_err(), Miss::Build);
+        let mut k = key();
+        k.knobs = "encoder_cells_deny cleared".into();
+        assert_eq!(load_matching(&path, &k, 1_001).unwrap_err(), Miss::Knobs);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// #3267 — two faults are good evidence and not proof, so an answer that
+    /// learned a deny stands for a day where a clean one stands for a week. A
+    /// GPU reset that landed on both runs costs a cell for a day at most.
+    #[test]
+    fn an_answer_with_a_learned_deny_stands_for_a_day() {
+        let path = tmp_path("learned-age");
+        store(
+            &path,
+            &CacheFile::new(key(), 1_000, 1, hw_caps(), None).with_learned_deny(learned_vulkan()),
+        )
+        .unwrap();
+        assert!(load_matching(&path, &key(), 1_000 + MAX_AGE_LEARNED_SECS).is_ok());
+        assert_eq!(
+            load_matching(&path, &key(), 1_000 + MAX_AGE_LEARNED_SECS + 1).unwrap_err(),
+            Miss::StaleLearned {
+                age_secs: MAX_AGE_LEARNED_SECS + 1
+            }
+        );
+        // A clean answer keeps its week.
+        store(&path, &CacheFile::new(key(), 1_000, 1, hw_caps(), None)).unwrap();
+        assert!(load_matching(&path, &key(), 1_000 + MAX_AGE_SECS).is_ok());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// #3267 — a file written before the field existed reads as nothing learned.
+    #[test]
+    fn a_file_without_the_field_learned_nothing() {
+        let path = tmp_path("learned-old");
+        store(&path, &CacheFile::new(key(), 1_000, 1, hw_caps(), None)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("learned_deny"),
+            "an empty list is not written: {text}"
+        );
+        let back = load_matching(&path, &key(), 1_001).expect("hit");
+        assert!(back.learned_deny.is_empty());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

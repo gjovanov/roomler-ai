@@ -64,6 +64,15 @@ impl OutputCodec {
         }
     }
 
+    /// #3267 — the name the denylist knows this cell by.
+    pub(crate) fn cell_name(&self) -> &'static str {
+        match self {
+            Self::H264 => crate::encode::cells::MF_H264,
+            Self::Hevc => crate::encode::cells::MF_HEVC,
+            Self::Av1 => crate::encode::cells::MF_AV1,
+        }
+    }
+
     fn subtype_guid(&self) -> GUID {
         match self {
             Self::H264 => MFVideoFormat_H264,
