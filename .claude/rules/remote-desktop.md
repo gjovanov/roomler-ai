@@ -59,11 +59,11 @@ backend × chroma cell matrix, and the per-backend traps (NVENC / QSV / AMF /
 VAAPI / D3D12 / Vulkan / VideoToolbox) — lives in the **`encoder-cells` skill** and
 `docs/encoders.md`. Three that must not be re-learned the hard way:
 
-- ⚠️ The probe runs in a **child process**, and *any* failure means "no hardware".
-  A capability probe is untrusted third-party code by definition (vendor drivers,
-  GPU firmware) and does not belong in the daemon's address space — before this, a
-  fault inside one took `roomlerd` down and the service manager restarted it
-  straight back into the same probe.
+- ⚠️ The probe runs in a **child process**, and a failure costs the cell it died in
+  or, with no cell to blame, "no hardware" (#3267). A capability probe is untrusted
+  third-party code by definition (vendor drivers, GPU firmware) and does not belong
+  in the daemon's address space — before this, a fault inside one took `roomlerd`
+  down and the service manager restarted it straight back into the same probe.
 - ⚠️ **A gate applies at every entry point, or it is a courtesy**: the cell
   denylist was probe-only until 0.4.90, and a session happily opened a denied cell
   the hello never advertised.

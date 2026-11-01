@@ -1578,6 +1578,12 @@ pub struct AgentConfig {
     /// result that opened a hardware cell. Built-in: on.
     #[serde(default)]
     pub caps_cache: Option<bool>,
+    /// #3267 — when the encoder probe's `base` child dies inside one cell, run
+    /// it again and cost that cell rather than the host
+    /// (`ROOMLERD_CAPS_LEARN_DENY`). Off puts back one child, whose death means
+    /// no hardware. Built-in: on. Read at start.
+    #[serde(default)]
+    pub caps_learn_deny: Option<bool>,
     /// FR-119 — offer a viewer that asks a frame rate above 60
     /// (`ROOMLERD_FPS_HIGH`): advertise `fps-high`, and grant a higher rate
     /// only on a direct path, on a rate class this host has proven (or as a
@@ -3028,6 +3034,7 @@ pub fn test_fixture() -> AgentConfig {
         relay_probe: None,
         text_mod_neutralize: None,
         caps_cache: None,
+        caps_learn_deny: None,
         fps_high: None,
         encoder_cells_deny: None,
         fps_deny: None,
@@ -3156,7 +3163,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 92] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 93] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -3259,6 +3266,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 92]
         ("RELAY_PROBE", cfg.relay_probe),
         ("TEXT_MOD_NEUTRALIZE", cfg.text_mod_neutralize),
         ("CAPS_CACHE", cfg.caps_cache),
+        ("CAPS_LEARN_DENY", cfg.caps_learn_deny),
         ("FPS_HIGH", cfg.fps_high),
         ("ZERO_COPY", cfg.zero_copy),
         ("COLOR_DESCRIPTION", cfg.color_description),
