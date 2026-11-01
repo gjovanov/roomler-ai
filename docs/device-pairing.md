@@ -277,7 +277,7 @@ gate was gone at delivery must all leave a trace.
 **Durable or bounded.** Every decision about a real pairing and everything a signed-in
 account does is a durable row: every `start ok`, every `lookup`, `approve` and `deny` with
 either outcome, every `deliver`, `expire` and `gate_lost`. A refusal an anonymous caller can
-repeat at will — an address past its ceiling, a body that is not a request, a code that names
+repeat at will — an address past its ceiling, a `start` body that is not a request, a code that names
 nothing, a poll too soon, a poll after delivery — is written **once per
 `(action, reason, address)` per hour per pod**, the repeats counted in a debug line
 (`Audit::record`, `pairing.rs:466-481`; `WindowLimiter::once`, `rate_limit.rs:200-220`), or a
