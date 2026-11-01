@@ -4390,6 +4390,7 @@ async fn run_cmd(
     wd.register("capture", std::time::Duration::from_secs(30), false);
     let _ = watchdog::install(wd.clone());
     watchdog::spawn_thread_watchdog(wd.clone());
+    tokio::spawn(roomlerd::resource_watch::run(shutdown_rx.clone()));
     let wd_task = tokio::spawn({
         let wd = wd.clone();
         let rx = shutdown_rx.clone();
