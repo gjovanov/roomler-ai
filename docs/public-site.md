@@ -462,6 +462,8 @@ writes `date` as the moment it publishes. Rules for any publisher:
   `/blog/_release.txt`, which is how a release that was uploaded but never served gets noticed.
 - It holds one credential: a MinIO user limited to the `roomler-blog` bucket. The pods hold none,
   because the bucket's content is the public blog and anonymous download works inside the cluster.
+- ⚠️ IndexNow's answer does not stop a publish. The post is live by then, and a refused or failed
+  call is not retried. The publisher keeps the status in its own audit record and nowhere else.
 - A hand-written post merged to master reaches the lane at the publisher's next rebuild, with no
   promote.
 

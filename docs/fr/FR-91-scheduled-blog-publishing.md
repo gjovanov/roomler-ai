@@ -129,7 +129,7 @@ sequenceDiagram
     P->>M: put releases/<id>/** then current = <id>
     M-->>N: sidecar mirrors <id>, swaps the symlink
     P->>E: GET /blog/<slug>/ signed out: 200, canonical, headers == /docs/
-    P->>P: indexnow.sh changed + submit (200/202)
+    P->>P: POST the post's URLs to IndexNow (200/202)
     P->>P: later: PR adding the post to ui/blog/posts/ (the archive)
 ```
 
@@ -188,13 +188,13 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
   page, the feed and `sitemap-blog.xml` equal once `/blog/assets/` reads `/docs/assets/`, and that the lane
   names nothing under `/docs/assets/`
   ([step log 2](https://github.com/gjovanov/roomler-ai/issues/1880#issuecomment-6070929601)).
-- [~] **AC2:** a new post goes live on production with **zero** `roomler2` restarts and unchanged pod
+- [x] **AC2:** a new post goes live on production with **zero** `roomler2` restarts and unchanged pod
   ages, measured before and after the publish.
-  **Partly met:** the lane has published daily since 2026-10-21 with no promote in the path, and P2's sync
-  left the same two pods with the same start times and 0 restarts
+  **Met 2026-11-01** on a real post (§8): `how-does-socks5-proxy-work` was published at 06:00:04Z, between
+  pod reads at 05:46:47Z and 06:00:46Z. Both reads show the same two pods on `hosted-20261101-5d59e47`, the
+  same start times and 0 restarts, and the last promote was at 03:12Z, before the first read. P2's sync had
+  shown the same for a release with no post
   ([step log 3](https://github.com/gjovanov/roomler-ai/issues/1880#issuecomment-6078426445)).
-  **Missing:** a bracket around a post. On 2026-10-31 the pods started at 09:37Z, a promote, after that
-  morning's 06:37Z post, so that post proves nothing about their ages. Owed at the 2026-11-01 post.
 - [x] **AC3:** the served `/blog/<slug>/` sends CSP, HSTS, X-Frame-Options, X-Content-Type-Options,
   Referrer-Policy and Permissions-Policy byte-identical to `/docs/`, and the `--blog` smoke passes.
   Negative control: drop the include from the blog config, and the smoke fails.
@@ -205,10 +205,11 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
   2026-10-30 23:17Z against that morning's release: 13/13 again (§8).
 - [~] **AC4:** `sitemap-blog.xml` and `/blog/feed.xml` list the new post within a minute of publishing,
   and IndexNow answers 200 or 202 for it.
-  **Partly met:** for the 2026-10-31 post, published 06:37:10Z, both pods wrote `sitemap-blog.xml` and
-  `feed.xml` at 06:37:21–22Z (§8), and the mirror swaps a release in right after writing it.
-  **Missing:** a read of the served files through the flip, owed at the 2026-11-01 post, and IndexNow's
-  answer, which only the publisher sees.
+  **Partly met:** the served half, read through the flip of the 2026-11-01 post. Published 06:00:04Z, both
+  files first named it at 06:00:28Z, then on six reads running (§8). That is 24 s at most: the reads began
+  when the flip was seen, at 06:00:27Z.
+  **Missing:** IndexNow's answer. The publisher stores it only in its own audit record and logs nothing
+  about it (§8), so the operator reads it there.
 - [ ] **AC5:** with the two edge locations removed, the image's blog serves and the smoke passes for the
   older post. Restoring them serves the lane again.
 - [ ] **AC6:** with the bucket unreachable, the running `roomler-blog` pods keep serving the last
@@ -280,6 +281,10 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
 | 2026-10-31 17:37Z | AC6 natural experiment: `minio-0` started 10-12, the `roomler-blog` pods 10-20, so MinIO has not restarted under the running pods | no outage to read; AC6 needs a real fault |
 | 2026-10-31 17:52Z | AC4: `published` 06:37:10Z, release `20261031T063710Z-securely-access-home-server-remotely`. `Last-Modified` of `sitemap-blog.xml` and `feed.xml` is 06:37:21Z on one pod and 06:37:22Z on the other (the mirror's `wget` stamps its fetch time) | both pods held the files 12 s after the publish moment |
 | 2026-10-31 17:45Z | The archive: 2 posts in `ui/blog/posts/`, 21 in the lane, 19 only in the lane | §6 decision 4 |
+| 2026-10-31 18:41Z | AC4, IndexNow: the publisher's application log, 14 h covering the 10-31 post, counted and never printed. Control: the same filter on a planted line returned `1 202` | 112 lines, 0 naming IndexNow. The answer exists only in the publisher's audit record, where 0 means the call failed. A refused or failed call does not fail the publish and is not retried |
+| 2026-11-01 06:00Z | AC2: `roomler2` read at 05:46:47Z and 06:00:46Z around the real post `how-does-socks5-proxy-work`, `published` 06:00:04Z. Last promote 03:12Z | unchanged: the same two pods, started 03:13:00Z and 03:13:17Z, 0 restarts, `hosted-20261101-5d59e47` |
+| 2026-11-01 06:00Z | AC4, served half: release `20261101T060004Z-how-does-socks5-proxy-work` first seen 06:00:27Z. `sitemap-blog.xml` and `feed.xml` first named the post at 06:00:28Z, then on six reads running. `Last-Modified` 06:00:16Z | within 24 s of `published` |
+| 2026-11-01 06:01Z | AC3: `public-site-smoke.sh --blog https://roomler.ai` against that release | all checks passed |
 
 Negative controls for P3, each run and restored (hashes compared):
 
