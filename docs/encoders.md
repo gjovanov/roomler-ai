@@ -19,6 +19,7 @@ the words below are the glossary's ([`CONTEXT.md`](../CONTEXT.md)).
 | **probe** | the real-bytes trial that proves a cell on a host | `roomlerd caps-probe` |
 | **probe cache** | the remembered answer of the last probe, kept only under the build, hardware, drivers and settings that produced it | `caps-cache.json` |
 | **denylist** | cells a device must not open or advertise — the kill switch | `hevc_qsv:yuv444` |
+| **learned deny** | a cell this host stopped opening because a probe child died in it, kept only in the probe cache and tested again when the key changes | `hevc_vulkan:yuv420` |
 
 ## The pipeline
 
@@ -225,16 +226,21 @@ A capability probe is untrusted third-party code by definition — vendor driver
 and, through them, GPU firmware — so it does not run in the daemon's address
 space. `encode::caps::detect()` (`agents/roomlerd/src/encode/caps.rs`) answers
 from the cache when it can, and otherwise spawns `roomlerd caps-probe` two or
-three times:
+three times, more if a `base` child dies:
 
 ```mermaid
 flowchart TD
     S([daemon start]) --> K{cache key?<br/>build × hardware × knobs}
     K -- "macOS: no fingerprint<br/>ROOMLERD_CAPS_CACHE=0" --> B
     K --> L{caps-cache.json<br/>same key, < 7 days?}
-    L -- hit --> M[merge: driver-derived fields from the cache,<br/>permissions / verbs recomputed now<br/>probe_cached = true; the proven<br/>GPU-input forms installed]
+    L -- hit --> M[merge: driver-derived fields from the cache,<br/>permissions / verbs recomputed now<br/>probe_cached = true; the proven<br/>GPU-input forms and learned denies installed]
     L -- "miss (reason logged)" --> B["child 1 — ROOMLERD_CAPS_PHASE=base<br/>every 4:2:0 cell, the software cells,<br/>the vp9_qsv IDR verdict"]
-    B -- "died / hung / unparseable" --> F[driver-free caps,<br/>no hardware advertised]
+    B -- "died / hung, no report" --> R{"run_base: at most 9 runs,<br/>none started after 90 s"}
+    R -- "same cell twice, or a hang:<br/>denied, and run again" --> B
+    R -- "first death in a cell,<br/>or none to blame: run again" --> B
+    R -- "out of runs or time,<br/>or two deaths with no cell" --> SW["one more child — PHASE=software<br/>libvpx's cell alone: it needs no driver"]
+    SW -- "ROOMLER_CAPS_JSON: no hardware,<br/>and what was learned still holds" --> C
+    SW -- "died / hung" --> F[driver-free caps,<br/>no hardware advertised]
     B -- ROOMLER_CAPS_JSON --> C{candidates_444:<br/>hardware NVENC / QSV / VAAPI cells<br/>on the 4:4:4-capable list, minus the denylist}
     C -- none --> P
     C -- some --> T["child 2 — PHASE=444<br/>ROOMLERD_CAPS_444_NAMES=…<br/>announces each open on stdout first"]
@@ -247,10 +253,10 @@ flowchart TD
     P -- some --> U["child 3 — PHASE=gpu<br/>ROOMLERD_CAPS_GPU_NAMES=…<br/>each GPU-input form opened on a device of its<br/>frames' adapter, two GPU frames encoded<br/>(VideoToolbox: IOSurface frames until a packet)"]
     U -- ROOMLER_CAPS_GPU --> V[gpu_input: the forms<br/>a session may open]
     U -- "died / hung" --> V2["no GPU-input form, and the log names<br/>the last open — the entry for zero_copy_deny"]
-    V --> W{any hardware cell?}
+    V --> W{any hardware cell, and no cell<br/>denied on a hang or a kill only?}
     V2 --> W
-    W -- yes --> ST[store caps-cache.json atomically]
-    W -- no --> N[not cached: a boot-time<br/>driver race must not be frozen]
+    W -- yes --> ST[store caps-cache.json atomically,<br/>with the confirmed learned denies]
+    W -- no --> N[not cached: a boot-time driver race<br/>or a transient must not be frozen]
     ST --> H([hello: video_cells, probe_ms, probe_cached])
     N --> H
     M --> H
@@ -259,10 +265,11 @@ flowchart TD
 
 | Outcome of a child | Verdict |
 |---|---|
-| non-zero exit, or killed by a signal | phase base: no hardware advertised (logged at ERROR with the status) · phase 444: the 4:2:0 matrix, the last announced open named · phase gpu: every cell as before, no GPU-input form, the last announced open named |
-| still running after 60 s | killed; as above |
-| could not spawn / output unparseable | as above |
-| clean exit with a marked line | those caps, as reported |
+| non-zero exit, or killed by a signal | phase base: it costs the cell it died in, not the host ([below](#a-dead-child-costs-the-cell-it-died-in)), and no hardware only when there is no cell to blame (logged at ERROR with the status) · phase 444: the 4:2:0 matrix, the last announced open named · phase gpu: every cell as before, no GPU-input form, the last announced open named |
+| still running after 60 s | killed; as above, except that phase base does not confirm a hang with a second one |
+| could not spawn | no answer from that phase, no retry |
+| clean exit with no marked line | inside an open: as a non-zero exit (a driver that called `exit(0)`) · otherwise no answer from that phase, no retry |
+| a marked line, however the child ended after it | those caps, as reported (phase base; a learning-off run needs a clean exit) |
 
 Why two children (P3c): on the 0.4.84 roll CORPLAP-3's Intel media runtime died
 with `0xc0000005` on the first `vp9_qsv` 4:4:4 open over VUYX, and with ONE child
@@ -302,10 +309,11 @@ display driver produces); a hit takes **only** the driver-derived fields
 (`hw_encoders`, `codecs`, `transports`, `hevc_chroma`, `vp9_chroma`,
 `video_cells`, the vp9_qsv IDR verdict) and recomputes permissions, the
 GUI-session state and every verb list; the hello then says `probe_cached: true`
-with `probe_ms` = the cached probe's duration. Every miss logs its reason. On a
-Windows service host the WORKER (console session) runs the probe and owns the
-cache file. Measured: a hit answers 0.5 s after `agent starting` where the probe
-took 3.6 s.
+with `probe_ms` = the cached probe's duration. Every miss logs its reason. A
+confirmed learned deny rides the file with the caps, and a hit installs it, so
+a session stays out of what the matrix leaves out. On a Windows service host the
+WORKER (console session) runs the probe and owns the cache file. Measured: a hit
+answers 0.5 s after `agent starting` where the probe took 3.6 s.
 
 ⚠️ **The knob half of the key makes every `ROOMLERD_*` variable a probe
 trigger, including ones that have nothing to do with encoding.** Flipping a
@@ -355,6 +363,107 @@ Implementation notes that keep the child honest:
   reached a session.
 - `ROOMLERD_HW_AUTO=0` and `ROOMLERD_ENCODER=software` do **not** skip the probe.
   Those select an encoder; the probe enumerates what to *advertise*.
+
+### A dead child costs the cell it died in
+
+`base` is still one process, and three vendor faults have now landed in it: Intel's
+VUYX open, radeonsi's flush, and AMD's `amdenc64.dll` on `hevc_vulkan` (#3267). The
+last one cost a Radeon laptop its RTX 5090's three NVENC cells and all four
+DataChannel transports for 4 h 22 min, and the viewer looked healthy throughout.
+So `base` announces every open (`ROOMLER_CAPS_PROGRESS:<name>:<chroma>`, and
+`ROOMLER_CAPS_PROGRESS:-` once it has ended, its teardown included), and the
+parent runs it again ([`run_base`](../agents/roomlerd/src/encode/caps.rs#L539)).
+
+```mermaid
+sequenceDiagram
+    participant P as parent (worker)
+    participant C as base child
+    P->>C: run 1, nothing denied
+    C--xP: dies, last_open = hevc_vulkan:yuv420, 0xc0000005
+    Note over P: a suspect, not a verdict:<br/>a transient must get the chance to pass
+    P->>C: run 2, nothing denied
+    C--xP: dies in the same open, 0xc0000005
+    Note over P: confirmed: denied and kept
+    P->>C: run 3, ROOMLERD_ENCODER_CELLS_LEARNED=hevc_vulkan:yuv420
+    C-->>P: ROOMLER_CAPS_JSON (11 cells)
+    Note over P: 444 and gpu children as usual,<br/>then stored in caps-cache.json with the list
+```
+
+What earns a cell a place on the list:
+
+| The child ended | With `last_open` | Next run | The deny |
+|---|---|---|---|
+| a fault's status, in the same cell as the run before | named | without the cell | **confirmed**: cached |
+| a fault's status, first time in this cell | named | unchanged | none yet: a clean next run leaves the matrix whole |
+| any other death, in the same cell as the run before (a kill, an `exit()`) | named | without the cell | this process only; the result is not cached |
+| hung for 60 s | named | without the cell, no confirming run | this process only; the result is not cached |
+| any death | none, or `-` | unchanged, once | none. A second one gives up: no hardware, not cached |
+
+**Giving up** means no hardware, and not no video. When `base` is out of runs or time or
+has no cell to blame, one more child (`ROOMLERD_CAPS_PHASE=software`) opens libvpx and
+nothing else, because libvpx needs no driver. The host keeps `data-channel-vp9-444`
+instead of falling to the RTP track, and answers like any host with no hardware
+encoder. It is a child and not an open in the daemon because this is a host whose probes
+have been dying. Only if that child dies as well is the answer the driver-free caps.
+
+A **fault's status** ([`is_fault`](../agents/roomlerd/src/encode/caps.rs#L338)) is
+what a driver leaves when it faults, and not what someone else leaves when they end
+the process. On Windows that is an exit code with an NTSTATUS severity of "error"
+(`0xC0000005`, `0xC000001D`, `0xC0000374`, `0xC0000409`, `0xC00000FD`), minus the ones
+that are about the host and not the open: Ctrl+C, out of memory or commit, an image
+that was refused or would not load. And 255, because 2 of the 7 AMD deaths read
+`exit code: 255` with an Application Error event for the same fault behind each; that
+Windows Error Reporting's termination is the source is a guess. On Linux and macOS it
+is SIGSEGV, SIGBUS, SIGILL, SIGFPE or SIGABRT, never SIGKILL (the OOM killer, an EDR)
+or SIGTERM.
+
+⚠️ **Two faults in a row are good evidence, not proof.** A GPU reset can land on both.
+So an answer with a learned deny stands for a day where a clean one stands for a week
+(`MAX_AGE_LEARNED_SECS`), and any key mismatch throws the list away with the file. The
+next probe starts with nothing denied and tests the cell again. A driver update
+changes the hardware fingerprint, so a vendor's fix heals with nobody acting. A new
+build does the same, and so does any `ROOMLERD_*` knob, which is how an operator forces
+a re-test (`roomler config clear encoder_cells_deny` keeps its effect, and a restart
+then re-probes).
+
+⚠️ **The learned list is not `encoder_cells_deny`.** That key still REPLACES the
+built-in list, and still goes back to it when cleared. The learned cells add to
+whichever list is in force (`cells::denied_cells`) and are never written to the config.
+`none` empties the operator's list and leaves them alone. `caps_learn_deny = false` is
+the way past them, and the kill switch: one child, and its death means the driver-free
+caps, as before.
+
+⚠️ **A session honours the same list, because the same fault would end the worker.**
+The FFmpeg cascades read it through `cells::names_420` / `names_444`, the rebuild
+through `new_preferred`. Media Foundation (`h264_mf`, `hevc_mf`, `av1_mf`) and libvpx
+(`vp9_libvpx`) refuse in their constructors, so the names work in
+`encoder_cells_deny` too. A process the worker starts gets the list as
+`ROOMLERD_ENCODER_CELLS_LEARNED` (`learned_for_child`): the probe's next child and a
+recorder. A `roomlerd record` run by hand and the recording editor's `media export` do
+not get it, and a fault there costs that process alone. `encoder-smoke --name` still
+opens what it is told to: driving a denied cell under the harness is what it is for.
+
+**The cost.** `base` runs at most 9 times per probe (four cells at two deaths each, and
+the run that reports), and no run starts more than 90 s after the first. The worst case
+is therefore 90 s plus one 60 s timeout, 150 s against 60 s before; with the 4:4:4 and GPU
+children, 270 s against 180 s. Giving up adds the software child (60 s at most) and takes
+those two away, so that path tops out at 210 s. It needs a host whose children each take a minute. The
+probe runs before the worker connects (#2551), with the watchdog's pump gated off, so
+this is time the device is offline, and only on a cache miss. Measured on the dev box
+with AMD's real fault (a debug build, run by hand from Git Bash): two deaths and a report
+in 7.2–7.8 s, against 3.4–3.8 s for the same probe with the cell denied from the start. A
+hung child (suspended, standing in for a driver) cost 63 s, and two of them, which is
+giving up, 120 s. Those deaths took 1.9–2.1 s each and left no Application Error event.
+Under the service each of the same faults took
+3.9–15 s (the log of 2026-11-01), so expect 15–35 s there. A healthy host pays nothing:
+one run, and two more lines per open on a pipe.
+
+**Where to see it.** The log names the cell and the status at each step, at ERROR once
+denied. `roomlerd caps` prints `learned_deny:`. The hello carries it in
+`AgentCaps.unavailable["encoder-cells"]` (code `learned-deny`), so a fleet read of
+`agents.capabilities` sees it with no server change, and
+`scripts/fr97-caps-census.sh` counts it. No viewer asks for that key, so the person at
+the viewer is still told nothing.
 
 ## Selection at session time
 
@@ -446,7 +555,7 @@ own, and only a restart freed them.
   microseconds. Ending one between adapters would make the next adapter build a new instance, and
   so change what wins on every host with two GPUs.
 - ⚠️ **The winner's activation moves into its pipeline**, in the field declared first
-  (`encode/mf/sync_pipeline.rs:96`), so the MFT ends while its transform and device are still held.
+  (`encode/mf/sync_pipeline.rs:105`), so the MFT ends while its transform and device are still held.
 - `cargo test -p roomlerd --lib --features mf-encoder -- --ignored closed_encoder` measures it. It
   needs a host's real drivers, so no CI lane runs it. It encodes after the cascade returns, because
   the cascade's own probe runs before the losers end. With `ROOMLERD_MF_SHUTDOWN=0` it fails the way
@@ -772,13 +881,13 @@ colour-manages by primaries and transfer (FR-130 §2.5).
 | Family | Where it is written | What the bitstream carries (read on neo16 in P1, and in the field in P3) |
 |---|---|---|
 | FFmpeg, every backend | the codec context's four fields in `build_encoder` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1912`), before the open, for every cell, rebuild, probe, recording and GPU form | NVENC, D3D12 and Vulkan: set S exactly (H.264, HEVC and AV1; NVENC 4:4:4 too). QSV (AV1, H.264) and VideoToolbox (HEVC, H.264): set S, as Chrome's decoder reads it in the field when it is told nothing. `hevc_amf`: S's values, with the matrix under code 5 (BT.470 BG, the same coefficients). `h264_amf`: matrix 2 (unspecified), AMD's runtime's choice. `vp9_qsv`, `vp9_vaapi`: nothing, because FFmpeg 9.0.1 cannot tag VP9 there. VAAPI: not yet read |
-| Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES` and `MF_MT_TRANSFER_FUNCTION` on both media types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:610`), and again on the renegotiated output type | Microsoft's H.264 and HEVC encoders ignore the attributes and write no description. NVIDIA's and AMD's MF encoders did not open on neo16, so they are unread |
+| Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES` and `MF_MT_TRANSFER_FUNCTION` on both media types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:619`), and again on the renegotiated output type | Microsoft's H.264 and HEVC encoders ignore the attributes and write no description. NVIDIA's and AMD's MF encoders did not open on neo16, so they are unread |
 | openh264, live | the SPS VUI (`agents/roomlerd/src/encode/openh264_backend.rs:116`) | set S |
-| libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:435`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
+| libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:454`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
 | openh264, recording | its own VUI and the MP4 `colr` box, unchanged since FR-85 | SMPTE 170M at limited range |
 
 A vendor runtime that refuses the description opens the encoder without it rather than failing the open.
-While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:1833`).
+While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:2252`).
 
 **Which lever reaches which path:**
 
@@ -814,8 +923,9 @@ source's CSS values.
 | Key (config.toml / `roomler config set`) | Env | Default | What |
 |---|---|---|---|
 | `encoder_preference` | `ROOMLERD_ENCODER` (CLI `--encoder` wins) | `auto` | `auto` · `hardware` · `software` |
-| `encoder_cells_deny` | `ROOMLERD_ENCODER_CELLS_DENY` | the built-in list | `name:chroma` cells never opened nor advertised; `none` = deny nothing; pushable through remote config (`MANAGE_AGENTS`), `needs_restart`. On a supervised Mac the session's encoders open in the GUI worker, which reads the person's config, so the root's effective value is handed to it at spawn (FR-43, `WORKER_ENV_FORWARD`, from 0.4.155); before that a root-side deny bound the probe and the hello but not the worker's sessions |
+| `encoder_cells_deny` | `ROOMLERD_ENCODER_CELLS_DENY` | the built-in list | `name:chroma` cells never opened nor advertised; `none` = deny nothing; a cell the probe learned stays denied on top of it; pushable through remote config (`MANAGE_AGENTS`), `needs_restart`. On a supervised Mac the session's encoders open in the GUI worker, which reads the person's config, so the root's effective value is handed to it at spawn (FR-43, `WORKER_ENV_FORWARD`, from 0.4.155); before that a root-side deny bound the probe and the hello but not the worker's sessions |
 | `caps_cache` | `ROOMLERD_CAPS_CACHE` | on | the probe cache (read and write) |
+| `caps_learn_deny` | `ROOMLERD_CAPS_LEARN_DENY` | on | a dead `base` child costs the cell it died in ([above](#a-dead-child-costs-the-cell-it-died-in)); off = one child, and its death means no hardware. A change is a knob change, so the next start re-probes. Not pushable through remote config |
 | `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them; on macOS the display stream's IOSurfaces go to a proven VideoToolbox cell ([above](#gpu-resident-frames-the-input-path-fr-118)). On a supervised Mac the root's value is handed to the GUI worker at spawn (`WORKER_ENV_FORWARD`, from FR-118 P5) |
 | `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing. Handed to a supervised Mac's GUI worker as `zero_copy` is. Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`, passed on unread like the other denylists; a blank push clears it (FR-132 P1, [remote-config.md](remote-config.md)). `zero_copy` itself is not pushable |
 | `color_description` | `ROOMLERD_COLOR_DESCRIPTION` | on | every encoder writes the colour description its input was converted with (BT.601 matrix, BT.709 primaries, sRGB transfer, limited range: `encode::color_desc::DESCRIPTION`, [FR-130](fr/FR-130-colours-decode-true.md)), and the hello says `color-described`; `false` writes the undescribed stream of earlier agents. Read at every encoder open, so a restart applies it; the probe and recorder children, a hand-run `roomlerd record`, `encoder-smoke` and the recording editor's `media export` follow it (the export reads the config file only where the person running it can read it), and a supervised Mac's GUI worker gets the root's value (`WORKER_ENV_FORWARD`). Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`: a push of `off` or `on` sets it, and a blank one clears it back to on (FR-130 P1b, [remote-config.md](remote-config.md)). Not every encoder can carry it: `vp9_qsv` and `vp9_vaapi` (FFmpeg writes none), Microsoft's MF encoders (they ignore the attributes), and `h264_amf`'s matrix (AMD's H.264 runtime writes 2) |

@@ -122,6 +122,9 @@ pub struct MfEncoder {
     /// startup. Consulted by `VideoEncoder::is_hardware`; the peer media
     /// pump reads that to trigger auto-downscale on SW HEVC at 4K.
     backend_kind: &'static str,
+    /// #3267 — the worker, so the capability probe can wait out its teardown
+    /// ([`MfEncoder::shut_down_within`]). Nothing else joins it.
+    worker: thread::JoinHandle<()>,
 }
 
 /// #2283 — the backend kind of the default-adapter software MFT when it
@@ -180,11 +183,20 @@ impl MfEncoder {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("mf-encoder: require non-zero, even dimensions, got {width}x{height}");
         }
+        // #3267 — every MF open comes through here, the probe's and a
+        // session's, and a session's is in the daemon.
+        if crate::encode::cells::cell_denied(
+            &crate::encode::cells::denied_cells(),
+            codec.cell_name(),
+            roomler_ai_remote_control::models::ChromaFormat::Yuv420,
+        ) {
+            bail!("{}:yuv420 is on the device denylist", codec.cell_name());
+        }
 
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<&'static str>>();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<Cmd>();
 
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name(format!("roomlerd-mf-encoder-{}", codec.backend_name()))
             .spawn(move || {
                 // 1. Initialise COM for this thread. MTA because MF is
@@ -233,7 +245,19 @@ impl MfEncoder {
             height,
             codec,
             backend_kind,
+            worker,
         })
+    }
+
+    /// #3267 — end the encoder and wait up to `limit` for its worker to finish
+    /// the teardown. Polled, because a thread has no timed join; a teardown
+    /// that outlasts the limit runs on, as it does after a plain drop.
+    pub(crate) fn shut_down_within(self, limit: std::time::Duration) {
+        let _ = self.cmd_tx.send(Cmd::Shutdown);
+        let deadline = std::time::Instant::now() + limit;
+        while !self.worker.is_finished() && std::time::Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// #2283 — did the cascade end on Microsoft's software MFT with no GPU

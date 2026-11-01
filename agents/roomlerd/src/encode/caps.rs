@@ -102,8 +102,8 @@ pub fn summarize(
 }
 
 /// FR-84 D4 — what the LocalAPI `EncoderCaps` verb answers: the CACHED
-/// probe (never a fresh one), the denylist in force (env > config > built-in)
-/// and the preference `run` resolved.
+/// probe (never a fresh one), the denylist in force (env > config > built-in,
+/// plus what the probe learned, #3267) and the preference `run` resolved.
 pub fn summarize_cached() -> tunnel_core::localapi::EncoderCapsSummary {
     summarize(
         cached().as_ref(),
@@ -130,9 +130,11 @@ pub fn summarize_cached() -> tunnel_core::localapi::EncoderCapsSummary {
 /// So the probes run behind a process boundary and **"the child died" is read
 /// as "codec unavailable"**. That retires the whole class rather than the one
 /// CUDA symptom: any future driver that faults, hangs, or calls `exit()` costs
-/// this host its HW advertisement and nothing more.
+/// this host at most its HW advertisement, and since #3267 only the cell it
+/// was opening when it can name one ([`run_base`]).
 mod child {
     use super::AgentCaps;
+    use crate::encode::cells::{self, LearnedDeny};
     use roomler_ai_remote_control::models::{ChromaFormat, VideoBackend, VideoCodec};
 
     /// Marks the line carrying the child's JSON, so log output on the same
@@ -150,6 +152,34 @@ mod child {
     /// record of which open a dying child was inside; the parent quotes the
     /// last one in its verdict.
     pub(super) const PROGRESS: &str = "ROOMLER_CAPS_PROGRESS:";
+    /// #3267 — the value of a `PROGRESS` line that says the open before it
+    /// ended, so a child that dies between opens (an enumeration, its own
+    /// exit) is not read as dying in the last cell it opened.
+    pub(super) const NO_OPEN: &str = "-";
+
+    /// #3267 — one open in the `base` phase, announced for as long as this
+    /// lives, so `last_open` names the cell if the process dies in it. Holds
+    /// across the encoder's teardown too: radeonsi's fault was in the flush.
+    /// Silent outside a probe child: nobody else reads these lines.
+    pub(super) struct OpenWindow;
+
+    impl OpenWindow {
+        pub(super) fn begin(name: &str, chroma: ChromaFormat) -> Self {
+            if super::in_probe_child() {
+                emit(&format!("{PROGRESS}{name}:{}", chroma.wire()));
+            }
+            Self
+        }
+    }
+
+    impl Drop for OpenWindow {
+        fn drop(&mut self) {
+            // A panic inside the open leaves the open announced: it died there.
+            if super::in_probe_child() && !std::thread::panicking() {
+                emit(&format!("{PROGRESS}{NO_OPEN}"));
+            }
+        }
+    }
 
     /// #2719 — how a child whose parent stopped reading exits. In the field
     /// nobody is left to read it (the parent was terminated); a parent that
@@ -246,6 +276,8 @@ mod child {
         /// FR-118 P2-3 — only the GPU-input forms of the names in
         /// [`NAMES_GPU_ENV`].
         OnlyGpu,
+        /// #3267 — only the cells that need no driver ([`run_software`]).
+        Software,
     }
 
     pub(super) fn phase_from_env() -> Phase {
@@ -253,6 +285,7 @@ mod child {
             Ok("base") => Phase::Base,
             Ok("444") => Phase::Only444,
             Ok("gpu") => Phase::OnlyGpu,
+            Ok("software") => Phase::Software,
             _ => Phase::Full,
         }
     }
@@ -279,18 +312,301 @@ mod child {
 
     /// What one child run came back with. `stdout` is everything it printed
     /// (the progress lines survive a crash: Rust's stdout is line-buffered).
-    struct Run {
-        ok: bool,
-        stdout: String,
-        elapsed: std::time::Duration,
+    pub(super) struct Run {
+        pub(super) ending: Ending,
+        pub(super) stdout: String,
+        pub(super) elapsed: std::time::Duration,
     }
 
-    /// Probe in two children. `None` = no usable answer from the BASE phase,
-    /// for ANY reason (spawn failed, non-zero exit, killed by a signal, timed
-    /// out, unparseable output) — the caller treats every one of them the
-    /// same way. A failure of the 4:4:4 phase costs only the 4:4:4 cells:
-    /// the base matrix is advertised, with the last open the child reported
-    /// named in the log so the operator can denylist it.
+    /// How a child ended.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum Ending {
+        /// Exit 0.
+        Clean,
+        /// It exited non-zero or was killed. `fault` = with a status a faulting
+        /// driver leaves ([`is_fault`]); `status` is that status, as the log
+        /// says it.
+        Died { status: String, fault: bool },
+        /// Still running at [`TIMEOUT`], and killed for it.
+        Hung,
+    }
+
+    /// #3267 — whether a child's status is what a fault in a driver leaves,
+    /// rather than someone ending the process or the host running out of
+    /// something. An OOM kill and an EDR's `TerminateProcess` say nothing about
+    /// the open they happened to land in, so they cannot earn a cached deny.
+    pub(super) fn is_fault(status: &std::process::ExitStatus) -> bool {
+        #[cfg(windows)]
+        {
+            status.code().is_some_and(|c| windows_fault_code(c as u32))
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal().is_some_and(unix_fault_signal)
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = status;
+            false
+        }
+    }
+
+    /// #3267 — on Windows a process's exit code is the exception code that
+    /// ended it, with an NTSTATUS severity of "error" in the top two bits:
+    /// `0xC0000005` access violation, `0xC000001D` illegal instruction,
+    /// `0xC0000374` heap corruption, `0xC0000409` a fast fail (`abort`),
+    /// `0xC00000FD` stack overflow.
+    ///
+    /// 255 counts too, because the field says so: 2 of the 7 AMD deaths on the
+    /// dev box (2026-11-01) read `exit code: 255`, and each lined up with an
+    /// Application Error event for the same fault. Windows Error Reporting's
+    /// own termination is the likely source; that part is unmeasured.
+    #[cfg(windows)]
+    fn windows_fault_code(code: u32) -> bool {
+        const CONTROL_C_EXIT: u32 = 0xC000_013A;
+        const NO_MEMORY: u32 = 0xC000_0017;
+        const COMMITMENT_LIMIT: u32 = 0xC000_012D;
+        const ACCESS_DENIED: u32 = 0xC000_0022;
+        const DLL_NOT_FOUND: u32 = 0xC000_0135;
+        const DLL_INIT_FAILED: u32 = 0xC000_0142;
+        // `TerminateProcess(h, -1)`: .NET's `Process.Kill`, so `Stop-Process`.
+        const TERMINATED_MINUS_ONE: u32 = 0xFFFF_FFFF;
+        match code {
+            255 => true,
+            // Someone ended it, the host is out of memory or desktop heap, or
+            // the image would not load: nothing here is about the open.
+            CONTROL_C_EXIT | NO_MEMORY | COMMITMENT_LIMIT | ACCESS_DENIED | DLL_NOT_FOUND
+            | DLL_INIT_FAILED | TERMINATED_MINUS_ONE => false,
+            c => c >> 30 == 0b11,
+        }
+    }
+
+    /// #3267 — the signals a faulting driver raises on itself. Never SIGKILL
+    /// (the OOM killer, an EDR, an operator) or SIGTERM (a stop).
+    #[cfg(unix)]
+    fn unix_fault_signal(signal: i32) -> bool {
+        matches!(
+            signal,
+            libc::SIGSEGV | libc::SIGBUS | libc::SIGILL | libc::SIGFPE | libc::SIGABRT
+        )
+    }
+
+    /// #3267 — `base` runs at most this many times per probe: four cells at
+    /// two deaths each, and the run that reports. One whole vendor runtime
+    /// that faults on every open is four cells (`vp9`, `hevc`, `av1`, `h264`).
+    pub(super) const MAX_BASE_RUNS: u32 = 9;
+    /// #3267 — no new `base` run starts this long after the first started. The
+    /// base phase's worst case is therefore this plus one [`TIMEOUT`]: 150 s,
+    /// against 60 s before, and it is only reached by a host whose children
+    /// take a minute each. Long enough for one hang to get its retry, and for
+    /// the three runs one fault costs on a host where a run takes 45 s. The
+    /// dev box's slowest run on record is 24 s.
+    pub(super) const BASE_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+
+    /// What a death in `base` means for the next run.
+    enum Step {
+        RunAgain,
+        GiveUp(&'static str),
+    }
+
+    /// #3267 — what the base runs have shown so far, and what earns a cell a
+    /// place on the list. Pure apart from its log lines, so every OS tests it.
+    ///
+    /// - **A named cell that ends a child with a fault's status, twice in a
+    ///   row, is learned and cached.** The first death only earns a second
+    ///   run with nothing added: a transient fault passes it, and the cell
+    ///   keeps its place in the matrix.
+    /// - **A hang earns this process only.** A second hang would cost another
+    ///   minute to confirm what load alone can produce (`docs/encoders.md` has
+    ///   the one measured), so the run after it skips the cell, the result is
+    ///   not cached, and the next start tests the cell again.
+    /// - **Any other named death, twice, earns this process only** too: a kill
+    ///   or an `exit()` may have been the cell's doing, and a session must not
+    ///   be the next process to find out, but it proves too little to keep.
+    /// - **A death with no cell to blame costs nothing but one more run.** A
+    ///   second such death is the old answer: no hardware, and not cached.
+    #[derive(Default)]
+    struct BaseRetry {
+        runs: u32,
+        denied: Vec<LearnedDeny>,
+        /// The cell the last run died in, and whether that was a fault, until
+        /// the next run says whether the cell was the cause.
+        suspect: Option<(String, bool)>,
+        blind_retry_used: bool,
+    }
+
+    impl BaseRetry {
+        /// The child that ended with `ending` was inside `last_open`, and left
+        /// no report. `elapsed` is since the first run started.
+        fn after_death(
+            &mut self,
+            last_open: Option<&str>,
+            ending: &Ending,
+            elapsed: std::time::Duration,
+        ) -> Step {
+            let suspect = self.suspect.take();
+            match last_open {
+                // Nothing died and nothing was open: it just has no answer, and
+                // will not have one on a second run. A test binary, spawned as
+                // `caps-probe`, ends this way in every integration test.
+                None if *ending == Ending::Clean => {
+                    return Step::GiveUp("a clean exit with no report");
+                }
+                None => {
+                    if self.blind_retry_used {
+                        return Step::GiveUp("two deaths with no cell to blame");
+                    }
+                    self.blind_retry_used = true;
+                    tracing::warn!(
+                        ?ending,
+                        "caps probe: the base child died with no open in progress, so there is \
+                         no cell to blame — running it once more"
+                    );
+                }
+                Some(cell) if self.denied.iter().any(|d| d.cell == cell) => {
+                    return Step::GiveUp("a child died in a cell it was told not to open");
+                }
+                Some(cell) if *ending == Ending::Hung => self.deny(cell, "hung".to_string(), false),
+                Some(cell) => {
+                    let (status, fault) = match ending {
+                        Ending::Died { status, fault } => (status.as_str(), *fault),
+                        // A driver that called `exit(0)` in the open: a death.
+                        _ => ("exited 0 with no report", false),
+                    };
+                    match suspect {
+                        Some((again, was_fault)) if again == cell => {
+                            self.deny(cell, status.to_string(), fault && was_fault)
+                        }
+                        _ => {
+                            tracing::warn!(
+                                cell,
+                                status,
+                                "caps probe: the base child died in this open — running it once \
+                                 more with nothing added, to see whether the cell is the cause"
+                            );
+                            self.suspect = Some((cell.to_string(), fault));
+                        }
+                    }
+                }
+            }
+            if self.runs >= MAX_BASE_RUNS {
+                return Step::GiveUp("the run limit");
+            }
+            if elapsed >= BASE_RETRY_BUDGET {
+                return Step::GiveUp("the time limit");
+            }
+            Step::RunAgain
+        }
+
+        fn deny(&mut self, cell: &str, why: String, confirmed: bool) {
+            if confirmed {
+                tracing::error!(
+                    cell,
+                    why = %why,
+                    "caps probe: this cell ended the base child twice, so it is denied: not \
+                     opened by the probe or by a session, until the driver, this build or a \
+                     ROOMLERD_* knob changes, or a restart a day from now"
+                );
+            } else {
+                tracing::error!(
+                    cell,
+                    why = %why,
+                    "caps probe: this cell is denied for this process only: a hang or a kill \
+                     proves too little to keep, so the next start tests it again"
+                );
+            }
+            self.denied.push(LearnedDeny {
+                cell: cell.to_string(),
+                why,
+                confirmed,
+            });
+        }
+    }
+
+    /// #3267 — the `base` phase: as many runs as it takes to get a report, each
+    /// with every cell learned so far denied, within [`MAX_BASE_RUNS`] and
+    /// [`BASE_RETRY_BUDGET`]. Returns the report, if any run left one, and the
+    /// cells learned. `None` = no usable answer, for any reason (spawn failed,
+    /// out of runs or time): no hardware, the caller's fallback.
+    ///
+    /// A report the child printed is the answer however the child ended
+    /// afterwards: every open behind it had already come back, so a fault in
+    /// its exit (a driver's DLL teardown) has no cell to cost.
+    ///
+    /// `run` starts one child with the given cells denied. Learning off is the
+    /// behaviour before #3267: one run, and a death means no hardware.
+    pub(super) fn run_base(
+        learning: bool,
+        mut run: impl FnMut(&[LearnedDeny]) -> Option<Run>,
+        elapsed: impl Fn() -> std::time::Duration,
+    ) -> (Option<ProbeReport>, Vec<LearnedDeny>) {
+        let mut retry = BaseRetry::default();
+        loop {
+            retry.runs += 1;
+            let Some(child) = run(&retry.denied) else {
+                return (None, retry.denied);
+            };
+            if (learning || child.ending == Ending::Clean)
+                && let Some(report) = parse_line(&child.stdout, child.elapsed)
+            {
+                if child.ending != Ending::Clean {
+                    tracing::warn!(
+                        ending = ?child.ending,
+                        "caps probe: the base child ended badly after it reported — its report \
+                         stands, every open behind it had come back"
+                    );
+                }
+                if retry.runs > 1 {
+                    tracing::warn!(
+                        runs = retry.runs,
+                        denied = ?retry.denied.iter().map(|d| d.cell.as_str()).collect::<Vec<_>>(),
+                        "caps probe: the base phase reported after a death"
+                    );
+                }
+                return (Some(report), retry.denied);
+            }
+            if !learning {
+                return (None, retry.denied);
+            }
+            let last_open = last_progress(&child.stdout);
+            match retry.after_death(last_open.as_deref(), &child.ending, elapsed()) {
+                Step::RunAgain => {}
+                Step::GiveUp(why) => {
+                    tracing::error!(
+                        why,
+                        runs = retry.runs,
+                        elapsed_ms = elapsed().as_millis(),
+                        denied = ?retry.denied.iter().map(|d| d.cell.as_str()).collect::<Vec<_>>(),
+                        "caps probe: the base phase left no report — no hardware advertised"
+                    );
+                    return (None, retry.denied);
+                }
+            }
+        }
+    }
+
+    /// #3267 — `base` gave up on the hardware, and libvpx needs no driver: one
+    /// more child, opening that and nothing else, so the host keeps VP9 4:4:4
+    /// over the DataChannel instead of falling to the RTP track. A child all the
+    /// same, because this is a host whose probes have been dying and the daemon
+    /// has no business finding out why. At most one [`TIMEOUT`], on a path where
+    /// no 4:4:4 or GPU child follows, since neither has a candidate left.
+    fn run_software() -> Option<ProbeReport> {
+        tracing::warn!(
+            "caps probe: no answer from the base phase — asking a child for the cells that need \
+             no driver"
+        );
+        let child = run_child(&[(PHASE_ENV, "software".to_string())])?;
+        parse_line(&child.stdout, child.elapsed)
+    }
+
+    /// Probe in up to three phases, each in its own child. `None` = no usable
+    /// answer from the BASE phase ([`run_base`]) or, after it, the software one
+    /// ([`run_software`]) — the caller treats every reason the same way. A
+    /// failure of the 4:4:4 phase costs only the 4:4:4 cells: the base matrix
+    /// is advertised, with the last open the child reported named in the log
+    /// so the operator can denylist it.
     ///
     /// Why two processes (FR-77 P3c, field 2026-09-08): CORPLAP-3's Intel
     /// media runtime died with 0xc0000005 on the first `vp9_qsv` 4:4:4 open
@@ -305,16 +621,29 @@ mod child {
         }
         let started = std::time::Instant::now();
 
-        let base = run_child(&[(PHASE_ENV, "base".to_string())])?;
-        if !base.ok {
-            return None;
-        }
-        let mut report = parse_line(&base.stdout, base.elapsed)?;
+        let learning = cells::learning_enabled();
+        let (base, learned) = run_base(
+            learning,
+            |denied| {
+                // `run_child` hands the installed list to the child.
+                cells::install_learned(denied.to_vec());
+                run_child(&[(PHASE_ENV, "base".to_string())])
+            },
+            || started.elapsed(),
+        );
+        // Whatever the runs left, a session opens encoders in the daemon, and
+        // the fault that ended the child would end the daemon.
+        cells::install_learned(learned);
+        let mut report = match base {
+            Some(report) => report,
+            None if learning => run_software()?,
+            None => return None,
+        };
 
         let names = candidates_444(&report.caps);
         if names.is_empty() {
             tracing::info!(
-                elapsed_ms = base.elapsed.as_millis(),
+                elapsed_ms = started.elapsed().as_millis(),
                 "caps probe: no 4:4:4 candidate on this host — single phase"
             );
         } else {
@@ -322,7 +651,7 @@ mod child {
                 (PHASE_ENV, "444".to_string()),
                 (NAMES_444_ENV, names.join(",")),
             ]) {
-                Some(run) if run.ok => match parse_444_line(&run.stdout) {
+                Some(run) if run.ending == Ending::Clean => match parse_444_line(&run.stdout) {
                     Some(ok) => {
                         tracing::info!(
                             elapsed_ms = run.elapsed.as_millis(),
@@ -363,7 +692,7 @@ mod child {
                 (PHASE_ENV, "gpu".to_string()),
                 (NAMES_GPU_ENV, gpu_names.join(",")),
             ]) {
-                Some(run) if run.ok => match parse_gpu_line(&run.stdout) {
+                Some(run) if run.ending == Ending::Clean => match parse_gpu_line(&run.stdout) {
                     Some(ok) => {
                         tracing::info!(
                             elapsed_ms = run.elapsed.as_millis(),
@@ -403,6 +732,7 @@ mod child {
             hw_encoders = ?report.caps.hw_encoders,
             cells = report.caps.video_cells.len(),
             vp9_qsv_idr = ?report.vp9_qsv_idr,
+            learned_deny = ?cells::learned().iter().map(|l| l.cell.clone()).collect::<Vec<_>>(),
             "caps probe: child reported"
         );
         Some(report)
@@ -427,6 +757,8 @@ mod child {
             // real env vars, or every knob it reads falls to its built-in
             // default (FR-19 P4c: `relay-server` was never advertised).
             .envs(tunnel_core::env::config_fallbacks_for_child())
+            // #3267 — process-local too, and the deny the next run depends on.
+            .envs(cells::learned_for_child())
             .envs(extra.iter().map(|(k, v)| (*k, v.as_str())))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -481,7 +813,7 @@ mod child {
                      the process boundary doing its job."
                 );
                 return Some(Run {
-                    ok: false,
+                    ending: Ending::Hung,
                     stdout,
                     elapsed: started.elapsed(),
                 });
@@ -501,25 +833,30 @@ mod child {
                  fault crash-looped the daemon."
             );
             return Some(Run {
-                ok: false,
+                ending: Ending::Died {
+                    status: status.to_string(),
+                    fault: is_fault(&status),
+                },
                 stdout,
                 elapsed: started.elapsed(),
             });
         }
         Some(Run {
-            ok: true,
+            ending: Ending::Clean,
             stdout,
             elapsed: started.elapsed(),
         })
     }
 
     /// The last `PROGRESS` line in a child's output: the open it was inside
-    /// when it stopped answering.
+    /// when it stopped answering. `None` when it printed none, or the last one
+    /// said that open had ended ([`NO_OPEN`]).
     pub(super) fn last_progress(out: &str) -> Option<String> {
         out.lines()
             .rev()
             .find_map(|l| l.trim().strip_prefix(PROGRESS))
             .map(|s| s.trim().to_string())
+            .filter(|s| s != NO_OPEN)
     }
 
     /// FR-77 P3c — the FFmpeg encoder names whose 4:4:4 form the second
@@ -799,7 +1136,11 @@ pub fn print_probe_result() {
             }
         }
         phase => {
-            let report = in_process_report(phase != child::Phase::Base);
+            let report = if phase == child::Phase::Software {
+                software_report()
+            } else {
+                in_process_report(phase != child::Phase::Base)
+            };
             match serde_json::to_string(&report) {
                 Ok(json) => child::emit(&format!("{}{json}", child::MARKER)),
                 Err(e) => {
@@ -1134,14 +1475,6 @@ const PROBE_HEIGHT: u32 = 270;
 /// FR-118 P2-3 — whether this process is a `caps-probe` child: the one place
 /// an encoder form may open before a probe proved it (proving it is the
 /// child's job).
-#[cfg_attr(
-    not(all(
-        target_os = "windows",
-        feature = "ffmpeg-encoder",
-        any(feature = "mf-encoder", feature = "wgc-capture")
-    )),
-    allow(dead_code)
-)]
 pub(crate) fn in_probe_child() -> bool {
     std::env::var_os(child::CHILD_ENV).is_some()
 }
@@ -1154,9 +1487,54 @@ pub(crate) fn in_probe_child() -> bool {
 pub fn detect() -> AgentCaps {
     CACHED_CAPS
         .get_or_init(|| {
-            with_honest_words(with_config_lists(cached_or_probed()), &HostFacts::here())
+            let caps = cached_or_probed();
+            assigned_by_the_daemon(caps, &HostFacts::here(), &super::cells::learned())
         })
         .clone()
+}
+
+/// What the daemon says over whatever `cached_or_probed` answered, on every
+/// path. A named seam, like [`with_config_lists`], so a test can lock each line.
+fn assigned_by_the_daemon(
+    caps: AgentCaps,
+    facts: &HostFacts,
+    learned: &[super::cells::LearnedDeny],
+) -> AgentCaps {
+    with_learned_word(with_honest_words(with_config_lists(caps), facts), learned)
+}
+
+/// #3267 — the key and code a learned deny rides in [`AgentCaps::unavailable`].
+/// That map is already on the wire and in `agents.capabilities`, and readers
+/// skip a key they do not know, so a fleet read sees this on any server, and
+/// no viewer says anything about it. `scripts/fr97-caps-census.sh` counts it.
+pub const LEARNED_WORD: &str = "encoder-cells";
+pub const LEARNED_CODE: &str = "learned-deny";
+
+/// #3267 — a host that lost a cell to a driver fault says so: which cell, and
+/// how its probe child ended. The collapse this replaces went unnoticed for
+/// hours because the viewer still looked healthy.
+fn with_learned_word(mut caps: AgentCaps, learned: &[super::cells::LearnedDeny]) -> AgentCaps {
+    use roomler_ai_remote_control::models::Unavailable;
+    if learned.is_empty() {
+        return caps;
+    }
+    let cells = learned
+        .iter()
+        .map(|l| format!("{} ({})", l.cell, l.why))
+        .collect::<Vec<_>>()
+        .join(", ");
+    caps.unavailable.insert(
+        LEARNED_WORD.into(),
+        Unavailable::new(
+            LEARNED_CODE,
+            &format!(
+                "These encoder cells ended the capability probe on this host, so neither the \
+                 probe nor a session opens them: {cells}. A driver update, an agent update, a \
+                 settings change or a restart a day later tests them again"
+            ),
+        ),
+    );
+    caps
 }
 
 /// FR-97 P0c — what this host can actually serve, as plain facts, so the
@@ -1592,6 +1970,15 @@ fn cached_or_probed() -> AgentCaps {
                     hardware = %key.hardware,
                     "caps probe: cache hit — reusing the last probe's encoder matrix"
                 );
+                if !hit.learned_deny.is_empty() {
+                    tracing::warn!(
+                        learned_deny = ?hit.learned_deny,
+                        "caps probe: that probe learned to deny these cells — sessions will not \
+                         open them either; a driver, build or knob change, or a restart after a \
+                         day, tests them again"
+                    );
+                }
+                super::cells::install_learned(hit.learned_deny.clone());
                 install_vp9_qsv_idr(hit.vp9_qsv_idr);
                 install_gpu_input(hit.gpu_input.clone());
                 return merge_cached(hit);
@@ -1616,7 +2003,17 @@ fn cached_or_probed() -> AgentCaps {
             install_vp9_qsv_idr(report.vp9_qsv_idr);
             install_gpu_input(report.gpu_input.clone());
             if let (Some(key), Some(path)) = (key, path) {
-                if cache::worth_caching(&report.caps) {
+                let learned = super::cells::learned();
+                if learned.iter().any(|l| !l.confirmed) {
+                    // #3267 — this answer leans on a cell a hang or a kill may
+                    // have cost for nothing. Freezing it would keep a healthy
+                    // cell out for as long as the cache lives.
+                    tracing::info!(
+                        learned_deny = ?learned,
+                        "caps probe: a cell is denied on a hang or a kill only — not cached, so \
+                         the next start tests it again"
+                    );
+                } else if cache::worth_caching(&report.caps) {
                     let file = cache::CacheFile::new(
                         key,
                         now,
@@ -1624,7 +2021,8 @@ fn cached_or_probed() -> AgentCaps {
                         report.caps.clone(),
                         report.vp9_qsv_idr,
                     )
-                    .with_gpu_input(report.gpu_input.clone());
+                    .with_gpu_input(report.gpu_input.clone())
+                    .with_learned_deny(learned);
                     match cache::store(&path, &file) {
                         Ok(()) => tracing::info!(
                             path = %path.display(),
@@ -1645,11 +2043,11 @@ fn cached_or_probed() -> AgentCaps {
             report.caps
         }
         None => {
-            // The child died, hung, or could not be launched. "Codec
-            // unavailable" is the only honest reading: we have no
-            // evidence this host can encode with any of them, and
-            // advertising one we cannot produce costs a black session.
-            // Everything that needs no driver still stands.
+            // No child came back, the one that asks for no driver included
+            // (`child::run_software`). "Codec unavailable" is the only honest
+            // reading: we have no evidence this host can encode with any of
+            // them, and advertising one we cannot produce costs a black
+            // session. Everything that needs no driver still stands.
             compute_caps(false, false)
         }
     }
@@ -1746,6 +2144,27 @@ fn in_process_report(attempt_444: bool) -> child::ProbeReport {
     }
 }
 
+/// #3267 — the `software` phase: everything that needs no driver call, and
+/// libvpx's cell, which needs none either but does open an encoder, so it takes
+/// a child to ask. No hardware cell, so never cached.
+fn software_report() -> child::ProbeReport {
+    child::ProbeReport {
+        caps: compute_caps_with(false, false, true),
+        vp9_qsv_idr: None,
+        gpu_input: Vec::new(),
+    }
+}
+
+/// #3267 — run one open, its teardown included, announced as `name:chroma`, so
+/// a child that dies in it says which cell. `open` must leave nothing open
+/// behind it: the announcement ends when it returns.
+// A build with no encoder backend opens nothing.
+#[allow(dead_code)]
+fn announced_open<T>(name: &str, chroma: ChromaFormat, open: impl FnOnce() -> T) -> T {
+    let _window = child::OpenWindow::begin(name, chroma);
+    open()
+}
+
 /// Compute caps IN THIS PROCESS, running the hardware probes. This is what
 /// the `caps-probe` child executes; nothing else should call it, because a
 /// vendor driver that faults takes the whole process with it.
@@ -1834,12 +2253,19 @@ pub const COLOR_DESCRIBED: &str = "color-described";
 
 /// `run_hw_probes = false` computes everything that needs no driver call —
 /// which is exactly the honest answer when the probe child did not come back.
-///
-/// `unused_variables` is allowed because EVERY consumer of the flag sits
-/// behind a `#[cfg]` (mf-encoder / ffmpeg-encoder / vp9-444); a default-feature
-/// build probes nothing and legitimately never reads it.
-#[allow(unused_variables)]
 fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
+    compute_caps_with(run_hw_probes, attempt_444, run_hw_probes)
+}
+
+/// [`compute_caps`], with libvpx's open apart from the hardware's (#3267): it
+/// needs no driver, so a child that was told to touch none can still prove it
+/// ([`software_report`]).
+///
+/// `unused_variables` is allowed because EVERY consumer of the flags sits
+/// behind a `#[cfg]` (mf-encoder / ffmpeg-encoder / vp9-444); a default-feature
+/// build probes nothing and legitimately never reads them.
+#[allow(unused_variables)]
+fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -> AgentCaps {
     // `mut` is only consumed inside the cfg-gated push blocks below
     // (openh264-encoder / mf-encoder). Default-feature builds skip
     // both blocks and the vecs stay empty; silence the unused-mut
@@ -1871,13 +2297,18 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
 
     #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
     if run_hw_probes {
+        // #3267 — a denied MF cell is not opened, and its legacy label goes
+        // with it (the H.264 label below is enumeration-gated, so an open that
+        // is refused would not take it away).
+        let mf_deny = denied_cells();
         // H.264: enumeration is sufficient. If any H.264 MFT
         // enumerates the cascade always succeeds (at worst it falls
         // through to the default-adapter SW MFT via
         // CLSID_MSH264EncoderMFT); runtime activation failure would
         // be caught by open_default's triple-fallback (MF → openh264
         // → Noop). No probe needed.
-        if let Ok(adapters) = super::mf::probe_adapter_count()
+        if !cell_denied(&mf_deny, super::cells::MF_H264, ChromaFormat::Yuv420)
+            && let Ok(adapters) = super::mf::probe_adapter_count()
             && adapters > 0
         {
             hw_encoders.push("mf-h264-hw".into());
@@ -1909,7 +2340,8 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         // fallback-decode. Gate advertising on a successful HW probe;
         // SW-only paths are dropped so H.264 wins negotiation
         // (mediasoup-screenshare-grade quality on iGPU hosts).
-        if let Ok(adapters) = super::mf::probe_hevc_adapter_count()
+        if !cell_denied(&mf_deny, super::cells::MF_HEVC, ChromaFormat::Yuv420)
+            && let Ok(adapters) = super::mf::probe_hevc_adapter_count()
             && adapters > 0
         {
             let probe = activates(CodecProbe::Hevc);
@@ -1931,7 +2363,8 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         // (see `Known Issues` in CLAUDE.md). Probe-at-startup
         // filters this out so the agent doesn't advertise a codec
         // it can't actually produce.
-        if let Ok(adapters) = super::mf::probe_av1_adapter_count()
+        if !cell_denied(&mf_deny, super::cells::MF_AV1, ChromaFormat::Yuv420)
+            && let Ok(adapters) = super::mf::probe_av1_adapter_count()
             && adapters > 0
         {
             let probe = activates(CodecProbe::Av1);
@@ -1979,9 +2412,6 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
     // works on RTX 5090 Blackwell — the two boxes MF was broken on.
     #[cfg(feature = "ffmpeg-encoder")]
     if run_hw_probes && crate::encode::ffmpeg::available() {
-        // `name()` is on the `VideoEncoder` trait — need the trait in
-        // scope at the call site for method-resolution.
-        use super::VideoEncoder;
         use crate::encode::ffmpeg::FfmpegEncoder;
 
         // FR-77 — cells this build will not even TRY (the kill switch), and
@@ -2003,10 +2433,21 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         // didn't request 4:4:4 chroma (which vp9_qsv doesn't support).
         {
             let start_vp9 = std::time::Instant::now();
-            match crate::encode::ffmpeg::FfmpegEncoder::new_vp9(PROBE_WIDTH, PROBE_HEIGHT) {
-                Ok(enc) => {
-                    let name = enc.name();
-                    drop(enc);
+            // #3267 — `new_vp9`'s cascade, one announced open at a time, so a
+            // child that dies here names the cell.
+            let mut vp9: anyhow::Result<&'static str> =
+                Err(anyhow::anyhow!("every VP9 4:2:0 cell is on the denylist"));
+            for name in super::cells::names_420(VideoCodec::Vp9) {
+                vp9 = announced_open(name, ChromaFormat::Yuv420, || {
+                    FfmpegEncoder::new_named_probe(name, PROBE_WIDTH, PROBE_HEIGHT, false).map(drop)
+                })
+                .map(|()| name);
+                if vp9.is_ok() {
+                    break;
+                }
+            }
+            match vp9 {
+                Ok(name) => {
                     tracing::info!(
                         encoder = name,
                         elapsed_ms = start_vp9.elapsed().as_millis(),
@@ -2026,16 +2467,16 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
                             && ffmpeg_444_capable(name)
                             && !cell_denied(&deny, name, ChromaFormat::Yuv444)
                         {
-                            match FfmpegEncoder::new_named_probe(
-                                name,
-                                PROBE_WIDTH,
-                                PROBE_HEIGHT,
-                                true,
-                            ) {
-                                Ok(e) => {
-                                    drop(e);
-                                    chroma.push(ChromaFormat::Yuv444);
-                                }
+                            match announced_open(name, ChromaFormat::Yuv444, || {
+                                FfmpegEncoder::new_named_probe(
+                                    name,
+                                    PROBE_WIDTH,
+                                    PROBE_HEIGHT,
+                                    true,
+                                )
+                                .map(drop)
+                            }) {
+                                Ok(()) => chroma.push(ChromaFormat::Yuv444),
                                 Err(e) => {
                                     tracing::debug!(encoder = name, %e, "caps probe: 4:4:4 cell did not open")
                                 }
@@ -2049,10 +2490,22 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
                     // residual ~1 Hz natural-key pulse on VP9-over-DC);
                     // hosts that don't keep the rc.219 containment. Escape
                     // hatch ROOMLERD_VP9_QSV_IDR_PROBE=0.
-                    if tunnel_core::env::node_env("VP9_QSV_IDR_PROBE").as_deref() != Some("0") {
+                    if tunnel_core::env::node_env("VP9_QSV_IDR_PROBE").as_deref() == Some("0") {
+                        tracing::info!(
+                            "caps probe: vp9_qsv IDR probe disabled (ROOMLERD_VP9_QSV_IDR_PROBE=0) — keeping GOP-60 containment"
+                        );
+                    } else if cell_denied(&deny, "vp9_qsv", ChromaFormat::Yuv420) {
+                        // #3267 — it names `vp9_qsv` itself, whichever VP9 cell
+                        // won above, and a denied cell is never opened.
+                        tracing::info!(
+                            "caps probe: vp9_qsv:yuv420 is on the denylist — no IDR probe"
+                        );
+                    } else {
                         let t_idr = std::time::Instant::now();
                         if let Some((lp1, lp0)) =
-                            crate::encode::ffmpeg::FfmpegEncoder::probe_and_cache_vp9_qsv_idr()
+                            announced_open("vp9_qsv", ChromaFormat::Yuv420, || {
+                                FfmpegEncoder::probe_and_cache_vp9_qsv_idr()
+                            })
                         {
                             tracing::info!(
                                 honors_low_power = lp1,
@@ -2061,10 +2514,6 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
                                 "caps probe: vp9_qsv runtime-IDR verdict (either true → long GOP + on-demand keys; both false → GOP-60 containment)"
                             );
                         }
-                    } else {
-                        tracing::info!(
-                            "caps probe: vp9_qsv IDR probe disabled (ROOMLERD_VP9_QSV_IDR_PROBE=0) — keeping GOP-60 containment"
-                        );
                     }
                 }
                 Err(e) => {
@@ -2125,24 +2574,25 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
                     continue;
                 }
                 let t = std::time::Instant::now();
-                match FfmpegEncoder::new_named_probe(name, PROBE_WIDTH, PROBE_HEIGHT, false) {
-                    Ok(enc) => {
-                        drop(enc);
+                match announced_open(name, ChromaFormat::Yuv420, || {
+                    FfmpegEncoder::new_named_probe(name, PROBE_WIDTH, PROBE_HEIGHT, false).map(drop)
+                }) {
+                    Ok(()) => {
                         let mut chroma = vec![ChromaFormat::Yuv420];
                         if attempt_444
                             && ffmpeg_444_capable(name)
                             && !cell_denied(&deny, name, ChromaFormat::Yuv444)
                         {
-                            match FfmpegEncoder::new_named_probe(
-                                name,
-                                PROBE_WIDTH,
-                                PROBE_HEIGHT,
-                                true,
-                            ) {
-                                Ok(e) => {
-                                    drop(e);
-                                    chroma.push(ChromaFormat::Yuv444);
-                                }
+                            match announced_open(name, ChromaFormat::Yuv444, || {
+                                FfmpegEncoder::new_named_probe(
+                                    name,
+                                    PROBE_WIDTH,
+                                    PROBE_HEIGHT,
+                                    true,
+                                )
+                                .map(drop)
+                            }) {
+                                Ok(()) => chroma.push(ChromaFormat::Yuv444),
                                 Err(e) => tracing::info!(
                                     encoder = name,
                                     %e,
@@ -2234,7 +2684,7 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
     }
 
     #[cfg(feature = "vp9-444")]
-    if run_hw_probes {
+    if run_libvpx {
         // Phase Y.4 caps probe (Y.runtime-encoder rewrite landed,
         // 0.1.47). Try to instantiate the libvpx encoder at a probe
         // resolution; on success advertise both the transport and
@@ -2242,9 +2692,10 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         // ever negotiates onto a broken path. The probe runs once
         // per agent process via the OnceLock cache.
         let start = std::time::Instant::now();
-        match crate::encode::libvpx::Vp9Encoder::new(PROBE_WIDTH, PROBE_HEIGHT) {
-            Ok(enc) => {
-                drop(enc);
+        match announced_open(super::cells::LIBVPX_VP9, ChromaFormat::Yuv444, || {
+            crate::encode::libvpx::Vp9Encoder::new(PROBE_WIDTH, PROBE_HEIGHT).map(drop)
+        }) {
+            Ok(()) => {
                 tracing::info!(
                     elapsed_ms = start.elapsed().as_millis(),
                     "caps probe: vp9-444 libvpx encoder activates — advertising data-channel-vp9-444 transport"
@@ -2254,16 +2705,16 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
                 // FR-77 — the libvpx cell: profile 0 (4:2:0) is opened for
                 // real too, so the cell claims only what opened.
                 let mut chroma = Vec::new();
-                match crate::encode::libvpx::Vp9Encoder::new_with_fps_chroma(
-                    PROBE_WIDTH,
-                    PROBE_HEIGHT,
-                    30,
-                    crate::encode::libvpx::Vp9Chroma::Yuv420,
-                ) {
-                    Ok(e) => {
-                        drop(e);
-                        chroma.push(ChromaFormat::Yuv420);
-                    }
+                match announced_open(super::cells::LIBVPX_VP9, ChromaFormat::Yuv420, || {
+                    crate::encode::libvpx::Vp9Encoder::new_with_fps_chroma(
+                        PROBE_WIDTH,
+                        PROBE_HEIGHT,
+                        30,
+                        crate::encode::libvpx::Vp9Chroma::Yuv420,
+                    )
+                    .map(drop)
+                }) {
+                    Ok(()) => chroma.push(ChromaFormat::Yuv420),
                     Err(e) => tracing::debug!(%e, "caps probe: libvpx 4:2:0 cell did not open"),
                 }
                 chroma.push(ChromaFormat::Yuv444);
@@ -2850,6 +3301,18 @@ enum CodecProbe {
     Av1,
 }
 
+#[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+impl CodecProbe {
+    /// The name the denylist knows this cell by.
+    fn cell(self) -> &'static str {
+        match self {
+            Self::H264 => super::cells::MF_H264,
+            Self::Hevc => super::cells::MF_HEVC,
+            Self::Av1 => super::cells::MF_AV1,
+        }
+    }
+}
+
 /// Outcome of a codec probe. We split SW from HW because shipping
 /// HEVC over the SW MFT (`HEVCVideoExtensionEncoder`) is a UX
 /// regression vs negotiating H.264 with the host's HW H.264 path
@@ -2873,11 +3336,19 @@ enum ProbeResult {
     Failed,
 }
 
+/// How long [`activates`] waits for an MF encoder's worker to finish its
+/// teardown. It runs on the worker's thread, so without a wait a fault there
+/// lands in whatever open comes next and is blamed on that cell (#3267). A
+/// teardown that outlasts this is left to run, as every drop leaves it.
+#[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+const MF_TEARDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Spin up the real MF encoder for `codec` at a tiny probe resolution,
 /// inspect the resulting backend kind, then drop it. Logs the verdict
 /// at info / warn so the cascade outcome is visible in startup logs.
 #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
 fn activates(codec: CodecProbe) -> ProbeResult {
+    let _window = child::OpenWindow::begin(codec.cell(), ChromaFormat::Yuv420);
     let start = std::time::Instant::now();
     let result = match codec {
         CodecProbe::H264 => super::mf::MfEncoder::new_h264(PROBE_WIDTH, PROBE_HEIGHT),
@@ -2889,9 +3360,9 @@ fn activates(codec: CodecProbe) -> ProbeResult {
         Ok(enc) => {
             use super::VideoEncoder;
             let is_hw = enc.is_hardware();
-            // Dropping `enc` triggers the worker's Shutdown cmd which
-            // in turn runs MFShutdown + CoUninitialize on its thread.
-            drop(enc);
+            // The worker's Shutdown cmd runs MFShutdown + CoUninitialize on
+            // its thread; this waits for it, inside the announced window.
+            enc.shut_down_within(MF_TEARDOWN_WAIT);
             if is_hw {
                 tracing::info!(
                     codec = ?codec,
@@ -4345,6 +4816,709 @@ mod tests {
         assert_eq!(child::last_progress(""), None);
     }
 
+    /// #3267 — a child that dies between opens did not die in the last cell it
+    /// opened: the window closed. `h264_vulkan` opening fine and the process
+    /// dying in its next enumeration must not cost `h264_vulkan`.
+    #[test]
+    fn a_closed_window_names_no_cell() {
+        let open = format!(
+            "{p}hevc_nvenc:yuv420\n{p}{no}\n{p}hevc_vulkan:yuv420\n",
+            p = child::PROGRESS,
+            no = child::NO_OPEN
+        );
+        assert_eq!(
+            child::last_progress(&open).as_deref(),
+            Some("hevc_vulkan:yuv420")
+        );
+        let closed = format!(
+            "{p}hevc_vulkan:yuv420\n{p}{no}\n",
+            p = child::PROGRESS,
+            no = child::NO_OPEN
+        );
+        assert_eq!(child::last_progress(&closed), None);
+    }
+
+    /// Outside a probe child an announced open is only the open: this process
+    /// is no child, and `compute_caps(true, _)` runs in tests like this.
+    #[test]
+    fn an_announced_open_returns_what_the_open_returned() {
+        assert_eq!(
+            announced_open("hevc_nvenc", ChromaFormat::Yuv420, || 7),
+            7,
+            "the announcement must not get in the way of the open"
+        );
+    }
+
+    fn base_died_in(cell: &str, status: &str, fault: bool) -> child::Run {
+        child::Run {
+            ending: child::Ending::Died {
+                status: status.to_string(),
+                fault,
+            },
+            stdout: format!("{}{cell}\n", child::PROGRESS),
+            elapsed: std::time::Duration::from_secs(2),
+        }
+    }
+
+    fn base_hung_in(cell: &str) -> child::Run {
+        child::Run {
+            ending: child::Ending::Hung,
+            stdout: format!("{}{cell}\n", child::PROGRESS),
+            elapsed: std::time::Duration::from_secs(60),
+        }
+    }
+
+    fn base_died_blind(status: &str) -> child::Run {
+        child::Run {
+            ending: child::Ending::Died {
+                status: status.to_string(),
+                fault: false,
+            },
+            stdout: String::new(),
+            elapsed: std::time::Duration::from_secs(2),
+        }
+    }
+
+    fn base_report_line() -> String {
+        let report = child::ProbeReport {
+            caps: compute_caps(false, false),
+            vp9_qsv_idr: None,
+            gpu_input: Vec::new(),
+        };
+        format!(
+            "{}{}\n",
+            child::MARKER,
+            serde_json::to_string(&report).unwrap()
+        )
+    }
+
+    fn base_reported() -> child::Run {
+        child::Run {
+            ending: child::Ending::Clean,
+            stdout: base_report_line(),
+            elapsed: std::time::Duration::from_secs(4),
+        }
+    }
+
+    /// What a scripted sequence of base runs came to: whether a report came
+    /// out, the cells learned, and the deny list each run was started with.
+    struct Scripted {
+        reported: bool,
+        learned: Vec<crate::encode::cells::LearnedDeny>,
+        asked: Vec<Vec<String>>,
+    }
+
+    /// `script` is the runs in order; each `Duration` is what the clock reads
+    /// when that run has ended. Running out of script fails the test: the
+    /// loop asked for a run the case says it must not make.
+    fn run_base_scripted(
+        learning: bool,
+        script: Vec<(std::time::Duration, Option<child::Run>)>,
+    ) -> Scripted {
+        let clock = std::cell::Cell::new(std::time::Duration::ZERO);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut script = script.into_iter();
+        let (report, learned) = child::run_base(
+            learning,
+            |denied| {
+                asked
+                    .borrow_mut()
+                    .push(denied.iter().map(|d| d.cell.clone()).collect::<Vec<_>>());
+                let (at, run) = script.next().expect("a run the case does not expect");
+                clock.set(at);
+                run
+            },
+            || clock.get(),
+        );
+        Scripted {
+            reported: report.is_some(),
+            learned,
+            asked: asked.into_inner(),
+        }
+    }
+
+    fn secs(s: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(s)
+    }
+
+    const NOTHING: &[&str] = &[];
+
+    /// #3267, the field's own case: the same cell faults twice. The second run
+    /// adds nothing, the third runs without the cell, and the host gets its
+    /// report. Only the third run may deny it, and the first says nothing yet.
+    #[test]
+    fn two_faults_in_one_cell_cost_that_cell_and_not_the_host() {
+        let out = run_base_scripted(
+            true,
+            vec![
+                (
+                    secs(2),
+                    Some(base_died_in("hevc_vulkan:yuv420", "exit code: 255", true)),
+                ),
+                (
+                    secs(4),
+                    Some(base_died_in(
+                        "hevc_vulkan:yuv420",
+                        "exit code: 0xc0000005",
+                        true,
+                    )),
+                ),
+                (secs(9), Some(base_reported())),
+            ],
+        );
+        assert!(out.reported);
+        assert_eq!(
+            out.asked,
+            vec![
+                NOTHING.to_vec(),
+                NOTHING.to_vec(),
+                vec!["hevc_vulkan:yuv420"]
+            ]
+        );
+        assert_eq!(
+            out.learned,
+            vec![crate::encode::cells::LearnedDeny {
+                cell: "hevc_vulkan:yuv420".into(),
+                why: "exit code: 0xc0000005".into(),
+                confirmed: true,
+            }],
+            "two faults confirm it: this is what the cache keeps"
+        );
+    }
+
+    /// #3267 — a transient must not cost a healthy cell: one death, a clean
+    /// second run with nothing denied, and the matrix is whole.
+    #[test]
+    fn one_fault_then_a_clean_run_learns_nothing() {
+        let out = run_base_scripted(
+            true,
+            vec![
+                (
+                    secs(2),
+                    Some(base_died_in(
+                        "hevc_nvenc:yuv420",
+                        "exit code: 0xc0000005",
+                        true,
+                    )),
+                ),
+                (secs(6), Some(base_reported())),
+            ],
+        );
+        assert!(out.reported);
+        assert_eq!(out.asked, vec![NOTHING.to_vec(), NOTHING.to_vec()]);
+        assert!(out.learned.is_empty(), "{:?}", out.learned);
+    }
+
+    /// #3267 — a hang earns this process only, and gets no confirming run: a
+    /// second minute is too much to prove what load alone can do. The next run
+    /// skips the cell, and `confirmed: false` keeps the answer out of the cache.
+    #[test]
+    fn a_hang_is_denied_for_this_process_without_a_second_hang() {
+        let out = run_base_scripted(
+            true,
+            vec![
+                (secs(60), Some(base_hung_in("hevc_nvenc:yuv420"))),
+                (secs(65), Some(base_reported())),
+            ],
+        );
+        assert!(out.reported);
+        assert_eq!(out.asked, vec![NOTHING.to_vec(), vec!["hevc_nvenc:yuv420"]]);
+        assert_eq!(out.learned.len(), 1);
+        assert!(
+            !out.learned[0].confirmed,
+            "a hang proves too little to keep"
+        );
+        assert_eq!(out.learned[0].why, "hung");
+    }
+
+    /// #3267 — an OOM kill or an EDR's terminate that lands in the same open
+    /// twice protects this process's sessions and proves nothing to keep. So
+    /// does a fault one run and a kill the next.
+    #[test]
+    fn a_kill_never_confirms_a_cell() {
+        for (first_fault, second_fault) in [(false, false), (true, false), (false, true)] {
+            let out = run_base_scripted(
+                true,
+                vec![
+                    (
+                        secs(2),
+                        Some(base_died_in(
+                            "av1_nvenc:yuv420",
+                            "signal: 9 (SIGKILL)",
+                            first_fault,
+                        )),
+                    ),
+                    (
+                        secs(4),
+                        Some(base_died_in(
+                            "av1_nvenc:yuv420",
+                            "signal: 9 (SIGKILL)",
+                            second_fault,
+                        )),
+                    ),
+                    (secs(8), Some(base_reported())),
+                ],
+            );
+            assert!(out.reported);
+            assert_eq!(out.learned.len(), 1);
+            assert!(!out.learned[0].confirmed, "{first_fault} {second_fault}");
+        }
+    }
+
+    /// #3267 — evidence is one cell twice IN A ROW. Two different cells are two
+    /// transients until one of them repeats.
+    #[test]
+    fn a_death_elsewhere_clears_the_suspicion() {
+        let out = run_base_scripted(
+            true,
+            vec![
+                (
+                    secs(2),
+                    Some(base_died_in("hevc_nvenc:yuv420", "exit code: 255", true)),
+                ),
+                (
+                    secs(4),
+                    Some(base_died_in("hevc_amf:yuv420", "exit code: 255", true)),
+                ),
+                (secs(8), Some(base_reported())),
+            ],
+        );
+        assert!(out.reported);
+        assert_eq!(
+            out.asked,
+            vec![NOTHING.to_vec(), NOTHING.to_vec(), NOTHING.to_vec()]
+        );
+        assert!(out.learned.is_empty(), "{:?}", out.learned);
+    }
+
+    /// #3267 — Intel's runtime and AMD's driver can both be on one host: each
+    /// cell pays for itself, and every later run carries the list so far.
+    #[test]
+    fn two_faulting_cells_are_learned_one_after_the_other() {
+        let out = run_base_scripted(
+            true,
+            vec![
+                (
+                    secs(2),
+                    Some(base_died_in("hevc_qsv:yuv420", "exit code: 255", true)),
+                ),
+                (
+                    secs(4),
+                    Some(base_died_in("hevc_qsv:yuv420", "exit code: 255", true)),
+                ),
+                (
+                    secs(6),
+                    Some(base_died_in("hevc_vulkan:yuv420", "exit code: 255", true)),
+                ),
+                (
+                    secs(8),
+                    Some(base_died_in("hevc_vulkan:yuv420", "exit code: 255", true)),
+                ),
+                (secs(12), Some(base_reported())),
+            ],
+        );
+        assert!(out.reported);
+        assert_eq!(
+            out.asked,
+            vec![
+                NOTHING.to_vec(),
+                NOTHING.to_vec(),
+                vec!["hevc_qsv:yuv420"],
+                vec!["hevc_qsv:yuv420"],
+                vec!["hevc_qsv:yuv420", "hevc_vulkan:yuv420"],
+            ]
+        );
+        assert!(out.learned.iter().all(|l| l.confirmed));
+    }
+
+    /// #3267 — no open in progress, no cell to blame: one more run for a
+    /// transient (desktop heap, an EDR at start), and the second such death is
+    /// the old answer, with nothing learned.
+    #[test]
+    fn a_death_with_no_cell_costs_one_run_and_then_the_old_answer() {
+        let out = run_base_scripted(
+            true,
+            vec![
+                (secs(1), Some(base_died_blind("exit code: 0xc0000142"))),
+                (secs(2), Some(base_died_blind("exit code: 0xc0000142"))),
+            ],
+        );
+        assert!(!out.reported, "no report, no hardware: as before #3267");
+        assert!(out.learned.is_empty());
+        assert_eq!(out.asked.len(), 2);
+
+        let out = run_base_scripted(
+            true,
+            vec![
+                (secs(1), Some(base_died_blind("exit code: 0xc0000142"))),
+                (secs(5), Some(base_reported())),
+            ],
+        );
+        assert!(out.reported, "a transient: the retry's report stands");
+        assert!(out.learned.is_empty());
+    }
+
+    /// #3267 — the bound on runs: a host that dies somewhere new each time
+    /// stops at the limit, however quickly it dies.
+    #[test]
+    fn the_runs_stop_at_the_limit() {
+        let script = (0..child::MAX_BASE_RUNS)
+            .map(|i| {
+                (
+                    secs(u64::from(i)),
+                    Some(base_died_in(
+                        &format!("cell{i}:yuv420"),
+                        "exit code: 255",
+                        true,
+                    )),
+                )
+            })
+            .collect();
+        let out = run_base_scripted(true, script);
+        assert!(!out.reported);
+        assert_eq!(out.asked.len() as u32, child::MAX_BASE_RUNS);
+        assert!(out.learned.is_empty(), "no cell died twice: nothing earned");
+    }
+
+    /// #3267 — the bound on time: no run starts past the budget, and what the
+    /// runs learned still stands, because a session opens in the daemon.
+    #[test]
+    fn no_run_starts_past_the_time_budget_and_the_cell_stays_denied() {
+        let over = child::BASE_RETRY_BUDGET + secs(1);
+        let out = run_base_scripted(
+            true,
+            vec![
+                (
+                    secs(40),
+                    Some(base_died_in("hevc_vulkan:yuv420", "exit code: 255", true)),
+                ),
+                (
+                    over,
+                    Some(base_died_in("hevc_vulkan:yuv420", "exit code: 255", true)),
+                ),
+            ],
+        );
+        assert!(!out.reported);
+        assert_eq!(out.asked.len(), 2, "the script would panic on a third");
+        assert_eq!(out.learned.len(), 1);
+        assert!(out.learned[0].confirmed);
+    }
+
+    /// #3267 — the base phase's worst case, as the PR states it: one last
+    /// start just inside the budget, running its whole timeout.
+    #[test]
+    fn the_worst_case_is_the_budget_plus_one_timeout() {
+        assert_eq!(child::BASE_RETRY_BUDGET, secs(90));
+        let out = run_base_scripted(
+            true,
+            vec![
+                (
+                    secs(89),
+                    Some(base_died_in("hevc_nvenc:yuv420", "exit code: 255", true)),
+                ),
+                (secs(149), Some(base_hung_in("h264_nvenc:yuv420"))),
+            ],
+        );
+        assert!(!out.reported);
+        assert_eq!(out.asked.len(), 2);
+    }
+
+    /// #3267 — a child that dies in a cell it was told not to open means the
+    /// list is not being honoured, and another run cannot help.
+    #[test]
+    fn a_death_in_a_denied_cell_stops_the_runs() {
+        let out = run_base_scripted(
+            true,
+            vec![
+                (
+                    secs(2),
+                    Some(base_died_in("hevc_vulkan:yuv420", "exit code: 255", true)),
+                ),
+                (
+                    secs(4),
+                    Some(base_died_in("hevc_vulkan:yuv420", "exit code: 255", true)),
+                ),
+                (
+                    secs(6),
+                    Some(base_died_in("hevc_vulkan:yuv420", "exit code: 255", true)),
+                ),
+            ],
+        );
+        assert!(!out.reported);
+        assert_eq!(out.asked.len(), 3);
+        assert_eq!(out.learned.len(), 1);
+    }
+
+    /// #3267 — the report is the answer however the child ended afterwards:
+    /// every open behind it had come back. A driver's DLL teardown faulting on
+    /// the way out has no cell to cost, and no reason to cost the host.
+    #[test]
+    fn a_report_stands_when_the_child_dies_after_printing_it() {
+        let out = run_base_scripted(
+            true,
+            vec![(
+                secs(5),
+                Some(child::Run {
+                    ending: child::Ending::Died {
+                        status: "exit code: 0xc0000005".into(),
+                        fault: true,
+                    },
+                    stdout: format!(
+                        "{p}h264_nvenc:yuv420\n{p}{no}\n{line}",
+                        p = child::PROGRESS,
+                        no = child::NO_OPEN,
+                        line = base_report_line()
+                    ),
+                    elapsed: secs(5),
+                }),
+            )],
+        );
+        assert!(out.reported);
+        assert_eq!(out.asked.len(), 1);
+        assert!(out.learned.is_empty());
+    }
+
+    /// #3267 — a driver that calls `exit(0)` inside an open leaves a clean
+    /// status and no report. That is a death, not an answer.
+    #[test]
+    fn a_clean_exit_with_no_report_is_a_death() {
+        let exited = || child::Run {
+            ending: child::Ending::Clean,
+            stdout: format!("{}vp9_qsv:yuv420\n", child::PROGRESS),
+            elapsed: secs(2),
+        };
+        let out = run_base_scripted(
+            true,
+            vec![
+                (secs(2), Some(exited())),
+                (secs(4), Some(exited())),
+                (secs(8), Some(base_reported())),
+            ],
+        );
+        assert!(out.reported);
+        assert_eq!(out.learned.len(), 1);
+        assert!(!out.learned[0].confirmed);
+
+        // With no open in progress nothing died: it just has no answer, and a
+        // second run would have none either. Every integration test's probe
+        // ends this way, its test binary spawned as `caps-probe`.
+        let out = run_base_scripted(
+            true,
+            vec![(
+                secs(1),
+                Some(child::Run {
+                    ending: child::Ending::Clean,
+                    stdout: "running 0 tests\n".to_string(),
+                    elapsed: secs(1),
+                }),
+            )],
+        );
+        assert!(!out.reported);
+        assert_eq!(out.asked.len(), 1);
+    }
+
+    /// #3267 — a child that could not be started will not start on a second
+    /// try this second either: no retry, and no hardware as before.
+    #[test]
+    fn a_child_that_cannot_start_stops_the_runs() {
+        let out = run_base_scripted(true, vec![(secs(0), None)]);
+        assert!(!out.reported);
+        assert_eq!(out.asked.len(), 1);
+    }
+
+    /// #3267 — the kill switch is the behaviour before it: one run, and a child
+    /// that does not exit cleanly means no hardware, whatever it printed.
+    #[test]
+    fn learning_off_is_one_run_and_a_death_means_no_hardware() {
+        let out = run_base_scripted(
+            false,
+            vec![(
+                secs(2),
+                Some(base_died_in("hevc_vulkan:yuv420", "exit code: 255", true)),
+            )],
+        );
+        assert!(!out.reported);
+        assert_eq!(out.asked.len(), 1);
+        assert!(out.learned.is_empty());
+
+        let mut died_after_report = base_reported();
+        died_after_report.ending = child::Ending::Died {
+            status: "exit code: 255".into(),
+            fault: true,
+        };
+        let out = run_base_scripted(false, vec![(secs(2), Some(died_after_report))]);
+        assert!(!out.reported);
+
+        let out = run_base_scripted(false, vec![(secs(4), Some(base_reported()))]);
+        assert!(out.reported, "a healthy host never sees the switch");
+    }
+
+    /// #3267 — the statuses that can confirm a cell, on the real type. A status
+    /// that reads as a fault on the wrong OS, or a kill that reads as a fault,
+    /// is how a healthy cell gets cached out.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_fault_is_an_exception_code_or_the_255_the_field_saw() {
+        use std::os::windows::process::ExitStatusExt;
+        for code in [
+            0xC000_0005u32, // access violation: the AMD fault
+            0xC000_001D,    // illegal instruction
+            0xC000_00FD,    // stack overflow
+            0xC000_0374,    // heap corruption
+            0xC000_0409,    // fast fail, what `abort` leaves
+            255,            // 2 of the 7 AMD deaths read this
+        ] {
+            assert!(
+                child::is_fault(&std::process::ExitStatus::from_raw(code)),
+                "{code:#x}"
+            );
+        }
+        for code in [
+            0u32,
+            1,           // `Child::kill` and many a TerminateProcess
+            2,           // the child's own "could not serialise"
+            3,           // EXIT_PARENT_GONE
+            101,         // a Rust panic
+            0xC000_013A, // Ctrl+C
+            0xC000_0017, // out of memory
+            0xC000_012D, // out of commit
+            0xC000_0022, // the image was refused
+            0xC000_0135, // a DLL is missing
+            0xC000_0142, // DLL init failed: desktop heap
+            0xFFFF_FFFF, // `Stop-Process`, and whatever else terminates with -1
+            0x4000_0000, // not an error's severity
+        ] {
+            assert!(
+                !child::is_fault(&std::process::ExitStatus::from_raw(code)),
+                "{code:#x}"
+            );
+        }
+    }
+
+    /// #3267 — the same on Unix: a signal a driver raises on itself, and never
+    /// the OOM killer's or an operator's.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_fault_is_a_signal_a_driver_raises_on_itself() {
+        use std::os::unix::process::ExitStatusExt;
+        for signal in [
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGILL,
+            libc::SIGFPE,
+            libc::SIGABRT,
+        ] {
+            assert!(
+                child::is_fault(&std::process::ExitStatus::from_raw(signal)),
+                "{signal}"
+            );
+        }
+        for signal in [libc::SIGKILL, libc::SIGTERM, libc::SIGINT, libc::SIGPIPE] {
+            assert!(
+                !child::is_fault(&std::process::ExitStatus::from_raw(signal)),
+                "{signal}"
+            );
+        }
+        // A plain exit is no signal, whatever its code.
+        for code in [1, 2, 3, 101, 255] {
+            assert!(!child::is_fault(&std::process::ExitStatus::from_raw(
+                code << 8
+            )));
+        }
+    }
+
+    /// #3267 — the host `base` gave up on keeps what needs no driver. libvpx is
+    /// software, so losing it to a probe that died in a vendor's driver drops
+    /// VP9 4:4:4 over the DataChannel for nothing. And nothing else comes with
+    /// it: no hardware cell, no candidate for the 4:4:4 or GPU children, and so
+    /// nothing the cache would keep.
+    #[test]
+    fn giving_up_on_the_hardware_keeps_libvpx_and_nothing_else() {
+        let report = software_report();
+        let caps = &report.caps;
+        assert_eq!(
+            caps.transports.iter().any(|t| t == "data-channel-vp9-444"),
+            cfg!(feature = "vp9-444"),
+            "{:?}",
+            caps.transports
+        );
+        assert_eq!(
+            caps.hw_encoders.iter().any(|h| h == "libvpx-vp9-444-sw"),
+            cfg!(feature = "vp9-444"),
+            "{:?}",
+            caps.hw_encoders
+        );
+        assert_eq!(
+            caps.video_cells
+                .iter()
+                .any(|c| c.backend == VideoBackend::Libvpx.wire()),
+            cfg!(feature = "vp9-444"),
+            "{:?}",
+            caps.video_cells
+        );
+        assert_eq!(
+            !caps.vp9_chroma.is_empty(),
+            cfg!(feature = "vp9-444"),
+            "the viewer configures its decoder from this"
+        );
+        assert!(
+            caps.video_cells.iter().all(|c| !c.hw),
+            "a hardware cell with no driver asked: {:?}",
+            caps.video_cells
+        );
+        assert!(
+            !caps
+                .hw_encoders
+                .iter()
+                .any(|h| h.starts_with("ffmpeg-") || h.starts_with("mf-")),
+            "{:?}",
+            caps.hw_encoders
+        );
+        assert!(child::candidates_444(caps).is_empty());
+        assert!(child::candidates_gpu(caps).is_empty());
+        assert!(
+            !super::super::caps_cache::worth_caching(caps),
+            "and the next start tests the hardware again"
+        );
+        assert!(report.vp9_qsv_idr.is_none() && report.gpu_input.is_empty());
+    }
+
+    /// #3267 — a learned deny reaches a fleet read, by the one seam every path
+    /// to the hello goes through, under a key every reader already skips. No
+    /// list, no word: a healthy host's `unavailable` does not change.
+    #[test]
+    fn a_learned_cell_reaches_the_hello_as_an_honest_word() {
+        use roomler_ai_remote_control::models::{OsKind, Unavailable};
+        let learned = vec![crate::encode::cells::LearnedDeny {
+            cell: "hevc_vulkan:yuv420".into(),
+            why: "exit code: 0xc0000005".into(),
+            confirmed: true,
+        }];
+        let c = assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &learned);
+        let word = &c.unavailable[LEARNED_WORD];
+        assert_eq!(word.code, LEARNED_CODE);
+        assert!(
+            word.reason.contains("hevc_vulkan:yuv420") && word.reason.contains("0xc0000005"),
+            "the reason names the cell and why: {}",
+            word.reason
+        );
+        assert!(
+            Unavailable::KEYS.contains(&LEARNED_WORD),
+            "the wire lock names it"
+        );
+        assert_ne!(
+            word.code,
+            Unavailable::NOT_APPLICABLE,
+            "the one code a viewer acts on"
+        );
+        // The seam still assigns what it always did.
+        assert!(c.unavailable.contains_key("sas"));
+        assert!(!c.files.is_empty(), "with_config_lists still runs");
+
+        let none = assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &[]);
+        assert!(!none.unavailable.contains_key(LEARNED_WORD));
+    }
+
     /// #2719 — a line written to a pipe whose reader is gone (the parent was
     /// terminated mid-probe) reads as "the parent is gone", where `println!`
     /// panicked. A real OS pipe, so the error is the one the field saw:
@@ -4386,6 +5560,8 @@ mod tests {
         assert_eq!(child::phase_from_env(), child::Phase::Full);
         unsafe { std::env::set_var(child::PHASE_ENV, "base") };
         assert_eq!(child::phase_from_env(), child::Phase::Base);
+        unsafe { std::env::set_var(child::PHASE_ENV, "software") };
+        assert_eq!(child::phase_from_env(), child::Phase::Software);
         unsafe { std::env::set_var(child::PHASE_ENV, "444") };
         assert_eq!(child::phase_from_env(), child::Phase::Only444);
         unsafe { std::env::set_var(child::NAMES_444_ENV, " hevc_nvenc, vp9_qsv ,") };

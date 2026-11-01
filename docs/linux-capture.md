@@ -483,7 +483,7 @@ what would capture it. An exec sweep cannot answer "how many hosts are Wayland,
 and which arm serves each": a sweep reaches only the devices that are online.
 The server can, because every device says it in its hello.
 
-The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1487`),
+The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1492`),
 all strings, so a newer agent's word reaches an older server as a word:
 
 | field | values | from |
@@ -2038,7 +2038,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1243-1274`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2989`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2995`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|
@@ -2073,11 +2073,11 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 
 The encoder-capability cache is keyed on **build × hardware × knobs**, and the
 knob half is a SHA-256 over **every** `ROOMLERD_*` variable the daemon can see
-(`agents/roomlerd/src/encode/caps_cache.rs:24-27`, `:197-217`; the reasoning
+(`agents/roomlerd/src/encode/caps_cache.rs:24-27`, `:234-254`; the reasoning
 is in [`encoders.md`](encoders.md#the-probe-lifecycle)). So a capture flag
 that has nothing to do with encoding still changes the key, the single-entry
 cache misses (`a ROOMLERD_* knob changed`), and the next start runs the full
-probe in a child process bounded at 60 s per phase (`encode/caps.rs:212`).
+probe in a child process bounded at 60 s per phase (`encode/caps.rs:242`).
 Restoring the old knob set afterwards is a **second** miss, because the cache
 now holds the new key.
 
