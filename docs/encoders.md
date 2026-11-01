@@ -266,7 +266,7 @@ flowchart TD
 | Outcome of a child | Verdict |
 |---|---|
 | non-zero exit, or killed by a signal | phase base: it costs the cell it died in, not the host ([below](#a-dead-child-costs-the-cell-it-died-in)), and no hardware only when there is no cell to blame (logged at ERROR with the status) · phase 444: the 4:2:0 matrix, the last announced open named · phase gpu: every cell as before, no GPU-input form, the last announced open named |
-| still running after 60 s | killed; as above, except that phase base does not confirm a hang with a second one |
+| still running after 60 s | told to die, and the probe goes on within 10 s whether it went or not ([below](#a-dead-child-costs-the-cell-it-died-in)); as above, except that phase base does not confirm a hang with a second one |
 | could not spawn | no answer from that phase, no retry |
 | clean exit with no marked line | inside an open: as a non-zero exit (a driver that called `exit(0)`) · otherwise no answer from that phase, no retry |
 | a marked line, however the child ended after it | those caps, as reported (phase base; a learning-off run needs a clean exit) |
@@ -372,7 +372,7 @@ last one cost a Radeon laptop its RTX 5090's three NVENC cells and all four
 DataChannel transports for 4 h 22 min, and the viewer looked healthy throughout.
 So `base` announces every open (`ROOMLER_CAPS_PROGRESS:<name>:<chroma>`, and
 `ROOMLER_CAPS_PROGRESS:-` once it has ended, its teardown included), and the
-parent runs it again ([`run_base`](../agents/roomlerd/src/encode/caps.rs#L544)).
+parent runs it again ([`run_base`](../agents/roomlerd/src/encode/caps.rs#L554)).
 
 ```mermaid
 sequenceDiagram
@@ -406,7 +406,7 @@ instead of falling to the RTP track, and answers like any host with no hardware
 encoder. It is a child and not an open in the daemon because this is a host whose probes
 have been dying. Only if that child dies as well is the answer the driver-free caps.
 
-A **fault's status** ([`is_fault`](../agents/roomlerd/src/encode/caps.rs#L338)) is
+A **fault's status** ([`is_fault`](../agents/roomlerd/src/encode/caps.rs#L347)) is
 what a driver leaves when it faults, and not what someone else leaves when they end
 the process. On Windows that is a short list of exception codes a thread raises on
 itself: access violation, illegal instruction, the arithmetic traps, stack overflow,
@@ -449,16 +449,15 @@ not get it, and a fault there costs that process alone. `encoder-smoke --name` s
 opens what it is told to: driving a denied cell under the harness is what it is for.
 
 **The cost.** `base` runs at most 9 times per probe (four cells at two deaths each, and
-the run that reports), and no run starts more than 90 s after the first. The worst case
-is therefore 90 s plus one 60 s timeout, 150 s against 60 s before; with the 4:4:4 and GPU
-children, 270 s against 180 s. Giving up adds the software child (60 s at most) and takes
-those two away, so that path tops out at 210 s. It needs a host whose children each take a minute. The
-probe runs before the worker connects (#2551), with the watchdog's pump gated off, so
-this is time the device is offline, and only on a cache miss. Nothing reads that time as
-a hang: the pump is gated off, a service manager watches for an exit and not for a
-hello, and the crash-loop detector counts unclean exits. ⚠️ These bounds assume the kill
-lands. A child stuck in a kernel call cannot be ended, and `run_child` then waits for it
-with no bound, the device offline (#3273). Measured on the dev box
+the run that reports), and no run starts more than 90 s after the first. One child is
+bounded at 70 s: the 60 s timeout, then 10 s for the kill to land and its stdout to end
+(`KILL_WAIT`). The worst case is therefore 90 s plus one child, 160 s against 60 s before;
+with the 4:4:4 and GPU children, 300 s against 180 s. Giving up adds the software child and
+takes those two away, so that path tops out at 230 s. It needs a host whose children each
+take a minute. The probe runs before the worker connects (#2551), with the watchdog's pump
+gated off, so this is time the device is offline, and only on a cache miss. Nothing reads
+that time as a hang: the pump is gated off, a service manager watches for an exit and not
+for a hello, and the crash-loop detector counts unclean exits. Measured on the dev box
 with AMD's real fault (a debug build, run by hand from Git Bash): two deaths and a report
 in 7.2–7.8 s, against 3.4–3.8 s for the same probe with the cell denied from the start. A
 hung child (suspended, standing in for a driver) cost 63 s, and two of them, which is
@@ -466,6 +465,22 @@ giving up, 120 s. Those deaths took 1.9–2.1 s each and left no Application Err
 Under the service each of the same faults took
 3.9–15 s (the log of 2026-11-01), so expect 15–35 s there. A healthy host pays nothing:
 one run, and two more lines per open on a pipe.
+
+⚠️ **A kill may not land, and a pipe may not end** (#3273), and nothing restarts a worker
+during a probe, so an unbounded wait for either keeps the device offline until someone
+acts on the host. A child stuck in a kernel call does not die until that call returns, and
+a GPU driver hung in a kernel wait is the way to get there. Its stdout stays open while it
+or anything it started holds the write end, and that can outlive a child that exited
+cleanly, which `TIMEOUT` never bounded. So
+[`wait_for_child`](../agents/roomlerd/src/encode/caps.rs#L1085) waits for neither past the
+bound above and keeps what the child wrote, so a stuck child's `PROGRESS` line still costs
+it one cell, denied for this process like any hang. The child stays behind, on a thread
+that reaps it if the call ever returns, and the log says so at ERROR. If the next run
+sticks in the same driver, the budget above ends the runs and the software child answers:
+the device comes online with no hardware, and that is the point. Nothing has produced this
+in the field: a stand-in that is never sent the kill is a unit test, and a real driver case
+is unproven. A child that exits while something holds its pipe is a unit test with a real
+process on each OS.
 
 **Where to see it.** The log names the cell and the status at each step, at ERROR once
 denied. `roomlerd caps` prints `learned_deny:`. The hello carries it in
@@ -896,7 +911,7 @@ colour-manages by primaries and transfer (FR-130 §2.5).
 | openh264, recording | its own VUI and the MP4 `colr` box, unchanged since FR-85 | SMPTE 170M at limited range |
 
 A vendor runtime that refuses the description opens the encoder without it rather than failing the open.
-While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:2263`).
+While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:2383`).
 
 **Which lever reaches which path:**
 

@@ -41,6 +41,12 @@ records nothing.
 crashed, or leaving at its 3 s runtime-shutdown budget, #2718) must not orphan
 a `roomlerd.exe caps-probe`. It would hold the binary an update replaces, and
 nobody would enforce the 60 s bound on a child hung in a driver.
+⚠️ **A child told to die may not go, and its pipe may not end** (#3273). A child
+stuck in a kernel call outlives the kill, and whatever it started can hold its
+stdout after it has gone. `child::wait_for_child` waits for neither past `TIMEOUT` +
+`KILL_WAIT`, and keeps what was written, so a stuck child still costs one cell. A
+`wait()` or a `join()` with no bound on this path keeps the device offline: nothing
+restarts a worker during a probe.
 
 ### Anything derived from CONFIG belongs in the PARENT
 

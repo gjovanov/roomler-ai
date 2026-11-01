@@ -240,6 +240,14 @@ mod child {
     /// budget — and even at the ceiling it beats the in-process behaviour it
     /// replaces, which was to hang forever.
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    /// #3273 — how long a child that ended or was told to die, and then its
+    /// stdout, get before [`run_child`] carries on without them. A healthy host
+    /// waits none of this, as the pipe ends with the child. It is this long
+    /// because a report is the last thing a child writes: a reader thread starved
+    /// past this on a thrashing host costs that report, and with it the hardware
+    /// until the next start. So it is long for a scheduler, and short for a
+    /// device waiting to come online.
+    const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// What the child hands back: the caps, plus the per-host verdicts the
     /// probe measured that are NOT wire capabilities.
@@ -327,7 +335,8 @@ mod child {
         /// driver leaves ([`is_fault`]); `status` is that status, as the log
         /// says it.
         Died { status: String, fault: bool },
-        /// Still running at [`TIMEOUT`], and killed for it.
+        /// Still running at [`TIMEOUT`], and told to die for it (#3273: it may
+        /// not have).
         Hung,
     }
 
@@ -402,10 +411,11 @@ mod child {
     /// that faults on every open is four cells (`vp9`, `hevc`, `av1`, `h264`).
     pub(super) const MAX_BASE_RUNS: u32 = 9;
     /// #3267 — no new `base` run starts this long after the first started. The
-    /// base phase's worst case is therefore this plus one [`TIMEOUT`]: 150 s,
-    /// against 60 s before, and it is only reached by a host whose children
-    /// take a minute each. Long enough for one hang to get its retry, and for
-    /// the three runs one fault costs on a host where a run takes under 45 s.
+    /// base phase's worst case is therefore this plus one child's bound
+    /// ([`TIMEOUT`] + [`KILL_WAIT`]): 160 s, against 60 s before, and it is only
+    /// reached by a host whose children take a minute each. Long enough for one
+    /// hang to get its retry, and for the three runs one fault costs on a host
+    /// where a run takes under 45 s.
     /// The dev box's slowest run on record is 24 s.
     pub(super) const BASE_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
@@ -595,8 +605,8 @@ mod child {
     /// more child, opening that and nothing else, so the host keeps VP9 4:4:4
     /// over the DataChannel instead of falling to the RTP track. A child all the
     /// same, because this is a host whose probes have been dying and the daemon
-    /// has no business finding out why. At most one [`TIMEOUT`], on a path where
-    /// no 4:4:4 or GPU child follows, since neither has a candidate left.
+    /// has no business finding out why. At most one child's bound, on a path
+    /// where no 4:4:4 or GPU child follows, since neither has a candidate left.
     fn run_software() -> Option<ProbeReport> {
         tracing::warn!(
             "caps probe: no answer from the base phase — asking a child for the cells that need \
@@ -744,8 +754,8 @@ mod child {
     }
 
     /// Spawn one `caps-probe` child with `extra` on top of the recursion
-    /// guard and the S2 config fallbacks; read its stdout on a thread while
-    /// waiting, bounded by [`TIMEOUT`]. `None` = could not spawn / hung.
+    /// guard and the S2 config fallbacks, and wait for it ([`wait_for_child`]),
+    /// bounded by [`TIMEOUT`] plus [`KILL_WAIT`]. `None` = could not spawn.
     fn run_child(extra: &[(&str, String)]) -> Option<Run> {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
@@ -779,7 +789,7 @@ mod child {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let mut childp = match cmd.spawn() {
+        let childp = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(%e, "caps probe: could not spawn the probe child — no HW advertisement");
@@ -791,32 +801,35 @@ mod child {
         #[cfg(windows)]
         let _ends_with_us = tie_to_this_process(&childp);
 
-        // Read stdout on this thread while waiting, so a chatty child cannot
-        // fill the pipe and deadlock against our own wait.
-        let stdout = childp.stdout.take();
-        let reader = std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = String::new();
-            if let Some(mut s) = stdout {
-                let _ = s.read_to_string(&mut buf);
-            }
-            buf
+        let (waited, stdout) = wait_for_child(childp, TIMEOUT, KILL_WAIT, |c| {
+            let _ = c.kill();
         });
-
-        let status = match wait_bounded(&mut childp) {
-            Some(s) => s,
-            None => {
-                // A hung driver. Kill it and carry on without this phase.
-                let _ = childp.kill();
-                let _ = childp.wait();
-                let stdout = reader.join().unwrap_or_default();
-                tracing::warn!(
-                    timeout_s = TIMEOUT.as_secs(),
-                    phase = ?extra.iter().find(|(k, _)| *k == PHASE_ENV).map(|(_, v)| v.as_str()),
-                    last_open = %last_progress(&stdout).unwrap_or_default(),
-                    "caps probe: the probe child hung — the daemon is unaffected; this is \
-                     the process boundary doing its job."
-                );
+        let phase = extra.iter().find(|(k, _)| *k == PHASE_ENV);
+        let phase = phase.map(|(_, v)| v.as_str());
+        let last_open = last_progress(&stdout).unwrap_or_default();
+        let status = match waited {
+            Waited::Exited(status) => status,
+            Waited::Hung { gone } => {
+                // A hung driver. Carry on without this phase.
+                if gone {
+                    tracing::warn!(
+                        timeout_s = TIMEOUT.as_secs(),
+                        ?phase,
+                        %last_open,
+                        "caps probe: the probe child hung — the daemon is unaffected; this is \
+                         the process boundary doing its job."
+                    );
+                } else {
+                    tracing::error!(
+                        timeout_s = TIMEOUT.as_secs(),
+                        kill_wait_s = KILL_WAIT.as_secs(),
+                        ?phase,
+                        %last_open,
+                        "caps probe: the probe child hung and did not die when killed. It is \
+                         most likely stuck in a kernel call in a driver, and stays until that \
+                         call returns. Going on without it; the daemon is unaffected."
+                    );
+                }
                 return Some(Run {
                     ending: Ending::Hung,
                     stdout,
@@ -824,7 +837,6 @@ mod child {
                 });
             }
         };
-        let stdout = reader.join().unwrap_or_default();
 
         if !status.success() {
             // THE case this module exists for. A signal death here is a
@@ -832,8 +844,8 @@ mod child {
             tracing::error!(
                 status = %status,
                 elapsed_ms = started.elapsed().as_millis(),
-                phase = ?extra.iter().find(|(k, _)| *k == PHASE_ENV).map(|(_, v)| v.as_str()),
-                last_open = %last_progress(&stdout).unwrap_or_default(),
+                ?phase,
+                %last_open,
                 "caps probe: the probe child DIED. Before this ran out-of-process the same \
                  fault crash-looped the daemon."
             );
@@ -1047,13 +1059,121 @@ mod child {
         }
     }
 
-    /// `wait` with a deadline. `None` = still running when time ran out.
+    /// How waiting on a child came out.
+    #[derive(Debug)]
+    pub(super) enum Waited {
+        /// It ended by itself.
+        Exited(std::process::ExitStatus),
+        /// Still running at the limit, and told to die. `gone` = it did.
+        Hung { gone: bool },
+    }
+
+    /// #3273 — wait for a child and read what it wrote, for at most `timeout`
+    /// plus `kill_wait`, whatever the child does.
+    ///
+    /// Neither wait here ends by itself. A child stuck in a kernel call does not
+    /// die when killed: the kill is queued until the call returns, and a GPU
+    /// driver hung in a kernel wait is the way to get there. Its stdout does not
+    /// end while anything holds the pipe's write end: that child, or something
+    /// it started, which can outlive a child that exited cleanly. Nothing
+    /// restarts a worker during a probe (`signaling::run` gates the watchdog's
+    /// pump off), so either wait, unbounded, keeps the device offline until
+    /// someone acts on the host.
+    ///
+    /// `kill` is a parameter because no real process can ignore a kill, so a test
+    /// has to decline to send it.
+    pub(super) fn wait_for_child(
+        mut child: std::process::Child,
+        timeout: std::time::Duration,
+        kill_wait: std::time::Duration,
+        kill: impl FnOnce(&mut std::process::Child),
+    ) -> (Waited, String) {
+        // Read stdout on its own thread while waiting, so a chatty child cannot
+        // fill the pipe and deadlock against our own wait.
+        let output = read_output(child.stdout.take());
+        if let Some(status) = wait_bounded(&mut child, timeout) {
+            let deadline = std::time::Instant::now() + kill_wait;
+            return (Waited::Exited(status), collect_output(output, deadline));
+        }
+        kill(&mut child);
+        let deadline = std::time::Instant::now() + kill_wait;
+        let gone = wait_bounded(&mut child, kill_wait).is_some();
+        if !gone {
+            // Reap it if that call ever returns, or it stays a zombie for as
+            // long as the daemon runs.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        (Waited::Hung { gone }, collect_output(output, deadline))
+    }
+
+    /// #3273 — a child's stdout, chunk by chunk as it arrives. The thread ends
+    /// with the pipe, or at the first chunk after the receiver has gone.
+    fn read_output(
+        stdout: Option<std::process::ChildStdout>,
+    ) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        use std::io::Read;
+        let (chunks, output) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Some(mut stdout) = stdout else {
+                return;
+            };
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        if chunks.send(chunk[..n].to_vec()).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return,
+                }
+            }
+        });
+        output
+    }
+
+    /// #3273 — what [`read_output`] has read by `deadline`, or by the end of the
+    /// pipe if that comes first.
+    ///
+    /// Lossy, because a driver's banner in the wrong code page should cost that
+    /// banner and not the report beside it. A pipe that has not ended may have
+    /// stopped mid-line, and half a `PROGRESS` line names a cell that does not
+    /// exist, so what it gives back then stops at the last whole line.
+    pub(super) fn collect_output(
+        output: std::sync::mpsc::Receiver<Vec<u8>>,
+        deadline: std::time::Instant,
+    ) -> String {
+        use std::sync::mpsc::RecvTimeoutError;
+        let mut bytes = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match output.recv_timeout(left) {
+                Ok(chunk) => bytes.extend_from_slice(&chunk),
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    let whole = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+                    bytes.truncate(whole);
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// `wait` with a limit. `None` = still running when time ran out.
     ///
     /// Polling rather than a platform wait-with-timeout: it is a handful of
     /// wakeups on a path that runs ONCE per process, and it keeps this
     /// module free of per-platform process APIs.
-    fn wait_bounded(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
-        let deadline = std::time::Instant::now() + TIMEOUT;
+    fn wait_bounded(
+        child: &mut std::process::Child,
+        limit: std::time::Duration,
+    ) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + limit;
         loop {
             match child.try_wait() {
                 Ok(Some(s)) => return Some(s),
@@ -5645,5 +5765,211 @@ mod tests {
         }
         assert!(ran_on, "the control: the probe runs while its job is open");
         assert!(ended, "the probe outlived its job's last handle");
+    }
+
+    /// #3273 — a stand-in for a probe child: a script in the platform's shell,
+    /// with stdout piped as `run_child` pipes it. The second value ends it with
+    /// the test on Windows, where a job can; elsewhere its `sleep` runs out.
+    fn stand_in(windows: &str, unix: &str) -> (std::process::Child, Box<dyn std::any::Any>) {
+        use std::process::{Command, Stdio};
+        let mut cmd = if cfg!(windows) {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/c", windows]);
+            cmd
+        } else {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", unix]);
+            cmd
+        };
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a stand-in probe child");
+        #[cfg(windows)]
+        let job: Box<dyn std::any::Any> = Box::new(child::tie_to_this_process(&child));
+        #[cfg(not(windows))]
+        let job: Box<dyn std::any::Any> = Box::new(());
+        (child, job)
+    }
+
+    /// #3273 — every stand-in below stays this long, or leaves something behind
+    /// holding its pipe for this long. Anything that waits for it fails [`STAND_IN_HELD`].
+    const STAND_IN_WIN: &str = "ping -n 16 127.0.0.1 > nul";
+    const STAND_IN_UNIX: &str = "sleep 15";
+    const STAND_IN_HELD: std::time::Duration = std::time::Duration::from_secs(12);
+    /// What a stand-in that has said its line gets before it counts as hung.
+    const STAND_IN_HANG: std::time::Duration = std::time::Duration::from_secs(4);
+    const STAND_IN_KILL: std::time::Duration = std::time::Duration::from_secs(1);
+    const STAND_IN_CELL: &str = "hevc_vulkan:yuv420";
+
+    /// #3273 — nothing can make a real process ignore a kill, so this one is
+    /// told nothing: to the parent that is what a child stuck in a kernel call
+    /// looks like. It is alive and it holds its pipe, as that child would.
+    #[test]
+    fn a_child_that_does_not_die_when_killed_does_not_hold_the_probe() {
+        let (child, _job) = stand_in(
+            &format!("echo {}{STAND_IN_CELL}& {STAND_IN_WIN}", child::PROGRESS),
+            &format!("echo {}{STAND_IN_CELL}; {STAND_IN_UNIX}", child::PROGRESS),
+        );
+        let started = std::time::Instant::now();
+        let (waited, stdout) = child::wait_for_child(child, STAND_IN_HANG, STAND_IN_KILL, |_| {});
+        assert!(
+            started.elapsed() < STAND_IN_HELD,
+            "waited for the child: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(waited, child::Waited::Hung { gone: false }),
+            "{waited:?}"
+        );
+        assert_eq!(
+            child::last_progress(&stdout).as_deref(),
+            Some(STAND_IN_CELL),
+            "the line that lets a stuck child cost one cell and not the host: {stdout:?}"
+        );
+    }
+
+    /// #3273 — the kill lands, and what the child started keeps the pipe open.
+    #[test]
+    fn a_killed_child_whose_pipe_lives_on_does_not_hold_the_probe() {
+        let (child, _job) = stand_in(
+            &format!("echo {}{STAND_IN_CELL}& {STAND_IN_WIN}", child::PROGRESS),
+            &format!(
+                "echo {}{STAND_IN_CELL}; {STAND_IN_UNIX} & wait",
+                child::PROGRESS
+            ),
+        );
+        let started = std::time::Instant::now();
+        let (waited, stdout) = child::wait_for_child(child, STAND_IN_HANG, STAND_IN_KILL, |c| {
+            let _ = c.kill();
+        });
+        assert!(
+            started.elapsed() < STAND_IN_HELD,
+            "waited for the pipe: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(waited, child::Waited::Hung { gone: true }),
+            "{waited:?}"
+        );
+        assert_eq!(
+            child::last_progress(&stdout).as_deref(),
+            Some(STAND_IN_CELL),
+            "{stdout:?}"
+        );
+    }
+
+    /// #3273 — the child ends by itself, its report written, and something it
+    /// started holds the pipe. `TIMEOUT` never bounded this wait.
+    #[test]
+    fn a_child_that_exits_while_its_pipe_lives_on_keeps_what_it_wrote() {
+        let (child, _job) = stand_in(
+            &format!(
+                "echo {}{STAND_IN_CELL}& start /b {STAND_IN_WIN}",
+                child::PROGRESS
+            ),
+            &format!(
+                "echo {}{STAND_IN_CELL}; {STAND_IN_UNIX} & exit 0",
+                child::PROGRESS
+            ),
+        );
+        let started = std::time::Instant::now();
+        let (waited, stdout) = child::wait_for_child(
+            child,
+            std::time::Duration::from_secs(30),
+            STAND_IN_KILL,
+            |_| panic!("a child that ended by itself is never killed"),
+        );
+        assert!(
+            started.elapsed() < STAND_IN_HELD,
+            "waited for the pipe: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&waited, child::Waited::Exited(s) if s.success()),
+            "{waited:?}"
+        );
+        assert_eq!(
+            child::last_progress(&stdout).as_deref(),
+            Some(STAND_IN_CELL),
+            "{stdout:?}"
+        );
+    }
+
+    /// #3273 — the path every host takes: the pipe ends with the child, so the
+    /// bound is never waited out, and every line arrives.
+    #[test]
+    fn a_child_that_ends_cleanly_pays_nothing_for_the_bound() {
+        let (child, _job) = stand_in("echo one& echo two& exit 3", "echo one; echo two; exit 3");
+        let limit = std::time::Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        let (waited, stdout) = child::wait_for_child(child, limit, limit, |_| {
+            panic!("a child that ended by itself is never killed")
+        });
+        assert!(
+            started.elapsed() < STAND_IN_HELD,
+            "waited out the bound: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&waited, child::Waited::Exited(s) if s.code() == Some(3)),
+            "{waited:?}"
+        );
+        assert_eq!(
+            stdout.lines().map(str::trim).collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+    }
+
+    /// #3273 — `read_to_string` dropped everything on one bad byte, and a report
+    /// lost that way reads as no hardware.
+    #[test]
+    fn a_byte_that_is_not_utf8_costs_that_byte_and_not_the_rest() {
+        let (chunks, output) = std::sync::mpsc::channel();
+        chunks
+            .send(b"\xffbanner\nROOMLER_CAPS_PROGRESS:hevc_nvenc:yuv420\n".to_vec())
+            .unwrap();
+        drop(chunks);
+        let stdout = child::collect_output(output, std::time::Instant::now());
+        assert_eq!(
+            child::last_progress(&stdout).as_deref(),
+            Some("hevc_nvenc:yuv420"),
+            "{stdout:?}"
+        );
+    }
+
+    /// #3273 — half a line names a cell that does not exist, so it is dropped
+    /// while the pipe is still open. A pipe that ended has no more of it coming,
+    /// so there what is left stays.
+    #[test]
+    fn a_pipe_still_open_gives_back_whole_lines_and_an_ended_one_everything() {
+        let line = b"ROOMLER_CAPS_PROGRESS:hevc_nvenc:yuv420\nROOMLER_CAPS_PROGRESS:hevc_vul";
+
+        let (chunks, output) = std::sync::mpsc::channel();
+        chunks.send(line.to_vec()).unwrap();
+        let stdout = child::collect_output(output, std::time::Instant::now());
+        drop(chunks);
+        assert_eq!(
+            child::last_progress(&stdout).as_deref(),
+            Some("hevc_nvenc:yuv420"),
+            "{stdout:?}"
+        );
+
+        let (chunks, output) = std::sync::mpsc::channel();
+        chunks.send(line.to_vec()).unwrap();
+        drop(chunks);
+        let stdout = child::collect_output(output, std::time::Instant::now());
+        assert_eq!(
+            child::last_progress(&stdout).as_deref(),
+            Some("hevc_vul"),
+            "{stdout:?}"
+        );
     }
 }
