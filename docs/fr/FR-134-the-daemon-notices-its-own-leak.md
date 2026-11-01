@@ -98,3 +98,4 @@ None blocking. AC3 is what would change the thresholds.
 
 | date | what | result |
 |---|---|---|
+| 2026-11-01 | #3252's fix on 0.4.193, NEO16 `SystemContext` worker, keep-busy `running` throughout (read from the worker's log, so the leaking path was live) | 573 handles at 55 s, 707 at 775 s, and it falls back between readings. 0.4.192 reached 237,194 at 76 min on the same host |

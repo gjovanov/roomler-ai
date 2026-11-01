@@ -109,8 +109,7 @@ fn min_rise() -> u64 {
         .unwrap_or(MIN_RISE)
 }
 
-/// Runs until `shutdown`. Does nothing on a device that switched it off, or
-/// where the OS will not report a count.
+/// Runs until `shutdown`, and does nothing on a device that switched it off.
 pub async fn run(mut shutdown: watch::Receiver<bool>) {
     if node_env("RESOURCE_WATCH").as_deref() == Some("0") {
         return;
@@ -124,14 +123,16 @@ pub async fn run(mut shutdown: watch::Receiver<bool>) {
     loop {
         tokio::select! {
             biased;
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() { return; }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return; }
                 continue;
             }
             _ = tick.tick() => {}
         }
+        // A refused read skips the sample and must not end the watch: on Unix
+        // the likeliest cause is having run out of descriptors.
         let Some(handles) = open_handles() else {
-            return;
+            continue;
         };
         since_log += 1;
         match watch.observe(handles) {
@@ -229,5 +230,15 @@ mod tests {
     fn counts_that_fall_cannot_underflow() {
         let falling: Vec<u64> = (0..13).rev().map(|i| i * 10_000).collect();
         assert_eq!(fed(&falling), Verdict::Steady);
+    }
+
+    #[tokio::test]
+    async fn a_closed_shutdown_channel_ends_the_watch() {
+        // With every sender gone `changed()` answers at once, for ever, so a
+        // loop that ignores its error never reaches the tick and spins.
+        let (tx, rx) = watch::channel(false);
+        drop(tx);
+        let ended = tokio::time::timeout(Duration::from_secs(5), run(rx)).await;
+        assert!(ended.is_ok(), "the watch must end, not spin");
     }
 }
