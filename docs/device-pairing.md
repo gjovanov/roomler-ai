@@ -91,7 +91,7 @@ polls after one approval, cannot both win.
 |---|---|---|
 | What it is | 32 CSPRNG bytes as unpadded base64url, 43 characters (`generate_device_code`, `crates/modules/fleet/src/pairing.rs:292-296`) | 8 letters from `BCDFGHJKLMNPQRSTVWXZ` — the 20 consonants with no look-alikes, about 34.6 bits, rejection-sampled so every letter is equally likely (`generate_user_code`, `:247-258`); shown `XXXX-XXXX` (`:262-268`) |
 | Who holds it | the installer, in memory: `DeviceCode` has no `Display` and a `Debug` that prints nothing of it (`crates/agent-core/src/pairing.rs:99-116`); the wizard keeps it in its `PairStore`, never in the webview (§11) | the person, who reads it off the installer and types it in the browser |
-| At rest | only `hex(SHA-256(code))`, as `device_code_hash`, unique (`hash_device_code`, `:299-301`; `crates/db/src/models/device_pairing.rs:26-27`) — a copy of the database cannot poll | stored without the hyphen; unique **among `pending` rows** by a partial index, so a decided pairing frees its code and `start` regenerates on a collision (`crates/modules/fleet/src/lib.rs:648-659`) |
+| At rest | only `hex(SHA-256(code))`, as `device_code_hash`, unique (`hash_device_code`, `:299-301`; `crates/db/src/models/device_pairing.rs:26-27`) — a copy of the database cannot poll | stored without the hyphen; unique **among `pending` rows** by a partial index, so a decided pairing frees its code and `start` regenerates on a collision (`crates/modules/fleet/src/lib.rs:651-662`) |
 | On the wire | POST bodies only: `start`'s response is the one time it leaves the server, and `poll`'s request the only place it goes | `start`'s response, and the bodies of `lookup`, `approve` and `deny` |
 | What it retrieves | the token — the **only** credential that can | nothing: it names a pairing to a signed-in person |
 | In a log line | never: the two structs that carry it redact it from `{:?}` on the server (`:192-216`), the client does the same (`crates/agent-core/src/pairing.rs:112-116`), and an integration test asserts no response but `start`'s and no database row carries it (`crates/tests/src/pairing_tests.rs:531`) | not a secret: it names the pairing, as its row id does |
@@ -293,7 +293,7 @@ an `approve` with an unparseable `tenant_id` (400), and the empty 404s of the ki
 **Never in it**: the device code, a token, an email address. The pairing is named by its row
 id, the person by theirs. Rows live **90 days** from `at` (`TTL_SECS`,
 `pairing_audit.rs:50`), indexed by `(pairing_id, at)`, `(tenant_id, at)` and `(user_id, at)`
-(`lib.rs:662-674`). Writes are best-effort — a failed insert is logged and the request
+(`lib.rs:665-677`). Writes are best-effort — a failed insert is logged and the request
 proceeds (`:495-497`) — so the audit never gates a pairing. The server's own `info!` lines
 (`pairing: started` · `approved` · `delivered` · `denied`) name the pairing id, the org and the
 user id, never a code.
@@ -331,12 +331,12 @@ looks up, approves and polls on another over one database, and checks delivery i
 across both (`pairing_tests.rs:468`).
 
 What *is* per pod, on purpose: the three `WindowLimiter`s (the start ceiling, the account
-misses, the audit de-duplication; `lib.rs:121-131`, built `:320-322`). They are abuse
+misses, the audit de-duplication; `lib.rs:124-134`, built `:323-325`). They are abuse
 ceilings, not the boundary (§5), and a flood can therefore leave up to one audit row per pod
 per hour rather than one.
 
 The clock is the authority on a pairing's life, not the TTL sweep: the TTL index on
-`expires_at` (`lib.rs:657`) only tidies, because its monitor passes every 60 s (an expired row lingers up to a minute, or goes at once), and
+`expires_at` (`lib.rs:660`) only tidies, because its monitor passes every 60 s (an expired row lingers up to a minute, or goes at once), and
 **every reader compares `expires_at` to now** (`live_pending`; `decide_poll`; the CAS filters
 `expires_at > now` on `approve` and `deliver`). A row found past its life is flipped to
 `expired` by whichever reader found it, so the expiry is audited exactly once.
@@ -431,11 +431,11 @@ HTTP call, then applies the answer under a fresh lock (`apply_poll`, `:181-233`)
 **The paste fallback.** The `I already have a token` box is the scripted, MSP, offline-mint
 and FR-104 anchoring path, and the only path when the server has no pairing. A server that
 says `"pairing": false` takes the card away before the Join step opens: the wizard asks once
-per server (`readPairingOffer`, `app.js:328-343`; `pairing_off`,
+per server (`readPairingOffer`, `app.js:366-381`; `pairing_off`,
 `agents/roomler-setup/src/features.rs:131`), retitles the box "Enrollment token" and opens it
-(`:1237-1246`). Only that word does it, so a timeout or an older server leaves the card up,
+(`app.js:1331-1338`). Only that word does it, so a timeout or an older server leaves the card up,
 and a 404 on `start` then decides as it always has: `StartOutcome::Unavailable`, not an error
-(`crates/agent-core/src/pairing.rs:336-339`), and the same fallback (`app.js:1031-1034`),
+(`crates/agent-core/src/pairing.rs:336-339`), and the same fallback (`app.js:1122-1125`),
 silently, because a client cannot tell "switched off" from "not there". The answer lasts the
 wizard's run, so a switch flipped under an open wizard takes a relaunch to show.
 
@@ -451,7 +451,7 @@ enrolls unchanged (test `:1071-1089`). Nothing is unmounted and no index moves: 
 collections stay, empty.
 
 **`GET /api/setup/features`** (B1-s; `setup_features`,
-`crates/modules/fleet/src/setup_release.rs:139-146`; route `lib.rs:579`) is the server's
+`crates/modules/fleet/src/setup_release.rs:139-146`; route `lib.rs:582`) is the server's
 word on which install paths a client may offer, a public JSON object with every key present
 (`SetupFeatures`, `:88-99`):
 
@@ -589,10 +589,10 @@ device-paired notice failed` says why when the whole notice failed.
 
 | Layer | Where |
 |---|---|
-| The routes and every invariant | `crates/modules/fleet/src/pairing.rs` (`start` `:702`, `poll` `:847`, `deliver` `:928`, `lookup` `:1068`, `approve` `:1135`, `deny` `:1293`); mounted at `lib.rs:602-607`, `:631` |
+| The routes and every invariant | `crates/modules/fleet/src/pairing.rs` (`start` `:702`, `poll` `:847`, `deliver` `:928`, `lookup` `:1068`, `approve` `:1135`, `deny` `:1293`); mounted at `lib.rs:605-610`, `:634` |
 | The notice | `crates/modules/fleet/src/pairing_notice.rs`; the mail `crates/services/src/email.rs:621-683` |
-| The rows and their DAOs | `crates/db/src/models/device_pairing.rs`, `pairing_audit.rs`; `crates/services/src/dao/device_pairing.rs`, `pairing_audit.rs`; the index sets `lib.rs:648-674` |
-| The ceilings | `crates/core/src/rate_limit.rs:109-220` (`WindowLimiter`); the state `lib.rs:116-131` |
+| The rows and their DAOs | `crates/db/src/models/device_pairing.rs`, `pairing_audit.rs`; `crates/services/src/dao/device_pairing.rs`, `pairing_audit.rs`; the index sets `lib.rs:651-677` |
+| The ceilings | `crates/core/src/rate_limit.rs:109-220` (`WindowLimiter`); the state `lib.rs:119-134` |
 | The settings | `crates/config/src/settings.rs:91-183` (`SetupSettings`, `PairingSettings`) |
 | The features route | `crates/modules/fleet/src/setup_release.rs:88-146` |
 | The integration tests | `crates/tests/src/pairing_tests.rs` — the happy paths, the codes, the clocks, the decisions, the downstream refusals, the limits, the switches |
