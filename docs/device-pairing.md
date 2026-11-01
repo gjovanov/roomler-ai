@@ -21,7 +21,7 @@ applications and an inbox, with a ten-minute clock on the last two (the spec's
 [field evidence](fr/FR-129-guided-cross-platform-installer.md#the-field-evidence)).
 
 Pairing turns the token step around. The installer asks the server for a pairing, shows an
-eight-letter code and opens the browser on `/pair`. The person signs in or creates an account
+eight-letter code and a button that opens the browser on `/pair`. The person signs in or creates an account
 (and their organization) there, types the code, sees which device is asking, and approves it.
 The installer's next poll receives the ordinary enrollment token, says which organization it
 was approved into and by whom, and installs on the person's click. Nothing is copied: not a
@@ -277,7 +277,7 @@ gate was gone at delivery must all leave a trace.
 **Durable or bounded.** Every decision about a real pairing and everything a signed-in
 account does is a durable row: every `start ok`, every `lookup`, `approve` and `deny` with
 either outcome, every `deliver`, `expire` and `gate_lost`. A refusal an anonymous caller can
-repeat at will — an address past its ceiling, a body that is not a request, a code that names
+repeat at will — an address past its ceiling, a `start` body that is not a request, a code that names
 nothing, a poll too soon, a poll after delivery — is written **once per
 `(action, reason, address)` per hour per pod**, the repeats counted in a debug line
 (`Audit::record`, `pairing.rs:466-481`; `WindowLimiter::once`, `rate_limit.rs:200-220`), or a
@@ -429,11 +429,15 @@ HTTP call, then applies the answer under a fresh lock (`apply_poll`, `:181-233`)
 | **Back, Cancel, a paste** | each forgets the pairing on both sides: the loop here, the device code and any delivered token in the store (`cancelPairing`, `:718-737`; `cmd_pair_cancel`, `commands.rs:546-548`). Nothing is told to the server — the row expires on its own, and Cancel after an approval leaves it `delivered` with the token unused (AC5) |
 
 **The paste fallback.** The `I already have a token` box is the scripted, MSP, offline-mint
-and FR-104 anchoring path, and the only path when the server has no pairing: a 404 on
-`start` is `StartOutcome::Unavailable`, not an error (`crates/agent-core/src/pairing.rs:336-339`),
-and the wizard then hides the card, retitles the box "Enrollment token" and opens it
-(`app.js:686-694`, `:889-901`) — silently, because a client cannot tell "switched off" from
-"not there".
+and FR-104 anchoring path, and the only path when the server has no pairing. A server that
+says `"pairing": false` takes the card away before the Join step opens: the wizard asks once
+per server (`readPairingOffer`, `app.js:328-343`; `pairing_off`,
+`agents/roomler-setup/src/features.rs:131`), retitles the box "Enrollment token" and opens it
+(`:1237-1246`). Only that word does it, so a timeout or an older server leaves the card up,
+and a 404 on `start` then decides as it always has: `StartOutcome::Unavailable`, not an error
+(`crates/agent-core/src/pairing.rs:336-339`), and the same fallback (`app.js:1031-1034`),
+silently, because a client cannot tell "switched off" from "not there". The answer lasts the
+wizard's run, so a switch flipped under an open wizard takes a relaunch to show.
 
 ## 12 · The kill switch, and `/api/setup/features`
 
