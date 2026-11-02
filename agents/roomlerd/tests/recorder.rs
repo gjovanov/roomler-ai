@@ -850,6 +850,7 @@ async fn a_recording_without_audio_has_no_audio_track() {
 #[cfg(feature = "synthetic-frame-source")]
 mod process {
     use super::*;
+    use roomlerd::recording::mp4::{ColorInfo, FragmentedWriter, VideoTrack, read_fragmented};
     use roomlerd::recording::recorder::PartialLock;
     use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
@@ -1045,6 +1046,20 @@ mod process {
         );
     }
 
+    /// The partial a recorder left when it was killed past its first fragment,
+    /// and the staging folder it is in.
+    fn a_killed_recorders_partial(out: &Path) -> (PathBuf, PathBuf) {
+        let mut r = spawn(out);
+        r.wait_for("started", Duration::from_secs(30));
+        std::thread::sleep(Duration::from_millis(3500));
+        r.child.kill().unwrap();
+        let _ = r.child.wait();
+        let staging = out.join(PARTIAL_DIR);
+        let partials = partials_in(&staging);
+        assert_eq!(partials.len(), 1);
+        (staging, partials[0].clone())
+    }
+
     /// A recorder that dies during the remux leaves its temp beside the
     /// destination and its partial whole. The retry refused that temp, and the
     /// reconciler read the refusal as "nothing recoverable" and deleted the
@@ -1053,15 +1068,13 @@ mod process {
     #[test]
     fn a_recorder_that_died_during_the_remux_loses_nothing() {
         let dir = scratch();
-        let mut r = spawn(dir.path());
-        r.wait_for("started", Duration::from_secs(30));
-        std::thread::sleep(Duration::from_millis(3500));
-        r.child.kill().unwrap();
-        let _ = r.child.wait();
-        let staging = dir.path().join(PARTIAL_DIR);
-        let partials = partials_in(&staging);
-        assert_eq!(partials.len(), 1);
-        let tmp = remux_temp_of(dir.path(), &partials[0]);
+        let (staging, partial) = a_killed_recorders_partial(dir.path());
+        let want = read_fragmented(&partial)
+            .unwrap()
+            .samples(VIDEO_TRACK_ID)
+            .len();
+        assert!(want >= 60, "past the first fragment ({want} frames)");
+        let tmp = remux_temp_of(dir.path(), &partial);
         std::fs::write(&tmp, b"half a remux").unwrap();
 
         let done = recorder::reconcile_partials(&staging, dir.path());
@@ -1075,7 +1088,7 @@ mod process {
             .samples(VIDEO_TRACK_ID)
             .unwrap()
             .len();
-        assert!(n >= 60, "every complete fragment survives ({n} frames)");
+        assert_eq!(n, want, "every complete fragment survives");
         assert!(!tmp.exists(), "the dead remux's temp is gone");
         assert_eq!(
             std::fs::read_dir(&staging).unwrap().count(),
@@ -1084,39 +1097,90 @@ mod process {
         );
     }
 
-    /// Only a partial that holds nothing may be removed. One this attempt could
-    /// not finalize (a full disk, a file another program holds) keeps its
-    /// recording for the next start.
+    /// A remux that fails follows the stop path's rule: the fragmented file
+    /// under its final name, marked `interrupted`, with every fragment. So one
+    /// attempt per partial, and what is left is listed, can be deleted and plays.
     #[test]
-    fn a_partial_that_could_not_be_finalized_now_is_kept() {
+    fn a_failed_remux_keeps_the_fragmented_file_under_its_final_name() {
         let dir = scratch();
-        let mut r = spawn(dir.path());
-        r.wait_for("started", Duration::from_secs(30));
-        std::thread::sleep(Duration::from_millis(3500));
-        r.child.kill().unwrap();
-        let _ = r.child.wait();
-        let staging = dir.path().join(PARTIAL_DIR);
-        let partials = partials_in(&staging);
-        assert_eq!(partials.len(), 1);
+        let (staging, partial) = a_killed_recorders_partial(dir.path());
+        let before = read_fragmented(&partial).unwrap();
+        let frames = before.samples(VIDEO_TRACK_ID).len();
+        let bytes = std::fs::metadata(&partial).unwrap().len();
         // A directory where the temp goes: no file can be created there.
-        let tmp = remux_temp_of(dir.path(), &partials[0]);
+        let tmp = remux_temp_of(dir.path(), &partial);
         std::fs::create_dir(&tmp).unwrap();
 
         let done = recorder::reconcile_partials(&staging, dir.path());
-        assert!(done.is_empty(), "nothing could be written: {done:?}");
-        assert_eq!(
-            partials_in(&staging),
-            partials,
-            "the partial is still there"
+        assert_eq!(done.len(), 1, "the `recovered` event names it");
+        let dest = &done[0];
+        let kept = read_fragmented(dest).unwrap();
+        assert_eq!(kept.fragment_count(), before.fragment_count());
+        assert_eq!(kept.samples(VIDEO_TRACK_ID).len(), frames);
+        assert_eq!(std::fs::metadata(dest).unwrap().len(), bytes);
+        let sc = sidecar_of(dest);
+        assert_eq!(sc.stop_reason, Some(StopReason::Interrupted));
+        assert_eq!(sc.frames, frames as u64);
+        assert_eq!(sc.bytes, bytes);
+        assert!(
+            sc.duration_ms > 1000,
+            "read from its fragments: {} ms",
+            sc.duration_ms
         );
+        assert_eq!(
+            std::fs::read_dir(&staging).unwrap().count(),
+            0,
+            "no partial and no lock: nothing is left to retry"
+        );
+        let listed = roomlerd::recording::manager::list_recordings(dir.path());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            Some(listed[0].name.as_str()),
+            dest.file_name().unwrap().to_str()
+        );
+        assert_eq!(listed[0].stop_reason.as_deref(), Some("interrupted"));
+        // The editor reads progressive files only: it finds no video here, as
+        // it does in the stop path's fragmented file.
+        let editable = ProgressiveFile::open(dest).and_then(|p| p.samples(VIDEO_TRACK_ID));
+        assert!(!matches!(editable, Ok(s) if !s.is_empty()));
+    }
 
-        std::fs::remove_dir(&tmp).unwrap();
-        let done = recorder::reconcile_partials(&staging, dir.path());
+    /// The one case that waits for the next start: the final name cannot be
+    /// reached either, here because the folder is gone.
+    #[test]
+    fn a_partial_that_cannot_reach_its_folder_waits_for_the_next_start() {
+        let dir = scratch();
+        let (staging, partial) = a_killed_recorders_partial(dir.path());
+        let gone = dir.path().join("unplugged");
+
+        let done = recorder::reconcile_partials(&staging, &gone);
+        assert!(done.is_empty(), "nowhere to put it: {done:?}");
+        assert_eq!(partials_in(&staging), [partial], "the partial is kept");
+
+        std::fs::create_dir(&gone).unwrap();
+        let done = recorder::reconcile_partials(&staging, &gone);
         assert_eq!(done.len(), 1, "and the next start finalizes it");
+        assert!(ProgressiveFile::open(&done[0]).is_ok());
+    }
+
+    /// The temp is replaced, never opened: a link standing at its name, as
+    /// another user can plant in a shared folder, is not written through.
+    #[test]
+    fn a_link_at_the_temp_name_is_not_written_through() {
+        let dir = scratch();
+        let (staging, partial) = a_killed_recorders_partial(dir.path());
+        let theirs = dir.path().join("someone-elses.txt");
+        std::fs::write(&theirs, b"someone else's").unwrap();
+        std::fs::hard_link(&theirs, remux_temp_of(dir.path(), &partial)).unwrap();
+
+        let done = recorder::reconcile_partials(&staging, dir.path());
+        assert_eq!(done.len(), 1);
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"someone else's");
+        assert!(ProgressiveFile::open(&done[0]).is_ok());
     }
 
     /// The other half of the rule above: a partial with no complete fragment
-    /// holds nothing, and it is removed rather than retried at every start.
+    /// holds nothing, and it is removed rather than kept as a recording.
     #[test]
     fn a_partial_that_holds_nothing_is_removed() {
         let dir = scratch();
@@ -1134,6 +1198,39 @@ mod process {
         let done = recorder::reconcile_partials(&staging, dir.path());
         assert!(done.is_empty(), "there was nothing to finalize: {done:?}");
         assert!(partials_in(&staging).is_empty(), "and nothing is kept");
+    }
+
+    /// The empty partial a real recorder leaves: killed during its first GOP,
+    /// with `ftyp` and `moov` on disk and no fragment.
+    #[test]
+    fn a_partial_with_a_header_and_no_fragment_is_removed() {
+        let dir = scratch();
+        let staging = dir.path().join(PARTIAL_DIR);
+        std::fs::create_dir_all(&staging).unwrap();
+        let partial = staging.join(format!("first-gop.mp4{PARTIAL_SUFFIX}"));
+        let mut w = FragmentedWriter::create(
+            &partial,
+            VideoTrack {
+                width: W,
+                height: H,
+                fps: 30,
+                color: ColorInfo::BT601_LIMITED,
+            },
+            None,
+        )
+        .unwrap();
+        // SPS, PPS and an IDR: the header is written, the fragment never closes.
+        let idr = [
+            0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0x88,
+        ];
+        w.push_video(0, &idr, true).unwrap();
+        drop(w);
+        assert_eq!(read_fragmented(&partial).unwrap().fragment_count(), 0);
+
+        let done = recorder::reconcile_partials(&staging, dir.path());
+        assert!(done.is_empty(), "there was nothing to finalize: {done:?}");
+        assert!(partials_in(&staging).is_empty(), "and nothing is kept");
+        assert!(!dir.path().join("first-gop.mp4").exists());
     }
 
     /// Where the remux of `partial` puts its temp, in the recording's folder.
