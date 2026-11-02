@@ -9065,6 +9065,12 @@ mod tests {
             cells::MF_AV1
         );
         assert_eq!(of(VideoCodec::Vp9, VideoBackend::Libvpx), cells::LIBVPX_VP9);
+        let forms = forms_of(&with_cells(&[(VideoCodec::Hevc, VideoBackend::D3d12)]), &[]);
+        assert_eq!(
+            forms.keys().collect::<Vec<_>>(),
+            ["hevc_d3d12va:yuv420"],
+            "an answer's forms, in the same spelling"
+        );
     }
 
     /// A fault in a D3D12 cell really takes it, with all that says it is there.

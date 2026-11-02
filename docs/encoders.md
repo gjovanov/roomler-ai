@@ -499,8 +499,8 @@ something holds its pipe is a unit test with a real process on each OS.
   cells, so the hello does not promise what a session is refused. Only a kill that landed
   within its bound keeps Media Foundation: a later kill on a thrashing host reads as "would
   not die". [A later try](#a-host-that-ran-out-of-time-gets-another-try) is what brings the
-  cells back. A try's own stuck child takes them off the list at once and leaves the answer
-  in force as it is, so until #3279 that answer can still offer one a session is refused.
+  cells back. A try's own stuck child takes them only once no session is live or has asked in
+  the last minute, and the answer in force stops offering them then.
 - **A `444` or `gpu` child** costs those forms and names no cell. Only a fault's death counts
   as an answer about the host, and stays cached as it always was
   ([`PhaseGaps::note`](../agents/roomlerd/src/encode/caps.rs#L961)). Anything else keeps the answer out of the cache
@@ -592,12 +592,14 @@ on. Each try hands its children their own list
 ([`list_for_a_try`](../agents/roomlerd/src/encode/caps.rs#L2970)): everything learned except what is there only for want of
 time. A fault's deny and a double kill's stay on it. It goes to the child directly, so the
 daemon's list never relaxes while a cell is being tested, and a session keeps honouring the list
-in force. A fault a try confirms joins the daemon's list at once, whatever becomes of that try's
-answer. The answer in force then stops offering that form and says why, and every row hears of it
-within a beat (`withdraw_refused`), because a session would otherwise pick a codec its open is
-refused, and an RTP track binds to its codec first. That form is all a fault costs: what the same
-try lost for want of time stays in force, and a later answer that cannot hold the form can still go
-in.
+in force. A fault a try confirms joins the daemon's list before that try's next child starts,
+whatever becomes of its answer. The answer in force stops offering that form at the same moment and
+says why, and every row hears of it within a beat (`withdraw_refused`), because a session asking in
+the rest of the probe would otherwise pick a codec its open is refused, and an RTP track binds to
+its codec first. The form a cell opens first takes the cell with it, as the next answer would:
+4:2:0 for an FFmpeg cell, whose 4:4:4 is the `444` child's question, and 4:4:4 for libvpx, whose
+4:2:0 open sits behind it. That is all a fault costs: what the same try lost for want of time stays
+in force, and a later answer that cannot hold the form can still go in.
 
 **The Media Foundation deny comes back the same way.** It is marked as out of time
 (`LearnedDeny::timed_out`), so it is off the next try's list, and that try can only start once
@@ -625,11 +627,20 @@ nothing has produced a stuck child in the field.
   what an encoder open may do, and a session that opened its capture under one list must not
   rebuild its encoder under another.
 - **A stuck child does not take Media Foundation from under one.** A first probe's child that would
-  not die costs those cells at once, with nothing live to touch. A try's waits for nothing to be live
-  (`hold_media_foundation_back`): a live session's encoder may rebuild at the next change of size,
-  and a refusal there is no video, where the open has so far been fine beside that child. It is a
-  level, so a child that came back first costs nothing. When the cells go, the answer in force stops
-  offering them, as for a fault. A second session starting beside the first can still open them.
+  not die costs those cells at once, with nothing live to touch. A try's waits until no session is
+  live and none has asked in the last minute (`hold_media_foundation_back`): a live session's encoder
+  may rebuild at the next change of size, one that just asked may have picked such a cell and be
+  about to open it, and a refusal there is no video, where the open has so far been fine beside that
+  child. It is a level, so a child that came back first costs nothing. When the cells go, the answer
+  in force stops offering them, as for a fault. A session starting beside a live one, or within that
+  minute, can still open them.
+- **An offer reads its picks again** (`picks_at_the_offer`). A session picks its codec and transport
+  at its request, before consent, and a person can take longer than that minute (`prompt_then_email`
+  waits minutes). So its offer reads both against `detect()`: what has gone is picked again by the
+  request's own rules, and a pick still offered stays, even beside a better one that has appeared
+  since. A track bound to a codec its open is refused carries no video, and a DataChannel pump with no
+  cell left ends. A GUI worker's picks stand: the daemon made them, from an answer the worker does not
+  hold.
 
 Stopping the child, rather than letting it run beside the session, is deliberate. This host is
 slow by definition, so at the top of the table a session could share the GPU with a child for about
@@ -1148,7 +1159,7 @@ source's CSS values.
 | `encoder_cells_deny` | `ROOMLERD_ENCODER_CELLS_DENY` | the built-in list | `name:chroma` cells never opened nor advertised; `none` = deny nothing; a cell the probe learned stays denied on top of it; pushable through remote config (`MANAGE_AGENTS`), `needs_restart`. On a supervised Mac the session's encoders open in the GUI worker, which reads the person's config, so the root's effective value is handed to it at spawn (FR-43, `WORKER_ENV_FORWARD`, from 0.4.155); before that a root-side deny bound the probe and the hello but not the worker's sessions |
 | `caps_cache` | `ROOMLERD_CAPS_CACHE` | on | the probe cache (read and write) |
 | `caps_learn_deny` | `ROOMLERD_CAPS_LEARN_DENY` | on | a dead `base` child costs the cell it died in ([above](#a-dead-child-costs-the-cell-it-died-in)); off = one child, and its death means no hardware. A change is a knob change, so the next start re-probes. Not pushable through remote config |
-| `caps_probe_retry` | `ROOMLERD_CAPS_PROBE_RETRY` | on | a first answer short of time gets more tries by itself, with no restart ([above](#a-host-that-ran-out-of-time-gets-another-try)); off = no try, so it stands until the next start, and the word `probe-short` is not said. That is all it turns off: a stuck child's Media Foundation deny and the `444` and `gpu` answers that stand however their child ended answer to `caps_learn_deny`. Read once, at start. Not pushable through remote config |
+| `caps_probe_retry` | `ROOMLERD_CAPS_PROBE_RETRY` | on | a first answer short of time gets more tries by itself, with no restart ([above](#a-host-that-ran-out-of-time-gets-another-try)); off = no try, so it stands until the next start, and the word `probe-short` is not said. That is all it turns off: a stuck child's Media Foundation deny and the `444` and `gpu` answers that stand however their child ended answer to `caps_learn_deny`. Read at the start and again before each try. Not pushable through remote config |
 | `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them; on macOS the display stream's IOSurfaces go to a proven VideoToolbox cell ([above](#gpu-resident-frames-the-input-path-fr-118)). On a supervised Mac the root's value is handed to the GUI worker at spawn (`WORKER_ENV_FORWARD`, from FR-118 P5) |
 | `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing. Handed to a supervised Mac's GUI worker as `zero_copy` is. Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`, passed on unread like the other denylists; a blank push clears it (FR-132 P1, [remote-config.md](remote-config.md)). `zero_copy` itself is not pushable |
 | `color_description` | `ROOMLERD_COLOR_DESCRIPTION` | on | every encoder writes the colour description its input was converted with (BT.601 matrix, BT.709 primaries, sRGB transfer, limited range: `encode::color_desc::DESCRIPTION`, [FR-130](fr/FR-130-colours-decode-true.md)), and the hello says `color-described`; `false` writes the undescribed stream of earlier agents. Read at every encoder open, so a restart applies it; the probe and recorder children, a hand-run `roomlerd record`, `encoder-smoke` and the recording editor's `media export` follow it (the export reads the config file only where the person running it can read it), and a supervised Mac's GUI worker gets the root's value (`WORKER_ENV_FORWARD`). Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`: a push of `off` or `on` sets it, and a blank one clears it back to on (FR-130 P1b, [remote-config.md](remote-config.md)). Not every encoder can carry it: `vp9_qsv` and `vp9_vaapi` (FFmpeg writes none), Microsoft's MF encoders (they ignore the attributes), and `h264_amf`'s matrix (AMD's H.264 runtime writes 2) |

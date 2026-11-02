@@ -124,12 +124,20 @@ longer bounds. Keep these true when you touch it:
 - **A try cannot take a form** (`weigh`, `keeps`). A count of cells is not enough: an answer with
   more cells that leaves one out is dropped, and so is one where hardware came back as software.
   Dropping a complete answer ends nothing; only an adopted one does.
-- **A fault costs its own form, at once** (`withdraw_refused`): off the daemon's list and off the
-  answer in force, with the generation moved, so nothing offers what a session is refused. A later
-  answer is compared with what is left.
-- **A try's stuck child never takes Media Foundation from under a live session**
-  (`hold_media_foundation_back`), because a refused rebuild is no video. A first probe's costs them
-  at once; nothing is live yet.
+- **A fault costs its own form, at the join** (`withdraw_refused`, from `probe_with`): off the
+  daemon's list and off the answer in force before the next child starts, with the generation moved,
+  so nothing offers what a session is refused. A later answer is compared with what is left. Losing
+  the form a cell opens first loses the cell: 4:2:0 for FFmpeg's, 4:4:4 for libvpx's.
+- ⚠️ **Compare a cell with a list by `list_name`, never its wire form.** D3D12's wire form is
+  `hevc_d3d12`; the lists say `hevc_d3d12va`. Get it wrong and a fault withdraws nothing, and no later
+  answer is ever adopted.
+- **A try's stuck child never takes Media Foundation from under a session**
+  (`hold_media_foundation_back`, `busy`): a live one, because a refused rebuild is no video, or one
+  that asked in the last minute, which is in no registry until its peer is built. A first probe's
+  costs them at once; nothing is live yet.
+- **An offer reads its picks again** (`picks_at_the_offer`), codec and transport, because consent
+  can outlast that minute. What has gone is picked again by the request's rules. A GUI worker's
+  picks stand: they came from the daemon's answer, not its own.
 - **Adopt the list first and the generation last,** and read `generation()` before reading the
   answer, so a change in between reads as news rather than getting lost.
 - ⚠️ `std::thread`, not `spawn_blocking`: a runtime's shutdown waits on those, and
