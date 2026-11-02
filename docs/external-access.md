@@ -125,6 +125,32 @@ notice quotes it on one line, bounded, and words it as a claim (`quoted`,
 `extauth_notice.rs:35`). The people list shows the account id's tail beside it, because
 two accounts can carry one name.
 
+**The person at the machine is told what the server knows first**, and the name after it
+(`asked_by`, `extauth_notice.rs:111`, FR-52 decision 8):
+
+| The account | The prompt reads |
+|---|---|
+| Has proven an address | `alice@corp.example (verified) as "Alice from IT" is requesting to control this device.` |
+| Has not, or its row could not be read | `Unverified account "Alice from IT" is requesting to control this device.` |
+
+Every consent panel draws that on one line and cuts its end, so the order is the defence.
+The name comes last and bounded, in quotes it cannot close, with anything that can reorder
+or hide text taken out (`plain`, `extauth_notice.rs:61`). It can neither forge the words
+before it nor push them out of view. Proven means `proven_address`
+(`crates/services/src/dao/user.rs:33`), the security baseline's rule for `users.email`.
+
+The server sends this as `controller_name`, so it takes no wire change and no agent
+change, and every surface says the same thing: the native panels, the companion,
+`roomlerd consent --list`, the "Being viewed by" banner, and the rail any other viewer
+sees. The address also lands in the device's log and in `remote_audit`. `/connect` tells
+the person this before they connect. `external_rc_audit` and the notices keep the name as
+chosen.
+
+⚠️ "Verified" says the account controls that mailbox, and nothing about who the person is.
+Anyone can prove an address at a domain they own, which is why a long address keeps the end
+of its domain (`shown_address`, `extauth_notice.rs:83`). A homoglyph domain reads as it
+is written.
+
 ## 5. Stopping someone
 
 | You do | It stops | It does not stop |
