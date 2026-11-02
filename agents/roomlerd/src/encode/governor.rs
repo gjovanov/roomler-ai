@@ -4686,10 +4686,13 @@ mod tests {
             None,
             "a delivery past the band ends the prior: the unremembered session"
         );
+        // Two frames: `set_floor` caps at the ceiling the last tick left, so the
+        // floor only reaches the target on the tick after the clamp lifts.
+        v5b_tick(&mut g, t);
         assert_eq!(
             v5b_tick(&mut g, t),
             crate::encode::MIN_BITRATE_BPS,
-            "back at the nominal floor at once, the climb continues from there"
+            "back at the nominal floor within a frame, the climb continues from there"
         );
     }
 
