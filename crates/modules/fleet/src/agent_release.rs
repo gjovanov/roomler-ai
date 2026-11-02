@@ -33,7 +33,6 @@ use axum::{
     response::Response,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 use roomler_core::{ApiError, client_ip::PeerAddr};
 
@@ -57,6 +56,11 @@ pub struct AgentReleaseAsset {
     /// case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+    /// GitHub's word on the upload: `"uploaded"` once the asset is whole,
+    /// `"open"` or `"starter"` while it is being uploaded, which can be to a
+    /// release already published. Read to pick (FR-129 C), never forwarded.
+    #[serde(default, skip_serializing)]
+    pub state: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -278,11 +282,9 @@ pub async fn installer_proxy(
         ))
     })?;
 
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| ApiError::Internal(format!("reqwest client build: {e}")))?;
+    // FR-129 C2b — a connect and an idle-read bound, never a total deadline:
+    // the MSI streams at the person's pace (`crate::asset_stream` says why).
+    let client = crate::asset_stream::client()?;
     let upstream = client
         .get(&asset.browser_download_url)
         .send()
@@ -394,6 +396,7 @@ mod tests {
             browser_download_url: format!("https://example/{name}"),
             size: 1024,
             digest: Some("sha256:deadbeef".to_string()),
+            state: None,
         }
     }
 

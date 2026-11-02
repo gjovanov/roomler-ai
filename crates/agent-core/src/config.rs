@@ -3519,7 +3519,7 @@ pub fn default_config_path() -> Result<PathBuf> {
 fn harden_machine_global_dir(dir: &std::path::Path) {
     let d = dir.display().to_string();
     for (i, args) in HARDEN_STEPS.iter().enumerate() {
-        match std::process::Command::new("icacls")
+        match std::process::Command::new(crate::appdirs::system32_tool("icacls.exe"))
             .arg(&d)
             .args(*args)
             .output()

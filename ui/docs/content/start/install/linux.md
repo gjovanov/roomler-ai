@@ -38,7 +38,23 @@ unit as that account (`systemctl --user disable --now roomler.service`).
 
 ## Install
 
-Mint a token under **Devices → Enroll device**, then:
+**On a desktop, Roomler Setup needs no token.** Download
+[Roomler Setup for Linux](https://roomler.ai/api/setup/linux), unpack it and run
+`roomler-setup`:
+
+1. **Be accessed — system service** is already selected. Change it if you want this
+   user only, then continue to **Join your organization**.
+2. Click **Set up in the browser**. The wizard shows a code of eight letters.
+3. Open [roomler.ai/pair](https://roomler.ai/pair), sign in or create an account,
+   type the code, check the device the page shows, pick your organization and
+   click **Approve**.
+4. Go back to the wizard. It names who approved the device and into which
+   organization. Click **Install** and answer the password prompt.
+
+A code lasts 15 minutes. When it runs out the wizard says so, and **Start again**
+gives you a new one. A mistyped code only gets "No pending pairing with that code".
+
+**From a terminal**, mint a token under **Devices → Enroll device**, then:
 
 **Headless server / cluster node** — root systemd service:
 

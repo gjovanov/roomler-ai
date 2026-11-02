@@ -27,7 +27,7 @@ approximate, wire/identity names excluded):
 | Windows Apps & Features | `agents/roomlerd/wix/main.wxs:56`, `agents/roomlerd/wix-perMachine/main.wxs:65` (ProductName); `:291-292` (Start-menu shortcut), `:312` / `:302` (the installer UI's title) | **Roomler Agent**, **Roomler Agent (per-Machine)** |
 | the UAC prompt on every MSI | `.github/workflows/release-agent.yml:1998` (the Authenticode description) | "Roomler Agent installer" |
 | `apt show` / `dnf info` summary | `agents/roomlerd/Cargo.toml:7` (`description`, the package summary) | "Roomler AI remote-control agent — …" (the extended description already says "Roomler Daemon") |
-| the wizard | `agents/roomler-setup/src/front/app.js:1667` and ~35 more lines | "Resolved tag **agent**-v0.4.188" |
+| the wizard | `agents/roomler-setup/src/front/app.js:1758` and ~35 more lines | "Resolved tag **agent**-v0.4.188" |
 | the companion | `agents/roomler-desktop/src/` | ~17 lines |
 | `install.sh` / `install.ps1` output | `scripts/` | ~10 lines |
 | the web app | `ui/src/components`, `ui/src/views` | ~378 lines (e.g. "agent version" on the Devices page) |

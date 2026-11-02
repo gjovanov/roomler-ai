@@ -28,7 +28,7 @@ one install by a person does. The chip is how the operator learns that a person 
   0.4.138 that never logs out, an updater broken by a full disk, `auto_update` switched off and forgotten. Each
   of these is invisible on the devices page today, and each was found only by someone reading a device's log.
 - The data is already in the browser's reach: `GET /api/agent/latest-release` returns the agent releases
-  **newest first, each with `published_at`** (`crates/modules/fleet/src/agent_release.rs:81-90`, the shared
+  **newest first, each with `published_at`** (`crates/modules/fleet/src/agent_release.rs:80-89`, the shared
   cache in `crate::releases`). Nothing on the server or the device has to change. That matters, because a stuck
   device cannot receive an agent change anyway.
 - The server cannot tell a per-user daemon from a system one for these devices. `desktop.session` is logind's
