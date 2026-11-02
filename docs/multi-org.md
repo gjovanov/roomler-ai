@@ -928,10 +928,15 @@ everything it knows.**
 
 1. hidden from the org switcher (`GET /api/tenant`; `?include_archived=true`
    still lists it — this is not erasure);
-2. no new device enrollments;
+2. no new device enrollments — a daemon or a `roomler` tunnel client, into a
+   new row or back into its old one — and no token minted for one (#3042): the
+   three mint routes refuse with the enroll routes' own sentence, so the person
+   hears it where they asked rather than in someone's terminal later;
 3. no new remote-control sessions;
-4. its devices leave its mesh — every enrollment revoked, every overlay
-   node released back to the address pool, its block quarantined;
+4. its devices leave its mesh — every enrollment revoked, tunnel clients
+   included (#3042), every overlay node released back to the address pool, its
+   block quarantined. A join into an archived org is refused whatever its row
+   says, so nothing racing the teardown takes an address on the way out;
 5. everything else — rooms, messages, files, members, roles, audit —
    retained untouched.
 
