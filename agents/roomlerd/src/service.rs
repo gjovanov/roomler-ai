@@ -712,7 +712,8 @@ mod windows {
         let exe = std::env::current_exe().context("locating current exe")?;
         let user = current_user_qualified().context("resolving current user")?;
         let mut command = task_command(&exe);
-        if command != exe && applocker_holds_exe_rules() && launcher_is_blocked(&command, &user) {
+        if command != exe && applocker_exe_policy_in_force() && launcher_is_blocked(&command, &user)
+        {
             eprintln!(
                 "This machine's AppLocker policy does not let {} start, so the task runs {} \
                  instead, with a console window: closing it stops the daemon. Allow the \
@@ -1069,28 +1070,11 @@ mod windows {
     /// `SCHED_S_TASK_HAS_NOT_RUN`: the check has not started yet.
     const TASK_HAS_NOT_RUN: u32 = 0x0004_1303;
 
-    /// Does the machine's AppLocker policy hold any rule for programs? One subkey per
-    /// rule, read back on Win11; a person may read it, and `reg.exe` may be refused them.
-    fn applocker_holds_exe_rules() -> bool {
-        use windows_sys::Win32::System::Registry::{
-            HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegEnumKeyW, RegOpenKeyExW,
-        };
-        let path: Vec<u16> = r"SOFTWARE\Policies\Microsoft\Windows\SrpV2\Exe"
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-        let mut key = std::ptr::null_mut();
-        let mut rule = [0u16; 64];
-        // SAFETY: `path` is NUL-terminated and outlives the call; `key` is a valid
-        // out-pointer, and the key it receives is closed once; `rule` holds its length.
-        unsafe {
-            if RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, KEY_READ, &mut key) != 0 {
-                return false;
-            }
-            let first = RegEnumKeyW(key, 0, rule.as_mut_ptr(), rule.len() as u32);
-            RegCloseKey(key);
-            first == 0
-        }
+    /// Is an AppLocker policy for programs in force? The compiled file is what Windows
+    /// enforces, and it outlives its rules: emptied by `Set-AppLockerPolicy`, it blocked
+    /// through a reboot (measured). A standard user may see it, also measured.
+    fn applocker_exe_policy_in_force() -> bool {
+        crate::appdirs::system32_tool(r"AppLocker\Exe.AppLocker").is_file()
     }
 
     /// #3292 — will a policy stop the task from starting the launcher? The launcher is

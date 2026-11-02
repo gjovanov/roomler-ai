@@ -568,19 +568,35 @@ console, passes its arguments on, and leaves with the daemon's exit code.
 | The default terminal | No window with Windows Terminal or `conhost` | `CREATE_NO_WINDOW` makes no console to show. Measured a start and a repair with the default set to `conhost` |
 | A running daemon, at an upgrade or an uninstall | The MSI stops it. An uninstall: `StopDaemon`, a plain `service stop`, before `UnregisterAutostart`. An upgrade: `StopOldDaemon`, `service stop --for-upgrade`, from the new product after `InstallFiles`, so it also reaches a daemon from a release without these actions | Restart Manager does not: the daemon declines its `ENDSESSION_CLOSEAPP` on purpose ([`ephemeral-nodes.md`](./ephemeral-nodes.md)), and the log still says "Successfully shut down all applications", with no event 10002. Measured from 0.4.196 to 0.4.197 by hand: the old daemon ran on until the next sign-in, and an uninstall left it running with its files gone, both with exit 0 |
 
-**A self-update brings the device back by itself.** The daemon has exited for the
-installer, and registering the task is all the MSI's custom action does. So `service
-install`, when a config exists, adds one-shot `<TimeTrigger>`s one, three and ten
+**A self-update whose install succeeds brings the device back by itself.** The daemon has
+exited for the installer, and registering the task is all the MSI's custom action does. So
+`service install`, when a config exists, adds one-shot `<TimeTrigger>`s one, three and ten
 minutes on (`start_soon_triggers`, `agents/roomlerd/src/service.rs`). With `IgnoreNew`
 the later ones do nothing once the daemon is up, and `StartWhenAvailable` keeps them
 through a sleep. A fresh MSI has no config and starts nothing. A `service stop` inside
 those ten minutes can therefore be undone once, and a device removed inside them gets
-one more start, which retries against the server as the next sign-in's start would.
+one more start, which retries against the server as the next sign-in's start would. An
+install that fails is the section [below](#when-a-per-user-upgrade-fails).
 
 **The first update onto the launcher looks a little different.** It runs the old
 product's table and the old daemon's own console: one terminal can flash when the old
 `UnregisterAutostart` runs, and nothing after that. From a launcher release onward nothing
 is shown. Measured on both jumps.
+
+**A machine whose AppLocker policy refuses the launcher keeps the console window.** The
+launcher is a file of its own, so a rule that allows `roomlerd.exe` by path refuses it:
+MSI exit 0, the task failing `0x800704EC` each minute, an 8004 event each time, the row
+offline for good (measured on a policy that lets only `roomlerd.exe` start). No custom
+action can tell, because the installer's token is `SANDBOX_INERT`, which AppLocker does not
+check: the blocked launcher ran all of them. A task is the one start with the token the
+real task gets. So `service install`, only where the compiled policy
+`%SystemRoot%\System32\AppLocker\Exe.AppLocker` exists, starts the launcher with `--version`
+through a throwaway task, `Roomler launcher check`, and reads its
+`LastTaskResult` for at most ten seconds (the answer was there in 0.6 s). `0x800704EC`
+means the real task names `roomlerd.exe`: a console window a person can close, on a device
+that is online. Any other answer keeps the launcher, so a person who is not signed in at
+that moment gets the launcher, and the block, until the next registration. Once the policy
+allows the launcher, the next update takes the window away.
 
 **`last-install.json` can stay at `InProgress` on a self-update.** The staged watcher
 holds the install folder's VC runtime through `PATH`, and Restart Manager can shut it down
@@ -599,6 +615,20 @@ or after `0xC000013A`, five minutes on, with `Count` 10 and `PT1M` registered. A
 per-user daemon that crashes stays down until the next sign-in or `roomlerd service
 start` (#3295). It does retry a start that could not begin at all: with a task naming a
 missing launcher it fired each minute, answering `0x80070002`.
+
+**Known gaps of the launcher**, each small enough to name and not to build yet:
+
+| Gap | What a person sees | Why it stands |
+|---|---|---|
+| The launcher cannot start the daemon: an EDR holds the replaced file at logon | Offline until the next sign-in; `LastTaskResult` 127 is the only trace | `<RestartOnFailure>` sees the launcher's start, and the launcher did start. A short retry belongs with #3295 |
+| A hand upgrade while the daemon is still starting | The stop event does not exist yet, so nothing stops it: the daemon runs on renamed files, and the one-shots exit 8, until the next sign-in | The window is the seconds before `run_cmd`'s last `select!`. `installer-smoke` waits 45 s for it |
+| A disk that is full at the day's log roll | The file log stays silent until the next start | `tracing-appender` prints that failure on stderr, which is now a file on the same disk, and its thread dies of it |
+| WDAC, or an EDR that quarantines the launcher | The AppLocker check answers nothing for them, so the launcher stays, and the row is offline | The check reads AppLocker's rules; a second kind of probe is not worth its code before one is seen in the field |
+| The Start menu entry on a machine that refuses the launcher | "Blocked by group policy" | It names the launcher, and the MSI cannot tell at build time |
+
+**Unread: Windows 10.** Every read above is on Windows 11. An older `ucrtbase.dll` may buffer a
+redirected stderr, and then the last lines before a crash die with it.
+`logging::tests::stderr_capture` on a Windows 10 guest settles it.
 
 #### When a per-user upgrade fails
 
