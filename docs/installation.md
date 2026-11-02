@@ -581,7 +581,7 @@ fire on a resume.
 ⚠️ **The task is not a supervisor.** `<RestartOnFailure>` restarted nothing after exit 1
 or after `0xC000013A`, five minutes on, with `Count` 10 and `PT1M` registered. A
 per-user daemon that crashes stays down until the next sign-in or `roomlerd service
-start`.
+start` (#3295).
 
 ### What an MSI run does to the `Roomler` service
 

@@ -4347,7 +4347,7 @@ async fn run_cmd(
     // when any pump silently stalls past its threshold, relying on
     // the OS supervisor (the Windows service's / systemd Restart=on-failure /
     // launchd KeepAlive) to relaunch. The per-user Windows task relaunches
-    // no exit, so that one stays down until the next sign-in (#3292).
+    // no exit, so that one stays down until the next sign-in (#3295).
     // Encoder + capture are registered but gated off until a session
     // attaches — those pumps can legitimately go idle for hours when
     // no controller is connected.

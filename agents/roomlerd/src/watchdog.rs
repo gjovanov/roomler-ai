@@ -8,7 +8,7 @@
 //! detected — relying on the OS supervisor (the service's on Windows,
 //! `Restart=on-failure` on systemd, `KeepAlive` on macOS) to relaunch a
 //! healthy copy. The per-user Scheduled Task relaunches no exit, so that one
-//! stays down until the next sign-in (#3292).
+//! stays down until the next sign-in (#3295).
 //!
 //! Why force-exit instead of panic? A panic on the watchdog task
 //! doesn't unwind the application — `tokio::spawn` swallows it, the

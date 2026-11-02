@@ -100,7 +100,7 @@ orphans a legacy host's config, which is why stderr capture lives in the daemon.
 ⚠️ **`RegisterAutostart` stays the last action before `InstallFinalize`.** The task names the
 launcher, and a rollback onto a release without one would leave a task that starts nothing.
 ⚠️ **`<RestartOnFailure>` is not a supervisor**: it restarted nothing after exit 1 or
-`0xC000013A`. What brings a device back after a self-update is the one-shot `<TimeTrigger>`s
+`0xC000013A` (a crash stays down, #3295). What brings a device back after a self-update is the one-shot `<TimeTrigger>`s
 `service install` adds when a config exists. A repeating trigger would cover a crash too, and was
 rejected: it fires inside the installer's window on the old files, and needs a latch for
 `service stop` and for a removed row.

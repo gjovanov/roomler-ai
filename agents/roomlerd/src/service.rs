@@ -656,8 +656,8 @@ pub fn stop_system() -> Result<String> {
 //     on Win11 (#3292): after exit 1 and after `0xC000013A` it restarted nothing
 //     for five minutes, with `Count` 10 and `PT1M` registered and the task reading
 //     `Ready`. So a per-user daemon that exits stays down until the next logon or
-//     `service start`; nothing here is at parity with systemd's `Restart=` or
-//     macOS's `KeepAlive`. Kept for what it can still do: a start that FAILED.
+//     `service start` (#3295); nothing here is at parity with systemd's `Restart=`
+//     or macOS's `KeepAlive`. Kept for what it can still do: a start that FAILED.
 //   * `<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>` and
 //     `<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>` — schtasks
 //     defaults to BOTH true, which silently terminates the agent the
