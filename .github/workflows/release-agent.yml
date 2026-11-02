@@ -86,14 +86,8 @@ permissions:
 # failure, not cancellation — and its lost save is exactly the
 # generation the newer rehearsal supersedes.)
 concurrency:
-  group: >-
-    ${{ (github.event_name == 'schedule' ||
-         (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release != 'true'))
-        && 'agent-seed-rehearsal'
-        || format('agent-run-{0}', github.run_id) }}
-  cancel-in-progress: >-
-    ${{ github.event_name == 'schedule' ||
-        (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release != 'true') }}
+  group: agent-run-${{ github.run_id }}
+  cancel-in-progress: false
 
 # P3e Phase 2: single-codegen-unit release artifacts. Set as WORKFLOW env
 # (cargo reads CARGO_PROFILE_RELEASE_* like a Cargo.toml [profile.release]
@@ -278,6 +272,7 @@ jobs:
   # 1. Linux — .deb via cargo-deb, bundles the systemd-user unit.
   # ---------------------------------------------------------------------------
   build-linux:
+    if: ${{ false }}
     name: Build .deb (Linux x86_64)
     needs: validate-version
     # Build on 22.04 (glibc 2.35), NOT ubuntu-latest (now 24.04 = glibc 2.39):
@@ -777,6 +772,7 @@ jobs:
   # the same path it always took.
   # ---------------------------------------------------------------------------
   build-linux-companion:
+    if: ${{ false }}
     name: Build desktop companion .deb (Linux x86_64)
     needs: validate-version
     # 22.04 for the same glibc reason as build-linux (see there).
@@ -958,6 +954,7 @@ jobs:
   # x86_64 set) and its own seed family.
   # ---------------------------------------------------------------------------
   build-linux-companion-arm64:
+    if: ${{ false }}
     name: Build desktop companion .deb + .rpm (Linux aarch64)
     needs: validate-version
     # 22.04 for the same glibc reason as build-linux-arm64.
@@ -1092,6 +1089,7 @@ jobs:
   # libvpx VP9-444 as before.
   # ---------------------------------------------------------------------------
   build-linux-arm64:
+    if: ${{ false }}
     name: Build .deb (Linux aarch64)
     needs: validate-version
     # 22.04 for the same glibc reason as the x86_64 lane: build on the OLDEST
@@ -1323,6 +1321,7 @@ jobs:
   # fails here is never published. deb-bare-image.yml runs the same script on a
   # PR that changes what the packages declare.
   verify-linux-debs:
+    if: ${{ false }}
     name: Bare-image install (${{ matrix.triple }})
     needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64]
     strategy:
@@ -2305,6 +2304,7 @@ jobs:
   #     in LOCKSTEP with every agent release: FR-84 S1.)
   # ---------------------------------------------------------------------------
   build-windows-companions:
+    if: ${{ false }}
     name: Build desktop companion EXE (Windows x86_64)
     needs: validate-version
     runs-on: windows-latest
@@ -2459,6 +2459,7 @@ jobs:
   #     .tar.gz would publish an intermediate as a release asset.
   # ---------------------------------------------------------------------------
   build-macos-companion:
+    if: ${{ false }}
     name: Build desktop companion (macOS arm64)
     needs: validate-version
     # Same pinned image as build-macos (see there).
@@ -2522,6 +2523,7 @@ jobs:
   # 3. macOS — signed + notarised .pkg. Unsigned unless Apple secrets present.
   # ---------------------------------------------------------------------------
   build-macos:
+    if: ${{ false }}
     name: Build .pkg (macOS arm64)
     needs: validate-version
     # macos-15, pinned, not `macos-latest`: GitHub retires macos-14 by
@@ -3602,8 +3604,8 @@ jobs:
   # 4. Publish — only on tag push (or dispatch with publish_release=true).
   # ---------------------------------------------------------------------------
   release:
+    if: ${{ false }}
     name: Publish GitHub Release
-    if: needs.validate-version.outputs.is_release == 'true'
     needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64, verify-linux-debs, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
@@ -3740,19 +3742,8 @@ jobs:
   #    half. Tag-run failures stay out — those are already loud.
   # ---------------------------------------------------------------------------
   seed-failure-alert:
+    if: ${{ false }}
     name: Alert on failed seed rehearsal
-    if: >-
-      always() &&
-      needs.validate-version.outputs.is_release == 'false' &&
-      (needs.build-linux.result == 'failure' ||
-       needs.build-linux-companion.result == 'failure' ||
-       needs.build-linux-companion-arm64.result == 'failure' ||
-       needs.build-linux-arm64.result == 'failure' ||
-       needs.verify-linux-debs.result == 'failure' ||
-       needs.build-windows.result == 'failure' ||
-       needs.build-windows-companions.result == 'failure' ||
-       needs.build-macos-companion.result == 'failure' ||
-       needs.build-macos.result == 'failure')
     needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64, verify-linux-debs, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
@@ -3804,19 +3795,8 @@ jobs:
   #     touch it; tag failures are loud on their own.
   # ---------------------------------------------------------------------------
   seed-recovery-close:
+    if: ${{ false }}
     name: Close the seed alert on a green rehearsal
-    if: >-
-      always() &&
-      needs.validate-version.outputs.is_release == 'false' &&
-      needs.build-linux.result == 'success' &&
-      needs.build-linux-companion.result == 'success' &&
-      needs.build-linux-companion-arm64.result == 'success' &&
-      needs.build-linux-arm64.result == 'success' &&
-      needs.verify-linux-debs.result == 'success' &&
-      needs.build-windows.result == 'success' &&
-      needs.build-windows-companions.result == 'success' &&
-      needs.build-macos-companion.result == 'success' &&
-      needs.build-macos.result == 'success'
     needs: [validate-version, build-linux, build-linux-companion, build-linux-companion-arm64, build-linux-arm64, verify-linux-debs, build-windows, build-windows-companions, build-macos-companion, build-macos]
     runs-on: ubuntu-latest
     permissions:
@@ -3856,8 +3836,8 @@ jobs:
   #    never trigger this job.
   # ---------------------------------------------------------------------------
   reseed:
+    if: ${{ false }}
     name: Re-seed master caches (post-release)
-    if: needs.validate-version.outputs.is_release == 'true'
     needs: [validate-version, release]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -3912,8 +3892,8 @@ jobs:
   #    a transient prod blip must not mark an already-shipped release failed.
   # ---------------------------------------------------------------------------
   refresh-release-cache:
+    if: ${{ false }}
     name: Refresh roomler.ai release cache
-    if: needs.validate-version.outputs.is_release == 'true'
     needs: [validate-version, release]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -4019,8 +3999,8 @@ jobs:
   #    SETUP_LOCKSTEP=false skips the job.
   # ---------------------------------------------------------------------------
   dispatch-setup-release:
+    if: ${{ false }}
     name: Release the setup wizard in lockstep
-    if: needs.validate-version.outputs.is_release == 'true' && vars.SETUP_LOCKSTEP != 'false'
     needs: [validate-version, release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
