@@ -1036,7 +1036,7 @@ So a black canvas never again means "unknown": the viewer knows what it was prom
 
 | Event | Today | After | Bound |
 |---|---|---|---|
-| Decode error after the first frame | Worker stopped, 10 s watchdog [M 9.4-10.2 s] | `decoder.reset`, wait for a key, `rc:keyframe`, in place | ≤ 500 ms |
+| Decode error after the first frame | Worker stopped, 10 s watchdog [M 9.4-10.2 s] | A new decoder, because the error closed the old one and `reset` would throw; wait for a key, `rc:keyframe`, in place | ≤ 500 ms |
 | Chunk gap | Gate not re-armed (`rc-vp9-444-worker.ts:465-474`) | Re-arms the gate, asks once | ≤ 150 ms LAN |
 | Lost frame on ordered SCTP | Retransmit at RTO, floor 1 s; head-of-line stall | RTO floor lowered per association for RC only, because the vendored crate is shared with tunnels, and only where its arm reads clean: on a TCP-carried relay loss is queueing, and a lower floor would fire spuriously (R14) | measured first, on UDP and TCP-carried arms |
 | Repeated keyframe asks | 9 rationers | Throttle with backoff, in one place, cause-tagged | ≤ one per 2 RTT |
@@ -1563,7 +1563,7 @@ A cell the plan cannot reach is listed here, with who can. This follows `CLAUDE.
 
 ## 13. Field log
 
-Nothing below is a phase's proof. No phase has run. These are the reads the plan rests on.
+A row that names a phase is that phase's read. Every other row is a read the plan rests on, and none of those is a phase's proof.
 
 | Date (UTC) | Read | Result | Source |
 |---|---|---|---|
@@ -1581,3 +1581,5 @@ Nothing below is a phase's proof. No phase has run. These are the reads the plan
 | 2026-11-02 | Ledger content check | 627 of 698 within ±3 lines; 23 misses opened; no wrong anchor; 48 unopened. Review: 32 more rows opened, all right; 131 env names checked, one real miss, added | §4 |
 | 2026-11-02 | This spec's own anchors, by script at `de6571f1a` | 295 of 295 in range; the 2 it could not resolve are Sunshine's, in another repository. That script checks range, not content. §4.2's 43 rows: 16 pass by identifier, 27 cite future names or none, and I opened their lines by hand. The plan's review opened 77 anchors and found 1 wrong, now fixed. The anchors added after the review were opened at the pin | this log |
 | 2026-11-02 | **Two dead ends worth keeping.** The first draft ordered by sessions. The second ordered by session-hours and led with "two-thirds of real use is `hevc_qsv`" | Sessions put VP9 at 18 % and R4 at "93 % of hours"; by hours VP9 is 0.3 h of interactive use. Hours put `hevc_qsv` first, yet 94 % of its hours are sparse, it holds 13 % of the moving hours, and R4b's rate gain reaches about 1 moving hour, not 15 h. The plan's own review caught the second from data already on disk. The order in §7.3 is the corrected one | §2.1, §2.3, §7.3 |
+| 2026-11-02 | **R1 RED**, production's viewer, the released 0.4.196 agent, a Windows 11 guest, VP9 4:4:4 over the data channel, a decode error forced by FR-132 AC3's method | Error to next paint: Chromium 10217, 9106, 10405 ms, Firefox 11198, 11472 ms, a new session for each. A gap: 1 delta reached the decoder, in 2 sessions. Playwright WebKit paints nothing on this rig, so Safari is unreached | #3293 |
+| 2026-11-02 | **R1 before the merge**, the branch's viewer at production's API, the same agent and guest | Chromium 41-81 ms, 61-99 ms on a still screen, Firefox 45-104 ms, no new session. A gap: 0 deltas, key frame painted at 72-112 ms. Switch off: 10234, 10469 ms. A 4th error inside 10 s hands over to the watchdog, 9967 ms and one new session. The HEVC worker has Vitest only | #3293 |
