@@ -895,19 +895,14 @@ jobs:
         # FR-6 wave 14: the WITH-`audio` half of this step now runs in the
         # `rust-recorder-audio` lane, in parallel with this one.
         #
-        # FR-130 P1 — `encode::openh264_backend::`: the live encoder's SPS
-        # VUI carries the colour description (and nothing with the switch
-        # off), the recording profile's keeps its own. No other lane builds
-        # `openh264-encoder` without a `recording::` filter, and this one
-        # already built the test binary for the line above.
-        #
-        # #3245 — `peer::codec_cap_tests::`: the RTP pump holds openh264's size
-        # ceiling, read on the real encoder. Those two tests need the feature, so
-        # they run here, on the same binary, or nowhere.
+        # FR-130 P1 — `encode::openh264_backend::`: the live encoder's SPS VUI
+        # carries the colour description (and nothing with the switch off), the
+        # recording profile's keeps its own. #3245 — `peer::codec_cap_tests::`: the
+        # RTP pump holds that encoder's ceiling. No other lane builds the feature
+        # without a `recording::` filter, and this one built the test binary above.
         run: |
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib recording::
-          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib encode::openh264_backend::
-          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib peer::codec_cap_tests::
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib -- encode::openh264_backend:: peer::codec_cap_tests::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test control_dc_record
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test export
