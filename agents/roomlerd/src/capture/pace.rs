@@ -36,10 +36,15 @@ const SPINNING_AFTER: u32 = 3;
 /// on a spinning host, 96.7 % of what its uploader sent.
 pub const IDLE_LINE_EVERY: Duration = Duration::from_secs(5);
 
+/// How soon after the last encode an owed keyframe re-encodes a still screen:
+/// at most 4 times a second, however often a browser on a lossy link asks.
+pub const OWED_KEYFRAME_MIN_GAP: Duration = Duration::from_millis(250);
+
 /// `ROOMLERD_RTP_CAPTURE_WAIT`, default on. Off, the RTP pump does not opt in
-/// and arms no guard: the capture spins as it did before #3272. Read once per
-/// pump (FR-70: no per-frame reads). Env only, by the operator's decision: it
-/// is a kill switch for the first release, not a setting (`docs/encoders.md`).
+/// and arms no guard: the capture and its open run as they did before #3272.
+/// Read once per pump (FR-70: no per-frame reads). Env only, by the operator's
+/// decision: it is a kill switch for the first release, not a setting
+/// (`docs/encoders.md`).
 pub fn rtp_capture_wait_enabled() -> bool {
     tunnel_core::env::flag("RTP_CAPTURE_WAIT", true)
 }
@@ -47,6 +52,14 @@ pub fn rtp_capture_wait_enabled() -> bool {
 /// What is left of [`EMPTY_FLOOR`] after an empty that took `took`.
 pub fn floor_remaining(took: Duration) -> Duration {
     EMPTY_FLOOR.saturating_sub(took)
+}
+
+/// Does a still screen re-encode its last frame now? At the pump's `keepalive`,
+/// or sooner for a keyframe that is owed: nothing else answers one on a still
+/// screen, and a session whose first frame beat its transport has no picture
+/// until one is answered.
+pub fn re_encode_due(idle_for: Duration, keepalive: Duration, keyframe_owed: bool) -> bool {
+    idle_for >= keepalive || (keyframe_owed && idle_for >= OWED_KEYFRAME_MIN_GAP)
 }
 
 /// Is the idle line due, `last` being when it was last written (or when the
@@ -138,9 +151,10 @@ mod tests {
         let started = Instant::now();
         const ASKS: u32 = 25;
         for _ in 0..ASKS {
-            let asked = Instant::now();
             assert!(capturer.next_frame().await.unwrap().is_none());
-            let floor = guard.on_empty(asked.elapsed(), capturer.backend());
+            // Not read off the clock: a stall of a millisecond on a busy runner
+            // would read as a wait, and that empty rightly owes nothing.
+            let floor = guard.on_empty(INSTANT, capturer.backend());
             assert_eq!(floor, EMPTY_FLOOR);
             tokio::time::sleep(floor).await;
         }
@@ -215,6 +229,37 @@ mod tests {
         );
         assert_eq!(floor_remaining(EMPTY_FLOOR), Duration::ZERO);
         assert_eq!(floor_remaining(Duration::from_millis(16)), Duration::ZERO);
+    }
+
+    /// An owed keyframe does not wait for the keepalive, and however often a
+    /// browser asks, a still screen spends at most 4 keyframes a second on it.
+    #[test]
+    fn an_owed_keyframe_beats_the_keepalive_and_no_more_than_4_times_a_second() {
+        const KEEPALIVE: Duration = Duration::from_secs(1);
+        const TICK: Duration = Duration::from_millis(16);
+        let just_before = |t: Duration| t - Duration::from_millis(1);
+
+        assert!(!re_encode_due(just_before(KEEPALIVE), KEEPALIVE, false));
+        assert!(re_encode_due(KEEPALIVE, KEEPALIVE, false));
+
+        assert!(!re_encode_due(
+            just_before(OWED_KEYFRAME_MIN_GAP),
+            KEEPALIVE,
+            true
+        ));
+        assert!(re_encode_due(OWED_KEYFRAME_MIN_GAP, KEEPALIVE, true));
+
+        // The pump on a still screen, one ask per acquire wait, a keyframe owed
+        // on every one of them, for 10 s.
+        let (mut idle, mut encodes) = (Duration::ZERO, 0);
+        for _ in 0..(10_000 / TICK.as_millis()) {
+            idle += TICK;
+            if re_encode_due(idle, KEEPALIVE, true) {
+                idle = Duration::ZERO;
+                encodes += 1;
+            }
+        }
+        assert!((30..=40).contains(&encodes), "{encodes} in 10 s");
     }
 
     #[test]

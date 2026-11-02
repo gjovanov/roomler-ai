@@ -969,9 +969,9 @@ Measured on 0.4.195 on one host, worker CPU over 30 s, as a share of one CPU:
 session**. Its idle line ran at 362 lines a second, which crowded its heartbeats
 out of the log uploader (16 on disk, 10 in `agent_logs`).
 
-A pump asks for the contract once after each open, with `pace_capture()`. Only
-the RTP pump does so far, and the request travels on each `CaptureCmd`, so a
-pump that does not ask keeps the old path byte for byte.
+A pump asks for the contract when it opens the capture (`capture::open_async`'s
+`paced`). Only the RTP pump does so far, and the request travels on each
+`CaptureCmd`, so a pump that does not ask keeps the old path, its open included.
 
 ```mermaid
 flowchart TB
@@ -1067,8 +1067,11 @@ The rest of the change:
   on GDI (`set_target_fps`, as the DC pumps do on a grant).
 - **That error has a name now.** `BackendBail::SeatBusy`, at the `DuplicateOutput`
   call alone: the capture that is ending lets go within one in-flight capture, so
-  an open waits up to 5 × 40 ms before going on to scrap and GDI. A second viewer,
-  who really is locked out, pays that once, and then re-climbs quietly every 5 s.
+  a paced open waits up to 5 × 40 ms before going on to scrap and GDI. A second
+  viewer, who really is locked out, pays that once, and then re-climbs quietly
+  every 5 s. An unpaced open takes one look and goes straight on, as it always did:
+  a DC pump's reopen holds the old capture through the open, so a wait there could
+  not succeed, and FR-70 AC10's week reads those pumps.
 - **An owed keyframe does not wait for the keepalive, and the transport coming up
   owes one.** A frame encoded before the transport is up is lost, and a browser asks
   for a keyframe only once a packet reaches it, which on a still screen is the next
@@ -1085,9 +1088,11 @@ The rest of the change:
 - **`capture::pace::EmptyGuard`** watches the pump's empties: three instant ones in
   a row with no frame between them warn once and cost 2 ms each. One alone is
   normal, because a pull backend's next ask is already due after a slow encode.
-- **The log uploader counts what it drops** and says `dropped=N` in its next batch
-  (`crates/agent-core/src/logs_upload.rs`), so a read off `agent_logs` can tell a
-  quiet host from a host whose lines never arrived.
+- **The log uploader counts what a full channel drops** and says `dropped=N` in its
+  next batch (`crates/agent-core/src/logs_upload.rs`), so a read off `agent_logs` can
+  tell a quiet host from one that overflowed the channel. It is not every loss: a
+  batch shed in an outage or refused 401/403 is not counted, and can take the line
+  with it, so no `dropped` line does not prove that nothing was lost.
 
 **What this does not do.** On DXGI a motion source above the target still delivers
 at the display's rate: a 60 fps source read 55-56 frames a second at a target of 30,
@@ -1097,8 +1102,8 @@ Only the GDI arm holds to the target here.
 
 The kill switch is `ROOMLERD_RTP_CAPTURE_WAIT=0`: environment only, read once per
 pump. Off, the pump does not ask and the guard is not armed, so the capture spins
-as it did. The reopen, the seat retry, the time-gated line and the blocking open do
-not come back with it. [FR-98 C7](fr/FR-98-input-to-photon-budget.md#4-design-cuts-each-one-attributed-by-l4)
+as it did and an open on a taken seat takes one look. The reopen, the time-gated line
+and the blocking open do not come back with it. [FR-98 C7](fr/FR-98-input-to-photon-budget.md#4-design-cuts-each-one-attributed-by-l4)
 moves the other pumps over and retires the opt-in, the switch and their sleeps.
 
 ### 5.2 Encoder selection

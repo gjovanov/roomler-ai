@@ -16,7 +16,9 @@
 //!   dropped at the layer (`try_send` returns Err). Acceptable for
 //!   diagnostic data; the rolling on-disk file logs retain everything.
 //!   #3272 — but counted, and the next batch carries a `dropped=N` line, so a
-//!   fleet read can tell a quiet host from one whose lines never arrived.
+//!   fleet read can tell a quiet host from one that overflowed this channel. It
+//!   counts this drop alone: a batch shed below or refused 401/403 is not in it,
+//!   and that batch can take the `dropped=N` line with it.
 //! - 401 / 403 from server → batch dropped, longer backoff (likely
 //!   JWT expired / agent unenrolled).
 //! - #2512: the control socket heard the server refuse this enrollment's

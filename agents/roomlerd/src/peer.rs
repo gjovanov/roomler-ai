@@ -2677,20 +2677,20 @@ async fn media_pump(
         "media pump starting"
     );
     // #3272 — read once per pump (FR-70). On, this pump's capture keeps
-    // `next_frame`'s contract and the guard below watches it. Off is the kill
-    // switch for the first release: the capture spins as it did. The DC pumps
-    // do not ask yet (FR-98 C7).
+    // `next_frame`'s contract and the guard below watches it, and its open waits
+    // for a seat the capture before it is letting go of. Off is the kill switch
+    // for the first release: the capture and its open run as they did. The DC
+    // pumps do not ask yet (FR-98 C7), and their open stays as it is until then:
+    // `capture::open_default_async`.
     let pace_capture = capture::pace::rtp_capture_wait_enabled();
     let mut empty_guard = capture::pace::EmptyGuard::new(pace_capture);
-    let mut capturer = capture::open_default_async(
+    let mut capturer = capture::open_async(
         target_fps,
         downscale,
+        pace_capture,
         media_waiting_hook(session_id, control_dc.clone()),
     )
     .await;
-    if pace_capture {
-        capturer.pace_capture();
-    }
     // FR-80 — a capturer that cannot capture says so, and the controller is
     // told once, here, instead of the operator reading a stall. Every real
     // backend answers `None`, so a healthy session sends nothing.
@@ -2758,10 +2758,10 @@ async fn media_pump(
     // only when dirty_rects.is_empty() == false; otherwise emit
     // a NAL-free heartbeat tied to the wallclock.
     const IDLE_KEEPALIVE: Duration = Duration::from_millis(1_000);
-    // #3272 — how soon after the last encode an owed keyframe re-encodes a still
-    // screen. A browser on a lossy link can ask many times a second, and each
-    // answer here is a whole keyframe of an unchanged picture: at most 4 a second.
-    const OWED_KEYFRAME_MIN_GAP: Duration = Duration::from_millis(250);
+    // #3272 — a keyframe that is owed does not wait for that keepalive, at most 4
+    // times a second (`capture::pace::re_encode_due`): a browser on a lossy link
+    // can ask many times a second, and each answer is a whole keyframe of an
+    // unchanged picture. The transport coming up owes one.
     let mut transport_up = false;
     let mut last_capture_at = std::time::Instant::now();
     // FR-93 P3e — a capture waiting on its host (a display switched off).
@@ -2935,11 +2935,11 @@ async fn media_pump(
                 // session whose first frame beat its transport has no picture
                 // until one is answered. A reopen used to hide this, by putting
                 // a session's first 5 s on GDI, which has a frame on every ask.
-                let idle_for = last_capture_at.elapsed();
-                if idle_for >= IDLE_KEEPALIVE
-                    || (idle_for >= OWED_KEYFRAME_MIN_GAP
-                        && keyframe_requested.load(std::sync::atomic::Ordering::Relaxed))
-                {
+                if capture::pace::re_encode_due(
+                    last_capture_at.elapsed(),
+                    IDLE_KEEPALIVE,
+                    keyframe_requested.load(std::sync::atomic::Ordering::Relaxed),
+                ) {
                     if let Some(ref f) = last_good_frame {
                         frames_keepalive += 1;
                         last_capture_at = std::time::Instant::now();
@@ -2975,18 +2975,18 @@ async fn media_pump(
                 warn!(%session_id, %e, "capture error — rebuilding capturer");
                 // #3272 — let go first: a capture thread still holding the
                 // output's duplication is what makes the new open answer
-                // 0x80070057, and that open would land on GDI for 5 s.
+                // 0x80070057, and that open would land on GDI for 5 s. A paced
+                // open waits for a seat, but it would be waiting on the seat
+                // this very pump holds.
                 drop(capturer);
                 tokio::time::sleep(reopen_backoff.delay()).await;
-                capturer = capture::open_default_async(
+                capturer = capture::open_async(
                     target_fps,
                     downscale,
+                    pace_capture,
                     media_waiting_hook(session_id, control_dc.clone()),
                 )
                 .await;
-                if pace_capture {
-                    capturer.pace_capture();
-                }
                 // Force the encoder to rebuild on the next frame — new
                 // capturer may come back at a different resolution (e.g.
                 // after a DPI change) and openh264 can't be resized

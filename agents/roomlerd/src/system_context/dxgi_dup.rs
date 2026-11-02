@@ -110,9 +110,9 @@ pub enum BackendBail {
     /// binds the adapter that owns the output, so in the field it means the
     /// first: the capture of a session that is ending, whose thread lets go
     /// within one in-flight capture, or a second viewer that really does hold
-    /// it. The open waits a moment, then tries scrap and GDI as it always did.
-    /// Typed at that call site alone, because `E_INVALIDARG` means what it says
-    /// everywhere else.
+    /// it. A paced open waits a moment first; then, and at once for any other
+    /// open, it tries scrap and GDI as it always did. Typed at that call site
+    /// alone, because `E_INVALIDARG` means what it says everywhere else.
     SeatBusy,
 }
 
