@@ -989,7 +989,7 @@ flowchart TB
 
 | Arm | A still screen costs | What it adds to a frame |
 |---|---|---|
-| DXGI direct (`dxgi_direct.rs` `frame`) | about 62 asks a second | an event wake in place of a poll. L4 against the kill switch is below |
+| DXGI direct (`dxgi_direct.rs` `frame`) | about 58 asks a second, and about 74 with a pointer moving, since a pointer-only update ends a wait and reads as an empty | an event wake in place of a poll. L4 against the kill switch is below |
 | scrap | about 450 asks a second | at least one 2 ms floor, not read on L4. The same poll on the direct arm cost more than that, below |
 | GDI | the target rate, full work on each | the bucket's wait, once it is out of credit |
 
@@ -1028,8 +1028,8 @@ in brackets.
 With the zero-copy switch on, the spin reads GPU frames and the waiting arm does
 not, and motion reads p50 **+4.9** (1.4), p95 **+8.0** (2.0), while the still screen
 reads +0.5 (0.2) / −1.2 (1.4). Motion is the wait's one standing L4 miss, the cause
-is not proven, and it comes from a guest whose compositor renders in software. No
-real GPU has been read on any of this.
+is not proven, and it comes from a guest whose compositor renders in software. L4 has not been read on a real GPU.
+`calls` and CPU have, on 0.4.197 ([#3272's result](https://github.com/gjovanov/roomler-ai/issues/3272#issuecomment-6577753677)): on a still screen, 1,686 to 1,744 `calls` per 30 s on an Intel GPU and 2,146 to 2,254 on a Radeon with a person's pointer moving, against 1,571,195 before. Worker CPU reads 19 to 22 % of one CPU on both, about what a DataChannel session costs (16.2 %), against 191.8 %. A third to a half of that is on threads that do not outlive the 30 s read, and its cause is not proven; FR-98 C7 inherits it.
 
 ⚠️ **How to move a pointer in an L4 cell.** A target-mode probe is itself a pointer
 move onto the probe window's pad, so a load that moves the same pointer can measure
@@ -1053,9 +1053,9 @@ across it:
   wait in the acquire, and on GDI the bucket's wait: a frame that arrives 10 ms
   into a wait reads 10 ms plus its readback, where it used to read the readback
   alone, because the polls before it were not counted. It is waiting, not work.
-  The work is `avg_readback_ms`.
+  The work is `avg_readback_ms`, which only the DataChannel heartbeat carries, so an RTP heartbeat cannot tell the wait from the work.
 - `worker_avg_capture_ms` counts every ask, so on a still screen on the waiting
-  arm it reads about 16 ms. The floor and the bucket's wait stay outside its clock.
+  arm it reads about 16 ms, and about 12.6 ms with a pointer moving. The floor and the bucket's wait stay outside its clock.
 - `frames_empty` drops about 1,000-fold, and `calls=` with it. A rate read off
   them from before and after the release is measuring this change.
 
