@@ -21,14 +21,13 @@
 #   ROOMLER__MEDIASOUP__ANNOUNCED_IP  the address browsers send RTP to. `127.0.0.1`
 #                                     works only for calls made on this machine.
 #                                     Set it to the host's LAN or public IP.
-#   RTC_MIN_PORT / RTC_MAX_PORT       mapped below. 32 ports is enough to try
-#                                     the product; widen for real use.
+#   RTC_MIN_PORT / RTC_MAX_PORT       published by the `netns` service below. 32
+#                                     ports is enough to try the product; widen
+#                                     for real use.
 #
-# On Linux you can skip all of that by giving the `roomler` service
-# `network_mode: host` and deleting its `ports:` block — then the full
-# 40000-49999 range is reachable and ANNOUNCED_IP is just the host's IP. That is
-# how the hosted service runs. It is not available on Docker Desktop for
-# macOS/Windows, which is why it is not the default here.
+# Don't give the `roomler` service `network_mode: host` to get past this: the
+# server finds its datastores by service name, those names stop resolving on the
+# host's network, and it loops on `mongo:27017` while port 80 answers 502.
 #
 # Remote desktop, tunnels, SSH and the overlay mesh do NOT use mediasoup and are
 # unaffected by any of the above — they are peer-to-peer with a relay fallback.
@@ -108,13 +107,46 @@ services:
     networks: [roomler]
     restart: "no"
 
+  # The network namespace the server and coturn share. It runs nothing: it owns
+  # the network and every published port, and it must stay up for as long as they
+  # do. They share it because a browser asks the relay for the SFU at the public
+  # address, and coturn rewrites that address to its own before it sends. Only
+  # when the SFU listens on coturn's own address does that packet reach a call.
+  #
+  # It reuses the Redis image, so there is nothing new to pull. `init` makes it
+  # stop at once: as PID 1, `sleep` would ignore SIGTERM and hold `down` for 10 s.
+  # The aliases keep the two services' names resolving on this network.
+  netns:
+    image: redis:7-alpine
+    init: true
+    command: ["sleep", "infinity"]
+    restart: unless-stopped
+    ports:
+      - "${ROOMLER_HTTP_PORT:-8080}:80"
+      # Conference media. Must match RTC_MIN_PORT/RTC_MAX_PORT below.
+      - "40000-40031:40000-40031/udp"
+      - "40000-40031:40000-40031/tcp"
+      # TURN, and the ports coturn relays on.
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49152-49252:49152-49252/udp"
+    networks:
+      roomler:
+        aliases: [roomler, coturn]
+
   # TURN relay. Only needed when two peers can punch no direct path AND you want
   # a relay you own; the DERP floor over the API's own :443 already guarantees
   # connectivity without it. Comment the service out if you don't want it —
   # nothing else depends on it.
+  #
+  # Pinned by digest because `latest` once moved to a release that exits on a flag
+  # this file passed, and the only symptom was a relay that never answered. Before
+  # you move the pin, and whenever you wonder if it is healthy:
+  #   bash scripts/selfhost-coturn-check.sh       (docs/self-hosting.md, "The TURN relay")
   coturn:
     image: coturn/coturn:4.18.0-r0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
     restart: unless-stopped
+    network_mode: service:netns
     command:
       - --listening-port=3478
       - --fingerprint
@@ -122,20 +154,29 @@ services:
       - --static-auth-secret=${ROOMLER_TURN_SECRET:?set ROOMLER_TURN_SECRET in .env.selfhost}
       - --realm=${ROOMLER_TURN_REALM:-roomler.local}
       - --no-tls
+      # The image's own default command sets this; a `command:` here replaces it.
+      - --log-file=stdout
       - --no-multicast-peers
+      # A relay can only be UDP. Browsers and the agent's TURN client never ask for
+      # anything else, and TCP to this server stays. A TCP relay would reach every
+      # TCP listener on the address allowed below, the API included.
+      - --no-tcp-relay
       # Refuse to relay to private ranges — an open TURN server that can reach
       # your LAN is a proxy into your LAN for anyone who obtains a credential.
       - --denied-peer-ip=10.0.0.0-10.255.255.255
       - --denied-peer-ip=172.16.0.0-172.31.255.255
       - --denied-peer-ip=192.168.0.0-192.168.255.255
+      # The same for the range overlay meshes use, this product's included.
+      - --denied-peer-ip=100.64.0.0-100.127.255.255
       - --external-ip=${ROOMLER_PUBLIC_IP:-127.0.0.1}
+      # The one exception to those lines: this namespace's own address, computed at
+      # each start because it moves. It is what coturn rewrites the public address
+      # to. On it, UDP reaches only ports published above. Docker's other containers
+      # and its gateway stay refused.
+      - --relay-ip=$$(hostname -I | grep -oE '[0-9]+([.][0-9]+){3}' | head -1)
+      - --allowed-peer-ip=$$(hostname -I | grep -oE '[0-9]+([.][0-9]+){3}' | head -1)
       - --min-port=49152
       - --max-port=49252
-    ports:
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
-      - "49152-49252:49152-49252/udp"
-    networks: [roomler]
 
   roomler:
     # Two ways to get this running, and the fast one is the default:
@@ -168,11 +209,8 @@ services:
       mongo: { condition: service_healthy }
       redis: { condition: service_healthy }
       minio: { condition: service_healthy }
-    ports:
-      - "${ROOMLER_HTTP_PORT:-8080}:80"
-      # Conference media. Must match RTC_MIN_PORT/RTC_MAX_PORT below.
-      - "40000-40031:40000-40031/udp"
-      - "40000-40031:40000-40031/tcp"
+    # Its ports are published by the `netns` service, above.
+    network_mode: service:netns
     environment:
       # ── identity + security ────────────────────────────────────────────────
       # `production` makes the server REFUSE to boot on the built-in default
@@ -222,7 +260,6 @@ services:
       # The first start runs schema migrations behind a lease, so give it room
       # before a failing probe starts counting against `retries`.
       start_period: 45s
-    networks: [roomler]
 
 volumes:
   mongo_data:
