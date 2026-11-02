@@ -142,6 +142,8 @@ async fn create_duplicate_room_returns_409() {
         .unwrap();
 
     assert_eq!(resp.status().as_u16(), 409);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["message"], "That already exists");
 }
 
 #[tokio::test]

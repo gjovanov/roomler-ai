@@ -5,7 +5,7 @@ and on production: P1–P8 since 2026-10-20 09:33Z (`hosted-20261020-9776afb`), 
 13:53Z, P3d (#2607) since 14:39Z (`hosted-20261020-3fbc5ad`), P6c (#2652) and the pin fix #2653 since 2026-10-21 13:18Z
 (`hosted-20261021-f72df08`), P5c (#2768) since 2026-10-23 18:51Z (`hosted-20261023-978e47b`), P6d (#2792) since 22:48Z
 (`hosted-20261023-f530ac6`); AC1–AC9 field-verified there (§8) · **Owner:** the web app (UI); P6 touches three server payloads and P6d hive's room texts ·
-**Anchors:** master `bfcb2349b` · **Builds on:** [FR-12](FR-12-onboarding-tutorial.md) (the tour anchors),
+**Anchors:** master `7c95d26f4` · **Builds on:** [FR-12](FR-12-onboarding-tutorial.md) (the tour anchors),
 [FR-103](FR-103-device-credentials-renew-themselves.md) and [FR-106](FR-106-devices-say-when-not-updating.md) (the
 "needs a person" chips), [FR-111](FR-111-touch-controls.md) (touch control of the viewer, left as it is)
 
@@ -48,7 +48,7 @@ At 820 px (a portrait tablet) the same one-column cards stretched every select t
 ### 2.2 Every page: a 4 px sideways scroll
 
 The house padding is `pa-2` (8 px) on phones (`docs/ui.md` § Responsive page padding), and a default `v-row` pulls
-12 px past it on each side. `v-main` scrolls (`AppLayout.vue:1227-1233`, `overflow-y: auto`), so it also scrolls
+12 px past it on each side. `v-main` scrolls (`AppLayout.vue:1231-1237`, `overflow-y: auto`), so it also scrolls
 **sideways by 4 px** on every page that has a row: measured on the tenant dashboard, the org list, Billing and
 Observability, and on the sign-in pages.
 
@@ -114,7 +114,7 @@ The desktop grid is untouched: screenshots of master and P1 at 1300 and 2400 px 
 
 ### 3.3 Later phases — what each commits to
 
-The high and medium findings, by phase; anchors at `bfcb2349b`. Each phase lists its own low findings in its PR.
+The high and medium findings, by phase; anchors at `7c95d26f4`. Each phase lists its own low findings in its PR.
 
 **P2 — the shell**
 
@@ -123,7 +123,7 @@ The high and medium findings, by phase; anchors at `bfcb2349b`. Each phase lists
 | the page scrolls sideways by 4 px (§2.2) | `AppLayout.vue:1227-1233` | `overflow-x: hidden` on `v-main`; `v-row dense` where a page needs edge-to-edge |
 | app bar overflow: with the unread and call buttons up, the avatar menu — and **Logout** — go off-screen | `AppLayout.vue:431-540` | a phone budget: `?` and the theme toggle into the avatar menu below 600 px, the text buttons icon-only with a badge |
 | a page opens at the previous page's scroll offset (`v-main` is the scroller, nothing resets it) | `AppLayout.vue:563-567` | reset on path change |
-| a running call leaves no visible controls once you leave its page | `AppLayout.vue:406-420`, `:703-707` | an in-call control in the app bar on phones (D5) |
+| a running call leaves no visible controls once you leave its page | `AppLayout.vue:406-420`, `:706-710` | an in-call control in the app bar on phones (D5) |
 | other-org activity and the current org's name are drawer-only | `AppLayout.vue:57-65` | a dot on the nav icon |
 | dialogs never go full screen on a phone | 20+ dialogs | a `useResponsiveDialog()` (`fullscreen` on `xs`), with a toolbar close |
 | rail state from a wide window leaks into the phone drawer | `AppLayout.vue:49`, `:176`, `:271`, `:412` | `railActive = !mobile && rail` |
@@ -163,11 +163,11 @@ The high and medium findings, by phase; anchors at `bfcb2349b`. Each phase lists
 | finding | where | fix |
 |---|---|---|
 | once a session starts, the toolbar's title gets 0 px (no device name), chips lose their text, and **Disconnect** and Fullscreen are off-screen | `RemoteControl.vue:15-883`, `:50` | on `xs`: name, status and Disconnect on row 1, tools on an extension row; the rarer tools in an overflow menu |
-| stage alerts shrink to a 32 px strip beside the picture, at every width — and their coming and going resizes the frame, which re-sends `rc:resolution` | `RemoteControl.vue:908-970`, `:5248-5255` | the alerts as an overlay on the stage |
-| the **Unverified** device-identity badge is hidden below 600 px | `RemoteControl.vue:81-92` | always shown when it warns (icon-only on `xs`) |
-| the Settings **Session** tab is off-screen on a phone | `RemoteControl.vue:1522-1527` | `show-arrows` |
-| the Metrics tab's live values never render (`hide-details` with `messages`) | `RemoteControl.vue:1707-1755` | `hide-details="auto"` |
-| the files drawer has no tap path into a folder and no "upload here" | `RemoteControl.vue:2226-2232` | a chevron per folder; an upload button |
+| stage alerts shrink to a 32 px strip beside the picture, at every width — and their coming and going resizes the frame, which re-sends `rc:resolution` | `RemoteControl.vue:914-1014`, `:5411-5418` | the alerts as an overlay on the stage |
+| the **Unverified** device-identity badge is hidden below 600 px | `RemoteControl.vue:87-98` | always shown when it warns (icon-only on `xs`) |
+| the Settings **Session** tab is off-screen on a phone | `RemoteControl.vue:1566-1571` | `show-arrows` |
+| the Metrics tab's live values never render (`hide-details` with `messages`) | `RemoteControl.vue:1751-1799` | `hide-details="auto"` |
+| the files drawer has no tap path into a folder and no "upload here" | `RemoteControl.vue:2282-2288` | a chevron per folder; an upload button |
 
 **P6 — observability, analytics, growth, hive**
 
@@ -203,7 +203,7 @@ actions inside the viewport.
 | **P3d** — #2607 | the audit lists on a phone: compact cards, 20 at a time, a long command clamped until tapped; and the SSH audit's refusal that also read "granted" (P3a) | revert: UI only | the exec audit at 360 px with 100 rows: 47,997 → 4,822 px in the harness; production after a promote | S |
 | **P4** — P4a #2574 (chat) · P4b #2580 (calls) | chat and conference | revert | a two-browser call with one at phone width | L |
 | **P5** — #2577 · P5b #2588 (the files drawer; a stack on #2577) | the viewer's chrome | revert | an offline device's page for the idle chrome; a session from a real phone (the operator) | M |
-| **P5c** — #2768 | a running session's state chips and tools ride their own row under the toolbar, at every width (`#rc-tb-strip`, `RemoteControl.vue:916`; one `<Teleport>`, `:58-870`, gated by `sessionToolsOnStrip`, `:2595`), so the toolbar keeps Back, the device's name, Disconnect and Fullscreen; Connect's phases keep the one row. P5's single scrolling row could not: the tools overflowed it, and an overflowing flex row shrinks the title first — to its 96 px minimum on a phone, to 0 px on a 1300 px desktop (the operator chose the strip for desktop too, 2026-10-23) | revert: UI only | a session at 360 px on production, red (§8, 2026-10-23), then this build served at the production origin, green at 360–1920 px; then production as deployed (`hosted-20261023-978e47b`), green | S |
+| **P5c** — #2768 | a running session's state chips and tools ride their own row under the toolbar, at every width (`#rc-tb-strip`, `RemoteControl.vue:937`; one `<Teleport>`, `:64-891`, gated by `sessionToolsOnStrip`, `:2762`), so the toolbar keeps Back, the device's name, Disconnect and Fullscreen; Connect's phases keep the one row. P5's single scrolling row could not: the tools overflowed it, and an overflowing flex row shrinks the title first — to its 96 px minimum on a phone, to 0 px on a 1300 px desktop (the operator chose the strip for desktop too, 2026-10-23) | revert: UI only | a session at 360 px on production, red (§8, 2026-10-23), then this build served at the production origin, green at 360–1920 px; then production as deployed (`hosted-20261023-978e47b`), green | S |
 | **P6** — P6a #2584 (UI) · P6b #2586 (D4, the server); hive's rows are FR-90's and stay open | observability, analytics, growth, hive + display names on the server | revert (the server fields are additive) | the sweep | L |
 | **P6c** — #2652 | hive's session rows and dialogs name the device as the Devices page does (a UI join on `device_id`; the kept `device_name` only for a device the org no longer lists). The agent's message author, `Claude · <device_name>` (`crates/modules/hive/src/model.rs:640`), is stamped by the server and stays FR-90's | revert: UI only | the hive pages on production after a promote | S |
 | **P6d** — #2792 | what the server writes into a session's room names the device as the device list does: the author line `Claude · <device>`, the notes (started, adopted, refused, managed, moving, moved, forked, the failures, tail), an approval's notification, and the reasons a move or fork sends back. It is resolved live when the text is written: `crates/modules/hive/src/room.rs` `for_people` / `promotion_for_people`. The record (`location.device_name`, `to_name`) and what the device's harness reads (the memory snapshot, a move's resume note) keep the machine's name, which the CLI's selectors resolve. Taken with the operator's go (2026-10-23), FR-90 told on #1827 | revert: a display-only lookup, nothing stored changes | `hive_tests::a_sessions_room_names_its_device_as_the_device_list_does` (a display name, a rename, a cleared one), then a session's room on production (`hosted-20261023-f530ac6`): red before, green after (§8) | S |
@@ -282,7 +282,7 @@ counted as a visit. The viewer route is an offline device's idle page, which sta
 |---|---|---|---|
 | 2026-10-20 13:53Z | promote of `hosted-20261020-d2eae7e` (by FR-115's session; carries D1 #2599 and D6 #2601) | — | — |
 | 2026-10-20 14:17–14:18Z | production, `hosted-20261020-d2eae7e` (each frame's entry script checked) | the same instrument | 🟢 **D1** at 1300 px: 10 rows of 53–61 px (each ~210 px with every control open before D1), every Consent summary closed (`aria-expanded="false"`) and no select rendered; a click opens the six controls in place (4 selects, 2 checkboxes; the row 234 px) and a second click closes them. 🔴 **P3d before:** the exec audit 42,534 px at 360 px, 100 rows, no paging. 🔴 **#2605 before:** `/login` and a tenant deep link carry no `Cache-Control`, and a never-seen deep link loaded twice comes from cache the second time (`transferSize 0`) |
-| 2026-10-20 14:37:35Z | promote of `hosted-20261020-3fbc5ad`: P3d #2607, the SPA-shell fix #2605, FR-90's server half (`74996c9c0`) | the fleet | pods ready by 14:39:24Z, 0 restarts; 20 of 32 online, the operator's 14 of 22 (the one fewer last seen 13:29Z, before the roll); `roomler exec` answered from 5 devices; a tunnel forward 200 in 0.50 s |
+| 2026-10-20 14:37:35Z | promote of `hosted-20261020-3fbc5ad`: P3d #2607, the SPA-shell fix #2605, FR-90's server half (`b7facf2ad`) | the fleet | pods ready by 14:39:24Z, 0 restarts; 20 of 32 online, the operator's 14 of 22 (the one fewer last seen 13:29Z, before the roll); `roomler exec` answered from 5 devices; a tunnel forward 200 in 0.50 s |
 | 2026-10-20 14:40–14:45Z | production, `hosted-20261020-3fbc5ad` | the same instrument | 🟢 **P3d** at 360 px: the exec audit **5,264 px** (20 cards of 204–270 px; 9 long commands behind **Show all**), the SSH audit 4,376 px, SSH activity 5,476 px; **Show 20 more** reaches 40 on each; nothing off-screen. 🟢 **#2605:** `Cache-Control: no-cache` on `/login` and the deep link, and the second load of a never-seen deep link revalidates (`transferSize 300`, a 304). 🟢 **AC3's last red:** the idle viewer's break-glass button spans 99–261 px at 360 px (361 px this morning); the only elements past the edge are in the closed Remote files drawer |
 | 2026-10-21 06:10–06:29Z | production, `hosted-20261020-5ffa1d8` | the vmtest org from mars (Playwright 1.62): a desktop context (1300 px) and a phone context (360 × 780, touch, mobile, `(hover: none)` true), the same test account in both (participants are keyed per connection); a throwaway room each run | 🔴 **AC6, Pin.** Send on screen, empty and with a long message; the hover row `display: none` (0 × 0); ⋮ on screen; a tap on the header's empty stretch pins nothing and opens nothing; the menu opens (React, Reply in thread, Edit, Pin, Delete); **Pin by tap does nothing**: the app logs `API error 415`. Since the first commit the UI's `togglePin` sent a bare PUT, and the server's `Json<{ pinned }>` refused it, so no message could be pinned at any width; fixed by #2653. Then 🟢 the call: the phone decodes the desktop's video; off the call page the bar's in-call menu is on screen (Return to call, Mute, Turn camera off, Hang up), Mute works by tap, and Return comes back to the live call. The first run's cleanup was cut by the test's own timeout, so its room was deleted by hand (HTTP 200, then 404); later runs set an action timeout |
 | 2026-10-21 13:16:11Z | promote of `hosted-20261021-f72df08`: P6c #2652, the pin fix #2653 (with FR-118 P0, FR-97 P2g and FR-70 M3a.1/.2 from other sessions) | the fleet | pods ready by 13:18:25Z, 0 restarts; `roomler exec` answered from 5 devices; a tunnel forward 200 in 0.48 s |

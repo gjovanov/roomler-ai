@@ -53,12 +53,12 @@ flowchart LR
 
 | Phase | What it does | Kill switch | Lives in |
 |---|---|---|---|
-| P1 | Byte-budget gate on the **direct** send queue (150 ms of the path ceiling); send depth 12→6 | `direct_queue_ms` | `rate_profile.rs:504` ([rate-control.md](rate-control.md)) |
+| P1 | Byte-budget gate on the **direct** send queue (150 ms of the path ceiling); send depth 12→6 | `direct_queue_ms` | `rate_profile.rs:547` ([rate-control.md](rate-control.md)) |
 | P2 | Measured-rate ceiling `min(nominal, 0.85×goodput)` from blocked-send samples | `measured_ceiling` | [rate-control.md](rate-control.md) |
 | P3 | Background encoder rebuild — the replacement opens on a blocking thread while the current one keeps producing; swap between frames | `bg_rebuild` | [rate-control.md](rate-control.md) |
-| P4 | Direct HRD window 2×→1× (AV1 floored at 2×); area-scaled AIMD floor | `direct_hrd_pct`, `area_min_bitrate` | `rate_profile.rs:590` |
+| P4 | Direct HRD window 2×→1× (AV1 floored at 2×); area-scaled AIMD floor | `direct_hrd_pct`, `area_min_bitrate` | `rate_profile.rs:657` |
 | **P5** | **Encode cost & cadence** — parallel convert, off-runtime encode, **fps-first** shedding on a paced even grid | `par_convert`, `fps_pace` | §3 below |
-| **P6** | **Pointer cadence off rAF** — immediate-send + 8 ms min-gap timer, `pointerrawupdate` sampling | localStorage `roomler-rc-input-gap-ms` | §4 below |
+| **P6** | **Pointer cadence off rAF** — immediate-send + 8 ms min-gap timer, `pointerrawupdate` sampling | localStorage `roomler-rc-input-gap` | §4 below |
 | **P7** | **End-to-end age** — one process clock stamped on the wire, echoed over control, measured at paint | — (absent on old agents) | §5 below |
 
 > P1–P4 are **direct-only** since 0.4.3 — they were field-proven *relay-hostile*
@@ -73,14 +73,16 @@ flowchart LR
 Three independent levers, each hatched (`agents/roomlerd/src/encode/`):
 
 1. **Parallel convert** (`par_convert`, default on). Frames ≥ 2 MPix run the
-   BGRA→NV12/I444 conversion in row bands across scoped threads — byte-identical
-   output (even-row cuts, chroma pairs never straddle a band boundary). Band
-   count is `min(4, cores)`; under 2 MPix the single call wins
-   (`encoder.rs:2039` `convert_bands`, `:2058` `band_cuts`; `mod.rs:552`
-   `par_convert_enabled`).
-2. **Off-runtime encode** (`block_in_place`). The 20–30 ms HW encode no longer
-   stalls the async runtime the DataChannel send task shares (`peer.rs:6469`,
-   `:9218`).
+   BGRA→NV12/I444 conversion in row bands, since FR-119 P2b-11 on a pool that
+   stays up (`encoder.rs:3383` `convert_pool`) — byte-identical output (even-row
+   cuts, chroma pairs never straddle a band boundary). Band count is
+   `min(4, cores)`; under 2 MPix the single call wins (`encoder.rs:2306`
+   `convert_bands`, `:2325` `band_cuts`; `mod.rs:631` `par_convert_enabled`).
+2. **Off-runtime encode.** The 20–30 ms HW encode no longer stalls the async
+   runtime the DataChannel send task shares. P5 did it with `block_in_place`;
+   since FR-70 M1 (default on since 0.4.70) the encoder lives on its own thread per
+   session and the pump awaits the packets (`thread.rs:387` `encode`, called at
+   `peer.rs:9535`). `block_in_place` remains the inline path, `media_thread = false`.
 3. **fps-first shedding** (`fps_pace`, default on). When the encoder can't hold
    the target frame rate, frames are consumed on an **even grid** at the
    sustainable rate — instead of WGC dropping ~33 % of frames at *random* phases,
@@ -99,19 +101,21 @@ paced       = Some(quantized)  if quantized + 5 ≤ target_fps   // engage ≥5 
 
 floored at `FPS_PACE_MIN = 15` (`encode_pressure.rs:139` — below that the cure is
 a resolution tier, not more pacing). While paced, the exposed `encode_factor` is
-masked at 1.0 (`governor.rs:1523`): the pixels-bound HW encode time never
+masked at 1.0 (`governor.rs:1602`): the pixels-bound HW encode time never
 responded to the bitrate factor, so resolution stays the second lever. The pump
-reads `governor.paced_fps()` each loop (`governor.rs:1535`; consumed at
-`peer.rs:9576`, logged at `:9653`).
+reads `governor.paced_fps()` each loop (`governor.rs:1614`; consumed at
+`peer.rs:8084`, logged at `:9906`). FR-112 gave a software encoder a pace of its
+own, `SoftwarePace`, which holds its steps up by a margin and never goes below 30.
 
 > ⚠️ **The pace keys on encode time, not full-pipeline time.** `FpsPace` derives
 > the sustainable rate from `ewma_encode_ms` alone. At small geometries encode
 > *is* the bottleneck and the pace tracks delivery closely. At 2880×1800 the
 > per-frame capture + convert + submit cost sits *beyond* the encode EWMA, so the
 > pace target can read higher than the full pipeline can actually deliver — see
-> the field finding in §6. Closing that gap is pipeline-cost work
-> ([FR-70](fr/FR-70-media-pipeline-leaves-the-runtime.md),
-> [FR-118](fr/FR-118-gpu-resident-frames.md)), not a pacing change.
+> the field finding in §6. That gap closed as pipeline-cost work, not as a pacing
+> change: the 7.9 ms the pump waited for a readback is gone when the frame stays on
+> the GPU ([FR-118](fr/FR-118-gpu-resident-frames.md), switch `zero_copy`, off by
+> default until [FR-132](fr/FR-132-zero-copy-by-default.md)).
 
 ## 4. P6 — pointer cadence off rAF
 
@@ -120,15 +124,15 @@ driven by the compositor, so a tab busy decoding/compositing heavy video slows
 the pointer stream **exactly when a drag needs it most**, and even idle it adds up
 to a frame (~16 ms) before the first send.
 
-P6 drives sends from a timer instead (`useRemoteControl.ts:6499`
-`INPUT_MOVE_GAP_MS`, `:6512` `schedulePendingMove`): send immediately when the
+P6 drives sends from a timer instead (`useRemoteControl.ts:6965`
+`INPUT_MOVE_GAP_MS`, `:6978` `schedulePendingMove`): send immediately when the
 min-gap has elapsed, else arm one `setTimeout` for the remainder; latest position
 wins. 8 ms ≈ a 125 Hz ceiling at ~60 B/message — noise even on a constrained
 relay. Where the browser supports it (Chromium), `pointerrawupdate` feeds the
 coalescer at device rate between rAF-aligned moves, so the freshest position is
-always queued (`useRemoteControl.ts:11981`). The gap is localStorage-tunable
-(`roomler-rc-input-gap-ms`); the same timer drives the relative-pointer path
-(`:6608`).
+always queued (`useRemoteControl.ts:12637`). The gap is a per-browser knob,
+0 to 16 ms (`roomler-rc-input-gap`, `:2671` `storedInputGapMs`, from FR-98 C3); the
+same timer drives the relative-pointer path (`:7071`).
 
 The point of the design is that `setTimeout` cadence is **independent of rAF**:
 under a compositor load that drops rAF to 20 fps, pointer sends still leave at
@@ -141,18 +145,18 @@ built **without a wire-format change**: the 13-byte video header already carried
 µs timestamp.
 
 - **One process clock.** Both DataChannel pumps stamp the header from a single
-  process-wide epoch (`peer.rs:3522` `agent_epoch_us`). Stamped at framing, so the
+  process-wide epoch (`peer.rs:3667` `agent_epoch_us`). Stamped at framing, so the
   send-queue wait is *inside* the measured age.
 - **An echo on the same clock.** A new `rc:clock` control verb echoes `t0`
-  verbatim plus the agent's epoch µs (`peer.rs:3529` `clock_echo_json`, handled at
-  `:10562`). The browser probes it every stats tick and keeps the **lowest-RTT**
-  sample of the last 8 (`useRemoteControl.ts:6447` `CLOCK_RING`, `:6451`
+  verbatim plus the agent's epoch µs (`peer.rs:3674` `clock_echo_json`, handled at
+  `:11053`). The browser probes it every stats tick and keeps the **lowest-RTT**
+  sample of the last 8 (`useRemoteControl.ts:6913` `CLOCK_RING`, `:6917`
   `sendClockProbe`): both clocks are fixed-origin, so the offset is a constant and
   min-RTT bounds the asymmetry error to RTT/2 of the best probe.
 - **Measured at paint.** The decode worker computes
   `age = epochNow + offset − wireTs` (`rc-hop-stats.ts:213` `frameAgeMs`). The
   pill is the window average, `~${Math.round(age.avgMs)} ms`
-  (`RemoteControl.vue:3180` `statsAgeLabel`, rendered at `:236`).
+  (`RemoteControl.vue:4875` `statsAgeLabel`, rendered at `:289`).
 
 It covers **encode-output → send queue → network → decode → paint**. The
 agent-side capture + encode (~10–15 ms) sits *before* the stamp and is excluded,
@@ -167,8 +171,9 @@ never echo → the ring stays empty → the pill simply does not appear.
 
 ## 6. Field verification
 
-Measured 2026-10-26 from production `agent_logs` (read-only, 7-day window). The
-fleet was on 0.4.167–0.4.172.
+Measured 2026-10-26 from production `agent_logs` (read-only, 7-day window), with the
+fleet on 0.4.167–0.4.172, and read again 2026-11-02 with the fleet on 0.4.177–0.4.197.
+Each dated read keeps the anchors of its day.
 
 ### Encode cadence (AC6) — **partial**
 
@@ -199,6 +204,28 @@ and the motion windows are what matter.
   drop pathology is gone. That host is NVENC/WGC, not a 2880×1800 Iris-Xe one (no
   online Iris-Xe host captures via WGC).
 
+**2026-11-02: the headline depends on where the frame lives.** Every
+`FFmpeg DC pump heartbeat` at 2880×1800 from 2026-10-27 to 2026-11-02: 2 831 windows,
+17 sessions, one host (the same laptop, `av1_qsv`, direct). No other host in the week
+encodes at that geometry.
+
+| Input path | windows | sessions | fps med / p90 / max | motion(≥25) med | ≥45 fps | avg_encode_ms med / p90 | paced |
+|---|---|---|---|---|---|---|---|
+| `cpu`, switch off: today's default | 1701 | 12 | 31.4 / 38.4 / 42.8 | 37.1 | **0 %** | 17.7 / 21.3 | 55 on 69 % of windows |
+| `gpu`, `zero_copy` on | 986 | 1 | **60.0 / 60.0 / 60.3** | **60.0** | **89 %** | **16.3** / 18.9 | none on 80 % |
+| unlabelled, 0.4.177, before `input_path` | 144 | 1 | 17.9 / 27.8 / 34.9 | 27.9 | 0 % | 17.7 / 17.9 | 55 on 98 % |
+
+- The `gpu` row is [FR-118 §9.10](fr/FR-118-gpu-resident-frames.md#910-ac4-the-slow-laptop-at-60-fps-2026-10-30):
+  a test pattern, full screen, in a window the laptop's owner agreed to. In its
+  controlled 20-minute leg 594 of 596 windows reached 50 fps, and capture + encode fell
+  from about 25.5 ms to 16.6 ms, because the 7.9 ms the pump waited for a readback is gone.
+- The `cpu` row is what the §3 caveat predicts. The pace reads a 17.7 ms encode and
+  allows 55 fps, while a frame costs about 25 ms in all, so delivery stays near 38.
+- **So P5's numbers are reachable on this hardware, and the default does not reach them
+  yet.** `zero_copy` is off by default until [FR-132](fr/FR-132-zero-copy-by-default.md).
+- **WGC drop ratio** (`wgc_backend.rs:789`): median 2 %, p90 2, max 42, over 2 571
+  samples on the one WGC-capture host in the week, again NVENC and not Iris-Xe.
+
 ### End-to-end age (AC8) — **partial**
 
 | Transport | age_ms med / p90 / p99 | floor med | windows | sessions / hosts |
@@ -214,6 +241,17 @@ tail is the [FR-14](fr/FR-14-direct-link-jitter-episodes.md) jitter episodes mad
 visible, which is the point of the pill. The **"HUD shows end-to-end age" half is
 met**; a literal side-by-side comparison against RustDesk's own Delay readout on
 the reference pair is an operator A/B (FR-1 AC9).
+
+**2026-11-02, the whole week:** an age on 123 375 of 128 325 heartbeat windows from the
+two DataChannel pumps, with 6 sentinels and no `viewer_age_implausible`.
+
+| Transport | age_ms med / p90 / p99 | floor med | windows | sessions / hosts |
+|---|---|---|---|---|
+| direct | **15** / 30 / 62 | 10 | 95 845 | 411 / 64 |
+| relay | **42** / 80 / 179 | 33 | 27 530 | 150 / 12 |
+
+The direct tail the 10-26 read showed (p90 1108, p99 1194) is not in this week's
+numbers. This read does not say why.
 
 ### Pointer cadence (AC7) — mechanism confirmed, field read owed
 
@@ -232,7 +270,8 @@ on the operator's own browser or a dedicated idle host.
 | `fps_pace` | `ROOMLERD_FPS_PACE` | on | fps-first even-cadence shedding |
 | `direct_queue_ms` | `ROOMLERD_DIRECT_QUEUE_MS` | 150 | direct send-queue lag bound (0 = off) |
 | `direct_hrd_pct` | `ROOMLERD_DIRECT_HRD_PCT` | 100 | direct HRD/VBV window (AV1 floored 200) |
-| `roomler-rc-input-gap-ms` | — (localStorage) | 8 | pointer min-gap, ms |
+| `roomler-rc-input-gap` | — (localStorage) | 8 | pointer min-gap, ms (0–16) |
+| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | the frame stays on the GPU ([FR-118](fr/FR-118-gpu-resident-frames.md)); what lifts 2880×1800 past 45 fps |
 
 The age pill needs agent ≥ 0.4.9 and a WebCodecs decode path (HEVC-over-DC or
 VP9-4:4:4); it is absent on the classic `<video>` path and on older agents.

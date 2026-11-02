@@ -210,12 +210,17 @@ pub fn network_view_wanted(own_overlay_ip: Option<&str>, euid: u32) -> bool {
 /// without that, `roomler status` as the console user printed the root half's
 /// address as this half's, right above this half's own "overlay OFF"
 /// enrollments, and the companion's Overview showed it as the device's own.
+///
+/// FR-128 D8 — and the machine's netcheck: this half runs no overlay, so it
+/// measures nothing, and an `auto` session it builds reads the far-TURN reach
+/// of its own machine from here (`rc_overlay::own_far_turn`).
 pub fn with_machine_network(mut own: NodeStatus, machine: &NodeStatus) -> NodeStatus {
     if machine.overlay_ip.is_some() {
         own.overlay_ip = machine.overlay_ip.clone();
         own.overlay_ip6 = machine.overlay_ip6.clone();
         own.exit_node = machine.exit_node.clone();
         own.dns = machine.dns.clone();
+        own.netcheck = machine.netcheck.clone();
         own.network_from = Some(tunnel_core::localapi::NetworkOrigin {
             node_id: machine.node_id.clone(),
             name: machine.name.clone(),
@@ -501,13 +506,18 @@ mod tests {
             r#"{"node_id":"d","name":"mac-d","version":"0.4.149","mode":"service","connected":true,
                 "overlay_ip":"100.64.0.9","overlay_ip6":"fd7a:115c:a1e0::9",
                 "dns":{"magic_domain":"vmtest.roomler.ai","resolver_bound":true,
-                       "os_steer_active":true,"upstream":"192.0.2.53:53","answer_aaaa":true}}"#,
+                       "os_steer_active":true,"upstream":"192.0.2.53:53","answer_aaaa":true},
+                "netcheck":{"stun_udp":false,"relay_band_udp":false,"derp_ws_ok":true,"age_s":90}}"#,
         );
         let merged = with_machine_network(own.clone(), &machine);
         assert_eq!(merged.overlay_ip.as_deref(), Some("100.64.0.9"));
         assert_eq!(merged.overlay_ip6.as_deref(), Some("fd7a:115c:a1e0::9"));
         assert!(merged.dns.is_some());
         assert_eq!(merged.dns, machine.dns);
+        // FR-128 D8 — the machine's netcheck, which this half cannot measure.
+        assert!(own.netcheck.is_none());
+        assert_eq!(merged.netcheck, machine.netcheck);
+        assert!(merged.netcheck.as_ref().is_some_and(|n| !n.stun_udp));
         // #2892 — and the answer names the daemon those fields belong to.
         assert_eq!(
             merged.network_from,

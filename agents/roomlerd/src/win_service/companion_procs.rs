@@ -254,6 +254,22 @@ pub(crate) fn normalize(p: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// `find(exe)` once it names `pid`, or its last answer after 10 s.
+    ///
+    /// #3005: a process `find` can name has a loader's module list, and a
+    /// just-spawned child has none until its first thread has run. On a busy
+    /// runner that has not happened yet when `spawn` returns.
+    fn once_found(exe: &Path, pid: u32) -> Vec<CompanionProcess> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let found = find(exe);
+            if found.iter().any(|p| p.pid == pid) || std::time::Instant::now() >= deadline {
+                return found;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     #[test]
     fn only_the_companion_its_renamed_copy_or_a_file_id_is_worth_opening() {
         let name = "roomler-desktop.exe";
@@ -313,13 +329,25 @@ mod tests {
             .spawn()
             .expect("spawn the probe");
 
-        let found = find(&exe);
+        let found = once_found(&exe, child.id());
         let me = found.iter().find(|p| p.pid == child.id()).copied();
         let own_session = session_of(std::process::id());
 
         // The refresh's first move on the companion's file: rename it aside.
+        // A just-started image can still be open elsewhere for a moment (os
+        // error 32 under load, #3005), so a sharing violation is retried. The
+        // companion the refresh renames has been running far longer.
         let aside = dir.path().join(format!("{name}.old"));
-        std::fs::rename(&exe, &aside).expect("rename a running image aside");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let renamed = loop {
+            match std::fs::rename(&exe, &aside) {
+                Err(e) if e.raw_os_error() == Some(32) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                other => break other,
+            }
+        };
+        renamed.expect("rename a running image aside");
         let found_after_rename = find(&exe).iter().any(|p| p.pid == child.id());
         // A running image's file refuses deletion, and a replace onto it.
         let delete_refused = std::fs::remove_file(&aside).is_err();
@@ -377,6 +405,12 @@ mod tests {
             .args(["/c", "ping -n 30 127.0.0.1 > nul"])
             .spawn()
             .expect("spawn the bystander");
+        // The control: the bystander verifies against its OWN path, so a
+        // refusal below is the path check, not a process the loader has not
+        // set up yet (which verifies against nothing).
+        let readable = once_found(&other, bystander.id())
+            .iter()
+            .any(|p| p.pid == bystander.id());
 
         // The bystander's pid, claimed to be a process started from `ours`.
         let stopped = terminate_verified(&ours, &[bystander.id()], Duration::from_secs(2));
@@ -384,6 +418,7 @@ mod tests {
         let _ = bystander.kill();
         let _ = bystander.wait();
 
+        assert!(readable, "the control: found by its own started-from path");
         assert!(
             stopped.is_empty(),
             "nothing it could not verify is counted as stopped"

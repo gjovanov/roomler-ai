@@ -1,7 +1,7 @@
 # FR-27 — Host consent: every mode, every OS, and a desktop companion that works
 
 **Issue:** [#854](https://github.com/gjovanov/roomler-ai/issues/854)
-**Status:** design
+**Status:** ✅ **closed 2026-10-26**. Every acceptance criterion is field-verified; the last was macOS "Apply update" from the companion (0.4.172 → 0.4.174, see the 10-26 log entry).
 
 ## Goal
 
@@ -33,7 +33,7 @@ Every line below was read on `origin/master` at `861d4557`.
    The agent writes a `.pending` marker and waits; only the companion renders it
    (750 ms LocalAPI poll). Nothing starts the companion, and the daemon never
    checks whether anything can ask. Observable failure: 30 s of nothing, then a
-   deny. — `agents/roomlerd/src/signaling.rs:2073`,
+   deny. — `agents/roomlerd/src/signaling.rs:2181`,
    `agents/roomler-desktop/src/main.rs` (`consent_watch_loop`)
 3. **"Nobody was there" is reported to the controller as "the user denied you".**
    `Decision::Timeout` maps to `granted: false`, and the hub terminates that as
@@ -67,12 +67,12 @@ Every line below was read on `origin/master` at `861d4557`.
    Roomler SSH both prompt through the same broker and write no marker, so an
    `exec_policy` / `SshPolicy` of `prompt` can only be answered by someone who
    greps the daemon log for a request id and runs the CLI within 30 s.
-   — `signaling.rs:2949`, `ssh.rs:2251` vs `git grep write_pending`
+   — `signaling.rs:2991`, `ssh.rs:2251` vs `git grep write_pending`
 5. **`prompt_then_email` is "prompt AND email", with a 300 s on-screen modal.**
    The hub gives every owner-side mode `ASYNC_CONSENT_TIMEOUT` (300 s) and the
    agent uses that as its modal timeout. The doc-comment on
    `ConsentMode::PromptThenEmail` still describes a fallback that was never
-   built. — `hub.rs:39,862`, `models.rs:393`, `state.rs:1199`
+   built. — `hub.rs:39,862`, `models.rs:400`, `state.rs:1199`
 
 ### Desktop companion
 
@@ -80,7 +80,7 @@ Every line below was read on `origin/master` at `861d4557`.
    Tauri 2.11 auto-creates a tray from `app.trayIcon` (id `main`, icon, no menu);
    `tray::install` then builds a *second* one and never calls `.icon()`. The
    blank one carries the menu — which is exactly what the operator described.
-   — `tauri-2.11.2/src/app.rs:2412`, `agents/roomler-desktop/src/tray.rs:53`
+   — `tauri-2.11.2/src/app.rs:2412`, `agents/roomler-desktop/src/tray.rs:54`
 7. **One bug breaks most pages on macOS and Linux: `agent_exe_path()`.** It
    probes for a *sibling* `roomlerd`, then falls back to a bare name on `PATH`.
    On macOS the companion is `/Applications/Roomler.app/Contents/MacOS/`, the
@@ -94,7 +94,7 @@ Every line below was read on `origin/master` at `861d4557`.
    `Spawning self-update: No such file or directory (os error 2)` made this
    look like a second, independent macOS defect. It is not: `self_update_cmd`
    has queued the root `com.roomler.update` helper for a non-root macOS caller
-   since FR-5 (`main.rs:3370`), so the mechanism was already correct and
+   since FR-5 (`app.rs:3816`), so the mechanism was already correct and
    finding 7 alone accounts for the error. What WAS wrong is that
    `cmd_apply_update` spawned detached and discarded stdout, so the daemon's
    <!-- RETIRED-NAME-ANCHOR: quoting the daemon's OWN output; that log path is
@@ -107,17 +107,17 @@ Every line below was read on `origin/master` at `861d4557`.
 9. **`companion::refresh_if_stale` is Windows-only** and nothing reports the
    companion's version to the server, so "Update all" cannot tell anyone the
    desktop stayed behind. — `agents/roomlerd/src/companion.rs:115`
-10. **`roomler-desktop` is not shipped for Linux at all** (`scripts/install.sh:529`),
+10. **`roomler-desktop` is not shipped for Linux at all** (`scripts/install.sh:494`, at master `5c5a70767`),
     although it already *compiles* there — `cargo clippy --workspace` installs
     webkit2gtk and walks the crate. This is packaging, not porting.
-    — `.github/workflows/ci.yml:147`
+    — `.github/workflows/ci.yml:334`
 
 ### The on-screen panel
 
 11. **"Being viewed by X + Disconnect" is Windows-only**, gated on
     `all(target_os = "windows", feature = "viewer-indicator")`, with a no-op
     `Inner` on every other OS — and `viewer-indicator` is only in the `full-hw`
-    set, so the Linux and macOS release lines (`release-agent.yml:391, 621, 1922`)
+    set, so the Linux and macOS release lines (`release-agent.yml:400, 621, 1922`)
     build plain `full`. There is also no LocalAPI verb for live RC sessions, so
     no thin client can render a banner or offer a Disconnect.
 
@@ -163,10 +163,10 @@ Two things make the native backends much cheaper than they look, both verified
 against `Cargo.lock`: **`x11rb 0.13.2`, `objc2 0.6.4` and `objc2-app-kit 0.3.2`
 are already locked** (via enigo/arboard and tauri), so neither adds a new
 dependency tree; and the macOS daemon **already ships as an `.app` with
-`LSUIElement=true`** (`release-agent.yml:2457`), the bundle identity AppKit
+`LSUIElement=true`** (`release-agent.yml:2529`), the bundle identity AppKit
 windows require.
 
-⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/main.rs:690`
+⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/app.rs:741`
 is `#[tokio::main]`, so the main thread is parked in `block_on` for the daemon's
 whole life — the main dispatch queue never drains and AppKit can never deliver a
 click to an Approve button. The macOS arm has to build the runtime explicitly, run
@@ -315,7 +315,7 @@ in place of `Permission denied (os error 13)` for everything else.
 | 0 | FR + issue + ledger | n/a | **done** — the FR-24 collision was already repaired on master by #850 |
 | 1 | Consent correctness — owner override, local floor, timeout≠deny, `prompt_then_email`, `.pending` for exec+ssh, `roomlerd consent ls` | `prompt_owner` defaults to today's behaviour; the floor only tightens | **implemented** — timeout≠deny and `prompt_then_email` field-verified on 0.4.16, `.pending` for exec+ssh on 0.4.18, **the local floor on 2026-09-25** (AC4, WSL node, 0.4.102); `prompt_owner` still needs an owner-account run |
 | 2 | Desktop companion — one tray with an icon, daemon-path resolution, update-output surfacing, version honesty, `ensure_running()` | each item independent; no wire change | **implemented** (version honesty deferred to a follow-up) — field pending |
-| 3 | `PromptSurface` — 3.0 selection layer, 3.1 native Windows consent panel, 3.2 Tauri companion panels, 3.3 native X11, 3.4 native macOS | per-backend cargo feature; probe failure falls back to the companion | **all implemented** — field pending. ⚠️ `viewer-indicator-macos` is compiled by CI but deliberately **NOT in the macOS release feature set**: it moves tokio off the main thread, i.e. changes how every Mac agent STARTS, and macOS updates are owned by the root helper — a daemon that fails to start cannot pull its own fix. Enable only after a dispatch artifact runs on a real Mac. *FR-97 P2b (2026-10-21) ran that procedure on a tart Mac (both halves, a viewer from outside): the native panel came up, Approve connected and Deny declined, so the feature is in the macOS release set (`.github/workflows/release-agent.yml:2710`); the field Mac and a release follow* |
+| 3 | `PromptSurface` — 3.0 selection layer, 3.1 native Windows consent panel, 3.2 Tauri companion panels, 3.3 native X11, 3.4 native macOS | per-backend cargo feature; probe failure falls back to the companion | **all implemented** — field pending. ⚠️ `viewer-indicator-macos` is compiled by CI but deliberately **NOT in the macOS release feature set**: it moves tokio off the main thread, i.e. changes how every Mac agent STARTS, and macOS updates are owned by the root helper — a daemon that fails to start cannot pull its own fix. Enable only after a dispatch artifact runs on a real Mac. *FR-97 P2b (2026-10-21) ran that procedure on a tart Mac (both halves, a viewer from outside): the native panel came up, Approve connected and Deny declined, so the feature is in the macOS release set (`.github/workflows/release-agent.yml:2783`); the field Mac and a release follow* |
 | 4 | Linux packaging — a **separate** `roomler-desktop` .deb | absent package = today's behaviour | **implemented** — field pending |
 | 5 | Input arbitration — mode re-seed, visible floor requests, single-viewer rail, deterministic handover | none needed (bug fixes) | **implemented** — field pending |
 | 6 | Field test on the GROX fleet | n/a | **partly done, 2026-08-29 on 0.4.16** — the Windows native panel is verified end to end and the field log below lists exactly what is not. The test itself found 3 defects (#877), one of which froze the whole pre-0.4.16 Linux fleet |
@@ -426,7 +426,7 @@ Ticked only where a run is recorded in the field log below.
       2026-10-25.**
 - [x] `roomler-desktop` shows exactly one tray icon, with a menu — **Windows**,
       measured 2 → 1 against the 0.4.15 build. macOS/Linux untested.
-- [ ] macOS "Check for updates" and "Apply update" both work from the companion.
+- [x] macOS "Check for updates" and "Apply update" both work from the companion.
       **"Check for updates" verified — the Mac, 0.4.117, 2026-10-08**: the button
       runs `<daemon> self-update --check-only` (`cmd_check_update`, via
       `agent_exe_path`), replicated as the console user → `Up to date (current:
@@ -438,6 +438,13 @@ Ticked only where a run is recorded in the field log below.
       companion. The window is between a release publishing and the fleet roll:
       at the next release, leave one Mac out of the roll and click "Apply update"
       in its companion.)*
+      **"Apply update" verified — the operator's MacBook, 0.4.172 → 0.4.174,
+      2026-10-26 08:18Z**: his click in the companion woke the root update
+      helper, which verified and installed 0.4.174. The companion came back on
+      0.4.174, and both agent rows read 0.4.174 with `update_mode=self`. No push
+      reached the Mac during the run: neither the server's log nor either half's
+      log shows one. Two earlier tries were voided by a web "Update all" (see the
+      10-26 log entry).
 - [x] The Devices grid shows the companion version alongside the agent version.
       (Implemented in #877; deployed since API `v20260829-0d5078f44e42` + 0.4.18.)
       **Half met, 2026-09-25 on the live grid (API 0.4.101, 21 devices):** the
@@ -1260,3 +1267,36 @@ The cell was shut down gracefully (the service stops and the ephemeral device un
 | it clears | `auto_update` back to `true` (as found) and the marker removed (it was absent before). At the next start FR-117 repaired the skew in **2.5 s** (`from=0.4.169 to=0.4.170 restarted=1`). The agent row then read 0.4.170, and the grid carried no caption anywhere |
 
 The lab lock was held throughout and released after.
+
+### 2026-10-26 — "Apply update" from the companion on the operator's MacBook (0.4.172 → 0.4.174)
+
+**What this had to prove: that the button, and nothing else, moves the Mac.** On macOS the agents install nothing. Both halves only forward an `rc:agent.update` push to the root update helper's wake file (`agents/roomlerd/src/updater.rs:3095-3101`). The helper, `com.roomler.update`, also runs on its own 6-hour timer. So a push, the timer and the button all end in the same helper run, and the update log alone cannot tell them apart. The proof is that no push and no timer run happened.
+
+**Two tries were voided first, and why is the finding.**
+
+| release | what moved the Mac before the click | evidence |
+|---|---|---|
+| 0.4.171 | the web Devices page's "Update all", 10-25 19:33:11Z | server: `operator-triggered bulk agent self-update requested=21 delivered=15`. The Mac's root log: `rc:agent.update — operator-triggered self-update`, then the helper's install |
+| 0.4.172 | the same button, 41 s after the click was requested (22:39:14Z) | `requested=21 delivered=14`, then the same pair of lines on the Mac |
+
+Keeping one Mac out of the fleet roll is not enough. "Update all" sends an empty body, which means every device in the org, and anyone with the org's admin rights can press it.
+
+**The protection that worked, and why on macOS it is the marker and not `auto_update = false`.** `auto_update = false` stops a daemon's own updater, and its row reports `update_mode=off`, so the server refuses a push. But the helper reads only `/etc/roomler/disable-auto-update` (`updater.rs:3930`), so its own timer still installs. The marker stops every helper run, whatever woke it. The sequence:
+
+1. **Marker set**, 10-25 23:27Z. Overnight it stopped the helper's timer (05:28Z) and a third "Update all" (10-26 07:35:38Z), each logged as `auto-update opted out — exiting`.
+2. **The daemon restarted with the marker present**, 07:42:38Z. On macOS the per-user half is the daemon's supervised child, so one `launchctl kickstart -k system/com.roomler.daemon` restarts both. Both halves logged `auto-update opted out — the operator's marker is present, updates are manual` (#2901), and both agent rows read `update_mode=off`: the server now refuses every push to either.
+3. **Marker removed**, 08:16:31Z. From then on only a click could move the Mac, or the helper's own timer, which was next due about 13:36Z.
+
+**The run.**
+
+| when (UTC) | what | evidence |
+|---|---|---|
+| 08:17:55 | the operator opens the companion | `roomler-desktop starting version="0.4.172"` |
+| 08:18:16 | the helper verifies and installs | `.asc verified against the pinned release signing key`, `artifact self-identifies as the release it was offered as … claimed=agent-v0.4.174 artifact_version=0.4.174`, `installing … current=0.4.172 latest=agent-v0.4.174` |
+| 08:18:18 | the companion relaunches | `roomler-desktop starting version="0.4.174"` |
+| 08:18:21 | both halves restart on 0.4.174 | `agent starting version="0.4.174"`, then `auto-updater armed interval_h=4`: the marker is gone, so both are `self` again |
+| 08:18:22 | the helper finishes | `installed — postinstall re-bootstrapped the agent halves latest=agent-v0.4.174` |
+
+**No push.** Neither half logged an `rc:agent.update` between 08:16 and 08:19, and neither server pod logged an `operator-triggered … self-update` between 08:15 and 08:20. Both agent rows afterwards: `agent_version` 0.4.174, `companion_version` 0.4.174, `update_mode=self`. Nothing was left to restore.
+
+**Found on the way, fixed separately.** The text the button prints still named the log path from before FR-46 P5a, which does not exist on a migrated Mac. It now names `/var/log/roomler/update.log`: #2916, shipped in 0.4.172.

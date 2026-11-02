@@ -330,6 +330,43 @@ impl RemoteConfigServices {
                     applied.needs_restart.push("fps_deny");
                 }
             }
+            // FR-130 P1b — the colour-description switch, a tribool pushed as
+            // a word: `off` / `on` set it, a blank push clears it back to the
+            // built-in default (on). It reaches the encoders through the
+            // config fallbacks, registered once per process, hence
+            // `needs_restart`. A word this build cannot read leaves the key
+            // as it is and never fails the keys beside it; the server
+            // refuses such a word, so only another server could send one.
+            if let Some(want) = desired.color_description.as_deref() {
+                match roomler_ai_remote_control::models::parse_pushed_tribool(want) {
+                    Ok(next) => {
+                        if cfg.color_description != next {
+                            cfg.color_description = next;
+                            applied.needs_restart.push("color_description");
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "rc:agent.config — color_description left as it is"
+                    ),
+                }
+            }
+            // FR-132 P1 — the GPU-input denylist, FR-118's kill switch, the
+            // shape of the two above: a blank push clears it (deny nothing),
+            // `none` denies nothing, and an entry the gate cannot read denies
+            // nothing either (`cells::parse_denylist` keeps it, `is_denied`
+            // never matches it). The probe reads it once per process and the
+            // encoders through the config fallbacks, registered once per
+            // process, hence `needs_restart`.
+            if let Some(want) = desired.zero_copy_deny.as_deref() {
+                let next = Some(want.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                if cfg.zero_copy_deny != next {
+                    cfg.zero_copy_deny = next;
+                    applied.needs_restart.push("zero_copy_deny");
+                }
+            }
 
             if applied.is_noop() {
                 return Ok(applied);
@@ -521,6 +558,53 @@ mod tests {
         )
     }
 
+    /// FR-52 — a compromised server can put anything it likes in a frame, so
+    /// what stops an `external_*` key is THIS side: the frame's type cannot hold
+    /// one. The raw frame goes through the real decode and the real `apply`. The
+    /// key beside them lands, so a frame that was dropped whole cannot pass, and
+    /// gate 3 and every other `external_*` value stay as the owner left them.
+    #[tokio::test]
+    async fn a_pushed_external_key_never_reaches_the_device() {
+        let dir = std::env::temp_dir().join(format!("fr52-push-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        );
+        let frame = r#"{"t":"rc:agent.config","revision":9,"desired":{
+            "fps_deny":"hevc_qsv:120",
+            "external_access_enabled":true,
+            "external_access_setup":"fr52-pushed-marker",
+            "external_access_verifier":"fr52-pushed-marker",
+            "external_consent_mode":"auto",
+            "external_max_permissions":"VIEW | INPUT | FILES",
+            "external_added_next_year":true
+        }}"#;
+        let roomler_ai_remote_control::signaling::ServerMsg::ConfigPush { desired, .. } =
+            serde_json::from_str(frame).expect("an unknown key must not fail the frame")
+        else {
+            panic!("the frame decoded as something else");
+        };
+        let applied = svc.apply(&desired).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["fps_deny"]);
+        assert!(applied.live.is_empty());
+
+        let cfg = crate::config::load(&path).unwrap();
+        assert_eq!(cfg.fps_deny.as_deref(), Some("hevc_qsv:120"));
+        assert!(!cfg.external_access_enabled, "gate 3 is the owner's");
+        assert_eq!(cfg.external_access_setup, None);
+        assert_eq!(cfg.external_access_verifier, None);
+        assert_eq!(cfg.external_consent_mode, None);
+        assert_eq!(cfg.external_max_permissions, None);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("fr52-pushed-marker"), "{raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// FR-119 P2b — a pushed frame-rate denylist is written and reported as
     /// needing a restart; the same push again changes nothing; a blank push
     /// clears it.
@@ -547,6 +631,149 @@ mod tests {
         assert!(svc.apply(&push("hevc_qsv:120")).await.unwrap().is_noop());
         svc.apply(&push("")).await.unwrap();
         assert_eq!(crate::config::load(&path).unwrap().fps_deny, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-130 P1b — a pushed `color_description` is written and reported as
+    /// needing a restart, and the same push again changes nothing. Leaving
+    /// the key unmanaged keeps what the device has (it is not a revert); a
+    /// blank push is the revert, back to the built-in default; a word this
+    /// build cannot read leaves the key as it is and does not stop a key
+    /// beside it.
+    #[tokio::test]
+    async fn a_pushed_colour_description_is_written_and_a_blank_clears_it() {
+        let dir = std::env::temp_dir().join(format!("fr130-color-desc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        );
+        let push = |v: &str| DesiredConfig {
+            color_description: Some(v.to_string()),
+            ..Default::default()
+        };
+        let on_disk = || crate::config::load(&path).unwrap().color_description;
+        assert_eq!(on_disk(), None, "the fixture leaves the key unset");
+
+        let applied = svc.apply(&push("off")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["color_description"]);
+        assert!(applied.live.is_empty(), "read once per process: never live");
+        assert_eq!(on_disk(), Some(false));
+        assert!(svc.apply(&push("off")).await.unwrap().is_noop());
+
+        // Not managed: the device keeps its `off`.
+        assert!(
+            svc.apply(&DesiredConfig::default())
+                .await
+                .unwrap()
+                .is_noop()
+        );
+        assert_eq!(on_disk(), Some(false), "unmanaged is not a revert");
+
+        // A word it cannot read: the key stays, and the key beside it lands.
+        let mixed = DesiredConfig {
+            color_description: Some("maybe".into()),
+            fps_deny: Some("hevc_qsv:120".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            svc.apply(&mixed).await.unwrap().needs_restart,
+            vec!["fps_deny"]
+        );
+        assert_eq!(on_disk(), Some(false), "never guessed");
+
+        let applied = svc.apply(&push("on")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["color_description"]);
+        assert_eq!(on_disk(), Some(true));
+
+        // The revert: cleared, so the built-in default (on) decides again.
+        let applied = svc.apply(&push("")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["color_description"]);
+        assert_eq!(on_disk(), None);
+        assert!(svc.apply(&push("")).await.unwrap().is_noop());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-132 P1 — a pushed GPU-input denylist is written and reported as
+    /// needing a restart, the same push again changes nothing, an unmanaged
+    /// key is left alone, and a blank push clears it. And it reaches the gate:
+    /// the restarted daemon's config fallbacks carry it as
+    /// `ROOMLERD_ZERO_COPY_DENY`, which parses to the exact `name:gpu` entry
+    /// `gpu_hint::is_denied` matches — the step AC2's field read takes after
+    /// the restart (`input_reason=denied`).
+    #[tokio::test]
+    async fn a_pushed_gpu_input_denylist_is_written_reaches_the_gate_and_a_blank_clears_it() {
+        let dir = std::env::temp_dir().join(format!("fr132-zc-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        );
+        let push = |v: &str| DesiredConfig {
+            zero_copy_deny: Some(v.to_string()),
+            ..Default::default()
+        };
+        let on_disk = || crate::config::load(&path).unwrap().zero_copy_deny;
+        assert_eq!(on_disk(), None, "the fixture denies nothing");
+
+        let applied = svc
+            .apply(&push(" hevc_qsv:gpu, av1_nvenc:gpu "))
+            .await
+            .unwrap();
+        assert_eq!(applied.needs_restart, vec!["zero_copy_deny"]);
+        assert!(applied.live.is_empty(), "read once per process: never live");
+        assert_eq!(on_disk().as_deref(), Some("hevc_qsv:gpu, av1_nvenc:gpu"));
+        assert!(
+            svc.apply(&push("hevc_qsv:gpu, av1_nvenc:gpu"))
+                .await
+                .unwrap()
+                .is_noop()
+        );
+
+        // What the next process reads: the fallback, then the gate's parse.
+        let restarted = crate::config::load(&path).unwrap();
+        let fallbacks = crate::config::env_fallbacks(&restarted);
+        let raw = fallbacks
+            .get("ZERO_COPY_DENY")
+            .expect("the pushed denylist rides the config fallbacks");
+        let deny = crate::encode::cells::parse_denylist(raw);
+        assert!(deny.iter().any(|d| d == "hevc_qsv:gpu"), "{deny:?}");
+        assert!(deny.iter().any(|d| d == "av1_nvenc:gpu"), "{deny:?}");
+        #[cfg(feature = "ffmpeg-encoder")]
+        {
+            use crate::encode::ffmpeg::gpu_hint::is_denied;
+            assert!(is_denied(&deny, "hevc_qsv") && is_denied(&deny, "av1_nvenc"));
+            assert!(!is_denied(&deny, "h264_qsv"), "only the named cells");
+        }
+
+        // Not managed: the device keeps its list.
+        assert!(
+            svc.apply(&DesiredConfig::default())
+                .await
+                .unwrap()
+                .is_noop()
+        );
+        assert_eq!(on_disk().as_deref(), Some("hevc_qsv:gpu, av1_nvenc:gpu"));
+
+        // `none` is stored as written (the gate reads it as deny nothing)...
+        let applied = svc.apply(&push("none")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["zero_copy_deny"]);
+        assert_eq!(on_disk().as_deref(), Some("none"));
+        assert!(crate::encode::cells::parse_denylist("none").is_empty());
+
+        // ...and a blank clears the key.
+        let applied = svc.apply(&push("  ")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["zero_copy_deny"]);
+        assert_eq!(on_disk(), None);
+        assert!(svc.apply(&push("")).await.unwrap().is_noop());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

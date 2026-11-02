@@ -200,6 +200,13 @@ pub async fn forward_media_cmd(
     } else {
         roomler_core::cluster::bus::RPC_DEADLINE
     };
+    // FR-127 P1 — a forwarded `media:view` is BEST-EFFORT. The report is
+    // idempotent and the next one (a tile change, the client's periodic
+    // re-send) heals a lost one, so a bus hiccup must neither tell the viewer
+    // the conference broke nor prune a LIVE owner's claim — which the
+    // deadline branch below does for every other command, and which a viewer
+    // scrolling on the non-owner pod would otherwise trip on every report.
+    let best_effort = msg_type == "media:view";
     match bus
         .request_with_deadline(owner_pod, "media.cmd", body.clone(), deadline)
         .await
@@ -210,6 +217,10 @@ pub async fn forward_media_cmd(
         Err(BusError::Nack(reason)) if reason.starts_with("not_owner:") => {
             let next = reason.trim_start_matches("not_owner:").to_string();
             if next.is_empty() || next == owner_pod {
+                if best_effort {
+                    debug!(%owner_pod, "media:view forward: owner moved, report dropped");
+                    return false;
+                }
                 media_error(state, connection_id, "Conference moved — please rejoin").await;
                 return false;
             }
@@ -220,18 +231,29 @@ pub async fn forward_media_cmd(
                 Ok(_) => true,
                 Err(e) => {
                     debug!(%e, "media.cmd retry toward re-declared owner failed");
-                    media_error(state, connection_id, "Conference moved — please rejoin").await;
+                    if !best_effort {
+                        media_error(state, connection_id, "Conference moved — please rejoin").await;
+                    }
                     false
                 }
             }
         }
         Err(BusError::Nack(reason)) => {
+            if best_effort {
+                debug!(%owner_pod, %reason, "media:view forward refused, report dropped");
+                return false;
+            }
             media_error(state, connection_id, &format!("Conference error: {reason}")).await;
             false
         }
         // Deadline/Redis — the owner is presumed dead: prune the record
         // we acted on (compare-DEL against what we observed) so the next
-        // join re-claims on a live pod.
+        // join re-claims on a live pod. Never for a view: a dropped report
+        // is no evidence that the owner is dead.
+        Err(e) if best_effort => {
+            debug!(%owner_pod, %e, "media:view forward failed, report dropped (no prune)");
+            false
+        }
         Err(e) => {
             warn!(%owner_pod, %e, "media.cmd RPC failed — pruning presumed-dead owner record");
             prune_owner_record(state, connection_id, user_id, msg_type, data, owner_pod).await

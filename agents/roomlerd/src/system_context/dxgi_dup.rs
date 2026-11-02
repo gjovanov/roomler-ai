@@ -60,7 +60,8 @@
 //!   capture pump in `peer.rs` (or the SYSTEM-context-mode variant
 //!   of it that the supervisor wires up).
 //! * No GDI fallback — that's [`super::gdi_backend`] (TODO).
-//! * No frame timing / cadence — same; the capture pump owns it.
+//! * No frame pacing: this backend asks scrap, which never waits. The capture
+//!   pump's worker floors an empty for a pump that opted in (#3272).
 
 #![cfg(target_os = "windows")]
 
@@ -103,6 +104,16 @@ pub enum BackendBail {
     /// error and falls through to the GDI BitBlt backend; if that
     /// also fails, the supervisor tears down.
     HardError(io::Error),
+    /// #3272 — an open only: `DuplicateOutput` answered `E_INVALIDARG`. The
+    /// documented reasons are that this process is already duplicating the
+    /// output, or that the device is on the wrong adapter. The direct backend
+    /// binds the adapter that owns the output, so in the field it means the
+    /// first: the capture of a session that is ending, whose thread lets go
+    /// within one in-flight capture, or a second viewer that really does hold
+    /// it. A paced open waits a moment first; then, and at once for any other
+    /// open, it tries scrap and GDI as it always did. Typed at that call site
+    /// alone, because `E_INVALIDARG` means what it says everywhere else.
+    SeatBusy,
 }
 
 impl BackendBail {
@@ -153,8 +164,9 @@ impl BackendBail {
 /// to recompute.
 #[cfg(feature = "scrap-capture")]
 pub struct DxgiFrame {
-    /// BGRA8 pixel data, length `width * height * 4`.
-    pub bytes: Vec<u8>,
+    /// BGRA8 pixels, `width * height * 4` bytes in memory, or (FR-118 P2) a
+    /// texture on the capture device.
+    pub data: crate::capture::FrameData,
     pub width: u32,
     pub height: u32,
     /// Bytes per row. Always `width * 4` on the DXGI path; carried
@@ -169,6 +181,10 @@ pub struct DxgiFrame {
     /// Phase B — native dims when the backend GPU-scaled before the
     /// readback; `None` = the frame is native-sized.
     pub source: Option<(u32, u32)>,
+    /// FR-118 P0 — how long this frame's copy of the desktop surface into
+    /// CPU memory took, in microseconds. The adapter-bound direct backend
+    /// times it; `None` from the scrap-wrapped one, which copies inside scrap.
+    pub readback_us: Option<u64>,
 }
 
 /// Uniform interface over the two DXGI Desktop Duplication backends —
@@ -180,13 +196,18 @@ pub struct DxgiFrame {
 /// [`DxgiFrame`]; the direct backend additionally needs `mf-encoder`.
 #[cfg(feature = "scrap-capture")]
 pub trait DxgiCapture {
-    /// Acquire one frame (non-blocking). `BackendBail::Transient` on a
-    /// static desktop (no new frame this tick). Phase B — `output_cap`
-    /// is the pump's effective encode box: a GPU-capable backend MAY
-    /// scale to it before the CPU readback (delivering `source` = native
-    /// dims + damage in scaled coords); backends without a GPU path
-    /// ignore it and deliver native.
-    fn frame(&mut self, output_cap: Option<(u32, u32)>) -> Result<DxgiFrame, BackendBail>;
+    /// Acquire one frame. `BackendBail::Transient` on a static desktop (no
+    /// new frame this tick). Phase B — `output_cap` is the pump's effective
+    /// encode box: a GPU-capable backend MAY scale to it before the CPU
+    /// readback (delivering `source` = native dims + damage in scaled
+    /// coords); backends without a GPU path ignore it and deliver native.
+    /// #3272 — `wait_ms` is how long a backend that can wait for the frame
+    /// may do so. 0 asks and returns; a backend that cannot wait ignores it.
+    fn frame(
+        &mut self,
+        output_cap: Option<(u32, u32)>,
+        wait_ms: u32,
+    ) -> Result<DxgiFrame, BackendBail>;
     /// Drop + recreate the duplication after `AccessLost`.
     fn reset(&mut self) -> Result<(), BackendBail>;
     /// Capture dimensions in pixels.
@@ -255,7 +276,8 @@ impl DxgiDupBackend {
     /// Try to acquire one frame. Synchronous; the scrap wrapper
     /// passes `MILLISECONDS_PER_FRAME=0` so this is non-blocking
     /// (returns `WouldBlock` immediately if no new frame is
-    /// available). The capture pump owns timing.
+    /// available). It cannot wait, so the capture pump's worker floors
+    /// its empties for a pump that opted in (#3272).
     pub fn frame(&mut self) -> Result<DxgiFrame, BackendBail> {
         match self.capturer.frame() {
             Ok(buf) => {
@@ -270,12 +292,13 @@ impl DxgiDupBackend {
                 }
                 let bytes = buf[..expected].to_vec();
                 Ok(DxgiFrame {
-                    bytes,
+                    data: bytes.into(),
                     width: self.width,
                     height: self.height,
                     stride,
                     damage: crate::capture::Damage::Unknown,
                     source: None,
+                    readback_us: None,
                 })
             }
             Err(e) => Err(BackendBail::from_io(e)),
@@ -302,8 +325,13 @@ impl DxgiCapture for DxgiDupBackend {
     // Inherent methods win method resolution, so these delegate without
     // recursing. Kept as a thin shim so the capture pump can box this
     // backend behind `dyn DxgiCapture` alongside the adapter-bound one.
-    fn frame(&mut self, _output_cap: Option<(u32, u32)>) -> Result<DxgiFrame, BackendBail> {
-        // scrap owns the readback — no GPU-scale hook here.
+    fn frame(
+        &mut self,
+        _output_cap: Option<(u32, u32)>,
+        _wait_ms: u32,
+    ) -> Result<DxgiFrame, BackendBail> {
+        // scrap owns the readback — no GPU-scale hook here. And its acquire
+        // takes a fixed 0, so the wait falls to the worker's floor.
         DxgiDupBackend::frame(self)
     }
     fn reset(&mut self) -> Result<(), BackendBail> {
@@ -411,6 +439,7 @@ mod tests {
         assert!(!BackendBail::AccessLost.is_retryable_without_reset());
         assert!(!BackendBail::SessionGone.is_retryable_without_reset());
         assert!(!BackendBail::HardError(io::Error::other("x")).is_retryable_without_reset());
+        assert!(!BackendBail::SeatBusy.is_retryable_without_reset());
     }
 
     #[test]
@@ -429,6 +458,8 @@ mod tests {
         assert!(!BackendBail::AccessLost.is_terminal());
         assert!(BackendBail::SessionGone.is_terminal());
         assert!(BackendBail::HardError(io::Error::other("x")).is_terminal());
+        // An open that has to wait its turn, not a dead host.
+        assert!(!BackendBail::SeatBusy.is_terminal());
     }
 
     #[cfg(feature = "scrap-capture")]

@@ -12,8 +12,8 @@ docs/fr/FR-106-devices-say-when-not-updating.md	ui/src/components/admin/AgentsSe
 docs/fr/FR-40-overlay-key-rotation.md	ui/src/components/admin/AgentsSection.vue:1918-1906
 docs/fr/FR-40-overlay-key-rotation.md	ui/src/stores/agents.ts:749-704
 docs/fr/FR-43-macos-single-enrollment.md	crates/localapi/src/lib.rs:1966-1875
-docs/fr/FR-49-second-org-has-no-mesh.md	agents/roomlerd/src/main.rs:1791-1731
-docs/linux-capture.md	main.rs:3498-3486
+docs/fr/FR-49-second-org-has-no-mesh.md	agents/roomlerd/src/app.rs:1791-1731
+docs/linux-capture.md	app.rs:3498-3486
 docs/overlay-key-rotation.md	agents/roomlerd/src/remote_config.rs:346-245
 docs/overlay-key-rotation.md	agents/roomlerd/src/remote_config.rs:346-245
 docs/overlay-key-rotation.md	config_surface.rs:1096-1069

@@ -40,6 +40,31 @@ impl Frame {
     pub fn bytes_per_row(&self) -> usize {
         self.bytes_per_row
     }
+
+    /// ROOMLER PATCH: hand the surface itself to the caller, for a consumer
+    /// that reads it on the GPU (roomler's FR-118 P5: VideoToolbox takes the
+    /// IOSurface as a `CVPixelBuffer`, with no copy into memory).
+    ///
+    /// The CPU lock taken in `new` is released here, because nothing reads
+    /// the bytes through this frame any more. The retain and the use count
+    /// `new` took pass to the caller, which must give both back:
+    /// `IOSurfaceDecrementUseCount`, then `CFRelease`. The use count is what
+    /// keeps `CGDisplayStream` from drawing the next frame into a surface a
+    /// consumer still holds.
+    pub fn into_surface(self) -> IOSurfaceRef {
+        let surface = self.surface;
+        unsafe {
+            IOSurfaceUnlock(
+                surface,
+                SURFACE_LOCK_READ_ONLY,
+                ptr::null_mut()
+            );
+        }
+        // `Drop` would unlock a second time and give back what the caller
+        // now owns.
+        std::mem::forget(self);
+        surface
+    }
 }
 
 impl ops::Deref for Frame {

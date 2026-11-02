@@ -163,6 +163,112 @@
     show(el);
   }
 
+  /* ── Updates: one check, from the button or the tray (#2936) ─────── */
+
+  let checking = false;
+
+  // A check that answers in 200 ms looked like no check at all: "Up to date"
+  // was simply there (field 2026-10-26, on a Mac). The "Checking…" state stays
+  // up at least this long, and the answer carries the time it was asked.
+  const MIN_CHECKING_MS = 700;
+
+  function checkedAt() {
+    return 'Checked at ' + new Date().toLocaleTimeString() + '.';
+  }
+
+  // The one update check, for the card's button and the tray's menu item
+  // alike. A stale "Install update" from an earlier check is hidden first;
+  // a second click while a check runs is ignored. `reveal` (the tray) brings
+  // the card into view again when the answer lands: the cards above may have
+  // grown while it ran.
+  async function runUpdateCheck({ reveal = false } = {}) {
+    if (checking) return;
+    checking = true;
+    const btn = $('btn-check-update');
+    if (btn) btn.disabled = true;
+    hide($('btn-apply-update'));
+    pushOutput('Checking for updates…');
+    const started = Date.now();
+    let text;
+    let available = false;
+    try {
+      const out = String(await invoke('cmd_check_update'));
+      available = out.toLowerCase().includes('update available');
+      text = out;
+    } catch (e) {
+      text = 'Error: ' + e;
+    }
+    const wait = MIN_CHECKING_MS - (Date.now() - started);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    pushOutput(text + '\n' + checkedAt());
+    if (available) show($('btn-apply-update'));
+    if (btn) btn.disabled = false;
+    checking = false;
+    if (reveal) scrollToUpdates();
+  }
+
+  // Bring the Updates card to the top of the content pane (`#content` scrolls,
+  // the body does not). INSTANT on purpose: a smooth scroll is driven by
+  // animation frames, and a page whose window is still coming up gets none.
+  // On macOS 0.4.177's smooth scroll never happened (field 2026-10-26).
+  function scrollToUpdates() {
+    const card = $('ov-updates');
+    if (card) card.scrollIntoView({ block: 'start' });
+  }
+
+  // Draw the eye to the card the tray just opened.
+  function flashUpdates() {
+    const card = $('ov-updates');
+    if (!card) return;
+    card.classList.remove('flash');
+    void card.offsetWidth; // restart the animation on a second click
+    card.classList.add('flash');
+    setTimeout(() => card.classList.remove('flash'), 1600);
+  }
+
+  // The last card of Overview, so a tray click that only switched views left
+  // the answer below the fold. When the view must change first, this runs
+  // once app.js has unhidden it (it announces the view after unhiding). A page
+  // that is not visible yet (the tray shows the window and runs this at once)
+  // is placed again the moment it becomes visible.
+  function revealUpdates() {
+    const reveal = () => {
+      scrollToUpdates();
+      flashUpdates();
+      if (document.visibilityState === 'visible') return;
+      const onVisible = () => {
+        if (document.visibilityState !== 'visible') return;
+        document.removeEventListener('visibilitychange', onVisible);
+        scrollToUpdates();
+      };
+      document.addEventListener('visibilitychange', onVisible);
+    };
+    const section = $('view-overview');
+    if (currentView() === 'overview' && section && !section.hidden) {
+      reveal();
+      return;
+    }
+    const onView = (ev) => {
+      if (ev.detail !== 'overview') return;
+      document.removeEventListener('roomler:view', onView);
+      reveal();
+    };
+    document.addEventListener('roomler:view', onView);
+    navigate('overview');
+  }
+
+  // The tray's "Check for Updates" (tray.rs): it shows the window, raises the
+  // pending flag and fires the event. One click does it all here.
+  function trayCheckUpdate() {
+    window.__roomler_tray_check_pending = false;
+    // The check first: it puts "Checking for updates…" in the card before its
+    // first await, so the scroll below already sees the card at that height
+    // (scrolled the other way round, its last line sat below the pane).
+    const running = runUpdateCheck({ reveal: true });
+    revealUpdates();
+    void running;
+  }
+
   /* ── FR-84 D4: what this device can encode ─────────────────────────
    *
    * `cmd_encoder_caps` reads the service's CACHED probe; the service probes
@@ -564,7 +670,41 @@
     const inputRow = $('ov-perm-input');
     if (screenRow) screenRow.hidden = p.screen_recording;
     if (inputRow) inputRow.hidden = p.accessibility;
+    // #3164 — Screen Recording reaches a freshly started agent only, so its
+    // row comes with the restart that applies it. Accessibility is live.
+    const restartRow = $('ov-perm-restart');
+    if (restartRow) restartRow.hidden = p.screen_recording;
     show(banner);
+  }
+
+  /*
+   * #3164 — the restart a Screen Recording grant needs, through the app's one
+   * restart flow (settings.js, `window.Roomler.restartDaemon`: LocalAPI
+   * `RestartDaemon`, the agent's own supervisor relaunches it, no crash
+   * counted). Before this the card said "restart the agent" with no way to,
+   * and the one way macOS offers, Quit & Reopen, left an agent that predates
+   * #3164 offline. A refusal is shown verbatim.
+   */
+  let permRestarting = false;
+  async function restartForPermissions(btn) {
+    const R = window.Roomler || {};
+    if (permRestarting || typeof R.restartDaemon !== 'function') return;
+    permRestarting = true;
+    btn.disabled = true;
+    const out = $('ov-perm-restart-result');
+    const say = (text) => {
+      if (!out) return;
+      out.textContent = text || '';
+      out.hidden = !text;
+    };
+    try {
+      const r = await R.restartDaemon('macOS permissions: Screen Recording applies after a restart', say);
+      say(r.ok ? 'roomlerd restarted.' : r.message);
+      await refreshPermissions();
+    } finally {
+      permRestarting = false;
+      btn.disabled = false;
+    }
   }
 
   document.addEventListener('DOMContentLoaded', () => {
@@ -621,6 +761,10 @@
         }
       });
     }
+    const permRestart = $('ov-btn-perm-restart');
+    if (permRestart) {
+      permRestart.addEventListener('click', () => void restartForPermissions(permRestart));
+    }
 
     $('ov-btn-onboard').addEventListener('click', () => navigate('onboarding'));
     $('ov-attention-reenroll').addEventListener('click', () => navigate('onboarding'));
@@ -634,18 +778,7 @@
       }
     });
 
-    $('btn-check-update').addEventListener('click', async () => {
-      pushOutput('Checking for updates…');
-      try {
-        const out = await invoke('cmd_check_update');
-        pushOutput(out);
-        if (out.toLowerCase().includes('update available')) {
-          show($('btn-apply-update'));
-        }
-      } catch (e) {
-        pushOutput('Error: ' + e);
-      }
-    });
+    $('btn-check-update').addEventListener('click', () => void runUpdateCheck());
 
     $('btn-apply-update').addEventListener('click', async () => {
       pushOutput('Applying update…');
@@ -661,18 +794,10 @@
       }
     });
 
-    // Tray's "Check for Updates" menu item evals a global + dispatches this
-    // event (tray.rs) — surface the result where it's visible.
-    window.addEventListener('roomler-update-check', () => {
-      const r = window.__roomler_check_update_result;
-      if (r && r.check) {
-        navigate('overview');
-        pushOutput(r.check);
-        if (r.check.toLowerCase().includes('update available')) {
-          show($('btn-apply-update'));
-        }
-      }
-    });
+    // #2936 — the tray's "Check for Updates" (tray.rs fires this by name).
+    // A click that landed before this script listened left the flag up.
+    window.addEventListener('roomler-tray-check-update', trayCheckUpdate);
+    if (window.__roomler_tray_check_pending) trayCheckUpdate();
 
     // tunnels.js broadcasts its route list; the overview only needs the count.
     document.addEventListener('roomler:routes', (ev) => {

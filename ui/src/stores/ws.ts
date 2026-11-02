@@ -12,6 +12,7 @@ import { useTenantStore } from './tenant'
 import { useOrgBadgesStore } from './orgBadges'
 import { useAgentStore } from './agents'
 import { useDeviceStore } from './devices'
+import type { SleepView } from '@/utils/devicePresence'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { callEndedByPlanMessage, callEndingSoonMessage } from '@/utils/meetingCap'
 
@@ -305,7 +306,14 @@ export const useWsStore = defineStore('ws', () => {
         // as belt).
         const dp = msg.data as {
           tenant_id?: string
-          agents?: Array<{ agent_id: string; name: string; presence: 'online' | 'stale' | 'offline' }>
+          // FR-55 P4 — `sleep` rides an offline row whose device announced
+          // a sleep (`crates/modules/fleet/src/presence.rs`).
+          agents?: Array<{
+            agent_id: string
+            name: string
+            presence: 'online' | 'stale' | 'offline'
+            sleep?: SleepView
+          }>
         }
         if (!dp.tenant_id || !dp.agents?.length) break
         if (dp.tenant_id === useTenantStore().current?.id) {

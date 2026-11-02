@@ -63,7 +63,7 @@ sequenceDiagram
 - ⚠️ **Both frames are gated at both ends.** An older agent cannot parse them. The agent advertises
   `mouse-rel` in `AgentCaps.input` only where its injector carries relative motion
   ([`mod.rs:185`](../agents/roomlerd/src/input/mod.rs#L185) `advertises_mouse_rel`, appended at every
-  announcement, [`signaling.rs:7167`](../agents/roomlerd/src/signaling.rs#L7167)). The viewer offers the
+  announcement, [`signaling.rs:7329`](../agents/roomlerd/src/signaling.rs#L7329)). The viewer offers the
   control only to an agent that says so, matched by equality
   ([`relativeMouse.ts:17`](../ui/src/composables/relativeMouse.ts#L17) `agentSupportsRelativeMouse`).
 
@@ -140,18 +140,18 @@ each absolute move as a large jump. In relative mode the same probe read the del
 ## The viewer
 
 - **The control** is a toolbar button, shown only for an agent that advertises `mouse-rel`
-  ([`RemoteControl.vue:3510`](../ui/src/views/remote/RemoteControl.vue#L3510) `relativeMouseOffered`).
+  ([`RemoteControl.vue:3757`](../ui/src/views/remote/RemoteControl.vue#L3757) `relativeMouseOffered`).
   Pointer Lock needs a user gesture, and the click is one.
 - **Entering** asks for raw, unaccelerated deltas (`unadjustedMovement`). A browser that rejects the option
-  gets plain Pointer Lock ([`useRemoteControl.ts:6533`](../ui/src/composables/useRemoteControl.ts#L6533)
+  gets plain Pointer Lock ([`useRemoteControl.ts:6999`](../ui/src/composables/useRemoteControl.ts#L6999)
   `enterRelativeMouse`).
 - **While locked**, every pointer move is a delta into the accumulator
-  ([`useRemoteControl.ts:11038`](../ui/src/composables/useRemoteControl.ts#L11038)), and a hint at the
+  ([`useRemoteControl.ts:11687`](../ui/src/composables/useRemoteControl.ts#L11687)), and a hint at the
   bottom of the picture says how to get the pointer back.
 - **Leaving** is Esc, the browser's own rule. Under Keyboard Lock in fullscreen, Esc reaches the host, so
   the browser wants it held, and the hint says so. Leaving sends the motion still gathered and lets go of
   any held button where the pointer is, before moves turn absolute again
-  ([`useRemoteControl.ts:11952`](../ui/src/composables/useRemoteControl.ts#L11952)). An absolute button-up
+  ([`useRemoteControl.ts:12608`](../ui/src/composables/useRemoteControl.ts#L12608)). An absolute button-up
   there would throw the host's cursor to an old position.
 - A blur or a hidden tab releases held buttons with `mouse_release` in relative mode, never with a
   position.
@@ -175,15 +175,15 @@ stateDiagram-v2
 ```
 
 - **The click that switches is the gesture, not input**
-  ([`useRemoteControl.ts:11101`](../ui/src/composables/useRemoteControl.ts#L11101)). Forwarded as an
+  ([`useRemoteControl.ts:11750`](../ui/src/composables/useRemoteControl.ts#L11750)). Forwarded as an
   absolute press, it would first jump the captured pointer to where the click happened. Its button-up is
   swallowed too.
 - **The cursor coming back** is the next `cursor:pos` after a `cursor:hide`, not `cursor:shape`, which
-  arrives only when the shape changes ([`useRemoteControl.ts:6554`](../ui/src/composables/useRemoteControl.ts#L6554)
+  arrives only when the shape changes ([`useRemoteControl.ts:7020`](../ui/src/composables/useRemoteControl.ts#L7020)
   `onHostCursorShown`). It ends a lock the auto-switch took. A lock the person took from the toolbar stays
   theirs until Esc.
 - **Esc while the cursor stays hidden** leaves relative mode and holds it off until the cursor shows again
-  ([`useRemoteControl.ts:11966`](../ui/src/composables/useRemoteControl.ts#L11966)). Otherwise a host that
+  ([`useRemoteControl.ts:12622`](../ui/src/composables/useRemoteControl.ts#L12622)). Otherwise a host that
   keeps its cursor hidden, fullscreen video for one, would trap the person on every click.
 - ⚠️ **Never while the host is locked.** The lock screen hides the cursor too
   ([`relativeMouse.ts:108`](../ui/src/composables/relativeMouse.ts#L108) `shouldAutoEnterRelative`
@@ -191,7 +191,7 @@ stateDiagram-v2
   and then hidden on a locked Windows host, the click stayed a click; unlocked through the viewer in the
   same session, the same click entered relative mode.
 - ⚠️ **Only after this host has reported its pointer** on the channel, a `cursor:pos` or `cursor:shape`
-  ([`useRemoteControl.ts:6488`](../ui/src/composables/useRemoteControl.ts#L6488) `hostCursorTracked`). A
+  ([`useRemoteControl.ts:6954`](../ui/src/composables/useRemoteControl.ts#L6954) `hostCursorTracked`). A
   tracker that sees no pointer (a Linux host without DRM capture, macOS) sends one `cursor:hide` when the
   channel opens and nothing after it. Those Linux hosts advertise `mouse-rel` since P2, so without this rule
   their first click would take the pointer. The price is small: a Windows session that starts with the
@@ -220,7 +220,7 @@ person's.
 
 - It never reads input on the host. The agent only injects; there is no hook and no raw-input reader in
   `roomlerd` (FR-92's rule). A unit test scans the relative-mouse code for any of them
-  ([`input/mod.rs:853`](../agents/roomlerd/src/input/mod.rs#L853) `fr109_relative_mouse_reads_no_input`).
+  ([`input/mod.rs:868`](../agents/roomlerd/src/input/mod.rs#L868) `fr109_relative_mouse_reads_no_input`).
 - No ghost cursor in relative mode: other viewers see the host's own cursor in the picture.
 - The host's pointer speed and acceleration settings are not changed.
 - Not measured on macOS: an app that reads the GameController framework (`GCMouse`). It reads the mouse

@@ -63,6 +63,9 @@ pub mod synthetic_backend;
 /// slot-first (look, and pace only a source that outruns the target).
 pub mod gate;
 
+/// #3272 — the pump's side of [`ScreenCapture::next_frame`]'s contract.
+pub mod pace;
+
 /// FR-119 P2b-3 — the captured display's refresh rate, per OS.
 pub mod refresh;
 
@@ -70,11 +73,45 @@ pub mod refresh;
 /// the synthetic source and `roomlerd probe-target` paint and the viewer reads.
 pub mod bench_marker;
 
+/// FR-16 L1 — the synthetic source's painter and the motion profiles, in every
+/// build: the encoder bench paints them on release builds.
+pub mod synthetic_scene;
+
 pub mod cursor;
 
 /// FR-85 P1d — the mouse pointer in a recording: whether each backend draws
 /// it into the frame, and where it is when the recorder has to draw it.
 pub mod pointer;
+
+/// FR-118 P2 — a frame that stays on the GPU: a texture on the capture's device.
+#[cfg(all(
+    target_os = "windows",
+    any(feature = "mf-encoder", feature = "wgc-capture")
+))]
+pub mod gpu_frame;
+
+/// FR-118 P5 — a frame that stays on the GPU on macOS: the IOSurface the
+/// display stream delivered.
+#[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+pub mod iosurface_frame;
+
+/// FR-118 — the kill switch for GPU-resident frames, on every platform:
+/// `ROOMLERD_ZERO_COPY` (config `zero_copy`), default OFF. A capture backend
+/// reads it once, when it opens, and delivers GPU frames only while it is on.
+pub fn zero_copy_enabled() -> bool {
+    zero_copy_from(tunnel_core::env::node_env("ZERO_COPY").as_deref())
+}
+
+/// `1`, `true`, `yes` or `on`, in any case, turn it on; anything else leaves
+/// it off.
+fn zero_copy_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        let v = v.trim();
+        ["1", "true", "yes", "on"]
+            .iter()
+            .any(|on| v.eq_ignore_ascii_case(on))
+    })
+}
 
 /// A captured frame, in an encoder-agnostic representation.
 ///
@@ -87,7 +124,9 @@ pub struct Frame {
     pub height: u32,
     pub stride: u32,
     pub pixel_format: PixelFormat,
-    pub data: Vec<u8>,
+    /// FR-118 P1 — the pixels, where they live. Read them through
+    /// [`Frame::cpu`].
+    pub data: FrameData,
     pub monotonic_us: u64,
     /// Screen index that produced this frame. Matches `DisplayInfo::index`
     /// in the `rc:agent.hello` message.
@@ -116,6 +155,81 @@ impl Frame {
     /// unless a downscale recorded the pre-scale size in `source`.
     pub fn native_dims(&self) -> (u32, u32) {
         self.source.unwrap_or((self.width, self.height))
+    }
+
+    /// FR-118 P1 — the frame's bytes in CPU memory, laid out as
+    /// `pixel_format` with `stride` bytes per row. Every consumer that does
+    /// not take a GPU surface reads the pixels here. A GPU frame reads them
+    /// back on the first call and keeps them.
+    pub fn cpu(&self) -> &[u8] {
+        match &self.data {
+            FrameData::Cpu(bytes) => bytes,
+            #[cfg(all(
+                target_os = "windows",
+                any(feature = "mf-encoder", feature = "wgc-capture")
+            ))]
+            FrameData::Gpu(gpu) => gpu.cpu(),
+            #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+            FrameData::IoSurface(surface) => surface.cpu(),
+        }
+    }
+
+    /// FR-118 P1 — the bytes, to change in place: the recorder draws the
+    /// pointer into a frame, and tests paint one. A GPU frame becomes a CPU
+    /// frame first: a consumer that changes pixels needs them in memory.
+    pub fn cpu_mut(&mut self) -> &mut Vec<u8> {
+        #[cfg(all(
+            target_os = "windows",
+            any(feature = "mf-encoder", feature = "wgc-capture")
+        ))]
+        if let FrameData::Gpu(gpu) = &self.data {
+            self.data = FrameData::Cpu(gpu.cpu().to_vec());
+        }
+        #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+        if let FrameData::IoSurface(surface) = &self.data {
+            self.data = FrameData::Cpu(surface.cpu().to_vec());
+        }
+        match &mut self.data {
+            FrameData::Cpu(bytes) => bytes,
+            #[cfg(all(
+                target_os = "windows",
+                any(feature = "mf-encoder", feature = "wgc-capture")
+            ))]
+            FrameData::Gpu(_) => unreachable!("a GPU frame was replaced by its bytes just above"),
+            #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+            FrameData::IoSurface(_) => {
+                unreachable!("an IOSurface frame was replaced by its bytes just above")
+            }
+        }
+    }
+}
+
+/// FR-118 P1 (C0) — where a frame's pixels live.
+///
+/// The GPU forms arrive with their cells (FR-118 §4.1): the D3D11 texture
+/// first (P2), an IOSurface and a dma-buf later. A consumer that has not
+/// moved keeps reading through [`Frame::cpu`].
+/// ⚠️ Each accessor matches this enum without a wildcard, so a new variant
+/// fails to compile until every one of them handles it.
+#[derive(Clone)]
+pub enum FrameData {
+    /// In system memory.
+    Cpu(Vec<u8>),
+    /// FR-118 P2 — a BGRA texture on the capture's D3D11 device.
+    #[cfg(all(
+        target_os = "windows",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    ))]
+    Gpu(gpu_frame::GpuFrame),
+    /// FR-118 P5 — the BGRA IOSurface `CGDisplayStream` delivered, held for as
+    /// long as a consumer holds the frame.
+    #[cfg(all(target_os = "macos", feature = "scrap-capture"))]
+    IoSurface(iosurface_frame::IoSurfaceFrame),
+}
+
+impl From<Vec<u8>> for FrameData {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Cpu(bytes)
     }
 }
 
@@ -384,7 +498,25 @@ pub fn readback_window_ms(now: (u64, u64), base: (u64, u64)) -> f64 {
 
 #[async_trait::async_trait]
 pub trait ScreenCapture: Send {
+    /// The next frame, or `Ok(None)` when none arrived.
+    ///
+    /// #3272 — the contract:
+    /// - **The backend owns its pace.** A pump loops straight back on an
+    ///   `Ok(None)` and sleeps on nothing. So an `Ok(None)` comes after a bounded
+    ///   wait for a frame (an event, a timer, an acquire with a timeout), not at
+    ///   once. WGC, the portal, scrap and DRM wait in here.
+    /// - **The wait is bounded.** A pump reads its keepalive, its teardown and
+    ///   its pending settings between calls, so nothing here waits for long.
+    /// - **Stray instant empties are fine.** A pull backend's next ask can be
+    ///   already due after a slow encode, and the ask after it sleeps. A stream
+    ///   of them is a spin: [`pace::EmptyGuard`] warns once and floors each.
+    ///
+    /// ⚠️ One backend meets this only when asked: the SYSTEM-context capture,
+    /// through [`open_async`]'s `paced`. The two DataChannel pumps do not ask, and
+    /// sleep on an empty themselves. FR-98 C7 moves them over and deletes the
+    /// opt-in.
     async fn next_frame(&mut self) -> Result<Option<Frame>>;
+
     fn monitor_count(&self) -> u8;
     /// HW-downscale Phase B — the pump's CURRENT effective encode box
     /// (aspect-preserved, even dims), so a GPU-capable backend can scale
@@ -437,9 +569,9 @@ pub trait ScreenCapture: Send {
     }
 
     /// FR-118 P0 — the backend's own copy of a GPU surface into CPU memory,
-    /// cumulative `(frames, microseconds)`, for a backend that does it OFF the
-    /// pump's clock: WGC reads back on its capture thread, inside
-    /// `FrameArrived`, so the pump's `avg_capture_ms` never contained it.
+    /// cumulative `(frames, microseconds)`. WGC reads back inside `FrameArrived`,
+    /// off the pump's clock, so `avg_capture_ms` never contains it; the DXGI arm
+    /// reads back on its capture thread while the pump waits, so it does.
     /// `None` from every backend that does not measure it.
     fn readback_totals(&self) -> Option<(u64, u64)> {
         None
@@ -607,9 +739,7 @@ impl CaptureUnavailableCode {
         match self {
             Self::Permission => {
                 if cfg!(target_os = "macos") {
-                    "Grant Screen Recording to Roomler in System Settings → Privacy & Security, \
-                     then reconnect. A macOS update or a change to the app's code signature \
-                     invalidates an existing grant."
+                    MAC_PERMISSION_HINT
                 } else {
                     "The host denied this agent permission to capture the screen. Grant it on \
                      the host, then reconnect."
@@ -638,6 +768,22 @@ impl CaptureUnavailableCode {
         }
     }
 }
+
+/// #3164 — the macOS `permission` sentence. It names the entry the pane shows
+/// (`roomlerd`, the bundle's file name, beside the menu-bar app's own
+/// "Roomler"), and the restart: macOS applies a Screen Recording grant to a
+/// freshly started process only, so a reconnect alone found the same process
+/// and the same `permission` (field, agent 0.4.188). Up to 0.4.188 this said
+/// "Grant Screen Recording to Roomler … then reconnect"; the viewer corrects
+/// that older sentence itself (`ui/src/composables/macPermissionHint.ts`).
+///
+/// ⚠️ On the wire as a JSON literal, unescaped
+/// (`capture_unavailable_payload`): no double quote, no backslash.
+pub(crate) const MAC_PERMISSION_HINT: &str = "Turn on roomlerd in System Settings → Privacy & \
+     Security → Screen & System Audio Recording. macOS applies that grant only when roomlerd \
+     restarts, so reconnecting alone does not help: on the Mac, choose Quit & Reopen when macOS \
+     offers it, or Restart in the Roomler menu-bar app, then reconnect. A macOS update or a \
+     change to the app's code signature invalidates an existing grant.";
 
 /// FR-113 P2 — the `x11_not_enabled` sentence, by install type. A root daemon
 /// reads it when its automatic capture did not switch on for the X11 session
@@ -2253,7 +2399,7 @@ fn x_has_xwayland_monitor(
     target_os = "linux",
     any(feature = "scrap-capture", feature = "enigo-input")
 ))]
-fn x_server_query(
+pub(crate) fn x_server_query(
     display: &str,
     ask: impl FnOnce(&x11rb::rust_connection::RustConnection, x11rb::protocol::xproto::Window) -> bool,
 ) -> Option<bool> {
@@ -2497,7 +2643,12 @@ impl Default for ReopenBackoff {
 /// The live path: the pointer stays OUT of the frames wherever a backend can
 /// leave it out, because it travels on its own channel (`cursor.rs`).
 pub fn open_default(target_fps: u32, downscale: DownscalePolicy) -> Box<dyn ScreenCapture> {
-    open_with(target_fps, downscale, pointer::PointerRequest::Separate)
+    open_with(
+        target_fps,
+        downscale,
+        pointer::PointerRequest::Separate,
+        false,
+    )
 }
 
 /// FR-93 P2d — [`open_default`] for the media pumps, off the runtime's workers.
@@ -2521,6 +2672,24 @@ pub async fn open_default_async(
     downscale: DownscalePolicy,
     on_wait: OnOpenWait,
 ) -> Box<dyn ScreenCapture> {
+    open_async(target_fps, downscale, false, on_wait).await
+}
+
+/// #3272 — [`open_default_async`], for a pump that may ask for
+/// [`ScreenCapture::next_frame`]'s contract. `paced` matters to the SYSTEM-context
+/// capture alone, because every other backend already keeps the contract. There
+/// the open waits for a seat the capture before it is letting go of, the acquire
+/// waits for a frame (so frames stay off the GPU: a wait holds the device's lock),
+/// and GDI holds to its target. It is said here, not after the open, because the
+/// open is the first thing it changes. Only the RTP pump asks; FR-98 C7 moves the
+/// others over and deletes the choice.
+pub async fn open_async(
+    target_fps: u32,
+    downscale: DownscalePolicy,
+    paced: bool,
+    on_wait: OnOpenWait,
+) -> Box<dyn ScreenCapture> {
+    let pointer = pointer::PointerRequest::Separate;
     #[cfg(target_os = "linux")]
     {
         // FR-93 P5b — dropped with this future, so an open still waiting when
@@ -2529,7 +2698,7 @@ pub async fn open_default_async(
         let _mark = SetOnDrop(std::sync::Arc::clone(&abandoned));
         match tokio::task::spawn_blocking(move || {
             let _hook = ParkHook::install(on_wait, abandoned);
-            open_default(target_fps, downscale)
+            open_with(target_fps, downscale, pointer, paced)
         })
         .await
         {
@@ -2547,7 +2716,7 @@ pub async fn open_default_async(
     {
         // No open here waits for a person: there is no portal off Linux.
         drop(on_wait);
-        open_default(target_fps, downscale)
+        open_with(target_fps, downscale, pointer, paced)
     }
 }
 
@@ -2761,14 +2930,17 @@ pub fn open_for_recording(target_fps: u32) -> Box<dyn ScreenCapture> {
         target_fps,
         DownscalePolicy::Never,
         pointer::PointerRequest::InFrame,
+        false,
     )
 }
 
-/// The backend cascade, shared by the live path and the recorder.
+/// The backend cascade, shared by the live path and the recorder. `_paced`:
+/// see [`open_async`].
 fn open_with(
     _target_fps: u32,
     _downscale: DownscalePolicy,
     _pointer: pointer::PointerRequest,
+    _paced: bool,
 ) -> Box<dyn ScreenCapture> {
     // Phase 1 — synthetic-frame-source short-circuit. When the agent
     // is running inside the agent-e2e Pod (or any headless CI
@@ -2810,6 +2982,7 @@ fn open_with(
                 match crate::system_context::capture_pump::SystemContextCapture::primary(
                     _target_fps,
                     _downscale,
+                    _paced,
                 ) {
                     Ok(c) => {
                         tracing::info!(
@@ -3311,6 +3484,44 @@ mod frame_tests {
         )));
     }
 
+    /// FR-118 P1 (C0) — a CPU frame hands back exactly the bytes it was built
+    /// with, and `cpu_mut` changes them in place. With only `Cpu` produced,
+    /// every consumer reads what it read before C0.
+    #[test]
+    fn a_cpu_frame_reads_back_the_bytes_it_was_built_with() {
+        let bytes: Vec<u8> = (0..64u8).collect();
+        let mut f = Frame {
+            width: 4,
+            height: 4,
+            stride: 16,
+            pixel_format: PixelFormat::Bgra,
+            data: bytes.clone().into(),
+            monotonic_us: 0,
+            monitor: 0,
+            damage: Damage::Unknown,
+            source: None,
+        };
+        assert_eq!(f.cpu(), bytes.as_slice());
+        f.cpu_mut()[0] = 0xFF;
+        assert_eq!(f.cpu()[0], 0xFF);
+        assert_eq!(&f.cpu()[1..], &bytes[1..]);
+        let copy = f.clone();
+        assert_eq!(copy.cpu(), f.cpu(), "a clone carries the same bytes");
+    }
+
+    /// FR-118 — the switch is off unless it says on: unset, empty, `0` and
+    /// anything unrecognised all leave a host on today's path.
+    #[test]
+    fn the_zero_copy_switch_is_off_unless_it_says_on() {
+        for on in ["1", "true", "TRUE", "yes", "On", " on "] {
+            assert!(zero_copy_from(Some(on)), "{on:?} turns it on");
+        }
+        for off in ["0", "false", "no", "off", "", "2", "enabled"] {
+            assert!(!zero_copy_from(Some(off)), "{off:?} leaves it off");
+        }
+        assert!(!zero_copy_from(None));
+    }
+
     // P8a — damage re-projection through a downscale (moved here with
     // scale_damage in Phase B).
     #[test]
@@ -3472,7 +3683,7 @@ mod frame_tests {
             height: 640,
             stride: 4096,
             pixel_format: PixelFormat::Bgra,
-            data: vec![],
+            data: vec![].into(),
             monotonic_us: 0,
             monitor: 0,
             damage: Damage::Unknown,
@@ -3490,8 +3701,9 @@ mod frame_tests {
 mod wayland_reason_tests {
     use super::CaptureUnavailableCode::{self, *};
     use super::{
-        SeatKind, linux_no_pixels_code, wayland_hint, wayland_not_enabled_detail, x11_hint,
-        x11_hint_with, x11_not_enabled_detail, xwayland_verdict,
+        MAC_PERMISSION_HINT, SeatKind, linux_no_pixels_code, wayland_hint,
+        wayland_not_enabled_detail, x11_hint, x11_hint_with, x11_not_enabled_detail,
+        xwayland_verdict,
     };
 
     fn seat(answer: Option<SeatKind>) -> impl FnOnce() -> Option<SeatKind> {
@@ -3730,6 +3942,8 @@ mod wayland_reason_tests {
             X11NotEnabled,
         ];
         let mut hints: Vec<&str> = codes.iter().map(|c| c.hint()).collect();
+        // #3164 — the macOS sentence, checked on every platform.
+        hints.push(MAC_PERMISSION_HINT);
         hints.push(wayland_hint(true));
         hints.push(wayland_hint(false));
         hints.push(x11_hint(true));
@@ -3749,6 +3963,26 @@ mod wayland_reason_tests {
                 "a hint would break the payload: {hint}"
             );
         }
+    }
+
+    /// #3164 — a Mac is told the entry the pane shows and that macOS applies
+    /// the grant only to a restarted agent, by the two restarts that bring it
+    /// back (master said "Grant Screen Recording to Roomler … then reconnect",
+    /// and a reconnect reached the same process and the same `permission`).
+    #[test]
+    fn the_mac_permission_hint_names_roomlerd_and_the_restart() {
+        let h = MAC_PERMISSION_HINT;
+        assert!(h.contains("Turn on roomlerd"), "{h}");
+        assert!(h.contains("Screen & System Audio Recording"), "{h}");
+        assert!(h.contains("only when roomlerd restarts"), "{h}");
+        assert!(
+            h.contains("Quit & Reopen") && h.contains("Roomler menu-bar app"),
+            "{h}"
+        );
+        assert!(
+            !h.contains("to Roomler in"),
+            "names the menu-bar app's entry: {h}"
+        );
     }
 
     /// Each install type is told the keys it can actually use: only root can

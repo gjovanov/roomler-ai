@@ -315,6 +315,8 @@ async fn run_install_inner(
         desktop_installed: None,
         // FR-104 — a tunnel client has no SYSTEM service to anchor.
         anchored: None,
+        // FR-129 B2 — nor a root half.
+        root_half: None,
     })
 }
 

@@ -1,6 +1,6 @@
 diff -ruN --strip-trailing-cr upstream/build.rs vendored/build.rs
 --- upstream/build.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/build.rs	2026-10-25 21:13:56.629243000 +0100
++++ vendored/build.rs	2026-10-29 12:50:26.734268000 +0100
 @@ -1,4 +1,9 @@
  fn main() {
 +    // This file is the script's only input. Without the line, cargo re-runs
@@ -13,7 +13,7 @@ diff -ruN --strip-trailing-cr upstream/build.rs vendored/build.rs
          println!("cargo:rustc-cfg=dxgi");
 diff -ruN --strip-trailing-cr upstream/src/common/dxgi.rs vendored/src/common/dxgi.rs
 --- upstream/src/common/dxgi.rs	2018-01-04 12:35:10.000000000 +0100
-+++ vendored/src/common/dxgi.rs	2026-10-25 21:13:56.521171800 +0100
++++ vendored/src/common/dxgi.rs	2026-10-29 12:50:26.694784700 +0100
 @@ -68,4 +68,12 @@
      pub fn height(&self) -> usize {
          self.0.height() as usize
@@ -29,7 +29,7 @@ diff -ruN --strip-trailing-cr upstream/src/common/dxgi.rs vendored/src/common/dx
  }
 diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/quartz.rs
 --- upstream/src/common/quartz.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/common/quartz.rs	2026-10-25 21:13:56.536528800 +0100
++++ vendored/src/common/quartz.rs	2026-10-29 12:50:26.700826500 +0100
 @@ -9,16 +9,75 @@
  }
  
@@ -109,7 +109,7 @@ diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/
              move |inner| {
                  if let Ok(mut f) = f.lock() {
                      *f = Some(inner);
-@@ -66,6 +125,17 @@
+@@ -66,6 +125,24 @@
      PhantomData<&'a [u8]>
  );
  
@@ -122,12 +122,19 @@ diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/
 +    pub fn bytes_per_row(&self) -> usize {
 +        self.0.bytes_per_row()
 +    }
++
++    /// ROOMLER PATCH: the `IOSurfaceRef` this frame holds, handed over with
++    /// its retain and its use count (see `quartz::Frame::into_surface`). The
++    /// caller gives both back: `IOSurfaceDecrementUseCount`, then `CFRelease`.
++    pub fn into_surface(self) -> *mut std::os::raw::c_void {
++        self.0.into_surface()
++    }
 +}
 +
  impl<'a> ops::Deref for Frame<'a> {
      type Target = [u8];
      fn deref(&self) -> &[u8] {
-@@ -97,4 +167,20 @@
+@@ -97,4 +174,20 @@
      pub fn height(&self) -> usize {
          self.0.height()
      }
@@ -150,7 +157,7 @@ diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/
  }
 diff -ruN --strip-trailing-cr upstream/src/common/x11.rs vendored/src/common/x11.rs
 --- upstream/src/common/x11.rs	2018-04-08 11:24:21.000000000 +0200
-+++ vendored/src/common/x11.rs	2026-10-25 21:13:56.542081500 +0100
++++ vendored/src/common/x11.rs	2026-10-29 12:50:26.688616800 +0100
 @@ -68,4 +68,13 @@
      pub fn height(&self) -> usize {
          self.0.rect().h as usize
@@ -167,7 +174,7 @@ diff -ruN --strip-trailing-cr upstream/src/common/x11.rs vendored/src/common/x11
  }
 diff -ruN --strip-trailing-cr upstream/src/dxgi/mod.rs vendored/src/dxgi/mod.rs
 --- upstream/src/dxgi/mod.rs	2018-04-08 13:02:22.000000000 +0200
-+++ vendored/src/dxgi/mod.rs	2026-10-25 21:13:56.557860500 +0100
++++ vendored/src/dxgi/mod.rs	2026-10-29 12:50:26.707768100 +0100
 @@ -395,6 +395,19 @@
          self.desc.Rotation
      }
@@ -190,7 +197,7 @@ diff -ruN --strip-trailing-cr upstream/src/dxgi/mod.rs vendored/src/dxgi/mod.rs
          let i = s.iter()
 diff -ruN --strip-trailing-cr upstream/src/quartz/capturer.rs vendored/src/quartz/capturer.rs
 --- upstream/src/quartz/capturer.rs	2018-04-08 13:03:09.000000000 +0200
-+++ vendored/src/quartz/capturer.rs	2026-10-25 21:13:56.572790600 +0100
++++ vendored/src/quartz/capturer.rs	2026-10-29 12:50:26.654325500 +0100
 @@ -5,10 +5,14 @@
  use super::display::Display;
  use super::frame::Frame;
@@ -357,7 +364,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/capturer.rs vendored/src/quart
 +extern "C" fn drained(_: *mut c_void) {}
 diff -ruN --strip-trailing-cr upstream/src/quartz/display.rs vendored/src/quartz/display.rs
 --- upstream/src/quartz/display.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/display.rs	2026-10-25 21:13:56.587949500 +0100
++++ vendored/src/quartz/display.rs	2026-10-29 12:50:26.641967000 +0100
 @@ -40,6 +40,48 @@
          unsafe { CGDisplayPixelsHigh(self.0) }
      }
@@ -409,7 +416,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/display.rs vendored/src/quartz
      }
 diff -ruN --strip-trailing-cr upstream/src/quartz/ffi.rs vendored/src/quartz/ffi.rs
 --- upstream/src/quartz/ffi.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/ffi.rs	2026-10-25 21:13:56.592005300 +0100
++++ vendored/src/quartz/ffi.rs	2026-10-29 12:50:26.647332600 +0100
 @@ -9,6 +9,8 @@
  pub type CFNumberRef = *mut c_void;
  pub type CFStringRef = *mut c_void;
@@ -474,7 +481,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/ffi.rs vendored/src/quartz/ffi
      pub static kCFTypeDictionaryKeyCallBacks: CFDictionaryKeyCallBacks;
 diff -ruN --strip-trailing-cr upstream/src/quartz/frame.rs vendored/src/quartz/frame.rs
 --- upstream/src/quartz/frame.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/frame.rs	2026-10-25 21:13:56.594080700 +0100
++++ vendored/src/quartz/frame.rs	2026-10-29 12:50:26.654325500 +0100
 @@ -3,7 +3,9 @@
  
  pub struct Frame {
@@ -486,7 +493,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/frame.rs vendored/src/quartz/f
  }
  
  impl Frame {
-@@ -22,7 +24,21 @@
+@@ -22,7 +24,46 @@
              IOSurfaceGetAllocSize(surface)
          );
  
@@ -506,6 +513,31 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/frame.rs vendored/src/quartz/f
 +    /// doing, because upstream exposes no accessor for the real value.
 +    pub fn bytes_per_row(&self) -> usize {
 +        self.bytes_per_row
++    }
++
++    /// ROOMLER PATCH: hand the surface itself to the caller, for a consumer
++    /// that reads it on the GPU (roomler's FR-118 P5: VideoToolbox takes the
++    /// IOSurface as a `CVPixelBuffer`, with no copy into memory).
++    ///
++    /// The CPU lock taken in `new` is released here, because nothing reads
++    /// the bytes through this frame any more. The retain and the use count
++    /// `new` took pass to the caller, which must give both back:
++    /// `IOSurfaceDecrementUseCount`, then `CFRelease`. The use count is what
++    /// keeps `CGDisplayStream` from drawing the next frame into a surface a
++    /// consumer still holds.
++    pub fn into_surface(self) -> IOSurfaceRef {
++        let surface = self.surface;
++        unsafe {
++            IOSurfaceUnlock(
++                surface,
++                SURFACE_LOCK_READ_ONLY,
++                ptr::null_mut()
++            );
++        }
++        // `Drop` would unlock a second time and give back what the caller
++        // now owns.
++        std::mem::forget(self);
++        surface
      }
  }
  

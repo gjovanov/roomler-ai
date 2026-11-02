@@ -16,8 +16,11 @@
 //!   earlier one.
 //! - **`ROOMLERD_CAPS_CACHE=0` switches this off too**: no read, no write.
 //!   Every class is then unproven on every start, and trials repeat.
-//! - **A verdict older than [`MAX_AGE_SECS`] is forgotten**: the safety net for
-//!   a dependency the key does not model, as for the probe cache.
+//! - **A verdict older than its life is forgotten**: [`MAX_AGE_SECS`] for a
+//!   `Proven` one, the safety net for a dependency the key does not model, as
+//!   for the probe cache; [`FAILED_MAX_AGE_SECS`] for a `Failed` one (P2b-17a),
+//!   because a trial can fail for a reason that passes, such as another process
+//!   holding the GPU, and a week of refusals for that is a week too long.
 
 use super::caps_cache::{self, CacheKey};
 use super::frame_rate::{ClassKey, Verdict};
@@ -29,6 +32,20 @@ pub(crate) const FILE_NAME: &str = "fps-class-cache.json";
 const FORMAT_VERSION: u32 = 1;
 /// The same week as the probe cache's.
 pub(crate) const MAX_AGE_SECS: u64 = caps_cache::MAX_AGE_SECS;
+/// P2b-17a — a `Failed` verdict's life: an hour, then the class trials again.
+/// A host that really cannot sustain the rate pays one 10 s trial an hour; one
+/// whose trial was starved by someone else's load is refused for an hour, not
+/// a week (neo16, 2026-10-26: AV1 trials run while another process held the
+/// GPU at 97–100 % were refused until removed by hand).
+pub(crate) const FAILED_MAX_AGE_SECS: u64 = 3600;
+
+/// How long a verdict holds.
+fn max_age_secs(verdict: Verdict) -> u64 {
+    match verdict {
+        Verdict::Proven => MAX_AGE_SECS,
+        Verdict::Failed => FAILED_MAX_AGE_SECS,
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Entry {
@@ -67,7 +84,7 @@ pub(crate) fn load(path: &Path, key: &CacheKey, now_unix: u64) -> Vec<Entry> {
     }
     file.classes
         .into_iter()
-        .filter(|e| now_unix.saturating_sub(e.at_unix) <= MAX_AGE_SECS)
+        .filter(|e| now_unix.saturating_sub(e.at_unix) <= max_age_secs(e.verdict))
         .collect()
 }
 
@@ -229,6 +246,34 @@ mod tests {
         assert!(
             load(&p, &k, 101 + MAX_AGE_SECS).is_empty(),
             "older than a week"
+        );
+    }
+
+    /// P2b-17a — a `Failed` verdict holds for an hour, a `Proven` one for a
+    /// week: an hour after a failed trial the class trials again.
+    #[test]
+    fn a_failed_verdict_lives_an_hour_and_a_proven_one_a_week() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(FILE_NAME);
+        let k = key("b");
+        record(&p, &k, class("av1_nvenc", 144), Verdict::Failed, 1_000).unwrap();
+        record(&p, &k, class("av1_nvenc", 120), Verdict::Proven, 1_000).unwrap();
+        let at = |secs| load(&p, &k, 1_000 + secs);
+        assert_eq!(
+            verdict_for(&at(FAILED_MAX_AGE_SECS), &class("av1_nvenc", 144)),
+            Some(Verdict::Failed),
+            "an hour old still holds"
+        );
+        let later = at(FAILED_MAX_AGE_SECS + 1);
+        assert_eq!(
+            verdict_for(&later, &class("av1_nvenc", 144)),
+            None,
+            "older than an hour: the class trials again"
+        );
+        assert_eq!(
+            verdict_for(&later, &class("av1_nvenc", 120)),
+            Some(Verdict::Proven),
+            "a proven class keeps its week"
         );
     }
 }

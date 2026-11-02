@@ -48,6 +48,41 @@ pub fn process_is_local_system() -> bool {
     result
 }
 
+/// `true` when the calling process runs elevated, with a full administrator
+/// token ("Run as administrator", or UAC off), or as `LocalSystem`. Any failure
+/// to read the token is `false`: the answer that asks for elevation up front,
+/// which beats an access-denied halfway. FR-104's anchor writer refuses on it;
+/// the setup wizard (#3116) asks for it before a SystemContext install spends
+/// an enrollment token on a config it could not write.
+pub fn process_is_elevated() -> bool {
+    use windows_sys::Win32::Security::{TOKEN_ELEVATION, TokenElevation};
+    if process_is_local_system() {
+        return true;
+    }
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: our own process's pseudo-handle; the token is closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
+        || token.is_null()
+    {
+        return false;
+    }
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut len = 0u32;
+    // SAFETY: a live token; `elevation` is sized for TokenElevation.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+    };
+    // SAFETY: the handle OpenProcessToken gave us, closed once.
+    unsafe { CloseHandle(token) };
+    ok != 0 && elevation.TokenIsElevated != 0
+}
+
 fn token_user_is_local_system(token: HANDLE) -> bool {
     let mut needed: u32 = 0;
     // SAFETY: the documented size-discovery call — a NULL buffer and a zero

@@ -2,7 +2,7 @@
 
 **Issue:** [#2148](https://github.com/gjovanov/roomler-ai/issues/2148) · **Status:** **closed 2026-10-14**: all six criteria field-verified, on the 0.4.136 candidate and again on the released 0.4.136 (§8 rows 1–16) · **Owner:**
 network (grants, the routing, the audit), fleet (the anchor credential), the Windows agent (the service's
-SSH endpoint, the worker's splice) · **Anchors:** master `94a2032c6` · **Builds on:** FR-94 (decision 5:
+SSH endpoint, the worker's splice) · **Anchors:** master `13f11afc3` · **Builds on:** FR-94 (decision 5:
 "route SSH sessions through the service as a follow-up FR"), roomler SSH (`docs/roomler-ssh.md`), FR-83
 (grant acks)
 
@@ -15,7 +15,7 @@ every install type. `console_user` works on attended installs for the first time
 FR-94's invariant holds for SSH: **nothing the signed-in user can write may decide what SYSTEM runs, or read
 what a SYSTEM session shows.**
 
-## 2. Evidence (master `94a2032c6`)
+## 2. Evidence (master `13f11afc3`)
 
 **Roomler SSH runs entirely in the console-session worker.** The path is:
 - `agents/roomlerd/src/ssh.rs` `maybe_intercept` L188;
@@ -104,7 +104,7 @@ flowchart LR
 |---|---|---|---|
 | P0 | This spec, the issue and the registry row. Docs truth first: `roomler-ssh.md`'s identity table and the P4b ConPTY paragraph; the stale `pty/windows.rs` L846 test comment. vmtest RED: SSH identity on attended (the user), SystemContext (SYSTEM in session 1), `console_user` refused on attended | docs only | spec #2149; docs truth #2155; vmtest RED §8 rows 1–3 and 12 |
 | P1 | Server: `ssh_pending`, the claim route, the claim-as-ack resolver; the host-key route; `routes_ssh_via_service`; port and key per grant; `ssh_audit.ran_as`; the composition baseline | `rc.ssh_via_service = false` | merged (#2166) |
-| P2 | Service: the anchor's `ssh` ceiling and `roomlerd anchor ssh`; the service host key and its publication; the SSH pipe server; russh over the pipe with its own grant table; daemon → SYSTEM, console_user; key-list and `direct-tcpip` refused | the anchor's `ssh = off` (default) | #2179 (merged as `f7e7f8a12`), one PR with P3 (neither half can be field-tested without the other); field-verified on the 0.4.136 candidate (§8) |
+| P2 | Service: the anchor's `ssh` ceiling and `roomlerd anchor ssh`; the service host key and its publication; the SSH pipe server; russh over the pipe with its own grant table; daemon → SYSTEM, console_user; key-list and `direct-tcpip` refused | the anchor's `ssh = off` (default) | #2179 (merged as `088d3708e`), one PR with P3 (neither half can be field-tested without the other); field-verified on the 0.4.136 candidate (§8) |
 | P3 | Worker: the `ssh-system` word (from the service's health reply); 2223 → the pipe; the via-service grant ring; the consent frames | `ROOMLERD_SSH_VIA_SERVICE=0` | #2179, with P2 (merged) |
 | P4 | UI (`ran_as` in the SSH audit, the device's SSH identity); docs; field | — | this PR: the audit's *As* chip and the policy dialog read `ran_as` and `ssh-system` (`ui/src/utils/sshIdentity.ts`); `roomler-ssh.md` § Through the device's SYSTEM service; field §8 |
 

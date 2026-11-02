@@ -18,6 +18,10 @@
  *  equality on both ends. */
 export const FPS_CAP = 'fps-high'
 
+/** FR-119 P2b-17b — the agent acts on `rc:fps {retry: true}`: it forgets its
+ *  verdict for the rate asked for and trials it again. ⚠️ A wire spelling. */
+export const FPS_RETRY_CAP = 'fps-retry'
+
 /** The rates the picker offers. 60 is today's rate on every session. */
 export const FRAME_RATES = [60, 120, 144] as const
 export type FrameRate = (typeof FRAME_RATES)[number]
@@ -27,6 +31,12 @@ export const FRAME_RATE_STORAGE_KEY = 'roomler-rc-fps'
 
 export function agentOffersHighRefresh(video: readonly string[] | undefined | null): boolean {
   return (video ?? []).includes(FPS_CAP)
+}
+
+/** FR-119 P2b-17b — whether this agent can be asked to trial a refused rate
+ *  again. An older one ignores the field, so it is never offered there. */
+export function agentOffersFrameRateRetry(video: readonly string[] | undefined | null): boolean {
+  return (video ?? []).includes(FPS_RETRY_CAP)
 }
 
 export interface FrameRateOption {
@@ -54,9 +64,13 @@ export function frameRateOptions(
   })
 }
 
-/** The control-channel ask. */
-export function fpsWireMessage(fps: FrameRate): { t: 'rc:fps'; fps: FrameRate } {
-  return { t: 'rc:fps', fps }
+/** The control-channel ask; `retry` asks the agent to trial the rate again
+ *  (FR-119 P2b-17b), and is sent only when true. */
+export function fpsWireMessage(
+  fps: FrameRate,
+  retry = false,
+): { t: 'rc:fps'; fps: FrameRate; retry?: true } {
+  return retry ? { t: 'rc:fps', fps, retry: true } : { t: 'rc:fps', fps }
 }
 
 /** A stored or typed value, as a rate the picker offers; `null` otherwise. */
@@ -74,7 +88,8 @@ export interface FrameRateAnswer {
   /** Why not, in the agent's word (`unproven`, `constrained`, …). */
   reason: string | null
   /** FR-119 P2b — the rate runs as a trial: the host has not shown it can
-   *  sustain it yet, and goes back to its usual rate if it cannot. */
+   *  sustain it yet, and steps down if it cannot. P2b-18: a refused ask can
+   *  run one rate lower as a trial (144 refused, 120 on trial). */
   trial: boolean
 }
 
@@ -118,6 +133,8 @@ export function describeFrameRateReason(word: string): string {
       return 'the connection is relayed, and a relay stays at its current rate'
     case 'refresh':
       return "the host's screen refreshes slower than that"
+    case 'viewer_refresh':
+      return 'this screen refreshes slower than that'
     case 'denied':
       return "this device's owner has turned that rate off for its encoder"
     case 'pipe':
@@ -132,10 +149,20 @@ export function describeFrameRateReason(word: string): string {
 export function frameRateSummary(answer: FrameRateAnswer | null): string | null {
   if (!answer) return null
   if (answer.asked !== null && answer.reason !== null) {
-    return `${answer.fps} fps (${answer.asked} fps not granted: ${describeFrameRateReason(answer.reason)})`
+    // FR-119 P2b-18 — the agent steps a refused ask down one rate at a time,
+    // so the rate below it may itself be on trial.
+    const running = answer.trial ? `${answer.fps} fps on trial` : `${answer.fps} fps`
+    return `${running} (${answer.asked} fps not granted: ${describeFrameRateReason(answer.reason)})`
   }
   if (answer.trial) {
     return `${answer.fps} fps, on trial until this host has shown it can keep up`
   }
   return `${answer.fps} fps`
+}
+
+/** FR-119 P2b-17b — offer "try again" for an ask the agent refused as unproven,
+ *  to an agent that can act on it. No other reason is a verdict a retry could
+ *  change: a relay, the screen's refresh, a denial and the pipe all stand. */
+export function frameRateCanRetry(answer: FrameRateAnswer | null, offersRetry: boolean): boolean {
+  return offersRetry && answer?.reason === 'unproven' && answer.asked !== null
 }

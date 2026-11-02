@@ -80,12 +80,17 @@
         <div class="text-subtitle-2 mb-1">Connect code</div>
         <div class="d-flex align-center flex-wrap ga-2 mb-1">
           <code v-if="connectCode" class="text-h6">{{ connectCode }}</code>
-          <span v-else class="text-medium-emphasis">Not yet created</span>
+          <span v-else-if="codeRead === 'read'" class="text-medium-emphasis">Not yet created</span>
+          <span v-else-if="codeRead === 'reading'" class="text-medium-emphasis">Reading…</span>
+          <span v-else class="text-medium-emphasis">Could not read the code.</span>
           <v-spacer />
+          <!-- Until the read answers, "no code" only means "not known yet", and
+               Create would replace a code the device may already have (#3182). -->
           <v-btn
             size="small"
             variant="tonal"
             :loading="rotating"
+            :disabled="!connectCode && codeRead !== 'read'"
             prepend-icon="mdi-autorenew"
             @click="rotate"
           >
@@ -164,7 +169,17 @@ const agentStore = useAgentStore()
 const saving = ref(false)
 const rotating = ref(false)
 const error = ref('')
+/** The device's code, from its own read or from a mint here. Not from the
+ *  store's list: that holds APPROVED devices only, and approval and the code
+ *  are independent. A code on a device whose approval was withdrawn, or one
+ *  minted before any approval, read as none, and Create replaced it (#3197). */
 const connectCode = ref<string | null>(null)
+/** Until this is `read`, "no code" is unknown rather than absent. */
+const codeRead = ref<'reading' | 'read' | 'failed'>('reading')
+/** Bumped by every read and mint of the code, so only the latest answer lands.
+ *  The dialog can move to another device with one out, and an old read must not
+ *  put back a code a mint has just replaced. */
+let codeSeq = 0
 const agent = computed(() => props.agent)
 const orgDisabled = computed(() => agentStore.orgExternalAccessEnabled === false)
 
@@ -225,25 +240,48 @@ const expiryLocal = computed({
   },
 })
 
+/** Read the code of the device this dialog is open on. */
+async function readCode() {
+  const seq = ++codeSeq
+  connectCode.value = null
+  codeRead.value = 'reading'
+  try {
+    const code = await agentStore.fetchConnectCode(props.tenantId, agent.value.id)
+    if (seq !== codeSeq) return
+    connectCode.value = code
+    codeRead.value = 'read'
+  } catch {
+    if (seq === codeSeq) codeRead.value = 'failed'
+  }
+}
+
+/** Fill the draft from the device and read its code on every open, and read
+ *  the org switch if the store has not. Immediate (#3156): AgentsSection mounts
+ *  this dialog with `v-if` and opens it in the same tick, so the first open
+ *  MOUNTS it open and a lazy watch never fired: the draft stayed unapproved,
+ *  and Save revoked a standing approval. It runs during setup, so it must stay
+ *  below everything it reads. */
 watch(
   () => props.modelValue,
   (v) => {
     if (!v) return
     error.value = ''
     draft.value = { ...emptyPolicy(), ...(agent.value?.external_access_policy ?? {}) }
-    connectCode.value =
-      agentStore.externalDevices.find((d) => d.id === agent.value?.id)?.connect_code ?? null
+    void readCode()
     if (agentStore.orgExternalAccessEnabled === null) {
       void agentStore.fetchExternalAccess(props.tenantId)
     }
   },
+  { immediate: true },
 )
 
 async function rotate() {
+  const seq = ++codeSeq
   rotating.value = true
   error.value = ''
   try {
-    connectCode.value = await agentStore.rotateConnectCode(props.tenantId, agent.value.id)
+    const code = await agentStore.rotateConnectCode(props.tenantId, agent.value.id)
+    if (seq === codeSeq) connectCode.value = code
   } catch (e) {
     error.value = e instanceof Error ? e.message : 'Could not create a connect code.'
   } finally {

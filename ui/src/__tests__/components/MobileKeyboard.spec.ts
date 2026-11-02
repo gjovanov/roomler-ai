@@ -381,6 +381,37 @@ describe('MobileKeyboard', () => {
       w.unmount()
     })
 
+    it("the OS keyboard's own Backspace and Delete (no physical code) are the component's alone (#2909)", async () => {
+      // The listener maps by `code` and drops them; the always-empty textarea
+      // deletes nothing, so no `input` event carries them either. Before
+      // #2909 they reached the host through nobody.
+      const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      const sent = withListener(() => {
+        press(ta, { key: 'Backspace', code: '' })
+        press(ta, { key: 'Delete', code: '' })
+      })
+      await flushPromises()
+      expect(sent).toEqual([])
+      expect(w.emitted('key')).toEqual([
+        [0x2a, true, 0],
+        [0x2a, false, 0],
+        [0x4c, true, 0],
+        [0x4c, false, 0],
+      ])
+      w.unmount()
+    })
+
+    it('a Backspace an IME is composing with (keyCode 229) is neither owner\'s keydown', async () => {
+      const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      const sent = withListener(() => press(ta, { key: 'Backspace', code: '', keyCode: 229 }))
+      await flushPromises()
+      expect(sent).toEqual([])
+      expect(w.emitted('key')).toBeUndefined()
+      w.unmount()
+    })
+
     it("text the OS keyboard types (an input event, no keydown) is the component's alone", async () => {
       const w = mount(MobileKeyboard, { props: { open: true }, attachTo: document.body })
       const ta = w.find('textarea').element as HTMLTextAreaElement

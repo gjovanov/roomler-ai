@@ -81,17 +81,20 @@
       @update:model-value="(m) => emit('lock-on-end', m as LockOnEnd)"
     />
     <!-- #1882 — may a session to this device ride the mesh? Off by default:
-         the agent keeps overlay addresses out of its ICE. -->
-    <v-checkbox
-      :model-value="agent.access_policy.rc_overlay ?? false"
+         the agent keeps overlay addresses out of its ICE. FR-128 — Auto lets
+         each session decide from the mesh link to the viewer's own device. -->
+    <v-select
+      :model-value="rcOverlayMode(agent.access_policy)"
+      :items="RC_OVERLAY_ITEMS"
+      :label="labelled ? 'Remote desktop over the mesh' : undefined"
       density="compact"
+      :variant="variant"
       hide-details
       :disabled="busy"
-      label="Remote desktop over the mesh"
+      class="consent-select"
       :title="RC_OVERLAY_HINT"
-      :aria-label="`Let remote desktop to ${deviceName} use the mesh (overlay)`"
-      class="consent-owner-toggle"
-      @update:model-value="(v) => emit('rc-overlay', v === true)"
+      :aria-label="`Remote desktop to ${deviceName} over the mesh (overlay)`"
+      @update:model-value="(m) => emit('rc-overlay', m as RcOverlayMode)"
     />
     <!-- The hints above live in `title`, which a touch screen never shows.
          The labelled (phone) layout spells them out instead, on demand. -->
@@ -115,7 +118,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import type { Agent, ConsentMode, LockOnEnd } from '@/stores/agents'
+import type { Agent, ConsentMode, LockOnEnd, RcOverlayMode } from '@/stores/agents'
 import {
   CONSENT_MODE_ITEMS,
   IDLE_LIMIT_HINT,
@@ -123,8 +126,10 @@ import {
   LOCK_ON_END_HINT,
   LOCK_ON_END_ITEMS,
   RC_OVERLAY_HINT,
+  RC_OVERLAY_ITEMS,
   idleMinuteItems,
   ownerPromptLabel,
+  rcOverlayMode,
 } from './devicePolicy'
 
 const props = withDefaults(
@@ -147,7 +152,7 @@ const emit = defineEmits<{
   'input-mode': [mode: 'free' | 'exclusive']
   'idle-minutes': [minutes: number]
   'lock-on-end': [lock: LockOnEnd]
-  'rc-overlay': [on: boolean]
+  'rc-overlay': [mode: RcOverlayMode]
 }>()
 
 const labelled = computed(() => props.variant === 'outlined')

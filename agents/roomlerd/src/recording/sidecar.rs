@@ -170,6 +170,18 @@ pub struct Sidecar {
     /// before P1d, and from one the reconciler rebuilt after a crash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pointer: Option<Pointer>,
+    /// #2877 — the screen's own size, when the recording was scaled down to
+    /// fit its encoder (the software rung above 3840×2160). Absent when it
+    /// was recorded at native size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaled_from: Option<SourceSize>,
+}
+
+/// A picture's size (#2877's `scaled_from`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSize {
+    pub width: u32,
+    pub height: u32,
 }
 
 pub const SIDECAR_VERSION: u32 = 1;
@@ -223,6 +235,10 @@ mod tests {
             stop_reason: Some(StopReason::Requested),
             bytes: 12_345,
             pointer: Some(Pointer::Drawn),
+            scaled_from: Some(SourceSize {
+                width: 4096,
+                height: 2160,
+            }),
         }
     }
 

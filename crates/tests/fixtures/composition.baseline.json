@@ -269,6 +269,10 @@
       "methods": "POST"
     },
     {
+      "path": "/api/auth/resend-activation",
+      "methods": "POST"
+    },
+    {
       "path": "/api/capabilities",
       "methods": "GET,HEAD"
     },
@@ -333,6 +337,26 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/pair/approve",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/pair/deny",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/pair/lookup",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/pair/poll",
+      "methods": "POST"
+    },
+    {
+      "path": "/api/pair/start",
+      "methods": "POST"
+    },
+    {
       "path": "/api/push/config",
       "methods": "GET,HEAD"
     },
@@ -359,6 +383,10 @@
     {
       "path": "/api/setup/diagnostics",
       "methods": "POST"
+    },
+    {
+      "path": "/api/setup/features",
+      "methods": "GET,HEAD"
     },
     {
       "path": "/api/setup/install.ps1",
@@ -462,7 +490,7 @@
     },
     {
       "path": "/api/tenant/{tenant_id}/agent/{agent_id}/connect-code",
-      "methods": "POST"
+      "methods": "GET,HEAD,POST"
     },
     {
       "path": "/api/tenant/{tenant_id}/agent/{agent_id}/crash",
@@ -490,6 +518,10 @@
     },
     {
       "path": "/api/tenant/{tenant_id}/agent/{agent_id}/external-access-policy",
+      "methods": "PUT"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/agent/{agent_id}/external-principals/{user_id}",
       "methods": "PUT"
     },
     {
@@ -555,6 +587,10 @@
     {
       "path": "/api/tenant/{tenant_id}/external-access",
       "methods": "GET,HEAD,PUT"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/external-principals",
+      "methods": "GET,HEAD"
     },
     {
       "path": "/api/tenant/{tenant_id}/external-rc-audit",
@@ -1475,6 +1511,32 @@
         ]
       },
       {
+        "collection": "device_pairings",
+        "indexes": [
+          {
+            "key": {
+              "device_code_hash": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "user_code": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "status": "pending"
+            }
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
         "collection": "enroll_token_issued",
         "indexes": [
           {
@@ -1570,6 +1632,24 @@
               "expires_at": 1
             },
             "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
+        "collection": "external_principals",
+        "indexes": [
+          {
+            "key": {
+              "agent_id": 1,
+              "user_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "last_session_at": -1
+            }
           }
         ]
       },
@@ -2339,6 +2419,35 @@
           {
             "key": {
               "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "pairing_audit",
+        "indexes": [
+          {
+            "key": {
+              "pairing_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
             },
             "expireAfterSeconds": 7776000
           }
@@ -3855,6 +3964,32 @@
         ]
       },
       {
+        "collection": "device_pairings",
+        "indexes": [
+          {
+            "key": {
+              "device_code_hash": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "user_code": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "status": "pending"
+            }
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
         "collection": "enroll_token_issued",
         "indexes": [
           {
@@ -3950,6 +4085,24 @@
               "expires_at": 1
             },
             "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
+        "collection": "external_principals",
+        "indexes": [
+          {
+            "key": {
+              "agent_id": 1,
+              "user_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "last_session_at": -1
+            }
           }
         ]
       },
@@ -4591,6 +4744,11 @@
             "op": "drop_index_if_present",
             "index": "network_id_1",
             "why": "multi-block schema — one-block-per-network guard removed"
+          },
+          {
+            "op": "drop_index_if_present",
+            "index": "network_id_1_seq_1",
+            "why": "multi-block schema — the plain (network_id, seq) read index is replaced by the assigned-unique position guard"
           }
         ],
         "indexes": [
@@ -4614,6 +4772,11 @@
             "key": {
               "network_id": 1,
               "seq": 1
+            },
+            "name": "network_id_1_seq_1_assigned",
+            "unique": true,
+            "partialFilterExpression": {
+              "state": "assigned"
             }
           }
         ]
@@ -4717,6 +4880,35 @@
           {
             "key": {
               "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "pairing_audit",
+        "indexes": [
+          {
+            "key": {
+              "pairing_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
             },
             "expireAfterSeconds": 7776000
           }
@@ -5896,6 +6088,7 @@
   "wire": [
     "rc:agent.hello",
     "rc:agent.heartbeat",
+    "rc:agent.sleeping",
     "rc:relay.probe_report",
     "rc:session.stats",
     "rc:relay.derp_ticket_request",
@@ -5943,6 +6136,7 @@
     "rc:knowhow.get",
     "rc:knowhow.propose",
     "rc:knowhow.verify",
+    "rc:knowhow.connect",
     "rc:knowhow.probed",
     "rc:sdp.answer",
     "rc:consent",
@@ -6076,6 +6270,7 @@
     "rc:knowhow.refused",
     "rc:knowhow.verifying",
     "rc:knowhow.verified",
+    "rc:knowhow.access",
     "rc:knowhow.probe",
     "rc:pong",
     "rc:error",
@@ -6087,6 +6282,7 @@
     "rc:agent.hello": "fleet",
     "rc:agent.key_rotated": "network",
     "rc:agent.local_relay": "remote",
+    "rc:agent.sleeping": "fleet",
     "rc:consent": "fleet",
     "rc:consent.pending": "fleet",
     "rc:extauth.finish": "remote",
@@ -6116,6 +6312,7 @@
     "rc:hive.view.grant_ack": "hive",
     "rc:hive.view.ice": "hive",
     "rc:ice": "remote",
+    "rc:knowhow.connect": "knowhow",
     "rc:knowhow.get": "knowhow",
     "rc:knowhow.probed": "knowhow",
     "rc:knowhow.propose": "knowhow",

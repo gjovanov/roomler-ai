@@ -23,6 +23,11 @@
 # `_CGYDisplayStreamFrameAvailable` after every session. Field-hit on a
 # MacBook, 2026-10-15.
 #
+# FR-118 P5 adds the quartz `Frame::into_surface()`: the frame hands its
+# `IOSurfaceRef` on (CPU lock released, retain and use count kept for the
+# caller) instead of being copied, so VideoToolbox can take the surface as a
+# `CVPixelBuffer` with no copy into memory.
+#
 # The build script declares `rerun-if-changed=build.rs` (FR-6 wave 29). With
 # no `rerun-if` line at all, cargo fingerprints a path crate's build script by
 # the crate's NEWEST file mtime. A fresh checkout therefore re-ran it and

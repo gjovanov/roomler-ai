@@ -130,3 +130,87 @@ describe('conference layouts — every tile carries a stream key', () => {
     })
   }
 })
+
+// FR-124 — a tile's `picture-black` reaches the call page WITH its stream key,
+// from every tile a layout renders. The floating self-view is named again: it
+// is the tile that shows your own (covered) camera in a solo call.
+const forwardingStub = {
+  props: ['streamKey', 'isScreenShare'],
+  emits: ['picture-black'],
+  template: '<div class="tile-stub" :data-stream-key="streamKey" :data-screen="isScreenShare ? 1 : 0" />',
+}
+
+describe('conference layouts — a black picture is reported with its stream key (FR-124)', () => {
+  for (const c of cases) {
+    it(`${c.name} forwards picture-black from every tile, floating self-view included`, async () => {
+      const wrapper = mount(c.component, {
+        props: c.props as never,
+        global: { plugins: [vuetify], stubs: { VideoTile: forwardingStub } },
+      })
+      const tiles = wrapper.findAllComponents(forwardingStub)
+      expect(tiles.length).toBeGreaterThan(0)
+      for (const tile of tiles) tile.vm.$emit('picture-black', true)
+
+      const reported = (wrapper.emitted('picture-black') ?? []) as [string, boolean][]
+      expect(reported).toHaveLength(tiles.length)
+      expect(reported.map(([key]) => key).sort()).toEqual(
+        tiles.map((t) => t.props('streamKey') as string).sort(),
+      )
+      expect(reported).toContainEqual(['me:cam', true])
+    })
+  }
+
+  it('a shared screen is marked as one, so its picture is never judged', () => {
+    const screen = participant({ streamKey: 'them:screen', isScreenShare: true })
+    const wrapper = mount(SpotlightLayout, {
+      props: {
+        primary: [screen],
+        secondary: [remote],
+        selfParticipant: null,
+        selfViewFloating: false,
+        selfViewMode: 'in-grid-cropped',
+        activeSpeakerKey: null,
+      },
+      global: { plugins: [vuetify], stubs: { VideoTile: forwardingStub } },
+    })
+    const byKey = Object.fromEntries(
+      wrapper.findAll('.tile-stub').map((t) => [t.attributes('data-stream-key'), t.attributes('data-screen')]),
+    )
+    expect(byKey).toEqual({ 'them:screen': '1', 'them:cam': '0' })
+  })
+})
+
+// FR-127 P1 — a tile's `visible` report reaches the call page WITH its stream
+// key from every remote tile a layout renders: the grid, the big tile, and
+// the strip. The floating self-view is local and never reports, so no layout
+// listens to it for this.
+const visibleStub = {
+  props: ['streamKey', 'isLocal'],
+  emits: ['visible'],
+  template: '<div class="tile-stub" :data-stream-key="streamKey" />',
+}
+const remote2 = participant({ streamKey: 'other:cam', userId: 'other', displayName: 'Other' })
+
+describe('conference layouts — a tile on screen is reported with its stream key (FR-127 P1)', () => {
+  const withStrip = [
+    { name: 'TiledLayout', component: TiledLayout, props: { ...cases[0].props, participants: [remote, remote2] } },
+    { name: 'SpotlightLayout', component: SpotlightLayout, props: { ...cases[1].props, secondary: [remote2] } },
+    { name: 'SidebarLayout', component: SidebarLayout, props: { ...cases[2].props, secondary: [remote2] } },
+  ]
+  for (const c of withStrip) {
+    it(`${c.name} forwards visible from every remote tile, strip included, never the floating self-view`, async () => {
+      const wrapper = mount(c.component, {
+        props: c.props as never,
+        global: { plugins: [vuetify], stubs: { VideoTile: visibleStub } },
+      })
+      const tiles = wrapper.findAllComponents(visibleStub)
+      expect(tiles.length).toBe(3)
+      const report = { visible: true, w: 320, h: 240 }
+      for (const tile of tiles) tile.vm.$emit('visible', report)
+
+      const reported = (wrapper.emitted('visible') ?? []) as [string, typeof report][]
+      expect(reported.map(([key]) => key).sort()).toEqual(['other:cam', 'them:cam'])
+      expect(reported.every(([, r]) => r === report)).toBe(true)
+    })
+  }
+})

@@ -18,7 +18,8 @@
 //!   `ip -o monitor route addr link` (all three classes); macOS =
 //!   `route -n monitor` (the PF_ROUTE socket's line-per-message view).
 //! * **Monitor** debounces bursts (a Check Point connect injects dozens of
-//!   routes in one gulp), samples a [`NetSnapshot`], diffs it against the
+//!   routes in one gulp), samples a [`NetSnapshot`] on the blocking pool
+//!   (#3018: the sample shells out to `route`/`ip`), diffs it against the
 //!   previous one, and publishes a [`NetDelta`] with a severity verdict.
 //! * **Fan-out**: `watch<Arc<NetSnapshot>>` (latest state — always readable)
 //!   plus `broadcast<NetDelta>` (wake-ups). A lagged subscriber loses only
@@ -76,6 +77,11 @@ fn debounce() -> Duration {
 /// A continuous signal storm must still emit periodically — cap the absorb
 /// window so a delta lands at least this often while churn is ongoing.
 const DEBOUNCE_CAP: Duration = Duration::from_secs(3);
+
+/// #3018 — a sample slower than this is a WARN. A normal one takes
+/// milliseconds: a few route lookups (`route -n get` on macOS, `ip route get`
+/// on Linux, `GetBestRoute2` and `lan_repair`'s table read on Windows).
+const SLOW_SAMPLE: Duration = Duration::from_secs(1);
 
 /// Flap damping (field 2026-08-16 19:00Z, winhost-a IN-VPN): Check Point and
 /// our own route-guard waves fight over the routing table, so the effective
@@ -463,11 +469,24 @@ fn spawn() -> Option<NetstateHandle> {
 }
 
 async fn monitor(
-    mut raw_rx: mpsc::UnboundedReceiver<(RawSignal, String)>,
+    raw_rx: mpsc::UnboundedReceiver<(RawSignal, String)>,
     snap_tx: watch::Sender<Arc<NetSnapshot>>,
     delta_tx: broadcast::Sender<NetDelta>,
     _guard: backend::BackendGuard,
+    prev: Arc<NetSnapshot>,
+) {
+    run_monitor(raw_rx, snap_tx, delta_tx, prev, sample_snapshot).await
+}
+
+/// The monitor loop, with the sampler passed in so a test can stand in a slow
+/// one. `monitor` keeps the OS registration alive for exactly as long as this
+/// runs.
+async fn run_monitor(
+    mut raw_rx: mpsc::UnboundedReceiver<(RawSignal, String)>,
+    snap_tx: watch::Sender<Arc<NetSnapshot>>,
+    delta_tx: broadcast::Sender<NetDelta>,
     mut prev: Arc<NetSnapshot>,
+    sampler: fn() -> NetSnapshot,
 ) {
     let quiet = debounce();
     let mut last_major_pub: Option<tokio::time::Instant> = None;
@@ -501,7 +520,36 @@ async fn monitor(
                 Err(_) => break, // quiet period elapsed
             }
         }
-        let next = Arc::new(sample_snapshot());
+        // #3018 — sampled on the blocking pool, never on a runtime worker. The
+        // sample runs `route -n get` (macOS) or `ip route get` (Linux) two to
+        // six times, and on Windows reads the route table and may repair a LAN
+        // route; inline, every burst of a carrier flap held a worker through all
+        // of it.
+        let started = std::time::Instant::now();
+        let next = match tokio::task::spawn_blocking(sampler).await {
+            Ok(snapshot) => Arc::new(snapshot),
+            // The monitor stops, as it did when the sample panicked inline. The
+            // panic hook has recorded it once; a sampler that panics on every
+            // burst must not record a crash on every burst.
+            Err(e) if e.is_panic() => {
+                warn!(
+                    "netstate: the network sample panicked — monitor stopping (subscribers degrade to timers)"
+                );
+                return;
+            }
+            Err(_) => {
+                debug!("netstate: the runtime is shutting down — monitor stopping");
+                return;
+            }
+        };
+        let took = started.elapsed();
+        let sample_ms = took.as_millis() as u64;
+        if took >= SLOW_SAMPLE {
+            warn!(
+                sample_ms,
+                absorbed, "netstate: a network sample was slow (normally milliseconds)"
+            );
+        }
         match diff(&prev, &next, saw_addr, saw_iface) {
             Some(mut delta) => {
                 // Flap damping — see MAJOR_PUBLISH_COOLDOWN. Demotion keeps
@@ -520,6 +568,7 @@ async fn monitor(
                 info!(
                     severity = ?delta.severity,
                     absorbed,
+                    sample_ms,
                     %delta.summary,
                     "netstate: network changed"
                 );
@@ -539,7 +588,7 @@ async fn monitor(
                 // re-assert wave) — still a wake-up, flagged immaterial.
                 debug!(
                     absorbed,
-                    "netstate: signal burst with no snapshot-visible change"
+                    sample_ms, "netstate: signal burst with no snapshot-visible change"
                 );
                 let _ = delta_tx.send(NetDelta {
                     severity: Severity::Minor,
@@ -857,6 +906,11 @@ fn route_lookup(dest_ip: IpAddr) -> Option<DefaultRoute> {
     })
 }
 
+/// #3080 — `route -n get` answers in milliseconds. This bounds the read that
+/// waits for it.
+#[cfg(target_os = "macos")]
+const ROUTE_GET_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[cfg(target_os = "macos")]
 fn route_lookup(dest_ip: IpAddr) -> Option<DefaultRoute> {
     // `route -n get` — the BSD twin of `ip route get`; multi-line
@@ -868,7 +922,9 @@ fn route_lookup(dest_ip: IpAddr) -> Option<DefaultRoute> {
     } else {
         cmd.args(["-n", "get", dest.as_str()]);
     }
-    let out = cmd.output().ok()?;
+    // #3080 — read until `route` exits, not until EOF: a long-lived child
+    // spawned on another thread may hold this pipe too.
+    let out = crate::child::output_bounded(&mut cmd, ROUTE_GET_DEADLINE).ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let (mut ifname, mut gw) = (None, None);
     for line in text.lines() {
@@ -1147,13 +1203,19 @@ mod backend {
         }
 
         fn start(make: fn() -> tokio::process::Command) -> Option<tokio::process::Child> {
-            make()
-                .stdin(Stdio::null())
+            let mut cmd = make();
+            cmd.stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .ok()
+                .kill_on_drop(true);
+            // #3080 — the monitor lives as long as the daemon, so a pipe it
+            // inherits from a spawn on another thread (macOS has no `pipe2`)
+            // stays open that long, and that pipe's reader never sees EOF.
+            // Field, 0.4.184: it held the GUI-worker supervisor's `ps` pipe,
+            // and the Mac had no capture or input until a restart.
+            #[cfg(target_os = "macos")]
+            crate::child::inherit_only_stdio_async(&mut cmd);
+            cmd.spawn().ok()
         }
 
         /// #1867 — run the monitor child and RESPAWN it whenever it exits.
@@ -1670,5 +1732,80 @@ sockaddrs: <DST,GATEWAY>
         let s = sample_snapshot();
         // At least a loopback-stripped view exists; both calls agree.
         assert_eq!(s.ifaces, sample_snapshot().ifaces);
+    }
+
+    /// #3018 — the sample after a burst runs off the runtime worker. On a
+    /// runtime with ONE thread, a ticker keeps ticking while a slow sample
+    /// runs, and the sample's thread is not the runtime's. Inline, the ticker
+    /// cannot run at all until the sample returns.
+    #[test]
+    fn a_slow_sample_does_not_hold_the_runtime() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static TICKS: AtomicUsize = AtomicUsize::new(0);
+        static TICKS_DURING: AtomicUsize = AtomicUsize::new(usize::MAX);
+        static SAMPLER_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+        fn slow_sample() -> NetSnapshot {
+            *SAMPLER_THREAD.lock().unwrap() = Some(std::thread::current().id());
+            let before = TICKS.load(Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            TICKS_DURING.store(TICKS.load(Ordering::SeqCst) - before, Ordering::SeqCst);
+            // One new address: a Minor delta, so the test publishes without
+            // stamping the process-wide Major clock (`last_major_within`).
+            let mut s = NetSnapshot::default();
+            s.ifaces.insert(
+                "en9".into(),
+                IfaceSnap {
+                    v4: vec![Ipv4Addr::new(192, 0, 2, 7)],
+                    ..Default::default()
+                },
+            );
+            s
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let runtime_thread = std::thread::current().id();
+        rt.block_on(async {
+            let (raw_tx, raw_rx) = mpsc::unbounded_channel();
+            let (snap_tx, snap_rx) = watch::channel(Arc::new(NetSnapshot::default()));
+            let (delta_tx, mut deltas) = broadcast::channel(16);
+            tokio::spawn(run_monitor(
+                raw_rx,
+                snap_tx,
+                delta_tx,
+                Arc::new(NetSnapshot::default()),
+                slow_sample,
+            ));
+            tokio::spawn(async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    TICKS.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            raw_tx.send((RawSignal::Addr, String::new())).unwrap();
+            let d = tokio::time::timeout(Duration::from_secs(10), deltas.recv())
+                .await
+                .expect("the monitor publishes within 10 s")
+                .expect("a delta");
+            assert!(d.material && d.severity == Severity::Minor, "{}", d.summary);
+            assert_eq!(
+                snap_rx.borrow().ifaces.len(),
+                1,
+                "the published snapshot is the sample's"
+            );
+        });
+        assert_ne!(
+            SAMPLER_THREAD.lock().unwrap().expect("the sampler ran"),
+            runtime_thread,
+            "the sample ran on the runtime's own thread"
+        );
+        let during = TICKS_DURING.load(Ordering::SeqCst);
+        assert!(
+            during >= 3,
+            "the runtime ticked {during} times during a 300 ms sample: the sample held it"
+        );
     }
 }

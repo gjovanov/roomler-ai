@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | [#2557](https://github.com/gjovanov/roomler-ai/issues/2557) |
-| **Status** | every phase live on prod (P4d since 2026-10-24) and AC1–AC12 ticked; still open, and the FR waits on them: the issue #2820 (P4c-1 moves a live TURN carrier only when the pair re-establishes; the real-pair test is done, *P4c, as built*) and O4's measurement. **O3 is complete** (2026-10-25, the field log). Free's and the paid rate keep typing, kernel-TCP bulk and a remote-desktop session over the overlay usable. roomler SSH's collapse under both was #2876, fixed by #2899, which shipped in agent 0.4.171 and was verified on the published build |
+| **Status** | **done 2026-10-31.** Every phase is live on prod (P4d since 2026-10-24), and AC1–AC12 are field-verified: on 2026-10-30 each tick's evidence was opened again and linked from its criterion. **O4 is decided** (2026-10-27, the operator): one room carries about 20 people with cameras on (*O4, measured*), and rather than lower Pro's 50 and Business's 100, the scaling is its own FR, [FR-127](FR-127-meeting-room-scales-past-one-worker.md) (#2985), whose re-measure sets the published caps. **#2820 is fixed** (agent 0.4.175, verified on the published build, the field log): a pair riding TURN leaves it while live once a probe over `/derp` proves the peer, at the cost of a short one-way window: up to a 5 s tick on 0.4.175–0.4.177, about a round trip (or 0.5 s when one end follows) from 0.4.178 (#2952). Open beyond the criteria: a node with no `/derp` open does not move (#2992), and the QUIC-over-TURN carrier drops full-size packets on a 1280-MTU uplink (#2819). **O3 is complete** (2026-10-25, the field log). Free's and the paid rate keep typing, kernel-TCP bulk and a remote-desktop session over the overlay usable. roomler SSH's collapse under both was #2876, fixed by #2899, which shipped in agent 0.4.171 and was verified on the published build |
 | **Arc** | P3 of the pricing sequence in [`../business-model.md`](../business-model.md) §5 (enforce → meter → **reshape** → keys) |
 | **Related** | [FR-32](FR-32-plan-limit-enforcement.md) (the one decision point), [FR-20](FR-20-per-tenant-relay-cost-metering.md) (the ledger), [FR-19](FR-19-peer-relays.md) (org relays), [FR-52](FR-52-cross-org-remote-access.md) (support sessions to other orgs), [FR-102](FR-102-growth-observability.md) (revenue view) |
 | **Private annex** | `roomler-ai-docs/gtm/pricing/FR-115-annex-census-2026-10-19.md` — per-org census, account counts, competitor detail |
@@ -55,7 +55,7 @@ A 20-person team is quoted $160 and billed $8.
 ### 3. The one limit a new Free org hits is the one that should not exist
 
 Only `max_devices` and `max_tunnel_clients` are **established** — enforced whatever the org's
-`plan_enforcement` mode (`crates/services/src/quota.rs:71` at `c5d36ca84`, before P1). Every other gate runs in `Warn` for
+`plan_enforcement` mode (`crates/services/src/quota.rs:71` at `893f915d1`, before P1). Every other gate runs in `Warn` for
 an org created after 2026-08-30, by standing decision (`crates/db/src/models/tenant.rs:58`), so
 for a new signup MagicDNS and exit nodes already pass. The advertised "1 concurrent session"
 (Free) and "5" (Pro) are enforced **nowhere**: FR-32 withheld the gate because nothing wrote
@@ -119,7 +119,7 @@ the webhook, so renaming one is a migration (`crates/services/src/stripe.rs:337`
 ### Limits become a function of plan **and** seats
 
 `Plan::limits()` (`crates/db/src/models/tenant.rs:411`) is a pure function of the plan, and
-`quota::evaluate` takes only the plan (`crates/services/src/quota.rs:258` at `c5d36ca84`; P1 added `evaluate_for`). Per-seat
+`quota::evaluate` takes only the plan (`crates/services/src/quota.rs:258` at `893f915d1`; P1 added `evaluate_for`). Per-seat
 allowances (concurrency, relay, storage) need the billed seat count, so the tenant's
 `BillingInfo` gains `seats` (the subscription quantity, written by the webhook) and the
 limits are computed from `(plan, seats)`. Free has no seats; a paid org whose webhook has not
@@ -134,7 +134,7 @@ one. So `Core::plans_sold` (`crates/core/src/state.rs:131`) is true only where t
 self-host image and the compose build are both built without it. With it false, the one
 decision point refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and the
 two fences that read the plan outside it stand down too: the session cap
-(`crates/modules/remote/src/controller.rs:745`) and the meeting sweep
+(`crates/modules/remote/src/controller.rs:824`) and the meeting sweep
 (`crates/modules/conference/src/meeting_cap.rs:104`).
 
 ⚠️ Found while documenting P5, after P1 and P3 had merged. Without the flag, P1's
@@ -190,10 +190,10 @@ a live session is **never** ended by the fence (`business-model.md` §6 rule 4).
 like the device cap: no org is over it today.
 
 **As built (P3).** The authz gate reads the cap from the device's org
-(`org_session_cap_of`, `crates/modules/remote/src/controller.rs:652`) and hands it to the hub
+(`org_session_cap_of`, `crates/modules/remote/src/controller.rs:654`) and hands it to the hub
 in `DispatchCtx`, and in the body of a request relayed to the pod that owns the device. The
 hub counts that org's live sessions after its coalesce, so a re-asked session is not a
-second one (`crates/modules/fleet/src/hub.rs:1621`). Tenant affinity puts an org's devices
+second one (`crates/modules/fleet/src/hub.rs:1702`). Tenant affinity puts an org's devices
 and its controllers on one pod, so that pod's count is the org's. Redis leases are needed
 only for the one case affinity cannot place: a session to **another** org's device, which
 must count against the controller's org. That is **P3b** (#2637), live since 2026-10-21 with
@@ -201,20 +201,20 @@ must count against the controller's org. That is **P3b** (#2637), live since 202
 outsider's session (FR-52's extauth path) opens
 uncapped. A refusal is `org_session_limit`
 (`crates/remote_control/src/error.rs:41`), which the viewer does not retry
-(`ui/src/composables/useRemoteControl.ts:734`). It names the person and the device holding
+(`ui/src/composables/useRemoteControl.ts:783`). It names the person and the device holding
 the slot, and a Pro org at its cap (one per billed seat) is told the way past it is a
 session ending or Business. Kill switch `rc.org_session_cap = false`.
 
 ### P3b, as proposed: a cluster-wide session count that heals itself (O6 + O7 decided 2026-10-20)
 
 **Why P3's count cannot carry it.** P3 counts on the hub that owns the device
-(`crates/modules/fleet/src/hub.rs:1605`). Under tenant affinity, that hub holds every live
+(`crates/modules/fleet/src/hub.rs:1653`). Under tenant affinity, that hub holds every live
 session of the device's org, so the count is complete for a same-org session. A cross-org
 session breaks that assumption: the org that pays is the controller's, and its sessions live
 on whichever pods hold the devices they reach. Today FR-52's external path opens its session
-uncapped (`crates/modules/remote/src/extauth.rs:305`), waiting for this phase. P3's own count
+uncapped (`crates/modules/remote/src/extauth.rs:341`), waiting for this phase. P3's own count
 also has a documented race: the count and the insert are two steps, so two starts in the same
-instant can both pass (`hub.rs:1617`).
+instant can both pass (`hub.rs:1666`).
 
 **The record: session slots in the cluster directory.** C-1's directory
 (`crates/core/src/cluster/directory.rs`) already keeps per-entity records in Redis on exactly
@@ -254,7 +254,7 @@ sequenceDiagram
 **Why this is durable.**
 
 - **One atomic claim.** The Lua claim drops expired members, checks the count and adds the
-  session in one step, so the race at `hub.rs:1617` closes.
+  session in one step, so the race at `hub.rs:1666` closes.
 - **It heals itself.** A lease lives 90 s and is renewed every 30 s by the pod that holds the
   session. A pod that dies stops renewing, and its slots free themselves within 90 s. A Redis
   restart loses the set, but renewal is an upsert, so within one renewal round every live
@@ -271,7 +271,7 @@ sequenceDiagram
   P3's hub count stays as the fallback.
 
 **Whose quota an external session uses (O6 + O7, decided by the operator 2026-10-20).** FR-52's
-outsider is an account (`docs/fr/FR-52-cross-org-remote-access.md:388`). That account is not a
+outsider is an account (`docs/fr/FR-52-cross-org-remote-access.md:427`). That account is not a
 member of the device's org, and it may belong to several orgs of its own, or to none.
 
 - **No paid org is needed (O7).** Any account that may start an external session today still may.
@@ -372,7 +372,7 @@ flowchart LR
 - **PoPs are DB-free and must stay so.** Tickets cannot carry the flag: they live 24 h and are
   checked once, at connect (`crates/remote_control/src/derp_ticket.rs:33`). Instead the API,
   which already polls each PoP's `/stats`, sends the PoP the set on that poll, signed with the
-  ticket signer, which the PoP already verifies (`crates/derp-relay/src/main.rs:50`). A PoP
+  ticket signer, which the PoP already verifies (`crates/derp-relay/src/main.rs:56`). A PoP
   that has not heard a fresh set within 3 poll periods drops it: it fails open, never closed.
 - **The bucket** is per network (the org's mesh), at O3's rate: 1 Mbit/s on Free, 4 Mbit/s on
   paid plans. Over the bucket, a frame is dropped, as R4 already does for tunnels: WireGuard
@@ -521,8 +521,8 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | The parser, one for both readers | `crates/remote_control/src/turn_stats.rs:42` (`parse`), moved from the cluster's collector |
-| The PoP's store and its collector | `crates/derp-relay/src/main.rs:256` (`TurnUsage`), `:382` (the subscription to `TURN_STATS_REDIS`) |
-| The PoP's endpoint | `crates/derp-relay/src/main.rs:494` (`GET /stats/turn-usage`), under the prefix every PoP's nginx already proxies |
+| The PoP's store and its collector | `crates/derp-relay/src/main.rs:262` (`TurnUsage`), `:388` (the subscription to `TURN_STATS_REDIS`) |
+| The PoP's endpoint | `crates/derp-relay/src/main.rs:618` (`GET /stats/turn-usage`), under the prefix every PoP's nginx already proxies |
 | The signed request | `crates/remote_control/src/derp_ticket.rs:220` (sign), `:239` (verify): audience `derp-turn-usage`, a `region` claim, 60 s |
 | The pull | `crates/core/src/relay_load.rs:314` (`TurnUsagePull`), from endpoints whose `/stats` reports `turn_usage` (`:186`) |
 | The booking, one for both readers | `crates/core/src/turn_bytes.rs:86` (`record`). The cluster's claim key is P4b-1's, unchanged (`:71`) |
@@ -567,7 +567,7 @@ mechanism does not exist, so this section replaces it.
   session's bytes with no regard for packet type, so it would also hold WireGuard handshakes,
   which P4a was built never to do.
 - **The overlay already has the right lever.** A pair with no TURN grant stays on its DERP
-  floor (`crates/tunnel-core/src/overlay/relay_link.rs:2010`), and P4a already holds DERP's
+  floor (`crates/tunnel-core/src/overlay/relay_link.rs:2119`), and P4a already holds DERP's
   bulk frames to the plan's rate while letting every handshake through. The server can also
   stamp a pair's relay tier itself (`server_relay_verdict`,
   `crates/modules/network/src/overlay.rs:2312`), flipping both ends at once.
@@ -605,7 +605,7 @@ handshake held.
 ### P4c, as built (dark, 2026-10-23)
 
 Built as proposed, behind two switches that ship **off**: `relay_allowance.count_turn` for
-P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:415`, `:421`).
+P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:421`, `:427`).
 
 | Piece | Where |
 |---|---|
@@ -629,7 +629,7 @@ P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:415`,
   - **Enterprise has no relay allowance.** Its relay is "custom" on the ladder
     (`crates/db/src/models/tenant.rs:624`).
   - **The operator's orgs are exempt.** `relay_allowance.exempt_tenants`
-    (`crates/config/src/settings.rs:427`) names them, and `is_exempt`
+    (`crates/config/src/settings.rs:433`) names them, and `is_exempt`
     (`crates/services/src/relay_allowance.rs:42`) is asked by both the job and the org's page.
   - **That org's real seats are recorded** (data, in the annex).
 
@@ -659,6 +659,16 @@ P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:415`,
     restarts with the bucket drained re-established in gaps of at most 2.0 s.
   - **Not run there:** the unthrottled storm on CORPLAP-2. A fleet update mid-test left the
     org without its SOCKS front (#2836).
+- **#2820, fixed in agent 0.4.175** (#2921; the mechanics are in
+  `docs/overlay-nat-traversal.md`, *Phase D*). A pair already riding TURN now leaves it while
+  live. When the server stamps the pair DERP, the agent probes `/derp`, and the probe replaces
+  the TURN carrier only once a handshake over `/derp` latches. A peer that does not answer
+  within 15 s keeps the pair on TURN. One end on 0.4.175 is enough, since an older peer follows
+  it. Back under the allowance, the pair stays on DERP until it next re-establishes. The move
+  costs one direction a short window. On 0.4.175–0.4.177 it is up to one 5 s tick (2.6 s and
+  0.70 s measured). With #2952, which promotes at the latch, it is about a round trip when both
+  ends probe (nothing lost to a 20/s ping) and about 0.5 s when one end follows (0.57 s). A node
+  with no `/derp` connection open does not move at all (#2992).
 
 ### P4d, as built: exit nodes on Free
 
@@ -751,38 +761,84 @@ roughly 500 consumers. A meeting where everyone sends a camera and a microphone 
 fits. Pro's 50 (P1 raised it from 10) and Business's 100 (unchanged) do not, unless a
 room is piped across workers. That is O4.
 
+### O4, measured: one room is one worker thread (2026-10-26)
+
+Prod gave nothing to measure (one audio-only sample in the whole retention window,
+2026-10-26), so the bench builds the room itself.
+`crates/modules/conference/examples/room_capacity.rs` drives one mediasoup worker with the
+production settings (`media::worker_pool::worker_settings`, now the one function the pool
+uses too) and one router with the production codecs (`media::room_manager::media_codecs`).
+Its synthetic participants send what the client sends (`ui/src/stores/conference.ts`): one
+VP8 camera stream with no simulcast and one Opus stream each, with every participant
+consuming every other one's. Each sends RTP into its own `PlainTransport` and receives on an
+SRTP-encrypting one, so the per-consumer encryption (the N² half of the work) is paid as on
+a `WebRtcTransport`. The CPU is the worker *thread's*, from procfs. `get_resource_usage` is
+process-wide when the worker runs as a thread.
+
+⚠️ **It is an upper bound.** Not modelled, and each makes the real cost higher: ICE
+consent checks and DTLS, receiver RTCP (reports, transport-cc feedback, NACKs) and
+retransmission, and decrypting the senders' SRTP.
+
+| Per participant | Host | Last N delivering ≥ 97 % | The next step |
+|---|---|---|---|
+| VP8 1.58 Mbit/s (Chrome's ceiling for the client's unconstrained 640×480 capture) + Opus 40 kbit/s | Ryzen 9 9955HX3D (Zen 5) | **20**: worker 99.8 %, 88,200 pkt/s out | 25: 60 % |
+| the same | Ryzen 7 1700X (Zen 1) | **15**: worker 85 % | 20: 35 % |
+| VP8 0.53 Mbit/s + Opus | Zen 5 | **30**: worker 100 %, 92,800 pkt/s | 35: 69 % |
+| Opus only, everyone unmuted | Zen 5 | **40**: worker 76 % | 50: 89 % |
+
+Production's nodes are Ryzen 9 7950X3D (Zen 4), between the two hosts and much nearer the
+first.
+
+- **The ceiling is packets, not bits.** One worker thread forwards about 85,000–110,000
+  packets a second, whatever their size: audio's small packets saturate it at 109,000.
+- **Neither knob moved it.** `WorkerSettings::default()` in mediasoup 0.20 runs the worker at
+  `Debug` with every log tag on, although its own doc says `Error`. `Warn` measured the same.
+  io_uring off measured the same.
+- **A saturated worker floods its log.** It emits `BitrateProber … probe delay too high` as a
+  WARN, about 3,300 lines in one run. Production's `warn` floor passes them, so an overloaded
+  room would also fill the pod's log.
+- **A pod gives its four workers two CPUs between them**
+  (`roomler-ai-deploy/k8s/base/deployment-roomler2.yaml`), so it carries at most about two
+  such rooms at once.
+- **The client has its own ceiling.** At 50 people each participant would receive
+  49 × 1.6 Mbit/s ≈ 78 Mbit/s, which a home uplink and a browser decoding 16 tiles do not
+  sustain either.
+
+So neither Pro's 50 nor Business's 100 fits one room as built: about 20 people with
+cameras on. On 2026-10-27 the operator chose O4's second branch (*Open decisions*): [FR-127](FR-127-meeting-room-scales-past-one-worker.md).
+
 ## Phases
 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
-| P0 | Spec, registry row, issue | — | ✅ #2560 (`c5d36ca84`) |
+| P0 | Spec, registry row, issue | — | ✅ #2560 (`893f915d1`) |
 | P0-ops | Tombstone the orphaned orgs (owner account gone), with an export first | restore from the export | ✅ 2026-10-19 21:32Z — 62 of 62, backup verified first; **deleted outright 2026-10-20** (O5), from a second verified export |
-| P1 | The ladder: `Plan::limits_for(seats)`, Free = 10 users established + 100 devices + MagicDNS, unlimited chat; plan copy, commercial-use message on landing / docs / billing; snapshot tests | revert (data only) | ✅ merged #2565 (`ca7c23bdc`), promoted 2026-10-20 (`hosted-20261020-9776afb`); AC1 and AC2 field-verified on prod |
-| P2 | Per-seat Stripe: quantity at checkout, annual + EUR prices, quantity sync with proration, webhook stores seats/interval/currency/plan, plan change on the live subscription, summary route; integration tests against a recording fake Stripe; then Stripe **test mode** and an e2e checkout with a test card | `stripe.seat_sync = false`; absent annual ids hide annual | ✅ merged #2565 (`ca7c23bdc`) against the fake; proven against Stripe's test mode, including a test-card checkout in a real browser (#2604, AC3 + AC4). A Free `year` price that put annual on every page was fixed by #2603 |
-| P3 | Concurrency fence: counted by the device's hub, established, start-only, names the holder | `rc.org_session_cap = false` | ✅ merged #2571 (`83e9a9772`); field-verified on prod for one org (AC6's first half); the cross-org half is P3b |
-| P3b | A cross-org session counts against the org it is for, at that org's tier (Redis leases); no paid org needed; an account in no org gets Free's one session | `rc.org_session_cap = false`; `rc.session_slots = false` | ✅ **live and field-verified 2026-10-21**: #2637 (`726654b35` since the 2026-10-21 history rewrite), session slots in the cluster directory (*P3b, as proposed*), with O6 + O7 as the operator decided them on 2026-10-20. The integration lane ran all 11 `org_session_cap` tests, two pods among them. Promoted with `hosted-20261021-adbdadc`, then `rc.session_slots` switched on (deploy `596782e`), on the operator's go. In the field, both halves of AC6 hold: same-org with the slot doing the refusing (red, then green), and cross-org through FR-52's external path (field log) |
-| P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | 🟡 **live 2026-10-21**, switched on in the deploy repo (`f5940b7`) on the operator's go. At that moment 0 orgs were over their allowance, so it held nobody. On prod all three of AC7's clauses hold (field log): the throttle and the direct path since 2026-10-21, and the org relay since 2026-10-22. Each was measured as a pair against a DERP arm on the same org and ledger. Still owed: O3's usability items. The design was approved 2026-10-20 (*P4a — the DERP throttle*). P4a-1 (#2616, `d6235e5ee`) is on the API pods; P4a-3 (#2629, `b2c66f102`) is the analytics surface; P4a-2 (#2633, `11f18c33a`) merged 2026-10-20: the PoPs throttle by the set the API signs and pushes on its `/stats` poll, and a PoP that holds no set throttles nothing. All four PoPs have run it since 2026-10-21 06:11Z, and the API's push has reached every one since the 12:46Z promote (field log) |
-| P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | `relay_allowance.turn_attribution = false`; coturn flag off | ✅ **live on every coturn**: the cluster's since 2026-10-22, the PoPs' since 2026-10-23. Designed 2026-10-20 (#2619). P4b-1 (#2622, `54a3709ff`) makes TURN usernames name the paying org (`:org-`) and adds the collector. coturn-worker-1..3 are pinned to the 4.18.0 they ran, and they have published to Redis since 22:14–22:21Z (k8s-cluster-multi `e352c63`, one worker at a time; *As built* above). `relay_allowance.turn_attribution` has been on since 22:25:55Z (deploy `b656323`). AC8 is field-verified (field log). **P4b-2** (the PoPs' coturn, *P4b-2, as built*) merged in #2767 (`023ac05a1`). Its PoP half has been live on all four PoPs since 2026-10-23 09:41Z, each PoP keeping coturn's totals for the API to pull with a signed request (field log). The API's pull went live with the promote of `hosted-20261023-5b3eb0a` (18:02Z), and the PoPs' totals were booked once in the field (field log). The cost view reports TURN monitored behind the switch (#2782). Found while designing it: #2763, PoP-relayed DERP bytes would be booked once per API pod (latent), fixed by #2773 and live on both halves |
-| P4c | TURN throttle for over-allowance orgs | `relay_allowance.count_turn = false`; `relay_allowance.turn = false` | ✅ **on since 2026-10-23** (deploy `a29d397`), field-verified on prod (the field log): P4c-0 counts TURN toward the allowance, and P4c-1 moves over-allowance overlay pairs to the DERP floor (*P4c, as built*, #2791). O8–O10 decided by the operator; internal orgs (O11) by Enterprise's unlimited relay and the exempt list (#2798), live with it |
+| P1 | The ladder: `Plan::limits_for(seats)`, Free = 10 users established + 100 devices + MagicDNS, unlimited chat; plan copy, commercial-use message on landing / docs / billing; snapshot tests | revert (data only) | ✅ merged #2565 (`0be42a87c`), promoted 2026-10-20 (`hosted-20261020-9776afb`); AC1 and AC2 field-verified on prod |
+| P2 | Per-seat Stripe: quantity at checkout, annual + EUR prices, quantity sync with proration, webhook stores seats/interval/currency/plan, plan change on the live subscription, summary route; integration tests against a recording fake Stripe; then Stripe **test mode** and an e2e checkout with a test card | `stripe.seat_sync = false`; absent annual ids hide annual | ✅ merged #2565 (`0be42a87c`) against the fake; proven against Stripe's test mode, including a test-card checkout in a real browser (#2604, AC3 + AC4). A Free `year` price that put annual on every page was fixed by #2603 |
+| P3 | Concurrency fence: counted by the device's hub, established, start-only, names the holder | `rc.org_session_cap = false` | ✅ merged #2571 (`9a6394bd3`); field-verified on prod for one org (AC6's first half); the cross-org half is P3b |
+| P3b | A cross-org session counts against the org it is for, at that org's tier (Redis leases); no paid org needed; an account in no org gets Free's one session | `rc.org_session_cap = false`; `rc.session_slots = false` | ✅ **live and field-verified 2026-10-21**: #2637 (`8521dbc6a` since the 2026-10-21 history rewrite), session slots in the cluster directory (*P3b, as proposed*), with O6 + O7 as the operator decided them on 2026-10-20. The integration lane ran all 11 `org_session_cap` tests, two pods among them. Promoted with `hosted-20261021-adbdadc`, then `rc.session_slots` switched on (deploy `596782e`), on the operator's go. In the field, both halves of AC6 hold: same-org with the slot doing the refusing (red, then green), and cross-org through FR-52's external path (field log) |
+| P4a | Relay allowance on DERP: month-to-date, over-allowance set, token bucket, analytics quota slot | `relay_allowance.enabled = false` | 🟡 **live 2026-10-21**, switched on in the deploy repo (`f5940b7`) on the operator's go. At that moment 0 orgs were over their allowance, so it held nobody. On prod all three of AC7's clauses hold (field log): the throttle and the direct path since 2026-10-21, and the org relay since 2026-10-22. Each was measured as a pair against a DERP arm on the same org and ledger. Still owed: O3's usability items. The design was approved 2026-10-20 (*P4a — the DERP throttle*). P4a-1 (#2616, `39de8fe41`) is on the API pods; P4a-3 (#2629, `dcc78f3cd`) is the analytics surface; P4a-2 (#2633, `901230c55`) merged 2026-10-20: the PoPs throttle by the set the API signs and pushes on its `/stats` poll, and a PoP that holds no set throttles nothing. All four PoPs have run it since 2026-10-21 06:11Z, and the API's push has reached every one since the 12:46Z promote (field log) |
+| P4b | Per-org TURN attribution (`--redis-statsdb` → `turn_bytes`) | `relay_allowance.turn_attribution = false`; coturn flag off | ✅ **live on every coturn**: the cluster's since 2026-10-22, the PoPs' since 2026-10-23. Designed 2026-10-20 (#2619). P4b-1 (#2622, `a5afea6d3`) makes TURN usernames name the paying org (`:org-`) and adds the collector. coturn-worker-1..3 are pinned to the 4.18.0 they ran, and they have published to Redis since 22:14–22:21Z (k8s-cluster-multi `e352c63`, one worker at a time; *As built* above). `relay_allowance.turn_attribution` has been on since 22:25:55Z (deploy `b656323`). AC8 is field-verified (field log). **P4b-2** (the PoPs' coturn, *P4b-2, as built*) merged in #2767 (`1d69dbf9c`). Its PoP half has been live on all four PoPs since 2026-10-23 09:41Z, each PoP keeping coturn's totals for the API to pull with a signed request (field log). The API's pull went live with the promote of `hosted-20261023-5b3eb0a` (18:02Z), and the PoPs' totals were booked once in the field (field log). The cost view reports TURN monitored behind the switch (#2782). Found while designing it: #2763, PoP-relayed DERP bytes would be booked once per API pod (latent), fixed by #2773 and live on both halves |
+| P4c | TURN throttle for over-allowance orgs | `relay_allowance.count_turn = false`; `relay_allowance.turn = false` | ✅ **on since 2026-10-23** (deploy `a29d397`), field-verified on prod (the field log): P4c-0 counts TURN toward the allowance, and P4c-1 moves over-allowance overlay pairs to the DERP floor (*P4c, as built*, #2791), including, from agent 0.4.175, a pair already riding TURN (#2820). O8–O10 decided by the operator; internal orgs (O11) by Enterprise's unlimited relay and the exempt list (#2798), live with it |
 | P4d | Exit nodes on Free | revert (data only) | ✅ **live since 2026-10-24** (#2803, promoted with `hosted-20261024-6a327b8`), field-verified red then green on prod (*P4d, as built*, the field log) |
-| P5 | Meetings: Free 60-minute cap, established participant caps, measured SFU cost | `meetings.free_cap = false` | ✅ merged #2583 (`8ed9ccb34`); AC9 field-verified on prod 2026-10-20 in real time (warned at 55:00, ended at 60:00); the SFU measurement found nothing to measure (O4) |
+| P5 | Meetings: Free 60-minute cap, established participant caps, measured SFU cost | `meetings.free_cap = false` | ✅ merged #2583 (`83a74d0e0`); AC9 field-verified on prod 2026-10-20 in real time (warned at 55:00, ended at 60:00); the SFU measurement found nothing to measure, which opened O4: measured 2026-10-26 (#2931), decided 2026-10-27 (FR-127) |
 | P6 | Announcement email to real users, once P1 + P2 are live | — | ✅ sent 2026-10-20 13:55Z to every real user, after #2603's promote and an all-green AC5 re-check; the send log is in the private annex |
-| P7 | **Docs**: `business-model.md` (§4 ladder, §6 rule 4, §7), `compare/vs-tailscale.md`, a plans-and-limits page, with diagrams, linked from `docs/README.md` | — | ✅ `business-model.md` and `vs-tailscale.md` landed with P0/P1; [`plans-and-limits.md`](../plans-and-limits.md) merged #2592 (`94f9ab2c5`). P4's docs came with P4: the relay allowance and its TURN half in plans-and-limits (#2747, #2791, #2798), [`relay-cost-metering.md`](../relay-cost-metering.md) §B–§C (#2773, #2782), and P4d with P4c's switch-on (#2803) |
+| P7 | **Docs**: `business-model.md` (§4 ladder, §6 rule 4, §7), `compare/vs-tailscale.md`, a plans-and-limits page, with diagrams, linked from `docs/README.md` | — | ✅ `business-model.md` and `vs-tailscale.md` landed with P0/P1; [`plans-and-limits.md`](../plans-and-limits.md) merged #2592 (`da53b4053`). P4's docs came with P4: the relay allowance and its TURN half in plans-and-limits (#2747, #2791, #2798), [`relay-cost-metering.md`](../relay-cost-metering.md) §B–§C (#2773, #2782), and P4d with P4c's switch-on (#2803) |
 
 ## Acceptance criteria
 
-- [x] AC1 — A new Free org enrolls its 100th device and is refused the 101st with the plan message (prod).
-- [x] AC2 — A Free org's 11th member is refused, with `plan_enforcement` set to `warn` **and** to `off` (prod).
-- [x] AC3 — Checkout in Stripe test mode, monthly and annual, USD and EUR, charges quantity = seats, and the webhook stores plan, seats, interval and currency (integration test against test mode **and** an e2e checkout with a test card).
-- [x] AC4 — Adding and removing a member of a paid org changes the subscription quantity with a proration (integration test against test mode).
-- [x] AC5 — Landing page, docs home and billing page show the same per-seat prices, the annual price and EUR, and say Free allows commercial use (e2e).
-- [x] AC6 — A Free org's second concurrent remote session is refused at start with a message naming the session holding the slot, and the first session is untouched (prod, two browsers). A cross-org session counts against the controller's org.
-- [x] AC7 — A Free org over its relay allowance still connects over DERP at the throttled rate; a direct transfer and an org-relay transfer add **zero** relay bytes (unit, falsifiable as FR-20's; prod). Prod: 2026-10-21 (throttle, direct) and 2026-10-22 (org relay, three devices), each against a DERP arm on the same org and ledger. Unit: `derp.rs`'s billing tests pin that only a forwarded DERP frame bills.
-- [x] AC8 — `turn_bytes` is populated per org from coturn (prod). Four orgs within minutes of the switch, traced to known sessions (2026-10-22). The PoPs' coturn is P4b-2.
-- [x] AC9 — A Free meeting is warned at 55 and ended at 60 minutes (prod).
-- [x] AC10 — The orphaned orgs are tombstoned from an export, and no per-org view counts them (prod). Since 2026-10-20 they are deleted outright (O5), so no view can.
-- [x] AC11 — The announcement reached every real user and no internal or test account (send log).
-- [x] AC12 — Docs updated or created in the house style with diagrams, and linked from `docs/README.md`'s index. [`plans-and-limits.md`](../plans-and-limits.md) (three mermaid diagrams), [`relay-cost-metering.md`](../relay-cost-metering.md) and [`business-model.md`](../business-model.md), each with its row in the index, describe every phase as shipped (2026-10-24, P7).
+- [x] AC1 — A new Free org enrolls its 100th device and is refused the 101st with the plan message (prod). *Evidence:* the [red](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6287410221) and [green](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6288392507) runs, 2026-10-20.
+- [x] AC2 — A Free org's 11th member is refused, with `plan_enforcement` set to `warn` **and** to `off` (prod). *Evidence:* the [red](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6287410221) and [green](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6288392507) runs, 2026-10-20.
+- [x] AC3 — Checkout in Stripe test mode, monthly and annual, USD and EUR, charges quantity = seats, and the webhook stores plan, seats, interval and currency (integration test against test mode **and** an e2e checkout with a test card). *Evidence:* [four test-mode Checkout Sessions](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6288392507) and [a test-card checkout in a real browser](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6288528495), 2026-10-20; the tests are `fr115_testmode` in `crates/tests/src/billing_tests.rs` (#2604).
+- [x] AC4 — Adding and removing a member of a paid org changes the subscription quantity with a proration (integration test against test mode). *Evidence:* [a member joining and leaving a test-mode subscription](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6288392507), 2026-10-20 (`fr115_testmode`, #2604).
+- [x] AC5 — Landing page, docs home and billing page show the same per-seat prices, the annual price and EUR, and say Free allows commercial use (e2e). *Evidence:* [the USD half after #2603](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6292556892) and [the whole check once O1 was live](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6297695845), 2026-10-20 (the field log); `ui/e2e/billing.spec.ts` asserts the per-user prices, EUR and the commercial-use line.
+- [x] AC6 — A Free org's second concurrent remote session is refused at start with a message naming the session holding the slot, and the first session is untouched (prod, two browsers). A cross-org session counts against the controller's org. *Evidence:* [same org](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6288392507) (2026-10-20), [again with P3b's slots](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6316841775) and [cross-org, through FR-52's external path](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6319386639) (2026-10-21). The two controllers were the field harness's sockets, which the server cannot tell from two browsers.
+- [x] AC7 — A Free org over its relay allowance still connects over DERP at the throttled rate; a direct transfer and an org-relay transfer add **zero** relay bytes (unit, falsifiable as FR-20's; prod). Prod: [2026-10-21](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6327439900) (throttle, direct) and [2026-10-22](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6353286292) (org relay, three devices), each against a DERP arm on the same org and ledger. Unit: `derp.rs`'s billing tests pin that only a forwarded DERP frame bills.
+- [x] AC8 — `turn_bytes` is populated per org from coturn (prod). Rows for [two orgs ten minutes after the switch](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6352844378), and for [four within the hour, traced to known sessions](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6353286292) (2026-10-22). The PoPs' coturn is P4b-2, [booked once](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6372032236) (2026-10-23).
+- [x] AC9 — A Free meeting is warned at 55 and ended at 60 minutes (prod). *Evidence:* [backdated](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6288392507) and [in real time](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6289376161), 2026-10-20.
+- [x] AC10 — The orphaned orgs are tombstoned from an export, and no per-org view counts them (prod). Since 2026-10-20 they are deleted outright (O5), so no view can. *Evidence:* [tombstoned from a verified export](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6278525909) (2026-10-19), then deleted (the field log, 2026-10-20, #2611).
+- [x] AC11 — The announcement reached every real user and no internal or test account (send log). *Evidence:* [the send](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6292556892), 2026-10-20 13:55Z; the send log and its counts are in the private annex.
+- [x] AC12 — Docs updated or created in the house style with diagrams, and linked from `docs/README.md`'s index. [`plans-and-limits.md`](../plans-and-limits.md) (three mermaid diagrams), [`relay-cost-metering.md`](../relay-cost-metering.md) and [`business-model.md`](../business-model.md), each with its row in the index, describe every phase as shipped (2026-10-24, P7). At the close-out (2026-10-30), `plans-and-limits.md` §8 got O4's measurement and decision, and the index row for `relay-cost-metering.md` stopped calling coturn attribution unbuilt.
 
 ## Open decisions
 
@@ -791,7 +847,7 @@ room is piped across workers. That is O4.
 | O1 | Live Stripe prices: create the annual Prices and the EUR currency options in the live account, then set `ROOMLER__STRIPE__PRICE_PRO_ANNUAL`, `…__PRICE_BUSINESS_ANNUAL` and `ROOMLER__STRIPE__CURRENCIES=usd,eur` | **Decided 2026-10-20: yes, and done.** Both monthly Prices carry an EUR option at the USD number; annual Prices exist on the same products; the prod ConfigMap names them and sets `usd,eur` (the field log) |
 | O2 | Do pending invites count toward Free's 10? | no — a seat is a member who accepted |
 | O3 | Throttled rate for an over-allowance org | 1 Mbps per org on Free, 4 Mbps on paid plans, measured before it ships |
-| O4 | Pro's 50 and Business's 100 people per meeting, against one mediasoup worker per room (*Meetings, as built*) | the numbers stay as published; a synthetic-participant load test measures what one room carries, then either a room pipes across workers or the published numbers come down to the measured one |
+| O4 | Pro's 50 and Business's 100 people per meeting, against one mediasoup worker per room (*Meetings, as built*) | **Decided 2026-10-27 (operator): the second branch, the scaling as its own FR, then a re-measure.** Measured 2026-10-26: about 20 people with cameras on, 40 on audio alone (*O4, measured*; [#2557](https://github.com/gjovanov/roomler-ai/issues/2557#issuecomment-6412112517) put both branches to the operator). The choice is recorded where it was acted on: [FR-127](FR-127-meeting-room-scales-past-one-worker.md)'s issue ([#2985](https://github.com/gjovanov/roomler-ai/issues/2985), *"the operator's choice of O4's second branch"*) and its claim, #2986 (`51bbaabb9`). FR-127 builds receiving only the visible tiles, simulcast and a room piped across workers, then measures again, and the published caps follow that measurement (its AC8 and its decision 4). Until then the numbers stay as published |
 | O5 | AC10's "no per-org view counts them". Admin stats, plan compliance and weekly active orgs exclude the 62 tombstoned orphans. FR-102's growth **Orgs** list shows them with an *archived* chip, and a cohort view asked for more than its default 26 weeks would count them in their February cohorts. Hiding archived orgs outright would also hide an owner's own archive, which is the churn signal that list is for | **Decided 2026-10-20: remove them completely, and done.** Every document of the 62 is deleted (the field log), so no view lists or counts them |
 | O6 | Whose plan pays for an external (FR-52) session (*P3b, as proposed*)? | **Decided 2026-10-20 (operator): it uses the quota of the org it is for, at that org's tier.** The outsider picks the org on `/connect`, from all of their orgs, and the session takes one of that org's concurrent-session slots. An account in no org uses Free's quota (one session), counted against the account; the operator confirmed this case on 2026-10-21 |
 | O7 | Do accounts in no paid org get no external sessions? | **Decided 2026-10-20 (operator): no, no paid org is needed.** FR-52's helping-a-friend case keeps working without membership |
@@ -834,7 +890,7 @@ decision 5), and any limit on a self-hosted server — self-hosting stays free a
 | 2026-10-23 | **Promoted `hosted-20261023-ee827af`** (07:42Z, the operator's go), carrying #2740: the allowance set goes only to `/stats` endpoints that report an `allowance`. #2740 had left the poller's integration test stale, because its fake PoP reported no `allowance`. #2740 touched only `crates/core`, so the integration lane never ran on it, and master's run went red. The FR-90 session found it, and #2749 fixed it with a negative control | **Red → green:** `relay allowance push: refused … 405` went from 60 per 10 minutes per pod (three eu-central endpoints that are not PoPs, every 30 s poll) to **0** in both new pods. The four PoPs still got the set, `age_s` 4–5 s, and that freshness is the positive control: the new poller ran and pushed. All 27 agents were back within ~4 minutes, and both pods were subscribed to coturn's statistics |
 | 2026-10-23 | **P4b-2's PoP half, all four PoPs** one at a time, us-east first (09:35–09:41Z). New `derp-relay` from `hosted-20261023-023ac05`, coturn pinned to the 4.16.0 digest each already ran, a loopback-only Redis. Only the render, compose and binary steps ran, not a full `provision.sh`, whose apt-get can upgrade Docker on a live PoP | **Before the edit:** all four ran coturn 4.16.0 through `:latest`, with configs matching the repo's templates. A rehearsal on that exact digest gave the same totals format as 4.18.0. **On every PoP:** `turn_usage` went absent → present on `/stats`; the unsigned pull went **404 → 401**; coturn logged its Redis connection and the auto-deny of the Redis host; derp-relay subscribed; Redis listened on loopback only. The fleet TURN health check was **OK** on every probe (STUN over UDP, TCP and TLS, UDP and TLS allocations, the relay echo, DERP), and its own allocations arrived as totals, **`kept` 0 → 8** per PoP. No PoP had a live TURN allocation when it restarted. **Still owed:** the booking, which needs the API's pull, which needs a promote |
 | 2026-10-23 | **#2763's PoP half, all four PoPs** one at a time, us-east first (11:03–11:06Z): `derp-relay` from `hosted-20261023-e587e31` (#2773), a binary swap only, after a run on the PoPs' base image with a throwaway ticket key | **On every PoP:** `/stats` gained a top-level `boot`, equal to `turn_usage.boot`; `healthz` 200; the unsigned pull still 401; the allowance set re-pushed within 5 s. No PoP had a DERP registration, so no session dropped. Detail on #2763 |
-| 2026-10-23 | **Promoted `hosted-20261023-5b3eb0a`** (18:02:17Z, the operator's go), carrying P4b-2's pull (#2767) and #2763's API half (#2773) with other FRs' merged work; gated on `ad38ef2a2`'s CI, integration and installer smoke, the image's own commit plus a test-only change | Pods up at 18:02:31Z and 18:02:48Z, 0 restarts. **28/28** agents seen in the 30 min before the roll were back by 18:07Z. No `relay allowance push: refused`, both pods subscribed for TURN with no warning, and no pull error |
+| 2026-10-23 | **Promoted `hosted-20261023-5b3eb0a`** (18:02:17Z, the operator's go), carrying P4b-2's pull (#2767) and #2763's API half (#2773) with other FRs' merged work; gated on `94e8ce768`'s CI, integration and installer smoke, the image's own commit plus a test-only change | Pods up at 18:02:31Z and 18:02:48Z, 0 restarts. **28/28** agents seen in the 30 min before the roll were back by 18:07Z. No `relay allowance push: refused`, both pods subscribed for TURN with no warning, and no pull error |
 | 2026-10-23 | **P4b-2 end to end on us-east** (18:10–18:29Z): from inside the PoP's coturn container, two `turnutils_uclient` runs, one uncharged and one charged to an id that is no tenant, while a subscriber on the PoP's statistics Redis captured coturn's own totals. The row above (09:41Z) is the before-state: totals kept, no pull to book them | **Charged:** the 8 legs coturn had published at the verdict, `sentb` **98,808**, were booked **98,808**, once: one row, 8 claim keys, one per leg. A ninth leg that ended later (252 bytes) got its own key and row. **Uncharged:** both pods logged all 8 legs unattributed, so each pulled every total, and nothing was claimed or booked. Real traffic too: the pull booked 6 charged legs of 2 orgs on eu-north by 18:24Z. Cleanup: the probe's rows deleted, the capture stopped (its `docker exec`'d `redis-cli` outlived its unit and was killed by PID), files removed |
 | 2026-10-23 | **P4c's red on the live deploy** (`hosted-20261023-0c0d5ff`, which predates #2791). Two Free orgs with no devices each got one synthetic 11 GB `turn_bytes` row in the hourly ledger (21:40Z): a throwaway org (excluded from growth) and one of the operator's. The rows were dated to a closed day so the daily rollup never folds them in. P4c-1's rig is the integration test's: three simulated agents over real agent WebSockets, with TEST-NET endpoints and srflx, a and b reading server verdicts, c too old to | **P4c-0:** after more than one job period (21:46Z), the over-allowance set held **neither** network, and the throwaway org's page read `used_bytes: 0` beside its 11 GB of TURN. **Positive control:** an 11 GB `derp_bytes` row put its network in the set within a minute (21:49:41Z, 125,000 B/s). Its page then read `used_bytes` 11,000,000,000, the DERP row alone beside the TURN row. So the job was alive, and ignoring TURN. **P4c-1:** inside the allowance, a's verdict for b was `single-relay-anchor`, and a and c were both granted TURN. **Over it (by DERP), the same:** `single-relay-anchor`, TURN to a and to c, no pin. Removing the DERP row cleared the set by 21:54:44Z |
 | 2026-10-23 | **P4d's red, same deploy**: the throwaway Free org's admin enables an exit node on an id that names no node. The plan gate runs before the lookup (`set_exit_node`), so the answer is the gate's alone | In `enforce`: **403**, *"Exit nodes are not available on the Free plan. Upgrade to enable."* In `warn`, every new org's default: **404**, from the lookup. So the gate let it through and only counted a collision. The org went back to `warn` |
@@ -850,5 +906,9 @@ decision 5), and any limit on a self-hosted server — self-hosting stays free a
 | 2026-10-25 | **O3, the usability measurement at Free's rate** (agents 0.4.169). Two containers in a throwaway Free org (growth-excluded) with all UDP egress dropped, so the pair rides only the DERP floor (`relay:derp/tcp`, 2 ms). The org went over its allowance *before* the pair formed, so P4c-1 granted no TURN. The relay's drop counter showed the bucket full in every loaded run. Transport: roomler SSH on 2222 | **Bulk over kernel TCP (HTTP): 0.85–0.86 Mbit/s**, 64 MB in 600 s, so 100 MB in about 16 min (unthrottled: 154 Mbit/s). **Typing** (a PTY echo over roomler SSH, one key every 250 ms): idle p50 2 / p95 4 / max 12 ms. With a bulk holding the bucket full: p50 3–4 / p95 44–45 / max 82 ms, **0 of 120 lost**. **Bulk over roomler SSH (`scp`): 48.5 kbit/s**, 1 MiB in 173 s (unthrottled: 66 Mbit/s). So the rate is usable, but roomler SSH was not: its server side is smoltcp, which ran with no congestion control (#2876). Fixing that exposed #2882: a dropped netstack stream lost its unacknowledged tail, and the reader saw a clean EOF. #2884 fixed both (0.4.170) |
 | 2026-10-25 | **#2876's cause, and its fix**, same rig and throttle. On the released 0.4.170, Reno's gain did not hold up: 35 kbit/s. One instrumented build isolated the cause: master on smoltcp 0.13.1, runtime knobs, and an RTO trace per retransmit. Then master on smoltcp 0.14.0 was interleaved with 0.4.170 on the device node. Each run is a 1 MiB `scp` over roomler SSH | **Cause:** smoltcp 0.13.1 doubled the RTO on every *fast* retransmit and resent the whole window. Only an RTT sample from never-sent data collapsed the backoff, and every retransmit aborted that sample, so a policed path pinned the timer at 60 s (trace `2000 4000 … 60000`). With knobs only: stock 33 and 101 kbit/s; no fast-retransmit backoff, plus a collapse on every ACK of new data, **803 kbit/s**. **Fix: smoltcp 0.14.0 (#2899).** Four runs at **535–805 kbit/s**, each done in 10–16 s, with the RTO at most 2 s, against 0.4.170's 77 and 67 kbit/s. Kernel TCP: 0.86 Mbit/s. Typing beside a roomler SSH bulk: p50 2 / p95 7 / max 43 ms. Unthrottled 8 MiB: 70.1 and 52.6 Mbit/s against 73.1 and 51.1, so no regression. **Wrong turn:** the 13:17Z reading blamed the 1 s RTO floor, but a 200 ms floor alone collapses the same way over a 30 ms round trip |
 | 2026-10-25 | **O3, the paid rate**, on the operator's go. The same throwaway org was switched Free → Pro by a direct write to its `plan`. It had no billing, so it counted one seat. A synthetic DERP row put it past Pro's one-seat allowance, so the set held its network at 500,000 B/s. Afterwards it went back to Free, with every row it got deleted (`plan=free`, `billing=null`, the set absent). Each run is 8 MiB from the device to the client | **HTTP over kernel TCP: 3.62 and 3.63 Mbit/s.** `scp` over roomler SSH: 0.4.170 **did not finish in 150 s** (2.6 MB and 3.7 MB), while smoltcp 0.14 held **3.23 and 3.21 Mbit/s** (89% of kernel TCP). Typing on 0.14 beside an 8 MiB bulk: 60/60 keystrokes, p50 2 / p95 11 / max 43 ms. The paid bucket behaves like Free's at four times the rate, and #2876 is no artefact of Free's low one (#2557 -6401254452) |
-| 2026-10-25 | **#2876 on the published agent 0.4.171** (tagged `agent-v0.4.171` on `0831dd289`, published 18:28:01Z, 37 assets). The binary under test came out of the released x86_64 `.deb`, whose SHA-256 matched its published sidecar. It was interleaved with 0.4.170 on the device node under Free's throttle, each run a 1 MiB `scp` | **0.4.171: 803, 804 and 538 kbit/s**, each done in 10–16 s, with every file's SHA-256 intact. **0.4.170: 77 kbit/s, then not finished in 150 s** (999,424 B). Kernel TCP: 0.86 Mbit/s. **#2876 and #2882 closed** (-6401683455, -6400998813). The throttle was lifted, and the org's rows deleted |
+| 2026-10-25 | **#2876 on the published agent 0.4.171** (tagged `agent-v0.4.171` on `dfa9fa178`, published 18:28:01Z, 37 assets). The binary under test came out of the released x86_64 `.deb`, whose SHA-256 matched its published sidecar. It was interleaved with 0.4.170 on the device node under Free's throttle, each run a 1 MiB `scp` | **0.4.171: 803, 804 and 538 kbit/s**, each done in 10–16 s, with every file's SHA-256 intact. **0.4.170: 77 kbit/s, then not finished in 150 s** (999,424 B). Kernel TCP: 0.86 Mbit/s. **#2876 and #2882 closed** (-6401683455, -6400998813). The throttle was lifted, and the org's rows deleted |
 | 2026-10-25 | **O3, a remote-desktop session over the overlay**, the last O3 item (#2557 -6402633621). A new node in the throwaway org ran the published 0.4.171 with its own desktop: Xvfb at 1280×720 with openbox, a clock, a terminal and xeyes. Its `rc_overlay` was on, and its UDP was open only to DNS and the overlay prefix. The viewer was the remote-desktop e2e spec's headless Chromium, inside the client node's network namespace. As FR-121 provides, it named the device it runs on, so the server handed it that device's loopback relay; every other TURN server was stripped. So the only possible pair was overlay to overlay, and every session selected the agent's candidate on its overlay address. Each session is 60 s, **light** (the clock plus a terminal redrawing twice a second) or **heavy** (plus a full-screen terminal scrolling without pause) | **Light:** fps p50 16 unthrottled (308 kbit/s), **16 at Free's rate** (346 kbit/s), **17 at the paid rate** (372 kbit/s), so unaffected. **Heavy:** fps p50 40 unthrottled (3.1 Mbit/s), **12 at Free's** (634 kbit/s), **27 at the paid** (2.67 Mbit/s). The stream is held to the bucket and degrades without stalling. In all six sessions: connect 0.31–0.45 s, first frame 1.5–2.4 s, RTT p50 4–11 ms, **no sample at zero fps**. With the bulk and typing rows above, 1 Mbit/s keeps the mesh usable, so the policy and the Free rate stand. **O3 is complete.** Afterwards the org went back to Free with every row deleted. A first driver run died when a bulk agent update restarted the rig host's own daemon mid-run (its systemd cgroup took the job), which left the Free throttle on until it was cleaned by hand. The rerun used a transient unit |
+| 2026-10-26 | **O4: what one room carries.** Prod first: a read-only aggregate of `stats_call_user` found one audio-only sample (33 kbit/s up) in the whole retention window, so no field calibration exists. Then `examples/room_capacity.rs` (*O4, measured*), production's worker settings and codecs, on a Ryzen 9 9955HX3D and on a Ryzen 7 1700X. Each step held 5 s, then 15 s measured, ramping N until under 90 % delivered | **Cameras at Chrome's 640×480 ceiling (1.58 Mbit/s VP8 + 40 kbit/s Opus):** delivered 100 % up to N = 20 (worker 99.8 %, 88,200 pkt/s, 653 Mbit/s), 60 % at 25. On Zen 1: 100 % at 15 (85 %), 35 % at 20. **0.53 Mbit/s VP8:** 100 % at 25 (89 %), 97 % at 30 (100 %), 69 % at 35. **Audio only:** 100 % at 40 (76 %), 89 % at 50 (100 %, 109,000 pkt/s). `--log-level warn` and `--no-liburing` measured the same as production's defaults. A saturated worker logged about 3,300 `BitrateProber … probe delay too high` WARNs. **One room carries about 20 people with cameras on, against Pro's 50 and Business's 100** |
+| 2026-10-26 | **#2820, the fix, red to green.** The throwaway org's rig: nodes in containers behind a firewall that admits UDP only from the relay fleet, with the DERP floor off, so a pair forms on TURN. A synthetic 11 GB `derp_bytes` row put the org over, once per run. Red on the published 0.4.172, then three builds of #2921 | **Red (0.4.172):** both pods re-stamped, and the pair stayed on `relay:turn/udp` for all 6 minutes. **v1 (DERP installed straight over TURN) ✗:** a peer whose `/derp` had never opened sat with no carrier for 12 min. **v2 (probe `/derp` first):** a peer without `/derp` kept TURN; a peer with it, older or not, followed the nudge and the pair moved. A pod roll mid-run rebuilt both DERP carriers in 3 s. **v3 (the promotion forgets the pair's relay state):** no way back by regrade, so back under the pair stays on DERP. Detail: #2820's step log |
+| 2026-10-26 | **#2820 on the published agent 0.4.175** (tagged `agent-v0.4.175` on `45d52aa36`, published 11:39:58Z, 37 assets). Both ends ran the binary from the released x86_64 `.deb`. The row put the org over at 11:43:30Z, and a ping every 200 ms ran across the move | **Moved while live:** the stamp reached both ends in the same millisecond (11:43:59.55Z). Both probed `/derp` and promoted after 1641 and 4274 ms, then held `relay:derp/tcp` both ways for the whole over window. **Ping:** 2032 sent, 2020 answered. All 12 losses fall in one 2.6 s window, the time between the two promotions (#2952). Back under (11:54:09Z), the pair stayed on DERP, as designed. The updater's check-only offered 0.4.175 on Windows, Linux and macOS. **#2820 closed** (-6415538685). The row was removed |
+| 2026-10-30 | **The close-out**, read-only. Each ticked criterion's evidence was opened on #2557 and read against what its tick claims. Every PR the evidence cites, and every commit the spec cites, was checked against master | **All twelve hold**, and each now links its evidence (*Acceptance criteria*). All 29 cited PRs are merged. Every cited commit is on master, except the deploy-repo and cluster-repo commits, which the rows above name as such. AC6's two controllers were the field harness's sockets, not two browsers; the server cannot tell them apart. AC8's note said four orgs "within minutes"; its evidence shows two at ten minutes and four within the hour, so the note now says that. **AC5's page, read live on 2026-10-31:** the served HTML is the build-time fallback, with no EUR or annual line. `initPrices` in the served `home.js`, run against the live `/api/stripe/plans`, renders both as the 2026-10-20 row quotes them, with no yearly line on Free. So a plain fetch of the page does not see EUR or annual, and that is not a regression. Free's `year` entries at $0 are by design once annual is on sale (`get_plans`' test), and no page shows them. **O4** was decided by the operator on 2026-10-27: FR-127. **Two docs statements were stale** and are corrected: `plans-and-limits.md` §8 still called a room's capacity unmeasured, and the index row for `relay-cost-metering.md` still said coturn attribution was deliberately not built |

@@ -37,6 +37,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     hive_host();
+    worker_calls();
     windows_main_stack();
 
     #[cfg(windows)]
@@ -91,6 +92,21 @@ fn hive_host() {
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if hive && matches!(os.as_str(), "linux" | "macos" | "windows") {
         println!("cargo::rustc-cfg=hive_host");
+    }
+}
+
+/// FR-90 P8-2b-1, P8-2b-3 — `cfg(worker_calls)`: a session's worker takes the
+/// daemon's calls (P8-2a-2's endpoints, P8-2a-4b's egress fronts). That is the
+/// `vault` feature, on every OS it builds for: a listener crosses as
+/// `SCM_RIGHTS` on the second channel on Unix (`worker/fds.rs`, gated
+/// `cfg(all(worker_calls, unix))` on top of this), and inside the call's own
+/// frame as `WSAPROTOCOL_INFOW` on Windows, since there is no second channel
+/// there (P8-2b-3). Read from Cargo's environment, as [`hive_host`] is.
+fn worker_calls() {
+    println!("cargo::rustc-check-cfg=cfg(worker_calls)");
+    let vault = std::env::var_os("CARGO_FEATURE_VAULT").is_some();
+    if vault {
+        println!("cargo::rustc-cfg=worker_calls");
     }
 }
 

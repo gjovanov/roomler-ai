@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::time::{Duration, Instant};
 
 use boringtun::noise::errors::WireGuardError;
@@ -529,6 +529,15 @@ pub struct PeerStats {
     /// per [`RPF_LOG_THROTTLE_MS`] so neither a spoofing flood nor a
     /// misconfigured subnet router turns a per-packet check into a log flood.
     rpf_logged_at: AtomicU64,
+    /// #2952 — woken the moment [`handshake`](Self::handshake) latches, on a
+    /// session that is a make-before-break PROBE ([`WgDevice::insert_probe`]
+    /// arms it; an installed peer's stays unset). The runtime promotes on it
+    /// instead of on its next 5 s sweep. Promoting drops the old carrier, so
+    /// while the two ends promote at different moments one direction has
+    /// none: the gap was the time between the two sweeps (2.6 s measured on
+    /// 0.4.175). Set once, and the latch it reports is set-once too, so a
+    /// promoted session never fires it again.
+    latch_wake: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
 }
 
 /// P3 PR-B — process-monotonic epoch for [`PeerStats::handshake_at`] stamps.
@@ -763,6 +772,28 @@ impl Drop for Peer {
     }
 }
 
+/// Send one handshake initiation for `tunn` over `carrier`, `after` from now
+/// (zero: at once). rc.211 — the bytes are formatted under the session lock
+/// and sent once it is released, the same split as the timer tasks.
+fn spawn_initiation(tunn: Arc<Mutex<Tunn>>, carrier: Arc<Carrier>, after: Duration) {
+    tokio::spawn(async move {
+        if !after.is_zero() {
+            tokio::time::sleep(after).await;
+        }
+        let mut buf = vec![0u8; WG_BUF];
+        let out = {
+            let mut t = tunn.lock().await;
+            match t.format_handshake_initiation(&mut buf, false) {
+                TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
+                _ => None,
+            }
+        };
+        if let Some(b) = out {
+            let _ = carrier.send(&b).await;
+        }
+    });
+}
+
 /// rc.134/143 — shared-routes demux for N direct-LAN peers. One UDP socket
 /// **per usable LAN interface** (each bound to its interface IP, not `0.0.0.0`
 /// — rc.143), and one recv loop per socket, all routing into a single shared
@@ -987,6 +1018,10 @@ pub struct WgDevice {
     /// peer that can only relay). Empty unless the feature is on + an upgrade is
     /// in flight.
     probes: HashMap<[u8; 32], Peer>,
+    /// #2952 — fired by any probe's handshake latch ([`PeerStats::latch_wake`]);
+    /// the runtime selects on it ([`Self::probe_latch_wake`]) to promote at the
+    /// latch. One per device: a wake means "sweep the probes", not which one.
+    probe_latched: Arc<tokio::sync::Notify>,
     /// P1 (S6) — the shared send half (Router + send-triple mirror). This
     /// device is the SOLE writer; the outbound pump reads. See [`WgSender`].
     send: WgSender,
@@ -1058,6 +1093,7 @@ impl WgDevice {
                 public,
                 peers: HashMap::new(),
                 probes: HashMap::new(),
+                probe_latched: Arc::new(tokio::sync::Notify::new()),
                 send: WgSender::new(),
                 tun_tx,
                 next_index: 1,
@@ -1362,6 +1398,91 @@ impl WgDevice {
         carrier: Arc<Carrier>,
         initiate: bool,
     ) {
+        let peer = self.build_carrier_session(peer_public, overlay_ip, carrier.clone());
+        let (tunn, stats) = (peer.tunn.clone(), peer.stats.clone());
+        if let Some(old) = self.peers.insert(peer_public, peer) {
+            self.unregister_plane_route(&old);
+        }
+        self.send_install(
+            peer_public,
+            overlay_ip,
+            tunn.clone(),
+            carrier.clone(),
+            stats,
+        );
+        self.debug_assert_send_synced();
+        if initiate {
+            spawn_initiation(tunn, carrier, Duration::ZERO);
+        }
+    }
+
+    /// #2820 — a shadow probe over a carrier with its own receive loop (a
+    /// `/derp` carrier): the session [`add_peer`](Self::add_peer) would
+    /// install, held in `probes` instead, so the peer's active carrier keeps
+    /// all its traffic until this one is PROVEN. It promotes and drops exactly
+    /// as a direct probe does ([`promote_direct_probe`](Self::promote_direct_probe),
+    /// [`drop_direct_probe`](Self::drop_direct_probe)), and replaces any probe
+    /// already in flight for the peer.
+    ///
+    /// A latched handshake is the proof: the peer answered over this carrier,
+    /// so it can be reached there. The initiation goes out after `initiate_after`
+    /// rather than at once, so a peer that follows the carrier only once it
+    /// hears from us over it (demote-follow) has registered for it when the
+    /// handshake arrives.
+    pub async fn start_relay_probe(
+        &mut self,
+        peer_public: [u8; 32],
+        overlay_ip: Ipv4Addr,
+        carrier: Arc<Carrier>,
+        initiate_after: Duration,
+    ) {
+        self.drop_direct_probe(&peer_public).await;
+        let peer = self.build_carrier_session(peer_public, overlay_ip, carrier.clone());
+        let tunn = peer.tunn.clone();
+        self.insert_probe(peer_public, peer);
+        spawn_initiation(tunn, carrier, initiate_after);
+    }
+
+    /// #2952 — the wake every probe's handshake latch fires
+    /// ([`PeerStats::latch_wake`]). The runtime selects on it and sweeps its
+    /// probes at once, so a probe is promoted at its latch rather than up to a
+    /// fallback tick (5 s) later. The tick still sweeps: deadlines expire
+    /// there, and it is the floor if a wake were ever missed.
+    pub fn probe_latch_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.probe_latched.clone()
+    }
+
+    /// Hold `peer` as `peer_public`'s make-before-break probe, armed to wake
+    /// the runtime when its handshake latches. Both probe kinds come through
+    /// here ([`Self::start_direct_probe`], [`Self::start_relay_probe`]).
+    ///
+    /// The session's receive path is already running, so its latch can beat
+    /// the arming: a LAN reply needs only a round trip. The fence pairs with
+    /// the one at the latch in `process_inbound`, so whichever comes second
+    /// sees the other and the wake fires exactly when it is due. Firing twice
+    /// costs one empty sweep.
+    fn insert_probe(&mut self, peer_public: [u8; 32], peer: Peer) {
+        // A session is filed as a probe once, when it is built; an armed one
+        // coming back here would mean some path re-files a probe it took out.
+        let armed = peer.stats.latch_wake.set(self.probe_latched.clone());
+        debug_assert!(armed.is_ok(), "a probe session armed twice");
+        fence(Ordering::SeqCst);
+        if peer.stats.handshake.load(Ordering::Relaxed) {
+            self.probe_latched.notify_one();
+        }
+        self.probes.insert(peer_public, peer);
+    }
+
+    /// A fresh WireGuard session for `peer_public` over `carrier`, with its
+    /// recv + timer tasks running: the part [`add_peer`](Self::add_peer) and
+    /// [`start_relay_probe`](Self::start_relay_probe) share. It is installed
+    /// nowhere: the caller puts it in `peers` or in `probes`.
+    fn build_carrier_session(
+        &mut self,
+        peer_public: [u8; 32],
+        overlay_ip: Ipv4Addr,
+        carrier: Arc<Carrier>,
+    ) -> Peer {
         let index = self.alloc_index();
 
         let tunn = Tunn::new(
@@ -1469,45 +1590,15 @@ impl WgDevice {
             }
         });
 
-        if let Some(old) = self.peers.insert(
-            peer_public,
-            Peer {
-                tunn: tunn.clone(),
-                carrier: carrier.clone(),
-                overlay_ip,
-                tasks: vec![recv_task, timer_task],
-                stats: stats.clone(),
-                direct_src: None,
-                plane_idx: None,
-                direct_index: None,
-            },
-        ) {
-            self.unregister_plane_route(&old);
-        }
-        self.send_install(
-            peer_public,
+        Peer {
+            tunn,
+            carrier,
             overlay_ip,
-            tunn.clone(),
-            carrier.clone(),
+            tasks: vec![recv_task, timer_task],
             stats,
-        );
-        self.debug_assert_send_synced();
-
-        if initiate {
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; WG_BUF];
-                // rc.211 — same lock-then-send split as the timer tasks.
-                let out = {
-                    let mut t = tunn.lock().await;
-                    match t.format_handshake_initiation(&mut buf, false) {
-                        TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
-                        _ => None,
-                    }
-                };
-                if let Some(b) = out {
-                    let _ = carrier.send(&b).await;
-                }
-            });
+            direct_src: None,
+            plane_idx: None,
+            direct_index: None,
         }
     }
 
@@ -1821,7 +1912,7 @@ impl WgDevice {
         {
             // Deliberately NOT added to the router — routing stays on the active
             // (relay) peer in `peers` until this probe is promoted.
-            self.probes.insert(peer_public, peer);
+            self.insert_probe(peer_public, peer);
         }
     }
 
@@ -1927,10 +2018,7 @@ impl WgDevice {
     #[cfg(test)]
     pub fn test_latch_probe_handshake_done(&self, peer_public: &[u8; 32]) {
         if let Some(p) = self.probes.get(peer_public) {
-            p.stats.handshake.store(true, Ordering::Relaxed);
-            p.stats
-                .handshake_at
-                .store(mono_ms_now().max(1), Ordering::Relaxed);
+            latch_handshake(&p.stats);
         }
     }
 
@@ -2266,10 +2354,7 @@ impl WgDevice {
     #[cfg(test)]
     pub fn test_latch_handshake_done(&self, peer_public: &[u8; 32]) {
         if let Some(p) = self.peers.get(peer_public) {
-            p.stats.handshake.store(true, Ordering::Relaxed);
-            p.stats
-                .handshake_at
-                .store(mono_ms_now().max(1), Ordering::Relaxed);
+            latch_handshake(&p.stats);
         }
     }
 
@@ -2400,14 +2485,30 @@ pub(crate) async fn process_inbound(
     // exactly the "punch succeeded" signal the health deadline needs. Set-once;
     // the Tunn lock is already held here (rc.137: never lock it from the sweep).
     if !stats.handshake.load(Ordering::Relaxed) && t.time_since_last_handshake().is_some() {
-        stats.handshake.store(true, Ordering::Relaxed);
-        // P3 PR-B — stamp the latch instant (recv-path precision; the sweep's
-        // 5 s tick only OBSERVES it later). `max(1)`: 0 is the unset sentinel.
-        stats
-            .handshake_at
-            .store(mono_ms_now().max(1), Ordering::Relaxed);
+        latch_handshake(stats);
     }
     authenticated
+}
+
+/// Record that a session's WireGuard handshake completed: the set-once
+/// [`PeerStats::handshake`] latch, the instant it latched, and, for a probe,
+/// the wake that has the runtime promote it now. One function, so the test
+/// helpers that fake a latch run exactly what the receive path runs.
+fn latch_handshake(stats: &PeerStats) {
+    stats.handshake.store(true, Ordering::Relaxed);
+    // P3 PR-B — stamp the latch instant (recv-path precision; the sweep's
+    // 5 s tick only OBSERVES it later). `max(1)`: 0 is the unset sentinel.
+    stats
+        .handshake_at
+        .store(mono_ms_now().max(1), Ordering::Relaxed);
+    // #2952 — a probe's latch wakes the runtime to promote it now. The fence
+    // pairs with the one in `WgDevice::insert_probe`: whichever of the latch
+    // and the arming comes second sees the other, so a latch is never left to
+    // wait for the tick (which still sweeps regardless).
+    fence(Ordering::SeqCst);
+    if let Some(wake) = stats.latch_wake.get() {
+        wake.notify_one();
+    }
 }
 
 /// Phase C — the WireGuard datagram shape: a 4-byte little-endian message type
@@ -2845,6 +2946,202 @@ mod tests {
             dev.peer_traffic(&pk).is_some(),
             "the active carrier survives an unrelated probe drop"
         );
+    }
+
+    /// #2952 — a probe's handshake latch wakes the runtime, which then
+    /// promotes at once instead of on its 5 s tick. Both probe kinds wake it,
+    /// an installed peer's latch does not, and a latch that beat the arming
+    /// (the receive path runs before the probe is filed) wakes it at the
+    /// arming.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_latch_wakes_the_runtime_and_an_installed_peers_does_not() {
+        let kp = WgKeypair::generate();
+        let peer = WgKeypair::generate();
+        let (mut dev, _rx) = WgDevice::new(kp.secret.clone());
+        let pk = peer.public.to_bytes();
+        let overlay_ip = Ipv4Addr::new(100, 64, 0, 4);
+        let carrier =
+            |port: u16| Carrier::relay(Arc::new(OkRelay), SocketAddr::from(([127, 0, 0, 1], port)));
+        let wake = dev.probe_latch_wake();
+        let woke = |w: Arc<tokio::sync::Notify>| async move {
+            tokio::time::timeout(Duration::from_millis(200), w.notified())
+                .await
+                .is_ok()
+        };
+
+        // An installed peer's latch is not a probe's.
+        dev.add_peer(pk, overlay_ip, carrier(11), false);
+        dev.test_latch_handshake_done(&pk);
+        assert!(
+            !woke(wake.clone()).await,
+            "an installed peer's latch must not wake the probe sweep"
+        );
+
+        // A relay probe (#2820's /derp probe) wakes it when it latches.
+        dev.start_relay_probe(pk, overlay_ip, carrier(12), Duration::from_secs(60))
+            .await;
+        assert!(!woke(wake.clone()).await, "nothing has latched yet");
+        dev.test_latch_probe_handshake_done(&pk);
+        assert!(
+            woke(wake.clone()).await,
+            "a relay probe's latch wakes the sweep"
+        );
+
+        // So does a direct (make-before-break upgrade) probe.
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        dev.ensure_direct_demux(sock.clone());
+        dev.start_direct_probe(sock, pk, overlay_ip, "127.0.0.1:13".parse().unwrap(), false)
+            .await;
+        assert!(!woke(wake.clone()).await, "the new probe has not latched");
+        dev.test_latch_probe_handshake_done(&pk);
+        assert!(
+            woke(wake.clone()).await,
+            "a direct probe's latch wakes the sweep"
+        );
+
+        // A latch that beat the arming: no wake was set when it latched, so
+        // filing the probe must wake the sweep itself.
+        dev.drop_direct_probe(&pk).await;
+        let early = dev.build_carrier_session(pk, overlay_ip, carrier(14));
+        latch_handshake(&early.stats);
+        assert!(
+            !woke(wake.clone()).await,
+            "unarmed: there was nothing to wake yet"
+        );
+        dev.insert_probe(pk, early);
+        assert!(
+            woke(wake.clone()).await,
+            "filing a probe that already latched wakes the sweep"
+        );
+        assert_eq!(dev.probe_handshake_done(&pk), Some(true));
+    }
+
+    /// #2952 — the wake fires from the RECEIVE path, with no test helper
+    /// latching anything: A's direct probe toward B handshakes over real
+    /// loopback sockets, and A's runtime wake completes. Promoted, the session
+    /// never fires it again, even when a rekey completes a fresh handshake
+    /// (the latch is set-once).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_real_probe_handshake_wakes_from_the_receive_path_once() {
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+        let (mut dev_a, _rx_a) = WgDevice::new(a.secret.clone());
+        let (mut dev_b, _rx_b) = WgDevice::new(b.secret.clone());
+        let pk_b = b.public.to_bytes();
+
+        // B knows A as an ordinary installed peer; A probes B directly.
+        dev_b.add_peer(
+            a.public.to_bytes(),
+            IP_A,
+            Carrier::direct(sock_b.clone(), addr_a),
+            false,
+        );
+        dev_a.ensure_direct_demux(sock_a.clone());
+        let wake = dev_a.probe_latch_wake();
+        dev_a
+            .start_direct_probe(sock_a, pk_b, IP_B, addr_b, true)
+            .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), wake.notified())
+                .await
+                .is_ok(),
+            "the probe's handshake latched on the receive path and woke the runtime"
+        );
+        assert_eq!(dev_a.probe_handshake_done(&pk_b), Some(true));
+        assert!(dev_a.promote_direct_probe(&pk_b));
+
+        assert!(dev_a.poke_handshake(&pk_b), "a rekey toward B");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), wake.notified())
+                .await
+                .is_err(),
+            "a promoted session never wakes the probe sweep again"
+        );
+    }
+
+    /// #2820 — a probe over a carrier with its own receive loop (`/derp`) is
+    /// held exactly like a direct probe: the peer's ACTIVE relay carrier keeps
+    /// routing until the probe is promoted, a dropped probe never disturbs it,
+    /// and a relay probe replaces a direct one already in flight (one probe
+    /// slot per peer).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_probe_holds_the_active_carrier_until_promoted() {
+        let kp = WgKeypair::generate();
+        let peer = WgKeypair::generate();
+        let (mut dev, _rx) = WgDevice::new(kp.secret.clone());
+        let pk = peer.public.to_bytes();
+        let overlay_ip = Ipv4Addr::new(100, 64, 0, 4);
+        let turn: SocketAddr = "127.0.0.1:11".parse().unwrap();
+        let derp: SocketAddr = "127.0.0.1:12".parse().unwrap();
+
+        // The pair rides a relay carrier (TURN).
+        dev.add_peer(
+            pk,
+            overlay_ip,
+            Carrier::relay(Arc::new(OkRelay), turn),
+            false,
+        );
+        assert!(dev.peer_traffic(&pk).is_some());
+
+        dev.start_relay_probe(
+            pk,
+            overlay_ip,
+            Carrier::relay(Arc::new(OkRelay), derp),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(dev.has_direct_probe(&pk));
+        assert_eq!(dev.probe_count(), 1);
+        assert_eq!(dev.peer_count(), 1, "the probe is not a second routed peer");
+        assert_eq!(dev.probe_handshake_done(&pk), Some(false));
+        assert!(
+            dev.peer_traffic(&pk).is_some(),
+            "the active carrier keeps the pair while the probe is unproven"
+        );
+
+        // The peer answered over the probe's carrier → it becomes the active one.
+        dev.test_latch_probe_handshake_done(&pk);
+        assert!(dev.promote_direct_probe(&pk));
+        assert_eq!(dev.probe_count(), 0, "promoted out of the shadow map");
+        assert_eq!(dev.peer_count(), 1);
+
+        // An unanswered relay probe is dropped; the active carrier survives.
+        dev.start_relay_probe(
+            pk,
+            overlay_ip,
+            Carrier::relay(Arc::new(OkRelay), turn),
+            Duration::from_millis(1),
+        )
+        .await;
+        dev.drop_direct_probe(&pk).await;
+        assert_eq!(dev.probe_count(), 0);
+        assert!(dev.peer_traffic(&pk).is_some());
+
+        // One slot per peer: a relay probe replaces a direct probe in flight.
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        dev.ensure_direct_demux(sock.clone());
+        dev.start_direct_probe(sock, pk, overlay_ip, "127.0.0.1:13".parse().unwrap(), false)
+            .await;
+        assert_eq!(dev.probe_count(), 1);
+        dev.start_relay_probe(
+            pk,
+            overlay_ip,
+            Carrier::relay(Arc::new(OkRelay), derp),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(
+            dev.probe_count(),
+            1,
+            "the relay probe replaced the direct one"
+        );
+        dev.drop_direct_probe(&pk).await;
+        assert_eq!(dev.probe_count(), 0);
     }
 
     /// P1 (S6) — the shared send half must track every routing mutation:

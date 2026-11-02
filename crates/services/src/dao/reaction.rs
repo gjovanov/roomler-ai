@@ -37,7 +37,7 @@ impl ReactionDao {
             .await?;
 
         if existing.is_some() {
-            return Err(DaoError::DuplicateKey(
+            return Err(DaoError::Conflict(
                 "Already reacted with this emoji".to_string(),
             ));
         }

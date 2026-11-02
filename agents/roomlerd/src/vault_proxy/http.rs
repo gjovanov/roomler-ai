@@ -132,6 +132,9 @@ pub(crate) struct Upstream {
     pub(crate) front: String,
     /// P3-5e-1 — what the endpoint stands for.
     pub(crate) flavor: Flavor,
+    /// FR-90 P4-6-1b-2 — where the TCP goes: `host:port`, or a flow's end
+    /// toward it; TLS is verified against `host` either way.
+    pub(crate) dial: super::Dial,
 }
 
 impl Upstream {
@@ -502,9 +505,9 @@ async fn send(
 async fn connect(up: &Upstream) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
     let name = tls::server_name(&up.host)?;
     let connected = async {
-        let tcp = TcpStream::connect((up.host.as_str(), up.port))
+        let tcp = super::tcp_to(&up.host, up.port, up.dial)
             .await
-            .map_err(|e| format!("{}: {e}", up.authority()))?;
+            .map_err(|e| format!("{}: {e}", super::dialled(&up.host, up.port, up.dial)))?;
         up.tls
             .connect(name, tcp)
             .await

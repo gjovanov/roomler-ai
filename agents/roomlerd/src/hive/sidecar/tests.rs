@@ -160,6 +160,16 @@ async fn provider() -> Provider {
 /// A rig whose sessions reach `provider` through the sidecar, with a key
 /// helper that counts its runs in `count`.
 async fn sidecar_rig(provider: &Provider, grace: Duration) -> (Rig, tempfile::TempDir) {
+    sidecar_rig_with(provider, grace, false).await
+}
+
+/// [`sidecar_rig`], on a device whose owner turned workers on
+/// (`hive_worker`) where `worker` says so (P8-2c-4).
+async fn sidecar_rig_with(
+    provider: &Provider,
+    grace: Duration,
+    worker: bool,
+) -> (Rig, tempfile::TempDir) {
     let count_dir = tempfile::tempdir().unwrap();
     let count = count_dir.path().join("helper-runs");
     let helper = format!(
@@ -170,7 +180,10 @@ async fn sidecar_rig(provider: &Provider, grace: Duration) -> (Rig, tempfile::Te
     let r = rig_with(
         true,
         4,
-        move |cfg| cfg.api_key_helper = Some(helper),
+        move |cfg| {
+            cfg.api_key_helper = Some(helper);
+            cfg.worker = worker;
+        },
         move |sup| sup.with_sidecar(upstream, grace),
     );
     std::fs::write(r.root.path().join("claude"), ENV_HARNESS).unwrap();
@@ -237,9 +250,11 @@ async fn a_session_reaches_the_provider_only_through_the_sidecar_with_its_own_to
     let (mut r, _count) = sidecar_rig(&p, OFFLINE_GRACE).await;
     let (sid, base, token) = started(&mut r).await;
 
+    // P8-2c-3 — this session's own port is the whole address now: no
+    // `/s/<sid>` to route within a shared one.
     assert!(
-        base.starts_with("http://127.0.0.1:") && base.ends_with(&format!("/s/{}", sid.to_hex())),
-        "the harness points at the loopback sidecar: {base}"
+        base.starts_with("http://127.0.0.1:") && !base.contains("/s/"),
+        "the harness points at the loopback sidecar, this session's own port: {base}"
     );
     assert!(token.starts_with("hive-"), "a session token: {token}");
     assert_ne!(
@@ -298,6 +313,64 @@ async fn a_session_reaches_the_provider_only_through_the_sidecar_with_its_own_to
     r.sup.stop(sid, 1, "owner".into());
 }
 
+/// FR-90 P8-2c-4 — a FRESH launch with `hive_worker` on hands the session's
+/// sidecar to its worker, which carries a model call to the provider with
+/// the device's key. `sidecar::open` runs in `decide_and_launch`, before
+/// `launch` starts the worker, so whether a worker exists yet
+/// (`worker::has`) was false at every fresh launch and no sidecar was ever
+/// handed; it is told the device's own setting now. A sidecar kept for its
+/// worker is served by nothing in the daemon, so both answers below are
+/// the worker's, its admission and key asked of the daemon a call at a
+/// time (`Call::SidecarAdmit`).
+#[cfg(worker_calls)]
+#[tokio::test]
+async fn a_fresh_launch_hands_its_sidecar_to_its_worker_which_carries_a_model_call() {
+    use crate::hive::worker::{in_process_when_live, seen};
+    let p = provider().await;
+    let (mut r, _count) = sidecar_rig_with(&p, OFFLINE_GRACE, true).await;
+    let o = order(&r);
+    in_process_when_live(o.session_id);
+    let (sid, base, token) = started_with(&mut r, o).await;
+    assert!(
+        handed::is_kept(sid, 1),
+        "kept for the worker at the run's very first launch"
+    );
+
+    let refused = call(&format!("{base}/v1/messages"), None).await;
+    assert_eq!(
+        error_kind(refused).await,
+        (401, "authentication_error".to_string()),
+        "the daemon's refusal, rebuilt by the worker"
+    );
+    let resp = call(&format!("{base}/v1/messages?beta=true"), Some(&token)).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let mut stream = resp.bytes_stream();
+    let first = tokio::time::timeout(WAIT, stream.next())
+        .await
+        .expect("the first chunk while the provider still answers")
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("message_start"));
+    p.go.notify_one();
+    let mut rest = String::new();
+    while let Some(chunk) = tokio::time::timeout(WAIT, stream.next()).await.unwrap() {
+        rest.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    assert!(rest.contains("message_stop"), "{rest}");
+    let seen_by_provider = p.seen.lock().await.clone();
+    assert_eq!(seen_by_provider.len(), 1, "the refused call never left");
+    assert_eq!(
+        seen_by_provider[0].headers["x-api-key"], DEVICE_KEY,
+        "the device's key, asked of the daemon for this one call"
+    );
+    assert!(
+        seen(sid, 1).is_some_and(|s| s.up && s.starts == 1),
+        "one worker, up all along: {:?}",
+        seen(sid, 1)
+    );
+    r.sup.stop(sid, 1, "owner".into());
+}
+
 #[tokio::test]
 async fn a_call_that_is_not_this_live_session_s_never_reaches_the_provider() {
     let p = provider().await;
@@ -326,18 +399,31 @@ async fn a_call_that_is_not_this_live_session_s_never_reaches_the_provider() {
     );
 
     // Stopped: its token is dead with it (once the session has ended — until
-    // then it is still the session's).
+    // then it is still the session's). P8-2c-3 — its own sidecar closes
+    // with it too, so the terminal state is either an HTTP 401 (the task
+    // ended its run but has not yet dropped the listener) or the
+    // connection refused outright (it has): either answers "this session
+    // no longer serves this token", which is what this asserts.
     r.sup.stop(sid, 1, "owner".into());
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
         p.go.notify_one();
-        let resp = call(&url, Some(&token)).await;
-        if resp.status().as_u16() == 401 {
-            let (_, kind) = error_kind(resp).await;
-            assert_eq!(kind, "authentication_error");
-            break;
+        let attempt = reqwest::Client::new()
+            .post(&url)
+            .header("anthropic-version", "2023-06-01")
+            .header("x-api-key", &token)
+            .body(r#"{"model":"m","messages":[]}"#)
+            .send()
+            .await;
+        match attempt {
+            Err(_) => break,
+            Ok(resp) if resp.status().as_u16() == 401 => {
+                let (_, kind) = error_kind(resp).await;
+                assert_eq!(kind, "authentication_error");
+                break;
+            }
+            Ok(resp) => drop(resp),
         }
-        drop(resp);
         assert!(
             tokio::time::Instant::now() < deadline,
             "the token outlived its session"
@@ -407,8 +493,12 @@ while :; do sleep 1; done
 /// P2k-7 — AC4's stale-fence half, captured at the provider: a run demoted
 /// to a newer fence makes no model call. Its harness does not listen, so the
 /// run holds on through the stop grace with its token still live, and the
-/// fence alone refuses the call before anything leaves the host. Once the run
-/// has ended, its token is gone too.
+/// fence alone refuses the call before anything leaves the host. P8-2c-3 —
+/// once the run has ended, its OWN sidecar is gone with it (no longer the
+/// one shared listener the whole daemon used to keep forever), so a stale
+/// call past that point finds nothing listening at all: a stronger
+/// guarantee than the `authentication_error` a lingering listener answered
+/// with before this step.
 #[tokio::test]
 async fn a_demoted_run_makes_no_model_call() {
     let p = provider().await;
@@ -443,11 +533,19 @@ async fn a_demoted_run_makes_no_model_call() {
     assert!(r.sup.holds_live(sid), "refused while the run still held on");
 
     assert_eq!(next_state(&mut r, sid).await.0, HiveRunState::Ended);
-    let (status, kind) = error_kind(call(&url, Some(&token)).await).await;
-    assert_eq!(
-        (status, kind.as_str()),
-        (401, "authentication_error"),
-        "and once it has ended"
+    // P8-2c-3 — this run's own sidecar closed with it: a stale call now
+    // finds nothing listening, rather than an `authentication_error` from
+    // a lingering shared one.
+    let refused = reqwest::Client::new()
+        .post(&url)
+        .header("anthropic-version", "2023-06-01")
+        .header("x-api-key", &token)
+        .body(r#"{"model":"m","messages":[]}"#)
+        .send()
+        .await;
+    assert!(
+        refused.is_err(),
+        "the run's own sidecar is gone with it: {refused:?}"
     );
     assert_eq!(
         p.hits.load(Ordering::SeqCst),
@@ -944,16 +1042,6 @@ fn revoking_one_run_s_token_leaves_another_run_s_alone() {
         Some((session, 1)),
         "the run that started as the other ended keeps its token"
     );
-}
-
-#[test]
-fn a_session_path_splits_into_its_id_and_the_provider_path() {
-    assert_eq!(
-        split_session("/s/abc/v1/messages"),
-        Some(("abc", "/v1/messages"))
-    );
-    assert_eq!(split_session("/s/abc"), Some(("abc", "/")));
-    assert_eq!(split_session("/v1/messages"), None);
 }
 
 /// FR-90 P2e-6a — the server waits a primary out for `UNREACHABLE_SECS`

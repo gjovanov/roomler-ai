@@ -21,7 +21,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use roomlerd::capture::pointer::{PointerSample, PointerShape, PointerSource, RecordedPointer};
-use roomlerd::capture::{Damage, Frame, PixelFormat, ScreenCapture};
+use roomlerd::capture::{
+    CaptureUnavailable, CaptureUnavailableCode, Damage, Frame, NoopCapture, PixelFormat,
+    ScreenCapture,
+};
 use roomlerd::encode::VideoEncoder;
 use roomlerd::encode::openh264_backend::Openh264Encoder;
 use roomlerd::recording::annexb::length_prefixed_to_annexb;
@@ -105,6 +108,8 @@ struct CounterCapture {
     /// FR-85 P1d — after this many frames the screen goes still: no new
     /// frame, the way DXGI, or X11's damage tracking, reports "unchanged".
     still_after: Option<u64>,
+    /// The screen's size (#2877 needs one wider than openh264 takes).
+    size: (u32, u32),
 }
 
 impl CounterCapture {
@@ -117,6 +122,7 @@ impl CounterCapture {
             fail: false,
             pointer: None,
             still_after: None,
+            size: (W, H),
         }
     }
 }
@@ -139,15 +145,15 @@ impl ScreenCapture for CounterCapture {
             return Ok(None);
         }
         let (w, h) = match self.resize_after {
-            Some(k) if self.n >= k => (W + 64, H),
-            _ => (W, H),
+            Some(k) if self.n >= k => (self.size.0 + 64, self.size.1),
+            _ => self.size,
         };
         let f = Frame {
             width: w,
             height: h,
             stride: w * 4,
             pixel_format: PixelFormat::Bgra,
-            data: render(self.n as u16, w, h),
+            data: render(self.n as u16, w, h).into(),
             monotonic_us: self.start.elapsed().as_micros() as u64,
             monitor: 0,
             damage: Damage::Unknown,
@@ -198,16 +204,20 @@ async fn record_for(
     cap: CounterCapture,
     for_how_long: Duration,
 ) -> (Result<recorder::RecordingSummary>, Vec<RecorderEvent>) {
+    let fps = opts.fps;
+    record_with(opts, cap, openh264_factory(fps), for_how_long).await
+}
+
+/// [`record_for`] with the encoder factory given.
+async fn record_with(
+    opts: RecordOptions,
+    cap: CounterCapture,
+    factory: EncoderFactory,
+    for_how_long: Duration,
+) -> (Result<recorder::RecordingSummary>, Vec<RecorderEvent>) {
     let (stop_tx, stop_rx) = watch::channel(None);
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
-    let fps = opts.fps;
-    let handle = tokio::spawn(recorder::run(
-        opts,
-        Box::new(cap),
-        openh264_factory(fps),
-        stop_rx,
-        ev_tx,
-    ));
+    let handle = tokio::spawn(recorder::run(opts, Box::new(cap), factory, stop_rx, ev_tx));
     tokio::time::sleep(for_how_long).await;
     let _ = stop_tx.send(Some(StopReason::Requested));
     let result = handle.await.expect("the recorder task panicked");
@@ -409,6 +419,73 @@ async fn a_display_that_changes_size_ends_the_file_cleanly() {
     );
 }
 
+// ── #2877: a screen wider than the software encoder takes ────────────────────
+
+/// 4096 px wide, like the lab's arm64 host's 4096×2160 scanout, but only 256
+/// tall, so a debug build encodes it quickly. openh264 takes at most 3840 on
+/// the long side.
+const WIDE: (u32, u32) = (4096, 256);
+
+/// #2877 — the software rung records such a screen scaled to fit, keeping
+/// its shape (4096×256 → 3840×240), and every record of it says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_screen_wider_than_the_software_encoder_records_scaled_to_fit() {
+    use roomlerd::recording::sidecar::SourceSize;
+    let dir = scratch();
+    let mut opts = options(dir.path());
+    opts.fps = 10;
+    let mut cap = CounterCapture::new(10);
+    cap.size = WIDE;
+    let factory: EncoderFactory =
+        Box::new(|w, h| roomlerd::recording::fit::software_recording_encoder(w, h, 10, 20));
+    let (result, events) = record_with(opts, cap, factory, Duration::from_secs(3)).await;
+    let s = result.expect("the recording finalizes");
+    assert_eq!(s.reason, StopReason::Requested, "{s:?}");
+    let from = SourceSize {
+        width: WIDE.0,
+        height: WIDE.1,
+    };
+    assert!(
+        matches!(
+            events.first(),
+            Some(RecorderEvent::Started { width: 3840, height: 240, scaled_from: Some(f), .. })
+                if *f == from
+        ),
+        "{:?}",
+        events.first()
+    );
+    let path = s.path.expect("a finished file");
+    let file = ProgressiveFile::open(&path).unwrap();
+    let vf = file.video_format().unwrap();
+    assert_eq!(
+        (vf.width, vf.height),
+        (3840, 240),
+        "the track is the recorded size"
+    );
+    let samples = file.samples(VIDEO_TRACK_ID).unwrap().len();
+    assert!(samples >= 5, "{samples} frames");
+    let sc = s.sidecar.expect("a sidecar");
+    assert_eq!((sc.width, sc.height), (3840, 240));
+    assert_eq!(sc.scaled_from, Some(from));
+    assert_eq!(sc.frames as usize, samples);
+}
+
+/// …and the control: the bare software encoder at the screen's own size, as
+/// before #2877. It ends `encoder_failed`, with no frame written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_bare_software_encoder_records_nothing_of_that_screen() {
+    let dir = scratch();
+    let mut opts = options(dir.path());
+    opts.fps = 10;
+    let mut cap = CounterCapture::new(10);
+    cap.size = WIDE;
+    let (result, _) = record_with(opts, cap, openh264_factory(10), Duration::from_secs(6)).await;
+    let s = result.expect("the recorder ends on its own");
+    assert_eq!(s.reason, StopReason::EncoderFailed, "{s:?}");
+    // The empty file is kept fragmented, with a sidecar that says 0 frames.
+    assert_eq!(s.sidecar.map_or(0, |sc| sc.frames), 0);
+}
+
 // ── the pointer (FR-85 P1d) ──────────────────────────────────────────────────
 
 /// Where the test pointer is: at `a` for the first `switch_after` polls, at
@@ -554,6 +631,34 @@ async fn no_frame_refuses_the_start() {
         err.downcast_ref::<StartError>().unwrap().refusal,
         StartRefusal::NoFrame
     );
+}
+
+/// FR-85 P2e — a capturer that could not open knows why, and the start says so
+/// at once. Waiting for a frame that cannot come hid it: a recorder launched
+/// with no `DISPLAY` answered "no frame from the capture backend" ten seconds
+/// later, and the reason stayed in the child's own log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capturer_that_could_not_open_says_why() {
+    let dir = scratch();
+    let mut opts = options(dir.path());
+    opts.first_frame_timeout = Duration::from_secs(60);
+    let fps = opts.fps;
+    let cap = NoopCapture::unavailable(CaptureUnavailable::new(
+        CaptureUnavailableCode::NoDisplay,
+        "no primary display: connection refused",
+    ));
+    let (_stop_tx, stop_rx) = watch::channel(None);
+    let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        recorder::run(opts, Box::new(cap), openh264_factory(fps), stop_rx, ev_tx),
+    )
+    .await
+    .expect("refused at once, not after the wait for a first frame");
+    let err = result.unwrap_err();
+    let start = err.downcast_ref::<StartError>().unwrap();
+    assert_eq!(start.refusal, StartRefusal::NoFrame);
+    assert!(start.detail.contains("connection refused"), "{start}");
 }
 
 // ── audio (FR-85 P1c) ────────────────────────────────────────────────────────

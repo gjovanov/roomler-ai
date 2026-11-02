@@ -46,7 +46,7 @@ fn belt_running(peer: PeerId, run: Run, timing: Timing) -> Belt {
     let dir = tempfile::tempdir().unwrap();
     let (tx, events) = mpsc::channel(64);
     #[cfg(unix)]
-    let toolbelt = open(dir.path(), None, peer, run, tx, timing).unwrap();
+    let toolbelt = open(dir.path(), None, peer, run, tx, timing, false).unwrap();
     #[cfg(windows)]
     let toolbelt = open(peer, run, tx, timing).unwrap();
     Belt {
@@ -443,12 +443,12 @@ async fn the_socket_is_the_sessions_alone() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("toolbelt.sock"), b"not a socket").unwrap();
     let (tx, _rx) = mpsc::channel(4);
-    let refused = open(dir.path(), None, me(), run(), tx.clone(), quick());
+    let refused = open(dir.path(), None, me(), run(), tx.clone(), quick(), false);
     assert!(refused.is_err(), "a file in the socket's place is refused");
     std::fs::remove_file(dir.path().join("toolbelt.sock")).unwrap();
-    let first = open(dir.path(), None, me(), run(), tx.clone(), quick()).unwrap();
+    let first = open(dir.path(), None, me(), run(), tx.clone(), quick(), false).unwrap();
     std::mem::forget(first); // leaves a stale socket, as a crash would
-    let again = open(dir.path(), None, me(), run(), tx, quick());
+    let again = open(dir.path(), None, me(), run(), tx, quick(), false);
     assert!(again.is_ok(), "a stale socket is replaced");
 }
 
@@ -2687,6 +2687,474 @@ async fn vault_connect_serves_an_http_upstream_on_a_loopback_port() {
     assert!(ended.is_ok(), "the connection ended with the lease");
 }
 
+/// A port nothing listens on, held while what it returns lives: bound and
+/// never listening, so no test beside this one is given it meanwhile.
+#[cfg(feature = "vault")]
+fn closed_port() -> (u16, tokio::net::TcpSocket) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    (socket.local_addr().unwrap().port(), socket)
+}
+
+/// FR-90 P4-6-1b-2 — an endpoint `roomler_connect` opens through another
+/// device: its upstream connections dial the flow's end, never the
+/// upstream's own address, while TLS is verified against the upstream's host
+/// and the request is still the upstream's. A session's own `vault_connect`
+/// cannot say where it dials: a `dial` it names is not read, and its endpoint
+/// dials the upstream.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn an_endpoint_through_a_flow_dials_its_end_and_a_call_cannot_say_where() {
+    use crate::vault_proxy::testing::{fake_http, made};
+    let token = made();
+    let (ca, port, mut saw) = fake_http().await;
+    // The upstream's own address answers nobody: only the flow's end does.
+    let (closed, _held) = closed_port();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("run")).unwrap();
+    let vault = Arc::new(FakeVault {
+        values: [
+            ("git/bot#token".to_string(), token.as_bytes().to_vec()),
+            ("pki/git-ca".to_string(), ca.as_bytes().to_vec()),
+        ]
+        .into_iter()
+        .collect(),
+        ..FakeVault::default()
+    });
+    let target = super::super::vault_exec::ExecTarget {
+        account: None,
+        home: dir.path().to_path_buf(),
+        folder: dir.path().to_path_buf(),
+        session_dir: dir.path().join("run"),
+        owner: None,
+    };
+    let end = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let args = json!({
+        "handle": "git/bot",
+        "engine": "http",
+        "upstream": format!("https://localhost:{closed}"),
+        "auth": "bearer",
+        "ca": "pki/git-ca",
+        "ttl_s": 60,
+        "dial": end.to_string(),
+        "through": end.to_string(),
+    });
+    let get = |answer: Value| async move {
+        let at = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+        let mut h = tokio::net::TcpStream::connect(("127.0.0.1", at))
+            .await
+            .unwrap();
+        h.write_all(b"GET /api/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        http_response(&mut h).await
+    };
+    let sid = ObjectId::new();
+    let own = super::super::vault_connect::call(vault.clone(), sid, 5, Some(&target), &me(), &args)
+        .await
+        .unwrap();
+    let response = get(own).await;
+    assert!(
+        response.starts_with("HTTP/1.1 502"),
+        "the upstream's own address, which answers nobody: {response}"
+    );
+    assert!(saw.try_recv().is_err(), "nothing reached the flow's end");
+
+    let through = super::super::vault_connect::call_through(
+        vault,
+        sid,
+        5,
+        Some(&target),
+        &me(),
+        &args,
+        crate::vault_proxy::Dial::Through(end),
+    )
+    .await
+    .unwrap();
+    let response = get(through).await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let s = tokio::time::timeout(WAIT, saw.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.values("authorization"), [format!("Bearer {token}")]);
+    assert_eq!(s.values("host"), [format!("localhost:{closed}")]);
+}
+
+/// FR-90 P8-2a-6 — where the run has a worker, an endpoint through another
+/// device is handed to it as a direct one is, and the worker dials the
+/// flow's end the daemon holds: the upstream's own address answers nobody,
+/// so only that end reaches it, with the secret's token and the host the
+/// call named.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn where_the_run_has_a_worker_an_endpoint_through_a_flow_is_served_there() {
+    use super::super::vault_connect::handed::kept_for;
+    use crate::vault_proxy::testing::{fake_http, made};
+    let token = made();
+    let (ca, port, mut saw) = fake_http().await;
+    let (closed, _held) = closed_port();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("run")).unwrap();
+    let vault = Arc::new(FakeVault {
+        values: [
+            ("git/bot#token".to_string(), token.as_bytes().to_vec()),
+            ("pki/git-ca".to_string(), ca.as_bytes().to_vec()),
+        ]
+        .into_iter()
+        .collect(),
+        ..FakeVault::default()
+    });
+    let target = super::super::vault_exec::ExecTarget {
+        account: None,
+        home: dir.path().to_path_buf(),
+        folder: dir.path().to_path_buf(),
+        session_dir: dir.path().join("run"),
+        owner: None,
+    };
+    let end = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let args = json!({
+        "handle": "git/bot",
+        "engine": "http",
+        "upstream": format!("https://localhost:{closed}"),
+        "auth": "bearer",
+        "ca": "pki/git-ca",
+        "ttl_s": 60,
+    });
+    let sid = ObjectId::new();
+    super::super::worker::run_in_process(sid, 5, Arc::new(|_| {}));
+    let answer = super::super::vault_connect::call_through(
+        vault,
+        sid,
+        5,
+        Some(&target),
+        &me(),
+        &args,
+        crate::vault_proxy::Dial::Through(end),
+    )
+    .await
+    .expect("an endpoint through a flow, from the run's worker");
+    assert_eq!(
+        kept_for(sid, 5),
+        1,
+        "one through a flow, handed to the worker"
+    );
+    let at = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    let mut h = tokio::net::TcpStream::connect(("127.0.0.1", at))
+        .await
+        .unwrap();
+    h.write_all(b"GET /api/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let response = http_response(&mut h).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "through the flow's end, from the worker: {response}"
+    );
+    let s = tokio::time::timeout(WAIT, saw.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.values("authorization"), [format!("Bearer {token}")]);
+    assert_eq!(s.values("host"), [format!("localhost:{closed}")]);
+    drop(h);
+    super::super::worker::drop_run(sid, 5);
+}
+
+/// FR-90 P4-6-1b-2 — which refusals of a path through another device the
+/// daemon's reach says another device would change: this device's own word
+/// (no vault, no egress) and the vault's word on the credential are every
+/// device's, the vault's word on that exit is that path's. A flow no
+/// endpoint rides goes at once; one an endpoint rides is held, toward the
+/// upstream as asked.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn the_daemons_reach_says_which_refusals_another_device_would_change() {
+    use super::super::connect_tool::{Failed, Reach};
+    use crate::tunnel::client_mgr::TunnelClientHub;
+    use crate::vault_proxy::testing::made;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("run")).unwrap();
+    let ctx = |vault: Option<Arc<FakeVault>>, net: Option<TunnelClientHub>| Ctx {
+        session: ObjectId::new(),
+        fence: 5,
+        vault: vault.map(|v| v as Arc<dyn VaultTools>),
+        knowhow: None,
+        exec: Some(super::super::vault_exec::ExecTarget {
+            account: None,
+            home: dir.path().to_path_buf(),
+            folder: dir.path().to_path_buf(),
+            session_dir: dir.path().join("run"),
+            owner: None,
+        }),
+        net: net.map(|h| Arc::new(h) as Arc<dyn super::super::net_tools::SessionEgress>),
+        #[cfg(feature = "ssh-server")]
+        ssh: None,
+        peer: me(),
+        pending: Arc::new(Pending::default()),
+        events: mpsc::channel(1).0,
+        timing: quick(),
+    };
+    let hub = || TunnelClientHub::new("test".into());
+    let exit = ObjectId::new();
+    let asked = json!({
+        "handle": "git/bot",
+        "engine": "http",
+        "upstream": "https://localhost:8443",
+        "auth": "bearer",
+        "ttl_s": 60,
+    });
+
+    let vault = Arc::new(FakeVault::default());
+    for (c, why) in [
+        (ctx(None, Some(hub())), "(vault_enabled)"),
+        (ctx(Some(vault.clone()), None), "(hive_net)"),
+    ] {
+        let reach = DaemonReach { ctx: &c };
+        let through = reach
+            .open_through(asked.clone(), exit, "localhost", 8443)
+            .await;
+        assert!(
+            matches!(&through, Err(Failed::Every(w)) if w.contains(why)),
+            "{through:?}"
+        );
+        let forward = reach.forward(exit, "localhost", 8443).await;
+        assert!(
+            matches!(&forward, Err(Failed::Every(w)) if w.contains(why)),
+            "{forward:?}"
+        );
+    }
+    assert!(
+        vault.nets.lock().unwrap().is_empty(),
+        "nothing asked of the vault"
+    );
+
+    let refusing = Arc::new(FakeVault {
+        net_refusal: Some("the vault refused: net:forward".into()),
+        ..FakeVault::default()
+    });
+    let on = hub();
+    let c = ctx(Some(refusing.clone()), Some(on.clone()));
+    let reach = DaemonReach { ctx: &c };
+    let through = reach
+        .open_through(asked.clone(), exit, "localhost", 8443)
+        .await;
+    assert!(
+        matches!(&through, Err(Failed::Path(w)) if w.contains("net:forward")),
+        "{through:?}"
+    );
+    let forward = reach.forward(exit, "localhost", 8443).await;
+    assert!(
+        matches!(&forward, Err(Failed::Path(w)) if w.contains("net:forward")),
+        "{forward:?}"
+    );
+    assert_eq!(refusing.nets.lock().unwrap().len(), 2);
+    assert!(on.flows_snapshot().is_empty());
+
+    let bare = Arc::new(FakeVault::default());
+    let on = hub();
+    let c = ctx(Some(bare.clone()), Some(on.clone()));
+    let through = DaemonReach { ctx: &c }
+        .open_through(asked.clone(), exit, "localhost", 8443)
+        .await;
+    assert!(
+        matches!(&through, Err(Failed::Every(w)) if w.contains("no_secret")),
+        "{through:?}"
+    );
+    assert_eq!(bare.nets.lock().unwrap().len(), 1, "its flow was made");
+    assert!(on.flows_snapshot().is_empty(), "and went at once");
+
+    let lending = Arc::new(FakeVault {
+        values: [("git/bot#token".to_string(), made().into_bytes())]
+            .into_iter()
+            .collect(),
+        ..FakeVault::default()
+    });
+    let on = hub();
+    let c = ctx(Some(lending.clone()), Some(on.clone()));
+    let answer = DaemonReach { ctx: &c }
+        .open_through(asked, exit, "localhost", 8443)
+        .await
+        .unwrap();
+    assert!(
+        answer["through_expires_in_secs"]
+            .as_u64()
+            .is_some_and(|s| s <= 60),
+        "{answer}"
+    );
+    let flows = on.flows_snapshot();
+    assert_eq!(flows.len(), 1, "held for its endpoint");
+    assert_eq!(
+        {
+            let nets = lending.nets.lock().unwrap();
+            (nets[0].exit, nets[0].dst.clone())
+        },
+        (exit, Some(("localhost".to_string(), 8443)))
+    );
+    // Its end serves this daemon: this process's own connection is held.
+    let mut held = tokio::net::TcpStream::connect(flows[0].local_addr.as_str())
+        .await
+        .unwrap();
+    assert!(
+        !ended(&mut held, Duration::from_millis(300)).await,
+        "this daemon's connection is held"
+    );
+}
+
+/// FR-90 P8-1a — a session's egress reaches the tunnel hub only through its
+/// seam, `SessionEgress`, and says who each listener admits as data: the
+/// session's account for `net_forward`, this daemon alone for a connect's
+/// flow through another device. Each admit is asked before the vault is, so
+/// where the seam cannot say who connects the vault is asked nothing; and a
+/// run's end ends its flows through the seam.
+#[cfg(feature = "vault")]
+#[tokio::test]
+async fn the_hub_is_reached_through_its_seam_which_says_who_it_admits() {
+    use super::super::net_tools::{self, Admits, SessionEgress};
+    struct FakeEgress {
+        admits: Result<(), String>,
+        said: std::sync::Mutex<Vec<String>>,
+    }
+    impl FakeEgress {
+        fn note(&self, what: String) {
+            self.said.lock().unwrap().push(what);
+        }
+        fn said(&self) -> Vec<String> {
+            self.said.lock().unwrap().clone()
+        }
+    }
+    #[async_trait::async_trait]
+    impl SessionEgress for FakeEgress {
+        fn admits(&self, who: &Admits) -> Result<(), String> {
+            self.note(format!("admits {who:?}"));
+            self.admits.clone()
+        }
+        async fn open_flow(
+            &self,
+            _exit: ObjectId,
+            target: tunnel_core::driver::Target,
+            _grant: tunnel_core::driver::SessionGrantRef,
+            _until: std::time::Instant,
+            who: Admits,
+        ) -> Result<(String, std::net::SocketAddr), String> {
+            let n = self.said.lock().unwrap().len();
+            self.note(format!("open {target:?} {who:?}"));
+            Ok((format!("f{n}"), ([127, 0, 0, 1], 4000).into()))
+        }
+        fn end_flow(&self, id: &str) -> bool {
+            self.note(format!("end {id}"));
+            true
+        }
+        fn holds(&self, _id: &str) -> bool {
+            true
+        }
+    }
+    let (exit, fence) = (ObjectId::new(), 7);
+    let forward = json!({ "exit": exit.to_hex(), "host": "db.internal", "port": 5432 });
+
+    let vault = Arc::new(FakeVault::default());
+    let egress = Arc::new(FakeEgress {
+        admits: Ok(()),
+        said: std::sync::Mutex::new(Vec::new()),
+    });
+    let seam: Arc<dyn SessionEgress> = egress.clone();
+    let session = ObjectId::new();
+    let answer = net_tools::call(
+        net_tools::FORWARD,
+        vault.as_ref(),
+        &seam,
+        session,
+        fence,
+        me(),
+        &forward,
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer["address"], "127.0.0.1:4000");
+    let flow = net_tools::daemon_flow(
+        vault.as_ref(),
+        &seam,
+        session,
+        fence,
+        exit,
+        "db.internal",
+        5432,
+        60,
+    )
+    .await
+    .unwrap();
+    assert_eq!(flow.end, std::net::SocketAddr::from(([127, 0, 0, 1], 4000)));
+    // The session's own account, exactly, for net_forward; this daemon (at
+    // this session and fence, P8-2b-4) for a connect's flow; each checked
+    // before the vault was asked.
+    let account = format!("{:?}", Admits::Account(me()));
+    let daemon = format!("{:?}", Admits::Daemon(session, fence));
+    let said = egress.said();
+    assert_eq!(said.len(), 4, "{said:?}");
+    assert_eq!(said[0], format!("admits {account}"), "{said:?}");
+    assert!(
+        said[1].starts_with("open Static") && said[1].ends_with(&account),
+        "{said:?}"
+    );
+    assert_eq!(said[2], format!("admits {daemon}"), "{said:?}");
+    assert!(
+        said[3].starts_with("open Static") && said[3].ends_with(&daemon),
+        "{said:?}"
+    );
+    assert_eq!(vault.nets.lock().unwrap().len(), 2, "one grant a flow");
+    assert_eq!(
+        net_tools::drop_run(session, fence),
+        2,
+        "both end with the run"
+    );
+    assert_eq!(egress.said()[4..], ["end f1", "end f3"], "through the seam");
+
+    let refusing = Arc::new(FakeEgress {
+        admits: Err("this system cannot say who connects to a loopback port".into()),
+        said: std::sync::Mutex::new(Vec::new()),
+    });
+    let seam: Arc<dyn SessionEgress> = refusing.clone();
+    let quiet = Arc::new(FakeVault::default());
+    let session = ObjectId::new();
+    let refused = net_tools::call(
+        net_tools::FORWARD,
+        quiet.as_ref(),
+        &seam,
+        session,
+        fence,
+        me(),
+        &forward,
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("cannot say who connects"), "{refused}");
+    let refused = net_tools::daemon_flow(
+        quiet.as_ref(),
+        &seam,
+        session,
+        fence,
+        exit,
+        "db.internal",
+        5432,
+        60,
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("cannot say who connects"), "{refused}");
+    assert!(
+        quiet.nets.lock().unwrap().is_empty(),
+        "nothing asked of the vault"
+    );
+    assert_eq!(
+        refusing.said(),
+        [
+            format!("admits {account}"),
+            format!("admits {:?}", Admits::Daemon(session, fence))
+        ],
+        "only the admits were asked: no flow opened"
+    );
+}
+
 /// FR-90 P3-9-2 — a person's leases over the fake vault: each asked for
 /// recorded with the endpoint it is for, refused while `refuse` says so, and
 /// every lease an endpoint was given let go when it closes.
@@ -3923,7 +4391,7 @@ fn net_belt(
             vault: Some(vault.clone()),
             knowhow: None,
             exec: None,
-            net: Some(hub.clone()),
+            net: Some(Arc::new(hub.clone())),
             #[cfg(feature = "ssh-server")]
             ssh: None,
         },
@@ -3977,8 +4445,14 @@ async fn the_net_tools_are_offered_only_where_the_owner_offers_egress() {
     let vault = Arc::new(FakeVault::default());
     let hub = crate::tunnel::client_mgr::TunnelClientHub::new("test".into());
     // The vault without egress, and egress without the vault.
-    let offers: [(Option<Arc<dyn VaultTools>>, _); 2] =
-        [(Some(vault.clone()), None), (None, Some(hub.clone()))];
+    type Offer = (
+        Option<Arc<dyn VaultTools>>,
+        Option<Arc<dyn super::super::net_tools::SessionEgress>>,
+    );
+    let offers: [Offer; 2] = [
+        (Some(vault.clone()), None),
+        (None, Some(Arc::new(hub.clone()))),
+    ];
     for (offered, net) in offers {
         let b = belt_running(
             me(),
@@ -4256,10 +4730,11 @@ async fn a_net_connection_from_another_account_is_refused() {
     }
     .to_string();
     let sid = ObjectId::new();
+    let egress: Arc<dyn super::super::net_tools::SessionEgress> = Arc::new(hub.clone());
     let answer = super::super::net_tools::call(
         "net_socks",
         &vault,
-        &hub,
+        &egress,
         sid,
         7,
         other,
@@ -4593,6 +5068,270 @@ async fn the_relay_pipes_both_ways_and_ends_with_the_harness() {
     let nowhere = Path::new(r"\\.\pipe\roomler-hive-nowhere");
     let gone = relay_io(nowhere, tokio::io::empty(), tokio::io::sink()).await;
     assert!(gone.is_err());
+}
+
+/// A fake worker the test fully controls — one accepted connection, read and
+/// written as raw lines — so a relay test can assert exactly what crossed
+/// without the real toolbelt's own dispatch (its own tests already cover
+/// that) in the way.
+struct FakeWorker {
+    lines: LineReader<BufReader<Box<dyn AsyncRead + Unpin + Send>>>,
+    wr: Box<dyn AsyncWrite + Unpin + Send>,
+}
+
+#[cfg(unix)]
+type RawListener = UnixListener;
+#[cfg(windows)]
+type RawListener = tokio::net::windows::named_pipe::NamedPipeServer;
+
+/// Binds `addr` right now, synchronously — before the relay under test gets
+/// a chance to dial it — so [`accept`]ing later never races a connect that
+/// arrived before anything was listening.
+#[cfg(unix)]
+fn bind(addr: &Path) -> RawListener {
+    let _ = std::fs::remove_file(addr);
+    UnixListener::bind(addr).unwrap()
+}
+
+#[cfg(windows)]
+fn bind(addr: &str) -> RawListener {
+    tokio::net::windows::named_pipe::ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(addr)
+        .unwrap()
+}
+
+#[cfg(unix)]
+async fn accept(listener: RawListener) -> FakeWorker {
+    let (stream, _) = listener.accept().await.unwrap();
+    let (rd, wr) = stream.into_split();
+    let rd: Box<dyn AsyncRead + Unpin + Send> = Box::new(rd);
+    FakeWorker {
+        lines: LineReader::new(BufReader::new(rd), MAX_MESSAGE),
+        wr: Box::new(wr),
+    }
+}
+
+#[cfg(windows)]
+async fn accept(server: RawListener) -> FakeWorker {
+    server.connect().await.unwrap();
+    let (rd, wr) = tokio::io::split(server);
+    let rd: Box<dyn AsyncRead + Unpin + Send> = Box::new(rd);
+    FakeWorker {
+        lines: LineReader::new(BufReader::new(rd), MAX_MESSAGE),
+        wr: Box::new(wr),
+    }
+}
+
+impl FakeWorker {
+    async fn recv(&mut self) -> Value {
+        let line = tokio::time::timeout(WAIT, self.lines.next_line())
+            .await
+            .expect("a line in time")
+            .unwrap()
+            .expect("the relay's connection, not closed");
+        serde_json::from_slice(&line).unwrap()
+    }
+
+    async fn send(&mut self, v: &Value) {
+        self.wr.write_all(v.to_string().as_bytes()).await.unwrap();
+        self.wr.write_all(b"\n").await.unwrap();
+    }
+}
+
+#[cfg(unix)]
+fn relay_test_address(dir: &tempfile::TempDir) -> PathBuf {
+    dir.path().join(SOCKET)
+}
+
+#[cfg(windows)]
+fn relay_test_address(_dir: &tempfile::TempDir) -> String {
+    format!(
+        r"\\.\pipe\roomler-relay-test-{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    )
+}
+
+/// P8-0's point 1 — a worker's restart: the connection it held drops, a call
+/// already in flight is failed at once (never left hanging), the relay
+/// replays the run's own handshake onto the worker that replaces it WITHOUT
+/// forwarding that replay's own `initialize` answer, and resumes serving new
+/// calls — all without Claude Code ever seeing this process exit.
+#[tokio::test]
+async fn a_dropped_worker_is_recovered_without_the_harness_seeing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = relay_test_address(&dir);
+    let bound = bind(&addr);
+    let (mut harness_in, relay_in) = tokio::io::duplex(1024);
+    let (relay_out, harness_out) = tokio::io::duplex(1024);
+    let addr_for_relay = addr.clone();
+    let relay =
+        tokio::spawn(
+            async move { relay_io(Path::new(&addr_for_relay), relay_in, relay_out).await },
+        );
+    let mut first = accept(bound).await;
+    let mut out = BufReader::new(harness_out).lines();
+
+    // The run's own handshake, exactly once, as Claude Code sends it.
+    harness_in
+        .write_all(br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#)
+        .await
+        .unwrap();
+    harness_in.write_all(b"\n").await.unwrap();
+    assert_eq!(first.recv().await["method"], "initialize");
+    first
+        .send(&json!({"jsonrpc":"2.0","id":0,"result":"first"}))
+        .await;
+    let init_reply = tokio::time::timeout(WAIT, out.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&init_reply).unwrap()["result"],
+        "first"
+    );
+    harness_in
+        .write_all(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+        .await
+        .unwrap();
+    harness_in.write_all(b"\n").await.unwrap();
+    assert_eq!(first.recv().await["method"], "notifications/initialized");
+
+    // A call that will still be waiting when the worker dies under it.
+    harness_in
+        .write_all(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .await
+        .unwrap();
+    harness_in.write_all(b"\n").await.unwrap();
+    assert_eq!(first.recv().await["method"], "ping");
+    drop(first); // the worker dies: its connection goes with it.
+
+    let failed = tokio::time::timeout(WAIT, out.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let failed: Value = serde_json::from_str(&failed).unwrap();
+    assert_eq!(failed["id"], 1);
+    assert_eq!(failed["error"]["code"], RESTARTED);
+    assert!(
+        failed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("call again")
+    );
+
+    // A fresh worker at the same address, same as the daemon handing the
+    // same listener to the worker that replaces the dead one.
+    let mut second = accept(bind(&addr)).await;
+    assert_eq!(second.recv().await["id"], 0, "the replayed initialize");
+    // A distinctive answer the relay must NEVER forward: the harness
+    // already has its first run's reply (asserted above as "first").
+    second
+        .send(&json!({"jsonrpc":"2.0","id":0,"result":"replayed, never seen"}))
+        .await;
+    assert_eq!(
+        second.recv().await["method"],
+        "notifications/initialized",
+        "replayed before anything new"
+    );
+
+    harness_in
+        .write_all(br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#)
+        .await
+        .unwrap();
+    harness_in.write_all(b"\n").await.unwrap();
+    assert_eq!(second.recv().await["id"], 2);
+    second
+        .send(&json!({"jsonrpc":"2.0","id":2,"result":"pong"}))
+        .await;
+
+    let answered = tokio::time::timeout(WAIT, out.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let answered: Value = serde_json::from_str(&answered).unwrap();
+    assert_eq!(answered["id"], 2);
+    assert_eq!(
+        answered["result"], "pong",
+        "the replayed initialize's answer must never reach the harness"
+    );
+
+    drop(harness_in);
+    drop(second);
+    tokio::time::timeout(WAIT, relay)
+        .await
+        .expect("the relay ends with the harness")
+        .unwrap()
+        .unwrap();
+}
+
+/// P8-0's point 1 — a line that arrives while the relay is reconnecting, and
+/// the worker never comes back, waits [`RECONNECT_GIVE_UP`] and no longer:
+/// it is failed the same way an already-in-flight call is, rather than left
+/// to hang forever.
+#[tokio::test(start_paused = true)]
+async fn a_request_that_outwaits_the_reconnect_window_is_failed_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = relay_test_address(&dir);
+    let bound = bind(&addr);
+    let (mut harness_in, relay_in) = tokio::io::duplex(1024);
+    let (relay_out, harness_out) = tokio::io::duplex(1024);
+    let addr_for_relay = addr.clone();
+    let relay =
+        tokio::spawn(
+            async move { relay_io(Path::new(&addr_for_relay), relay_in, relay_out).await },
+        );
+    let mut first = accept(bound).await;
+    let mut out = BufReader::new(harness_out).lines();
+
+    harness_in
+        .write_all(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .await
+        .unwrap();
+    harness_in.write_all(b"\n").await.unwrap();
+    assert_eq!(first.recv().await["id"], 1);
+    drop(first);
+    // Nothing ever replaces it: every dial from here on fails.
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&addr);
+
+    let failed_inflight = tokio::time::timeout(WAIT, out.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&failed_inflight).unwrap()["id"],
+        1
+    );
+
+    // Arrives while reconnecting. Not yet failed well short of the window.
+    harness_in
+        .write_all(br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#)
+        .await
+        .unwrap();
+    harness_in.write_all(b"\n").await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(8), out.next_line())
+            .await
+            .is_err(),
+        "id 2 must not be failed before the reconnect window closes"
+    );
+    // The window closes within the next couple of seconds.
+    let failed_waiter = tokio::time::timeout(Duration::from_secs(5), out.next_line())
+        .await
+        .expect("id 2 failed once RECONNECT_GIVE_UP elapsed")
+        .unwrap()
+        .unwrap();
+    let failed_waiter: Value = serde_json::from_str(&failed_waiter).unwrap();
+    assert_eq!(failed_waiter["id"], 2);
+    assert_eq!(failed_waiter["error"]["code"], RESTARTED);
+
+    drop(harness_in);
+    let _ = tokio::time::timeout(WAIT, relay).await;
 }
 
 /// FR-90 P3-4e-2 — what the model is told when a lease needed a person: a
@@ -5176,6 +5915,28 @@ impl super::super::knowhow_tools::KnowhowTools for FakeKnowhow {
         ));
         Ok(json!({"probe_id": "p1", "state": "ok", "rtt_ms": 3}))
     }
+
+    /// P4-6-1b — a `tcp` entity this device reached lately: no credential,
+    /// so no vault is needed to answer where to dial.
+    async fn access(
+        &self,
+        session: ObjectId,
+        fence: u64,
+        kind: &str,
+        key: &str,
+    ) -> Result<Value, String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((session, fence, format!("access {kind}/{key}")));
+        Ok(json!({
+            "entity": {"kind": kind, "key": key},
+            "engine": "tcp", "upstream": "10.0.4.12:6379", "host": "10.0.4.12", "port": 6379,
+            "credential": null, "options": {}, "missing": [], "proposed": [],
+            "here": "verified", "paths": [{"device_id": "6adc000000000000000000ab", "here": true,
+            "kind": "tcp", "carrier": "direct"}], "seen": [], "fresh_secs": 86400,
+        }))
+    }
 }
 
 fn knowhow_run(session: ObjectId, knowhow: Option<Arc<FakeKnowhow>>) -> Run {
@@ -5414,4 +6175,282 @@ async fn a_verify_is_offered_on_the_servers_word_and_asked_as_the_run() {
         [(sid, 4, "verify endpoint/db tls".to_string())],
         "the run's own session and fence; one naming no kind asks nothing"
     );
+}
+
+/// FR-90 P4-6-1b — `roomler_connect` is offered only where the server names
+/// it, and reaches the connect, not the knowhow reads' chain: the map is asked
+/// for the access as the run's session at its fence, and a `tcp` entity this
+/// device reached is answered where to dial, with no vault in the run. The
+/// person is asked by the session's settings
+/// (`the_settings_ask_a_person_for_each_verify`).
+#[tokio::test]
+async fn a_connect_is_offered_on_the_servers_word_and_asked_as_the_run() {
+    use roomler_ai_remote_control::knowhow::{
+        TOOL_CONNECT, TOOL_GET, TOOL_PROPOSE, TOOL_SEARCH, TOOL_VERIFY,
+    };
+    let cache = || json!({"kind": "service", "key": "cache"});
+    let four = FakeKnowhow::offering(&[TOOL_SEARCH, TOOL_GET, TOOL_PROPOSE, TOOL_VERIFY]);
+    let r = belt_running(
+        me(),
+        knowhow_run(ObjectId::new(), Some(four.clone())),
+        quick(),
+    );
+    let mut c = Client::connect(&r).await;
+    c.send(tool_call(1, "roomler_connect", cache())).await;
+    assert_eq!(
+        c.recv().await["error"]["code"],
+        -32602,
+        "a server that did not name it has no such tool"
+    );
+    assert!(four.asked().is_empty(), "and asked nobody");
+
+    let map = FakeKnowhow::offering(&[
+        TOOL_SEARCH,
+        TOOL_GET,
+        TOOL_PROPOSE,
+        TOOL_VERIFY,
+        TOOL_CONNECT,
+    ]);
+    let sid = ObjectId::new();
+    let b = belt_running(me(), knowhow_run(sid, Some(map.clone())), quick());
+    let mut c = Client::connect(&b).await;
+    assert_eq!(
+        listed(&mut c).await,
+        [
+            "approve",
+            "knowhow_search",
+            "knowhow_get",
+            "knowhow_propose",
+            "knowhow_verify",
+            "roomler_connect"
+        ]
+    );
+    c.send(tool_call(2, "roomler_connect", cache())).await;
+    let reached = c.recv().await;
+    assert!(reached["result"].get("isError").is_none(), "{reached}");
+    let text: Value =
+        serde_json::from_str(reached["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["connection"], "10.0.4.12:6379");
+    assert_eq!(text["path"], "direct");
+    assert_eq!(text["entity"], cache());
+    c.send(tool_call(3, "roomler_connect", json!({"key": "cache"})))
+        .await;
+    assert_eq!(c.recv().await["result"]["isError"], true);
+    assert_eq!(
+        map.asked(),
+        [(sid, 4, "access service/cache".to_string())],
+        "the run's own session and fence; one naming no kind asks nothing"
+    );
+}
+
+/// FR-90 P8-2a-2 — where the run has a worker, its `vault_connect`
+/// endpoint is handed to it and served there: the request reaches the
+/// upstream with the secret's token, as the daemon's would; its lease let
+/// go, the endpoint ends in the worker with its connection, and the daemon
+/// forgets it.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn where_the_run_has_a_worker_its_endpoint_is_served_there() {
+    use super::super::vault_connect::handed::kept_for;
+    use crate::vault_proxy::testing::{fake_http, made};
+    let token = made();
+    let (ca, port, mut saw) = fake_http().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (b, vault, sid) = http_belt(
+        dir.path(),
+        &[
+            ("git/bot#token", token.as_bytes()),
+            ("pki/git-ca", ca.as_bytes()),
+        ],
+    );
+    super::super::worker::run_in_process(sid, 5, Arc::new(|_| {}));
+    let mut c = Client::connect(&b).await;
+    let answer = connect_answer(
+        &mut c,
+        1,
+        json!({
+            "handle": "git/bot",
+            "engine": "http",
+            "upstream": format!("https://localhost:{port}"),
+            "auth": "bearer",
+            "ca": "pki/git-ca",
+            "ttl_s": 60,
+        }),
+    )
+    .await
+    .expect("an endpoint, from the run's worker");
+    assert_eq!(kept_for(sid, 5), 1, "handed to the run's worker");
+    let dial = u16::try_from(answer["port"].as_u64().unwrap()).unwrap();
+    let mut h = tokio::net::TcpStream::connect(("127.0.0.1", dial))
+        .await
+        .unwrap();
+    h.write_all(b"GET /api/x?y=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let response = http_response(&mut h).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "served in the worker: {response}"
+    );
+    let s = tokio::time::timeout(WAIT, saw.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.values("authorization"), [format!("Bearer {token}")]);
+    vault.release(&["L1".to_string()]);
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(
+        WAIT,
+        tokio::io::AsyncReadExt::read_to_end(&mut h, &mut rest),
+    )
+    .await;
+    assert!(
+        ended.is_ok(),
+        "the connection ended with the lease, cut in the worker"
+    );
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while kept_for(sid, 5) > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(kept_for(sid, 5), 0, "the daemon forgot it");
+    super::super::worker::drop_run(sid, 5);
+}
+
+/// FR-90 P8-2a-2 — where the run's worker is given up on, its endpoint is
+/// refused: served in the worker or not at all, never by the daemon instead.
+#[cfg(all(feature = "vault", unix))]
+#[tokio::test]
+async fn where_the_runs_worker_is_given_up_on_its_endpoint_is_refused() {
+    use super::super::vault_connect::handed::kept_for;
+    use crate::vault_proxy::testing::{fake_http, made};
+    let token = made();
+    let (ca, port, _saw) = fake_http().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (b, _vault, sid) = http_belt(
+        dir.path(),
+        &[
+            ("git/bot#token", token.as_bytes()),
+            ("pki/git-ca", ca.as_bytes()),
+        ],
+    );
+    super::super::worker::run_never_up(sid, 5, Arc::new(|_| {}));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !super::super::worker::seen(sid, 5).is_some_and(|s| s.gave_up)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut c = Client::connect(&b).await;
+    let asked = tokio::time::Instant::now();
+    let refused = connect_answer(
+        &mut c,
+        1,
+        json!({
+            "handle": "git/bot",
+            "engine": "http",
+            "upstream": format!("https://localhost:{port}"),
+            "auth": "bearer",
+            "ca": "pki/git-ca",
+            "ttl_s": 60,
+        }),
+    )
+    .await;
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "refused at once, not after the wait for a worker coming up"
+    );
+    let why = refused.expect_err("refused, never served by the daemon instead");
+    assert!(why.contains("worker"), "{why}");
+    assert_eq!(kept_for(sid, 5), 0, "nothing handed");
+    super::super::worker::drop_run(sid, 5);
+}
+
+/// FR-90 P8-2c-2 — `Pending`'s own `Slot` bookkeeping in `remote` mode
+/// (the daemon's side of a handed-over toolbelt), without a real worker or
+/// channel: `note_remote_open`/`answer`/`withdraw`/`withdraw_all`'s return
+/// values and `ids()`, which must stay correct even though the real wait
+/// lives elsewhere. The forward itself (a `Link::call` to whatever worker
+/// `worker::link_of` finds, if any) is exercised by `handed::tests`
+/// instead, where a real `Serving` answers it.
+#[cfg(all(unix, worker_calls))]
+mod remote_pending {
+    use super::*;
+
+    fn remote() -> Pending {
+        Pending::remote(ObjectId::new(), 1, 42)
+    }
+
+    #[tokio::test]
+    async fn note_remote_open_respects_max_pending() {
+        let p = remote();
+        for i in 0..MAX_PENDING {
+            assert!(p.note_remote_open(&format!("a{i}")), "under the bound");
+        }
+        assert!(
+            !p.note_remote_open("one_too_many"),
+            "MAX_PENDING already open"
+        );
+        assert_eq!(p.ids().len(), MAX_PENDING);
+    }
+
+    #[tokio::test]
+    async fn ids_reflects_remote_opens_sorted() {
+        let p = remote();
+        p.note_remote_open("b");
+        p.note_remote_open("a");
+        assert_eq!(p.ids(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn answer_removes_a_remote_slot_and_reports_it_was_open() {
+        let p = remote();
+        p.note_remote_open("r1");
+        let answer = Answer {
+            decision: Decision::Allow,
+            by: Author {
+                user_id: ObjectId::new(),
+                name: "x".into(),
+            },
+        };
+        assert!(p.answer("r1", answer.clone()), "it was open");
+        assert!(p.ids().is_empty());
+        // A second answer of the same (now-closed) id reports it was not.
+        assert!(!p.answer("r1", answer));
+    }
+
+    #[tokio::test]
+    async fn answer_of_an_id_never_opened_reports_false() {
+        let p = remote();
+        let answer = Answer {
+            decision: Decision::Allow,
+            by: Author {
+                user_id: ObjectId::new(),
+                name: "x".into(),
+            },
+        };
+        assert!(!p.answer("never_opened", answer));
+    }
+
+    #[tokio::test]
+    async fn withdraw_removes_one_remote_slot_and_leaves_the_rest() {
+        let p = remote();
+        p.note_remote_open("w1");
+        p.note_remote_open("w2");
+        p.withdraw("w1");
+        assert_eq!(p.ids(), vec!["w2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn withdraw_all_clears_every_remote_slot() {
+        let p = remote();
+        p.note_remote_open("x1");
+        p.note_remote_open("x2");
+        p.withdraw_all();
+        assert!(p.ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn withdraw_all_on_an_already_empty_pending_does_not_panic() {
+        remote().withdraw_all();
+    }
 }

@@ -85,7 +85,7 @@ pub fn produce(width: u32, height: u32, monotonic_us: u64, monitor: u8) -> Arc<F
         height,
         stride,
         pixel_format: PixelFormat::Bgra,
-        data,
+        data: data.into(),
         monotonic_us,
         monitor,
         // P8a — a synthetic frozen still: provably nothing changes
@@ -198,7 +198,7 @@ mod tests {
         assert_eq!(f.height, 480);
         assert_eq!(f.stride, 640 * 4);
         assert_eq!(f.pixel_format, PixelFormat::Bgra);
-        assert_eq!(f.data.len(), (640 * 480 * 4) as usize);
+        assert_eq!(f.cpu().len(), (640 * 480 * 4) as usize);
     }
 
     #[test]
@@ -209,7 +209,7 @@ mod tests {
         let f = produce(640, 480, 0, 0);
         let pixel_at = |x: u32, y: u32| {
             let i = ((y * f.stride) + x * 4) as usize;
-            [f.data[i], f.data[i + 1], f.data[i + 2], f.data[i + 3]]
+            [f.cpu()[i], f.cpu()[i + 1], f.cpu()[i + 2], f.cpu()[i + 3]]
         };
         assert_eq!(pixel_at(0, 0), BG_GRAY);
         assert_eq!(pixel_at(639, 0), BG_GRAY);
@@ -228,7 +228,7 @@ mod tests {
         let cx = 320u32;
         let cy = 240u32;
         let i = ((cy * f.stride) + cx * 4) as usize;
-        let centre = [f.data[i], f.data[i + 1], f.data[i + 2], f.data[i + 3]];
+        let centre = [f.cpu()[i], f.cpu()[i + 1], f.cpu()[i + 2], f.cpu()[i + 3]];
         assert_ne!(
             centre, BG_GRAY,
             "centre pixel should be inside the badge, got {centre:?}"
@@ -240,10 +240,10 @@ mod tests {
         // Portrait-tall (e.g. side monitor rotated). The badge
         // should still fit (uses min(40% width, 60% height)).
         let f = produce(480, 1080, 0, 0);
-        assert_eq!(f.data.len(), (480 * 1080 * 4) as usize);
+        assert_eq!(f.cpu().len(), (480 * 1080 * 4) as usize);
         // Square 1:1 (kiosk).
         let f = produce(1024, 1024, 0, 0);
-        assert_eq!(f.data.len(), (1024 * 1024 * 4) as usize);
+        assert_eq!(f.cpu().len(), (1024 * 1024 * 4) as usize);
     }
 
     #[test]
@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(f.width, 60);
         assert_eq!(f.height, 60);
         // Frame should be non-empty and correctly sized.
-        assert_eq!(f.data.len(), 60 * 60 * 4);
+        assert_eq!(f.cpu().len(), 60 * 60 * 4);
     }
 
     #[test]

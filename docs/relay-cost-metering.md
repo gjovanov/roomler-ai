@@ -55,6 +55,12 @@ flowchart LR
 > signalling; metering it would invert the growth model and charge for exactly the outcome
 > the whole NAT-traversal program exists to produce. The cheapest customer to serve is the
 > one whose peers connect directly, and the meter must say so.
+>
+> **Measured 2026-11-01:** a remote-control session that ends direct is close to that, not at
+> it. It books about 380 KB of `turn_bytes` while ICE settles, flat across one minute and
+> three, and nothing for the bytes on the direct pair. A viewer offering no relay candidate
+> booked 10 KB. Those bytes did cross a relay, so the meter is right. The numbers are in
+> [FR-52, decision 17](fr/FR-52-cross-org-remote-access.md#9-open-decisions).
 
 ## One ledger, and why it needs no lock
 
@@ -127,7 +133,7 @@ already polls every 30 s; the poller resolves network → tenant and writes the 
 | another `boot`: the PoP restarted, or a late sample from the old process | nothing | restarts at this sample |
 | none: the first sample, or the PoP was unreachable for 7 days | nothing | starts at this sample |
 
-`boot` names the PoP process in `/stats` (`crates/derp-relay/src/main.rs:283`, the same id
+`boot` names the PoP process in `/stats` (`crates/derp-relay/src/main.rs:289`, the same id
 `turn_usage.boot` carries), and it is what tells a restart from a stale sample. Every row
 but the first **under-reports and never double-counts**, the same trade the host-total
 `net_*_bytes` columns make: a missing byte is recoverable, an invented one is a refund.
@@ -188,7 +194,7 @@ flowchart LR
 | Path | Where |
 |---|---|
 | The cluster's coturn (P4b-1) | every pod subscribes, `crates/modules/network/src/turn_usage.rs:81` |
-| Each PoP's coturn (P4b-2) | derp-relay keeps an hour of totals (`crates/derp-relay/src/main.rs:256`), and every pod pulls them with a request signed for that region (`crates/core/src/relay_load.rs:314`) |
+| Each PoP's coturn (P4b-2) | derp-relay keeps an hour of totals (`crates/derp-relay/src/main.rs:262`), and every pod pulls them with a request signed for that region (`crates/core/src/relay_load.rs:314`) |
 | The booking | `crates/core/src/turn_bytes.rs:86`: the first pod to claim a leg books it, and a username naming no org is counted as unattributed |
 
 > ⚠️ **`turn_bytes` is monitored only behind `relay_allowance.turn_attribution`**, which

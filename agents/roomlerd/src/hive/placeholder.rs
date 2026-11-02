@@ -55,7 +55,9 @@ pub const MAX_PER_RUN: usize = 64;
 type RunKey = (ObjectId, u64);
 
 /// One of a run's placeholders: what the proxy needs to swap its value in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// FR-90 P8-2a-4b — none of it secret, so it crosses to the session's
+/// worker as it is; its value crosses apart, for one request.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Bound {
     pub token: String,
     pub lease_id: String,
@@ -122,6 +124,16 @@ pub fn bound(session: ObjectId, fence: u64, host: &str, port: u16) -> Vec<Bound>
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// FR-90 P8-2a-4b — whether `host`, in its one spelling, is the audience of
+/// a placeholder the run holds, on any port: the only hosts the run's CA
+/// makes a leaf for.
+#[cfg(unix)]
+pub fn is_audience(session: ObjectId, fence: u64, host: &str) -> bool {
+    runs()
+        .get(&(session, fence))
+        .is_some_and(|all| all.iter().any(|b| b.host == host))
 }
 
 /// How many placeholders the run holds.

@@ -20,8 +20,11 @@ name: Cache janitor
 # instead of full debuginfo. And six families no longer live here at all:
 # integration, both installer smokes, and ci.yml's macOS overlay and two
 # Windows lanes keep their cargo caches on the free `seed-cache` release
-# (.github/actions/ci-seed-restore + ci-seed-save). That leaves the Actions
-# cache the seven Linux lanes plus apt and bun, room for a full rotation. ⚠ A step that deletes the crate archives
+# (.github/actions/ci-seed-restore + ci-seed-save). That left the Actions
+# cache the seven Linux lanes plus apt and bun, room for a full rotation.
+# Wave 34 (2026-10-30) moved those seven to `seed-cache` too, once the Actions
+# cache began refusing downloads ("Egress is over the account limit"); it now
+# holds the apt and bun sets and the release lane's small tool caches. ⚠ A step that deletes the crate archives
 # before the save CANNOT work. rust-cache's post step runs `cargo metadata
 # --all-features` first, and cargo needs a crate's `.crate` file even when its
 # source is already unpacked, so it downloads all of them again. Wave 21

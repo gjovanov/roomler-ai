@@ -49,6 +49,10 @@ _Avoid_: caps detection, capability scan, encoder test
 The remembered answer of the last probe, kept only under the build, hardware, drivers and settings that produced it; a change in any of them re-probes, and an answer that found no hardware is never remembered.
 _Avoid_: caps cache file, cached capabilities, hardware cache
 
+**Learned deny**:
+A cell this host stopped opening because a probe child died in it. Kept only in the probe cache, and tested again when the build, hardware, drivers or settings change, or after a day. Separate from `encoder_cells_deny`, the list an operator controls.
+_Avoid_: auto-deny, blacklist, denied by the driver
+
 ### Remote desktop — recording (FR-85)
 
 **Recording**:

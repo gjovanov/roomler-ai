@@ -36,11 +36,15 @@ sessions read it too, through their toolbelt.
 > confirmed for `knowhow.stale_days` turns `stale`, and a probe's or a
 > person's word revives it (§13.4); and P4-5-4, what each device last found
 > of an entity, a row of each probe kind (P4-5-4b), on its card beside each
-> fact's last word (§13.5).** People,
-> the sync, scans and sessions' proposals fill the map, probes verify it, and
-> what nobody confirms ages.
-> Windows (P4-3b-4) and `roomler_connect` (P4-6) come with the steps that
-> build them (§14).
+> fact's last word (§13.5); and P4-6-1a, a session's connect, the server's
+> half of `roomler_connect`: the engine, upstream and credential an entity's
+> confirmed facts say, and the paths its devices measured (§13.6); and
+> P4-6-1b, the toolbelt's `roomler_connect`: from the session's own device
+> when a probe from here found it (P4-6-1b-1), or through another device that
+> reached it, its upstream connection riding a flow only this daemon may use
+> (P4-6-1b-2) (§13.7).** People, the sync, scans and sessions' proposals fill
+> the map, probes verify it, and what nobody confirms ages.
+> Windows (P4-3b-4) comes with the step that builds it (§14).
 
 ## 1. A map, not a gate
 
@@ -149,7 +153,7 @@ that is no device is an `endpoint`.
 ## 3. The store
 
 Five collections, per organization
-([`lib.rs:271`](../crates/modules/knowhow/src/lib.rs#L271)):
+([`lib.rs:272`](../crates/modules/knowhow/src/lib.rs#L272)):
 
 - **`knowhow_entities`**, unique on `(tenant_id, kind, key)` among the live (a
   partial index on `deleted_at: {$type: "null"}`, so a live row stores an
@@ -204,7 +208,7 @@ because a card and a neighbourhood show only the links whose other end is live.
 | Switch | Effect |
 |---|---|
 | `[modules] knowhow` (`ROOMLER__MODULES__KNOWHOW`) | **default OFF**, like `hive` and `vault`: no route is mounted |
-| `knowhow.tenants` (`ROOMLER__KNOWHOW__TENANTS=<id>,<id>`) | the organizations whose map it keeps ([`KnowhowSettings`](../crates/config/src/settings.rs#L163)). A list alone mounts the module ([`knowhow_on`](../crates/config/src/settings.rs#L1635)), the form a hosted server uses, because no older image reads it. Clearing it is the kill switch |
+| `knowhow.tenants` (`ROOMLER__KNOWHOW__TENANTS=<id>,<id>`) | the organizations whose map it keeps ([`KnowhowSettings`](../crates/config/src/settings.rs#L163)). A list alone mounts the module ([`knowhow_on`](../crates/config/src/settings.rs#L1641)), the form a hosted server uses, because no older image reads it. Clearing it is the kill switch |
 
 `knowhow.tenants` reads like `vault.tenants`: empty or `*` is every
 organization, and an entry that is not an organization id matches nothing
@@ -402,7 +406,7 @@ the device row as the fleet keeps it.
 | `overlay.ipv4` | the address the device leases on the organization's overlay | while it holds a live overlay node |
 | `overlay.name` | its name there, the MagicDNS label, as the device list shows it | while the node has a label (every node since names) |
 | `overlay.magicdns` | `<label>.<domain>`, the name the device list shows ([`mirror`](../crates/modules/knowhow/src/sync.rs#L222)) | while the organization has a MagicDNS domain |
-| `overlay.routes` | the subnets it carries for its peers: approved by an admin **and** still offered by the device ([`effective_routes`](../crates/remote_control/src/models.rs#L6633)), the default route apart; at most 64 | while it holds a node (`[]` for none) |
+| `overlay.routes` | the subnets it carries for its peers: approved by an admin **and** still offered by the device ([`effective_routes`](../crates/remote_control/src/models.rs#L6971)), the default route apart; at most 64 | while it holds a node (`[]` for none) |
 | `overlay.exit` | whether it carries the default route `0.0.0.0/0` for the peers that choose it, approved and still offered | while it holds a node |
 | `tunnel.routes` | the subnets it is a gateway for in the tunnel mesh, as an admin set them | always (`[]` for none); at most 64 |
 | `ssh.server` | whether its build serves roomler SSH: the `ssh` verb it advertises, matched whole | always |
@@ -654,11 +658,11 @@ flowchart TD
 
 | | |
 |---|---|
-| the key | `knowhow_scan_roots`: comma-separated absolute paths, set in the device's config or over the LocalAPI, `roomler config set knowhow_scan_roots …` ([`config_surface`](../crates/agent-core/src/config_surface.rs#L544)). A folder is walked for its checkouts; a file is read as a kubeconfig (decision 46) |
+| the key | `knowhow_scan_roots`: comma-separated absolute paths, set in the device's config or over the LocalAPI, `roomler config set knowhow_scan_roots …` ([`config_surface`](../crates/agent-core/src/config_surface.rs#L552)). A folder is walked for its checkouts; a file is read as a kubeconfig (decision 46) |
 | empty | nothing is read: the answer is `no_roots` |
 | live | read from the config file again at each scan, under the LocalAPI's write lock ([`read_config`](../agents/roomlerd/src/hive/knowhow/mod.rs#L523)): an edit takes the next scan, with no restart |
-| whose | the device's: absent from `DesiredConfig`, and named in the test that keeps every device-owned key out of it ([`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9284)) |
-| the listeners | P4-3b-3: `knowhow_scan_listeners`, off by default, live and the device's like the roots ([`config_surface`](../crates/agent-core/src/config_surface.rs#L554)). Nothing listed at all, neither a root nor the listeners, is `no_roots` |
+| whose | the device's: absent from `DesiredConfig`, and named in the test that keeps every device-owned key out of it ([`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9779)) |
+| the listeners | P4-3b-3: `knowhow_scan_listeners`, off by default, live and the device's like the roots ([`config_surface`](../crates/agent-core/src/config_surface.rs#L562)). Nothing listed at all, neither a root nor the listeners, is `no_roots` |
 
 **Whose eyes** ([`whose`](../agents/roomlerd/src/hive/knowhow/owner.rs#L78)).
 
@@ -779,7 +783,7 @@ each root not read and why, and counts what was dropped.
 > A scan runs off the signaling loop, one at a time, and the last 16 answers are kept, so a scan
 > delivered again after a lost connection is answered from what it found, never run twice. The
 > verb is advertised by every Linux and macOS build carrying `hive`
-> ([`rpc_caps`](../agents/roomlerd/src/encode/caps.rs#L1991)), whatever its roots say: an empty
+> ([`rpc_caps`](../agents/roomlerd/src/encode/caps.rs#L4383)), whatever its roots say: an empty
 > list is an answer.
 
 ## 12. A session's questions (P4-4-1)
@@ -804,18 +808,19 @@ sequenceDiagram
     K-->>D: rc:knowhow.card {req_id, card}, or rc:knowhow.refused {req_id, reason}
 ```
 
-**The word that the map is there** ([`served`](../crates/modules/knowhow/src/session.rs#L234)). At each hello the
+**The word that the map is there** ([`served`](../crates/modules/knowhow/src/session.rs#L258)). At each hello the
 pod's knowhow sends `rc:knowhow.served {tools}` to a device whose hello
 advertised `knowhow-tools`, on its primary enrollment's connection, when
 knowhow serves its organization. `tools` names what this server answers
-(`knowhow_search`, `knowhow_get`, since P4-4-2a `knowhow_propose`, and since
-P4-5-2a `knowhow_verify` for a device that probes, §13.3), so a newer agent
+(`knowhow_search`, `knowhow_get`, since P4-4-2a `knowhow_propose`, since
+P4-5-2a `knowhow_verify` for a device that probes, §13.3, and since P4-6-1a
+`roomler_connect` for a device with a vault client, §13.6), so a newer agent
 offers a session no tool an older server would leave unanswered. No other device is sent it: an older
 agent would log a frame it cannot read. A device offers its sessions the
 tools only on this word, so where knowhow is switched off no session is shown
 a tool that no module would answer.
 
-**Who is asking** ([`identify`](../crates/modules/knowhow/src/session.rs#L454)). A question names a session and
+**Who is asking** ([`identify`](../crates/modules/knowhow/src/session.rs#L500)). A question names a session and
 its fence; the organization and the device come from the socket. Every
 question is checked, in this order:
 
@@ -825,14 +830,14 @@ question is checked, in this order:
 | the session's record, read through hive's own DAO, is this organization's and runs on this device | `not_located` |
 | at the frame's fence | `stale_fence` |
 | live: starting, idle, running or awaiting approval | `ended` |
-| its starter holds `KNOWHOW_VIEW` or `KNOWHOW_EDIT` in the organization, read now ([`may_read`](../crates/modules/knowhow/src/session.rs#L501), decision 48) | `denied` |
+| its starter holds `KNOWHOW_VIEW` or `KNOWHOW_EDIT` in the organization, read now ([`may_read`](../crates/modules/knowhow/src/session.rs#L547), decision 48) | `denied` |
 | 120 questions a minute for the session on its device | `busy` |
 
 Then the question itself: `bad_request` for one past its bounds, `not_found`
 for a name no live entity holds, `unavailable` when a read failed. Each
 connection's questions wait in one queue of 16, answered in order by one task,
 so a slow read never holds the socket and a flood is answered `busy` instead
-of queued ([`Questions`](../crates/modules/knowhow/src/session.rs#L113)).
+of queued ([`Questions`](../crates/modules/knowhow/src/session.rs#L124)).
 
 > [!IMPORTANT]
 > **A session reads what its starter may, now.** The vault holds a session's
@@ -846,7 +851,7 @@ of queued ([`Questions`](../crates/modules/knowhow/src/session.rs#L113)).
 | Question | Answer | Bounds |
 |---|---|---|
 | `rc:knowhow.search {q?, kind?, env?, limit?}` | `rc:knowhow.found {entities, truncated}`: the people's search (§6), each entity as a listing shows one, no attributes and no facts | at most 50, 20 by default; `q` at most 200 characters |
-| `rc:knowhow.get {kind, key}` | `rc:knowhow.card {card}`: the people's card (§6), by the name a chip and a session use, with each device's last finding (§13.5) | at most 50 links. Past 64 KiB the devices' findings go first, the oldest first, then links from the end, until the card fits ([`bounded`](../crates/modules/knowhow/src/session.rs#L634)); the entity itself is never cut, its own bounds hold it |
+| `rc:knowhow.get {kind, key}` | `rc:knowhow.card {card}`: the people's card (§6), by the name a chip and a session use, with each device's last finding (§13.5) | at most 50 links. Past 64 KiB the devices' findings go first, the oldest first, then links from the end, until the card fits ([`bounded`](../crates/modules/knowhow/src/session.rs#L680)); the entity itself is never cut, its own bounds hold it |
 
 Every entity, fact and link comes with its status and source, so a session
 sees what a person said, what the sync and scans said, and (with P4-4-2) what
@@ -871,23 +876,25 @@ a session proposed, each for what it is.
 > on, so a knowhow mounted without hive finds no session and refuses every
 > question `not_located`; the `knowhow` build feature implies `hive`.
 
-### 12.1 The toolbelt's tools (P4-4-1b, P4-4-2b, P4-5-2b)
+### 12.1 The toolbelt's tools (P4-4-1b, P4-4-2b, P4-5-2b, P4-6-1b-1)
 
 The device's half ([`knowhow_tools.rs`](../agents/roomlerd/src/hive/knowhow_tools.rs)):
-four tools in a session's toolbelt, `mcp__roomler__knowhow_search`,
-`mcp__roomler__knowhow_get`, (P4-4-2b) `mcp__roomler__knowhow_propose` and
-(P4-5-2b) `mcp__roomler__knowhow_verify`, compiled wherever agent sessions are
+five tools in a session's toolbelt, `mcp__roomler__knowhow_search`,
+`mcp__roomler__knowhow_get`, (P4-4-2b) `mcp__roomler__knowhow_propose`,
+(P4-5-2b) `mcp__roomler__knowhow_verify` and (P4-6-1b-1)
+`mcp__roomler__roomler_connect` (§13.7), compiled wherever agent sessions are
 (Linux, macOS, Windows), apart from the scanner.
 
 | Piece | Design |
 |---|---|
 | the verb | every build that runs sessions advertises `knowhow-tools`, so its server tells it whether the map is there |
 | the word | the device forgets `rc:knowhow.served` at every primary connection and keeps the tools it names from that frame on, each only when this build knows it |
-| the offer | fixed at a session's launch, as the vault's tools are: a run is offered the tools its server named at that moment. Its settings allow the reads and a proposal outright (`permissions.allow`), since neither asks a person (decision 39), and ask a person for each verify (`permissions.ask`, decision 54), since it aims a connection from this device |
+| the offer | fixed at a session's launch, as the vault's tools are: a run is offered the tools its server named at that moment. Its settings allow the reads and a proposal outright (`permissions.allow`), since neither asks a person (decision 39), and ask a person for each verify and (P4-6-1b-1) each connect (`permissions.ask`, decision 54, [`ASKED`](../agents/roomlerd/src/hive/knowhow_tools.rs#L71)), since each aims something from this device: a probe, an endpoint signed in with a credential |
 | the questions | on the primary's connection, a `req_id` each, the session and its fence attached by the daemon, never by the model; each answer matched to its question, 15 s each |
 | the tools | `knowhow_search {q?, kind?, env?, limit?}`, `knowhow_get {kind, key}` and `knowhow_propose {entity \| fact \| link, why}` (§12.2), each argument checked before anything is asked: a proposal names exactly one of the three, an object, with a `why` of at most 500 characters. The answer is the map's JSON as text (for a proposal, what it wrote, its id, `proposed`, and the proposals left), a refusal an error in words the model can act on. `knowhow_get`'s description says what a card's `verified` and (P4-5-4) `probes` mean: the last probe's word on a fact, and each device's last finding of each kind (§13.5) |
 | a proposal unanswered | asked and never answered within its 15 s, it may have been written all the same. The model is told so, and that `knowhow_get` shows whether it was: proposing it again is safe, since one already there is refused `exists` |
-| a verify (P4-5-2b) | `knowhow_verify {kind, key, probe?}`, `probe` `tcp` or `tls` and `tcp` when absent. The first answer (`rc:knowhow.verifying`) names the probe, and the tool waits 30 s more for what it measured (`rc:knowhow.verified`), matched by the probe's id, which may come back before the first answer is read: one kept for a waiter yet to come, up to 16 ([`Client::verify`](../agents/roomlerd/src/hive/knowhow_tools.rs#L289)). The model reads the outcome and what it means, where the probe went, how, and what it found ([`measured`](../agents/roomlerd/src/hive/knowhow_tools.rs#L584)); a probe past the 30 s is `pending`, recorded on the facts when it ends, and so is one whose connection went |
+| a verify (P4-5-2b) | `knowhow_verify {kind, key, probe?}`, `probe` `tcp` or `tls` and `tcp` when absent. The first answer (`rc:knowhow.verifying`) names the probe, and the tool waits 30 s more for what it measured (`rc:knowhow.verified`), matched by the probe's id, which may come back before the first answer is read: one kept for a waiter yet to come, up to 16 ([`Client::verify`](../agents/roomlerd/src/hive/knowhow_tools.rs#L307)). The model reads the outcome and what it means, where the probe went, how, and what it found ([`measured`](../agents/roomlerd/src/hive/knowhow_tools.rs#L648)); a probe past the 30 s is `pending`, recorded on the facts when it ends, and so is one whose connection went |
+| a connect (P4-6-1b-1) | `roomler_connect {kind, key}`, routed apart from the reads, since it needs the run's vault, its command target and its account ([`reach_entity`](../agents/roomlerd/src/hive/toolbelt.rs#L1537)). It asks `rc:knowhow.connect` ([`Client::connect`](../agents/roomlerd/src/hive/knowhow_tools.rs#L335)) and opens the access from this device, or (P4-6-1b-2) through another device that reached it, as §13.7 says |
 
 > [!WARNING]
 > **A tool the server did not name is an unknown tool.** A newer agent may know
@@ -1048,7 +1055,7 @@ sequenceDiagram
 ```
 
 **Who asks, and which devices**
-([`request`](../crates/modules/knowhow/src/probe.rs#L879)). A person with
+([`request`](../crates/modules/knowhow/src/probe.rs#L880)). A person with
 `KNOWHOW_EDIT` (decision 54) asks a live device of the organization to probe a
 live entity, as `tcp` or `tls` (decision 55). **202** with the probe, or with
 the device's pending one when it is this same probe. One probe runs at a time a
@@ -1060,12 +1067,12 @@ scan's is. A device is asked at most 30 a minute, by anyone: past that, **429**
 `rate_limited`, counted after every other gate so a refusal says which.
 
 **The target is the map's, never the request's**
-([`target`](../crates/modules/knowhow/src/probe.rs#L183)). The request names an
+([`target`](../crates/modules/knowhow/src/probe.rs#L184)). The request names an
 entity, and the server reads where it is from that entity's facts:
 
 | Fact | Read as |
 |---|---|
-| `address`, else `host` | the host: an IP address or a DNS name, in one spelling ([`probe_host`](../crates/remote_control/src/knowhow.rs#L696)). `host` is read when there is no `address` a probe reaches, as when a scan's listener says `0.0.0.0` |
+| `address`, else `host` | the host: an IP address or a DNS name, in one spelling ([`probe_host`](../crates/remote_control/src/knowhow.rs#L772)). `host` is read when there is no `address` a probe reaches, as when a scan's listener says `0.0.0.0` |
 | `port` | a number from 1 to 65535, or one written as text |
 | `sni` | for `tls`, the server name: else the `host` fact or the host when it is a name, and none for an address alone |
 
@@ -1075,7 +1082,7 @@ written into it); a listener's bind address; or an address never probed.
 
 > [!WARNING]
 > **Some addresses are never probed, whatever any list says**
-> ([`never_probed`](../crates/remote_control/src/knowhow.rs#L738)). Link-local
+> ([`never_probed`](../crates/remote_control/src/knowhow.rs#L814)). Link-local
 > (`169.254.0.0/16`, `fe80::/10`), where every major cloud's metadata service
 > answers, and the two metadata addresses outside it: AWS's IPv6
 > `fd00:ec2::254`, and Alibaba's `100.100.100.200`, which sits inside
@@ -1093,7 +1100,7 @@ would test that other device's own port, and is **400**. An answer that says it
 connected to a loopback address measures nothing on another device's entity.
 
 **The delivery** is a scan's
-([`deliver`](../crates/modules/knowhow/src/probe.rs#L259)): the row is the bus,
+([`deliver`](../crates/modules/knowhow/src/probe.rs#L260)): the row is the bus,
 on the same link a scan goes out on. A connection is linked at its hello when the
 device can scan or probe. A probe goes out at once from the pod holding the
 device, at that pod's sweep when it landed on another, at the device's next hello
@@ -1116,7 +1123,7 @@ which facts it measured (`measured`).
 | `failed` | not measured: a handshake that failed past the connect, a certificate the server could not read, or a probe the device could not run; why is `detail` | the detail's |
 | `expired` | 10 minutes without an answer | ask again |
 
-**The answer** ([`read_answer`](../crates/modules/knowhow/src/probe.rs#L355)).
+**The answer** ([`read_answer`](../crates/modules/knowhow/src/probe.rs#L356)).
 It is recorded once, and only from the device the probe was sent to. A round
 trip past 11 s is dropped, and an address is kept only as an IP literal. A
 `tls` answer's certificate is read by the wire's rules (names lowercase, the
@@ -1128,7 +1135,7 @@ shape.
 
 ### 13.1 What a probe confirms (decision 56)
 
-Only what it measured ([`measure`](../crates/modules/knowhow/src/probe.rs#L439)).
+Only what it measured ([`measure`](../crates/modules/knowhow/src/probe.rs#L440)).
 On each fact it measured, `verified {at, probe, from_device, rtt_ms, carrier,
 ok}`, the card's view of the last probe that measured it:
 
@@ -1212,14 +1219,23 @@ flowchart TD
     T -->|no TLS there| FL["failed"]
 ```
 
-| Rule ([`measure`](../agents/roomlerd/src/hive/knowhow_probe.rs#L257)) | Why |
+| Rule ([`measure`](../agents/roomlerd/src/hive/knowhow_probe.rs#L330)) | Why |
 |---|---|
 | a name is resolved here, and **every** address is checked before any connect; one never-probed address refuses the whole probe | a name that points at a metadata service is not one to reach through its other addresses |
 | a connect goes only to an address that passed, the first that answers | a name that resolves elsewhere by the time of the connect reaches nothing new |
 | an address rule holds addresses, a name rule matches the name asked for ([`allows`](../crates/agent-core/src/probe_reach.rs#L181)) | listing `db.example.com` trusts that name's resolution; listing `10.0.0.0/8` trusts no name |
 | `tcp`: a connect and a close, not a byte sent | connect, never converse (decision 55) |
-| `tls`: a ClientHello, the leaf certificate read, the handshake signature checked (so the server holds the key of the certificate recorded), the chain neither trusted nor refused ([`SeeOnly`](../agents/roomlerd/src/hive/knowhow_probe.rs#L475)) | a private CA is what an organization's own services have; a probe says what the address presents |
+| `tls`: a ClientHello, the leaf certificate read, the handshake signature checked (so the server holds the key of the certificate recorded), the chain neither trusted nor refused ([`SeeOnly`](../agents/roomlerd/src/hive/knowhow_probe.rs#L544)) | a private CA is what an organization's own services have; a probe says what the address presents |
 | ten seconds for the whole probe; a probe id run once, and one sent again answered as it was | the server sends a probe again at a hello while it is unanswered |
+
+**Where it runs (FR-90 P8-2d-1).** Where the device's owner turned workers on (`hive_worker`), in a
+build with the vault, the measure runs in the device's worker, not the daemon: what it parses comes
+from a host the probe reached, and a fault in it costs that worker. The daemon keeps the prober: what
+it was asked, the answers it gave, the list above read under the config's lock, and the frame. The
+answer is the same word for word. A worker that cannot take a probe answers `failed`, the detail
+saying why (parked, not up within 10 s, lost during the probe), so it records nothing on a fact
+(§13.1), and it is never measured in the daemon instead. Someone asks again under a new id. The
+states: [`hive.md`](hive.md#the-devices-worker-fr-90-p8-2d-1).
 
 > [!WARNING]
 > **Link-local and the cloud metadata addresses are never reached, whatever
@@ -1232,11 +1248,11 @@ flowchart TD
 
 A session asks its own device to probe an entity of the map, by the entity's
 kind and key (decision 54), answered by
-[`verify`](../crates/modules/knowhow/src/session.rs#L368). It travels as
+[`verify`](../crates/modules/knowhow/src/session.rs#L414). It travels as
 a question does, on the device's primary connection, and is believed as one is
 (§12): the same checks, in the same order, and the same 120 a minute. The
 probe is then asked as a person's is
-([`ask`](../crates/modules/knowhow/src/probe.rs#L782)), and what it
+([`ask`](../crates/modules/knowhow/src/probe.rs#L783)), and what it
 measured is recorded as a person's probe's is (§13.1). P4-5-2a is the server's
 half. The toolbelt's `knowhow_verify`, which carries it and asks a person at
 each call, is P4-5-2b's (§12.1).
@@ -1260,12 +1276,12 @@ sequenceDiagram
 
 | Piece | Design |
 |---|---|
-| the offer | `rc:knowhow.served` names `knowhow_verify` only for a device whose hello advertised `knowhow-probe` ([`served`](../crates/modules/knowhow/src/session.rs#L234)): a session is offered it only where its own device runs probes |
-| who may ask | a session whose starter holds `KNOWHOW_EDIT`, read at every verify ([`may_probe`](../crates/modules/knowhow/src/session.rs#L529)), as a person's probe needs: a probe writes what it measured onto the map, and a session asks only what its starter may ask. A starter who holds `KNOWHOW_VIEW` alone has sessions that read the map and verify nothing |
+| the offer | `rc:knowhow.served` names `knowhow_verify` only for a device whose hello advertised `knowhow-probe` ([`served`](../crates/modules/knowhow/src/session.rs#L258)): a session is offered it only where its own device runs probes |
+| who may ask | a session whose starter holds `KNOWHOW_EDIT`, read at every verify ([`may_probe`](../crates/modules/knowhow/src/session.rs#L575)), as a person's probe needs: a probe writes what it measured onto the map, and a session asks only what its starter may ask. A starter who holds `KNOWHOW_VIEW` alone has sessions that read the map and verify nothing |
 | what is probed | the live entity by `kind` and `key`, its target read from its own facts (§13); `probe` is `tcp` or `tls` |
 | from where | the session's own device, the one the question came from: never another |
 | the answer, at once | `rc:knowhow.verifying {req_id, probe_id}`: the probe asked, or the one the device is already running for this same entity and kind. The probe itself goes out as soon as it is asked, so the device may be sent it before this answer: a device reads the two in either order |
-| the answer, after | once the device's answer is recorded, `rc:knowhow.verified {probe_id, probe}` on the same connection, the probe as the people's listing shows it: its state, round trip, address, carrier, what TLS showed and the facts it measured ([`answered`](../crates/modules/knowhow/src/probe.rs#L584)) |
+| the answer, after | once the device's answer is recorded, `rc:knowhow.verified {probe_id, probe}` on the same connection, the probe as the people's listing shows it: its state, round trip, address, carrier, what TLS showed and the facts it measured ([`answered`](../crates/modules/knowhow/src/probe.rs#L585)) |
 | the record | the probe row names the `session`, and no person: `requested_by` stays empty. One probe at a time a device and its 30 a minute are the device's, whoever asks |
 
 | Refusal | Means | Asking again |
@@ -1352,8 +1368,8 @@ flowchart LR
 | which probes | an `ok` or an `unreachable` one: it reached the target, or tried to. A `not_allowed` one (its owner's list) and a `failed` one (it could not ask) say nothing of the target, so the device's earlier finding stands behind them; a probe never answered is no one's finding |
 | how many | at most 16 devices ([`MAX_CARD_DEVICES`](../crates/modules/knowhow/src/routes.rs#L72)), each with a row of each kind it found (`tcp`, `tls`), so at most 32 rows, the newest first, and `probes_truncated` when a device was left out. A device is shown by its newest finding and brings its other kind's row along, however old. They are read from the entity's newest 512 findings, so a device whose last one lies further back is not shown; the probes listing (§6) still has it |
 | each row | the probes listing's own view (§6): its id, which a fact's `verified.probe` names; its device; who asked, or which session; its kind and target; its state, round trip, address and carrier; what TLS showed; and what it measured |
-| the read | one aggregate over the entity's probe index, at every card read ([`card`](../crates/modules/knowhow/src/routes.rs#L446)); which devices are shown is a pure function of what it read ([`card_rows`](../crates/modules/knowhow/src/probe.rs#L973)) |
-| a session's card | the same rows. Past the card's 64 KiB they go first, the oldest first, before any link ([`bounded`](../crates/modules/knowhow/src/session.rs#L634)), so a card a session was given whole before them still is |
+| the read | one aggregate over the entity's probe index, at every card read ([`card`](../crates/modules/knowhow/src/routes.rs#L446)); which devices are shown is a pure function of what it read ([`card_rows`](../crates/modules/knowhow/src/probe.rs#L974)) |
+| a session's card | the same rows. Past the card's 64 KiB they go first, the oldest first, before any link ([`bounded`](../crates/modules/knowhow/src/session.rs#L680)), so a card a session was given whole before them still is |
 
 > [!NOTE]
 > **The last word stays the last word.** `verified` and `verified_at` are
@@ -1369,11 +1385,180 @@ flowchart LR
 > probe had hidden what TLS showed it. Every probe stays in the probes
 > listing (`GET …/probe?entity=`) for 90 days.
 
+### 13.6 A session's connect (P4-6-1a)
+
+A session names an entity of the map, and knowhow says what reaching it
+takes: the engine, the upstream and the credential the entity's own facts
+say, and the paths its devices' findings measured, the session's own device
+first ([`compile`](../crates/modules/knowhow/src/connect.rs#L148)). The
+question travels on the device's primary connection and is believed as any
+question is (§12): the same checks, in the same order, and the same 120 a
+minute, its starter holding `KNOWHOW_VIEW` (decision 61), read at every
+connect ([`connect`](../crates/modules/knowhow/src/session.rs#L390)).
+P4-6-1a is the server's half, decisions 59–61 as recommended. The toolbelt's
+`roomler_connect`, which takes the access, leases the credential, dials a
+path and asks a person at each call, is P4-6-1b's. The design is the FR-90
+spec's §3e "P4-6, `roomler_connect`, as designed".
+
+```mermaid
+sequenceDiagram
+    participant D as the device (the primary's connection)
+    participant K as knowhow, the pod holding it
+    participant M as knowhow_probes
+    D->>K: rc:knowhow.connect {req_id, session_id, fence, kind, key}
+    K->>K: believed as a question is (§12), the starter's KNOWHOW_VIEW read now
+    K->>K: the live entity by kind and key, its active and stale facts
+    K->>M: each device's last finding of each kind (§13.5)
+    K-->>D: rc:knowhow.access {req_id, access}, or rc:knowhow.refused {req_id, reason}
+    Note over D,K: it grants nothing - the device asks the vault for each lease and the forward
+```
+
+**What an entity says** (decision 59,
+[`access_facts`](../crates/remote_control/src/knowhow.rs#L452)).
+Reserved fact paths, read only when the fact is `active` or `stale`
+([`read`](../crates/modules/knowhow/src/connect.rs#L79)):
+
+| Fact | Holds | Read as |
+|---|---|---|
+| `engine` | what the endpoint speaks: `postgres`, `mongodb`, `http`, `kubernetes` or `ssh`, as `vault_connect` takes it, or `tcp` for a service with no credential ([`Engine`](../crates/remote_control/src/knowhow.rs#L476)) | any other word is `unknown_engine`, and `engine` is missing |
+| `host`, else `address` | where the upstream is, read as a probe's host is (§13): lower case, no root dot, never a link-local or metadata address | `host` first: it is the name a secret's `audiences` and the upstream's certificate carry |
+| `port` | a whole number from 1 to 65535, or one written as text | |
+| `credential` | a vault handle: a structured secret by its path or RRN, never a value | needed by every engine but `tcp` |
+| `database`, `auth`, `auth_source`, `ca` | `vault_connect`'s options, as its call takes them | in `options`, when present |
+| `user` | `ssh`'s: the one account the key signs in as | in `options`, and in the `ssh` upstream (`ssh://user@host`) |
+
+**The access** (`rc:knowhow.access {req_id, access}`,
+[`signaling.rs`](../crates/remote_control/src/signaling.rs#L5280)):
+
+| Field | Holds |
+|---|---|
+| `entity` | its id, kind, key and name |
+| `engine`, `upstream`, `host`, `port` | the upstream spelled as `vault_connect` takes it and as a secret's `audiences` must name it ([`upstream`](../crates/modules/knowhow/src/connect.rs#L115)): `host:port` for a database and for `tcp`, `https://host[:port]` for `http` and `kubernetes`, `ssh://[user@]host[:port]` for `ssh`, each default port left out and an IPv6 address bracketed. `null` while anything it needs is missing |
+| `credential`, `options` | the handle, and the options the entity says |
+| `missing`, `proposed` | each path the access needs that the map does not say (`engine`, `host`, `port`, and `credential` for an engine that needs one), and which of those a session only proposed |
+| `here` | the session's own device's last word: `verified` (its last finding is `ok` and fresh), `unreachable` (fresh and `unreachable`) or `unmeasured` (not fresh, or none) |
+| `paths` | each device whose last finding is `ok` and fresh, the session's own first, at most 16: the device, `here`, the probe's id, its kind, carrier, round trip, address and time |
+| `seen` | every finding of a device that is no path, at most 16, newest first: its device, `here`, kind, state, time and `fresh` |
+| `fresh_secs` | how fresh a path must be |
+
+**The paths** (decision 60). Measured, never assumed. A device's last word is
+its newest finding of either kind (§13.5), so an `ok` behind a newer
+`unreachable` is no path. A path is a last word that is `ok` and no older than
+`knowhow.connect_fresh_secs`, read from the entity's newest 512 findings at
+every connect, as a card's are. The device takes them in that order: its own,
+else one probe from here when its word is `unmeasured`, else another device's
+through a forward whose proxy leg has no listener (P4-6-1b). Nothing else is
+ever dialled.
+
+```mermaid
+flowchart LR
+    F["the entity's findings:<br/>a row of each kind a device"] --> L["each device's newest:<br/>its last word"]
+    L --> P{"ok and no older than<br/>connect_fresh_secs?"}
+    P -->|yes| R["a path: the session's<br/>own device first, 16 at most"]
+    P -->|no| S["seen: that device's<br/>findings, beside the paths"]
+```
+
+| Setting | Effect |
+|---|---|
+| `knowhow.connect_fresh_secs` (`ROOMLER__KNOWHOW__CONNECT_FRESH_SECS`) | how old a finding may be and still be a path, in seconds; 0 or absent: 86400, a day ([`fresh_secs`](../crates/modules/knowhow/src/connect.rs#L43)) |
+
+| Refusal | Means | Asking again |
+|---|---|---|
+| a question's (§12) | `not_served`, `not_located`, `stale_fence`, `ended`, `denied` (no `KNOWHOW_VIEW`) and `busy`, as there | as there |
+| `bad_request` | the kind or key is malformed | not as it is |
+| `not_found` | no live entity by that kind and key | once one is on the map |
+| `unavailable` | a read failed | later |
+
+`roomler_connect` is named in `rc:knowhow.served` for a device whose hello
+advertised `vault` ([`served`](../crates/modules/knowhow/src/session.rs#L258)): the
+tool leases its credential through the device's own vault client. An older
+agent keeps only the tools it knows (§12.1).
+
+> [!IMPORTANT]
+> **A session's proposal never places a credential.** A fact a session
+> proposed stays `proposed` until a person or a probe confirms it (§12.3,
+> §13.1), and the access reads the entity as if it were absent. A session
+> cannot choose where a credential goes, or the host it is sent to, by
+> proposing `credential` or `host`. The path is named in `missing` and in
+> `proposed`, so the tool can say that a person's word is what it waits for.
+
+> [!NOTE]
+> **A map, still not a gate.** The access grants nothing. The device asks the
+> vault for each lease and, for a path through another device, for the
+> forward, each decided where it is decided today. The upstream is the
+> string a secret's `audiences` must name, so a `host` fact naming another
+> host gets no lease there.
+
+> [!TIP]
+> **What is missing is an answer, not a refusal.** An entity that lacks its
+> engine or its credential is still answered, with `missing` and `proposed`
+> naming each path, and with its paths. A refusal is one word, and the person
+> who must add the fact needs its path. The tool's `no_access` is read from
+> `missing` (P4-6-1b).
+
+### 13.7 A session's connect, from this device or through another (P4-6-1b)
+
+The toolbelt's `roomler_connect` takes the access §13.6 answers and opens it,
+a person approving each call
+([`call`](../agents/roomlerd/src/hive/connect_tool.rs#L322)). It opens it
+from the session's own device when a probe from here found it (P4-6-1b-1), or
+else through each other device that reached it lately, newest first, until one
+opens (P4-6-1b-2,
+[`through`](../agents/roomlerd/src/hive/connect_tool.rs#L251)). What
+it does from here is a pure function of the access
+([`plan`](../agents/roomlerd/src/hive/connect_tool.rs#L148)).
+
+```mermaid
+flowchart TD
+    A["rc:knowhow.access"] --> M{"missing, or an engine<br/>this build does not speak?"}
+    M -->|yes| N["no_access: each path named,<br/>and what a session only proposed"]
+    M -->|no| H{"this device's word"}
+    H -->|verified| O["open it from here"]
+    H -->|unmeasured| P["one tcp probe from here:<br/>the session's knowhow_verify"]
+    P -->|ok| O
+    P -->|anything else| X["each other device that reached it,<br/>newest first, until one opens"]
+    H -->|unreachable| X
+    X -->|one opens| Y["open it through that device"]
+    X -->|a refusal no device changes| S["no path: that refusal,<br/>no other device tried"]
+    X -->|none| E["no path: each one tried, and why"]
+```
+
+| Piece | As built |
+|---|---|
+| a path from here | `vault_connect`'s endpoint, asked with the access's credential as its `handle`, its engine and upstream, and its options `database`, `auth`, `auth_source` and `ca` ([`connect_args`](../agents/roomlerd/src/hive/connect_tool.rs#L213)). Its leases, its endpoint served only to the session's account, and its connection string with no credential in it are `vault_connect`'s own, as for a session that names them by hand. The answer adds the entity, `path: direct`, and a probe asked first. A path from here that does not open is answered as it failed: the vault's refusal, or a misdescribed entity, is no reason to go through another device |
+| `tcp` | no credential and no endpoint: from here, the answer says where to dial; through a device, it is the forward itself, `net_forward`'s, served to the session's account |
+| the probe from here | when this device's word is `unmeasured`: one `tcp` probe, asked as the session's own `knowhow_verify` is (§13.3), so it is recorded on the map. Only `ok` opens anything from here |
+| through a device (P4-6-1b-2) | for a credentialed engine, `vault_connect`'s endpoint, its upstream connections riding a flow toward the upstream that only this daemon may use, with TLS verified against the upstream's host (`docs/vault.md` §19, "An endpoint through another device"). For `ssh`, a forward the session's own `ssh` dials, its host key checked with `HostKeyAlias`, and `vault_connect`'s agent beside it: the agent holds the key, so it is opened once, and only once a forward has. Each through `rc:vault.net`'s `net:forward` toward that device, then that device's own gates. The answer names `path: through <device>`, its carrier, and `tried`. "Opens" means the vault granted the forward and the flow was made here: that device's own gates (`forward_acl`, tunnel policies) are met at the first connection through it, so a refusal there fails that connection, its error naming the path (`… (through <end>)`), and does not try the next device |
+| no path | nothing is opened. The answer names each path tried, in order, and why: this device's first (its last probe found it unreachable, the probe from here found something else, or none could be asked), then each device's ([`no_path`](../agents/roomlerd/src/hive/connect_tool.rs#L303)). A refusal that no other device changes ends the trying at once ([`Failed`](../agents/roomlerd/src/hive/connect_tool.rs#L76)): this device's vault or egress turned off, or the vault refusing the credential. The vault's word on one device's forward, or a flow not made, tries the next |
+| `no_access` | each path the map lacks, which of them a session only proposed, and what a person adds ([`no_access`](../agents/roomlerd/src/hive/connect_tool.rs#L124)). An answer naming no engine this build speaks, no upstream, or no credential for an engine that needs one opens nothing either, whatever the server said |
+
+> [!IMPORTANT]
+> **Measured, never assumed.** Nothing is dialled that no device's probe
+> found: from here, a probe from here; through a device, that device's own
+> finding. A device whose owner has not listed the target in
+> `knowhow_probe_reach` never finds it from here (its probe is `not_allowed`),
+> so it opens nothing toward it from here through the map, though a session
+> naming the same handle and upstream to `vault_connect` by hand still could.
+
+> [!NOTE]
+> **Through a device needs `hive_net`.** A path through another device is the
+> session's egress, which the device's owner turns on (`hive_net`). Without it
+> there is no path through another device, and the answer says so. The
+> vault's `net:forward` policy and the other device's `forward_acl` each
+> refuse on their own.
+
+> [!NOTE]
+> **The probe from here needs `KNOWHOW_EDIT`.** It is the session's own
+> verify, and a probe writes what it measured onto the map (decision 54). A
+> starter who may only read the map has sessions that connect when this
+> device's last finding is fresh and `ok`, and are told what the devices
+> found otherwise.
+
 ## 14. What comes next
 
 | Step | Builds |
 |---|---|
 | P4-3b-4 | Windows, every root read as the console user (decision 45) |
-| P4-6 | `roomler_connect(entity)`: the best verified path from the session's device, its listener and its credential, each asked of the vault, a person approving. Designed in the FR-90 spec's §3e "P4-6, `roomler_connect`, as designed" (P4-6-0), with decisions 59–62: the entity's access as reserved facts; measured paths only, this device's own, a probe from here, then a device's through a forward whose proxy leg has no listener |
+| P4-6-2 | a person's `roomler connect <kind>/<key>`, if decision 62 asks for it |
 | P4-7, P4-8 | the map in the web app; `#` chips |
 | P4k | the field run in the test organization (AC15) |

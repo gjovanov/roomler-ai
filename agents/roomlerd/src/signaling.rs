@@ -134,8 +134,7 @@ fn host_disconnect_grace_from(raw: Option<&str>) -> Duration {
     }
 }
 
-/// The one message the host's Disconnect puts on the wire. A function so a
-/// test can hold the daemon to the spelling the viewer and the audit key on.
+/// The host's Disconnect on the wire: one function, so a test holds its spelling.
 fn host_disconnect_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
     ClientMsg::Terminate {
         session_id,
@@ -144,10 +143,9 @@ fn host_disconnect_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
     }
 }
 
-/// FR-101 P4b-2 — the one message the idle limit puts on the wire: the reason
-/// every server already knows, and the limit a newer one names to the viewer
-/// and the audit (an older server ignores `limit` and ends the session as
-/// `IdleTimeout` all the same).
+/// FR-101 P4b-2 — the idle limit on the wire: the reason every server knows, and
+/// the limit a newer one names to the viewer and the audit (an older server
+/// ignores `limit` and ends the session as `IdleTimeout` all the same).
 fn idle_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
     ClientMsg::Terminate {
         session_id,
@@ -156,14 +154,14 @@ fn idle_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
     }
 }
 
-/// FR-101 P4b-2 — why the DEVICE is ending a session: the person at it
-/// pressed Disconnect (FR-27 P10), or the session sat idle past its limit
-/// (`session_idle`). Both end it the same way, saying so first and closing
-/// after the grace, under their own reason.
+/// FR-101 P4b-2 — why the DEVICE is ending a session: Disconnect at the device
+/// (FR-27 P10), idle past its limit (`session_idle`), or an RTP pump with no
+/// encoder (#3245). All end alike: said first, closed after the grace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceEnd {
     HostDisconnect,
     Idle,
+    NoVideo,
 }
 
 impl DeviceEnd {
@@ -171,6 +169,7 @@ impl DeviceEnd {
         match self {
             Self::HostDisconnect => host_disconnect_terminate(session_id),
             Self::Idle => idle_terminate(session_id),
+            Self::NoVideo => crate::peer::no_video_terminate(session_id),
         }
     }
 
@@ -178,6 +177,7 @@ impl DeviceEnd {
         match self {
             Self::HostDisconnect => "host_disconnect",
             Self::Idle => "idle_timeout",
+            Self::NoVideo => "no_video",
         }
     }
 }
@@ -786,6 +786,69 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// #3280 — what a later caps try gives way to: a session on this device, a recording
+/// that outlives one, and a local recording, whose child opens the same encoders.
+pub(crate) fn live_on_this_host(
+    rc_sessions: crate::rc_sessions::RcSessionRegistry,
+) -> impl Fn() -> bool + Send + 'static {
+    move || {
+        #[cfg(feature = "recording")]
+        if crate::recording::manager::is_recording() {
+            return true;
+        }
+        !rc_sessions.is_empty()
+    }
+}
+
+/// What `rc:session.request` picked for a session, until its offer takes it.
+struct PendingCodec {
+    chosen: String,
+    /// What the browser takes, to pick again from. `None` when the daemon picked and
+    /// handed it to this GUI worker: that came from the daemon's answer, not this
+    /// process's.
+    browser_caps: Option<Vec<String>>,
+}
+
+/// #3280 — the codec and transport a session's offer builds its peer with. The
+/// request's picks, unless the answer in force has since stopped offering them
+/// ([`crate::encode::caps::picks_at_the_offer`]).
+///
+/// A session that skipped the request (some test harnesses do) or a broken message
+/// order gets "h264" so the peer still works: the universal fallback the browser
+/// understands. No transport is the legacy WebRTC track, the silent default for older
+/// controllers and for sessions that arrived without `preferred_transport`.
+fn picks_for_the_offer(
+    pending_codecs: &mut HashMap<bson::oid::ObjectId, PendingCodec>,
+    pending_transports: &mut HashMap<bson::oid::ObjectId, Option<String>>,
+    session_id: bson::oid::ObjectId,
+    in_force: impl FnOnce() -> roomler_ai_remote_control::models::AgentCaps,
+) -> (String, Option<String>) {
+    let transport = pending_transports.remove(&session_id).unwrap_or(None);
+    let Some(pending) = pending_codecs.remove(&session_id) else {
+        return ("h264".to_string(), transport);
+    };
+    let Some(browser_caps) = pending.browser_caps else {
+        return (pending.chosen, transport);
+    };
+    let picks = crate::encode::caps::picks_at_the_offer(
+        pending.chosen.clone(),
+        transport.clone(),
+        &browser_caps,
+        &in_force(),
+    );
+    if picks.0 != pending.chosen || picks.1 != transport {
+        warn!(
+            %session_id,
+            codec_was = %pending.chosen,
+            codec = %picks.0,
+            transport_was = ?transport,
+            transport = ?picks.1,
+            "rc:sdp.offer — what this session picked at its request is no longer offered"
+        );
+    }
+    picks
+}
+
 /// Drive the signaling loop forever. Returns only on fatal error (e.g.
 /// auth rejection) or shutdown signal.
 /// B1 — the CURRENT connection's RTT-sample sink. Each overlay start
@@ -850,6 +913,9 @@ pub async fn run(
     // device offline. Warm it here instead, with the pump gated off and on a
     // blocking thread.
     let _ = tokio::task::spawn_blocking(crate::encode::caps::detect).await;
+    // #3280 — a first answer that ran short of time gets more tries, off to one
+    // side. It arms nothing on a healthy host, or in a second organization's loop.
+    crate::encode::caps::arm_retry(live_on_this_host(rc_sessions.clone()));
     // Overlay "Disconnect" control → this channel → the connect_once
     // loop, which tears the session down (peer close + ClientMsg::Terminate).
     // Created once; the receiver is polled inside connect_once across
@@ -995,6 +1061,15 @@ pub async fn run(
         if *shutdown.borrow() {
             info!("shutdown signalled; exiting signaling loop");
             return Ok(());
+        }
+        // FR-55 P4 — after a goodbye before a sleep, no dial until the wake:
+        // one inside the window the OS gave the device to go to sleep would
+        // say hello again and erase the notice. Returns at once while awake.
+        tokio::select! {
+            _ = crate::sleep_notice::hold_while_asleep() => {},
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { return Ok(()); }
+            },
         }
 
         // #2221 — how long this attempt runs decides whether its drop
@@ -1590,6 +1665,8 @@ async fn connect_once(
     }
 
     // Say hello.
+    // #3280 — read before the answer: one adopted in between is news next beat.
+    let mut last_announced_caps_generation = crate::encode::caps::generation();
     let mut hello_caps = stub_caps(cfg.overlay_multi_org, ctx.is_primary);
     // FR-90 P2c-3 — copies are held for the primary organization only: a
     // secondary org's connection never offers them, so its placement never
@@ -1705,6 +1782,11 @@ async fn connect_once(
     // immediately after upgrade.
     watchdog::tick(ctx.pump);
     info!("rc:agent.hello sent");
+    // FR-55 P4 — this connection says goodbye when the computer is going to
+    // sleep. After the hello, because the server keys the notice by the
+    // hello's connection; one that comes up inside an announced sleep is told
+    // at once (`sleep_notice::register_control`).
+    let (_sleep_goodbye, mut goodbye_rx) = crate::sleep_notice::register_control();
     // A5 — if this connect ended a ≥1 h outage, the fleet may have shipped a
     // fix (or a forced update push) we never saw; check now, not in ≤4 h.
     ctx.note_ws_up_and_maybe_recheck_update();
@@ -1856,7 +1938,7 @@ async fn connect_once(
     // at `rc:sdp.offer` time to drive the track + encoder). Entries are
     // removed when the peer is built; orphaned entries (session
     // cancelled before SDP) get cleaned when the session is terminated.
-    let mut pending_codecs: HashMap<bson::oid::ObjectId, String> = HashMap::new();
+    let mut pending_codecs: HashMap<bson::oid::ObjectId, PendingCodec> = HashMap::new();
     // Y.3: same lifecycle as `pending_codecs` but for the negotiated
     // video transport. Inserted when `rc:session.request` arrives,
     // consumed when `rc:sdp.offer` builds the AgentPeer + media pump.
@@ -2006,6 +2088,32 @@ async fn connect_once(
                     let _ = send_frame(&mut ws, Message::Close(None)).await;
                     return Ok(());
                 }
+            }
+            // FR-55 P4 — the computer is going to sleep, and its viewers have
+            // been told (P5h runs first). The goodbye goes out, the hook hears
+            // it went, and then this connection closes like one the server
+            // closed: every peer closed, never just dropped, or its UDP
+            // sockets outlive it. `run` holds the next dial until the wake.
+            Some(goodbye) = goodbye_rx.recv() => {
+                let _stage = watchdog::enter(ctx.pump, "sleep");
+                let crate::sleep_notice::Goodbye { power, sent } = goodbye;
+                info!(
+                    policy = %power.policy,
+                    on_ac = ?power.on_ac,
+                    held = power.held,
+                    "the computer is going to sleep: saying goodbye to the server (FR-55 P4)"
+                );
+                match send_msg(&mut ws, &ClientMsg::AgentSleeping { power }).await {
+                    Ok(()) => {
+                        let _ = sent.send(());
+                    }
+                    Err(e) => warn!(%e, "the sleep goodbye did not go out (FR-55 P4)"),
+                }
+                close_all_peers(&mut peers, &indicator).await;
+                close_all_tunnel_peers(&mut tunnel_peers).await;
+                park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
+                let _ = send_frame(&mut ws, Message::Close(None)).await;
+                return Ok(());
             }
             _ = keepalive.tick() => {
                 let _stage = watchdog::enter(ctx.pump, "keepalive");
@@ -2307,6 +2415,9 @@ async fn connect_once(
                 // FR-101 P2b — the owner's floor is live too: a new `off` must
                 // reach the hub's strip (and its reason) within a beat.
                 let session_policy_now = crate::session_policy::caps_policy();
+                // #3280 — a later try's answer replaced the probe's: its cells
+                // reach this row within a beat. Read before `stub_caps` below.
+                let caps_generation_now = crate::encode::caps::generation();
                 let caps = if caps_now == last_announced_permissions
                     && record_now == last_announced_record
                     && apps_now == last_announced_apps
@@ -2318,6 +2429,7 @@ async fn connect_once(
                     && ssh_system_now == last_announced_ssh_system
                     && privacy_now == last_announced_privacy
                     && session_policy_now == last_announced_session_policy
+                    && caps_generation_now == last_announced_caps_generation
                 {
                     None
                 } else {
@@ -2332,6 +2444,7 @@ async fn connect_once(
                     last_announced_ssh_system = ssh_system_now;
                     last_announced_privacy = privacy_now;
                     last_announced_session_policy = session_policy_now;
+                    last_announced_caps_generation = caps_generation_now;
                     // Our own caps AS THE HELLO BUILT THEM — the server replaces
                     // its stored blob with this, so anything the hello carried
                     // (`multi_org` `tun`, `record`) must be here too — with the
@@ -2361,6 +2474,7 @@ async fn connect_once(
                         apps = ?c.apps,
                         audio = ?c.audio,
                         desktop = ?c.desktop,
+                        video_cells = c.video_cells.len(),
                         "announcing changed capabilities on the heartbeat (FR-43 P2c)"
                     );
                     Some(Box::new(c))
@@ -2379,6 +2493,8 @@ async fn connect_once(
                     caps,
                     // FR-92 P5b — where keep busy runs, for the device list.
                     keep_busy: crate::keep_busy::brief(),
+                    // FR-55 P4 — the power keeper's posture, for the same.
+                    power: crate::power::brief(),
                 };
                 watchdog::stage(ctx.pump, "heartbeat.send");
                 if let Err(e) = send_msg(&mut ws, &hb).await {
@@ -2495,6 +2611,10 @@ async fn connect_once(
             }
             Some((sid, end)) = device_end(kill_rx, idle_rx) => {
                 let _stage = watchdog::enter(ctx.pump, "device_end");
+                // #3245 — a pump with no encoder asks through the kill channel too,
+                // and its end says something else.
+                let no_video = peers.get(&sid).is_some_and(AgentPeer::no_video);
+                let end = if no_video { DeviceEnd::NoVideo } else { end };
                 // FR-101 P4b-2 — a hand-back from an idle watcher races the
                 // session's own end; one this connection no longer holds has
                 // nothing left to end (a disconnect closed every peer).
@@ -2524,6 +2644,7 @@ async fn connect_once(
                     DeviceEnd::Idle => {
                         info!(session_id = %sid, "idle limit reached — ending the session")
                     }
+                    DeviceEnd::NoVideo => {}
                 }
                 // FR-85 P3b-3 — the person at the device sent the controller
                 // away: a recording of this session STOPS now, rather than
@@ -2536,6 +2657,15 @@ async fn connect_once(
                 // clipboard, files or frames from here on, while the bare
                 // connection waits for the viewer to hear why.
                 let peer = peers.remove(&sid);
+                // A delegated session (a supervised Mac) speaks through the
+                // daemon's WS, the way its answer and its ICE did. A worker's
+                // own session speaks on its own: from the daemon the hub
+                // answers `not a party`, ends nothing and tells no viewer.
+                // Everywhere else there is no delegation channel at all.
+                let delegated = crate::delegate::delegation_for_session(
+                    delegated_out.as_ref(),
+                    peer.as_ref().map(AgentPeer::outbound),
+                );
                 if let Some(peer) = &peer {
                     peer.stop_serving();
                     // FR-101 P3 — the audit's last sample, while the server
@@ -2546,29 +2676,15 @@ async fn connect_once(
                     // must land BEFORE the terminate directly below it, and
                     // the server drops a sample once `ended_at` is set — on
                     // the peer's queue, the direct terminate write would
-                    // overtake it. Pre-existing follow-up, out of P9d's
-                    // scope: `delegated_out` is connection-wide, so on a
-                    // supervised Mac a worker's OWN session (its own row)
-                    // goes up the delegation channel here too, under the
-                    // daemon's identity, and the server drops it as another
-                    // device's. A fix needs the terminate on the same queue
-                    // as the sample, or a per-session delegation marker.
+                    // overtake it.
                     if let Some(stats) = final_session_stats(sid, peer).await
-                        && let Err(e) =
-                            reply_for_session(&mut ws, delegated_out.as_ref(), &stats).await
+                        && let Err(e) = reply_for_session(&mut ws, delegated, &stats).await
                     {
                         debug!(session_id = %sid, %e, "final session stats send failed");
                     }
                 }
-                // A delegated session (a supervised Mac) speaks through the
-                // daemon's WS, the way its answer and its ICE did.
-                let grace = match reply_for_session(
-                    &mut ws,
-                    delegated_out.as_ref(),
-                    &end.terminate(sid),
-                )
-                .await
-                {
+                let said = end.terminate(sid);
+                let grace = match reply_for_session(&mut ws, delegated, &said).await {
                     Ok(()) => host_disconnect_grace(),
                     Err(e) => {
                         warn!(
@@ -2579,7 +2695,7 @@ async fn connect_once(
                     }
                 };
                 // The FR-27 field logs key on the host-disconnect line as it
-                // reads; the idle end says its own.
+                // reads; the others name their reason.
                 let grace_ms = grace.as_millis() as u64;
                 match end {
                     DeviceEnd::HostDisconnect => info!(
@@ -2588,11 +2704,11 @@ async fn connect_once(
                         grace_ms,
                         "host disconnect: told the server; the peer closes after the grace"
                     ),
-                    DeviceEnd::Idle => info!(
+                    DeviceEnd::Idle | DeviceEnd::NoVideo => info!(
                         session_id = %sid,
                         reason = end.label(),
                         grace_ms,
-                        "idle limit: told the server; the peer closes after the grace"
+                        "device end: told the server; the peer closes after the grace"
                     ),
                 }
                 if let Some(peer) = peer {
@@ -2728,7 +2844,13 @@ async fn connect_once(
                     crate::delegate::WorkerInbound::Params(p) => {
                         match bson::oid::ObjectId::parse_str(&p.session_id) {
                             Ok(sid) => {
-                                pending_codecs.insert(sid, p.codec);
+                                pending_codecs.insert(
+                                    sid,
+                                    PendingCodec {
+                                        chosen: p.codec,
+                                        browser_caps: None,
+                                    },
+                                );
                                 pending_transports.insert(sid, p.transport);
                                 pending_chroma.insert(sid, p.chroma);
                                 pending_chunk_framing.insert(sid, p.chunk_framing);
@@ -3163,7 +3285,7 @@ async fn handle_server_msg(
     >,
     msg: ServerMsg,
     peers: &mut HashMap<bson::oid::ObjectId, AgentPeer>,
-    pending_codecs: &mut HashMap<bson::oid::ObjectId, String>,
+    pending_codecs: &mut HashMap<bson::oid::ObjectId, PendingCodec>,
     pending_transports: &mut HashMap<bson::oid::ObjectId, Option<String>>,
     pending_chroma: &mut HashMap<bson::oid::ObjectId, Option<String>>,
     pending_chunk_framing: &mut HashMap<bson::oid::ObjectId, bool>,
@@ -3308,6 +3430,15 @@ async fn handle_server_msg(
         remote_cfg.peer_auth_offers().forget(*session_id);
     }
 
+    // #3280 — a session asked, before anything that could wait on a person: a
+    // later caps try gets out of its way. Ahead of the delegation, because the
+    // GPU is shared whichever process serves the session. And again at its offer,
+    // because a consent wait can outlast the minute a try holds off for
+    // (`prompt_then_email` waits minutes), and a peer is about to open an encoder.
+    if matches!(msg, ServerMsg::Request { .. } | ServerMsg::SdpOffer { .. }) {
+        crate::encode::caps::session_asked();
+    }
+
     // FR-43 P2b — hand a remote-desktop session to the GUI worker, if there is
     // one. This sits ahead of the whole dispatch rather than inside each of
     // the five handlers: one place to read, one place to audit, and no way for
@@ -3354,6 +3485,8 @@ async fn handle_server_msg(
             input_mode,
             tenant_name,
             rc_overlay,
+            // FR-128 — the device's policy is `auto`; decided per session.
+            rc_overlay_auto,
             // FR-101 P2b — the org's policy; applied below with the device's
             // own floor, once the consent mode is resolved.
             session_policy,
@@ -3366,8 +3499,11 @@ async fn handle_server_msg(
         } => {
             // #1882 — the device's overlay decision, resolved HERE, by the
             // daemon: it is the process whose overlay knows the blocks, and a
-            // delegated session's worker gets this same value.
-            let rc_overlay = crate::rc_overlay::RcOverlay::resolve(rc_overlay);
+            // delegated session's worker gets this same value. FR-128: an
+            // `auto` policy rides along with its hints, and the session decides
+            // at its offer, in whichever process builds the peer.
+            let rc_overlay =
+                crate::rc_overlay::RcOverlay::resolve_mode(rc_overlay, rc_overlay_auto.as_ref());
             // FR-52 P4 — a controller from OUTSIDE the organization. Admitted
             // by THIS device or not at all: bound to a login it verified, under
             // its own ceiling and its own consent mode, never the server's. A
@@ -3436,14 +3572,7 @@ async fn handle_server_msg(
                     &ctx.label,
                 )
             };
-            // Pick the best codec for this session from the
-            // intersection of (browser-advertised, agent-supported).
-            // Stashed per session_id so the rc:sdp.offer handler can
-            // read it back when building the peer: that's where the
-            // track codec + encoder backend are actually bound.
             let our_caps = crate::encode::caps::detect();
-            let chosen = crate::encode::caps::pick_best_codec(&browser_caps, &our_caps.codecs);
-            pending_codecs.insert(session_id, chosen.clone());
 
             // Phase Y.3: figure out which video transport this
             // session will use. Honour `preferred_transport` only if
@@ -3458,6 +3587,24 @@ async fn handle_server_msg(
                     None
                 }
             });
+            // Pick the codec for this session. #3245 — after the transport,
+            // because the transport decides what can open it: the RTP track's
+            // opener knows fewer encoders than `our_caps.codecs` advertises.
+            // Stashed per session_id so the rc:sdp.offer handler can read it
+            // back when building the peer: that's where the track codec +
+            // encoder backend are actually bound.
+            let chosen = crate::peer::session_codec(
+                &browser_caps,
+                &our_caps,
+                negotiated_transport.as_deref(),
+            );
+            pending_codecs.insert(
+                session_id,
+                PendingCodec {
+                    chosen: chosen.clone(),
+                    browser_caps: Some(browser_caps.clone()),
+                },
+            );
             // Stash for the upcoming SdpOffer handler — that's where
             // AgentPeer::new is called and the media pump is built.
             // Without this stash the negotiation result was logged but
@@ -3998,24 +4145,23 @@ async fn handle_server_msg(
                 // old one's drop forgets its counters: carry the transfer
                 // readings across, so the cumulative tallies never go back.
                 let carried = crate::session_telemetry::counters(session_id).take_transfers();
+                // FR-132 P1 — and the decode-error count, for the same reason.
+                let carried_decode_errors =
+                    crate::session_telemetry::counters(session_id).decode_errors();
                 close_within_budget(old.close(), session_id, "replaced_by_offer").await;
                 drop(old);
                 crate::session_telemetry::counters(session_id).carry_transfers(carried);
+                crate::session_telemetry::counters(session_id)
+                    .carry_decode_errors(carried_decode_errors);
             }
 
-            // Read back the codec picked by `rc:session.request`. If
-            // the session skipped request (some test harnesses do) or
-            // the message order is broken, default to "h264" so the
-            // peer still works — that's the universal fallback the
-            // browser understands.
-            let chosen_codec = pending_codecs
-                .remove(&session_id)
-                .unwrap_or_else(|| "h264".to_string());
-            // Y.3: pull the transport stashed in the request handler.
-            // `None` (legacy WebRTC track) is the silent default for
-            // older controllers / sessions that arrived without
-            // preferred_transport.
-            let negotiated_transport = pending_transports.remove(&session_id).unwrap_or(None);
+            // Read back what `rc:session.request` picked. Y.3: the transport too.
+            let (chosen_codec, negotiated_transport) = picks_for_the_offer(
+                pending_codecs,
+                pending_transports,
+                session_id,
+                crate::encode::caps::detect,
+            );
             // #2231 — the RTP video track's codec, read from this offer: on a
             // DataChannel transport it moves to VP8 when the browser cannot
             // take the pump's codec, so the answer does not fail on a track
@@ -4066,6 +4212,11 @@ async fn handle_server_msg(
                     None,
                 )
             });
+            // FR-128 — an `auto` session decides HERE, at its offer, in the
+            // process that builds the peer (a delegated GUI worker runs this
+            // handler too): one LocalAPI lookup, bounded at 400 ms. The peer
+            // then sees a plain on/off, filtered exactly as ever.
+            let rc_overlay = rc_overlay.decide(session_id).await;
             // FR-27 follow-up — capture what the "Being viewed by" banner needs
             // BEFORE `controller_name` is moved into `AgentPeer::new` below.
             // The banner is raised once the peer is established (after
@@ -6699,6 +6850,14 @@ async fn handle_server_msg(
                 crate::hive::knowhow_tools::on_verified(&probe_id.to_hex(), probe);
             }
         }
+        // P4-6-1b — what reaching an entity takes, for a session's
+        // `roomler_connect`.
+        #[cfg(hive_host)]
+        ServerMsg::KnowhowAccess { req_id, access } => {
+            if ctx.is_primary {
+                crate::hive::knowhow_tools::on_access(&req_id, access);
+            }
+        }
         #[cfg(hive_host)]
         ServerMsg::KnowhowRefused { req_id, reason } => {
             if ctx.is_primary {
@@ -7023,6 +7182,9 @@ fn session_stats_msg(
         // server never sees the key and a sample before `Connected` carries
         // nothing to misread.
         carrier: t.carrier.map(|c| c.as_str().to_string()),
+        // FR-132 P1 — absent until the viewer said it counts decode errors,
+        // so a zero on the wire is always a measured one.
+        decode_errors: t.decode_errors,
     }
 }
 
@@ -7376,6 +7538,95 @@ pub(crate) fn prompt_org(
 mod tests {
     use super::*;
 
+    /// #3280 — a later caps try reads the registry the session pump writes.
+    #[test]
+    fn a_session_on_this_device_is_live_for_a_caps_try() {
+        let sessions = crate::rc_sessions::RcSessionRegistry::new();
+        let live = live_on_this_host(sessions.clone());
+        assert!(!live());
+        let (kill, _rx) = tokio::sync::mpsc::channel(1);
+        let session = bson::oid::ObjectId::new();
+        sessions.insert(
+            session,
+            "a viewer".to_string(),
+            "VIEW".to_string(),
+            String::new(),
+            kill,
+        );
+        assert!(live());
+        sessions.remove(&session);
+        assert!(!live());
+    }
+
+    fn caps_offering(
+        codecs: &[&str],
+        transports: &[&str],
+    ) -> roomler_ai_remote_control::models::AgentCaps {
+        roomler_ai_remote_control::models::AgentCaps {
+            codecs: codecs.iter().map(|c| c.to_string()).collect(),
+            transports: transports.iter().map(|t| t.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// #3280 — a later try took Media Foundation while a person decided, and the offer
+    /// comes minutes after the pick. A track bound to `av1` would carry no video and a
+    /// pump for a transport with no cell left would end, so each is picked again. A
+    /// pick that still stands is not asked about.
+    #[test]
+    fn an_offer_reads_its_picks_again_against_the_answer_in_force() {
+        let session = bson::oid::ObjectId::new();
+        let browser = vec!["av1".to_string(), "h265".to_string(), "h264".to_string()];
+        let picked = |codec: &str, browser: Option<Vec<String>>| {
+            HashMap::from([(
+                session,
+                PendingCodec {
+                    chosen: codec.to_string(),
+                    browser_caps: browser,
+                },
+            )])
+        };
+        let hevc_dc = || HashMap::from([(session, Some("data-channel-hevc".to_string()))]);
+        let (mut codecs, mut transports) = (picked("av1", Some(browser.clone())), hevc_dc());
+        assert_eq!(
+            picks_for_the_offer(&mut codecs, &mut transports, session, || {
+                caps_offering(&["h265", "h264"], &[])
+            }),
+            ("h264".to_string(), None),
+            "gone from the answer in force, so picked again, by the RTP track's rule"
+        );
+        assert!(
+            codecs.is_empty() && transports.is_empty(),
+            "the stash is taken"
+        );
+
+        let (mut codecs, mut transports) = (picked("h265", Some(browser.clone())), hevc_dc());
+        assert_eq!(
+            picks_for_the_offer(&mut codecs, &mut transports, session, || {
+                caps_offering(&["av1", "h265", "h264"], &["data-channel-hevc"])
+            }),
+            ("h265".to_string(), Some("data-channel-hevc".to_string())),
+            "still offered, so it stands, even with a better one there now"
+        );
+
+        // A GUI worker's picks are the daemon's, from an answer it does not hold.
+        let (mut codecs, mut transports) = (picked("av1", None), hevc_dc());
+        assert_eq!(
+            picks_for_the_offer(&mut codecs, &mut transports, session, || {
+                panic!("a worker does not ask its own answer")
+            }),
+            ("av1".to_string(), Some("data-channel-hevc".to_string())),
+        );
+
+        // A session that skipped its request.
+        assert_eq!(
+            picks_for_the_offer(&mut HashMap::new(), &mut HashMap::new(), session, || {
+                panic!("nothing to read again")
+            }),
+            ("h264".to_string(), None),
+        );
+    }
+
     /// #2551 — a `ws.text` stage is refined to the message's wire tag, read
     /// straight from the JSON. Anything without a plain `t` gives `None`, and
     /// the arm then names `?` rather than failing.
@@ -7445,6 +7696,7 @@ mod tests {
             shared_seconds: 0,
             mixed_dial_seconds: 0,
             carrier: Some(crate::session_carrier::SessionCarrier::OverlayTurn),
+            decode_errors: Some(2),
         };
         match session_stats_msg(sid, &t, Default::default()) {
             ClientMsg::SessionStats {
@@ -7455,8 +7707,11 @@ mod tests {
                 keyframe_requests,
                 input_events,
                 carrier,
+                decode_errors,
                 ..
             } => {
+                // FR-132 P1 — the viewer's decode errors ride it too.
+                assert_eq!(decode_errors, Some(2));
                 assert_eq!(session_id, sid.to_hex());
                 assert_eq!(bytes_sent, 1_234);
                 assert_eq!(bytes_recv, 5_678);
@@ -7691,6 +7946,7 @@ mod tests {
         assert!(!json.contains("limit"), "{json}");
         assert_eq!(DeviceEnd::Idle.label(), "idle_timeout");
         assert_eq!(DeviceEnd::HostDisconnect.label(), "host_disconnect");
+        assert_eq!(DeviceEnd::NoVideo.label(), "no_video");
     }
 
     /// FR-101 P4b-2 — either channel ends a session, each under its own

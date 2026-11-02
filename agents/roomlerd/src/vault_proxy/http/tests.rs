@@ -41,7 +41,32 @@ fn upstream(host: &str, port: u16, ca: &str, credential: Credential) -> Upstream
         tls: tls::connector(Some(ca)).unwrap(),
         front: FRONT.to_string(),
         flavor: Flavor::Plain,
+        dial: crate::vault_proxy::Dial::Direct,
     }
+}
+
+/// FR-90 P4-6-1b-2 — through another device the TCP goes to the flow's
+/// end, and the request is still the upstream's: TLS verified against its
+/// host, `Host` its own authority, never the end's.
+#[tokio::test]
+async fn through_a_flow_the_request_is_still_the_upstreams() {
+    let (ca, port, mut rx) = fake_http().await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let through = Upstream {
+        dial: crate::vault_proxy::Dial::Through(([127, 0, 0, 1], port).into()),
+        ..upstream("localhost", closed, &ca, bearer(&made()))
+    };
+    let mut c = client(through).await;
+    let (status, _, body) = ask(&mut c, get("/repos/x/y")).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "ok"));
+    assert_eq!(
+        saw(&mut rx).await.values("host"),
+        [format!("localhost:{closed}")]
+    );
 }
 
 /// P3-5e-1 — the same, standing for a Kubernetes API server.

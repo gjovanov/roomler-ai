@@ -2,6 +2,10 @@
 // Copyright (C) 2026 G ROX EOOD
 pub mod fixtures;
 
+/// #3199 — the way back from an expired activation link: one answer for every
+/// address, both rate limits, and who can ever be mailed.
+#[cfg(test)]
+mod activation_resend_tests;
 #[cfg(test)]
 mod auth_tests;
 #[cfg(test)]
@@ -12,6 +16,10 @@ mod channel_tests;
 mod conference_message_tests;
 #[cfg(test)]
 mod conference_tests;
+/// FR-127 P1 — receive what is visible: `caps: ["view"]`, `media:view`, the
+/// viewer's pause against the owner's (AC2), the kill switch, the other pod.
+#[cfg(test)]
+mod conference_view_tests;
 #[cfg(test)]
 mod export_tests;
 #[cfg(test)]
@@ -161,6 +169,12 @@ mod invite_tests;
 mod keep_busy_tests;
 #[cfg(test)]
 mod key_rotation_tests;
+/// FR-90 P4-6-1a — a session's connect: offered to a device with a vault
+/// client, answered with the access the entity's facts say and the paths the
+/// devices' findings measured, this device's first; a proposal places no
+/// credential; the refusals in a word.
+#[cfg(test)]
+mod knowhow_connect_tests;
 /// FR-90 P4-5-1b — a device's probe end to end: the real agent loop probes
 /// within the list its config file holds, what it measured on the map; an
 /// emptied list answers `not_allowed`. Linux, as the device's scan test is:
@@ -252,6 +266,14 @@ mod overlay_route_offer_tests;
 mod overlay_tests;
 #[cfg(test)]
 mod pagination_tests;
+/// FR-129 A1 — device pairing, the server half: the daemon and tunnel
+/// flows end to end, two halves, two pods, the codes (a user code or a
+/// forged device code retrieves nothing; the device code in no response
+/// but start's), slow-down, expiry, denial, the gate re-checked at delivery,
+/// the device cap and an archived org refusing a paired token like a pasted
+/// one, the address and account ceilings, the kill switch, the audit trail.
+#[cfg(test)]
+mod pairing_tests;
 #[cfg(test)]
 mod pdf_export_tests;
 /// FR-100 P1a — a device's identity key as the fleet stores and shows it, and
@@ -300,11 +322,32 @@ mod room_visibility_tests;
 /// overwritten by a later sample with none.
 #[cfg(test)]
 mod session_carrier_tests;
+/// FR-132 P1 (§3b) — the viewer's decode errors: a real viewer peer reports
+/// one on the control channel, the real agent counts it and sends a sample at
+/// once, and the server stores `remote_sessions.stats.decode_errors`; a
+/// counted zero is stored as zero, and a sample that did not count never
+/// overwrites a stored count.
+#[cfg(test)]
+mod session_decode_errors_tests;
 /// FR-102 P9b — the post-session rating's server half: a party stores one
 /// rating with codes only, everyone else is refused with a code, the kill
 /// switch's empty 404, `purge_user`, and the digest's `quality.ratings`.
 #[cfg(test)]
 mod session_feedback_tests;
+/// FR-135 R2 — `rc:media-plan` and `rc:viewer-hz` through a real agent and a real
+/// viewer peer: the verb, the plan on the control channel, and the viewer's
+/// refresh reaching the agent.
+#[cfg(test)]
+mod session_media_plan_tests;
+/// FR-129 B1-s — `GET /api/setup/features`: the Phase B kill switch (one per
+/// OS since B1-s2, the legacy `wizard_unix_daemon` for both; default off) and
+/// `pairing`, each following its setting, read by a guest and a member alike.
+#[cfg(test)]
+mod setup_features_tests;
+/// FR-55 P4 — a device that says it is going to sleep reads "asleep" until its
+/// next hello, and only the connection that said hello can say so.
+#[cfg(test)]
+mod sleep_announce_tests;
 #[cfg(test)]
 mod ssh_grant_ack_tests;
 #[cfg(test)]

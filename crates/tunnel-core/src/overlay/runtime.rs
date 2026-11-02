@@ -2798,6 +2798,9 @@ impl OverlayRuntime {
         // packet); either way the loop breaks and the agent's WS lifecycle
         // rebuilds the whole runtime.
         let sender = wg.sender();
+        // #2952 — the device lives for this whole run (never rebuilt), so one
+        // handle to its probe-latch wake serves the loop below.
+        let probe_wake = wg.probe_latch_wake();
         let mut outbound_pump = tokio::spawn(async move {
             let mut rx = tun_pkt_rx;
             while let Some(pkt) = rx.recv().await {
@@ -3216,7 +3219,7 @@ impl OverlayRuntime {
                     let t0 = Instant::now();
                     self.sweep_upgrade_probes(
                         &mut wg, &mut by_node, &mut relay, &tun,
-                        &mut upgrade_probes, &mut relay_bq,
+                        &mut upgrade_probes, &mut relay_bq, SweepCause::Tick,
                     ).await;
                     warn_if_slow("sweep_upgrade_probes", t0);
                     // D8 — periodic direct re-upgrade (~every 6th tick ≈ 30 s).
@@ -3263,6 +3266,44 @@ impl OverlayRuntime {
                         &wg,
                     );
                     warn_if_slow("arm:fallback_sweep", t_arm);
+                },
+                // #2952 — a probe's handshake latched (its receive path woke
+                // us): promote it now rather than on the next fallback tick.
+                // Promoting drops the old carrier, so while the two ends of a
+                // pair promote at different moments one direction has none;
+                // on the tick that gap was the distance between the two
+                // ends' 5 s sweeps (2.6 s measured on 0.4.175), at the latch
+                // it is about one round trip. The tick still sweeps
+                // (deadlines, and the floor for a wake never delivered), so
+                // this only ever shortens THIS end's wait. Not every pair's
+                // gap: while the peer is an agent that still promotes on its
+                // tick (≤ 0.4.177), the gap is that end's whole tick phase
+                // (mean ~2.5 s, max 5 s, the same max as before) instead of
+                // the distance between two phases (mean ~1.7 s), until it
+                // updates. The same post-promote steps as the tick, in its
+                // order: exit routing re-reconciled before the refreshed view.
+                _ = probe_wake.notified() => {
+                    let t_arm = Instant::now();
+                    let in_flight = upgrade_probes.len();
+                    self.sweep_upgrade_probes(
+                        &mut wg, &mut by_node, &mut relay, &tun,
+                        &mut upgrade_probes, &mut relay_bq, SweepCause::Latch,
+                    ).await;
+                    // A wake whose probe the tick already settled sweeps
+                    // nothing; only a probe settled HERE changed a carrier.
+                    if upgrade_probes.len() != in_flight {
+                        self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state)
+                            .await;
+                        self.publish_view(
+                            &self_ip,
+                            &by_node,
+                            &current_peers,
+                            &upgrade_probes,
+                            exit_node_status(self.exit_node.as_deref(), &exit_state),
+                            &wg,
+                        );
+                    }
+                    warn_if_slow("arm:probe_latched", t_arm);
                 },
                 // rc.146 — re-assert every installed peer's /32 on the overlay
                 // NIC (evict any competing route a full-tunnel VPN re-added, then
@@ -6089,6 +6130,7 @@ mod tests {
             &tun,
             &mut upgrade_probes,
             &mut test_relay_bq(),
+            SweepCause::Tick,
         )
         .await;
 
@@ -6173,6 +6215,7 @@ mod tests {
             &tun,
             &mut upgrade_probes,
             &mut test_relay_bq(),
+            SweepCause::Tick,
         )
         .await;
 
@@ -6209,6 +6252,7 @@ mod tests {
             &tun,
             &mut upgrade_probes,
             &mut test_relay_bq(),
+            SweepCause::Tick,
         )
         .await;
 

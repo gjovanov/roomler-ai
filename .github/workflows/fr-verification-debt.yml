@@ -45,7 +45,7 @@ name: FR verification debt
 
 on:
   schedule:
-    - cron: '0 7 * * *'     # 07:00 UTC daily — an hour after daily-health-check
+    - cron: '0 7 * * *'     # 07:00 UTC daily
   pull_request:
     branches: [master]
     paths:

@@ -51,9 +51,16 @@
   (XML comment rule: no consecutive dashes, hence the awkward phrasing.)
 -->
 <Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+    <!-- FR-133 P1: Name is what Apps & Features lists, and it is a DISPLAY name
+         only. Windows Installer matches an upgrade by the UpgradeCode (the
+         MajorUpgrade below), and roomlerd's install_detect keys on that too, so
+         the rename leaves upgrades alone: a machine installed before P1 keeps its
+         old entry until the next upgrade replaces it, and scripts/install.ps1
+         finds either name. The UpgradeCode, the Component and Feature Ids and
+         the FileKeys are installer IDENTITY and never change. -->
     <Product
         Id='*'
-        Name='Roomler Agent'
+        Name='Roomler'
         UpgradeCode='1F2D7B1C-8B2F-4D2E-B1A3-6B1E2C7E4D91'
         Manufacturer='G ROX LTD'
         Language='1033'
@@ -85,7 +92,7 @@
         -->
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' />
-        <Property Id='DiskPrompt' Value='Roomler Agent Installation' />
+        <Property Id='DiskPrompt' Value='Roomler Installation' />
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <!-- Per-user install under %LOCALAPPDATA%\Programs\Roomler
@@ -287,9 +294,14 @@
             <Directory Id='ProgramMenuFolder'>
                 <Directory Id='ProgramMenuSubfolder' Name='Roomler'>
                     <Component Id='ApplicationShortcut' Guid='6D3F4A02-8B5E-4D4C-B03F-9C4D5E6F7081'>
+                        <!-- FR-133 P1: the Start-menu entry's NAME follows the
+                             product's; its Id and the component's Guid are identity
+                             and stay. MajorUpgrade runs afterInstallInitialize, so
+                             the old product (and its old .lnk) is removed before
+                             this one installs. -->
                         <Shortcut
                             Id='AgentShortcut'
-                            Name='Roomler Agent'
+                            Name='Roomler'
                             Description='Roomler Daemon — private mesh network + secure remote control'
                             Target='[APPLICATIONFOLDER]roomlerd.exe'
                             Arguments='run'
@@ -309,7 +321,7 @@
 
         <Feature
             Id='Complete'
-            Title='Roomler Agent'
+            Title='Roomler'
             Description='Roomler Daemon — keeps this device on your private Roomler mesh network and available for secure remote control.'
             Display='expand'
             Level='1'

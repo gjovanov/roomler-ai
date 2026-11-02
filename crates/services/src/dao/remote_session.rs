@@ -142,6 +142,12 @@ impl RemoteSessionDao {
         if let Some(c) = carrier {
             set.insert("carrier", c);
         }
+        // FR-132 P1 — the viewer's decode errors, only from a sample that
+        // counted them: absent means "not counted", so it must never write a
+        // zero over a count an earlier sample of this session recorded.
+        if let Some(n) = stats.decode_errors {
+            set.insert("stats.decode_errors", i64::from(n));
+        }
         self.base
             .update_one(
                 doc! { "_id": session_id, "agent_id": agent_id, "ended_at": bson::Bson::Null },

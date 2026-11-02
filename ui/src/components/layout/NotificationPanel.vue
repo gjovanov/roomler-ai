@@ -114,6 +114,8 @@ function iconFor(type: string): string {
     case 'call': return 'mdi-phone'
     // FR-90 — an agent session waits for a driver.
     case 'approval_request': return 'mdi-shield-key'
+    // FR-52 P5 — someone from outside reached a device.
+    case 'external_access': return 'mdi-account-arrow-right-outline'
     default: return 'mdi-bell'
   }
 }

@@ -1,8 +1,15 @@
 # FR-6: CI + release build-speed SLO — every lane ≤10 min warm, self-healing
 
-**Status:** shipped + field-verified through 2026-08-26 (retroactive FR per the CLAUDE.md
-standing rule — the program ran 2026-07-13 → 2026-08-26 across ~20 PRs). Tracking issue:
-`FR-6` (#773) in gjovanov/roomler-ai/issues.
+**Status:** **closed 2026-10-30**, with every acceptance criterion field-verified and ticked and
+documented in [`docs/build-caches.md`](../build-caches.md). It first closed that morning and
+reopened in the afternoon for wave 33: from #3125 on, `ci.yml`'s Windows clippy lane built cold on
+every run, because its cache was over its cap. The Actions cache had also started refusing
+downloads (Open decisions). Wave 34 moved the Linux lanes off it, wave 35 skips the heavy lanes on
+docs-only PRs, and wave 36 lets a cold unit or lint run finish its publish. Waves 33–37 are
+field-verified in the log, and wave 38 stops the macOS overlay cache growing with each version.
+What is left is runner queueing. First shipped and field-verified 2026-08-26
+(retroactive FR per the CLAUDE.md standing rule — the program ran 2026-07-13 → 2026-08-26 across
+~20 PRs). Tracking issue: `FR-6` (#773) in gjovanov/roomler-ai/issues.
 
 ## Goal
 
@@ -49,9 +56,9 @@ itself on the affected run's page. Baseline when the program started: releases t
   TAG build; failed rehearsals file a GitHub issue (`seed-failure-alert` job); saves run
   under `if: always()` so a downstream failure still seeds.
 - **Growth control**: accretion GC before the build (registry mtime sweep + all-or-nothing
-  `target` drop over `SEED_TARGET_MAX_MB`, never file-level deletes under `target` —
-  cargo fingerprints outlive outputs); `cache-janitor.yml` sweeps PR-ref/idle/tag-ref
-  strays every 6 h.
+  `target` drop over `SEED_TARGET_MAX_MB`, 3,000 MB by default and 4,500 MB on the four daemon
+  jobs since wave 32; never file-level deletes under `target` — cargo fingerprints outlive
+  outputs); `cache-janitor.yml` sweeps PR-ref/idle/tag-ref strays every 6 h.
 - **A tag run reuses its rehearsal's compile** (wave 29). After a job's last cargo build,
   `.github/actions/seed-tree-stamp` writes `tree=<HEAD^{tree}> job=<workflow>/<job>` into
   `target/.seed-source-tree`. When the next run of that job restores the seed,
@@ -62,7 +69,10 @@ itself on the affected run's page. Baseline when the program started: releases t
   report the release version from `--version`. Where it cannot run before packaging,
   it must at least contain the version string: the macOS binary links
   `@rpath/libavcodec…`, which only the `.app` resolves. Kill switch: repository
-  variable `SEED_REUSE_SAME_TREE=off`.
+  variable `SEED_REUSE_SAME_TREE=off`. ⚠️ Reuse is only as good as each build script's
+  declared inputs: a watched path that does not exist counts as changed (wave 30's
+  `capabilities`), and so does a path-crate build script with no `rerun-if` line at
+  all (wave 29's `scrap`). `cargo build -v` prints each unit's `Dirty` reason.
 - **PR CI** (`ci.yml`): Swatinem, keyed on the environment and the lockfile. A member
   crate's `Cargo.toml` edit or a third-party `Cargo.lock` change rotates a family's key,
   and the next run restores the previous generation as a prefix match. A version bump
@@ -120,6 +130,15 @@ itself on the affected run's page. Baseline when the program started: releases t
 | 27 | 10-24 | **PR CI's two long poles.** The integration suite runs as four shards, not three. FR-90 P1i's Windows agent-session tests move out of `windows-overlay-clippy` into a parallel `windows-agent-sessions` job with its own seed family | #2844 |
 | 28 | 10-24 | **The wizard lane: one run per release, and its apt packages from the seed store.** release-agent.yml's lockstep job skips its dispatch when a release-setup.yml run on the tag is already in flight or green. The wizard's Linux jobs install with new `apt-seed-install`/`apt-seed-save` actions: the .debs live on the `seed-cache` release (`apt-<family>-<ID><VERSION_ID>-<arch>`) instead of an LRU-evicted Actions-cache entry | #2847 |
 | 29 | 10-25 | **A tag run reuses its rehearsal's compile.** Six of six releases checked (0.4.163 to 0.4.171) tagged exactly the tree their rehearsal had just built, and recompiled every crate of ours anyway. A stamp in the seed now records the tree and job a successful build compiled; the next run of that job on that tree marks its checkout unchanged and cargo reuses the build. The macOS job drops its cached libvpx build only when brew's Cellar path moved, and the vendored `scrap` build script declares `rerun-if-changed` | #2914 |
+| 30 | 10-26 | **The companion jobs reuse too.** `tauri_build::build()` declares `cargo:rerun-if-changed=capabilities` whether or not the directory exists, and cargo treats a missing watched path as changed. `roomler-desktop` had no `capabilities/`, so every build re-ran its build script and recompiled it, including a reused tag run (114–149 s per companion job). An `agents/roomler-desktop/capabilities/README.md` makes the directory exist. The capability parser loads only `*.json`/`*.toml`, so the app's ACL is unchanged (still no capability). **And the release lane's two cached-apt steps are bounded.** One hung 23+ min on 0.4.175's tag run where it takes ~37 s. Each now has `timeout-minutes: 8` + `continue-on-error`, and falls through to the existing verify/apt-get fallback, which first repairs an interrupted dpkg | #2940 |
+| 31 | 10-28 | **A release's first build no longer makes its tag run recompile.** Tauri's `generate_context!` writes `out/tauri-codegen-assets/<hash>` into `roomler-desktop`'s OUT_DIR *while that crate compiles*, only when the file is missing, and lists it as an input. So the first build of a new version (a release's rehearsal) left an input newer than the build itself, and the tag run, plus the reseed after it, recompiled `roomler-desktop` once. That cost about 2.5 min on macOS every release, and on Windows whenever the write and the compile's start fell in different seconds (the seed's tar keeps whole seconds). Two things found it: `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the four companion build steps (#3024, diagnostic), and a probe that bumps only `roomler-desktop`'s version. On a same-tree reuse, `seed-tree-reuse` now marks the build's OUT_DIR files unchanged, as it already does the sources. Field-verified on 0.4.181: no companion recompiled on the tag run or the reseed after it, and the diagnostic came out again (#3037) | #3024, #3030, #3037 |
+| 32 | 10-28 | **The daemon lanes' seed cap rises to 4,500 MB.** The accretion GC drops a seed's `target` whole once it passes `SEED_TARGET_MAX_MB`, 3,000 MB by default. A daemon seed restarts at ~2.2–2.7 GB after a cold build and grows ~350–400 MB with each release. Only a new version adds artifacts: cargo names them by name, version, features and profile, never by source, so a rebuild of the same version overwrites in place. The default therefore dropped a seed again within one or two releases: the Windows seed on four post-release reseeds in a row (0.4.180–0.4.183), and 0.4.183's reseed the `.pkg` and `.deb` aarch64 seeds too (574–580 crates cold, a 31 min run). The four daemon jobs' restore steps now set the cap to 4,500 MB, release-setup's macOS job already running at 5,000. That lasts about four releases, and a compressed seed (535–790 MiB) stays far under the 2 GiB asset limit. The GC line also prints the cap in effect and the volume's free space, so a bigger target's disk headroom shows on every run. The operator chose this over pruning stale units, the riskier change: rc.422–424's seed died on a deleted output whose fingerprint survived. Field-verified on 0.4.185's post-release reseed: at the tag's tree it kept the MSI seed at 3,037 MB and the `.deb` x86_64 seed at 3,367 MB and reused the build, with 0 compiles in all 8 jobs. The same run on 0.4.184 had dropped the MSI seed at 3,082 MB and compiled 586 crates cold | #3068 |
+| 33 | 10-30 | **The Windows clippy lane's CI cache fits its cap again.** #3125 (for #3116) added the setup wizard's clippy and unit tests to `windows-overlay-clippy`, and the job's cold build then pruned to 4,440 MB, over `ci-seed-restore`'s default cap of 4,000 MB. Every restore dropped the cache whole (`restored target is 4440 MB (> 4000) — dropping it whole`), every run compiled or checked ~1,740 units cold, and each master run published the same 4,440 MB again. The GC's promise that "the next master run publishes a lean one" cannot hold once a lean one is over the cap. The lane took 7.4–8.3 min in the three runs before #3125 and 17.0–22.6 min in all 20 runs checked after it, the floor of each run's wall clock. The job now sets `max-target-mb: "6000"`, as the macOS overlay check and the integration shards already did. And a master run that publishes a cache its own restore would drop warns `CI cache over its cap` (the restore exports the cap it applied as `CI_SEED_MAX_TARGET_MB`) | #3153 |
+| 34 | 10-30 | **The Linux lanes' cargo caches move to `seed-cache`.** From 2026-10-30 the Actions cache refused downloads under load (`Failed to restore: Egress is over the account limit.`), and Swatinem then built the lane cold: `Rust unit tests` compiled 1,795 crates in 23–27 min against ~8 (Open decisions). The seven Linux families now restore and publish through `ci-seed-restore` and `ci-seed-save`, as the macOS, Windows, integration and installer families have since wave 22. They are `lint`, `unit`, `agent`, `ffmpeg-encoder`, `recording-ffmpeg`, `profiles` and `recorder-audio`, which both recorder lanes restore. Each publishing job gets `contents: write`, and `CARGO_INCREMENTAL=0` is set where rust-cache used to set it. A target archive over the 2 GiB asset cap goes up as numbered 1,900 MiB parts that the restore concatenates (the unit lane's is ~2.5 GB). A publish writes one form and then retires the other. A whole asset wins over parts, and parts from two publishes fail zstd's checksum, so a mixed set builds cold rather than wrong. A local harness with real tar and zstd passed 8 of 8 restore cases and, against a fake `gh`, 6 of 6 publish cases. First caps are about 1.5× each lane's old Actions-cache archive at the integration lane's 4.3× unpack ratio. The Actions cache keeps the apt and bun sets | #3157 |
+| 35 | 10-30 | **A docs-only PR skips the heavy jobs.** 22 of the last 60 CI runs on 2026-10-30 were docs by title, and each took all 20 jobs, ~10 GB of cache downloads and up to 44 min. A new `changes` job reads the PR's file list (`pulls/N/files`, old paths of renames included). When every path is under `docs/`, a top-level `*.md` or `.claude/`, the twelve heavy jobs skip: the five Rust lanes, the macOS overlay check, the three Windows jobs, both FFmpeg jobs and the profiles build. No Rust build, test or link reads those paths. Every job that does read them still runs: frontend builds the docs site and tests the UI that uses `docs/assets`, machine-names and commit-identity run `.claude`'s self-tests, and the docs audits read `docs/`. It fails safe every way. A push to master skips the gate, so every heavy job runs, and a superseded run can never leave a code commit unverified. A file list that does not load, or one at the API's 3,000-file limit, runs everything. "Rust checks" passes a docs PR whose lanes all skipped, and fails when the gate did not succeed. A local harness passed 18 of 18 cases: nine classifications against a fake `gh`, and nine aggregate outcomes over push, code-PR and docs-PR inputs | #3170 |
+| 36 | 10-30 | **A cold unit or lint run fits its job's ceiling, publish included.** Wave 34's first master run to start (41107105820) found no `ci-unit` cache and built the lane cold: 1,795 crates, the tests, a prune from 14,068 to 10,373 MB, then a 2,587,763,998-byte archive published in two parts. The 30-minute ceiling cut the job off at 30 min 15 s with part 2 still uploading, and "Rust checks" failed on master. The part landed two seconds after the runner began its cleanup, so the next run restored the cache whole. Had it not landed, every later run would have built cold and been cut off the same way. The lint lane's cold run in that master run took 27 min 19 s, 91 % of its ceiling. `rust-unit` now allows 45 minutes and `rust-lint` 40 (`ci.yml:474`, `:159`), about 1.5 times each lane's measured cold run. Warm runs take 8–11 min, so only a cold or hung run comes near either | #3170 |
+| 37 | 10-30 | **The macOS overlay check's cold run fits its ceiling too.** Wave 36's audit of every `ci.yml` lane's ceiling against its slowest measured cold run found one more lane well under 1.5×. On 2026-10-30, master run 41069134834 republished the macOS cache at 6,159 MB, over its 6,000 MB cap (before wave 33's warning existed). The next master run (41072792020) dropped it and built cold: 1,954 units in 22 min 33 s, 90 % of the job's 25-minute ceiling. The ceiling is now 35 (`ci.yml:1340`). The same change corrects #3185's history in the bun-runtime vue-tsc step: the image broke six times, not four | #3192 |
+| 38 | 11-01 | **The prune removes local crates' macOS object files.** The macOS overlay cache grew 525–552 MB with each version bump while unit, lint and Windows sessions stayed flat, which put it over its cap and cold every third bump. macOS's default `split-debuginfo=unpacked` leaves `<crate>-<hash>.<cgu>-cgu.N.rcgu.o` beside each unit, and `ci-seed-save` read a unit's name at its last dash, which in those names is not the one before the hash. So 602 MB of local objects survived in a one-version cache. Those names are now read at the first dash (`ci-seed-save/action.yml:85`), and a cold prune lands at 4,039 MB, not 4,664 | #3251 |
 
 ## Acceptance criteria
 
@@ -158,16 +177,51 @@ itself on the affected run's page. Baseline when the program started: releases t
       and bun, with no superseded or PR-ref entries. That leaves ~2.5 GiB for a rotation of
       the largest family (`ci-unit`, 2.1 GiB). Saves land with no budget warning, and the six
       moved families republished from master to the `seed-cache` release (log)
-- [ ] **First normal-delta `agent-v*` tag post-migration lands ≤10 min end-to-end** —
-      **not met.** agent-v0.4.115 (2026-10-01, run 36937794461, the first tag after
+- [x] **First normal-delta `agent-v*` tag post-migration lands ≤10 min end-to-end** —
+      **not met until wave 29.** agent-v0.4.115 (2026-10-01, run 36937794461, the first tag after
       waves 18 and 19, whose agent code is 0.4.114's) took **14.9 min**: Windows MSI
       13.9, macOS `.pkg` 10.4, Linux x86_64 9.9, aarch64 7.4. Over the 12 tags 0.4.102–
       0.4.115 the MSI job ran 9.2–14.9 min and is the steady long pole. Of its 13.9 min,
       586 s were the final single-crate compile of `roomlerd` under `codegen-units=1`, which
       took 349 s on 0.4.114 for the same code: runner speed, not work. The remaining
       levers are the operator's (see Open decisions)
+      **Since wave 29 the compile is no longer the reason.** agent-v0.4.173 (2026-10-26,
+      run 40250842840) reused its rehearsal's build: MSI 4.0 min, `.pkg` 2.0, Linux 1.9
+      and 1.4. From the first build job to the post-release reseed, its own critical path
+      was about 7 min. It still took **17.0 min** on the clock, because its jobs waited up
+      to 10 min for a runner (the account runs at most 20 jobs at once). Still unmet: the
+      box is ticked when a tag lands under 10 min on the clock.
+      **Met on agent-v0.4.174** (2026-10-26, run 40287645036): 07:44:29 → 07:51:43Z,
+      **7.2 min** on the clock. All 8 build jobs reused rehearsal 40267019868's build (same
+      SHA `065e15308`, no release dispatch between them), and the four daemon jobs
+      reported `roomlerd 0.4.174`. The longest jobs were the Windows companion (4.2 min)
+      and the MSI (4.0); wave 30 takes the companions' remaining compile out.
+- [x] **Docs** — [`docs/build-caches.md`](../build-caches.md) describes what this FR built, in
+      house style: the seed store, a release's five runs, same-tree reuse and its traps, the
+      accretion GC and its caps, the merge freeze, and the log lines a run is read by. It has
+      a row in `docs/README.md`'s index (2026-10-29).
 
 ## Open decisions / residual levers (all trade-offs, not waste)
+
+- **The Actions cache refuses downloads under load (from 2026-10-30).** A restore finds its key
+  (`Cache hit for: v0-rust-ci-unit-…`), sits at `Received 0 of 2852032394` for 36–68 s, then
+  fails with `Failed to restore: Egress is over the account limit.` Swatinem reports
+  `No cache found`, and the lane compiles every dependency. `Rust unit tests` compiled 1,795
+  crates instead of 73 and took 23.4 and 27.0 min instead of 6.5–9.6 (runs 41056324624 and
+  41063619620). The second was the 0.4.188 bump PR's CI, 37.5 min end to end. Six of the twelve
+  CI runs sampled between 12:03 and 14:07Z had a refused restore, most of them the apt sets,
+  which fall back to the mirror. The limit is GitHub's, on the account's downloads, not the
+  pool's 10 GB; other projects report the same message from 2026-10-24. The `seed-cache` release
+  assets are not behind it: the Windows and macOS lanes restored from them in every run checked.
+  Levers posed to the operator, who chose the first two on 2026-10-30:
+  - **wave 34:** move the Linux lanes' cargo caches to `seed-cache`, as wave 22 did for the
+    rest. The unit lane's archive is 2.85 GB, so its target goes up in parts under the 2 GiB
+    asset cap;
+  - **wave 35:** skip the Rust, Windows and macOS lanes on a docs-only change. That means
+    fewer downloads, and fewer of the account's 20 concurrent job slots taken;
+  - not chosen: a plan with more concurrent jobs (Pro 40, Team 60; macOS stays at 5).
+
+  Both chosen levers shipped and are field-verified (waves 34 and 35, in the log).
 
 - The warm Windows floor is the per-release rebuild of every path crate under the
   size-optimized `cgu=1` profile, plus Azure signing steps. **Measured 2026-10-01, now
@@ -288,8 +342,8 @@ itself on the affected run's page. Baseline when the program started: releases t
 
 - The tag-race double-runs during release bursts (release-cutting process: `ls-remote`
   before tagging).
-- CI-lane cache sizing owned by other programs (`ci-integration`, `ci-ffmpeg-encoder`…) —
-  the pool is theirs now; the janitor governs it.
+- CI-lane cache sizing owned by other programs (`ci-integration`, `ci-ffmpeg-encoder`…).
+  Wave 34 moved their store and set first caps; tuning a lane's cap is its owner's.
 
 ## Field-verification log
 
@@ -399,7 +453,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   with the runner image ("already the newest version"). The composite costs ~21 s in a
   lane, against ~14 s for the raw step on a good day.
 - 2026-10-01: **Budget $10 (the operator); saves resume, and wave 16 in the field.**
-  Re-ran master CI at `0c3a74ed0` (run 36819352918, attempt 2, 7.8 min): all 11 salted
+  Re-ran master CI at `1dd1d08be` (run 36819352918, attempt 2, 7.8 min): all 11 salted
   `ci.yml` jobs restored the pre-salt generation (`full match: false`, none cold) and
   SAVED their salted one, every key the one PR #1784's run had computed, the first
   writes since 09-28 20:24Z. installer-smoke's Windows job (run 36899658523) did the
@@ -439,7 +493,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   caches are invisible to master. It installed in 40 s, the mirror having recovered, and
   saved on master at 22:40:57Z.
 - 2026-10-01: **agent-v0.4.115, the field test of waves 18 and 19** (run 36937794461,
-  tagged 22:54:13Z on `426150261`, published 23:08:48Z). 14.9 min end to end: MSI 13.9
+  tagged 22:54:13Z on `c2eaff8e1`, published 23:08:48Z). 14.9 min end to end: MSI 13.9
   (the pole), `.pkg` 10.4 (12.2 on 0.4.114, median 12.3 over the last 12 tags), Linux
   x86_64 9.9, aarch64 7.4, the companions 3.3 (macOS) and 6.1 (Windows).
   - Release: 28 assets, names identical to 0.4.114's apart from the version, each
@@ -569,7 +623,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   - A dry run in WSL caught one bug before any of this: without `zstd`, `tar` left 0-byte
     archives, and the first draft uploaded them over the good cache. `ci-seed-save` now
     refuses a failed pack.
-- 2026-10-11: **wave 22 on master** (`b928d563b`, #1954).
+- 2026-10-11: **wave 22 on master** (`f1f861c19`, #1954).
   - The first master runs (CI 38096524857, integration-tests 38096524893, installer-smoke
     38096524865) restored each of the six from the `seed-cache` release. Each saw the key
     change, since removing the validation clause changed each job's definition, and
@@ -580,7 +634,7 @@ itself on the affected run's page. Baseline when the program started: releases t
   - The six families' old Actions-cache entries were deleted by hand (8 entries,
     ~6.4 GiB), along with the orphaned plain-recorder family. One more
     `installer-smoke-windows` entry appeared at 00:00:31Z, written by the last run on the
-    old workflow (38095828862, `a91171f26`, started before the merge), and was deleted.
+    old workflow (38095828862, `e4e3896bf`, started before the merge), and was deleted.
   - Settled pool: **7.48 GiB in 12 entries**, against the free 10 GiB.
 - 2026-10-19: **"the tests got slow": two causes, wave 23 (#2544).**
   - **CI lanes cold.** PR run 39288740822: lint 22.5 min, unit tests 19.2, profiles 10.1,
@@ -644,8 +698,8 @@ itself on the affected run's page. Baseline when the program started: releases t
   - The partition was dry-run first with two fake libtest binaries (103 tests): union ==
     listing, no duplicates, the skipped test excluded, a module's tests spread 8/8/9.
 - 2026-10-20, evening: **the shards on master, and the queue** (wave 25).
-  - ⚠️ The forecast above was wrong. Of the six master runs since wave 24 (f0bf3a958
-    through d6235e5ee), five took **11.7–15.3 min wall-clock**. Their shards ran 9.6–12.9
+  - ⚠️ The forecast above was wrong. Of the six master runs since wave 24 (36cb849ec
+    through 39de8fe41), five took **11.7–15.3 min wall-clock**. Their shards ran 9.6–12.9
     min: builds 1.9–3.8 min, suites 5.4–8.2. The sixth took 24.8 min: its shards queued
     3–7 min, and one shard's build ran 10.1 min. The build does not drop to ~2 min,
     because the cache holds third-party crates only and every shard rebuilds the workspace
@@ -808,3 +862,448 @@ itself on the affected run's page. Baseline when the program started: releases t
       On four cores, 4 units beat 16. The macOS release build spent 564 s in the
       `roomlerd` lib and 229 s in its bin (`main.rs`) of 858 s. The two run one after the
       other, and each is a single crate.
+- 2026-10-26: **wave 29 field-verified on agent-v0.4.173.**
+  - The macOS re-probe (40230929108) passed. The fixed check ran the reused binary
+    with the vendored FFmpeg as its library path: `reused build reports 'roomlerd 0.4.171'
+    (want 0.4.171): OK`. On macOS, codegen-units 4 took 494 s and 16 took 439 s, against
+    766 s at 1, for +14.2% and +23.7% gzip size.
+  - **The real workflow, before any release depended on it:**
+    - The post-merge master reseed (40244838141, `5b55f04c2`) stamped all 8 build jobs
+      (`tree=1a584f76… job=Release roomlerd/<job>`), the two Windows jobs included, so a
+      fresh Windows checkout reads as clean.
+    - A same-tree dress rehearsal (40247220674, on a temporary branch at `5b55f04c2`)
+      then reused in all 8 jobs. The daemon build steps took 3–43 s, and all four version
+      checks passed, the two Linux jobs that no probe had covered included.
+  - **0.4.173**, cut by roomler-ai-7e at `ffffdacb7` (tree `99bc30a6276b`), with no release
+    dispatch between rehearsal and tag:
+    - Rehearsal 40249389321: every job found the reseed's stamp for another tree,
+      rebuilt as before, and stamped its own: 8 of 8.
+    - Tag 40250842840: 8 of 8 jobs reused the build, and the 4 daemon jobs reported
+      `roomlerd 0.4.173`.
+
+    | job | 0.4.172 tag | 0.4.173 rehearsal | 0.4.173 tag | build step |
+    |---|---|---|---|---|
+    | .msi (Windows) | 17.6 min | 16.1 | **4.0** | 38 s |
+    | .pkg (macOS) | 12.8 | 16.3 | **2.0** | 8 s |
+    | .deb (Linux x86_64) | 11.5 | 12.4 | **1.9** | 6 s |
+    | .deb (Linux aarch64) | 10.7 | 11.8 | **1.4** | 4 s |
+    | the four companions | 3.7–6.2 | 4.4–7.0 | 3.0–4.2 | 114–149 s |
+
+  - The build jobs' runner time fell from about 72 min to about 24.
+  - End-to-end, the run took 17.0 min against 18.7. The jobs queued for runners: the first
+    build job started 3 min in, and the MSI job 10 min in. Their own critical path was
+    about 7 min.
+  - ⚠️ The companions still recompile `roomler-desktop`. Tauri regenerates its gitignored
+    `gen/schemas/` (#2894), so its build script reruns on a fresh checkout. Carrying
+    `agents/*/gen/` in the seed is the open fix.
+- 2026-10-26, later: **0.4.174 lands in 7.2 min, and the companions' recompile is explained
+  and fixed (wave 30).**
+  - agent-v0.4.174 (tag run 40287645036) ran 07:44:29 → 07:51:43Z: **7.2 min** on the clock,
+    so the ≤10 min criterion is met.
+    - All 8 build jobs reused rehearsal 40267019868's build. It ran at the same SHA
+      `065e15308`, 3.7 h earlier, with no release dispatch between them.
+    - Daemon jobs: MSI 4.0 min, `.pkg` 3.1, `.deb` 1.6 and 1.5. The longest jobs were the
+      companions: Windows 4.2, aarch64 4.0.
+  - **Correction to the previous entry: `gen/schemas/` was not the cause.**
+    - Probe 40299709033 ran three Windows jobs, restoring seeds but never saving one, and
+      rebuilt with `-v` after a reuse.
+    - In all three variants it printed `Dirty roomler-desktop v0.4.174: the file
+      'agents\roomler-desktop\capabilities' is missing`. The variants were: nothing
+      restored; `gen/` restored with its mtimes; `gen/` restored and marked old.
+    - `tauri_build::build()` declares `cargo:rerun-if-changed=capabilities` unless the app
+      sets a capabilities pattern (tauri-build 2.6.2, `acl::build`). The directory had never
+      existed. So every build of `roomler-desktop` re-ran its build script and recompiled it:
+      local, CI, rehearsal or reused tag.
+  - With `agents/roomler-desktop/capabilities/README.md` in place (probe 40301394043), the
+    reused rebuild took **0.9 s** in all three variants, with nothing compiled, against
+    157–251 s before. A normal build still passes. The capability set is unchanged and
+    empty: the parser loads only `*.json`/`*.toml` files.
+- 2026-10-26, midday: **agent-v0.4.175, cut by roomler-ai-df.** Rehearsal 40308879884 and tag
+  run 40312190685 were both at `45d52aa36`, with no dispatch between them.
+  - Reuse held in every job, as reported by df: MSI 5.3 min, `.pkg` 6.6, `.deb` aarch64
+    1.6. The Linux x86_64 build step took 4 s.
+  - The run was created at 11:03:40, but its jobs only started at 11:09:59, after 6 min
+    waiting for runners.
+  - ⚠️ In attempt 1, the Linux x86_64 job **hung 23+ min in "Install system build deps
+    (cached apt)"** (`awalsh128/cache-apt-pkgs-action`), from 11:11:16. The same step took
+    37 s in the rehearsal and 37 s on the re-run. It had no limit of its own, so only the
+    job's 60 min would have ended it.
+  - df cancelled it at 11:34:47 and re-ran the failed jobs (attempt 2: 11:36:55–11:38:54).
+    The release published at 11:39:58, **36.3 min** after the tag, against 7.2 min for
+    0.4.174.
+  - Wave 30 bounds both cached-apt steps (8 min + `continue-on-error`) into the existing
+    fallback. A hang now costs at most ~8 min plus a direct apt-get, and never the job.
+- 2026-10-27: **wave 30 field-verified on agent-v0.4.179** (cut by the stardesk session, with
+  #2940 on board, on one SHA for rehearsal and tag).
+  - Tag run 40554147480: the tag was pushed at 17:49:08Z and the release published at
+    17:58:18Z, **9 min 10 s** from tag to publish. That is under the ≤10 min target for the
+    second time, after 0.4.174.
+  - None of the four companion jobs has a `Compiling roomler-desktop` line: Windows EXE
+    5 min, Linux x86_64 1 min, aarch64 1 min, macOS 3 min. On 0.4.174's tag they had spent
+    114–149 s on it. ⚠️ **Wrong, corrected in the next entry:** the Windows EXE and macOS
+    jobs did compile it (4 min 03 s, 2 min 26 s). This grep could not match a colour-coded line.
+  - Both cached-apt steps finished well inside their new bound: 7 s for the daemon .deb
+    and 6 s for the companion .deb. The aarch64 jobs use the uncached step (22 s and 43 s).
+  - All 8 build jobs carry the reuse notice. The four daemon jobs printed `reused build
+    reports 'roomlerd 0.4.179' (want 0.4.179): OK`. The MSI's ProductVersion reads 0.4.179,
+    and its G ROX LTD Authenticode signature is valid.
+  - Tags in between, all with the reuse held, as their cutters reported:
+    - 0.4.176 (2e) lost its first MSI attempt at "Sign MSIs": `azure/login` could not fetch
+      the OIDC token. A re-run of the failed jobs published it.
+    - 0.4.178 (df) took 15.0 min from tag to publish, before wave 30: MSI 6.8 min,
+      companion EXE 5.8.
+  - Next on this lane is FR-123 P2 (#2999, merged as `de813b504`): the daemon compiles as
+    one unit, measured −14 % on Windows and −30 % on macOS on the rehearsal's critical
+    path. Its field check is 0.4.180's rehearsal.
+- 2026-10-27, evening: **agent-v0.4.180 (cut by roomler-ai-2e) published 5 min 28 s after its
+  tag, the fastest yet. Also a correction to the 0.4.179 entry.**
+  - Rehearsal 40574588069 and tag run 40577974956 both ran at `317f2a6ab`, the first release
+    with FR-123 P2. The run was created at 20:25:51Z and the release published at
+    20:31:19Z.
+    - All 8 build jobs carry the reuse notice. The four daemon jobs compiled nothing and
+      printed `reused build reports 'roomlerd 0.4.180' (want 0.4.180): OK`.
+    - Three jobs ended together at 20:30:11Z, so they share the critical path:
+      - the Windows companion EXE: signing 62 s, then its post step 40 s;
+      - the MSI: payload signing 47 s, MSI signing 34 s;
+      - the `.pkg`, which waited 119 s for the macOS companion.
+  - **Correction to the 0.4.179 entry: two of the four companion jobs did compile
+    `roomler-desktop`.** The Windows EXE took 4 min 03 s and the macOS companion 2 min 26 s;
+    the two Linux jobs compiled nothing.
+    - That check grepped the raw logs. Cargo writes `Compiling\x1b[0m roomler-desktop`, and
+      the colour reset between the words means a plain grep for `Compiling roomler-desktop`
+      can never match: it counted 0 whatever happened. The cutter's check for 0.4.180 had
+      the same blind spot.
+    - With colours stripped: on 0.4.180's tag run only the macOS companion compiled it
+      (2 min 30 s). The reseed after it (40578859007) did the same (142 s). No Linux
+      companion compiled it on either run, nor did 0.4.180's Windows one.
+    - ⚠️ Prove a "none" count with a positive control: run the same grep on a log where the
+      answer must be at least 1, such as the rehearsal's.
+  - **Why the macOS companion recompiles is not yet known.** Probe branch
+    `exp/fr6-w31-companion-probe` restores the seed read-only and rebuilds with `-v` and
+    cargo's fingerprint log. It never stamps or saves a seed.
+    - Runs: v1 40583704652, v2 40584382028, v3 40585289155, v4 40586307513,
+      v5 40587490912.
+    - v1: the reseed's seed, rebuilt as a tag run does on another runner, was fresh (4.4 s).
+    - v2 to v4 each did a rehearsal-style build, then a tag-style rebuild on the same
+      runner. All were fresh (0.9–1.5 s), including:
+      - with the gitignored `gen/` removed, as a fresh checkout has it;
+      - with the seed's own `tar --zstd` round trip in between.
+    - v5 had the field's exact shape: a rehearsal-style build on runner A, the target
+      packed with `tar --zstd`, restored on runner B, then rebuilt as a tag run does. It was
+      fresh too (5.3 s, 0 of the dep-info's 48 inputs newer than its reference).
+    - Measured on the way:
+      - macOS bsdtar 3.5.3 stores mtimes to the whole second, cargo's reference included
+        (`…387.712610` → `…387.000000`). Windows' bsdtar 3.8.9 does the same to a 72- and a
+        167-character path, so no input can overtake its reference in the round trip.
+      - None of the tauri `OUT_DIR` inputs in the companion's dep-info is missing after a
+        restore.
+    - So the trigger lives in something only the real release jobs carry: their
+      environment (`SEED_REUSE_SAME_TREE`, `ROOMLER_SEED_REUSED_TREE`, the rehearsal branch
+      against the tag ref), or the steps around the build (stamp, artifact upload, seed
+      save). The way to read it is cargo's own answer in a real job:
+      `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the companion build steps, a
+      log-only change. It is not on today's critical path: the Windows companion and the
+      MSI ended at the same second as the `.pkg`.
+  - The reseed's MSI job compiled from scratch: 586 crates, 21 min 38 s. Its restored seed
+    held 3,042 MB, over the 3,000 MB cap, and was dropped whole by design. A reseed absorbs
+    that cold build, so the next rehearsal starts from a fresh seed.
+  - FR-123's reading of the same rehearsal is in its spec, §8.1: −19 % and −12 % of the
+    daemon's compile on the two Linux lanes. The MSI build step took 542 s, the fastest of
+    the 40 release runs since 10-24.
+- 2026-10-28: **wave 31 (#3024), the operator's go: the four companion build steps log
+  cargo's fingerprint decisions.**
+  - The reseed its merge dispatches builds a new tree, so it recompiles our crates by design.
+    Its companion logs are the positive control: each dirty unit must print its reason.
+  - The first reused same-tree run after it names the macOS companion's reason: the next tag
+    run, or the reseed after a release. Its read goes here.
+- 2026-10-28, night: **the reason, read off cargo, and the fix (#3030).**
+  - R1, reseed 40602653917 (a new tree), was the positive control. Its macOS companion printed
+    22 fingerprint lines, each a source with both mtimes.
+  - R2, 40605173133, ran the same tree on a branch pinned to R1's commit. It was **fresh**
+    (5.50 s). A reseed's seed reuses cleanly; something only a release's rehearsal does
+    leaves the trap. The rehearsal is the one that builds a new version, so every one of
+    our units gets a new hash and compiles for the first time.
+  - Probe v6, 40605635409, bumped `roomler-desktop` alone to 0.4.999, so its build is a
+    first build. The rebuild on the same runner was dirty:
+    `stale: changed …/out/tauri-codegen-assets/8068…ba4.js (vs) …/dep-bin-roomler-desktop`,
+    `1793145568.351986499 < 1793145569.649334416`.
+    - The asset was written 1.3 s after the compile started, by tauri's `generate_context!`.
+      It writes the file during the compile, only when missing, and lists it as an input.
+    - Restored from the tar on another runner, the rebuild was dirty the same way (`568 <
+      569`, the tar keeping whole seconds). It recompiled in 2 min 22 s, the field's figure.
+    - That explains every reading: the macOS companion every release; the Windows one on
+      0.4.179 and not on 0.4.180, depending on whether the write crossed a second; and the
+      once-only recompile, because the file then exists and is never rewritten.
+  - The fix: on a same-tree reuse, `seed-tree-reuse` marks every file under
+    `target/*/build/*/out/` and `target/*/*/build/*/out/` old, as it does the sources. A
+    build script that does rerun rewrites its OUT_DIR, which is new again.
+  - Probe v7, 40607295709, applied the fix verbatim after a first build. All three were
+    fresh: macOS on the same runner 1.98 s, macOS on another runner 4.87 s, Windows 0.68 s.
+  - Field proof owed, on the next release's tag run:
+    - no `Compiling roomler-desktop` in any companion job (strip colours first);
+    - no `fingerprint dirty` line in their logs.
+    Then the `CARGO_LOG` lines come out of the four steps.
+- 2026-10-28, morning: **wave 31 field-verified on agent-v0.4.181**, cut by stardesk-teardown-roomler.
+  The rehearsal (run 40627954705) and the tag run (40630476314) built the same tree, `c6406facc817`.
+  - The rehearsal is the positive control, and it passed. Each of the four companion jobs compiled
+    `roomler-desktop` once, and `CARGO_LOG` printed 12 fingerprint lines there. On the first build of
+    a new version these read `fingerprint error … failed to read …/bin-roomler-desktop`, not
+    `fingerprint dirty`, because there is no previous fingerprint to compare.
+  - **The tag run is clean.** In all four companion jobs there is no `Compiling roomler-desktop` and
+    no fingerprint line, the only `CARGO_LOG` trace being the env line. Against 0.4.180:
+    - the macOS companion job took 52 s, against 184 s;
+    - the Windows companion took 111 s, against 223 s;
+    - the `.pkg` took 130 s, against 247 s, because it no longer waits for the companion.
+    The four daemon jobs reused as before and reported `roomlerd 0.4.181`.
+  - **The reseed after it is clean too.** Run 40631116972 on master, the same tree: all four
+    companion jobs reused, with no compile and no fingerprint line. On 0.4.180 this run had recompiled
+    the macOS companion (142 s).
+    - Two of its daemon jobs compiled cold anyway. Their seeds had passed the 3,000 MB cap (Linux
+      x86_64 at 3,306 MB: 580 crates, 12 min 47 s) and were dropped whole, as designed. A reseed
+      absorbs that cost, so no release pays it.
+  - **Tag to publish took 6 min 28 s** (04:06:56 → 04:13:24Z). The critical path is now the MSI: its
+    job waited 70 s for a Windows runner, then took 274 s. The companion fix shortens the `.pkg`'s
+    path, not this one.
+  - The diagnostic came out of the four steps again (#3037). To read a future recompile, put
+    `CARGO_LOG=cargo::core::compiler::fingerprint=info` back on the step, or run `cargo build -v`.
+- 2026-10-28, afternoon: **agent-v0.4.182, cut by stardesk-teardown-roomler.** Wave 31 held on its
+  second release. Rehearsal 40723384188, tag run 40730055980 and the bump's squash `e0a445f9c`
+  all had tree `8048f68fca0c`.
+  - The rehearsal compiled `roomler-desktop` once in each companion job: the positive control.
+  - **The tag run is clean.** All 8 jobs carry the reuse notice. The four daemon jobs compiled
+    nothing and reported `roomlerd 0.4.182`. The four companion jobs compiled nothing either.
+  - **Tag to publish took 13 min 09 s**, all of it runner queueing, none of it builds. The run was
+    created at 16:51:21Z and validated by 16:51:52Z. The Linux jobs started at 16:51:54–16:52:53Z,
+    the Windows companion at 16:53:37Z, the MSI at 16:53:58Z, the macOS companion at 16:58:44Z, and
+    the `.pkg` only at 17:00:01Z, 8 min after validation. The release published at 17:04:30Z.
+    Each build job itself took 99–339 s.
+  - The reseed after it (40732757710, the same tree): every companion job reused with no compile,
+    and the three daemon jobs that reused (the `.pkg` and both `.deb`) reported `roomlerd 0.4.182`.
+    Its MSI compiled cold: the seed held 3,024 MB, over the 3,000 MB cap, and was dropped whole
+    (586 crates, 20 min 47 s).
+  - That is the third post-release reseed in a row to drop the Windows seed, after 0.4.180 (3,042 MB)
+    and 0.4.181 (3,022 MB). Each cycle (reseed, rehearsal, tag, reseed) grows it past the cap again, so the cap
+    now costs one cold Windows build per release. It lands on the reseed, never on the tag run. The
+    next lever: prune units older than the last few generations instead of dropping the whole target.
+    Not started.
+  - Two seeds are at the cap's edge: the `.pkg` at 2,995 MB and the `.deb` aarch64 at 2,902 MB, so
+    the next rehearsal or reseed will likely drop them and compile those jobs cold once. A tag run
+    skips that check ("tag run — skipping accretion GC"), so no release pays it.
+- 2026-10-28, evening: **agent-v0.4.183, cut by stardesk-teardown-roomler.** Wave 31 held on its
+  third release. Rehearsal 40742354169, tag run 40751997218 and the bump's squash `4bbd94e5d` all
+  had tree `7daedbf21ffd`.
+  - The rehearsal compiled `roomler-desktop` once in each companion job: the positive control.
+  - **The tag run is clean.** All 8 jobs carry the reuse notice and compiled nothing, and the four
+    daemon jobs reported `roomlerd 0.4.183`.
+  - **Tag to publish took 16 min 00 s** (19:11:09 → 19:27:09Z), again almost all of it runner
+    queueing. The `.pkg` waited 8 min 12 s for a macOS runner (0.4.182's waited 8 min 09 s), then
+    took 343 s, 10 s of it the build step. On both releases the ≤10 min mark failed on macOS runner
+    queueing alone.
+  - The reseed (40754452329) ran on master `0a70ac83b`: a docs PR merged after the bump, so its tree
+    differed from the tag's and every job compiled, as designed for a new tree. It dropped three
+    seeds over the cap, the MSI's at 3,025 MB (the fourth reseed in a row), the `.pkg`'s at
+    3,332 MB and the `.deb` aarch64's at 3,290 MB; those jobs compiled 574–580 crates cold, and the
+    run took 31 min. Wave 32 raises the four daemon jobs' cap to 4,500 MB.
+  - The rehearsal's `.pkg` build step read 1,519 s, a new high: the daemon lib's codegen took
+    1,374 s against 672 s on 0.4.182. The reseed compiled the same code on another runner in 713 s,
+    so it was the runner (FR-123 §8, decision 8).
+- 2026-10-29, small hours: **agent-v0.4.184, cut by fr94-followup-issues.** Wave 31 held on its
+  fourth release.
+  - **The tag run is clean** (40792470875). All 8 jobs carry the reuse notice and compiled nothing,
+    the four daemon jobs reported `roomlerd 0.4.184`, and no companion compiled. Tag to publish
+    took 5 min 32 s (00:12:04 → 00:17:36Z).
+  - **The post-release reseed is wave 32's red** (40793113939, at the tag's tree, the old cap). The
+    MSI restored `target is 3082 MB (> 3000) — dropping it whole` and compiled 586 crates cold,
+    26.3 min, where it could have reused. The other seven jobs kept their seeds and reused. It was
+    the fifth reseed in a row to drop the Windows seed. The `.pkg` job's first attempt failed only
+    in its Notarise step (Apple's stapler, `-1005`), after its seed had published; a re-run passed.
+- 2026-10-29, small hours: **wave 32 (#3068) merged as `5baaf79cb`.** The reseed it dispatched
+  (40797998801) printed the cap in effect in every job: `(cap 4500)` on the four daemon jobs and
+  `(cap 3000)` on the companions. The macOS runners had ~40 GB free, so a bigger seed is no disk
+  risk there.
+- 2026-10-29, early morning: **agent-v0.4.185, cut by fr94-followup-issues.**
+  - The rehearsal (40808801238) could not tell the two caps apart: every daemon seed it restored
+    was under 3,000 MB. It corrected the growth model instead. The MSI restored exactly 2,668 MB,
+    although #3068's reseed had recompiled 20 crates at 0.4.184 in between, so a seed grows per new
+    version, not per build.
+  - **The tag run is clean** (40812002848): reuse in 8 of 8 jobs, nothing compiled, `roomlerd
+    0.4.185` in 4 of 4, no companion compile. Tag to publish took 6 min 38 s (03:24:58 →
+    03:31:36Z); the MSI was the longest job, at 263 s.
+  - **The post-release reseed is wave 32's green** (40812653908, at the tag's tree). It kept the MSI
+    seed at 3,037 MB and the `.deb` x86_64 seed at 3,367 MB, both over the old cap, and every job
+    reused the build with 0 compiles. The MSI job took 6.0 min and the whole run 6.7 min, against
+    26.3 min for the MSI's cold build one release earlier.
+- 2026-10-29, evening: **agent-v0.4.187, cut by roomler-ai-de.**
+  - **The tag run is clean** (40929759871): reuse in 8 of 8 jobs, nothing compiled, `roomlerd
+    0.4.187` in 4 of 4, no companion compile. Tag to publish took 5 min 33 s (18:19:47 →
+    18:25:20Z).
+  - **The post-release reseed** (40930679656) kept all four daemon seeds under 4,500 MB and reused
+    the build: MSI 3,765, `.deb` x86_64 4,153, `.pkg` 3,386 and `.deb` aarch64 3,321 MB. The
+    Windows companion EXE's seed reached its 3,000 MB cap for the first time (2,877 → 2,972 →
+    3,068 MB over three reseeds) and was dropped whole, so its build ran cold, 6 min 6 s, after the
+    release had published.
+  - That is the cycle `docs/build-caches.md` §4 describes, not a regression. A tag run skips the
+    GC, and a rehearsal restores a seed the last reseed already checked, so a drop lands on a
+    reseed. At ~390 MB a release, the `.deb` x86_64 seed should drop on 0.4.188's reseed and the
+    MSI's about two releases later.
+- 2026-10-30: **closed**, with every criterion ticked and the docs merged in #3107 (`d738146ad`).
+- 2026-10-30, afternoon: **reopened for wave 33.** The operator flagged the 0.4.188 bump PR's CI
+  (run 41063619620, 37.5 min), which held the release. The bump PR opened at 13:29Z, its CI was
+  green at 14:06, and the release published at 14:21:22, 12 min after the tag.
+  - **Its long pole was the Actions cache refusing a download** (Open decisions). `Rust unit
+    tests` waited 9.4 min for a runner, got `Failed to restore: Egress is over the account
+    limit.`, and compiled 1,795 crates cold in 27.0 min. The same lane went cold the same way in
+    run 41056324624 (12:46Z, 23.4 min).
+  - **Behind it sat a regression in this FR's own caches.** From #3125 (10:46Z) on, `Windows
+    overlay clippy` restored `ci-windows-clippy-Windows-X64` at 4,440 MB, over its 4,000 MB
+    cap, dropped it and built cold: 297 + 329 + 42 + 821 + 252 units across its five steps,
+    the wizard's step alone 503 s. Each master run then published `pruned target: 5809 MB ->
+    4440 MB` again (41063266842, 41069134834). The lane took 7.4–8.3 min in the three runs before #3125
+    (41041779768, 41042348489, 41042618394) and 17.0–22.6 min in all 20 runs checked after it.
+    So even without the refused download, the bump PR's CI would have taken ~22 min. Wave 33
+    (#3153) is the fix.
+  - **The operator chose two of the three egress levers**: move the Linux lanes to `seed-cache`
+    (wave 34), and skip the heavy lanes on docs-only PRs (wave 35). A bigger plan was not chosen.
+- 2026-10-30, 15:31Z: **wave 33 (#3153) merged as `4c43b714a`.** Its own PR run (41076872429)
+  restored `ci-windows-clippy-Windows-X64: target 4440 MB, key changed` and kept it, compiled or
+  checked 98 units instead of ~1,740, and took 11.2 min against 17.0–22.6 cold. The wizard's step
+  took 179 s, against 503 s cold. The macOS overlay check (13.8 min) is now each run's floor.
+- 2026-10-30, 16:00Z: **wave 33 holds.** Master run 41081498611 (attempt 1, at the merge)
+  restored `ci-windows-clippy-Windows-X64` at 4,440 MB and kept it under the new 6,000 MB cap,
+  compiled or checked 98 units, republished `pruned target: 5810 MB -> 4440 MB`, and its Windows
+  clippy job took 13.2 min. #3157's PR run (41085608470) then restored the same cache `same key`
+  in 10.4 min, against 17.0–22.6 min cold.
+- 2026-10-30, 18:07Z: **wave 34 (#3157) merged as `224c79615`.** The three master runs queued
+  behind the next merges were cancelled before they started, so the first to run it was
+  41107105820 (`ff0074175`, 18:27Z). Every Linux family started cold (`no ci-<family>-Linux-X64
+  cache on the seed-cache release yet`) and published:
+
+  | Family | Pruned target | Job |
+  |---|---|---|
+  | lint | 6,830 → 6,081 MB | 27 min 19 s |
+  | unit | 14,068 → 10,373 MB, two parts | cut off at 30 min 15 s (wave 36) |
+  | agent | 4,944 → 3,268 MB | 14 min 18 s |
+  | profiles | 2,588 → 2,445 MB | 9 min 1 s |
+  | recording-ffmpeg | 3,120 → 1,848 MB | 7 min 2 s |
+  | recorder-audio | 3,172 → 1,601 MB | 7 min 49 s |
+  | ffmpeg-encoder | 2,198 → 1,675 MB | 4 min 43 s |
+
+  - **The caps stand.** Every cache sits at 32–65 % of its cap, and no `CI cache over its cap`
+    warning fired.
+  - **The unit lane's publish raced its ceiling.** Its 2,587,763,998-byte archive went up as two
+    parts, and the 30-minute ceiling cut the job off with the second part still uploading. That
+    part landed 2 s later, but "Rust checks" failed on that master run. Wave 36 is the fix.
+  - **Restores:** the next master run (41111211419, `392f09635`) restored all seven `same key`
+    and published nothing new. The unit lane joined its two parts into 10,380 MB and took
+    8 min 34 s (73 units). The first PR run after it (41118044702) restored the same seven
+    `same key`: unit 7 min 31 s, lint 11 min 4 s, agent 8 min 13 s, the other five
+    2.5–7.5 min. Before wave 34, a refused Actions-cache download built the unit lane cold in
+    23–27 min.
+  - `Recorder tests (FR-85)` restores the shared `recorder-audio` cache under its own key, so it
+    always logs `key changed` and builds ~56 units on top. Only `rust-recorder-audio` publishes
+    that family, by design.
+- 2026-10-30, 20:41Z: **agent-v0.4.189 published 17.0 min after its tag run started, all of the
+  gap runner queueing.** The tag run (41122965565) reused its rehearsal in all eight jobs: no
+  daemon compiled, `roomler-desktop` compiled in no companion, `roomlerd 0.4.189` in 4 of 4.
+  Its build steps took 3–41 s. The MSI job waited 9 min 16 s for a Windows runner and the `.pkg`
+  6 min 28 s for a macOS one, against 0–100 s on 0.4.184–0.4.185.
+- 2026-10-30, 21:09Z: **waves 35 and 36 (#3170) merged as `ead2192c9`.** The PR's own run
+  (41124429682) was a code PR: `What changed` found `.github/workflows/ci.yml` outside the docs,
+  set `heavy=true`, and every job ran. The slowest took 10.7 min (Windows clippy).
+- 2026-10-30, 21:18Z: **wave 35 holds on this close-out PR (#3184), the first docs-only PR after
+  it.** In its run (41130010043), `What changed` read 3 paths, none outside the docs, set
+  `heavy=false` and posted the skip notice. The twelve heavy jobs skipped, and the other nine
+  passed, "Rust checks" included. The nine ran 3 s to 2 min 40 s each, yet the run took 22 min,
+  nearly all of it waiting for runners: `What changed` waited 6 min, the last audits 21. The
+  twelve jobs it skipped had taken 84 runner-minutes on #3170's code-PR run, three Windows jobs
+  and the macOS one among them.
+- 2026-10-30, evening: **closed again**, waves 33–36 shipped; #773's Result comment carries the
+  evidence.
+- 2026-10-30, 23:15Z: **wave 37, a hardening after the close.** No acceptance criterion moves. The
+  audit behind it compared each `ci.yml` lane's ceiling with its slowest measured cold run:
+  - lint 27.3 min against 40, unit about 30.5 against 45;
+  - agent 14.3 against 30, profiles 9.0 against 45;
+  - recorder-audio 7.8, recording-ffmpeg 7.0 and ffmpeg-encoder 4.7, each against 30;
+  - Windows clippy 22.6 against 40 and Windows recorder 13.3 against 45;
+  - macOS overlay 22.6 against 25 (1.1×), the only lane well under 1.5×. Its run is
+    41072792020, after its cache crossed its cap.
+
+  Windows sessions and the FR-85 recorder lane have no cold run on record.
+- 2026-10-31, 18:37–19:14Z: **the first cold macOS runs since wave 37, and the GC recovered by
+  itself.** The bump to 0.4.191 changed the lane's key, so master run 41229495094 built on the
+  5,821 MB it restored and published 6,440 MB at 18:36:49Z, over the 6,000 MB cap.
+  `CI cache over its cap` fired. The next three macOS jobs dropped that cache and compiled 976
+  crates, against a warm job's 41:
+
+  | Run | Kind | Started | Took |
+  |---|---|---|---|
+  | 41230117636 | PR | 18:37:20Z | 20.9 min |
+  | 41229869004 | master | 18:50:29Z | 9.2 min |
+  | 41230762929 | PR | 18:51:57Z | 22.1 min |
+
+  All three fit the 35-minute ceiling, and the old 25 too. The master run pruned 5,767 MB to
+  4,664 MB and published at 18:59:39Z, 23 minutes after the oversize publish, and the next job
+  (41230851548) restored it and compiled 41. Those were the only 3 cold jobs among the 44 macOS
+  jobs that ran from wave 36's merge to 19:28Z.
+
+  Two things follow:
+  - **A job's time does not say cold or warm on this lane.** The 9.2 and 22.1 min jobs built the
+    same crates and started 88 s apart, and the 41 warm jobs took 6.9–17.3 min. Read the job's
+    `restored` line or its compile count instead.
+  - **The warning was wrong about this case.** It said every run would build cold and to raise
+    the cap, which is wave 33's stuck cache, where the cold build itself is over the cap. This
+    cache came back lean, so the cap stays at 6,000 MB, and `ci-seed-save/action.yml:95` now
+    names both cases.
+
+  This lane's published size rose with each version bump, 5,289 to 5,831 MB at 0.4.190 and 5,888
+  to 6,440 MB at 0.4.191, while unit, lint and Windows sessions published the same size across
+  both bumps. The cause is not established. At that rate a 4,664 MB cache crosses 6,000 MB on the
+  third bump from here, 0.4.194.
+- 2026-10-31, 19:50Z: **wave 35 holds on every docs-only PR that ran the gate.** Of the 28 PRs
+  merged from #3170 on, nine were docs-only with the gate in their run: #3137, #3184, #3189,
+  #3196, #3200, #3201, #3206, #3211 and #3212. All nine skipped the twelve heavy jobs, and each
+  `What changed` log shows the skip notice. #3179 and #3183 were docs-only too, but their runs
+  started before #3170 merged, so they ran every job. The other 17 each have a path outside the
+  docs, and none skipped anything. The PR page counts 14 skipped: the twelve, plus the CLA check
+  listed twice.
+- 2026-10-31, 20:54Z: **wave 36 is still unproven: neither unit nor lint has run cold since it
+  merged.** A drop lasts until a master run publishes, so reading the master runs finds every
+  one. All 17 finished master jobs per lane, through the run created at 19:31Z, compiled the usual
+  few crates: unit 73, lint 15, the FR-85 recorder 56, Windows sessions 18–19. Unit published
+  10,380 MB and lint 6,088 MB on every publish, 65 % and 61 % of their caps, so the GC will not
+  reach them and a cold run needs a lost cache. Windows sessions and the FR-85 recorder lane
+  still have no cold run on record.
+- 2026-11-01, 01:29–01:56Z: **a forced cold run of five lanes, and all five fit.** Run
+  41261253426, on a branch that was never merged, gave lint, unit, the FR-85 recorder, Windows
+  sessions and macOS fresh `probe-*` cache families, so each logged `no … cache … building cold`.
+  A read-only token stopped every upload with HTTP 403, and no probe asset reached `seed-cache`.
+  The publish step still pruned and packed, so these times leave out only the upload, about 90 s
+  for unit:
+
+  | Lane | Cold | Ceiling | Crates compiled | Pruned to |
+  |---|---|---|---|---|
+  | Unit | 27.3 min | 45 | 1,795 | 10,373 MB |
+  | Lint | 18.0 min | 40 | 624 | 6,082 MB |
+  | macOS | 14.3 min | 35 | 976 | 4,039 MB |
+  | Windows sessions | 11.1 min | 40 | 508 | 1,612 MB |
+  | FR-85 recorder | 8.9 min | 30 | 460 | no publish step |
+
+  So wave 36's ceilings hold, and Windows sessions and the recorder lane have cold runs on
+  record. The recorder lane restores `recorder-audio`'s cache read-only, which is why it never
+  publishes.
+
+  A cap lowered to 1,000 MB on Windows sessions made the rewritten warning print: the run page
+  shows `CI cache over its cap` on that lane and no other, with the two cases spelled out.
+- 2026-11-01, 02:10Z: **wave 38: the macOS cache's growth was a prune bug.** The third bump
+  measured it again: 0.4.192's run (41260502582) compiled its usual 41 crates and still grew the
+  cache from 4,723 to 5,248 MB. Reading the published asset's tar headers found 602 MB of
+  `.rcgu.o` files from local crates (`roomlerd` 315, `tunnel_core` 121, the vendored `webrtc_*`
+  too), whose `.rlib` and `.rmeta` had gone. macOS's default `split-debuginfo=unpacked` leaves
+  those files, and the prune read their names at the last dash, which is not the one before the
+  hash.
+
+  The fix reads them at the first dash. Run against the real listing, it took the cache from
+  4,591 to 3,989 MB. On a real Mac, the probe's cold prune went 5,753 to 4,039 MB against master
+  41229869004's 5,767 to 4,664 MB, 625 MB less. That supersedes the 0.4.194 forecast above: the
+  cap should stop dropping this cache. Still to read: the next macOS publish should shrink, and
+  the next version bump should add nothing.

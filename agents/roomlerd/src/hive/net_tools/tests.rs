@@ -147,11 +147,12 @@ async fn a_listener_made_after_its_run_ended_ends_at_once() {
         "the run ends while its call asks"
     );
     let later = Place::hold(run).unwrap();
+    let egress: Arc<dyn SessionEgress> = Arc::new(hub.clone());
     let (ended, _) = flow().await.unwrap();
-    assert!(!place.fill(&hub, &ended), "its run ended");
+    assert!(!place.fill(&egress, &ended), "its run ended");
     assert!(!hub.has_flow(&ended), "ended at once");
     let (kept, _) = flow().await.unwrap();
-    assert!(later.fill(&hub, &kept), "the later call's run lives");
+    assert!(later.fill(&egress, &kept), "the later call's run lives");
     assert_eq!(drop_run(run.0, run.1), 1);
     assert!(!hub.has_flow(&kept));
 }

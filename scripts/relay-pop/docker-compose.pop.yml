@@ -44,6 +44,9 @@ services:
       # FR-115 P4b-2 — the Redis coturn publishes its totals to; empty (when
       # pop.env says TURN_STATS=0) keeps none, and the API pulls nothing here.
       TURN_STATS_REDIS: ${TURN_STATS_REDIS:-}
+      # FR-76 P3 — no DERP_NETWORKS here: a regional PoP serves every network.
+      # Never add it as ${DERP_NETWORKS:-}. An empty value refuses to start,
+      # so that line would stop every PoP that leaves it unset (README.md).
     volumes:
       # Linux x86_64 binary built by CI / the build host:
       #   cargo build -p derp-relay --release

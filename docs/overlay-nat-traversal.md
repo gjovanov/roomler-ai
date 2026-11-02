@@ -95,7 +95,7 @@ already held the stale row, so a VPN reconnect does not cure it.
 
 That case is repaired, not reported
 (`crates/tunnel-core/src/overlay/lan_repair.rs:165`, run from the network-state
-sample before the capture probe at `netstate.rs:537`):
+sample before the capture probe at `netstate.rs:650`):
 
 ```mermaid
 flowchart TD
@@ -392,9 +392,9 @@ cascade's guarantees while replacing its reactive counters:
   WireGuard only with its whole 4-byte header, a type and three zero bytes, which a
   greased packet matches only if its random connection ID also opens on three zero bytes;
   and the DERP endpoints advertise no greasing, so nobody greases toward them
-  (`derp_endpoint_config`, [`quic.rs:241`](../crates/tunnel-core/src/transport/quic.rs#L241);
+  (`derp_endpoint_config`, [`quic.rs:254`](../crates/tunnel-core/src/transport/quic.rs#L254);
   the measurement is `quic_over_derp_never_clears_the_fixed_bit`,
-  [`quic.rs:1140`](../crates/tunnel-core/src/transport/quic.rs#L1140)).
+  [`quic.rs:1191`](../crates/tunnel-core/src/transport/quic.rs#L1191)).
   ⚠️ During a rollout an old peer still advertises greasing, so a fixed build still
   greases toward it, and the old peer still reads by the first byte: the old-to-fixed
   direction is clean at once, the fixed-to-old one once the old end upgrades.
@@ -479,6 +479,89 @@ two allocations landing on *different* coturn workers — not a defect in the
 carrier itself: relay-to-relay hairpin and full WG over two same-worker
 allocations both verify green. Single-relay avoids it by using one allocation;
 DERP avoids coturn entirely.
+
+**A DERP stamp moves a live TURN carrier (#2820, agent 0.4.175).** A pair's relay strategy is
+the server's per-edge stamp in its netmap row (`relay_strategy`), and the
+coordinator reads it when it **builds** a link. A healthy link never asked again,
+so a pair on TURN kept TURN after the server re-stamped it DERP, until it happened
+to churn. Two stamps make that wrong: FR-115 P4c-1's, when an org crosses its relay
+allowance (TURN is not throttled, DERP is), and P7's churn pin, which rides the
+same verdict (`fan_pair_verdicts`). `RelayCoordinator::stamp_to_derp`
+(`crates/tunnel-core/src/overlay/relay_link.rs`), asked from the keep-the-relay
+paths of `install_peers` (`maybe_probe_stamp_to_derp`,
+`crates/tunnel-core/src/overlay/runtime/establish.rs`), builds the DERP carrier
+on the live mux and **probes** it: the carrier waits in the make-before-break
+probe slot (`WgDevice::start_relay_probe`) while TURN keeps the pair's traffic,
+and `sweep_upgrade_probes` promotes it over the TURN carrier only once a
+handshake over `/derp` has latched. The one-byte permission nudge goes out over
+`/derp` first and the initiation 500 ms later, so a peer that follows us there
+(demote-follow, on any agent) has its DERP carrier up when the handshake arrives.
+A peer probing at the same moment answers on its own probe.
+⚠️ **The stamp alone is never enough to move.** It says both ends *support* DERP,
+not that the peer's `/derp` is up: the verdict and the grant both decide on
+`supports_derp`, and the measured `derp_ws_ok` rides a ~20-minute netcheck, too
+stale to gate on. Field 2026-10-26: the first version installed the DERP carrier
+straight over TURN, released the allocation the peer was dialing, and a peer whose
+`/derp` had never opened sat with no carrier for 12 minutes, where 0.4.172 kept
+the pair on TURN. Now a peer that does not answer within 15 s keeps the pair on
+TURN, and is not probed again for 10 minutes (`STAMP_PROBE_BACKOFF`).
+⚠️ Only an installed **TURN** carrier is probed, and only on the server's stamp,
+never on a local derivation. A direct carrier, an org relay, a pair with another
+probe in flight and a pair still being established are left alone: DERP is a
+fallback tier, not a destination.
+⚠️ **There is no way back by regrade.** The promotion forgets the pair's relay state
+(`commit_stamp_derp`), as a direct promotion does. It adopts no `Derp` strategy, so
+when the stamp turns again (the org back under, the pin lapsed) the pair stays on
+DERP, the floor every fleet pair is born on, until its next re-establishment reads
+the stamp afresh. Measured both ways (field 2026-10-26): in every run one end
+probed and the other, on an older agent or not, followed the nudge. So the
+DERP→TURN regrade (`derp_regrade_due`, break-before-make) fired on the prober
+alone. That left the follower with no carrier for 18 s, and the pair back on DERP
+by demote-follow anyway.
+⚠️ The forget also clears a slot the move would otherwise leave behind. A peer that
+followed us abandoned the TURN leg, so a health sweep that runs before the probe is
+promoted can convict our TURN carrier, and on any relay death it re-requests.
+That request's slot outlived the promotion: a tracked peer is skipped by the stamp
+and the regrade alike, and a later build from it would have installed over the
+carrier the probe had just proved.
+⚠️ The move costs one direction a short window. Promoting drops the old carrier
+(`WgDevice::promote_direct_probe` replaces the peer, and the old peer's drop aborts
+its receive task), so whatever the other end still sends over TURN is lost until it
+moves too. **A probe is promoted the moment its handshake latches** (#2952): the
+latch on the receive path wakes the runtime (`PeerStats::latch_wake`, armed on every
+probe by `WgDevice::insert_probe`), which runs the same post-promote steps as the
+fallback tick. The tick (`FALLBACK_TICK`, 5 s) still sweeps, for deadlines and as
+the floor. Which direction pays depends on who probes:
+- **Both ends probe:** the two latches are about a round trip apart, and so is the
+  loss, on the later end's outbound.
+- **The peer follows:** the follower drops its TURN leg on the nudge, so the
+  **prober's** outbound is lost until its probe latches: the 500 ms the initiation
+  waits, plus a round trip. The follower's traffic flows through the probe session
+  meanwhile. An older agent always follows. Two agents with #2952 can land here too:
+  the stamp reaches both in one fan, and if one end's nudge arrives before the other
+  end has acted on its own stamp, that end follows instead of probing. Which case a
+  pair gets is that race.
+- **One end on 0.4.175–0.4.177**, which still promotes on its tick: both probe,
+  and the gap is however far that end's tick falls behind the latch, up to 5 s.
+
+Field, on two nodes holding a live TURN pair, with a ping across the move (every 200 ms
+on 2026-10-26, every 50 ms on 2026-10-27):
+
+| Build | Case | Promotions | Lost |
+|---|---|---|---|
+| published 0.4.175 (2026-10-26) | both probe, on their ticks | 2.6 s apart (`probe_ms` 1641, 4274) | 2.6 s |
+| published 0.4.177 (2026-10-27) | both probe, on their ticks | 0.73 s apart (916, 1644) | 0.70 s |
+| a tick-promoting prober (#2820 case C, 2026-10-26) | the peer follows | the prober's next tick (`probe_ms` 5002) | ≈ 5 s, from the logs (no ping that run) |
+| #2952 (2026-10-27) | both probe, at the latch (`via="latch"`) | 1.4 ms apart (503, 503) | **nothing** |
+| #2952 (2026-10-27) | one end's nudge won the race; the peer follows | the prober at its latch (504) | **0.57 s** |
+
+Sending the initiation sooner (or again, early) would shrink the follower case
+toward a round trip as well. The 500 ms exists so a follower's DERP carrier is up
+before the initiation arrives; a dropped initiation waits out boringtun's 5 s
+retransmit.
+
+The same applies to every make-before-break upgrade: a relay → direct probe was
+also promoted on the tick, and now promotes at its latch.
 
 ## Worker co-location — one pick, everywhere (invariant I6)
 

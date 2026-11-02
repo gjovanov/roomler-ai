@@ -1675,9 +1675,14 @@ pub fn run(
                         // Ctrl+Alt+Del. A worker running as the person cannot
                         // signal it (SYSTEM only), and says so in its hello.
                         let sas_args = super::sas_relay::worker_args();
+                        // FR-119 P2b-16 — the lease this worker, which runs
+                        // as the person, renews for full GPU clocks above
+                        // 60 fps; this (SYSTEM) host is what pins them.
+                        let pin_args = super::gpu_pin_relay::worker_args();
                         let mut spawn_args: Vec<&str> = args_borrow.clone();
                         spawn_args.extend(ev_args.iter().map(String::as_str));
                         spawn_args.extend(sas_args.iter().map(String::as_str));
+                        spawn_args.extend(pin_args.iter().map(String::as_str));
                         // SAFETY: `spawn_handle` is a live primary/user
                         // token — either the WTSQueryUserToken result or
                         // its duplicated elevated linked token; both
@@ -1824,9 +1829,12 @@ pub fn run(
                 // FR-97 P4a — the relay this SYSTEM worker asks for the real
                 // Ctrl+Alt+Del, which only this (the service) process can send.
                 let sas_args = super::sas_relay::worker_args();
+                // FR-119 P2b-16 — the same lease as the user-context arm.
+                let pin_args = super::gpu_pin_relay::worker_args();
                 let mut spawn_args: Vec<&str> = args_borrow.clone();
                 spawn_args.extend(ev_args.iter().map(String::as_str));
                 spawn_args.extend(sas_args.iter().map(String::as_str));
+                spawn_args.extend(pin_args.iter().map(String::as_str));
                 let cmdline = winlogon_token::build_cmdline(&worker_exe, &spawn_args);
                 let res = (|| -> anyhow::Result<Option<OwnedProcess>> {
                     let Some(pid) = winlogon_token::find_winlogon_pid_in_session(sid)
@@ -2550,8 +2558,8 @@ pub unsafe fn spawn_into_job(
 
 /// A `STARTUPINFOEXW` whose handle list bounds inheritance to the handles
 /// given, and only those.
-struct InheritOnly {
-    si: STARTUPINFOEXW,
+pub(crate) struct InheritOnly {
+    pub(crate) si: STARTUPINFOEXW,
     // `si.lpAttributeList` points into this.
     _attrs: Vec<u8>,
     // The handle-list attribute points at this.
@@ -2559,7 +2567,7 @@ struct InheritOnly {
 }
 
 impl InheritOnly {
-    fn new(handles: Vec<HANDLE>) -> Result<Self> {
+    pub(crate) fn new(handles: Vec<HANDLE>) -> Result<Self> {
         let mut bytes: usize = 0;
         // SAFETY: the sizing call, DOCUMENTED to fail and write the size.
         unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut bytes) };

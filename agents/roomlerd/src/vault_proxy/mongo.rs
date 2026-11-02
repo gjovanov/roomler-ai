@@ -40,6 +40,9 @@ pub(crate) struct Upstream {
     /// The database the user is defined in (`authSource`).
     pub(crate) auth_source: String,
     pub(crate) tls: tokio_rustls::TlsConnector,
+    /// FR-90 P4-6-1b-2 — where the TCP goes: `host:port`, or a flow's end
+    /// toward it; TLS is verified against `host` either way.
+    pub(crate) dial: super::Dial,
 }
 
 pub(super) const OP_REPLY: i32 = 1;
@@ -122,18 +125,11 @@ async fn start(up: &Upstream) -> Result<TlsStream<TcpStream>, String> {
 /// TCP to the upstream, then TLS from its first byte, verified.
 async fn connect(up: &Upstream) -> Result<TlsStream<TcpStream>, String> {
     let name = tls::server_name(&up.host)?;
-    let tcp = tokio::time::timeout(
-        CONNECT_DEADLINE,
-        TcpStream::connect((up.host.as_str(), up.port)),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "{}:{} did not answer within {CONNECT_DEADLINE:?}",
-            up.host, up.port
-        )
-    })?
-    .map_err(|e| format!("{}:{}: {e}", up.host, up.port))?;
+    let to = super::dialled(&up.host, up.port, up.dial);
+    let tcp = tokio::time::timeout(CONNECT_DEADLINE, super::tcp_to(&up.host, up.port, up.dial))
+        .await
+        .map_err(|_| format!("{to} did not answer within {CONNECT_DEADLINE:?}"))?
+        .map_err(|e| format!("{to}: {e}"))?;
     up.tls
         .connect(name, tcp)
         .await

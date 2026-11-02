@@ -100,8 +100,25 @@
               @toggle-pin="handleTogglePin"
               @request-pip="handlePiP"
               @spotlight="handleSpotlight"
+              @picture-black="handlePictureBlack"
+              @visible="handleTileVisible"
             />
 
+            <!-- FR-124 — YOUR camera is sending a black picture: said where you
+                 look, not only on a small self-view tile. Closing it hides it
+                 until the picture shows something and turns black again. -->
+            <v-alert
+              v-if="joined && localPictureBlack && !blackWarningClosed"
+              class="black-picture-warning"
+              type="warning"
+              density="compact"
+              variant="elevated"
+              closable
+              data-testid="black-picture-warning"
+              @click:close="blackWarningClosed = true"
+            >
+              {{ $t('call.blackPicture') }}
+            </v-alert>
           </div>
 
           <!-- Files panel -->
@@ -236,6 +253,8 @@ import { useSnackbar } from '@/composables/useSnackbar'
 import { useAudioPlayback } from '@/composables/useAudioPlayback'
 import { useConferenceLayout } from '@/composables/useConferenceLayout'
 import { usePictureInPicture } from '@/composables/usePictureInPicture'
+import { useBlackPictureTiles } from '@/composables/useBlackPictureTiles'
+import type { TileVisibility } from '@/utils/viewReport'
 import LayoutSwitcher from '@/components/conference/LayoutSwitcher.vue'
 import ConferenceFilesPanel from '@/components/conference/ConferenceFilesPanel.vue'
 import MessageBubble from '@/components/chat/MessageBubble.vue'
@@ -389,6 +408,31 @@ function handleTogglePin(streamKey: string) {
 function handleSpotlight(streamKey: string) {
   layoutCtrl.toggleSpotlight(streamKey)
 }
+
+// FR-124 — your own camera's picture is black (a covered lens, a closed
+// privacy shutter): the warning over the call says so. Only YOUR camera earns
+// it, since you are the one who can uncover it; a peer's black picture is
+// named on their tile.
+const blackPictures = useBlackPictureTiles()
+const localPictureBlack = computed(() => blackPictures.isBlack('local'))
+const blackWarningClosed = ref(false)
+
+function handlePictureBlack(streamKey: string, black: boolean) {
+  blackPictures.report(streamKey, black)
+}
+
+// FR-127 P1 — receive what is visible: the tiles on screen, from the tiles
+// themselves, go to the store, which tells the server which video to send.
+// Off screen means the server pauses that video; audio always flows.
+function handleTileVisible(streamKey: string, report: TileVisibility) {
+  conferenceStore.reportTileVisible(streamKey, report)
+}
+
+// A warning closed by hand stays closed only for this black spell: once the
+// picture shows something, the next black spell warns again.
+watch(localPictureBlack, (black) => {
+  if (!black) blackWarningClosed.value = false
+})
 
 /**
  * FR-25 — the tile lookup depends on `data-stream-key`, which no layout was
@@ -742,5 +786,16 @@ onUnmounted(() => {
     z-index: 5;
     border-left: 0;
   }
+}
+/* FR-124 — over the top of the call, clear of the controls bar, never wider
+   than the stage on a phone. Under the chat overlay (z 5) when that is open. */
+.black-picture-warning {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: min(560px, calc(100% - 16px));
+  z-index: 4;
 }
 </style>

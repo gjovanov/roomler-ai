@@ -39,7 +39,7 @@ flowchart LR
 The org relay is a **third kind of relay, not a new tier**. The ladder is still LAN
 → public → srflx hole-punch → relay. A relay carrier is now one of three `RelayKind`s,
 `Turn`, `Derp` or `Org`
-([`relay_link.rs:160`](../crates/tunnel-core/src/overlay/relay_link.rs#L160)), and
+([`relay_link.rs:166`](../crates/tunnel-core/src/overlay/relay_link.rs#L166)), and
 DERP over TLS :443 stays the floor under all of them. The org relay shows in the CONN
 column as `relay:org/udp`.
 
@@ -52,7 +52,7 @@ behaviour too. Adding a transport behind the existing `RelayConn` seam (`OrgRela
 changed none of the send path, the router or the carrier plane.
 
 Which relay a pair uses is decided in this order
-([`relay_link.rs:1052`](../crates/tunnel-core/src/overlay/relay_link.rs#L1052)):
+([`relay_link.rs:1161`](../crates/tunnel-core/src/overlay/relay_link.rs#L1161)):
 
 | priority | source | why it sits there |
 |---|---|---|
@@ -74,7 +74,7 @@ actor can turn one device into the org's traffic chokepoint.
 
 | # | gate | owner | default | where |
 |---|---|---|---|---|
-| 1 | org switch `peer_relay_mode` — `off` · `warn` · `on` | the org owner (`MANAGE_TENANT`) | `off` | [`models.rs:2714`](../crates/remote_control/src/models.rs#L2714) |
+| 1 | org switch `peer_relay_mode` — `off` · `warn` · `on` | the org owner (`MANAGE_TENANT`) | `off` | [`models.rs:2893`](../crates/remote_control/src/models.rs#L2893) |
 | 2 | overlay ACL grants **each** member the relay node | the policy author | no grant | [`org_relay.rs:377`](../crates/modules/network/src/org_relay.rs#L377) |
 | 3 | per-device approval `peer_relay_policy.serve` | the fleet admin (`MANAGE_AGENTS` **and** `EXEC_DEVICE`) | `false` | [`routes/peer_relay.rs:53`](../crates/modules/network/src/routes/peer_relay.rs#L53) |
 | 4 | the relay device's own `relay_server_enabled` | the relay host's owner, **locally** | off | [`orgrelay/mod.rs:36`](../crates/tunnel-core/src/overlay/orgrelay/mod.rs#L36) |
@@ -388,13 +388,13 @@ the capacity gained: the relay was in France and the members in Austria and Germ
 |---|---|
 | the mint: gates, ranking, session, push | [`crates/modules/network/src/org_relay.rs`](../crates/modules/network/src/org_relay.rs) — `plan_mint` `:377`, `maybe_mint` `:544`, revoke `:742`–`:815` |
 | admin routes + approval policy | [`crates/modules/network/src/routes/peer_relay.rs`](../crates/modules/network/src/routes/peer_relay.rs) |
-| modes, policy, limits, deny reasons, audit row | [`crates/remote_control/src/models.rs`](../crates/remote_control/src/models.rs) `:2212`–`:2388` |
+| modes, policy, limits, deny reasons, audit row | [`crates/remote_control/src/models.rs`](../crates/remote_control/src/models.rs) `:2303`–`:2489` |
 | wire framing and shape rules | [`orgrelay/wire.rs`](../crates/tunnel-core/src/overlay/orgrelay/wire.rs) |
 | the authenticated bind | [`orgrelay/bind.rs`](../crates/tunnel-core/src/overlay/orgrelay/bind.rs) |
 | the relay's session table (pure) | [`orgrelay/session.rs`](../crates/tunnel-core/src/overlay/orgrelay/session.rs) |
 | the relay server + counters | [`orgrelay/server.rs`](../crates/tunnel-core/src/overlay/orgrelay/server.rs), [`agents/roomlerd/src/relay_server.rs`](../agents/roomlerd/src/relay_server.rs) |
 | the member: bind + `OrgRelayConn` | [`orgrelay/client.rs`](../crates/tunnel-core/src/overlay/orgrelay/client.rs) |
-| the member's coordinator | [`relay_link.rs`](../crates/tunnel-core/src/overlay/relay_link.rs) — `relay_strategy` `:1052`, `org_request_bind` `:1946`, `commit_org_bind` `:1972` |
+| the member's coordinator | [`relay_link.rs`](../crates/tunnel-core/src/overlay/relay_link.rs) — `relay_strategy` `:1161`, `org_request_bind` `:2055`, `commit_org_bind` `:2081` |
 | pod-offload metric | `derp_bytes_relayed_total`, [`crates/api/src/cluster/metrics.rs:62`](../crates/api/src/cluster/metrics.rs#L62) |
 
 ## Not built

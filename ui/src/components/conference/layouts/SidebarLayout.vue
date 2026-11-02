@@ -17,13 +17,17 @@
         object-fit="contain"
         :show-actions="true"
         :stream-key="p.streamKey"
+        :is-screen-share="p.isScreenShare"
         @toggle-pin="$emit('toggle-pin', p.streamKey)"
         @request-pip="$emit('request-pip', p.streamKey)"
         @spotlight="$emit('spotlight', p.streamKey)"
+        @picture-black="$emit('picture-black', p.streamKey, $event)"
+        @visible="$emit('visible', p.streamKey, $event)"
       />
     </div>
 
-    <!-- Sidebar strip -->
+    <!-- Sidebar strip — scrolls down: a tile past its edge is off screen,
+         and its IntersectionObserver says so (FR-127 P1). -->
     <div v-if="secondary.length > 0" class="sidebar-strip">
       <VideoTile
         v-for="p in secondary"
@@ -39,9 +43,12 @@
         :show-actions="true"
         :stream-key="p.streamKey"
         :object-fit="p.isLocal && selfViewMode === 'in-grid-uncropped' ? 'contain' : 'cover'"
+        :is-screen-share="p.isScreenShare"
         @toggle-pin="$emit('toggle-pin', p.streamKey)"
         @request-pip="$emit('request-pip', p.streamKey)"
         @spotlight="$emit('spotlight', p.streamKey)"
+        @picture-black="$emit('picture-black', p.streamKey, $event)"
+        @visible="$emit('visible', p.streamKey, $event)"
       />
     </div>
 
@@ -59,6 +66,7 @@
         :compact="true"
         object-fit="contain"
         @spotlight="$emit('spotlight', $event)"
+        @picture-black="$emit('picture-black', selfParticipant.streamKey, $event)"
       />
     </div>
   </div>
@@ -67,6 +75,7 @@
 <script setup lang="ts">
 import VideoTile from '@/components/conference/VideoTile.vue'
 import type { LayoutParticipant, SelfViewMode } from '@/composables/useConferenceLayout'
+import type { TileVisibility } from '@/utils/viewReport'
 
 defineProps<{
   primary: LayoutParticipant[]
@@ -84,6 +93,11 @@ defineEmits<{
   'toggle-pin': [streamKey: string]
   'request-pip': [streamKey: string]
   spotlight: [streamKey: string]
+  /** FR-124 — a tile's picture turned black (or stopped being black). */
+  'picture-black': [streamKey: string, black: boolean]
+  /** FR-127 P1 — a remote tile came on screen or left it: the big tile, and
+      the strip tiles inside the strip's viewport. */
+  visible: [streamKey: string, report: TileVisibility]
 }>()
 </script>
 

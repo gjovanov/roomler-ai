@@ -291,6 +291,12 @@ pub async fn export(
                 let e = make(frame.width, frame.height)
                     .map_err(|e| ExportError::Encoder(format!("{e:#}")))?;
                 encoder_name = e.name().to_string();
+                // #2877: the software rung encodes a picture above openh264's
+                // limit scaled down to fit (a hardware recording that large
+                // exported where only software is left). The track gives the
+                // size the stream holds, as the recorder's does.
+                let (track_width, track_height) =
+                    e.coded_dims().unwrap_or((frame.width, frame.height));
                 encoder = Some(e);
                 #[cfg(feature = "audio")]
                 let audio_track = audio.as_ref().map(|a| a.track());
@@ -300,8 +306,8 @@ pub async fn export(
                     FragmentedWriter::create(
                         &partial,
                         VideoTrack {
-                            width: frame.width,
-                            height: frame.height,
+                            width: track_width,
+                            height: track_height,
                             fps,
                             color: ColorInfo::BT601_LIMITED,
                         },

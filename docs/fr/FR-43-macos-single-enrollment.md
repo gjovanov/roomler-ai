@@ -1,8 +1,8 @@
 # FR-43: One macOS device row — a supervising daemon and an unenrolled GUI worker
 
-**Status:** P0 + P1 + **P2 complete and field-verified** (0.4.33 → 0.4.43) — the daemon's row streams real pixels; P2c/P3 next. Tracking issue: `FR-43`.
+**Status:** P0, P1, P2, P2c and P2d are shipped and field-verified (0.4.33 → 0.4.192): the daemon's row streams real pixels, accepts input and reports the worker's permissions, and a package update no longer undoes that. **P3 is not built**, so a Mac is still two rows. It waits on the three decisions under [Open decisions](#open-decisions). A worst-phase `kill -9` of the worker takes 6.19 s on 0.4.192, down from 10.09 s on 0.4.191. Tracking issue: `FR-43`.
 
-⚠️ Anchors RE-VERIFIED against master `9700e9ff` on 2026-09-06, when this record was
+⚠️ Anchors RE-VERIFIED against master `c6e8ec58` on 2026-09-06, when this record was
 landed 27 releases after the field run. `remote_control`'s hub moved to
 `crates/modules/fleet/src/hub.rs` in the interim and every citation to it was stale —
 which is exactly why the convention asks for a master sha rather than a bare line number.
@@ -80,7 +80,7 @@ Anchors below verified against master `3980e79d`.
 ### ⚠️ First, a correction to "Key design" above: P2 has no Windows precedent
 
 "Port our own Windows supervisor to launchd" is true of **P1 and only P1**. The Windows
-SCM service is a *pure launcher*: `win_service/mod.rs:400` hands off to
+SCM service is a *pure launcher*: `win_service/mod.rs:404` hands off to
 `supervisor::run(worker_exe, vec!["run"], …)` and does nothing else, so the spawned worker
 is the entire agent — control WS, overlay, capture, input, all in one process. Windows
 never had to split the planes, because a SYSTEM process can attach to the interactive
@@ -126,7 +126,7 @@ session setup and then nothing.
 ### The transport problem, stated honestly
 
 LocalAPI is **strictly request→response**: `serve_connection` reads newline-delimited JSON,
-answers each line, and loops to EOF (`crates/localapi/src/lib.rs:1741`); `TailLog`'s
+answers each line, and loops to EOF (`crates/localapi/src/lib.rs:1762`); `TailLog`'s
 own doc calls itself "poll-based follow (no streaming)" (`lib.rs:1074`). There is no server
 push, and delegation needs it in both directions — trickle ICE arrives whenever the network
 decides, not when someone asks.
@@ -247,7 +247,7 @@ touched: dispatch it on the branch before merging.
 
 ## P2c design — the daemon's row stops calling itself "not a capture target"
 
-Measured against master `9700e9ff` (2026-09-06).
+Measured against master `c6e8ec58` (2026-09-06).
 
 P2b made the daemon's row able to stream real pixels. It still advertises
 `permissions: ["no-gui-session"]`, so the dashboard renders it as *not a capture
@@ -356,6 +356,53 @@ by hand or pushed to the per-user row. For a kill switch that is the point, sinc
 one account must not undo a switch set for the machine. To give the per-user row
 its own value, clear the root's.
 
+### A worker never outlives its daemon (#2987, 2026-10-27)
+
+The process group that lets `stop_worker` take the whole chain down is also why
+the chain survived a daemon that never reached `stop_worker`: the watchdog's
+`exit(2)` after a 69 s stall, on the operator's MacBook on 2026-10-26. The
+orphaned 0.4.174 worker kept the person's single-instance lock through the
+0.4.175 and 0.4.177 updates. Every new worker exited 0 on that lock, the
+supervisor gave up naming "no per-user enrollment", and the orphan's re-attach
+was refused as a `secret mismatch` every 30 s.
+
+| | as built |
+|---|---|
+| **Lifeline** | `spawn_worker` writes `stdin_handoff`: the secret, then `roomler-lifeline/1`, in one write. It keeps its end of the pipe in a static that lives as long as the daemon process (`agents/roomlerd/src/macos_supervisor.rs:651`, `:530`, `:347`). The worker's stdin thread reads the secret, then the offer, then blocks until end-of-file (`stdin_link`, `:405`), and leaves through the internal shutdown (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). |
+| **Reap** | At start and after a worker exits 0 within `HEALTHY_RUN`, a daemon that holds no worker stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:820`, `:457`). SIGTERM, then up to `REAP_GRACE` (20 s, more than the worker's `LIFELINE_BACKSTOP` of 15 s), then SIGKILL. |
+| **Diagnosis** | The give-up reads the last worker's end: code 0 is a held lock, anything else the enrollment hint (`macos_supervisor.rs:475`). |
+
+An adversarial review before the merge found three edges, all fixed in the same PR:
+
+| Edge | Fix |
+|---|---|
+| With a 2 s grace, the next daemon's reap could SIGKILL a worker of this release that was still in its own clean stop. The worker no longer hears the SIGTERM, so the kill came before its clean-run mark and counted a crash on the person's config. | `REAP_GRACE` exceeds `LIFELINE_BACKSTOP`, and a compile-time assert holds the order |
+| A reap that stopped something reset the give-up count. Two spawners of `run --supervised` (two root daemons on different `--config`s, each with its own lock) would then stop each other's workers forever. | The exit still counts: `MAX_FAST_EXITS` bounds it |
+| A reap with the LaunchAgent loaded left no user half. launchd's worker had exited 0 on the held lock and is never retried, and `LaunchdOwns` kickstarts only a debt. | A reap that stopped anything while the LaunchAgent is loaded owes `KICKSTART_RETRIES` |
+
+The proposal on the issue was different, and both changes were deliberate:
+
+- **Not "exit on delegation EOF plus `secret mismatch`".** The refusal is silent
+  by design (`delegate::serve` sends no reason), so the worker cannot tell a
+  refusal from a restart that is still in progress. The pipe's end-of-file is
+  certain: the kernel closes the write end when the daemon process ends, however
+  it ends.
+- **Not "record the pgid in a runtime file".** A daemon from before #2987 never
+  wrote one, so the workers already stranded in the field would stay stranded.
+  Matching the exact command line also finds those workers, and it carries no
+  stale-pid risk.
+
+**Field-verified on 0.4.181 (2026-10-28, the operator's MacBook).** After a
+`kill -9` of the daemon, the worker left 5.7 ms later through a clean stop, and the
+next daemon's worker attached 472 ms after the kill. A stand-in for an older worker
+had its argv set to exactly `<exe> run --supervised`, and the next daemon's reap
+stopped it 107 ms before spawning. A `SIGSTOP`ped worker cannot stand in for an old
+one: the kernel's SIGHUP to an orphaned, stopped process group ends it first.
+
+Operator-facing detail, the mixed-version matrix, the field runs and the remedy
+for a stuck Mac: `docs/installation.md`, "The GUI worker never outlives its
+daemon".
+
 ### Components
 
 | where | change |
@@ -417,28 +464,95 @@ scripts — *"`#!/bin/sh\r` … fails to configure on EVERY host"* — had no ma
 counterpart despite the identical failure mode under PackageKit. Pinned
 `text eol=lf` alongside this change.
 
+## P3 design — one enrollment (not built)
+
+Read against master `cd3c7882c` on 2026-10-31. Nothing in this section is built or run, apart
+from the two REDs. It waits on [Open decisions](#open-decisions), and the first of those can
+change it.
+
+**P3 is still needed.** MacBook-1 is two rows, the worker holds its own enrollment and its own
+control WS, and FR-129's pairing gives one approval but two tokens. The P2 layout makes that
+enrollment load-bearing:
+
+| What stops one row today | Where | Measured on 0.4.191 |
+|---|---|---|
+| The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `signaling.rs:2762` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
+| `run` refuses to start with no config | `app.rs:3718` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
+| Delegation is primary-org only, on purpose | `signaling.rs:3365-3369` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes |
+
+**Recommended: a stand-in for the control plane, in the worker's process.** When `--supervised`
+finds no enrollment, the worker binds `127.0.0.1:0`, runs a small WS server that accepts, answers
+pings and discards, and points `ws_url` at it. `connect_once` then runs unchanged, so the warning
+in [Order of work](#order-of-work) about the shared session-setup path does not apply to the
+worker's side. The switch is "no per-user enrollment", with no new flag, so a two-row Mac stays on
+P2 byte for byte.
+
+Rejected: a `ControlLink` enum over the WS. It looks small at `send_frame` and `ws.next()`, but
+the receive deadline and the ping arms would each need a detached branch.
+
+The stand-in still has to handle:
+
+- A synthesized config persisted to disk, because `caps`, `record` and `config set` all load the
+  file.
+- The appdirs directory existing before `instance_lock::acquire`.
+- No log upload, crash upload or `/health` preflight with an empty token. The worker's
+  `agent_logs` are lost, and that is a known gap.
+- The companion not reading an empty `agent_id` as "not enrolled".
+
 ## Acceptance criteria
 
 - [ ] A fresh install with **one** token produces **one** device row, and that row serves
       both a remote-desktop session and `roomler ssh`.
-- [ ] `roomler exec <mac>` reaches root-owned paths **and** the GUI session's log from the
+- [x] `roomler exec <mac>` reaches root-owned paths **and** the GUI session's log from the
       same row (today this needs two different rows).
-- [ ] After a reboot with **nobody logged in**, the Mac is present in `roomler peers` and
+      *(2026-10-31, 0.4.190, read-only on MacBook-1. It needs no P3: the "two rows" above was
+      already wrong for reads. The daemon's row runs as `root`, lists the `-rw------- root wheel`
+      `/etc/roomler/config.toml`, and `tail`s the worker's log under the person's Library. On
+      the per-user row the same `cat` answers `Permission denied`, which is the control.)*
+- [~] After a reboot with **nobody logged in**, the Mac is present in `roomler peers` and
       `roomler ssh` works — the capability the daemon half exists for.
-- [ ] A remote-desktop session started while logged in streams real pixels and accepts
+      *(2026-10-31, 0.4.191, tart Mac. The mesh half is met: auto-login removed and rebooted, the
+      console owned by root, 0 sessions, no `gui/501`, the daemon the only `roomlerd`. The Mac's
+      `roomler peers` showed the anchor on `relay:derp/tcp`, a `roomler ping` to it round-tripped
+      in 37.0 ms, the anchor's `peers` listed the Mac, and the per-user row went offline, which is
+      the control. No ping started from the far side: the anchor runs 0.4.48, whose `roomler
+      ping` errored, and its container has no `ping`. **`roomler ssh` is not measured**: the
+      vmtest org's `remote_ssh_enabled` is off, and an org switch is the operator's to flip.)*
+- [~] A remote-desktop session started while logged in streams real pixels and accepts
       input, with `caps` reporting `has_input_permission: true` and **no TCC re-prompt**.
+      *(2026-10-31, 0.4.191. Pixels, input and `has_input_permission: true` are met, in one
+      delegated session on the daemon's row of a throwaway tart Mac: field log. **The re-prompt
+      half is partly met, and a VM cannot finish it.** MacBook-1's 67 retained worker starts
+      across 41 versions (0.4.141 → 0.4.190) each logged both grants held, but that log line
+      reads the grant, not the screen. The VM's own grant is seeded, and macOS still showed
+      its screen-recording confirmation over a working stream. Whether a person on a real Mac
+      is asked again is the operator's to say.)*
 - [ ] `codesign -d -r-` on the bundle is byte-identical before and after the migration.
 - [x] P2c: with a worker attached, the daemon's row reports `screen-capture` +
       `input` and the dashboard stops calling it "not a capture target".
       *Field-verified 2026-09-24 end to end — the daemon's send AND the row the dashboard
       renders from (field log). The daemon's own hello reports `no-gui-session`, so the
       row can only say otherwise through the P2c heartbeat path.*
-- [ ] P2c: when the worker DETACHES, the row goes back to `no-gui-session`
+- [x] P2c: when the worker DETACHES, the row goes back to `no-gui-session`
       within one heartbeat — a stale "capture target" is worse than an honest
       "not one", because the next session gets a black screen.
-- [ ] P2c: a device with no worker (every non-macOS agent, and a macOS one with
-      the switch off) sends no `caps` on its heartbeats at all — measured on the
-      wire, not inferred from behaviour.
+      *(2026-10-31, 0.4.191, tart Mac. A detach longer than a heartbeat, which the 09-24 run
+      could not get: the LaunchAgent bootstrapped back, the supervisor handed over, and the
+      channel closed at 19:59:47.8Z. The row read `no-gui-session` on the heartbeat of
+      19:59:54.2Z, 6.4 s later, while the per-user row stayed online. Booted out again, the
+      worker attached at 20:00:53.3Z and the row read `screen-capture` + `input` on the
+      heartbeat of 20:00:54.2Z. No offline sample in 61.)*
+- [~] P2c: a device with no worker (every non-macOS agent, and a macOS one with
+      the switch off) sends no `caps` on a steady heartbeat, and exactly one when
+      what it advertises changes — measured on the wire, not inferred from
+      behaviour.
+      *(Reworded 2026-10-31: it said "no `caps` at all", which stopped being true when later
+      FRs made more of the caps live, so a heartbeat now re-announces on any change
+      (`signaling.rs:2350-2361`). Measured with a capture server on released agents, a live
+      `rc_clipboard off` as the same-run control. Linux 0.4.190: 15 heartbeats, 14 without
+      `caps`, one 16 s after the flip. macOS 0.4.190, root daemon, key absent, hello
+      `no-gui-session`: 5 without, one after the flip, then none. **Windows is not measured**:
+      it takes the same `Delegation::Off` as Linux, and that is inference.)*
 - [x] P2d: a supervised Mac takes a package **update** and delegation is still
       armed afterwards — `gui/<uid>/com.roomler.agent` is not loaded, the plist
       is gone from `~/Library/LaunchAgents`, and a session started after the
@@ -457,14 +571,37 @@ counterpart despite the identical failure mode under PackageKit. Pinned
       the black-screen-with-working-input result, which is why P2d exists.
       Re-creating it today would mean downgrading the operator's Mac to a pre-P2d
       build.)*
-- [ ] P2d: a Mac with the daemon opted in but the supervise key **absent** takes
+- [x] P2d: a Mac with the daemon opted in but the supervise key **absent** takes
       the same update and keeps its LaunchAgent — the five unchanged states are
       what makes this safe to ship to every Mac, not just the supervised one.
-- [ ] `kill -9` on the GUI worker respawns it within 10 s **without** the control WS
+      *(2026-10-31, `installer -pkg` 0.4.190 → 0.4.191 on a tart Mac, the key line deleted and
+      `grep -c` reading 0 just before it: the LaunchAgent came back with a new pid and
+      `runs = 1`, its plist stayed, no `--supervised` process. The key = `false` state held the
+      same way from 0.4.189 to 0.4.190. Control on the same Mac: the key `true` and the same
+      package, and the job was gone, the plist removed, and the worker `--supervised`.
+      ⚠️ `enroll` and the daemon's own saves write the key as `false`, so a real Mac that
+      never touched it reads `false`, not absent.)*
+- [x] `kill -9` on the GUI worker respawns it within 10 s **without** the control WS
       dropping (measured: the device row never goes offline).
+      *(2026-11-01, released 0.4.192, tart Mac, 10 kills phase-locked to the supervisor's tick:
+      1.36–6.19 s from the kill to the channel attached, 0 offline samples in 108, no reconnect.
+      RED on 0.4.191, same rig and phases: 5.29–10.09 s, so the worst phase missed the 10 s. The
+      fix wakes on the backoff (`next_tick_in`).)*
 - [ ] An existing two-row Mac migrates to one row keeping its overlay address, and the
       retired row is tombstoned per `release_overlay_node`'s ordering (never re-issued).
-- [ ] With the kill switch off, behaviour is byte-for-byte today's.
+- [x] With the kill switch off, behaviour is byte-for-byte today's.
+      *(2026-10-31, tart Mac, switch off. On 0.4.190: no `--supervised` process, no
+      `/var/run/roomler-delegate`, no supervisor or delegation line in the root log, launchd
+      owning the worker, and the heartbeats of the AC8 row. On 0.4.191 a real viewer on the
+      per-user row streamed lit pixels, and the daemon's row logged `no_display` and showed
+      none. That is the pre-P1 pair. In the code the switch stops the supervisor before it does
+      anything (`macos_supervisor.rs:977-984`). "Byte-for-byte" is read off those surfaces;
+      nothing here diffs two builds.)*
+- [ ] **Docs:** `docs/installation.md` describes the one-row Mac, with a mermaid diagram of the
+      daemon, the worker and the delegation channel, its migration and its kill switch, under
+      the `docs/README.md` index row it already has, and `docs/platform-support.md` stops
+      saying two rows. *(The layout that ships today is documented there, with the diagram, as
+      of 2026-10-31. This stays open until P3 changes it.)*
 
 ## Dead hypotheses — do not re-run these
 
@@ -503,9 +640,15 @@ counterpart despite the identical failure mode under PackageKit. Pinned
 
 ## Open decisions
 
-- Spawn mechanism: `launchctl asuser` from the daemon vs a daemon-managed LaunchAgent
-  (the postinstall already bootstraps into `gui/<uid>` — `packaging/macos/postinstall:108`).
-- Migration: delete or tombstone the retired per-user row, and who initiates it.
+- Spawn mechanism: settled by the field. P1 to P2d run `launchctl asuser` from the daemon,
+  verified through every release since 0.4.36.
+- **Secondary orgs on a one-row Mac** (found 2026-10-31, the operator's). Today's per-user
+  half is what streams in a secondary org, and P3 removes it. Delegating those sessions
+  reverses the rule at `signaling.rs:3365-3369`. Windows and Linux already serve them, with
+  the consent prompt naming the org (`docs/multi-org.md` §8b). The other choices are no remote
+  desktop on a Mac's secondary rows, or leaving a multi-org Mac on two rows.
+- Migration: delete or tombstone the retired per-user row, and who initiates it. An org only
+  the per-user half holds needs a root enrollment first, or it is dropped.
 - Whether the worker keeps a *dormant* enrollment as the P2 fallback, or is fully
   unenrolled from the start.
 
@@ -517,8 +660,8 @@ companion.
 
 ## Field-verification log
 
-All of it on the operator's MacBook (Apple Silicon), driven
-remotely — `roomler exec` for P0, `roomler ssh` on the daemon row from P1 onwards.
+On the operator's MacBook (Apple Silicon), driven remotely — `roomler exec` for P0,
+`roomler ssh` on the daemon row from P1 onwards — until the throwaway tart Macs of 2026-10-23 on.
 
 ### 2026-08-30 — P0 spike: the mechanism works, and one half was never measured
 
@@ -804,3 +947,131 @@ The underlying fix is **P3**: one enrollment, one file, the worker's session kno
 down as `WORKER_ENV_FORWARD` already does. Whether the console user may set the root
 half's device-owned gates from the app *before* P3 — a new authorization path on the
 person socket — is the decision open on #2871.
+
+### 2026-10-31 — the open criteria on the released agent (0.4.190 → 0.4.191)
+
+Most of the open criteria had shipped and never been read. MacBook-1 was read only, through
+`roomler exec` and its retained logs. Everything else ran on one throwaway tart Mac (macOS
+15.7.7, 1024 × 768, grants seeded into TCC, both halves in the vmtest org), driven from mars and
+deleted afterwards. Nothing on MacBook-1 itself was changed, and every package was a released
+`.pkg`.
+
+**Switch off, then the update (AC10, AC13).** The row, the plist and the process list read the
+same before and after, and the session pair is the pre-P1 pair:
+
+| | key `false`, 0.4.190 | key line deleted, then 0.4.190 → 0.4.191 | key `true`, same package (control) |
+|---|---|---|---|
+| `gui/501/com.roomler.agent` | running, pid 782 | running, new pid 1368, `runs = 1` | **`Could not find service`** |
+| `com.roomler.agent.plist` | present | present | **gone** |
+| `run --supervised` processes | 0 | 0 | **1, as uid 501, under the daemon's `sudo`** |
+| `postinstall` said | n/a | `roomlerd installed and started` | `the GUI worker is owned by the ROOT DAEMON` |
+| daemon's row | `no-gui-session` | `no-gui-session` | `screen-capture`, `input`; channel attached 217 ms after the spawn |
+
+With the switch off, a real viewer on the per-user row decoded lit pixels (99.4% lit) in 8.8 s. On
+the daemon's row the same viewer stayed black, and the root log gave the reason:
+`scrap capture unavailable — falling back to NoopCapture … code="no_display"`. That black row is
+the RED for AC4.
+
+⚠️ `grep -c` read 0 before the package and 1 after it: the daemon saved its config and wrote the
+default back. An "absent" key lasts only until the next save.
+
+**One session, pixels and input (AC4).** A viewer drove the daemon's row with the switch on,
+delegated to the worker (`serving a delegated rc message` in its log), `direct`, VP9 4:4:4. What
+arrived was read on the host, by a pointer poller in the console session and a full-screen
+Terminal in raw mode that reports the mouse:
+
+| The viewer sent | The host received |
+|---|---|
+| pointer to (0.25, 0.25), (0.75, 0.25), (0.5, 0.75) | (256, 192), (767, 192), (512, 575) of 1024 × 768 |
+| click at (0.5, 0.75) | `ESC[<0;73;38M` then `ESC[<0;73;38m`: press and release, button 0 |
+| one wheel notch down | `ESC[<65;73;38M` |
+| `hello 123`, then Shift+A | `hello 123A` |
+
+The Terminal echoed those bytes, so the viewer's final screenshot shows the input it sent, in
+pixels from that same session. Run twice with the same bytes. The row read
+`has_input_permission: true` throughout.
+
+⚠️ **The picture also held two macOS dialogs over the desktop:** Local Network for `roomlerd`, and
+Sequoia's screen-recording confirmation (`… may be visible or audible`, *Allow* / *Open System
+Settings*). Neither stopped the stream or the input. The VM's grants were written into TCC by
+hand, so the dialogs here say little about a real install, and they are why this run cannot speak
+to AC4's "no re-prompt". MacBook-1's `macOS permissions: … both granted` line cannot either: it
+reads the grant, while a dialog is something a person sees. The operator can answer that in one line.
+
+**`kill -9` (AC11).** Ten kills, each worker past `HEALTHY_RUN` first, each aimed at a phase of the
+supervisor's 5 s tick. Times are from the kill:
+
+| Kill, after the last tick | Exit seen | Spawned | Channel attached |
+|---|---|---|---|
+| 4.7–5.0 s (3 kills) | 0.03–0.27 s | 5.07–5.33 s | 5.29–5.56 s |
+| 1.1–4.2 s (4 kills) | 0.85–3.87 s | 5.90–8.92 s | 6.12–9.14 s |
+| 0.2–0.4 s (3 kills) | 4.59–4.80 s | 9.65–9.86 s | **9.88–10.09 s** |
+
+The cause was in the loop: an exit is seen on a tick, the 1 s backoff is set, and the next check
+waits a whole `POLL`, so the 1 s cost 5. The fix sleeps only to the end of the backoff. A
+backoff that has passed stays a normal tick, because the arms that do not spawn leave `wait_until`
+set and a zero sleep would spin the loop.
+
+The control WS held: 0 offline samples of 116, and no reconnect line in the root log. Twice a
+heartbeat fell inside the gap, and the row read `no-gui-session` for one heartbeat and then
+recovered. That is AC7's revert happening unprompted.
+
+**A detach longer than a heartbeat (AC7).** The LaunchAgent bootstrapped back to force it:
+
+| When | What |
+|---|---|
+| 19:59:42.5Z | `HandBack(501)`; the supervisor stops its worker |
+| 19:59:47.8Z | `delegation channel closed` |
+| 19:59:54.2Z | the next heartbeat: the row reads `no-gui-session`; the per-user row stays online on launchd's worker |
+| 20:00:49Z | the LaunchAgent booted out |
+| 20:00:53.3Z | `delegation channel attached` |
+| 20:00:54.2Z | the next heartbeat: the row reads `screen-capture`, `input` |
+
+**Nobody logged in (AC3).** Auto-login removed and the guest rebooted, twice. `ssh` answered
+33 s after the reboot, and the mesh was up at the first read, 80 s after it. The per-user row
+stopped at the reboot and stayed offline, which is the control. See the criterion for what was and
+was not measured.
+
+**P3's REDs.** Both on the supervised Mac, with a viewer on the daemon's row afterwards:
+
+| Case | The worker | The supervisor | The viewer on the daemon's row |
+|---|---|---|---|
+| per-user row deleted | exits 7 at every spawn; `rc:goodbye` `AgentDeleted` | backs off, then gives up | no pixels, `no_display` |
+| no per-user config, one root enrollment | exits 1 at every spawn | gives up in about 65 s, naming the missing per-user enrollment | no pixels, `no_display` |
+
+The second case is what one token gives today, so it is AC1's RED. The first is a trap, so
+`docs/installation.md` now warns about it: on a supervised Mac the per-user row looks like a
+duplicate, and deleting it takes the daemon row's remote desktop with it.
+
+🔍 **Found, not fixed: the viewer blames the network.** On both black rows the viewer read *"No
+video from this device after 3 attempts — retrying every 30s. Its network may be blocking the
+connection."* while the agent had logged `no_display` and `telling the controller`. Whether the
+word reached the page is not checked here.
+
+🔍 **A dead end, kept: a live-use check that reads a person into a restart.** The last
+`user_active` on MacBook-1 read 19:05:57Z with `paused_by="local"`, which looked like someone at
+the Mac. It was the worker starting: the line sits beside `restored from the per-person store`,
+and keep busy read `running` 30 s later.
+
+### 2026-11-01 — AC11 on released 0.4.192: the worst kill is 6.19 s
+
+The same tart rig and the same ten phases as the 0.4.191 RED above, on `agent-v0.4.192`. The
+`.pkg`'s SHA-256 starts `81ca6fcefc8714c6` and matches its published sidecar. The guest went from
+0.4.191 to 0.4.192 by `installer` with the key `true`, so the fix arrived the way it reaches a
+real Mac. Times are from the kill:
+
+| Kill, after the last tick | Exit seen | Spawned | Channel attached | Attached on 0.4.191 |
+|---|---|---|---|---|
+| 4.7–4.9 s (2 kills) | 0.08–0.28 s | 1.13–1.33 s | 1.36–1.54 s | 5.29–5.56 s |
+| 1.1–4.1 s (4 kills) | 0.87–3.90 s | 1.92–4.95 s | 2.16–5.16 s | 6.12–9.14 s |
+| 0.1–0.4 s (4 kills) | 4.64–4.93 s | 5.70–5.98 s | **5.91–6.19 s** | 9.88–10.09 s |
+
+The exit is still seen on the 5 s tick, as before. From there a spawn took 1.04–1.06 s at every
+phase, which is the backoff, where it took 5 s on 0.4.191. The channel attached 0.21–0.24 s later.
+One kill aimed at 0.15 s came 95 s after its spawn, by when the tick had drifted 0.23 s, so it
+landed just before a tick and sits in the first row.
+
+The control WS held: 0 offline samples of 108, and no reconnect. The root log's two
+`rc:agent.hello sent` lines are the daemon's own connects, at 02:16:04Z and 02:17:14Z, and the
+first kill came at 02:18:49Z. One heartbeat fell inside a gap, at 02:22:14.9Z: the row read
+`no-gui-session` for that heartbeat and `screen-capture` again at the next. That is AC7's revert.

@@ -632,6 +632,43 @@ impl TenantDao {
             .unwrap_or_default())
     }
 
+    /// FR-129 A1 — every member holding `flag` in `tenant_id`, in two
+    /// queries (the members, the tenant's roles) rather than one
+    /// [`Self::get_member_permissions`] per member: the "device paired"
+    /// notice goes to the org's other `MANAGE_AGENTS` holders, and an org
+    /// can have hundreds of members. The same fold as
+    /// `get_member_permissions`, so the two cannot disagree on who holds a
+    /// bit (`permissions::has` carries the `ADMINISTRATOR` bypass).
+    pub async fn members_with_permission(
+        &self,
+        tenant_id: ObjectId,
+        flag: u64,
+    ) -> DaoResult<Vec<ObjectId>> {
+        let members = self
+            .members
+            .find_many(doc! { "tenant_id": tenant_id }, None)
+            .await?;
+        let roles = self
+            .roles
+            .find_many(doc! { "tenant_id": tenant_id }, None)
+            .await?;
+        let masks: std::collections::HashMap<ObjectId, u64> = roles
+            .iter()
+            .filter_map(|r| r.id.map(|id| (id, r.permissions)))
+            .collect();
+        Ok(members
+            .into_iter()
+            .filter(|m| {
+                let combined = m
+                    .role_ids
+                    .iter()
+                    .fold(0u64, |acc, id| acc | masks.get(id).copied().unwrap_or(0));
+                role::permissions::has(combined, flag)
+            })
+            .map(|m| m.user_id)
+            .collect())
+    }
+
     /// P4 — every member's user id for one tenant, in one query. The
     /// `device:presence` fan-out recipient set (device listing visibility is
     /// member-gated, so presence events follow the same audience). Callers

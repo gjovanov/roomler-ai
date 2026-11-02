@@ -259,6 +259,13 @@ pub struct AgentCaps {
     ///   to photon. Only a build with the synthetic frame source, running
     ///   it, with `ROOMLERD_BENCH=1`, ever advertises it; a viewer sends no
     ///   probe to an agent without it.
+    /// * `color-described` — FR-130: every encoder of this agent that can
+    ///   carry a colour description writes the one it converted with (the
+    ///   BT.601 matrix at limited range, in the SPS VUI, the AV1 sequence
+    ///   header or the VP9 header). Absent on older agents and with the
+    ///   agent's `color_description` switch off: their streams are
+    ///   undescribed, and a decoder guessing BT.709 for HD shifts every
+    ///   saturated colour.
     ///
     /// Empty / unset (older agents) deserialises to `[]` and the browser
     /// keeps the legacy unframed format. The capability is what makes the
@@ -551,6 +558,10 @@ pub struct AgentCaps {
     ///   to the viewer's stage (macOS; a Linux system install, a Wayland
     ///   desktop). Until P3e-2 the viewer offered the toggle on Windows only,
     ///   by OS; it now follows this word, and an absent key still offers it.
+    /// * `encoder-cells` — #3267: cells this host learned not to open, because its
+    ///   probe died in them (`learned-deny`, naming each and how), or #3280: a probe
+    ///   short of time with no cell to name (`probe-short`). For a fleet read: the
+    ///   lists already leave them out, and no viewer control follows it.
     ///
     /// Empty from every agent before P0c: those agents claim what their lists
     /// say, so an absent key never means "unavailable".
@@ -615,12 +626,13 @@ impl Unavailable {
     /// The feature means nothing on this OS: hide the control.
     pub const NOT_APPLICABLE: &'static str = "not-applicable";
     /// The keys [`AgentCaps::unavailable`] may carry, in wire spelling.
-    pub const KEYS: [&'static str; 5] = [
+    pub const KEYS: [&'static str; 6] = [
         "audio",
         "clipboard",
         "clipboard-image-events",
         "sas",
         "display-match",
+        "encoder-cells",
     ];
 
     pub fn new(code: &str, reason: &str) -> Self {
@@ -1275,6 +1287,22 @@ pub enum RpcCap {
     /// (`ROOMLERD_LOCAL_TURN`, default on); a device with no overlay yet
     /// still advertises it and reports `None`.
     LocalRelay,
+    /// FR-128 — this device decides `rc_overlay = auto` for each session at
+    /// the offer (`Request.rc_overlay_auto`): the overlay when its mesh link
+    /// to the viewer's own device is direct, and not otherwise. The hub sends
+    /// `auto`, and hands out the viewer's relay under it, only to a
+    /// connection advertising this; to any other the policy reads as `off`,
+    /// which is D1's answer for an older agent. Advertised while the decision
+    /// is switched on (`ROOMLERD_RC_OVERLAY_AUTO`, default on). Not a prefix
+    /// of another verb, nor another of it.
+    RcOverlayAuto,
+    /// FR-135 R2 — this device states each session's plan on the control
+    /// channel (`rc:media-plan`) and takes the viewer's refresh back
+    /// (`rc:viewer-hz`), so a viewer can read silence on it as a fault, and
+    /// knows the second message will be understood. Advertised while it is
+    /// switched on (`ROOMLERD_MEDIA_PLAN`, default on). Not a prefix of another
+    /// verb, nor another of it.
+    MediaPlan,
 }
 
 impl RpcCap {
@@ -1328,11 +1356,13 @@ impl RpcCap {
             Self::KnowhowTools => "knowhow-tools",
             Self::KnowhowProbe => "knowhow-probe",
             Self::LocalRelay => "local-relay",
+            Self::RcOverlayAuto => "rc-overlay-auto",
+            Self::MediaPlan => "media-plan",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 42] = [
+    pub const ALL: [RpcCap; 44] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1375,6 +1405,8 @@ impl RpcCap {
         Self::KnowhowTools,
         Self::KnowhowProbe,
         Self::LocalRelay,
+        Self::RcOverlayAuto,
+        Self::MediaPlan,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -1599,6 +1631,17 @@ pub struct AccessPolicy {
     /// carries over DERP/TCP reads as a direct host pair.
     #[serde(default)]
     pub rc_overlay: Option<bool>,
+    /// FR-128 — `auto`: each session decides for itself, at the agent's
+    /// offer. It takes the overlay when the mesh link to the viewer's own
+    /// device is direct, and not otherwise. `rc_overlay: true` wins over
+    /// it ([`Self::rc_overlay_mode`]). `None`/`false` (the default, and every
+    /// row older than the field) is not `auto`.
+    ///
+    /// A separate field rather than a third value of `rc_overlay`, so a pod
+    /// or a page older than it reads an `auto` row as `off`, never as a row
+    /// it cannot parse.
+    #[serde(default)]
+    pub rc_overlay_auto: Option<bool>,
     /// FR-99 P3b — what this device's sessions ask of it when the last one
     /// ends: `auto` (lock again if the screen was locked, or nobody was at it,
     /// when the session started) or `always`. Set by a `MANAGE_AGENTS` admin.
@@ -1624,10 +1667,66 @@ pub fn stricter_idle_limit(org_secs: Option<u32>, device_secs: Option<u32>) -> O
     }
 }
 
+/// FR-128 — how a device's remote-desktop sessions may use the overlay: its
+/// [`AccessPolicy::rc_overlay_mode`], carried from the authz gate to the hub
+/// that builds the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RcOverlayMode {
+    /// #1882's default: the agent keeps every overlay address out of the
+    /// session's ICE.
+    #[default]
+    Off,
+    /// The agent decides at its offer, from its mesh carrier to the viewer's
+    /// own device. `far_turn`: did both devices' last netcheck reach the far
+    /// TURN over UDP? `None` = not measured, which the agent reads as "it
+    /// works".
+    Auto { far_turn: Option<bool> },
+    /// Whichever pair ICE finds best, the overlay included.
+    On,
+}
+
+impl RcOverlayMode {
+    /// The `rc_overlay` bool of `rc:request`: only `on` says yes. `auto`
+    /// rides beside a `false`, so an agent that knows only the bool reads
+    /// `off` (FR-128 D1).
+    pub fn is_on(self) -> bool {
+        self == Self::On
+    }
+
+    /// May the hub hand the viewer's loopback relay to this session (FR-121)?
+    /// Under `auto` as under `on`: the relay is an overlay path, and under
+    /// `auto` the agent may yet decide to take it.
+    pub fn hands_out_relay(self) -> bool {
+        self != Self::Off
+    }
+
+    /// For a log line.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto { .. } => "auto",
+            Self::On => "on",
+        }
+    }
+}
+
 impl AccessPolicy {
     /// #1882 — [`Self::rc_overlay`] resolved: off unless explicitly on.
     pub fn rc_overlay_allowed(&self) -> bool {
         self.rc_overlay.unwrap_or(false)
+    }
+
+    /// FR-128 — [`Self::rc_overlay`] and [`Self::rc_overlay_auto`] resolved:
+    /// `on` wins, then `auto`, else `off`. The far-TURN hint is the authz
+    /// gate's to fill in; a policy row has none.
+    pub fn rc_overlay_mode(&self) -> RcOverlayMode {
+        if self.rc_overlay_allowed() {
+            RcOverlayMode::On
+        } else if self.rc_overlay_auto.unwrap_or(false) {
+            RcOverlayMode::Auto { far_turn: None }
+        } else {
+            RcOverlayMode::Off
+        }
     }
 
     /// FR-101 P4b-2 — [`Self::auto_terminate_idle_minutes`] as seconds. `0`
@@ -2037,6 +2136,76 @@ pub struct KeepBusyBrief {
     pub set_by: Option<String>,
 }
 
+/// FR-55 P4 — the device's power posture, as its keeper holds it: the
+/// standing `power_policy`, the power source, and whether the keeper is
+/// holding the machine awake right now. Reported on every heartbeat, and
+/// carried by the suspend announcement (`rc:agent.sleeping`).
+///
+/// A CLAIM by the device, like [`KeepBusyBrief`]: shown, never enforced on.
+/// `policy` is a string for the same additive-wire reason: a policy a newer
+/// agent knows must reach an older dashboard as a word it can print.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PowerBrief {
+    /// `never` · `on-ac` · `always`, as the keeper parsed `power_policy`. A
+    /// typo the keeper read as `never` therefore reads `never` here too.
+    pub policy: String,
+    /// `Some(true)` on mains, `Some(false)` on battery, `None` when the
+    /// device cannot tell. Three-valued for the keeper's own reason
+    /// (`agents/roomlerd/src/power.rs` `Inputs::on_ac`): "on battery" and
+    /// "unknown" must not collapse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_ac: Option<bool>,
+    /// The keeper holds a stay-awake request right now (an IOKit assertion,
+    /// a Windows power request, a logind block inhibitor), for the policy or
+    /// for a live session.
+    pub held: bool,
+}
+
+impl PowerBrief {
+    /// The OS was free to sleep the device: the keeper held nothing. That is
+    /// what "asleep by policy" means. A device that went to sleep with the
+    /// hold in place was put to sleep past it: a closed lid, a person, or the
+    /// OS overruling the hold (FR-55's AC-power finding, 2026-09-24).
+    pub fn by_policy(&self) -> bool {
+        !self.held
+    }
+}
+
+/// FR-55 P4 — the device announced it was going to sleep: when, and its
+/// power posture at that moment. Written on the [`Agent`] row only by the
+/// connection that wrote the row's hello, and removed by the next hello, so
+/// it is the device's LAST word for exactly as long as nothing newer was
+/// heard.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SleepNotice {
+    pub at: DateTime,
+    pub power: PowerBrief,
+}
+
+/// FR-55 P4 — a [`SleepNotice`] as the device lists show it, on a device
+/// that is not online: since when it has been asleep, and its posture when
+/// it went. RFC 3339, like every other time on a device row.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SleepView {
+    pub since: String,
+    pub power: PowerBrief,
+}
+
+impl SleepView {
+    /// The view of a row's notice, for a device whose presence is not
+    /// `online`. A device that is online again is not asleep, whatever its
+    /// row still says, so the caller passes its own presence verdict.
+    pub fn of(notice: Option<&SleepNotice>, online: bool) -> Option<Self> {
+        if online {
+            return None;
+        }
+        notice.map(|n| SleepView {
+            since: n.at.try_to_rfc3339_string().unwrap_or_default(),
+            power: n.power.clone(),
+        })
+    }
+}
+
 /// FR-92 P8 — the keep-busy patterns, by their exact wire names, as the
 /// agent spells them (`agents/roomlerd/src/keep_busy/patterns.rs`
 /// `Pattern::wire`) and the viewer lists them
@@ -2237,6 +2406,16 @@ pub struct Agent {
     /// speak for the GUI worker that runs it. So "unknown", never "off".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_busy: Option<KeepBusyBrief>,
+    /// FR-55 P4 — the device's power posture as its last heartbeat reported
+    /// it. `None` = it does not say (an agent that predates P4), so
+    /// "unknown", never "never".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<PowerBrief>,
+    /// FR-55 P4 — the device announced it was going to sleep and has not
+    /// said hello since. Read only through [`SleepView::of`], which drops it
+    /// for a device that is online again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<SleepNotice>,
     /// P6 — OpenSSH public half of the device's SSH host key, as reported on
     /// its last hello. Published so a caller can verify what it dialled
     /// instead of trusting it on first use.
@@ -2814,6 +2993,34 @@ pub struct DesiredConfig {
     /// per process, which the device reports as `needs_restart`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fps_deny: Option<String>,
+    /// FR-130 P1b — the colour-description switch (`color_description`). A
+    /// tribool on the device, so a push carries a word: `on`, `off`, or
+    /// blank, which CLEARS the device's key back to its built-in default (on),
+    /// as a blank `encoder_cells_deny` clears that list. Pushable with
+    /// `MANAGE_AGENTS` alone, like the two denylists: it is not a gate and
+    /// grants nothing either way. `off` only removes metadata from the
+    /// stream, and `on` writes what the built-in default writes. The server
+    /// stores the word [`parse_pushed_tribool`] reads, spelled as
+    /// [`pushed_tribool_wire`] spells it; the daemon reads the key once per
+    /// process, which the device reports as `needs_restart`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_description: Option<String>,
+    /// FR-132 P1 — the GPU-input denylist (`zero_copy_deny`): comma-separated
+    /// `name:gpu` entries (`hevc_qsv:gpu`) or `none`, the kill switch of
+    /// FR-118's GPU-input cells. Pushable for the reason the two denylists
+    /// above are: it only ever REMOVES a GPU form a device would otherwise
+    /// open, so `MANAGE_AGENTS` is enough, and the server passes it on
+    /// unread, because a device skips an entry it cannot parse. Blank clears
+    /// the device's key (deny nothing). The probe and the config fallbacks
+    /// read it once per process, which the device reports as `needs_restart`.
+    ///
+    /// ⚠️ `zero_copy` ITSELF, the switch that turns the GPU path on, is
+    /// ABSENT and stays absent (FR-132 decision 1): turning a cell ON is a
+    /// decision made on the device, or by a release. `zero_copy` is a PREFIX
+    /// of `zero_copy_deny`, so the test guarding it compares whole keys
+    /// (`the_device_owned_refusals_are_not_pushable`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_copy_deny: Option<String>,
     /// Bumped on every write. The agent reports the revision it has applied,
     /// so "asked for" and "actually running" can be told apart in the UI —
     /// without it, a device that refused the config and one that never heard
@@ -2837,6 +3044,8 @@ impl DesiredConfig {
             && self.ssh_port.is_none()
             && self.encoder_cells_deny.is_none()
             && self.fps_deny.is_none()
+            && self.color_description.is_none()
+            && self.zero_copy_deny.is_none()
     }
 
     /// Whether this request touches the Fleet-RPC grant. Drives the
@@ -2882,6 +3091,11 @@ impl DesiredConfig {
             encoder_cells_deny: _,
             // FR-119 P2b — the same for the frame-rate denylist: it only removes.
             fps_deny: _,
+            // FR-130 P1b — neither: the colour description grants nothing,
+            // whichever way it is pushed.
+            color_description: _,
+            // FR-132 P1 — neither: the GPU-input denylist only removes.
+            zero_copy_deny: _,
             revision: _,
             updated_by: _,
             updated_at: _,
@@ -2890,6 +3104,40 @@ impl DesiredConfig {
             && *ssh_authorized_keys == other.ssh_authorized_keys
             && *ssh_account_mode == other.ssh_account_mode
             && *ssh_port == other.ssh_port
+    }
+}
+
+/// FR-130 P1b — the ONE reading of a tribool pushed through [`DesiredConfig`]
+/// (`color_description`). The server refuses a word this cannot read, and the
+/// device applies a push through it, so the two cannot disagree about a word.
+///
+/// Blank CLEARS the device's key, back to its built-in default. `on` and
+/// `off`, or the words `roomler config set` takes for them (`true`/`false`,
+/// `1`/`0`, `yes`/`no`, in any case), set it. Anything else is `Err`: a device
+/// must never guess which way a word it cannot read was meant.
+pub fn parse_pushed_tribool(v: &str) -> Result<Option<bool>, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "on" | "true" | "1" | "yes" => Ok(Some(true)),
+        "off" | "false" | "0" | "no" => Ok(Some(false)),
+        other => {
+            // Echoed into a 400 and a device's log: a short prefix is enough
+            // to recognise, and a pushed megabyte must not become a log line.
+            let shown: String = other.chars().take(32).collect();
+            Err(format!(
+                "{shown:?} is not on, off, or blank (the device's built-in default)"
+            ))
+        }
+    }
+}
+
+/// The spelling the server stores and pushes for what [`parse_pushed_tribool`]
+/// read: `on`, `off`, or blank (clear the key).
+pub fn pushed_tribool_wire(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "",
     }
 }
 
@@ -3319,6 +3567,13 @@ pub struct VisibleDeviceRow {
     /// device dial it right now? `false` for a device with no overlay node.
     #[serde(default)]
     pub reachable: bool,
+    /// FR-55 P4 — the device is not online because it announced a sleep, at
+    /// this RFC 3339 time. Presence-class, like `last_seen_at`: the moment
+    /// and the fact only. Its power posture stays on the admin listing,
+    /// because a device's `power_policy` is a setting, and a peer sees the
+    /// netmap's view, never the fleet record (the note above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asleep_since: Option<String>,
     /// FR-51 — enrolled as temporary. Serialised only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
@@ -3377,9 +3632,33 @@ mod visible_device_tests {
             magic_dns_fqdn: None,
             tags: vec!["prod".into()],
             reachable: true,
+            asleep_since: None,
             ephemeral: false,
             is_self: false,
         }
+    }
+
+    /// FR-55 P4 — a peer learns THAT a device is asleep and since when, the
+    /// presence-class fact, and never its power posture: `power_policy` is a
+    /// device setting, and settings are the fleet record.
+    #[test]
+    fn a_visible_row_says_asleep_but_never_the_power_policy() {
+        let mut r = row();
+        r.presence = "offline".into();
+        r.is_online = false;
+        r.asleep_since = Some("2026-10-30T12:00:00Z".into());
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["asleep_since"], "2026-10-30T12:00:00Z");
+        for forbidden in ["power", "policy", "held", "on_ac", "sleep"] {
+            assert!(v.get(forbidden).is_none(), "{forbidden} leaked: {v}");
+        }
+        // Absent on a device that gave no such reason.
+        assert!(
+            serde_json::to_value(row())
+                .unwrap()
+                .get("asleep_since")
+                .is_none()
+        );
     }
 
     /// The fleet-record fields a device must never see have no slot on the
@@ -4245,6 +4524,15 @@ pub enum ExternalRcAuditAction {
     /// session" is one join. What the DEVICE then decides — its own consent,
     /// its own ceiling — is the session's own audit trail, not this row.
     Session,
+    /// FR-52 P5 — an admin barred a person from a device (`approved:
+    /// Some(false)`) or let them back (`Some(true)`). `user_id` is the admin,
+    /// `principal` the person; a refused attempt carries `denied`.
+    Principal,
+    /// An action this build does not know, a newer server's. Read as itself,
+    /// so one new kind of row cannot fail a whole page of the log on an older
+    /// pod mid-roll.
+    #[serde(other)]
+    Other,
 }
 
 /// One external-access decision, granted or refused. TTL-expired after 90 days
@@ -4306,10 +4594,52 @@ pub struct ExternalRcAuditEvent {
     /// then decided.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<ObjectId>,
+    /// `principal` — the person the admin acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<ObjectId>,
 }
 
 impl ExternalRcAuditEvent {
     pub const COLLECTION: &'static str = "external_rc_audit";
+}
+
+/// FR-52 P5 — one person from outside, on one device: the org's lasting memory
+/// of who came in, and the row a revocation sits on.
+///
+/// It exists because [`ExternalRcAuditEvent`]s TTL out at 90 days: a "first
+/// session ever" read off them would come round every quarter. Per device, not
+/// per org, because the password is the device's, so a person proving a second
+/// device's password is a new fact.
+///
+/// ⚠️ A session makes the row and nothing else does. The people list joins
+/// `users` for a name at read time, so a route that could make a row for any id
+/// would read any account's name to any org admin.
+///
+/// No name of its own: the row has no TTL, and a name is the account's to
+/// change.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ExternalPrincipal {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub agent_id: ObjectId,
+    /// The outsider's own account.
+    pub user_id: ObjectId,
+    pub first_session_at: DateTime,
+    pub last_session_at: DateTime,
+    /// While set, this person is barred from this device (`gates` in the
+    /// extauth relay). A server gate, like the org's switch and the device's
+    /// approval: it stops an account, and it does not survive a compromised
+    /// server. Changing the device's password does both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<DateTime>,
+    /// The admin who barred them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_by: Option<ObjectId>,
+}
+
+impl ExternalPrincipal {
+    pub const COLLECTION: &'static str = "external_principals";
 }
 
 /// FR-52 P3 — why an external-access login step was refused.
@@ -4568,6 +4898,7 @@ mod external_access_tests {
             login_refused: None,
             login_detail: None,
             session_id: None,
+            principal: None,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert!(json.get("approved").is_none());
@@ -5610,6 +5941,13 @@ pub struct SessionStats {
     /// go/no-go dataset — see the signalling twin's doc).
     #[serde(default)]
     pub mixed_dial_seconds: u64,
+    /// FR-132 P1 (§3b) — the viewer's decode errors in this session, as the
+    /// agent counted them (see the signalling twin's doc). **Absent is "not
+    /// counted", never zero**: a session whose viewer or agent predates the
+    /// count, or that never decoded in a worker, carries no such field, so a
+    /// fleet read can compare only sessions that counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_errors: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -7077,6 +7415,23 @@ impl BlockList {
 mod tests {
     use super::*;
 
+    /// FR-52 P5 — the stored spelling of the newest action, and an action from a
+    /// newer server read as `Other`, through BSON, which is how a page of the log
+    /// is read. One new kind of row must not fail the page on an older pod.
+    #[test]
+    fn an_audit_action_this_build_does_not_know_is_read_not_refused() {
+        assert_eq!(
+            bson::to_bson(&ExternalRcAuditAction::Principal).unwrap(),
+            bson::Bson::String("principal".into())
+        );
+        #[derive(Deserialize)]
+        struct Row {
+            action: ExternalRcAuditAction,
+        }
+        let row: Row = bson::from_document(bson::doc! { "action": "quorum_reached" }).unwrap();
+        assert_eq!(row.action, ExternalRcAuditAction::Other);
+    }
+
     /// #1882 — every policy row written before `rc_overlay` existed must read
     /// OFF: the default is the whole point, and it has to hold for the rows
     /// already in Mongo, not just for `AccessPolicy::default()`.
@@ -7106,6 +7461,80 @@ mod tests {
             ..Default::default()
         };
         assert!(!off.rc_overlay_allowed());
+    }
+
+    /// FR-128 — the tri-state from the two fields: every row older than
+    /// `rc_overlay_auto` is `off` (or `on`, as before), `auto` survives the
+    /// round trip, and `on` wins over `auto` on a row that says both.
+    #[test]
+    fn rc_overlay_mode_reads_on_then_auto_then_off() {
+        let old: AccessPolicy = bson::from_document(bson::doc! {
+            "consent_mode": "auto",
+            "allowed_role_ids": [],
+            "allowed_user_ids": [],
+            "rc_overlay": null,
+        })
+        .expect("a pre-FR-128 row deserialises");
+        assert_eq!(old.rc_overlay_auto, None);
+        assert_eq!(old.rc_overlay_mode(), RcOverlayMode::Off);
+        assert_eq!(
+            AccessPolicy::default().rc_overlay_mode(),
+            RcOverlayMode::Off
+        );
+
+        let auto = AccessPolicy {
+            rc_overlay: Some(false),
+            rc_overlay_auto: Some(true),
+            ..Default::default()
+        };
+        let back: AccessPolicy = bson::from_document(bson::to_document(&auto).expect("serialises"))
+            .expect("round-trips");
+        assert_eq!(
+            back.rc_overlay_mode(),
+            RcOverlayMode::Auto { far_turn: None }
+        );
+        assert!(
+            !back.rc_overlay_allowed(),
+            "auto is not on to a reader of the bool"
+        );
+
+        let both = AccessPolicy {
+            rc_overlay: Some(true),
+            rc_overlay_auto: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(both.rc_overlay_mode(), RcOverlayMode::On);
+
+        let auto_off = AccessPolicy {
+            rc_overlay_auto: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(auto_off.rc_overlay_mode(), RcOverlayMode::Off);
+    }
+
+    /// FR-128 — what each mode tells the agent and the relay: only `on` sets
+    /// the `rc:request` bool, and `auto` hands out the viewer's relay as `on`
+    /// does.
+    #[test]
+    fn rc_overlay_mode_on_is_the_only_bool_and_auto_hands_out_the_relay() {
+        let auto = RcOverlayMode::Auto {
+            far_turn: Some(false),
+        };
+        assert!(RcOverlayMode::On.is_on());
+        assert!(!auto.is_on());
+        assert!(!RcOverlayMode::Off.is_on());
+        assert!(RcOverlayMode::On.hands_out_relay());
+        assert!(auto.hands_out_relay());
+        assert!(!RcOverlayMode::Off.hands_out_relay());
+        assert_eq!(RcOverlayMode::default(), RcOverlayMode::Off);
+        assert_eq!(
+            [
+                RcOverlayMode::Off.wire(),
+                auto.wire(),
+                RcOverlayMode::On.wire()
+            ],
+            ["off", "auto", "on"]
+        );
     }
 
     /// FR-99 P3b — every row written before `lock_on_end` asks nothing, a
@@ -7325,6 +7754,8 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
+            zero_copy_deny: Some("hevc_qsv:gpu".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7370,6 +7801,8 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
+            zero_copy_deny: Some("hevc_qsv:gpu".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7399,6 +7832,8 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
+            zero_copy_deny: Some("hevc_qsv:gpu".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7448,6 +7883,8 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
+            zero_copy_deny: Some("hevc_qsv:gpu".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7490,6 +7927,8 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
+            zero_copy_deny: Some("hevc_qsv:gpu".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7527,7 +7966,9 @@ mod tests {
                 "clipboard-image-events",
                 "sas",
                 // FR-97 P3e-2 — added, never renamed: an older viewer ignores it.
-                "display-match"
+                "display-match",
+                // #3267 — the same: no viewer asks for it, a fleet read does.
+                "encoder-cells"
             ]
         );
         assert_eq!(Unavailable::NOT_APPLICABLE, "not-applicable");
@@ -7648,6 +8089,8 @@ mod tests {
         assert_eq!(RpcCap::KnowhowTools.wire(), "knowhow-tools");
         assert_eq!(RpcCap::KnowhowProbe.wire(), "knowhow-probe");
         assert_eq!(RpcCap::LocalRelay.wire(), "local-relay");
+        assert_eq!(RpcCap::RcOverlayAuto.wire(), "rc-overlay-auto");
+        assert_eq!(RpcCap::MediaPlan.wire(), "media-plan");
     }
 
     /// FR-90 P4-4-1 — `knowhow-tools` and `knowhow-scan` are two verbs: a
@@ -7985,6 +8428,58 @@ mod tests {
             assert_eq!(serde_json::to_value(k).unwrap(), serde_json::json!(w));
             let back: RecordingActivityKind = serde_json::from_value(serde_json::json!(w)).unwrap();
             assert_eq!(back, k);
+        }
+    }
+
+    /// FR-85 AC10 — a `recording_activity` row is the device's claim about a
+    /// recording, never the recording: the fact, sizes and reasons, and no
+    /// frames, no sound, no link to either. The stored keys are pinned
+    /// exactly, so a new field fails here first and whoever adds it reads
+    /// "What the server holds" in `docs/recording.md` §10 before re-pinning.
+    /// No value nests a document, an array or binary, either: a renamed key
+    /// cannot carry a payload in.
+    #[test]
+    fn a_recording_activity_row_holds_no_content() {
+        let every_field = RecordingActivityEvent {
+            id: Some(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            agent_id: ObjectId::new(),
+            session_id: ObjectId::new(),
+            controller_user_id: ObjectId::new(),
+            kind: RecordingActivityKind::Stopped,
+            name: Some("Roomler Recording 2026-10-31 00-12-00.mp4".into()),
+            bytes: Some(5_759_995),
+            duration_ms: Some(26_000),
+            reason: Some("requested".into()),
+            at: DateTime::now(),
+        };
+        let row = bson::to_document(&every_field).unwrap();
+        let keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "_id",
+                "tenant_id",
+                "agent_id",
+                "session_id",
+                "controller_user_id",
+                "kind",
+                "name",
+                "bytes",
+                "duration_ms",
+                "reason",
+                "at"
+            ],
+            "a recording_activity row may hold the claim only"
+        );
+        for (k, v) in &row {
+            assert!(
+                !matches!(
+                    v,
+                    bson::Bson::Binary(_) | bson::Bson::Document(_) | bson::Bson::Array(_)
+                ),
+                "{k} holds {v:?}"
+            );
         }
     }
 
@@ -9292,6 +9787,8 @@ mod tests {
             ssh_port: Some(2222),
             encoder_cells_deny: Some("none".into()),
             fps_deny: Some("*:144".into()),
+            color_description: Some("off".into()),
+            zero_copy_deny: Some("hevc_qsv:gpu".into()),
             revision: 1,
             updated_by: Some(ObjectId::new()),
             updated_at: Some(DateTime::now()),
@@ -9400,6 +9897,16 @@ mod tests {
                  refusal, and a server that can set it can set everything. Got keys: {keys:?}"
             );
         }
+        // FR-132 decision 1 — nor the GPU path's ON switch: only its denylist,
+        // the half that removes, is pushable. `zero_copy` is a PREFIX of
+        // `zero_copy_deny`, so both checks compare whole keys; a prefix match
+        // would refuse the kill switch along with the switch.
+        assert!(
+            !keys.contains(&"zero_copy"),
+            "zero_copy must never be pushable by the server: turning a GPU-input cell on \
+             is the device's decision, or a release's. Got keys: {keys:?}"
+        );
+        assert!(keys.contains(&"zero_copy_deny"), "{keys:?}");
         assert!(
             !keys.iter().any(|k| k.contains("restart")),
             "remote configuration never restarts a daemon (docs/remote-config.md §7b): {keys:?}"
@@ -9422,6 +9929,87 @@ mod tests {
         }))
         .expect("unknown keys are ignored, not fatal");
         assert_eq!(pushed.ssh_enabled, Some(true));
+    }
+
+    /// FR-130 P1b — a pushed tribool has one reading, shared by the server
+    /// (which refuses what it cannot read) and the device (which applies it).
+    /// Blank is a request to CLEAR, never "not managed": that is an absent
+    /// key. A word it cannot read is refused rather than guessed.
+    #[test]
+    fn a_pushed_tribool_takes_the_config_set_words_and_blank_clears() {
+        for on in ["on", "ON", " true ", "1", "Yes"] {
+            assert_eq!(parse_pushed_tribool(on), Ok(Some(true)), "{on:?}");
+        }
+        for off in ["off", "Off", "false", "0", " no "] {
+            assert_eq!(parse_pushed_tribool(off), Ok(Some(false)), "{off:?}");
+        }
+        for clear in ["", "   "] {
+            assert_eq!(parse_pushed_tribool(clear), Ok(None), "{clear:?}");
+        }
+        for unread in ["maybe", "default", "2", "o n", "onn"] {
+            assert!(parse_pushed_tribool(unread).is_err(), "{unread:?}");
+        }
+        let long = "x".repeat(10_000);
+        let err = parse_pushed_tribool(&long).unwrap_err();
+        assert!(err.len() < 120, "the echo is capped: {} bytes", err.len());
+
+        // What the server stores reads back as what it read.
+        for v in [None, Some(true), Some(false)] {
+            assert_eq!(parse_pushed_tribool(pushed_tribool_wire(v)), Ok(v));
+        }
+        // And it travels: a clear survives the round trip as a clear, and
+        // an absent key stays absent ("not managed").
+        let clear = DesiredConfig {
+            color_description: Some(pushed_tribool_wire(None).into()),
+            ..Default::default()
+        };
+        assert!(!clear.is_empty(), "a clear is a request");
+        let json = serde_json::to_string(&clear).unwrap();
+        assert!(json.contains(r#""color_description":"""#), "{json}");
+        let back: DesiredConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.color_description.as_deref(), Some(""));
+        let unmanaged = serde_json::to_string(&DesiredConfig::default()).unwrap();
+        assert!(!unmanaged.contains("color_description"), "{unmanaged}");
+    }
+
+    /// FR-132 P1 — the GPU-input denylist travels as the text the device
+    /// reads, a blank (clear) is a request rather than "not managed", and it
+    /// is neither an exec nor an SSH change, so pushing it needs no grant bit.
+    /// A frame from a server older than the key reads as not managed.
+    #[test]
+    fn a_pushed_zero_copy_denylist_is_a_request_that_grants_nothing() {
+        let deny = DesiredConfig {
+            zero_copy_deny: Some("hevc_qsv:gpu, av1_nvenc:gpu".into()),
+            ..Default::default()
+        };
+        assert!(!deny.is_empty());
+        assert!(!deny.touches_exec() && !deny.touches_ssh());
+        assert!(
+            deny.same_ssh_as(&DesiredConfig::default()),
+            "the denylist is not part of the SSH family"
+        );
+        let json = serde_json::to_string(&deny).unwrap();
+        assert!(
+            json.contains(r#""zero_copy_deny":"hevc_qsv:gpu, av1_nvenc:gpu""#),
+            "{json}"
+        );
+        let back: DesiredConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, deny);
+
+        let clear = DesiredConfig {
+            zero_copy_deny: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(!clear.is_empty(), "a clear is a request");
+        let back: DesiredConfig =
+            serde_json::from_str(&serde_json::to_string(&clear).unwrap()).unwrap();
+        assert_eq!(back.zero_copy_deny.as_deref(), Some(""));
+
+        let old: DesiredConfig =
+            serde_json::from_str(r#"{"fps_deny":"*:144","revision":3}"#).unwrap();
+        assert_eq!(old.zero_copy_deny, None, "absent = not managed");
+        let unmanaged = serde_json::to_string(&DesiredConfig::default()).unwrap();
+        assert!(!unmanaged.contains("zero_copy"), "{unmanaged}");
     }
 
     // ── #1630: an audit row must read back through the driver's own pair ───
@@ -10061,5 +10649,45 @@ pub fn should_redeliver(
     match request.delivered_at {
         None => true,
         Some(at) => (now.timestamp_millis() - at.timestamp_millis()) / 1000 >= REDELIVER_AFTER_SECS,
+    }
+}
+
+#[cfg(test)]
+mod power_brief_tests {
+    use super::*;
+
+    fn notice(held: bool) -> SleepNotice {
+        SleepNotice {
+            at: DateTime::from_millis(1_793_000_000_000),
+            power: PowerBrief {
+                policy: "never".into(),
+                on_ac: Some(false),
+                held,
+            },
+        }
+    }
+
+    /// FR-55 P4 — a device that is online again is not asleep, whatever its
+    /// row still says: the hello clears the notice, but a read that lands
+    /// between the reconnect and that write must not show a stale "asleep".
+    #[test]
+    fn a_sleep_notice_shows_only_on_a_device_that_is_not_online() {
+        let n = notice(false);
+        assert_eq!(SleepView::of(Some(&n), true), None);
+        let shown = SleepView::of(Some(&n), false).expect("offline and announced");
+        assert!(shown.since.starts_with("2026-10-26T07:33:20"), "{shown:?}");
+        assert_eq!(shown.power, n.power);
+        assert_eq!(SleepView::of(None, false), None, "no notice, no reason");
+    }
+
+    /// FR-55 P4 — the row field is optional both ways: a pre-P4 row has
+    /// neither field, and a row with them round-trips.
+    #[test]
+    fn the_row_fields_are_optional_and_round_trip() {
+        let n = notice(true);
+        let b = bson::to_document(&n).expect("bson");
+        let back: SleepNotice = bson::from_document(b).expect("decode");
+        assert_eq!(back, n);
+        assert!(!back.power.by_policy(), "held: it slept past the hold");
     }
 }

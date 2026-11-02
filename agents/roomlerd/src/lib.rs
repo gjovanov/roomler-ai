@@ -1,8 +1,20 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! Library crate for `roomlerd`. The binary at `src/main.rs` is a thin
-//! CLI shell around these modules; exposing them here lets integration
+//! Library crate for `roomlerd`. The binary at `src/bin/roomlerd.rs` is one
+//! call into [`app::main`]; exposing the modules here lets integration
 //! tests drive the agent in-process against a `TestApp` server.
+
+// FR-123 P2 — the daemon's CLI and every subcommand, the former `src/main.rs`
+// (now `src/app.rs`, a pure rename). It lives in the lib so the daemon
+// compiles as ONE unit: an `async fn`'s body is emitted in the crate that
+// polls it, so a bin that polled `daemon_main` itself instantiated the
+// daemon's whole async tree a second time, after the lib and on one core
+// (measured: lib + bin 610 → 516 s on Windows, 702 → 548 s on macOS, and the
+// binary 5.5 % / 11.5 % smaller, FR-123 §2.4). The self alias keeps that
+// file's `roomlerd::` spelling valid inside the lib, so an edit in flight on
+// the old file still applies and compiles once its branch rebases.
+extern crate self as roomlerd;
+pub mod app;
 
 // P3e lever E: the daemon-free building blocks (appdirs, machine, config,
 // config_surface, enrollment, logging, logs_upload, crash_recorder, the
@@ -15,7 +27,7 @@
 // `tunnel/mod.rs` so `crate::tunnel::acl::…` still resolves.
 pub use roomler_node_core::{
     appdirs, config, config_surface, crash_recorder, enrollment, files_dir, logging, logs_upload,
-    machine, token_slot,
+    machine, pairing, pairing_terminal, token_slot,
 };
 
 pub mod apps;
@@ -90,6 +102,8 @@ pub mod host_mute;
 /// running behind it; black-box over the agent this daemon's sessions use.
 #[cfg(test)]
 mod ice_lifetime_tests;
+/// FR-134 — an ICMP echo with no `ping.exe` (the module gates itself to Windows).
+pub mod icmp_win;
 pub mod indicator;
 pub mod input;
 pub mod install_cleanup;
@@ -106,12 +120,18 @@ pub mod lock_on_end;
 pub mod lock_overlay;
 pub mod lock_state;
 pub mod logs_fetch;
+/// #3164 — a Quit AppleEvent restarts the agent; LaunchServices' own launch of
+/// the bundle never becomes a second daemon. Pure halves on every platform.
+pub mod macos_quit;
 /// FR-97 P2f-2 — start a child that is its own responsible process, so macOS
 /// asks the person about the microphone a supervised Mac's recorder opens.
 #[cfg(target_os = "macos")]
 pub mod macos_spawn;
 pub mod macos_supervisor;
 pub mod mdns_resolve;
+/// FR-135 R2 — `rc:media-plan`: what a session promised its viewer, and every
+/// step it took down from there.
+pub mod media_plan;
 pub mod mem_trim;
 pub mod power;
 pub mod remote_config;
@@ -174,9 +194,14 @@ pub mod relay_server;
 /// FR-96 P2b — a per-user Linux daemon restarts onto its replaced binary once
 /// nothing it serves would be cut.
 pub mod replaced_binary;
+/// FR-134 — the daemon samples its own handle count and says when it climbs.
+pub mod resource_watch;
 /// FR-98 C6 — `playout-delay` 0/0 on the RTP fallback track, so the
 /// browser's jitter buffer renders as soon as it decodes (default off).
 pub mod rtp_playout;
+/// #2718 — the daemon's runtime is shut down with a budget, so a blocking
+/// read an exec left behind cannot hold the process past a stop.
+pub mod runtime_exit;
 /// FR-84 D5b — the companion's Devices page: the org's device list and mesh,
 /// asked of the server with the org's agent token.
 pub mod self_view;
@@ -231,6 +256,9 @@ pub use roomler_node_core::tcc;
 #[cfg(target_os = "linux")]
 pub mod tarball_owner;
 pub mod telemetry;
+/// #3018 — every thread's stack, read from outside the stuck code, for the
+/// record a stall leaves.
+pub mod thread_dump;
 /// FR-103 — renewing each enrollment's agent token before it expires.
 pub mod token_renewal;
 pub mod tunnel;

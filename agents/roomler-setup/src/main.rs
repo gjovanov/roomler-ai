@@ -8,10 +8,11 @@
 //! P4c-2 (`roomler-installer` drove the daemon MSIs,
 //! `roomler-tunnel-installer` the tunnel CLI). The operator picks a
 //! role on the Welcome step
-//! — three daemon flavours (Windows) or the tunnel client (any OS) —
-//! and the wizard drives the matching install pipeline end-to-end:
-//! detect → server + device → token → install (download / MSI or
-//! extract / enroll) → done.
+//! — three daemon flavours (Windows), two (Linux) or one (macOS) when
+//! the chosen server allows them (FR-129 B1), or the tunnel client
+//! (any OS) — and the wizard drives the matching install pipeline
+//! end-to-end: detect → server + device → token → install (download /
+//! MSI, the `install.sh` halves, or extract / enroll) → done.
 //!
 //! Architecture mirrors the rc.28 wizard lineage:
 //!
@@ -44,6 +45,13 @@ use tauri::{Emitter, Manager};
 use wizard_app::{INSTALL_IN_PROGRESS, commands};
 
 fn main() {
+    // FR-129 C — before anything can load a DLL by name: the EXE sits in the
+    // person's Downloads and goes on to run elevated.
+    wizard_shared::elevation::restrict_dll_search();
+    // And before anything reads the environment or spawns a program: an
+    // elevated run takes nothing from its user's own state.
+    wizard_app::launch::start_clean();
+
     // Stderr-only tracing. The wizard is a foreground EXE the
     // operator launches manually; persistent logging is the daemon's
     // job, not ours. Operators who want wizard-side logs run from a
@@ -56,6 +64,13 @@ fn main() {
         .with_target(false)
         .with_writer(std::io::stderr)
         .try_init();
+
+    // FR-129 C3 — an elevated relaunch waits for the limited copy that asked
+    // for it to exit BEFORE the single-instance plugin below looks for a
+    // running copy; otherwise it would hand its arguments to that dying copy
+    // and quit.
+    let launch = wizard_app::launch::LaunchArgs::from_env();
+    wizard_app::launch::wait_for_parent(&launch);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -88,6 +103,71 @@ fn main() {
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        // FR-129 C3 — the one window, from its `tauri.conf.json` entry (which
+        // says `"create": false`), so that an ELEVATED wizard can hand
+        // WebView2 a user-data folder of its own: through the API, the only
+        // channel an elevated host honours (`launch::webview_data_directory`
+        // says why). A limited wizard passes nothing and keeps Tauri's folder.
+        // A relaunch then takes the foreground: the limited copy held it and
+        // has exited, so Windows gave it to the window behind (a browser, when
+        // that is where the download was opened), and a new window stays
+        // behind that unless it asks. `run_elevated` left it the right to.
+        .setup(move |app| {
+            let config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == wizard_app::launch::MAIN_WINDOW)
+                .cloned()
+                .ok_or("tauri.conf.json has no main window")?;
+            let mut window = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?;
+            if let Some(dir) = wizard_app::launch::webview_data_directory(&launch) {
+                tracing::info!(dir = %dir.display(), "elevated: WebView2 keeps its own data folder");
+                window = window.data_directory(dir);
+            }
+            // No window is the one failure nothing on screen can report, and
+            // on an elevated run the copy that asked for it has already gone.
+            let window = window.build().unwrap_or_else(|e| {
+                tracing::error!(error = %e, "no main window");
+                wizard_shared::elevation::show_fatal(&format!(
+                    "Roomler Setup could not open its window ({e})."
+                ));
+                std::process::exit(1);
+            });
+            if launch.after_elevation.is_some() {
+                let _ = window.set_focus();
+            }
+            Ok(())
+        })
+        // FR-129 B1 — the window's own close button: whatever a Linux/macOS
+        // daemon install left in the private scratch directory (an enrolled
+        // system-scope config kept for a Retry) is shredded before the
+        // process goes. `cmd_exit_wizard` does the same for Finish/Cancel.
+        // While the privileged half runs the window does not close at all:
+        // the exit would remove that directory — the script a terminal step
+        // has yet to run, the config a root half has yet to place — from
+        // under a step that cannot be stopped from here.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if wizard_app::unix_daemon::privileged_running() {
+                    use tauri_plugin_dialog::{DialogExt as _, MessageDialogKind};
+                    api.prevent_close();
+                    window
+                        .dialog()
+                        .message(
+                            "An install step is running as administrator and cannot be \
+                             interrupted. Cancel it from the wizard while the password prompt is \
+                             still open, or wait for it to finish; the wizard closes after that.",
+                        )
+                        .title("Roomler Setup")
+                        .kind(MessageDialogKind::Warning)
+                        .show(|_| {});
+                    return;
+                }
+                wizard_app::unix_daemon::clear_kept();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::cmd_detect_install,
             commands::cmd_default_device_name,
@@ -103,6 +183,21 @@ fn main() {
             // FR-102 P3b — the opt-in diagnostics box and the page boundaries.
             commands::cmd_diagnostics_opt_in,
             commands::cmd_diagnostics_page,
+            // FR-129 A3 — device pairing: start, poll, open the page, cancel.
+            commands::cmd_pair_start,
+            commands::cmd_pair_poll,
+            commands::cmd_pair_open,
+            commands::cmd_pair_cancel,
+            // FR-129 B1 — the server's switches, and the terminal fallback's
+            // "I've run it".
+            commands::cmd_setup_features,
+            commands::cmd_privileged_half_done,
+            // #3116 — the Welcome page's elevation gate.
+            commands::cmd_system_context_needs_elevation,
+            // FR-129 C3 — "Restart as administrator", and what an elevated
+            // relaunch was handed.
+            commands::cmd_relaunch_elevated,
+            commands::cmd_launch_options,
         ])
         .run(tauri::generate_context!())
         .expect("error while running roomler-setup");

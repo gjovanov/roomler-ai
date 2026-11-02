@@ -39,7 +39,7 @@ use roomler_ai_remote_control::models::{OverlayAclMode, OverlayPolicy};
 use roomler_ai_remote_control::{
     models::{AgentStatus, NodeRef, OverlayNode},
     signaling::{
-        ClientMsg, IceServer, NetmapPeer, OverlayJoinRefusal, OverlayNetworkInfo,
+        CapVectorWire, ClientMsg, IceServer, NetmapPeer, OverlayJoinRefusal, OverlayNetworkInfo,
         RelayStrategyWire, ServerMsg,
     },
     turn_creds,
@@ -806,7 +806,7 @@ async fn handle_overlay_netcheck(
 /// Phase B — the freshness gate: a vector older than 3× the measurement
 /// cadence (20 min) is surfaced as ABSENT, so a stalled prober can never
 /// stay fleet-authoritative (consumers then fall back to presence rules).
-fn fresh_caps(node: &OverlayNode) -> Option<roomler_ai_remote_control::signaling::CapVectorWire> {
+pub(crate) fn fresh_caps(node: &OverlayNode) -> Option<CapVectorWire> {
     const CAPS_FRESH_MS: i64 = 60 * 60 * 1000; // 3 × the 20-min cadence
     let at = node.caps_measured_at?;
     let age_ms = bson::DateTime::now().timestamp_millis() - at.timestamp_millis();

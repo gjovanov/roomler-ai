@@ -162,25 +162,28 @@ Two consequences worth knowing:
   with a *different* address. To remove a device for good, delete it. There is
   deliberately no per-machine overlay denylist.
 
-### Pre-release gaps are ACCEPTED — don't "fix" them
+### Pre-release gaps: reclaimed through `release_host`, never by hand (FR-47 P3)
 
 Every device removed *before* the release mechanism shipped (2026-07-29) burned
 its host number with nothing to hand it back, so a long-lived tenant's cursor
-sits above its live-node count with holes below. The fleet tenant is the worked
+sits above its live-node count with holes below. The fleet tenant was the worked
 example: `next_host = 33`, 14 live nodes, and 16 numbers (`.3 .5 .8–.13
-.16–.23`) that belong to no row at all.
+.16–.23`) that belonged to no row at all.
 
-**This is expected and deliberately not reclaimed.** Those numbers aren't
-attached to any document, so eviction cannot reach them — recovering them means
-writing `free_hosts` directly, which bypasses every guard in `release_host` (the
-`next_host: {$gt: host}` sanity filter, the `$addToSet` dedup, the CAS release
-token) for a `/10` that holds 4.19 M addresses. The pool already stops *new*
-leaks, so the win is cosmetic.
-
-If a tenant ever does churn enough for the cursor to matter, do it properly: an
-admin-triggered reconcile that computes `(1..next_host) − live − pooled`
-server-side and returns each number through `release_host`, so the guards still
-apply. Not a hand-rolled database update.
+Those numbers aren't attached to any document, so eviction cannot reach them,
+and writing `free_hosts` directly would bypass every guard in `release_host`:
+the `next_host: {$gt: host}` sanity filter, the `$addToSet` dedup and the
+pool's size cap. On a carved `/22` (1 022 addresses, not the `/10`'s 4.19 M)
+the holes are no longer cosmetic, so FR-47 P3 recovers them the guarded way.
+`POST /api/tenant/{tid}/overlay-block/reconcile-hosts`
+([`overlay_block.rs:1139`](../crates/modules/network/src/routes/overlay_block.rs#L1139))
+computes `(1..next_host) − live − pooled` server-side and returns each number
+through `release_host`, so every guard still applies. It is platform-operator
+only, and anyone else gets a 404. It is a dry run unless the body says
+`{"dry_run": false}`. Run on production on 2026-08-31, it released exactly 17
+ordinals in the oldest org and refused none, and a second dry run read
+`orphaned: []` ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486189495)).
+Run it again a month later to tell a historical leak from a live one.
 
 Because addresses are reused, the client keys every routing teardown by
 **pubkey**, never by address, and drops an OS `/32` only when no surviving peer
@@ -254,7 +257,7 @@ each socket's `rb`. Linux reports twice the request, so a carrier socket shows
 daemon logs the granted sizes once per socket (*"overlay: carrier socket
 buffers"*) whatever `RUST_LOG` says. The packaged Linux units set
 `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO, so the logger
-appends this one target on its own (`crates/agent-core/src/logging.rs:225`). On
+appends this one target on its own (`crates/agent-core/src/logging.rs:348`). On
 Windows that line is the only evidence of the size.
 
 ⚠️ **A per-user Linux install gains nothing until the host allows it.** It runs
@@ -568,7 +571,7 @@ does instead:
   `firewall-cmd --info-zone` ([`hostfw.rs:45`](../crates/tunnel-core/src/overlay/hostfw.rs#L45))
   or `ufw status verbose` ([`hostfw.rs:130`](../crates/tunnel-core/src/overlay/hostfw.rs#L130)).
 - `roomler status` prints it only when the firewall limits what a mesh peer
-  reaches ([`localclient.rs:2834`](../agents/roomler-cli/src/localclient.rs#L2834)):
+  reaches ([`localclient.rs:2884`](../agents/roomler-cli/src/localclient.rs#L2884)):
 
   ```text
     host fw     firewalld has roomler0 in no zone, so the default zone public applies: mesh peers reach only dhcpv6-client, ssh here
@@ -668,7 +671,93 @@ single-relay lacks — which is why single-relay must force QUIC while DERP
 deliberately stays raw. QUIC over a reliable WebSocket would be double-reliable,
 head-of-line blocking on top of head-of-line blocking.
 
+### Queue discipline: the age bound and the kernel send-buffer cap (FR-18)
+
+For a host whose corporate VPN blocks every UDP path, DERP is the only carrier
+there is, so the two buffers a frame waits in on its way out are the latency
+this carrier adds. FR-18 bounds both. The first is the node's outbound queue.
+The second is the kernel's TCP send buffer under the `/derp` WebSocket.
+
+```mermaid
+flowchart LR
+    WG["WireGuard datagram"] --> SEND["DerpConn::send_to<br/>stamps the frame"]
+    SEND -->|"queue full"| FULL["dropped, uncounted"]
+    SEND --> Q["outbound queue<br/>512 frames, a memory bound"]
+    Q --> AGE{"waited longer than<br/>the age bound?"}
+    AGE -->|"yes"| STALE["dropped_stale + 1"]
+    AGE -->|"no"| KBUF["kernel send buffer<br/>capped at 256 KiB"]
+    KBUF --> WIRE["TLS over TCP 443<br/>to the relay"]
+    CAP["at connect: set SO_SNDBUF,<br/>read it back, log one line"] -.-> KBUF
+```
+
+| Lever | Where | What it does |
+|---|---|---|
+| Age bound | `crates/tunnel-core/src/transport/derp.rs:72` (`queue_max_age`), checked by the WS writer at `agents/roomlerd/src/derp.rs:472` | The writer drops a frame that waited longer than `ROOMLERD_DERP_QUEUE_MAX_AGE_MS` (default 100) instead of sending it. That bounds the queue in time whatever the link rate: 512 frames are 33 ms at 160 Mbit/s and 1.8 s at 3 Mbit/s. `0` turns the check off, the behaviour before FR-18 |
+| Send-buffer cap | `cap_send_buffer` (`agents/roomlerd/src/derp.rs:71`), called once per connect (`:374`) | Asks for `SO_SNDBUF` = 256 KiB (`DERP_SNDBUF_BYTES`, `:39`), above the bandwidth-delay product of these paths (3 Mbit/s × 200 ms is about 75 KB) and far below the megabytes that autotuning grows. Without it, a frame the age check let through could still sit for seconds in the kernel. The cap has no switch of its own |
+| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:440`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it when it changed (`agents/roomlerd/src/derp.rs:440`): *"overlay derp: shed stale carrier frames (queue age bound)"* |
+
+⚠️ **A successful set is not a cap.** The OS may apply less than was asked and
+still return success, so the daemon reads the size back with
+`getsockopt(SO_SNDBUF)` right after the set
+(`cap_tcp`, `agents/roomlerd/src/derp.rs:90`) and judges it in the request's
+units (`SndbufCap::read_back`, `agents/roomlerd/src/derp.rs:135`). This is
+FR-18's AC4. In a Linux 6.6 container at stock sysctls (2026-10-30), a 262144
+request returned `Ok`, and the kernel then reported 425984: **212992 in
+force**. The daemon used to assume 256 KiB.
+
+How each OS answers, from its documentation or source:
+
+| OS | `getsockopt` returns | What can change the request | Why one read is enough |
+|---|---|---|---|
+| Linux | **twice** the size in force, for kernel bookkeeping (socket(7)). The daemon halves it (`KERNEL_DOUBLES_SNDBUF`, `agents/roomlerd/src/derp.rs:104`) | `net.core.wmem_max` clamps it **without an error**. The default was 212992 until Linux 6.18 raised it to 4 MiB, so a stock older kernel holds 208 KiB of the 256 asked | The set takes `SOCK_SNDBUF_LOCK`, so TCP neither grows nor shrinks the buffer afterwards (`tcp_should_expand_sndbuf`, `sk_stream_moderate_sndbuf`) |
+| Windows | the size in force | Winsock "can succeed even if the implementation did not provide the whole amount requested" and tells the caller to check with `getsockopt` | Dynamic send buffering "is enabled unless an application sets the SO_SNDBUF socket option" |
+| macOS | the size in force (`sb_hiwat`) | `kern.ipc.maxsockbuf` (8 MiB by default) clamps a larger request, far above this one | The set clears `SB_AUTOSIZE`, which TCP's send-buffer growth and trim both require. The MSS rounding runs only on a SYN, before the cap |
+
+Every connect logs one line, and every message opens with *"overlay derp: send
+buffer"* (`SndbufCap::log`, `agents/roomlerd/src/derp.rs:165`). It carries
+`relay`, `requested` and, where it was read, `applied` in the request's units:
+
+| Read-back | Level | Message |
+|---|---|---|
+| applied = requested | INFO | *"… capped — the kernel holds the requested size (FR-18)"*, `clamped=false` |
+| applied < requested | INFO | *"… capped below the request — the OS clamped it …"*, `clamped=true`. A tighter cap is still a cap |
+| applied > requested | WARN | *"… not capped — the kernel holds more than requested"*. No OS is documented to do this. The read-back is there to catch it if one does |
+| the set failed | WARN | *"… cap refused — the OS keeps its own size"*, with that size when it reads back |
+| the read failed | WARN | *"… cap set but not read back — the size in force is unknown"* |
+| no TCP socket under the WebSocket | WARN | *"… left at the OS default — unrecognised TLS wrapper"* |
+
+The verdict per OS and the line's fields are pinned by unit tests
+(`agents/roomlerd/src/derp.rs:675`, `:841`). Two more use a real loopback
+socket. In one, the cap reaches the socket under the WebSocket and reads back
+as the kernel under the test applies it (`agents/roomlerd/src/derp.rs:753`).
+In the other, a socket filled until the kernel takes no more keeps the size its
+cap read back (`agents/roomlerd/src/derp.rs:781`). CI runs them on Linux and
+Windows.
+
+⚠️ **To read the cap on a host, grep its log for `overlay derp: send buffer`.**
+A node writes the line each time its `/derp` socket connects. Since the
+always-on floor (`ROOMLERD_OVERLAY_DERP_FLOOR`, default on since rc.400) opens
+the central `/derp` socket at startup (see the lazy connection below), that is
+every node, and a regional relay's socket logs a line of its own under its
+`relay` name. Expect
+`clamped=true applied=212992` on a stock Linux kernel before 6.18, and
+`applied=262144` on Windows and macOS. On Linux, `ss -tmp` shows the same
+socket's `tb` as twice `applied`. All three OSes read that way on the fleet on
+0.4.191 ([FR-18's field log](fr/FR-18-carrier-queue-discipline.md#field-log)).
+
+⚠️ **A full outbound queue drops the frame uncounted.** `DerpConn::send_to`
+answers `Ok` when the queue is full (`crates/tunnel-core/src/transport/derp.rs:323`)
+so that a transient overflow never latches the carrier dead. FR-18's design
+also named a `dropped_full` counter, and it was never built.
+
 ### Lazy connection
+
+⚠️ **Since rc.400 the always-on floor opens `/derp` on every node at startup**
+(`ROOMLERD_OVERLAY_DERP_FLOOR`, default on;
+`crates/tunnel-core/src/overlay/runtime.rs:2576`), so that DERP can carry every
+fresh pair from birth while better tiers upgrade over it. A server's force-DERP
+push can open it mid-run too. The lazy rule below is what a node does with the
+floor switched off.
 
 DERP is default-ON, but the `/derp` WS is opened **only when the node is itself
 UDP-blocked** — that is, when its own srflx gather came back empty, the same
@@ -693,8 +782,40 @@ UDP-blocked — moving onto a restrictive network — opens `/derp` at that poin
 `/derp` is served by the same API pods behind the same nginx as `/ws`, on its own
 `location` block with 86400 s idle timeouts. It is a **separate** endpoint from
 `/ws` on purpose: WireGuard data at line rate would head-of-line-block the JSON
-control channel. The registry is in-memory on a single-replica deployment, so a
-web deploy severs DERP links — they simply rebuild via the carrier's dead-latch.
+control channel. The registry is in-memory and per pod, and the front nginx pins a
+tenant to one pod (`hash … consistent`, `max_fails=0`, `proxy_next_upstream off`),
+so a roll closes each pod's sockets in turn and they rebuild via the dead-latch.
+
+### What a pod roll costs (FR-28)
+
+Read on 15 production rolls in October 2026
+([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#where-it-stands-2026-10-31)):
+
+```mermaid
+flowchart LR
+    T["SIGTERM"] --> X["old pod exits<br/>+0.5 to 0.85 s"]
+    X --> B["every redial answers 502<br/>the pin has no process behind it"]
+    B --> L["replacement listens<br/>+5.3 to 6.3 s"]
+    L --> R["next ladder step<br/>+7, +15 or +25 s"]
+    R --> C["socket back, carriers rebuild"]
+```
+
+| Measure | Value |
+|---|---|
+| `/derp` down, per socket | p50 7.6 s, p90 15.9 s, p99 26.2 s (310 sockets) |
+| A whole roll | 33.9 s on the live read: two waves about 17 s apart, each hitting one pod's tenants |
+| `relay carrier send hard-errored` | 14–73 lines per roll on 10–15 hosts. The line marks a close, not a fault |
+| An RC session | Ends on the control WS on any carrier, 9 of 9. A new one is Active 8.4–18.6 s after the cut |
+
+⚠️ **Make-before-break has no pod to dial here.** The strict pin sends a second dial to the
+same dying pod, and with hostNetwork and `maxSurge: 0` the replacement cannot exist until
+that pod is gone. The pin is deliberate: a ring that walked to the survivor parked
+long-lived sockets on the wrong pod after a roll.
+
+⚠️ **The downtime is mostly Kubernetes, the image and the agent's ladder.** The binary listens
+under 0.4 s after its container starts. The rest is scheduling (about 1.5 s), the image pull
+(3–4 s), and the wait for the next backoff step (`agents/roomlerd/src/derp.rs:49`), which is
+why per-roll medians land on 7.5, 15 and 25 s.
 
 ---
 
@@ -799,6 +920,16 @@ server. Detail and the negative-control test:
   with a capped backoff (250 ms → 30 s), and each respawn sends one synthetic
   wake-up, so whatever changed while nothing was watching is re-sampled and
   re-asserted.
+* **The sample after a burst runs on the blocking pool** (#3018). It is two
+  to six `route -n get` processes on macOS (~2.5 ms each on an idle Mac),
+  `ip route get` on Linux, and on Windows a route-table read that can also
+  repair a LAN route (`lan_repair`). It used to run inline on a tokio worker,
+  so every burst of a carrier flap held a worker for the whole sample. It now
+  runs under `spawn_blocking` (`crates/tunnel-core/src/overlay/netstate.rs:529`),
+  the monitor's log lines carry `sample_ms`, and a sample over 1 s is a WARN.
+  A sample that panics still stops the monitor, as it did inline: the panic
+  hook records one crash, and a sampler that panicked on every burst would
+  otherwise record one per burst.
 * **Evict a competing route only when it wins, and stop when it is futile**
   (#1405, Windows). AnyConnect mirrors our prefixes onto its miniport: every
   peer `/32`, the floor `/24`s, and the derived ULA `/96`. It re-adds a
@@ -843,6 +974,7 @@ prefix is still honoured.
 | `…_SRFLX_KEEPALIVE_SECS` | 20 | STUN keepalive holding the mapping open |
 | `…_RELAY_SINGLE` | on | single-relay tier |
 | `…_DERP` | **on** since rc.203 | DERP tier |
+| `…_DERP_FLOOR` | **on** since rc.400 | the always-on floor: every node opens its central `/derp` socket at startup, and DERP carries each fresh pair while better tiers upgrade over it (§6); off = open `/derp` only when UDP-blocked, or when a force-DERP push asks |
 | `…_ORG_RELAY` | off | ride a tenant-owned org relay when the server mints a session for a pair (FR-19 P4b); serving is `RELAY_SERVER_ENABLED` |
 | `…_PATHMON` | **on** | path-monitor telemetry (`on`/`shadow`/`off`). Selection is always monitor-driven since rc.282 — non-`on` values only silence the 10-min decision summaries |
 | `…_ROUTE_EVENTS` | **on** | event-driven route guard: OS route-change subscription driving immediate re-asserts; off = 2 s blind tick only |
@@ -850,6 +982,10 @@ prefix is still honoured.
 | `…_ROUTE_EVICT_WINNERS_ONLY` | **on** | Windows: evict a competing VPN route only when it wins the FIB lookup (#1405); off = evict every competing row every wave |
 | `…_NETSTACK_SOCKS` | unset | userspace netstack + SOCKS5 instead of an OS TUN |
 | `…_SOCKBUF` | **on** (FR-110) | every direct carrier socket asks for 7 MiB receive and send buffers (§2); off = the OS default |
+
+One DERP knob sits outside that prefix: the queue's age bound,
+`ROOMLERD_DERP_QUEUE_MAX_AGE_MS`, default 100, where `0` turns the check off
+(FR-18, §6). The `/derp` socket's send-buffer cap has no switch.
 
 Joining the mesh at all additionally requires `overlay_enabled = true` in the
 node config and a build carrying the `overlay-l3` (or `overlay-netstack`)

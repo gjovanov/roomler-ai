@@ -113,6 +113,7 @@ async fn a_server_that_offers_no_tls_is_sent_no_byte_of_the_sign_in() {
             user: "admin".into(),
             password: Zeroizing::new(made()),
             tls: tls::connector(Some(&ca)).unwrap(),
+            dial: crate::vault_proxy::Dial::Direct,
         };
         let why = sign_in(&up, "orders").await.err().unwrap();
         let sent = server.await.unwrap();
@@ -134,6 +135,7 @@ async fn a_server_that_asks_for_a_local_file_is_sent_none() {
         user: "admin".into(),
         password: Zeroizing::new(admin.clone()),
         tls: tls::connector(Some(&f.ca)).unwrap(),
+        dial: crate::vault_proxy::Dial::Direct,
     };
     let mut s = sign_in(&up, "orders").await.unwrap();
     let why = query(&mut s, LOCAL_FILE_PLEASE).await.unwrap_err();

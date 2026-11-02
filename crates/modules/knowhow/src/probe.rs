@@ -133,8 +133,9 @@ fn loopback(host: &str) -> bool {
     }
 }
 
-/// A fact's value as a probe's host, or why not.
-fn host_of(value: &Bson) -> Result<String, String> {
+/// A fact's value as a probe's host, or why not; (P4-6-1a) a connect's
+/// upstream host too ([`crate::connect`]).
+pub(crate) fn host_of(value: &Bson) -> Result<String, String> {
     let Bson::String(raw) = value else {
         return Err("is not text".into());
     };
@@ -157,7 +158,7 @@ fn host_of(value: &Bson) -> Result<String, String> {
 
 /// A fact's value as a port: a whole number from 1 to 65535, or one written
 /// as text.
-fn port_of(value: &Bson) -> Option<u16> {
+pub(crate) fn port_of(value: &Bson) -> Option<u16> {
     let n = match value {
         Bson::Int32(n) => i64::from(*n),
         Bson::Int64(n) => *n,
@@ -402,7 +403,7 @@ pub fn read_answer(
 }
 
 /// A fact's value as text, or none.
-fn text(value: &Bson) -> Option<&str> {
+pub(crate) fn text(value: &Bson) -> Option<&str> {
     match value {
         Bson::String(s) => Some(s.as_str()),
         _ => None,

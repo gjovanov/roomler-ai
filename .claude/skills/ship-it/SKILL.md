@@ -54,6 +54,16 @@ These do not error. They make every device quietly stop updating.
 | The GPG sidecar job | Non-Windows `download_asset` **requires** `<asset-url>.asc` and refuses fail-closed. A release whose GPG job skipped freezes every Linux/macOS agent. `release-agent.yml` now hard-fails on a tag when `GPG_PRIVATE_KEY` is absent (graceful skip only on a branch dispatch), plus a post-signing assertion that every `.deb`/`.pkg`/`.msi` got a sidecar |
 | The version scheme (rolling `0.4.<counter>`) | Six coupled MSI-mapping copies. Agents ≤ rc.483 **refuse** 0.4.x MSIs |
 | Asset ORDER in a release | A frozen agent's picker takes the **first** `.deb` matching its arch, and `/api/agent/latest-release` forwards GitHub's order. Publishing the Linux companion `.deb` into the agent release froze every pre-0.4.16 Linux agent — they apt-installed the companion *as* their daemon update. Fixed server-side (`agent_release::order_assets_daemon_first`) **because a frozen agent cannot receive an agent-side fix** |
+| `depends` in `agents/roomlerd/Cargo.toml` **vs** what a bare host resolves it to | `apt-get install` exits 0 whichever provider it picks, so a package can install and not start: 0.4.190 and 0.4.191 on a bare Ubuntu 24.04 (#3204). `verify-linux-debs` installs the finished packages on five bare images, on both arches, and `release` needs it. Read a red before re-running it: a failed fetch in the log is a mirror, and anything else is a package that does not start. Why the ALSA line reads as it does: `docs/installation.md`, "What a bare host needs" |
+
+⚠️ **The MSI's `Name` (what Apps & Features lists) is a display name**, not a fleet
+coupling: upgrades, `install_detect`, the version sweep and the updater's own MSI
+reader never read it (FR-133 P1). Its one consumer is `install.ps1`, which matches
+exact names (`$MsiNamesPerUser`, `$MsiNamesPerMachine`), and that script is served
+by the **server image**, not by the release. So a change to the name ships in this
+order: the script learns the new name, **promote that image**, and only then publish
+a release with it. The other way round, the served `install.ps1 -Uninstall` removes
+nothing and exits 0 (measured 2026-10-31: `done.`, and the product stayed installed).
 
 ⚠️ **A tag can publish nothing.** Always check `gh release view <tag>` assets
 before believing a release shipped; re-cut on a **fresh** number rather than
@@ -220,8 +230,9 @@ the next version.
 ```bash
 # Verify a lockstep roll — both must hold
 git ls-remote origin 'refs/tags/setup-v<V>^{}' 'refs/tags/agent-v<V>^{}'   # the SAME commit (the release's targetCommitish now reads `master`)
-gh release view setup-v<V> --json assets   # 3 platforms + sidecars
-for p in windows linux macos; do curl -sI https://roomler.ai/api/setup/$p | grep -i content-disposition; done   # every filename carries <V>
+gh release view setup-v<V> --json assets   # 4 platform archives + the Windows .exe (FR-129 C2), each with .sha256 + .asc
+for p in windows linux macos; do curl -sI https://roomler.ai/api/setup/$p | grep -i content-disposition; done   # every filename carries <V>; windows is the .exe
+curl -sI 'https://roomler.ai/api/setup/windows?format=zip' | grep -i content-disposition   # the zip, for a proxy that refuses an EXE
 
 # Re-run after a failure (the tag already exists at the agent commit; idempotent)
 gh workflow run release-setup.yml --ref setup-v<V> -f version=<V> -f publish_release=true
@@ -239,3 +250,21 @@ back into.
 ⚠️ `/api/setup/*` is served from the same per-pod release cache as the agent
 feed; the wizard lane's `refresh-release-cache` busts it, and the 15 min TTL is
 the backstop.
+
+⚠️ **`scripts/install.sh` ships on two trains (FR-129 B1).** The server compiles
+it in and serves it as `/api/setup/install.sh`
+(`crates/modules/fleet/src/setup_release.rs:346`), so the **terminal's** copy
+changes with a **promote**. The wizard compiles in its own for the Linux and macOS
+daemon installs (`agents/roomler-setup/src/unix_daemon.rs:78`), so the **GUI's**
+copy changes with an **agent release** (its `setup-v<V>` twin). A fix reaches each
+path only on its own train. The two copies differ whenever the deployed image and
+the newest wizard come from different commits, which during a promote hold can
+last weeks. (`agents/roomlerd/src/updater.rs` includes it too, in a test only.)
+⚠️ Both copies install the **newest** packages (`/api/agent/latest-release`), and a
+wizard someone downloaded keeps running its own copy for as long as the download
+is kept: an admin's share, or the SourceForge default, which stays on a pinned
+`setup-v` until someone moves it. So everything the script assumes about a package
+is a compatibility surface: the asset names it matches, the macOS marker that must
+exist before the `.pkg` (`/etc/roomler/enable-daemon`), what the postinstall does
+with it, and the `adopt-enrollment` verb. A package that changes one of these must
+keep the old behaviour working for the scripts already out there.

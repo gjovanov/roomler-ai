@@ -1,7 +1,12 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
-  <v-container fluid class="pa-0 remote-control-wrapper">
+  <v-container
+    fluid
+    class="pa-0 remote-control-wrapper"
+    :class="{ 'rc-immersive': immersive, 'rc-chrome-revealed': immersive && chromeRevealed }"
+    :style="immersive ? { '--rc-tb-h': `${toolbarHeight}px` } : undefined"
+  >
     <!-- ============================================================
          Toolbar Row 1: primary controls — Back / Title / status /
          Ctrl-Alt-Del / Connect-Disconnect / Fullscreen. Designed to
@@ -17,6 +22,7 @@
       color="surface"
       class="px-2 rc-toolbar-primary"
       :class="{ 'rc-tb-split': sessionToolsOnStrip }"
+      @pointerdown.capture="onChromeTouched"
     >
       <v-btn
         icon="mdi-arrow-left"
@@ -260,6 +266,14 @@
              mutter capture without asking anyone, and the operator can see
              that they did. Absent on Windows, macOS and older agents. -->
         <span v-if="metrics.codec && statsCaptureLabel" class="stats-pill">{{ statsCaptureLabel }}</span>
+        <!-- FR-135 R2 — the steps this session took down from what it set out to
+             run: the last one here, all of them on hover. -->
+        <span
+          v-if="metrics.codec && statsLadderLabel"
+          class="stats-pill"
+          data-testid="rc-media-ladder"
+          :title="statsLadderTitle"
+        >{{ statsLadderLabel }}</span>
         <span v-if="metrics.bitrate" class="stats-pill">{{ statsBitrateLabel }}</span>
         <span v-if="metrics.fps" class="stats-pill">{{ statsFpsLabel }}</span>
         <span v-if="metrics.resolution && statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
@@ -581,6 +595,13 @@
             </div>
             <div v-else-if="rec.state.value === 'pending_consent'" class="text-body-2">
               Waiting for the person at the device to allow it…
+            </div>
+            <div
+              v-else-if="rec.state.value === 'announcing'"
+              class="text-body-2"
+              data-testid="rc-record-announcing"
+            >
+              Telling the person at the device first…
             </div>
             <div v-else>
               <!-- #1760 — where the device says computer audio cannot go into
@@ -913,7 +934,44 @@
     </v-toolbar>
     <!-- FR-116 P5c — a running session's row: state chips first, then the
          tools, scrolling sideways. Empty and hidden otherwise. -->
-    <div v-show="sessionToolsOnStrip" id="rc-tb-strip" class="rc-tb-strip" data-testid="rc-tb-strip" />
+    <div
+      v-show="sessionToolsOnStrip"
+      id="rc-tb-strip"
+      class="rc-tb-strip"
+      data-testid="rc-tb-strip"
+      @pointerdown.capture="onChromeTouched"
+    />
+
+    <!-- FR-125 — immersive: the toolbar and the strip above are an overlay
+         out of view, and this tab slides them down over the stage. Over it,
+         not beside it: the stage keeps its size, so nothing re-sends
+         rc:resolution. 48 × 36 px of hit area (FR-120's D1), a 44 × 18 px tab. -->
+    <button
+      v-if="immersive && !chromeRevealed"
+      type="button"
+      class="rc-pulltab"
+      aria-label="Show the toolbar"
+      data-testid="rc-pulltab"
+      @click="revealChrome"
+    >
+      <span class="rc-pulltab-tab"><v-icon size="14">mdi-chevron-down</v-icon></span>
+    </button>
+    <!-- FR-125 P3 — once, where the browser can fullscreen the stage. -->
+    <v-chip
+      v-if="fullscreenChipShown"
+      class="rc-fullscreen-chip"
+      color="surface"
+      variant="elevated"
+      size="small"
+      prepend-icon="mdi-fullscreen"
+      closable
+      close-label="Not now"
+      data-testid="rc-fullscreen-chip"
+      @click="fullscreenFromChip"
+      @click:close="closeFullscreenChip"
+    >
+      Full screen
+    </v-chip>
 
     <!-- File input (hidden); shared between Row 2 inline upload
          button and the bottom-sheet upload button. `multiple`
@@ -939,6 +997,7 @@
       rounded="lg"
       border
       class="ma-2 ma-md-3 remote-stage-card flex-grow-1 d-flex"
+      @pointerdown.capture="onStageTouchedWhileRevealed"
     >
     <div class="remote-stage">
       <!-- An overlay along the top of the stage. As flex siblings of the
@@ -1143,6 +1202,40 @@
         </v-btn>
       </div>
 
+      <!-- FR-135 R2 — and a page with no picture keeps saying why while the
+           watchdog re-creates the session. With the words only on the connected
+           stage, every redial read "Connection lost", which is false (the device
+           answered) and, from the fourth attempt, lasts minutes. -->
+      <div
+        v-else-if="noPictureWhileRedialling"
+        class="empty-state"
+        :data-testid="noPictureWhileRedialling.testId"
+      >
+        <v-icon size="72" :color="noPictureWhileRedialling.iconColor">mdi-video-off</v-icon>
+        <p class="text-body-1 mt-3">{{ noPictureWhileRedialling.title }}</p>
+        <p v-if="noPictureWhileRedialling.body" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
+          {{ noPictureWhileRedialling.body }}
+        </p>
+        <p v-if="noPictureWhileRedialling.code" class="text-caption text-medium-emphasis mt-2">
+          Reported by the device as
+          <code>{{ noPictureWhileRedialling.code }}</code>.
+          <span v-if="noPictureWhileRedialling.detail">{{ noPictureWhileRedialling.detail }}</span>
+        </p>
+        <p class="text-caption text-medium-emphasis mt-2">
+          <template v-if="rc.phase.value === 'reconnecting'">
+            Trying again by itself (attempt {{ rc.reconnectAttempt.value }})…
+          </template>
+          <template v-else>{{ phaseLabel }}</template>
+        </p>
+        <p v-if="agent && !agent.is_online" class="text-caption text-warning">
+          The device currently reports offline — retries continue until it
+          returns.
+        </p>
+        <v-btn variant="tonal" size="small" class="mt-3" @click="leave()">
+          Cancel
+        </v-btn>
+      </div>
+
       <div
         v-else-if="['requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value)"
         class="empty-state"
@@ -1314,8 +1407,11 @@
         <div v-if="rc.mediaUnavailable.value" class="no-media-overlay">
           <v-icon size="72" color="warning">mdi-monitor-off</v-icon>
           <p class="text-body-1 mt-3">This device cannot capture its screen.</p>
+          <!-- #3164 — the agent's sentence, except the one every agent up to
+               0.4.188 sends for a Mac's Screen Recording, which said "then
+               reconnect" (macOS applies the grant to a restarted agent only). -->
           <p v-if="rc.mediaUnavailable.value.hint" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
-            {{ rc.mediaUnavailable.value.hint }}
+            {{ mediaUnavailableHint(rc.mediaUnavailable.value.code, rc.mediaUnavailable.value.hint) }}
           </p>
           <p class="text-caption text-medium-emphasis mt-2">
             Reported by the device as
@@ -1341,6 +1437,25 @@
           <p v-if="mediaWaitingCopy(rc.mediaWaiting.value.for).showsDeadline" class="text-caption text-medium-emphasis mt-2">
             If nobody answers, the request ends at {{ mediaWaitingEnds }}.
           </p>
+        </div>
+        <!-- FR-135 R2 — the device said why it stopped its video, or it said
+             nothing and no picture ever came, and the page knows what it was
+             promised. Before this the page stayed black and re-created the
+             session every 10 s, with the reason only in the host's log. The
+             stage above carries the same words through the re-create. -->
+        <div v-else-if="noPicture" class="no-media-overlay" :data-testid="noPicture.testId">
+          <v-icon size="72" :color="noPicture.iconColor">mdi-video-off</v-icon>
+          <p class="text-body-1 mt-3">{{ noPicture.title }}</p>
+          <p v-if="noPicture.body" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
+            {{ noPicture.body }}
+          </p>
+          <p v-if="noPicture.code" class="text-caption text-medium-emphasis mt-2">
+            Reported by the device as
+            <code>{{ noPicture.code }}</code>.
+            <span v-if="noPicture.detail">{{ noPicture.detail }}</span>
+          </p>
+          <!-- An external session takes no retry: the watchdog ends it instead. -->
+          <p v-if="!isExternal" class="text-caption text-medium-emphasis mt-1">This page keeps trying.</p>
         </div>
         <div v-else-if="!rc.hasMedia.value" class="no-media-overlay">
           <v-icon size="72" color="grey-lighten-1">mdi-video-off</v-icon>
@@ -1667,6 +1782,19 @@
             class="mt-3 mb-2"
             data-testid="rc-picker-fps"
           />
+          <!-- FR-119 P2b-17b — the agent refused the ask as unproven and can be
+               asked to trial it again (`fps-retry` in its video caps). -->
+          <v-btn
+            v-if="frameRateRetryable"
+            size="small"
+            variant="text"
+            prepend-icon="mdi-refresh"
+            class="mb-2"
+            data-testid="rc-fps-retry"
+            @click="retryFrameRate"
+          >
+            {{ frameRateRetryLabel }}
+          </v-btn>
 
           </v-tabs-window-item>
 
@@ -1754,6 +1882,18 @@
             class="mt-2"
             label="Hide device name when a display name is set"
             messages="The same setting as on the Devices page"
+          />
+          <!-- FR-125 — the mode's kill switch, offered where a finger is the
+               pointer; remembered per browser. -->
+          <v-checkbox
+            v-if="coarsePointer"
+            v-model="immersiveSetting"
+            density="compact"
+            hide-details="auto"
+            class="mt-2"
+            label="Immersive when sideways on a phone"
+            messages="The bars step aside and the remote desktop takes the whole screen; the tab at the top brings them back"
+            data-testid="rc-immersive-setting"
           />
 
           </v-tabs-window-item>
@@ -1873,14 +2013,21 @@
             {{ localRelayTooltip }}
           </div>
           <!-- FR-121 — which of your devices this browser runs on, so the
-               server hands its relay over and the browser never asks for the
-               local-network permission. Next Connect, like the switch. -->
+               server hands their relays over and the browser never asks for
+               the local-network permission. Next Connect, like the switch.
+               P3b (#2774) — more than one: a computer can run several agents
+               (Windows and WSL), each with its own relay and its own path. -->
           <v-select
             v-if="localRelayOn"
-            v-model="thisDevice"
+            v-model="thisDevicesPick"
             :items="thisDeviceItems"
             :disabled="sessionLive"
             label="This browser runs on"
+            placeholder="Not set — look for a relay on this computer"
+            persistent-placeholder
+            multiple
+            chips
+            closable-chips
             density="compact"
             variant="outlined"
             hide-details
@@ -2467,6 +2614,9 @@ import {
   idleSecondsLeft,
   hostLockedChipTitle,
   awaitingConsentLabel,
+  drawerPasteFiles,
+  uploadOutcomeMessage,
+  thisDevicesFromPick,
 } from '@/composables/useRemoteControl'
 import {
   PICKER_CHROMAS,
@@ -2491,7 +2641,14 @@ import {
   type RemoteRecordingItem,
 } from '@/composables/useRemoteRecording'
 import { describePrivacyReason, showsPrivacyRefusal } from '@/composables/usePrivacyMode'
-import { agentOffersHighRefresh, frameRateSummary, type FrameRate } from '@/composables/frameRate'
+import {
+  agentOffersFrameRateRetry,
+  agentOffersHighRefresh,
+  frameRateCanRetry,
+  frameRateSummary,
+  type FrameRate,
+} from '@/composables/frameRate'
+import { describeMediaStep, mediaLadderLabel, noPictureWords } from '@/composables/mediaPlan'
 import { featureRefusal, summarizeRefusals } from '@/composables/useSessionFeatures'
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
@@ -2505,6 +2662,7 @@ import type { KeepBusyPattern } from '@/composables/keepBusy'
 import { displayMatchSummary } from '@/composables/displayMatch'
 import { agentSupportsRelativeMouse, relativeMouseSwitchedOff } from '@/composables/relativeMouse'
 import { agentSendsSas } from '@/composables/ctrlAltDel'
+import { mediaUnavailableHint } from '@/composables/macPermissionHint'
 import { pictureOverflows, stageTouchAction } from '@/composables/touchInput'
 import {
   BUILTIN_PRESETS,
@@ -2514,6 +2672,15 @@ import {
   readControlsPreset,
   type TouchPreset,
 } from '@/composables/touchControls'
+import {
+  IMMERSIVE_CHROME_HIDE_MS,
+  dismissFullscreenChip,
+  isPhoneSideways,
+  readFullscreenChipDismissed,
+  readImmersiveSetting,
+  setImmersiveViewer,
+  writeImmersiveSetting,
+} from '@/composables/useImmersiveViewer'
 import { secondaryDeviceName, useHideDeviceName } from '@/composables/useHideDeviceName'
 import { asSentence } from '@/utils/sentence'
 import { hostOffers, hostReason, hostSpeaks } from '@/utils/hostUnavailable'
@@ -2600,6 +2767,104 @@ const settingsOpen = ref(false)
 // next session's verdict is a new object, so it shows again.
 const dismissedInputReach = ref<object | null>(null)
 const clipboardBusy = ref(false)
+
+// FR-125 P1 — immersive landscape on phones. While a session runs on a touch
+// page held sideways and under 500 px tall, the app bar, the toolbar and the
+// tools strip step aside and the stage takes the whole page. The toolbar and
+// the strip become an overlay out of view, still mounted: the strip is the
+// session tools' Teleport target, and the toolbar holds live state. The
+// pull-tab slides them back down OVER the stage, which keeps its size, so
+// nothing re-sends rc:resolution. Measured on production before it: the bars
+// left the remote desktop 146–254 px on a phone held sideways, and every
+// built-in touch preset ran off the top.
+const coarsePointer = (() => {
+  try {
+    return globalThis.matchMedia?.('(pointer: coarse)').matches === true
+  } catch {
+    return false
+  }
+})()
+// The setting is the kill switch (FR-125 §3.4): on unless this browser turned
+// it off; holding the phone upright or ending the session also leaves the mode.
+const immersiveSetting = ref(readImmersiveSetting())
+watch(immersiveSetting, (on) => writeImmersiveSetting(on))
+const immersive = computed(
+  () =>
+    rc.phase.value === 'connected' &&
+    immersiveSetting.value &&
+    isPhoneSideways(coarsePointer, displayWidth.value, displayHeight.value),
+)
+const chromeRevealed = ref(false)
+// Revealed, the strip sits under the toolbar: the toolbar's own height, read
+// when it is revealed (a compact v-toolbar is 48 px).
+const toolbarHeight = ref(48)
+let chromeHideTimer: ReturnType<typeof setTimeout> | null = null
+function clearChromeHide() {
+  if (chromeHideTimer !== null) {
+    clearTimeout(chromeHideTimer)
+    chromeHideTimer = null
+  }
+}
+/** D2 — the revealed toolbar hides again after a few seconds without a touch
+ *  inside it. A dialog or a menu opened from it (an active Vuetify overlay —
+ *  Settings, the files drawer, the touch presets' menu) keeps it up until that
+ *  closes. */
+function armChromeHide() {
+  clearChromeHide()
+  chromeHideTimer = setTimeout(() => {
+    chromeHideTimer = null
+    if (globalThis.document?.querySelector('.v-overlay--active')) armChromeHide()
+    else chromeRevealed.value = false
+  }, IMMERSIVE_CHROME_HIDE_MS)
+}
+function revealChrome() {
+  const tb = globalThis.document?.querySelector<HTMLElement>('.rc-toolbar-primary')
+  if (tb && tb.offsetHeight > 0) toolbarHeight.value = tb.offsetHeight
+  chromeRevealed.value = true
+  armChromeHide()
+}
+function hideChrome() {
+  clearChromeHide()
+  chromeRevealed.value = false
+}
+function onChromeTouched() {
+  if (immersive.value && chromeRevealed.value) armChromeHide()
+}
+/** A tap on the stage while the toolbar is down puts it away; the tap itself
+ *  still reaches the remote desktop. */
+function onStageTouchedWhileRevealed() {
+  if (immersive.value && chromeRevealed.value) hideChrome()
+}
+watch(
+  immersive,
+  (on) => {
+    setImmersiveViewer(on)
+    if (!on) hideChrome()
+  },
+  { immediate: true },
+)
+// FR-125 P3 — where the browser can fullscreen the stage (Android's Chrome),
+// the mode offers it once: it also hides the browser's own bar, which nothing
+// a page does otherwise can. Used or closed, it is gone for this browser.
+// `fullscreenEnabled` and `isFullscreen` are declared further down; the
+// computed reads them only once the page runs.
+const fullscreenChipDismissed = ref(readFullscreenChipDismissed())
+const fullscreenChipShown = computed(
+  () => immersive.value && fullscreenEnabled.value && !isFullscreen.value && !fullscreenChipDismissed.value,
+)
+function closeFullscreenChip() {
+  fullscreenChipDismissed.value = true
+  dismissFullscreenChip()
+}
+function fullscreenFromChip() {
+  closeFullscreenChip()
+  toggleFullscreen()
+}
+onBeforeUnmount(() => {
+  clearChromeHide()
+  // No other page may start without the app bar.
+  setImmersiveViewer(false)
+})
 
 // FR-85 P3c — recording the remote screen (docs/recording.md §10). The file is
 // made and kept on the device; this starts and stops it and downloads it.
@@ -2830,7 +3095,10 @@ watch(
     if (phase !== 'connected') mobileKeyboardOpen.value = false
   },
 )
-const uploadBusy = ref(false)
+// A count, not a flag (#2929): a drop while an upload runs now queues behind
+// it, and the first of the two to finish must not stop the spinner.
+const uploadsInFlight = ref(0)
+const uploadBusy = computed(() => uploadsInFlight.value > 0)
 // Visual cue when a draggable item is hovering the stage. Toggled on
 // dragenter/dragover (true) + drop/dragleave (false). The
 // `.prevent.stop` modifiers on the v-on bindings are what actually
@@ -3192,26 +3460,21 @@ async function downloadEntry(entry: { name: string; is_dir: boolean }) {
 // only fire on the focused element — so unless the operator clicked
 // into the drawer first, the handler never ran (Field repro rc.15
 // 2026-05-07). Moving to window scope makes the handler robust to
-// focus state. The viewer's separate composable-side onPaste fires
-// first; it only acts when `pendingCtrlV` is set (Ctrl+V over the
-// viewer specifically), so this drawer handler kicks in for every
-// other paste-with-files when the drawer is open.
+// focus state. It is one of TWO window `paste` listeners: the
+// composable's `onPaste` takes the paste that follows a deferred Ctrl+V
+// over the viewer. This one is registered at mount, before `attachInput`
+// registers that one, so it runs FIRST — and with the drawer open a
+// files Ctrl+V used to upload twice, here and again from `onPaste` into
+// the default folder (#2910). One owner per paste now:
+// `drawerPasteFiles` steps aside on a paste already consumed, and
+// `routeDeferredPaste` answers `taken` for one this handler consumed.
 function onWindowPasteForDrawer(ev: ClipboardEvent) {
-  if (!filesDrawer.value) return
-  const dt = ev.clipboardData
-  if (!dt || !dt.files || dt.files.length === 0) return
-  // Don't intercept paste into form inputs (e.g. the path-input
-  // field at the top of the drawer).
-  const target = ev.target as Element | null
-  if (target) {
-    const tag = target.tagName
-    if (tag === 'INPUT' || tag === 'TEXTAREA') return
-    if ((target as HTMLElement).isContentEditable) return
-  }
+  // Not the drawer's: shut, no files, a form input's own paste (the
+  // path field at the top of the drawer), or already consumed.
+  const files = drawerPasteFiles(ev, filesDrawer.value)
+  if (!files) return
   ev.preventDefault()
   ev.stopPropagation()
-  const files: File[] = []
-  for (let i = 0; i < dt.files.length; i++) files.push(dt.files[i])
   // Drawer-scope paste honours the current dir as the upload target
   // (file-DC v2.2 path-targeted upload). When the drawer is at the
   // roots view (currentDirPath = "Drives" / "/"), we skip dest_path
@@ -3389,32 +3652,16 @@ async function uploadMany(
   destPath?: string
 ) {
   if (items.length === 0) return
-  uploadBusy.value = true
+  uploadsInFlight.value++
   try {
     const results = await rc.uploadFiles(items, destPath ? { destPath } : undefined)
-    const ok = results.filter((r) => r.ok).length
-    const failed = results.filter((r) => !r.ok)
-    if (failed.length === 0) {
-      showSuccess(
-        ok === 1
-          ? `Uploaded ${results[0].name}`
-          : `Uploaded ${ok} files`
-      )
-    } else if (ok === 0) {
-      const first = failed[0] as { name: string; error: string }
-      showError(
-        failed.length === 1
-          ? `Upload failed: ${first.error}`
-          : `${failed.length} uploads failed (first: ${first.name} — ${first.error})`
-      )
-    } else {
-      const first = failed[0] as { name: string; error: string }
-      showError(
-        `Uploaded ${ok}/${items.length} — ${failed.length} failed (e.g. ${first.name}: ${first.error})`
-      )
-    }
+    // #2930 — a file the host put somewhere else is a warning, not "Uploaded".
+    const said = uploadOutcomeMessage(results, items.length, destPath)
+    if (said.level === 'success') showSuccess(said.text)
+    else if (said.level === 'warning') showSnackbar(said.text, 'warning', 10000)
+    else showError(said.text)
   } finally {
-    uploadBusy.value = false
+    uploadsInFlight.value--
   }
 }
 
@@ -3546,12 +3793,13 @@ function toggleLocalRelay() {
   rc.setLocalRelayEnabled(!localRelayOn.value)
 }
 
-// FR-121 — "This browser runs on": one of the signed-in person's own devices
-// that report their loopback relay (`local-relay`), or none of them. Named, the
-// server hands that device's relay over and the browser never fetches
-// 127.0.0.1, so Chrome's local-network permission is never asked. Per browser,
-// and like the switch above it takes effect on the next Connect. A probe that
-// finds a relay naming its device fills it in by itself.
+// FR-121 — "This browser runs on": the signed-in person's own devices that
+// report their loopback relay (`local-relay`), or none of them. Named, the
+// server hands their relays over and the browser never fetches 127.0.0.1, so
+// Chrome's local-network permission is never asked. Per browser, and like the
+// switch above it takes effect on the next Connect. A probe that finds relays
+// naming the person's devices fills them in by itself. P3b (#2774) — every
+// device on this computer, not one: a computer can run several agents.
 const thisDeviceItems = computed(() => {
   const me = authStore.user?.id
   const own = agentStore.agents
@@ -3565,9 +3813,12 @@ const thisDeviceItems = computed(() => {
     ...own,
   ]
 })
-const thisDevice = computed<string>({
-  get: () => rc.thisDeviceId.value ?? '',
-  set: (v) => rc.setThisDevice(v === '' ? null : v),
+const thisDevicesPick = computed<string[]>({
+  get: () => {
+    const v = rc.thisDevices.value
+    return v === null ? [] : v === 'none' ? ['none'] : [...v]
+  },
+  set: (next) => rc.setThisDevices(thisDevicesFromPick(thisDevicesPick.value, next)),
 })
 const localRelayRefusedText = computed<string | null>(() => {
   const why = rc.localRelayRefused.value
@@ -3576,7 +3827,9 @@ const localRelayRefusedText = computed<string | null>(() => {
     not_your_device: 'that device is not yours',
     other_network: 'that device is in another organization',
     device_offline: 'that device is offline, or reports no relay',
-    rc_overlay_off: 'this device does not let remote desktop use the mesh (rc_overlay)',
+    // FR-128 — also `auto` on an agent too old to decide it, which reads as off.
+    rc_overlay_off:
+      'this device does not let remote desktop use the mesh (rc_overlay off, or auto on an agent that predates it)',
     same_device: 'you are viewing the device this browser runs on',
   }
   return `The local relay was not used: ${reasons[why] ?? why}.`
@@ -3879,9 +4132,9 @@ const codecChoice = rc.codecChoice
 // FR-77 — the validity matrix behind the two dropdowns: the agent's cells
 // (one derivation for new and old agents) crossed with this browser's decode
 // probes and the decode failures remembered for this device. 4:2:0 cells stay
-// optimistic until the device record arrives (the rc.190 contract — the agent
-// falls back when it cannot honour a pick); every 4:4:4 cell demands proof
-// from both ends, because a chroma mismatch is a black screen.
+// optimistic until the device record arrives (connect() holds the pick to that
+// record, #3167); every 4:4:4 cell demands proof from both ends, because a
+// chroma mismatch is a black screen.
 const cellAvail = computed<Availability>(() =>
   cellAvailability({
     cells: cellsFromCaps(agent.value?.capabilities),
@@ -3960,6 +4213,19 @@ const frameRateHint = computed(
     frameRateSummary(rc.frameRateAnswer.value) ??
     'Above 60 only where this device has shown it can sustain it',
 )
+// FR-119 P2b-17b — "try again" for an ask the agent refused as unproven.
+const frameRateRetryable = computed(() =>
+  frameRateCanRetry(
+    rc.frameRateAnswer.value,
+    agentOffersFrameRateRetry(agent.value?.capabilities?.video),
+  ),
+)
+const frameRateRetryLabel = computed(
+  () => `Try ${rc.frameRateAnswer.value?.asked ?? ''} fps again`,
+)
+function retryFrameRate() {
+  rc.setFrameRate(rc.frameRate.value, true)
+}
 const priorityOptions = [
   {
     title: 'Balanced',
@@ -4604,6 +4870,8 @@ const statsBitrateLabel = computed(() => {
 /** FR-93 P2 — which Linux arm captures this session, and whether anyone at
  *  the screen was asked. `''` (no pill) for Windows, macOS and older agents. */
 const statsCaptureLabel = computed(() => captureArmLabel(rc.videoInfo.value))
+const statsLadderLabel = computed(() => mediaLadderLabel(rc.mediaPlan.value?.ladder ?? []))
+const statsLadderTitle = computed(() => (rc.mediaPlan.value?.ladder ?? []).map(describeMediaStep).join('\n'))
 const statsAgeLabel = computed(() => {
   const age = rc.decodeDiag.value?.age
   if (!age || age.n <= 0) return ''
@@ -4922,6 +5190,15 @@ const asleepWhileRedialling = computed(() => {
   if (w?.for !== 'host_sleep') return null
   return ['reconnecting', 'requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value) ? w : null
 })
+// FR-135 R2 — what this page says about having no picture, on the connected stage
+// and through a redial. The composable keeps it across a re-create, and the first
+// frame ends it.
+const noPicture = computed(() =>
+  noPictureWords(rc.mediaStop.value, rc.mediaSilent.value, rc.mediaPlan.value, rc.mediaDataArrived.value),
+)
+const noPictureWhileRedialling = computed(() =>
+  ['reconnecting', 'requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value) ? noPicture.value : null,
+)
 const mediaWaitingEnds = computed(() => {
   const w = rc.mediaWaiting.value
   return w ? new Date(w.deadlineMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''
@@ -5372,7 +5649,11 @@ watch(
               ? `Uploading ${files[0].name}…`
               : `Uploading ${files.length} files…`
           )
-          void uploadMany(files)
+          // With the drawer open its directory is the destination,
+          // whichever listener took the paste (#2910): the drawer's
+          // handler leaves a paste into the soft keyboard's textarea
+          // (a form input) to this one.
+          void uploadMany(files, filesDrawer.value ? drawerUploadDestPath() : undefined)
         },
         // rc.18: anchor focus on the viewer wrapper itself. The
         // composable's onPointerEnter blurs whatever was focused
@@ -5584,6 +5865,95 @@ onBeforeUnmount(() => {
   overflow: hidden;
   min-height: 0;
   background: #0b0b0b;
+}
+/* FR-125 — immersive landscape on phones (`immersive`): the stage takes the
+   whole page, and the toolbar and the strip become an overlay above it, out of
+   view (and out of the tab order) until the pull-tab slides them down. Over the
+   stage, never beside it: the stage keeps its size, so nothing re-sends
+   rc:resolution. The card's margin, border, corners and shadow go too: 8 px of
+   margin a side is 4 % of a 390 px page. Vuetify's utility classes are
+   !important, hence the !important here. */
+.remote-control-wrapper.rc-immersive {
+  position: relative;
+  overflow: hidden;
+}
+.rc-immersive > .rc-toolbar-primary,
+.rc-immersive > .rc-tb-strip {
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  visibility: hidden;
+  transition:
+    transform 160ms ease-out,
+    visibility 0s linear 160ms;
+}
+.rc-immersive > .rc-toolbar-primary {
+  top: 0;
+  transform: translateY(-100%);
+}
+.rc-immersive > .rc-tb-strip {
+  top: var(--rc-tb-h, 48px);
+  transform: translateY(calc(-100% - var(--rc-tb-h, 48px)));
+}
+.rc-immersive.rc-chrome-revealed > .rc-toolbar-primary,
+.rc-immersive.rc-chrome-revealed > .rc-tb-strip {
+  visibility: visible;
+  transform: none;
+  transition:
+    transform 160ms ease-out,
+    visibility 0s;
+}
+.rc-immersive > .remote-stage-card {
+  margin: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+/* Above the stage and the touch overlay (z-index 20), below the revealed
+   toolbar. The button is the 48 × 36 px hit area (FR-120's D1); the tab is
+   what shows. */
+.rc-pulltab {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 25;
+  width: 48px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  cursor: pointer;
+}
+/* The tab sits on whatever the remote desktop shows at its top edge — a dark
+   panel as often as a light title bar — so it is a surface-coloured pill with a
+   shadow, like the full-screen chip: a translucent dark tab vanished against a
+   GNOME top panel in the first field run. */
+.rc-pulltab-tab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 18px;
+  border-radius: 0 0 10px 10px;
+  background: rgb(var(--v-theme-surface));
+  color: rgb(var(--v-theme-on-surface));
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.35),
+    0 0 0 1px rgba(0, 0, 0, 0.12);
+}
+.rc-pulltab:focus-visible .rc-pulltab-tab {
+  outline: 2px solid rgb(var(--v-theme-primary));
+}
+.rc-fullscreen-chip {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 25;
 }
 .remote-stage {
   flex: 1;

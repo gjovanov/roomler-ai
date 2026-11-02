@@ -104,6 +104,16 @@ pub enum Vp9Chroma {
 }
 
 impl Vp9Chroma {
+    /// #3267 — whether `deny` names libvpx in this chroma.
+    fn denied_by(self, deny: &[String]) -> bool {
+        use roomler_ai_remote_control::models::ChromaFormat;
+        let chroma = match self {
+            Self::Yuv420 => ChromaFormat::Yuv420,
+            Self::Yuv444 => ChromaFormat::Yuv444,
+        };
+        crate::encode::cells::cell_denied(deny, crate::encode::cells::LIBVPX_VP9, chroma)
+    }
+
     /// libvpx `g_profile` value (0 or 1).
     pub fn vpx_profile(self) -> c_uint {
         match self {
@@ -193,6 +203,15 @@ impl Vp9Encoder {
     ) -> Result<Self> {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("vp9-444: require non-zero, even dimensions, got {width}x{height}");
+        }
+        // #3267 — software, but a cell like any other: if an open of it ended
+        // the probe's child it would end the daemon's session too.
+        if chroma.denied_by(&crate::encode::cells::denied_cells()) {
+            bail!(
+                "{}:{} is on the device denylist",
+                crate::encode::cells::LIBVPX_VP9,
+                chroma.as_str()
+            );
         }
         let target_fps = target_fps.clamp(1, 240);
 
@@ -422,14 +441,35 @@ impl Vp9Encoder {
             0 as c_uint,
             "VP9E_SET_NOISE_SENSITIVITY",
         );
+        // FR-130 P1 — the header's colour space and range, for 4:2:0 and 4:4:4
+        // alike. libvpx writes them from these two controls ONLY: `img.cs` /
+        // `img.range` in `encode_sync` never reach the bitstream (libvpx
+        // 1.12 `vp9_cx_iface.c:1876-1888`, `vp9_bitstream.c:1184-1187`), so
+        // until FR-130 every VP9 keyframe said CS_UNKNOWN. Unset (the switch
+        // off) leaves libvpx's defaults, CS_UNKNOWN at studio range: today's
+        // header exactly. VP9 has no primaries or transfer field.
+        if let Some(d) = crate::encode::color_desc::active() {
+            let c = crate::encode::color_desc::vp9(d);
+            self.set_ctrl(
+                vpx::vp8e_enc_control_id::VP9E_SET_COLOR_SPACE as c_int,
+                c.color_space,
+                "VP9E_SET_COLOR_SPACE",
+            );
+            self.set_ctrl(
+                vpx::vp8e_enc_control_id::VP9E_SET_COLOR_RANGE as c_int,
+                c.color_range,
+                "VP9E_SET_COLOR_RANGE",
+            );
+        }
     }
 
     fn set_ctrl<T: Copy>(&mut self, id: c_int, value: T, name: &'static str) {
         // SAFETY: libvpx's variadic control ABI accepts an int-sized
         // argument for every VP9 control we touch (cpuused, tune,
         // aq_mode, tile_columns, frame_parallel, static_threshold,
-        // noise_sensitivity). We only ever pass `c_int` or `c_uint`,
-        // both of which are int-width on every supported target.
+        // noise_sensitivity, color_space, color_range). We only ever pass
+        // `c_int` or `c_uint`, both of which are int-width on every
+        // supported target.
         let err = unsafe { vpx::vpx_codec_control_(&mut self.ctx, id, value) };
         if err != vpx::VPX_CODEC_OK {
             tracing::warn!(
@@ -529,14 +569,14 @@ impl Vp9Encoder {
         // Size the floor off the ACTUAL stride. The old `width * height * 4`
         // check passed on a padded buffer and then read past the last row.
         let expected = src_stride * (frame.height as usize);
-        if frame.data.len() < expected {
+        if frame.cpu().len() < expected {
             bail!(
                 "vp9-444: BGRA buffer too small — need {} bytes ({}x{} at stride {}), got {}",
                 expected,
                 frame.width,
                 frame.height,
                 src_stride,
-                frame.data.len()
+                frame.cpu().len()
             );
         }
         use dcv_color_primitives as dcv;
@@ -554,7 +594,7 @@ impl Vp9Encoder {
             color_space: dcv::ColorSpace::Bt601,
             num_planes: 3,
         };
-        let src_buffers: &[&[u8]] = &[&frame.data];
+        let src_buffers: &[&[u8]] = &[frame.cpu()];
         let src_strides = &[src_stride];
         let dst_buffers: &mut [&mut [u8]] =
             &mut [&mut self.y_plane, &mut self.u_plane, &mut self.v_plane];
@@ -626,6 +666,8 @@ impl Vp9Encoder {
             ),
         };
         img.fmt = img_fmt;
+        // Never reaches the bitstream: the header's colour comes from the
+        // FR-130 controls in `apply_screen_content_controls`.
         img.cs = vpx::vpx_color_space::VPX_CS_BT_601;
         img.range = vpx::vpx_color_range::VPX_CR_STUDIO_RANGE;
         img.w = self.width as c_uint;
@@ -964,12 +1006,23 @@ mod tests {
             height: h,
             stride: w * 4,
             pixel_format: PixelFormat::Bgra,
-            data,
+            data: data.into(),
             monotonic_us: 0,
             monitor: 0,
             damage: crate::capture::Damage::Unknown,
             source: None,
         }
+    }
+
+    /// #3267 — a denylist that names one chroma form leaves the other. Pure on
+    /// purpose: other tests here open both forms unlocked, so this one must
+    /// not put either on the process-wide list.
+    #[test]
+    fn a_denylist_names_one_chroma_form() {
+        let deny = vec!["vp9_libvpx:yuv444".to_string()];
+        assert!(Vp9Chroma::Yuv444.denied_by(&deny));
+        assert!(!Vp9Chroma::Yuv420.denied_by(&deny));
+        assert!(!Vp9Chroma::Yuv444.denied_by(&[]));
     }
 
     /// First-frame keyframe lock. With profile 1 + I444 + lag=0 the
@@ -993,6 +1046,45 @@ mod tests {
     fn rejects_odd_dims() {
         assert!(Vp9Encoder::new(321, 240).is_err());
         assert!(Vp9Encoder::new(320, 241).is_err());
+    }
+
+    /// FR-130 P1 — both VP9 forms' keyframe headers carry
+    /// `color_desc::vp9(DESCRIPTION)` with the switch on, and libvpx's
+    /// defaults (CS_UNKNOWN at studio range: today's header) with it off.
+    /// `img.cs` is set either way, which is why the off case reads unknown.
+    #[test]
+    fn both_vp9_forms_describe_their_colour() {
+        use crate::encode::bitstream_color::{bars, vp9_keyframe};
+        use crate::encode::color_desc::{DESCRIPTION, vp9};
+        use tunnel_core::env::test_env::{Saved, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _switch = Saved::cleared("COLOR_DESCRIPTION");
+        let want = vp9(DESCRIPTION);
+        for chroma in [Vp9Chroma::Yuv420, Vp9Chroma::Yuv444] {
+            for on in [true, false] {
+                // SAFETY: serialised by DENY_ENV_LOCK; the guard restores it.
+                unsafe { set("COLOR_DESCRIPTION", if on { "1" } else { "0" }) };
+                let mut enc = Vp9Encoder::new_with_fps_chroma(320, 240, 30, chroma).expect("init");
+                let packets = enc.encode_sync(&bars(320, 240, 0)).expect("encode");
+                let key = packets.iter().find(|p| p.is_keyframe).expect("a keyframe");
+                let header = vp9_keyframe(&key.data).expect("a keyframe header");
+                eprintln!("FR-130 libvpx {}, switch {on}: {header:?}", chroma.as_str());
+                assert_eq!(u32::from(header.profile), chroma.vpx_profile());
+                if on {
+                    assert_eq!(
+                        i32::from(header.color_space),
+                        want.color_space,
+                        "{chroma:?}"
+                    );
+                    assert_eq!(i32::from(header.full_range), want.color_range, "{chroma:?}");
+                } else {
+                    assert_eq!(header.color_space, 0, "{chroma:?}: CS_UNKNOWN");
+                    assert!(!header.full_range, "{chroma:?}: studio range");
+                }
+            }
+        }
     }
 
     /// A padded source must convert to the same picture as a tight one.
@@ -1023,7 +1115,7 @@ mod tests {
         }
 
         let mut padded_frame = synth_bgra(w, h);
-        padded_frame.data = padded;
+        padded_frame.data = padded.into();
         padded_frame.stride = stride as u32;
 
         let mut from_padded = Vp9Encoder::new(w, h).expect("encoder init");
@@ -1051,7 +1143,7 @@ mod tests {
         let mut frame = synth_bgra(w, h);
         frame.stride = stride as u32;
         // Big enough for the old `w*h*4` check, too small for the real rows.
-        frame.data = vec![0u8; stride * (h as usize - 1)];
+        frame.data = vec![0u8; stride * (h as usize - 1)].into();
 
         let mut enc = Vp9Encoder::new(w, h).expect("encoder init");
         assert!(enc.bgra_to_yuv(&frame).is_err());
@@ -1210,7 +1302,7 @@ mod tests {
                     height: h,
                     stride: self.w * 4,
                     pixel_format: PixelFormat::Bgra,
-                    data,
+                    data: data.into(),
                     monotonic_us: t_us as _,
                     monitor: 0,
                     damage: crate::capture::Damage::Unknown,
@@ -1489,7 +1581,7 @@ mod fr112_bench {
                     height: H,
                     stride: W * 4,
                     pixel_format: PixelFormat::Bgra,
-                    data: d,
+                    data: d.into(),
                     monotonic_us: (k as u64) * 16_667,
                     monitor: 0,
                     damage: crate::capture::Damage::Unknown,
