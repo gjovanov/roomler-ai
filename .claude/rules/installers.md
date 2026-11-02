@@ -99,12 +99,14 @@ tree: `appdirs::use_old_segment` is new-if-present, so a log folder made from ou
 orphans a legacy host's config, which is why stderr capture lives in the daemon.
 ⚠️ **`RegisterAutostart` stays the last action before `InstallFinalize`.** The task names the
 launcher, and a rollback onto a release without one would leave a task that starts nothing.
-⚠️ **Restart Manager stops nothing once the daemon runs through the launcher, so the MSI's
-`StopDaemon` stops it, and it stays before `UnregisterAutostart`.** A windowless launcher and a
-daemon with a hidden console are no target for it (measured: no event 10002). Without the action an
-upgrade by hand keeps the old daemon until the next sign-in, and an uninstall leaves it running with
-its files gone, both with exit 0. A major upgrade runs it from the OLD product's table, and its
-fallback ends the task, so after `UnregisterAutostart` it would reach nothing.
+⚠️ **Restart Manager does not stop a running per-user daemon, console or not, so the MSI's
+`StopDaemon` does, and it stays before `UnregisterAutostart`.** The log says "Successfully shut down
+all applications", with no event 10002 (measured 0.4.196 to 0.4.197, and on the launcher); that
+event only appears on a self-update, where the daemon is leaving anyway. Without the action an upgrade
+by hand keeps the old daemon until the next sign-in, and an uninstall leaves it running with its
+files gone, both with exit 0. A major upgrade runs it from the OLD product's table, and its fallback
+ends the task, so after `UnregisterAutostart` it would reach nothing. `StopOldDaemon` is the same stop
+from the NEW product, for an old table without it.
 ⚠️ **`<RestartOnFailure>` is not a supervisor**: it restarted nothing after exit 1 or
 `0xC000013A` (a crash stays down, #3295). What brings a device back after a self-update is the one-shot `<TimeTrigger>`s
 `service install` adds when a config exists. A repeating trigger would cover a crash too, and was

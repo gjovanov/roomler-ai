@@ -413,18 +413,32 @@
             Return='ignore' />
 
         <!--
-          #3292: stop a running daemon. Restart Manager did this while the daemon
-          had a console window; a windowless launcher and a daemon with a hidden
-          console are not something it shuts down (measured: the log says
-          "Successfully shut down all applications", there is no event 10002, and
-          both run on). Without this action an upgrade by hand keeps the old daemon
-          until the next sign-in, and an uninstall leaves it running with its files
-          gone. `service stop` asks through the daemon's stop event and otherwise
-          ends the task, whose kill-on-close job takes the daemon. Return="ignore"
-          because a failure here must not fail an uninstall.
+          #3292: stop a running daemon. Restart Manager does not, with a console
+          window or without one (measured 0.4.196 to 0.4.197 and on the launcher:
+          the log says "Successfully shut down all applications", there is no event
+          10002, and the daemon runs on). Without this action an upgrade by hand
+          keeps the old daemon until the next sign-in, and an uninstall leaves it
+          running with its files gone, both with exit 0. `service stop` asks through
+          the daemon's stop event and otherwise ends the task, whose kill-on-close
+          job takes the daemon. Return="ignore" because a failure here must not fail
+          an uninstall.
         -->
         <CustomAction
             Id='StopDaemon'
+            FileKey='roomlerdw_exe'
+            ExeCommand='service stop'
+            Execute='deferred'
+            Impersonate='yes'
+            Return='ignore' />
+
+        <!--
+          #3292: the same stop from the NEW product, for an upgrade from a release
+          whose table has no StopDaemon. That daemon holds the stop event, and only
+          the new files are left to ask it: otherwise it stays in its terminal on
+          renamed files, and the new task's one-shots exit 8 until the next sign-in.
+        -->
+        <CustomAction
+            Id='StopOldDaemon'
             FileKey='roomlerdw_exe'
             ExeCommand='service stop'
             Execute='deferred'
@@ -481,6 +495,16 @@
             -->
             <Custom Action='CleanupLegacyPerMachine' After='InstallFiles'>
                 NOT (REMOVE="ALL")
+            </Custom>
+            <!--
+              #3292: after InstallFiles, because it runs the new launcher. Nothing
+              to do when the old table stopped the daemon or the updater's daemon has
+              left: it finds no event, and no task to end either, the old one being
+              gone and the new one not yet written. A repair or a fresh install has
+              no WIX_UPGRADE_DETECTED and leaves a running daemon alone.
+            -->
+            <Custom Action='StopOldDaemon' After='CleanupLegacyPerMachine'>
+                WIX_UPGRADE_DETECTED
             </Custom>
             <!--
               Run UnregisterAutostart only during full uninstall,

@@ -566,7 +566,7 @@ console, passes its arguments on, and leaves with the daemon's exit code.
 | stdout | `NUL` | Tracing only, and the rolling log has the same events |
 | The MSI's custom actions, the Start menu entry | Run through the launcher too | Each opened a terminal in the foreground |
 | The default terminal | No window with Windows Terminal or `conhost` | `CREATE_NO_WINDOW` makes no console to show. Measured a start and a repair with the default set to `conhost` |
-| Restart Manager | Stops nothing here, so the MSI's `StopDaemon` custom action does (`service stop`, before `UnregisterAutostart`). On a major upgrade it runs from the OLD product's table | Measured: a windowless launcher and a daemon with a hidden console are no target for it. The log says "Successfully shut down all applications", there is no event 10002, and without the action an upgrade by hand keeps the old daemon until the next sign-in, while an uninstall leaves it running with its files gone |
+| A running daemon, at an upgrade or an uninstall | The MSI stops it with `service stop`: `StopDaemon` before `UnregisterAutostart`, which a major upgrade runs from the OLD product's table, and `StopOldDaemon` after `InstallFiles`, for an old table without it | Restart Manager does not, console or no console: the log says "Successfully shut down all applications", and there is no event 10002. Measured from 0.4.196 to 0.4.197 by hand: the old daemon ran on until the next sign-in, and an uninstall left it running with its files gone, both with exit 0 |
 
 **A self-update brings the device back by itself.** The daemon has exited for the
 installer, and registering the task is all the MSI's custom action does. So `service
@@ -578,8 +578,8 @@ those ten minutes can therefore be undone once.
 
 **The first update onto the launcher looks a little different.** It runs the old
 product's table and the old daemon's own console: one terminal can flash when the old
-`UnregisterAutostart` runs, and nothing after that. Restart Manager still shuts down that
-console, and takes the staged watcher with it, so `last-install.json` stays at
+`UnregisterAutostart` runs, and nothing after that. On a self-update Restart Manager shuts
+down that console, and takes the staged watcher with it, so `last-install.json` stays at
 `InProgress` on that one jump. From a launcher release onward nothing is shown, and it
 reads `SucceededVerified`. Measured on both jumps.
 
