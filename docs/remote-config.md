@@ -189,7 +189,16 @@ reconnect from a restart, so the device does it: the daemon records what it star
 on (`running_on`, `agents/roomlerd/src/remote_config.rs:227`), and a key the pushed
 document manages stays in `needs_restart` until this process runs it. A reconnect
 still writes nothing to disk. A local edit waiting on a restart is left out,
-because this report is about the push.
+because this report is about the push. A save back to the value this process runs
+leaves nothing waiting, so it reads `applied` at once, and a restart would change
+nothing.
+
+Two limits. A build before P1c still turns the row to `applied` at a reconnect, and
+nothing on the wire tells the two apart. And an environment variable beats the file
+for the encoder keys (`crates/tunnel-core/src/env.rs:30`), so a key set in the
+daemon's environment reads `applied` after a restart while the environment's value
+is in force, and no restart changes that. A supervised Mac worker gets the root's
+value that way (`agents/roomlerd/src/macos_supervisor.rs:303`).
 
 ⚠️ **`config-report` is a SEPARATE capability verb from `config`**, and this is
 the `ssh` / `ssh-consent` split recurring exactly as that doc predicted it

@@ -5102,8 +5102,7 @@ async fn handle_server_msg(
                     if !applied.needs_restart.is_empty() {
                         warn!(
                             keys = ?applied.needs_restart,
-                            "rc:agent.config — saved, but these need a daemon restart \
-                             to take effect"
+                            "rc:agent.config — these need a daemon restart to take effect"
                         );
                     }
                     let msg = ClientMsg::ConfigStatus {

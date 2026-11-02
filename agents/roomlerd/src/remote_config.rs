@@ -44,11 +44,15 @@ pub struct Applied {
     /// Keys on disk that need a daemon restart to take effect: changed now, or
     /// changed earlier and still not what this process runs.
     pub needs_restart: Vec<&'static str>,
+    /// This frame changed the file. The lists cannot say so on their own: a key
+    /// written back to the value this process runs leaves nothing waiting, and
+    /// that is not the `noop` of a device that already matched.
+    pub wrote: bool,
 }
 
 impl Applied {
     pub fn is_noop(&self) -> bool {
-        self.live.is_empty() && self.needs_restart.is_empty()
+        !self.wrote && self.live.is_empty() && self.needs_restart.is_empty()
     }
 }
 
@@ -90,45 +94,64 @@ impl RunningKeys {
         desired: &DesiredConfig,
         cfg: &crate::config::AgentConfig,
     ) -> Vec<&'static str> {
+        // Destructured EXHAUSTIVELY, as `DesiredConfig::same_ssh_as` is: a new
+        // pushable key must say here whether it is read once before this
+        // compiles. One that fell outside the list would read `applied` while
+        // the daemon still ran the old value.
+        let DesiredConfig {
+            // Live: `apply` puts it in force with the write.
+            exec_enabled: _,
+            ssh_enabled,
+            ssh_authorized_keys,
+            ssh_account_mode,
+            ssh_port,
+            encoder_cells_deny,
+            fps_deny,
+            color_description,
+            zero_copy_deny,
+            revision: _,
+            updated_by: _,
+            updated_at: _,
+        } = desired;
         [
             (
                 "ssh_enabled",
-                desired.ssh_enabled.is_some(),
+                ssh_enabled.is_some(),
                 cfg.ssh_enabled != self.ssh_enabled,
             ),
             (
                 "ssh_authorized_keys",
-                desired.ssh_authorized_keys.is_some(),
+                ssh_authorized_keys.is_some(),
                 cfg.ssh_authorized_keys != self.ssh_authorized_keys,
             ),
             (
                 "ssh_account_mode",
-                desired.ssh_account_mode.is_some(),
+                ssh_account_mode.is_some(),
                 cfg.ssh_account_mode != self.ssh_account_mode,
             ),
             (
                 "ssh_port",
-                desired.ssh_port.is_some(),
+                ssh_port.is_some(),
                 cfg.ssh_port != self.ssh_port,
             ),
             (
                 "encoder_cells_deny",
-                desired.encoder_cells_deny.is_some(),
+                encoder_cells_deny.is_some(),
                 cfg.encoder_cells_deny != self.encoder_cells_deny,
             ),
             (
                 "fps_deny",
-                desired.fps_deny.is_some(),
+                fps_deny.is_some(),
                 cfg.fps_deny != self.fps_deny,
             ),
             (
                 "color_description",
-                desired.color_description.is_some(),
+                color_description.is_some(),
                 cfg.color_description != self.color_description,
             ),
             (
                 "zero_copy_deny",
-                desired.zero_copy_deny.is_some(),
+                zero_copy_deny.is_some(),
                 cfg.zero_copy_deny != self.zero_copy_deny,
             ),
         ]
@@ -474,25 +497,28 @@ impl RemoteConfigServices {
                 }
             }
 
-            if !applied.is_noop() {
+            applied.wrote = !applied.live.is_empty() || !applied.needs_restart.is_empty();
+            if applied.wrote {
                 crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
-                // AFTER the durable write, never before: a live flag that is on
-                // while the file says off would survive a crash as a device
-                // running exec that its own config denies.
-                if applied.live.contains(&"exec_enabled") {
-                    exec_flag.store(cfg.exec_enabled, Ordering::Relaxed);
-                }
             }
-            // FR-132 P1c — the lists above say what changed in the FILE. On a
-            // later frame nothing does, and the report used to go out as
-            // `noop`, which reads `applied` while the daemon still runs the
-            // old value. A pod roll did that to every such device at once.
+            // AFTER the durable write, never before: a live flag that is on
+            // while the file says off would survive a crash as a device
+            // running exec that its own config denies. And whenever the
+            // document manages the key, not only on a change: a file edited by
+            // hand already matches, and the gate would stay on what this
+            // process started with while the report read `noop`.
+            if desired.exec_enabled.is_some() {
+                exec_flag.store(cfg.exec_enabled, Ordering::Relaxed);
+            }
+            // FR-132 P1c — the lists above say what changed in the FILE, and
+            // the report means what this process does not run yet. On a later
+            // frame nothing changes, and the report used to go out as `noop`,
+            // which reads `applied` while the daemon still runs the old value;
+            // a pod roll did that to every such device at once. A key written
+            // back to the value this process runs is the other way round: it
+            // changed, and nothing is waiting on it.
             if let Some(running) = running.as_deref() {
-                for key in running.waiting_on_restart(&desired, &cfg) {
-                    if !applied.needs_restart.contains(&key) {
-                        applied.needs_restart.push(key);
-                    }
-                }
+                applied.needs_restart = running.waiting_on_restart(&desired, &cfg);
             }
             Ok(applied)
         })
@@ -1006,6 +1032,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A deny lifted before the restart that would have applied it: the file
+    /// moves back to what this process runs, so nothing is waiting and a restart
+    /// would change nothing. The file did change, so it is no `noop` either, and
+    /// a key still off the running value keeps its place in the list.
+    #[tokio::test]
+    async fn a_save_back_to_the_running_value_leaves_nothing_waiting() {
+        let dir = std::env::temp_dir().join(format!("fr132-p1c-back-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut started = crate::config::test_fixture();
+        started.zero_copy_deny = Some("none".to_string());
+        crate::config::save(&path, &started).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        )
+        .running_on(&started);
+        let deny = |value: &str| DesiredConfig {
+            zero_copy_deny: Some(value.to_string()),
+            ..Default::default()
+        };
+
+        let denied = svc.apply(&deny("hevc_qsv:gpu")).await.unwrap();
+        assert_eq!(denied.needs_restart, vec!["zero_copy_deny"]);
+
+        let lifted = svc.apply(&deny("none")).await.unwrap();
+        assert_eq!(
+            lifted,
+            Applied {
+                wrote: true,
+                ..Applied::default()
+            },
+            "written, and nothing waits on it"
+        );
+        assert!(!lifted.is_noop(), "the file changed");
+        assert_eq!(
+            crate::config::load(&path)
+                .unwrap()
+                .zero_copy_deny
+                .as_deref(),
+            Some("none")
+        );
+
+        // A reconnect after that: this time nothing changes at all.
+        assert!(svc.apply(&deny("none")).await.unwrap().is_noop());
+
+        // One key back on the running value, one still off it.
+        let mixed = svc
+            .apply(&DesiredConfig {
+                zero_copy_deny: Some("none".to_string()),
+                fps_deny: Some("hevc_qsv:120".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(mixed.needs_restart, vec!["fps_deny"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The live gate follows the document even when the file needs no write. A
+    /// hand edit turned exec off in the file and this process still ran it on, so
+    /// a push saying off found the file matching. Before, the report read
+    /// `noop`, the row read `applied`, and the gate stayed open.
+    #[tokio::test]
+    async fn a_pushed_exec_off_closes_the_gate_when_the_file_already_matches() {
+        let dir = std::env::temp_dir().join(format!("fr132-p1c-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut started = crate::config::test_fixture();
+        started.exec_enabled = true;
+        crate::config::save(&path, &started).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            true,
+            true,
+        )
+        .running_on(&started);
+
+        let mut edited = started.clone();
+        edited.exec_enabled = false;
+        crate::config::save(&path, &edited).unwrap();
+        assert!(svc.exec_enabled(), "a hand edit is not in force yet");
+
+        let off = DesiredConfig {
+            exec_enabled: Some(false),
+            ..Default::default()
+        };
+        assert!(svc.apply(&off).await.unwrap().is_noop());
+        assert!(!svc.exec_enabled(), "the report and the gate agree");
+
+        // A document that does not manage the key leaves the gate alone.
+        svc.adopt_local(&started);
+        assert!(svc.exec_enabled());
+        assert!(
+            svc.apply(&DesiredConfig::default())
+                .await
+                .unwrap()
+                .is_noop()
+        );
+        assert!(svc.exec_enabled());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// FR-40 — a rotation writes ONE enrollment's key + epoch through the
     /// atomic save and leaves the other identity on disk untouched; an
     /// unknown org is refused with nothing written.
@@ -1147,6 +1279,7 @@ mod tests {
         let applied = Applied {
             live: vec!["exec_enabled"],
             needs_restart: vec!["ssh_enabled"],
+            wrote: true,
         };
         assert!(!applied.is_noop());
         assert!(!applied.live.contains(&"ssh_enabled"));
