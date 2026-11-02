@@ -30,7 +30,7 @@ through remote configuration, and changing one takes a restart.
 Every 5 minutes it reads the count. Once an hour it logs that count. While the
 count climbs, the hourly line is a warning instead. Both go through the ordinary
 log path, so a fleet read needs no new wire: the uploader's `tracing` layer takes
-every event (`crates/agent-core/src/logs_upload.rs:128`) and `agent_logs` keeps
+every event (`crates/agent-core/src/logs_upload.rs:166`) and `agent_logs` keeps
 them for 7 days.
 
 ```mermaid

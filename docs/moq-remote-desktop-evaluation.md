@@ -11,7 +11,7 @@ This doc is the answer ("research + evaluate MoQ + weigh pros/cons + decide if i
 ### How remote desktop works today (verified)
 - **P2P WebRTC** (webrtc-rs): the controlled-host **agent is the answerer**, the **browser controller is the offerer**; media flows agent↔browser directly, **TURN-relayed only when NAT requires** — and TURN relays *opaque DTLS*, so **the server never sees pixels**. (`agents/roomlerd/src/peer.rs`; `crates/remote_control/src/turn_creds.rs`.)
 - Three video sub-paths: WebRTC **video track** (RTP/SRTP, H.264/HEVC/AV1, `peer.rs:856-1700`); **HEVC-over-DataChannel** and **VP9-444-over-DataChannel** (`peer.rs:899-998`) — both send raw frames over the `"video-bytes"` SCTP DataChannel with a **13-byte length header** (`frame_video_bytes`, `peer.rs:1724`), 16 KiB chunks, AIMD on `dc.buffered_amount`, keyframe-on-open gating.
-- The two DC paths **decode in the browser via WebCodecs onto a canvas** (`ui/src/workers/rc-vp9-444-worker.ts`, `rc-hevc-worker.ts`) — already bypassing `<video>`'s jitter buffer (present-ASAP). Input is JSON over an `"input"` DataChannel (`peer.rs:2934-3020`, enigo). Transport is chosen via `AgentCaps.transports` + `ClientMsg::SessionRequest{preferred_transport}` (`encode/caps.rs:144-671`, `signaling.rs:250`).
+- The two DC paths **decode in the browser via WebCodecs onto a canvas** (`ui/src/workers/rc-vp9-444-worker.ts`, `rc-hevc-worker.ts`) — already bypassing `<video>`'s jitter buffer (present-ASAP). Input is JSON over an `"input"` DataChannel (`peer.rs:2973-3066`, enigo). Transport is chosen via `AgentCaps.transports` + `ClientMsg::SessionRequest{preferred_transport}` (`encode/caps.rs:144-671`, `signaling.rs:250`).
 
 ## Evaluation — pros / cons (the "is there a benefit?" answer)
 
