@@ -4101,8 +4101,8 @@ pub(crate) mod session_lifetime {
             Self { child, dir }
         }
 
-        /// The processes the session reports, watched from here.
-        pub(crate) fn wait_for_its_processes(&self) -> Vec<Watched> {
+        /// The shell's pid and its child's, once the session has reported them.
+        fn reported_pids(&self) -> Vec<u32> {
             let started = self.dir.join("started");
             let deadline = Instant::now() + COMMAND_STARTS_WITHIN;
             loop {
@@ -4112,7 +4112,7 @@ pub(crate) mod session_lifetime {
                     .filter_map(|s| s.parse().ok())
                     .collect();
                 if pids.len() == 2 {
-                    return pids.into_iter().map(Watched::open).collect();
+                    return pids;
                 }
                 assert!(
                     Instant::now() < deadline,
@@ -4120,6 +4120,20 @@ pub(crate) mod session_lifetime {
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
+        }
+
+        /// The processes the session reports, watched from here.
+        pub(crate) fn wait_for_its_processes(&self) -> Vec<Watched> {
+            self.reported_pids()
+                .into_iter()
+                .map(Watched::open)
+                .collect()
+        }
+
+        /// What the session's shell started, alone: a shell that ends as soon
+        /// as it has reported may be gone before anyone can watch it.
+        fn wait_for_what_it_started(&self) -> Watched {
+            Watched::open(self.reported_pids()[1])
         }
 
         /// Tell the stand-in to leave, and see it gone.
@@ -4262,9 +4276,8 @@ pub(crate) mod session_lifetime {
     #[test]
     fn what_a_command_left_running_when_it_ended_stays() {
         let daemon = StandIn::start(STAND_IN_TEST, "ended");
-        let processes = daemon.wait_for_its_processes();
+        let left = daemon.wait_for_what_it_started();
         daemon.wait_for("returned");
-        let left = &processes[1];
         assert!(
             !left.gone_within(STILL_THERE_FOR),
             "it ended with the command"
