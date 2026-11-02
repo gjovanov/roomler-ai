@@ -570,7 +570,7 @@ view:S02	special-case		ui/src/composables/useRemoteControl.ts:9810	`wantsWebCode
 view:S03	special-case		ui/src/composables/useRemoteControl.ts:8274	2×2 synthetic canvas until the view mounts, HEVC twin :8539	DecodeWorker	R3	Worker starts on the visible canvas
 view:S04	special-case		ui/src/composables/useRemoteControl.ts:8163	Pre-first-frame failure: ban, remember, reconnect, VP9 worker	ViewerSession	stays	Keep as one rule
 view:S05	special-case		ui/src/composables/useRemoteControl.ts:8457	Same rule, HEVC worker, hard-coded transport	delete	R13	One worker
-view:S06	special-case		ui/src/composables/useRemoteControl.ts:8165	Post-first-frame decode error: worker stopped, no reconnect, black until watchdog	ViewerSession	R1	Reconnect or rebuild immediately
+view:S06	special-case		ui/src/composables/useRemoteControl.ts:8165	Post-first-frame decode error: worker stopped, no reconnect, black until watchdog	ViewerSession	R1	Done in #3294: Reconnect or rebuild immediately
 view:S07	special-case		ui/src/composables/useRemoteControl.ts:8458	Same, HEVC	delete	R13	One worker
 view:S08	special-case		ui/src/composables/useRemoteControl.ts:5927	`failedDcTransports`: per instance, never cleared; bans whole transport for a 4:4:4-only failure	CellTable	R10	Bans keyed by cell
 view:S09	special-case		ui/src/composables/useRemoteControl.ts:10840	Remembered cells copied into the transport ban	CellTable	R10	Bans keyed by cell
@@ -600,7 +600,7 @@ view:S32	special-case		ui/src/composables/useRemoteControl.ts:11000	Direct unmem
 view:S33	special-case		ui/src/composables/useRemoteControl.ts:3085	MC query fixed at 1920×1200@60, 8 Mbps, `type:'file'` (:3185, :3219, :3306)	TransportPick	R13	Probe parameters come from the session's target
 view:S34	special-case		ui/src/composables/useRemoteControl.ts:3539	AV1 rung and rung 3 (:3556) trust MC alone	TransportPick	R13	One gate for all rungs
 view:S35	special-case		ui/src/composables/useRemoteControl.ts:206	Dead-air floor on the ladder, FR-93 exclusions at :632, :643	ViewerSession	stays	Keep
-view:S36	special-case		ui/src/composables/useRemoteControl.ts:5371	Media watchdog counts any of three counters, RTP bytes included on a DC session	ViewerSession	R1	Progress reads the session's actual transport
+view:S36	special-case		ui/src/composables/useRemoteControl.ts:5371	Media watchdog counts any of three counters, RTP bytes included on a DC session	ViewerSession	R1	Done in #3294: Progress reads the session's actual transport
 view:S37	special-case		ui/src/composables/useRemoteControl.ts:9695	TURN path uses `orgId`, undefined on a retry, unlike :9606	ViewerSession	R3	Retry passes the org
 view:S38	special-case		ui/src/composables/useRemoteControl.ts:5633	`window.__roomler_remote_stats`, e2e hook, and `__roomler_remote_pc` :9773	keep	stays	E2E has another oracle
 view:S39	special-case		ui/src/composables/useRemoteControl.ts:10648	`console.log` of every inbound control message, rc.23 hotfix, 2 Hz on clock echoes	delete	R13	Now

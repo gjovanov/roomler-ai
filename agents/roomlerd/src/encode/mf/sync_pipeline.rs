@@ -123,9 +123,9 @@ pub(super) struct MfPipeline {
     /// `build_sync_pipeline` based on whether a D3D manager handoff
     /// actually stuck (i.e. whether `_d3d_device` is `Some`). The
     /// `peer` media pump consults this to auto-downscale the capture
-    /// resolution when SW HEVC wins at 4K — the cascade-winner log
-    /// line is "HW pipeline active" regardless of actual backend, so
-    /// log-parsing wouldn't work.
+    /// resolution when SW HEVC wins at 4K. The cascade-winner log line
+    /// carries it as `backend`: an MFT inside the adapter loop can still
+    /// be software, so winning that loop says nothing about the silicon.
     backend_kind: &'static str,
     /// FR-130 P1 — the colour attributes the media types carry, put back on
     /// the type `drain_output` renegotiates (a stream change hands over a

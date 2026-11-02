@@ -172,9 +172,9 @@ A stored pick is held to the device again at connect, because the picker only gr
 what a person is about to choose. A choice also becomes this browser's default for
 every other device, and a per-device override outlives an agent losing a cell. The
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
-and telling nobody (`agents/roomlerd/src/signaling.rs:3596`), and the viewer ignores
+and telling nobody (`agents/roomlerd/src/signaling.rs:3583`), and the viewer ignores
 that track while it holds a DataChannel transport
-(`ui/src/composables/useRemoteControl.ts:9811`). The session reads connected, with a
+(`ui/src/composables/useRemoteControl.ts:9876`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
 watchdog quiet. So `transportForSession` (`ui/src/composables/videoCells.ts:437`)
 runs the auto rank for that session and leaves the pick stored (#3167). H.264 keeps
@@ -634,11 +634,12 @@ nothing has produced a stuck child in the field.
   child. It is a level, so a child that came back first costs nothing. When the cells go, the answer
   in force stops offering them, as for a fault. A session starting beside a live one, or within that
   minute, can still open them.
-- **An offer reads its picks again** ([`picks_at_the_offer`](../agents/roomlerd/src/encode/caps.rs#L4797)). A session picks its codec and transport
+- **An offer reads its picks again** ([`picks_at_the_offer`](../agents/roomlerd/src/encode/caps.rs#L4799)). A session picks its codec and transport
   at its request, before consent, and a person can take longer than that minute (`prompt_then_email`
   waits minutes). So its offer reads both against `detect()`: what has gone is picked again by the
   request's own rules, and a pick still offered stays, even beside a better one that has appeared
-  since. A track bound to a codec its open is refused carries no video, and a DataChannel pump with no
+  since. On the RTP track "still offered" means its opener can open it, and a session that just lost
+  its DataChannel picks again (`session_codec`, below). A track bound to a codec its open is refused carries no video, and a DataChannel pump with no
   cell left ends. A GUI worker's picks stand: the daemon made them, from an answer the worker does not
   hold.
 
@@ -742,7 +743,8 @@ Key properties:
   host cannot produce.
 - **Fail closed**: once a session's track is bound to `video/HEVC` or
   `video/AV1`, an encoder failure yields a null encoder rather than silently
-  switching bitstreams.
+  switching bitstreams. The RTP pump then ends a session that never painted by
+  name, so nobody sits in front of a black picture that reads connected (below).
 - **Escape hatch**: `ROOMLERD_HW_AUTO=0` reverts `auto` to software-first
   without a rebuild; `ROOMLERD_USE_FFMPEG=0` removes the FFmpeg backends.
 - **Auto does not keep the GPU-less software MFT** (#2283). When the
@@ -763,6 +765,72 @@ Key properties:
   picture issued SEGVs inside `avcodec_send_frame(NULL)` on radeonsi — the probe
   child (open, then drop) died on every start of 0.4.86 on jupiter, and in a
   session the same drop runs in the daemon.
+
+### What a session's RTP track is bound to (#3245)
+
+The RTP track is created with its codec before any encoder opens, and it cannot
+take another codec's bitstream afterwards. Its opener, `open_for_codec`, knows
+fewer encoders than the host advertises: **AV1 opens through Media Foundation
+alone**, and an FFmpeg AV1 cell is for the DataChannel pumps. So a pick made from
+`AgentCaps.codecs` bound a laptop with `av1_qsv` and no MF AV1 to a track nothing
+could feed: `chosen_codec=av1`, `backend="noop"`, `bytes_written=0`, and a page
+that read connected. All seven of that laptop's no-video sessions in a week went
+this way.
+
+The pick now waits for the transport (`session_codec`), and reads the cells
+(`rtp_opener_opens`), never a legacy label.
+
+```mermaid
+flowchart TB
+    T{"negotiated transport?"} -->|"data-channel-*"| BEST["the best common codec<br/>(pick_best_codec): the pump has its own<br/>cascade, the track is a placeholder"]
+    T -->|"none: the RTP track"| H{"browser lists H.264,<br/>or lists nothing?"}
+    H -->|yes| H264["H.264: every host opens it"]
+    H -->|no| AV{"lists AV1, and a<br/>cell av1 × mf?"}
+    AV -->|yes| AV1["AV1"]
+    AV -->|no| HE{"lists H.265, and<br/>any hevc cell?"}
+    HE -->|yes| H265["H.265"]
+    HE -->|no| REF["H.264 stays: the offer has none,<br/>so rtp_track_unanswerable refuses it<br/>as no_common_codec"]
+```
+
+| Case | Bound to | Ends as |
+|---|---|---|
+| Browser lists H.264, whatever the host could also do | H.264 | a session |
+| Browser without H.264, host with an MF AV1 cell | AV1 | a session |
+| Browser without H.264, host with FFmpeg's AV1 only | H.264 | `no_common_codec`, at the offer |
+| Browser with only VP8 or VP9 | H.264: on RTP the opener would put H.264 bytes on their track | `no_common_codec`, at the offer |
+| The encoder opens as a Noop before anything painted (a cell proves an open at 480×270, not at this session's size; MF and OpenH264 both failing), after the auto-downscale has had its go | whatever was picked | `no_common_codec`, from the pump |
+| A reopen opens as a Noop on a session that painted (a GPU reset, a size the MFT refuses) | unchanged | not ended: its codec opens, and the viewer's stall watchdog brings it back |
+
+Why H.264 and not the most efficient codec the host can open: the viewer's RTP
+fallback already assumes H.264, OpenH264 is proven at L4 p50 37 ms on this path,
+and taking H.265 here means FFmpeg HEVC on the RTP pump, with an inline encode, a
+synchronous QSV rebuild on a REMB move and a 64,800-frame GOP. A browser that
+wants the efficient codecs gets them on the DataChannel transports.
+
+⚠️ `no_common_codec` from the pump is slightly off in one case. The sentence the
+viewer shows blames the browser, and on a host where every H.264 encoder failed
+the browser is not at fault. It is the existing limit because a new one needs a
+server roll and a viewer change first, and the case needs both MF and OpenH264 to
+fail. What matters here is that the end is final and said once.
+
+⚠️ `chosen_codec` on the `incoming session request` line is this pick, and an
+RTP session reading `h264` on a host with AV1 cells is the design, not a
+regression.
+
+**The pump's end says first and closes after.** It goes through the signalling
+loop's device-end arm, the road the person's Disconnect takes (`DeviceEnd::NoVideo`,
+FR-27 P10): the hub tells the viewer, and the peer closes a second later. Closed
+first, the viewer's control channel `onclose` reads a plain drop and it reconnects
+into the same Noop, with a new consent prompt on a device that asks.
+
+**H.264 has a size ceiling on the software rung.** openh264 opens at any size and
+refuses every frame above 3840×2160 (`fit_for_software`), so the cascade cannot see
+it. It lands there when nothing else takes the size: wider than MF H.264's 4096, or
+Linux, where H.264 is always openh264. The encode error used to end the pump with
+the page connected and black. Now the first open that lands there holds the
+session's frames inside the ceiling for good (`rtp_frame_target`), whatever
+`rc:resolution` says: the viewer's default `original` arrives after the one-shot
+auto-downscale has run. A 5120×1440 screen codes at 3840×1080 at most.
 
 ### Hardware quirks the cascade routes around
 
@@ -1342,7 +1410,7 @@ direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climb
 coarsened to the top rung and `set_bitrate` returned. Until its first rung crossing the
 encoder runs at the maxrate it opened with, and after that at the rung, never at the target.
 
-**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:9882-9915`):
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:9979-10012`):
 
 | Field | Meaning |
 |---|---|
@@ -1351,7 +1419,7 @@ encoder runs at the maxrate it opened with, and after that at the rung, never at
 | `rebuilds` | synchronous reopens, the inline arm |
 | `swaps` | background-rebuilt encoders adopted. Read it beside the two above: on a direct QSV session every rate move lands here and only here (FR-65) |
 | `dims_swaps` | reopens for a resolution change (FR-70 M2) |
-| `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:840`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
+| `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:843`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
 **The read for any host** — the FR-62 A0 sweep (`app.rs:6296`):

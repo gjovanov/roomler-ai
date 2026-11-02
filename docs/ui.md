@@ -103,9 +103,12 @@ flowchart TB
   hardware decode* both hold.
 - **Transport control**: auto-pick, priority dial (balanced / sharper / smoother),
   keyframe requests, decoder-stats feedback to the agent (`rc:decodestat` — drives
-  its frame-skip rate control), one `rc:decode-error` per decode error before the
-  fallback to `<video>`, counted into the session's stats (FR-132 P1,
+  its frame-skip rate control), one `rc:decode-error` per decode error, counted into
+  the session's stats (FR-132 P1,
   [remote-control.md §11.10](remote-control.md#1110-the-viewers-decode-errors-fr-132-p1)),
+  a data-channel decoder that fails after its first frame replaced in place, off with
+  `roomler-rc-decode-recover=0` (FR-135 R1,
+  [remote-control.md §11.11](remote-control.md#1111-a-decode-error-recovers-in-place-fr-135-r1)),
   agent-local loopback-TURN probe for fast relayed
   paths on the same LAN.
 - **Input**: HID-mapped keyboard (keyboard-lock, Ctrl-Alt-Del / SAS chord),
@@ -154,7 +157,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   60 Hz").
 - **The pick** is stored per browser (`roomler-rc-fps`,
   `composables/frameRate.ts:30`) and sent again each time the control channel
-  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7597`), so
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7643`), so
   a reload asks again without a click.
 - **The hint under it is the agent's answer**, from `rc:video-info`
   (`frameRateSummary`, `composables/frameRate.ts:147`): "120 fps"; "120 fps, on
