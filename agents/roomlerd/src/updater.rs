@@ -1776,10 +1776,10 @@ pub(crate) async fn fetch_release_by_tag(tag: &str) -> Result<GithubRelease> {
 ///
 /// On Windows it cannot. Both MSI flavours refuse a downgrade
 /// (`DowngradeErrorMessage`), so an attempt spent a download and a daemon exit to
-/// change nothing: measured 1603 on a per-machine install, and exit 0 in 2 s with
-/// the newer files still there on a per-user one whose Installer registration had
-/// fallen behind. Nothing raised the sentinel either way, and on a per-user device
-/// the exit is what took it offline.
+/// change nothing: measured 1603 in about a second on both flavours of released
+/// 0.4.197, with the newer files still there. Nothing raised the sentinel either way,
+/// and on a per-user device the exit took it offline: nothing restarts that daemon
+/// (#3295).
 pub const ROLLBACK_CAN_DOWNGRADE: bool = cfg!(not(target_os = "windows"));
 
 /// Pin to a specific release tag. Used by the rollback path when
