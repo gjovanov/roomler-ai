@@ -155,8 +155,9 @@ against the same hosts' CPU-path week before it, from the heartbeats and `rc:ses
 | capture + encode, CPU per frame | the heartbeat; the process's CPU time | FR-118's saving for that cell, roughly |
 
 The capture + encode row reads moving and idle windows apart, with under 5 fps captured as idle. FR-118 measured its
-savings under motion, and on an idle window readback is close to nothing, so a mostly idle week can show neither a
-saving nor a harm (§8, 2026-11-02).
+savings under motion, and an idle window spends most of its encodes on keepalives, which read nothing back, so a mostly
+idle week can show neither a saving nor a harm (§8, 2026-11-02). It also keeps to builds that report `input_path`,
+because an older build's `avg_readback_ms` reads 0 whatever the capture cost.
 
 A clean week puts the cell on the default list in the next agent release. A fleet week after that release verifies
 the flip on every host that runs the cell, canary or not.
@@ -244,7 +245,8 @@ numbers are in §8.
    auto-update, on a third party's working PCs, and no read names their GPU or driver. A pushed `zero_copy_deny`
    probably does not reach them either: the remote-config opt-in is off by default and out of the server's reach, and
    none of the four has a config report on its row. So the rollback there is a forward release. The flip also buys
-   them little, since 43.88 of the cell's 46.97 windowed hours are idle. **Recommended:** `hevc_qsv` and `h264_qsv`,
+   them little: 43.88 of the cell's 46.97 windowed hours are idle, where a keystroke's frame would save about 2.7 ms of
+   readback and a keepalive nothing. **Recommended:** `hevc_qsv` and `h264_qsv`,
    the two GPU-input cells those PCs advertise, stay off the default list until one of the PCs has run a canary week,
    opted in, in a window its owner agrees to. `av1_qsv`, NVENC and VideoToolbox do not wait for this, since those PCs
    advertise none of them.
@@ -368,10 +370,15 @@ advertise CORPLAP-1's encoder list, and the fourth lacks `vp9_qsv`, so the cell 
 or driver. None of the four has a config report on its row, and none holds a desired-config revision above 0, so
 nothing has tested whether a push reaches them.
 
-These hours are real use, someone working on an office PC, but the screen changes rarely. In `hevc_qsv`'s idle windows
-readback is 0 ms at p50 and 2.90 ms at p90, conversion 1.12 ms and submit 5.31 ms. §2.1's savings were measured under
-motion, and they come from not copying each captured frame through the CPU, so they do not carry over to those 43.88
-hours. That is decision 9, and the reason 3d reads moving and idle windows apart.
+These hours are real use, someone working on an office PC, but the screen changes rarely: 60.6 % of the idle windows
+capture under 1 fps, and the encoder spends them on keepalives, which read nothing back. A frame that is captured costs
+about what it does under motion. On the builds that report `input_path`, readback reads 0 / 2.66 / 3.76 ms at p10, p50
+and p90 in idle windows and 1.88 / 2.90 / 4.10 ms in moving ones. Older builds leave the field at 0, and they hold
+51,735 of the 78,980 idle windows, so a read across all builds understates it.
+
+So a keystroke's frame would save about 2.7 ms and a keepalive nothing. §2.1's savings were measured under motion, frame
+after frame, and those 43.88 hours capture few frames, so they save little. That is decision 9, and the reason 3d reads
+moving and idle windows apart.
 
 ## 9. Related
 
