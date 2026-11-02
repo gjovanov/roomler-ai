@@ -1610,6 +1610,52 @@ pub fn open_named(
     }
 }
 
+/// #3245 — could [`open_for_codec`] open `codec` on this host, by the cells the
+/// probe opened? Beside the opener because it states what the opener knows, and
+/// `AgentCaps.codecs` cannot say that: it lists AV1 for an FFmpeg cell the opener
+/// never tries. AV1 opens through Media Foundation alone. HEVC opens through
+/// whichever backend has a cell, since `open_for_codec_hevc` walks FFmpeg's
+/// cascade and then MF. VP8 and VP9 do not open at all: the opener's fallback arm
+/// would put H.264 bytes on their track. H.264 is the opener's own fallback and
+/// needs no cell.
+///
+/// A cell proves an open at the probe's size, not at a session's, so a `true`
+/// here can still end in a Noop; the RTP pump ends that session by name.
+pub fn rtp_opener_opens(
+    codec: &str,
+    cells: &[roomler_ai_remote_control::models::VideoCell],
+) -> bool {
+    use roomler_ai_remote_control::models::{VideoBackend, VideoCodec};
+    match codec.to_ascii_lowercase().as_str() {
+        "h264" => true,
+        "av1" => cells.iter().any(|c| {
+            c.codec == VideoCodec::Av1.wire() && c.backend == VideoBackend::MediaFoundation.wire()
+        }),
+        "h265" | "hevc" => cells.iter().any(|c| c.codec == VideoCodec::Hevc.wire()),
+        _ => false,
+    }
+}
+
+/// #3245 — the largest size inside openh264's ceiling with `width`×`height`'s
+/// shape. A build without that encoder has no such ceiling.
+pub fn fit_for_openh264(width: u32, height: u32) -> (u32, u32) {
+    #[cfg(feature = "openh264-encoder")]
+    {
+        openh264_backend::fit_for_software(width, height)
+    }
+    #[cfg(not(feature = "openh264-encoder"))]
+    {
+        (width, height)
+    }
+}
+
+/// #3245 — is `encoder` openh264, at a size it refuses? It opens at any size and
+/// refuses on every frame, so the opener cannot tell; every other backend refuses
+/// at the open, where the cascade handles it.
+pub fn above_openh264_ceiling(encoder: &str, width: u32, height: u32) -> bool {
+    encoder == "openh264" && fit_for_openh264(width, height) != (width, height)
+}
+
 pub fn open_for_codec(
     codec: &str,
     width: u32,

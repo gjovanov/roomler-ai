@@ -273,7 +273,8 @@ pub(super) fn activate_and_probe_pipeline_for_codec(
                         codec = codec.backend_name(),
                         adapter = %adapter_info.description,
                         mft = %candidate.friendly_name,
-                        "mf-encoder: cascade winner — HW pipeline active"
+                        backend = pipeline.backend_kind(),
+                        "mf-encoder: cascade winner"
                     );
                     pipeline.keep_activation(candidates.swap_remove(i));
                     return Ok(pipeline);
