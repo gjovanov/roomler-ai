@@ -154,6 +154,7 @@ impl Refusal {
 /// kind on the other side (never a raw [`StatusCode`]/`&'static str` pair,
 /// neither of which round-trips through serde cleanly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum AdmitRefusalKind {
     Authentication,
     Overloaded,
@@ -376,7 +377,7 @@ pub(crate) trait Source: Clone + Send + Sync + 'static {
 
 /// A sidecar's [`Source`] where no worker serves its session: the
 /// daemon's own [`Supervisor`], called directly. `upstream`/`workspace`
-/// are read once, at [`bind_for`]'s own call, since neither changes while
+/// are read once, at [`open`]'s own call, since neither changes while
 /// the daemon runs.
 #[derive(Clone)]
 struct DaemonSource {
@@ -526,10 +527,12 @@ pub(crate) async fn open(
     })
 }
 
-/// Serve `source`'s sidecar on `listener` until `stop`. `source` is
-/// cloned once a connection, never shared mutable state across one: each
-/// request asks it afresh, so a device whose key rotated mid-connection
-/// still gets the new one on its next request.
+/// Serve `source`'s sidecar on `listener` until `stop`, which cuts its
+/// connections too: a process of the session that outlived it gets no more
+/// of an answer on the device's key. `source` is cloned once a connection,
+/// never shared mutable state across one: each request asks it afresh, so a
+/// device whose key rotated mid-connection still gets the new one on its
+/// next request.
 pub(crate) fn serve<S: Source>(listener: TcpListener, source: S, stop: CancellationToken) {
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
@@ -556,17 +559,24 @@ pub(crate) fn serve<S: Source>(listener: TcpListener, source: S, stop: Cancellat
             };
             let source = source.clone();
             let client = client.clone();
+            let stop = stop.clone();
             tokio::spawn(async move {
                 let svc = hyper::service::service_fn(move |req| {
                     let source = source.clone();
                     let client = client.clone();
                     async move { Ok::<_, Infallible>(handle(req, &source, &client).await) }
                 });
-                if let Err(e) = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(TokioIo::new(stream), svc)
-                    .await
-                {
-                    debug!(%e, "hive: a model sidecar connection ended with an error");
+                let connection = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc);
+                // Dropped at the stop: that cuts the connection, and the
+                // provider's call under it.
+                tokio::select! {
+                    () = stop.cancelled() => {}
+                    served = connection => {
+                        if let Err(e) = served {
+                            debug!(%e, "hive: a model sidecar connection ended with an error");
+                        }
+                    }
                 }
             });
         }
@@ -720,7 +730,7 @@ async fn handle<S: Source>(
     let key = match source.admit(token.as_deref()).await {
         Ok(k) => k,
         Err(r) => {
-            debug!(%session, status = r.status.as_u16(), "hive: a model call was refused");
+            debug!(%session, status = r.status.as_u16(), kind = r.kind, why = %r.message, "hive: a model call was refused");
             return refusal(r);
         }
     };
