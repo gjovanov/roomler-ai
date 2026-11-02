@@ -1050,6 +1050,8 @@ As built by R2 (`docs/remote-control.md` §5.1h): the key is `t`, like every con
 
 RustDesk patches SCTP's RTO floor and drops cwnd, a trade-off (prior art §D). `mlweb` runs ordered + `maxPacketLifeTime` 500 ms, ≤ 16 KB chunks (prior art §D, one author's numbers). FR-17's stage C (unordered + a reorder buffer) stays default OFF: it needs lost-frame detection, gate re-arm and keyframe reliability, and IDR survival at 1 % loss is 0.5 % at 625 KB [reasoned, FR-17]. Lifetime-limited ordered DC is the cheaper cousin and stays a spike (S5).
 
+**A candidate after §7.1's gates, not R1's work (2026-11-02).** Let a recovery's ask past the agent's `MIN_KF_GAP`. R1's production read met ≤ 500 ms in 18 of 22 Chromium rounds, and three of the four over it waited out that gap after a key frame had just gone out (§13). The first row's bar stays as written, and AC3 stays partly met until a read on a real GPU. The gap was set in rc.217 because bursts of IDRs fed the backlog they were meant to clear, so a bypass has to bound the asks it lets through. The row above on repeated asks is where it belongs.
+
 ### 6.9 A fallback ladder that is seen
 
 ```mermaid
