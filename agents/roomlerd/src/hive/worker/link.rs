@@ -49,6 +49,11 @@ pub(crate) trait Role: Send + Sync + 'static {
     /// How long a call of this role waits for its answer.
     #[cfg(worker_calls)]
     const WAIT: Duration;
+    /// How long `_call` waits: [`Self::WAIT`], unless its role says otherwise.
+    #[cfg(worker_calls)]
+    fn wait_of(_call: &Self::Call) -> Duration {
+        Self::WAIT
+    }
     /// The frame a call of this role goes in.
     #[cfg(worker_calls)]
     fn call_frame(id: u64, call: Self::Call) -> Msg;
@@ -107,6 +112,10 @@ pub(crate) type DeviceLink = Linked<DeviceRole>;
 /// How long a session's worker's call waits for its answer.
 #[cfg(worker_calls)]
 pub(crate) const CALL_WAIT: Duration = Duration::from_secs(10);
+
+/// SCAFFOLD.
+#[cfg(worker_calls)]
+pub(crate) const ADMIT_WAIT: Duration = CALL_WAIT;
 
 /// FR-90 P8-2d-1 — how long a device's call waits for its answer: past a
 /// measure's own deadline. A bound of that deadline or less would take a

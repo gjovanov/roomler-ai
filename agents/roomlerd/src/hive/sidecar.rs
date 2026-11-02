@@ -81,7 +81,7 @@ const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 /// How long the key the helper printed is reused before it runs again.
 pub const KEY_TTL: Duration = Duration::from_secs(5 * 60);
 /// The helper's time limit.
-const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Body = BoxBody<Bytes, BoxError>;

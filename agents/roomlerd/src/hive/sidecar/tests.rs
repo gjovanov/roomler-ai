@@ -557,6 +557,16 @@ async fn a_demoted_run_makes_no_model_call() {
 /// P2e-2 — [`sidecar_rig`], whose leased runs give up on the server's word
 /// after `wait`.
 async fn leased_sidecar_rig(provider: &Provider, wait: Duration) -> (Rig, tempfile::TempDir) {
+    leased_sidecar_rig_with(provider, wait, false).await
+}
+
+/// [`leased_sidecar_rig`], on a device whose owner turned workers on
+/// (`hive_worker`) where `worker` says so.
+async fn leased_sidecar_rig_with(
+    provider: &Provider,
+    wait: Duration,
+    worker: bool,
+) -> (Rig, tempfile::TempDir) {
     let count_dir = tempfile::tempdir().unwrap();
     let count = count_dir.path().join("helper-runs");
     let helper = format!(
@@ -567,7 +577,10 @@ async fn leased_sidecar_rig(provider: &Provider, wait: Duration) -> (Rig, tempfi
     let r = rig_with(
         true,
         4,
-        move |cfg| cfg.api_key_helper = Some(helper),
+        move |cfg| {
+            cfg.api_key_helper = Some(helper);
+            cfg.worker = worker;
+        },
         move |sup| {
             sup.with_sidecar(upstream, OFFLINE_GRACE)
                 .with_lease_wait(wait)
@@ -641,6 +654,222 @@ async fn a_leased_run_calls_the_model_after_a_reconnect_only_on_the_servers_word
     p.go.notify_one();
     assert_eq!(waiting.await.unwrap(), 200);
     r.sup.stop(sid, 1, "owner".into());
+}
+
+/// #3305 — a word that comes after a session's own call bound
+/// ([`CALL_WAIT`](crate::hive::worker::link::CALL_WAIT)), the wait the daemon
+/// is told to allow (`LEASE_WAIT`), on a real channel to a worker: the call
+/// goes, as a daemon-hosted one always did, and it costs the worker nothing.
+/// `SidecarAdmit` is the worker's call, so its bound is the worker's to wait
+/// out: nothing on the worker's side watches its link for lost, and the beats
+/// the daemon goes by are answered all the while.
+#[cfg(worker_calls)]
+#[tokio::test]
+async fn a_word_past_a_sessions_call_bound_costs_neither_the_call_nor_its_worker() {
+    use crate::hive::worker::link::CALL_WAIT;
+    use crate::hive::worker::{in_process_when_live, seen};
+    let p = provider().await;
+    let (mut r, _count) =
+        leased_sidecar_rig_with(&p, crate::hive::supervisor::LEASE_WAIT, true).await;
+    let mut o = order(&r);
+    o.lease = true;
+    let first = super::super::supervisor::tests::latest(&r);
+    assert!(r.sup.record_word(o.session_id, 1, &first));
+    in_process_when_live(o.session_id);
+    let (sid, base, token) = started_with(&mut r, o).await;
+    let url = format!("{base}/v1/messages");
+    p.go.notify_one();
+    assert_eq!(call(&url, Some(&token)).await.status().as_u16(), 200);
+
+    // A new connection, no word on it yet.
+    let (tx, reports) = tokio::sync::mpsc::channel(64);
+    r.reports = reports;
+    r.sup.connected(tx.clone());
+    let hits = p.hits.load(Ordering::SeqCst);
+    let waiting = {
+        let (url, token) = (url.clone(), token.clone());
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(&url)
+                .header("anthropic-version", "2023-06-01")
+                .header("x-api-key", &token)
+                .body(r#"{"model":"m","messages":[]}"#)
+                .send()
+                .await
+                .map(|resp| resp.status().as_u16())
+        })
+    };
+    tokio::time::sleep(CALL_WAIT + Duration::from_secs(2)).await;
+    assert_eq!(p.hits.load(Ordering::SeqCst), hits, "it waits for the word");
+    assert!(
+        seen(sid, 1).is_some_and(|s| s.up && s.starts == 1),
+        "one worker, up all along, past the bound: {:?}",
+        seen(sid, 1)
+    );
+
+    r.sup.take_lease(sid, 1, &tx);
+    p.go.notify_one();
+    assert_eq!(
+        tokio::time::timeout(WAIT, waiting)
+            .await
+            .expect("answered once the word came")
+            .unwrap()
+            .unwrap(),
+        200,
+        "the word came within the daemon's own wait, so the call goes"
+    );
+    assert!(
+        seen(sid, 1).is_some_and(|s| s.up && s.starts == 1),
+        "the same worker: {:?}",
+        seen(sid, 1)
+    );
+    r.sup.stop(sid, 1, "owner".into());
+}
+
+/// #3305 — a word that never comes is refused at the daemon's own wait, in
+/// the daemon's words, rebuilt by the worker: never held to a longer bound
+/// than `LEASE_WAIT`, and never `did not answer`.
+#[cfg(worker_calls)]
+#[tokio::test]
+async fn a_word_that_never_comes_is_refused_at_the_daemons_own_wait() {
+    use crate::hive::worker::in_process_when_live;
+    let p = provider().await;
+    let (mut r, _count) = leased_sidecar_rig_with(&p, Duration::from_millis(600), true).await;
+    let mut o = order(&r);
+    o.lease = true;
+    let first = super::super::supervisor::tests::latest(&r);
+    assert!(r.sup.record_word(o.session_id, 1, &first));
+    in_process_when_live(o.session_id);
+    let (sid, base, token) = started_with(&mut r, o).await;
+    let url = format!("{base}/v1/messages");
+    p.go.notify_one();
+    assert_eq!(call(&url, Some(&token)).await.status().as_u16(), 200);
+
+    let (tx, reports) = tokio::sync::mpsc::channel(64);
+    r.reports = reports;
+    r.sup.connected(tx);
+    let hits = p.hits.load(Ordering::SeqCst);
+    let resp = call(&url, Some(&token)).await;
+    assert_eq!(resp.status().as_u16(), 503);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["type"], "overloaded_error");
+    let message = v["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("has not yet heard"), "{message}");
+    assert_eq!(p.hits.load(Ordering::SeqCst), hits, "nothing left the host");
+    r.sup.stop(sid, 1, "owner".into());
+}
+
+/// #3305 — a session's end cuts what its sidecar still serves, in the daemon:
+/// a model answer mid-stream and a connection left idle. Only the harness's
+/// own death ended them before, so a process of the session that outlived it
+/// kept its answer coming on the device's key, and its connection held here.
+#[tokio::test]
+async fn a_sessions_end_cuts_what_its_sidecar_still_serves() {
+    let p = provider().await;
+    let (mut r, _count) = sidecar_rig(&p, OFFLINE_GRACE).await;
+    let (sid, base, token) = started(&mut r).await;
+
+    // The second chunk is withheld: this answer is still coming at the end.
+    let streaming = call(&format!("{base}/v1/messages"), Some(&token)).await;
+    assert_eq!(streaming.status().as_u16(), 200);
+    let mut streaming = streaming.bytes_stream();
+    let first = tokio::time::timeout(WAIT, streaming.next())
+        .await
+        .expect("the first chunk")
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("message_start"));
+
+    // A path it does not forward is answered at once, and the connection
+    // stays open for the next request.
+    let addr = base.trim_start_matches("http://").to_string();
+    let mut idle = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    idle.write_all(b"GET /nope HTTP/1.1\r\nhost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains("not_found_error") {
+        let mut buf = [0u8; 1024];
+        let n = tokio::time::timeout(WAIT, idle.read(&mut buf))
+            .await
+            .expect("the answer in time")
+            .unwrap();
+        assert_ne!(n, 0, "the answer before the end");
+        seen.extend_from_slice(&buf[..n]);
+    }
+
+    r.sup.stop(sid, 1, "owner".into());
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while next_state(&mut r, sid).await.0 != HiveRunState::Ended {
+        assert!(tokio::time::Instant::now() < deadline, "the run ended");
+    }
+
+    let mut buf = [0u8; 1024];
+    let after = tokio::time::timeout(WAIT, idle.read(&mut buf)).await;
+    assert!(
+        matches!(after, Ok(Ok(0)) | Ok(Err(_))),
+        "the idle connection is cut: {after:?}"
+    );
+    let rest = tokio::time::timeout(WAIT, async {
+        let mut rest = String::new();
+        while let Some(Ok(chunk)) = streaming.next().await {
+            rest.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        rest
+    })
+    .await
+    .expect("the answer mid-stream is cut");
+    assert!(!rest.contains("message_stop"), "{rest}");
+}
+
+/// [`Source`] that refuses every call, so a test can read what is logged.
+#[derive(Clone)]
+struct Refusing(ObjectId);
+
+impl Source for Refusing {
+    async fn admit(&self, _token: Option<&str>) -> Result<String, Refusal> {
+        Err(Refusal::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded_error",
+            "the reason this call was refused",
+        ))
+    }
+    async fn forget_key(&self) {}
+    fn upstream(&self) -> &str {
+        "http://127.0.0.1:9"
+    }
+    fn workspace(&self) -> Option<&str> {
+        None
+    }
+    fn session(&self) -> ObjectId {
+        self.0
+    }
+}
+
+/// #3305 — the one line a refusal logs says which refusal: since P8-2c-3 a
+/// lease's wait, an offline device and a helper that failed are all one line
+/// at one status, and the field cannot tell them apart without its words.
+#[tokio::test]
+async fn a_refused_calls_line_says_why() {
+    let logs = crate::hive::view::tests::Logs::default();
+    let (_second, _guard) = logs.capture();
+    let (listener, port) = bind().await.unwrap();
+    let stop = CancellationToken::new();
+    serve(listener, Refusing(ObjectId::new()), stop.clone());
+    let resp = call(
+        &format!("http://127.0.0.1:{port}/v1/messages"),
+        Some("hive-token"),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 503);
+    stop.cancel();
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|l| l.contains("a model call was refused"))
+        .unwrap_or_else(|| panic!("no such line in: {text}"));
+    assert!(line.contains("overloaded_error"), "{line}");
+    assert!(line.contains("the reason this call was refused"), "{line}");
 }
 
 /// P2e-2 — a run that is not leased keeps P1's behaviour: after a reconnect
