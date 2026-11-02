@@ -1166,6 +1166,7 @@ jobs:
   # asserts the honest REFUSAL path instead, which is exactly what runtime
   # permission reporting made assertable.
   macos-pkg-install:
+    if: ${{ false }}
     name: macOS pkg install smoke
     # Pinned to the image release-agent.yml builds the shipped .pkg on (GitHub
     # retires macos-14 by 2026-11-02).

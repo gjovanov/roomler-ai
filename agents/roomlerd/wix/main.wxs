@@ -499,9 +499,7 @@
               the daemon is already leaving, and msiexec is outside the launcher's
               job, so this cannot take the install down with it.
             -->
-            <Custom Action='StopDaemon' Before='UnregisterAutostart'>
-                REMOVE="ALL"
-            </Custom>
+            
         </InstallExecuteSequence>
     </Product>
 </Wix>
