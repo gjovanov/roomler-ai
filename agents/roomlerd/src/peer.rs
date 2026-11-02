@@ -13799,7 +13799,9 @@ mod codec_cap_tests {
         }
     }
 
-    /// The #3245 host: AV1 and HEVC through FFmpeg, none through MF.
+    /// The #3245 host: AV1 and HEVC through FFmpeg, none through MF. Also what a
+    /// host looks like after a probe child that would not die denied `av1_mf`
+    /// (#3273): the cell goes with the denial, and FFmpeg's still lists `av1`.
     fn ffmpeg_only() -> AgentCaps {
         host(
             &["h264", "h265", "av1"],
