@@ -184,18 +184,94 @@ pub fn system_context_switch(value: Option<&str>) -> SystemContextSwitch {
     }
 }
 
+/// FR-129 C — what this run of the wizard narrows the role cards to, on top of
+/// what the OS implements.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoleLimit {
+    /// Nothing does.
+    #[default]
+    None,
+    /// An elevated wizard running as another account than the person at the
+    /// screen: a standard user started it and an administrator typed their
+    /// password (`launch::on_another_account`). Only the machine-wide service
+    /// is right: the other roles install into that administrator's profile and
+    /// still report Done.
+    AnotherAccount,
+    /// The machine's policy refuses this user every administrator prompt
+    /// (`elevation::elevation_refused_by_policy`; the CIS and STIG baselines set
+    /// it). Only what needs no prompt can work, and a card that needs one would
+    /// lead the person through pairing to "blocked by your administrator".
+    NoElevation,
+}
+
+/// The limit for this run, from the two things that decide it.
+pub fn role_limit(another_account: bool, elevation_refused: bool) -> RoleLimit {
+    if another_account {
+        RoleLimit::AnotherAccount
+    } else if elevation_refused {
+        RoleLimit::NoElevation
+    } else {
+        RoleLimit::None
+    }
+}
+
+/// The daemon roles this run may offer on `os`, in card order.
+pub fn roles_open_here(os: HostOs, limit: RoleLimit) -> Vec<Role> {
+    daemon_roles(os)
+        .iter()
+        .copied()
+        .filter(|role| match limit {
+            RoleLimit::None => true,
+            RoleLimit::AnotherAccount => *role == Role::DaemonSystem,
+            RoleLimit::NoElevation => *role == Role::DaemonUser,
+        })
+        .collect()
+}
+
+/// May this run install `role`? The cards follow [`roles_open_here`], and this
+/// is the same rule for the entry points a card does not stand in front of, such
+/// as a run resumed on the Token page.
+pub fn role_open_here(os: HostOs, role: Role, limit: RoleLimit) -> bool {
+    if role == Role::TunnelClient {
+        limit != RoleLimit::AnotherAccount
+    } else {
+        roles_open_here(os, limit).contains(&role)
+    }
+}
+
+/// What [`default_role`] decides from.
+#[derive(Clone, Copy, Debug)]
+pub struct WelcomeFacts<'a> {
+    pub os: HostOs,
+    /// The daemon cards shown RIGHT NOW: [`roles_open_here`], or none when the
+    /// server's switch for this OS is off.
+    pub offered: &'a [Role],
+    /// `"clean"`, `"peruser"`, `"permachine"` or `"ambiguous"`.
+    pub kind: &'a str,
+    /// The tunnel card is shown.
+    pub tunnel_offered: bool,
+    /// The tunnel client is already configured here.
+    pub tunnel_installed: bool,
+    /// The server was asked and said something (`features::Asked::answered`);
+    /// `true` on Windows, which asks no server.
+    pub server_answered: bool,
+}
+
 /// FR-129 C1 — the role the Welcome page preselects, or `None` for no
 /// preselection (the person picks, as before C1).
 ///
-/// Chosen among what this OS offers RIGHT NOW: its [`daemon_roles`] when
-/// `supported` (on Linux and macOS the chosen server's `wizard_unix_daemon`
-/// switch), and the tunnel client.
+/// Chosen among what this run offers RIGHT NOW ([`WelcomeFacts`]).
 ///
 /// - Nothing installed (`kind` `"clean"`): the first daemon role offered —
 ///   the background service (Windows `DaemonSystem`: perMachine +
 ///   SystemContext; Linux `DaemonSystem`: the root service; macOS
-///   `DaemonUser`, which brings the root half with the overlay box ticked) —
-///   else the tunnel client, the only card there is.
+///   `DaemonUser`, which brings the root half with the overlay box ticked; on
+///   a locked desktop `DaemonUser`, [`RoleLimit::NoElevation`]) — else the
+///   tunnel client, the only card there is. Two exceptions: a machine whose only
+///   install is the tunnel client keeps it, as any install keeps its flavour,
+///   and a server that could not be asked preselects nothing, because the tunnel
+///   client would then read a failed request as the server's word.
 /// - An existing install keeps its own flavour, so a default never makes a
 ///   flavour switch or a posture change the person did not ask for:
 ///   `"peruser"` → `DaemonUser`; on Linux a system enrollment (`"permachine"`,
@@ -209,14 +285,25 @@ pub fn system_context_switch(value: Option<&str>) -> SystemContextSwitch {
 ///   switch off), or a `kind` this build does not know: `None`. The tunnel
 ///   client would be a different product from the one the device has.
 pub fn default_role(
-    os: HostOs,
-    supported: bool,
-    kind: &str,
+    facts: &WelcomeFacts<'_>,
     system_context: impl FnOnce() -> SystemContextSwitch,
 ) -> Option<Role> {
-    let offered: &[Role] = if supported { daemon_roles(os) } else { &[] };
+    let WelcomeFacts {
+        os,
+        offered,
+        kind,
+        tunnel_offered,
+        tunnel_installed,
+        server_answered,
+    } = *facts;
     let keep = match kind {
-        "clean" => return Some(offered.first().copied().unwrap_or(Role::TunnelClient)),
+        "clean" if tunnel_installed && tunnel_offered => return Some(Role::TunnelClient),
+        "clean" => {
+            return offered
+                .first()
+                .copied()
+                .or_else(|| (server_answered && tunnel_offered).then_some(Role::TunnelClient));
+        }
         "peruser" => Role::DaemonUser,
         "permachine" | "ambiguous" => match os {
             HostOs::Windows => match system_context() {
@@ -495,6 +582,180 @@ mod tests {
         assert_eq!(root_half_name("studio-mac"), "studio-mac-daemon");
     }
 
+    /// [`default_role`] with what a plain run has: the cards this OS implements
+    /// when the server's switch is on, the tunnel card, and an answer.
+    fn plain_default_role(
+        os: HostOs,
+        supported: bool,
+        kind: &str,
+        system_context: impl FnOnce() -> SystemContextSwitch,
+    ) -> Option<Role> {
+        default_role(
+            &WelcomeFacts {
+                os,
+                offered: if supported { daemon_roles(os) } else { &[] },
+                kind,
+                tunnel_offered: true,
+                tunnel_installed: false,
+                server_answered: true,
+            },
+            system_context,
+        )
+    }
+
+    /// FR-129 C, review finding 8: a machine with only the tunnel client keeps
+    /// it, as AC17 says any existing install keeps its flavour. A daemon on the
+    /// machine as well is that daemon's flavour, whatever the tunnel says.
+    #[test]
+    fn a_tunnel_only_machine_keeps_its_flavour() {
+        let facts = |kind, tunnel_installed| WelcomeFacts {
+            os: HostOs::Windows,
+            offered: daemon_roles(HostOs::Windows),
+            kind,
+            tunnel_offered: true,
+            tunnel_installed,
+            server_answered: true,
+        };
+        let on = || SystemContextSwitch::On;
+        assert_eq!(
+            default_role(&facts("clean", true), on),
+            Some(Role::TunnelClient)
+        );
+        assert_eq!(
+            default_role(&facts("clean", false), on),
+            Some(Role::DaemonSystem)
+        );
+        assert_eq!(
+            default_role(&facts("peruser", true), on),
+            Some(Role::DaemonUser)
+        );
+        assert_eq!(
+            default_role(&facts("permachine", true), on),
+            Some(Role::DaemonSystem)
+        );
+    }
+
+    /// FR-129 C, review finding 7: a server that could not be asked preselects
+    /// nothing. The tunnel card is there, and a click still takes it; the
+    /// default must not make that choice from a failed request.
+    #[test]
+    fn could_not_ask_preselects_nothing() {
+        for os in [HostOs::Linux, HostOs::Macos] {
+            let facts = |server_answered, tunnel_installed| WelcomeFacts {
+                os,
+                offered: &[],
+                kind: "clean",
+                tunnel_offered: true,
+                tunnel_installed,
+                server_answered,
+            };
+            let off = || SystemContextSwitch::Unreadable;
+            assert_eq!(default_role(&facts(false, false), off), None, "{os:?}");
+            assert_eq!(
+                default_role(&facts(true, false), off),
+                Some(Role::TunnelClient),
+                "{os:?}: the server said off, in so many words"
+            );
+            assert_eq!(
+                default_role(&facts(false, true), off),
+                Some(Role::TunnelClient),
+                "{os:?}: it is what this machine has, whatever the server says"
+            );
+        }
+    }
+
+    /// FR-129 C, review findings 3 and 6: what a run may offer under each limit,
+    /// the cards and the rule for what no card stands in front of alike, and the
+    /// default that follows from it.
+    #[test]
+    fn the_cards_follow_the_limit() {
+        let win = HostOs::Windows;
+        assert_eq!(roles_open_here(win, RoleLimit::None), daemon_roles(win));
+        assert_eq!(
+            roles_open_here(win, RoleLimit::AnotherAccount),
+            vec![Role::DaemonSystem]
+        );
+        assert_eq!(
+            roles_open_here(win, RoleLimit::NoElevation),
+            vec![Role::DaemonUser]
+        );
+        for os in [HostOs::Linux, HostOs::Macos] {
+            assert_eq!(roles_open_here(os, RoleLimit::None), daemon_roles(os));
+        }
+
+        for role in [Role::DaemonSystem, Role::DaemonMachine, Role::DaemonUser] {
+            assert!(role_open_here(win, role, RoleLimit::None), "{role:?}");
+        }
+        assert!(role_open_here(win, Role::TunnelClient, RoleLimit::None));
+        assert!(role_open_here(
+            win,
+            Role::DaemonSystem,
+            RoleLimit::AnotherAccount
+        ));
+        for role in [Role::DaemonMachine, Role::DaemonUser, Role::TunnelClient] {
+            assert!(
+                !role_open_here(win, role, RoleLimit::AnotherAccount),
+                "{role:?} would land in the administrator's profile"
+            );
+        }
+        assert!(role_open_here(
+            win,
+            Role::DaemonUser,
+            RoleLimit::NoElevation
+        ));
+        assert!(role_open_here(
+            win,
+            Role::TunnelClient,
+            RoleLimit::NoElevation
+        ));
+        for role in [Role::DaemonSystem, Role::DaemonMachine] {
+            assert!(
+                !role_open_here(win, role, RoleLimit::NoElevation),
+                "{role:?} needs a prompt this user is refused"
+            );
+        }
+
+        let default_under = |limit, kind| {
+            let offered = roles_open_here(win, limit);
+            default_role(
+                &WelcomeFacts {
+                    os: win,
+                    offered: &offered,
+                    kind,
+                    tunnel_offered: limit != RoleLimit::AnotherAccount,
+                    tunnel_installed: false,
+                    server_answered: true,
+                },
+                || SystemContextSwitch::On,
+            )
+        };
+        assert_eq!(
+            default_under(RoleLimit::NoElevation, "clean"),
+            Some(Role::DaemonUser),
+            "the locked desktop: what can work"
+        );
+        assert_eq!(
+            default_under(RoleLimit::AnotherAccount, "clean"),
+            Some(Role::DaemonSystem)
+        );
+        assert_eq!(
+            default_under(RoleLimit::NoElevation, "permachine"),
+            None,
+            "a machine-wide install this user cannot touch: the person picks"
+        );
+        assert_eq!(role_limit(false, false), RoleLimit::None);
+        assert_eq!(role_limit(true, false), RoleLimit::AnotherAccount);
+        assert_eq!(role_limit(false, true), RoleLimit::NoElevation);
+        assert_eq!(
+            serde_json::to_string(&RoleLimit::AnotherAccount).unwrap(),
+            r#""another-account""#
+        );
+        assert_eq!(
+            serde_json::to_string(&RoleLimit::NoElevation).unwrap(),
+            r#""no-elevation""#
+        );
+    }
+
     /// FR-129 C1 — the default role per OS and install kind (the table in the
     /// spec's design section C). Nothing installed preselects the background
     /// service the OS offers; an existing install keeps its flavour; nothing
@@ -503,7 +764,7 @@ mod tests {
     fn the_default_role_per_os_and_install_kind() {
         use SystemContextSwitch::{Off, On, Unreadable};
         // Windows offers its three daemon roles whatever the server says.
-        let win = |kind, sc| default_role(HostOs::Windows, true, kind, || sc);
+        let win = |kind, sc| plain_default_role(HostOs::Windows, true, kind, || sc);
         assert_eq!(win("clean", Unreadable), Some(Role::DaemonSystem));
         assert_eq!(win("peruser", On), Some(Role::DaemonUser));
         assert_eq!(win("permachine", On), Some(Role::DaemonSystem));
@@ -519,7 +780,7 @@ mod tests {
         assert_eq!(win("kind-from-the-future", On), None);
 
         // Linux with the server's switch on: the root service by default.
-        let linux = |kind| default_role(HostOs::Linux, true, kind, || Unreadable);
+        let linux = |kind| plain_default_role(HostOs::Linux, true, kind, || Unreadable);
         assert_eq!(linux("clean"), Some(Role::DaemonSystem));
         assert_eq!(linux("peruser"), Some(Role::DaemonUser));
         assert_eq!(linux("permachine"), Some(Role::DaemonSystem));
@@ -529,7 +790,7 @@ mod tests {
         // is ticked, the box's macOS default).
         for kind in ["clean", "peruser", "permachine", "ambiguous"] {
             assert_eq!(
-                default_role(HostOs::Macos, true, kind, || Unreadable),
+                plain_default_role(HostOs::Macos, true, kind, || Unreadable),
                 Some(Role::DaemonUser),
                 "{kind}"
             );
@@ -538,20 +799,20 @@ mod tests {
         // The switch off (or an older server): only the tunnel card is shown.
         for os in [HostOs::Linux, HostOs::Macos] {
             assert_eq!(
-                default_role(os, false, "clean", || Unreadable),
+                plain_default_role(os, false, "clean", || Unreadable),
                 Some(Role::TunnelClient),
                 "{os:?}: the only card"
             );
             for kind in ["peruser", "permachine", "ambiguous"] {
                 assert_eq!(
-                    default_role(os, false, kind, || Unreadable),
+                    plain_default_role(os, false, kind, || Unreadable),
                     None,
                     "{os:?} {kind}: never the tunnel client over a daemon the device has"
                 );
             }
         }
         assert_eq!(
-            default_role(HostOs::Other, true, "clean", || Unreadable),
+            plain_default_role(HostOs::Other, true, "clean", || Unreadable),
             Some(Role::TunnelClient)
         );
     }
@@ -567,16 +828,16 @@ mod tests {
             SystemContextSwitch::On
         };
         for kind in ["clean", "peruser", "kind-from-the-future"] {
-            default_role(HostOs::Windows, true, kind, probe);
+            plain_default_role(HostOs::Windows, true, kind, probe);
         }
         for os in [HostOs::Linux, HostOs::Macos, HostOs::Other] {
             for kind in ["clean", "peruser", "permachine", "ambiguous"] {
-                default_role(os, true, kind, probe);
+                plain_default_role(os, true, kind, probe);
             }
         }
         assert_eq!(asked.get(), 0);
-        default_role(HostOs::Windows, true, "permachine", probe);
-        default_role(HostOs::Windows, true, "ambiguous", probe);
+        plain_default_role(HostOs::Windows, true, "permachine", probe);
+        plain_default_role(HostOs::Windows, true, "ambiguous", probe);
         assert_eq!(asked.get(), 2);
     }
 

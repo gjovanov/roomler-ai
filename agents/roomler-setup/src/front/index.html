@@ -46,6 +46,10 @@
              decided in Rust as daemonOffered); app.js fills the copy per OS
              and shows this note when no daemon card may appear. -->
         <p id="platform-note" class="muted" hidden></p>
+        <!-- FR-129 C: why this run offers fewer cards than the OS has
+             (AgentDetect.roleLimit): an administrator's password typed for a
+             standard user, or a policy that refuses administrator prompts. -->
+        <p id="role-limit-note" class="muted" hidden></p>
         <fieldset id="role-fieldset">
           <label class="radio role-daemon" data-role="daemon-system">
             <input type="radio" name="role" value="daemon-system">
@@ -70,7 +74,7 @@
               <p class="muted" id="role-desc-daemon-user">perUser install under my account. No admin password needed.</p>
             </div>
           </label>
-          <label class="radio">
+          <label class="radio" id="role-card-tunnel">
             <input type="radio" name="role" value="tunnel-client">
             <div>
               <strong>Reach others only — tunnel client</strong>

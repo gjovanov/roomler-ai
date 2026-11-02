@@ -287,12 +287,217 @@ pub fn wait_for_exit(_pid: u32, _image: &str, _timeout: Duration) -> WaitOutcome
     WaitOutcome::Unknown
 }
 
+/// End process `pid` if it is still the image `image` (a reused id belongs to
+/// another program and is left alone). `false` when it could not be ended:
+/// another account's process usually refuses the handle.
+#[cfg(target_os = "windows")]
+pub fn terminate_if_still(pid: u32, image: &str) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    if listed(pid, image) != Some(true) {
+        return false;
+    }
+    // SAFETY: a plain OpenProcess; the handle is null-checked and closed.
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: a valid handle with the right to end the process.
+    let ended = unsafe { TerminateProcess(handle, 1) } != 0;
+    unsafe { CloseHandle(handle) };
+    ended
+}
+
+/// Nothing hands a process id across an elevation off Windows.
+#[cfg(not(target_os = "windows"))]
+pub fn terminate_if_still(_pid: u32, _image: &str) -> bool {
+    false
+}
+
+/// Say `text` in a native message box: what a start that cannot get as far as
+/// a window has left to tell the person. It blocks until the box is closed.
+#[cfg(target_os = "windows")]
+pub fn show_fatal(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+    };
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let (text, title) = (wide(text), wide("Roomler Setup"));
+    // SAFETY: two NUL-terminated strings that outlive the call; no owner window.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        )
+    };
+}
+
+/// There is no such box off Windows; the text goes to stderr.
+#[cfg(not(target_os = "windows"))]
+pub fn show_fatal(text: &str) {
+    eprintln!("{text}");
+}
+
+/// `ConsentPromptBehaviorUser`'s "automatically deny elevation requests", which
+/// the CIS and STIG baselines set on managed desktops.
+pub const CONSENT_USER_DENY: u32 = 0;
+
+/// Does the machine's policy refuse every administrator prompt to this token?
+/// Only a known refusal: `EnableLUA` on (or absent, its default), a plain
+/// standard user's token, and the deny value in so many words. An administrator
+/// approving their own prompt has no deny value to be refused by, so a filtered
+/// administrator's token never reads as refused, and neither does anything this
+/// could not read.
+pub fn policy_refuses_elevation(
+    enable_lua: Option<u32>,
+    consent_prompt_behavior_user: Option<u32>,
+    plain_standard_token: bool,
+) -> bool {
+    enable_lua != Some(0)
+        && plain_standard_token
+        && consent_prompt_behavior_user == Some(CONSENT_USER_DENY)
+}
+
+/// [`policy_refuses_elevation`] for this process, from the machine's policy key
+/// (readable by a standard user) and this process's own token.
+#[cfg(target_os = "windows")]
+pub fn elevation_refused_by_policy() -> bool {
+    const POLICY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+    policy_refuses_elevation(
+        hklm_dword(POLICY, "EnableLUA"),
+        hklm_dword(POLICY, "ConsentPromptBehaviorUser"),
+        token_is_plain_standard(),
+    )
+}
+
+/// No UAC here; the wizard's halves ask through `pkexec` or the macOS prompt.
+#[cfg(not(target_os = "windows"))]
+pub fn elevation_refused_by_policy() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn hklm_dword(key: &str, value: &str) -> Option<u32> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW,
+    };
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let (key, value) = (wide(key), wide(value));
+    let mut data = 0u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: NUL-terminated names and a u32 with its size, for one call; no
+    // type out-parameter is asked for.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&raw mut data).cast(),
+            &mut size,
+        )
+    };
+    (status == 0).then_some(data)
+}
+
+/// Is this a plain, unelevated token, one with no linked administrator behind
+/// it? `TokenElevationTypeDefault` with `TokenIsElevated` clear: a filtered
+/// administrator reads `Limited`, and the built-in Administrator elevated.
+/// `false` when the token cannot be read.
+#[cfg(target_os = "windows")]
+fn token_is_plain_standard() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE, TOKEN_QUERY, TokenElevation,
+        TokenElevationType, TokenElevationTypeDefault,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = std::ptr::null_mut();
+    // SAFETY: this process's pseudo-handle; the token is closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return false;
+    }
+    let mut kind: TOKEN_ELEVATION_TYPE = 0;
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut len = 0u32;
+    // SAFETY: a live token and buffers sized for each class, one call each.
+    let read = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevationType,
+            (&raw mut kind).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION_TYPE>() as u32,
+            &mut len,
+        ) != 0
+            && GetTokenInformation(
+                token,
+                TokenElevation,
+                (&raw mut elevation).cast(),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            ) != 0
+    };
+    // SAFETY: the handle OpenProcessToken gave us, closed once.
+    unsafe { CloseHandle(token) };
+    read && kind == TokenElevationTypeDefault && elevation.TokenIsElevated == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// Only the known refusal reads as one. Every other value of the policy
+    /// asks for credentials; a missing value or `EnableLUA` is its default.
+    #[test]
+    fn only_a_stated_deny_for_a_plain_token_refuses() {
+        assert!(policy_refuses_elevation(Some(1), Some(0), true));
+        assert!(
+            policy_refuses_elevation(None, Some(0), true),
+            "EnableLUA defaults to on"
+        );
+        for consent in [None, Some(1), Some(3)] {
+            assert!(
+                !policy_refuses_elevation(Some(1), consent, true),
+                "{consent:?} asks for credentials"
+            );
+        }
+        assert!(
+            !policy_refuses_elevation(Some(1), Some(0), false),
+            "an administrator's own prompt has no such value"
+        );
+        assert!(
+            !policy_refuses_elevation(Some(0), Some(0), true),
+            "with UAC off that value says nothing"
+        );
+    }
+
+    /// A process that is another image under that id is left alone; the
+    /// image's own is ended. A real child, as the wait's tests use.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn only_the_named_image_is_terminated() {
+        let mut child = a_second_long_child();
+        let pid = child.id();
+        assert!(!terminate_if_still(pid, "roomler-setup.exe"));
+        assert_eq!(
+            poll_until_gone(pid, "cmd.exe", Duration::from_millis(50)),
+            WaitOutcome::TimedOut,
+            "still running"
+        );
+        assert!(terminate_if_still(pid, "cmd.exe"));
+        assert_eq!(
+            poll_until_gone(pid, "cmd.exe", Duration::from_secs(30)),
+            WaitOutcome::Exited
+        );
+        child.wait().unwrap();
+        assert!(!terminate_if_still(pid, "cmd.exe"), "gone already");
     }
 
     /// The wizard's own arguments carry no space or quote, and pass as they

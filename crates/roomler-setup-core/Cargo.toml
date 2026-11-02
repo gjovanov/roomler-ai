@@ -75,8 +75,10 @@ tar = "0.4"
 #                      WaitForSingleObject / GetProcessId) +
 #                      Win32_System_Diagnostics_ToolHelp (the process list,
 #                      when another account's process refuses a handle) +
-#                      Win32_UI_WindowsAndMessaging (AllowSetForegroundWindow) +
-#                      Win32_System_LibraryLoader (SetDefaultDllDirectories)
+#                      Win32_UI_WindowsAndMessaging (AllowSetForegroundWindow,
+#                      MessageBoxW) +
+#                      Win32_System_LibraryLoader (SetDefaultDllDirectories) +
+#                      Win32_Security (the token: can this user ever elevate?)
 # NB Win32_UI_WindowsAndMessaging was declared by NEITHER legacy
 # crate — it compiled there only via cargo feature-unification with
 # roomlerd's windows-sys features. This crate declares what it
@@ -84,6 +86,7 @@ tar = "0.4"
 # are unused by the moved code and deliberately dropped.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",

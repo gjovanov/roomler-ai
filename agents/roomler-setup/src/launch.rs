@@ -43,6 +43,9 @@ pub const AFTER_ELEVATION_FLAG: &str = "--after-elevation";
 /// exit in the field took 12.2 s.
 pub const PARENT_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a copy that was ended past [`PARENT_EXIT_WAIT`] gets to be gone.
+pub const PARENT_END_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What the wizard was started with.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaunchArgs {
@@ -179,6 +182,107 @@ pub fn local_app_data() -> Option<std::path::PathBuf> {
     directories::BaseDirs::new().map(|b| b.data_local_dir().to_path_buf())
 }
 
+/// FR-129 C — an override an elevated wizard refuses from its environment. A
+/// limited process can write any variable to `HKCU\Environment`, and an elevated
+/// process of that user inherits it: `ROOMLER_INSTALLER_PROXY_BASE` there would
+/// name where the MSI comes from, and nothing would ask again before it runs.
+/// `ROOMLER*` are this product's own switches, `WEBVIEW2_*` and `TAURI_*` steer
+/// the webview, `SSL_CERT_*` name what TLS trusts. A proxy stays: a corporate
+/// one is how the download gets out, and TLS is still checked through it.
+pub fn distrusted_variable(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_uppercase();
+    name.starts_with("ROOMLER")
+        || name.starts_with("WEBVIEW2_")
+        || name.starts_with("TAURI_")
+        || name == "SSL_CERT_FILE"
+        || name == "SSL_CERT_DIR"
+}
+
+/// FR-129 C — before anything reads the environment or spawns a program, in
+/// `main`, while no other thread exists.
+///
+/// - The variables that name the machine's own folders take their true values
+///   on every run. The code the wizard links reads them (`%ProgramFiles%` for
+///   the install folder a prompt is then shown for, `%ProgramData%` for where a
+///   config with a token goes), and `HKCU\Environment` can override each.
+/// - The current directory leaves the person's Downloads, so nothing started
+///   from here looks there for a program or a DLL.
+/// - An elevated run also drops every [`distrusted_variable`]. A limited run
+///   keeps them: it crosses nothing its user cannot already do, and test
+///   fixtures point it at a staging server through them.
+pub fn start_clean() {
+    #[cfg(target_os = "windows")]
+    {
+        for (name, value) in roomlerd::appdirs::machine_folder_variables() {
+            // SAFETY: the first thing `main` does, before any other thread.
+            unsafe { std::env::set_var(name, value) };
+        }
+        if roomlerd::win_identity::process_is_elevated() {
+            let names: Vec<_> = std::env::vars_os()
+                .map(|(name, _)| name)
+                .filter(|name| distrusted_variable(name))
+                .collect();
+            for name in names {
+                // SAFETY: as above.
+                unsafe { std::env::remove_var(name) };
+            }
+        }
+        let _ = std::env::set_current_dir(roomlerd::appdirs::system_directory());
+    }
+}
+
+/// Do these name two different local app-data folders? Case and a trailing
+/// separator aside. `false` when either is unknown.
+fn names_another_profile(session_data: Option<&str>, own: Option<&std::path::Path>) -> bool {
+    let clean = |s: &str| s.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    match (session_data, own.and_then(std::path::Path::to_str)) {
+        (Some(session), Some(own)) => clean(session) != clean(own),
+        _ => false,
+    }
+}
+
+/// FR-129 C — is this an elevated wizard running as ANOTHER account than the
+/// person at the screen? Over-the-shoulder credentials: a standard user started
+/// it and an administrator typed their password. The limited copy named its own
+/// local app-data folder (`--session-data`), so a different one here says so.
+/// Only the machine-wide service is right then: the other roles would install
+/// into that administrator's profile and report Done
+/// ([`crate::role::roles_open_here`]).
+pub fn on_another_account(args: &LaunchArgs) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        roomlerd::win_identity::process_is_elevated()
+            && names_another_profile(args.session_data.as_deref(), local_app_data().as_deref())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = args;
+        false
+    }
+}
+
+/// FR-129 C — what this run narrows the role cards to.
+pub fn role_limit_here() -> crate::role::RoleLimit {
+    crate::role::role_limit(
+        on_another_account(&LaunchArgs::from_env()),
+        wizard_shared::elevation::elevation_refused_by_policy(),
+    )
+}
+
+/// FR-129 C — open `url` in the session's own browser, from an ELEVATED wizard.
+/// A browser started directly would inherit this process's token: the
+/// administrator's profile on a standard user's desktop under over-the-shoulder
+/// credentials, and elevated (with per-user handler overrides in play) for a
+/// same-user elevation. Explorer hands the request to the shell that owns the
+/// desktop, which runs as that desktop's user and is not elevated.
+#[cfg(target_os = "windows")]
+pub fn open_through_the_shell(url: &str) -> std::io::Result<()> {
+    std::process::Command::new(roomlerd::appdirs::windows_directory().join("explorer.exe"))
+        .arg(url)
+        .spawn()
+        .map(drop)
+}
+
 /// The WebView2 user-data folder of an ELEVATED wizard: beside the limited
 /// one's (`%LOCALAPPDATA%\ai.roomler.setup`, where Tauri puts it), never in
 /// it. WebView2 shares one browser process among every host that names the
@@ -208,6 +312,30 @@ pub fn elevated_webview_folder(session_data: Option<&str>) -> Option<std::path::
         .map(|folder| folder.join(TAURI_IDENTIFIER).join("elevated"))
 }
 
+/// FR-129 C — make `dir` a new, empty folder: run before WebView2 is pointed at
+/// it, with the administrator's token, in a place the limited user can write.
+/// Nothing a limited process left there may reach the elevated host's browser
+/// (a profile, an extension, a preference), and no link there is followed: a
+/// junction or symlink at either of the two names this wizard owns is removed,
+/// itself and not what it points at, before anything is created through it.
+pub fn make_elevated_folder(dir: &std::path::Path) -> std::io::Result<()> {
+    let is_link = |p: &std::path::Path| {
+        p.symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+    };
+    for path in [dir.parent(), Some(dir)].into_iter().flatten() {
+        if is_link(path) {
+            std::fs::remove_dir(path).or_else(|_| std::fs::remove_file(path))?;
+        }
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::create_dir_all(dir)
+}
+
 /// `tauri.conf.json`'s `identifier`, the folder Tauri keeps the limited
 /// copy's WebView2 data in (asserted against the file by a test).
 pub const TAURI_IDENTIFIER: &str = "ai.roomler.setup";
@@ -227,13 +355,28 @@ pub const MAIN_WINDOW: &str = "main";
 /// honours what the app passes through the API ("Develop secure WebView2
 /// apps", Microsoft Learn), which is why an elevated wizard's CDP port also
 /// comes only from machine policy, never from the environment.
+///
+/// The folder is made new each time ([`make_elevated_folder`]). When the one
+/// under the limited copy's folder cannot be, this process's own is tried, and
+/// a window that then cannot be built says so instead of panicking with none.
 pub fn webview_data_directory(args: &LaunchArgs) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
         if !roomlerd::win_identity::process_is_elevated() {
             return None;
         }
-        elevated_webview_folder(args.session_data.as_deref())
+        let dir = elevated_webview_folder(args.session_data.as_deref())?;
+        if let Err(e) = make_elevated_folder(&dir) {
+            tracing::warn!(dir = %dir.display(), error = %e, "elevated: its WebView2 folder could not be made");
+            let own = elevated_webview_folder(None)?;
+            if own != dir {
+                if let Err(e) = make_elevated_folder(&own) {
+                    tracing::warn!(dir = %own.display(), error = %e, "elevated: nor this one");
+                }
+                return Some(own);
+            }
+        }
+        Some(dir)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -251,7 +394,13 @@ pub fn webview_data_directory(args: &LaunchArgs) -> Option<std::path::PathBuf> {
 /// limited copy is another account's process; the wait then reads the
 /// process list instead of holding a handle
 /// (`wizard_shared::elevation::wait_for_exit`).
+///
+/// A copy still there past the bound is ended, since it holds the lock and would
+/// otherwise swallow this start: the person approved a prompt and would get
+/// nothing, with nothing saying why. If it cannot be ended (another account's
+/// process usually refuses), the person is told what to do and this copy exits.
 pub fn wait_for_parent(args: &LaunchArgs) {
+    use wizard_shared::elevation::{WaitOutcome, show_fatal, terminate_if_still, wait_for_exit};
     let Some(pid) = args.after_elevation else {
         return;
     };
@@ -260,13 +409,29 @@ pub fn wait_for_parent(args: &LaunchArgs) {
         .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_default();
     let started = std::time::Instant::now();
-    let outcome = wizard_shared::elevation::wait_for_exit(pid, &image, PARENT_EXIT_WAIT);
+    let mut outcome = wait_for_exit(pid, &image, PARENT_EXIT_WAIT);
+    if outcome == WaitOutcome::TimedOut {
+        let ended = terminate_if_still(pid, &image);
+        tracing::warn!(
+            pid,
+            ended,
+            "elevated start: the wizard that asked for it is still running"
+        );
+        outcome = wait_for_exit(pid, &image, PARENT_END_WAIT);
+    }
     tracing::info!(
         pid,
         ?outcome,
         waited_ms = started.elapsed().as_millis() as u64,
         "elevated start: waited for the wizard that asked for it"
     );
+    if outcome == WaitOutcome::TimedOut {
+        show_fatal(
+            "The Roomler Setup window you started this from has not closed. Close it, \
+             then choose Restart as administrator again from a new one.",
+        );
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -475,6 +640,136 @@ mod tests {
         );
     }
 
+    /// What an elevated run refuses from its environment, in any spelling, and
+    /// what it keeps: a corporate proxy is how the download gets out.
+    #[test]
+    fn the_overrides_an_elevated_run_refuses() {
+        use std::ffi::OsStr;
+        for name in [
+            "ROOMLER_INSTALLER_PROXY_BASE",
+            "roomler_installer_proxy_base",
+            "ROOMLER_TUNNEL_CLI_PROXY_BASE",
+            "ROOMLER_TUNNEL_WIZARD_PROXY_BASE",
+            "ROOMLER_TUNNEL_WIZARD_INSTALL_ROOT",
+            "ROOMLER_TUNNEL_ENROLL_BASE_URL",
+            "ROOMLERD_ENCODER",
+            "WEBVIEW2_USER_DATA_FOLDER",
+            "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
+            "TAURI_WEBVIEW_AUTOMATION",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+        ] {
+            assert!(distrusted_variable(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            "PATH",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "NO_PROXY",
+            "RUST_LOG",
+            "TEMP",
+            "USERPROFILE",
+            "XROOMLER",
+        ] {
+            assert!(!distrusted_variable(OsStr::new(name)), "{name}");
+        }
+    }
+
+    /// Every override the wizard's own code reads is on that list, so a new
+    /// one cannot slip past it by being spelled differently.
+    #[test]
+    fn every_override_the_wizard_reads_is_refused_when_elevated() {
+        for source in [
+            include_str!("proxy.rs"),
+            include_str!("orchestrator_tunnel.rs"),
+            include_str!("../../../crates/roomler-setup-core/src/tunnel_enroll.rs"),
+        ] {
+            let mut seen = 0;
+            for piece in source.split("env::var(\"").skip(1) {
+                let name = piece.split('"').next().unwrap();
+                if name == "HOSTNAME" || name == "COMPUTERNAME" {
+                    continue;
+                }
+                seen += 1;
+                assert!(distrusted_variable(std::ffi::OsStr::new(name)), "{name}");
+            }
+            assert!(seen > 0, "this source reads none any more: drop it here");
+        }
+    }
+
+    /// The same folder in another spelling is the same person; another folder
+    /// is another account's; and what cannot be compared is not a difference.
+    #[test]
+    fn telling_another_account_from_the_session_folder() {
+        let own = std::path::Path::new(r"C:\Users\me\AppData\Local");
+        for same in [
+            r"C:\Users\me\AppData\Local",
+            r"c:\users\ME\appdata\local",
+            r"C:\Users\me\AppData\Local\",
+        ] {
+            assert!(!names_another_profile(Some(same), Some(own)), "{same}");
+        }
+        assert!(names_another_profile(
+            Some(r"C:\Users\std\AppData\Local"),
+            Some(own)
+        ));
+        assert!(!names_another_profile(None, Some(own)));
+        assert!(!names_another_profile(
+            Some(r"C:\Users\std\AppData\Local"),
+            None
+        ));
+    }
+
+    /// The folder comes out new and empty, with nothing left by whoever had it
+    /// before; a parent that is missing is made.
+    #[test]
+    fn the_elevated_folder_is_made_new() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(TAURI_IDENTIFIER).join("elevated");
+        make_elevated_folder(&dir).unwrap();
+        assert!(dir.is_dir());
+        std::fs::create_dir_all(dir.join("EBWebView/Default/Extensions")).unwrap();
+        std::fs::write(dir.join("EBWebView/Default/Preferences"), "left").unwrap();
+        make_elevated_folder(&dir).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// A link at either of the wizard's two names is removed, never followed:
+    /// what it points at is untouched.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_junction_in_the_elevated_folders_path_is_not_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        let keep = elsewhere.join("elevated").join("keep.txt");
+        std::fs::create_dir_all(keep.parent().unwrap()).unwrap();
+        std::fs::write(&keep, "keep").unwrap();
+        let junction = |link: &std::path::Path, target: &std::path::Path| {
+            let made = std::process::Command::new(roomlerd::appdirs::system32_tool("cmd.exe"))
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "mklink: {made:?}");
+        };
+        // The wizard's folder is a junction to a folder holding an "elevated".
+        let owned = root.path().join("first").join(TAURI_IDENTIFIER);
+        std::fs::create_dir_all(owned.parent().unwrap()).unwrap();
+        junction(&owned, &elsewhere);
+        make_elevated_folder(&owned.join("elevated")).unwrap();
+        assert_eq!(std::fs::read_to_string(&keep).unwrap(), "keep");
+        assert!(!owned.symlink_metadata().unwrap().file_type().is_symlink());
+        // "elevated" itself is the junction.
+        let parent = root.path().join("second").join(TAURI_IDENTIFIER);
+        std::fs::create_dir_all(&parent).unwrap();
+        let dir = parent.join("elevated");
+        junction(&dir, &elsewhere.join("elevated"));
+        make_elevated_folder(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&keep).unwrap(), "keep");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
     /// A named folder that is not there changes nothing.
     #[test]
     fn a_missing_session_folder_falls_back_to_this_process() {
@@ -498,29 +793,41 @@ mod tests {
         assert_eq!(windows.len(), 1, "one window");
         assert_eq!(windows[0]["label"], MAIN_WINDOW);
         assert_eq!(windows[0]["create"], false);
-        let main = include_str!("main.rs");
-        assert!(main.contains("WebviewWindowBuilder::from_config"));
-        assert!(main.contains("webview_data_directory(&launch)"));
+        let calls = crate::spawn_gate::called_names(include_str!("main.rs"));
+        for name in [
+            "from_config",
+            "webview_data_directory",
+            "data_directory",
+            "build",
+        ] {
+            assert!(
+                calls.iter().any(|c| c == name),
+                "main.rs no longer calls {name}"
+            );
+        }
     }
 
-    /// No DLL comes from the folder the EXE sits in: the search is restricted
-    /// before anything else in `main`, and the linker does the same for the
-    /// imports the loader resolves before `main` runs. The plant test in the
-    /// field log is what proves the pair; this keeps either half from going.
+    /// The window is handed the folder BEFORE it is built: a `data_directory`
+    /// after `build` would not be a call the builder has.
     #[test]
-    fn dlls_come_from_system32_alone() {
-        let body = include_str!("main.rs")
-            .split("fn main() {")
-            .nth(1)
-            .expect("main");
-        let first = body
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty() && !line.starts_with("//"))
-            .unwrap();
-        assert_eq!(first, "wizard_shared::elevation::restrict_dll_search();");
-        let build = include_str!("../build.rs");
-        assert!(build.contains("rustc-link-arg-bin=roomler-setup=/DEPENDENTLOADFLAG:0x800"));
+    fn the_folder_reaches_the_builder_before_the_window_is_built() {
+        let calls = crate::spawn_gate::called_names(include_str!("main.rs"));
+        let at = |name: &str| calls.iter().position(|c| c == name).expect(name);
+        assert!(at("from_config") < at("data_directory"));
+        assert!(at("data_directory") < at("build"));
+    }
+
+    /// No DLL comes from the folder the EXE sits in, and no variable of its
+    /// user's is taken: the search is restricted first thing in `main`, the
+    /// environment made clean second, each before anything can load or read.
+    /// `build.rs` holds the linker's half; what proves that one is the flag read
+    /// from the built EXE (`scripts/signing/pe-dependent-load-flags.ps1`, run by
+    /// CI's Windows job and by the release lane), and what proves the pair is
+    /// the plant test in the field log.
+    #[test]
+    fn main_starts_clean_before_anything_else() {
+        let calls = crate::spawn_gate::called_names(include_str!("main.rs"));
+        assert_eq!(calls[..2], ["restrict_dll_search", "start_clean"]);
     }
 
     /// A relaunch comes to the front. Windows otherwise leaves it behind
@@ -528,11 +835,40 @@ mod tests {
     /// browser that offered the download.
     #[test]
     fn a_relaunch_takes_the_foreground() {
-        let main = include_str!("main.rs");
-        let setup = main.split(".setup(").nth(1).expect("the setup hook");
-        let hook = setup.split(".on_window_event(").next().unwrap();
-        assert!(hook.contains("launch.after_elevation.is_some()"));
-        assert!(hook.contains("set_focus()"));
+        let calls = crate::spawn_gate::called_names(include_str!("main.rs"));
+        let build = calls.iter().position(|c| c == "build").expect("build");
+        // The single-instance callback focuses too, earlier in the file: the
+        // last one is the setup hook's, on the window it has just built.
+        let focus = calls.iter().rposition(|c| c == "set_focus").expect("focus");
+        assert!(build < focus);
+    }
+
+    /// FR-129 C, review finding 5: the page gets the two IPC groups it uses and
+    /// nothing else. A native file picker or the shell's open, granted to a
+    /// script a limited user can reach, is a way into an elevated process.
+    #[test]
+    fn the_page_has_only_the_grants_it_uses() {
+        let caps: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        assert_eq!(
+            caps["permissions"],
+            serde_json::json!([
+                "core:default",
+                "core:event:allow-listen",
+                "core:event:allow-unlisten"
+            ])
+        );
+        let page = include_str!("front/app.js");
+        let plugins: std::collections::BTreeSet<&str> = page
+            .split("__TAURI__.")
+            .skip(1)
+            .map(|rest| rest.split(|c: char| !c.is_alphanumeric()).next().unwrap())
+            .collect();
+        assert_eq!(
+            plugins,
+            std::collections::BTreeSet::from(["core", "event"]),
+            "a new plugin in the page needs its grant, and this test updating"
+        );
     }
 
     /// A limited process never names a folder of its own, whatever its command

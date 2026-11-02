@@ -284,15 +284,50 @@ async function probeAndRender() {
   } catch (err) {
     console.warn("elevation probe failed:", err);
   }
-  if (state.detection.agent.featuresServer) {
-    state.features = {
-      server: state.detection.agent.featuresServer,
-      daemonOffered: state.detection.agent.daemonOffered === true,
-    };
-  }
+  applyDetectedFeatures();
 
   state.pageEnteredAt = performance.now();
   render();
+}
+
+function applyDetectedFeatures() {
+  const a = state.detection.agent;
+  if (a.featuresServer) {
+    state.features = {
+      server: a.featuresServer,
+      daemonOffered: a.daemonOffered === true,
+      answered: a.featuresAnswered !== false,
+    };
+  }
+}
+
+// FR-129 C — "could not ask" is not "switched off". A clean Linux or macOS
+// machine behind a TLS-inspecting box fails the question, so while the server
+// has not answered Rust preselects nothing and this page keeps asking: the
+// daemon cards appear when it answers, without a restart of the wizard.
+const FEATURES_RETRY_MS = 10_000;
+let detectionRetry = null;
+
+function keepAskingWhileUnanswered() {
+  const a = state.detection && state.detection.agent;
+  if (detectionRetry !== null || !a || a.featuresAnswered !== false) return;
+  detectionRetry = setTimeout(async () => {
+    detectionRetry = null;
+    if (state.step !== "welcome") return;
+    const server = state.server;
+    try {
+      const detection = await invoke("cmd_detect_install", { server });
+      if (server === state.server && state.step === "welcome") {
+        state.detection = detection;
+        applyDetectedFeatures();
+        renderWelcome();
+        return;
+      }
+    } catch (err) {
+      console.warn("[features] asked again, not read:", err);
+    }
+    keepAskingWhileUnanswered();
+  }, FEATURES_RETRY_MS);
 }
 
 function wireGlobalListeners() {
@@ -580,6 +615,15 @@ function renderWelcome() {
   // (copy per OS), and on Linux/macOS the server says whether they may be
   // shown at all. Off, only the tunnel-client card makes sense.
   const offered = new Set(a.supported ? (a.daemonRoles ?? []) : []);
+  // FR-129 C — every OS has the tunnel card, unless this run must not offer it
+  // (Rust's roleLimit; an unknown or absent answer leaves it shown).
+  const tunnelOffered = a.tunnelOffered !== false;
+  if (tunnelOffered) offered.add("tunnel-client");
+  document.getElementById("role-card-tunnel").hidden = !tunnelOffered;
+  const limitNote = document.getElementById("role-limit-note");
+  const limitText = ROLE_LIMIT_NOTE[a.roleLimit] ?? null;
+  limitNote.hidden = limitText === null;
+  limitNote.textContent = limitText ?? "";
   const copy = ROLE_COPY[state.os] ?? ROLE_COPY.windows;
   document.querySelectorAll("label.role-daemon").forEach((card) => {
     const role = card.dataset.role;
@@ -595,7 +639,7 @@ function renderWelcome() {
   if (!a.supported) {
     note.textContent = platformNote(a);
   }
-  if (state.role && state.role !== "tunnel-client" && !offered.has(state.role)) {
+  if (state.role && !offered.has(state.role)) {
     state.role = null;
   }
   // FR-129 C1 — nothing picked yet: preselect the role Rust recommends (the
@@ -607,10 +651,9 @@ function renderWelcome() {
   }
 
   // Restore radio selection.
-  if (state.role) {
-    const radio = document.querySelector(`input[name='role'][value='${state.role}']`);
-    if (radio) radio.checked = true;
-  }
+  document.querySelectorAll("input[name='role']").forEach((radio) => {
+    radio.checked = radio.value === state.role;
+  });
 
   // Cross-flavour warning gate (daemon roles only) — BLOCKER-7 of
   // the rc.28 plan critique, relocated from the agent wizard.
@@ -646,6 +689,7 @@ function renderWelcome() {
   // enrollment goes to, as the Server page currently has it.
   document.getElementById("diag-opt-in").checked = state.diagOptIn;
   document.getElementById("diag-server").textContent = state.server || "https://roomler.ai";
+  keepAskingWhileUnanswered();
 }
 
 // #3116 — does `role` need a wizard that runs as administrator, which this one
@@ -657,11 +701,18 @@ function needsElevatedWizard(role) {
 }
 
 // FR-129 C1 — may `role` be preselected on this page? A role the SPA knows,
-// and one of the cards shown: a daemon card this OS and server offer, or the
-// tunnel client, which every OS has.
+// and one of the cards shown.
 function isOfferedRole(role, offered) {
-  return ROLES.includes(role) && (role === "tunnel-client" || offered.has(role));
+  return ROLES.includes(role) && offered.has(role);
 }
+
+// FR-129 C — why this run shows fewer cards than the OS has.
+const ROLE_LIMIT_NOTE = {
+  "another-account":
+    "You approved this with another account's password, so this window runs as that account. It can install the background service for the whole computer and nothing else, because anything else would go into that account's profile. To install for your own account, close this window and open Roomler Setup again.",
+  "no-elevation":
+    "This computer's policy refuses administrator prompts for your account, so only what needs none is shown. For the background service, which also works before anyone signs in, ask your administrator to install it.",
+};
 
 // FR-129 C3 — "Restart as administrator": Rust starts this wizard again
 // through Windows' administrator prompt (one UAC prompt), with the role the
@@ -700,6 +751,10 @@ function platformNote(a) {
   if (os === "linux" || os === "macos") {
     const server = a.featuresServer ?? state.server;
     const shown = (server || "").replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+    // FR-129 C — nobody said so: the question did not get an answer.
+    if (a.featuresAnswered === false) {
+      return `Could not reach ${shown || "the server"} to ask what it offers, so the daemon options are not shown yet. Still trying; they appear when it answers. A network or proxy that blocks it will keep them hidden.`;
+    }
     return `${shown || "This server"} does not offer the daemon install from this wizard on ${os === "linux" ? "Linux" : "macOS"} yet (or it is an older server). This wizard can set up the tunnel client here; for the daemon, run in a terminal: curl -fsSL ${server.replace(/\/+$/, "")}/api/setup/install.sh | sh -s -- --role daemon`;
   }
   return "This platform supports the tunnel client only.";
@@ -782,17 +837,27 @@ async function refreshFeatures() {
   if (!isUnix() || !state.role || state.role === "tunnel-client") return;
   const server = state.server;
   if (!/^https?:\/\/[^\s]+$/i.test(server)) return;
-  if (state.features && state.features.server === server) return;
+  if (state.features && state.features.server === server && state.features.answered !== false) return;
   let view;
   try {
     view = await invoke("cmd_setup_features", { server });
   } catch (err) {
     console.warn("[features] not read:", err);
-    view = { daemonOffered: false };
+    view = { daemonOffered: false, answered: false };
   }
   if (server !== state.server) return;
-  state.features = { server, daemonOffered: view.daemonOffered === true };
+  state.features = { server, daemonOffered: view.daemonOffered === true, answered: view.answered !== false };
   renderServer();
+}
+
+// FR-129 C — a question that got no answer is asked again while this page is up.
+let featuresRetry = null;
+function askAgainSoon() {
+  if (featuresRetry !== null) return;
+  featuresRetry = setTimeout(() => {
+    featuresRetry = null;
+    if (state.step === "server") refreshFeatures();
+  }, FEATURES_RETRY_MS);
 }
 
 function renderServer() {
@@ -802,15 +867,19 @@ function renderServer() {
   // FR-129 B1: on Linux/macOS a daemon role needs this server's say-so.
   const note = document.getElementById("server-features-note");
   const daemonOnUnix = isUnix() && state.role && state.role !== "tunnel-client";
-  const refused = daemonOnUnix && state.features
-    && state.features.server === state.server && !state.features.daemonOffered;
-  const unknown = daemonOnUnix && (!state.features || state.features.server !== state.server);
-  note.hidden = !refused;
+  const asked = daemonOnUnix && state.features && state.features.server === state.server;
+  const unanswered = asked && state.features.answered === false;
+  const refused = asked && !unanswered && !state.features.daemonOffered;
+  const unknown = daemonOnUnix && !asked;
+  note.hidden = !(refused || unanswered);
+  const shown = state.server.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
   if (refused) {
-    const shown = state.server.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
     note.textContent = `${shown} does not offer the daemon install from this wizard on ${state.os === "linux" ? "Linux" : "macOS"} (its setup features say so, or it is an older server). Choose another server, or go back and pick the tunnel client.`;
+  } else if (unanswered) {
+    note.textContent = `Could not reach ${shown} to ask whether it offers the daemon install here. Still trying; a network or proxy that blocks it will keep this page from going on. Choose another server, or go back and pick the tunnel client.`;
+    askAgainSoon();
   }
-  if (refused || unknown) valid = false;
+  if (refused || unanswered || unknown) valid = false;
   document.getElementById("server-continue").disabled = !valid;
   // S2: the advanced section holds daemon config keys — meaningless for
   // the tunnel-client role.

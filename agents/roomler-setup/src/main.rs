@@ -48,6 +48,9 @@ fn main() {
     // FR-129 C — before anything can load a DLL by name: the EXE sits in the
     // person's Downloads and goes on to run elevated.
     wizard_shared::elevation::restrict_dll_search();
+    // And before anything reads the environment or spawns a program: an
+    // elevated run takes nothing from its user's own state.
+    wizard_app::launch::start_clean();
 
     // Stderr-only tracing. The wizard is a foreground EXE the
     // operator launches manually; persistent logging is the daemon's
@@ -123,7 +126,15 @@ fn main() {
                 tracing::info!(dir = %dir.display(), "elevated: WebView2 keeps its own data folder");
                 window = window.data_directory(dir);
             }
-            let window = window.build()?;
+            // No window is the one failure nothing on screen can report, and
+            // on an elevated run the copy that asked for it has already gone.
+            let window = window.build().unwrap_or_else(|e| {
+                tracing::error!(error = %e, "no main window");
+                wizard_shared::elevation::show_fatal(&format!(
+                    "Roomler Setup could not open its window ({e})."
+                ));
+                std::process::exit(1);
+            });
             if launch.after_elevation.is_some() {
                 let _ = window.set_focus();
             }

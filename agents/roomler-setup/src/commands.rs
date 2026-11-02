@@ -73,6 +73,16 @@ pub struct AgentDetect {
     /// `false` for anything but a JSON `true`, and on Windows, where no
     /// server is asked.
     pub daemon_offered: bool,
+    /// FR-129 C — that server said something ([`crate::features::Asked`]).
+    /// `false` means nobody could say, and the page keeps asking; `true` on
+    /// Windows, where no server is asked.
+    pub features_answered: bool,
+    /// FR-129 C — what this run narrows the cards to, for the page's note
+    /// ([`crate::role::RoleLimit`]); `daemon_roles` is already narrowed.
+    pub role_limit: crate::role::RoleLimit,
+    /// FR-129 C — the tunnel card may be shown: not to an elevated wizard on
+    /// another account, where it would land in that account's profile.
+    pub tunnel_offered: bool,
     /// FR-129 C1 — the role the Welcome page preselects
     /// ([`crate::role::default_role`]): the background service on a machine
     /// with nothing installed, an existing install's own flavour otherwise.
@@ -105,26 +115,39 @@ pub struct TunnelDetect {
 #[tauri::command(rename_all = "camelCase")]
 pub async fn cmd_detect_install(server: Option<String>) -> Result<DetectResult, String> {
     let os = crate::role::HostOs::current();
+    let tunnel = probe_tunnel_install();
     let agent = match os {
-        crate::role::HostOs::Windows => detect_windows(os),
+        crate::role::HostOs::Windows => detect_windows(os, tunnel.installed),
         _ => {
             let server = server
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(cmd_default_server_url);
-            let features = crate::features::fetch(&server).await;
-            detect_unix(os, &server, features)
+            let asked = crate::features::ask(&server).await;
+            detect_unix(os, &server, asked, tunnel.installed)
         }
     };
-    let tunnel = probe_tunnel_install();
     Ok(DetectResult { agent, tunnel })
 }
 
-/// Windows: the MSI registry probe (`detect_existing_install`), and (FR-129
-/// C1) the role it makes the default.
-fn detect_windows(os: crate::role::HostOs) -> AgentDetect {
+/// Windows: the MSI registry probe (`detect_existing_install`), what this run
+/// narrows the cards to (FR-129 C), and (FR-129 C1) the role that makes the
+/// default.
+fn detect_windows(os: crate::role::HostOs, tunnel_installed: bool) -> AgentDetect {
     let mut d = detect_windows_install(os);
-    d.default_role =
-        crate::role::default_role(os, d.supported, &d.kind, read_system_context_switch);
+    d.role_limit = crate::launch::role_limit_here();
+    d.tunnel_offered = d.role_limit != crate::role::RoleLimit::AnotherAccount;
+    d.daemon_roles = crate::role::roles_open_here(os, d.role_limit);
+    d.default_role = crate::role::default_role(
+        &crate::role::WelcomeFacts {
+            os,
+            offered: &d.daemon_roles,
+            kind: &d.kind,
+            tunnel_offered: d.tunnel_offered,
+            tunnel_installed,
+            server_answered: true,
+        },
+        read_system_context_switch,
+    );
     d
 }
 
@@ -141,6 +164,9 @@ fn detect_windows_install(os: crate::role::HostOs) -> AgentDetect {
         daemon_roles: crate::role::daemon_roles(os).to_vec(),
         features_server: None,
         daemon_offered: false,
+        features_answered: true,
+        role_limit: crate::role::RoleLimit::None,
+        tunnel_offered: true,
         default_role: None,
     };
     match detect_existing_install() {
@@ -198,11 +224,12 @@ fn read_system_context_switch() -> crate::role::SystemContextSwitch {
 fn detect_unix(
     os: crate::role::HostOs,
     server: &str,
-    features: crate::features::SetupFeatures,
+    asked: crate::features::Asked,
+    tunnel_installed: bool,
 ) -> AgentDetect {
     let d = crate::unix_daemon::detect(os);
     let roles = crate::role::daemon_roles(os);
-    let offered = features.daemon_offered(os);
+    let offered = asked.features.daemon_offered(os);
     let kind = match (d.per_user_config, d.system_config) {
         (true, true) => "ambiguous",
         (true, false) => "peruser",
@@ -225,8 +252,21 @@ fn detect_unix(
         daemon_roles: roles.to_vec(),
         features_server: Some(server.to_string()),
         daemon_offered: offered,
+        features_answered: asked.answered,
+        role_limit: crate::role::RoleLimit::None,
+        tunnel_offered: true,
         // FR-129 C1: the switch is Windows-only and never asked here.
-        default_role: crate::role::default_role(os, supported, kind, read_system_context_switch),
+        default_role: crate::role::default_role(
+            &crate::role::WelcomeFacts {
+                os,
+                offered: if supported { roles } else { &[] },
+                kind,
+                tunnel_offered: true,
+                tunnel_installed,
+                server_answered: asked.answered,
+            },
+            read_system_context_switch,
+        ),
     }
 }
 
@@ -237,7 +277,7 @@ fn detect_unix(
 /// `false`.
 #[tauri::command]
 pub async fn cmd_setup_features(server: String) -> crate::features::FeaturesView {
-    crate::features::fetch(&server)
+    crate::features::ask(&server)
         .await
         .view(crate::role::HostOs::current())
 }
@@ -271,6 +311,29 @@ pub struct LaunchView {
     pub server: Option<String>,
     /// Started by "Restart as administrator" (it carried `--after-elevation`).
     pub relaunched: bool,
+}
+
+/// FR-129 C — the same rule as the Welcome cards, at the points no card stands
+/// in front of: a run resumed on the Token page, or a role that reached Rust
+/// any other way. Before a pairing is asked for and before a token is spent.
+fn refuse_a_role_this_run_cannot_install(role: Role) -> Result<(), String> {
+    use crate::role::RoleLimit;
+    let limit = crate::launch::role_limit_here();
+    if crate::role::role_open_here(crate::role::HostOs::current(), role, limit) {
+        return Ok(());
+    }
+    Err(match limit {
+        RoleLimit::AnotherAccount => {
+            "This window runs as the administrator who approved the prompt, so it can only \
+             install the background service for the whole computer. Close it and start Roomler \
+             Setup again to install anything for your own account."
+        }
+        _ => {
+            "This computer's policy refuses administrator prompts for your account, so this \
+             role cannot be installed from it. Pick \"this user only\", or ask your administrator."
+        }
+    }
+    .to_string())
 }
 
 /// FR-129 C3 — this run's own command line, parsed and validated.
@@ -591,6 +654,7 @@ pub async fn cmd_install(
     use_paired: Option<bool>,
     on_event: tauri::ipc::Channel<wizard_shared::progress::ProgressEvent>,
 ) -> Result<DoneReport, String> {
+    refuse_a_role_this_run_cannot_install(role)?;
     let store = crate::pairing::PairStore::global();
     let root_half = crate::role::wants_root_half(
         crate::role::HostOs::current(),
@@ -806,6 +870,7 @@ pub async fn cmd_pair_start(
     root_half: Option<bool>,
 ) -> Result<PairStartView, String> {
     use roomlerd::pairing::{StartOutcome, StartRequest, host_arch, host_os};
+    refuse_a_role_this_run_cannot_install(role)?;
     let halves = crate::role::pair_halves(crate::role::wants_root_half(
         crate::role::HostOs::current(),
         role,
@@ -892,6 +957,12 @@ fn is_web_address(uri: &str) -> bool {
 /// opens its links (`shell::open` is deprecated for tauri-plugin-opener,
 /// but the shell plugin is already shipped and initialised here).
 fn open_in_browser(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+    // FR-129 C — an elevated wizard's token must not reach a browser.
+    #[cfg(target_os = "windows")]
+    if roomlerd::win_identity::process_is_elevated() {
+        return crate::launch::open_through_the_shell(url)
+            .map_err(|e| format!("opening the browser: {e}"));
+    }
     #[allow(deprecated)]
     {
         use tauri_plugin_shell::ShellExt;
@@ -945,6 +1016,9 @@ mod tests {
                 daemon_roles: vec![Role::DaemonSystem, Role::DaemonUser],
                 features_server: Some("https://example.invalid".to_string()),
                 daemon_offered: true,
+                features_answered: true,
+                role_limit: crate::role::RoleLimit::NoElevation,
+                tunnel_offered: true,
                 default_role: Some(Role::DaemonUser),
             },
             tunnel: TunnelDetect {
@@ -982,6 +1056,10 @@ mod tests {
         );
         assert!(json.contains(r#""daemonOffered":true"#), "{json}");
         assert!(!json.contains("wizardUnixDaemon"), "{json}");
+        // FR-129 C — what the page's notes and its tunnel card follow.
+        assert!(json.contains(r#""featuresAnswered":true"#), "{json}");
+        assert!(json.contains(r#""roleLimit":"no-elevation""#), "{json}");
+        assert!(json.contains(r#""tunnelOffered":true"#), "{json}");
     }
 
     /// FR-129 B1 — on Linux and macOS a daemon card needs the server's
@@ -989,16 +1067,21 @@ mod tests {
     /// asks.
     #[test]
     fn unix_detection_follows_the_server_switch() {
-        use crate::features::SetupFeatures;
+        use crate::features::{Asked, SetupFeatures};
         use crate::role::HostOs;
-        let off = SetupFeatures::default();
-        let on = SetupFeatures {
+        let said = |features| Asked {
+            features,
+            answered: true,
+        };
+        let off = said(SetupFeatures::default());
+        let on = said(SetupFeatures {
             pairing: true,
             pairing_off: false,
             wizard_linux_daemon: true,
             wizard_macos_daemon: true,
             wizard_unix_daemon: true,
-        };
+        });
+        let detect_unix = |os, server, asked| detect_unix(os, server, asked, false);
         // FR-129 C1 — the default follows the same switch; the kind is
         // whatever this box has, so the expectation is per kind.
         let clean_or_none = |d: &AgentDetect, clean: Option<Role>| {
@@ -1026,17 +1109,24 @@ mod tests {
         assert_eq!(d.daemon_roles, vec![Role::DaemonUser]);
         assert_eq!(d.default_role, Some(Role::DaemonUser), "whatever the kind");
         // B1-s2 — the field the page binds is this OS's switch alone.
-        let linux_only = SetupFeatures {
+        let linux_only = said(SetupFeatures {
             pairing: true,
             wizard_linux_daemon: true,
             ..SetupFeatures::default()
-        };
+        });
         let d = detect_unix(HostOs::Macos, "https://a.invalid", linux_only);
         assert!(!d.supported, "Linux's switch is not the Mac's");
         assert!(!d.daemon_offered);
         // FR-129 C1 — and the default follows it: no Mac card, so the tunnel
         // client on a clean Mac, never a daemon role the page does not show.
         clean_or_none(&d, Some(Role::TunnelClient));
+        // FR-129 C — could not ask: the same cards as "off", no preselection,
+        // and the page is told to keep asking.
+        let d = detect_unix(HostOs::Linux, "https://a.invalid", Asked::default());
+        assert!(!d.supported);
+        assert!(!d.features_answered);
+        clean_or_none(&d, None);
+        assert!(detect_unix(HostOs::Linux, "https://a.invalid", on).features_answered);
         let d = detect_unix(HostOs::Other, "https://a.invalid", on);
         assert!(!d.supported, "no daemon role on this OS");
         assert!(d.daemon_roles.is_empty());
@@ -1056,10 +1146,11 @@ mod tests {
     /// `wizard_unix_daemon` alone, and it still turns both on.
     #[test]
     fn each_os_follows_its_own_switch_and_an_older_server_still_works() {
-        use crate::features::parse;
+        use crate::features::read_answer;
         use crate::role::HostOs;
         let server = "https://a.invalid";
-        let supported = |os, body: &[u8]| detect_unix(os, server, parse(200, body)).supported;
+        let supported =
+            |os, body: &[u8]| detect_unix(os, server, read_answer(200, body), false).supported;
 
         let linux_only = br#"{"pairing": true, "wizard_linux_daemon": true, "wizard_macos_daemon": false, "wizard_unix_daemon": false, "wizard_pairing": false}"#;
         assert!(supported(HostOs::Linux, linux_only), "Linux is on");
