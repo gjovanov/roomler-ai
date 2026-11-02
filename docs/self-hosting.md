@@ -273,6 +273,124 @@ parameters — it says nothing about whether packets can flow.
 
 ---
 
+## The TURN relay
+
+coturn carries traffic for peers that have no direct path, and for a browser told
+to use nothing else. It is optional: the DERP floor over the API's own port keeps
+remote desktop, tunnels, SSH and the overlay connected without it. That is also
+how a broken coturn goes unnoticed. `/health` stays 200, the server keeps
+advertising the TURN URLs, and the only sign is in a client's log:
+`TURN allocate failed … attribute not found` when nothing answers on 3478.
+
+### How to tell that it is healthy
+
+Run this on the host:
+
+```bash
+bash scripts/selfhost-coturn-check.sh
+```
+
+It starts coturn if it is not running, watches it for 30 seconds, then drives the
+image's own TURN client through the published port, with credentials minted the way
+the server mints them. It exits non-zero and names what failed.
+
+| It says | What is wrong |
+|---|---|
+| `coturn is not staying up` | A crash loop. See below. |
+| `no relay allocation` | Nothing answers on 3478. Check the `netns` service's ports, and that it is running. |
+| `coturn hands out … but its --external-ip is …` | The relay address is not the public address. Clients would be told the wrong place. |
+| `CreatePermission to the public address … is refused` | No call can use this relay: every browser asks for this first. coturn logs `A peer IP … denied in the range`, because it rewrites the public address to its own before the deny list reads it. An edited file has lost the `--allowed-peer-ip` line. |
+| `relay to relay carried nothing` | Two relayed clients cannot reach each other. |
+| `do not share a namespace` | coturn or the server has lost `network_mode: service:netns`. A relay to the public address lands on coturn itself, so a call signals and carries no media. |
+| `NOT refused` | The deny list has a hole. See [what it refuses](#what-the-relay-refuses). |
+| `NOTE the relay address is 127.0.0.1` | Not a failure, but only this machine can use it. See [the two addresses](#the-two-addresses-to-set). |
+
+### What a crash loop looks like
+
+```bash
+docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost ps -a coturn
+docker inspect -f '{{.RestartCount}}' "$(docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost ps -aq coturn)"
+```
+
+The status reads `Restarting (255)`, or `running` if you catch it between two exits,
+and `RestartCount` climbs. Anything but 0 means it has died since Docker last started
+it. Read the reason from the whole log:
+
+```bash
+docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost logs --no-log-prefix coturn | grep -a 'unrecognized option'
+```
+
+⚠️ `logs --tail` hides it: coturn prints its full help text after the line that says
+why it quit.
+
+### What is pinned
+
+`coturn/coturn:4.18.0-r0`, by its multi-arch digest, in both compose files. `latest`
+moved to 4.18.0, which removed `--no-dtls`, a flag this file passed, and every fresh
+install crash-looped from then on. Nothing replaces that flag: with no certificate
+configured, coturn opens no TLS or DTLS listener at all.
+
+To move the pin, change the line in both files and run the check. The
+`selfhost-coturn` lane runs it on any PR that changes either file.
+
+### Why coturn and the server share a namespace
+
+A browser asks the relay for the SFU at the public address, and coturn rewrites that
+address to its own before it sends. So the SFU has to listen on coturn's own address.
+The small `netns` service holds one network namespace, the Docker network and every
+published port, and `roomler` and `coturn` both run inside it with
+`network_mode: service:netns`.
+
+The costs:
+
+- One idle container, on the Redis image, so there is nothing more to pull.
+- The ports are on `netns`, so that is the service to edit to change one, and
+  `docker compose ps` lists them there.
+
+### The two addresses to set
+
+`ROOMLER_PUBLIC_IP` is what coturn tells clients its relay address is.
+`ROOMLER_TURN_URL` is where the server tells them to find coturn. Both default to
+`127.0.0.1`, and that fails silently for anyone on another machine: coturn starts
+clean, hands out `127.0.0.1`, and logs no error, while the client is told to reach the
+relay at its own loopback. Set both to an address clients can reach, as in
+[Putting it behind a real hostname](#putting-it-behind-a-real-hostname).
+
+A LAN address works for `ROOMLER_PUBLIC_IP`, although the deny list covers it, because
+coturn rewrites it to its own before the check.
+
+⚠️ The server hands out more TURN URLs than this coturn serves: it adds
+`turn:…:443?transport=udp` and three `turns:` variants, and this file opens only 3478
+over UDP and TCP, with no TLS. A failed allocation that names port 443 or 5349 is
+expected here and costs a client time, not the relay.
+
+### What the relay refuses
+
+Anyone with an account on your server can get a TURN credential, so the relay must not
+be a way into the machines around it. With the shipped flags it answers 403 to a peer in:
+
+| Range | Refused by |
+|---|---|
+| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | the `--denied-peer-ip` lines |
+| `100.64.0.0/10`, the range overlay meshes use | the `--denied-peer-ip` lines |
+| `169.254.0.0/16`, including the cloud metadata address | coturn 4.18.0 itself |
+| loopback | coturn itself |
+| multicast | `--no-multicast-peers` |
+
+That includes the other containers on the stack's network and its gateway, which
+reaches every listener on the host. The check tries each of them.
+
+**One address passes:** the shared namespace's own, through `--allowed-peer-ip`. coturn
+needs it to reach the SFU. On it, a relay can reach only UDP ports that are already
+published to the world: coturn's, its relay ports and the SFU's.
+`--no-tcp-relay` answers a TCP relay allocation with 442, so the TCP listeners on that
+address, the API among them, stay out of reach. Clients still reach coturn over TCP:
+browsers and the agent only ever ask for a UDP relay.
+
+The relay still carries UDP to public addresses. That is what a TURN relay does.
+
+---
+
 ## Optional integrations
 
 None of these are required to run the product; all are off until you supply
@@ -395,6 +513,7 @@ anything; on this server that name carries no limits (`Core::plans_sold`,
 - **No automatic TLS.** Deliberate: terminate it in whatever you already run.
 - **coturn is optional and off the critical path.** The DERP floor over the
   API's own port already guarantees connectivity when no direct path exists.
+  That also means nothing fails loudly when it breaks: [check it](#how-to-tell-that-it-is-healthy).
 
 ## Getting help
 
