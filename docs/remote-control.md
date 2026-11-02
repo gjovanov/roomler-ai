@@ -4448,8 +4448,44 @@ installer PID (Win `OpenProcess` + `WaitForSingleObject`; Unix
 settle, runs the new binary's `--version`, writes a typed JSON
 outcome to `<log_dir>/last-install.json` with status
 `InProgress` / `SucceededVerified` / `SucceededUnverified` /
-`InstallerFailed` / `Timeout`. Operators + future agent startups
-read the file to surface what actually happened to the upgrade.
+`InstallerFailed` / `Timeout` / `WatcherStopped`. Operators + future
+agent startups read the file to surface what actually happened to the
+upgrade.
+
+**What the record says** (#3302):
+
+| `status` | Meaning | `installer_exit_code` |
+|---|---|---|
+| `InProgress` | The watcher wrote its opening line and no verdict yet | none |
+| `SucceededVerified` | The new binary answers the expected version: by the watcher's probe, or, when the watcher left no verdict, by the next daemon being that version | 0 or 3010, or none when nobody read it |
+| `SucceededUnverified` | The installer went through and the probe did not confirm the version. The note says what it saw | 0 or 3010 |
+| `InstallerFailed` | The installer exited with anything else, or it was gone before its exit could be read and the expected version is not on disk | the code, or none |
+| `Timeout` | The installer did not exit within the budget, on Windows after a kill and a retry | none |
+| `WatcherStopped` | Nothing wrote a verdict in the watcher's whole life, 25 min, and this daemon is not the expected version | none |
+
+⚠️ **A process gone before the wait has no exit code.** A refused MSI is
+over in under a second and the watcher starts after it, so `OpenProcess`
+finds no such pid. That used to read as exit 0: released 0.4.197 wrote
+`installer_exit_code: 0` and `SucceededUnverified` for an MSI whose own
+log says `status 1603`. `WaitOutcome::AlreadyGone` leaves the code unset
+and the version on disk decides. Unix keeps its stand-in 0: `wait_pid_unix`
+is never the installer's parent, so it reads no exit at all, and the probe
+is its source of truth.
+
+⚠️ **3010 is a success with a reboot asked for** (#3340). `msiexec` answers it
+when it replaced a file in use, and 1641 is the same family, so
+`installer_went_through` sends both on to the probe and the note says a reboot
+was asked for. A self-update measured at 3010 was online on the new version
+15 s later, with a record that called it failed.
+
+⚠️ **The next daemon settles what the watcher never wrote.** A watcher can
+be stopped before its verdict (below), and a release cannot reach the
+watcher of the release before it, so the watcher alone could never fix the
+first jump. At the clean-run threshold the daemon reads the record, and
+`post_install::settle_unreported` turns an `InProgress` into
+`SucceededVerified` when this daemon is the expected version, or, once the
+watcher's whole life has passed, into `WatcherStopped`. Younger than that
+it looks once more when the time is up.
 
 **It must inherit no socket (#2836, Windows).** std's `Command` spawns
 with `bInheritHandles = TRUE`, so the watcher gets a copy of every
