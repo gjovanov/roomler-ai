@@ -1,6 +1,6 @@
 # FR-43: One macOS device row — a supervising daemon and an unenrolled GUI worker
 
-**Status:** P0, P1, P2, P2c and P2d are shipped and field-verified (0.4.33 → 0.4.192): the daemon's row streams real pixels, accepts input and reports the worker's permissions, and a package update no longer undoes that. **P3 is not built**, so a Mac is still two rows. It waits on the three decisions under [Open decisions](#open-decisions). A worst-phase `kill -9` of the worker takes 6.19 s on 0.4.192, down from 10.09 s on 0.4.191. Tracking issue: `FR-43`.
+**Status:** P0, P1, P2, P2c and P2d are shipped and field-verified (0.4.33 → 0.4.192): the daemon's row streams real pixels, accepts input and reports the worker's permissions, and a package update no longer undoes that. **P3 is designed, on the operator's three decisions of 2026-11-02, and not built**, so a Mac is still two rows: see [P3 design](#p3-design--one-enrollment). A worst-phase `kill -9` of the worker takes 6.19 s on 0.4.192, down from 10.09 s on 0.4.191. Tracking issue: `FR-43`.
 
 ⚠️ Anchors RE-VERIFIED against master `c6e8ec58` on 2026-09-06, when this record was
 landed 27 releases after the field run. `remote_control`'s hub moved to
@@ -71,7 +71,10 @@ boot); the GUI-session process becomes an **unenrolled worker** it spawns and dr
 | P2 | Session delegation: the daemon's WS accepts an rc session and drives the worker over LocalAPI. | per-session fallback — delegation failure re-serves from the worker's own enrollment |
 | P2c | The daemon's row advertises the WORKER's `permissions`, so the dashboard stops calling a working capture target "not a capture target". | caps are only ever sent when they CHANGE; absent field = today's behaviour |
 | P2d | The installer stops reverting P2 on every update: with the daemon supervising, the `.pkg` no longer re-bootstraps the per-user LaunchAgent. | the guard needs BOTH the daemon opt-in and `macos_supervise_gui_worker = true`; either absent = today's behaviour byte-for-byte |
-| P3 | Collapse the enrollment: installer mints ONE token; existing two-row Macs migrate. | `--daemon-token` keeps working (two-row install stays reachable for a release) |
+| P3a | The worker runs with no enrollment: `run --supervised --unenrolled`, on a stand-in control plane in its own process. | `macos_one_row` in the root's config (default **off**; off = P2 byte for byte) |
+| P3b | A secondary org's session is delegated, each worker reply goes to the org that asked, and the person's floor crosses to the daemon. | the same switch |
+| P3c | `sudo roomlerd one-row` migrates a two-row Mac; a person deletes the retired row through the ordinary route. | `--revert`, until that delete |
+| P3d | `--one-row` at install: one token, one row. | `--daemon-token` keeps working (the two-row install stays reachable) |
 
 ## P2 design — session delegation over LocalAPI
 
@@ -464,40 +467,149 @@ scripts — *"`#!/bin/sh\r` … fails to configure on EVERY host"* — had no ma
 counterpart despite the identical failure mode under PackageKit. Pinned
 `text eol=lf` alongside this change.
 
-## P3 design — one enrollment (not built)
+## P3 design — one enrollment
 
-Read against master `cd3c7882c` on 2026-10-31. Nothing in this section is built or run, apart
-from the two REDs. It waits on [Open decisions](#open-decisions), and the first of those can
-change it.
+The operator chose on 2026-11-02 (#971): a secondary org's session is delegated and its consent names the org; the worker is fully unenrolled, not dormant; migration starts with a person's one command, and the retired row goes through an ordinary delete. Read against master `658a0bef2`. Nothing in this section is built yet.
 
-**P3 is still needed.** MacBook-1 is two rows, the worker holds its own enrollment and its own
-control WS, and FR-129's pairing gives one approval but two tokens. The P2 layout makes that
-enrollment load-bearing:
+**P3 is still needed.** MacBook-1 is two rows, the worker holds its own enrollment and its own control WS, and FR-129's pairing gives one approval but two tokens. The P2 layout makes that enrollment load-bearing:
 
 | What stops one row today | Where | Measured on 0.4.191 |
 |---|---|---|
-| The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `signaling.rs:2762` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
-| `run` refuses to start with no config | `app.rs:3718` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
-| Delegation is primary-org only, on purpose | `signaling.rs:3365-3369` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes |
+| The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `agents/roomlerd/src/signaling.rs:2836` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
+| `run` refuses to start with no config | `agents/roomlerd/src/app.rs:3744-3749` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
+| Delegation is primary-org only, on purpose | `agents/roomlerd/src/signaling.rs:3454-3462`, `agents/roomlerd/src/app.rs:5034`, `:5218` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes |
 
-**Recommended: a stand-in for the control plane, in the worker's process.** When `--supervised`
-finds no enrollment, the worker binds `127.0.0.1:0`, runs a small WS server that accepts, answers
-pings and discards, and points `ws_url` at it. `connect_once` then runs unchanged, so the warning
-in [Order of work](#order-of-work) about the shared session-setup path does not apply to the
-worker's side. The switch is "no per-user enrollment", with no new flag, so a two-row Mac stays on
-P2 byte for byte.
+After P3 a Mac has one row in each org, and the worker talks to the server through the daemon alone:
 
-Rejected: a `ControlLink` enum over the WS. It looks small at `send_frame` and `ws.next()`, but
-the receive deadline and the ping arms would each need a detached branch.
+```mermaid
+flowchart TB
+    subgraph server["roomler.ai"]
+        ROW["one row, in each org"]
+    end
+    subgraph mac["The Mac"]
+        subgraph root["root, from boot"]
+            DAEMON["com.roomler.daemon: a control WS per org, overlay, SSH, exec, consent"]
+        end
+        subgraph gui["the console user's session"]
+            WORKER["roomlerd run --supervised --unenrolled: peers, capture, input, clipboard"]
+            STAND["stand-in control plane, on loopback, in the worker's process"]
+        end
+        DAEMON -- "spawns: launchctl asuser, sudo -u" --> WORKER
+        DAEMON <-- "rc messages, caps, the person's floor: /var/run/roomler-delegate" --> WORKER
+        WORKER -- "its signalling loop's socket: nothing leaves the process" --> STAND
+    end
+    ROW -- "control WS" --- DAEMON
+```
 
-The stand-in still has to handle:
+### The switch
 
-- A synthesized config persisted to disk, because `caps`, `record` and `config set` all load the
-  file.
-- The appdirs directory existing before `instance_lock::acquire`.
-- No log upload, crash upload or `/health` preflight with an empty token. The worker's
-  `agent_logs` are lost, and that is a known gap.
-- The companion not reading an empty `agent_id` as "not enrolled".
+`macos_one_row` in the root's `config.toml`, default **off**, read at the daemon's start. It only means something with `macos_supervise_gui_worker = true`. Like that key it is the device's own: it is not in `DesiredConfig`, so no server can push it.
+
+| | Off, the default | On |
+|---|---|---|
+| The spawn (`agents/roomlerd/src/macos_supervisor.rs:612`) | `run --supervised`, on the person's enrollment | `run --supervised --unenrolled` |
+| A person's enrollment on this Mac | what the worker runs on | ignored and left in the file, so turning the switch off brings it back until the migration strips it |
+| A secondary org's session | served by the root, no pixels | delegated |
+| A Mac with no per-user config | no worker | a worker |
+
+⚠️ The switch does not turn itself on. The default flips only after the field proof below, and that flip is the operator's.
+
+### P3a — the worker holds no enrollment
+
+**A stand-in for the control plane, in the worker's process.** With `--unenrolled` the worker binds `127.0.0.1:0` and runs a small WS server that answers pings and discards the rest. Its signalling loop dials that instead of a server, so `connect_once` runs as it does everywhere, its `next_delegated` arm included, and the warning in [Order of work](#order-of-work) about the shared session-setup path does not reach this phase. The handshake must carry a secret minted for the process (`agents/roomlerd/src/signaling.rs:1582-1587` sends it as the token, and `agents/roomlerd/src/ws_connect.rs:36` dials an address literal directly), so another local process that dials the port gets a 401 and no socket.
+
+Rejected: a `ControlLink` enum over the WS. It looks small at `send_frame` and `ws.next()`, but the receive deadline and the ping arms would each need a detached branch, on the path every platform's sessions take.
+
+⚠️ **The stand-in's lifetime is the worker's.** The secret proves the worker to the stand-in, and nothing proves the stand-in to the worker. If the listener ended while the worker lived, its port would be free, any local process could bind it, and the loop's reconnect would dial that process, hand it the secret and act on what it sent. That process would be a control plane for a worker holding the person's TCC grants. So when the listener's task ends, for any reason, the worker exits at once, with a code of its own, and the supervisor starts a new one on a new port with a new secret. It never dials an old port. The exit is a crash record on the root's enrollment (`agents/roomlerd/src/macos_supervisor.rs:271`), because that task ending is a defect. A test kills the listener and reads the exit from a real child process.
+
+Rejected: a mutual check on the upgrade response. The secret goes out in the request, so whoever answers already holds it, and a real challenge would add a handshake to `connect_once` to guard a state the exit removes.
+
+⚠️ **A session reaches this process through the root's delegation socket and nothing else.** `handle_server_msg` has two callers: the `next_delegated` arm (`signaling.rs:2909`) and the `ws.next()` arm (`:2978`). With `--unenrolled` the second drops every text frame (`OrgCtx::unenrolled`, false in every other process). That gate does not depend on who holds the port. It is the one line this phase adds to `connect_once`. The worker reaches the delegation socket at a path only root can bind (`/var/run/roomler-delegate`, `agents/roomlerd/src/delegate.rs:80-81`). Its other two listeners take no session:
+
+| Listener | What it serves | Why it stays |
+|---|---|---|
+| The per-user LocalAPI socket, `0600` | The person's own verbs. No verb starts a session, and the tunnel verbs refuse (below) | The companion and `roomler` as the console user |
+| The loopback probe, `127.0.0.1:47989` (`agents/roomlerd/src/rc_local_turn.rs:42-43`) | The TURN half answers 503 with no overlay address. The clipboard bridge serves the page in the person's own browser, behind an origin allowlist | As on any per-user install; root cannot reach the person's pasteboard |
+
+The WebRTC peers, the SSH server and the relay responder need an offer or an overlay this process no longer has.
+
+**The person's file is never rewritten.** `run_cmd` takes the file and runs on a view of it, `AgentConfig::for_unenrolled_worker`, built right after the load (`agents/roomlerd/src/app.rs:3796`). The startup saves that write the loaded copy (`config::StartupWrites`, from `app.rs:3810`) become no-ops in this mode, and every later writer already reloads the file first. So an unmigrated person's token survives on disk, and the switch stays a real off.
+
+| In `run_cmd` | Enrolled worker | `--unenrolled` |
+|---|---|---|
+| No config file (`app.rs:3744`) | bails, the supervisor gives up | writes one with blank identity fields, because `caps`, `record` and `config set` load the file |
+| No secret on stdin (`agents/roomlerd/src/delegate_worker.rs:174`) | warns and keeps serving its own row | exits: with no channel it can serve nothing, and the supervisor's bound applies |
+| Identity, `[[orgs]]`, `[[tunnel_routes]]`, overlay, SSH, exec, relay, hive, vault | from the file | blank or off in the view: the root holds all of them |
+| Preflight to the server (`app.rs:4119`) | runs | skipped |
+| Crash bookkeeping and rollback (`app.rs:4131-4228`) | runs | skipped. A worker cannot install a package. The supervisor records its crashes on the root's enrollment (`macos_supervisor.rs:1051`) |
+| Updater (`app.rs:4238`, `:5366`) | runs | off: the view sets `auto_update = false`, and the root and its update helper own updates |
+| Crash upload (`app.rs:4429`), log upload (`app.rs:4466`) | on its own token | no token. See the gap below |
+| Self-unenroll on a stop (`app.rs:5544`) | if its row is ephemeral | never: this process is not that row |
+
+**What the person sees.** A worker with no enrollment answers `Status` with the root half's identity and link, not its own blanks, over the person socket it already uses for the network fields (`agents/roomlerd/src/person_socket.rs:217`, `:235`). `connected` comes from the root half only, since the stand-in always reads connected. `Devices` and `Mesh` go straight to the root half (`person_socket.rs:146`). The companion's `enrolled` stops meaning "a file exists" (`agents/roomler-desktop/src/commands.rs:95`), which lets the daemon's word fill it in (`:154`).
+
+⚠️ **A person's own tunnels.** `roomler forward` as the console user reaches the worker, whose hub has no server behind it, and the person socket refuses that verb (`crates/localapi/src/lib.rs:3172`). On a one-row Mac those verbs answer at once with `sudo roomler forward …`, rather than hanging. Declared `[[tunnel_routes]]` in a person's file are named by the migration, not moved.
+
+**The gap, and its own PR.** The worker's `agent_logs` and panic records have no enrollment to upload on. The log lines relay over the delegation channel to the daemon's uploader, marked as the worker's. Until that PR lands, a one-row Mac's worker logs are local only.
+
+### P3b — a secondary org's session is delegated
+
+Under the switch, `run_cmd` gives every org loop the host (`app.rs:5034`, and `:5218` for a join), and these gates ask the host instead of `ctx.is_primary`: the delegation (`signaling.rs:3459-3462`), the session params (`:3813`), the audio offer (`:3638`) and the caps on the hello and the heartbeat (`:1697-1720`, `:2385-2402`).
+
+**Each worker reply goes to the org that asked.** `DelegateHost` holds one outbound today (`agents/roomlerd/src/delegate.rs:439`). It keeps one per enrollment and a bounded `session → enrollment` map, written where a message crosses to the worker and read in `relay_upstream` (`delegate.rs:1046`). A session it does not know goes to the primary, as every reply does today. Signing and sealing need no change: they run per loop on that loop's outbound (`signaling.rs:2533`, `:2547`), so an answer is signed with the key of the org it belongs to.
+
+**The consent names the org.** The prompt stays the daemon's. `prompt_org` already names the org on a multi-org device (`signaling.rs:3568`, `docs/multi-org.md` §8b), and `asking_org` already reaches the worker's banner (`delegate.rs:205`). This is the same rule Windows and Linux run. The field proof reads the prompt itself, because the macOS native panel is still FR-27's open item.
+
+**The person's floor crosses too.** Today a person's `auto_grant_session = false` binds their own row, through their own broker. The `Request` arm reads the daemon's (`signaling.rs:3751`) and the daemon's `rc_*` floor (`:3763`), so with their row gone a person would silently lose the prompt they asked for, and the app's switch would do nothing. The worker sends its own values at attach (`DelegateFrame::PersonFloor`), and the daemon takes the stricter of the two for every org's session. It can only tighten, so this is not the authority over the root's gates that #2871 left open. A worker from before the frame sends nothing, and the root's values stand.
+
+### P3c — a person's one command
+
+`sudo roomlerd one-row`, with `--dry-run` for the plan alone and `--revert` for the way back.
+
+| Step | What it does | If it fails |
+|---|---|---|
+| Read | Root, macOS, the root half enrolled and connected; every person's config under `/Users` | Stops. Nothing has changed |
+| Plan | Each person's enrollment is **retired** when the root holds that server and tenant, and **moved** when it does not | `--dry-run` stops here |
+| Keep | Both files copied to `*.pre-one-row`, mode 600 | Stops |
+| LaunchAgent | Booted out and its plist removed, as `postinstall`'s guard does (`agents/roomlerd/packaging/macos/postinstall:210-215`) | Stops, and restores it |
+| Root's file | Both keys on; a moved enrollment appended to `[[orgs]]` with its token and WireGuard key unchanged | Restores, and stops |
+| Person's file | Identity fields blanked, `[[orgs]]` emptied, every other key kept | Restores, and stops |
+| Restart | The daemon restarts. **This ends live sessions, and the plan says so first** | |
+| Verify | Within 60 s: connected, `delegation channel attached`, the row reports `screen-capture` | Restores both files and restarts, then says what it saw |
+| Report | Each retired row's name and id, and where to delete it | |
+
+**The retired row is deleted by a person, through the ordinary route.** `DELETE /api/tenant/{tid}/agent/{id}` (`crates/modules/fleet/src/agent.rs:1315`) is `remove_agent_device` (`crates/modules/fleet/src/removal.rs:43`): the lease released first, then the tombstone, then the kick. That is the order AC12 names. The command cannot do this itself: a device holds no user credential, and `POST /api/agent/self/unenroll` refuses a permanent row on purpose (`agent.rs:558`), so a compromised host cannot erase its own record. Deleting the row is therefore the person's second act, and the Mac works whether or not they have done it yet. A row left behind only reads offline.
+
+**The overlay address.** The root's enrollment is untouched, so its row keeps its node and its address. A moved enrollment keeps its row, its key and any address it had, since only the holder of the token changed. A retired row with a node of its own releases it through the delete. Where the only address in an org was on the retired row, the plan says so before anything changes.
+
+⚠️ **A moved row keeps the machine id it enrolled with.** `{tenant_id, machine_id}` still holds, with that row under the per-user half's id (`crates/agent-core/src/machine.rs:33`) and the root's under its own (`:130`). Enrolling the root into that org later would make a new row, as it would today.
+
+### P3d — one token at install
+
+`roomlerd enroll --one-row` writes both keys beside the enrollment, and `install.sh --role daemon --token <one> --one-row` enrolls the root half alone: the marker, the package, the enrollment with the overlay on, the LaunchAgent removed, the daemon kickstarted (`scripts/install.sh:836`, `:929`). `--pair` takes the same flag. The two-row commands stay as they are (`--daemon-token`, `scripts/install.sh:265`), so a person without admin rights keeps the per-user half alone, which is a one-row Mac with no mesh. The wizard's `halves: 2` (`docs/device-pairing.md:153`) and the dashboard's commands follow only when the default flips.
+
+### What does not move
+
+| Invariant | Under P3 |
+|---|---|
+| One daemon per machine | Still one. The worker stays a process of that install, and now holds less |
+| Who holds the TCC grant | The same bundle at the same path, through the same chain (`macos_supervisor.rs:612-667`). The migration touches no bundle, which is what AC5 reads |
+| The hub keys on `agent_id` (`crates/modules/fleet/src/hub.rs:917`) | The worker no longer dials a server, so it can displace nothing |
+| The delegation channel's two gates (`delegate.rs:516-537`) | Unchanged |
+| The reap's exact match (`macos_supervisor.rs:469`, `:482`) | Matches both command lines, so a worker of either kind is found |
+
+### What rides what
+
+| PR | Holds | Field proof |
+|---|---|---|
+| This one | The design, in the spec | None |
+| P3a | The switch, the unenrolled worker, the stand-in, the person's surfaces | AC1's stream half: RED on the current release, GREEN on the release carrying it |
+| P3a logs | The worker's log lines over the channel | AC18 |
+| P3b | Secondary orgs, the routing, the floor | AC15, AC16 |
+| P3c | The command | AC5, AC12, AC17 |
+| P3d | `--one-row` | AC1 |
+
+Each is default-off, so none waits for the FR-63 read. All the field proof runs on throwaway tart Macs, one at a time, and a Mac's `roomler ssh` half of AC1 shares AC3's wait on the vmtest org's switch.
 
 ## Acceptance criteria
 
@@ -602,6 +714,15 @@ The stand-in still has to handle:
       the `docs/README.md` index row it already has, and `docs/platform-support.md` stops
       saying two rows. *(The layout that ships today is documented there, with the diagram, as
       of 2026-10-31. This stays open until P3 changes it.)*
+- [ ] P3b: with the switch on, a session on a secondary org's row streams real pixels and takes
+      input, and its consent prompt names that org. With the switch off the same row reads
+      `no-gui-session` and shows no pixels, as today.
+- [ ] P3b: a person's `auto_grant_session = false` in their own file makes a session on the one
+      row ask them, in every org, and a root value of `false` holds whatever the person's file
+      says.
+- [ ] P3c: a migration whose verify fails leaves the Mac as it was, both files restored, and
+      `--revert` before the delete gives back a two-row Mac that streams.
+- [ ] P3a: a one-row Mac's worker logs reach `agent_logs`, on the row.
 
 ## Dead hypotheses — do not re-run these
 
@@ -642,15 +763,11 @@ The stand-in still has to handle:
 
 - Spawn mechanism: settled by the field. P1 to P2d run `launchctl asuser` from the daemon,
   verified through every release since 0.4.36.
-- **Secondary orgs on a one-row Mac** (found 2026-10-31, the operator's). Today's per-user
-  half is what streams in a secondary org, and P3 removes it. Delegating those sessions
-  reverses the rule at `signaling.rs:3365-3369`. Windows and Linux already serve them, with
-  the consent prompt naming the org (`docs/multi-org.md` §8b). The other choices are no remote
-  desktop on a Mac's secondary rows, or leaving a multi-org Mac on two rows.
-- Migration: delete or tombstone the retired per-user row, and who initiates it. An org only
-  the per-user half holds needs a root enrollment first, or it is dropped.
-- Whether the worker keeps a *dormant* enrollment as the P2 fallback, or is fully
-  unenrolled from the start.
+- Settled by the operator on 2026-11-02 (#971): secondary orgs are delegated with the consent
+  naming the org, the worker is fully unenrolled, and migration is a person's one command with an
+  ordinary delete. [P3 design](#p3-design--one-enrollment) has what follows from each.
+- When `macos_one_row` becomes the default: after AC1, AC5, AC12 and AC15 to AC18 read green. The
+  operator's.
 
 ## Out of scope
 

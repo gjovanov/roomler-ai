@@ -136,6 +136,14 @@ async fn the_daemon_s_measure_is_the_probe() {
     }
 }
 
+/// FR-90 P8-2d-1 (AC5) — a daemon no device worker was started in, which is
+/// every build without `worker_calls` and every device with `hive_worker` off,
+/// measures in this process, and its prober with it.
+#[test]
+fn with_no_device_worker_a_probe_measures_in_the_daemon() {
+    assert!(measure().in_daemon());
+}
+
 /// FR-90 P8-2d-0 — a device's call and its answer cross the channel as
 /// themselves: their own frames, never read as a session worker's.
 #[cfg(worker_calls)]

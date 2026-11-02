@@ -613,12 +613,12 @@ pub struct AgentConfig {
     /// the vault decides is the owner's call.
     #[serde(default)]
     pub hive_egress: bool,
-    /// FR-90 P8-2a-1 — run a worker beside each agent session on this
-    /// device (`roomlerd hive-worker`, the same binary as the daemon's
-    /// supervised child), so a fault in what it serves costs that session's
-    /// worker and never the daemon. Unix first. Default OFF, and never
+    /// FR-90 P8-2a-1 — run a worker beside each agent session on this device
+    /// (`roomlerd hive-worker`, the same binary as the daemon's supervised
+    /// child) and, P8-2d-1, one for the device itself, so a fault in what one
+    /// serves costs that worker and never the daemon. Default OFF, and never
     /// pushable: how this device's own processes are arranged is the owner's
-    /// call.
+    /// call. Read as the daemon starts: a change waits for its next start.
     #[serde(default)]
     pub hive_worker: bool,
     /// FR-90 P4-3b-1 — what this device's knowhow scans read (decision 38):
@@ -1584,6 +1584,12 @@ pub struct AgentConfig {
     /// no hardware. Built-in: on. Read at start.
     #[serde(default)]
     pub caps_learn_deny: Option<bool>,
+    /// #3280 — when the encoder probe's first answer ran short of time, try again
+    /// by itself, with more time and no restart, giving way to any session
+    /// (`ROOMLERD_CAPS_PROBE_RETRY`). Off: that answer stands until the next start.
+    /// Built-in: on. Read at start.
+    #[serde(default)]
+    pub caps_probe_retry: Option<bool>,
     /// FR-119 — offer a viewer that asks a frame rate above 60
     /// (`ROOMLERD_FPS_HIGH`): advertise `fps-high`, and grant a higher rate
     /// only on a direct path, on a rate class this host has proven (or as a
@@ -3035,6 +3041,7 @@ pub fn test_fixture() -> AgentConfig {
         text_mod_neutralize: None,
         caps_cache: None,
         caps_learn_deny: None,
+        caps_probe_retry: None,
         fps_high: None,
         encoder_cells_deny: None,
         fps_deny: None,
@@ -3163,7 +3170,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 93] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 94] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -3267,6 +3274,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 93]
         ("TEXT_MOD_NEUTRALIZE", cfg.text_mod_neutralize),
         ("CAPS_CACHE", cfg.caps_cache),
         ("CAPS_LEARN_DENY", cfg.caps_learn_deny),
+        ("CAPS_PROBE_RETRY", cfg.caps_probe_retry),
         ("FPS_HIGH", cfg.fps_high),
         ("ZERO_COPY", cfg.zero_copy),
         ("COLOR_DESCRIPTION", cfg.color_description),
@@ -3511,7 +3519,7 @@ pub fn default_config_path() -> Result<PathBuf> {
 fn harden_machine_global_dir(dir: &std::path::Path) {
     let d = dir.display().to_string();
     for (i, args) in HARDEN_STEPS.iter().enumerate() {
-        match std::process::Command::new("icacls")
+        match std::process::Command::new(crate::appdirs::system32_tool("icacls.exe"))
             .arg(&d)
             .args(*args)
             .output()

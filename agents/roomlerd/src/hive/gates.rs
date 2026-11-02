@@ -61,8 +61,8 @@ pub struct HiveConfig {
     /// (P3b-5-1) on Windows, where none runs, behind the proxy as its
     /// environment names it.
     pub egress: bool,
-    /// FR-90 P8-2a-1 — whether each session here gets a worker beside it
-    /// (`hive_worker`): `roomlerd hive-worker`, supervised. Unix first.
+    /// FR-90 P8-2a-1 — whether each session here gets a worker beside it, and
+    /// P8-2d-1 the device one (`hive_worker`): `roomlerd hive-worker`, supervised.
     pub worker: bool,
 }
 

@@ -26,7 +26,7 @@ flowchart TB
 | Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux |
 | Agent overlay tests | add `--features overlay-l3` | ⚠️ feature-gated — the default `--lib` run silently skips them |
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
-| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2543`) |
+| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2554`) |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
 | Phone-width smoke | `cd ui && bun run test:phone` | nothing — the built SPA with every `/api` call mocked (`ui/e2e-phone/`) |
@@ -98,6 +98,10 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   the `rc:*` channel — notifications, conference, tenants, files, agents…),
   composables (`useRemoteControl` HID + button-mapping locks, validation,
   markdown, snackbar), API client, plugins.
+- **The setup wizard's page** (`ui/src/__tests__/setupWizardPage.spec.ts`, FR-129 C): the
+  real `index.html` and `app.js` of `agents/roomler-setup` in jsdom, with Tauri's `invoke`
+  mocked. What is preselected, when Continue opens and which cards show are the product there,
+  and no other lane runs that file.
 - **Playwright** (`ui/e2e/`): auth, chat (multi-client, pagination, reactions,
   threads, mentions), rooms + files panel, conference (list/chat/multi),
   websocket + connection status, billing, invite, oauth, email flows,
@@ -142,7 +146,7 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   character, so the `input` event the soft keyboard types through never fires
   and a key's second owner is invisible. `softkbd.html` mounts the real
   `MobileKeyboard.vue` and a window-level capture listener running the real
-  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14648`,
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14854`,
   `:14334`), both recording what the host would get and WHO sent it.
   `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
   OS keyboard does (`insertText`: an `input` event and no keydown), composes
@@ -198,6 +202,12 @@ in the macOS job (FR-90 P1h-1), which before it never compiled the supervisor fo
 `windows-agent-sessions` job (#2886) — every `#[cfg(windows)]` test, with the features the
 table below names; before it, the Windows jobs ran filtered subsets and a Windows-only failure
 in an unfiltered module was invisible until someone ran the suite on a Windows box.
+
+**The wizard's spawn gate** (`agents/roomler-setup/src/spawn_gate.rs`, FR-129 C) parses the source
+of everything the wizard runs on Windows with a Windows build's `cfg` applied, and fails on a
+program named by a bare literal or by an expression it has not been told about. It runs in
+`cargo test -p roomler-setup --lib` on every OS, because it reads source, so a Linux runner guards
+the Windows path. A new spawn on that path is a decision someone writes down in its table.
 
 > [!WARNING]
 > **A log assertion in a binary of parallel tests needs two dispatchers** (FR-90 P2i-1). With
@@ -624,7 +634,7 @@ VP9 DataChannel is 4:4:4 by default), less what the build cannot open (`BuildCap
 | `rtp:h264` | `encode::open_for_codec`: Media Foundation's cascade on Windows, then OpenH264 | `mf-encoder` (Windows) |
 | `rtp:h265` | FFmpeg's HEVC cascade, then MF's | FFmpeg or MF |
 | `rtp:av1` | MF's AV1 | MF |
-| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5247`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
+| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5379`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
 | `dc:vp9`, `dc:vp9:444` | the session's quick probe at 480×270, then FFmpeg's VP9 if it opened, else libvpx | FFmpeg |
 | `named` | `encode::open_named`, past every cascade and the denylist | FFmpeg |
 
@@ -680,7 +690,7 @@ cascades and `--name` are hardware by construction, so they always ask.
   is the device's record on the server (its hello's hardware encoders), which a fleet run joins
   to these rows. A row says what this build opened on this host when it ran. Read `video_cells`
   beside `hw_encoders` for that join: the legacy label is enumeration-only
-  (`agents/roomlerd/src/encode/caps.rs:2576`), so on Windows it says `mf-h264-hw` even where the
+  (`agents/roomlerd/src/encode/caps.rs:3673`), so on Windows it says `mf-h264-hw` even where the
   cascade lands on Microsoft's software MFT.
 - ⚠️ The bench does not drain an encoder at the end of a row, so a frame an encoder still holds
   is not counted in `out_kbps`.
@@ -709,10 +719,13 @@ cascades and `--name` are hardware by construction, so they always ask.
   is the CPU's clock, not the encoder.
 - ⚠️ **Noise.** These are wall-clock times on a host doing other things. Run a cell twice and read
   the spread before comparing two hosts: the reference run below did, on a busy machine.
-- ⚠️ **One frame rate and one size to a comparison.** At `--bench-fps 60` a frame carries half the
-  motion of one at 30, so it costs less whatever the clock does: set a paced row against a
-  back-to-back row at the same `--bench-fps`. Run one size per process: on a Windows laptop an
-  H.264 row that followed a VP9-444 row at a smaller size read about twice as slow, on any core
+- ⚠️ **One frame rate to a comparison, one row to a process, and on Windows past 10 s.** At
+  `--bench-fps 60` a frame carries half the motion of one at 30, so it costs less whatever the
+  clock does: set a paced row against a back-to-back row at the same `--bench-fps`. On a hybrid
+  Windows laptop a process runs at full speed for its first 3–4 seconds and at half speed after,
+  at any cadence, unless `ROOMLERD_ENCODER_CLOCK=1`. So a row that starts late in its process reads
+  twice as slow for that reason alone, and an arm of 150 frames ends before most of it shows: use
+  `--bench-frames 300` at 30 fps or 600 at 60
   ([FR-112 §9](fr/FR-112-software-encoding-at-60-fps.md#9-field-verification-log)).
 
 **Reference run** (2026-10-30). A release build with the Linux release lane's features

@@ -29,16 +29,36 @@ use roomler_ai_remote_control::models::AgentCaps;
 // encoder features, so the import is allowed to be partly idle.
 #[allow(unused_imports)]
 use roomler_ai_remote_control::models::{ChromaFormat, VideoBackend, VideoCell, VideoCodec};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 #[allow(unused_imports)]
 use super::cells::{cell_denied, denied_cells, ffmpeg_444_capable};
 
 static CACHED_CAPS: OnceLock<AgentCaps> = OnceLock::new();
+/// #3280 — a later try's answer, once one is adopted ([`adopt`]). [`CACHED_CAPS`]
+/// keeps the first and keeps serialising the first probe, so every reader asks
+/// here first.
+static LATE_CAPS: RwLock<Option<AgentCaps>> = RwLock::new(None);
+/// #3280 — moves when the answer in force does. Each connection's heartbeat
+/// compares it, so every organization's row gets the new answer within a beat.
+static CAPS_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// #3280 — what the first answer ran out of time on. [`arm_retry`] takes it, so a
+/// second organization's loop finds nothing to arm.
+static FIRST_SHORT: Mutex<Option<child::Shortfall>> = Mutex::new(None);
+/// #3280 — when a session last asked for this host ([`session_asked`]).
+static LAST_ASK: Mutex<Option<Instant>> = Mutex::new(None);
+/// #3280 — the GPU-input forms of the answer in force, for [`weigh`].
+static GPU_IN_FORCE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn late_caps() -> Option<AgentCaps> {
+    LATE_CAPS.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
 
 /// FR-84 D4 — the probe's result if it has run in this process, else `None`.
 ///
-/// Reads the `OnceLock` and nothing else — deliberately NOT `detect()`. The
+/// Reads what is already there and nothing else — deliberately NOT `detect()`. The
 /// LocalAPI serves this on every Overview poll, and the first `detect()` in a
 /// process spawns the probe children (vendor driver code, the reason the
 /// probe is out-of-process at all); a control-surface read must never be what
@@ -46,7 +66,13 @@ static CACHED_CAPS: OnceLock<AgentCaps> = OnceLock::new();
 /// daemon has reached its server this is `None`, and the Overview says
 /// "not probed yet" and asks again later.
 pub fn cached() -> Option<AgentCaps> {
-    CACHED_CAPS.get().cloned()
+    late_caps().or_else(|| CACHED_CAPS.get().cloned())
+}
+
+/// #3280 — a number that changes when the answer [`detect`] gives does. Read it
+/// BEFORE reading the answer: a change in between then reads as news next time.
+pub fn generation() -> u64 {
+    CAPS_GENERATION.load(Ordering::SeqCst)
 }
 
 /// Whether this build carries ANY video encoder. A signalling-only build
@@ -135,7 +161,8 @@ pub fn summarize_cached() -> tunnel_core::localapi::EncoderCapsSummary {
 mod child {
     use super::AgentCaps;
     use crate::encode::cells::{self, LearnedDeny};
-    use roomler_ai_remote_control::models::{ChromaFormat, VideoBackend, VideoCodec};
+    use roomler_ai_remote_control::models::{ChromaFormat, VideoBackend, VideoCell, VideoCodec};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// Marks the line carrying the child's JSON, so log output on the same
     /// stream cannot be mistaken for the result. Parsing the last line, or
@@ -338,9 +365,23 @@ mod child {
         /// driver leaves ([`is_fault`]); `status` is that status, as the log
         /// says it.
         Died { status: String, fault: bool },
-        /// Still running at [`TIMEOUT`], and told to die for it. `gone` = it did
-        /// (#3273): one that did not is stuck in a kernel call in a driver.
+        /// Still running at its bound ([`Bounds::child`]), and told to die for it.
+        /// `gone` = it did (#3273): one that did not is stuck in a kernel call in
+        /// a driver.
         Hung { gone: bool },
+        /// #3280 — told to die because a session asked for this host
+        /// ([`Try::stop`]). `gone` as for `Hung`.
+        Stopped { gone: bool },
+    }
+
+    impl Ending {
+        /// #3273 — it was told to die and had not within [`Bounds::kill_wait`].
+        pub(super) fn stuck(&self) -> bool {
+            matches!(
+                self,
+                Ending::Hung { gone: false } | Ending::Stopped { gone: false }
+            )
+        }
     }
 
     /// #3267 — whether a child's status is what a fault in a driver leaves,
@@ -431,10 +472,151 @@ mod child {
         &[]
     };
 
+    /// #3273, #3280 — a child that would not die is a driver stuck in the kernel,
+    /// and what the daemon opens whatever the caps say could hang the same way, on
+    /// a wait with no bound. So those cells go too, for this process, whichever
+    /// child it was. Not for a child whose kill landed within its bound: a merely
+    /// slow host keeps them.
+    pub(super) fn media_foundation_denies() -> Vec<LearnedDeny> {
+        MF_IN_THE_DAEMON
+            .iter()
+            .map(|name| LearnedDeny {
+                cell: format!("{name}:{}", ChromaFormat::Yuv420.wire()),
+                why: "a probe child would not die".to_string(),
+                confirmed: false,
+                timed_out: true,
+            })
+            .collect()
+    }
+
+    /// The name the denylists know a cell by. Only D3D12's differs from its wire
+    /// form: FFmpeg calls those encoders `*_d3d12va`.
+    pub(super) fn list_name(cell: &VideoCell) -> String {
+        let backend = if cell.backend == VideoBackend::D3d12.wire() {
+            "d3d12va"
+        } else {
+            cell.backend.as_str()
+        };
+        format!("{}_{backend}", cell.codec)
+    }
+
+    /// The label the legacy `hw_encoders` knows a cell by.
+    fn legacy_label(name: &str) -> String {
+        match name {
+            cells::MF_H264 => "mf-h264-hw".to_string(),
+            cells::MF_HEVC => "mf-h265-hw".to_string(),
+            cells::MF_AV1 => "mf-av1-hw".to_string(),
+            cells::LIBVPX_VP9 => "libvpx-vp9-444-sw".to_string(),
+            ffmpeg => format!("ffmpeg-{ffmpeg}"),
+        }
+    }
+
+    /// #3280 — an answer stops offering what `list` denies, and everything that says
+    /// so goes with it: a child stuck after its report, or a later try that found what
+    /// the answer in force still offers. An RTP track binds to its codec before the
+    /// encoder opens, so an offer a session is then refused costs it its video.
+    /// Nothing here for what the answer was made without.
+    ///
+    /// A cell opens one form first and is asked about the other only if that opened,
+    /// so losing the first loses the cell, as the next answer would: 4:2:0 for an
+    /// FFmpeg cell, whose 4:4:4 is the `444` child's question, and 4:4:4 for libvpx,
+    /// whose 4:2:0 open sits behind it.
+    pub(super) fn withdraw(caps: &mut AgentCaps, list: &[LearnedDeny]) {
+        let before = caps.video_cells.clone();
+        for deny in list {
+            let Some((name, chroma)) = deny.cell.split_once(':') else {
+                continue;
+            };
+            let opens_first = if name == cells::LIBVPX_VP9 {
+                ChromaFormat::Yuv444
+            } else {
+                ChromaFormat::Yuv420
+            };
+            for cell in caps.video_cells.iter_mut().filter(|c| list_name(c) == name) {
+                if chroma == opens_first.wire() {
+                    cell.chroma.clear();
+                } else {
+                    cell.chroma.retain(|c| c != chroma);
+                }
+            }
+        }
+        caps.video_cells.retain(|c| !c.chroma.is_empty());
+        let left = caps.video_cells.clone();
+        let has = |name: &str, chroma: Option<&str>| {
+            left.iter().any(|c| {
+                list_name(c) == name && chroma.is_none_or(|want| c.chroma.iter().any(|c| c == want))
+            })
+        };
+        // The label is enumeration's, so it can stand with no cell behind it.
+        for name in list.iter().filter_map(|d| d.cell.split(':').next()) {
+            if !has(name, None) {
+                let label = legacy_label(name);
+                caps.hw_encoders.retain(|h| *h != label);
+            }
+        }
+        if left == before {
+            return;
+        }
+        let ffmpeg = |codec: VideoCodec| {
+            left.iter().any(|c| {
+                c.codec == codec.wire()
+                    && ![
+                        VideoBackend::MediaFoundation.wire(),
+                        VideoBackend::Openh264.wire(),
+                        VideoBackend::Libvpx.wire(),
+                    ]
+                    .contains(&c.backend.as_str())
+            })
+        };
+        let yuv444 = ChromaFormat::Yuv444.wire();
+        caps.transports.retain(|t| match t.as_str() {
+            "data-channel-hevc" => ffmpeg(VideoCodec::Hevc),
+            "data-channel-av1" => ffmpeg(VideoCodec::Av1),
+            "data-channel-h264" => ffmpeg(VideoCodec::H264),
+            "data-channel-vp9-444" => has(cells::LIBVPX_VP9, Some(yuv444)),
+            _ => true,
+        });
+        if !ffmpeg(VideoCodec::Hevc) {
+            caps.hevc_chroma.clear();
+        }
+        if !has("hevc_nvenc", Some(yuv444)) {
+            caps.hevc_chroma.retain(|c| c != yuv444);
+        }
+        if !caps.transports.iter().any(|t| t == "data-channel-vp9-444") {
+            caps.vp9_chroma.clear();
+        }
+        // A codec goes when its last cell does, and not for having had none.
+        caps.codecs.retain(|codec| {
+            let wire = if codec == "h265" {
+                VideoCodec::Hevc.wire()
+            } else {
+                codec.as_str()
+            };
+            !before.iter().any(|c| c.codec == wire) || left.iter().any(|c| c.codec == wire)
+        });
+    }
+
+    /// [`media_foundation_denies`], onto a probe's own list.
+    fn stuck_costs_media_foundation(denied: &mut Vec<LearnedDeny>) {
+        for deny in media_foundation_denies() {
+            if !denied.iter().any(|d| d.cell == deny.cell) {
+                tracing::error!(
+                    cell = %deny.cell,
+                    "caps probe: a child would not die, so this probe's answer leaves this cell \
+                     out, and sessions stay out of it from when none is live or asking, until a \
+                     later try or the next start"
+                );
+                denied.push(deny);
+            }
+        }
+    }
+
     /// What a death in `base` means for the next run.
     enum Step {
         RunAgain,
         GiveUp(&'static str),
+        /// #3280 — as [`Self::GiveUp`], and for want of time.
+        OutOfBudget,
     }
 
     /// #3267 — what the base runs have shown so far, and what earns a cell a
@@ -447,7 +629,7 @@ mod child {
     /// - **A hang earns this process only.** A second hang would cost another
     ///   minute to confirm what load alone can produce (`docs/encoders.md` has
     ///   the one measured), so the run after it skips the cell, the result is
-    ///   not cached, and the next start tests the cell again.
+    ///   not cached, and a later try or the next start tests the cell again.
     /// - **Any other named death, twice, earns this process only** too: a kill
     ///   or an `exit()` may have been the cell's doing, and a session must not
     ///   be the next process to find out, but it proves too little to keep.
@@ -456,6 +638,7 @@ mod child {
     #[derive(Default)]
     struct BaseRetry {
         runs: u32,
+        budget: std::time::Duration,
         denied: Vec<LearnedDeny>,
         /// The cell the last run died in, and whether that was a fault, until
         /// the next run says whether the cell was the cause.
@@ -466,29 +649,6 @@ mod child {
     impl BaseRetry {
         /// The child that ended with `ending` was inside `last_open`, and left
         /// no report. `elapsed` is since the first run started.
-        ///
-        /// #3273 — a child that would not die is a driver stuck in the kernel,
-        /// and what the daemon opens whatever the caps say could hang the same
-        /// way, on a wait with no bound. So those cells go too, for this process.
-        /// Not for a hang whose kill landed: a merely slow host keeps them.
-        fn after_death(
-            &mut self,
-            last_open: Option<&str>,
-            ending: &Ending,
-            elapsed: std::time::Duration,
-        ) -> Step {
-            let step = self.weigh_death(last_open, ending, elapsed);
-            if *ending == (Ending::Hung { gone: false }) {
-                for name in MF_IN_THE_DAEMON {
-                    let cell = format!("{name}:{}", ChromaFormat::Yuv420.wire());
-                    if !self.denied.iter().any(|d| d.cell == cell) {
-                        self.deny(&cell, "a probe child would not die".to_string(), false);
-                    }
-                }
-            }
-            step
-        }
-
         fn weigh_death(
             &mut self,
             last_open: Option<&str>,
@@ -500,9 +660,8 @@ mod child {
                 // Nothing died and nothing was open: it just has no answer, and a
                 // second run would say the same. A test binary, spawned as
                 // `caps-probe`, ends this way in every integration test. So does a
-                // report lost to the bound on the read (`Run::cut_off`, #3273), for
-                // which a second run might well answer: `run_child` has logged it,
-                // and this does not try again.
+                // report lost to the bound on the read (`Run::cut_off`, #3273): that
+                // is out of time, so a later try asks again with more (#3280).
                 None if *ending == Ending::Clean => {
                     return Step::GiveUp("a clean exit with no report");
                 }
@@ -521,7 +680,7 @@ mod child {
                     return Step::GiveUp("a child died in a cell it was told not to open");
                 }
                 Some(cell) if matches!(ending, Ending::Hung { .. }) => {
-                    self.deny(cell, "hung".to_string(), false)
+                    self.deny(cell, "hung".to_string(), false, true)
                 }
                 Some(cell) => {
                     let (status, fault) = match ending {
@@ -531,7 +690,7 @@ mod child {
                     };
                     match suspect {
                         Some((again, was_fault)) if again == cell => {
-                            self.deny(cell, status.to_string(), fault && was_fault)
+                            self.deny(cell, status.to_string(), fault && was_fault, false)
                         }
                         _ => {
                             tracing::warn!(
@@ -548,13 +707,13 @@ mod child {
             if self.runs >= MAX_BASE_RUNS {
                 return Step::GiveUp("the run limit");
             }
-            if elapsed >= BASE_RETRY_BUDGET {
-                return Step::GiveUp("the time limit");
+            if elapsed >= self.budget {
+                return Step::OutOfBudget;
             }
             Step::RunAgain
         }
 
-        fn deny(&mut self, cell: &str, why: String, confirmed: bool) {
+        fn deny(&mut self, cell: &str, why: String, confirmed: bool, timed_out: bool) {
             if confirmed {
                 tracing::error!(
                     cell,
@@ -567,23 +726,39 @@ mod child {
                 tracing::error!(
                     cell,
                     why = %why,
+                    timed_out,
                     "caps probe: this cell is denied for this process only: a hang or a kill \
-                     proves too little to keep, so the next start tests it again"
+                     proves too little to keep, so the next start tests it again, and if it \
+                     was a hang so does a later try"
                 );
             }
             self.denied.push(LearnedDeny {
                 cell: cell.to_string(),
                 why,
                 confirmed,
+                timed_out,
             });
         }
     }
 
+    /// #3280 — what the `base` phase came to.
+    pub(super) struct BaseOutcome {
+        /// `None` = no usable answer, for any reason (spawn failed, out of runs
+        /// or time): no hardware, the caller's fallback.
+        pub(super) report: Option<ProbeReport>,
+        /// `seed`, and what the runs added to it.
+        pub(super) denied: Vec<LearnedDeny>,
+        /// It left no report, and any of its runs hung or was cut off, or it spent
+        /// its budget. A try is worth making. Never true beside a report.
+        pub(super) out_of_time: bool,
+        /// A session asked, so it stopped where it was.
+        pub(super) stopped: bool,
+    }
+
     /// #3267 — the `base` phase: as many runs as it takes to get a report, each
     /// with every cell learned so far denied, within [`MAX_BASE_RUNS`] and
-    /// [`BASE_RETRY_BUDGET`]. Returns the report, if any run left one, and the
-    /// cells learned. `None` = no usable answer, for any reason (spawn failed,
-    /// out of runs or time): no hardware, the caller's fallback.
+    /// `budget`. It starts with `seed` denied: nothing on a first probe, and on a
+    /// later try what is not there for want of time (#3280).
     ///
     /// A report the child printed is the answer however the child ended
     /// afterwards: every open behind it had already come back, so a fault in
@@ -593,15 +768,39 @@ mod child {
     /// behaviour before #3267: one run, and a death means no hardware.
     pub(super) fn run_base(
         learning: bool,
+        seed: Vec<LearnedDeny>,
+        budget: std::time::Duration,
         mut run: impl FnMut(&[LearnedDeny]) -> Option<Run>,
         elapsed: impl Fn() -> std::time::Duration,
-    ) -> (Option<ProbeReport>, Vec<LearnedDeny>) {
-        let mut retry = BaseRetry::default();
+    ) -> BaseOutcome {
+        let mut retry = BaseRetry {
+            budget,
+            denied: seed,
+            ..Default::default()
+        };
+        let mut ran_short = false;
         loop {
             retry.runs += 1;
             let Some(child) = run(&retry.denied) else {
-                return (None, retry.denied);
+                return BaseOutcome {
+                    report: None,
+                    denied: retry.denied,
+                    out_of_time: ran_short,
+                    stopped: false,
+                };
             };
+            ran_short |= ran_out_of_time(&child);
+            if matches!(child.ending, Ending::Stopped { .. }) {
+                if learning && child.ending.stuck() {
+                    stuck_costs_media_foundation(&mut retry.denied);
+                }
+                return BaseOutcome {
+                    report: None,
+                    denied: retry.denied,
+                    out_of_time: false,
+                    stopped: true,
+                };
+            }
             if (learning || child.ending == Ending::Clean)
                 && let Some(report) = parse_line(&child.stdout, child.elapsed)
             {
@@ -619,25 +818,52 @@ mod child {
                         "caps probe: the base phase reported after a death"
                     );
                 }
-                return (Some(report), retry.denied);
+                // A report stands, and a child that printed one and then stuck is
+                // still a driver stuck in the kernel.
+                if learning && child.ending.stuck() {
+                    stuck_costs_media_foundation(&mut retry.denied);
+                }
+                return BaseOutcome {
+                    report: Some(report),
+                    denied: retry.denied,
+                    out_of_time: false,
+                    stopped: false,
+                };
             }
             if !learning {
-                return (None, retry.denied);
+                return BaseOutcome {
+                    report: None,
+                    denied: retry.denied,
+                    out_of_time: ran_short,
+                    stopped: false,
+                };
             }
             let last_open = last_progress(&child.stdout);
-            match retry.after_death(last_open.as_deref(), &child.ending, elapsed()) {
-                Step::RunAgain => {}
-                Step::GiveUp(why) => {
-                    tracing::error!(
-                        why,
-                        runs = retry.runs,
-                        elapsed_ms = elapsed().as_millis(),
-                        denied = ?retry.denied.iter().map(|d| d.cell.as_str()).collect::<Vec<_>>(),
-                        "caps probe: the base phase left no report — no hardware advertised"
-                    );
-                    return (None, retry.denied);
-                }
+            let step = retry.weigh_death(last_open.as_deref(), &child.ending, elapsed());
+            if child.ending.stuck() {
+                stuck_costs_media_foundation(&mut retry.denied);
             }
+            let why = match step {
+                Step::RunAgain => continue,
+                Step::GiveUp(why) => why,
+                Step::OutOfBudget => {
+                    ran_short = true;
+                    "the time limit"
+                }
+            };
+            tracing::error!(
+                why,
+                runs = retry.runs,
+                elapsed_ms = elapsed().as_millis(),
+                denied = ?retry.denied.iter().map(|d| d.cell.as_str()).collect::<Vec<_>>(),
+                "caps probe: the base phase left no report — no hardware advertised"
+            );
+            return BaseOutcome {
+                report: None,
+                denied: retry.denied,
+                out_of_time: ran_short,
+                stopped: false,
+            };
         }
     }
 
@@ -647,94 +873,297 @@ mod child {
     /// same, because this is a host whose probes have been dying and the daemon
     /// has no business finding out why. At most one child's bound, on a path
     /// where no 4:4:4 or GPU child follows, since neither has a candidate left.
-    fn run_software() -> Option<ProbeReport> {
+    /// A first probe's only: a later try has an answer in force to fall back on.
+    fn run_software(
+        run: &mut impl FnMut(&[LearnedDeny], &[(&str, String)]) -> Option<Run>,
+        learned: &mut Vec<LearnedDeny>,
+    ) -> Option<ProbeReport> {
         tracing::warn!(
             "caps probe: no answer from the base phase — asking a child for the cells that need \
              no driver"
         );
-        let child = run_child(&[(PHASE_ENV, "software".to_string())])?;
+        let child = run(learned, &[(PHASE_ENV, "software".to_string())])?;
+        if child.ending.stuck() {
+            stuck_costs_media_foundation(learned);
+        }
         parse_line(&child.stdout, child.elapsed)
     }
 
-    /// Probe in up to three phases, each in its own child. `None` = no usable
+    /// #3280 — how long a probe gives its children.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Bounds {
+        /// One child's run, before it is told to die.
+        pub(super) child: std::time::Duration,
+        /// After that: for it to die, and for its stdout to end.
+        pub(super) kill_wait: std::time::Duration,
+        /// No new `base` run starts this long after the first started.
+        pub(super) base_budget: std::time::Duration,
+    }
+
+    impl Bounds {
+        /// The first probe's, which the device waits on.
+        pub(super) const FIRST: Bounds = Bounds {
+            child: TIMEOUT,
+            kill_wait: KILL_WAIT,
+            base_budget: BASE_RETRY_BUDGET,
+        };
+    }
+
+    /// #3280 — one whole probe, and what it starts from.
+    pub(super) struct Try<'a> {
+        pub(super) bounds: Bounds,
+        /// What its children start with denied. The daemon's own list is not read
+        /// or relaxed for this: a session keeps honouring that one.
+        pub(super) denied: Vec<LearnedDeny>,
+        /// Read on every 50 ms poll of a child. True = a session asked, so the
+        /// child is told to die and the probe ends where it is.
+        pub(super) stop: &'a dyn Fn() -> bool,
+        /// The answer the device starts on, with nothing live: it takes the software
+        /// child when `base` leaves nothing ([`run_software`]), and a stuck child costs
+        /// Media Foundation at once ([`stuck_reaches_the_daemon`]).
+        pub(super) first: bool,
+    }
+
+    /// #3280 — what ran out of time, so that more of it might answer.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub(super) struct Shortfall {
+        /// `base` left no report ([`BaseOutcome::out_of_time`]): no hardware.
+        pub(super) base: bool,
+        /// Named cells: denied on a hang or because a child would not die, and the
+        /// form a `444` or `gpu` child was inside when it ran out. The same one
+        /// again with more time is a real hang.
+        pub(super) cells: Vec<String>,
+        /// A `444` or `gpu` child ran out of time.
+        pub(super) forms: bool,
+    }
+
+    impl Shortfall {
+        fn of(base: bool, learned: &[LearnedDeny], phases: PhaseGaps) -> Option<Self> {
+            let mut cells: Vec<String> = learned
+                .iter()
+                .filter(|d| d.timed_out)
+                .map(|d| d.cell.clone())
+                .collect();
+            for cell in phases.cells {
+                if !cells.contains(&cell) {
+                    cells.push(cell);
+                }
+            }
+            (base || phases.forms || !cells.is_empty()).then_some(Shortfall {
+                base,
+                cells,
+                forms: phases.forms,
+            })
+        }
+    }
+
+    /// What the `444` and `gpu` children left missing.
+    #[derive(Default)]
+    struct PhaseGaps {
+        forms: bool,
+        cells: Vec<String>,
+        /// [`Probed::unanswered`].
+        unanswered: bool,
+    }
+
+    impl PhaseGaps {
+        /// This child left no answer. Only a fault's death says anything about the
+        /// host, so anything else keeps the rest of the answer out of the cache:
+        /// an OOM kill, an EDR's terminate, a child that could not start. Only
+        /// running out of time is worth a try.
+        fn note(&mut self, run: Option<&Run>) {
+            let out_of_time = run.is_some_and(ran_out_of_time);
+            let fault = run.is_some_and(|r| matches!(r.ending, Ending::Died { fault: true, .. }));
+            self.unanswered |= out_of_time || !fault;
+            if let Some(run) = run.filter(|_| out_of_time) {
+                self.forms = true;
+                if let Some(cell) = last_progress(&run.stdout)
+                    && !self.cells.contains(&cell)
+                {
+                    self.cells.push(cell);
+                }
+            }
+        }
+    }
+
+    /// #3280 — what one probe came to.
+    pub(super) struct Probed {
+        pub(super) report: Option<ProbeReport>,
+        /// [`Try::denied`], and what this probe added to it.
+        pub(super) learned: Vec<LearnedDeny>,
+        /// What it ran out of time on. `None` is an answer, even "no hardware".
+        pub(super) short: Option<Shortfall>,
+        /// A `444` or `gpu` child left no answer, and not by a fault, so those
+        /// forms are missing for no reason about the host, and the answer must not
+        /// outlive this process.
+        pub(super) unanswered: bool,
+        /// A session asked: the probe ended where it was, and none of this counts.
+        pub(super) stopped: bool,
+    }
+
+    impl Probed {
+        fn stopped(learned: Vec<LearnedDeny>) -> Self {
+            Probed {
+                report: None,
+                learned,
+                short: None,
+                unanswered: false,
+                stopped: true,
+            }
+        }
+    }
+
+    /// The answer a phase's child printed, however it ended afterwards, as with
+    /// `base`'s report: every open behind it had already come back. Learning off
+    /// is the behaviour before #3267.
+    fn printed_answer<T>(
+        run: Option<&Run>,
+        learning: bool,
+        parse: impl Fn(&str) -> Option<T>,
+    ) -> Option<T> {
+        run.filter(|r| learning || r.ending == Ending::Clean)
+            .and_then(|r| parse(&r.stdout))
+    }
+
+    /// Probe in up to three phases, each in its own child. No report = no usable
     /// answer from the BASE phase ([`run_base`]) or, after it, the software one
     /// ([`run_software`]) — the caller treats every reason the same way. A
     /// failure of the 4:4:4 phase costs only the 4:4:4 cells: the base matrix
     /// is advertised, with the last open the child reported named in the log
     /// so the operator can denylist it.
     ///
-    /// #3273 — the `bool` beside the report: a `444` or `gpu` child ran out of
-    /// time ([`ran_out_of_time`]), so those forms are missing for want of an
-    /// answer, and the answer must not outlive this process.
-    ///
     /// Why two processes (FR-77 P3c, field 2026-09-08): CORPLAP-3's Intel
     /// media runtime died with 0xc0000005 on the first `vp9_qsv` 4:4:4 open
     /// over VUYX, and one child meant the daemon advertised NO hardware at
     /// all — `av1_qsv`, `h264_qsv`, `vp9_qsv` 4:2:0 all gone for a cell the
     /// session pump would never have needed.
-    pub(super) fn probe() -> Option<(ProbeReport, bool)> {
+    pub(super) fn probe(this: &Try) -> Probed {
         if std::env::var_os(CHILD_ENV).is_some() {
             // We ARE the child (or something re-entered). Probing in-process
             // is what this process was started to do.
-            return Some((
-                super::in_process_report(phase_from_env() != Phase::Base),
-                false,
-            ));
+            return Probed {
+                report: Some(super::in_process_report(phase_from_env() != Phase::Base)),
+                learned: Vec::new(),
+                short: None,
+                unanswered: false,
+                stopped: false,
+            };
         }
-        let started = std::time::Instant::now();
-        let mut unfinished = false;
+        probe_with(this, cells::learning_enabled(), |list, extra| {
+            run_child(this, list, extra)
+        })
+    }
 
-        let learning = cells::learning_enabled();
-        let (base, learned) = run_base(
+    /// [`probe`], with the children to run as an argument. `run` starts one with
+    /// that list denied and those variables set.
+    pub(super) fn probe_with(
+        this: &Try,
+        learning: bool,
+        mut run: impl FnMut(&[LearnedDeny], &[(&str, String)]) -> Option<Run>,
+    ) -> Probed {
+        let started = std::time::Instant::now();
+        let mut gaps = PhaseGaps::default();
+        // A later try has an answer in force, so once one of its own children is
+        // stuck it starts no more: they could only pile onto the same driver. A
+        // first probe has nothing to fall back on, so it goes on.
+        let first = this.first;
+        // Whatever becomes of this probe, a session opens encoders in the daemon, and
+        // the fault that ended the child would end the daemon. A later try has an
+        // answer in force, which stops offering the cell from here: a session asking
+        // now must not pick what it will be refused.
+        let confirmed = |denied: &[LearnedDeny]| {
+            cells::join_learned(denied.iter().filter(|d| d.confirmed).cloned());
+            if !first {
+                super::withdraw_refused(true);
+            }
+        };
+        let mut stuck = false;
+        let mut run = move |list: &[LearnedDeny], extra: &[(&str, String)]| {
+            if stuck && !first {
+                return None;
+            }
+            let child = run(list, extra);
+            stuck |= child.as_ref().is_some_and(|r| r.ending.stuck());
+            child
+        };
+
+        let base = run_base(
             learning,
+            this.denied.clone(),
+            this.bounds.base_budget,
             |denied| {
-                // `run_child` hands the installed list to the child.
-                cells::install_learned(denied.to_vec());
-                run_child(&[(PHASE_ENV, "base".to_string())])
+                confirmed(denied);
+                run(denied, &[(PHASE_ENV, "base".to_string())])
             },
             || started.elapsed(),
         );
-        // Whatever the runs left, a session opens encoders in the daemon, and
-        // the fault that ended the child would end the daemon.
-        cells::install_learned(learned);
-        let mut report = match base {
-            Some(report) => report,
-            None if learning => run_software()?,
-            None => return None,
+        let BaseOutcome {
+            report,
+            denied: mut learned,
+            out_of_time,
+            stopped,
+        } = base;
+        confirmed(&learned);
+        let report = match report {
+            Some(report) => Some(report),
+            None if stopped => return Probed::stopped(learned),
+            None if this.first && learning => run_software(&mut run, &mut learned),
+            None => None,
+        };
+        let Some(mut report) = report else {
+            return Probed {
+                report: None,
+                short: Shortfall::of(out_of_time, &learned, gaps),
+                learned,
+                unanswered: false,
+                stopped: false,
+            };
         };
 
-        let names = candidates_444(&report.caps);
+        let deny = cells::denied_with(&learned);
+        let names = candidates_444(&report.caps, &deny);
         if names.is_empty() {
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis(),
                 "caps probe: no 4:4:4 candidate on this host — single phase"
             );
         } else {
-            match run_child(&[
-                (PHASE_ENV, "444".to_string()),
-                (NAMES_444_ENV, names.join(",")),
-            ]) {
-                Some(run) if run.ending == Ending::Clean => match parse_444_line(&run.stdout) {
-                    Some(ok) => {
-                        tracing::info!(
-                            elapsed_ms = run.elapsed.as_millis(),
-                            tried = ?names,
-                            opened = ?ok,
-                            "caps probe: 4:4:4 phase reported"
-                        );
-                        merge_444(&mut report, &ok);
-                    }
-                    None => {
-                        unfinished |= ran_out_of_time(&run);
-                        tracing::warn!(
-                            tried = ?names,
-                            "caps probe: 4:4:4 phase printed no answer — advertising the 4:2:0 matrix"
-                        )
-                    }
-                },
-                other => {
-                    unfinished |= other.as_ref().is_some_and(ran_out_of_time);
-                    let last = other
+            let child = run(
+                &learned,
+                &[
+                    (PHASE_ENV, "444".to_string()),
+                    (NAMES_444_ENV, names.join(",")),
+                ],
+            );
+            if learning && child.as_ref().is_some_and(|r| r.ending.stuck()) {
+                stuck_costs_media_foundation(&mut learned);
+            }
+            if child
+                .as_ref()
+                .is_some_and(|r| matches!(r.ending, Ending::Stopped { .. }))
+            {
+                return Probed::stopped(learned);
+            }
+            match printed_answer(child.as_ref(), learning, parse_444_line) {
+                Some(ok) => {
+                    tracing::info!(
+                        elapsed_ms = child.as_ref().map_or(0, |r| r.elapsed.as_millis()),
+                        tried = ?names,
+                        opened = ?ok,
+                        "caps probe: 4:4:4 phase reported"
+                    );
+                    merge_444(&mut report, &ok);
+                }
+                None if child.as_ref().is_some_and(|r| r.ending == Ending::Clean) => {
+                    gaps.note(child.as_ref());
+                    tracing::warn!(
+                        tried = ?names,
+                        "caps probe: 4:4:4 phase printed no answer — advertising the 4:2:0 matrix"
+                    )
+                }
+                None => {
+                    gaps.note(child.as_ref());
+                    let last = child
                         .as_ref()
                         .and_then(|r| last_progress(&r.stdout))
                         .unwrap_or_else(|| "(none reported)".to_string());
@@ -753,33 +1182,44 @@ mod child {
         // that kills its process costs only the GPU forms (the 4:4:4
         // lesson), and the daemon never opens one the probe has not proven.
         // With the switch off there are no candidates, so no child (AC6).
-        let gpu_names = candidates_gpu(&report.caps);
+        let gpu_names = candidates_gpu(&report.caps, &cells::denied_with(&learned));
         if !gpu_names.is_empty() {
-            match run_child(&[
-                (PHASE_ENV, "gpu".to_string()),
-                (NAMES_GPU_ENV, gpu_names.join(",")),
-            ]) {
-                Some(run) if run.ending == Ending::Clean => match parse_gpu_line(&run.stdout) {
-                    Some(ok) => {
-                        tracing::info!(
-                            elapsed_ms = run.elapsed.as_millis(),
-                            tried = ?gpu_names,
-                            proven = ?ok,
-                            "caps probe: GPU-input phase reported"
-                        );
-                        report.gpu_input = ok;
-                    }
-                    None => {
-                        unfinished |= ran_out_of_time(&run);
-                        tracing::warn!(
-                            tried = ?gpu_names,
-                            "caps probe: GPU-input phase printed no answer — sessions take CPU frames"
-                        )
-                    }
-                },
-                other => {
-                    unfinished |= other.as_ref().is_some_and(ran_out_of_time);
-                    let last = other
+            let child = run(
+                &learned,
+                &[
+                    (PHASE_ENV, "gpu".to_string()),
+                    (NAMES_GPU_ENV, gpu_names.join(",")),
+                ],
+            );
+            if learning && child.as_ref().is_some_and(|r| r.ending.stuck()) {
+                stuck_costs_media_foundation(&mut learned);
+            }
+            if child
+                .as_ref()
+                .is_some_and(|r| matches!(r.ending, Ending::Stopped { .. }))
+            {
+                return Probed::stopped(learned);
+            }
+            match printed_answer(child.as_ref(), learning, parse_gpu_line) {
+                Some(ok) => {
+                    tracing::info!(
+                        elapsed_ms = child.as_ref().map_or(0, |r| r.elapsed.as_millis()),
+                        tried = ?gpu_names,
+                        proven = ?ok,
+                        "caps probe: GPU-input phase reported"
+                    );
+                    report.gpu_input = ok;
+                }
+                None if child.as_ref().is_some_and(|r| r.ending == Ending::Clean) => {
+                    gaps.note(child.as_ref());
+                    tracing::warn!(
+                        tried = ?gpu_names,
+                        "caps probe: GPU-input phase printed no answer — sessions take CPU frames"
+                    )
+                }
+                None => {
+                    gaps.note(child.as_ref());
+                    let last = child
                         .as_ref()
                         .and_then(|r| last_progress(&r.stdout))
                         .unwrap_or_else(|| "(none reported)".to_string());
@@ -794,6 +1234,9 @@ mod child {
             }
         }
 
+        // A child stuck after the report left it offering what a session is refused.
+        withdraw(&mut report.caps, &learned);
+
         // The whole cost the daemon paid: every spawn, every open, every parse.
         report.caps.probe_ms =
             Some(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX));
@@ -803,10 +1246,17 @@ mod child {
             hw_encoders = ?report.caps.hw_encoders,
             cells = report.caps.video_cells.len(),
             vp9_qsv_idr = ?report.vp9_qsv_idr,
-            learned_deny = ?cells::learned().iter().map(|l| l.cell.clone()).collect::<Vec<_>>(),
+            learned_deny = ?learned.iter().map(|l| l.cell.clone()).collect::<Vec<_>>(),
             "caps probe: child reported"
         );
-        Some((report, unfinished))
+        let unanswered = gaps.unanswered;
+        Probed {
+            report: Some(report),
+            short: Shortfall::of(out_of_time, &learned, gaps),
+            learned,
+            unanswered,
+            stopped: false,
+        }
     }
 
     /// #3273 — whether a child ended for want of time, rather than with an
@@ -817,9 +1267,18 @@ mod child {
     }
 
     /// Spawn one `caps-probe` child with `extra` on top of the recursion
-    /// guard and the S2 config fallbacks, and wait for it ([`wait_for_child`]),
-    /// bounded by [`TIMEOUT`] plus [`KILL_WAIT`]. `None` = could not spawn.
-    fn run_child(extra: &[(&str, String)]) -> Option<Run> {
+    /// guard, the S2 config fallbacks and `list`, and wait for it
+    /// ([`wait_for_child`]), within this probe's [`Bounds`]. `None` = could not
+    /// spawn.
+    fn run_child(this: &Try, list: &[LearnedDeny], extra: &[(&str, String)]) -> Option<Run> {
+        if (this.stop)() {
+            return Some(Run {
+                ending: Ending::Stopped { gone: true },
+                stdout: String::new(),
+                cut_off: false,
+                elapsed: std::time::Duration::ZERO,
+            });
+        }
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
@@ -836,7 +1295,7 @@ mod child {
             // default (FR-19 P4c: `relay-server` was never advertised).
             .envs(tunnel_core::env::config_fallbacks_for_child())
             // #3267 — process-local too, and the deny the next run depends on.
-            .envs(cells::learned_for_child())
+            .envs(cells::list_for_child(list))
             .envs(extra.iter().map(|(k, v)| (*k, v.as_str())))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -864,9 +1323,11 @@ mod child {
         #[cfg(windows)]
         let _ends_with_us = tie_to_this_process(&childp);
 
-        let (waited, output) = wait_for_child(childp, TIMEOUT, KILL_WAIT, |c| {
-            let _ = c.kill();
-        });
+        let bounds = this.bounds;
+        let (waited, output) =
+            wait_for_child(childp, bounds.child, bounds.kill_wait, this.stop, |c| {
+                let _ = c.kill();
+            });
         let Output {
             text: stdout,
             cut_off,
@@ -876,7 +1337,7 @@ mod child {
         let last_open = last_progress(&stdout).unwrap_or_default();
         if cut_off {
             tracing::warn!(
-                kill_wait_s = KILL_WAIT.as_secs(),
+                kill_wait_s = bounds.kill_wait.as_secs(),
                 ?phase,
                 %last_open,
                 "caps probe: the child's stdout had not ended at the bound, so anything it wrote \
@@ -890,7 +1351,7 @@ mod child {
                 // A hung driver. Carry on without this phase.
                 if gone {
                     tracing::warn!(
-                        timeout_s = TIMEOUT.as_secs(),
+                        timeout_s = bounds.child.as_secs(),
                         ?phase,
                         %last_open,
                         "caps probe: the probe child hung — the daemon is unaffected; this is \
@@ -898,17 +1359,33 @@ mod child {
                     );
                 } else {
                     tracing::error!(
-                        timeout_s = TIMEOUT.as_secs(),
-                        kill_wait_s = KILL_WAIT.as_secs(),
+                        timeout_s = bounds.child.as_secs(),
+                        kill_wait_s = bounds.kill_wait.as_secs(),
                         ?phase,
                         %last_open,
                         "caps probe: the probe child hung and did not die when killed. It is \
                          most likely stuck in a kernel call in a driver, and stays until that \
                          call returns. Going on without it; the daemon is unaffected."
                     );
+                    stuck_reaches_the_daemon(this);
                 }
                 return Some(Run {
                     ending: Ending::Hung { gone },
+                    stdout,
+                    cut_off,
+                    elapsed: started.elapsed(),
+                });
+            }
+            Waited::Stopped { gone } => {
+                tracing::info!(
+                    gone,
+                    ?phase,
+                    %last_open,
+                    "caps probe: a session asked for this host, so this try's child was told to \
+                     stop"
+                );
+                return Some(Run {
+                    ending: Ending::Stopped { gone },
                     stdout,
                     cut_off,
                     elapsed: started.elapsed(),
@@ -945,6 +1422,16 @@ mod child {
         })
     }
 
+    /// #3280 — the daemon's own list takes [`media_foundation_denies`] the moment a
+    /// first probe's child is known to be stuck: nothing is live yet, and a session
+    /// may be about to open them. A later try's waits for nothing to be live
+    /// ([`super::hold_media_foundation_back`]).
+    pub(super) fn stuck_reaches_the_daemon(this: &Try) {
+        if this.first && cells::learning_enabled() {
+            cells::join_learned(media_foundation_denies());
+        }
+    }
+
     /// The last `PROGRESS` line in a child's output: the open it was inside
     /// when it stopped answering. `None` when it printed none, or the last one
     /// said that open had ended ([`NO_OPEN`]).
@@ -960,9 +1447,8 @@ mod child {
     /// phase should try: every hardware cell of the base matrix whose name
     /// the source matrix lists for 4:4:4, minus the denylist. Cells the base
     /// phase could not open are never asked (no `vp9_qsv` 4:4:4 on a host
-    /// without `vp9_qsv`).
-    pub(super) fn candidates_444(caps: &AgentCaps) -> Vec<String> {
-        let deny = crate::encode::cells::denied_cells();
+    /// without `vp9_qsv`). `deny` is this probe's ([`cells::denied_with`]).
+    pub(super) fn candidates_444(caps: &AgentCaps, deny: &[String]) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         for cell in caps.typed_cells() {
             let backend = match cell.backend {
@@ -977,7 +1463,7 @@ mod child {
             }
             let name = format!("{}_{}", cell.codec.wire(), backend);
             if crate::encode::cells::ffmpeg_444_capable(&name)
-                && !crate::encode::cells::cell_denied(&deny, &name, ChromaFormat::Yuv444)
+                && !crate::encode::cells::cell_denied(deny, &name, ChromaFormat::Yuv444)
                 && !names.contains(&name)
             {
                 names.push(name);
@@ -1063,8 +1549,9 @@ mod child {
     /// (4:2:0), minus the cell denylist and `zero_copy_deny`; none at all with
     /// the switch off or on a build without GPU frames. A gate the probe
     /// honours is a gate only if the session honours it too: `gpu_input::plan`
-    /// reads the same two lists at every open.
-    pub(super) fn candidates_gpu(caps: &AgentCaps) -> Vec<String> {
+    /// reads the same two lists at every open. `deny` is this probe's
+    /// ([`cells::denied_with`]).
+    pub(super) fn candidates_gpu(caps: &AgentCaps, deny: &[String]) -> Vec<String> {
         #[cfg(all(
             target_os = "windows",
             feature = "ffmpeg-encoder",
@@ -1074,7 +1561,6 @@ mod child {
             if !crate::capture::gpu_frame::zero_copy_enabled() {
                 return Vec::new();
             }
-            let cells_deny = crate::encode::cells::denied_cells();
             let gpu_deny = crate::encode::ffmpeg::gpu_hint::denied();
             let mut names: Vec<String> = Vec::new();
             for cell in caps.typed_cells() {
@@ -1083,7 +1569,7 @@ mod child {
                 }
                 let name = format!("{}_{}", cell.codec.wire(), cell.backend.wire());
                 if crate::encode::ffmpeg::gpu_input::gpu_cell(&name, false)
-                    && !crate::encode::cells::cell_denied(&cells_deny, &name, ChromaFormat::Yuv420)
+                    && !crate::encode::cells::cell_denied(deny, &name, ChromaFormat::Yuv420)
                     && !crate::encode::ffmpeg::gpu_hint::is_denied(&gpu_deny, &name)
                     && !names.contains(&name)
                 {
@@ -1103,7 +1589,6 @@ mod child {
             if !crate::capture::zero_copy_enabled() {
                 return Vec::new();
             }
-            let cells_deny = crate::encode::cells::denied_cells();
             let gpu_deny = crate::encode::ffmpeg::gpu_hint::denied();
             let mut names: Vec<String> = Vec::new();
             for cell in caps.typed_cells() {
@@ -1112,7 +1597,7 @@ mod child {
                 }
                 let name = format!("{}_{}", cell.codec.wire(), cell.backend.wire());
                 if crate::encode::ffmpeg::vt_input::gpu_cell(&name, false)
-                    && !crate::encode::cells::cell_denied(&cells_deny, &name, ChromaFormat::Yuv420)
+                    && !crate::encode::cells::cell_denied(deny, &name, ChromaFormat::Yuv420)
                     && !crate::encode::ffmpeg::gpu_hint::is_denied(&gpu_deny, &name)
                     && !names.contains(&name)
                 {
@@ -1134,7 +1619,7 @@ mod child {
             )
         )))]
         {
-            let _ = caps;
+            let _ = (caps, deny);
             Vec::new()
         }
     }
@@ -1146,6 +1631,17 @@ mod child {
         Exited(std::process::ExitStatus),
         /// Still running at the limit, and told to die. `gone` = it did.
         Hung { gone: bool },
+        /// #3280 — `stop` said so, and it was told to die. `gone` = it did.
+        Stopped { gone: bool },
+    }
+
+    /// #3280 — children told to die that had not within their bound, until the call
+    /// they are stuck in returns. No later try starts while this is above 0: a
+    /// second child could only pile onto the same stuck driver.
+    static STUCK: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) fn stuck_children() -> u32 {
+        STUCK.load(Ordering::SeqCst)
     }
 
     /// #3273 — what [`collect_output`] got of a child's stdout.
@@ -1168,38 +1664,51 @@ mod child {
     /// pump off), so either wait, unbounded, keeps the device offline until
     /// someone acts on the host.
     ///
+    /// `stop` ends the wait early, on a later try when a session asks (#3280).
     /// `kill` is a parameter because no real process can ignore a kill, so a test
     /// has to decline to send it.
     pub(super) fn wait_for_child(
         mut child: std::process::Child,
         timeout: std::time::Duration,
         kill_wait: std::time::Duration,
+        stop: &dyn Fn() -> bool,
         kill: impl FnOnce(&mut std::process::Child),
     ) -> (Waited, Output) {
         // Read stdout on its own thread while waiting, so a chatty child cannot
         // fill the pipe and deadlock against our own wait.
         let output = read_output(child.stdout.take());
-        if let Some(status) = wait_bounded(&mut child, timeout) {
+        let ended = wait_bounded(&mut child, timeout, stop);
+        if let WaitEnd::Exited(status) = ended {
             let deadline = std::time::Instant::now() + kill_wait;
             return (Waited::Exited(status), collect_output(output, deadline));
         }
         kill(&mut child);
         let deadline = std::time::Instant::now() + kill_wait;
-        let gone = wait_bounded(&mut child, kill_wait).is_some();
+        let gone = matches!(
+            wait_bounded(&mut child, kill_wait, &|| false),
+            WaitEnd::Exited(_)
+        );
         if !gone {
             // Reap it if that call ever returns, or it stays a zombie for as
             // long as the daemon runs. On a host out of threads it goes unreaped,
-            // which is no reason to take the probe down.
+            // which is no reason to take the probe down. It also stays counted
+            // then: nothing will ever say that call returned.
+            STUCK.fetch_add(1, Ordering::SeqCst);
             let reaper = std::thread::Builder::new()
                 .name("roomlerd-caps-reap".into())
                 .spawn(move || {
                     let _ = child.wait();
+                    STUCK.fetch_sub(1, Ordering::SeqCst);
                 });
             if let Err(e) = reaper {
                 tracing::warn!(%e, "caps probe: no thread to reap the stuck child");
             }
         }
-        (Waited::Hung { gone }, collect_output(output, deadline))
+        let waited = match ended {
+            WaitEnd::Stopped => Waited::Stopped { gone },
+            _ => Waited::Hung { gone },
+        };
+        (waited, collect_output(output, deadline))
     }
 
     /// #3273 — a piece of a child's stdout, and when it arrived.
@@ -1284,26 +1793,39 @@ mod child {
         }
     }
 
-    /// `wait` with a limit. `None` = still running when time ran out.
+    /// How [`wait_bounded`] ended.
+    enum WaitEnd {
+        Exited(std::process::ExitStatus),
+        /// Still running when time ran out.
+        TimedOut,
+        /// Still running when `stop` said so.
+        Stopped,
+    }
+
+    /// `wait` with a limit.
     ///
     /// Polling rather than a platform wait-with-timeout: it is a handful of
-    /// wakeups on a path that runs ONCE per process, and it keeps this
-    /// module free of per-platform process APIs.
+    /// wakeups on a path that runs at most a few times per process, and it keeps
+    /// this module free of per-platform process APIs.
     fn wait_bounded(
         child: &mut std::process::Child,
         limit: std::time::Duration,
-    ) -> Option<std::process::ExitStatus> {
+        stop: &dyn Fn() -> bool,
+    ) -> WaitEnd {
         let deadline = std::time::Instant::now() + limit;
         loop {
             match child.try_wait() {
-                Ok(Some(s)) => return Some(s),
+                Ok(Some(s)) => return WaitEnd::Exited(s),
                 // Treat "cannot ask" as death; the caller's fallback is the
                 // safe answer either way.
-                Err(_) => return None,
+                Err(_) => return WaitEnd::TimedOut,
                 Ok(None) => {}
             }
             if std::time::Instant::now() >= deadline {
-                return None;
+                return WaitEnd::TimedOut;
+            }
+            if stop() {
+                return WaitEnd::Stopped;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -1315,7 +1837,7 @@ mod child {
     /// A worker told to stop while it probes leaves without waiting the probe
     /// out (`signaling::run`). Untied, its probe child, a `roomlerd.exe`,
     /// would outlive it. It could hold the very binary an update is replacing,
-    /// or, hung in a driver, run on with nobody left to enforce [`TIMEOUT`].
+    /// or, hung in a driver, run on with nobody left to enforce its bound.
     /// Windows has no process group to take down with a parent; a
     /// `KILL_ON_JOB_CLOSE` job is the equivalent, and its last handle closes
     /// when this process ends. `None` (logged) when the job cannot be made:
@@ -1728,14 +2250,24 @@ pub(crate) fn in_probe_child() -> bool {
 /// and currently functional on this host. First call runs the
 /// activation probes (~300ms per codec on HEVC/AV1-capable boxes,
 /// <10ms on boxes with no HW encoder); subsequent calls return the
-/// cached result.
+/// cached result, or a later try's if one was adopted (#3280). This never waits
+/// for a try.
 pub fn detect() -> AgentCaps {
-    CACHED_CAPS
-        .get_or_init(|| {
-            let caps = cached_or_probed();
-            assigned_by_the_daemon(caps, &HostFacts::here(), &super::cells::learned())
-        })
-        .clone()
+    let first = CACHED_CAPS.get_or_init(|| {
+        let caps = cached_or_probed();
+        let short = FIRST_SHORT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .filter(|_| retry_enabled());
+        assigned_by_the_daemon(
+            caps,
+            &HostFacts::here(),
+            &super::cells::learned(),
+            short.as_ref(),
+        )
+    });
+    late_caps().unwrap_or_else(|| first.clone())
 }
 
 /// What the daemon says over whatever `cached_or_probed` answered, on every
@@ -1744,8 +2276,13 @@ fn assigned_by_the_daemon(
     caps: AgentCaps,
     facts: &HostFacts,
     learned: &[super::cells::LearnedDeny],
+    short: Option<&child::Shortfall>,
 ) -> AgentCaps {
-    with_learned_word(with_honest_words(with_config_lists(caps), facts), learned)
+    with_learned_word(
+        with_honest_words(with_config_lists(caps), facts),
+        learned,
+        short,
+    )
 }
 
 /// #3267 — the key and code a learned deny rides in [`AgentCaps::unavailable`].
@@ -1754,13 +2291,31 @@ fn assigned_by_the_daemon(
 /// no viewer says anything about it. `scripts/fr97-caps-census.sh` counts it.
 pub const LEARNED_WORD: &str = "encoder-cells";
 pub const LEARNED_CODE: &str = "learned-deny";
+/// #3280 — the same key's code on a host short of time with no cell to name, so
+/// that one with no hardware says why instead of looking like it has none.
+pub const SHORT_CODE: &str = "probe-short";
 
 /// #3267 — a host that lost a cell to a driver fault says so: which cell, and
 /// how its probe child ended. The collapse this replaces went unnoticed for
 /// hours because the viewer still looked healthy.
-fn with_learned_word(mut caps: AgentCaps, learned: &[super::cells::LearnedDeny]) -> AgentCaps {
+fn with_learned_word(
+    mut caps: AgentCaps,
+    learned: &[super::cells::LearnedDeny],
+    short: Option<&child::Shortfall>,
+) -> AgentCaps {
     use roomler_ai_remote_control::models::Unavailable;
     if learned.is_empty() {
+        if short.is_some() {
+            caps.unavailable.insert(
+                LEARNED_WORD.into(),
+                Unavailable::new(
+                    SHORT_CODE,
+                    "The capability probe ran out of time on this host, so hardware encoders may \
+                     be missing from this answer. A later try with more time, or the next start, \
+                     can bring them back",
+                ),
+            );
+        }
         return caps;
     }
     let cells = learned
@@ -1768,6 +2323,11 @@ fn with_learned_word(mut caps: AgentCaps, learned: &[super::cells::LearnedDeny])
         .map(|l| {
             if l.confirmed {
                 format!("{} ({})", l.cell, l.why)
+            } else if l.timed_out && short.is_some() {
+                format!(
+                    "{} ({}, until a later try or the next start)",
+                    l.cell, l.why
+                )
             } else {
                 format!("{} ({}, until the next start)", l.cell, l.why)
             }
@@ -2231,7 +2791,7 @@ fn cached_or_probed() -> AgentCaps {
                 }
                 super::cells::install_learned(hit.learned_deny.clone());
                 install_vp9_qsv_idr(hit.vp9_qsv_idr);
-                install_gpu_input(hit.gpu_input.clone());
+                install_gpu_forms(hit.gpu_input.clone());
                 return merge_cached(hit);
             }
             Err(miss) => tracing::info!(
@@ -2249,36 +2809,22 @@ fn cached_or_probed() -> AgentCaps {
         _ => tracing::debug!("caps probe: no cache key on this platform — probing"),
     }
 
-    match child::probe() {
-        Some((report, unfinished)) => {
+    let got = child::probe(&child::Try {
+        bounds: child::Bounds::FIRST,
+        denied: Vec::new(),
+        stop: &|| false,
+        first: true,
+    });
+    // Whatever the runs left, a session opens encoders in the daemon, and the
+    // fault that ended the child would end the daemon.
+    super::cells::install_learned(got.learned.clone());
+    *FIRST_SHORT.lock().unwrap_or_else(|e| e.into_inner()) = got.short;
+    match got.report {
+        Some(report) => {
             install_vp9_qsv_idr(report.vp9_qsv_idr);
-            install_gpu_input(report.gpu_input.clone());
+            install_gpu_forms(report.gpu_input.clone());
             if let (Some(key), Some(path)) = (key, path) {
-                let learned = super::cells::learned();
-                if let Some(why) = why_not_cached(&report.caps, &learned, unfinished) {
-                    tracing::info!(learned_deny = ?learned, "caps probe: not cached: {why}");
-                } else {
-                    let file = cache::CacheFile::new(
-                        key,
-                        now,
-                        report.caps.probe_ms.unwrap_or(0),
-                        report.caps.clone(),
-                        report.vp9_qsv_idr,
-                    )
-                    .with_gpu_input(report.gpu_input.clone())
-                    .with_learned_deny(learned);
-                    match cache::store(&path, &file) {
-                        Ok(()) => tracing::info!(
-                            path = %path.display(),
-                            "caps probe: result cached for the next start"
-                        ),
-                        Err(e) => tracing::warn!(
-                            %e,
-                            path = %path.display(),
-                            "caps probe: could not write the cache — harmless, the next start probes again"
-                        ),
-                    }
-                }
+                store_answer(key, &path, now, &report, &got.learned, got.unanswered);
             }
             report.caps
         }
@@ -2293,21 +2839,58 @@ fn cached_or_probed() -> AgentCaps {
     }
 }
 
+/// Keep a probe's answer for the next start, if [`why_not_cached`] lets it.
+fn store_answer(
+    key: super::caps_cache::CacheKey,
+    path: &std::path::Path,
+    now: u64,
+    report: &child::ProbeReport,
+    learned: &[super::cells::LearnedDeny],
+    unanswered: bool,
+) {
+    use super::caps_cache as cache;
+    if let Some(why) = why_not_cached(&report.caps, learned, unanswered) {
+        tracing::info!(learned_deny = ?learned, "caps probe: not cached: {why}");
+        return;
+    }
+    let file = cache::CacheFile::new(
+        key,
+        now,
+        report.caps.probe_ms.unwrap_or(0),
+        report.caps.clone(),
+        report.vp9_qsv_idr,
+    )
+    .with_gpu_input(report.gpu_input.clone())
+    .with_learned_deny(learned.to_vec());
+    match cache::store(path, &file) {
+        Ok(()) => tracing::info!(
+            path = %path.display(),
+            "caps probe: result cached for the next start"
+        ),
+        Err(e) => tracing::warn!(
+            %e,
+            path = %path.display(),
+            "caps probe: could not write the cache — harmless, the next start probes again"
+        ),
+    }
+}
+
 /// Why this probe's answer must not outlive the process, or `None` when it may.
+/// A later try's answer passes through here unchanged (#3280).
 fn why_not_cached(
     caps: &AgentCaps,
     learned: &[super::cells::LearnedDeny],
-    unfinished: bool,
+    unanswered: bool,
 ) -> Option<&'static str> {
     if learned.iter().any(|l| !l.confirmed) {
         // #3267 — this answer leans on a cell a hang or a kill may have cost for
         // nothing. Freezing it would keep a healthy cell out for as long as the
         // cache lives.
         Some("a cell is denied on a hang or a kill only, so the next start tests it again")
-    } else if unfinished {
+    } else if unanswered {
         // #3273 — those forms are missing for want of an answer, and a hit would
-        // not ask again for a week.
-        Some("a 4:4:4 or GPU child ran out of time, so the next start asks again")
+        // not ask again for a week. Only a fault's death is an answer (#3280).
+        Some("a 4:4:4 or GPU child left no answer, so the next start asks again")
     } else if !super::caps_cache::worth_caching(caps) {
         Some("no hardware cell opened (a boot-time driver race must not be frozen for a week)")
     } else {
@@ -2322,16 +2905,530 @@ fn why_not_cached(
 /// `detect()` assigns them after the merge, by the same line a miss takes.
 fn merge_cached(hit: super::caps_cache::CacheFile) -> AgentCaps {
     let mut fresh = compute_caps(false, false);
-    let cached = hit.caps;
-    fresh.hw_encoders = cached.hw_encoders;
-    fresh.codecs = cached.codecs;
-    fresh.transports = cached.transports;
-    fresh.hevc_chroma = cached.hevc_chroma;
-    fresh.vp9_chroma = cached.vp9_chroma;
-    fresh.video_cells = cached.video_cells;
+    take_probed_fields(&mut fresh, hit.caps);
     fresh.probe_ms = Some(hit.probe_ms);
     fresh.probe_cached = true;
     fresh
+}
+
+/// What a probe answers, as against what the running process says for itself. A
+/// cache hit and an adopted try move exactly these.
+fn take_probed_fields(into: &mut AgentCaps, from: AgentCaps) {
+    into.hw_encoders = from.hw_encoders;
+    into.codecs = from.codecs;
+    into.transports = from.transports;
+    into.hevc_chroma = from.hevc_chroma;
+    into.vp9_chroma = from.vp9_chroma;
+    into.video_cells = from.video_cells;
+}
+
+/// #3280 — one row of the table a host short of time climbs: how long to wait
+/// after the last try ended, and how long this one gives its children.
+struct Rung {
+    wait: Duration,
+    bounds: child::Bounds,
+}
+
+const fn rung(wait_min: u64, child_min: u64, kill_wait_s: u64, budget_min: u64) -> Rung {
+    Rung {
+        wait: Duration::from_secs(wait_min * 60),
+        bounds: child::Bounds {
+            child: Duration::from_secs(child_min * 60),
+            kill_wait: Duration::from_secs(kill_wait_s),
+            base_budget: Duration::from_secs(budget_min * 60),
+        },
+    }
+}
+
+/// #3280 — the first probe blocks the device, so its bounds cannot grow. These do
+/// not, so they can. Five tries over about a day and a half, and each is a whole
+/// probe, because its answer has to stand alone.
+const LADDER: [Rung; 5] = [
+    rung(1, 2, 20, 3),
+    rung(10, 4, 40, 6),
+    rung(60, 8, 80, 12),
+    rung(6 * 60, 8, 80, 12),
+    rung(24 * 60, 8, 80, 12),
+];
+
+/// #3280 — how often the wait for a quiet host looks.
+const RETRY_TICK: Duration = Duration::from_secs(1);
+/// #3280 — no try starts this soon after a session asked. It may be waiting on a
+/// person at the consent prompt, with nothing in the registry yet.
+const QUIET_AFTER_ASK: Duration = Duration::from_secs(60);
+
+/// #3280 — `ROOMLERD_CAPS_PROBE_RETRY=0` / `caps_probe_retry = false`: a first
+/// answer short of time stands until the next start, as before. Read at each try.
+fn retry_enabled() -> bool {
+    tunnel_core::env::flag("CAPS_PROBE_RETRY", true)
+}
+
+/// #3280 — a session asked for this host. A try's child is told to die at its next
+/// poll, because a try has no value until it finishes and a session sharing the GPU
+/// with a slow or stuck child can wedge on the same driver. Cheap, and harmless
+/// with no try running. Earlier than the registry can say: a session enters that
+/// only after its peer is built and its pump has started.
+pub fn session_asked() {
+    *LAST_ASK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+}
+
+fn last_ask() -> Option<Instant> {
+    *LAST_ASK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// #3280 — a session has this host, a recording that outlives one included, or just
+/// asked for it, and that one is in no registry until its peer is built.
+fn busy(live: bool, since_ask: Option<Duration>) -> bool {
+    live || since_ask.is_some_and(|t| t < QUIET_AFTER_ASK)
+}
+
+/// #3280 — whether a try may start, or the wait for one may count. Not while a
+/// child that would not die is still stuck: the driver has not recovered. Not
+/// while a session has the host or just asked.
+fn quiet(stuck: u32, live: bool, since_ask: Option<Duration>) -> bool {
+    stuck == 0 && !busy(live, since_ask)
+}
+
+/// #3280 — what a later try starts with denied: everything the daemon goes by,
+/// except what is there only for want of time. A fault's deny and a double kill's
+/// stay on every try's list.
+fn list_for_a_try(list: &[super::cells::LearnedDeny]) -> Vec<super::cells::LearnedDeny> {
+    list.iter().filter(|d| !d.timed_out).cloned().collect()
+}
+
+/// Every form an answer advertises, by the denylists' spellings, and whether it is
+/// hardware. A GPU-input form counts only beside its cell: with no cell, no child is
+/// asked about it.
+fn forms_of(caps: &AgentCaps, gpu_input: &[String]) -> std::collections::BTreeMap<String, bool> {
+    let mut forms: std::collections::BTreeMap<String, bool> = caps
+        .video_cells
+        .iter()
+        .flat_map(|c| {
+            let name = child::list_name(c);
+            c.chroma
+                .iter()
+                .map(move |chroma| (format!("{name}:{chroma}"), c.hw))
+        })
+        .collect();
+    forms.extend(
+        gpu_input
+            .iter()
+            .filter(|name| {
+                caps.video_cells
+                    .iter()
+                    .any(|c| child::list_name(c) == **name)
+            })
+            .map(|name| (format!("{name}:gpu"), true)),
+    );
+    forms
+}
+
+/// `has` offers everything `had` does, and hardware stayed hardware.
+fn keeps(
+    had: &std::collections::BTreeMap<String, bool>,
+    has: &std::collections::BTreeMap<String, bool>,
+) -> bool {
+    had.iter()
+        .all(|(form, hw)| has.get(form).is_some_and(|now| *now || !*hw))
+}
+
+/// #3280 — what one try means for the next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Next {
+    /// A session stopped it, so it does not count: the same row again once
+    /// nothing has been live or asked for a minute.
+    Again,
+    /// Still short of time: the next row, with what it was short by.
+    Climb(child::Shortfall),
+    End(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Verdict {
+    adopt: bool,
+    next: Next,
+}
+
+/// #3280 — whether a try's answer replaces the one in force, and what comes next.
+/// Pure, so every row and every stop is a test with no child in it.
+///
+/// A try cannot take a form from a host: an answer is adopted when it keeps everything
+/// in force and has no shortfall or has more. What a fault costs left the answer in
+/// force when it joined the list ([`withdraw_refused`]), so it costs that form, and it
+/// does not stand in the way of a later answer that cannot hold it.
+fn weigh(
+    in_force: &AgentCaps,
+    in_force_gpu: &[String],
+    last: &child::Shortfall,
+    got: &child::Probed,
+) -> Verdict {
+    if got.stopped {
+        return Verdict {
+            adopt: false,
+            next: Next::Again,
+        };
+    }
+    let adopt = got.report.as_ref().is_some_and(|report| {
+        let had = forms_of(in_force, in_force_gpu);
+        let has = forms_of(&report.caps, &report.gpu_input);
+        keeps(&had, &has) && (got.short.is_none() || has.len() > had.len())
+    });
+    let next = match &got.short {
+        None if adopt => Next::End("it answered"),
+        // A form in force is missing, and nothing says why: a `gpu` child that answered
+        // nothing, an open that came back as software under load. The next one may
+        // answer, and what the last was short by still stands.
+        None if got.report.is_some() => Next::Climb(last.clone()),
+        None => Next::End("it left no answer, and not for want of time"),
+        // The signature of a real hang, and another try could hold the GPU for
+        // minutes on a host someone may be using. The cost: a host that needs more
+        // than the first try's bound for one open loses that one form.
+        Some(now) if now.cells.iter().any(|c| last.cells.contains(c)) => {
+            Next::End("the same cell ran out of time again, with more of it")
+        }
+        Some(now) => Next::Climb(now.clone()),
+    };
+    Verdict { adopt, next }
+}
+
+/// #3280 — climb [`LADDER`] from the first answer's shortfall, one try at a time.
+/// `wait` is told what the table owes and returns when that has passed quietly; a
+/// try a session stopped owes nothing but quiet. Returns why it ended.
+fn climb(
+    first: child::Shortfall,
+    mut wait: impl FnMut(Duration),
+    mut attempt: impl FnMut(usize, &child::Shortfall) -> Next,
+) -> &'static str {
+    let mut last = first;
+    let mut row = 0;
+    let mut lost = false;
+    while let Some(rung) = LADDER.get(row) {
+        wait(if lost { Duration::ZERO } else { rung.wait });
+        match attempt(row, &last) {
+            Next::Again => lost = true,
+            Next::Climb(short) => {
+                last = short;
+                row += 1;
+                lost = false;
+            }
+            Next::End(why) => return why,
+        }
+    }
+    "the end of the table"
+}
+
+/// #3280 — sit out `owed` of quiet, and at least one look.
+fn wait_quietly(owed: Duration, live: &impl Fn() -> bool) {
+    let mut owed = owed.max(RETRY_TICK);
+    while !owed.is_zero() {
+        std::thread::sleep(RETRY_TICK);
+        let since_ask = last_ask().map(|t| t.elapsed());
+        owed = one_look(owed, child::stuck_children(), live(), since_ask);
+    }
+}
+
+/// #3280 — one look at the host: what a stuck child costs, if that can be paid now,
+/// and what is still owed.
+fn one_look(owed: Duration, stuck: u32, live: bool, since_ask: Option<Duration>) -> Duration {
+    hold_media_foundation_back(stuck, busy(live, since_ask), true);
+    after_a_look(owed, quiet(stuck, live, since_ask))
+}
+
+/// #3280 — what is still owed after one look. Anything [`quiet`] says no to stops
+/// the clock, and a try then owes a minute with nothing going on, however long
+/// ago that session asked: it may only just have ended, and its viewer may be
+/// reloading the page.
+fn after_a_look(owed: Duration, quiet: bool) -> Duration {
+    if quiet {
+        owed.saturating_sub(RETRY_TICK)
+    } else {
+        owed.max(QUIET_AFTER_ASK)
+    }
+}
+
+/// #3280 — one try. Its answer goes in the cache by the first probe's gate, with the
+/// key read before the probe started.
+fn one_try(row: usize, last: &child::Shortfall, live: &impl Fn() -> bool) -> Next {
+    use super::caps_cache as cache;
+    if !retry_enabled() {
+        return Next::End("ROOMLERD_CAPS_PROBE_RETRY is off");
+    }
+    let spot = cache::enabled()
+        .then(cache::current_key)
+        .flatten()
+        .zip(cache::path())
+        .map(|(key, path)| (key, path, cache::now_unix()));
+    one_try_with(row, last, live, child::stuck_children(), spot, child::probe)
+}
+
+/// [`one_try`] with its reads as arguments: a whole probe on this rung's bounds and
+/// its own list. Its answer goes in only if nothing went live or asked meanwhile.
+fn one_try_with(
+    row: usize,
+    last: &child::Shortfall,
+    live: &impl Fn() -> bool,
+    stuck: u32,
+    spot: Option<(super::caps_cache::CacheKey, std::path::PathBuf, u64)>,
+    probe: impl FnOnce(&child::Try) -> child::Probed,
+) -> Next {
+    let bounds = LADDER[row].bounds;
+    // A session that asked before this read is caught here, and one after it by
+    // `stop`, so none falls between the wait and the try.
+    let asked = last_ask();
+    if !quiet(stuck, live(), asked.map(|t| t.elapsed())) {
+        return Next::Again;
+    }
+    let stop = || last_ask() != asked || live();
+    let denied = list_for_a_try(&super::cells::learned());
+    let started = Instant::now();
+    tracing::warn!(
+        attempt = row + 1,
+        child_bound_s = bounds.child.as_secs(),
+        denied = ?denied.iter().map(|d| d.cell.as_str()).collect::<Vec<_>>(),
+        "caps probe: a later try starts, with more time"
+    );
+    let mut got = probe(&child::Try {
+        bounds,
+        denied,
+        stop: &stop,
+        first: false,
+    });
+    got.stopped |= stop();
+    let in_force_gpu = GPU_IN_FORCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let verdict = weigh(&in_force(), &in_force_gpu, last, &got);
+    tracing::warn!(
+        attempt = row + 1,
+        elapsed_ms = started.elapsed().as_millis(),
+        stopped = got.stopped,
+        short = ?got.short,
+        cells = got.report.as_ref().map(|r| r.caps.video_cells.len()),
+        adopt = verdict.adopt,
+        next = ?verdict.next,
+        "caps probe: a later try ended"
+    );
+    if verdict.adopt
+        && let Some(report) = got.report
+    {
+        if let Some((key, path, now)) = spot {
+            store_answer(key, &path, now, &report, &got.learned, got.unanswered);
+        }
+        adopt(report, got.learned, got.short.as_ref());
+    }
+    verdict.next
+}
+
+/// The answer a try goes by. The first exists by the time one starts, so this asks
+/// [`detect`] for nothing.
+fn in_force() -> AgentCaps {
+    cached().unwrap_or_else(detect)
+}
+
+/// #3280 — the answer in force stops offering what the daemon's list now refuses,
+/// and says why, because a session would otherwise pick a codec its open is refused:
+/// an RTP track binds to it first. Every row hears of it within a beat, and nothing
+/// live is touched: its encoder is open, and the list is what a rebuild reads.
+fn withdraw_refused(tries_left: bool) {
+    let learned = super::cells::learned();
+    let Some(was) = cached().filter(|_| !learned.is_empty()) else {
+        return;
+    };
+    let mut now = was.clone();
+    child::withdraw(&mut now, &learned);
+    now.unavailable.remove(LEARNED_WORD);
+    let short = tries_left.then(child::Shortfall::default);
+    let now = with_learned_word(now, &learned, short.as_ref());
+    if offered_forms(&now) != offered_forms(&was)
+        || now.unavailable.get(LEARNED_WORD) != was.unavailable.get(LEARNED_WORD)
+    {
+        tracing::warn!(
+            cells = now.video_cells.len(),
+            learned_deny = ?learned.iter().map(|l| l.cell.as_str()).collect::<Vec<_>>(),
+            "caps probe: the answer in force stops offering what is now refused"
+        );
+        install_late(now);
+    }
+}
+
+/// The forms an answer offers, for telling whether it changed.
+fn offered_forms(caps: &AgentCaps) -> std::collections::BTreeMap<String, bool> {
+    forms_of(caps, &[])
+}
+
+/// A later answer is in force. The generation last, so a heartbeat that sees it
+/// finds the new answer.
+fn install_late(answer: AgentCaps) {
+    *LATE_CAPS.write().unwrap_or_else(|e| e.into_inner()) = Some(answer);
+    CAPS_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// #3280 — a later try's child that would not die costs Media Foundation as a first
+/// probe's does, for the reason it does: what the daemon opens could hang the same
+/// way. But never from under a session. A live one's encoder is open beside that child
+/// and may rebuild at the next change of size, and one that just asked may have picked
+/// such a cell and is about to open it. A refusal there is no video, where the open has
+/// so far been fine. So this waits until nothing is [`busy`], and it is a level, not an
+/// event: a child that came back meanwhile costs nothing. Returns whether the child's
+/// cost has been paid.
+fn hold_media_foundation_back(stuck: u32, busy: bool, tries_left: bool) -> bool {
+    if stuck == 0 || busy {
+        return false;
+    }
+    if super::cells::learning_enabled() {
+        super::cells::join_learned(child::media_foundation_denies());
+        withdraw_refused(tries_left);
+    }
+    true
+}
+
+/// #3280 — once the table is done, nothing promises a try any more. A host still
+/// short has the next start left, and says so.
+fn word_after_the_climb(mut caps: AgentCaps, learned: &[super::cells::LearnedDeny]) -> AgentCaps {
+    use roomler_ai_remote_control::models::Unavailable;
+    let was_short = caps
+        .unavailable
+        .remove(LEARNED_WORD)
+        .is_some_and(|w| w.code == SHORT_CODE);
+    let mut caps = with_learned_word(caps, learned, None);
+    if was_short && learned.is_empty() {
+        caps.unavailable.insert(
+            LEARNED_WORD.into(),
+            Unavailable::new(
+                SHORT_CODE,
+                "The capability probe ran out of time on this host and no more tries are coming, \
+                 so hardware encoders may be missing from this answer until the next start",
+            ),
+        );
+    }
+    caps
+}
+
+/// #3280 — [`word_after_the_climb`], on the answer in force.
+fn say_the_climb_is_over() {
+    let Some(was) = cached() else {
+        return;
+    };
+    let now = word_after_the_climb(was.clone(), &super::cells::learned());
+    if now.unavailable.get(LEARNED_WORD) != was.unavailable.get(LEARNED_WORD) {
+        install_late(now);
+    }
+}
+
+/// #3280 — [`climb`], and what is left once the table is done. Nothing promises a try
+/// any more. A stuck child's cost outlives the table, and with no try left this is the
+/// only thing still looking for a moment when nothing is [`busy`].
+fn climb_then_close(
+    first: child::Shortfall,
+    wait: impl FnMut(Duration),
+    attempt: impl FnMut(usize, &child::Shortfall) -> Next,
+    live: &impl Fn() -> bool,
+    stuck: &impl Fn() -> u32,
+    tick: Duration,
+) {
+    let why = climb(first, wait, attempt);
+    tracing::info!(
+        why,
+        "caps probe: no more tries; the answer in force stands until the next start"
+    );
+    say_the_climb_is_over();
+    while stuck() > 0
+        && !hold_media_foundation_back(
+            stuck(),
+            busy(live(), last_ask().map(|t| t.elapsed())),
+            false,
+        )
+    {
+        std::thread::sleep(tick);
+    }
+}
+
+/// #3280 — a later try's answer becomes the one in force. The list first, because
+/// it decides what an open may do, and the generation last, so a heartbeat that
+/// sees it finds the new answer.
+fn adopt(
+    report: child::ProbeReport,
+    learned: Vec<super::cells::LearnedDeny>,
+    short: Option<&child::Shortfall>,
+) {
+    super::cells::install_learned(learned.clone());
+    install_vp9_qsv_idr(report.vp9_qsv_idr);
+    install_gpu_forms(report.gpu_input.clone());
+    let answer = adopted_answer(in_force(), report.caps, &learned, short);
+    tracing::warn!(
+        hw_encoders = ?answer.hw_encoders,
+        codecs = ?answer.codecs,
+        cells = answer.video_cells.len(),
+        learned_deny = ?learned.iter().map(|l| l.cell.as_str()).collect::<Vec<_>>(),
+        "caps probe: a later try's answer is now the one in force, with no restart"
+    );
+    install_late(answer);
+}
+
+/// The answer in force, with what a later try's probe answered. The config-derived
+/// words stay as they are: they did not change, and re-deriving them here could
+/// only move them for no reason. The word about the probe is replaced.
+fn adopted_answer(
+    mut in_force: AgentCaps,
+    answer: AgentCaps,
+    learned: &[super::cells::LearnedDeny],
+    short: Option<&child::Shortfall>,
+) -> AgentCaps {
+    let probe_ms = answer.probe_ms;
+    take_probed_fields(&mut in_force, answer);
+    in_force.probe_ms = probe_ms;
+    in_force.probe_cached = false;
+    in_force.unavailable.remove(LEARNED_WORD);
+    with_learned_word(in_force, learned, short)
+}
+
+/// #3280 — after the first answer, on a host whose first answer ran short of time:
+/// another try by itself, with more time, with no restart, never blocking the start
+/// or a live session. A cache hit or a complete answer arms nothing, so a healthy
+/// host runs none of this. The first call of a process takes the shortfall, so a
+/// second organization's loop arms nothing.
+///
+/// A thread of its own and not `spawn_blocking`: a runtime's shutdown waits on
+/// those, and `signaling::run` must be able to leave. `live` says whether a session
+/// is live on this device.
+pub fn arm_retry(live: impl Fn() -> bool + Send + 'static) {
+    let Some(short) = FIRST_SHORT.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    if !retry_enabled() {
+        tracing::info!(
+            ?short,
+            "caps probe: the first answer ran short of time, and ROOMLERD_CAPS_PROBE_RETRY is \
+             off: it stands until the next start"
+        );
+        return;
+    }
+    tracing::warn!(
+        ?short,
+        "caps probe: the first answer ran short of time — trying again with more, with no restart"
+    );
+    let spawned = std::thread::Builder::new()
+        .name("roomlerd-caps-retry".into())
+        .spawn(move || {
+            climb_then_close(
+                short,
+                |owed| wait_quietly(owed, &live),
+                |row, last| one_try(row, last, &live),
+                &live,
+                &child::stuck_children,
+                RETRY_TICK,
+            );
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(%e, "caps probe: no thread for a later try; this answer stands until the next start");
+    }
+}
+
+/// [`install_gpu_input`], and what [`weigh`] compares a later try against.
+fn install_gpu_forms(proven: Vec<String>) {
+    *GPU_IN_FORCE.lock().unwrap_or_else(|e| e.into_inner()) = proven.clone();
+    install_gpu_input(proven);
 }
 
 #[cfg(feature = "ffmpeg-encoder")]
@@ -3342,6 +4439,10 @@ fn rpc_caps() -> Vec<String> {
     if crate::rc_overlay::auto_enabled() {
         caps.push(RpcCap::RcOverlayAuto);
     }
+    // FR-135 R2 — it says each session's plan, while that is switched on.
+    if crate::media_plan::enabled() {
+        caps.push(RpcCap::MediaPlan);
+    }
     if cfg!(feature = "ssh-server") {
         caps.push(RpcCap::Ssh);
         // P5d. Distinct from `ssh` because agents rc.419 and earlier advertise
@@ -3690,6 +4791,37 @@ pub fn pick_best_codec(browser_caps: &[String], agent_caps: &[String]) -> String
     // Fallback — universal baseline. If the browser advertises nothing
     // (pre-2B.1 controller) we assume it decodes H.264.
     "h264".to_string()
+}
+
+/// #3280 — a session's picks, read again at its offer. A later try can take what they
+/// were made from while a person decides, and that can take minutes: a track bound to
+/// a codec its open is then refused carries no video, and a DataChannel pump with no
+/// cell left ends. So what has gone is picked again by the request's own rules, and a
+/// pick that still stands stays. #3245 — on the RTP track "still stands" means its
+/// opener can open it, and a session that just lost its DataChannel picks again: what
+/// `codecs` lists is what a DataChannel pump can open.
+pub fn picks_at_the_offer(
+    codec: String,
+    transport: Option<String>,
+    browser_caps: &[String],
+    now: &AgentCaps,
+) -> (String, Option<String>) {
+    use crate::peer::on_data_channel;
+    let kept = transport
+        .clone()
+        .filter(|t| now.transports.iter().any(|have| have == t));
+    let stands = if on_data_channel(kept.as_deref()) {
+        now.codecs.iter().any(|c| c.eq_ignore_ascii_case(&codec))
+    } else {
+        !on_data_channel(transport.as_deref())
+            && crate::encode::rtp_opener_opens(&codec, &now.video_cells)
+    };
+    if stands {
+        (codec, kept)
+    } else {
+        let codec = crate::peer::session_codec(browser_caps, now, kept.as_deref());
+        (codec, kept)
+    }
 }
 
 #[cfg(test)]
@@ -4819,15 +5951,15 @@ mod tests {
         };
         // Built-in denylist: hevc_qsv, hevc_vaapi AND vp9_qsv (CORPLAP-3, 2026-09-08).
         assert_eq!(
-            child::candidates_444(&caps),
+            child::candidates_444(&caps, &denied_cells()),
             vec!["hevc_nvenc".to_string(), "h264_nvenc".to_string()]
         );
         unsafe { tunnel_core::env::test_env::set("ENCODER_CELLS_DENY", "none") };
         assert_eq!(
-            child::candidates_444(&caps),
+            child::candidates_444(&caps, &denied_cells()),
             vec!["hevc_nvenc", "h264_nvenc", "vp9_qsv", "hevc_qsv"]
         );
-        assert!(child::candidates_444(&AgentCaps::default()).is_empty());
+        assert!(child::candidates_444(&AgentCaps::default(), &denied_cells()).is_empty());
     }
 
     /// FR-118 P2-3, AC6's probe half — the GPU-input phase tries the base
@@ -4860,27 +5992,36 @@ mod tests {
             ],
             ..AgentCaps::default()
         };
-        assert!(child::candidates_gpu(&caps).is_empty(), "the switch is off");
+        assert!(
+            child::candidates_gpu(&caps, &denied_cells()).is_empty(),
+            "the switch is off"
+        );
         // SAFETY: serialised by DENY_ENV_LOCK; the guards restore all three.
         unsafe { set("ZERO_COPY", "1") };
         assert_eq!(
-            child::candidates_gpu(&caps),
+            child::candidates_gpu(&caps, &denied_cells()),
             vec!["hevc_qsv", "av1_qsv", "h264_qsv", "hevc_nvenc"],
             "vp9_qsv takes no GPU frames yet; NVENC does since P3"
         );
         // SAFETY: as above.
         unsafe { set("ZERO_COPY_DENY", "av1_qsv:gpu") };
         assert_eq!(
-            child::candidates_gpu(&caps),
+            child::candidates_gpu(&caps, &denied_cells()),
             vec!["hevc_qsv", "h264_qsv", "hevc_nvenc"]
         );
         // SAFETY: as above.
         unsafe { set("ENCODER_CELLS_DENY", "h264_qsv:yuv420") };
-        assert_eq!(child::candidates_gpu(&caps), vec!["hevc_qsv", "hevc_nvenc"]);
+        assert_eq!(
+            child::candidates_gpu(&caps, &denied_cells()),
+            vec!["hevc_qsv", "hevc_nvenc"]
+        );
         // A list REPLACES the one before it, so both entries go in one list.
         // SAFETY: as above.
         unsafe { set("ZERO_COPY_DENY", "av1_qsv:gpu,hevc_nvenc:gpu") };
-        assert_eq!(child::candidates_gpu(&caps), vec!["hevc_qsv"]);
+        assert_eq!(
+            child::candidates_gpu(&caps, &denied_cells()),
+            vec!["hevc_qsv"]
+        );
     }
 
     /// FR-118 P5, AC6's probe half on macOS — the GPU-input phase tries
@@ -4910,22 +6051,31 @@ mod tests {
             ],
             ..AgentCaps::default()
         };
-        assert!(child::candidates_gpu(&caps).is_empty(), "the switch is off");
+        assert!(
+            child::candidates_gpu(&caps, &denied_cells()).is_empty(),
+            "the switch is off"
+        );
         // SAFETY: serialised by DENY_ENV_LOCK; the guards restore all three.
         unsafe { set("ZERO_COPY", "1") };
         assert_eq!(
-            child::candidates_gpu(&caps),
+            child::candidates_gpu(&caps, &denied_cells()),
             vec!["hevc_videotoolbox", "h264_videotoolbox"],
             "AV1 opens on no shipped Mac"
         );
         // SAFETY: as above.
         unsafe { set("ZERO_COPY_DENY", "hevc_videotoolbox:gpu") };
-        assert_eq!(child::candidates_gpu(&caps), vec!["h264_videotoolbox"]);
+        assert_eq!(
+            child::candidates_gpu(&caps, &denied_cells()),
+            vec!["h264_videotoolbox"]
+        );
         // SAFETY: as above.
         unsafe { set("ZERO_COPY_DENY", "none") };
         // SAFETY: as above.
         unsafe { set("ENCODER_CELLS_DENY", "h264_videotoolbox:yuv420") };
-        assert_eq!(child::candidates_gpu(&caps), vec!["hevc_videotoolbox"]);
+        assert_eq!(
+            child::candidates_gpu(&caps, &denied_cells()),
+            vec!["hevc_videotoolbox"]
+        );
     }
 
     /// FR-118 P3 — the GPU phase proves NVENC's GPU-input forms on an NVIDIA
@@ -5182,6 +6332,8 @@ mod tests {
         reported: bool,
         learned: Vec<crate::encode::cells::LearnedDeny>,
         asked: Vec<Vec<String>>,
+        out_of_time: bool,
+        stopped: bool,
     }
 
     /// `script` is the runs in order; each `Duration` is what the clock reads
@@ -5194,8 +6346,10 @@ mod tests {
         let clock = std::cell::Cell::new(std::time::Duration::ZERO);
         let asked = std::cell::RefCell::new(Vec::new());
         let mut script = script.into_iter();
-        let (report, learned) = child::run_base(
+        let out = child::run_base(
             learning,
+            Vec::new(),
+            child::BASE_RETRY_BUDGET,
             |denied| {
                 asked
                     .borrow_mut()
@@ -5207,9 +6361,11 @@ mod tests {
             || clock.get(),
         );
         Scripted {
-            reported: report.is_some(),
-            learned,
+            reported: out.report.is_some(),
+            learned: out.denied,
             asked: asked.into_inner(),
+            out_of_time: out.out_of_time,
+            stopped: out.stopped,
         }
     }
 
@@ -5257,6 +6413,7 @@ mod tests {
                 cell: "hevc_vulkan:yuv420".into(),
                 why: "exit code: 0xc0000005".into(),
                 confirmed: true,
+                timed_out: false,
             }],
             "two faults confirm it: this is what the cache keeps"
         );
@@ -5452,6 +6609,7 @@ mod tests {
             .collect();
         let out = run_base_scripted(true, script);
         assert!(!out.reported);
+        assert!(!out.out_of_time, "a kill says nothing about time");
         assert_eq!(out.asked.len() as u32, child::MAX_BASE_RUNS);
         assert!(out.learned.is_empty(), "no cell died twice: nothing earned");
     }
@@ -5475,6 +6633,7 @@ mod tests {
             ],
         );
         assert!(!out.reported);
+        assert!(out.out_of_time, "that is what a later try is for");
         assert_eq!(out.asked.len(), 2, "the script would panic on a third");
         assert_eq!(out.learned.len(), 1);
         assert!(out.learned[0].confirmed);
@@ -5761,8 +6920,8 @@ mod tests {
             "{:?}",
             caps.hw_encoders
         );
-        assert!(child::candidates_444(caps).is_empty());
-        assert!(child::candidates_gpu(caps).is_empty());
+        assert!(child::candidates_444(caps, &denied_cells()).is_empty());
+        assert!(child::candidates_gpu(caps, &denied_cells()).is_empty());
         assert!(
             !super::super::caps_cache::worth_caching(caps),
             "and the next start tests the hardware again"
@@ -5780,8 +6939,9 @@ mod tests {
             cell: "hevc_vulkan:yuv420".into(),
             why: "exit code: 0xc0000005".into(),
             confirmed: true,
+            timed_out: false,
         }];
-        let c = assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &learned);
+        let c = assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &learned, None);
         let word = &c.unavailable[LEARNED_WORD];
         assert_eq!(word.code, LEARNED_CODE);
         assert!(
@@ -5802,14 +6962,31 @@ mod tests {
         assert!(c.unavailable.contains_key("sas"));
         assert!(!c.files.is_empty(), "with_config_lists still runs");
 
-        // A cell denied on a hang comes back at the next start, whatever day
-        // that is, and the word says so.
+        // A cell denied on a hang comes back at a later try or the next start,
+        // whatever day that is, and the word says so.
         let hung = vec![crate::encode::cells::LearnedDeny {
             cell: "hevc_nvenc:yuv420".into(),
             why: "hung".into(),
             confirmed: false,
+            timed_out: true,
         }];
-        let c = assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &hung);
+        let short = child::Shortfall {
+            cells: vec!["hevc_nvenc:yuv420".into()],
+            ..Default::default()
+        };
+        let c =
+            assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &hung, Some(&short));
+        assert!(
+            c.unavailable[LEARNED_WORD]
+                .reason
+                .contains("hevc_nvenc:yuv420 (hung, until a later try or the next start)"),
+            "{}",
+            c.unavailable[LEARNED_WORD].reason
+        );
+
+        // With the kill switch off no later try comes, and the word does not say
+        // one will: `detect` passes no shortfall then.
+        let c = assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &hung, None);
         assert!(
             c.unavailable[LEARNED_WORD]
                 .reason
@@ -5818,7 +6995,23 @@ mod tests {
             c.unavailable[LEARNED_WORD].reason
         );
 
-        let none = assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &[]);
+        // A double kill is not tried again: only the next start tests it.
+        let killed = vec![crate::encode::cells::LearnedDeny {
+            cell: "hevc_nvenc:yuv420".into(),
+            why: "signal: 9".into(),
+            confirmed: false,
+            timed_out: false,
+        }];
+        let c = assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &killed, None);
+        assert!(
+            c.unavailable[LEARNED_WORD]
+                .reason
+                .contains("hevc_nvenc:yuv420 (signal: 9, until the next start)"),
+            "{}",
+            c.unavailable[LEARNED_WORD].reason
+        );
+
+        let none = assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &[], None);
         assert!(!none.unavailable.contains_key(LEARNED_WORD));
     }
 
@@ -5967,7 +7160,8 @@ mod tests {
             &format!("echo {}{STAND_IN_CELL}; {STAND_IN_UNIX}", child::PROGRESS),
         );
         let started = std::time::Instant::now();
-        let (waited, stdout) = child::wait_for_child(child, STAND_IN_HANG, STAND_IN_KILL, |_| {});
+        let (waited, stdout) =
+            child::wait_for_child(child, STAND_IN_HANG, STAND_IN_KILL, &|| false, |_| {});
         assert!(
             started.elapsed() < STAND_IN_HELD,
             "waited for the child: {:?}",
@@ -5983,6 +7177,14 @@ mod tests {
             "the line that lets a stuck child cost one cell and not the host: {stdout:?}"
         );
         assert!(stdout.cut_off, "the child still holds its pipe: {stdout:?}");
+        // #3280 — a later try waits on this. It holds until that call returns, and
+        // other tests here may be holding it too, so this looks for the end.
+        assert!(child::stuck_children() >= 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while child::stuck_children() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert_eq!(child::stuck_children(), 0, "the reaper counts it off");
     }
 
     /// #3273 — the kill lands, and what the child started keeps the pipe open.
@@ -5996,9 +7198,10 @@ mod tests {
             ),
         );
         let started = std::time::Instant::now();
-        let (waited, stdout) = child::wait_for_child(child, STAND_IN_HANG, STAND_IN_KILL, |c| {
-            let _ = c.kill();
-        });
+        let (waited, stdout) =
+            child::wait_for_child(child, STAND_IN_HANG, STAND_IN_KILL, &|| false, |c| {
+                let _ = c.kill();
+            });
         assert!(
             started.elapsed() < STAND_IN_HELD,
             "waited for the pipe: {:?}",
@@ -6034,6 +7237,7 @@ mod tests {
             child,
             std::time::Duration::from_secs(30),
             STAND_IN_KILL,
+            &|| false,
             |_| panic!("a child that ended by itself is never killed"),
         );
         assert!(
@@ -6059,7 +7263,7 @@ mod tests {
         let (child, _job) = stand_in("echo one& echo two& exit 3", "echo one; echo two; exit 3");
         let limit = std::time::Duration::from_secs(30);
         let started = std::time::Instant::now();
-        let (waited, stdout) = child::wait_for_child(child, limit, limit, |_| {
+        let (waited, stdout) = child::wait_for_child(child, limit, limit, &|| false, |_| {
             panic!("a child that ended by itself is never killed")
         });
         assert!(
@@ -6215,6 +7419,10 @@ mod tests {
         assert!(child::ran_out_of_time(&run(child::Ending::Clean, true)));
         assert!(!child::ran_out_of_time(&run(child::Ending::Clean, false)));
         assert!(!child::ran_out_of_time(&run(fault(), false)));
+        assert!(!child::ran_out_of_time(&run(
+            child::Ending::Stopped { gone: true },
+            false
+        )));
     }
 
     /// #3273 — the review's question: a host that comes online with no hardware
@@ -6296,6 +7504,27 @@ mod tests {
         );
     }
 
+    /// #3280 — a session asked: the runs stop where they are, with nothing to say
+    /// about time, and no second run.
+    #[test]
+    fn a_stop_ends_the_runs_at_once() {
+        let out = run_base_scripted(
+            true,
+            vec![(
+                secs(1),
+                Some(child::Run {
+                    ending: child::Ending::Stopped { gone: true },
+                    stdout: String::new(),
+                    cut_off: false,
+                    elapsed: secs(1),
+                }),
+            )],
+        );
+        assert!(out.stopped);
+        assert!(!out.reported && !out.out_of_time);
+        assert!(out.learned.is_empty());
+    }
+
     /// #3273 — two children stuck with no cell to blame: the old answer, no
     /// hardware, and the daemon stays out of Media Foundation all the same. This
     /// is the state the review asked about.
@@ -6312,6 +7541,7 @@ mod tests {
             vec![(secs(70), Some(blind())), (secs(140), Some(blind()))],
         );
         assert!(!out.reported);
+        assert!(out.out_of_time);
         assert_eq!(
             out.learned
                 .iter()
@@ -6322,5 +7552,2134 @@ mod tests {
                 .map(|n| format!("{n}:yuv420"))
                 .collect::<Vec<_>>()
         );
+    }
+
+    // #3280 — a host that is merely slow gets another try by itself.
+
+    use crate::encode::cells::{self, LearnedDeny};
+
+    /// What every test of a whole probe holds: the list and the denylists are
+    /// process-wide, and a probe joins a fault's deny to the list at once. The
+    /// environment comes back while the lock is still held.
+    struct ProbeFixture {
+        _saved: Vec<tunnel_core::env::test_env::Saved>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ProbeFixture {
+        fn drop(&mut self) {
+            cells::install_learned(Vec::new());
+            *LATE_CAPS.write().unwrap_or_else(|e| e.into_inner()) = None;
+            *LAST_ASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            GPU_IN_FORCE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
+    }
+
+    fn probe_fixture() -> ProbeFixture {
+        use tunnel_core::env::test_env::{Saved, set};
+        let guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = [
+            "ENCODER_CELLS_DENY",
+            "ENCODER_CELLS_LEARNED",
+            "ZERO_COPY",
+            "ZERO_COPY_DENY",
+            "CAPS_PROBE_RETRY",
+        ]
+        .map(Saved::cleared)
+        .into_iter()
+        .collect();
+        // SAFETY: serialised by DENY_ENV_LOCK; the guards restore it.
+        unsafe { set("ZERO_COPY", "0") };
+        cells::install_learned(Vec::new());
+        ProbeFixture {
+            _saved: saved,
+            _guard: guard,
+        }
+    }
+
+    fn a_first_probe() -> child::Try<'static> {
+        child::Try {
+            bounds: child::Bounds::FIRST,
+            denied: Vec::new(),
+            stop: &|| false,
+            first: true,
+        }
+    }
+
+    fn a_later_try(denied: Vec<LearnedDeny>) -> child::Try<'static> {
+        child::Try {
+            bounds: LADDER[0].bounds,
+            denied,
+            stop: &|| false,
+            first: false,
+        }
+    }
+
+    /// A whole probe over scripted children: `script` is each child in order, by
+    /// its phase. Asking for one the case does not expect fails it, and so does
+    /// leaving one out. Also returns the list each child was started with.
+    fn probe_scripted(
+        this: &child::Try,
+        script: Vec<(&'static str, Option<child::Run>)>,
+    ) -> (child::Probed, Vec<Vec<String>>) {
+        let mut script = script.into_iter();
+        let mut asked = Vec::new();
+        let got = child::probe_with(this, true, |list, extra| {
+            asked.push(list.iter().map(|d| d.cell.clone()).collect::<Vec<_>>());
+            let phase = extra
+                .iter()
+                .find(|(k, _)| *k == child::PHASE_ENV)
+                .map(|(_, v)| v.clone())
+                .expect("every child has a phase");
+            let (want, run) = script
+                .next()
+                .unwrap_or_else(|| panic!("a {phase} child the case does not expect"));
+            assert_eq!(phase, want);
+            run
+        });
+        assert!(
+            script.next().is_none(),
+            "a child the case expected did not run"
+        );
+        (got, asked)
+    }
+
+    /// An answer with one 4:4:4-capable hardware cell, on top of what needs no
+    /// driver, so a `444` child follows.
+    fn nvenc_caps() -> AgentCaps {
+        let mut caps = compute_caps(false, false);
+        caps.video_cells.push(VideoCell::new(
+            VideoCodec::Hevc,
+            VideoBackend::Nvenc,
+            &[ChromaFormat::Yuv420],
+            true,
+        ));
+        caps
+    }
+
+    fn ran_clean(stdout: String) -> child::Run {
+        child::Run {
+            ending: child::Ending::Clean,
+            stdout,
+            cut_off: false,
+            elapsed: secs(4),
+        }
+    }
+
+    fn report_of(caps: AgentCaps) -> child::Run {
+        let report = child::ProbeReport {
+            caps,
+            vp9_qsv_idr: None,
+            gpu_input: Vec::new(),
+        };
+        ran_clean(format!(
+            "{}{}\n",
+            child::MARKER,
+            serde_json::to_string(&report).unwrap()
+        ))
+    }
+
+    fn answer_444(names: &[&str]) -> child::Run {
+        ran_clean(format!(
+            "{}{}\n",
+            child::MARKER_444,
+            serde_json::to_string(names).unwrap()
+        ))
+    }
+
+    fn hung_blind() -> child::Run {
+        child::Run {
+            ending: child::Ending::Hung { gone: true },
+            stdout: String::new(),
+            cut_off: false,
+            elapsed: secs(60),
+        }
+    }
+
+    fn hung_in_444() -> child::Run {
+        base_hung_in("hevc_nvenc:yuv444")
+    }
+
+    fn mf_cells() -> Vec<String> {
+        child::MF_IN_THE_DAEMON
+            .iter()
+            .map(|n| format!("{n}:yuv420"))
+            .collect()
+    }
+
+    fn names(list: &[LearnedDeny]) -> Vec<String> {
+        list.iter().map(|d| d.cell.clone()).collect()
+    }
+
+    /// The table's first row: a report from every child it asked. The next probe
+    /// has nothing to add, so this arms nothing.
+    #[test]
+    fn a_report_from_every_child_it_asked_is_an_answer() {
+        let _fixture = probe_fixture();
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(report_of(nvenc_caps()))),
+                ("444", Some(answer_444(&["hevc_nvenc"]))),
+            ],
+        );
+        assert_eq!(got.short, None);
+        assert!(!got.unanswered && !got.stopped);
+        let report = got.report.expect("a report");
+        assert!(
+            forms_of(&report.caps, &report.gpu_input).contains_key("hevc_nvenc:yuv444"),
+            "the 4:4:4 child's answer is folded in"
+        );
+    }
+
+    /// A blind hang costs one run and no cell, so the report after it is complete.
+    #[test]
+    fn a_blind_hang_and_then_a_report_lost_nothing() {
+        let _fixture = probe_fixture();
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(hung_blind())),
+                ("base", Some(base_reported())),
+            ],
+        );
+        assert!(got.report.is_some());
+        assert_eq!(got.short, None);
+    }
+
+    /// The pipe ended and nothing was on it, so time has nothing to do with it. A
+    /// test binary spawned as `caps-probe` ends this way in every integration test,
+    /// so this also says those arm nothing.
+    #[test]
+    fn a_clean_exit_with_no_report_is_not_time() {
+        let _fixture = probe_fixture();
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(ran_clean(String::new()))),
+                ("software", Some(ran_clean(String::new()))),
+            ],
+        );
+        assert!(got.report.is_none());
+        assert_eq!(got.short, None);
+    }
+
+    /// A fault is an answer: learned, joined to the daemon's list at once, and kept.
+    #[test]
+    fn a_fault_twice_in_one_cell_is_an_answer() {
+        let _fixture = probe_fixture();
+        let cell = "hevc_vulkan:yuv420";
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                (
+                    "base",
+                    Some(base_died_in(cell, "exit code: 0xc0000005", true)),
+                ),
+                (
+                    "base",
+                    Some(base_died_in(cell, "exit code: 0xc0000005", true)),
+                ),
+                ("base", Some(report_of(nvenc_caps()))),
+                ("444", Some(answer_444(&[]))),
+            ],
+        );
+        assert_eq!(got.short, None);
+        assert_eq!(names(&got.learned), [cell]);
+        assert!(got.learned[0].confirmed && !got.learned[0].timed_out);
+        assert_eq!(names(&cells::learned()), [cell]);
+        let report = got.report.expect("a report");
+        assert_eq!(
+            why_not_cached(&report.caps, &got.learned, got.unanswered),
+            None,
+            "this is what the cache keeps"
+        );
+    }
+
+    /// A kill twice, named or blind, proves too little to keep, and more time would
+    /// not change it.
+    #[test]
+    fn any_other_death_twice_is_not_time() {
+        let _fixture = probe_fixture();
+        let cell = "hevc_nvenc:yuv420";
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(base_died_in(cell, "signal: 9", false))),
+                ("base", Some(base_died_in(cell, "signal: 9", false))),
+                ("base", Some(base_reported())),
+            ],
+        );
+        assert_eq!(got.short, None);
+        assert_eq!(names(&got.learned), [cell]);
+        assert!(!got.learned[0].confirmed && !got.learned[0].timed_out);
+
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(base_died_blind("signal: 9"))),
+                ("base", Some(base_died_blind("signal: 9"))),
+                ("software", Some(base_reported())),
+            ],
+        );
+        assert!(got.report.is_some());
+        assert_eq!(got.short, None);
+    }
+
+    #[test]
+    fn a_child_that_could_not_be_spawned_is_not_time() {
+        let _fixture = probe_fixture();
+        let (got, _) = probe_scripted(&a_first_probe(), vec![("base", None), ("software", None)]);
+        assert!(got.report.is_none());
+        assert_eq!(got.short, None);
+    }
+
+    #[test]
+    fn a_hang_in_a_named_cell_is_short_by_that_cell() {
+        let _fixture = probe_fixture();
+        let cell = "hevc_nvenc:yuv420";
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(base_hung_in(cell))),
+                ("base", Some(base_reported())),
+            ],
+        );
+        assert!(got.report.is_some());
+        assert_eq!(
+            got.short,
+            Some(child::Shortfall {
+                base: false,
+                cells: vec![cell.to_string()],
+                forms: false,
+            })
+        );
+        assert!(got.learned[0].timed_out && !got.learned[0].confirmed);
+    }
+
+    /// `base` gave up, and time is why: its runs hung, or one was cut off, or it
+    /// spent its budget. What stands is the software child's answer.
+    #[test]
+    fn base_giving_up_for_want_of_time_is_short_of_everything() {
+        let _fixture = probe_fixture();
+        let short = |got: &child::Probed| got.short.as_ref().is_some_and(|s| s.base);
+
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(hung_blind())),
+                ("base", Some(hung_blind())),
+                ("software", Some(base_reported())),
+            ],
+        );
+        assert!(got.report.is_some() && short(&got), "two blind hangs");
+
+        let cut_off = child::Run {
+            cut_off: true,
+            ..ran_clean(String::new())
+        };
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![("base", Some(cut_off)), ("software", Some(base_reported()))],
+        );
+        assert!(short(&got), "a report lost to the bound on the read");
+
+        // Past its budget with nothing hung: the first death is already too late.
+        let spent = child::Try {
+            bounds: child::Bounds {
+                base_budget: Duration::ZERO,
+                ..child::Bounds::FIRST
+            },
+            ..a_first_probe()
+        };
+        let (got, _) = probe_scripted(
+            &spent,
+            vec![
+                (
+                    "base",
+                    Some(base_died_in("hevc_nvenc:yuv420", "signal: 9", false)),
+                ),
+                ("software", Some(base_reported())),
+            ],
+        );
+        assert!(short(&got), "the budget ran out");
+
+        // A later try leaves the answer in force alone: no software child.
+        let (got, _) = probe_scripted(
+            &a_later_try(Vec::new()),
+            vec![("base", Some(hung_blind())), ("base", Some(hung_blind()))],
+        );
+        assert!(got.report.is_none() && short(&got));
+    }
+
+    /// A `444` child that ran out of time costs those forms, and they are worth
+    /// another try. The report stands.
+    #[test]
+    fn a_444_child_out_of_time_is_short_by_those_forms() {
+        let _fixture = probe_fixture();
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(report_of(nvenc_caps()))),
+                ("444", Some(hung_in_444())),
+            ],
+        );
+        assert!(got.report.is_some());
+        assert!(got.unanswered, "and it must not be cached");
+        assert_eq!(
+            got.short,
+            Some(child::Shortfall {
+                base: false,
+                cells: vec!["hevc_nvenc:yuv444".to_string()],
+                forms: true,
+            })
+        );
+
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(report_of(nvenc_caps()))),
+                (
+                    "444",
+                    Some(child::Run {
+                        cut_off: true,
+                        ..ran_clean(String::new())
+                    }),
+                ),
+            ],
+        );
+        assert!(got.unanswered);
+        assert_eq!(
+            got.short,
+            Some(child::Shortfall {
+                base: false,
+                cells: Vec::new(),
+                forms: true,
+            }),
+            "cut off, with no form to name"
+        );
+    }
+
+    /// The same four lines for the `gpu` child, where a build can reach them.
+    #[cfg(all(
+        target_os = "windows",
+        feature = "ffmpeg-encoder",
+        any(feature = "mf-encoder", feature = "wgc-capture")
+    ))]
+    #[test]
+    fn a_gpu_child_out_of_time_is_short_by_those_forms() {
+        use tunnel_core::env::test_env::set;
+        let _fixture = probe_fixture();
+        // SAFETY: serialised by DENY_ENV_LOCK; the fixture restores it.
+        unsafe { set("ZERO_COPY", "1") };
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(report_of(nvenc_caps()))),
+                ("444", Some(answer_444(&[]))),
+                ("gpu", Some(base_hung_in("hevc_nvenc:gpu"))),
+            ],
+        );
+        assert!(got.unanswered);
+        assert_eq!(
+            got.short,
+            Some(child::Shortfall {
+                base: false,
+                cells: vec!["hevc_nvenc:gpu".to_string()],
+                forms: true,
+            })
+        );
+
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(report_of(nvenc_caps()))),
+                ("444", Some(answer_444(&[]))),
+                (
+                    "gpu",
+                    Some(child::Run {
+                        ending: child::Ending::Hung { gone: true },
+                        ..ran_clean(format!("{}[\"hevc_nvenc\"]\n", child::MARKER_GPU))
+                    }),
+                ),
+            ],
+        );
+        assert_eq!(got.short, None, "it printed its answer before it hung");
+        assert!(!got.unanswered);
+        assert_eq!(got.report.expect("a report").gpu_input, ["hevc_nvenc"]);
+    }
+
+    /// The second review's gap: an OOM kill, an EDR's terminate or a failed spawn
+    /// says nothing about the host, so it must not freeze the 4:2:0 answer for a
+    /// week. A fault's death does, and costs the forms it always cost. None of
+    /// these is short of time, so none is worth a try.
+    #[test]
+    fn only_a_faults_death_lets_a_444_gap_into_the_cache() {
+        let _fixture = probe_fixture();
+        let run_444 = |run: Option<child::Run>| {
+            probe_scripted(
+                &a_first_probe(),
+                vec![("base", Some(report_of(nvenc_caps()))), ("444", run)],
+            )
+            .0
+        };
+        let got = run_444(Some(base_died_in(
+            "hevc_nvenc:yuv444",
+            "exit code: 0xc0000005",
+            true,
+        )));
+        assert!(!got.unanswered && got.short.is_none());
+
+        for lost in [
+            Some(base_died_in("hevc_nvenc:yuv444", "signal: 9", false)),
+            Some(ran_clean(String::new())),
+            None,
+        ] {
+            let got = run_444(lost);
+            assert!(got.unanswered);
+            assert_eq!(got.short, None);
+            let report = got.report.expect("the 4:2:0 matrix stands");
+            assert!(why_not_cached(&report.caps, &got.learned, got.unanswered).is_some());
+        }
+    }
+
+    /// The second review's gap: `base` honours a report from a child that then ended
+    /// badly, and so do these. A child that prints its answer and hangs in its exit
+    /// is the one way a host could never cache.
+    #[test]
+    fn a_444_answer_stands_however_the_child_ended() {
+        let _fixture = probe_fixture();
+        for ending in [
+            child::Ending::Hung { gone: true },
+            child::Ending::Died {
+                status: "exit code: 0xc0000005".to_string(),
+                fault: true,
+            },
+        ] {
+            let (got, _) = probe_scripted(
+                &a_first_probe(),
+                vec![
+                    ("base", Some(report_of(nvenc_caps()))),
+                    (
+                        "444",
+                        Some(child::Run {
+                            ending,
+                            ..answer_444(&["hevc_nvenc"])
+                        }),
+                    ),
+                ],
+            );
+            assert_eq!(got.short, None);
+            assert!(!got.unanswered);
+            let report = got.report.expect("a report");
+            assert!(forms_of(&report.caps, &[]).contains_key("hevc_nvenc:yuv444"));
+        }
+
+        // Learning off is what came before: only a clean exit's word counts.
+        let (got, _) = {
+            let mut script = vec![
+                report_of(nvenc_caps()),
+                child::Run {
+                    ending: child::Ending::Hung { gone: true },
+                    ..answer_444(&["hevc_nvenc"])
+                },
+            ]
+            .into_iter();
+            let this = a_first_probe();
+            (child::probe_with(&this, false, |_, _| script.next()), ())
+        };
+        let report = got.report.expect("a report");
+        assert!(!forms_of(&report.caps, &[]).contains_key("hevc_nvenc:yuv444"));
+    }
+
+    /// The second review's gap: the deny fired only from a `base` child that left
+    /// no report. A driver stuck in the kernel is as stuck whichever child found it.
+    #[test]
+    fn a_child_stuck_anywhere_keeps_the_daemon_out_of_media_foundation() {
+        let _fixture = probe_fixture();
+        let stuck = |stdout: String| child::Run {
+            ending: child::Ending::Hung { gone: false },
+            stdout,
+            cut_off: true,
+            elapsed: secs(70),
+        };
+
+        // `base`, after it reported: the report stands.
+        let reported = report_of(compute_caps(false, false)).stdout;
+        let (got, _) = probe_scripted(&a_first_probe(), vec![("base", Some(stuck(reported)))]);
+        assert!(got.report.is_some());
+        assert_eq!(names(&got.learned), mf_cells());
+
+        // A `444` child.
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(report_of(nvenc_caps()))),
+                ("444", Some(stuck(String::new()))),
+            ],
+        );
+        assert_eq!(names(&got.learned), mf_cells());
+
+        // The software child.
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(ran_clean(String::new()))),
+                ("software", Some(stuck(String::new()))),
+            ],
+        );
+        assert_eq!(names(&got.learned), mf_cells());
+    }
+
+    /// A child stuck after the report: the answer stops offering what a session is
+    /// now refused, or an RTP session would bind to a codec nothing can open. A
+    /// codec another cell still offers stays.
+    #[cfg(windows)]
+    #[test]
+    fn a_child_stuck_after_the_report_withdraws_media_foundation() {
+        let _fixture = probe_fixture();
+        let mut caps = nvenc_caps();
+        caps.video_cells.push(VideoCell::new(
+            VideoCodec::Av1,
+            VideoBackend::MediaFoundation,
+            &[ChromaFormat::Yuv420],
+            true,
+        ));
+        caps.video_cells.push(VideoCell::new(
+            VideoCodec::Hevc,
+            VideoBackend::MediaFoundation,
+            &[ChromaFormat::Yuv420],
+            true,
+        ));
+        caps.codecs = vec!["h265".to_string(), "av1".to_string()];
+        caps.hw_encoders = vec!["mf-av1-hw".to_string(), "ffmpeg-hevc_nvenc".to_string()];
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(report_of(caps))),
+                ("444", Some(base_stuck_in("hevc_nvenc:yuv444"))),
+            ],
+        );
+        let report = got.report.expect("the report stands");
+        assert!(
+            !report
+                .caps
+                .video_cells
+                .iter()
+                .any(|c| c.backend == VideoBackend::MediaFoundation.wire()),
+            "{:?}",
+            report.caps.video_cells
+        );
+        assert_eq!(report.caps.codecs, ["h265"], "FFmpeg's cell keeps HEVC");
+        assert_eq!(report.caps.hw_encoders, ["ffmpeg-hevc_nvenc"]);
+    }
+
+    /// A session asked: the probe ends where it is, and it starts nothing further.
+    #[test]
+    fn a_session_stops_a_probe_where_it_is() {
+        let _fixture = probe_fixture();
+        let stopped = |gone| child::Run {
+            ending: child::Ending::Stopped { gone },
+            stdout: String::new(),
+            cut_off: false,
+            elapsed: secs(1),
+        };
+        let (got, _) = probe_scripted(
+            &a_later_try(Vec::new()),
+            vec![("base", Some(stopped(true)))],
+        );
+        assert!(got.stopped && got.report.is_none() && got.short.is_none());
+        assert!(got.learned.is_empty());
+
+        let (got, _) = probe_scripted(
+            &a_later_try(Vec::new()),
+            vec![
+                ("base", Some(report_of(nvenc_caps()))),
+                ("444", Some(stopped(true))),
+            ],
+        );
+        assert!(
+            got.stopped && got.report.is_none(),
+            "half a try is no answer"
+        );
+
+        // One that would not die is still stuck, and the session is on its way.
+        let (got, _) = probe_scripted(
+            &a_later_try(Vec::new()),
+            vec![("base", Some(stopped(false)))],
+        );
+        assert!(got.stopped);
+        assert_eq!(names(&got.learned), mf_cells());
+    }
+
+    /// The wait itself: `stop` ends it, and the child is told to die.
+    #[test]
+    fn a_stop_ends_the_wait_and_the_child() {
+        let (child, _job) = stand_in(STAND_IN_WIN, STAND_IN_UNIX);
+        let started = std::time::Instant::now();
+        let stop = || started.elapsed() > std::time::Duration::from_millis(300);
+        let (waited, _) = child::wait_for_child(
+            child,
+            std::time::Duration::from_secs(60),
+            STAND_IN_KILL,
+            &stop,
+            |c| {
+                let _ = c.kill();
+            },
+        );
+        assert!(
+            matches!(waited, child::Waited::Stopped { gone: true }),
+            "{waited:?}"
+        );
+        assert!(
+            started.elapsed() < STAND_IN_HELD,
+            "waited for the child: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// What holds a try back, and stops the table's clock.
+    #[test]
+    fn a_leftover_child_or_a_session_holds_a_try_back() {
+        assert!(quiet(0, false, None));
+        assert!(!quiet(1, false, None), "a child is still stuck");
+        assert!(!quiet(0, true, None), "a session is live");
+        assert!(!quiet(0, false, Some(secs(59))), "a session just asked");
+        assert!(quiet(0, false, Some(secs(60))));
+    }
+
+    /// The clock stops, and a session that just ended still owes a try a minute,
+    /// even when it asked long ago.
+    #[test]
+    fn a_try_owes_a_minute_after_anything_that_held_it_back() {
+        assert_eq!(after_a_look(secs(600), true), secs(599));
+        assert_eq!(after_a_look(secs(1), true), secs(0));
+        assert_eq!(after_a_look(secs(600), false), secs(600), "the clock stops");
+        assert_eq!(
+            after_a_look(secs(1), false),
+            QUIET_AFTER_ASK,
+            "a try a session stopped owes nothing else, so this is its whole wait"
+        );
+        // A long session asks once, then ends: the look after it counts the minute
+        // from there, though `quiet` is already true.
+        let mut owed = secs(1);
+        owed = after_a_look(owed, quiet(0, true, Some(secs(3600))));
+        for _ in 0..59 {
+            owed = after_a_look(owed, quiet(0, false, Some(secs(3600))));
+            assert!(!owed.is_zero());
+        }
+        owed = after_a_look(owed, quiet(0, false, Some(secs(3600))));
+        assert!(owed.is_zero());
+    }
+
+    /// A later try's own stuck child ends it: only one child is scripted in each
+    /// case, so a second one fails it. It reads as short of time, because what is
+    /// missing is missing for want of it.
+    #[test]
+    fn a_later_try_starts_nothing_after_its_own_child_stuck() {
+        let _fixture = probe_fixture();
+        let stuck = |stdout: String| child::Run {
+            ending: child::Ending::Hung { gone: false },
+            stdout,
+            cut_off: false,
+            elapsed: secs(120),
+        };
+
+        let (got, asked) = probe_scripted(
+            &a_later_try(Vec::new()),
+            vec![("base", Some(stuck(String::new())))],
+        );
+        assert_eq!(asked.len(), 1);
+        assert!(got.report.is_none() && !got.stopped);
+        let short = got.short.expect("a stuck child is out of time");
+        assert!(short.base);
+        assert_eq!(short.cells, mf_cells());
+
+        // Its report stands, as a first probe's does, and no `444` child follows it.
+        let printed = report_of(nvenc_caps()).stdout;
+        let (got, asked) = probe_scripted(
+            &a_later_try(Vec::new()),
+            vec![("base", Some(stuck(printed)))],
+        );
+        assert_eq!(asked.len(), 1);
+        assert!(got.report.is_some());
+        assert_eq!(names(&got.learned), mf_cells());
+
+        // A first probe has nothing to fall back on, so it goes on to ask.
+        let (got, asked) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(stuck(String::new()))),
+                ("base", Some(report_of(nvenc_caps()))),
+                ("444", Some(answer_444(&[]))),
+            ],
+        );
+        assert_eq!(asked.len(), 3);
+        assert!(got.report.is_some());
+    }
+
+    /// A deny for want of time comes off a try's list, and nothing else does.
+    #[test]
+    fn a_faults_deny_stays_on_every_trys_list() {
+        let deny = |cell: &str, confirmed, timed_out| LearnedDeny {
+            cell: cell.to_string(),
+            why: "x".to_string(),
+            confirmed,
+            timed_out,
+        };
+        let list = vec![
+            deny("a_fault:yuv420", true, false),
+            deny("a_double_kill:yuv420", false, false),
+            deny("a_hang:yuv420", false, true),
+            deny("h264_mf:yuv420", false, true),
+        ];
+        assert_eq!(
+            names(&list_for_a_try(&list)),
+            ["a_fault:yuv420", "a_double_kill:yuv420"]
+        );
+    }
+
+    /// A fault a try finds is in force at once, whatever becomes of that try.
+    #[test]
+    fn a_fault_found_by_a_try_joins_the_daemons_list_at_once() {
+        let _fixture = probe_fixture();
+        let cell = "hevc_nvenc:yuv420";
+        let (got, _) = probe_scripted(
+            &a_later_try(Vec::new()),
+            vec![
+                (
+                    "base",
+                    Some(base_died_in(cell, "exit code: 0xc0000005", true)),
+                ),
+                (
+                    "base",
+                    Some(base_died_in(cell, "exit code: 0xc0000005", true)),
+                ),
+                ("base", Some(hung_blind())),
+                ("base", Some(hung_blind())),
+            ],
+        );
+        assert!(got.report.is_none(), "this try has no answer to adopt");
+        assert_eq!(names(&cells::learned()), [cell]);
+        assert!(
+            cell_denied(&denied_cells(), "hevc_nvenc", ChromaFormat::Yuv420),
+            "a session cannot open it now"
+        );
+        assert_eq!(names(&list_for_a_try(&cells::learned())), [cell]);
+    }
+
+    /// AC5 — the Media Foundation deny comes back through the retry: off the next
+    /// try's list, still on the daemon's while that try tests it, and gone when
+    /// the answer is adopted. A real driver is the field's to show.
+    #[test]
+    fn media_foundation_comes_back_with_no_restart() {
+        let _fixture = probe_fixture();
+        let (first, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(base_stuck_in("hevc_nvenc:yuv420"))),
+                ("base", Some(base_reported())),
+            ],
+        );
+        cells::install_learned(first.learned.clone());
+        let in_force = |name: &str| cell_denied(&denied_cells(), name, ChromaFormat::Yuv420);
+        assert_eq!(in_force(cells::MF_H264), cfg!(windows));
+
+        let seed = list_for_a_try(&cells::learned());
+        assert!(seed.is_empty(), "both were only for want of time: {seed:?}");
+        let (got, asked) =
+            probe_scripted(&a_later_try(seed), vec![("base", Some(base_reported()))]);
+        assert!(asked[0].is_empty(), "the child may open them");
+        assert_eq!(
+            in_force(cells::MF_H264),
+            cfg!(windows),
+            "and a session still may not, until an answer is adopted"
+        );
+        assert_eq!(got.short, None);
+        assert!(
+            weigh(
+                &compute_caps(false, false),
+                &[],
+                &first.short.clone().expect("short"),
+                &got
+            )
+            .adopt
+        );
+        cells::install_learned(got.learned);
+        assert!(!in_force(cells::MF_H264));
+    }
+
+    fn with_cells(list: &[(VideoCodec, VideoBackend)]) -> AgentCaps {
+        AgentCaps {
+            video_cells: list
+                .iter()
+                .map(|(codec, backend)| {
+                    VideoCell::new(*codec, *backend, &[ChromaFormat::Yuv420], true)
+                })
+                .collect(),
+            ..AgentCaps::default()
+        }
+    }
+
+    fn got_with(caps: Option<AgentCaps>, short: Option<child::Shortfall>) -> child::Probed {
+        child::Probed {
+            report: caps.map(|caps| child::ProbeReport {
+                caps,
+                vp9_qsv_idr: None,
+                gpu_input: Vec::new(),
+            }),
+            learned: Vec::new(),
+            short,
+            unanswered: false,
+            stopped: false,
+        }
+    }
+
+    const NVENC: (VideoCodec, VideoBackend) = (VideoCodec::Hevc, VideoBackend::Nvenc);
+    const QSV: (VideoCodec, VideoBackend) = (VideoCodec::H264, VideoBackend::Qsv);
+    const AMF: (VideoCodec, VideoBackend) = (VideoCodec::H264, VideoBackend::Amf);
+
+    fn short_by(cells: &[&str]) -> child::Shortfall {
+        child::Shortfall {
+            base: false,
+            cells: cells.iter().map(|c| c.to_string()).collect(),
+            forms: false,
+        }
+    }
+
+    /// The normal end: an answer with no shortfall, adopted, and no more tries.
+    #[test]
+    fn a_complete_answer_is_adopted_and_ends_the_climb() {
+        let verdict = weigh(
+            &with_cells(&[QSV]),
+            &[],
+            &short_by(&["hevc_nvenc:yuv420"]),
+            &got_with(Some(with_cells(&[QSV, NVENC])), None),
+        );
+        assert_eq!(
+            verdict,
+            Verdict {
+                adopt: true,
+                next: Next::End("it answered"),
+            }
+        );
+    }
+
+    /// A complete answer with the same forms still replaces the one in force: it is
+    /// what takes the word and the denies for want of time away.
+    #[test]
+    fn a_complete_answer_with_the_same_cells_is_adopted() {
+        let verdict = weigh(
+            &with_cells(&[QSV]),
+            &[],
+            &child::Shortfall::default(),
+            &got_with(Some(with_cells(&[QSV])), None),
+        );
+        assert!(verdict.adopt);
+    }
+
+    /// A try cannot take a form from a host. Fewer forms, and more forms that leave
+    /// one out, are both dropped, GPU-input forms included.
+    #[test]
+    fn a_try_never_takes_a_cell() {
+        let last = child::Shortfall::default();
+        let complete_but_smaller = weigh(
+            &with_cells(&[QSV, NVENC]),
+            &[],
+            &last,
+            &got_with(Some(with_cells(&[QSV])), None),
+        );
+        assert_eq!(
+            complete_but_smaller,
+            Verdict {
+                adopt: false,
+                next: Next::Climb(last.clone()),
+            }
+        );
+
+        let more_but_not_the_same = weigh(
+            &with_cells(&[NVENC]),
+            &[],
+            &last,
+            &got_with(Some(with_cells(&[QSV, AMF])), Some(short_by(&["x:yuv420"]))),
+        );
+        assert!(!more_but_not_the_same.adopt);
+
+        let lost_a_gpu_form = weigh(
+            &with_cells(&[QSV]),
+            &["h264_qsv".to_string()],
+            &last,
+            &got_with(Some(with_cells(&[QSV])), None),
+        );
+        assert!(!lost_a_gpu_form.adopt);
+    }
+
+    /// Still short, but with more than is in force: a host gets what it has found
+    /// so far, and the climb goes on.
+    #[test]
+    fn a_short_answer_with_more_cells_is_adopted_and_climbs() {
+        let now = short_by(&["av1_nvenc:yuv420"]);
+        let verdict = weigh(
+            &with_cells(&[QSV]),
+            &[],
+            &short_by(&["hevc_nvenc:yuv420"]),
+            &got_with(Some(with_cells(&[QSV, NVENC])), Some(now.clone())),
+        );
+        assert_eq!(
+            verdict,
+            Verdict {
+                adopt: true,
+                next: Next::Climb(now),
+            }
+        );
+
+        // With nothing new it waits for a better one.
+        let same = weigh(
+            &with_cells(&[QSV]),
+            &[],
+            &short_by(&["hevc_nvenc:yuv420"]),
+            &got_with(Some(with_cells(&[QSV])), Some(short_by(&["other:yuv420"]))),
+        );
+        assert!(!same.adopt);
+        assert!(matches!(same.next, Next::Climb(_)));
+    }
+
+    /// A try that ends short for a reason other than time has nothing more to learn
+    /// from time.
+    #[test]
+    fn a_try_short_for_another_reason_ends_the_climb() {
+        let verdict = weigh(
+            &with_cells(&[QSV]),
+            &[],
+            &child::Shortfall {
+                base: true,
+                ..Default::default()
+            },
+            &got_with(None, None),
+        );
+        assert_eq!(
+            verdict,
+            Verdict {
+                adopt: false,
+                next: Next::End("it left no answer, and not for want of time"),
+            }
+        );
+    }
+
+    /// The signature of a real hang: the same cell, with more time. Another try
+    /// could hold the GPU for minutes on a host someone may be using.
+    #[test]
+    fn the_same_cell_out_of_time_again_ends_the_climb() {
+        let cell = "hevc_nvenc:yuv420";
+        let verdict = weigh(
+            &with_cells(&[QSV]),
+            &[],
+            &short_by(&[cell]),
+            &got_with(Some(with_cells(&[QSV])), Some(short_by(&[cell]))),
+        );
+        assert_eq!(
+            verdict.next,
+            Next::End("the same cell ran out of time again, with more of it")
+        );
+        assert!(!verdict.adopt);
+
+        // A blind hang has no cell to repeat, and goes on up the table.
+        let blind = child::Shortfall {
+            base: true,
+            ..Default::default()
+        };
+        let verdict = weigh(
+            &with_cells(&[QSV]),
+            &[],
+            &blind,
+            &got_with(None, Some(blind.clone())),
+        );
+        assert_eq!(verdict.next, Next::Climb(blind));
+    }
+
+    /// A session stopped it, or went live before it could go in: nothing it found
+    /// counts, whatever it holds.
+    #[test]
+    fn an_answer_waits_for_a_live_session_and_a_stopped_try_is_lost() {
+        let got = child::Probed {
+            stopped: true,
+            ..got_with(Some(with_cells(&[QSV, NVENC])), None)
+        };
+        assert_eq!(
+            weigh(&with_cells(&[QSV]), &[], &child::Shortfall::default(), &got),
+            Verdict {
+                adopt: false,
+                next: Next::Again,
+            }
+        );
+    }
+
+    /// A try a session stopped is not counted: the same row, owing only quiet.
+    #[test]
+    fn a_stopped_try_runs_the_same_row_again() {
+        let mut waits = Vec::new();
+        let mut rows = Vec::new();
+        let mut script = vec![
+            Next::Again,
+            Next::Again,
+            Next::Climb(child::Shortfall::default()),
+            Next::End("done"),
+        ]
+        .into_iter();
+        let why = climb(
+            child::Shortfall::default(),
+            |owed| waits.push(owed),
+            |row, _| {
+                rows.push(row);
+                script.next().expect("a try the case does not expect")
+            },
+        );
+        assert_eq!(why, "done");
+        assert_eq!(rows, [0, 0, 0, 1]);
+        assert_eq!(
+            waits,
+            [
+                LADDER[0].wait,
+                Duration::ZERO,
+                Duration::ZERO,
+                LADDER[1].wait
+            ]
+        );
+    }
+
+    /// Five tries and no more, each told what the last was short by, each with at
+    /// least as long as the one before.
+    #[test]
+    fn the_climb_ends_at_the_end_of_the_table() {
+        let mut seen = Vec::new();
+        let short = |n: usize| short_by(&[format!("try{n}:yuv420").as_str()]);
+        let why = climb(
+            short(0),
+            |_| {},
+            |row, last| {
+                seen.push(last.clone());
+                Next::Climb(short(row + 1))
+            },
+        );
+        assert_eq!(why, "the end of the table");
+        assert_eq!(seen, (0..LADDER.len()).map(short).collect::<Vec<_>>());
+
+        assert_eq!(LADDER.len(), 5);
+        assert!(LADDER[0].bounds.child > child::Bounds::FIRST.child);
+        assert!(LADDER[0].bounds.kill_wait > child::Bounds::FIRST.kill_wait);
+        assert!(LADDER[0].bounds.base_budget > child::Bounds::FIRST.base_budget);
+        for pair in LADDER.windows(2) {
+            assert!(pair[1].wait > pair[0].wait);
+            assert!(pair[1].bounds.child >= pair[0].bounds.child);
+            assert!(pair[1].bounds.kill_wait >= pair[0].bounds.kill_wait);
+            assert!(pair[1].bounds.base_budget >= pair[0].bounds.base_budget);
+        }
+    }
+
+    /// The kill switch, read at each try: nothing starts, and no child runs.
+    #[test]
+    fn the_kill_switch_ends_the_climb_before_any_child() {
+        use tunnel_core::env::test_env::set;
+        let _fixture = probe_fixture();
+        assert!(retry_enabled(), "on by default");
+        // SAFETY: serialised by DENY_ENV_LOCK; the fixture restores it.
+        unsafe { set("CAPS_PROBE_RETRY", "0") };
+        assert!(!retry_enabled());
+        assert_eq!(
+            one_try(0, &child::Shortfall::default(), &|| false),
+            Next::End("ROOMLERD_CAPS_PROBE_RETRY is off")
+        );
+    }
+
+    /// A process arms once, however many organizations it serves.
+    #[test]
+    fn the_first_call_takes_the_shortfall() {
+        use tunnel_core::env::test_env::set;
+        let _fixture = probe_fixture();
+        // SAFETY: serialised by DENY_ENV_LOCK; the fixture restores it. Off, so
+        // that nothing starts a thread.
+        unsafe { set("CAPS_PROBE_RETRY", "0") };
+        *FIRST_SHORT.lock().unwrap() = Some(child::Shortfall::default());
+        arm_retry(|| false);
+        assert_eq!(*FIRST_SHORT.lock().unwrap(), None);
+    }
+
+    /// A try's answer takes the cache's gate unchanged: short of time, or with a
+    /// form unanswered, or with no hardware, it is not frozen.
+    #[test]
+    fn a_trys_answer_passes_the_caches_gate_unchanged() {
+        let _fixture = probe_fixture();
+        let (got, _) = probe_scripted(
+            &a_later_try(Vec::new()),
+            vec![
+                ("base", Some(report_of(nvenc_caps()))),
+                ("444", Some(answer_444(&["hevc_nvenc"]))),
+            ],
+        );
+        let report = got.report.expect("a report");
+        assert_eq!(
+            why_not_cached(&report.caps, &got.learned, got.unanswered),
+            None
+        );
+
+        let (got, _) = probe_scripted(
+            &a_later_try(Vec::new()),
+            vec![
+                ("base", Some(base_hung_in("av1_nvenc:yuv420"))),
+                ("base", Some(report_of(nvenc_caps()))),
+                ("444", Some(answer_444(&[]))),
+            ],
+        );
+        let report = got.report.expect("a report");
+        assert!(why_not_cached(&report.caps, &got.learned, got.unanswered).is_some());
+
+        let (got, _) = probe_scripted(
+            &a_later_try(Vec::new()),
+            vec![("base", Some(base_reported()))],
+        );
+        let report = got.report.expect("a report");
+        assert!(why_not_cached(&report.caps, &got.learned, got.unanswered).is_some());
+    }
+
+    /// A host short of time with no cell to name says so, under the key old readers
+    /// already skip, and the word goes when an answer comes.
+    #[test]
+    fn a_host_short_of_time_says_why() {
+        use roomler_ai_remote_control::models::OsKind;
+        let short = child::Shortfall {
+            base: true,
+            ..Default::default()
+        };
+        let first =
+            assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &[], Some(&short));
+        assert_eq!(first.unavailable[LEARNED_WORD].code, SHORT_CODE);
+
+        // A named cell says more than a short answer can.
+        let hung = LearnedDeny {
+            cell: "hevc_nvenc:yuv420".to_string(),
+            why: "hung".to_string(),
+            confirmed: false,
+            timed_out: true,
+        };
+        let named = assigned_by_the_daemon(
+            p0c_caps(),
+            &p0c_facts(OsKind::Windows),
+            std::slice::from_ref(&hung),
+            Some(&short),
+        );
+        assert_eq!(named.unavailable[LEARNED_WORD].code, LEARNED_CODE);
+
+        let gained = adopted_answer(first.clone(), nvenc_caps(), &[], None);
+        assert!(
+            !gained.unavailable.contains_key(LEARNED_WORD),
+            "{:?}",
+            gained.unavailable
+        );
+        let still = adopted_answer(first, nvenc_caps(), &[], Some(&short));
+        assert_eq!(still.unavailable[LEARNED_WORD].code, SHORT_CODE);
+    }
+
+    /// Adopting moves what a probe answers and nothing the daemon says for itself.
+    #[test]
+    fn adopting_moves_only_what_a_probe_answers() {
+        use roomler_ai_remote_control::models::OsKind;
+        let mut in_force =
+            assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &[], None);
+        in_force.files = vec!["the daemon's own".to_string()];
+        in_force.probe_cached = true;
+        let mut answer = nvenc_caps();
+        answer.files = vec!["the child's built-in default".to_string()];
+        answer.codecs = vec!["h265".to_string()];
+        answer.hw_encoders = vec!["ffmpeg-hevc_nvenc".to_string()];
+        answer.transports = vec!["data-channel-hevc".to_string()];
+        answer.hevc_chroma = vec!["yuv420".to_string()];
+        answer.vp9_chroma = "yuv444".to_string();
+        answer.probe_ms = Some(70_000);
+        let want_cells = answer.video_cells.clone();
+
+        let next = adopted_answer(in_force.clone(), answer, &[], None);
+        assert_eq!(next.codecs, ["h265"]);
+        assert_eq!(next.hw_encoders, ["ffmpeg-hevc_nvenc"]);
+        assert_eq!(next.transports, ["data-channel-hevc"]);
+        assert_eq!(next.hevc_chroma, ["yuv420"]);
+        assert_eq!(next.vp9_chroma, "yuv444");
+        assert_eq!(next.video_cells, want_cells);
+        assert_eq!(next.probe_ms, Some(70_000));
+        assert!(!next.probe_cached, "it is not the cache's answer");
+        assert_eq!(next.files, in_force.files, "config-derived words stay");
+        assert_eq!(next.rpc, in_force.rpc);
+        assert_eq!(next.apps, in_force.apps);
+        assert!(next.unavailable.contains_key("sas"), "and honest words");
+    }
+
+    fn a_fault(cell: &str) -> LearnedDeny {
+        LearnedDeny {
+            cell: cell.to_string(),
+            why: "exit code: 0xc0000005".to_string(),
+            confirmed: true,
+            timed_out: false,
+        }
+    }
+
+    fn a_hang(cell: &str) -> LearnedDeny {
+        LearnedDeny {
+            cell: cell.to_string(),
+            why: "hung".to_string(),
+            confirmed: false,
+            timed_out: true,
+        }
+    }
+
+    fn offered(caps: &AgentCaps) -> Vec<String> {
+        caps.video_cells
+            .iter()
+            .flat_map(|c| {
+                c.chroma
+                    .iter()
+                    .map(move |chroma| format!("{}_{}:{chroma}", c.codec, c.backend))
+            })
+            .collect()
+    }
+
+    fn set_in_force(caps: AgentCaps) {
+        *LATE_CAPS.write().unwrap() = Some(caps);
+    }
+
+    fn offered_in_force() -> Vec<String> {
+        offered(&cached().expect("set_in_force first"))
+    }
+
+    fn a_try_that_got(last: &child::Shortfall, got: child::Probed) -> Next {
+        one_try_with(0, last, &|| false, 0, None, |_| got)
+    }
+
+    /// A complete answer that left out a form in force goes back on the table, with
+    /// what the last one was short by: the next one may answer, and a host keeps
+    /// what it has until then. Only an answer that went in ends the climb.
+    #[test]
+    fn a_complete_answer_missing_a_form_climbs_on() {
+        let last = short_by(&["hevc_nvenc:yuv420"]);
+        let verdict = weigh(
+            &with_cells(&[QSV, AMF]),
+            &[],
+            &last,
+            &got_with(Some(with_cells(&[QSV, NVENC])), None),
+        );
+        assert_eq!(
+            verdict,
+            Verdict {
+                adopt: false,
+                next: Next::Climb(last),
+            }
+        );
+    }
+
+    fn hevc_nvenc_faulted() -> child::Run {
+        base_died_in("hevc_nvenc:yuv420", "exit code: 0xc0000005", true)
+    }
+
+    /// A try confirms a fault in a form in force and leaves no answer. That form is
+    /// refused from now on, so the answer in force stops offering it and says why, and
+    /// the next try's answer, which cannot hold it, can still go in.
+    #[test]
+    fn a_fault_on_a_try_with_no_answer_stops_the_offer_and_blocks_nothing() {
+        let _fixture = probe_fixture();
+        let cell = "hevc_nvenc:yuv420";
+        set_in_force(with_cells(&[QSV, NVENC]));
+        let before = generation();
+        let next = one_try_with(0, &short_by(&[]), &|| false, 0, None, |this| {
+            let script = vec![
+                ("base", Some(hevc_nvenc_faulted())),
+                ("base", Some(hevc_nvenc_faulted())),
+                ("base", Some(hung_blind())),
+                ("base", Some(hung_blind())),
+            ];
+            probe_scripted(this, script).0
+        });
+        let short = child::Shortfall {
+            base: true,
+            ..Default::default()
+        };
+        assert_eq!(next, Next::Climb(short));
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420"]);
+        assert!(generation() > before, "every row hears of it within a beat");
+        let word = cached().unwrap().unavailable[LEARNED_WORD].clone();
+        assert_eq!(word.code, LEARNED_CODE);
+        assert!(word.reason.contains(cell), "{}", word.reason);
+
+        let next = one_try_with(0, &short_by(&[]), &|| false, 0, None, |this| {
+            let script = vec![("base", Some(report_of(with_cells(&[QSV, AMF]))))];
+            probe_scripted(this, script).0
+        });
+        assert_eq!(next, Next::End("it answered"));
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420", "h264_amf:yuv420"]);
+        assert_eq!(names(&cells::learned()), [cell]);
+    }
+
+    /// A fault leaves the answer in force when it joins the list, not when the probe
+    /// returns. The rest of a probe can be minutes on the hosts this runs on, and a
+    /// session asking in them must not pick what it will be refused.
+    #[test]
+    fn a_fault_leaves_the_answer_in_force_before_the_next_child() {
+        let _fixture = probe_fixture();
+        set_in_force(with_cells(&[QSV, NVENC]));
+        let before = generation();
+        let mut runs = 0;
+        let got = child::probe_with(&a_later_try(Vec::new()), true, |_, _| {
+            runs += 1;
+            if runs <= 2 {
+                assert_eq!(
+                    offered_in_force(),
+                    ["h264_qsv:yuv420", "hevc_nvenc:yuv420"],
+                    "one death proves nothing"
+                );
+                assert_eq!(generation(), before);
+                return Some(hevc_nvenc_faulted());
+            }
+            assert_eq!(offered_in_force(), ["h264_qsv:yuv420"], "run {runs}");
+            assert!(generation() > before, "every row hears of it within a beat");
+            Some(hung_blind())
+        });
+        assert_eq!(runs, 4);
+        assert!(got.report.is_none());
+    }
+
+    /// The same when no child follows: the fault that spends the last run.
+    #[test]
+    fn a_fault_on_the_last_run_leaves_the_answer_in_force_too() {
+        let _fixture = probe_fixture();
+        set_in_force(with_cells(&[QSV, NVENC]));
+        let died_in = |cell: &str| Some(base_died_in(cell, "exit code: 0xc0000005", true));
+        let mut script = vec![Some(hung_blind())];
+        for cell in ["a_a:yuv420", "b_b:yuv420", "c_c:yuv420"] {
+            script.push(died_in(cell));
+            script.push(died_in(cell));
+        }
+        script.push(Some(hevc_nvenc_faulted()));
+        script.push(Some(hevc_nvenc_faulted()));
+        assert_eq!(script.len(), child::MAX_BASE_RUNS as usize);
+        let script = script.into_iter().map(|run| ("base", run)).collect();
+        let (got, _) = probe_scripted(&a_later_try(Vec::new()), script);
+        assert!(got.report.is_none());
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420"]);
+    }
+
+    /// A first probe is making the answer, so its faults have none to leave.
+    #[test]
+    fn a_first_probes_fault_touches_no_answer_in_force() {
+        let _fixture = probe_fixture();
+        set_in_force(with_cells(&[QSV, NVENC]));
+        let before = generation();
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(hevc_nvenc_faulted())),
+                ("base", Some(hevc_nvenc_faulted())),
+                ("base", Some(report_of(with_cells(&[QSV])))),
+            ],
+        );
+        assert!(got.report.is_some());
+        assert_eq!(names(&cells::learned()), ["hevc_nvenc:yuv420"]);
+        assert_eq!(generation(), before);
+    }
+
+    /// One try finds a fault and then answers for everything else. That answer cannot
+    /// hold what the fault cost and it goes in, because the form has already left the
+    /// answer it is weighed against.
+    #[test]
+    fn a_fault_and_a_complete_answer_in_one_try_go_in_together() {
+        let _fixture = probe_fixture();
+        let cell = "hevc_nvenc:yuv420";
+        set_in_force(with_cells(&[QSV, NVENC]));
+        let next = one_try_with(0, &short_by(&[]), &|| false, 0, None, |this| {
+            let script = vec![
+                ("base", Some(hevc_nvenc_faulted())),
+                ("base", Some(hevc_nvenc_faulted())),
+                ("base", Some(report_of(with_cells(&[QSV, AMF])))),
+            ];
+            probe_scripted(this, script).0
+        });
+        assert_eq!(next, Next::End("it answered"));
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420", "h264_amf:yuv420"]);
+        assert_eq!(names(&cells::learned()), [cell]);
+        assert!(
+            cell_denied(&denied_cells(), "hevc_nvenc", ChromaFormat::Yuv420),
+            "a session cannot open it now"
+        );
+    }
+
+    /// A fault costs the form it was found in. What the same try lost for want of
+    /// time stays: its answer is dropped, not adopted, and not kept for the next start.
+    #[test]
+    fn a_fault_takes_its_own_form_and_no_other() {
+        let _fixture = probe_fixture();
+        let dir = std::env::temp_dir().join(format!("roomler-3280-a-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("caps.json");
+        let _ = std::fs::remove_file(&path);
+        let key = test_cache_key();
+        set_in_force(with_cells(&[QSV, NVENC, AMF]));
+        let next = one_try_with(
+            0,
+            &short_by(&[]),
+            &|| false,
+            0,
+            Some((key, path.clone(), 1)),
+            |this| {
+                let script = vec![
+                    ("base", Some(hevc_nvenc_faulted())),
+                    ("base", Some(hevc_nvenc_faulted())),
+                    ("base", Some(base_hung_in("h264_qsv:yuv420"))),
+                    ("base", Some(report_of(with_cells(&[AMF])))),
+                ];
+                probe_scripted(this, script).0
+            },
+        );
+        assert_eq!(next, Next::Climb(short_by(&["h264_qsv:yuv420"])));
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420", "h264_amf:yuv420"]);
+        assert!(
+            !path.exists(),
+            "a dropped answer is no answer for the cache"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The denylists spell a D3D12 cell as FFmpeg does, and the wire as the vocabulary
+    /// does, and every other cell the same both ways.
+    #[test]
+    fn a_cell_goes_by_the_name_its_encoder_has_on_the_lists() {
+        let of = |codec, backend| {
+            child::list_name(&VideoCell::new(
+                codec,
+                backend,
+                &[ChromaFormat::Yuv420],
+                true,
+            ))
+        };
+        for name in [
+            "hevc_nvenc",
+            "h264_qsv",
+            "av1_amf",
+            "h264_videotoolbox",
+            "hevc_vaapi",
+            "hevc_d3d12va",
+            "av1_vulkan",
+        ] {
+            let (codec, backend) = VideoBackend::from_ffmpeg_name(name).expect(name);
+            assert_eq!(of(codec, backend), name);
+        }
+        assert_eq!(
+            of(VideoCodec::Av1, VideoBackend::MediaFoundation),
+            cells::MF_AV1
+        );
+        assert_eq!(of(VideoCodec::Vp9, VideoBackend::Libvpx), cells::LIBVPX_VP9);
+        let forms = forms_of(&with_cells(&[(VideoCodec::Hevc, VideoBackend::D3d12)]), &[]);
+        assert_eq!(
+            forms.keys().collect::<Vec<_>>(),
+            ["hevc_d3d12va:yuv420"],
+            "an answer's forms, in the same spelling"
+        );
+    }
+
+    /// A fault in a D3D12 cell really takes it, with all that says it is there.
+    #[test]
+    fn a_fault_in_a_d3d12_cell_takes_that_cell() {
+        let mut caps = with_cells(&[QSV, (VideoCodec::Hevc, VideoBackend::D3d12)]);
+        caps.codecs = vec!["h264".into(), "h265".into()];
+        caps.hw_encoders = vec!["ffmpeg-hevc_d3d12va".into()];
+        caps.transports = vec!["data-channel-hevc".into()];
+        caps.hevc_chroma = vec!["yuv420".into()];
+        child::withdraw(&mut caps, &[a_fault("hevc_d3d12va:yuv420")]);
+        assert_eq!(offered(&caps), ["h264_qsv:yuv420"]);
+        assert!(caps.hw_encoders.is_empty(), "{:?}", caps.hw_encoders);
+        assert!(caps.transports.is_empty(), "{:?}", caps.transports);
+        assert!(caps.hevc_chroma.is_empty());
+        assert_eq!(caps.codecs, ["h264"]);
+    }
+
+    /// libvpx opens 4:4:4 first and its 4:2:0 only behind that, so a fault in 4:4:4
+    /// loses the cell, as the next answer would.
+    #[test]
+    fn a_fault_in_libvpxs_first_form_takes_the_cell() {
+        let mut caps = AgentCaps {
+            codecs: vec!["h264".into(), "vp9".into()],
+            hw_encoders: vec!["libvpx-vp9-444-sw".into(), "openh264-sw".into()],
+            transports: vec!["data-channel-vp9-444".into()],
+            vp9_chroma: "yuv444".into(),
+            video_cells: vec![
+                VideoCell::new(
+                    VideoCodec::H264,
+                    VideoBackend::Openh264,
+                    &[ChromaFormat::Yuv420],
+                    false,
+                ),
+                VideoCell::new(
+                    VideoCodec::Vp9,
+                    VideoBackend::Libvpx,
+                    &[ChromaFormat::Yuv420, ChromaFormat::Yuv444],
+                    false,
+                ),
+            ],
+            ..AgentCaps::default()
+        };
+        child::withdraw(&mut caps, &[a_fault("vp9_libvpx:yuv444")]);
+        assert_eq!(offered(&caps), ["h264_openh264:yuv420"]);
+        assert!(caps.transports.is_empty());
+        assert!(caps.vp9_chroma.is_empty());
+        assert_eq!(caps.hw_encoders, ["openh264-sw"]);
+        assert_eq!(caps.codecs, ["h264"]);
+    }
+
+    /// What a confirmed fault costs has to really leave, or no later answer, which
+    /// cannot hold it, is ever adopted, and the climb runs out for nothing.
+    #[test]
+    fn a_later_answer_goes_in_after_a_fault_in_either_of_those() {
+        let d3d12 = VideoCell::new(
+            VideoCodec::Hevc,
+            VideoBackend::D3d12,
+            &[ChromaFormat::Yuv420],
+            true,
+        );
+        let libvpx = VideoCell::new(
+            VideoCodec::Vp9,
+            VideoBackend::Libvpx,
+            &[ChromaFormat::Yuv420, ChromaFormat::Yuv444],
+            false,
+        );
+        for (cell, faulted) in [
+            ("hevc_d3d12va:yuv420", d3d12),
+            ("vp9_libvpx:yuv444", libvpx),
+        ] {
+            let _fixture = probe_fixture();
+            let mut caps = with_cells(&[QSV]);
+            caps.video_cells.push(faulted);
+            set_in_force(caps);
+            let fault = || Some(base_died_in(cell, "exit code: 0xc0000005", true));
+            let next = one_try_with(0, &short_by(&[]), &|| false, 0, None, |this| {
+                let script = vec![
+                    ("base", fault()),
+                    ("base", fault()),
+                    ("base", Some(report_of(with_cells(&[QSV])))),
+                ];
+                probe_scripted(this, script).0
+            });
+            assert_eq!(next, Next::End("it answered"), "{cell}");
+            assert_eq!(offered_in_force(), ["h264_qsv:yuv420"], "{cell}");
+        }
+    }
+
+    /// A session that asked is in no registry until its peer is built, and it may have
+    /// picked a Media Foundation cell it is about to open. Taking that now is no video,
+    /// so the look gives it the minute a try gives it. Past that its offer reads its
+    /// pick again.
+    #[test]
+    fn a_stuck_child_leaves_a_session_that_asked_its_media_foundation() {
+        let _fixture = probe_fixture();
+        let mf = (VideoCodec::Av1, VideoBackend::MediaFoundation);
+        let mut caps = with_cells(&[QSV, mf]);
+        caps.codecs = vec!["h264".to_string(), "av1".to_string()];
+        set_in_force(caps);
+        let before = generation();
+
+        let owed = secs(30);
+        assert_eq!(
+            one_look(owed, 1, false, Some(secs(59))),
+            QUIET_AFTER_ASK,
+            "the clock stops too"
+        );
+        assert!(cells::learned().is_empty(), "{:?}", cells::learned());
+        assert_eq!(generation(), before);
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420", "av1_mf:yuv420"]);
+
+        assert_eq!(one_look(owed, 1, true, Some(secs(600))), QUIET_AFTER_ASK);
+        assert!(cells::learned().is_empty(), "a session is live");
+
+        // A minute on nothing has gone live: that is a person at a prompt, or nobody.
+        assert_eq!(one_look(owed, 1, false, Some(secs(60))), QUIET_AFTER_ASK);
+        assert_eq!(names(&cells::learned()), mf_cells());
+        if cfg!(windows) {
+            assert_eq!(offered_in_force(), ["h264_qsv:yuv420"]);
+            assert!(generation() > before);
+            let browser = ["av1".to_string(), "h264".to_string()];
+            assert_eq!(
+                picks_at_the_offer("av1".into(), None, &browser, &cached().unwrap()),
+                ("h264".to_string(), None),
+                "the pick it made a minute ago went with them"
+            );
+        }
+    }
+
+    /// A pick stands while it is offered, whatever else has changed, and what has gone
+    /// is picked again by the request's rules, in the same spellings.
+    #[test]
+    fn a_pick_stands_until_the_answer_stops_offering_it() {
+        use roomler_ai_remote_control::models::{
+            ChromaFormat, VideoBackend, VideoCell, VideoCodec,
+        };
+        let caps = AgentCaps {
+            codecs: vec!["H265".into(), "h264".into()],
+            transports: vec!["data-channel-h264".into()],
+            video_cells: vec![VideoCell::new(
+                VideoCodec::Hevc,
+                VideoBackend::Qsv,
+                &[ChromaFormat::Yuv420],
+                true,
+            )],
+            ..AgentCaps::default()
+        };
+        let browser: Vec<String> = ["av1", "h265", "h264"].map(String::from).to_vec();
+        let at_offer = |codec: &str, transport: Option<&str>| {
+            picks_at_the_offer(
+                codec.to_string(),
+                transport.map(String::from),
+                &browser,
+                &caps,
+            )
+        };
+        assert_eq!(at_offer("h265", None), ("h265".into(), None));
+        assert_eq!(
+            at_offer("h264", None),
+            ("h264".into(), None),
+            "not the best"
+        );
+        // #3245 — gone from the RTP track's opener, and this browser lists H.264.
+        assert_eq!(at_offer("av1", None), ("h264".into(), None));
+        assert_eq!(
+            at_offer("h264", Some("data-channel-h264")),
+            ("h264".into(), Some("data-channel-h264".into()))
+        );
+        assert_eq!(
+            at_offer("h264", Some("data-channel-av1")),
+            ("h264".into(), None)
+        );
+        // #3245 — a DataChannel pick that lost its pump does not ride onto the RTP
+        // track, though `codecs` still lists it: an FFmpeg AV1 cell lists `av1`.
+        assert_eq!(
+            at_offer("h265", Some("data-channel-hevc")),
+            ("h264".into(), None)
+        );
+        // #3245 — a pick a browser without H.264 took stands while its opener can
+        // open it, and when it cannot, the next it can.
+        let firefox: Vec<String> = ["av1", "h265", "vp8"].map(String::from).to_vec();
+        assert_eq!(
+            picks_at_the_offer("h265".into(), None, &firefox, &caps),
+            ("h265".into(), None)
+        );
+        assert_eq!(
+            picks_at_the_offer("av1".into(), None, &firefox, &caps),
+            ("h265".into(), None)
+        );
+        // Nothing in common leaves what `pick_best_codec` leaves.
+        let none = AgentCaps::default();
+        assert_eq!(
+            picks_at_the_offer("av1".into(), None, &browser, &none),
+            ("h264".into(), None)
+        );
+    }
+
+    /// A first probe's stuck child costs Media Foundation at once, with nothing live to
+    /// touch. A try's waits ([`hold_media_foundation_back`]).
+    #[test]
+    fn only_a_first_probes_stuck_child_takes_media_foundation_at_once() {
+        let _fixture = probe_fixture();
+        child::stuck_reaches_the_daemon(&a_later_try(Vec::new()));
+        assert!(cells::learned().is_empty(), "{:?}", cells::learned());
+        child::stuck_reaches_the_daemon(&a_first_probe());
+        assert_eq!(names(&cells::learned()), mf_cells());
+    }
+
+    /// With no try left the word about a form lost for want of time promises none.
+    #[test]
+    fn a_withdrawal_with_no_try_left_promises_none() {
+        let _fixture = probe_fixture();
+        set_in_force(with_cells(&[QSV, NVENC]));
+        cells::join_learned([a_hang("hevc_nvenc:yuv420")]);
+        let reason = || cached().unwrap().unavailable[LEARNED_WORD].reason.clone();
+        withdraw_refused(true);
+        assert!(reason().contains("a later try"), "{}", reason());
+        withdraw_refused(false);
+        assert!(reason().contains("until the next start"), "{}", reason());
+        assert!(!reason().contains("a later try"), "{}", reason());
+    }
+
+    /// However the table ends, the words stop promising a try, and a child that came
+    /// back costs nothing.
+    #[test]
+    fn the_end_of_the_table_stops_the_promise() {
+        let _fixture = probe_fixture();
+        let short = child::Shortfall {
+            base: true,
+            ..Default::default()
+        };
+        let mf = (VideoCodec::Av1, VideoBackend::MediaFoundation);
+        set_in_force(with_learned_word(with_cells(&[QSV, mf]), &[], Some(&short)));
+        assert!(
+            cached().unwrap().unavailable[LEARNED_WORD]
+                .reason
+                .contains("later try"),
+            "promised, to begin with"
+        );
+        climb_then_close(
+            short,
+            |_| {},
+            |_, _| Next::End("for any reason"),
+            &|| false,
+            &|| 0,
+            Duration::ZERO,
+        );
+        let word = cached().unwrap().unavailable[LEARNED_WORD].clone();
+        assert_eq!(word.code, SHORT_CODE);
+        assert!(!word.reason.contains("later try"), "{}", word.reason);
+        assert!(word.reason.contains("next start"), "{}", word.reason);
+        assert!(cells::learned().is_empty(), "{:?}", cells::learned());
+    }
+
+    /// A stuck child's cost outlives the table. Nothing else is left to look for a
+    /// moment when nothing is live or asking, so this does, and it promises no try.
+    #[test]
+    fn a_stuck_childs_cost_outlives_the_table() {
+        let _fixture = probe_fixture();
+        let mf = (VideoCodec::Av1, VideoBackend::MediaFoundation);
+        set_in_force(with_cells(&[QSV, mf]));
+        let looks = std::sync::atomic::AtomicU32::new(0);
+        climb_then_close(
+            child::Shortfall::default(),
+            |_| {},
+            |_, _| Next::End("for any reason"),
+            &|| looks.fetch_add(1, Ordering::SeqCst) < 2,
+            &|| 1,
+            Duration::ZERO,
+        );
+        assert_eq!(
+            looks.load(Ordering::SeqCst),
+            3,
+            "it went on until nothing was live"
+        );
+        assert_eq!(names(&cells::learned()), mf_cells());
+        if cfg!(windows) {
+            let caps = cached().unwrap();
+            assert_eq!(offered(&caps), ["h264_qsv:yuv420"]);
+            let reason = caps.unavailable[LEARNED_WORD].reason.clone();
+            assert!(reason.contains("until the next start"), "{reason}");
+            assert!(!reason.contains("a later try"), "{reason}");
+        }
+    }
+
+    /// And that look gives a session that asked its minute too.
+    #[test]
+    fn after_the_table_a_session_that_asked_still_has_its_minute() {
+        let _fixture = probe_fixture();
+        set_in_force(with_cells(&[QSV]));
+        let held_for = Duration::from_millis(300);
+        *LAST_ASK.lock().unwrap() = Some(Instant::now() - (QUIET_AFTER_ASK - held_for));
+        let started = Instant::now();
+        climb_then_close(
+            child::Shortfall::default(),
+            |_| {},
+            |_, _| Next::End("for any reason"),
+            &|| false,
+            &|| 1,
+            Duration::from_millis(10),
+        );
+        assert!(started.elapsed() >= held_for - Duration::from_millis(50));
+    }
+
+    /// A try's child that would not die takes Media Foundation as a first probe's
+    /// does, but never from under a live session: its encoder may rebuild at the next
+    /// change of size, and a refusal there is no video. Once nothing is busy the
+    /// cells go, from the list and from what the answer in force offers, and every
+    /// row hears of it.
+    #[test]
+    fn a_stuck_child_leaves_a_live_session_its_media_foundation() {
+        let _fixture = probe_fixture();
+        let mf = (VideoCodec::Av1, VideoBackend::MediaFoundation);
+        let mut caps = with_cells(&[QSV, mf]);
+        caps.codecs = vec!["h264".to_string(), "av1".to_string()];
+        caps.hw_encoders = vec!["mf-av1-hw".to_string()];
+        set_in_force(caps);
+        let before = generation();
+
+        assert!(
+            !hold_media_foundation_back(1, true, true),
+            "a session is live"
+        );
+        assert!(cells::learned().is_empty());
+        assert_eq!(generation(), before);
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420", "av1_mf:yuv420"]);
+
+        assert!(
+            !hold_media_foundation_back(0, false, true),
+            "nothing is stuck"
+        );
+        assert!(cells::learned().is_empty());
+
+        assert!(hold_media_foundation_back(1, false, true));
+        if cfg!(windows) {
+            assert_eq!(names(&cells::learned()), mf_cells());
+            let caps = cached().unwrap();
+            assert_eq!(offered(&caps), ["h264_qsv:yuv420"]);
+            assert_eq!(caps.codecs, ["h264"]);
+            assert!(caps.hw_encoders.is_empty(), "{:?}", caps.hw_encoders);
+            assert!(generation() > before);
+            assert!(
+                caps.unavailable[LEARNED_WORD].reason.contains("av1_mf"),
+                "{:?}",
+                caps.unavailable
+            );
+        }
+    }
+
+    /// An adopted answer's list replaces the daemon's, which is what takes a deny
+    /// for want of time away.
+    #[test]
+    fn adopting_replaces_the_daemons_list() {
+        let _fixture = probe_fixture();
+        let cell = "hevc_nvenc:yuv420";
+        set_in_force(with_cells(&[QSV]));
+        cells::install_learned(vec![a_hang(cell)]);
+        let before = generation();
+        let next = a_try_that_got(
+            &short_by(&[cell]),
+            got_with(Some(with_cells(&[QSV, NVENC])), None),
+        );
+        assert_eq!(next, Next::End("it answered"));
+        assert!(cells::learned().is_empty(), "{:?}", cells::learned());
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420", "hevc_nvenc:yuv420"]);
+        assert!(generation() > before);
+    }
+
+    /// A session that asks while a try runs stops its child, by `stop`, and the try
+    /// is lost even if its answer got out first.
+    #[test]
+    fn a_session_asking_during_a_try_loses_it() {
+        let _fixture = probe_fixture();
+        set_in_force(with_cells(&[QSV]));
+        let before = generation();
+        let next = one_try_with(
+            0,
+            &child::Shortfall::default(),
+            &|| false,
+            0,
+            None,
+            |this| {
+                assert!(!(this.stop)(), "nothing has asked yet");
+                session_asked();
+                assert!((this.stop)(), "told to stop at its next poll");
+                got_with(Some(with_cells(&[QSV, NVENC])), None)
+            },
+        );
+        assert_eq!(next, Next::Again);
+        assert_eq!(generation(), before);
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420"]);
+    }
+
+    /// The same for a session going live, which also never asked on this loop.
+    #[test]
+    fn a_session_going_live_during_a_try_loses_it() {
+        let _fixture = probe_fixture();
+        set_in_force(with_cells(&[QSV]));
+        let is_live = std::sync::atomic::AtomicBool::new(false);
+        let next = one_try_with(
+            0,
+            &child::Shortfall::default(),
+            &|| is_live.load(Ordering::SeqCst),
+            0,
+            None,
+            |this| {
+                assert!(!(this.stop)());
+                is_live.store(true, Ordering::SeqCst);
+                assert!((this.stop)());
+                got_with(Some(with_cells(&[QSV, NVENC])), None)
+            },
+        );
+        assert_eq!(next, Next::Again);
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420"]);
+    }
+
+    /// No child starts beside a stuck one, a live session or one that just asked.
+    #[test]
+    fn nothing_starts_beside_a_stuck_child_a_session_or_an_ask() {
+        let _fixture = probe_fixture();
+        set_in_force(with_cells(&[QSV]));
+        let last = child::Shortfall::default();
+        let no_child = |_: &child::Try| -> child::Probed { panic!("a child started") };
+        assert_eq!(
+            one_try_with(0, &last, &|| false, 1, None, no_child),
+            Next::Again
+        );
+        assert_eq!(
+            one_try_with(0, &last, &|| true, 0, None, no_child),
+            Next::Again
+        );
+        session_asked();
+        assert_eq!(
+            one_try_with(0, &last, &|| false, 0, None, no_child),
+            Next::Again
+        );
+    }
+
+    fn test_cache_key() -> crate::encode::caps_cache::CacheKey {
+        crate::encode::caps_cache::CacheKey {
+            build: "a build".to_string(),
+            hardware: "a host".to_string(),
+            knobs: "no knobs".to_string(),
+        }
+    }
+
+    /// An adopted answer is the next start's cache hit, by the first probe's gate.
+    #[test]
+    fn an_adopted_answer_is_kept_for_the_next_start() {
+        let _fixture = probe_fixture();
+        let dir = std::env::temp_dir().join(format!("roomler-3280-b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("caps.json");
+        let _ = std::fs::remove_file(&path);
+        let key = test_cache_key();
+        let now = crate::encode::caps_cache::now_unix();
+        set_in_force(with_cells(&[QSV]));
+        let next = one_try_with(
+            0,
+            &child::Shortfall::default(),
+            &|| false,
+            0,
+            Some((key.clone(), path.clone(), now)),
+            |_| got_with(Some(with_cells(&[QSV, NVENC])), None),
+        );
+        assert_eq!(next, Next::End("it answered"));
+        let hit = crate::encode::caps_cache::load_matching(&path, &key, now)
+            .unwrap_or_else(|_| panic!("the cache has no hit for it"));
+        assert_eq!(offered(&hit.caps), ["h264_qsv:yuv420", "hevc_nvenc:yuv420"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hardware form that comes back as software has not been kept, under load
+    /// especially. The other way round is a host gaining something.
+    #[test]
+    fn a_hardware_form_turning_software_is_not_kept() {
+        let software = |caps: AgentCaps| AgentCaps {
+            video_cells: caps
+                .video_cells
+                .into_iter()
+                .map(|c| VideoCell { hw: false, ..c })
+                .collect(),
+            ..caps
+        };
+        let last = child::Shortfall::default();
+        let turned = weigh(
+            &with_cells(&[NVENC]),
+            &[],
+            &last,
+            &got_with(Some(software(with_cells(&[NVENC]))), None),
+        );
+        assert!(!turned.adopt);
+        let gained = weigh(
+            &software(with_cells(&[NVENC])),
+            &[],
+            &last,
+            &got_with(Some(with_cells(&[NVENC])), None),
+        );
+        assert!(gained.adopt);
+    }
+
+    /// Withdrawing a form takes everything that says it is there, and nothing else.
+    #[test]
+    fn withdrawing_a_form_takes_what_says_it_is_there() {
+        let cell = |codec, backend, chroma: &[ChromaFormat]| {
+            VideoCell::new(codec, backend, chroma, backend != VideoBackend::Libvpx)
+        };
+        let both = [ChromaFormat::Yuv420, ChromaFormat::Yuv444];
+        let one = [ChromaFormat::Yuv420];
+        let mut caps = AgentCaps {
+            codecs: vec!["h264".into(), "h265".into(), "av1".into()],
+            hw_encoders: vec![
+                "ffmpeg-hevc_nvenc".into(),
+                "mf-av1-hw".into(),
+                "libvpx-vp9-444-sw".into(),
+                "openh264-sw".into(),
+            ],
+            transports: vec!["data-channel-hevc".into(), "data-channel-vp9-444".into()],
+            hevc_chroma: vec!["yuv420".into(), "yuv444".into()],
+            vp9_chroma: "yuv444".into(),
+            video_cells: vec![
+                cell(VideoCodec::H264, VideoBackend::Openh264, &one),
+                cell(VideoCodec::Hevc, VideoBackend::Nvenc, &both),
+                cell(VideoCodec::Hevc, VideoBackend::Qsv, &one),
+                cell(VideoCodec::Av1, VideoBackend::MediaFoundation, &one),
+                cell(VideoCodec::Vp9, VideoBackend::Libvpx, &both),
+            ],
+            ..AgentCaps::default()
+        };
+
+        let untouched = format!("{caps:?}");
+        child::withdraw(&mut caps, &[a_fault("hevc_amf:yuv420")]);
+        assert_eq!(format!("{caps:?}"), untouched, "nothing it offers");
+
+        // A base child opens 4:2:0, and only a cell that has it is asked about 4:4:4.
+        child::withdraw(&mut caps, &[a_fault("hevc_nvenc:yuv420")]);
+        assert!(!offered(&caps).iter().any(|f| f.starts_with("hevc_nvenc")));
+        assert!(!caps.hw_encoders.iter().any(|h| h == "ffmpeg-hevc_nvenc"));
+        assert_eq!(caps.hevc_chroma, ["yuv420"], "only hevc_nvenc says 4:4:4");
+        assert!(caps.codecs.iter().any(|c| c == "h265"), "QSV still has it");
+        assert!(caps.transports.iter().any(|t| t == "data-channel-hevc"));
+
+        child::withdraw(&mut caps, &[a_fault("hevc_qsv:yuv420")]);
+        assert!(!caps.codecs.iter().any(|c| c == "h265"));
+        assert!(!caps.transports.iter().any(|t| t == "data-channel-hevc"));
+        assert!(caps.hevc_chroma.is_empty());
+
+        child::withdraw(&mut caps, &[a_hang("av1_mf:yuv420")]);
+        assert!(!caps.codecs.iter().any(|c| c == "av1"));
+        assert!(!caps.hw_encoders.iter().any(|h| h == "mf-av1-hw"));
+
+        // libvpx opens each form on its own.
+        child::withdraw(&mut caps, &[a_fault("vp9_libvpx:yuv420")]);
+        assert!(offered(&caps).iter().any(|f| f == "vp9_libvpx:yuv444"));
+        assert!(caps.transports.iter().any(|t| t == "data-channel-vp9-444"));
+        assert_eq!(caps.vp9_chroma, "yuv444");
+        child::withdraw(&mut caps, &[a_fault("vp9_libvpx:yuv444")]);
+        assert!(caps.transports.is_empty());
+        assert!(caps.vp9_chroma.is_empty());
+        assert!(!caps.hw_encoders.iter().any(|h| h == "libvpx-vp9-444-sw"));
+        assert!(caps.hw_encoders.iter().any(|h| h == "openh264-sw"));
+        assert_eq!(caps.codecs, ["h264"]);
+    }
+
+    /// When the table is done nothing promises a try any more. A host still short
+    /// says that the next start is what is left, and a host with an answer says nothing.
+    #[test]
+    fn the_words_stop_promising_a_try_when_the_climb_ends() {
+        use roomler_ai_remote_control::models::OsKind;
+        let short = child::Shortfall {
+            base: true,
+            ..Default::default()
+        };
+        let facts = p0c_facts(OsKind::Windows);
+        let first = assigned_by_the_daemon(p0c_caps(), &facts, &[], Some(&short));
+        let over = word_after_the_climb(first, &[]);
+        let word = &over.unavailable[LEARNED_WORD];
+        assert_eq!(word.code, SHORT_CODE);
+        assert!(!word.reason.contains("later try with"), "{}", word.reason);
+        assert!(word.reason.contains("next start"), "{}", word.reason);
+
+        let hung = [a_hang("hevc_nvenc:yuv420")];
+        let named = assigned_by_the_daemon(p0c_caps(), &facts, &hung, Some(&short));
+        let over = word_after_the_climb(named, &hung);
+        let word = &over.unavailable[LEARNED_WORD];
+        assert_eq!(word.code, LEARNED_CODE);
+        assert!(
+            word.reason.contains("until the next start"),
+            "{}",
+            word.reason
+        );
+        assert!(!word.reason.contains("a later try"), "{}", word.reason);
+
+        let answered = assigned_by_the_daemon(p0c_caps(), &facts, &[], None);
+        let over = word_after_the_climb(answered, &[]);
+        assert!(!over.unavailable.contains_key(LEARNED_WORD));
     }
 }

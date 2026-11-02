@@ -37,7 +37,7 @@ what it costs in installer size and ships with integration and e2e tests.
   uid drop used by the portal helper (`capture/portal/mod.rs`); cpal loopback audio + audiopus Opus (`audio/`); the
   consent chain and `PromptKind` (`consent.rs:157`); the config surface (`crates/agent-core/src/config_surface.rs:1159`)
   and LocalAPI `ConfigSet`; the capture-excluded Windows indicator (`indicator/win.rs`); the updater's
-  `decide_defer` (`updater.rs:119`); the files-DC chunk pump (`peer.rs:11062`); `.roomler-partial` staging (`files.rs`).
+  `decide_defer` (`updater.rs:119`); the files-DC chunk pump (`peer.rs:11129`); `.roomler-partial` staging (`files.rs`).
 
 ## Decisions taken with the operator (2026-09-25)
 
@@ -198,7 +198,7 @@ Each refusal carries a named reason on the wire and in the UI.
    RECORD never reaches one.
 3. **Device gate.** `record_remote_enabled` and `record_remote_audio`, both default **OFF**, device-owned and
    **structurally absent from `DesiredConfig`** — a `record_` twin of `no_relay_key_is_server_pushable_via_desired_config`
-   (`crates/remote_control/src/models.rs:5256`). Capabilities are read once at hello, so ON takes effect at the next
+   (`crates/remote_control/src/models.rs:5265`). Capabilities are read once at hello, so ON takes effect at the next
    connect; **OFF is immediate** — new starts are refused and a running remote recording stops.
 4. **A `record` DataChannel**, attached only when the grant holds RECORD — the same attach-time gate as `files` and
    `input`. The control channel carries no permission context, so it cannot host this. Messages:

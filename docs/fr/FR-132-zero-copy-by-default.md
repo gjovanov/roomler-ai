@@ -1,7 +1,7 @@
 # FR-132: Zero-copy by default — each GPU-input cell turns on for the fleet after a clean week of its own
 
 **Issue:** [#3141](https://github.com/gjovanov/roomler-ai/issues/3141) · **Status:** P1 released in 0.4.191 on 2026-10-31;
-the decisions taken 2026-10-30 and 2026-10-31, one open (§6); proposed 2026-10-30 · **Owner:** the agent's capture and encode path, and
+the decisions taken 2026-10-30, 2026-10-31 and 2026-11-02 (§6); proposed 2026-10-30 · **Owner:** the agent's capture and encode path, and
 remote config · **Anchors:** master `01520c8af` (§2); the as-built notes in §3a and §3b, master `ff29120ed` + P1 ·
 **Takes over:** [FR-118](FR-118-gpu-resident-frames.md) open decision 2 (the default) · **Builds on:**
 [FR-118](FR-118-gpu-resident-frames.md) (the GPU-input cells), [FR-77](FR-77-encoder-chroma-matrix.md) (cells, the
@@ -44,7 +44,7 @@ opens. An encoder then opens the GPU form only for a cell the probe's `gpu` chil
 ### 2.3 The server cannot turn a cell off
 
 `DesiredConfig`, what remote config pushes, carries two keys of this family, `encoder_cells_deny` and `fps_deny`
-(`crates/remote_control/src/models.rs:2967-2981`), and the agent's `apply` handles exactly those two
+(`crates/remote_control/src/models.rs:2976-2990`), and the agent's `apply` handles exactly those two
 (`agents/roomlerd/src/remote_config.rs:308-332`). Neither `zero_copy` nor `zero_copy_deny` is there. Today that
 costs nothing, because the switch is off everywhere. With a default on, a cell that misbehaves on one driver could
 be turned off only one host at a time, over exec, and only on hosts that answer exec.
@@ -54,7 +54,7 @@ be turned off only one host at a time, over exec, and only on hosts that answer 
 A decode error in the viewer's WebCodecs worker is posted to the page (`ui/src/workers/rc-webcodecs-worker.ts:170-182`),
 which tears the WebCodecs path down and falls back to `<video>` (`ui/src/composables/useRemoteControl.ts:7752-7765`).
 Nothing reaches the agent or the server. What does reach the server per session is `rc:session.stats`, whose
-`keyframe_requests` counts the viewer's keyframe asks (`agents/roomlerd/src/peer.rs:331-347`). FR-118's legs read
+`keyframe_requests` counts the viewer's keyframe asks (`agents/roomlerd/src/peer.rs:334-350`). FR-118's legs read
 decode errors in a viewer someone was watching, and a fleet week has no such viewer. So the first measure decision
 2 names cannot be read today.
 
@@ -85,7 +85,7 @@ read denies nothing (`crates/modules/fleet/src/remote_config.rs:206`). The agent
 it, and it reports `needs_restart` (`agents/roomlerd/src/remote_config.rs:354`). A test chains the pushed value
 through the restarted daemon's config fallbacks to the exact `name:gpu` entry `gpu_hint::is_denied` matches.
 Decision 1 is held by `the_device_owned_refusals_are_not_pushable`, which compares whole keys
-(`crates/remote_control/src/models.rs:9530`). The dialog gets the field, and
+(`crates/remote_control/src/models.rs:9540`). The dialog gets the field, and
 [`remote-config.md`](../remote-config.md) §6 the key, with its value table.
 
 **P1b, the push reaches a connected device.** AC2's field run (§8) showed what the push cost a kill switch: reconcile
@@ -151,7 +151,7 @@ against the same hosts' CPU-path week before it, from the heartbeats and `rc:ses
 |---|---|---|
 | decode errors per session-hour | `rc:session.stats` (3b) | no rise (open decision 3) |
 | keyframe requests per session-hour | `rc:session.stats` | no rise |
-| `input_reason` | the DC heartbeat (`agents/roomlerd/src/peer.rs:9729-9743`) | `gpu` on every session of the cell; no `open_failed` that persists |
+| `input_reason` | the DC heartbeat (`agents/roomlerd/src/peer.rs:9941-9955`) | `gpu` on every session of the cell; no `open_failed` that persists |
 | capture + encode, CPU per frame | the heartbeat; the process's CPU time | FR-118's saving for that cell, roughly |
 
 The capture + encode row reads moving and idle windows apart, with under 5 fps captured as idle. FR-118 measured its
@@ -168,7 +168,7 @@ the flip on every host that runs the cell, canary or not.
 |---|---|---|---|
 | P0 | The red record: a fleet week of heartbeats read per cell (encoder × capture arm), counting the sessions that could have opened a GPU form and read `switch_off`, and naming the hosts that run each cell | — | **done 2026-10-30** (§8, AC1) |
 | P1 | 3a and 3b: `zero_copy_deny` in `DesiredConfig` and the agent's `apply`; the viewer's decode-error message and its count in `rc:session.stats` | the push is absent (no change); a viewer without the message sends nothing | **built 2026-10-30, released 2026-10-31** ([#3154](https://github.com/gjovanov/roomler-ai/pull/3154), in 0.4.191 and `hosted-20261031-28dfd72`). 3a: `MANAGE_AGENTS` alone, passed on unread, written by the device with `needs_restart`, end to end in `agent_tests` (AC2's integration half). 3b: `rc:decode-error` per error before the fallback, `de: 1` on every `rc:decodestat`, `decode_errors` on `rc:session.stats` (absent = not counted), the first `de` and the first eight errors sent at once, end to end through a real agent and viewer peer in `session_decode_errors_tests` (AC3's integration half). The field halves of AC2 and AC3 are met (§8) |
-| P1b | 3a: a save nudges a connected device with the same frame, and one hub call sends every `rc:agent.config` | the previous image: the connect path never left, so a device still converges | in progress |
+| P1b | 3a: a save nudges a connected device with the same frame, and one hub call sends every `rc:agent.config` | the previous image: the connect path never left, so a device still converges | **built** ([#3242](https://github.com/gjovanov/roomler-ai/pull/3242)): server and UI only, so it needs a promote and no release; AC8's field half follows it |
 | P1c | 3a: `needs_restart` holds until the daemon runs the value | the previous agent: a reconnect reads `applied` again | not started |
 | P1d | 3d: `rc:session.stats` carries the encoder, the capture arm and the input form (decision 8) | absent from an older agent, and the week reads the heartbeats | not started |
 | P2 | 3c: the three-valued reading, the default list (empty), `default_off`, at both entry points | `zero_copy = off`; the list empty | not started |
@@ -236,20 +236,21 @@ The next four were decided by the operator on 2026-10-31, each as recommended.
    and the input form on it. The heartbeat carries no capture arm, and a week read per session from `remote_sessions`
    does not depend on a grep of `agent_logs`.
 
-One is open, and it is the operator's. An independent review of the RC media plan raised it on 2026-11-02, and the
-numbers are in §8.
+The last came from an independent review of the RC media plan on 2026-11-02, with the numbers in §8. The operator took
+it the same day, as recommended and open to being overturned, with [FR-135](FR-135-one-rc-media-pipeline.md)'s
+decisions, where it is D16.
 
-9. **Should the GPU form reach the client-office PCs, and how?** Decision 6 leaves out the class that runs `hevc_qsv`.
-   Four PCs at a client's office ran 45.3 of its 47.6 session-hours in the week read. Its one canary, CORPLAP-1, ran
-   2.3, and CORPLAP-3 has no `hevc_qsv`. So a flip puts the first GPU-form frames on that class at the fleet flip, by
-   auto-update, on a third party's working PCs, and no read names their GPU or driver. A pushed `zero_copy_deny`
+9. **Should the GPU form reach the office desktops, and how?** Decision 6 leaves out the class that runs `hevc_qsv`.
+   Four office desktops ran 45.3 of its 47.6 session-hours in the week read. Its one canary, CORPLAP-1, ran 2.3, and
+   CORPLAP-3 has no `hevc_qsv`. So a flip puts the first GPU-form frames on that class at the fleet flip, by
+   auto-update, on PCs people are working on, and no read names their GPU or driver. A pushed `zero_copy_deny`
    probably does not reach them either: the remote-config opt-in is off by default and out of the server's reach, and
    none of the four has a config report on its row. So the rollback there is a forward release. The flip also buys
    them little: 43.88 of the cell's 46.97 windowed hours are idle, where a keystroke's frame would save about 2.7 ms of
-   readback and a keepalive nothing. **Recommended:** `hevc_qsv` and `h264_qsv`,
-   the two GPU-input cells those PCs advertise, stay off the default list until one of the PCs has run a canary week,
-   opted in, in a window its owner agrees to. `av1_qsv`, NVENC and VideoToolbox do not wait for this, since those PCs
-   advertise none of them.
+   readback and a keepalive nothing. **Decided: hold.** `hevc_qsv` and `h264_qsv`, the two GPU-input cells those PCs
+   advertise, stay off the default list until one of the PCs has run a canary week, opted in, in a window its owner
+   agrees to. FR-135's D2 adds one more step for these two: after that canary, R5 or a read that the floor costs that
+   class nothing. `av1_qsv`, NVENC and VideoToolbox wait for neither, since those PCs advertise none of them.
 
 ## 7. Out of scope
 
@@ -268,7 +269,7 @@ own checks.
 
 | Family | Encoder | `switch_off` sessions | Hosts | Sessions on `input_path=gpu` |
 |---|---|---|---|---|
-| QSV | `hevc_qsv` | 36 | three PCs at a client office (29), CORPLAP-1 (7) | 0 |
+| QSV | `hevc_qsv` | 36 | three office desktops (29), CORPLAP-1 (7) | 0 |
 | QSV | `av1_qsv` | 13 | the 2880×1800 laptop (10), CORPLAP-3 (3) | 19 |
 | QSV | `h264_qsv` | 0 | none | 1 |
 | NVENC | `av1_nvenc` | 23 | CORPLAP-2 (21), NEO16 (2) | 2 |
@@ -365,7 +366,7 @@ window that captured under 5 fps is idle.
 | `av1_qsv` | 4.42 | 1.07 | 3.32 | 75.2 % |
 | `hevc_nvenc` | 0.91 | 0.06 | 0.80 | 87.4 % |
 
-By session, `hevc_qsv` ran 47.61 h: 45.30 on four PCs at a client's office and 2.30 on CORPLAP-1. Three of the four
+By session, `hevc_qsv` ran 47.61 h: 45.30 on four office desktops and 2.30 on CORPLAP-1. Three of the four
 advertise CORPLAP-1's encoder list, and the fourth lacks `vp9_qsv`, so the cell matches, but no read names their GPU
 or driver. None of the four has a config report on its row, and none holds a desired-config revision above 0, so
 nothing has tested whether a push reaches them.
