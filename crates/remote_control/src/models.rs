@@ -1296,6 +1296,13 @@ pub enum RpcCap {
     /// is switched on (`ROOMLERD_RC_OVERLAY_AUTO`, default on). Not a prefix
     /// of another verb, nor another of it.
     RcOverlayAuto,
+    /// FR-135 R2 — this device states each session's plan on the control
+    /// channel (`rc:media-plan`) and takes the viewer's refresh back
+    /// (`rc:viewer-hz`), so a viewer can read silence on it as a fault, and
+    /// knows the second message will be understood. Advertised while it is
+    /// switched on (`ROOMLERD_MEDIA_PLAN`, default on). Not a prefix of another
+    /// verb, nor another of it.
+    MediaPlan,
 }
 
 impl RpcCap {
@@ -1350,11 +1357,12 @@ impl RpcCap {
             Self::KnowhowProbe => "knowhow-probe",
             Self::LocalRelay => "local-relay",
             Self::RcOverlayAuto => "rc-overlay-auto",
+            Self::MediaPlan => "media-plan",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 43] = [
+    pub const ALL: [RpcCap; 44] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1398,6 +1406,7 @@ impl RpcCap {
         Self::KnowhowProbe,
         Self::LocalRelay,
         Self::RcOverlayAuto,
+        Self::MediaPlan,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -8081,6 +8090,7 @@ mod tests {
         assert_eq!(RpcCap::KnowhowProbe.wire(), "knowhow-probe");
         assert_eq!(RpcCap::LocalRelay.wire(), "local-relay");
         assert_eq!(RpcCap::RcOverlayAuto.wire(), "rc-overlay-auto");
+        assert_eq!(RpcCap::MediaPlan.wire(), "media-plan");
     }
 
     /// FR-90 P4-4-1 — `knowhow-tools` and `knowhow-scan` are two verbs: a

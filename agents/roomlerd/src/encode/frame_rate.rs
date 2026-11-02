@@ -42,6 +42,29 @@ pub fn parse_ask(msg: &serde_json::Value) -> Option<u32> {
     CHOICES.contains(&fps).then_some(fps)
 }
 
+/// FR-135 R2 — the most a viewer's reported refresh may read. Anything above it
+/// is no screen, and the message is dropped.
+const VIEWER_HZ_MAX: u32 = 1000;
+/// FR-135 R2 — a measured refresh reads a little under its nominal rate (59.94,
+/// 119.88), and a median of ticks moves by about 1 Hz. A rate this close to the
+/// reading is that rate, not one the screen cannot show.
+const VIEWER_HZ_SLACK: u32 = 2;
+
+/// FR-135 R2 — the refresh in an `rc:viewer-hz` message, when it is one.
+pub fn parse_viewer_hz(msg: &serde_json::Value) -> Option<u32> {
+    let hz = u32::try_from(msg.get("hz")?.as_u64()?).ok()?;
+    (1..=VIEWER_HZ_MAX).contains(&hz).then_some(hz)
+}
+
+/// FR-135 R2 — `ROOMLERD_VIEWER_HZ_CAP`, default OFF. On, the grant reads the
+/// viewer's measured refresh. Off, it is only stored and logged, and no answer
+/// changes. The one agent-behaviour change in FR-135's Wave A, so it rides after
+/// FR-135 §7.1's gates, and R0 folds it into its keys. Read once per pump.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub fn viewer_hz_cap_enabled() -> bool {
+    tunnel_core::env::flag("VIEWER_HZ_CAP", false)
+}
+
 /// P2b-17b — whether an `rc:fps` message asks to trial its rate again. Only a
 /// literal `true` counts: anything else is an ordinary ask.
 pub fn parse_retry(msg: &serde_json::Value) -> bool {
@@ -71,6 +94,10 @@ pub enum Reason {
     /// FR-119 P2b — what the session believes the pipe carries does not cover
     /// the ceiling the higher rate needs.
     Pipe,
+    /// FR-135 R2 — the viewer's own screen refreshes slower than the ask, so the
+    /// frames above its rate would never be seen. Only under
+    /// `ROOMLERD_VIEWER_HZ_CAP=1`.
+    ViewerRefresh,
 }
 
 impl Reason {
@@ -82,6 +109,7 @@ impl Reason {
             Self::Refresh => "refresh",
             Self::Denied => "denied",
             Self::Pipe => "pipe",
+            Self::ViewerRefresh => "viewer_refresh",
         }
     }
 }
@@ -165,6 +193,9 @@ pub struct GrantInputs {
     pub constrained: bool,
     /// The captured display's refresh rate, when the agent could read it.
     pub refresh_hz: Option<u16>,
+    /// FR-135 R2 — the viewers' measured refresh, merged by `min`. `None` with
+    /// `ROOMLERD_VIEWER_HZ_CAP` off, which leaves every answer as it was.
+    pub viewer_hz: Option<u32>,
     /// P2b-18 — what the grant reads about each rate in [`CHOICES`], in that
     /// order, so a refused ask can step down one rate at a time
     /// ([`rate_facts`] builds it).
@@ -235,6 +266,9 @@ impl GrantInputs {
             .is_some_and(|hz| hz > 0 && u32::from(hz) < fps)
         {
             return Some(Reason::Refresh);
+        }
+        if self.viewer_hz.is_some_and(|hz| hz + VIEWER_HZ_SLACK < fps) {
+            return Some(Reason::ViewerRefresh);
         }
         // A rate this agent does not offer has no record to show for it.
         let Some(f) = self.facts(fps) else {
@@ -805,6 +839,127 @@ mod tests {
         i
     }
 
+    /// FR-135 R2 — `rc:viewer-hz`: a whole number of hertz a screen could have.
+    #[test]
+    fn a_viewer_hz_message_is_a_plausible_refresh_or_nothing() {
+        let parse = |v: serde_json::Value| parse_viewer_hz(&v);
+        assert_eq!(parse(serde_json::json!({"hz": 60})), Some(60));
+        assert_eq!(parse(serde_json::json!({"hz": 144})), Some(144));
+        assert_eq!(parse(serde_json::json!({"hz": 1000})), Some(1000));
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"hz": 0}),
+            serde_json::json!({"hz": 1001}),
+            serde_json::json!({"hz": -60}),
+            serde_json::json!({"hz": 59.94}),
+            serde_json::json!({"hz": "60"}),
+        ] {
+            assert_eq!(parse_viewer_hz(&bad), None, "{bad}");
+        }
+    }
+
+    /// FR-135 R2 — the cap. A 60 Hz viewer asking 144 is held at the session's
+    /// cap and told why, with every rate above it open on the host.
+    #[test]
+    fn the_viewers_refresh_caps_the_grant_only_when_given() {
+        let ask = |asked: u32, viewer_hz: Option<u32>| {
+            grant(&GrantInputs {
+                asked: Some(asked),
+                cap: 60,
+                constrained: false,
+                refresh_hz: Some(144),
+                viewer_hz,
+                rates: [RateFacts::OPEN; CHOICES.len()],
+            })
+            .answer
+        };
+        // The switch off is `None`: the host's say alone, exactly as before.
+        assert_eq!(
+            ask(144, None),
+            Answer {
+                fps: 144,
+                refused: None
+            }
+        );
+        assert_eq!(
+            ask(144, Some(60)),
+            Answer {
+                fps: 60,
+                refused: Some((144, Reason::ViewerRefresh)),
+            }
+        );
+        // A step down lands on what the screen can show.
+        assert_eq!(
+            ask(144, Some(120)),
+            Answer {
+                fps: 120,
+                refused: Some((144, Reason::ViewerRefresh)),
+            }
+        );
+        // A screen that keeps up is no reason, and a reading just under its
+        // nominal rate is that rate.
+        assert_eq!(
+            ask(144, Some(144)),
+            Answer {
+                fps: 144,
+                refused: None
+            }
+        );
+        assert_eq!(
+            ask(144, Some(143)),
+            Answer {
+                fps: 144,
+                refused: None
+            }
+        );
+        assert_eq!(
+            ask(120, Some(119)),
+            Answer {
+                fps: 120,
+                refused: None
+            }
+        );
+        // An ask at the cap needs nothing from the screen: the cap is the floor.
+        assert_eq!(
+            ask(60, Some(30)),
+            Answer {
+                fps: 60,
+                refused: None
+            }
+        );
+    }
+
+    /// The screen on the host still reads first: it is what the frames can be.
+    #[test]
+    fn the_hosts_refresh_is_named_before_the_viewers() {
+        let a = grant(&GrantInputs {
+            asked: Some(144),
+            cap: 60,
+            constrained: false,
+            refresh_hz: Some(60),
+            viewer_hz: Some(60),
+            rates: [RateFacts::OPEN; CHOICES.len()],
+        })
+        .answer;
+        assert_eq!(a.refused, Some((144, Reason::Refresh)));
+    }
+
+    /// A wire spelling, read by every viewer's `describeFrameRateReason`.
+    #[test]
+    fn the_viewer_refresh_reason_keeps_its_wire_word() {
+        assert_eq!(Reason::ViewerRefresh.wire(), "viewer_refresh");
+    }
+
+    #[test]
+    fn the_viewer_hz_cap_is_off_unless_told() {
+        use tunnel_core::env::test_env::{Saved, set};
+        let _saved = Saved::cleared("VIEWER_HZ_CAP");
+        assert!(!viewer_hz_cap_enabled());
+        // SAFETY: this test alone touches this variable, and restores it on drop.
+        unsafe { set("VIEWER_HZ_CAP", "1") };
+        assert!(viewer_hz_cap_enabled());
+    }
+
     fn inputs() -> GrantInputs {
         at(
             GrantInputs {
@@ -812,6 +967,7 @@ mod tests {
                 cap: 60,
                 constrained: false,
                 refresh_hz: Some(120),
+                viewer_hz: None,
                 rates: [RateFacts::OPEN; CHOICES.len()],
             },
             120,
@@ -850,6 +1006,7 @@ mod tests {
             refused(GrantInputs {
                 constrained: true,
                 refresh_hz: Some(60),
+                viewer_hz: None,
                 ..inputs()
             }),
             Some(Reason::Constrained),
@@ -900,6 +1057,7 @@ mod tests {
             GrantInputs {
                 asked: Some(144),
                 refresh_hz: Some(240),
+                viewer_hz: None,
                 ..inputs()
             },
             144,
@@ -936,6 +1094,7 @@ mod tests {
         let at_144 = GrantInputs {
             asked: Some(144),
             refresh_hz: Some(240),
+            viewer_hz: None,
             ..inputs()
         };
         let step = |i: GrantInputs| grant(&i).answer;
@@ -1323,6 +1482,7 @@ mod tests {
             cap: 60,
             constrained: false,
             refresh_hz: None,
+            viewer_hz: None,
             rates: [RateFacts::OPEN; CHOICES.len()],
         }
     }

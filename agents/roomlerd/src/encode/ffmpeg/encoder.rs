@@ -1746,6 +1746,12 @@ impl FfmpegEncoder {
                     // (VP9_ENCODER_NAMES = ["vp9_qsv"]). Error reason is
                     // preserved in `last_err` → surfaced by the caller.
                     tracing::debug!(encoder = name, error = %e, "ffmpeg encoder candidate failed to open");
+                    // FR-135 R2 — `last_err` keeps one reason, and a pump's plan
+                    // names them all. A name this build does not carry never
+                    // ran, and "it tried h264_videotoolbox" on Windows is false.
+                    if codec::encoder::find_by_name(name).is_some() {
+                        crate::media_plan::note_candidate_failed(name, &e);
+                    }
                     last_err = Some(e);
                 }
             }
@@ -3624,6 +3630,28 @@ mod tests {
             msg.contains("not registered") || msg.contains("encoder names tried"),
             "expected dispatch error, got: {msg}"
         );
+    }
+
+    /// FR-135 R2 — a name this build does not carry is not a cell that ran, so a
+    /// plan must not say the device tried it.
+    #[test]
+    fn a_name_this_build_does_not_carry_leaves_no_trail() {
+        let trail = crate::media_plan::OpenTrail::default();
+        {
+            let _recording = trail.recording();
+            let res = FfmpegEncoder::new_with_dispatch(
+                &["nope_nvenc_xx", "nope_qsv_xx"],
+                640,
+                360,
+                30,
+                3_000_000,
+                0,
+                false,
+                false,
+            );
+            assert!(res.is_err());
+        }
+        assert!(trail.take().is_empty());
     }
 
     /// P5 — the banded convert's row math: every band starts on an EVEN

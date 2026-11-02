@@ -332,7 +332,7 @@ Linux runs were `nice -n 10`, and their `clock=` reads `clamped`. The Windows ru
   (`agents/roomlerd/src/encode/caps.rs:4017`), the RTP path tries only Media Foundation
   (`agents/roomlerd/src/encode/mod.rs:1642`), and `pick_best_codec` ranks AV1 first with no
   per-path filter (`agents/roomlerd/src/signaling.rs:3581`,
-  `agents/roomlerd/src/encode/caps.rs:4779`). The code logs `Session will have no video until
+  `agents/roomlerd/src/encode/caps.rs:4783`). The code logs `Session will have no video until
   reconnect` there. `agent_logs` holds that line 14 times in the org in 7 days, all on
   CORPLAP-3, whose hello has the same shape, the last on 2026-10-30. None of those batches
   carries a session id, so this shows the path fires, not that a viewer lost its picture. Not

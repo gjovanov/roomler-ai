@@ -64,6 +64,7 @@ import {
   stripChunkPrefix,
 } from './rc-chunk-framing'
 import { createBenchSampler } from './rc-bench-sampler'
+import { startViewerHzBursts } from './rc-viewer-hz'
 import { createDecoderColorSpace, frameColorSpace, rcDecoderConfig } from './rc-decoder-config'
 import { createDecodeRecovery } from './rc-decode-recovery'
 
@@ -568,6 +569,8 @@ function initDecoder() {
   decoder = new VideoDecoder({
     output: (frame) => {
       framesDecoded++
+      // FR-135 R2 — the first picture means the page is up, so its rAF ticks.
+      if (framesDecoded === 1) startViewerHzBursts((hz) => workerScope.postMessage({ type: 'viewer-hz', hz }))
       statsFramesInWindow++
       noteOutputForStallCheck()
       // P1 — submit→output latency (queue + decoder time); FR-119 P2b-7 —

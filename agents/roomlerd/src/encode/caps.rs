@@ -4439,6 +4439,10 @@ fn rpc_caps() -> Vec<String> {
     if crate::rc_overlay::auto_enabled() {
         caps.push(RpcCap::RcOverlayAuto);
     }
+    // FR-135 R2 — it says each session's plan, while that is switched on.
+    if crate::media_plan::enabled() {
+        caps.push(RpcCap::MediaPlan);
+    }
     if cfg!(feature = "ssh-server") {
         caps.push(RpcCap::Ssh);
         // P5d. Distinct from `ssh` because agents rc.419 and earlier advertise

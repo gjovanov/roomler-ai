@@ -79,8 +79,10 @@ const SHIM = `;(() => {
   if (proto) {
     const origDraw = proto.drawImage;
     proto.drawImage = function (...a) {
+      // After the draw: a draw that stalls is time the person still has no picture.
+      const drawn = origDraw.apply(this, a);
       if (paintPending) { const was = paintPending; paintPending = null; log('paint after=' + was); }
-      return origDraw.apply(this, a);
+      return drawn;
     };
   }
   const origPost = self.postMessage.bind(self);
@@ -213,7 +215,7 @@ test('FR-135 R1: a forced decode failure, timed to the next paint', async ({ con
       else if (text.startsWith('[dr] error')) errors.push(t)
       else if (text.startsWith('[dr] gap-key')) gapKeys.push({ t, deltas: Number(/deltas=(\d+)/.exec(text)?.[1] ?? NaN) })
       else if (text.startsWith('[dr] gap')) gaps.push(t)
-    } else if (text.includes('[rc]') && /decod|keyframe|stalled|re-creating|frame rejected|recovering|recovered|fallback/i.test(text)) {
+    } else if (text.includes('[rc]') && /decod|keyframe|stalled|re-creating|frame rejected|recovering|recovered|fallback|backlog/i.test(text)) {
       say(text.slice(0, 240))
     }
   })
