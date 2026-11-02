@@ -547,6 +547,72 @@ async fn the_first_ask_is_served_at_any_ttl() {
     }
 }
 
+// #3247 — the slug is checked before the account exists, so a person who picks
+// a taken one fixes it and presses Register again, with the same address.
+#[tokio::test]
+async fn a_taken_slug_leaves_no_account_behind() {
+    let app = TestApp::spawn().await;
+    let with_slug = |email: &'static str, username: &'static str, slug: &'static str| {
+        let (client, url) = (app.client.clone(), app.url("/api/auth/register"));
+        async move {
+            client
+                .post(url)
+                .json(&json!({
+                    "email": email,
+                    "username": username,
+                    "display_name": "Late",
+                    "password": PASSWORD,
+                    "tenant_name": "An organization",
+                    "tenant_slug": slug,
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let first = with_slug("first@test.com", "first", "taken-org").await;
+    assert_eq!(first.status().as_u16(), 201);
+
+    let taken = with_slug("second@test.com", "second", "taken-org").await;
+    assert_eq!(taken.status().as_u16(), 409);
+    let body = taken.text().await.unwrap();
+    assert!(body.contains("slug is taken"), "{body}");
+    assert!(!body.contains("E11000"), "{body}");
+
+    let again = with_slug("second@test.com", "second", "free-org").await;
+    assert_eq!(
+        again.status().as_u16(),
+        201,
+        "the address must still be free"
+    );
+}
+
+// #3247 — the sign-in page sends what is typed as `username`.
+#[tokio::test]
+async fn an_address_typed_into_the_sign_in_box_signs_in() {
+    let app = TestApp::spawn().await;
+    let login = |who: &'static str, password: &'static str| {
+        let (client, url) = (app.client.clone(), app.url("/api/auth/login"));
+        async move {
+            client
+                .post(url)
+                .json(&json!({ "username": who, "password": password }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    signed_up(&app, "typed@test.com", "typed").await;
+    app.activate_user("typed@test.com").await;
+
+    assert_eq!(login("typed", PASSWORD).await, 200);
+    assert_eq!(login("typed@test.com", PASSWORD).await, 200);
+    assert_eq!(login("typed@test.com", "not the password").await, 401);
+    assert_eq!(login("nobody@test.com", PASSWORD).await, 401);
+}
+
 #[tokio::test]
 async fn a_taken_address_or_username_is_said_in_words() {
     let app = TestApp::spawn().await;
