@@ -462,7 +462,7 @@ serving its zip. One wizard, four roles:
 | Wizard role | What it installs | Runs as |
 |---|---|---|
 | **Daemon — system** | perMachine MSI + SystemContext enabled | SCM service `Roomler` (LocalSystem) — controls lock screen, UAC, pre-logon |
-| **Daemon — per user** | perUser MSI | Scheduled Task `Roomler` at logon (limited) |
+| **Daemon — per user** | perUser MSI | Scheduled Task `Roomler` at logon (limited), with no window: [what the task runs](#what-the-per-user-scheduled-task-runs-3292) |
 | **Daemon — machine (attended)** | perMachine MSI | SCM service, no SystemContext |
 | **Tunnel client** | CLI archive + PATH entry | on demand |
 
@@ -537,6 +537,51 @@ Details worth knowing:
   placed deliberately is left alone — #1698,
   [`overlay-wfp.md`](./overlay-wfp.md)). The perUser flavour cannot elevate
   and is unchanged.
+
+### What the per-user Scheduled Task runs (#3292)
+
+```mermaid
+flowchart LR
+    TS["Task Scheduler<br/>logon · OS start · after a registration"] --> W["roomlerdw.exe<br/>windows subsystem, no console<br/>kill-on-close job"]
+    W -->|"CREATE_NO_WINDOW<br/>stdio NUL"| D["roomlerd.exe run --supervisor task"]
+    D -->|"stderr: same file<br/>(capped per day)"| L[("roomlerd.log.YYYY-MM-DD")]
+    D -->|"tracing"| L
+    D -->|"spawns, outside the job"| M["msiexec, watcher,<br/>companion, session shells"]
+```
+
+`roomlerd.exe` is a console program and stays one: `enroll`, `service` and the
+diagnostics answer on the terminal they were run from. Task Scheduler gives a console
+program started with an interactive token a new console, so until #3292 a per-user
+daemon kept a terminal of raw logs on the person's desktop, and closing it stopped the
+device. Now the task runs `roomlerdw.exe` (`agents/roomlerdw/src/main.rs`), which has no
+console, passes its arguments on, and leaves with the daemon's exit code.
+
+| What | Behaviour | Why |
+|---|---|---|
+| The task's `Running`, `IgnoreNew`, `LastTaskResult` | Unchanged: the launcher stays until the daemon exits, with its code | Task Scheduler watches the process it started |
+| `schtasks /End` | Ends the launcher, whose kill-on-close job takes the daemon | Measured without the job: `/End` says success, the task reads `Ready`, the daemon runs on |
+| What the daemon spawns | Outside that job (`SILENT_BREAKAWAY_OK`, `BREAKAWAY_OK`) | `msiexec` and its watcher have to outlive the daemon on an update |
+| Sign-out | The launcher is shut down last (`SetProcessShutdownParameters`) | Otherwise it could take the daemon down through the job before its `WM_ENDSESSION` |
+| stderr | The rolling log, the same dated file tracing writes; `NUL` past 256 MiB in a day | A panic, a stack overflow and FFmpeg print only there; the launcher must not create the log folder (`appdirs::use_old_segment`) |
+| stdout | `NUL` | Tracing only, and the rolling log has the same events |
+| The MSI's custom actions, the Start menu entry | Run through the launcher too | Each opened a terminal in the foreground |
+
+**A self-update brings the device back by itself.** The daemon has exited for the
+installer, and registering the task is all the MSI's custom action does. So `service
+install`, when a config exists, adds one-shot `<TimeTrigger>`s one, three and ten
+minutes on (`start_soon_triggers`, `agents/roomlerd/src/service.rs`). With `IgnoreNew`
+the later ones do nothing once the daemon is up, and `StartWhenAvailable` keeps them
+through a sleep. A fresh MSI has no config and starts nothing. A `service stop` inside
+those ten minutes can therefore be undone once.
+
+**A resume from sleep needs no start.** The processes sleep with the machine and carry
+on. The task's second trigger is `Kernel-General` event 12, an OS start, which does not
+fire on a resume.
+
+⚠️ **The task is not a supervisor.** `<RestartOnFailure>` restarted nothing after exit 1
+or after `0xC000013A`, five minutes on, with `Count` 10 and `PT1M` registered. A
+per-user daemon that crashes stays down until the next sign-in or `roomlerd service
+start`.
 
 ### What an MSI run does to the `Roomler` service
 

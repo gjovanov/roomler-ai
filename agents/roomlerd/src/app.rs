@@ -1615,6 +1615,14 @@ async fn daemon_main() -> Result<()> {
 
     logging::init();
 
+    // #3292 — the per-user task's daemon has no console, and its launcher gave it
+    // `NUL`: what only stderr carries (a panic, a stack overflow, FFmpeg) goes to
+    // the rolling log. Only this start: every other verb answers on its terminal.
+    #[cfg(target_os = "windows")]
+    if matches!(&cli.command, Some(Command::Run { supervisor: Some(s), .. }) if s == "task") {
+        logging::send_stderr_to_the_log();
+    }
+
     // FR-46 P2b — the retired env prefix is no longer READ, so a host that
     // still sets one must be TOLD rather than quietly ignored. Straight after
     // logging::init, because the whole point is that it reaches the log.
@@ -4337,8 +4345,9 @@ async fn run_cmd(
     // Install the liveness watchdog. Pumps tick after every iteration;
     // the scan loop force-exits via std::process::exit(STALL_EXIT_CODE)
     // when any pump silently stalls past its threshold, relying on
-    // the OS supervisor (Win Scheduled Task with RestartOnFailure /
-    // systemd Restart=on-failure / launchd KeepAlive) to relaunch.
+    // the OS supervisor (the Windows service's / systemd Restart=on-failure /
+    // launchd KeepAlive) to relaunch. The per-user Windows task relaunches
+    // no exit, so that one stays down until the next sign-in (#3292).
     // Encoder + capture are registered but gated off until a session
     // attaches — those pumps can legitimately go idle for hours when
     // no controller is connected.
@@ -5590,8 +5599,15 @@ async fn run_cmd(
 async fn service_cmd(action: ServiceAction, config_path: &PathBuf) -> Result<()> {
     match action {
         ServiceAction::Install { as_service: false } => {
-            service::install().context("installing auto-start hook")?;
-            println!("Auto-start registered. The agent will launch on next login.");
+            service::install(config_path).context("installing auto-start hook")?;
+            println!(
+                "Auto-start registered. The agent will launch on next login{}.",
+                if cfg!(target_os = "windows") && config_path.exists() {
+                    ", and within about a minute"
+                } else {
+                    ""
+                }
+            );
             // FR-84 D6 — the per-user install's companion login start
             // (`HKCU\…\Run`): the MSI's RegisterAutostart CA runs this as the
             // installing user. A fresh install has no companion beside us yet

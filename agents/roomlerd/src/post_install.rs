@@ -79,10 +79,11 @@
 //!    the service STOPPED (the MSI never reached StartServices), Restart
 //!    Manager can stop the NEW service after the install has finished, and a
 //!    host that stays down is worse than any install verdict. Elsewhere the
-//!    agent comes back at the next logon (the per-user Scheduled Task), within
-//!    5 s (systemd, `Restart=always`), or through the `.pkg`'s postinstall
-//!    (launchd skips a clean exit); the new binary reads `last-install.json`
-//!    at startup.
+//!    agent comes back within a minute of the install (the per-user Scheduled
+//!    Task, whose registration by the new MSI adds the one-shot starts: #3292,
+//!    `service::windows::start_soon_triggers`), within 5 s (systemd,
+//!    `Restart=always`), or through the `.pkg`'s postinstall (launchd skips a
+//!    clean exit); the new binary reads `last-install.json` at startup.
 //!
 //! ## What this is NOT
 //!

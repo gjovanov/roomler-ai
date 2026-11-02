@@ -49,7 +49,7 @@ table mirrors it for readers, and CI reads only the script.
 
 The **shipped** agents, the binaries the graph check guards, are listed separately
 ([`:118`](../scripts/licence-classes.sh#L118)): `roomlerd`, `roomler-cli`,
-`roomler-cli-shim`, `roomler-desktop` and `roomler-setup`.
+`roomler-cli-shim`, `roomlerdw`, `roomler-desktop` and `roomler-setup`.
 
 ⚠️ **A new crate must be added to one of the two crate lists.** The manifest check
 fails any workspace member it cannot classify. That failure is the reminder, and it

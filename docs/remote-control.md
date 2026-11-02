@@ -4003,6 +4003,7 @@ ONLOGON ...` with `schtasks /Create /XML <utf-16-le-bom-tempfile>`.
 Schema 1.2 (broadest universally-supported version, Win 7+).
 Settings that were previously missing or wrong:
 - `<RestartOnFailure><Interval>PT1M</Interval><Count>10</Count></RestartOnFailure>`
+  (#3292, 2026-11-02, measured: this restarts no exit, despite its name)
 - `<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>`
 - `<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>` (default
   is `true` — silently kills agent on laptop unplug)
@@ -4576,8 +4577,7 @@ Crate: `windows-service = "0.7"` for the SCM lifecycle.
     {SpawnIn|KeepCurrent|Idle}` — pure state machine, exhaustively
     unit-tested without FFI.
   - `next_backoff(consecutive_failures)` — 2 s × 2^(n−1) capped at
-    60 s, saturating against runaway counters; mirrors the
-    Scheduled Task `RestartOnFailure` PT1M cap.
+    60 s, saturating against runaway counters.
   - `run(exe, args, rx)` is the supervisor main loop on a dedicated
     OS thread. SCM session-change notifications swap the worker to
     the new active console user; worker crash respawns under backoff.

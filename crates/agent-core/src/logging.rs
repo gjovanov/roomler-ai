@@ -395,6 +395,131 @@ pub fn say_on_stdout(msg: impl std::fmt::Display) {
     let _ = out.flush();
 }
 
+/// #3292 — a daemon the per-user Scheduled Task started has no console: its
+/// launcher (`roomlerdw.exe`) gives it `NUL` for stdio, so that no window opens
+/// on the person's desktop. Its stdout carries only what its rolling log carries
+/// too, but its stderr carries what nothing else does: a panic's message, a stack
+/// overflow's, the single-instance refusal, and FFmpeg's `av_log`. So this points
+/// stderr at today's rolling log, and keeps it on the current day's file.
+///
+/// A file handle and not a pipe to a reader, because the process that is crashing
+/// writes the file itself: a reader thread dies before it reads a fatal message,
+/// and a pipe's reader outside this process hands every grandchild that inherited
+/// the write end a broken pipe when it goes (#2934).
+///
+/// Call it after [`init`], which resolves the directory. The launcher must not
+/// do this: `appdirs::use_old_segment` is new-if-present, so creating the log
+/// folder from outside the daemon would switch a legacy host to the empty new tree
+/// and orphan its enrolled config.
+#[cfg(windows)]
+pub fn send_stderr_to_the_log() {
+    if let Some(dir) = log_dir() {
+        stderr_file::keep_on_the_rolling_log(dir);
+    }
+}
+
+#[cfg(windows)]
+mod stderr_file {
+    use super::*;
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+
+    /// What one day's rolling log may reach before stderr stops going there.
+    /// FFmpeg prints to stderr at INFO with nothing limiting its rate: 87 lines in
+    /// one start on an idle guest, and one line per frame from an encoder that is
+    /// failing. A console threw that away as it scrolled. A file would keep it until
+    /// the disk is full.
+    pub(super) const DAILY_CAP: u64 = 256 * 1024 * 1024;
+    /// How often the day and the cap are looked at.
+    const CHECK_EVERY: Duration = Duration::from_secs(60);
+
+    unsafe extern "C" {
+        fn _open_osfhandle(handle: isize, flags: i32) -> i32;
+        fn _dup2(from: i32, to: i32) -> i32;
+        fn _close(fd: i32) -> i32;
+    }
+
+    pub(super) fn keep_on_the_rolling_log(dir: PathBuf) {
+        let mut date = utc_date_now();
+        let mut on_the_file = repoint(&dir, &date);
+        let keeper = move || {
+            loop {
+                std::thread::sleep(CHECK_EVERY);
+                let now = utc_date_now();
+                if now != date {
+                    on_the_file = repoint(&dir, &now);
+                    date = now;
+                } else if on_the_file && !has_room(&rolling_file(&dir, &date)) {
+                    on_the_file = repoint(&dir, &date);
+                }
+            }
+        };
+        let _ = std::thread::Builder::new()
+            .name("stderr-to-log".into())
+            .spawn(keeper);
+    }
+
+    /// The name tracing-appender's daily roll gives `date`'s file, in UTC. The
+    /// tests hold this against a real `RollingFileAppender`.
+    pub(super) fn rolling_file(dir: &Path, date: &str) -> PathBuf {
+        dir.join(format!("{}.{date}", log_basename()))
+    }
+
+    pub(super) fn utc_date_now() -> String {
+        format_utc_date(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        )
+    }
+
+    fn has_room(file: &Path) -> bool {
+        std::fs::metadata(file).map_or(true, |m| m.len() < DAILY_CAP)
+    }
+
+    /// Point stderr at `date`'s file, or at `NUL` when that file is at its cap or
+    /// cannot be opened. Says whether it is on the file.
+    pub(super) fn repoint(dir: &Path, date: &str) -> bool {
+        let file = rolling_file(dir, date);
+        if has_room(&file) && point_stderr_at(&file).is_ok() {
+            return true;
+        }
+        let _ = point_stderr_at(Path::new("NUL"));
+        false
+    }
+
+    /// Point this process's two stderrs at `path`. Rust's reads `GetStdHandle` on
+    /// every write, and panics and stack overflows go through it. The C runtime's is
+    /// fd 2, in the UCRT every module of this process shares, and that is where
+    /// FFmpeg's `fprintf(stderr, …)` lands. Each gets its own handle.
+    ///
+    /// The handle given to `SetStdHandle` is never closed: a write racing this call
+    /// may still hold the old value, and that value could be reused by anything by
+    /// then. One or two a day is a leak that does not matter.
+    fn point_stderr_at(path: &Path) -> std::io::Result<()> {
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+        };
+        let for_rust = open()?.into_raw_handle();
+        let for_crt = open()?.into_raw_handle();
+        // SAFETY: `for_rust` is a valid handle, owned from here on by the process's
+        // standard-handle table. `_open_osfhandle` takes ownership of `for_crt`, and
+        // `_dup2` and `_close` run under the C runtime's own per-fd locks.
+        unsafe {
+            SetStdHandle(STD_ERROR_HANDLE, for_rust);
+            let fd = _open_osfhandle(for_crt as isize, 0);
+            if fd >= 0 {
+                _dup2(fd, 2);
+                _close(fd);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Path of TODAY's rolling log file, if file logging is active.
 /// Used by `crash_recorder::record` to attach a `log_tail` to crash
 /// sidecars. Returns `None` when `init()` hasn't run yet OR no log
@@ -1006,6 +1131,152 @@ mod tests {
         // No directory at all (tests, no home): stdout-only, quietly, as ever.
         let (got, notes) = open_log_appender(None, Some(fallback), |_| Ok(()));
         assert!(got.is_none() && notes.is_empty());
+    }
+
+    /// #3292 — the windowless task daemon's stderr. Each `child_*` test does nothing
+    /// unless a parent test started this binary again with the directory in the
+    /// environment, because the point is what reaches the file when the process
+    /// dies, and a test's own process has to stay alive to read it.
+    #[cfg(windows)]
+    mod stderr_capture {
+        use super::super::log_basename;
+        use super::super::stderr_file::*;
+        use std::path::{Path, PathBuf};
+
+        const CHILD_DIR: &str = "ROOMLER_TEST_STDERR_DIR";
+
+        unsafe extern "C" {
+            fn __acrt_iob_func(index: u32) -> *mut std::ffi::c_void;
+            fn fputs(text: *const std::ffi::c_char, stream: *mut std::ffi::c_void) -> i32;
+        }
+
+        /// The way FFmpeg's default `av_log` callback writes.
+        fn crt_stderr(line: &std::ffi::CStr) {
+            // SAFETY: index 2 is the C runtime's `stderr`, and `line` ends in NUL.
+            unsafe {
+                fputs(line.as_ptr(), __acrt_iob_func(2));
+            }
+        }
+
+        fn child(name: &str, dir: &Path) -> std::process::ExitStatus {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("logging::tests::stderr_capture::{name}"),
+                    "--nocapture",
+                ])
+                .env(CHILD_DIR, dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+        }
+
+        fn child_dir() -> Option<PathBuf> {
+            std::env::var_os(CHILD_DIR).map(Into::into)
+        }
+
+        fn today(dir: &Path) -> String {
+            std::fs::read_to_string(rolling_file(dir, &utc_date_now())).unwrap()
+        }
+
+        #[test]
+        fn child_panics() {
+            let Some(dir) = child_dir() else { return };
+            keep_on_the_rolling_log(dir);
+            eprintln!("from-rust-eprintln");
+            crt_stderr(c"from-the-c-runtime\n");
+            panic!("from-a-panic");
+        }
+
+        #[test]
+        fn eprintln_the_c_runtime_and_a_panic_reach_the_rolling_log() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = child("child_panics", dir.path());
+            assert!(!status.success(), "the child panics");
+            let log = today(dir.path());
+            for line in ["from-rust-eprintln", "from-the-c-runtime", "from-a-panic"] {
+                assert!(log.contains(line), "{line} missing from: {log}");
+            }
+        }
+
+        #[allow(unconditional_recursion)]
+        fn overflow(depth: u64) -> u64 {
+            let frame = std::hint::black_box([depth; 256]);
+            overflow(depth + 1) + frame[0]
+        }
+
+        #[test]
+        fn child_overflows_its_stack() {
+            let Some(dir) = child_dir() else { return };
+            keep_on_the_rolling_log(dir);
+            overflow(0);
+        }
+
+        /// The process dies inside the runtime's handler: no reader thread would
+        /// have lived to see this line.
+        #[test]
+        fn a_stack_overflow_reaches_the_rolling_log() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = child("child_overflows_its_stack", dir.path());
+            assert!(!status.success(), "the child dies");
+            let log = today(dir.path());
+            assert!(log.contains("overflowed its stack"), "{log}");
+        }
+
+        #[test]
+        fn child_rolls_to_a_new_day_and_past_the_cap() {
+            let Some(dir) = child_dir() else { return };
+            assert!(repoint(&dir, "2026-01-01"));
+            eprintln!("on-day-one");
+            crt_stderr(c"crt-on-day-one\n");
+            assert!(repoint(&dir, "2026-01-02"));
+            eprintln!("on-day-two");
+            crt_stderr(c"crt-on-day-two\n");
+            let full = std::fs::File::create(rolling_file(&dir, "2026-01-03")).unwrap();
+            full.set_len(DAILY_CAP).unwrap();
+            drop(full);
+            assert!(!repoint(&dir, "2026-01-03"));
+            eprintln!("past-the-cap");
+            crt_stderr(c"crt-past-the-cap\n");
+            assert!(repoint(&dir, "2026-01-04"));
+            eprintln!("on-day-four");
+            crt_stderr(c"crt-on-day-four\n");
+        }
+
+        #[test]
+        fn stderr_follows_the_day_and_stops_at_the_cap_with_no_panic() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = child("child_rolls_to_a_new_day_and_past_the_cap", dir.path());
+            assert!(status.success(), "the child must not panic: {status:?}");
+            let read = |date| std::fs::read_to_string(rolling_file(dir.path(), date)).unwrap();
+            assert_eq!(read("2026-01-01"), "on-day-one\ncrt-on-day-one\n");
+            assert_eq!(read("2026-01-02"), "on-day-two\ncrt-on-day-two\n");
+            assert_eq!(read("2026-01-04"), "on-day-four\ncrt-on-day-four\n");
+            let capped = std::fs::metadata(rolling_file(dir.path(), "2026-01-03")).unwrap();
+            assert_eq!(capped.len(), DAILY_CAP, "nothing past the cap");
+        }
+
+        /// A second name would split one day's story across two files, and
+        /// `active_log_path` reads only this one.
+        #[test]
+        fn the_file_is_the_one_the_rolling_appender_writes() {
+            use std::io::Write;
+            let dir = tempfile::tempdir().unwrap();
+            let before = utc_date_now();
+            let mut appender = tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix(log_basename())
+                .build(dir.path())
+                .unwrap();
+            appender.write_all(b"x\n").unwrap();
+            let after = utc_date_now();
+            assert!(
+                rolling_file(dir.path(), &before).exists()
+                    || rolling_file(dir.path(), &after).exists()
+            );
+        }
     }
 }
 // RETIRED-NAME-ANCHOR-END

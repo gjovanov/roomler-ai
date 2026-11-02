@@ -5,9 +5,10 @@
 //! Each pump (signaling, encoder, capture) ticks the watchdog after
 //! every iteration. A background tokio task scans for stalls and
 //! force-exits the process via `std::process::exit(2)` when one is
-//! detected — relying on the OS supervisor (Scheduled Task on
-//! Windows with `RestartOnFailure`, `Restart=on-failure` on systemd,
-//! `KeepAlive` on macOS) to relaunch a healthy copy.
+//! detected — relying on the OS supervisor (the service's on Windows,
+//! `Restart=on-failure` on systemd, `KeepAlive` on macOS) to relaunch a
+//! healthy copy. The per-user Scheduled Task relaunches no exit, so that one
+//! stays down until the next sign-in (#3292).
 //!
 //! Why force-exit instead of panic? A panic on the watchdog task
 //! doesn't unwind the application — `tokio::spawn` swallows it, the
@@ -142,15 +143,12 @@ pub const AGENT_DELETED_EXIT_CODE: i32 = 7;
 /// ⚠️ **Windows side-effect, accepted deliberately.** Nothing distinguishes
 /// a supervisor-spawned worker from a directly launched one — both run
 /// `Command::Run` — so the perUser *Scheduled Task* flavour now also exits
-/// non-zero when it loses the lock, which trips its `<RestartOnFailure>`
-/// (10 attempts, 1 min apart, then it stops for good). That is bounded and
-/// self-terminating, unlike the supervisor loop this fixes, and it is
-/// arguably the better signal: exiting 0 left the task reporting SUCCESS
-/// while doing nothing, so an operator who had installed two conflicting
-/// flavours got no indication at all. A "last run failed" task is a
-/// visible, actionable state. If the 10 launches ever matter, the fix is a
-/// supervised-worker marker on the spawn — not reverting to 0, which is
-/// ambiguous with a self-update.
+/// non-zero when it loses the lock. Its `<RestartOnFailure>` restarts no exit
+/// (measured, #3292), so nothing loops, and it is arguably the better signal:
+/// exiting 0 left the task reporting SUCCESS while doing nothing, so an
+/// operator who had installed two conflicting flavours got no indication at
+/// all. A "last run failed" task is a visible, actionable state. Do not revert
+/// to 0, which is ambiguous with a self-update.
 ///
 /// Emitted by the `AcquireOutcome::AlreadyRunning` arm in `main.rs`.
 /// ⚠️ Three places must agree, in three different files, with nothing
@@ -185,7 +183,7 @@ pub const ALREADY_RUNNING_EXIT_CODE: i32 = 8;
 ///   * **the FR-43 macOS supervisor** respawns any exit after ≥ 1 s.
 ///   * **the Windows Scheduled Task**: the caller runs `roomlerd service
 ///     start` once the old process is gone (`restart_by: caller`); the
-///     task's own `<RestartOnFailure>` is at most a floor a minute later.
+///     task restarts no exit by itself (#3292).
 ///   * **the Windows SCM supervisor** does NOT see it: an SCM worker exits
 ///     **0**, which `decide_exit_reaction` already maps to an immediate
 ///     `Respawn` (and which an SCM host older than D3 respawns too). The

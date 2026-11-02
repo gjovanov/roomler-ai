@@ -10,9 +10,9 @@
 //! Scope: the agent exits after spawning the installer so the installer
 //! can overwrite the binary without `ERROR_SHARING_VIOLATION`. The
 //! Scheduled Task / systemd unit / LaunchAgent registered via
-//! `roomlerd service install` re-launches the new version on
-//! the next login (Windows) or immediately (Restart=on-failure on
-//! Linux, KeepAlive on macOS).
+//! `roomlerd service install` re-launches the new version within a
+//! minute of the install (Windows, the registration's one-shot starts,
+//! #3292) or immediately (Restart=on-failure on Linux, KeepAlive on macOS).
 //!
 //! Trust model: we assume GitHub-over-TLS is sufficient for now. No
 //! signature check beyond the MSI's cargo-wix / codesign identity

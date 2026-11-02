@@ -40,6 +40,7 @@ on:
     branches: [master]
     paths:
       - 'agents/roomlerd/**'
+      - 'agents/roomlerdw/**'
       - '.github/workflows/installer-smoke.yml'
       - 'scripts/macos-productbuild-gated.sh'
   # Also on PRs — but only those touching the INSTALLER surface, not the whole
@@ -62,6 +63,10 @@ on:
     paths:
       - 'agents/roomlerd/wix/**'
       - 'agents/roomlerd/wix-perMachine/**'
+      # #3292 — what the per-user MSI's task, custom actions and shortcut run,
+      # and what the registration writes.
+      - 'agents/roomlerdw/**'
+      - 'agents/roomlerd/src/service.rs'
       - 'agents/roomlerd/packaging/windows/**'
       # The macOS packaging was missing here, so the postinstall — the script
       # that decides whether the root daemon lives or is DELETED — could change
@@ -182,6 +187,12 @@ jobs:
           }
           $kb = [math]::Round((Get-Item target\release\roomler-shim.exe).Length/1KB, 0)
           Write-Host "Staged roomler-shim.exe ($kb KB, installs as roomler.exe) for the TunnelExe component"
+          # #3292: the windowless launcher the per-user Scheduled Task runs.
+          cargo build -p roomlerdw --release
+          if (-not (Test-Path target\release\roomlerdw.exe)) {
+            Write-Host "::error::roomlerdw.exe not produced — LauncherExe harvest would fail (LGHT0103)"
+            exit 1
+          }
 
       # Mirrors release-agent.yml's payload-signing placement exactly: after
       # the binaries are built, BEFORE the third-party DLLs (wintun, VC-CRT)
@@ -198,6 +209,7 @@ jobs:
           files: |
             target\release\roomlerd.exe
             target\release\roomler-shim.exe
+            target\release\roomlerdw.exe
           mode:               local
           require:            'true'
           # The action imports the self-signed cert into the runner's Root +
@@ -410,7 +422,7 @@ jobs:
           $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
           # msvcp140/vcruntime140* lock the app-local VcRedistCrt component
           # (fresh machines without the VC++ redist -- 2026-07-28 fix).
-          $mustExist = @('roomlerd.exe', 'roomler.exe', 'wintun.dll',
+          $mustExist = @('roomlerd.exe', 'roomler.exe', 'roomlerdw.exe', 'wintun.dll',
                          'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
           $missing = @()
           foreach ($f in $mustExist) {
@@ -477,7 +489,7 @@ jobs:
             param([switch]$Quiet)
             $found    = @()
             $appLocal = @()
-            foreach ($exe in @('roomlerd.exe', 'roomler.exe')) {
+            foreach ($exe in @('roomlerd.exe', 'roomler.exe', 'roomlerdw.exe')) {
               $path = Join-Path $installDir $exe
               if (-not (Test-Path $path)) { $found += "$exe missing"; continue }
               $imports = & $dumpbin /dependents $path |
@@ -589,7 +601,7 @@ jobs:
           # must have been removed (Environment Part='last' +
           # implicit Permanent='no').
           $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
-          foreach ($f in @('roomlerd.exe', 'roomler-agent.exe', 'roomler.exe', 'wintun.dll', 'msvcp140.dll', 'vcruntime140_1.dll')) {
+          foreach ($f in @('roomlerd.exe', 'roomlerdw.exe', 'roomler-agent.exe', 'roomler.exe', 'wintun.dll', 'msvcp140.dll', 'vcruntime140_1.dll')) {
             $p = Join-Path $installDir $f
             if (Test-Path $p) {
               throw "$f still at $p after uninstall — MSI uninstaller is broken"

@@ -196,9 +196,10 @@ pub fn record_with_log_tail(
         Err(_) => {
             // The closure panicked. Avoid touching tracing here (its
             // backing subscriber may also be in a poisoned state mid
-            // crash) — `eprintln!` goes to the SCM service's stderr
-            // capture or the terminal, which is sufficient.
-            eprintln!("crash_recorder:RECURSIVE_PANIC during record()");
+            // crash) — stderr goes to the SCM service's capture, the
+            // terminal or the rolling log (#3292), which is sufficient.
+            // Never `eprintln!`: on a failing stderr it panics (#1538).
+            crate::logging::say_on_stderr("crash_recorder:RECURSIVE_PANIC during record()");
         }
     }
 }

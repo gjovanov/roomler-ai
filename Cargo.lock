@@ -9644,6 +9644,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "roomlerdw"
+version = "0.4.196"
+dependencies = [
+ "embed-resource",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "rpassword"
 version = "7.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

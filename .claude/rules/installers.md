@@ -88,6 +88,23 @@ after about a minute (`docs/fr/FR-129-guided-cross-platform-installer.md`, C3).
 `self-update` is **kept** — it is the sole updater for tunnel-only hosts ("one
 updater" is per-role; daemon hosts get `roomler.exe` refreshed by the MSI).
 
+⚠️ **The per-user task, the MSI's custom actions and the Start menu entry run `roomlerdw.exe`,
+never `roomlerd.exe`** (#3292, `docs/installation.md`). Windows opens a terminal for a console
+program started from any of those, on the person's desktop, and closing it stopped the device.
+`FreeConsole` first thing does not help (the console exists before `main`), and `conhost
+--headless` is an EDR rule. The launcher leaves with the daemon's exit code and holds it in a
+kill-on-close job, because `schtasks /End` kills the launcher alone (measured); what the daemon
+spawns stays out of that job, or `msiexec` dies with it on an update. It must not touch the data
+tree: `appdirs::use_old_segment` is new-if-present, so a log folder made from outside the daemon
+orphans a legacy host's config, which is why stderr capture lives in the daemon.
+⚠️ **`RegisterAutostart` stays the last action before `InstallFinalize`.** The task names the
+launcher, and a rollback onto a release without one would leave a task that starts nothing.
+⚠️ **`<RestartOnFailure>` is not a supervisor**: it restarted nothing after exit 1 or
+`0xC000013A`. What brings a device back after a self-update is the one-shot `<TimeTrigger>`s
+`service install` adds when a config exists. A repeating trigger would cover a crash too, and was
+rejected: it fires inside the installer's window on the old files, and needs a latch for
+`service stop` and for a removed row.
+
 ⚠️ **A `.deb` can install cleanly and not start** (#3204). Any edit to a package's
 `depends` goes through `scripts/deb-bare-check.sh` on the real package; a hand-written
 package list proves nothing about what `depends` resolves to. The ALSA dependency is

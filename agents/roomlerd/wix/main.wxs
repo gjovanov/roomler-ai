@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="windows-1252"?>
 <!-- RETIRED-NAME-ANCHOR-BEGIN
      Every retired name here is MSI identity or legacy cleanup: the
-     roomler_agent_exe FileKey that CustomActions reference and upgrades key off,
+     roomler_agent_exe FileKey that upgrades key off,
      the inert roomler-agent.exe alias the deployed fleet still resolves, and the
      pre-P4b install folder this package vacates.
      INVARIANT: an MSI identifier that ships cannot be renamed without breaking
@@ -24,7 +24,8 @@
   Autostart: registered automatically on every install + upgrade via the
   RegisterAutostart custom action below. The action shells out to
   `roomlerd service install` which writes a Schema 1.2 Task
-  Scheduler XML with restart-on-failure + battery-defeat settings (see
+  Scheduler XML with battery-defeat settings and, on an enrolled machine,
+  a start shortly after (see
   agents/roomlerd/src/service.rs::render_task_xml). Symmetric
   UnregisterAutostart hook runs `service uninstall` before the EXE is
   removed during uninstall. Both actions Return="ignore" so an
@@ -32,6 +33,15 @@
   Win11 quirk that bit us 2026-04-29) doesn't sink the whole MSI —
   operator can still recover via the manual schtasks delete + service
   install path documented in packaging/windows/README.txt.
+
+  roomlerdw.exe (#3292): the windowless launcher. The task, the custom
+  actions and the Start menu entry all run through it, because Windows opens
+  a terminal for any console program started from one of those, on the
+  person's desktop, in the foreground. It starts its sibling roomlerd.exe with
+  the arguments it was given and leaves with its exit code. Each custom action's
+  FileKey is therefore the launcher's. A MajorUpgrade runs the OLD product's
+  UnregisterAutostart from the OLD MSI's table, so the jump from a release
+  before the launcher can still flash one terminal.
 
   Why this works without UAC: perUser MSIs run in the user's token
   context. Custom actions with Execute="deferred" Impersonate="yes"
@@ -114,14 +124,14 @@
                                 Value='1'
                                 KeyPath='yes' />
                             <!-- P3d Slice B: the daemon EXE is now `roomlerd.exe`.
-                                 The File Id stays `roomler_agent_exe` so every
-                                 <CustomAction FileKey='roomler_agent_exe'> below
-                                 still resolves to THIS (the real daemon) file. The
-                                 component Id + Guid are unchanged for stable
-                                 component identity across upgrade. -->
-                            <!-- RETIRED-NAME-ANCHOR(3): an MSI FileKey is installer IDENTITY; five
-                                 CustomActions reference it and upgrades key off it, so it is frozen
-                                 deliberately. docs/fr/FR-21 -->
+                                 The File Id stays `roomler_agent_exe`, and the
+                                 component Id + Guid are unchanged, for stable
+                                 component identity across upgrade. The custom actions
+                                 below run through the launcher, which starts THIS
+                                 (the real daemon) file. -->
+                            <!-- RETIRED-NAME-ANCHOR(3): an MSI FileKey is installer IDENTITY, and
+                                 upgrades key off it, so it is frozen deliberately, though #3292 moved
+                                 this flavour's CustomActions to the launcher's. docs/fr/FR-21 -->
                             <File
                                 Id='roomler_agent_exe'
                                 Name='roomlerd.exe'
@@ -190,6 +200,29 @@
                                 Part='last'
                                 Action='set'
                                 System='no' />
+                        </Component>
+                        <!-- #3292: what the per-user Scheduled Task, the custom
+                             actions and the Start menu entry run, so that no
+                             terminal opens on the person's desktop. The workflow
+                             builds target\release\roomlerdw.exe via
+                             `cargo build -p roomlerdw [dash][dash]release` and signs
+                             it with the rest of the payload. Per-user only: the
+                             service's supervisor starts its worker windowless by
+                             itself. HKCU KeyPath like siblings (ICE38,
+                             user-profile dir). -->
+                        <Component Id='LauncherExe' Guid='5EB7791A-B52B-4E33-ADE3-2026B3AAA188'>
+                            <RegistryValue
+                                Root='HKCU'
+                                Key='Software\Roomler\Agent'
+                                Name='installed_launcher'
+                                Type='integer'
+                                Value='1'
+                                KeyPath='yes' />
+                            <File
+                                Id='roomlerdw_exe'
+                                Name='roomlerdw.exe'
+                                DiskId='1'
+                                Source='target\release\roomlerdw.exe' />
                         </Component>
                         <Component Id='LicenseTxt' Guid='4B1D2E80-6F3C-4B2A-9E1D-7A2B3C4D5E6F'>
                             <RegistryValue
@@ -298,13 +331,15 @@
                              product's; its Id and the component's Guid are identity
                              and stay. MajorUpgrade runs afterInstallInitialize, so
                              the old product (and its old .lnk) is removed before
-                             this one installs. -->
+                             this one installs. #3292: it starts the task, through
+                             the launcher, so a click opens no terminal and never
+                             leaves a daemon nothing supervises. -->
                         <Shortcut
                             Id='AgentShortcut'
                             Name='Roomler'
                             Description='Roomler Daemon — private mesh network + secure remote control'
-                            Target='[APPLICATIONFOLDER]roomlerd.exe'
-                            Arguments='run'
+                            Target='[APPLICATIONFOLDER]roomlerdw.exe'
+                            Arguments='service start'
                             WorkingDirectory='APPLICATIONFOLDER' />
                         <RemoveFolder Id='CleanupProgramMenuSubfolder' On='uninstall' />
                         <RegistryValue
@@ -332,6 +367,8 @@
             <ComponentRef Id='AgentExe' />
             <!-- P4b: tunnel CLI + user-PATH append. -->
             <ComponentRef Id='TunnelExe' />
+            <!-- #3292: the windowless launcher. -->
+            <ComponentRef Id='LauncherExe' />
             <ComponentRef Id='LicenseTxt' />
             <ComponentRef Id='ReadmeTxt' />
             <ComponentRef Id='WintunDll' />
@@ -354,7 +391,7 @@
         -->
         <CustomAction
             Id='RegisterAutostart'
-            FileKey='roomler_agent_exe'
+            FileKey='roomlerdw_exe'
             ExeCommand='service install'
             Execute='deferred'
             Impersonate='yes'
@@ -369,7 +406,7 @@
         -->
         <CustomAction
             Id='UnregisterAutostart'
-            FileKey='roomler_agent_exe'
+            FileKey='roomlerdw_exe'
             ExeCommand='service uninstall'
             Execute='deferred'
             Impersonate='yes'
@@ -390,7 +427,7 @@
         -->
         <CustomAction
             Id='CleanupLegacyPerMachine'
-            FileKey='roomler_agent_exe'
+            FileKey='roomlerdw_exe'
             ExeCommand='cleanup-legacy-install --target-flavour perUser'
             Execute='deferred'
             Impersonate='yes'
@@ -404,17 +441,19 @@
               anyway. The condition leaves it active for upgrade
               installs (which are technically "REMOVE=ALL" of the
               old + install of the new, scheduled separately).
+              #3292: last before the commit, because the task it writes
+              names the launcher. A failure after it rolls an upgrade from
+              a release without the launcher back to that release, and a
+              task left pointing at a file the rollback removed starts
+              nothing at any logon.
             -->
-            <Custom Action='RegisterAutostart' After='InstallFiles'>
+            <Custom Action='RegisterAutostart' Before='InstallFinalize'>
                 NOT (REMOVE="ALL")
             </Custom>
             <!--
               rc.18: scrub stale artefacts AFTER the new EXE lands
-              (so we can shell out to it). NB both this and
-              RegisterAutostart are After='InstallFiles'; WiX v3
-              breaks the tie in DOCUMENT order, so RegisterAutostart
-              actually runs FIRST (an earlier comment here claimed
-              the opposite). Ordering is immaterial: the helper's
+              (so we can shell out to it). This now runs before
+              RegisterAutostart. Ordering is immaterial: the helper's
               CA-reachable step only sweeps the vacated pre-rename
               install dir (P4b), and its cross-flavour arms — which
               touch the other flavour's task/service namespace — are
