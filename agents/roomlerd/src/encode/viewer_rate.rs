@@ -1258,4 +1258,17 @@ mod tests {
         assert!(f.take_retrial());
         assert!(!f.take_retrial(), "taken once");
     }
+
+    /// FR-135 R2 — a viewer that never said is `None`, and the last reading
+    /// stands until another: the window can move to another screen.
+    #[test]
+    fn a_viewers_refresh_stands_until_it_says_otherwise() {
+        let f = ViewerFeedback::new();
+        assert_eq!(f.viewer_hz(), None);
+        f.store_viewer_hz(144);
+        assert_eq!(f.viewer_hz(), Some(144));
+        assert_eq!(f.viewer_hz(), Some(144), "reading it takes nothing");
+        f.store_viewer_hz(60);
+        assert_eq!(f.viewer_hz(), Some(60));
+    }
 }

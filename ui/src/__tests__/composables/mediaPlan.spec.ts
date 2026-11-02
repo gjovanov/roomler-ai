@@ -6,9 +6,11 @@ import {
   describeMediaStep,
   describeMediaStop,
   mediaLadderLabel,
+  mediaPlanAction,
   nextMediaSilent,
   parseMediaPlan,
   viewerHzWireMessage,
+  type RcMediaPlan,
 } from '@/composables/mediaPlan'
 import { parseControlInbound } from '@/composables/useRemoteControl'
 
@@ -163,6 +165,55 @@ describe('FR-135 R2: what the page says', () => {
     expect(mediaLadderLabel([step('a', 'b'), step('b', 'c')])).toBe('b → c (2 steps)')
     expect(describeMediaStep(step('gpu', 'cpu', 'cpu_frames'))).toBe('gpu → cpu: cpu_frames')
     expect(describeMediaStep(step('gpu', 'cpu', ''))).toBe('gpu → cpu')
+  })
+})
+
+describe('FR-135 R2: what a page does with a plan', () => {
+  const planWith = (over: Partial<RcMediaPlan>): RcMediaPlan => ({
+    epoch: 2,
+    transport: 'data-channel-h264',
+    codec: 'h264',
+    chroma: null,
+    cell: null,
+    input: null,
+    fps: null,
+    capture: null,
+    ladder: [],
+    stopped: null,
+    ...over,
+  })
+
+  it('drops an older epoch and takes a newer or the same one', () => {
+    expect(mediaPlanAction(planWith({ epoch: 2 }), 3, true)).toBeNull()
+    expect(mediaPlanAction(planWith({ epoch: 3 }), 3, true)).not.toBeNull()
+    expect(mediaPlanAction(planWith({ epoch: 4 }), 3, true)).not.toBeNull()
+  })
+
+  it('takes a re-created session\'s first plan: its epoch starts over and the page\'s newest is reset', () => {
+    expect(mediaPlanAction(planWith({ epoch: 1 }), 0, true)).not.toBeNull()
+  })
+
+  it('words a stop', () => {
+    const stop = mediaPlanAction(planWith({ stopped: { why: 'no_encoder', detail: 'x' } }), 0, true)?.stop
+    expect(stop?.code).toBe('no_encoder')
+    expect(stop?.detail).toBe('x')
+  })
+
+  it('clears the words when an encoder opened', () => {
+    expect(mediaPlanAction(planWith({ cell: 'h264_qsv:yuv420' }), 0, true)?.stop).toBeNull()
+  })
+
+  it('leaves the words alone on a plan that knows neither: they would blink at every re-create', () => {
+    expect(mediaPlanAction(planWith({}), 0, true)?.stop).toBeUndefined()
+  })
+
+  it('shows the track when the device is on it and this page decodes a data channel', () => {
+    expect(mediaPlanAction(planWith({ transport: 'webrtc' }), 0, true)?.showTrack).toBe(true)
+  })
+
+  it('has nothing to show on a page already on the track, or a device on the channel', () => {
+    expect(mediaPlanAction(planWith({ transport: 'webrtc' }), 0, false)?.showTrack).toBe(false)
+    expect(mediaPlanAction(planWith({ transport: 'data-channel-h264' }), 0, true)?.showTrack).toBe(false)
   })
 })
 

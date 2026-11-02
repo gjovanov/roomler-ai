@@ -161,6 +161,26 @@ export function describeMediaStop(plan: Pick<RcMediaPlan, 'stopped' | 'ladder'>)
   }
 }
 
+export interface MediaPlanAction {
+  /** The page's words: new ones, `null` to clear them, or `undefined` to leave
+   *  them. A re-created session's first plan knows nothing yet about why the last
+   *  one stopped, and clearing on it would blink the words every 10 s. */
+  stop: MediaStopCopy | null | undefined
+  /** The device is on the RTP track, while this page decodes a data channel
+   *  nothing will arrive on: the black session. It has to show the track. */
+  showTrack: boolean
+}
+
+/** What a page does with a plan it just read. `null` for one older than the
+ *  newest this session has seen, which is dropped. */
+export function mediaPlanAction(plan: RcMediaPlan, newestEpoch: number, dataChannelActive: boolean): MediaPlanAction | null {
+  if (plan.epoch < newestEpoch) return null
+  return {
+    stop: plan.stopped ? describeMediaStop(plan) : plan.cell ? null : undefined,
+    showTrack: plan.transport === 'webrtc' && dataChannelActive,
+  }
+}
+
 /** One arrow, for the stats pill's title: `h264_nvenc → h264_qsv: no NVIDIA GPU`. */
 export function describeMediaStep(step: RcMediaStep): string {
   return step.why ? `${step.from} → ${step.to}: ${step.why}` : `${step.from} → ${step.to}`

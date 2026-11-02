@@ -770,15 +770,37 @@ mod tests {
         assert!(trail.take().is_empty());
     }
 
-    /// The switch, and the verb's source of truth. Env tests write process
-    /// state, so this is the only one that touches `MEDIA_PLAN`.
+    /// On by default. Its off is read on a guest and not here: this switch gates
+    /// a verb, and `the_daemon_assigns_every_config_list` compares two reads of
+    /// the verb list on another test thread.
     #[test]
-    fn the_switch_is_on_by_default_and_off_only_when_told() {
-        use tunnel_core::env::test_env::{Saved, set};
-        let _saved = Saved::cleared("MEDIA_PLAN");
+    fn the_switch_is_on_by_default() {
+        let _saved = tunnel_core::env::test_env::Saved::cleared("MEDIA_PLAN");
         assert!(enabled());
-        // SAFETY: this test alone touches this variable, and restores it on drop.
-        unsafe { set("MEDIA_PLAN", "0") };
-        assert!(!enabled());
+    }
+
+    /// A plan lives as long as its session: no channel ever opened here, so the
+    /// emitter is still in its retry when the session ends, and it must go.
+    #[tokio::test]
+    async fn a_session_that_ends_leaves_no_plan_behind() {
+        let id = ObjectId::new();
+        let end = CancellationToken::new();
+        start(
+            id,
+            Some("data-channel-h264"),
+            "h264",
+            Arc::new(tokio::sync::Mutex::new(None)),
+            end.clone(),
+        );
+        assert!(registry().get(&id).is_some());
+        fps_answer(id, 60, None);
+        end.cancel();
+        for _ in 0..200 {
+            if registry().get(&id).is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the plan outlived its session");
     }
 }

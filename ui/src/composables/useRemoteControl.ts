@@ -127,7 +127,7 @@ import {
 } from './frameRate'
 import {
   agentSaysMediaPlan,
-  describeMediaStop,
+  mediaPlanAction,
   nextMediaSilent,
   parseMediaPlan,
   viewerHzWireMessage,
@@ -7652,15 +7652,13 @@ export function useRemoteControl(
   /** FR-135 R2 — the device's plan: keep the newest, and act on the one thing in it
    *  a page must not leave to the watchdog. */
   function onMediaPlan(plan: RcMediaPlan) {
-    if (plan.epoch < mediaPlanEpoch) return
+    const action = mediaPlanAction(plan, mediaPlanEpoch, vp9_444Active.value || hevcActive.value)
+    if (!action) return
     mediaPlanEpoch = plan.epoch
     mediaPlan.value = plan
     console.info(`[rc] media plan ${JSON.stringify(plan)}`)
-    if (plan.stopped) mediaStop.value = describeMediaStop(plan)
-    else if (plan.cell) mediaStop.value = null
-    // The device says this session is on the RTP track, while this page opened
-    // a data channel nothing will arrive on: the black session. Show the track.
-    if (plan.transport === 'webrtc' && (vp9_444Active.value || hevcActive.value)) {
+    if (action.stop !== undefined) mediaStop.value = action.stop
+    if (action.showTrack) {
       console.warn('[rc] media plan: the device is sending over WebRTC, not the data channel this page opened - showing <video>')
       stopVp9_444Path()
       stopHevcPath()

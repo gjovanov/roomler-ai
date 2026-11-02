@@ -1161,6 +1161,29 @@ mod tests {
         assert_eq!(owner.merged_fps_ask(None), None);
     }
 
+    /// FR-135 R2 — the slowest screen that has said holds the stream, and a
+    /// viewer yet to measure is no floor, or a late joiner would lift a cap the
+    /// owner's own screen set.
+    #[tokio::test]
+    async fn the_viewers_refresh_takes_the_slowest_that_said() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-VIEWER-HZ");
+        let owner = Pipeline::register(key, ObjectId::new());
+        assert_eq!(owner.merged_viewer_hz(None), None, "nobody said");
+        assert_eq!(owner.merged_viewer_hz(Some(144)), Some(144), "alone");
+        let s = sink(ObjectId::new());
+        let follower_report = s.viewer_report.clone();
+        let _g = try_join(key, s, 60).expect("join");
+        assert_eq!(
+            owner.merged_viewer_hz(Some(144)),
+            Some(144),
+            "a follower yet to measure"
+        );
+        follower_report.store_viewer_hz(60);
+        assert_eq!(owner.merged_viewer_hz(Some(144)), Some(60));
+        assert_eq!(owner.merged_viewer_hz(None), Some(60), "the owner yet to");
+    }
+
     // P8 Phase 4 — the mixed-dial predicate: false with no followers,
     // false when everyone matches the owner, true on either a Priority
     // or a resolution-pick divergence.
