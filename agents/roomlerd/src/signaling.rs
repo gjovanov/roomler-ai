@@ -788,7 +788,7 @@ impl Drop for AbortOnDrop {
 
 /// #3280 — what a later caps try gives way to: a session on this device, a recording
 /// that outlives one, and a local recording, whose child opens the same encoders.
-fn live_on_this_host(
+pub(crate) fn live_on_this_host(
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
 ) -> impl Fn() -> bool + Send + 'static {
     move || {
@@ -798,6 +798,55 @@ fn live_on_this_host(
         }
         !rc_sessions.is_empty()
     }
+}
+
+/// What `rc:session.request` picked for a session, until its offer takes it.
+struct PendingCodec {
+    chosen: String,
+    /// What the browser takes, to pick again from. `None` when the daemon picked and
+    /// handed it to this GUI worker: that came from the daemon's answer, not this
+    /// process's.
+    browser_caps: Option<Vec<String>>,
+}
+
+/// #3280 — the codec and transport a session's offer builds its peer with. The
+/// request's picks, unless the answer in force has since stopped offering them
+/// ([`crate::encode::caps::picks_at_the_offer`]).
+///
+/// A session that skipped the request (some test harnesses do) or a broken message
+/// order gets "h264" so the peer still works: the universal fallback the browser
+/// understands. No transport is the legacy WebRTC track, the silent default for older
+/// controllers and for sessions that arrived without `preferred_transport`.
+fn picks_for_the_offer(
+    pending_codecs: &mut HashMap<bson::oid::ObjectId, PendingCodec>,
+    pending_transports: &mut HashMap<bson::oid::ObjectId, Option<String>>,
+    session_id: bson::oid::ObjectId,
+    in_force: impl FnOnce() -> roomler_ai_remote_control::models::AgentCaps,
+) -> (String, Option<String>) {
+    let transport = pending_transports.remove(&session_id).unwrap_or(None);
+    let Some(pending) = pending_codecs.remove(&session_id) else {
+        return ("h264".to_string(), transport);
+    };
+    let Some(browser_caps) = pending.browser_caps else {
+        return (pending.chosen, transport);
+    };
+    let picks = crate::encode::caps::picks_at_the_offer(
+        pending.chosen.clone(),
+        transport.clone(),
+        &browser_caps,
+        &in_force(),
+    );
+    if picks.0 != pending.chosen || picks.1 != transport {
+        warn!(
+            %session_id,
+            codec_was = %pending.chosen,
+            codec = %picks.0,
+            transport_was = ?transport,
+            transport = ?picks.1,
+            "rc:sdp.offer — what this session picked at its request is no longer offered"
+        );
+    }
+    picks
 }
 
 /// Drive the signaling loop forever. Returns only on fatal error (e.g.
@@ -1889,7 +1938,7 @@ async fn connect_once(
     // at `rc:sdp.offer` time to drive the track + encoder). Entries are
     // removed when the peer is built; orphaned entries (session
     // cancelled before SDP) get cleaned when the session is terminated.
-    let mut pending_codecs: HashMap<bson::oid::ObjectId, String> = HashMap::new();
+    let mut pending_codecs: HashMap<bson::oid::ObjectId, PendingCodec> = HashMap::new();
     // Y.3: same lifecycle as `pending_codecs` but for the negotiated
     // video transport. Inserted when `rc:session.request` arrives,
     // consumed when `rc:sdp.offer` builds the AgentPeer + media pump.
@@ -2795,7 +2844,13 @@ async fn connect_once(
                     crate::delegate::WorkerInbound::Params(p) => {
                         match bson::oid::ObjectId::parse_str(&p.session_id) {
                             Ok(sid) => {
-                                pending_codecs.insert(sid, p.codec);
+                                pending_codecs.insert(
+                                    sid,
+                                    PendingCodec {
+                                        chosen: p.codec,
+                                        browser_caps: None,
+                                    },
+                                );
                                 pending_transports.insert(sid, p.transport);
                                 pending_chroma.insert(sid, p.chroma);
                                 pending_chunk_framing.insert(sid, p.chunk_framing);
@@ -3230,7 +3285,7 @@ async fn handle_server_msg(
     >,
     msg: ServerMsg,
     peers: &mut HashMap<bson::oid::ObjectId, AgentPeer>,
-    pending_codecs: &mut HashMap<bson::oid::ObjectId, String>,
+    pending_codecs: &mut HashMap<bson::oid::ObjectId, PendingCodec>,
     pending_transports: &mut HashMap<bson::oid::ObjectId, Option<String>>,
     pending_chroma: &mut HashMap<bson::oid::ObjectId, Option<String>>,
     pending_chunk_framing: &mut HashMap<bson::oid::ObjectId, bool>,
@@ -3524,7 +3579,13 @@ async fn handle_server_msg(
             // track codec + encoder backend are actually bound.
             let our_caps = crate::encode::caps::detect();
             let chosen = crate::encode::caps::pick_best_codec(&browser_caps, &our_caps.codecs);
-            pending_codecs.insert(session_id, chosen.clone());
+            pending_codecs.insert(
+                session_id,
+                PendingCodec {
+                    chosen: chosen.clone(),
+                    browser_caps: Some(browser_caps.clone()),
+                },
+            );
 
             // Phase Y.3: figure out which video transport this
             // session will use. Honour `preferred_transport` only if
@@ -4089,19 +4150,13 @@ async fn handle_server_msg(
                     .carry_decode_errors(carried_decode_errors);
             }
 
-            // Read back the codec picked by `rc:session.request`. If
-            // the session skipped request (some test harnesses do) or
-            // the message order is broken, default to "h264" so the
-            // peer still works — that's the universal fallback the
-            // browser understands.
-            let chosen_codec = pending_codecs
-                .remove(&session_id)
-                .unwrap_or_else(|| "h264".to_string());
-            // Y.3: pull the transport stashed in the request handler.
-            // `None` (legacy WebRTC track) is the silent default for
-            // older controllers / sessions that arrived without
-            // preferred_transport.
-            let negotiated_transport = pending_transports.remove(&session_id).unwrap_or(None);
+            // Read back what `rc:session.request` picked. Y.3: the transport too.
+            let (chosen_codec, negotiated_transport) = picks_for_the_offer(
+                pending_codecs,
+                pending_transports,
+                session_id,
+                crate::encode::caps::detect,
+            );
             // #2231 — the RTP video track's codec, read from this offer: on a
             // DataChannel transport it moves to VP8 when the browser cannot
             // take the pump's codec, so the answer does not fail on a track
@@ -7496,6 +7551,75 @@ mod tests {
         assert!(live());
         sessions.remove(&session);
         assert!(!live());
+    }
+
+    fn caps_offering(
+        codecs: &[&str],
+        transports: &[&str],
+    ) -> roomler_ai_remote_control::models::AgentCaps {
+        roomler_ai_remote_control::models::AgentCaps {
+            codecs: codecs.iter().map(|c| c.to_string()).collect(),
+            transports: transports.iter().map(|t| t.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// #3280 — a later try took Media Foundation while a person decided, and the offer
+    /// comes minutes after the pick. A track bound to `av1` would carry no video and a
+    /// pump for a transport with no cell left would end, so each is picked again. A
+    /// pick that still stands is not asked about.
+    #[test]
+    fn an_offer_reads_its_picks_again_against_the_answer_in_force() {
+        let session = bson::oid::ObjectId::new();
+        let browser = vec!["av1".to_string(), "h265".to_string(), "h264".to_string()];
+        let picked = |codec: &str, browser: Option<Vec<String>>| {
+            HashMap::from([(
+                session,
+                PendingCodec {
+                    chosen: codec.to_string(),
+                    browser_caps: browser,
+                },
+            )])
+        };
+        let hevc_dc = || HashMap::from([(session, Some("data-channel-hevc".to_string()))]);
+        let (mut codecs, mut transports) = (picked("av1", Some(browser.clone())), hevc_dc());
+        assert_eq!(
+            picks_for_the_offer(&mut codecs, &mut transports, session, || {
+                caps_offering(&["h265", "h264"], &[])
+            }),
+            ("h265".to_string(), None),
+            "gone from the answer in force, so picked again"
+        );
+        assert!(
+            codecs.is_empty() && transports.is_empty(),
+            "the stash is taken"
+        );
+
+        let (mut codecs, mut transports) = (picked("h265", Some(browser.clone())), hevc_dc());
+        assert_eq!(
+            picks_for_the_offer(&mut codecs, &mut transports, session, || {
+                caps_offering(&["av1", "h265", "h264"], &["data-channel-hevc"])
+            }),
+            ("h265".to_string(), Some("data-channel-hevc".to_string())),
+            "still offered, so it stands, even with a better one there now"
+        );
+
+        // A GUI worker's picks are the daemon's, from an answer it does not hold.
+        let (mut codecs, mut transports) = (picked("av1", None), hevc_dc());
+        assert_eq!(
+            picks_for_the_offer(&mut codecs, &mut transports, session, || {
+                panic!("a worker does not ask its own answer")
+            }),
+            ("av1".to_string(), Some("data-channel-hevc".to_string())),
+        );
+
+        // A session that skipped its request.
+        assert_eq!(
+            picks_for_the_offer(&mut HashMap::new(), &mut HashMap::new(), session, || {
+                panic!("nothing to read again")
+            }),
+            ("h264".to_string(), None),
+        );
     }
 
     /// #2551 — a `ws.text` stage is refined to the message's wire tag, read

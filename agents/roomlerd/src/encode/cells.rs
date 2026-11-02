@@ -507,10 +507,14 @@ mod tests {
     #[test]
     fn the_learning_switch_reads_the_usual_spellings() {
         use tunnel_core::env::test_env::{Saved, set};
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _saved = Saved::cleared("CAPS_LEARN_DENY");
         assert!(learning_enabled(), "default on");
         for off in ["0", "false", "OFF", "no"] {
-            // SAFETY: no other test touches this suffix.
+            // SAFETY: serialised by DENY_ENV_LOCK, which a whole probe's tests hold
+            // too, and those read this switch; the guard restores it.
             unsafe { set("CAPS_LEARN_DENY", off) };
             assert!(!learning_enabled(), "{off} must switch it off");
         }
