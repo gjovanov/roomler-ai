@@ -174,10 +174,13 @@ export const BLOG_FRONTMATTER_KEYS = [
  * the edge for `/blog/` and `/sitemap-blog.xml`) and published without this
  * image. While true, the sitemap index lists `sitemap-blog.xml` WITHOUT a
  * `lastmod` and whether or not this image has posts: the image cannot know the
- * blog's newest date, and a stale one is worse than none. Flip it in the same
- * change that routes the edge, never before.
+ * blog's newest date, and a stale one is worse than none. On since the edge
+ * routes the lane (P2, roomler-ai-deploy#19). While it was still off, the
+ * served index dated the blog 2026-10-17, the newest post this image carried,
+ * when the lane had served posts up to 2026-10-30. Off again only if the lane
+ * is retired.
  */
-export const BLOG_LANE = false
+export const BLOG_LANE = true
 
 export interface Author {
   name: string

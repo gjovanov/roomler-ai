@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { BLOG_LANE, SITE_ORIGIN } from '../site.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const UI = join(HERE, '..', '..')
@@ -102,6 +103,15 @@ describe('--blog-only, the published post (AC1)', () => {
       expect(readFileSync(join(FULL, f), 'utf8').includes('/blog/assets/'), f).toBe(false)
     }
     expect(readFileSync(join(FULL, 'blog', 'index.html'), 'utf8')).toContain('/docs/assets/')
+  })
+
+  // The image still serves the index, while the lane serves the blog: the
+  // image cannot date a blog it no longer publishes.
+  it('the image’s sitemap index follows BLOG_LANE: the blog child is undated while the lane serves the blog', () => {
+    const index = readFileSync(join(FULL, 'sitemap.xml'), 'utf8')
+    const child = index.match(new RegExp(`<loc>${SITE_ORIGIN}/sitemap-blog\\.xml</loc>([\\s\\S]*?)</sitemap>`))
+    expect(child, index).not.toBeNull()
+    expect(child![1]!.includes('<lastmod>'), index).toBe(!BLOG_LANE)
   })
 })
 
