@@ -5,7 +5,9 @@
 # `scripts/selfhost-smoke.sh` proves the same document through a source build,
 # which takes 20 minutes and pulls none of the published images. This one takes
 # about two, and it fails when an image the compose file names can no longer be
-# pulled, the failure nothing noticed on #2034 because no lane pulled it.
+# pulled, the failure nothing noticed on #2034 because no lane pulled it. Then two
+# real browsers make a call, directly and over the relay (#3287), because "the
+# containers are up" says nothing about media on this architecture.
 #
 #   bash scripts/selfhost-pull-check.sh
 #
@@ -86,7 +88,8 @@ code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 http://localhost:8080/)"
 sleep 30
 say "services:"
 "${DC[@]}" ps -a --format '  {{.Service}}  {{.State}}  {{.Status}}'
-for svc in mongo redis minio roomler coturn; do
+for svc in $("${DC[@]}" config --services); do
+  [ "$svc" = minio-init ] && continue
   cid="$("${DC[@]}" ps -a -q "$svc")"
   state="$(docker inspect "$cid" --format '{{.State.Status}}')"
   restarts="$(docker inspect "$cid" --format '{{.RestartCount}}')"
@@ -96,7 +99,59 @@ done
 init="$("${DC[@]}" ps -a -q minio-init)"
 [ "$(docker inspect "$init" --format '{{.State.ExitCode}}')" = 0 ] || bad "minio-init failed, so uploads have no bucket"
 
-"${DC[@]}" down -v >/dev/null 2>&1
-rm -f "$ENVF"
+# ── a call, then a call over the relay ───────────────────────────────────────
+# The browser runs on this machine, in the Playwright image pinned to the repo's
+# runner, on the host network: the only way http://localhost:8080 is both the
+# server's Origin and a secure context, and the address the SFU announces.
+PW_VER="$(sed -nE 's/.*"@playwright\/test": "([0-9.]+)".*/\1/p' ui/package.json)"
+PW_DIR="$(mktemp -d)"
+cp -r ui/e2e ui/playwright.config.ts "$PW_DIR/"
+printf '{"name":"selfhost-e2e","private":true,"devDependencies":{"@playwright/test":"%s"}}\n' "$PW_VER" > "$PW_DIR/package.json"
+OVR=.selfhost-check.override.yml
+
+# restart_server [environment line]: only the server, on the given settings. The
+# rate limits are the profile matrix's one deviation: a Playwright run is one IP
+# doing a whole team's work.
+restart_server() {
+  {
+    printf 'services:\n  roomler:\n    environment:\n'
+    printf '      ROOMLER__APP__RATE_LIMIT_PER_SEC: "200"\n      ROOMLER__APP__RATE_LIMIT_BURST: "5000"\n'
+    printf '      ROOMLER__APP__AUTH_RATE_LIMIT_PER_MIN: "600"\n      ROOMLER__APP__AUTH_RATE_LIMIT_BURST: "600"\n'
+    [ -n "${1:-}" ] && printf '      %s\n' "$1"
+  } > "$OVR"
+  "${DC[@]}" -f "$OVR" up -d roomler >/dev/null 2>&1
+  for _ in $(seq 1 60); do
+    curl -fsS -m 3 -o /dev/null http://localhost:8080/health 2>/dev/null && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# browser_spec <spec> [docker run arguments]
+browser_spec() {
+  local spec="$1"
+  shift
+  docker run --rm --network host -v "$PW_DIR:/work" -w /work -e CI=1 \
+    -e E2E_BASE_URL=http://localhost:8080 -e E2E_API_URL=http://localhost:8080 "$@" \
+    "mcr.microsoft.com/playwright:v${PW_VER}-jammy" bash -lc \
+    "npm i --no-audit --no-fund >/tmp/npm.log 2>&1 || { tail -20 /tmp/npm.log; exit 1; }
+     npx playwright test $spec --reporter=line --retries=0"
+}
+
+say "a two-party call on the direct path"
+restart_server || bad "the server did not come back with the browser rate limits"
+browser_spec e2e/selfhost-collab.spec.ts || bad "the direct-path call failed on $(uname -m)"
+
+say "a two-party call with the relay forced"
+restart_server 'ROOMLER__TURN__FORCE_RELAY: "true"' || bad "the server did not come back with the relay forced"
+browser_spec e2e/selfhost-turn-relay.spec.ts -e E2E_EXPECT_TURN_RELAY=1 || bad "the call over the relay failed on $(uname -m)"
+"${DC[@]}" logs --no-log-prefix coturn 2>&1 | grep -E 'denied|403' | tail -8
+
+if [ "$FAIL" != 0 ] && [ -d "$PW_DIR/test-results" ]; then
+  mkdir -p selfhost-artifacts && cp -r "$PW_DIR/test-results" selfhost-artifacts/ 2>/dev/null
+fi
+
+"${DC[@]}" -f "$OVR" down -v >/dev/null 2>&1
+rm -f "$ENVF" "$OVR"
 [ "$FAIL" = 0 ] && say "the documented path works on $(uname -m)"
 exit "$FAIL"

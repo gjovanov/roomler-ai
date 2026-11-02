@@ -4,8 +4,8 @@
  * #3287 — a self-hosted call whose media really crosses the compose file's
  * coturn. "coturn is running" and "an allocation succeeded" are both true of a
  * relay that carries nothing, so this asks the browsers: every connected peer
- * connection must have selected a `relay` candidate, and each side must decode
- * the other's frames, advancing, over that path.
+ * connection must have selected a pair on a TURN allocation, and each side must
+ * decode the other's frames, advancing, over that path.
  *
  * Runs INSIDE the server VM, for the same three reasons as
  * `selfhost-collab.spec.ts`, against a server started with
@@ -122,7 +122,12 @@ test.describe('#3287 a call over the self-host TURN relay', () => {
         const connected = paths.filter((path) => path.state === 'connected')
         expect(connected.length, `${tag} has no connected peer connection`).toBeGreaterThan(0)
         for (const path of connected) {
-          expect(path.localType, `${tag} selected a pair that is not relayed`).toBe('relay')
+          // Not `localType`: it reads `prflx` on this pair although the socket is the
+          // allocation. coturn and the SFU share an address here, so the SFU answers
+          // to the allocation's private side and Chrome learns that as a new candidate
+          // on the same relayed socket. `url` and `relayProtocol` name the socket.
+          expect(path.relayProtocol, `${tag} selected a pair that is not relayed`).not.toBeNull()
+          expect(path.localUrl ?? '', `${tag} selected a pair that is not relayed`).toMatch(/^turns?:/)
           expect(path.bytesReceived, `${tag} received nothing over its relay pair`).toBeGreaterThan(0)
         }
         expect(
