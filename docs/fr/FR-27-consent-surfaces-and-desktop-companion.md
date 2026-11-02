@@ -94,7 +94,7 @@ Every line below was read on `origin/master` at `861d4557`.
    `Spawning self-update: No such file or directory (os error 2)` made this
    look like a second, independent macOS defect. It is not: `self_update_cmd`
    has queued the root `com.roomler.update` helper for a non-root macOS caller
-   since FR-5 (`app.rs:3816`), so the mechanism was already correct and
+   since FR-5 (`app.rs:3830`), so the mechanism was already correct and
    finding 7 alone accounts for the error. What WAS wrong is that
    `cmd_apply_update` spawned detached and discarded stdout, so the daemon's
    <!-- RETIRED-NAME-ANCHOR: quoting the daemon's OWN output; that log path is
@@ -163,7 +163,7 @@ Two things make the native backends much cheaper than they look, both verified
 against `Cargo.lock`: **`x11rb 0.13.2`, `objc2 0.6.4` and `objc2-app-kit 0.3.2`
 are already locked** (via enigo/arboard and tauri), so neither adds a new
 dependency tree; and the macOS daemon **already ships as an `.app` with
-`LSUIElement=true`** (`release-agent.yml:2529`), the bundle identity AppKit
+`LSUIElement=true`** (`release-agent.yml:2542`), the bundle identity AppKit
 windows require.
 
 ⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/app.rs:741`
