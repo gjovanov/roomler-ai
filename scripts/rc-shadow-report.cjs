@@ -491,8 +491,7 @@ class ShadowReport {
   /** Feed one NDJSON / fleet-read row: `{ a, t, m, f }`. */
   addRow(row) {
     if (!row) return;
-    const t = row.t && typeof row.t.toISOString === 'function' ? row.t.toISOString() : row.t;
-    this.add(row.m, row.f || {}, t, row.a ? text(row.a) : null);
+    this.add(row.m, row.f || {}, row.t instanceof Date ? row.t.toISOString() : row.t, row.a ? text(row.a) : null);
   }
 
   finish() {
@@ -1351,9 +1350,7 @@ function selfTest() {
       const v = value(p.fields[k]);
       f[k] = typeof v === 'number' && Number.isInteger(v) && /^\d+$/.test(p.fields[k]) ? { toNumber: () => v } : p.fields[k].replace(/^"(.*)"$/, '$1');
     }
-    // A date from the driver is not `instanceof` this realm's Date under mongosh.
-    const iso = new Date(p.ts).toISOString();
-    viaRow.addRow({ a: { toHexString: () => 'aaaaaaaaaaaaaaaaaaaaaaaa' }, t: { toISOString: () => iso }, m: p.msg, f });
+    viaRow.addRow({ a: { toHexString: () => 'aaaaaaaaaaaaaaaaaaaaaaaa' }, t: new Date(p.ts), m: p.msg, f });
   }
   const textOut = viaText.finish();
   const rowOut = viaRow.finish();
