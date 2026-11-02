@@ -17,8 +17,12 @@
  * purpose needs consent (ePrivacy Art. 5(3)); this site has no consent banner
  * and must not need one. The keys live in links, and only in links.
  *
- * No campaign key on the URL, no change at all: that is every organic visit.
- * With one, only `href`s change, so nothing on the page moves.
+ * No campaign key on the URL, no change at all, with one exception (FR-91
+ * #1880 §3e): a journey that began on the blog, from another site. That is a
+ * reader who found a post in search, and only `referrer_host` and
+ * `landing_path` are carried for them. Every other organic visit changes
+ * nothing. When something is carried, only `href`s change, so nothing on the
+ * page moves.
  *
  * ⚠️ The keys are the register view's (`ui/src/utils/attribution.ts`), locked
  * equal by `docs/__tests__/attribution.spec.ts`. The build omits this script
@@ -30,6 +34,9 @@
   var CAMPAIGN = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'ref']
   // The server keeps 64 characters of each value (FR-88 §3a).
   var MAX = 64
+  // Where an organic journey must begin for it to be carried (FR-91 §3e):
+  // the blog's index, its tag pages and its posts.
+  var ORGANIC_PREFIX = '/blog/'
 
   // Where a campaign is carried to, and nowhere else, same origin only:
   // sign-up; sign-in, whose provider buttons create an account when there is
@@ -84,13 +91,20 @@
     var v = param(CAMPAIGN[i])
     if (v) carried.push([CAMPAIGN[i], v])
   }
-  if (!carried.length) return
 
   // A page of this site that the visitor reached by a carried link already
   // knows where the journey began; only the first page works it out.
   var referrer = param('referrer_host') || externalHost(document.referrer)
+  var landing = param('landing_path') || here.pathname.slice(0, MAX)
+
+  // Without a campaign, only a journey that began on the blog, from another
+  // site, is carried. The test is on where it BEGAN, so a reader who goes
+  // from the post to an install guide keeps it through the guide's own
+  // sign-up link.
+  if (!carried.length && !(referrer && landing.indexOf(ORGANIC_PREFIX) === 0)) return
+
   if (referrer) carried.push(['referrer_host', referrer])
-  carried.push(['landing_path', param('landing_path') || here.pathname.slice(0, MAX)])
+  carried.push(['landing_path', landing])
 
   function carry() {
     var links = document.querySelectorAll('a[href]')
