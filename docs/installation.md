@@ -638,19 +638,21 @@ can fail the old product's `UnregisterAutostart` has deleted the task, and past
 `StopOldDaemon` the daemon has gone too. A rollback restores the old files. Nothing
 restored the task until #3292, because the old table has no rollback action of its own.
 
-| Failure, measured on candidates by a forced failing action | Before | Now |
+| Failure, measured on signed candidates by a forced failing action | Before | Now |
 |---|---|---|
-| From a release before the launcher, after `StopOldDaemon` | Exit 1603, old files, **no task, no daemon, row offline** | Exit 1603, old files, the old task back, the old daemon started by `DaemonBackOnRollback`, row online on the old version |
+| From a release before the launcher, after `StopOldDaemon` | Exit 1603, old files, **no task, no daemon, row offline** | Exit 1603, old files, the old task back, the old daemon started by `DaemonBackOnRollback` within a second, row online on the old version |
 | The same, just before `InstallFinalize` | Exit 1603, old files, **a task naming a launcher the rollback removed** (`0x80070002` each minute), row offline | The same as above: `AutostartBackOnRollback` overwrites it |
-| From a release with the launcher, after `StopOldDaemon` | Exit 1603, old files, **no task, no daemon, row offline** | The same as above, on the launcher |
-| From a release with the launcher, just before `InstallFinalize` | Exit 1603, old files, the new task, whose one-shot starts the daemon | No change in what the device ends up with |
+| The same, before `InstallFiles` | Exit 1603, old files, **no task**. The old daemon was never stopped, so the row stays online until the next sign-in, when nothing starts it | Exit 1603, old files, the old task back. `DaemonBackOnRollback`'s start answers 8, because the old daemon still runs. Row online on the old version |
+| From a release with the launcher, after `StopOldDaemon` | Exit 1603, old files, **no task, no daemon, row offline** | The same as the first row, on the launcher |
+| From a release with the launcher, just before `InstallFinalize` | Exit 1603, old files, the restored task, whose one-shot starts the daemon a minute on | The same device, with the daemon back within a second |
 
 `AutostartBackOnRollback` and `DaemonBackOnRollback` (`agents/roomlerd/wix/main.wxs`) run
 the restored `roomlerd.exe`, the one file every release has, so the task is the one that
 release writes, and each can flash a terminal, on a failed upgrade only. They sit ahead
 of `RemoveExistingProducts` because a rollback plays the script backwards: the old files
 are back when they run. `service install` comes back first, because `service start` needs
-its task. An uninstall that fails gets the same pair. `InstallExecute` sits between them and
+its task. An uninstall that fails gets the same pair (measured: exit 1603, "Removal failed", the
+daemon back within a second, row online). `InstallExecute` sits between them and
 `RemoveExistingProducts`, because that action refuses to run with anything spooled ahead of
 it: `Error 2613`, exit 1603, on every upgrade, healthy ones included (measured on signed
 candidates; ICE63 only warns). It flushes those two and nothing else, so the old product's
@@ -663,6 +665,55 @@ action ran. `start_user_daemon_after_a_failure` (`agents/roomlerd/src/post_insta
 starts the task on a failed verdict. It runs in the watcher of the release being updated
 FROM, so the first update onto it does not have it: that device stays down until the next
 sign-in.
+
+**A standard user's rollback cannot restore the Installer's own registration.** The files
+come back and the registration does not: the rollback's registry opens under
+`HKU\<SID>\Software\Microsoft\Installer\Products` and
+`HKLM\…\Installer\UserData\<SID>\Products` answer error 5, and the MSI log counts about 166
+`Error in rollback skipped`. The failed product stays registered, with its cached package
+deleted. The released tables do the same, so this is older than #3292.
+
+| After, measured on signed candidates | The Installer's products (`ProductsEx`) | Apps & Features | What runs |
+|---|---|---|---|
+| A healthy upgrade | 1: the new version | 1: the new version | The new version |
+| A failure past `InstallFiles` | 2: the failed version (installed, no package), the old one (advertised, no version) | 1: **the failed version, which is not what runs** | The old version |
+| A failure before `InstallFiles` | 1: the old one (advertised, no version) | **None** | The old version |
+| A failed uninstall | 1: the product (advertised, no version) | **None** | The same version |
+| The next release over a failure past `InstallFiles`, by the updater | 3: the new version, the failed one, the old one | 2: the failed version, the new one | The new version |
+| The next release over a failure before `InstallFiles`, by the updater | 2: the new version, the old one (advertised) | 1: the new version | The new version |
+| A failure inside the old product's removal | 1: the new version | 1: the new version | The new version |
+| A cached package deleted from `C:\Windows\Installer`, then the next release by the updater | 2: the new version, the old one (installed, no package) | 2: the old version, the new one | The new version |
+
+**`IgnoreRemoveFailure` keeps such a device updating.** Without it the next release's
+`RemoveExistingProducts` finds a product with no package and stops the install: Error 1714,
+System Error 1612, exit 1603, on every release from then on. A cached package deleted from
+`C:\Windows\Installer` does the same to a healthy machine, and on a self-update the device
+also stays offline, because the daemon has left (measured to +6 min, on a watcher without the
+start above). With it that 1612 is ignored, and a self-update lays the new files, the task
+and the one-shots as usual (measured from the released 0.4.197's updater and from a release
+with the attribute). A daemon still on its way out when the copy reaches `roomlerd.exe` makes
+that exit 3010, with the file replaced in use and the row online on the new version in 15 s;
+the watcher records 3010 as `InstallerFailed` (#3340). A failure inside the old product's
+removal is ignored too: its table has already unregistered it and nothing is played back, so
+the install carries on to exit 0 and one product. Without the attribute that failure was exit
+1603, no Apps entry and no task.
+
+What it does not do:
+
+- **It does not remove the stale entry.** The entry stays through every later release. A
+  person's Uninstall of it answers 1612 and changes nothing, because its package is gone.
+  Uninstalling the current entry stops the daemon and removes the task, and the stale
+  product keeps the files it shares with that release in the folder.
+- **It does not help a hand upgrade with the daemon running.** The old product did not leave
+  and `StopOldDaemon` comes after `InstallFiles`, so `roomlerd.exe` is in use: Error 1310,
+  exit 1603, no change, row online on the old version. `roomlerd service stop` first, and it
+  goes through.
+- **It does not help the failed version again.** That answers 1612, so an updater retrying the
+  same release gets that until a newer one publishes.
+  `start_user_daemon_after_a_failure` has the device back in seconds; on the first update
+  onto it, the device stays down until the next sign-in.
+
+The per-machine table has no such attribute, and none of this was read on it.
 
 ### What an MSI run does to the `Roomler` service
 

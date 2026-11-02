@@ -89,14 +89,14 @@
             SummaryCodepage='1252' />
 
         <!--
-          #3292: IgnoreRemoveFailure, because a rollback under a standard user cannot
-          restore the installer's own registration: its registry opens answer error 5,
-          and 165 lines of "Error in rollback skipped" later the failed product is still
-          registered as installed, with no package anywhere. Without this, every later
-          release stops at Error 1714, System Error 1612, "the older version cannot be
-          removed": one failed upgrade would freeze that device's updates for good. With
-          it, the new files go over the old ones and RegisterAutostart runs as usual. An
-          action failing inside the old product's removal still rolls the install back.
+          #3292: IgnoreRemoveFailure: an old product that cannot leave must not end a
+          device's updates. A standard user's rollback leaves the failed product
+          registered with no package (166 "Error in rollback skipped"), and a cleaned
+          C:\Windows\Installer does the same to a healthy one: every later release stopped
+          at Error 1714, System Error 1612. With this, a self-update lays the new files, the
+          task and the one-shots as usual, at the price of a stale Apps entry. An action
+          failing inside the old product's removal carries on too, with nothing played back.
+          By hand with the daemon running it does not help: Error 1310, exit 1603, no harm.
         -->
         <MajorUpgrade
             Schedule='afterInstallExecute'

@@ -107,6 +107,13 @@ that way, and `installer-smoke` holds it against the built MSI.
 `afterInstallExecute`.** With anything spooled ahead of it, that action fails every upgrade, healthy
 ones included: `Error 2613`, exit 1603 (measured on signed candidates). ICE63 only warns, and a
 compile or a sequence read does not see it: only a real upgrade does.
+⚠️ **`IgnoreRemoveFailure='yes'` on the per-user `MajorUpgrade` keeps a device updating after a failed
+upgrade; it does not make a rollback work.** A standard user's rollback cannot restore the Installer's
+registration (error 5 on each registry open, `Error in rollback skipped`), so the failed product stays
+registered with no package, and without the attribute every later release stops at Error 1714, System
+Error 1612 (measured). With it a self-update goes on, at the price of a stale Apps entry a person cannot
+remove. The daemon has to be gone first, as on a self-update: by hand with it running, Error 1310, exit
+1603, no harm (`docs/installation.md`, "When a per-user upgrade fails").
 ⚠️ **Nothing a custom action starts proves a policy allows a file.** The installer's token is
 `SANDBOX_INERT`, which AppLocker does not check: the blocked launcher ran every action, with MSI exit
 0, and the task it registered could not start (`0x800704EC`). A scheduled task is the start with the
