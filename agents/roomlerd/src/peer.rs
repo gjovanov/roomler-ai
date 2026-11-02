@@ -1623,6 +1623,16 @@ impl AgentPeer {
             });
         }
 
+        // FR-135 R2 — say what this session is set to send, before any pump
+        // runs, so a pump that cannot start still leaves the viewer knowing.
+        crate::media_plan::start(
+            session_id,
+            negotiated_transport.as_deref(),
+            &chosen_codec,
+            control_dc.clone(),
+            session_end.clone(),
+        );
+
         // Start the capture→encode→track pump. The pump is self-regulating:
         // with no capture backend compiled in, open_default returns a Noop
         // that parks forever, producing no samples. Phase Y.3:
@@ -2640,6 +2650,9 @@ async fn media_pump(
             );
         }
     }
+    // FR-135 R2 — from here this session is on the RTP track, whatever it
+    // negotiated above, and its plan must not promise otherwise.
+    crate::media_plan::on_rtp_track(session_id, &chosen_codec);
     // Suppress the "field never read" warning when the legacy path
     // ignores video_bytes_dc (no vp9-444 feature, or webrtc track
     // mode). The handle is still created in peer.rs because the
@@ -6495,6 +6508,8 @@ async fn media_pump_ffmpeg_dc(
     } else {
         None
     };
+    // FR-135 R2 — whether the grant reads the viewer's measured refresh.
+    let viewer_hz_cap = crate::encode::frame_rate::viewer_hz_cap_enabled();
     let mut fps_state = fps_high.then(|| {
         let verdicts = fps_cache
             .as_ref()
@@ -6513,6 +6528,7 @@ async fn media_pump_ffmpeg_dc(
     // encoder, its dims), and when: decided again when any of it moves, and
     // once a second for the pipe's belief.
     type FpsDecidedOn = (
+        Option<u32>,
         Option<u32>,
         u32,
         bool,
@@ -7558,6 +7574,13 @@ async fn media_pump_ffmpeg_dc(
             if told != fps_told {
                 fps_told = told;
                 video_info_sent = false;
+                // FR-135 R2 — asked to granted, for the plan.
+                let answer = state.answer();
+                crate::media_plan::fps_answer(
+                    session_id,
+                    answer.fps,
+                    answer.refused.map(|(asked, why)| (asked, why.wire())),
+                );
             }
         }
 
@@ -8309,8 +8332,14 @@ async fn media_pump_ffmpeg_dc(
             && let (Some(enc), Some(enc_dims)) = (encoder.as_ref(), encoder_dims)
         {
             let asked = pipeline.merged_fps_ask(viewer_report.fps_ask());
+            // FR-135 R2 — `None` with the cap off, so the decision and its
+            // cadence are what they were.
+            let viewer_hz = viewer_hz_cap
+                .then(|| pipeline.merged_viewer_hz(viewer_report.viewer_hz()))
+                .flatten();
             let on = (
                 asked,
+                viewer_hz,
                 base_fps,
                 constrained,
                 capturer.backend(),
@@ -8360,6 +8389,7 @@ async fn media_pump_ffmpeg_dc(
                     cap: base_fps,
                     constrained,
                     refresh_hz: capturer.refresh_hz(),
+                    viewer_hz,
                     rates: crate::encode::frame_rate::rate_facts(
                         asked,
                         base_fps,
@@ -8753,7 +8783,12 @@ async fn media_pump_ffmpeg_dc(
             // FR-118 P2-2 — a GPU frame names its capture device, and a QSV
             // encoder opened in its scope takes GPU frames from it.
             let gpu_device = crate::encode::ffmpeg::gpu_hint::device_of(&frame);
+            // FR-135 R2 — what this open tries before its answer, for the plan.
+            let capture_gpu = gpu_device.is_some();
+            let open_trail = crate::media_plan::OpenTrail::default();
+            let trail = open_trail.clone();
             let __opened = match tokio::task::spawn_blocking(move || {
+                let _recording = trail.recording();
                 crate::encode::ffmpeg::gpu_hint::opening_on(gpu_device, || {
                     codec.open(
                         w,
@@ -8785,6 +8820,14 @@ async fn media_pump_ffmpeg_dc(
             match __opened {
                 Ok(enc) => {
                     let encoder_name = enc.name();
+                    crate::media_plan::encoder_opened(
+                        session_id,
+                        encoder_name,
+                        enc.chroma444(),
+                        capturer.backend(),
+                        capture_gpu,
+                        &open_trail.take(),
+                    );
                     // rc.445 — the proven backend skips the dead cascade
                     // prefix on the next rebuild, and stale pre-rebuild
                     // frames stop delaying the fresh encoder's IDR.
@@ -8865,6 +8908,9 @@ async fn media_pump_ffmpeg_dc(
                         %e,
                         "FFmpeg DC pump: encoder construction failed — exiting pump"
                     );
+                    // FR-135 R2 — the black page's reason: until this the
+                    // only trace of it was the line above, on the host.
+                    crate::media_plan::no_encoder(session_id, &e.to_string(), &open_trail.take());
                     return;
                 }
             }
@@ -9419,6 +9465,7 @@ async fn media_pump_ffmpeg_dc(
                             consecutive = err_ladder.consecutive(),
                             "FFmpeg DC pump: encoder unrecoverable after rebuilds — exiting pump (pipeline reaps, viewer renegotiates)"
                         );
+                        crate::media_plan::encoder_fault(session_id, &e.to_string());
                         return;
                     }
                 }
@@ -9788,6 +9835,11 @@ async fn media_pump_ffmpeg_dc(
             // one grep; read `idr_count` against `keyframe_requests` to isolate
             // rate-caused IDRs.
             let rate_stats = enc.rate_stats().await;
+            crate::media_plan::input_form(
+                session_id,
+                rate_stats.input.gpu,
+                rate_stats.input.reason,
+            );
             // FR-118 P0 — `avg_encode_ms` split into its four steps, and the
             // capture thread's own readback, per frame over this window (0.0
             // when the window had none, like `avg_encode_ms`). The readback runs
@@ -10671,6 +10723,21 @@ fn attach_control_handler(
                         }
                         None => {
                             debug!(%session_id, "control: rc:fps with no offered rate — dropped");
+                        }
+                    }
+                }
+                "rc:viewer-hz" => {
+                    // FR-135 R2 — how fast this viewer's screen refreshes,
+                    // measured by its decode worker and sent when it changes.
+                    // Stored and logged. The grant reads it only under
+                    // `ROOMLERD_VIEWER_HZ_CAP=1`.
+                    match crate::encode::frame_rate::parse_viewer_hz(&val) {
+                        Some(hz) => {
+                            viewer_report.store_viewer_hz(hz);
+                            info!(%session_id, hz, "control: rc:viewer-hz");
+                        }
+                        None => {
+                            debug!(%session_id, "control: rc:viewer-hz with no usable rate — dropped");
                         }
                     }
                 }

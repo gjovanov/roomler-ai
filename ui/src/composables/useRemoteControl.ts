@@ -126,6 +126,15 @@ import {
   type FrameRate,
 } from './frameRate'
 import {
+  agentSaysMediaPlan,
+  describeMediaStop,
+  nextMediaSilent,
+  parseMediaPlan,
+  viewerHzWireMessage,
+  type MediaStopCopy,
+  type RcMediaPlan,
+} from './mediaPlan'
+import {
   createRelAccumulator,
   relativeAutoSwitchedOff,
   relativeButtonMessage,
@@ -1499,6 +1508,7 @@ export type RcControlInbound =
   | { kind: 'clock_echo'; t0: number; agentUs: number }
   | { kind: 'desktop_changed'; name: string }
   | { kind: 'video_info'; info: RcVideoInfo }
+  | { kind: 'media_plan'; plan: RcMediaPlan }
   | { kind: 'media_unavailable'; reason: RcMediaUnavailable }
   /** FR-97 P3c-1 — the session's audio track carries no sound, and why. */
   | { kind: 'audio_unavailable'; reason: RcAudioUnavailable }
@@ -1603,6 +1613,12 @@ export function parseControlInbound(data: unknown): RcControlInbound {
           : {}),
       },
     }
+  }
+  // FR-135 R2 — what the device promised this session. A plan with no epoch,
+  // transport or codec is no plan, and is dropped like any unknown message.
+  if (obj.t === 'rc:media-plan') {
+    const plan = parseMediaPlan(obj)
+    if (plan) return { kind: 'media_plan', plan }
   }
   // FR-80 — the agent says this session will produce no pixels, and why.
   // `code` is a closed vocabulary but an unknown one is kept, not dropped:
@@ -5416,6 +5432,12 @@ export function useRemoteControl(
         advanced,
         mediaUnavailable.value !== null || agentIsWaiting(mediaWaiting.value, Date.now()),
       )
+      // FR-135 R2 — the first picture ends what the page said about having none.
+      mediaSilent.value = nextMediaSilent(mediaSilent.value, advanced, sessionPainted, mediaPlan.value !== null, stallTicks)
+      if (advanced) {
+        sessionPainted = true
+        mediaStop.value = null
+      }
       degraded.value = classifyDegraded({
         pcState: pc?.connectionState ?? null,
         wsConnected: ws.status === 'connected',
@@ -5523,6 +5545,20 @@ export function useRemoteControl(
   /** FR-80 — set when the agent tells us it cannot capture; cleared on every
    *  new connect so a fixed host stops showing yesterday's reason. */
   const mediaUnavailable = ref<RcMediaUnavailable | null>(null)
+  /** FR-135 R2 — the device's plan for this session; `null` from an older agent. */
+  const mediaPlan = ref<RcMediaPlan | null>(null)
+  /** FR-135 R2 — why the device stopped its video. Outlives the watchdog's
+   *  re-create, or the page's one sentence would blink every 10 s. */
+  const mediaStop = ref<MediaStopCopy | null>(null)
+  /** FR-135 R2 — a plan, and no picture ever came (`nextMediaSilent`). */
+  const mediaSilent = ref(false)
+  /** FR-135 R2 — how fast this screen refreshes, from the decode worker. */
+  const viewerHz = ref<number | null>(null)
+  /** The newest plan's epoch this session. Apart from `mediaPlan`, because the
+   *  next session's plan starts at 1 again. */
+  let mediaPlanEpoch = 0
+  /** Whether this session has painted, for `mediaSilent`. */
+  let sessionPainted = false
   /** FR-97 P3c-1 — set when the agent says this session's audio track carries
    *  no sound; cleared on every new connect, like `mediaUnavailable`. */
   const audioUnavailable = ref<RcAudioUnavailable | null>(null)
@@ -7599,6 +7635,38 @@ export function useRemoteControl(
     sendControl(fpsWireMessage(frameRate.value, retry))
   }
 
+  /** FR-135 R2 — tell the agent how fast this screen refreshes, if it takes it.
+   *  No-op while the channel is closed; its `onopen` calls this. */
+  function sendViewerHz() {
+    if (viewerHz.value === null || !agentSaysMediaPlan(agent?.value?.capabilities?.rpc)) return
+    sendControl(viewerHzWireMessage(viewerHz.value))
+  }
+
+  function onViewerHz(hz: unknown) {
+    if (typeof hz !== 'number' || !Number.isFinite(hz) || hz <= 0) return
+    viewerHz.value = hz
+    console.info(`[rc] viewer_hz ${hz}`)
+    sendViewerHz()
+  }
+
+  /** FR-135 R2 — the device's plan: keep the newest, and act on the one thing in it
+   *  a page must not leave to the watchdog. */
+  function onMediaPlan(plan: RcMediaPlan) {
+    if (plan.epoch < mediaPlanEpoch) return
+    mediaPlanEpoch = plan.epoch
+    mediaPlan.value = plan
+    console.info(`[rc] media plan ${JSON.stringify(plan)}`)
+    if (plan.stopped) mediaStop.value = describeMediaStop(plan)
+    else if (plan.cell) mediaStop.value = null
+    // The device says this session is on the RTP track, while this page opened
+    // a data channel nothing will arrive on: the black session. Show the track.
+    if (plan.transport === 'webrtc' && (vp9_444Active.value || hevcActive.value)) {
+      console.warn('[rc] media plan: the device is sending over WebRTC, not the data channel this page opened - showing <video>')
+      stopVp9_444Path()
+      stopHevcPath()
+    }
+  }
+
   /** FR-119 P1 — the viewer picked a frame rate (P2b-17b: `retry` = try it again). */
   function setFrameRate(next: FrameRate, retry = false) {
     frameRate.value = next
@@ -8113,6 +8181,10 @@ export function useRemoteControl(
         onBenchProbe(msg.seq, msg.paintedAt, 'vp9-444')
         return
       }
+      if (msg.type === 'viewer-hz') {
+        onViewerHz(msg.hz)
+        return
+      }
       if (msg.type === 'request-keyframe') {
         // rc.130 Ã¢ÂÂ worker dropped deltas on a decode backlog; ask the agent
         // for a fresh IDR so it can resync.
@@ -8401,6 +8473,10 @@ export function useRemoteControl(
       if (!msg || typeof msg.type !== 'string') return
       if (msg.type === 'bench-probe') {
         onBenchProbe(msg.seq, msg.paintedAt, 'hevc')
+        return
+      }
+      if (msg.type === 'viewer-hz') {
+        onViewerHz(msg.hz)
         return
       }
       if (msg.type === 'request-keyframe') {
@@ -9357,8 +9433,15 @@ export function useRemoteControl(
     phase.value = 'reconnecting'
     // FR-93 P5j — a computer going to sleep keeps saying so through the redial.
     const kept = waitKeptAcrossReconnect(mediaWaiting.value, Date.now())
+    // FR-135 R2 — so is why this page has no picture, until one comes.
+    const keptStop = mediaStop.value
+    const keptSilent = mediaSilent.value
+    const keptPlan = keptStop || keptSilent ? mediaPlan.value : null
     teardown()
     if (kept) mediaWaiting.value = kept
+    mediaStop.value = keptStop
+    mediaSilent.value = keptSilent
+    mediaPlan.value = keptPlan
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null
       fireReconnectAttempt()
@@ -9497,6 +9580,11 @@ export function useRemoteControl(
     mediaUnavailable.value = null
     audioUnavailable.value = null
     mediaWaiting.value = null
+    mediaPlan.value = null
+    mediaPlanEpoch = 0
+    mediaStop.value = null
+    mediaSilent.value = false
+    sessionPainted = false
     inputReach.value = null
     idleEndsAt.value = null
     dcDecoderCodec.value = null
@@ -10608,6 +10696,8 @@ export function useRemoteControl(
       sendPriorityPreference()
       // FR-119 P1 — re-ask for the stored frame rate (agents with fps-high only).
       sendFrameRatePreference()
+      // FR-135 R2 — a re-created session's agent has not heard this screen's rate.
+      sendViewerHz()
     }
     // The control DC closing while the session still reports
     // 'connected' means the transport died under us (SCTP teardown
@@ -10679,6 +10769,8 @@ export function useRemoteControl(
         // honest stats badge (replaces the hardcoded "VP9 4:4:4 SW").
         videoInfo.value = parsed.info
         console.info('[rc] video-info', parsed.info)
+      } else if (parsed?.kind === 'media_plan') {
+        onMediaPlan(parsed.plan)
       } else if (parsed?.kind === 'media_unavailable') {
         // FR-80 — the host cannot capture. Surfaced on the canvas, because
         // the alternative the operator had was a black rectangle and a
@@ -11158,8 +11250,9 @@ export function useRemoteControl(
     // If we're advertising the data-channel transport, open the DC +
     // worker NOW so the channel lands in the SDP offer. The agent
     // will only actually pump bytes through it when its caps include
-    // the same transport, so opening it speculatively is harmless on
-    // older agents (they ignore the channel entirely).
+    // the same transport. An older agent ignores the channel, and a session
+    // it then sends over the RTP track is black until the watchdog gives up;
+    // an agent with a plan says so, and `onMediaPlan` shows the track (FR-135 R2).
     if (preferredTransport === 'data-channel-vp9-444') {
       // rc.190 Ã¢ÂÂ when the pick forced 4:2:0 (auto-rank / HEVC fallback),
       // configure the worker for profile 0 explicitly so the codec
@@ -13715,6 +13808,10 @@ export function useRemoteControl(
      *  badge falls back to a selection-derived label then. */
     videoInfo,
     mediaUnavailable,
+    mediaPlan,
+    mediaStop,
+    mediaSilent,
+    viewerHz,
     // FR-97 P3c-1 — why this session's audio track carries no sound, or null.
     audioUnavailable,
     mediaWaiting,

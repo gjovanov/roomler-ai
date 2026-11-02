@@ -339,6 +339,19 @@ impl Pipeline {
         })
     }
 
+    /// FR-135 R2 — the slowest screen among the viewers that have said. One
+    /// stream serves them all, and a viewer yet to measure has not asked for a
+    /// faster one, so it does not lift the floor (unlike [`Self::merged_fps_ask`]).
+    pub fn merged_viewer_hz(&self, own: Option<u32>) -> Option<u32> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .followers
+            .iter()
+            .filter_map(|f| f.sink.viewer_report.viewer_hz())
+            .chain(own)
+            .min()
+    }
+
     /// Floor-merge of the Priority dial's relay resolution cap: the smallest
     /// cap across viewers (None = uncapped for that viewer).
     pub fn merged_priority_cap(&self, own_cap: Option<u32>, constrained: bool) -> Option<u32> {

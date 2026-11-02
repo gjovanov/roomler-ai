@@ -372,6 +372,10 @@ pub struct ViewerFeedback {
     /// FR-119 P2b-17b — the viewer asked to trial its rate again
     /// (`rc:fps {retry: true}`); taken by the pump's next decision.
     retrial: std::sync::atomic::AtomicBool,
+    /// FR-135 R2 — how fast this viewer's screen refreshes, in Hz, as its decode
+    /// worker measured it (`rc:viewer-hz`); `0` = it never said. It stands until
+    /// the viewer says otherwise, like the ask.
+    viewer_hz: std::sync::atomic::AtomicU32,
 }
 
 impl ViewerFeedback {
@@ -401,6 +405,20 @@ impl ViewerFeedback {
         match self.fps_asked.load(std::sync::atomic::Ordering::Relaxed) {
             0 => None,
             fps => Some(fps),
+        }
+    }
+
+    /// FR-135 R2 — record this viewer's refresh (`rc:viewer-hz`).
+    pub fn store_viewer_hz(&self, hz: u32) {
+        self.viewer_hz
+            .store(hz, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// FR-135 R2 — this viewer's refresh, if it has said.
+    pub fn viewer_hz(&self) -> Option<u32> {
+        match self.viewer_hz.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            hz => Some(hz),
         }
     }
 

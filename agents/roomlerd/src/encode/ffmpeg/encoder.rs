@@ -1746,6 +1746,9 @@ impl FfmpegEncoder {
                     // (VP9_ENCODER_NAMES = ["vp9_qsv"]). Error reason is
                     // preserved in `last_err` → surfaced by the caller.
                     tracing::debug!(encoder = name, error = %e, "ffmpeg encoder candidate failed to open");
+                    // FR-135 R2 — `last_err` keeps one reason, and a pump's plan
+                    // names them all.
+                    crate::media_plan::note_candidate_failed(name, &e);
                     last_err = Some(e);
                 }
             }
