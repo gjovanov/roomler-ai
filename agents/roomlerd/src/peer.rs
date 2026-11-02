@@ -268,6 +268,9 @@ pub struct AgentPeer {
     /// ever told. The same shape as the arbiter entries the `Drop` below
     /// releases.
     session_end: tokio_util::sync::CancellationToken,
+    /// #3245 — this session's RTP pump has no encoder and asked for its end. The
+    /// signalling loop reads it to name that end ([`Self::no_video`]).
+    no_video: Arc<std::sync::atomic::AtomicBool>,
     /// #1882 — may this session use the overlay? Read by
     /// [`Self::add_remote_candidate`] and [`Self::handle_offer`]; the local
     /// half is already in the `SettingEngine`.
@@ -1639,6 +1642,7 @@ impl AgentPeer {
         // `negotiated_transport` + `video_bytes_dc` let the pump route
         // VP9 4:4:4 frames over the DC instead of the track when the
         // session negotiated `data-channel-vp9-444`.
+        let no_video = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pump = tokio::spawn(media_pump(
             session_id,
             video_track,
@@ -1664,6 +1668,7 @@ impl AgentPeer {
             viewer_report.clone(),
             priority,
             rc_sessions,
+            no_video.clone(),
         ));
 
         // FR-93 P5h — told when this computer goes to sleep.
@@ -1672,6 +1677,7 @@ impl AgentPeer {
             pc,
             session_id,
             media_pump: Some(pump),
+            no_video,
             #[cfg(feature = "audio")]
             audio_pump: audio_pump_handle,
             rtcp_reader: Some(rtcp_reader),
@@ -1697,6 +1703,12 @@ impl AgentPeer {
     /// a delegated session's sample reaches the server under the identity the
     /// session row carries (the daemon's), never up the worker's own WS, where
     /// `merge_live_stats` would match nothing and drop it without a word.
+    /// #3245 — did this session's RTP pump ask for its end because it has no
+    /// encoder?
+    pub(crate) fn no_video(&self) -> bool {
+        self.no_video.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn outbound(&self) -> &mpsc::Sender<ClientMsg> {
         &self.outbound
     }
@@ -2375,6 +2387,9 @@ async fn media_pump(
     // FR-93 P6c — where a pump ends its session when the person at the screen
     // stops the share (`end_stopped_at_screen`).
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
+    // #3245 — set before the RTP pump asks for its session's end with no encoder
+    // (`end_no_video`), so the signalling loop names that end.
+    no_video: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // `viewer_report` is consumed only by the DC video pumps (vp9-444 +
     // ffmpeg-encoder); keep the signalling-only build warning-clean.
@@ -2727,6 +2742,12 @@ async fn media_pump(
     // override via `rc:resolution` must not be clobbered by a
     // re-evaluation on an incidental encoder rebuild (DPI flip, etc.).
     let mut auto_downscale_evaluated = false;
+    // #3245 — this pump landed on openh264 at a size it refuses: from then on its
+    // frames stay inside that encoder's ceiling (`rtp_frame_target`).
+    let mut openh264_ceiling = false;
+    // #3245 — an encoder has produced a packet on this session, so a later Noop is
+    // a failed reopen, not a codec nothing can open (`end_no_video`).
+    let mut painted = false;
     // FR-112 P2b — the software tier, live once the cascade lands on a
     // software encoder: its pace (from the heartbeat's encode cost), the
     // cadence gate's next slot, and the frame rate last handed to the encoder.
@@ -3025,14 +3046,16 @@ async fn media_pump(
             pack_dims(frame.width, frame.height),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let frame = crate::encode::resample::apply_target_resolution(
-            &mut resampler,
-            frame,
+        let frame_target = rtp_frame_target(
             *target_resolution.lock().unwrap(),
+            (frame.width, frame.height),
+            openh264_ceiling,
         );
+        let frame =
+            crate::encode::resample::apply_target_resolution(&mut resampler, frame, frame_target);
         // rc.190 — publish the dims we actually encode so the cursor pump
         // scales from truth (this pump's auto-downscale mutates the shared
-        // target_resolution, so user-target == effective here).
+        // target_resolution, and `rtp_frame_target` can hold it lower still).
         encoded_dims.store(
             pack_dims(frame.width, frame.height),
             std::sync::atomic::Ordering::Relaxed,
@@ -3108,6 +3131,27 @@ async fn media_pump(
                     }
                 }
             };
+            // #3245 — openh264 opens at any size and refuses every frame above
+            // its ceiling. The cascade lands there when nothing else takes the
+            // size, and the encode error below would end this pump with the page
+            // connected and black. So this pump's frames stay inside the ceiling
+            // from now on, whatever `rc:resolution` says: the viewer's default
+            // `original` arrives after the one-shot auto-downscale has run.
+            if !openh264_ceiling
+                && encode::above_openh264_ceiling(enc.name(), frame.width, frame.height)
+            {
+                warn!(
+                    %session_id,
+                    w = frame.width, h = frame.height,
+                    "openh264 cannot encode this size — holding the session's frames inside its ceiling"
+                );
+                openh264_ceiling = true;
+                encoder = None;
+                encoder_dims = None;
+                keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::session_telemetry::counters(session_id).note_keyframe();
+                continue;
+            }
             if actual != chosen_codec {
                 // Runtime demotion (e.g. HEVC cascade failed at actual
                 // dims despite enumeration passing). The track was
@@ -3143,12 +3187,13 @@ async fn media_pump(
             // but nothing works" footgun in the stack. Shout at
             // session-build time so field reports land on a log
             // line that explains the symptom in one read.
-            if encoder.as_ref().map(|e| e.name()) == Some("noop") {
+            let no_encoder = encoder.as_ref().map(|e| e.name()) == Some("noop");
+            if no_encoder {
                 warn!(
                     %session_id,
                     codec = %chosen_codec,
                     w = frame.width, h = frame.height,
-                    "encoder resolved to NoopEncoder — NO VIDEO WILL SHIP for this session. Cascade above tells you why. Workarounds: toggle codec override to H.264 + reconnect, or switch Quality to `low` to force a smaller profile."
+                    "encoder resolved to NoopEncoder — NO VIDEO CAN SHIP at this size. Cascade above tells you why."
                 );
             }
 
@@ -3312,6 +3357,16 @@ async fn media_pump(
                     continue;
                 }
             }
+
+            // #3245 — a session with no encoder that has never painted ends by
+            // name: the viewer showed it as connected, with a black picture and
+            // nothing to read. After the auto-downscale, which has just had its
+            // one go at a size the cascade might open. A session that painted
+            // has a codec that opens, so this is a failed reopen, and the viewer's
+            // stall watchdog stays its way back.
+            if no_encoder && !painted {
+                match end_no_video(session_id, &rc_sessions, &no_video).await {}
+            }
         }
 
         let enc = encoder.as_mut().unwrap();
@@ -3439,6 +3494,7 @@ async fn media_pump(
                 return;
             }
         };
+        painted |= !packets.is_empty();
         encode_time_us = encode_time_us.saturating_add(encode_started.elapsed().as_micros() as u64);
 
         // Wallclock-based RTP timestamps, so they advance at real time, not
@@ -6062,6 +6118,47 @@ async fn end_stopped_at_screen(
         }
         if let Some(p) = pipeline {
             p.beat();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// #3245 — the one message the end of a session with no encoder puts on the wire.
+/// `no_common_codec` is the one end the viewer does not retry, since a retry would
+/// make the same offer and land here again.
+pub(crate) fn no_video_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
+    ClientMsg::Terminate {
+        session_id,
+        reason: roomler_ai_remote_control::models::EndReason::Error,
+        limit: Some(roomler_ai_remote_control::signaling::LIMIT_NO_COMMON_CODEC.to_string()),
+    }
+}
+
+/// #3245 — the end of an RTP session whose encoder opened as a Noop before it ever
+/// painted. The track is bound to its codec and cannot take another's bitstream,
+/// so nothing can ever reach the browser.
+///
+/// Through the signalling loop's device-end arm, the road the person's Disconnect
+/// takes (FR-27 P10): the viewer hears why before its peer dies. Closed first, its
+/// control channel's `onclose` reads a plain drop and it reconnects into the same
+/// Noop. Asked until the session is listed, then once. Never returns: that arm's
+/// `stop_serving` aborts this pump.
+async fn end_no_video(
+    session_id: bson::oid::ObjectId,
+    rc_sessions: &crate::rc_sessions::RcSessionRegistry,
+    no_video: &std::sync::atomic::AtomicBool,
+) -> std::convert::Infallible {
+    warn!(%session_id, "no encoder and nothing painted — ending the session");
+    no_video.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut asks = 0u32;
+    let mut asked = false;
+    loop {
+        if !asked {
+            asked = rc_sessions.disconnect(&session_id);
+            if !asked && asks.is_multiple_of(30) {
+                warn!(%session_id, asks, "no encoder: the session's end could not be queued yet");
+            }
+            asks += 1;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -13729,6 +13826,67 @@ fn codec_params_for(codec: &str) -> webrtc::rtp_transceiver::rtp_codec::RTCRtpCo
     }
 }
 
+/// #3245 — what the RTP pump scales a `native` frame to: the viewer's `target`,
+/// held inside openh264's ceiling once the pump has landed on that encoder
+/// (`openh264_ceiling`). A target at or above the frame's size codes at the frame's
+/// size, since the resampler never upscales.
+fn rtp_frame_target(
+    target: TargetResolution,
+    native: (u32, u32),
+    openh264_ceiling: bool,
+) -> TargetResolution {
+    if !openh264_ceiling {
+        return target;
+    }
+    let (w, h) = match target {
+        TargetResolution::Fixed { width, height } if width < native.0 || height < native.1 => {
+            (width, height)
+        }
+        _ => native,
+    };
+    let (width, height) = encode::fit_for_openh264(w, h);
+    if (width, height) == (w, h) {
+        target
+    } else {
+        TargetResolution::Fixed { width, height }
+    }
+}
+
+/// #3245 — the codec a session is bound to, once its transport is known.
+///
+/// A DataChannel pump opens its encoder through its own cascade, so the best
+/// common codec stands (`pick_best_codec`). On the RTP track the picture IS this
+/// codec, bound before the encoder opens, and its opener knows fewer encoders
+/// than the host advertises: a browser listing AV1 on an FFmpeg-only AV1 host
+/// got a track no encoder could feed, and a session that read connected and
+/// stayed black.
+///
+/// So on the RTP track, H.264 whenever the browser lists it, or lists nothing
+/// (a controller from before the list): every host opens it, the pump holds its
+/// frames inside openh264's ceiling (`rtp_frame_target`), and it is the path the
+/// viewer already assumes. Only a browser without H.264 takes something
+/// else, and only a codec the opener can open, by the probe's cells. With no
+/// such codec H.264 stays, and the offer decides: `rtp_track_unanswerable`
+/// refuses it by name, where a pick of anything else would have been black.
+pub fn session_codec(
+    browser_caps: &[String],
+    caps: &roomler_ai_remote_control::models::AgentCaps,
+    transport: Option<&str>,
+) -> String {
+    if on_data_channel(transport) {
+        return crate::encode::caps::pick_best_codec(browser_caps, &caps.codecs);
+    }
+    let browser_lists = |c: &str| browser_caps.iter().any(|b| b.eq_ignore_ascii_case(c));
+    if browser_caps.is_empty() || browser_lists("h264") {
+        return "h264".to_string();
+    }
+    ["av1", "h265"]
+        .into_iter()
+        .find(|c| browser_lists(c) && encode::rtp_opener_opens(c, &caps.video_cells))
+        .unwrap_or("h264")
+        .to_string()
+}
+
 /// #2231 — the codec the RTP video track is created and pinned with.
 ///
 /// On a DataChannel transport the track carries no frame (the DC pump owns the
@@ -13797,7 +13955,7 @@ pub fn offered_video_codecs(offer_sdp: &str) -> Vec<String> {
     out
 }
 
-fn on_data_channel(transport: Option<&str>) -> bool {
+pub(crate) fn on_data_channel(transport: Option<&str>) -> bool {
     transport.is_some_and(|t| t.starts_with("data-channel-"))
 }
 
@@ -13832,10 +13990,208 @@ fn offer_carries_track(offer_sdp: &str, codec: &str) -> bool {
 
 #[cfg(test)]
 mod codec_cap_tests {
+    #[cfg(feature = "openh264-encoder")]
+    use super::TargetResolution::{Fixed, Native};
+    #[cfg(feature = "openh264-encoder")]
+    use super::rtp_frame_target;
     use super::{
         build_video_codec_cap, codec_params_for, offered_video_codecs, rtp_track_codec,
-        rtp_track_unanswerable,
+        rtp_track_unanswerable, session_codec,
     };
+    use roomler_ai_remote_control::models::{
+        AgentCaps, ChromaFormat, VideoBackend, VideoCell, VideoCodec,
+    };
+
+    fn list(codecs: &[&str]) -> Vec<String> {
+        codecs.iter().map(|c| c.to_string()).collect()
+    }
+
+    fn host(codecs: &[&str], cells: &[(VideoCodec, VideoBackend)]) -> AgentCaps {
+        AgentCaps {
+            codecs: list(codecs),
+            video_cells: cells
+                .iter()
+                .map(|&(c, b)| VideoCell::new(c, b, &[ChromaFormat::Yuv420], true))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The #3245 host: AV1 and HEVC through FFmpeg, none through MF. Also what a
+    /// host looks like after a probe child that would not die denied `av1_mf`
+    /// (#3273): the cell goes with the denial, and FFmpeg's still lists `av1`.
+    fn ffmpeg_only() -> AgentCaps {
+        host(
+            &["h264", "h265", "av1"],
+            &[
+                (VideoCodec::H264, VideoBackend::Openh264),
+                (VideoCodec::Hevc, VideoBackend::Qsv),
+                (VideoCodec::Av1, VideoBackend::Qsv),
+            ],
+        )
+    }
+
+    /// #3245 — with no transport a browser that lists H.264 gets H.264, whatever
+    /// the host could also do: the bound track is what a host without the
+    /// opener's encoder stayed black on.
+    #[test]
+    fn the_rtp_track_takes_h264_whenever_the_browser_lists_it() {
+        let chrome = list(&["av1", "h265", "vp9", "h264", "vp8"]);
+        assert_eq!(session_codec(&chrome, &ffmpeg_only(), None), "h264");
+        let mf_av1 = host(
+            &["h264", "av1"],
+            &[(VideoCodec::Av1, VideoBackend::MediaFoundation)],
+        );
+        assert_eq!(session_codec(&chrome, &mf_av1, None), "h264");
+        assert_eq!(session_codec(&list(&["H264"]), &mf_av1, None), "h264");
+        // A controller from before the list.
+        assert_eq!(session_codec(&[], &ffmpeg_only(), None), "h264");
+    }
+
+    /// #3245 — a browser without H.264 takes a codec the opener can open, read
+    /// from the cells rather than from `codecs`; with none, H.264 stays and the
+    /// offer refuses it by name. Never a codec bound to a Noop.
+    #[test]
+    fn a_browser_without_h264_takes_only_what_the_opener_opens() {
+        let firefox = list(&["vp8", "vp9", "av1"]);
+        let mf_av1 = host(
+            &["h264", "av1"],
+            &[(VideoCodec::Av1, VideoBackend::MediaFoundation)],
+        );
+        assert_eq!(session_codec(&firefox, &mf_av1, None), "av1");
+        assert!(!rtp_track_unanswerable("av1", None, FIREFOX_NO_H264));
+
+        // The same browser on the #3245 host: the AV1 cell is FFmpeg's.
+        let refused = session_codec(&firefox, &ffmpeg_only(), None);
+        assert_eq!(refused, "h264");
+        assert!(rtp_track_unanswerable(&refused, None, FIREFOX_NO_H264));
+
+        // HEVC opens through FFmpeg's cascade as well as MF's.
+        let hevc_only = list(&["h265", "vp8"]);
+        for backend in [VideoBackend::Qsv, VideoBackend::MediaFoundation] {
+            let hevc = host(&["h265"], &[(VideoCodec::Hevc, backend)]);
+            assert_eq!(session_codec(&hevc_only, &hevc, None), "h265");
+        }
+        // `codecs` says h265 and no cell does: the probe opened nothing.
+        assert_eq!(
+            session_codec(&hevc_only, &host(&["h265"], &[]), None),
+            "h264"
+        );
+        // AV1 first, as `pick_best_codec` ranks them.
+        let both = host(
+            &["h265", "av1"],
+            &[
+                (VideoCodec::Hevc, VideoBackend::MediaFoundation),
+                (VideoCodec::Av1, VideoBackend::MediaFoundation),
+            ],
+        );
+        assert_eq!(session_codec(&list(&["h265", "av1"]), &both, None), "av1");
+        // VP9 and VP8 never bind: the opener would put H.264 bytes on the track.
+        let vp9 = host(&["vp9"], &[(VideoCodec::Vp9, VideoBackend::Libvpx)]);
+        assert_eq!(session_codec(&list(&["vp9", "vp8"]), &vp9, None), "h264");
+    }
+
+    /// #3245 — once the pump holds openh264, a frame above the encoder's ceiling
+    /// never reaches it, whatever the viewer asks for. The viewer's default
+    /// `original` puts the target back to Native after the auto-downscale has run.
+    /// A build without that encoder has no ceiling to hold to.
+    #[cfg(feature = "openh264-encoder")]
+    #[test]
+    fn a_pump_on_openh264_holds_its_frames_inside_the_ceiling() {
+        let five_k = (5120, 1440);
+        let fitted = Fixed {
+            width: 3840,
+            height: 1080,
+        };
+        assert_eq!(rtp_frame_target(Native, five_k, true), fitted);
+        // A Fixed above the ceiling and below the frame.
+        let dci = Fixed {
+            width: 4096,
+            height: 1152,
+        };
+        assert_eq!(rtp_frame_target(dci, five_k, true), fitted);
+        // A Fixed at or above the frame codes at the frame's size.
+        let over = Fixed {
+            width: 6000,
+            height: 2000,
+        };
+        assert_eq!(rtp_frame_target(over, five_k, true), fitted);
+        // Inside the ceiling nothing changes.
+        let small = Fixed {
+            width: 1280,
+            height: 360,
+        };
+        assert_eq!(rtp_frame_target(small, five_k, true), small);
+        assert_eq!(rtp_frame_target(Native, (3840, 2160), true), Native);
+        assert_eq!(rtp_frame_target(Native, (1920, 1080), true), Native);
+        // Another encoder has its own limits, and refuses at the open.
+        assert_eq!(rtp_frame_target(Native, five_k, false), Native);
+    }
+
+    /// #3245 — the death itself, on the real encoder: it opens above the ceiling and
+    /// refuses the frame. The target the pump now holds to is one it encodes.
+    #[cfg(feature = "openh264-encoder")]
+    #[tokio::test]
+    async fn openh264_refuses_above_its_ceiling_and_encodes_the_pumps_target() {
+        use crate::encode::VideoEncoder;
+        use crate::encode::openh264_backend::Openh264Encoder;
+        use crate::encode::resample::{Resampler, apply_target_resolution};
+        let (w, h) = (5120u32, 1440u32);
+        let frame = std::sync::Arc::new(crate::capture::Frame {
+            width: w,
+            height: h,
+            stride: w * 4,
+            pixel_format: crate::capture::PixelFormat::Bgra,
+            data: vec![0x40u8; (w * h * 4) as usize].into(),
+            monotonic_us: 0,
+            monitor: 0,
+            damage: crate::capture::Damage::Unknown,
+            source: None,
+        });
+        assert!(crate::encode::above_openh264_ceiling("openh264", w, h));
+        assert!(!crate::encode::above_openh264_ceiling("mf-h264", w, h));
+        assert!(!crate::encode::above_openh264_ceiling(
+            "openh264", 3840, 2160
+        ));
+
+        let mut at_native = Openh264Encoder::new(w, h).expect("opens at any size");
+        assert!(
+            at_native.encode(frame.clone()).await.is_err(),
+            "above the ceiling it refuses the frame"
+        );
+
+        let target = rtp_frame_target(Native, (w, h), true);
+        let fitted = apply_target_resolution(&mut Resampler::new(), frame, target);
+        assert_eq!((fitted.width, fitted.height), (3840, 1080));
+        let mut inside = Openh264Encoder::new(fitted.width, fitted.height).expect("opens");
+        assert!(
+            !inside.encode(fitted).await.expect("encodes").is_empty(),
+            "a packet"
+        );
+    }
+
+    /// #3245 — a DataChannel session keeps the best common codec: its pump opens
+    /// through its own cascade, and its track is only a placeholder.
+    #[test]
+    fn a_data_channel_session_keeps_the_best_common_codec() {
+        let chrome = list(&["av1", "h265", "vp9", "h264", "vp8"]);
+        for transport in [
+            "data-channel-av1",
+            "data-channel-hevc",
+            "data-channel-h264",
+            "data-channel-vp9-444",
+        ] {
+            assert_eq!(
+                session_codec(&chrome, &ffmpeg_only(), Some(transport)),
+                "av1",
+                "{transport}"
+            );
+        }
+        assert_eq!(
+            session_codec(&[], &ffmpeg_only(), Some("data-channel-hevc")),
+            "h264"
+        );
+    }
 
     /// A Firefox without OpenH264, as it offers: VP8, VP9 and AV1 (+ rtx/fec),
     /// with Opus on the audio line.
@@ -15648,6 +16004,70 @@ mod stopped_at_screen_tests {
             "org".into(),
             kill,
         );
+    }
+
+    /// #3245 — a pump with no encoder ends through the device-end arm, on the
+    /// kill channel the person's Disconnect takes, and says why first so the loop
+    /// names it. It asks once and never returns: only the teardown ends the pump.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_with_no_encoder_ends_through_the_device_end_once() {
+        let reg = RcSessionRegistry::new();
+        let sid = ObjectId::new();
+        let (kill, mut killed) = tokio::sync::mpsc::channel(4);
+        listed(&reg, sid, kill);
+        let no_video = std::sync::atomic::AtomicBool::new(false);
+        let held =
+            tokio::time::timeout(Duration::from_secs(30), end_no_video(sid, &reg, &no_video)).await;
+        assert!(held.is_err(), "it held until the teardown");
+        assert!(
+            no_video.load(std::sync::atomic::Ordering::Relaxed),
+            "the loop can name the end"
+        );
+        assert_eq!(killed.try_recv().ok(), Some(sid), "the session's end");
+        assert!(killed.try_recv().is_err(), "asked once, not every second");
+    }
+
+    /// #3245 — the peer goes up around the first frame, so its entry can come after
+    /// the Noop: asked again every second until it is listed.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_with_no_encoder_not_listed_yet_is_asked_again() {
+        let reg = RcSessionRegistry::new();
+        let sid = ObjectId::new();
+        let (kill, mut killed) = tokio::sync::mpsc::channel(4);
+        let pump = tokio::spawn({
+            let reg = reg.clone();
+            async move {
+                let no_video = std::sync::atomic::AtomicBool::new(false);
+                end_no_video(sid, &reg, &no_video).await
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(killed.try_recv().is_err(), "nothing to end yet");
+        listed(&reg, sid, kill);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(killed.try_recv().ok(), Some(sid));
+        assert!(!pump.is_finished(), "only the teardown ends the pump");
+        pump.abort();
+    }
+
+    /// #3245 — it says the limit the viewer treats as final.
+    #[test]
+    fn the_end_of_a_session_with_no_encoder_names_the_limit() {
+        let sid = ObjectId::new();
+        let ClientMsg::Terminate {
+            session_id,
+            reason,
+            limit,
+        } = no_video_terminate(sid)
+        else {
+            panic!("not a Terminate");
+        };
+        assert_eq!(session_id, sid);
+        assert!(matches!(
+            reason,
+            roomler_ai_remote_control::models::EndReason::Error
+        ));
+        assert_eq!(limit.as_deref(), Some("no_common_codec"));
     }
 
     /// FR-93 P6c — a pump whose capture the person at the screen stopped ends

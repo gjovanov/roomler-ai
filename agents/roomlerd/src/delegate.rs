@@ -1722,6 +1722,17 @@ fn msg_kind(msg: &ClientMsg) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
+/// FR-43 P2b-2 — the delegation channel, if the session was built on it. The
+/// channel is the whole connection's, and a worker also serves its own sessions
+/// under its own row, so `built_on` (the session's own sender, [`crate::peer`]'s
+/// seam) tells them apart. With no session held, the channel, as ever.
+pub fn delegation_for_session<'a>(
+    delegated: Option<&'a tokio::sync::mpsc::Sender<ClientMsg>>,
+    built_on: Option<&tokio::sync::mpsc::Sender<ClientMsg>>,
+) -> Option<&'a tokio::sync::mpsc::Sender<ClientMsg>> {
+    delegated.filter(|tx| built_on.is_none_or(|own| own.same_channel(tx)))
+}
+
 #[cfg(test)]
 mod routing_tests {
     use super::*;
@@ -1729,6 +1740,31 @@ mod routing_tests {
 
     fn oid() -> bson::oid::ObjectId {
         bson::oid::ObjectId::new()
+    }
+
+    /// #3245 — what a device end says about a session takes the road the session
+    /// was built on: `delegated.unwrap_or(outbound_tx).clone()`.
+    #[test]
+    fn a_session_says_its_end_on_the_road_it_was_built_on() {
+        let (channel, _keep_channel) = tokio::sync::mpsc::channel::<ClientMsg>(1);
+        let (own_ws, _keep_own_ws) = tokio::sync::mpsc::channel::<ClientMsg>(1);
+        assert!(
+            delegation_for_session(None, Some(&own_ws)).is_none(),
+            "every host that is not a worker"
+        );
+        assert!(
+            delegation_for_session(Some(&channel), Some(&own_ws)).is_none(),
+            "a worker's own session, on its own row"
+        );
+        let built_on_it = channel.clone();
+        assert!(
+            delegation_for_session(Some(&channel), Some(&built_on_it)).is_some(),
+            "a delegated session"
+        );
+        assert!(
+            delegation_for_session(Some(&channel), None).is_some(),
+            "no session held"
+        );
     }
 
     /// The five that make a remote-desktop session, and nothing else.

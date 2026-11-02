@@ -134,8 +134,7 @@ fn host_disconnect_grace_from(raw: Option<&str>) -> Duration {
     }
 }
 
-/// The one message the host's Disconnect puts on the wire. A function so a
-/// test can hold the daemon to the spelling the viewer and the audit key on.
+/// The host's Disconnect on the wire: one function, so a test holds its spelling.
 fn host_disconnect_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
     ClientMsg::Terminate {
         session_id,
@@ -144,10 +143,9 @@ fn host_disconnect_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
     }
 }
 
-/// FR-101 P4b-2 — the one message the idle limit puts on the wire: the reason
-/// every server already knows, and the limit a newer one names to the viewer
-/// and the audit (an older server ignores `limit` and ends the session as
-/// `IdleTimeout` all the same).
+/// FR-101 P4b-2 — the idle limit on the wire: the reason every server knows, and
+/// the limit a newer one names to the viewer and the audit (an older server
+/// ignores `limit` and ends the session as `IdleTimeout` all the same).
 fn idle_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
     ClientMsg::Terminate {
         session_id,
@@ -156,14 +154,14 @@ fn idle_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
     }
 }
 
-/// FR-101 P4b-2 — why the DEVICE is ending a session: the person at it
-/// pressed Disconnect (FR-27 P10), or the session sat idle past its limit
-/// (`session_idle`). Both end it the same way, saying so first and closing
-/// after the grace, under their own reason.
+/// FR-101 P4b-2 — why the DEVICE is ending a session: Disconnect at the device
+/// (FR-27 P10), idle past its limit (`session_idle`), or an RTP pump with no
+/// encoder (#3245). All end alike: said first, closed after the grace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceEnd {
     HostDisconnect,
     Idle,
+    NoVideo,
 }
 
 impl DeviceEnd {
@@ -171,6 +169,7 @@ impl DeviceEnd {
         match self {
             Self::HostDisconnect => host_disconnect_terminate(session_id),
             Self::Idle => idle_terminate(session_id),
+            Self::NoVideo => crate::peer::no_video_terminate(session_id),
         }
     }
 
@@ -178,6 +177,7 @@ impl DeviceEnd {
         match self {
             Self::HostDisconnect => "host_disconnect",
             Self::Idle => "idle_timeout",
+            Self::NoVideo => "no_video",
         }
     }
 }
@@ -2611,6 +2611,10 @@ async fn connect_once(
             }
             Some((sid, end)) = device_end(kill_rx, idle_rx) => {
                 let _stage = watchdog::enter(ctx.pump, "device_end");
+                // #3245 — a pump with no encoder asks through the kill channel too,
+                // and its end says something else.
+                let no_video = peers.get(&sid).is_some_and(AgentPeer::no_video);
+                let end = if no_video { DeviceEnd::NoVideo } else { end };
                 // FR-101 P4b-2 — a hand-back from an idle watcher races the
                 // session's own end; one this connection no longer holds has
                 // nothing left to end (a disconnect closed every peer).
@@ -2640,6 +2644,7 @@ async fn connect_once(
                     DeviceEnd::Idle => {
                         info!(session_id = %sid, "idle limit reached — ending the session")
                     }
+                    DeviceEnd::NoVideo => {}
                 }
                 // FR-85 P3b-3 — the person at the device sent the controller
                 // away: a recording of this session STOPS now, rather than
@@ -2652,6 +2657,15 @@ async fn connect_once(
                 // clipboard, files or frames from here on, while the bare
                 // connection waits for the viewer to hear why.
                 let peer = peers.remove(&sid);
+                // A delegated session (a supervised Mac) speaks through the
+                // daemon's WS, the way its answer and its ICE did. A worker's
+                // own session speaks on its own: from the daemon the hub
+                // answers `not a party`, ends nothing and tells no viewer.
+                // Everywhere else there is no delegation channel at all.
+                let delegated = crate::delegate::delegation_for_session(
+                    delegated_out.as_ref(),
+                    peer.as_ref().map(AgentPeer::outbound),
+                );
                 if let Some(peer) = &peer {
                     peer.stop_serving();
                     // FR-101 P3 — the audit's last sample, while the server
@@ -2662,29 +2676,15 @@ async fn connect_once(
                     // must land BEFORE the terminate directly below it, and
                     // the server drops a sample once `ended_at` is set — on
                     // the peer's queue, the direct terminate write would
-                    // overtake it. Pre-existing follow-up, out of P9d's
-                    // scope: `delegated_out` is connection-wide, so on a
-                    // supervised Mac a worker's OWN session (its own row)
-                    // goes up the delegation channel here too, under the
-                    // daemon's identity, and the server drops it as another
-                    // device's. A fix needs the terminate on the same queue
-                    // as the sample, or a per-session delegation marker.
+                    // overtake it.
                     if let Some(stats) = final_session_stats(sid, peer).await
-                        && let Err(e) =
-                            reply_for_session(&mut ws, delegated_out.as_ref(), &stats).await
+                        && let Err(e) = reply_for_session(&mut ws, delegated, &stats).await
                     {
                         debug!(session_id = %sid, %e, "final session stats send failed");
                     }
                 }
-                // A delegated session (a supervised Mac) speaks through the
-                // daemon's WS, the way its answer and its ICE did.
-                let grace = match reply_for_session(
-                    &mut ws,
-                    delegated_out.as_ref(),
-                    &end.terminate(sid),
-                )
-                .await
-                {
+                let said = end.terminate(sid);
+                let grace = match reply_for_session(&mut ws, delegated, &said).await {
                     Ok(()) => host_disconnect_grace(),
                     Err(e) => {
                         warn!(
@@ -2695,7 +2695,7 @@ async fn connect_once(
                     }
                 };
                 // The FR-27 field logs key on the host-disconnect line as it
-                // reads; the idle end says its own.
+                // reads; the others name their reason.
                 let grace_ms = grace.as_millis() as u64;
                 match end {
                     DeviceEnd::HostDisconnect => info!(
@@ -2704,11 +2704,11 @@ async fn connect_once(
                         grace_ms,
                         "host disconnect: told the server; the peer closes after the grace"
                     ),
-                    DeviceEnd::Idle => info!(
+                    DeviceEnd::Idle | DeviceEnd::NoVideo => info!(
                         session_id = %sid,
                         reason = end.label(),
                         grace_ms,
-                        "idle limit: told the server; the peer closes after the grace"
+                        "device end: told the server; the peer closes after the grace"
                     ),
                 }
                 if let Some(peer) = peer {
@@ -3572,20 +3572,7 @@ async fn handle_server_msg(
                     &ctx.label,
                 )
             };
-            // Pick the best codec for this session from the
-            // intersection of (browser-advertised, agent-supported).
-            // Stashed per session_id so the rc:sdp.offer handler can
-            // read it back when building the peer: that's where the
-            // track codec + encoder backend are actually bound.
             let our_caps = crate::encode::caps::detect();
-            let chosen = crate::encode::caps::pick_best_codec(&browser_caps, &our_caps.codecs);
-            pending_codecs.insert(
-                session_id,
-                PendingCodec {
-                    chosen: chosen.clone(),
-                    browser_caps: Some(browser_caps.clone()),
-                },
-            );
 
             // Phase Y.3: figure out which video transport this
             // session will use. Honour `preferred_transport` only if
@@ -3600,6 +3587,24 @@ async fn handle_server_msg(
                     None
                 }
             });
+            // Pick the codec for this session. #3245 — after the transport,
+            // because the transport decides what can open it: the RTP track's
+            // opener knows fewer encoders than `our_caps.codecs` advertises.
+            // Stashed per session_id so the rc:sdp.offer handler can read it
+            // back when building the peer: that's where the track codec +
+            // encoder backend are actually bound.
+            let chosen = crate::peer::session_codec(
+                &browser_caps,
+                &our_caps,
+                negotiated_transport.as_deref(),
+            );
+            pending_codecs.insert(
+                session_id,
+                PendingCodec {
+                    chosen: chosen.clone(),
+                    browser_caps: Some(browser_caps.clone()),
+                },
+            );
             // Stash for the upcoming SdpOffer handler — that's where
             // AgentPeer::new is called and the media pump is built.
             // Without this stash the negotiation result was logged but
@@ -7587,8 +7592,8 @@ mod tests {
             picks_for_the_offer(&mut codecs, &mut transports, session, || {
                 caps_offering(&["h265", "h264"], &[])
             }),
-            ("h265".to_string(), None),
-            "gone from the answer in force, so picked again"
+            ("h264".to_string(), None),
+            "gone from the answer in force, so picked again, by the RTP track's rule"
         );
         assert!(
             codecs.is_empty() && transports.is_empty(),
@@ -7941,6 +7946,7 @@ mod tests {
         assert!(!json.contains("limit"), "{json}");
         assert_eq!(DeviceEnd::Idle.label(), "idle_timeout");
         assert_eq!(DeviceEnd::HostDisconnect.label(), "host_disconnect");
+        assert_eq!(DeviceEnd::NoVideo.label(), "no_video");
     }
 
     /// FR-101 P4b-2 — either channel ends a session, each under its own
