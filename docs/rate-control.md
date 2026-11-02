@@ -1077,9 +1077,9 @@ whether the bar is right, and whether to flip, stay the operator's calls.
 flowchart LR
     HB["DC pump heartbeat<br/>(FFmpeg ≈2 s · VP9-444 ≈1 s)<br/>target_bps + six shadow_*"] -->|"INFO line"| DISK["the host's rolling log<br/>roomlerd.log.* · 14 days"]
     HB -->|"uploader · 5 s batches"| AL[("agent_logs<br/>every daemon and RC worker,<br/>every org · 7-day TTL")]
-    AL -->|"FLEET read: mongosh inside the Mongo pod<br/>$match created_at (index) → $filter msg →<br/>$unwind → $project 12 fields"| CORE["ShadowReport<br/>counters + sparse histograms"]
+    AL -->|"FLEET read: mongosh inside the Mongo pod<br/>$match created_at (index) → $filter msg →<br/>$unwind → $project 14 fields"| CORE["ShadowReport<br/>counters + sparse histograms"]
     DISK -->|"HOST read: node over text<br/>(evidence about that host only)"| CORE
-    CORE --> OUT["per-class table · the criterion<br/>MET / NOT MET / INCONCLUSIVE<br/>· B1's invariants"]
+    CORE --> OUT["per-class table · the criterion<br/>MET / NOT MET / INCONCLUSIVE<br/>· B1's invariants<br/>· what the encoder spent"]
 ```
 
 **One window is one DC-pump heartbeat.** A window without `shadow_state` came from a
@@ -1121,6 +1121,84 @@ report prints the clean-window disagreement under its own heading, with no
 threshold of its own; the detail and the B2 question it raises are in the FR-63 spec
 (§ "Day 0").
 
+#### What the encoder spent: the reading the criterion cannot make
+
+⚠️ **The criterion can fail a shadow that asks for too much, never one that asks for
+too little.** Pinned at its floor, the shadow scores 100 %:
+
+| clause | why it cannot catch a shadow asking for too little |
+|---|---|
+| sessions | counts sessions, whatever the shadow asked for |
+| agreement | `shadow ≤ live`, and the floor is one the live AIMD holds too: both take the same `floor_bps` (`governor.rs:909`, `:924`), and on a constrained path the shadow's 200 k (`ratectl.rs:293-294`) is the live floor's default stop (`encode/mod.rs:387-392`). The shadow also shares the live ceiling (`ratectl.rs:298`, `:318`) |
+| fixtures | the four fixtures run the shipped laws. `RatectlLaw`'s three tests (`sim.rs:1843-1906`) assert a domain, an upper bound and no pause on direct, and a shadow pinned at its floor passes all three |
+
+The self-test pins the result: pinned at its floor, with the encoder spending 20 Mbps,
+the verdict is MET. The clean-window disagreement cannot show it either, because
+`target_bps` is a cap, usually far above what the encoder spends: the live cap climbs
+past 200 Mbps on a desktop sending 5 kbps. So −96 % reads the same on a resting desktop
+that lost nothing and on a scroll spending 14 times the shadow's target.
+
+So the report also compares the shadow with what was actually sent. `bytes_written` is
+the send task's running total of whole frames the transport took (`peer.rs:7096`,
+`:4215`), on both heartbeats (`peer.rs:9754`, `:5137`):
+
+```mermaid
+flowchart LR
+    HB["heartbeat<br/>bytes_written + its timestamp"] --> SAME{"same pump,<br/>counter did not fall,<br/>0.5 s ≤ gap ≤ 10 s?"}
+    SAME -->|no| NR["no rate: counted apart,<br/>never read as a low one"]
+    SAME -->|yes| RATE["spent = Δbytes × 8 / gap"]
+    RATE --> OVER{"spent > the higher of the<br/>shadow's targets at the two ends?"}
+    OVER -->|yes| CAP["over: it would have<br/>capped real spending"]
+    OVER -->|no| FIT["covered: the window's<br/>average fit under it"]
+    CAP --> CUBE["one sparse cube per age class:<br/>first 120 s or later · spent · how far over ·<br/>encoder · shadow state"]
+    FIT --> CUBE
+```
+
+| reading | what it proves | what it does not |
+|---|---|---|
+| `spent > shadow`, clean window | the shadow would have capped spending the path was carrying | that the picture needed those bits. Every FFmpeg backend but NVENC anchors `bit_rate = maxrate` (`ffmpeg/encoder.rs:1870-1879`), so a high target can also draw spend, which is why the report splits by encoder. A small excess can be overshoot, hence the "by > 25 %" column |
+| `spent ≤ shadow` | the window's average fit | that no burst inside the window was capped |
+| the encoder's demand | `spent` bounds it from below | nothing bounds it from above: the heartbeat has no maxrate field (`peer.rs:9745-9760`), and a new field cannot help a read of logs already written |
+
+The live cap cannot hide a bite: while `shadow < live`, a window capped by live spends
+about live, which is over the shadow. Elevated windows are kept out of the table, since
+spending over the shadow there is the safe direction; a window with no viewer age is
+counted beside it, not judged clean. The report applies no bar, and the verdict does not
+read any of this. Each row carries the sessions, the share over and the share over by
+more than 25 % at its spend or more, so any gate can be read off one report, and `--json`
+keeps the whole cube.
+
+**First read, 2026-11-02.** Every shadow heartbeat in one dev box's service log since
+`agent-v0.4.188`: 20 sessions, 235 windows, all direct, all NVENC. It is evidence about
+that host only. The last column is a counterfactual over the same lines, a shadow that
+never left its opening target:
+
+| spent, Mbps | clean windows | spent > shadow | at this spend or more: sessions | over | over by > 25 % | pinned shadow: over |
+|---|---|---|---|---|---|---|
+| < 0.5 | 143 | 0 | 19 | 8/200 = 4.0 % | 6/200 = 3.0 % | 14/200 = 7.0 % |
+| 0.5 – 1 | 35 | 0 | 9 | 8/57 = 14.0 % | 6/57 = 10.5 % | 14/57 = 24.6 % |
+| 1 – 2 | 8 | 0 | 8 | 8/22 = 36.4 % | 6/22 = 27.3 % | 14/22 = 63.6 % |
+| 2 – 5 | 11 | 5 | 3 | 8/14 = 57.1 % | 6/14 = 42.9 % | 14/14 = 100 % |
+| 10 – 20 | 1 | 1 | 1 | 3/3 = 100 % | 3/3 = 100 % | 3/3 = 100 % |
+| 20 – 50 | 2 | 2 | 1 | 2/2 = 100 % | 2/2 = 100 % | 2/2 = 100 % |
+
+- **The −96 % was mostly a gap between two caps.** In 192 of the 200 clean windows the
+  shadow's target covered the spend and the session would have lost nothing.
+- **Where the encoder worked, the bite was hard.** One session's second heartbeat spent
+  40.7 Mbps against a 2.87 M target, ×14, on a path that carried it with a clean age.
+- **A bar over all clean windows has no power.** B1 scores 96 % and the pinned shadow
+  93 %, because resting windows dominate. Only a gate on the spend separates a working
+  controller from a pinned one, which is why the table is binned.
+- **It says nothing yet about after the climb.** All 8 fell within 14 s of the pump
+  opening, with the shadow still in `startup`, and no session on that box ran past 59 s.
+  The fleet read's "after the first 120 s" column is what answers it.
+- **The derived rate is real.** It sits within ×2 of `shadow_measured_bps`, the viewer's
+  own arrival rate on most windows, in 197 of 215 windows. The report prints that control
+  on every run.
+
+Whether the criterion gains a clause on this is the operator's call; the recommended
+wording and what it would need are in the FR-63 spec (§ "Open decisions").
+
 **Why the fleet read is server-side.** The plan assumed the API could serve it
 (`list_for_agent(?session_id=…)`). It cannot: `GET /api/tenant/{tid}/agent/{aid}/logs`
 takes only `limit`, clamped to 500 recent batches per agent — about 40 minutes of a
@@ -1138,8 +1216,8 @@ Mongo container OOM-killed production Mongo once (2026-10-26):
 |---|---|
 | time | a window of at most 8 days (`agent_logs` keeps 7), read one day per query, each with `maxTimeMS` 240 s |
 | plan | `$match` on `created_at` + `$sort` served by an index — `IXSCAN created_at_1` for the fleet, `tenant_id_1_source_1_created_at_-1` (backward) for one org; `explain` shows no blocking SORT |
-| memory | only streaming stages after the index scan, `allowDiskUse: false`; mongosh holds one row at a time and folds it into counters and sparse histograms |
-| data | only 12 fields are projected — never an address, a name or another line |
+| memory | only streaming stages after the index scan, `allowDiskUse: false`; mongosh holds one row at a time and folds it into counters and sparse histograms. 2,000,000 synthetic rows over 2,000 sessions peak at 14 MiB of heap |
+| data | only 14 fields are projected — never an address, a name or another line |
 | credentials | read from the container's own environment, never argv |
 | consent | `--kubectl` / `--mars` refuse without `--yes`; the mongodb pod's restart count is printed before and after, and a restart fails the run (exit 3) |
 
@@ -1152,8 +1230,15 @@ over the text, the mongosh read over the seeded batches, and the Node read over 
 fleet read's own `--rows` output agreed exactly on every class, the pool, the
 criterion and the invariants.
 
+The spend reading was rehearsed the same way on 2026-11-02, on the 235 real lines of the
+table above. Master's file printed no spend section and its rows held no `bytes_written`.
+The file as pushed printed the table, and the same three reads agreed exactly, cube
+included, there and again with 17 synthetic lines for what that log does not hold (a
+constrained session, VP9-444 with and without its ICE line). `explain` still reads
+`IXSCAN created_at_1` with no SORT stage, and `rc-shadow-report.sh` did not change.
+
 ```bash
-node scripts/rc-shadow-report.cjs --self-test                       # 33 cases, incl. the bar's edges and red runs
+node scripts/rc-shadow-report.cjs --self-test                       # 80 cases, incl. the bar's edges, red runs and the spend's edges
 node scripts/rc-shadow-report.cjs roomlerd.log.2026-10-30 …          # a host's logs: evidence about that host only
 bash scripts/rc-shadow-report.sh --mars --yes --since 2026-10-30T14:21:00Z   # the fleet read AC2 is judged by (--until: now)
 bash scripts/rc-shadow-report.sh --docker NAME --seed seed.ejson     # the rehearsal
