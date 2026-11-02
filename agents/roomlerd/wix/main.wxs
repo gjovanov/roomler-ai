@@ -99,7 +99,7 @@
           action failing inside the old product's removal still rolls the install back.
         -->
         <MajorUpgrade
-            Schedule='afterInstallInitialize'
+            Schedule='afterInstallExecute'
             IgnoreRemoveFailure='yes'
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.' />
 
@@ -511,10 +511,13 @@
             <!--
               #3292: ahead of RemoveExistingProducts, because a rollback plays the
               script backwards: the old product's files must be back when these run.
-              So the task comes back first, and then the start that needs it. ICE63
-              warns about an action between InstallInitialize and
-              RemoveExistingProducts; installer-smoke holds this order against the
-              built MSI, because WiX puts actions sharing a parent in name order.
+              So the task comes back first, and then the start that needs it.
+              InstallExecute sits between them and RemoveExistingProducts because
+              Windows Installer refuses that action with anything spooled ahead of it:
+              Error 2613, exit 1603, on every upgrade, and ICE63 only warns. It flushes
+              these two and nothing else, so the old product's removal still runs before
+              any file of this one. installer-smoke holds this order against the built
+              MSI, because WiX puts actions sharing a parent in name order.
             -->
             <Custom Action='DaemonBackOnRollback' After='InstallInitialize'>
                 WIX_UPGRADE_DETECTED OR (REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE)
@@ -522,6 +525,7 @@
             <Custom Action='AutostartBackOnRollback' After='DaemonBackOnRollback'>
                 WIX_UPGRADE_DETECTED OR (REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE)
             </Custom>
+            <InstallExecute After='AutostartBackOnRollback' />
             <!--
               Run RegisterAutostart on every fresh install, repair,
               and MajorUpgrade. Skip during full uninstall — there's

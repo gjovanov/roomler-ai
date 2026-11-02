@@ -290,8 +290,10 @@ jobs:
 
       # #3292: a rollback plays the script backwards, so a failed upgrade restores
       # the task and the daemon only from ahead of RemoveExistingProducts, once the
-      # old files are back, and the task must come back before the start. WiX orders
-      # actions that share a parent by itself, so this reads what it built.
+      # old files are back, and the task must come back before the start. Anything
+      # spooled ahead of that action fails every upgrade with Error 2613, so an
+      # InstallExecute has to flush them right before it. WiX orders actions that share
+      # a parent by itself, so this reads what it built.
       - name: "Assert the rollback actions' order in the built MSI (#3292)"
         shell: pwsh
         run: |
@@ -304,11 +306,16 @@ jobs:
             if ($null -eq $row) { throw "$action is not in InstallExecuteSequence" }
             [int]$row.GetType().InvokeMember('IntegerData', 'GetProperty', $null, $row, ([object[]]@([int32]1)))
           }
-          $seq = @('InstallInitialize', 'DaemonBackOnRollback', 'AutostartBackOnRollback', 'RemoveExistingProducts') | ForEach-Object { Get-Seq $_ }
-          Write-Host "InstallInitialize, DaemonBackOnRollback, AutostartBackOnRollback, RemoveExistingProducts: $($seq -join ', ')"
+          $seq = @('InstallInitialize', 'DaemonBackOnRollback', 'AutostartBackOnRollback', 'InstallExecute', 'RemoveExistingProducts', 'InstallFiles') | ForEach-Object { Get-Seq $_ }
+          Write-Host "InstallInitialize, DaemonBackOnRollback, AutostartBackOnRollback, InstallExecute, RemoveExistingProducts, InstallFiles: $($seq -join ', ')"
           for ($i = 1; $i -lt $seq.Count; $i++) {
             if ($seq[$i - 1] -ge $seq[$i]) { throw "out of order: $($seq -join ', ')" }
           }
+          # Immediately ahead: anything between InstallExecute and the removal is spooled
+          # ahead of it again.
+          $between = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @("SELECT Action FROM InstallExecuteSequence WHERE Sequence > $($seq[3]) AND Sequence < $($seq[4])"))
+          [void]$between.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $between, $null)
+          if ($null -ne $between.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $between, $null)) { throw 'an action sits between InstallExecute and RemoveExistingProducts' }
           # A rollback leaves a registration the next release cannot remove, and only
           # this attribute lets that release go on (docs/installation.md).
           $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @("SELECT Attributes FROM Upgrade WHERE ActionProperty='WIX_UPGRADE_DETECTED'"))
@@ -1124,7 +1131,7 @@ jobs:
           Invoke-Msi '/i' $pu (Join-Path $logDir 'fr133-branch-peruser.log') ''
           $null = Assert-Entries 'per-User upgraded to this branch' @($new.pu) $nextMsi
           # The Start-menu entry follows the name, and the old one leaves with
-          # the old product (MajorUpgrade runs afterInstallInitialize).
+          # the old product, whose removal runs ahead of this product's files.
           $menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Roomler'
           if (-not (Test-Path -LiteralPath (Join-Path $menu "$($new.pu).lnk"))) { throw "no $($new.pu).lnk in $menu after the upgrade" }
           if (Test-Path -LiteralPath (Join-Path $menu "$($old.pu).lnk")) { throw "the pre-P1 shortcut survived the upgrade in $menu" }

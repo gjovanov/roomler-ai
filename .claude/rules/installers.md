@@ -99,6 +99,20 @@ tree: `appdirs::use_old_segment` is new-if-present, so a log folder made from ou
 orphans a legacy host's config, which is why stderr capture lives in the daemon.
 ⚠️ **`RegisterAutostart` stays the last action before `InstallFinalize`.** The task names the
 launcher, and a rollback onto a release without one would leave a task that starts nothing.
+⚠️ **`AutostartBackOnRollback` and `DaemonBackOnRollback` stay ahead of `RemoveExistingProducts`.** A
+rollback plays the script backwards, so they run last, with the old files back; anywhere later they
+would run on files that are not there yet. WiX numbers siblings by name, so the names have to sort
+that way, and `installer-smoke` holds it against the built MSI.
+⚠️ **`InstallExecute` stays right before `RemoveExistingProducts`, so the MSI's schedule is
+`afterInstallExecute`.** With anything spooled ahead of it, that action fails every upgrade, healthy
+ones included: `Error 2613`, exit 1603 (measured on signed candidates). ICE63 only warns, and a
+compile or a sequence read does not see it: only a real upgrade does.
+⚠️ **Nothing a custom action starts proves a policy allows a file.** The installer's token is
+`SANDBOX_INERT`, which AppLocker does not check: the blocked launcher ran every action, with MSI exit
+0, and the task it registered could not start (`0x800704EC`). A scheduled task is the start with the
+real token, which is why `launcher_is_blocked` (`agents/roomlerd/src/service.rs`) goes through one.
+⚠️ **The check reads `Exe.AppLocker`, the compiled policy, not the registry.** An emptied policy
+leaves that file enforcing through a reboot, with `SrpV2\Exe` holding no rule (measured).
 ⚠️ **Restart Manager does not stop a running per-user daemon, so the MSI does, and the two stops are
 not interchangeable.** The daemon declines `ENDSESSION_CLOSEAPP` on purpose, and the log still says
 "Successfully shut down all applications", with no event 10002 (measured 0.4.196 to 0.4.197). Without

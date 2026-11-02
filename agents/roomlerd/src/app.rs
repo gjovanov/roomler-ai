@@ -7552,6 +7552,7 @@ mod tests {
         ] {
             let declared = action(id);
             assert!(
+                // RETIRED-NAME-ANCHOR: an MSI FileKey is installer identity, frozen.
                 declared.contains("FileKey='roomler_agent_exe'"),
                 "{declared}"
             );
@@ -7565,6 +7566,10 @@ mod tests {
         assert!(
             wxs.contains("<Custom Action='AutostartBackOnRollback' After='DaemonBackOnRollback'>")
         );
+        // Spooled ahead of RemoveExistingProducts with no flush, those two fail every
+        // upgrade with Error 2613. Measured on signed candidates; ICE63 only warns.
+        assert!(wxs.contains("<InstallExecute After='AutostartBackOnRollback' />"));
+        assert!(wxs.contains("Schedule='afterInstallExecute'"));
     }
 
     #[test]

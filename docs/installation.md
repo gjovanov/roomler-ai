@@ -575,8 +575,9 @@ minutes on (`start_soon_triggers`, `agents/roomlerd/src/service.rs`). With `Igno
 the later ones do nothing once the daemon is up, and `StartWhenAvailable` keeps them
 through a sleep. A fresh MSI has no config and starts nothing. A `service stop` inside
 those ten minutes can therefore be undone once, and a device removed inside them gets
-one more start, which retries against the server as the next sign-in's start would. An
-install that fails is the section [below](#when-a-per-user-upgrade-fails).
+one more start, which hears the server's goodbye and leaves again with exit 7, as the
+next sign-in's start would (measured, a start with the row already gone). An install that
+fails is the section [below](#when-a-per-user-upgrade-fails).
 
 **The first update onto the launcher looks a little different.** It runs the old
 product's table and the old daemon's own console: one terminal can flash when the old
@@ -632,7 +633,7 @@ redirected stderr, and then the last lines before a crash die with it.
 
 #### When a per-user upgrade fails
 
-`RemoveExistingProducts` runs right after `InstallInitialize`, so by the time anything
+`RemoveExistingProducts` runs before any file of the new product, so by the time anything
 can fail the old product's `UnregisterAutostart` has deleted the task, and past
 `StopOldDaemon` the daemon has gone too. A rollback restores the old files. Nothing
 restored the task until #3292, because the old table has no rollback action of its own.
@@ -649,9 +650,12 @@ the restored `roomlerd.exe`, the one file every release has, so the task is the 
 release writes, and each can flash a terminal, on a failed upgrade only. They sit ahead
 of `RemoveExistingProducts` because a rollback plays the script backwards: the old files
 are back when they run. `service install` comes back first, because `service start` needs
-its task. An uninstall that fails gets the same pair. ICE63 warns about an action between
-`InstallInitialize` and `RemoveExistingProducts`, and `installer-smoke` holds the order
-against the built MSI, because WiX orders actions that share a parent by itself.
+its task. An uninstall that fails gets the same pair. `InstallExecute` sits between them and
+`RemoveExistingProducts`, because that action refuses to run with anything spooled ahead of
+it: `Error 2613`, exit 1603, on every upgrade, healthy ones included (measured on signed
+candidates; ICE63 only warns). It flushes those two and nothing else, so the old product's
+removal still comes before any new file. `installer-smoke` holds the order against the
+built MSI, because WiX orders actions that share a parent by itself.
 
 **An install that never reaches its script has no rollback.** `msiexec` exits 1618 while
 another install holds the machine's mutex, so on a self-update the daemon has left and no
