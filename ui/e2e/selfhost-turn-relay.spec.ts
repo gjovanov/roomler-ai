@@ -99,14 +99,15 @@ test.describe('#3287 a call over the self-host TURN relay', () => {
 
       // A failed relay shows here: the track exists and its counter never moves.
       for (const [tag, page] of sides) {
-        await expect
-          .poll(async () => (await remoteVideoProgress(page)).frames, {
-            timeout: 90_000,
-            message:
-              `${tag} decoded no remote frame. Peer paths: ` +
-              JSON.stringify(await peerPaths(page)),
-          })
-          .toBeGreaterThan(0)
+        try {
+          await expect
+            .poll(async () => (await remoteVideoProgress(page)).frames, { timeout: 90_000 })
+            .toBeGreaterThan(0)
+        } catch {
+          throw new Error(
+            `${tag} decoded no remote frame. Peer paths: ${JSON.stringify(await peerPaths(page))}`,
+          )
+        }
       }
 
       const before = await Promise.all(pages.map(remoteVideoProgress))
