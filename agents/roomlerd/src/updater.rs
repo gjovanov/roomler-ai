@@ -1772,6 +1772,16 @@ pub(crate) async fn fetch_release_by_tag(tag: &str) -> Result<GithubRelease> {
     Ok(release)
 }
 
+/// #3289 — whether a crash loop's rollback can put an older version in place here.
+///
+/// On Windows it cannot. Both MSI flavours refuse a downgrade
+/// (`DowngradeErrorMessage`), so an attempt spent a download and a daemon exit to
+/// change nothing: measured 1603 on a per-machine install, and exit 0 in 2 s with
+/// the newer files still there on a per-user one whose Installer registration had
+/// fallen behind. Nothing raised the sentinel either way, and on a per-user device
+/// the exit is what took it offline.
+pub const ROLLBACK_CAN_DOWNGRADE: bool = cfg!(not(target_os = "windows"));
+
 /// Pin to a specific release tag. Used by the rollback path when
 /// the crash-loop detector decides the current version is broken
 /// and the last known-good version should be reinstalled.
@@ -6512,6 +6522,21 @@ mod tests {
     }
 
     // ----- msiexec_argv (Plan rc.18 P1) -------------------------------
+
+    /// #3289 — the constant is only as true as the two tables it describes. Whoever
+    /// lets an MSI downgrade (`AllowDowngrades`, or a schedule that drops the refusal)
+    /// lands here, and a crash loop on Windows can then go back to rolling back.
+    #[test]
+    fn no_rollback_runs_where_the_msis_refuse_a_downgrade() {
+        for table in [
+            include_str!("../wix/main.wxs"),
+            include_str!("../wix-perMachine/main.wxs"),
+        ] {
+            assert!(table.contains("DowngradeErrorMessage="));
+            assert!(!table.contains("AllowDowngrades"));
+        }
+        assert_eq!(ROLLBACK_CAN_DOWNGRADE, !cfg!(target_os = "windows"));
+    }
 
     #[test]
     fn msiexec_argv_per_user_uses_qn() {

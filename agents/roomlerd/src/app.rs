@@ -2573,6 +2573,23 @@ fn rollback_attention_msg(
     msg
 }
 
+/// #3289 — what a crash loop says where the installer cannot go back
+/// ([`updater::ROLLBACK_CAN_DOWNGRADE`]). Nothing was attempted, so nothing failed,
+/// and running the older installer over this version is the one thing it refuses.
+fn crash_loop_no_rollback_msg(current: &str, target: &str, crash_count: u32) -> String {
+    format!(
+        "Roomler agent: crash loop detected.\n\n\
+         Version {current} has crashed {crash_count} times within {win_min} min. \
+         Last known good version: {target}.\n\n\
+         This device did not roll back: the Windows installer refuses to install an \
+         older version over a newer one. It stays on {current} and updates itself as \
+         usual when a newer release is published.\n\n\
+         To go back sooner, uninstall Roomler, then install {target} from\n\
+         https://github.com/gjovanov/roomler-ai/releases",
+        win_min = config::CRASH_WINDOW_SECS / 60,
+    )
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4168,22 +4185,11 @@ async fn run_cmd(
 
     // If the crash counter has tripped the rollback threshold AND we
     // have a known-good fallback to roll back TO that isn't this same
-    // version, raise an attention sentinel. v1 does NOT auto-execute
-    // the rollback install — that requires fetching a specific tag's
-    // installer and ships in 0.1.52 alongside the SHA256 / HMAC
-    // manifest work. The operator can downgrade manually via
-    // `roomlerd self-update --pin <version>` (also 0.1.52) or
-    // by reinstalling the previous MSI by hand.
+    // version: go back to it where the installer can, and raise the
+    // attention sentinel where it cannot or when the attempt fails.
     if config::should_rollback(&cfg, current_pkg, now_unix)
         && let Some(target) = cfg.last_known_good_version.clone()
     {
-        let target_tag = format!("agent-v{target}");
-        tracing::error!(
-            current = %current_pkg,
-            target = %target_tag,
-            crash_count = cfg.crash_count,
-            "crash loop detected; attempting automatic rollback"
-        );
         // Mark attempted FIRST so a crash during the rollback
         // itself doesn't loop us back into another rollback. If the
         // rollback fetch / install fails, the operator still gets
@@ -4191,68 +4197,96 @@ async fn run_cmd(
         config::mark_rollback_attempted(&mut cfg);
         let _ = startup_writes.save(&cfg);
 
-        let outcome = updater::pin_version(&target_tag).await;
-        match outcome {
-            updater::CheckOutcome::UpdateReady {
-                latest,
-                installer_path,
-                ..
-            } => {
-                tracing::warn!(
-                    target = %latest,
-                    path = %installer_path.display(),
-                    "rollback installer downloaded — spawning + exiting"
-                );
-                if let Err(e) = updater::spawn_installer_with_watch(&installer_path, Some(&latest))
-                {
-                    tracing::error!(error = %e, "rollback installer spawn failed");
-                    let _ = notify::raise_attention_with_reason_for_version(
-                        notify::REASON_ROLLBACK,
+        if updater::ROLLBACK_CAN_DOWNGRADE {
+            let target_tag = format!("agent-v{target}");
+            tracing::error!(
+                current = %current_pkg,
+                target = %target_tag,
+                crash_count = cfg.crash_count,
+                "crash loop detected; attempting automatic rollback"
+            );
+            let outcome = updater::pin_version(&target_tag).await;
+            match outcome {
+                updater::CheckOutcome::UpdateReady {
+                    latest,
+                    installer_path,
+                    ..
+                } => {
+                    tracing::warn!(
+                        target = %latest,
+                        path = %installer_path.display(),
+                        "rollback installer downloaded — spawning + exiting"
+                    );
+                    if let Err(e) =
+                        updater::spawn_installer_with_watch(&installer_path, Some(&latest))
+                    {
+                        tracing::error!(error = %e, "rollback installer spawn failed");
+                        // FR-53: the build being accused, so a later healthy
+                        // connect from a different one can clear this.
+                        let _ = notify::raise_rollback_attention(
+                            &rollback_attention_msg(
+                                current_pkg,
+                                &target,
+                                cfg.crash_count,
+                                Some(&format!("automatic install failed: {e}")),
+                            ),
+                            current_pkg,
+                        );
+                    } else {
+                        // Installer is running, agent is about to exit.
+                        // The post-install watcher (spawned by
+                        // spawn_installer_with_watch) will record the
+                        // verdict in last-install.json; the new binary
+                        // can surface it on next start. #3289 — this exit is
+                        // our own, so the next start must not count it.
+                        config::mark_clean_shutdown(&mut cfg);
+                        let _ = startup_writes.save(&cfg);
+                        return Ok(None);
+                    }
+                }
+                updater::CheckOutcome::Skipped(reason)
+                | updater::CheckOutcome::Unreachable(reason) => {
+                    tracing::error!(%reason, "rollback fetch skipped — operator action required");
+                    let _ = notify::raise_rollback_attention(
                         &rollback_attention_msg(
                             current_pkg,
                             &target,
                             cfg.crash_count,
-                            Some(&format!("automatic install failed: {e}")),
+                            Some(&reason),
                         ),
-                        // FR-53: the build being accused, so a later
-                        // healthy connect from a different one can clear this.
-                        Some(current_pkg),
+                        current_pkg,
                     );
-                } else {
-                    // Installer is running, agent is about to exit.
-                    // The post-install watcher (spawned by
-                    // spawn_installer_with_watch) will record the
-                    // verdict in last-install.json; the new binary
-                    // can surface it on next start. #3289 — this exit is
-                    // our own, so the next start must not count it.
-                    config::mark_clean_shutdown(&mut cfg);
-                    let _ = startup_writes.save(&cfg);
-                    return Ok(None);
+                }
+                updater::CheckOutcome::UpToDate { .. } => {
+                    tracing::warn!(
+                        "rollback target reports as up-to-date — odd state, raising sentinel"
+                    );
+                    let _ = notify::raise_rollback_attention(
+                        &rollback_attention_msg(
+                            current_pkg,
+                            &target,
+                            cfg.crash_count,
+                            Some(
+                                "target version reports as up-to-date — manual investigation needed",
+                            ),
+                        ),
+                        current_pkg,
+                    );
                 }
             }
-            updater::CheckOutcome::Skipped(reason) | updater::CheckOutcome::Unreachable(reason) => {
-                tracing::error!(%reason, "rollback fetch skipped — operator action required");
-                let _ = notify::raise_attention_with_reason_for_version(
-                    notify::REASON_ROLLBACK,
-                    &rollback_attention_msg(current_pkg, &target, cfg.crash_count, Some(&reason)),
-                    Some(current_pkg),
-                );
-            }
-            updater::CheckOutcome::UpToDate { .. } => {
-                tracing::warn!(
-                    "rollback target reports as up-to-date — odd state, raising sentinel"
-                );
-                let _ = notify::raise_attention_with_reason_for_version(
-                    notify::REASON_ROLLBACK,
-                    &rollback_attention_msg(
-                        current_pkg,
-                        &target,
-                        cfg.crash_count,
-                        Some("target version reports as up-to-date — manual investigation needed"),
-                    ),
-                    Some(current_pkg),
-                );
-            }
+        } else {
+            // #3289 — no download and no exit: the installer would refuse, and this
+            // process is still the device's remote access for as long as it stays up.
+            tracing::error!(
+                current = %current_pkg,
+                last_known_good = %target,
+                crash_count = cfg.crash_count,
+                "crash loop detected; the installer here refuses a downgrade, so no rollback runs"
+            );
+            let _ = notify::raise_rollback_attention(
+                &crash_loop_no_rollback_msg(current_pkg, &target, cfg.crash_count),
+                current_pkg,
+            );
         }
     }
 
@@ -7444,6 +7478,19 @@ mod tests {
 
     /// #3289 — a worker the host hands a flag this build does not parse exits at
     /// once, on every spawn, so the host's spelling is read back here.
+    /// #3289 — nothing was attempted, so it does not say an attempt failed, and it
+    /// does not send a person to the one thing the installer refuses.
+    #[test]
+    fn a_crash_loop_with_no_rollback_says_what_is_true() {
+        let msg = crash_loop_no_rollback_msg("0.4.220", "0.4.197", 3);
+        assert!(msg.contains("0.4.220 has crashed 3 times within 10 min"));
+        assert!(msg.contains("Last known good version: 0.4.197"));
+        assert!(msg.contains("did not roll back"));
+        assert!(msg.contains("uninstall Roomler, then install 0.4.197"));
+        assert!(!msg.contains("auto-rollback failed"));
+        assert!(!msg.contains("reinstall manually"));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn parses_a_worker_as_the_service_host_spawns_it() {
