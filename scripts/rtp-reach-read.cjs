@@ -15,6 +15,11 @@
 // theirs differently, so a session whose transport fell through is still counted.
 // Counters are cumulative, so empties/s holds when the uploader lost heartbeats. A
 // flood drops lines, and then `hb` is a floor.
+// A rate runs from the session's request line to its last heartbeat. A still screen
+// heartbeats about every 30 s and the counters start at the session's start, so the
+// span between heartbeats alone read a short session high: 106 for a true 72. A
+// session whose request line was lost falls back to its first heartbeat.
+// The totals cover the 7 days, which mix releases, so `OUT version` splits them.
 //
 // ⚠️ mongosh reads stdin as a REPL, so a line that parses alone runs alone. Keep
 // `coll.aggregate([` together and `.forEach` on the closing line: split them and
@@ -42,7 +47,7 @@ coll.aggregate([
   { $limit: MAX_BATCHES },
   { $project: { _id: 0, lines: linesLike(/^incoming session request/) } },
   { $unwind: '$lines' },
-  { $project: { s: '$lines.fields.session_id', c: '$lines.fields.chosen_codec', q: '$lines.fields.requested_transport', n: '$lines.fields.negotiated_transport', b: '$lines.fields.browser_caps' } },
+  { $project: { s: '$lines.fields.session_id', t: '$lines.ts', c: '$lines.fields.chosen_codec', q: '$lines.fields.requested_transport', n: '$lines.fields.negotiated_transport', b: '$lines.fields.browser_caps' } },
 ], opts).forEach((row) => {
   total++;
   if ((row.n || '').includes('data-channel')) onDc++;
@@ -69,6 +74,7 @@ database.getCollection('agents').find({ _id: { $in: ids.map((id) => ObjectId(id)
 });
 
 const byBackend = {};
+const byVersion = {};
 const rates = [];
 let noVideo = 0;
 let rtpH264OnHw = 0;
@@ -76,13 +82,21 @@ sessions.forEach((s) => {
   const id = s.a ? s.a.toHexString() : '-';
   const host = hosts[id] || {};
   const req = requests[s._id] || {};
-  const secs = (s.last - s.first) / 1000;
+  const secs = (s.last - (req.t || s.first)) / 1000;
   const emptyRate = secs >= MIN_RATE_SECS ? Math.round((s.empty || 0) / secs) : null;
   const encRate = secs >= MIN_RATE_SECS ? ((s.enc || 0) / secs).toFixed(1) : '-';
   const name = s.backends.join('+');
+  const ver = byVersion[s.v || '-'] || (byVersion[s.v || '-'] = { rtp: 0, noVideo: 0, rates: [] });
   byBackend[name] = (byBackend[name] || 0) + 1;
-  if (emptyRate !== null) rates.push(emptyRate);
-  if (!s.bytes) noVideo++;
+  ver.rtp++;
+  if (emptyRate !== null) {
+    rates.push(emptyRate);
+    ver.rates.push(emptyRate);
+  }
+  if (!s.bytes) {
+    noVideo++;
+    ver.noVideo++;
+  }
   if (req.c === 'h264' && host.h264Hw && !host.ephemeral) rtpH264OnHw++;
   print(['OUT rtp', s.first.toISOString(), id, s.v || '-', 'secs=' + Math.round(secs), 'hb=' + s.hb, 'backend=' + name, 'chosen=' + (req.c || '?'), 'requested=' + (req.q || '?'), 'negotiated=' + (req.n || '?'), 'caps=' + (req.b || '?').replace(/[\s"]/g, ''), 'enc/s=' + encRate, 'empties/s=' + (emptyRate === null ? '-' : emptyRate), 'fps=' + (s.fps ?? '-'), 'bytes=' + (s.bytes ?? 0), 'ephemeral=' + (host.ephemeral ?? '?'), 'h264hw=' + (host.h264Hw ?? '?')].join(' '));
 });
@@ -94,3 +108,7 @@ print('OUT no-video ' + noVideo);
 print('OUT backends ' + Object.keys(byBackend).sort().map((k) => k + '=' + byBackend[k]).join(' '));
 print('OUT empties/s p50 ' + at(0.5) + ' p90 ' + at(0.9) + ' max ' + (rates.length ? rates[rates.length - 1] : '-') + ' over ' + rates.length + ' sessions of ' + MIN_RATE_SECS + ' s or more');
 print('OUT rtp-h264-on-a-hardware-cell-not-ephemeral ' + rtpH264OnHw);
+Object.keys(byVersion).sort().forEach((v) => {
+  const r = byVersion[v].rates.sort((a, b) => a - b);
+  print('OUT version ' + v + ' rtp ' + byVersion[v].rtp + ' no-video ' + byVersion[v].noVideo + ' empties/s p50 ' + (r.length ? r[Math.floor(r.length / 2)] : '-') + ' max ' + (r.length ? r[r.length - 1] : '-'));
+});

@@ -892,7 +892,7 @@ flowchart LR
 | `OUT sessions N dc D rtp R agents A` | How much of the fleet's remote desktop runs on this path |
 | `OUT no-video N` | Sessions that wrote no bytes: `backend=noop`, the failure #3245 ends. It should read **zero** once every host has the pick, and a session with a `limit` no longer reaches it |
 | `OUT backends …` | Which encoder those sessions got |
-| `OUT empties/s p50 … p90 … max …` | The spin #3272's waiting capture ends: about 90,000 a second before it, with a bar of 80 on a waiting arm and 520 on a floor arm after it |
+| `OUT empties/s p50 … p90 … max …` | The spin #3272's waiting capture ends: about 90,000 a second before it, with a bar of 80 on the direct arm and 520 on scrap after it. The 7 days mix releases, so `OUT version V rtp N no-video M empties/s …` splits it. 0.4.197's first 8 sessions read p50 58, max 73 |
 | `OUT rtp-h264-on-a-hardware-cell-not-ephemeral N` | The reach an H.264 hardware rung would have on this path. #3272 decided against building one, and more than 10 a week is what would reopen that |
 
 **Baseline, the 7 days to 2026-11-01:** 730 sessions, 672 on a DataChannel and 58 on RTP (7.9 %), on
