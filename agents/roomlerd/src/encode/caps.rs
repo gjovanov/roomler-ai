@@ -489,6 +489,24 @@ mod child {
             .collect()
     }
 
+    /// #3280 — a child stuck after the report left an answer offering what a session
+    /// is now refused, and an RTP track binds to its codec before the encoder opens.
+    /// Nothing here when the report was made without them.
+    fn withdraw_media_foundation(caps: &mut AgentCaps) {
+        caps.video_cells
+            .retain(|c| c.backend != VideoBackend::MediaFoundation.wire());
+        caps.hw_encoders.retain(|h| !h.starts_with("mf-"));
+        let cells = &caps.video_cells;
+        caps.codecs.retain(|codec| {
+            let wire = if codec == "h265" {
+                VideoCodec::Hevc.wire()
+            } else {
+                codec.as_str()
+            };
+            cells.iter().any(|c| c.codec == wire)
+        });
+    }
+
     /// [`media_foundation_denies`], onto a probe's own list.
     fn stuck_costs_media_foundation(denied: &mut Vec<LearnedDeny>) {
         for deny in media_foundation_denies() {
@@ -1102,6 +1120,14 @@ mod child {
                     );
                 }
             }
+        }
+
+        if !MF_IN_THE_DAEMON.is_empty()
+            && media_foundation_denies()
+                .iter()
+                .all(|d| learned.iter().any(|l| l.cell == d.cell))
+        {
+            withdraw_media_foundation(&mut report.caps);
         }
 
         // The whole cost the daemon paid: every spawn, every open, every parse.
@@ -2980,7 +3006,12 @@ fn one_try(row: usize, last: &child::Shortfall, live: &impl Fn() -> bool) -> Nex
         return Next::End("ROOMLERD_CAPS_PROBE_RETRY is off");
     }
     let bounds = LADDER[row].bounds;
+    // A session that asked before this read is caught here, and one after it by
+    // `stop`, so none falls between the wait and the try.
     let asked = last_ask();
+    if !quiet(child::stuck_children(), live(), asked.map(|t| t.elapsed())) {
+        return Next::Again;
+    }
     let stop = || last_ask() != asked || live();
     let now = cache::now_unix();
     let key = cache::enabled().then(cache::current_key).flatten();
@@ -7761,6 +7792,49 @@ mod tests {
             ],
         );
         assert_eq!(names(&got.learned), mf_cells());
+    }
+
+    /// A child stuck after the report: the answer stops offering what a session is
+    /// now refused, or an RTP session would bind to a codec nothing can open. A
+    /// codec another cell still offers stays.
+    #[cfg(windows)]
+    #[test]
+    fn a_child_stuck_after_the_report_withdraws_media_foundation() {
+        let _fixture = probe_fixture();
+        let mut caps = nvenc_caps();
+        caps.video_cells.push(VideoCell::new(
+            VideoCodec::Av1,
+            VideoBackend::MediaFoundation,
+            &[ChromaFormat::Yuv420],
+            true,
+        ));
+        caps.video_cells.push(VideoCell::new(
+            VideoCodec::Hevc,
+            VideoBackend::MediaFoundation,
+            &[ChromaFormat::Yuv420],
+            true,
+        ));
+        caps.codecs = vec!["h265".to_string(), "av1".to_string()];
+        caps.hw_encoders = vec!["mf-av1-hw".to_string(), "ffmpeg-hevc_nvenc".to_string()];
+        let (got, _) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(report_of(caps))),
+                ("444", Some(base_stuck_in("hevc_nvenc:yuv444"))),
+            ],
+        );
+        let report = got.report.expect("the report stands");
+        assert!(
+            !report
+                .caps
+                .video_cells
+                .iter()
+                .any(|c| c.backend == VideoBackend::MediaFoundation.wire()),
+            "{:?}",
+            report.caps.video_cells
+        );
+        assert_eq!(report.caps.codecs, ["h265"], "FFmpeg's cell keeps HEVC");
+        assert_eq!(report.caps.hw_encoders, ["ffmpeg-hevc_nvenc"]);
     }
 
     /// A session asked: the probe ends where it is, and it starts nothing further.

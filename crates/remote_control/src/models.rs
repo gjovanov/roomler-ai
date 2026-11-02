@@ -558,10 +558,10 @@ pub struct AgentCaps {
     ///   to the viewer's stage (macOS; a Linux system install, a Wayland
     ///   desktop). Until P3e-2 the viewer offered the toggle on Windows only,
     ///   by OS; it now follows this word, and an absent key still offers it.
-    /// * `encoder-cells` — #3267: encoder cells this host learned not to open,
-    ///   because its capability probe died in them (`learned-deny`, naming each
-    ///   cell and how the probe ended). For a fleet read: `video_cells` and the
-    ///   other lists already leave them out, and no viewer control follows it.
+    /// * `encoder-cells` — #3267: cells this host learned not to open, because its
+    ///   probe died in them (`learned-deny`, naming each and how), or #3280: a probe
+    ///   short of time with no cell to name (`probe-short`). For a fleet read: the
+    ///   lists already leave them out, and no viewer control follows it.
     ///
     /// Empty from every agent before P0c: those agents claim what their lists
     /// say, so an absent key never means "unavailable".

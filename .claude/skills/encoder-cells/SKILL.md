@@ -94,7 +94,7 @@ none started after 90 s:
 - **No cell to blame: one more run**, then it gives up: no hardware, as before, but a
   last child (`software`) still proves libvpx, which needs no driver. Only if that
   dies too is the answer `compute_caps(false)`.
-- ⚠️ A report the child printed stands however it ended afterwards.
+- ⚠️ A report the child printed stands however it ended afterwards, in every phase.
 - ⚠️ `windows_fault_code` is a list of what counts, because an unknown NTSTATUS must
   not cache a healthy cell out. Don't widen it back to "any error severity": that
   polarity let `0xffffffff` through until a field kill test found it. 255 stays on the
@@ -102,8 +102,33 @@ none started after 90 s:
 - ⚠️ A cell learned in 4:2:0 takes its 4:4:4 form with it (`names_444`): the `444`
   child never tested that form, and nothing checks `chroma_pref` against the hello.
 
+⚠️ **A child that would not die costs Media Foundation too**, for this process, whichever
+phase it was (`media_foundation_denies`), because a session opens those cells in the daemon on
+a wait with no bound. Only a kill that landed within its bound keeps them, so a thrashing host
+can lose them too, until a later try. With `h264` chosen the session takes OpenH264; with `av1`
+chosen it gets no video until #3279 lands.
+
+⚠️ **A first answer that ran short of time gets more tries by itself** (#3280,
+`caps::arm_retry`, `docs/encoders.md`). A detached thread climbs `LADDER`, whole probes with
+longer bounds. Keep these true when you touch it:
+
+- **A cache hit or a complete answer arms nothing.** A healthy host must run none of this.
+- **A try's children get the try's own list** (`list_for_a_try`, `Try::denied`), never through
+  `install_learned`: the daemon's list does not relax while a cell is being tested. A fault's deny
+  stays on every list; only what is there for want of time (`LearnedDeny::timed_out`) comes off.
+- **Never compare `why` strings.** `timed_out` is the mark.
+- **A session comes first.** `session_asked` kills the child at its next poll, the try is lost
+  and not counted, and an answer goes in only with nothing live.
+- **A try cannot take a form, except for a fault** (`weigh`). A count of cells is not enough: an
+  answer with more cells that leaves one out is dropped.
+- **Adopt the list first and the generation last,** and read `generation()` before reading the
+  answer, so a change in between reads as news rather than getting lost.
+- ⚠️ `std::thread`, not `spawn_blocking`: a runtime's shutdown waits on those, and
+  `signaling::run` must be able to leave.
+
 When a host is missing a cell, read `learned_deny` in the log or
-`capabilities.unavailable["encoder-cells"]`, then the WER event's faulting module.
+`capabilities.unavailable["encoder-cells"]` (code `learned-deny`, or `probe-short` with no cell to
+name), then the WER event's faulting module.
 `roomlerd caps-probe` by hand with `ROOMLERD_CAPS_CHILD=1 ROOMLERD_CAPS_PHASE=base`
 reproduces a fault in seconds, and its last `PROGRESS` line names it. A healthy
 session is no tell, because an MF H.264 session plays with no hardware cell at all.
@@ -136,6 +161,9 @@ GUI-session state and every verb list are recomputed by the running process
 (`caps::merge_cached`) — they change without any driver changing.
 ⚠️ On a Windows SCM host the **worker** (console session) runs the probe and owns
 the cache file, not the supervisor's `service-logs`.
+⚠️ **Only a fault's death counts as an answer for the cache.** A `444` or `gpu` child that left
+nothing for any other reason (a hang, an OOM kill, an EDR's terminate, a failed spawn) keeps the
+answer out of it, so the next start asks again (`why_not_cached`, `PhaseGaps::note`).
 ⚠️ **A confirmed learned deny lives in this file and nowhere else** (#3267), and an
 answer carrying one stands for a day, not a week. Any key mismatch drops it, and the
 next probe tests the cell again: that is how a vendor's fix heals with nobody acting.
