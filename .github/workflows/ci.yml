@@ -1455,7 +1455,7 @@ jobs:
       # release tag. Windows has the same gap: windows-shipped-flavour, below.
       # On a warm cache the check costs 43 s and the tests 2 min 42 s (run 41522300303),
       # on the job that is each run's floor. The tests earn that: Linux's unit tests
-      # build `hive,vault` too, so this is the one Unix run of these 434 without it.
+      # build `hive,vault` too, so this is the one Unix run of these tests without it.
       - name: cargo check agent as macOS ships it (hive, no vault)
         run: cargo check -p roomlerd --lib --bins --features hive
       - name: Agent sessions as macOS ships them, unit tests (hive, no vault)
