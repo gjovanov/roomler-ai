@@ -1003,13 +1003,42 @@ frame to anyone. `zero_copy` still decides what the DC pumps get, because their
 encoders do take GPU frames.
 
 The other way out was built and measured, and it lost: an `AcquireNextFrame(0)`
-poll resting on the 2 ms floor, which read L4 +11.3 ms p50 on a still screen and
-+24.0 ms with a pointer at 30 Hz, against the same switch spinning ([#3272's third
+poll resting on the 2 ms floor, which read L4 +11.3 ms p50 on a still screen,
+against the same switch spinning ([#3272's third
 run](https://github.com/gjovanov/roomler-ai/issues/3272#issuecomment-6568846719),
 on a guest with only the Basic Render Driver). The poll itself runs at 2.6 ms, so
 the poll alone does not account for that, and the cause is not proven. FR-98 C7
 inherits both facts, because a DC pump's encoder wants GPU frames and its pump
 sleep is the same poll.
+
+**What the wait costs, measured.** On that guest (2 vCPU, `openh264` over RTP, zero
+copy off), against the kill switch beside it. L4 is `p50 / p95` in ms, 2 runs per
+arm; a gap counts when it is beyond the larger of the two arms' run-to-run spread,
+in brackets.
+
+| Read | spin (kill switch) | waiting | gap, p50 / p95 |
+|---|---|---|---|
+| Worker CPU, one viewer, still screen, % of one CPU | 162 | **1.5** | |
+| `calls` per 30 s, still screen | about 3 M | **about 1,790** | |
+| L4, still | 40.9 / 57.5 | 40.8 / 57.9 | 0.0 (1.1) / +0.4 (0.5) |
+| L4, a pointer at about 30 Hz | 39.9 / 57.9 | 39.8 / 59.2 | −0.1 (1.9) / +1.3 (3.7) |
+| L4, a pointer at about 110 Hz | 41.4 / 57.7 | 42.1 / 57.5 | +0.7 (2.0) / −0.2 (0.6) |
+| L4, 60 fps motion | 39.5 / 68.5 | 42.8 / 69.7 | **+3.4 (0.5)** / +1.2 (8.2) |
+
+With the zero-copy switch on, the spin reads GPU frames and the waiting arm does
+not, and motion reads p50 **+4.9** (1.4), p95 **+8.0** (2.0), while the still screen
+reads +0.5 (0.2) / −1.2 (1.4). Motion is the wait's one standing L4 miss, the cause
+is not proven, and it comes from a guest whose compositor renders in software. No
+real GPU has been read on any of this.
+
+⚠️ **How to move a pointer in an L4 cell.** A target-mode probe is itself a pointer
+move onto the probe window's pad, so a load that moves the same pointer can measure
+the two movers instead of the capture. The rows above move it the way a controller
+does: an absolute move through the input queue, 1 px either side of where the probe
+left it. `SetCursorPos` costs both arms 8-11 ms by itself, and pulling the pointer
+off the pad also loses probes on the waiting arm, 15 and 31 of about 480 at 110 Hz
+against 2 and 0 through the queue ([the correction on
+#3272](https://github.com/gjovanov/roomler-ai/issues/3272#issuecomment-6571879880)).
 
 RTP gives up nothing on H.264: its encoders read every frame back anyway
 (`mf/sync_pipeline.rs`, `openh264_backend.rs`, `frame.cpu()`). An RTP session on
@@ -1061,9 +1090,10 @@ The rest of the change:
   quiet host from a host whose lines never arrived.
 
 **What this does not do.** On DXGI a motion source above the target still delivers
-at the display's rate. A session at a 30 fps target that encodes faster than that
-stamps each frame at least 33 ms on (`frame_duration_floor`), so its RTP clock runs
-ahead of wall time. Only the GDI arm holds to the target here.
+at the display's rate: a 60 fps source read 55-56 frames a second at a target of 30,
+waiting or spinning. A session that encodes faster than its target stamps each frame
+at least 33 ms on (`frame_duration_floor`), so its RTP clock runs ahead of wall time.
+Only the GDI arm holds to the target here.
 
 The kill switch is `ROOMLERD_RTP_CAPTURE_WAIT=0`: environment only, read once per
 pump. Off, the pump does not ask and the guard is not armed, so the capture spins
