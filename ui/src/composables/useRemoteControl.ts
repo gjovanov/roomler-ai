@@ -225,6 +225,18 @@ export function deadAirDelayMs(streak: number): number {
 }
 
 /**
+ * FR-135 R2 — what the dead-air backoff tells the operator. A session whose
+ * `rc:media-plan` arrived was reached: the plan came over the control channel,
+ * so blaming the device's network would be false, and the stage already says
+ * what the device did say. The backoff itself stays: 388 sessions in 24 h buy
+ * nothing whatever keeps the frames away.
+ */
+export function deadAirNotice(streak: number, delayMs: number, planKnown: boolean): string {
+  const retrying = `No video from this device after ${streak} attempts — retrying every ${Math.round(delayMs / 1000)}s.`
+  return planKnown ? retrying : `${retrying} Its network may be blocking the connection.`
+}
+
+/**
  * S3 viewer resilience Ã¢ÂÂ detection constants. All exported so the
  * decision tables below are unit-lockable.
  *
@@ -9418,14 +9430,17 @@ export function useRemoteControl(
     const deadAir = deadAirDelayMs(deadAirStreak.value)
     const delay = Math.max(nextReconnectDelayMs(attemptIdx), deadAir)
     if (deadAir > 0) {
+      const planKnown = mediaPlan.value !== null
       console.warn(
         '[rc] no media on the last',
         deadAirStreak.value,
         'attempts — backing off',
         delay,
-        'ms. The device likely has no usable network path to this browser.',
+        planKnown
+          ? 'ms. The control channel carried its plan, so the path to this browser works.'
+          : 'ms. The device likely has no usable network path to this browser.',
       )
-      notice.value = `No video from this device after ${deadAirStreak.value} attempts — retrying every ${Math.round(delay / 1000)}s. Its network may be blocking the connection.`
+      notice.value = deadAirNotice(deadAirStreak.value, delay, planKnown)
     }
     reconnectAttempt.value = attemptIdx + 1
     phase.value = 'reconnecting'

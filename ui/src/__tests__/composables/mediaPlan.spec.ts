@@ -8,11 +8,12 @@ import {
   mediaLadderLabel,
   mediaPlanAction,
   nextMediaSilent,
+  noPictureWords,
   parseMediaPlan,
   viewerHzWireMessage,
   type RcMediaPlan,
 } from '@/composables/mediaPlan'
-import { parseControlInbound } from '@/composables/useRemoteControl'
+import { deadAirNotice, parseControlInbound } from '@/composables/useRemoteControl'
 
 const step = (from: string, to: string, why = 'because') => ({ from, to, why, at_ms: 1 })
 
@@ -165,6 +166,38 @@ describe('FR-135 R2: what the page says', () => {
     expect(mediaLadderLabel([step('a', 'b'), step('b', 'c')])).toBe('b → c (2 steps)')
     expect(describeMediaStep(step('gpu', 'cpu', 'cpu_frames'))).toBe('gpu → cpu: cpu_frames')
     expect(describeMediaStep(step('gpu', 'cpu', ''))).toBe('gpu → cpu')
+  })
+})
+
+describe('FR-135 R2: the words on a page with no picture', () => {
+  const stop = { title: 'Stopped.', body: 'It tried a.', code: 'no_encoder', detail: 'x' }
+  const plan = { codec: 'av1', transport: 'webrtc' }
+
+  it('takes the device\'s own stop over what it was promised', () => {
+    expect(noPictureWords(stop, true, plan)).toEqual({ testId: 'rc-media-stop', iconColor: 'warning', ...stop })
+  })
+
+  it('says what was promised once the session is silent, with no word of the device\'s to show', () => {
+    const words = noPictureWords(null, true, plan)
+    expect(words?.testId).toBe('rc-media-silent')
+    expect(words?.title).toBe('No picture yet.')
+    expect(words?.body).toBe('This device is set to send AV1 over WebRTC, and no frame has arrived.')
+    expect(words?.code).toBeNull()
+  })
+
+  it('has none before the session is silent, or without a plan: an older agent\'s session reads as it did', () => {
+    expect(noPictureWords(null, false, plan)).toBeNull()
+    expect(noPictureWords(null, true, null)).toBeNull()
+    expect(noPictureWords(null, false, null)).toBeNull()
+  })
+})
+
+describe('FR-135 R2: what the dead-air backoff tells the operator', () => {
+  it('blames the network only when no plan ever came over the control channel', () => {
+    expect(deadAirNotice(3, 30_000, false)).toBe(
+      'No video from this device after 3 attempts — retrying every 30s. Its network may be blocking the connection.',
+    )
+    expect(deadAirNotice(3, 30_000, true)).toBe('No video from this device after 3 attempts — retrying every 30s.')
   })
 })
 

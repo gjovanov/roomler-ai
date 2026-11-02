@@ -195,6 +195,16 @@ refs: `mediaPlan`, `mediaStop`, `mediaSilent`, `viewerHz`.
   blink every 10 s. A new session's first plan knows only the transport and the codec,
   so it leaves the words alone (`mediaPlanAction`). An opened encoder clears them, and
   so does the first picture.
+- **The overlays live on the connected stage, so the redial has a stage of its own**
+  (`noPictureWhileRedialling`, the same shape as FR-93 P5j's `rc-host-asleep`). It says
+  the same words under the same `data-testid`, with the attempt's own phase in its
+  caption: a consent prompt on the device still reads as one. Without it, every
+  re-create read "Connection lost", which is false because the device answered, and
+  from the fourth attempt the dead-air backoff holds that stage for minutes.
+- **The backoff stays and stops blaming the network** (`deadAirNotice`). Three frameless
+  sessions still slow the retries to minutes, whatever keeps the frames away. A plan
+  came over the control channel, so "its network may be blocking the connection" is
+  left off for any session that has one.
 - **A plan is kept by `epoch`.** The next session's plan starts at 1 again, so the page
   counts apart from the plan it shows and resets on `teardown`.
 - **A plan that says `webrtc` while a data-channel path runs stops that path**, so

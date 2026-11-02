@@ -1162,7 +1162,10 @@ never something wrong.
 one failure in the error it returns, which on a guest read `no vulkan device opened on
 this host` with three other cells tried and unnamed. `media_plan::OpenTrail` listens
 on the open's own blocking-pool thread, and `note_candidate_failed` costs one
-thread-local read when nobody is listening, as during a probe.
+thread-local read when nobody is listening, as during a probe. A name this build does
+not carry never ran, so it leaves no arrow: the cascade asks FFmpeg (`find_by_name`)
+rather than reading its own error's words, and a Windows page does not say it tried
+`h264_videotoolbox`.
 
 **What the page does with it** (`composables/mediaPlan.ts`, in full in
 [`ui.md`](ui.md#a-session-says-what-it-got-fr-135-r2)). `stopped` becomes an overlay
@@ -1172,9 +1175,12 @@ And a plan that says `webrtc` while the page decodes a data channel stops that p
 channel the page opened.
 
 ⚠️ **It does not end the session.** The watchdog still asks for a new one every 10 s,
-because a transient GPU fault heals that way today. The page keeps the words across the
-re-create, so they hold still while it tries. Ending the session with a reason is R8's
-(FR-135 §6.8).
+because a transient GPU fault heals that way today, and from the fourth attempt the
+dead-air backoff stretches that to minutes. The page keeps the words across the
+re-create and through the backoff, so they hold still while it tries. It has dropped
+the backoff's "its network may be blocking the connection" for a session with a plan,
+because the plan came over the control channel. Ending the session with a reason is
+R8's (FR-135 §6.8).
 
 **`rc:viewer-hz`.** The decode worker measures its own `requestAnimationFrame` in a
 short burst when the first frame paints and once a minute after

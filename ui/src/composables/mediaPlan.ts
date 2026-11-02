@@ -161,6 +161,36 @@ export function describeMediaStop(plan: Pick<RcMediaPlan, 'stopped' | 'ladder'>)
   }
 }
 
+export interface NoPictureWords {
+  testId: 'rc-media-stop' | 'rc-media-silent'
+  iconColor: string
+  title: string
+  body: string
+  /** The device's word, only when it gave one. */
+  code: string | null
+  detail: string
+}
+
+/** What a page with no picture says, from what it knows: the device's own stop,
+ *  else what it was promised. `null` when it knows neither, which is every
+ *  session of an older agent. */
+export function noPictureWords(
+  stop: MediaStopCopy | null,
+  silent: boolean,
+  plan: Pick<RcMediaPlan, 'codec' | 'transport'> | null,
+): NoPictureWords | null {
+  if (stop) return { testId: 'rc-media-stop', iconColor: 'warning', ...stop }
+  if (!silent || !plan) return null
+  return {
+    testId: 'rc-media-silent',
+    iconColor: 'grey-lighten-1',
+    title: 'No picture yet.',
+    body: `This device is set to send ${describeMediaPromise(plan)}, and no frame has arrived.`,
+    code: null,
+    detail: '',
+  }
+}
+
 export interface MediaPlanAction {
   /** The page's words: new ones, `null` to clear them, or `undefined` to leave
    *  them. A re-created session's first plan knows nothing yet about why the last

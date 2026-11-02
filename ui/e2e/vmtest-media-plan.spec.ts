@@ -12,7 +12,8 @@
  *   MP_EXPECT_PAINTS    `0`: no frame may paint. `1`: a frame must paint
  *   MP_EXPECT_PLAN      a regex a logged `[rc] media plan` line must match
  *   MP_EXPECT_NO_PLAN   `1`: no such line may appear, for an older agent
- *   MP_EXPECT_NO_BLINK  `1`: once an overlay shows, it stays until the end of the wait
+ *   MP_EXPECT_NO_BLINK  `1`: once the page says why it has no picture, it says so until the end of the wait
+ *   MP_EXPECT_NO_BLAME  `1`: the page must not blame the device's network
  *   MP_EXPECT_HZ        a regex a logged `[rc] viewer_hz` line must match
  *   MP_EXPECT_VERB      `1` or `0`: whether the agent's row must advertise `media-plan`
  *   MP_UI_DIST        serve the viewer from this `dist` directory at the production origin, for a read before a promote
@@ -36,6 +37,7 @@ const EXPECT_PAINTS = process.env.MP_EXPECT_PAINTS || ''
 const EXPECT_PLAN = process.env.MP_EXPECT_PLAN || ''
 const EXPECT_NO_PLAN = process.env.MP_EXPECT_NO_PLAN === '1'
 const EXPECT_NO_BLINK = process.env.MP_EXPECT_NO_BLINK === '1'
+const EXPECT_NO_BLAME = process.env.MP_EXPECT_NO_BLAME === '1'
 const EXPECT_HZ = process.env.MP_EXPECT_HZ || ''
 const EXPECT_VERB = process.env.MP_EXPECT_VERB || ''
 const UI_DIST = process.env.MP_UI_DIST || ''
@@ -43,7 +45,24 @@ const SHOT = process.env.MP_SHOT || ''
 const CODEC_STORAGE_PREFIX = 'roomler-rc-codec.v1:'
 const WORKER_FILE = /\/rc-(vp9-444|hevc)-worker[^/]*\.js$/
 
+/** The two reasons a page gives for having no picture, on the connected stage or through a redial. */
+const REASON = '[data-testid="rc-media-stop"], [data-testid="rc-media-silent"]'
+const NOTICE = /No video from this device[^\n]*/
+
 const say = (s: string) => console.log(`[mp-spec] ${new Date().toISOString()} ${s}`)
+
+/**
+ * Runs in the page: logs every time the reason leaves the DOM, on the mutation and not on a poll, so a redial shorter
+ * than any sampling still counts.
+ */
+function watchTheReason(selector: string) {
+  let shown = false
+  new MutationObserver(() => {
+    const now = document.querySelector(selector) !== null
+    if (shown && !now) console.info('[mp] reason gone')
+    shown = now
+  }).observe(document, { childList: true, subtree: true })
+}
 
 /** Prepended to the decode worker: counts paints on the data-channel path. */
 const SHIM = `;(() => {
@@ -113,6 +132,7 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
     },
     [agentId as string, RC_CODEC, CODEC_STORAGE_PREFIX],
   )
+  await context.addInitScript(watchTheReason, REASON)
   await context.route('https://purestat.ai/**', (route) => route.abort())
   await context.route(`${BASE_URL}/**`, async (route) => {
     const url = new URL(route.request().url())
@@ -141,8 +161,11 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   const plans: string[] = []
   const hzLines: string[] = []
   const overlayWords = new Set<string>()
+  const noticeWords = new Set<string>()
   let painted = 0
   let sessionsAsked = 0
+  let blink = 0
+  const t0 = Date.now()
   page.on('websocket', (ws) => {
     ws.on('framesent', (f) => {
       if (typeof f.payload === 'string' && f.payload.includes('rc:session.request')) {
@@ -162,6 +185,9 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
     if (text === '[mp] first paint') {
       painted++
       say('first paint on the data-channel path')
+    } else if (text === '[mp] reason gone') {
+      blink++
+      say(`the reason left the page after ${Date.now() - t0} ms`)
     } else if (text.startsWith('[rc] media plan')) {
       plans.push(text)
       say(text.slice(0, 600))
@@ -179,26 +205,28 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   say(`browser=${browserName} ui=${UI_DIST ? 'local dist' : 'served'} connect`)
   await connect.click()
 
-  // Every overlay this page can show, read once a second, so one that a re-created session clears still counts.
-  // `blink` counts the reads with the words gone again: a page that keeps saying why must not stop saying it.
-  const t0 = Date.now()
-  let firstWords = false
-  let blink = 0
+  // Every overlay this page can show, read once a second, so one that a re-created session clears still counts. So is
+  // the backoff's notice. Whether the reason ever left is `watchTheReason`'s to say: a redial is shorter than this read.
   while (Date.now() - t0 < WAIT_MS) {
     const words = await page
-      .locator('.no-media-overlay')
+      .locator(`.no-media-overlay, ${REASON}`)
       .allInnerTexts()
       .catch(() => [] as string[])
-    if (words.length > 0) firstWords = true
-    else if (firstWords) {
-      blink++
-      say(`no overlay after ${Date.now() - t0} ms`)
-    }
     for (const w of words) {
       const clean = w.replace(/\s+/g, ' ').trim()
       if (clean && !overlayWords.has(clean)) {
         overlayWords.add(clean)
         say(`overlay after ${Date.now() - t0} ms: ${clean.slice(0, 400)}`)
+      }
+    }
+    const notices = await page
+      .getByText(NOTICE)
+      .allInnerTexts()
+      .catch(() => [] as string[])
+    for (const n of notices) {
+      if (!noticeWords.has(n)) {
+        noticeWords.add(n)
+        say(`notice after ${Date.now() - t0} ms: ${n.slice(0, 200)}`)
       }
     }
     await page.waitForTimeout(1_000)
@@ -212,7 +240,8 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   if (SHOT) await page.screenshot({ path: SHOT }).catch(() => undefined)
   const paints = painted + (video.w > 0 && video.t > 0 ? 1 : 0)
   const overlay = [...overlayWords].join(' | ')
-  say(`RESULT browser=${browserName} paints=${paints} video=${video.w} sessions=${sessionsAsked} plans=${plans.length} hz=${hzLines.length} blink=${blink} verb=${verb} pageerrors=${pageErrors} overlay="${overlay.slice(0, 500)}"`)
+  const notice = [...noticeWords].join(' | ')
+  say(`RESULT browser=${browserName} paints=${paints} video=${video.w} sessions=${sessionsAsked} plans=${plans.length} hz=${hzLines.length} blink=${blink} verb=${verb} pageerrors=${pageErrors} overlay="${overlay.slice(0, 500)}" notice="${notice.slice(0, 300)}"`)
 
   const disconnect = page.locator('button[aria-label="Disconnect"]').first()
   if (await disconnect.isVisible().catch(() => false)) await disconnect.click().catch(() => undefined)
@@ -224,6 +253,7 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   if (EXPECT_PLAN) expect(plans.join('\n')).toMatch(new RegExp(EXPECT_PLAN))
   if (EXPECT_NO_PLAN) expect(plans.length).toBe(0)
   if (EXPECT_NO_BLINK) expect(blink).toBe(0)
+  if (EXPECT_NO_BLAME) expect(notice).not.toMatch(/network may be blocking/)
   if (EXPECT_HZ) expect(hzLines.join('\n')).toMatch(new RegExp(EXPECT_HZ))
   if (EXPECT_VERB) expect(String(verb)).toBe(EXPECT_VERB === '1' ? 'true' : 'false')
   expect(pageErrors).toBe(0)
