@@ -265,6 +265,13 @@ enum Command {
         /// the same reason as `--stop-event`.
         #[arg(long, hide = true)]
         gpu_pin_event: Option<String>,
+        /// #3289 (Windows) — the SCM service host's word for how the last
+        /// worker ended, when it saw that end and it was not the worker failing
+        /// (`supervisor::worker_end_is_no_crash`). This start then does not
+        /// count the last run as a crash. Passed only by the host; hidden for
+        /// the same reason as `--stop-event`.
+        #[arg(long, hide = true)]
+        prior_end: Option<String>,
     },
     /// Run the codec capability probes and print the result as one
     /// `ROOMLER_CAPS_JSON:{…}` line. Spawned by the daemon itself — never
@@ -1703,6 +1710,8 @@ async fn daemon_main() -> Result<()> {
         sas_event: None,
         // FR-119 P2b-16 — and a GPU-pin relay.
         gpu_pin_event: None,
+        // #3289 — and what it saw of the last worker's end.
+        prior_end: None,
     });
     // Only the worker subcommand (`Run`) is the one the SCM supervisor
     // spawns + observes for crashes. On non-zero exit from that path,
@@ -1797,6 +1806,7 @@ async fn daemon_main() -> Result<()> {
             stop_event,
             sas_event,
             gpu_pin_event,
+            prior_end,
         } => {
             // FR-97 P4a — the host's relay, for the real Ctrl+Alt+Del.
             #[cfg(target_os = "windows")]
@@ -1818,6 +1828,7 @@ async fn daemon_main() -> Result<()> {
                 supervised,
                 supervisor.as_deref(),
                 stop_event.as_deref(),
+                prior_end.as_deref(),
             )
             .await
             .map(|restart| {
@@ -3738,6 +3749,9 @@ async fn run_cmd(
     // `terminate_signal`. `None` on every non-service run and every other
     // platform.
     stop_event: Option<&str>,
+    // #3289 (Windows) — the SCM host's word for the last worker's end, when it
+    // saw that end and it was not the worker failing. `None` everywhere else.
+    prior_end: Option<&str>,
 ) -> Result<Option<i32>> {
     // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
     let process_started = std::time::Instant::now();
@@ -4121,21 +4135,33 @@ async fn run_cmd(
 
     // Crash-loop bookkeeping: if the previous run was marked
     // `last_run_unhealthy=true` (started, never reached the clean
-    // threshold, never exited gracefully) → count it as a crash. Then
-    // mark THIS run as tentatively unhealthy; either the 5-min healthy
+    // threshold, never exited gracefully) and neither the OS nor its
+    // service host ended it (#3289) → count it as a crash. Then mark
+    // THIS run as tentatively unhealthy; either the 5-min healthy
     // task or the Ctrl-C handler will flip the flag back to false.
     // Save before checking for rollback so the worst-case state is
     // durable on disk if we then crash again.
     let now_unix = unix_now();
     let current_pkg = env!("CARGO_PKG_VERSION");
-    if cfg.last_run_unhealthy {
-        config::record_crash_at(&mut cfg, now_unix);
-        tracing::warn!(
+    let boot_now = roomlerd::boot_id::current();
+    match config::previous_run(&cfg, boot_now.as_deref(), prior_end.is_some()) {
+        config::PreviousRun::Clean => {}
+        config::PreviousRun::Crashed => {
+            config::record_crash_at(&mut cfg, now_unix);
+            tracing::warn!(
+                crash_count = cfg.crash_count,
+                "previous run did not reach clean-run threshold — counting as crash"
+            );
+        }
+        ended => tracing::info!(
+            ?ended,
+            prior_end,
             crash_count = cfg.crash_count,
-            "previous run did not reach clean-run threshold — counting as crash"
-        );
+            "previous run did not reach clean-run threshold, but it did not crash — not counting it"
+        ),
     }
     config::mark_run_starting(&mut cfg);
+    cfg.last_run_boot = boot_now;
     if let Err(e) = startup_writes.save(&cfg) {
         tracing::warn!(error = %format!("{e:#}"), "could not persist crash-tracking state");
     }
@@ -4197,7 +4223,10 @@ async fn run_cmd(
                     // The post-install watcher (spawned by
                     // spawn_installer_with_watch) will record the
                     // verdict in last-install.json; the new binary
-                    // can surface it on next start.
+                    // can surface it on next start. #3289 — this exit is
+                    // our own, so the next start must not count it.
+                    config::mark_clean_shutdown(&mut cfg);
+                    let _ = startup_writes.save(&cfg);
                     return Ok(None);
                 }
             }
@@ -7410,6 +7439,31 @@ mod tests {
         match cli.command {
             Some(Command::KeepSystemContext { no_restart }) => assert!(!no_restart),
             other => panic!("expected KeepSystemContext, got {other:?}"),
+        }
+    }
+
+    /// #3289 — a worker the host hands a flag this build does not parse exits at
+    /// once, on every spawn, so the host's spelling is read back here.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parses_a_worker_as_the_service_host_spawns_it() {
+        use roomlerd::win_service::supervisor::{ENDED_BY_HOST, prior_end_args};
+        for word in [Some(ENDED_BY_HOST), None] {
+            let mut argv = vec!["roomlerd".to_string()];
+            argv.extend(win_service::worker_args());
+            argv.extend(prior_end_args(word));
+            let cli = Cli::try_parse_from(&argv).unwrap();
+            match cli.command {
+                Some(Command::Run {
+                    supervisor,
+                    prior_end,
+                    ..
+                }) => {
+                    assert_eq!(supervisor.as_deref(), Some("scm"));
+                    assert_eq!(prior_end.as_deref(), word);
+                }
+                other => panic!("expected run, got {other:?}"),
+            }
         }
     }
 

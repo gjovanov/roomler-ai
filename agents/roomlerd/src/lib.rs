@@ -26,8 +26,8 @@ pub mod app;
 // `apps` re-exports the moved config shapes; the ACL is re-exported inside
 // `tunnel/mod.rs` so `crate::tunnel::acl::…` still resolves.
 pub use roomler_node_core::{
-    appdirs, config, config_surface, crash_recorder, enrollment, files_dir, logging, logs_upload,
-    machine, pairing, pairing_terminal, token_slot,
+    appdirs, boot_id, config, config_surface, crash_recorder, enrollment, files_dir, logging,
+    logs_upload, machine, pairing, pairing_terminal, token_slot,
 };
 
 pub mod apps;
