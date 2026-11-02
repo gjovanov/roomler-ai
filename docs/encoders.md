@@ -172,7 +172,7 @@ A stored pick is held to the device again at connect, because the picker only gr
 what a person is about to choose. A choice also becomes this browser's default for
 every other device, and a per-device override outlives an agent losing a cell. The
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
-and telling nobody (`agents/roomlerd/src/signaling.rs:3501`), and the viewer ignores
+and telling nobody (`agents/roomlerd/src/signaling.rs:3524`), and the viewer ignores
 that track while it holds a DataChannel transport
 (`ui/src/composables/useRemoteControl.ts:9811`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
@@ -372,7 +372,7 @@ last one cost a Radeon laptop its RTX 5090's three NVENC cells and all four
 DataChannel transports for 4 h 22 min, and the viewer looked healthy throughout.
 So `base` announces every open (`ROOMLER_CAPS_PROGRESS:<name>:<chroma>`, and
 `ROOMLER_CAPS_PROGRESS:-` once it has ended, its teardown included), and the
-parent runs it again ([`run_base`](../agents/roomlerd/src/encode/caps.rs#L594)).
+parent runs it again ([`run_base`](../agents/roomlerd/src/encode/caps.rs#L679)).
 
 ```mermaid
 sequenceDiagram
@@ -406,7 +406,7 @@ instead of falling to the RTP track, and answers like any host with no hardware
 encoder. It is a child and not an open in the daemon because this is a host whose probes
 have been dying. Only if that child dies as well is the answer the driver-free caps.
 
-A **fault's status** ([`is_fault`](../agents/roomlerd/src/encode/caps.rs#L350)) is
+A **fault's status** ([`is_fault`](../agents/roomlerd/src/encode/caps.rs#L391)) is
 what a driver leaves when it faults, and not what someone else leaves when they end
 the process. On Windows that is a short list of exception codes a thread raises on
 itself: access violation, illegal instruction, the arithmetic traps, stack overflow,
@@ -472,7 +472,7 @@ acts on the host. A child stuck in a kernel call does not die until that call re
 a GPU driver hung in a kernel wait is the way to get there. Its stdout stays open while it
 or anything it started holds the write end, and that can outlive a child that exited
 cleanly, which `TIMEOUT` never bounded. So
-[`wait_for_child`](../agents/roomlerd/src/encode/caps.rs#L1173) waits for neither past the
+[`wait_for_child`](../agents/roomlerd/src/encode/caps.rs#L1578) waits for neither past the
 bound above and keeps what arrived by then, and the log says at WARN when it stopped reading
 before the pipe ended (`Run::cut_off`). The child stays behind, on a thread that reaps it if
 the call ever returns, and the log says so at ERROR. At most 4 can stay behind per start
@@ -494,7 +494,7 @@ something holds its pipe is a unit test with a real process on each OS.
   session on that host would run the same vendor's code in-process. With `h264` chosen it
   takes OpenH264 instead. With `av1` chosen it gets no video until #3279 lands: `av1_mf` is
   denied, an FFmpeg AV1 cell that opened still puts `av1` in `codecs`,
-  [`pick_best_codec`](../agents/roomlerd/src/encode/caps.rs#L4462) puts it first, and
+  [`pick_best_codec`](../agents/roomlerd/src/encode/caps.rs#L4515) puts it first, and
   `MfEncoder::new_av1` refuses. A report that came before the stuck child stops offering those
   cells, so the hello does not promise what a session is refused. Only a kill that landed
   within its bound keeps Media Foundation: a later kill on a thrashing host reads as "would
@@ -503,7 +503,7 @@ something holds its pipe is a unit test with a real process on each OS.
   in force as it is, so until #3279 that answer can still offer one a session is refused.
 - **A `444` or `gpu` child** costs those forms and names no cell. Only a fault's death counts
   as an answer about the host, and stays cached as it always was
-  ([`PhaseGaps::note`](../agents/roomlerd/src/encode/caps.rs#L865)). Anything else keeps the answer out of the cache
+  ([`PhaseGaps::note`](../agents/roomlerd/src/encode/caps.rs#L883)). Anything else keeps the answer out of the cache
   (`why_not_cached`), so the next start asks again: a hang, an answer lost to the bound, an OOM
   kill, an EDR's terminate, a child that could not start. An answer it printed stands however
   it ended afterwards, as `base`'s does. A host where the form really hangs pays that child's
@@ -521,7 +521,7 @@ thrashing at boot, an EDR scanning a driver DLL on its first load), and it then 
 child would have said until the next start, which on a server can be months away. So a first
 answer that ran short of time arms one thread that tries again by itself, with more time and
 no restart, never blocking the start or a live session
-([`arm_retry`](../agents/roomlerd/src/encode/caps.rs#L3078), #3280). A cache hit or a complete answer arms nothing, so a
+([`arm_retry`](../agents/roomlerd/src/encode/caps.rs#L3131), #3280). A cache hit or a complete answer arms nothing, so a
 healthy host runs none of this. `signaling::run` is what arms it, once per process however
 many organizations it serves, and `roomlerd caps` never does.
 
@@ -543,7 +543,7 @@ sequenceDiagram
     W->>S: next heartbeat carries the new caps, same connection
 ```
 
-**What counts as out of time** ([`Shortfall`](../agents/roomlerd/src/encode/caps.rs#L820)):
+**What counts as out of time** ([`Shortfall`](../agents/roomlerd/src/encode/caps.rs#L838)):
 
 | How the probe ended | Reads as | A try? |
 |---|---|---|
@@ -558,7 +558,7 @@ sequenceDiagram
 | A `444` or `gpu` child hung or was cut off | out of time: short by those forms | **yes** |
 | A child that would not die | out of time: short by the Media Foundation cells, whatever else it left | **yes** |
 
-**The table** ([`LADDER`](../agents/roomlerd/src/encode/caps.rs#L2815)). Each try is a whole probe, `base` and then `444`
+**The table** ([`LADDER`](../agents/roomlerd/src/encode/caps.rs#L2854)). Each try is a whole probe, `base` and then `444`
 and `gpu`, because its answer has to stand alone. A later try has an answer in force to fall
 back on, so it runs no software child.
 
@@ -571,7 +571,7 @@ back on, so it runs no software child.
 | 4 | 6 h | 8 min | 80 s | 12 min |
 | 5 | 24 h | 8 min | 80 s | 12 min |
 
-**What stops it** ([`weigh`](../agents/roomlerd/src/encode/caps.rs#L2900), [`climb`](../agents/roomlerd/src/encode/caps.rs#L2938)): an answer with no
+**What stops it** ([`weigh`](../agents/roomlerd/src/encode/caps.rs#L2939), [`climb`](../agents/roomlerd/src/encode/caps.rs#L2977)): an answer with no
 shortfall, which is the normal end; a try that ends short for a reason other than time; the
 same named cell running out of time again, which is the signature of a real hang, and another
 try could hold the GPU for minutes on a host someone may be using; the end of the table; the
@@ -580,11 +580,11 @@ kill switch; the process ending. The same-cell rule has a cost: a host that need
 
 **Never stacked, and a learned deny holds.** A child that would not die is counted until the
 call it is stuck in returns, and no try starts while one is, so the table's clock stops
-([`quiet`](../agents/roomlerd/src/encode/caps.rs#L2851)). One that never comes back means no more tries, which is right:
+([`quiet`](../agents/roomlerd/src/encode/caps.rs#L2890)). One that never comes back means no more tries, which is right:
 the driver has not recovered. A try whose own child would not die starts no more children, because
 they could only pile onto the same driver; a first probe has no answer to fall back on, so it goes
 on. Each try hands its children their own list
-([`list_for_a_try`](../agents/roomlerd/src/encode/caps.rs#L2858)): everything learned except what is there only for want of
+([`list_for_a_try`](../agents/roomlerd/src/encode/caps.rs#L2897)): everything learned except what is there only for want of
 time. A fault's deny and a double kill's stay on it. It goes to the child directly, so the
 daemon's list never relaxes while a cell is being tested, and a session keeps honouring the list
 in force. A fault a try confirms joins the daemon's list at once, whatever becomes of that try's
@@ -605,7 +605,7 @@ nothing has produced a stuck child in the field.
   (`RcSessionRegistry`), or within a minute of a session asking, and the clock stops for that too.
   Whatever held it back, a try then owes a minute with nothing going on (`after_a_look`), however
   long ago that session asked: it may only just have ended, and its viewer may be reloading the page.
-- **A session stops a try.** [`session_asked`](../agents/roomlerd/src/encode/caps.rs#L2840) runs when `rc:session.request`
+- **A session stops a try.** [`session_asked`](../agents/roomlerd/src/encode/caps.rs#L2879) runs when `rc:session.request`
   arrives, before the consent prompt and ahead of the delegation to a Mac's GUI worker, which is
   earlier than the registry can say: a session enters that only after its peer is built and its
   pump has started. It runs again at the session's offer, because a consent wait can outlast the
@@ -627,7 +627,7 @@ be seconds, and a child stuck in a kernel call cannot be stopped at all.
 try when it asks, and a try can start a minute later while it is live. That needs a Mac whose first
 probe ran out of a minute, on a probe that takes about 120 ms there.
 
-**What adopting changes** ([`adopt`](../agents/roomlerd/src/encode/caps.rs#L3032)). An answer is adopted when it keeps every
+**What adopting changes** ([`adopt`](../agents/roomlerd/src/encode/caps.rs#L3085)). An answer is adopted when it keeps every
 form in force and has no shortfall or has more forms, or when the try confirmed a new fault in a
 form in force. So a try cannot take a form from a host, except for a fault. A try that loses to the
 answer in force is dropped. It moves the fields a cache hit takes (`take_probed_fields`), plus
@@ -1090,7 +1090,7 @@ colour-manages by primaries and transfer (FR-130 §2.5).
 | openh264, recording | its own VUI and the MP4 `colr` box, unchanged since FR-85 | SMPTE 170M at limited range |
 
 A vendor runtime that refuses the description opens the encoder without it rather than failing the open.
-While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:2514`).
+While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:3348`).
 
 **Which lever reaches which path:**
 
