@@ -243,7 +243,9 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   const paints = painted + (video.w > 0 && video.t > 0 ? 1 : 0)
   const overlay = [...overlayWords].join(' | ')
   const notice = [...noticeWords].join(' | ')
-  say(`RESULT browser=${browserName} paints=${paints} video=${video.w} sessions=${sessionsAsked} plans=${plans.length} hz=${hzLines.length} blink=${blink} verb=${verb} pageerrors=${pageErrors} overlay="${overlay.slice(0, 500)}" notice="${notice.slice(0, 300)}"`)
+  // Here, not at the assert: the Disconnect below ends the session, and the reason goes with it.
+  const blinks = blink
+  say(`RESULT browser=${browserName} paints=${paints} video=${video.w} sessions=${sessionsAsked} plans=${plans.length} hz=${hzLines.length} blink=${blinks} verb=${verb} pageerrors=${pageErrors} overlay="${overlay.slice(0, 500)}" notice="${notice.slice(0, 300)}"`)
 
   const disconnect = page.locator('button[aria-label="Disconnect"]').first()
   if (await disconnect.isVisible().catch(() => false)) await disconnect.click().catch(() => undefined)
@@ -254,7 +256,7 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   if (EXPECT_PAINTS === '1') expect(paints).toBeGreaterThan(0)
   if (EXPECT_PLAN) expect(plans.join('\n')).toMatch(new RegExp(EXPECT_PLAN))
   if (EXPECT_NO_PLAN) expect(plans.length).toBe(0)
-  if (EXPECT_NO_BLINK) expect(blink).toBe(0)
+  if (EXPECT_NO_BLINK) expect(blinks).toBe(0)
   if (EXPECT_NO_BLAME) expect(notice).not.toMatch(/network may be blocking/)
   if (EXPECT_HZ) expect(hzLines.join('\n')).toMatch(new RegExp(EXPECT_HZ))
   if (EXPECT_VERB) expect(String(verb)).toBe(EXPECT_VERB === '1' ? 'true' : 'false')

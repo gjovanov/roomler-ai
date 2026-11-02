@@ -605,7 +605,7 @@ view:S37	special-case		ui/src/composables/useRemoteControl.ts:9695	TURN path use
 view:S38	special-case		ui/src/composables/useRemoteControl.ts:5633	`window.__roomler_remote_stats`, e2e hook, and `__roomler_remote_pc` :9773	keep	stays	E2E has another oracle
 view:S39	special-case		ui/src/composables/useRemoteControl.ts:10648	`console.log` of every inbound control message, rc.23 hotfix, 2 Hz on clock echoes	delete	R13	Now
 view:S40	special-case		ui/src/views/remote/RemoteControl.vue:5494	rVFC tick calling `play()` when paused	ViewerSession	R3	`<video>` path removed or a pause listener used
-view:S41	special-case		ui/src/composables/frameRate.ts:52	Options capped by host refresh only; viewer's refresh unknown	ViewerSession	R2	Viewer measures its own refresh
+view:S41	special-case		ui/src/composables/frameRate.ts:52	Options capped by host refresh only; viewer's refresh unknown	ViewerSession	R2	R2 measures (rc:viewer-hz); the picker waits with the cap: Viewer measures its own refresh
 view:S42	special-case		ui/src/composables/useRemoteControl.ts:4956	`filterCapsByPreference` adds H.264 as a parachute	TransportPick	R13	Track codec comes from the pick
 view:S43	special-case		ui/src/workers/rc-chunk-framing.ts:157	`STRAGGLER_WINDOW` 64 frames	DecodeWorker	R3	Expressed in time or fixed by a transport decision
 view:S44	special-case		ui/src/workers/rc-chunk-framing.ts:83	`MAX_PARTIAL_FRAMES` 3	DecodeWorker	R3	Expressed in time or fixed by a transport decision
@@ -753,7 +753,7 @@ view:K17	misleading-comment		ui/src/composables/useRemoteControl.ts:6841	'one pe
 view:K18	misleading-comment		ui/src/composables/useRemoteControl.ts:5735	'defaults to `video`, opt-in'; any picker use flips it	delete	R13	L04 retired
 view:K19	misleading-comment		ui/src/composables/useRemoteControl.ts:5740	'`webrtc` is the legacy default', also :2828; default is `auto`	TransportPick	R13	L01 retired
 view:K20	misleading-comment		ui/src/composables/useRemoteControl.ts:2815	Firefox 'exposes insertable streams via a different API'; code tests the global, truth unknown	delete	R13	B02 retired
-view:K21	misleading-comment		ui/src/composables/useRemoteControl.ts:11158	'opening it speculatively is harmless'; a DC session on an RTP agent is the black session	ViewerSession	R2	Agent reports transport
+view:K21	misleading-comment		ui/src/composables/useRemoteControl.ts:11158	'opening it speculatively is harmless'; a DC session on an RTP agent is the black session	ViewerSession	R2	Done in #3298: Agent reports transport
 view:K22	misleading-comment		ui/src/composables/useRemoteControl.ts:11247	'chroma_pref is only meaningful on' VP9, HEVC and AV1 '4:2:0 by construction'; :11265 sends it; also sig.rs:3514	TransportPick	R13	Pick returns a cell
 view:K23	misleading-comment		ui/src/stores/agents.ts:149	'Today the only value is chunk-framing'; bench, fps-high, fps-retry, color-described exist	CellTable	R10	Fixed
 view:K24	misleading-comment		ui/src/stores/agents.ts:143	Transport list lacks H.264; 'deriving from hw_encoders' only for three	CellTable	R10	Fixed
