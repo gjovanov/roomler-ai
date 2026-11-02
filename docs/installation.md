@@ -46,7 +46,7 @@ The Welcome page opens with a role already picked, which the person can change
 before anything happens: the background service on a machine with nothing
 installed, and an existing install's own flavour otherwise, so a default never
 switches a flavour or changes a device's security posture. Rust decides
-(`agents/roomler-setup/src/role.rs:211`, `default_role`, carried as
+(`agents/roomler-setup/src/role.rs:287`, `default_role`, carried as
 `defaultRole` on the detection); the SPA only applies it, when nothing is picked
 yet, and never saves it (a click does). The "Join the overlay network" box keeps
 its per-OS default, ticked for every preselected daemon role.
@@ -135,13 +135,13 @@ new name. Two changes close it:
 | Where | What it does |
 |---|---|
 | the daemon's start (`agents/roomlerd/src/app.rs:3776`, `crates/agent-core/src/config.rs:4163`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
-| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:633`, `:965`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
+| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:634`, `:966`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
 administrator.** After its first healthy run the daemon hardens that config's
 folder to SYSTEM and Administrators (#3073), and a wizard that is not elevated
 cannot open it. The wizard says so on its first page, before a token is pasted
-or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1156`), and the
+or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1157`), and the
 install refuses it before anything is downloaded (`:290`). Before the enroll it
 also stops on a config it may not read (`:634`, never reported as a damaged
 config) or a folder it may not write (`:640`). The token is never spent on a
@@ -190,9 +190,39 @@ it does not** (the white window above, or Edge's "We couldn't create the data
 directory"): that start has no limited copy to name the session's folder. Start the
 wizard normally and use the button.
 
-The wizard EXE loads DLLs from System32 alone, never from the folder it sits in
-(the linker's `/DEPENDENTLOADFLAG:0x800` and `SetDefaultDllDirectories`): that
-folder is usually Downloads, and the same image goes on to run elevated.
+**The cards follow what can work here** (`role::RoleLimit`,
+`agents/roomler-setup/src/role.rs:191`), and a note on Welcome says why:
+
+| The situation | The cards | Why |
+|---|---|---|
+| Another account's password was typed at the prompt (the limited copy's `%LOCALAPPDATA%`, passed as `--session-data`, differs from this process's) | the background service only | anything else would install into that administrator's profile and still report Done |
+| The machine's policy refuses prompts from a standard user (`ConsentPromptBehaviorUser=0`, set by the CIS and STIG baselines) | **this user only**, preselected, and the tunnel client | a machine role would lead through pairing and the download into "blocked by your system administrator" |
+
+`cmd_install` and `cmd_pair_start` hold the same rule for a run that resumes past Welcome.
+
+**An elevated wizard opens the pairing page through Explorer.** A browser started directly
+would take its token: under another account's password that was Edge as the administrator,
+at high integrity, on the standard user's desktop (FR-129's log, 2026-11-02).
+`launch::open_through_the_shell` leaves it to the session's own Explorer, so the page opens in
+that person's browser and profile, at medium integrity.
+
+**What an elevated wizard trusts.** Its folder is usually Downloads, a limited process can write
+that folder and `HKCU\Environment`, and the same image goes on to run elevated:
+
+- it loads DLLs from System32 alone (the linker's `/DEPENDENTLOADFLAG:0x800`,
+  `SetDefaultDllDirectories`, and `secur32.dll` delay-loaded, since that flag does not reach an
+  import's own imports), and `pe-dependent-load-flags.ps1` reads the flag and the import table
+  back from the EXE in CI, in the release lane and in the verifier;
+- it names every program it starts by a full path from the kernel, and
+  `agents/roomler-setup/src/spawn_gate.rs` fails CI on a bare name;
+- `launch::start_clean`, the second line of `main`, gives the machine's folder variables their
+  true values on every run and leaves the current directory, and an elevated run drops
+  `ROOMLER*`, `WEBVIEW2_*`, `TAURI_*` and `SSL_CERT_*`, so the staging override a test fixture
+  uses works limited and nowhere else;
+- its WebView2 folder is made new at each start, following no link.
+
+Still open: the wizard checks no publisher on the MSI it stages, and the staged file sits in the
+user's temp folder until `msiexec` reads it (#3246).
 
 A declined prompt leaves the limited wizard as it was, with one line saying so;
 any other failure shows its reason and the right-click way. Nothing else in the

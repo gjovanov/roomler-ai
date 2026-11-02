@@ -26,7 +26,7 @@ flowchart TB
 | Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux |
 | Agent overlay tests | add `--features overlay-l3` | ⚠️ feature-gated — the default `--lib` run silently skips them |
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
-| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2546`) |
+| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2554`) |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
 | Phone-width smoke | `cd ui && bun run test:phone` | nothing — the built SPA with every `/api` call mocked (`ui/e2e-phone/`) |
@@ -98,6 +98,10 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   the `rc:*` channel — notifications, conference, tenants, files, agents…),
   composables (`useRemoteControl` HID + button-mapping locks, validation,
   markdown, snackbar), API client, plugins.
+- **The setup wizard's page** (`ui/src/__tests__/setupWizardPage.spec.ts`, FR-129 C): the
+  real `index.html` and `app.js` of `agents/roomler-setup` in jsdom, with Tauri's `invoke`
+  mocked. What is preselected, when Continue opens and which cards show are the product there,
+  and no other lane runs that file.
 - **Playwright** (`ui/e2e/`): auth, chat (multi-client, pagination, reactions,
   threads, mentions), rooms + files panel, conference (list/chat/multi),
   websocket + connection status, billing, invite, oauth, email flows,
@@ -198,6 +202,12 @@ in the macOS job (FR-90 P1h-1), which before it never compiled the supervisor fo
 `windows-agent-sessions` job (#2886) — every `#[cfg(windows)]` test, with the features the
 table below names; before it, the Windows jobs ran filtered subsets and a Windows-only failure
 in an unfiltered module was invisible until someone ran the suite on a Windows box.
+
+**The wizard's spawn gate** (`agents/roomler-setup/src/spawn_gate.rs`, FR-129 C) parses the source
+of everything the wizard runs on Windows with a Windows build's `cfg` applied, and fails on a
+program named by a bare literal or by an expression it has not been told about. It runs in
+`cargo test -p roomler-setup --lib` on every OS, because it reads source, so a Linux runner guards
+the Windows path. A new spawn on that path is a decision someone writes down in its table.
 
 > [!WARNING]
 > **A log assertion in a binary of parallel tests needs two dispatchers** (FR-90 P2i-1). With

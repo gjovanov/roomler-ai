@@ -139,6 +139,8 @@ revokes the machine's credential and releases its mesh address back to the pool.
 ## Troubleshooting
 
 - **The device never appears.** The enrollment token is single-use — if an earlier attempt consumed it, mint a fresh one.
+- **Your company's policy refuses the administrator prompt.** Roomler Setup says so on its first page and selects **Be accessed — this user only**, which needs no administrator rights. For the background service, ask your administrator to install it.
+- **An administrator typed their password for you.** The window then runs as that administrator, so it offers only the background service for the whole computer. To install for your own account, close the window and start Roomler Setup again.
 - **It appears, then goes stale.** See [device offline or stale](/docs/troubleshooting/device-offline/).
 - **Black screen when you connect.** Usually a capture problem rather than a network one — see [black screen](/docs/troubleshooting/black-screen/).
 - **Antivirus blocked the download.** Installers are served through `roomler.ai` rather than GitHub precisely so corporate allow-lists can trust one origin. If yours blocks it, allow-list `roomler.ai` and retry.
