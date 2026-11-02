@@ -90,6 +90,35 @@ pub fn default_config_path() -> Result<PathBuf> {
     Ok(dirs.config_dir().join("config.toml"))
 }
 
+/// Parse a tunnel config, saying where it stopped and nothing of the file (#3086):
+/// a `toml` error quotes the line it stopped at, and its message can quote a
+/// value. The file holds the client's token, and `main` prints a returned error
+/// whole, so the parser's error ends here with no source to reach. The one message
+/// kept is the schema's word for a key it wanted, which no file can put there.
+/// The daemon's config has its own (`roomler_node_core::config`), and this crate
+/// does not depend on that one.
+fn parse(raw: &str, path: &Path) -> Result<TunnelConfig> {
+    toml::from_str(raw).map_err(|e: toml::de::Error| {
+        let mut said = format!("parsing tunnel config {}: TOML parse error", path.display());
+        if let Some(before) = e.span().and_then(|span| raw.get(..span.start)) {
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            said.push_str(&format!(" at line {line}, column {column}"));
+        }
+        if let Some(field) = e
+            .message()
+            .strip_prefix("missing field `")
+            .and_then(|rest| rest.strip_suffix('`'))
+            && field
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            said.push_str(&format!(": missing field `{field}`"));
+        }
+        anyhow::anyhow!(said)
+    })
+}
+
 /// Load config from `path` (or the default). Env-var overrides
 /// short-circuit the file read when BOTH `ROOMLER_TUNNEL_SERVER` and
 /// `ROOMLER_TUNNEL_TOKEN` are set — useful for CI / smoke tests where
@@ -122,8 +151,7 @@ pub fn load(path: Option<PathBuf>) -> Result<TunnelConfig> {
     }
     let s = std::fs::read_to_string(&resolved)
         .with_context(|| format!("reading tunnel config {}", resolved.display()))?;
-    let mut cfg: TunnelConfig = toml::from_str(&s)
-        .with_context(|| format!("parsing tunnel config {}", resolved.display()))?;
+    let mut cfg = parse(&s, &resolved)?;
     cfg.secure_server_url();
     if cfg.tunnel_client_token.is_empty() {
         bail!(
@@ -178,8 +206,7 @@ pub fn save_renewed_token(
     };
     let current = std::fs::read_to_string(&target)
         .with_context(|| format!("reading tunnel config {}", target.display()))?;
-    let mut on_disk: TunnelConfig = toml::from_str(&current)
-        .with_context(|| format!("parsing tunnel config {}", target.display()))?;
+    let mut on_disk = parse(&current, &target)?;
     if on_disk.tunnel_client_token != renewed_from {
         bail!(
             "{} was re-enrolled while the token was being renewed; keeping its token",
@@ -295,6 +322,57 @@ mod tests {
         let err = save_renewed_token(&cfg("renewed-again"), "renewed", Some(&path)).unwrap_err();
         assert!(err.to_string().contains("re-enrolled"), "{err:#}");
         assert_eq!(load(Some(path)).unwrap().tunnel_client_token, "re-enrolled");
+    }
+
+    /// #3086 — `main` returns this error, so the terminal gets its whole chain,
+    /// and a `toml` error quotes the line it stopped at, or the value itself:
+    /// a typo on `tunnel_client_token` printed the token. Both readers of the
+    /// file, each in every form the error can be printed.
+    #[test]
+    fn a_config_that_does_not_parse_prints_no_value() {
+        // Shaped like a token, and not one.
+        const T: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJub3QtcmVhbCJ9.bm90LWEtcmVhbC1zaWc";
+        let head = "server_url = \"https://example.invalid\"\nmachine_name = \"box\"\n";
+        let shapes = [
+            (
+                "an unterminated string",
+                format!("tunnel_client_token = \"{T}"),
+            ),
+            ("no quotes at all", format!("tunnel_client_token = {T}")),
+            ("a value with no key", T.to_string()),
+            ("an array of it", format!("tunnel_client_token = [\"{T}\"]")),
+            (
+                "a string where a bool belongs",
+                format!("tunnel_client_token = \"x\"\nallow_plaintext_server = \"{T}\""),
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (shape, line) in shapes {
+            std::fs::write(&path, format!("{head}{line}\n")).unwrap();
+            let loaded = load(Some(path.clone())).expect_err(shape);
+            let renewed = save_renewed_token(&cfg("new"), "old", Some(&path)).expect_err(shape);
+            for err in [loaded, renewed] {
+                for text in [format!("{err}"), format!("{err:#}"), format!("{err:?}")] {
+                    assert!(
+                        T.split('.').all(|part| !text.contains(part)),
+                        "{shape}: the error carries a value from the file: {text}"
+                    );
+                }
+                assert!(
+                    format!("{err:#}").contains("parsing tunnel config"),
+                    "{err:#}"
+                );
+            }
+        }
+
+        // What is left says where, and names a lost key in the schema's own word.
+        std::fs::write(&path, format!("{head}tunnel_client_token = \"oops\n")).unwrap();
+        let err = format!("{:#}", load(Some(path.clone())).unwrap_err());
+        assert!(err.contains("line 3"), "{err}");
+        std::fs::write(&path, head).unwrap();
+        let err = format!("{:#}", load(Some(path.clone())).unwrap_err());
+        assert!(err.contains("missing field `tunnel_client_token`"), "{err}");
     }
 
     #[test]

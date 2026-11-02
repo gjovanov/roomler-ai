@@ -433,15 +433,26 @@ keys this build does not know: ignored here, and kept in the file through every 
 key paths. After a rollback, "my setting did nothing" has its answer in the log.
 
 `load`'s recovery keeps them too. It reinstates the `config.toml.prev` copy it loaded over a
-live file that does not parse, and names the copy as the base (`save_with_base`, `:4068`):
-the keys to keep are the copy's, and the live file holds nothing a merge can read. Every
-other save reads the file it replaces, and one over a file that does not parse says so —
-WARN *"the config being replaced does not parse: keys this build does not know in it, if
+live file that does not parse, and names the copy as the base (`save_with_base`): the keys to
+keep are the copy's, and the live file holds nothing a merge can read. Every other save reads
+the file it replaces, and if that does not read as a config, its last good copy (#3087), so
+the wizard's enrollment and `adopt-enrollment`, which recover through `read_merge_base`, keep
+them as well. When neither reads it says so — WARN *"the config being replaced does not read
+as a config, and neither does its last good copy: keys this build does not know in them, if
 any, are NOT kept through this save"*, a fixed string, never the parser's.
 
 ⚠️ **Key paths only, never values.** The file holds the agent token and the overlay keys. A
-TOML parse error quotes the line it stopped at, so the merge reports fixed strings and never
-passes a parser message on.
+TOML parse error quotes the line it stopped at, and its message can quote a value, so the merge
+reports fixed strings and never passes a parser message on.
+
+⚠️ **No error about this file carries anything from it** (#3086). A typo on `agent_token`'s line
+used to print the token into the daemon's log, which uploads to the server, onto the wizard's
+page and into the terminal. The parser's error now ends where it happens (`parse_failure` in
+`crates/agent-core/src/config.rs`, and its copy in `agents/roomler-cli/src/config.rs`): what
+leaves is *"TOML parse error at line 3, column 81"* with no source behind it, so no `{:#}` or
+`{:?}` further up can reach the parser's words. The one message kept is `missing field
+\`name\``, the schema's word for a key it wanted. A key name read off the file is never kept,
+because a broken line can turn a value into one. The person has the file and the line.
 
 ⚠️ **A key a build retires now stays in the file** and is logged as unknown at every start,
 where the next save used to scrub it. Every key retired so far was a knob or a kill switch. A
