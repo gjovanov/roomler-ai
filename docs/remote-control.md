@@ -1182,6 +1182,10 @@ the backoff's "its network may be blocking the connection" for a session with a 
 because the plan came over the control channel. Ending the session with a reason is
 R8's (FR-135 §6.8).
 
+⚠️ **A follower of a shared pipeline carries the plan's start only.** The owner's pump
+writes under the owner's session, so a second viewer on one stream knows the transport
+and the codec, and not the ladder or a stop.
+
 **`rc:viewer-hz`.** The decode worker measures its own `requestAnimationFrame` in a
 short burst when the first frame paints and once a minute after
 (`ui/src/workers/rc-viewer-hz.ts`), and the page sends a reading that moved by more
