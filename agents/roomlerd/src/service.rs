@@ -710,9 +710,19 @@ mod windows {
     /// fresh MSI has none, and starts nothing until `enroll` and `service start`.
     pub fn install(enrolled: bool) -> Result<()> {
         let exe = std::env::current_exe().context("locating current exe")?;
-        let command = task_command(&exe);
-        let exe_str = command.to_string_lossy().into_owned();
         let user = current_user_qualified().context("resolving current user")?;
+        let mut command = task_command(&exe);
+        if command != exe && applocker_holds_exe_rules() && launcher_is_blocked(&command, &user) {
+            eprintln!(
+                "This machine's AppLocker policy does not let {} start, so the task runs {} \
+                 instead, with a console window: closing it stops the daemon. Allow the \
+                 launcher, and the next update takes the window away.",
+                command.display(),
+                exe.display()
+            );
+            command = exe;
+        }
+        let exe_str = command.to_string_lossy().into_owned();
 
         let start_soon = if enrolled {
             start_soon_triggers(chrono::Utc::now())
@@ -762,6 +772,7 @@ mod windows {
         // half-migrated host (both).
         delete_task(NEW_TASK_NAME)?;
         delete_task(LEGACY_TASK_NAME)?;
+        let _ = delete_task(LAUNCHER_CHECK_TASK);
         Ok(())
     }
 
@@ -1050,6 +1061,92 @@ mod windows {
         }
     }
 
+    /// Registered only for the seconds [`launcher_is_blocked`] runs. One that a killed
+    /// install leaves behind starts nothing that matters, and the next one replaces it.
+    const LAUNCHER_CHECK_TASK: &str = "Roomler launcher check";
+    /// `ERROR_ACCESS_DISABLED_BY_POLICY`, a task's result when policy refuses its file.
+    const BLOCKED_BY_POLICY: u32 = 0x8007_04EC;
+    /// `SCHED_S_TASK_HAS_NOT_RUN`: the check has not started yet.
+    const TASK_HAS_NOT_RUN: u32 = 0x0004_1303;
+
+    /// Does the machine's AppLocker policy hold any rule for programs? One subkey per
+    /// rule, read back on Win11; a person may read it, and `reg.exe` may be refused them.
+    fn applocker_holds_exe_rules() -> bool {
+        use windows_sys::Win32::System::Registry::{
+            HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegEnumKeyW, RegOpenKeyExW,
+        };
+        let path: Vec<u16> = r"SOFTWARE\Policies\Microsoft\Windows\SrpV2\Exe"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut key = std::ptr::null_mut();
+        let mut rule = [0u16; 64];
+        // SAFETY: `path` is NUL-terminated and outlives the call; `key` is a valid
+        // out-pointer, and the key it receives is closed once; `rule` holds its length.
+        unsafe {
+            if RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, KEY_READ, &mut key) != 0 {
+                return false;
+            }
+            let first = RegEnumKeyW(key, 0, rule.as_mut_ptr(), rule.len() as u32);
+            RegCloseKey(key);
+            first == 0
+        }
+    }
+
+    /// #3292 — will a policy stop the task from starting the launcher? The launcher is
+    /// a file of its own, so a rule that names `roomlerd.exe` blocks it: MSI exit 0, a
+    /// task failing `0x800704EC` each minute, a device offline for good. Nothing a custom
+    /// action starts can tell, because the installer's token is exempt from AppLocker
+    /// (measured: the blocked launcher ran every action). A task is the one start with
+    /// the token the real task gets, so a throwaway one tries it, for seconds. Only a
+    /// clear block answers true: a person who is not signed in keeps the launcher.
+    fn launcher_is_blocked(launcher: &Path, user: &str) -> bool {
+        const TASK: &str = LAUNCHER_CHECK_TASK;
+        let xml = render_launcher_check_xml(&launcher.to_string_lossy(), user);
+        let Ok(path) = write_temp_xml(&xml) else {
+            return false;
+        };
+        let ok = |args: &[&str]| {
+            let out = schtasks().args(args).output().ok();
+            out.filter(|o| o.status.success())
+        };
+        let created = ok(&[
+            "/Create",
+            "/TN",
+            TASK,
+            "/XML",
+            &path.to_string_lossy(),
+            "/F",
+        ]);
+        let _ = std::fs::remove_file(&path);
+        let mut result = None;
+        if created.is_some() && ok(&["/Run", "/TN", TASK]).is_some() {
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                result = ok(&["/Query", "/TN", TASK, "/V", "/FO", "CSV", "/NH"])
+                    .and_then(|o| last_result(&String::from_utf8_lossy(&o.stdout)));
+                if result.is_some_and(|r| r != TASK_HAS_NOT_RUN) {
+                    break;
+                }
+            }
+        }
+        let _ = ok(&["/Delete", "/TN", TASK, "/F"]);
+        result == Some(BLOCKED_BY_POLICY)
+    }
+
+    /// The real task with one change: what it asks the launcher to do.
+    fn render_launcher_check_xml(launcher: &str, user: &str) -> String {
+        render_task_xml(launcher, user, "").replace("run --supervisor task", "--version")
+    }
+
+    /// The `Last Result` of a `schtasks /Query /V /FO CSV /NH` listing: the seventh
+    /// column in any language, in signed decimal.
+    fn last_result(listing: &str) -> Option<u32> {
+        let row = listing.lines().find(|line| !line.trim().is_empty())?;
+        let field = row.trim().trim_matches('"').split("\",\"").nth(6)?;
+        field.parse::<i64>().ok().map(|result| result as u32)
+    }
+
     /// #3292 — when, after this registration, the task starts the daemon. A
     /// self-update's daemon has exited for the installer, and registering the task
     /// is all an MSI's custom action does, so the device stayed offline until the
@@ -1305,6 +1402,33 @@ mod windows {
                 xml.contains("<Arguments>run --supervisor task</Arguments>"),
                 "`supervision::detect` reads this argv from the daemon the launcher starts"
             );
+        }
+
+        /// #3292 — the answers the throwaway task can give. The row's shape is a real
+        /// `schtasks` listing's on Win11; its words and the comma are this test's, for a
+        /// language the column has to hold in.
+        #[test]
+        fn a_check_reads_the_last_result_by_its_column() {
+            let row = |result: &str| {
+                format!(
+                    "\r\n\"H\",\"\\Roomler launcher check\",\"N/A\",\"Bereit, jetzt\",\"Nur interaktiv\",\
+                     \"02.11.2026 19:00:00\",\"{result}\",\"H\\u\",\"C:\\r\\roomlerdw.exe --version\"\r\n"
+                )
+            };
+            assert_eq!(last_result(&row("-2147023636")), Some(BLOCKED_BY_POLICY));
+            assert_eq!(last_result(&row("267011")), Some(TASK_HAS_NOT_RUN));
+            assert_eq!(last_result(&row("0")), Some(0));
+            assert_eq!(last_result(&row("n/a")), None);
+            assert_eq!(last_result(""), None);
+        }
+
+        #[test]
+        fn the_launcher_check_only_asks_for_a_version() {
+            let xml = render_launcher_check_xml("C:\\P\\roomlerdw.exe", "DOM\\u");
+            assert!(xml.contains("<Arguments>--version</Arguments>"), "{xml}");
+            assert!(xml.contains("<Command>C:\\P\\roomlerdw.exe</Command>"));
+            assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+            assert!(!xml.contains("--supervisor"), "{xml}");
         }
 
         #[test]
