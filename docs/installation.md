@@ -576,6 +576,11 @@ Details worth knowing:
 - Daemon installs also place **`roomler-desktop`** (tray companion: status,
   tunnels pane, consent prompts) and **`roomler.exe`** — a small shim that
   re-execs `roomlerd cli`, so CLI and daemon can never version-skew.
+  On a machine-wide install a limited wizard cannot write under `%ProgramFiles%`, so
+  it leaves `roomler-desktop` to the service, waits up to a minute for it
+  (`service_places_companion`, `wait_for_file`) and reports what is there, as Done
+  and the install trace do on every path (#3174). If the EXE is still absent the
+  checklist says so: the service adds it at its next start, or within 4 hours.
 - Terminal alternative: `irm https://roomler.ai/api/setup/install.ps1 | iex`
   runs the script with its defaults (`-Role daemon-system` from an elevated
   shell, nothing enrolled — it asks for nothing). To pass parameters, which

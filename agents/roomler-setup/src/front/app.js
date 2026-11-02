@@ -1476,6 +1476,10 @@ const STEP_LABELS = {
   IntegrationDone: "PATH integration finished",
   EnrollStarted: "Enrolling with Roomler",
   EnrollOk: "Enrolled",
+  // #3174: whoever placed it, this is what the machine has.
+  CompanionWaiting: "Waiting for the Roomler service to add roomler-desktop",
+  CompanionPresent: "roomler-desktop is in place",
+  CompanionAbsent: "roomler-desktop is not there yet",
   AnchorStarted: "Anchoring for SYSTEM exec (administrator prompt)",
   AnchorOk: "Anchored for SYSTEM exec",
   AnchorSkipped: "Not anchored",
@@ -1826,14 +1830,14 @@ function checklistClass(event) {
   if (t === "ScriptHalfDone" && d.code !== 0) return "error";
   if (
     t === "PreflightWarning" || t === "AnchorSkipped" || t === "ElevationUnavailable" ||
-    t === "DaemonRestartSkipped"
+    t === "DaemonRestartSkipped" || t === "CompanionAbsent"
   ) {
     return "warning";
   }
   if (
     t === "Done" || t === "EnrollOk" || t === "AnchorOk" || t === "DaemonRestartOk" || t === "MsiCompleted" ||
     t === "ExtractDone" || t === "IntegrationDone" || t === "ScriptHalfDone" ||
-    t === "PublisherVerified" || t === "PreflightOk" || t === "AssetResolved"
+    t === "PublisherVerified" || t === "PreflightOk" || t === "AssetResolved" || t === "CompanionPresent"
   ) {
     return "ok";
   }
@@ -1868,6 +1872,7 @@ function checklistLabel(event) {
     return `Enrolled the private network's root half (device ${d.principalId})`;
   }
   if (t === "EnrollOk") return `Enrolled (${principalKindLabel(d.principalKind)} ${d.principalId})`;
+  if (t === "CompanionAbsent") return `${base}. ${d.message}`;
   if (t === "AnchorSkipped") return `Not anchored: ${d.reason}`;
   if (t === "DaemonRestartOk" && d.pid) return `${base} (PID ${d.pid})`;
   if (t === "DaemonRestartSkipped") return `${base}: ${d.reason}`;
