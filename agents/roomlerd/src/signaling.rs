@@ -3366,8 +3366,10 @@ async fn handle_server_msg(
 
     // #3280 — a session asked, before anything that could wait on a person: a
     // later caps try gets out of its way. Ahead of the delegation, because the
-    // GPU is shared whichever process serves the session.
-    if matches!(msg, ServerMsg::Request { .. }) {
+    // GPU is shared whichever process serves the session. And again at its offer,
+    // because a consent wait can outlast the minute a try holds off for
+    // (`prompt_then_email` waits minutes), and a peer is about to open an encoder.
+    if matches!(msg, ServerMsg::Request { .. } | ServerMsg::SdpOffer { .. }) {
         crate::encode::caps::session_asked();
     }
 

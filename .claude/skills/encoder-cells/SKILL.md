@@ -119,6 +119,8 @@ longer bounds. Keep these true when you touch it:
 - **Never compare `why` strings.** `timed_out` is the mark.
 - **A session comes first.** `session_asked` kills the child at its next poll, the try is lost
   and not counted, and an answer goes in only with nothing live.
+- **A try whose own child would not die starts no more children** (`probe_with`). A first probe
+  goes on, because it has no answer to fall back on.
 - **A try cannot take a form, except for a fault** (`weigh`). A count of cells is not enough: an
   answer with more cells that leaves one out is dropped.
 - **Adopt the list first and the generation last,** and read `generation()` before reading the

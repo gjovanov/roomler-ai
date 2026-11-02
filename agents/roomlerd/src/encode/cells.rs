@@ -194,6 +194,7 @@ pub(crate) fn list_for_child(list: &[LearnedDeny]) -> Vec<(String, String)> {
 }
 
 /// [`list_for_child`], for this process's own list.
+#[cfg(any(test, feature = "recording"))]
 pub(crate) fn learned_for_child() -> Vec<(String, String)> {
     list_for_child(&learned())
 }

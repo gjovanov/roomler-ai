@@ -581,7 +581,9 @@ kill switch; the process ending. The same-cell rule has a cost: a host that need
 **Never stacked, and a learned deny holds.** A child that would not die is counted until the
 call it is stuck in returns, and no try starts while one is, so the table's clock stops
 ([`quiet`](../agents/roomlerd/src/encode/caps.rs#L2851)). One that never comes back means no more tries, which is right:
-the driver has not recovered. Each try hands its children their own list
+the driver has not recovered. A try whose own child would not die starts no more children, because
+they could only pile onto the same driver; a first probe has no answer to fall back on, so it goes
+on. Each try hands its children their own list
 ([`list_for_a_try`](../agents/roomlerd/src/encode/caps.rs#L2858)): everything learned except what is there only for want of
 time. A fault's deny and a double kill's stay on it. It goes to the child directly, so the
 daemon's list never relaxes while a cell is being tested, and a session keeps honouring the list
@@ -601,10 +603,13 @@ nothing has produced a stuck child in the field.
 - `detect()` never waits for a try. It reads the answer in force.
 - No try starts while a session is live, a recording that outlives one included
   (`RcSessionRegistry`), or within a minute of a session asking, and the clock stops for that too.
+  Whatever held it back, a try then owes a minute with nothing going on (`after_a_look`), however
+  long ago that session asked: it may only just have ended, and its viewer may be reloading the page.
 - **A session stops a try.** [`session_asked`](../agents/roomlerd/src/encode/caps.rs#L2840) runs when `rc:session.request`
   arrives, before the consent prompt and ahead of the delegation to a Mac's GUI worker, which is
   earlier than the registry can say: a session enters that only after its peer is built and its
-  pump has started. The try's child is killed at its next 50 ms poll. The try is lost and not
+  pump has started. It runs again at the session's offer, because a consent wait can outlast the
+  minute a try holds off for (`prompt_then_email` waits minutes). The try's child is killed at its next 50 ms poll. The try is lost and not
   counted: the same row runs again once nothing has been live or asked for a minute.
 - **An answer is adopted only with nothing live.** The GPU-input lists and the deny list decide
   what an encoder open may do, and a session that opened its capture under one list must not

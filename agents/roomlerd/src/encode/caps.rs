@@ -972,6 +972,19 @@ mod child {
     ) -> Probed {
         let started = std::time::Instant::now();
         let mut gaps = PhaseGaps::default();
+        // A later try has an answer in force, so once one of its own children is
+        // stuck it starts no more: they could only pile onto the same driver. A
+        // first probe has nothing to fall back on, so it goes on.
+        let first = this.first;
+        let mut stuck = false;
+        let mut run = move |list: &[LearnedDeny], extra: &[(&str, String)]| {
+            if stuck && !first {
+                return None;
+            }
+            let child = run(list, extra);
+            stuck |= child.as_ref().is_some_and(|r| r.ending.stuck());
+            child
+        };
 
         let base = run_base(
             learning,
@@ -2218,7 +2231,7 @@ fn with_learned_word(
         .map(|l| {
             if l.confirmed {
                 format!("{} ({})", l.cell, l.why)
-            } else if l.timed_out {
+            } else if l.timed_out && short.is_some() {
                 format!(
                     "{} ({}, until a later try or the next start)",
                     l.cell, l.why
@@ -2984,16 +2997,25 @@ fn climb(
     "the end of the table"
 }
 
-/// #3280 — sit out `owed` of quiet, and at least one look: the clock stops while
-/// anything [`quiet`] reads says no.
+/// #3280 — sit out `owed` of quiet, and at least one look.
 fn wait_quietly(owed: Duration, live: &impl Fn() -> bool) {
     let mut owed = owed.max(RETRY_TICK);
     while !owed.is_zero() {
         std::thread::sleep(RETRY_TICK);
         let since_ask = last_ask().map(|t| t.elapsed());
-        if quiet(child::stuck_children(), live(), since_ask) {
-            owed = owed.saturating_sub(RETRY_TICK);
-        }
+        owed = after_a_look(owed, quiet(child::stuck_children(), live(), since_ask));
+    }
+}
+
+/// #3280 — what is still owed after one look. Anything [`quiet`] says no to stops
+/// the clock, and a try then owes a minute with nothing going on, however long
+/// ago that session asked: it may only just have ended, and its viewer may be
+/// reloading the page.
+fn after_a_look(owed: Duration, quiet: bool) -> Duration {
+    if quiet {
+        owed.saturating_sub(RETRY_TICK)
+    } else {
+        owed.max(QUIET_AFTER_ASK)
     }
 }
 
@@ -6650,11 +6672,27 @@ mod tests {
             confirmed: false,
             timed_out: true,
         }];
-        let c = assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &hung, None);
+        let short = child::Shortfall {
+            cells: vec!["hevc_nvenc:yuv420".into()],
+            ..Default::default()
+        };
+        let c =
+            assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &hung, Some(&short));
         assert!(
             c.unavailable[LEARNED_WORD]
                 .reason
                 .contains("hevc_nvenc:yuv420 (hung, until a later try or the next start)"),
+            "{}",
+            c.unavailable[LEARNED_WORD].reason
+        );
+
+        // With the kill switch off no later try comes, and the word does not say
+        // one will: `detect` passes no shortfall then.
+        let c = assigned_by_the_daemon(p0c_caps(), &p0c_facts(OsKind::Windows), &hung, None);
+        assert!(
+            c.unavailable[LEARNED_WORD]
+                .reason
+                .contains("hevc_nvenc:yuv420 (hung, until the next start)"),
             "{}",
             c.unavailable[LEARNED_WORD].reason
         );
@@ -7909,6 +7947,76 @@ mod tests {
         assert!(!quiet(0, true, None), "a session is live");
         assert!(!quiet(0, false, Some(secs(59))), "a session just asked");
         assert!(quiet(0, false, Some(secs(60))));
+    }
+
+    /// The clock stops, and a session that just ended still owes a try a minute,
+    /// even when it asked long ago.
+    #[test]
+    fn a_try_owes_a_minute_after_anything_that_held_it_back() {
+        assert_eq!(after_a_look(secs(600), true), secs(599));
+        assert_eq!(after_a_look(secs(1), true), secs(0));
+        assert_eq!(after_a_look(secs(600), false), secs(600), "the clock stops");
+        assert_eq!(
+            after_a_look(secs(1), false),
+            QUIET_AFTER_ASK,
+            "a try a session stopped owes nothing else, so this is its whole wait"
+        );
+        // A long session asks once, then ends: the look after it counts the minute
+        // from there, though `quiet` is already true.
+        let mut owed = secs(1);
+        owed = after_a_look(owed, quiet(0, true, Some(secs(3600))));
+        for _ in 0..59 {
+            owed = after_a_look(owed, quiet(0, false, Some(secs(3600))));
+            assert!(!owed.is_zero());
+        }
+        owed = after_a_look(owed, quiet(0, false, Some(secs(3600))));
+        assert!(owed.is_zero());
+    }
+
+    /// A later try's own stuck child ends it: only one child is scripted in each
+    /// case, so a second one fails it. It reads as short of time, because what is
+    /// missing is missing for want of it.
+    #[test]
+    fn a_later_try_starts_nothing_after_its_own_child_stuck() {
+        let _fixture = probe_fixture();
+        let stuck = |stdout: String| child::Run {
+            ending: child::Ending::Hung { gone: false },
+            stdout,
+            cut_off: false,
+            elapsed: secs(120),
+        };
+
+        let (got, asked) = probe_scripted(
+            &a_later_try(Vec::new()),
+            vec![("base", Some(stuck(String::new())))],
+        );
+        assert_eq!(asked.len(), 1);
+        assert!(got.report.is_none() && !got.stopped);
+        let short = got.short.expect("a stuck child is out of time");
+        assert!(short.base);
+        assert_eq!(short.cells, mf_cells());
+
+        // Its report stands, as a first probe's does, and no `444` child follows it.
+        let printed = report_of(nvenc_caps()).stdout;
+        let (got, asked) = probe_scripted(
+            &a_later_try(Vec::new()),
+            vec![("base", Some(stuck(printed)))],
+        );
+        assert_eq!(asked.len(), 1);
+        assert!(got.report.is_some());
+        assert_eq!(names(&got.learned), mf_cells());
+
+        // A first probe has nothing to fall back on, so it goes on to ask.
+        let (got, asked) = probe_scripted(
+            &a_first_probe(),
+            vec![
+                ("base", Some(stuck(String::new()))),
+                ("base", Some(report_of(nvenc_caps()))),
+                ("444", Some(answer_444(&[]))),
+            ],
+        );
+        assert_eq!(asked.len(), 3);
+        assert!(got.report.is_some());
     }
 
     /// A deny for want of time comes off a try's list, and nothing else does.
