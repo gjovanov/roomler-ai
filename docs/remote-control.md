@@ -4608,7 +4608,7 @@ all (`updater::ROLLBACK_CAN_DOWNGRADE`,
 | Platform | What it does | Read |
 |---|---|---|
 | Windows, both MSI flavours | Raises `rollback_failed`, downloads nothing, does not exit. It stays on this version and takes the next release as usual | Released 0.4.197, both flavours: the old attempt cost a download and a daemon exit, the MSI refused in about a second (events 10005, 11708, 1033 `status 1603`), and the exe still read 0.4.197. On a per-user device the exit took it offline, because nothing restarts that daemon (#3295). A real downgrade is #3318 |
-| Linux, macOS | `pin_version(format!("agent-v{target}"))`, then on `UpdateReady` the installer with the post-install watcher, and exit so it can overwrite the binary. Skipped, Unreachable, UpToDate or a spawn error raise `rollback_failed` | See #3289 for the Linux read. macOS unread |
+| Linux, macOS | `pin_version(format!("agent-v{target}"))`, then on `UpdateReady` the installer with the post-install watcher, and exit so it can overwrite the binary. Skipped, Unreachable, UpToDate or a spawn error raise `rollback_failed` | Released 0.4.197, root `.deb`: `apt-get` refused the downgrade (100), `dpkg --install` took it, 8 s from the decision to the older daemon, row online. macOS unread |
 
 The sentinel goes where its reader looks:
 `notify::raise_rollback_attention` writes through
@@ -4624,6 +4624,10 @@ back. With `auto_update` still on, that daemon said `new release
 available` one second after it started and was on 0.4.197 again 23 s
 later. So the Windows message says to set `auto_update = false` first
 (`crash_loop_no_rollback_msg`).
+
+⚠️ **A rollback does not hold** (#3346). Nothing remembers the version it
+left, so the next check takes it again: measured on Linux, a restart ten
+minutes after the rollback was back on the release that had crash-looped.
 
 ⚠️ **The sentinel outlives the crash loop.** FR-53's `rollback_is_stale`
 clears it only on a healthy connect from a *different* build, so a device
