@@ -62,8 +62,9 @@
           label="Accept remote commands (exec_enabled)"
         />
         <div class="text-caption text-medium-emphasis mb-1 ml-1">
-          Commands run as the daemon: <strong>root</strong> under systemd; on
-          Windows the <strong>signed-in user</strong> (an attended install) or
+          Commands run as <strong>root</strong> under systemd; on Windows as
+          <strong>SYSTEM</strong> once the device is anchored, otherwise as the
+          <strong>signed-in user</strong> (an attended install) or
           <strong>SYSTEM</strong> (SystemContext mode). Takes effect immediately
           on the device; no restart.
         </div>
@@ -544,7 +545,7 @@ const colorDescriptionOptions = [
 ]
 const accountOptions = [
   { title: 'The signed-in user at the device', value: 'console_user' },
-  { title: 'The daemon account (SYSTEM / root)', value: 'daemon' },
+  { title: 'The daemon account (root, or on Windows the agent\'s own)', value: 'daemon' },
 ]
 
 const dirty = computed(() => JSON.stringify(draft.value) !== original.value)

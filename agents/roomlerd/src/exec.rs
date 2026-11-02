@@ -37,10 +37,12 @@
 //! ## Privilege
 //!
 //! Under systemd the daemon runs as root, and commands inherit that. On
-//! Windows they inherit the console-session WORKER's identity, because the
+//! Windows a command runs as SYSTEM in session 0, through the device's service,
+//! once an administrator anchored the device (FR-94, `crate::exec_service`).
+//! Otherwise it inherits the console-session WORKER's identity, because the
 //! worker holds the agent socket: the signed-in user on an attended install
 //! (their elevated token if they are an admin), SYSTEM in SystemContext mode.
-//! FR-94 (#2035) makes SYSTEM the default. Root/SYSTEM is the intent and it is
+//! Root/SYSTEM is the intent and it is
 //! deliberate — `Get-NetFirewallRule`, `netsh`, route tables and service state
 //! are exactly what remote diagnosis needs — and is surfaced in the admin UI's
 //! opt-in copy rather than hidden.

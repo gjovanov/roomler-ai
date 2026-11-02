@@ -1146,9 +1146,10 @@ mod sshd {
         ///
         /// **It spawns OpenSSH's `sftp-server` as the session's account rather
         /// than serving SFTP in-process**, and that is a privilege decision,
-        /// not convenience. In-process file I/O would run as the DAEMON —
-        /// SYSTEM on Windows, root under systemd — so a session resolved to
-        /// `console_user` would silently read and write every file as root.
+        /// not convenience. In-process file I/O would run as the DAEMON — root
+        /// under systemd, SYSTEM in the device's service or a SystemContext
+        /// worker — so a session resolved to `console_user` would silently read
+        /// and write every file as that.
         /// `exec` and the pty both drop privilege by handing work to a child;
         /// doing anything else here would introduce a second, weaker privilege
         /// story for the one subsystem that exists to touch files. Same

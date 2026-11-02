@@ -80,8 +80,9 @@ source.
 
 ## 3 · The updater's trust chain
 
-The updater runs what it downloads **as the daemon identity — SYSTEM on Windows,
-root under systemd**. The manifest's SHA-256 is *not* a tamper anchor: the digest
+The updater runs what it downloads **as the daemon identity: root under systemd;
+on Windows the worker's, SYSTEM in SystemContext mode and otherwise the signed-in
+user**. The manifest's SHA-256 is *not* a tamper anchor: the digest
 arrives in the same manifest, from the same origin, as the `browser_download_url`.
 
 | Platform | Anchor |

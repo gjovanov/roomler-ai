@@ -2820,7 +2820,10 @@ pub enum SshMode {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SshAccountMode {
-    /// The daemon's own identity — SYSTEM on Windows, root under systemd.
+    /// The daemon's own identity: root under systemd. On Windows, the
+    /// console-session worker's (the signed-in user on an attended install,
+    /// SYSTEM in SystemContext mode), or SYSTEM through the device's service
+    /// where a grant is served there (FR-105).
     ///
     /// The default *today* because it is what P2 can actually do, and it is
     /// why `SshMode::On` is root-equivalent until the P5 privilege-drop slice
