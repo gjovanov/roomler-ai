@@ -2640,11 +2640,11 @@ nothing and drop it. `try_send`, never an await: the loop that queues is the loo
 full queue skips the round, hands the FR-101 file notes back, and the next tick retries. A session that
 **outlives** the observation therefore records its carrier whatever its length. Only a session that
 **ends before** the observation lands still records `unknown`: a pair was nominated, but the settle read
-that names the carrier never ran. ⚠️ Not on that road yet: the device-ended last sample (§11.3a), which
-must stay ahead of the terminate written directly after it. On a supervised Mac it still goes up the
-delegation channel connection-wide, so a worker's **own** session's last sample is dropped as another
-device's — a pre-existing follow-up; a fix needs the terminate on the same queue, or a per-session
-delegation marker.
+that names the carrier never ran. ⚠️ Not on that road: the device-ended last sample (§11.3a), which
+must stay ahead of the terminate written directly after it. On a supervised Mac both still pick their
+road per session (`delegation_for_session`, #3245): a delegated session's go up the delegation channel,
+and a worker's **own** session's go on its own WS, where the hub reads them as that row's and not as
+another device's.
 
 ### 11.10 The viewer's decode errors (FR-132 P1)
 

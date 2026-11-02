@@ -2657,6 +2657,15 @@ async fn connect_once(
                 // clipboard, files or frames from here on, while the bare
                 // connection waits for the viewer to hear why.
                 let peer = peers.remove(&sid);
+                // A delegated session (a supervised Mac) speaks through the
+                // daemon's WS, the way its answer and its ICE did. A worker's
+                // own session speaks on its own: from the daemon the hub
+                // answers `not a party`, ends nothing and tells no viewer.
+                // Everywhere else there is no delegation channel at all.
+                let delegated = crate::delegate::delegation_for_session(
+                    delegated_out.as_ref(),
+                    peer.as_ref().map(AgentPeer::outbound),
+                );
                 if let Some(peer) = &peer {
                     peer.stop_serving();
                     // FR-101 P3 — the audit's last sample, while the server
@@ -2667,24 +2676,15 @@ async fn connect_once(
                     // must land BEFORE the terminate directly below it, and
                     // the server drops a sample once `ended_at` is set — on
                     // the peer's queue, the direct terminate write would
-                    // overtake it. Pre-existing follow-up, out of P9d's
-                    // scope: `delegated_out` is connection-wide, so on a
-                    // supervised Mac a worker's OWN session (its own row)
-                    // goes up the delegation channel here too, under the
-                    // daemon's identity, and the server drops it as another
-                    // device's. A fix needs the terminate on the same queue
-                    // as the sample, or a per-session delegation marker.
+                    // overtake it.
                     if let Some(stats) = final_session_stats(sid, peer).await
-                        && let Err(e) =
-                            reply_for_session(&mut ws, delegated_out.as_ref(), &stats).await
+                        && let Err(e) = reply_for_session(&mut ws, delegated, &stats).await
                     {
                         debug!(session_id = %sid, %e, "final session stats send failed");
                     }
                 }
-                // A delegated session (a supervised Mac) speaks through the
-                // daemon's WS, the way its answer and its ICE did.
                 let said = end.terminate(sid);
-                let grace = match reply_for_session(&mut ws, delegated_out.as_ref(), &said).await {
+                let grace = match reply_for_session(&mut ws, delegated, &said).await {
                     Ok(()) => host_disconnect_grace(),
                     Err(e) => {
                         warn!(
