@@ -16,6 +16,8 @@
  *   MP_EXPECT_NO_BLAME  `1`: the page must not blame the device's network
  *   MP_EXPECT_HZ        a regex a logged `[rc] viewer_hz` line must match
  *   MP_EXPECT_VERB      `1` or `0`: whether the agent's row must advertise `media-plan`
+ *   MP_SWALLOW_DECODE   `1`: the decode worker takes every chunk and shows nothing, so a real session has a plan, no stop
+ *                       and no picture, which no agent setup still gives since #3279
  *   MP_UI_DIST        serve the viewer from this `dist` directory at the production origin, for a read before a promote
  *   MP_SHOT             where the screenshot goes
  *   E2E_RC_CODEC        the codec picker's value for this agent
@@ -75,7 +77,7 @@ const SHIM = `;(() => {
     return origDraw.apply(this, a);
   };
 })();
-`
+` + (process.env.MP_SWALLOW_DECODE === '1' ? `;if (self.VideoDecoder) self.VideoDecoder.prototype.decode = function () {};\n` : '')
 
 const CONTENT_TYPES: Record<string, string> = {
   '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml',
