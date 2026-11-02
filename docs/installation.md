@@ -565,6 +565,7 @@ console, passes its arguments on, and leaves with the daemon's exit code.
 | stderr | The rolling log, the same dated file tracing writes; `NUL` past 256 MiB in a day | A panic, a stack overflow and FFmpeg print only there; the launcher must not create the log folder (`appdirs::use_old_segment`) |
 | stdout | `NUL` | Tracing only, and the rolling log has the same events |
 | The MSI's custom actions, the Start menu entry | Run through the launcher too | Each opened a terminal in the foreground |
+| The default terminal | No window with Windows Terminal or `conhost` | `CREATE_NO_WINDOW` makes no console to show. Measured a start and a repair with the default set to `conhost` |
 | Restart Manager | Stops nothing here, so the MSI's `StopDaemon` custom action does (`service stop`, before `UnregisterAutostart`). On a major upgrade it runs from the OLD product's table | Measured: a windowless launcher and a daemon with a hidden console are no target for it. The log says "Successfully shut down all applications", there is no event 10002, and without the action an upgrade by hand keeps the old daemon until the next sign-in, while an uninstall leaves it running with its files gone |
 
 **A self-update brings the device back by itself.** The daemon has exited for the
@@ -575,9 +576,18 @@ the later ones do nothing once the daemon is up, and `StartWhenAvailable` keeps 
 through a sleep. A fresh MSI has no config and starts nothing. A `service stop` inside
 those ten minutes can therefore be undone once.
 
+**The first update onto the launcher looks a little different.** It runs the old
+product's table and the old daemon's own console: one terminal can flash when the old
+`UnregisterAutostart` runs, and nothing after that. Restart Manager still shuts down that
+console, and takes the staged watcher with it, so `last-install.json` stays at
+`InProgress` on that one jump. From a launcher release onward nothing is shown, and it
+reads `SucceededVerified`. Measured on both jumps.
+
 **A resume from sleep needs no start.** The processes sleep with the machine and carry
-on. The task's second trigger is `Kernel-General` event 12, an OS start, which does not
-fire on a resume.
+on, with the same process ids: after a hibernate the row was back online 13 s after the
+resume, and no terminal appeared. The task's second trigger is `Kernel-General` event 12,
+an OS start, which does not fire on a resume. S3 and Modern Standby are unread: the test
+guest offers only S4.
 
 ⚠️ **The task is not a supervisor.** `<RestartOnFailure>` restarted nothing after exit 1
 or after `0xC000013A`, five minutes on, with `Count` 10 and `PT1M` registered. A
