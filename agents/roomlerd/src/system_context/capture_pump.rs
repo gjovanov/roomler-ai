@@ -46,11 +46,11 @@
 //!
 //! A pump that called [`ScreenCapture::pace_capture`] gets
 //! [`ScreenCapture::next_frame`]'s contract, carried on every [`CaptureCmd`]:
-//! the DXGI arm waits in the acquire, an empty faster than the floor sleeps the
-//! rest on this thread, and GDI (which has no "nothing new", so every ask is a
-//! whole capture) holds to the target rate. A pump that did not ask keeps the
-//! old behaviour, byte for byte, and sleeps on its own empties. FR-98 C7 moves
-//! every pump over and removes the choice.
+//! the DXGI arm waits in the acquire and reads its frames back on this thread, an
+//! empty faster than the floor sleeps the rest here, and GDI (which has no
+//! "nothing new", so every ask is a whole capture) holds to the target rate. A
+//! pump that did not ask keeps the old behaviour, byte for byte, and sleeps on
+//! its own empties. FR-98 C7 moves every pump over and removes the choice.
 
 #![cfg(all(feature = "system-context", target_os = "windows"))]
 
@@ -530,9 +530,9 @@ fn worker_main(
                 Ok(Some(_)) if matches!(backend, ActiveBackend::Gdi(_)) => {
                     gdi_gate_at(&mut gdi_gate, pace.target_fps).took(Instant::now());
                 }
-                // Everything that returns an empty at once: a zero-copy host's
-                // poll, the scrap arm, a pointer-only update, a desktop rebind,
-                // an AccessLost, a failed BitBlt. A timed-out wait owes nothing.
+                // Everything that returns an empty at once: the scrap arm, a
+                // pointer-only update, a desktop rebind, an AccessLost, a failed
+                // BitBlt. A timed-out wait owes nothing.
                 Ok(None) => {
                     let floor = floor_remaining(took);
                     if !floor.is_zero() {

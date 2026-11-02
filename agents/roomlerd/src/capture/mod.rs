@@ -518,9 +518,10 @@ pub trait ScreenCapture: Send {
     async fn next_frame(&mut self) -> Result<Option<Frame>>;
 
     /// #3272 — hold this capture to [`Self::next_frame`]'s contract, and to its
-    /// target rate where nothing else holds it (GDI). Called once after an open,
-    /// by the RTP pump only. The default does nothing, and every backend but the
-    /// SYSTEM-context one already keeps the contract.
+    /// target rate where nothing else holds it (GDI). A paced SYSTEM-context
+    /// capture delivers CPU frames: a wait holds its device's lock. Called once
+    /// after an open, by the RTP pump only. The default does nothing, and every
+    /// backend but the SYSTEM-context one already keeps the contract.
     fn pace_capture(&mut self) {}
 
     fn monitor_count(&self) -> u8;

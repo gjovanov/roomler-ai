@@ -976,13 +976,11 @@ pump that does not ask keeps the old path byte for byte.
 ```mermaid
 flowchart TB
     ASK["the RTP pump asks for a frame<br/>(CaptureCmd with a pace)"] --> ARM{"which arm"}
-    ARM -->|"DXGI direct,<br/>zero-copy off"| WAIT["AcquireNextFrame(16 ms):<br/>a new frame ends the wait at once"]
-    ARM -->|"DXGI direct, zero-copy on"| POLL["AcquireNextFrame(0):<br/>a waiting acquire holds the<br/>device's lock, and the encoder<br/>reads frames back on that device"]
-    ARM -->|"scrap"| POLL2["a fixed 0 inside scrap"]
+    ARM -->|"DXGI direct,<br/>zero-copy on or off"| WAIT["AcquireNextFrame(16 ms):<br/>a new frame ends the wait at once,<br/>and it is read back on this thread"]
+    ARM -->|"scrap"| POLL["a fixed 0 inside scrap"]
     ARM -->|"GDI"| GATE["the slot-first bucket holds it to<br/>the target; a failed BitBlt takes no slot"]
     WAIT --> EMPTY{"Ok(None)?"}
     POLL --> EMPTY
-    POLL2 --> EMPTY
     GATE --> EMPTY
     EMPTY -->|"yes, under 2 ms"| FLOOR["sleep the rest of 2 ms<br/>on the capture thread"]
     EMPTY -->|"a frame, or a wait that ran out"| REPLY["reply to the pump"]
@@ -991,15 +989,33 @@ flowchart TB
 
 | Arm | A still screen costs | What it adds to a frame |
 |---|---|---|
-| DXGI direct, zero-copy off (the default) | about 62 asks a second | nothing: an event wake replaces the poll |
-| DXGI direct, zero-copy on (`dxgi_direct.rs` `frame`) | about 450 asks a second | up to one 2 ms floor, as the FFmpeg DC pump's sleep does |
-| scrap | about 450 asks a second | the same |
+| DXGI direct (`dxgi_direct.rs` `frame`) | about 62 asks a second | an event wake in place of a poll. L4 against the kill switch is below |
+| scrap | about 450 asks a second | at least one 2 ms floor, not read on L4. The same poll on the direct arm cost more than that, below |
 | GDI | the target rate, full work on each | the bucket's wait, once it is out of credit |
 
-Why zero-copy polls: a thread waiting in `AcquireNextFrame` holds the D3D11
-multithread lock for its wait. Measured on one driver with a test in
-`dxgi_direct.rs` (`a_waiting_acquire_and_a_readback_share_one_device`): taking the lock went from 1 µs to 22 ms,
-and a readback from 6 ms to 67 ms.
+**Why a paced capture's frames stay off the GPU.** A thread waiting in
+`AcquireNextFrame` holds the D3D11 multithread lock for its wait. Measured on two
+drivers with a test in `dxgi_direct.rs`
+(`a_waiting_acquire_and_a_readback_share_one_device`): on one, taking the lock went
+from 1 µs to 22 ms and a readback from 6 ms to 67 ms. So a capture that waits keeps
+its device to itself, reads each frame back on its own thread, and hands no GPU
+frame to anyone. `zero_copy` still decides what the DC pumps get, because their
+encoders do take GPU frames.
+
+The other way out was built and measured, and it lost: an `AcquireNextFrame(0)`
+poll resting on the 2 ms floor, which read L4 +11.3 ms p50 on a still screen and
++24.0 ms with a pointer at 30 Hz, against the same switch spinning ([#3272's third
+run](https://github.com/gjovanov/roomler-ai/issues/3272#issuecomment-6568846719),
+on a guest with only the Basic Render Driver). The poll itself runs at 2.6 ms, so
+the poll alone does not account for that, and the cause is not proven. FR-98 C7
+inherits both facts, because a DC pump's encoder wants GPU frames and its pump
+sleep is the same poll.
+
+RTP gives up nothing on H.264: its encoders read every frame back anyway
+(`mf/sync_pipeline.rs`, `openh264_backend.rs`, `frame.cpu()`). An RTP session on
+FFmpeg HEVC, which takes a browser without H.264, opens with no capture device
+named, so `gpu_input::plan` refuses `cpu_frames` and it stays on the CPU form, as
+on a host with zero-copy off.
 
 ⚠️ **The RTP heartbeat changes meaning at this release.** Don't compare these
 across it:

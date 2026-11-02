@@ -13,10 +13,10 @@
 
 use std::time::{Duration, Instant};
 
-/// The shortest an empty may take. It is what the DXGI arm rests on when it
-/// cannot wait in the acquire (a zero-copy host), what a backend that returns
-/// at once is held to, and the pump-side sleep the FFmpeg DC pump has had since
-/// rc.99: about 450 asks a second, against 90,000.
+/// The shortest an empty may take. It is what a backend that returns at once is
+/// held to (the scrap arm, whose acquire takes a fixed 0, and a pointer-only
+/// update), and the pump-side sleep the FFmpeg DC pump has had since rc.99: about
+/// 450 asks a second, against 90,000.
 pub const EMPTY_FLOOR: Duration = Duration::from_millis(2);
 
 /// An empty faster than this did no waiting at all. Under a millisecond is a

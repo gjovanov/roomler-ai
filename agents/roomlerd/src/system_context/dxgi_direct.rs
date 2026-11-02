@@ -1049,7 +1049,11 @@ impl DxgiDirectBackend {
     /// Copy the acquired GPU texture into the staging texture, map it, and
     /// read out a tightly-packed BGRA8 buffer. Called between
     /// AcquireNextFrame and ReleaseFrame.
-    fn read_acquired(&mut self, resource: Option<IDXGIResource>) -> Result<DxgiFrame, BackendBail> {
+    fn read_acquired(
+        &mut self,
+        resource: Option<IDXGIResource>,
+        gpu_frames: bool,
+    ) -> Result<DxgiFrame, BackendBail> {
         // FR-118 P0 — the whole readback is timed, a GPU scale's included.
         let started = std::time::Instant::now();
         let resource = resource.ok_or_else(|| {
@@ -1061,7 +1065,7 @@ impl DxgiDirectBackend {
 
         // FR-118 P2 — with the switch on, the frame stays on the GPU: nothing
         // is read back here, so it reports no readback time.
-        if let Some(f) = self.try_gpu_frame(&src) {
+        if gpu_frames && let Some(f) = self.try_gpu_frame(&src) {
             return Ok(f);
         }
 
@@ -1186,12 +1190,15 @@ impl DxgiCapture for DxgiDirectBackend {
         // nothing on the runtime waits with it. A timeout is
         // DXGI_ERROR_WAIT_TIMEOUT on a static desktop (mapped to Transient).
         //
-        // ⚠️ Not on a zero-copy device. A thread waiting in AcquireNextFrame
-        // holds that device's multithread lock (measured on #3272: taking the
-        // lock went from 1 µs to 22 ms, and a readback from 6 ms to 67 ms), and
-        // the encoder reads GPU frames back on the same device. That host polls
-        // with 0 and rests on the worker's 2 ms floor.
-        let wait_ms = if self.zero_copy { 0 } else { wait_ms };
+        // ⚠️ A capture that waits keeps this device to itself, so its frames
+        // stay off the GPU: a thread waiting in AcquireNextFrame holds the
+        // device's multithread lock (measured on #3272: taking the lock went
+        // from 1 µs to 22 ms, and a readback from 6 ms to 67 ms), and an encoder
+        // reads a GPU frame back on this device from another thread. Polling
+        // instead is no way out: the 2 ms poll cost 11 ms of L4 on a still screen
+        // and 24 ms with a pointer moving. The only pump that waits is the RTP
+        // one, and its H.264 encoders read every frame back anyway.
+        let gpu_frames = wait_ms == 0;
         // SAFETY: out-params are valid; duplication is live.
         unsafe {
             self.duplication
@@ -1224,7 +1231,7 @@ impl DxgiCapture for DxgiDirectBackend {
         // next AcquireNextFrame, on every path. read_acquired never
         // touches self.duplication, so the borrows don't overlap; the
         // metadata read MUST happen while the frame is still held.
-        let mut result = self.read_acquired(resource);
+        let mut result = self.read_acquired(resource, gpu_frames);
         if let Ok(f) = result.as_mut() {
             f.damage = self.read_damage(&frame_info);
             // Phase B — a GPU-scaled frame's damage must share ITS
@@ -1516,8 +1523,8 @@ mod tests {
     /// #3272 AC1 — does a thread waiting in `AcquireNextFrame` hold the device's
     /// multithread lock? A zero-copy frame is read back on another thread of
     /// this device (`gpu_frame::TexturePool::new`), so if the wait holds it,
-    /// every readback stalls for as long as the screen is still, and on such a
-    /// host the capture thread cannot wait at all.
+    /// every readback stalls for as long as the screen is still, and a capture
+    /// that waits cannot hand a GPU frame to anyone (`frame`).
     ///
     /// Three arms on one device, read by the same sampler: nothing else on the
     /// device; a control that holds the lock itself for 300 ms, which the
