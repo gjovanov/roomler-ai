@@ -736,6 +736,10 @@ function render(r) {
   for (const c of r.criterion.clauses) L.push(`| ${c.clause} | ${c.value} | ${c.status} |`);
   L.push('');
   L.push(`**Verdict: ${r.criterion.verdict}** (the measurement; the flip is the operator's call).`);
+  // A MET is the line a reader stops at, and it can only ever speak to asking for
+  // too much. Said on every run, so the read does not depend on knowing that.
+  L.push('');
+  L.push('This verdict can fail a shadow that asks for too much, never one that asks for too little: read it with "What the encoder spent" below.');
   if (r.criterion.classesBelowBar.length) {
     L.push('');
     L.push(`⚠️ Below the bar on its own: ${r.criterion.classesBelowBar.join(', ')}.`);
@@ -1362,6 +1366,7 @@ function selfTest() {
   const md = render(working);
   ok(/spent > shadow/.test(md) && /\| 20 – 50 \| 4 \| 4 \| 4 \| 4 \| 4 \|/.test(md), 'the render carries the spend table', md.split('\n').filter((l) => /\|/.test(l)));
   ok(!md.includes(s1), 'no session id is printed');
+  ok(/\*\*Verdict: MET\*\*[^]*never one that asks for too little/.test(render(pin)), 'a MET says what it cannot see', render(pin).split('\n').filter((l) => /Verdict|too little/.test(l)));
   const none = render(run([FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50 }), FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50 })]));
   ok(/no window has a spend rate/.test(none), 'no rate is no evidence, not a clean bill', none.split('\n').slice(-4));
 
