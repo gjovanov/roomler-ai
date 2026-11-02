@@ -874,22 +874,21 @@ async fn a_refused_calls_line_says_why() {
 
 /// P2e-2 — a run that is not leased keeps P1's behaviour: after a reconnect
 /// it calls the model at once, on no word.
+///
+/// The word's wait is past [`call`]'s own bound and no word ever comes, so a
+/// run that waits fails that bound, and one that does not answers however
+/// busy the host is: no clock reading here has to tell the two apart (#3305).
 #[tokio::test]
 async fn a_run_that_is_not_leased_calls_the_model_after_a_reconnect_on_no_word() {
     let p = provider().await;
-    let (mut r, _count) = leased_sidecar_rig(&p, Duration::from_secs(5)).await;
+    let (mut r, _count) = leased_sidecar_rig(&p, 6 * WAIT).await;
     let (sid, base, token) = started(&mut r).await;
     let url = format!("{base}/v1/messages");
     let (tx, reports) = tokio::sync::mpsc::channel(64);
     r.reports = reports;
     r.sup.connected(tx);
     p.go.notify_one();
-    let asked = tokio::time::Instant::now();
     assert_eq!(call(&url, Some(&token)).await.status().as_u16(), 200);
-    assert!(
-        asked.elapsed() < Duration::from_secs(2),
-        "it waited for a word it does not need"
-    );
     r.sup.stop(sid, 1, "owner".into());
 }
 
