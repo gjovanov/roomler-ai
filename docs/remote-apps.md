@@ -25,7 +25,7 @@ The rest of the design follows from taking that sentence seriously.
 
 Everything is P2P over the session's existing `control` data channel — no
 server change, and the server never sees a window title. `peer.rs` routes three
-envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:10901`),
+envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:10964`),
 runs it on `spawn_blocking` because every backend shells out or calls FFI, and
 sends the returned reply back on the same channel. The request/reply shape and
 the id correlation are `rc:logs-fetch`'s.
@@ -395,7 +395,7 @@ rule are [`linux-capture.md`](linux-capture.md) §4.
 
 **Switching it on takes two keys.** `window_capture` only says what to ask the
 portal for. The portal arm itself is `portal_capture`
-(`agents/roomlerd/src/capture/mod.rs:3222`), and DRM is tried before it, so a
+(`agents/roomlerd/src/capture/mod.rs:3250`), and DRM is tried before it, so a
 host with `drm_capture = true` never gets there. Set `portal_capture = true` and
 `window_capture = true`, leave `drm_capture` unset or false, then
 `roomler restart`.

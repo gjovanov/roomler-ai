@@ -683,9 +683,9 @@ bounds), and the same-cell rule usually stops it after one try. It blocks nothin
 to a session. On a healthy host, nothing.
 
 ⚠️ **The deny covers Media Foundation and nothing else in a session.** Capture's D3D calls
-still reach the display driver, and the RTP pump opens its encoder inline on a runtime thread
-(`peer::media_pump`). A hang in an open the deny does not cover costs that thread and a black
-session, while signalling goes on on the others. An older hang whose kill landed could always
+still reach the display driver, and the RTP pump opens its encoder on a blocking-pool thread
+(`spawn_blocking` in `peer::media_pump`). A hang in an open the deny does not cover costs that
+thread and a black session, while the runtime goes on. An older hang whose kill landed could always
 reach this state; a stuck child now can too, where before it kept the device offline.
 
 **Where to see it.** The log names the cell and the status at each step, at ERROR once
@@ -721,7 +721,8 @@ flowchart TB
     NEXT --> SWMFT["MS software MFT (default adapter)"]
     SWMFT -->|"took the D3D manager,<br/>or preference = hardware"| OK
     SWMFT -->|"auto, and it ignored the D3D manager:<br/>no GPU behind it (#2283)"| SW
-    MFQ -->|"no (or MF exhausted)"| FF{"FFmpeg available?"}
+    ADP -->|"MF failed outright"| SW
+    MFQ -->|"no: a data-channel cell"| FF{"FFmpeg available?"}
     FF -->|yes| CASC["the codec's table in order<br/>nvenc → qsv → amf → videotoolbox<br/>→ vaapi → d3d12va → vulkan"]
     FF -->|no| SW
     CASC -->|none opened| SW
@@ -731,6 +732,10 @@ flowchart TB
 
 Key properties:
 
+- **The RTP H.264 track never reaches FFmpeg**: Media Foundation, then OpenH264
+  (`encode::open`). An MF cascade that ends with nothing goes to OpenH264, not to
+  the codec table, so a hardware cell the probe found through FFmpeg does not
+  serve this track. FFmpeg's H.264 serves the data channel.
 - **Probe, don't trust**: every candidate encoder must actually open (and, for
   the MF path, encode a frame) before it is selected — the same trial the
   startup probe runs at 480×270, so the browser is never offered a codec the
@@ -794,6 +799,56 @@ own, and only a restart freed them.
   the cascade's own probe runs before the losers end. With `ROOMLERD_MF_SHUTDOWN=0` it fails the way
   the old code did, which is its positive control.
 - About 3 handles per open remain, unattributed, and they had not levelled off after 40 opens.
+
+### Reading RTP's reach (#3272)
+
+`rc:session.stats` carries neither the transport nor the encoder, so how far the RTP path reaches,
+and how it behaves, can only be read from `agent_logs`. `scripts/rtp-reach-read.cjs` does that, bounded
+by construction, with no exec on any host:
+
+```bash
+roomler ssh mars -- 'kubectl -n roomler-ai exec -i mongodb-0 -- mongosh --nodb --quiet' \
+  < scripts/rtp-reach-read.cjs | grep -o 'OUT .*'
+```
+
+```mermaid
+flowchart LR
+    REQ["incoming session request<br/>browser_caps, chosen_codec,<br/>requested and negotiated transport"] --> JOIN["one line per RTP session"]
+    HB["media pump heartbeat<br/>(the RTP pump's alone)<br/>backend, frames_empty, frames_encoded, bytes_written"] --> JOIN
+    ROW["agents row<br/>ephemeral, video_cells"] --> JOIN
+    JOIN --> TOT["totals: sessions, no-video,<br/>backends, empties/s,<br/>RTP H.264 on a hardware cell"]
+```
+
+| Read | What it answers |
+|---|---|
+| `OUT sessions N dc D rtp R agents A` | How much of the fleet's remote desktop runs on this path |
+| `OUT no-video N` | Sessions that wrote no bytes: `backend=noop`, the failure #3245 ends. It should read **zero** once every host has the pick, and a session with a `limit` no longer reaches it |
+| `OUT backends …` | Which encoder those sessions got |
+| `OUT empties/s p50 … p90 … max …` | The spin #3272's waiting capture ends: about 90,000 a second before it, with a bar of 80 on a waiting arm and 520 on a floor arm after it |
+| `OUT rtp-h264-on-a-hardware-cell-not-ephemeral N` | The reach an H.264 hardware rung would have on this path. #3272 decided against building one, and more than 10 a week is what would reopen that |
+
+**Baseline, the 7 days to 2026-11-01:** 730 sessions, 672 on a DataChannel and 58 on RTP (7.9 %), on
+13 agents.
+
+| RTP class | Sessions | Encoder |
+|---|---|---|
+| One host whose caps probe had collapsed, so every transport was gone (#3267) | 15 | Microsoft's H.264 MFT |
+| Throwaway hosts with no hardware (5) | 19 | OpenH264 |
+| A stale transport pick the agent dropped | 11 | **Noop AV1 × 7**, `hevc_qsv`, `hevc_vaapi`, OpenH264 |
+| Explicit H.264 | 8 | OpenH264, Microsoft's H.264 MFT |
+| Other | 5 | `hevc_*`, OpenH264 |
+
+⚠️ **The host's facts are today's.** `ephemeral` and `h264hw` come from the agents row as it reads now,
+not at the session, so a host whose probe has since recovered reads as having had its hardware cell.
+Read `backend=` and the date beside them, and take the hardware count as a ceiling. A row that has
+been reaped reads `?`.
+
+⚠️ **`chosen=?` is a lost line, not a missing pick.** Before #3272 the idle flood overran the log
+uploader, so a session's request line can be gone while its heartbeats landed. Counters are cumulative,
+so its rates still hold.
+
+⚠️ **`avg_capture_ms` changed meaning at the waiting capture**, so this read's history does not compare
+across that release for capture time. Empties a second is what compares.
 
 ## The new cells (FR-77 P3b)
 
@@ -1160,7 +1215,7 @@ source's CSS values.
 | `caps_cache` | `ROOMLERD_CAPS_CACHE` | on | the probe cache (read and write) |
 | `caps_learn_deny` | `ROOMLERD_CAPS_LEARN_DENY` | on | a dead `base` child costs the cell it died in ([above](#a-dead-child-costs-the-cell-it-died-in)); off = one child, and its death means no hardware. A change is a knob change, so the next start re-probes. Not pushable through remote config |
 | `caps_probe_retry` | `ROOMLERD_CAPS_PROBE_RETRY` | on | a first answer short of time gets more tries by itself, with no restart ([above](#a-host-that-ran-out-of-time-gets-another-try)); off = no try, so it stands until the next start, and the word `probe-short` is not said. That is all it turns off: a stuck child's Media Foundation deny and the `444` and `gpu` answers that stand however their child ended answer to `caps_learn_deny`. Read at the start and again before each try. Not pushable through remote config |
-| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them; on macOS the display stream's IOSurfaces go to a proven VideoToolbox cell ([above](#gpu-resident-frames-the-input-path-fr-118)). On a supervised Mac the root's value is handed to the GUI worker at spawn (`WORKER_ENV_FORWARD`, from FR-118 P5) |
+| `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them (an RTP pump's SystemContext capture stays on the CPU path, because it waits: [remote-control.md §5.1g](remote-control.md#51g-the-capture-waits-3272)); on macOS the display stream's IOSurfaces go to a proven VideoToolbox cell ([above](#gpu-resident-frames-the-input-path-fr-118)). On a supervised Mac the root's value is handed to the GUI worker at spawn (`WORKER_ENV_FORWARD`, from FR-118 P5) |
 | `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing. Handed to a supervised Mac's GUI worker as `zero_copy` is. Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`, passed on unread like the other denylists; a blank push clears it (FR-132 P1, [remote-config.md](remote-config.md)). `zero_copy` itself is not pushable |
 | `color_description` | `ROOMLERD_COLOR_DESCRIPTION` | on | every encoder writes the colour description its input was converted with (BT.601 matrix, BT.709 primaries, sRGB transfer, limited range: `encode::color_desc::DESCRIPTION`, [FR-130](fr/FR-130-colours-decode-true.md)), and the hello says `color-described`; `false` writes the undescribed stream of earlier agents. Read at every encoder open, so a restart applies it; the probe and recorder children, a hand-run `roomlerd record`, `encoder-smoke` and the recording editor's `media export` follow it (the export reads the config file only where the person running it can read it), and a supervised Mac's GUI worker gets the root's value (`WORKER_ENV_FORWARD`). Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`: a push of `off` or `on` sets it, and a blank one clears it back to on (FR-130 P1b, [remote-config.md](remote-config.md)). Not every encoder can carry it: `vp9_qsv` and `vp9_vaapi` (FFmpeg writes none), Microsoft's MF encoders (they ignore the attributes), and `h264_amf`'s matrix (AMD's H.264 runtime writes 2) |
 | `vaapi_device` | `ROOMLERD_VAAPI_DEVICE` | unset | pin the render node; unset = `/dev/dri/renderD128`…`135` in order |
@@ -1168,6 +1223,7 @@ source's CSS values.
 | `vulkan_device` | `ROOMLERD_VULKAN_DEVICE` | unset | pin the Vulkan physical device by index or name; unset = the loader's default |
 | `rate_factor_{h264,hevc,vp9}_444` | `ROOMLERD_RATE_FACTOR_<CODEC>_444` | 150 | the 4:4:4 ceiling factor (%), 50–400 |
 | — | `ROOMLERD_HW_AUTO=0` | — | `auto` becomes software-first |
+| — | `ROOMLERD_RTP_CAPTURE_WAIT=0` | — | a kill switch, not a setting: the RTP pump's capture no longer waits or floors an empty, its GDI arm no longer holds to the target, and its open no longer waits for a taken seat ([remote-control.md §5.1g](remote-control.md#51g-the-capture-waits-3272)). Read once per pump, environment only. It cannot bring back the reopen #3272 removed |
 | — | `ROOMLERD_MF_SHUTDOWN=0` | — | a kill switch, not a setting: Media Foundation encoders are released without being ended, which [leaks their threads](#ending-a-media-foundation-encoder) |
 | — | `ROOMLERD_USE_FFMPEG=0` | — | no FFmpeg backends at all |
 | — | `ROOMLERD_DC_H264=0` | — | no H.264-over-DataChannel advertisement (its cells are then not probed either) |
@@ -1286,7 +1342,7 @@ direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climb
 coarsened to the top rung and `set_bitrate` returned. Until its first rung crossing the
 encoder runs at the maxrate it opened with, and after that at the rung, never at the target.
 
-**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:9819-9852`):
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:9882-9915`):
 
 | Field | Meaning |
 |---|---|
