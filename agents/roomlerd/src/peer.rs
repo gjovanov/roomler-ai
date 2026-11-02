@@ -2366,11 +2366,6 @@ async fn media_pump(
     // stops the share (`end_stopped_at_screen`).
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
 ) {
-    // `pc` is consumed only by the VP9-444 DC pump's per-session transport
-    // detection (feature-gated); keep the signalling-only / non-vp9 build
-    // warning-clean.
-    #[cfg(not(feature = "vp9-444"))]
-    let _ = &pc;
     // `viewer_report` is consumed only by the DC video pumps (vp9-444 +
     // ffmpeg-encoder); keep the signalling-only build warning-clean.
     #[cfg(not(any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
@@ -2767,6 +2762,7 @@ async fn media_pump(
     // screen. A browser on a lossy link can ask many times a second, and each
     // answer here is a whole keyframe of an unchanged picture: at most 4 a second.
     const OWED_KEYFRAME_MIN_GAP: Duration = Duration::from_millis(250);
+    let mut transport_up = false;
     let mut last_capture_at = std::time::Instant::now();
     // FR-93 P3e — a capture waiting on its host (a display switched off).
     let mut capture_wait = CaptureWait::default();
@@ -2855,6 +2851,13 @@ async fn media_pump(
                 sw_pace_due = None;
             }
         }
+        // #3272 — the transport coming up owes a keyframe. Whatever this pump
+        // encoded before then is lost, and a browser asks only once a packet
+        // reaches it, which on a still screen is the next keepalive.
+        if !transport_up && matches!(pc.connection_state(), RTCPeerConnectionState::Connected) {
+            transport_up = true;
+            keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let capture_started = std::time::Instant::now();
         // Bound to a local first so the mutable borrow of `capturer` ends
         // here — the idle arm below reads `capturer.frames_unchanged()`, and
@@ -2928,11 +2931,10 @@ async fn media_pump(
                 // which keeps the browser's decoder unpaused.
                 //
                 // #3272 — and a keyframe that is owed does not wait for the
-                // keepalive. On a still screen nothing else answers one, and
-                // the browser's first one comes as the track starts, so the
-                // first picture waited for it. A reopen used to hide this, by
-                // putting a session's first 5 s on GDI, which has a frame on
-                // every ask.
+                // keepalive. On a still screen nothing else answers one, and a
+                // session whose first frame beat its transport has no picture
+                // until one is answered. A reopen used to hide this, by putting
+                // a session's first 5 s on GDI, which has a frame on every ask.
                 let idle_for = last_capture_at.elapsed();
                 if idle_for >= IDLE_KEEPALIVE
                     || (idle_for >= OWED_KEYFRAME_MIN_GAP
