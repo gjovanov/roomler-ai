@@ -22,7 +22,7 @@
 //!
 //! Who asks: the encoder thread (`encode::thread`) and OpenH264's worker on
 //! every OS, the DRM capture worker on Linux, the capture worker on macOS.
-//! Nothing else of the daemon does.
+//! Nothing else of the daemon does: not Media Foundation's worker, on Windows.
 //!
 //! A kernel without util clamping (`CONFIG_UCLAMP_TASK` off) refuses the
 //! request, and the encoder runs as before; the log says so once.
@@ -30,18 +30,18 @@
 //! macOS and Windows have a request of their own (P3, #2430). Neither is a
 //! clamp, and neither is inherited: each covers only the thread that makes it.
 //! That is the whole of an H.264 frame, on OpenH264's one worker, and none of
-//! libvpx's workers. Neither has been measured yet, so each OS's request is
-//! opt-in until its own hardware has answered ([`DEFAULT_ON`]):
-//! - **macOS:** the thread's QoS class, `QOS_CLASS_USER_INTERACTIVE`.
-//!   `pthread_create` gives a new thread `QOS_CLASS_DEFAULT` whatever its
-//!   creator runs at (`sys/qos.h`).
-//! - **Windows:** the thread leaves power throttling, Microsoft's "HighQoS"
-//!   (`SetThreadInformation`, `ThreadPowerThrottling`). Microsoft documents the
-//!   throttling of a background service as "on battery", so a measurement says
-//!   little without its power source.
+//! libvpx's workers. Each OS's default is what its own hardware answered
+//! ([`DEFAULT_ON`]):
+//! - **macOS, off:** the thread's QoS class, `QOS_CLASS_USER_INTERACTIVE`. It
+//!   changed nothing on a Mac. `pthread_create` gives a new thread
+//!   `QOS_CLASS_DEFAULT` whatever its creator runs at (`sys/qos.h`).
+//! - **Windows, on:** the thread leaves power throttling, Microsoft's "HighQoS"
+//!   (`SetThreadInformation`, `ThreadPowerThrottling`). On a hybrid laptop on AC
+//!   it doubled H.264's speed, and a desktop paid almost nothing. Microsoft
+//!   documents the throttling "on battery", where nobody has measured it yet.
 //!
-//! The switch: `ROOMLERD_ENCODER_CLOCK=0` never asks, `=1` asks on macOS and
-//! Windows too.
+//! The switch: `ROOMLERD_ENCODER_CLOCK=0` never asks, `=1` asks on macOS too,
+//! and unset takes [`DEFAULT_ON`].
 
 use std::sync::Mutex;
 
@@ -50,10 +50,10 @@ use std::sync::Mutex;
 pub const CLAMP_MIN: u32 = 1024;
 
 /// Whether a thread asks when `ROOMLERD_ENCODER_CLOCK` is unset: on where the
-/// clock was measured. macOS and Windows flip this only on their own numbers
+/// request was measured to gain. Each OS moves this only on its own numbers
 /// (#2430): a frame back to back against the same frame at a 30 fps cadence
 /// (`encoder-smoke --bench`), with the request and without it.
-pub const DEFAULT_ON: bool = cfg!(target_os = "linux");
+pub const DEFAULT_ON: bool = cfg!(any(target_os = "linux", target_os = "windows"));
 
 /// What a thread's request did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +332,34 @@ mod tests {
     #[test]
     fn the_kill_switch_asks_for_nothing() {
         assert_eq!(ask(false), Outcome::Off);
+    }
+
+    /// Linux: unset, a thread asks. A kernel without util clamping refuses, which
+    /// is still an ask.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unset_asks_on_linux() {
+        std::thread::spawn(|| assert_ne!(ask(DEFAULT_ON), Outcome::Off))
+            .join()
+            .expect("test thread");
+    }
+
+    /// Windows: unset, a thread leaves power throttling. It doubled H.264's speed
+    /// on a hybrid laptop and cost a desktop almost nothing (#2430).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unset_asks_on_windows() {
+        std::thread::spawn(|| assert_eq!(ask(DEFAULT_ON), Outcome::Unthrottled))
+            .join()
+            .expect("test thread");
+    }
+
+    /// macOS: unset, a thread asks for nothing. The request changed nothing on a
+    /// Mac (#2430), so off is the measured choice.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unset_asks_for_nothing_on_macos() {
+        assert_eq!(ask(DEFAULT_ON), Outcome::Off);
     }
 
     /// The request is a VER1 `sched_attr` (56 bytes, the first size that carries

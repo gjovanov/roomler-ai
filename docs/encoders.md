@@ -1511,7 +1511,7 @@ flowchart LR
   thread from the capture worker's EGL. Kill switch: `ROOMLERD_ENCODER_CLOCK=0`.
   - ⚠️ **Not the async runtime.** Clamping every daemon thread was measured and added nothing (56.3 fps either
     way), and a clamped runtime would clock up every timer the daemon wakes for, with no session open.
-  - macOS and Windows have requests of their own, opt-in until each is measured on its own hardware
+  - macOS and Windows have requests of their own, and each OS's default follows its own hardware's numbers
     ([below](#the-clock-on-macos-and-windows-fr-112-p3)).
 - **Software paths target 60, paced to what they sustain** (P2). `SoftwarePace` (`encode/encode_pressure.rs:242`)
   runs FR-1's `FpsPace` over its own encode EWMA. It is its own EWMA so that `ROOMLERD_ENCODE_PRESSURE=0`, the
@@ -1521,9 +1521,9 @@ flowchart LR
   a software encoder to 30 applies only where the tier is off: Windows and macOS by default, where the WGC
   readback it was written for lives.
   - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:829`). On a host whose clock was
-    never the limit, 60 frames cost twice the CPU of 30, and an attended desktop pays for it, so Windows and
-    macOS opt in with `ROOMLERD_SW_FPS_60=1` until the operator decides it per OS on P3's numbers
-    ([below](#what-the-numbers-recommend)). `ROOMLERD_SW_FPS_60=0` gives back 30 everywhere.
+    never the limit, 60 frames cost twice the CPU of 30, and an attended desktop pays for it. So on P3's numbers
+    the operator kept the tier off on Windows and macOS until a live read
+    ([below](#what-the-numbers-recommend)): `ROOMLERD_SW_FPS_60=1` opts in, `=0` gives back 30 everywhere.
   - ⚠️ **A step up waits for headroom** (P2d, `SW_PACE_UP_MARGIN_FPS`, `encode/encode_pressure.rs:255`).
     `FpsPace` was meant to hold an engaged pace until the estimate moved a full step, but it compared two 5-fps
     steps, which always differ by at least a whole step, so on 0.4.142 a pace on a step boundary moved every
@@ -1537,11 +1537,11 @@ flowchart LR
 
 ### The clock on macOS and Windows (FR-112 P3)
 
-Linux's clamp has no counterpart elsewhere, so each OS has a request of its own. Both are measured, and both still ask
-for nothing unless `ROOMLERD_ENCODER_CLOCK=1` (`DEFAULT_ON`, `encode/clock.rs:56`): each default, and the 60 fps tier's,
-is the operator's decision on these numbers ([#2430](https://github.com/gjovanov/roomler-ai/issues/2430)). **On a
-hybrid Windows laptop the request doubles H.264's speed, for 9–35 % more energy a frame. On a desktop it helps a
-little. On a Mac it changes nothing.**
+Linux's clamp has no counterpart elsewhere, so each OS has a request of its own. Both are measured, and each default
+follows its numbers (`DEFAULT_ON`, `encode/clock.rs:56`): Windows asks and macOS does not, the operator's decision on
+these numbers ([#2430](https://github.com/gjovanov/roomler-ai/issues/2430)). **On a hybrid Windows laptop the request
+doubles H.264's speed, for 9–35 % more energy a frame. On a desktop it helps a little. On a Mac it changes nothing.**
+`ROOMLERD_ENCODER_CLOCK=0` never asks.
 
 ```mermaid
 flowchart LR
@@ -1549,8 +1549,8 @@ flowchart LR
     S -->|"0"| N["asks for nothing"]
     S -->|"1"| A["asks the OS"]
     S -->|"unset"| D{"DEFAULT_ON:<br/>measured on this OS?"}
-    D -->|"Linux"| A
-    D -->|"macOS, Windows"| N
+    D -->|"Linux, Windows"| A
+    D -->|"macOS"| N
     A --> L["Linux: uclamp_min 1024"]
     A --> M["macOS: QOS_CLASS_USER_INTERACTIVE"]
     A --> W["Windows: out of power throttling"]
@@ -1559,9 +1559,9 @@ flowchart LR
 | | Linux | macOS | Windows |
 |---|---|---|---|
 | The request | `uclamp_min` 1024 | the QoS class `QOS_CLASS_USER_INTERACTIVE`, `pthread_set_qos_class_self_np` (`encode/clock.rs:218`) | Microsoft's "HighQoS": `SetThreadInformation(ThreadPowerThrottling)`, `ControlMask` execution speed, `StateMask` 0 (`encode/clock.rs:276`) |
-| Who asks | the encoder thread, OpenH264's worker, the DRM capture worker | the encoder thread, OpenH264's worker, the capture worker (`capture/scrap_backend.rs:154`) | the encoder thread, OpenH264's worker |
+| Who asks | the encoder thread, OpenH264's worker, the DRM capture worker | the encoder thread, OpenH264's worker, the capture worker (`capture/scrap_backend.rs:154`) | the encoder thread, OpenH264's worker; **not** Media Foundation's worker (`encode/mf/mod.rs:199`) |
 | Threads it starts | inherit it | **do not** | **do not** |
-| `ROOMLERD_ENCODER_CLOCK` unset | asks | does not ask | does not ask |
+| `ROOMLERD_ENCODER_CLOCK` unset | asks | does not ask | asks |
 | The bench's `clock=` | `clamped` | `qos-user-interactive` | `unthrottled` |
 | A refusal | no `CONFIG_UCLAMP_TASK`, or a cgroup limit | `EPERM`, only for a thread that left the QoS system through `pthread_setschedparam`, which the daemon never calls | logged with its `GetLastError` |
 
@@ -1597,9 +1597,9 @@ flowchart LR
   at 30 fps, 600 at 60). A hybrid laptop's process runs at full speed for 3–4 seconds and at half speed after, so a
   short arm misses it, and a row that starts late in its process reads twice as slow for that reason alone.
 
-  `ROOMLERD_ENCODER_CLOCK=1` in front of the same two lines gives the other arm (on Windows,
-  `$env:ROOMLERD_ENCODER_CLOCK='1'` first). Each is a one-shot process, so no daemon restarts, and a release carries
-  both arms, so no test binary has to reach the host. Through `roomler exec` on a Mac, call
+  `ROOMLERD_ENCODER_CLOCK=0` or `=1` in front of the same two lines picks the arm, whatever the OS's default (on
+  Windows, `$env:ROOMLERD_ENCODER_CLOCK='0'` first). Each is a one-shot process, so no daemon restarts, and a release
+  carries both arms, so no test binary has to reach the host. Through `roomler exec` on a Mac, call
   `/usr/local/bin/roomlerd`: exec's `PATH` does not hold it.
 
   Two reads that need no build. On a Mac, `/usr/bin/time -l` in front of the command reports cycles, and cycles ÷
@@ -1618,8 +1618,8 @@ not do it.
 flowchart LR
     S["a process with no window starts"] --> F["first 3–4 s:<br/>full speed"]
     F --> R{"ROOMLERD_ENCODER_CLOCK"}
-    R -->|"=1"| H["full speed stays<br/>1080p H.264: 6.5 ms"]
-    R -->|"=0, the default"| L["half speed, at any cadence<br/>1080p H.264: 14.2 ms"]
+    R -->|"=1, the default"| H["full speed stays<br/>1080p H.264: 6.5 ms"]
+    R -->|"=0"| L["half speed, at any cadence<br/>1080p H.264: 14.2 ms"]
 ```
 
 | Laptop, H.264 1920×1080 | `=0`, ms p50 · p95 | `=1`, ms p50 · p95 |
@@ -1669,11 +1669,11 @@ Here the trap costs about 3 ms of latency and no frames: every 1080p row fits it
 | `ROOMLERD_SW_FPS_60` | off until a live read; the laptop reaches 60 at 1080p only with the request | off until a live read |
 | 60 fps against 30, package watts | 1.5–2× | 2.7–3×, because the clock rises with the rate (H.264: 38 % → 46 % of a core, but 1.78× the cycles) |
 
-Nothing has flipped: `DEFAULT_ON` is still Linux only, and these are the bench's numbers on one host of each kind.
+The operator took all three on 2026-11-02. They are the bench's numbers on one host of each kind, and a live session
+can still move them: `ROOMLERD_ENCODER_CLOCK=0` gives back the old behaviour without a release.
 
 - **What is owed:** a live session on the laptop, which is also the proof that a session's encoder thread drops the
-  way a bench process does; a laptop on battery; a hardware encoder's thread, because FFmpeg's hardware encoders can
-  run on the same `encode::thread`, so a flip reaches them; and other machines. Every run is in
+  way a bench process does; a laptop on battery; and other machines. Every run is in
   [FR-112 §9](fr/FR-112-software-encoding-at-60-fps.md#9-field-verification-log).
 
 ### OpenH264's runtime settings (FR-112 P2b)

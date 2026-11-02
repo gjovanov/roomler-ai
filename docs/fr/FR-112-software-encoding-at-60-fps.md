@@ -10,10 +10,10 @@ criterion field-verified on a release (§9).
   (11 moves in 40 s).
 - P4's docs: [#2425](https://github.com/gjovanov/roomler-ai/pull/2425).
 - P3 (macOS, Windows) moved to [#2430](https://github.com/gjovanov/roomler-ai/issues/2430), and the hardware
-  pace's own flaw to [#2432](https://github.com/gjovanov/roomler-ai/issues/2432). P3's requests are opt-in (§4) and
-  measured (§9): on a hybrid Windows laptop the request doubles H.264's speed for 9–35 % more energy a frame, on a
-  desktop it helps a little, and on a Mac it changes nothing. Each OS's defaults, a live session and a laptop on
-  battery are owed there.
+  pace's own flaw to [#2432](https://github.com/gjovanov/roomler-ai/issues/2432). P3's requests are measured (§9): on
+  a hybrid Windows laptop the request doubles H.264's speed for 9–35 % more energy a frame, on a desktop it helps a
+  little, and on a Mac it changes nothing. So Windows asks by default and macOS does not (§4). A live session and a
+  laptop on battery are owed there.
 Spec and claim 2026-10-17, on the operator's *"why is asahi having
 less than 30fps, cant it reach 60?"* and, after the answer, *"yes do it"* · **Owner:** remote desktop (the software
 encode paths) · **Anchors:** master `391f114a7` ·
@@ -167,8 +167,8 @@ flowchart LR
 - **macOS and Windows ask differently (P3, [#2430](https://github.com/gjovanov/roomler-ai/issues/2430)).** macOS
   sets the thread's QoS class (`QOS_CLASS_USER_INTERACTIVE`), and Windows takes the thread out of power throttling
   (`SetThreadInformation`, Microsoft's "HighQoS"). Neither passes to the threads it starts (§9), so each request
-  covers OpenH264's worker wholly and libvpx's workers not at all. Both stay opt-in (`ROOMLERD_ENCODER_CLOCK=1`,
-  `DEFAULT_ON`) until the operator decides on the numbers in §9. The two OSes turned out to have different traps. On
+  covers OpenH264's worker wholly and libvpx's workers not at all. Each default (`DEFAULT_ON`) is the operator's
+  decision on the numbers in §9: Windows asks, macOS does not. The two OSes turned out to have different traps. On
   a Mac the clock falls with the idle gap, as on Linux, and the request does not lift it: XNU caps a daemon's request
   at user-initiated, priority 37. On a hybrid Windows laptop a process halves in speed after its first 3–4 seconds,
   at any cadence, and the request removes that.
@@ -238,7 +238,7 @@ flowchart LR
 | **P2b** | the H.264 RTP pump's tier: target 60 on Linux, the same pace (`SoftwarePace`, shared with P2a) and ceiling, OpenH264's frame rate following the rate it runs at, its runtime settings held until its first frame and its max bitrate moving with the target, the auto-fps-cap left to Windows | `ROOMLERD_SW_FPS_60=0` | ✅ released in 0.4.142, field-verified on the Asahi host (§9) | M |
 | **P2d** | the software pace's steps up wait for headroom: down at once, up only once the estimate clears the higher step by 2.5 fps (`SW_PACE_UP_MARGIN_FPS`); the hardware pace keeps margin 0 until it is measured ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)) | `ROOMLERD_SW_PACE_UP_MARGIN=0` (0.4.142's pace) | ✅ released in **0.4.143**, field-verified on it (§9): no pace change in 38 and 43 windows where 0.4.142 flapped, and the switch gives the flapping back. Before it: a candidate on the Asahi host (0.4.142's pace 14 moves in 40 s, the margin 2); unit: margin 0 replays 0.4.142's logged field trace window for window | S |
 | ~~**P2c**~~ | ~~software H.264's ≤ 1280-px cap decided by the measured encode~~ — dropped: the viewer's default `original` already overrides the cap (§3), and the host encodes 2048×1080 in 5.5 ms | — | — | — |
-| **P3** | the clock elsewhere, moved to [#2430](https://github.com/gjovanov/roomler-ai/issues/2430) so this FR could close on what Linux measured: macOS (`QOS_CLASS_USER_INTERACTIVE` on the encoder thread, OpenH264's worker and the capture worker) and Windows (the encoder thread and OpenH264's worker out of power throttling); each OS's default for this and for the 60 fps tier follows its own measurement | `ROOMLERD_ENCODER_CLOCK`: `0` never asks, `1` asks on macOS and Windows, off there by default | 🟡 the requests are written, opt-in and measured on one hybrid laptop, one desktop and one Mac (§9): Windows gains, macOS does not; each OS's default and the tier's are the operator's; a laptop on battery, a hardware encoder's thread and the live numbers are owed on #2430 | S |
+| **P3** | the clock elsewhere, moved to [#2430](https://github.com/gjovanov/roomler-ai/issues/2430) so this FR could close on what Linux measured: macOS (`QOS_CLASS_USER_INTERACTIVE` on the encoder thread, OpenH264's worker and the capture worker) and Windows (the encoder thread and OpenH264's worker out of power throttling); each OS's default for this and for the 60 fps tier follows its own measurement | `ROOMLERD_ENCODER_CLOCK`: `0` never asks, `1` asks on macOS too, unset asks on Windows and not on macOS | 🟡 the requests are written and measured on one hybrid laptop, one desktop and one Mac (§9). The operator's decision on those numbers: Windows asks by default, from the first release after FR-63's read has started; macOS stays off; the 60 fps tier stays off on both until a live read. A laptop on battery and the live numbers are owed on #2430 | S |
 | **P4** | docs: `docs/rate-control.md` (the software tier, the ceiling), `docs/encoders.md` (the clock, why one slice), the `docs/README.md` index row | — | ✅ `encoders.md` § Software encoders (the clock, the tier, OpenH264's settings), `rate-control.md` § Software encoders and two config rows, both index rows | S |
 
 ## 5. Test plan

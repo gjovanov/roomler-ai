@@ -713,8 +713,8 @@ cascades and `--name` are hardware by construction, so they always ask.
   back and 16–20 ms at a 30 fps cadence on an Apple M2 Pro. The preamble's `clock=` says what the
   thread got: `clamped` (Linux), `qos-user-interactive` (macOS), `unthrottled` (Windows),
   `refused:<errno>` (on Linux, a kernel without `CONFIG_UCLAMP_TASK`, or a cgroup limit), `off`
-  (`ROOMLERD_ENCODER_CLOCK=0`, or unset on macOS and Windows, where the request is
-  [opt-in](encoders.md#the-clock-on-macos-and-windows-fr-112-p3)) or `n/a` (no request on this
+  (`ROOMLERD_ENCODER_CLOCK=0`, or unset on macOS, where the request is
+  [off by default](encoders.md#the-clock-on-macos-and-windows-fr-112-p3)) or `n/a` (no request on this
   OS). A paced row well above its back-to-back twin, on a host that answered `off` or `refused`,
   is the CPU's clock, not the encoder.
 - ⚠️ **Noise.** These are wall-clock times on a host doing other things. Run a cell twice and read
@@ -723,7 +723,7 @@ cascades and `--name` are hardware by construction, so they always ask.
   `--bench-fps 60` a frame carries half the motion of one at 30, so it costs less whatever the
   clock does: set a paced row against a back-to-back row at the same `--bench-fps`. On a hybrid
   Windows laptop a process runs at full speed for its first 3–4 seconds and at half speed after,
-  at any cadence, unless `ROOMLERD_ENCODER_CLOCK=1`. So a row that starts late in its process reads
+  at any cadence, if `ROOMLERD_ENCODER_CLOCK=0`. So a row that starts late in its process reads
   twice as slow for that reason alone, and an arm of 150 frames ends before most of it shows: use
   `--bench-frames 300` at 30 fps or 600 at 60
   ([FR-112 §9](fr/FR-112-software-encoding-at-60-fps.md#9-field-verification-log)).
