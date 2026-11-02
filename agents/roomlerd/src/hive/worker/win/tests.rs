@@ -242,6 +242,7 @@ async fn a_worker_starts_in_a_job_of_its_own_its_memory_bounded() {
 /// a bound of its own, not a session's: read back from the job its own spawner
 /// made. A process the daemon starts beside it (a session's account's command,
 /// `hive-pack`) is outside that job, so the job's limit never reaches it.
+#[cfg(worker_calls)]
 #[tokio::test]
 async fn the_devices_worker_starts_into_a_job_at_its_own_bound() {
     use super::super::device::{MAX_MEMORY as DEVICE_MEMORY, OwnBinary};
@@ -354,6 +355,7 @@ async fn the_real_worker_answers_over_its_pipe() {
 /// own reconstructed listener, not this test's, is the one serving it: this
 /// test's copy is dropped the moment its protocol info is taken, so nothing
 /// is left listening here if the worker's `socket_from_info` had failed.
+#[cfg(worker_calls)]
 #[tokio::test]
 #[ignore = "needs a built roomlerd.exe with hive,vault, named in ROOMLERD_WORKER_EXE"]
 async fn the_real_worker_serves_a_credential_endpoint_handed_to_it() {
