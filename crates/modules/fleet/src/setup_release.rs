@@ -57,7 +57,7 @@ fn default_version_latest() -> String {
 /// The download page promises "a signed EXE with a role picker", and from the
 /// first `setup-v*` release that publishes one, `exe` (the default) serves that
 /// EXE itself: `roomler-setup-<v>-x86_64-pc-windows-msvc.exe`, the same signed
-/// bytes the zip carries. A release without one (every release up to 0.4.189)
+/// bytes the zip carries. A release without one (every release before that one)
 /// still serves its zip, so the default can never 404 where it used to answer.
 /// `zip` serves the zip whatever the release has — for a network whose proxy
 /// refuses an EXE download. Linux and macOS have one download each and ignore
@@ -699,7 +699,7 @@ mod tests {
         );
     }
 
-    /// FR-129 C2 — every release up to 0.4.189 has no EXE asset: the default
+    /// FR-129 C2 — a release from before C2 has no EXE asset: the default
     /// keeps serving its zip, exactly as before.
     #[test]
     fn a_release_without_the_exe_keeps_serving_the_zip() {
