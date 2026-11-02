@@ -1213,8 +1213,8 @@ flowchart LR
   readback it was written for lives.
   - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:829`). On a host whose clock was
     never the limit, 60 frames cost twice the CPU of 30, and an attended desktop pays for it, so Windows and
-    macOS opt in with `ROOMLERD_SW_FPS_60=1` until P3's numbers decide it per OS. `ROOMLERD_SW_FPS_60=0` gives
-    back 30 everywhere.
+    macOS opt in with `ROOMLERD_SW_FPS_60=1` until the operator decides it per OS on P3's numbers
+    ([below](#what-the-numbers-recommend)). `ROOMLERD_SW_FPS_60=0` gives back 30 everywhere.
   - ⚠️ **A step up waits for headroom** (P2d, `SW_PACE_UP_MARGIN_FPS`, `encode/encode_pressure.rs:255`).
     `FpsPace` was meant to hold an engaged pace until the estimate moved a full step, but it compared two 5-fps
     steps, which always differ by at least a whole step, so on 0.4.142 a pace on a step boundary moved every
@@ -1228,10 +1228,11 @@ flowchart LR
 
 ### The clock on macOS and Windows (FR-112 P3)
 
-Linux's clamp has no counterpart elsewhere, so each OS has a request of its own. Both are written and neither has
-been measured, so they ask for nothing unless `ROOMLERD_ENCODER_CLOCK=1` (`DEFAULT_ON`, `encode/clock.rs:56`) until
-that OS's own hardware has answered ([#2430](https://github.com/gjovanov/roomler-ai/issues/2430)). The 60 fps
-tier's default follows the same numbers.
+Linux's clamp has no counterpart elsewhere, so each OS has a request of its own. Both are measured, and both still ask
+for nothing unless `ROOMLERD_ENCODER_CLOCK=1` (`DEFAULT_ON`, `encode/clock.rs:56`): each default, and the 60 fps tier's,
+is the operator's decision on these numbers ([#2430](https://github.com/gjovanov/roomler-ai/issues/2430)). **On a
+hybrid Windows laptop the request doubles H.264's speed, for 9–35 % more energy a frame. On a desktop it helps a
+little. On a Mac it changes nothing.**
 
 ```mermaid
 flowchart LR
@@ -1259,16 +1260,20 @@ flowchart LR
   `QOS_CLASS_DEFAULT` whatever its creator runs at (`sys/qos.h`). On Windows a thread started after the request
   reads `ControlMask` 0, with the system in charge again; Microsoft documents neither that read nor the
   inheritance, so the unit tests in `encode/clock.rs` record what each OS does, on a real Mac and a real Windows.
-  OpenH264 encodes one slice on its one worker, so an H.264 frame is wholly covered. If VP9-444 measures short
-  with the request on, its workers need a request of their own.
+  OpenH264 encodes one slice on its one worker, so an H.264 frame is wholly covered. VP9-444 does measure short: on
+  the laptop below its p50 falls 23–35 % where H.264's falls 53–60 %, so its workers are the next lever if that
+  matters.
 - ⚠️ **On Windows, record the power source.** Microsoft's [Quality of Service](https://learn.microsoft.com/en-us/windows/win32/procthread/quality-of-service)
   table gives background services the Utility level and hidden windows the Low level, and describes both as
-  slowed "on battery". It does not say what they do on AC. Only EcoQoS is "always". A flat read on AC therefore
-  says nothing about the same laptop on battery.
+  slowed "on battery". It does not say what they do on AC, and on a hybrid laptop on AC a process with no window
+  slows too (below). Only EcoQoS is "always". A read on AC says nothing about the same laptop on battery.
 - **macOS's job type is a separate lever.** The daemon's launchd job has run `ProcessType = Interactive` since
   FR-119 P2b-9, which took every thread out of the utility band. The QoS class asks for more than that, for the
   threads on a frame's path. Apple's headers warn that `QOS_CLASS_USER_INTERACTIVE` "is not an energy-efficient
   QOS class to use for large tasks", which is one more reason it is measured first.
+- ⚠️ **On macOS `clock=qos-user-interactive` names what was asked for, not what was granted.** Read from outside with
+  `ps -M`, the asking threads go from priority 31 to 37 and libvpx's workers stay at 31. It isn't 46 or 47 because XNU
+  [squashes user-interactive to user-initiated for a daemon](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/osfmk/kern/task_policy.c#L887).
 - **Measure first**, as FR-112 §2 did: the same frame back to back and at a 30 fps cadence, on the host itself.
 
   ```bash
@@ -1276,25 +1281,89 @@ flowchart LR
   roomlerd encoder-smoke --encoder software --bench --bench-cells rtp:h264 --bench-sizes 1920x1080 --bench-frames 150 --bench-paced
   ```
 
-  A paced row well above its back-to-back twin is the trap. ⚠️ A flat row speaks for its own size only, so read a
-  size that leaves the thread mostly idle: on the same Mac a 1920×1080 frame doubles at a 30 fps cadence and a
-  3024×1964 frame does not move. ⚠️ Compare rows at one `--bench-fps` only: at 60 a frame carries half the motion, so
-  it costs less whatever the clock does. ⚠️ Run one size per process: on a Windows laptop an H.264 row that followed
-  a VP9-444 row at a smaller size read about twice as slow on any core, for a reason not yet found.
+  A paced row well above its back-to-back twin is the Mac's and Linux's trap. ⚠️ A flat row speaks for its own size
+  only, so read a size that leaves the thread mostly idle: on the same Mac a 1920×1080 frame doubles at a 30 fps cadence
+  and a 3024×1964 frame does not move. ⚠️ Compare rows at one `--bench-fps` only: at 60 a frame carries half the motion,
+  so it costs less whatever the clock does. ⚠️ **One row per process, and on Windows past 10 s** (`--bench-frames 300`
+  at 30 fps, 600 at 60). A hybrid laptop's process runs at full speed for 3–4 seconds and at half speed after, so a
+  short arm misses it, and a row that starts late in its process reads twice as slow for that reason alone.
 
   `ROOMLERD_ENCODER_CLOCK=1` in front of the same two lines gives the other arm (on Windows,
   `$env:ROOMLERD_ENCODER_CLOCK='1'` first). Each is a one-shot process, so no daemon restarts, and a release carries
   both arms, so no test binary has to reach the host. Through `roomler exec` on a Mac, call
   `/usr/local/bin/roomlerd`: exec's `PATH` does not hold it.
-- **macOS, before the request.** MacBook-1 (Apple M5 Pro, AC, 0.4.190) has the trap in a milder form. A 1080p frame
-  goes from about 3.1 ms back to back to about 6.4 ms at a 30 fps cadence on H.264 and VP9-444. At a 60 fps cadence
-  every row still fits its 16.7 ms, so here it costs about 3 ms of latency and no frames.
-- **Windows, before the request.** On AC the gap is smaller again, and it is not core placement. At 1280×720 and a
-  30 fps cadence H.264 goes from 3.3 to 4.6 ms on a hybrid laptop and from 3.8 to 4.0 ms on a desktop, and VP9-444
-  from 3.7 to 6.8 ms and from 4.5 to 6.0 ms. At 1080p no p50 rises by more than about 10 %. The laptop's free-running
-  rows match the same rows pinned to its fast cores, so nothing parks the encoder on its slow cores on AC. A laptop
-  on battery is the case Microsoft documents, and it is not measured yet.
-- **What is owed:** what each request does, a laptop on battery, and a live session. Both before halves are in
+
+  Two reads that need no build. On a Mac, `/usr/bin/time -l` in front of the command reports cycles, and cycles ÷
+  (user + sys) is the process's average clock. On Windows, `\Energy Meter(RAPL_Package0_PKG)\Energy` is the CPU
+  package's running total, and its raw value counts in picowatt-hours (the same counter's `Power` agrees, on both hosts
+  below); read it around an arm and around an idle arm of the same length.
+
+#### Windows: a process halves after a few seconds
+
+On a hybrid laptop (Core Ultra 7 355, AC, Balanced) the first seconds of a process are not what a session lives with.
+Without the request, H.264 takes twice as long from about 3–4 s into the process, at any cadence. It happens back to
+back and pinned to the fast cores, so neither the idle gap nor core placement is the cause. A desktop (i5-12400) does
+not do it.
+
+```mermaid
+flowchart LR
+    S["a process with no window starts"] --> F["first 3–4 s:<br/>full speed"]
+    F --> R{"ROOMLERD_ENCODER_CLOCK"}
+    R -->|"=1"| H["full speed stays<br/>1080p H.264: 6.5 ms"]
+    R -->|"=0, the default"| L["half speed, at any cadence<br/>1080p H.264: 14.2 ms"]
+```
+
+| Laptop, H.264 1920×1080 | `=0`, ms p50 · p95 | `=1`, ms p50 · p95 |
+|---|---|---|
+| 30 fps cadence, 150 frames (5 s) | 7.42 · 18.64 | 6.58 · 9.78 |
+| 30 fps cadence, 300 frames (10 s) | **14.16 · 19.76** | 6.52 · 8.62 |
+| back to back, 150 frames (2.6 s) | 6.58 · 9.40 | 6.52 · 9.73 |
+| back to back, 1500 frames | **14.44 · 19.94** | 6.53 · 8.64 |
+| 30 fps cadence, 300 frames, pinned to the fast cores | **14.24 · 19.48** | 6.53 · 8.80 |
+
+What it costs, in 10 s arms at 1920×1080. Frames a second is the whole bench process, its own scene rendering
+included, so it isn't a session's frame rate.
+
+| Host, row, cadence | ms p50 · p95, `=0` → `=1` | frames a second | package W above idle | mJ a frame |
+|---|---|---|---|---|
+| Laptop, H.264, 30 | 14.15 · 19.82 → **6.65 · 9.27** | **25.6 → 29.8** | 2.90 → 4.53 | 124 → 168 |
+| Laptop, H.264, 60 | 13.30 · 15.34 → **6.06 · 7.26** | **30.6 → 59.9** | 3.45 → 7.70 | 119 → 142 |
+| Laptop, VP9-444, 30 | 9.36 · 13.27 → 7.05 · 10.50 | 29.7 → 29.8 | 6.38 → 7.33 | 237 → 272 |
+| Laptop, VP9-444, 60 | 8.93 · 10.74 → 5.75 · 7.55 | **39.1 → 59.6** | 6.91 → 11.18 | 190 → 207 |
+| Desktop, H.264, 30 | 7.70 · 13.21 → 7.67 · 10.86 | 29.9 → 29.9 | 7.71 → 7.75 | 285 → 286 |
+| Desktop, VP9-444, 60 | 7.79 · 11.17 → 7.37 · 10.01 | 52.8 → 55.8 | 19.20 → 20.14 | 397 → 396 |
+
+Where `=0` can't hold the rate, `=1` draws more because it encodes more frames. Per frame, across every row at both
+sizes, the laptop pays 9–35 % more and the desktop 0–6 %.
+
+#### macOS: the clock falls, and the request doesn't lift it
+
+On MacBook-1 (M5 Pro, AC) all 28 rows are flat in frame time. At a 30 fps cadence at 1080p the request is flat in
+package watts too: H.264 0.82 → 0.80 W above idle, VP9-444 1.81 → 1.81 W. The frame takes the same cycles on the same
+kind of core, at about half the clock, so this is Linux's trap and not Windows'.
+
+| H.264 row | ms p50, `=0` · `=1` | Clock, `=0` · `=1` | Cycles a frame | Instructions a cycle |
+|---|---|---|---|---|
+| 1920×1080, back to back at `--bench-fps 30` | 3.29 · 3.25 | 4.51 · 4.50 GHz | 31.1 M | 5.07 |
+| 1920×1080, 30 fps cadence | **6.46 · 6.38** | **2.47 · 2.48 GHz** | 32.0 M | 4.92 |
+| 1920×1080, 60 fps cadence | 3.65 · 3.65 | 3.72 · 3.71 GHz | 29.0 M | 5.17 |
+| 3024×1964, 30 fps cadence | 9.59 · 9.60 | 4.49 · 4.50 GHz | 87.7 M | 4.86 |
+
+Here the trap costs about 3 ms of latency and no frames: every 1080p row fits its period.
+
+#### What the numbers recommend
+
+| | Windows | macOS |
+|---|---|---|
+| `ROOMLERD_ENCODER_CLOCK` | **on**: twice the encoder on a hybrid laptop, almost free on a desktop | **off**: it changes nothing |
+| `ROOMLERD_SW_FPS_60` | off until a live read; the laptop reaches 60 at 1080p only with the request | off until a live read |
+| 60 fps against 30, package watts | 1.5–2× | 2.7–3×, because the clock rises with the rate (H.264: 38 % → 46 % of a core, but 1.78× the cycles) |
+
+Nothing has flipped: `DEFAULT_ON` is still Linux only, and these are the bench's numbers on one host of each kind.
+
+- **What is owed:** a live session on the laptop, which is also the proof that a session's encoder thread drops the
+  way a bench process does; a laptop on battery; a hardware encoder's thread, because FFmpeg's hardware encoders can
+  run on the same `encode::thread`, so a flip reaches them; and other machines. Every run is in
   [FR-112 §9](fr/FR-112-software-encoding-at-60-fps.md#9-field-verification-log).
 
 ### OpenH264's runtime settings (FR-112 P2b)
