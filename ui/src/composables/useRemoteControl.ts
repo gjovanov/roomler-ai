@@ -654,6 +654,31 @@ export function nextStallTicks(prev: number, advanced: boolean, agentSaidNoPixel
   return advanced || agentSaidNoPixels ? 0 : prev + 1
 }
 
+/** The counters one media-watchdog tick compares. */
+export interface MediaProgress {
+  rtpBytes: number
+  vp9Frames: number
+  hevcFrames: number
+}
+
+/**
+ * FR-135 R1 — did media advance since the last tick, on the transport this
+ * session actually uses? Pure so the rule is testable.
+ *
+ * A data-channel path that has decoded a frame IS the session's transport, so
+ * its RTP counter says nothing about the picture: bytes on a silent video
+ * m-section must not hold off a re-create while the canvas is frozen. Before
+ * that first frame RTP still counts, because the viewer opens its channel
+ * speculatively and an agent that ignores it sends RTP instead. A path taken
+ * down reads zero frames, so a `<video>` fallback is judged on RTP again.
+ * `transportOnly` false is the old rule, any of the three, for the kill switch.
+ */
+export function mediaAdvanced(prev: MediaProgress, cur: MediaProgress, transportOnly: boolean): boolean {
+  if (cur.vp9Frames > prev.vp9Frames || cur.hevcFrames > prev.hevcFrames) return true
+  const onDataChannel = transportOnly && (cur.vp9Frames > 0 || cur.hevcFrames > 0)
+  return !onDataChannel && cur.rtpBytes > prev.rtpBytes
+}
+
 /**
  * FR-93 — is a session that is ending "dead air" (it reached `connected`
  * and never delivered a frame)? Not when the agent said why there are no
@@ -4274,6 +4299,24 @@ export function storedColorSpaceOverride(): boolean {
   }
 }
 
+/** FR-135 R1 — the per-browser kill switch for recovering a decode error in
+ *  place. `localStorage.setItem('roomler-rc-decode-recover', '0')`, then
+ *  reconnect: a decoder that fails after its first frame stops the path again,
+ *  and the media watchdog re-creates the session about 10 s later (the old path,
+ *  which stays until R1's delete gate). Anything else, or no value, leaves
+ *  recovery on, and so does storage that cannot be read. Read once per connect,
+ *  like every `roomler-rc-*` knob. Pure + exported for tests. */
+export const DECODE_RECOVER_STORAGE_KEY = 'roomler-rc-decode-recover'
+
+export function storedDecodeRecover(): boolean {
+  try {
+    const raw = globalThis.localStorage?.getItem(DECODE_RECOVER_STORAGE_KEY)
+    return (raw ?? '').trim() !== '0'
+  } catch {
+    return true
+  }
+}
+
 /** The browser's ICE-server entry for the loopback TURN (dialled over loopback,
  *  never firewalled). Pure + exported for tests. */
 export function localRelayIceServer(desc: LocalRelayDescriptor): IceServer {
@@ -5334,7 +5377,7 @@ export function useRemoteControl(
   /** 1 Hz media-progress watchdog (runs only while connected). */
   let watchdogTimer: ReturnType<typeof setInterval> | null = null
   let stallTicks = 0
-  let lastMediaProgress = { rtpBytes: 0, vp9Frames: 0, hevcFrames: 0 }
+  let lastMediaProgress: MediaProgress = { rtpBytes: 0, vp9Frames: 0, hevcFrames: 0 }
 
   function clearPcDisconnectedTimer() {
     if (pcDisconnectedTimer !== null) {
@@ -5414,10 +5457,7 @@ export function useRemoteControl(
       // No hasMedia special-case: a session that reached 'connected'
       // but never produced a track/frame is just as dead as one that
       // stalled mid-flight Ã¢ÂÂ both count ticks toward probe/reconnect.
-      const advanced =
-        cur.rtpBytes > lastMediaProgress.rtpBytes
-        || cur.vp9Frames > lastMediaProgress.vp9Frames
-        || cur.hevcFrames > lastMediaProgress.hevcFrames
+      const advanced = mediaAdvanced(lastMediaProgress, cur, sessionDecodeRecover)
       lastMediaProgress = cur
       // Media actually moving is the ONLY proof this pair has a working
       // path — reaching `connected` is not. Reset the ladders here rather
@@ -5770,6 +5810,12 @@ export function useRemoteControl(
    *  before any worker is started: the data-channel workers get it in their
    *  `init-canvas`, the RTP WebCodecs worker in its transform's options. */
   let sessionColorSpace = false
+  /** FR-135 R1 — true when THIS session recovers a decode error in place
+   *  (`workers/rc-decode-recovery.ts`), which is all of them unless this
+   *  browser set `roomler-rc-decode-recover=0`. Resolved beside
+   *  `sessionChunkFraming`; the data-channel workers get it in `init-canvas`,
+   *  and the media watchdog reads it for what counts as progress. */
+  let sessionDecodeRecover = false
   let benchProber: BenchProber | null = null
   let videoBench: VideoBenchSampler | null = null
   /** The element `attachInput` was given: the `<video>` the bench sampler
@@ -8255,6 +8301,13 @@ export function useRemoteControl(
           console.warn(`[rc] ${failedTransport} banned for this page (decoder failed before first frame) - reconnecting on the next-best transport`)
           if (lastConnectArgs) scheduleReconnect()
         }
+      } else if (msg.type === 'decode-recovering') {
+        // FR-135 R1 — the worker replaced the decoder and waits for the key
+        // frame it asked for. The path stays up. The agent still counts it.
+        console.warn('[rc] vp9-444 decoder failed:', msg.error, '- recovering in place, attempt', msg.attempt)
+        reportDecodeError('vp9-444', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
+      } else if (msg.type === 'decode-recovered') {
+        console.info('[rc] vp9-444 decode recovered in', msg.ms, 'ms, attempts', msg.attempts)
       } else if (msg.type === 'frame-rejected') {
         console.warn('[rc] vp9-444 frame rejected', msg)
       } else if (msg.type === 'awaiting-keyframe') {
@@ -8369,6 +8422,9 @@ export function useRemoteControl(
           bench: sessionBench,
           // FR-130 P2 — resolved per session; see `sessionColorSpace`.
           colorSpace: sessionColorSpace,
+          // FR-135 R1 — resolved per session; see `sessionDecodeRecover`.
+          decodeRecover: sessionDecodeRecover,
+          unorderedVideo: videoDcOptions(sessionChunkFraming, storedUnorderedVideo()).ordered === false,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -8552,6 +8608,12 @@ export function useRemoteControl(
           console.warn('[rc] data-channel-hevc banned for this page (decoder failed before first frame) - reconnecting on the next-best transport')
           if (lastConnectArgs) scheduleReconnect()
         }
+      } else if (msg.type === 'decode-recovering') {
+        // FR-135 R1 — see the vp9-444 handler.
+        console.warn('[rc] hevc decoder failed:', msg.error, '- recovering in place, attempt', msg.attempt)
+        reportDecodeError('hevc', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
+      } else if (msg.type === 'decode-recovered') {
+        console.info('[rc] hevc decode recovered in', msg.ms, 'ms, attempts', msg.attempts)
       } else if (msg.type === 'frame-rejected') {
         console.warn('[rc] hevc frame rejected', msg)
       } else if (msg.type === 'awaiting-keyframe') {
@@ -8640,6 +8702,9 @@ export function useRemoteControl(
           bench: sessionBench,
           // FR-130 P2 — resolved per session; see `sessionColorSpace`.
           colorSpace: sessionColorSpace,
+          // FR-135 R1 — resolved per session; see `sessionDecodeRecover`.
+          decodeRecover: sessionDecodeRecover,
+          unorderedVideo: videoDcOptions(sessionChunkFraming, storedUnorderedVideo()).ordered === false,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -11247,6 +11312,11 @@ export function useRemoteControl(
     sessionColorSpace = agentConvertsBt601Limited && storedColorSpaceOverride()
     if (!sessionColorSpace) {
       console.info('[rc] decoder colour space: not set this session (roomler-rc-colorspace=off) - each stream\'s own description decides (FR-130 P2)')
+    }
+    // FR-135 R1 — on every session, off only under this browser's kill switch.
+    sessionDecodeRecover = storedDecodeRecover()
+    if (!sessionDecodeRecover) {
+      console.info('[rc] decode recovery: off this session (roomler-rc-decode-recover=0) - a decode error stops the path and the watchdog re-creates the session (FR-135 R1)')
     }
     if (sessionBenchMode === 'probe') {
       console.info('[rc] bench mode: the agent advertised `bench`; probing once the input channel opens (FR-16 L4)')

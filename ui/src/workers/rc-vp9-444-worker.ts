@@ -60,6 +60,7 @@ import {
 import { createBenchSampler } from './rc-bench-sampler'
 import { startViewerHzBursts } from './rc-viewer-hz'
 import { createDecoderColorSpace, frameColorSpace, rcDecoderConfig } from './rc-decoder-config'
+import { createDecodeRecovery } from './rc-decode-recovery'
 
 type InitCanvasMessage = {
   type: 'init-canvas'
@@ -74,6 +75,15 @@ type InitCanvasMessage = {
    *  `roomler-rc-colorspace=off`). Absent/false configures as before FR-130,
    *  and it sticks across the idempotent visible-canvas re-init. */
   colorSpace?: boolean
+  /** FR-135 R1 — replace a decoder that fails after its first frame, in place
+   *  (`rc-decode-recovery.ts`). Resolved per session by the composable
+   *  (`sessionDecodeRecover`, off under `roomler-rc-decode-recover=0`).
+   *  Absent/false reports the failure as before, and it sticks across the
+   *  idempotent visible-canvas re-init. */
+  decodeRecover?: boolean
+  /** FR-135 R1 — this session's video channel is unordered (`videoDcOptions`),
+   *  so a chunk gap is routine and keeps the deltas moving. Sticks the same way. */
+  unorderedVideo?: boolean
   /** FR-17 — true when the controller negotiated per-chunk framing for
    *  this session (the agent advertised `chunk-framing` in
    *  `AgentCaps.video`). Absent/false keeps the pre-FR-17 bare byte
@@ -164,6 +174,9 @@ const decoderColorSpace = createDecoderColorSpace((stage, error) =>
     error: extractErrorMessage(error),
   }),
 )
+
+/** FR-135 R1 — whether a failed decoder is replaced in place. */
+const decodeRecovery = createDecodeRecovery()
 
 let canvas: OffscreenCanvas | null = null
 let ctx: OffscreenCanvasRenderingContext2D | null = null
@@ -438,6 +451,9 @@ workerScope.onmessage = (e) => {
     }
     // FR-130 P2 — before `initDecoder`, whose configure() reads it.
     if (typeof msg.colorSpace === 'boolean') decoderColorSpace.setWanted(msg.colorSpace)
+    // FR-135 R1 — sticky across the visible-canvas re-init, which omits it.
+    if (typeof msg.decodeRecover === 'boolean') decodeRecovery.setEnabled(msg.decodeRecover)
+    if (typeof msg.unorderedVideo === 'boolean') decodeRecovery.setUnorderedChannel(msg.unorderedVideo)
     initDecoder()
   } else if (msg.type === 'viewport') {
     // P7 — cache the element box; the sizing policy runs per paint.
@@ -466,6 +482,11 @@ workerScope.onmessage = (e) => {
       const { payload, gap } = stripChunkPrefix(framingState, u8)
       if (gap) {
         resetAssembler()
+        // FR-135 R1 — the deltas behind the gap reference the frame it lost,
+        // so they wait at the gate for the IDR asked for below. Decoded, they
+        // paint garbage until it lands, or fail the decoder. Not where a gap is
+        // routine, or with the switch off (`gapClosesGate`).
+        if (decodeRecovery.gapClosesGate()) sawKeyframe = false
         workerScope.postMessage({
           type: 'frame-rejected',
           reason: 'chunk-gap',
@@ -483,12 +504,12 @@ workerScope.onmessage = (e) => {
   }
 }
 
-/** FR-130 P2 — the decoder failed before its first frame while told the
- *  colour space: an error closes a VideoDecoder, so start a new one, which
- *  `initDecoder` configures without it, and wait for a key frame as after
- *  configure() (the leading-delta gate drops the deltas meanwhile and keeps
- *  asking for one). */
-function rebuildDecoderWithoutColorSpace(): void {
+/** An error closes a VideoDecoder, so start a new one and wait for a key frame
+ *  as after configure() (the leading-delta gate drops the deltas meanwhile and
+ *  keeps asking for one). FR-130 P2 calls this when a decoder told the colour
+ *  space fails before its first frame (`initDecoder` then configures without
+ *  it), and FR-135 R1 when any decoder fails after it. */
+function rebuildDecoder(): void {
   try {
     decoder?.close()
   } catch {
@@ -504,10 +525,25 @@ function rebuildDecoderWithoutColorSpace(): void {
   pendingArrivalUs.clear()
   initDecoder()
   // Ask for the key frame at once, past `requestKeyframeResync`'s debounce:
-  // this happens at most once a session, and early in a worker's life the
-  // debounce swallows a request (its clock starts at the worker's creation).
+  // rebuilds are few (once a session for FR-130, a budget for R1), and early in
+  // a worker's life the debounce swallows a request (its clock starts at the
+  // worker's creation).
   lastKeyframeReqMs = performance.now()
   workerScope.postMessage({ type: 'request-keyframe' })
+}
+
+/** FR-135 R1 — the decoder failed: its error callback (`decoder-error`) or
+ *  `decode()` throwing (`decode-error`). `rc-decode-recovery.ts` decides whether
+ *  this session replaces the decoder in place. If not, the composable hears the
+ *  error as before and takes the path down. */
+function onDecoderFailure(type: 'decoder-error' | 'decode-error', err: unknown): void {
+  const error = extractErrorMessage(err)
+  if (decodeRecovery.onFailure(framesDecoded, performance.now())) {
+    workerScope.postMessage({ type: 'decode-recovering', error, attempt: decodeRecovery.attempts })
+    rebuildDecoder()
+    return
+  }
+  workerScope.postMessage({ type, error })
 }
 
 function initDecoder() {
@@ -544,6 +580,11 @@ function initDecoder() {
       paintFrame(frame, w, h)
       paintStats.add(performance.now() - paintT0)
       if (benchClone) bench.settle(benchClone, epochNowMs())
+      // FR-135 R1 — this paint ends an outage, if one is open.
+      const recovered = decodeRecovery.onOutput(performance.now())
+      if (recovered) {
+        workerScope.postMessage({ type: 'decode-recovered', ms: Math.round(recovered.ms), attempts: recovered.attempts })
+      }
       // Age at paint on the agent's clock (mapped via the rc:clock probe).
       const arrivalUs = epochNowUs()
       if (clockOffsetUs !== null) {
@@ -584,16 +625,13 @@ function initDecoder() {
       // FR-130 P2 — a decoder told the colour space that fails before its
       // first frame gets one more try without it, so a browser that refuses
       // the member or a value in it still shows the picture. Any other error
-      // is reported as before (before the first frame the composable bans
+      // goes to `onDecoderFailure` (before the first frame the composable bans
       // this transport and renegotiates).
       if (decoderColorSpace.retryAfterError(err, framesDecoded)) {
-        rebuildDecoderWithoutColorSpace()
+        rebuildDecoder()
         return
       }
-      workerScope.postMessage({
-        type: 'decoder-error',
-        error: extractErrorMessage(err),
-      })
+      onDecoderFailure('decoder-error', err)
     },
   })
   // Configure now; the default `vp09.01.10.08` is unconditionally
@@ -773,10 +811,7 @@ function emitFrame(): void {
     pendingArrivalUs.set(ts, epochNowUs())
     decoder.decode(chunk)
   } catch (err) {
-    workerScope.postMessage({
-      type: 'decode-error',
-      error: extractErrorMessage(err),
-    })
+    onDecoderFailure('decode-error', err)
   }
 }
 
