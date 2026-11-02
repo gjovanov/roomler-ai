@@ -674,10 +674,10 @@ sequenceDiagram
     V-->>V: a snackbar once, and the reason<br/>on the audio control's title
 ```
 
-The pump ([`peer.rs:13301`](../agents/roomlerd/src/peer.rs#L13301)) sends it
+The pump ([`peer.rs:13364`](../agents/roomlerd/src/peer.rs#L13364)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
-[`peer.rs:5521`](../agents/roomlerd/src/peer.rs#L5521); the viewer parses it
+[`peer.rs:5584`](../agents/roomlerd/src/peer.rs#L5584); the viewer parses it
 at [`useRemoteControl.ts:1623`](../ui/src/composables/useRemoteControl.ts#L1623)
 and puts it on the toggle's title
 ([`RemoteControl.vue:3690`](../ui/src/views/remote/RemoteControl.vue#L3690)).
@@ -714,7 +714,7 @@ machine awake while a session is live, per OS:
 |---|---|---|---|
 | The lock signal | the input desktop moves to `winsta0\Winlogon` (`lock_state`) | logind's `LockedHint` for seat0's active session, polled every 2 s ([`lock_state.rs:347`](../agents/roomlerd/src/lock_state.rs#L347)); GNOME, KDE and light-locker set it | the session dictionary's `CGSSessionScreenIsLocked`, or another user on the console, polled every 2 s ([`lock_state.rs:357`](../agents/roomlerd/src/lock_state.rs#L357)); only the GUI session's half can ask, so the root half says nothing |
 | What the session does | paints the "Host locked" overlay and suppresses input: the worker can neither capture nor inject there | **nothing**: the lock screen is captured like any other screen, and input reaches it | **nothing**: no overlay, and input is not suppressed |
-| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:10237`](../agents/roomlerd/src/peer.rs#L10237)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
+| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:10300`](../agents/roomlerd/src/peer.rs#L10300)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
 | The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" | "The remote host is on its lock screen.", claiming neither way ([`useRemoteControl.ts:1480`](../ui/src/composables/useRemoteControl.ts#L1480) `hostLockedChipTitle`) |
 | A request that waits for consent | `rc:consent.pending{host_locked}` (FR-34, §11.2) | not yet: the read is a `loginctl` run, which does not belong on the signalling loop | `rc:consent.pending{host_locked}`, from the same session dictionary ([`lock_state.rs:301-320`](../agents/roomlerd/src/lock_state.rs#L301-L320)) |
 | Holding the machine awake while a session is live (FR-55) | `PowerCreateRequest` | a logind **block** inhibitor ([`power.rs:758`](../agents/roomlerd/src/power.rs#L758)): `sleep:idle` for a root daemon, `idle` only for a per-user one | `IOPMAssertion` |
@@ -955,6 +955,157 @@ flowchart TB
   [§9.7](fr/FR-118-gpu-resident-frames.md#97-ac7-nvenc-on-the-wgc-arm-2026-10-29)
   and [§9.9](fr/FR-118-gpu-resident-frames.md#99-ac7-videotoolbox-on-the-macbook-2026-10-29).
 
+### 5.1g The capture waits (#3272)
+
+`ScreenCapture::next_frame` has a contract: **the backend owns its pace, and an
+`Ok(None)` comes after a bounded wait for a frame**. A pump loops straight back
+on one and sleeps on nothing. WGC, the portal, scrap and DRM always did this.
+The SYSTEM-context capture did not: it polled and returned at once, and the two
+DataChannel pumps slept on an empty themselves, while the RTP pump, which had no
+sleep, asked about 90,000 times a second on a still screen.
+
+Measured on 0.4.195 on one host, worker CPU over 30 s, as a share of one CPU:
+2.3 % with no session, 17.1 % on a DataChannel session, **191.8 % on an RTP
+session**. Its idle line ran at 362 lines a second, which crowded its heartbeats
+out of the log uploader (16 on disk, 10 in `agent_logs`).
+
+A pump asks for the contract when it opens the capture (`capture::open_async`'s
+`paced`). Only the RTP pump does so far, and the request travels on each
+`CaptureCmd`, so a pump that does not ask keeps the old path, its open included.
+
+```mermaid
+flowchart TB
+    ASK["the RTP pump asks for a frame<br/>(CaptureCmd with a pace)"] --> ARM{"which arm"}
+    ARM -->|"DXGI direct,<br/>zero-copy on or off"| WAIT["AcquireNextFrame(16 ms):<br/>a new frame ends the wait at once,<br/>and it is read back on this thread"]
+    ARM -->|"scrap"| POLL["a fixed 0 inside scrap"]
+    ARM -->|"GDI"| GATE["the slot-first bucket holds it to<br/>the target; a failed BitBlt takes no slot"]
+    WAIT --> EMPTY{"Ok(None)?"}
+    POLL --> EMPTY
+    GATE --> EMPTY
+    EMPTY -->|"yes, under 2 ms"| FLOOR["sleep the rest of 2 ms<br/>on the capture thread"]
+    EMPTY -->|"a frame, or a wait that ran out"| REPLY["reply to the pump"]
+    FLOOR --> REPLY
+```
+
+| Arm | A still screen costs | What it adds to a frame |
+|---|---|---|
+| DXGI direct (`dxgi_direct.rs` `frame`) | about 62 asks a second | an event wake in place of a poll. L4 against the kill switch is below |
+| scrap | about 450 asks a second | at least one 2 ms floor, not read on L4. The same poll on the direct arm cost more than that, below |
+| GDI | the target rate, full work on each | the bucket's wait, once it is out of credit |
+
+**Why a paced capture's frames stay off the GPU.** A thread waiting in
+`AcquireNextFrame` holds the D3D11 multithread lock for its wait. Measured on two
+drivers with a test in `dxgi_direct.rs`
+(`a_waiting_acquire_and_a_readback_share_one_device`): on one, taking the lock went
+from 1 µs to 22 ms and a readback from 6 ms to 67 ms. So a capture that waits keeps
+its device to itself, reads each frame back on its own thread, and hands no GPU
+frame to anyone. `zero_copy` still decides what the DC pumps get, because their
+encoders do take GPU frames.
+
+The other way out was built and measured, and it lost: an `AcquireNextFrame(0)`
+poll resting on the 2 ms floor, which read L4 +11.3 ms p50 on a still screen,
+against the same switch spinning ([#3272's third
+run](https://github.com/gjovanov/roomler-ai/issues/3272#issuecomment-6568846719),
+on a guest with only the Basic Render Driver). The poll itself runs at 2.6 ms, so
+the poll alone does not account for that, and the cause is not proven. FR-98 C7
+inherits both facts, because a DC pump's encoder wants GPU frames and its pump
+sleep is the same poll.
+
+**What the wait costs, measured.** On that guest (2 vCPU, `openh264` over RTP, zero
+copy off), against the kill switch beside it. L4 is `p50 / p95` in ms, 2 runs per
+arm; a gap counts when it is beyond the larger of the two arms' run-to-run spread,
+in brackets.
+
+| Read | spin (kill switch) | waiting | gap, p50 / p95 |
+|---|---|---|---|
+| Worker CPU, one viewer, still screen, % of one CPU | 162 | **1.5** | |
+| `calls` per 30 s, still screen | about 3 M | **about 1,790** | |
+| L4, still | 40.9 / 57.5 | 40.8 / 57.9 | 0.0 (1.1) / +0.4 (0.5) |
+| L4, a pointer at about 30 Hz | 39.9 / 57.9 | 39.8 / 59.2 | −0.1 (1.9) / +1.3 (3.7) |
+| L4, a pointer at about 110 Hz | 41.4 / 57.7 | 42.1 / 57.5 | +0.7 (2.0) / −0.2 (0.6) |
+| L4, 60 fps motion | 39.5 / 68.5 | 42.8 / 69.7 | **+3.4 (0.5)** / +1.2 (8.2) |
+
+With the zero-copy switch on, the spin reads GPU frames and the waiting arm does
+not, and motion reads p50 **+4.9** (1.4), p95 **+8.0** (2.0), while the still screen
+reads +0.5 (0.2) / −1.2 (1.4). Motion is the wait's one standing L4 miss, the cause
+is not proven, and it comes from a guest whose compositor renders in software. No
+real GPU has been read on any of this.
+
+⚠️ **How to move a pointer in an L4 cell.** A target-mode probe is itself a pointer
+move onto the probe window's pad, so a load that moves the same pointer can measure
+the two movers instead of the capture. The rows above move it the way a controller
+does: an absolute move through the input queue, 1 px either side of where the probe
+left it. `SetCursorPos` costs both arms 8-11 ms by itself, and pulling the pointer
+off the pad also loses probes on the waiting arm, 15 and 31 of about 480 at 110 Hz
+against 2 and 0 through the queue ([the correction on
+#3272](https://github.com/gjovanov/roomler-ai/issues/3272#issuecomment-6571879880)).
+
+RTP gives up nothing on H.264: its encoders read every frame back anyway
+(`mf/sync_pipeline.rs`, `openh264_backend.rs`, `frame.cpu()`). An RTP session on
+FFmpeg HEVC, which takes a browser without H.264, opens with no capture device
+named, so `gpu_input::plan` refuses `cpu_frames` and it stays on the CPU form, as
+on a host with zero-copy off.
+
+⚠️ **The RTP heartbeat changes meaning at this release.** Don't compare these
+across it:
+
+- `avg_capture_ms` counts the asks that brought a frame. Each now includes its
+  wait in the acquire, and on GDI the bucket's wait: a frame that arrives 10 ms
+  into a wait reads 10 ms plus its readback, where it used to read the readback
+  alone, because the polls before it were not counted. It is waiting, not work.
+  The work is `avg_readback_ms`.
+- `worker_avg_capture_ms` counts every ask, so on a still screen on the waiting
+  arm it reads about 16 ms. The floor and the bucket's wait stay outside its clock.
+- `frames_empty` drops about 1,000-fold, and `calls=` with it. A rate read off
+  them from before and after the release is measuring this change.
+
+The rest of the change:
+
+- **The auto-fps-cap moves the rate in place.** It used to reopen the capture
+  while the old one still held the output, so `DuplicateOutput` answered
+  `0x80070057`, and 15 of 16 sessions on one host in a day spent their first 5 s
+  on GDI (`set_target_fps`, as the DC pumps do on a grant).
+- **That error has a name now.** `BackendBail::SeatBusy`, at the `DuplicateOutput`
+  call alone: the capture that is ending lets go within one in-flight capture, so
+  a paced open waits up to 5 × 40 ms before going on to scrap and GDI. A second
+  viewer, who really is locked out, pays that once, and then re-climbs quietly
+  every 5 s. An unpaced open takes one look and goes straight on, as it always did:
+  a DC pump's reopen holds the old capture through the open, so a wait there could
+  not succeed, and FR-70 AC10's week reads those pumps.
+- **An owed keyframe does not wait for the keepalive, and the transport coming up
+  owes one.** A frame encoded before the transport is up is lost, and a browser asks
+  for a keyframe only once a packet reaches it, which on a still screen is the next
+  keepalive. So a session whose first frame beat its transport by 100 ms showed its
+  first picture about 1.5 s after the click, and one whose transport won showed it
+  in 0.25 s (read on #3272). The reopen used to hide that by accident: GDI has a
+  frame on every ask. It also stands in for the frame the auto-downscale drops to
+  build the encoder at the smaller size. An owed keyframe re-encodes the last frame
+  at most 4 times a second, however often a browser on a lossy link asks.
+- **The encoder open left the runtime worker** (`spawn_blocking`, as the FFmpeg DC
+  pump's). The MF cascade waits on each candidate's own thread, about 0.6 s a go.
+- **The idle line runs on time, once per 5 s**, on every OS. The FR-29 line on an
+  idle Linux host used to run once per 150 empties.
+- **`capture::pace::EmptyGuard`** watches the pump's empties: three instant ones in
+  a row with no frame between them warn once and cost 2 ms each. One alone is
+  normal, because a pull backend's next ask is already due after a slow encode.
+- **The log uploader counts what a full channel drops** and says `dropped=N` in its
+  next batch (`crates/agent-core/src/logs_upload.rs`), so a read off `agent_logs` can
+  tell a quiet host from one that overflowed the channel. It is not every loss: a
+  batch shed in an outage or refused 401/403 is not counted, and can take the line
+  with it, so no `dropped` line does not prove that nothing was lost.
+
+**What this does not do.** On DXGI a motion source above the target still delivers
+at the display's rate: a 60 fps source read 55-56 frames a second at a target of 30,
+waiting or spinning. A session that encodes faster than its target stamps each frame
+at least 33 ms on (`frame_duration_floor`), so its RTP clock runs ahead of wall time.
+Only the GDI arm holds to the target here.
+
+The kill switch is `ROOMLERD_RTP_CAPTURE_WAIT=0`: environment only, read once per
+pump. Off, the pump does not ask and the guard is not armed, so the capture spins
+as it did and an open on a taken seat takes one look. The reopen, the time-gated line
+and the blocking open do not come back with it. [FR-98 C7](fr/FR-98-input-to-photon-budget.md#4-design-cuts-each-one-attributed-by-l4)
+moves the other pumps over and retires the opt-in, the switch and their sleeps.
+
 ### 5.2 Encoder selection
 
 Picked at agent startup, redetected on GPU change:
@@ -992,11 +1143,11 @@ Without them the viewer never offers above 60 and never sends `rc:fps`.
 | Message | Direction | Fields |
 |---|---|---|
 | `rc:fps` | viewer → agent, control channel | `fps`: 60, 120 or 144 ([`frame_rate.rs:36`](../agents/roomlerd/src/encode/frame_rate.rs#L36)); anything else is dropped. `retry: true`, a literal `true` only, asks to trial a refused rate again (`fps-retry`, [`frame_rate.rs:30`](../agents/roomlerd/src/encode/frame_rate.rs#L30)) |
-| `rc:video-info` | agent → viewer | `fps`, what the stream runs at; `fps_asked` and `fps_reason` once it runs below the ask; `fps_trial` while a trial runs; `refresh_hz` when the host could read its screen's rate ([`peer.rs:5363`](../agents/roomlerd/src/peer.rs#L5363)) |
+| `rc:video-info` | agent → viewer | `fps`, what the stream runs at; `fps_asked` and `fps_reason` once it runs below the ask; `fps_trial` while a trial runs; `refresh_hz` when the host could read its screen's rate ([`peer.rs:5426`](../agents/roomlerd/src/peer.rs#L5426)) |
 
 **The grant** ([`frame_rate.rs:286`](../agents/roomlerd/src/encode/frame_rate.rs#L286)).
 It runs in the FFmpeg data-channel pump
-([`peer.rs:8238`](../agents/roomlerd/src/peer.rs#L8238)) whenever the ask, the
+([`peer.rs:8301`](../agents/roomlerd/src/peer.rs#L8301)) whenever the ask, the
 base rate, the transport or the class moves, and once a second for the pipe's
 belief. Each rate is checked in the order a viewer can see and act on
 ([`frame_rate.rs:229`](../agents/roomlerd/src/encode/frame_rate.rs#L229)):
@@ -1013,7 +1164,7 @@ A refused ask **steps down one rate at a time** (P2b-18): the highest offered
 rate below the ask that nothing refuses runs instead, and the viewer is still
 told why the ask was refused, as "120 fps (144 fps not granted: …)". The pump
 checks each of those rates against its own deny entry and its own ceiling
-([`peer.rs:8300`](../agents/roomlerd/src/peer.rs#L8300)).
+([`peer.rs:8363`](../agents/roomlerd/src/peer.rs#L8363)).
 
 ```mermaid
 flowchart TD
@@ -1060,7 +1211,7 @@ from the top. A proven rate stays proven.
 every Windows session ran at about 58 fps. An NVENC session holds the GPU clock
 pin, graphics and memory, from the moment the grant wants the rate
 ([`gpu_clock.rs:506`](../agents/roomlerd/src/gpu_clock.rs#L506),
-[`peer.rs:8338`](../agents/roomlerd/src/peer.rs#L8338)). Under an encoder-only
+[`peer.rs:8401`](../agents/roomlerd/src/peer.rs#L8401)). Under an encoder-only
 load the driver otherwise drops the memory clock, and NVENC's time per frame
 doubles.
 
@@ -2415,8 +2566,8 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:13637`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:13615`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4139`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:13646`) |
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:13700`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:13678`). An offer with no `m=video` is answered without the track |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4139`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:13709`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:668`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:321`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:759`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:413`, #2326) |
@@ -2522,8 +2673,8 @@ sequenceDiagram
 | Piece | What it does | Where |
 |---|---|---|
 | the message | `{t: 'rc:decode-error', stage, path, codec, error}`: `stage` is `configure` (the decoder's `configure()`), `decode` (its error callback, or `decode()` throwing) or `pipe` (the RTP transform's reader or pipe); `path` is `webcodecs`, `vp9-444` or `hevc`; the codec and the message are cut to 64 and 160 characters | `decodeErrorWireMessage`, `ui/src/composables/useRemoteControl.ts:2451`; sent by `reportDecodeError` (`:7362`) from all three worker handlers |
-| the counted marker | every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts and a zero is a measured one | `useRemoteControl.ts:2426`; read by `viewer_counts_decode_errors`, `agents/roomlerd/src/peer.rs:10321` |
-| the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:10835`; `viewer_decode_error`, `peer.rs:10296` |
+| the counted marker | every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts and a zero is a measured one | `useRemoteControl.ts:2426`; read by `viewer_counts_decode_errors`, `agents/roomlerd/src/peer.rs:10384` |
+| the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:10898`; `viewer_decode_error`, `peer.rs:10359` |
 | the count | per session, saturating; `None` until the viewer counts, so absent means **not counted**; carried to a new peer when a re-offer replaces one, as the clipboard tallies are | `SessionCounters::note_decode_error` / `decode_errors` / `carry_decode_errors`, `agents/roomlerd/src/session_telemetry.rs:162` |
 | the early samples | the first `de` and each of the first eight errors send one `rc:session.stats` at once, by the carrier's road (§11.9): a session someone leaves right after a black screen still records its count, and a short clean one its zero | the FR-102 P9d channel, `peer.rs` `attach_control_handler` |
 | the wire | `decode_errors: Option<u32>` on `rc:session.stats`, absent unless counted; an older server ignores it | `crates/remote_control/src/signaling.rs:782` |
@@ -2583,7 +2734,7 @@ Each cut is its own switch, A/B'd on these cells and reverted if it moves nothin
 
 | Cut | Switch | Default | State |
 |---|---|---|---|
-| C1 slot-first capture gate | `ROOMLERD_CAPTURE_GATE=slot_first`, environment only, read by the WGC backend | `legacy` at 60 fps and below; above 60, slot-first whatever the switch says (FR-119 P2b) | built; L0 moves 19.9 ms in CI. The L4 field A/B is owed on a WGC host at 60 fps; the system-context DXGI arm (`scrap`) never reads the switch |
+| C1 slot-first capture gate | `ROOMLERD_CAPTURE_GATE=slot_first`, environment only, read by the WGC backend | `legacy` at 60 fps and below; above 60, slot-first whatever the switch says (FR-119 P2b) | built; L0 moves 19.9 ms in CI. The L4 field A/B is owed on a WGC host at 60 fps; the system-context DXGI arm never reads the switch |
 | C2 GPU clock pin, NVENC | `ROOMLERD_GPU_CLOCK_PIN`: `1` pins every session, `0` never | unset pins only above 60 fps (FR-119 P2b-16) | the 60 fps A/B is owed |
 | C3 pointer-move coalescing gap | `localStorage['roomler-rc-input-gap']`, 0–16 ms | 8 ms | knob built; L4's target mode cannot read it |
 | C4 cursor poller period | `ROOMLERD_CURSOR_POLL_MS`, 2–50 ms | 8 ms | knob built; L4's target mode cannot read it |
@@ -3546,7 +3697,7 @@ The same chip and picker on an X11 desktop, through the same two messages. On
 Linux `input::layout` *is* `input::layout_x11`
 (`agents/roomlerd/src/input/mod.rs:97`), so the peer's emitter
 (`agents/roomlerd/src/peer.rs:1561`) and its `rc:layout.set` arm
-(`agents/roomlerd/src/peer.rs:10928`) serve both platforms.
+(`agents/roomlerd/src/peer.rs:10991`) serve both platforms.
 
 ```mermaid
 sequenceDiagram
