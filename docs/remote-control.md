@@ -1358,7 +1358,7 @@ enum InputMsg {
     MouseButton { btn: Button, down: bool, x: f32, y: f32, mon: u8 },
     MouseRelease { btn: Button },                     // let go WHERE THE POINTER IS (#1945)
     MouseWheel  { dx: f32, dy: f32, mode: WheelMode },
-    Key         { code: u32, down: bool, mods: u8 }, // USB HID usage code
+    Key         { code: u32, down: bool, mods: u8 }, // USB HID usage code; mods: 0x01 Ctrl, 0x02 Shift, 0x04 Alt, 0x08 Meta
     KeyText     { text: String },                    // for IME / unicode
     Touch       { id: u32, phase: TouchPhase, x: f32, y: f32 },
     Heartbeat   { seq: u64, ts_ms: u64 },
@@ -1370,6 +1370,16 @@ Key design choices:
 - **Normalized coordinates** (0..1 per monitor index), not pixels. The browser doesn't know the agent's resolution, and the agent's resolution can change mid-session (laptop docking, etc.). The agent maps to absolute pixels using its current monitor geometry. An app that captures the pointer needs movement instead of a position: that is relative mode, `mouse_rel` and `mouse_press` under Pointer Lock ([relative-mouse.md](relative-mouse.md), FR-109). A finger on a touch screen is the mouse too, and the stage keeps every touch so the browser cannot cancel a drag halfway through and leave the host's button down ([touch-controls.md](touch-controls.md), FR-111). Its on-screen controls (rows of keys, a d-pad, a mouse stick) send the frames a keyboard and a mouse would, so they work with every deployed agent. ⚠️ The agent turns a pixel wheel into 100 px steps and rounds every frame on its own (`enigo_backend.rs` `wheel_to_steps`). So the viewer gathers pixel-mode wheel events and sends whole steps, carrying the rest and dropping the carry after a 400 ms pause (`useRemoteControl.ts` `onWheel`, #2367). Before that, a precision trackpad's or a high-resolution wheel's frames under 50 px scrolled nothing.
 - **HID usage codes**, not browser key codes or X11 keysyms. Browser keyboard events expose `KeyboardEvent.code` which maps cleanly to HID; the agent maps HID → OS-native scan codes. This is the only way to get layout-independent behavior (a German controller pressing the physical "Z" key sends "Y" on a US-layout host *correctly*, because the host's layout interprets the scan code).
 - **Unreliable DC, ordered=false, maxRetransmits=0** — input is real-time; a dropped move event is replaced by the next one a few ms later. Latency >> reliability.
+- **A chord only `mods` names is tapped whole, on its `down`** (#3046). `mods` says what the viewer believes is down with a key. A physical keyboard's modifiers arrive as frames of their own and stay held, so for those it adds nothing. The soft keyboard's sticky Ctrl, Alt and Win, a controller's one-key chord, and a Ctrl+V flushed after its Ctrl came up have only `mods`. For those the arbiter, ahead of every backend (`chord_tap`, `agents/roomlerd/src/input/arbiter.rs:75`), presses what `mods` names and the session does not hold, then the key, then lets go of the key and those modifiers, all on that one frame. Nothing stays down and nothing is tracked, so the viewer's own up frame has nothing to let go of.
+  ⚠️ That is why the viewer sends no explicit modifier frames for these, and why the release doesn't wait for the up frame: on this channel a lost Ctrl-up would be a stuck Ctrl on the host, which is worse than the bare letter it replaces.
+  ⚠️ A viewer turns Ctrl into Cmd for a Mac host in the key's code and not in `mods` (FR-13), so on a Mac a held Cmd answers the Ctrl bit. Without that rule every Ctrl+C from a viewer would press a second, literal Ctrl.
+
+  | | A soft keyboard's chord | A physical Ctrl+C |
+  |---|---|---|
+  | New viewer, older agent | the bare key, as before, until the agent updates | unchanged |
+  | Older viewer, new agent | works, as a literal Ctrl on a Mac host | unchanged |
+
+  No capability word goes with it: the field has always been on the wire, and every sender already set it truthfully.
 - **A click moves first; a release-all never moves** (#1945). Every backend
   positions the pointer before a `MouseButton` event, so a click lands on its
   target even if the moves before it were coalesced away. The arbiter's
@@ -1509,11 +1519,11 @@ The agent does **not** render the cursor into the captured frame (it tells the O
 ### 6.3 One owner per key — the soft keyboard beside a hardware keyboard (#2888)
 
 The viewer has two places a key can enter the host from. The window-level
-CAPTURE listener (`attachInput`, `useRemoteControl.ts:12669`) sees every key
+CAPTURE listener (`attachInput`, `useRemoteControl.ts:12677`) sees every key
 first and forwards it — `key_text` for a printable character, a HID `key` frame
 otherwise. The soft keyboard (`MobileKeyboard.vue`) is an off-screen textarea
 whose focus brings up the OS keyboard; its typing arrives as `input` events
-(`MobileKeyboard.vue:218`), a composition as `compositionend` (`:281`), and a
+(`MobileKeyboard.vue:233`), a composition as `compositionend` (`:293`), and a
 special key the OS keyboard sends as a `keydown` through `onKeyDown` (`:313`).
 Both are needed: the keydown is the only way a Backspace on the always-empty
 textarea or a hardware chord reaches the host (#2878), and the `input` event
@@ -1552,7 +1562,7 @@ pre-fix run.
 | Ctrl+Alt+End | End forwarded, no SAS | SAS (derived) | SAS once, no End |
 | sticky toolbar Ctrl, then `c` | `L text:"c"` + `S` Ctrl+C — **twice, and the host's text first** | same | `S` Ctrl+C — once, the modifier cleared |
 
-The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14854`, pure)
+The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:14869`, pure)
 and carried out by `applyKeyRoute` (`:14334`): a key whose target is the soft
 keyboard's textarea (`isSoftKeyboardTarget`, `:14075` — the same
 `data-rc-capture` attribute `isViewerOwnInput` exempts) is **driving**, like a
@@ -1605,7 +1615,7 @@ paste.** `routeDeferredPaste` calls `preventDefault` whenever a deferral is
 pending — in the one function `onPaste`, the harness and the spec all run, so
 it is not a copy that can drift. With nothing editable focused the default did
 nothing anyway; with the textarea focused it inserted the clipboard, and the
-`input` handler typed it. `onKeyDown` (`MobileKeyboard.vue:313`) also ignores
+`input` handler typed it. `onKeyDown` (`MobileKeyboard.vue:325`) also ignores
 a `defaultPrevented` keydown — the second lock, should the listener ever
 forward without stopping.
 
@@ -1614,20 +1624,20 @@ listener maps by `code`, so a keydown with `key` "Backspace" and an empty
 `code` — what an OS keyboard that sends keydowns without a physical position
 emits, iOS's being the likely one — is dropped, and the always-empty textarea
 deletes nothing, so no `input` event carries it either: it reached the host
-through nobody. `onKeyDown` now sends both (`MobileKeyboard.vue:317`), with
+through nobody. `onKeyDown` now sends both (`MobileKeyboard.vue:329`), with
 its default prevented; a `keyCode` 229 one stays the IME's, editing its own
 composition.
 
 ⚠️ **A paste has one owner too** (#2910). Two `paste` listeners sit on
 `window`: the files drawer's `onWindowPasteForDrawer`
 (`RemoteControl.vue:3471`), registered at mount (`:5714`), and the deferred
-Ctrl+V's `onPaste` (`useRemoteControl.ts:12415`), registered later by
+Ctrl+V's `onPaste` (`useRemoteControl.ts:12423`), registered later by
 `attachInput` (`:12006`). Same node, same phase, so the drawer's runs
 **first** — and `preventDefault` stops no other listener on the same node.
 With the drawer open, a Ctrl+V over the stage with files on the clipboard
 uploaded every file twice: into the drawer's directory, then again into the
 default folder. Now each half steps aside for the other: `drawerPasteFiles`
-(`useRemoteControl.ts:15063`) returns nothing for a paste already consumed,
+(`useRemoteControl.ts:15078`) returns nothing for a paste already consumed,
 and `routeDeferredPaste` (`:14427`) answers `taken` for one the drawer
 consumed — the deferred chord is dropped, with no keystroke and no second
 upload (`:11843`). Whichever listener runs first owns the paste, so a future
@@ -2789,7 +2799,7 @@ sequenceDiagram
 
 | Piece | What it does | Where |
 |---|---|---|
-| the message | `{t: 'rc:decode-error', stage, path, codec, error}`: `stage` is `configure` (the decoder's `configure()`), `decode` (its error callback, or `decode()` throwing) or `pipe` (the RTP transform's reader or pipe); `path` is `webcodecs`, `vp9-444` or `hevc`; the codec and the message are cut to 64 and 160 characters | `decodeErrorWireMessage`, `ui/src/composables/useRemoteControl.ts:2518`; sent by `reportDecodeError` (`:7474`) from all three worker handlers |
+| the message | `{t: 'rc:decode-error', stage, path, codec, error}`: `stage` is `configure` (the decoder's `configure()`), `decode` (its error callback, or `decode()` throwing) or `pipe` (the RTP transform's reader or pipe); `path` is `webcodecs`, `vp9-444` or `hevc`; the codec and the message are cut to 64 and 160 characters | `decodeErrorWireMessage`, `ui/src/composables/useRemoteControl.ts:2518`; sent by `reportDecodeError` (`:7479`) from all three worker handlers |
 | the counted marker | every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts and a zero is a measured one | `useRemoteControl.ts:2493`; read by `viewer_counts_decode_errors`, `agents/roomlerd/src/peer.rs:10533` |
 | the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:11062`; `viewer_decode_error`, `peer.rs:10508` |
 | the count | per session, saturating; `None` until the viewer counts, so absent means **not counted**; carried to a new peer when a re-offer replaces one, as the clipboard tallies are | `SessionCounters::note_decode_error` / `decode_errors` / `carry_decode_errors`, `agents/roomlerd/src/session_telemetry.rs:162` |
@@ -2827,7 +2837,7 @@ stateDiagram-v2
 | the decision | Whether this failure recovers. Before the first frame it does not: the page bans the transport and renegotiates, because the browser's probe was wrong. Past 3 rebuilds in 10 s it does not: a stream this decoder cannot take fails again on every key frame | `createDecodeRecovery`, `ui/src/workers/rc-decode-recovery.ts:76` |
 | the rebuild | A new decoder, configured as the old one was, and one `request-keyframe` at once. `reset()` is not an option, because the error already closed the codec and `reset()` then throws. The leading-delta gate drops deltas and keeps asking until the key frame lands | `rebuildDecoder`, `ui/src/workers/rc-vp9-444-worker.ts:512`, `ui/src/workers/rc-hevc-worker.ts:530` |
 | both failure routes | The decoder's error callback and `decode()` throwing go through one function. Without recovery each still posts its old message | `onDecoderFailure`, `rc-vp9-444-worker.ts:539`, `rc-hevc-worker.ts:557` |
-| the page | `decode-recovering` sends the same `rc:decode-error` as §11.10 and leaves the path up, so the agent's count still counts every error. `decode-recovered` logs the outage's length: `[rc] vp9-444 decode recovered in N ms, attempts K` | `useRemoteControl.ts:8323`, `:8631` |
+| the page | `decode-recovering` sends the same `rc:decode-error` as §11.10 and leaves the path up, so the agent's count still counts every error. `decode-recovered` logs the outage's length: `[rc] vp9-444 decode recovered in N ms, attempts K` | `useRemoteControl.ts:8328`, `:8636` |
 | a chunk gap | The deltas behind a gap reference the frame it lost, so on the default ordered channel the gap also re-arms the gate, on the same decoder. Before R1 they were decoded, painting garbage until the IDR landed, or failing the decoder. ⚠️ Not on the unordered opt-in (`roomler-rc-unordered-video=1`): a lost packet there kills its chunk, which is routine, and at 1 % loss a key frame rarely survives whole, so a gate waiting for one would freeze a picture that today keeps moving. The switch below turns it off too (`gapClosesGate`) | `rc-vp9-444-worker.ts:489`, `rc-hevc-worker.ts:507` |
 | the watchdog | Once a data-channel path has decoded a frame, only its frames count as progress: RTP bytes on the silent m-section must not hold off a re-create while the canvas is frozen. Before that frame RTP still counts, because the viewer opens its channel speculatively and an agent that ignores it sends RTP | `mediaAdvanced`, `useRemoteControl.ts:676` |
 
@@ -2992,7 +3002,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:9284`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:9289`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark
@@ -3750,10 +3760,10 @@ to-activate, so the browser never sees a bait-and-switch.
   together therefore both failed. The field saw it 9 ms apart, and a drop
   while a long upload runs does the same. Every upload source ends in
   `uploadOne`, so it takes a place in the session's queue there
-  ([`useRemoteControl.ts:13077`](../ui/src/composables/useRemoteControl.ts#L13077),
-  `createUploadQueue` at `useRemoteControl.ts:15095`). The transfer shows
+  ([`useRemoteControl.ts:13085`](../ui/src/composables/useRemoteControl.ts#L13085),
+  `createUploadQueue` at `useRemoteControl.ts:15110`). The transfer shows
   as `queued` at once, and its `files:begin` waits until every earlier
-  upload has settled (`useRemoteControl.ts:13327`). ⚠️ The next place
+  upload has settled (`useRemoteControl.ts:13335`). ⚠️ The next place
   waits for this one's turn AND its settle.
   So an upload cancelled while queued cannot let the one behind it start
   while an earlier one is still on the wire.
@@ -3762,10 +3772,10 @@ to-activate, so the browser never sees a bait-and-switch.
   outside the active user's profile (FR-84 D4), a path that is not a
   directory, or the agent's own state. It says why only in its own log. The
   viewer learns of the fallback from the completed `path`
-  (`uploadLandedIn`, `useRemoteControl.ts:15130`, which compares whole segments:
+  (`uploadLandedIn`, `useRemoteControl.ts:15145`, which compares whole segments:
   `/tmp/x` does not hold `/tmp/xy`). A file that landed outside the folder
   the person chose is a warning that names where it went
-  (`uploadOutcomeMessage`, `useRemoteControl.ts:15153`), not "Uploaded".
+  (`uploadOutcomeMessage`, `useRemoteControl.ts:15168`), not "Uploaded".
 - **Remote Apps on the control DC** (FR-56, [`remote-apps.md`](remote-apps.md)):
   `rc:apps.list` / `rc:apps.focus` / `rc:apps.launch` and their `*.reply`,
   id-correlated like `rc:logs-fetch`, handled off-thread in
@@ -3851,7 +3861,7 @@ to drop straight to VK_PACKET (which conhost ignores). Now
 - **FR-97 P3e, on both platforms:** `rc:layout.set` goes through the input
   arbiter, which refuses a session that may not type, and in exclusive mode
   anyone but the floor holder, as keep busy's switch does
-  (`agents/roomlerd/src/input/arbiter.rs:810`). Before, a view-only session
+  (`agents/roomlerd/src/input/arbiter.rs:874`). Before, a view-only session
   could switch the host's layout. And the current snapshot goes out once when
   the control DC opens (`agents/roomlerd/src/peer.rs:1272`): the emitter
   starts before the channel does, so the snapshot it starts with found no
@@ -4109,7 +4119,7 @@ from (`ui/src/workers/rc-decoder-config.ts:38`). The override wins over whatever
 | | |
 |---|---|
 | **Paths** | the three decode workers: `rc-vp9-444-worker` (VP9, AV1 and H.264 over the data channel), `rc-hevc-worker`, and `rc-webcodecs-worker` (the RTP transform; its flag rides the transform's options, because the transform can start before the canvas arrives). The `<video>` element has no such control and decodes true once the agent describes its stream (FR-130 P1) |
-| **Sessions** | every one, from every agent (`ui/src/composables/useRemoteControl.ts:11337`). Every agent so far converts with BT.601 limited, the oldest included. For VP9 this is the only fix: Chrome's WebCodecs ignores VP9's own colour space ([FR-130 §2.5](fr/FR-130-colours-decode-true.md#25-p0-what-chrome-does-with-each-description-2026-10-30)) |
+| **Sessions** | every one, from every agent (`ui/src/composables/useRemoteControl.ts:11342`). Every agent so far converts with BT.601 limited, the oldest included. For VP9 this is the only fix: Chrome's WebCodecs ignores VP9's own colour space ([FR-130 §2.5](fr/FR-130-colours-decode-true.md#25-p0-what-chrome-does-with-each-description-2026-10-30)) |
 | **Kill switch** | `localStorage.setItem('roomler-rc-colorspace', 'off')`, then reconnect (`ui/src/composables/useRemoteControl.ts:4307`). The decoders are no longer told, and the console says so at connect |
 | **A browser that refuses it** | keeps its picture (`ui/src/workers/rc-decoder-config.ts:93`). A `configure()` that throws on the colour space goes again without it. A decoder that fails before its first frame with it set is rebuilt once without it, and it waits for a key frame, which it asks the agent for. One console line names the case: `decoder colour space dropped (FR-130 P2)` |
 | **Reading it** | each worker's `decoder configured` line in the console names the colour space `configure()` was told, and its `first frame` line the one the decoder says it produced. With the override, that is `matrix=smpte170m primaries=bt709 transfer=iec61966-2-1 range=limited` |

@@ -172,6 +172,34 @@ describe('MobileKeyboard', () => {
       expect(text![0][0]).toBe('a')
     })
 
+    it.each([
+      ['1', 0x1e],
+      ['9', 0x26],
+      ['0', 0x27],
+      [' ', 0x2c],
+    ])('sticky Win then %j is a chord too, never plain text with the modifier lost (#3046)', async (ch, hid) => {
+      const w = mount(MobileKeyboard, { props: { open: true } })
+      await w.findAll('.mkb-btn').find((b) => b.text() === 'Win')!.trigger('pointerdown')
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      ta.value = ch
+      await w.find('textarea').trigger('input')
+      expect(w.emitted('key')).toEqual([
+        [hid, true, 0x08],
+        [hid, false, 0x08],
+      ])
+      expect(w.emitted('keyText')).toBeUndefined()
+    })
+
+    it('a symbol has no key on every layout: it stays text, and the modifier is spent', async () => {
+      const w = mount(MobileKeyboard, { props: { open: true } })
+      await w.findAll('.mkb-btn').find((b) => b.text() === 'Ctrl')!.trigger('pointerdown')
+      const ta = w.find('textarea').element as HTMLTextAreaElement
+      ta.value = '/'
+      await w.find('textarea').trigger('input')
+      expect(w.emitted('key')).toBeUndefined()
+      expect(w.emitted('keyText')).toEqual([['/']])
+    })
+
     it('sticky Ctrl tapped twice clears without firing', async () => {
       const w = mount(MobileKeyboard, { props: { open: true } })
       const ctrlBtn = w.findAll('.mkb-btn').find((b) => b.text() === 'Ctrl')
