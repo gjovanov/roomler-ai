@@ -1045,6 +1045,107 @@ mod process {
         );
     }
 
+    /// A recorder that dies during the remux leaves its temp beside the
+    /// destination and its partial whole. The retry refused that temp, and the
+    /// reconciler read the refusal as "nothing recoverable" and deleted the
+    /// partial: every fragment of a finished recording, gone (2026-11-02, on a
+    /// Windows guest, a fault during finalize on 0.4.197).
+    #[test]
+    fn a_recorder_that_died_during_the_remux_loses_nothing() {
+        let dir = scratch();
+        let mut r = spawn(dir.path());
+        r.wait_for("started", Duration::from_secs(30));
+        std::thread::sleep(Duration::from_millis(3500));
+        r.child.kill().unwrap();
+        let _ = r.child.wait();
+        let staging = dir.path().join(PARTIAL_DIR);
+        let partials = partials_in(&staging);
+        assert_eq!(partials.len(), 1);
+        let tmp = remux_temp_of(dir.path(), &partials[0]);
+        std::fs::write(&tmp, b"half a remux").unwrap();
+
+        let done = recorder::reconcile_partials(&staging, dir.path());
+        assert_eq!(
+            done.len(),
+            1,
+            "the partial was whole, so the file must exist"
+        );
+        let n = ProgressiveFile::open(&done[0])
+            .unwrap()
+            .samples(VIDEO_TRACK_ID)
+            .unwrap()
+            .len();
+        assert!(n >= 60, "every complete fragment survives ({n} frames)");
+        assert!(!tmp.exists(), "the dead remux's temp is gone");
+        assert_eq!(
+            std::fs::read_dir(&staging).unwrap().count(),
+            0,
+            "the partial and its lock are gone"
+        );
+    }
+
+    /// Only a partial that holds nothing may be removed. One this attempt could
+    /// not finalize (a full disk, a file another program holds) keeps its
+    /// recording for the next start.
+    #[test]
+    fn a_partial_that_could_not_be_finalized_now_is_kept() {
+        let dir = scratch();
+        let mut r = spawn(dir.path());
+        r.wait_for("started", Duration::from_secs(30));
+        std::thread::sleep(Duration::from_millis(3500));
+        r.child.kill().unwrap();
+        let _ = r.child.wait();
+        let staging = dir.path().join(PARTIAL_DIR);
+        let partials = partials_in(&staging);
+        assert_eq!(partials.len(), 1);
+        // A directory where the temp goes: no file can be created there.
+        let tmp = remux_temp_of(dir.path(), &partials[0]);
+        std::fs::create_dir(&tmp).unwrap();
+
+        let done = recorder::reconcile_partials(&staging, dir.path());
+        assert!(done.is_empty(), "nothing could be written: {done:?}");
+        assert_eq!(
+            partials_in(&staging),
+            partials,
+            "the partial is still there"
+        );
+
+        std::fs::remove_dir(&tmp).unwrap();
+        let done = recorder::reconcile_partials(&staging, dir.path());
+        assert_eq!(done.len(), 1, "and the next start finalizes it");
+    }
+
+    /// The other half of the rule above: a partial with no complete fragment
+    /// holds nothing, and it is removed rather than retried at every start.
+    #[test]
+    fn a_partial_that_holds_nothing_is_removed() {
+        let dir = scratch();
+        let staging = dir.path().join(PARTIAL_DIR);
+        std::fs::create_dir_all(&staging).unwrap();
+        let empty = staging.join(format!("empty.mp4{PARTIAL_SUFFIX}"));
+        std::fs::write(&empty, b"").unwrap();
+        let headerless = staging.join(format!("headerless.mp4{PARTIAL_SUFFIX}"));
+        std::fs::write(
+            &headerless,
+            [0u8, 0, 0, 24, b'f', b't', b'y', b'p', 1, 2, 3],
+        )
+        .unwrap();
+
+        let done = recorder::reconcile_partials(&staging, dir.path());
+        assert!(done.is_empty(), "there was nothing to finalize: {done:?}");
+        assert!(partials_in(&staging).is_empty(), "and nothing is kept");
+    }
+
+    /// Where the remux of `partial` puts its temp, in the recording's folder.
+    fn remux_temp_of(folder: &Path, partial: &Path) -> PathBuf {
+        let name = partial
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(PARTIAL_SUFFIX))
+            .unwrap();
+        folder.join(format!("{name}.remux-tmp"))
+    }
+
     fn partials_in(staging: &Path) -> Vec<PathBuf> {
         std::fs::read_dir(staging)
             .unwrap()

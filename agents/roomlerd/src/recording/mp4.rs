@@ -876,6 +876,20 @@ fn read_box_bytes<R: Read + Seek>(r: &mut R, b: &TopBox) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// The file itself shows there is nothing to recover: no `moov`, or no
+/// complete fragment. Any other error from [`finalize`] is that attempt
+/// failing, and the file may still hold the whole recording.
+#[derive(Debug)]
+pub struct NothingRecoverable(String);
+
+impl std::fmt::Display for NothingRecoverable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mp4: {}", self.0)
+    }
+}
+
+impl std::error::Error for NothingRecoverable {}
+
 /// Index a fragmented file written by [`FragmentedWriter`], stopping cleanly
 /// at the first incomplete fragment.
 pub fn read_fragmented(path: &Path) -> Result<FragmentedIndex> {
@@ -966,7 +980,10 @@ pub fn read_fragmented(path: &Path) -> Result<FragmentedIndex> {
         f.seek(SeekFrom::Start(end))?;
     }
     let moov = moov.ok_or_else(|| {
-        anyhow!("mp4: no moov — not a recording, or it died before its first keyframe")
+        anyhow::Error::new(NothingRecoverable(format!(
+            "no moov in {}: not a recording, or it died before its first keyframe",
+            path.display()
+        )))
     })?;
     Ok(FragmentedIndex {
         moov,
@@ -991,11 +1008,15 @@ pub struct FinalizeSummary {
 /// Remux the fragmented file at `partial` into a progressive, moov-first MP4
 /// at `dest` (written to a temp name beside it, synced, then renamed —
 /// never a half-written `dest`). The source is left in place; the caller
-/// removes it once it has what it needs.
+/// removes it once it has what it needs. The caller also holds the partial's
+/// lock, so a temp already there is a dead remux's and is overwritten.
 pub fn finalize(partial: &Path, dest: &Path) -> Result<FinalizeSummary> {
     let index = read_fragmented(partial)?;
     if index.fragments.is_empty() {
-        bail!("mp4: {} holds no complete fragment", partial.display());
+        return Err(anyhow::Error::new(NothingRecoverable(format!(
+            "{} holds no complete fragment",
+            partial.display()
+        ))));
     }
 
     // Per-track sample tables, chunked one chunk per fragment run.
@@ -1051,7 +1072,8 @@ pub fn finalize(partial: &Path, dest: &Path) -> Result<FinalizeSummary> {
     let result = (|| -> Result<u64> {
         let out = OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(true)
             .open(&tmp)
             .with_context(|| format!("mp4: cannot create {}", tmp.display()))?;
         let mut w = BufWriter::with_capacity(1 << 20, out);

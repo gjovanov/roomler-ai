@@ -971,8 +971,10 @@ fn finalize_into_place(partial: &Path, dest: &Path) -> Result<mp4::FinalizeSumma
 
 /// Finalize every partial a dead recorder left in `staging` (the boot
 /// reconciler): remux what is complete, mark it `interrupted`. Returns the
-/// finished paths. A partial with nothing recoverable is removed; one whose
-/// [`PartialLock`] is held belongs to a live recorder and is left alone.
+/// finished paths. Only a partial the file itself shows to be empty is removed
+/// ([`mp4::NothingRecoverable`]); one this attempt could not finalize stays for
+/// the next start, and one whose [`PartialLock`] is held belongs to a live
+/// recorder and is left alone.
 pub fn reconcile_partials(staging: &Path, dest_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(staging) else {
         return Vec::new();
@@ -1047,9 +1049,14 @@ pub fn reconcile_partials(staging: &Path, dest_dir: &Path) -> Vec<PathBuf> {
                 tracing::info!(file = %dest.display(), truncated = s.truncated, "recording: an interrupted recording was finalized");
                 done.push(dest);
             }
-            Err(e) => {
+            Err(e) if e.is::<mp4::NothingRecoverable>() => {
                 tracing::warn!(%e, partial = %p.display(), "recording: an interrupted partial holds nothing recoverable — removing it");
                 let _ = std::fs::remove_file(&p);
+            }
+            // ⚠️ Never removed on a failure of this attempt: the partial may
+            // hold the whole recording, and a full disk or a held file passes.
+            Err(e) => {
+                tracing::warn!(error = format!("{e:#}"), partial = %p.display(), "recording: an interrupted partial could not be finalized — kept for the next start");
             }
         }
     }
