@@ -11,16 +11,21 @@
 //! The probe spawns `current_exe()`, so THIS binary is the child: `main` plays
 //! one when it finds `ROOMLERD_CAPS_CHILD`, which is why the target is
 //! `harness = false`, with nothing in production code to swap the child out. The
-//! bounds are the real ones, so this takes about 5 minutes. It answers just
+//! bounds are the real ones, so this takes about 7 minutes. It answers just
 //! enough of libtest's command line for the integration lane to list it, run it
 //! and count it.
+//!
+//! A viewer asks for a session while the first try's child is running, so that try
+//! has to be lost, the child killed and the same row run again, a minute of quiet
+//! after the ask's own minute. Nothing else makes a real `rc:session.request` reach
+//! a real try.
 //!
 //! Its own binary because the answer is process-wide, as it is in the daemon.
 
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use roomler_ai_remote_control::models::{
     AgentCaps, ChromaFormat, VideoBackend, VideoCell, VideoCodec,
@@ -36,9 +41,34 @@ const NAME: &str = "a_slow_host_gains_its_hardware_with_no_restart";
 const BASE_TAKES: Duration = Duration::from_secs(70);
 /// Two children at 60 s each, then the software child, which answers at once.
 const FIRST_HELLO_WITHIN: Duration = Duration::from_secs(200);
-/// The first try's minute of waiting, [`BASE_TAKES`] and a heartbeat's 30 s, with
-/// room for a slow runner. On a build with no retry this runs out.
+/// From the first hello, a minute of waiting and a slow runner. On a build with no
+/// retry this runs out.
+const FIRST_TRY_WITHIN: Duration = Duration::from_secs(120);
+/// How far from the ask the same row can start again: the ask's own minute, then a
+/// minute with nothing going on. Not all of it, so that a slow tick cannot fail this.
+const AN_ASK_HOLDS_A_TRY: Duration = Duration::from_secs(100);
+/// Both of those minutes, [`BASE_TAKES`] and a heartbeat's 30 s, with room for a slow
+/// runner.
 const GAINED_WITHIN: Duration = Duration::from_secs(300);
+/// Where each `base` child writes when it started, one line of milliseconds.
+const STARTS_ENV: &str = "CAPS_PROBE_RETRY_TEST_STARTS";
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("a clock")
+        .as_millis()
+}
+
+/// When each `base` child started, in order.
+fn base_starts() -> Vec<u128> {
+    let path = std::env::var(STARTS_ENV).expect("set in main");
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect()
+}
 
 fn caps_of(hardware: bool) -> AgentCaps {
     let mut cells = vec![VideoCell::new(
@@ -70,6 +100,14 @@ fn be_the_probe_child() {
     let report = |caps: AgentCaps| serde_json::json!({ "caps": caps });
     match std::env::var("ROOMLERD_CAPS_PHASE").as_deref() {
         Ok("base") => {
+            use std::io::Write;
+            let mut starts = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(std::env::var(STARTS_ENV).expect("inherited"))
+                .expect("the starts file");
+            writeln!(starts, "{}", now_ms()).expect("a line");
+            drop(starts);
             std::thread::sleep(BASE_TAKES);
             println!("ROOMLER_CAPS_JSON:{}", report(caps_of(true)));
         }
@@ -125,6 +163,10 @@ fn main() -> ExitCode {
     unsafe {
         std::env::set_var("ROOMLERD_CAPS_CACHE", "0");
         std::env::set_var("ROOMLERD_AUTO_UPDATE", "0");
+        std::env::set_var(
+            STARTS_ENV,
+            std::env::temp_dir().join(format!("caps-probe-retry-{}", std::process::id())),
+        );
     }
     println!("\nrunning 1 test");
     let started = Instant::now();
@@ -223,6 +265,50 @@ async fn enrol(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> AgentC
     .expect("agent enrollment")
 }
 
+/// A viewer's `rc:session.request`, as far as the agent can tell. The socket is the
+/// caller's to hold, so that the session stays asked for.
+async fn a_viewer_asks(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    agent_id: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let token = seeded
+        .admin
+        .access_token
+        .replace('+', "%2B")
+        .replace('/', "%2F")
+        .replace('=', "%3D");
+    let url = format!("ws://{}/ws?token={token}", app.addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("a viewer's socket");
+    ws.send(Message::Text(
+        serde_json::json!({
+            "t": "rc:session.request",
+            "agent_id": agent_id,
+            "permissions": "VIEW",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("the ask");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout(Duration::from_secs(1), ws.next()).await
+        else {
+            continue;
+        };
+        if serde_json::from_str::<Value>(&text).is_ok_and(|v| v["t"] == "rc:session.created") {
+            return ws;
+        }
+    }
+    panic!("the server never took the ask");
+}
+
 /// The admin listing's row for the agent. `None` for anything but a JSON
 /// success: the per-IP limiter answers a fast poll with a 429 that is not JSON.
 async fn agent_row(app: &TestApp, seeded: &SeededTenant, agent_id: &str) -> Option<Value> {
@@ -319,6 +405,20 @@ async fn the_test() {
         })
     };
 
+    // The first try's child is up, so a session asks. Two `base` children ran in the
+    // first probe.
+    let waiting = Instant::now();
+    while base_starts().len() < 3 {
+        assert!(
+            waiting.elapsed() < FIRST_TRY_WITHIN,
+            "hardware, with no restart: no try's child within {FIRST_TRY_WITHIN:?}: {:?}",
+            base_starts()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let asked_at = now_ms();
+    let _viewer = a_viewer_asks(&app, &seeded, &id).await;
+
     let gained = wait_row(
         &app,
         &seeded,
@@ -332,6 +432,20 @@ async fn the_test() {
     assert!(
         !dropped.load(Ordering::SeqCst),
         "the connection dropped, so this may be a hello and not the heartbeat"
+    );
+
+    // That answer has to be from the row run again. The child the session stopped
+    // would otherwise have answered about 70 s after it started.
+    let starts = base_starts();
+    assert_eq!(
+        starts.len(),
+        4,
+        "the stopped try and the same row again: {starts:?}"
+    );
+    assert!(
+        starts[3].saturating_sub(asked_at) >= AN_ASK_HOLDS_A_TRY.as_millis(),
+        "a session asked at {asked_at}, and the next child started at {}",
+        starts[3]
     );
 
     // A host short of time says why, and stops saying it once it has an answer.

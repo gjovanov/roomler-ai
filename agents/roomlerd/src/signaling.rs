@@ -786,6 +786,20 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// #3280 — what a later caps try gives way to: a session on this device, a recording
+/// that outlives one, and a local recording, whose child opens the same encoders.
+fn live_on_this_host(
+    rc_sessions: crate::rc_sessions::RcSessionRegistry,
+) -> impl Fn() -> bool + Send + 'static {
+    move || {
+        #[cfg(feature = "recording")]
+        if crate::recording::manager::is_recording() {
+            return true;
+        }
+        !rc_sessions.is_empty()
+    }
+}
+
 /// Drive the signaling loop forever. Returns only on fatal error (e.g.
 /// auth rejection) or shutdown signal.
 /// B1 — the CURRENT connection's RTT-sample sink. Each overlay start
@@ -852,10 +866,7 @@ pub async fn run(
     let _ = tokio::task::spawn_blocking(crate::encode::caps::detect).await;
     // #3280 — a first answer that ran short of time gets more tries, off to one
     // side. It arms nothing on a healthy host, or in a second organization's loop.
-    crate::encode::caps::arm_retry({
-        let rc_sessions = rc_sessions.clone();
-        move || !rc_sessions.is_empty()
-    });
+    crate::encode::caps::arm_retry(live_on_this_host(rc_sessions.clone()));
     // Overlay "Disconnect" control → this channel → the connect_once
     // loop, which tears the session down (peer close + ClientMsg::Terminate).
     // Created once; the receiver is polled inside connect_once across
@@ -7466,6 +7477,26 @@ pub(crate) fn prompt_org(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3280 — a later caps try reads the registry the session pump writes.
+    #[test]
+    fn a_session_on_this_device_is_live_for_a_caps_try() {
+        let sessions = crate::rc_sessions::RcSessionRegistry::new();
+        let live = live_on_this_host(sessions.clone());
+        assert!(!live());
+        let (kill, _rx) = tokio::sync::mpsc::channel(1);
+        let session = bson::oid::ObjectId::new();
+        sessions.insert(
+            session,
+            "a viewer".to_string(),
+            "VIEW".to_string(),
+            String::new(),
+            kill,
+        );
+        assert!(live());
+        sessions.remove(&session);
+        assert!(!live());
+    }
 
     /// #2551 — a `ws.text` stage is refined to the message's wire tag, read
     /// straight from the JSON. Anything without a plain `t` gives `None`, and

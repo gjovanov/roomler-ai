@@ -172,7 +172,7 @@ A stored pick is held to the device again at connect, because the picker only gr
 what a person is about to choose. A choice also becomes this browser's default for
 every other device, and a per-device override outlives an agent losing a cell. The
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
-and telling nobody (`agents/roomlerd/src/signaling.rs:3524`), and the viewer ignores
+and telling nobody (`agents/roomlerd/src/signaling.rs:3535`), and the viewer ignores
 that track while it holds a DataChannel transport
 (`ui/src/composables/useRemoteControl.ts:9811`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
@@ -372,7 +372,7 @@ last one cost a Radeon laptop its RTX 5090's three NVENC cells and all four
 DataChannel transports for 4 h 22 min, and the viewer looked healthy throughout.
 So `base` announces every open (`ROOMLER_CAPS_PROGRESS:<name>:<chroma>`, and
 `ROOMLER_CAPS_PROGRESS:-` once it has ended, its teardown included), and the
-parent runs it again ([`run_base`](../agents/roomlerd/src/encode/caps.rs#L679)).
+parent runs it again ([`run_base`](../agents/roomlerd/src/encode/caps.rs#L756)).
 
 ```mermaid
 sequenceDiagram
@@ -472,7 +472,7 @@ acts on the host. A child stuck in a kernel call does not die until that call re
 a GPU driver hung in a kernel wait is the way to get there. Its stdout stays open while it
 or anything it started holds the write end, and that can outlive a child that exited
 cleanly, which `TIMEOUT` never bounded. So
-[`wait_for_child`](../agents/roomlerd/src/encode/caps.rs#L1578) waits for neither past the
+[`wait_for_child`](../agents/roomlerd/src/encode/caps.rs#L1651) waits for neither past the
 bound above and keeps what arrived by then, and the log says at WARN when it stopped reading
 before the pipe ended (`Run::cut_off`). The child stays behind, on a thread that reaps it if
 the call ever returns, and the log says so at ERROR. At most 4 can stay behind per start
@@ -494,7 +494,7 @@ something holds its pipe is a unit test with a real process on each OS.
   session on that host would run the same vendor's code in-process. With `h264` chosen it
   takes OpenH264 instead. With `av1` chosen it gets no video until #3279 lands: `av1_mf` is
   denied, an FFmpeg AV1 cell that opened still puts `av1` in `codecs`,
-  [`pick_best_codec`](../agents/roomlerd/src/encode/caps.rs#L4515) puts it first, and
+  [`pick_best_codec`](../agents/roomlerd/src/encode/caps.rs#L4729) puts it first, and
   `MfEncoder::new_av1` refuses. A report that came before the stuck child stops offering those
   cells, so the hello does not promise what a session is refused. Only a kill that landed
   within its bound keeps Media Foundation: a later kill on a thrashing host reads as "would
@@ -503,7 +503,7 @@ something holds its pipe is a unit test with a real process on each OS.
   in force as it is, so until #3279 that answer can still offer one a session is refused.
 - **A `444` or `gpu` child** costs those forms and names no cell. Only a fault's death counts
   as an answer about the host, and stays cached as it always was
-  ([`PhaseGaps::note`](../agents/roomlerd/src/encode/caps.rs#L883)). Anything else keeps the answer out of the cache
+  ([`PhaseGaps::note`](../agents/roomlerd/src/encode/caps.rs#L961)). Anything else keeps the answer out of the cache
   (`why_not_cached`), so the next start asks again: a hang, an answer lost to the bound, an OOM
   kill, an EDR's terminate, a child that could not start. An answer it printed stands however
   it ended afterwards, as `base`'s does. A host where the form really hangs pays that child's
@@ -521,7 +521,7 @@ thrashing at boot, an EDR scanning a driver DLL on its first load), and it then 
 child would have said until the next start, which on a server can be months away. So a first
 answer that ran short of time arms one thread that tries again by itself, with more time and
 no restart, never blocking the start or a live session
-([`arm_retry`](../agents/roomlerd/src/encode/caps.rs#L3131), #3280). A cache hit or a complete answer arms nothing, so a
+([`arm_retry`](../agents/roomlerd/src/encode/caps.rs#L3337), #3280). A cache hit or a complete answer arms nothing, so a
 healthy host runs none of this. `signaling::run` is what arms it, once per process however
 many organizations it serves, and `roomlerd caps` never does.
 
@@ -543,7 +543,7 @@ sequenceDiagram
     W->>S: next heartbeat carries the new caps, same connection
 ```
 
-**What counts as out of time** ([`Shortfall`](../agents/roomlerd/src/encode/caps.rs#L838)):
+**What counts as out of time** ([`Shortfall`](../agents/roomlerd/src/encode/caps.rs#L916)):
 
 | How the probe ended | Reads as | A try? |
 |---|---|---|
@@ -558,7 +558,7 @@ sequenceDiagram
 | A `444` or `gpu` child hung or was cut off | out of time: short by those forms | **yes** |
 | A child that would not die | out of time: short by the Media Foundation cells, whatever else it left | **yes** |
 
-**The table** ([`LADDER`](../agents/roomlerd/src/encode/caps.rs#L2854)). Each try is a whole probe, `base` and then `444`
+**The table** ([`LADDER`](../agents/roomlerd/src/encode/caps.rs#L2927)). Each try is a whole probe, `base` and then `444`
 and `gpu`, because its answer has to stand alone. A later try has an answer in force to fall
 back on, so it runs no software child.
 
@@ -571,24 +571,33 @@ back on, so it runs no software child.
 | 4 | 6 h | 8 min | 80 s | 12 min |
 | 5 | 24 h | 8 min | 80 s | 12 min |
 
-**What stops it** ([`weigh`](../agents/roomlerd/src/encode/caps.rs#L2939), [`climb`](../agents/roomlerd/src/encode/caps.rs#L2977)): an answer with no
+**What stops it** ([`weigh`](../agents/roomlerd/src/encode/caps.rs#L3033), [`climb`](../agents/roomlerd/src/encode/caps.rs#L3071)): an answer with no
 shortfall, which is the normal end; a try that ends short for a reason other than time; the
 same named cell running out of time again, which is the signature of a real hang, and another
 try could hold the GPU for minutes on a host someone may be using; the end of the table; the
 kill switch; the process ending. The same-cell rule has a cost: a host that needs more than
-2 min for one open loses that one cell until the next start.
+2 min for one open loses that one cell until the next start. A complete answer that left out a
+form in force stops nothing: it is dropped, and the climb goes on with what the last one was short
+by, because a `gpu` child that answered nothing, or an open that came back as software under load,
+may answer next time. Two ways to run out of time arm nothing, both narrow: the software child
+hanging after `base` gave up for another reason, and a named cell whose child died with its pipe
+cut off, twice, which is denied as a death and not for want of time.
 
 **Never stacked, and a learned deny holds.** A child that would not die is counted until the
 call it is stuck in returns, and no try starts while one is, so the table's clock stops
-([`quiet`](../agents/roomlerd/src/encode/caps.rs#L2890)). One that never comes back means no more tries, which is right:
+([`quiet`](../agents/roomlerd/src/encode/caps.rs#L2963)). One that never comes back means no more tries, which is right:
 the driver has not recovered. A try whose own child would not die starts no more children, because
 they could only pile onto the same driver; a first probe has no answer to fall back on, so it goes
 on. Each try hands its children their own list
-([`list_for_a_try`](../agents/roomlerd/src/encode/caps.rs#L2897)): everything learned except what is there only for want of
+([`list_for_a_try`](../agents/roomlerd/src/encode/caps.rs#L2970)): everything learned except what is there only for want of
 time. A fault's deny and a double kill's stay on it. It goes to the child directly, so the
 daemon's list never relaxes while a cell is being tested, and a session keeps honouring the list
 in force. A fault a try confirms joins the daemon's list at once, whatever becomes of that try's
-answer, and so do the Media Foundation cells when a try's child would not die.
+answer. The answer in force then stops offering that form and says why, and every row hears of it
+within a beat (`withdraw_refused`), because a session would otherwise pick a codec its open is
+refused, and an RTP track binds to its codec first. That form is all a fault costs: what the same
+try lost for want of time stays in force, and a later answer that cannot hold the form can still go
+in.
 
 **The Media Foundation deny comes back the same way.** It is marked as out of time
 (`LearnedDeny::timed_out`), so it is off the next try's list, and that try can only start once
@@ -602,10 +611,11 @@ nothing has produced a stuck child in the field.
 
 - `detect()` never waits for a try. It reads the answer in force.
 - No try starts while a session is live, a recording that outlives one included
-  (`RcSessionRegistry`), or within a minute of a session asking, and the clock stops for that too.
+  (`RcSessionRegistry`), beside a local recording, whose child opens the same encoders, or within
+  a minute of a session asking, and the clock stops for that too.
   Whatever held it back, a try then owes a minute with nothing going on (`after_a_look`), however
   long ago that session asked: it may only just have ended, and its viewer may be reloading the page.
-- **A session stops a try.** [`session_asked`](../agents/roomlerd/src/encode/caps.rs#L2879) runs when `rc:session.request`
+- **A session stops a try.** [`session_asked`](../agents/roomlerd/src/encode/caps.rs#L2952) runs when `rc:session.request`
   arrives, before the consent prompt and ahead of the delegation to a Mac's GUI worker, which is
   earlier than the registry can say: a session enters that only after its peer is built and its
   pump has started. It runs again at the session's offer, because a consent wait can outlast the
@@ -614,6 +624,12 @@ nothing has produced a stuck child in the field.
 - **An answer is adopted only with nothing live.** The GPU-input lists and the deny list decide
   what an encoder open may do, and a session that opened its capture under one list must not
   rebuild its encoder under another.
+- **A stuck child does not take Media Foundation from under one.** A first probe's child that would
+  not die costs those cells at once, with nothing live to touch. A try's waits for nothing to be live
+  (`hold_media_foundation_back`): a live session's encoder may rebuild at the next change of size,
+  and a refusal there is no video, where the open has so far been fine beside that child. It is a
+  level, so a child that came back first costs nothing. When the cells go, the answer in force stops
+  offering them, as for a fault. A second session starting beside the first can still open them.
 
 Stopping the child, rather than letting it run beside the session, is deliberate. This host is
 slow by definition, so at the top of the table a session could share the GPU with a child for about
@@ -625,15 +641,17 @@ be seconds, and a child stuck in a kernel call cannot be stopped at all.
 
 ⚠️ **A delegated session is not in the root daemon's registry.** On a supervised Mac it stops a
 try when it asks, and a try can start a minute later while it is live. That needs a Mac whose first
-probe ran out of a minute, on a probe that takes about 120 ms there.
+probe ran out of a minute, on a probe that takes about 120 ms there. The GUI worker climbs too, on
+its own answer and for its own sessions; that answer is not on the wire.
 
-**What adopting changes** ([`adopt`](../agents/roomlerd/src/encode/caps.rs#L3085)). An answer is adopted when it keeps every
-form in force and has no shortfall or has more forms, or when the try confirmed a new fault in a
-form in force. So a try cannot take a form from a host, except for a fault. A try that loses to the
-answer in force is dropped. It moves the fields a cache hit takes (`take_probed_fields`), plus
-`probe_ms`, `probe_cached`, `unavailable["encoder-cells"]`, the learned list, the IDR verdict and
-the GPU-input lists, in that order for the lists: list first, answer second, generation last. The
-config-derived words stay as they are. The GPU-input lists are an `RwLock` rather than a
+**What adopting changes** ([`adopt`](../agents/roomlerd/src/encode/caps.rs#L3292)). An answer is adopted when it keeps every
+form in force, with hardware still hardware, and has no shortfall or has more forms. So a try
+cannot take a form from a host: what a fault costs has already left the answer in force. A try that
+loses to the answer in force is dropped. It moves the fields a cache hit takes
+(`take_probed_fields`), plus `probe_ms`, `probe_cached`, `unavailable["encoder-cells"]`, the learned
+list and the GPU-input lists, in that order for the lists: list first, answer second, generation
+last. The IDR verdict moves only if this process has none yet, because that one is first writer
+wins. The config-derived words stay as they are. The GPU-input lists are an `RwLock` rather than a
 `OnceLock` for this: a first answer installs even an empty list, so a later one could never have got
 in.
 
@@ -665,8 +683,9 @@ denied. `roomlerd caps` prints `learned_deny:`. The hello carries it in
 `agents.capabilities` sees it with no server change, and
 `scripts/fr97-caps-census.sh` counts it. With no cell to name and an answer short of time, the
 same key says code `probe-short`, so a host with no hardware says why instead of looking like it
-has none, and the word goes when a later try answers. No viewer asks for that key, so the person
-at the viewer is still told nothing.
+has none. The word goes when a later try answers, and once the table is done with no answer it says
+that the next start is what is left. No viewer asks for that key, so the person at the viewer is
+still told nothing.
 
 ## Selection at session time
 
@@ -1090,7 +1109,7 @@ colour-manages by primaries and transfer (FR-130 §2.5).
 | openh264, recording | its own VUI and the MP4 `colr` box, unchanged since FR-85 | SMPTE 170M at limited range |
 
 A vendor runtime that refuses the description opens the encoder without it rather than failing the open.
-While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:3348`).
+While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:3562`).
 
 **Which lever reaches which path:**
 
@@ -1129,7 +1148,7 @@ source's CSS values.
 | `encoder_cells_deny` | `ROOMLERD_ENCODER_CELLS_DENY` | the built-in list | `name:chroma` cells never opened nor advertised; `none` = deny nothing; a cell the probe learned stays denied on top of it; pushable through remote config (`MANAGE_AGENTS`), `needs_restart`. On a supervised Mac the session's encoders open in the GUI worker, which reads the person's config, so the root's effective value is handed to it at spawn (FR-43, `WORKER_ENV_FORWARD`, from 0.4.155); before that a root-side deny bound the probe and the hello but not the worker's sessions |
 | `caps_cache` | `ROOMLERD_CAPS_CACHE` | on | the probe cache (read and write) |
 | `caps_learn_deny` | `ROOMLERD_CAPS_LEARN_DENY` | on | a dead `base` child costs the cell it died in ([above](#a-dead-child-costs-the-cell-it-died-in)); off = one child, and its death means no hardware. A change is a knob change, so the next start re-probes. Not pushable through remote config |
-| `caps_probe_retry` | `ROOMLERD_CAPS_PROBE_RETRY` | on | a first answer short of time gets more tries by itself, with no restart ([above](#a-host-that-ran-out-of-time-gets-another-try)); off = it stands until the next start, and the word `probe-short` is not said. Read at each try. Not pushable through remote config |
+| `caps_probe_retry` | `ROOMLERD_CAPS_PROBE_RETRY` | on | a first answer short of time gets more tries by itself, with no restart ([above](#a-host-that-ran-out-of-time-gets-another-try)); off = no try, so it stands until the next start, and the word `probe-short` is not said. That is all it turns off: a stuck child's Media Foundation deny and the `444` and `gpu` answers that stand however their child ended answer to `caps_learn_deny`. Read once, at start. Not pushable through remote config |
 | `zero_copy` | `ROOMLERD_ZERO_COPY` | off | GPU-resident frames: the SystemContext DXGI arm and the WGC arm keep frames on the GPU, and a proven QSV or NVENC cell takes them; on macOS the display stream's IOSurfaces go to a proven VideoToolbox cell ([above](#gpu-resident-frames-the-input-path-fr-118)). On a supervised Mac the root's value is handed to the GUI worker at spawn (`WORKER_ENV_FORWARD`, from FR-118 P5) |
 | `zero_copy_deny` | `ROOMLERD_ZERO_COPY_DENY` | unset | `name:gpu` GPU-input forms never opened, by the probe or a session; `none` = deny nothing. Handed to a supervised Mac's GUI worker as `zero_copy` is. Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`, passed on unread like the other denylists; a blank push clears it (FR-132 P1, [remote-config.md](remote-config.md)). `zero_copy` itself is not pushable |
 | `color_description` | `ROOMLERD_COLOR_DESCRIPTION` | on | every encoder writes the colour description its input was converted with (BT.601 matrix, BT.709 primaries, sRGB transfer, limited range: `encode::color_desc::DESCRIPTION`, [FR-130](fr/FR-130-colours-decode-true.md)), and the hello says `color-described`; `false` writes the undescribed stream of earlier agents. Read at every encoder open, so a restart applies it; the probe and recorder children, a hand-run `roomlerd record`, `encoder-smoke` and the recording editor's `media export` follow it (the export reads the config file only where the person running it can read it), and a supervised Mac's GUI worker gets the root's value (`WORKER_ENV_FORWARD`). Pushable through remote config (`MANAGE_AGENTS`), `needs_restart`: a push of `off` or `on` sets it, and a blank one clears it back to on (FR-130 P1b, [remote-config.md](remote-config.md)). Not every encoder can carry it: `vp9_qsv` and `vp9_vaapi` (FFmpeg writes none), Microsoft's MF encoders (they ignore the attributes), and `h264_amf`'s matrix (AMD's H.264 runtime writes 2) |

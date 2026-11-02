@@ -477,7 +477,7 @@ mod child {
     /// a wait with no bound. So those cells go too, for this process, whichever
     /// child it was. Not for a child whose kill landed within its bound: a merely
     /// slow host keeps them.
-    fn media_foundation_denies() -> Vec<LearnedDeny> {
+    pub(super) fn media_foundation_denies() -> Vec<LearnedDeny> {
         MF_IN_THE_DAEMON
             .iter()
             .map(|name| LearnedDeny {
@@ -489,21 +489,98 @@ mod child {
             .collect()
     }
 
-    /// #3280 — a child stuck after the report left an answer offering what a session
-    /// is now refused, and an RTP track binds to its codec before the encoder opens.
-    /// Nothing here when the report was made without them.
-    fn withdraw_media_foundation(caps: &mut AgentCaps) {
-        caps.video_cells
-            .retain(|c| c.backend != VideoBackend::MediaFoundation.wire());
-        caps.hw_encoders.retain(|h| !h.starts_with("mf-"));
-        let cells = &caps.video_cells;
+    /// The label the legacy `hw_encoders` knows a cell by.
+    fn legacy_label(name: &str) -> String {
+        match name {
+            cells::MF_H264 => "mf-h264-hw".to_string(),
+            cells::MF_HEVC => "mf-h265-hw".to_string(),
+            cells::MF_AV1 => "mf-av1-hw".to_string(),
+            cells::LIBVPX_VP9 => "libvpx-vp9-444-sw".to_string(),
+            ffmpeg => format!("ffmpeg-{ffmpeg}"),
+        }
+    }
+
+    /// #3280 — an answer stops offering what `list` denies, and everything that says
+    /// so goes with it: a child stuck after its report, or a later try that found what
+    /// the answer in force still offers. An RTP track binds to its codec before the
+    /// encoder opens, so an offer a session is then refused costs it its video.
+    /// Nothing here for what the answer was made without.
+    ///
+    /// A `base` child opens 4:2:0, and only a cell that has it is asked about 4:4:4,
+    /// so losing that loses the cell, as the next answer would. libvpx opens each on
+    /// its own.
+    pub(super) fn withdraw(caps: &mut AgentCaps, list: &[LearnedDeny]) {
+        let before = caps.video_cells.clone();
+        for deny in list {
+            let Some((name, chroma)) = deny.cell.split_once(':') else {
+                continue;
+            };
+            for cell in caps
+                .video_cells
+                .iter_mut()
+                .filter(|c| format!("{}_{}", c.codec, c.backend) == name)
+            {
+                if chroma == ChromaFormat::Yuv420.wire() && name != cells::LIBVPX_VP9 {
+                    cell.chroma.clear();
+                } else {
+                    cell.chroma.retain(|c| c != chroma);
+                }
+            }
+        }
+        caps.video_cells.retain(|c| !c.chroma.is_empty());
+        let left = caps.video_cells.clone();
+        let has = |name: &str, chroma: Option<&str>| {
+            left.iter().any(|c| {
+                format!("{}_{}", c.codec, c.backend) == name
+                    && chroma.is_none_or(|want| c.chroma.iter().any(|c| c == want))
+            })
+        };
+        // The label is enumeration's, so it can stand with no cell behind it.
+        for name in list.iter().filter_map(|d| d.cell.split(':').next()) {
+            if !has(name, None) {
+                let label = legacy_label(name);
+                caps.hw_encoders.retain(|h| *h != label);
+            }
+        }
+        if left == before {
+            return;
+        }
+        let ffmpeg = |codec: VideoCodec| {
+            left.iter().any(|c| {
+                c.codec == codec.wire()
+                    && ![
+                        VideoBackend::MediaFoundation.wire(),
+                        VideoBackend::Openh264.wire(),
+                        VideoBackend::Libvpx.wire(),
+                    ]
+                    .contains(&c.backend.as_str())
+            })
+        };
+        let yuv444 = ChromaFormat::Yuv444.wire();
+        caps.transports.retain(|t| match t.as_str() {
+            "data-channel-hevc" => ffmpeg(VideoCodec::Hevc),
+            "data-channel-av1" => ffmpeg(VideoCodec::Av1),
+            "data-channel-h264" => ffmpeg(VideoCodec::H264),
+            "data-channel-vp9-444" => has(cells::LIBVPX_VP9, Some(yuv444)),
+            _ => true,
+        });
+        if !ffmpeg(VideoCodec::Hevc) {
+            caps.hevc_chroma.clear();
+        }
+        if !has("hevc_nvenc", Some(yuv444)) {
+            caps.hevc_chroma.retain(|c| c != yuv444);
+        }
+        if !caps.transports.iter().any(|t| t == "data-channel-vp9-444") {
+            caps.vp9_chroma.clear();
+        }
+        // A codec goes when its last cell does, and not for having had none.
         caps.codecs.retain(|codec| {
             let wire = if codec == "h265" {
                 VideoCodec::Hevc.wire()
             } else {
                 codec.as_str()
             };
-            cells.iter().any(|c| c.codec == wire)
+            !before.iter().any(|c| c.codec == wire) || left.iter().any(|c| c.codec == wire)
         });
     }
 
@@ -828,8 +905,9 @@ mod child {
         /// Read on every 50 ms poll of a child. True = a session asked, so the
         /// child is told to die and the probe ends where it is.
         pub(super) stop: &'a dyn Fn() -> bool,
-        /// The answer the device starts on, which takes the software child when
-        /// `base` leaves nothing ([`run_software`]).
+        /// The answer the device starts on, with nothing live: it takes the software
+        /// child when `base` leaves nothing ([`run_software`]), and a stuck child costs
+        /// Media Foundation at once ([`stuck_reaches_the_daemon`]).
         pub(super) first: bool,
     }
 
@@ -1135,13 +1213,8 @@ mod child {
             }
         }
 
-        if !MF_IN_THE_DAEMON.is_empty()
-            && media_foundation_denies()
-                .iter()
-                .all(|d| learned.iter().any(|l| l.cell == d.cell))
-        {
-            withdraw_media_foundation(&mut report.caps);
-        }
+        // A child stuck after the report left it offering what a session is refused.
+        withdraw(&mut report.caps, &learned);
 
         // The whole cost the daemon paid: every spawn, every open, every parse.
         report.caps.probe_ms =
@@ -1273,7 +1346,9 @@ mod child {
                          most likely stuck in a kernel call in a driver, and stays until that \
                          call returns. Going on without it; the daemon is unaffected."
                     );
-                    stuck_reaches_the_daemon();
+                    if this.first {
+                        stuck_reaches_the_daemon();
+                    }
                 }
                 return Some(Run {
                     ending: Ending::Hung { gone },
@@ -1290,9 +1365,6 @@ mod child {
                     "caps probe: a session asked for this host, so this try's child was told to \
                      stop"
                 );
-                if !gone {
-                    stuck_reaches_the_daemon();
-                }
                 return Some(Run {
                     ending: Ending::Stopped { gone },
                     stdout,
@@ -1332,8 +1404,9 @@ mod child {
     }
 
     /// #3280 — the daemon's own list takes [`media_foundation_denies`] the moment a
-    /// child is known to be stuck: a session may be about to open them, and neither
-    /// a first probe nor a later try has got as far as an answer.
+    /// first probe's child is known to be stuck: nothing is live yet, and a session
+    /// may be about to open them. A later try's waits for nothing to be live
+    /// ([`super::hold_media_foundation_back`]).
     fn stuck_reaches_the_daemon() {
         if cells::learning_enabled() {
             cells::join_learned(media_foundation_denies());
@@ -2898,19 +2971,39 @@ fn list_for_a_try(list: &[super::cells::LearnedDeny]) -> Vec<super::cells::Learn
     list.iter().filter(|d| !d.timed_out).cloned().collect()
 }
 
-/// Every form an answer advertises, by the denylists' spellings.
-fn forms_of(caps: &AgentCaps, gpu_input: &[String]) -> std::collections::BTreeSet<String> {
-    let mut forms: std::collections::BTreeSet<String> = caps
+/// Every form an answer advertises, by the denylists' spellings, and whether it is
+/// hardware. A GPU-input form counts only beside its cell: with no cell, no child is
+/// asked about it.
+fn forms_of(caps: &AgentCaps, gpu_input: &[String]) -> std::collections::BTreeMap<String, bool> {
+    let mut forms: std::collections::BTreeMap<String, bool> = caps
         .video_cells
         .iter()
         .flat_map(|c| {
             c.chroma
                 .iter()
-                .map(move |chroma| format!("{}_{}:{chroma}", c.codec, c.backend))
+                .map(move |chroma| (format!("{}_{}:{chroma}", c.codec, c.backend), c.hw))
         })
         .collect();
-    forms.extend(gpu_input.iter().map(|name| format!("{name}:gpu")));
+    forms.extend(
+        gpu_input
+            .iter()
+            .filter(|name| {
+                caps.video_cells
+                    .iter()
+                    .any(|c| format!("{}_{}", c.codec, c.backend) == **name)
+            })
+            .map(|name| (format!("{name}:gpu"), true)),
+    );
     forms
+}
+
+/// `has` offers everything `had` does, and hardware stayed hardware.
+fn keeps(
+    had: &std::collections::BTreeMap<String, bool>,
+    has: &std::collections::BTreeMap<String, bool>,
+) -> bool {
+    had.iter()
+        .all(|(form, hw)| has.get(form).is_some_and(|now| *now || !*hw))
 }
 
 /// #3280 — what one try means for the next.
@@ -2933,13 +3026,13 @@ struct Verdict {
 /// #3280 — whether a try's answer replaces the one in force, and what comes next.
 /// Pure, so every row and every stop is a test with no child in it.
 ///
-/// A try cannot take a form from a host, except for a fault: an answer is adopted
-/// when it keeps everything in force and has no shortfall or has more, or when it
-/// confirmed a new fault in a form in force, which no session can be left to find.
+/// A try cannot take a form from a host: an answer is adopted when it keeps everything
+/// in force and has no shortfall or has more. What a fault costs has already left the
+/// answer in force by the time this reads it ([`withdraw_refused`]), so it costs that
+/// form, and it does not stand in the way of a later answer that cannot hold it.
 fn weigh(
     in_force: &AgentCaps,
     in_force_gpu: &[String],
-    denied_before: &[super::cells::LearnedDeny],
     last: &child::Shortfall,
     got: &child::Probed,
 ) -> Verdict {
@@ -2952,13 +3045,14 @@ fn weigh(
     let adopt = got.report.as_ref().is_some_and(|report| {
         let had = forms_of(in_force, in_force_gpu);
         let has = forms_of(&report.caps, &report.gpu_input);
-        let new_fault = got.learned.iter().any(|d| {
-            d.confirmed && had.contains(&d.cell) && !denied_before.iter().any(|b| b.cell == d.cell)
-        });
-        new_fault || (had.is_subset(&has) && (got.short.is_none() || has.len() > had.len()))
+        keeps(&had, &has) && (got.short.is_none() || has.len() > had.len())
     });
     let next = match &got.short {
-        None if got.report.is_some() => Next::End("it answered"),
+        None if adopt => Next::End("it answered"),
+        // A form in force is missing, and nothing says why: a `gpu` child that answered
+        // nothing, an open that came back as software under load. The next one may
+        // answer, and what the last was short by still stands.
+        None if got.report.is_some() => Next::Climb(last.clone()),
         None => Next::End("it left no answer, and not for want of time"),
         // The signature of a real hang, and another try could hold the GPU for
         // minutes on a host someone may be using. The cost: a host that needs more
@@ -3003,7 +3097,9 @@ fn wait_quietly(owed: Duration, live: &impl Fn() -> bool) {
     while !owed.is_zero() {
         std::thread::sleep(RETRY_TICK);
         let since_ask = last_ask().map(|t| t.elapsed());
-        owed = after_a_look(owed, quiet(child::stuck_children(), live(), since_ask));
+        let (stuck, is_live) = (child::stuck_children(), live());
+        hold_media_foundation_back(stuck, is_live, true);
+        owed = after_a_look(owed, quiet(stuck, is_live, since_ask));
     }
 }
 
@@ -3019,25 +3115,39 @@ fn after_a_look(owed: Duration, quiet: bool) -> Duration {
     }
 }
 
-/// #3280 — one try: a whole probe on this rung's bounds and its own list. Its answer
-/// goes in only if nothing went live or asked meanwhile, and the cache's gate is
-/// the first probe's, with the key read before the probe started.
+/// #3280 — one try. Its answer goes in the cache by the first probe's gate, with the
+/// key read before the probe started.
 fn one_try(row: usize, last: &child::Shortfall, live: &impl Fn() -> bool) -> Next {
     use super::caps_cache as cache;
     if !retry_enabled() {
         return Next::End("ROOMLERD_CAPS_PROBE_RETRY is off");
     }
+    let spot = cache::enabled()
+        .then(cache::current_key)
+        .flatten()
+        .zip(cache::path())
+        .map(|(key, path)| (key, path, cache::now_unix()));
+    one_try_with(row, last, live, child::stuck_children(), spot, child::probe)
+}
+
+/// [`one_try`] with its reads as arguments: a whole probe on this rung's bounds and
+/// its own list. Its answer goes in only if nothing went live or asked meanwhile.
+fn one_try_with(
+    row: usize,
+    last: &child::Shortfall,
+    live: &impl Fn() -> bool,
+    stuck: u32,
+    spot: Option<(super::caps_cache::CacheKey, std::path::PathBuf, u64)>,
+    probe: impl FnOnce(&child::Try) -> child::Probed,
+) -> Next {
     let bounds = LADDER[row].bounds;
     // A session that asked before this read is caught here, and one after it by
     // `stop`, so none falls between the wait and the try.
     let asked = last_ask();
-    if !quiet(child::stuck_children(), live(), asked.map(|t| t.elapsed())) {
+    if !quiet(stuck, live(), asked.map(|t| t.elapsed())) {
         return Next::Again;
     }
     let stop = || last_ask() != asked || live();
-    let now = cache::now_unix();
-    let key = cache::enabled().then(cache::current_key).flatten();
-    let path = cache::path();
     let denied = list_for_a_try(&super::cells::learned());
     let started = Instant::now();
     tracing::warn!(
@@ -3046,18 +3156,20 @@ fn one_try(row: usize, last: &child::Shortfall, live: &impl Fn() -> bool) -> Nex
         denied = ?denied.iter().map(|d| d.cell.as_str()).collect::<Vec<_>>(),
         "caps probe: a later try starts, with more time"
     );
-    let mut got = child::probe(&child::Try {
+    let mut got = probe(&child::Try {
         bounds,
-        denied: denied.clone(),
+        denied,
         stop: &stop,
         first: false,
     });
     got.stopped |= stop();
+    // A fault it found is on the daemon's list already, whatever becomes of its answer.
+    withdraw_refused(true);
     let in_force_gpu = GPU_IN_FORCE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let verdict = weigh(&detect(), &in_force_gpu, &denied, last, &got);
+    let verdict = weigh(&in_force(), &in_force_gpu, last, &got);
     tracing::warn!(
         attempt = row + 1,
         elapsed_ms = started.elapsed().as_millis(),
@@ -3071,12 +3183,107 @@ fn one_try(row: usize, last: &child::Shortfall, live: &impl Fn() -> bool) -> Nex
     if verdict.adopt
         && let Some(report) = got.report
     {
-        if let (Some(key), Some(path)) = (key, path) {
+        if let Some((key, path, now)) = spot {
             store_answer(key, &path, now, &report, &got.learned, got.unanswered);
         }
         adopt(report, got.learned, got.short.as_ref());
     }
     verdict.next
+}
+
+/// The answer a try goes by. The first exists by the time one starts, so this asks
+/// [`detect`] for nothing.
+fn in_force() -> AgentCaps {
+    cached().unwrap_or_else(detect)
+}
+
+/// #3280 — the answer in force stops offering what the daemon's list now refuses,
+/// and says why, because a session would otherwise pick a codec its open is refused:
+/// an RTP track binds to it first. Every row hears of it within a beat, and nothing
+/// live is touched: its encoder is open, and the list is what a rebuild reads.
+fn withdraw_refused(tries_left: bool) {
+    let learned = super::cells::learned();
+    let Some(was) = cached().filter(|_| !learned.is_empty()) else {
+        return;
+    };
+    let mut now = was.clone();
+    child::withdraw(&mut now, &learned);
+    now.unavailable.remove(LEARNED_WORD);
+    let short = tries_left.then(child::Shortfall::default);
+    let now = with_learned_word(now, &learned, short.as_ref());
+    if offered_forms(&now) != offered_forms(&was)
+        || now.unavailable.get(LEARNED_WORD) != was.unavailable.get(LEARNED_WORD)
+    {
+        tracing::warn!(
+            cells = now.video_cells.len(),
+            learned_deny = ?learned.iter().map(|l| l.cell.as_str()).collect::<Vec<_>>(),
+            "caps probe: the answer in force stops offering what is now refused"
+        );
+        install_late(now);
+    }
+}
+
+/// The forms an answer offers, for telling whether it changed.
+fn offered_forms(caps: &AgentCaps) -> std::collections::BTreeMap<String, bool> {
+    forms_of(caps, &[])
+}
+
+/// A later answer is in force. The generation last, so a heartbeat that sees it
+/// finds the new answer.
+fn install_late(answer: AgentCaps) {
+    *LATE_CAPS.write().unwrap_or_else(|e| e.into_inner()) = Some(answer);
+    CAPS_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// #3280 — a later try's child that would not die costs Media Foundation as a first
+/// probe's does, for the reason it does: what the daemon opens could hang the same
+/// way. But never from under a live session, whose encoder is open beside that child
+/// and may rebuild at the next change of size: a refusal there is no video, where the
+/// open has so far been fine. So this waits for nothing to be live, and it is a level,
+/// not an event: a child that came back meanwhile costs nothing. Returns whether the
+/// child's cost has been paid.
+fn hold_media_foundation_back(stuck: u32, live: bool, tries_left: bool) -> bool {
+    if stuck == 0 || live {
+        return false;
+    }
+    if super::cells::learning_enabled() {
+        super::cells::join_learned(child::media_foundation_denies());
+        withdraw_refused(tries_left);
+    }
+    true
+}
+
+/// #3280 — once the table is done, nothing promises a try any more. A host still
+/// short has the next start left, and says so.
+fn word_after_the_climb(mut caps: AgentCaps, learned: &[super::cells::LearnedDeny]) -> AgentCaps {
+    use roomler_ai_remote_control::models::Unavailable;
+    let was_short = caps
+        .unavailable
+        .remove(LEARNED_WORD)
+        .is_some_and(|w| w.code == SHORT_CODE);
+    let mut caps = with_learned_word(caps, learned, None);
+    if was_short && learned.is_empty() {
+        caps.unavailable.insert(
+            LEARNED_WORD.into(),
+            Unavailable::new(
+                SHORT_CODE,
+                "The capability probe ran out of time on this host, and so did its later tries, \
+                 so hardware encoders may be missing from this answer until the next start",
+            ),
+        );
+    }
+    caps
+}
+
+/// #3280 — [`word_after_the_climb`], on the answer in force.
+fn say_the_climb_is_over() {
+    let Some(was) = cached() else {
+        return;
+    };
+    let now = word_after_the_climb(was.clone(), &super::cells::learned());
+    if now.unavailable.get(LEARNED_WORD) != was.unavailable.get(LEARNED_WORD) {
+        install_late(now);
+    }
 }
 
 /// #3280 — a later try's answer becomes the one in force. The list first, because
@@ -3090,7 +3297,7 @@ fn adopt(
     super::cells::install_learned(learned.clone());
     install_vp9_qsv_idr(report.vp9_qsv_idr);
     install_gpu_forms(report.gpu_input.clone());
-    let answer = adopted_answer(detect(), report.caps, &learned, short);
+    let answer = adopted_answer(in_force(), report.caps, &learned, short);
     tracing::warn!(
         hw_encoders = ?answer.hw_encoders,
         codecs = ?answer.codecs,
@@ -3098,8 +3305,7 @@ fn adopt(
         learned_deny = ?learned.iter().map(|l| l.cell.as_str()).collect::<Vec<_>>(),
         "caps probe: a later try's answer is now the one in force, with no restart"
     );
-    *LATE_CAPS.write().unwrap_or_else(|e| e.into_inner()) = Some(answer);
-    CAPS_GENERATION.fetch_add(1, Ordering::SeqCst);
+    install_late(answer);
 }
 
 /// The answer in force, with what a later try's probe answered. The config-derived
@@ -3156,6 +3362,14 @@ pub fn arm_retry(live: impl Fn() -> bool + Send + 'static) {
                 why,
                 "caps probe: no more tries; the answer in force stands until the next start"
             );
+            say_the_climb_is_over();
+            // A stuck child's cost outlives the table, and with no try left this is
+            // the only thing still looking for a moment with nothing live.
+            while child::stuck_children() > 0
+                && !hold_media_foundation_back(child::stuck_children(), live(), false)
+            {
+                std::thread::sleep(RETRY_TICK);
+            }
         });
     if let Err(e) = spawned {
         tracing::warn!(%e, "caps probe: no thread for a later try; this answer stands until the next start");
@@ -7271,6 +7485,12 @@ mod tests {
     impl Drop for ProbeFixture {
         fn drop(&mut self) {
             cells::install_learned(Vec::new());
+            *LATE_CAPS.write().unwrap_or_else(|e| e.into_inner()) = None;
+            *LAST_ASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            GPU_IN_FORCE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
         }
     }
 
@@ -7428,7 +7648,7 @@ mod tests {
         assert!(!got.unanswered && !got.stopped);
         let report = got.report.expect("a report");
         assert!(
-            forms_of(&report.caps, &report.gpu_input).contains("hevc_nvenc:yuv444"),
+            forms_of(&report.caps, &report.gpu_input).contains_key("hevc_nvenc:yuv444"),
             "the 4:4:4 child's answer is folded in"
         );
     }
@@ -7773,7 +7993,7 @@ mod tests {
             assert_eq!(got.short, None);
             assert!(!got.unanswered);
             let report = got.report.expect("a report");
-            assert!(forms_of(&report.caps, &[]).contains("hevc_nvenc:yuv444"));
+            assert!(forms_of(&report.caps, &[]).contains_key("hevc_nvenc:yuv444"));
         }
 
         // Learning off is what came before: only a clean exit's word counts.
@@ -7790,7 +8010,7 @@ mod tests {
             (child::probe_with(&this, false, |_, _| script.next()), ())
         };
         let report = got.report.expect("a report");
-        assert!(!forms_of(&report.caps, &[]).contains("hevc_nvenc:yuv444"));
+        assert!(!forms_of(&report.caps, &[]).contains_key("hevc_nvenc:yuv444"));
     }
 
     /// The second review's gap: the deny fired only from a `base` child that left
@@ -8088,10 +8308,8 @@ mod tests {
 
         let seed = list_for_a_try(&cells::learned());
         assert!(seed.is_empty(), "both were only for want of time: {seed:?}");
-        let (got, asked) = probe_scripted(
-            &a_later_try(seed.clone()),
-            vec![("base", Some(base_reported()))],
-        );
+        let (got, asked) =
+            probe_scripted(&a_later_try(seed), vec![("base", Some(base_reported()))]);
         assert!(asked[0].is_empty(), "the child may open them");
         assert_eq!(
             in_force(cells::MF_H264),
@@ -8103,7 +8321,6 @@ mod tests {
             weigh(
                 &compute_caps(false, false),
                 &[],
-                &seed,
                 &first.short.clone().expect("short"),
                 &got
             )
@@ -8157,7 +8374,6 @@ mod tests {
         let verdict = weigh(
             &with_cells(&[QSV]),
             &[],
-            &[],
             &short_by(&["hevc_nvenc:yuv420"]),
             &got_with(Some(with_cells(&[QSV, NVENC])), None),
         );
@@ -8177,7 +8393,6 @@ mod tests {
         let verdict = weigh(
             &with_cells(&[QSV]),
             &[],
-            &[],
             &child::Shortfall::default(),
             &got_with(Some(with_cells(&[QSV])), None),
         );
@@ -8192,7 +8407,6 @@ mod tests {
         let complete_but_smaller = weigh(
             &with_cells(&[QSV, NVENC]),
             &[],
-            &[],
             &last,
             &got_with(Some(with_cells(&[QSV])), None),
         );
@@ -8200,13 +8414,12 @@ mod tests {
             complete_but_smaller,
             Verdict {
                 adopt: false,
-                next: Next::End("it answered"),
+                next: Next::Climb(last.clone()),
             }
         );
 
         let more_but_not_the_same = weigh(
             &with_cells(&[NVENC]),
-            &[],
             &[],
             &last,
             &got_with(Some(with_cells(&[QSV, AMF])), Some(short_by(&["x:yuv420"]))),
@@ -8216,7 +8429,6 @@ mod tests {
         let lost_a_gpu_form = weigh(
             &with_cells(&[QSV]),
             &["h264_qsv".to_string()],
-            &[],
             &last,
             &got_with(Some(with_cells(&[QSV])), None),
         );
@@ -8230,7 +8442,6 @@ mod tests {
         let now = short_by(&["av1_nvenc:yuv420"]);
         let verdict = weigh(
             &with_cells(&[QSV]),
-            &[],
             &[],
             &short_by(&["hevc_nvenc:yuv420"]),
             &got_with(Some(with_cells(&[QSV, NVENC])), Some(now.clone())),
@@ -8247,42 +8458,11 @@ mod tests {
         let same = weigh(
             &with_cells(&[QSV]),
             &[],
-            &[],
             &short_by(&["hevc_nvenc:yuv420"]),
             &got_with(Some(with_cells(&[QSV])), Some(short_by(&["other:yuv420"]))),
         );
         assert!(!same.adopt);
         assert!(matches!(same.next, Next::Climb(_)));
-    }
-
-    /// The one thing that takes a cell: a new fault in a form the answer in force
-    /// advertises. No session can be left to find it. Old news changes nothing.
-    #[test]
-    fn a_new_fault_in_a_cell_in_force_takes_that_cell() {
-        let fault = LearnedDeny {
-            cell: "hevc_nvenc:yuv420".to_string(),
-            why: "exit code: 0xc0000005".to_string(),
-            confirmed: true,
-            timed_out: false,
-        };
-        let got = child::Probed {
-            learned: vec![fault.clone()],
-            ..got_with(Some(with_cells(&[QSV])), None)
-        };
-        let last = child::Shortfall::default();
-        assert!(weigh(&with_cells(&[QSV, NVENC]), &[], &[], &last, &got).adopt);
-        assert!(
-            !weigh(
-                &with_cells(&[QSV, NVENC]),
-                &[],
-                std::slice::from_ref(&fault),
-                &last,
-                &got
-            )
-            .adopt,
-            "already on the list when this try started"
-        );
-        assert!(weigh(&with_cells(&[QSV]), &[], &[], &last, &got).adopt);
     }
 
     /// A try that ends short for a reason other than time has nothing more to learn
@@ -8291,7 +8471,6 @@ mod tests {
     fn a_try_short_for_another_reason_ends_the_climb() {
         let verdict = weigh(
             &with_cells(&[QSV]),
-            &[],
             &[],
             &child::Shortfall {
                 base: true,
@@ -8316,7 +8495,6 @@ mod tests {
         let verdict = weigh(
             &with_cells(&[QSV]),
             &[],
-            &[],
             &short_by(&[cell]),
             &got_with(Some(with_cells(&[QSV])), Some(short_by(&[cell]))),
         );
@@ -8334,7 +8512,6 @@ mod tests {
         let verdict = weigh(
             &with_cells(&[QSV]),
             &[],
-            &[],
             &blind,
             &got_with(None, Some(blind.clone())),
         );
@@ -8350,13 +8527,7 @@ mod tests {
             ..got_with(Some(with_cells(&[QSV, NVENC])), None)
         };
         assert_eq!(
-            weigh(
-                &with_cells(&[QSV]),
-                &[],
-                &[],
-                &child::Shortfall::default(),
-                &got
-            ),
+            weigh(&with_cells(&[QSV]), &[], &child::Shortfall::default(), &got),
             Verdict {
                 adopt: false,
                 next: Next::Again,
@@ -8560,5 +8731,435 @@ mod tests {
         assert_eq!(next.rpc, in_force.rpc);
         assert_eq!(next.apps, in_force.apps);
         assert!(next.unavailable.contains_key("sas"), "and honest words");
+    }
+
+    fn a_fault(cell: &str) -> LearnedDeny {
+        LearnedDeny {
+            cell: cell.to_string(),
+            why: "exit code: 0xc0000005".to_string(),
+            confirmed: true,
+            timed_out: false,
+        }
+    }
+
+    fn a_hang(cell: &str) -> LearnedDeny {
+        LearnedDeny {
+            cell: cell.to_string(),
+            why: "hung".to_string(),
+            confirmed: false,
+            timed_out: true,
+        }
+    }
+
+    fn offered(caps: &AgentCaps) -> Vec<String> {
+        caps.video_cells
+            .iter()
+            .flat_map(|c| {
+                c.chroma
+                    .iter()
+                    .map(move |chroma| format!("{}_{}:{chroma}", c.codec, c.backend))
+            })
+            .collect()
+    }
+
+    fn set_in_force(caps: AgentCaps) {
+        *LATE_CAPS.write().unwrap() = Some(caps);
+    }
+
+    fn offered_in_force() -> Vec<String> {
+        offered(&cached().expect("set_in_force first"))
+    }
+
+    fn a_try_that_got(last: &child::Shortfall, got: child::Probed) -> Next {
+        one_try_with(0, last, &|| false, 0, None, |_| got)
+    }
+
+    /// A complete answer that left out a form in force goes back on the table, with
+    /// what the last one was short by: the next one may answer, and a host keeps
+    /// what it has until then. Only an answer that went in ends the climb.
+    #[test]
+    fn a_complete_answer_missing_a_form_climbs_on() {
+        let last = short_by(&["hevc_nvenc:yuv420"]);
+        let verdict = weigh(
+            &with_cells(&[QSV, AMF]),
+            &[],
+            &last,
+            &got_with(Some(with_cells(&[QSV, NVENC])), None),
+        );
+        assert_eq!(
+            verdict,
+            Verdict {
+                adopt: false,
+                next: Next::Climb(last),
+            }
+        );
+    }
+
+    /// A try confirms a fault in a form in force and leaves no answer. That form is
+    /// refused from now on, so the answer in force stops offering it at once and
+    /// says why, and the next try's answer, which cannot hold it, can still go in.
+    #[test]
+    fn a_fault_on_a_try_with_no_answer_stops_the_offer_and_blocks_nothing() {
+        let _fixture = probe_fixture();
+        let cell = "hevc_nvenc:yuv420";
+        set_in_force(with_cells(&[QSV, NVENC]));
+        cells::join_learned([a_fault(cell)]);
+        let before = generation();
+        let short = child::Shortfall {
+            base: true,
+            ..Default::default()
+        };
+        let next = a_try_that_got(
+            &child::Shortfall::default(),
+            child::Probed {
+                learned: vec![a_fault(cell)],
+                ..got_with(None, Some(short.clone()))
+            },
+        );
+        assert_eq!(next, Next::Climb(short));
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420"]);
+        assert!(generation() > before, "every row hears of it within a beat");
+        let word = cached().unwrap().unavailable[LEARNED_WORD].clone();
+        assert_eq!(word.code, LEARNED_CODE);
+        assert!(word.reason.contains(cell), "{}", word.reason);
+
+        let next = a_try_that_got(
+            &child::Shortfall::default(),
+            child::Probed {
+                learned: vec![a_fault(cell)],
+                ..got_with(Some(with_cells(&[QSV, AMF])), None)
+            },
+        );
+        assert_eq!(next, Next::End("it answered"));
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420", "h264_amf:yuv420"]);
+        assert_eq!(names(&cells::learned()), [cell]);
+    }
+
+    /// A fault costs the form it was found in. What the same try lost for want of
+    /// time stays: its answer is dropped, not adopted, and not kept for the next start.
+    #[test]
+    fn a_fault_takes_its_own_form_and_no_other() {
+        let _fixture = probe_fixture();
+        let dir = std::env::temp_dir().join(format!("roomler-3280-a-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("caps.json");
+        let _ = std::fs::remove_file(&path);
+        let key = test_cache_key();
+        let cell = "hevc_nvenc:yuv420";
+        set_in_force(with_cells(&[QSV, NVENC, AMF]));
+        cells::join_learned([a_fault(cell)]);
+        let now = short_by(&["h264_qsv:yuv420"]);
+        let next = one_try_with(
+            0,
+            &child::Shortfall::default(),
+            &|| false,
+            0,
+            Some((key, path.clone(), 1)),
+            |_| child::Probed {
+                learned: vec![a_fault(cell), a_hang("h264_qsv:yuv420")],
+                ..got_with(Some(with_cells(&[AMF])), Some(now.clone()))
+            },
+        );
+        assert_eq!(next, Next::Climb(now.clone()));
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420", "h264_amf:yuv420"]);
+        assert!(
+            !path.exists(),
+            "a dropped answer is no answer for the cache"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A try's child that would not die takes Media Foundation as a first probe's
+    /// does, but never from under a live session: its encoder may rebuild at the next
+    /// change of size, and a refusal there is no video. Once nothing is live the
+    /// cells go, from the list and from what the answer in force offers, and every
+    /// row hears of it.
+    #[test]
+    fn a_stuck_child_leaves_a_live_session_its_media_foundation() {
+        let _fixture = probe_fixture();
+        let mf = (VideoCodec::Av1, VideoBackend::MediaFoundation);
+        let mut caps = with_cells(&[QSV, mf]);
+        caps.codecs = vec!["h264".to_string(), "av1".to_string()];
+        caps.hw_encoders = vec!["mf-av1-hw".to_string()];
+        set_in_force(caps);
+        let before = generation();
+
+        assert!(
+            !hold_media_foundation_back(1, true, true),
+            "a session is live"
+        );
+        assert!(cells::learned().is_empty());
+        assert_eq!(generation(), before);
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420", "av1_mf:yuv420"]);
+
+        assert!(
+            !hold_media_foundation_back(0, false, true),
+            "nothing is stuck"
+        );
+        assert!(cells::learned().is_empty());
+
+        assert!(hold_media_foundation_back(1, false, true));
+        if cfg!(windows) {
+            assert_eq!(names(&cells::learned()), mf_cells());
+            let caps = cached().unwrap();
+            assert_eq!(offered(&caps), ["h264_qsv:yuv420"]);
+            assert_eq!(caps.codecs, ["h264"]);
+            assert!(caps.hw_encoders.is_empty(), "{:?}", caps.hw_encoders);
+            assert!(generation() > before);
+            assert!(
+                caps.unavailable[LEARNED_WORD].reason.contains("av1_mf"),
+                "{:?}",
+                caps.unavailable
+            );
+        }
+    }
+
+    /// An adopted answer's list replaces the daemon's, which is what takes a deny
+    /// for want of time away.
+    #[test]
+    fn adopting_replaces_the_daemons_list() {
+        let _fixture = probe_fixture();
+        let cell = "hevc_nvenc:yuv420";
+        set_in_force(with_cells(&[QSV]));
+        cells::install_learned(vec![a_hang(cell)]);
+        let before = generation();
+        let next = a_try_that_got(
+            &short_by(&[cell]),
+            got_with(Some(with_cells(&[QSV, NVENC])), None),
+        );
+        assert_eq!(next, Next::End("it answered"));
+        assert!(cells::learned().is_empty(), "{:?}", cells::learned());
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420", "hevc_nvenc:yuv420"]);
+        assert!(generation() > before);
+    }
+
+    /// A session that asks while a try runs stops its child, by `stop`, and the try
+    /// is lost even if its answer got out first.
+    #[test]
+    fn a_session_asking_during_a_try_loses_it() {
+        let _fixture = probe_fixture();
+        set_in_force(with_cells(&[QSV]));
+        let before = generation();
+        let next = one_try_with(
+            0,
+            &child::Shortfall::default(),
+            &|| false,
+            0,
+            None,
+            |this| {
+                assert!(!(this.stop)(), "nothing has asked yet");
+                session_asked();
+                assert!((this.stop)(), "told to stop at its next poll");
+                got_with(Some(with_cells(&[QSV, NVENC])), None)
+            },
+        );
+        assert_eq!(next, Next::Again);
+        assert_eq!(generation(), before);
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420"]);
+    }
+
+    /// The same for a session going live, which also never asked on this loop.
+    #[test]
+    fn a_session_going_live_during_a_try_loses_it() {
+        let _fixture = probe_fixture();
+        set_in_force(with_cells(&[QSV]));
+        let is_live = std::sync::atomic::AtomicBool::new(false);
+        let next = one_try_with(
+            0,
+            &child::Shortfall::default(),
+            &|| is_live.load(Ordering::SeqCst),
+            0,
+            None,
+            |this| {
+                assert!(!(this.stop)());
+                is_live.store(true, Ordering::SeqCst);
+                assert!((this.stop)());
+                got_with(Some(with_cells(&[QSV, NVENC])), None)
+            },
+        );
+        assert_eq!(next, Next::Again);
+        assert_eq!(offered_in_force(), ["h264_qsv:yuv420"]);
+    }
+
+    /// No child starts beside a stuck one, a live session or one that just asked.
+    #[test]
+    fn nothing_starts_beside_a_stuck_child_a_session_or_an_ask() {
+        let _fixture = probe_fixture();
+        set_in_force(with_cells(&[QSV]));
+        let last = child::Shortfall::default();
+        let no_child = |_: &child::Try| -> child::Probed { panic!("a child started") };
+        assert_eq!(
+            one_try_with(0, &last, &|| false, 1, None, no_child),
+            Next::Again
+        );
+        assert_eq!(
+            one_try_with(0, &last, &|| true, 0, None, no_child),
+            Next::Again
+        );
+        session_asked();
+        assert_eq!(
+            one_try_with(0, &last, &|| false, 0, None, no_child),
+            Next::Again
+        );
+    }
+
+    fn test_cache_key() -> crate::encode::caps_cache::CacheKey {
+        crate::encode::caps_cache::CacheKey {
+            build: "a build".to_string(),
+            hardware: "a host".to_string(),
+            knobs: "no knobs".to_string(),
+        }
+    }
+
+    /// An adopted answer is the next start's cache hit, by the first probe's gate.
+    #[test]
+    fn an_adopted_answer_is_kept_for_the_next_start() {
+        let _fixture = probe_fixture();
+        let dir = std::env::temp_dir().join(format!("roomler-3280-b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("caps.json");
+        let _ = std::fs::remove_file(&path);
+        let key = test_cache_key();
+        let now = crate::encode::caps_cache::now_unix();
+        set_in_force(with_cells(&[QSV]));
+        let next = one_try_with(
+            0,
+            &child::Shortfall::default(),
+            &|| false,
+            0,
+            Some((key.clone(), path.clone(), now)),
+            |_| got_with(Some(with_cells(&[QSV, NVENC])), None),
+        );
+        assert_eq!(next, Next::End("it answered"));
+        let hit = crate::encode::caps_cache::load_matching(&path, &key, now)
+            .unwrap_or_else(|_| panic!("the cache has no hit for it"));
+        assert_eq!(offered(&hit.caps), ["h264_qsv:yuv420", "hevc_nvenc:yuv420"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hardware form that comes back as software has not been kept, under load
+    /// especially. The other way round is a host gaining something.
+    #[test]
+    fn a_hardware_form_turning_software_is_not_kept() {
+        let software = |caps: AgentCaps| AgentCaps {
+            video_cells: caps
+                .video_cells
+                .into_iter()
+                .map(|c| VideoCell { hw: false, ..c })
+                .collect(),
+            ..caps
+        };
+        let last = child::Shortfall::default();
+        let turned = weigh(
+            &with_cells(&[NVENC]),
+            &[],
+            &last,
+            &got_with(Some(software(with_cells(&[NVENC]))), None),
+        );
+        assert!(!turned.adopt);
+        let gained = weigh(
+            &software(with_cells(&[NVENC])),
+            &[],
+            &last,
+            &got_with(Some(with_cells(&[NVENC])), None),
+        );
+        assert!(gained.adopt);
+    }
+
+    /// Withdrawing a form takes everything that says it is there, and nothing else.
+    #[test]
+    fn withdrawing_a_form_takes_what_says_it_is_there() {
+        let cell = |codec, backend, chroma: &[ChromaFormat]| {
+            VideoCell::new(codec, backend, chroma, backend != VideoBackend::Libvpx)
+        };
+        let both = [ChromaFormat::Yuv420, ChromaFormat::Yuv444];
+        let one = [ChromaFormat::Yuv420];
+        let mut caps = AgentCaps {
+            codecs: vec!["h264".into(), "h265".into(), "av1".into()],
+            hw_encoders: vec![
+                "ffmpeg-hevc_nvenc".into(),
+                "mf-av1-hw".into(),
+                "libvpx-vp9-444-sw".into(),
+                "openh264-sw".into(),
+            ],
+            transports: vec!["data-channel-hevc".into(), "data-channel-vp9-444".into()],
+            hevc_chroma: vec!["yuv420".into(), "yuv444".into()],
+            vp9_chroma: "yuv444".into(),
+            video_cells: vec![
+                cell(VideoCodec::H264, VideoBackend::Openh264, &one),
+                cell(VideoCodec::Hevc, VideoBackend::Nvenc, &both),
+                cell(VideoCodec::Hevc, VideoBackend::Qsv, &one),
+                cell(VideoCodec::Av1, VideoBackend::MediaFoundation, &one),
+                cell(VideoCodec::Vp9, VideoBackend::Libvpx, &both),
+            ],
+            ..AgentCaps::default()
+        };
+
+        let untouched = format!("{caps:?}");
+        child::withdraw(&mut caps, &[a_fault("hevc_amf:yuv420")]);
+        assert_eq!(format!("{caps:?}"), untouched, "nothing it offers");
+
+        // A base child opens 4:2:0, and only a cell that has it is asked about 4:4:4.
+        child::withdraw(&mut caps, &[a_fault("hevc_nvenc:yuv420")]);
+        assert!(!offered(&caps).iter().any(|f| f.starts_with("hevc_nvenc")));
+        assert!(!caps.hw_encoders.iter().any(|h| h == "ffmpeg-hevc_nvenc"));
+        assert_eq!(caps.hevc_chroma, ["yuv420"], "only hevc_nvenc says 4:4:4");
+        assert!(caps.codecs.iter().any(|c| c == "h265"), "QSV still has it");
+        assert!(caps.transports.iter().any(|t| t == "data-channel-hevc"));
+
+        child::withdraw(&mut caps, &[a_fault("hevc_qsv:yuv420")]);
+        assert!(!caps.codecs.iter().any(|c| c == "h265"));
+        assert!(!caps.transports.iter().any(|t| t == "data-channel-hevc"));
+        assert!(caps.hevc_chroma.is_empty());
+
+        child::withdraw(&mut caps, &[a_hang("av1_mf:yuv420")]);
+        assert!(!caps.codecs.iter().any(|c| c == "av1"));
+        assert!(!caps.hw_encoders.iter().any(|h| h == "mf-av1-hw"));
+
+        // libvpx opens each form on its own.
+        child::withdraw(&mut caps, &[a_fault("vp9_libvpx:yuv420")]);
+        assert!(offered(&caps).iter().any(|f| f == "vp9_libvpx:yuv444"));
+        assert!(caps.transports.iter().any(|t| t == "data-channel-vp9-444"));
+        assert_eq!(caps.vp9_chroma, "yuv444");
+        child::withdraw(&mut caps, &[a_fault("vp9_libvpx:yuv444")]);
+        assert!(caps.transports.is_empty());
+        assert!(caps.vp9_chroma.is_empty());
+        assert!(!caps.hw_encoders.iter().any(|h| h == "libvpx-vp9-444-sw"));
+        assert!(caps.hw_encoders.iter().any(|h| h == "openh264-sw"));
+        assert_eq!(caps.codecs, ["h264"]);
+    }
+
+    /// When the table is done nothing promises a try any more. A host still short
+    /// says that the next start is what is left, and a host with an answer says nothing.
+    #[test]
+    fn the_words_stop_promising_a_try_when_the_climb_ends() {
+        use roomler_ai_remote_control::models::OsKind;
+        let short = child::Shortfall {
+            base: true,
+            ..Default::default()
+        };
+        let facts = p0c_facts(OsKind::Windows);
+        let first = assigned_by_the_daemon(p0c_caps(), &facts, &[], Some(&short));
+        let over = word_after_the_climb(first, &[]);
+        let word = &over.unavailable[LEARNED_WORD];
+        assert_eq!(word.code, SHORT_CODE);
+        assert!(!word.reason.contains("later try with"), "{}", word.reason);
+        assert!(word.reason.contains("next start"), "{}", word.reason);
+
+        let hung = [a_hang("hevc_nvenc:yuv420")];
+        let named = assigned_by_the_daemon(p0c_caps(), &facts, &hung, Some(&short));
+        let over = word_after_the_climb(named, &hung);
+        let word = &over.unavailable[LEARNED_WORD];
+        assert_eq!(word.code, LEARNED_CODE);
+        assert!(
+            word.reason.contains("until the next start"),
+            "{}",
+            word.reason
+        );
+        assert!(!word.reason.contains("a later try"), "{}", word.reason);
+
+        let answered = assigned_by_the_daemon(p0c_caps(), &facts, &[], None);
+        let over = word_after_the_climb(answered, &[]);
+        assert!(!over.unavailable.contains_key(LEARNED_WORD));
     }
 }

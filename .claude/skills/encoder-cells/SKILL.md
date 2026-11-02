@@ -121,8 +121,15 @@ longer bounds. Keep these true when you touch it:
   and not counted, and an answer goes in only with nothing live.
 - **A try whose own child would not die starts no more children** (`probe_with`). A first probe
   goes on, because it has no answer to fall back on.
-- **A try cannot take a form, except for a fault** (`weigh`). A count of cells is not enough: an
-  answer with more cells that leaves one out is dropped.
+- **A try cannot take a form** (`weigh`, `keeps`). A count of cells is not enough: an answer with
+  more cells that leaves one out is dropped, and so is one where hardware came back as software.
+  Dropping a complete answer ends nothing; only an adopted one does.
+- **A fault costs its own form, at once** (`withdraw_refused`): off the daemon's list and off the
+  answer in force, with the generation moved, so nothing offers what a session is refused. A later
+  answer is compared with what is left.
+- **A try's stuck child never takes Media Foundation from under a live session**
+  (`hold_media_foundation_back`), because a refused rebuild is no video. A first probe's costs them
+  at once; nothing is live yet.
 - **Adopt the list first and the generation last,** and read `generation()` before reading the
   answer, so a change in between reads as news rather than getting lost.
 - ⚠️ `std::thread`, not `spawn_blocking`: a runtime's shutdown waits on those, and
