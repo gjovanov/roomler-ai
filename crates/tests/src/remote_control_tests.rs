@@ -319,6 +319,7 @@ async fn delete_agent_removes_from_list() {
 async fn a_removed_device_is_a_404_on_every_per_device_route() {
     use bson::{Bson, doc, oid::ObjectId};
     use reqwest::Method;
+    use roomler_ai_remote_control::models::{DesiredConfig, ExecAnchor};
 
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("rcgone").await;
@@ -577,6 +578,33 @@ async fn a_removed_device_is_a_404_on_every_per_device_route() {
             .unwrap(),
         "a setter must not land on a tombstone"
     );
+    // A tombstone revives whole, so these two would come back with the machine's
+    // next enrollment: SYSTEM exec, and a config nobody is still asking for.
+    let late_anchor = ExecAnchor {
+        anchored_at: bson::DateTime::now(),
+        anchored_by: ObjectId::new(),
+        anchor_id: "late".into(),
+    };
+    assert!(
+        !fleet
+            .agents
+            .set_exec_anchor(tid, aid, &late_anchor)
+            .await
+            .unwrap(),
+        "an anchor must not land on a tombstone"
+    );
+    let late_config = DesiredConfig {
+        revision: 99,
+        ..Default::default()
+    };
+    assert!(
+        !fleet
+            .agents
+            .set_desired_config(tid, aid, &late_config)
+            .await
+            .unwrap(),
+        "a desired config must not land on a tombstone"
+    );
     // The removal time is written once: a repeat tombstoning is a no-op.
     assert!(!fleet.agents.soft_delete(tid, aid).await.unwrap());
     let row = agents.find_one(doc! { "_id": aid }).await.unwrap().unwrap();
@@ -584,6 +612,21 @@ async fn a_removed_device_is_a_404_on_every_per_device_route() {
     assert_eq!(
         row.get_array("tags").unwrap(),
         &vec![Bson::String("before".into())]
+    );
+    assert!(
+        !row.contains_key("exec_anchor"),
+        "the removal ended the anchor and nothing wrote one back"
+    );
+    assert_ne!(
+        fleet
+            .agents
+            .find_any_in_tenant(tid, aid)
+            .await
+            .unwrap()
+            .desired_config
+            .revision,
+        99,
+        "the late config did not land"
     );
 
     // A repeat DELETE is a 404 — the same answer the listing gives, and the
