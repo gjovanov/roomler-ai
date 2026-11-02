@@ -5657,10 +5657,9 @@ async fn service_cmd(action: ServiceAction, config_path: &PathBuf) -> Result<()>
             as_service: false,
             for_upgrade,
         } => {
-            if for_upgrade {
-                updater::record_update_attempt();
-            }
-            let how = service::stop(config_path).context("stopping the daemon")?;
+            let how = stop_for_upgrade_or_not(for_upgrade, updater::record_update_attempt, || {
+                service::stop(config_path).context("stopping the daemon")
+            })?;
             println!("{how}");
             Ok(())
         }
@@ -5668,6 +5667,22 @@ async fn service_cmd(action: ServiceAction, config_path: &PathBuf) -> Result<()>
             as_service: true, ..
         } => service_stop_as_service(),
     }
+}
+
+/// #3292 — `--for-upgrade` asks the daemon to leave only once the marker that says
+/// so is on disk. The daemon reads it on its way out, and without it an ephemeral
+/// device deletes its own row during the upgrade (#1683). Left running, the old
+/// daemon stays on the renamed files until the next sign-in: online, and the
+/// device is still itself.
+fn stop_for_upgrade_or_not(
+    for_upgrade: bool,
+    record_the_upgrade: impl FnOnce() -> bool,
+    stop: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    if for_upgrade && !record_the_upgrade() {
+        bail!("could not record the upgrade, so the daemon was left running");
+    }
+    stop()
 }
 
 #[cfg(target_os = "windows")]
@@ -7494,6 +7509,61 @@ mod tests {
             wxs.matches("ExeCommand='service stop --for-upgrade'")
                 .count(),
             1
+        );
+    }
+
+    /// #3292 — no marker, no stop: an ephemeral device's identity is at stake.
+    #[test]
+    fn an_upgrades_stop_needs_the_marker_on_disk() {
+        let stopped = std::cell::Cell::new(false);
+        let stop = || {
+            stopped.set(true);
+            Ok("stopped".to_string())
+        };
+        let refused = stop_for_upgrade_or_not(true, || false, stop);
+        assert!(refused.is_err());
+        assert!(!stopped.get(), "the daemon must be left running");
+
+        assert!(stop_for_upgrade_or_not(true, || true, stop).is_ok());
+        assert!(stopped.get());
+
+        stopped.set(false);
+        let not_consulted = || panic!("a plain stop writes no marker");
+        assert!(stop_for_upgrade_or_not(false, not_consulted, stop).is_ok());
+        assert!(stopped.get());
+    }
+
+    /// #3292 — a rollback plays the script backwards, so these must sit ahead of
+    /// `RemoveExistingProducts` to run after the old files are back, and run the
+    /// daemon's EXE: the launcher is gone after a rollback to a release without one.
+    #[test]
+    fn a_rollback_brings_back_the_task_and_then_the_daemon() {
+        let wxs = include_str!("../wix/main.wxs");
+        let action = |id: &str| -> String {
+            let at = wxs
+                .find(&format!("Id='{id}'"))
+                .expect("declared as a custom action");
+            let rest = &wxs[at..];
+            rest[..rest.find("/>").expect("closed")].to_string()
+        };
+        for (id, command) in [
+            ("AutostartBackOnRollback", "service install"),
+            ("DaemonBackOnRollback", "service start"),
+        ] {
+            let declared = action(id);
+            assert!(
+                declared.contains("FileKey='roomler_agent_exe'"),
+                "{declared}"
+            );
+            assert!(declared.contains("Execute='rollback'"), "{declared}");
+            assert!(
+                declared.contains(&format!("ExeCommand='{command}'")),
+                "{declared}"
+            );
+        }
+        assert!(wxs.contains("<Custom Action='DaemonBackOnRollback' After='InstallInitialize'>"));
+        assert!(
+            wxs.contains("<Custom Action='AutostartBackOnRollback' After='DaemonBackOnRollback'>")
         );
     }
 

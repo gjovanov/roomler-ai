@@ -421,16 +421,21 @@ pub fn update_attempt_marker_path() -> Option<PathBuf> {
 /// failure is logged but does not block the update path (we'd
 /// rather have a working install with a noisy crash counter than
 /// no install at all). The per-user MSI's `service stop --for-upgrade`
-/// (#3292) calls it too: an upgrade by hand has no installer spawn of ours.
-pub fn record_update_attempt() {
+/// (#3292) calls it too: an upgrade by hand has no installer spawn of ours,
+/// and that caller reads the answer: whether the marker is on disk.
+pub fn record_update_attempt() -> bool {
     let Some(p) = update_attempt_marker_path() else {
-        return;
+        return false;
     };
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(&p, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
-        tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
+    match std::fs::write(&p, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
+            false
+        }
     }
 }
 

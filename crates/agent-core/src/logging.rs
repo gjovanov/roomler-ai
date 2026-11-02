@@ -422,6 +422,7 @@ pub fn send_stderr_to_the_log() {
 mod stderr_file {
     use super::*;
     use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
 
     /// What one day's rolling log may reach before stderr stops going there.
@@ -437,6 +438,7 @@ mod stderr_file {
         fn _open_osfhandle(handle: isize, flags: i32) -> i32;
         fn _dup2(from: i32, to: i32) -> i32;
         fn _close(fd: i32) -> i32;
+        fn _get_osfhandle(fd: i32) -> isize;
     }
 
     pub(super) fn keep_on_the_rolling_log(dir: PathBuf) {
@@ -488,14 +490,20 @@ mod stderr_file {
         false
     }
 
-    /// Point this process's two stderrs at `path`. Rust's reads `GetStdHandle` on
-    /// every write, and panics and stack overflows go through it. The C runtime's is
-    /// fd 2, in the UCRT every module of this process shares, and that is where
-    /// FFmpeg's `fprintf(stderr, …)` lands. Each gets its own handle.
+    /// Point this process's two stderrs at `path`. The C runtime's is fd 2, in the
+    /// UCRT every module of this process shares, and that is where FFmpeg's
+    /// `fprintf(stderr, …)` lands. Rust's reads `GetStdHandle` on every write, and
+    /// panics and stack overflows go through it. Each gets its own handle.
     ///
-    /// The handle given to `SetStdHandle` is never closed: a write racing this call
-    /// may still hold the old value, and that value could be reused by anything by
-    /// then. One or two a day is a leak that does not matter.
+    /// In this order, because in a console program `_dup2` also sets the standard
+    /// handle, to the duplicate the next `_dup2` closes. The handle given to
+    /// `SetStdHandle` is never closed: a write racing this call may still hold the
+    /// old value, and that value could be reused by anything by then. One or two a
+    /// day is a leak that does not matter.
+    ///
+    /// `_dup2`'s duplicate is inheritable, and a child started with inherited handles
+    /// would keep that day's log open for its lifetime. `Command` hands a child its
+    /// stderr with a duplicate of its own, so a child that asks for it still gets it.
     fn point_stderr_at(path: &Path) -> std::io::Result<()> {
         let open = || {
             std::fs::OpenOptions::new()
@@ -505,16 +513,19 @@ mod stderr_file {
         };
         let for_rust = open()?.into_raw_handle();
         let for_crt = open()?.into_raw_handle();
-        // SAFETY: `for_rust` is a valid handle, owned from here on by the process's
-        // standard-handle table. `_open_osfhandle` takes ownership of `for_crt`, and
-        // `_dup2` and `_close` run under the C runtime's own per-fd locks.
+        // SAFETY: `_open_osfhandle` takes ownership of `for_crt`, and `_dup2`,
+        // `_close` and `_get_osfhandle` run under the C runtime's own per-fd locks.
+        // `for_rust` is a valid handle, owned from here on by the process's
+        // standard-handle table. A failed `_get_osfhandle` gives an invalid handle,
+        // which `SetHandleInformation` refuses.
         unsafe {
-            SetStdHandle(STD_ERROR_HANDLE, for_rust);
             let fd = _open_osfhandle(for_crt as isize, 0);
             if fd >= 0 {
                 _dup2(fd, 2);
                 _close(fd);
             }
+            SetStdHandle(STD_ERROR_HANDLE, for_rust);
+            SetHandleInformation(_get_osfhandle(2) as HANDLE, HANDLE_FLAG_INHERIT, 0);
         }
         Ok(())
     }
@@ -1256,6 +1267,57 @@ mod tests {
             assert_eq!(read("2026-01-04"), "on-day-four\ncrt-on-day-four\n");
             let capped = std::fs::metadata(rolling_file(dir.path(), "2026-01-03")).unwrap();
             assert_eq!(capped.len(), DAILY_CAP, "nothing past the cap");
+        }
+
+        #[test]
+        fn child_keeps_a_handle_across_a_roll() {
+            use std::io::Write;
+            use std::os::windows::io::FromRawHandle;
+            use windows_sys::Win32::Foundation::{
+                GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+            };
+            use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+            unsafe extern "C" {
+                fn _get_osfhandle(fd: i32) -> isize;
+            }
+            let Some(dir) = child_dir() else { return };
+            let inheritable = |handle: HANDLE| {
+                let mut flags = 0u32;
+                // SAFETY: `flags` is a valid out-pointer for the call.
+                assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+                flags & HANDLE_FLAG_INHERIT != 0
+            };
+            assert!(repoint(&dir, "2026-01-01"));
+            // SAFETY: reads the process's standard handle.
+            let before_the_roll = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+            assert!(repoint(&dir, "2026-01-02"));
+            // SAFETY: as above, and fd 2 is open.
+            let (rust, crt) =
+                unsafe { (GetStdHandle(STD_ERROR_HANDLE), _get_osfhandle(2) as HANDLE) };
+            assert_ne!(rust, crt, "the next roll closes the C runtime's");
+            assert!(!inheritable(rust));
+            assert!(!inheritable(crt));
+            // A panic that read the handle just before the roll: `from_raw_handle`
+            // borrows here, and `ManuallyDrop` keeps it open as the code under test does.
+            // SAFETY: a handle the code under test says it never closes.
+            let raced = unsafe { std::fs::File::from_raw_handle(before_the_roll) };
+            let mut raced = std::mem::ManuallyDrop::new(raced);
+            raced.write_all(b"raced-the-roll\n").unwrap();
+            eprintln!("after-the-roll");
+            crt_stderr(c"crt-after-the-roll\n");
+        }
+
+        /// Findings of the independent read of #3296: `_dup2` set the standard handle
+        /// to its own duplicate, so the next roll closed it under a racing write, and
+        /// that duplicate was inheritable.
+        #[test]
+        fn a_write_racing_a_roll_lands_and_no_child_inherits_the_log() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = child("child_keeps_a_handle_across_a_roll", dir.path());
+            let read = |date| std::fs::read_to_string(rolling_file(dir.path(), date)).unwrap();
+            assert!(status.success(), "{}", read("2026-01-02"));
+            assert_eq!(read("2026-01-01"), "raced-the-roll\n");
+            assert_eq!(read("2026-01-02"), "after-the-roll\ncrt-after-the-roll\n");
         }
 
         /// A second name would split one day's story across two files, and

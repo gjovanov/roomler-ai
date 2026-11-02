@@ -597,7 +597,38 @@ guest offers only S4.
 ⚠️ **The task is not a supervisor.** `<RestartOnFailure>` restarted nothing after exit 1
 or after `0xC000013A`, five minutes on, with `Count` 10 and `PT1M` registered. A
 per-user daemon that crashes stays down until the next sign-in or `roomlerd service
-start` (#3295).
+start` (#3295). It does retry a start that could not begin at all: with a task naming a
+missing launcher it fired each minute, answering `0x80070002`.
+
+#### When a per-user upgrade fails
+
+`RemoveExistingProducts` runs right after `InstallInitialize`, so by the time anything
+can fail the old product's `UnregisterAutostart` has deleted the task, and past
+`StopOldDaemon` the daemon has gone too. A rollback restores the old files. Nothing
+restored the task until #3292, because the old table has no rollback action of its own.
+
+| Failure, measured on candidates by a forced failing action | Before | Now |
+|---|---|---|
+| From a release before the launcher, after `StopOldDaemon` | Exit 1603, old files, **no task, no daemon, row offline** | Exit 1603, old files, the old task back, the old daemon started by `DaemonBackOnRollback`, row online on the old version |
+| The same, just before `InstallFinalize` | Exit 1603, old files, **a task naming a launcher the rollback removed** (`0x80070002` each minute), row offline | The same as above: `AutostartBackOnRollback` overwrites it |
+| From a release with the launcher, after `StopOldDaemon` | Exit 1603, old files, **no task, no daemon, row offline** | The same as above, on the launcher |
+| From a release with the launcher, just before `InstallFinalize` | Exit 1603, old files, the new task, whose one-shot starts the daemon | No change in what the device ends up with |
+
+`AutostartBackOnRollback` and `DaemonBackOnRollback` (`agents/roomlerd/wix/main.wxs`) run
+the restored `roomlerd.exe`, the one file every release has, so the task is the one that
+release writes, and each can flash a terminal, on a failed upgrade only. They sit ahead
+of `RemoveExistingProducts` because a rollback plays the script backwards: the old files
+are back when they run. `service install` comes back first, because `service start` needs
+its task. An uninstall that fails gets the same pair. ICE63 warns about an action between
+`InstallInitialize` and `RemoveExistingProducts`, and `installer-smoke` holds the order
+against the built MSI, because WiX orders actions that share a parent by itself.
+
+**An install that never reaches its script has no rollback.** `msiexec` exits 1618 while
+another install holds the machine's mutex, so on a self-update the daemon has left and no
+action ran. `start_user_daemon_after_a_failure` (`agents/roomlerd/src/post_install.rs`)
+starts the task on a failed verdict. It runs in the watcher of the release being updated
+FROM, so the first update onto it does not have it: that device stays down until the next
+sign-in.
 
 ### What an MSI run does to the `Roomler` service
 

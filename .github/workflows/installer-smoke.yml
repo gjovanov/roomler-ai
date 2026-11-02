@@ -288,6 +288,36 @@ jobs:
           'MSI_PATH=' + $msi.FullName | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "MSI ready: $($msi.FullName) ($([math]::Round($msi.Length / 1MB, 2)) MiB)"
 
+      # #3292: a rollback plays the script backwards, so a failed upgrade restores
+      # the task and the daemon only from ahead of RemoveExistingProducts, once the
+      # old files are back, and the task must come back before the start. WiX orders
+      # actions that share a parent by itself, so this reads what it built.
+      - name: "Assert the rollback actions' order in the built MSI (#3292)"
+        shell: pwsh
+        run: |
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($env:MSI_PATH, 0))
+          function Get-Seq([string]$action) {
+            $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @("SELECT Sequence FROM InstallExecuteSequence WHERE Action='$action'"))
+            [void]$view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+            $row = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+            if ($null -eq $row) { throw "$action is not in InstallExecuteSequence" }
+            [int]$row.GetType().InvokeMember('IntegerData', 'GetProperty', $null, $row, ([object[]]@([int32]1)))
+          }
+          $seq = @('InstallInitialize', 'DaemonBackOnRollback', 'AutostartBackOnRollback', 'RemoveExistingProducts') | ForEach-Object { Get-Seq $_ }
+          Write-Host "InstallInitialize, DaemonBackOnRollback, AutostartBackOnRollback, RemoveExistingProducts: $($seq -join ', ')"
+          for ($i = 1; $i -lt $seq.Count; $i++) {
+            if ($seq[$i - 1] -ge $seq[$i]) { throw "out of order: $($seq -join ', ')" }
+          }
+          # A rollback leaves a registration the next release cannot remove, and only
+          # this attribute lets that release go on (docs/installation.md).
+          $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @("SELECT Attributes FROM Upgrade WHERE ActionProperty='WIX_UPGRADE_DETECTED'"))
+          [void]$view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+          $row = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+          $attributes = [int]$row.GetType().InvokeMember('IntegerData', 'GetProperty', $null, $row, ([object[]]@([int32]1)))
+          Write-Host "Upgrade.Attributes: $attributes"
+          if (($attributes -band 4) -eq 0) { throw 'msidbUpgradeAttributesIgnoreRemoveFailure is not set' }
+
       - name: Install the MSI (quiet, per-User)
         shell: pwsh
         run: |

@@ -88,8 +88,19 @@
             InstallScope='perUser'
             SummaryCodepage='1252' />
 
+        <!--
+          #3292: IgnoreRemoveFailure, because a rollback under a standard user cannot
+          restore the installer's own registration: its registry opens answer error 5,
+          and 165 lines of "Error in rollback skipped" later the failed product is still
+          registered as installed, with no package anywhere. Without this, every later
+          release stops at Error 1714, System Error 1612, "the older version cannot be
+          removed": one failed upgrade would freeze that device's updates for good. With
+          it, the new files go over the old ones and RegisterAutostart runs as usual. An
+          action failing inside the old product's removal still rolls the install back.
+        -->
         <MajorUpgrade
             Schedule='afterInstallInitialize'
+            IgnoreRemoveFailure='yes'
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.' />
 
         <!--
@@ -448,6 +459,34 @@
             Return='ignore' />
 
         <!--
+          #3292: what a rollback puts back. The old product's UnregisterAutostart
+          has no rollback of its own, so an upgrade that fails after
+          RemoveExistingProducts restores the old files and leaves no task, or this
+          product's task naming a launcher the rollback just removed, and past
+          StopOldDaemon no daemon either: offline, even at the next sign-in.
+          These run the RESTORED roomlerd.exe, the one file every release has, so the
+          task is the one that release writes, and each flashes a terminal, on a failed
+          upgrade only. `service start` is here because a release before the one-shot
+          triggers registers a task that starts nothing until the next sign-in; with a
+          daemon that never stopped, the second start exits 8.
+          An uninstall that fails gets the same.
+        -->
+        <CustomAction
+            Id='AutostartBackOnRollback'
+            FileKey='roomler_agent_exe'
+            ExeCommand='service install'
+            Execute='rollback'
+            Impersonate='yes'
+            Return='ignore' />
+        <CustomAction
+            Id='DaemonBackOnRollback'
+            FileKey='roomler_agent_exe'
+            ExeCommand='service start'
+            Execute='rollback'
+            Impersonate='yes'
+            Return='ignore' />
+
+        <!--
           rc.18: cross-flavour cleanup. When the operator installs the
           perUser MSI over a prior perMachine install, this CA shells
           out to the freshly-laid EXE to scrub the OTHER flavour's
@@ -470,6 +509,20 @@
 
         <InstallExecuteSequence>
             <!--
+              #3292: ahead of RemoveExistingProducts, because a rollback plays the
+              script backwards: the old product's files must be back when these run.
+              So the task comes back first, and then the start that needs it. ICE63
+              warns about an action between InstallInitialize and
+              RemoveExistingProducts; installer-smoke holds this order against the
+              built MSI, because WiX puts actions sharing a parent in name order.
+            -->
+            <Custom Action='DaemonBackOnRollback' After='InstallInitialize'>
+                WIX_UPGRADE_DETECTED OR (REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE)
+            </Custom>
+            <Custom Action='AutostartBackOnRollback' After='DaemonBackOnRollback'>
+                WIX_UPGRADE_DETECTED OR (REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE)
+            </Custom>
+            <!--
               Run RegisterAutostart on every fresh install, repair,
               and MajorUpgrade. Skip during full uninstall — there's
               nothing to register and the EXE is about to be deleted
@@ -478,9 +531,9 @@
               old + install of the new, scheduled separately).
               #3292: last before the commit, because the task it writes
               names the launcher. A failure after it rolls an upgrade from
-              a release without the launcher back to that release, and a
-              task left pointing at a file the rollback removed starts
-              nothing at any logon.
+              a release without the launcher back to that release, and
+              AutostartBackOnRollback has to overwrite a task that names a
+              file the rollback removed.
             -->
             <Custom Action='RegisterAutostart' Before='InstallFinalize'>
                 NOT (REMOVE="ALL")
