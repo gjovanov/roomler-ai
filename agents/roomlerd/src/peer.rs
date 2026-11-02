@@ -5295,12 +5295,16 @@ async fn media_pump_vp9_444_dc(
                 evidence_rejected = ?governor.evidence_rejected(),
                 // FR-79 V3b (SHADOW) — the ONE belief beside the old composition:
                 // believed / demonstrated floor / pushed-back capacity, and the
-                // (deliveries, capacities) that produced them. Nothing reads these
-                // yet; they exist so the field can say whether the belief is sane
-                // before a loop acts on it.
+                // (deliveries, capacities) that produced them. Only V5b reads the
+                // belief, and only whether the floor rose; these exist so the field
+                // can say whether the belief is sane before a loop acts on it.
                 pipe_belief = ?governor.belief_bps(std::time::Instant::now()),
                 pipe_belief_n = ?governor.belief_counts(),
                 pipe_gap_stalls = governor.pipe_gap_stalls(),
+                // FR-79 V5b — see the FFmpeg pump's heartbeat.
+                pipe_measured = ?governor
+                    .measured_bps(std::time::Instant::now(), constrained_transport),
+                readings_refuted = governor.readings_refuted(),
                 // FR-59 P1 — see the FFmpeg pump's heartbeat.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
                 // FR-70 P1 — what stands in for a pipe measurement while
@@ -9196,6 +9200,8 @@ async fn media_pump_ffmpeg_dc(
             // applied rate at the last window is wherever the last decrease
             // left it, which on a lumpy relay drifts the memory DOWN across
             // sessions (200 kbps was an attractor, not a stale day).
+            // FR-79 V5b — `stable_bps()` is a hold a valid window carried. A hold
+            // nothing carried used to write the session's own opener back here.
             rate_memory_guard.stable.store(
                 governor
                     .stable_bps()
@@ -10016,12 +10022,18 @@ async fn media_pump_ffmpeg_dc(
                 evidence_rejected = ?governor.evidence_rejected(),
                 // FR-79 V3b (SHADOW) — the ONE belief beside the old composition:
                 // believed / demonstrated floor / pushed-back capacity, and the
-                // (deliveries, capacities) that produced them. Nothing reads these
-                // yet; they exist so the field can say whether the belief is sane
-                // before a loop acts on it.
+                // (deliveries, capacities) that produced them. Only V5b reads the
+                // belief, and only whether the floor rose; these exist so the field
+                // can say whether the belief is sane before a loop acts on it.
                 pipe_belief = ?governor.belief_bps(std::time::Instant::now()),
                 pipe_belief_n = ?governor.belief_counts(),
                 pipe_gap_stalls = governor.pipe_gap_stalls(),
+                // FR-79 V5b — what a stall is judged against: a live reading, never
+                // the prior's stand-in. None = no claim to contradict, so a stall
+                // cuts nothing. `readings_refuted` counts the deliveries that took
+                // out what stood below them; `goodput_bps` reads None after one.
+                pipe_measured = ?governor.measured_bps(std::time::Instant::now(), constrained),
+                readings_refuted = governor.readings_refuted(),
                 // FR-59 P1 — the floor actually in force once the measured
                 // pipe has been shown to sit under the nominal legibility
                 // minimum. None = the flat floor stands, which on a slow

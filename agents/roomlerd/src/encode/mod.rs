@@ -467,6 +467,19 @@ pub fn queue_drain_enabled() -> bool {
     tunnel_core::env::node_env("QUEUE_DRAIN").as_deref() != Some("0")
 }
 
+/// FR-79 V5b kill switch (2026-11-02): when on (default), only a measurement is
+/// evidence about the rate. A transit stall is judged against a live reading and
+/// never the prior's stand-in, and it no longer walks that prior; a later
+/// delivery at twice a reading or more takes the reading out; and a hold counts
+/// for the pair memory only if a valid window carried it. `0` = V5a's rules.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn measured_evidence_enabled() -> bool {
+    tunnel_core::env::node_env("MEASURED_EVIDENCE").as_deref() != Some("0")
+}
+
 /// FR-59 P5 kill switch (2026-09-01): when on (default), a constrained
 /// session whose pair the rate memory remembers as SLOW opens with fewer
 /// pixels and fewer frames (see `rate_profile::slow_link_profile`).

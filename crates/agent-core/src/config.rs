@@ -1426,6 +1426,13 @@ pub struct AgentConfig {
     /// pause loses no frames. `false` = rate control only.
     #[serde(default)]
     pub queue_drain: Option<bool>,
+    /// FR-79 V5b — only a measurement is evidence about the rate
+    /// (`ROOMLERD_MEASURED_EVIDENCE`). Built-in default: on. A transit stall is
+    /// judged against a live reading and never the prior's stand-in, a later
+    /// delivery at twice a reading takes the reading out, and a hold reaches
+    /// the pair memory only if a valid window carried it. `false` = V5a's rules.
+    #[serde(default)]
+    pub measured_evidence: Option<bool>,
     /// FR-59 P5 — a constrained session whose pair the rate memory
     /// remembers as SLOW opens with fewer pixels and fewer frames
     /// (`ROOMLERD_SLOW_LINK_PROFILE`). Built-in default: on. The bitrate
@@ -3020,6 +3027,7 @@ pub fn test_fixture() -> AgentConfig {
         seed_contradiction: None,
         viewer_rate_clamp: None,
         queue_drain: None,
+        measured_evidence: None,
         slow_link_profile: None,
         slow_link_profile_bps: None,
         bg_rebuild: None,
@@ -3170,7 +3178,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 94] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 95] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -3186,6 +3194,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 94]
         ("SEED_CONTRADICTION", cfg.seed_contradiction),
         ("VIEWER_RATE_CLAMP", cfg.viewer_rate_clamp),
         ("QUEUE_DRAIN", cfg.queue_drain),
+        ("MEASURED_EVIDENCE", cfg.measured_evidence),
         ("SLOW_LINK_PROFILE", cfg.slow_link_profile),
         ("BG_REBUILD", cfg.bg_rebuild),
         ("PAR_CONVERT", cfg.par_convert),
