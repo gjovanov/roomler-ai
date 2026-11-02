@@ -624,7 +624,7 @@ VP9 DataChannel is 4:4:4 by default), less what the build cannot open (`BuildCap
 | `rtp:h264` | `encode::open_for_codec`: Media Foundation's cascade on Windows, then OpenH264 | `mf-encoder` (Windows) |
 | `rtp:h265` | FFmpeg's HEVC cascade, then MF's | FFmpeg or MF |
 | `rtp:av1` | MF's AV1 | MF |
-| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5247`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
+| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5310`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
 | `dc:vp9`, `dc:vp9:444` | the session's quick probe at 480×270, then FFmpeg's VP9 if it opened, else libvpx | FFmpeg |
 | `named` | `encode::open_named`, past every cascade and the denylist | FFmpeg |
 
@@ -709,10 +709,13 @@ cascades and `--name` are hardware by construction, so they always ask.
   is the CPU's clock, not the encoder.
 - ⚠️ **Noise.** These are wall-clock times on a host doing other things. Run a cell twice and read
   the spread before comparing two hosts: the reference run below did, on a busy machine.
-- ⚠️ **One frame rate and one size to a comparison.** At `--bench-fps 60` a frame carries half the
-  motion of one at 30, so it costs less whatever the clock does: set a paced row against a
-  back-to-back row at the same `--bench-fps`. Run one size per process: on a Windows laptop an
-  H.264 row that followed a VP9-444 row at a smaller size read about twice as slow, on any core
+- ⚠️ **One frame rate to a comparison, one row to a process, and on Windows past 10 s.** At
+  `--bench-fps 60` a frame carries half the motion of one at 30, so it costs less whatever the
+  clock does: set a paced row against a back-to-back row at the same `--bench-fps`. On a hybrid
+  Windows laptop a process runs at full speed for its first 3–4 seconds and at half speed after,
+  at any cadence, unless `ROOMLERD_ENCODER_CLOCK=1`. So a row that starts late in its process reads
+  twice as slow for that reason alone, and an arm of 150 frames ends before most of it shows: use
+  `--bench-frames 300` at 30 fps or 600 at 60
   ([FR-112 §9](fr/FR-112-software-encoding-at-60-fps.md#9-field-verification-log)).
 
 **Reference run** (2026-10-30). A release build with the Linux release lane's features
