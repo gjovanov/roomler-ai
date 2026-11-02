@@ -143,7 +143,7 @@ Anything a deployed host — or a deployed *operator runbook* — already depend
   people's shell history.
 - residual on-disk paths not yet behind `appdirs` (§5).
 - the HTTP `user_agent("roomler-agent/…")` sent by the updater
-  (`agents/roomlerd/src/updater.rs:717,800,1002`). It is **recorded** into device/session
+  (`agents/roomlerd/src/updater.rs:718,800,1002`). It is **recorded** into device/session
   telemetry at `crates/api/src/ws/handler.rs:69` — confirm nothing *dispatches* on it before
   changing it, because changing it also changes what historical rows mean.
 
@@ -487,7 +487,7 @@ whole of it.
 
 - **Published GitHub release assets.** Already-published names are immutable. The updater's
   pickers key on extension + arch + the `-permachine-` infix, **not** on the `roomler-agent-`
-  prefix (`agents/roomlerd/src/updater.rs:414-484`) — verified, not assumed. This is why P2
+  prefix (`agents/roomlerd/src/updater.rs:414-485`) — verified, not assumed. This is why P2
   is low-risk and why no asset rename is forced.
 - The `ROOMLER__` **server** config prefix — a different product surface, not a retired name.
 - `roomler-setup`'s own naming, including the UAC lib-naming rule (`wizard_app` / `wizard_shared`
