@@ -262,6 +262,12 @@
             and we delete the stored YouTube data within 30 days of a revocation or on request to
             <a href="mailto:privacy@roomler.ai" class="text-primary">privacy@roomler.ai</a>.
           </p>
+          <p class="text-body-1 legal-muted mb-4">
+            Some of our pages show one of our videos. Until you press play, such a page shows a picture we host
+            ourselves, and <strong>your browser requests nothing from YouTube</strong>. When you press play, the
+            player loads from <code>www.youtube-nocookie.com</code>, and the YouTube Terms of Service and the Google
+            Privacy Policy named above apply to what happens in it.
+          </p>
         </section>
 
         <section class="mb-8">
