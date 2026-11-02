@@ -1206,6 +1206,7 @@ pub fn list_recordings(dir: &Path) -> Vec<RecordingItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// #3280 — a local recording's child opens the same encoders a session does, so
     /// a later caps try gives way to it, with no session in the registry.
@@ -1218,7 +1219,6 @@ mod tests {
         RECORDING.fetch_sub(1, Ordering::Relaxed);
         assert!(while_recording);
     }
-    use serde_json::json;
 
     #[test]
     fn events_fold_into_the_state_and_mark_the_end() {

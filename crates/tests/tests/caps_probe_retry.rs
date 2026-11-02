@@ -156,15 +156,15 @@ fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    // SAFETY: no other thread exists yet. The per-user cache is not this test's
-    // to read or write, and no environment variable moves it.
-    // RAW-ENV-DELIBERATE: this binary has no `tunnel_core` to reach `test_env` through,
-    // and `ROOMLERD_` is the spelling every reader tries first.
     let starts = std::env::temp_dir().join(format!(
         "caps-probe-retry-{}-{}",
         std::process::id(),
         now_ms()
     ));
+    // SAFETY: no other thread exists yet. The per-user cache is not this test's
+    // to read or write, and no environment variable moves it.
+    // RAW-ENV-DELIBERATE: this binary has no `tunnel_core` to reach `test_env` through,
+    // and `ROOMLERD_` is the spelling every reader tries first.
     unsafe {
         std::env::set_var("ROOMLERD_CAPS_CACHE", "0");
         std::env::set_var("ROOMLERD_AUTO_UPDATE", "0");
