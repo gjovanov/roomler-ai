@@ -1219,14 +1219,23 @@ flowchart TD
     T -->|no TLS there| FL["failed"]
 ```
 
-| Rule ([`measure`](../agents/roomlerd/src/hive/knowhow_probe.rs#L312)) | Why |
+| Rule ([`measure`](../agents/roomlerd/src/hive/knowhow_probe.rs#L330)) | Why |
 |---|---|
 | a name is resolved here, and **every** address is checked before any connect; one never-probed address refuses the whole probe | a name that points at a metadata service is not one to reach through its other addresses |
 | a connect goes only to an address that passed, the first that answers | a name that resolves elsewhere by the time of the connect reaches nothing new |
 | an address rule holds addresses, a name rule matches the name asked for ([`allows`](../crates/agent-core/src/probe_reach.rs#L181)) | listing `db.example.com` trusts that name's resolution; listing `10.0.0.0/8` trusts no name |
 | `tcp`: a connect and a close, not a byte sent | connect, never converse (decision 55) |
-| `tls`: a ClientHello, the leaf certificate read, the handshake signature checked (so the server holds the key of the certificate recorded), the chain neither trusted nor refused ([`SeeOnly`](../agents/roomlerd/src/hive/knowhow_probe.rs#L526)) | a private CA is what an organization's own services have; a probe says what the address presents |
+| `tls`: a ClientHello, the leaf certificate read, the handshake signature checked (so the server holds the key of the certificate recorded), the chain neither trusted nor refused ([`SeeOnly`](../agents/roomlerd/src/hive/knowhow_probe.rs#L544)) | a private CA is what an organization's own services have; a probe says what the address presents |
 | ten seconds for the whole probe; a probe id run once, and one sent again answered as it was | the server sends a probe again at a hello while it is unanswered |
+
+**Where it runs (FR-90 P8-2d-1).** Where the device's owner turned workers on (`hive_worker`), in a
+build with the vault, the measure runs in the device's worker, not the daemon: what it parses comes
+from a host the probe reached, and a fault in it costs that worker. The daemon keeps the prober: what
+it was asked, the answers it gave, the list above read under the config's lock, and the frame. The
+answer is the same word for word. A worker that cannot take a probe answers `failed`, the detail
+saying why (parked, not up within 10 s, lost during the probe), so it records nothing on a fact
+(§13.1), and it is never measured in the daemon instead. Someone asks again under a new id. The
+states: [`hive.md`](hive.md#the-devices-worker-fr-90-p8-2d-1).
 
 > [!WARNING]
 > **Link-local and the cloud metadata addresses are never reached, whatever

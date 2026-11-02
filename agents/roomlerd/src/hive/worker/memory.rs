@@ -13,7 +13,7 @@
 //! |---|---|
 //! | where | only where the daemon's own unit, as `run` identified it (`supervision::current`), answers `Delegate=yes` with `memory` among its `DelegateControllers`, asked of systemd within 5 s. As root a cgroup write succeeds without any delegation, so nothing is tried on a guess |
 //! | the daemon | moved, with every process in the unit's cgroup, into a leaf of its own (`roomlerd`) as the first worker is started, since cgroup v2 gives a controller to child cgroups only of a cgroup with no processes of its own; then the unit's cgroup hands `memory` down |
-//! | a worker | `hive-worker-<n>`, with `memory.max` at [`MAX_MEMORY`] and `memory.swap.max` at 0, since its memory holds the leases' values; it joins between fork and exec, writing itself into the cgroup's `cgroup.procs`, so it never runs a step outside it |
+//! | a worker | `hive-worker-<n>`, with `memory.max` at [`MAX_MEMORY`] (P8-2d-1: the device's worker, at its own bound, decision 72) and `memory.swap.max` at 0, since its memory holds the leases' values; it joins between fork and exec, writing itself into the cgroup's `cgroup.procs`, so it never runs a step outside it |
 //! | its end | its cgroup's `memory.events` read for an OOM kill, which is logged as the reason, and the cgroup removed |
 //! | a failure | where the unit delegates and the cgroups cannot be made, no worker runs: the bound is a limit as `RLIMIT_CORE` is (P8-2a-3), and a worker that cannot have it does not start |
 //!
@@ -33,7 +33,7 @@ use tracing::{info, warn};
 
 use super::Running;
 
-/// The most memory one worker holds, where its cgroup bounds it.
+/// The most memory one session's worker holds, where its cgroup bounds it.
 pub(crate) const MAX_MEMORY: u64 = 512 << 20;
 /// The leaf the daemon's own processes move into.
 const DAEMON_LEAF: &str = "roomlerd";
@@ -64,13 +64,13 @@ pub(crate) async fn prepare() {
             match ready().await {
                 Ok(Some(base)) => {
                     info!(
-                        base = %base.display(), max_mib = MAX_MEMORY >> 20,
-                        "hive: a session's worker runs in a cgroup of its own, its memory bounded"
+                        base = %base.display(),
+                        "hive: a worker runs in a cgroup of its own, its memory bounded"
                     );
                     Ready::Bound(base)
                 }
                 Ok(None) => {
-                    info!("hive: a session's worker runs without a memory bound: the service delegates no cgroup with the memory controller (systemd's Delegate=)");
+                    info!("hive: a worker runs without a memory bound: the service delegates no cgroup with the memory controller (systemd's Delegate=)");
                     Ready::Unbounded
                 }
                 Err(why) => {
@@ -217,14 +217,16 @@ pub(crate) struct Slot {
     /// Its `cgroup.procs`, which the child writes itself into: the parent's
     /// copy goes once the child is in.
     procs: Option<OwnedFd>,
+    /// Its `memory.max`.
+    max: u64,
 }
 
-/// The cgroup the next worker runs in: `None` where it runs without a bound,
-/// and an error where it must have one and cannot.
-pub(crate) fn slot() -> std::io::Result<Option<Slot>> {
+/// The cgroup the next worker runs in, holding it to `max`: `None` where it
+/// runs without a bound, and an error where it must have one and cannot.
+pub(crate) fn slot(max: u64) -> std::io::Result<Option<Slot>> {
     match READY.get() {
         None | Some(Ready::Unbounded) => Ok(None),
-        Some(Ready::Bound(base)) => slot_in(base).map(Some),
+        Some(Ready::Bound(base)) => slot_in(base, max).map(Some),
         Some(Ready::Broken(why)) => Err(std::io::Error::other(format!(
             "its memory bound could not be made: {why}"
         ))),
@@ -233,14 +235,14 @@ pub(crate) fn slot() -> std::io::Result<Option<Slot>> {
 
 static NO_SWAP_ACCOUNT: AtomicBool = AtomicBool::new(false);
 
-fn slot_in(base: &Path) -> std::io::Result<Slot> {
+fn slot_in(base: &Path, max: u64) -> std::io::Result<Slot> {
     let dir = base.join(format!(
         "{WORKER_PREFIX}{}",
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir(&dir)?;
     let made = (|| {
-        std::fs::write(dir.join("memory.max"), MAX_MEMORY.to_string())?;
+        std::fs::write(dir.join("memory.max"), max.to_string())?;
         // Its memory holds the leases' values: never on swap.
         match std::fs::write(dir.join("memory.swap.max"), "0") {
             Ok(()) => {}
@@ -263,6 +265,7 @@ fn slot_in(base: &Path) -> std::io::Result<Slot> {
         Ok(procs) => Ok(Slot {
             dir,
             procs: Some(procs),
+            max,
         }),
         Err(e) => {
             let _ = std::fs::remove_dir(&dir);
@@ -329,8 +332,8 @@ impl Running for Bounded {
                 warn!(
                     ?pid,
                     kills,
-                    max_mib = MAX_MEMORY >> 20,
-                    "hive: a session's worker was ended by the kernel for its memory: past its bound"
+                    max_mib = slot.max >> 20,
+                    "hive: a worker was ended by the kernel for its memory: past its bound"
                 );
             }
         }
@@ -342,9 +345,9 @@ impl Running for Bounded {
 #[cfg(test)]
 pub(crate) fn ready_for_test(base: &Path) -> Result<(), String> {
     let base = ready_at(base)?;
-    READY
-        .set(Ready::Bound(base))
-        .map_err(|_| "already made".to_string())
+    // Another test of this process made it ready first: the same cgroup.
+    let _ = READY.set(Ready::Bound(base));
+    Ok(())
 }
 
 #[cfg(test)]

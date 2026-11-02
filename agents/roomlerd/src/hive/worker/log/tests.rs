@@ -7,6 +7,8 @@ use tokio::net::UnixStream;
 use tracing_subscriber::layer::SubscriberExt;
 
 #[cfg(unix)]
+use super::super::link::Link;
+#[cfg(unix)]
 use super::super::recv;
 use super::*;
 

@@ -4985,8 +4985,8 @@ sequenceDiagram
   wall clock. On the vmtest guest whose clock had been corrected backwards by
   nine hours, the 0.4.132 orphan read as nine hours *younger* than the host that
   replaced it, so an "older than this host" rule would have left it running.
-- **When it runs.** Once before the first spawn (`supervisor.rs:1291`). Again in
-  the `Stop` arm (`supervisor.rs:1432`) before it gives up: if that pass ended an
+- **When it runs.** Once before the first spawn (`supervisor.rs:1302`). Again in
+  the `Stop` arm (`supervisor.rs:1443`) before it gives up: if that pass ended an
   orphan, the supervisor respawns instead of stopping.
 - **How the orphan ends.** `TerminateProcess` through the handle it was read
   with, waited on for up to 5 s (`terminate_and_wait`, `orphan.rs:353`).
