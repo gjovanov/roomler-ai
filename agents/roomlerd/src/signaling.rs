@@ -850,6 +850,12 @@ pub async fn run(
     // device offline. Warm it here instead, with the pump gated off and on a
     // blocking thread.
     let _ = tokio::task::spawn_blocking(crate::encode::caps::detect).await;
+    // #3280 — a first answer that ran short of time gets more tries, off to one
+    // side. It arms nothing on a healthy host, or in a second organization's loop.
+    crate::encode::caps::arm_retry({
+        let rc_sessions = rc_sessions.clone();
+        move || !rc_sessions.is_empty()
+    });
     // Overlay "Disconnect" control → this channel → the connect_once
     // loop, which tears the session down (peer close + ClientMsg::Terminate).
     // Created once; the receiver is polled inside connect_once across
@@ -1599,6 +1605,8 @@ async fn connect_once(
     }
 
     // Say hello.
+    // #3280 — read before the answer: one adopted in between is news next beat.
+    let mut last_announced_caps_generation = crate::encode::caps::generation();
     let mut hello_caps = stub_caps(cfg.overlay_multi_org, ctx.is_primary);
     // FR-90 P2c-3 — copies are held for the primary organization only: a
     // secondary org's connection never offers them, so its placement never
@@ -2347,6 +2355,9 @@ async fn connect_once(
                 // FR-101 P2b — the owner's floor is live too: a new `off` must
                 // reach the hub's strip (and its reason) within a beat.
                 let session_policy_now = crate::session_policy::caps_policy();
+                // #3280 — a later try's answer replaced the probe's: its cells
+                // reach this row within a beat. Read before `stub_caps` below.
+                let caps_generation_now = crate::encode::caps::generation();
                 let caps = if caps_now == last_announced_permissions
                     && record_now == last_announced_record
                     && apps_now == last_announced_apps
@@ -2358,6 +2369,7 @@ async fn connect_once(
                     && ssh_system_now == last_announced_ssh_system
                     && privacy_now == last_announced_privacy
                     && session_policy_now == last_announced_session_policy
+                    && caps_generation_now == last_announced_caps_generation
                 {
                     None
                 } else {
@@ -2372,6 +2384,7 @@ async fn connect_once(
                     last_announced_ssh_system = ssh_system_now;
                     last_announced_privacy = privacy_now;
                     last_announced_session_policy = session_policy_now;
+                    last_announced_caps_generation = caps_generation_now;
                     // Our own caps AS THE HELLO BUILT THEM — the server replaces
                     // its stored blob with this, so anything the hello carried
                     // (`multi_org` `tun`, `record`) must be here too — with the
@@ -2401,6 +2414,7 @@ async fn connect_once(
                         apps = ?c.apps,
                         audio = ?c.audio,
                         desktop = ?c.desktop,
+                        video_cells = c.video_cells.len(),
                         "announcing changed capabilities on the heartbeat (FR-43 P2c)"
                     );
                     Some(Box::new(c))
@@ -3348,6 +3362,13 @@ async fn handle_server_msg(
     if let ServerMsg::Terminate { session_id, .. } = &msg {
         crate::extauth::end_session(remote_cfg, *session_id);
         remote_cfg.peer_auth_offers().forget(*session_id);
+    }
+
+    // #3280 — a session asked, before anything that could wait on a person: a
+    // later caps try gets out of its way. Ahead of the delegation, because the
+    // GPU is shared whichever process serves the session.
+    if matches!(msg, ServerMsg::Request { .. }) {
+        crate::encode::caps::session_asked();
     }
 
     // FR-43 P2b — hand a remote-desktop session to the GUI worker, if there is

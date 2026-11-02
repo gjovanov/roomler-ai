@@ -434,11 +434,12 @@ fn upload_into(frames: *mut ff::AVBufferRef, sw: &frame::Video) -> Result<frame:
 }
 
 /// FR-118 P2-3 — the encoders whose GPU-input form the capability probe proved
-/// in its child process. `caps::detect` installs them once, before any session.
-static PROVEN: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+/// in its child process. `caps::detect` installs them before any session, and
+/// again only when a later try's answer is adopted with no session live (#3280).
+static PROVEN: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 pub(crate) fn install_proven(names: Vec<String>) {
-    let _ = PROVEN.set(names);
+    *PROVEN.write().unwrap_or_else(|e| e.into_inner()) = names;
 }
 
 /// Whether `name`'s GPU-input form may open in this process: the probe child
@@ -448,8 +449,10 @@ pub(crate) fn install_proven(names: Vec<String>) {
 fn proven(name: &str) -> bool {
     crate::encode::caps::in_probe_child()
         || PROVEN
-            .get()
-            .is_some_and(|names| names.iter().any(|n| n == name))
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|n| n == name)
 }
 
 /// A QSV encoder's input on the capture's D3D11 device: the frame pool the

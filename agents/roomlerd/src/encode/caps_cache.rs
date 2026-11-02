@@ -430,7 +430,19 @@ mod tests {
             cell: "hevc_vulkan:yuv420".into(),
             why: "exit code: 0xc0000005".into(),
             confirmed: true,
+            timed_out: false,
         }]
+    }
+
+    /// #3280 — the file a confirmed deny is written to reads the same as before
+    /// the flag, for an older agent and for the diff of a host's own file.
+    #[test]
+    fn a_confirmed_deny_leaves_the_files_bytes_alone() {
+        let json = serde_json::to_string(&learned_vulkan()).unwrap();
+        assert!(!json.contains("timed_out"), "{json}");
+        let older = r#"[{"cell":"hevc_vulkan:yuv420","why":"x","confirmed":true}]"#;
+        let read: Vec<crate::encode::cells::LearnedDeny> = serde_json::from_str(older).unwrap();
+        assert!(!read[0].timed_out, "a file from before the flag");
     }
 
     /// #3267 — a learned deny rides the cache with the caps it produced, so a

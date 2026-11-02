@@ -122,6 +122,12 @@ pub struct LearnedDeny {
     /// status. Only a confirmed cell may be cached; any other (a hang, a kill)
     /// is denied for this process's life and tested again at the next start.
     pub confirmed: bool,
+    /// #3280 — denied for want of time: a hang, or a child that would not die.
+    /// That says nothing against the cell, so a later try starts without it
+    /// (`caps::list_for_a_try`). Never set on a confirmed cell, so the cache's
+    /// bytes do not change.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timed_out: bool,
 }
 
 /// What this process learned. `RwLock`, not `OnceLock`: the probe adds to it
@@ -138,16 +144,28 @@ pub(crate) fn install_learned(learned: Vec<LearnedDeny>) {
     *LEARNED.write().unwrap_or_else(|e| e.into_inner()) = learned;
 }
 
+/// #3280 — add to this process's list, keeping what is on it. A confirmed fault
+/// replaces a weaker entry for its cell. What a later try finds takes effect here
+/// at once, whatever becomes of that try's answer.
+pub(crate) fn join_learned(found: impl IntoIterator<Item = LearnedDeny>) {
+    let mut list = LEARNED.write().unwrap_or_else(|e| e.into_inner());
+    for deny in found {
+        match list.iter_mut().find(|l| l.cell == deny.cell) {
+            Some(held) if deny.confirmed && !held.confirmed => *held = deny,
+            Some(_) => {}
+            None => list.push(deny),
+        }
+    }
+}
+
 /// What this process learned, with why.
 pub fn learned() -> Vec<LearnedDeny> {
     LEARNED.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// The learned cells in force here: this process's own, and those its parent
-/// handed down. A `caps-probe` child or a recorder runs no probe of its own to
-/// learn them from, and it opens the same drivers.
-fn learned_names() -> Vec<String> {
-    let mut names: Vec<String> = learned().into_iter().map(|l| l.cell).collect();
+/// The names on `list`, and those this process's parent handed down.
+fn names_with_inherited(list: &[LearnedDeny]) -> Vec<String> {
+    let mut names: Vec<String> = list.iter().map(|l| l.cell.clone()).collect();
     if let Some(v) = tunnel_core::env::node_env(LEARNED_ENV) {
         for name in parse_denylist(&v) {
             if !names.contains(&name) {
@@ -158,14 +176,26 @@ fn learned_names() -> Vec<String> {
     names
 }
 
-/// The environment that hands the learned cells to a process this daemon
-/// starts. `std::env::set_var` is not an option in a process this threaded.
-pub(crate) fn learned_for_child() -> Vec<(String, String)> {
-    let names = learned_names();
+/// The learned cells in force here: this process's own, and those its parent
+/// handed down. A `caps-probe` child or a recorder runs no probe of its own to
+/// learn them from, and it opens the same drivers.
+fn learned_names() -> Vec<String> {
+    names_with_inherited(&learned())
+}
+
+/// The environment that hands `list` to a process this daemon starts.
+/// `std::env::set_var` is not an option in a process this threaded.
+pub(crate) fn list_for_child(list: &[LearnedDeny]) -> Vec<(String, String)> {
+    let names = names_with_inherited(list);
     if names.is_empty() {
         return Vec::new();
     }
     vec![(format!("ROOMLERD_{LEARNED_ENV}"), names.join(","))]
+}
+
+/// [`list_for_child`], for this process's own list.
+pub(crate) fn learned_for_child() -> Vec<(String, String)> {
+    list_for_child(&learned())
 }
 
 /// #3267 — `ROOMLERD_CAPS_LEARN_DENY=0` / `caps_learn_deny = false` puts back
@@ -195,8 +225,15 @@ fn configured_denied_cells() -> Vec<String> {
 /// `encoder_cells_deny` keeps meaning what it says: it still replaces the
 /// built-in, and clearing it still goes back to the built-in.
 pub(crate) fn denied_cells() -> Vec<String> {
+    denied_with(&learned())
+}
+
+/// #3280 — [`denied_cells`], with `list` standing in for this process's own. A
+/// later try works from its own list, so that the daemon's never relaxes while
+/// a cell is being tested.
+pub(crate) fn denied_with(list: &[LearnedDeny]) -> Vec<String> {
     let mut deny = configured_denied_cells();
-    for cell in learned_names() {
+    for cell in names_with_inherited(list) {
         if !deny.contains(&cell) {
             deny.push(cell);
         }
@@ -364,6 +401,7 @@ mod tests {
             cell: cell.to_string(),
             why: "exit code: 0xc0000005".to_string(),
             confirmed: true,
+            timed_out: false,
         }
     }
 
