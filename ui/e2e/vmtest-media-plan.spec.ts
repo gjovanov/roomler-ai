@@ -12,7 +12,9 @@
  *   MP_EXPECT_PAINTS    `0`: no frame may paint. `1`: a frame must paint
  *   MP_EXPECT_PLAN      a regex a logged `[rc] media plan` line must match
  *   MP_EXPECT_NO_PLAN   `1`: no such line may appear, for an older agent
- *   MP_UI_DIST          serve the viewer from this `dist` directory at the production origin, for a read before a promote
+ *   MP_EXPECT_NO_BLINK  `1`: once an overlay shows, it stays until the end of the wait
+ *   MP_EXPECT_HZ        a regex a logged `[rc] viewer_hz` line must match
+ *   MP_UI_DIST         serve the viewer from this `dist` directory at the production origin, for a read before a promote
  *   MP_SHOT             where the screenshot goes
  *   E2E_RC_CODEC        the codec picker's value for this agent
  */
@@ -32,6 +34,8 @@ const EXPECT_REASON = process.env.MP_EXPECT_REASON || ''
 const EXPECT_PAINTS = process.env.MP_EXPECT_PAINTS || ''
 const EXPECT_PLAN = process.env.MP_EXPECT_PLAN || ''
 const EXPECT_NO_PLAN = process.env.MP_EXPECT_NO_PLAN === '1'
+const EXPECT_NO_BLINK = process.env.MP_EXPECT_NO_BLINK === '1'
+const EXPECT_HZ = process.env.MP_EXPECT_HZ || ''
 const UI_DIST = process.env.MP_UI_DIST || ''
 const SHOT = process.env.MP_SHOT || ''
 const CODEC_STORAGE_PREFIX = 'roomler-rc-codec.v1:'
@@ -165,12 +169,20 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   await connect.click()
 
   // Every overlay this page can show, read once a second, so one that a re-created session clears still counts.
+  // `blink` counts the reads with the words gone again: a page that keeps saying why must not stop saying it.
   const t0 = Date.now()
+  let firstWords = false
+  let blink = 0
   while (Date.now() - t0 < WAIT_MS) {
     const words = await page
       .locator('.no-media-overlay')
       .allInnerTexts()
       .catch(() => [] as string[])
+    if (words.length > 0) firstWords = true
+    else if (firstWords) {
+      blink++
+      say(`no overlay after ${Date.now() - t0} ms`)
+    }
     for (const w of words) {
       const clean = w.replace(/\s+/g, ' ').trim()
       if (clean && !overlayWords.has(clean)) {
@@ -189,7 +201,7 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   if (SHOT) await page.screenshot({ path: SHOT }).catch(() => undefined)
   const paints = painted + (video.w > 0 && video.t > 0 ? 1 : 0)
   const overlay = [...overlayWords].join(' | ')
-  say(`RESULT browser=${browserName} paints=${paints} video=${video.w} sessions=${sessionsAsked} plans=${plans.length} hz=${hzLines.length} overlay="${overlay.slice(0, 500)}"`)
+  say(`RESULT browser=${browserName} paints=${paints} video=${video.w} sessions=${sessionsAsked} plans=${plans.length} hz=${hzLines.length} blink=${blink} overlay="${overlay.slice(0, 500)}"`)
 
   const disconnect = page.locator('button[aria-label="Disconnect"]').first()
   if (await disconnect.isVisible().catch(() => false)) await disconnect.click().catch(() => undefined)
@@ -200,4 +212,6 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   if (EXPECT_PAINTS === '1') expect(paints).toBeGreaterThan(0)
   if (EXPECT_PLAN) expect(plans.join('\n')).toMatch(new RegExp(EXPECT_PLAN))
   if (EXPECT_NO_PLAN) expect(plans.length).toBe(0)
+  if (EXPECT_NO_BLINK) expect(blink).toBe(0)
+  if (EXPECT_HZ) expect(hzLines.join('\n')).toMatch(new RegExp(EXPECT_HZ))
 })
