@@ -1,0 +1,68 @@
+# The compose files' coturn, started from the file and driven with a real TURN client (#3287).
+#
+# A fresh install's coturn crash-looped, and then, with the flag gone, refused every relay
+# to the public address, and no lane starts coturn, so nothing noticed. This runs the check
+# a self-hoster runs, with the file's own image and command, in about a minute a file. Nothing here
+# compiles anything or starts the server.
+#
+# ⚠️ ROOMLER_PUBLIC_IP is a documentation address (RFC 5737), not this runner's. A permission
+# to it needs no route, and it stays out of every deny range, so a refusal can only come
+# from what coturn does with its own public address.
+name: selfhost-coturn
+
+on:
+  pull_request:
+    paths:
+      - 'docker-compose.selfhost.yml'
+      - 'docker-compose.yml'
+      - 'turnserver.conf'
+      - '.env.selfhost.example'
+      - 'scripts/selfhost-coturn-check.sh'
+      - '.github/workflows/selfhost-coturn.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'docker-compose.selfhost.yml'
+      - 'docker-compose.yml'
+      - 'turnserver.conf'
+      - '.env.selfhost.example'
+      - 'scripts/selfhost-coturn-check.sh'
+      - '.github/workflows/selfhost-coturn.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  coturn:
+    name: coturn stays up and relays
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: An env file, made the way the docs make one
+        run: |
+          env="$RUNNER_TEMP/selfhost.env"
+          cp .env.selfhost.example "$env"
+          sed -i "s|^ROOMLER_JWT_SECRET=.*|ROOMLER_JWT_SECRET=$(openssl rand -hex 32)|" "$env"
+          sed -i "s|^ROOMLER_TURN_SECRET=.*|ROOMLER_TURN_SECRET=$(openssl rand -hex 32)|" "$env"
+          sed -i "s|^MONGO_ROOT_PASSWORD=.*|MONGO_ROOT_PASSWORD=$(openssl rand -hex 24)|" "$env"
+          sed -i "s|^MINIO_ROOT_PASSWORD=.*|MINIO_ROOT_PASSWORD=$(openssl rand -hex 24)|" "$env"
+          sed "s|^ROOMLER_PUBLIC_IP=.*|ROOMLER_PUBLIC_IP=203.0.113.10|" "$env" > "$RUNNER_TEMP/selfhost-public.env"
+
+      # Every step below runs however the one before it ended: each file's answer is its own.
+      - name: docker-compose.selfhost.yml, with a public address
+        run: bash scripts/selfhost-coturn-check.sh --file docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost-public.env"
+
+      - name: docker-compose.selfhost.yml, with the example's defaults
+        if: ${{ !cancelled() }}
+        run: |
+          docker compose -f docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost.env" down -v --remove-orphans
+          bash scripts/selfhost-coturn-check.sh --file docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost.env"
+
+      - name: docker-compose.yml, the development stack
+        if: ${{ !cancelled() }}
+        run: |
+          docker compose -f docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost.env" down -v --remove-orphans
+          bash scripts/selfhost-coturn-check.sh --file docker-compose.yml
