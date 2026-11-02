@@ -1195,9 +1195,9 @@ impl DxgiCapture for DxgiDirectBackend {
         // device's multithread lock (measured on #3272: taking the lock went
         // from 1 µs to 22 ms, and a readback from 6 ms to 67 ms), and an encoder
         // reads a GPU frame back on this device from another thread. Polling
-        // instead is no way out: the 2 ms poll cost 11 ms of L4 on a still screen
-        // and 24 ms with a pointer moving. The only pump that waits is the RTP
-        // one, and its H.264 encoders read every frame back anyway.
+        // instead is no way out: the 2 ms poll cost 11 ms of L4 on a still screen,
+        // on a guest with no real GPU. The only pump that waits is the RTP one,
+        // and its H.264 encoders read every frame back anyway.
         let gpu_frames = wait_ms == 0;
         // SAFETY: out-params are valid; duplication is live.
         unsafe {
