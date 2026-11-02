@@ -233,6 +233,7 @@ pub fn start_clean() {
 
 /// Do these name two different local app-data folders? Case and a trailing
 /// separator aside. `false` when either is unknown.
+#[cfg(any(target_os = "windows", test))]
 fn names_another_profile(session_data: Option<&str>, own: Option<&std::path::Path>) -> bool {
     let clean = |s: &str| s.trim_end_matches(['\\', '/']).to_ascii_lowercase();
     match (session_data, own.and_then(std::path::Path::to_str)) {

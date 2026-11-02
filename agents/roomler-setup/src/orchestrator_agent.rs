@@ -586,6 +586,7 @@ async fn run_install_inner(
     // has the rights. Best-effort: a failure is logged + surfaced but
     // doesn't abort the install (the config still lands; the operator
     // can re-tighten). See harden_machine_global_dir.
+    #[cfg(target_os = "windows")]
     if is_system_context && let Err(e) = harden_machine_global_dir(&config_path) {
         emit(
             on_event,
@@ -1472,6 +1473,7 @@ fn flavour_parts(role: Role) -> Result<(WindowsInstallFlavour, bool), String> {
 /// Windows (`Administratoren`, etc.) and a name-based grant would
 /// fail there. `*S-1-5-18` = LocalSystem, `*S-1-5-32-544` =
 /// Administrators.
+#[cfg(target_os = "windows")]
 fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String> {
     let roomler_dir = config_path
         .parent() // …\roomler\<segment>
