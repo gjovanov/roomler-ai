@@ -413,15 +413,15 @@
             Return='ignore' />
 
         <!--
-          #3292: stop a running daemon. Restart Manager does not, with a console
-          window or without one (measured 0.4.196 to 0.4.197 and on the launcher:
-          the log says "Successfully shut down all applications", there is no event
-          10002, and the daemon runs on). Without this action an upgrade by hand
-          keeps the old daemon until the next sign-in, and an uninstall leaves it
-          running with its files gone, both with exit 0. `service stop` asks through
-          the daemon's stop event and otherwise ends the task, whose kill-on-close
-          job takes the daemon. Return="ignore" because a failure here must not fail
-          an uninstall.
+          #3292: stop a running daemon at an uninstall. Restart Manager does not:
+          the daemon declines its ENDSESSION_CLOSEAPP on purpose
+          (docs/ephemeral-nodes.md), the log still says "Successfully shut down all
+          applications", there is no event 10002, and the daemon runs on (measured
+          0.4.196 to 0.4.197). Without this action an uninstall exits 0 and leaves it
+          running with its files gone. A plain `service stop`, so an ephemeral device
+          removes itself: it is leaving. It asks through the daemon's stop event and
+          otherwise ends the task, whose kill-on-close job takes the daemon.
+          Return="ignore" because a failure here must not fail an uninstall.
         -->
         <CustomAction
             Id='StopDaemon'
@@ -432,15 +432,17 @@
             Return='ignore' />
 
         <!--
-          #3292: the same stop from the NEW product, for an upgrade from a release
-          whose table has no StopDaemon. That daemon holds the stop event, and only
-          the new files are left to ask it: otherwise it stays in its terminal on
-          renamed files, and the new task's one-shots exit 8 until the next sign-in.
+          #3292: the stop on an upgrade, from the NEW product, so it also reaches a
+          daemon from a release without these actions. Otherwise that daemon stays in
+          its terminal on renamed files until the next sign-in, and the new task's
+          one-shots exit 8. The for-upgrade flag records an update attempt first: a
+          stop during an upgrade must not unenroll an ephemeral device (#1683,
+          updater::should_self_unenroll).
         -->
         <CustomAction
             Id='StopOldDaemon'
             FileKey='roomlerdw_exe'
-            ExeCommand='service stop'
+            ExeCommand='service stop --for-upgrade'
             Execute='deferred'
             Impersonate='yes'
             Return='ignore' />
@@ -497,11 +499,11 @@
                 NOT (REMOVE="ALL")
             </Custom>
             <!--
-              #3292: after InstallFiles, because it runs the new launcher. Nothing
-              to do when the old table stopped the daemon or the updater's daemon has
-              left: it finds no event, and no task to end either, the old one being
-              gone and the new one not yet written. A repair or a fresh install has
-              no WIX_UPGRADE_DETECTED and leaves a running daemon alone.
+              #3292: after InstallFiles, because it runs the new launcher. The
+              updater's daemon has already left, so there it finds no event, and no
+              task to end either, the old one being gone and the new one not yet
+              written. A repair or a fresh install has no WIX_UPGRADE_DETECTED and
+              leaves a running daemon alone.
             -->
             <Custom Action='StopOldDaemon' After='CleanupLegacyPerMachine'>
                 WIX_UPGRADE_DETECTED
@@ -517,14 +519,12 @@
             <!--
               #3292: BEFORE UnregisterAutostart, because deleting the task orphans
               a running instance and `service stop` falls back to ending that task.
-              REMOVE="ALL" also holds for the OLD product during a MajorUpgrade, so
-              an upgrade stops the old daemon from the old MSI's table, and the new
-              RegisterAutostart's one-shot starts the new one. On the updater's path
-              the daemon is already leaving, and msiexec is outside the launcher's
-              job, so this cannot take the install down with it.
+              REMOVE="ALL" also holds for the OLD product during a MajorUpgrade,
+              which UPGRADINGPRODUCTCODE tells apart: an upgrade's stop is
+              StopOldDaemon, and it must not be this plain one.
             -->
             <Custom Action='StopDaemon' Before='UnregisterAutostart'>
-                REMOVE="ALL"
+                REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE
             </Custom>
         </InstallExecuteSequence>
     </Product>

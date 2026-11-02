@@ -420,8 +420,9 @@ pub fn update_attempt_marker_path() -> Option<PathBuf> {
 /// moment the installer process is launched. Best-effort: any I/O
 /// failure is logged but does not block the update path (we'd
 /// rather have a working install with a noisy crash counter than
-/// no install at all).
-fn record_update_attempt() {
+/// no install at all). The per-user MSI's `service stop --for-upgrade`
+/// (#3292) calls it too: an upgrade by hand has no installer spawn of ours.
+pub fn record_update_attempt() {
     let Some(p) = update_attempt_marker_path() else {
         return;
     };

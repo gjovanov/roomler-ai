@@ -1040,6 +1040,12 @@ enum ServiceAction {
         /// --as-service`. Requires elevation on a stock install.
         #[arg(long, visible_alias = "system")]
         as_service: bool,
+        /// The per-user MSI's stop during an upgrade (#3292): records an update
+        /// attempt first, so an ephemeral device stays enrolled. The installer
+        /// replacing the files is not the device leaving
+        /// (`updater::should_self_unenroll`, #1683).
+        #[arg(long, hide = true)]
+        for_upgrade: bool,
     },
 }
 
@@ -5647,12 +5653,20 @@ async fn service_cmd(action: ServiceAction, config_path: &PathBuf) -> Result<()>
         ServiceAction::Uninstall { as_service: true } => service_uninstall_as_service(),
         ServiceAction::Status { as_service: true } => service_status_as_service(),
         ServiceAction::Start { as_service: true } => service_start_as_service(),
-        ServiceAction::Stop { as_service: false } => {
+        ServiceAction::Stop {
+            as_service: false,
+            for_upgrade,
+        } => {
+            if for_upgrade {
+                updater::record_update_attempt();
+            }
             let how = service::stop(config_path).context("stopping the daemon")?;
             println!("{how}");
             Ok(())
         }
-        ServiceAction::Stop { as_service: true } => service_stop_as_service(),
+        ServiceAction::Stop {
+            as_service: true, ..
+        } => service_stop_as_service(),
     }
 }
 
@@ -7427,6 +7441,60 @@ mod tests {
             Some(Command::KeepSystemContext { no_restart }) => assert!(!no_restart),
             other => panic!("expected KeepSystemContext, got {other:?}"),
         }
+    }
+
+    /// #3292 — the spellings in the per-user MSI's `StopOldDaemon` and
+    /// `StopDaemon`. Both are Return='ignore', so a flag that stopped parsing
+    /// would fail silently, and an upgrade would keep the old daemon again.
+    #[test]
+    fn parses_service_stop_as_the_msi_spells_it() {
+        for (argv, want) in [
+            (vec!["roomlerd", "service", "stop", "--for-upgrade"], true),
+            (vec!["roomlerd", "service", "stop"], false),
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            match cli.command {
+                Some(Command::Service {
+                    action:
+                        ServiceAction::Stop {
+                            as_service,
+                            for_upgrade,
+                        },
+                }) => {
+                    assert!(!as_service);
+                    assert_eq!(for_upgrade, want);
+                }
+                other => panic!("expected service stop, got {other:?}"),
+            }
+        }
+    }
+
+    /// #3292 — the two stops are not interchangeable. A plain stop during an
+    /// upgrade deletes an ephemeral device (#1683, `should_self_unenroll`), and
+    /// `REMOVE="ALL"` alone also holds for the old product during a MajorUpgrade.
+    #[test]
+    fn the_msi_keeps_the_plain_stop_out_of_an_upgrade() {
+        let wxs = include_str!("../wix/main.wxs");
+        let scheduled = |action: &str| -> String {
+            let open = format!("<Custom Action='{action}'");
+            let at = wxs.find(&open).expect("scheduled in the sequence");
+            let rest = &wxs[at..];
+            rest[..rest.find("</Custom>").expect("closed")].to_string()
+        };
+        let plain = scheduled("StopDaemon");
+        assert!(plain.contains("Before='UnregisterAutostart'"), "{plain}");
+        assert!(
+            plain.contains(r#"REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE"#),
+            "{plain}"
+        );
+        let upgrade = scheduled("StopOldDaemon");
+        assert!(upgrade.contains("WIX_UPGRADE_DETECTED"), "{upgrade}");
+        assert_eq!(wxs.matches("ExeCommand='service stop'").count(), 1);
+        assert_eq!(
+            wxs.matches("ExeCommand='service stop --for-upgrade'")
+                .count(),
+            1
+        );
     }
 
     #[test]
