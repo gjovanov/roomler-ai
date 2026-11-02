@@ -497,7 +497,7 @@ class ShadowReport {
   finish() {
     const classes = {};
     for (const c of CLASSES) {
-      classes[c] = { sessions: 0, viaIce: 0, over: 0, windows: 0, bucket: newBucket() };
+      classes[c] = { sessions: 0, viaIce: 0, over: 0, reached: SPENT_LABELS.map(() => 0), windows: 0, bucket: newBucket() };
     }
     let sessionsWithShadow = 0;
     const ffmpegSessions = { n: 0 };
@@ -523,6 +523,10 @@ class ShadowReport {
           classes[c].sessions++;
           if (b.viaIce) classes[c].viaIce++;
           if (b.cleanOver) classes[c].over++;
+          // How far this session's clean windows reached, for each row's session count.
+          let top = -1;
+          for (const key of b.spend.clean.keys()) top = Math.max(top, Number(key.split('|')[1]));
+          for (let i = 0; i <= top; i++) classes[c].reached[i]++;
         }
       }
       if (any) sessionsWithShadow++;
@@ -553,6 +557,9 @@ class ShadowReport {
       const b = k.bucket;
       if (c !== 'unknown') mergeBucket(pooled, b);
       out.classes[c] = summarise(b, { sessions: k.sessions, sessionsViaIce: k.viaIce, sessionsOver: k.over });
+      out.classes[c].spend.clean.bins.forEach((row, i) => {
+        row.atOrAbove.sessions = k.reached[i];
+      });
     }
     out.pooled = summarise(pooled, {});
 
@@ -648,7 +655,7 @@ function spendSummary(cube) {
       over2x: 0,
       over4x: 0,
       later: { windows: 0, over: 0 },
-      atOrAbove: { windows: 0, over: 0 },
+      atOrAbove: { windows: 0, over: 0, over25: 0 },
     })),
     encoders: {},
     overStates: {},
@@ -681,10 +688,12 @@ function spendSummary(cube) {
   }
   let windows = 0;
   let over = 0;
+  let over25 = 0;
   for (let i = o.bins.length - 1; i >= 0; i--) {
     windows += o.bins[i].windows;
     over += o.bins[i].over;
-    o.bins[i].atOrAbove = { windows, over };
+    over25 += o.bins[i].over25;
+    o.bins[i].atOrAbove = { windows, over, over25 };
   }
   return o;
 }
@@ -808,13 +817,14 @@ function renderSpend(r, L) {
         `First 120 s of a pump: ${k.opening.over} of ${k.opening.rated}; later: ${k.later.over} of ${k.later.rated}.`,
     );
     L.push('');
-    L.push('| spent, Mbps | clean windows | spent > shadow | by > 25 % | by > ×2 | by > ×4 | over, after the first 120 s | share over, at this spend or more |');
-    L.push('|---|---|---|---|---|---|---|---|');
+    L.push('| spent, Mbps | clean windows | spent > shadow | by > 25 % | by > ×2 | by > ×4 | over, after the first 120 s | at this spend or more: sessions | over | over by > 25 % |');
+    L.push('|---|---|---|---|---|---|---|---|---|---|');
     for (const b of k.bins) {
       if (!b.windows) continue;
+      const m = b.atOrAbove;
       L.push(
         `| ${b.spent} | ${b.windows} | ${b.over} | ${b.over25} | ${b.over2x} | ${b.over4x} | ` +
-          `${b.later.over} of ${b.later.windows} | ${share(b.atOrAbove.over, b.atOrAbove.windows)} |`,
+          `${b.later.over} of ${b.later.windows} | ${m.sessions} | ${share(m.over, m.windows)} | ${share(m.over25, m.windows)} |`,
       );
     }
     L.push('');
@@ -1217,6 +1227,12 @@ function selfTest() {
     'each row carries the share at its spend or more',
     rows,
   );
+  ok(rows[0].atOrAbove.over25 === 2 && rows[1].atOrAbove.over25 === 2 && mix.classes.direct.spend.clean.bins[1].atOrAbove.over25 === 2, 'and the same share over by more than 25 %', rows);
+  const slight = run(spending(s1, 3, { spend: 2.6 }));
+  ok(bin(slight).atOrAbove.over === 2 && bin(slight).atOrAbove.over25 === 0, 'a bite under 25 % is not over by more than 25 %', bin(slight).atOrAbove);
+  ok(rows[0].atOrAbove.sessions === 2 && rows[1].atOrAbove.sessions === 1, 'and how many sessions reached that spend', rows);
+  const short = clean(run([...spending(s1, 5, { spend: 0.2 }), ...spending(s2, 3, { spend: 8, from: 41 })], { minWindows: 4 })).bins;
+  ok(short[0].atOrAbove.sessions === 1 && short[4].atOrAbove.sessions === 0, '--min-windows gates those sessions too', short[0].atOrAbove);
 
   // A pump restarted (a new codec, a reopened channel) counts from zero.
   const rst = [
