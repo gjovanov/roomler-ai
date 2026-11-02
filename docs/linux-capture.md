@@ -2073,7 +2073,7 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 
 The encoder-capability cache is keyed on **build × hardware × knobs**, and the
 knob half is a SHA-256 over **every** `ROOMLERD_*` variable the daemon can see
-(`agents/roomlerd/src/encode/caps_cache.rs:24-27`, `:234-254`; the reasoning
+(`agents/roomlerd/src/encode/caps_cache.rs:26-29`, `:236-256`; the reasoning
 is in [`encoders.md`](encoders.md#the-probe-lifecycle)). So a capture flag
 that has nothing to do with encoding still changes the key, the single-entry
 cache misses (`a ROOMLERD_* knob changed`), and the next start runs the full

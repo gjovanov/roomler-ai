@@ -323,6 +323,9 @@ mod child {
     pub(super) struct Run {
         pub(super) ending: Ending,
         pub(super) stdout: String,
+        /// #3273 — the pipe had not ended at the bound, so `stdout` may be short
+        /// of what the child wrote, its report included.
+        pub(super) cut_off: bool,
         pub(super) elapsed: std::time::Duration,
     }
 
@@ -335,9 +338,9 @@ mod child {
         /// driver leaves ([`is_fault`]); `status` is that status, as the log
         /// says it.
         Died { status: String, fault: bool },
-        /// Still running at [`TIMEOUT`], and told to die for it (#3273: it may
-        /// not have).
-        Hung,
+        /// Still running at [`TIMEOUT`], and told to die for it. `gone` = it did
+        /// (#3273): one that did not is stuck in a kernel call in a driver.
+        Hung { gone: bool },
     }
 
     /// #3267 — whether a child's status is what a fault in a driver leaves,
@@ -419,6 +422,15 @@ mod child {
     /// The dev box's slowest run on record is 24 s.
     pub(super) const BASE_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
+    /// #3273 — the cells a session opens in the daemon whatever the caps say
+    /// (`encode::open_default`), so a host that lost its hardware still runs their
+    /// driver code in-process.
+    pub(super) const MF_IN_THE_DAEMON: &[&str] = if cfg!(windows) {
+        &[cells::MF_H264, cells::MF_HEVC, cells::MF_AV1]
+    } else {
+        &[]
+    };
+
     /// What a death in `base` means for the next run.
     enum Step {
         RunAgain,
@@ -454,7 +466,30 @@ mod child {
     impl BaseRetry {
         /// The child that ended with `ending` was inside `last_open`, and left
         /// no report. `elapsed` is since the first run started.
+        ///
+        /// #3273 — a child that would not die is a driver stuck in the kernel,
+        /// and what the daemon opens whatever the caps say could hang the same
+        /// way, on a wait with no bound. So those cells go too, for this process.
+        /// Not for a hang whose kill landed: a merely slow host keeps them.
         fn after_death(
+            &mut self,
+            last_open: Option<&str>,
+            ending: &Ending,
+            elapsed: std::time::Duration,
+        ) -> Step {
+            let step = self.weigh_death(last_open, ending, elapsed);
+            if *ending == (Ending::Hung { gone: false }) {
+                for name in MF_IN_THE_DAEMON {
+                    let cell = format!("{name}:{}", ChromaFormat::Yuv420.wire());
+                    if !self.denied.iter().any(|d| d.cell == cell) {
+                        self.deny(&cell, "a probe child would not die".to_string(), false);
+                    }
+                }
+            }
+            step
+        }
+
+        fn weigh_death(
             &mut self,
             last_open: Option<&str>,
             ending: &Ending,
@@ -462,9 +497,12 @@ mod child {
         ) -> Step {
             let suspect = self.suspect.take();
             match last_open {
-                // Nothing died and nothing was open: it just has no answer, and
-                // will not have one on a second run. A test binary, spawned as
-                // `caps-probe`, ends this way in every integration test.
+                // Nothing died and nothing was open: it just has no answer, and a
+                // second run would say the same. A test binary, spawned as
+                // `caps-probe`, ends this way in every integration test. So does a
+                // report lost to the bound on the read (`Run::cut_off`, #3273), for
+                // which a second run might well answer: `run_child` has logged it,
+                // and this does not try again.
                 None if *ending == Ending::Clean => {
                     return Step::GiveUp("a clean exit with no report");
                 }
@@ -482,7 +520,9 @@ mod child {
                 Some(cell) if self.denied.iter().any(|d| d.cell == cell) => {
                     return Step::GiveUp("a child died in a cell it was told not to open");
                 }
-                Some(cell) if *ending == Ending::Hung => self.deny(cell, "hung".to_string(), false),
+                Some(cell) if matches!(ending, Ending::Hung { .. }) => {
+                    self.deny(cell, "hung".to_string(), false)
+                }
                 Some(cell) => {
                     let (status, fault) = match ending {
                         Ending::Died { status, fault } => (status.as_str(), *fault),
@@ -623,18 +663,26 @@ mod child {
     /// is advertised, with the last open the child reported named in the log
     /// so the operator can denylist it.
     ///
+    /// #3273 — the `bool` beside the report: a `444` or `gpu` child ran out of
+    /// time ([`ran_out_of_time`]), so those forms are missing for want of an
+    /// answer, and the answer must not outlive this process.
+    ///
     /// Why two processes (FR-77 P3c, field 2026-09-08): CORPLAP-3's Intel
     /// media runtime died with 0xc0000005 on the first `vp9_qsv` 4:4:4 open
     /// over VUYX, and one child meant the daemon advertised NO hardware at
     /// all — `av1_qsv`, `h264_qsv`, `vp9_qsv` 4:2:0 all gone for a cell the
     /// session pump would never have needed.
-    pub(super) fn probe() -> Option<ProbeReport> {
+    pub(super) fn probe() -> Option<(ProbeReport, bool)> {
         if std::env::var_os(CHILD_ENV).is_some() {
             // We ARE the child (or something re-entered). Probing in-process
             // is what this process was started to do.
-            return Some(super::in_process_report(phase_from_env() != Phase::Base));
+            return Some((
+                super::in_process_report(phase_from_env() != Phase::Base),
+                false,
+            ));
         }
         let started = std::time::Instant::now();
+        let mut unfinished = false;
 
         let learning = cells::learning_enabled();
         let (base, learned) = run_base(
@@ -676,12 +724,16 @@ mod child {
                         );
                         merge_444(&mut report, &ok);
                     }
-                    None => tracing::warn!(
-                        tried = ?names,
-                        "caps probe: 4:4:4 phase printed no answer — advertising the 4:2:0 matrix"
-                    ),
+                    None => {
+                        unfinished |= ran_out_of_time(&run);
+                        tracing::warn!(
+                            tried = ?names,
+                            "caps probe: 4:4:4 phase printed no answer — advertising the 4:2:0 matrix"
+                        )
+                    }
                 },
                 other => {
+                    unfinished |= other.as_ref().is_some_and(ran_out_of_time);
                     let last = other
                         .as_ref()
                         .and_then(|r| last_progress(&r.stdout))
@@ -717,12 +769,16 @@ mod child {
                         );
                         report.gpu_input = ok;
                     }
-                    None => tracing::warn!(
-                        tried = ?gpu_names,
-                        "caps probe: GPU-input phase printed no answer — sessions take CPU frames"
-                    ),
+                    None => {
+                        unfinished |= ran_out_of_time(&run);
+                        tracing::warn!(
+                            tried = ?gpu_names,
+                            "caps probe: GPU-input phase printed no answer — sessions take CPU frames"
+                        )
+                    }
                 },
                 other => {
+                    unfinished |= other.as_ref().is_some_and(ran_out_of_time);
                     let last = other
                         .as_ref()
                         .and_then(|r| last_progress(&r.stdout))
@@ -750,7 +806,14 @@ mod child {
             learned_deny = ?cells::learned().iter().map(|l| l.cell.clone()).collect::<Vec<_>>(),
             "caps probe: child reported"
         );
-        Some(report)
+        Some((report, unfinished))
+    }
+
+    /// #3273 — whether a child ended for want of time, rather than with an
+    /// answer or a death of its own: it hung, or its stdout outlasted the bound.
+    /// What it did not say says nothing about the host.
+    pub(super) fn ran_out_of_time(run: &Run) -> bool {
+        matches!(run.ending, Ending::Hung { .. }) || run.cut_off
     }
 
     /// Spawn one `caps-probe` child with `extra` on top of the recursion
@@ -801,12 +864,26 @@ mod child {
         #[cfg(windows)]
         let _ends_with_us = tie_to_this_process(&childp);
 
-        let (waited, stdout) = wait_for_child(childp, TIMEOUT, KILL_WAIT, |c| {
+        let (waited, output) = wait_for_child(childp, TIMEOUT, KILL_WAIT, |c| {
             let _ = c.kill();
         });
+        let Output {
+            text: stdout,
+            cut_off,
+        } = output;
         let phase = extra.iter().find(|(k, _)| *k == PHASE_ENV);
         let phase = phase.map(|(_, v)| v.as_str());
         let last_open = last_progress(&stdout).unwrap_or_default();
+        if cut_off {
+            tracing::warn!(
+                kill_wait_s = KILL_WAIT.as_secs(),
+                ?phase,
+                %last_open,
+                "caps probe: the child's stdout had not ended at the bound, so anything it wrote \
+                 after that is lost, a report included. Something it started may hold the pipe, \
+                 or this host is too busy to read it in time."
+            );
+        }
         let status = match waited {
             Waited::Exited(status) => status,
             Waited::Hung { gone } => {
@@ -831,8 +908,9 @@ mod child {
                     );
                 }
                 return Some(Run {
-                    ending: Ending::Hung,
+                    ending: Ending::Hung { gone },
                     stdout,
+                    cut_off,
                     elapsed: started.elapsed(),
                 });
             }
@@ -855,12 +933,14 @@ mod child {
                     fault: is_fault(&status),
                 },
                 stdout,
+                cut_off,
                 elapsed: started.elapsed(),
             });
         }
         Some(Run {
             ending: Ending::Clean,
             stdout,
+            cut_off,
             elapsed: started.elapsed(),
         })
     }
@@ -1068,6 +1148,14 @@ mod child {
         Hung { gone: bool },
     }
 
+    /// #3273 — what [`collect_output`] got of a child's stdout.
+    #[derive(Debug)]
+    pub(super) struct Output {
+        pub(super) text: String,
+        /// The pipe had not ended by the deadline.
+        pub(super) cut_off: bool,
+    }
+
     /// #3273 — wait for a child and read what it wrote, for at most `timeout`
     /// plus `kill_wait`, whatever the child does.
     ///
@@ -1087,7 +1175,7 @@ mod child {
         timeout: std::time::Duration,
         kill_wait: std::time::Duration,
         kill: impl FnOnce(&mut std::process::Child),
-    ) -> (Waited, String) {
+    ) -> (Waited, Output) {
         // Read stdout on its own thread while waiting, so a chatty child cannot
         // fill the pipe and deadlock against our own wait.
         let output = read_output(child.stdout.take());
@@ -1100,68 +1188,100 @@ mod child {
         let gone = wait_bounded(&mut child, kill_wait).is_some();
         if !gone {
             // Reap it if that call ever returns, or it stays a zombie for as
-            // long as the daemon runs.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
+            // long as the daemon runs. On a host out of threads it goes unreaped,
+            // which is no reason to take the probe down.
+            let reaper = std::thread::Builder::new()
+                .name("roomlerd-caps-reap".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
+            if let Err(e) = reaper {
+                tracing::warn!(%e, "caps probe: no thread to reap the stuck child");
+            }
         }
         (Waited::Hung { gone }, collect_output(output, deadline))
     }
 
+    /// #3273 — a piece of a child's stdout, and when it arrived.
+    pub(super) type Chunk = (std::time::Instant, Vec<u8>);
+
     /// #3273 — a child's stdout, chunk by chunk as it arrives. The thread ends
     /// with the pipe, or at the first chunk after the receiver has gone.
-    fn read_output(
-        stdout: Option<std::process::ChildStdout>,
-    ) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    fn read_output(stdout: Option<std::process::ChildStdout>) -> std::sync::mpsc::Receiver<Chunk> {
         use std::io::Read;
         let (chunks, output) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let Some(mut stdout) = stdout else {
-                return;
-            };
-            let mut chunk = [0u8; 4096];
-            loop {
-                match stdout.read(&mut chunk) {
-                    Ok(0) => return,
-                    Ok(n) => {
-                        if chunks.send(chunk[..n].to_vec()).is_err() {
-                            return;
+        let reader = std::thread::Builder::new()
+            .name("roomlerd-caps-read".into())
+            .spawn(move || {
+                let Some(mut stdout) = stdout else {
+                    return;
+                };
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stdout.read(&mut chunk) {
+                        Ok(0) => return,
+                        Ok(n) => {
+                            let arrived = std::time::Instant::now();
+                            if chunks.send((arrived, chunk[..n].to_vec())).is_err() {
+                                return;
+                            }
                         }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => return,
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(_) => return,
                 }
-            }
-        });
+            });
+        // With no thread the sender is gone too, and this reads as a child that
+        // wrote nothing: the safe answer, and no panic on a host out of threads.
+        if let Err(e) = reader {
+            tracing::warn!(%e, "caps probe: no thread to read the child's stdout");
+        }
         output
     }
 
     /// #3273 — what [`read_output`] has read by `deadline`, or by the end of the
     /// pipe if that comes first.
     ///
+    /// By when a chunk ARRIVED, not by when this gets to it. A child that floods
+    /// its pipe never lets the wait below time out, so a chunk from after the
+    /// deadline has to end the read. And a stuck child's lines are already queued
+    /// when this starts, with the deadline spent on the kill: all of them count,
+    /// because the last `PROGRESS` line is the one that names its cell.
+    ///
     /// Lossy, because a driver's banner in the wrong code page should cost that
     /// banner and not the report beside it. A pipe that has not ended may have
     /// stopped mid-line, and half a `PROGRESS` line names a cell that does not
     /// exist, so what it gives back then stops at the last whole line.
     pub(super) fn collect_output(
-        output: std::sync::mpsc::Receiver<Vec<u8>>,
+        output: std::sync::mpsc::Receiver<Chunk>,
         deadline: std::time::Instant,
-    ) -> String {
+    ) -> Output {
         use std::sync::mpsc::RecvTimeoutError;
         let mut bytes = Vec::new();
+        let mut cut_off = false;
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match output.recv_timeout(left) {
-                Ok(chunk) => bytes.extend_from_slice(&chunk),
+                Ok((arrived, _)) if arrived > deadline => {
+                    cut_off = true;
+                    break;
+                }
+                Ok((_, chunk)) => bytes.extend_from_slice(&chunk),
                 Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {
-                    let whole = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-                    bytes.truncate(whole);
+                    cut_off = true;
                     break;
                 }
             }
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+        if cut_off {
+            let whole = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            bytes.truncate(whole);
+        }
+        Output {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            cut_off,
+        }
     }
 
     /// `wait` with a limit. `None` = still running when time ran out.
@@ -2130,21 +2250,14 @@ fn cached_or_probed() -> AgentCaps {
     }
 
     match child::probe() {
-        Some(report) => {
+        Some((report, unfinished)) => {
             install_vp9_qsv_idr(report.vp9_qsv_idr);
             install_gpu_input(report.gpu_input.clone());
             if let (Some(key), Some(path)) = (key, path) {
                 let learned = super::cells::learned();
-                if learned.iter().any(|l| !l.confirmed) {
-                    // #3267 — this answer leans on a cell a hang or a kill may
-                    // have cost for nothing. Freezing it would keep a healthy
-                    // cell out for as long as the cache lives.
-                    tracing::info!(
-                        learned_deny = ?learned,
-                        "caps probe: a cell is denied on a hang or a kill only — not cached, so \
-                         the next start tests it again"
-                    );
-                } else if cache::worth_caching(&report.caps) {
+                if let Some(why) = why_not_cached(&report.caps, &learned, unfinished) {
+                    tracing::info!(learned_deny = ?learned, "caps probe: not cached: {why}");
+                } else {
                     let file = cache::CacheFile::new(
                         key,
                         now,
@@ -2165,10 +2278,6 @@ fn cached_or_probed() -> AgentCaps {
                             "caps probe: could not write the cache — harmless, the next start probes again"
                         ),
                     }
-                } else {
-                    tracing::info!(
-                        "caps probe: no hardware cell opened — not cached (a boot-time driver race must not be frozen for a week)"
-                    );
                 }
             }
             report.caps
@@ -2181,6 +2290,28 @@ fn cached_or_probed() -> AgentCaps {
             // session. Everything that needs no driver still stands.
             compute_caps(false, false)
         }
+    }
+}
+
+/// Why this probe's answer must not outlive the process, or `None` when it may.
+fn why_not_cached(
+    caps: &AgentCaps,
+    learned: &[super::cells::LearnedDeny],
+    unfinished: bool,
+) -> Option<&'static str> {
+    if learned.iter().any(|l| !l.confirmed) {
+        // #3267 — this answer leans on a cell a hang or a kill may have cost for
+        // nothing. Freezing it would keep a healthy cell out for as long as the
+        // cache lives.
+        Some("a cell is denied on a hang or a kill only, so the next start tests it again")
+    } else if unfinished {
+        // #3273 — those forms are missing for want of an answer, and a hit would
+        // not ask again for a week.
+        Some("a 4:4:4 or GPU child ran out of time, so the next start asks again")
+    } else if !super::caps_cache::worth_caching(caps) {
+        Some("no hardware cell opened (a boot-time driver race must not be frozen for a week)")
+    } else {
+        None
     }
 }
 
@@ -4987,15 +5118,27 @@ mod tests {
                 fault,
             },
             stdout: format!("{}{cell}\n", child::PROGRESS),
+            cut_off: false,
             elapsed: std::time::Duration::from_secs(2),
         }
     }
 
     fn base_hung_in(cell: &str) -> child::Run {
         child::Run {
-            ending: child::Ending::Hung,
+            ending: child::Ending::Hung { gone: true },
             stdout: format!("{}{cell}\n", child::PROGRESS),
+            cut_off: false,
             elapsed: std::time::Duration::from_secs(60),
+        }
+    }
+
+    /// #3273 — the kill did not land.
+    fn base_stuck_in(cell: &str) -> child::Run {
+        child::Run {
+            ending: child::Ending::Hung { gone: false },
+            stdout: format!("{}{cell}\n", child::PROGRESS),
+            cut_off: true,
+            elapsed: std::time::Duration::from_secs(70),
         }
     }
 
@@ -5006,6 +5149,7 @@ mod tests {
                 fault: false,
             },
             stdout: String::new(),
+            cut_off: false,
             elapsed: std::time::Duration::from_secs(2),
         }
     }
@@ -5027,6 +5171,7 @@ mod tests {
         child::Run {
             ending: child::Ending::Clean,
             stdout: base_report_line(),
+            cut_off: false,
             elapsed: std::time::Duration::from_secs(4),
         }
     }
@@ -5400,6 +5545,7 @@ mod tests {
                         no = child::NO_OPEN,
                         line = base_report_line()
                     ),
+                    cut_off: false,
                     elapsed: secs(5),
                 }),
             )],
@@ -5416,6 +5562,7 @@ mod tests {
         let exited = || child::Run {
             ending: child::Ending::Clean,
             stdout: format!("{}vp9_qsv:yuv420\n", child::PROGRESS),
+            cut_off: false,
             elapsed: secs(2),
         };
         let out = run_base_scripted(
@@ -5440,6 +5587,7 @@ mod tests {
                 Some(child::Run {
                     ending: child::Ending::Clean,
                     stdout: "running 0 tests\n".to_string(),
+                    cut_off: false,
                     elapsed: secs(1),
                 }),
             )],
@@ -5806,7 +5954,7 @@ mod tests {
     const STAND_IN_HELD: std::time::Duration = std::time::Duration::from_secs(12);
     /// What a stand-in that has said its line gets before it counts as hung.
     const STAND_IN_HANG: std::time::Duration = std::time::Duration::from_secs(4);
-    const STAND_IN_KILL: std::time::Duration = std::time::Duration::from_secs(1);
+    const STAND_IN_KILL: std::time::Duration = std::time::Duration::from_secs(3);
     const STAND_IN_CELL: &str = "hevc_vulkan:yuv420";
 
     /// #3273 — nothing can make a real process ignore a kill, so this one is
@@ -5830,10 +5978,11 @@ mod tests {
             "{waited:?}"
         );
         assert_eq!(
-            child::last_progress(&stdout).as_deref(),
+            child::last_progress(&stdout.text).as_deref(),
             Some(STAND_IN_CELL),
             "the line that lets a stuck child cost one cell and not the host: {stdout:?}"
         );
+        assert!(stdout.cut_off, "the child still holds its pipe: {stdout:?}");
     }
 
     /// #3273 — the kill lands, and what the child started keeps the pipe open.
@@ -5860,7 +6009,7 @@ mod tests {
             "{waited:?}"
         );
         assert_eq!(
-            child::last_progress(&stdout).as_deref(),
+            child::last_progress(&stdout.text).as_deref(),
             Some(STAND_IN_CELL),
             "{stdout:?}"
         );
@@ -5897,7 +6046,7 @@ mod tests {
             "{waited:?}"
         );
         assert_eq!(
-            child::last_progress(&stdout).as_deref(),
+            child::last_progress(&stdout.text).as_deref(),
             Some(STAND_IN_CELL),
             "{stdout:?}"
         );
@@ -5923,9 +6072,10 @@ mod tests {
             "{waited:?}"
         );
         assert_eq!(
-            stdout.lines().map(str::trim).collect::<Vec<_>>(),
+            stdout.text.lines().map(str::trim).collect::<Vec<_>>(),
             ["one", "two"]
         );
+        assert!(!stdout.cut_off, "the pipe ended with the child");
     }
 
     /// #3273 — `read_to_string` dropped everything on one bad byte, and a report
@@ -5934,12 +6084,15 @@ mod tests {
     fn a_byte_that_is_not_utf8_costs_that_byte_and_not_the_rest() {
         let (chunks, output) = std::sync::mpsc::channel();
         chunks
-            .send(b"\xffbanner\nROOMLER_CAPS_PROGRESS:hevc_nvenc:yuv420\n".to_vec())
+            .send((
+                std::time::Instant::now(),
+                b"\xffbanner\nROOMLER_CAPS_PROGRESS:hevc_nvenc:yuv420\n".to_vec(),
+            ))
             .unwrap();
         drop(chunks);
         let stdout = child::collect_output(output, std::time::Instant::now());
         assert_eq!(
-            child::last_progress(&stdout).as_deref(),
+            child::last_progress(&stdout.text).as_deref(),
             Some("hevc_nvenc:yuv420"),
             "{stdout:?}"
         );
@@ -5953,23 +6106,221 @@ mod tests {
         let line = b"ROOMLER_CAPS_PROGRESS:hevc_nvenc:yuv420\nROOMLER_CAPS_PROGRESS:hevc_vul";
 
         let (chunks, output) = std::sync::mpsc::channel();
-        chunks.send(line.to_vec()).unwrap();
+        chunks
+            .send((std::time::Instant::now(), line.to_vec()))
+            .unwrap();
         let stdout = child::collect_output(output, std::time::Instant::now());
         drop(chunks);
         assert_eq!(
-            child::last_progress(&stdout).as_deref(),
+            child::last_progress(&stdout.text).as_deref(),
             Some("hevc_nvenc:yuv420"),
             "{stdout:?}"
         );
 
         let (chunks, output) = std::sync::mpsc::channel();
-        chunks.send(line.to_vec()).unwrap();
+        chunks
+            .send((std::time::Instant::now(), line.to_vec()))
+            .unwrap();
         drop(chunks);
         let stdout = child::collect_output(output, std::time::Instant::now());
         assert_eq!(
-            child::last_progress(&stdout).as_deref(),
+            child::last_progress(&stdout.text).as_deref(),
             Some("hevc_vul"),
             "{stdout:?}"
+        );
+    }
+
+    /// #3273 — the review's flood: chunks that keep coming never let the wait
+    /// time out, so the arm that takes one has to read the clock too, or
+    /// "at most `timeout` plus `kill_wait`, whatever the child does" is untrue.
+    #[test]
+    fn a_child_that_floods_its_pipe_does_not_outlast_the_deadline() {
+        let deadline = std::time::Instant::now() + secs(60);
+        let (chunks, output) = std::sync::mpsc::channel();
+        chunks
+            .send((deadline - secs(1), b"in time\n".to_vec()))
+            .unwrap();
+        for after in [1, 2, 3] {
+            chunks
+                .send((deadline + secs(after), b"too late\n".to_vec()))
+                .unwrap();
+        }
+        let got = child::collect_output(output, deadline);
+        assert!(got.cut_off, "{got:?}");
+        assert_eq!(got.text, "in time\n");
+    }
+
+    /// #3273 — a stuck child's lines are queued before the deadline, and the kill
+    /// spends the whole of it, so this starts with none left. Every line counts:
+    /// reading only the first would deny the first cell the child opened.
+    #[test]
+    fn a_stuck_child_still_gives_back_every_line_it_wrote_in_time() {
+        let (chunks, output) = std::sync::mpsc::channel();
+        for cell in ["h264_nvenc:yuv420", "-", "hevc_nvenc:yuv420"] {
+            chunks
+                .send((
+                    std::time::Instant::now(),
+                    format!("{}{cell}\n", child::PROGRESS).into_bytes(),
+                ))
+                .unwrap();
+        }
+        let got = child::collect_output(output, std::time::Instant::now());
+        assert!(got.cut_off, "the pipe has not ended: {got:?}");
+        assert_eq!(
+            child::last_progress(&got.text).as_deref(),
+            Some("hevc_nvenc:yuv420"),
+            "{got:?}"
+        );
+        drop(chunks);
+    }
+
+    /// #3273 — the review's medium: a `444` or `gpu` child that ran out of time
+    /// leaves a 4:2:0 answer with those forms missing for want of an answer.
+    /// Stored, it is a cache hit for a week that never tests them again.
+    #[test]
+    fn an_answer_short_of_time_is_not_frozen_in_the_cache() {
+        let mut caps = compute_caps(false, false);
+        caps.video_cells.push(VideoCell::new(
+            VideoCodec::H264,
+            VideoBackend::Nvenc,
+            &[ChromaFormat::Yuv420],
+            true,
+        ));
+        assert_eq!(why_not_cached(&caps, &[], false), None, "the plain case");
+        assert!(why_not_cached(&caps, &[], true).is_some());
+    }
+
+    /// #3273 — what counts as out of time. A fault's death is an answer about
+    /// the host and stays cached, as it always did.
+    #[test]
+    fn only_a_hang_or_a_read_cut_off_counts_as_out_of_time() {
+        let run = |ending, cut_off| child::Run {
+            ending,
+            stdout: String::new(),
+            cut_off,
+            elapsed: std::time::Duration::from_secs(1),
+        };
+        let fault = || child::Ending::Died {
+            status: "exit code: 0xc0000005".to_string(),
+            fault: true,
+        };
+        assert!(child::ran_out_of_time(&run(
+            child::Ending::Hung { gone: true },
+            false
+        )));
+        assert!(child::ran_out_of_time(&run(
+            child::Ending::Hung { gone: false },
+            true
+        )));
+        assert!(child::ran_out_of_time(&run(child::Ending::Clean, true)));
+        assert!(!child::ran_out_of_time(&run(child::Ending::Clean, false)));
+        assert!(!child::ran_out_of_time(&run(fault(), false)));
+    }
+
+    /// #3273 — the review's question: a host that comes online with no hardware
+    /// still runs Media Foundation's cascade in the daemon at its first session
+    /// (`encode::open_default`), on a wait with no bound. A child that would not
+    /// die is the evidence that it could hang there, so those cells go, for this
+    /// process only, and that session takes OpenH264.
+    #[test]
+    fn a_child_that_would_not_die_keeps_the_daemon_out_of_media_foundation() {
+        let mf = child::MF_IN_THE_DAEMON
+            .iter()
+            .map(|n| format!("{n}:yuv420"))
+            .collect::<Vec<_>>();
+        let out = run_base_scripted(
+            true,
+            vec![
+                (secs(70), Some(base_stuck_in("hevc_nvenc:yuv420"))),
+                (secs(74), Some(base_reported())),
+            ],
+        );
+        assert!(out.reported);
+        let mut want = vec!["hevc_nvenc:yuv420".to_string()];
+        want.extend(mf);
+        assert_eq!(
+            out.learned
+                .iter()
+                .map(|d| d.cell.clone())
+                .collect::<Vec<_>>(),
+            want
+        );
+        assert!(out.learned.iter().all(|d| !d.confirmed), "never cached");
+        assert_eq!(out.asked[1], want, "the next run is told too");
+        assert_eq!(
+            cfg!(windows),
+            !child::MF_IN_THE_DAEMON.is_empty(),
+            "Media Foundation is Windows only"
+        );
+    }
+
+    /// #3273 — a hang whose kill landed proves far less, and a merely slow host
+    /// keeps its Media Foundation session.
+    #[test]
+    fn a_hang_whose_kill_landed_leaves_media_foundation_alone() {
+        let out = run_base_scripted(
+            true,
+            vec![
+                (secs(60), Some(base_hung_in("hevc_nvenc:yuv420"))),
+                (secs(64), Some(base_reported())),
+            ],
+        );
+        assert!(out.reported);
+        assert_eq!(
+            out.learned
+                .iter()
+                .map(|d| d.cell.clone())
+                .collect::<Vec<_>>(),
+            ["hevc_nvenc:yuv420"]
+        );
+    }
+
+    /// #3273 — stuck in an MF cell itself: denied once, and no run is told it
+    /// died in a cell it was told not to open.
+    #[test]
+    fn a_child_stuck_in_a_media_foundation_cell_is_not_denied_twice() {
+        let cell = format!("{}:yuv420", crate::encode::cells::MF_H264);
+        let out = run_base_scripted(
+            true,
+            vec![
+                (secs(70), Some(base_stuck_in(&cell))),
+                (secs(74), Some(base_reported())),
+            ],
+        );
+        assert!(out.reported);
+        assert_eq!(
+            out.learned.iter().filter(|d| d.cell == cell).count(),
+            1,
+            "{:?}",
+            out.learned
+        );
+    }
+
+    /// #3273 — two children stuck with no cell to blame: the old answer, no
+    /// hardware, and the daemon stays out of Media Foundation all the same. This
+    /// is the state the review asked about.
+    #[test]
+    fn two_stuck_children_with_no_cell_to_blame_keep_the_daemon_out_too() {
+        let blind = || child::Run {
+            ending: child::Ending::Hung { gone: false },
+            stdout: String::new(),
+            cut_off: true,
+            elapsed: secs(70),
+        };
+        let out = run_base_scripted(
+            true,
+            vec![(secs(70), Some(blind())), (secs(140), Some(blind()))],
+        );
+        assert!(!out.reported);
+        assert_eq!(
+            out.learned
+                .iter()
+                .map(|d| d.cell.clone())
+                .collect::<Vec<_>>(),
+            child::MF_IN_THE_DAEMON
+                .iter()
+                .map(|n| format!("{n}:yuv420"))
+                .collect::<Vec<_>>()
         );
     }
 }

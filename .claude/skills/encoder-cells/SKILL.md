@@ -44,9 +44,15 @@ nobody would enforce the 60 s bound on a child hung in a driver.
 ⚠️ **A child told to die may not go, and its pipe may not end** (#3273). A child
 stuck in a kernel call outlives the kill, and whatever it started can hold its
 stdout after it has gone. `child::wait_for_child` waits for neither past `TIMEOUT` +
-`KILL_WAIT`, and keeps what was written, so a stuck child still costs one cell. A
-`wait()` or a `join()` with no bound on this path keeps the device offline: nothing
-restarts a worker during a probe.
+`KILL_WAIT`, and keeps what arrived by then, so in `base` a stuck child still costs
+one cell. A `wait()` or a `join()` with no bound on this path keeps the device
+offline: nothing restarts a worker during a probe.
+⚠️ **A child that would not die also denies `h264_mf`, `hevc_mf` and `av1_mf` for this
+process**: `open_default` runs Media Foundation's cascade in the daemon whatever the
+caps say. A hang whose kill landed does not, so a merely slow host keeps MF.
+⚠️ **A `444` or `gpu` child short of time leaves an answer that is not cached**
+(`why_not_cached`): stored, it is a hit for a week that never asks again. Its forms
+name no cell. A fault's death there stays cached.
 
 ### Anything derived from CONFIG belongs in the PARENT
 

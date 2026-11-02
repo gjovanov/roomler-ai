@@ -372,7 +372,7 @@ last one cost a Radeon laptop its RTX 5090's three NVENC cells and all four
 DataChannel transports for 4 h 22 min, and the viewer looked healthy throughout.
 So `base` announces every open (`ROOMLER_CAPS_PROGRESS:<name>:<chroma>`, and
 `ROOMLER_CAPS_PROGRESS:-` once it has ended, its teardown included), and the
-parent runs it again ([`run_base`](../agents/roomlerd/src/encode/caps.rs#L554)).
+parent runs it again ([`run_base`](../agents/roomlerd/src/encode/caps.rs#L594)).
 
 ```mermaid
 sequenceDiagram
@@ -406,7 +406,7 @@ instead of falling to the RTP track, and answers like any host with no hardware
 encoder. It is a child and not an open in the daemon because this is a host whose probes
 have been dying. Only if that child dies as well is the answer the driver-free caps.
 
-A **fault's status** ([`is_fault`](../agents/roomlerd/src/encode/caps.rs#L347)) is
+A **fault's status** ([`is_fault`](../agents/roomlerd/src/encode/caps.rs#L350)) is
 what a driver leaves when it faults, and not what someone else leaves when they end
 the process. On Windows that is a short list of exception codes a thread raises on
 itself: access violation, illegal instruction, the arithmetic traps, stack overflow,
@@ -472,15 +472,40 @@ acts on the host. A child stuck in a kernel call does not die until that call re
 a GPU driver hung in a kernel wait is the way to get there. Its stdout stays open while it
 or anything it started holds the write end, and that can outlive a child that exited
 cleanly, which `TIMEOUT` never bounded. So
-[`wait_for_child`](../agents/roomlerd/src/encode/caps.rs#L1085) waits for neither past the
-bound above and keeps what the child wrote, so a stuck child's `PROGRESS` line still costs
-it one cell, denied for this process like any hang. The child stays behind, on a thread
-that reaps it if the call ever returns, and the log says so at ERROR. If the next run
-sticks in the same driver, the budget above ends the runs and the software child answers:
-the device comes online with no hardware, and that is the point. Nothing has produced this
-in the field: a stand-in that is never sent the kill is a unit test, and a real driver case
-is unproven. A child that exits while something holds its pipe is a unit test with a real
-process on each OS.
+[`wait_for_child`](../agents/roomlerd/src/encode/caps.rs#L1173) waits for neither past the
+bound above and keeps what arrived by then, and the log says at WARN when it stopped reading
+before the pipe ended (`Run::cut_off`). The child stays behind, on a thread that reaps it if
+the call ever returns, and the log says so at ERROR. At most 4 can stay behind per start
+(a run stuck in an open, a run that reports and sticks in its exit, then `444` and `gpu`):
+280 s and 8 parked threads. Nothing has produced this in the field: a stand-in that is never
+sent the kill is a unit test, and a real driver case is unproven. A child that exits while
+something holds its pipe is a unit test with a real process on each OS.
+
+**What running out of time costs depends on the child.**
+
+- **In `base`,** a stuck child's `PROGRESS` line costs it one cell, denied for this process
+  like any hang. If the next run sticks in the same driver, the budget above ends the runs
+  and the software child answers: the device comes online with no hardware, and that is the
+  point.
+- **A child that would not die** (`Hung { gone: false }`) also takes `h264_mf`, `hevc_mf` and
+  `av1_mf` with it, for this process (`BaseRetry::after_death`). `encode::open_default` runs
+  Media Foundation's cascade in the daemon whatever the caps say, on a wait with no bound, so
+  a session on that host would run the same vendor's code in-process. It takes OpenH264
+  instead. A hang whose kill landed does not do this, so a merely slow host keeps Media
+  Foundation.
+- **A `444` or `gpu` child** that hung, or whose answer was lost to the bound, costs those
+  forms and names no cell. The answer is not cached (`why_not_cached`), so the next start
+  asks again. A host where the form really hangs pays that child's bound at every start;
+  before #3273 it paid once and a hit did not ask again for a week. A fault's death there
+  stays cached, as it always was.
+- **A report lost to the bound on the read** reads as a clean exit with no report: no second
+  run, and in `base` no hardware until the next start.
+
+⚠️ **The deny covers Media Foundation and nothing else in a session.** Capture's D3D calls
+still reach the display driver, and the RTP pump opens its encoder inline on a runtime thread
+(`peer::media_pump`). A hang in an open the deny does not cover costs that thread and a black
+session, while signalling goes on on the others. An older hang whose kill landed could always
+reach this state; a stuck child now can too, where before it kept the device offline.
 
 **Where to see it.** The log names the cell and the status at each step, at ERROR once
 denied. `roomlerd caps` prints `learned_deny:`. The hello carries it in
@@ -911,7 +936,7 @@ colour-manages by primaries and transfer (FR-130 §2.5).
 | openh264, recording | its own VUI and the MP4 `colr` box, unchanged since FR-85 | SMPTE 170M at limited range |
 
 A vendor runtime that refuses the description opens the encoder without it rather than failing the open.
-While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:2383`).
+While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:2514`).
 
 **Which lever reaches which path:**
 
