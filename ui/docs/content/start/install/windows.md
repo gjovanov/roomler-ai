@@ -25,10 +25,27 @@ a machine sitting at the lock screen.
 
 ## Install
 
-Mint a token in the dashboard under **Devices → Enroll device**, then use either
-form. The graphical wizard asks the same questions the flags answer.
+**Roomler Setup needs no token.** It is a signed EXE with a role picker:
 
-**One line, in an Administrator PowerShell** (Terminal (Admin)):
+[Roomler Setup for Windows](https://roomler.ai/api/setup/windows)
+
+If your network's proxy refuses to download an EXE, take
+[the same signed EXE in a zip](https://roomler.ai/api/setup/windows?format=zip) instead.
+
+1. Run it. **Be accessed — background service** is already selected. Change it if
+   you want another mode, then continue to **Join your organization**.
+2. Click **Set up in the browser**. The wizard shows a code of eight letters.
+3. Open [roomler.ai/pair](https://roomler.ai/pair), sign in or create an account,
+   type the code, check the device the page shows, pick your organization and
+   click **Approve**.
+4. Go back to the wizard. It names who approved the device and into which
+   organization. Click **Install** and answer the administrator prompt.
+
+A code lasts 15 minutes. When it runs out the wizard says so, and **Start again**
+gives you a new one. A mistyped code only gets "No pending pairing with that code".
+
+**Or one line, in an Administrator PowerShell** (Terminal (Admin)), with a token
+you mint in the dashboard under **Devices → Enroll device**:
 
 ```powershell
 & ([scriptblock]::Create((irm https://roomler.ai/api/setup/install.ps1))) -Role daemon-system -Token <token> -Server https://roomler.ai
@@ -36,13 +53,6 @@ form. The graphical wizard asks the same questions the flags answer.
 
 Swap `-Role` for `daemon-machine` (attended) or `daemon-user` (per user) to
 change the service mode.
-
-**Or download the wizard** — a signed EXE with a role picker:
-
-[Roomler Setup for Windows](https://roomler.ai/api/setup/windows)
-
-If your network's proxy refuses to download an EXE, take
-[the same signed EXE in a zip](https://roomler.ai/api/setup/windows?format=zip) instead.
 
 **Already installed and just need to enroll?**
 

@@ -58,7 +58,7 @@ curl -sI https://roomler.ai/api/setup/macos   → 404
 ```
 
 The agent lane is at `agent-v0.4.102`. The resolver is correct — it serves the newest
-`setup-v*` that exists (`crates/modules/fleet/src/setup_release.rs:418-439`); nothing has
+`setup-v*` that exists (`crates/modules/fleet/src/setup_release.rs:474-493`); nothing has
 cut one since 0.4.48, which shipped without macOS (`skip_macos`, before Apple signing).
 
 ## The mechanism, in the code (master `31cb9510e`)
@@ -68,7 +68,7 @@ it. Do not shift these anchors with code that moved later.*
 
 | Surface | Where | What it does today |
 |---|---|---|
-| Routes poll | `agents/roomler-desktop/src/front/tunnels.js:285`, `app.js:166-168` | two 2 s intervals armed at load: device view (1 connection) + routes + flows (2 more) |
+| Routes poll | `agents/roomler-desktop/src/front/tunnels.js:285`, `app.js:171-173` | two 2 s intervals armed at load: device view (1 connection) + routes + flows (2 more) |
 | swallowed errors | `agents/roomler-desktop/src/commands.rs:1143-1147`, `:1188-1193` | `Err(_) => Vec::new()` — any failure renders as "no routes" |
 | empty paint | `tunnels.js:126-129`, `:176-179` | `paintRoutes([])` hides the table; `paintFlows([])` hides the card |
 | pipe server | `crates/localapi/src/lib.rs:1796-1871` | ONE listening instance; the next is created only after `connect()` returns |
@@ -79,7 +79,7 @@ it. Do not shift these anchors with code that moved later.*
 | encoder caps | `agents/roomlerd/src/encode/caps.rs:37, 548-559` | a process OnceLock filled at the first `rc:agent.hello`; never on the LocalAPI |
 | drop folder | `agents/roomlerd/src/files.rs:1966-2030` | SystemContext → the active user's Downloads; else the process owner's; Windows fallback `%PROGRAMDATA%\roomler\<segment>\uploads`; not configurable |
 | devices | `agents/roomler-desktop/src/front/devices.js:60, 179` | LocalAPI `Peers` (netmap) every 2 s, `p.name` only, no `display_name`, orgs mixed |
-| agent-token routes | `crates/modules/fleet/src/lib.rs:331-340` | crash / self-unenroll / logs; nothing lists devices; the web grid and mesh are `AuthUser` |
+| agent-token routes | `crates/modules/fleet/src/lib.rs:334-343` | crash / self-unenroll / logs; nothing lists devices; the web grid and mesh are `AuthUser` |
 | launch after install | `scripts/install.ps1:283-305`; `agents/roomler-setup/src/orchestrator_agent.rs:501-610`; `agents/roomlerd/wix*/main.wxs` | copy the EXE, launch nothing, register nothing |
 | first launch | `agents/roomler-desktop/src/main.rs:57-75`; `tauri.conf.json:26` | `--view=` handled only in the single-instance callback; the window starts hidden |
 | companion spawn | `agents/roomlerd/src/companion.rs:689` | `std::process::Command` (inherits handles) on the user-session path; the SYSTEM path already passes `bInheritHandles = FALSE` |

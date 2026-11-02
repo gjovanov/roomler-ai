@@ -48,7 +48,7 @@ path is the same: `install.sh` without `--token` prints the enroll command to ru
 ### The GUI installs the daemon only on Windows
 
 Every daemon-role arm of the wizard's detection says
-`supported: cfg!(target_os = "windows")` (`agents/roomler-setup/src/commands.rs:79, 86, 93, 103`),
+`supported: cfg!(target_os = "windows")` (`agents/roomler-setup/src/commands.rs:85, 86, 93, 103`),
 and the daemon surface off Windows is a set of no-op stubs
 (`agents/roomler-setup/src/orchestrator_agent.rs:758, 889, 922`). The docs say so plainly:
 on Linux and macOS the daemon is `install.sh` in a terminal, and the wizard does the tunnel
@@ -81,9 +81,9 @@ it. Do not shift these anchors with code that moved later.*
 
 | Surface | Where | What it does today |
 |---|---|---|
-| token mint | `crates/modules/fleet/src/agent.rs:90-140`; route `crates/modules/fleet/src/lib.rs:386` | `POST /api/tenant/{tid}/agent/enroll-token`: `AuthUser` + `MANAGE_AGENTS`; 600 s single-use JWT (`:24`); FR-102 issuance recorded (`:114-124`); FR-104 `anchor` from an optional body (`:52-85`) |
+| token mint | `crates/modules/fleet/src/agent.rs:90-140`; route `crates/modules/fleet/src/lib.rs:389` | `POST /api/tenant/{tid}/agent/enroll-token`: `AuthUser` + `MANAGE_AGENTS`; 600 s single-use JWT (`:24`); FR-102 issuance recorded (`:117-127`); FR-104 `anchor` from an optional body (`:52-88`) |
 | token claims | `crates/services/src/auth/mod.rs:82-96`, `:530-563` | `EnrollmentClaims { sub = issuing admin, tenant_id, jti, anchor }`; ten audiences in `TokenType` (`:37-78`) |
-| token redeem | `crates/modules/fleet/src/agent.rs:180-260`; route `fleet/src/lib.rs:477-478`, `:564` | public `POST /api/agent/enroll`: archived org refused (`:192-207`), plan device cap before the single-use claim (`:222-242`), the claim fails closed (`:244-260`) |
+| token redeem | `crates/modules/fleet/src/agent.rs:180-260`; route `fleet/src/lib.rs:480-481`, `:567` | public `POST /api/agent/enroll`: archived org refused (`:195-210`), plan device cap before the single-use claim (`:225-245`), the claim fails closed (`:247-263`) |
 | tunnel token | `crates/modules/network/src/routes/tunnel.rs:53-75`; mint `crates/services/src/auth/mod.rs:731` | any member (`is_member`) mints a `TunnelEnrollment` token |
 | registration | `crates/api/src/routes/auth.rs:167-325` | creates the user; the org inline only with `tenant_name` + `tenant_slug` (`:250-255`); production returns no session (`:311-324`) |
 | login gate | `crates/api/src/routes/auth.rs:366-370` | an unactivated account is refused |
@@ -93,11 +93,11 @@ it. Do not shift these anchors with code that moved later.*
 | decision log | `crates/services/src/dao/peer_relay_audit.rs:3-10` | one collection per decision kind; the refused rows are the point |
 | install trace | `crates/remote_control/src/models.rs:31-93` | `InstallInfo { method, scope, run }`; `InstallMethod::Wizard` already exists |
 | module graph | `crates/core/src/graph.rs:45-47` | `remote → fleet`, `network → fleet`, `hive → fleet` |
-| wizard daemon gate | `agents/roomler-setup/src/commands.rs:79, 86, 93, 103` | `supported: cfg!(target_os = "windows")` |
+| wizard daemon gate | `agents/roomler-setup/src/commands.rs:85, 86, 93, 103` | `supported: cfg!(target_os = "windows")` |
 | wizard daemon pipeline | `agents/roomler-setup/src/orchestrator_agent.rs:142-203`, `:289`, `:403`, `:555-567` | resolve → download → verify → elevated `msiexec` → in-process `roomlerd::enrollment::enroll`, tagged `InstallMethod::Wizard` |
 | non-Windows stubs | `agents/roomler-setup/src/orchestrator_agent.rs:758, 889, 922` | the daemon surface off Windows is a no-op |
 | platform strings | `crates/roomler-setup-core/src/asset_resolver.rs:265-300` | `windows-x86_64`, `linux-x86_64`, `linux-aarch64`, `macos` |
-| token step | `agents/roomler-setup/src/front/index.html:176-204`; `app.js:461-497`, `:629-680` | paste + a live, unverified JWT peek (`cmd_validate_token`, `commands.rs:204`); no polling anywhere in the frontend |
+| token step | `agents/roomler-setup/src/front/index.html:176-204`; `app.js:499-538`, `:718-769` | paste + a live, unverified JWT peek (`cmd_validate_token`, `commands.rs:248`); no polling anywhere in the frontend |
 | browser open | `agents/roomler-setup/tauri.conf.json:40-41` | the shell-open plugin is enabled and unused by the token step |
 | terminal installer | `scripts/install.sh:402-509` (Linux), `:511-576` (macOS), `:584-610` (root half), `:642` (enroll), `:842` (companion) | plain `sudo`, so it needs a terminal; no `pkexec` anywhere |
 
