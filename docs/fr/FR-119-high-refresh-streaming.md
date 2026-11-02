@@ -613,7 +613,7 @@ over 11, and two thirds of the long ones were followed by a short one. A frame w
   header's is the hand-off to the send task, after encode (`agent_epoch_us()`, `peer.rs:9446`). So a trial that
   passes at p99 16.4 ms says the host CAN keep up; it says nothing about the cadence the viewer gets.
 - **Guards.** CI's macOS packaging lint (`ci.yml:1304`) fails if the daemon, agent or desktop job loses
-  `ProcessType = Interactive`. The macOS install smoke (`installer-smoke.yml:1168`) asserts that launchd loaded the
+  `ProcessType = Interactive`. The macOS install smoke (`installer-smoke.yml:1238`) asserts that launchd loaded the
   daemon as `spawn type = interactive (4)`, after an enabled install and after a plain re-install (the self-update
   path). Both checks were run red against the shipped job on the MacBook, which reads `daemon (3)`.
 

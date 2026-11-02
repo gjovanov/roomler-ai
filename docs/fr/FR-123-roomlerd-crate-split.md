@@ -50,7 +50,7 @@ at 1):
 | 4 | 426 s (−25 %) | 231 + 122 | +16.5 % | +13.7 % | 494 s (−35 %) | +14.2 % |
 | 16 | 463 s | 250 + 140 | +23.8 % | +19.5 % | 439 s | +23.7 % |
 
-The MSI budget (`release-agent.yml:2088-2154`) is a 22.00 MB baseline, a warning at 24 and a hard
+The MSI budget (`release-agent.yml:2098-2167`) is a 22.00 MB baseline, a warning at 24 and a hard
 ceiling at 26; today's MSI is 22.18 MB. At 4 units it would land near 25.2 MB, at 16 near 26.6. So
 the lever is structural, not a flag.
 
@@ -498,7 +498,7 @@ v2 runners (§2.4):
 | binary | **−5.5 % Windows, −11.5 % macOS (measured)**: the duplicated generics vanish | today's: two units still instantiate the same generics twice |
 | packages | none change; `roomlerd` keeps its lib and bin | the lib and the bin must sit in different packages (a package's bin may not depend on a crate that depends on the package's lib) |
 | the lane | untouched | layout (ii) below leaves it untouched; (i) changes four build lines |
-| what else | `main.rs`'s tests (`agents/roomlerd/src/app.rs:6872` after the rename) start running under `--lib`; 59 anchors in 30 docs take the new file name at the same numbers (FR-28's two `main.rs:N` are the API's and stay) | the same, plus the layout's CI edits |
+| what else | `main.rs`'s tests (`agents/roomlerd/src/app.rs:6888` after the rename) start running under `--lib`; 59 anchors in 30 docs take the new file name at the same numbers (FR-28's two `main.rs:N` are the API's and stay) | the same, plus the layout's CI edits |
 
 **A first, then B if more time is needed.** A is one moved file, no package change, and the only
 option that improves both axes — it buys 1.2 MB of MSI headroom on Windows against a 22.00 MB
@@ -522,7 +522,7 @@ How A is cut, so that it is the measured shape and nothing else:
   file keeps its `roomlerd::` spelling (219 sites) behind `extern crate self as roomlerd;` in
   `lib.rs`, so an edit in flight on the old file still applies *and compiles* when its branch
   rebases. The `crate::` respelling is a later, quiet commit once the open PRs have landed.
-- **Its tests run for the first time.** `app::tests` (`agents/roomlerd/src/app.rs:6872`) — the CLI
+- **Its tests run for the first time.** `app::tests` (`agents/roomlerd/src/app.rs:6888`) — the CLI
   parses the wizard's snippets rely on, the config-path ladder, the self-heal predicate, the
   retired-spelling guard — ran in no lane while they were a bin's; under `--lib` the Linux, Windows
   and macOS unit steps now run them. They are pure (clap parses, pure predicates, a process-env

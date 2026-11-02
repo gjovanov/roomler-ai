@@ -477,7 +477,7 @@ enrollment load-bearing:
 | What stops one row today | Where | Measured on 0.4.191 |
 |---|---|---|
 | The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `signaling.rs:2762` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
-| `run` refuses to start with no config | `app.rs:3718` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
+| `run` refuses to start with no config | `app.rs:3726` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
 | Delegation is primary-org only, on purpose | `signaling.rs:3365-3369` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes |
 
 **Recommended: a stand-in for the control plane, in the worker's process.** When `--supervised`
