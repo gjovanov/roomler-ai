@@ -48,7 +48,7 @@ sequenceDiagram
     A->>A: the sweep logs hard-errored and carriers rebuild
 ```
 
-The agent closes every peer on any control-WS close (`agents/roomlerd/src/signaling.rs:2983-2990`)
+The agent closes every peer on any control-WS close (`agents/roomlerd/src/signaling.rs:3063-3070`)
 and the Hub ends the agent's sessions when it unregisters (`crates/modules/fleet/src/hub.rs:1159-1201`).
 `docs/multi-pod-scale-out.md:182` records this; the 08-29 spec missed it.
 
@@ -70,7 +70,7 @@ under 0.4 s after its container started.
 backoff ladder (1, 2, 4, 8, 10 s; `agents/roomlerd/src/derp.rs:49`, `:522`): 3.4 s in one roll,
 7.5–7.7 s in ten, 15.2–15.8 s in two, 25.9 s in one. A replacement that listens just after a step
 waits for the next one. The control WS doubles the same way, up to 60 s
-(`agents/roomlerd/src/signaling.rs:1303`).
+(`agents/roomlerd/src/signaling.rs:1369`).
 
 A device in two orgs holds one socket per org, each pinned by its own tenant, so it can lose a
 socket in each wave. That accounts for the 6–8 hosts per roll that log two closes: on the roll of

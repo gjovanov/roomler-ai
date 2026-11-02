@@ -115,7 +115,7 @@ suspect first.
 ## On the device
 
 The handler sits in the WS loop that received the order, next to `ConfigPush`
-(`agents/roomlerd/src/signaling.rs:6256-6388`). Every branch **reports**, refusals
+(`agents/roomlerd/src/signaling.rs:6350-6482`). Every branch **reports**, refusals
 included — the operator is looking at a security action and each refusal has a
 different fix:
 
@@ -306,7 +306,7 @@ The server cannot see the device switch, so a switched-off device is still order
 
 | piece | where |
 |---|---|
-| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:669`, `:700`, `:714`, test `:6085`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:3390-3394` |
+| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:669`, `:700`, `:714`, test `:6085`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:4487-4491` |
 | wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:3287`, `:1008`; owner `network` (`:2463`, `modular-monolith.md`) |
 | models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:1872`, `:1898`, `:1923`, `:1954`, `:3611`, `:6304`, `:6319` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
@@ -316,9 +316,9 @@ The server cannot see the device switch, so a switched-off device is still order
 | the conditional report write | `crates/services/src/dao/agent.rs:1044-1074` |
 | state resolver + grid view | `crates/modules/fleet/src/agent.rs:521-685`, `:1471-1479` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:808-816` |
-| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6256-6388`, `:3130-3172`, `:3174-3195`, `:1187-1211` |
+| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6350-6482`, `:3210-3252`, `:3254-3275`, `:1253-1277` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:346-245` |
-| kill switch · epoch | `crates/agent-core/src/config.rs:980-868`, `:1661`, `:1662-1664`; `config_surface.rs:1096-1069` |
+| kill switch · epoch | `crates/agent-core/src/config.rs:980-868`, `:1667`, `:1668-1670`; `config_surface.rs:1096-1069` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1287-1314`, `:2089-2190`; `ui/src/stores/agents.ts:948-902` |
 
 ## Not built
