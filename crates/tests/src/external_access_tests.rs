@@ -590,3 +590,187 @@ async fn an_expiry_in_the_past_is_refused_before_anything_is_written() {
         "audit `expires_at` must be a string: {row}"
     );
 }
+
+/// P5 — one write decides who was first, and the unique index arbitrates it, so
+/// two first sessions on two pods tell the org once. Ten rounds, because a race
+/// that loses one round in ten is still a race.
+#[tokio::test]
+async fn one_of_eight_concurrent_sessions_is_told_it_is_the_first() {
+    let app = TestApp::spawn().await;
+    let dao = &app.state.fleet().external_principals;
+    let (tenant, agent) = (ObjectId::new(), ObjectId::new());
+    for round in 0..10 {
+        let user = ObjectId::new();
+        let answers =
+            futures::future::join_all((0..8).map(|_| dao.note_session(tenant, agent, user))).await;
+        let firsts = answers
+            .into_iter()
+            .map(|answer| answer.expect("every one of them is answered"))
+            .filter(Option::is_none)
+            .count();
+        assert_eq!(firsts, 1, "round {round}");
+    }
+    assert_eq!(
+        dao.base.count(doc! { "agent_id": agent }).await.unwrap(),
+        10
+    );
+}
+
+/// P5 — the routes around a person's standing on a device. What these lock is
+/// the WIRING: who may do which half, what a stranger can learn from the answer,
+/// that nothing here can make a row, and that both arms reach the log.
+#[tokio::test]
+async fn a_person_is_barred_by_a_device_admin_and_let_back_by_the_pair() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extbar").await;
+    let owner = &seeded.admin.access_token;
+    let member = &seeded.member.access_token;
+    let cfg = enrol(&app, &seeded, "mach-ext-bar").await;
+    let visitor = app
+        .register_user(
+            "visitor@outside.test",
+            "visitor",
+            "A Visitor",
+            &format!("fr52-not-a-credential-{}", ObjectId::new()),
+            None,
+            None,
+        )
+        .await;
+    let (tenant, agent, who) = (
+        ObjectId::parse_str(&seeded.tenant_id).unwrap(),
+        ObjectId::parse_str(&cfg.agent_id).unwrap(),
+        ObjectId::parse_str(&visitor.id).unwrap(),
+    );
+    // A session makes the row. Nothing on this surface can.
+    let dao = &app.state.fleet().external_principals;
+    dao.note_session(tenant, agent, who).await.unwrap();
+
+    let list = url(&seeded, "/external-principals");
+    let standing_of = |id: &str| {
+        url(
+            &seeded,
+            &format!("/agent/{}/external-principals/{id}", cfg.agent_id),
+        )
+    };
+    let standing = standing_of(&visitor.id);
+    let nobody = standing_of(&ObjectId::new().to_hex());
+    let colleague = standing_of(&seeded.member.id);
+    let audit = url(&seeded, "/external-rc-audit");
+    let (bar, back) = (json!({ "revoked": true }), json!({ "revoked": false }));
+
+    // 1. A plain member reads nothing, and one 403 says nothing about who came in.
+    let (s, _) = get(&app, &list, member).await;
+    assert_eq!(s, 403);
+    let (s, came_in) = put(&app, &standing, member, bar.clone()).await;
+    assert_eq!(s, 403, "{came_in}");
+    let (s, never_did) = put(&app, &nobody, member, bar.clone()).await;
+    assert_eq!(s, 403, "{never_did}");
+    assert_eq!(came_in, never_did, "a 403 must not tell the two apart");
+
+    // 2. Nor can the person lift their own bar, or read the list.
+    let (s, body) = put(&app, &standing, &visitor.access_token, back.clone()).await;
+    assert_eq!(s, 403, "{body}");
+    let (s, _) = get(&app, &list, &visitor.access_token).await;
+    assert_eq!(s, 403);
+
+    // 3. The owner reads them, under what the account calls itself today.
+    let (s, body) = get(&app, &list, owner).await;
+    assert_eq!(s, 200, "{body}");
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["user_id"], json!(visitor.id));
+    assert_eq!(items[0]["agent_id"], json!(cfg.agent_id));
+    assert_eq!(items[0]["name"], json!("A Visitor"));
+    assert_eq!(items[0]["revoked_at"], Value::Null);
+
+    // 4. An id that never came in is a 404 and makes no row, not even for an
+    //    account that exists: the list reads a name for every row it holds.
+    for id in [&nobody, &colleague] {
+        let (s, body) = put(&app, id, owner, bar.clone()).await;
+        assert_eq!(s, 404, "{body}");
+    }
+    let (_, body) = get(&app, &list, owner).await;
+    assert_eq!(body["total"], json!(1), "no route makes a row: {body}");
+
+    // 5. Another org's admin finds no such device, and no row on their list.
+    let other = app.seed_tenant("extbaro").await;
+    let (s, body) = put(
+        &app,
+        &format!(
+            "/api/tenant/{}/agent/{}/external-principals/{}",
+            other.tenant_id, cfg.agent_id, visitor.id
+        ),
+        &other.admin.access_token,
+        bar.clone(),
+    )
+    .await;
+    assert_eq!(s, 404, "a foreign device id: {body}");
+    let (s, body) = get(
+        &app,
+        &url(&other, "/external-principals"),
+        &other.admin.access_token,
+    )
+    .await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(body["total"], json!(0), "{body}");
+    assert!(!dao.is_revoked(agent, who).await.unwrap());
+
+    // 6. MANAGE_AGENTS alone shuts the door, and it takes REMOTE_CONTROL too to
+    //    open it. Barring is not a grant, and it reads nothing either.
+    let device_admin = create_role(&app, &seeded, "device-admin", MANAGE_AGENTS).await;
+    assign_role(&app, &seeded, &device_admin, &seeded.member.id).await;
+    let (s, _) = get(&app, &list, member).await;
+    assert_eq!(s, 403, "barring is not reading");
+    let (s, body) = put(&app, &standing, member, bar.clone()).await;
+    assert_eq!(s, 200, "{body}");
+    assert!(dao.is_revoked(agent, who).await.unwrap());
+    let (_, body) = get(&app, &list, owner).await;
+    let stamped = body["items"][0]["revoked_at"].clone();
+    assert!(stamped.is_string(), "{body}");
+
+    // 7. A repeat keeps the first stamp and adds no row to the log.
+    let (s, body) = put(&app, &standing, member, bar.clone()).await;
+    assert_eq!(s, 200, "{body}");
+    let (_, body) = get(&app, &list, owner).await;
+    assert_eq!(body["items"][0]["revoked_at"], stamped, "{body}");
+
+    let (s, body) = put(&app, &standing, member, back.clone()).await;
+    assert_eq!(s, 403, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("REMOTE_CONTROL"),
+        "the refusal must name the missing permission, got {body}"
+    );
+    assert!(dao.is_revoked(agent, who).await.unwrap());
+
+    let (s, body) = put(&app, &standing, owner, back.clone()).await;
+    assert_eq!(s, 200, "{body}");
+    assert!(!dao.is_revoked(agent, who).await.unwrap());
+    let (_, body) = get(&app, &list, owner).await;
+    assert_eq!(body["items"][0]["revoked_at"], Value::Null, "{body}");
+
+    // 8. Every decision is a row, and it names the person acted on: the two
+    //    plain-member refusals, the bar, the refused let-back and the let-back.
+    //    A 404 decides nothing, and an account in no org has no decision to make
+    //    here (the shape of `set_policy`).
+    let (_, body) = get(&app, &audit, owner).await;
+    let rows: Vec<&Value> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["action"] == "principal")
+        .collect();
+    let denied = |reason: &str| rows.iter().filter(|r| r["denied"] == json!(reason)).count();
+    assert_eq!(denied("not_device_admin"), 2, "{rows:#?}");
+    assert_eq!(denied("cannot_grant_external"), 1, "{rows:#?}");
+    let decided: Vec<&&Value> = rows.iter().filter(|r| r["denied"].is_null()).collect();
+    assert_eq!(decided.len(), 2, "{rows:#?}");
+    assert!(decided.iter().any(|r| r["approved"] == json!(false)));
+    assert!(decided.iter().any(|r| r["approved"] == json!(true)));
+    assert!(
+        decided.iter().all(|r| r["principal"] == json!(visitor.id)),
+        "{rows:#?}"
+    );
+}

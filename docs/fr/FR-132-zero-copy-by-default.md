@@ -1,7 +1,7 @@
 # FR-132: Zero-copy by default — each GPU-input cell turns on for the fleet after a clean week of its own
 
 **Issue:** [#3141](https://github.com/gjovanov/roomler-ai/issues/3141) · **Status:** P1 released in 0.4.191 on 2026-10-31;
-the decisions taken 2026-10-30 and 2026-10-31 (§6); proposed 2026-10-30 · **Owner:** the agent's capture and encode path, and
+the decisions taken 2026-10-30 and 2026-10-31, one open (§6); proposed 2026-10-30 · **Owner:** the agent's capture and encode path, and
 remote config · **Anchors:** master `01520c8af` (§2); the as-built notes in §3a and §3b, master `ff29120ed` + P1 ·
 **Takes over:** [FR-118](FR-118-gpu-resident-frames.md) open decision 2 (the default) · **Builds on:**
 [FR-118](FR-118-gpu-resident-frames.md) (the GPU-input cells), [FR-77](FR-77-encoder-chroma-matrix.md) (cells, the
@@ -154,6 +154,10 @@ against the same hosts' CPU-path week before it, from the heartbeats and `rc:ses
 | `input_reason` | the DC heartbeat (`agents/roomlerd/src/peer.rs:9729-9743`) | `gpu` on every session of the cell; no `open_failed` that persists |
 | capture + encode, CPU per frame | the heartbeat; the process's CPU time | FR-118's saving for that cell, roughly |
 
+The capture + encode row reads moving and idle windows apart, with under 5 fps captured as idle. FR-118 measured its
+savings under motion, and on an idle window readback is close to nothing, so a mostly idle week can show neither a
+saving nor a harm (§8, 2026-11-02).
+
 A clean week puts the cell on the default list in the next agent release. A fleet week after that release verifies
 the flip on every host that runs the cell, canary or not.
 
@@ -167,7 +171,7 @@ the flip on every host that runs the cell, canary or not.
 | P1c | 3a: `needs_restart` holds until the daemon runs the value | the previous agent: a reconnect reads `applied` again | not started |
 | P1d | 3d: `rc:session.stats` carries the encoder, the capture arm and the input form (decision 8) | absent from an older agent, and the week reads the heartbeats | not started |
 | P2 | 3c: the three-valued reading, the default list (empty), `default_off`, at both entry points | `zero_copy = off`; the list empty | not started |
-| P3 | QSV: the canary week, then the flip (if open decision 4 orders it first) | `zero_copy_deny` pushed; the cell off the list in the next release | not started |
+| P3 | QSV: the canary week, then the flip (if open decision 4 orders it first). `hevc_qsv` and `h264_qsv` also wait for decision 9 | `zero_copy_deny` pushed; the cell off the list in the next release | not started |
 | P4 | NVENC on the WGC arm: the same | the same | not started |
 | P5 | VideoToolbox: the same | the same | not started |
 | P6 | Docs: the default per cell and each flip in `docs/encoders.md`, the pushable deny list in `docs/remote-config.md`, `docs/remote-control.md` §5.1f | — | not started |
@@ -230,6 +234,20 @@ The next four were decided by the operator on 2026-10-31, each as recommended.
 8. **Where a canary week is read from.** **Decided: an extended `rc:session.stats`**, with the encoder, the capture arm
    and the input form on it. The heartbeat carries no capture arm, and a week read per session from `remote_sessions`
    does not depend on a grep of `agent_logs`.
+
+One is open, and it is the operator's. An independent review of the RC media plan raised it on 2026-11-02, and the
+numbers are in §8.
+
+9. **Should the GPU form reach the client-office PCs, and how?** Decision 6 leaves out the class that runs `hevc_qsv`.
+   Four PCs at a client's office ran 45.3 of its 47.6 session-hours in the week read. Its one canary, CORPLAP-1, ran
+   2.3, and CORPLAP-3 has no `hevc_qsv`. So a flip puts the first GPU-form frames on that class at the fleet flip, by
+   auto-update, on a third party's working PCs, and no read names their GPU or driver. A pushed `zero_copy_deny`
+   probably does not reach them either: the remote-config opt-in is off by default and out of the server's reach, and
+   none of the four has a config report on its row. So the rollback there is a forward release. The flip also buys
+   them little, since 43.88 of the cell's 46.97 windowed hours are idle. **Recommended:** `hevc_qsv` and `h264_qsv`,
+   the two GPU-input cells those PCs advertise, stay off the default list until one of the PCs has run a canary week,
+   opted in, in a window its owner agrees to. `av1_qsv`, NVENC and VideoToolbox do not wait for this, since those PCs
+   advertise none of them.
 
 ## 7. Out of scope
 
@@ -330,6 +348,30 @@ has reconnected and then restarted, which across a fleet means a pod roll follow
 at the device, two `roomler restart`s do it in about a minute. A canary week should be planned on that reach.
 Whether the server should also send a changed document to a connected device is a decision for before P3, and was not
 taken here.
+
+### 2026-11-02: who runs `hevc_qsv`, and how
+
+An offline read of production `agent_logs`, 2026-10-26 01:30Z to 2026-11-01 22:30Z, from the RC media plan's
+independent review. The derivation was re-run for this entry. An hour here is the DC heartbeat's 2 s windows, and a
+window that captured under 5 fps is idle.
+
+| Cell | Hours | Idle | Moving | Moving share |
+|---|---|---|---|---|
+| `hevc_qsv` | 46.97 | 43.88 | 3.03 | 6.5 % |
+| `hevc_videotoolbox` | 11.25 | 0.20 | 11.03 | 97.9 % |
+| `av1_nvenc` | 5.34 | 0.22 | 5.08 | 95.1 % |
+| `av1_qsv` | 4.42 | 1.07 | 3.32 | 75.2 % |
+| `hevc_nvenc` | 0.91 | 0.06 | 0.80 | 87.4 % |
+
+By session, `hevc_qsv` ran 47.61 h: 45.30 on four PCs at a client's office and 2.30 on CORPLAP-1. Three of the four
+advertise CORPLAP-1's encoder list, and the fourth lacks `vp9_qsv`, so the cell matches, but no read names their GPU
+or driver. None of the four has a config report on its row, and none holds a desired-config revision above 0, so
+nothing has tested whether a push reaches them.
+
+These hours are real use, someone working on an office PC, but the screen changes rarely. In `hevc_qsv`'s idle windows
+readback is 0 ms at p50 and 2.90 ms at p90, conversion 1.12 ms and submit 5.31 ms. §2.1's savings were measured under
+motion, and they come from not copying each captured frame through the CPU, so they do not carry over to those 43.88
+hours. That is decision 9, and the reason 3d reads moving and idle windows apart.
 
 ## 9. Related
 

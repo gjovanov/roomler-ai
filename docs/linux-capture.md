@@ -483,7 +483,7 @@ what would capture it. An exec sweep cannot answer "how many hosts are Wayland,
 and which arm serves each": a sweep reaches only the devices that are online.
 The server can, because every device says it in its hello.
 
-The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1487`),
+The hello's caps carry `desktop` (`crates/remote_control/src/models.rs:1492`),
 all strings, so a newer agent's word reaches an older server as a word:
 
 | field | values | from |
@@ -557,7 +557,7 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3385`,
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3411`,
 `virtual_desktop.rs:685`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
@@ -1285,7 +1285,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:6811`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:6812`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -1984,7 +1984,7 @@ Measured on the released 0.4.142 with S3 in the lab: 48 s that named no reason,
 the last 19 of them after the wake.
 
 Now the viewer keeps a `host_sleep` notice through the redial
-(`waitKeptAcrossReconnect`, `ui/src/composables/useRemoteControl.ts:1013`). Its
+(`waitKeptAcrossReconnect`, `ui/src/composables/useRemoteControl.ts:1015`). Its
 deadline is spent, so the stall watchdog is not held: a new session that stays
 silent is still re-created on the usual clock. The stage shows the notice in
 every redial phase, with that phase's own words beneath it
@@ -2038,7 +2038,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1243-1274`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2989`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2995`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|
@@ -2073,11 +2073,11 @@ the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/co
 
 The encoder-capability cache is keyed on **build × hardware × knobs**, and the
 knob half is a SHA-256 over **every** `ROOMLERD_*` variable the daemon can see
-(`agents/roomlerd/src/encode/caps_cache.rs:24-27`, `:197-217`; the reasoning
+(`agents/roomlerd/src/encode/caps_cache.rs:26-29`, `:236-256`; the reasoning
 is in [`encoders.md`](encoders.md#the-probe-lifecycle)). So a capture flag
 that has nothing to do with encoding still changes the key, the single-entry
 cache misses (`a ROOMLERD_* knob changed`), and the next start runs the full
-probe in a child process bounded at 60 s per phase (`encode/caps.rs:212`).
+probe in a child process bounded at 60 s per phase (`encode/caps.rs:242`).
 Restoring the old knob set afterwards is a **second** miss, because the cache
 now holds the new key.
 

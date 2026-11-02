@@ -36,7 +36,7 @@
 # Contract: exit 0 allows, exit 2 blocks and shows stderr to the model.
 set -u
 
-INPUT="$(cat)"
+IFS= read -r -d '' INPUT || true
 
 # The tool payload arrives as JSON. It is matched as raw TEXT rather than
 # parsed, on purpose and not for want of a parser:

@@ -107,11 +107,11 @@ sequenceDiagram
 ### 3.1 The posture
 
 `PowerBrief { policy, on_ac?, held }`
-([`models.rs:2134`](../crates/remote_control/src/models.rs#L2134)) rides the
+([`models.rs:2139`](../crates/remote_control/src/models.rs#L2139)) rides the
 heartbeat as an optional `power`
 ([`signaling.rs:704`](../crates/remote_control/src/signaling.rs#L704)). It is a
 claim by the device, shown and never enforced on. The keeper publishes it before
-anything connects ([`app.rs:4692`](../agents/roomlerd/src/app.rs#L4692)) and
+anything connects ([`app.rs:4693`](../agents/roomlerd/src/app.rs#L4693)) and
 after every pass, with what it actually holds, not what it wanted
 ([`power.rs:319`](../agents/roomlerd/src/power.rs#L319)).
 
@@ -121,7 +121,7 @@ after every pass, with what it actually holds, not what it wanted
   stay two answers.
 - `held: false` is what **asleep by policy** means: nothing was holding the
   machine, so the OS slept it as the policy allows
-  ([`models.rs:2155`](../crates/remote_control/src/models.rs#L2155)
+  ([`models.rs:2160`](../crates/remote_control/src/models.rs#L2160)
   `by_policy`). `held: true` means it slept past the hold: a closed lid, a
   person, or the OS overruling it.
 
@@ -168,7 +168,7 @@ sleep would say hello again and erase the reason.
 - The next hello `$unset`s `sleep`
   ([`agent.rs:517`](../crates/services/src/dao/agent.rs#L517)), and every reader
   goes through `SleepView::of`, which shows a notice only on a device that is not
-  online ([`models.rs:2184`](../crates/remote_control/src/models.rs#L2184)). A
+  online ([`models.rs:2189`](../crates/remote_control/src/models.rs#L2189)). A
   read between the reconnect and that write never shows a stale "asleep".
 
 ### 3.4 What each surface shows
@@ -180,7 +180,7 @@ sleep would say hello again and erase the reason.
 | the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
 | the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
 | the admin agent API | `power`, `sleep` ([`agent.rs:629`](../crates/modules/fleet/src/agent.rs#L629)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
-| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3562`](../crates/remote_control/src/models.rs#L3562)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
+| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3567`](../crates/remote_control/src/models.rs#L3567)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
 
 The dashboard's words, for a device that announced a sleep:
 
@@ -253,8 +253,9 @@ shipped in `0.4.190`: an older agent says no goodbye, and an older CLI has no
 
 ### 3.8 Seen in the field
 
-On production, on the released `0.4.190`, on Linux only. **The Windows and macOS
-hooks have not run in a field test yet.** The full record is in the
+On production: Linux driven by hand on the released `0.4.190`, Windows from real
+laptops' own sleeps on `0.4.190`–`0.4.195`. **The macOS hook has not run in a field
+test yet.** The full record is in the
 [spec's field log](fr/FR-55-always-reachable.md#field-verification-log).
 
 | the read | what it showed |
@@ -262,6 +263,7 @@ hooks have not run in a field test yet.** The full record is in the
 | a real suspend on a desktop guest, `never`, 3 of 3 | the goodbye in the same second as `PM: suspend entry`, `sleep` on both admin routes, `◌ … asleep` in a peer's `roomler devices`, and the chip on an open dashboard page turning `asleep` within 3 s with no reload. `online` 1 s after the wake |
 | the same with no delay inhibitor on the host | 7 goodbyes written. All 4 suspends whose row was read arrived as `asleep`; the other 3 went unread |
 | the same device with its link taken down | nothing said, `online` until the server's 2:00 receive deadline, then plain `offline` with no `sleep`, never `asleep` |
+| three Windows laptops nobody staged, 7 days of `agent_logs` | 11 goodbyes, each uploaded after its wake. One laptop asleep at the read, with `sleep` on its row 29 ms before its `last_seen_at`: policy `never`, on mains, nothing held. The chip was not read by eye on a Windows row |
 
 ## 4. What this does not cover
 
