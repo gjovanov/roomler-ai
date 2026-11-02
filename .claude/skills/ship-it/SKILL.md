@@ -44,6 +44,13 @@ ArgoCD reconciles the deploy repo's `master` with **Automated + selfHeal +
 prune** and a webhook: a push rolls out within ~5 s. The cluster pulls from GHCR
 with **no pull secret** (the package is public; `regcred` is vestigial).
 
+⚠️ **A promote is two commits, 30 s apart** (FR-28): the `roomler2-prepull`
+DaemonSet's image first, which rolls nothing, then `newTag`, which rolls. So a
+replacement pod starts without pulling. Reading `newTag` during the wait shows
+the old tag, and that is correct. A manual bump moves `newTag` alone and rolls
+without a pre-pull. The kill switch is deleting the DaemonSet's file from the
+deploy repo (`docs/deployment.md`, "The pre-pull").
+
 ## 2 · The couplings that freeze the fleet
 
 These do not error. They make every device quietly stop updating.
