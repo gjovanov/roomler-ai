@@ -79,8 +79,10 @@ const SHIM = `;(() => {
   if (proto) {
     const origDraw = proto.drawImage;
     proto.drawImage = function (...a) {
+      // After the draw: a draw that stalls is time the person still has no picture.
+      const drawn = origDraw.apply(this, a);
       if (paintPending) { const was = paintPending; paintPending = null; log('paint after=' + was); }
-      return origDraw.apply(this, a);
+      return drawn;
     };
   }
   const origPost = self.postMessage.bind(self);

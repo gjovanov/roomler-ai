@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 /**
  * FR-135 R2 — `rc:media-plan`: what the device promised this session, read and
  * put into words. Pure, so the wire and the wording are unit-tested.

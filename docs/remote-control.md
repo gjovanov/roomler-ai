@@ -2841,8 +2841,16 @@ to 500 ms for the gate's next one.
 there `<video>` has real samples to show. A decoder that hangs without an error is still the watchdog's.
 
 The field proof is [`ui/e2e/vmtest-decode-recover.spec.ts`](../ui/e2e/vmtest-decode-recover.spec.ts). It forces a
-real `Decoding error.` from outside the product and times the next paint, so the same spec reads RED on an old
-viewer and GREEN on a new one.
+real `Decoding error.` from outside the product and times the next paint, once the draw has returned, so the same
+spec reads RED on an old viewer and GREEN on a new one.
+
+⚠️ **≤ 500 ms is the typical read, not a bound.** On production (2026-11-02, no GPU on the guest, VP9 4:4:4, screen
+noise) Chromium's median is 188 ms and 18 of 22 rounds met it, and Firefox's 12 rounds read 62-116 ms. Decoding and
+drawing the key frame is a steady 50-61 ms in Chromium, so nearly all the spread is the wait for it. An ask inside
+500 ms of the last one is dropped ([`MIN_KF_GAP`](../agents/roomlerd/src/peer.rs#L11077), rc.217: bursts of IDRs fed
+the backlog they were meant to clear), and the worker has to ask again, so a key frame that has just gone out adds
+up to that gap. Three of the four rounds over the bar followed a key frame by 36-137 ms. A hard bound would need the
+agent to let a recovery's ask past the gap.
 
 ## 12. Performance targets & budget
 
