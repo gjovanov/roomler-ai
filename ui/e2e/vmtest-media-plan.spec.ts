@@ -190,13 +190,13 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
     } else if (text === '[mp] reason gone') {
       blink++
       say(`the reason left the page after ${Date.now() - t0} ms`)
-    } else if (text.startsWith('[rc] media plan')) {
+    } else if (text.startsWith('[rc] media plan {')) {
       plans.push(text)
       say(text.slice(0, 600))
     } else if (text.startsWith('[rc] viewer_hz')) {
       hzLines.push(text)
       say(text.slice(0, 200))
-    } else if (text.includes('[rc]') && /stalled|re-creating|decoder|failed|banned|fallback|refus/i.test(text)) {
+    } else if (text.includes('[rc]') && /stalled|re-creating|decoder|failed|banned|fallback|refus|showing/i.test(text)) {
       say(text.slice(0, 240))
     }
   })

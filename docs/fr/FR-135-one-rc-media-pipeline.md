@@ -1565,7 +1565,7 @@ A cell the plan cannot reach is listed here, with who can. This follows `CLAUDE.
 
 ## 13. Field log
 
-Nothing below is a phase's proof. No phase has run. These are the reads the plan rests on.
+A row that names a phase is that phase's read. Every other row is a read the plan rests on, and none of those is a phase's proof.
 
 | Date (UTC) | Read | Result | Source |
 |---|---|---|---|
@@ -1583,3 +1583,5 @@ Nothing below is a phase's proof. No phase has run. These are the reads the plan
 | 2026-11-02 | Ledger content check | 627 of 698 within ±3 lines; 23 misses opened; no wrong anchor; 48 unopened. Review: 32 more rows opened, all right; 131 env names checked, one real miss, added | §4 |
 | 2026-11-02 | This spec's own anchors, by script at `de6571f1a` | 295 of 295 in range; the 2 it could not resolve are Sunshine's, in another repository. That script checks range, not content. §4.2's 43 rows: 16 pass by identifier, 27 cite future names or none, and I opened their lines by hand. The plan's review opened 77 anchors and found 1 wrong, now fixed. The anchors added after the review were opened at the pin | this log |
 | 2026-11-02 | **Two dead ends worth keeping.** The first draft ordered by sessions. The second ordered by session-hours and led with "two-thirds of real use is `hevc_qsv`" | Sessions put VP9 at 18 % and R4 at "93 % of hours"; by hours VP9 is 0.3 h of interactive use. Hours put `hevc_qsv` first, yet 94 % of its hours are sparse, it holds 13 % of the moving hours, and R4b's rate gain reaches about 1 moving hour, not 15 h. The plan's own review caught the second from data already on disk. The order in §7.3 is the corrected one | §2.1, §2.3, §7.3 |
+| 2026-11-02 | **R2 RED**, the released 0.4.196 agent, production's viewer, a Windows 11 guest with its cells seeded until nothing opens | `paints=0 sessions=3 plans=0 overlay=""`: a black page, and no reason anywhere on it | #3293 |
+| 2026-11-02 | **R2 before the merge**, the branch's agent and viewer at production's API, the same guest, 100 s past the first two backoffs | Chromium and Firefox: "This device could not start its video. It tried h264_nvenc, h264_qsv, h264_amf, h264_d3d12va and h264_vulkan, and none of them opened", `no_encoder`, through 5 sessions. The reason left the page 0 times by a mutation observer, against 4 on the viewer before the redial stage, and the backoff's banner stopped blaming the network. With real caps: VP9 over the channel painted, `rc:viewer-hz hz=60` in the agent's log on both browsers, and RTP's plan read `webrtc`/`h264`. Both skews paint with no page error. `ROOMLERD_MEDIA_PLAN=0`: no plan, no verb. **Unread until a release on a real GPU:** GPU to CPU form, the next cell landing on a real encoder, asked to granted. **`rc-media-silent` after #3279:** that seed now reads `webrtc`/`h264` and paints, so the silent page was read with the worker's decoder swallowed on a real session | #3298 |
