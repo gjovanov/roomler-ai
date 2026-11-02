@@ -68,7 +68,8 @@ check and the `%TEMP%` swap stay open in #3246, the last ways left for a limited
 the administrator's token.
 
 ⚠️ **The cards narrow to what can work here** (`role::RoleLimit`), each with its note.
-Another account's password (`--session-data` differs from this process's `%LOCALAPPDATA%`)
+Another account's password (`--session-data`, or on a start by hand the folder `LaunchArgs::from_env`
+finds from the owner of the session's Explorer, differs from this process's `%LOCALAPPDATA%`)
 leaves only `daemon-system`, because the other roles would install into that administrator's
 profile and still report Done. A policy that refuses prompts from a standard user
 (`ConsentPromptBehaviorUser=0`) leaves `daemon-user` and the tunnel, preselected, so nobody

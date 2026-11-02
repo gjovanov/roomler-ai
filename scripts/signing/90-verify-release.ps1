@@ -176,7 +176,7 @@ foreach ($a in $assets) {
             # FR-129 C: the wizard goes on to run elevated from the person's
             # Downloads, so its own imports must come from System32 alone.
             if ($a.Name -like 'roomler-setup-*.exe') {
-                & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'pe-dependent-load-flags.ps1') -Path $a.FullName -Expect 0x800 -NotImported secur32.dll
+                & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'pe-dependent-load-flags.ps1') -Path $a.FullName -Expect 0x800 -NotImported 'secur32.dll,wtsapi32.dll'
                 if ($LASTEXITCODE -ne 0) { $failures.Add("$($a.Name) does not load its imports from System32 alone") }
             }
         }

@@ -185,10 +185,16 @@ it happens on Welcome, before a token exists. The elevated copy
    default, and the Continue gate as usual.
 
 A right-click **Run as administrator** by a person who is an administrator works
-as it always has, in that account's own folder. **With another account's password
-it does not** (the white window above, or Edge's "We couldn't create the data
-directory"): that start has no limited copy to name the session's folder. Start the
-wizard normally and use the button.
+as it always has, in that account's own folder. **With another account's password**
+that start has no limited copy to name the session's folder, so it finds it (#3229): the
+owner of the session's `explorer.exe` from `WTSEnumerateProcessesW`, and that SID's folder
+from the machine's `ProfileList`. It then opens with only the machine-wide service on offer,
+as the button does. If it finds another account's shell but no folder that person can use
+(say a profile whose `AppData\Local` is elsewhere), it says so and stops, before any window,
+instead of the white window above or Edge's "We couldn't create the data directory". A
+session with no Explorer at all (a replaced shell) cannot be told apart from a person elevating
+themselves, and still shows that white window: there, start the wizard normally and use the
+button.
 
 **The cards follow what can work here** (`role::RoleLimit`,
 `agents/roomler-setup/src/role.rs:191`), and a note on Welcome says why:

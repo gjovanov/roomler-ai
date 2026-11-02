@@ -111,6 +111,8 @@ if ($Expect -eq '') {
 }
 
 $imports = Get-StaticImports -Image $image -File $Path
+# One quoted comma-separated argument: a `pwsh <script>` call binds no array.
+$NotImported = @($NotImported | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $found = @($NotImported | Where-Object { $imports -contains $_ })
 if ($found.Count -gt 0) {
     Write-Host "$Path has $($found -join ', ') in its import table: it must be delay-loaded" -ForegroundColor Red
