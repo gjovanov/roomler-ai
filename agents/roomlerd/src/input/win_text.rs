@@ -37,6 +37,9 @@
 
 #![cfg(all(target_os = "windows", feature = "enigo-input"))]
 
+use std::cell::Cell;
+use std::time::{Duration, Instant};
+
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, GetKeyboardLayout, HKL, INPUT, INPUT_0, INPUT_KEYBOARD,
@@ -236,6 +239,8 @@ fn send_unicode(c: char) {
 /// so we briefly `AttachThreadInput` to the foreground thread to share its key
 /// state for an accurate read. Best-effort: a failed attach falls back to the
 /// worker's own state (CapsLock treated as off → no compensation).
+///
+/// ⚠️ Never per character: see [`caps_for_frame`].
 fn capslock_on(fg_tid: u32) -> bool {
     // SAFETY: Attach/Detach are paired; GetKeyState reads thread-queue state.
     unsafe {
@@ -250,6 +255,56 @@ fn capslock_on(fg_tid: u32) -> bool {
         }
         on
     }
+}
+
+/// #3047 — how long the target's CapsLock stays read after the last KeyText
+/// frame. A pause this long is where the next read is cheap: nothing typed is
+/// likely to be waiting in the target's queue any more.
+const CAPS_FRESH_FOR: Duration = Duration::from_secs(2);
+
+/// The last CapsLock read: of which thread, what it said, and when a frame last
+/// relied on it.
+#[derive(Clone, Copy)]
+struct CapsRead {
+    tid: u32,
+    on: bool,
+    used: Instant,
+}
+
+thread_local! {
+    /// One per injector thread, the only thread that types.
+    static CAPS: Cell<Option<CapsRead>> = const { Cell::new(None) };
+}
+
+/// The target's CapsLock for one KeyText frame, reading it only when `last` no
+/// longer answers.
+///
+/// #3047 — the viewer sends one frame per character, and a read attaches to the
+/// foreground thread and detaches, which resets that thread's key state. While a
+/// burst outran a slow target, the target kept being reset between dequeuing
+/// Shift-down and the key it was meant for: Shift was already up in the async
+/// state, because `tap_vk` sends the whole press in one `SendInput`. Every shifted
+/// character came out unshifted until the last frame, when the resets stopped and
+/// the rest of the backlog drained correctly: the issue's clean split.
+fn caps_for_frame(fg_tid: u32, now: Instant, read: impl FnOnce(u32) -> bool) -> bool {
+    let last = CAPS.with(Cell::get);
+    let on = last
+        .filter(|r| r.tid == fg_tid && now.saturating_duration_since(r.used) < CAPS_FRESH_FOR)
+        .map_or_else(|| read(fg_tid), |r| r.on);
+    CAPS.with(|c| {
+        c.set(Some(CapsRead {
+            tid: fg_tid,
+            on,
+            used: now,
+        }))
+    });
+    on
+}
+
+/// A CapsLock key went through this injector: the next KeyText frame reads the
+/// target again rather than trusting what it read before.
+pub(super) fn caps_changed() {
+    CAPS.with(|c| c.set(None));
 }
 
 /// Type `text` into the foreground window. Per character: real VK+scancode when
@@ -279,7 +334,7 @@ pub(super) fn type_text(text: &str) {
     // shift bit for ALPHABETIC chars (CapsLock only affects letters). Non-letters
     // and the Unicode fallback are unaffected. Hosts with CapsLock off (e.g.
     // WINHOST-A) read `false` here → no change.
-    let caps = capslock_on(fg_tid);
+    let caps = caps_for_frame(fg_tid, Instant::now(), capslock_on);
     let mut switches_this_call: u32 = 0;
     for c in text.chars() {
         match c {
@@ -398,6 +453,70 @@ mod tests {
     fn decode_altgr_combo() {
         // Ctrl+Alt (AltGr) state in the high byte (0x06) over VK_Q (0x51).
         assert_eq!(decode_vk_scan(0x0651), Some((0x51, false, true, true)));
+    }
+
+    /// #3047 — one burst of the issue's 1,147 frames, 3 ms apart: the target is
+    /// read once, for the first, and never again while the burst runs. Reading
+    /// per frame is what cost every shifted character.
+    #[test]
+    fn a_burst_reads_the_targets_capslock_once() {
+        caps_changed();
+        let t0 = Instant::now();
+        let mut reads = 0;
+        for i in 0..1147 {
+            let on = caps_for_frame(7, t0 + Duration::from_millis(3 * i), |_| {
+                reads += 1;
+                true
+            });
+            assert!(on, "every frame gets what the one read said");
+        }
+        assert_eq!(reads, 1);
+    }
+
+    /// The window runs from the last frame, not the read: a steady stream never
+    /// reads again, however long it lasts.
+    #[test]
+    fn the_read_lasts_as_long_as_frames_keep_coming() {
+        caps_changed();
+        let t0 = Instant::now();
+        caps_for_frame(7, t0, |_| false);
+        let step = CAPS_FRESH_FOR - Duration::from_millis(1);
+        for i in 1..=5 {
+            caps_for_frame(7, t0 + step * i, |_| panic!("read during a stream"));
+        }
+    }
+
+    /// A pause long enough reads again, so a CapsLock the person toggled at the
+    /// host itself is seen on the next word.
+    #[test]
+    fn a_pause_reads_the_target_again() {
+        caps_changed();
+        let t0 = Instant::now();
+        assert!(!caps_for_frame(7, t0, |_| false));
+        assert!(caps_for_frame(7, t0 + CAPS_FRESH_FOR, |_| true));
+    }
+
+    /// Another foreground thread has key state of its own.
+    #[test]
+    fn a_new_foreground_thread_is_read_at_once() {
+        caps_changed();
+        let t0 = Instant::now();
+        assert!(!caps_for_frame(7, t0, |_| false));
+        assert!(caps_for_frame(8, t0 + Duration::from_millis(1), |tid| {
+            assert_eq!(tid, 8);
+            true
+        }));
+    }
+
+    /// The viewer's own CapsLock is read after, not trusted from before: letters
+    /// typed right after it must take its new state.
+    #[test]
+    fn a_capslock_key_makes_the_next_frame_read() {
+        caps_changed();
+        let t0 = Instant::now();
+        assert!(!caps_for_frame(7, t0, |_| false));
+        caps_changed();
+        assert!(caps_for_frame(7, t0 + Duration::from_millis(1), |_| true));
     }
 
     #[test]
