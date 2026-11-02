@@ -502,9 +502,9 @@ something holds its pipe is a unit test with a real process on each OS.
   run, and in `base` no hardware until the next start.
 
 ⚠️ **The deny covers Media Foundation and nothing else in a session.** Capture's D3D calls
-still reach the display driver, and the RTP pump opens its encoder inline on a runtime thread
-(`peer::media_pump`). A hang in an open the deny does not cover costs that thread and a black
-session, while signalling goes on on the others. An older hang whose kill landed could always
+still reach the display driver, and the RTP pump opens its encoder on a blocking-pool thread
+(`spawn_blocking` in `peer::media_pump`). A hang in an open the deny does not cover costs that
+thread and a black session, while the runtime goes on. An older hang whose kill landed could always
 reach this state; a stuck child now can too, where before it kept the device offline.
 
 **Where to see it.** The log names the cell and the status at each step, at ERROR once
