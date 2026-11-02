@@ -3852,7 +3852,7 @@ What runs where today, and where P8 puts it:
   "P4-6-1b-2, as built".)
 - ⚠️ **Publishing a second package is a known way to freeze the fleet.** A frozen agent takes the
   first asset matching its architecture. The server orders the daemon's assets first
-  (`order_assets_daemon_first`, `crates/modules/fleet/src/agent_release.rs:160`) because a frozen
+  (`order_assets_daemon_first`, `crates/modules/fleet/src/agent_release.rs:164`) because a frozen
   agent can take no fix of its own, after the companion `.deb` was once installed as the daemon's
   update. That rule sorts only the companion's assets last today, so a hive-free asset would need
   the same treatment. A hive-free package keeps
