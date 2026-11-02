@@ -77,6 +77,126 @@ pub fn project_dirs() -> Option<ProjectDirs> {
 }
 
 /// Machine-global data root `%PROGRAMDATA%\roomler\<segment>` (Windows only).
+/// `C:\Windows\System32`, as the kernel knows it: never from `%SystemRoot%` or
+/// `%windir%`, which a limited process can override for its own user in
+/// `HKCU\Environment`.
+#[cfg(target_os = "windows")]
+pub fn system_directory() -> PathBuf {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    system_folder(GetSystemDirectoryW).unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"))
+}
+
+/// `C:\Windows`, read the way [`system_directory`] is.
+#[cfg(target_os = "windows")]
+pub fn windows_directory() -> PathBuf {
+    use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+    system_folder(GetSystemWindowsDirectoryW).unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+}
+
+#[cfg(target_os = "windows")]
+fn system_folder(read: unsafe extern "system" fn(*mut u16, u32) -> u32) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut buf = [0u16; 512];
+    // SAFETY: the buffer and its length in characters, for one call.
+    let len = unsafe { read(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    (len > 0 && len < buf.len()).then(|| std::ffi::OsString::from_wide(&buf[..len]).into())
+}
+
+/// A program that ships with Windows, by its full path. FR-129 C: this, never
+/// a bare name, on any path a person's wizard runs. `Command` looks for a bare
+/// name in the folder of the running EXE BEFORE System32, the shell's `runas`
+/// in the current directory, and the wizard sits in the person's Downloads and
+/// goes on to run elevated: a bare `icacls` there is any `icacls.exe` someone
+/// left beside it, with the administrator's token and no prompt. CI's gate is
+/// `agents/roomler-setup/src/spawn_gate.rs`.
+#[cfg(target_os = "windows")]
+pub fn system32_tool(file: &str) -> PathBuf {
+    system_directory().join(file)
+}
+
+/// The variables that name a machine's own folders, with what they really are:
+/// from the kernel and the machine's registry, whatever the environment says.
+/// A value in `HKCU\Environment` overrides each of them for every process of
+/// that user, an elevated one included, so an elevated process that reads one
+/// is reading what a limited one wrote. FR-129 C: the wizard sets these first
+/// thing, for the code it links that reads them
+/// (`agents/roomler-setup/src/launch.rs`, `start_clean`).
+#[cfg(target_os = "windows")]
+pub fn machine_folder_variables() -> Vec<(&'static str, PathBuf)> {
+    let windows = windows_directory();
+    let drive: PathBuf = windows.components().take(1).collect();
+    let drive_text = drive.to_string_lossy().into_owned();
+    let program_files = hklm_text(
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion",
+        "ProgramFilesDir",
+    )
+    .unwrap_or_else(|| format!(r"{drive_text}\Program Files"));
+    let program_files = PathBuf::from(program_files);
+    // `%SystemDrive%\ProgramData` as it is stored: left unexpanded, and that
+    // one variable filled in from the kernel's answer.
+    let program_data = hklm_text(
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList",
+        "ProgramData",
+    )
+    .map(|v| expand_system_drive(&v, &drive_text))
+    .unwrap_or_else(|| format!(r"{drive_text}\ProgramData"));
+    let program_data = PathBuf::from(program_data);
+    vec![
+        ("SystemRoot", windows.clone()),
+        ("windir", windows),
+        ("SystemDrive", drive),
+        ("ComSpec", system32_tool("cmd.exe")),
+        ("ProgramFiles", program_files.clone()),
+        ("ProgramW6432", program_files),
+        ("ProgramData", program_data.clone()),
+        ("ALLUSERSPROFILE", program_data),
+    ]
+}
+
+/// Fill in `%SystemDrive%`, in any case, and nothing else. Anything else that
+/// looks like a variable stays as it is: no variable is read here.
+#[cfg(any(target_os = "windows", test))]
+fn expand_system_drive(stored: &str, drive: &str) -> String {
+    const NAME: &str = "%systemdrive%";
+    match stored.to_ascii_lowercase().find(NAME) {
+        Some(at) => format!("{}{drive}{}", &stored[..at], &stored[at + NAME.len()..]),
+        None => stored.to_string(),
+    }
+}
+
+/// A text value under `HKEY_LOCAL_MACHINE`, not expanded. `None` when it is not
+/// there or is not text.
+#[cfg(target_os = "windows")]
+fn hklm_text(key: &str, value: &str) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
+    };
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let (key, value) = (wide(key), wide(value));
+    let mut buf = [0u16; 1024];
+    let mut bytes = std::mem::size_of_val(&buf) as u32;
+    // SAFETY: NUL-terminated names, and a buffer with its size in bytes, for
+    // one call; no type out-parameter is asked for.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let chars = buf.get(..(bytes as usize) / 2)?;
+    let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+    let text = String::from_utf16_lossy(&chars[..end]);
+    (!text.is_empty()).then_some(text)
+}
+
 /// Same new-then-old resolution as [`project_dirs`], keyed independently on the
 /// machine-global tree (a perMachine/SystemContext host's enrolled config lives
 /// here and must not be orphaned). Consumers `.join(...)` their subdir
@@ -456,6 +576,66 @@ fn migrate_children(old: &Path, new: &Path, root_err: &std::io::Error) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-129 C — what the wizard's Windows path names by full path is there.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_tools_are_where_the_helper_says() {
+        for tool in ["icacls.exe", "msiexec.exe", "schtasks.exe", "cmd.exe"] {
+            let path = system32_tool(tool);
+            assert!(path.is_absolute(), "{}", path.display());
+            assert!(path.is_file(), "{}", path.display());
+        }
+        assert!(windows_directory().join("explorer.exe").is_file());
+    }
+
+    /// FR-129 C — the machine's folders do not move with the environment: the
+    /// same test in a child process whose variables say otherwise, as a value
+    /// in `HKCU\Environment` would, reads the same answer.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_machine_folders_ignore_what_the_environment_says() {
+        const ANSWER: &str = "ROOMLER_TEST_FOLDERS_ANSWER=";
+        let answer = format!("{ANSWER}{:?}", machine_folder_variables());
+        if std::env::var_os("ROOMLER_TEST_FOLDERS_CHILD").is_some() {
+            println!("{answer}");
+            return;
+        }
+        assert!(!answer.contains("poison"), "{answer}");
+        for (name, value) in machine_folder_variables() {
+            assert!(value.is_absolute() || name == "SystemDrive", "{name}");
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "appdirs::tests::the_machine_folders_ignore_what_the_environment_says",
+                "--nocapture",
+            ])
+            .env("ROOMLER_TEST_FOLDERS_CHILD", "1")
+            .env("ProgramFiles", r"C:\poison")
+            .env("ProgramW6432", r"C:\poison")
+            .env("ProgramData", r"C:\poison")
+            .env("ALLUSERSPROFILE", r"C:\poison")
+            .env("SystemDrive", "P:")
+            .env("windir", r"C:\poison")
+            .env("ComSpec", r"C:\poison\cmd.exe")
+            .output()
+            .unwrap();
+        let printed = String::from_utf8_lossy(&out.stdout);
+        assert!(printed.contains(&answer), "{printed}");
+    }
+
+    #[test]
+    fn only_the_system_drive_variable_is_filled_in() {
+        for (stored, want) in [
+            (r"%SystemDrive%\ProgramData", r"D:\ProgramData"),
+            (r"%SYSTEMDRIVE%\ProgramData", r"D:\ProgramData"),
+            (r"E:\ProgramData", r"E:\ProgramData"),
+            (r"%Other%\ProgramData", r"%Other%\ProgramData"),
+        ] {
+            assert_eq!(expand_system_drive(stored, "D:"), want, "{stored}");
+        }
+    }
 
     /// FR-92 — the profile-relative form must name the SAME directory the
     /// person's own `project_dirs()` does, or a SystemContext worker and a

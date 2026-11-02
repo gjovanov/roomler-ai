@@ -1496,7 +1496,7 @@ fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String
     // (inheritance first), a child someone else owns comes out with an
     // empty DACL — measured on the daemon's copy in 0.4.185, which now
     // grants before it drops inheritance (`roomler_node_core::config`).
-    let owner = std::process::Command::new("icacls")
+    let owner = std::process::Command::new(roomlerd::appdirs::system32_tool("icacls.exe"))
         .arg(roomler_dir)
         .arg("/setowner")
         .arg("*S-1-5-32-544")
@@ -1509,7 +1509,7 @@ fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String
             String::from_utf8_lossy(&owner.stderr).trim()
         ));
     }
-    let output = std::process::Command::new("icacls")
+    let output = std::process::Command::new(roomlerd::appdirs::system32_tool("icacls.exe"))
         .arg(roomler_dir)
         .arg("/inheritance:r")
         .arg("/grant:r")

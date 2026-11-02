@@ -45,6 +45,9 @@ pub mod role;
 /// FR-129 B1 (F3) — the running root daemon's own word on which device it is
 /// (Linux: its person socket), asked before a system-scope enroll.
 pub mod root_identity;
+/// FR-129 C — the gate on how the wizard's Windows path names a program.
+#[cfg(test)]
+mod spawn_gate;
 /// FR-129 B1 — the mechanics under `orchestrator_unix`: the embedded
 /// script, the halves' argv, the prompt tools, the exit codes, the private
 /// scratch directory.
