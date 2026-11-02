@@ -814,6 +814,14 @@ const KEYS: &[KeyMeta] = &[
         description: "LEGACY ReplacedByNewer escalation: exit the process after 3 displacements in the window instead of backing off in-process. Built-in default: off (W4d — zombie-WS storms must not tear down the overlay).",
     },
     KeyMeta {
+        key: "ws_flat_redial",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-28: while the front load balancer answers 502 (a pod roll: its pin has no process behind it), redial the control WS and the central /derp WS every 0.5-1 s instead of climbing the backoff ladder, so a socket is back within a second of the replacement pod listening. Default OFF. Only a 502 at the upgrade is flat: every other failure, and a server that accepts and drops, keeps the ladder. Bounded at 30 flat redials per outage per socket, refilled by a connection that lived 30 s or a network change; a 502 that outlasts them climbs the ladder from where it stood. Regional relays keep their ladder. Env: ROOMLERD_WS_FLAT_REDIAL. Restart required.",
+    },
+    KeyMeta {
         key: "overlay_warm_relay",
         group: Group::NetworkCarriers,
         tier: Tier::Advanced,
@@ -2098,6 +2106,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_init_auth_first" => cfg.overlay_init_auth_first.map(fmt_bool),
         "overlay_srflx_seek" => cfg.overlay_srflx_seek.map(fmt_bool),
         "ws_replaced_exit" => cfg.ws_replaced_exit.map(fmt_bool),
+        "ws_flat_redial" => cfg.ws_flat_redial.map(fmt_bool),
         "overlay_warm_relay" => cfg.overlay_warm_relay.map(fmt_bool),
         "overlay_quic_async" => cfg.overlay_quic_async.map(fmt_bool),
         "overlay_vpn_vantage" => cfg.overlay_vpn_vantage.map(fmt_bool),
@@ -2581,6 +2590,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_init_auth_first" => cfg.overlay_init_auth_first = parse_tribool(value)?,
         "overlay_srflx_seek" => cfg.overlay_srflx_seek = parse_tribool(value)?,
         "ws_replaced_exit" => cfg.ws_replaced_exit = parse_tribool(value)?,
+        "ws_flat_redial" => cfg.ws_flat_redial = parse_tribool(value)?,
         "overlay_warm_relay" => cfg.overlay_warm_relay = parse_tribool(value)?,
         "overlay_quic_async" => cfg.overlay_quic_async = parse_tribool(value)?,
         "overlay_vpn_vantage" => cfg.overlay_vpn_vantage = parse_tribool(value)?,
@@ -4166,6 +4176,30 @@ mod tests {
                 .any(|(k, _)| *k == "OVERLAY_SRFLX_SEEK"),
             "key must be bridged to the daemon's env"
         );
+    }
+
+    /// FR-28 — the flat redial is opt-in, reaches the daemon through the env
+    /// bridge under the spelling `FlatRedial` reads, and clears back to the
+    /// built-in default.
+    #[test]
+    fn ws_flat_redial_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(cfg.ws_flat_redial, None, "built-in default is OFF");
+        assert!(
+            !crate::config::env_fallbacks(&cfg).contains_key("WS_FLAT_REDIAL"),
+            "an unset key must not reach the daemon's env at all"
+        );
+        apply(&mut cfg, "ws_flat_redial", Some("on")).unwrap();
+        assert_eq!(cfg.ws_flat_redial, Some(true));
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("WS_FLAT_REDIAL")
+                .map(String::as_str),
+            Some("1"),
+            "the one value FlatRedial turns on for"
+        );
+        apply(&mut cfg, "ws_flat_redial", None).unwrap();
+        assert_eq!(cfg.ws_flat_redial, None, "clear → built-in default");
     }
 
     /// W4(d) — the legacy ReplacedByNewer process-exit escalation is

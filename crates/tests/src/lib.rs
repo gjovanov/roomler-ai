@@ -50,6 +50,10 @@ mod agent_e2e_tests;
 mod agent_exec_tests;
 #[cfg(test)]
 mod agent_presence_tests;
+/// FR-28 — the control socket's redial on the load balancer's 502, through the
+/// real signaling loop and a scripted front.
+#[cfg(test)]
+mod agent_redial_tests;
 /// #2267 — a removal (or an archive) tells a connected device at once with
 /// `rc:goodbye AgentDeleted`, instead of leaving it its socket.
 #[cfg(test)]

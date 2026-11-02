@@ -500,7 +500,7 @@ const UPDATE_RECHECK_AFTER_DOWN: Duration = Duration::from_secs(3600);
 /// the LAST outage left the ladder. The bar is the session's life, not the
 /// handshake: a server that accepts and drops at once must still climb the
 /// ladder, or a fleet would reconnect to it every second.
-const LADDER_PROVEN_AFTER: Duration = Duration::from_secs(30);
+pub(crate) const LADDER_PROVEN_AFTER: Duration = Duration::from_secs(30);
 
 /// #2221 — the reconnect ladder after a transient drop. `started_outage`: the
 /// attempt that just ended had sent its hello (see [`OrgCtx::note_ws_down`]);
@@ -554,6 +554,9 @@ pub struct OrgCtx {
     /// FR-103 — rung once the server has ACCEPTED the token on a connect:
     /// the renewal task looks after every connect.
     renewal_connected: Arc<tokio::sync::Notify>,
+    /// FR-28 — the flat redial on a load balancer's 502, for this org's loop.
+    /// As the config says unless a test passes its own ([`Self::with_flat_redial`]).
+    pub flat_redial: crate::ws_connect::FlatRedial,
     /// FR-90 P4-3b-1 — the device's knowhow scanner, on the primary's context
     /// alone (decision 43): `None` on a secondary's, and on a daemon with no
     /// config file to read its roots from.
@@ -577,6 +580,7 @@ impl OrgCtx {
             token,
             renewal: Default::default(),
             renewal_connected: Arc::new(tokio::sync::Notify::new()),
+            flat_redial: crate::ws_connect::FlatRedial::from_config(),
             #[cfg(all(hive_host, unix))]
             knowhow: None,
             #[cfg(hive_host)]
@@ -596,6 +600,7 @@ impl OrgCtx {
             token,
             renewal: Default::default(),
             renewal_connected: Arc::new(tokio::sync::Notify::new()),
+            flat_redial: crate::ws_connect::FlatRedial::from_config(),
             // Decision 43: a secondary enrollment never scans, nor probes.
             #[cfg(all(hive_host, unix))]
             knowhow: None,
@@ -608,6 +613,12 @@ impl OrgCtx {
     /// environment's; a test passes its own).
     pub fn with_renewal(mut self, renewal: crate::token_renewal::Settings) -> Self {
         self.renewal = renewal;
+        self
+    }
+
+    /// FR-28 — replace the flat redial the config picked (a test passes its own).
+    pub fn with_flat_redial(mut self, flat_redial: crate::ws_connect::FlatRedial) -> Self {
+        self.flat_redial = flat_redial;
         self
     }
 
@@ -625,6 +636,14 @@ impl OrgCtx {
     pub fn with_prober(mut self, prober: Arc<crate::hive::knowhow_probe::Prober>) -> Self {
         self.prober = Some(prober);
         self
+    }
+
+    /// No outage is stamped: the last attempt sent its hello, or no attempt has
+    /// failed yet. What [`Self::note_ws_down`]'s stamp would answer.
+    fn ws_is_up(&self) -> bool {
+        self.down_since_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
     }
 
     /// Stamp the start of an outage. `true` when this failure STARTED one: the
@@ -1009,6 +1028,9 @@ pub async fn run(
     // LocalAPI shares the SAME instance and its live `pending` set. Lives across
     // reconnects, so a sentinel dropped while the WS was down is still honoured.
     let mut backoff = Duration::from_secs(1);
+    // FR-28 — off unless the device's config turned it on; off, this loop's
+    // ladder is exactly the one above (`ws_connect::FlatRedial`).
+    let mut flat_redial = ctx.flat_redial.clone();
     // netstate PR-2b — a MAJOR network change during a reconnect backoff
     // cuts the wait and resets the ladder: the transition that killed this
     // WS has ended (or moved again), and an exponential grown to 60 s while
@@ -1104,6 +1126,11 @@ pub async fn run(
         .await;
         if !matches!(attempt, Err(ConnectError::AuthRejected)) {
             recovered_last = false;
+        }
+        // FR-28 — only a connection that lived earns the next outage its flat
+        // redials: #2221's bar, on every way a connection can end.
+        if ctx.ws_is_up() {
+            flat_redial.connection_ended(attempt_started.elapsed());
         }
         match attempt {
             Ok(()) => {
@@ -1364,9 +1391,24 @@ pub async fn run(
                 // every failure mode, blocking root-cause analysis.
                 let cause = error_chain(e.as_ref());
                 warn!(error = %e, %cause, "signaling connect failed; backing off");
+                // FR-28 — the load balancer answered 502: this tenant's pod is
+                // rolling. A flat wait, and the ladder stays where it is.
+                let flat_wait = flat_redial.step(
+                    e.downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+                        .is_some_and(crate::ws_connect::is_lb_502),
+                );
+                if let Some(wait) = flat_wait {
+                    info!(
+                        wait_ms = wait.as_millis() as u64,
+                        left = flat_redial.left(),
+                        "signaling: the load balancer has no pod for this org yet; redialling flat (FR-28)"
+                    );
+                }
                 tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {
-                        backoff = (backoff * 2).min(Duration::from_secs(60));
+                    _ = tokio::time::sleep(flat_wait.unwrap_or(backoff)) => {
+                        if flat_wait.is_none() {
+                            backoff = (backoff * 2).min(Duration::from_secs(60));
+                        }
                     },
                     // netstate PR-2b — the network moved: retry NOW with a
                     // reset ladder instead of waiting out a backoff sized
@@ -1374,6 +1416,7 @@ pub async fn run(
                     _ = next_major_netchange(&mut ladder_net_rx) => {
                         info!("network changed during reconnect backoff — retrying immediately");
                         backoff = Duration::from_secs(1);
+                        flat_redial.restart();
                         // New network = new throttle regime: the slowness
                         // treadmill re-earns its verdict from scratch.
                         slowness_cycles = 0;
