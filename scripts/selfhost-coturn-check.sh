@@ -11,8 +11,8 @@
 #
 # Usage: scripts/selfhost-coturn-check.sh [--file COMPOSE] [--env-file FILE] [--window SECONDS]
 #   --file      the compose file. Default: docker-compose.selfhost.yml. docker-compose.yml,
-#               the development stack, gets the same checks minus the ones about the
-#               deny list and the SFU, neither of which that file has.
+#               the development stack, gets the checks up to the CreatePermission: it has
+#               no deny list and no SFU, and it relays on every address of the host.
 #   --env-file  passed to compose. Default: .env.selfhost beside a selfhost file.
 #   --window    how long coturn must stay up, in seconds. Default: 30.
 #
@@ -124,10 +124,12 @@ client() {
   local user pass rc
   user="$(( $(date +%s) + 600 )):coturn-check"
   pass="$(printf '%s' "$user" | openssl dgst -sha1 -binary -hmac "$SECRET" | base64)"
-  timeout 60 docker run --rm --name "$CLIENT" --network host --entrypoint turnutils_uclient "$IMAGE" \
+  # Against a silent port the client retries forever. As PID 1 it would ignore the SIGTERM,
+  # and `docker run` would wait for it, so the check needs --init, and -k behind that.
+  timeout -k 5 30 docker run --rm --init --name "$CLIENT" --network host --entrypoint turnutils_uclient "$IMAGE" \
     -u "$user" -w "$pass" "$@" 127.0.0.1 >"$OUT" 2>&1
   rc=$?
-  [ "$rc" = 124 ] && docker rm -f "$CLIENT" >/dev/null 2>&1
+  [ "$rc" -ge 124 ] && [ "$rc" -ne 255 ] && docker rm -f "$CLIENT" >/dev/null 2>&1
   return "$rc"
 }
 said() { sed -E 's/^[0-9T:.+-]+ //; s/^(INFO|WARNING|ERROR) //' "$OUT" | grep -aE "$1" | sort -u | head -3 | detail; }
@@ -178,6 +180,11 @@ else
   coturn_says 'denied'
 fi
 
+# The development file stops here. On the host's network every address of the host is a
+# relay address, and coturn rewrites the public address to the first of them, so relay to
+# relay depends on where each allocation landed: that is the host, not the file.
+[ "$SELFHOST" = 1 ] || verdict
+
 # Two clients that can punch nothing, each relayed.
 for how in UDP TCP; do
   flags=(); [ "$how" = TCP ] && flags=(-t)
@@ -191,8 +198,6 @@ for how in UDP TCP; do
     said 'error|rror:'
   fi
 done
-
-[ "$SELFHOST" = 1 ] || verdict
 
 # A relay to the public address lands in coturn's own namespace, so the SFU has to live
 # there too. Without that, every check above passes and a call gets no media.
