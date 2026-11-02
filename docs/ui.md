@@ -148,7 +148,7 @@ flowchart TB
 
 The Video tab of the viewer's settings offers **Frame rate**, with 60, 120 and
 144, only for an agent whose hello carries `fps-high`
-(`views/remote/RemoteControl.vue:1782`). The agent's side, the grant and its
+(`views/remote/RemoteControl.vue:1783`). The agent's side, the grant and its
 step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-the-viewer-asks-the-host-proves-it-fr-119).
 
 - **The options** (`frameRateOptions`, `composables/frameRate.ts:52`): 60 is
@@ -157,7 +157,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   60 Hz").
 - **The pick** is stored per browser (`roomler-rc-fps`,
   `composables/frameRate.ts:30`) and sent again each time the control channel
-  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7691`), so
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7709`), so
   a reload asks again without a click.
 - **The hint under it is the agent's answer**, from `rc:video-info`
   (`frameRateSummary`, `composables/frameRate.ts:149`): "120 fps"; "120 fps, on
@@ -167,7 +167,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   …)". A reason word from a newer agent is shown as it came. With no session
   open, the hint reads "Above 60 only where this device has shown it can sustain
   it".
-- **"Try N fps again"** (`views/remote/RemoteControl.vue:1792`) appears under
+- **"Try N fps again"** (`views/remote/RemoteControl.vue:1793`) appears under
   the picker for an `unproven` refusal, from an agent that advertises
   `fps-retry` (`frameRateCanRetry`, `composables/frameRate.ts:166`). It re-sends
   the pick with `retry: true`, and the agent trials the step-down again from the
