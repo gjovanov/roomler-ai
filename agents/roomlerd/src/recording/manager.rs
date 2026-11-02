@@ -1208,6 +1208,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// #3280 — a local recording's child opens the same encoders a session does, so
+    /// a later caps try gives way to it, with no session in the registry.
+    #[test]
+    fn a_recording_holds_a_later_caps_try_back() {
+        let live =
+            crate::signaling::live_on_this_host(crate::rc_sessions::RcSessionRegistry::new());
+        RECORDING.fetch_add(1, Ordering::Relaxed);
+        let while_recording = live();
+        RECORDING.fetch_sub(1, Ordering::Relaxed);
+        assert!(while_recording);
+    }
+
     #[test]
     fn events_fold_into_the_state_and_mark_the_end() {
         let mut s = RecordingState::default();

@@ -38,7 +38,7 @@
     no config change to be read for AC2/AC3, and flipping the flag off does not produce
     a RED (no IDR per rate step). The read's RED is a **positive control**: a viewer
     resize that moves `dims_swaps` by one must move `idr_count` by exactly one. That
-    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7366`), which
+    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7326`), which
     keeps the encoder's counters. A read that cannot see that IDR cannot vouch for the
     absence of the others.
   - 🔑 **AC3's read, as written, could fail with no rate-caused IDR at all.** Its
@@ -49,20 +49,20 @@
 
     | IDR source | Site (`peer.rs`) | What shows it |
     |---|---|---|
-    | the opener, and one force per frame while the DC is not open yet | `:9605`, `:9611` | `dc_unopen_drops`. Baseline the read after the first heartbeat |
-    | a dims swap | `:7394` | `dims_swaps` |
-    | the viewer's `rc:keyframe`, sent when its decode queue backs up | `:10934` | `keyframe_requests` on `rc:session.stats`, every 30 s. Its log line is `debug!` |
-    | a drop-burst resync: the send channel filled, so the next enqueue forces an IDR | `:9682`, then `:9673` | nothing of its own. `frames_dropped_backpressure` shows the burst |
-    | a lock or unlock | `:8930` | the session's lock state |
-    | a settle keyframe | `:8156` | suppressed on a constrained session (`settle_kf_suppressed`) |
-    | a force unanswered for 4 s | `:8952` | one log line per episode |
+    | the opener, and one force per frame while the DC is not open yet | `:9565`, `:9571` | `dc_unopen_drops`. Baseline the read after the first heartbeat |
+    | a dims swap | `:7354` | `dims_swaps` |
+    | the viewer's `rc:keyframe`, sent when its decode queue backs up | `:10894` | `keyframe_requests` on `rc:session.stats`, every 30 s. Its log line is `debug!` |
+    | a drop-burst resync: the send channel filled, so the next enqueue forces an IDR | `:9642`, then `:9633` | nothing of its own. `frames_dropped_backpressure` shows the burst |
+    | a lock or unlock | `:8890` | the session's lock state |
+    | a settle keyframe | `:8116` | suppressed on a constrained session (`settle_kf_suppressed`) |
+    | a force unanswered for 4 s | `:8912` | one log line per episode |
 
     The drop-burst resync is the one that matters: it is what a congested relay does,
     and it is neither a dims change nor a viewer request. So the read is per window, on
     the heartbeat's cumulative counters: **every Δ`idr_count` must have a Δ`dims_swaps`, a
     Δ`frames_dropped_backpressure`, a `keyframe_requests` tick or a lock edge beside it.
     An unexplained IDR in a window with Δ`rate_moves` > 0 is the RED.** The session must
-    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:8879`)
+    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:8839`)
     builds a new encoder whose counters restart at zero, so a window across one is not
     diffed.
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
@@ -73,7 +73,7 @@
       perfect encoder reads off by the rung's distance.
     - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung
       and move nothing. Δ`rate_moves` marks a real move. The read judges the first
-      complete 2 s heartbeat window (`peer.rs:6820`) after a Δ`rate_moves`, on
+      complete 2 s heartbeat window (`peer.rs:6780`) after a Δ`rate_moves`, on
       Δ`bytes_written` ÷ Δ`frames_encoded`. A window that starts at most 2 s after the
       move and holds the ratio shows the encoder had tracked by then.
     - ≈ 1.0 is a CBR's contract. NVENC is quality-capped VBR and sits under its cap on
