@@ -451,8 +451,8 @@ remove one today.
 ## Windows
 
 **Recommended: the `roomler-setup` wizard**, downloadable from the admin UI or
-`https://roomler.ai/api/setup/windows`. From the first `setup-v*` release that
-publishes it (FR-129 C2), that link serves the **signed EXE itself**,
+`https://roomler.ai/api/setup/windows`. Since `setup-v0.4.197` (FR-129 C2), that
+link serves the **signed EXE itself**,
 `roomler-setup-<v>-x86_64-pc-windows-msvc.exe`, whose bytes equal the release's
 `.exe.sha256` and carry a GPG `.asc` like every other asset;
 `https://roomler.ai/api/setup/windows?format=zip` serves the same EXE in a zip,
