@@ -1024,10 +1024,13 @@ The rest of the change:
   call alone: the capture that is ending lets go within one in-flight capture, so
   an open waits up to 5 × 40 ms before going on to scrap and GDI. A second viewer,
   who really is locked out, pays that once, and then re-climbs quietly every 5 s.
-- **The auto-downscale re-feeds its frame.** It drops the first frame to build
-  the encoder at the smaller size, and the reopen used to bring another by
-  accident. Now the next empty re-encodes the last frame, or a still screen would
-  wait a second for its first picture.
+- **An owed keyframe does not wait for the keepalive.** On a still screen nothing
+  else answers a browser's request, and its first one comes as the track starts,
+  so without this the first picture waits for the 1 s keepalive. The reopen used to
+  hide that by accident: GDI has a frame on every ask. It also stands in for the
+  frame the auto-downscale drops to build the encoder at the smaller size. An
+  owed keyframe re-encodes the last frame at most 4 times a second, however often
+  a browser on a lossy link asks.
 - **The encoder open left the runtime worker** (`spawn_blocking`, as the FFmpeg DC
   pump's). The MF cascade waits on each candidate's own thread, about 0.6 s a go.
 - **The idle line runs on time, once per 5 s**, on every OS. The FR-29 line on an

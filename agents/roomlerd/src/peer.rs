@@ -2763,6 +2763,10 @@ async fn media_pump(
     // only when dirty_rects.is_empty() == false; otherwise emit
     // a NAL-free heartbeat tied to the wallclock.
     const IDLE_KEEPALIVE: Duration = Duration::from_millis(1_000);
+    // #3272 — how soon after the last encode an owed keyframe re-encodes a still
+    // screen. A browser on a lossy link can ask many times a second, and each
+    // answer here is a whole keyframe of an unchanged picture: at most 4 a second.
+    const OWED_KEYFRAME_MIN_GAP: Duration = Duration::from_millis(250);
     let mut last_capture_at = std::time::Instant::now();
     // FR-93 P3e — a capture waiting on its host (a display switched off).
     let mut capture_wait = CaptureWait::default();
@@ -2922,7 +2926,18 @@ async fn media_pump(
                 // have a cached frame, re-encode it. openh264 will emit
                 // a tiny (~tens of bytes) P-frame since nothing changed,
                 // which keeps the browser's decoder unpaused.
-                if last_capture_at.elapsed() >= IDLE_KEEPALIVE {
+                //
+                // #3272 — and a keyframe that is owed does not wait for the
+                // keepalive. On a still screen nothing else answers one, and
+                // the browser's first one comes as the track starts, so the
+                // first picture waited for it. A reopen used to hide this, by
+                // putting a session's first 5 s on GDI, which has a frame on
+                // every ask.
+                let idle_for = last_capture_at.elapsed();
+                if idle_for >= IDLE_KEEPALIVE
+                    || (idle_for >= OWED_KEYFRAME_MIN_GAP
+                        && keyframe_requested.load(std::sync::atomic::Ordering::Relaxed))
+                {
                     if let Some(ref f) = last_good_frame {
                         frames_keepalive += 1;
                         last_capture_at = std::time::Instant::now();
@@ -3279,14 +3294,6 @@ async fn media_pump(
                         %session_id,
                         "auto-downscale fired on first encoder build — dropping native-dim encoder so the track's first frame is at the downscaled dims (avoids browser videoWidth resize race)"
                     );
-                    // #3272 — and re-feed this picture on the next empty. Nothing
-                    // else would bring one: on a still screen a capture has no
-                    // new frame, and the keepalive is a second away. The reopen
-                    // this branch used to fall through to re-delivered it by
-                    // accident (a new duplication, or GDI).
-                    last_capture_at = std::time::Instant::now()
-                        .checked_sub(IDLE_KEEPALIVE)
-                        .unwrap_or(last_capture_at);
                     continue;
                 }
             }
