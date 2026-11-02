@@ -574,14 +574,19 @@ install`, when a config exists, adds one-shot `<TimeTrigger>`s one, three and te
 minutes on (`start_soon_triggers`, `agents/roomlerd/src/service.rs`). With `IgnoreNew`
 the later ones do nothing once the daemon is up, and `StartWhenAvailable` keeps them
 through a sleep. A fresh MSI has no config and starts nothing. A `service stop` inside
-those ten minutes can therefore be undone once.
+those ten minutes can therefore be undone once, and a device removed inside them gets
+one more start, which retries against the server as the next sign-in's start would.
 
 **The first update onto the launcher looks a little different.** It runs the old
 product's table and the old daemon's own console: one terminal can flash when the old
-`UnregisterAutostart` runs, and nothing after that. On a self-update Restart Manager shuts
-down that console, and takes the staged watcher with it, so `last-install.json` stays at
-`InProgress` on that one jump. From a launcher release onward nothing is shown, and it
-reads `SucceededVerified`. Measured on both jumps.
+`UnregisterAutostart` runs, and nothing after that. From a launcher release onward nothing
+is shown. Measured on both jumps.
+
+**`last-install.json` can stay at `InProgress` on a self-update.** The staged watcher
+holds the install folder's VC runtime through `PATH`, and Restart Manager can shut it down
+(event 10002) before it writes a verdict: read on both jumps, while another
+launcher-to-launcher update read `SucceededVerified`. Nothing reads the file, and the
+device comes back either way.
 
 **A resume from sleep needs no start.** The processes sleep with the machine and carry
 on, with the same process ids: after a hibernate the row was back online 13 s after the
