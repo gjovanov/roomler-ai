@@ -1032,6 +1032,8 @@ pub trait PacketSink: Send + Sync {
 
 So a black canvas never again means "unknown": the viewer knows what it was promised, and can say so. The viewer replies with `viewer_hz` from a worker's `requestAnimationFrame`, so fps stops exceeding the panel.
 
+As built by R2 (`docs/remote-control.md` §5.1h): the key is `t`, like every control message, not `type`; the plan adds `stopped: { why, detail }`, which §6.9's `Z` node needs and the sketch leaves out; and `viewer_hz` goes as its own message, `rc:viewer-hz`.
+
 ### 6.8 Recovery
 
 | Event | Today | After | Bound |

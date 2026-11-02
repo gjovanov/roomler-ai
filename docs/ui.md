@@ -172,6 +172,38 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   again", shown after a session fails, has the same icon and reconnects
   instead.
 
+### A session says what it got (FR-135 R2)
+
+An agent that advertises `media-plan` states its plan on the control channel
+(`rc:media-plan`, [`remote-control.md` §5.1h](remote-control.md#51h-a-session-says-what-it-got-fr-135-r2)).
+An older agent sends none, and its sessions read as they did. The reading and the
+wording are pure, in `composables/mediaPlan.ts`, and `useRemoteControl` holds the
+refs: `mediaPlan`, `mediaStop`, `mediaSilent`, `viewerHz`.
+
+| On the page | `data-testid` | When | Says |
+|---|---|---|---|
+| Overlay | `rc-media-stop` | The plan carries `stopped` | "This device could not start its video. It tried h264_nvenc, h264_amf and h264_vulkan, and none of them opened.", the device's word, and the backend's own words |
+| Overlay | `rc-media-silent` | A plan, no `stopped`, never painted, 6 s (`nextMediaSilent`) | "This device is set to send H.265 over the data channel, and no frame has arrived." This is what a page has on the two pumps that are not instrumented |
+| Stats pill | `rc-media-ladder` | The plan has at least one step down | The last arrow and the count, every arrow on hover |
+
+- **The overlays sit below `rc.mediaUnavailable` and `rc.mediaWaiting`**, because
+  those name a cause and a fix, and above "waiting for agent to publish a video
+  track", which this replaces when there is more to say
+  (`views/remote/RemoteControl.vue`).
+- **The words outlive the watchdog's re-create.** `scheduleReconnect` keeps the stop,
+  the silence and the plan across its `teardown`, or the page's one sentence would
+  blink every 10 s. A new session's first plan knows only the transport and the codec,
+  so it leaves the words alone (`mediaPlanAction`). An opened encoder clears them, and
+  so does the first picture.
+- **A plan is kept by `epoch`.** The next session's plan starts at 1 again, so the page
+  counts apart from the plan it shows and resets on `teardown`.
+- **A plan that says `webrtc` while a data-channel path runs stops that path**, so
+  `<video>` shows. Nothing is coming on a channel the agent is not writing to.
+- **`viewerHz`** comes from the decode worker (`workers/rc-viewer-hz.ts`), and
+  `sendViewerHz` sends it only to an agent with the verb, again at each control
+  channel `onopen`. The picker does not read it yet: it waits with the agent's cap,
+  past FR-135 §7.1's gates.
+
 ## Observability components
 
 `ui/src/components/stats/`: `MeshGraph` (d3 force graph of overlay edges +

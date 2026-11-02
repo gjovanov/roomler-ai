@@ -1106,6 +1106,102 @@ as it did and an open on a taken seat takes one look. The reopen, the time-gated
 and the blocking open do not come back with it. [FR-98 C7](fr/FR-98-input-to-photon-budget.md#4-design-cuts-each-one-attributed-by-l4)
 moves the other pumps over and retires the opt-in, the switch and their sleeps.
 
+### 5.1h A session says what it got (FR-135 R2)
+
+Until this a viewer learned its encoder from `rc:video-info`, which only an opened
+encoder sends. A pump that could not open one logged a line and returned, so the
+page stayed black, read *connected*, and asked for a new session every 10 s. The
+reason was in the host's log and nowhere else. Now a session states its plan on the
+p2p control channel when it starts, and again on every change.
+
+```mermaid
+sequenceDiagram
+    participant S as session start
+    participant P as FFmpeg DC pump
+    participant E as the plan's emitter
+    participant V as viewer
+
+    S->>E: media_plan::start, before any pump runs
+    Note over E: transport and codec are known now.<br/>The control channel usually opens later,<br/>so the emitter retries every 500 ms.
+    E->>V: rc:media-plan epoch 1
+    V-->>V: remembers what it was promised
+    P->>E: encoder_opened, fps_answer, input_form
+    E->>V: rc:media-plan epoch n, only when something changed
+    alt nothing opens
+        P->>E: no_encoder: every cell it tried, and the backend's words
+        E->>V: rc:media-plan with stopped
+        V-->>V: the page names the cells and the reason
+    else the decode worker paints
+        V->>P: rc:viewer-hz, measured and sent when it moves
+    end
+```
+
+The agent's side is `agents/roomlerd/src/media_plan.rs`: pure transitions on a `Plan`,
+a registry keyed by session id as `session_telemetry`'s is, and one emitter per
+session that ends with the session. Only a real change raises `epoch`, so a heartbeat
+that reports the same input form costs nothing.
+
+| Field | Written by | Says |
+|---|---|---|
+| `epoch` | every real change | A viewer keeps the newest. A re-created session starts at 1 again |
+| `transport`, `codec` | session start | What the session negotiated. A data channel names its own codec, because `chosen_codec` is the RTP track's pick |
+| `chroma`, `cell` | `encoder_opened` | `cell` is `name:chroma`, the spelling `encoder_cells_deny` takes |
+| `capture` | `encoder_opened` | The capture backend as it names itself, and the frames' form when the encoder opened |
+| `input` | the pump's heartbeat | `gpu` or `cpu`, with the encoder's own reason |
+| `fps` | the grant, when the answer moves | `granted`, plus `asked` and `reason` when an ask was refused |
+| `ladder` | every step down | `{from, to, why, at_ms}`. A cell that lost to the next, GPU form to CPU form, asked to granted. At most 24, and `stopped` still says how it ended |
+| `stopped` | the pump, on its way out | `no_encoder` or `encoder_fault`, and the backend's own words, one line of at most 160 characters |
+
+⚠️ **Three of those arrows are written by one pump.** The FFmpeg data-channel pump is
+the only one instrumented. An RTP or VP9 session carries the plan's start and nothing
+after it, on purpose: FR-135's ratchet stops those pumps growing, and their fault
+ladders arrive with their stages (R8, R11). So a viewer on one of them learns less,
+never something wrong.
+
+⚠️ **The arrows come from a recording, not from the pump's error.** The cascade keeps
+one failure in the error it returns, which on a guest read `no vulkan device opened on
+this host` with three other cells tried and unnamed. `media_plan::OpenTrail` listens
+on the open's own blocking-pool thread, and `note_candidate_failed` costs one
+thread-local read when nobody is listening, as during a probe.
+
+**What the page does with it** (`composables/mediaPlan.ts`, in full in
+[`ui.md`](ui.md#a-session-says-what-it-got-fr-135-r2)). `stopped` becomes an overlay
+that names the cells it tried. A plan and no picture for 6 s says what was promised.
+And a plan that says `webrtc` while the page decodes a data channel stops that path, so
+`<video>` shows: the agent fell to the RTP track, and nothing will ever arrive on the
+channel the page opened.
+
+⚠️ **It does not end the session.** The watchdog still asks for a new one every 10 s,
+because a transient GPU fault heals that way today. The page keeps the words across the
+re-create, so they hold still while it tries. Ending the session with a reason is R8's
+(FR-135 §6.8).
+
+**`rc:viewer-hz`.** The decode worker measures its own `requestAnimationFrame` in a
+short burst when the first frame paints and once a minute after
+(`ui/src/workers/rc-viewer-hz.ts`), and the page sends a reading that moved by more
+than 1 Hz. The agent stores it per viewer (`ViewerFeedback::store_viewer_hz`) and logs
+`control: rc:viewer-hz`. It changes nothing unless `ROOMLERD_VIEWER_HZ_CAP=1`, which
+is off by default. On, the grant reads the slowest screen that has said
+(`Pipeline::merged_viewer_hz`) and refuses a rate above it with the reason
+`viewer_refresh`, 2 Hz of slack allowed for a 59.94 panel. FR-135's S14 has not yet
+answered whether a worker's rAF follows the panel under `desynchronized`, and a worker
+that falls behind reads low, so the cap and the picker wait for that answer and for
+FR-135 §7.1's gates.
+
+Both directions are additive, and each is read by the other side's verb or by nothing:
+
+| Agent | Viewer | What happens |
+|---|---|---|
+| With `media-plan` | Knows it | The whole of this section |
+| With `media-plan` | Older | Its parser drops an unknown `t`. It never sends `rc:viewer-hz`, so `viewer_hz()` stays `None` |
+| Older | Knows it | No plan arrives, so the page reads as it did. No `rc:viewer-hz` is sent, because the verb is absent |
+
+Kill switch: `ROOMLERD_MEDIA_PLAN=0` registers no plan, so every writer does nothing,
+and the agent stops advertising `media-plan`. R0 folds it into `rc_media_legacy` as
+`media_plan`, and the cap into R0's keys. Neither touches the server wire or the
+composition baseline: both messages are peer-to-peer control-channel JSON, and the
+baseline holds no verbs.
+
 ### 5.2 Encoder selection
 
 Picked at agent startup, redetected on GPU change:
@@ -1144,6 +1240,7 @@ Without them the viewer never offers above 60 and never sends `rc:fps`.
 |---|---|---|
 | `rc:fps` | viewer → agent, control channel | `fps`: 60, 120 or 144 ([`frame_rate.rs:36`](../agents/roomlerd/src/encode/frame_rate.rs#L36)); anything else is dropped. `retry: true`, a literal `true` only, asks to trial a refused rate again (`fps-retry`, [`frame_rate.rs:30`](../agents/roomlerd/src/encode/frame_rate.rs#L30)) |
 | `rc:video-info` | agent → viewer | `fps`, what the stream runs at; `fps_asked` and `fps_reason` once it runs below the ask; `fps_trial` while a trial runs; `refresh_hz` when the host could read its screen's rate ([`peer.rs:5426`](../agents/roomlerd/src/peer.rs#L5426)) |
+| `rc:viewer-hz` | viewer → agent, control channel | `hz`, the viewer's screen as its decode worker measured it, 1 to 1000. Stored and logged ([§5.1h](#51h-a-session-says-what-it-got-fr-135-r2)). The grant reads it only under `ROOMLERD_VIEWER_HZ_CAP=1` |
 
 **The grant** ([`frame_rate.rs:286`](../agents/roomlerd/src/encode/frame_rate.rs#L286)).
 It runs in the FFmpeg data-channel pump
@@ -1156,6 +1253,7 @@ belief. Each rate is checked in the order a viewer can see and act on
 |---|---|---|
 | `constrained` | the session is relayed: above 60 there waits for FR-17 stage C, FR-63 and FR-70 M3 | no: a relay refuses every rate above its cap |
 | `refresh` | the captured screen refreshes slower than the rate | yes |
+| `viewer_refresh` | the viewer's measured screen refreshes slower than the rate, by more than 2 Hz. Only under `ROOMLERD_VIEWER_HZ_CAP=1`, off by default | yes |
 | `denied` | `fps_deny` names this encoder at this rate | yes |
 | `unproven` | this rate class's last trial failed, within the hour | yes |
 | `pipe` | the session's pipe push-back is below the ceiling at this rate | yes |

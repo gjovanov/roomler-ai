@@ -14,7 +14,8 @@
  *   MP_EXPECT_NO_PLAN   `1`: no such line may appear, for an older agent
  *   MP_EXPECT_NO_BLINK  `1`: once an overlay shows, it stays until the end of the wait
  *   MP_EXPECT_HZ        a regex a logged `[rc] viewer_hz` line must match
- *   MP_UI_DIST         serve the viewer from this `dist` directory at the production origin, for a read before a promote
+ *   MP_EXPECT_VERB      `1` or `0`: whether the agent's row must advertise `media-plan`
+ *   MP_UI_DIST        serve the viewer from this `dist` directory at the production origin, for a read before a promote
  *   MP_SHOT             where the screenshot goes
  *   E2E_RC_CODEC        the codec picker's value for this agent
  */
@@ -36,6 +37,7 @@ const EXPECT_PLAN = process.env.MP_EXPECT_PLAN || ''
 const EXPECT_NO_PLAN = process.env.MP_EXPECT_NO_PLAN === '1'
 const EXPECT_NO_BLINK = process.env.MP_EXPECT_NO_BLINK === '1'
 const EXPECT_HZ = process.env.MP_EXPECT_HZ || ''
+const EXPECT_VERB = process.env.MP_EXPECT_VERB || ''
 const UI_DIST = process.env.MP_UI_DIST || ''
 const SHOT = process.env.MP_SHOT || ''
 const CODEC_STORAGE_PREFIX = 'roomler-rc-codec.v1:'
@@ -94,6 +96,10 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   const token = ((await login.json()) as { access_token: string }).access_token
   const agentId = await findNamedOnlineAgent(token)
   expect(agentId, `agent "${AGENT_NAME}" never reported online`).toBeTruthy()
+  const row = (await (
+    await fetch(`${API_URL}/api/tenant/${TENANT_ID}/agent/${agentId}`, { headers: { Authorization: `Bearer ${token}` } })
+  ).json()) as { capabilities?: { rpc?: string[] } }
+  const verb = row.capabilities?.rpc?.includes('media-plan') === true
 
   await context.addInitScript(
     ([id, codec, prefix]: string[]) => {
@@ -145,6 +151,11 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
         say(`rc:session.request ${sessionsAsked} preferred_transport=${t}`)
       }
     })
+  })
+  let pageErrors = 0
+  page.on('pageerror', (e) => {
+    pageErrors++
+    say(`pageerror: ${e.message.slice(0, 240)}`)
   })
   page.on('console', (m) => {
     const text = m.text()
@@ -201,7 +212,7 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   if (SHOT) await page.screenshot({ path: SHOT }).catch(() => undefined)
   const paints = painted + (video.w > 0 && video.t > 0 ? 1 : 0)
   const overlay = [...overlayWords].join(' | ')
-  say(`RESULT browser=${browserName} paints=${paints} video=${video.w} sessions=${sessionsAsked} plans=${plans.length} hz=${hzLines.length} blink=${blink} overlay="${overlay.slice(0, 500)}"`)
+  say(`RESULT browser=${browserName} paints=${paints} video=${video.w} sessions=${sessionsAsked} plans=${plans.length} hz=${hzLines.length} blink=${blink} verb=${verb} pageerrors=${pageErrors} overlay="${overlay.slice(0, 500)}"`)
 
   const disconnect = page.locator('button[aria-label="Disconnect"]').first()
   if (await disconnect.isVisible().catch(() => false)) await disconnect.click().catch(() => undefined)
@@ -214,4 +225,6 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   if (EXPECT_NO_PLAN) expect(plans.length).toBe(0)
   if (EXPECT_NO_BLINK) expect(blink).toBe(0)
   if (EXPECT_HZ) expect(hzLines.join('\n')).toMatch(new RegExp(EXPECT_HZ))
+  if (EXPECT_VERB) expect(String(verb)).toBe(EXPECT_VERB === '1' ? 'true' : 'false')
+  expect(pageErrors).toBe(0)
 })
