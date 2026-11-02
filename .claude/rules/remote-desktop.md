@@ -108,3 +108,13 @@ Moved from CLAUDE.md's Known Issues, verbatim; the full field log is in `docs/fr
   outcome for that person. The X11 panel was field-verified through Xwayland in
   FR-93 AC10 (0.4.141). Still unverified: the macOS native panel.
   Detail: `docs/fr/FR-27-*.md`.
+
+### Input: a Noop is not final (#2066, #3164)
+
+An injector without permission is dropped and opened again, so a first event before a
+display, `/dev/uinput` or a grant no longer kills input until a restart
+(`docs/remote-control.md` §6.1b).
+⚠️ Off macOS each try is a real open and each failure warns, so the wait doubles up to a
+minute. Don't shorten it: a root daemon with no `DISPLAY` never gets an injector.
+⚠️ `has_permission()` must stay true for any backend that works. This retry drops
+whatever reports false.

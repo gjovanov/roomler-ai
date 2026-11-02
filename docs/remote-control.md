@@ -1502,6 +1502,21 @@ its moves while any session holds a mouse button, and tells it about every
 controller event it injects, so a remote person pauses it exactly as a local
 one does. See [`keep-busy.md`](keep-busy.md).
 
+### 6.1b An injector with no permission is opened again (#2066, #3164)
+
+The arbiter opens the OS injector at the first event, then keeps it. If no backend can open yet, it gets a `NoopInjector`, which drops every event. Before these two fixes that Noop stayed for the life of the process, so input stayed dead for every later controller until a restart.
+
+| Host | What it waits for | How often it looks, while events arrive |
+|---|---|---|
+| macOS | the Accessibility grant, read live with `AXIsProcessTrusted` | once a second |
+| Elsewhere | nothing to ask: only opening one tells (a Linux daemon before its display or `/dev/uinput` exists) | after 1 s, doubling to once a minute |
+
+A new session's first event looks at once, from the shortest wait again (`Regrant`, `agents/roomlerd/src/input/arbiter.rs:1055`; `os_grants_input`, `agents/roomlerd/src/input/mod.rs:505`).
+
+⚠️ A root daemon with no `DISPLAY` can never open enigo, and each failed open warns. The doubling is what keeps that host to one warning a minute.
+
+Off macOS only a Noop reports no permission, because enigo, SystemContext and uinput all report it once they open. So this can never drop an injector that works.
+
 ### 6.2 Remote cursor
 
 The agent does **not** render the cursor into the captured frame (it tells the OS "I'm capturing, hide the cursor"). Instead, it sends cursor shape + position over the `control` DC. The controller renders the cursor as a CSS overlay on top of the video. This eliminates the "delayed mouse" feeling that plagues lower-end remote desktop tools — the local cursor moves at native refresh, the video catches up.

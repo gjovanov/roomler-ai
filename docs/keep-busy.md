@@ -66,8 +66,8 @@ flowchart LR
 
 The engine is one std thread, `keep-busy`. It never touches the OS injector
 itself. It asks the input arbiter to read or move the pointer: the one injector,
-created lazily and cached for the life of the process
-(`input/arbiter.rs` `keep_busy_op`, L953).
+created lazily and cached, and opened again while it has no permission
+(`agents/roomlerd/src/input/arbiter.rs:1173` `keep_busy_op`; #2066).
 
 | Rule | Where |
 |---|---|
@@ -220,7 +220,7 @@ show that one sentence.
 | **Moves only.** Never a click, a key or a scroll | — |
 | **The safe box**: the monitor's work area ∩ a 48 px inset from every monitor edge (`patterns.rs` `safe_box`, L233). macOS uses 96 pt (`host_mac.rs` `mac_safe_box`, L235): the release build has no AppKit, so no `visibleFrame`, and the margin keeps the menu bar and a Dock on any edge clear | The pointer never reaches a hot corner or edge: GNOME Activities, a macOS hot corner that can start the screensaver **or lock the screen**, an auto-hidden taskbar or Dock, Windows Peek |
 | **No jumps.** Each loop starts at the pointer, and a changing pattern (Shuffle, Wander, Lissajous) continues from where the last loop ended. The one exception is a blind host (GNOME through uinput), which resumes where it stopped | — |
-| **Never the first to create the injector before a display exists.** A boot-time restore waits for an unlocked session, and an injector the OS has not granted is answered for and not cached | The arbiter caches the injector, Noop included. Creating it too early would break remote control's input until a restart |
+| **Never the first to create the injector before a display exists.** A boot-time restore waits for an unlocked session, and an injector the OS has not granted is answered for and not cached | The arbiter caches the injector, and a Noop only until it opens another (#2066). Creating it too early would cost a controller its first input until that retry |
 | **The viewer never re-asserts keep busy on connect**, unlike display-match | A reconnecting tab must not undo the person's Stop |
 | **Wayland is refused from the display itself** (`host_x11.rs` `session`, L389): the `XWAYLAND` extension, or monitors named `XWAYLAND*`. The GNOME host is asked instead (`host_linux.rs`) | XTest there moves only Xwayland's own pointer, so a calibration could pass while nothing real moves |
 

@@ -1045,16 +1045,33 @@ fn warm(injector: &mut Option<Box<dyn super::InputInjector + Send>>) {
 /// asked at most once per [`Regrant::EVERY`] while events arrive (a stubborn
 /// backend then costs one open a second, not one per event), and at once for
 /// the first event of each new session.
+///
+/// #2066 — off macOS there is no grant to ask about. A Noop there means no
+/// backend opened (a Linux daemon before its display or `/dev/uinput` exists),
+/// and only trying again can tell that one would now. Each failed open warns,
+/// and a root daemon with no `DISPLAY` never gets one, so the wait doubles with
+/// every open, up to [`Regrant::AT_MOST`], and starts over with each new session.
 #[derive(Debug, Default)]
 struct Regrant {
     asked_at: Option<Instant>,
+    /// Opens tried since this session began or an injector last had permission.
+    opens: u32,
 }
 
 impl Regrant {
     const EVERY: Duration = Duration::from_secs(1);
+    const AT_MOST: Duration = Duration::from_secs(60);
+
+    /// How long after the last question the next one may come: [`Self::EVERY`]
+    /// until the first open and right after it, then doubling.
+    fn wait(&self) -> Duration {
+        Self::EVERY
+            .saturating_mul(1 << self.opens.saturating_sub(1).min(6))
+            .min(Self::AT_MOST)
+    }
 
     /// Whether to drop the cached injector and open another: it lacks the OS's
-    /// permission, the OS was not asked within [`Self::EVERY`], and asked now
+    /// permission, the OS was not asked within [`Self::wait`], and asked now
     /// (`os_grants`, only then) it grants it.
     fn reopen(
         &mut self,
@@ -1063,26 +1080,33 @@ impl Regrant {
         os_grants: impl FnOnce() -> bool,
     ) -> bool {
         if has_permission {
+            self.opens = 0;
             return false;
         }
         if self
             .asked_at
-            .is_some_and(|at| now.saturating_duration_since(at) < Self::EVERY)
+            .is_some_and(|at| now.saturating_duration_since(at) < self.wait())
         {
             return false;
         }
         self.asked_at = Some(now);
-        os_grants()
+        let granted = os_grants();
+        if granted {
+            self.opens = self.opens.saturating_add(1);
+        }
+        granted
     }
 
     /// A session opened: its first event asks the OS again.
     fn session_opened(&mut self) {
         self.asked_at = None;
+        self.opens = 0;
     }
 }
 
 /// The cached injector, unless it no longer fits: stale (FR-95 P2,
-/// `input::stale`), or opened without a grant the OS has given since (#3164).
+/// `input::stale`), or opened without a permission it may have now (#3164,
+/// #2066).
 fn refresh(injector: &mut Option<Box<dyn super::InputInjector + Send>>, regrant: &mut Regrant) {
     refresh_with(injector, regrant, super::os_grants_input);
 }
@@ -1101,8 +1125,8 @@ fn refresh_with(
         *injector = None;
     } else if regrant.reopen(inj.has_permission(), Instant::now(), os_grants) {
         tracing::info!(
-            "input: the OS grants this agent input now — opening the injector again, no restart \
-             needed (#3164)"
+            "input: this injector has no permission — opening it again, no restart needed (#3164, \
+             #2066). A failed open warns right after this line; no warning means it worked."
         );
         *injector = None;
     }
@@ -1139,13 +1163,13 @@ fn inject_all(
 
 /// FR-92 — run one keep-busy request against the ONE injector.
 ///
-/// ⚠️ The injector is created lazily and then cached for the life of the
-/// process — a `NoopInjector` included. Remote control's first event used to
-/// be the only creator, and a session implies a display. Keep-busy may be
-/// first (a boot-time restore), so an injector without the OS's permission
-/// is answered for and NOT cached: a Noop cached before a display exists
-/// would silently break every later controller's input. (The engine also
-/// sends nothing before its host confirms an interactive session.)
+/// ⚠️ The injector is created lazily and then cached, a `NoopInjector` included
+/// until [`Regrant`] opens it again. Remote control's first event used to be
+/// the only creator, and a session implies a display. Keep-busy may be first (a
+/// boot-time restore), so an injector without the OS's permission is answered
+/// for and NOT cached: a Noop cached before a display exists would cost a later
+/// controller its first input. (The engine also sends nothing before its host
+/// confirms an interactive session.)
 fn keep_busy_op(
     state: &ArbiterState,
     injector: &mut Option<Box<dyn super::InputInjector + Send>>,
@@ -2070,15 +2094,72 @@ mod tests {
         assert!(fresh.asked_at.is_none());
     }
 
-    /// Off macOS no grant is waited on: an injector opened without permission
-    /// (a Noop where enigo would not open) stays as it was, as before #3164.
+    /// #2066 — off macOS no grant is waited on, so a Noop a first event cached
+    /// before a display or `/dev/uinput` existed is dropped, and the next event
+    /// opens whatever can open now. Master kept it until a restart.
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn off_macos_an_unpermitted_injector_stays() {
-        assert!(!crate::input::os_grants_input());
+    fn off_macos_a_noop_is_opened_again() {
+        assert!(crate::input::os_grants_input());
         let mut injector: Option<Box<dyn crate::input::InputInjector + Send>> =
             Some(Box::new(crate::input::NoopInjector));
         refresh(&mut injector, &mut Regrant::default());
-        assert!(injector.is_some());
+        assert!(injector.is_none());
+    }
+
+    /// #2066 — a host that can never open one (a root daemon with no `DISPLAY`)
+    /// pays one open, and one warning, a minute while events arrive, not one a
+    /// second. A new session asks at once, from the shortest wait again.
+    #[test]
+    fn a_failing_open_backs_off_to_a_minute_and_a_session_starts_it_over() {
+        let mut at = Instant::now();
+        let mut r = Regrant::default();
+        for secs in [1, 2, 4, 8, 16, 32, 60, 60, 60] {
+            assert!(r.reopen(false, at, || true), "due after {at:?}");
+            let next = at + Duration::from_secs(secs);
+            assert!(
+                !r.reopen(false, next - Duration::from_millis(1), || panic!(
+                    "asked inside the wait of {secs} s"
+                )),
+                "inside the wait of {secs} s"
+            );
+            at = next;
+        }
+        r.session_opened();
+        assert!(r.reopen(false, at, || true), "a new session asks at once");
+        assert!(!r.reopen(false, at + Duration::from_millis(999), || panic!(
+            "asked inside the shortest wait"
+        )));
+        assert!(r.reopen(false, at + Regrant::EVERY, || true));
+    }
+
+    /// An open that worked ends the back-off: an injector that later loses its
+    /// permission starts from the shortest wait, not the longest.
+    #[test]
+    fn a_permitted_injector_ends_the_back_off() {
+        let mut at = Instant::now();
+        let mut r = Regrant::default();
+        for _ in 0..8 {
+            r.reopen(false, at, || true);
+            at += Regrant::AT_MOST;
+        }
+        assert_eq!(r.wait(), Regrant::AT_MOST);
+        assert!(!r.reopen(true, at, || panic!(
+            "a permitted injector is never asked about"
+        )));
+        assert_eq!(r.wait(), Regrant::EVERY);
+    }
+
+    /// macOS's 1 s poll of a grant nobody has given yet must not slow down: the
+    /// wait grows only with an open, never with a "no" from the OS.
+    #[test]
+    fn a_grant_not_given_keeps_the_shortest_wait() {
+        let mut at = Instant::now();
+        let mut r = Regrant::default();
+        for _ in 0..4 {
+            assert!(!r.reopen(false, at, || false));
+            assert_eq!(r.wait(), Regrant::EVERY);
+            at += Regrant::EVERY;
+        }
     }
 }
