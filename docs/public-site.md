@@ -2,14 +2,18 @@
 
 **Audience:** whoever changes `ui/docs/`, `ui/blog/`, the landing copy, the pod's nginx config,
 or anything a search engine sees. Built by [FR-60](fr/FR-60-public-docs-site.md) (#1165, the
-docs generator) and [FR-87](fr/FR-87-blog-and-google-indexing.md) (#1776, the blog, honest
-dates, hashed assets, the head and the static homepage).
+docs generator), [FR-87](fr/FR-87-blog-and-google-indexing.md) (#1776, the blog, honest
+dates, hashed assets, the head and the static homepage) and
+[FR-91](fr/FR-91-scheduled-blog-publishing.md) (#1880, the blog's own publishing lane, §11). What
+promotion brings is measured here too: [FR-88](fr/FR-88-promotion-attribution-and-site-video.md)
+(#1790) added the video facade (§7), the campaign's carry (§9) and the link hub (§10).
 
 The product is a single-page app that a crawler reads as one empty `<div id="app">`.
 Everything a search engine should find (the homepage, the user documentation, the blog) is
 **static HTML** built by one in-repo generator into `ui/dist/`, next to the SPA, and served by
-the same pod nginx. No dependency was added for any of it: the generator is `markdown-it`
-(already a UI dependency) plus hand-written TypeScript.
+the same pod nginx. In production the blog is the exception: the same generator builds it, and
+a server of its own serves it, so a post needs no roll (§11). No dependency was added for any of
+it: the generator is `markdown-it` (already a UI dependency) plus hand-written TypeScript.
 
 > ⚠️ **CI green is not "Google can read it".** Every defect FR-87 fixed was invisible from
 > inside the build: dates that changed on every deploy, a redirect that downgraded to
@@ -161,7 +165,7 @@ Built once, in [`theme/shell.ts:91`](../ui/docs/theme/shell.ts), for every colle
   [`theme/analytics.js`](../ui/docs/theme/analytics.js), content-hashed like every theme file
   (and into the blog lane's own `/blog/assets/`), whose configuration rides on its own
   `<script>` tag as `data-src` / `data-domain` / `data-hosts`, written by the shell from
-  `ANALYTICS` ([`site.ts:215`](../ui/docs/site.ts)); there is no inline script, so the CSP is
+  `ANALYTICS` ([`site.ts:218`](../ui/docs/site.ts)); there is no inline script, so the CSP is
   unchanged (`script-src 'self' https://purestat.ai` already covers both). The loader injects
   the tracker only when **all three** hold: the page's hostname is on the allowlist exactly
   (`roomler.ai`, `www.roomler.ai`; no subdomain, no fork, no preview origin), the page is
@@ -175,6 +179,10 @@ Built once, in [`theme/shell.ts:91`](../ui/docs/theme/shell.ts), for every colle
   on the visitor's device. `ANALYTICS = null` still turns it all off: no loader, no tag.
 
 ## 5. How nginx serves it
+
+In production the edge sends `/blog`, `/blog/` and `/sitemap-blog.xml` to the blog lane (§11). The
+pod nginx answers them only while the lane's kill switch is pulled, and the lane's config mirrors
+the rules below for those URLs.
 
 ```mermaid
 flowchart TD
@@ -244,7 +252,13 @@ checks the **served** site. It runs against every image in `hosted-image.yml`
 
 ```bash
 bash scripts/public-site-smoke.sh https://roomler.ai . <deployed-sha>
+bash scripts/public-site-smoke.sh --blog https://roomler.ai     # the blog lane (§11), after a publish
 ```
+
+`--blog <base-url> [<docs-base-url>]` checks the lane instead: `/blog/`, the `/blog` redirect, the
+urlset, a post, the feed, a real 404, `no-cache` HTML, every asset under `/blog/assets/`, hashed and
+loading, and the security headers of `/blog/`, the post and the feed against `/docs/`'s. Production
+is the natural target, because there the edge sends one URL to each server.
 
 | Check | Catches |
 |---|---|
@@ -364,6 +378,8 @@ sequenceDiagram
   the file is served as committed.
 - **Off unless the repository variable `INDEXNOW_ENABLED` is `true`**, and warn-only: a missed
   hint to a crawler never fails a promote.
+- **A post is not a promote.** The lane's publisher submits its own URLs (§11.2). A promote's
+  snapshots read the same `sitemap-blog.xml` before and after the roll, so they see no change.
 
 **Search Console** holds the Domain property `sc-domain:roomler.ai`. It sits under the
 Workspace account that owns the domain, and it verified itself from the domain's existing
@@ -383,6 +399,262 @@ property from it. Review the coverage at +3, +14 and +28 days after a launch (FR
 > Indexing API (Google limits it to job postings and livestreams), and a `SoftwareApplication`
 > rich result, which requires ratings.
 
+## 9. What a campaign link carries
+
+[FR-88](fr/FR-88-promotion-attribution-and-site-video.md) makes one campaign id travel from a
+post's link to the account it produced, and on to that account's first enrolled device. The
+rule is **carry, don't store**: nothing about it is written to the visitor's device, not a
+cookie, not localStorage, not sessionStorage. Storing on a terminal for a non-essential purpose
+needs consent under ePrivacy Art. 5(3), and the site has no consent banner and must not need
+one. The keys live in links, and only in links.
+
+```mermaid
+sequenceDiagram
+  participant V as Visitor
+  participant S as A static page
+  participant A as The SPA
+  participant API as /api
+  participant R as Redis
+  participant P as OAuth provider
+  V->>S: /blog/x/?utm_source=youtube&utm_campaign=c1
+  S->>S: attribution.js copies the keys onto the page's own links
+  V->>A: a carried link: /register?utm_source=youtube&utm_campaign=c1&landing_path=/blog/x/
+  alt the email form
+    A->>API: POST /api/auth/register with attribution
+  else a provider button, on /register or /login
+    A->>API: GET /api/oauth/google?utm_source=youtube&utm_campaign=c1
+    API->>R: park under the CSRF state, 600 s
+    API->>P: 307 to the provider, carrying none of it
+    P->>API: GET /api/oauth/callback/google?code&state
+    API->>R: read and delete
+  end
+  API->>API: a NEW account keeps signup_attribution, once
+```
+
+| Hop | What happens | Where |
+|---|---|---|
+| A static page | With `utm_source`, `utm_medium`, `utm_campaign`, `utm_content`, `utm_term` or `ref` on its URL, it copies those keys onto its own links to `/register`, `/login`, the installer downloads and the install pages, and adds `landing_path` and the referring site's host. With none of them it changes nothing, unless the journey began on the blog, from another site (§11.5). The homepage's newsletter form gets the campaign as its `source` | [`attribution.js`](../ui/docs/theme/attribution.js), with the install pages written in from `INSTALL_PAGES` by [`carry.ts`](../ui/docs/theme/carry.ts) |
+| The SPA | `/register` reads its own URL at the moment of sending, asks "How did you hear about Roomler?" (optional), and sends one `attribution` object. The provider buttons on `/register` and `/login` put the same keys on the OAuth start URL | [`attribution.ts`](../ui/src/utils/attribution.ts), [`RegisterView.vue`](../ui/src/views/auth/RegisterView.vue), [`LoginView.vue`](../ui/src/views/auth/LoginView.vue) |
+| OAuth | `oauth_redirect` parks the keys in Redis under the CSRF state it already mints, for that cookie's 600 s, and sets no cookie of its own. `complete_sign_in` reads and deletes them. ⚠️ A missing or expired key means "no attribution", never a failed sign-in | [`routes/oauth.rs`](../crates/api/src/routes/oauth.rs), [`core/attribution.rs`](../crates/core/src/attribution.rs) |
+| The account | `sanitize` keeps printable ASCII up to 64 characters, drops anything else and any unknown key, keeps a referrer's bare host and a landing page's path, and normalises `source` and `medium`. The result is stored once, at creation, as `users.signup_attribution`. No user-facing endpoint returns it, and it is not logged at `info` | [`core/attribution.rs`](../crates/core/src/attribution.rs), [`routes/auth.rs`](../crates/api/src/routes/auth.rs) |
+
+**Conversions** are purestat goals. Each fires once, `signup` and `subscribe` only after the
+server said yes, and none does anything when `window.purestat` is absent:
+
+| Goal | Fires on | Where |
+|---|---|---|
+| `signup` | a successful register, or an OAuth callback whose redirect says `#signup=1` (this sign-in created the account) | [`RegisterView.vue`](../ui/src/views/auth/RegisterView.vue), [`OAuthCallbackView.vue`](../ui/src/views/auth/OAuthCallbackView.vue) |
+| `subscribe` | the newsletter form's 202 | [`home.js`](../ui/docs/theme/home.js), [`StayInTouch.vue`](../ui/src/components/landing/StayInTouch.vue) |
+| `install-copy` | the copy button on an install or enroll command | [`docs.js`](../ui/docs/theme/docs.js), [`EnrollmentDialog.vue`](../ui/src/components/enroll/EnrollmentDialog.vue) |
+| `github-outbound` | a click or a middle click on a link into the repository | [`docs.js`](../ui/docs/theme/docs.js) |
+
+**The activation view** is `GET /api/admin/stats/attribution?since=&until=`
+([`routes/attribution.rs`](../crates/api/src/routes/attribution.rs)), platform admin only and a
+404 to anyone else. It returns counts, never a user list: sign-ups by source, medium, campaign,
+self-reported answer and blog page (§11.5), and how many *activated*, meaning an org the person
+belongs to enrolled a device within 7 days of the account's creation. The Campaigns tab of
+[growth observability](growth-observability.md) shows the same account plane beside purestat's
+web plane. Read either with these in mind:
+
+> ⚠️ **`activated` is meaningful for an email sign-up only from 2026-10-29.** Until
+> `hosted-20261029-2ae4ffd` took #3041 to production, the activation link had no page (#3029), so
+> an email sign-up could never sign in, make an org or enroll a device. Before that date only an
+> OAuth sign-up could activate. An email sign-up that misses its 5-minute link is still locked
+> out: [#3199](https://github.com/gjovanov/roomler-ai/issues/3199).
+
+- **`pending` is not a failure.** A sign-up with no device whose 7 days are still running is
+  `pending`, and `settled` (`signups − pending`) is the only valid denominator for a rate.
+  Without `fleet`, all three are `null`, never `0`: "cannot see devices" is a different answer
+  from "nobody enrolled one".
+- **A count by source is what the links said, not a measurement.** Any link can set any value,
+  `referrer_host` and `landing_path` included. The server clamps them, and nothing checks them.
+- **The two planes can disagree, by design.** purestat credits a visit to the key it landed with
+  ([growth-observability.md](growth-observability.md)), so a visitor who lands untagged and then
+  follows a tagged link counts as untagged there and under the campaign on the account.
+- **"An org the person belongs to" is any org at query time**, one they were invited into
+  included. That definition is FR-88's open decision 4.
+- ⚠️ **Every bucket key is text chosen by whoever built the link.** An admin UI renders it as text
+  (`{{ key }}`), never as markup (`v-html`).
+
+**An organic landing** carries nothing: no campaign key, no change to any link, so that sign-up
+has no source at all. The one exception is a journey that began under `/blog/`, from another
+site: it carries `referrer_host` and `landing_path` alone, and still has no source (§11.5).
+
+**Kill switches:** `ATTRIBUTION_ENABLED = false` in
+[`attribution.ts`](../ui/src/utils/attribution.ts) stops the carry everywhere: the register view
+sends nothing and hides its question, the provider buttons carry nothing, the newsletter keeps
+its own `source`, and the build leaves out the carry script. `ANALYTICS = null` in
+[`site.ts`](../ui/docs/site.ts) leaves the tracker off every static page, which silences the
+goals there.
+
+## 10. The link hub and the short paths
+
+A profile bio, or a URL said out loud in a video, cannot carry parameters. So each channel has a
+short path, and every short path lands on `/links/` with the campaign already on it:
+
+```mermaid
+flowchart LR
+    BIO["A profile bio,<br/>or a URL said in a video"] --> SHORT["/yt /tt /x /fb"]
+    SHORT -->|"302 from nginx, relative"| HUB["/links/ with utm_source=youtube,<br/>utm_medium=bio, utm_campaign=profile"]
+    HUB -->|"attribution.js (§9)"| CTA["/register, the install pages,<br/>carrying the campaign"]
+    HUB --> REST["the docs, the blog, the repository,<br/>the channel profiles"]
+```
+
+- **`/links/`** is a static page from the same generator
+  ([`links-layout.ts`](../ui/docs/theme/links-layout.ts)), held to the homepage's link gate. It is
+  `noindex, follow` and left out of the sitemap: it repeats the homepage for people who arrive
+  from a profile, so it is not a page to rank.
+- **`CHANNELS`** in [`site.ts`](../ui/docs/site.ts) is the one list of profiles. The hub lists
+  them, and `ORG.sameAs` names them to search engines next to the repository.
+- **The short paths** are one `location = /yt { return 302 … }` line each in
+  [`files/nginx-pod.conf`](../files/nginx-pod.conf). `utm_medium=bio&utm_campaign=profile` is what
+  every profile link of the program carries, so a visit through a bio is one source whichever way
+  it came.
+- **302, not 301:** a browser keeps a 301 for good, and where a short path points may change.
+- **No `add_header` in these locations** (§5), and the redirect stays relative
+  (`absolute_redirect off`).
+- ⚠️ **A short path lives only as long as its channel.**
+  [`links-page.spec.ts`](../ui/docs/__tests__/links-page.spec.ts) checks the nginx lines against
+  `CHANNELS` both ways, and the SPA's route table for a collision, so `/ig` left when X took
+  Instagram's place on 2026-10-11. To add a channel, add its `CHANNELS` row and its `location`
+  line in one PR.
+- **The SPA's old marketing routes keep a campaign too.** `/pricing?utm_source=x` is a 301 to
+  `/?utm_source=x#pricing`, `/landing?…` to `/?…`, and without a query both answer as they always
+  did (§5).
+
+The smoke's redirect block and its §5c check the redirects and the hub on the served site, after
+every promote (§6). Removing the locations and the page is the kill switch.
+
+## 11. Publishing without a roll: the blog lane
+
+A post used to be part of the server image. It went live through an image build and a promote,
+and a promote rolls both `roomler2` pods, which re-homes every remote-desktop session, tunnel and
+DERP socket on each replaced pod. That is a fair price for a release and too high for an article.
+[FR-91](fr/FR-91-scheduled-blog-publishing.md) gave the blog a server of its own, `roomler-blog`,
+fed from a MinIO bucket. Readers get the same URLs, headers, feed and sitemap, and `roomler2`
+takes no part.
+
+### 11.1 What serves what
+
+```mermaid
+flowchart LR
+    R["reader or crawler"] --> E{"the edge vhost<br/>(deploy repo)"}
+    E -->|"= /blog · ^~ /blog/<br/>= /sitemap-blog.xml"| B["roomler-blog (NodePort 30097)<br/>nginx ×2, a mirror sidecar in each pod"]
+    E -->|"everything else: /, /docs/, /api/, /ws, /derp,<br/>/sitemap.xml, /robots.txt"| P["roomler2<br/>the image, changed only by a promote"]
+    M[("MinIO bucket roomler-blog<br/>current · releases/&lt;id&gt;/**")] -->|"polled every 15 s"| B
+    W["the publisher (private)"] -->|"one bucket-scoped key"| M
+```
+
+| Piece | Where | What it does |
+|---|---|---|
+| `--blog-only --out <dir>` | [`build.ts:99`](../ui/docs/build.ts) | runs every gate of the full build (§1), then writes only `blog/**` and `sitemap-blog.xml`, with its own `/blog/assets/` and `/blog/404.html`, so the output depends on no hashed name in the image |
+| `--blog-dir <dir>` | [`build.ts:103`](../ui/docs/build.ts) | reads posts from `<dir>/posts`: a publisher's staging copy, for a post the repo does not hold yet |
+| `installCopy: true` | [`site.ts:169`](../ui/docs/site.ts) | a post that shows an install command joins `INSTALL_PAGES` for that build. Without the key it fails the install-page gate, as any page does |
+| [`files/nginx-blog.conf`](../files/nginx-blog.conf) | copied verbatim into the deploy repo | the pod's rules for the blog's URLs, and a 404 for everything else |
+| [`files/security-headers.conf`](../files/security-headers.conf) | included by both servers | one source for the headers; the deploy repo carries a copy of it too |
+| `mirror.sh` | the deploy repo, `k8s/base/blog/` | follows `current`: fetches every file the release's `MANIFEST` lists into a hidden directory, renames it in once all arrived, then swaps a symlink |
+| `BLOG_LANE` | [`site.ts:183`](../ui/docs/site.ts) | the image's sitemap index stays the image's, so while this is on it names `sitemap-blog.xml` with no `lastmod`. The image cannot know the blog's newest date, and a stale one teaches a crawler to distrust the field |
+
+> ⚠️ **A change to `files/security-headers.conf` is two steps.** The promote carries it to the
+> image, and the deploy repo's copy carries it to the lane. Until both land, `/blog/` and `/docs/`
+> differ, which is what the `--blog` smoke (§6) exists to catch. The same holds for
+> `files/nginx-blog.conf`.
+
+### 11.2 Publishing a post
+
+```mermaid
+sequenceDiagram
+    participant P as Publisher (private)
+    participant B as build.ts --blog-only
+    participant M as MinIO roomler-blog
+    participant N as roomler-blog pods
+    participant I as api.indexnow.org
+    P->>B: master + the post (date = now), + installCopy if it needs it
+    B-->>P: /blog/** or a gate failure (stop, nothing is uploaded)
+    P->>M: put releases/<id>/** and its MANIFEST
+    P->>M: put current = <id>, LAST
+    M-->>N: within 15 s each mirror fetches <id>, renames it in, swaps the symlink
+    P->>N: GET /blog/_release.txt is <id>, then the post, signed out
+    P->>I: POST the post's URLs
+    I-->>P: 200 / 202
+    P->>P: later: a PR adds the post to ui/blog/posts/, the archive
+```
+
+**This repo has no scheduler, on purpose.** What is published, and when, is not engineering. A
+future `date` stays a build error ([`posts.ts:178`](../ui/docs/theme/posts.ts)) and a file in
+`ui/blog/posts/` is published, so unpublished copy and the calendar live with the publisher, which
+writes `date` as the moment it publishes. Rules for any publisher:
+
+- It never uploads a tree that failed a gate.
+- It verifies the **served** page, not its build. Every release carries its id at
+  `/blog/_release.txt`, which is how a release that was uploaded but never served gets noticed.
+- It holds one credential: a MinIO user limited to the `roomler-blog` bucket. The pods hold none,
+  because the bucket's content is the public blog and anonymous download works inside the cluster.
+- ⚠️ IndexNow's answer does not stop a publish. The post is live by then, and a refused or failed
+  call is not retried. The publisher keeps the status in its own audit record and nowhere else.
+- A hand-written post merged to master reaches the lane at the publisher's next rebuild, with no
+  promote.
+
+### 11.3 When something fails
+
+| What fails | What a reader sees |
+|---|---|
+| a build gate | nothing: the publisher stops before the upload |
+| the upload, part way | nothing: `current` is written last, so the pods never look at an unfinished release |
+| a fetch during the mirror | the old release: the hidden directory is removed, and the next poll starts again |
+| MinIO goes away | the old release: the running pods serve it from their `emptyDir`, and the mirror retries every 15 s |
+| a pod starts while MinIO is away | nothing from that pod: it has no release, so its readiness probe holds it out of the Service, and `maxUnavailable: 0` holds the old pods up through a roll |
+| both pods restart while MinIO is away | no blog: the emptyDirs are gone. Pull the kill switch |
+
+The MinIO rows are what the manifests say. AC6 proves them in the field, and it is still owed.
+
+### 11.4 The kill switch
+
+Delete the three `location`s marked FR-91 from the edge vhost (`= /blog`, `^~ /blog/` and
+`= /sitemap-blog.xml`), run `nginx -t`, and reload. Those URLs go back to `roomler2`, which serves
+the blog as of its image's last build. That vhost carries `/ws` and `/derp` for the whole fleet, so
+every edit is `nginx -t` → reload → re-check `/ws`, `/derp`, `/health` and a remote-desktop connect.
+
+> ⚠️ **The image serves only what the repo has archived.** On 2026-10-31 that was 2 of the lane's
+> 21 posts. With the switch pulled, the other 19 URLs answer 404, and a crawler that fetches one
+> sees it gone. Keep a pull short, and read `ui/blog/posts/` against `sitemap-blog.xml` first.
+
+### 11.5 Which blog post brought a sign-up
+
+FR-88's carry (§9) follows a campaign link and nothing else, so a reader who found a post in
+search and signed up used to record nothing. FR-91 adds that one journey and no other:
+
+```mermaid
+flowchart TD
+    V["a page opens"] --> C{"a campaign key<br/>on the URL?"}
+    C -->|yes| A["carry the campaign, referrer_host<br/>and landing_path (FR-88)"]
+    C -->|no| B{"did the journey begin under /blog/,<br/>from another site?"}
+    B -->|yes| T["carry referrer_host<br/>and landing_path, alone"]
+    B -->|no| N["change nothing"]
+```
+
+- **"Began" is read from the URL first.** The rule is on where the journey began, not on the page
+  it has reached, so a reader who goes from a post to an install guide keeps it through the guide's
+  own sign-up link ([`attribution.js:104`](../ui/docs/theme/attribution.js)).
+- **The register view applies the same rule** ([`attribution.ts:146`](../ui/src/utils/attribution.ts))
+  and sends the two keys as `attribution`, or on the OAuth start URL. The static script cannot
+  import it, so `docs/__tests__/attribution.spec.ts` runs both on the same visits and locks them equal.
+- **Carry only.** Nothing is written to the device, the referrer is a host and never a URL, and a
+  browser that reports no referrer carries nothing. So a post's sign-ups stay a lower bound.
+- **Where it shows.** `by_landing_path` in `GET /api/admin/stats/attribution` gives a blog page its
+  own bucket ([`routes/attribution.rs:59`](../crates/api/src/routes/attribution.rs)). The growth
+  funnel's `landing_path` and `channel` breakdowns and the Content tab read the same field
+  ([growth-observability.md](growth-observability.md)).
+
+| A change here | reaches readers through |
+|---|---|
+| `/blog/**`, including its copy of the carry script | the publisher's next release built from that master, no promote |
+| `/docs/**`, `/` and the register view | a promote |
+| the report and the growth notes | a promote |
+
+> ⚠️ **The privacy policy describes this carry, in section 2.16.** Who gets carried, and what is
+> stored, must change there in the same pull request.
+
 ## Code map
 
 | File | What it owns |
@@ -393,6 +665,9 @@ property from it. Review the coverage at +3, +14 and +28 days after a launch (FR
 | [`ui/docs/theme/render.ts`](../ui/docs/theme/render.ts) | markdown → HTML: containers, images, headings, code |
 | [`ui/docs/theme/shell.ts`](../ui/docs/theme/shell.ts) | the `<head>`, top bar, footer, search dialog |
 | [`ui/docs/theme/analytics.js`](../ui/docs/theme/analytics.js) · [`ui/src/utils/analytics.ts`](../ui/src/utils/analytics.ts) | the hosted-only analytics loader (FR-102), and the SPA's rule it mirrors |
+| [`ui/docs/theme/attribution.js`](../ui/docs/theme/attribution.js) · [`carry.ts`](../ui/docs/theme/carry.ts) · [`ui/src/utils/attribution.ts`](../ui/src/utils/attribution.ts) · [`ui/src/utils/goals.ts`](../ui/src/utils/goals.ts) | the carry (FR-88, and FR-91's organic case): the static pages, the install list, the SPA, and the purestat goals |
+| [`crates/core/src/attribution.rs`](../crates/core/src/attribution.rs) · [`crates/api/src/routes/attribution.rs`](../crates/api/src/routes/attribution.rs) | the sanitiser and the OAuth parking spot · the activation view |
+| [`ui/docs/theme/links-layout.ts`](../ui/docs/theme/links-layout.ts) | the link hub (FR-88 P2) |
 | [`ui/docs/theme/layout.ts`](../ui/docs/theme/layout.ts) | a docs page |
 | [`ui/docs/theme/blog-layout.ts`](../ui/docs/theme/blog-layout.ts) | a post, the index, tag pages |
 | [`ui/docs/theme/posts.ts`](../ui/docs/theme/posts.ts) | the post contract, ordering, backlinks |
@@ -403,6 +678,6 @@ property from it. Review the coverage at +3, +14 and +28 days after a launch (FR
 | [`ui/docs/theme/structured.ts`](../ui/docs/theme/structured.ts) | JSON-LD |
 | [`ui/docs/theme/xml.ts`](../ui/docs/theme/xml.ts) | sitemaps, robots, the Atom feed |
 | [`ui/docs/theme/assets.ts`](../ui/docs/theme/assets.ts) · [`images.ts`](../ui/docs/theme/images.ts) · [`links.ts`](../ui/docs/theme/links.ts) | hashing · image sizes · the link gate |
-| [`files/nginx-pod.conf`](../files/nginx-pod.conf) | how it is served |
+| [`files/nginx-pod.conf`](../files/nginx-pod.conf) · [`files/nginx-blog.conf`](../files/nginx-blog.conf) | how it is served: the pod, and the blog lane (§11) |
 | [`scripts/public-site-smoke.sh`](../scripts/public-site-smoke.sh) | how it is proven |
 | [`scripts/indexnow.sh`](../scripts/indexnow.sh) · `ui/public/<key>.txt` · [`promote.yml`](../.github/workflows/promote.yml) | telling search engines what a roll changed |
