@@ -1186,6 +1186,13 @@ R8's (FR-135 §6.8).
 writes under the owner's session, so a second viewer on one stream knows the transport
 and the codec, and not the ladder or a stop.
 
+The field proof is [`ui/e2e/vmtest-media-plan.spec.ts`](../ui/e2e/vmtest-media-plan.spec.ts).
+It reads what a person would see on a named device, and whether the reason ever leaves
+the page, on a mutation rather than a poll, because a redial is shorter than any
+sampling. So one spec reads the black page on an old viewer and the reason on a new one.
+Through a real agent and a webrtc-rs viewer, `session_media_plan_tests` reads the verb,
+the plan on the control channel and `rc:viewer-hz` reaching the agent.
+
 **`rc:viewer-hz`.** The decode worker measures its own `requestAnimationFrame` in a
 short burst when the first frame paints and once a minute after
 (`ui/src/workers/rc-viewer-hz.ts`), and the page sends a reading that moved by more

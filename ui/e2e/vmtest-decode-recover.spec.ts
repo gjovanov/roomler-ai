@@ -213,7 +213,7 @@ test('FR-135 R1: a forced decode failure, timed to the next paint', async ({ con
       else if (text.startsWith('[dr] error')) errors.push(t)
       else if (text.startsWith('[dr] gap-key')) gapKeys.push({ t, deltas: Number(/deltas=(\d+)/.exec(text)?.[1] ?? NaN) })
       else if (text.startsWith('[dr] gap')) gaps.push(t)
-    } else if (text.includes('[rc]') && /decod|keyframe|stalled|re-creating|frame rejected|recovering|recovered|fallback/i.test(text)) {
+    } else if (text.includes('[rc]') && /decod|keyframe|stalled|re-creating|frame rejected|recovering|recovered|fallback|backlog/i.test(text)) {
       say(text.slice(0, 240))
     }
   })
