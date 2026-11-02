@@ -124,7 +124,7 @@ On `rc:session.request` with `local_relay_from` and no descriptor, the Hub answe
 The descriptor is stored on the session exactly as a probed one is, so `forward_offer` hands the remote agent the
 overlay relay as today, with the same overlay-range check. The browser adds `turn:127.0.0.1:<port>` with
 `pc.setConfiguration` when `rc:session.created` arrives. The peer connection exists by then
-(`useRemoteControl.ts:9570`) and has gathered nothing: the offer waits for `rc:ready` (`:8730`).
+(`useRemoteControl.ts:9572`) and has gathered nothing: the offer waits for `rc:ready` (`:8732`).
 
 ⚠️ The descriptor's credential lets its holder allocate on the device's relay, which the overlay and loopback reach.
 It is minted by the device, valid for an hour, held only in the Hub's memory, and handed only to the device's owner's

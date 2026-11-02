@@ -313,7 +313,7 @@ restart changes it. That is why P6 added a fourth value:
 - The viewer shows the *Remote apps* entry for `list` **or** `status`
   (`ui/src/views/remote/RemoteControl.vue:5268` `agentSupportsApps`), never disables it, and lets
   the **dialog** carry the truth from the live reply: the list, the caveats,
-  or the reason (`useRemoteControl.ts:10837`, the `apps_list_reply` arm). A greyed button with no tooltip
+  or the reason (`useRemoteControl.ts:10839`, the `apps_list_reply` arm). A greyed button with no tooltip
   was the one place a reason could not reach.
 - 🔑 **`availability_for()` is the single source for both** (`mod.rs:396`): the
   hello's `list` and the reply's `unavailable` come from one function, so they

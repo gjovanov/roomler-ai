@@ -37,6 +37,19 @@ describe('FR-135 R1 — the recovery decision', () => {
     expect(r.onFailure(10, 1_500)).toBe(false)
   })
 
+  it('lets a chunk gap close the gate only on an ordered channel with the switch on', () => {
+    const r = createDecodeRecovery()
+    expect(r.gapClosesGate()).toBe(false)
+    r.setEnabled(true)
+    expect(r.gapClosesGate()).toBe(true)
+    r.setUnorderedChannel(true)
+    expect(r.gapClosesGate()).toBe(false)
+    r.setUnorderedChannel(false)
+    expect(r.gapClosesGate()).toBe(true)
+    r.setEnabled(false)
+    expect(r.gapClosesGate()).toBe(false)
+  })
+
   it('times an outage from the failure to the first frame, once', () => {
     const r = enabled()
     expect(r.onOutput(500)).toBeNull()
@@ -345,5 +358,40 @@ describe.each(DC_WORKERS)('FR-135 R1 — $name', ({ load }) => {
     expect(decoder.chunks.map((c) => c.type)).toEqual(['key', 'delta', 'key'])
     expect(FakeDecoder.instances).toHaveLength(1)
     expect(ofType('keyframe-acquired')).toHaveLength(1)
+  })
+
+  it.each([
+    ['with the switch off', { decodeRecover: false, chunkFraming: true }],
+    ['on an unordered channel, where a gap is routine', { decodeRecover: true, chunkFraming: true, unorderedVideo: true }],
+  ])('keeps decoding the deltas behind a chunk gap %s', async (_name, init) => {
+    const send = await start(init)
+    const decoder = FakeDecoder.instances[0]!
+    send({ type: 'chunk', bytes: framedChunk(1, 0, 1, frameBytes(true, 1)) })
+    send({ type: 'chunk', bytes: framedChunk(2, 0, 1, frameBytes(false, 2)) })
+    decoder.init.output(fakeFrame(1))
+    decoder.init.output(fakeFrame(2))
+    clock += 1_000 // past the resync debounce
+    posted = []
+
+    send({ type: 'chunk', bytes: framedChunk(3, 0, 2, frameBytes(false, 3)) })
+    send({ type: 'chunk', bytes: framedChunk(4, 0, 1, frameBytes(false, 4)) })
+    send({ type: 'chunk', bytes: framedChunk(5, 0, 1, frameBytes(false, 5)) })
+    // The gap is still counted and still asks for a key frame, as it always has.
+    expect(ofType('frame-rejected')).toHaveLength(1)
+    expect(ofType('request-keyframe')).toHaveLength(1)
+    // Frame 3 died with its chunk, and the two behind it reach the decoder.
+    expect(decoder.chunks.map((c) => c.type)).toEqual(['key', 'delta', 'delta', 'delta'])
+  })
+
+  it('keeps the channel flag across the idempotent visible-canvas re-init', async () => {
+    const send = await start({ decodeRecover: true, chunkFraming: true, unorderedVideo: true })
+    send({ type: 'init-canvas', canvas: fakeCanvas() })
+    const decoder = FakeDecoder.instances[0]!
+    send({ type: 'chunk', bytes: framedChunk(1, 0, 1, frameBytes(true, 1)) })
+    decoder.init.output(fakeFrame(1))
+    clock += 1_000
+    send({ type: 'chunk', bytes: framedChunk(2, 0, 2, frameBytes(false, 2)) })
+    send({ type: 'chunk', bytes: framedChunk(3, 0, 1, frameBytes(false, 3)) })
+    expect(decoder.chunks.map((c) => c.type)).toEqual(['key', 'delta'])
   })
 })

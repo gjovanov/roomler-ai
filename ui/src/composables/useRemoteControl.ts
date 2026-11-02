@@ -8342,6 +8342,7 @@ export function useRemoteControl(
           colorSpace: sessionColorSpace,
           // FR-135 R1 — resolved per session; see `sessionDecodeRecover`.
           decodeRecover: sessionDecodeRecover,
+          unorderedVideo: videoDcOptions(sessionChunkFraming, storedUnorderedVideo()).ordered === false,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -8617,6 +8618,7 @@ export function useRemoteControl(
           colorSpace: sessionColorSpace,
           // FR-135 R1 — resolved per session; see `sessionDecodeRecover`.
           decodeRecover: sessionDecodeRecover,
+          unorderedVideo: videoDcOptions(sessionChunkFraming, storedUnorderedVideo()).ordered === false,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),

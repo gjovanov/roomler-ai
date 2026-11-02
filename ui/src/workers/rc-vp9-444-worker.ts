@@ -80,6 +80,9 @@ type InitCanvasMessage = {
    *  Absent/false reports the failure as before, and it sticks across the
    *  idempotent visible-canvas re-init. */
   decodeRecover?: boolean
+  /** FR-135 R1 — this session's video channel is unordered (`videoDcOptions`),
+   *  so a chunk gap is routine and keeps the deltas moving. Sticks the same way. */
+  unorderedVideo?: boolean
   /** FR-17 — true when the controller negotiated per-chunk framing for
    *  this session (the agent advertised `chunk-framing` in
    *  `AgentCaps.video`). Absent/false keeps the pre-FR-17 bare byte
@@ -449,6 +452,7 @@ workerScope.onmessage = (e) => {
     if (typeof msg.colorSpace === 'boolean') decoderColorSpace.setWanted(msg.colorSpace)
     // FR-135 R1 — sticky across the visible-canvas re-init, which omits it.
     if (typeof msg.decodeRecover === 'boolean') decodeRecovery.setEnabled(msg.decodeRecover)
+    if (typeof msg.unorderedVideo === 'boolean') decodeRecovery.setUnorderedChannel(msg.unorderedVideo)
     initDecoder()
   } else if (msg.type === 'viewport') {
     // P7 — cache the element box; the sizing policy runs per paint.
@@ -479,8 +483,9 @@ workerScope.onmessage = (e) => {
         resetAssembler()
         // FR-135 R1 — the deltas behind the gap reference the frame it lost,
         // so they wait at the gate for the IDR asked for below. Decoded, they
-        // paint garbage until it lands, or fail the decoder.
-        sawKeyframe = false
+        // paint garbage until it lands, or fail the decoder. Not where a gap is
+        // routine, or with the switch off (`gapClosesGate`).
+        if (decodeRecovery.gapClosesGate()) sawKeyframe = false
         workerScope.postMessage({
           type: 'frame-rejected',
           reason: 'chunk-gap',
