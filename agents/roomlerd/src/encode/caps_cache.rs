@@ -14,6 +14,8 @@
 //!   no-hardware answer is the cheap case anyway (every open fails fast), and
 //!   it is the answer a boot-time driver race produces — a service that starts
 //!   before the display driver is up — which must not be frozen for a week.
+//! - **Nor one a `444` or `gpu` child ran out of time on (#3273).** Those forms
+//!   are missing for want of an answer, and a hit would not ask again.
 //! - **Only the driver-derived fields come from the cache** (`hw_encoders`,
 //!   `codecs`, `transports`, `hevc_chroma`, `vp9_chroma`, `video_cells`, the
 //!   vp9_qsv IDR verdict). Permissions, the GUI-session state, the file /

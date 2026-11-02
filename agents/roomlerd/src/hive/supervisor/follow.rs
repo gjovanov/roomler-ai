@@ -52,6 +52,7 @@ use tracing::{debug, info, warn};
 
 use super::Supervisor;
 use super::stream::MAX_FOLLOWING;
+use crate::hive::device::Device;
 
 /// The first wait, after one outcome that carried nothing; each one after
 /// doubles it, up to [`WAIT_MAX`].
@@ -113,7 +114,7 @@ struct Follow {
     /// while that ask, or the stream it got, is still out: its verdict is
     /// about a fence the session has left.
     asked_fence: u64,
-    /// The rung the next ask tries, into [`Supervisor::ladder`].
+    /// The rung the next ask tries, into [`Device::ladder`].
     rung: usize,
     /// Outcomes in a row that carried nothing: each doubles the wait.
     misses: u32,
@@ -123,7 +124,7 @@ struct Follow {
     generation: u64,
     /// P2d-4 — the renewal of the stream followed, beside it. Only while
     /// one is followed: every other phase is entered through
-    /// [`Supervisor::next`], which lets it go.
+    /// [`Device::next`], which lets it go.
     renewal: Option<Renewal>,
     /// P2d-4 — renewal asks so far: each one's own generation.
     renewals: u64,
@@ -134,7 +135,7 @@ struct Follow {
 /// followed once its own stream answers, and the old one let go then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Renewal {
-    /// The rung it asks on, into [`Supervisor::ladder`].
+    /// The rung it asks on, into [`Device::ladder`].
     rung: usize,
     /// Which ask it is: a timeout meant for an earlier one moves nothing.
     generation: u64,
@@ -265,12 +266,79 @@ fn backoff(misses: u32) -> Duration {
     jittered(doubled.min(WAIT_MAX))
 }
 
+/// FR-90 P8-2d-0 — the daemon's half of the follow: each word it takes for
+/// the copies this device holds, handed to the device's parts ([`Device`]),
+/// which hold the follows.
 impl Supervisor {
+    /// At the primary organization's connection: every copy held followed
+    /// ([`Device::follow_all`]).
+    pub(super) async fn follow_all(self: &Arc<Self>) {
+        self.device().follow_all().await;
+    }
+
+    /// FR-90 P2f-1b — at the primary organization's connection, on a device
+    /// whose owner holds no copies: a teleport's copies alone
+    /// ([`Device::follow_teleports`]).
+    pub(super) async fn follow_teleports(self: &Arc<Self>) {
+        self.device().follow_teleports().await;
+    }
+
+    /// A join this device passed as a member, at `fence`
+    /// ([`Device::follow_joined`]).
+    pub(super) fn follow_joined(self: &Arc<Self>, session: ObjectId, fence: u64) {
+        self.device().follow_joined(session, fence);
+    }
+
+    /// `rc:hive.replica.refused`, for an ask this device made
+    /// ([`Device::on_refused`]).
+    pub(super) fn on_refused(
+        self: &Arc<Self>,
+        session: ObjectId,
+        fence: u64,
+        path: Option<HiveStreamPath>,
+        reason: Option<HiveStreamRefusal>,
+    ) {
+        self.device().on_refused(session, fence, path, reason);
+    }
+
+    /// A dial came for `session` ([`Device::on_dialed`]).
+    #[cfg(all(test, unix))]
+    pub(super) fn on_dialed(
+        self: &Arc<Self>,
+        session: ObjectId,
+        grant_id: ObjectId,
+        ttl_secs: u32,
+    ) {
+        self.device().on_dialed(session, grant_id, ttl_secs);
+    }
+
+    /// P2d-4 — a member stream of `session` got past its opening exchange
+    /// ([`Device::on_answered`]).
+    #[cfg(all(test, unix))]
+    pub(super) fn on_answered(self: &Arc<Self>, session: ObjectId, grant_id: ObjectId) {
+        self.device().on_answered(session, grant_id);
+    }
+
+    /// A member stream of `session` ended ([`Device::on_stream_over`]).
+    #[cfg(all(test, unix))]
+    pub(super) fn on_stream_over(
+        self: &Arc<Self>,
+        session: ObjectId,
+        grant_id: ObjectId,
+        reason: &str,
+        answered: bool,
+    ) {
+        self.device()
+            .on_stream_over(session, grant_id, reason, answered);
+    }
+}
+
+impl Device {
     /// The rungs this device can ask on, top first: `derp` only while it has
     /// a live DERP connection, whose key the ask names.
     fn ladder(&self) -> Vec<HiveStreamPath> {
         let mut rungs = vec![HiveStreamPath::Direct, HiveStreamPath::Relay];
-        if self.derp_handle().is_some() {
+        if self.seams.derp_handle().is_some() {
             rungs.push(HiveStreamPath::Derp);
         }
         rungs
@@ -352,7 +420,7 @@ impl Supervisor {
             let Ok(session) = ObjectId::parse_str(&m.session) else {
                 continue;
             };
-            if self.teleport_admitted(session, m.fence) {
+            if self.seams.teleport_admitted(session, m.fence) {
                 self.follow_joined(session, m.fence);
             }
         }
@@ -429,14 +497,14 @@ impl Supervisor {
             (path, f.fence, f.generation)
         };
         let (path, fence, generation) = asked;
-        let sup = Arc::clone(self);
+        let me = Arc::clone(self);
         tokio::spawn(async move {
-            sup.send_want(session, fence, path).await;
+            me.send_want(session, fence, path).await;
             // No answer at all: taken for one the source never gave.
             tokio::time::sleep(WANT_TIMEOUT).await;
-            if sup.still(session, generation) {
+            if me.still(session, generation) {
                 debug!(session = %session, path = path.as_str(), "hive: an ask went unanswered");
-                sup.next(session, Next::Down);
+                me.next(session, Next::Down);
             }
         });
     }
@@ -456,14 +524,9 @@ impl Supervisor {
             }
         };
         let derp_pubkey = match path {
-            HiveStreamPath::Derp => self.derp_handle().map(|h| h.self_pubkey_hex.clone()),
+            HiveStreamPath::Derp => self.seams.derp_handle().map(|h| h.self_pubkey_hex.clone()),
             HiveStreamPath::Direct | HiveStreamPath::Relay => None,
         };
-        let tx = self
-            .reporter
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
         let want = ClientMsg::HiveReplicaWant {
             session_id: session,
             fence,
@@ -473,9 +536,7 @@ impl Supervisor {
             derp_pubkey,
         };
         info!(session = %session, fence, seq, path = path.as_str(), "hive: asking for a stream");
-        if let Some(tx) = tx {
-            let _ = tx.try_send(want);
-        }
+        let _ = self.link.send(want);
     }
 
     /// Whether `session`'s follow is still where `generation` left it.
@@ -628,10 +689,10 @@ impl Supervisor {
         ttl_secs: u32,
     ) {
         let half = Duration::from_millis(u64::from(ttl_secs) * 500);
-        let sup = Arc::clone(self);
+        let me = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep(half).await;
-            sup.renew(session, grant_id, generation);
+            me.renew(session, grant_id, generation);
         });
     }
 
@@ -675,11 +736,11 @@ impl Supervisor {
         path: HiveStreamPath,
         generation: u64,
     ) {
-        let sup = Arc::clone(self);
+        let me = Arc::clone(self);
         tokio::spawn(async move {
-            sup.send_want(session, fence, path).await;
+            me.send_want(session, fence, path).await;
             tokio::time::sleep(WANT_TIMEOUT).await;
-            let unanswered = sup
+            let unanswered = me
                 .follows
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -691,7 +752,7 @@ impl Supervisor {
                 });
             if unanswered {
                 debug!(session = %session, path = path.as_str(), "hive: a renewal's ask went unanswered");
-                sup.renewal_next(session, Next::Down);
+                me.renewal_next(session, Next::Down);
             }
         });
     }
@@ -885,11 +946,11 @@ impl Supervisor {
         if ask_now {
             self.ask(session);
         } else if let Some(wait) = wait {
-            let sup = Arc::clone(self);
+            let me = Arc::clone(self);
             tokio::spawn(async move {
                 tokio::time::sleep(wait).await;
-                if sup.still(session, generation) {
-                    sup.ask(session);
+                if me.still(session, generation) {
+                    me.ask(session);
                 }
             });
         }
@@ -915,11 +976,14 @@ impl Supervisor {
             self.ask(next);
         }
     }
+}
 
+impl Supervisor {
     /// What this device is doing about `session` now.
     #[cfg(all(test, unix))]
     pub(super) fn follow_phase(&self, session: ObjectId) -> Option<Phase> {
-        self.follows
+        self.parts
+            .follows
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .map
@@ -931,7 +995,8 @@ impl Supervisor {
     /// anything does: the renewal's rung, and how far it is.
     #[cfg(all(test, unix))]
     pub(super) fn follow_renewal(&self, session: ObjectId) -> Option<(usize, Renewing)> {
-        self.follows
+        self.parts
+            .follows
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .map

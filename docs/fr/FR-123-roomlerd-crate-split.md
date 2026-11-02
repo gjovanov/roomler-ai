@@ -376,8 +376,9 @@ flowchart BT
 - **The hub overlaps the siblings.** Its front end starts when the slowest sibling's metadata is out;
   its LLVM half runs after its own front end. With the former `main.rs` inside the hub (P3) the bin is a
   shell, and the whole of today's second serial unit rides inside the overlap.
-- **Hive's crate is FR-90's.** P8-1 moves the session-facing machinery behind `SessionEgress` and
-  `ControlLink` into `crates/hive-node` or a sibling (`FR-90-hive-agent-sessions.md` §3i). This FR asks
+- **Hive's crate is FR-90's.** P8-1 moves the session-facing machinery behind `SessionEgress` into
+  `crates/hive-node` or a sibling, and P8-2d puts the device's own parts behind `ControlLink` and
+  `DeviceSeams` (`FR-90-hive-agent-sessions.md` §3i, decision 69). This FR asks
   one property of it: the crate depends on L0 and the seams, never on `roomlerd`'s hub, so it compiles
   beside `roomler-node-media`. Its 64k lines are the largest single sibling; nothing here moves them.
 

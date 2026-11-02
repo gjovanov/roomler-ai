@@ -74,6 +74,7 @@ use tunnel_core::transport::quic::{
 use tunnel_core::transport::relay::{self, RelayConn, RelayUdpSocket};
 
 use super::Supervisor;
+use crate::hive::device::{Conn, ControlLink, Device};
 use crate::hive::packer;
 use crate::hive::store::{StoreHandle, WriterError};
 
@@ -121,9 +122,9 @@ const _: () = assert!(wire::MAX_WANT_HAVES == crate::hive::workspace::MAX_HAVES)
 const TIP_EVERY: Duration = Duration::from_secs(5);
 /// P2d-3 — the event bytes this device holds in memory as a member, across
 /// every stream it follows: two of the largest the stream carries.
-pub(super) const EVENT_BUDGET: usize = 2 * wire::MAX_EVENT_BYTES;
+pub(crate) const EVENT_BUDGET: usize = 2 * wire::MAX_EVENT_BYTES;
 /// P2d-3 — the blob bytes, likewise: a wave's worth, four of the largest.
-pub(super) const BLOB_BUDGET: usize = 4 * wire::MAX_STREAM_BLOB;
+pub(crate) const BLOB_BUDGET: usize = 4 * wire::MAX_STREAM_BLOB;
 
 // P2d-3 — what the limits promise, held at build time. The largest event a
 // device records fits the stream: a checkpoint's manifest, a stream-json
@@ -348,6 +349,13 @@ fn answer(tx: mpsc::Sender<ClientMsg>, msg: ClientMsg) {
     tokio::spawn(async move {
         let _ = tx.send(msg).await;
     });
+}
+
+/// `rc:hive.replica.close` for `grant_id`, its reason cut to
+/// [`MAX_REASON_CHARS`].
+fn close_msg(grant_id: ObjectId, reason: &str) -> ClientMsg {
+    let reason: String = reason.chars().take(MAX_REASON_CHARS).collect();
+    ClientMsg::HiveReplicaClose { grant_id, reason }
 }
 
 async fn write_frame<T: Serialize>(send: &mut SendStream, msg: &T) -> anyhow::Result<()> {
@@ -734,34 +742,82 @@ fn refused_word(e: &WriterError) -> &'static str {
     }
 }
 
+/// FR-90 P8-2d-0 — the daemon's half of the stream: its gates, then each
+/// frame handed to the device's parts ([`Device`]), which hold the streams.
 impl Supervisor {
-    /// `rc:hive.replica.grant`: what needs only this device's word is
-    /// answered at once; otherwise the grant is registered, and its task
-    /// spawned, under one lock, so a server `close` finds it from the first
-    /// moment, its endpoint still being stood up or not. The task stands the
-    /// endpoint up, answers `ready` on `tx`, and serves.
+    /// `rc:hive.replica.grant`: served for the primary organization alone,
+    /// refused on another's connection at once; otherwise handed to the
+    /// device's parts with the connection it came on, which hears `ready`.
     pub(super) fn take_grant(
         self: &Arc<Self>,
         g: Grant,
         primary: bool,
         tx: mpsc::Sender<ClientMsg>,
     ) {
-        let grant_id = g.grant_id;
         if !primary {
             return answer(
                 tx,
                 refusal(
-                    grant_id,
+                    g.grant_id,
                     HiveStreamRefusal::Other,
                     "this device serves streams for its primary organization only".into(),
                 ),
             );
         }
+        let on = self.conns.of(tx);
+        self.device().take_grant(g, on);
+    }
+
+    /// `rc:hive.replica.candidate`: taken on the primary organization's
+    /// connection alone, by the device's parts.
+    pub(super) fn take_candidate(self: &Arc<Self>, grant_id: ObjectId, addr: &str, primary: bool) {
+        if !primary {
+            return debug!(grant = %grant_id, "hive stream: a candidate on a secondary org's connection — ignored");
+        }
+        self.device().take_candidate(grant_id, addr);
+    }
+
+    /// `rc:hive.replica.dial`: not this device's to follow, closed at once,
+    /// in words; otherwise handed to the device's parts, which dial.
+    pub(super) fn follow_dial(self: &Arc<Self>, d: Dial, primary: bool) {
+        if !primary {
+            return self.report_close(d.grant_id, "secondary_org");
+        }
+        // P2d-3b — the gate that survives a compromised server: a copy is
+        // followed only while the owner lets this device hold copies.
+        // P2f-1b — or it is the copy of a teleport this device was prepared
+        // for (P2f-1a), the one it will run.
+        if !self.cfg.replica && !self.teleport_admitted(d.session_id, d.fence) {
+            return self.report_close(d.grant_id, "replica_disabled");
+        }
+        self.device().follow_dial(d);
+    }
+
+    /// The server's `rc:hive.replica.close`: the device's parts end the
+    /// stream ([`Device::close_stream`]).
+    pub(super) fn close_stream(self: &Arc<Self>, grant_id: ObjectId, reason: &str) {
+        self.device().close_stream(grant_id, reason);
+    }
+
+    /// A dial refused at the daemon's gate: the server is told why.
+    fn report_close(&self, grant_id: ObjectId, reason: &str) {
+        let _ = ControlLink::send(self, close_msg(grant_id, reason));
+    }
+}
+
+impl Device {
+    /// `rc:hive.replica.grant`, past the daemon's gate: what needs only this
+    /// device's word is answered at once; otherwise the grant is registered,
+    /// and its task spawned, under one lock, so a server `close` finds it
+    /// from the first moment, its endpoint still being stood up or not. The
+    /// task stands the endpoint up, answers `ready` on `on`, and serves.
+    fn take_grant(self: &Arc<Self>, g: Grant, on: Conn) {
+        let grant_id = g.grant_id;
         let path = match g.path {
             Some(p) => p,
             None => {
-                return answer(
-                    tx,
+                return self.answer_on(
+                    on,
                     refusal(
                         grant_id,
                         HiveStreamRefusal::PathUnavailable,
@@ -781,8 +837,8 @@ impl Supervisor {
             >= stream_limits::MAX_PER_SOURCE
         {
             drop(streams);
-            return answer(
-                tx,
+            return self.answer_on(
+                on,
                 refusal(
                     grant_id,
                     HiveStreamRefusal::Busy,
@@ -794,7 +850,7 @@ impl Supervisor {
             );
         }
         let session_id = g.session_id;
-        let task = tokio::spawn(Arc::clone(self).run_grant(g, tx));
+        let task = tokio::spawn(Arc::clone(self).run_grant(g, on));
         streams.insert(
             grant_id,
             Stream {
@@ -810,9 +866,19 @@ impl Supervisor {
         );
     }
 
+    /// `msg` on `on` from a task of its own, as [`answer`] sends on a
+    /// connection: the signalling loop never waits on its own outbound
+    /// queue.
+    fn answer_on(&self, on: Conn, msg: ClientMsg) {
+        let link = Arc::clone(&self.link);
+        tokio::spawn(async move {
+            let _ = link.reply(on, msg).await;
+        });
+    }
+
     /// One registered grant's life, by its `ttl_secs` at most: the endpoint
     /// stood up, `ready` sent, ONE connection served.
-    async fn run_grant(self: Arc<Self>, g: Grant, tx: mpsc::Sender<ClientMsg>) {
+    async fn run_grant(self: Arc<Self>, g: Grant, on: Conn) {
         let deadline = Instant::now() + Duration::from_secs(u64::from(g.ttl_secs));
         let ep = match tokio::time::timeout_at(deadline, self.stand_up(&g)).await {
             Ok(Ok(ep)) => ep,
@@ -821,7 +887,7 @@ impl Supervisor {
                 // then; the ready says why, and the server forgets the
                 // grant itself, so no close follows.
                 self.forget_stream(g.grant_id);
-                let _ = tx.send(refusal(g.grant_id, word, why)).await;
+                let _ = self.link.reply(on, refusal(g.grant_id, word, why)).await;
                 return;
             }
             Err(_) => return self.stream_ended(g.grant_id, "expired"),
@@ -850,10 +916,9 @@ impl Supervisor {
             addrs: ep.addrs,
             derp_pubkey: ep.derp_pubkey,
         };
-        if tx.send(ready).await.is_err() {
+        if self.link.reply(on, ready).await.is_err() {
             return self.stream_ended(g.grant_id, "disconnected");
         }
-        drop(tx);
         let reason = self.serve_one(ep.peer, &g, deadline).await;
         self.stream_ended(g.grant_id, &reason);
     }
@@ -892,7 +957,7 @@ impl Supervisor {
                 )
             }),
             Some(HiveStreamPath::Derp) => {
-                let Some(handle) = self.derp_handle() else {
+                let Some(handle) = self.seams.derp_handle() else {
                     return Err((
                         HiveStreamRefusal::PathUnavailable,
                         "this device has no live DERP connection".into(),
@@ -913,10 +978,13 @@ impl Supervisor {
             }),
         }
     }
+}
 
+impl Supervisor {
     /// This device's DERP mux, the primary org's: the one Hive streams ride,
     /// as every Hive frame is the primary org's. `None` without the overlay
-    /// features, or while the overlay is down.
+    /// features, or while the overlay is down. The device's parts ask it
+    /// through their seam (P8-2d-0).
     pub(super) fn derp_handle(&self) -> Option<DerpTunnelHandle> {
         #[cfg(test)]
         if let Some(forced) = self
@@ -929,7 +997,9 @@ impl Supervisor {
         }
         crate::tunnel::netwatch::primary_derp_tunnel_handle()
     }
+}
 
+impl Device {
     /// The endpoint is up: on the relay rung its allocation kept for the
     /// member's permission, and the addresses held until now returned.
     /// `None` when the grant was closed meanwhile.
@@ -949,10 +1019,7 @@ impl Supervisor {
     /// server drops the member's opening Initials, since the source, the
     /// QUIC server, never sends first. Permitted at once when the
     /// allocation is up, held until it lands otherwise.
-    pub(super) fn take_candidate(&self, grant_id: ObjectId, addr: &str, primary: bool) {
-        if !primary {
-            return debug!(grant = %grant_id, "hive stream: a candidate on a secondary org's connection — ignored");
-        }
+    fn take_candidate(&self, grant_id: ObjectId, addr: &str) {
         let Some(addr) = addr.parse::<SocketAddr>().ok().filter(is_dialable) else {
             return debug!(grant = %grant_id, %addr, "hive stream: a candidate no member could hold — dropped");
         };
@@ -1017,7 +1084,7 @@ impl Supervisor {
                 }
                 MemberMsg::Hello { fence, .. } if *fence != g.fence => (refuse("wrong_fence"), 0),
                 MemberMsg::Hello { tip, .. } => {
-                    let live = self.session_live(g.session_id);
+                    let live = self.seams.session_live(g.session_id);
                     let answer = match &self.store {
                         Ok(store) => match store.answer_hello(hello.clone(), live).await {
                             Ok(a) => a,
@@ -1220,19 +1287,10 @@ impl Supervisor {
         std::future::pending().await
     }
 
-    /// `rc:hive.replica.dial`: dial the source and say where this copy
-    /// ends. Not this device's to follow: closed at once, in words.
-    pub(super) fn follow_dial(self: &Arc<Self>, d: Dial, primary: bool) {
-        if !primary {
-            return self.report_close(d.grant_id, "secondary_org");
-        }
-        // P2d-3b — the gate that survives a compromised server: a copy is
-        // followed only while the owner lets this device hold copies.
-        // P2f-1b — or it is the copy of a teleport this device was prepared
-        // for (P2f-1a), the one it will run.
-        if !self.cfg.replica && !self.teleport_admitted(d.session_id, d.fence) {
-            return self.report_close(d.grant_id, "replica_disabled");
-        }
+    /// `rc:hive.replica.dial`, past the daemon's gates: dial the source and
+    /// say where this copy ends. One this build cannot follow, or past the
+    /// device's streams, closed at once, in words.
+    fn follow_dial(self: &Arc<Self>, d: Dial) {
         let path = match d.path {
             Some(p) => p,
             None => {
@@ -1253,10 +1311,10 @@ impl Supervisor {
             return self.report_close(grant_id, "busy");
         }
         let ttl_secs = d.ttl_secs;
-        let sup = Arc::clone(self);
+        let me = Arc::clone(self);
         let task = tokio::spawn(async move {
-            let reason = sup.follow_one(&d).await;
-            sup.stream_ended(d.grant_id, &reason);
+            let reason = me.follow_one(&d).await;
+            me.stream_ended(d.grant_id, &reason);
         });
         streams.insert(
             grant_id,
@@ -1678,7 +1736,7 @@ impl Supervisor {
         if !offer.packs {
             return Ok(false);
         }
-        let place = self.have_want_place(session);
+        let place = self.seams.have_want_place(session);
         let stood_in = offer.stand_ins.contains(&ws.commit);
         if place.is_none() && !stood_in {
             return Ok(false);
@@ -1699,7 +1757,9 @@ impl Supervisor {
             return Ok(false);
         }
         let held = match &place {
-            Some((order, account, folder)) => self.haves_for(order, account, folder, ws).await,
+            Some((order, account, folder)) => {
+                self.seams.haves_for(order, account, folder, ws).await
+            }
             None => None,
         };
         let haves = match held {
@@ -1785,13 +1845,15 @@ impl Supervisor {
             BlobMsg::Blob { .. } => Err("bad_blob".to_string()),
         }
     }
+}
 
+impl Supervisor {
     /// P2f-2b — what the folder this device will run the session in holds
     /// that a pack can be made against: the person's `HEAD` where the
     /// checkpoint was taken, when this repository holds it, and its own
     /// `HEAD`. Asked of the account's own git, as the account. `None`:
     /// nothing to offer, or nothing could be asked.
-    async fn haves_for(
+    pub(super) async fn haves_for(
         &self,
         order: &super::StartOrder,
         account: &str,
@@ -1830,7 +1892,9 @@ impl Supervisor {
         haves.truncate(wire::MAX_WANT_HAVES);
         (!haves.is_empty()).then_some(haves)
     }
+}
 
+impl Device {
     /// P2f-2b — the answer to a member's `want_pack`: the pack that brings
     /// `commit` into a repository holding `haves`, made as the session's
     /// account from its own repository, its chunks kept as blobs of the
@@ -1871,29 +1935,13 @@ impl Supervisor {
                 }
             }
         }
-        let place = match self.workplace(session) {
-            Some(place) => place,
-            None => match self.kept_workplace(store, sid).await {
-                Some(place) => Arc::new(place),
-                None => return no("not_live"),
-            },
-        };
-        let req = packer::Request {
-            v: packer::REQUEST_V,
-            folder: place.folder.clone(),
-            state_dir: place.state_dir.clone(),
-            ask: packer::Ask::Pack {
-                commit: commit.to_string(),
-                haves: haves.to_vec(),
-            },
-        };
-        let (against, pack) = match packer::ask(&self.checkpoint_runner(), &place.who, &req).await {
-            Ok(packer::Answer::Pack { against, pack }) => (against, pack),
-            Ok(_) => return no("other"),
-            Err(e) => {
-                warn!(session = sid, commit, %e, "hive stream: no pack against the member's repository");
-                return no("pack_failed");
-            }
+        let (against, pack) = match self
+            .seams
+            .pack_for_member(session, sid, commit, haves)
+            .await
+        {
+            Ok(made) => made,
+            Err(why) => return no(why),
         };
         let (chunks, blobs) = chunk_bytes(&pack);
         for blob in blobs {
@@ -1924,12 +1972,55 @@ impl Supervisor {
             chunks,
         }
     }
+}
+
+impl Supervisor {
+    /// P2f-2b — the daemon's half of a member's `want_pack`: the pack that
+    /// brings `commit` into a repository holding `haves`, made as the
+    /// session's account from where it runs here, or (P2f-2c) from where its
+    /// last launch here kept it was worked on. What it is against, and its
+    /// bytes; the `no_pack` word when it cannot be made.
+    pub(super) async fn pack_for_member(
+        &self,
+        session: ObjectId,
+        sid: &str,
+        commit: &str,
+        haves: &[String],
+    ) -> Result<(Vec<String>, Vec<u8>), &'static str> {
+        let place = match self.workplace(session) {
+            Some(place) => place,
+            None => match self.kept_workplace(sid).await {
+                Some(place) => Arc::new(place),
+                None => return Err("not_live"),
+            },
+        };
+        let req = packer::Request {
+            v: packer::REQUEST_V,
+            folder: place.folder.clone(),
+            state_dir: place.state_dir.clone(),
+            ask: packer::Ask::Pack {
+                commit: commit.to_string(),
+                haves: haves.to_vec(),
+            },
+        };
+        match packer::ask(&self.checkpoint_runner(), &place.who, &req).await {
+            Ok(packer::Answer::Pack { against, pack }) => Ok((against, pack)),
+            Ok(_) => Err("other"),
+            Err(e) => {
+                warn!(session = sid, commit, %e, "hive stream: no pack against the member's repository");
+                Err("pack_failed")
+            }
+        }
+    }
 
     /// P2f-2c — where a session that does not run here now was last worked
     /// on, as its launch here kept it, and as whom: the account resolved as a
     /// start resolves it, now. `None` when nothing was kept, or that account
     /// cannot be run as now.
-    async fn kept_workplace(&self, store: &StoreHandle, sid: &str) -> Option<packer::Workplace> {
+    async fn kept_workplace(&self, sid: &str) -> Option<packer::Workplace> {
+        let Ok(store) = &self.store else {
+            return None;
+        };
         let kept = match store.workplace(sid).await {
             Ok(Some(kept)) => kept,
             Ok(None) => return None,
@@ -1950,7 +2041,9 @@ impl Supervisor {
             }
         }
     }
+}
 
+impl Device {
     /// P2d-3 — the member's tip reported as its stream moves it: at once,
     /// then at most every [`TIP_EVERY`], what lands meanwhile in one report
     /// after it. Never returns; the stream's end is the caller's to report.
@@ -1980,6 +2073,19 @@ impl Supervisor {
         std::future::pending().await
     }
 
+    /// P2d-3 — where this device's copy of `session` ends now, told to the
+    /// server (`rc:hive.replica.tip`), as a member's stream moves it.
+    async fn report_tip(&self, session: ObjectId) {
+        let Ok(store) = &self.store else {
+            return;
+        };
+        if let Some(tip) = super::replica::tip_of(store, session).await {
+            let _ = self.link.send(super::replica::tip_msg(tip));
+        }
+    }
+}
+
+impl Supervisor {
     /// P2d-3b — whether `session` is not over on this device: it runs here,
     /// or its hosted record will resume it here. What a source tells its
     /// member: a member caught up with a session that is over lets go.
@@ -2000,7 +2106,9 @@ impl Supervisor {
                 .is_some()
             || self.moving_here(session)
     }
+}
 
+impl Device {
     /// P2d-3 — one more blob carried on `grant_id`'s stream.
     fn count_blob(&self, grant_id: ObjectId) {
         if let Some(s) = self
@@ -2018,7 +2126,7 @@ impl Supervisor {
     /// key (by the grant's id), and the address that route answers to. The
     /// reason, in the close's words, when it cannot.
     fn member_derp(&self, d: &Dial) -> Result<(QuicPeer, SocketAddr), String> {
-        let Some(handle) = self.derp_handle() else {
+        let Some(handle) = self.seams.derp_handle() else {
             return Err("no_derp".to_string());
         };
         let Some(source) = d.derp_pubkey.as_deref().and_then(parse_pubkey_hex) else {
@@ -2072,18 +2180,12 @@ impl Supervisor {
             .map_err(|e| format!("the client could not be built: {e}"))?;
         // Awaited, not dropped on a full queue: without it the source never
         // permits this allocation, and nothing ever connects.
-        let tx = self
-            .reporter
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
         let candidate = ClientMsg::HiveReplicaCandidate {
             grant_id: d.grant_id,
             addr: ours.to_string(),
         };
-        match tx {
-            Some(tx) if tx.send(candidate).await.is_ok() => {}
-            _ => return Err("disconnected".to_string()),
+        if self.link.deliver(candidate).await.is_err() {
+            return Err("disconnected".to_string());
         }
         // This allocation's own permission for each of the source's
         // addresses, before the first Initial, as the tunnel's client sends
@@ -2126,15 +2228,7 @@ impl Supervisor {
     }
 
     fn report_close(&self, grant_id: ObjectId, reason: &str) {
-        let tx = self
-            .reporter
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Some(tx) = tx {
-            let reason: String = reason.chars().take(MAX_REASON_CHARS).collect();
-            let _ = tx.try_send(ClientMsg::HiveReplicaClose { grant_id, reason });
-        }
+        let _ = self.link.send(close_msg(grant_id, reason));
     }
 
     /// P2d-4 — a stream this device lets go on its own word, from outside its
@@ -2158,7 +2252,7 @@ impl Supervisor {
     /// The server's `rc:hive.replica.close`: the stream ends here at once,
     /// its endpoint still being stood up or not, and nothing is said back
     /// (the server already forgot the grant).
-    pub(super) fn close_stream(self: &Arc<Self>, grant_id: ObjectId, reason: &str) {
+    fn close_stream(self: &Arc<Self>, grant_id: ObjectId, reason: &str) {
         let gone = self
             .streams
             .lock()
@@ -2174,11 +2268,14 @@ impl Supervisor {
             }
         }
     }
+}
 
+impl Supervisor {
     /// The source's answer to this member's hello on `grant_id`, once heard.
     #[cfg(all(test, unix))]
     pub(super) fn stream_answer(&self, grant_id: ObjectId) -> Option<SourceMsg> {
-        self.streams
+        self.parts
+            .streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&grant_id)
@@ -2188,7 +2285,8 @@ impl Supervisor {
     /// Whether this device is a side of `grant_id` now.
     #[cfg(all(test, unix))]
     pub(super) fn holds_stream(&self, grant_id: ObjectId) -> bool {
-        self.streams
+        self.parts
+            .streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&grant_id)
@@ -2198,7 +2296,8 @@ impl Supervisor {
     /// being stood up among them.
     #[cfg(all(test, unix))]
     pub(super) fn serving(&self) -> usize {
-        self.streams
+        self.parts
+            .streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
@@ -2248,7 +2347,8 @@ impl Supervisor {
     /// kept, as the member. `None` once the stream is over.
     #[cfg(all(test, unix))]
     pub(super) fn stream_blobs(&self, grant_id: ObjectId) -> Option<u64> {
-        self.streams
+        self.parts
+            .streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&grant_id)
@@ -2258,7 +2358,8 @@ impl Supervisor {
     /// The member's addresses held for `grant_id`'s allocation.
     #[cfg(all(test, unix))]
     pub(super) fn held_candidates(&self, grant_id: ObjectId) -> usize {
-        self.streams
+        self.parts
+            .streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&grant_id)
