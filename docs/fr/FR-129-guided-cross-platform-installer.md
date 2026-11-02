@@ -48,7 +48,7 @@ path is the same: `install.sh` without `--token` prints the enroll command to ru
 ### The GUI installs the daemon only on Windows
 
 Every daemon-role arm of the wizard's detection says
-`supported: cfg!(target_os = "windows")` (`agents/roomler-setup/src/commands.rs:85, 86, 93, 103`),
+`supported: cfg!(target_os = "windows")` (`agents/roomler-setup/src/commands.rs:85, 92, 99, 109`),
 and the daemon surface off Windows is a set of no-op stubs
 (`agents/roomler-setup/src/orchestrator_agent.rs:758, 889, 922`). The docs say so plainly:
 on Linux and macOS the daemon is `install.sh` in a terminal, and the wizard does the tunnel
@@ -93,7 +93,7 @@ it. Do not shift these anchors with code that moved later.*
 | decision log | `crates/services/src/dao/peer_relay_audit.rs:3-10` | one collection per decision kind; the refused rows are the point |
 | install trace | `crates/remote_control/src/models.rs:31-93` | `InstallInfo { method, scope, run }`; `InstallMethod::Wizard` already exists |
 | module graph | `crates/core/src/graph.rs:45-47` | `remote → fleet`, `network → fleet`, `hive → fleet` |
-| wizard daemon gate | `agents/roomler-setup/src/commands.rs:85, 86, 93, 103` | `supported: cfg!(target_os = "windows")` |
+| wizard daemon gate | `agents/roomler-setup/src/commands.rs:85, 92, 99, 109` | `supported: cfg!(target_os = "windows")` |
 | wizard daemon pipeline | `agents/roomler-setup/src/orchestrator_agent.rs:142-203`, `:289`, `:403`, `:555-567` | resolve → download → verify → elevated `msiexec` → in-process `roomlerd::enrollment::enroll`, tagged `InstallMethod::Wizard` |
 | non-Windows stubs | `agents/roomler-setup/src/orchestrator_agent.rs:758, 889, 922` | the daemon surface off Windows is a no-op |
 | platform strings | `crates/roomler-setup-core/src/asset_resolver.rs:265-300` | `windows-x86_64`, `linux-x86_64`, `linux-aarch64`, `macos` |

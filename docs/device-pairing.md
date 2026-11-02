@@ -451,7 +451,7 @@ enrolls unchanged (test `:1071-1089`). Nothing is unmounted and no index moves: 
 collections stay, empty.
 
 **`GET /api/setup/features`** (B1-s; `setup_features`,
-`crates/modules/fleet/src/setup_release.rs:139-146`; route `lib.rs:582`) is the server's
+`crates/modules/fleet/src/setup_release.rs:148-200`; route `lib.rs:582`) is the server's
 word on which install paths a client may offer, a public JSON object with every key present
 (`SetupFeatures`, `:88-99`):
 
@@ -597,6 +597,6 @@ device-paired notice failed` says why when the whole notice failed.
 | The features route | `crates/modules/fleet/src/setup_release.rs:129-187` |
 | The integration tests | `crates/tests/src/pairing_tests.rs` — the happy paths, the codes, the clocks, the decisions, the downstream refusals, the limits, the switches |
 | The `/pair` page | `ui/src/views/pair/PairView.vue`, `ui/src/utils/pairing.ts`, `ui/src/plugins/router.ts:110-124`, the three auth views, `ui/src/locales/en.json:109-158` |
-| The wizard | `agents/roomler-setup/src/pairing.rs` (the store), `commands.rs:583-689` (the four commands, `cmd_install`'s `usePaired` at `:453-512`), `front/app.js:609-947`, `front/index.html:176-243` |
+| The wizard | `agents/roomler-setup/src/pairing.rs` (the store), `commands.rs:583-689` (the four commands, `cmd_install`'s `usePaired` at `:453-512`), `front/app.js:698-1038`, `front/index.html:176-243` |
 | The shared client | `crates/agent-core/src/pairing.rs` (`start` `:315`, `poll` `:368`, re-exported as `roomlerd::pairing`) |
 | The composition baseline | `crates/tests/fixtures/composition.baseline.json` — the five routes and `/api/setup/features`, re-recorded with `COMPOSITION_UPDATE=1` |
