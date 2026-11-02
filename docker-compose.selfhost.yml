@@ -113,8 +113,12 @@ services:
   # address, and coturn rewrites that address to its own before it sends. Only
   # when the SFU listens on coturn's own address does that packet reach a call.
   #
-  # It reuses the Redis image, so there is nothing new to pull. `init` makes it
-  # stop at once: as PID 1, `sleep` would ignore SIGTERM and hold `down` for 10 s.
+  # If it dies, Docker brings it back with a new namespace and leaves them in the
+  # old one, with no network, while `docker ps` stays green. `restart netns` takes
+  # them along; the check names it (docs/self-hosting.md, "The TURN relay").
+  #
+  # It reuses the Redis image, so there is nothing new to pull. `init` is there
+  # because `sleep` as PID 1 ignores SIGTERM, and Docker would wait out its 10 s.
   # The aliases keep the two services' names resolving on this network.
   netns:
     image: redis:7-alpine

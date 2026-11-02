@@ -109,6 +109,46 @@ while :; do
 done
 pass "it stayed up for ${WINDOW}s, RestartCount 0"
 
+# The service each one takes its network from, as this file says.
+network_of() {
+  "${DC[@]}" config 2>/dev/null | awk -v s="  $1:" '
+    $0 == s { inside = 1; next }
+    inside && /^  [^ ]/ { exit }
+    inside && /^    network_mode:/ { print $2; exit }'
+}
+OURS="$(network_of coturn)"
+
+# A member outlives its holder. When `netns` dies, Docker brings it back with a new namespace
+# and leaves the members in the old one with no address: `docker ps` stays green, RestartCount
+# stays 0, `up -d` sees nothing to do, and nothing answers on any published port.
+HOLDER="${OURS#service:}"
+if [ "$HOLDER" != "$OURS" ]; then
+  namespace() { docker exec "$1" readlink /proc/self/ns/net 2>/dev/null; }
+  OWNED="$(namespace "$("${DC[@]}" ps -q "$HOLDER")")"
+  LEFT=0
+  for svc in coturn roomler; do
+    [ "$(network_of "$svc")" = "$OURS" ] || continue
+    c="$("${DC[@]}" ps -aq "$svc")"
+    [ -n "$c" ] || continue
+    if [ "$(docker inspect -f '{{.State.Status}}' "$c")" != running ]; then
+      fail "$svc is not running: $(docker inspect -f '{{.State.Status}} {{.State.Error}}' "$c")"
+      LEFT=1
+    elif [ -z "$OWNED" ] || [ "$(namespace "$c")" != "$OWNED" ]; then
+      fail "$svc is running outside the $HOLDER service's namespace, so nothing reaches it on a published port"
+      LEFT=1
+    fi
+  done
+  if [ "$LEFT" = 0 ] && [ -z "$(docker exec "$CID" hostname -I 2>/dev/null | tr -d ' ')" ]; then
+    fail "coturn's namespace has no address"
+    LEFT=1
+  fi
+  if [ "$LEFT" = 1 ]; then
+    echo "     Repair: docker compose -f $(basename "$FILE") --env-file $(basename "${ENV_FILE:-.env.selfhost}") restart $HOLDER"
+    verdict
+  fi
+  pass "coturn shares the $HOLDER service's namespace, and it has an address"
+fi
+
 # The secret is what this coturn runs with, so a stale env file cannot make a healthy
 # service look broken. It sits on turnserver's argv for as long as the service runs,
 # so the moment it spends on openssl's adds no exposure.
@@ -201,13 +241,6 @@ done
 
 # A relay to the public address lands in coturn's own namespace, so the SFU has to live
 # there too. Without that, every check above passes and a call gets no media.
-network_of() {
-  "${DC[@]}" config 2>/dev/null | awk -v s="  $1:" '
-    $0 == s { inside = 1; next }
-    inside && /^  [^ ]/ { exit }
-    inside && /^    network_mode:/ { print $2; exit }'
-}
-OURS="$(network_of coturn)"
 if [ -n "$OURS" ] && [ "$OURS" = "$(network_of roomler)" ]; then
   pass "coturn and the server share one network namespace ($OURS)"
 else
