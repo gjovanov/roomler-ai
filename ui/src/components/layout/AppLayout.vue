@@ -377,7 +377,7 @@
              per item on the SERVER's own bit split (VIEW_EXEC_AUDIT vs
              VIEW_SSH_AUDIT — reviewing commands and reviewing SSH sessions
              are different jobs); the group shows when either applies. -->
-        <v-list-group v-if="canSeeExecAudit || canSeeSshAudit" value="audit">
+        <v-list-group v-if="canSeeExecAudit || canSeeSshAudit || canSeeExternalAudit" value="audit">
           <template #activator="{ props: groupProps }">
             <v-list-item v-bind="groupProps" prepend-icon="mdi-clipboard-text-clock" :title="$t('nav.audit')" />
           </template>
@@ -398,6 +398,12 @@
             :to="`/tenant/${tenantId}/audit/ssh-activity`"
             prepend-icon="mdi-pulse"
             :title="$t('nav.sshActivity')"
+          />
+          <v-list-item
+            v-if="canSeeExternalAudit"
+            :to="`/tenant/${tenantId}/audit/external`"
+            prepend-icon="mdi-account-arrow-right-outline"
+            :title="$t('nav.externalAudit')"
           />
         </v-list-group>
       </v-list>
@@ -732,12 +738,13 @@ import {
   canQueryAnalytics,
   canSeeFleetNav,
   canViewExecAudit,
+  canViewExternalAudit,
   canViewSshAudit,
 } from '@/utils/permissions'
 import { useRoomStore, type Room } from '@/stores/rooms'
 import { useAgentStore } from '@/stores/agents'
 import { useCappedSearchList } from '@/composables/useCappedSearchList'
-import { api } from '@/api/client'
+import { api, ApiError } from '@/api/client'
 import { useNotificationStore } from '@/stores/notification'
 import { useOrgBadgesStore } from '@/stores/orgBadges'
 import { useConferenceStore } from '@/stores/conference'
@@ -1053,6 +1060,9 @@ const canSeeExecAudit = computed(() =>
 const canSeeSshAudit = computed(() =>
   canViewSshAudit(tenantStore.myPermissions, tenantStore.isOwner),
 )
+const canSeeExternalAudit = computed(() =>
+  canViewExternalAudit(tenantStore.myPermissions, tenantStore.isOwner),
+)
 const isPlatformAdmin = computed(() => auth.user?.is_platform_admin === true)
 
 // Sidebar Devices group data + capped-list resets. A SEPARATE watcher from
@@ -1187,9 +1197,9 @@ async function handleCreateOrg() {
     router.push(`/tenant/${tenant.id}`)
   } catch (e) {
     const msg = e instanceof Error ? e.message : 'Failed to create organization'
-    // tenants.slug is globally unique — surface the dup-key case in words.
+    // tenants.slug is globally unique, and a taken slug is the only 409 here.
     showCreateOrgError(
-      msg.includes('duplicate') || msg.includes('E11000')
+      e instanceof ApiError && e.status === 409
         ? 'That slug is already taken — pick another'
         : msg,
     )

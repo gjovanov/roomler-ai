@@ -1,6 +1,6 @@
 # FR-63 — One delay-based rate controller for remote desktop
 
-**Issue:** [#1243](https://github.com/gjovanov/roomler-ai/issues/1243) · **Status:** in progress — B-opener shipped (default OFF); **B0 simulator shipped**, AC0b answered in simulation and still open in the field; **B1 shadow controller built** (`encode::ratectl` beside the governor, six `shadow_*` heartbeat fields, observe-only — drives nothing) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
+**Issue:** [#1243](https://github.com/gjovanov/roomler-ai/issues/1243) · **Status:** in progress — B-opener shipped (default OFF); **B0 simulator shipped**, AC0b answered in simulation and still open in the field; **B1 shadow controller shipped in `agent-v0.4.188`** (2026-10-30; `encode::ratectl` beside the governor, six `shadow_*` heartbeat fields, observe-only — drives nothing); **B1b: AC2's instrument built** (`scripts/rc-shadow-report.cjs`, the bounded fleet read of `agent_logs`) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 **Parent/siblings:** FR-59 (the regression that motivated the arc). This is one of three FRs from that plan (FR-62 encoder apply path, FR-63 the controller, FR-64 the data path).
 
@@ -23,7 +23,8 @@ Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodpu
 |---|---|---|---|
 | **B-opener** | Slow-start for the session opener — `encode::slow_start` (pure law) + the governor cap on the opening ceiling **and floor** | `rate_slow_start` (default **OFF**) | shipped **inert** in 0.4.55 (#1262, #1265 capped only the ceiling, which `set_ceiling` raised back to the flat 1.5 M floor); fixed in 0.4.56 (#1275) and **field-verified engaging** — AC0a done, AC0b open |
 | B0 | `encode/sim.rs` — pipe/encoder/viewer simulator + the four scenario fixtures, driving the SHIPPED laws | n/a (test-only) | **shipped** — 11 tests in `cargo test -p roomlerd --lib` on the default build. CSV trace replay deferred (see below) |
-| B1 | `ratectl` shadow beside the governor, `shadow_*` heartbeat fields | `ROOMLERD_RATECTL` (env; `off` disables, default shadow) | **built** — `encode::ratectl::Controller` (pure, 13 unit tests) fed at the five live positions, six `shadow_*` fields on both pump heartbeats, a containment test (`the_shadow_never_moves_the_live_decision`, red-run confirmed) and a `RateLaw` adapter running it on the B0 cells. **Observe-only: it drives nothing.** AC2 (the fleet-log flip criterion) still needs a release + a week of logs |
+| B1 | `ratectl` shadow beside the governor, `shadow_*` heartbeat fields | `ROOMLERD_RATECTL` (env; `off` disables, default shadow) | **shipped in `agent-v0.4.188`** (#3102, published 2026-10-30 14:21Z; merged after 0.4.187 was cut) — `encode::ratectl::Controller` (pure, 13 unit tests) fed at the five live positions, six `shadow_*` fields on both pump heartbeats, a containment test (`the_shadow_never_moves_the_live_decision`, red-run confirmed) and a `RateLaw` adapter running it on the B0 cells. **Observe-only: it drives nothing.** AC2 (the fleet-log flip criterion) still needs a release + a week of logs |
+| B1b | AC2's instrument — `scripts/rc-shadow-report.cjs` (+ `.sh`): the flip criterion measured over `agent_logs` | n/a (a read; the prod targets refuse without `--yes`) | **built** — see "B1b — the shadow report" below. The plan's read path (`list_for_agent(?session_id=…)`) does not exist, so the fleet read runs as a bounded mongosh pass inside the Mongo pod; rehearsed on `mongo:7` with three-way parity. It measures; the operator runs the prod read and decides the flip. Since 2026-11-02 it also reads what the encoder spent, because the criterion cannot fail a shadow that asks for too little |
 | B2 | Flip to `live` on the flip criterion | `ratectl = shadow\|live\|off` | not started |
 | B3 | Retire the eight estimators and their switches | `ratectl = off` for one release | not started |
 
@@ -39,7 +40,7 @@ commitment — a proven floor (FR-59 P8's remembered-slow-pair open) still wins.
 ### The constrained cell (why this was blocked, and now is not)
 
 `constrained` is measured from the nominated ICE pair
-(`detect_constrained_transport`, `peer.rs:1497`), so the constrained posture
+(`detect_constrained_transport`, `peer.rs:1500`), so the constrained posture
 exists only on a path that actually relays. Field-measured 2026-09-03:
 CORPLAP-1 on 0.4.55 took a **direct** pair (`tgt=12096000`, `c=false`, paint
 age 11-42 ms), so slow-start could not engage and the A/B could not run —
@@ -235,6 +236,147 @@ across the fleet meeting the flip criterion — a release plus a week of
 `agent_logs`, which no unit test or simulation reaches. The containment test and
 the B0 cells are what B1 can prove; the fleet read is B2's.
 
+## B1b — the shadow report (AC2's instrument)
+
+B1 shipped the controller and the plan named its judge — "`scripts/rc-shadow-report.py`
+reads a week of `agent_logs` by session" — but nothing had built it. B1b does:
+`scripts/rc-shadow-report.cjs` measures the flip criterion, and
+`scripts/rc-shadow-report.sh` runs it where the data lives. Its contract, the bounds
+and the commands are in `docs/rate-control.md` § "Reading the shadow".
+
+### The read path the plan assumed does not exist
+
+The plan reads `agent_logs` through `list_for_agent(?session_id=…)`. On master that
+route takes only `limit`, clamped to 500 recent batches per agent
+(`crates/modules/fleet/src/agent_log.rs`, `ListLogsQuery`) — about 40 minutes of a
+session, never a week. The tempting substitute is worse than incomplete: an exec
+sweep of host logs reaches only exec-enabled, online hosts of one org, which is a
+biased sample, and the criterion is a fleet-wide proportion. `agent_logs` itself does
+hold the whole population — every daemon and every RC worker runs the uploader (a
+Windows host's pump runs in its console-session worker, `roomlerd run --supervisor
+scm`, which goes through `run_cmd` and spawns it), across every org, for 7 days.
+
+So the fleet read is a **mongosh pass inside the Mongo pod**, bounded by construction
+(the 2026-10-26 OOM was an unbounded read in that same container): at most 8 days, one
+day per query, `$match`/`$sort` served by an index (`explain`: `IXSCAN created_at_1`, no
+blocking SORT), streaming stages only, 14 projected fields, credentials from the pod's
+own environment. The production targets refuse without `--yes` and print the pod's
+restart count before and after.
+
+### The criterion, as the script measures it
+
+| term | measured as |
+|---|---|
+| window | one DC-pump heartbeat; one without `shadow_state` is a pre-B1 build (counted, not compared); `off` is the kill switch |
+| agreement | `shadow_target_bps ≤ target_bps` — the same `applied_bps` `shadow_disagree_pct` divides by |
+| elevated | `viewer_age_ms − viewer_age_floor_ms ≥ 70 ms` (`ratectl::AGE_SLACK_MS`, drift-checked by the self-test) |
+| class | the FFmpeg heartbeat's `constrained`; a VP9-444 session takes its ICE line's `relay=`, else `unknown` (never `direct`) |
+| sessions | per class, a session with ≥ `--min-windows` (default 1) windows in it |
+| verdict | MET · NOT MET · **INCONCLUSIVE** when nothing fails but no window is elevated — zero evidence is not a pass |
+
+The agreement clause is pooled, as the criterion is worded; each class's own agreement
+is printed beside it and a class under 90 % on its own is flagged. Whether a pooled
+pass with one class below the bar may flip is the operator's call, and the report
+says so rather than deciding it. The fixtures clause belongs to CI, so the report
+prints "not checked here".
+
+### Evidence
+
+- **The suite can fail.** 33 self-test cases, including both edges of the bar (18/20
+  = 90.0 % meets, 17/20 does not; 19 sessions do not) and three red runs. Five
+  mutations were run against it: `≥ 70` → `> 70`, the pooled clause's denominator,
+  the ICE merge, the mirrored constant (70 → 71) and agreement `≤` → `<`. The last one
+  **survived** the first suite (nothing pinned that asking for exactly the live rate
+  under strain agrees), so a case was added; all five now fail it.
+- **Fail-first on real logs.** A dev box's own 2026-10-29 worker log — 2,179 heartbeat
+  windows from 4 sessions on pre-B1 builds — reads as 0 sessions with the shadow, 2,179
+  windows without it, **NOT MET**: the instrument does not invent a comparison from a
+  build that has no shadow.
+- **The fleet read, rehearsed.** `--to-ejson` stored the same real lines (plus synthetic
+  B1 lines) as `agent_logs` batches the way the uploader does, and the fleet read ran
+  against a throwaway `mongo:7` — the image production runs (mongosh 2.10.0, server
+  7.0.40). The Node read over the text, the mongosh read over the 925 seeded batches,
+  and the Node read over the fleet read's own `--rows` output agreed exactly on every
+  class, the pool, the criterion and the invariants (2,274 lines). The transport to
+  mars (`roomler ssh` stdin) was checked byte-for-byte with no database read.
+
+Two defects in the wrapper surfaced only in the rehearsal, and both were Git-Bash
+path rewriting: a container path (`/tmp/…`) reached mongosh as `C:/Users/…`, and with
+the rewrite off, a host path reached `docker cp` as `C:\c\dev`. Neither touches the
+production targets, which run on Linux.
+
+### Day 0 — B1 in the field (2026-10-30)
+
+The first RC sessions on `agent-v0.4.188` the report could read without touching
+anyone's machine were ten short direct sessions a peer ran on a dev box (16:46–16:50Z,
+HEVC on NVENC, host ↔ host), read from that box's own log:
+
+| | live governor | shadow |
+|---|---|---|
+| opens at | 89.8 Mbps (76.3 in one session) — the content-generous ceiling (FR-74 P1) | **2.46 Mbps** — the governor's area floor for 2560×1600 (`area_min_bitrate_bps` = pixels × 3/5), the direct path's floor; the first heartbeat already shows one rise (2 654 208 = 2 457 600 × 1.08) |
+| after 6 s / 14 s | 101.1 / 123.7 Mbps | 3.34 / 4.55 Mbps — 4 / 8 rises of ×1.08 from the floor, one per 2-s window |
+| state | — | `startup` / `climbing` in all 44 windows |
+
+**B1 works in the field.** Every window carries all six fields, populated and
+consistent (`shadow_disagree_pct` = `(shadow − live)/live`), the climb runs at
+exactly the law's rate, and no pause was ordered on a direct path.
+
+🔑 **And the first thing it shows is a B2 question the flip criterion cannot see.**
+In all 43 clean windows the shadow asked for **96 % less** than the governor
+(p50 = p90 = −96 %). At the measured rate — one ×1.08 rise per window to half the
+ceiling, then ceiling/16 per step — reaching a ~100 Mbps live rate takes about 47 rises,
+roughly a minute and a half (a projection from the law at the measured rise rate,
+not a measurement). The criterion judges elevated windows only, where asking for less
+is the safe direction, so this behaviour passes it: flipped live as it is, every
+direct session would open near 2.5 Mbps. The report now prints the clean-window
+disagreement under its own heading, with no threshold. How B2 opens a direct session
+(at the ceiling or the remembered rate as the governor does, or a faster climb on clean
+direct windows) is B2's design call; whether the flip criterion needs a clean-window
+clause is the operator's.
+
+⚠️ **B1b does not tick AC2.** It is the instrument. AC2 is the instrument run over a
+release of fleet logs: the window opens with `agent-v0.4.188` (2026-10-30 14:21Z) and
+must be read during its 7th day, before the TTL takes its first hours. That read is a
+production database read, so it is the operator's to start
+(`bash scripts/rc-shadow-report.sh --mars --yes --since 2026-10-30T14:21:00Z`).
+
+### What the criterion cannot see (2026-11-02)
+
+The lead was that the criterion cannot fail on under-driving, and it holds. A shadow
+pinned at its floor scores 100 %, the fixtures clause does not bind the controller, and
+the self-test now shows the verdict reading MET on exactly that input. The clean-window
+disagreement cannot show it either: −96 % reads the same whether the encoder is resting
+or spending 14 times the shadow's target. The reasoning, with its anchors, is in
+`docs/rate-control.md` § "What the encoder spent".
+
+So the report now also reads what the encoder spent (`bytes_written`, already on both
+heartbeats; `encoder` to split by backend). No agent code and no new heartbeat field
+were involved. The criterion and its verdict did not change.
+
+| read | clean windows | over the shadow | at ≥ 2 Mbps, over | over by > 25 % |
+|---|---|---|---|---|
+| B1 on one dev box's real lines (20 sessions, direct, NVENC) | 200 | 8 (4.0 %) | 8/14 = 57.1 % | 6/14 = 42.9 % |
+| the same lines, a shadow that never left its opening target (derived) | 200 | 14 (7.0 %) | 14/14 = 100 % | 14/14 = 100 % |
+
+**Evidence.** 80 self-test cases, and 34 mutations of the new code all fail them. Fail-first
+on the rehearsal target: over the same 88 batches of real lines, master's file printed no
+spend section and projected no `bytes_written`, and the file as pushed printed the table.
+The Node read over the text, the mongosh read over the batches and the Node read over
+`--rows` agreed exactly, the cube included. The production read itself was not run.
+
+Three limits on what this first read says. It is one host and all direct, so the
+constrained class has only synthetic lines behind it. No session on that host ran past
+59 s, so it cannot say what the controller does after its climb. And a spend over the
+shadow on a backend that anchors `bit_rate = maxrate` may be drawn by the live target,
+not needed by the picture, which is why the report splits by encoder.
+
+⚠️ **The deadline is softer for this question than the window suggests.** `agent_logs` is
+a rolling 7 days, and `ratectl.rs` has not changed since B1, so a read after 2026-11-06
+loses the first days of data and still answers the question from later sessions. It
+stays worth reading in time for AC2's "one release", and a read must run this file or
+later to get the spend table: `git log -1 -- scripts/rc-shadow-report.cjs` in the
+checkout it runs from.
+
 ## Acceptance criteria
 
 - [x] AC0a — **the ramp engages and opens where it says.** Field-verified 2026-09-03 on 0.4.56, CORPLAP-1: `FR-63 slow-start armed open_bps=300000 ceiling_bps=2550000`, against an arm-A opener of `2_550_000` on the same host and build — an 8.5× smaller opening commitment. `slf=Some(600000)` on the first window with `gp=None` proves the **floor descent** did it, since the P1 relief cannot fire without a measurement; on 0.4.55, which capped only the ceiling, the opener was pinned at the flat 1.5 M and the ramp was inert.
@@ -244,6 +386,8 @@ the B0 cells are what B1 can prove; the fleet read is B2's.
       Shipped with seven more: four asserting the simulator itself, the AC0b A/B, and the
       keyframe-sensitivity check. 11 tests, ~10 ms.
 - [ ] AC2 — One release of shadow logs across the fleet meets the flip criterion, report attached.
+      Instrument: B1b's `bash scripts/rc-shadow-report.sh --mars --yes --since 2026-10-30T14:21:00Z`
+      (the window opens with `agent-v0.4.188`; read it during its 7th day).
 - [ ] AC3 — Field A/B (`scripts/rc-ab.sh`) on CORPLAP-1 (QSV, corp VPN) and CORPLAP-2 (real relay): paint age p90 ≤ 0.4.50's and no window with a standing queue while the encoder tracks (FR-62).
 - [ ] AC4 — FR-59 AC4 (< 600 ms sustained on the airport-class link) closes here.
 - [ ] AC5 — The eight replaced estimators and their six switches are deleted; `ratectl = off` restores the prior behaviour for one release.
@@ -378,6 +522,29 @@ either — which is the number B1 has to beat.
 
 ## Open decisions
 
+- **Does the flip criterion gain a spend clause? (the operator's, raised 2026-11-02.)** The
+  criterion above is unchanged. Recommended addition, per path class and not pooled:
+
+  > and `spent ≤ 1.25 × shadow` in ≥ 90 % of the clean windows at or above the class's
+  > gate (2 Mbps direct, 0.5 Mbps constrained), over ≥ 20 sessions per class that reached
+  > the gate; fewer sessions is INCONCLUSIVE, never a pass.
+
+  | number | why | how firm |
+  |---|---|---|
+  | a gate on the spend | a bar over all clean windows has no power: B1 scores 96 %, a pinned shadow 93 % | measured, one host |
+  | 2 Mbps direct | the direct floor is 1.5-4 M (`encode/mod.rs:292-297`), so most lower spend cannot be capped at all; 186 of that host's 200 clean windows sit under it | measured, one host |
+  | 0.5 Mbps constrained | the constrained floor is 200 k against a ~3 M nominal cap | **not measured**: no real constrained line was read. Check it against the fleet table first |
+  | ×1.25 | a small excess can be overshoot. The result does not hang on it: B1 at ≥ 2 Mbps is 43 % over by more than this, 57 % over at all | judgement |
+  | 90 %, ≥ 20 sessions | mirror the existing bar, so no new number to defend | judgement |
+
+  Run on that host's lines it reads 8/14 = 57 % covered from 3 sessions: INCONCLUSIVE on
+  the count, and below the bar. A shadow that never left its opening target reads 0/14,
+  and a controller that always covered the spend reads 14/14, so the clause can tell them
+  apart. **It includes the opening on purpose**, so expect B1 as it stands to fall short of
+  it: that is the day-0 finding, and it makes B2's opener the first thing to change, then a
+  release of shadow to re-measure. If the fleet table's "after the first 120 s" column is
+  clean, the opener is the whole defect; if it is not, the controller's own law is under-driving
+  too. The data it needs is the spend table from one fleet read of this script.
 - **Deferred from B0: CSV trace replay from `agent_logs`.** The four fixtures are calibrated from
   recorded field numbers but are generated, not replayed. Replay is worth building when a trace
   disagrees with a fixture; building it first would have delayed the AC0b answer for no evidence.

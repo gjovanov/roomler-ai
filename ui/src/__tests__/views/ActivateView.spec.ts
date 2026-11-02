@@ -5,6 +5,8 @@
 // token on arrival and hands the person to sign-in; a 400 and a half link
 // say the link is invalid, with the ways back; a refresh after success
 // shows the success again without a second POST; two mounts make one POST.
+// #3199 — the way back from a refused link is a new link, asked for here, and
+// the page says the same words whatever the address.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import { createVuetify } from 'vuetify'
@@ -25,6 +27,16 @@ let fetchMock: ReturnType<typeof vi.fn>
 function answer(status: number) {
   fetchMock = vi.fn(async () => ({ ok: status >= 200 && status < 300, status, json: async () => ({}) }))
   vi.stubGlobal('fetch', fetchMock)
+}
+
+async function askForALink(w: Awaited<ReturnType<typeof land>>['w'], address: string) {
+  await w.find('[data-test="activate-email"] input').setValue(address)
+  await w.find('[data-test="activate-resend"]').trigger('submit')
+  await flushPromises()
+}
+
+function lastCall(): [string, RequestInit] {
+  return fetchMock.mock.calls.at(-1) as unknown as [string, RequestInit]
 }
 
 async function land(url: string) {
@@ -78,16 +90,23 @@ describe('ActivateView', () => {
     const signIn = w.find('[data-test="activate-sign-in"]')
     expect(signIn.exists()).toBe(true)
     expect(signIn.attributes('href')).toBe('/login')
-    expect(w.find('[data-test="activate-register"]').exists()).toBe(false)
+    expect(w.find('[data-test="activate-resend"]').exists()).toBe(false)
   })
 
-  it('a 400 says the link is invalid or expired, with sign-in and register as the ways back', async () => {
+  it('a 400 says the link is invalid or expired, and offers a new link and sign-in', async () => {
     answer(400)
     const { w } = await land(LINK)
     expect(w.find('[data-test="activate-invalid"]').text()).toBe('This activation link is invalid or has expired')
-    expect(w.text()).toContain('already activated your account, just sign in')
+    expect(w.text()).toContain('already active, just sign in')
     expect(w.find('[data-test="activate-sign-in"]').attributes('href')).toBe('/login')
-    expect(w.find('[data-test="activate-register"]').attributes('href')).toBe('/register')
+    expect(w.find('[data-test="activate-resend"]').exists()).toBe(true)
+  })
+
+  it('never sends a refused link back to registering: that address answers 409 (#3199)', async () => {
+    answer(400)
+    const { w } = await land(LINK)
+    expect(w.text().toLowerCase()).not.toContain('register')
+    expect(w.find('a[href="/register"]').exists()).toBe(false)
   })
 
   it('a link missing a parameter gets the same words, without calling the server', async () => {
@@ -95,10 +114,57 @@ describe('ActivateView', () => {
     const half = await land(`/auth/activate?userId=${USER_ID}`)
     expect(fetchMock).not.toHaveBeenCalled()
     expect(half.w.find('[data-test="activate-invalid"]').exists()).toBe(true)
-    half.w.unmount()
-    const bare = await land('/auth/activate')
+  })
+
+  it('with no link at all it just asks: that is sign-in’s and sign-up’s way in', async () => {
+    answer(200)
+    const { w } = await land('/auth/activate')
     expect(fetchMock).not.toHaveBeenCalled()
-    expect(bare.w.find('[data-test="activate-invalid"]').exists()).toBe(true)
+    expect(w.find('[data-test="activate-invalid"]').exists()).toBe(false)
+    expect(w.find('[data-test="activate-ask"]').text()).toBe('Get a new activation link')
+    expect(w.find('[data-test="activate-resend"]').exists()).toBe(true)
+  })
+
+  it('asks for a new link with the server’s shape, the address trimmed', async () => {
+    answer(400)
+    const { w } = await land(LINK)
+    answer(202)
+    await askForALink(w, '  person@example.com ')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url, init] = lastCall()
+    expect(url).toBe('/api/auth/resend-activation')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(String(init.body))).toEqual({ email: 'person@example.com' })
+  })
+
+  it('says one thing on a 202, and never that the address has an account', async () => {
+    answer(202)
+    const { w } = await land('/auth/activate')
+    await askForALink(w, 'person@example.com')
+    const words = w.find('[data-test="activate-resend-outcome"]').text()
+    expect(words).toBe(en.activation.resend.sent)
+    expect(words).toContain('If that address is waiting for activation')
+    expect(words).not.toContain('person@example.com')
+  })
+
+  it('does not ask without an address', async () => {
+    answer(202)
+    const { w } = await land('/auth/activate')
+    expect(w.find('[data-test="activate-resend-send"]').attributes('disabled')).toBeDefined()
+    await askForALink(w, '   ')
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(w.find('[data-test="activate-resend-outcome"]').exists()).toBe(false)
+  })
+
+  it('a 429 says to wait, and an unreachable server says to try again', async () => {
+    answer(429)
+    const { w } = await land('/auth/activate')
+    await askForALink(w, 'person@example.com')
+    expect(w.find('[data-test="activate-resend-outcome"]').text()).toBe(en.activation.resend.throttled)
+    fetchMock = vi.fn(async () => Promise.reject(new TypeError('Failed to fetch')))
+    vi.stubGlobal('fetch', fetchMock)
+    await askForALink(w, 'person@example.com')
+    expect(w.find('[data-test="activate-resend-outcome"]').text()).toBe(en.activation.resend.error)
   })
 
   it('a refresh after success shows the success again, with no second POST', async () => {

@@ -116,3 +116,28 @@ export function activateAccount(
   inflight.set(key, p)
   return p
 }
+
+export type ResendOutcome = 'sent' | 'throttled' | 'error'
+
+/**
+ * #3199 — ask for a new link. The server answers the same 202 for every
+ * address and does the work afterwards, so `sent` means only that the request
+ * was taken, and the page must not claim more. `throttled` is the per-client
+ * 429; `error` is anything else, where trying again is right.
+ */
+export async function requestActivationLink(
+  email: string,
+  fetchImpl: FetchLike = (input, init) => fetch(input, init),
+): Promise<ResendOutcome> {
+  try {
+    const r = await fetchImpl('/api/auth/resend-activation', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    })
+    if (r.ok) return 'sent'
+    return r.status === 429 ? 'throttled' : 'error'
+  } catch {
+    return 'error'
+  }
+}

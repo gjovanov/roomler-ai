@@ -102,6 +102,8 @@ pub mod host_mute;
 /// running behind it; black-box over the agent this daemon's sessions use.
 #[cfg(test)]
 mod ice_lifetime_tests;
+/// FR-134 — an ICMP echo with no `ping.exe` (the module gates itself to Windows).
+pub mod icmp_win;
 pub mod indicator;
 pub mod input;
 pub mod install_cleanup;
@@ -127,6 +129,9 @@ pub mod macos_quit;
 pub mod macos_spawn;
 pub mod macos_supervisor;
 pub mod mdns_resolve;
+/// FR-135 R2 — `rc:media-plan`: what a session promised its viewer, and every
+/// step it took down from there.
+pub mod media_plan;
 pub mod mem_trim;
 pub mod power;
 pub mod remote_config;
@@ -189,6 +194,8 @@ pub mod relay_server;
 /// FR-96 P2b — a per-user Linux daemon restarts onto its replaced binary once
 /// nothing it serves would be cut.
 pub mod replaced_binary;
+/// FR-134 — the daemon samples its own handle count and says when it climbs.
+pub mod resource_watch;
 /// FR-98 C6 — `playout-delay` 0/0 on the RTP fallback track, so the
 /// browser's jitter buffer renders as soon as it decodes (default off).
 pub mod rtp_playout;

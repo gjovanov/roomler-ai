@@ -2295,6 +2295,12 @@ impl ClientPeer {
         peer_may_start_keep_busy(self, scope, console_session_id(), own_uid())
     }
 
+    /// FR-85 P2e — may this peer start, stop or delete a recording, on
+    /// `scope`'s endpoint? [`peer_may_record`].
+    pub fn may_record(&self, scope: Scope) -> bool {
+        peer_may_record(self, scope, console_session_id(), own_uid())
+    }
+
     /// FR-90 P3-9-2b — may this peer run `roomler connect` here (decision
     /// 26)? [`peer_may_connect`].
     pub fn may_connect(&self) -> bool {
@@ -2411,6 +2417,26 @@ pub fn peer_may_start_keep_busy(
     match scope {
         Scope::Person => peer.uid.is_some(),
         Scope::Full => matches!((peer.uid, own_uid), (Some(p), Some(o)) if p == o),
+    }
+}
+
+/// FR-85 P2e — the pure decision behind [`ClientPeer::may_record`].
+///
+/// The daemon's own endpoints keep [`peer_is_console_user`]. On the person
+/// socket of a system install that gate cannot pass: it compares the peer with
+/// this daemon, which is root, and the person at the seat is not. There the
+/// listener has already taken the kernel's word that the peer is that person
+/// or root ([`person_peer_ok`]), so all that is left to ask is whether the
+/// peer was identified at all.
+pub fn peer_may_record(
+    peer: &ClientPeer,
+    scope: Scope,
+    console_session: Option<u32>,
+    own_uid: Option<u32>,
+) -> bool {
+    match scope {
+        Scope::Person => peer.uid.is_some(),
+        Scope::Full => peer_is_console_user(peer, console_session, own_uid),
     }
 }
 
@@ -3083,8 +3109,9 @@ pub enum Scope {
     Full,
     /// The person-at-the-device socket of a Linux system install, and of a
     /// Mac's root half ([`serve_person_socket`]): only what that person needs
-    /// to see who is viewing their screen, end it, answer a consent prompt, and
-    /// see the devices the machine's private network lets it see.
+    /// to see who is viewing their screen, end it, answer a consent prompt,
+    /// record it, and see the devices the machine's private network lets it
+    /// see.
     Person,
 }
 
@@ -3097,7 +3124,8 @@ pub enum Scope {
 /// the service is up, the sessions behind the "Being viewed by …" banner, its
 /// Disconnect, the consent prompt and its answer, and whether a recording is
 /// running (the tray turns red). FR-97 P2g adds the companion's Devices page,
-/// and P2h the live links its Connection column and Overview read.
+/// and P2h the live links its Connection column and Overview read. FR-85 P2e
+/// adds recording that person's own screen.
 pub fn person_may(req: &Request) -> bool {
     match req {
         Request::Status
@@ -3127,7 +3155,18 @@ pub fn person_may(req: &Request) -> bool {
         // (online, direct or relayed, round trip), which the Devices page's
         // Connection column and Overview's count read. Read-only, and served
         // without the endpoints and probe detail (`person_view`).
-        | Request::Peers => true,
+        | Request::Peers
+        // FR-85 P2e — this person's own screen, into this person's own folder.
+        // The recorder runs as them and the daemon lists and deletes as them
+        // (`RecordingManager`), so this reaches nothing they could not reach
+        // themselves. The Recordings view needs the list to show anything,
+        // and the start is gated again, on the peer, in the dispatcher. Where
+        // recordings go and whether a controller may make one stay
+        // `ConfigSet`, below.
+        | Request::RecordStart { .. }
+        | Request::RecordStop
+        | Request::RecordingsList
+        | Request::RecordingDelete { .. } => true,
         Request::Flows
         | Request::Ping { .. }
         | Request::CreateForward { .. }
@@ -3151,10 +3190,6 @@ pub fn person_may(req: &Request) -> bool {
         | Request::TailLog { .. }
         | Request::ExecRemote { .. }
         | Request::SshSession { .. }
-        | Request::RecordStart { .. }
-        | Request::RecordStop
-        | Request::RecordingsList
-        | Request::RecordingDelete { .. }
         | Request::RestartDaemon { .. }
         | Request::EncoderCaps
         | Request::HiveUpdateHold
@@ -3193,9 +3228,9 @@ pub fn person_view(resp: Response) -> Response {
 fn not_on_the_person_socket() -> Response {
     Response::Error {
         message: "this is the person-at-the-device socket of a system install: it shows who is \
-                  viewing this screen, ends it, answers consent prompts, and lists the devices \
-                  this machine's private network reaches and its links to them. Everything else \
-                  goes to the daemon's own socket — run `sudo roomler …`"
+                  viewing this screen, ends it, answers consent prompts, records this screen, \
+                  and lists the devices this machine's private network reaches and its links \
+                  to them. Everything else goes to the daemon's own socket — run `sudo roomler …`"
             .into(),
     }
 }
@@ -3524,7 +3559,7 @@ where
                     Request::RecordStart { .. }
                     | Request::RecordStop
                     | Request::RecordingDelete { .. },
-                ) if !peer.is_console_user() => not_the_console_user(),
+                ) if !peer.may_record(scope) => not_the_console_user(),
                 Ok(Request::RecordStart { opts }) => state.record_start(opts).await,
                 Ok(Request::RecordStop) => state.record_stop().await,
                 Ok(Request::RecordingDelete { name }) => state.recording_delete(&name).await,
@@ -7601,10 +7636,14 @@ mod tests {
     }
 
     async fn ask_scoped(scope: Scope, line: &str) -> Response {
+        ask_scoped_as(ClientPeer::UNKNOWN, scope, line).await
+    }
+
+    async fn ask_scoped_as(peer: ClientPeer, scope: Scope, line: &str) -> Response {
         let (client, server) = tokio::io::duplex(4096);
         let srv = tokio::spawn(async move {
             let state = Mock;
-            serve_connection_scoped(server, &state, ClientPeer::UNKNOWN, scope).await
+            serve_connection_scoped(server, &state, peer, scope).await
         });
         let (crd, mut cwr) = tokio::io::split(client);
         let mut clines = tokio::io::BufReader::new(crd).lines();
@@ -7638,6 +7677,12 @@ mod tests {
             r#"{"t":"mesh","d":{"org":"primary"}}"#,
             // FR-97 P2h — and its live links, without the endpoints.
             r#"{"t":"peers"}"#,
+            // FR-85 P2e — recording their own screen into their own folder
+            // (the peer is gated again on top).
+            r#"{"t":"record_start","d":{}}"#,
+            r#"{"t":"record_stop"}"#,
+            r#"{"t":"recordings_list"}"#,
+            r#"{"t":"recording_delete","d":{"name":"x.mp4"}}"#,
         ];
         for j in allowed {
             let req: Request = serde_json::from_str(j).unwrap();
@@ -7667,16 +7712,11 @@ mod tests {
                 value: Some("true".into()),
             },
             Request::ConfigCleanupStale,
-            Request::RecordStop,
-            Request::RecordingsList,
             Request::EncoderCaps,
             Request::HiveUpdateHold,
             Request::KillFlow { id: "f".into() },
             Request::RouteRemove { id: "r".into() },
             Request::SetDeviceName { name: "x".into() },
-            Request::RecordingDelete {
-                name: "x.mp4".into(),
-            },
             // FR-90 P3-9-2b — the owner's grants, never the seat's.
             Request::Connect {
                 args: ConnectArgs::default(),
@@ -7778,6 +7818,74 @@ mod tests {
             }
             other => panic!("expected Peers on the full socket, got {other:?}"),
         }
+    }
+
+    /// FR-85 P2e — who may start, stop or delete a recording. The daemon's own
+    /// endpoints keep the console gate. On a system install's person socket
+    /// that gate can never pass: it compares the peer with the daemon, which
+    /// is root, and the person is not root.
+    #[test]
+    fn the_recording_decision_table() {
+        let unix = |u| ClientPeer {
+            uid: Some(u),
+            ..ClientPeer::UNKNOWN
+        };
+        let win = |s| ClientPeer {
+            session_id: Some(s),
+            ..ClientPeer::UNKNOWN
+        };
+        let full = Scope::Full;
+        let person = Scope::Person;
+        // The person at the seat of a system install, on their own socket.
+        assert!(peer_may_record(&unix(1000), person, None, Some(0)));
+        assert!(
+            !peer_is_console_user(&unix(1000), None, Some(0)),
+            "the gate this one widens"
+        );
+        // Root passes there as it does on its own socket.
+        assert!(peer_may_record(&unix(0), person, None, Some(0)));
+        // The daemon's own endpoints: nothing moved. A root daemon's socket
+        // refuses anyone else, and a per-user daemon's serves its owner.
+        assert!(peer_may_record(&unix(0), full, None, Some(0)));
+        assert!(!peer_may_record(&unix(1000), full, None, Some(0)));
+        assert!(peer_may_record(&unix(501), full, None, Some(501)));
+        assert!(!peer_may_record(&unix(502), full, None, Some(501)));
+        // Windows: the console session, RDP refused.
+        assert!(peer_may_record(&win(1), full, Some(1), None));
+        assert!(!peer_may_record(&win(2), full, Some(1), None));
+        // Fail closed.
+        for scope in [full, person] {
+            assert!(!peer_may_record(
+                &ClientPeer::UNKNOWN,
+                scope,
+                Some(1),
+                Some(0)
+            ));
+        }
+    }
+
+    /// FR-85 P2e — the person at a system install's seat works their own
+    /// recordings on their own socket, past both gates, and a peer the listener
+    /// could not name still is not them.
+    #[tokio::test]
+    async fn the_person_at_the_seat_records_on_their_own_socket() {
+        let person = || ClientPeer {
+            uid: Some(1000),
+            ..ClientPeer::UNKNOWN
+        };
+        for line in [
+            r#"{"t":"record_start","d":{}}"#,
+            r#"{"t":"record_stop"}"#,
+            r#"{"t":"recording_delete","d":{"name":"x.mp4"}}"#,
+        ] {
+            let r = ask_scoped_as(person(), Scope::Person, line).await;
+            assert!(!is_person_refusal(&r), "{line} → {r:?}");
+            assert!(!is_console_refusal(&r), "{line} → {r:?}");
+            let r = ask_scoped_as(ClientPeer::UNKNOWN, Scope::Person, line).await;
+            assert!(is_console_refusal(&r), "{line} → {r:?}");
+        }
+        let r = ask_scoped_as(person(), Scope::Person, r#"{"t":"recordings_list"}"#).await;
+        assert!(!is_person_refusal(&r), "{r:?}");
     }
 
     /// FR-97 P2h — the person's view of the peers keeps the link and drops

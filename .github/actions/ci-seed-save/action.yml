@@ -76,9 +76,13 @@ runs:
                -exec rm -rf {} + 2>/dev/null
           for sub in build .fingerprint deps; do
             [ -d "$prof/$sub" ] || continue
+            # macOS's default `split-debuginfo=unpacked` leaves <crate>-<hash>.<cgu>-cgu.N.rcgu.o
+            # beside a unit. The last dash in that name is not the one before the hash, so read
+            # it at the first: a crate name in `deps/` has none. FR-6 wave 38: ~600 MB a version.
             ls -1A "$prof/$sub" | awk -v L="$local_names" '
               BEGIN { while ((getline m < L) > 0) local[m] = 1 }
               { base = $0; i = match(base, /-[^-]*$/); if (i > 0) base = substr(base, 1, i - 1)
+                if ($0 ~ /\.rcgu\.o$/) base = substr($0, 1, index($0, "-") - 1)
                 if (base in local) print }' \
             | while IFS= read -r unit; do rm -rf "$prof/$sub/$unit"; done
           done
@@ -87,12 +91,12 @@ runs:
         printf '%s\n' "$KEY" > target/.ci-seed-key
         after=$(du -sm target 2>/dev/null | cut -f1)
         echo "pruned target: ${before:-?} MB -> ${after:-?} MB (third-party dependencies only)"
-        # FR-6 wave 33: a target over the restore's cap is dropped by every later restore, so
-        # every run of this job builds cold and the next master run publishes the same size
-        # again. The restore step exports the cap it applied.
+        # FR-6 wave 33: the next restore drops a target over its cap and builds cold. If that
+        # cold build fits the cap, this was the GC. If not, every run stays cold and each master
+        # run publishes the same size again. The restore step exports the cap it applied.
         cap="${CI_SEED_MAX_TARGET_MB:-}"
         if [ -n "$cap" ] && [ -n "${after:-}" ] && [ "$after" -gt "$cap" ]; then
-          echo "::warning title=CI cache over its cap::'${FAM}' publishes a ${after} MB target, over the ${cap} MB its restore keeps, so every run of this job builds cold. Raise the job's max-target-mb (ci-seed-restore) above ${after}."
+          echo "::warning title=CI cache over its cap::'${FAM}' publishes a ${after} MB target, over the ${cap} MB its restore keeps, so the next run drops it and builds cold. If the master run after that publishes under ${cap} MB, this was the GC and nothing is owed. If it publishes over again, every run stays cold: raise the job's max-target-mb (ci-seed-restore)."
         fi
 
         home="${CARGO_HOME:-$HOME/.cargo}"

@@ -55,11 +55,20 @@ pub trait NetstackPinger: Send + Sync {
 /// OWN reported round-trip (subprocess spawn cost never pollutes the number).
 /// The overlay ICMP path is exactly what a user's own `ping 100.64.x.y`
 /// exercises, so the column now shows the same truth they'd measure.
+/// FR-134: Windows makes `ping.exe`'s own calls instead of starting it, because
+/// a probe per peer every 15 s was a process a second. `ROOMLERD_PING_SUBPROCESS=1`
+/// puts the subprocess back.
 pub struct OsPinger;
 
 #[async_trait]
 impl NetstackPinger for OsPinger {
     async fn ping(&self, dst: IpAddr, timeout: Duration) -> Result<Duration, String> {
+        #[cfg(windows)]
+        if tunnel_core::env::node_env("PING_SUBPROCESS").as_deref() != Some("1") {
+            return tokio::task::spawn_blocking(move || crate::icmp_win::echo(dst, timeout))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         let target = dst.to_string();
         let mut cmd = tokio::process::Command::new("ping");
         #[cfg(windows)]
@@ -385,12 +394,12 @@ impl RestartHandle {
     }
 
     /// #3164 — macOS asked this process to quit with a Quit AppleEvent: System
-    /// Settings' "Quit & Reopen" after a Screen Recording grant, the Dock,
-    /// Activity Monitor, a script (`crate::macos_quit` has the table). Under a
-    /// supervisor that relaunches it, that is a restart: armed here with that
-    /// supervisor's code and recorded as the verb records one; the caller then
-    /// [`Self::commit`]s it, so it leaves through the same graceful door (no
-    /// crash counted, no ephemeral unenroll).
+    /// Settings' "Quit & Reopen" after a Screen Recording grant, or a script
+    /// (`crate::macos_quit` has the table, and why Activity Monitor's Quit is
+    /// not here). Under a supervisor that relaunches it, that is a restart:
+    /// armed here with that supervisor's code and recorded as the verb records
+    /// one; the caller then [`Self::commit`]s it, so it leaves through the same
+    /// graceful door (no crash counted, no ephemeral unenroll).
     ///
     /// Not the verb's gates. The process quits either way (AppKit exits 0 when
     /// this returns `None`), so the only choice here is whether the device comes
@@ -1078,7 +1087,7 @@ impl LocalApiState for DaemonState {
     fn rc_sessions(&self) -> Vec<tunnel_core::localapi::RcSessionInfo> {
         self.rc_sessions
             .as_ref()
-            .map(|r| r.list())
+            .map(|r| r.list_for_client())
             .unwrap_or_default()
     }
 

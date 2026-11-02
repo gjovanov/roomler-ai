@@ -181,7 +181,7 @@ bounded passive staleness; (4) pod-alive → advisory only.
 |---|---|---|
 | Agent WS | socket breaks ⇒ agent redials; LWW re-register | that pod's rc sessions end (P2P media freezes → controller reconnect); listing stale ≤90 s |
 | Tunnel session | **data plane survives outright** (P2P); new opens rehome | bookkeeping blip only |
-| DERP peer | reconnect loop; LB re-hashes deterministically | seconds of WG loss; corp pairs re-handshake |
+| DERP peer | reconnect loop; the tenant pin answers 502 until the replacement listens, with no failover to the survivor | ~7.6 s of WG loss (p50 over 14 rolls, FR-28); corp pairs re-handshake |
 | Media room | claim gone (graceful: zero window; crash: ≤30 s TTL) ⇒ rejoin claims a live pod | one conference, ≤30 s gap on crash |
 
 **Redis-down degradation (hard requirement)**: directory ops fail soft to

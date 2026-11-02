@@ -64,8 +64,8 @@ flowchart TD
 - **Linux: the companion tracks the daemon**, the invariant Windows has had since S1a (`companion.rs:3-29`). The one
   process that installs updates as root on the host also moves an installed `roomler-desktop` package to its **own**
   version (`CARGO_PKG_VERSION`), never "latest": the companion follows the daemon, not the feed.
-  - **Who:** the owner `decide_update_owner` already names (`updater.rs:3619`, FR-96). That is a system install's root
-    daemon, or `roomlerd update-helper` (`updater.rs:3889`) for a per-user install. A per-user daemon that sees the
+  - **Who:** the owner `decide_update_owner` already names (`updater.rs:3634`, FR-96). That is a system install's root
+    daemon, or `roomlerd update-helper` (`updater.rs:3904`) for a per-user install. A per-user daemon that sees the
     skew touches the helper's wake file (`/var/tmp/roomler-update-check`): a wake, never an instruction. A non-root
     daemon with no helper skips, with one log line, never a password prompt (D3).
   - **What:** the package database that owns the companion picks the format (`installed_version_inner`,
@@ -78,7 +78,7 @@ flowchart TD
     the daemon (#2055).
   - **Install:** the host's own package manager, so it stays the source of truth. `apt-get install -y` (then
     `dpkg --install`) for a `.deb`; `dnf`, `zypper` or `yum` for an `.rpm`, in `install.sh`'s order
-    (`desktop_rpm_tool`, `scripts/install.sh:1145`). `NEEDRESTART_SUSPEND=1`: Ubuntu's needrestart hook otherwise
+    (`desktop_rpm_tool`, `scripts/install.sh:1148`). `NEEDRESTART_SUSPEND=1`: Ubuntu's needrestart hook otherwise
     restarts services, roomlerd among them, after an apt run (a vmtest trap, seen 2026-10-19). Then `DEBIAN_FRONTEND=noninteractive`
     and a dpkg lock timeout, so unattended-upgrades holding the lock costs one tick, not a hang.
   - **Restart:** a companion that was running is stopped and started again in its person's graphical session, through

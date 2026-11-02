@@ -25,10 +25,27 @@ a machine sitting at the lock screen.
 
 ## Install
 
-Mint a token in the dashboard under **Devices → Enroll device**, then use either
-form. The graphical wizard asks the same questions the flags answer.
+**Roomler Setup needs no token.** It is a signed EXE with a role picker:
 
-**One line, in an Administrator PowerShell** (Terminal (Admin)):
+[Roomler Setup for Windows](https://roomler.ai/api/setup/windows)
+
+If your network's proxy refuses to download an EXE, take
+[the same signed EXE in a zip](https://roomler.ai/api/setup/windows?format=zip) instead.
+
+1. Run it. **Be accessed — background service** is already selected. Change it if
+   you want another mode, then continue to **Join your organization**.
+2. Click **Set up in the browser**. The wizard shows a code of eight letters.
+3. Open [roomler.ai/pair](https://roomler.ai/pair), sign in or create an account,
+   type the code, check the device the page shows, pick your organization and
+   click **Approve**.
+4. Go back to the wizard. It names who approved the device and into which
+   organization. Click **Install** and answer the administrator prompt.
+
+A code lasts 15 minutes. When it runs out the wizard says so, and **Start again**
+gives you a new one. A mistyped code only gets "No pending pairing with that code".
+
+**Or one line, in an Administrator PowerShell** (Terminal (Admin)), with a token
+you mint in the dashboard under **Devices → Enroll device**:
 
 ```powershell
 & ([scriptblock]::Create((irm https://roomler.ai/api/setup/install.ps1))) -Role daemon-system -Token <token> -Server https://roomler.ai
@@ -36,10 +53,6 @@ form. The graphical wizard asks the same questions the flags answer.
 
 Swap `-Role` for `daemon-machine` (attended) or `daemon-user` (per user) to
 change the service mode.
-
-**Or download the wizard** — a signed EXE with a role picker:
-
-[Roomler Setup for Windows](https://roomler.ai/api/setup/windows)
 
 **Already installed and just need to enroll?**
 
@@ -126,6 +139,8 @@ revokes the machine's credential and releases its mesh address back to the pool.
 ## Troubleshooting
 
 - **The device never appears.** The enrollment token is single-use — if an earlier attempt consumed it, mint a fresh one.
+- **Your company's policy refuses the administrator prompt.** Roomler Setup says so on its first page and selects **Be accessed — this user only**, which needs no administrator rights. For the background service, ask your administrator to install it.
+- **An administrator typed their password for you.** The window then runs as that administrator, so it offers only the background service for the whole computer. To install for your own account, close the window and start Roomler Setup again.
 - **It appears, then goes stale.** See [device offline or stale](/docs/troubleshooting/device-offline/).
 - **Black screen when you connect.** Usually a capture problem rather than a network one — see [black screen](/docs/troubleshooting/black-screen/).
 - **Antivirus blocked the download.** Installers are served through `roomler.ai` rather than GitHub precisely so corporate allow-lists can trust one origin. If yours blocks it, allow-list `roomler.ai` and retry.

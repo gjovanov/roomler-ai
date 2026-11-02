@@ -22,6 +22,9 @@ agents/roomlerd/packaging/macos/*.plist text eol=lf
 agents/roomlerd/packaging/linux/*.service text eol=lf
 scripts/*.sh text eol=lf
 scripts/aws-testbox/*.sh text eol=lf
+# FR-63's shadow report is shipped to mars and run there, by node or mongosh;
+# a `#!/usr/bin/env node\r` shebang would not run it directly on Linux/macOS.
+scripts/*.cjs text eol=lf
 
 # The sanitisation guard runs on Linux CI; a CRLF shebang would break it.
 .claude/skills/sanitize-hostnames/*.sh text eol=lf

@@ -359,6 +359,11 @@ pub async fn run_with_audio(
     }
 
     // ── the first frame decides the size ────────────────────────────────────
+    // A capturer that could not open knows why. Waiting for a frame it will
+    // never give would only turn that into "no frame", ten seconds later.
+    if let Some(why) = capturer.unavailable() {
+        return Err(refuse(StartRefusal::NoFrame, why.detail.clone()));
+    }
     let first = tokio::time::timeout(opts.first_frame_timeout, async {
         loop {
             match capturer.next_frame().await {

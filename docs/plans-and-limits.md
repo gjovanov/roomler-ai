@@ -241,7 +241,10 @@ Each fence now has an integration test on a server without `saas`.
 
 ## 8. Not built yet
 
-- **What one meeting room carries is published, not measured** (FR-115 O4). Pro's 50 and
-  Business's 100 people stand until a synthetic-participant load test measures what one
-  mediasoup worker's room holds. Then either a room spans workers, or the published numbers
-  come down to the measured one.
+- **A meeting room carries fewer people than Pro and Business sell** (FR-115 O4, measured
+  2026-10-26 with production's worker settings and codecs): one room is one mediasoup worker,
+  which delivers to about 20 people with cameras on, or about 40 on audio alone, against Pro's
+  50 and Business's 100. On 2026-10-27 the operator chose to scale the room rather than lower
+  the numbers. [FR-127](fr/FR-127-meeting-room-scales-past-one-worker.md) builds it (receiving
+  only the visible tiles, simulcast, a room across workers) and measures again, and the
+  published caps follow that measurement. Until then they stand as published.

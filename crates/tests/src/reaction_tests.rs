@@ -109,6 +109,8 @@ async fn duplicate_reaction_fails() {
         .unwrap();
 
     assert_eq!(resp.status().as_u16(), 409);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["message"], "Already reacted with this emoji");
 }
 
 #[tokio::test]

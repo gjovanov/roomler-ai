@@ -104,6 +104,16 @@ pub enum Vp9Chroma {
 }
 
 impl Vp9Chroma {
+    /// #3267 — whether `deny` names libvpx in this chroma.
+    fn denied_by(self, deny: &[String]) -> bool {
+        use roomler_ai_remote_control::models::ChromaFormat;
+        let chroma = match self {
+            Self::Yuv420 => ChromaFormat::Yuv420,
+            Self::Yuv444 => ChromaFormat::Yuv444,
+        };
+        crate::encode::cells::cell_denied(deny, crate::encode::cells::LIBVPX_VP9, chroma)
+    }
+
     /// libvpx `g_profile` value (0 or 1).
     pub fn vpx_profile(self) -> c_uint {
         match self {
@@ -193,6 +203,15 @@ impl Vp9Encoder {
     ) -> Result<Self> {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("vp9-444: require non-zero, even dimensions, got {width}x{height}");
+        }
+        // #3267 — software, but a cell like any other: if an open of it ended
+        // the probe's child it would end the daemon's session too.
+        if chroma.denied_by(&crate::encode::cells::denied_cells()) {
+            bail!(
+                "{}:{} is on the device denylist",
+                crate::encode::cells::LIBVPX_VP9,
+                chroma.as_str()
+            );
         }
         let target_fps = target_fps.clamp(1, 240);
 
@@ -993,6 +1012,17 @@ mod tests {
             damage: crate::capture::Damage::Unknown,
             source: None,
         }
+    }
+
+    /// #3267 — a denylist that names one chroma form leaves the other. Pure on
+    /// purpose: other tests here open both forms unlocked, so this one must
+    /// not put either on the process-wide list.
+    #[test]
+    fn a_denylist_names_one_chroma_form() {
+        let deny = vec!["vp9_libvpx:yuv444".to_string()];
+        assert!(Vp9Chroma::Yuv444.denied_by(&deny));
+        assert!(!Vp9Chroma::Yuv420.denied_by(&deny));
+        assert!(!Vp9Chroma::Yuv444.denied_by(&[]));
     }
 
     /// First-frame keyframe lock. With profile 1 + I444 + lag=0 the

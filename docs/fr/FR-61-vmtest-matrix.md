@@ -102,7 +102,7 @@ COW-clone golden image → boot → SSH in
   must fetch from the server under test, never from the repo.
 - **MSI**: two products (perUser task-autostart, `agents/roomlerd/wix/main.wxs`; perMachine SCM
   service, `agents/roomlerd/wix-perMachine/main.wxs`); the third type is the property flip
-  `ENABLE_SYSTEM_CONTEXT=1` — the **only** public property (`wix-perMachine/main.wxs:426`).
+  `ENABLE_SYSTEM_CONTEXT=1` — the **only** public property (`wix-perMachine/main.wxs:432`).
   Enrollment is always post-MSI (`roomlerd enroll`, `--machine-global` for the machine
   flavours); the perMachine service auto-starts at install, so the ephemeral enroll may need a
   stop-enroll-start dance (`enroll --ephemeral` refuses if a config exists —

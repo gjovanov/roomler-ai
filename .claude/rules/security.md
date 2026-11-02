@@ -39,6 +39,12 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   `Forbidden("Not a member of this room")` is the same shape and must not evict
   anyone from their org. ⚠️⚠️ An unclassified 403 does nothing but throw, so a
   newly-gated route is inert on the client by construction.
+- **A client never reads the database's words.** `DaoError::DuplicateKey` holds
+  MongoDB's text and always answers `That already exists`; a sentence written for the
+  person is `DaoError::Conflict`. ⚠️ Don't pass `msg` through to "keep the detail": it
+  names the database, the index and the value, and the log already keeps where it
+  collided (`duplicate_key_site`). ⚠️ A client reads the status or a code, never
+  `message`: three organization forms once matched `E11000`.
 - **A system-managed role is reconciled, not frozen at its birthday** — one
   `role::MANAGED_ROLES` table, reconciled at boot under the startup lease.
   ⚠️⚠️ **Additive (`stored | definition`), never a replace** — a managed mask *is*
@@ -55,6 +61,12 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   one-sided `email_verified` check — that state left both the reservation and the
   unactivated-signup paths open. ⚠️ Microsoft is the only provider that is *always*
   unverified.
+- **An open form that mails whoever its body names answers before it looks.**
+  `POST /api/auth/resend-activation` gives one 202 for every address, and
+  `accept_resend` is deliberately not `async`, so neither the bytes nor the latency
+  can depend on the row. The per-account cooldown is silent: a 429 there would fire
+  only for an address with an account. Detaching just the mail is not enough, because
+  a known address also costs more Mongo round trips.
 - **Agent tokens are status-checked on every use** via
   `crates/api/src/extractors/agent.rs::AuthAgent`. ⚠️ A lookup **failure is 500, not
   401** — a Mongo blip must not tell a healthy fleet its credentials were revoked,

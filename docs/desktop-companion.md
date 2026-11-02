@@ -353,7 +353,7 @@ sequenceDiagram
   `ConfigSet` are refused on the person socket, so Settings edits the per-user half's own
   file — and says so (§5). The same socket does tell the companion, and the CLI's
   `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:4592`), that a root half exists: `/var/run/roomler` is
+  `crates/localapi/src/lib.rs:4627`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
@@ -399,7 +399,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:1774`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:1800`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -457,7 +457,7 @@ root half with no GUI session) shows no card.
 
 macOS's own **Quit & Reopen** restarts the agent too (`agents/roomlerd/src/macos_quit.rs`): a
 Quit AppleEvent from anyone but `loginwindow` ends it with the supervisor's restart code instead
-of AppKit's exit 0. Up to 0.4.188 that button left the agent offline (`docs/installation.md`,
+of AppKit's exit 0. Up to 0.4.189 that button left the agent offline (`docs/installation.md`,
 the macOS grants).
 
 ## 8. What this device can encode
@@ -468,7 +468,7 @@ the software encoders — with the chroma each cell produced (4:2:0 / 4:4:4), de
 struck through, and how long the probe took.
 
 - It asks `Request::EncoderCaps`, which answers from the probe's **cached** result only
-  (`caps::cached()`, `agents/roomlerd/src/encode/caps.rs:48`). The capability probe runs in
+  (`caps::cached()`, `agents/roomlerd/src/encode/caps.rs:68`). The capability probe runs in
   child processes (vendor driver code) at the first server hello; a control-surface poll
   must never be what launches it — locked by `not_probed_never_triggers_a_probe`.
 - Three states: `ready` (the matrix), `not_probed` (the daemon has not connected yet — the
@@ -676,7 +676,9 @@ tries first:
 - it serves the safety surface: status, the sessions viewing the screen, their Disconnect,
   consent, the recording state and keep busy (FR-92); and, since FR-97 P2g, the Devices page
   and the mesh, read-only (§6); since P2h, the peers too, without the endpoints of either end
-  or of a relay, the carrier snapshot, the path decision or the probes (`localapi::person_view`).
+  or of a relay, the carrier snapshot, the path decision or the probes (`localapi::person_view`);
+  and since FR-85 P2e, recording: the Recordings view's start, stop, list and delete, and the
+  **Stop recording** on the banner and the tray.
 
 Everything else on it is refused with a pointer to `sudo roomler …`, so the companion's other
 views show that refusal on a system install. The kill switch is `ROOMLERD_PERSON_SOCKET=0`.
@@ -705,8 +707,8 @@ registered the moment it connects, and the banner used to come up then. It said 
 while nothing was shared yet. On a desktop that centres new windows, it also sat right over the
 dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat beside the
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
-dialog is the wait (`agents/roomlerd/src/peer.rs:5612`, `AskingMark`
-`agents/roomlerd/src/rc_sessions.rs:42`). The LocalAPI row carries the mark (`asking`,
+dialog is the wait (`agents/roomlerd/src/peer.rs:5744`, `AskingMark`
+`agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
 `crates/localapi/src/lib.rs:1207`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:325`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
@@ -836,7 +838,7 @@ step differently:
 
 | OS | How the companion ships | What moves it with the daemon |
 |---|---|---|
-| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1139`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
+| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1162`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
 | macOS | inside the daemon's `.pkg` (`/Applications/Roomler.app`) | the same `.pkg`: one install moves both |
 | Linux | its own `.deb`, or `.rpm` (§10.1) | FR-117 P1: the root update owner moves the package (`companion/package_sync.rs`) |
 

@@ -406,7 +406,7 @@ the device row as the fleet keeps it.
 | `overlay.ipv4` | the address the device leases on the organization's overlay | while it holds a live overlay node |
 | `overlay.name` | its name there, the MagicDNS label, as the device list shows it | while the node has a label (every node since names) |
 | `overlay.magicdns` | `<label>.<domain>`, the name the device list shows ([`mirror`](../crates/modules/knowhow/src/sync.rs#L222)) | while the organization has a MagicDNS domain |
-| `overlay.routes` | the subnets it carries for its peers: approved by an admin **and** still offered by the device ([`effective_routes`](../crates/remote_control/src/models.rs#L6905)), the default route apart; at most 64 | while it holds a node (`[]` for none) |
+| `overlay.routes` | the subnets it carries for its peers: approved by an admin **and** still offered by the device ([`effective_routes`](../crates/remote_control/src/models.rs#L6971)), the default route apart; at most 64 | while it holds a node (`[]` for none) |
 | `overlay.exit` | whether it carries the default route `0.0.0.0/0` for the peers that choose it, approved and still offered | while it holds a node |
 | `tunnel.routes` | the subnets it is a gateway for in the tunnel mesh, as an admin set them | always (`[]` for none); at most 64 |
 | `ssh.server` | whether its build serves roomler SSH: the `ssh` verb it advertises, matched whole | always |
@@ -661,7 +661,7 @@ flowchart TD
 | the key | `knowhow_scan_roots`: comma-separated absolute paths, set in the device's config or over the LocalAPI, `roomler config set knowhow_scan_roots …` ([`config_surface`](../crates/agent-core/src/config_surface.rs#L552)). A folder is walked for its checkouts; a file is read as a kubeconfig (decision 46) |
 | empty | nothing is read: the answer is `no_roots` |
 | live | read from the config file again at each scan, under the LocalAPI's write lock ([`read_config`](../agents/roomlerd/src/hive/knowhow/mod.rs#L523)): an edit takes the next scan, with no restart |
-| whose | the device's: absent from `DesiredConfig`, and named in the test that keeps every device-owned key out of it ([`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9641)) |
+| whose | the device's: absent from `DesiredConfig`, and named in the test that keeps every device-owned key out of it ([`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9779)) |
 | the listeners | P4-3b-3: `knowhow_scan_listeners`, off by default, live and the device's like the roots ([`config_surface`](../crates/agent-core/src/config_surface.rs#L562)). Nothing listed at all, neither a root nor the listeners, is `no_roots` |
 
 **Whose eyes** ([`whose`](../agents/roomlerd/src/hive/knowhow/owner.rs#L78)).
@@ -783,7 +783,7 @@ each root not read and why, and counts what was dropped.
 > A scan runs off the signaling loop, one at a time, and the last 16 answers are kept, so a scan
 > delivered again after a lost connection is answered from what it found, never run twice. The
 > verb is advertised by every Linux and macOS build carrying `hive`
-> ([`rpc_caps`](../agents/roomlerd/src/encode/caps.rs#L2573)), whatever its roots say: an empty
+> ([`rpc_caps`](../agents/roomlerd/src/encode/caps.rs#L4383)), whatever its roots say: an empty
 > list is an answer.
 
 ## 12. A session's questions (P4-4-1)
@@ -1219,14 +1219,23 @@ flowchart TD
     T -->|no TLS there| FL["failed"]
 ```
 
-| Rule ([`measure`](../agents/roomlerd/src/hive/knowhow_probe.rs#L257)) | Why |
+| Rule ([`measure`](../agents/roomlerd/src/hive/knowhow_probe.rs#L330)) | Why |
 |---|---|
 | a name is resolved here, and **every** address is checked before any connect; one never-probed address refuses the whole probe | a name that points at a metadata service is not one to reach through its other addresses |
 | a connect goes only to an address that passed, the first that answers | a name that resolves elsewhere by the time of the connect reaches nothing new |
 | an address rule holds addresses, a name rule matches the name asked for ([`allows`](../crates/agent-core/src/probe_reach.rs#L181)) | listing `db.example.com` trusts that name's resolution; listing `10.0.0.0/8` trusts no name |
 | `tcp`: a connect and a close, not a byte sent | connect, never converse (decision 55) |
-| `tls`: a ClientHello, the leaf certificate read, the handshake signature checked (so the server holds the key of the certificate recorded), the chain neither trusted nor refused ([`SeeOnly`](../agents/roomlerd/src/hive/knowhow_probe.rs#L475)) | a private CA is what an organization's own services have; a probe says what the address presents |
+| `tls`: a ClientHello, the leaf certificate read, the handshake signature checked (so the server holds the key of the certificate recorded), the chain neither trusted nor refused ([`SeeOnly`](../agents/roomlerd/src/hive/knowhow_probe.rs#L544)) | a private CA is what an organization's own services have; a probe says what the address presents |
 | ten seconds for the whole probe; a probe id run once, and one sent again answered as it was | the server sends a probe again at a hello while it is unanswered |
+
+**Where it runs (FR-90 P8-2d-1).** Where the device's owner turned workers on (`hive_worker`), in a
+build with the vault, the measure runs in the device's worker, not the daemon: what it parses comes
+from a host the probe reached, and a fault in it costs that worker. The daemon keeps the prober: what
+it was asked, the answers it gave, the list above read under the config's lock, and the frame. The
+answer is the same word for word. A worker that cannot take a probe answers `failed`, the detail
+saying why (parked, not up within 10 s, lost during the probe), so it records nothing on a fact
+(§13.1), and it is never measured in the daemon instead. Someone asks again under a new id. The
+states: [`hive.md`](hive.md#the-devices-worker-fr-90-p8-2d-1).
 
 > [!WARNING]
 > **Link-local and the cloud metadata addresses are never reached, whatever

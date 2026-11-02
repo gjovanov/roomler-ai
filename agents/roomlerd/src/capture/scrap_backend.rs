@@ -146,6 +146,12 @@ impl ScrapCapture {
         thread::Builder::new()
             .name("roomlerd-capture".into())
             .spawn(move || {
+                // FR-112 P3 — the frame's bytes leave CoreGraphics on this
+                // thread, on every frame's path, and Apple silicon's efficiency
+                // cores are the same trap as the encoder's. This arm stays as it
+                // was on Linux and Windows, which FR-112 measured without it.
+                #[cfg(target_os = "macos")]
+                crate::encode::clock::ask_for_this_thread("capture");
                 // macOS — a sleeping display composites nothing, so a stream
                 // opened on it never delivers a frame and the viewer hangs up
                 // (`power::DisplayAwake`). Taken here, on the thread that owns

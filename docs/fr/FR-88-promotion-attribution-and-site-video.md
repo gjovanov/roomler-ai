@@ -1,8 +1,8 @@
 # FR-88: Measure what promotion brings — attribution to an activated device, a link hub, and video on the site
 
-**Issue:** [#1790](https://github.com/gjovanov/roomler-ai/issues/1790) · **Status:** P1 merged 2026-09-30, not yet
-promoted: P1a, the server half, in #1800 (`ca755310e`); P1b, the site and SPA half, in #1798. P0 merged
-2026-09-29 (#1791); P2–P4 not started · **Owner:** web / public site + auth · **Anchors:** master `9ddf0aa6b` ·
+**Issue:** [#1790](https://github.com/gjovanov/roomler-ai/issues/1790) · **Status:** in progress. P0–P3 merged
+and promoted; P4's docs written. 9 of 12 criteria met; AC3, AC8 and AC10 are open (§5) · **Owner:**
+web / public site + auth · **Anchors:** master `9ddf0aa6b` ·
 **Builds on:** [FR-87](FR-87-blog-and-google-indexing.md) (the static site, purestat on every page),
 [FR-60](FR-60-public-docs-site.md) (the generator), [FR-39](FR-39-launch-readiness.md) (`subscribers.source`)
 
@@ -207,6 +207,8 @@ sequenceDiagram
   `ui/src/assets/tutorial/`, which the docs build already searches and the SPA imports from.
 - **Docs only** get `:::video <id>`; the blog's `video:` front-matter key is not built. A post
   can use the container, but adds no `VideoObject` yet.
+- **`/links/` got no facade.** §3d's featured video on the hub was not built: the hub stays a
+  list of links.
 - **Proof:** the built site served locally, YouTube blocked at the browser: 0 requests to a
   YouTube host before the click, then `youtube-nocookie.com/embed/<id>` on the click, on the
   homepage and the docs page (`ui/docs/__tests__/video.spec.ts` runs `docs.js` the same way).
@@ -218,53 +220,103 @@ sequenceDiagram
 | P0 | claim: issue #1790, this spec, the ledger row | docs only | **merged** #1791 `91c02f6f5` |
 | P1a | the server half of §3a — `RegisterRequest.attribution`, the `utm_*` query on `GET /api/oauth/{provider}` and its Redis parking spot, `users.signup_attribution` — and the §3c view | the SPA omits `attribution`; the view is platform-admin only | **merged** #1800 `ca755310e`, promoted `hosted-20260930-60fe7a7` |
 | P1b | the site and SPA half of §3a (the shell script, the register view and its select, the provider buttons, the newsletter form), the goals (§3b), the privacy-policy section, and the `/landing` and `/pricing` redirects in nginx that now keep the query | `ATTRIBUTION_ENABLED = false` in `ui/src/utils/attribution.ts`; `ANALYTICS = null` | **merged** #1798 `78a2ea096`, promoted `hosted-20260930-60fe7a7` |
-| P2 | `/links/` and the short paths (§3d) | remove the locations and the page | PR open |
-| P3 | video on the site (§3e, as built below it): the homepage, `/docs/start/what-is-roomler/`, the SPA landing and the tutorial's first chapter, with `docs/public-site.md` §7 | empty manifest; revert `frame-src` | PR open |
-| P4 | docs: `docs/public-site.md` gains the attribution flow, the link hub and the video facade, with mermaid; the field log | — | — |
+| P2 | `/links/` and the short paths (§3d) | remove the locations and the page | **merged** #1803 `1dd1d08be`, promoted `hosted-20261001-37fa997`; X took Instagram's place in #2007 `405e5724d`, promoted `hosted-20261011-ffa860c` |
+| P3 | video on the site (§3e, as built below it): the homepage, `/docs/start/what-is-roomler/`, the SPA landing and the tutorial's first chapter, with `docs/public-site.md` §7 | empty manifest; revert `frame-src` | **merged** #2262 `1c76d5fb4`, promoted `hosted-20261015-75a88bf` |
+| P4 | docs: `docs/public-site.md` gains the attribution flow (§9) and the link hub (§10), beside the video facade (§7), with mermaid; the field log; and the privacy policy's click-to-load paragraph, which §3e asked of P3 | revert the paragraph | written; the paragraph reaches production with the next promote |
 
 **Deploy order:** P1 is promoted before the first video is published, so the first posts are
 measured from their first view. Each phase is its own promote.
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1:** a production visit to `/?utm_source=youtube&utm_medium=video&utm_campaign=fr88-test`
+- [x] **AC1:** a production visit to `/?utm_source=youtube&utm_medium=video&utm_campaign=fr88-test`
   appears under that campaign in purestat's stats API. A visit without UTM appears as direct
   (control).
-- [ ] **AC2:** an email sign-up on a local dev server, reached through a UTM landing, stores
+  **Met 2026-10-31 on real traffic instead of the `fr88-test` probe,** which would have added a
+  fake YouTube visit to the data this FR is judged on: §8's 2026-10-31 row, after the data-level
+  read in [the 2026-09-30 step log](https://github.com/gjovanov/roomler-ai/issues/1790#issuecomment-5920437758).
+- [x] **AC2:** an email sign-up on a local dev server, reached through a UTM landing, stores
   `signup_attribution` with those values. The same sign-up without UTM stores none (control). The
   field is absent from every user-facing response.
-- [ ] **AC3:** an OAuth sign-up on local dev (one provider), reached through a UTM landing, stores the
+  **Met on production, which is stronger than local dev:** the operator's two tagged email sign-ups
+  stored their values ([FR-102 §8](FR-102-growth-observability.md), 2026-10-18), and §8's
+  2026-10-31 row reads the rest. The field's absence is
+  `the_attribution_reaches_no_user_facing_response`, green on
+  [master](https://github.com/gjovanov/roomler-ai/actions/runs/41193085304).
+- [~] **AC3:** an OAuth sign-up on local dev (one provider), reached through a UTM landing, stores the
   same values. The Redis key is gone after the callback and expires after 600 s if the callback
   never comes. No new cookie is set (response-header diff against master). An expired key still
   logs the user in.
-- [ ] **AC4:** no attribution value is written to cookies, localStorage or sessionStorage on `/`, a
+  **Proven in parts.** The parking, its TTL, the read-and-delete, the one cookie and a sign-in with
+  no key are `oauth_redirect_parks_the_attribution_under_the_csrf_state_with_no_new_cookie`,
+  `oauth_attribution_is_applied_only_when_the_account_is_created` and
+  `oauth_completion_redirects_with_a_signup_marker_and_no_token`, green on
+  [master](https://github.com/gjovanov/roomler-ai/actions/runs/41193085304). On production, tagged
+  starts reach `/api/oauth/google` ([FR-102 §8](FR-102-growth-observability.md), 2026-10-18) and
+  provider sign-ups create accounts. **Owed:** one run end to end, which takes a provider identity
+  with no Roomler account, through a tagged link. An existing identity just signs in and stores
+  nothing, which is correct and looks like a failure.
+- [x] **AC4:** no attribution value is written to cookies, localStorage or sessionStorage on `/`, a
   docs page, a blog post, `/links/` or the register page (a Playwright check over all five).
-- [ ] **AC5:** `GET /api/admin/stats/attribution` returns signups and activated signups by source for
+  **Met 2026-10-30:** one Playwright pass over all five on production, §8.
+- [x] **AC5:** `GET /api/admin/stats/attribution` returns signups and activated signups by source for
   a platform admin, and 404 for anyone else. With `fleet` unmounted, `activated` is `null`.
-- [ ] **AC6:** a scripted pass records exactly one event for each of the four purestat goals, and zero
+  **Met:** a platform admin's 200 with those fields on production
+  ([step log](https://github.com/gjovanov/roomler-ai/issues/1790#issuecomment-5915258939)). A
+  signed-in non-admin's 404 and the `null` are `admin_attribution_view_counts_signups_and_activations`
+  and `admin_attribution_view_reports_null_activation_without_fleet`, green on
+  [master](https://github.com/gjovanov/roomler-ai/actions/runs/41193085304). Anonymous gets the auth
+  layer's 401, like every sibling.
+- [x] **AC6:** a scripted pass records exactly one event for each of the four purestat goals, and zero
   with `ANALYTICS = null` (control).
-- [ ] **AC7:** `curl -sI https://roomler.ai/yt` (and `/tt`, `/x`, `/fb`) returns a 302 whose relative
+  **Met 2026-10-31:** a scripted pass over the served production pages, with and without the
+  tracker, §8. That `ANALYTICS = null` leaves the tracker off every page is
+  `ui/docs/__tests__/analytics-off.spec.ts`.
+- [x] **AC7:** `curl -sI https://roomler.ai/yt` (and `/tt`, `/x`, `/fb`) returns a 302 whose relative
   `Location` is `/links/` with that channel's `utm_source`, `utm_medium=bio` and
   `utm_campaign=profile`, and no SPA route answers any of those paths. `/links/` answers 200 with the
   hub and `/links` a 301 to it. Checked by `scripts/public-site-smoke.sh` §5c, shown failing on the
   deploy before P2 (§8).
-- [ ] **AC8:** a blog post with `video:` makes no request to a YouTube host before the click (network
+  **Met:** red then green on production for P2
+  ([step log](https://github.com/gjovanov/roomler-ai/issues/1790#issuecomment-5925427841)) and for
+  X (§8, 2026-10-11 and -12), and still green on 2026-10-30 (§8).
+- [~] **AC8:** a blog post with `video:` makes no request to a YouTube host before the click (network
   log), plays after it, passes the Rich Results Test with a `VideoObject`, and keeps Lighthouse at
   100 in all four categories. A `video:` id missing from the manifest fails the build, shown failing
   and then passing.
-- [ ] **AC9:** the served CSP carries `frame-src https://www.youtube-nocookie.com` on the SPA, a docs
+  **Partly met, by the docs container only.** `:::video` on a docs page makes no request to a
+  YouTube host before the click and plays after it
+  ([step log](https://github.com/gjovanov/roomler-ai/issues/1790#issuecomment-6203128624)). The
+  blog's `video:` key is not built (§3e, as built), and the Rich Results Test, Lighthouse and the
+  build gate's red have not been read. What happens to this criterion is the operator's to decide.
+- [x] **AC9:** the served CSP carries `frame-src https://www.youtube-nocookie.com` on the SPA, a docs
   page and a post, every other security header is unchanged (header diff), and a remote-control
   session still connects with its loopback probes unblocked.
-- [ ] **AC10:** the privacy policy names the attribution fields, their purpose and retention, and the
+  **Met:** `frame-src` before and after, and `connect-src` byte-identical on the remote-control page
+  ([step log](https://github.com/gjovanov/roomler-ai/issues/1790#issuecomment-6203128624)). The SPA,
+  a docs page, a post and the header diff are §8's 2026-10-30 row. A real remote-control session
+  under this policy connected with 0 violations
+  ([#1100](https://github.com/gjovanov/roomler-ai/issues/1100#issuecomment-6256710513)).
+- [~] **AC10:** the privacy policy names the attribution fields, their purpose and retention, and the
   click-to-load embed.
-- [ ] **AC11:** docs updated with mermaid diagrams (`docs/public-site.md`: the attribution flow, the
+  **Partly met.** Section 2.16 names the fields, the purpose and the retention, on production since
+  P1b. The embed was missing (§8, red on 2026-10-30). P4 adds it to section 2.17; tick this when
+  production serves it.
+- [x] **AC11:** docs updated with mermaid diagrams (`docs/public-site.md`: the attribution flow, the
   link hub, the video facade) and indexed in `docs/README.md`.
-- [ ] **AC12:** the SPA's old marketing routes keep a campaign: on production,
+  **Met:** [`docs/public-site.md`](../public-site.md) §9 (the attribution flow), §10 (the link hub)
+  and §7 (the video facade), each with its diagram, and its row in [`docs/README.md`](../README.md).
+- [x] **AC12:** the SPA's old marketing routes keep a campaign: on production,
   `/pricing?utm_source=x` answers `301` to `/?utm_source=x#pricing` and `/landing?…` to `/?…`,
   and without a query both answer exactly as before (`/#pricing`, `/`). Checked by
   `scripts/public-site-smoke.sh`, shown failing on the deploy before P1b (§8).
+  **Met:** red then green on production
+  ([step log](https://github.com/gjovanov/roomler-ai/issues/1790#issuecomment-5915258939)), and
+  still green on 2026-10-30 (§8).
 
 ## 6. Open decisions
+
+Decisions 1–3 shipped with their defaults in P1. Decision 4 is open.
 
 1. **Where the OAuth attribution waits:** the existing Redis with a 600 s TTL (default), or a Mongo
    collection with a TTL index.
@@ -296,6 +348,8 @@ measured from their first view. Each phase is its own promote.
 | 2026-09-30 | production, before P2 (`hosted-20260930-e7e7fad`, `/health` 0.4.114) | AC7's red run: `scripts/public-site-smoke.sh https://roomler.ai` with the §5c block P2 adds | **fails as expected**: `/yt`, `/tt`, `/ig` and `/fb` each answer **200 with the SPA shell** (a soft 404), `/links` answers 200 instead of a 301, `/links/` is not the hub, and `/links/fr88-smoke-missing/` answers 200. The same smoke against the P2 build, served by `files/nginx-pod.conf` in `nginx:stable` (Docker): every check green, `nginx -t` clean, and each short path answers `302 Location: /links/?utm_source=<channel>&utm_medium=bio&utm_campaign=profile` |
 | 2026-10-11 | production, before #2007 (`hosted-20261011-9443077`, `/health` 0.4.126) | the red run for X taking Instagram's place (`/ig` → `/x`): `scripts/public-site-smoke.sh https://roomler.ai` with #2007's §5c pairs | **fails as expected**: `/x -> 200`, the SPA shell answering; `/yt`, `/tt` and `/fb` 302 to `/links/`; no other check red |
 | 2026-10-12 | production, after #2007 (`hosted-20261011-ffa860c`, promoted 2026-10-11 20:48Z, `/health` 0.4.127) | the same smoke, from master | **passes**, every check: `/x` → `302 Location: /links/?utm_source=x&utm_medium=bio&utm_campaign=profile`. `/ig` now answers 200 with no redirect, as the both-ways rule requires. `/links/` lists YouTube, TikTok, X (@roomler_ai) and Facebook, with no instagram.com link left |
+| 2026-10-30 23:10–23:30Z | production `hosted-20261030-9336d4b` (`/health` 0.4.189) | the smoke (AC7, AC12); the served headers (AC9); a Playwright pass over the five pages (AC4); the served privacy policy (AC10) | **Green, and one red.**<br>• **Smoke:** `scripts/public-site-smoke.sh https://roomler.ai` passes every check.<br>• **AC9:** `/login`, `/docs/start/what-is-roomler/`, a post and `/` each serve `frame-src https://www.youtube-nocookie.com`, with the same security headers on all four. The pod's seven headers are byte-identical to master's `files/security-headers.conf`, and P3's diff (`1c76d5fb4`) changed only the CSP line and its comments.<br>• **AC4:** six tagged parameters on all five pages in one browser: 0 attribution values, no storage key and no cookie at all. Each page carried the campaign onto its own links (14, 16, 9, 6 and 1), so its script saw the query. purestat's tracker was requested and aborted on each page, a planted value was seen in all three stores, and the tracker's source only reads one opt-out flag.<br>• **AC10's red:** the served `PrivacyPolicyView` chunk holds 2.16's phrases and nothing about the embed (`youtube-nocookie`, `press play` and `embedded`, 0 each) |
+| 2026-10-31 17:39–17:55Z | production `hosted-20261031-28dfd72` (`/health` 0.4.190); read-only, bounded Mongo | AC1, AC2, AC3 and AC6; whether an attributed account has reached a device | **Green on the mechanism; the goal has no field datum yet.**<br>• **AC1:** `growth_digests` holds the server's own reads of purestat's query API for 2026-10-13…10-30. On 17 of those 18 days the campaign rows are measured: real visits under `youtube/video/<campaign>`, and under LinkedIn, Facebook, X and `chatgpt.com`. Every day has a `direct` channel (the control).<br>• **AC2:** among accounts created since P1's promote, the field exists only on those that came through a tagged link or answered the question, one of them an organic `utm_source=chatgpt.com` sign-up. Every other account has no key (the control).<br>• **AC3:** no provider account carries the field. That is what the carry predicts unless a tagged visitor picks a provider, so it proves nothing either way, and the criterion stays open.<br>• **AC6:** the real tracker on the served pages, every beacon caught in the browser, the two writes stubbed (no account, no subscriber, no purestat row): exactly 1 `install-copy`, `github-outbound`, `subscribe` and `signup`. With the tracker blocked: 0 of each, and all four flows still complete. The same digests show all four goals on real traffic, `subscribe` included.<br>• **The goal:** every account carrying `signup_attribution` was created before the activation link worked (#3029, fixed by #3041, on production from `hosted-20261029-2ae4ffd`), so none could sign in, make an org or enroll a device. The same join finds orgs for other accounts, so the zero is real. No email sign-up has happened since the fix, and one that misses the 5-minute link is still locked out (#3199).<br>• `mongodb-0` shows no new restart after the reads |
 
 ## 9. Related
 
@@ -304,3 +358,8 @@ measured from their first view. Each phase is its own promote.
 - [FR-39](FR-39-launch-readiness.md): `subscribers` and its `source`.
 - [FR-69](FR-69-modular-monolith.md): the composition baseline and the host-owned views.
 - [FR-85](FR-85-hq-screen-recording.md) (#1634): the recorder the videos are made with.
+- [FR-91](FR-91-scheduled-blog-publishing.md) (#1880): §3e, the organic carry for a post reached from
+  another site.
+- [FR-102](FR-102-growth-observability.md) (#2127): the Campaigns tab, this account plane beside
+  purestat's web plane.
+- #3029 and #3199: why an email sign-up could not activate, and what still locks one out.

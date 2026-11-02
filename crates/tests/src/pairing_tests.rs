@@ -1354,3 +1354,38 @@ async fn malformed_requests_are_refused_with_400() {
     .await;
     assert_eq!(status, 401);
 }
+
+/// AC7 — a poll after a delivery answers like a swept row and is on the trail
+/// once per address per hour, however often it repeats. Only the loser of a
+/// race wrote this row before; a poll that came in afterwards wrote nothing.
+#[tokio::test]
+async fn a_poll_after_a_delivery_is_refused_and_on_the_trail_once() {
+    let app = app_fast().await;
+    let org = app.seed_tenant("pairgone").await;
+    let (device_code, user_code) = start_daemon(&app).await;
+    let (status, approved) =
+        approve(&app, &org.admin.access_token, &user_code, &org.tenant_id).await;
+    assert_eq!(status, 200, "{approved}");
+
+    let (status, polled) = poll(&app, &device_code).await;
+    assert_eq!(status, 200, "{polled}");
+    assert_eq!(polled["status"], "approved");
+    assert!(
+        audit(&app, "refuse", "refused:already_delivered")
+            .await
+            .is_empty(),
+        "the delivery itself refuses nobody"
+    );
+
+    for _ in 0..3 {
+        let (status, polled) = poll(&app, &device_code).await;
+        assert_eq!(status, 200, "{polled}");
+        assert_eq!(polled, json!({ "status": "expired_token" }));
+    }
+    assert_eq!(
+        audit(&app, "refuse", "refused:already_delivered")
+            .await
+            .len(),
+        1
+    );
+}

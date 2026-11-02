@@ -80,6 +80,7 @@ import {
   isDeadAir,
   agentIsWaiting,
   advanceEndsWait,
+  mediaStopAfterTick,
   waitKeptAcrossReconnect,
   isKeptSleepNotice,
   mediaWaitingCopy,
@@ -135,6 +136,7 @@ import {
   localRelayIceServer,
   localRelayPlan,
   withLocalRelays,
+  withSessionIceServers,
   parseStoredThisDevices,
   readStoredThisDevices,
   persistThisDevices,
@@ -155,6 +157,9 @@ import {
   storedDecodePref,
   storedColorSpaceOverride,
   COLORSPACE_STORAGE_KEY,
+  storedDecodeRecover,
+  DECODE_RECOVER_STORAGE_KEY,
+  mediaAdvanced,
   storedCtxMode,
   storedPerFrameMsg,
   storedFlowParams,
@@ -5870,6 +5875,70 @@ describe('S3 resilience: sessionGateAllows', () => {
   })
 })
 
+describe('FR-135 R1 — the kill switch and what the watchdog counts', () => {
+  afterEach(() => {
+    localStorage.removeItem(DECODE_RECOVER_STORAGE_KEY)
+  })
+
+  it('is the key the spec names, on unless it says 0', () => {
+    expect(DECODE_RECOVER_STORAGE_KEY).toBe('roomler-rc-decode-recover')
+    expect(storedDecodeRecover()).toBe(true)
+    for (const raw of ['1', 'on', 'off', '']) {
+      localStorage.setItem(DECODE_RECOVER_STORAGE_KEY, raw)
+      expect(storedDecodeRecover(), raw).toBe(true)
+    }
+    for (const raw of ['0', ' 0 ']) {
+      localStorage.setItem(DECODE_RECOVER_STORAGE_KEY, raw)
+      expect(storedDecodeRecover(), raw).toBe(false)
+    }
+  })
+
+  it('stays on when storage cannot be read', () => {
+    const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new Error('denied')
+    })
+    expect(storedDecodeRecover()).toBe(true)
+    spy.mockRestore()
+  })
+
+  it('names a recovery as the decode stage on the wire', () => {
+    expect(decodeErrorStage('decode-recovering')).toBe('decode')
+    expect(decodeErrorWireMessage('vp9-444', 'decode-recovering', 'Decoding error.', 'vp09.01.10.08')).toEqual({
+      t: 'rc:decode-error',
+      stage: 'decode',
+      path: 'vp9-444',
+      codec: 'vp09.01.10.08',
+      error: 'Decoding error.',
+    })
+  })
+
+  const at = (rtpBytes: number, vp9Frames = 0, hevcFrames = 0) => ({ rtpBytes, vp9Frames, hevcFrames })
+
+  it('counts frames on a data-channel session, and RTP bytes no longer hold off the re-create', () => {
+    expect(mediaAdvanced(at(0, 10), at(0, 11), true)).toBe(true)
+    expect(mediaAdvanced(at(0, 0, 10), at(0, 0, 11), true)).toBe(true)
+    expect(mediaAdvanced(at(100, 10), at(200, 10), true)).toBe(false)
+    expect(mediaAdvanced(at(100, 0, 10), at(200, 0, 10), true)).toBe(false)
+  })
+
+  it('still counts RTP bytes before a first data-channel frame: an agent that ignores the channel sends RTP', () => {
+    expect(mediaAdvanced(at(100), at(200), true)).toBe(true)
+    expect(mediaAdvanced(at(100), at(100), true)).toBe(false)
+  })
+
+  it('judges a <video> fallback on RTP again once the path is down', () => {
+    // stopVp9_444Path zeroes the counter.
+    expect(mediaAdvanced(at(100, 10), at(200, 0), true)).toBe(true)
+    expect(mediaAdvanced(at(100, 10), at(100, 0), true)).toBe(false)
+  })
+
+  it('is the old rule under the kill switch', () => {
+    expect(mediaAdvanced(at(100, 10), at(200, 10), false)).toBe(true)
+    expect(mediaAdvanced(at(100, 10), at(100, 11), false)).toBe(true)
+    expect(mediaAdvanced(at(100, 10), at(100, 10), false)).toBe(false)
+  })
+})
+
 describe('S3 resilience: nextStallAction', () => {
   it('does nothing below the probe threshold', () => {
     for (let t = 0; t < RC_STALL_PROBE_TICKS; t++) {
@@ -5954,6 +6023,22 @@ describe('FR-93: an agent that says it cannot capture is believed', () => {
     expect(advanceEndsWait(true, since + RC_MEDIA_WAITING_SETTLE_MS - 1, since)).toBe(false)
     expect(advanceEndsWait(true, since + RC_MEDIA_WAITING_SETTLE_MS, since)).toBe(true)
     expect(advanceEndsWait(false, since + 5_000, since)).toBe(false)
+  })
+
+  // FR-135 R2 — the same race on the device's own stop: a frame it sent before
+  // stopping must not take down the sentence that says why the picture froze.
+  it('a frame the device sent before it stopped does not erase why it stopped', () => {
+    const stop = { title: 'This device\'s video encoder stopped.' }
+    const since = 10_000
+    // The tick that counted the last frames began before the stop arrived.
+    expect(mediaStopAfterTick(stop, true, 9_500, since)).toBe(stop)
+    // The worker's 1 s stats can carry them into the next interval as well.
+    expect(mediaStopAfterTick(stop, true, since + RC_MEDIA_WAITING_SETTLE_MS - 1, since)).toBe(stop)
+    // Past that, a frame is a picture that came after the stop.
+    expect(mediaStopAfterTick(stop, true, since + RC_MEDIA_WAITING_SETTLE_MS, since)).toBeNull()
+    // Nothing moved: it stands however long it has been.
+    expect(mediaStopAfterTick(stop, false, since + 60_000, since)).toBe(stop)
+    expect(mediaStopAfterTick(null, true, since + 60_000, since)).toBeNull()
   })
 
   // FR-93 P5b — the overlay says what the host waits for. GNOME's lock screen
@@ -6715,5 +6800,60 @@ describe('the record channel (FR-85 P3c)', () => {
     expect(opened).toEqual(['record'])
     // No PeerConnection (a create racing teardown): nothing to open it on.
     expect(openRecordChannel(null, {}, 'VIEW | RECORD')).toBeNull()
+  })
+})
+
+// FR-52 P5 (F3): an outsider's pre-fetch cannot be charged, because they are no
+// member of the device's org and never learn its ids. Relay bytes on those
+// credentials were counted as nobody's. `rc:ready` carries credentials the Hub
+// charged to the session's org, the device's, so an external viewer takes them
+// before the offer's first gathering.
+describe('withSessionIceServers', () => {
+  const preFetch: RTCConfiguration = {
+    iceServers: [
+      { urls: ['stun:stun.example:3478'] },
+      { urls: ['turn:coturn.example:3478'], username: '1792000000:uid', credential: 'uncharged' },
+    ],
+    bundlePolicy: 'max-bundle',
+  }
+  const charged = {
+    urls: ['turn:worker-b.example:3478', 'turn:worker-a.example:3478'],
+    username: '1792000000:uid:org-6a975e17971e2d55ddcdedb2',
+    credential: 'charged',
+  }
+
+  it("takes the session's credentials in place of the pre-fetch's and keeps every other setting", () => {
+    const stun = { urls: ['stun:stun.example:3478'] }
+    const out = withSessionIceServers(preFetch, [stun, charged])
+    expect(out.iceServers).toEqual([stun, charged])
+    expect(out.bundlePolicy).toBe('max-bundle')
+    expect(preFetch.iceServers).toHaveLength(2)
+  })
+
+  it('reads a turns: URL as TURN too', () => {
+    const tls = { ...charged, urls: ['turns:coturn.example:443?transport=tcp'] }
+    expect(withSessionIceServers(preFetch, [tls]).iceServers).toEqual([tls])
+  })
+
+  // Connecting uncharged beats not connecting: a frame that cannot relay must
+  // never take away the pre-fetch's TURN server.
+  it.each([
+    ['no list at all', undefined],
+    ['null', null],
+    ['not a list', { urls: ['turn:x'] }],
+    ['an empty list', []],
+    ['STUN only', [{ urls: ['stun:stun.example:3478'] }]],
+    ['TURN with no credential', [{ urls: ['turn:coturn.example:3478'], username: 'u' }]],
+    ['TURN with no username', [{ urls: ['turn:coturn.example:3478'], credential: 'c' }]],
+    ['an entry with no URLs', [{ urls: [], username: 'u', credential: 'c' }]],
+    ['entries that are not servers', ['turn:coturn.example:3478', null, 7]],
+  ])('leaves the pre-fetch in place on %s', (_name, servers) => {
+    expect(withSessionIceServers(preFetch, servers)).toBe(preFetch)
+  })
+
+  it('drops an unusable entry beside a usable one', () => {
+    expect(withSessionIceServers(preFetch, [null, charged, { urls: 'turn:x' }]).iceServers).toEqual([
+      charged,
+    ])
   })
 })

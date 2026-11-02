@@ -10,6 +10,7 @@ import {
   activateAccount,
   activationParams,
   rememberActivated,
+  requestActivationLink,
   wasActivated,
   type StorageLike,
 } from '@/utils/activation'
@@ -123,5 +124,30 @@ describe('activateAccount', () => {
     const f = respond(200)
     await Promise.all([activateAccount(PARAMS, f), activateAccount({ ...PARAMS, token: 'other12' }, f)])
     expect(f).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('requestActivationLink (#3199)', () => {
+  function respond(status: number) {
+    return vi.fn(async () => ({ ok: status >= 200 && status < 300, status }))
+  }
+
+  it('POSTs the address to the resend route and is `sent` on the server’s 202', async () => {
+    const f = respond(202)
+    expect(await requestActivationLink('person@example.com', f)).toBe('sent')
+    const [url, init] = f.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe('/api/auth/resend-activation')
+    expect(init.method).toBe('POST')
+    expect(init.body).toBe('{"email":"person@example.com"}')
+  })
+
+  it('is `throttled` on the per-client 429', async () => {
+    expect(await requestActivationLink('person@example.com', respond(429))).toBe('throttled')
+  })
+
+  it('is `error` on anything else, the server unreachable included', async () => {
+    expect(await requestActivationLink('person@example.com', respond(503))).toBe('error')
+    const unreachable = vi.fn(async () => Promise.reject(new TypeError('Failed to fetch')))
+    expect(await requestActivationLink('person@example.com', unreachable)).toBe('error')
   })
 })

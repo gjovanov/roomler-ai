@@ -84,7 +84,7 @@ there — but the request is made.
 **Substitute at serve time from `app.frontend_url`.**
 
 `frontend_url` is already the canonical "which server am I" value: it builds
-OAuth returns (`routes/auth.rs:167`), invite links (`routes/invite.rs:636`),
+OAuth returns (`routes/auth.rs:173`), invite links (`routes/invite.rs:636`),
 subscriber confirm/unsubscribe links (`routes/subscribe.rs:157,204`) and — since
 the 2026-07-28 tightening — the **CORS origin policy** itself
 (`crates/api/src/origin.rs:37`). A deployment whose `frontend_url` is wrong has

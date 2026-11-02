@@ -238,7 +238,7 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
   AC5's two reloads.
 - [x] **AC10:** docs updated or created with mermaid diagrams (`docs/public-site.md`: the publishing
   lane, the edge routing, the kill switch) and linked from `docs/README.md`.
-  **Met** in P4: `docs/public-site.md` §9 (the edge routing and the publishing sequence as mermaid, what
+  **Met** in P4: `docs/public-site.md` §11 (the edge routing and the publishing sequence as mermaid, what
   happens when each part fails, the kill switch, the organic carry), its `docs/README.md` row, and
   `docs/deployment.md`'s note that the blog is off the pod path.
 

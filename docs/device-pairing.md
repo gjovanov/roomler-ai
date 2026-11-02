@@ -21,7 +21,7 @@ applications and an inbox, with a ten-minute clock on the last two (the spec's
 [field evidence](fr/FR-129-guided-cross-platform-installer.md#the-field-evidence)).
 
 Pairing turns the token step around. The installer asks the server for a pairing, shows an
-eight-letter code and opens the browser on `/pair`. The person signs in or creates an account
+eight-letter code and a button that opens the browser on `/pair`. The person signs in or creates an account
 (and their organization) there, types the code, sees which device is asking, and approves it.
 The installer's next poll receives the ordinary enrollment token, says which organization it
 was approved into and by whom, and installs on the person's click. Nothing is copied: not a
@@ -91,11 +91,11 @@ polls after one approval, cannot both win.
 |---|---|---|
 | What it is | 32 CSPRNG bytes as unpadded base64url, 43 characters (`generate_device_code`, `crates/modules/fleet/src/pairing.rs:292-296`) | 8 letters from `BCDFGHJKLMNPQRSTVWXZ` — the 20 consonants with no look-alikes, about 34.6 bits, rejection-sampled so every letter is equally likely (`generate_user_code`, `:247-258`); shown `XXXX-XXXX` (`:262-268`) |
 | Who holds it | the installer, in memory: `DeviceCode` has no `Display` and a `Debug` that prints nothing of it (`crates/agent-core/src/pairing.rs:99-116`); the wizard keeps it in its `PairStore`, never in the webview (§11) | the person, who reads it off the installer and types it in the browser |
-| At rest | only `hex(SHA-256(code))`, as `device_code_hash`, unique (`hash_device_code`, `:299-301`; `crates/db/src/models/device_pairing.rs:26-27`) — a copy of the database cannot poll | stored without the hyphen; unique **among `pending` rows** by a partial index, so a decided pairing frees its code and `start` regenerates on a collision (`crates/modules/fleet/src/lib.rs:632-643`) |
+| At rest | only `hex(SHA-256(code))`, as `device_code_hash`, unique (`hash_device_code`, `:299-301`; `crates/db/src/models/device_pairing.rs:26-27`) — a copy of the database cannot poll | stored without the hyphen; unique **among `pending` rows** by a partial index, so a decided pairing frees its code and `start` regenerates on a collision (`crates/modules/fleet/src/lib.rs:651-662`) |
 | On the wire | POST bodies only: `start`'s response is the one time it leaves the server, and `poll`'s request the only place it goes | `start`'s response, and the bodies of `lookup`, `approve` and `deny` |
 | What it retrieves | the token — the **only** credential that can | nothing: it names a pairing to a signed-in person |
 | In a log line | never: the two structs that carry it redact it from `{:?}` on the server (`:192-216`), the client does the same (`crates/agent-core/src/pairing.rs:112-116`), and an integration test asserts no response but `start`'s and no database row carries it (`crates/tests/src/pairing_tests.rs:531`) | not a secret: it names the pairing, as its row id does |
-| Typed input | — | case-insensitive, hyphens and spaces optional; anything that is not exactly eight letters of the alphabet names no pairing and counts as a miss (`normalize_user_code`, `:273-289`). The page drops every other character as it is typed, so a vowel or a digit never fills the field (`ui/src/utils/pairing.ts:21-29`) |
+| Typed input | — | case-insensitive, hyphens and spaces optional; anything that is not exactly eight letters of the alphabet names no pairing and counts as a miss (`normalize_user_code`, `:273-289`). The page drops every other character from the code it sends, so a vowel or a digit never counts toward the eight (`ui/src/utils/pairing.ts:21-29`). Such a character can stay visible until the next valid letter redraws the box: the field keeps showing `a1e-4!` while **Look up** stays disabled, because the model never changed (read on production, 2026-11-02) |
 
 The split is what makes the rest hold. A code read off a screen, photographed or
 shoulder-surfed is worth nothing to an attacker **as a poller** — it retrieves no token. It is
@@ -189,7 +189,7 @@ pending install into *their* org, and gets remote control of a stranger's machin
 |---|---|
 | **The code space and the clock.** 20⁸ ≈ 2.6 × 10¹⁰ codes, and a pairing lives 15 minutes (`[pairing] ttl_secs`), so at any moment the live codes are a vanishing fraction of the space | `start`, `expires_at` |
 | **Misses are counted per account.** A lookup, deny or approve of a code that names no live pairing, and an approval the gate refused ("an org you cannot add devices to is as much a probe as a code that names nothing", `:1207-1210`), each count; at `[pairing] misses_per_account_per_hour` (10) that account's `lookup`, `approve` and `deny` answer 429 for the rest of the hour (`account_locked`, `:625-629`; test `:1001`). Every miss is on the audit with the user's id | §6 |
-| **The real lock: the installer shows the org and the approver before it installs**, by their **unique** handles beside the display names — "Approved by «Dana» (@dana) to join «Acme» (acme). Install into this org?" — and installs only on that click (`agents/roomler-setup/src/front/index.html:213-221`; `app.js:923-932`). A display name is free text anyone can set; the username and the slug are unique, so a name copied from the real admin does not pass as them (`pairing.rs:1029-1045`). An approval into an org you do not recognise ends at your own screen: Cancel leaves the device unenrolled | delivery, the wizard |
+| **The real lock: the installer shows the org and the approver before it installs**, by their **unique** handles beside the display names — "Approved by «Dana» (@dana) to join «Acme» (acme). Install into this org?" — and installs only on that click (`agents/roomler-setup/src/front/index.html:213-221`; `app.js:1014-1023`). A display name is free text anyone can set; the username and the slug are unique, so a name copied from the real admin does not pass as them (`pairing.rs:1029-1045`). An approval into an org you do not recognise ends at your own screen: Cancel leaves the device unenrolled | delivery, the wizard |
 | **The token is bound to the pairing it came from.** The wizard refuses to install with it for a different role or a different server than the pairing was started for (`PairStore::token_for`, `agents/roomler-setup/src/pairing.rs:247-272`) | the wizard |
 
 > ⚠️ The ceilings are **abuse ceilings, per pod, in memory** — not the security boundary. The
@@ -226,8 +226,8 @@ together — so the client types it `PollOutcome::RateLimited` rather than faili
 (`:383-389`) and backs off like a `slow_down`: the polled interval plus 5 s, or `Retry-After`
 when that is longer, never shorter (`interval_after_rate_limit`, `:219-222`). The wizard
 shows "The server asked for a slower pace — trying again." and keeps the pairing
-(`agents/roomler-setup/src/front/app.js:785-794`). A 429 on `start` is an error shown with
-the Start button, not a loop (`app.js:671-677`). On the web page a 429 is shown in the
+(`agents/roomler-setup/src/front/app.js:874-883`). A 429 on `start` is an error shown with
+the Start button, not a loop (`app.js:760-766`). On the web page a 429 is shown in the
 product's words — the server's own message where it sent one, else the client's text with
 `Retry-After` (`ui/src/api/client.ts:156-167`, `rateLimitMessage`, `:74-82`) — and is never
 read as a session failure.
@@ -277,7 +277,7 @@ gate was gone at delivery must all leave a trace.
 **Durable or bounded.** Every decision about a real pairing and everything a signed-in
 account does is a durable row: every `start ok`, every `lookup`, `approve` and `deny` with
 either outcome, every `deliver`, `expire` and `gate_lost`. A refusal an anonymous caller can
-repeat at will — an address past its ceiling, a body that is not a request, a code that names
+repeat at will — an address past its ceiling, a `start` body that is not a request, a code that names
 nothing, a poll too soon, a poll after delivery — is written **once per
 `(action, reason, address)` per hour per pod**, the repeats counted in a debug line
 (`Audit::record`, `pairing.rs:466-481`; `WindowLimiter::once`, `rate_limit.rs:200-220`), or a
@@ -293,7 +293,7 @@ an `approve` with an unparseable `tenant_id` (400), and the empty 404s of the ki
 **Never in it**: the device code, a token, an email address. The pairing is named by its row
 id, the person by theirs. Rows live **90 days** from `at` (`TTL_SECS`,
 `pairing_audit.rs:50`), indexed by `(pairing_id, at)`, `(tenant_id, at)` and `(user_id, at)`
-(`lib.rs:646-658`). Writes are best-effort — a failed insert is logged and the request
+(`lib.rs:665-677`). Writes are best-effort — a failed insert is logged and the request
 proceeds (`:495-497`) — so the audit never gates a pairing. The server's own `info!` lines
 (`pairing: started` · `approved` · `delivered` · `denied`) name the pairing id, the org and the
 user id, never a code.
@@ -331,12 +331,12 @@ looks up, approves and polls on another over one database, and checks delivery i
 across both (`pairing_tests.rs:468`).
 
 What *is* per pod, on purpose: the three `WindowLimiter`s (the start ceiling, the account
-misses, the audit de-duplication; `lib.rs:120-130`, built `:316-318`). They are abuse
+misses, the audit de-duplication; `lib.rs:124-134`, built `:323-325`). They are abuse
 ceilings, not the boundary (§5), and a flood can therefore leave up to one audit row per pod
 per hour rather than one.
 
 The clock is the authority on a pairing's life, not the TTL sweep: the TTL index on
-`expires_at` (`lib.rs:641`) only tidies, because its monitor passes every 60 s (an expired row lingers up to a minute, or goes at once), and
+`expires_at` (`lib.rs:660`) only tidies, because its monitor passes every 60 s (an expired row lingers up to a minute, or goes at once), and
 **every reader compares `expires_at` to now** (`live_pending`; `decide_poll`; the CAS filters
 `expires_at > now` on `approve` and `deliver`). A row found past its life is flipped to
 `expired` by whichever reader found it, so the expiry is audited exactly once.
@@ -379,7 +379,7 @@ same-origin `pending_redirect` it already honoured:
 
 | Decision point | Where |
 |---|---|
-| the router guard's signed-in branch | `ui/src/plugins/router.ts:447-451` |
+| the router guard's signed-in branch | `ui/src/plugins/router.ts:448-452` |
 | the sign-in page | `ui/src/views/auth/LoginView.vue:153-157` |
 | the OAuth callback | `ui/src/views/auth/OAuthCallbackView.vue:91-94` |
 | the sign-up page: with a session (the auto-verified overlay) straight back; with none it **stays** and says "Registration successful. Please check your email to activate your account. Then sign in, and you will be brought back to the pairing page. The code in your installer stays valid for 15 minutes; if it ran out, start the pairing again there." | `ui/src/views/auth/RegisterView.vue:279-287`; `en.json:95-96` |
@@ -410,30 +410,34 @@ already have." The pairing card is the primary action; the paste is a collapsed
 **Where the secrets live.** The device code and, later, the delivered token exist only in
 the wizard's `PairStore` (`agents/roomler-setup/src/pairing.rs:112-114`), in this process's
 memory, for as long as the session lives. The webview is answered the user code, the page to
-open and the clock (`PairStartView`, `agents/roomler-setup/src/commands.rs:455-463`) and a
+open and the clock (`PairStartView`, `agents/roomler-setup/src/commands.rs:596-604`) and a
 poll's status, org and approver (`PairPollView`, `pairing.rs:55-63`) — never a secret. This is
 structural: `WizardState` has no field for either, so `cmd_save_state` cannot persist one;
 the store's `Debug` prints `<redacted>` (test `:554`). The store's mutex is never held across
 an await — a command copies what the request needs out (`snapshot`, `:152-159`), awaits the
 HTTP call, then applies the answer under a fresh lock (`apply_poll`, `:181-233`).
 
-**The flow** (`app.js:609-624`):
+**The flow** (`app.js:698-713`):
 
 | Phase | What happens |
 |---|---|
-| **Set up in the browser** | `cmd_pair_start` (`commands.rs:474-509`) posts `start` with the device name from the Server page, this host's OS and architecture, the role's kind, `halves: 1` and `client: wizard` with the wizard's version. The verification URI must be `http(s)://` or the wizard refuses to hand it to the OS (`:496-500`, `:551`). The store replaces whatever pairing it held and bumps the session's **generation** (`begin`, `pairing.rs:134-149`) |
-| **Waiting** | the code, large, with **Copy code**; **Open ‹host›/pair** — the store's own URI, carrying no code — which becomes **Open the page again** once used (`cmd_pair_open`, `commands.rs:535-540`); "Waiting for approval in the browser… the code expires in mm:ss"; "Approve it in the browser only if this is the device in front of you."; **Cancel pairing** |
-| **The poll loop** | one tick per second updates the countdown and fires `cmd_pair_poll` when the interval is due (`pairTick`, `app.js:739-816`; `commands.rs:520-529`). A poll copies the generation out with the device code, and its answer is applied only if the session is still that one — a poll in flight when the person clicked Cancel or Start again can neither deliver an old pairing's token into the new session nor end the new one with the old one's denial (`apply_poll`, `pairing.rs:189-196`; test `:434`). A failed poll (the network blinked) is retried at the interval with "Could not reach the server … — trying again."; the clock ends the loop one grace interval past expiry, giving the server's own answer a chance first (`:745-749`). `slow_down` and a 429 lengthen the interval as §6 says; a status this build does not know keeps polling and lets the clock decide (`:810-814`) |
-| **Approved** | "Approved by «name» (@username) to join «org» (slug). Install into this org?" with **Cancel** and **Install →** (`index.html:213-221`). Install sets `installMode = paired` and runs the ordinary install (`app.js:641-646`): `cmd_install` with `usePaired: true` and an empty `token` (`commands.rs:312-331`), which clones the token out of the store for *this* role and server (`resolve_install_token`, `:362-371`; `token_for`, `pairing.rs:247-272`) — a pasted call never reads the store, so a pairing left behind cannot leak into a paste. The token is cleared when the install **succeeds** (`finish`, `:275-278`), so an install that broke before its enroll can Retry with the same still-valid token; a paired install that failed drops the pairing instead (`app.js:1010-1012`). The done page says which org it joined and who approved it (`:1277-1282`) |
-| **Ended** | "This was denied in the browser." or "The code expired.", with **Start again** — a fresh `start`, a fresh pairing (`endPairing`, `app.js:818-827`) |
-| **Back, Cancel, a paste** | each forgets the pairing on both sides: the loop here, the device code and any delivered token in the store (`cancelPairing`, `:718-737`; `cmd_pair_cancel`, `commands.rs:546-548`). Nothing is told to the server — the row expires on its own, and Cancel after an approval leaves it `delivered` with the token unused (AC5) |
+| **Set up in the browser** | `cmd_pair_start` (`commands.rs:615-650`) posts `start` with the device name from the Server page, this host's OS and architecture, the role's kind, `halves: 1` and `client: wizard` with the wizard's version. The verification URI must be `http(s)://` or the wizard refuses to hand it to the OS (`:637-641`, `:692`). The store replaces whatever pairing it held and bumps the session's **generation** (`begin`, `pairing.rs:134-149`) |
+| **Waiting** | the code, large, with **Copy code**; **Open ‹host›/pair** — the store's own URI, carrying no code — which becomes **Open the page again** once used (`cmd_pair_open`, `commands.rs:676-681`). An elevated wizard hands it to the session's Explorer, so the person's own browser opens it and never one with the wizard's token (`launch::open_through_the_shell`, `agents/roomler-setup/src/launch.rs:280`). "Waiting for approval in the browser… the code expires in mm:ss"; "Approve it in the browser only if this is the device in front of you."; **Cancel pairing** |
+| **The poll loop** | one tick per second updates the countdown and fires `cmd_pair_poll` when the interval is due (`pairTick`, `app.js:828-905`; `commands.rs:661-670`). A poll copies the generation out with the device code, and its answer is applied only if the session is still that one — a poll in flight when the person clicked Cancel or Start again can neither deliver an old pairing's token into the new session nor end the new one with the old one's denial (`apply_poll`, `pairing.rs:189-196`; test `:434`). A failed poll (the network blinked) is retried at the interval with "Could not reach the server … — trying again."; the clock ends the loop one grace interval past expiry, giving the server's own answer a chance first (`:745-749`). `slow_down` and a 429 lengthen the interval as §6 says; a status this build does not know keeps polling and lets the clock decide (`:810-814`) |
+| **Approved** | "Approved by «name» (@username) to join «org» (slug). Install into this org?" with **Cancel** and **Install →** (`index.html:213-221`). Install sets `installMode = paired` and runs the ordinary install (`app.js:730-735`): `cmd_install` with `usePaired: true` and an empty `token` (`commands.rs:453-472`), which clones the token out of the store for *this* role and server (`resolve_install_token`, `:503-512`; `token_for`, `pairing.rs:247-272`) — a pasted call never reads the store, so a pairing left behind cannot leak into a paste. The token is cleared when the install **succeeds** (`finish`, `:275-278`), so an install that broke before its enroll can Retry with the same still-valid token; a paired install that failed drops the pairing instead (`app.js:1101-1103`). The done page says which org it joined and who approved it (`:1368-1373`) |
+| **Ended** | "This was denied in the browser." or "The code expired.", with **Start again** — a fresh `start`, a fresh pairing (`endPairing`, `app.js:907-916`) |
+| **Back, Cancel, a paste** | each forgets the pairing on both sides: the loop here, the device code and any delivered token in the store (`cancelPairing`, `:718-737`; `cmd_pair_cancel`, `commands.rs:687-689`). Nothing is told to the server — the row expires on its own, and Cancel after an approval leaves it `delivered` with the token unused (AC5) |
 
 **The paste fallback.** The `I already have a token` box is the scripted, MSP, offline-mint
-and FR-104 anchoring path, and the only path when the server has no pairing: a 404 on
-`start` is `StartOutcome::Unavailable`, not an error (`crates/agent-core/src/pairing.rs:336-339`),
-and the wizard then hides the card, retitles the box "Enrollment token" and opens it
-(`app.js:686-694`, `:889-901`) — silently, because a client cannot tell "switched off" from
-"not there".
+and FR-104 anchoring path, and the only path when the server has no pairing. A server that
+says `"pairing": false` takes the card away before the Join step opens: the wizard asks once
+per server (`readPairingOffer`, `app.js:366-381`; `pairing_off`,
+`agents/roomler-setup/src/features.rs:131`), retitles the box "Enrollment token" and opens it
+(`app.js:1331-1338`). Only that word does it, so a timeout or an older server leaves the card up,
+and a 404 on `start` then decides as it always has: `StartOutcome::Unavailable`, not an error
+(`crates/agent-core/src/pairing.rs:336-339`), and the same fallback (`app.js:1122-1125`),
+silently, because a client cannot tell "switched off" from "not there". The answer lasts the
+wizard's run, so a switch flipped under an open wizard takes a relaunch to show.
 
 ## 12 · The kill switch, and `/api/setup/features`
 
@@ -447,7 +451,7 @@ enrolls unchanged (test `:1071-1089`). Nothing is unmounted and no index moves: 
 collections stay, empty.
 
 **`GET /api/setup/features`** (B1-s; `setup_features`,
-`crates/modules/fleet/src/setup_release.rs:139-146`; route `lib.rs:567`) is the server's
+`crates/modules/fleet/src/setup_release.rs:148-200`; route `lib.rs:582`) is the server's
 word on which install paths a client may offer, a public JSON object with every key present
 (`SetupFeatures`, `:88-99`):
 
@@ -585,14 +589,14 @@ device-paired notice failed` says why when the whole notice failed.
 
 | Layer | Where |
 |---|---|
-| The routes and every invariant | `crates/modules/fleet/src/pairing.rs` (`start` `:702`, `poll` `:847`, `deliver` `:928`, `lookup` `:1068`, `approve` `:1135`, `deny` `:1293`); mounted at `lib.rs:590-595`, `:615` |
+| The routes and every invariant | `crates/modules/fleet/src/pairing.rs` (`start` `:702`, `poll` `:847`, `deliver` `:928`, `lookup` `:1068`, `approve` `:1135`, `deny` `:1293`); mounted at `lib.rs:605-610`, `:634` |
 | The notice | `crates/modules/fleet/src/pairing_notice.rs`; the mail `crates/services/src/email.rs:621-683` |
-| The rows and their DAOs | `crates/db/src/models/device_pairing.rs`, `pairing_audit.rs`; `crates/services/src/dao/device_pairing.rs`, `pairing_audit.rs`; the index sets `lib.rs:632-658` |
-| The ceilings | `crates/core/src/rate_limit.rs:109-220` (`WindowLimiter`); the state `lib.rs:115-130` |
+| The rows and their DAOs | `crates/db/src/models/device_pairing.rs`, `pairing_audit.rs`; `crates/services/src/dao/device_pairing.rs`, `pairing_audit.rs`; the index sets `lib.rs:651-677` |
+| The ceilings | `crates/core/src/rate_limit.rs:109-220` (`WindowLimiter`); the state `lib.rs:119-134` |
 | The settings | `crates/config/src/settings.rs:91-183` (`SetupSettings`, `PairingSettings`) |
-| The features route | `crates/modules/fleet/src/setup_release.rs:88-146` |
+| The features route | `crates/modules/fleet/src/setup_release.rs:129-187` |
 | The integration tests | `crates/tests/src/pairing_tests.rs` — the happy paths, the codes, the clocks, the decisions, the downstream refusals, the limits, the switches |
 | The `/pair` page | `ui/src/views/pair/PairView.vue`, `ui/src/utils/pairing.ts`, `ui/src/plugins/router.ts:110-124`, the three auth views, `ui/src/locales/en.json:109-158` |
-| The wizard | `agents/roomler-setup/src/pairing.rs` (the store), `commands.rs:442-548` (the four commands, `cmd_install`'s `usePaired` at `:312-371`), `front/app.js:609-947`, `front/index.html:176-243` |
+| The wizard | `agents/roomler-setup/src/pairing.rs` (the store), `commands.rs:583-689` (the four commands, `cmd_install`'s `usePaired` at `:453-512`), `front/app.js:698-1038`, `front/index.html:176-243` |
 | The shared client | `crates/agent-core/src/pairing.rs` (`start` `:315`, `poll` `:368`, re-exported as `roomlerd::pairing`) |
 | The composition baseline | `crates/tests/fixtures/composition.baseline.json` — the five routes and `/api/setup/features`, re-recorded with `COMPOSITION_UPDATE=1` |

@@ -558,6 +558,53 @@ mod tests {
         )
     }
 
+    /// FR-52 — a compromised server can put anything it likes in a frame, so
+    /// what stops an `external_*` key is THIS side: the frame's type cannot hold
+    /// one. The raw frame goes through the real decode and the real `apply`. The
+    /// key beside them lands, so a frame that was dropped whole cannot pass, and
+    /// gate 3 and every other `external_*` value stay as the owner left them.
+    #[tokio::test]
+    async fn a_pushed_external_key_never_reaches_the_device() {
+        let dir = std::env::temp_dir().join(format!("fr52-push-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        );
+        let frame = r#"{"t":"rc:agent.config","revision":9,"desired":{
+            "fps_deny":"hevc_qsv:120",
+            "external_access_enabled":true,
+            "external_access_setup":"fr52-pushed-marker",
+            "external_access_verifier":"fr52-pushed-marker",
+            "external_consent_mode":"auto",
+            "external_max_permissions":"VIEW | INPUT | FILES",
+            "external_added_next_year":true
+        }}"#;
+        let roomler_ai_remote_control::signaling::ServerMsg::ConfigPush { desired, .. } =
+            serde_json::from_str(frame).expect("an unknown key must not fail the frame")
+        else {
+            panic!("the frame decoded as something else");
+        };
+        let applied = svc.apply(&desired).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["fps_deny"]);
+        assert!(applied.live.is_empty());
+
+        let cfg = crate::config::load(&path).unwrap();
+        assert_eq!(cfg.fps_deny.as_deref(), Some("hevc_qsv:120"));
+        assert!(!cfg.external_access_enabled, "gate 3 is the owner's");
+        assert_eq!(cfg.external_access_setup, None);
+        assert_eq!(cfg.external_access_verifier, None);
+        assert_eq!(cfg.external_consent_mode, None);
+        assert_eq!(cfg.external_max_permissions, None);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("fr52-pushed-marker"), "{raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// FR-119 P2b — a pushed frame-rate denylist is written and reported as
     /// needing a restart; the same push again changes nothing; a blank push
     /// clears it.

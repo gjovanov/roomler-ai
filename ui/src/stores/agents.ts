@@ -8,6 +8,7 @@ import { canManageOrgSettings } from '@/utils/permissions'
 import { isKeepBusyPattern, type KeepBusyPattern } from '@/composables/keepBusy'
 import type { AgentReleaseBrief } from '@/utils/updateStall'
 import type { PowerBrief, SleepView } from '@/utils/devicePresence'
+import type { ExternalAuditEntry, ExternalPrincipal } from '@/utils/externalAudit'
 
 /**
  * The three org-level switches (`exec-settings`, `ssh-settings`,
@@ -1619,6 +1620,17 @@ export const useAgentStore = defineStore('agents', () => {
     if (idx !== -1) agents.value[idx]!.external_access_policy = policy
   }
 
+  /** Read one device's connect code, approved or not: `null` when it has none.
+   *  This one throws, unlike `fetchExternalAccess`. "Could not read it" and
+   *  "there is none" must stay different answers, because the second is what
+   *  offers Create, and Create replaces a code. */
+  async function fetchConnectCode(tenantId: string, agentId: string): Promise<string | null> {
+    const resp = await api.get<{ connect_code: string | null }>(
+      `/tenant/${tenantId}/agent/${agentId}/connect-code`,
+    )
+    return resp.connect_code
+  }
+
   /** Mint or rotate a device's connect code. One call for both, because
    *  rotation IS the revocation story for a leaked code. */
   async function rotateConnectCode(tenantId: string, agentId: string): Promise<string> {
@@ -1866,6 +1878,47 @@ export const useAgentStore = defineStore('agents', () => {
     return { items: resp.items, total: resp.total }
   }
 
+  /** FR-52 P5 — every decision about letting someone from outside the org onto
+   *  a device, the refusals included. Requires `VIEW_REMOTE_AUDIT`. */
+  async function fetchExternalAudit(
+    tenantId: string,
+    opts: { page?: number; perPage?: number } = {},
+  ): Promise<{ items: ExternalAuditEntry[]; total: number }> {
+    const q = new URLSearchParams()
+    q.set('page', String(opts.page ?? 1))
+    q.set('per_page', String(opts.perPage ?? 50))
+    const resp = await api.get<{ items: ExternalAuditEntry[]; total: number }>(
+      `/tenant/${tenantId}/external-rc-audit?${q.toString()}`,
+    )
+    return { items: resp.items, total: resp.total }
+  }
+
+  /** FR-52 P5 — who has come in from outside, device by device. The same
+   *  `VIEW_REMOTE_AUDIT` as the log it sits beside. */
+  async function fetchExternalPrincipals(
+    tenantId: string,
+    opts: { page?: number; perPage?: number } = {},
+  ): Promise<{ items: ExternalPrincipal[]; total: number }> {
+    const q = new URLSearchParams()
+    q.set('page', String(opts.page ?? 1))
+    q.set('per_page', String(opts.perPage ?? 50))
+    const resp = await api.get<{ items: ExternalPrincipal[]; total: number }>(
+      `/tenant/${tenantId}/external-principals?${q.toString()}`,
+    )
+    return { items: resp.items, total: resp.total }
+  }
+
+  /** FR-52 P5 — bar a person from a device, or let them back. `MANAGE_AGENTS` to
+   *  bar; letting back is a grant, so that takes `REMOTE_CONTROL` too. */
+  async function setExternalPrincipal(
+    tenantId: string,
+    agentId: string,
+    userId: string,
+    revoked: boolean,
+  ): Promise<void> {
+    await api.put(`/tenant/${tenantId}/agent/${agentId}/external-principals/${userId}`, { revoked })
+  }
+
   /** P8 — what devices reported doing inside their sessions.
    *
    *  `grantId` narrows to ONE session, which is how a reader gets from an
@@ -1941,6 +1994,7 @@ export const useAgentStore = defineStore('agents', () => {
     fetchExternalAccess,
     setOrgExternalAccessEnabled,
     updateExternalAccessPolicy,
+    fetchConnectCode,
     rotateConnectCode,
     orgEphemeralKeysEnabled,
     fetchOrgEphemeralKeysEnabled,
@@ -1956,6 +2010,9 @@ export const useAgentStore = defineStore('agents', () => {
     updateSshPolicy,
     updateDesiredConfig,
     fetchSshAudit,
+    fetchExternalAudit,
+    fetchExternalPrincipals,
+    setExternalPrincipal,
     fetchSshActivity,
     execOnAgent,
     execOnFleet,
