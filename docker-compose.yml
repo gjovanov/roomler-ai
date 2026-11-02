@@ -1,6 +1,8 @@
+# The same pinned images as docker-compose.selfhost.yml, and for the same reasons:
+# its header says why, and docs/self-hosting.md what each pin costs.
 services:
   mongo:
-    image: mongo:7
+    image: mongo:7.0.45@sha256:8bb4442761a63a8dda452744082cdac9644b429807eb977b42324a63cef59ca4
     ports:
       - "27019:27017"
     volumes:
@@ -14,7 +16,7 @@ services:
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-local-dev-only-CHANGE-ME}
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.12-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f
     ports:
       - "6379:6379"
 
