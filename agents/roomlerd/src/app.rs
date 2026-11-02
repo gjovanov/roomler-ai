@@ -2576,6 +2576,8 @@ fn rollback_attention_msg(
 /// #3289 — what a crash loop says where the installer cannot go back
 /// ([`updater::ROLLBACK_CAN_DOWNGRADE`]). Nothing was attempted, so nothing failed,
 /// and running the older installer over this version is the one thing it refuses.
+/// The way back it gives is measured: an uninstall keeps the config and the
+/// enrollment, and with updates left on the older version took this one back in 25 s.
 fn crash_loop_no_rollback_msg(current: &str, target: &str, crash_count: u32) -> String {
     format!(
         "Roomler agent: crash loop detected.\n\n\
@@ -2584,8 +2586,10 @@ fn crash_loop_no_rollback_msg(current: &str, target: &str, crash_count: u32) -> 
          This device did not roll back: the Windows installer refuses to install an \
          older version over a newer one. It stays on {current} and updates itself as \
          usual when a newer release is published.\n\n\
-         To go back sooner, uninstall Roomler, then install {target} from\n\
-         https://github.com/gjovanov/roomler-ai/releases",
+         To go back sooner: set auto_update = false in this device's config.toml, \
+         uninstall Roomler, then install {target} from\n\
+         https://github.com/gjovanov/roomler-ai/releases\n\
+         With updates left on, it takes {current} again at its first check.",
         win_min = config::CRASH_WINDOW_SECS / 60,
     )
 }
@@ -7486,6 +7490,7 @@ mod tests {
         assert!(msg.contains("0.4.220 has crashed 3 times within 10 min"));
         assert!(msg.contains("Last known good version: 0.4.197"));
         assert!(msg.contains("did not roll back"));
+        assert!(msg.contains("auto_update = false"));
         assert!(msg.contains("uninstall Roomler, then install 0.4.197"));
         assert!(!msg.contains("auto-rollback failed"));
         assert!(!msg.contains("reinstall manually"));

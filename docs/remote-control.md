@@ -4515,19 +4515,64 @@ sequenceDiagram
 back-compat — pre-0.1.51 configs continue to load, locked by
 `old_config_without_new_fields_loads_with_defaults`): `last_known_
 good_version: Option<String>`; `crash_count: u32`; `last_crash_unix:
-u64`; `rollback_attempted: bool`; `last_run_unhealthy: bool`.
+u64`; `rollback_attempted: bool`; `last_run_unhealthy: bool`;
+`last_run_boot: Option<String>` (#3289).
 
-**Crash-loop detection**: at `run_cmd` startup, if
-`last_run_unhealthy=true` (previous run started but never reached
-`CLEAN_RUN_THRESHOLD_SECS=300` and didn't exit gracefully via
-Ctrl-C), `record_crash_at` bumps the in-window counter
-(`CRASH_WINDOW_SECS=600`). After 5 min of healthy signaling, a
-background tokio task promotes the running version to
-`last_known_good_version` and resets the counter via
-`record_clean_run_at`. Ctrl-C handler also clears the unhealthy
-flag (`mark_clean_shutdown`). When `should_rollback` returns true
-(3 crashes within 10 min, target != current, !rollback_attempted),
-the agent raises an operator-attention sentinel.
+**Crash-loop detection** (rewritten for #3289). A crash is the daemon
+dying on its own while the OS was up and nobody had asked it to go.
+`last_run_unhealthy` alone says only that nothing marked the last run
+clean, and Windows can end a worker before its service host hears of a
+restart. On released 0.4.197 two `shutdown /r` within five minutes of a
+self-update reached `crash_count=3`, and a healthy device tried to roll
+itself back. `config::previous_run`
+([`crates/agent-core/src/config.rs:2692`](../crates/agent-core/src/config.rs#L2692))
+is the one table that decides, on every start:
+
+| How the last run ended | Who can say | `PreviousRun` | Counts |
+|---|---|---|---|
+| It marked itself clean (`mark_clean_shutdown`) or reached `CLEAN_RUN_THRESHOLD_SECS=300` (`record_clean_run_at`) | `last_run_unhealthy` is false | `Clean` | no |
+| Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L950)) | `EndedByItsHost` | no |
+| The OS restarted during it: a restart, a power cut, a kernel fault | `last_run_boot` differs from [`boot_id::current`](../crates/agent-core/src/boot_id.rs#L17) | `EndedWithTheOs` | no |
+| Anything else: a kill, an access violation, a panic, a stall | nobody | `Crashed` | **yes** |
+| Either boot unknown, and no word from a host | nobody | `Crashed` | **yes** |
+
+```mermaid
+flowchart TD
+    A["start: last_run_unhealthy?"] -->|no| C["Clean: nothing counted"]
+    A -->|yes| B{"--prior-end from the service host?"}
+    B -->|yes| D["EndedByItsHost: not counted"]
+    B -->|no| E{"last_run_boot differs from the boot id now, both known?"}
+    E -->|yes| F["EndedWithTheOs: not counted"]
+    E -->|no| G["Crashed: record_crash_at"]
+    G --> H{"should_rollback: 3 in 10 min, not yet promoted, not yet handled"}
+    H -->|no| I["carry on"]
+    H -->|yes| J{"ROLLBACK_CAN_DOWNGRADE"}
+    J -->|Linux, macOS| K["pin_version, installer, exit"]
+    J -->|Windows| L["raise rollback_failed, stay up"]
+```
+
+⚠️ **When in doubt it counts.** A real crash loop must still reach the
+ladder, so an unknown boot reads as the same boot, and a code nobody
+named counts. A stall counts too (`STALL_EXIT_CODE`): it is the build's
+own failure, although `should_record_supervisor_crash` leaves it out of
+the crash *reports* because the watchdog wrote its own.
+
+⚠️ **The boot is an id, never a time.** A boot time worked out from the
+wall clock moves when the clock is stepped, and two starts of one boot
+then read as two boots. Linux reads `/proc/sys/kernel/random/boot_id`,
+macOS `kern.bootsessionuuid`, Windows `BootId` in `KUSER_SHARED_DATA`,
+which has no API (`boot_id.rs`). Measured on a Win11 guest: the registry's
+copy and KUSER both read 7 before three restarts and 10 after.
+
+⚠️ **The bookkeeping runs after preflight**
+([`agents/roomlerd/src/app.rs:4154`](../agents/roomlerd/src/app.rs#L4154),
+a 15 s budget). A daemon that dies before it is not counted, and marks
+nothing. This is the one crash loop the ladder cannot see.
+
+After 5 min of healthy signaling, a background tokio task promotes the
+running version to `last_known_good_version` and resets the counter via
+`record_clean_run_at`. Ctrl-C handler also clears the unhealthy flag
+(`mark_clean_shutdown`).
 
 ### 19.3 SHA256 verification + automatic rollback (0.1.52)
 
@@ -4550,16 +4595,44 @@ crash-loop recovery, not a fleet-wide poll). Returns the same
 `CheckOutcome::UpdateReady` shape as the regular update path so
 the rest of the install flow composes.
 
-**Automatic rollback execution**: when `should_rollback` fires AND
-`last_known_good_version` is set AND it's different from current:
-mark `rollback_attempted=true` FIRST (so a crash during the
-rollback fetch can't loop us into another rollback) → save → call
-`pin_version(format!("agent-v{target}"))` → on `UpdateReady`,
-spawn the installer with the post-install watcher, exit so the
-installer can overwrite the binary. Failure modes (Skipped,
-UpToDate, spawn error) raise the operator-attention sentinel
-with a remediation link to the GitHub releases page so the
-operator can downgrade manually.
+**What a crash loop does**: when `should_rollback` fires (3 crashes
+within 10 min, `last_known_good_version` set and different from the
+running version, `rollback_attempted` false), mark `rollback_attempted`
+FIRST and save, so a crash during what follows cannot loop into it
+again. That flag reads "handled" on Windows, where nothing is attempted.
+It is cleared by `record_clean_run_at`, so one sentinel per clean-run
+cycle. The rest depends on whether the installer here can go back at
+all (`updater::ROLLBACK_CAN_DOWNGRADE`,
+[`agents/roomlerd/src/updater.rs:1783`](../agents/roomlerd/src/updater.rs#L1783), #3289):
+
+| Platform | What it does | Read |
+|---|---|---|
+| Windows, both MSI flavours | Raises `rollback_failed`, downloads nothing, does not exit. It stays on this version and takes the next release as usual | Released 0.4.197, per-machine: the old attempt cost a download and a daemon exit, the MSI refused in under a second (events 10005, 11708, 1033 `status 1603`), and the exe still read 0.4.197. A real downgrade is #3318 |
+| Linux, macOS | `pin_version(format!("agent-v{target}"))`, then on `UpdateReady` the installer with the post-install watcher, and exit so it can overwrite the binary. Skipped, Unreachable, UpToDate or a spawn error raise `rollback_failed` | See #3289 for the Linux read. macOS unread |
+
+The sentinel goes where its reader looks:
+`notify::raise_rollback_attention` writes through
+`attention_path_for_worker`, so a worker in SystemContext reaches the
+machine-global path, where the companion (running as the person) reads
+it. Its one reader is the companion's Overview
+([`agents/roomler-desktop/src/commands.rs:90`](../agents/roomler-desktop/src/commands.rs#L90)).
+
+⚠️ **The way back by hand undoes itself unless updates are off first.**
+Uninstalling keeps the config and the enrollment, and installing the
+older MSI over nothing works: measured on 0.4.197 → 0.4.196, exit 0, row
+back. With `auto_update` still on, that daemon said `new release
+available` one second after it started and was on 0.4.197 again 23 s
+later. So the Windows message says to set `auto_update = false` first
+(`crash_loop_no_rollback_msg`).
+
+⚠️ **The sentinel outlives the crash loop.** FR-53's `rollback_is_stale`
+clears it only on a healthy connect from a *different* build, so a device
+that recovers without an update keeps saying it until its next update.
+
+⚠️ **Nothing on the server reads it.** A crash-looping device's row says
+`online`, with its version, and nothing else. The reports do arrive
+(`agent_crashes`, `supervisor_detected`, "worker exit code 1"), behind
+the row's Crash reports action.
 
 ### 19.4 Schema 1.3+ regression fix (0.1.53)
 
