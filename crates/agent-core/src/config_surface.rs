@@ -543,7 +543,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "bool",
-        description: "FR-90 - run a worker beside each agent session on this device (roomlerd hive-worker, the daemon's own supervised child), so a fault in what it serves costs that session's worker and never the daemon. Unix only for now. Never settable by the server. Default: OFF.",
+        description: "FR-90 - run a worker beside each agent session on this device, and one for the device itself (roomlerd hive-worker, the daemon's own supervised child), so a fault in what one serves costs that worker and never the daemon. Builds with the vault run the device's. Read as the daemon starts. Never settable by the server. Default: OFF.",
     },
     // FR-90 P4-3b-1 — what a knowhow scan reads (decision 38): the device's,
     // like every Hive key, and absent from `DesiredConfig`, since a server

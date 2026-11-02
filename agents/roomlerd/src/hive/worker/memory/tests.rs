@@ -145,3 +145,78 @@ async fn a_worker_runs_in_a_bounded_cgroup_of_its_own_where_the_unit_delegates_o
     running.kill().await;
     assert!(!dir.exists(), "its cgroup gone with it: {}", dir.display());
 }
+
+/// FR-90 P8-2d-1 (decision 72, AC4) — the device's worker, as its own spawner
+/// starts it: in a cgroup of its own at a bound of its own, none of it on swap,
+/// and holding no process but itself. What the daemon spawns (a session's
+/// account's command, `hive-pack`) goes on in the daemon's leaf, outside it, so
+/// that bound is never spent on them, nor an out-of-memory kill aimed at them.
+///
+/// Run inside a delegated cgroup, which CI has not: see the test above. Its
+/// bound exceeded is the field run's (§3i "P8-2d-1, as built"): a real out-of-
+/// memory kill is no test for a shared box.
+#[cfg(worker_calls)]
+#[tokio::test]
+#[ignore = "needs a delegated cgroup with the memory controller (systemd-run --user --scope -p Delegate=yes)"]
+async fn the_devices_worker_has_its_own_bound_and_what_the_daemon_spawns_stays_outside() {
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let base = unit_dir(v2_path(&own).expect("a cgroup v2 hierarchy"));
+    ready_for_test(&base).expect(
+        "a delegated cgroup with the memory controller (systemd-run --user --scope -p Delegate=yes)",
+    );
+    let spawner = super::super::device::OwnBinary(super::super::Program {
+        exe: "/bin/sh".into(),
+        arg0: None,
+        args: vec!["-c".into(), "sleep 30".into()],
+    });
+    let (_ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (_ours_d, theirs_d) = std::os::unix::net::UnixStream::pair().unwrap();
+    let theirs = super::super::Theirs {
+        ch: theirs,
+        descriptors: theirs_d,
+    };
+    let mut running = super::super::Spawn::spawn(&spawner, theirs).unwrap();
+    let pid = running.pid().unwrap();
+    let cgroup_of = |pid: u32| {
+        let read = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+        v2_path(&read).unwrap().to_string()
+    };
+    let path = cgroup_of(pid);
+    let leaf = path.rsplit('/').next().unwrap();
+    assert!(leaf.starts_with(WORKER_PREFIX), "its own: {path}");
+    let dir = Path::new(CGROUP_ROOT).join(path.trim_start_matches('/'));
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).map(|s| s.trim().to_string());
+    assert_eq!(
+        read("memory.max").unwrap(),
+        super::super::device::MAX_MEMORY.to_string(),
+        "its own bound, not a session's"
+    );
+    assert_ne!(super::super::device::MAX_MEMORY, MAX_MEMORY);
+    if let Ok(swap) = read("memory.swap.max") {
+        assert_eq!(swap, "0", "none of it on swap");
+    }
+    assert_eq!(
+        read("cgroup.procs").unwrap(),
+        pid.to_string(),
+        "itself alone"
+    );
+
+    let mut outside = tokio::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 30"])
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let theirs = cgroup_of(outside.id().unwrap());
+    assert!(
+        theirs.ends_with(&format!("/{DAEMON_LEAF}")),
+        "what the daemon spawns stays in its leaf: {theirs}"
+    );
+    assert_eq!(
+        read("cgroup.procs").unwrap(),
+        pid.to_string(),
+        "still alone"
+    );
+    let _ = outside.kill().await;
+    running.kill().await;
+    assert!(!dir.exists(), "its cgroup gone with it: {}", dir.display());
+}
