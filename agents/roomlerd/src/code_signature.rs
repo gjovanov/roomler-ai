@@ -446,9 +446,11 @@ mod tests {
     /// #3246 — through a handle, the same refusal.
     #[test]
     fn an_unsigned_open_file_is_refused() {
-        let src = Path::new(file!());
-        let open = std::fs::File::open(src).unwrap();
-        match verify_open_publisher(&open, src, EXPECTED_PUBLISHER) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.msi");
+        std::fs::write(&src, b"not signed").unwrap();
+        let open = std::fs::File::open(&src).unwrap();
+        match verify_open_publisher(&open, &src, EXPECTED_PUBLISHER) {
             Err(VerifyError::Untrusted(_)) | Err(VerifyError::Unsupported) => {}
             other => panic!("an unsigned file must never verify, got {other:?}"),
         }
