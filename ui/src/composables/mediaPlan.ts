@@ -134,22 +134,26 @@ function listed(items: string[]): string {
 export function describeMediaStop(plan: Pick<RcMediaPlan, 'stopped' | 'ladder'>): MediaStopCopy | null {
   const s = plan.stopped
   if (!s) return null
-  // What fell to `none` and the arrows before it: every cell this open tried.
+  // What fell to `none` and the arrows before it: every cell this session tried. A
+  // cell on this list may have opened earlier: the ladder spans every open, so a
+  // rebuild that fails lists the cell it ran on. The words must hold for that too.
   const tried = [...new Set(plan.ladder.filter((l) => !l.from.endsWith(' fps') && l.from !== 'gpu' && l.from !== 'cpu').map((l) => l.from))]
+  // The device's own arrow, when a full ladder did not drop it. The list above can't
+  // say which cell it was: after rebuilds there and back, the cell is not its last.
+  const last = plan.ladder[plan.ladder.length - 1]
+  const faulted = last?.to === 'none' ? last.from : ''
   switch (s.why) {
     case 'no_encoder':
       return {
-        title: 'This device could not start its video.',
-        body: tried.length
-          ? `It tried ${listed(tried)}, and none of them opened.`
-          : 'It has no encoder it can open for this stream.',
+        title: 'This device could not open a video encoder.',
+        body: tried.length ? `It tried ${listed(tried)}.` : 'It has no encoder it can open for this stream.',
         code: s.why,
         detail: s.detail,
       }
     case 'encoder_fault':
       return {
         title: "This device's video encoder stopped.",
-        body: tried.length ? `${tried[tried.length - 1]} failed and would not restart.` : 'It failed and would not restart.',
+        body: faulted ? `${faulted} failed and would not restart.` : 'It failed and would not restart.',
         code: s.why,
         detail: s.detail,
       }
@@ -175,19 +179,23 @@ export interface NoPictureWords {
 
 /** What a page with no picture says, from what it knows: the device's own stop,
  *  else what it was promised. `null` when it knows neither, which is every
- *  session of an older agent. */
+ *  session of an older agent. `dataArrived` is a decode worker's byte count: the
+ *  silence counts decoded frames, and bytes with no frame are not a device that
+ *  sent nothing. */
 export function noPictureWords(
   stop: MediaStopCopy | null,
   silent: boolean,
   plan: Pick<RcMediaPlan, 'codec' | 'transport'> | null,
+  dataArrived: boolean,
 ): NoPictureWords | null {
   if (stop) return { testId: 'rc-media-stop', iconColor: 'warning', ...stop }
   if (!silent || !plan) return null
+  const promised = `This device is set to send ${describeMediaPromise(plan)}`
   return {
     testId: 'rc-media-silent',
     iconColor: 'grey-lighten-1',
     title: 'No picture yet.',
-    body: `This device is set to send ${describeMediaPromise(plan)}, and no frame has arrived.`,
+    body: dataArrived ? `${promised}. Data has arrived, and no picture has decoded from it.` : `${promised}, and no frame has arrived.`,
     code: null,
     detail: '',
   }

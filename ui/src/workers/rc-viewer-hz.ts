@@ -73,17 +73,27 @@ function workerEnv(): HzEnv {
 
 /** Measure now and every `VIEWER_HZ_EVERY_MS`, and report a reading that moved.
  *  With no worker rAF (an older browser) it does nothing, and the agent simply
- *  never hears: that is what it hears from an older viewer too. */
+ *  never hears: that is what it hears from an older viewer too. A browser may also
+ *  refuse rAF by throwing (the HTML spec's `NotSupportedError`), which reads the
+ *  same. It must never throw at its caller, the decoder's `output`, where a throw
+ *  costs the frame in hand. */
 export function startViewerHzBursts(report: (hz: number) => void, env: HzEnv = workerEnv()): void {
   const raf = env.raf
   if (!raf) return
   let told: number | null = null
+  const ask = (cb: (nowMs: number) => void) => {
+    try {
+      raf(cb)
+    } catch {
+      /* no tick follows, so no later burst either */
+    }
+  }
   const burst = () => {
     const meter = createHzMeter()
     const onTick = (nowMs: number) => {
       const hz = meter.tick(nowMs)
       if (hz === null) {
-        raf(onTick)
+        ask(onTick)
         return
       }
       if (told === null || Math.abs(hz - told) > VIEWER_HZ_SAME) {
@@ -92,7 +102,7 @@ export function startViewerHzBursts(report: (hz: number) => void, env: HzEnv = w
       }
       env.later(burst, VIEWER_HZ_EVERY_MS)
     }
-    raf(onTick)
+    ask(onTick)
   }
   burst()
 }

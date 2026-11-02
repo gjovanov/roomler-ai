@@ -117,8 +117,8 @@ describe('FR-135 R2: what the page says', () => {
       stopped: { why: 'no_encoder', detail: 'no vulkan device opened on this host' },
       ladder: [step('h264_nvenc', 'h264_amf'), step('h264_amf', 'h264_vulkan'), step('h264_vulkan', 'none')],
     })
-    expect(copy?.title).toBe('This device could not start its video.')
-    expect(copy?.body).toBe('It tried h264_nvenc, h264_amf and h264_vulkan, and none of them opened.')
+    expect(copy?.title).toBe('This device could not open a video encoder.')
+    expect(copy?.body).toBe('It tried h264_nvenc, h264_amf and h264_vulkan.')
     expect(copy?.code).toBe('no_encoder')
     expect(copy?.detail).toBe('no vulkan device opened on this host')
   })
@@ -128,7 +128,18 @@ describe('FR-135 R2: what the page says', () => {
       stopped: { why: 'no_encoder', detail: '' },
       ladder: [step('144 fps', '60 fps'), step('gpu', 'cpu'), step('h264_qsv', 'none')],
     })
-    expect(copy?.body).toBe('It tried h264_qsv, and none of them opened.')
+    expect(copy?.body).toBe('It tried h264_qsv.')
+  })
+
+  // A session ran on h264_qsv for an hour, and a rebuild failed. The ladder holds
+  // both opens, so the words must be true of a cell that did open once.
+  it('does not say a session that ran never started', () => {
+    const copy = describeMediaStop({
+      stopped: { why: 'no_encoder', detail: '' },
+      ladder: [step('h264_nvenc', 'h264_qsv'), step('h264_qsv', 'h264_amf'), step('h264_amf', 'none')],
+    })
+    expect(copy?.title).toBe('This device could not open a video encoder.')
+    expect(copy?.body).toBe('It tried h264_nvenc, h264_qsv and h264_amf.')
   })
 
   it('says something when nothing was tried', () => {
@@ -141,6 +152,27 @@ describe('FR-135 R2: what the page says', () => {
     const copy = describeMediaStop({ stopped: { why: 'encoder_fault', detail: 'gone' }, ladder: [step('h264_qsv:yuv420', 'none')] })
     expect(copy?.title).toBe("This device's video encoder stopped.")
     expect(copy?.body).toBe('h264_qsv:yuv420 failed and would not restart.')
+  })
+
+  it('names the cell that failed after rebuilds there and back, not the one it left', () => {
+    const copy = describeMediaStop({
+      stopped: { why: 'encoder_fault', detail: 'gone' },
+      ladder: [step('a:yuv420', 'b:yuv420'), step('b:yuv420', 'a:yuv420'), step('a:yuv420', 'none')],
+    })
+    expect(copy?.body).toBe('a:yuv420 failed and would not restart.')
+  })
+
+  it('names no cell when a full ladder dropped the fault\'s own arrow', () => {
+    const copy = describeMediaStop({
+      stopped: { why: 'encoder_fault', detail: 'gone' },
+      ladder: Array.from({ length: 24 }, () => step('a:yuv420', 'b:yuv420')),
+    })
+    expect(copy?.body).toBe('It failed and would not restart.')
+  })
+
+  it('names no cell when the device had none to name', () => {
+    const copy = describeMediaStop({ stopped: { why: 'encoder_fault', detail: 'gone' }, ladder: [step('', 'none')] })
+    expect(copy?.body).toBe('It failed and would not restart.')
   })
 
   it('keeps a word it does not know, because that still says something', () => {
@@ -176,21 +208,32 @@ describe('FR-135 R2: the words on a page with no picture', () => {
   const plan = { codec: 'av1', transport: 'webrtc' }
 
   it('takes the device\'s own stop over what it was promised', () => {
-    expect(noPictureWords(stop, true, plan)).toEqual({ testId: 'rc-media-stop', iconColor: 'warning', ...stop })
+    expect(noPictureWords(stop, true, plan, false)).toEqual({ testId: 'rc-media-stop', iconColor: 'warning', ...stop })
   })
 
   it('says what was promised once the session is silent, with no word of the device\'s to show', () => {
-    const words = noPictureWords(null, true, plan)
+    const words = noPictureWords(null, true, plan, false)
     expect(words?.testId).toBe('rc-media-silent')
     expect(words?.title).toBe('No picture yet.')
     expect(words?.body).toBe('This device is set to send AV1 over WebRTC, and no frame has arrived.')
     expect(words?.code).toBeNull()
   })
 
+  // Chunks climbing and no frame out of the decoder: this browser's fault, or the
+  // stream's, and "no frame has arrived" would send the reader to the device.
+  it('says data arrived when it did, and claims nothing about why it did not decode', () => {
+    const words = noPictureWords(null, true, { codec: 'h265', transport: 'data-channel-hevc' }, true)
+    expect(words?.testId).toBe('rc-media-silent')
+    expect(words?.body).toBe(
+      'This device is set to send H.265 over the data channel. Data has arrived, and no picture has decoded from it.',
+    )
+  })
+
   it('has none before the session is silent, or without a plan: an older agent\'s session reads as it did', () => {
-    expect(noPictureWords(null, false, plan)).toBeNull()
-    expect(noPictureWords(null, true, null)).toBeNull()
-    expect(noPictureWords(null, false, null)).toBeNull()
+    expect(noPictureWords(null, false, plan, false)).toBeNull()
+    expect(noPictureWords(null, true, null, false)).toBeNull()
+    expect(noPictureWords(null, false, null, false)).toBeNull()
+    expect(noPictureWords(null, false, plan, true)).toBeNull()
   })
 })
 

@@ -156,4 +156,32 @@ describe('FR-135 R2: the bursts', () => {
     expect(told).toEqual([])
     expect(later).toEqual([])
   })
+
+  // The first call runs inside the decoder's `output`, and a throw there would cost
+  // the frame it was handed: neither painted nor closed.
+  it('reads a browser that refuses rAF as one without it, and never throws at its caller', () => {
+    const told: number[] = []
+    const later: unknown[] = []
+    const refused = () => {
+      throw new DOMException('no rAF here', 'NotSupportedError')
+    }
+    expect(() => startViewerHzBursts((hz) => told.push(hz), { raf: refused, later: (run) => later.push(run) })).not.toThrow()
+    expect(told).toEqual([])
+    expect(later).toEqual([])
+  })
+
+  it('stops measuring, quietly, when a browser refuses rAF partway', () => {
+    const told: number[] = []
+    let pending: ((t: number) => void) | null = null
+    let calls = 0
+    const raf = (cb: (t: number) => void) => {
+      calls++
+      if (calls > 1) throw new DOMException('no rAF here', 'NotSupportedError')
+      pending = cb
+    }
+    startViewerHzBursts((hz) => told.push(hz), { raf, later: () => {} })
+    expect(() => pending!(16)).not.toThrow()
+    expect(calls).toBe(2)
+    expect(told).toEqual([])
+  })
 })

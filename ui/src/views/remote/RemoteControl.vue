@@ -1454,7 +1454,8 @@
             <code>{{ noPicture.code }}</code>.
             <span v-if="noPicture.detail">{{ noPicture.detail }}</span>
           </p>
-          <p class="text-caption text-medium-emphasis mt-1">This page keeps trying.</p>
+          <!-- An external session takes no retry: the watchdog ends it instead. -->
+          <p v-if="!isExternal" class="text-caption text-medium-emphasis mt-1">This page keeps trying.</p>
         </div>
         <div v-else-if="!rc.hasMedia.value" class="no-media-overlay">
           <v-icon size="72" color="grey-lighten-1">mdi-video-off</v-icon>
@@ -5192,7 +5193,9 @@ const asleepWhileRedialling = computed(() => {
 // FR-135 R2 — what this page says about having no picture, on the connected stage
 // and through a redial. The composable keeps it across a re-create, and the first
 // frame ends it.
-const noPicture = computed(() => noPictureWords(rc.mediaStop.value, rc.mediaSilent.value, rc.mediaPlan.value))
+const noPicture = computed(() =>
+  noPictureWords(rc.mediaStop.value, rc.mediaSilent.value, rc.mediaPlan.value, rc.mediaDataArrived.value),
+)
 const noPictureWhileRedialling = computed(() =>
   ['reconnecting', 'requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value) ? noPicture.value : null,
 )

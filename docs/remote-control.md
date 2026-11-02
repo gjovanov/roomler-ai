@@ -1178,8 +1178,8 @@ channel the page opened.
 because a transient GPU fault heals that way today, and from the fourth attempt the
 dead-air backoff stretches that to minutes. The page keeps the words across the
 re-create and through the backoff, so they hold still while it tries. It has dropped
-the backoff's "its network may be blocking the connection" for a session with a plan,
-because the plan came over the control channel. Ending the session with a reason is
+the backoff's "its network may be blocking the connection" for an attempt that heard a
+plan, because the plan came over the control channel. Ending the session with a reason is
 R8's (FR-135 §6.8).
 
 ⚠️ **A follower of a shared pipeline carries the plan's start only.** The owner's pump

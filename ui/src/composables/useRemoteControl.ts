@@ -1128,6 +1128,20 @@ export function advanceEndsWait(
   return advanced && intervalFromMs >= waitingSinceMs + RC_MEDIA_WAITING_SETTLE_MS
 }
 
+/** FR-135 R2 — the device's stop through one watchdog tick. The race of
+ *  `advanceEndsWait`: `encoder_fault` only ever follows frames, and they ride
+ *  another channel, so one sent before the stop can be counted after it. Erased by
+ *  that frame, the page would show a frozen picture and no reason until the
+ *  re-create. The plan stays as it was, so nothing would say it again. */
+export function mediaStopAfterTick<T>(
+  stop: T | null,
+  advanced: boolean,
+  intervalFromMs: number,
+  stopSinceMs: number,
+): T | null {
+  return stop !== null && advanceEndsWait(advanced, intervalFromMs, stopSinceMs) ? null : stop
+}
+
 /** FR-93 P5b — the waiting overlay's words, by what the agent waits for. */
 export interface RcMediaWaitingCopy {
   /** The overlay's headline. */
@@ -5486,10 +5500,8 @@ export function useRemoteControl(
       )
       // FR-135 R2 — the first picture ends what the page said about having none.
       mediaSilent.value = nextMediaSilent(mediaSilent.value, advanced, sessionPainted, mediaPlan.value !== null, stallTicks)
-      if (advanced) {
-        sessionPainted = true
-        mediaStop.value = null
-      }
+      if (advanced) sessionPainted = true
+      mediaStop.value = mediaStopAfterTick(mediaStop.value, advanced, intervalFromMs, mediaStopSinceMs)
       degraded.value = classifyDegraded({
         pcState: pc?.connectionState ?? null,
         wsConnected: ws.status === 'connected',
@@ -5602,8 +5614,14 @@ export function useRemoteControl(
   /** FR-135 R2 — why the device stopped its video. Outlives the watchdog's
    *  re-create, or the page's one sentence would blink every 10 s. */
   const mediaStop = ref<MediaStopCopy | null>(null)
+  /** FR-135 R2 — when the device last said it stopped, on this browser's clock:
+   *  only a frame after it ends the stop (`mediaStopAfterTick`). */
+  let mediaStopSinceMs = 0
   /** FR-135 R2 — a plan, and no picture ever came (`nextMediaSilent`). */
   const mediaSilent = ref(false)
+  /** FR-135 R2 — media reached a decode worker, so a silent page's data arrived and
+   *  did not decode. Kept with `mediaSilent`, or the words would change every 10 s. */
+  const mediaDataArrived = ref(false)
   /** FR-135 R2 — how fast this screen refreshes, from the decode worker. */
   const viewerHz = ref<number | null>(null)
   /** The newest plan's epoch this session. Apart from `mediaPlan`, because the
@@ -7715,6 +7733,7 @@ export function useRemoteControl(
     mediaPlanEpoch = plan.epoch
     mediaPlan.value = plan
     console.info(`[rc] media plan ${JSON.stringify(plan)}`)
+    if (action.stop) mediaStopSinceMs = Date.now()
     if (action.stop !== undefined) mediaStop.value = action.stop
     if (action.showTrack) {
       console.warn('[rc] media plan: the device is sending over WebRTC, not the data channel this page opened - showing <video>')
@@ -8371,6 +8390,7 @@ export function useRemoteControl(
           height: typeof m.height === 'number' ? m.height : 0,
           bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
         }
+        if (vp9_444Stats.value.bytesReceivedTotal > 0) mediaDataArrived.value = true
         // P1 Ã¢ÂÂ the per-frame `frame-decoded` message is off by default; keep
         // the diagnostics counter monotonic from the 1 s window total.
         if (typeof m.framesDecodedTotal === 'number') {
@@ -8671,6 +8691,7 @@ export function useRemoteControl(
           height: typeof m.height === 'number' ? m.height : 0,
           bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
         }
+        if (hevcStats.value.bytesReceivedTotal > 0) mediaDataArrived.value = true
         // P1 Ã¢ÂÂ see the vp9-444 handler.
         if (typeof m.framesDecodedTotal === 'number') {
           hevcFramesDecoded.value = Math.max(hevcFramesDecoded.value, m.framesDecodedTotal)
@@ -9495,7 +9516,8 @@ export function useRemoteControl(
     const deadAir = deadAirDelayMs(deadAirStreak.value)
     const delay = Math.max(nextReconnectDelayMs(attemptIdx), deadAir)
     if (deadAir > 0) {
-      const planKnown = mediaPlan.value !== null
+      // This attempt's plan, not one the redial kept: the path has to be working now.
+      const planKnown = mediaPlanEpoch > 0
       console.warn(
         '[rc] no media on the last',
         deadAirStreak.value,
@@ -9514,11 +9536,13 @@ export function useRemoteControl(
     // FR-135 R2 — so is why this page has no picture, until one comes.
     const keptStop = mediaStop.value
     const keptSilent = mediaSilent.value
+    const keptDataArrived = keptSilent && mediaDataArrived.value
     const keptPlan = keptStop || keptSilent ? mediaPlan.value : null
     teardown()
     if (kept) mediaWaiting.value = kept
     mediaStop.value = keptStop
     mediaSilent.value = keptSilent
+    mediaDataArrived.value = keptDataArrived
     mediaPlan.value = keptPlan
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null
@@ -9662,6 +9686,7 @@ export function useRemoteControl(
     mediaPlanEpoch = 0
     mediaStop.value = null
     mediaSilent.value = false
+    mediaDataArrived.value = false
     sessionPainted = false
     inputReach.value = null
     idleEndsAt.value = null
@@ -13894,6 +13919,7 @@ export function useRemoteControl(
     mediaPlan,
     mediaStop,
     mediaSilent,
+    mediaDataArrived,
     viewerHz,
     // FR-97 P3c-1 — why this session's audio track carries no sound, or null.
     audioUnavailable,

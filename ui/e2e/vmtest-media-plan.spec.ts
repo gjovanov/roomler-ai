@@ -17,7 +17,11 @@
  *   MP_EXPECT_HZ        a regex a logged `[rc] viewer_hz` line must match
  *   MP_EXPECT_VERB      `1` or `0`: whether the agent's row must advertise `media-plan`
  *   MP_SWALLOW_DECODE   `1`: the decode worker takes every chunk and shows nothing, so a real session has a plan, no stop
- *                       and no picture, which no agent setup still gives since #3279
+ *                       and no picture, which no agent setup still gives since #3279. Data arrives and nothing decodes, so
+ *                       the words must say that, and not that no frame arrived
+ *   MP_INJECT_STOP      how many times to say a device's stop over the control channel of a session that keeps painting, to
+ *                       time the sentence against the frames behind it. The device is not touched: it goes on sending
+ *   MP_EXPECT_STOP_HOLDS `1`: every injected stop outlives the settle (`RC_MEDIA_WAITING_SETTLE_MS`), and then leaves
  *   MP_UI_DIST        serve the viewer from this `dist` directory at the production origin, for a read before a promote
  *   MP_SHOT             where the screenshot goes
  *   E2E_RC_CODEC        the codec picker's value for this agent
@@ -42,6 +46,9 @@ const EXPECT_NO_BLINK = process.env.MP_EXPECT_NO_BLINK === '1'
 const EXPECT_NO_BLAME = process.env.MP_EXPECT_NO_BLAME === '1'
 const EXPECT_HZ = process.env.MP_EXPECT_HZ || ''
 const EXPECT_VERB = process.env.MP_EXPECT_VERB || ''
+const INJECT_STOP = Number(process.env.MP_INJECT_STOP || '0')
+const EXPECT_STOP_HOLDS = process.env.MP_EXPECT_STOP_HOLDS === '1'
+const STOP_SETTLE_MS = 1_000
 const UI_DIST = process.env.MP_UI_DIST || ''
 const SHOT = process.env.MP_SHOT || ''
 const CODEC_STORAGE_PREFIX = 'roomler-rc-codec.v1:'
@@ -64,6 +71,29 @@ function watchTheReason(selector: string) {
     if (shown && !now) console.info('[mp] reason gone')
     shown = now
   }).observe(document, { childList: true, subtree: true })
+}
+
+/** Runs in the page: keeps the control channel, for `MP_INJECT_STOP`. */
+function keepTheControlChannel() {
+  const create = RTCPeerConnection.prototype.createDataChannel
+  RTCPeerConnection.prototype.createDataChannel = function (this: RTCPeerConnection, label: string, init?: RTCDataChannelInit) {
+    const channel = create.call(this, label, init)
+    if (label === 'control') (window as unknown as { mpControl: RTCDataChannel }).mpControl = channel
+    return channel
+  } as typeof RTCPeerConnection.prototype.createDataChannel
+}
+
+/** Runs in the page: the device's stop, as its control channel would deliver it. The epoch only has to beat the session's. */
+function sayAStop(epoch: number) {
+  const data = JSON.stringify({
+    t: 'rc:media-plan',
+    epoch,
+    transport: 'data-channel-vp9-444',
+    codec: 'vp9',
+    ladder: [{ from: 'injected:yuv420', to: 'none', why: 'injected', at_ms: 1 }],
+    stopped: { why: 'encoder_fault', detail: 'injected' },
+  })
+  ;(window as unknown as { mpControl: RTCDataChannel }).mpControl.dispatchEvent(new MessageEvent('message', { data }))
 }
 
 /** Prepended to the decode worker: counts paints on the data-channel path. */
@@ -135,6 +165,7 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
     [agentId as string, RC_CODEC, CODEC_STORAGE_PREFIX],
   )
   await context.addInitScript(watchTheReason, REASON)
+  await context.addInitScript(keepTheControlChannel)
   await context.route('https://purestat.ai/**', (route) => route.abort())
   await context.route(`${BASE_URL}/**`, async (route) => {
     const url = new URL(route.request().url())
@@ -207,6 +238,24 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   say(`browser=${browserName} ui=${UI_DIST ? 'local dist' : 'served'} connect`)
   await connect.click()
 
+  // How long the sentence lasts behind frames that keep coming. A frame counted within the settle may predate the stop,
+  // so it must not take the sentence down. The first frame after the settle ends it, because here frames do keep coming.
+  const stopLifetimes: number[] = []
+  if (INJECT_STOP > 0) {
+    await expect.poll(() => painted, { timeout: 30_000 }).toBeGreaterThan(0)
+    const stop = page.locator('[data-testid="rc-media-stop"]').first()
+    for (let i = 1; i <= INJECT_STOP; i++) {
+      await page.waitForTimeout(2_500)
+      await page.evaluate(sayAStop, 1000 + i)
+      const since = Date.now()
+      await stop.waitFor({ state: 'visible', timeout: 3_000 })
+      await stop.waitFor({ state: 'detached', timeout: 9_000 }).catch(() => undefined)
+      const lifetime = Date.now() - since
+      stopLifetimes.push(lifetime)
+      say(`the injected stop ${i} lasted ${lifetime} ms`)
+    }
+  }
+
   // Every overlay this page can show, read once a second, so one that a re-created session clears still counts. So is
   // the backoff's notice. Whether the reason ever left is `watchTheReason`'s to say: a redial is shorter than this read.
   while (Date.now() - t0 < WAIT_MS) {
@@ -245,7 +294,7 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   const notice = [...noticeWords].join(' | ')
   // Here, not at the assert: the Disconnect below ends the session, and the reason goes with it.
   const blinks = blink
-  say(`RESULT browser=${browserName} paints=${paints} video=${video.w} sessions=${sessionsAsked} plans=${plans.length} hz=${hzLines.length} blink=${blinks} verb=${verb} pageerrors=${pageErrors} overlay="${overlay.slice(0, 500)}" notice="${notice.slice(0, 300)}"`)
+  say(`RESULT browser=${browserName} paints=${paints} video=${video.w} sessions=${sessionsAsked} plans=${plans.length} hz=${hzLines.length} blink=${blinks} verb=${verb} pageerrors=${pageErrors} stop_ms=[${stopLifetimes.join(' ')}] overlay="${overlay.slice(0, 500)}" notice="${notice.slice(0, 300)}"`)
 
   const disconnect = page.locator('button[aria-label="Disconnect"]').first()
   if (await disconnect.isVisible().catch(() => false)) await disconnect.click().catch(() => undefined)
@@ -260,5 +309,13 @@ test('FR-135 R2: what a page says about its picture', async ({ context, browserN
   if (EXPECT_NO_BLAME) expect(notice).not.toMatch(/network may be blocking/)
   if (EXPECT_HZ) expect(hzLines.join('\n')).toMatch(new RegExp(EXPECT_HZ))
   if (EXPECT_VERB) expect(String(verb)).toBe(EXPECT_VERB === '1' ? 'true' : 'false')
+  if (EXPECT_STOP_HOLDS) {
+    expect(stopLifetimes.length).toBe(INJECT_STOP)
+    // Under 9 s: the wait above gives up at 9 s, and a stop that never left would read as a stop that held.
+    for (const lifetime of stopLifetimes) {
+      expect(lifetime).toBeGreaterThanOrEqual(STOP_SETTLE_MS)
+      expect(lifetime).toBeLessThan(9_000)
+    }
+  }
   expect(pageErrors).toBe(0)
 })

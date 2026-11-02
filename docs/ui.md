@@ -181,12 +181,12 @@ An agent that advertises `media-plan` states its plan on the control channel
 (`rc:media-plan`, [`remote-control.md` §5.1h](remote-control.md#51h-a-session-says-what-it-got-fr-135-r2)).
 An older agent sends none, and its sessions read as they did. The reading and the
 wording are pure, in `composables/mediaPlan.ts`, and `useRemoteControl` holds the
-refs: `mediaPlan`, `mediaStop`, `mediaSilent`, `viewerHz`.
+refs: `mediaPlan`, `mediaStop`, `mediaSilent`, `mediaDataArrived`, `viewerHz`.
 
 | On the page | `data-testid` | When | Says |
 |---|---|---|---|
-| Overlay | `rc-media-stop` | The plan carries `stopped` | "This device could not start its video. It tried h264_nvenc, h264_amf and h264_vulkan, and none of them opened.", the device's word, and the backend's own words |
-| Overlay | `rc-media-silent` | A plan, no `stopped`, never painted, 6 s (`nextMediaSilent`) | "This device is set to send H.265 over the data channel, and no frame has arrived." This is what a page has on the two pumps that are not instrumented |
+| Overlay | `rc-media-stop` | The plan carries `stopped` | "This device could not open a video encoder. It tried h264_nvenc, h264_amf and h264_vulkan.", the device's word, and the backend's own words. The list spans the session's opens, so a failed rebuild lists the cell it ran on, and the words hold for that too |
+| Overlay | `rc-media-silent` | A plan, no `stopped`, never painted, 6 s (`nextMediaSilent`) | "This device is set to send H.265 over the data channel, and no frame has arrived." With a decode worker's byte count above zero (`mediaDataArrived`), "Data has arrived, and no picture has decoded from it." instead, because that is not a device that sent nothing. This overlay is what a page has on the two pumps that are not instrumented |
 | Stats pill | `rc-media-ladder` | The plan has at least one step down | The last arrow and the count, every arrow on hover |
 
 - **The overlays sit below `rc.mediaUnavailable` and `rc.mediaWaiting`**, because
@@ -197,7 +197,10 @@ refs: `mediaPlan`, `mediaStop`, `mediaSilent`, `viewerHz`.
   the silence and the plan across its `teardown`, or the page's one sentence would
   blink every 10 s. A new session's first plan knows only the transport and the codec,
   so it leaves the words alone (`mediaPlanAction`). An opened encoder clears them, and
-  so does the first picture.
+  so does the first picture. For a stop, that means the first frame past the settle
+  (`mediaStopAfterTick`): `encoder_fault` only follows frames and they ride another
+  channel, so a frame counted just after the stop may have been sent before it. Without
+  the wait, that frame took the sentence down and the plan never said it again.
 - **The overlays live on the connected stage, so the redial has a stage of its own**
   (`noPictureWhileRedialling`, the same shape as FR-93 P5j's `rc-host-asleep`). It says
   the same words under the same `data-testid`, with the attempt's own phase in its
@@ -207,7 +210,8 @@ refs: `mediaPlan`, `mediaStop`, `mediaSilent`, `viewerHz`.
 - **The backoff stays and stops blaming the network** (`deadAirNotice`). Three frameless
   sessions still slow the retries to minutes, whatever keeps the frames away. A plan
   came over the control channel, so "its network may be blocking the connection" is
-  left off for any session that has one.
+  left off for an attempt that heard one. A plan the redial kept from an earlier attempt
+  does not count: the path has to be working now.
 - **A plan is kept by `epoch`.** The next session's plan starts at 1 again, so the page
   counts apart from the plan it shows and resets on `teardown`.
 - **A plan that says `webrtc` while a data-channel path runs stops that path**, so
