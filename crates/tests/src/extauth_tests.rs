@@ -2970,98 +2970,148 @@ async fn a_cleared_approval_ends_the_devices_external_sessions() {
     }
 }
 
-/// The admin's request lands on one pod and the session lives on the other, for
-/// each gate: only the ctrl event can reach it.
+/// One device on pod 1 and one outsider on pod 2, with a session that lives with the
+/// device. The admin's request lands on pod 2, so only the ctrl event can reach it.
+async fn session_on_the_other_pod(
+    app1: &TestApp,
+    app2: &TestApp,
+    seeded: &SeededTenant,
+    machine: &str,
+    tag: &str,
+) -> (Device, Ws, String) {
+    wait_for_bus(app1, app2).await;
+    let dev = device_with(app1, seeded, machine, &pw("device"), unattended()).await;
+    let (_, ws, session) = in_session(app2, &dev, tag).await;
+    assert!(
+        app1.state
+            .fleet()
+            .rc_hub
+            .session_snapshot(oid(&session))
+            .is_some()
+            && app2
+                .state
+                .fleet()
+                .rc_hub
+                .session_snapshot(oid(&session))
+                .is_none(),
+        "the session lives with the device, on pod 1"
+    );
+    (dev, ws, session)
+}
+
 #[tokio::test]
-async fn an_off_switch_on_the_other_pod_ends_the_session() {
+async fn a_cleared_approval_on_the_other_pod_ends_the_session() {
     let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
     if app1.state.cluster_bus.is_none() {
-        eprintln!("SKIPPED an_off_switch_on_the_other_pod_ends_the_session: no Redis");
+        eprintln!("SKIPPED a_cleared_approval_on_the_other_pod_ends_the_session: no Redis");
         return;
     }
-    wait_for_bus(&app1, &app2).await;
-
-    let seeded = app1.seed_tenant("extauth-xpod-off").await;
-    let admin = &seeded.admin.access_token;
-    let dev = device_with(
+    let seeded = app1.seed_tenant("extauth-xpod-clear").await;
+    let (dev, mut ws, session) = session_on_the_other_pod(
         &app1,
+        &app2,
         &seeded,
-        "mach-extauth-xpod-off",
-        &pw("device"),
-        unattended(),
+        "mach-extauth-xpod-clear",
+        "extxpodclr",
     )
     .await;
-    let (principal, mut ws) = outsider(&app2, "extxpodoff").await;
-    let hub1 = &app1.state.fleet().rc_hub;
-    let hub2 = &app2.state.fleet().rc_hub;
     let policy = url(
         &seeded,
         &format!("/agent/{}/external-access-policy", dev.agent_id),
     );
-
-    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
-    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
-    assert!(
-        hub1.session_snapshot(oid(&session)).is_some()
-            && hub2.session_snapshot(oid(&session)).is_none(),
-        "the session lives with the device, on pod 1"
-    );
     assert_eq!(
-        put(&app2, &policy, admin, json!({ "approved": false })).await,
+        put(
+            &app2,
+            &policy,
+            &seeded.admin.access_token,
+            json!({ "approved": false })
+        )
+        .await,
         200
     );
     put_out(&mut ws, &session).await;
-    assert!(hub1.session_snapshot(oid(&session)).is_none());
-
-    assert_eq!(
-        put(&app1, &policy, admin, json!({ "approved": true })).await,
-        200
-    );
-    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
-    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
     assert!(
-        hub1.session_snapshot(oid(&session)).is_some()
-            && hub2.session_snapshot(oid(&session)).is_none(),
-        "the session lives with the device, on pod 1"
+        app1.state
+            .fleet()
+            .rc_hub
+            .session_snapshot(oid(&session))
+            .is_none()
     );
+    let _ = dev.stop.send(true);
+}
+
+#[tokio::test]
+async fn the_org_switch_going_off_on_the_other_pod_ends_the_session() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_bus.is_none() {
+        eprintln!("SKIPPED the_org_switch_going_off_on_the_other_pod_ends_the_session: no Redis");
+        return;
+    }
+    let seeded = app1.seed_tenant("extauth-xpod-off").await;
+    let (dev, mut ws, session) =
+        session_on_the_other_pod(&app1, &app2, &seeded, "mach-extauth-xpod-off", "extxpodoff")
+            .await;
     assert_eq!(
         put(
             &app2,
             &url(&seeded, "/external-access"),
-            admin,
+            &seeded.admin.access_token,
             json!({ "enabled": false })
         )
         .await,
         200
     );
     put_out(&mut ws, &session).await;
-    assert!(hub1.session_snapshot(oid(&session)).is_none());
+    assert!(
+        app1.state
+            .fleet()
+            .rc_hub
+            .session_snapshot(oid(&session))
+            .is_none()
+    );
     let _ = dev.stop.send(true);
 }
 
-/// The crossing, for the gates. They read open, an admin turns one off and finds no
-/// session yet, and the Hub opens one. Played here by writing the gate through the
-/// DAO, which ends nothing, under a live session: what `session_opened` then reads
-/// is all that stands between that session and the gate. The row it is handed is
-/// the one the gates read, from before the write, as in the real call. With both
-/// gates open it ends nothing, so the ending below is the gate's doing.
+/// What the Hub opening a session sets off, on the row the gates read: from before
+/// any write the crossing tests make, as in the real call.
+async fn session_opened_on(
+    app: &TestApp,
+    agent: &roomler_ai_remote_control::models::Agent,
+    principal: &str,
+) {
+    let remote = app.state.modules.remote.clone().unwrap();
+    roomler_ai_mod_remote::extauth::session_opened(
+        &remote,
+        agent,
+        agent.id.unwrap(),
+        oid(principal),
+        "crossing",
+    )
+    .await;
+}
+
+/// The crossing, for gate 2. The gates read it open, an admin clears it and finds no
+/// session yet, and the Hub opens one. Played here by writing the approval through
+/// the DAO, which ends nothing, under a live session: what `session_opened` then
+/// reads is all that stands between that session and the gate. With the gates open
+/// it ends nothing, so the ending below is the gate's doing.
 #[tokio::test]
-async fn a_gate_that_crossed_an_opening_session_ends_it() {
+async fn a_cleared_approval_that_crossed_an_opening_session_ends_it() {
     use roomler_ai_remote_control::models::ExternalAccessPolicy;
     let app = TestApp::spawn().await;
-    let seeded = app.seed_tenant("extauth-gate-cross").await;
+    let seeded = app.seed_tenant("extauth-cross-2").await;
     let dev = device_with(
         &app,
         &seeded,
-        "mach-extauth-gate-cross",
+        "mach-extauth-cross-2",
         &pw("device"),
         unattended(),
     )
     .await;
-    let (principal, mut ws) = outsider(&app, "extgatecross").await;
+    let (principal, mut ws, session) = in_session(&app, &dev, "extcrosstwo").await;
+    noted(&app, &seeded, &dev, &principal, None).await;
     let fleet = app.state.fleet();
-    let remote = app.state.modules.remote.clone().unwrap();
-    let (tenant, device, who) = (oid(&seeded.tenant_id), oid(&dev.agent_id), oid(&principal));
+    let (tenant, device) = (oid(&seeded.tenant_id), oid(&dev.agent_id));
     let agent = fleet
         .agents
         .base
@@ -3069,10 +3119,7 @@ async fn a_gate_that_crossed_an_opening_session_ends_it() {
         .await
         .unwrap();
 
-    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
-    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
-    noted(&app, &seeded, &dev, &principal, None).await;
-    roomler_ai_mod_remote::extauth::session_opened(&remote, &agent, device, who, "crossing").await;
+    session_opened_on(&app, &agent, &principal).await;
     tokio::time::sleep(SETTLE).await;
     assert!(
         fleet.rc_hub.session_snapshot(oid(&session)).is_some(),
@@ -3089,25 +3136,42 @@ async fn a_gate_that_crossed_an_opening_session_ends_it() {
         fleet.rc_hub.session_snapshot(oid(&session)).is_some(),
         "the DAO ends nothing: this is the state the race leaves"
     );
-    roomler_ai_mod_remote::extauth::session_opened(&remote, &agent, device, who, "crossing").await;
+    session_opened_on(&app, &agent, &principal).await;
     put_out(&mut ws, &session).await;
+    let _ = dev.stop.send(true);
+}
 
-    let policy = url(
+/// The crossing, for gate 1, on the terms of the test above.
+#[tokio::test]
+async fn an_org_switch_that_crossed_an_opening_session_ends_it() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-cross-1").await;
+    let dev = device_with(
+        &app,
         &seeded,
-        &format!("/agent/{}/external-access-policy", dev.agent_id),
+        "mach-extauth-cross-1",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws, session) = in_session(&app, &dev, "extcrossone").await;
+    noted(&app, &seeded, &dev, &principal, None).await;
+    let fleet = app.state.fleet();
+    let (tenant, device) = (oid(&seeded.tenant_id), oid(&dev.agent_id));
+    let agent = fleet
+        .agents
+        .base
+        .find_by_id_in_tenant(tenant, device)
+        .await
+        .unwrap();
+
+    session_opened_on(&app, &agent, &principal).await;
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        fleet.rc_hub.session_snapshot(oid(&session)).is_some(),
+        "both gates open: this ends nothing"
     );
-    assert_eq!(
-        put(
-            &app,
-            &policy,
-            &seeded.admin.access_token,
-            json!({ "approved": true })
-        )
-        .await,
-        200
-    );
-    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
-    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+
     fleet
         .tenants
         .base
@@ -3122,67 +3186,87 @@ async fn a_gate_that_crossed_an_opening_session_ends_it() {
         fleet.rc_hub.session_snapshot(oid(&session)).is_some(),
         "the DAO ends nothing: this is the state the race leaves"
     );
-    roomler_ai_mod_remote::extauth::session_opened(&remote, &agent, device, who, "crossing").await;
+    session_opened_on(&app, &agent, &principal).await;
     put_out(&mut ws, &session).await;
     let _ = dev.stop.send(true);
 }
 
 /// A second "off" changes nothing that was stored, and it still ends the session:
-/// the first may have raced it. The gate here is the state such a race leaves, with
-/// the row closed and the session live.
+/// the first may have raced it. The switch here is the state such a race leaves,
+/// with the row off and the session live.
 #[tokio::test]
-async fn a_repeated_off_switch_still_ends_the_session() {
-    use roomler_ai_remote_control::models::ExternalAccessPolicy;
+async fn a_repeated_org_switch_off_still_ends_the_session() {
     let app = TestApp::spawn().await;
-    let seeded = app.seed_tenant("extauth-gate-repeat").await;
-    let admin = &seeded.admin.access_token;
+    let seeded = app.seed_tenant("extauth-repeat-1").await;
     let dev = device_with(
         &app,
         &seeded,
-        "mach-extauth-gate-repeat",
+        "mach-extauth-repeat-1",
         &pw("device"),
         unattended(),
     )
     .await;
-    let (principal, mut ws) = outsider(&app, "extgaterepeat").await;
-    let fleet = app.state.fleet();
-    let (tenant, device) = (oid(&seeded.tenant_id), oid(&dev.agent_id));
-    let switch = url(&seeded, "/external-access");
-    let policy = url(
-        &seeded,
-        &format!("/agent/{}/external-access-policy", dev.agent_id),
-    );
-
-    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
-    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
-    fleet
+    let (_, mut ws, session) = in_session(&app, &dev, "extrepeatone").await;
+    app.state
+        .fleet()
         .tenants
         .base
         .update_by_id(
-            tenant,
+            oid(&seeded.tenant_id),
             bson::doc! { "$set": { "settings.external_rc_enabled": false } },
         )
         .await
         .unwrap();
     assert_eq!(
-        put(&app, &switch, admin, json!({ "enabled": false })).await,
+        put(
+            &app,
+            &url(&seeded, "/external-access"),
+            &seeded.admin.access_token,
+            json!({ "enabled": false })
+        )
+        .await,
         200
     );
     put_out(&mut ws, &session).await;
+    let _ = dev.stop.send(true);
+}
 
-    assert_eq!(
-        put(&app, &switch, admin, json!({ "enabled": true })).await,
-        200
-    );
-    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
-    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
-    fleet
+/// The same, for a second clear of a device's approval.
+#[tokio::test]
+async fn a_repeated_clear_still_ends_the_session() {
+    use roomler_ai_remote_control::models::ExternalAccessPolicy;
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-repeat-2").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-repeat-2",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (_, mut ws, session) = in_session(&app, &dev, "extrepeattwo").await;
+    app.state
+        .fleet()
         .agents
-        .update_external_access_policy(tenant, device, &ExternalAccessPolicy::default())
+        .update_external_access_policy(
+            oid(&seeded.tenant_id),
+            oid(&dev.agent_id),
+            &ExternalAccessPolicy::default(),
+        )
         .await
         .unwrap();
     assert_eq!(
-        put(&app, &policy, admin, json!({ "approved": false })).await,
+        put(
+            &app,
+            &url(
+                &seeded,
+                &format!("/agent/{}/external-access-policy", dev.agent_id)
+            ),
+            &seeded.admin.access_token,
+            json!({ "approved": false })
+        )
+        .await,
         200
     );
     put_out(&mut ws, &session).await;

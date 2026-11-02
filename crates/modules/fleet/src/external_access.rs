@@ -463,11 +463,26 @@ pub async fn set_enabled(
             bson::doc! { "$set": { "settings.external_rc_enabled": body.enabled } },
         )
         .await?;
+    // FR-52 decision 16 — off means out: an admin flipping this in an incident
+    // believes everyone has gone, and their sessions have no standing left. After
+    // the write, and on a repeat too, for `set_principal`'s reason.
+    let ended_here = if body.enabled {
+        0
+    } else {
+        let ended = state.rc_hub.terminate_external_in(tid);
+        crate::ctrl::publish_rc_ctrl(
+            &state,
+            "terminate_external_org",
+            serde_json::json!({ "tenant_id": tid.to_hex() }),
+        )
+        .await;
+        ended
+    };
     // WARN rather than INFO: this is the switch that decides whether strangers
     // can reach this org's machines, and it should be visible in a log an
     // operator skims.
     warn!(
-        tenant = %tenant_id, admin = %auth.user_id, enabled = body.enabled,
+        tenant = %tenant_id, admin = %auth.user_id, enabled = body.enabled, ended_here,
         "external access: org switch changed"
     );
     Ok(Json(body))
@@ -549,9 +564,23 @@ pub async fn set_policy(
         .agents
         .update_external_access_policy(tid, aid, &requested)
         .await?;
+    // FR-52 decision 16 — cleared, not narrowed. A ceiling or an expiry applies
+    // from the next session, and the approval they sit under still stands.
+    let ended_here = if requested.approved {
+        0
+    } else {
+        let ended = state.rc_hub.terminate_external_on(aid, tid);
+        crate::ctrl::publish_rc_ctrl(
+            &state,
+            "terminate_external_device",
+            serde_json::json!({ "agent_id": aid.to_hex(), "tenant_id": tid.to_hex() }),
+        )
+        .await;
+        ended
+    };
     warn!(
         tenant = %tenant_id, agent = %agent_id, admin = %auth.user_id,
-        approved = requested.approved, ceiling = %spec.ceiling().wire_names(),
+        approved = requested.approved, ceiling = %spec.ceiling().wire_names(), ended_here,
         "external access: device approval changed"
     );
     Ok(Json(body))

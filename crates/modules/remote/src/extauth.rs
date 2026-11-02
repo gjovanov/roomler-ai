@@ -1375,6 +1375,9 @@ async fn open_session(
 /// and before the session existed for `set_principal` to find, so it ends here.
 /// A revoke written after this read finds the session in the Hub. Either way
 /// nobody slips between the two.
+///
+/// Decision 16 — gates 1 and 2 can cross it the same way, and nothing else reads
+/// them after the session exists, so they are read here first.
 pub async fn session_opened(
     state: &RemoteState,
     agent: &Agent,
@@ -1382,6 +1385,20 @@ pub async fn session_opened(
     principal: ObjectId,
     actor: &str,
 ) {
+    match org_gates_open(state, agent.tenant_id, device).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let ended =
+                state
+                    .fleet
+                    .rc_hub
+                    .terminate_external_of(device, principal, agent.tenant_id);
+            info!(%principal, agent = %device, ended, "extauth: a gate closed across this session; ended");
+        }
+        Err(e) => {
+            warn!(%e, %principal, agent = %device, "extauth: the gates could not be read again")
+        }
+    }
     let before = state
         .fleet
         .external_principals
@@ -1402,6 +1419,26 @@ pub async fn session_opened(
         Ok(Some(_)) => {}
         Err(e) => warn!(%e, %principal, agent = %device, "extauth: the session could not be noted"),
     }
+}
+
+/// Decision 16 — gates 1 and 2 as they stand now, from fresh rows. The row
+/// [`gates`] read is from before the session existed, and is the one this is
+/// asking about. An `Err` leaves the session running, as a failed `note_session`
+/// does: what runs behind a session never costs it on a read it could not make.
+async fn org_gates_open(
+    state: &RemoteState,
+    tenant_id: ObjectId,
+    device: ObjectId,
+) -> Result<bool, roomler_ai_services::dao::base::DaoError> {
+    let tenant = state.fleet.tenants.base.find_by_id(tenant_id).await?;
+    let agent = state
+        .fleet
+        .agents
+        .base
+        .find_by_id_in_tenant(tenant_id, device)
+        .await?;
+    let (approval, _) = agent.external_access_policy.split();
+    Ok(tenant.settings.external_rc_enabled && approval.is_open_at(bson::DateTime::now()))
 }
 
 /// Route a controller frame here if it is an `rc:extauth.*` frame. `None` =
