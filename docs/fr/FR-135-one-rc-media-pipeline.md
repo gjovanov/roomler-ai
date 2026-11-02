@@ -1036,7 +1036,7 @@ So a black canvas never again means "unknown": the viewer knows what it was prom
 
 | Event | Today | After | Bound |
 |---|---|---|---|
-| Decode error after the first frame | Worker stopped, 10 s watchdog [M 9.4-10.2 s] | `decoder.reset`, wait for a key, `rc:keyframe`, in place | ≤ 500 ms |
+| Decode error after the first frame | Worker stopped, 10 s watchdog [M 9.4-10.2 s] | A new decoder, because the error closed the old one and `reset` would throw; wait for a key, `rc:keyframe`, in place | ≤ 500 ms |
 | Chunk gap | Gate not re-armed (`rc-vp9-444-worker.ts:465-474`) | Re-arms the gate, asks once | ≤ 150 ms LAN |
 | Lost frame on ordered SCTP | Retransmit at RTO, floor 1 s; head-of-line stall | RTO floor lowered per association for RC only, because the vendored crate is shared with tunnels, and only where its arm reads clean: on a TCP-carried relay loss is queueing, and a lower floor would fire spuriously (R14) | measured first, on UDP and TCP-carried arms |
 | Repeated keyframe asks | 9 rationers | Throttle with backoff, in one place, cause-tagged | ≤ one per 2 RTT |

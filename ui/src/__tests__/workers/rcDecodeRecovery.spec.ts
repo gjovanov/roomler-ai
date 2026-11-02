@@ -323,6 +323,10 @@ describe.each(DC_WORKERS)('FR-135 R1 — $name', ({ load }) => {
     send({ type: 'chunk', bytes: framedChunk(1, 0, 1, frameBytes(true, 1)) })
     send({ type: 'chunk', bytes: framedChunk(2, 0, 1, frameBytes(false, 2)) })
     expect(decoder.chunks.map((c) => c.type)).toEqual(['key', 'delta'])
+    // Both came out, so no backlog: the shed also re-arms the gate, and this
+    // test must pass on the gap's doing alone.
+    decoder.init.output(fakeFrame(1))
+    decoder.init.output(fakeFrame(2))
     clock += 1_000 // past the resync debounce
     posted = []
 

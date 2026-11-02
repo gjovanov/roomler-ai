@@ -103,9 +103,12 @@ flowchart TB
   hardware decode* both hold.
 - **Transport control**: auto-pick, priority dial (balanced / sharper / smoother),
   keyframe requests, decoder-stats feedback to the agent (`rc:decodestat` — drives
-  its frame-skip rate control), one `rc:decode-error` per decode error before the
-  fallback to `<video>`, counted into the session's stats (FR-132 P1,
+  its frame-skip rate control), one `rc:decode-error` per decode error, counted into
+  the session's stats (FR-132 P1,
   [remote-control.md §11.10](remote-control.md#1110-the-viewers-decode-errors-fr-132-p1)),
+  a data-channel decoder that fails after its first frame replaced in place, off with
+  `roomler-rc-decode-recover=0` (FR-135 R1,
+  [remote-control.md §11.11](remote-control.md#1111-a-decode-error-recovers-in-place-fr-135-r1)),
   agent-local loopback-TURN probe for fast relayed
   paths on the same LAN.
 - **Input**: HID-mapped keyboard (keyboard-lock, Ctrl-Alt-Del / SAS chord),

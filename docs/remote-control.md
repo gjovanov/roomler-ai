@@ -2651,7 +2651,9 @@ delegation marker.
 Before FR-132 a decode error in the viewer's worker reached nobody: the page tore the WebCodecs
 path down and fell back to `<video>`, so a fleet week of a GPU-input cell could not be read for
 decode errors unless someone was watching a viewer. Now the viewer sends **one control message per
-decode error, before the fallback**, and the agent counts it into `rc:session.stats`.
+decode error, before the fallback**, and the agent counts it into `rc:session.stats`. On the two
+data-channel paths, after the first frame, there is no fallback any more unless recovery gives up:
+see [§11.11](#1111-a-decode-error-recovers-in-place-fr-135-r1).
 
 ```mermaid
 sequenceDiagram
@@ -2685,6 +2687,47 @@ an older agent ignores both (its control arm drops an unknown `t`); a session th
 a worker has nothing to count. Each reads as an absent field, so a fleet read (FR-132 §3d) compares
 only sessions that counted. **Record, never decide**: nothing on the agent changes because a viewer
 reported an error; the fallback is the viewer's own, as before.
+
+### 11.11 A decode error recovers in place (FR-135 R1)
+
+A decoder can fail mid-session: the GPU process restarts, a driver faults, a frame is corrupt. WebCodecs
+closes a `VideoDecoder` when it errors. Before R1 the page answered by stopping the worker, and on a
+data-channel session nothing else carries pixels, so the picture froze until the media watchdog
+re-created the session 10 s later. The worker now replaces its decoder and the session goes on. The bound
+is 500 ms from the error to the next paint ([FR-135 §6.8](fr/FR-135-one-rc-media-pipeline.md#68-recovery)).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Decoding: first frame painted
+    Decoding --> Recovering: decoder error, or decode() threw
+    Recovering --> Decoding: first paint after a key frame
+    Recovering --> Recovering: the new decoder fails too, budget left
+    Decoding --> WatchdogPath: 4th failure inside 10 s
+    Recovering --> WatchdogPath: 4th failure inside 10 s
+    WatchdogPath --> [*]: path stopped, session re-created about 10 s later
+```
+
+| Piece | What it does | Where |
+|---|---|---|
+| the decision | Whether this failure recovers. Before the first frame it does not: the page bans the transport and renegotiates, because the browser's probe was wrong. Past 3 rebuilds in 10 s it does not: a stream this decoder cannot take fails again on every key frame | `createDecodeRecovery`, `ui/src/workers/rc-decode-recovery.ts:66` |
+| the rebuild | A new decoder, configured as the old one was, and one `request-keyframe` at once. `reset()` is not an option, because the error already closed the codec and `reset()` then throws. The leading-delta gate drops deltas and keeps asking until the key frame lands | `rebuildDecoder`, `ui/src/workers/rc-vp9-444-worker.ts:506`, `ui/src/workers/rc-hevc-worker.ts:524` |
+| both failure routes | The decoder's error callback and `decode()` throwing go through one function. Without recovery each still posts its old message | `onDecoderFailure`, `rc-vp9-444-worker.ts:533`, `rc-hevc-worker.ts:551` |
+| the page | `decode-recovering` sends the same `rc:decode-error` as §11.10 and leaves the path up, so the agent's count still counts every error. `decode-recovered` logs the outage's length: `[rc] vp9-444 decode recovered in N ms, attempts K` | `useRemoteControl.ts:8222`, `:8524` |
+| a chunk gap | The deltas behind a gap reference the frame it lost, so the gap also re-arms the gate, on the same decoder. Before R1 they were decoded, painting garbage until the IDR landed, or failing the decoder | `rc-vp9-444-worker.ts:483`, `rc-hevc-worker.ts:501` |
+| the watchdog | Once a data-channel path has decoded a frame, only its frames count as progress: RTP bytes on the silent m-section must not hold off a re-create while the canvas is frozen. Before that frame RTP still counts, because the viewer opens its channel speculatively and an agent that ignores it sends RTP | `mediaAdvanced`, `useRemoteControl.ts:655` |
+
+**The switch.** `localStorage.setItem('roomler-rc-decode-recover', '0')` in a browser, then reconnect, is the
+old path in all of the above (`storedDecodeRecover`, `useRemoteControl.ts:4283`). Rolling back the whole fleet is
+promoting the previous image: this phase changes the viewer only, and an agent of any version answers the same
+`rc:keyframe` it always did. The agent clamps those asks to two a second, so an ask just after another waits up
+to 500 ms for the gate's next one.
+
+**What it does not cover.** The RTP transform worker (`rc-webcodecs-worker.ts`) keeps its fallback, because
+there `<video>` has real samples to show. A decoder that hangs without an error is still the watchdog's.
+
+The field proof is [`ui/e2e/vmtest-decode-recover.spec.ts`](../ui/e2e/vmtest-decode-recover.spec.ts). It forces a
+real `Decoding error.` from outside the product and times the next paint, so the same spec reads RED on an old
+viewer and GREEN on a new one.
 
 ## 12. Performance targets & budget
 
