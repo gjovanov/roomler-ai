@@ -174,7 +174,7 @@ every other device, and a per-device override outlives an agent losing a cell. T
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
 and telling nobody (`agents/roomlerd/src/signaling.rs:3501`), and the viewer ignores
 that track while it holds a DataChannel transport
-(`ui/src/composables/useRemoteControl.ts:9811`). The session reads connected, with a
+(`ui/src/composables/useRemoteControl.ts:9874`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
 watchdog quiet. So `transportForSession` (`ui/src/composables/videoCells.ts:437`)
 runs the auto rank for that session and leaves the pick stored (#3167). H.264 keeps
