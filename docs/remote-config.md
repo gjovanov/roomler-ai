@@ -194,7 +194,8 @@ leaves nothing waiting, so it reads `applied` at once, and a restart would chang
 nothing.
 
 Two limits. A build before P1c still turns the row to `applied` at a reconnect, and
-nothing on the wire tells the two apart. And an environment variable beats the file
+no capability word marks the difference, so read the row's `agent_version` against
+the release that carries it. And an environment variable beats the file
 for the encoder keys (`crates/tunnel-core/src/env.rs:30`), so a key set in the
 daemon's environment reads `applied` after a restart while the environment's value
 is in force, and no restart changes that. A supervised Mac worker gets the root's

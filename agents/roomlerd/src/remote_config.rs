@@ -41,8 +41,9 @@ use roomler_ai_remote_control::models::DesiredConfig;
 pub struct Applied {
     /// Keys that changed and are ALREADY in force.
     pub live: Vec<&'static str>,
-    /// Keys on disk that need a daemon restart to take effect: changed now, or
-    /// changed earlier and still not what this process runs.
+    /// Keys on disk that need a daemon restart to take effect: the ones this
+    /// process does not run, or with no process to speak for
+    /// ([`RemoteConfigServices::running_on`]) the ones this frame changed.
     pub needs_restart: Vec<&'static str>,
     /// This frame changed the file. The lists cannot say so on their own: a key
     /// written back to the value this process runs leaves nothing waiting, and
@@ -99,7 +100,7 @@ impl RunningKeys {
         // compiles. One that fell outside the list would read `applied` while
         // the daemon still ran the old value.
         let DesiredConfig {
-            // Live: `apply` puts it in force with the write.
+            // Live: `apply` puts it in force itself.
             exec_enabled: _,
             ssh_enabled,
             ssh_authorized_keys,
@@ -506,9 +507,13 @@ impl RemoteConfigServices {
             // running exec that its own config denies. And whenever the
             // document manages the key, not only on a change: a file edited by
             // hand already matches, and the gate would stay on what this
-            // process started with while the report read `noop`.
-            if desired.exec_enabled.is_some() {
-                exec_flag.store(cfg.exec_enabled, Ordering::Relaxed);
+            // process started with while the report read `noop`. A gate that
+            // moves is always in `live`, so the report and the log say it did.
+            if let Some(want) = desired.exec_enabled
+                && exec_flag.swap(want, Ordering::Relaxed) != want
+                && !applied.live.contains(&"exec_enabled")
+            {
+                applied.live.push("exec_enabled");
             }
             // FR-132 P1c — the lists above say what changed in the FILE, and
             // the report means what this process does not run yet. On a later
@@ -1094,11 +1099,12 @@ mod tests {
     }
 
     /// The live gate follows the document even when the file needs no write. A
-    /// hand edit turned exec off in the file and this process still ran it on, so
-    /// a push saying off found the file matching. Before, the report read
-    /// `noop`, the row read `applied`, and the gate stayed open.
+    /// hand edit changed the file and this process still ran the old value, so
+    /// a push saying the same found the file matching. Before, the report read
+    /// `noop`, the row read `applied`, and the gate stayed where it was. A gate
+    /// that moves is in `live` either way, because this one grants root.
     #[tokio::test]
-    async fn a_pushed_exec_off_closes_the_gate_when_the_file_already_matches() {
+    async fn a_push_moves_the_exec_gate_when_the_file_already_matches_and_says_so() {
         let dir = std::env::temp_dir().join(format!("fr132-p1c-exec-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
@@ -1113,28 +1119,43 @@ mod tests {
         )
         .running_on(&started);
 
-        let mut edited = started.clone();
-        edited.exec_enabled = false;
-        crate::config::save(&path, &edited).unwrap();
-        assert!(svc.exec_enabled(), "a hand edit is not in force yet");
-
-        let off = DesiredConfig {
-            exec_enabled: Some(false),
+        let hand_edit = |value: bool| {
+            let mut edited = started.clone();
+            edited.exec_enabled = value;
+            crate::config::save(&path, &edited).unwrap();
+        };
+        let exec = |value: bool| DesiredConfig {
+            exec_enabled: Some(value),
             ..Default::default()
         };
-        assert!(svc.apply(&off).await.unwrap().is_noop());
-        assert!(!svc.exec_enabled(), "the report and the gate agree");
+
+        // Closing.
+        hand_edit(false);
+        assert!(svc.exec_enabled(), "a hand edit is not in force yet");
+        let closed = svc.apply(&exec(false)).await.unwrap();
+        assert_eq!(closed.live, vec!["exec_enabled"], "the gate moved");
+        assert!(!closed.wrote, "the file already said so");
+        assert!(!svc.exec_enabled());
+        assert!(svc.apply(&exec(false)).await.unwrap().is_noop());
+
+        // Opening, which is the direction a reader of the log cares about.
+        hand_edit(true);
+        assert!(!svc.exec_enabled());
+        let opened = svc.apply(&exec(true)).await.unwrap();
+        assert_eq!(opened.live, vec!["exec_enabled"], "the gate moved");
+        assert!(!opened.wrote);
+        assert!(svc.exec_enabled());
+        assert!(svc.apply(&exec(true)).await.unwrap().is_noop());
 
         // A document that does not manage the key leaves the gate alone.
-        svc.adopt_local(&started);
-        assert!(svc.exec_enabled());
+        hand_edit(false);
         assert!(
             svc.apply(&DesiredConfig::default())
                 .await
                 .unwrap()
                 .is_noop()
         );
-        assert!(svc.exec_enabled());
+        assert!(svc.exec_enabled(), "not this document's to move");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

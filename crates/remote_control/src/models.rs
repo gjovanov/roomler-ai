@@ -3146,8 +3146,8 @@ pub enum ConfigOutcome {
     /// down is in `live` / `needs_restart` — see [`ConfigReport`].
     Applied,
     /// The device already matched; nothing was written. Distinct from
-    /// `Applied` with two empty lists so a reader can tell "converged" from
-    /// "applied nothing, and I am not sure why".
+    /// `Applied` with two empty lists, which says a key was written back to the
+    /// value the daemon runs (FR-132 P1c): the file changed and nothing waits.
     Noop,
     /// The device has not opted in: `remote_config_enabled` is off. This is
     /// gate 4 doing its job, not an error — the operator's move is to set the
