@@ -4479,13 +4479,38 @@ was asked for. A self-update measured at 3010 was online on the new version
 15 s later, with a record that called it failed.
 
 ⚠️ **The next daemon settles what the watcher never wrote.** A watcher can
-be stopped before its verdict (below), and a release cannot reach the
-watcher of the release before it, so the watcher alone could never fix the
-first jump. At the clean-run threshold the daemon reads the record, and
+be stopped before its verdict, and a release cannot reach the watcher of
+the release before it, so the watcher alone could never fix the first
+jump. At the clean-run threshold the daemon reads the record, and
 `post_install::settle_unreported` turns an `InProgress` into
 `SucceededVerified` when this daemon is the expected version, or, once the
 watcher's whole life has passed, into `WatcherStopped`. Younger than that
 it looks once more when the time is up.
+
+**What stops a watcher** (#3302). Measured beside a real per-user update,
+released 0.4.196 to 0.4.197, with four stand-ins running the same
+`post-install-watch`:
+
+| Who | Its console | Its VC runtime | How it ended |
+|---|---|---|---|
+| the real watcher | the daemon's | the install folder's | `0xC000013A` |
+| stand-in A | its own | the install folder's | `0xC000013A` |
+| stand-in B | the daemon's | the install folder's | `0xC000013A` |
+| stand-in C | its own | its own copy | still alive |
+| stand-in D | the daemon's | its own copy | `0xC000013A` |
+
+All four ended within 6 ms, 3.5 s after the MSI began, at Restart Manager's
+event 10002. `0xC000013A` is `STATUS_CONTROL_C_EXIT`, a console control event.
+So Restart Manager picks its targets by the files they hold and reaches them
+through their console, and either half is enough on its own: holding the
+runtime makes you a target, and sharing a console with a target gets you the
+same event.
+
+⚠️ **A staged copy does not keep a watcher off that list.** A copy in `%TEMP%`
+still loads `VCRUNTIME140.dll` from the install folder. What saves one is having
+no console at all: with the launcher's daemon (`roomlerdw.exe`) the record reached
+`SucceededVerified`, with no event 10002. `CREATE_NO_WINDOW` would not do it,
+because that hands the watcher a console of its own, which is stand-in A.
 
 **It must inherit no socket (#2836, Windows).** std's `Command` spawns
 with `bInheritHandles = TRUE`, so the watcher gets a copy of every
