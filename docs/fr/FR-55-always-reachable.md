@@ -188,9 +188,11 @@ The P4 anchors are verified against #3148's branch, on master `7e7a862ad`.
       without reading a log. *2026-10-31: proven on Linux, on the released `0.4.190`
       against production. Real suspends read `asleep` on the dashboard, in a peer's
       `roomler devices` and on the API, and the same device read plain `offline` when it
-      lost its network instead (field log). Owed: the same read on Windows and on a Mac,
-      whose hooks have not run in a field test. The box stays partial until they do: those
-      are the devices that sleep. 2026-10-30, #3148: built and proven through the real
+      lost its network instead (field log). 2026-11-01: Windows' hook has run for real.
+      Three laptops logged 11 goodbyes on `0.4.190`–`0.4.194`, and one of them was asleep at
+      the read, with `sleep` on its row on `0.4.195` (field log). Owed: a Mac, whose hook has
+      not run in a field test, and the chip read by eye on a Windows row. The box stays
+      partial until then. 2026-10-30, #3148: built and proven through the real
       server (`sleep_announce_tests`) and the real agent loop (`sleep_announce_agent`,
       shown failing first with the kill switch).*
 - [~] ⚠️ The macOS **clamshell** limitation is documented in the UI where the policy is
@@ -445,3 +447,34 @@ Still owed:
   in no field test, and laptops on those two systems are the devices that sleep. Putting one
   on `0.4.190` or newer to sleep and reading the grid is the whole test. AC5 stays partial
   until then.
+
+### 2026-11-01 — Windows' goodbye runs on real laptops, in production
+
+Nobody staged this one. A bounded read of production at 23:16Z (`agent_logs` through its text
+index, capped with `$limit`; `mongodb-0`'s restart count 1 before and after) looked for the
+goodbye over the 7 days the logs keep:
+
+| Windows laptop | goodbyes logged | on | the row at the read |
+|---|---|---|---|
+| A | 7, the last at 19:44:26Z | `0.4.190`, `0.4.191`, `0.4.192`, `0.4.194` | `offline` on `0.4.195`, `sleep: { at: 21:49:28Z, power: { policy: never, on_ac: true, held: false } }` |
+| B | 2, the last on 10-31 at 14:23Z | `0.4.190` | `online`, no `sleep` |
+| C | 2, the last on 10-31 at 20:34Z | `0.4.191` | `offline` on `0.4.192`, no `sleep` |
+
+- **The hook fires and the frame arrives before the machine goes.** A's `last_seen_at` is 29 ms
+  after its `sleep.at`, with its policy `never`, on mains, nothing held: asleep by policy,
+  which is what the chip exists to say.
+- **The wake works too.** A sleeping machine uploads nothing, so every line above reached
+  `agent_logs` after a wake, and A's span four releases. That also explains why A's own
+  21:49Z goodbye is on its row and not yet in the logs. B's row lost its `sleep` at its next
+  hello.
+- **C's later `offline` carries no reason,** so it went down without saying so. This read
+  can't tell why, and it doesn't need to: an unexplained `offline` is the row doing its job.
+- **No Mac logged a goodbye in those 7 days.** The IOKit hook is still unproven.
+
+Not read: the chip itself on a Windows row. A's org isn't one the reading account belongs to,
+and no access was created to look. From the code, `isAsleep` and the by-policy sentence in
+`ui/src/utils/devicePresence.ts` don't read the OS (only the closed-lid sentence does, on
+macOS), and the same chip was read on Linux on 10-31. So AC5's Windows half rests on the row
+and that code, not on a person's eyes.
+
+Still owed: a Mac asleep on `0.4.190` or newer. AC5 stays partial.

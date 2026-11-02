@@ -167,13 +167,13 @@ sudo dpkg -i /tmp/roomler-cli.deb
 > `linux-aarch64`. The arm64 build is made on Ubuntu 22.04, so it needs glibc
 > 2.35 or later, as the x86_64 agent does.
 
-> ⚠️ **On x86_64 Debian 12 and Ubuntu 22.04 the published CLI does not start**
-> (#3217). tunnel-v0.4.149 was built on Ubuntu 24.04, so its binary needs glibc
+> ⚠️ **On x86_64 Debian 12 and Ubuntu 22.04, tunnel-v0.4.149 does not start**
+> (#3217). It was built on Ubuntu 24.04, so its binary needs glibc
 > 2.39: the `.deb` installs, and `roomler` stops with `version 'GLIBC_2.39' not
-> found`. The tarball below is the same binary, so neither it nor
+> found`. Its tarball is the same binary, so neither it nor
 > `install.sh --role tunnel`'s fallback helps. The arm64 build is not affected.
-> The next tunnel release is built on Ubuntu 22.04, as the arm64 one is. Built
-> there it needs glibc 2.34, which its package declares, and it starts on both.
+> From tunnel-v0.4.192 the x86_64 build is made on Ubuntu 22.04, as the arm64 one
+> is. It needs glibc 2.34, which its package declares, and it starts on both.
 
 > ⚠️ **On those two, `tunnel-v0.3.0-rc.266` cannot install at all** (#2472). It
 > depends on `libssl3t64`, the name Debian 13 and Ubuntu 24.04 use; these two

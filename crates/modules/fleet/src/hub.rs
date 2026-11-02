@@ -1903,6 +1903,8 @@ impl Hub {
         // older agent ignores would be a promise nothing keeps.
         let idle_told = idle_secs.filter(|_| agent_enforces_idle);
         live.idle_secs = idle_told;
+        // FR-52 P5 — what a revocation ends (`terminate_external_of`).
+        live.external = external.is_some();
         // Multi-region relay: freeze the session's region NOW — a load-aware
         // pick over the agent's home + its RTT-ordered prefs — so Ready/
         // Offer/Answer all issue from the same PoP regardless of mid-setup
@@ -2522,6 +2524,40 @@ impl Hub {
             },
         );
         Ok(())
+    }
+
+    /// FR-52 P5 — end every session this pod holds that `principal` opened on
+    /// `agent_id` through an external login: what a revocation owes a person who
+    /// is already in. Any pod may run it, and only the one holding the session
+    /// finds anything. A session the same account holds as a member stands: that
+    /// door has its own gates. Returns how many ended.
+    ///
+    /// The tenant check is the `terminate` envelope's: a forged or mismatched
+    /// envelope cannot end another org's session.
+    pub fn terminate_external_of(
+        &self,
+        agent_id: ObjectId,
+        principal: ObjectId,
+        tenant_id: ObjectId,
+    ) -> usize {
+        // Collected first: `terminate` writes to the map this iterates.
+        let ended: Vec<ObjectId> = self
+            .inner
+            .sessions
+            .iter()
+            .filter_map(|e| {
+                let s = e.value().lock();
+                (s.external
+                    && s.agent_id == agent_id
+                    && s.controller_user_id == principal
+                    && s.tenant_id == tenant_id)
+                    .then_some(*e.key())
+            })
+            .collect();
+        for session_id in &ended {
+            let _ = self.terminate(*session_id, EndReason::AdminTerminated);
+        }
+        ended.len()
     }
 
     // ─── helpers ─────────────────────────────────────────────────────

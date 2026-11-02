@@ -27,7 +27,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
 - The agent hard-wires `yuv420` for the VP9/AV1/H.264 data-channel codecs
   (`agents/roomlerd/src/peer.rs:5332-5339`); the ONLY hardware 4:4:4 path is
   `hevc_nvenc` with the RExt profile (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:770-787`),
-  advertised by `hevc_chroma` iff the name is `hevc_nvenc` (`agents/roomlerd/src/encode/caps.rs:612-615`).
+  advertised by `hevc_chroma` iff the name is `hevc_nvenc` (`agents/roomlerd/src/encode/caps.rs:1046-1049`).
 - The picker (`ui/src/views/remote/RemoteControl.vue:2989-2997`) is a hard-coded list
   — `auto / av1 / hevc / hevc-444 / vp9-444 / vp9-420 / h264` — English literals, no
   i18n, chroma inside the value. Its per-agent override allow-list omitted `hevc-444`
@@ -39,7 +39,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
   (`release-agent.yml:2393-2416`) — several docs still say it does not.
 - There is **no video decoder anywhere on the agent side** (grep-confirmed). The
   browser decodes, through WebCodecs, and probes per codec string
-  (`ui/src/composables/useRemoteControl.ts:2958-2988`).
+  (`ui/src/composables/useRemoteControl.ts:2960-2990`).
 
 ### The size question, measured
 
@@ -150,7 +150,7 @@ flowchart LR
    hardware-only device, so a software implementation fails the open. (FR-16's
    "advertises hardware, runs software" case.)
 3. **The probe is eager, in the child, bounded.** One timeout per open; the probe's
-   duration reported in the hello. Today's probe (`caps.rs:51-318`) opens the first
+   duration reported in the hello. Today's probe (`caps.rs:51-710`) opens the first
    working backend per codec in ~2.6 s on the dev box; the matrix prunes to roughly
    16–18 opens on a Windows host. A cache keyed by GPU + driver version is added only if
    fleet p95 crosses ~3 s.
@@ -161,7 +161,7 @@ flowchart LR
    format, i18n keys, each impossible entry greyed with the reason as its subtitle.
    Auto chroma follows Priority (sharper ⇒ 4:4:4 when a cell exists; latency and
    balanced ⇒ 4:2:0). Auto codec under 4:4:4 ranks HEVC → VP9 → H.264 → libvpx; under
-   4:2:0 it keeps today's rank (`useRemoteControl.ts:2397-2502`). Explicit chroma
+   4:2:0 it keeps today's rank (`useRemoteControl.ts:2399-2504`). Explicit chroma
    overrides Priority; Priority only ever fills an Auto. The backend is never in the
    picker: it is a host fact, shown in the pill (FR-26 format).
 6. **Decode gating.** Pessimistic on the agent (probed cells only), optimistic on the

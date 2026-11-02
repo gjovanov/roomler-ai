@@ -121,6 +121,25 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
                 info!(session = %sid, "rc ctrl: terminate applied from another pod");
             }
         }
+        // FR-52 P5 — an admin barred a person from a device on another pod,
+        // and the session they are in may be here. `terminate_external_of`
+        // holds the tenant check `terminate` makes above.
+        Some("terminate_external") => {
+            let oid = |key: &str| {
+                ctrl.get(key)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok())
+            };
+            let (Some(aid), Some(uid), Some(tid)) =
+                (oid("agent_id"), oid("user_id"), oid("tenant_id"))
+            else {
+                return;
+            };
+            let ended = hub.terminate_external_of(aid, uid, tid);
+            if ended > 0 {
+                info!(agent = %aid, principal = %uid, ended, "rc ctrl: revocation applied from another pod");
+            }
+        }
         // P2b — cycle an agent's WS so it re-establishes its overlay session
         // on the tenant's NEW block (self_ip binds once, at establish). Rides
         // the ctrl lane rather than a directed RPC because the renumber

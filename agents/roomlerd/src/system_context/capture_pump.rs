@@ -482,8 +482,8 @@ const DXGI_INIT_RETRY_BACKOFF: Duration = Duration::from_millis(120);
 ///
 /// rc.109 — the rebind BEFORE the build matters: `DuplicateOutput` returns
 /// E_ACCESSDENIED when the calling thread isn't on the desktop it's trying to
-/// duplicate. `try_change_desktop` dedupes (SetThreadDesktop only on a real
-/// change), so the steady-state cost is one OpenInputDesktop syscall. The
+/// duplicate. `try_change_desktop` rebinds on every call (its own comment
+/// says why), so the steady-state cost is a few syscalls. The
 /// desktop name is logged so a PERSISTENT post-rebind E_ACCESSDENIED — the
 /// thread IS on the right desktop but duplication is still denied (another
 /// process holds it, or a session-0 nuance) — is distinguishable in the field.
@@ -912,9 +912,9 @@ fn capture_one_blocking(
             // (field: WINHOST-E). `SetThreadDesktop` is per-thread and this
             // always runs on `roomlerd-system-capture`, so the
             // rebind sticks for the BitBlt that follows. `try_change_desktop`
-            // dedupes (only SetThreadDesktop when the desktop actually
-            // changed), so steady-state cost is one OpenInputDesktop
-            // syscall (µs) per frame — negligible at GDI-fallback rates.
+            // rebinds on every call (its own comment says why), so the
+            // steady-state cost is a few syscalls (µs) per frame —
+            // negligible at GDI-fallback rates.
             match desktop_rebind::try_change_desktop() {
                 Ok(desktop_rebind::DesktopChange::Switched(name)) => {
                     tracing::info!(

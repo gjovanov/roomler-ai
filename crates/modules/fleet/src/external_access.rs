@@ -131,6 +131,23 @@ pub fn decide_approval(
     Ok(())
 }
 
+/// FR-52 P5 — who may bar a person from a device, or let them back. Gate 2's rule
+/// and for its reason: barring someone is not a grant, so `MANAGE_AGENTS` alone
+/// shuts the door, and letting them back opens it, so that takes
+/// `REMOTE_CONTROL` too.
+pub fn decide_revocation(
+    caller_permissions: u64,
+    revoked: bool,
+) -> Result<(), ExternalRcDenyReason> {
+    if !permissions::has(caller_permissions, permissions::MANAGE_AGENTS) {
+        return Err(ExternalRcDenyReason::NotDeviceAdmin);
+    }
+    if !revoked && !permissions::has(caller_permissions, permissions::REMOTE_CONTROL) {
+        return Err(ExternalRcDenyReason::CannotGrantExternal);
+    }
+    Ok(())
+}
+
 fn tenant_of(tenant_id: &str) -> Result<ObjectId, ApiError> {
     ObjectId::parse_str(tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))
@@ -301,6 +318,9 @@ pub struct ExternalRcAuditView {
     /// FR-52 P4 — `session` rows: the session an admitted login opened.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// FR-52 P5 — `principal` rows: the person the admin acted on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
 }
 
 impl From<ExternalRcAuditEvent> for ExternalRcAuditView {
@@ -323,6 +343,7 @@ impl From<ExternalRcAuditEvent> for ExternalRcAuditView {
             login_refused,
             login_detail,
             session_id,
+            principal,
         } = e;
         Self {
             id: id.map(|i| i.to_hex()),
@@ -339,8 +360,28 @@ impl From<ExternalRcAuditEvent> for ExternalRcAuditView {
             login_refused,
             login_detail,
             session_id: session_id.map(|s| s.to_hex()),
+            principal: principal.map(|p| p.to_hex()),
         }
     }
+}
+
+/// FR-52 P5 — one person from outside, as the org's list shows them.
+#[derive(Debug, Serialize)]
+pub struct ExternalPrincipalView {
+    pub agent_id: String,
+    pub user_id: String,
+    /// What the account calls itself today, read at this request: a claim, not
+    /// an identity (FR-52 decision 8). `None` once the account is gone.
+    pub name: Option<String>,
+    pub first_session_at: String,
+    pub last_session_at: String,
+    /// While set, this person is barred from this device.
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExternalPrincipalBody {
+    pub revoked: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -493,6 +534,7 @@ pub async fn set_policy(
         login_refused: None,
         login_detail: None,
         session_id: None,
+        principal: None,
     };
     if let Err(e) = state.external_rc_audit.record(event).await {
         // Best-effort, like the other decision logs: an audit insert must
@@ -621,6 +663,7 @@ pub async fn rotate_connect_code(
                     login_refused: None,
                     login_detail: None,
                     session_id: None,
+                    principal: None,
                 };
                 if let Err(e) = state.external_rc_audit.record(event).await {
                     warn!(%e, "external access: audit write failed");
@@ -688,6 +731,156 @@ pub async fn audit(
     })))
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// People (P5)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `GET /api/tenant/{tenant_id}/external-principals` — who has come in from
+/// outside, device by device. `VIEW_REMOTE_AUDIT`, as the log it sits beside.
+pub async fn principals(
+    State(state): State<FleetState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tid = tenant_of(&tenant_id)?;
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::VIEW_REMOTE_AUDIT,
+        "VIEW_REMOTE_AUDIT",
+    )
+    .await?;
+    let page = state
+        .external_principals
+        .list_for_tenant(tid, &params)
+        .await?;
+    let ids: Vec<ObjectId> = page.items.iter().map(|p| p.user_id).collect();
+    let names: std::collections::HashMap<ObjectId, String> = state
+        .users
+        .base
+        .find_by_ids(&ids)
+        .await?
+        .into_iter()
+        .filter_map(|u| Some((u.id?, u.display_name)))
+        .collect();
+    let items: Vec<ExternalPrincipalView> = page
+        .items
+        .into_iter()
+        .map(|p| ExternalPrincipalView {
+            agent_id: p.agent_id.to_hex(),
+            user_id: p.user_id.to_hex(),
+            name: names.get(&p.user_id).cloned(),
+            first_session_at: fmt_dt(p.first_session_at),
+            last_session_at: fmt_dt(p.last_session_at),
+            revoked_at: p.revoked_at.map(fmt_dt),
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "items": items,
+        "total": page.total,
+        "page": page.page,
+        "per_page": page.per_page,
+        "total_pages": page.total_pages,
+    })))
+}
+
+/// `PUT /api/tenant/{tenant_id}/agent/{agent_id}/external-principals/{user_id}`
+/// — bar a person from this device, or let them back.
+///
+/// A row of its own, never the whole-policy PUT: that one replaces the stored
+/// shape, and a person's standing is not part of the device's approval.
+///
+/// ⚠️ The verdict comes before the row is read, so a member with no business
+/// here gets one 403 whether or not that person ever came in. A session makes a
+/// row and this route never does, so a 404 here cannot be turned into a read of
+/// any account's name through the list ([`ExternalPrincipal`]).
+///
+/// ⚠️ A server gate, like 1 and 2. It stops an account from this server's side;
+/// it does not survive a compromised server, and anyone who knows the password
+/// can come back on another account. Changing the password on the device does
+/// both.
+///
+/// [`ExternalPrincipal`]: roomler_ai_remote_control::models::ExternalPrincipal
+pub async fn set_principal(
+    State(state): State<FleetState>,
+    auth: AuthUser,
+    Path((tenant_id, agent_id, user_id)): Path<(String, String, String)>,
+    Json(body): Json<ExternalPrincipalBody>,
+) -> Result<Json<ExternalPrincipalBody>, ApiError> {
+    let tid = tenant_of(&tenant_id)?;
+    let aid = agent_of(&agent_id)?;
+    let uid = ObjectId::parse_str(&user_id)
+        .map_err(|_| ApiError::BadRequest("Invalid user_id".to_string()))?;
+    let perms = state
+        .tenants
+        .get_member_permissions(tid, auth.user_id)
+        .await?;
+    // Tenant-scoped: an agent id from another org is a 404.
+    state.agents.base.find_by_id_in_tenant(tid, aid).await?;
+
+    let event = |denied: Option<ExternalRcDenyReason>| ExternalRcAuditEvent {
+        id: None,
+        tenant_id: tid,
+        action: ExternalRcAuditAction::Principal,
+        agent_id: aid,
+        user_id: auth.user_id,
+        actor: auth.username.clone(),
+        approved: Some(!body.revoked),
+        max_permissions: None,
+        expires_at: None,
+        at: DateTime::now(),
+        denied,
+        attempt_id: None,
+        login_refused: None,
+        login_detail: None,
+        session_id: None,
+        principal: Some(uid),
+    };
+    if let Err(reason) = decide_revocation(perms, body.revoked) {
+        if let Err(e) = state.external_rc_audit.record(event(Some(reason))).await {
+            warn!(%e, "external access: audit write failed");
+        }
+        return Err(ApiError::Forbidden(reason.message().to_string()));
+    }
+    let Some(changed) = state
+        .external_principals
+        .set_revoked(tid, aid, uid, auth.user_id, body.revoked)
+        .await?
+    else {
+        return Err(ApiError::NotFound(
+            "That person has not opened a session on this device".to_string(),
+        ));
+    };
+    if changed {
+        if let Err(e) = state.external_rc_audit.record(event(None)).await {
+            warn!(%e, "external access: audit write failed");
+        }
+        warn!(
+            tenant = %tenant_id, agent = %agent_id, admin = %auth.user_id, principal = %uid,
+            revoked = body.revoked, "external access: a person's standing changed"
+        );
+    }
+    // After the write, and on a repeat too: a session the first call raced is
+    // still ended by the second. The row is read again at every gate, so nobody
+    // new gets in while this runs.
+    if body.revoked {
+        state.rc_hub.terminate_external_of(aid, uid, tid);
+        crate::ctrl::publish_rc_ctrl(
+            &state,
+            "terminate_external",
+            serde_json::json!({
+                "agent_id": aid.to_hex(),
+                "user_id": uid.to_hex(),
+                "tenant_id": tid.to_hex(),
+            }),
+        )
+        .await;
+    }
+    Ok(Json(body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,6 +926,25 @@ mod tests {
             ),
             Err(ExternalRcDenyReason::CannotGrantExternal)
         );
+    }
+
+    /// P5 — the same rule, for one person. Barring needs `MANAGE_AGENTS` alone,
+    /// letting back needs the pair, and neither is open to anyone else.
+    #[test]
+    fn barring_a_person_is_not_a_grant_and_letting_them_back_is() {
+        let manager = permissions::MANAGE_AGENTS;
+        assert_eq!(decide_revocation(manager, true), Ok(()));
+        assert_eq!(
+            decide_revocation(manager, false),
+            Err(ExternalRcDenyReason::CannotGrantExternal)
+        );
+        assert_eq!(decide_revocation(ADMIN, false), Ok(()));
+        for revoked in [true, false] {
+            assert_eq!(
+                decide_revocation(permissions::REMOTE_CONTROL, revoked),
+                Err(ExternalRcDenyReason::NotDeviceAdmin)
+            );
+        }
     }
 
     /// Revocation is not a grant — the person who can open a door must not be

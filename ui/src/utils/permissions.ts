@@ -410,6 +410,33 @@ export function canViewSshAudit(mask: number | null, isOwner: boolean): boolean 
 }
 
 /**
+ * FR-52 P5 — the external-access log and the people list beside it. Server
+ * gate: `VIEW_REMOTE_AUDIT`, the bit the remote-session audit reads under.
+ */
+export function canViewExternalAudit(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, byKeys(['VIEW_REMOTE_AUDIT']))
+}
+
+/**
+ * FR-52 P5 — gate 2's rule, for one person: `MANAGE_AGENTS` alone shuts the door,
+ * because barring someone grants nothing. Letting them back opens it, so that
+ * takes `REMOTE_CONTROL` too. Server gate: `decide_revocation`.
+ */
+export function canBarExternalPerson(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS']))
+}
+
+export function canLetBackExternalPerson(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS', 'REMOTE_CONTROL']))
+}
+
+/**
  * May this caller ask a device to turn exec / SSH ON?
  *
  * `MANAGE_AGENTS` alone is NOT enough, and that is the whole point. Enabling
