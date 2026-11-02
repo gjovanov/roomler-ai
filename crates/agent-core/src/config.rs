@@ -613,12 +613,12 @@ pub struct AgentConfig {
     /// the vault decides is the owner's call.
     #[serde(default)]
     pub hive_egress: bool,
-    /// FR-90 P8-2a-1 — run a worker beside each agent session on this
-    /// device (`roomlerd hive-worker`, the same binary as the daemon's
-    /// supervised child), so a fault in what it serves costs that session's
-    /// worker and never the daemon. Unix first. Default OFF, and never
+    /// FR-90 P8-2a-1 — run a worker beside each agent session on this device
+    /// (`roomlerd hive-worker`, the same binary as the daemon's supervised
+    /// child) and, P8-2d-1, one for the device itself, so a fault in what one
+    /// serves costs that worker and never the daemon. Default OFF, and never
     /// pushable: how this device's own processes are arranged is the owner's
-    /// call.
+    /// call. Read as the daemon starts: a change waits for its next start.
     #[serde(default)]
     pub hive_worker: bool,
     /// FR-90 P4-3b-1 — what this device's knowhow scans read (decision 38):

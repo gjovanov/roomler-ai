@@ -42,7 +42,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::rustls;
 use tracing::{info, warn};
 
-use super::device::{InDaemon, Measure};
+use super::device::Measure;
 
 /// Answers kept, so a probe delivered again is answered as it was, never run
 /// twice.
@@ -88,6 +88,14 @@ impl Probed {
         }
     }
 
+    /// FR-90 P8-2d-1 — nothing was measured, and why: the word a probe gets
+    /// from a device whose worker cannot take it. The server records nothing
+    /// on a fact for it (decision 56).
+    #[cfg(worker_calls)]
+    pub(crate) fn failed(why: String) -> Self {
+        Self::of(ProbeOutcome::Failed, None, None, None, Some(why))
+    }
+
     /// `rc:knowhow.probed` for probe `id`, saying what was seen.
     pub(crate) fn answer(self, id: ObjectId) -> ClientMsg {
         reply(
@@ -104,7 +112,8 @@ impl Probed {
 /// The primary's prober: `knowhow_probe_reach` read from `config` under
 /// `lock` at each probe, each probe run once. FR-90 P8-2d-0 — what the probe
 /// reaches is the device's parts' to measure, through `measure`; the prober
-/// itself, what it was asked and what it answered, stays the daemon's.
+/// itself, what it was asked and what it answered, stays the daemon's. P8-2d-1
+/// — they measure in the device's worker where the owner turned workers on.
 pub struct Prober {
     config: PathBuf,
     lock: crate::config::WriteLock,
@@ -124,11 +133,20 @@ impl Prober {
     /// The daemon's: the list read from `config` under `lock` (the
     /// LocalAPI's own, so a probe never reads a half-written file).
     pub fn new(config: PathBuf, lock: crate::config::WriteLock) -> Arc<Self> {
+        Self::measuring(config, lock, super::device::measure())
+    }
+
+    /// [`Self::new`], its measures taken by `measure`.
+    pub(crate) fn measuring(
+        config: PathBuf,
+        lock: crate::config::WriteLock,
+        measure: Arc<dyn Measure>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config,
             lock,
             state: Mutex::new(State::default()),
-            measure: Arc::new(InDaemon),
+            measure,
         })
     }
 
@@ -773,6 +791,84 @@ mod tests {
         assert_eq!(outcome, ProbeOutcome::Failed);
         assert!(address.is_some() && rtt.is_some() && tls.is_none());
         assert!(detail.unwrap().contains("TLS handshake"));
+    }
+
+    /// FR-90 P8-2d-1 (AC2) — what a probe answers when it is measured in the
+    /// device's worker is what it answers in the daemon, byte for byte on the
+    /// wire but for the round trip, which is measured each time. Every kind of
+    /// answer: `ok` (a connect, and a certificate read), `unreachable`,
+    /// `not_allowed` and `failed`, through the daemon's prober.
+    #[cfg(worker_calls)]
+    #[tokio::test]
+    async fn a_probe_measured_in_the_devices_worker_answers_as_the_daemon_does() {
+        use crate::hive::device::InDaemon;
+        use crate::hive::worker::device::tests::in_process;
+
+        // The frame, as it goes on the wire: its round trip said as whether
+        // it has one, and how a handshake with no TLS there ended left out,
+        // which is the socket's timing and no process's.
+        let wire = |msg: &ClientMsg| {
+            let mut v = serde_json::to_value(msg).unwrap();
+            let rtt = v.get("rtt_ms").is_some_and(|r| !r.is_null());
+            v["rtt_ms"] = serde_json::json!(rtt);
+            let cut = v["detail"].as_str().and_then(|d| {
+                let (head, _) = d.split_once(": ")?;
+                head.contains("TLS handshake").then(|| head.to_string())
+            });
+            if let Some(cut) = cut {
+                v["detail"] = serde_json::json!(cut);
+            }
+            v
+        };
+        let (open, _) = counting().await;
+        let (shut, _held) = closed_port();
+        let (tls, der) = tls_server().await;
+        let mut named = asked("tls", "127.0.0.1", tls);
+        named.sni = Some("localhost".into());
+        let cases = [
+            (asked("tcp", "127.0.0.1", open), "ok"),
+            (named, "ok"),
+            (asked("tls", "127.0.0.1", open), "failed"),
+            (asked("tcp", "127.0.0.1", shut), "unreachable"),
+            (asked("tcp", "127.0.0.1", 9), "not_allowed"),
+            (asked("tcp", "169.254.169.254", 80), "not_allowed"),
+            (asked("http", "127.0.0.1", open), "failed"),
+            (asked("tcp", "127.0.0.1", 0), "failed"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = crate::config::test_fixture();
+        cfg.knowhow_probe_reach = vec![
+            format!("127.0.0.1:{open}"),
+            format!("127.0.0.1:{shut}"),
+            format!("127.0.0.1:{tls}"),
+        ];
+        crate::config::save(&path, &cfg).unwrap();
+        let worker = in_process();
+        let there = Prober::measuring(
+            path.clone(),
+            Default::default(),
+            Arc::clone(&worker) as Arc<dyn Measure>,
+        );
+        let here = Prober::measuring(path, Default::default(), Arc::new(InDaemon));
+        for (case, word) in cases {
+            let (tx, mut rx) = mpsc::channel(4);
+            Arc::clone(&there).request(case.clone(), tx);
+            let far = rx.recv().await.unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            Arc::clone(&here).request(case.clone(), tx);
+            let near = rx.recv().await.unwrap();
+            assert_eq!(wire(&far), wire(&near), "{case:?}");
+            assert_eq!(read(&far).0.as_str(), word, "{case:?}: {far:?}");
+            if case.kind == "tls" && word == "ok" {
+                let seen = read(&far).3.unwrap();
+                assert_eq!(seen.fingerprint, hex::encode(Sha256::digest(&der)));
+            }
+        }
+        // Every one of them crossed: the worker that answered is the first.
+        let s = worker.seen();
+        assert_eq!((s.starts, s.up), (1, true), "{s:?}");
+        worker.stop().await;
     }
 
     /// A secondary enrollment's connection probes nothing, and says so.

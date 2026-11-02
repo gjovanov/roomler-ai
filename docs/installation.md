@@ -1028,7 +1028,8 @@ signed-in user to those verbs, and the card edits as before.
 
 Where the device's owner turned workers on (`hive_worker`, `docs/hive.md`), each
 Hive session's worker runs in a cgroup of its own, its memory bounded at 512 MiB
-and kept off swap, **only where systemd delegates a cgroup with the memory
+and kept off swap, and in a build with the vault the device's own worker too, at
+1 GiB (FR-90 P8-2d-1), **only where systemd delegates a cgroup with the memory
 controller to the daemon's unit**. The packaged units do not. To give a system
 install the bound:
 
@@ -1041,7 +1042,7 @@ sudo systemctl restart roomlerd
 
 As the first worker starts, the daemon moves its own processes into a leaf of the
 unit's cgroup (`roomlerd.service/roomlerd`), since cgroup v2 hands a controller
-down only from a cgroup with no processes of its own, and logs `hive: a session's
+down only from a cgroup with no processes of its own, and logs `hive: a
 worker runs in a cgroup of its own, its memory bounded`. Without the drop-in it
 logs that the worker runs without one. A per-user install takes the same two
 lines through `systemctl --user edit roomler`.

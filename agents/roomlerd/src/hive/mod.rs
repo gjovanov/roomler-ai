@@ -161,7 +161,7 @@ mod vault_render;
 mod vault_request;
 pub mod view;
 /// FR-90 P8-2a-1 — `roomlerd hive-worker`: a session's worker, the
-/// daemon's supervised child (P8-2b-1: on Windows too).
+/// daemon's supervised child (P8-2b-1: on Windows too; P8-2d-1: the device's).
 mod worker;
 mod workspace;
 

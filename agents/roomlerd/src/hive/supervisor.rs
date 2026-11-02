@@ -773,11 +773,18 @@ pub fn begin_shutdown() {
 /// unsupervised daemon. [`begin_shutdown`] first, so each session task reads
 /// its harness's exit as going down with the daemon: the session is kept for
 /// the next daemon to resume, and nothing is reported. Bounded by
-/// [`WIND_DOWN_GRACE`].
+/// [`WIND_DOWN_GRACE`]. FR-90 P8-2d-1 — the device's worker goes beside them,
+/// so one that is hung costs its own grace and not theirs.
 pub async fn wind_down() {
-    if let Some(s) = global() {
-        s.wind_down().await;
-    }
+    let harnesses = async {
+        if let Some(s) = global() {
+            s.wind_down().await;
+        }
+    };
+    #[cfg(worker_calls)]
+    tokio::join!(harnesses, super::worker::device::wind_down());
+    #[cfg(not(worker_calls))]
+    harnesses.await;
 }
 
 /// FR-90 P1d-1 (AC7) — the sessions mid-turn on this daemon: what an update
@@ -872,6 +879,10 @@ pub fn init(cfg: &AgentConfig) {
     }
     let sup = Arc::new(sup);
     let _ = SUPERVISOR.set(Arc::clone(&sup));
+    // FR-90 P8-2d-1 — the device's worker, eagerly (decision 73): a cold start
+    // at a part's first frame would race the deadlines the server holds it to.
+    #[cfg(worker_calls)]
+    super::worker::device::start(sup.cfg.worker);
     // P2g-3d — the device's own clock, for the copies its store keeps.
     if sup.store.is_ok() {
         sup.spawn_retention_clock();
