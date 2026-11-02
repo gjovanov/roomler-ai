@@ -13923,10 +13923,13 @@ fn offer_carries_track(offer_sdp: &str, codec: &str) -> bool {
 
 #[cfg(test)]
 mod codec_cap_tests {
-    use super::TargetResolution::{self, Fixed, Native};
+    #[cfg(feature = "openh264-encoder")]
+    use super::TargetResolution::{Fixed, Native};
+    #[cfg(feature = "openh264-encoder")]
+    use super::rtp_frame_target;
     use super::{
-        build_video_codec_cap, codec_params_for, offered_video_codecs, rtp_frame_target,
-        rtp_track_codec, rtp_track_unanswerable, session_codec,
+        build_video_codec_cap, codec_params_for, offered_video_codecs, rtp_track_codec,
+        rtp_track_unanswerable, session_codec,
     };
     use roomler_ai_remote_control::models::{
         AgentCaps, ChromaFormat, VideoBackend, VideoCell, VideoCodec,
@@ -14024,6 +14027,8 @@ mod codec_cap_tests {
     /// #3245 — once the pump holds openh264, a frame above the encoder's ceiling
     /// never reaches it, whatever the viewer asks for. The viewer's default
     /// `original` puts the target back to Native after the auto-downscale has run.
+    /// A build without that encoder has no ceiling to hold to.
+    #[cfg(feature = "openh264-encoder")]
     #[test]
     fn a_pump_on_openh264_holds_its_frames_inside_the_ceiling() {
         let five_k = (5120, 1440);
@@ -14088,7 +14093,7 @@ mod codec_cap_tests {
             "above the ceiling it refuses the frame"
         );
 
-        let target = rtp_frame_target(TargetResolution::Native, (w, h), true);
+        let target = rtp_frame_target(Native, (w, h), true);
         let fitted = apply_target_resolution(&mut Resampler::new(), frame, target);
         assert_eq!((fitted.width, fitted.height), (3840, 1080));
         let mut inside = Openh264Encoder::new(fitted.width, fitted.height).expect("opens");
