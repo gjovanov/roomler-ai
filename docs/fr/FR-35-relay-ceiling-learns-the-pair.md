@@ -56,9 +56,9 @@ measured-rate line (#678: a sender cannot see capacity it is not using). Operato
 
 - `relay_max_bps()` = **3 Mbps** (`agents/roomlerd/src/encode/mod.rs:498`, env `RELAY_MAX_KBPS`),
   applied as the encoder's `maxrate` cap on every constrained session
-  (`encoder.rs` ↔ `rate_profile::ffmpeg_maxrate_bps_scaled`, `peer.rs:3209`), opened at 85 % =
+  (`encoder.rs` ↔ `rate_profile::ffmpeg_maxrate_bps_scaled`, `peer.rs:3218`), opened at 85 % =
   **2.55 Mbps**, and as the AIMD's ceiling (`governor.rs:264-283`); the send-queue budget derives
-  from the same constant (`peer.rs:4728`).
+  from the same constant (`peer.rs:4737`).
 - The AIMD (`encode/aimd.rs`) climbs additively (+ceiling/16 ≥ 150 kbps per 5 s of quiet) but
   **never above that ceiling**; it decreases ×0.85 on a full send channel, on a send-wait stall
   (#818) and on viewer-age excess (FR-15 P2). The governor's measured-ceiling clamp (stage 1) is
@@ -170,8 +170,8 @@ shipped defaults:
 - [ ] `relay_ceiling_learn=false` restores today's numbers byte-for-byte — needs a kill-switch A/B that
       restarts a relay-locked host's daemon (config `relay_ceiling_learn` applies on restart): an
       operator-scheduled run on a host nobody is using. **2026-10-31: a VM or a container with no GPU
-      cannot answer this.** The learner exists only in `media_pump_ffmpeg_dc` (`peer.rs:6353`, the
-      one caller of `relay_max_hi_bps()`), the VP9-444 pump passes `hi = 0` (`peer.rs:4216`), and the
+      cannot answer this.** The learner exists only in `media_pump_ffmpeg_dc` (`peer.rs:6393`, the
+      one caller of `relay_max_hi_bps()`), the VP9-444 pump passes `hi = 0` (`peer.rs:4225`), and the
       FFmpeg pump needs a hardware encoder. So on a host with no GPU the switch reads the same on and
       off, and a pass there proves nothing. It needs a session on a hardware encoder, on a relay, on a
       host whose daemon may restart. **2026-10-31, evening: that host exists.** A relay pinned in the
