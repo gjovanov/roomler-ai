@@ -146,6 +146,12 @@ save can push something newer, and the older read then goes out second and puts
 the device back on a config the operator replaced. Never send this frame any
 other way.
 
+Two races remain, and neither is reachable at a person's speed in the dialog.
+Reports are written by separate tasks, so two answers milliseconds apart can land
+out of order, and the row reads `pending`. Two PUTs inside the window between
+reading the row and writing it take the same revision, so the device can hold the
+document the row did not keep. The next connect heals both.
+
 **Wire.** A new `ServerMsg` variant carrying the desired keys.
 
 ⚠️ It must be gated on a hello capability flag. An older agent does not break on

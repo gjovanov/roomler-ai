@@ -2325,7 +2325,7 @@ function remoteConfigChip(
         color: 'info',
         icon: 'mdi-clock-outline',
         text: 'config pending',
-        tooltip: 'Waiting for the device to reconnect and reconcile.',
+        tooltip: 'Waiting for the device: a connected one answers within seconds, an offline one when it next connects.',
       }
     case 'reports_unsupported':
     case 'push_unsupported':
