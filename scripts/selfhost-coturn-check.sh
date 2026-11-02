@@ -141,10 +141,11 @@ coturn_says() {
 
 # A peer nothing routes to, and not the public address, for the plain allocations. No
 # message is sent: the client waits about 10 s for an echo from a peer that never answers.
+# It prints the address it was given only under -v.
 RELAY=""
 for how in UDP TCP; do
   flags=(); [ "$how" = TCP ] && flags=(-t)
-  client "${flags[@]}" -e 203.0.113.9 -n 0 -m 1 -l 120
+  client "${flags[@]}" -v -e 203.0.113.9 -n 0 -m 1 -l 120 -c
   rc=$?
   got="$(sed -n 's/.*Received relay addr: \([0-9.]*\):.*/\1/p' "$OUT" | head -1)"
   if [ "$rc" = 0 ] && [ -n "$got" ]; then
@@ -263,7 +264,7 @@ done
 # TURN client (the `turn` crate) request UDP only. TCP to the server is a different thing and stays.
 client -T -e "$RELAY" -r 80 -n 0 -m 1 -l 120 -c
 rc=$?
-if grep -aqE '\b442\b' "$OUT"; then
+if grep -aq 'error 442' "$OUT"; then
   pass "a TCP relay allocation is refused (442)"
 else
   fail "a TCP relay allocation was not refused with a 442 (client exit $rc)"
