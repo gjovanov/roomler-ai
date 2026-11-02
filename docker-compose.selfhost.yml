@@ -7,7 +7,11 @@
 #
 #   cp .env.selfhost.example .env.selfhost
 #   $EDITOR .env.selfhost                 # two secrets, both generated for you
-#   docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build
+#   docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost pull
+#   docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d
+#
+# Run `pull` first: `up -d` alone builds from source, which takes minutes rather
+# than seconds.
 #
 # Then open http://localhost:8080 and register — the first account owns the
 # first organization. Full walkthrough, including putting it behind a real
