@@ -63,7 +63,9 @@
 #![cfg(target_os = "windows")]
 
 use anyhow::{Result, bail};
+use std::cell::RefCell;
 use std::ffi::OsStr;
+use std::mem::ManuallyDrop;
 use std::os::windows::ffi::OsStrExt;
 
 use windows_sys::Win32::Foundation::{FALSE, GetLastError};
@@ -80,6 +82,21 @@ use crate::win_service::desktop::{
 /// feature doesn't currently re-export the constant. Value matches
 /// `winuser.h`.
 const WINSTA_ALL_ACCESS: u32 = 0x37F;
+
+thread_local! {
+    /// The handle this thread is bound to. `CloseDesktop` fails with
+    /// `ERROR_BUSY` on a handle a thread of this process is using, so a
+    /// handle can only be closed after the thread has left it: it waits
+    /// here until the next rebind. Dropping it right after the bind
+    /// leaked one handle per [`try_change_desktop`], 60 a second under
+    /// keep-busy, which reaches the 16.7M per-process limit in 3 days.
+    ///
+    /// `ManuallyDrop` because a thread still bound at exit can only fail
+    /// that close, and from a TLS destructor. The handle goes when the
+    /// process does, so the cost is one per thread rather than per call.
+    static BOUND_DESKTOP: RefCell<Option<ManuallyDrop<OwnedDesktop>>> =
+        const { RefCell::new(None) };
+}
 
 /// Result of [`try_change_desktop`]. Lets callers distinguish "no
 /// change, carry on" from "switched, log + force keyframe" without
@@ -173,6 +190,9 @@ pub fn try_change_desktop() -> Result<DesktopChange> {
     // but SendInput failed ACCESS_DENIED because the bound handle
     // had stale rights.
     set_thread_desktop(&input)?;
+    // The thread has just left the previous handle, so it can close now.
+    let previous = BOUND_DESKTOP.replace(Some(ManuallyDrop::new(input)));
+    drop(previous.map(ManuallyDrop::into_inner));
     if current_name == target_name {
         return Ok(DesktopChange::Unchanged);
     }
@@ -180,9 +200,8 @@ pub fn try_change_desktop() -> Result<DesktopChange> {
 }
 
 /// `SetThreadDesktop(desk)`. Per-thread; caller must guarantee `desk`
-/// outlives every operation made under it on this thread. RAII via
-/// `OwnedDesktop` + a single `attach`-and-leak in the input thread's
-/// loop covers this trivially.
+/// outlives every operation made under it on this thread, which also
+/// means past the end of the call: see `BOUND_DESKTOP`.
 ///
 /// Wraps the `win_service::desktop::set_thread_desktop` of the same
 /// shape — duplicated here only so the M3 A1 module exports a
@@ -201,6 +220,7 @@ pub fn set_thread_desktop(desk: &OwnedDesktop) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
 
     #[test]
     fn winsta_all_access_constant_is_correct() {
@@ -240,6 +260,36 @@ mod tests {
         // is acceptable — we lock against panic, not specific
         // outcomes.
         let _ = try_change_desktop();
+    }
+
+    #[test]
+    fn try_change_desktop_does_not_leak_a_handle_per_call() {
+        const CALLS: u32 = 2_000;
+        fn handle_count() -> u32 {
+            let mut count = 0;
+            // SAFETY: the pseudo-handle is always valid and `count`
+            // outlives the call.
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+            count
+        }
+        // Its own thread: the binding is per thread and outlives the call.
+        std::thread::spawn(|| {
+            // No reachable input desktop on this runner (a service
+            // account, say). Nothing to measure.
+            if try_change_desktop().is_err() {
+                return;
+            }
+            let before = handle_count();
+            for _ in 0..CALLS {
+                let _ = try_change_desktop();
+            }
+            // A bound, not an equality: other tests open handles in
+            // parallel with this one.
+            let grew = handle_count().saturating_sub(before);
+            assert!(grew < CALLS / 2, "{grew} handles after {CALLS} rebinds");
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

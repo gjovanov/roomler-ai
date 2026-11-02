@@ -66,6 +66,7 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
+use super::device::{Device, Unsent};
 use super::framing::{self, Bounds, Reassembler};
 use super::supervisor::{Author, Supervisor, global};
 use super::toolbelt::Decision;
@@ -355,69 +356,46 @@ impl Supervisor {
                 "this device holds no transcript of that session".into(),
             ));
         }
-        let rx = {
-            let mut map = self.viewers().lock();
-            // Idempotent on the grant id: a re-sent grant is answered again.
-            if map.contains_key(&grant.grant_id) {
-                return Ok(());
-            }
-            if map.len() >= view_limits::MAX_PER_DEVICE {
-                return Err((
-                    HiveViewRefusal::AtCapacity,
-                    format!(
-                        "this device already serves {} viewers",
-                        view_limits::MAX_PER_DEVICE
-                    ),
-                ));
-            }
-            let on_session = map
-                .values()
-                .filter(|v| v.session == grant.session_id)
-                .count();
-            if on_session >= view_limits::MAX_PER_SESSION {
-                return Err((
-                    HiveViewRefusal::AtCapacity,
-                    format!(
-                        "this session already has {} viewers",
-                        view_limits::MAX_PER_SESSION
-                    ),
-                ));
-            }
-            let (tx, rx) = mpsc::channel(64);
-            map.insert(
-                grant.grant_id,
-                Viewer {
-                    session: grant.session_id,
-                    cmd: tx,
-                    search: false,
-                },
-            );
-            rx
-        };
         // P1c-2 — the server names drivers; THIS device decides whom it lets
         // act as one of its accounts.
         let mut grant = grant;
         grant.copy = copy;
-        if grant.copy {
+        let driving_refused = if grant.copy {
             // P2d-5 — a copy is read only, whoever the server named: the
             // harness runs on another device. The hello says why.
             grant.may_prompt = false;
+            None
         } else if grant.may_prompt
             && let Err(why) =
                 self.drives_here(grant.session_id, grant.user_id, grant.user_email.as_deref())
         {
+            grant.may_prompt = false;
+            grant.driving_refused = Some(why.clone());
+            Some(why)
+        } else {
+            None
+        };
+        let (gid, sid, uid, may_prompt) = (
+            grant.grant_id,
+            grant.session_id,
+            grant.user_id,
+            grant.may_prompt,
+        );
+        // P8-2d-0 — the device's parts take it from here: a grant they hold
+        // already is answered again, and one past their room is refused.
+        if !self.device().view(grant)? {
+            return Ok(());
+        }
+        if let Some(why) = driving_refused {
             info!(
-                grant = %grant.grant_id, session = %grant.session_id, user = %grant.user_id,
+                grant = %gid, session = %sid, user = %uid,
                 %why, "hive: a driver the server named may not drive here — read only"
             );
-            grant.may_prompt = false;
-            grant.driving_refused = Some(why);
         }
         info!(
-            grant = %grant.grant_id, session = %grant.session_id, user = %grant.user_id,
-            may_prompt = grant.may_prompt, copy = grant.copy, "hive: view granted"
+            grant = %gid, session = %sid, user = %uid,
+            may_prompt, copy, "hive: view granted"
         );
-        tokio::spawn(run(Arc::clone(self), grant, store, rx));
         Ok(())
     }
 
@@ -477,45 +455,7 @@ impl Supervisor {
                 "this device holds a copy of none of those sessions".into(),
             ));
         }
-        let rx = {
-            let mut map = self.viewers().lock();
-            // Idempotent on the grant id, as a view grant is.
-            if map.contains_key(&g.grant_id) {
-                return Ok(());
-            }
-            if map.len() >= view_limits::MAX_PER_DEVICE {
-                return Err((
-                    HiveViewRefusal::AtCapacity,
-                    format!(
-                        "this device already serves {} viewers",
-                        view_limits::MAX_PER_DEVICE
-                    ),
-                ));
-            }
-            if map.values().filter(|v| v.search).count() >= search_limits::MAX_PER_DEVICE {
-                return Err((
-                    HiveViewRefusal::AtCapacity,
-                    format!(
-                        "this device already serves {} searches",
-                        search_limits::MAX_PER_DEVICE
-                    ),
-                ));
-            }
-            let (tx, rx) = mpsc::channel(64);
-            map.insert(
-                g.grant_id,
-                Viewer {
-                    session: ObjectId::from_bytes([0; 12]),
-                    cmd: tx,
-                    search: true,
-                },
-            );
-            rx
-        };
-        info!(
-            grant = %g.grant_id, user = %g.user_id, sessions = sessions.len(),
-            named = g.sessions.len(), "hive: search granted"
-        );
+        let (found, named) = (sessions.len(), g.sessions.len());
         let grant = ViewGrant {
             grant_id: g.grant_id,
             session_id: ObjectId::from_bytes([0; 12]),
@@ -528,7 +468,14 @@ impl Supervisor {
             ttl_secs: g.ttl_secs,
             search: Some(sessions.into()),
         };
-        tokio::spawn(run(Arc::clone(self), grant, store, rx));
+        // P8-2d-0 — the device's parts take it from here, as a view grant's.
+        if !self.device().view(grant)? {
+            return Ok(());
+        }
+        info!(
+            grant = %g.grant_id, user = %g.user_id, sessions = found,
+            named, "hive: search granted"
+        );
         Ok(())
     }
 
@@ -547,6 +494,77 @@ impl Supervisor {
     }
 }
 
+impl Device {
+    /// FR-90 P8-2d-0 — a view or search grant the daemon's gates passed: its
+    /// actor running, waiting for the viewer's offer, while this device has
+    /// room for it. `false`: a grant held already, answered again.
+    pub(crate) fn view(
+        self: &Arc<Self>,
+        grant: ViewGrant,
+    ) -> Result<bool, (HiveViewRefusal, String)> {
+        let store = self
+            .store
+            .clone()
+            .map_err(|e| (HiveViewRefusal::NoSession, e))?;
+        let search = grant.search.is_some();
+        let rx = {
+            let mut map = self.viewers.lock();
+            // Idempotent on the grant id: a re-sent grant is answered again.
+            if map.contains_key(&grant.grant_id) {
+                return Ok(false);
+            }
+            if map.len() >= view_limits::MAX_PER_DEVICE {
+                return Err((
+                    HiveViewRefusal::AtCapacity,
+                    format!(
+                        "this device already serves {} viewers",
+                        view_limits::MAX_PER_DEVICE
+                    ),
+                ));
+            }
+            if search {
+                // P2i-1 — a search counts toward the device's searches, and
+                // toward no session's viewers.
+                if map.values().filter(|v| v.search).count() >= search_limits::MAX_PER_DEVICE {
+                    return Err((
+                        HiveViewRefusal::AtCapacity,
+                        format!(
+                            "this device already serves {} searches",
+                            search_limits::MAX_PER_DEVICE
+                        ),
+                    ));
+                }
+            } else {
+                let on_session = map
+                    .values()
+                    .filter(|v| v.session == grant.session_id)
+                    .count();
+                if on_session >= view_limits::MAX_PER_SESSION {
+                    return Err((
+                        HiveViewRefusal::AtCapacity,
+                        format!(
+                            "this session already has {} viewers",
+                            view_limits::MAX_PER_SESSION
+                        ),
+                    ));
+                }
+            }
+            let (tx, rx) = mpsc::channel(64);
+            map.insert(
+                grant.grant_id,
+                Viewer {
+                    session: grant.session_id,
+                    cmd: tx,
+                    search,
+                },
+            );
+            rx
+        };
+        tokio::spawn(run(Arc::clone(self), grant, store, rx));
+        Ok(true)
+    }
+}
+
 /// How a grant's actor ended.
 enum End {
     /// The server closed it — it knows; nothing is reported.
@@ -555,9 +573,23 @@ enum End {
     Device(String),
 }
 
-/// The grant's actor: owns the peer from offer to close.
+/// A frame of the viewer's peer, on the primary connection that is up NOW.
+/// Not replayed: a viewer's handshake that loses a frame times out, and the
+/// browser asks again.
+fn send_view(device: &Device, msg: ClientMsg) {
+    match device.link.send(msg) {
+        Ok(()) | Err(Unsent::NotTheirs) => {}
+        Err(Unsent::Full) => {
+            debug!("hive: the control connection's queue is full — a view frame was dropped")
+        }
+        Err(Unsent::Gone) => debug!("hive: no control connection — a view frame was dropped"),
+    }
+}
+
+/// The grant's actor: owns the peer from offer to close. The device's part:
+/// it reaches the daemon through the device's seams alone (P8-2d-0).
 async fn run(
-    sup: Arc<Supervisor>,
+    device: Arc<Device>,
     grant: ViewGrant,
     store: super::store::StoreHandle,
     mut cmds: mpsc::Receiver<Cmd>,
@@ -572,8 +604,8 @@ async fn run(
     // `Some` while the viewer follows the live session: the feed, and the
     // newest `seq` it has been sent.
     let mut follow: Option<(broadcast::Receiver<Arc<EventEnvelope>>, u64)> = None;
-    let mut states = sup.subscribe_states();
-    let mut approvals = sup.subscribe_approvals();
+    let mut states = device.subscribe_states();
+    let mut approvals = device.subscribe_approvals();
 
     let end = loop {
         tokio::select! {
@@ -591,7 +623,7 @@ async fn run(
                             peer = Some(pc);
                             // Before any local candidate: they queue on
                             // `events` behind this and are sent after it.
-                            sup.send(ClientMsg::HiveViewAnswer { grant_id: gid, sdp: answer_sdp });
+                            send_view(&device, ClientMsg::HiveViewAnswer { grant_id: gid, sdp: answer_sdp });
                         }
                         Err(e) => break End::Device(format!("offer_refused: {e}")),
                     }
@@ -609,7 +641,7 @@ async fn run(
                 // The actor holds a sender: never closed while it runs.
                 None => break End::Device("internal".into()),
                 Some(PeerEvent::LocalIce(candidate)) => {
-                    sup.send(ClientMsg::HiveViewIce { grant_id: gid, candidate });
+                    send_view(&device, ClientMsg::HiveViewIce { grant_id: gid, candidate });
                 }
                 Some(PeerEvent::Channel(dc)) => {
                     if channel.is_some() || dc.label() != CHANNEL {
@@ -629,7 +661,7 @@ async fn run(
                             continue;
                         }
                     };
-                    if let Err(e) = on_request(&sup, &grant, &sid, &store, ch, &mut follow, &message).await {
+                    if let Err(e) = on_request(&device, &grant, &sid, &store, ch, &mut follow, &message).await {
                         break End::Device(e);
                     }
                 }
@@ -662,7 +694,7 @@ async fn run(
                     Err(broadcast::error::RecvError::Lagged(_)) => grant
                         .search
                         .is_none()
-                        .then(|| sup.pending_approvals(grant.session_id)),
+                        .then(|| device.seams.pending_approvals(grant.session_id)),
                     Err(broadcast::error::RecvError::Closed) => None,
                 };
                 if let Some(ids) = pending
@@ -676,7 +708,7 @@ async fn run(
     };
 
     // The one place a viewer peer is torn down.
-    sup.viewers().remove(gid);
+    device.viewers.remove(gid);
     drop(channel);
     if let Some(pc) = peer
         && let Err(e) = pc.close().await
@@ -687,10 +719,13 @@ async fn run(
         End::Server(reason) => info!(grant = %gid, %reason, "hive: view closed by the server"),
         End::Device(reason) => {
             info!(grant = %gid, %reason, "hive: view closed");
-            sup.send(ClientMsg::HiveViewClosed {
-                grant_id: gid,
-                reason,
-            });
+            send_view(
+                &device,
+                ClientMsg::HiveViewClosed {
+                    grant_id: gid,
+                    reason,
+                },
+            );
         }
     }
 }
@@ -923,7 +958,7 @@ fn batch(envs: &[EventEnvelope]) -> (Vec<Value>, bool) {
 
 /// One request from the viewer.
 async fn on_request(
-    sup: &Arc<Supervisor>,
+    device: &Device,
     grant: &ViewGrant,
     sid: &str,
     store: &super::store::StoreHandle,
@@ -942,13 +977,16 @@ async fn on_request(
     match req.get("op").and_then(Value::as_str).unwrap_or("") {
         "hello" => {
             let tip = store.tip(sid).await.unwrap_or(0);
-            let state = sup.run_state(grant.session_id).map(HiveRunState::as_str);
+            let state = device
+                .seams
+                .run_state(grant.session_id)
+                .map(HiveRunState::as_str);
             ch.send(&json!({
                 "op": "hello",
                 "v": 1,
                 "session": sid,
                 "tip": tip,
-                "live": sup.holds_live(grant.session_id),
+                "live": device.seams.holds_live(grant.session_id),
                 "state": state,
                 "may_prompt": grant.may_prompt,
                 // A driver is who answers (design §4.5): the grant that may
@@ -960,7 +998,7 @@ async fn on_request(
                 // P2d-5 — a copy this device holds as a member: read only,
                 // the session running (or having run) elsewhere.
                 "copy": grant.copy,
-                "approvals": sup.pending_approvals(grant.session_id),
+                "approvals": device.seams.pending_approvals(grant.session_id),
             }))
             .await
         }
@@ -1015,7 +1053,9 @@ async fn on_request(
                     user_id: grant.user_id,
                     name: grant.user_name.clone(),
                 };
-                sup.prompt(grant.session_id, Some(author), text.to_string())
+                device
+                    .seams
+                    .prompt(grant.session_id, Some(author), text.to_string())
                     .err()
             };
             match refused {
@@ -1066,7 +1106,9 @@ async fn on_request(
                             user_id: grant.user_id,
                             name: grant.user_name.clone(),
                         };
-                        sup.answer_approval(grant.session_id, &approval, decision, by)
+                        device
+                            .seams
+                            .answer_approval(grant.session_id, &approval, decision, by)
                             .err()
                     }
                 }

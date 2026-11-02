@@ -558,6 +558,10 @@ pub struct AgentCaps {
     ///   to the viewer's stage (macOS; a Linux system install, a Wayland
     ///   desktop). Until P3e-2 the viewer offered the toggle on Windows only,
     ///   by OS; it now follows this word, and an absent key still offers it.
+    /// * `encoder-cells` — #3267: encoder cells this host learned not to open,
+    ///   because its capability probe died in them (`learned-deny`, naming each
+    ///   cell and how the probe ended). For a fleet read: `video_cells` and the
+    ///   other lists already leave them out, and no viewer control follows it.
     ///
     /// Empty from every agent before P0c: those agents claim what their lists
     /// say, so an absent key never means "unavailable".
@@ -622,12 +626,13 @@ impl Unavailable {
     /// The feature means nothing on this OS: hide the control.
     pub const NOT_APPLICABLE: &'static str = "not-applicable";
     /// The keys [`AgentCaps::unavailable`] may carry, in wire spelling.
-    pub const KEYS: [&'static str; 5] = [
+    pub const KEYS: [&'static str; 6] = [
         "audio",
         "clipboard",
         "clipboard-image-events",
         "sas",
         "display-match",
+        "encoder-cells",
     ];
 
     pub fn new(code: &str, reason: &str) -> Self {
@@ -7952,7 +7957,9 @@ mod tests {
                 "clipboard-image-events",
                 "sas",
                 // FR-97 P3e-2 — added, never renamed: an older viewer ignores it.
-                "display-match"
+                "display-match",
+                // #3267 — the same: no viewer asks for it, a fleet read does.
+                "encoder-cells"
             ]
         );
         assert_eq!(Unavailable::NOT_APPLICABLE, "not-applicable");
