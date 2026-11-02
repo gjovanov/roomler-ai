@@ -2541,6 +2541,8 @@ mod sshd {
             run_as,
             // FR-97 P5b — in the person's home, where sshd runs a command.
             start_in_home: true,
+            // #3303 — it ends with this session, however the daemon leaves.
+            session_owned: true,
         };
 
         let finished = if streaming {
