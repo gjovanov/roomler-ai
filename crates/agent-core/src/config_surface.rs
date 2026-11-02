@@ -1737,6 +1737,14 @@ const KEYS: &[KeyMeta] = &[
         description: "#3267 - when the encoder probe's child dies inside one encoder cell, run it again and cost that cell rather than every hardware encoder on the host. Off: one child, and its death means no hardware. Built-in default: on. Env: ROOMLERD_CAPS_LEARN_DENY. Restart required.",
     },
     KeyMeta {
+        key: "caps_probe_retry",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "#3280 - when the encoder probe's first answer ran short of time, try again by itself, with more time and no restart, giving way to any session. Off: that answer stands until the next start. Built-in default: on. Env: ROOMLERD_CAPS_PROBE_RETRY. Restart required.",
+    },
+    KeyMeta {
         key: "encoder_cells_deny",
         group: Group::VideoEncoding,
         tier: Tier::Advanced,
@@ -2211,6 +2219,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "text_mod_neutralize" => cfg.text_mod_neutralize.map(fmt_bool),
         "caps_cache" => cfg.caps_cache.map(fmt_bool),
         "caps_learn_deny" => cfg.caps_learn_deny.map(fmt_bool),
+        "caps_probe_retry" => cfg.caps_probe_retry.map(fmt_bool),
         "fps_high" => cfg.fps_high.map(fmt_bool),
         "encoder_cells_deny" => cfg.encoder_cells_deny.clone(),
         "fps_deny" => cfg.fps_deny.clone(),
@@ -2845,6 +2854,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "text_mod_neutralize" => cfg.text_mod_neutralize = parse_tribool(value)?,
         "caps_cache" => cfg.caps_cache = parse_tribool(value)?,
         "caps_learn_deny" => cfg.caps_learn_deny = parse_tribool(value)?,
+        "caps_probe_retry" => cfg.caps_probe_retry = parse_tribool(value)?,
         "fps_high" => cfg.fps_high = parse_tribool(value)?,
         "zero_copy" => cfg.zero_copy = parse_tribool(value)?,
         "color_description" => cfg.color_description = parse_tribool(value)?,
@@ -5371,6 +5381,23 @@ mod tests {
         );
         apply(&mut cfg, "caps_learn_deny", None).unwrap();
         assert_eq!(cfg.caps_learn_deny, None);
+    }
+
+    /// #3280 — and so does the retry's.
+    #[test]
+    fn caps_probe_retry_is_a_tribool_that_bridges() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(entry_for(&cfg, "caps_probe_retry").unwrap().kind, "tribool");
+        apply(&mut cfg, "caps_probe_retry", Some("0")).unwrap();
+        assert_eq!(cfg.caps_probe_retry, Some(false));
+        assert!(
+            crate::config::env_bridge_bools(&cfg)
+                .iter()
+                .any(|(s, v)| *s == "CAPS_PROBE_RETRY" && *v == Some(false)),
+            "the kill switch must reach the daemon through the S2 bridge"
+        );
+        apply(&mut cfg, "caps_probe_retry", None).unwrap();
+        assert_eq!(cfg.caps_probe_retry, None);
     }
 
     /// FR-119 — `fps_high` is a tribool that reaches the daemon as

@@ -57,7 +57,7 @@ sequenceDiagram
 [`display_match.rs:1297`](../agents/roomlerd/src/display_match.rs#L1297) `may_switch` is the decision, pure and
 unit-tested. [`display_match.rs:1322`](../agents/roomlerd/src/display_match.rs#L1322) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:10590`](../agents/roomlerd/src/peer.rs#L10590)).
+control-channel arm sends the answer ([`peer.rs:10802`](../agents/roomlerd/src/peer.rs#L10802)).
 
 ### The answers
 
@@ -77,7 +77,7 @@ Every request gets exactly one `rc:display-match.state`
 ⚠️ An agent from before FR-108 answers nothing, and the viewer then shows the toggle as it always did. A word
 this viewer does not know, from a newer agent, is shown as it came and never read as success
 ([`displayMatch.ts:39`](../ui/src/composables/displayMatch.ts#L39) `describeDisplayMatchRefusal`). The viewer
-puts the answer under the toggle ([`RemoteControl.vue:4454`](../ui/src/views/remote/RemoteControl.vue#L4454)
+puts the answer under the toggle ([`RemoteControl.vue:4516`](../ui/src/views/remote/RemoteControl.vue#L4516)
 `displayMatchSaid`).
 
 ⚠️ `attended` and `disabled_on_device` hand the screen back: a mode this session applied earlier is restored
@@ -98,12 +98,12 @@ roomler config set display_match auto     # auto (default) | always | never
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
   ([`lib.rs:3459`](../crates/localapi/src/lib.rs#L3459)), and absent from `DesiredConfig`, so a server cannot
-  push it ([`models.rs:9908`](../crates/remote_control/src/models.rs#L9908)). A server that could set it could
+  push it ([`models.rs:9918`](../crates/remote_control/src/models.rs#L9918)). A server that could set it could
   take every screen it reaches.
 - **Read live** at every request ([`display_match.rs:1226`](../agents/roomlerd/src/display_match.rs#L1226)
   `set_device_policy`).
 - ⚠️ A value this build does not know reads as `never`, the strictest, and never fails the config file
-  ([`config.rs:2644`](../crates/agent-core/src/config.rs#L2644) `DisplayMatchPolicy`).
+  ([`config.rs:2650`](../crates/agent-core/src/config.rs#L2650) `DisplayMatchPolicy`).
 
 ## Who is at the screen
 
@@ -145,7 +145,7 @@ An unattended office PC is usually locked, so this is the main path, not an edge
 
 At the session's unlock the device decides again
 ([`display_match.rs:1405`](../agents/roomlerd/src/display_match.rs#L1405) `on_unlock`, called from the
-session's lock watcher, [`peer.rs:1422`](../agents/roomlerd/src/peer.rs#L1422)):
+session's lock watcher, [`peer.rs:1425`](../agents/roomlerd/src/peer.rs#L1425)):
 
 | Who unlocked it | What the clock shows | The answer |
 |---|---|---|
@@ -160,7 +160,7 @@ read as `attended` for four more minutes, and the request would be refused for n
 ## The person comes back (P1b)
 
 While a session holds a mode it applied, a watcher checks four times a second
-([`peer.rs:1520`](../agents/roomlerd/src/peer.rs#L1520), Windows only). It hands the screen back at once
+([`peer.rs:1523`](../agents/roomlerd/src/peer.rs#L1523), Windows only). It hands the screen back at once
 and tells the viewer ([`display_match.rs:1438`](../agents/roomlerd/src/display_match.rs#L1438)
 `on_tick`):
 
@@ -263,8 +263,8 @@ sequenceDiagram
 | The modes | the display's own list | the one active output's list in `xrandr --current`; none is added, this is someone's monitor ([`display_match.rs:370`](../agents/roomlerd/src/display_match.rs#L370) `parse_xrandr_outputs`) |
 | Several displays | the primary only | more than one active output answers `unsupported` |
 | After a crash | `CDS_FULLSCREEN`: Windows reverts the mode itself | a restore guard in `$XDG_RUNTIME_DIR`, written before the switch; the next start puts the start mode back, only while the screen still shows the mode display match set ([`display_match.rs:425`](../agents/roomlerd/src/display_match.rs#L425) `guard_undoes`, [`display_match.rs:605`](../agents/roomlerd/src/display_match.rs#L605) `recover`) |
-| A locked screen | answers `locked`, decided again at the unlock | the same, the unlock read from logind's hint ([`peer.rs:1467`](../agents/roomlerd/src/peer.rs#L1467)) |
-| The person comes back | the session's watcher, every quarter second | the same watcher ([`peer.rs:1507`](../agents/roomlerd/src/peer.rs#L1507)) |
+| A locked screen | answers `locked`, decided again at the unlock | the same, the unlock read from logind's hint ([`peer.rs:1470`](../agents/roomlerd/src/peer.rs#L1470)) |
+| The person comes back | the session's watcher, every quarter second | the same watcher ([`peer.rs:1510`](../agents/roomlerd/src/peer.rs#L1510)) |
 | Kill switch | `display_match = never` | `ROOMLERD_X11_DISPLAY_MATCH=0`, and `display_match = never` |
 
 - ⚠️ **The X server says how long ago, not when.** "Now minus the idle time" moves by each read's latency,

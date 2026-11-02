@@ -126,6 +126,15 @@ import {
   type FrameRate,
 } from './frameRate'
 import {
+  agentSaysMediaPlan,
+  mediaPlanAction,
+  nextMediaSilent,
+  parseMediaPlan,
+  viewerHzWireMessage,
+  type MediaStopCopy,
+  type RcMediaPlan,
+} from './mediaPlan'
+import {
   createRelAccumulator,
   relativeAutoSwitchedOff,
   relativeButtonMessage,
@@ -213,6 +222,18 @@ export const RC_DEAD_AIR_LADDER_MS = [0, 0, 0, 30_000, 60_000, 120_000, 300_000]
 export function deadAirDelayMs(streak: number): number {
   if (streak <= 0) return 0
   return RC_DEAD_AIR_LADDER_MS[Math.min(streak, RC_DEAD_AIR_LADDER_MS.length - 1)]
+}
+
+/**
+ * FR-135 R2 — what the dead-air backoff tells the operator. A session whose
+ * `rc:media-plan` arrived was reached: the plan came over the control channel,
+ * so blaming the device's network would be false, and the stage already says
+ * what the device did say. The backoff itself stays: 388 sessions in 24 h buy
+ * nothing whatever keeps the frames away.
+ */
+export function deadAirNotice(streak: number, delayMs: number, planKnown: boolean): string {
+  const retrying = `No video from this device after ${streak} attempts — retrying every ${Math.round(delayMs / 1000)}s.`
+  return planKnown ? retrying : `${retrying} Its network may be blocking the connection.`
 }
 
 /**
@@ -631,6 +652,31 @@ export function nextStallAction(stallTicks: number): 'none' | 'probe' | 'reconne
  */
 export function nextStallTicks(prev: number, advanced: boolean, agentSaidNoPixels: boolean): number {
   return advanced || agentSaidNoPixels ? 0 : prev + 1
+}
+
+/** The counters one media-watchdog tick compares. */
+export interface MediaProgress {
+  rtpBytes: number
+  vp9Frames: number
+  hevcFrames: number
+}
+
+/**
+ * FR-135 R1 — did media advance since the last tick, on the transport this
+ * session actually uses? Pure so the rule is testable.
+ *
+ * A data-channel path that has decoded a frame IS the session's transport, so
+ * its RTP counter says nothing about the picture: bytes on a silent video
+ * m-section must not hold off a re-create while the canvas is frozen. Before
+ * that first frame RTP still counts, because the viewer opens its channel
+ * speculatively and an agent that ignores it sends RTP instead. A path taken
+ * down reads zero frames, so a `<video>` fallback is judged on RTP again.
+ * `transportOnly` false is the old rule, any of the three, for the kill switch.
+ */
+export function mediaAdvanced(prev: MediaProgress, cur: MediaProgress, transportOnly: boolean): boolean {
+  if (cur.vp9Frames > prev.vp9Frames || cur.hevcFrames > prev.hevcFrames) return true
+  const onDataChannel = transportOnly && (cur.vp9Frames > 0 || cur.hevcFrames > 0)
+  return !onDataChannel && cur.rtpBytes > prev.rtpBytes
 }
 
 /**
@@ -1082,6 +1128,20 @@ export function advanceEndsWait(
   return advanced && intervalFromMs >= waitingSinceMs + RC_MEDIA_WAITING_SETTLE_MS
 }
 
+/** FR-135 R2 — the device's stop through one watchdog tick. The race of
+ *  `advanceEndsWait`: `encoder_fault` only ever follows frames, and they ride
+ *  another channel, so one sent before the stop can be counted after it. Erased by
+ *  that frame, the page would show a frozen picture and no reason until the
+ *  re-create. The plan stays as it was, so nothing would say it again. */
+export function mediaStopAfterTick<T>(
+  stop: T | null,
+  advanced: boolean,
+  intervalFromMs: number,
+  stopSinceMs: number,
+): T | null {
+  return stop !== null && advanceEndsWait(advanced, intervalFromMs, stopSinceMs) ? null : stop
+}
+
 /** FR-93 P5b — the waiting overlay's words, by what the agent waits for. */
 export interface RcMediaWaitingCopy {
   /** The overlay's headline. */
@@ -1499,6 +1559,7 @@ export type RcControlInbound =
   | { kind: 'clock_echo'; t0: number; agentUs: number }
   | { kind: 'desktop_changed'; name: string }
   | { kind: 'video_info'; info: RcVideoInfo }
+  | { kind: 'media_plan'; plan: RcMediaPlan }
   | { kind: 'media_unavailable'; reason: RcMediaUnavailable }
   /** FR-97 P3c-1 — the session's audio track carries no sound, and why. */
   | { kind: 'audio_unavailable'; reason: RcAudioUnavailable }
@@ -1603,6 +1664,12 @@ export function parseControlInbound(data: unknown): RcControlInbound {
           : {}),
       },
     }
+  }
+  // FR-135 R2 — what the device promised this session. A plan with no epoch,
+  // transport or codec is no plan, and is dropped like any unknown message.
+  if (obj.t === 'rc:media-plan') {
+    const plan = parseMediaPlan(obj)
+    if (plan) return { kind: 'media_plan', plan }
   }
   // FR-80 — the agent says this session will produce no pixels, and why.
   // `code` is a closed vocabulary but an unknown one is kept, not dropped:
@@ -4246,6 +4313,24 @@ export function storedColorSpaceOverride(): boolean {
   }
 }
 
+/** FR-135 R1 — the per-browser kill switch for recovering a decode error in
+ *  place. `localStorage.setItem('roomler-rc-decode-recover', '0')`, then
+ *  reconnect: a decoder that fails after its first frame stops the path again,
+ *  and the media watchdog re-creates the session about 10 s later (the old path,
+ *  which stays until R1's delete gate). Anything else, or no value, leaves
+ *  recovery on, and so does storage that cannot be read. Read once per connect,
+ *  like every `roomler-rc-*` knob. Pure + exported for tests. */
+export const DECODE_RECOVER_STORAGE_KEY = 'roomler-rc-decode-recover'
+
+export function storedDecodeRecover(): boolean {
+  try {
+    const raw = globalThis.localStorage?.getItem(DECODE_RECOVER_STORAGE_KEY)
+    return (raw ?? '').trim() !== '0'
+  } catch {
+    return true
+  }
+}
+
 /** The browser's ICE-server entry for the loopback TURN (dialled over loopback,
  *  never firewalled). Pure + exported for tests. */
 export function localRelayIceServer(desc: LocalRelayDescriptor): IceServer {
@@ -5306,7 +5391,7 @@ export function useRemoteControl(
   /** 1 Hz media-progress watchdog (runs only while connected). */
   let watchdogTimer: ReturnType<typeof setInterval> | null = null
   let stallTicks = 0
-  let lastMediaProgress = { rtpBytes: 0, vp9Frames: 0, hevcFrames: 0 }
+  let lastMediaProgress: MediaProgress = { rtpBytes: 0, vp9Frames: 0, hevcFrames: 0 }
 
   function clearPcDisconnectedTimer() {
     if (pcDisconnectedTimer !== null) {
@@ -5386,10 +5471,7 @@ export function useRemoteControl(
       // No hasMedia special-case: a session that reached 'connected'
       // but never produced a track/frame is just as dead as one that
       // stalled mid-flight Ã¢ÂÂ both count ticks toward probe/reconnect.
-      const advanced =
-        cur.rtpBytes > lastMediaProgress.rtpBytes
-        || cur.vp9Frames > lastMediaProgress.vp9Frames
-        || cur.hevcFrames > lastMediaProgress.hevcFrames
+      const advanced = mediaAdvanced(lastMediaProgress, cur, sessionDecodeRecover)
       lastMediaProgress = cur
       // Media actually moving is the ONLY proof this pair has a working
       // path — reaching `connected` is not. Reset the ladders here rather
@@ -5416,6 +5498,10 @@ export function useRemoteControl(
         advanced,
         mediaUnavailable.value !== null || agentIsWaiting(mediaWaiting.value, Date.now()),
       )
+      // FR-135 R2 — the first picture ends what the page said about having none.
+      mediaSilent.value = nextMediaSilent(mediaSilent.value, advanced, sessionPainted, mediaPlan.value !== null, stallTicks)
+      if (advanced) sessionPainted = true
+      mediaStop.value = mediaStopAfterTick(mediaStop.value, advanced, intervalFromMs, mediaStopSinceMs)
       degraded.value = classifyDegraded({
         pcState: pc?.connectionState ?? null,
         wsConnected: ws.status === 'connected',
@@ -5523,6 +5609,26 @@ export function useRemoteControl(
   /** FR-80 — set when the agent tells us it cannot capture; cleared on every
    *  new connect so a fixed host stops showing yesterday's reason. */
   const mediaUnavailable = ref<RcMediaUnavailable | null>(null)
+  /** FR-135 R2 — the device's plan for this session; `null` from an older agent. */
+  const mediaPlan = ref<RcMediaPlan | null>(null)
+  /** FR-135 R2 — why the device stopped its video. Outlives the watchdog's
+   *  re-create, or the page's one sentence would blink every 10 s. */
+  const mediaStop = ref<MediaStopCopy | null>(null)
+  /** FR-135 R2 — when the device last said it stopped, on this browser's clock:
+   *  only a frame after it ends the stop (`mediaStopAfterTick`). */
+  let mediaStopSinceMs = 0
+  /** FR-135 R2 — a plan, and no picture ever came (`nextMediaSilent`). */
+  const mediaSilent = ref(false)
+  /** FR-135 R2 — media reached a decode worker, so a silent page's data arrived and
+   *  did not decode. Kept with `mediaSilent`, or the words would change every 10 s. */
+  const mediaDataArrived = ref(false)
+  /** FR-135 R2 — how fast this screen refreshes, from the decode worker. */
+  const viewerHz = ref<number | null>(null)
+  /** The newest plan's epoch this session. Apart from `mediaPlan`, because the
+   *  next session's plan starts at 1 again. */
+  let mediaPlanEpoch = 0
+  /** Whether this session has painted, for `mediaSilent`. */
+  let sessionPainted = false
   /** FR-97 P3c-1 — set when the agent says this session's audio track carries
    *  no sound; cleared on every new connect, like `mediaUnavailable`. */
   const audioUnavailable = ref<RcAudioUnavailable | null>(null)
@@ -5722,6 +5828,12 @@ export function useRemoteControl(
    *  before any worker is started: the data-channel workers get it in their
    *  `init-canvas`, the RTP WebCodecs worker in its transform's options. */
   let sessionColorSpace = false
+  /** FR-135 R1 — true when THIS session recovers a decode error in place
+   *  (`workers/rc-decode-recovery.ts`), which is all of them unless this
+   *  browser set `roomler-rc-decode-recover=0`. Resolved beside
+   *  `sessionChunkFraming`; the data-channel workers get it in `init-canvas`,
+   *  and the media watchdog reads it for what counts as progress. */
+  let sessionDecodeRecover = false
   let benchProber: BenchProber | null = null
   let videoBench: VideoBenchSampler | null = null
   /** The element `attachInput` was given: the `<video>` the bench sampler
@@ -7599,6 +7711,37 @@ export function useRemoteControl(
     sendControl(fpsWireMessage(frameRate.value, retry))
   }
 
+  /** FR-135 R2 — tell the agent how fast this screen refreshes, if it takes it.
+   *  No-op while the channel is closed; its `onopen` calls this. */
+  function sendViewerHz() {
+    if (viewerHz.value === null || !agentSaysMediaPlan(agent?.value?.capabilities?.rpc)) return
+    sendControl(viewerHzWireMessage(viewerHz.value))
+  }
+
+  function onViewerHz(hz: unknown) {
+    if (typeof hz !== 'number' || !Number.isFinite(hz) || hz <= 0) return
+    viewerHz.value = hz
+    console.info(`[rc] viewer_hz ${hz}`)
+    sendViewerHz()
+  }
+
+  /** FR-135 R2 — the device's plan: keep the newest, and act on the one thing in it
+   *  a page must not leave to the watchdog. */
+  function onMediaPlan(plan: RcMediaPlan) {
+    const action = mediaPlanAction(plan, mediaPlanEpoch, vp9_444Active.value || hevcActive.value)
+    if (!action) return
+    mediaPlanEpoch = plan.epoch
+    mediaPlan.value = plan
+    console.info(`[rc] media plan ${JSON.stringify(plan)}`)
+    if (action.stop) mediaStopSinceMs = Date.now()
+    if (action.stop !== undefined) mediaStop.value = action.stop
+    if (action.showTrack) {
+      console.warn('[rc] media plan: the device is sending over WebRTC, not the data channel this page opened - showing <video>')
+      stopVp9_444Path()
+      stopHevcPath()
+    }
+  }
+
   /** FR-119 P1 — the viewer picked a frame rate (P2b-17b: `retry` = try it again). */
   function setFrameRate(next: FrameRate, retry = false) {
     frameRate.value = next
@@ -8113,6 +8256,10 @@ export function useRemoteControl(
         onBenchProbe(msg.seq, msg.paintedAt, 'vp9-444')
         return
       }
+      if (msg.type === 'viewer-hz') {
+        onViewerHz(msg.hz)
+        return
+      }
       if (msg.type === 'request-keyframe') {
         // rc.130 Ã¢ÂÂ worker dropped deltas on a decode backlog; ask the agent
         // for a fresh IDR so it can resync.
@@ -8173,6 +8320,13 @@ export function useRemoteControl(
           console.warn(`[rc] ${failedTransport} banned for this page (decoder failed before first frame) - reconnecting on the next-best transport`)
           if (lastConnectArgs) scheduleReconnect()
         }
+      } else if (msg.type === 'decode-recovering') {
+        // FR-135 R1 — the worker replaced the decoder and waits for the key
+        // frame it asked for. The path stays up. The agent still counts it.
+        console.warn('[rc] vp9-444 decoder failed:', msg.error, '- recovering in place, attempt', msg.attempt)
+        reportDecodeError('vp9-444', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
+      } else if (msg.type === 'decode-recovered') {
+        console.info('[rc] vp9-444 decode recovered in', msg.ms, 'ms, attempts', msg.attempts)
       } else if (msg.type === 'frame-rejected') {
         console.warn('[rc] vp9-444 frame rejected', msg)
       } else if (msg.type === 'awaiting-keyframe') {
@@ -8236,6 +8390,7 @@ export function useRemoteControl(
           height: typeof m.height === 'number' ? m.height : 0,
           bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
         }
+        if (vp9_444Stats.value.bytesReceivedTotal > 0) mediaDataArrived.value = true
         // P1 Ã¢ÂÂ the per-frame `frame-decoded` message is off by default; keep
         // the diagnostics counter monotonic from the 1 s window total.
         if (typeof m.framesDecodedTotal === 'number') {
@@ -8287,6 +8442,9 @@ export function useRemoteControl(
           bench: sessionBench,
           // FR-130 P2 — resolved per session; see `sessionColorSpace`.
           colorSpace: sessionColorSpace,
+          // FR-135 R1 — resolved per session; see `sessionDecodeRecover`.
+          decodeRecover: sessionDecodeRecover,
+          unorderedVideo: videoDcOptions(sessionChunkFraming, storedUnorderedVideo()).ordered === false,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -8403,6 +8561,10 @@ export function useRemoteControl(
         onBenchProbe(msg.seq, msg.paintedAt, 'hevc')
         return
       }
+      if (msg.type === 'viewer-hz') {
+        onViewerHz(msg.hz)
+        return
+      }
       if (msg.type === 'request-keyframe') {
         // rc.130 Ã¢ÂÂ worker dropped deltas on a decode backlog; ask the agent
         // for a fresh IDR so it can resync.
@@ -8466,6 +8628,12 @@ export function useRemoteControl(
           console.warn('[rc] data-channel-hevc banned for this page (decoder failed before first frame) - reconnecting on the next-best transport')
           if (lastConnectArgs) scheduleReconnect()
         }
+      } else if (msg.type === 'decode-recovering') {
+        // FR-135 R1 — see the vp9-444 handler.
+        console.warn('[rc] hevc decoder failed:', msg.error, '- recovering in place, attempt', msg.attempt)
+        reportDecodeError('hevc', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
+      } else if (msg.type === 'decode-recovered') {
+        console.info('[rc] hevc decode recovered in', msg.ms, 'ms, attempts', msg.attempts)
       } else if (msg.type === 'frame-rejected') {
         console.warn('[rc] hevc frame rejected', msg)
       } else if (msg.type === 'awaiting-keyframe') {
@@ -8523,6 +8691,7 @@ export function useRemoteControl(
           height: typeof m.height === 'number' ? m.height : 0,
           bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
         }
+        if (hevcStats.value.bytesReceivedTotal > 0) mediaDataArrived.value = true
         // P1 Ã¢ÂÂ see the vp9-444 handler.
         if (typeof m.framesDecodedTotal === 'number') {
           hevcFramesDecoded.value = Math.max(hevcFramesDecoded.value, m.framesDecodedTotal)
@@ -8554,6 +8723,9 @@ export function useRemoteControl(
           bench: sessionBench,
           // FR-130 P2 — resolved per session; see `sessionColorSpace`.
           colorSpace: sessionColorSpace,
+          // FR-135 R1 — resolved per session; see `sessionDecodeRecover`.
+          decodeRecover: sessionDecodeRecover,
+          unorderedVideo: videoDcOptions(sessionChunkFraming, storedUnorderedVideo()).ordered === false,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -9344,21 +9516,34 @@ export function useRemoteControl(
     const deadAir = deadAirDelayMs(deadAirStreak.value)
     const delay = Math.max(nextReconnectDelayMs(attemptIdx), deadAir)
     if (deadAir > 0) {
+      // This attempt's plan, not one the redial kept: the path has to be working now.
+      const planKnown = mediaPlanEpoch > 0
       console.warn(
         '[rc] no media on the last',
         deadAirStreak.value,
         'attempts — backing off',
         delay,
-        'ms. The device likely has no usable network path to this browser.',
+        planKnown
+          ? 'ms. The control channel carried its plan, so the path to this browser works.'
+          : 'ms. The device likely has no usable network path to this browser.',
       )
-      notice.value = `No video from this device after ${deadAirStreak.value} attempts — retrying every ${Math.round(delay / 1000)}s. Its network may be blocking the connection.`
+      notice.value = deadAirNotice(deadAirStreak.value, delay, planKnown)
     }
     reconnectAttempt.value = attemptIdx + 1
     phase.value = 'reconnecting'
     // FR-93 P5j — a computer going to sleep keeps saying so through the redial.
     const kept = waitKeptAcrossReconnect(mediaWaiting.value, Date.now())
+    // FR-135 R2 — so is why this page has no picture, until one comes.
+    const keptStop = mediaStop.value
+    const keptSilent = mediaSilent.value
+    const keptDataArrived = keptSilent && mediaDataArrived.value
+    const keptPlan = keptStop || keptSilent ? mediaPlan.value : null
     teardown()
     if (kept) mediaWaiting.value = kept
+    mediaStop.value = keptStop
+    mediaSilent.value = keptSilent
+    mediaDataArrived.value = keptDataArrived
+    mediaPlan.value = keptPlan
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null
       fireReconnectAttempt()
@@ -9497,6 +9682,12 @@ export function useRemoteControl(
     mediaUnavailable.value = null
     audioUnavailable.value = null
     mediaWaiting.value = null
+    mediaPlan.value = null
+    mediaPlanEpoch = 0
+    mediaStop.value = null
+    mediaSilent.value = false
+    mediaDataArrived.value = false
+    sessionPainted = false
     inputReach.value = null
     idleEndsAt.value = null
     dcDecoderCodec.value = null
@@ -10608,6 +10799,8 @@ export function useRemoteControl(
       sendPriorityPreference()
       // FR-119 P1 — re-ask for the stored frame rate (agents with fps-high only).
       sendFrameRatePreference()
+      // FR-135 R2 — a re-created session's agent has not heard this screen's rate.
+      sendViewerHz()
     }
     // The control DC closing while the session still reports
     // 'connected' means the transport died under us (SCTP teardown
@@ -10679,6 +10872,8 @@ export function useRemoteControl(
         // honest stats badge (replaces the hardcoded "VP9 4:4:4 SW").
         videoInfo.value = parsed.info
         console.info('[rc] video-info', parsed.info)
+      } else if (parsed?.kind === 'media_plan') {
+        onMediaPlan(parsed.plan)
       } else if (parsed?.kind === 'media_unavailable') {
         // FR-80 — the host cannot capture. Surfaced on the canvas, because
         // the alternative the operator had was a black rectangle and a
@@ -11143,6 +11338,11 @@ export function useRemoteControl(
     if (!sessionColorSpace) {
       console.info('[rc] decoder colour space: not set this session (roomler-rc-colorspace=off) - each stream\'s own description decides (FR-130 P2)')
     }
+    // FR-135 R1 — on every session, off only under this browser's kill switch.
+    sessionDecodeRecover = storedDecodeRecover()
+    if (!sessionDecodeRecover) {
+      console.info('[rc] decode recovery: off this session (roomler-rc-decode-recover=0) - a decode error stops the path and the watchdog re-creates the session (FR-135 R1)')
+    }
     if (sessionBenchMode === 'probe') {
       console.info('[rc] bench mode: the agent advertised `bench`; probing once the input channel opens (FR-16 L4)')
     } else if (sessionBenchMode === 'target') {
@@ -11158,8 +11358,9 @@ export function useRemoteControl(
     // If we're advertising the data-channel transport, open the DC +
     // worker NOW so the channel lands in the SDP offer. The agent
     // will only actually pump bytes through it when its caps include
-    // the same transport, so opening it speculatively is harmless on
-    // older agents (they ignore the channel entirely).
+    // the same transport. An older agent ignores the channel, and a session
+    // it then sends over the RTP track is black until the watchdog gives up;
+    // an agent with a plan says so, and `onMediaPlan` shows the track (FR-135 R2).
     if (preferredTransport === 'data-channel-vp9-444') {
       // rc.190 Ã¢ÂÂ when the pick forced 4:2:0 (auto-rank / HEVC fallback),
       // configure the worker for profile 0 explicitly so the codec
@@ -13715,6 +13916,11 @@ export function useRemoteControl(
      *  badge falls back to a selection-derived label then. */
     videoInfo,
     mediaUnavailable,
+    mediaPlan,
+    mediaStop,
+    mediaSilent,
+    mediaDataArrived,
+    viewerHz,
     // FR-97 P3c-1 — why this session's audio track carries no sound, or null.
     audioUnavailable,
     mediaWaiting,

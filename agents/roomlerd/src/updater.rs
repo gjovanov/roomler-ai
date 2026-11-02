@@ -2250,7 +2250,7 @@ pub fn spawn_installer_for_flavour_with_properties(
                 // #2718 — `/qn` prints nothing, and an inherited copy of our
                 // stdio held a caller's pipes for the whole install.
                 let child = without_caller_stdio(
-                    std::process::Command::new("msiexec")
+                    std::process::Command::new(crate::appdirs::system32_tool("msiexec.exe"))
                         .args(argv.iter().map(String::as_str).collect::<Vec<_>>()),
                 )
                 .spawn()
@@ -2634,8 +2634,13 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
 /// cycle).
 #[cfg(target_os = "windows")]
 pub fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
-    spawn_elevated("msiexec.exe", argv)
-        .map_err(|e| e.context("elevated msiexec — install not started"))
+    spawn_elevated(
+        &crate::appdirs::system32_tool("msiexec.exe")
+            .display()
+            .to_string(),
+        argv,
+    )
+    .map_err(|e| e.context("elevated msiexec — install not started"))
 }
 
 /// FR-104 — [`spawn_msiexec_elevated`] for any program: `ShellExecuteExW`
@@ -2648,6 +2653,11 @@ pub fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
 /// ⚠️ Arguments are joined with spaces; one that contains a space is quoted.
 /// An argument containing a `"` is not escaped, so none may (paths, origins,
 /// ids and JWTs never do).
+///
+/// ⚠️ `file` is a full path; anything else is refused. The shell looks for a
+/// bare name in the current directory first, and a wizard started from the
+/// person's Downloads sits among whatever a site left there: the prompt would
+/// be for that file (FR-129 C).
 #[cfg(target_os = "windows")]
 pub fn spawn_elevated(file: &str, argv: &[String]) -> Result<u32> {
     use std::os::windows::ffi::OsStrExt;
@@ -2656,6 +2666,11 @@ pub fn spawn_elevated(file: &str, argv: &[String]) -> Result<u32> {
     use windows_sys::Win32::UI::Shell::{
         SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
     };
+
+    anyhow::ensure!(
+        std::path::Path::new(file).is_absolute(),
+        "{file} is not a full path; refusing to ask for administrator rights for it"
+    );
 
     // Build wide-string buffers for ShellExecuteExW. The Win32 API
     // wants null-terminated UTF-16; OsStr::encode_wide returns the
@@ -4219,6 +4234,17 @@ pub fn helper_owns_updates() -> Option<PathBuf> {
 // docs/fr/FR-21
 #[cfg(test)]
 mod tests {
+    /// FR-129 C — a bare name is refused before any prompt: the shell would look
+    /// for it in the current directory first.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn asking_for_administrator_rights_takes_a_full_path_only() {
+        for file in ["msiexec.exe", "msiexec", r"sub\msiexec.exe"] {
+            let refused = super::spawn_elevated(file, &[]).unwrap_err();
+            assert!(format!("{refused:#}").contains("not a full path"), "{file}");
+        }
+    }
+
     /// #2901 — the documented opt-out marker turns a daemon's own updater off,
     /// exactly as `auto_update = false` does. Field 2026-10-25, a Linux system
     /// install on 0.4.170: with the marker present the daemon logged

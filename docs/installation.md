@@ -33,11 +33,43 @@ flowchart TB
 ```
 
 Everything needs an **enrollment token** — minted in the admin UI
-(**Admin → Agents → Enroll** for daemons, **Tunnel clients → Enroll** for CLIs),
-valid 10 minutes, single-use — or, for a daemon, a **pairing** (FR-129): the
-wizard's "Set up in the browser", and `--pair` on the terminal installers
-([below](#pairing-from-a-terminal)), mint that same token into the installing
-process after you approve a code at `/pair`, so nothing is copied or pasted.
+(**Devices → Enroll → Device** for daemons, **Devices → Enroll → Tunnel client**
+for CLIs), valid 10 minutes, single-use — or, for a daemon, a **pairing**
+(FR-129): the wizard's "Set up in the browser", and `--pair` on the terminal
+installers ([below](#pairing-from-a-terminal)), mint that same token into the
+installing process after you approve a code at `/pair`, so nothing is copied or
+pasted.
+
+### The wizard's first page: the background service by default (FR-129 C1)
+
+The Welcome page opens with a role already picked, which the person can change
+before anything happens: the background service on a machine with nothing
+installed, and an existing install's own flavour otherwise, so a default never
+switches a flavour or changes a device's security posture. Rust decides
+(`agents/roomler-setup/src/role.rs:287`, `default_role`, carried as
+`defaultRole` on the detection); the SPA only applies it, when nothing is picked
+yet, and never saves it (a click does). The "Join the overlay network" box keeps
+its per-OS default, ticked for every preselected daemon role.
+
+| OS | nothing installed | a per-user install | a machine-wide install (or both) |
+|---|---|---|---|
+| Windows | **background service** (perMachine + SystemContext: the lock screen, UAC dialogs, admin apps) | this user only | the service's SystemContext switch (`ROOMLERD_ENABLE_SYSTEM_SWAP` in the `Roomler` service's SCM Environment, read as the daemon reads it): on → background service; off or absent → attended service (SystemContext would make the lock screen remotely controllable, a choice left to the person); unreadable → nothing preselected |
+| Linux | **system service** (root), once the server offers the Linux daemon cards; the tunnel client while it does not | this user only | system service |
+| macOS | **this Mac** (with the root half, the overlay box being ticked), once the server offers the macOS cards; the tunnel client while it does not | this Mac | this Mac |
+
+Where an installed flavour is not offered (a Linux or macOS server with the
+switch off), nothing is preselected: the tunnel client would be another product
+than the one the device has. An installed tunnel client does not change the
+default; the daemon roles carry the `roomler` CLI too.
+
+**A new launch resumes a run only from the Server or the Token page.** The
+wizard's saved state (`%LOCALAPPDATA%\roomler\roomler-setup\data\wizard-state.json`
+on Windows) restores its role and device name only when the run was killed on
+one of those two pages; a run that finished, stopped on Welcome, or was cut off
+during the install starts a new run at Welcome, with the default device name.
+The server URL is kept either way. Before FR-129 C1 a finished run's role and
+name came back: a test run's tunnel-client role preselected the tunnel card on
+the operator's own machine, and its device name was offered again.
 
 ## Enrollment — what every path does
 
@@ -102,19 +134,99 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3776`, `crates/agent-core/src/config.rs:4163`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
-| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:633`, `:965`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3776`, `crates/agent-core/src/config.rs:4171`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:634`, `:966`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
 administrator.** After its first healthy run the daemon hardens that config's
 folder to SYSTEM and Administrators (#3073), and a wizard that is not elevated
 cannot open it. The wizard says so on its first page, before a token is pasted
-or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1156`), and the
+or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1157`), and the
 install refuses it before anything is downloaded (`:290`). Before the enroll it
 also stops on a config it may not read (`:634`, never reported as a damaged
 config) or a folder it may not write (`:640`). The token is never spent on a
 config that cannot be written. A **fresh** install of that role still works
 from a double-click: the folder is not hardened yet.
+
+**The wizard asks for those rights itself** (FR-129 C3). The note on its first
+page carries a **Restart as administrator** button: the wizard starts its own
+image again through the shell's `runas` verb (one UAC prompt,
+`crates/roomler-setup-core/src/elevation.rs`) with
+`--role <role> [--server <url>] [--session-data <folder>] --after-elevation <its pid>`
+(the folder is its own `%LOCALAPPDATA%`), and exits once the elevated copy has started,
+handing it the right to take the foreground. Nothing secret is on that command line:
+it happens on Welcome, before a token exists. The elevated copy
+(`agents/roomler-setup/src/launch.rs`):
+
+1. waits, at most 30 s, for the limited copy to exit, **before** Tauri's
+   single-instance plugin looks for a running copy — otherwise it would find
+   the dying copy's lock, hand it its arguments and quit. With over-the-shoulder
+   credentials (a standard user typing an administrator's password) the copy is
+   another account, may be refused a handle on the limited one, and polls the
+   process list instead; it also runs in that account's profile, which is why
+   the role travels on the command line rather than in the saved state;
+2. keeps its WebView2 data in its own folder, under the LIMITED copy's
+   `%LOCALAPPDATA%` (`...\ai.roomler.setup\elevated`): WebView2 shares one browser
+   process among every host naming the same folder, the limited copy's can
+   outlive it by a moment, and an elevated host must not join a limited browser
+   process. The folder goes through the API (Tauri's `data_directory`, so the
+   main window is created by the wizard's setup hook and `tauri.conf.json` says
+   `"create": false`), never through `WEBVIEW2_USER_DATA_FOLDER`: an elevated
+   WebView2 host ignores every `WEBVIEW2_*` environment variable — for the same
+   reason an elevated wizard's debugging port comes only from the HKLM policy.
+   It sits in the limited copy's profile because WebView2's browser process
+   de-elevates to the session's user, who cannot open an administrator's
+   profile: with the folder there, over-the-shoulder credentials give a white
+   window that goes away after about a minute. A limited run keeps Tauri's folder
+   unchanged;
+3. comes to the front, or it would open behind the browser the wizard was
+   started from;
+4. opens on Welcome with the handed role preselected, over the detected
+   default, and the Continue gate as usual.
+
+A right-click **Run as administrator** by a person who is an administrator works
+as it always has, in that account's own folder. **With another account's password
+it does not** (the white window above, or Edge's "We couldn't create the data
+directory"): that start has no limited copy to name the session's folder. Start the
+wizard normally and use the button.
+
+**The cards follow what can work here** (`role::RoleLimit`,
+`agents/roomler-setup/src/role.rs:191`), and a note on Welcome says why:
+
+| The situation | The cards | Why |
+|---|---|---|
+| Another account's password was typed at the prompt (the limited copy's `%LOCALAPPDATA%`, passed as `--session-data`, differs from this process's) | the background service only | anything else would install into that administrator's profile and still report Done |
+| The machine's policy refuses prompts from a standard user (`ConsentPromptBehaviorUser=0`, set by the CIS and STIG baselines) | **this user only**, preselected, and the tunnel client | a machine role would lead through pairing and the download into "blocked by your system administrator" |
+
+`cmd_install` and `cmd_pair_start` hold the same rule for a run that resumes past Welcome.
+
+**An elevated wizard opens the pairing page through Explorer.** A browser started directly
+would take its token: under another account's password that was Edge as the administrator,
+at high integrity, on the standard user's desktop (FR-129's log, 2026-11-02).
+`launch::open_through_the_shell` leaves it to the session's own Explorer, so the page opens in
+that person's browser and profile, at medium integrity.
+
+**What an elevated wizard trusts.** Its folder is usually Downloads, a limited process can write
+that folder and `HKCU\Environment`, and the same image goes on to run elevated:
+
+- it loads DLLs from System32 alone (the linker's `/DEPENDENTLOADFLAG:0x800`,
+  `SetDefaultDllDirectories`, and `secur32.dll` delay-loaded, since that flag does not reach an
+  import's own imports), and `pe-dependent-load-flags.ps1` reads the flag and the import table
+  back from the EXE in CI, in the release lane and in the verifier;
+- it names every program it starts by a full path from the kernel, and
+  `agents/roomler-setup/src/spawn_gate.rs` fails CI on a bare name;
+- `launch::start_clean`, the second line of `main`, gives the machine's folder variables their
+  true values on every run and leaves the current directory, and an elevated run drops
+  `ROOMLER*`, `WEBVIEW2_*`, `TAURI_*` and `SSL_CERT_*`, so the staging override a test fixture
+  uses works limited and nowhere else;
+- its WebView2 folder is made new at each start, following no link.
+
+Still open: the wizard checks no publisher on the MSI it stages, and the staged file sits in the
+user's temp folder until `msiexec` reads it (#3246).
+
+A declined prompt leaves the limited wizard as it was, with one line saying so;
+any other failure shows its reason and the right-click way. Nothing else in the
+wizard elevates itself: a fresh install still gets the MSI's own UAC prompt.
 
 **The enroll says how it was installed** (FR-102 P3, the install trace in
 [growth-observability.md](growth-observability.md)): the device row records
@@ -208,7 +320,7 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3564`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3608`) |
+| `config::load` (`crates/agent-core/src/config.rs:3572`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3616`) |
 | `config::read_if_present` (`:3617`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
@@ -244,7 +356,7 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2628`, `:2650`), at the clean-run promotion
+`crates/agent-core/src/config.rs:2634`, `:2656`), at the clean-run promotion
 (`record_clean_run_at`, `:2620`), at every `ConfigSet`, and at enrollment. The daemon, the
 desktop app and the setup wizard all write it through `config::save` (`:4062`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
@@ -338,9 +450,14 @@ remove one today.
 
 ## Windows
 
-**Recommended: the `roomler-setup` wizard** (signed EXE, downloadable from the
-admin UI or `https://roomler.ai/api/setup/windows-x86_64`). One wizard, four
-roles:
+**Recommended: the `roomler-setup` wizard**, downloadable from the admin UI or
+`https://roomler.ai/api/setup/windows`. Since `setup-v0.4.197` (FR-129 C2), that
+link serves the **signed EXE itself**,
+`roomler-setup-<v>-x86_64-pc-windows-msvc.exe`, whose bytes equal the release's
+`.exe.sha256` and carry a GPG `.asc` like every other asset;
+`https://roomler.ai/api/setup/windows?format=zip` serves the same EXE in a zip,
+for a proxy that refuses an EXE download. A release without the EXE asset keeps
+serving its zip. One wizard, four roles:
 
 | Wizard role | What it installs | Runs as |
 |---|---|---|
@@ -715,9 +832,11 @@ library and passed while a bare 24.04 got the stub.
 
 The same `roomler-setup` wizard that installs the daemon on Windows installs it
 on a Linux desktop, with two daemon cards — **this user only** (the systemd user
-unit, the overlay through the userspace netstack; the default for a desktop)
-and **system service** (the root `roomlerd.service`, the TUN overlay, config at
-`/etc/roomler/config.toml` — the terminal path's `--system`). It is a GUI front
+unit, the overlay through the userspace netstack) and **system service** (the
+root `roomlerd.service`, the TUN overlay, config at `/etc/roomler/config.toml` —
+the terminal path's `--system`; the card preselected on a machine with nothing
+installed, [FR-129 C1](#the-wizards-first-page-the-background-service-by-default-fr-129-c1)).
+It is a GUI front
 end to the **embedded `install.sh`**, never a second implementation of its steps
 (`agents/roomler-setup/src/unix_daemon.rs`, `orchestrator_unix.rs`):
 
@@ -1303,7 +1422,7 @@ handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3414`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2678`).
+back to the version that is running (`crates/agent-core/src/config.rs:2684`).
 
 ### No pipe can stall the supervisor (#3080)
 

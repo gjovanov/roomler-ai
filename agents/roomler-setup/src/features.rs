@@ -89,6 +89,7 @@ impl SetupFeatures {
             pairing: self.pairing,
             pairing_off: self.pairing_off,
             daemon_offered: self.daemon_offered(os),
+            answered: false,
         }
     }
 }
@@ -104,6 +105,32 @@ pub struct FeaturesView {
     pub pairing_off: bool,
     /// [`SetupFeatures::daemon_offered`] for this OS.
     pub daemon_offered: bool,
+    /// [`Asked::answered`]: `false` means nobody could say, not "off".
+    pub answered: bool,
+}
+
+/// FR-129 C — what asking a server came to. "Could not ask" is not "switched
+/// off": behind a TLS-inspecting box a clean machine's question fails, every
+/// switch reads off, and a page that took that for the server's word would
+/// preselect the tunnel client over the background service the person came for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Asked {
+    /// The switches, each off unless the answer said `true`.
+    pub features: SetupFeatures,
+    /// The server said something that can be read as its word: a JSON object,
+    /// or an older server's "no such route" ([`older_server`]). A network
+    /// error, a 5xx, or a page in place of JSON (a proxy's block page) is not.
+    pub answered: bool,
+}
+
+impl Asked {
+    /// The answer for THIS OS.
+    pub fn view(self, os: HostOs) -> FeaturesView {
+        FeaturesView {
+            answered: self.answered,
+            ..self.features.view(os)
+        }
+    }
 }
 
 /// The URL to fetch for `server`, read as the enroll reads it (a remote
@@ -142,11 +169,22 @@ pub fn older_server(status: u16) -> bool {
     matches!(status, 400 | 404)
 }
 
+/// One answer as [`Asked`]: the switches, and whether it was the server's word.
+pub fn read_answer(status: u16, body: &[u8]) -> Asked {
+    let an_object = (200..300).contains(&status)
+        && serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v.is_object());
+    Asked {
+        features: parse(status, body),
+        answered: an_object || older_server(status),
+    }
+}
+
 /// Ask `server`. Never fails: a server that cannot be reached, answers
-/// something else, or takes too long reads as every switch off. An older
-/// server's answer is quiet ([`older_server`]); any other failure is a warning
-/// line, so "why is there no daemon card" has an answer in the log.
-pub async fn fetch(server: &str) -> SetupFeatures {
+/// something else, or takes too long reads as every switch off and not
+/// [`Asked::answered`]. An older server's answer is quiet ([`older_server`]);
+/// any other failure is a warning line, so "why is there no daemon card" has an
+/// answer in the log.
+pub async fn ask(server: &str) -> Asked {
     let url = features_url(server);
     let client = match reqwest::Client::builder()
         .user_agent(crate::proxy::USER_AGENT)
@@ -156,28 +194,34 @@ pub async fn fetch(server: &str) -> SetupFeatures {
         Ok(client) => client,
         Err(e) => {
             tracing::warn!(error = %e, "setup features: no HTTP client; reading every switch as off");
-            return SetupFeatures::default();
+            return Asked::default();
         }
     };
     match client.get(&url).send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
             let body = resp.bytes().await.unwrap_or_default();
-            let features = parse(status, &body);
+            let asked = read_answer(status, &body);
             if older_server(status) {
                 tracing::debug!(%url, status, "setup features: an older server; every switch off");
-            } else if !(200..300).contains(&status) {
+            } else if !asked.answered {
                 tracing::warn!(%url, status, "setup features: not answered; every switch read as off");
             } else {
-                tracing::info!(%url, ?features, "setup features");
+                tracing::info!(%url, features = ?asked.features, "setup features");
             }
-            features
+            asked
         }
         Err(e) => {
             tracing::warn!(%url, error = %e, "setup features: not reachable; every switch read as off");
-            SetupFeatures::default()
+            Asked::default()
         }
     }
+}
+
+/// [`ask`], for a caller that decides on the switches alone: an install that is
+/// about to run refuses on "off", whichever way it came to be off.
+pub async fn fetch(server: &str) -> SetupFeatures {
+    ask(server).await.features
 }
 
 #[cfg(test)]
@@ -324,7 +368,8 @@ mod tests {
             FeaturesView {
                 pairing: true,
                 pairing_off: false,
-                daemon_offered: true
+                daemon_offered: true,
+                answered: false
             }
         );
         assert_eq!(
@@ -332,7 +377,8 @@ mod tests {
             FeaturesView {
                 pairing: true,
                 pairing_off: false,
-                daemon_offered: false
+                daemon_offered: false,
+                answered: false
             }
         );
         assert_eq!(
@@ -386,6 +432,37 @@ mod tests {
         assert_eq!(parse(302, ALL_ON), SetupFeatures::default());
     }
 
+    /// FR-129 C - could not ask is not switched off: a JSON object and an older
+    /// server's "no such route" are the server's word, and nothing else is.
+    #[test]
+    fn only_the_servers_own_word_counts_as_answered() {
+        for (status, body) in [
+            (200u16, ALL_ON),
+            (200, br#"{"wizard_linux_daemon": false}"#),
+            (200, b"{}"),
+            (400, b"{\"error\":\"bad_request\"}"),
+            (404, b"Not Found"),
+        ] {
+            assert!(read_answer(status, body).answered, "{status}");
+        }
+        for (status, body) in [
+            (500u16, &b"{}"[..]),
+            (502, b"Bad Gateway"),
+            (503, ALL_ON),
+            (403, b"<html>blocked by policy</html>"),
+            (200, b"<html>blocked by policy</html>"),
+            (200, b""),
+            (200, b"[true]"),
+            (302, ALL_ON),
+        ] {
+            assert!(!read_answer(status, body).answered, "{status}");
+        }
+        assert!(!Asked::default().answered, "a failed request reads as this");
+        assert_eq!(read_answer(200, ALL_ON).features, ON);
+        assert!(read_answer(200, ALL_ON).view(HostOs::Linux).answered);
+        assert!(!Asked::default().view(HostOs::Linux).answered);
+    }
+
     /// Production before B1-s, measured 2026-10-28: its `/api/setup/{platform}`
     /// takes "features" for a platform and answers 400 with an error object.
     /// That is an older server, read as every switch off and said nowhere
@@ -428,7 +505,7 @@ mod tests {
         let json = serde_json::to_string(&ON.view(HostOs::Linux)).unwrap();
         assert_eq!(
             json,
-            r#"{"pairing":true,"pairingOff":false,"daemonOffered":true}"#
+            r#"{"pairing":true,"pairingOff":false,"daemonOffered":true,"answered":false}"#
         );
     }
 }

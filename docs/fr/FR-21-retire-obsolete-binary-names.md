@@ -168,13 +168,13 @@ const OLD_APP: &str = "roomler-agent";
 **The RC console's "open staging folder" affordance points at a path that does not exist on a
 fresh install.**
 
-`ui/src/views/remote/RemoteControl.vue:1925` hardcodes:
+`ui/src/views/remote/RemoteControl.vue:1986` hardcodes:
 
 ```js
 const STAGING_PATH = 'C:\\ProgramData\\roomler\\roomler-agent\\staging'
 ```
 
-But `appdirs::machine_global_dir()` (`crates/agent-core/src/appdirs.rs:73-92`) resolves
+But `appdirs::machine_global_dir()` (`crates/agent-core/src/appdirs.rs:205`) resolves
 `%PROGRAMDATA%\roomler\<segment>`, where `<segment>` is `NEW_APP = "roomler"` unless a pre-rename
 tree is present:
 
@@ -188,7 +188,7 @@ So the hardcoded path is correct **only** on a perMachine host that still carrie
 tree, and wrong on every fresh perMachine install — where the real directory is
 `C:\ProgramData\roomler\roomler\staging`.
 
-And unlike the per-user trees, `migrate_legacy_trees` (`appdirs.rs:133-175`) walks the three
+And unlike the per-user trees, `migrate_legacy_trees` (`appdirs.rs:253-295`) walks the three
 `ProjectDirs` paths **only** — it never touches the machine-global tree — so the split is
 permanent, not transitional.
 
