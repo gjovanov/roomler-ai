@@ -53,6 +53,22 @@
 //   (an overlay remote on a relay tier), so ICE-classed windows are reported
 //   apart.
 //
+// WHAT THE CRITERION CANNOT SEE, AND WHAT IS PRINTED FOR IT
+//
+//   Agreement is `shadow <= live`, so a shadow pinned at its floor scores 100 %:
+//   the criterion has no power against asking for too little. The disagreement
+//   cannot say either, because `target_bps` is a cap the encoder is usually far
+//   under, so -96 % reads the same on a resting desktop that lost nothing and on
+//   a scroll spending 14 times the shadow's target.
+//
+//   So the report also compares the shadow with what the encoder actually SPENT:
+//   `bytes_written` over the gap between two heartbeats of one pump. Spending over
+//   the shadow across a whole window proves it would have capped real spending.
+//   Under it proves less: a burst inside the window can still have been capped.
+//   The heartbeat has no maxrate field, so the spend bounds the encoder's demand
+//   from below and nothing bounds it from above. No bar is applied: the flip
+//   criterion is unchanged, and whether it gains a clause is the operator's call.
+//
 // RUN
 //
 //   node scripts/rc-shadow-report.cjs --self-test
@@ -91,7 +107,9 @@ const FIELDS = [
   'session_id',
   'constrained',
   'relay',
+  'encoder',
   'target_bps',
+  'bytes_written',
   'viewer_age_ms',
   'viewer_age_floor_ms',
   'shadow_target_bps',
@@ -103,6 +121,21 @@ const FIELDS = [
 ];
 
 const CLASSES = ['constrained', 'direct', 'unknown'];
+
+/** What the encoder spent, in bps: each row's lower edge is inclusive. */
+const SPENT_EDGES_BPS = [500000, 1000000, 2000000, 5000000, 10000000, 20000000, 50000000];
+const SPENT_LABELS = ['< 0.5', '0.5 – 1', '1 – 2', '2 – 5', '5 – 10', '10 – 20', '20 – 50', '≥ 50'];
+/** spent ÷ the shadow's target: bin 0 is covered, each upper edge is inclusive. */
+const OVER_EDGES = [1, 1.25, 2, 4, 8];
+const OVER_LABELS = ['covered', '≤ ×1.25', '≤ ×2', '≤ ×4', '≤ ×8', '> ×8'];
+/** A pump's opening. The law climbs ×1.08 per 2-s window, about 47 rises to a
+ *  ~100 Mbps ceiling (FR-63 § "Day 0"), so 120 s holds the whole climb. */
+const OPENING_MS = 120000;
+/** Two heartbeats of one pump make a rate only this far apart. Nominally 1-2 s:
+ *  closer is a replay, and further is a hole in the log, whose average says
+ *  nothing about any one window. */
+const RATE_MIN_GAP_MS = 500;
+const RATE_MAX_GAP_MS = 10000;
 
 // ---------------------------------------------------------------- values
 
@@ -223,7 +256,14 @@ function newBucket() {
     belowFloor: 0,
     pauseRisesOnDirect: 0,
     viaIce: 0,
+    noRate: 0,
+    cleanOver: 0,
+    controlNear: 0,
+    controlOf: 0,
     hist: { elevated: new Map(), clean: new Map(), noAge: new Map() },
+    // One sparse cube per age class, keyed phase|spent bin|over bin|encoder|state.
+    // Every table the report prints is a marginal of it.
+    spend: { elevated: new Map(), clean: new Map(), noAge: new Map() },
     states: new Map(),
     reasons: new Map(),
   };
@@ -239,9 +279,81 @@ function mergeBucket(into, from) {
   }
   for (const h of ['elevated', 'clean', 'noAge']) {
     for (const [k, v] of from.hist[h]) bump(into.hist[h], k, v);
+    for (const [k, v] of from.spend[h]) bump(into.spend[h], k, v);
   }
   for (const [k, v] of from.states) bump(into.states, k, v);
   for (const [k, v] of from.reasons) bump(into.reasons, k, v);
+}
+
+function epochMs(ts) {
+  if (ts === null || ts === undefined) return null;
+  const s = String(ts);
+  const ms = Date.parse(s.endsWith('Z') ? s : s + 'Z');
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function spentBin(bps) {
+  const i = SPENT_EDGES_BPS.findIndex((edge) => bps < edge);
+  return i < 0 ? SPENT_EDGES_BPS.length : i;
+}
+
+function overBin(ratio) {
+  const i = OVER_EDGES.findIndex((edge) => ratio <= edge);
+  return i < 0 ? OVER_EDGES.length : i;
+}
+
+/**
+ * What one pump sent since its last heartbeat. `bytes_written` is the send task's
+ * running total of whole frames the transport took, so a rate is the difference
+ * over the two heartbeats' own gap. Null when there is no honest rate.
+ *
+ * `cover` is the higher of the shadow's targets at the two ends, because a shadow
+ * that cut mid-window held the higher one for part of it. That can only UNDER-count
+ * a bite, which is the side to err on: the reading exists to prove one.
+ */
+function pumpSpend(s, kind, f, ts, shadow) {
+  const bytes = num(f.bytes_written);
+  const at = epochMs(ts);
+  if (bytes === null || at === null) return null;
+  const p = s.pump;
+  // Behind the mark: a replayed batch, never a window, and it must not rewind it.
+  if (p && at <= p.at) return null;
+  // A counter that falls is a new pump (a new codec, a reopened channel), with a
+  // new governor, so its shadow opens again too.
+  if (!p || p.kind !== kind || bytes < p.bytes) {
+    s.pump = { kind, at, bytes, shadow, openedAt: at };
+    return null;
+  }
+  const gap = at - p.at;
+  if (gap < RATE_MIN_GAP_MS) return null;
+  const spent =
+    gap > RATE_MAX_GAP_MS
+      ? null
+      : {
+          bps: ((bytes - p.bytes) * 8000) / gap,
+          cover: Math.max(shadow || 0, p.shadow || 0),
+          opening: at - p.openedAt < OPENING_MS,
+        };
+  p.at = at;
+  p.bytes = bytes;
+  p.shadow = shadow;
+  return spent;
+}
+
+function noteSpend(b, judged, spent, encoder, state, measured) {
+  if (!spent) {
+    b.noRate++;
+    return;
+  }
+  const over = overBin(spent.bps / spent.cover);
+  bump(b.spend[judged], [spent.opening ? 'opening' : 'later', spentBin(spent.bps), over, encoder, state].join('|'));
+  if (judged === 'clean' && over > 0) b.cleanOver++;
+  // The positive control: the sender's own count against what the viewer says
+  // arrived, two readings that share nothing. See the render.
+  if (measured) {
+    b.controlOf++;
+    if (spent.bps * 2 >= measured && spent.bps <= measured * 2) b.controlNear++;
+  }
 }
 
 /** Nearest-rank percentile of a sparse histogram (value -> count). */
@@ -276,7 +388,7 @@ class ShadowReport {
     const key = (agent || '') + '/' + sid;
     let s = this.sessions.get(key);
     if (!s) {
-      s = { iceRelay: null, cls: {}, lastPauses: null, kinds: new Set() };
+      s = { iceRelay: null, cls: {}, lastPauses: null, kinds: new Set(), pump: null };
       this.sessions.set(key, s);
     }
     return s;
@@ -313,7 +425,8 @@ class ShadowReport {
       this.off++;
       return;
     }
-    s.kinds.add(/FFmpeg/.test(msg) ? 'ffmpeg' : 'vp9');
+    const kind = /FFmpeg/.test(msg) ? 'ffmpeg' : 'vp9';
+    s.kinds.add(kind);
     const c = bool(f.constrained);
     const cls = c === true ? 'constrained' : c === false ? 'direct' : 'unknown';
     const b = s.cls[cls] || (s.cls[cls] = newBucket());
@@ -331,6 +444,9 @@ class ShadowReport {
 
     const live = num(f.target_bps);
     const shadow = num(f.shadow_target_bps);
+    // Before the two returns: a window that is not compared still moves the
+    // pump's mark, or the next rate would average over two windows.
+    const spent = pumpSpend(s, kind, f, ts, shadow);
     if (shadow === null) {
       b.noShadow++;
       return;
@@ -351,30 +467,38 @@ class ShadowReport {
     else b.pos++;
     const age = num(f.viewer_age_ms);
     const floor = num(f.viewer_age_floor_ms);
+    let judged;
     if (age === null || floor === null) {
       b.noAge++;
       bump(b.hist.noAge, pct);
+      judged = 'noAge';
     } else if (age - floor >= AGE_SLACK_MS) {
       b.elevated++;
       if (agree) b.elevatedAgree++;
       bump(b.hist.elevated, pct);
+      judged = 'elevated';
     } else {
       b.clean++;
       if (agree) b.cleanAgree++;
       bump(b.hist.clean, pct);
+      judged = 'clean';
     }
+    // The VP9-444 heartbeat has no `encoder` field: it is always libvpx.
+    const encoder = kind === 'vp9' ? 'vp9-444' : text(f.encoder) || '?';
+    noteSpend(b, judged, spent, encoder, state || '?', num(f.shadow_measured_bps));
   }
 
   /** Feed one NDJSON / fleet-read row: `{ a, t, m, f }`. */
   addRow(row) {
     if (!row) return;
-    this.add(row.m, row.f || {}, row.t instanceof Date ? row.t.toISOString() : row.t, row.a ? text(row.a) : null);
+    const t = row.t && typeof row.t.toISOString === 'function' ? row.t.toISOString() : row.t;
+    this.add(row.m, row.f || {}, t, row.a ? text(row.a) : null);
   }
 
   finish() {
     const classes = {};
     for (const c of CLASSES) {
-      classes[c] = { sessions: 0, viaIce: 0, windows: 0, bucket: newBucket() };
+      classes[c] = { sessions: 0, viaIce: 0, over: 0, windows: 0, bucket: newBucket() };
     }
     let sessionsWithShadow = 0;
     const ffmpegSessions = { n: 0 };
@@ -399,6 +523,7 @@ class ShadowReport {
         if (b.windows >= this.minWindows) {
           classes[c].sessions++;
           if (b.viaIce) classes[c].viaIce++;
+          if (b.cleanOver) classes[c].over++;
         }
       }
       if (any) sessionsWithShadow++;
@@ -428,7 +553,7 @@ class ShadowReport {
       const k = classes[c];
       const b = k.bucket;
       if (c !== 'unknown') mergeBucket(pooled, b);
-      out.classes[c] = summarise(b, { sessions: k.sessions, sessionsViaIce: k.viaIce });
+      out.classes[c] = summarise(b, { sessions: k.sessions, sessionsViaIce: k.viaIce, sessionsOver: k.over });
     }
     out.pooled = summarise(pooled, {});
 
@@ -497,7 +622,71 @@ function summarise(b, extra) {
     viaIceWindows: b.viaIce,
     states: Object.fromEntries([...b.states].sort((x, y) => y[1] - x[1])),
     reasons: Object.fromEntries([...b.reasons].sort((x, y) => y[1] - x[1])),
+    noRate: b.noRate,
+    control: { near: b.controlNear, of: b.controlOf },
+    spend: {
+      clean: spendSummary(b.spend.clean),
+      noAge: spendSummary(b.spend.noAge),
+      elevated: spendSummary(b.spend.elevated),
+    },
   });
+  return o;
+}
+
+/** One age class's cube: its totals, the rows the report prints, and the cube
+ *  itself for `--json`, so a later cut needs no second read of the database. */
+function spendSummary(cube) {
+  const o = {
+    rated: 0,
+    over: 0,
+    opening: { rated: 0, over: 0 },
+    later: { rated: 0, over: 0 },
+    bins: SPENT_LABELS.map((spent) => ({
+      spent,
+      windows: 0,
+      over: 0,
+      over25: 0,
+      over2x: 0,
+      over4x: 0,
+      later: { windows: 0, over: 0 },
+      atOrAbove: { windows: 0, over: 0 },
+    })),
+    encoders: {},
+    overStates: {},
+    cells: [],
+  };
+  // Sorted, so the same windows print the same JSON whichever read fed them.
+  for (const key of [...cube.keys()].sort()) {
+    const n = cube.get(key);
+    const [phase, spentAt, overAt, encoder, state] = key.split('|');
+    const at = Number(overAt);
+    const row = o.bins[Number(spentAt)];
+    const enc = o.encoders[encoder] || (o.encoders[encoder] = { rated: 0, over: 0 });
+    o.rated += n;
+    o[phase].rated += n;
+    row.windows += n;
+    enc.rated += n;
+    if (phase === 'later') row.later.windows += n;
+    if (at > 0) {
+      o.over += n;
+      o[phase].over += n;
+      row.over += n;
+      enc.over += n;
+      o.overStates[state] = (o.overStates[state] || 0) + n;
+      if (phase === 'later') row.later.over += n;
+    }
+    if (at > 1) row.over25 += n;
+    if (at > 2) row.over2x += n;
+    if (at > 3) row.over4x += n;
+    o.cells.push({ phase, spent: SPENT_LABELS[Number(spentAt)], over: OVER_LABELS[at], encoder, state, windows: n });
+  }
+  let windows = 0;
+  let over = 0;
+  for (let i = o.bins.length - 1; i >= 0; i--) {
+    windows += o.bins[i].windows;
+    over += o.bins[i].over;
+    o.bins[i].atOrAbove = { windows, over };
+  }
   return o;
 }
 
@@ -582,7 +771,59 @@ function render(r) {
         `disagreement p50 ${fmtPct(x.disagreePct.clean.p50)}, p90 ${fmtPct(x.disagreePct.clean.p90)}`,
     );
   }
+  renderSpend(r, L);
   return L.join('\n');
+}
+
+function share(over, of) {
+  return of ? `${over}/${of} = ${pctText(over / of)}` : '—';
+}
+
+/** What the encoder spent against what the shadow would have allowed. Counts
+ *  only, and no bar: each row carries the share at its spend or more, so any gate
+ *  can be read off this one report, and which gate is the operator's call. */
+function renderSpend(r, L) {
+  L.push('');
+  L.push('**What the encoder spent, against the shadow (clean windows; the criterion does not judge these)**');
+  L.push('');
+  const present = CLASSES.filter((c) => r.classes[c].spend.clean.rated || r.classes[c].spend.noAge.rated);
+  if (!present.length) {
+    L.push('- no evidence: no window has a spend rate (a build without `bytes_written`, or sessions of one window)');
+    return;
+  }
+  L.push(
+    '`spent` is `Δbytes_written` between two heartbeats of one pump, against the higher of the shadow\'s targets at the two ends. ' +
+      'Over it across a whole window proves the shadow would have capped real spending, and a shadow pinned at its floor meets the criterion above and shows only here. ' +
+      'Under it proves less: a burst inside the window can still have been capped.',
+  );
+  for (const c of present) {
+    const x = r.classes[c];
+    const k = x.spend.clean;
+    L.push('');
+    L.push(
+      `${c}: ${k.rated} clean windows with a rate, ${k.over} over the shadow, in ${x.sessionsOver} of ${x.sessions} sessions. ` +
+        `First 120 s of a pump: ${k.opening.over} of ${k.opening.rated}; later: ${k.later.over} of ${k.later.rated}.`,
+    );
+    L.push('');
+    L.push('| spent, Mbps | clean windows | spent > shadow | by > 25 % | by > ×2 | by > ×4 | over, after the first 120 s | share over, at this spend or more |');
+    L.push('|---|---|---|---|---|---|---|---|');
+    for (const b of k.bins) {
+      if (!b.windows) continue;
+      L.push(
+        `| ${b.spent} | ${b.windows} | ${b.over} | ${b.over25} | ${b.over2x} | ${b.over4x} | ` +
+          `${b.later.over} of ${b.later.windows} | ${share(b.atOrAbove.over, b.atOrAbove.windows)} |`,
+      );
+    }
+    L.push('');
+    const encoders = Object.entries(k.encoders).map(([name, v]) => `${name} ${v.over} of ${v.rated}`);
+    if (encoders.length) L.push(`- over the shadow, by encoder: ${encoders.join(', ')}`);
+    const states = Object.entries(k.overStates).map(([name, n]) => `${name} ${n}`);
+    if (states.length) L.push(`- the shadow's state when it was over: ${states.join(', ')}`);
+    const noAge = x.spend.noAge;
+    if (noAge.rated) L.push(`- no viewer age, so not judged clean: ${noAge.rated} windows with a rate, ${noAge.over} over the shadow`);
+    L.push(`- no rate (a pump's first window, a hole in the log): ${x.noRate} of ${x.compared} compared windows`);
+    if (x.control.of) L.push(`- positive control, the sender's rate within ×2 of \`shadow_measured_bps\`: ${share(x.control.near, x.control.of)}`);
+  }
 }
 
 // ---------------------------------------------------------------- mongosh runner
@@ -691,10 +932,13 @@ const FIX = {
     '2026-10-29T00:06:14.904250Z  INFO FFmpeg DC pump heartbeat (≈2s window) session_id=aaaaaaaaaaaaaaaaaaaaaa01 codec_label="AV1" target_fps=60 constrained=false target_bps=48000000 width=2560 height=1600 encoder="av1_nvenc" viewer_age_ms=Some(6) viewer_age_floor_ms=Some(1) viewer_age_implausible=0 age_split=Some(AgeSplit { sender_ms: Some(0.107), transit_ms: 3, viewer_ms: 3 }) pipe_state=None pipe_states=[0, 0, 0, 0, 0] plan_divergences=PlanDivergences { budget: 0, hard_budget: 0, lag_bound: 0, gate: 0, fps: 0, dims: 0, bitrate: 0 } plan_epoch=3 pump_stalls=0',
   ice: (sid, relay) =>
     `2026-10-30T16:00:00.000000Z  INFO per-session ICE path detected (adaptive bitrate) session_id=${sid} relay=${relay} local_typ=Host local_proto=Udp local_addr=192.0.2.10:52131 remote_typ=Host remote_proto=Udp remote_addr=198.51.100.20:57224`,
+  // `o.s` is seconds past 16:00:00, so a session can run past the opening.
+  at: (s) =>
+    `2026-10-30T16:${String(Math.floor((s || 0) / 60)).padStart(2, '0')}:${String((s || 0) % 60).padStart(2, '0')}.000000Z`,
   ff: (sid, o) =>
-    `2026-10-30T16:00:${String(o.s || 0).padStart(2, '0')}.000000Z  INFO FFmpeg DC pump heartbeat (≈2s window) session_id=${sid} codec_label="HEVC" target_fps=30 constrained=${o.c} target_bps=${o.live} encoder="hevc_qsv" viewer_age_ms=${o.age === null ? 'None' : `Some(${o.age})`} viewer_age_floor_ms=${o.floor === null ? 'None' : `Some(${o.floor})`} age_split=Some(AgeSplit { sender_ms: Some(0.1), transit_ms: 3, viewer_ms: 3 }) plan_divergences=PlanDivergences { budget: 0, hard_budget: 0 } shadow_target_bps=${o.shadow === null ? 'None' : `Some(${o.shadow})`} shadow_state="${o.state || 'hold'}" shadow_measured_bps=Some(900000) shadow_disagree_pct=${o.shadow === null || !o.live ? 'None' : `Some(${Math.trunc(((o.shadow - o.live) * 100) / o.live)})`} shadow_pauses=${o.pauses || 0} shadow_reason="${o.reason || 'held'}" pump_stalls=0`,
+    `${FIX.at(o.s)}  INFO FFmpeg DC pump heartbeat (≈2s window) session_id=${sid} codec_label="HEVC" target_fps=30 constrained=${o.c} target_bps=${o.live} encoder="${o.enc || 'hevc_qsv'}"${o.bytes === undefined ? '' : ` frames_sent=7 bytes_written=${o.bytes} send_errors=0`} viewer_age_ms=${o.age === null ? 'None' : `Some(${o.age})`} viewer_age_floor_ms=${o.floor === null ? 'None' : `Some(${o.floor})`} age_split=Some(AgeSplit { sender_ms: Some(0.1), transit_ms: 3, viewer_ms: 3 }) plan_divergences=PlanDivergences { budget: 0, hard_budget: 0 } shadow_target_bps=${o.shadow === null ? 'None' : `Some(${o.shadow})`} shadow_state="${o.state || 'hold'}" shadow_measured_bps=${o.measured === undefined ? 'Some(900000)' : o.measured === null ? 'None' : `Some(${o.measured})`} shadow_disagree_pct=${o.shadow === null || !o.live ? 'None' : `Some(${Math.trunc(((o.shadow - o.live) * 100) / o.live)})`} shadow_pauses=${o.pauses || 0} shadow_reason="${o.reason || 'held'}" pump_stalls=0`,
   vp9: (sid, o) =>
-    `2026-10-30T16:00:${String(o.s || 0).padStart(2, '0')}.000000Z  INFO VP9-444 DC pump heartbeat (≈1s window) session_id=${sid} target_fps=30 cpu_used=6 paced_fps=None target_bps=${o.live} avg_qp=Some(200) viewer_age_ms=Some(${o.age}) viewer_age_floor_ms=Some(${o.floor}) pipe_state=Some("unknown") link_stats=(0, 0, 0) shadow_target_bps=Some(${o.shadow}) shadow_state="normal" shadow_measured_bps=None shadow_disagree_pct=Some(${Math.trunc(((o.shadow - o.live) * 100) / o.live)}) shadow_pauses=0 shadow_reason="climbing"`,
+    `${FIX.at(o.s)}  INFO VP9-444 DC pump heartbeat (≈1s window) session_id=${sid} target_fps=30 cpu_used=6${o.bytes === undefined ? '' : ` frames_sent=7 bytes_written=${o.bytes} send_errors=0`} paced_fps=None target_bps=${o.live} avg_qp=Some(200) viewer_age_ms=Some(${o.age}) viewer_age_floor_ms=Some(${o.floor}) pipe_state=Some("unknown") link_stats=(0, 0, 0) shadow_target_bps=Some(${o.shadow}) shadow_state="normal" shadow_measured_bps=None shadow_disagree_pct=Some(${Math.trunc(((o.shadow - o.live) * 100) / o.live)}) shadow_pauses=0 shadow_reason="climbing"`,
 };
 
 function selfTest() {
@@ -863,6 +1107,266 @@ function selfTest() {
   const rt = new ShadowReport();
   rt.add(t.msg, t.fields, t.ts, 'aaaaaaaaaaaaaaaaaaaaaaaa');
   ok(JSON.stringify(ra.finish().classes) === JSON.stringify(rt.finish().classes), 'agent_logs row == text line');
+
+  // --- what the encoder spent. `bytes_written` is the pump's running total, so a
+  // rate is the difference between two heartbeats of one pump over their own gap.
+  const mbps = (m, secs) => Math.round((m * 1e6 * secs) / 8);
+  // Heartbeats every 2 s from `o.from` (default 1), spending `o.spend` Mbps, the
+  // running total starting at `o.start` (default 1000).
+  const spending = (sid, n, o) => {
+    const out = [];
+    let bytes = o.start === undefined ? 1000 : o.start;
+    const from = o.from === undefined ? 1 : o.from;
+    for (let i = 0; i < n; i++) {
+      out.push(FIX.ff(sid, Object.assign({ s: from + 2 * i, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes }, o)));
+      bytes += mbps(o.spend, 2);
+    }
+    return out;
+  };
+  const s1 = 'ssssssssssssssssssssss01';
+  const s2 = 'ssssssssssssssssssssss02';
+
+  const clean = (r, c) => r.classes[c || 'direct'].spend.clean;
+  const k0 = run(spending(s1, 3, { spend: 8 }));
+  ok(clean(k0).rated === 2 && k0.classes.direct.noRate === 1, "a pump's first window has no rate, the next ones do", k0.classes.direct.spend);
+  ok(clean(k0).over === 2 && k0.classes.direct.sessionsOver === 1, 'spending 8 Mbps against a 2.46 M shadow is over it', clean(k0));
+
+  // The reason the column exists. These two sessions print the SAME disagreement
+  // and the same criterion, and only one of them would have lost anything.
+  const atRest = run(spending(s1, 5, { spend: 0.05 }));
+  const working = run(spending(s1, 5, { spend: 20 }));
+  ok(
+    JSON.stringify(atRest.classes.direct.disagreePct) === JSON.stringify(working.classes.direct.disagreePct),
+    'the disagreement cannot tell a resting encoder from a working one',
+    [atRest.classes.direct.disagreePct, working.classes.direct.disagreePct],
+  );
+  ok(clean(atRest).rated === 4 && clean(atRest).over === 0, 'at rest the same shadow caps nothing', clean(atRest));
+  ok(clean(working).rated === 4 && clean(working).over === 4, 'working, the same shadow caps every window', clean(working));
+
+  // The blind spot, measured: pinned at its floor with the encoder working, the
+  // shadow still MEETS the criterion. The criterion is the operator's, so this
+  // pins that the new reading does not move it.
+  const pinned = [];
+  for (let i = 0; i < 20; i++) {
+    for (const [cls, sid, live, floor] of [
+      [true, 'q' + String(i).padStart(23, '0'), 2550000, 200000],
+      [false, 'r' + String(i).padStart(23, '0'), 89760000, 2457600],
+    ]) {
+      pinned.push(FIX.ff(sid, { s: 1, c: cls, live, shadow: floor, age: 600, floor: 50, bytes: 1000 }));
+      pinned.push(FIX.ff(sid, { s: 3, c: cls, live, shadow: floor, age: 60, floor: 50, bytes: 1000 + mbps(20, 2) }));
+      pinned.push(FIX.ff(sid, { s: 5, c: cls, live, shadow: floor, age: 60, floor: 50, bytes: 1000 + mbps(40, 2) }));
+    }
+  }
+  const pin = run(pinned);
+  ok(pin.criterion.verdict === 'MET', 'a shadow pinned at its floor MEETS the criterion', pin.criterion);
+  ok(
+    clean(pin, 'constrained').over === 40 && clean(pin, 'direct').over === 40 && pin.classes.direct.sessionsOver === 20,
+    'and every clean window it would have capped says so',
+    [clean(pin, 'constrained'), clean(pin, 'direct')],
+  );
+
+  // A bite is proved only when the spend beat the higher of the window's two
+  // targets: a shadow that cut mid-window held the higher one for part of it.
+  const cut = [
+    FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 8000000, age: 60, floor: 50, bytes: 1000 }),
+    FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow: 4000000, age: 60, floor: 50, bytes: 1000 + mbps(6, 2) }),
+    FIX.ff(s1, { s: 5, c: false, live: 89760000, shadow: 4000000, age: 60, floor: 50, bytes: 1000 + mbps(12, 2) }),
+  ];
+  const k1b = run(cut);
+  ok(clean(k1b).rated === 2 && clean(k1b).over === 1, 'the spend is judged against the higher of the two ends of its window', clean(k1b));
+  const rose = run([
+    FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2000000, age: 60, floor: 50, bytes: 1000 }),
+    FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow: 4000000, age: 60, floor: 50, bytes: 1000 + mbps(3, 2) }),
+  ]);
+  ok(clean(rose).rated === 1 && clean(rose).over === 0, 'whichever end is the higher one', clean(rose));
+
+  // Exactly the target is covered; a byte more is not.
+  const edge2 = (extra) =>
+    run([
+      FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 4000000, age: 60, floor: 50, bytes: 0 }),
+      FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow: 4000000, age: 60, floor: 50, bytes: 1000000 + extra }),
+    ]);
+  ok(clean(edge2(0)).rated === 1 && clean(edge2(0)).over === 0, 'spending exactly the target is covered', clean(edge2(0)));
+  ok(clean(edge2(1)).over === 1, 'one byte more is over it', clean(edge2(1)));
+
+  // Bins: the spend's lower edge is inclusive, the ratio's upper edge is.
+  const single = (spendMbps, shadow) =>
+    run([
+      FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow, age: 60, floor: 50, bytes: 0 }),
+      FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow, age: 60, floor: 50, bytes: mbps(spendMbps, 2) }),
+    ]);
+  const bin = (r) => clean(r).bins.filter((x) => x.windows)[0];
+  ok(bin(single(2, 100000000)).spent === '2 – 5', 'exactly 2 Mbps falls in the 2 – 5 row', clean(single(2, 100000000)).bins);
+  ok(bin(single(1.99, 100000000)).spent === '1 – 2', 'just under falls in the 1 – 2 row');
+  ok(bin(single(60, 100000000)).spent === '≥ 50', 'the top row is open');
+  const by = (r) => [bin(r).over, bin(r).over25, bin(r).over2x, bin(r).over4x].join();
+  ok(by(single(5, 4000000)) === '1,0,0,0', 'exactly 25 % over counts as over, not as over by more than 25 %', by(single(5, 4000000)));
+  ok(by(single(5.2, 4000000)) === '1,1,0,0', 'more than 25 % over', by(single(5.2, 4000000)));
+  ok(by(single(8.2, 4000000)) === '1,1,1,0', 'more than twice', by(single(8.2, 4000000)));
+  ok(by(single(16.2, 4000000)) === '1,1,1,1', 'more than four times', by(single(16.2, 4000000)));
+
+  // Each row carries the share at its spend or more, so any gate can be read off
+  // the one report without this script choosing one.
+  const mix = run([...spending(s1, 5, { spend: 0.2 }), ...spending(s2, 3, { spend: 8, from: 41 })]);
+  const rows = clean(mix).bins.filter((x) => x.windows);
+  ok(
+    rows.length === 2 && rows[0].atOrAbove.windows === 6 && rows[0].atOrAbove.over === 2 && rows[1].atOrAbove.windows === 2 && rows[1].atOrAbove.over === 2,
+    'each row carries the share at its spend or more',
+    rows,
+  );
+
+  // A pump restarted (a new codec, a reopened channel) counts from zero.
+  const rst = [
+    FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 50000000 }),
+    FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 60000000 }),
+    FIX.ff(s1, { s: 5, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 }),
+    FIX.ff(s1, { s: 7, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(8, 2) }),
+  ];
+  const k2 = run(rst);
+  ok(clean(k2).rated === 2 && k2.classes.direct.noRate === 2 && clean(k2).over === 2, 'a counter that falls is a new pump, never a negative rate', clean(k2));
+
+  // A hole in the log is not a low rate, and a replayed batch is not a window.
+  const gap = [
+    FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 }),
+    FIX.ff(s1, { s: 31, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(8, 30) }),
+    FIX.ff(s1, { s: 33, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(8, 32) }),
+  ];
+  const k3 = run(gap);
+  ok(clean(k3).rated === 1 && k3.classes.direct.noRate === 2, 'a gap over 10 s has no rate; the window after it does', clean(k3));
+  const replay = [
+    FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 }),
+    FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(8, 2) }),
+    FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 }),
+    FIX.ff(s1, { s: 5, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(8, 2) + mbps(30, 2) }),
+  ];
+  const k4 = run(replay);
+  // Rewound to the replayed line, the last rate would average to 19 Mbps over 4 s.
+  ok(
+    clean(k4).rated === 2 && k4.classes.direct.noRate === 2 && clean(k4).bins[6].windows === 1,
+    'a replayed line neither rates nor rewinds the pump',
+    clean(k4).bins.filter((x) => x.windows),
+  );
+  // Hard on the mark's heels: no window is that short, and the mark stays put.
+  const near = new ShadowReport();
+  const nearLines = [
+    [FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 }), null],
+    [FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(8, 2) }), '2026-10-30T16:00:01.200Z'],
+    [FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(8, 2) }), null],
+  ];
+  for (const [l, ts] of nearLines) {
+    const p = parseLogLine(l);
+    near.add(p.msg, p.fields, ts || p.ts, null);
+  }
+  const k4b = near.finish();
+  ok(clean(k4b).rated === 1 && bin(k4b).spent === '5 – 10', 'two heartbeats under 500 ms apart make no rate, and the next one spans from the mark', clean(k4b).bins.filter((x) => x.windows));
+  // A session that changed pump: the VP9 total is not a continuation of the FFmpeg one.
+  const swap = run([
+    FIX.ice(s1, 'false'),
+    FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 }),
+    FIX.vp9(s1, { s: 3, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(8, 2) }),
+    FIX.vp9(s1, { s: 4, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(8, 2) + mbps(1, 1) }),
+  ]);
+  ok(clean(swap).rated === 1 && bin(swap).spent === '1 – 2', 'a different pump starts its own count', clean(swap).bins.filter((x) => x.windows));
+
+  // The opening: B2's question is whether the harm ends when the climb does.
+  const long = run(spending(s1, 70, { spend: 8 }));
+  ok(clean(long).opening.rated === 59 && clean(long).later.rated === 10, 'the first 120 s of a pump are its opening', [clean(long).opening, clean(long).later]);
+  ok(bin(long).later.windows === 10 && bin(long).later.over === 10 && bin(long).windows === 69, 'each row says how much of it came after the opening', bin(long));
+  const restarted = run([
+    ...spending(s1, 70, { spend: 8, start: 900000000 }),
+    ...spending(s1, 3, { spend: 8, from: 200 }),
+  ]);
+  ok(clean(restarted).opening.rated === 61, 'a restarted pump opens again', clean(restarted).opening);
+
+  // Elevated and no-age windows are not clean; a window not compared still moves the mark.
+  const ages = run([
+    FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 }),
+    FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow: 2457600, age: 600, floor: 50, bytes: 1000 + mbps(8, 2) }),
+    FIX.ff(s1, { s: 5, c: false, live: 89760000, shadow: 2457600, age: null, floor: null, bytes: 1000 + mbps(8, 4) }),
+    FIX.ff(s1, { s: 7, c: false, live: 89760000, shadow: null, age: 60, floor: 50, bytes: 1000 + mbps(8, 6) }),
+    FIX.ff(s1, { s: 9, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(16, 6) }),
+  ]);
+  const ka = ages.classes.direct.spend;
+  ok(ka.elevated.over === 1 && ka.noAge.over === 1 && ka.clean.rated === 1, 'elevated, no-age and clean windows are read apart', ka);
+  ok(bin(ages).spent === '20 – 50', 'an uncompared window still moves the mark: the next rate spans 2 s, not 4', bin(ages));
+  const onlyElevated = run([
+    FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 600, floor: 50, bytes: 1000 }),
+    FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow: 2457600, age: 600, floor: 50, bytes: 1000 + mbps(8, 2) }),
+  ]);
+  ok(onlyElevated.classes.direct.sessionsOver === 0, 'over the shadow while the age is elevated is the safe direction, not a session over it', onlyElevated.classes.direct);
+
+  // Who was over, and in what state.
+  const who = run([
+    ...spending(s1, 3, { spend: 8, enc: 'av1_nvenc', state: 'startup' }),
+    ...spending(s2, 3, { spend: 0.1, enc: 'hevc_qsv', state: 'hold', from: 41 }),
+  ]);
+  ok(
+    clean(who).encoders.av1_nvenc.over === 2 && clean(who).encoders.av1_nvenc.rated === 2 && clean(who).encoders.hevc_qsv.over === 0 && clean(who).encoders.hevc_qsv.rated === 2,
+    'clean windows and those over the shadow, per encoder',
+    clean(who).encoders,
+  );
+  ok(clean(who).overStates.startup === 2 && !clean(who).overStates.hold, "the shadow's state when it was over", clean(who).overStates);
+
+  // The positive control: the sender's rate against the viewer's own arrival rate.
+  const ctl = run([
+    FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000, measured: 900000 }),
+    FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(1, 2), measured: 900000 }),
+    FIX.ff(s1, { s: 5, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(9, 2), measured: 900000 }),
+    FIX.ff(s1, { s: 7, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(10, 2), measured: null }),
+  ]);
+  ok(ctl.classes.direct.control.near === 1 && ctl.classes.direct.control.of === 2, 'the control counts a rate within ×2 of the viewer arrival, and skips a window with none', ctl.classes.direct.control);
+  const ctlLow = run([
+    FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000, measured: 900000 }),
+    FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(0.6, 2), measured: 900000 }),
+    FIX.ff(s1, { s: 5, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50, bytes: 1000 + mbps(0.6, 2) + mbps(0.4, 2), measured: 900000 }),
+  ]);
+  ok(ctlLow.classes.direct.control.near === 1 && ctlLow.classes.direct.control.of === 2, 'the ×2 is on both sides', ctlLow.classes.direct.control);
+
+  // A VP9 window takes its class from the ICE line, spend included.
+  const v3 = 'dddddddddddddddddddddd03';
+  const vr = run([
+    FIX.ice(v3, 'true'),
+    FIX.vp9(v3, { s: 1, live: 3000000, shadow: 300000, age: 60, floor: 50, bytes: 1000 }),
+    FIX.vp9(v3, { s: 2, live: 3000000, shadow: 300000, age: 60, floor: 50, bytes: 1000 + mbps(1, 1) }),
+  ]);
+  ok(
+    clean(vr, 'constrained').rated === 1 && clean(vr, 'constrained').over === 1 && clean(vr, 'constrained').encoders['vp9-444'].over === 1 && vr.classes.constrained.sessionsOver === 1 && vr.classes.unknown.windows === 0,
+    'a VP9 window spends under its ICE class, as vp9-444',
+    vr.classes.constrained.spend,
+  );
+  ok(clean(vr, 'constrained').rated === vr.pooled.spend.clean.rated, 'the pool carries the spend');
+
+  // The fleet read's trap: a field the fold reads and $project drops reads as
+  // "no rate" there and nowhere else. Push each line through FIELDS, with the
+  // driver's types, and the report must not change.
+  const lines = [...spending(s1, 4, { spend: 8, enc: 'av1_nvenc' }), ...spending(s2, 3, { spend: 0.1, from: 41 })];
+  const viaText = new ShadowReport();
+  const viaRow = new ShadowReport();
+  for (const l of lines) {
+    const p = parseLogLine(l);
+    viaText.add(p.msg, p.fields, p.ts, 'aaaaaaaaaaaaaaaaaaaaaaaa');
+    const f = {};
+    for (const k of FIELDS) {
+      if (!(k in p.fields)) continue;
+      const v = value(p.fields[k]);
+      f[k] = typeof v === 'number' && Number.isInteger(v) && /^\d+$/.test(p.fields[k]) ? { toNumber: () => v } : p.fields[k].replace(/^"(.*)"$/, '$1');
+    }
+    // A date from the driver is not `instanceof` this realm's Date under mongosh.
+    const iso = new Date(p.ts).toISOString();
+    viaRow.addRow({ a: { toHexString: () => 'aaaaaaaaaaaaaaaaaaaaaaaa' }, t: { toISOString: () => iso }, m: p.msg, f });
+  }
+  const textOut = viaText.finish();
+  const rowOut = viaRow.finish();
+  ok(rowOut.classes.direct.spend.clean.rated === 5, 'the fleet read rates what it projects', rowOut.classes.direct.spend.clean);
+  ok(JSON.stringify(rowOut.classes) === JSON.stringify(textOut.classes), 'every field the fold reads survives the projection', [rowOut.classes.direct.spend, textOut.classes.direct.spend]);
+  ok(/^2026-10-30T/.test(rowOut.provenance.first), "a driver's date reads as ISO", rowOut.provenance.first);
+
+  // The render states it, counts only, and says so when it has nothing to say.
+  const md = render(working);
+  ok(/spent > shadow/.test(md) && /\| 20 – 50 \| 4 \| 4 \| 4 \| 4 \| 4 \|/.test(md), 'the render carries the spend table', md.split('\n').filter((l) => /\|/.test(l)));
+  ok(!md.includes(s1), 'no session id is printed');
+  const none = render(run([FIX.ff(s1, { s: 1, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50 }), FIX.ff(s1, { s: 3, c: false, live: 89760000, shadow: 2457600, age: 60, floor: 50 })]));
+  ok(/no window has a spend rate/.test(none), 'no rate is no evidence, not a clean bill', none.split('\n').slice(-4));
 
   // --- the constants still mirror the controller (a drift check, when run in a checkout)
   try {
