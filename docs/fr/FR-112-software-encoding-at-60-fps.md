@@ -575,7 +575,9 @@ at every length, on both arms.
 
 The 10 s arms, with what they cost. Six rounds on 0.4.196, `drag:1000`. Watts are the CPU package from `\Energy
 Meter(RAPL_Package0_PKG)`, minus an idle arm in the same round (1.47 W on the laptop, 2.62 W on the desktop). Frames a
-second is the whole bench process, including its own scene rendering, so it isn't a session's frame rate.
+second is the whole bench process, including its own scene rendering, so it isn't a session's frame rate. It is
+frames ÷ (the seconds between the arm's two energy reads, less 1.05): the reads add a fixed second of their own, and a
+10 s idle arm spans 11.02–11.04 s.
 
 | Host, row, cadence | ms p50 · p95, `=0` → `=1` | frames a second | W above idle | mJ a frame |
 |---|---|---|---|---|

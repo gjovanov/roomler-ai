@@ -1322,7 +1322,8 @@ flowchart LR
 | 30 fps cadence, 300 frames, pinned to the fast cores | **14.24 · 19.48** | 6.53 · 8.80 |
 
 What it costs, in 10 s arms at 1920×1080. Frames a second is the whole bench process, its own scene rendering
-included, so it isn't a session's frame rate.
+included, so it isn't a session's frame rate. It is frames ÷ (the seconds between the arm's two energy reads, less
+1.05): the reads add a fixed second of their own, and a 10 s idle arm spans 11.02–11.04 s.
 
 | Host, row, cadence | ms p50 · p95, `=0` → `=1` | frames a second | package W above idle | mJ a frame |
 |---|---|---|---|---|
