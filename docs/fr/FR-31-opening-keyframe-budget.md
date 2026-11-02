@@ -60,7 +60,7 @@ Two things this is NOT, both refuted by data rather than assumed:
    driver. That is what the A/B has to establish.
 
 The runtime side already works: the agent's `set_bitrate`
-(`encoder.rs:1736-1773`) writes `rc_max_rate` / `rc_buffer_size` on the open context and
+(`encoder.rs:1736-1779`) writes `rc_max_rate` / `rc_buffer_size` on the open context and
 ffmpeg's reconfigure path (`nvenc.c:2985-3001`) applies both via `NvEncReconfigureEncoder`
 before the next frame — the `if (avctx->rc_buffer_size > 0 && vbvBufferSize != rc_buffer_size)`
 branch is unconditional on `cq`. Consequence worth writing down: **from the first AIMD step

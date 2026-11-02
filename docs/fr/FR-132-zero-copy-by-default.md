@@ -44,7 +44,7 @@ opens. An encoder then opens the GPU form only for a cell the probe's `gpu` chil
 ### 2.3 The server cannot turn a cell off
 
 `DesiredConfig`, what remote config pushes, carries two keys of this family, `encoder_cells_deny` and `fps_deny`
-(`crates/remote_control/src/models.rs:2967-2981`), and the agent's `apply` handles exactly those two
+(`crates/remote_control/src/models.rs:2976-2990`), and the agent's `apply` handles exactly those two
 (`agents/roomlerd/src/remote_config.rs:308-332`). Neither `zero_copy` nor `zero_copy_deny` is there. Today that
 costs nothing, because the switch is off everywhere. With a default on, a cell that misbehaves on one driver could
 be turned off only one host at a time, over exec, and only on hosts that answer exec.
@@ -85,7 +85,7 @@ read denies nothing (`crates/modules/fleet/src/remote_config.rs:206`). The agent
 it, and it reports `needs_restart` (`agents/roomlerd/src/remote_config.rs:354`). A test chains the pushed value
 through the restarted daemon's config fallbacks to the exact `name:gpu` entry `gpu_hint::is_denied` matches.
 Decision 1 is held by `the_device_owned_refusals_are_not_pushable`, which compares whole keys
-(`crates/remote_control/src/models.rs:9530`). The dialog gets the field, and
+(`crates/remote_control/src/models.rs:9540`). The dialog gets the field, and
 [`remote-config.md`](../remote-config.md) §6 the key, with its value table.
 
 ### 3b. Decode errors become countable (P1)
@@ -136,7 +136,7 @@ against the same hosts' CPU-path week before it, from the heartbeats and `rc:ses
 |---|---|---|
 | decode errors per session-hour | `rc:session.stats` (3b) | no rise (open decision 3) |
 | keyframe requests per session-hour | `rc:session.stats` | no rise |
-| `input_reason` | the DC heartbeat (`agents/roomlerd/src/peer.rs:9889-9903`) | `gpu` on every session of the cell; no `open_failed` that persists |
+| `input_reason` | the DC heartbeat (`agents/roomlerd/src/peer.rs:9941-9955`) | `gpu` on every session of the cell; no `open_failed` that persists |
 | capture + encode, CPU per frame | the heartbeat; the process's CPU time | FR-118's saving for that cell, roughly |
 
 A clean week puts the cell on the default list in the next agent release. A fleet week after that release verifies

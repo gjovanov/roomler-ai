@@ -80,6 +80,7 @@ import {
   isDeadAir,
   agentIsWaiting,
   advanceEndsWait,
+  mediaStopAfterTick,
   waitKeptAcrossReconnect,
   isKeptSleepNotice,
   mediaWaitingCopy,
@@ -6022,6 +6023,22 @@ describe('FR-93: an agent that says it cannot capture is believed', () => {
     expect(advanceEndsWait(true, since + RC_MEDIA_WAITING_SETTLE_MS - 1, since)).toBe(false)
     expect(advanceEndsWait(true, since + RC_MEDIA_WAITING_SETTLE_MS, since)).toBe(true)
     expect(advanceEndsWait(false, since + 5_000, since)).toBe(false)
+  })
+
+  // FR-135 R2 — the same race on the device's own stop: a frame it sent before
+  // stopping must not take down the sentence that says why the picture froze.
+  it('a frame the device sent before it stopped does not erase why it stopped', () => {
+    const stop = { title: 'This device\'s video encoder stopped.' }
+    const since = 10_000
+    // The tick that counted the last frames began before the stop arrived.
+    expect(mediaStopAfterTick(stop, true, 9_500, since)).toBe(stop)
+    // The worker's 1 s stats can carry them into the next interval as well.
+    expect(mediaStopAfterTick(stop, true, since + RC_MEDIA_WAITING_SETTLE_MS - 1, since)).toBe(stop)
+    // Past that, a frame is a picture that came after the stop.
+    expect(mediaStopAfterTick(stop, true, since + RC_MEDIA_WAITING_SETTLE_MS, since)).toBeNull()
+    // Nothing moved: it stands however long it has been.
+    expect(mediaStopAfterTick(stop, false, since + 60_000, since)).toBe(stop)
+    expect(mediaStopAfterTick(null, true, since + 60_000, since)).toBeNull()
   })
 
   // FR-93 P5b — the overlay says what the host waits for. GNOME's lock screen

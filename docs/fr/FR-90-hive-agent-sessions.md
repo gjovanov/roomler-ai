@@ -333,11 +333,11 @@ flowchart TD
 
 | Rule | Why | Where |
 |---|---|---|
-| A device holds copies only while its OWN `hive_replica` is on. It advertises `hive-replica` only then, as `hive-adopt` is advertised (`agents/roomlerd/src/encode/caps.rs:2729`), and refuses a join otherwise. `hive_archive` (it offers itself as an archive replica) and `hive_store_quota_mib` are device keys too. None is pushable, and each joins the lock test's list | the gate that survives a compromised server. The code keeps every Hive key out of `DesiredConfig` (`crates/remote_control/src/models.rs:2798`); §3g's "can ever be pushed" is the design's allowance, not the code's | `crates/agent-core/src/config.rs:374` |
-| Candidates are the session owner's own devices and the archive replicas an `ADMINISTRATOR` designated, nothing else. "The owner's own" means `enrolled_by` and `owner_user_id` both name the owner | `owner_user_id` is reassignable with `MANAGE_AGENTS` alone, and `enrolled_by` is set once, at enrollment (`crates/services/src/dao/agent.rs:128`, `:1298`): a device manager who hands someone a device must not receive that person's sessions on it | `crates/remote_control/src/models.rs:2169`, `:2173` |
+| A device holds copies only while its OWN `hive_replica` is on. It advertises `hive-replica` only then, as `hive-adopt` is advertised (`agents/roomlerd/src/encode/caps.rs:2729`), and refuses a join otherwise. `hive_archive` (it offers itself as an archive replica) and `hive_store_quota_mib` are device keys too. None is pushable, and each joins the lock test's list | the gate that survives a compromised server. The code keeps every Hive key out of `DesiredConfig` (`crates/remote_control/src/models.rs:2807`); §3g's "can ever be pushed" is the design's allowance, not the code's | `crates/agent-core/src/config.rs:374` |
+| Candidates are the session owner's own devices and the archive replicas an `ADMINISTRATOR` designated, nothing else. "The owner's own" means `enrolled_by` and `owner_user_id` both name the owner | `owner_user_id` is reassignable with `MANAGE_AGENTS` alone, and `enrolled_by` is set once, at enrollment (`crates/services/src/dao/agent.rs:128`, `:1298`): a device manager who hands someone a device must not receive that person's sessions on it | `crates/remote_control/src/models.rs:2178`, `:2182` |
 | A restricted tag only ever takes a device out. When no device left may hold a restricted session, the session has fewer copies than `min`, and its room says why | tags are free-form `MANAGE_AGENTS` labels (`crates/modules/fleet/src/agent.rs:1193`); as a filter they cannot widen where a copy goes. Decision 2 names prod ROLES, which are P3's, so until then the session's primary device is what carries the tag | `models.rs:1290` |
 | A device that no longer qualifies (a tag taken off, its owner changed, its `hive_replica` off) gets a purge for what it may no longer hold | the rules run again when a device's tags or owner change: fleet calls a new `FleetLifecycle::agent_updated` hook (`crates/core/src/hooks.rs:121`) from its update route, as it calls `agent_renamed` there (`agent.rs:1000`) | |
-| Never an ephemeral device (FR-51), never a secondary org's enrollment | an ephemeral row is hard-deleted, and could never acknowledge a purge; Hive frames count only on the primary enrollment (`agents/roomlerd/src/hive/view.rs:292`) | `models.rs:1311` |
+| Never an ephemeral device (FR-51), never a secondary org's enrollment | an ephemeral row is hard-deleted, and could never acknowledge a purge; Hive frames count only on the primary enrollment (`agents/roomlerd/src/hive/view.rs:292`) | `models.rs:1318` |
 | ⚠️ An adopted session is placed nowhere but where it was adopted | decision 11: only its owner sees it, and whoever runs an archive replica can read that replica's disk. It follows the policy once it is a managed session (P2f) | §3h |
 | Placement runs when a session starts, when the policy changes, when an archive replica is designated (which back-fills the live and retained sessions it may hold, newest first), when a member goes and when tags change. A session from before P2 is placed the first time its primary connects with the switch on | a session runs on its primary whatever placement finds: replication never blocks a start | |
 
@@ -2442,7 +2442,7 @@ sequenceDiagram
 |---|---|
 | who decides | the vault. It believes a session only from the device its record places it on, at its fence (`crates/modules/vault/src/lease.rs:36`). The network module cannot, because `hive ↔ network` is forbidden both ways (`crates/core/src/graph.rs:112`). Two new Cedar actions, `net:socks` and `net:forward`. Their principal is the `Session`, their resource a new `Node` entity (an enrolled device: its tags, OS and owner), and their context the device the session runs on and, for a forward, the destination. Every decision is recorded in `vault_audit` |
 | the grant | the vault's answer: a token signed by core's auth service (`crates/core/src/state.rs:53`) under an audience of its own, `net_grant`, which no other gate accepts. It names the tenant, the session and its fence, the session's owner, the origin device, the exit, the destination (one `host:port` for a forward, none for SOCKS) and its end, at most the lease ceiling (900 s). The network module verifies it and calls no module, so the graph is unchanged |
-| the principal | `Principal::Session {sid, owner}`: what `tunnel_policies` are evaluated for, and what `tunnel_audit` records, a `session_id` beside `origin_agent_id` (`crates/remote_control/src/models.rs:4689`). Which subjects match it is decision 20. As built (P3-7-2a), it names the session and the device whose WS carries its flows; the owner is the flow's subject `user_id`, as for any flow |
+| the principal | `Principal::Session {sid, owner}`: what `tunnel_policies` are evaluated for, and what `tunnel_audit` records, a `session_id` beside `origin_agent_id` (`crates/remote_control/src/models.rs:4698`). Which subjects match it is decision 20. As built (P3-7-2a), it names the session and the device whose WS carries its flows; the owner is the flow's subject `user_id`, as for any flow |
 | the listener | one per tool call, on loopback, on a port the system picks. It serves a connection only when the process holding it runs as the session's account, as `vault_connect`'s endpoint does on Linux, macOS and Windows (`agents/roomlerd/src/hive/vault_connect.rs:22`). `net_socks` adds RFC 1929: the username the session's id, the password a capability made for the listener (32 random bytes), so a second session under the same account cannot share it. The SOCKS5 front offers RFC 1929 on session listeners alone. The loopback listeners it already serves keep offering no authentication |
 | the answer | `net_socks`: `socks5h://<session>:<capability>@127.0.0.1:<port>` and its end; `net_forward`: `127.0.0.1:<port>` and its end. The capability lands in the transcript. It is the session's own: refused off the device and to any other account, and gone with its listener |
 | its life | until the grant's end, or the session's run ending on this device: its end, or a move, which the device's own fence ends. A grant is no lease, so no `rc:vault.revoke` names it. A flow the listener opened ends with it, both halves (#2129) |
@@ -2537,7 +2537,7 @@ sequenceDiagram
   with it.
 - ⚠️ **The key never reaches the session**, nor its transcript. The daemon mints it, presents it
   once and drops it, and the target's grant is single use and lives 60 s
-  (`crates/remote_control/src/models.rs:2668`). `roomler ssh` runs the system `ssh`
+  (`crates/remote_control/src/models.rs:2677`). `roomler ssh` runs the system `ssh`
   (`agents/roomler-cli/src/sshcmd.rs:94`), which would need the key in a file; the daemon does
   not.
 - ⚠️ **The target's consent still applies.** A `consent_mode` that prompts holds the session's
@@ -3212,7 +3212,7 @@ sequenceDiagram
 
 | Piece | Design |
 |---|---|
-| the roots | `knowhow_scan_roots`, absolute paths, the device's own as `hive_roots` is (`crates/agent-core/src/config.rs:488`): set in its config or over the LocalAPI (`crates/agent-core/src/config_surface.rs:405`, read by `parse_absolute_list`, `:2975`), absent from `DesiredConfig` and named in the test that keeps every device-owned key out of it (`crates/remote_control/src/models.rs:9322`). **Empty means nothing is read**: the answer is `no_roots`. Read again from the config file at each scan, so an owner's edit takes the next scan with no restart. A folder is walked for checkouts; a file is read as a kubeconfig (decision 46) |
+| the roots | `knowhow_scan_roots`, absolute paths, the device's own as `hive_roots` is (`crates/agent-core/src/config.rs:488`): set in its config or over the LocalAPI (`crates/agent-core/src/config_surface.rs:405`, read by `parse_absolute_list`, `:2975`), absent from `DesiredConfig` and named in the test that keeps every device-owned key out of it (`crates/remote_control/src/models.rs:9332`). **Empty means nothing is read**: the answer is `no_roots`. Read again from the config file at each scan, so an owner's edit takes the next scan with no restart. A folder is walked for checkouts; a file is read as a kubeconfig (decision 46) |
 | the verb | `knowhow-scan`, advertised by every build that can scan (`rpc_caps`, `agents/roomlerd/src/encode/caps.rs:2043`) whatever its roots say, since an empty list is an answer: Linux and macOS from P4-3b-1, Windows from P4-3b-4. Compiled where agent sessions are (`cfg(hive_host)`: the `hive` feature, which every release build carries, `.github/workflows/release-agent.yml:552`), since it shares their drop |
 | the frame | `rc:knowhow.scan`, in `handle_server_msg` (`agents/roomlerd/src/signaling.rs:3278`), on the **primary's** connection only (`OrgCtx.is_primary`, `:528`): one arriving on a secondary's is answered `failed` and never run (decision 43), so the gate holds at the device as well as at the server's 409. The scan runs off the signaling loop, never awaited in it, and answers on the primary's connection of the moment, as a session's reports do (`agents/roomlerd/src/hive/supervisor.rs:1542`) |
 | once | one scan at a time. A scan id already running is not started again, and the last 16 answers are kept in memory, so a scan delivered again after a lost connection (the delivery, in P4-3's design above) is answered from what it found, never run twice |
@@ -3693,7 +3693,7 @@ Running a session is remote code execution on a device, so it gets exec's and SS
 Cedar `role:assume` permit, default deny; per-(user, device) limits after the identity gates; and the
 device's own `hive_enabled`, `hive_accounts` and `hive_roots`, of which only `hive_enabled` (and
 `hive_replica`) can ever be pushed, and only to devices that opted into remote config
-(`crates/remote_control/src/models.rs:2449,5753`).
+(`crates/remote_control/src/models.rs:2458,5762`).
 
 **P1g, the org gate, as built.** The module switch (`[modules] hive`) is all or nothing for a
 server, so it has a second dial: `hive.tenants` (`ROOMLER__HIVE__TENANTS`), the organizations
@@ -5555,7 +5555,7 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
       restricted tag (`prod` by default) replicates only to devices carrying it too (decision 2's
       interim reading).
     - *`hive_replica` and `hive_archive`:* device-owned and never pushable, like every Hive key
-      today (`crates/remote_control/src/models.rs:2798`).
+      today (`crates/remote_control/src/models.rs:2807`).
     - *Promote, teleport, fork and purge:* the session owner's, with `HIVE_RUN`. There is no
       `HIVE_ADMIN` bit yet.
     - *The server relays the QUIC fingerprint it could replace:* accepted for P2, since the server
@@ -5716,7 +5716,7 @@ customer-managed keys, Roomler as an OIDC issuer and the Codex adapter are follo
         admits. `allowed_user_ids` and `allowed_role_ids` never match a session.
       - ⚠️ An empty `allowed_session_roles` admits **no** session: the opposite sense to the two
         lists beside it, where empty means no restriction
-        (`crates/remote_control/src/models.rs:3350`). The same field must not read both ways.
+        (`crates/remote_control/src/models.rs:3359`). The same field must not read both ways.
       - No SSH policy written before P3-8 opens a device to a session.
       - What it costs: each device a session may reach says so in its own policy.
     - *Or: a session matches as its owner does*: the owner's id against `allowed_user_ids`, the

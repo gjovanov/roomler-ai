@@ -65,7 +65,7 @@ latency side; this FR is the cadence side.
 
 Above 60 fps only when **all** of these hold, re-checked whenever any of them moves:
 
-1. The transport is not constrained (`detect_constrained_transport`, `peer.rs:1967`). Relayed paths wait for
+1. The transport is not constrained (`detect_constrained_transport`, `peer.rs:1977`). Relayed paths wait for
    [FR-17](FR-17-partial-reliability-video.md) stage C, [FR-63](FR-63-one-delay-based-rate-controller.md) and
    FR-70 M3, and stay at their current cap.
 2. The host has **proven the rate class** (§3.3) for this capture backend, display refresh, encoder and geometry.
