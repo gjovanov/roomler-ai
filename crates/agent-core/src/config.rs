@@ -3829,9 +3829,8 @@ pub fn describe_unreadable(
     }
 }
 
-/// An error chain on one line, bounded: a TOML parse error carries a source
-/// snippet over several lines, which a progress row or a terminal line cannot
-/// show.
+/// An error chain on one line, bounded, which is what a progress row or a
+/// terminal line can show.
 fn one_line(text: &str) -> String {
     let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if joined.chars().count() > 300 {
@@ -3840,6 +3839,40 @@ fn one_line(text: &str) -> String {
     } else {
         joined
     }
+}
+
+/// #3086 — what may be said about a config that does not parse: where it stopped,
+/// and a key the schema wanted. Nothing of the file. A `toml` error quotes the
+/// line it stopped at in its `Display` and its `Debug`, and its message can quote
+/// a value (`invalid type: string "…"`), and this file holds the agent token and
+/// the overlay keys. A daemon's log goes to the server, and a wizard's page and a
+/// terminal show the same words.
+///
+/// So the parser's error ends here: what leaves is a string with no source, and
+/// nothing built on it can reach those words, however it is printed. The file is
+/// there to open at that line.
+fn parse_failure(raw: &str, e: &toml::de::Error) -> String {
+    let mut said = String::from("TOML parse error");
+    if let Some(before) = e.span().and_then(|span| raw.get(..span.start)) {
+        let line = before.matches('\n').count() + 1;
+        let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+        said.push_str(&format!(" at line {line}, column {column}"));
+    }
+    // The schema's word for a key it wanted, which no file can put there. It is
+    // the one message kept: a lost key otherwise reads as something near line 1.
+    // A key name read off the file never is, because a broken line can turn a
+    // value into one.
+    if let Some(field) = e
+        .message()
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'))
+        && field
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        said.push_str(&format!(": missing field `{field}`"));
+    }
+    said
 }
 
 fn try_load(path: &PathBuf) -> Result<AgentConfig> {
@@ -3855,8 +3888,13 @@ fn try_load(path: &PathBuf) -> Result<AgentConfig> {
             raw.len()
         );
     }
-    let mut cfg: AgentConfig =
-        toml::from_str(&raw).with_context(|| format!("parsing config at {}", path.display()))?;
+    let mut cfg: AgentConfig = toml::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!(
+            "parsing config at {}: {}",
+            path.display(),
+            parse_failure(&raw, &e)
+        )
+    })?;
     // FR-101 P1b — TLS to the server whatever the file says, unless its owner
     // kept plaintext (`allow_plaintext_server`). Here, because every reader
     // parses through this function: the daemon, the probe, the recovery.
@@ -3886,12 +3924,14 @@ enum KeyStep {
 /// that knows it or left behind by a rollback. Paths only, never values: the
 /// file holds the agent token and the overlay keys.
 ///
-/// `Err` when `raw` does not parse as a config at all.
-fn unknown_keys(raw: &str) -> Result<Vec<Vec<KeyStep>>> {
+/// `None` when `raw` does not parse as a config at all. Not the parser's error,
+/// which quotes the file (#3086): no caller wants it, so none can print it.
+fn unknown_keys(raw: &str) -> Option<Vec<Vec<KeyStep>>> {
     let mut found = Vec::new();
-    let de = toml::de::Deserializer::parse(raw)?;
-    let _: AgentConfig = serde_ignored::deserialize(de, |path| found.push(key_steps(&path)))?;
-    Ok(found)
+    let de = toml::de::Deserializer::parse(raw).ok()?;
+    let _: AgentConfig =
+        serde_ignored::deserialize(de, |path| found.push(key_steps(&path))).ok()?;
+    Some(found)
 }
 
 fn key_steps(path: &serde_ignored::Path<'_>) -> Vec<KeyStep> {
@@ -4043,9 +4083,13 @@ fn merge_unknown_keys(
 /// #2078 — the text [`save`] writes over `path`: `cfg`, plus every key `base`
 /// holds that this build does not model. `base` is the file being replaced:
 /// `path` itself, or on [`load`]'s recovery the `.prev` copy it loaded, since
-/// the live file it then writes over parses as nothing. Before this, every
-/// save erased them: a key set ahead of the update that knows it was gone by
-/// the old daemon's stop, and a rollback erased every newer key for good.
+/// that live file may not even be there. Before this, every save erased them:
+/// a key set ahead of the update that knows it was gone by the old daemon's
+/// stop, and a rollback erased every newer key for good.
+///
+/// #3087 — a `base` that is there and does not read as a config holds no keys
+/// this can see, and its last good copy does. That is the config a recovery has
+/// just loaded, and [`read_merge_base`]'s callers name no base when they save it.
 ///
 /// A base with no such key is written exactly as before, byte for byte, and
 /// any failure to keep them saves `cfg` alone and says so: the worst case is
@@ -4056,31 +4100,29 @@ fn serialise_for(
     cfg: &AgentConfig,
 ) -> Result<String> {
     let plain = toml::to_string_pretty(cfg).context("serialising config")?;
-    let raw = match std::fs::read_to_string(base) {
-        Ok(raw) => raw,
-        // No file yet: a first save, nothing to keep.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(plain),
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                base = %base.display(),
-                error = %e,
-                "the config being replaced could not be read: keys this build does not know \
-                 in it, if any, are NOT kept through this save"
-            );
-            return Ok(plain);
-        }
+    let read = |file: &std::path::Path| {
+        let raw = std::fs::read_to_string(file).ok()?;
+        let unknown = unknown_keys(&raw)?;
+        Some((raw, unknown))
     };
-    // Said with a fixed string: a parse error quotes the line it stopped at,
-    // and the file holds the agent token and the overlay keys. A live file
-    // that does not parse is what `load` recovers from `.prev`, and a save
-    // over it keeps the copy's keys only when its caller names the copy.
-    let Ok(unknown) = unknown_keys(&raw) else {
+    // No file yet: a first save, nothing to keep.
+    if matches!(base.try_exists(), Ok(false)) {
+        return Ok(plain);
+    }
+    let copy = prev_path(path);
+    let (raw, base, unknown) = if let Some((raw, unknown)) = read(base) {
+        (raw, base, unknown)
+    } else if let Some((raw, unknown)) = read(&copy) {
+        (raw, copy.as_path(), unknown)
+    } else {
+        // Said with a fixed string: a parse error quotes the line it stopped
+        // at, and the file holds the agent token and the overlay keys.
         tracing::warn!(
             path = %path.display(),
             base = %base.display(),
-            "the config being replaced does not parse: keys this build does not know in it, \
-             if any, are NOT kept through this save"
+            "the config being replaced does not read as a config, and neither does its last \
+             good copy: keys this build does not know in them, if any, are NOT kept through \
+             this save"
         );
         return Ok(plain);
     };
@@ -4123,7 +4165,7 @@ fn note_unknown_keys(path: &PathBuf) {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return;
     };
-    let Ok(unknown) = unknown_keys(&raw) else {
+    let Some(unknown) = unknown_keys(&raw) else {
         return;
     };
     if unknown.is_empty() {
@@ -4894,6 +4936,194 @@ machine_name = "devbox"
             "a recovered config's unknown keys are named, as every load's are; got: {log}"
         );
         assert!(!log.contains("NOT kept"), "{log}");
+    }
+
+    /// #3087 — the two callers of [`read_merge_base`] (the setup wizard's
+    /// enrollment and `adopt-enrollment`) recover from `.prev` and then
+    /// [`save`] over the live file that does not parse. The save read the keys
+    /// to keep off that file, found nothing, and the recovered host lost them
+    /// with a WARN, which is the case [`load`]'s own recovery already handled.
+    #[test]
+    fn a_save_over_a_corrupt_live_file_keeps_the_last_good_copys_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg: AgentConfig = toml::from_str(&minimal_toml()).unwrap();
+        std::fs::write(
+            &path,
+            format!("a_key_from_a_newer_build = true\n{}", minimal_toml()),
+        )
+        .unwrap();
+        save(&path, &cfg).unwrap();
+        assert_eq!(
+            unknown_names(&prev_path(&path)),
+            ["a_key_from_a_newer_build"],
+            "the premise: the last good copy holds the key"
+        );
+
+        // The live file breaks; what those callers do next.
+        std::fs::write(&path, "agent_token = \"broken\n").unwrap();
+        let recovered = read_merge_base(&path)
+            .into_config()
+            .expect("recovered from .prev");
+        let (cap, _guard) = captured();
+        save(&path, &recovered).unwrap();
+        assert_eq!(
+            unknown_names(&path),
+            ["a_key_from_a_newer_build"],
+            "the recovered file lost the copy's key: {}",
+            cap.text()
+        );
+        assert!(!cap.text().contains("NOT kept"), "{}", cap.text());
+
+        // …and it survives the next save, whose rotation the copy goes through.
+        save(&path, &recovered).unwrap();
+        assert_eq!(unknown_names(&path), ["a_key_from_a_newer_build"]);
+        assert_eq!(
+            unknown_names(&prev_path(&path)),
+            ["a_key_from_a_newer_build"]
+        );
+
+        // With no copy that parses there is nothing to keep, and it says so.
+        std::fs::write(&path, "agent_token = \"broken\n").unwrap();
+        std::fs::write(prev_path(&path), "agent_token = \"broken too\n").unwrap();
+        save(&path, &recovered).unwrap();
+        assert!(unknown_names(&path).is_empty());
+        assert!(cap.text().contains("NOT kept"), "{}", cap.text());
+        assert_eq!(
+            std::fs::read_to_string(prev_path(&path)).unwrap(),
+            "agent_token = \"broken too\n",
+            "a save never rotates a file that does not parse into .prev"
+        );
+    }
+
+    /// Shaped like an agent token, and not one. Built at run time, because the
+    /// secret scanner reads a literal of this shape as a live credential.
+    fn token_shaped() -> String {
+        let segment = |word: &str| format!("eyJ{}", word.repeat(3));
+        [
+            segment("notreal"),
+            segment("alsofake"),
+            "nosignature".repeat(2),
+        ]
+        .join(".")
+    }
+
+    /// Every way a hand edit leaves a value on a line the parser stops at: the
+    /// syntax errors, whose `Display` quotes the line, and the schema errors,
+    /// whose message can quote the value itself.
+    fn lines_that_do_not_parse() -> Vec<(&'static str, String)> {
+        let t = token_shaped();
+        vec![
+            ("an unterminated string", format!("agent_token = \"{t}")),
+            ("a lost opening quote", format!("agent_token = {t}\"")),
+            ("no quotes at all", format!("agent_token = {t}")),
+            ("a value with no key", t.clone()),
+            (
+                "a string where a bool belongs",
+                format!("agent_token = \"tok\"\noverlay_enabled = \"{t}\""),
+            ),
+            ("an array of it", format!("agent_token = [\"{t}\"]")),
+            (
+                "the key twice",
+                format!("agent_token = \"{t}\"\nagent_token = \"{t}\""),
+            ),
+        ]
+    }
+
+    fn with_token_line(line: &str) -> String {
+        let raw = minimal_toml();
+        assert!(raw.contains("agent_token = \"tok\""), "the premise");
+        raw.replace("agent_token = \"tok\"", line)
+    }
+
+    fn assert_no_value(shape: &str, what: &str, text: &str) {
+        let token = token_shaped();
+        for part in token.split('.') {
+            assert!(
+                !text.contains(part),
+                "{shape}: {what} carries a value from the file: {text}"
+            );
+        }
+    }
+
+    /// #3086 — a config that does not parse puts nothing of the file in any error
+    /// or log. A `toml` error quotes the line it stopped at, so a typo on
+    /// `agent_token` printed the token: in the daemon's log, which uploads to the
+    /// server, on the wizard's page and in the terminal. Every reader goes
+    /// through [`try_load`], so nothing built on its error can carry a value.
+    #[test]
+    fn a_config_that_does_not_parse_puts_no_value_in_any_error_or_log() {
+        for (shape, line) in lines_that_do_not_parse() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let raw = with_token_line(&line);
+            std::fs::write(&path, &raw).unwrap();
+            let (cap, _guard) = captured();
+
+            let err = try_load(&path).expect_err(shape);
+            assert_no_value(shape, "Display", &format!("{err}"));
+            assert_no_value(shape, "the chain", &format!("{err:#}"));
+            assert_no_value(shape, "Debug", &format!("{err:?}"));
+            for cause in err.chain() {
+                assert_no_value(shape, "a cause", &cause.to_string());
+            }
+
+            // What the wizard and `adopt-enrollment` show the person.
+            match read_merge_base(&path) {
+                MergeBase::Unreadable { reason, recovered } => {
+                    assert!(recovered.is_none(), "{shape}: no .prev yet");
+                    assert_no_value(shape, "the reason", &reason);
+                    let kept = Ok(unreadable_copy_path(&path));
+                    let told = describe_unreadable(&path, &reason, false, &kept);
+                    assert_no_value(shape, "what the person is told", &told);
+                }
+                other => panic!("{shape}: {other:?}"),
+            }
+
+            // The probe's DEBUG line, and both of `load`'s: the live file's error
+            // alone, then with the same line in the copy it falls back to.
+            assert!(read_if_present(&path).is_none(), "{shape}");
+            let err = load(&path).expect_err(shape);
+            assert_no_value(shape, "load's error", &format!("{err:?}"));
+            std::fs::write(prev_path(&path), &raw).unwrap();
+            let err = load(&path).expect_err(shape);
+            assert_no_value(shape, "load's error", &format!("{err:?}"));
+
+            let log = cap.text();
+            assert!(
+                log.contains("config unreadable") && log.contains("treating as absent"),
+                "the premise: the loggers ran: {log}"
+            );
+            assert_no_value(shape, "the log", &log);
+        }
+    }
+
+    /// #3086 — what is left is still useful: the error says where, so the person
+    /// can open the file and look, and a lost key is named, because otherwise it
+    /// reads as a problem somewhere near line 1.
+    #[test]
+    fn a_parse_error_still_says_where_and_names_a_lost_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(&path, with_token_line("agent_token = \"unterminated")).unwrap();
+        let err = format!("{:#}", try_load(&path).unwrap_err());
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("line 3"), "{err}");
+
+        // The schema's own word for it, not the file's.
+        let raw = minimal_toml().replace("agent_token = \"tok\"\n", "");
+        std::fs::write(&path, raw).unwrap();
+        let err = format!("{:#}", try_load(&path).unwrap_err());
+        assert!(err.contains("missing field `agent_token`"), "{err}");
+
+        // An unreadable file is still read apart from a parse error.
+        match read_merge_base(&path) {
+            MergeBase::Unreadable { reason, .. } => {
+                assert!(reason.contains("parsing config"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// #2078 — a key a newer build wrote into a route's entry follows THAT
