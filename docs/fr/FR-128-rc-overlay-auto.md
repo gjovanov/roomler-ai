@@ -28,7 +28,7 @@ The record that opened this FR, from 2026-10-27. The operator's Windows laptop's
 
 The relayed sessions ran `constrained=true`: 30 fps, a ceiling of ~3.4 Mbit/s. They logged `rc ICE: overlay excluded (device policy rc_overlay=off, the default)` (`agents/roomlerd/src/peer.rs:500`). The mesh link between the two machines was direct the whole time: `tier=Lan`, ~11 ms (`roomler peers` on both ends).
 
-⚠️ **These sessions measured a broken worker, not `rc_overlay=off`.** All five ran on the GUI worker that #2987 orphaned when its daemon exited on 2026-10-26 at 13:06Z. A browser without a camera grant hides its LAN address behind an mDNS `.local` name. The agent resolves that name through the OS before handing the candidate to ICE (`agents/roomlerd/src/mdns_resolve.rs:99`, called from `agents/roomlerd/src/peer.rs:1864`). With the real address, the agent checks a Host↔Host pair itself, and that pair completes before the browser nominates. A worker that cannot resolve leaves the direct pair to peer-reflexive discovery, racing the pre-warmed relay pair. The table above shows that race: the relay four times, and one prflx pair that replaced the relay 3 s into the session (`transport path changed mid-session … was_relay=true now_relay=false`, `peer.rs:2236`). The worker's own log:
+⚠️ **These sessions measured a broken worker, not `rc_overlay=off`.** All five ran on the GUI worker that #2987 orphaned when its daemon exited on 2026-10-26 at 13:06Z. A browser without a camera grant hides its LAN address behind an mDNS `.local` name. The agent resolves that name through the OS before handing the candidate to ICE (`agents/roomlerd/src/mdns_resolve.rs:99`, called from `agents/roomlerd/src/peer.rs:1874`). With the real address, the agent checks a Host↔Host pair itself, and that pair completes before the browser nominates. A worker that cannot resolve leaves the direct pair to peer-reflexive discovery, racing the pre-warmed relay pair. The table above shows that race: the relay four times, and one prflx pair that replaced the relay 3 s into the session (`transport path changed mid-session … was_relay=true now_relay=false`, `peer.rs:2246`). The worker's own log:
 
 | worker | when (UTC) | sessions | direct | `mDNS host candidate resolved` | how they paired |
 |---|---|---|---|---|---|
@@ -57,7 +57,7 @@ So §2.2 still holds for **Chrome** and no longer for **Safari**. The cause for 
 
 - **#1856:** a 3 ms route hole on a Mac killed sessions.
 - **Hidden carrier:** a pair the mesh carries over DERP/TCP reads as `Host` ↔ `Host`. The data-channel video then crosses a TCP relay: two retransmission layers and head-of-line blocking.
-- The guard `overlay_remote_is_relay_tier` (`agents/roomlerd/src/peer.rs:2263`) asks the daemon which carrier holds the session's overlay peer, and clamps the session as constrained unless it is a live direct one. That ended the 2026-07-27 collapse (821 kbps, 17 fps, 1.5–7.5 s stalls). It **cannot** remove the TCP latency. And ICE still ranks the mesh host pair above a far TURN pair over UDP, so on a relayed mesh `on` picks the TCP path even when the UDP relay would be better.
+- The guard `overlay_remote_is_relay_tier` (`agents/roomlerd/src/peer.rs:2273`) asks the daemon which carrier holds the session's overlay peer, and clamps the session as constrained unless it is a live direct one. That ended the 2026-07-27 collapse (821 kbps, 17 fps, 1.5–7.5 s stalls). It **cannot** remove the TCP latency. And ICE still ranks the mesh host pair above a far TURN pair over UDP, so on a relayed mesh `on` picks the TCP path even when the UDP relay would be better.
 
 ### 2.4 Where the overlay is the only path (#2781)
 
@@ -67,7 +67,7 @@ On a UDP-blocked, TLS-inspected network no TURN allocation answers (`TURN alloca
 
 ### 3.1 The decision
 
-`AccessPolicy.rc_overlay` (`crates/remote_control/src/models.rs:1624`) gains a third value, **`auto`**. Under `auto` the **target agent** decides per session. Both inputs are facts it already has:
+`AccessPolicy.rc_overlay` (`crates/remote_control/src/models.rs:1633`) gains a third value, **`auto`**. Under `auto` the **target agent** decides per session. Both inputs are facts it already has:
 
 | mesh carrier to the viewer's device | far TURN candidate gathered | the session behaves as | why |
 |---|---|---|---|
@@ -106,7 +106,7 @@ flowchart TD
 As built, the Hub also sends `auto` only to an agent that advertises the `rc-overlay-auto` verb (`crates/remote_control/src/models.rs:1298`), as it sends `lock_on_end` only to one advertising `lock-on-end`. To any other agent the policy reads as `off`: no `rc_overlay_auto`, and no viewer relay handed out. That makes D1 hold on the server, not only in the older agent's parser. A device with the kill switch set stops advertising the verb (`agents/roomlerd/src/encode/caps.rs:4440`).
 
 P2, as built (`docs/remote-control.md` §4.4 has the diagram):
-- **Stored.** The policy row keeps `auto` in a field of its own, `AccessPolicy.rc_overlay_auto` (`crates/remote_control/src/models.rs:1635`), rather than as a third value of `rc_overlay`. A pod rolled back below P2 then reads the row as `off`, never as one it cannot parse.
+- **Stored.** The policy row keeps `auto` in a field of its own, `AccessPolicy.rc_overlay_auto` (`crates/remote_control/src/models.rs:1644`), rather than as a third value of `rc_overlay`. A pod rolled back below P2 then reads the row as `off`, never as one it cannot parse.
 - **Carried.** `RcOverlayMode` (`:1653`) is what the authz gate hands the Hub, and it crosses pods as `rc_overlay_auto` plus `rc_overlay_far_turn` beside the bool (`crates/modules/remote/src/relay.rs:585`).
 - **The far-TURN hint (D5).** The authz gate asks a new core hook, `far_turn_udp` (`crates/core/src/hooks.rs:187`), bounded at 500 ms (`crates/modules/remote/src/controller.rs:701`). `network` answers from the fresh netcheck of the target and of every device the browser runs on (`crates/modules/network/src/hooks.rs:107`). Since P2c the browser's end is its best device (D8, `browser_reach`, `:154`), and the target folds its own netcheck in at the offer (`own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:351`). A hook, because the Hub has no database and `remote` must not call `network` (the module DAG).
 - **The page.** **Mesh: off / auto / on** on each device's row (`ui/src/components/admin/devicePolicy.ts:82`) replaces the checkbox, and both fields are written on every change, so a row never says `on` and `auto` at once.

@@ -58,7 +58,7 @@ The presets place controls at fixed distances from the stage's edges:
 | Arrows | PgUp … Esc, a column 16 px above the bottom (`touchControls.ts:166`): 16 + 5 × 44 + 4 × 6 | **260 px** | by 6–114 px |
 | Office keys | one row 12 px above the bottom | 56 px | fits |
 
-The stage card clips (`.remote-stage-card { overflow: hidden }`, `RemoteControl.vue:5583-5584`). A control past the stage's top edge is cut off, and it cannot be reached.
+The stage card clips (`.remote-stage-card { overflow: hidden }`, `RemoteControl.vue:5653-5654`). A control past the stage's top edge is cut off, and it cannot be reached.
 
 On an iPhone 14 with WASD, Fire and Aim are gone and only Jump shows; at 740 × 304 the d-pad and the stick lose their top edges too. Measured in a live session, P1's field run, §8.
 

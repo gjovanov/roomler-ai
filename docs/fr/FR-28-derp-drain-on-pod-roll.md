@@ -244,7 +244,7 @@ None of the first five is met. They were written for P0, and against the measure
 
 | AC | Today | Reachable? |
 |---|---|---|
-| No delivery gap > 500 ms | The session ends, 9 of 9 | Not from `/derp`. It needs a session that survives a control-WS loss. ⚠️ The reader cannot show it either: `video DC delivery gap` is console-only and logs only above 1500 ms (`ui/src/composables/useRemoteControl.ts:7995`) |
+| No delivery gap > 500 ms | The session ends, 9 of 9 | Not from `/derp`. It needs a session that survives a control-WS loss. ⚠️ The reader cannot show it either: `video DC delivery gap` is console-only and logs only above 1500 ms (`ui/src/composables/useRemoteControl.ts:8073`) |
 | `hard-errored` disappears | 14–73 lines per roll | Not without an overlap the topology does not offer. The line marks a close, as P0 found |
 | Under ~4 s to `control-WS reattached` | p50 7.7 s, p90 32 s | Possibly: the replacement listens at 5.3–6.3 s today, so it takes the first two levers above |
 | Rollout not slower | Baseline 33.9 s | Yes, with nothing built |
