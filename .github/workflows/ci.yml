@@ -1654,6 +1654,14 @@ jobs:
         run: |
           cargo clippy -p roomler-setup -p roomler-setup-core --all-targets -- -D warnings
           cargo test -p roomler-setup -p roomler-setup-core --lib
+      # FR-129 C — the linker flag that keeps the wizard's own imports out of the
+      # person's Downloads, read back from the file the linker wrote: a string in
+      # build.rs says nothing about the EXE. The release lane reads the signed one.
+      - name: The setup wizard's EXE loads its imports from System32 alone
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build -p roomler-setup --bin roomler-setup
+          pwsh scripts/signing/pe-dependent-load-flags.ps1 -Path target/debug/roomler-setup.exe -Expect 0x800
       # FR-90 P1i's agent-session tests run in their own job,
       # windows-agent-sessions, below (FR-6 wave 27).
 

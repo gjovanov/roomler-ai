@@ -269,6 +269,7 @@ mod tests {
             browser_download_url: format!("https://example.com/{name}"),
             size: 1024,
             digest: None,
+            state: None,
         }
     }
 

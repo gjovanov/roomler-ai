@@ -56,6 +56,11 @@ pub struct AgentReleaseAsset {
     /// case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+    /// GitHub's word on the upload: `"uploaded"` once the asset is whole,
+    /// `"open"` or `"starter"` while it is being uploaded, which can be to a
+    /// release already published. Read to pick (FR-129 C), never forwarded.
+    #[serde(default, skip_serializing)]
+    pub state: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -391,6 +396,7 @@ mod tests {
             browser_download_url: format!("https://example/{name}"),
             size: 1024,
             digest: Some("sha256:deadbeef".to_string()),
+            state: None,
         }
     }
 

@@ -234,24 +234,26 @@ pub async fn setup_installer_health(
             normalised, release.tag_name
         ))
     })?;
-    // The `format` a caller named rides on, so the download resolves as this
-    // manifest did; without one the default resolves the same way anyway.
-    let format_param = if params.format.is_some() {
-        format!("&format={}", format.wire())
-    } else {
-        String::new()
-    };
     Ok(Json(InstallerHealth {
         tag: release.tag_name.clone(),
         platform: normalised.to_string(),
         filename: asset.name.clone(),
         size: asset.size,
         digest: asset.digest.clone(),
-        uri: format!(
-            "/api/setup/{}?version={}{}",
-            normalised, params.version, format_param
+        uri: installer_uri(
+            normalised,
+            &params.version,
+            params.format.is_some().then_some(format),
         ),
     }))
+}
+
+/// Where a health answer sends the download. The `format` a caller named rides
+/// on, so the download resolves as this manifest did; without one the default
+/// resolves the same way anyway.
+fn installer_uri(platform: &str, version: &str, named: Option<SetupFormat>) -> String {
+    let format = named.map_or(String::new(), |f| format!("&format={}", f.wire()));
+    format!("/api/setup/{platform}?version={version}{format}")
 }
 
 /// `GET /api/setup/{platform}` — streams the unified wizard bytes: on
@@ -311,7 +313,12 @@ pub fn pick_setup_asset<'a>(
     let named = |triple: &str, ext: &str| {
         assets.iter().find(|a| {
             let name = a.name.to_ascii_lowercase();
-            name.starts_with("roomler-setup-") && name.contains(triple) && name.ends_with(ext)
+            // An asset still being uploaded has no bytes to serve, and must not
+            // win over a whole one.
+            a.state.as_deref().is_none_or(|state| state == "uploaded")
+                && name.starts_with("roomler-setup-")
+                && name.contains(triple)
+                && name.ends_with(ext)
         })
     };
     match (platform, format) {
@@ -591,6 +598,7 @@ mod tests {
             browser_download_url: format!("https://example.com/{name}"),
             size: 1024,
             digest: None,
+            state: None,
         }
     }
 
@@ -776,6 +784,78 @@ mod tests {
 
     /// FR-129 C2 — `exe` is the default, the value is read without case or
     /// padding, and an unknown one is a 400 naming the two.
+    /// FR-129 C — a release can get an asset after it is published, and an
+    /// upload in progress is listed before its bytes are there. An unfinished
+    /// EXE does not win over a finished zip; a finished EXE does.
+    #[test]
+    fn an_asset_still_uploading_is_not_picked() {
+        let zip = asset("roomler-setup-0.4.200-x86_64-pc-windows-msvc.zip");
+        let mut exe = asset("roomler-setup-0.4.200-x86_64-pc-windows-msvc.exe");
+        for unfinished in ["starter", "open"] {
+            exe.state = Some(unfinished.to_string());
+            assert_eq!(
+                pick_setup_asset(
+                    &[exe.clone(), zip.clone()],
+                    "windows-x86_64",
+                    SetupFormat::Exe
+                )
+                .unwrap()
+                .name,
+                zip.name,
+                "{unfinished}"
+            );
+            assert!(
+                pick_setup_asset(
+                    std::slice::from_ref(&exe),
+                    "windows-x86_64",
+                    SetupFormat::Exe
+                )
+                .is_none(),
+                "{unfinished}: nothing whole to serve is a 404, not a 500"
+            );
+        }
+        exe.state = Some("uploaded".to_string());
+        assert_eq!(
+            pick_setup_asset(
+                &[zip.clone(), exe.clone()],
+                "windows-x86_64",
+                SetupFormat::Exe
+            )
+            .unwrap()
+            .name,
+            exe.name
+        );
+    }
+
+    /// GitHub's listing reaches the pick; the agent's wire does not grow by it.
+    #[test]
+    fn the_upload_state_is_read_and_never_forwarded() {
+        let listed: AgentReleaseAsset = serde_json::from_str(
+            r#"{"name":"a","browser_download_url":"https://example/a","size":1,"state":"open"}"#,
+        )
+        .unwrap();
+        assert_eq!(listed.state.as_deref(), Some("open"));
+        assert!(!serde_json::to_string(&listed).unwrap().contains("state"));
+    }
+
+    /// The manifest's download link: a format named is carried on, in its
+    /// canonical spelling; none named adds nothing.
+    #[test]
+    fn the_health_answers_the_download_link() {
+        assert_eq!(
+            installer_uri("windows-x86_64", "latest", None),
+            "/api/setup/windows-x86_64?version=latest"
+        );
+        assert_eq!(
+            installer_uri("windows-x86_64", "latest", Some(SetupFormat::Zip)),
+            "/api/setup/windows-x86_64?version=latest&format=zip"
+        );
+        assert_eq!(
+            installer_uri("windows-x86_64", "0.4.200", Some(SetupFormat::Exe)),
+            "/api/setup/windows-x86_64?version=0.4.200&format=exe"
+        );
+    }
+
     #[test]
     fn the_format_param() {
         for v in [None, Some(""), Some("exe"), Some("EXE"), Some(" exe ")] {

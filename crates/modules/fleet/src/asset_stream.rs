@@ -146,4 +146,27 @@ mod tests {
         assert_eq!(READ_IDLE_TIMEOUT, Duration::from_secs(60));
         assert!(client().is_ok());
     }
+
+    /// A client built right proves nothing about a proxy that builds its own.
+    /// Each of the three streams through this one, and has no other client with
+    /// a total deadline to cut a download with (the release-list fetch has its
+    /// own, in `releases.rs`, and reads a small JSON body at once).
+    #[test]
+    fn the_three_proxies_stream_through_this_client() {
+        for (file, source) in [
+            ("agent_release.rs", include_str!("agent_release.rs")),
+            ("setup_release.rs", include_str!("setup_release.rs")),
+            ("tunnel_release.rs", include_str!("tunnel_release.rs")),
+        ] {
+            let body = source.split("#[cfg(test)]").next().unwrap();
+            assert_eq!(
+                body.matches("crate::asset_stream::client()?").count(),
+                1,
+                "{file}"
+            );
+            for other in ["Client::new(", "Client::builder(", ".timeout("] {
+                assert!(!body.contains(other), "{file} has its own {other}");
+            }
+        }
+    }
 }

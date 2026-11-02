@@ -173,6 +173,12 @@ foreach ($a in $assets) {
         '.exe' {
             Test-Authenticode -Path $a.FullName -Label 'EXE'
             $exeAssetHash[$a.Name] = (Get-FileHash $a.FullName -Algorithm SHA256).Hash
+            # FR-129 C: the wizard goes on to run elevated from the person's
+            # Downloads, so its own imports must come from System32 alone.
+            if ($a.Name -like 'roomler-setup-*.exe') {
+                & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'pe-dependent-load-flags.ps1') -Path $a.FullName -Expect 0x800
+                if ($LASTEXITCODE -ne 0) { $failures.Add("$($a.Name) does not load its imports from System32 alone") }
+            }
         }
         '.zip' {
             $unzip = Join-Path $stage ("unzip-" + $a.BaseName)
