@@ -458,6 +458,15 @@ unsigned or mis-signed Windows artifact does not error, it just stops updating
 the fleet. The `require` mode in `.github/actions/sign-windows` is what
 prevents that reaching a release tag — do not weaken it.
 
+**The setup wizard makes the publisher check too, and the version check not**
+(#3246). `code_signature::verify_open_publisher` reads through a handle the
+wizard holds, on the MSI, the desktop companion, and every file but plain text
+in the Windows tunnel zip; [installation.md](installation.md) has what happens on
+each path and why the check that counts runs elevated. The updater's
+`verify_publisher` is unchanged. The wizard binds no version, so a hostile server
+can offer it an older signed MSI under its own tag: the signature says whose, not
+which.
+
 ## 8. Enterprise pilot path (before/without the public cert)
 
 `50-selfsigned-dev-cert.ps1` + `51-trust-dev-cert.ps1` produce a self-signed

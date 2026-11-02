@@ -210,8 +210,8 @@ that person's browser and profile, at medium integrity.
 that folder and `HKCU\Environment`, and the same image goes on to run elevated:
 
 - it loads DLLs from System32 alone (the linker's `/DEPENDENTLOADFLAG:0x800`,
-  `SetDefaultDllDirectories`, and `secur32.dll` delay-loaded, since that flag does not reach an
-  import's own imports), and `pe-dependent-load-flags.ps1` reads the flag and the import table
+  `SetDefaultDllDirectories`, and `secur32.dll` and `wintrust.dll` delay-loaded, since that flag
+  does not reach an import's own imports), and `pe-dependent-load-flags.ps1` reads the flag and the import table
   back from the EXE in CI, in the release lane and in the verifier;
 - it names every program it starts by a full path from the kernel, and
   `agents/roomler-setup/src/spawn_gate.rs` fails CI on a bare name;
@@ -221,12 +221,68 @@ that folder and `HKCU\Environment`, and the same image goes on to run elevated:
   uses works limited and nowhere else;
 - its WebView2 folder is made new at each start, following no link.
 
-Still open: the wizard checks no publisher on the MSI it stages, and the staged file sits in the
-user's temp folder until `msiexec` reads it (#3246).
-
 A declined prompt leaves the limited wizard as it was, with one line saying so;
 any other failure shows its reason and the right-click way. Nothing else in the
-wizard elevates itself: a fresh install still gets the MSI's own UAC prompt.
+wizard elevates itself: a fresh machine-wide install gets one prompt, for the
+wizard's own step below.
+
+**What the wizard runs is what it checked (#3246).** A digest comes from the same origin as the
+URL, so it says the bytes came through intact and never who made them. The anchor is the publisher:
+a valid Authenticode signature by `code_signature::EXPECTED_PUBLISHER`, compiled in.
+
+| What arrived (Windows unless named) | Digest published | What happens |
+|---|---|---|
+| MSI or desktop companion, signed by the publisher | matches | installs |
+| the same | none | installs, with a warning row: the signature decides |
+| anything | mismatch | refused |
+| unsigned, tampered, another publisher, or a root this machine does not trust | any | refused, whatever the digest says |
+| an older release with no signature | any | refused, as the updater refuses it |
+| tunnel zip, every file but plain text signed | matches, or none with a warning | extracts |
+| tunnel zip, any other file unsigned | any | refused, and nothing was extracted into place |
+| Linux or macOS tunnel archive | none | refused: there is no other anchor, as for the daemon there |
+| a `tag` or `filename` from the server that is not one plain name | any | refused before anything is written |
+
+A check is only worth something if nothing can change the file before it runs, and on the
+machine-wide roles the run crosses to the administrator. A process at the person's level can write
+their `%TEMP%` and can end or inject into a limited wizard, so anything that wizard holds it can
+drop. The check that counts therefore happens on the far side of the prompt, in the same EXE
+(`agents/roomler-setup/src/package_step.rs`):
+
+```mermaid
+sequenceDiagram
+    participant W as Limited wizard
+    participant U as UAC prompt
+    participant S as Elevated step, no window
+    participant M as msiexec
+    W->>W: download to %TEMP%, hold it, check digest and publisher
+    Note over W: a refusal here needs no prompt
+    W->>U: runas this EXE with a file, a folder name, the digest, a yes or no
+    U->>S: names Roomler Setup and its publisher
+    S->>S: new folder under %ProgramData%, SYSTEM and Administrators only, from its creation
+    Note over S: refused if the name exists, whoever made it
+    S->>S: copy in, hold it refusing writers, digest and publisher through that handle
+    S->>M: full path, TEMP set to that folder, arguments it built itself
+    M-->>S: exit code
+    S-->>W: exit code, the one channel back
+```
+
+- **The step takes nothing on trust.** A limited process can start it with any arguments, so it
+  parses exactly its own, reads the file as a claim, and builds `msiexec`'s command line itself: no
+  property, no transform, nothing we did not sign. Pointed at a genuine older MSI it installs that
+  after the person approves, which is no more than `runas msiexec` could do.
+- **It writes and deletes only inside its new folder.** An elevated write or delete under the
+  person's `%TEMP%` goes wherever a link planted there says, so the log no longer sits beside the
+  staged MSI there. A failed install leaves its log at
+  `%ProgramData%\roomler-setup-<hex>\<file>.log`, which the wizard names and only an administrator
+  can open, and the MSI copy is deleted. Otherwise the folder is removed.
+- **It opens no window and writes no state for the wizard.** Under another account's password it
+  runs as that administrator, so only its exit code comes back, through the handle the shell returned.
+- **An elevated wizard does the same in its own process.** It downloads into such a folder from the
+  start, because `%TEMP%` comes from `HKCU\Environment`, and it never starts a copy of its own image:
+  that file sits in Downloads, a limited process can rename another into its place, and an elevated
+  `runas` raises no prompt.
+- **A per-user install holds the file and checks it** with nothing to cross: `msiexec` runs at the
+  level of anything that could change it.
 
 **The enroll says how it was installed** (FR-102 P3, the install trace in
 [growth-observability.md](growth-observability.md)): the device row records

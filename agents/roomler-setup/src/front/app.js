@@ -1467,6 +1467,7 @@ const STEP_LABELS = {
   AssetResolved: "Download URL resolved",
   DownloadStarted: "Downloading",
   DownloadVerified: "Download verified (SHA256)",
+  PublisherVerified: "Publisher verified",
   MsiSpawned: "Running MSI installer",
   MsiCompleted: "MSI installer finished",
   ExtractStarted: "Extracting archive",
@@ -1771,7 +1772,8 @@ function renderInstall() {
 
   // Progress bar visible only while a download is active.
   const downloadStarted = installRows.has("DownloadStarted");
-  const downloadVerified = installRows.has("DownloadVerified");
+  // #3246 — a release with no digest sends only the publisher's row.
+  const downloadVerified = installRows.has("DownloadVerified") || installRows.has("PublisherVerified");
   document.getElementById("install-progress").hidden = !(downloadStarted && !downloadVerified);
 
   // FR-129 B1: the halves' output, and the terminal fallback.
@@ -1829,10 +1831,11 @@ function checklistClass(event) {
   if (
     t === "Done" || t === "EnrollOk" || t === "AnchorOk" || t === "DaemonRestartOk" || t === "MsiCompleted" ||
     t === "ExtractDone" || t === "IntegrationDone" || t === "ScriptHalfDone" ||
-    t === "DownloadVerified" || t === "PreflightOk" || t === "AssetResolved"
+    t === "PublisherVerified" || t === "PreflightOk" || t === "AssetResolved"
   ) {
     return "ok";
   }
+  if (t === "DownloadVerified") return d.sha256Match ? "ok" : "error";
   return "running";
 }
 
@@ -1852,6 +1855,8 @@ function checklistLabel(event) {
   if (t === "PreflightWarning") return `${base}: ${d.message}`;
   if (t === "AssetResolving") return `Resolving download URL (${d.artifact})`;
   if (t === "AssetResolved") return `Resolved ${releaseLabel(d.tag)} (${(d.sizeBytes / 1_000_000).toFixed(1)} MB)`;
+  if (t === "DownloadVerified") return d.sha256Match ? base : "The download does not match its checksum";
+  if (t === "PublisherVerified") return `Signed by ${d.signer}`;
   if (t === "MsiSpawned") return `Running MSI installer (PID ${d.pid})`;
   if (t === "MsiCompleted") return `MSI installer finished (exit ${d.code}, ${d.decoded})`;
   if (t === "ExtractDone") return `Extracted. Binary at ${d.tunnelBinary}`;

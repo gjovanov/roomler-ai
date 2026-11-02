@@ -63,9 +63,22 @@ folders such as `%ProgramData%` included. `launch::start_clean`, `main`'s second
 those folders their true values on every run, leaves the current directory, and in an elevated
 run drops `ROOMLER*`, `WEBVIEW2_*`, `TAURI_*` and `SSL_CERT_*`. A new override goes through
 `launch::distrusted_variable`. The elevated WebView2 folder sits where the limited user can
-write, so `make_elevated_folder` makes it new each time and follows no link. The publisher
-check and the `%TEMP%` swap stay open in #3246, the last ways left for a limited process to reach
-the administrator's token.
+write, so `make_elevated_folder` makes it new each time and follows no link.
+
+⚠️ **The MSI the wizard runs is the one it checked (#3246), and the check that counts runs
+elevated.** A process at the person's level can end or inject into a limited wizard, so a handle
+that wizard holds proves nothing across the prompt. A limited machine-wide install `runas`es its own
+EXE (`package_step.rs`, `--run-package`), which makes a new `%ProgramData%\roomler-setup-<hex>` with
+its DACL set at creation, copies the file in, holds it refusing writers, checks digest and publisher
+through that handle, and runs `msiexec` by full path with `TEMP` set to that folder. It takes only a
+file and a yes-or-no, builds `msiexec`'s arguments itself, and writes and deletes nothing outside its
+folder. An elevated wizard does this in its own process and **never re-launches `current_exe`**: a
+limited process can rename another file into that path, and an elevated `runas` raises no prompt. It
+also does **not** download under `%TEMP%`, and does not override `TEMP` for itself (WebView2's browser
+runs as the session's user). Any manifest name that becomes a path goes through
+`asset_resolver::plain_name`. A zip has no signature, so every file in one but plain text passes the
+publisher check: a genuine `roomler.exe` would load a `version.dll` left beside it. `wintrust.dll` is
+delay-loaded for the same reason as `secur32.dll`, and `-NotImported` reads both.
 
 ⚠️ **The cards narrow to what can work here** (`role::RoleLimit`), each with its note.
 Another account's password (`--session-data` differs from this process's `%LOCALAPPDATA%`)

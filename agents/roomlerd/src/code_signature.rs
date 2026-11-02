@@ -110,6 +110,36 @@ pub fn verify_publisher(_path: &Path, _expected: &str) -> Result<String, VerifyE
     Err(VerifyError::Unsupported)
 }
 
+/// [`verify_publisher`] for a file the caller holds open (#3246): the check
+/// reads through `file`, and the signer's name comes from what that check
+/// verified, not from a second look at the path. `path` is the same file's name,
+/// which `WinVerifyTrust` wants as well. Returns the signer's display name.
+#[cfg(windows)]
+pub fn verify_open_publisher(
+    file: &std::fs::File,
+    path: &Path,
+    expected: &str,
+) -> Result<String, VerifyError> {
+    let signer = win::verify_open(file, path)?;
+    if signer.contains(expected) {
+        Ok(signer)
+    } else {
+        Err(VerifyError::WrongPublisher {
+            found: signer,
+            expected: expected.to_string(),
+        })
+    }
+}
+
+#[cfg(not(windows))]
+pub fn verify_open_publisher(
+    _file: &std::fs::File,
+    _path: &Path,
+    _expected: &str,
+) -> Result<String, VerifyError> {
+    Err(VerifyError::Unsupported)
+}
+
 #[cfg(windows)]
 mod win {
     use super::VerifyError;
@@ -117,15 +147,17 @@ mod win {
     use std::iter::once;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
     use std::ptr::null_mut;
 
     use windows_sys::Win32::Foundation::{
-        CRYPT_E_SECURITY_SETTINGS, ERROR_SUCCESS, TRUST_E_EXPLICIT_DISTRUST, TRUST_E_NOSIGNATURE,
-        TRUST_E_SUBJECT_NOT_TRUSTED,
+        CERT_E_CHAINING, CERT_E_EXPIRED, CERT_E_REVOKED, CERT_E_UNTRUSTEDROOT,
+        CRYPT_E_SECURITY_SETTINGS, ERROR_SUCCESS, HANDLE, TRUST_E_EXPLICIT_DISTRUST,
+        TRUST_E_NOSIGNATURE, TRUST_E_SUBJECT_NOT_TRUSTED,
     };
     use windows_sys::Win32::Security::Cryptography::{
-        CERT_FIND_SUBJECT_CERT, CERT_INFO, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+        CERT_CONTEXT, CERT_FIND_SUBJECT_CERT, CERT_INFO, CERT_NAME_SIMPLE_DISPLAY_TYPE,
         CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED, CERT_QUERY_FORMAT_FLAG_BINARY,
         CERT_QUERY_OBJECT_FILE, CMSG_SIGNER_INFO, CMSG_SIGNER_INFO_PARAM,
         CertFindCertificateInStore, CertFreeCertificateContext, CertGetNameStringW,
@@ -134,7 +166,8 @@ mod win {
     use windows_sys::Win32::Security::WinTrust::{
         WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO,
         WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY,
-        WTD_UI_NONE, WinVerifyTrust,
+        WTD_UI_NONE, WTHelperGetProvCertFromChain, WTHelperGetProvSignerFromChain,
+        WTHelperProvDataFromStateData, WinVerifyTrust,
     };
 
     fn wide(path: &Path) -> Vec<u16> {
@@ -143,12 +176,56 @@ mod win {
 
     /// `WinVerifyTrust` against the generic Authenticode policy.
     pub(super) fn verify_trust(path: &Path) -> Result<(), VerifyError> {
+        verified(path, null_mut(), |_| Ok(()))
+    }
+
+    /// [`verify_trust`] through an open handle, and the name of the signer it
+    /// verified.
+    pub(super) fn verify_open(file: &std::fs::File, path: &Path) -> Result<String, VerifyError> {
+        verified(path, file.as_raw_handle(), verified_signer)
+    }
+
+    /// The leaf of the primary signer's chain, read from `WinVerifyTrust`'s own
+    /// state: the certificate it verified, with no second parse of the file.
+    fn verified_signer(state: HANDLE) -> Result<String, VerifyError> {
+        let missing = || VerifyError::Untrusted("signer certificate not found".into());
+        // SAFETY: `state` is the live state of a verify that succeeded, closed
+        // only after this returns; each pointer is null-checked before the next
+        // call reads through it, and all of them belong to that state.
+        let cert = unsafe {
+            let provider = WTHelperProvDataFromStateData(state);
+            if provider.is_null() {
+                return Err(missing());
+            }
+            let signer = WTHelperGetProvSignerFromChain(provider, 0, 0, 0);
+            if signer.is_null() {
+                return Err(missing());
+            }
+            let leaf = WTHelperGetProvCertFromChain(signer, 0);
+            if leaf.is_null() {
+                return Err(missing());
+            }
+            (*leaf).pCert
+        };
+        if cert.is_null() {
+            return Err(missing());
+        }
+        cert_name(cert)
+    }
+
+    /// Run the check on `path`, through `handle` when it is not null, and `read`
+    /// from its state before that is released.
+    fn verified<T>(
+        path: &Path,
+        handle: HANDLE,
+        read: impl FnOnce(HANDLE) -> Result<T, VerifyError>,
+    ) -> Result<T, VerifyError> {
         let file = wide(path);
 
         let mut file_info = WINTRUST_FILE_INFO {
             cbStruct: size_of::<WINTRUST_FILE_INFO>() as _,
             pcwszFilePath: file.as_ptr(),
-            hFile: null_mut(),
+            hFile: handle,
             pgKnownSubject: null_mut(),
         };
 
@@ -179,6 +256,9 @@ mod win {
             )
         };
 
+        const OK: i32 = ERROR_SUCCESS as i32;
+        let read = (status == OK).then(|| read(data.hWVTStateData));
+
         // The state handle must be released with a CLOSE call whatever the
         // verdict was, or every check leaks it.
         data.dwStateAction = WTD_STATEACTION_CLOSE;
@@ -190,14 +270,13 @@ mod win {
             );
         }
 
-        const OK: i32 = ERROR_SUCCESS as i32;
         // Not re-exported by windows-sys 0.59's Foundation module, and it is
         // the verdict that matters most: the signature is intact but the file
         // no longer hashes to what was signed, i.e. the payload was modified
         // in transit. Field-checked by flipping four bytes in a released MSI.
         const TRUST_E_BAD_DIGEST: i32 = 0x8009_6010_u32 as i32;
         match status {
-            OK => Ok(()),
+            OK => read.unwrap_or_else(|| Err(VerifyError::Untrusted("no verdict".into()))),
             TRUST_E_BAD_DIGEST => Err(VerifyError::Untrusted(
                 "the payload does not match its signature — it was modified after signing".into(),
             )),
@@ -210,6 +289,20 @@ mod win {
             )),
             CRYPT_E_SECURITY_SETTINGS => Err(VerifyError::Untrusted(
                 "local policy rejected the publisher or hash".into(),
+            )),
+            // #3246 — said apart from a bad file, because the way on differs: a
+            // machine whose root certificates Windows Update does not keep
+            // current refuses a genuine file, and its administrator can fix that.
+            CERT_E_UNTRUSTEDROOT | CERT_E_CHAINING => Err(VerifyError::Untrusted(
+                "this computer does not trust the root of the certificate that signed it, which \
+                 Windows Update normally keeps current, so an administrator may need to run it"
+                    .into(),
+            )),
+            CERT_E_EXPIRED => Err(VerifyError::Untrusted(
+                "the certificate that signed it has expired".into(),
+            )),
+            CERT_E_REVOKED => Err(VerifyError::Untrusted(
+                "the certificate that signed it has been revoked".into(),
             )),
             other => Err(VerifyError::Untrusted(format!(
                 "WinVerifyTrust returned 0x{other:08X}"
@@ -292,7 +385,13 @@ mod win {
                 "signer certificate not found".into(),
             ));
         }
+        let name = cert_name(cert);
+        unsafe { CertFreeCertificateContext(cert) };
+        name
+    }
 
+    /// A certificate's simple display name. `cert` stays the caller's.
+    fn cert_name(cert: *const CERT_CONTEXT) -> Result<String, VerifyError> {
         let needed = unsafe {
             CertGetNameStringW(
                 cert,
@@ -304,7 +403,6 @@ mod win {
             )
         };
         if needed == 0 {
-            unsafe { CertFreeCertificateContext(cert) };
             return Err(VerifyError::Untrusted("signer name unavailable".into()));
         }
         let mut name = vec![0u16; needed as usize];
@@ -318,7 +416,6 @@ mod win {
                 needed,
             )
         };
-        unsafe { CertFreeCertificateContext(cert) };
         if written == 0 {
             return Err(VerifyError::Untrusted("signer name unreadable".into()));
         }
@@ -343,6 +440,60 @@ mod tests {
             // Elsewhere: the check cannot run, and says so rather than passing.
             Err(VerifyError::Unsupported) => {}
             other => panic!("an unsigned file must never verify, got {other:?}"),
+        }
+    }
+
+    /// #3246 — through a handle, the same refusal.
+    #[test]
+    fn an_unsigned_open_file_is_refused() {
+        let src = Path::new(file!());
+        let open = std::fs::File::open(src).unwrap();
+        match verify_open_publisher(&open, src, EXPECTED_PUBLISHER) {
+            Err(VerifyError::Untrusted(_)) | Err(VerifyError::Unsupported) => {}
+            other => panic!("an unsigned file must never verify, got {other:?}"),
+        }
+    }
+
+    /// #3246 — a REAL signed release artifact, read the way the wizard reads it:
+    /// through a handle that refuses writers. It verifies; a copy with four
+    /// bytes flipped does not; and the publisher check compares the name it
+    /// read. Ignored like the test below; same variable.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn a_held_release_artifact_verifies_and_a_tampered_copy_does_not() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let Ok(p) = std::env::var("ROOMLER_TEST_SIGNED_MSI") else {
+            eprintln!("set ROOMLER_TEST_SIGNED_MSI to a downloaded release MSI");
+            return;
+        };
+        let held = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1) // FILE_SHARE_READ
+                .open(path)
+                .unwrap()
+        };
+        let path = Path::new(&p);
+        let signer = verify_open_publisher(&held(path), path, EXPECTED_PUBLISHER)
+            .expect("a released artifact must verify through a handle");
+        println!("signer: {signer}");
+        assert!(signer.contains(EXPECTED_PUBLISHER));
+
+        match verify_open_publisher(&held(path), path, "Someone Else Ltd") {
+            Err(VerifyError::WrongPublisher { found, .. }) => assert_eq!(found, signer),
+            other => panic!("the wrong name must be refused, got {other:?}"),
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("tampered.msi");
+        let mut bytes = std::fs::read(path).unwrap();
+        let at = bytes.len() / 2;
+        bytes[at..at + 4].iter_mut().for_each(|b| *b ^= 0xff);
+        std::fs::write(&copy, &bytes).unwrap();
+        match verify_open_publisher(&held(&copy), &copy, EXPECTED_PUBLISHER) {
+            Err(VerifyError::Untrusted(why)) => println!("tampered: {why}"),
+            other => panic!("a tampered copy must be refused, got {other:?}"),
         }
     }
 
