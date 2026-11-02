@@ -1,8 +1,8 @@
 # FR-88: Measure what promotion brings — attribution to an activated device, a link hub, and video on the site
 
 **Issue:** [#1790](https://github.com/gjovanov/roomler-ai/issues/1790) · **Status:** in progress. P0–P3 merged
-and promoted; P4's docs written. 9 of 12 criteria met; AC3, AC8 and AC10 are open (§5) · **Owner:**
-web / public site + auth · **Anchors:** master `9ddf0aa6b` ·
+and promoted; P4 merged, its privacy paragraph waiting on a promote. 10 of 12 criteria met; AC3 and AC10 are
+open (§5) · **Owner:** web / public site + auth · **Anchors:** master `9ddf0aa6b` ·
 **Builds on:** [FR-87](FR-87-blog-and-google-indexing.md) (the static site, purestat on every page),
 [FR-60](FR-60-public-docs-site.md) (the generator), [FR-39](FR-39-launch-readiness.md) (`subscribers.source`)
 
@@ -22,8 +22,9 @@ visitor's device**, and gives the videos a home on the site.
    within 7 days, by source and campaign.
 4. **A link hub**: `/links/` plus short paths (`/yt`, `/tt`, `/x`, `/fb`) that 302 there with UTM,
    for places a link cannot carry parameters: a profile bio, a URL said out loud in a video.
-5. **Video on the site**: a `video:` key on blog posts and a `:::video` container on docs pages,
-   rendered as a click-to-load youtube-nocookie facade with `VideoObject` structured data.
+5. **Video on the site**: a `:::video` container on docs pages, rendered as a click-to-load
+   youtube-nocookie facade with `VideoObject` structured data. The blog's `video:` key, planned here
+   first, moved out of scope on 2026-11-02 (§7).
 
 The channel program itself (what is posted, where, when, and why) is not engineering and is not in
 this spec. Nothing here depends on it.
@@ -205,8 +206,10 @@ sequenceDiagram
 - **The poster is our own copy, not `i.ytimg.com`.** A thumbnail from `i.ytimg.com` is a
   request to a Google host on page load, which the first bullet rules out. The poster lives in
   `ui/src/assets/tutorial/`, which the docs build already searches and the SPA imports from.
-- **Docs only** get `:::video <id>`; the blog's `video:` front-matter key is not built. A post
-  can use the container, but adds no `VideoObject` yet.
+- **Docs only** get `:::video <id>`. The blog's `video:` front-matter key was not built, and the
+  operator moved it out of scope on 2026-11-02 (§7). A post can use the container, which draws the
+  same facade, loads `docs.js` for the click and fails the build on an unknown id, but adds no
+  `VideoObject` (§8, 2026-11-02).
 - **`/links/` got no facade.** §3d's featured video on the hub was not built: the hub stays a
   list of links.
 - **Proof:** the built site served locally, YouTube blocked at the browser: 0 requests to a
@@ -222,7 +225,7 @@ sequenceDiagram
 | P1b | the site and SPA half of §3a (the shell script, the register view and its select, the provider buttons, the newsletter form), the goals (§3b), the privacy-policy section, and the `/landing` and `/pricing` redirects in nginx that now keep the query | `ATTRIBUTION_ENABLED = false` in `ui/src/utils/attribution.ts`; `ANALYTICS = null` | **merged** #1798 `78a2ea096`, promoted `hosted-20260930-60fe7a7` |
 | P2 | `/links/` and the short paths (§3d) | remove the locations and the page | **merged** #1803 `1dd1d08be`, promoted `hosted-20261001-37fa997`; X took Instagram's place in #2007 `405e5724d`, promoted `hosted-20261011-ffa860c` |
 | P3 | video on the site (§3e, as built below it): the homepage, `/docs/start/what-is-roomler/`, the SPA landing and the tutorial's first chapter, with `docs/public-site.md` §7 | empty manifest; revert `frame-src` | **merged** #2262 `1c76d5fb4`, promoted `hosted-20261015-75a88bf` |
-| P4 | docs: `docs/public-site.md` gains the attribution flow (§9) and the link hub (§10), beside the video facade (§7), with mermaid; the field log; and the privacy policy's click-to-load paragraph, which §3e asked of P3 | revert the paragraph | written; the paragraph reaches production with the next promote |
+| P4 | docs: `docs/public-site.md` gains the attribution flow (§9) and the link hub (§10), beside the video facade (§7), with mermaid; the field log; and the privacy policy's click-to-load paragraph, which §3e asked of P3 | revert the paragraph | **merged** #3207 `658a0bef2`; the paragraph reaches production with the next promote |
 
 **Deploy order:** P1 is promoted before the first video is published, so the first posts are
 measured from their first view. Each phase is its own promote.
@@ -280,15 +283,16 @@ measured from their first view. Each phase is its own promote.
   **Met:** red then green on production for P2
   ([step log](https://github.com/gjovanov/roomler-ai/issues/1790#issuecomment-5925427841)) and for
   X (§8, 2026-10-11 and -12), and still green on 2026-10-30 (§8).
-- [~] **AC8:** a blog post with `video:` makes no request to a YouTube host before the click (network
-  log), plays after it, passes the Rich Results Test with a `VideoObject`, and keeps Lighthouse at
-  100 in all four categories. A `video:` id missing from the manifest fails the build, shown failing
-  and then passing.
-  **Partly met, by the docs container only.** `:::video` on a docs page makes no request to a
-  YouTube host before the click and plays after it
-  ([step log](https://github.com/gjovanov/roomler-ai/issues/1790#issuecomment-6203128624)). The
-  blog's `video:` key is not built (§3e, as built), and the Rich Results Test, Lighthouse and the
-  build gate's red have not been read. What happens to this criterion is the operator's to decide.
+- [x] **AC8:** a docs page with `:::video` makes no request to a YouTube host before the click
+  (network log), plays after it, passes the Rich Results Test with a `VideoObject`, and keeps
+  Lighthouse at 100 in all four categories. A `:::video` id missing from the manifest fails the
+  build, shown failing and then passing.
+  **Amended 2026-11-02, the operator's decision:** this first asked for all of it on a blog post's
+  `video:` key, which was never built (§3e, as built; §7).
+  **Met 2026-11-02 on `/docs/start/what-is-roomler/`,** §8, after the click's first read on P3's
+  deploy ([step log](https://github.com/gjovanov/roomler-ai/issues/1790#issuecomment-6203128624)).
+  One number sits below the bar and is kept: the median of 8 Lighthouse runs is 100 in all four
+  categories, and one run read Performance 98, from a garbage-collection pause in the test browser.
 - [x] **AC9:** the served CSP carries `frame-src https://www.youtube-nocookie.com` on the SPA, a docs
   page and a post, every other security header is unchanged (header diff), and a remote-control
   session still connects with its loopback probes unblocked.
@@ -300,8 +304,8 @@ measured from their first view. Each phase is its own promote.
 - [~] **AC10:** the privacy policy names the attribution fields, their purpose and retention, and the
   click-to-load embed.
   **Partly met.** Section 2.16 names the fields, the purpose and the retention, on production since
-  P1b. The embed was missing (§8, red on 2026-10-30). P4 adds it to section 2.17; tick this when
-  production serves it.
+  P1b. The embed was missing (§8, red on 2026-10-30). P4 adds it to section 2.17 (#3207, merged
+  `658a0bef2`); tick this when production serves it.
 - [x] **AC11:** docs updated with mermaid diagrams (`docs/public-site.md`: the attribution flow, the
   link hub, the video facade) and indexed in `docs/README.md`.
   **Met:** [`docs/public-site.md`](../public-site.md) §9 (the attribution flow), §10 (the link hub)
@@ -336,6 +340,9 @@ Decisions 1–3 shipped with their defaults in P1. Decision 4 is open.
   lives in a private annex. This spec stands alone without it.
 - **Ads, ad pixels and any third-party tracking script;** cookies of any kind for attribution;
   fingerprinting; multi-touch attribution; server-side events to purestat.
+- **The blog's `video:` front-matter key.** The operator moved it here on 2026-11-02, when AC8 was
+  amended to the `:::video` container as built. A post can already use the container, and its embed
+  adds no `VideoObject`. Giving a post one is a change of its own.
 - **Conference-call recording.** `ui/docs/content/collaboration/video-conferencing.md:21` claims
   "Record a call", but `crates/modules/conference/src/recording.rs:84-107` only inserts a metadata
   row (`url` empty, `size` 0). The doc is corrected in a separate PR.
@@ -350,6 +357,7 @@ Decisions 1–3 shipped with their defaults in P1. Decision 4 is open.
 | 2026-10-12 | production, after #2007 (`hosted-20261011-ffa860c`, promoted 2026-10-11 20:48Z, `/health` 0.4.127) | the same smoke, from master | **passes**, every check: `/x` → `302 Location: /links/?utm_source=x&utm_medium=bio&utm_campaign=profile`. `/ig` now answers 200 with no redirect, as the both-ways rule requires. `/links/` lists YouTube, TikTok, X (@roomler_ai) and Facebook, with no instagram.com link left |
 | 2026-10-30 23:10–23:30Z | production `hosted-20261030-9336d4b` (`/health` 0.4.189) | the smoke (AC7, AC12); the served headers (AC9); a Playwright pass over the five pages (AC4); the served privacy policy (AC10) | **Green, and one red.**<br>• **Smoke:** `scripts/public-site-smoke.sh https://roomler.ai` passes every check.<br>• **AC9:** `/login`, `/docs/start/what-is-roomler/`, a post and `/` each serve `frame-src https://www.youtube-nocookie.com`, with the same security headers on all four. The pod's seven headers are byte-identical to master's `files/security-headers.conf`, and P3's diff (`1c76d5fb4`) changed only the CSP line and its comments.<br>• **AC4:** six tagged parameters on all five pages in one browser: 0 attribution values, no storage key and no cookie at all. Each page carried the campaign onto its own links (14, 16, 9, 6 and 1), so its script saw the query. purestat's tracker was requested and aborted on each page, a planted value was seen in all three stores, and the tracker's source only reads one opt-out flag.<br>• **AC10's red:** the served `PrivacyPolicyView` chunk holds 2.16's phrases and nothing about the embed (`youtube-nocookie`, `press play` and `embedded`, 0 each) |
 | 2026-10-31 17:39–17:55Z | production `hosted-20261031-28dfd72` (`/health` 0.4.190); read-only, bounded Mongo | AC1, AC2, AC3 and AC6; whether an attributed account has reached a device | **Green on the mechanism; the goal has no field datum yet.**<br>• **AC1:** `growth_digests` holds the server's own reads of purestat's query API for 2026-10-13…10-30. On 17 of those 18 days the campaign rows are measured: real visits under `youtube/video/<campaign>`, and under LinkedIn, Facebook, X and `chatgpt.com`. Every day has a `direct` channel (the control).<br>• **AC2:** among accounts created since P1's promote, the field exists only on those that came through a tagged link or answered the question, one of them an organic `utm_source=chatgpt.com` sign-up. Every other account has no key (the control).<br>• **AC3:** no provider account carries the field. That is what the carry predicts unless a tagged visitor picks a provider, so it proves nothing either way, and the criterion stays open.<br>• **AC6:** the real tracker on the served pages, every beacon caught in the browser, the two writes stubbed (no account, no subscriber, no purestat row): exactly 1 `install-copy`, `github-outbound`, `subscribe` and `signup`. With the tracker blocked: 0 of each, and all four flows still complete. The same digests show all four goals on real traffic, `subscribe` included.<br>• **The goal:** every account carrying `signup_attribution` was created before the activation link worked (#3029, fixed by #3041, on production from `hosted-20261029-2ae4ffd`), so none could sign in, make an org or enroll a device. The same join finds orgs for other accounts, so the zero is real. No email sign-up has happened since the fix, and one that misses the 5-minute link is still locked out (#3199).<br>• `mongodb-0` shows no new restart after the reads |
+| 2026-11-02 20:46–20:56Z | production `hosted-20261102-b8c6d1b` (`/health` 0.4.197); the build gate on master `658a0bef2` | AC8's reads on `/docs/start/what-is-roomler/`, and the claim that a post can use `:::video` | **Green, with one number below the bar.**<br>• **The gate:** with the page's id changed to one the manifest does not hold, `bun docs/build.ts` exits 1, reports that one file and `:::video dQw4w9WgXcQ`, and writes no page. Restored: exit 0, 98 pages, the page with its facade, one `VideoObject` and no iframe.<br>• **The click:** Playwright with purestat's request aborted (1 abort, so the tracker's path ran): 0 requests to a YouTube host and no iframe 3 s after network idle. The first YouTube request after the click is `youtube-nocookie.com/embed/C1YdfmhbAKM?autoplay=1&rel=0`. The player's `<video>` read 0.7, 1.7 and 2.7 s, not paused, with no error. 0 CSP violations.<br>• **Rich Results Test, URL mode:** crawled 20:53:40Z, 3 valid items (Articles, Breadcrumbs, Videos). The Videos item reads the manifest's title, description, `uploadDate`, `duration`, poster and `embedUrl`, with no warning. The control, `/docs/compare/teamviewer/`, which has no video: 2 valid items, no Videos.<br>• **Lighthouse 12.8.2, mobile, 8 runs, on a shared host (65 % CPU at the last read):** Accessibility, Best Practices and SEO 100 on all 8. Performance 100 on 7 and 98 on 1, median 100. The 98 is TBT 180 ms from one 238 ms task with no script attributed to it: that run shows 237 ms of garbage collection, the other 7 at most 12 ms. CLS 0, LCP 1.1–1.5 s and no off-host request on all 8: the loader keeps the tracker off in an automated browser, so no run wrote to purestat, and a real visitor also fetches its 3.4 KB script. The control page: 6 of 6 at 100.<br>• **A post:** a scratch copy of one with `:::video`, built with `--blog-only --blog-dir`: the facade, `docs.js`, the poster and no `VideoObject`. An unknown id fails that build too |
 
 ## 9. Related
 
