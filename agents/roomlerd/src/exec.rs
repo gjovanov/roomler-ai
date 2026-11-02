@@ -4025,7 +4025,7 @@ pub(crate) mod session_lifetime {
     pub(crate) struct Watched(HANDLE);
 
     impl Watched {
-        fn open(pid: u32) -> Self {
+        pub(crate) fn open(pid: u32) -> Self {
             // SAFETY: a documented call; the handle is owned from here on.
             let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
             assert!(!h.is_null(), "process {pid} is gone before it was watched");

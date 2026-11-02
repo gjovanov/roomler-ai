@@ -1557,26 +1557,46 @@ mod sshd {
                 }
             });
 
+            // #3303 — `channel_close` and this handler's `Drop` fire this, as they
+            // do for a command. The pump cannot hear a client go by itself: a
+            // shell at a prompt writes nothing that could fail.
+            let abort = tokio_util::sync::CancellationToken::new();
+            self.exec_aborts.insert(channel, abort.clone());
+
             let caller_for_pump = caller.clone();
             tokio::spawn(async move {
                 let mut pty = pty;
                 let mut buf = vec![0u8; 16 * 1024];
-                loop {
-                    match pty.read(&mut buf).await {
-                        Ok(0) => break,
+                let client_gone = loop {
+                    let read = tokio::select! {
+                        read = pty.read(&mut buf) => read,
+                        _ = abort.cancelled() => break true,
+                    };
+                    match read {
+                        Ok(0) => break false,
                         Ok(n) => {
-                            if handle.data(channel, buf[..n].to_vec()).await.is_err() {
-                                // The client vanished. Drop the session rather
-                                // than keep a shell alive against a channel
-                                // nobody reads.
-                                break;
+                            // A client that only stopped reading parks this, and
+                            // the abort ends the wait.
+                            let sent = tokio::select! {
+                                sent = handle.data(channel, buf[..n].to_vec()) => sent.is_ok(),
+                                _ = abort.cancelled() => false,
+                            };
+                            if !sent {
+                                break true;
                             }
                         }
                         Err(e) => {
                             warn!(%e, "ssh: terminal read failed");
-                            break;
+                            break false;
                         }
                     }
+                };
+                if client_gone {
+                    // Nobody is left to tell how it ended, and waiting for that
+                    // would keep a shell alive against a channel nobody reads:
+                    // `pty` drops here, which ends the session.
+                    info!(caller = %caller_for_pump, "ssh: interactive session ended: its client is gone");
+                    return;
                 }
                 let status = pty.wait().await;
                 info!(caller = %caller_for_pump, status, "ssh: interactive session ended");
@@ -4419,6 +4439,127 @@ mod tests {
              VT alone is exactly the P4b defect; got {text:?}"
         );
         assert!(exit.is_some(), "the session must report an exit status");
+    }
+
+    /// One process of a session, from outside it. Signal 0 only asks, and a
+    /// process nobody has reaped yet still answers; the runtime reaps a shell.
+    #[cfg(unix)]
+    struct Watched(i32);
+
+    #[cfg(unix)]
+    impl Watched {
+        fn open(pid: u32) -> Self {
+            Self(pid as i32)
+        }
+
+        fn gone_within(&self, within: std::time::Duration) -> bool {
+            let deadline = std::time::Instant::now() + within;
+            // SAFETY: signal 0 delivers nothing.
+            while unsafe { libc::kill(self.0, 0) } == 0 {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            true
+        }
+    }
+
+    #[cfg(windows)]
+    use crate::exec::session_lifetime::Watched;
+
+    /// #3303 — a client on an interactive shell that sits at its prompt, having
+    /// written nothing since it reported itself. On Windows it has also started
+    /// a child, which a job reaches; a Unix shell's background job is its own to
+    /// hang up, and depends on which shell this is.
+    async fn a_client_on_a_quiet_shell(
+        seed: u8,
+    ) -> (
+        russh::client::Handle<TestClient>,
+        russh::Channel<russh::client::Msg>,
+        Vec<Watched>,
+    ) {
+        let (key, line) = client_key(seed);
+        let addr = serve_one(&cfg_with_mode(vec![line], Some("daemon"))).await;
+        let session = connect(addr, key).await;
+        let channel = session.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+
+        let dir =
+            std::env::temp_dir().join(format!("roomlerd-3303-ssh-{}-{seed}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        let (typed, reports) = (
+            format!(
+                "{}\r\n",
+                crate::exec::session_lifetime::starts_a_child_then(&dir, "")
+            ),
+            2,
+        );
+        #[cfg(unix)]
+        let (typed, reports) = (
+            format!("echo $$ > '{}'\n", dir.join("started").display()),
+            1,
+        );
+        channel.data(typed.as_bytes()).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let pids = loop {
+            let pids: Vec<u32> = std::fs::read_to_string(dir.join("started"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if pids.len() == reports {
+                break pids;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell never reported itself"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        let processes = pids.into_iter().map(Watched::open).collect();
+        (session, channel, processes)
+    }
+
+    /// How long a lost session's processes may take to go, on a loaded runner.
+    const A_LOST_SHELL_GOES_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// No close and no goodbye: the transport goes, as a killed client's does or
+    /// a dead carrier's. A failed write can never tell a shell that writes
+    /// nothing, and it ran on for as long as the daemon lived.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_client_vanishing_ends_a_quiet_interactive_shell() {
+        let (session, channel, processes) = a_client_on_a_quiet_shell(47).await;
+        drop(channel);
+        drop(session);
+        for p in &processes {
+            assert!(
+                p.gone_within(A_LOST_SHELL_GOES_WITHIN),
+                "a process of the session outlived its client"
+            );
+        }
+    }
+
+    /// The channel closes and the connection stays, as a multiplexing client's
+    /// does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_client_closing_the_channel_ends_a_quiet_interactive_shell() {
+        let (session, channel, processes) = a_client_on_a_quiet_shell(48).await;
+        channel.close().await.unwrap();
+        for p in &processes {
+            assert!(
+                p.gone_within(A_LOST_SHELL_GOES_WITHIN),
+                "a process of the session outlived its channel"
+            );
+        }
+        drop(session);
     }
 
     /// A shell without a terminal is refused with a reason rather than handed
