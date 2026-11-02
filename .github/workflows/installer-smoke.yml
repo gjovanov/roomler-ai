@@ -551,6 +551,41 @@ jobs:
             Move-Item $stash $victim
           }
 
+      # #3292 — Restart Manager stops nothing once the daemon runs through the
+      # windowless launcher, so the MSI's StopDaemon custom action is what ends
+      # it. Without that action `msiexec /x` still exits 0, and the daemon runs on
+      # with its files gone. The launcher is started by hand here, so no task
+      # instance exists for the action's `schtasks /End` fallback to reach: only
+      # the daemon's stop event can pass the assert below.
+      - name: "Start a daemon for the uninstall to stop (#3292)"
+        shell: pwsh
+        run: |
+          $cfgDir = Join-Path $env:APPDATA 'roomler\roomler\config'
+          New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+          # Nothing answers on this port, so the daemon retries and stays up.
+          @(
+            'server_url = "http://127.0.0.1:9"',
+            'agent_token = "smoke"',
+            'agent_id = "000000000000000000000000"',
+            'tenant_id = "000000000000000000000000"',
+            'machine_id = "smoke"',
+            'machine_name = "smoke"'
+          ) | Set-Content -Encoding ascii -Path (Join-Path $cfgDir 'config.toml')
+          $env:ROOMLERD_AUTO_UPDATE = '0'
+          $launcher = Join-Path $env:LOCALAPPDATA 'Programs\Roomler\roomlerdw.exe'
+          Start-Process -FilePath $launcher -ArgumentList 'run', '--supervisor', 'task'
+          # Long enough to reach the wait on its stop event; a start on a slow
+          # guest had its row online in under 20 s. An action that runs before
+          # that finds no event, so a shorter sleep here reads as a false failure.
+          Start-Sleep -Seconds 45
+          $up = Get-Process roomlerd -ErrorAction SilentlyContinue
+          if (-not $up) {
+            Get-ChildItem (Join-Path $env:LOCALAPPDATA 'roomler\roomler\data\logs') -Filter 'roomlerd.log*' -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime | Select-Object -Last 1 | ForEach-Object { Get-Content -LiteralPath $_.FullName -Tail 40 }
+            throw 'the daemon did not stay up on a config with no server, so this lane proves nothing'
+          }
+          Write-Host "Daemon up under the launcher: pid $($up.Id)"
+
       - name: Uninstall the MSI (quiet)
         shell: pwsh
         run: |
@@ -565,6 +600,29 @@ jobs:
             throw "msiexec /x failed with exit $($proc.ExitCode)"
           }
           Write-Host 'Uninstall succeeded (exit 0)'
+
+      - name: "Assert the uninstall stopped the daemon (#3292)"
+        shell: pwsh
+        run: |
+          $left = Get-Process roomlerd, roomlerdw -ErrorAction SilentlyContinue
+          if ($left) {
+            $left | ForEach-Object { Write-Host "still running: $($_.Name) pid $($_.Id)" }
+            $left | Stop-Process -Force
+            throw 'msiexec /x exited 0 and the daemon runs on: is StopDaemon still in the MSI, before UnregisterAutostart?'
+          }
+          $logFile = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'roomler\roomler\data\logs') -Filter 'roomlerd.log*' |
+            Sort-Object LastWriteTime | Select-Object -Last 1
+          # A daemon that died by itself between the two steps must not pass.
+          $asked = Select-String -LiteralPath $logFile.FullName -SimpleMatch 'asked this per-user daemon to stop'
+          if (-not $asked) {
+            Get-Content -LiteralPath $logFile.FullName -Tail 40
+            throw 'the daemon is gone, and its log does not say it was asked to stop'
+          }
+          Write-Host 'The uninstall asked the daemon to stop, and it left'
+          # The later steps start from a host with no config.
+          foreach ($root in $env:APPDATA, $env:LOCALAPPDATA) {
+            Remove-Item -Recurse -Force (Join-Path $root 'roomler') -ErrorAction SilentlyContinue
+          }
 
       - name: Assert cleanup — registry + install dir gone
         shell: pwsh

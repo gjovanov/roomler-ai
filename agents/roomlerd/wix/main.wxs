@@ -413,6 +413,25 @@
             Return='ignore' />
 
         <!--
+          #3292: stop a running daemon. Restart Manager did this while the daemon
+          had a console window; a windowless launcher and a daemon with a hidden
+          console are not something it shuts down (measured: the log says
+          "Successfully shut down all applications", there is no event 10002, and
+          both run on). Without this action an upgrade by hand keeps the old daemon
+          until the next sign-in, and an uninstall leaves it running with its files
+          gone. `service stop` asks through the daemon's stop event and otherwise
+          ends the task, whose kill-on-close job takes the daemon. Return="ignore"
+          because a failure here must not fail an uninstall.
+        -->
+        <CustomAction
+            Id='StopDaemon'
+            FileKey='roomlerdw_exe'
+            ExeCommand='service stop'
+            Execute='deferred'
+            Impersonate='yes'
+            Return='ignore' />
+
+        <!--
           rc.18: cross-flavour cleanup. When the operator installs the
           perUser MSI over a prior perMachine install, this CA shells
           out to the freshly-laid EXE to scrub the OTHER flavour's
@@ -469,6 +488,18 @@
               still on disk.
             -->
             <Custom Action='UnregisterAutostart' Before='RemoveFiles'>
+                REMOVE="ALL"
+            </Custom>
+            <!--
+              #3292: BEFORE UnregisterAutostart, because deleting the task orphans
+              a running instance and `service stop` falls back to ending that task.
+              REMOVE="ALL" also holds for the OLD product during a MajorUpgrade, so
+              an upgrade stops the old daemon from the old MSI's table, and the new
+              RegisterAutostart's one-shot starts the new one. On the updater's path
+              the daemon is already leaving, and msiexec is outside the launcher's
+              job, so this cannot take the install down with it.
+            -->
+            <Custom Action='StopDaemon' Before='UnregisterAutostart'>
                 REMOVE="ALL"
             </Custom>
         </InstallExecuteSequence>

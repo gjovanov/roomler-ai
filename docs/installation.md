@@ -565,6 +565,7 @@ console, passes its arguments on, and leaves with the daemon's exit code.
 | stderr | The rolling log, the same dated file tracing writes; `NUL` past 256 MiB in a day | A panic, a stack overflow and FFmpeg print only there; the launcher must not create the log folder (`appdirs::use_old_segment`) |
 | stdout | `NUL` | Tracing only, and the rolling log has the same events |
 | The MSI's custom actions, the Start menu entry | Run through the launcher too | Each opened a terminal in the foreground |
+| Restart Manager | Stops nothing here, so the MSI's `StopDaemon` custom action does (`service stop`, before `UnregisterAutostart`). On a major upgrade it runs from the OLD product's table | Measured: a windowless launcher and a daemon with a hidden console are no target for it. The log says "Successfully shut down all applications", there is no event 10002, and without the action an upgrade by hand keeps the old daemon until the next sign-in, while an uninstall leaves it running with its files gone |
 
 **A self-update brings the device back by itself.** The daemon has exited for the
 installer, and registering the task is all the MSI's custom action does. So `service
