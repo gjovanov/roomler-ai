@@ -638,7 +638,8 @@ nothing has produced a stuck child in the field.
   at its request, before consent, and a person can take longer than that minute (`prompt_then_email`
   waits minutes). So its offer reads both against `detect()`: what has gone is picked again by the
   request's own rules, and a pick still offered stays, even beside a better one that has appeared
-  since. A track bound to a codec its open is refused carries no video, and a DataChannel pump with no
+  since. On the RTP track "still offered" means its opener can open it, and a session that just lost
+  its DataChannel picks again (`session_codec`, below). A track bound to a codec its open is refused carries no video, and a DataChannel pump with no
   cell left ends. A GUI worker's picks stand: the daemon made them, from an answer the worker does not
   hold.
 
@@ -742,8 +743,8 @@ Key properties:
   host cannot produce.
 - **Fail closed**: once a session's track is bound to `video/HEVC` or
   `video/AV1`, an encoder failure yields a null encoder rather than silently
-  switching bitstreams. The RTP pump then ends that session by name, so nobody
-  sits in front of a black picture that reads connected (below).
+  switching bitstreams. The RTP pump then ends a session that never painted by
+  name, so nobody sits in front of a black picture that reads connected (below).
 - **Escape hatch**: `ROOMLERD_HW_AUTO=0` reverts `auto` to software-first
   without a rebuild; `ROOMLERD_USE_FFMPEG=0` removes the FFmpeg backends.
 - **Auto does not keep the GPU-less software MFT** (#2283). When the
@@ -797,7 +798,8 @@ flowchart TB
 | Browser without H.264, host with an MF AV1 cell | AV1 | a session |
 | Browser without H.264, host with FFmpeg's AV1 only | H.264 | `no_common_codec`, at the offer |
 | Browser with only VP8 or VP9 | H.264: on RTP the opener would put H.264 bytes on their track | `no_common_codec`, at the offer |
-| The encoder opens as a Noop anyway (a cell proves an open at 480×270, not at this session's size; MF and OpenH264 both failing) | whatever was picked | `no_common_codec`, from the pump |
+| The encoder opens as a Noop before anything painted (a cell proves an open at 480×270, not at this session's size; MF and OpenH264 both failing), after the auto-downscale has had its go | whatever was picked | `no_common_codec`, from the pump |
+| A reopen opens as a Noop on a session that painted (a GPU reset, a size the MFT refuses) | unchanged | not ended: its codec opens, and the viewer's stall watchdog brings it back |
 
 Why H.264 and not the most efficient codec the host can open: the viewer's RTP
 fallback already assumes H.264, OpenH264 is proven at L4 p50 37 ms on this path,
@@ -814,6 +816,21 @@ fail. What matters here is that the end is final and said once.
 ⚠️ `chosen_codec` on the `incoming session request` line is this pick, and an
 RTP session reading `h264` on a host with AV1 cells is the design, not a
 regression.
+
+**The pump's end says first and closes after.** It goes through the signalling
+loop's device-end arm, the road the person's Disconnect takes (`DeviceEnd::NoVideo`,
+FR-27 P10): the hub tells the viewer, and the peer closes a second later. Closed
+first, the viewer's control channel `onclose` reads a plain drop and it reconnects
+into the same Noop, with a new consent prompt on a device that asks.
+
+**H.264 has a size ceiling on the software rung.** openh264 opens at any size and
+refuses every frame above 3840×2160 (`fit_for_software`), so the cascade cannot see
+it. It lands there when nothing else takes the size: wider than MF H.264's 4096, or
+Linux, where H.264 is always openh264. The encode error used to end the pump with
+the page connected and black. Now the first open that lands there holds the
+session's frames inside the ceiling for good (`rtp_frame_target`), whatever
+`rc:resolution` says: the viewer's default `original` arrives after the one-shot
+auto-downscale has run. A 5120×1440 screen codes at 3840×1080 at most.
 
 ### Hardware quirks the cascade routes around
 

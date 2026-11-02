@@ -4793,22 +4793,31 @@ pub fn pick_best_codec(browser_caps: &[String], agent_caps: &[String]) -> String
 /// were made from while a person decides, and that can take minutes: a track bound to
 /// a codec its open is then refused carries no video, and a DataChannel pump with no
 /// cell left ends. So what has gone is picked again by the request's own rules, and a
-/// pick that still stands stays.
+/// pick that still stands stays. #3245 — on the RTP track "still stands" means its
+/// opener can open it, and a session that just lost its DataChannel picks again: what
+/// `codecs` lists is what a DataChannel pump can open.
 pub fn picks_at_the_offer(
     codec: String,
     transport: Option<String>,
     browser_caps: &[String],
     now: &AgentCaps,
 ) -> (String, Option<String>) {
-    let codec = if now.codecs.iter().any(|c| c.eq_ignore_ascii_case(&codec)) {
-        codec
+    use crate::peer::on_data_channel;
+    let kept = transport
+        .clone()
+        .filter(|t| now.transports.iter().any(|have| have == t));
+    let stands = if on_data_channel(kept.as_deref()) {
+        now.codecs.iter().any(|c| c.eq_ignore_ascii_case(&codec))
     } else {
-        pick_best_codec(browser_caps, &now.codecs)
+        !on_data_channel(transport.as_deref())
+            && crate::encode::rtp_opener_opens(&codec, &now.video_cells)
     };
-    (
-        codec,
-        transport.filter(|t| now.transports.iter().any(|have| have == t)),
-    )
+    if stands {
+        (codec, kept)
+    } else {
+        let codec = crate::peer::session_codec(browser_caps, now, kept.as_deref());
+        (codec, kept)
+    }
 }
 
 #[cfg(test)]
@@ -9205,9 +9214,18 @@ mod tests {
     /// is picked again by the request's rules, in the same spellings.
     #[test]
     fn a_pick_stands_until_the_answer_stops_offering_it() {
+        use roomler_ai_remote_control::models::{
+            ChromaFormat, VideoBackend, VideoCell, VideoCodec,
+        };
         let caps = AgentCaps {
             codecs: vec!["H265".into(), "h264".into()],
             transports: vec!["data-channel-h264".into()],
+            video_cells: vec![VideoCell::new(
+                VideoCodec::Hevc,
+                VideoBackend::Qsv,
+                &[ChromaFormat::Yuv420],
+                true,
+            )],
             ..AgentCaps::default()
         };
         let browser: Vec<String> = ["av1", "h265", "h264"].map(String::from).to_vec();
@@ -9225,7 +9243,8 @@ mod tests {
             ("h264".into(), None),
             "not the best"
         );
-        assert_eq!(at_offer("av1", None), ("h265".into(), None));
+        // #3245 — gone from the RTP track's opener, and this browser lists H.264.
+        assert_eq!(at_offer("av1", None), ("h264".into(), None));
         assert_eq!(
             at_offer("h264", Some("data-channel-h264")),
             ("h264".into(), Some("data-channel-h264".into()))
@@ -9233,6 +9252,23 @@ mod tests {
         assert_eq!(
             at_offer("h264", Some("data-channel-av1")),
             ("h264".into(), None)
+        );
+        // #3245 — a DataChannel pick that lost its pump does not ride onto the RTP
+        // track, though `codecs` still lists it: an FFmpeg AV1 cell lists `av1`.
+        assert_eq!(
+            at_offer("h265", Some("data-channel-hevc")),
+            ("h264".into(), None)
+        );
+        // #3245 — a pick a browser without H.264 took stands while its opener can
+        // open it, and when it cannot, the next it can.
+        let firefox: Vec<String> = ["av1", "h265", "vp8"].map(String::from).to_vec();
+        assert_eq!(
+            picks_at_the_offer("h265".into(), None, &firefox, &caps),
+            ("h265".into(), None)
+        );
+        assert_eq!(
+            picks_at_the_offer("av1".into(), None, &firefox, &caps),
+            ("h265".into(), None)
         );
         // Nothing in common leaves what `pick_best_codec` leaves.
         let none = AgentCaps::default();

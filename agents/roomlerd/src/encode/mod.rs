@@ -1636,6 +1636,26 @@ pub fn rtp_opener_opens(
     }
 }
 
+/// #3245 — the largest size inside openh264's ceiling with `width`×`height`'s
+/// shape. A build without that encoder has no such ceiling.
+pub fn fit_for_openh264(width: u32, height: u32) -> (u32, u32) {
+    #[cfg(feature = "openh264-encoder")]
+    {
+        openh264_backend::fit_for_software(width, height)
+    }
+    #[cfg(not(feature = "openh264-encoder"))]
+    {
+        (width, height)
+    }
+}
+
+/// #3245 — is `encoder` openh264, at a size it refuses? It opens at any size and
+/// refuses on every frame, so the opener cannot tell; every other backend refuses
+/// at the open, where the cascade handles it.
+pub fn above_openh264_ceiling(encoder: &str, width: u32, height: u32) -> bool {
+    encoder == "openh264" && fit_for_openh264(width, height) != (width, height)
+}
+
 pub fn open_for_codec(
     codec: &str,
     width: u32,

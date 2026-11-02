@@ -134,8 +134,7 @@ fn host_disconnect_grace_from(raw: Option<&str>) -> Duration {
     }
 }
 
-/// The one message the host's Disconnect puts on the wire. A function so a
-/// test can hold the daemon to the spelling the viewer and the audit key on.
+/// The host's Disconnect on the wire: one function, so a test holds its spelling.
 fn host_disconnect_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
     ClientMsg::Terminate {
         session_id,
@@ -144,10 +143,9 @@ fn host_disconnect_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
     }
 }
 
-/// FR-101 P4b-2 — the one message the idle limit puts on the wire: the reason
-/// every server already knows, and the limit a newer one names to the viewer
-/// and the audit (an older server ignores `limit` and ends the session as
-/// `IdleTimeout` all the same).
+/// FR-101 P4b-2 — the idle limit on the wire: the reason every server knows, and
+/// the limit a newer one names to the viewer and the audit (an older server
+/// ignores `limit` and ends the session as `IdleTimeout` all the same).
 fn idle_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
     ClientMsg::Terminate {
         session_id,
@@ -156,14 +154,14 @@ fn idle_terminate(session_id: bson::oid::ObjectId) -> ClientMsg {
     }
 }
 
-/// FR-101 P4b-2 — why the DEVICE is ending a session: the person at it
-/// pressed Disconnect (FR-27 P10), or the session sat idle past its limit
-/// (`session_idle`). Both end it the same way, saying so first and closing
-/// after the grace, under their own reason.
+/// FR-101 P4b-2 — why the DEVICE is ending a session: Disconnect at the device
+/// (FR-27 P10), idle past its limit (`session_idle`), or an RTP pump with no
+/// encoder (#3245). All end alike: said first, closed after the grace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceEnd {
     HostDisconnect,
     Idle,
+    NoVideo,
 }
 
 impl DeviceEnd {
@@ -171,6 +169,7 @@ impl DeviceEnd {
         match self {
             Self::HostDisconnect => host_disconnect_terminate(session_id),
             Self::Idle => idle_terminate(session_id),
+            Self::NoVideo => crate::peer::no_video_terminate(session_id),
         }
     }
 
@@ -178,6 +177,7 @@ impl DeviceEnd {
         match self {
             Self::HostDisconnect => "host_disconnect",
             Self::Idle => "idle_timeout",
+            Self::NoVideo => "no_video",
         }
     }
 }
@@ -2611,6 +2611,10 @@ async fn connect_once(
             }
             Some((sid, end)) = device_end(kill_rx, idle_rx) => {
                 let _stage = watchdog::enter(ctx.pump, "device_end");
+                // #3245 — a pump with no encoder asks through the kill channel too,
+                // and its end says something else.
+                let no_video = peers.get(&sid).is_some_and(AgentPeer::no_video);
+                let end = if no_video { DeviceEnd::NoVideo } else { end };
                 // FR-101 P4b-2 — a hand-back from an idle watcher races the
                 // session's own end; one this connection no longer holds has
                 // nothing left to end (a disconnect closed every peer).
@@ -2640,6 +2644,7 @@ async fn connect_once(
                     DeviceEnd::Idle => {
                         info!(session_id = %sid, "idle limit reached — ending the session")
                     }
+                    DeviceEnd::NoVideo => {}
                 }
                 // FR-85 P3b-3 — the person at the device sent the controller
                 // away: a recording of this session STOPS now, rather than
@@ -2678,13 +2683,8 @@ async fn connect_once(
                 }
                 // A delegated session (a supervised Mac) speaks through the
                 // daemon's WS, the way its answer and its ICE did.
-                let grace = match reply_for_session(
-                    &mut ws,
-                    delegated_out.as_ref(),
-                    &end.terminate(sid),
-                )
-                .await
-                {
+                let said = end.terminate(sid);
+                let grace = match reply_for_session(&mut ws, delegated_out.as_ref(), &said).await {
                     Ok(()) => host_disconnect_grace(),
                     Err(e) => {
                         warn!(
@@ -2695,7 +2695,7 @@ async fn connect_once(
                     }
                 };
                 // The FR-27 field logs key on the host-disconnect line as it
-                // reads; the idle end says its own.
+                // reads; the others name their reason.
                 let grace_ms = grace.as_millis() as u64;
                 match end {
                     DeviceEnd::HostDisconnect => info!(
@@ -2704,11 +2704,11 @@ async fn connect_once(
                         grace_ms,
                         "host disconnect: told the server; the peer closes after the grace"
                     ),
-                    DeviceEnd::Idle => info!(
+                    DeviceEnd::Idle | DeviceEnd::NoVideo => info!(
                         session_id = %sid,
                         reason = end.label(),
                         grace_ms,
-                        "idle limit: told the server; the peer closes after the grace"
+                        "device end: told the server; the peer closes after the grace"
                     ),
                 }
                 if let Some(peer) = peer {
@@ -7592,8 +7592,8 @@ mod tests {
             picks_for_the_offer(&mut codecs, &mut transports, session, || {
                 caps_offering(&["h265", "h264"], &[])
             }),
-            ("h265".to_string(), None),
-            "gone from the answer in force, so picked again"
+            ("h264".to_string(), None),
+            "gone from the answer in force, so picked again, by the RTP track's rule"
         );
         assert!(
             codecs.is_empty() && transports.is_empty(),
@@ -7946,6 +7946,7 @@ mod tests {
         assert!(!json.contains("limit"), "{json}");
         assert_eq!(DeviceEnd::Idle.label(), "idle_timeout");
         assert_eq!(DeviceEnd::HostDisconnect.label(), "host_disconnect");
+        assert_eq!(DeviceEnd::NoVideo.label(), "no_video");
     }
 
     /// FR-101 P4b-2 — either channel ends a session, each under its own
