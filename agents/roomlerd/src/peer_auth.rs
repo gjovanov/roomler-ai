@@ -621,6 +621,11 @@ enum Read {
 /// use. Empty when this enrollment has no key it can keep (see the module
 /// docs), which the hello reports as "cannot prove who it is".
 pub fn hello_key(config_path: &Path, tenant_id: &str) -> String {
+    // FR-43 P3a — a GUI worker with no enrollment says hello to no one, and the
+    // root signs its answers.
+    if tenant_id.is_empty() {
+        return String::new();
+    }
     match device_key(config_path, tenant_id) {
         Ok(key) => key.public_b64(),
         Err(why) => {

@@ -526,6 +526,11 @@ pub struct OrgCtx {
     /// exit-route purges, and the `process::exit` escalations — a secondary
     /// org's terminal conditions stop ITS loop, never the daemon.
     pub is_primary: bool,
+    /// FR-43 P3a — this process is a GUI worker with no enrollment, on the
+    /// stand-in control plane ([`crate::unenrolled`]). A session reaches it
+    /// through the root's delegation channel and nothing else, so every text
+    /// frame off its own socket is dropped, whoever answers on that port.
+    pub unenrolled: bool,
     /// Watchdog pump name, registered by `run_cmd` before spawn:
     /// `signaling` for the primary (kept verbatim for log/tooling
     /// continuity) and `signaling:<label>` for secondaries — per-org pumps
@@ -571,6 +576,7 @@ impl OrgCtx {
         Self {
             label: crate::config::PRIMARY_ORG_LABEL.to_string(),
             is_primary: true,
+            unenrolled: false,
             pump: "signaling",
             down_since_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             updates_ignored: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -588,6 +594,7 @@ impl OrgCtx {
         Self {
             label: label.to_string(),
             is_primary: false,
+            unenrolled: false,
             // Interned (see the `pump` field doc): the watchdog registry
             // wants `&'static str`; one bounded leak per org per process.
             pump: Box::leak(format!("signaling:{label}").into_boxed_str()),
@@ -602,6 +609,13 @@ impl OrgCtx {
             #[cfg(hive_host)]
             prober: None,
         }
+    }
+
+    /// FR-43 P3a — this loop runs on the stand-in control plane
+    /// ([`Self::unenrolled`], the field).
+    pub fn unenrolled(mut self) -> Self {
+        self.unenrolled = true;
+        self
     }
 
     /// FR-103 — replace the renewal knobs (`run_cmd` passes the
@@ -2945,6 +2959,14 @@ async fn connect_once(
                     let _stage = watchdog::enter(ctx.pump, "ws.text");
                     last_rx = std::time::Instant::now();
                     watchdog::tick(ctx.pump);
+                    // FR-43 P3a — the stand-in sends none, so a text frame here
+                    // is something else on its port. This process holds the
+                    // person's capture grants, and it takes a session from the
+                    // root's delegation channel alone.
+                    if ctx.unenrolled {
+                        warn!("a text frame on the stand-in control plane's socket; dropped");
+                        continue;
+                    }
                     match serde_json::from_str::<ServerMsg>(&text) {
                         Ok(parsed) => {
                             // #2551 — which message this arm is handling: the

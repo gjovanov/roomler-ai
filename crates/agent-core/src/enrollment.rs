@@ -249,6 +249,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // FR-43 P1 — macOS root-daemon supervision of the GUI worker; off at
         // enrollment like every other posture switch.
         macos_supervise_gui_worker: false,
+        // FR-43 P3 — the same: one device row is a posture switch.
+        macos_one_row: false,
         power_policy: String::new(),
         // FR-84 D6 — the companion opens after install and starts at login by
         // default; a RE-enrollment keeps whatever the device had (the
@@ -582,6 +584,16 @@ pub fn apply_enrollment(
     let Some(existing) = existing else {
         return Ok((fresh, EnrollOutcome::FreshPrimary));
     };
+
+    // FR-43 P3 — a person's file on a one-row Mac holds their settings and no
+    // enrollment. One landing on it is the primary, with those settings kept:
+    // appended beside blank identity fields it would be a secondary of nothing.
+    if !existing.has_primary_enrollment() {
+        return Ok((
+            preserve_operator_config(fresh, existing),
+            EnrollOutcome::FreshPrimary,
+        ));
+    }
 
     if force_replace {
         let mut merged = preserve_operator_config(fresh, existing);

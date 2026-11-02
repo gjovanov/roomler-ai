@@ -151,6 +151,20 @@ pub struct AgentConfig {
     #[serde(default)]
     pub macos_supervise_gui_worker: bool,
 
+    /// FR-43 P3 — on macOS, ONE device row: the GUI worker holds no enrollment
+    /// of its own (`run --supervised --unenrolled`), so the root daemon's row
+    /// serves every session. Read by the root daemon at its start, and only
+    /// with [`Self::macos_supervise_gui_worker`] on: with no supervisor there
+    /// is no worker to run that way.
+    ///
+    /// Default OFF: a person's enrollment on this Mac stays what the worker
+    /// runs on, and a Mac with none has no worker. Device-owned like the key
+    /// above, so it is absent from `DesiredConfig` and no server can push it.
+    ///
+    /// No effect on any other platform.
+    #[serde(default)]
+    pub macos_one_row: bool,
+
     /// FR-55 — whether this device asks the OS to stay awake so it remains
     /// reachable: `never` (default) | `on-ac` | `always`.
     ///
@@ -2249,6 +2263,87 @@ impl AgentConfig {
         c
     }
 
+    /// FR-43 P3a — the config a GUI worker with no enrollment runs on: this
+    /// file with every enrollment and every host-global role taken out, and
+    /// its signalling loop pointed at the stand-in control plane
+    /// (`roomlerd::unenrolled`). The person's session knobs stay: they are why
+    /// the worker reads the file at all.
+    ///
+    /// ⚠️ A VIEW, and never written back. An unmigrated person's enrollment is
+    /// still in the file, which is what makes `macos_one_row = false` a real
+    /// off: [`StartupWrites::read_only`] keeps the daemon's startup saves off
+    /// it, and every later writer reloads the file first.
+    ///
+    /// The root holds what this takes out, so a worker running any of it would
+    /// be a second one on the machine. Crash bookkeeping goes too: a worker
+    /// cannot install a package, so it has no rollback to count towards, and the
+    /// supervisor records its crashes on the root's enrollment.
+    pub fn for_unenrolled_worker(&self, server_url: &str, ws_url: &str, secret: &str) -> Self {
+        let mut c = self.clone();
+        c.server_url = server_url.to_string();
+        c.ws_url = Some(ws_url.to_string());
+        c.agent_token = secret.to_string();
+        c.agent_id = String::new();
+        c.tenant_id = String::new();
+        c.ephemeral = false;
+        c.orgs = Vec::new();
+        c.tunnel_routes = Vec::new();
+        c.overlay_enabled = false;
+        c.overlay_multi_org = false;
+        c.netstack_socks_port = None;
+        c.overlay_wg_secret_key = None;
+        c.overlay_exit_node_enabled = false;
+        c.overlay_exit_node = None;
+        c.overlay_advertised_routes = Vec::new();
+        c.advertise_routes = Vec::new();
+        c.advertise_local_subnets = false;
+        c.relay_server_enabled = None;
+        c.ssh_enabled = false;
+        c.ssh_host_key = None;
+        c.ssh_authorized_keys = Vec::new();
+        c.exec_enabled = false;
+        c.remote_config_enabled = false;
+        c.external_access_enabled = false;
+        c.hive_enabled = false;
+        c.hive_adopt = false;
+        c.hive_replica = false;
+        c.hive_archive = false;
+        c.hive_net = false;
+        c.hive_ssh = false;
+        c.hive_egress = false;
+        c.hive_worker = false;
+        c.vault_enabled = false;
+        c.knowhow_scan_roots = Vec::new();
+        c.knowhow_scan_listeners = false;
+        c.knowhow_probe_reach = Vec::new();
+        c.auto_update = Some(false);
+        c.crash_count = 0;
+        c.last_crash_unix = 0;
+        c.last_run_unhealthy = false;
+        c.rollback_attempted = false;
+        c
+    }
+
+    /// FR-43 P3a — the file a worker with no enrollment writes when the person
+    /// has none: blank identity fields, and every default. `caps`, `record` and
+    /// `config set` load this file, and a person's own settings land in it.
+    pub fn for_person_with_no_enrollment(machine_name: &str) -> Result<Self> {
+        let mut cfg: Self = toml::from_str(
+            "server_url = \"\"\nagent_token = \"\"\nagent_id = \"\"\ntenant_id = \"\"\n\
+             machine_id = \"\"\nmachine_name = \"\"\n",
+        )
+        .context("the defaults of an empty config")?;
+        cfg.machine_name = machine_name.to_string();
+        Ok(cfg)
+    }
+
+    /// Does this file hold a primary enrollment? A person's file on a one-row
+    /// Mac does not (FR-43 P3): [`Self::for_person_with_no_enrollment`], or an
+    /// enrolled file the migration blanked.
+    pub fn has_primary_enrollment(&self) -> bool {
+        !self.agent_token.trim().is_empty() && !self.agent_id.trim().is_empty()
+    }
+
     /// Per-entry runnability partition for the daemon supervisor: each
     /// `[[orgs]]` entry paired with `None` (runnable) or `Some(reason)` (a
     /// validation problem — the supervisor skips it and surfaces the reason
@@ -2874,6 +2969,7 @@ pub fn test_fixture() -> AgentConfig {
         auto_grant_session: true,
         exec_enabled: false,
         macos_supervise_gui_worker: false,
+        macos_one_row: false,
         power_policy: String::new(),
         companion_autostart: true,
         remote_config_enabled: false,
@@ -4174,6 +4270,9 @@ pub struct StartupWrites {
     /// after each of its own saves. `None` when it could not be read, which
     /// leaves the saves unguarded, as they all were before.
     seen: Option<Vec<u8>>,
+    /// FR-43 P3a — this daemon runs on a view of the file, so its copy is
+    /// never the file's to write ([`Self::read_only`]).
+    read_only: bool,
 }
 
 impl StartupWrites {
@@ -4186,6 +4285,18 @@ impl StartupWrites {
         Self {
             path: path.to_path_buf(),
             seen: std::fs::read(path).ok(),
+            read_only: false,
+        }
+    }
+
+    /// FR-43 P3a — for a process running on
+    /// [`AgentConfig::for_unenrolled_worker`]'s view: every save succeeds and
+    /// writes nothing, so a view never lands on the person's file.
+    pub fn read_only(path: &std::path::Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            seen: None,
+            read_only: true,
         }
     }
 
@@ -4194,6 +4305,9 @@ impl StartupWrites {
     /// read back, is not written either: an uninstall or an unenroll removed
     /// it, and a startup save must not bring the enrollment back.
     pub fn save(&mut self, cfg: &AgentConfig) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         if let Some(seen) = &self.seen {
             let now = std::fs::read(&self.path).with_context(|| {
                 format!(
