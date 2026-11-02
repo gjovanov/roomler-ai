@@ -677,7 +677,7 @@ mod windows {
     fn schtasks() -> Command {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let mut cmd = Command::new("schtasks");
+        let mut cmd = Command::new(crate::appdirs::system32_tool("schtasks.exe"));
         cmd.creation_flags(CREATE_NO_WINDOW);
         cmd
     }

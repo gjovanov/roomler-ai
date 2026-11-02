@@ -586,13 +586,14 @@ async fn run_install_inner(
     // has the rights. Best-effort: a failure is logged + surfaced but
     // doesn't abort the install (the config still lands; the operator
     // can re-tighten). See harden_machine_global_dir.
+    #[cfg(target_os = "windows")]
     if is_system_context && let Err(e) = harden_machine_global_dir(&config_path) {
         emit(
             on_event,
             ProgressEvent::PreflightWarning {
                 message: format!(
                     "could not restrict permissions on the machine-global \
-                     config directory ({e}); the Agent token file may be \
+                     config directory ({e}); the daemon's token file may be \
                      readable by non-admin users until corrected"
                 ),
             },
@@ -1472,6 +1473,7 @@ fn flavour_parts(role: Role) -> Result<(WindowsInstallFlavour, bool), String> {
 /// Windows (`Administratoren`, etc.) and a name-based grant would
 /// fail there. `*S-1-5-18` = LocalSystem, `*S-1-5-32-544` =
 /// Administrators.
+#[cfg(target_os = "windows")]
 fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String> {
     let roomler_dir = config_path
         .parent() // …\roomler\<segment>
@@ -1496,7 +1498,7 @@ fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String
     // (inheritance first), a child someone else owns comes out with an
     // empty DACL — measured on the daemon's copy in 0.4.185, which now
     // grants before it drops inheritance (`roomler_node_core::config`).
-    let owner = std::process::Command::new("icacls")
+    let owner = std::process::Command::new(roomlerd::appdirs::system32_tool("icacls.exe"))
         .arg(roomler_dir)
         .arg("/setowner")
         .arg("*S-1-5-32-544")
@@ -1509,7 +1511,7 @@ fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String
             String::from_utf8_lossy(&owner.stderr).trim()
         ));
     }
-    let output = std::process::Command::new("icacls")
+    let output = std::process::Command::new(roomlerd::appdirs::system32_tool("icacls.exe"))
         .arg(roomler_dir)
         .arg("/inheritance:r")
         .arg("/grant:r")

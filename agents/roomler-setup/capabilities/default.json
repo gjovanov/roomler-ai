@@ -1,12 +1,10 @@
 {
   "identifier": "default",
-  "description": "Main-window capabilities for the roomler-setup wizard: core defaults plus the event-listen permission (the single-instance 'installer-already-running' signal) and the shell/dialog plugin commands the SPA uses. Without an explicit event grant, Tauri 2 denies plugin:event|listen — which aborted the wizard's listener wiring and left the Next buttons dead (2026-07-17).",
+  "description": "Main-window capabilities for the roomler-setup wizard: core defaults plus the event-listen permission (the single-instance 'installer-already-running' signal). Without an explicit event grant, Tauri 2 denies plugin:event|listen — which aborted the wizard's listener wiring and left the Next buttons dead (2026-07-17). Nothing else: the page's script is reachable by the user its WebView2 browser runs as, who under over-the-shoulder credentials is not the administrator this process runs as, so an unused grant (a native file dialog, the shell's open) would be a door into that process (FR-129 C). The Rust side opens its own dialogs and links, which no capability gates.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:event:allow-listen",
-    "core:event:allow-unlisten",
-    "shell:allow-open",
-    "dialog:default"
+    "core:event:allow-unlisten"
   ]
 }

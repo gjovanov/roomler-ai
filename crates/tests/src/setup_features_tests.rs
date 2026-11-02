@@ -209,3 +209,27 @@ async fn a_member_reads_the_same_switches_as_a_guest() {
     assert_eq!(guest["wizard_unix_daemon"], true);
     assert_eq!(guest["wizard_pairing"], false);
 }
+
+/// FR-129 C2 — a format that is neither the EXE nor the zip is refused before
+/// anything is looked up: the 400 names the two, on the download and on its
+/// manifest alike, never a silent guess at which file was meant.
+#[tokio::test]
+async fn an_unknown_setup_format_is_a_400_that_names_the_two() {
+    let app = TestApp::spawn().await;
+    for route in [
+        "/api/setup/windows?format=bogus",
+        "/api/setup/windows/health?format=bogus",
+    ] {
+        let response = reqwest::Client::new()
+            .get(app.url(route))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(response.status().as_u16(), 400, "{route}");
+        let body = response.text().await.unwrap();
+        assert!(
+            body.contains("exe") && body.contains("zip"),
+            "{route}: {body}"
+        );
+    }
+}
