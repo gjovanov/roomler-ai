@@ -224,7 +224,7 @@ prevent, and the guard re-asserts it on every tick.
   although every agent row has one (`models.rs:2110`).
 - `approved_routes` survives a rejoin on purpose (`crates/services/src/dao/overlay_node.rs:239-241`), and the netmap
   fans `approved_routes` without intersecting what the node still advertises
-  (`crates/modules/network/src/overlay.rs:2651`). A client accepts any peer whose fanned routes hold `/0`
+  (`crates/modules/network/src/overlay.rs:2714`). A client accepts any peer whose fanned routes hold `/0`
   (`route_guard.rs:303-304`). So an exit that stops offering, on any OS, stays an exit in its clients' netmaps until
   an admin un-approves it. ⚠️ A device-side fix alone cannot close the black hole.
 

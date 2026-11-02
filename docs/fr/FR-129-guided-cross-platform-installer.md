@@ -37,7 +37,7 @@ signup page or says where a token comes from. To get one, a new person must:
 3. log in;
 4. create an org, unless they filled the optional org fields at signup (`auth.rs:226-231`);
 5. find Devices → Enroll device, which mints a **10-minute single-use** token
-   (`crates/modules/fleet/src/agent.rs:24`, `:90-140`, behind `MANAGE_AGENTS`);
+   (`crates/modules/fleet/src/agent.rs:25`, `:113-164`, behind `MANAGE_AGENTS`);
 6. copy it — the dialog says "then paste the token into the wizard"
    (`ui/src/components/enroll/EnrollmentDialog.vue:119`);
 7. get back to the wizard and paste it before the 10 minutes run out.

@@ -257,7 +257,7 @@ sequenceDiagram
 
 | `reason` | the server sends it when | `roomler status` says |
 |---|---|---|
-| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:436-439`](../crates/modules/network/src/overlay.rs#L436-L439)) | retrying will not help; an operator has to act |
+| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:462-465`](../crates/modules/network/src/overlay.rs#L462-L465)) | retrying will not help; an operator has to act |
 | `network_unavailable` | the tenant's network row cannot be read or created, or an allocated ordinal falls outside the network's address space | retrying will not help; an operator has to act |
 | `store_unavailable` | any other allocation failure: a store fault | transient — a retry may succeed |
 | `unknown` | a reason this build does not know, from a newer server | retrying will not help; an operator has to act |
