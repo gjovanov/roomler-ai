@@ -103,12 +103,12 @@ Two settings decide it:
 | Setting | What it must be |
 |---|---|
 | The **announced IP** | The address browsers should send media to. `127.0.0.1` works only for calls made on the host itself. |
-| The **RTC port range** | 32 ports are mapped by default — enough to try it. A real deployment wants the full range. |
+| The **RTC port range** | 32 ports are mapped by default — enough to try it. A real deployment widens it. |
 
-On **Linux**, the clean answer is host networking: give the `roomler` service
-`network_mode: host` and drop its `ports:` block, and the whole range is
-reachable. That is how the hosted service runs. It is not available on Docker
-Desktop for macOS or Windows, which is why the port-mapped form is the default.
+To widen the range, change `40000-40031` in the `netns` service's `ports:` and
+`ROOMLER__MEDIASOUP__RTC_MAX_PORT` together. Don't give the `roomler` service
+`network_mode: host` with this compose file: the service names stop resolving
+there, so the server can't reach its database and the web port answers 502.
 
 ## Optional integrations
 
@@ -123,7 +123,8 @@ All off by default; each is a block of environment variables:
 
 ## Upgrading and backups
 
-Upgrading is `pull` then `up -d`. State lives in the MongoDB and MinIO volumes —
+Upgrading is `git pull`, then `pull`, then `up -d`: the compose file names exact image
+versions, so `git pull` is what moves them. State lives in the MongoDB and MinIO volumes —
 back those up, not the container.
 
 ## Known limitations, stated plainly

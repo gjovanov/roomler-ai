@@ -34,12 +34,12 @@
 # unaffected by any of the above — they are peer-to-peer with a relay fallback.
 
 # ── Why the images are pinned ─────────────────────────────────────────────────
-# Each image below names an exact version and a digest, so `pull` gets the bytes
-# this file was tested with. A moving tag broke fresh installs twice: `minio/minio`
-# left Docker Hub (#2034), and a new `coturn/coturn:latest` dropped a flag used
-# below (#3287). A digest names the multi-architecture index, so amd64 and arm64
-# hosts both resolve it. The cost is yours to know: upstream patches reach you
-# only when this file moves, through `git pull` and then `pull`.
+# Each image below names an exact version, and all but our own name a digest, so
+# `pull` gets the bytes this file was tested with. A moving tag broke fresh installs
+# twice: `minio/minio` left Docker Hub (#2034), and a new `coturn/coturn:latest`
+# dropped a flag used below (#3287). A digest names the multi-architecture index,
+# so amd64 and arm64 hosts both resolve it. The cost is yours to know: upstream
+# patches reach you only when this file moves, through `git pull` and then `pull`.
 # docs/self-hosting.md has the table, and how to move one yourself.
 
 services:
@@ -160,8 +160,11 @@ services:
     # minutes this image exists to save.
     #
     # `build:` stays because it is the AGPL promise in practice: the published
-    # image must never be the only way to run the server.
-    image: ${ROOMLER_IMAGE:-ghcr.io/gjovanov/roomler-ai:latest}
+    # image must never be the only way to run the server. It is also why this
+    # image has an exact tag and no digest: `up -d --build` cannot tag a build with
+    # one (`failed to solve: build tag cannot contain a digest`). A release moves
+    # this default in a commit, so `git pull` then `pull` is the upgrade.
+    image: ${ROOMLER_IMAGE:-ghcr.io/gjovanov/roomler-ai:v0.4.197}
     build:
       context: .
       args:

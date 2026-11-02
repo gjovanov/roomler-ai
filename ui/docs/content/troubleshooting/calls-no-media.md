@@ -57,13 +57,13 @@ port range. No proxy is involved and none can help.
 Two settings decide whether anything arrives:
 
 - **The announced address** — what browsers should send to. `127.0.0.1` works only for a call made on the host itself.
-- **The RTC port range** — a small range is mapped by default, enough to try it. A real deployment wants the full range reachable.
+- **The RTC port range** — a small range is mapped by default, enough to try it. A real deployment widens it.
 :::
 
-On **Linux**, host networking is the clean fix: give the service
-`network_mode: host` and drop its port mappings. That is how the hosted service
-runs. It is unavailable on Docker Desktop for macOS and Windows, which is why
-the port-mapped form is the default.
+To widen the range, change `40000-40031` in the `netns` service's `ports:` and
+`ROOMLER__MEDIASOUP__RTC_MAX_PORT` together. Don't give the `roomler` service
+`network_mode: host` with this compose file: the service names stop resolving
+there, so the server can't reach its database and the web port answers 502.
 
 Check the announced address first:
 

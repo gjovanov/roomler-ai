@@ -27,11 +27,13 @@ bad() {
 # ── every image is pinned ────────────────────────────────────────────────────
 # A digest, in both compose files. The one exception is the Roomler image, whose
 # default is a tag we publish ourselves: a digest there breaks `up -d --build`,
-# which cannot tag a build with one, and the source build is the AGPL promise.
+# which cannot tag a build with one, and the source build is the AGPL promise. It
+# still has to be an exact tag, or `git pull` stops being what moves it.
 for f in docker-compose.selfhost.yml docker-compose.yml; do
   while IFS= read -r ref; do
     case "$ref" in
-      '${ROOMLER_IMAGE:-'*) ;;
+      '${ROOMLER_IMAGE:-'*':v'[0-9]*'}') ;;
+      '${ROOMLER_IMAGE:-'*) bad "$f defaults the Roomler image to '$ref', not an exact v* tag" ;;
       *@sha256:*) ;;
       *) bad "$f names '$ref' with no digest: the next upstream push reaches every fresh install" ;;
     esac
