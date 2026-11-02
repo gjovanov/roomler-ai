@@ -53,6 +53,13 @@ fn main() {
     // and sets the same rule for what loads after this. MSVC's `link.exe` only.
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo:rustc-link-arg-bin=roomler-setup=/DEPENDENTLOADFLAG:0x800");
+        // That flag covers the EXE's imports, not theirs. `secur32.dll`, which
+        // TLS brings in, carries no such flag, so with it in the import table
+        // its `SSPICLI.DLL` came from the EXE's folder, limited and elevated,
+        // before `main` could run (measured, the spec's log). Delay-loaded, it
+        // loads on first use, after `restrict_dll_search`, from System32 alone.
+        println!("cargo:rustc-link-arg-bin=roomler-setup=/DELAYLOAD:secur32.dll");
+        println!("cargo:rustc-link-arg-bin=roomler-setup=delayimp.lib");
     }
     tauri_build::build()
 }
