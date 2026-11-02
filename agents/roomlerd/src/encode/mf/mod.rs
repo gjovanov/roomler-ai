@@ -122,6 +122,9 @@ pub struct MfEncoder {
     /// startup. Consulted by `VideoEncoder::is_hardware`; the peer media
     /// pump reads that to trigger auto-downscale on SW HEVC at 4K.
     backend_kind: &'static str,
+    /// #3267 — the worker, so the capability probe can wait out its teardown
+    /// ([`MfEncoder::shut_down_within`]). Nothing else joins it.
+    worker: thread::JoinHandle<()>,
 }
 
 /// #2283 — the backend kind of the default-adapter software MFT when it
@@ -180,11 +183,20 @@ impl MfEncoder {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("mf-encoder: require non-zero, even dimensions, got {width}x{height}");
         }
+        // #3267 — every MF open comes through here, the probe's and a
+        // session's, and a session's is in the daemon.
+        if crate::encode::cells::cell_denied(
+            &crate::encode::cells::denied_cells(),
+            codec.cell_name(),
+            roomler_ai_remote_control::models::ChromaFormat::Yuv420,
+        ) {
+            bail!("{}:yuv420 is on the device denylist", codec.cell_name());
+        }
 
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<&'static str>>();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<Cmd>();
 
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name(format!("roomlerd-mf-encoder-{}", codec.backend_name()))
             .spawn(move || {
                 // 1. Initialise COM for this thread. MTA because MF is
@@ -233,7 +245,19 @@ impl MfEncoder {
             height,
             codec,
             backend_kind,
+            worker,
         })
+    }
+
+    /// #3267 — end the encoder and wait up to `limit` for its worker to finish
+    /// the teardown. Polled, because a thread has no timed join; a teardown
+    /// that outlasts the limit runs on, as it does after a plain drop.
+    pub(crate) fn shut_down_within(self, limit: std::time::Duration) {
+        let _ = self.cmd_tx.send(Cmd::Shutdown);
+        let deadline = std::time::Instant::now() + limit;
+        while !self.worker.is_finished() && std::time::Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// #2283 — did the cascade end on Microsoft's software MFT with no GPU
@@ -402,6 +426,113 @@ const fn windows_mf_version() -> u32 {
 
 /// FR-130 P1 — what each Media Foundation encoder on this host writes about
 /// colour, read from its own output.
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::{MfEncoder, VideoEncoder};
+    use crate::capture::{Damage, Frame, FrameData, PixelFormat};
+    use std::mem::{size_of, zeroed};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentProcessId, GetProcessHandleCount,
+    };
+
+    fn threads() -> u32 {
+        // SAFETY: the snapshot is ours and closed below, and `entry` carries
+        // its own size, as the walk requires.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            assert_ne!(snapshot, INVALID_HANDLE_VALUE);
+            let me = GetCurrentProcessId();
+            let mut entry: THREADENTRY32 = zeroed();
+            entry.dwSize = size_of::<THREADENTRY32>() as u32;
+            let mut count = 0;
+            let mut more = Thread32First(snapshot, &mut entry);
+            while more != 0 {
+                if entry.th32OwnerProcessID == me {
+                    count += 1;
+                }
+                more = Thread32Next(snapshot, &mut entry);
+            }
+            CloseHandle(snapshot);
+            count
+        }
+    }
+
+    fn handles() -> u32 {
+        let mut count = 0;
+        // SAFETY: the pseudo-handle is always valid and `count` outlives the call.
+        unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+        count
+    }
+
+    fn black_frame() -> Arc<Frame> {
+        let (width, height) = (1280, 720);
+        Arc::new(Frame {
+            width,
+            height,
+            stride: width * 4,
+            pixel_format: PixelFormat::Bgra,
+            data: FrameData::Cpu(vec![0; (width * height * 4) as usize]),
+            monotonic_us: 0,
+            monitor: 0,
+            damage: Damage::Unknown,
+            source: None,
+        })
+    }
+
+    /// Opens an encoder, encodes through it and closes it, then gives its
+    /// worker time to end. The frames matter: the cascade ends its losers as
+    /// it returns, after its own probe, so only a frame sent now shows that the
+    /// winner survived that.
+    async fn cycle() -> bool {
+        let Ok(mut encoder) = MfEncoder::new_h264(1280, 720) else {
+            return false;
+        };
+        let mut encoded = 0;
+        for _ in 0..3 {
+            let packets = encoder.encode(black_frame()).await.expect("encode");
+            encoded += packets.iter().map(|p| p.data.len()).sum::<usize>();
+        }
+        assert!(encoded > 0, "the winner took frames and produced nothing");
+        drop(encoder);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        true
+    }
+
+    /// Every resolution change opens an encoder, so a session runs this cycle
+    /// several times. Ignored because it counts the whole process: run it alone,
+    /// on a host with the drivers to show it, with
+    /// `cargo test -p roomlerd --lib --features mf-encoder -- --ignored closed_encoder`.
+    #[tokio::test]
+    #[ignore = "counts the process's threads, so it needs the binary to itself"]
+    async fn a_closed_encoder_leaves_no_threads_behind() {
+        const CYCLES: usize = 6;
+        // The first open loads the drivers and their long-lived pools.
+        if !cycle().await {
+            eprintln!("no MF H.264 encoder here — nothing to measure");
+            return;
+        }
+        let (threads_before, handles_before) = (threads(), handles());
+        eprintln!("after the first cycle: {threads_before} threads, {handles_before} handles");
+        for i in 0..CYCLES {
+            assert!(
+                cycle().await,
+                "the encoder opened once and then stopped opening"
+            );
+            eprintln!("cycle {i}: {} threads, {} handles", threads(), handles());
+        }
+        let threads_grew = threads().saturating_sub(threads_before);
+        let handles_grew = handles().saturating_sub(handles_before);
+        assert!(threads_grew <= 8, "{threads_grew} threads left behind");
+        assert!(handles_grew <= 120, "{handles_grew} handles left behind");
+    }
+}
+
 #[cfg(test)]
 mod colour_tests {
     use super::activate::for_each_pipeline;

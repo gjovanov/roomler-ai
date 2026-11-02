@@ -64,6 +64,15 @@ impl OutputCodec {
         }
     }
 
+    /// #3267 — the name the denylist knows this cell by.
+    pub(crate) fn cell_name(&self) -> &'static str {
+        match self {
+            Self::H264 => crate::encode::cells::MF_H264,
+            Self::Hevc => crate::encode::cells::MF_HEVC,
+            Self::Av1 => crate::encode::cells::MF_AV1,
+        }
+    }
+
     fn subtype_guid(&self) -> GUID {
         match self {
             Self::H264 => MFVideoFormat_H264,
@@ -74,6 +83,7 @@ impl OutputCodec {
 }
 
 use super::super::EncodedPacket;
+use super::activate::HwMftCandidate;
 use crate::capture::Frame;
 use crate::encode::color;
 use crate::encode::color_desc::{self, MfAttributes};
@@ -90,6 +100,9 @@ const TARGET_FPS: u32 = TARGET_FPS_NUM / TARGET_FPS_DEN;
 
 /// MF pipeline owner. Everything COM-touching lives in here, on the worker.
 pub(super) struct MfPipeline {
+    /// The MFT's activation, when the cascade won it. Declared first so it
+    /// drops first: the MFT ends while the transform and device are still held.
+    activation: Option<HwMftCandidate>,
     transform: IMFTransform,
     codec_api: ICodecAPI,
     /// D3D11 device + DXGI manager kept alive for the MFT's lifetime.
@@ -124,6 +137,11 @@ pub(super) struct MfPipeline {
 impl MfPipeline {
     pub(super) fn backend_kind(&self) -> &'static str {
         self.backend_kind
+    }
+
+    /// The winner stays activated for as long as this runs, and ends with it.
+    pub(super) fn keep_activation(&mut self, candidate: HwMftCandidate) {
+        self.activation = Some(candidate);
     }
 }
 
@@ -254,6 +272,7 @@ impl MfPipeline {
             );
 
             Ok(Self {
+                activation: None,
                 transform,
                 codec_api,
                 _d3d_device: d3d_device,

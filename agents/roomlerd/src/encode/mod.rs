@@ -516,15 +516,17 @@ pub fn bg_rebuild_constrained_enabled() -> bool {
     tunnel_core::env::node_env("BG_REBUILD_CONSTRAINED").as_deref() != Some("0")
 }
 
-/// FR-65 P0 — the pump stall watch. Default **on**: it costs two `Instant::now()`
-/// per loop iteration (~20-40 ns each against a 16.7 ms frame budget at 60 fps)
-/// and logs nothing until an iteration actually overruns.
+/// FR-65 P0 — the pump stall watch. Default **on**: its cost is MEASURED, by
+/// `roomlerd stall-watch-cost` on the host in question (`encode::stall::cost`) —
+/// on NEO16 2026-10-30 at most 1.09 µs a pass, 0.035 % of the frame budget at
+/// the fleet's busiest pass rate — and it logs nothing until a pass overruns.
 ///
 /// 🔑 Its absence is why a 2 s encoder open hid for months. The pump already
 /// measured `capture`/`scale`/`encode`/`send`, and the stall appeared in NONE of
 /// them: the apply/rebuild phase was untimed, and a per-heartbeat AVERAGE cannot
 /// represent a single outlier even where it is counted. `ROOMLERD_PUMP_STALL_WATCH=0`
-/// disables.
+/// disables — and, since FR-79, blinds the governor's `agent_stalled` gate too
+/// (`docs/stall-watch.md` §4).
 pub fn pump_stall_watch_enabled() -> bool {
     tunnel_core::env::node_env("PUMP_STALL_WATCH").as_deref() != Some("0")
 }

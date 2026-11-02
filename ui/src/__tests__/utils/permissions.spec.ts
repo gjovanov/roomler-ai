@@ -17,6 +17,9 @@ import {
   canManageInvites,
   canViewExecAudit,
   canViewSshAudit,
+  canViewExternalAudit,
+  canBarExternalPerson,
+  canLetBackExternalPerson,
   canQueryAnalytics,
   canSeeFleetNav,
   describePermissions,
@@ -255,6 +258,30 @@ describe('canQueryAnalytics (org analytics gating — stats PR-4)', () => {
   it('plain member denied', () => {
     expect(canQueryAnalytics(DEFAULT_MEMBER, false)).toBe(false)
     expect(canQueryAnalytics(0, false)).toBe(false)
+  })
+})
+
+describe('external access (FR-52 P5): the gates of the server, as the page draws them', () => {
+  const byKey = (key: string) => PERMISSION_FLAGS.find((p) => p.key === key)!.bit
+  const VIEW_REMOTE_AUDIT = byKey('VIEW_REMOTE_AUDIT')
+  const MANAGE_AGENTS = byKey('MANAGE_AGENTS')
+  const REMOTE_CONTROL = byKey('REMOTE_CONTROL')
+
+  it('the log and the list read under VIEW_REMOTE_AUDIT alone', () => {
+    expect(canViewExternalAudit(VIEW_REMOTE_AUDIT, false)).toBe(true)
+    expect(canViewExternalAudit(MANAGE_AGENTS, false)).toBe(false)
+    expect(canViewExternalAudit(null, false)).toBe(false)
+    expect(canViewExternalAudit(null, true)).toBe(true)
+  })
+
+  it('barring takes MANAGE_AGENTS, and letting back takes the pair', () => {
+    expect(canBarExternalPerson(MANAGE_AGENTS, false)).toBe(true)
+    expect(canLetBackExternalPerson(MANAGE_AGENTS, false)).toBe(false)
+    expect(canLetBackExternalPerson(MANAGE_AGENTS | REMOTE_CONTROL, false)).toBe(true)
+    expect(canBarExternalPerson(REMOTE_CONTROL, false)).toBe(false)
+    expect(canLetBackExternalPerson(REMOTE_CONTROL, false)).toBe(false)
+    expect(canBarExternalPerson(null, false)).toBe(false)
+    expect(canLetBackExternalPerson(null, false)).toBe(false)
   })
 })
 

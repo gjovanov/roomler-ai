@@ -35,18 +35,21 @@ use roomler_ai_remote_control::knowhow::{
 use roomler_ai_remote_control::models::DestinationRule;
 use roomler_ai_remote_control::signaling::ClientMsg;
 use roomler_node_core::probe_reach;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::rustls;
 use tracing::{info, warn};
 
+use super::device::{InDaemon, Measure};
+
 /// Answers kept, so a probe delivered again is answered as it was, never run
 /// twice.
 const ANSWERS_KEPT: usize = 16;
 
 /// What the server asked.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Asked {
     pub id: ObjectId,
     pub kind: String,
@@ -55,12 +58,58 @@ pub struct Asked {
     pub sni: Option<String>,
 }
 
+/// FR-90 P8-2d-0 — what one probe saw, as data: what `rc:knowhow.probed`
+/// carries but the probe's id. The device's parts measure ([`Measure`]); the
+/// daemon's prober, which asked, speaks the frame ([`Self::answer`]), its
+/// detail held to the wire's bound there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Probed {
+    pub(crate) outcome: ProbeOutcome,
+    pub(crate) rtt_ms: Option<u32>,
+    pub(crate) address: Option<IpAddr>,
+    pub(crate) tls: Option<ProbeTls>,
+    pub(crate) detail: Option<String>,
+}
+
+impl Probed {
+    fn of(
+        outcome: ProbeOutcome,
+        rtt_ms: Option<u32>,
+        address: Option<IpAddr>,
+        tls: Option<ProbeTls>,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            outcome,
+            rtt_ms,
+            address,
+            tls,
+            detail,
+        }
+    }
+
+    /// `rc:knowhow.probed` for probe `id`, saying what was seen.
+    pub(crate) fn answer(self, id: ObjectId) -> ClientMsg {
+        reply(
+            id,
+            self.outcome,
+            self.rtt_ms,
+            self.address,
+            self.tls,
+            self.detail,
+        )
+    }
+}
+
 /// The primary's prober: `knowhow_probe_reach` read from `config` under
-/// `lock` at each probe, each probe run once.
+/// `lock` at each probe, each probe run once. FR-90 P8-2d-0 — what the probe
+/// reaches is the device's parts' to measure, through `measure`; the prober
+/// itself, what it was asked and what it answered, stays the daemon's.
 pub struct Prober {
     config: PathBuf,
     lock: crate::config::WriteLock,
     state: Mutex<State>,
+    measure: Arc<dyn Measure>,
 }
 
 #[derive(Default)]
@@ -79,6 +128,7 @@ impl Prober {
             config,
             lock,
             state: Mutex::new(State::default()),
+            measure: Arc::new(InDaemon),
         })
     }
 
@@ -141,7 +191,11 @@ impl Prober {
             }
         };
         let rules = probe_reach::rules(&cfg.knowhow_probe_reach);
-        let answer = measure(asked, &rules).await;
+        let answer = self
+            .measure
+            .measure(asked.clone(), rules)
+            .await
+            .answer(asked.id);
         if let ClientMsg::KnowhowProbed {
             outcome,
             rtt_ms,
@@ -254,9 +308,15 @@ fn ms(d: Duration) -> u32 {
 
 /// One probe within `rules`, pure of the config: resolve, check, connect to
 /// what was checked, and for `tls` the handshake. Its answer.
+#[cfg(test)]
 pub(crate) async fn measure(asked: &Asked, rules: &[DestinationRule]) -> ClientMsg {
-    let id = asked.id;
-    let no = |outcome, why: String| reply(id, outcome, None, None, None, Some(why));
+    probe(asked, rules).await.answer(asked.id)
+}
+
+/// FR-90 P8-2d-0 — [`measure`], as what the device's parts return for it:
+/// what the probe saw, the frame the daemon's to speak.
+pub(crate) async fn probe(asked: &Asked, rules: &[DestinationRule]) -> Probed {
+    let no = |outcome, why: String| Probed::of(outcome, None, None, None, Some(why));
     let deadline = Instant::now() + Duration::from_secs(probe_limits::TIMEOUT_SECS);
     let Some(kind) = ProbeKind::from_word(&asked.kind) else {
         return no(
@@ -348,24 +408,22 @@ pub(crate) async fn measure(asked: &Asked, rules: &[DestinationRule]) -> ClientM
                 return match kind {
                     ProbeKind::Tcp => {
                         drop(tcp);
-                        reply(id, ProbeOutcome::Ok, Some(rtt), Some(ip), None, None)
+                        Probed::of(ProbeOutcome::Ok, Some(rtt), Some(ip), None, None)
                     }
                     ProbeKind::Tls => {
                         let shake = handshake(tcp, asked.sni.as_deref(), ip);
                         match tokio::time::timeout(left(deadline), shake).await {
                             Ok(Ok(seen)) => {
-                                reply(id, ProbeOutcome::Ok, Some(rtt), Some(ip), Some(seen), None)
+                                Probed::of(ProbeOutcome::Ok, Some(rtt), Some(ip), Some(seen), None)
                             }
-                            Ok(Err(e)) => reply(
-                                id,
+                            Ok(Err(e)) => Probed::of(
                                 ProbeOutcome::Failed,
                                 Some(rtt),
                                 Some(ip),
                                 None,
                                 Some(format!("the TLS handshake failed: {e}")),
                             ),
-                            Err(_) => reply(
-                                id,
+                            Err(_) => Probed::of(
                                 ProbeOutcome::Failed,
                                 Some(rtt),
                                 Some(ip),
@@ -384,14 +442,7 @@ pub(crate) async fn measure(asked: &Asked, rules: &[DestinationRule]) -> ClientM
         }
     }
     let (ip, why) = last.unwrap_or((addrs[0], "no address answered".into()));
-    reply(
-        id,
-        ProbeOutcome::Unreachable,
-        None,
-        Some(ip),
-        None,
-        Some(why),
-    )
+    Probed::of(ProbeOutcome::Unreachable, None, Some(ip), None, Some(why))
 }
 
 /// The handshake, reading the leaf certificate: its names and its SHA-256.
