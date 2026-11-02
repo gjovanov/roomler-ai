@@ -1449,6 +1449,17 @@ jobs:
           cargo check -p roomlerd --lib --bins --features hive,vault
           cargo test -p roomlerd --lib --features hive,vault,clipboard,enigo-input -- hive:: vault:: vault_proxy:: macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock::
 
+      # #3304 — what macOS SHIPS is `hive` with no `vault` (release-agent.yml), and
+      # `vault` is what turns on `cfg(worker_calls)` (agents/roomlerd/build.rs). The
+      # step above builds both, so this flavour's macOS arms compiled nowhere before a
+      # release tag. Windows has the same gap: windows-shipped-flavour, below.
+      - name: cargo check agent as macOS ships it (hive, no vault)
+        run: cargo check -p roomlerd --lib --bins --features hive
+      - name: Agent sessions as macOS ships them, unit tests (hive, no vault)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test -p roomlerd --lib --features hive -- hive::
+
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the
       # canaries). Still named, so the recorder's macOS arms (the unix
@@ -1789,6 +1800,70 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         with:
           family: windows-sessions
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
+  windows-shipped-flavour:
+    # #3304 — the flavour Windows ships had no lane. release-agent.yml builds
+    # `hive` WITHOUT `vault`, and `vault` is what turns on `cfg(worker_calls)`
+    # (agents/roomlerd/build.rs), so the two flavours differ by far more than a
+    # few items, and every FR-90 P8 step widens that. Both Windows lanes above
+    # build `hive,vault`, so nothing linted or tested what actually ships.
+    #
+    # The release's list, less its media half (`full-hw`, `vp9-444`,
+    # `ffmpeg-encoder`), for the reason windows-agent-sessions gives. Its
+    # `overlay-netstack` is implied by `ssh-server`.
+    name: Windows as shipped (hive, no vault)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
+    runs-on: windows-latest
+    timeout-minutes: 40
+    # A master push publishes this job's cargo cache as a release asset
+    # (ci-seed-save), which needs `contents: write`.
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+
+      - name: Salt the cargo cache key with this job's definition
+        uses: ./.github/actions/cargo-cache-salt
+
+      - name: Restore the cargo cache (release-asset store)
+        id: seed
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: windows-shipped
+
+      - name: Clippy roomlerd as Windows ships it (incl. tests)
+        run: cargo clippy -p roomlerd --features overlay-l3,ssh-server,hive,system-context --tests -- -D warnings
+
+      # Runs even when clippy failed: the two prove different halves, and one
+      # red must not hide the other's evidence.
+      - name: Agent sessions as Windows ships them, unit tests
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,system-context --no-fail-fast -- hive::
+
+      # FR-6 wave 22 (#773): the job's LAST step. Only a master push
+      # publishes, and an unchanged cache is not re-uploaded; see the action.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: windows-shipped
           key: ${{ steps.seed.outputs.key }}
           exact: ${{ steps.seed.outputs.exact }}
 
