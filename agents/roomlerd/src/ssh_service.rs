@@ -946,10 +946,15 @@ async fn answer_here(ask: ConsentAsk, asker: &crate::ssh::Asker) -> ConsentAnswe
         _ if !crate::exec_service::valid_object_id(&ask.sentinel) => {
             Err("the SYSTEM service asked about a malformed grant".to_string())
         }
-        crate::ssh::Asker::Here { broker, indicator } => {
+        crate::ssh::Asker::Here {
+            broker,
+            indicator,
+            companion,
+        } => {
             crate::ssh::ask_here(
                 broker,
                 indicator,
+                *companion,
                 &clean_reason(&ask.caller),
                 &ask.sentinel,
                 &clean_reason(&ask.what),

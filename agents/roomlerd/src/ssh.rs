@@ -129,6 +129,12 @@ pub enum Asker {
         /// SSH prompt from mars timed out on a desktop whose native panel had
         /// just served three exec prompts in a row.
         indicator: crate::indicator::ViewerIndicator,
+        /// Whether the desktop companion can show the question: started if it
+        /// is installed and not running. [`Companion::System`] in the daemon;
+        /// a test holds its start open with a fixed one (#3442).
+        ///
+        /// [`Companion::System`]: crate::companion::Companion::System
+        companion: crate::companion::Companion,
     },
     /// FR-105 — the worker on the other end of this connection asks: the
     /// SYSTEM service's server, one relay per connection.
@@ -2269,8 +2275,15 @@ mod sshd {
             )
             .await;
         match asker {
-            Asker::Here { broker, indicator } => {
-                ask_here(broker, indicator, caller, sentinel, what, timeout).await
+            Asker::Here {
+                broker,
+                indicator,
+                companion,
+            } => {
+                ask_here(
+                    broker, indicator, *companion, caller, sentinel, what, timeout,
+                )
+                .await
             }
             Asker::Worker(relay) => {
                 let verdict = relay.ask(sentinel, caller, what, timeout).await;
@@ -2296,6 +2309,7 @@ mod sshd {
     pub(crate) async fn ask_here(
         broker: &crate::consent::ConsentBroker,
         indicator: &crate::indicator::ViewerIndicator,
+        companion: crate::companion::Companion,
         caller: &str,
         sentinel: &str,
         what: &str,
@@ -2349,12 +2363,7 @@ mod sshd {
             // refusal below say "nobody could be asked" instead of "nobody
             // answered" — different fixes, and the caller cannot tell them
             // apart afterwards.
-            let companion_up = tokio::time::timeout(
-                crate::signaling::COMPANION_START_BUDGET,
-                crate::companion::ensure_running(),
-            )
-            .await
-            .unwrap_or(false);
+            let companion_up = companion.up().await;
             // FR-93 P6f — the last on-screen surface, as for a screen-control
             // request: a desktop notification where the companion cannot show
             // the question.
@@ -3150,6 +3159,13 @@ mod tests {
     /// daemon hands the server — the startup mode is irrelevant because the
     /// server always prompts with an explicit per-session mode.
     fn test_services() -> super::SessionServices {
+        // No companion: a test must never start the real app.
+        test_services_with(crate::companion::Companion::Fixed(false))
+    }
+
+    /// [`test_services`] with the companion a test needs: one that is still
+    /// starting while the question is up, for one (#3442).
+    fn test_services_with(companion: crate::companion::Companion) -> super::SessionServices {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3163,6 +3179,7 @@ mod tests {
                 broker: crate::consent::ConsentBroker::new(crate::consent::Mode::AutoGrant, dir)
                     .expect("a temp sentinel dir"),
                 indicator: crate::indicator::ViewerIndicator::disabled(),
+                companion,
             },
             // Reporting off in tests unless a case opts in — the default a
             // device ships with.

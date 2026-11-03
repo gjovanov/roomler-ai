@@ -1948,6 +1948,7 @@ async fn connect_once(
             asker: crate::ssh::Asker::Here {
                 broker: consent_broker.clone(),
                 indicator: indicator.clone(),
+                companion: crate::companion::Companion::System,
             },
             activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
         },
@@ -2201,6 +2202,7 @@ async fn connect_once(
                             asker: crate::ssh::Asker::Here {
                                 broker: consent_broker.clone(),
                                 indicator: indicator.clone(),
+                                companion: crate::companion::Companion::System,
                             },
                             activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
                         },
