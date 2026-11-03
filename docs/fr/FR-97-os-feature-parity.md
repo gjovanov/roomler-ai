@@ -1078,7 +1078,7 @@ model on Windows, so the three agree on what the mode means.
   must never see: it would ignore it and run the command as root. So the agent advertises `console-user` (every
   Unix build, never Windows), the policy `PUT` stores `console_user` off Windows only for an agent whose hello
   carried it, `authorize` checks the live connection, and the hub refuses to push the field to a connection
-  without the word (`hub.rs:3709`). SSH's half fails closed on its own: an older agent refuses the mode.
+  without the word (`hub.rs:3792`). SSH's half fails closed on its own: an older agent refuses the mode.
 
 **P5b (built).** P5a's field run found every session as a person starting in `/`, the daemon's directory, for
 `named` too, where sshd starts it in the home. Now the shell, an SSH command and `sftp` start in the person's home:
@@ -1095,7 +1095,7 @@ model on Windows, so the three agree on what the mode means.
 ### 3.11 P6 — install, update, ops
 
 - **P6a, the artifact's own version (built).** Each format states its version inside the bytes its `.asc` signs, and
-  `download_asset` refuses when that disagrees with the tag `is_newer` read (`updater.rs:1691`), as it always has for
+  `download_asset` refuses when that disagrees with the tag `is_newer` read (`updater.rs:1704`), as it always has for
   the MSI:
   - the `.deb`: its control `Version` through `dpkg-deb --field` (`artifact_version.rs:288`), from the dpkg the
     updater requires before it picks a `.deb`; cargo-deb's revision (`0.4.142-1`) and any epoch are dropped;
