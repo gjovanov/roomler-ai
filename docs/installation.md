@@ -96,7 +96,7 @@ which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
 - `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:396`);
-- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1556`).
+- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1569`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
@@ -135,13 +135,13 @@ new name. Two changes close it:
 | Where | What it does |
 |---|---|
 | the daemon's start (`agents/roomlerd/src/app.rs:3790`, `crates/agent-core/src/config.rs:4171`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
-| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:634`, `:966`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
+| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:651`, `:983`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
 administrator.** After its first healthy run the daemon hardens that config's
 folder to SYSTEM and Administrators (#3073), and a wizard that is not elevated
 cannot open it. The wizard says so on its first page, before a token is pasted
-or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1157`), and the
+or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1174`), and the
 install refuses it before anything is downloaded (`:290`). Before the enroll it
 also stops on a config it may not read (`:634`, never reported as a damaged
 config) or a folder it may not write (`:640`). The token is never spent on a
@@ -843,7 +843,7 @@ sequenceDiagram
 
 **Auto-updates and upgrades** (the open question in #3115). The updater does
 not stop the service before it runs msiexec. `spawn_installer_with_watch`
-(`agents/roomlerd/src/updater.rs:1892`) launches `msiexec /i … /qn` elevated
+(`agents/roomlerd/src/updater.rs:1905`) launches `msiexec /i … /qn` elevated
 (`:2236`, `:2636`) while the service runs; the worker that launched it exits 0,
 and its host stays up (`:593`). Measured on a vmtest Win11 cell, released code,
 with each stop held to the field's 7.8 s:
@@ -977,7 +977,7 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 
 The daemon's `.deb` has to start on a host with nothing on it: a bare server, a
 container, a cluster node. FFmpeg, libvpx and libva ride in the package, so
-`depends` is short (`agents/roomlerd/Cargo.toml:1024`), and every name in it backs
+`depends` is short (`agents/roomlerd/Cargo.toml:1026`), and every name in it backs
 a library the binary links directly:
 
 | `Depends` | Why it reads this way |
@@ -1006,7 +1006,7 @@ alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives fro
 the binary's symbols.
 
 Neither floor can strand a running daemon on the updater's offline `dpkg --install`
-rung (`agents/roomlerd/src/updater.rs:2300`), which is the reason libva and
+rung (`agents/roomlerd/src/updater.rs:2313`), which is the reason libva and
 `iproute2` stay out of `depends`. A host where the daemon runs already has the real
 library and OpenSSL, because without them it cannot start. A healthy install
 upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,

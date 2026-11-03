@@ -362,7 +362,7 @@ installed. Measured on 0.4.143 before the fix: a feed offering `agent-v0.4.999`
 with the signed 0.4.142 `.deb` passed the `.asc` gate and was staged for
 install (FR-97 §8). Each format now states its own version inside the signed
 bytes, and the updater refuses when it disagrees with the tag
-(`updater.rs:1691`):
+(`updater.rs:1704`):
 
 | Format | Where the artifact states its version | Read by | Anchor |
 |---|---|---|---|
