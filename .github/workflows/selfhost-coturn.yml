@@ -83,7 +83,9 @@ jobs:
             sleep 2
             s="$("${dc[@]}" ps -q roomler)"; c="$("${dc[@]}" ps -q coturn)"
             [ -n "$s" ] && [ -n "$c" ] || continue
-            a="$(docker exec "$c" readlink /proc/self/ns/net 2>/dev/null)"
+            # A coturn its healthcheck is restarting is still listed, and its exec fails: under
+            # the step's `bash -e` a failed assignment ended the step with no output.
+            a="$(docker exec "$c" readlink /proc/self/ns/net 2>/dev/null || true)"
             [ -n "$a" ] && [ "$a" = "$(docker exec "$s" readlink /proc/self/ns/net 2>/dev/null)" ] && break
           done
           bash scripts/selfhost-coturn-check.sh --file docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost-public.env"

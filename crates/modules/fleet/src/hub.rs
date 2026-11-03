@@ -2555,6 +2555,28 @@ impl Hub {
         principal: ObjectId,
         tenant_id: ObjectId,
     ) -> usize {
+        self.terminate_external(tenant_id, |s| {
+            s.agent_id == agent_id && s.controller_user_id == principal
+        })
+    }
+
+    /// FR-52 decision 16 — the same for everyone on one device: its approval was
+    /// cleared (gate 2), so nobody's session there has any standing left.
+    pub fn terminate_external_on(&self, agent_id: ObjectId, tenant_id: ObjectId) -> usize {
+        self.terminate_external(tenant_id, |s| s.agent_id == agent_id)
+    }
+
+    /// FR-52 decision 16 — the same for everyone in one org: its switch went off
+    /// (gate 1).
+    pub fn terminate_external_in(&self, tenant_id: ObjectId) -> usize {
+        self.terminate_external(tenant_id, |_| true)
+    }
+
+    fn terminate_external(
+        &self,
+        tenant_id: ObjectId,
+        covers: impl Fn(&LiveSession) -> bool,
+    ) -> usize {
         // Collected first: `terminate` writes to the map this iterates.
         let ended: Vec<ObjectId> = self
             .inner
@@ -2562,11 +2584,7 @@ impl Hub {
             .iter()
             .filter_map(|e| {
                 let s = e.value().lock();
-                (s.external
-                    && s.agent_id == agent_id
-                    && s.controller_user_id == principal
-                    && s.tenant_id == tenant_id)
-                    .then_some(*e.key())
+                (s.external && s.tenant_id == tenant_id && covers(&s)).then_some(*e.key())
             })
             .collect();
         for session_id in &ended {

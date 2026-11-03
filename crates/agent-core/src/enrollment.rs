@@ -333,6 +333,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_init_auth_first: None,
         overlay_srflx_seek: None,
         ws_replaced_exit: None,
+        ws_flat_redial: None,
         overlay_warm_relay: None,
         overlay_quic_async: None,
         overlay_vpn_vantage: None,
@@ -342,6 +343,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_route_tick_secs: None,
         overlay_netmon: None,
         overlay_netmon_debounce_ms: None,
+        overlay_netchange_poke_quiet_secs: None,
         overlay_relay_tls: None,
         overlay_shared_carrier: None,
         overlay_roam: None,
@@ -482,6 +484,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         last_crash_unix: 0,
         rollback_attempted: false,
         last_run_unhealthy: false,
+        last_run_boot: None,
         // Stamp the current schema version directly on enrollment so
         // a fresh install skips the rc.18 migration on first launch.
         config_schema_version: Some(crate::config::CURRENT_SCHEMA_VERSION.to_string()),

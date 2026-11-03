@@ -811,6 +811,13 @@ The actual fix for the account is GitHub Settings → Emails.
   lives in the operator's `ROOMLER__TURN__SHARED_SECRET` env.
 - **No git hooks for secrets**: there is no gitleaks/trufflehog scanner in CI.
   *(Open, [LOW], 2026-03-10.)*
+- **An error about a config file says where, never what** (#3086). The daemon's and
+  the CLI's config hold a bearer token, and a `toml` error quotes the line it stopped
+  at, so a typo on that line put the token in the daemon's log, which uploads to the
+  server, on the wizard's page and in the terminal. The parser's error ends where it
+  happens, so no chain holds it for a `{:#}` or `{:?}` to print:
+  [`docs/installation.md`](installation.md). Rows uploaded before the fix were not
+  rewritten.
 
 ### Dependency-uplift pass (2026-07-29)
 

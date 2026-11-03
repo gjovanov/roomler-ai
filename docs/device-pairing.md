@@ -354,7 +354,7 @@ Three states by the session (`ui/src/views/pair/PairView.vue`):
 |---|---|
 | **Signed out** | says what this is ("This connects the installer running on your computer to your account…") and offers every way in: Sign in, Create an account, and the OAuth providers. Each leaves **both** returns before leaving (`keepReturn`, `:289-296`): `pending_redirect = /pair` in sessionStorage for the same tab, and the pending-pairing marker in localStorage for the tab that comes back (below) |
 | **Signed in, no code** | the code field, normalised as it is typed and shown `XXXX-XXXX`; **Look up** posts `/pair/lookup` (`:328-345`). A 404 says "No pending pairing with that code. Check the code in your installer; a pairing lasts 15 minutes, and the installer can start a new one. If this server does not offer pairing, paste a token into your installer instead." — the same 404 a server with pairing switched off answers, and the words cover both without claiming either (`en.json:119`). A 429 shows the server's lock message |
-| **The review** | the device card (§5.1), the warning, and the organization: a picker over the person's orgs, defaulting to the current one (`:334`), or — with none — "Create an organization" inline, name and slug, the slug following the name until edited, a taken slug said in words (`:135-162`, `:398-414`). **Approve** posts `/pair/approve {user_code, tenant_id}`; **Deny** posts `/pair/deny` (`decide`, `:422-454`). Then `approved` ("your installer continues on its own. You can close this tab"), `denied`, or `gone` on a 404 (expired, or already decided — "Enter another code") |
+| **The review** | the device card (§5.1), the warning, and the organization: a picker over the person's orgs, defaulting to the current one (`:334`), or — with none — "Create an organization" inline, name and slug, the slug following the name until edited, a taken slug said in words (`:135-162`, `:398-414`). **Approve** posts `/pair/approve {user_code, tenant_id}`; **Deny** posts `/pair/deny` (`decide`, `:422-454`). Then `approved` ("go back to your installer to finish. You can close this tab": the installer waits for its Install click, #3247), `denied`, or `gone` on a 404 (expired, or already decided — "Enter another code") |
 
 A **403** on Approve is an answer, not an expired credential: the page says, in the product's
 words, that the org needs the *Manage devices* permission (or, for a tunnel client,
@@ -379,7 +379,7 @@ same-origin `pending_redirect` it already honoured:
 
 | Decision point | Where |
 |---|---|
-| the router guard's signed-in branch | `ui/src/plugins/router.ts:448-452` |
+| the router guard's signed-in branch | `ui/src/plugins/router.ts:454-458` |
 | the sign-in page | `ui/src/views/auth/LoginView.vue:153-157` |
 | the OAuth callback | `ui/src/views/auth/OAuthCallbackView.vue:91-94` |
 | the sign-up page: with a session (the auto-verified overlay) straight back; with none it **stays** and says "Registration successful. Please check your email to activate your account. Then sign in, and you will be brought back to the pairing page. The code in your installer stays valid for 15 minutes; if it ran out, start the pairing again there." | `ui/src/views/auth/RegisterView.vue:279-287`; `en.json:95-96` |

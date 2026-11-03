@@ -111,7 +111,7 @@ sequenceDiagram
 heartbeat as an optional `power`
 ([`signaling.rs:704`](../crates/remote_control/src/signaling.rs#L704)). It is a
 claim by the device, shown and never enforced on. The keeper publishes it before
-anything connects ([`app.rs:4736`](../agents/roomlerd/src/app.rs#L4736)) and
+anything connects ([`app.rs:4857`](../agents/roomlerd/src/app.rs#L4857)) and
 after every pass, with what it actually holds, not what it wanted
 ([`power.rs:319`](../agents/roomlerd/src/power.rs#L319)).
 
@@ -142,9 +142,9 @@ every live control connection its goodbye
 
 The connection's own arm sends the frame, says it has gone out, closes every
 WebRTC peer and tunnel peer, and closes the socket
-([`signaling.rs:2097`](../agents/roomlerd/src/signaling.rs#L2097)). Then the run
+([`signaling.rs:2140`](../agents/roomlerd/src/signaling.rs#L2140)). Then the run
 loop holds every new dial until the wake
-([`signaling.rs:1069`](../agents/roomlerd/src/signaling.rs#L1069),
+([`signaling.rs:1091`](../agents/roomlerd/src/signaling.rs#L1091),
 [`sleep_notice.rs:319`](../agents/roomlerd/src/sleep_notice.rs#L319)
 `hold_while_asleep`). A dial inside the window the OS gave the computer to go to
 sleep would say hello again and erase the reason.

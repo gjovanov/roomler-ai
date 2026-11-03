@@ -48,6 +48,20 @@ consent-capable, fleet-wide. Locked by `ssh_does_not_imply_ssh_consent`.
 ⚠️ The wire spellings are a compatibility surface: renaming one doesn't fail
 loudly, it makes every deployed device look like it lacks the feature.
 
+### Input: a chord only `mods` names (#3046)
+
+The arbiter reads `InputMsg::Key.mods`, and no backend does. A key press naming a
+modifier the session does not hold (the soft keyboard's sticky keys, a controller's
+one-key chord) is tapped whole on its `down` frame, with nothing recorded as held
+(`chord_tap`, `docs/remote-control.md` §6).
+⚠️ **Don't split it into a press now and a release on the up frame, and don't have the
+viewer send modifier frames for it.** The input channel is `ordered: false,
+maxRetransmits: 0`, so a lost up frame is a stuck Ctrl on the host, which is worse
+than a bare letter.
+⚠️ On a Mac host a held Cmd answers the Ctrl bit, because a viewer rewrites Ctrl to
+Cmd in the key's code and not in `mods` (FR-13). Without it every Ctrl+C from a
+viewer presses a second, literal Ctrl.
+
 ### Encoders — load the `encoder-cells` skill
 
 Preference resolution: **CLI `--encoder` > env `ROOMLERD_ENCODER` >
@@ -118,3 +132,13 @@ Moved from CLAUDE.md's Known Issues, verbatim; the full field log is in `docs/fr
   outcome for that person. The X11 panel was field-verified through Xwayland in
   FR-93 AC10 (0.4.141). Still unverified: the macOS native panel.
   Detail: `docs/fr/FR-27-*.md`.
+
+### Input: a Noop is not final (#2066, #3164)
+
+An injector without permission is dropped and opened again, so a first event before a
+display, `/dev/uinput` or a grant no longer kills input until a restart
+(`docs/remote-control.md` §6.1b).
+⚠️ Off macOS each try is a real open and each failure warns, so the wait doubles up to a
+minute. Don't shorten it: a root daemon with no `DISPLAY` never gets an injector.
+⚠️ `has_permission()` must stay true for any backend that works. This retry drops
+whatever reports false.

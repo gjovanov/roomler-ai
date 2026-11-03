@@ -175,6 +175,7 @@ import {
   storedSharpness,
   HEVC_REXT_CODEC_STRING,
   translateModifierForHost,
+  translateModsForHost,
   type AutoTransportInputs,
   type KeyDecision,
   type RcCodecChoice,
@@ -6492,6 +6493,19 @@ describe('P7 — FSR localStorage knobs', () => {
 })
 
 // ─── FR-13 (#789): mac-host Ctrl→Cmd translation ─────────────────────────
+
+describe('translateModsForHost (#3046: a sticky Ctrl has no key of its own to rewrite)', () => {
+  it('turns the Ctrl bit into the Meta bit on a Mac host, keeping the others', () => {
+    expect(translateModsForHost(0x01, true)).toBe(0x08)
+    expect(translateModsForHost(0x01 | 0x04, true)).toBe(0x08 | 0x04)
+    expect(translateModsForHost(0x08, true)).toBe(0x08)
+    expect(translateModsForHost(0, true)).toBe(0)
+  })
+  it('changes nothing with the substitution off: another host, or a literal Ctrl', () => {
+    expect(translateModsForHost(0x01, false)).toBe(0x01)
+    expect(translateModsForHost(0x01 | 0x02, false)).toBe(0x01 | 0x02)
+  })
+})
 
 describe('translateModifierForHost (FR-13 mac Ctrl→Cmd)', () => {
   it('rewrites left/right Control to LeftGui when enabled', () => {

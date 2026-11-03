@@ -156,10 +156,10 @@ icacls "C:\ProgramData\roomler" /inheritance:r `
 >
 > The second command above drops inheritance and grants in one call, so
 > every child inherits SYSTEM and Administrators while it can still be
-> rewritten. The daemon's hardening (`crates/agent-core/src/config.rs:3519`,
-> steps at `:3525`) takes the directory for Administrators, grants, and only
+> rewritten. The daemon's hardening (`crates/agent-core/src/config.rs:3685`,
+> steps at `:3575`) takes the directory for Administrators, grants, and only
 > then drops inheritance. The wizard's
-> (`agents/roomler-setup/src/orchestrator_agent.rs:1528`) takes it, then
+> (`agents/roomler-setup/src/orchestrator_agent.rs:1605`) takes it, then
 > runs that one call. Both stop if they cannot take the directory.
 
 ### If SYSTEM is locked out of `C:\ProgramData\roomler\roomler` (#3073)
