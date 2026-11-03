@@ -1732,11 +1732,18 @@ rows ran at about the same speed.
   already down. ⚠️ A keyboard hook cannot show this bug. Only what the target
   translated can.
 
+Under SystemContext the same thing reaches the locked screen, where a lost Shift is
+a failed login. A password of 99 shifted characters, typed with no delay on de-AT,
+failed on released 4 times out of 4, and each time slower typing on the same build
+got in, so the password itself reaches the box. The candidate logged in 4 times
+out of 4.
+
 `caps_for_frame` (`:292`) now reads once per run of typing. A read stands for as
 long as frames keep coming within `CAPS_FRESH_FOR`, 2 s of each other, on one
 foreground thread. A CapsLock key frame clears it (`caps_changed`, `:309`, called
 from `agents/roomlerd/src/input/enigo_backend.rs:231`), so the letters after it
-take the new state. Injecting 1,147 characters went from about 3.7 s to about
+take the new state (read with CapsLock toggled twice inside a run of typing,
+`abcDEFabcDEFabcDEF`). Injecting 1,147 characters went from about 3.7 s to about
 0.9 s, because the attach was costing about 2.5 ms a character.
 
 Two corners are accepted. A CapsLock toggled at the host's own keyboard while a
