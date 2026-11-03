@@ -536,8 +536,12 @@ nor `ROOMLERD_OVERLAY_TUN_PER_ORG` is read any more:
   explicit org removal owns real adapter deletion — a loop end only drops
   the process's device handle, so an EDR-watched host never sees device
   churn on reconnects;
-- ICE never gathers on `roomler-*` (the peer.rs interface deny-list), and
-  the LAN gather's `roomler` prefix filter already covers them.
+- remote desktop's ICE stays off every `roomler-*` adapter unless the device
+  allows the overlay. The address filter does that, on every OS: the peer.rs
+  interface deny-list is a no-op on Windows, where webrtc-util names every
+  adapter `""` ([remote-control.md §4.4](remote-control.md#44-whether-a-session-may-ride-the-overlay-1882),
+  with its one gap, #3359). The LAN gather's `roomler` prefix filter already
+  covers them.
 
 The kill switch it shipped with (`overlay_tun_per_org = false`, back to the
 shared-TUN mux of §4.4 and §4b) went with the mux in W7c.

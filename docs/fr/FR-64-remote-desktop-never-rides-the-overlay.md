@@ -1,8 +1,13 @@
 # FR-64 — Remote desktop never rides the overlay
 
-**Issue:** [#1244](https://github.com/gjovanov/roomler-ai/issues/1244) · **Status:** proposed · **Plan:** `immutable-doodling-neumann` (approved 2026-09-02)
+**Issue:** [#1244](https://github.com/gjovanov/roomler-ai/issues/1244) · **Status:** open, AC1-AC5 read, two things owed (below) · **Plan:** `immutable-doodling-neumann` (approved 2026-09-02)
 
 **Parent/siblings:** FR-59 (the regression that motivated the arc). This is one of three FRs from that plan (FR-62 encoder apply path, FR-63 the controller, FR-64 the data path).
+
+**Where it stands, 2026-11-03.** C2 shipped as #1246. C1 changed shape: the `overlay_ice_candidates` switch never shipped, #1882 made the choice the device's (`AccessPolicy.rc_overlay`, default off, `docs/remote-control.md` §4.4), and FR-128 added `auto`. Two things keep this open:
+
+- **#3359.** A session requested while the daemon starts keeps an empty filter for its whole life. In the week read, 4 of the 15 such sessions on mesh devices gathered their own overlay address. None nominated a path on it.
+- **`auto` with the far TURN dead (FR-128, #3357).** With no UDP to coturn, `auto` lets a session ride the mesh over DERP. On a corp laptop on its VPN, TURN over TLS can still be alive, so `auto` can take this FR's exact path where `off` would take TURN. That cell is being measured, so this FR's "never" is not retired yet.
 
 ## Goal
 
@@ -17,11 +22,11 @@ Same root, second symptom: **#1237** — on multi-org hosts the two org runtimes
 
 ## Acceptance criteria
 
-- [ ] AC1 — CORPLAP-1 (multi-org, VPN on): `ICE: gathered local candidate` shows no `100.6x.`/`fd72:` host or srflx; `per-session ICE path detected` shows a relay/srflx pair outside the overlay ranges; no `overlay carrier under the nominated pair is not direct` line.
-- [ ] AC2 — CORPLAP-3 on the LAN: the native `192.168.0.x` pair, p50 ≤ 50 ms.
-- [ ] AC3 — `overlay_ice_candidates = true` brings the old `100.65.0.5 ↔ 100.65.0.6` pair back.
-- [ ] AC4 — 24 h on neo16 / CORPLAP-1 / CORPLAP-3: sibling evictions **0** (today 718/day), forced-revalidation pokes at idle baseline (today ~100/min), no withheld block floor on the primary.
-- [ ] AC5 — `docs/multi-org.md` and `docs/overlay-nat-traversal.md` state the rule (the former's "ICE never gathers on roomler-*" is true only on Linux today).
+- [x] AC1 — CORPLAP-1 (multi-org, VPN on): `ICE: gathered local candidate` shows no `100.6x.`/`fd72:` host or srflx; `per-session ICE path detected` shows a relay/srflx pair outside the overlay ranges; no `overlay carrier under the nominated pair is not direct` line. *7 days to 2026-11-02: 228 candidates and 15 ICE paths, none on an overlay address, 0 of those lines. The session of 2026-10-30 14:29Z ran with `stun_udp=false` read 136 minutes before and 2 minutes after, on a `Relay/Relay` pair. That is taken as VPN on: the logs don't name the VPN. The same read on NEO16 finds 214 overlay candidates and 29 overlay pairs, so it can see them.*
+- [x] AC2 — CORPLAP-3 on the LAN: the native `192.168.0.x` pair, p50 ≤ 50 ms. *7 days to 2026-11-02: 52 of 54 ICE paths have both ends on `192.168.*`, age p50 11 ms, p90 31 ms, over 6 468 windows.*
+- [x] AC3 — `rc_overlay=on` brings the overlay pair back (was `overlay_ice_candidates = true`, a switch that never shipped). *CORPLAP-2, 7 days to 2026-11-03: 100 sessions log `allowed (device policy rc_overlay=on)`, and 64 of them ran on a path holding the device's own overlay address, carrier `derp` on 63.*
+- [x] AC4 — 24 h on neo16 / CORPLAP-1 / CORPLAP-3: sibling evictions **0** (today 718/day), forced-revalidation pokes at idle baseline (today ~100/min), no withheld block floor on the primary. *24 h to 2026-11-02 22:15Z: sibling evictions 0 on all three. Seconds holding a `net-change` line: 1 803, 157 and 827, so at most 1.25 a minute. 7 days to 2026-11-03: 0 `WITHHOLDING block-floor routes` lines on any of the three, with `installing` lines every day. CORPLAP-3 also evicted another product's route 204 times in those 24 h, which is not a sibling. The `DERP floor WITHHELD` lines, 4 to 8 a host, are a different gate, a peer that doesn't advertise the floor (`relay_link.rs:2150`).*
+- [x] AC5 — Docs: `docs/remote-control.md` §4.4 holds the rule with its diagram and tables, in `docs/README.md`'s index, and `docs/multi-org.md` and `docs/overlay-nat-traversal.md` state it (the former's "ICE never gathers on roomler-*" was true only on Linux).
 
 ## Open decisions
 
@@ -34,4 +39,10 @@ Same root, second symptom: **#1237** — on multi-org hosts the two org runtimes
 
 ## Related
 
-#1237, FR-59 #1163, FR-33 (VPN LAN capture), FR-19 #805 (org relay), FR-35, FR-62, FR-63.
+#1237, FR-59 #1163, FR-33 (VPN LAN capture), FR-19 #805 (org relay), FR-35, FR-62, FR-63, #1882, FR-128 #2989, #3357, #3359.
+
+## Field verification log
+
+| Read | Result |
+|---|---|
+| 2026-11-02 and 2026-11-03, prod `agent_logs`, 7 days, read-only, 0.4.181-0.4.197 | **AC1 to AC4:** in the criteria above. **The filter, every `overlay excluded` session in the week:** 445 had their blocks, 422 of them on mesh devices, and none gathered or used the device's own overlay address. 391 had an empty filter: 376 on devices with no overlay row, where that is correct, and 15 on mesh devices, 4 of which gathered their own overlay address as a host candidate. None nominated a path on it. Those are #3359. |
