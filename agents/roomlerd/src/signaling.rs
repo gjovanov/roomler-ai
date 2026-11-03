@@ -3941,6 +3941,21 @@ async fn handle_server_msg(
             // the controller as "nobody could be asked" rather than as a deny.
             let will_prompt = !owner_side_consent
                 && matches!(effective_mode, crate::consent::Mode::Prompt { .. });
+            // ⚠️ Armed before anything shows it (#3442), and here on the WS
+            // loop, not inside the task below (#1632). `request_with_mode`
+            // registers the session as pending synchronously, so an answer
+            // counts from the moment the panel, the marker, a companion this
+            // may have to start (up to 3 s) or a notification shows the
+            // question, and a `Terminate` that is the very next frame this
+            // loop reads finds the prompt whether or not the task has been
+            // polled yet. (A spawned task has no ordering guarantee against
+            // the loop that spawned it.) Armed after the show, an answer given
+            // while the surfaces went up was refused. The window still runs
+            // from the show: the prompt starts its clock at its first look, in
+            // the task. Owner-side consent asks nobody here, and auto-grant
+            // arms nothing: its answer is ready at once.
+            let prompt = (!owner_side_consent)
+                .then(|| consent_broker.request_with_mode(&session_hex, effective_mode));
             let mut have_surface = true;
             if will_prompt {
                 // FR-27 — NATIVE surface first, companion as the fallback.
@@ -4117,21 +4132,9 @@ async fn handle_server_msg(
                     });
                 }
             }
-            if owner_side_consent {
-                info!(
-                    %session_id, ?consent_mode,
-                    "owner-side consent (email/push) — agent waits for the server to resolve"
-                );
-            } else {
+            if let Some(prompt) = prompt {
                 let outbound = outbound_tx.clone();
                 let ind = indicator.clone();
-                // #1632 — armed HERE, on the WS loop, not inside the task:
-                // `request_with_mode` registers the session as pending
-                // synchronously, so a `Terminate` that is the very next frame
-                // this loop reads finds the prompt whether or not the task
-                // below has been polled yet. (A spawned task has no ordering
-                // guarantee against the loop that spawned it.)
-                let prompt = consent_broker.request_with_mode(&session_hex, effective_mode);
                 // FR-52 P4 — only an external session carries the config in.
                 let external_cfg = external_consent.map(|_| remote_cfg.clone());
                 tokio::spawn(async move {
@@ -4190,6 +4193,11 @@ async fn handle_server_msg(
                         tracing::warn!(session = %session_hex, %e, "outbound consent send failed (channel closed)");
                     }
                 });
+            } else {
+                info!(
+                    %session_id, ?consent_mode,
+                    "owner-side consent (email/push) — agent waits for the server to resolve"
+                );
             }
         }
 
@@ -5417,6 +5425,16 @@ async fn handle_server_msg(
                 consent_broker.mode(),
                 crate::consent::DEFAULT_PROMPT_TIMEOUT,
             );
+            // ⚠️ Armed here on the loop, before anything shows the question
+            // (#3442). It used to be armed inside the task below, so the panel
+            // and the marker were up before it was: a click on the native
+            // panel, which this same loop reads, could come before the task's
+            // first poll, and it was refused and took the panel down with it.
+            // An answer through the companion or the CLI in that gap was
+            // refused too. The window still runs from the show: the prompt
+            // starts its clock at its first look, in the task. Auto-grant arms
+            // nothing: its answer is ready at once.
+            let asking = consent_broker.request_with_mode(&request_id, consent_mode);
 
             // FR-27 — exec has ALWAYS prompted through this broker and NEVER
             // written a marker, so its prompt reached no UI: the only way to
@@ -5486,7 +5504,6 @@ async fn handle_server_msg(
                 }
             }
 
-            let broker = consent_broker.clone();
             let outbound = outbound_tx.clone();
             let req = crate::exec::ExecRequest {
                 request_id: request_id.clone(),
@@ -5510,12 +5527,7 @@ async fn handle_server_msg(
                 // closed is withdrawn. Here it matters more, since an Approve
                 // given to a stale panel would run the command for a caller
                 // no longer waiting for it, and twice if that caller retried.
-                let decision = await_prompt_or_socket_end(
-                    broker.request_with_mode(&request_id, consent_mode),
-                    &outbound,
-                    &request_id,
-                )
-                .await;
+                let decision = await_prompt_or_socket_end(asking, &outbound, &request_id).await;
                 // FR-27 — same convergence point as the RC path: take the
                 // native panel down however the question was answered.
                 ind.hide_prompt(&request_id);
