@@ -692,9 +692,9 @@ flowchart LR
 
 | Lever | Where | What it does |
 |---|---|---|
-| Age bound | `crates/tunnel-core/src/transport/derp.rs:72` (`queue_max_age`), checked by the WS writer at `agents/roomlerd/src/derp.rs:472` | The writer drops a frame that waited longer than `ROOMLERD_DERP_QUEUE_MAX_AGE_MS` (default 100) instead of sending it. That bounds the queue in time whatever the link rate: 512 frames are 33 ms at 160 Mbit/s and 1.8 s at 3 Mbit/s. `0` turns the check off, the behaviour before FR-18 |
-| Send-buffer cap | `cap_send_buffer` (`agents/roomlerd/src/derp.rs:71`), called once per connect (`:374`) | Asks for `SO_SNDBUF` = 256 KiB (`DERP_SNDBUF_BYTES`, `:39`), above the bandwidth-delay product of these paths (3 Mbit/s × 200 ms is about 75 KB) and far below the megabytes that autotuning grows. Without it, a frame the age check let through could still sit for seconds in the kernel. The cap has no switch of its own |
-| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:440`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it when it changed (`agents/roomlerd/src/derp.rs:440`): *"overlay derp: shed stale carrier frames (queue age bound)"* |
+| Age bound | `crates/tunnel-core/src/transport/derp.rs:72` (`queue_max_age`), checked by the WS writer at `agents/roomlerd/src/derp.rs:477` | The writer drops a frame that waited longer than `ROOMLERD_DERP_QUEUE_MAX_AGE_MS` (default 100) instead of sending it. That bounds the queue in time whatever the link rate: 512 frames are 33 ms at 160 Mbit/s and 1.8 s at 3 Mbit/s. `0` turns the check off, the behaviour before FR-18 |
+| Send-buffer cap | `cap_send_buffer` (`agents/roomlerd/src/derp.rs:71`), called once per connect (`:379`) | Asks for `SO_SNDBUF` = 256 KiB (`DERP_SNDBUF_BYTES`, `:39`), above the bandwidth-delay product of these paths (3 Mbit/s × 200 ms is about 75 KB) and far below the megabytes that autotuning grows. Without it, a frame the age check let through could still sit for seconds in the kernel. The cap has no switch of its own |
+| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:440`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it when it changed (`agents/roomlerd/src/derp.rs:445`): *"overlay derp: shed stale carrier frames (queue age bound)"* |
 
 ⚠️ **A successful set is not a cap.** The OS may apply less than was asked and
 still return success, so the daemon reads the size back with
@@ -727,11 +727,11 @@ buffer"* (`SndbufCap::log`, `agents/roomlerd/src/derp.rs:165`). It carries
 | no TCP socket under the WebSocket | WARN | *"… left at the OS default — unrecognised TLS wrapper"* |
 
 The verdict per OS and the line's fields are pinned by unit tests
-(`agents/roomlerd/src/derp.rs:675`, `:841`). Two more use a real loopback
+(`agents/roomlerd/src/derp.rs:942`, `:1108`). Two more use a real loopback
 socket. In one, the cap reaches the socket under the WebSocket and reads back
-as the kernel under the test applies it (`agents/roomlerd/src/derp.rs:753`).
+as the kernel under the test applies it (`agents/roomlerd/src/derp.rs:1020`).
 In the other, a socket filled until the kernel takes no more keeps the size its
-cap read back (`agents/roomlerd/src/derp.rs:781`). CI runs them on Linux and
+cap read back (`agents/roomlerd/src/derp.rs:1048`). CI runs them on Linux and
 Windows.
 
 ⚠️ **To read the cap on a host, grep its log for `overlay derp: send buffer`.**
