@@ -1701,20 +1701,24 @@ mod tests {
         let _older = broker.arm(session, Duration::from_secs(30));
         let leftover = broker.write_sentinel(session, SentinelKind::Deny).unwrap();
 
-        let books = broker.inner.pending.lock().unwrap();
+        // The books' guard lives in this block alone, so no await is made
+        // while it is held.
         let arming = {
-            let broker = broker.clone();
-            std::thread::spawn(move || broker.arm(session, Duration::from_millis(300)))
+            let books = broker.inner.pending.lock().unwrap();
+            let arming = {
+                let broker = broker.clone();
+                std::thread::spawn(move || broker.arm(session, Duration::from_millis(300)))
+            };
+            let waited = Instant::now();
+            while leftover.exists() && waited.elapsed() < Duration::from_secs(1) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(books.contains_key(session), "the older question was asking");
+            broker
+                .write_sentinel(session, SentinelKind::Approve)
+                .unwrap();
+            arming
         };
-        let waited = Instant::now();
-        while leftover.exists() && waited.elapsed() < Duration::from_secs(1) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(books.contains_key(session), "the older question was asking");
-        broker
-            .write_sentinel(session, SentinelKind::Approve)
-            .unwrap();
-        drop(books);
 
         let newer = arming.join().unwrap();
         let decision = tokio::time::timeout(PROMPT_BOUND, newer.run())
