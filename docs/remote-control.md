@@ -804,7 +804,7 @@ sequenceDiagram
 - **The frame goes through the input arbiter like a key**, so it needs the
   input floor and the session's input permission, as typing does. The injector
   then checks again
-  ([`enigo_backend.rs:277`](../agents/roomlerd/src/input/enigo_backend.rs#L277)):
+  ([`enigo_backend.rs:282`](../agents/roomlerd/src/input/enigo_backend.rs#L282)):
   the policy can change between the hello and the click, and a viewer is not
   trusted to have read the hello.
 - **The relay** ([`sas_relay.rs:43`](../agents/roomlerd/src/win_service/sas_relay.rs#L43))
@@ -1683,6 +1683,74 @@ the verdicts, the one-owner invariant over every key and state, and the paste
 seam. Still owed on real devices: a tablet with a hardware keyboard, a phone
 with a Bluetooth keyboard (Android and iOS: Backspace and Enter from the OS
 keyboard once), and a desktop with the soft keyboard toggled on.
+
+### 6.4 Typed text and the target's key state (#3047)
+
+A printable character reaches a Windows agent as `KeyText`, one frame per
+character, and `win_text::type_text` presses the real key for it: one `SendInput`
+holding `Shift↓ X↓ X↑ Shift↑` (`tap_vk`,
+`agents/roomlerd/src/input/win_text.rs:194`). To correct letters for CapsLock it
+has to know the target's CapsLock, which is per thread, so it attaches to the
+foreground thread to read it (`capslock_on`, `:244`). Microsoft documents that
+key state is reset after a call to `AttachThreadInput`.
+
+Until #3047 that read ran once per frame. A reset falling between the target
+reading `Shift↓` and reading the key Shift was for lost Shift, because by then the
+async state already said Shift was up:
+
+```mermaid
+sequenceDiagram
+    participant A as Agent's injector
+    participant Q as Target's input queue
+    participant T as Target thread
+    A->>Q: frame n: Shift↓ X↓ X↑ Shift↑, one SendInput
+    T->>Q: reads Shift↓
+    A->>T: frame n+1: attach and detach, key state reset
+    T->>Q: reads X↓. Shift is up now, so X comes out unshifted
+```
+
+How often that happens depends on what the target spends on a key. Read on a
+de-AT guest under SystemContext, in a real session typing into a text box that
+sleeps on every key-down, Shift's included. Each burst is 1,147 characters, 386 of
+them shifted. Windows rounds a sleep up to its 15.6 ms tick, so the 3 ms and 10 ms
+rows ran at about the same speed.
+
+| Sleep per key-down | Injection on released | Shifted characters lost on released 0.4.197 | Last one lost | Lost on the candidate |
+|---|---|---|---|---|
+| none, three runs | 3.7 to 4.2 s | 34, 36, 25, anywhere in the line | 1109, 1141, 1060 | 0, 0, 0 |
+| 3 ms | 4.5 s | 63 | 210 | 0 |
+| 10 ms | 3.5 s | 54 | 157 | 0 |
+| 30 ms | 2.7 s | 18 | 52 | 0 |
+
+- A target that keeps up loses about one shifted character in twelve, anywhere.
+- A target spending time on each key loses nearly every one until injection ends,
+  and then none, because the resets stop and the backlog drains correctly: a clean
+  split at chars per second × injection time. The split doesn't follow the length
+  of the burst: at 10 ms, 400 characters split at 15 and 2,400 at 69.
+- The injected keys were right in every case. A hook on the guest saw Shift held
+  for every character the target lost, so the agent never believed Shift was
+  already down. ⚠️ A keyboard hook cannot show this bug. Only what the target
+  translated can.
+
+Under SystemContext the same thing reaches the locked screen, where a lost Shift is
+a failed login. A password of 99 shifted characters, typed with no delay on de-AT,
+failed on released 4 times out of 4. Typed at 150 ms a character on the same build
+it logged in on 3 of 5 tries, so the password itself reaches the box. The candidate
+logged in fast 4 times out of 4.
+
+`caps_for_frame` (`:292`) now reads once per run of typing. A read stands for as
+long as frames keep coming within `CAPS_FRESH_FOR`, 2 s of each other, on one
+foreground thread. A CapsLock key frame clears it (`caps_changed`, `:309`, called
+from `agents/roomlerd/src/input/enigo_backend.rs:231`), so the letters after it
+take the new state (read with CapsLock toggled twice inside a run of typing,
+`abcDEFabcDEFabcDEF`). Injecting 1,147 characters went from about 3.7 s to about
+0.9 s, because the attach was costing about 2.5 ms a character.
+
+Two corners are accepted. A CapsLock toggled at the host's own keyboard while a
+controller types isn't seen until a 2 s pause. And a read after such a pause, with
+a slow target still draining a backlog, can lose the one character it lands on.
+
+⚠️ Nothing on the per-frame path may call `AttachThreadInput`.
 
 ## 7. Signaling protocol (`rc:*` namespace)
 
