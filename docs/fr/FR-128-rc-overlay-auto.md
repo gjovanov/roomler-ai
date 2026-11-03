@@ -152,7 +152,7 @@ The guard keeps clamping a carrier that degrades during a session. Moving such a
 | D8 | The far-TURN hint's two blind spots (added 2026-10-30, §8): a Mac target is never measured, because its RC target is the GUI worker's row and that row has no overlay node; and only the browser's first device counts | For the Mac: **the target folds its own daemon's last netcheck into the hint at its offer** (any OS; an agent release). Or the GUI worker names its daemon's row in its hello (agent and server). Or document the limit, and a Mac on a UDP-blocked network keeps `on`. For the browser: **the best verdict among all its devices** (server only). **Decided 2026-10-30 (operator): both defaults**, the target's own netcheck for the Mac and the best device for the browser. Built in P2c |
 | D9 | What the hint reads from a device that holds a mapping but got no UDP allocation (`stun_udp=true, relay_band_udp=None`; added 2026-10-30, §8, [#3341](https://github.com/gjovanov/roomler-ai/issues/3341)) | **`stun_udp && relay_band_udp.is_some()`: a UDP-only allocation on coturn succeeded.** It keeps run 2's verdict and reads CORPLAP-1's vector of 22:22Z as dead, so such a session rides the mesh, clamped, instead of TURN over TLS (both TCP). Or keep P2b's `stun_udp` alone. A bit for TURN over TLS is §7's out-of-scope item |
 | D10 | The blind spot after a re-join (added 2026-10-30, §8, [#3341](https://github.com/gjovanov/roomler-ai/issues/3341)): every overlay join clears the server's vector, and the agent sends one only after its next measurement, up to 20 minutes later | **The agent re-sends its current fresh vector after every overlay join** (agent only; a network change already invalidates the vector on the agent). Or the server keeps `caps` across a reattach of the same node |
-| D11 | What "far TURN dead" means (added 2026-11-03, §8, [#3341](https://github.com/gjovanov/roomler-ai/issues/3341)): §3.1's "no far TURN" row fires on `stun_udp=false`, which tests UDP alone, so on a network that passes TURN over TLS the mesh is not the only path | **Leave it for now: no path is lost, and nothing measured so far is worse.** Or a netcheck bit for "TURN over TLS allocates", so the row means every far relay is dead. §7 puts that bit out of scope, and D9's rule needs the same one, so they are one decision |
+| D11 | What "far TURN dead" means (added 2026-11-03, §8, [#3341](https://github.com/gjovanov/roomler-ai/issues/3341)): §3.1's "no far TURN" row fires on `stun_udp=false`, which tests UDP alone, so on a network that passes TURN over TLS the mesh is not the only path | **Leave it for now: no path is lost, and under motion in the lab (§8, 2026-11-03 02:20Z) `auto` held `off`'s fps and rate, at about 20 ms more transit on DERP. A real corporate link and a session past the relay allowance stay unmeasured.** Or a netcheck bit for "TURN over TLS allocates", so the row means every far relay is dead. §7 puts that bit out of scope, and D9's rule needs the same one, so they are one decision |
 
 ## 7. Out of scope
 
@@ -337,7 +337,7 @@ The operator decided D2 on 2026-11-03: a new device starts on `auto`. This is th
 
 **D9 and D10 are no worse than `off`.** Both misreads end at "far TURN usable" (`agents/roomlerd/src/rc_overlay.rs:146`), and a relayed mesh then stays off. They cost the rescue on #2781's network, never a path.
 
-**One row this spec had wrong (D11).** "Far TURN dead" is `stun_udp=false`: UDP to coturn. On a corporate laptop on its VPN, TURN over TLS still works, so the mesh is not the only path, yet the row fires: `off` takes TURN over TLS and `auto` takes the overlay pair over DERP, the path FR-64 recorded at 20–400 kbps on 2026-09-02. The state is real: in 7 days two corporate laptops logged `stun_udp=false` 15 and 6 times, with 442 and 113 TURN allocations over TLS. The session of 22:30Z above stayed off only because its vector happened to read `stun_udp=true`.
+**One row this spec had wrong (D11).** "Far TURN dead" is `stun_udp=false`: UDP to coturn. On a corporate laptop on its VPN, TURN over TLS still works, so the mesh is not the only path, yet the row fires: `off` takes TURN over TLS, and `auto` allows the overlay pair over DERP, the path FR-64 recorded at 20–400 kbps on 2026-09-02. Which one then carries the session is a race, measured in the next entry. The state is real: in 7 days two corporate laptops logged `stun_udp=false` 15 and 6 times, with 442 and 113 TURN allocations over TLS. The session of 22:30Z above stayed off only because its vector happened to read `stun_udp=true`.
 
 Production's last week doesn't repeat FR-64's collapse, on thin evidence: ordinary use, one laptop over DERP, no side-by-side under motion.
 
@@ -349,3 +349,48 @@ Production's last week doesn't repeat FR-64's collapse, on thin evidence: ordina
 | CORPLAP-1, never chose, 10-31 | `turn` | 91.5 | 57/81/134 | 17.5 |
 
 **Stored policies before the flip** (bounded read, 2026-11-03 00:47Z, 529 rows): 88 live, of which 84 never chose, 1 chose `off`, 2 chose `auto` and 1 chose `on`. Of 441 tombstones, 440 never chose and 1 chose `on`. A new row reads apart from all of those: `rc_overlay` null beside `rc_overlay_auto` true.
+
+### 2026-11-03 02:20Z — D11 in the lab: `off` and `auto` under motion
+
+Production's last week gave D11 no side-by-side, so this builds one: the cell D11 names, with the same motion in both arms ([#3357](https://github.com/gjovanov/roomler-ai/issues/3357)).
+
+**The cell.** Two lab guests in the lab org, 0.4.197 at both ends. The browser ran in the viewer agent's own host, named as the browser's device, so `viewers` is populated (the AC2 recipe). The target's uplink drops UDP on egress except DNS and DHCP, with no redirect and no TCP drop, so TURN over TLS on 443 stays alive. Proved before any session: STUN answered before the drop and not after it, coturn's TLS issuer didn't change, and the target's netcheck read `stun_udp=false, relay_band_udp=false, derp_ws_ok=true`, with its mesh on `relay:derp/tcp`. Each session's own gather proves TURN over TLS: a `typ=relay` candidate while `TURN allocate failed` for every UDP URL. The overlay's own dial line, `TURN relay allocated (tier3-tls)` (`crates/tunnel-core/src/transport/relay.rs:879`), doesn't appear, because the mesh sat on DERP.
+
+**The load.** A full-screen terminal scrolling real text at 33 lines a second, 1280x800, VP9 4:4:4 in software, clamped at 3 Mbit/s in both arms. coturn is close to these guests, so both stages below add 30 ms on the target's uplink, an RTT of 30 ms to the server. The policies alternated, 130 s each, 20 s apart.
+
+30 ms, 3 sessions per policy:
+
+| | `off` | `auto` |
+|---|---|---|
+| Carrier | `turn`, 3 of 3 | `derp`, 3 of 3 |
+| Target's pair, local/remote | Relay/Prflx | Host/Relay (the viewer's local relay) |
+| Connect ms, p50 and max | 956, 1452 | 982, 1004 |
+| Transit ms, p50/p90/p99 and max | 16/17/21, 323 | 36/41/45, 50 |
+| Paint age ms, p50/p90/p99 and max | 23/24/29, 373 | 44/49/53, 57 |
+| fps, p1/p10/p50 | 32.3/32.9/33.3 | 32.2/32.8/33.5 |
+| Mbit/s p50 | 3.44 | 3.43 |
+| ICE RTT ms, p50/p90 | 31/32 | 62/83 |
+| Frames skipped on backpressure | 9 | 0 |
+
+30 ms and 0.5 % loss on the same uplink, 2 sessions per policy:
+
+| | `off` | `auto` |
+|---|---|---|
+| Carrier | `turn`, 2 of 2 | `derp`, 2 of 2 |
+| Connect ms, p50 | 1516 | 998 |
+| Transit ms, p50/p90/p99 and max | 31/60/152, 439 | 48/82/174, 364 |
+| Paint age ms, p50/p90/p99 and max | 38/68/159, 447 | 57/90/183, 372 |
+| fps, p1/p10/p50 | 9.2/32.6/33.4 | 13.0/32.4/33.4 |
+| Mbit/s p50 | 3.26 | 3.33 |
+| ICE RTT ms, p50/p90 | 36/80 | 69/113 |
+| Frames skipped on backpressure | 4 | 0 |
+
+Transit is an upper bound on this pump, whose frames carry no `sender_ms`. Mbit/s reads only windows with an applied rate: three of the first table's sessions, one `auto` and two `off`, lost theirs for a stretch after a capture rebuild ([#3376](https://github.com/gjovanov/roomler-ai/issues/3376)).
+
+**What it shows.** Both carriers hold the same fps and the same rate. DERP costs about 20 ms of transit and about twice TURN's ICE RTT, and on a clean link that's the only quality difference. At 0.5 % loss neither collapses: FR-64's 20–400 kbps and seconds of age don't reproduce. Both are TCP at the uplink, so both take the retransmits, and DERP stays about 20 ms behind at p50, p90 and p99.
+
+**It's a race, not a rule.** Across every stage `auto` rode DERP in 8 sessions of 9 and TURN once: `turn` first with no added latency, then `derp` once more there, twice in a 30 ms warm-up, and in all five sessions above. The pair nominated first carries the session. The target follows a later nomination only onto a real-path remote of strictly higher priority, or off a stale pair (`should_follow_renomination`, `crates/vendored/webrtc-ice/src/agent/agent_selector.rs:56`), so an overlay remote is never followed while the first pair lives. In the one `turn` session, video stayed on the relay at 3.4 Mbit/s while the browser sent its input over the overlay pair, and the session was as good as `off`. CORPLAP-2's six `on` sessions of the last week read the same way, `derp` five times and `turn` once, though nobody read them for it.
+
+**Not reached, so not read.** The relay allowance: the lab org's plan is far inside it, so this cell can't show the throttle. By code a bulk frame past the bucket is dropped (`crates/modules/network/src/relay_allowance.rs:83-102`, `crates/modules/network/src/derp.rs:622`), at 1 Mbit/s on Free and 4 Mbit/s on paid, per network. So a 3.4 Mbit/s session under a Free org's bucket would lose about 70 % of its frames until SCTP backs off, which `off` over coturn would not. That's arithmetic, not a measurement. A real corporate link is unread too: one loss rate on one short path says nothing of a congested one.
+
+**D11 stays an accepted cost.** In this cell, on a clean or lightly lossy link, `auto` is no worse than `off` in fps or rate, costs about 20 ms of transit when it lands on DERP, and costs nothing when it lands on TURN.
