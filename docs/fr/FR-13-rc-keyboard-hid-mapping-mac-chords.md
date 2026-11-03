@@ -18,7 +18,7 @@ The viewer maps `KeyboardEvent.code` → USB-HID usage
 (`kbdCodeToHid`, `ui/src/composables/useRemoteControl.ts:11232` —
 `CapsLock → 0x39` is **correct**, locked by
 `useRemoteControl.spec.ts:313`). The agent maps HID → enigo `Key` in
-`hid_to_key` (`agents/roomlerd/src/input/enigo_backend.rs:514-595`) —
+`hid_to_key` (`agents/roomlerd/src/input/enigo_backend.rs:519-600`) —
 which has **no arm for 0x39**, so the caller falls through
 (`enigo_backend.rs:210-218`) to:
 
@@ -51,11 +51,11 @@ encodes the wrong assumption.
    enigo, correct on all three OSes), numpad digits/operators
    (0x54–0x63), `IntlBackslash`, `ContextMenu`; platform-gate
    PrintScreen/Pause/NumLock/ScrollLock with the existing `0x49` cfg
-   precedent (`enigo_backend.rs:566-571`).
+   precedent (`enigo_backend.rs:571-576`).
 2. **Kill the unsound fallback**: unmapped HID → `tracing::debug!` + drop,
    never `Key::Other` (a HID usage is never a valid VK/CGKeyCode/keysym).
 3. Regression lock: extend `hid_table_covers_navigation_keys`
-   (`enigo_backend.rs:736-743`) and add a `BROWSER_EMITTED_HID` table test
+   (`enigo_backend.rs:741-748`) and add a `BROWSER_EMITTED_HID` table test
    asserting **every code `kbdCodeToHid` can emit maps to `Some(_)`** — the
    contract that silently broke.
 
