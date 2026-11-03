@@ -25,8 +25,7 @@
 //!
 //! 1. `WinVerifyTrust` — the file carries a valid, trusted, unrevoked
 //!    Authenticode signature (chain + timestamp).
-//! 2. The signer's common name contains [`EXPECTED_PUBLISHER`], or is exactly
-//!    that in [`verify_open_publisher`], the wizard's check.
+//! 2. The signer's common name contains [`EXPECTED_PUBLISHER`].
 //!
 //! Step 1 alone is **not** sufficient and it is the trap worth naming: it
 //! proves only that *somebody* the machine trusts signed the file, and every
@@ -111,14 +110,10 @@ pub fn verify_publisher(_path: &Path, _expected: &str) -> Result<String, VerifyE
     Err(VerifyError::Unsupported)
 }
 
-/// [`verify_publisher`] for a file the caller holds open (#3246): the check
-/// reads through `file`, and the signer's name comes from what that check
-/// verified, not from a second look at the path. `path` is the same file's name,
-/// which `WinVerifyTrust` wants as well. Returns the signer's display name.
-///
-/// The name has to match whole. A company called `BIG ROX LTD` can buy a
-/// certificate that chains to a root Windows trusts as readily as ours does, and
-/// this comparison is all that tells the two apart.
+/// Verify a file the caller holds open is signed by exactly `expected` (#3246):
+/// the check reads through `file`, and the signer's name comes from what that
+/// check verified, not from a second look at the path. `path` is the same file's
+/// name, which `WinVerifyTrust` wants as well. Returns the signer's display name.
 #[cfg(windows)]
 pub fn verify_open_publisher(
     file: &std::fs::File,
@@ -487,7 +482,6 @@ mod tests {
         println!("signer: {signer}");
         assert_eq!(signer, EXPECTED_PUBLISHER);
 
-        // A part of the name is not the name: this is what a lookalike is.
         for wrong in ["Someone Else Ltd", "G ROX", "ROX LTD"] {
             match verify_open_publisher(&held(path), path, wrong) {
                 Err(VerifyError::WrongPublisher { found, .. }) => assert_eq!(found, signer),
