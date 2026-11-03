@@ -37,9 +37,9 @@ pub struct HeldRequests {
 
 impl HeldRequests {
     /// Hold `msg` if it is a session request, and give anything else back.
-    pub fn hold(&mut self, msg: ServerMsg, now: Instant) -> Result<(), ServerMsg> {
+    pub fn hold(&mut self, msg: ServerMsg, now: Instant) -> Option<ServerMsg> {
         let Some(session_id) = session_of(&msg) else {
-            return Err(msg);
+            return Some(msg);
         };
         // The hub pushes a pending request again after a socket flap: the same
         // session, still waiting since the first push.
@@ -65,7 +65,7 @@ impl HeldRequests {
              session's encoder"
         );
         self.held.push((since, msg));
-        Ok(())
+        None
     }
 
     /// The session ended while its request waited.
@@ -201,7 +201,7 @@ mod tests {
             "reason": "controller_hangup",
         }))
         .expect("a terminate");
-        assert!(held.hold(other, Instant::now()).is_err());
+        assert!(held.hold(other, Instant::now()).is_some());
         assert!(held.is_empty());
     }
 
@@ -210,10 +210,10 @@ mod tests {
         let mut held = HeldRequests::default();
         let sid = ObjectId::new();
         let first = Instant::now();
-        held.hold(request(sid, 30, None), first).expect("held");
+        assert!(held.hold(request(sid, 30, None), first).is_none(), "held");
         // The hub's re-push after a flap, 20 s later.
         let again = first + Duration::from_secs(20);
-        held.hold(request(sid, 30, None), again).expect("held");
+        assert!(held.hold(request(sid, 30, None), again).is_none(), "held");
         let out = held.release(first + Duration::from_secs(25));
         assert_eq!(out.len(), 1, "one session, one request");
         assert_eq!(windows(&out[0]), (5, None), "counted from the first push");
@@ -225,8 +225,8 @@ mod tests {
         let mut held = HeldRequests::default();
         let (gone, stays) = (ObjectId::new(), ObjectId::new());
         let now = Instant::now();
-        held.hold(request(gone, 30, None), now).expect("held");
-        held.hold(request(stays, 30, None), now).expect("held");
+        assert!(held.hold(request(gone, 30, None), now).is_none(), "held");
+        assert!(held.hold(request(stays, 30, None), now).is_none(), "held");
         held.forget(gone);
         let out = held.release(now);
         assert_eq!(out.len(), 1);
@@ -239,7 +239,7 @@ mod tests {
         let now = Instant::now();
         let ids: Vec<ObjectId> = (0..=MOST).map(|_| ObjectId::new()).collect();
         for id in &ids {
-            held.hold(request(*id, 30, None), now).expect("held");
+            assert!(held.hold(request(*id, 30, None), now).is_none(), "held");
         }
         let out = held.release(now);
         assert_eq!(out.len(), MOST);

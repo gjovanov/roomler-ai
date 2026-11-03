@@ -3124,8 +3124,8 @@ async fn connect_once(
                                 parsed
                             } else {
                                 match held.hold(parsed, std::time::Instant::now()) {
-                                    Ok(()) => continue,
-                                    Err(other) => other,
+                                    None => continue,
+                                    Some(other) => other,
                                 }
                             };
                             handle_server_msg(
