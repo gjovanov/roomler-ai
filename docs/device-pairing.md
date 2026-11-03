@@ -379,7 +379,7 @@ same-origin `pending_redirect` it already honoured:
 
 | Decision point | Where |
 |---|---|
-| the router guard's signed-in branch | `ui/src/plugins/router.ts:448-452` |
+| the router guard's signed-in branch | `ui/src/plugins/router.ts:454-458` |
 | the sign-in page | `ui/src/views/auth/LoginView.vue:153-157` |
 | the OAuth callback | `ui/src/views/auth/OAuthCallbackView.vue:91-94` |
 | the sign-up page: with a session (the auto-verified overlay) straight back; with none it **stays** and says "Registration successful. Please check your email to activate your account. Then sign in, and you will be brought back to the pairing page. The code in your installer stays valid for 15 minutes; if it ran out, start the pairing again there." | `ui/src/views/auth/RegisterView.vue:279-287`; `en.json:95-96` |
