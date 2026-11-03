@@ -156,18 +156,18 @@ icacls "C:\ProgramData\roomler" /inheritance:r `
 >
 > The second command above drops inheritance and grants in one call, so
 > every child inherits SYSTEM and Administrators while it can still be
-> rewritten. The daemon's hardening (`crates/agent-core/src/config.rs:3542`,
-> steps at `:3580`) takes the directory for Administrators, grants, and only
+> rewritten. The daemon's hardening (`crates/agent-core/src/config.rs:3646`,
+> steps at `:3684`) takes the directory for Administrators, grants, and only
 > then drops inheritance. The wizard's
 > (`agents/roomler-setup/src/orchestrator_agent.rs:1605`) takes it, then
 > runs that one call. Both stop if they cannot take the directory.
 
 The daemon hardens on every save of this config, and every start saves it once
 for its crash bookkeeping. Since #3291 a save first reads the directory's owner
-and DACL in-process (`crates/agent-core/src/config.rs:3682`) and skips the
+and DACL in-process (`crates/agent-core/src/config.rs:3786`) and skips the
 steps when the directory already holds exactly what they write: owned by
 Administrators, inheritance off, full control with `(OI)(CI)` for SYSTEM and
-for Administrators, and no other entry (`crates/agent-core/src/config.rs:3625`). Anything else, a read that
+for Administrators, and no other entry (`crates/agent-core/src/config.rs:3729`). Anything else, a read that
 fails included, runs them as before. A directory that holds an entry of its own
 the steps never remove, a grant to another account for instance, never reaches
 that state: it runs them on every save, as every directory did before #3291.

@@ -268,7 +268,7 @@ purge finishes on a thread of its own.
 The last two rows say any Normal-priority child waits this way, so the bound
 alone does not get such a start to its probe. The next children on that path
 were the four `icacls` steps of the config save every start makes for its crash
-bookkeeping (`agents/roomlerd/src/app.rs:4156`). A save now reads the
+bookkeeping (`agents/roomlerd/src/app.rs:4195`). A save now reads the
 directory's owner and DACL in-process and runs the steps only when they would
 change something
 ([the hardening](operator-systemcontext-smoke.md#3-confirm-the-acl-is-locked-down)).
@@ -293,13 +293,13 @@ sequenceDiagram
 
 | Rule | Where | Why |
 |---|---|---|
-| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:347`, `:360`, called at `agents/roomlerd/src/app.rs:4055` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
+| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:348`, `:361`, called at `agents/roomlerd/src/app.rs:4091` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
 | Past the bound the purge still runs to its end | `crates/tunnel-core/src/overlay/dns.rs:849` (`purge_exit_dns_within`), `:887` (`run_within`) | A stale `.`-root rule outlives a crash and a reboot, and it must still go |
 | Every DNS change waits while a purge is in flight | `crates/tunnel-core/src/overlay/dns.rs:596` (`run_cmd`), `:929` (`wait_idle`) | A purge that ended after a steer would delete the steer. The wait has no bound on purpose: the steer needs the order, and the change it holds is itself a child the same load would hold |
 | A purge counts in before its thread starts, and out however it ends | `crates/tunnel-core/src/overlay/dns.rs:871` (`PurgeGate`) | No DNS change slips in between, and a purge that panics holds nothing |
 | With no thread to run it on, the purge runs inline and unbounded, as before | `crates/tunnel-core/src/overlay/dns.rs:911` | The purge is load-bearing and the bound is not |
 | The purge's child has null stdio | `crates/tunnel-core/src/overlay/dns.rs:806` | A child that outlives its waiter must not hold pipes to it |
-| The route purges stay synchronous | `agents/roomlerd/src/lib.rs:360` | They are typed IP Helper calls, with no child to wait for |
+| The route purges stay synchronous | `agents/roomlerd/src/lib.rs:361` | They are typed IP Helper calls, with no child to wait for |
 
 What the bound leaves as it was:
 
