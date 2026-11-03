@@ -453,9 +453,9 @@ mod tests {
         let person = sid(1, 1, [0, 0, 0, 0, 0, 5], 1002);
         let third = sid(1, 1, [0, 0, 0, 0, 0, 5], 1003);
         assert_eq!(someone_elses_shell(&[], &own), None, "no shell to read");
-        assert_eq!(someone_elses_shell(&[own.clone()], &own), None);
+        assert_eq!(someone_elses_shell(std::slice::from_ref(&own), &own), None);
         assert_eq!(
-            someone_elses_shell(&[person.clone()], &own),
+            someone_elses_shell(std::slice::from_ref(&person), &own),
             Some(person.as_slice())
         );
         assert_eq!(
