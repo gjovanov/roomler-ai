@@ -731,13 +731,13 @@ decision 46: a file listed as a root, read by the account that owns it.
 > 100,000 nodes a document ([`MAX_NODES`](../agents/roomlerd/src/hive/knowhow/yaml.rs#L18)):
 > a document past it is refused, and its file passed by.
 
-**The listeners** ([`listeners`](../agents/roomlerd/src/hive/knowhow/listeners.rs#L32)), P4-3b-3,
+**The listeners** ([`listeners`](../agents/roomlerd/src/hive/knowhow/listeners.rs#L35)), P4-3b-3,
 decision 47: the machine's TCP listeners, read by the daemon from the system's own table when
 `knowhow_scan_listeners` is on. No account's file is opened, so no account's eyes are needed.
 
 | OS | Table | Its process |
 |---|---|---|
-| Linux | `/proc/net/tcp` and `tcp6`, the rows in state `0A` | the socket's inode found under `/proc/<pid>/fd`, then `/proc/<pid>/comm` |
+| Linux | `/proc/net/tcp` and `tcp6`, the rows in state `0A` | the socket's inode found under `/proc/<pid>/fd`, the daemon's own walked first ([`socket_owners`](../agents/roomlerd/src/hive/knowhow/listeners.rs#L164)), then `/proc/<pid>/comm` |
 | macOS | `lsof -nP -iTCP -sTCP:LISTEN -F pctn`, within 10 s | its own lines; `*` is the family's any-address |
 
 Each is a `listener` finding: its port, `tcp`, the address it is bound to, and its process when
@@ -745,9 +745,13 @@ the table can say. Each bound address and port is reported once.
 
 > [!NOTE]
 > **The daemon's own ports are left out**: its loopback forwards are its declared routes, which
-> the scan reports as such. A daemon that is not root sees only its own account's processes, so
-> another account's listener comes without its process. A table that cannot be read is one more
-> source unread: the answer is `truncated`, and nothing is retired.
+> the scan reports as such. They are left out by the address and port the daemon holds, not by
+> its pid alone ([`select`](../agents/roomlerd/src/hive/knowhow/listeners.rs#L50)): a child of the
+> daemon can hold a copy of one of its listening sockets, and the table then names the child for
+> the same port (#3397). Nothing else can share that address and port, since the daemon's
+> listeners don't set `SO_REUSEPORT`. A daemon that is not root sees only its own account's
+> processes, so another account's listener comes without its process. A table that cannot be
+> read is one more source unread: the answer is `truncated`, and nothing is retired.
 
 > [!WARNING]
 > **macOS's `/usr/bin/git` is never run.** Without the developer tools it is a stub that offers
