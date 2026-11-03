@@ -544,7 +544,7 @@ The WebRTC peers, the SSH server and the relay responder need an offer or an ove
 | Crash bookkeeping and rollback (`app.rs:4202-4319`) | runs | skipped. A worker cannot install a package. The supervisor records its crashes on the root's enrollment (`macos_supervisor.rs:1093`) |
 | Updater (`app.rs:4330`, `:5491`) | runs | off: the view sets `auto_update = false`, and the root and its update helper own updates |
 | Crash upload (`app.rs:4535`), log upload (`app.rs:4577`) | on its own token | no token. See the gap below |
-| Self-unenroll on a stop (`app.rs:5669`) | if its row is ephemeral | never: this process is not that row |
+| Self-unenroll on a stop (`app.rs:5680`) | if its row is ephemeral | never: this process is not that row |
 
 **What the person sees.** A worker with no enrollment answers `Status` with the root half's identity and link, not its own blanks, over the person socket it already uses for the network fields (`agents/roomlerd/src/person_socket.rs:269`, `:294`). `connected` comes from the root half only, since the stand-in always reads connected. With no answer from the root half the status reads disconnected and lists no org: the companion opens a row's server in a browser, and a row here would name the stand-in. `network_from` goes, because with one row nothing is lent. `Devices` and `Mesh` go straight to the root half (`person_socket.rs:172`) and never to the worker's own `self_view`, whose row points at the stand-in. The companion's `enrolled` stops meaning "a file exists" (`agents/roomler-desktop/src/commands.rs:88`), which lets the daemon's word fill it in (`:156`), and "Open Roomler" and "View screen" read the server and tenant from the daemon's rows when the person's file has none (`:1425`, `:1522`).
 
