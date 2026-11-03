@@ -35,7 +35,7 @@
 //! distinct piece of new machinery, not a rename of `WSADuplicateSocketW`'s
 //! own. Left for its own step.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -322,11 +322,31 @@ pub(crate) async fn closed(
 /// [`Call::ToolbeltWithdrawAll`] can reach it.
 #[derive(Default)]
 pub(crate) struct Serving {
-    endpoints: Mutex<HashMap<u64, (CancellationToken, Arc<Pending>)>>,
+    endpoints: Mutex<Endpoints>,
     pub(crate) all: CancellationToken,
 }
 
+/// Each toolbelt a worker serves now, by its stop and its `Pending`, and each
+/// one it closed.
+#[derive(Default)]
+struct Endpoints {
+    served: HashMap<u64, (CancellationToken, Arc<Pending>)>,
+    closed: HashSet<u64>,
+}
+
+impl Endpoints {
+    /// Whether a hand-over of `endpoint` is one to drop: this worker serves it
+    /// already, or has closed it.
+    fn taken(&self, endpoint: u64) -> bool {
+        self.closed.contains(&endpoint) || self.served.contains_key(&endpoint)
+    }
+}
+
 impl Serving {
+    fn endpoints(&self) -> std::sync::MutexGuard<'_, Endpoints> {
+        self.endpoints.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A test's: claim `endpoint` with `pending` directly, without a real
     /// listener — `answered`/`withdrawn`/`withdrawn_all`/`close_handed`'s
     /// own dispatch is what these tests exercise, not `serve_handed`'s
@@ -335,17 +355,15 @@ impl Serving {
     #[cfg(test)]
     fn claim_for_test(&self, endpoint: u64, pending: Arc<Pending>) -> CancellationToken {
         let stop = self.all.child_token();
-        self.endpoints
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.endpoints()
+            .served
             .insert(endpoint, (stop.clone(), pending));
         stop
     }
 
     fn pending(&self, endpoint: u64) -> Option<Arc<Pending>> {
-        self.endpoints
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.endpoints()
+            .served
             .get(&endpoint)
             .map(|(_, p)| Arc::clone(p))
     }
@@ -354,7 +372,10 @@ impl Serving {
 /// The worker's answer to the daemon's [`Call::ToolbeltServe`]: build this
 /// run's [`Ctx`] (every trait field `None` — P8-2c's remaining scope) and
 /// serve the handed listener with the toolbelt's own, unchanged
-/// [`super::serve`]/[`super::connection`].
+/// [`super::serve`]/[`super::connection`]. One handed again (a hand-over that
+/// crossed a new worker's) is served once, the listener that came with it
+/// dropped; one whose close came first (a hand-over that crossed it) is not
+/// served.
 pub(crate) fn serve_handed(
     serving: &Arc<Serving>,
     link: Arc<Link>,
@@ -364,13 +385,7 @@ pub(crate) fn serve_handed(
     endpoint: u64,
     listener: OwnedFd,
 ) -> Answer {
-    if serving
-        .endpoints
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains_key(&endpoint)
-    {
-        // A hand-over answered twice (the first already claimed it).
+    if serving.endpoints().taken(endpoint) {
         return Answer::Done;
     }
     let std = std::os::unix::net::UnixListener::from(listener);
@@ -388,13 +403,16 @@ pub(crate) fn serve_handed(
     let (events_tx, mut events_rx) = mpsc::channel::<ApprovalEvent>(8);
     let pending = Arc::new(Pending::default());
     let stop = {
-        let mut endpoints = serving.endpoints.lock().unwrap_or_else(|e| e.into_inner());
-        if endpoints.contains_key(&endpoint) {
-            // Lost the race with another answer of the same hand-over.
+        let mut endpoints = serving.endpoints();
+        if endpoints.taken(endpoint) {
+            // Lost the race with another answer of the same hand-over, or
+            // with its close.
             return Answer::Done;
         }
         let stop = serving.all.child_token();
-        endpoints.insert(endpoint, (stop.clone(), Arc::clone(&pending)));
+        endpoints
+            .served
+            .insert(endpoint, (stop.clone(), Arc::clone(&pending)));
         stop
     };
     let ctx = Arc::new(Ctx::worker_hosted(
@@ -441,25 +459,20 @@ pub(crate) fn serve_handed(
         let stop_child = stop.clone();
         tokio::spawn(async move {
             super::serve(listener, ctx, stop_child).await;
-            serving
-                .endpoints
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&endpoint);
+            serving.endpoints().served.remove(&endpoint);
         });
     }
     Answer::Done
 }
 
 /// The daemon's [`Call::ToolbeltClose`]: the toolbelt stops, its connections
-/// cut.
+/// cut, and a hand-over of it still on its way is not served.
 pub(crate) fn close_handed(serving: &Serving, endpoint: u64) -> Answer {
-    let stop = serving
-        .endpoints
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&endpoint)
-        .map(|(stop, _)| stop);
+    let stop = {
+        let mut endpoints = serving.endpoints();
+        endpoints.closed.insert(endpoint);
+        endpoints.served.remove(&endpoint).map(|(stop, _)| stop)
+    };
     if let Some(stop) = stop {
         stop.cancel();
     }
