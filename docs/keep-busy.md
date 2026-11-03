@@ -67,7 +67,7 @@ flowchart LR
 The engine is one std thread, `keep-busy`. It never touches the OS injector
 itself. It asks the input arbiter to read or move the pointer: the one injector,
 created lazily and cached, and opened again while it has no permission
-(`agents/roomlerd/src/input/arbiter.rs:1173` `keep_busy_op`; #2066).
+(`agents/roomlerd/src/input/arbiter.rs:1251` `keep_busy_op`; #2066).
 
 | Rule | Where |
 |---|---|

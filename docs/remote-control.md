@@ -1529,7 +1529,7 @@ The arbiter opens the OS injector at the first event, then keeps it. If no backe
 | macOS | the Accessibility grant, read live with `AXIsProcessTrusted` | once a second |
 | Elsewhere | nothing to ask: only opening one tells (a Linux daemon before its display or `/dev/uinput` exists) | after 1 s, doubling to once a minute |
 
-A new session's first event looks at once, from the shortest wait again (`Regrant`, `agents/roomlerd/src/input/arbiter.rs:1055`; `os_grants_input`, `agents/roomlerd/src/input/mod.rs:505`).
+A new session's first event looks at once, from the shortest wait again (`Regrant`, `agents/roomlerd/src/input/arbiter.rs:1119`; `os_grants_input`, `agents/roomlerd/src/input/mod.rs:508`).
 
 ⚠️ A root daemon with no `DISPLAY` can never open enigo, and each failed open warns. The doubling is what keeps that host to one warning a minute.
 
