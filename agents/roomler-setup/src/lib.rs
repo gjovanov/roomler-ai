@@ -155,7 +155,16 @@ mod front_tests {
     /// markup aside) says `roomlerd`, "the daemon" or "device".
     #[test]
     fn the_page_text_never_says_agent() {
-        let html = include_str!("front/index.html");
+        let text = visible_text(include_str!("front/index.html"));
+        assert!(
+            !text.to_ascii_lowercase().contains("agent"),
+            "visible text mentions an agent: {}",
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+    }
+
+    /// The text of `html` a person sees: markup and comments dropped.
+    fn visible_text(html: &str) -> String {
         let mut text = String::new();
         let mut rest = html;
         while !rest.is_empty() {
@@ -170,10 +179,85 @@ mod front_tests {
                 rest = &rest[next..];
             }
         }
-        assert!(
-            !text.to_ascii_lowercase().contains("agent"),
-            "visible text mentions an agent: {}",
-            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        text
+    }
+
+    /// The MSI's flavour names and the service's switch, which a new person
+    /// does not know (#3247).
+    const JARGON: [&str; 3] = ["perUser", "perMachine", "SystemContext"];
+
+    /// #3247 — the cards, Welcome's summary, the warnings and Done speak a
+    /// person's words. The jargon stays in code, comments and the one event
+    /// name the page matches on.
+    #[test]
+    fn the_page_never_says_the_msi_flavour_names() {
+        let text = visible_text(include_str!("front/index.html"));
+        for word in JARGON {
+            assert!(!text.contains(word), "index.html shows {word}");
+        }
+        for literal in js_string_literals(include_str!("front/app.js")) {
+            // A template's `${…}` is code, whose names may say anything.
+            let shown = without_interpolations(literal);
+            for word in JARGON {
+                assert!(
+                    !shown.contains(word) || shown == "SystemContextError",
+                    "app.js shows {word}: {literal:?}"
+                );
+            }
+        }
+        // The scanner finds literals and skips comments, or the loop above
+        // could pass by reading nothing.
+        assert_eq!(
+            js_string_literals("// \"perUser\"\nf(\"a\", 'b', `c ${d}`); /* \"perMachine\" */"),
+            ["a", "b", "c ${d}"]
         );
+        assert_eq!(without_interpolations("a ${perUserWord} b ${c}"), "a  b ");
+    }
+
+    /// `literal` with each `${…}` taken out.
+    fn without_interpolations(literal: &str) -> String {
+        let mut shown = String::new();
+        let mut rest = literal;
+        while let Some(at) = rest.find("${") {
+            shown.push_str(&rest[..at]);
+            rest = rest[at..].split_once('}').map_or("", |(_, r)| r);
+        }
+        shown.push_str(rest);
+        shown
+    }
+
+    /// Every quoted string in `js`, outside comments. Rough, but app.js holds no
+    /// quote inside a regex literal.
+    fn js_string_literals(js: &str) -> Vec<&str> {
+        let bytes = js.as_bytes();
+        let mut found = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                }
+                quote @ (b'"' | b'\'' | b'`') => {
+                    let start = i + 1;
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != quote {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                    found.push(&js[start..i.min(js.len())]);
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        found
     }
 }

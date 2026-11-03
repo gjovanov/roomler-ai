@@ -1643,15 +1643,15 @@ pub fn cross_flavour_warning(detected: &ExistingInstall, requested: &str) -> Opt
     let requested_is_peruser = requested == "peruser";
     match detected {
         ExistingInstall::PerUser(_) if requested_is_permachine => Some(
-            "Switching from perUser → perMachine. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator."
+            "Switching from an install for this user only to one for the whole computer. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator."
                 .to_string(),
         ),
         ExistingInstall::PerMachine(_) if requested_is_peruser => Some(
-            "Switching from perMachine → perUser. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator."
+            "Switching from an install for the whole computer to one for this user only. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator."
                 .to_string(),
         ),
         ExistingInstall::Ambiguous { .. } => Some(
-            "Both perUser and perMachine installs detected. The MSI's cleanup custom action will remove the one not selected."
+            "Roomler is installed twice here, for this user only and for the whole computer. The install removes the one you did not pick."
                 .to_string(),
         ),
         _ => None,
@@ -1709,8 +1709,13 @@ mod tests {
         let w = cross_flavour_warning(&ExistingInstall::PerUser(info("0.3.0-rc.26")), "permachine");
         assert!(w.is_some());
         let msg = w.unwrap();
-        assert!(msg.contains("perUser"));
-        assert!(msg.contains("perMachine"));
+        // #3247: a person's words, not the MSI's.
+        assert!(msg.contains("for this user only"));
+        assert!(msg.contains("for the whole computer"));
+        assert!(
+            !msg.contains("perUser") && !msg.contains("perMachine"),
+            "{msg}"
+        );
         assert!(msg.contains("fresh enrollment token"));
     }
 
@@ -1748,7 +1753,7 @@ mod tests {
             "permachine",
         );
         assert!(w.is_some());
-        assert!(w.unwrap().contains("Both"));
+        assert!(w.unwrap().contains("installed twice"));
     }
 
     #[test]
