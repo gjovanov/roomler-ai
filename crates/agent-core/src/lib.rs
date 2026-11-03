@@ -23,6 +23,7 @@
 pub mod acl;
 pub mod appdirs;
 pub mod apps_config;
+pub mod boot_id;
 /// FR-84 D6 — the companion's login-start registration (Run value, XDG
 /// entry), shared so the daemon and the companion spell it identically.
 pub mod companion_autostart;
