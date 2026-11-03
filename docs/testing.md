@@ -613,7 +613,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1831`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7715`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1831`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7620`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |
@@ -794,7 +794,7 @@ flowchart LR
 | arm | how the VM gets its carrier | why it exists |
 |---|---|---|
 | `direct` | the overlay's defaults — the carrier ladder picks the best path that works | the real-world numbers |
-| `relay` | `overlay_direct = false` on the VM only ([`config.rs:425`](../crates/agent-core/src/config.rs#L425)), which leaves only relayed carriers | the relayed baseline for every target, including the servers that the direct arm reaches directly |
+| `relay` | `overlay_direct = false` on the VM only ([`config.rs:411`](../crates/agent-core/src/config.rs#L411)), which leaves only relayed carriers | the relayed baseline for every target, including the servers that the direct arm reaches directly |
 
 The direct arm's corp-laptop rows are the **control** for the relay arm: those laptops have no
 direct path at all, so where both arms relay, matching numbers show the forcing knob is not what
