@@ -475,7 +475,7 @@ The operator chose on 2026-11-02 (#971): a secondary org's session is delegated 
 
 | What stops one row today | Where | Measured on 0.4.191 |
 |---|---|---|
-| The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `agents/roomlerd/src/signaling.rs:2850` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
+| The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `agents/roomlerd/src/signaling.rs:2893` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
 | `run` refuses to start with no config | `agents/roomlerd/src/app.rs:3806-3811` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
 | Delegation is primary-org only, on purpose | `agents/roomlerd/src/signaling.rs:3519-3527`, `agents/roomlerd/src/app.rs:5214`, `:5398` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes |
 
@@ -516,7 +516,7 @@ flowchart TB
 
 ### P3a — the worker holds no enrollment
 
-**A stand-in for the control plane, in the worker's process.** With `--unenrolled` the worker binds `127.0.0.1:0` and runs a small WS server that answers pings and discards the rest. Its signalling loop dials that instead of a server, so `connect_once` runs as it does everywhere, its `next_delegated` arm included, and the warning in [Order of work](#order-of-work) about the shared session-setup path does not reach this phase. The handshake must carry a secret minted for the process (`agents/roomlerd/src/signaling.rs:1596-1601` sends it as the token, and `agents/roomlerd/src/ws_connect.rs:36` dials an address literal directly), so another local process that dials the port gets a 401 and no socket.
+**A stand-in for the control plane, in the worker's process.** With `--unenrolled` the worker binds `127.0.0.1:0` and runs a small WS server that answers pings and discards the rest. Its signalling loop dials that instead of a server, so `connect_once` runs as it does everywhere, its `next_delegated` arm included, and the warning in [Order of work](#order-of-work) about the shared session-setup path does not reach this phase. The handshake must carry a secret minted for the process (`agents/roomlerd/src/signaling.rs:1639-1644` sends it as the token, and `agents/roomlerd/src/ws_connect.rs:143` dials an address literal directly), so another local process that dials the port gets a 401 and no socket.
 
 Rejected: a `ControlLink` enum over the WS. It looks small at `send_frame` and `ws.next()`, but the receive deadline and the ping arms would each need a detached branch, on the path every platform's sessions take.
 
@@ -524,7 +524,7 @@ Rejected: a `ControlLink` enum over the WS. It looks small at `send_frame` and `
 
 Rejected: a mutual check on the upgrade response. The secret goes out in the request, so whoever answers already holds it, and a real challenge would add a handshake to `connect_once` to guard a state the exit removes.
 
-⚠️ **A session reaches this process through the root's delegation socket and nothing else.** `handle_server_msg` has two callers: the `next_delegated` arm (`signaling.rs:2923`) and the `ws.next()` arm (`:3000`). With `--unenrolled` the second drops every text frame (`OrgCtx::unenrolled`, false in every other process). That gate does not depend on who holds the port. It is the one line this phase adds to `connect_once`. The worker reaches the delegation socket at a path only root can bind (`/var/run/roomler-delegate`, `agents/roomlerd/src/delegate.rs:80-81`). Its other two listeners take no session:
+⚠️ **A session reaches this process through the root's delegation socket and nothing else.** `handle_server_msg` has two callers: the `next_delegated` arm (`signaling.rs:2966`) and the `ws.next()` arm (`:3043`). With `--unenrolled` the second drops every text frame (`OrgCtx::unenrolled`, false in every other process). That gate does not depend on who holds the port. It is the one line this phase adds to `connect_once`. The worker reaches the delegation socket at a path only root can bind (`/var/run/roomler-delegate`, `agents/roomlerd/src/delegate.rs:80-81`). Its other two listeners take no session:
 
 | Listener | What it serves | Why it stays |
 |---|---|---|
@@ -587,7 +587,7 @@ Under the switch, `run_cmd` gives every org loop the host (`app.rs:5214`, and `:
 | Verify | Within 60 s: connected, `delegation channel attached`, the row reports `screen-capture` | Restores both files and restarts, then says what it saw |
 | Report | Each retired row's name and id, and where to delete it | |
 
-**The retired row is deleted by a person, through the ordinary route.** `DELETE /api/tenant/{tid}/agent/{id}` (`crates/modules/fleet/src/agent.rs:1315`) is `remove_agent_device` (`crates/modules/fleet/src/removal.rs:43`): the lease released first, then the tombstone, then the kick. That is the order AC12 names. The command cannot do this itself: a device holds no user credential, and `POST /api/agent/self/unenroll` refuses a permanent row on purpose (`agent.rs:558`), so a compromised host cannot erase its own record. Deleting the row is therefore the person's second act, and the Mac works whether or not they have done it yet. A row left behind only reads offline.
+**The retired row is deleted by a person, through the ordinary route.** `DELETE /api/tenant/{tid}/agent/{id}` (`crates/modules/fleet/src/agent.rs:1326`) is `remove_agent_device` (`crates/modules/fleet/src/removal.rs:43`): the lease released first, then the tombstone, then the kick. That is the order AC12 names. The command cannot do this itself: a device holds no user credential, and `POST /api/agent/self/unenroll` refuses a permanent row on purpose (`agent.rs:569`), so a compromised host cannot erase its own record. Deleting the row is therefore the person's second act, and the Mac works whether or not they have done it yet. A row left behind only reads offline.
 
 **The overlay address.** The root's enrollment is untouched, so its row keeps its node and its address. A moved enrollment keeps its row, its key and any address it had, since only the holder of the token changed. A retired row with a node of its own releases it through the delete. Where the only address in an org was on the retired row, the plan says so before anything changes.
 
