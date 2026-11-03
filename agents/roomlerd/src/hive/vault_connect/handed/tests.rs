@@ -171,7 +171,8 @@ async fn an_endpoint_handed_twice_is_served_once() {
     }
     // The first is served; the second's listener went with its answer, and
     // nothing holds its port.
-    assert!(ask(ports[0]).await.starts_with("HTTP/1.1 200 OK"));
+    let first = ask(ports[0]).await;
+    assert!(first.starts_with("HTTP/1.1 200 OK"), "the first: {first:?}");
     assert!(
         TcpStream::connect(("127.0.0.1", ports[1])).await.is_err(),
         "the second listener is not served"
