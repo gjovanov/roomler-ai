@@ -5501,6 +5501,9 @@ async fn handle_server_msg(
                 run_as,
                 // Where it always started, or its `cwd` (FR-97 P5b is SSH's).
                 start_in_home: false,
+                // A command here may stop this daemon, and must outlive it
+                // (`roomler exec … self-update`, #2718).
+                session_owned: false,
             };
             let ind = indicator.clone();
             tokio::spawn(async move {
