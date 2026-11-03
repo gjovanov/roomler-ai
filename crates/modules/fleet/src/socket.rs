@@ -1062,12 +1062,17 @@ pub async fn handle_agent_socket(
         // `Online` write, so the gate above can answer "ours" between that
         // write and the new registration; a newer hello's `conn_id` makes
         // this write match nothing, in whichever order the two land.
-        match state.agents.mark_offline_if_conn(agent_id, &conn_id).await {
-            Ok(true) => {}
-            Ok(false) => {
-                debug!(%agent_id, "agent offline write skipped: a newer hello holds the row")
-            }
-            Err(e) => warn!(%agent_id, %e, "agent mark_offline_if_conn failed"),
+        // RED ONLY (#2552): the pre-#2621 write, unconditional. Never merged.
+        let _ = &conn_id;
+        if let Err(e) = state
+            .agents
+            .mark_status(
+                agent_id,
+                roomler_ai_remote_control::models::AgentStatus::Offline,
+            )
+            .await
+        {
+            warn!(%agent_id, %e, "agent mark_status(offline) failed");
         }
         // P4 — offline event, SUPPRESSED when a newer registration owns the
         // directory record (a re-homed agent's late teardown on the old pod:
