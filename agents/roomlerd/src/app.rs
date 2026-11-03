@@ -4120,7 +4120,10 @@ async fn run_cmd(
     // routing was active when it died — then had overlay disabled — is still
     // healed (else a persisted Windows Wintun `/1` blackholes egress to a dead
     // NIC until reboot). No-op on non-`overlay-l3` builds.
-    roomlerd::purge_exit_routes();
+    // #3291 — the start waits for the exit-DNS purge for a bounded time only:
+    // a starved host held its `powershell` for as long as the load lasted, and
+    // the device stayed offline meanwhile. The purge still runs to its end.
+    roomlerd::purge_exit_routes_at_start();
 
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
     // FR-84 D4 — publish the RESOLVED preference, so the LocalAPI reports
