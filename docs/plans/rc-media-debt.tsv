@@ -795,6 +795,7 @@ enc:I045	env-knob	FFmpeg DC, libvpx	agents/roomlerd/src/encode/mod.rs:334	[R] `S
 enc:I046	env-knob	FFmpeg DC, libvpx	agents/roomlerd/src/encode/mod.rs:428	[R] `SEED_CONTRADICTION`, default on. pump: governor.rs:185	RateController	FR-63 B2, B3	FR-63 B3 deletes the AIMD
 enc:I047	env-knob	FFmpeg DC, libvpx	agents/roomlerd/src/encode/mod.rs:449	[R] `VIEWER_RATE_CLAMP`, default on. pump: governor.rs:186	RateController	FR-63 B2, B3	FR-63 B3 deletes the AIMD
 enc:I048	env-knob	FFmpeg DC, libvpx	agents/roomlerd/src/encode/mod.rs:467	[R] `QUEUE_DRAIN`, default on. pump: governor.rs:187	RateController	FR-63 B2, B3	FR-63 B3 deletes the AIMD
+enc:I286	env-knob	FFmpeg DC, libvpx	agents/roomlerd/src/encode/mod.rs:479	[R] `MEASURED_EVIDENCE`, default on. pump: governor.rs:194 (added after the scan, FR-79 V5b)	RateController	FR-63 B2, B3	FR-63 B3 deletes the AIMD
 enc:I049	env-knob	FFmpeg DC, libvpx	agents/roomlerd/src/encode/mod.rs:545	[R] `RATE_SLOW_START`, default off. pump: governor.rs:188	RateController	FR-63 B2, B3	slow start ships in the controller or is dropped with the AIMD
 enc:I050	env-knob	FFmpeg DC, libvpx	agents/roomlerd/src/encode/mod.rs:585	[R] `RATECTL`, default shadow; only `off` stops it. pump: governor.rs:189	RateController	FR-63 B2, B3	the controller is the only rate law and no mode remains to choose
 enc:I051	env-knob	FFmpeg DC	agents/roomlerd/src/encode/mod.rs:412	[R] `CONSTRAINED_QUEUE_MEASURED`, default on. pump: plan.rs:187, ../peer.rs:6798	Plan	R8	M3b, with the measured reference unconditional

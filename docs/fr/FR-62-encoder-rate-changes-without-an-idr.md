@@ -38,7 +38,7 @@
     no config change to be read for AC2/AC3, and flipping the flag off does not produce
     a RED (no IDR per rate step). The read's RED is a **positive control**: a viewer
     resize that moves `dims_swaps` by one must move `idr_count` by exactly one. That
-    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7439`), which
+    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7444`), which
     keeps the encoder's counters. A read that cannot see that IDR cannot vouch for the
     absence of the others.
   - 🔑 **AC3's read, as written, could fail with no rate-caused IDR at all.** Its
@@ -62,7 +62,7 @@
     the heartbeat's cumulative counters: **every Δ`idr_count` must have a Δ`dims_swaps`, a
     Δ`frames_dropped_backpressure`, a `keyframe_requests` tick or a lock edge beside it.
     An unexplained IDR in a window with Δ`rate_moves` > 0 is the RED.** The session must
-    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:8979`)
+    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:8984`)
     builds a new encoder whose counters restart at zero, so a window across one is not
     diffed.
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
@@ -73,7 +73,7 @@
       perfect encoder reads off by the rung's distance.
     - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung
       and move nothing. Δ`rate_moves` marks a real move. The read judges the first
-      complete 2 s heartbeat window (`peer.rs:6893`) after a Δ`rate_moves`, on
+      complete 2 s heartbeat window (`peer.rs:6898`) after a Δ`rate_moves`, on
       Δ`bytes_written` ÷ Δ`frames_encoded`. A window that starts at most 2 s after the
       move and holds the ratio shows the encoder had tracked by then.
     - ≈ 1.0 is a CBR's contract. NVENC is quality-capped VBR and sits under its cap on
@@ -94,7 +94,7 @@
     flip plus one release soak (Sequencing row 5), and every A4 row's precondition is
     unmet: row 1 needs "A0 passes on QSV", which failed; row 2 needs VideoToolbox
     measured, and QSV still needs the ladder; row 3 is marked "a behavioral decision for
-    the post-soak pass" in the code (`encode/governor.rs:1017`). Found on the way:
+    the post-soak pass" in the code (`encode/governor.rs:1166`). Found on the way:
     B3b deletes `aimd.rs` whole, the coarsen ladder included, and the plan predates
     A0-QSV. Whatever replaces the AIMD must carry QSV's rationing forward.
 

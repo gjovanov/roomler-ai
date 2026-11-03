@@ -1,6 +1,6 @@
 # FR-79: One validity gate — a window is evidence about the pipe, or it is not
 
-**Issue:** [#1524](https://github.com/gjovanov/roomler-ai/issues/1524) · **Status:** proposed 2026-09-08; V1–V5a shipped (`agent-v0.4.93` → `0.4.97`), V3b in SHADOW (`0.4.98` → `0.4.100`), docs 2026-09-25; AC8 half-met, AC9 partly met 2026-10-31; **V5b proposed 2026-10-30** for the V5 loop FR-71's 2026-10-29 fleet read found, waiting on the operator ·
+**Issue:** [#1524](https://github.com/gjovanov/roomler-ai/issues/1524) · **Status:** proposed 2026-09-08; V1–V5a shipped (`agent-v0.4.93` → `0.4.97`), V3b in SHADOW (`0.4.98` → `0.4.100`), docs 2026-09-25; AC8 half-met, AC9 partly met 2026-10-31; **V5b built 2026-11-03** (the operator chose A on 2026-11-02), rides the first release after the FR-63 read has started; AC8 and AC9 need that build ·
 **Parent:** the consolidation FR-70's AC4 asks for (8 estimators → 1) and the rule
 FR-71's three field events wrote by induction. Deletes rather than adds:
 `transit_hold`, `transit_classify`, T2's quarantine and T2b's shadow all go.
@@ -188,6 +188,118 @@ direct sessions on the MacBook:
   a window's final pass. The governor now sums the passes
   (`WindowSenderStats::absorb`).
 
+### V5b — only a measurement is evidence about the rate (built 2026-11-03)
+
+V5 taught the gate that a stall is push-back. Four field reads then showed the
+same mistake in four places: **a number nobody measured was being treated as one.**
+A stand-in judged stalls, a reading stood after the path disproved it, a hold
+nobody carried was written as the pair's rate, and a trickle became the pipe.
+
+**The chain, end to end.** jupiter, 2026-11-02 21:05:18–21:07:34, `0.4.197`, one
+relayed `h264_vaapi` session that never lost a byte to a slow path:
+
+1. A minute at 10.7 Mbps, then the screen stopped.
+2. The viewer's queue read as growing on idle traffic: 145 ms twice, at 9,489 bps
+   arriving, with 9,120 bps written. That trickle became the pipe. The target fell
+   6.2 M → 200 kbps and FR-59 P6 abandoned the ceiling the session had just earned.
+3. The session walked 9,489 down to 3,322 and wrote that to the pair memory.
+4. The next sessions opened there.
+5. Each wrote its own stand-in back with a fresh TTL: 3,322 → 2,989 → 2,690, five
+   writes with no rise, so the key held itself low with nothing behind it.
+
+`the_jupiter_chain_replays_to_the_unit_with_the_switch_off` (`governor.rs:5130`) is
+one driver through the real governor, and every number above is asserted to the
+unit: the target, the ceiling abandoned, the twelve rungs, and "3,322 → 2,989 →
+2,690", which is one seed rung plus half the gap. That arm stays, because it pins
+the switch and says the replay is the session.
+
+**One switch, five rules.** `measured_evidence` (`ROOMLERD_MEASURED_EVIDENCE`,
+default on; off is V5a's rules byte for byte, apart from the heartbeat's new
+fields). All five are constrained-only, so a direct window moves nothing.
+
+| rule | what it says | where | what it ends |
+|---|---|---|---|
+| **q1** | A stall is judged against a live reading: the goodput, or the viewer's arrival rate inside its 15 s TTL, the lower of the two. With neither there is no claim to contradict, so it cuts nothing, and a stall that carries no number no longer walks the prior. | `measured_bps` (`governor.rs:683`), `:1362` | the V5 loop; no step of the chain |
+| **q2** | A delivery that raised the demonstrated floor, in a valid window, takes out every reading it beats by `CONTRADICTION_FACTOR` (2×): the goodput is forgotten, the arrival-rate clamp lifts, and the prior re-anchors on it. | `refute_readings` (`governor.rs:756`) | the 223,794 and 709,460 readings; no step of the chain |
+| **q3** | A hold reaches `stable_bps` only if a valid window carried it at 70 %. | `note_carried` (`ceiling_learn.rs:147`), `governor.rs:1642` | AC8's 18 rungs; no step of the chain |
+| **(a)** | The write-back records a reading or nothing: the carried hold, a live reading, or the last reading the session took. Never the stand-in. A session with none of them leaves the entry's value and age alone. | `session_evidence_bps` (`governor.rs:724`) | step 5, and the 84,195 write |
+| **(b)** | A growing queue counts only while the sender offered more than arrived, two windows running. | `offered` (`governor.rs:1473`), `viewer_rate::OfferLoop` (`viewer_rate.rs:676`) | step 2, and with it step 3 |
+
+⚠️ **(b) needed a second clause.** `bytes_written` counts what left the pump's own
+channel, and both pumps stamp a frame before it (`peer.rs:5195`, `:9752`), so a
+queue growing INSIDE that channel reads sent ≈ rx even though the encoder is
+overdriving. The classifier already calls that window `Overproduced`, so it counts
+as an offer. jupiter's two windows were `clear` in the field (`pipe_states` read
+`[0,64,2,4,0]` at 21:06:31 and `[0,66,2,4,0]` at 21:06:33), so this clause does not
+let the false report back in.
+
+⚠️ **Why 1.1 × and two windows.** A FIFO that grew `QUEUE_GROWTH_MS` (100 ms) over a
+one-second window was fed at least 1.1 × what it delivered, so `sent ≤ 1.1 × rx`
+contradicts the report itself. 1.2 × would also drop true reports, and at the
+nominal 1.5 M floor the age loop cannot cut, so a path at 1.25–1.5 M would be left
+with no reading. Noise is not what separates the reports: a 76 B frame is 7 % of an
+idle window and the windows are not aligned. The two windows do that. A keyframe
+sent at the end of a window offers 214 KB while the arrival rate still reads
+9 kbps, and jupiter's report came 5 s after one, so one window, or the sum of two,
+would let the same trickle through.
+
+The week's congested reports, all three, across 10 agents. **Thin: this is a
+premise, not a measurement of how often the rule fires.**
+
+| report | arrival | sent before | 1.1 × arrival | sent after | (b) | what it was |
+|---|---|---|---|---|---|---|
+| jupiter 2026-11-02 21:06:32 | 9,489 | **8,928** | 10,437 | 229,630, its own rebuild's 56 KB keyframe | **stopped** | false: the idle session, 15.9 M delivered a minute earlier |
+| CORPLAP-2 2026-10-30 12:04:05 | 581,546 | 1,107,067 | 639,700 | 2,051,049 | stands | false; q2 takes it out, 4.66 M two seconds later |
+| CORPLAP-2 2026-10-30 12:19:50 | 12,070 | 145,305 | 13,277 | 77,741 | stands | true: age 4,988 over a 698 floor, 26 more stalls |
+
+Why jupiter's queue read as growing is not proven. The viewer box sat at 96 % CPU,
+and `QueueDrift` sums `Δarrival − Δwire` on the worker's clock, so a busy viewer can
+read as a queue; an SCTP retransmit after the load is not ruled out either. (b) does
+not need the cause.
+
+⚠️ **The order is the rule, not the size.** q2 asks whether the floor ROSE after a
+reading, because comparing a reading with the floor gets it backwards: the true
+reading sits lower than the false ones. Two laptops, 7 days, 13,575 heartbeats,
+12,308 constrained, 5 readings. **Thin: say so wherever this is cited.**
+
+| reading | when | ÷ floor when taken | floor raised after it? | truth |
+|---|---|---|---|---|
+| 223,794 | 2026-10-30 11:48:36 | 1.00 | +2 s, to 1,199,442 | false: the path delivered 5.39 M |
+| 709,460 | 2026-10-30 12:04:06 | 0.39 | +2 s, to 4,657,230 | false |
+| 180,484 | 2026-10-30 12:19:52 | 0.23 | never in its 60 s; 26 more stalls, age to 1,402 | true |
+| 14,382,431 | 2026-10-31 22:33:50 | 1.00 | no | high, stands |
+| 13,044,940 | 2026-10-31 22:41:19 | 1.00 | no | high, stands |
+
+The window fold with these rules in it, as a diagram, is in
+[`docs/rate-control.md`](../rate-control.md#v5b--only-a-measurement-is-evidence-about-the-rate).
+
+⚠️ **(a) gives something up, on purpose.** FR-70 P1 wrote the decayed prior so a
+session measuring nothing could free a pair misremembered slow. Now such a session
+no longer raises a low entry at all, so the entry stands until a session measures
+or carries a hold, or its 7-day TTL runs out. That way out was already mostly gone:
+since V4 a write moves an entry 10 % of the gap upward; at the band `stand_in_bps`
+is `None`, so a long session writes nothing; P1's own field proof freed its pair
+through `stable_bps` (6,083,280), which (a) keeps; and on jupiter it moved the key
+DOWN, 3,322 → 2,989 → 2,690 over five writes with no rise.
+`a_poisoned_key_runs_out_or_a_measurement_lifts_it` (`governor.rs:5357`) holds the
+new behaviour: seven daily seeded sessions leave value and age alone, the seed is
+gone one second after the TTL, and a measuring session moves 3,322 → 102,989 at once.
+
+⚠️ **A known limit.** Inside a session q2 re-anchors a seed only on a floor rise. A
+seeded idle session re-anchors on its first delivery (9,120 in the replay), and the
+anchored ladder climbs ×1.1 per ten clean windows, not ×1.25, so its stand-in takes
+about 540 s to reach the band against about 270 s from the seed. It matters only
+while nothing moves: motion raises the floor and re-anchors again.
+
+`last_reading_bps` is a field of its own, not the prior's anchor, because q2 can put
+a delivery there: a lower bound, which `damp` would then use to move an entry above
+it down for a session that measured nothing.
+
+**The heartbeat.** `pipe_measured` (what a stall is judged against),
+`readings_refuted` (deliveries that took out what stood below them) and
+`link_unoffered` (valid congested windows the sender was not feeding, a subset of
+`link_stats.0`), in both pumps.
+
 ## Phases
 
 | phase | scope | kill switch | status |
@@ -199,7 +311,7 @@ direct sessions on the MacBook:
 | **V4** | the memory keeps what was MEASURED, damped down-fast/up-slow, and writes nothing when a session measured nothing; deletes the `max` rule, `had_decrease`, the opener arithmetic and its three constants | — | **built 2026-09-08** (net −159 lines), shipped `agent-v0.4.95` (#1542); AC8 half-met |
 | **V5** | the gate answers *is this a MEASUREMENT*, which V1 let every consumer read as *does this window say anything at all*. A transit stall above the measured pipe still reaches the rate-limited MD, the ramp verdict, the age streak and the prior's push-back; everything that sets a NUMBER still reads `valid` | — | **built 2026-09-09**, shipped `agent-v0.4.96` (#1552); AC9 open |
 | **V5a** | `stall_is_ours` compares the target against the composed `pipe_bps` (goodput → the viewer's arrival rate → the prior), not `blocked_send_bps`: the agent's sends block only when the queue is LOCAL, and on a relay it is downstream | — | **built 2026-09-09**, shipped `agent-v0.4.97` (#1566) — `0.4.96` was inert on CORPLAP-3 (`goodput_samples=(0, 5)`) |
-| **V5b** | `stall_is_ours` compares only against a MEASURED source: the blocked-send goodput, or the viewer's arrival rate inside its 15 s TTL. Never against the prior's stand-in, and a stall that carries no number stops walking the prior. Test-first on the 2026-10-20 14:16 arc (§Open decisions, *The V5 loop*) | — | **proposed 2026-10-30**, waiting on the operator; agent code, so it rides the release after `0.4.191` |
+| **V5b** | only a measurement is evidence about the rate. Five rules behind one switch: a stall is judged against a live reading; a delivery takes out a reading it beats by 2×; a hold must be carried; the write-back records a reading or nothing; a growing queue counts only while the sender offered more than arrived. Test-first on the 2026-10-20 14:16 arc and the 2026-11-02 chain (§Key design, *V5b*) | `measured_evidence` (`ROOMLERD_MEASURED_EVIDENCE`), default on: V1's "none" stands for the gate; this one guards a behaviour change while FR-63's read runs | **built 2026-11-03**; agent code, so it rides the first release after the FR-63 read has started; AC8 and AC9 need that build |
 | **Docs** | `docs/rate-control.md` opens with the gate: the verdict, every consumer, V5's exception, the write-back and the seed, and the V3b belief labelled as the shadow it is; `docs/README.md` row updated | — | **2026-09-25** (AC7), in the PR that carries these corrections |
 
 ## Acceptance criteria
@@ -318,6 +430,11 @@ direct sessions on the MacBook:
       `stable_bps()` returns `None` (`ceiling_learn.rs:266`). A second path is
       field-seen too: at 2026-10-30 12:22:06 a session wrote the prior's
       stand-in as its evidence (§Open decisions, *The V5 loop*).*
+      *2026-11-03, V5b built, still `[~]`: q3 makes the first choice a measurement
+      and (a) stops the stand-in writing, so `kept < old` will mean what this
+      criterion says from the release that carries it. The replay shows the
+      mechanism on the chain; the magnitude still needs a carrier measured WELL
+      below the memory, on that build (§Open decisions, *The rig*).*
 
 - [~] **AC9 (V5)** — field: on a session whose transport stalls repeatedly while
       the target sits above the measured pipe, the target CONVERGES toward the
@@ -369,6 +486,11 @@ direct sessions on the MacBook:
       path that delivered 1.2 M before that and 5.39 M after. That is the open
       risk this issue recorded on 2026-09-09, now observed (§Open decisions,
       *The V5 loop*).*
+      *2026-11-03, V5b built, still `[~]`: q1 stops the stand-in judging a stall
+      and q2 takes a disproved reading out, which answers the third ⚠️ point in
+      code. The first two still need a tagged carrier that is thin but above the
+      floor, read on the release that carries V5b, with the convergence shown
+      RED on the build before it.*
       ⚠️ **The control is FR-71's finding 4**: a transit stall on a path the
       session is NOT overdriving must still not cut — that is what
       `stall_is_ours` gates on, and
@@ -385,9 +507,10 @@ own starvation.
 
 ## Open decisions
 
-- **The V5 loop: a stall is "ours" because the last stall said so.** FR-71's
-  2026-10-29 fleet read found it. It was put to the operator on 2026-10-30 and
-  is not answered yet. Anchors printed from master on 2026-10-31:
+- **The V5 loop: a stall is "ours" because the last stall said so.**
+  **DECIDED 2026-11-02: A, by the operator, built as V5b (§Key design).** What
+  follows is the record it was decided on, as it stood. FR-71's
+  2026-10-29 fleet read found it. Anchors printed from master on 2026-10-31:
   - `stall_is_ours` (`governor.rs:1207`–`1216`) lets a `TransitStalled`
     window cut ×0.85 when `desired > 1.2 × pipe_bps`.
   - `pipe_bps` (`:634`) falls back to the prior's stand-in (`:648`) when
@@ -451,6 +574,10 @@ own starvation.
   floor)`: a reading below what the path just delivered is the reading being
   wrong. That makes the floor a consumer for the first time, so it is a second
   decision, recorded here and not bundled into A.
+  **DECIDED 2026-11-02: yes, as q2, narrower than `max(capacity, floor)`.** A
+  reading below the floor is not enough, because the true reading of the week
+  sat lower than the false ones. What counts is a delivery AFTER the reading
+  (§Key design, *The order is the rule*).
 
   ⚠️ **The walk is not what made that prior small (worked out 2026-10-31 from
   FR-71's numbers).** The arithmetic is firm; the last step is an inference.
@@ -499,6 +626,14 @@ own starvation.
   write-back's first choice is the larger gap: `stable_bps()` is a held target,
   not a measurement, and AC8's 18 of 18 rungs are that (the question FR-35 AC1
   turns on; `docs/rate-control.md`, the write-back's field rows).
+  **DECIDED 2026-11-02 for both.** The hold is q3: it must be carried. The tension
+  is (a): V4's rule wins and FR-70 P1's way out goes, with what that costs in
+  §Key design.
+  **Still open.** Nothing clamps a live reading to `hi` in the write-back:
+  2026-10-31 wrote 13,044,940 from a live goodput, not a hold, and moved the
+  memory +28.9 % in 45 s (`docs/rate-control.md`, *Three writes in one night*).
+  That is evidence by these rules, so V5b does not touch it. FR-71's *stall's
+  onset* stays FR-71's: there the sender really is offering, so (b) leaves it.
 - **The rig AC8 and AC9 need (2026-10-30).** Both need a relay that is thin
   AND measured, on demand. The fleet's relays cannot be summoned thin: the
   same carrier measured 1.06 M at 07:41 and 4.41 M at 14:42 on 2026-09-09.
@@ -520,6 +655,11 @@ own starvation.
      opens inside the measured range (AC8's magnitude half).
 
   It is not built. It costs two VMs and waits for a go.
+  *2026-11-03: "a build without V5b" is `0.4.197`, and V5b's build is the release
+  carrying it, or a branch `.deb` from a `release-agent.yml` dispatch with
+  `publish_release=false`. Motion must come from a script in the guest, because
+  an idle screen produces no rate moves. Guests stay inside the zeus cap,
+  `ROOMLERD_AUTO_UPDATE=0`, destroyed by name.*
 - Whether a `ViewerLate` window is evidence about the pipe. Today it is (only
   `TransitStalled` rejects); the viewer being the limiter says nothing about the
   path's capacity, but the goodput estimator only counts blocked sends anyway.
@@ -559,3 +699,4 @@ own starvation.
 | 2026-09-25 (logs of 2026-09-10 → 09-25) | **agent-v0.4.97 → 0.4.101** (V5a + V3b shadow throughout) | AC9 sweep of the three relay laptops' daemon **log files** over Fleet RPC — not `roomler logs`, whose 64 KiB tail ages a finished session out; `KEEP_DAYS = 14` had already pruned the 09-09 files (V5's first day and the 14:41 control run) | **AC9 — no natural occurrence; coverage recorded so that "none" is a count.** 20 worker logs (`service-logs\roomlerd.log.<date>`), **24,013 heartbeats, 7,442 constrained windows in 8 relay sessions**: CORPLAP-1 5 sessions / 2,171 windows (09-10, 09-11), CORPLAP-2 3 sessions / 5,271 windows (09-10, 09-24), CORPLAP-3 0 constrained in 14,373 heartbeats (every session direct — `av1_qsv` at a 34.56 M target; the zero positive-controlled by counting `constrained=false`). Transit stalls in those sessions: 118 + 69 + 6 = **193**, and at every one of them the session held **no pipe estimate**: `goodput_bps` was live in 147 constrained windows in total (2 %: one accepted sample per long session, held for its 60 s TTL), never in a stalled window, and `prior_bps` was `None` in every window pulled (7,395 of the 7,442 — no seed in force, or a measurement at the band leaving nothing to stand in). The detector's verdict function (`analyse`, kept outside the repo because it names hosts; its selftest had been lost, so it was re-validated the same day: `NONE` on these rows, `did NOT converge — ratio 1.89x → 1.82x` on an arc shaped like the 07:41 failure, `CONVERGED` on one that steps ×0.85 per stall) reads **NONE**. What the sweep does show is the negative-control half at scale: the three-hour CORPLAP-2 session (`6ab4de94`, 09-24 08:26–11:21, AV1 over `relay:derp/tcp`, `0.4.100`) held its target at the learned 3,386,718 through **117 of 118** transit stalls — the exception, 10:33:30–34, is an 800 ms locally blocked send inside an `agent-stalled` window (the AIMD's own loop, not the gate) — at a paint age of p50 76 / p95 99 / max 988 ms, `bytes_inflight` ≤ 71 KB, and `pipe_belief_n=(9912, 1)`: one push-back with a number in three hours. ⚠️ The condition AC9 needs — a stall INSIDE a measured minute on a thin relay — did not happen in two weeks of fleet traffic, and nothing here can summon it; the 07:41 arc stays the baseline. |
 | 2026-10-15 → 10-29 (read 2026-10-29 for FR-71; re-read against this FR 2026-10-30) | **agent-v0.4.137 → 0.4.184**; no line of the comparison or the prior's walk changed from `agent-v0.4.137` to master `dfca419fe` (tag diffs, 2026-10-31) | The three corporate laptops' worker logs over Fleet RPC: 67 constrained sessions, 40,654 constrained windows, 812 `transit-stalled` | **AC9: V5 caught converging, but toward the stand-in, not a measurement — the V5 loop, and not the criterion.** 55 drops of exactly ×0.85 on clean gap or split windows, every one on a session whose prior stood at 0.02–0.8 M. Worst: CORPLAP-2, 10-20 13:53–14:19, HEVC over `relay:derp/tcp`, a prior of 17.8–23.7 kbps under a 3.63 M target, 24 gap windows, 3.63 → 0.94 M, 0 B in flight, 3.1 s paint age; the next session 2.55 → 0.20 M. The half that must not regress held where nothing was measured: 433 of 482 clean stall episodes kept the target. Read on master the same day: the comparison falls through `pipe_bps` to the stand-in (`governor.rs:648`), and the cutting branch walks the prior down with no number (`:1439`). The stand-in's values show what set it: 23,688 → 21,535 → 19,578 lie on the measured ×11/10 ladder, above a base of at most 17,799 bps (§Open decisions). **AC8 was not read**: the write-back's line (`peer.rs:2111`–`2118`) was not part of the pull. Decision and rig: §Open decisions. |
 | 2026-10-24 → 10-31 (read 2026-10-31) | **agent-v0.4.187** and **0.4.188** on the sessions traced | The server's `agent_logs`, not the hosts (exec is off-limits on the corporate laptops): CORPLAP-1 2,203 heartbeats, 312 constrained, no prior in any; CORPLAP-2 8,040 heartbeats, 7,766 constrained, 308 with a prior, 30 write-backs. Bounded: one agent and one day per query; Mongo's restart count stayed 1 | **AC9, partly met; the V5 loop on `0.4.187`; AC8's rule reversed.** All three are in §Acceptance criteria and §Open decisions with their numbers. The A/B: over one DERP session stalls cut 13 of 16 times with a stand-in and 0 of 26 with nothing. The measured minute: 2026-10-30 12:19:52–12:20:48, 27 stalls at a live 180,484, the target held at 1.11–1.40×. The write-backs: 18 of 18 on the pair are rungs of the session's own opener, 17 with nothing measured, −43 % in six days; one wrote the stand-in, 84,195. New on the same trace: a live goodput of 223,794 from one 102 ms block on a path that delivered 5.39 M, the open risk of 2026-09-09. ⚠️ Scope: two laptops of the three, a heartbeat spans two windows so a cut is attributed by its heartbeat's counters, `agent_logs` drops lines under load so every count is a lower bound, and the upload keeps 7 days, so these numbers are the record. |
+| 2026-10-27 → 11-03 (read 2026-11-02 and 11-03) | **agent-v0.4.187** → **0.4.197** | The server's `agent_logs`: 10 agents, 7 days, 91,895 heartbeats, 12,643 constrained, bounded reads with Mongo's restart count checked; and the load test on jupiter, 2026-11-02 21:05:18–21:07:34 | **V5b's premises, and how much of the field it moves.** The chain and both tables are in §Key design. Direct windows: **0 move**, all five rules are constrained-only. 360 constrained heartbeats held a prior (308 CORPLAP-2, 52 the load test). Of 601 stall windows by heartbeat, 497 had nothing standing and 51 a live goodput, all unchanged; **53 had only a stand-in** (25 and 28), which is what q1 changes. Of 3 congested reports, (b) stops 1, the load test's, and q2 refutes 1, a natural one. Of 28 write-backs, (a) changes 6, 1 natural: CORPLAP-2's 84,195 and the load test's 5; 1 came from a goodput; 21 are learner holds, which q3 decides. FR-35's replay has 6 of 18 such writes carried, moving that key's end value from 3.38 M to about 4.13 M. RED for the rules is the replay, not the field: the switch-off arm reproduces the session to the unit, and the on arm failed at steps 2, 3 and 5 until (a) and (b) went in. ⚠️ Scope: heartbeats span two windows, `agent_logs` drops lines under load, 10 agents of the fleet, and the VP9 pump's `viewer-rate` line has a different message, so its reports are not in the 3. **No field read of V5b itself yet:** it needs a release. |

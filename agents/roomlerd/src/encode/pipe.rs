@@ -116,6 +116,21 @@
 //! A floor is a LOWER BOUND. It says the path carried at least X. It never
 //! says the path would refuse X + 1, and no amount of idle delivery makes it
 //! say that.
+//!
+//! # ⚠️ One consumer since FR-79 V5b: the floor's rise, and only as a veto
+//!
+//! The floor still never answers *"am I over?"*. What the governor reads is
+//! whether a valid window's delivery RAISED it, and it uses that to take out a
+//! reading the delivery contradicts ([`Pipe::observe_delivered`]). The order is
+//! the rule. Field 2026-10-30 on one laptop, a floor comparison alone gets these
+//! backwards:
+//!
+//! | reading | ÷ the floor when taken | what came after | it was |
+//! |---|---|---|---|
+//! | 709,460 at 12:04:06 | 0.39 | the floor rose to 4,657,230 two seconds later | false |
+//! | 180,484 at 12:19:52 | 0.23 | the floor did not move for the reading's 60 s, 26 more stalls | true |
+//!
+//! Everything else on this type is still SHADOW: the heartbeat's `pipe_belief`.
 
 use std::time::{Duration, Instant};
 
@@ -152,14 +167,22 @@ impl Pipe {
     /// Keeps the MAX for the life of the session: a higher delivery always
     /// wins, and only [`Self::observe_capacity`] with a smaller number takes it
     /// back down.
-    pub fn observe_delivered(&mut self, bps: u32, now: Instant) {
+    ///
+    /// Returns whether this delivery raised the floor, which is the fact FR-79
+    /// V5b reads. A floor that rose is a delivery LATER than anything that set
+    /// it, so it can contradict a reading taken earlier; a floor that stood
+    /// cannot.
+    pub fn observe_delivered(&mut self, bps: u32, now: Instant) -> bool {
         if bps == 0 {
-            return;
+            return false;
         }
         self.delivered_n = self.delivered_n.saturating_add(1);
         match self.floor {
-            Some((best, _)) if bps <= best => {}
-            _ => self.floor = Some((bps, now)),
+            Some((best, _)) if bps <= best => false,
+            _ => {
+                self.floor = Some((bps, now));
+                true
+            }
         }
     }
 
@@ -461,6 +484,23 @@ mod tests {
             "but NOTHING pushed back, so there is no capacity claim — and a \
              target of 3,000,000 here is not evidence of overdriving"
         );
+    }
+
+    /// FR-79 V5b reads the rise, so the return value has to mean exactly that:
+    /// a first delivery and a higher one rise, an equal or lower one does not,
+    /// and a zero window is no delivery at all.
+    #[test]
+    fn a_delivery_says_whether_it_raised_the_floor() {
+        let now = t0();
+        let mut p = Pipe::default();
+        assert!(!p.observe_delivered(0, now), "a zero is not a delivery");
+        assert!(p.observe_delivered(1_199_442, now), "the first one rises");
+        assert!(
+            !p.observe_delivered(1_199_442, now),
+            "an equal one does not"
+        );
+        assert!(!p.observe_delivered(300_000, now), "a lower one does not");
+        assert!(p.observe_delivered(2_423_632, now), "a higher one does");
     }
 
     /// Nothing observed at all is still `None` — the honest answer before the

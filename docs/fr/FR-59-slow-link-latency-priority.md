@@ -41,13 +41,13 @@ therefore **increased**.
 
 1. **A hard 1.5 Mbps bitrate floor.** `MIN_BITRATE_BPS = 1_500_000`
    (`agents/roomlerd/src/encode/mod.rs:219`); on a constrained path `area_min_bitrate_bps()`
-   (`:215`) returns exactly it, and `governor.rs:327` passes it as the AIMD's `floor_bps`.
+   (`:215`) returns exactly it, and `governor.rs:353` passes it as the AIMD's `floor_bps`.
    **The encoder cannot be told to emit less than 1.5 Mbps, ever** — 3.8× the measured pipe at
    best, 23× in the worst window. Every other lever is downstream of a target the encoder is
    not allowed to reach.
 
 2. **The measured-goodput clamp is off on exactly the path that needs it.**
-   `governor.rs:309` — `if self.measured_ceiling && !constrained` — is DIRECT-only, disabled
+   `governor.rs:324` — `if self.measured_ceiling && !constrained` — is DIRECT-only, disabled
    for relay on 2026-08-27 because lumpy TURN-TCP samples crashed the down-fast EWMA. So the
    relay path has **no rate anchor at all**. And `derived_ceiling_bps` is itself
    `.max(1_000_000)` (`goodput.rs:107`), so even re-enabled it could not describe a 395 kbps

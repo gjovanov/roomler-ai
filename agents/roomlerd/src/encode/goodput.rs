@@ -274,6 +274,17 @@ impl GoodputEstimator {
         Some(bps.clamp(0.0, u32::MAX as f64) as u32)
     }
 
+    /// FR-79 V5b — the path delivered at least twice this estimate after it was
+    /// taken, so it is wrong. Dropped outright, because the EWMA's slow way up
+    /// would carry the wrong number into the next reading: a 3 Mbps window
+    /// folded over 224 kbps reads 501 kbps, which nothing measured. The next
+    /// qualifying window is adopted as if it were the first. The counters stay;
+    /// they count windows.
+    pub fn forget(&mut self) {
+        self.ewma_bps = None;
+        self.last_sample_at = None;
+    }
+
     pub fn accepted(&self) -> u64 {
         self.accepted
     }
@@ -293,6 +304,22 @@ mod tests {
             elapsed: Duration::from_millis(ms),
             keyframe: false,
         }
+    }
+
+    /// FR-79 V5b — a forgotten estimate is gone, and the next window starts over
+    /// instead of folding into it. The counters keep counting windows.
+    #[test]
+    fn a_forgotten_estimate_does_not_bias_the_next_one() {
+        let now = Instant::now();
+        let mut e = GoodputEstimator::new();
+        assert!(e.observe_window(&[sample(2_854, 102)], now));
+        assert_eq!(e.accepted(), 1);
+        e.forget();
+        assert_eq!(e.estimate_bps(now), None);
+        assert_eq!(e.accepted(), 1);
+        assert!(e.observe_window(&[sample(37_500, 100)], now));
+        assert_eq!(e.estimate_bps(now), Some(3_000_000), "adopted outright");
+        assert_eq!(e.accepted(), 2);
     }
 
     /// FR-119 P2b-13 — the flag reaches the window as recorded.

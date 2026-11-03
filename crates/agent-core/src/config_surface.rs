@@ -1601,6 +1601,14 @@ const KEYS: &[KeyMeta] = &[
         description: "Queue drain (2026-09-01, FR-59 P4). Default ON: when the viewer reports a transit queue deeper than a rate cut can clear in reasonable time, the pump STOPS producing for a bounded sub-second pause so the queue drains. A rate cut alone drains at capacity minus inflow, which is the slowest possible way - converging to 90% of a 400 kbps pipe clears a 2 s backlog at 40 kbps, i.e. over ~20 s, which is why a field session stayed seconds behind even after it stopped growing. Pausing sets inflow to zero so the same backlog clears in the ~2 s it represents. Deliberately no forced keyframe on resume: a pause loses no frames so the delta chain survives, and an IDR at these rates is itself seconds of transit. Skipping production rather than discarding the agent queue is the only lever that reaches a queue living in the relay and the carrier - those bytes are already sent and cannot be recalled. false = rate control only. Env: ROOMLERD_QUEUE_DRAIN. Restart required.",
     },
     KeyMeta {
+        key: "measured_evidence",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Measured evidence (2026-11-02, FR-79 V5b). Default ON: only a measurement is evidence about the rate. A transit stall is judged against a live reading (the goodput, or the viewer's arrival rate inside its TTL) and never against the prior's stand-in, and it no longer walks that prior. A delivery that raises the demonstrated floor to at least twice a reading takes the reading out. A hold reaches the pair memory only if a valid window carried it, and a session with no reading writes nothing there. A growing viewer queue counts only while the sender offered more than arrived. `false` restores FR-79 V5a's rules.",
+    },
+    KeyMeta {
         key: "slow_link_profile",
         group: Group::VideoRate,
         tier: Tier::Advanced,
@@ -2195,6 +2203,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "seed_contradiction" => cfg.seed_contradiction.map(fmt_bool),
         "viewer_rate_clamp" => cfg.viewer_rate_clamp.map(fmt_bool),
         "queue_drain" => cfg.queue_drain.map(fmt_bool),
+        "measured_evidence" => cfg.measured_evidence.map(fmt_bool),
         "slow_link_profile" => cfg.slow_link_profile.map(fmt_bool),
         "slow_link_profile_bps" => cfg.slow_link_profile_bps.map(|p| p.to_string()),
         "bg_rebuild" => cfg.bg_rebuild.map(fmt_bool),
@@ -2816,6 +2825,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "seed_contradiction" => cfg.seed_contradiction = parse_tribool(value)?,
         "viewer_rate_clamp" => cfg.viewer_rate_clamp = parse_tribool(value)?,
         "queue_drain" => cfg.queue_drain = parse_tribool(value)?,
+        "measured_evidence" => cfg.measured_evidence = parse_tribool(value)?,
         "slow_link_profile" => cfg.slow_link_profile = parse_tribool(value)?,
         "slow_link_profile_bps" => {
             cfg.slow_link_profile_bps = parse_u32_range(key, value, 0, 100_000_000)?

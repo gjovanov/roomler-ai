@@ -86,7 +86,8 @@ pub struct ViewerWindow {
     pub ceiling_grown: Option<super::ceiling_learn::Grow>,
     /// FR-59 P3 — the viewer's transit queue has grown for two
     /// consecutive windows: the agent is putting bits in faster than they
-    /// come out, whatever its own send queue says.
+    /// come out, whatever its own send queue says. FR-79 V5b — and the sender
+    /// offered more than arrived in both, see `viewer_rate::OfferLoop`.
     pub link_congested: bool,
     /// FR-59 P3 — the ceiling that window's ARRIVAL rate justifies.
     /// `None` unless `link_congested` — see `viewer_rate::LinkLoop`.
@@ -134,6 +135,13 @@ pub struct GovernorFlags {
     /// FR-59 P4 — a transit queue too deep to cut our way out of is
     /// DRAINED by pausing production (`encode::queue_drain_enabled`).
     pub queue_drain: bool,
+    /// FR-79 V5b — only a measurement is evidence about the rate
+    /// (`encode::measured_evidence_enabled`): a stall is judged against a live
+    /// reading, a later delivery can take a reading out, a hold must be carried
+    /// to reach the pair memory, the memory records a reading or nothing, and a
+    /// growing queue counts only while the sender offered more than arrived.
+    /// Off = V5a's rules, byte for byte.
+    pub measured_evidence: bool,
     /// FR-63 — the opener ramps instead of committing to a constant
     /// (`encode::rate_slow_start_enabled`).
     ///
@@ -161,6 +169,7 @@ impl Default for GovernorFlags {
             seed_contradiction: true,
             viewer_rate_clamp: true,
             queue_drain: true,
+            measured_evidence: true,
             // FR-63 — see the field doc: OFF even here, until field evidence.
             slow_start: false,
             // FR-63 B1 — the shadow runs by default; it drives nothing, so ON
@@ -185,6 +194,7 @@ impl GovernorFlags {
             seed_contradiction: super::seed_contradiction_enabled(),
             viewer_rate_clamp: super::viewer_rate_clamp_enabled(),
             queue_drain: super::queue_drain_enabled(),
+            measured_evidence: super::measured_evidence_enabled(),
             slow_start: super::rate_slow_start_enabled(),
             ratectl: super::ratectl_mode(),
         }
@@ -264,6 +274,11 @@ pub struct RateGovernor {
     relieved_floor_bps: Option<u32>,
     /// FR-59 P3 — the viewer-side congestion loop.
     link_loop: viewer_rate::LinkLoop,
+    /// FR-79 V5b — was the sender feeding the queue that loop says is growing?
+    offer_loop: viewer_rate::OfferLoop,
+    /// FR-79 V5b — valid congested windows the sender was not feeding, for the
+    /// heartbeat: "the loop went quiet" and "this rule stopped it" read apart.
+    link_unoffered: u32,
     /// FR-59 P3 — the viewer's ARRIVAL rate and when it was reported.
     /// Held only while its queue is growing (see `viewer_rate::LinkLoop`
     /// for why that gate is not optional), and expired by
@@ -313,9 +328,20 @@ pub struct RateGovernor {
     evidence: super::evidence::Rejections,
     /// FR-79 V3b / FR-74 — the ONE belief about what the path carries, fed by
     /// every window (a demonstrated floor) and by every push-back (a capacity
-    /// estimate). SHADOW for now: computed and reported, read by no consumer,
-    /// so the field can compare it against `pipe_bps` before anything acts.
+    /// estimate). SHADOW for now: computed and reported, so the field can compare
+    /// it against `pipe_bps` before anything acts. The one exception is V5b,
+    /// which reads a rise of the floor as a veto on a reading ([`Self::refute_readings`]).
     belief: super::pipe::Pipe,
+    /// FR-79 V5b — how many times a delivery took out what stood below it, for
+    /// the heartbeat.
+    readings_refuted: u32,
+    /// FR-79 V5b — the last reading a valid window held, the goodput ahead of the
+    /// arrival rate, as the prior anchors. It outlives both their TTLs, because a
+    /// truly slow pair's reading expires long before the session ends and FR-59
+    /// P8 needs it in the memory. Not the prior's anchor, which [`Self::refute_readings`]
+    /// can set to a delivery: a lower bound, and it would move an entry above it
+    /// down for a session that measured nothing.
+    last_reading_bps: Option<u32>,
     /// FR-35 — a send blocked ≥ `HARD_STALL` since the last window boundary.
     /// The ×0.5 it earns is applied there, where the gate can say whether the
     /// block was the pipe (FR-79).
@@ -455,13 +481,16 @@ impl RateGovernor {
             pace: super::encode_pressure::FpsPace::new(),
             sw_pace: super::encode_pressure::SoftwarePace::new(),
             measured_ceiling: flags.measured_ceiling,
-            learner: super::ceiling_learn::CeilingLearner::new(ceiling_hi_bps, ceiling_seed_bps),
+            learner: super::ceiling_learn::CeilingLearner::new(ceiling_hi_bps, ceiling_seed_bps)
+                .with_carried_hold(flags.measured_evidence),
             last_decreases: 0,
             last_sent_bytes: 0,
             slow_link: flags,
             seed_abandoned_bps: None,
             relieved_floor_bps: None,
             link_loop: viewer_rate::LinkLoop::new(),
+            offer_loop: viewer_rate::OfferLoop::default(),
+            link_unoffered: 0,
             link_rx_bps: None,
             drain_until: None,
             open_seed_bps: ceiling_seed_bps
@@ -482,6 +511,8 @@ impl RateGovernor {
             window_sender: None,
             evidence: super::evidence::Rejections::default(),
             belief: super::pipe::Pipe::default(),
+            readings_refuted: 0,
+            last_reading_bps: None,
             window_hard_stall: false,
             slow_start: None,
             slow_start_logged: false,
@@ -635,18 +666,136 @@ impl RateGovernor {
         if !constrained {
             return None;
         }
+        // FR-59 P8 — with no live evidence at all, the remembered rate
+        // (lowest priority: any measurement outranks it). FR-70 P1: the
+        // rate as it DECAYS, so the queue budget denominated in it cannot
+        // seal the session against the measurement that would replace it.
+        self.measured_bps(now, constrained)
+            .or(self.prior.stand_in_bps())
+    }
+
+    /// FR-79 V5b — [`Self::pipe_bps`] without the stand-in: what this session
+    /// has actually MEASURED, right now. `None` = no claim to contradict.
+    ///
+    /// ⚠️ This, not `pipe_bps`, is what a stall is judged against. The stand-in
+    /// is a number nobody measured, and a cut made against it used to lower it
+    /// for the next stall.
+    pub fn measured_bps(&self, now: Instant, constrained: bool) -> Option<u32> {
+        if !constrained {
+            return None;
+        }
         let link = match self.link_rx_bps {
             Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => Some(rx),
             _ => None,
         };
         match (self.goodput.estimate_bps(now), link) {
             (Some(g), Some(rx)) => Some(g.min(rx)),
-            // FR-59 P8 — with no live evidence at all, the remembered rate
-            // (lowest priority: any measurement outranks it). FR-70 P1: the
-            // rate as it DECAYS, so the queue budget denominated in it cannot
-            // seal the session against the measurement that would replace it.
-            (g, rx) => g.or(rx).or(self.prior.stand_in_bps()),
+            (g, rx) => g.or(rx),
         }
+    }
+
+    /// What this session has to say to the pair memory right now, `None` for
+    /// nothing. The pump reads it once per viewer window, and the last answer is
+    /// what [`rate_memory::RateMemory::record_session`] gets when the session
+    /// ends, whichever way it ends.
+    ///
+    /// FR-35 P3b — the memory wants the rate the pipe actually CARRIED, not just
+    /// the learner's above-nominal ceiling. On a short or frozen session the
+    /// learner never rises, so `stable_bps()` is `None`. FR-70 P1 — then what the
+    /// session actually KNOWS about the pipe: a live measurement, or the prior as
+    /// it has decayed. FR-79 V4 — evidence only: the applied rate used to stand
+    /// in when nothing measured, which is the memory learning from itself.
+    /// FR-79 V5b — `stable_bps()` is a hold a valid window carried. A hold nothing
+    /// carried used to write the session's own opener back here.
+    ///
+    /// ⚠️ FR-79 V5b (a), reversing FR-70 P1 — with the rules on, the stand-in is
+    /// not evidence: what a session writes after its hold is a reading, live or
+    /// the last it took, and a session with neither writes nothing, so a key's
+    /// timestamp is not refreshed. P1 wrote the decayed prior on purpose, so that
+    /// a session measuring nothing could free a pair misremembered slow. That way
+    /// out barely worked (V4 moves an entry a tenth of the gap upward, and past the
+    /// band a stand-in is `None`), and on the way down it held a key low by itself.
+    /// Field 2026-11-02, jupiter: a false reading of 9,489 walked to 3,322, was
+    /// written, and each session opened from it wrote its own stand-in back with a
+    /// fresh TTL: 3,322 → 2,989 → 2,690, with no rise in five writes.
+    ///
+    /// [`rate_memory::RateMemory::record_session`]: super::rate_memory::RateMemory::record_session
+    #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+    pub fn session_evidence_bps(&self, now: Instant, constrained: bool) -> Option<u32> {
+        if !self.slow_link.measured_evidence {
+            return self
+                .stable_bps()
+                .or_else(|| self.pipe_bps(now, constrained));
+        }
+        self.stable_bps()
+            .or_else(|| self.measured_bps(now, constrained))
+            .or(self.last_reading_bps.filter(|_| constrained))
+    }
+
+    /// FR-79 V5b — a valid window delivered `delivered_bps`, and that raised the
+    /// floor: it came after whatever set the floor before it. Any reading it beats
+    /// by [`CONTRADICTION_FACTOR`] is wrong, because the bytes arrived, so it
+    /// stops counting: the goodput estimate is forgotten, the arrival-rate clamp
+    /// lifts, and a stand-in loses its base. Returns the delivery if anything
+    /// fell, for the prior to re-anchor on.
+    ///
+    /// ⚠️ The floor rising is what makes this safe, and comparing a reading
+    /// against the floor is not the same rule. Field 2026-10-30 on one laptop:
+    /// the reading of 180,484 at 12:19:52 was true (paint age 6.1 s, then 26 more
+    /// stalls at 200–253 kbps), and it sat at 0.23 of the floor. The reading of
+    /// 709,460 at 12:04:06 was false (4,657,230 delivered two seconds later), and
+    /// it sat at 0.39. A week of two laptops (13,575 heartbeats, 5 readings)
+    /// sorts correctly by the rise: both false readings fell within 2 s, and the
+    /// floor did not move for the true one's 60 s.
+    ///
+    /// ⚠️ It goes through nothing but the viewer's report on a VALID window. A
+    /// stall's shadow is its backlog draining, and FR-79's own rule is that no
+    /// consumer acts on a rejected window.
+    ///
+    /// [`CONTRADICTION_FACTOR`]: super::ceiling_learn::CONTRADICTION_FACTOR
+    fn refute_readings(&mut self, delivered_bps: u32, now: Instant) -> Option<u32> {
+        let refutes = |reading: u32| {
+            u64::from(delivered_bps)
+                >= u64::from(reading) * u64::from(super::ceiling_learn::CONTRADICTION_FACTOR)
+        };
+        // Whether or not it has expired: the write-back would still use it.
+        self.last_reading_bps = self.last_reading_bps.filter(|r| !refutes(*r));
+        let goodput = self.goodput.estimate_bps(now).filter(|g| refutes(*g));
+        if goodput.is_some() {
+            self.goodput.forget();
+        }
+        let link = match self.link_rx_bps {
+            Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => Some(rx),
+            _ => None,
+        }
+        .filter(|rx| refutes(*rx));
+        if link.is_some() {
+            self.link_rx_bps = None;
+        }
+        let stand_in = self.prior.stand_in_bps().filter(|s| refutes(*s));
+        if goodput.is_none() && link.is_none() && stand_in.is_none() {
+            return None;
+        }
+        self.readings_refuted = self.readings_refuted.saturating_add(1);
+        tracing::info!(
+            delivered_bps,
+            goodput_bps = ?goodput,
+            arrival_bps = ?link,
+            stand_in_bps = ?stand_in,
+            "FR-79 V5b: the path delivered at least twice what stood below it — \
+             those readings no longer count"
+        );
+        Some(delivered_bps)
+    }
+
+    /// FR-79 V5b — how many times a delivery took out what stood below it.
+    pub fn readings_refuted(&self) -> u32 {
+        self.readings_refuted
+    }
+
+    /// FR-79 V5b — valid congested windows the sender was not feeding.
+    pub fn link_unoffered(&self) -> u32 {
+        self.link_unoffered
     }
 
     /// FR-59 P3 — is the viewer's arrival-rate clamp currently HELD (a live
@@ -1091,9 +1240,9 @@ impl RateGovernor {
         // a relay-TCP session could finish knowing nothing about its own path
         // (CORPLAP-3, `goodput_samples=(0, 5)`). It is a FLOOR, never a
         // capacity: an idle desktop delivers 300 kbps through a gigabit path.
-        if let Some((rx_bps, _)) = link {
-            self.belief.observe_delivered(rx_bps, now);
-        }
+        // V5b reads whether it rose, once the window has a verdict.
+        let floor_raised =
+            link.is_some_and(|(rx_bps, _)| self.belief.observe_delivered(rx_bps, now));
         // The window's blocked-send samples. Drained here rather than per
         // frame — the send task is a different task, and this is the existing
         // once-a-second rendezvous. Whether they are FOLDED is the gate's call,
@@ -1204,11 +1353,19 @@ impl RateGovernor {
         // and V5 was inert on that host. `pipe_bps` composes the same goodput
         // with the viewer's arrival rate and falls back to the decaying prior,
         // which is what "how fast is the link" has meant since FR-59 P3.
+        // ⚠️ V5b — but a stall needs a MEASUREMENT to contradict, so it stops
+        // short of that fallback. Field 2026-10-30 11:48–12:19, CORPLAP-2, one
+        // session on `relay:derp/tcp`: stalls cut 13 times of 16 with a stand-in
+        // standing and 0 of 26 with nothing, the target spending 3 min 12 s under
+        // 1 M on a path that delivered 5.39 M. And 2026-10-20 14:16: a stand-in of
+        // 19,578 under a 1.17 M target, so every stall read as ours.
+        let stall_reference = if self.slow_link.measured_evidence {
+            self.measured_bps(now, constrained)
+        } else {
+            self.pipe_bps(now, constrained)
+        };
         let stall_is_ours = rejection.is_some_and(|r| r.is_congestion())
-            && match (
-                self.pipe_bps(now, constrained),
-                self.aimd.as_ref().map(|c| c.desired()),
-            ) {
+            && match (stall_reference, self.aimd.as_ref().map(|c| c.desired())) {
                 // A fifth of slack so a session parked at the measurement does
                 // not chatter in and out of cutting on rounding alone.
                 (Some(pipe), Some(desired)) => desired > pipe.saturating_add(pipe / 5),
@@ -1309,6 +1466,16 @@ impl RateGovernor {
         let verdict = link
             .map(|(rx_bps, queue_ms)| self.link_loop.observe(rx_bps, queue_ms))
             .unwrap_or_default();
+        // FR-79 V5b — a growing queue says nothing about the rate unless the
+        // sender was feeding it (`viewer_rate::OfferLoop`, which says why the
+        // classifier's word counts too). Asked of every report, whatever the
+        // switch says, so the streak stays true to the windows.
+        let offered = link.is_some_and(|(rx_bps, _)| {
+            self.offer_loop.observe(
+                state == super::pipe_state::PipeState::Overproduced
+                    || viewer_rate::offered_over_arrival(sent_bps, rx_bps),
+            )
+        }) || !self.slow_link.measured_evidence;
         // FR-79 — on an invalid window the clamp is neither armed nor released:
         // whatever it held before the stall, it still holds. The report that
         // lands in a stall's shadow is the stall's own arrival rate (field
@@ -1335,13 +1502,17 @@ impl RateGovernor {
         }
         if link_acts {
             match (verdict.congested, link) {
-                (true, Some((rx_bps, _))) => {
+                (true, Some((rx_bps, _))) if offered => {
                     // FR-79 V3b — an arrival rate measured while the viewer's
                     // queue is GROWING is the path's limit, not merely a
-                    // delivery: the sender was offering more than arrived.
+                    // delivery: the sender was offering more than arrived,
+                    // which V5b checks and no longer assumes.
                     self.belief.observe_capacity(rx_bps, now);
                     self.link_rx_bps = Some((rx_bps, now));
                 }
+                // FR-79 V5b — neither arms nor releases: the queue did grow, so
+                // whatever the clamp holds it still holds, and on its own TTL.
+                (true, Some(_)) => self.link_unoffered = self.link_unoffered.saturating_add(1),
                 // FR-59 — ONSET and HOLD read different sensors, because
                 // they ask different questions.
                 //
@@ -1378,10 +1549,21 @@ impl RateGovernor {
                 _ => {}
             }
         }
+        // FR-79 V5b — taken after this window's own readings are in, so a blocked
+        // send the same window's delivery beats is out at once. Everything that
+        // reads the pipe below and in the next tick sees the result.
+        let refuted_by = match link {
+            Some((rx_bps, _))
+                if constrained && valid && floor_raised && self.slow_link.measured_evidence =>
+            {
+                self.refute_readings(rx_bps, now)
+            }
+            _ => None,
+        };
         // FR-59 P3 — a growing transit queue folds into `struggling` exactly
         // as FR-15's age excess does: an instant, re-open-free byte cut
         // through machinery that already exists.
-        let link_over = link_acts && verdict.congested;
+        let link_over = link_acts && verdict.congested && offered;
         let own_div = self.viewer_rate.observe(
             reported_fps,
             struggling || age_over || link_over,
@@ -1424,23 +1606,41 @@ impl RateGovernor {
         // prior does not move at all.
         if constrained && valid {
             let stall_seen = std::mem::take(&mut self.stall_seen);
-            let live = self.goodput.estimate_bps(now).or(match self.link_rx_bps {
+            // FR-79 V5b — a delivery that refuted something re-anchors the prior
+            // when no reading is left: the stand-in then says "carried at least
+            // this", not the number the delivery disproved. Past the band that
+            // ends the prior, and the session is the unremembered one.
+            let reading = self.goodput.estimate_bps(now).or(match self.link_rx_bps {
                 Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => Some(rx),
                 _ => None,
             });
+            if reading.is_some() {
+                self.last_reading_bps = reading;
+            }
+            let live = reading.or(refuted_by);
             let pushed_back =
                 age_over || age_elevated || link_over || drain_for_ms.is_some() || stall_seen;
             self.prior.on_window(live, pushed_back);
-        } else if constrained && stall_is_ours {
+        } else if constrained && stall_is_ours && !self.slow_link.measured_evidence {
             // FR-79 V5 — no measurement (the stall's own numbers are not the
             // pipe's: that is the 14:52 defect), but the push-back is real, so
             // the prior re-anchors instead of decaying toward the band as it
             // would on a window where the pipe simply did not push back.
+            //
+            // ⚠️ V5b — behind the kill switch only. A stall carries no number, so
+            // this walked the prior with nothing behind it: 180,484 → 84,195 in
+            // 28 s on 2026-10-30, and the session then wrote 84,195 to the pair
+            // memory as evidence. A rejected window now leaves the prior alone.
             self.prior.on_window(None, true);
         }
         // FR-35 — hand the learner this window's evidence.
         let ceiling_grown = if constrained {
             let desired = self.aimd.as_ref().map(|c| c.desired()).unwrap_or(0);
+            // FR-79 V5b — only a valid window can carry a hold: the opener's
+            // keyframe falls in a rejected one.
+            if valid {
+                self.learner.note_carried(desired, sent_bps);
+            }
             self.learner
                 .on_window(desired, sent_bps, self.last_viewer_age, now)
         } else {
@@ -1482,7 +1682,7 @@ impl RateGovernor {
             age_over,
             ceiling_grown,
             link_congested: link_over,
-            link_ceiling_bps: verdict.ceiling_bps,
+            link_ceiling_bps: verdict.ceiling_bps.filter(|_| offered),
             drain_for_ms,
         })
     }
@@ -2017,6 +2217,7 @@ mod tests {
         }
         assert_eq!(g.prior_bps(), Some(312_500));
         // Four windows of a growing transit queue at 300 kbps of arrival.
+        let growing_from = now;
         for _ in 0..4 {
             now += Duration::from_secs(1);
             g.tick_viewer_window(
@@ -2027,7 +2228,7 @@ mod tests {
                 || viewer_rate::pack_link(300_000, 200),
                 true,
                 |o| o,
-                0,
+                offering(growing_from, now),
             );
         }
         assert_eq!(
@@ -2623,7 +2824,7 @@ mod tests {
                     || viewer_rate::pack_link(400_000, 250),
                     true,
                     |o| o,
-                    0,
+                    offering(start, t),
                 )
                 .expect("window due");
             if i >= 1 {
@@ -2800,7 +3001,7 @@ mod tests {
                 || viewer_rate::pack_link(400_000, q),
                 true,
                 |o| o,
-                0,
+                offering(start, *t),
             )
             .expect("window due")
         };
@@ -2881,7 +3082,7 @@ mod tests {
                 || viewer_rate::pack_link(400_000, q),
                 true,
                 |o| o,
-                0,
+                offering(start, *t),
             )
             .expect("window due")
         };
@@ -2944,7 +3145,7 @@ mod tests {
                 || viewer_rate::pack_link(400_000, q),
                 true,
                 |o| o,
-                0,
+                offering(start, *t),
             )
         };
         win(&mut g, &mut t, 300);
@@ -2986,7 +3187,7 @@ mod tests {
                 || viewer_rate::pack_link(400_000, 300),
                 true,
                 |o| o,
-                0,
+                offering(start, t),
             );
         }
         assert_eq!(
@@ -3031,7 +3232,9 @@ mod tests {
                         || viewer_rate::pack_link(400_000, 250),
                         constrained,
                         |o| o,
-                        0,
+                        // The bytes matter: with none, FR-79 V5b would stop this
+                        // report and the switch under test would prove nothing.
+                        offering(start, t),
                     )
                     .expect("window due");
                 assert!(!w.link_congested, "{label}: must not act");
@@ -3992,6 +4195,7 @@ mod tests {
             g.applied_bps()
         );
         // The windows after THAT are the pipe again: growing reports there act.
+        let reporting_from = t;
         for q in [900i16, 1200] {
             t += Duration::from_millis(1100);
             g.note_window_sender(t2_sender(30));
@@ -4003,7 +4207,7 @@ mod tests {
                 || viewer_rate::pack_link(400_000, q),
                 true,
                 |o| o,
-                0,
+                offering(reporting_from, t),
             )
             .expect("window due");
         }
@@ -4200,6 +4404,1106 @@ mod tests {
             "a relay keeps the keyframe sample"
         );
         assert!(r.blocked_send_bps(t1).is_some(), "and folds it");
+    }
+
+    /// FR-79 V5b — the pump's running byte total at 1 Mbps since `from`: over 1.1 ×
+    /// every arrival rate these cells report, so a growing queue counts, and under
+    /// the 70 % of their ceilings that would carry a hold.
+    fn offering(from: Instant, t: Instant) -> u64 {
+        t.duration_since(from).as_millis() as u64 * 125
+    }
+
+    /// FR-79 V5b — a relayed session with only the rule under test in the way.
+    /// `measured_ceiling` is off for the reason the V5 cell above gives.
+    fn v5b_governor(start: Instant, seed: Option<u32>) -> RateGovernor {
+        v5b_governor_hi(start, 8_000_000, seed)
+    }
+
+    /// With the learner's `hi` at the seeded ceiling it cannot step, so a window
+    /// that carries the target does not also move it off the hold.
+    fn v5b_governor_hi(start: Instant, hi_bps: u32, seed: Option<u32>) -> RateGovernor {
+        RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                measured_ceiling: false,
+                age_feedback: true,
+                ..GovernorFlags::default()
+            },
+            hi_bps,
+            seed,
+            start,
+        )
+    }
+
+    fn v5b_sender() -> WindowSenderStats {
+        WindowSenderStats {
+            inflight_bytes: 1_500,
+            budget_bytes: 128_000,
+            gate_skips: 0,
+            send_wait_max_ms: 1.0,
+            send_wait_avg_ms: Some(0.5),
+            frames_sent: 30,
+            stalled_passes: 0,
+            opening: false,
+        }
+    }
+
+    /// One reported window at a healthy paint age, carrying `link`, the pump idle.
+    fn v5b_reported(g: &mut RateGovernor, t: &mut Instant, link: u64) {
+        v5b_sending(g, t, link, 0);
+    }
+
+    /// One reported window with the pump's running byte total at `sent`.
+    fn v5b_sending(g: &mut RateGovernor, t: &mut Instant, link: u64, sent: u64) {
+        *t += Duration::from_millis(1100);
+        g.note_window_sender(v5b_sender());
+        g.tick_viewer_window(
+            *t,
+            30,
+            || viewer_rate::pack_report(30, false),
+            || viewer_rate::pack_age_with_arrival(70, 68, 80, 69),
+            || link,
+            true,
+            |o| o,
+            sent,
+        )
+        .expect("window due");
+    }
+
+    /// A silent window with the pump still sending: a transit stall.
+    fn v5b_gap(g: &mut RateGovernor, t: &mut Instant) {
+        *t += Duration::from_millis(1100);
+        g.note_window_sender(v5b_sender());
+        g.tick_viewer_window(*t, 30, || 0, || 0, || 0, true, |o| o, 0)
+            .expect("window due");
+        assert_eq!(
+            g.pipe_state(),
+            Some(crate::encode::pipe_state::PipeState::TransitStalled)
+        );
+    }
+
+    /// `pack_link`'s arrival rate, in a window whose queue did not grow.
+    fn v5b_delivery(rx_bps: u32) -> u64 {
+        viewer_rate::pack_link(rx_bps, 0)
+    }
+
+    /// The pump's tick at a 3 M plan: a real send capacity, so nothing but the
+    /// rule under test can lower the rate.
+    fn v5b_tick(g: &mut RateGovernor, t: Instant) -> u32 {
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        g.applied_bps()
+    }
+
+    /// One 102 ms blocked send folds as the field's 223,794 bps: the same bytes
+    /// and time as the 2026-10-30 11:48:36 reading, in a valid window.
+    fn v5b_fold_223794(g: &mut RateGovernor, t: &mut Instant) {
+        g.goodput_sink()
+            .record(2_854, Duration::from_micros(102_022));
+        v5b_reported(g, t, 0);
+        assert_eq!(g.blocked_send_bps(*t), Some(223_794));
+    }
+
+    /// FR-79 V5b — the fail-first cell. Field 2026-10-20 13:53–14:19, CORPLAP-2,
+    /// HEVC over `relay:derp/tcp`: `goodput_bps=None` throughout, a prior of
+    /// 17.8–23.7 kbps under a 3.63 M target, 24 gap windows, 3.63 → 0.94 M with
+    /// 0 B in flight. At 14:16, prior 19,578: 1.17 → 1.00 → 0.85 → 0.61 M.
+    ///
+    /// Each cut also walked the number the next stall was judged against. With
+    /// a stand-in standing, a stall read "ours" every time. With nothing
+    /// standing it never did, which is the A/B from 2026-10-30 11:48–12:19: 13
+    /// cuts of 16 stalls with a stand-in, 0 of 26 with nothing, one session,
+    /// one path, one build. So the cell runs every prior FR-71's 55 drops saw,
+    /// with the no-prior arm as its control.
+    #[test]
+    fn a_stall_with_only_a_stand_in_standing_cuts_nothing() {
+        for prior in [None, Some(19_578), Some(223_794), Some(800_000)] {
+            let start = Instant::now();
+            let mut t = start;
+            let mut g = v5b_governor(start, None);
+            // The classifier calls a silent window a stall only once the viewer
+            // has reported at all.
+            v5b_reported(&mut g, &mut t, 0);
+            if let Some(p) = prior {
+                g.prior.on_window(Some(p), false);
+            }
+            assert_eq!(g.pipe_bps(t, true), prior, "the premise");
+            let before = v5b_tick(&mut g, t);
+            assert_eq!(before, 3_000_000, "at the plan, so no climb can hide a cut");
+            for _ in 0..3 {
+                v5b_gap(&mut g, &mut t);
+                v5b_tick(&mut g, t);
+            }
+            assert_eq!(
+                g.applied_bps(),
+                before,
+                "prior {prior:?}: a stand-in is not a measurement"
+            );
+            assert_eq!(
+                g.prior_bps(),
+                prior,
+                "prior {prior:?}: a stall with no number does not walk it"
+            );
+        }
+    }
+
+    /// FR-79 V5b — a stall above a LIVE measurement still cuts (the 07:41 fix),
+    /// but it carries no number, so the prior does not walk under it. Field
+    /// 2026-10-30 12:20:22–40: the prior fell 180,484 → 164,076 → 149,160 while
+    /// `goodput_bps` read 180,484, and once the goodput expired it went on down
+    /// to 84,195, which the session then wrote to the pair memory as evidence.
+    #[test]
+    fn a_stall_that_cuts_does_not_walk_the_prior() {
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = v5b_governor(start, None);
+        let sink = g.goodput_sink();
+        for _ in 0..12 {
+            sink.record(1_500, Duration::from_millis(12));
+        }
+        v5b_reported(&mut g, &mut t, 0);
+        assert_eq!(
+            g.blocked_send_bps(t),
+            Some(1_000_000),
+            "the one measurement"
+        );
+        assert_eq!(g.prior_bps(), Some(1_000_000), "the prior anchors on it");
+        let before = v5b_tick(&mut g, t);
+        for _ in 0..2 {
+            v5b_gap(&mut g, &mut t);
+        }
+        assert!(
+            v5b_tick(&mut g, t) < before,
+            "the stall above it still cuts"
+        );
+        assert_eq!(
+            g.prior_bps(),
+            Some(1_000_000),
+            "two numberless stalls must not move the prior"
+        );
+    }
+
+    /// FR-79 V5b, the second half. Field 2026-10-30 11:48:36, CORPLAP-2 on
+    /// `0.4.187`: one 102 ms blocked send folded as `goodput_bps=223,794`, and
+    /// two seconds later the viewer reported 1,199,442 arriving. The path
+    /// delivered 5.39 M seven minutes on. The reading stood its 60 s TTL
+    /// anyway: the target fell 3.0 → 0.68 M in 22 s at a paint age of 50–104 ms,
+    /// through V5's cut and the queue budget denominated in the same number.
+    ///
+    /// A reading below what the path then delivered is the reading being wrong.
+    #[test]
+    fn a_delivery_after_a_reading_takes_the_reading_out() {
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = v5b_governor(start, None);
+        v5b_fold_223794(&mut g, &mut t);
+        let before = v5b_tick(&mut g, t);
+        v5b_reported(&mut g, &mut t, v5b_delivery(1_199_442));
+        assert_eq!(g.belief_bps(t).1, Some(1_199_442), "the floor rose");
+        assert_eq!(
+            g.pipe_bps(t, true),
+            Some(1_199_442),
+            "what the path delivered stands in, and the reading is gone"
+        );
+        for _ in 0..2 {
+            v5b_gap(&mut g, &mut t);
+        }
+        assert_eq!(
+            v5b_tick(&mut g, t),
+            before,
+            "with the reading refuted a stall has no claim to contradict"
+        );
+    }
+
+    /// FR-79 V5b — the control the rule above must not break, and why it cannot
+    /// be a plain `reading < floor`. Field 2026-10-30 12:19:52, the same
+    /// laptop twenty minutes later: 1,546,425 delivered nine seconds BEFORE a
+    /// reading of 180,484, at a paint age of 6.1 s, on a path that went on
+    /// stalling at 200–253 kbps. That reading was true, and it sat at 0.23 of
+    /// the floor, where the false 12:04:06 one sat at 0.39, so a comparison
+    /// against the floor alone would throw out the true one and could keep the
+    /// false one. What tells them apart is the order: nothing delivered AFTER
+    /// the 12:19:52 reading raised the floor, for the whole of its 60 s TTL.
+    #[test]
+    fn a_delivery_before_a_reading_does_not_refute_it() {
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = v5b_governor(start, None);
+        v5b_reported(&mut g, &mut t, v5b_delivery(1_546_425));
+        // 1,500 bytes over 66.5 ms is 180,451 bps, the field's reading to 0.02 %.
+        g.goodput_sink()
+            .record(1_500, Duration::from_micros(66_500));
+        v5b_reported(&mut g, &mut t, 0);
+        let reading = g.blocked_send_bps(t).expect("the reading");
+        assert!(
+            u64::from(reading) * 2 < u64::from(g.belief_bps(t).1.expect("a floor")),
+            "the premise: the reading sits far under the floor"
+        );
+        let before = v5b_tick(&mut g, t);
+        // What arrives after it stays under the damped floor: twice the reading
+        // and more, but the floor does not rise, as it did not in the field.
+        for rx in [225_000, 253_125, 400_000] {
+            v5b_reported(&mut g, &mut t, v5b_delivery(rx));
+        }
+        assert_eq!(g.pipe_bps(t, true), Some(reading), "the reading stands");
+        assert_eq!(g.blocked_send_bps(t), Some(reading));
+        for _ in 0..2 {
+            v5b_gap(&mut g, &mut t);
+        }
+        assert!(
+            v5b_tick(&mut g, t) < before,
+            "and a stall above it still cuts"
+        );
+    }
+
+    /// FR-79 V5b — FR-79's own law: no consumer acts on a rejected window. A
+    /// stall's shadow is its backlog draining, so a burst there refutes nothing,
+    /// though V3b still records it as a delivery.
+    #[test]
+    fn a_delivery_in_a_rejected_window_refutes_nothing() {
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = v5b_governor(start, None);
+        v5b_fold_223794(&mut g, &mut t);
+        v5b_gap(&mut g, &mut t);
+        // The next window is in the stall's shadow.
+        v5b_reported(&mut g, &mut t, v5b_delivery(5_000_000));
+        assert_eq!(
+            g.evidence_rejected()[2],
+            1,
+            "rejected as the stall's shadow"
+        );
+        assert_eq!(
+            g.belief_bps(t).1,
+            Some(5_000_000),
+            "V3b records the delivery"
+        );
+        assert_eq!(g.blocked_send_bps(t), Some(223_794), "the reading stands");
+        assert_eq!(g.pipe_bps(t, true), Some(223_794));
+    }
+
+    /// FR-79 V5b — the factor. A delivery that raises the floor but does not
+    /// reach twice the reading says the reading was lumpy, not wrong: FR-59 P6's
+    /// `CONTRADICTION_FACTOR`, the same law in the other direction.
+    #[test]
+    fn a_delivery_under_twice_the_reading_refutes_nothing() {
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = v5b_governor(start, None);
+        v5b_fold_223794(&mut g, &mut t);
+        v5b_reported(&mut g, &mut t, v5b_delivery(447_587));
+        assert_eq!(g.belief_bps(t).1, Some(447_587), "the floor rose");
+        assert_eq!(g.blocked_send_bps(t), Some(223_794), "one bit short of 2×");
+        v5b_reported(&mut g, &mut t, v5b_delivery(447_588));
+        assert_eq!(g.blocked_send_bps(t), None, "exactly 2× refutes it");
+    }
+
+    /// FR-79 V5b — a refutation takes out one reading, not the source. The next
+    /// blocked send is a reading in its own right, adopted outright rather than
+    /// folded over the number the path disproved, and a true collapse after a
+    /// false reading is still believed.
+    #[test]
+    fn a_reading_after_a_refutation_counts_on_its_own_merits() {
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = v5b_governor(start, None);
+        v5b_fold_223794(&mut g, &mut t);
+        v5b_reported(&mut g, &mut t, v5b_delivery(1_199_442));
+        assert_eq!(g.readings_refuted(), 1);
+        assert_eq!(g.blocked_send_bps(t), None, "the reading is gone");
+        v5b_fold_223794(&mut g, &mut t);
+        assert_eq!(g.measured_bps(t, true), Some(223_794), "a new one stands");
+        assert_eq!(g.readings_refuted(), 1, "nothing refuted it yet");
+    }
+
+    /// FR-79 V5b — the source a stall is judged against: the goodput, or the
+    /// viewer's arrival rate inside its 15 s TTL, the lower of the two. Never the
+    /// stand-in, which `pipe_bps` still offers everything else. Nothing here is
+    /// measured on a direct window, as `pipe_bps` has always said.
+    #[test]
+    fn the_measured_source_is_the_readings_and_never_the_stand_in() {
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = v5b_governor(start, None);
+        assert_eq!(g.measured_bps(t, true), None, "nothing yet");
+        for i in 1..=2 {
+            let growing = viewer_rate::pack_link(400_000, 250);
+            v5b_sending(&mut g, &mut t, growing, i * 137_500);
+        }
+        assert_eq!(g.measured_bps(t, true), Some(400_000), "the arrival rate");
+        assert_eq!(g.measured_bps(t, false), None, "nothing on a direct window");
+        let expired = t + LINK_CEILING_TTL + Duration::from_secs(1);
+        assert_eq!(g.measured_bps(expired, true), None, "past its TTL");
+        assert_eq!(
+            g.pipe_bps(expired, true),
+            Some(400_000),
+            "where the stand-in still answers for the rest of the session"
+        );
+    }
+
+    /// FR-79 V5b — the arrival-rate clamp is a reading too. Field 2026-10-30
+    /// 12:04:06: the viewer's arrival of 581,546 in a growing window clamped the
+    /// target 3.19 → 0.52 M, and 4,657,230 was delivered two seconds later, at
+    /// a paint age of 187 ms. The clamp stood until its age and depth released
+    /// it, and the target took 80 s to climb back.
+    #[test]
+    fn a_delivery_lifts_the_arrival_rate_clamp_it_contradicts() {
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = v5b_governor(start, None);
+        // The field's 1,107,067 bps offered, over these 1.1 s windows.
+        for i in 1..=2 {
+            let growing = viewer_rate::pack_link(581_546, 250);
+            v5b_sending(&mut g, &mut t, growing, i * 152_222);
+        }
+        assert!(
+            g.link_loop_holding(),
+            "the premise: two growing windows arm it"
+        );
+        assert_eq!(v5b_tick(&mut g, t), 523_391, "the field's 0.9 × 581,546");
+        // Elevated age, so the ordinary release cannot be what lifts it; a
+        // viewer-late window, valid, as the field's was.
+        t += Duration::from_millis(1100);
+        g.note_window_sender(v5b_sender());
+        g.tick_viewer_window(
+            t,
+            30,
+            || viewer_rate::pack_report(30, false),
+            || viewer_rate::pack_age_with_arrival(187, 68, 80, 70),
+            || v5b_delivery(4_657_230),
+            true,
+            |o| o,
+            0,
+        )
+        .expect("window due");
+        assert!(!g.link_loop_holding(), "the delivery refuted what it held");
+        assert_eq!(
+            g.prior_bps(),
+            None,
+            "a delivery past the band ends the prior: the unremembered session"
+        );
+        // Two frames: `set_floor` caps at the ceiling the last tick left, so the
+        // floor only reaches the target on the tick after the clamp lifts.
+        v5b_tick(&mut g, t);
+        assert_eq!(
+            v5b_tick(&mut g, t),
+            crate::encode::MIN_BITRATE_BPS,
+            "back at the nominal floor within a frame, the climb continues from there"
+        );
+    }
+
+    /// FR-79 V5b — a remembered rate is the same claim with less behind it. Field
+    /// 2026-09-04 (`6a9abc30`): 200 kbps in the memory held a session there for
+    /// four minutes through the floor relief and the queue budget.
+    #[test]
+    fn a_delivery_re_anchors_a_seed_it_contradicts() {
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = v5b_governor(start, Some(200_000));
+        assert_eq!(g.prior_bps(), Some(200_000), "the premise");
+        v5b_reported(&mut g, &mut t, v5b_delivery(1_199_442));
+        assert_eq!(g.prior_bps(), Some(1_199_442));
+    }
+
+    /// FR-79 V5b q3. Field 2026-10-27 15:29, CORPLAP-2 on `0.4.178`: a 130 s
+    /// session on an idle desktop (0.16–0.25 Mbps) never stepped and never cut,
+    /// so `stable_bps()` was its own opener, 0.85 × the memory, and the write-back
+    /// took half the gap: −7.5 % for having measured nothing. Over 2026-10-25 →
+    /// 10-30 all 18 writes were rungs of the session's own opener, and the entry
+    /// lost 43 % while those sessions delivered up to 10.2 M.
+    #[test]
+    fn a_hold_nothing_carried_is_not_evidence() {
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = v5b_governor(start, Some(4_760_000));
+        let opener = v5b_tick(&mut g, t);
+        assert_eq!(opener, 4_046_000, "the premise: 0.85 × the memory");
+        let mut sent = 0u64;
+        for _ in 0..15 {
+            sent += 30_000; // 0.22 Mbps over a 1.1 s window: an idle desktop
+            t += Duration::from_millis(1100);
+            g.note_window_sender(v5b_sender());
+            g.tick_viewer_window(
+                t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || viewer_rate::pack_age_with_arrival(70, 68, 80, 69),
+                || 0,
+                true,
+                |o| o,
+                sent,
+            )
+            .expect("window due");
+            v5b_tick(&mut g, t);
+        }
+        assert_eq!(g.applied_bps(), opener, "the premise: the target held");
+        assert_eq!(
+            g.stable_bps(),
+            None,
+            "a hold nothing carried is no evidence"
+        );
+    }
+
+    /// The control for the cell above: the same hold, with one valid window that
+    /// carried it. FR-35's `CARRIED_PCT`, the learner's own test for the same
+    /// question.
+    #[test]
+    fn a_hold_a_valid_window_carried_is_evidence() {
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = v5b_governor_hi(start, 4_046_000, Some(4_760_000));
+        let opener = v5b_tick(&mut g, t);
+        let mut sent = 0u64;
+        for i in 0..15 {
+            // 4,046,000 × 70 % × 1.1 s ÷ 8 = 389,428 bytes in the sixth window.
+            sent += if i == 5 { 390_000 } else { 30_000 };
+            t += Duration::from_millis(1100);
+            g.note_window_sender(v5b_sender());
+            g.tick_viewer_window(
+                t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || viewer_rate::pack_age_with_arrival(70, 68, 80, 69),
+                || 0,
+                true,
+                |o| o,
+                sent,
+            )
+            .expect("window due");
+            v5b_tick(&mut g, t);
+        }
+        assert_eq!(g.stable_bps(), Some(opener));
+    }
+
+    /// The opener's keyframe carries bytes in a window FR-119 P2b-8 already
+    /// rejects, and a session that opens and goes idle would otherwise have
+    /// proved its own opener with its own opening.
+    #[test]
+    fn the_opening_burst_does_not_carry_a_hold() {
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = v5b_governor_hi(start, 4_046_000, Some(4_760_000));
+        v5b_tick(&mut g, t);
+        let mut sent = 0u64;
+        for i in 0..15 {
+            sent += if i == 0 { 700_000 } else { 30_000 };
+            t += Duration::from_millis(1100);
+            g.note_window_sender(WindowSenderStats {
+                opening: i == 0,
+                ..v5b_sender()
+            });
+            g.tick_viewer_window(
+                t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || viewer_rate::pack_age_with_arrival(70, 68, 80, 69),
+                || 0,
+                true,
+                |o| o,
+                sent,
+            )
+            .expect("window due");
+            v5b_tick(&mut g, t);
+        }
+        assert_eq!(g.evidence_rejected()[4], 1, "rejected as the opening");
+        assert_eq!(g.stable_bps(), None);
+    }
+
+    /// FR-79 V5b, the kill switch: `measured_evidence = false` is V5a's rules, all
+    /// three of them, on the same drives as the cells above.
+    #[test]
+    fn with_the_switch_off_the_rules_are_v5a_s() {
+        let off = |start: Instant, seed: Option<u32>| {
+            RateGovernor::new(
+                30,
+                DEPTH,
+                GovernorFlags {
+                    measured_ceiling: false,
+                    age_feedback: true,
+                    measured_evidence: false,
+                    ..GovernorFlags::default()
+                },
+                8_000_000,
+                seed,
+                start,
+            )
+        };
+        // A stand-in is enough to cut on, and the stall walks it.
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = off(start, None);
+        v5b_reported(&mut g, &mut t, 0);
+        g.prior.on_window(Some(19_578), false);
+        let before = v5b_tick(&mut g, t);
+        for _ in 0..2 {
+            v5b_gap(&mut g, &mut t);
+            v5b_tick(&mut g, t);
+        }
+        assert!(g.applied_bps() < before, "the stand-in cuts");
+        assert_eq!(g.prior_bps(), Some(17_798), "and the stall walks it");
+        // A delivery takes out nothing.
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = off(start, None);
+        v5b_fold_223794(&mut g, &mut t);
+        v5b_reported(&mut g, &mut t, v5b_delivery(1_199_442));
+        assert_eq!(g.blocked_send_bps(t), Some(223_794));
+        assert_eq!(g.pipe_bps(t, true), Some(223_794));
+        assert_eq!(g.readings_refuted(), 0);
+        // A hold nothing carried is still the stable rate.
+        let start = Instant::now();
+        let mut t = start;
+        let mut g = off(start, Some(4_760_000));
+        let opener = v5b_tick(&mut g, t);
+        for _ in 0..15 {
+            v5b_reported(&mut g, &mut t, 0);
+            v5b_tick(&mut g, t);
+        }
+        assert_eq!(g.stable_bps(), Some(opener));
+    }
+
+    /// FR-79 V5b — the pair the replay below remembers (`rate_memory::memory_key`).
+    const V5B_KEY: &str = "203.0.113.221|relay:turn/udp";
+    /// What the pump wrote in one idle window on jupiter: 2,280 B over the 2 s
+    /// before the report, about 76 B a frame at 15 fps.
+    const V5B_IDLE_BYTES: u64 = 1_140;
+    /// The same bytes as the viewer's arrival rate.
+    const V5B_IDLE_RX: u32 = 9_120;
+
+    /// FR-79 V5b — one relayed session of the replay: the pump's clock and running
+    /// byte total, a 3 M plan, an 8 M `hi`, the viewer's paint floor at 17 ms.
+    struct V5bSession {
+        g: RateGovernor,
+        t: Instant,
+        sent: u64,
+    }
+
+    impl V5bSession {
+        fn open(measured_evidence: bool, seed: Option<u32>) -> Self {
+            let t = Instant::now();
+            let mut g = RateGovernor::new(
+                30,
+                DEPTH,
+                GovernorFlags {
+                    measured_evidence,
+                    ..GovernorFlags::default()
+                },
+                8_000_000,
+                seed,
+                t,
+            );
+            g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+            Self { g, t, sent: 0 }
+        }
+
+        /// One second: the pump wrote `wrote` bytes, the viewer reported `link`
+        /// at a paint age of `age` (`None` = it said nothing at all), and the
+        /// pump's tick follows.
+        fn window(
+            &mut self,
+            wrote: u64,
+            age: Option<u16>,
+            link: u64,
+            opening: bool,
+        ) -> ViewerWindow {
+            self.t += Duration::from_secs(1);
+            self.sent += wrote;
+            self.g.note_window_sender(WindowSenderStats {
+                opening,
+                ..v5b_sender()
+            });
+            let w = self
+                .g
+                .tick_viewer_window(
+                    self.t,
+                    30,
+                    || age.map_or(0, |_| viewer_rate::pack_report(30, false)),
+                    || age.map_or(0, |a| viewer_rate::pack_age_with_arrival(a, 17, 30, a - 2)),
+                    || link,
+                    true,
+                    |o| o,
+                    self.sent,
+                )
+                .expect("window due");
+            self.g.pre_encode_tick(
+                3_000_000,
+                crate::encode::MIN_BITRATE_BPS,
+                true,
+                DEPTH,
+                self.t,
+            );
+            w
+        }
+
+        /// An idle window: the trickle, reported at paint age `age`.
+        fn idle(&mut self, age: u16) -> ViewerWindow {
+            let link = viewer_rate::pack_link(V5B_IDLE_RX, 0);
+            self.window(V5B_IDLE_BYTES, Some(age), link, false)
+        }
+
+        /// A silent window with the pump still sending: a transit stall.
+        fn stall(&mut self) {
+            self.window(V5B_IDLE_BYTES, None, 0, false);
+            assert_eq!(
+                self.g.pipe_state(),
+                Some(crate::encode::pipe_state::PipeState::TransitStalled)
+            );
+        }
+
+        fn evidence(&self) -> Option<u32> {
+            self.g.session_evidence_bps(self.t, true)
+        }
+
+        /// Field 21:05:19–21:06:25: the screen moved for a minute. 10.7 Mbps
+        /// delivered, the opener's three windows rejected, the learner stepping
+        /// every 5 s, and the session's peak delivery at the end of it.
+        fn load(&mut self) {
+            let moving = viewer_rate::pack_link(10_700_000, 0);
+            for i in 0..55 {
+                self.window(1_337_500, Some(28), moving, i < 3);
+            }
+            let peak = viewer_rate::pack_link(15_915_240, 0);
+            self.window(1_337_500, Some(28), peak, false);
+        }
+
+        /// Field 21:06:26–21:06:32: the screen stopped, a transit stall at
+        /// 21:06:31, and then the two windows that read a growing queue on idle
+        /// traffic, the first in the stall's shadow and the second valid.
+        fn idle_report(&mut self) -> ViewerWindow {
+            for _ in 0..3 {
+                self.idle(68);
+            }
+            self.stall();
+            let growing = viewer_rate::pack_link(9_489, 145);
+            self.window(V5B_IDLE_BYTES, Some(216), growing, false);
+            self.window(V5B_IDLE_BYTES, Some(216), growing, false)
+        }
+
+        /// Field 21:06:33–21:07:32. The arrival rate's 15 s first, at an elevated
+        /// age so nothing releases it early. Then one letter a window, from the
+        /// heartbeats' counters: a heartbeat spans two windows, so the mix is the
+        /// field's and the order inside a pair is not. `S` a stall, `C` a clean
+        /// report, `E` a report at an elevated age. The window after an `S` is
+        /// rejected as its shadow, whatever it says. Returns each value the
+        /// stand-in took.
+        fn walk(&mut self) -> Vec<Option<u32>> {
+            for _ in 0..15 {
+                self.idle(150);
+            }
+            let mut seen = vec![self.g.prior_bps()];
+            for window in "SSSSSSSSCECCCSSSSSSCESSSCCCSSCEE".chars() {
+                match window {
+                    'S' => self.stall(),
+                    'C' => {
+                        self.idle(56);
+                    }
+                    _ => {
+                        self.idle(150);
+                    }
+                }
+                if seen.last() != Some(&self.g.prior_bps()) {
+                    seen.push(self.g.prior_bps());
+                }
+            }
+            seen
+        }
+    }
+
+    /// FR-79 V5b, the replay, with the rules that shipped: the switch off. Field
+    /// 2026-11-02 21:05:18–21:07:34, jupiter on `0.4.197`, one relayed `h264_vaapi`
+    /// session and the sessions opened from what it wrote. It never lost a byte to
+    /// a slow path, and it left the pair remembered at 3.3 kbps:
+    ///
+    /// 1. A minute at 10.7 Mbps, then the screen stopped.
+    /// 2. The viewer's queue read as growing on idle traffic, so the arrival rate
+    ///    of that trickle became the pipe. The target fell 6.2 M → 200 kbps and
+    ///    FR-59 P6 abandoned the ceiling the session had just earned.
+    /// 3. The session walked that reading down and wrote the last rung to the pair
+    ///    memory as evidence.
+    /// 4. The next sessions opened at that number.
+    /// 5. Each wrote its own stand-in back, which refreshed the 7-day TTL, so the
+    ///    key held itself low with nothing behind it.
+    ///
+    /// Every number here is the field's, to the unit. This arm stays: it pins the
+    /// switch, and it is what says the replay is the session.
+    #[test]
+    fn the_jupiter_chain_replays_to_the_unit_with_the_switch_off() {
+        let mut s = V5bSession::open(false, None);
+        s.load();
+        assert_eq!(s.g.learned_ceiling_bps(), 6_209_663, "twelve steps");
+        assert_eq!(s.g.prior_bps(), None, "nothing measured the pipe");
+        // Step 2.
+        let w = s.idle_report();
+        assert!(w.link_congested);
+        assert_eq!(w.link_ceiling_bps, Some(8_540));
+        assert_eq!(
+            s.g.evidence_rejected()[2],
+            1,
+            "its first window, the shadow"
+        );
+        assert_eq!(s.g.applied_bps(), 200_000, "target at the floor");
+        assert_eq!(s.g.take_seed_abandoned(), Some(6_209_663));
+        assert_eq!(s.g.learned_ceiling_bps(), 0);
+        assert_eq!(s.g.prior_bps(), Some(9_489));
+        assert_eq!(
+            s.g.belief_bps(s.t),
+            (Some(7_962_364), Some(7_962_364), Some(9_489)),
+            "the heartbeat's `pipe_belief` at 21:06:33"
+        );
+        // Step 3: the rungs, ×10/11 with integer floors.
+        let rungs = s.walk();
+        let rungs: Vec<u32> = rungs.into_iter().flatten().collect();
+        assert_eq!(
+            rungs,
+            [
+                9_489, 8_626, 7_841, 7_128, 6_480, 5_890, 5_354, 4_867, 4_424, 4_021, 3_655, 3_322
+            ]
+        );
+        assert_eq!(s.g.measured_bps(s.t, true), None, "nothing live at the end");
+        let evidence = s.evidence();
+        assert_eq!(evidence, Some(3_322));
+        let mut memory = super::super::rate_memory::RateMemory::default();
+        let at = 1_793_000_000u64;
+        assert_eq!(memory.record_session(V5B_KEY, evidence, at), 3_322);
+        // Steps 4 and 5, twice: each session opens low, takes one rung off the
+        // seed (×4/5) and writes it back, damped to half the gap. The field's
+        // 3,322 → 2,989 → 2,690.
+        for (session, (stand_in, kept)) in [(2_657, 2_989), (2_391, 2_690)].into_iter().enumerate()
+        {
+            let at = at + 600 * (session as u64 + 1);
+            let seed = memory.seed_for(V5B_KEY, at);
+            let mut next = V5bSession::open(false, seed);
+            assert_eq!(next.g.open_seed_bps(), seed);
+            assert_eq!(next.g.applied_bps(), 200_000, "opens at the floor");
+            next.idle(150);
+            next.idle(150);
+            assert_eq!(next.evidence(), Some(stand_in));
+            memory.record_session(V5B_KEY, next.evidence(), at);
+            let entry = &memory.entries[V5B_KEY];
+            assert_eq!(entry.stable_bps, kept);
+            assert_eq!(entry.at_unix, at, "the TTL refreshed on nothing");
+        }
+    }
+
+    /// FR-79 V5b — the replay's step 2 with the rules on. A queue that grew on
+    /// 1,140 B a window says nothing about the rate: the sender was not offering
+    /// anything for the path to refuse, so the trickle's arrival rate is the
+    /// content's weight, the case `viewer_rate::LinkLoop`'s own warning describes.
+    #[test]
+    fn the_jupiter_chain_takes_no_reading_from_idle_traffic() {
+        let mut s = V5bSession::open(true, None);
+        s.load();
+        let before = s.g.applied_bps();
+        let w = s.idle_report();
+        assert!(!w.link_congested, "nothing the sender offered");
+        assert_eq!(w.link_ceiling_bps, None);
+        assert_eq!(s.g.link_unoffered(), 1, "and the heartbeat says so");
+        assert!(!s.g.link_loop_holding(), "no clamp to the trickle");
+        assert_eq!(s.g.measured_bps(s.t, true), None, "and no reading");
+        assert_eq!(s.g.take_seed_abandoned(), None);
+        assert_eq!(s.g.learned_ceiling_bps(), 6_209_663, "the ceiling stands");
+        assert!(s.g.applied_bps() >= before, "the target stands");
+        assert_eq!(
+            s.g.belief_bps(s.t).1,
+            Some(15_915_240),
+            "no capacity sample took the floor down"
+        );
+    }
+
+    /// FR-79 V5b — the replay's step 3 with the rules on: a session whose only
+    /// "reading" was idle traffic leaves the memory alone.
+    #[test]
+    fn the_jupiter_chain_writes_nothing_at_session_end() {
+        let mut s = V5bSession::open(true, None);
+        s.load();
+        s.idle_report();
+        s.walk();
+        assert_eq!(s.evidence(), None);
+        let mut memory = super::super::rate_memory::RateMemory::default();
+        assert_eq!(
+            memory.record_session(V5B_KEY, s.evidence(), 1_793_000_000),
+            0
+        );
+        assert!(memory.entries.is_empty());
+    }
+
+    /// FR-79 V5b — the replay's step 5 with the rules on, from a key an earlier
+    /// build already poisoned: a session that opens from it and measures nothing
+    /// leaves its value and its age, so the entry runs out rather than holding
+    /// itself low.
+    #[test]
+    fn the_jupiter_chain_does_not_refresh_a_poisoned_key() {
+        let mut memory = super::super::rate_memory::RateMemory::default();
+        let written = 1_793_000_000u64;
+        memory.record_session(V5B_KEY, Some(3_322), written);
+        let at = written + 600;
+        let mut s = V5bSession::open(true, memory.seed_for(V5B_KEY, at));
+        assert_eq!(
+            s.g.open_seed_bps(),
+            Some(3_322),
+            "step 4 stands: it opens low"
+        );
+        s.idle(150);
+        s.idle(150);
+        assert_eq!(s.evidence(), None, "a seed is not a measurement");
+        memory.record_session(V5B_KEY, s.evidence(), at);
+        let entry = &memory.entries[V5B_KEY];
+        assert_eq!(entry.stable_bps, 3_322);
+        assert_eq!(entry.at_unix, written, "its age stands");
+    }
+
+    /// FR-79 V5b (a) — a truly slow pair's reading expires long before its session
+    /// ends: the arrival rate after 15 s, the goodput after 60. FR-59 P8 opens the
+    /// next session at what this one found, so the reading still goes to the memory,
+    /// as it was read and not as the prior has decayed since.
+    #[test]
+    fn a_reading_that_expired_is_written_as_it_was_read() {
+        for (measured_evidence, written) in [(true, 300_000), (false, 399_300)] {
+            let mut s = V5bSession::open(measured_evidence, None);
+            // A real overdrive: 1 Mbps into a 300 kbps path, two windows growing.
+            let growing = viewer_rate::pack_link(300_000, 200);
+            for _ in 0..2 {
+                s.window(125_000, Some(56), growing, false);
+            }
+            assert!(s.g.link_loop_holding(), "the premise: a reading");
+            let drained = viewer_rate::pack_link(300_000, -400);
+            s.window(V5B_IDLE_BYTES, Some(56), drained, false);
+            assert_eq!(s.g.measured_bps(s.t, true), None, "nothing live now");
+            for _ in 0..30 {
+                s.idle(56);
+            }
+            assert_eq!(s.g.prior_bps(), Some(399_300), "three steps of ×1.1");
+            assert_eq!(s.evidence(), Some(written));
+            assert_eq!(
+                s.g.session_evidence_bps(s.t, false),
+                None,
+                "a direct window has nothing to say about a relay"
+            );
+        }
+    }
+
+    /// FR-79 V5b (a), the 12:19 shape. Field 2026-10-30 12:19:50–12:22:06, CORPLAP-2:
+    /// a true collapse. The arrival rate read 12,070 in a growing window with
+    /// 145,305 bps offered, a blocked send read 180,484 two seconds later, and once
+    /// that expired the stand-in walked eight rungs to 84,195, which the session
+    /// wrote as evidence. It measured 180,484.
+    #[test]
+    fn a_walked_stand_in_is_not_what_the_session_measured() {
+        let mut s = V5bSession::open(true, None);
+        let growing = viewer_rate::pack_link(12_070, 150);
+        for _ in 0..2 {
+            s.window(18_164, Some(216), growing, false);
+        }
+        assert!(s.g.link_loop_holding(), "the premise: the report counted");
+        // 2,301 B over 101.992 ms folds as the field's reading to the unit.
+        s.g.goodput_sink()
+            .record(2_301, Duration::from_micros(101_992));
+        s.idle(56);
+        assert_eq!(s.g.blocked_send_bps(s.t), Some(180_484));
+        assert_eq!(
+            s.g.prior_bps(),
+            Some(180_484),
+            "the goodput outranks the arrival rate as the anchor"
+        );
+        for _ in 0..61 {
+            s.idle(56);
+        }
+        assert_eq!(s.g.blocked_send_bps(s.t), None, "past its 60 s");
+        for _ in 0..4 {
+            s.idle(150);
+        }
+        assert_eq!(s.g.prior_bps(), Some(149_160), "the field's second rung");
+        assert_eq!(s.evidence(), Some(180_484));
+    }
+
+    /// FR-79 V5b (a) — a reading a delivery took out is not written either. What
+    /// stands in after it says "at least this", and a lower bound is not a
+    /// measurement of the path.
+    #[test]
+    fn a_session_whose_only_reading_was_refuted_writes_nothing() {
+        let mut s = V5bSession::open(true, None);
+        s.g.goodput_sink()
+            .record(2_854, Duration::from_micros(102_022));
+        s.idle(56);
+        assert_eq!(s.evidence(), Some(223_794), "it stands until it is beaten");
+        s.window(150_000, Some(56), v5b_delivery(1_199_442), false);
+        assert_eq!(s.g.readings_refuted(), 1);
+        assert_eq!(s.g.prior_bps(), Some(1_199_442), "the premise");
+        assert_eq!(s.evidence(), None);
+    }
+
+    /// FR-79 V5b (a) — and a reading that has expired can still be wrong: what the
+    /// write-back would have used is what the delivery beat.
+    #[test]
+    fn a_delivery_takes_out_an_expired_reading_too() {
+        let mut s = V5bSession::open(true, None);
+        s.g.goodput_sink()
+            .record(2_854, Duration::from_micros(102_022));
+        s.idle(56);
+        for _ in 0..61 {
+            s.idle(56);
+        }
+        assert_eq!(s.g.blocked_send_bps(s.t), None, "past its 60 s");
+        assert_eq!(s.evidence(), Some(223_794), "still this session's reading");
+        s.window(150_000, Some(56), v5b_delivery(1_199_442), false);
+        assert_eq!(s.evidence(), None);
+    }
+
+    /// FR-79 V5b — a key that is already poisoned. Nothing that opens from it keeps
+    /// it alive any more, so it runs out seven days after its last write, to the
+    /// second, however many sessions opened from it. A session that really measures
+    /// moves it sooner, by the tenth of the gap FR-79 V4 allows upward.
+    #[test]
+    fn a_poisoned_key_runs_out_or_a_measurement_lifts_it() {
+        use super::super::rate_memory::{RateMemory, TTL};
+        let written = 1_793_000_000u64;
+        let poisoned = || {
+            let mut memory = RateMemory::default();
+            memory.record_session(V5B_KEY, Some(3_322), written);
+            memory
+        };
+        let mut memory = poisoned();
+        for day in 1..=7u64 {
+            let at = written + day * 86_400;
+            let mut s = V5bSession::open(true, memory.seed_for(V5B_KEY, at));
+            assert_eq!(s.g.open_seed_bps(), Some(3_322), "day {day} opens low");
+            s.idle(56);
+            s.idle(150);
+            s.idle(150);
+            memory.record_session(V5B_KEY, s.evidence(), at);
+        }
+        let last_second = written + TTL.as_secs();
+        assert_eq!(memory.seed_for(V5B_KEY, last_second), Some(3_322));
+        assert_eq!(
+            memory.seed_for(V5B_KEY, last_second + 1),
+            None,
+            "then the pair is cold"
+        );
+
+        let mut memory = poisoned();
+        let at = written + 600;
+        let mut s = V5bSession::open(true, memory.seed_for(V5B_KEY, at));
+        let sink = s.g.goodput_sink();
+        for _ in 0..12 {
+            sink.record(1_500, Duration::from_millis(12));
+        }
+        s.idle(56);
+        assert_eq!(s.evidence(), Some(1_000_000));
+        assert_eq!(
+            memory.record_session(V5B_KEY, s.evidence(), at),
+            102_989,
+            "3,322 + 0.1 × the gap"
+        );
+    }
+
+    /// FR-79 V5b (b) — what the rule must keep. The week's other two congested
+    /// reports both had the sender well over what arrived: CORPLAP-2 on 2026-10-30,
+    /// 1,107,067 bps offered at 12:04:05 and 145,305 at 12:19:50. The first was false
+    /// and a later delivery takes it out; the second was true. This rule is not what
+    /// tells them apart.
+    #[test]
+    fn a_report_the_sender_offered_still_counts() {
+        for (rx_bps, wrote, ceiling) in [(581_546, 138_383, 523_391), (12_070, 18_164, 10_863)] {
+            let mut s = V5bSession::open(true, None);
+            let growing = viewer_rate::pack_link(rx_bps, 250);
+            s.window(wrote, Some(56), growing, false);
+            let w = s.window(wrote, Some(56), growing, false);
+            assert!(w.link_congested, "{rx_bps}");
+            assert_eq!(w.link_ceiling_bps, Some(ceiling));
+            assert!(s.g.link_loop_holding());
+            assert_eq!(s.g.link_unoffered(), 0);
+        }
+    }
+
+    /// FR-79 V5b (b) — one keyframe is not an overdrive, in either order. Jupiter's
+    /// session sent 214,092 B in one, and its false report came 5 s after a 56,299 B
+    /// rebuild keyframe. Summing the two windows, or asking of one, would let this
+    /// through, and it is the same trickle again.
+    #[test]
+    fn a_keyframe_among_idle_windows_is_not_an_offer() {
+        let growing = viewer_rate::pack_link(V5B_IDLE_RX, 145);
+        for order in [[214_092, V5B_IDLE_BYTES], [V5B_IDLE_BYTES, 214_092]] {
+            let mut s = V5bSession::open(true, None);
+            s.window(order[0], Some(56), growing, false);
+            let w = s.window(order[1], Some(56), growing, false);
+            assert!(!w.link_congested, "{order:?}");
+            assert_eq!(w.link_ceiling_bps, None, "the log line says no ceiling");
+            assert!(!s.g.link_loop_holding());
+            assert_eq!(s.g.link_unoffered(), 1);
+        }
+    }
+
+    /// FR-79 V5b (b) — a path that really is stuck, the sender still offering: it
+    /// counts, at worst a window after the queue began to grow.
+    #[test]
+    fn a_stuck_path_counts_a_window_later_at_worst() {
+        let growing = viewer_rate::pack_link(300_000, 200);
+        let mut s = V5bSession::open(true, None);
+        s.window(V5B_IDLE_BYTES, Some(56), growing, false);
+        let w = s.window(125_000, Some(56), growing, false);
+        assert!(!w.link_congested, "one window has offered so far");
+        let w = s.window(125_000, Some(56), growing, false);
+        assert!(w.link_congested, "two have");
+        assert!(s.g.link_loop_holding());
+    }
+
+    /// FR-79 V5b (b) — `bytes_written` counts what left the pump's own channel and
+    /// frames are stamped before it, so a queue growing INSIDE that channel reads
+    /// sent ≈ rx. The classifier already calls that window the sender's. The byte
+    /// budget's skip is the FFmpeg pump's sign of it, and a blocked send is the one
+    /// sign the VP9-444 pump has.
+    #[test]
+    fn a_queue_in_the_pumps_own_channel_is_an_offer() {
+        let growing = viewer_rate::pack_link(300_000, 200);
+        let at_the_rate_that_arrived = 37_500;
+        let mut s = V5bSession::open(true, None);
+        for _ in 0..2 {
+            s.g.note_window_sender(WindowSenderStats {
+                gate_skips: 7,
+                ..v5b_sender()
+            });
+            s.window(at_the_rate_that_arrived, Some(56), growing, false);
+        }
+        assert_eq!(
+            s.g.pipe_state(),
+            Some(crate::encode::pipe_state::PipeState::Overproduced)
+        );
+        assert!(s.g.link_loop_holding(), "the budget skipped frames");
+        assert_eq!(s.g.link_unoffered(), 0);
+
+        let mut s = V5bSession::open(true, None);
+        let sink = s.g.goodput_sink();
+        for _ in 0..2 {
+            sink.record(at_the_rate_that_arrived, Duration::from_millis(900));
+            s.window(at_the_rate_that_arrived, Some(56), growing, false);
+        }
+        assert!(s.g.link_loop_holding(), "a send blocked");
+        assert_eq!(s.g.link_unoffered(), 0);
+    }
+
+    /// FR-79 V5b (b) — a growing window the sender was not feeding neither arms the
+    /// clamp nor releases it: the queue did grow, it just isn't the rate's doing.
+    /// What stands runs out on the clock of the window that counted.
+    #[test]
+    fn a_window_the_sender_did_not_feed_leaves_the_clamp_as_it_stands() {
+        let growing = viewer_rate::pack_link(300_000, 200);
+        let mut s = V5bSession::open(true, None);
+        for _ in 0..2 {
+            s.window(125_000, Some(56), growing, false);
+        }
+        assert!(s.g.link_loop_holding(), "armed");
+        let armed = s.t;
+        let w = s.window(V5B_IDLE_BYTES, Some(56), growing, false);
+        assert!(!w.link_congested);
+        assert_eq!(s.g.link_unoffered(), 1);
+        assert!(s.g.link_loop_holding(), "not released");
+        let ttl = armed + LINK_CEILING_TTL;
+        assert_eq!(s.g.measured_bps(ttl, true), Some(300_000));
+        assert_eq!(
+            s.g.measured_bps(ttl + Duration::from_secs(1), true),
+            None,
+            "not refreshed"
+        );
     }
 
     /// FR-119 P2b-14 — a DIRECT window whose blocked sends include a keyframe

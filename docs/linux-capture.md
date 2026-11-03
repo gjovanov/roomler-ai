@@ -1933,7 +1933,7 @@ remote-control session is live, the daemon holds one. On the signal it tells
 each live session's controller over that session's own control channel, then
 lets go. Each session registers its control channel as it starts
 (`sleep_notice.rs:99`); the watcher (`sleep_notice.rs:534`, the rule
-`:149`) sends `peer.rs:5543`'s notice to all of them at once (`:93`):
+`:149`) sends `peer.rs:5548`'s notice to all of them at once (`:93`):
 
 ```mermaid
 sequenceDiagram
@@ -2038,7 +2038,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1243-1274`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3001`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3010`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|
