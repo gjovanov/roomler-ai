@@ -330,7 +330,7 @@ Linux runs were `nice -n 10`, and their `clock=` reads `clamped`. The Windows ru
 - **A cell the hello advertises and a session may not open.** The laptop's hello lists `av1` in
   `codecs`, yet `rtp:av1` opened `noop`. FFmpeg's AV1 probe adds the codec
   (`agents/roomlerd/src/encode/caps.rs:4017`), the RTP path tries only Media Foundation
-  (`agents/roomlerd/src/encode/mod.rs:1642`), and `pick_best_codec` ranks AV1 first with no
+  (`agents/roomlerd/src/encode/mod.rs:1657`), and `pick_best_codec` ranks AV1 first with no
   per-path filter (`agents/roomlerd/src/signaling.rs:3581`,
   `agents/roomlerd/src/encode/caps.rs:4783`). The code logs `Session will have no video until
   reconnect` there. `agent_logs` holds that line 14 times in the org in 7 days, all on

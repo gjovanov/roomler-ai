@@ -71,10 +71,10 @@ measured-rate line (#678: a sender cannot see capacity it is not using). Operato
 
 ## What is in force today
 
-- `relay_max_bps()` = **3 Mbps** (`agents/roomlerd/src/encode/mod.rs:498`, env `RELAY_MAX_KBPS`),
+- `relay_max_bps()` = **3 Mbps** (`agents/roomlerd/src/encode/mod.rs:513`, env `RELAY_MAX_KBPS`),
   applied as the encoder's `maxrate` cap on every constrained session
   (`encoder.rs` ↔ `rate_profile::ffmpeg_maxrate_bps_scaled`, `peer.rs:3267`), opened at 85 % =
-  **2.55 Mbps**, and as the AIMD's ceiling (`governor.rs:264-283`); the send-queue budget derives
+  **2.55 Mbps**, and as the AIMD's ceiling (`governor.rs:274-298`); the send-queue budget derives
   from the same constant (`peer.rs:4797`).
 - The AIMD (`encode/aimd.rs`) climbs additively (+ceiling/16 ≥ 150 kbps per 5 s of quiet) but
   **never above that ceiling**; it decreases ×0.85 on a full send channel, on a send-wait stall
@@ -126,7 +126,7 @@ memory) and `relay_max_hi_kbps` (config-surface + env). Direct sessions are unto
 startup bandwidth probe (measures burst capacity, which this measurement shows is *not* the
 sustainable rate — 18 Mbps instantaneous vs ~8 sustained — and costs bytes on exactly the thin
 links); the goodput estimator as the learning input (its down-fast EWMA crashed on relay
-lumpiness, governor.rs:256-262 — the AIMD's own stable target is the robust signal).
+lumpiness, governor.rs:266-272 — the AIMD's own stable target is the robust signal).
 
 ## Acceptance criteria
 
@@ -162,7 +162,7 @@ shipped defaults:
       session's 95 heartbeats: send wait max 0.787 ms, age p99 195 ms, `send_stalls=0`, no
       backpressure skip. The FR-18 numbers (0.4.10, CORPLAP-3 relay): `send_wait` p99 200 ms / max
       1,778 ms, viewer age max 2,185 ms. The learner stepped eight times, 3.00 → 4.87 M, under `hi`
-      8 M, and bounded by construction (`ceiling_learn.rs:237`, `.min(hi)`). The load was the
+      8 M, and bounded by construction (`ceiling_learn.rs:268`, `.min(hi)`). The load was the
       screen's, not the pipe's: QP sat at 15 in all but two of the drag's heartbeats and the ceiling
       climbed past the load, so the drag did not push this pair to its limit. Without a drag the week's 24 sessions
       had one heartbeat near a second (824.7 ms) and one past FR-18's age max, 3,364 ms (2026-10-30
@@ -207,7 +207,7 @@ shipped defaults:
       on from off on this cell, and no cell that follows `maxrate` was run, because no such host has a
       daemon that may restart. The August numbers were a different host, encoder and screen, so off is
       compared with the current code's cold path. **2026-10-31: a VM or a container with no GPU cannot
-      answer this.** The learner exists only in `media_pump_ffmpeg_dc` (`peer.rs:6463`, the one caller
+      answer this.** The learner exists only in `media_pump_ffmpeg_dc` (`peer.rs:6468`, the one caller
       of `relay_max_hi_bps()`), the VP9-444 pump passes `hi = 0` (`peer.rs:4285`), and the FFmpeg pump
       needs a hardware encoder. So on a host with no GPU the switch reads the same on and off, and a
       pass there proves nothing
