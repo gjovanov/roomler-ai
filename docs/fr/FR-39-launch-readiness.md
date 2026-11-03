@@ -121,9 +121,19 @@ account** — so that interest which does not convert immediately is not lost pe
 - [x] the Privacy Policy describes the subscriber collection, and every sentence of that
       description is true of the code that ships with it — **done** (§2.14 + retention),
       written from the implementation rather than from a template
-- [ ] `docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build` brings up a working instance on a clean machine, and `/health` answers 200 **(operator — needs a clean box and a 10–20 min build)**
+- [~] `docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build` brings up a working instance on a clean machine, and `/health` answers 200 **(operator — needs a clean box and a 10–20 min build)**
+      *True on 2026-09-01: FR-42's whole purpose, the documented `up -d --build` from a
+      clean clone, `/health` 200
+      ([#967 — Result](https://github.com/gjovanov/roomler-ai/issues/967#issuecomment-5493250899)).
+      Not true today: the MinIO images it names are gone from Docker Hub (#2034). Tick
+      with that fix's clean-machine run.*
 - [ ] a 60–90 s demo (enroll → browser desktop → `roomler ssh` → `roomler forward`) exists
       and is embedded in the README **(operator — needs a real capture session)**
+      *A demo exists and is embedded (FR-41, 89.4 s, #1122) — but not this one: it
+      shows the browser desktop and a mesh ping, with no on-camera enrolment, no
+      `roomler ssh`, no `roomler forward`. The re-recordings of 09-30 and 10-01 (#1801,
+      #1802) show neither. Open for the same substitution as FR-41's two open criteria;
+      resolving those resolves this.*
 
 ## Open decisions
 
