@@ -1,7 +1,7 @@
 # FR-132: Zero-copy by default — each GPU-input cell turns on for the fleet after a clean week of its own
 
 **Issue:** [#3141](https://github.com/gjovanov/roomler-ai/issues/3141) · **Status:** P1 released in 0.4.191 on 2026-10-31;
-the decisions taken 2026-10-30, 2026-10-31 and 2026-11-02 (§6); proposed 2026-10-30 · **Owner:** the agent's capture and encode path, and
+P1b on production since 2026-11-03 and P1c merged the same day (§4); the decisions taken 2026-10-30, 2026-10-31 and 2026-11-02 (§6); proposed 2026-10-30 · **Owner:** the agent's capture and encode path, and
 remote config · **Anchors:** master `01520c8af` (§2); the as-built notes in §3a and §3b, master `ff29120ed` + P1 ·
 **Takes over:** [FR-118](FR-118-gpu-resident-frames.md) open decision 2 (the default) · **Builds on:**
 [FR-118](FR-118-gpu-resident-frames.md) (the GPU-input cells), [FR-77](FR-77-encoder-chroma-matrix.md) (cells, the
@@ -171,8 +171,8 @@ the flip on every host that runs the cell, canary or not.
 |---|---|---|---|
 | P0 | The red record: a fleet week of heartbeats read per cell (encoder × capture arm), counting the sessions that could have opened a GPU form and read `switch_off`, and naming the hosts that run each cell | — | **done 2026-10-30** (§8, AC1) |
 | P1 | 3a and 3b: `zero_copy_deny` in `DesiredConfig` and the agent's `apply`; the viewer's decode-error message and its count in `rc:session.stats` | the push is absent (no change); a viewer without the message sends nothing | **built 2026-10-30, released 2026-10-31** ([#3154](https://github.com/gjovanov/roomler-ai/pull/3154), in 0.4.191 and `hosted-20261031-28dfd72`). 3a: `MANAGE_AGENTS` alone, passed on unread, written by the device with `needs_restart`, end to end in `agent_tests` (AC2's integration half). 3b: `rc:decode-error` per error before the fallback, `de: 1` on every `rc:decodestat`, `decode_errors` on `rc:session.stats` (absent = not counted), the first `de` and the first eight errors sent at once, end to end through a real agent and viewer peer in `session_decode_errors_tests` (AC3's integration half). The field halves of AC2 and AC3 are met (§8) |
-| P1b | 3a: a save nudges a connected device with the same frame, and one hub call sends every `rc:agent.config` | the previous image: the connect path never left, so a device still converges | **built** ([#3242](https://github.com/gjovanov/roomler-ai/pull/3242)): server and UI only, so it needs a promote and no release; AC8's field half follows it |
-| P1c | 3a: `needs_restart` holds until the daemon runs the value | the previous agent: a reconnect reads `applied` again | **built** ([#3283](https://github.com/gjovanov/roomler-ai/pull/3283)): rides the next agent release after it merges; AC9's field half follows that release |
+| P1b | 3a: a save nudges a connected device with the same frame, and one hub call sends every `rc:agent.config` | the previous image: the connect path never left, so a device still converges | **built** ([#3242](https://github.com/gjovanov/roomler-ai/pull/3242)): server and UI only, so it needs a promote and no release. **On production since 2026-11-03** (`hosted-20261103-5f12695`); AC8's field half in §8 |
+| P1c | 3a: `needs_restart` holds until the daemon runs the value | the previous agent: a reconnect reads `applied` again | **built** ([#3283](https://github.com/gjovanov/roomler-ai/pull/3283)), merged 2026-11-03 after 0.4.198 was cut, so it rides the next agent release; AC9's field half follows that release |
 | P1d | 3d: `rc:session.stats` carries the encoder, the capture arm and the input form (decision 8) | absent from an older agent, and the week reads the heartbeats | not started |
 | P2 | 3c: the three-valued reading, the default list (empty), `default_off`, at both entry points | `zero_copy = off`; the list empty | not started |
 | P3 | QSV: the canary week, then the flip (if open decision 4 orders it first). `hevc_qsv` and `h264_qsv` also wait for decision 9 | `zero_copy_deny` pushed; the cell off the list in the next release | not started |
@@ -200,9 +200,13 @@ the flip on every host that runs the cell, canary or not.
   (the pushable deny list) and `docs/remote-control.md` §5.1f, with a row in `docs/README.md`'s index.
 - [ ] **AC8 (the switch's reach):** a `zero_copy_deny` saved for a connected device reports `needs_restart` within
   seconds, with no reconnect, whichever pod takes the save; a device offline at the save converges on connect; and a
-  connection never receives a revision after a newer one. Integration-tested, and seen in the field.
+  connection never receives a revision after a newer one. Integration-tested, and seen in the field. **Field so far**
+  (§8, 2026-11-03, `hosted-20261103-5f12695`): the connected device, the offline one and the order are seen; a save
+  that lands on the pod without the device's socket is not, because the load balancer keeps a tenant's requests and
+  sockets on one pod.
 - [ ] **AC9 (`needs_restart` is true):** a reconnect without a restart leaves the row on `needs_restart`, and it reads
-  `applied` only once the daemon runs the value. Tested, and seen in the field.
+  `applied` only once the daemon runs the value. Tested, and seen in the field. **Red first** (§8, 2026-11-03): on
+  0.4.197, the promote's reconnect turned a true `needs_restart` into `noop`.
 - [ ] **AC10 (the week's source):** a session's `rc:session.stats` names its encoder, capture arm and input form on an
   agent that sends them, and they are absent on one that does not. Seen in the field.
 
@@ -383,6 +387,43 @@ and p90 in idle windows and 1.88 / 2.90 / 4.10 ms in moving ones. Older builds l
 So a keystroke's frame would save about 2.7 ms and a keepalive nothing. §2.1's savings were measured under motion, frame
 after frame, and those 43.88 hours capture few frames, so they save little. That is decision 9, and the reason 3d reads
 moving and idle windows apart.
+
+### 2026-11-03: P1b on production, AC9's red and AC8's field half
+
+P1b ([#3242](https://github.com/gjovanov/roomler-ai/pull/3242)) reached production in `hosted-20261103-5f12695`,
+with both pods Ready at 05:31:50Z. The device is NEO16, which has the remote-config opt-in and no QSV, so no value
+below changes a session. Its document manages `exec_enabled` and `ssh_enabled` throughout, and `zero_copy_deny` where
+a row says so. Times are the server's clock. The device's clock ran about 4.4 s behind it, and its times are marked.
+
+**AC9, red on 0.4.197.** The image before P1b delivered a document on connect only.
+
+| Step | Device row | The daemon |
+|---|---|---|
+| Revision 2 (`h264_qsv:gpu`) saved at 01:24:37Z, the device connected | `pending` four minutes later, the last report revision 1 from the day before | not delivered |
+| Its service restarted at 01:48:47Z (device clock, not part of this test), and the reconnect delivered revision 2 | `needs_restart` (`zero_copy_deny`) at 01:49:07Z | the new worker started at 01:48:58Z (device clock), before the deny reached its file, so it runs without it |
+| The promote's roll: a reconnect at 05:31:19Z, the same worker | `noop`, nothing waiting. The dialog reads "Applied" and "The device confirmed this configuration and it is in force." | the 01:48:58Z worker, still without the deny |
+
+The last row is the defect P1c fixes ([#3283](https://github.com/gjovanov/roomler-ai/pull/3283)). The file already
+matched, so the reconnect answered `noop`, and the row said a deny was in force that the daemon did not run.
+
+**AC8, on the new image.** The first save went through the Device configuration dialog. The others sent the
+dialog's body to the same endpoint from the page, so they could be timed.
+
+| Case | The save | The report | Read |
+|---|---|---|---|
+| Connected | revision 3 (`none`) at 05:35:10.587Z | `needs_restart` at 05:35:10.737Z | 150 ms. The socket's only connect is 05:31:19Z, and the worker is the same |
+| Two saves 41 ms apart | revision 4 (`h264_qsv:gpu`) at 05:39:04.289Z, revision 5 (`none`) at 05:39:04.330Z | revision 5, `needs_restart`, at 05:39:04.585Z | the device applied twice, in order (its log, 119 ms apart), and its file ends on revision 5's `none` |
+| Offline at the save | the socket closed at 05:41:56.177Z for the device's 0.4.198 update; revision 6 (`h264_qsv:gpu`) at 05:41:58.109Z | `pending` until the reconnect at 05:42:12.996Z, then `needs_restart` at 05:42:13.258Z, on 0.4.198 | converged on connect, 262 ms after it |
+
+**Not seen yet: a save on the other pod.** The load balancer routes a request by the tenant id in its path and an
+agent's socket by its `tid`, so a tenant's saves and its devices' sockets land on one pod, and every save above was
+direct (the PUT and the socket on the same pod, no ctrl-lane line on either). A save takes the ctrl lane only for a
+socket left on the other pod, such as a device that reconnected during a roll's gap. That path is integration-tested
+(#3242), and AC8 stays open until a save reaches one in the field.
+
+Cleanup: revision 7 (`none`) put the file back to the value the 0.4.198 worker runs, and the device still answered
+`needs_restart`. That is the other half of what P1c fixes, seen in the field. Revision 8 stopped managing the key,
+and the device answered `noop`.
 
 ## 9. Related
 
