@@ -3861,8 +3861,8 @@ mod win_console {
 /// has to outlive it (`roomler exec … self-update`).
 ///
 /// A command that ENDS by itself lost nothing, so what it deliberately left
-/// running stays, the job let go: `ssh node 'msiexec /i x.msi /qn'` returns at
-/// once, and that installer has to go on. An interactive shell's `exit` is
+/// running stays, the job let go: `ssh node 'Start-Process msiexec …'` returns
+/// at once, and that installer has to go on. An interactive shell's `exit` is
 /// different, its session is over and its job closes (`pty/windows.rs`).
 ///
 /// A job was never a boundary against persistence: a process in it can ask
@@ -4271,8 +4271,8 @@ pub(crate) mod session_lifetime {
     }
 
     /// A command that started something and ENDED lost nothing to a stop:
-    /// `ssh node 'msiexec /i x.msi /qn'` returns at once, and that installer has
-    /// to go on. It stays through the command's end and the daemon's leaving.
+    /// `ssh node 'Start-Process msiexec …'` returns at once, and that installer
+    /// has to go on. It stays through the command's end and the daemon's leaving.
     #[test]
     fn what_a_command_left_running_when_it_ended_stays() {
         let daemon = StandIn::start(STAND_IN_TEST, "ended");

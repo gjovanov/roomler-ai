@@ -132,9 +132,10 @@ command never does** (`ExecRequest::session_owned`, #3303). A lost session ends 
 it started, with no code running, because the kernel closes the handle as the daemon
 goes. A Fleet RPC command may stop that daemon (`roomler exec … self-update`) and has
 to outlive it, so a job there would kill its own updater. A one-shot that ends by
-itself has its job let go, or `ssh node 'msiexec /i x.msi /qn'` would kill its own
-upgrade. Neither is a simplification to make: `docs/roomler-ssh.md` § What outlives a
-session.
+itself has its job let go, or `ssh node 'Start-Process msiexec …'` would kill the
+installer's client a moment after it started, and a client gone that early rolls the
+install back (1603). Neither is a simplification to make: `docs/roomler-ssh.md`
+§ What outlives a session.
 ⚠️ **An interactive pump can't hear its client go.** A shell at a prompt writes
 nothing that could fail, so `channel_close` and `Handler::drop` fire an abort for a
 shell as they do for a command, and on it the pump returns without `wait`, which
