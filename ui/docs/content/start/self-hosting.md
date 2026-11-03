@@ -61,9 +61,10 @@ Building instead takes roughly **six minutes** on a 16-core machine.
 
 Images are published at `ghcr.io/gjovanov/roomler-ai` for **linux/amd64 and
 linux/arm64** and are anonymously pullable; every other image in the file is
-published for both as well. The arm64 Roomler image is built and smoke-tested
-on a native arm64 machine, but the whole stack has not yet been run on an arm64
-host.
+published for both as well. The whole stack runs on both: an anonymous `pull`
+and `up -d` on a native arm64 machine and an x86 one, then a two-party call,
+directly and over the relay, on every proposed change to the compose file and
+once a week.
 
 Watch it come up:
 
@@ -103,12 +104,12 @@ Two settings decide it:
 | Setting | What it must be |
 |---|---|
 | The **announced IP** | The address browsers should send media to. `127.0.0.1` works only for calls made on the host itself. |
-| The **RTC port range** | 32 ports are mapped by default — enough to try it. A real deployment wants the full range. |
+| The **RTC port range** | 32 ports are mapped by default — enough to try it. A real deployment widens it. |
 
-On **Linux**, the clean answer is host networking: give the `roomler` service
-`network_mode: host` and drop its `ports:` block, and the whole range is
-reachable. That is how the hosted service runs. It is not available on Docker
-Desktop for macOS or Windows, which is why the port-mapped form is the default.
+To widen the range, change `40000-40031` in the `roomler` service's `ports:` and
+`ROOMLER__MEDIASOUP__RTC_MAX_PORT` together. Don't give the `roomler` service
+`network_mode: host` with this compose file: the service names stop resolving
+there, so the server can't reach its database and the web port answers 502.
 
 ## Optional integrations
 
@@ -123,14 +124,14 @@ All off by default; each is a block of environment variables:
 
 ## Upgrading and backups
 
-Upgrading is `pull` then `up -d`. State lives in the MongoDB and MinIO volumes —
+Upgrading is `git pull`, then `pull`, then `up -d`: the compose file names exact image
+versions, so `git pull` is what moves them. State lives in the MongoDB and MinIO volumes —
 back those up, not the container.
 
 ## Known limitations, stated plainly
 
 - **Single node.** The compose stack runs one API instance. Multi-node scale-out *is* supported by the code, but it is a Kubernetes topology rather than this file.
 - **No automatic TLS.** Deliberate — see above.
-- **arm64 is published but not yet run end to end.** Every image has an arm64 build; nobody has brought the whole stack up on an arm64 host yet.
 - **The relay is optional.** A separate TURN server is not on the critical path: the built-in relay floor over the API's own port already guarantees connectivity when no direct path exists.
 
 ## Licensing
