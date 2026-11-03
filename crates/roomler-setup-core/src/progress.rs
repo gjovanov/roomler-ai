@@ -79,10 +79,14 @@ pub enum ProgressEvent {
     /// into the replay log.
     #[serde(rename_all = "camelCase")]
     DownloadProgress { received_bytes: u64 },
-    /// Download complete; SHA256 verified (or `digest=None` and
-    /// verification was skipped with `sha256_match=true`).
+    /// Download complete, and compared with the digest the release
+    /// published. Not sent when the release published none.
     #[serde(rename_all = "camelCase")]
     DownloadVerified { sha256_match: bool },
+    /// #3246 — the download carries a valid signature from Roomler's
+    /// publisher, and `signer` is the name on it.
+    #[serde(rename_all = "camelCase")]
+    PublisherVerified { signer: String },
 
     /// msiexec launched (daemon roles, Windows). `pid` is the OS PID
     /// for operator diagnostics. SPA relabels Cancel to "Force-kill

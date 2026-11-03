@@ -680,7 +680,7 @@ pub(crate) trait Running: Send {
     /// End it now.
     async fn kill(&mut self);
     /// A test's: the memory its job holds it to, on Windows.
-    #[cfg(all(test, windows))]
+    #[cfg(all(test, windows, worker_calls))]
     fn job_limit(&self) -> Option<usize> {
         None
     }
