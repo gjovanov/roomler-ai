@@ -290,6 +290,19 @@ pub fn netchange_poke_enabled() -> bool {
     }
 }
 
+/// FR-65 P3 — how long a no-delta burst waits behind the last forced poke
+/// (`ROOMLERD_OVERLAY_NETCHANGE_POKE_QUIET_SECS`, config
+/// `overlay_netchange_poke_quiet_secs`). Default
+/// [`super::lifecycle::NETCHANGE_POKE_QUIET`]. `0` restores the arm as it was
+/// before the gate. The worst case with the gate is
+/// `POKE_SILENCE_AFTER` plus a tier deadline, and only for a no-delta burst
+/// right behind another one.
+pub(crate) fn netchange_poke_quiet() -> Duration {
+    crate::env::node_env("OVERLAY_NETCHANGE_POKE_QUIET_SECS")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(super::lifecycle::NETCHANGE_POKE_QUIET, Duration::from_secs)
+}
+
 /// rc.275 hygiene — gate for the LAN-gather virtual-interface filter
 /// (`ROOMLERD_OVERLAY_LAN_IFACE_FILTER` — see [`crate::env::node_env`]).
 /// Default **ON**; set `0`/`false`/`no`/`off` to restore the unfiltered

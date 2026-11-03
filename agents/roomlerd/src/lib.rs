@@ -129,9 +129,13 @@ pub mod macos_quit;
 pub mod macos_spawn;
 pub mod macos_supervisor;
 pub mod mdns_resolve;
+/// FR-135 R2 — `rc:media-plan`: what a session promised its viewer, and every
+/// step it took down from there.
+pub mod media_plan;
 pub mod mem_trim;
 pub mod power;
 pub mod remote_config;
+pub mod unenrolled;
 // P5 — crate-private: its surface leans on `peer::TargetResolution`
 // (pub(crate)) and nothing outside the agent consumes it. Compiled on
 // every build so its pure logic unit-tests on the default feature set
@@ -196,6 +200,9 @@ pub mod resource_watch;
 /// FR-98 C6 — `playout-delay` 0/0 on the RTP fallback track, so the
 /// browser's jitter buffer renders as soon as it decodes (default off).
 pub mod rtp_playout;
+/// FR-65 P2 / FR-70 AC1 — a 10 ms timer that records how late it woke, so a
+/// starved runtime shows up in the logs.
+pub mod runtime_canary;
 /// #2718 — the daemon's runtime is shut down with a budget, so a blocking
 /// read an exec left behind cannot hold the process past a stop.
 pub mod runtime_exit;

@@ -167,8 +167,9 @@ flowchart TB
   every colour.
 - **Crash recovery.** `read_fragmented` walks top-level boxes and stops at
   the first incomplete fragment. `reconcile_partials` remuxes whatever a dead
-  recorder left, marks it `interrupted`, and removes a partial that holds
-  nothing recoverable.
+  recorder left, marks it `interrupted`, and removes a partial only when the
+  file itself shows it holds nothing. Any other failure keeps the fragmented
+  file under the final name (§5).
 - If the remux itself fails (for example, no room for a second copy), the
   fragmented file is kept under the final name and the `stopped` event says
   `fragmented: true`.
@@ -330,7 +331,7 @@ the first log line. Use `recording::child::parse_event_line`.
 | `progress` | every second | `duration_ms`, `bytes`, `frames`, `late_ticks` |
 | `stopped` | the file is final | `reason`, `path`, `bytes`, `duration_ms`, `frames`, `fragmented` |
 | `refused` | it never started | `code`: `no_frame` · `disk_low` · `encoder_unavailable` · `folder_unwritable` · `audio_unavailable` · `system_audio_unavailable` · `mic_unavailable` |
-| `recovered` | a dead recorder's partial in this folder was finalized | `path` |
+| `recovered` | a dead recorder's partial in this folder was finalized, or kept under its final name because the remux failed | `path` |
 
 **stdin:** `{"cmd":"stop"}`, optionally with a `"reason"`. **End of stdin
 stops the recording** (`parent_gone`), and so does Ctrl+C. Every stop
@@ -357,7 +358,37 @@ says. It prints `saved <path>` with `ended: recorder_exited` and the line "the
 file may be finalized at the next recording". The file appears when the next
 recording starts in that folder, so the first read after a crash finds nothing
 at that path. Measured on Windows 11 and Ubuntu X11, six hard kills lost at most
-1.81 s.
+1.81 s; two more on release 0.4.198, on Windows, at most 0.54 s.
+
+⚠️ **A failed attempt never deletes a recording.** A recorder that dies during
+the remux leaves its temp (`<name>.remux-tmp`) beside the destination and its
+partial whole. The retry used to refuse that temp, and the reconciler read any
+error as "nothing recoverable", so it deleted the partial: a finished recording
+lost, every fragment of it (measured 2026-11-02 on Windows, 0.4.197; every
+release had it, on every OS). `mp4::finalize` now removes that temp and creates
+its own with `create_new`: the caller holds the partial's lock, so nothing else
+writes that name, and a link planted there is not written through.
+`reconcile_partials` removes a partial only on `mp4::NothingRecoverable`: no
+`moov`, or no complete fragment. Read on release 0.4.198 (2026-11-03): a
+Windows recorder terminated with its temp written and no final file came back
+whole at the next start, all 14,772 frames, marked `interrupted`.
+
+Every other failure, such as a full disk or a corrupt fragment, follows the stop
+path's rule: the fragmented file goes under its final name, marked `interrupted`,
+the whole error chain goes to the log, and the `recovered` event names it. That
+is one attempt per partial. Read on release 0.4.198 with a folder holding the
+temp's name: `Access is denied` in the log, the partial under its final name with
+its 31 fragments, listed, and Windows' Media Player plays it. Listing, deleting and downloading never read a
+recording's contents, so this file takes them like any other. The sidecar's
+duration, frames and bytes come from its fragments. The editor reads progressive
+files only and finds no video in it, as in the stop path's fragmented file. A
+partial stays for the next start only if that rename fails too, because the
+folder is gone or another program holds the file.
+
+A remux that cannot fit is not started. `mp4::finalize` compares the copy's exact
+size with `folder::available_space` first, because running the volume to zero to
+find out would stop whatever else writes there, the next recording included.
+Where the room cannot be told, the remux goes ahead.
 
 ⚠️ **A partial is finalized only if its `.partial.lock` can be taken**
 (`recorder::PartialLock`). The recorder takes that OS file lock before it
@@ -368,6 +399,11 @@ manual `roomlerd record` beside the daemon's) would remux a file under its
 writer, or, before the writer's first fragment, **delete it as
 unrecoverable**. `a_live_partial_is_left_alone_by_the_reconciler` is red with
 the lock disabled.
+
+A recorder's own WGC capture can end it during the remux. `docs/remote-control.md`
+§5.1 has that fault, which was over a moving screen, and its fix. A recording of a
+few seconds exits before the capture thread leaves its apartment, so it never gets
+that far.
 
 ## 6. Recording through the daemon — the local verbs (P2a)
 
@@ -713,7 +749,8 @@ recorded size. ⚠️ **Never content**: no window titles, and nothing typed.
 
 Computer audio and the microphone are both **OFF unless asked for**
 (`--system-audio`, `--microphone`; the checkboxes in §7; `RecordStartOpts`).
-The microphone is local-only: no remote path will ever set it (P3).
+The microphone is local-only: nothing in remote recording can set it (§10, "The
+microphone is the person's", which also says what that sentence does not cover).
 
 ```mermaid
 flowchart LR
@@ -1175,8 +1212,8 @@ sequenceDiagram
 
 | Piece | Where | What it guarantees |
 |---|---|---|
-| The record context crosses | `delegate.rs:172` (`SessionParams::record`), `signaling.rs:2697` (sent AFTER the consent mode is resolved), `signaling.rs:1937` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1098`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
-| The row says what the worker can do | `delegate_worker.rs:105` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:592` (`effective_record`), `signaling.rs:1749` (the heartbeat, primary org only) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
+| The record context crosses | `delegate.rs:172` (`SessionParams::record`), `signaling.rs:2740` (sent AFTER the consent mode is resolved), `signaling.rs:1980` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1101`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
+| The row says what the worker can do | `delegate_worker.rs:105` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:592` (`effective_record`), `signaling.rs:1792` (the heartbeat, primary org only) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
 | An OFF is live | `remote.rs:463` (`subscribe_gates`), `delegate_worker.rs:428-441` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
 | The worker's account of a recording | `delegate.rs:554` (noted where the grant crosses), `delegate.rs:794` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:195`). The server bounds it again to a live session of this agent |
 
@@ -1349,43 +1386,41 @@ storage. `crates/tests/src/recording_tests.rs` tests those, and
 ### The microphone is the person's
 
 A remote recording cannot take the host's microphone. Every way into a
-recording, as reviewed on 2026-10-31:
+recording, as reviewed on 2026-10-31 and re-read on 2026-11-02, plus the one other
+way a controller hears a device:
 
 | Entry point | Reached by | The microphone | Pinned by |
 |---|---|---|---|
 | `rc:record.start` on the `record` channel | A controller whose grant holds `RECORD` | No field for it, and a `microphone` key is ignored. `audio` means what the computer plays, behind `record_remote_audio` | `the_wire_parses_and_speaks_the_documented_shapes` |
-| `RecordingManager::start_remote` | That channel's handler, in the daemon or in a Mac's worker | `microphone: false`, and not a parameter | `tests/control_dc_record.rs`: a remote recording's sidecar says no microphone |
+| `RecordingManager::start_remote` | That channel's handler, in the daemon or in a Mac's worker | `microphone: false`, and not a parameter | `tests/control_dc_record.rs` `an_auto_granted_session_records_and_stops`: the sidecar says no microphone |
 | The Mac relay, `delegate::DelegatedRecord` | The root daemon, handing a session to the GUI worker | It carries who is recording and the prompt window, and nothing about sound | `the_mac_relay_carries_no_sound_choice` |
 | Remote configuration, `DesiredConfig` | An administrator, through the server | No `record_*` key can be pushed | `no_record_key_is_server_pushable_via_desired_config` |
 | The fleet RPC verbs, `RpcCap` | An administrator, through the server | None of them is a recording verb | `rpc_cap_wire_strings_are_locked` |
 | The words of `AgentCaps.record` | The hub, reading what a device offers | `remote`, `remote-audio` and `available`, and nothing about a microphone | `remote_recording_does_not_imply_remote_audio` |
 | `RecordStart` on the LocalAPI, behind `roomler record start --microphone` and the Recordings view | The person at the console; on a Linux system install, on their own socket (§6) | Theirs to choose | `the_console_user_decision_table`, `the_recording_decision_table`, `an_unidentified_peer_cannot_start_stop_delete_or_move_recordings` |
 | `roomlerd record --microphone`, run by hand | Whoever runs it, as themselves | That account's | Nothing remote starts it |
+| A live session's sound, "Receive host audio" | A controller whose session carries sound. Not a recording | What the computer plays, never the default input, which on Linux is the microphone ([remote-control.md §5.1c](remote-control.md)). `ROOMLERD_AUDIO_SOURCE` can name another device, and it is the daemon's environment, which no wire message sets | `the_default_input_is_never_the_pick` |
 
-⚠️ **This is about the recording feature, not about control of the device.** Four
-general-control paths act as an account on the device, so they can start a LOCAL
-recording with the microphone, as they can start any other program that opens
-one:
+⚠️ **This is about the recording feature, not about control of the device.**
+Decided 2026-11-02 (FR-85 open decision 7): in AC7, "a remote controller" means the
+RC controller and the remote-recording feature, and the table above is that claim
+with its proof. Four general-control paths act as an account on the device, so they
+can start a LOCAL recording with the microphone, as they can start any other
+program that opens one. They stay as they are, and this is where they are written
+down:
 
-- A controller holding `INPUT` works roomler-desktop or a terminal with the
-  host's own mouse and keyboard.
-- `roomler exec` arrives as root on Linux, as SYSTEM in the console session on a
-  SystemContext host, and as the person on an attended Windows install. All three
-  pass the console-user gate. An anchored service, SYSTEM in session 0, does not.
-- `roomler ssh` in `console_user` mode runs in the console session on Windows. On
-  Linux it drops to the person at the screen, and on a system install that person's
-  socket serves it (P2e).
-- A Hive session (default off) runs as its mapped account, which passes the gate
-  where that account is the daemon's or root, and on a Linux system install where
-  it is the person at the seat.
+| Path | Arrives as | Its own gates | Why the local gate lets it in |
+|---|---|---|---|
+| An RC session holding `INPUT` | The person's own desktop: roomler-desktop or a terminal, worked with the host's mouse and keyboard | The host's consent to `INPUT` | The Recordings view is the person's own process |
+| `roomler exec` | Root on Linux, SYSTEM in the console session on a SystemContext host, the person on an attended Windows install | `EXEC_DEVICE` (`ADMINISTRATOR` only) and the owner's `exec_enabled` | `peer_is_console_user`: uid 0, or the console session. An anchored service, SYSTEM in session 0, does not pass |
+| `roomler ssh` in `console_user` mode | The console session on Windows. On Linux it drops to the person at the screen | `SSH_DEVICE` (`ADMINISTRATOR` only) and the owner's `ssh_enabled` | The console session on Windows. On a Linux system install, that person's socket (P2e). `daemon` mode is the exec row on Linux |
+| A Hive session (default off) | Its mapped account | The device's `hive_accounts` | Where that account is the daemon's or root, or on a Linux system install the person at the seat |
 
-Each has its own gates: the host's consent to `INPUT`, `EXEC_DEVICE` or
-`SSH_DEVICE` (`ADMINISTRATOR` only) with the owner's `exec_enabled` or
-`ssh_enabled`, and the device's `hive_accounts`. A local gate cannot tell them
-from the person, which is the limit keep busy documents
-(`peer_may_start_keep_busy`, FR-92 §3g, #2021). What they get is a local
-recording: no `controller_user_id`, so the `record` channel neither lists nor
-serves it, and the tray turns red (§7).
+A local gate cannot tell them from the person, which is the limit keep busy
+documents (`peer_may_start_keep_busy`, FR-92 §3g, #2021). A stricter gate on the
+recorder would not close it either: each path can run any other program that opens
+a microphone. What they get is a local recording: no `controller_user_id`, so the
+`record` channel neither lists nor serves it, and the tray turns red (§7).
 
 ## 11. The editor (P5)
 
@@ -1587,7 +1622,7 @@ the music in the preview.
 | `recording::folder` unit test and the CI unit start (P2c) | a read-only file system on Linux is named as the service's sandbox ("… read-only for the Roomler service (on a Linux desktop it runs sandboxed …)"), and any other refusal keeps its own words. In CI, a unit carrying `roomler.service`'s sandbox lines VERBATIM starts on a runner with no pre-rename folders, the real `roomlerd record --where` inside it chooses `~/Videos/Roomler`, and the rest of home stays read-only. Shown failing first, locally (systemd 255, a user unit): master's unit fails `226/NAMESPACE` on a host without the pre-rename folders, and with them present it starts but keeps the recorder out of `~/Videos` (the recording falls back to the data folder); the CI step's own commands fail on master's unit ("did not start") and pass on this one. With unprivileged user namespaces refused (`user.max_user_namespaces=0`), master's user unit STARTS and writes `~/Videos`: the user manager skips the whole sandbox, which the CI step's system unit never does | "Test the recorder (FR-85)" (`--lib recording::`); "The Linux user unit's sandbox (FR-85 P2c)" |
 | `tests/recorder.rs`, Windows (P1e) | the recorder an elevated daemon launches reports (`record --whoami`) the same user at MEDIUM integrity with the admin group deny-only; red with the integrity left alone, red with no group made deny-only; the positive control, launched as the daemon itself, IS elevated. A whole recording through the rule: the folder asked of the recorder (`record --where`), start, stop, and the list and delete done as it | the same Windows job |
 | `tests/recorder.rs`, the kill switch | `ROOMLERD_RECORDING=0` closes every path and says so: the state a client greys Start out with, a start, `available` (so the device stops advertising `record`), the listing and the folder a download is served from; the control, the same manager without the switch, can record. `launch::switched_off` reads only an explicit off (`0`, `false`, `off`, `no`), never a typo | "Test the recorder (FR-85)", `--test recorder` and `--lib recording::` |
-| `tests/recorder.rs` | A counter-pattern capture → openh264 recording encoder → MP4 → openh264 decode, reading the counters back (the oracle is proven to discriminate first); display change; disk-low and no-frame refusals; the real `roomlerd record` process: the stop command, stdin EOF, `kill -9` followed by `reconcile_partials`, a **live** partial left alone (red with the lock disabled); and the manager end to end (start into `record_dir`, a second start refused, stop, list, delete), a missed start deadline killing the child (red without the kill), and the refusal where there is nobody to record as | same step, `--test recorder` |
+| `tests/recorder.rs` | A counter-pattern capture → openh264 recording encoder → MP4 → openh264 decode, reading the counters back (the oracle is proven to discriminate first); display change; disk-low and no-frame refusals; the real `roomlerd record` process: the stop command, stdin EOF, `kill -9` followed by `reconcile_partials`, a **live** partial left alone (red with the lock disabled), a recorder dead during the remux losing nothing, a failed remux keeping the fragmented file under its final name with every fragment and nothing left to retry, a partial that cannot reach its folder kept for the next start, a link at the temp's name not written through, one that holds nothing or only a header removed; and the manager end to end (start into `record_dir`, a second start refused, stop, list, delete), a missed start deadline killing the child (red without the kill), and the refusal where there is nobody to record as | same step, `--test recorder` |
 | `recording::pointer` unit tests (P1d) | the pointer lands where the source says and nowhere else; a translucent pixel blends (premultiplied "over"), a transparent one changes nothing, a malformed one saturates; moving it leaves no trail (byte-equal to drawing it once at the new place); hiding it gives the frame back byte for byte; clipped at every edge and never wrapped, wholly outside draws nothing; row padding respected; an unchanged pointer re-uses the same frame; **the frame the encoder still holds is never written** (red when the canvas is written without `make_mut`); a new capture is not patched with the old one's pixels (red when `replace` keeps them), and gets the pointer even when it did not move; a frame that is not BGRA passes untouched; a scaled frame takes the position through the ratio; one poll per frame | "Test the recorder (FR-85)" (`--lib recording::`) |
 | `capture::pointer` unit tests (P1d) | Windows' straight alpha premultiplied, XFixes' words read as B, G, R, A; a short or absurd image refused, never read past; the hotspot and the display's origin both taken off, a monitor left of the primary included. Windows only: a recording's WGC session draws the pointer, the live one only under `ROOMLERD_WGC_CURSOR=1` | every unfiltered `--lib` run ("Test agent under vp9-444"); the WGC cell in "Windows recorder identity (FR-85)", which also compiles and lints the Windows capture code (WGC, DXGI, the cursor tracker) that no other lane builds |
 | `capture::pointer::x11_tests` (P1d) | against a real X server: the pointer warped to a known place reads back there less its hotspot, and less a monitor's origin; it follows a second warp; an unchanged shape is not rebuilt | `ci.yml` "The recorder's pointer on X11 (FR-85 P1d)", under Xvfb. `ROOMLERD_TEST_X11=1` makes a missing server a failure, never a skip |

@@ -41,7 +41,7 @@ cannot answer it yet (§3), so P0 measures before anything is built.
 ### 2.2 What the fleet measures today (7 days to 2026-10-21, read-only)
 
 From `agent_logs`: 142 538 FFmpeg DC pump heartbeats from 11 hosts, read-only, from mars. The "encode"
-column is the pump's `avg_encode_ms` (`peer.rs:9542`): the time inside `encode_sync`, so **conversion,
+column is the pump's `avg_encode_ms` (`peer.rs:9589`): the time inside `encode_sync`, so **conversion,
 copies, upload, submission and the packet drain together** (§3). The fps columns are the delivered rate
 between consecutive heartbeats (spaced 2.0 s). The median sits at 16–17 fps on almost every host because an
 idle desktop produces few frames, which is not a limit. So the table shows the top of the distribution, p99
@@ -103,7 +103,7 @@ only when it asks:
 | Consumer | Anchor | After C0 |
 |---|---|---|
 | the pump's CPU resample | `encode/resample.rs:461`, `:463` | `cpu()`; on the GPU path the scale happens on the GPU first (§4.3), so it passes through |
-| `FfmpegEncoder::convert_into` | `encode/ffmpeg/encoder.rs:1960` | takes the GPU surface instead, on a GPU cell |
+| `FfmpegEncoder::convert_into` | `encode/ffmpeg/encoder.rs:1966` | takes the GPU surface instead, on a GPU cell |
 | libvpx (VP9 4:4:4), openh264, Media Foundation | `encode/libvpx.rs`, `encode/openh264_backend.rs:466`, `encode/mf/sync_pipeline.rs:341` | `cpu()`, unchanged |
 | the idle detector's hash | `session_idle.rs:218` | `cpu()`; it samples a few rows, and the cost is measured in P2 |
 | the recorder and its pointer | `recording/recorder.rs`, `recording/pointer.rs` | `cpu()`, unchanged |

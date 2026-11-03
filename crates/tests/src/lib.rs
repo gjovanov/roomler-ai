@@ -50,6 +50,10 @@ mod agent_e2e_tests;
 mod agent_exec_tests;
 #[cfg(test)]
 mod agent_presence_tests;
+/// FR-28 — the control socket's redial on the load balancer's 502, through the
+/// real signaling loop and a scripted front.
+#[cfg(test)]
+mod agent_redial_tests;
 /// #2267 — a removal (or an archive) tells a connected device at once with
 /// `rc:goodbye AgentDeleted`, instead of leaving it its socket.
 #[cfg(test)]
@@ -334,6 +338,11 @@ mod session_decode_errors_tests;
 /// switch's empty 404, `purge_user`, and the digest's `quality.ratings`.
 #[cfg(test)]
 mod session_feedback_tests;
+/// FR-135 R2 — `rc:media-plan` and `rc:viewer-hz` through a real agent and a real
+/// viewer peer: the verb, the plan on the control channel, and the viewer's
+/// refresh reaching the agent.
+#[cfg(test)]
+mod session_media_plan_tests;
 /// FR-129 B1-s — `GET /api/setup/features`: the Phase B kill switch (one per
 /// OS since B1-s2, the legacy `wizard_unix_daemon` for both; default off) and
 /// `pairing`, each following its setting, read by a guest and a member alike.
@@ -362,6 +371,10 @@ mod tenant_archive_tests;
 /// earlier token (agents and tunnel clients alike).
 #[cfg(test)]
 mod token_renewal_tests;
+/// #1821, #1829 — what a removal leaves behind answers nothing: External
+/// access on a removed device, and an overlay join on the socket it still holds.
+#[cfg(test)]
+mod tombstone_tests;
 /// FR-111 P4a — the org's on-screen control presets: any member reads them,
 /// `MANAGE_TENANT` writes them, a foreign id is a 404, a bad body is refused
 /// with a code, and an org keeps at most fifty.

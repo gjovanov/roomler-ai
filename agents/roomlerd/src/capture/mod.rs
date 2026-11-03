@@ -63,6 +63,9 @@ pub mod synthetic_backend;
 /// slot-first (look, and pace only a source that outruns the target).
 pub mod gate;
 
+/// #3272 — the pump's side of [`ScreenCapture::next_frame`]'s contract.
+pub mod pace;
+
 /// FR-119 P2b-3 — the captured display's refresh rate, per OS.
 pub mod refresh;
 
@@ -495,7 +498,25 @@ pub fn readback_window_ms(now: (u64, u64), base: (u64, u64)) -> f64 {
 
 #[async_trait::async_trait]
 pub trait ScreenCapture: Send {
+    /// The next frame, or `Ok(None)` when none arrived.
+    ///
+    /// #3272 — the contract:
+    /// - **The backend owns its pace.** A pump loops straight back on an
+    ///   `Ok(None)` and sleeps on nothing. So an `Ok(None)` comes after a bounded
+    ///   wait for a frame (an event, a timer, an acquire with a timeout), not at
+    ///   once. WGC, the portal, scrap and DRM wait in here.
+    /// - **The wait is bounded.** A pump reads its keepalive, its teardown and
+    ///   its pending settings between calls, so nothing here waits for long.
+    /// - **Stray instant empties are fine.** A pull backend's next ask can be
+    ///   already due after a slow encode, and the ask after it sleeps. A stream
+    ///   of them is a spin: [`pace::EmptyGuard`] warns once and floors each.
+    ///
+    /// ⚠️ One backend meets this only when asked: the SYSTEM-context capture,
+    /// through [`open_async`]'s `paced`. The two DataChannel pumps do not ask, and
+    /// sleep on an empty themselves. FR-98 C7 moves them over and deletes the
+    /// opt-in.
     async fn next_frame(&mut self) -> Result<Option<Frame>>;
+
     fn monitor_count(&self) -> u8;
     /// HW-downscale Phase B — the pump's CURRENT effective encode box
     /// (aspect-preserved, even dims), so a GPU-capable backend can scale
@@ -2622,7 +2643,12 @@ impl Default for ReopenBackoff {
 /// The live path: the pointer stays OUT of the frames wherever a backend can
 /// leave it out, because it travels on its own channel (`cursor.rs`).
 pub fn open_default(target_fps: u32, downscale: DownscalePolicy) -> Box<dyn ScreenCapture> {
-    open_with(target_fps, downscale, pointer::PointerRequest::Separate)
+    open_with(
+        target_fps,
+        downscale,
+        pointer::PointerRequest::Separate,
+        false,
+    )
 }
 
 /// FR-93 P2d — [`open_default`] for the media pumps, off the runtime's workers.
@@ -2646,6 +2672,24 @@ pub async fn open_default_async(
     downscale: DownscalePolicy,
     on_wait: OnOpenWait,
 ) -> Box<dyn ScreenCapture> {
+    open_async(target_fps, downscale, false, on_wait).await
+}
+
+/// #3272 — [`open_default_async`], for a pump that may ask for
+/// [`ScreenCapture::next_frame`]'s contract. `paced` matters to the SYSTEM-context
+/// capture alone, because every other backend already keeps the contract. There
+/// the open waits for a seat the capture before it is letting go of, the acquire
+/// waits for a frame (so frames stay off the GPU: a wait holds the device's lock),
+/// and GDI holds to its target. It is said here, not after the open, because the
+/// open is the first thing it changes. Only the RTP pump asks; FR-98 C7 moves the
+/// others over and deletes the choice.
+pub async fn open_async(
+    target_fps: u32,
+    downscale: DownscalePolicy,
+    paced: bool,
+    on_wait: OnOpenWait,
+) -> Box<dyn ScreenCapture> {
+    let pointer = pointer::PointerRequest::Separate;
     #[cfg(target_os = "linux")]
     {
         // FR-93 P5b — dropped with this future, so an open still waiting when
@@ -2654,7 +2698,7 @@ pub async fn open_default_async(
         let _mark = SetOnDrop(std::sync::Arc::clone(&abandoned));
         match tokio::task::spawn_blocking(move || {
             let _hook = ParkHook::install(on_wait, abandoned);
-            open_default(target_fps, downscale)
+            open_with(target_fps, downscale, pointer, paced)
         })
         .await
         {
@@ -2672,7 +2716,7 @@ pub async fn open_default_async(
     {
         // No open here waits for a person: there is no portal off Linux.
         drop(on_wait);
-        open_default(target_fps, downscale)
+        open_with(target_fps, downscale, pointer, paced)
     }
 }
 
@@ -2886,14 +2930,17 @@ pub fn open_for_recording(target_fps: u32) -> Box<dyn ScreenCapture> {
         target_fps,
         DownscalePolicy::Never,
         pointer::PointerRequest::InFrame,
+        false,
     )
 }
 
-/// The backend cascade, shared by the live path and the recorder.
+/// The backend cascade, shared by the live path and the recorder. `_paced`:
+/// see [`open_async`].
 fn open_with(
     _target_fps: u32,
     _downscale: DownscalePolicy,
     _pointer: pointer::PointerRequest,
+    _paced: bool,
 ) -> Box<dyn ScreenCapture> {
     // Phase 1 — synthetic-frame-source short-circuit. When the agent
     // is running inside the agent-e2e Pod (or any headless CI
@@ -2935,6 +2982,7 @@ fn open_with(
                 match crate::system_context::capture_pump::SystemContextCapture::primary(
                     _target_fps,
                     _downscale,
+                    _paced,
                 ) {
                     Ok(c) => {
                         tracing::info!(

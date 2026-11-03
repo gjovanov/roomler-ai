@@ -53,7 +53,7 @@ operator's to restore; the product's job is to say so.
 ## Key design
 
 1. **The reason survives the fallback.** `capture::open_default`
-   (`agents/roomlerd/src/capture/mod.rs:627`) currently drops the backend's
+   (`agents/roomlerd/src/capture/mod.rs:655`) currently drops the backend's
    error on the floor and returns `Box::new(NoopCapture)`
    (`mod.rs:683`). `NoopCapture` carries a `CaptureUnavailable { code, detail }`
    instead, exposed through one new `ScreenCapture` trait method defaulting to
@@ -90,7 +90,7 @@ operator's to restore; the product's job is to say so.
    turned out to have a GUI session and to capture fine. The ordering is right;
    the evidence for it was wrong, and no fleet host currently exercises it.
 3. **One new control-DC message**, `rc:media-unavailable`, built by a sibling of
-   `video_info_payload` (`peer.rs:4622`) and sent with the same
+   `video_info_payload` (`peer.rs:4754`) and sent with the same
    retry-until-delivered discipline both pumps already use for `rc:video-info`
    (rc.87: a once-only send races the control-DC open and is silently lost).
    It is peer-to-peer JSON on the control channel, **not** a `ClientMsg` /
@@ -136,7 +136,7 @@ operator's to restore; the product's job is to say so.
 - Restoring the permission itself. A remote agent must not be able to grant
   itself screen capture, and nothing here tries.
 - Making `has_input_permission` track the OS rather than the build
-  (`encode/caps.rs:3194` records that gap). Same class, separate change.
+  (`encode/caps.rs:4291` records that gap). Same class, separate change.
 - Re-signing or pinning the macOS identity so TCC grants survive a
   certificate change. That is FR-7's ground, and the answer there is that a
   Developer ID move is a one-time cost.

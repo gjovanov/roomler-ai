@@ -1143,15 +1143,37 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
     }
 }
 
+/// What `install` hands back: the scoped subscriber, and a SECOND registered
+/// dispatcher, never one alone. With exactly one registered, tracing-core
+/// rebuilds a callsite's interest from the default of whichever thread reaches
+/// it first (`Rebuilder::JustOne`) and caches it for every thread. A parallel
+/// test with no subscriber of its own makes it `never`, and the capture misses
+/// that line for good, though this thread emitted it. It can be any line: the
+/// lane installs no global subscriber, so nothing registers a callsite before
+/// the first capture does. Measured on CI, run 41584702058: "login VERIFIED by
+/// the device" missed while `the_org_hears_of_a_persons_first_session_once`
+/// logged in beside it. With two, every registered dispatcher is asked, as
+/// `roomler-node-core`'s config tests hold it. The scope ends first, then the
+/// second.
+struct CaptureGuard {
+    _scoped: tracing::subscriber::DefaultGuard,
+    _second: tracing::Dispatch,
+}
+
 impl LogCapture {
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
-        tracing::subscriber::set_default(
+    fn install(&self) -> CaptureGuard {
+        let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let scoped = tracing::subscriber::set_default(
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::TRACE)
                 .with_ansi(false)
                 .with_writer(self.clone())
                 .finish(),
-        )
+        );
+        CaptureGuard {
+            _scoped: scoped,
+            _second: second,
+        }
     }
 
     fn bytes(&self) -> Vec<u8> {
@@ -1161,6 +1183,28 @@ impl LogCapture {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes()).into_owned()
     }
+}
+
+/// The capture sees every line its own thread logs, even one another thread
+/// reached first. With one registered dispatcher that thread's `never` would be
+/// cached for both (`CaptureGuard`), which is how CI lost a line the capture
+/// test asserts on.
+#[test]
+fn the_capture_sees_a_line_another_thread_reached_first() {
+    fn reach() {
+        tracing::info!("capture probe: a line two threads reach");
+    }
+    let capture = LogCapture::default();
+    let _logs = capture.install();
+    std::thread::spawn(reach).join().unwrap();
+    reach();
+    assert!(
+        capture
+            .text()
+            .contains("capture probe: a line two threads reach"),
+        "the capture missed a line this thread logged: {:?}",
+        capture.text()
+    );
 }
 
 /// The spellings of a secret a log line, a frame or a stored field could hold.
@@ -1498,6 +1542,83 @@ async fn a_server_cannot_mint_a_session_the_device_never_logged_in() {
     let end = outcome(rx).await;
     assert_eq!(end["t"], "rc:terminate", "a spent login: {end}");
     assert_eq!(end["reason"], "agent_hangup", "{end}");
+    let _ = dev.stop.send(true);
+}
+
+/// The name the Hub told the device, read off the audit row it writes beside the
+/// request. Both come from one value, and the row is the part a test can read.
+async fn told_the_device(app: &TestApp, session: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let row = app
+            .db
+            .collection::<bson::Document>("remote_audit")
+            .find_one(bson::doc! { "session_id": oid(session), "event.kind": "session_requested" })
+            .await
+            .unwrap();
+        if let Some(row) = row {
+            return row
+                .get_document("event")
+                .unwrap()
+                .get_str("controller_name")
+                .unwrap()
+                .to_string();
+        }
+        assert!(Instant::now() < deadline, "no session_requested row");
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Decision 8. The person at the machine is told what the server knows of who is
+/// asking: the address the account proved, or that it has none, and only after that
+/// the name it chose. The org's log keeps the name as chosen.
+#[tokio::test]
+async fn the_device_is_told_a_proven_address_or_that_there_is_none() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-asked").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-asked",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+
+    // Signed up and activated: this account proved its address.
+    let (principal, mut ws) = outsider(&app, "extasked").await;
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    assert_eq!(
+        told_the_device(&app, &session).await,
+        "extasked@outside.test (verified) as \"An Outsider\""
+    );
+    let row = wait_for_row(&app, &seeded, |r| {
+        r["action"] == "session" && r["session_id"] == json!(session)
+    })
+    .await;
+    assert_eq!(row["actor"], "An Outsider", "{row}");
+    end_session(&app, &mut ws, &session).await;
+
+    // What an unverified provider identity holds instead: a placeholder.
+    app.state
+        .users
+        .base
+        .update_by_id(
+            oid(&principal),
+            bson::doc! { "$set": {
+                "email": "microsoft-oid@unverified.invalid",
+                "is_verified": false,
+            } },
+        )
+        .await
+        .unwrap();
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    assert_eq!(
+        told_the_device(&app, &session).await,
+        "Unverified account \"An Outsider\""
+    );
     let _ = dev.stop.send(true);
 }
 
@@ -2786,5 +2907,537 @@ async fn a_bar_leaves_a_session_the_account_holds_as_a_member() {
         hub.session_snapshot(ordinary).is_some(),
         "the session held as a member stands"
     );
+    let _ = dev.stop.send(true);
+}
+
+/// One outsider, logged in, with a session on this device.
+async fn in_session(app: &TestApp, dev: &Device, tag: &str) -> (String, Ws, String) {
+    let (principal, mut ws) = outsider(app, tag).await;
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    (principal, ws, session)
+}
+
+/// An admin's act ended this session, as its outsider reads it.
+async fn put_out(ws: &mut Ws, session: &str) {
+    let end = next_of(ws, &["rc:terminate"]).await;
+    assert_eq!(end["session_id"], json!(session), "{end}");
+    assert_eq!(end["reason"], "admin_terminated", "{end}");
+}
+
+/// Decision 16. Gate 1 going off ends what it covers, at once: every external
+/// session of the org, on every device. A session the same account holds as a
+/// member came through the other door and stands, and another org's switch is
+/// another org's. Neither a refused caller nor turning it on ends anything.
+#[tokio::test]
+async fn the_org_switch_going_off_ends_its_external_sessions() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-gate-1").await;
+    let elsewhere = app.seed_tenant("extauth-gate-1-b").await;
+    let admin = &seeded.admin.access_token;
+    let first = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-gate-1-a",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let second = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-gate-1-b",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let foreign = device_with(
+        &app,
+        &elsewhere,
+        "mach-extauth-gate-1-c",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws_first, on_first) = in_session(&app, &first, "extorgoffa").await;
+    let (_, mut ws_second, on_second) = in_session(&app, &second, "extorgoffb").await;
+    let (_, _ws_foreign, on_foreign) = in_session(&app, &foreign, "extorgoffc").await;
+    let (ordinary, _rx) = mint_session(&app, oid(&first.agent_id), oid(&principal), None);
+
+    let hub = &app.state.fleet().rc_hub;
+    let live = |session: &str| hub.session_snapshot(oid(session)).is_some();
+    let switch = url(&seeded, "/external-access");
+
+    assert_eq!(
+        put(
+            &app,
+            &switch,
+            &seeded.member.access_token,
+            json!({ "enabled": false })
+        )
+        .await,
+        403
+    );
+    assert_eq!(
+        put(&app, &switch, admin, json!({ "enabled": true })).await,
+        200
+    );
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        live(&on_first) && live(&on_second),
+        "neither of those is the switch going off"
+    );
+
+    assert_eq!(
+        put(&app, &switch, admin, json!({ "enabled": false })).await,
+        200
+    );
+    put_out(&mut ws_first, &on_first).await;
+    put_out(&mut ws_second, &on_second).await;
+    tokio::time::sleep(SETTLE).await;
+    assert!(!live(&on_first) && !live(&on_second));
+    assert!(
+        hub.session_snapshot(ordinary).is_some(),
+        "a session held as a member stands"
+    );
+    assert!(live(&on_foreign), "another org's switch is another org's");
+    for dev in [&first, &second, &foreign] {
+        let _ = dev.stop.send(true);
+    }
+}
+
+/// Decision 16. Gate 2 cleared ends the device's external sessions, and no other
+/// device's. An approval that still stands with less in it applies from the next
+/// session, as it always has, and a caller the route refuses ends nothing.
+#[tokio::test]
+async fn a_cleared_approval_ends_the_devices_external_sessions() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-gate-2").await;
+    let admin = &seeded.admin.access_token;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-gate-2-a",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let other = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-gate-2-b",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws, on_dev) = in_session(&app, &dev, "extclearoffa").await;
+    let (_, _ws_other, on_other) = in_session(&app, &other, "extclearoffb").await;
+    let (ordinary, _rx) = mint_session(&app, oid(&dev.agent_id), oid(&principal), None);
+
+    let hub = &app.state.fleet().rc_hub;
+    let live = |session: &str| hub.session_snapshot(oid(session)).is_some();
+    let policy = url(
+        &seeded,
+        &format!("/agent/{}/external-access-policy", dev.agent_id),
+    );
+
+    assert_eq!(
+        put(
+            &app,
+            &policy,
+            &seeded.member.access_token,
+            json!({ "approved": false })
+        )
+        .await,
+        403
+    );
+    assert_eq!(
+        put(
+            &app,
+            &policy,
+            admin,
+            json!({ "approved": true, "max_permissions": "VIEW" })
+        )
+        .await,
+        200
+    );
+    tokio::time::sleep(SETTLE).await;
+    assert!(live(&on_dev), "neither of those clears the approval");
+
+    assert_eq!(
+        put(&app, &policy, admin, json!({ "approved": false })).await,
+        200
+    );
+    put_out(&mut ws, &on_dev).await;
+    tokio::time::sleep(SETTLE).await;
+    assert!(!live(&on_dev));
+    assert!(live(&on_other), "another device's approval is its own");
+    assert!(
+        hub.session_snapshot(ordinary).is_some(),
+        "a session held as a member stands"
+    );
+
+    // The log has the act that did it, by whoever did it.
+    let row = wait_for_row(&app, &seeded, |r| {
+        r["action"] == "approve"
+            && r["approved"] == json!(false)
+            && r["agent_id"] == json!(dev.agent_id)
+            && r["denied"].is_null()
+    })
+    .await;
+    assert_eq!(row["user_id"], json!(seeded.admin.id), "{row}");
+    for dev in [&dev, &other] {
+        let _ = dev.stop.send(true);
+    }
+}
+
+/// One device on pod 1 and one outsider on pod 2, with a session that lives with the
+/// device. The admin's request lands on pod 2, so only the ctrl event can reach it.
+async fn session_on_the_other_pod(
+    app1: &TestApp,
+    app2: &TestApp,
+    seeded: &SeededTenant,
+    machine: &str,
+    tag: &str,
+) -> (Device, Ws, String) {
+    wait_for_bus(app1, app2).await;
+    let dev = device_with(app1, seeded, machine, &pw("device"), unattended()).await;
+    let (_, ws, session) = in_session(app2, &dev, tag).await;
+    assert!(
+        app1.state
+            .fleet()
+            .rc_hub
+            .session_snapshot(oid(&session))
+            .is_some()
+            && app2
+                .state
+                .fleet()
+                .rc_hub
+                .session_snapshot(oid(&session))
+                .is_none(),
+        "the session lives with the device, on pod 1"
+    );
+    (dev, ws, session)
+}
+
+#[tokio::test]
+async fn a_cleared_approval_on_the_other_pod_ends_the_session() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_bus.is_none() {
+        eprintln!("SKIPPED a_cleared_approval_on_the_other_pod_ends_the_session: no Redis");
+        return;
+    }
+    let seeded = app1.seed_tenant("extauth-xpod-clear").await;
+    let (dev, mut ws, session) = session_on_the_other_pod(
+        &app1,
+        &app2,
+        &seeded,
+        "mach-extauth-xpod-clear",
+        "extxpodclr",
+    )
+    .await;
+    let policy = url(
+        &seeded,
+        &format!("/agent/{}/external-access-policy", dev.agent_id),
+    );
+    assert_eq!(
+        put(
+            &app2,
+            &policy,
+            &seeded.admin.access_token,
+            json!({ "approved": false })
+        )
+        .await,
+        200
+    );
+    put_out(&mut ws, &session).await;
+    assert!(
+        app1.state
+            .fleet()
+            .rc_hub
+            .session_snapshot(oid(&session))
+            .is_none()
+    );
+    let _ = dev.stop.send(true);
+}
+
+#[tokio::test]
+async fn the_org_switch_going_off_on_the_other_pod_ends_the_session() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_bus.is_none() {
+        eprintln!("SKIPPED the_org_switch_going_off_on_the_other_pod_ends_the_session: no Redis");
+        return;
+    }
+    let seeded = app1.seed_tenant("extauth-xpod-off").await;
+    let (dev, mut ws, session) =
+        session_on_the_other_pod(&app1, &app2, &seeded, "mach-extauth-xpod-off", "extxpodoff")
+            .await;
+    assert_eq!(
+        put(
+            &app2,
+            &url(&seeded, "/external-access"),
+            &seeded.admin.access_token,
+            json!({ "enabled": false })
+        )
+        .await,
+        200
+    );
+    put_out(&mut ws, &session).await;
+    assert!(
+        app1.state
+            .fleet()
+            .rc_hub
+            .session_snapshot(oid(&session))
+            .is_none()
+    );
+    let _ = dev.stop.send(true);
+}
+
+/// What the Hub opening a session sets off, on the row the gates read: from before
+/// any write the crossing tests make, as in the real call.
+async fn session_opened_on(
+    app: &TestApp,
+    agent: &roomler_ai_remote_control::models::Agent,
+    principal: &str,
+) {
+    let remote = app.state.modules.remote.clone().unwrap();
+    roomler_ai_mod_remote::extauth::session_opened(
+        &remote,
+        agent,
+        agent.id.unwrap(),
+        oid(principal),
+        "crossing",
+    )
+    .await;
+}
+
+/// The crossing, for gate 2. The gates read it open, an admin clears it and finds no
+/// session yet, and the Hub opens one. Played here by writing the approval through
+/// the DAO, which ends nothing, under a live session: what `session_opened` then
+/// reads is all that stands between that session and the gate. With the gates open
+/// it ends nothing, so the ending below is the gate's doing.
+#[tokio::test]
+async fn a_cleared_approval_that_crossed_an_opening_session_ends_it() {
+    use roomler_ai_remote_control::models::ExternalAccessPolicy;
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-cross-2").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-cross-2",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws, session) = in_session(&app, &dev, "extcrosstwo").await;
+    noted(&app, &seeded, &dev, &principal, None).await;
+    let fleet = app.state.fleet();
+    let (tenant, device) = (oid(&seeded.tenant_id), oid(&dev.agent_id));
+    let agent = fleet
+        .agents
+        .base
+        .find_by_id_in_tenant(tenant, device)
+        .await
+        .unwrap();
+
+    session_opened_on(&app, &agent, &principal).await;
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        fleet.rc_hub.session_snapshot(oid(&session)).is_some(),
+        "both gates open: this ends nothing"
+    );
+
+    fleet
+        .agents
+        .update_external_access_policy(tenant, device, &ExternalAccessPolicy::default())
+        .await
+        .unwrap();
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        fleet.rc_hub.session_snapshot(oid(&session)).is_some(),
+        "the DAO ends nothing: this is the state the race leaves"
+    );
+    session_opened_on(&app, &agent, &principal).await;
+    put_out(&mut ws, &session).await;
+    let _ = dev.stop.send(true);
+}
+
+/// The crossing, for gate 1, on the terms of the test above.
+#[tokio::test]
+async fn an_org_switch_that_crossed_an_opening_session_ends_it() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-cross-1").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-cross-1",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws, session) = in_session(&app, &dev, "extcrossone").await;
+    noted(&app, &seeded, &dev, &principal, None).await;
+    let fleet = app.state.fleet();
+    let (tenant, device) = (oid(&seeded.tenant_id), oid(&dev.agent_id));
+    let agent = fleet
+        .agents
+        .base
+        .find_by_id_in_tenant(tenant, device)
+        .await
+        .unwrap();
+
+    session_opened_on(&app, &agent, &principal).await;
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        fleet.rc_hub.session_snapshot(oid(&session)).is_some(),
+        "both gates open: this ends nothing"
+    );
+
+    fleet
+        .tenants
+        .base
+        .update_by_id(
+            tenant,
+            bson::doc! { "$set": { "settings.external_rc_enabled": false } },
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        fleet.rc_hub.session_snapshot(oid(&session)).is_some(),
+        "the DAO ends nothing: this is the state the race leaves"
+    );
+    session_opened_on(&app, &agent, &principal).await;
+    put_out(&mut ws, &session).await;
+    let _ = dev.stop.send(true);
+}
+
+/// A second "off" changes nothing that was stored, and it still ends the session:
+/// the first may have raced it. The switch here is the state such a race leaves,
+/// with the row off and the session live.
+#[tokio::test]
+async fn a_repeated_org_switch_off_still_ends_the_session() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-repeat-1").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-repeat-1",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (_, mut ws, session) = in_session(&app, &dev, "extrepeatone").await;
+    app.state
+        .fleet()
+        .tenants
+        .base
+        .update_by_id(
+            oid(&seeded.tenant_id),
+            bson::doc! { "$set": { "settings.external_rc_enabled": false } },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        put(
+            &app,
+            &url(&seeded, "/external-access"),
+            &seeded.admin.access_token,
+            json!({ "enabled": false })
+        )
+        .await,
+        200
+    );
+    put_out(&mut ws, &session).await;
+    let _ = dev.stop.send(true);
+}
+
+/// The same, for a second clear of a device's approval.
+#[tokio::test]
+async fn a_repeated_clear_still_ends_the_session() {
+    use roomler_ai_remote_control::models::ExternalAccessPolicy;
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-repeat-2").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-repeat-2",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (_, mut ws, session) = in_session(&app, &dev, "extrepeattwo").await;
+    app.state
+        .fleet()
+        .agents
+        .update_external_access_policy(
+            oid(&seeded.tenant_id),
+            oid(&dev.agent_id),
+            &ExternalAccessPolicy::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        put(
+            &app,
+            &url(
+                &seeded,
+                &format!("/agent/{}/external-access-policy", dev.agent_id)
+            ),
+            &seeded.admin.access_token,
+            json!({ "approved": false })
+        )
+        .await,
+        200
+    );
+    put_out(&mut ws, &session).await;
+    let _ = dev.stop.send(true);
+}
+
+/// The scope of a ctrl event is its name, so an envelope short a key ends nothing,
+/// and cannot be read as a wider one. One naming another org ends nothing either.
+#[tokio::test]
+async fn a_ctrl_envelope_short_a_key_ends_nothing() {
+    use roomler_ai_mod_fleet::ctrl::apply_rc_ctrl;
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-gate-ctrl").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-gate-ctrl",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+    let (principal, mut ws, session) = in_session(&app, &dev, "extgatectrl").await;
+    let hub = &app.state.fleet().rc_hub;
+    let (tenant, device) = (seeded.tenant_id.as_str(), dev.agent_id.as_str());
+    let foreign = bson::oid::ObjectId::new().to_hex();
+
+    for envelope in [
+        json!({ "evt": "terminate_external", "agent_id": device, "tenant_id": tenant }),
+        json!({ "evt": "terminate_external_device", "tenant_id": tenant }),
+        json!({ "evt": "terminate_external_device", "agent_id": device }),
+        json!({ "evt": "terminate_external_device", "agent_id": device, "tenant_id": foreign }),
+        json!({ "evt": "terminate_external_org" }),
+        json!({ "evt": "terminate_external_org", "tenant_id": foreign }),
+    ] {
+        apply_rc_ctrl(hub, &envelope);
+        assert!(hub.session_snapshot(oid(&session)).is_some(), "{envelope}");
+    }
+
+    apply_rc_ctrl(
+        hub,
+        &json!({ "evt": "terminate_external_org", "tenant_id": tenant }),
+    );
+    put_out(&mut ws, &session).await;
+
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    apply_rc_ctrl(
+        hub,
+        &json!({ "evt": "terminate_external_device", "agent_id": device, "tenant_id": tenant }),
+    );
+    put_out(&mut ws, &session).await;
     let _ = dev.stop.send(true);
 }

@@ -16,7 +16,7 @@
 //! |---|---|---|---|
 //! | [`ControlLink`] | the parts → the daemon | the frames the viewer's peer and the stream speak themselves, and no other ([`speaks`], decision 69) | the control connection's queue |
 //! | [`DeviceSeams`] | the parts → the daemon | what they ask of what the daemon holds or decides: run state, a driver's prompt and answer, a teleport's place, a pack made as the session's account, the DERP mux | the supervisor's own methods |
-//! | [`Measure`] | the daemon → the parts | a knowhow probe's measure, a method and never a frame (decision 69) | [`InDaemon`]: the probe, in this process |
+//! | [`Measure`] | the daemon → the parts | a knowhow probe's measure, a method and never a frame (decision 69) | [`InDaemon`]: the probe, in this process; P8-2d-1 — where the owner turned workers on, [the device's worker](super::worker::device) |
 //! | [`Device`]'s methods | the daemon → the parts | the frames the daemon takes for them, once its own gates passed | the same code as before, moved off the supervisor |
 //!
 //! The split is every earlier P8-2 step's: the parts take what parses input
@@ -218,16 +218,21 @@ pub(crate) trait DeviceSeams: Send + Sync {
 /// keeps the prober itself: the probe asked, the connection that hears its
 /// answer, the answers it gave, and the list it read under the config's lock.
 /// The parts resolve, connect and shake hands within that list, and return
-/// what they saw. P8-2d-1 measures in the device's worker.
+/// what they saw. P8-2d-1 measures in the device's worker ([`measure`]).
 #[async_trait::async_trait]
 pub(crate) trait Measure: Send + Sync {
     /// `asked`, within `rules`: what the probe saw.
     async fn measure(&self, asked: Asked, rules: Vec<DestinationRule>) -> Probed;
+
+    /// A test's: whether this measures in this process.
+    #[cfg(test)]
+    fn in_daemon(&self) -> bool {
+        false
+    }
 }
 
-/// The device's parts, measuring in the daemon's own process: every probe,
-/// until P8-2d-1 measures in the device's worker where the owner turned
-/// workers on.
+/// The device's parts, measuring in the daemon's own process: every probe
+/// where no worker takes them.
 pub(crate) struct InDaemon;
 
 #[async_trait::async_trait]
@@ -235,6 +240,26 @@ impl Measure for InDaemon {
     async fn measure(&self, asked: Asked, rules: Vec<DestinationRule>) -> Probed {
         super::knowhow_probe::probe(&asked, &rules).await
     }
+
+    #[cfg(test)]
+    fn in_daemon(&self) -> bool {
+        true
+    }
+}
+
+/// FR-90 P8-2d-1 — what this daemon's prober measures in: the device's worker
+/// where the owner turned workers on, in a build that can have one
+/// ([`super::worker::device`]); else this process. Asked after `hive::init`,
+/// and for the daemon's life: what `hive_worker` said at the start.
+#[cfg(worker_calls)]
+pub(crate) fn measure() -> Arc<dyn Measure> {
+    super::worker::device::measure()
+}
+
+/// [`measure`], in a build whose worker takes no calls: this process.
+#[cfg(not(worker_calls))]
+pub(crate) fn measure() -> Arc<dyn Measure> {
+    Arc::new(InDaemon)
 }
 
 /// FR-90 P8-2d-0 — what the device's parts hold: one for the daemon, the
@@ -331,13 +356,12 @@ impl std::ops::Deref for Device {
     }
 }
 
-/// FR-90 P8-2d-0 — what the daemon asks the device's worker, which P8-2d-1
-/// starts. A type of its own, not a session worker's
-/// [`Call`](super::worker::Call): a link carries one role's calls
+/// FR-90 P8-2d-0 — what the daemon asks the device's worker
+/// ([`super::worker::device`], P8-2d-1). A type of its own, not a session
+/// worker's [`Call`](super::worker::Call): a link carries one role's calls
 /// ([`super::worker::link::DeviceLink`]), so neither is handed to the
 /// other's worker.
 #[cfg(worker_calls)]
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "d", rename_all = "snake_case")]
 pub(crate) enum DeviceCall {
@@ -351,7 +375,6 @@ pub(crate) enum DeviceCall {
 
 /// The answer to a [`DeviceCall`].
 #[cfg(worker_calls)]
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "e", rename_all = "snake_case")]
 pub(crate) enum DeviceAnswer {

@@ -80,6 +80,7 @@ import {
   isDeadAir,
   agentIsWaiting,
   advanceEndsWait,
+  mediaStopAfterTick,
   waitKeptAcrossReconnect,
   isKeptSleepNotice,
   mediaWaitingCopy,
@@ -156,6 +157,9 @@ import {
   storedDecodePref,
   storedColorSpaceOverride,
   COLORSPACE_STORAGE_KEY,
+  storedDecodeRecover,
+  DECODE_RECOVER_STORAGE_KEY,
+  mediaAdvanced,
   storedCtxMode,
   storedPerFrameMsg,
   storedFlowParams,
@@ -171,6 +175,7 @@ import {
   storedSharpness,
   HEVC_REXT_CODEC_STRING,
   translateModifierForHost,
+  translateModsForHost,
   type AutoTransportInputs,
   type KeyDecision,
   type RcCodecChoice,
@@ -5871,6 +5876,70 @@ describe('S3 resilience: sessionGateAllows', () => {
   })
 })
 
+describe('FR-135 R1 — the kill switch and what the watchdog counts', () => {
+  afterEach(() => {
+    localStorage.removeItem(DECODE_RECOVER_STORAGE_KEY)
+  })
+
+  it('is the key the spec names, on unless it says 0', () => {
+    expect(DECODE_RECOVER_STORAGE_KEY).toBe('roomler-rc-decode-recover')
+    expect(storedDecodeRecover()).toBe(true)
+    for (const raw of ['1', 'on', 'off', '']) {
+      localStorage.setItem(DECODE_RECOVER_STORAGE_KEY, raw)
+      expect(storedDecodeRecover(), raw).toBe(true)
+    }
+    for (const raw of ['0', ' 0 ']) {
+      localStorage.setItem(DECODE_RECOVER_STORAGE_KEY, raw)
+      expect(storedDecodeRecover(), raw).toBe(false)
+    }
+  })
+
+  it('stays on when storage cannot be read', () => {
+    const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new Error('denied')
+    })
+    expect(storedDecodeRecover()).toBe(true)
+    spy.mockRestore()
+  })
+
+  it('names a recovery as the decode stage on the wire', () => {
+    expect(decodeErrorStage('decode-recovering')).toBe('decode')
+    expect(decodeErrorWireMessage('vp9-444', 'decode-recovering', 'Decoding error.', 'vp09.01.10.08')).toEqual({
+      t: 'rc:decode-error',
+      stage: 'decode',
+      path: 'vp9-444',
+      codec: 'vp09.01.10.08',
+      error: 'Decoding error.',
+    })
+  })
+
+  const at = (rtpBytes: number, vp9Frames = 0, hevcFrames = 0) => ({ rtpBytes, vp9Frames, hevcFrames })
+
+  it('counts frames on a data-channel session, and RTP bytes no longer hold off the re-create', () => {
+    expect(mediaAdvanced(at(0, 10), at(0, 11), true)).toBe(true)
+    expect(mediaAdvanced(at(0, 0, 10), at(0, 0, 11), true)).toBe(true)
+    expect(mediaAdvanced(at(100, 10), at(200, 10), true)).toBe(false)
+    expect(mediaAdvanced(at(100, 0, 10), at(200, 0, 10), true)).toBe(false)
+  })
+
+  it('still counts RTP bytes before a first data-channel frame: an agent that ignores the channel sends RTP', () => {
+    expect(mediaAdvanced(at(100), at(200), true)).toBe(true)
+    expect(mediaAdvanced(at(100), at(100), true)).toBe(false)
+  })
+
+  it('judges a <video> fallback on RTP again once the path is down', () => {
+    // stopVp9_444Path zeroes the counter.
+    expect(mediaAdvanced(at(100, 10), at(200, 0), true)).toBe(true)
+    expect(mediaAdvanced(at(100, 10), at(100, 0), true)).toBe(false)
+  })
+
+  it('is the old rule under the kill switch', () => {
+    expect(mediaAdvanced(at(100, 10), at(200, 10), false)).toBe(true)
+    expect(mediaAdvanced(at(100, 10), at(100, 11), false)).toBe(true)
+    expect(mediaAdvanced(at(100, 10), at(100, 10), false)).toBe(false)
+  })
+})
+
 describe('S3 resilience: nextStallAction', () => {
   it('does nothing below the probe threshold', () => {
     for (let t = 0; t < RC_STALL_PROBE_TICKS; t++) {
@@ -5955,6 +6024,22 @@ describe('FR-93: an agent that says it cannot capture is believed', () => {
     expect(advanceEndsWait(true, since + RC_MEDIA_WAITING_SETTLE_MS - 1, since)).toBe(false)
     expect(advanceEndsWait(true, since + RC_MEDIA_WAITING_SETTLE_MS, since)).toBe(true)
     expect(advanceEndsWait(false, since + 5_000, since)).toBe(false)
+  })
+
+  // FR-135 R2 — the same race on the device's own stop: a frame it sent before
+  // stopping must not take down the sentence that says why the picture froze.
+  it('a frame the device sent before it stopped does not erase why it stopped', () => {
+    const stop = { title: 'This device\'s video encoder stopped.' }
+    const since = 10_000
+    // The tick that counted the last frames began before the stop arrived.
+    expect(mediaStopAfterTick(stop, true, 9_500, since)).toBe(stop)
+    // The worker's 1 s stats can carry them into the next interval as well.
+    expect(mediaStopAfterTick(stop, true, since + RC_MEDIA_WAITING_SETTLE_MS - 1, since)).toBe(stop)
+    // Past that, a frame is a picture that came after the stop.
+    expect(mediaStopAfterTick(stop, true, since + RC_MEDIA_WAITING_SETTLE_MS, since)).toBeNull()
+    // Nothing moved: it stands however long it has been.
+    expect(mediaStopAfterTick(stop, false, since + 60_000, since)).toBe(stop)
+    expect(mediaStopAfterTick(null, true, since + 60_000, since)).toBeNull()
   })
 
   // FR-93 P5b — the overlay says what the host waits for. GNOME's lock screen
@@ -6408,6 +6493,19 @@ describe('P7 — FSR localStorage knobs', () => {
 })
 
 // ─── FR-13 (#789): mac-host Ctrl→Cmd translation ─────────────────────────
+
+describe('translateModsForHost (#3046: a sticky Ctrl has no key of its own to rewrite)', () => {
+  it('turns the Ctrl bit into the Meta bit on a Mac host, keeping the others', () => {
+    expect(translateModsForHost(0x01, true)).toBe(0x08)
+    expect(translateModsForHost(0x01 | 0x04, true)).toBe(0x08 | 0x04)
+    expect(translateModsForHost(0x08, true)).toBe(0x08)
+    expect(translateModsForHost(0, true)).toBe(0)
+  })
+  it('changes nothing with the substitution off: another host, or a literal Ctrl', () => {
+    expect(translateModsForHost(0x01, false)).toBe(0x01)
+    expect(translateModsForHost(0x01 | 0x02, false)).toBe(0x01 | 0x02)
+  })
+})
 
 describe('translateModifierForHost (FR-13 mac Ctrl→Cmd)', () => {
   it('rewrites left/right Control to LeftGui when enabled', () => {

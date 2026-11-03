@@ -313,6 +313,14 @@ const KEYS: &[KeyMeta] = &[
         description: "macOS only. Let the root daemon spawn and babysit the GUI-session worker (FR-43 P1). Stands down whenever the LaunchAgent is loaded, so one enrollment is never served twice. Default: OFF.",
     },
     KeyMeta {
+        key: "macos_one_row",
+        group: Group::Device,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "macOS only. One device row: the root daemon's GUI worker runs with no enrollment of its own, and a person's enrollment on this Mac is ignored (FR-43 P3). Needs macos_supervise_gui_worker. Default: OFF.",
+    },
+    KeyMeta {
         key: "power_policy",
         group: Group::Device,
         tier: Tier::Essential,
@@ -543,7 +551,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "bool",
-        description: "FR-90 - run a worker beside each agent session on this device (roomlerd hive-worker, the daemon's own supervised child), so a fault in what it serves costs that session's worker and never the daemon. Unix only for now. Never settable by the server. Default: OFF.",
+        description: "FR-90 - run a worker beside each agent session on this device, and one for the device itself (roomlerd hive-worker, the daemon's own supervised child), so a fault in what one serves costs that worker and never the daemon. Builds with the vault run the device's. Read as the daemon starts. Never settable by the server. Default: OFF.",
     },
     // FR-90 P4-3b-1 — what a knowhow scan reads (decision 38): the device's,
     // like every Hive key, and absent from `DesiredConfig`, since a server
@@ -814,6 +822,14 @@ const KEYS: &[KeyMeta] = &[
         description: "LEGACY ReplacedByNewer escalation: exit the process after 3 displacements in the window instead of backing off in-process. Built-in default: off (W4d — zombie-WS storms must not tear down the overlay).",
     },
     KeyMeta {
+        key: "ws_flat_redial",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-28: while the front load balancer answers 502 (a pod roll: its pin has no process behind it), redial the control WS and the central /derp WS every 0.5-1 s instead of climbing the backoff ladder, so a socket is back within a second of the replacement pod listening. Default OFF. Only a 502 at the upgrade is flat: every other failure, and a server that accepts and drops, keeps the ladder. Bounded at 30 flat redials per outage per socket, refilled by a connection that lived 30 s or a network change; a 502 that outlasts them climbs the ladder from where it stood. Regional relays keep their ladder. Env: ROOMLERD_WS_FLAT_REDIAL. Restart required.",
+    },
+    KeyMeta {
         key: "overlay_warm_relay",
         group: Group::NetworkCarriers,
         tier: Tier::Advanced,
@@ -903,6 +919,16 @@ const KEYS: &[KeyMeta] = &[
         kind: "number",
         description: "netstate - debounce window in ms coalescing OS signal bursts (a VPN connect \
          injects dozens of routes) into one delta (100-5000). Built-in default: 750.",
+    },
+    KeyMeta {
+        key: "overlay_netchange_poke_quiet_secs",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "Seconds a network signal that changed nothing waits behind the last forced \
+         rekey of the direct peers (0-3600). A real network move never waits. 0 lets every such \
+         signal rekey, as it did before. Built-in default: 60.",
     },
     KeyMeta {
         key: "netstack_socks_port",
@@ -1737,6 +1763,14 @@ const KEYS: &[KeyMeta] = &[
         description: "#3267 - when the encoder probe's child dies inside one encoder cell, run it again and cost that cell rather than every hardware encoder on the host. Off: one child, and its death means no hardware. Built-in default: on. Env: ROOMLERD_CAPS_LEARN_DENY. Restart required.",
     },
     KeyMeta {
+        key: "caps_probe_retry",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "#3280 - when the encoder probe's first answer ran short of time, try again by itself, with more time and no restart, giving way to any session. Off: that answer stands until the next start. Built-in default: on. Env: ROOMLERD_CAPS_PROBE_RETRY. Restart required.",
+    },
+    KeyMeta {
         key: "encoder_cells_deny",
         group: Group::VideoEncoding,
         tier: Tier::Advanced,
@@ -2022,6 +2056,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "files_dir" => cfg.files_dir.clone(),
         "exec_enabled" => Some(fmt_bool(cfg.exec_enabled)),
         "macos_supervise_gui_worker" => Some(fmt_bool(cfg.macos_supervise_gui_worker)),
+        "macos_one_row" => Some(fmt_bool(cfg.macos_one_row)),
         "power_policy" => Some(if cfg.power_policy.is_empty() {
             "never".to_string()
         } else {
@@ -2090,6 +2125,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_init_auth_first" => cfg.overlay_init_auth_first.map(fmt_bool),
         "overlay_srflx_seek" => cfg.overlay_srflx_seek.map(fmt_bool),
         "ws_replaced_exit" => cfg.ws_replaced_exit.map(fmt_bool),
+        "ws_flat_redial" => cfg.ws_flat_redial.map(fmt_bool),
         "overlay_warm_relay" => cfg.overlay_warm_relay.map(fmt_bool),
         "overlay_quic_async" => cfg.overlay_quic_async.map(fmt_bool),
         "overlay_vpn_vantage" => cfg.overlay_vpn_vantage.map(fmt_bool),
@@ -2101,6 +2137,9 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_route_tick_secs" => cfg.overlay_route_tick_secs.map(|v| v.to_string()),
         "overlay_netmon" => cfg.overlay_netmon.map(fmt_bool),
         "overlay_netmon_debounce_ms" => cfg.overlay_netmon_debounce_ms.map(|v| v.to_string()),
+        "overlay_netchange_poke_quiet_secs" => {
+            cfg.overlay_netchange_poke_quiet_secs.map(|v| v.to_string())
+        }
         "netstack_socks_port" => cfg.netstack_socks_port.map(|v| v.to_string()),
         "localapi_pipe_pool" => cfg.localapi_pipe_pool.map(|v| v.to_string()),
         "rc_max_sessions" => cfg.rc_max_sessions.map(|v| v.to_string()),
@@ -2211,6 +2250,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "text_mod_neutralize" => cfg.text_mod_neutralize.map(fmt_bool),
         "caps_cache" => cfg.caps_cache.map(fmt_bool),
         "caps_learn_deny" => cfg.caps_learn_deny.map(fmt_bool),
+        "caps_probe_retry" => cfg.caps_probe_retry.map(fmt_bool),
         "fps_high" => cfg.fps_high.map(fmt_bool),
         "encoder_cells_deny" => cfg.encoder_cells_deny.clone(),
         "fps_deny" => cfg.fps_deny.clone(),
@@ -2297,6 +2337,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "macos_supervise_gui_worker" => {
             cfg.macos_supervise_gui_worker = parse_bool_or(value, false)?
         }
+        "macos_one_row" => cfg.macos_one_row = parse_bool_or(value, false)?,
         // FR-55 — validated HERE rather than at read time, so a typo is
         // refused when it is made instead of silently becoming `never` weeks
         // later on a device nobody is looking at.
@@ -2572,6 +2613,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_init_auth_first" => cfg.overlay_init_auth_first = parse_tribool(value)?,
         "overlay_srflx_seek" => cfg.overlay_srflx_seek = parse_tribool(value)?,
         "ws_replaced_exit" => cfg.ws_replaced_exit = parse_tribool(value)?,
+        "ws_flat_redial" => cfg.ws_flat_redial = parse_tribool(value)?,
         "overlay_warm_relay" => cfg.overlay_warm_relay = parse_tribool(value)?,
         "overlay_quic_async" => cfg.overlay_quic_async = parse_tribool(value)?,
         "overlay_vpn_vantage" => cfg.overlay_vpn_vantage = parse_tribool(value)?,
@@ -2641,6 +2683,25 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                         );
                     }
                     Some(ms)
+                }
+            }
+        }
+        "overlay_netchange_poke_quiet_secs" => {
+            cfg.overlay_netchange_poke_quiet_secs = match value
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None => None,
+                Some(v) => {
+                    let s: u32 = v.parse().map_err(|_| {
+                        format!("overlay_netchange_poke_quiet_secs must be a number (got {v:?})")
+                    })?;
+                    if s > 3600 {
+                        return Err(
+                            "overlay_netchange_poke_quiet_secs must be between 0 and 3600".into(),
+                        );
+                    }
+                    Some(s)
                 }
             }
         }
@@ -2845,6 +2906,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "text_mod_neutralize" => cfg.text_mod_neutralize = parse_tribool(value)?,
         "caps_cache" => cfg.caps_cache = parse_tribool(value)?,
         "caps_learn_deny" => cfg.caps_learn_deny = parse_tribool(value)?,
+        "caps_probe_retry" => cfg.caps_probe_retry = parse_tribool(value)?,
         "fps_high" => cfg.fps_high = parse_tribool(value)?,
         "zero_copy" => cfg.zero_copy = parse_tribool(value)?,
         "color_description" => cfg.color_description = parse_tribool(value)?,
@@ -4158,6 +4220,30 @@ mod tests {
         );
     }
 
+    /// FR-28 — the flat redial is opt-in, reaches the daemon through the env
+    /// bridge under the spelling `FlatRedial` reads, and clears back to the
+    /// built-in default.
+    #[test]
+    fn ws_flat_redial_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(cfg.ws_flat_redial, None, "built-in default is OFF");
+        assert!(
+            !crate::config::env_fallbacks(&cfg).contains_key("WS_FLAT_REDIAL"),
+            "an unset key must not reach the daemon's env at all"
+        );
+        apply(&mut cfg, "ws_flat_redial", Some("on")).unwrap();
+        assert_eq!(cfg.ws_flat_redial, Some(true));
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("WS_FLAT_REDIAL")
+                .map(String::as_str),
+            Some("1"),
+            "what the bridge writes for true, which FlatRedial's gate reads as on"
+        );
+        apply(&mut cfg, "ws_flat_redial", None).unwrap();
+        assert_eq!(cfg.ws_flat_redial, None, "clear → built-in default");
+    }
+
     /// W4(d) — the legacy ReplacedByNewer process-exit escalation is
     /// opt-in via `ws_replaced_exit`; the built-in default (cleared) is
     /// the in-process backoff ladder.
@@ -4467,6 +4553,30 @@ mod tests {
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("1")).is_err());
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("301")).is_err());
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("fast")).is_err());
+    }
+
+    /// FR-65 P3 — `0` is the kill switch, so it has to survive the round trip
+    /// and reach the env bridge as a value, not as an unset key.
+    #[test]
+    fn overlay_netchange_poke_quiet_secs_set_echo_clear_and_validate() {
+        let key = "overlay_netchange_poke_quiet_secs";
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, key, Some("0")).unwrap();
+        assert_eq!(cfg.overlay_netchange_poke_quiet_secs, Some(0));
+        assert_eq!(entry_for(&cfg, key).unwrap().value.as_deref(), Some("0"));
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("OVERLAY_NETCHANGE_POKE_QUIET_SECS")
+                .map(String::as_str),
+            Some("0")
+        );
+        apply(&mut cfg, key, None).unwrap();
+        assert_eq!(cfg.overlay_netchange_poke_quiet_secs, None);
+        assert!(
+            !crate::config::env_fallbacks(&cfg).contains_key("OVERLAY_NETCHANGE_POKE_QUIET_SECS")
+        );
+        assert!(apply(&mut cfg, key, Some("3601")).is_err());
+        assert!(apply(&mut cfg, key, Some("soon")).is_err());
     }
 
     #[test]
@@ -5371,6 +5481,23 @@ mod tests {
         );
         apply(&mut cfg, "caps_learn_deny", None).unwrap();
         assert_eq!(cfg.caps_learn_deny, None);
+    }
+
+    /// #3280 — and so does the retry's.
+    #[test]
+    fn caps_probe_retry_is_a_tribool_that_bridges() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(entry_for(&cfg, "caps_probe_retry").unwrap().kind, "tribool");
+        apply(&mut cfg, "caps_probe_retry", Some("0")).unwrap();
+        assert_eq!(cfg.caps_probe_retry, Some(false));
+        assert!(
+            crate::config::env_bridge_bools(&cfg)
+                .iter()
+                .any(|(s, v)| *s == "CAPS_PROBE_RETRY" && *v == Some(false)),
+            "the kill switch must reach the daemon through the S2 bridge"
+        );
+        apply(&mut cfg, "caps_probe_retry", None).unwrap();
+        assert_eq!(cfg.caps_probe_retry, None);
     }
 
     /// FR-119 — `fps_high` is a tribool that reaches the daemon as

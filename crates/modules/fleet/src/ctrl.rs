@@ -7,6 +7,7 @@
 //! the publisher needs only the core (Redis), the applier only the Hub.
 
 use bson::oid::ObjectId;
+use roomler_ai_remote_control::models::DesiredConfig;
 use roomler_core::Core;
 use tracing::{debug, info};
 
@@ -140,6 +141,37 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
                 info!(agent = %aid, principal = %uid, ended, "rc ctrl: revocation applied from another pod");
             }
         }
+        // FR-52 decision 16 — an admin cleared a device's approval, or turned the
+        // org's switch off, on another pod. Each scope has a name of its own, and
+        // none is `terminate_external` with a key left out: a key lost on the way
+        // must end nothing, never more.
+        Some("terminate_external_device") => {
+            let oid = |key: &str| {
+                ctrl.get(key)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok())
+            };
+            let (Some(aid), Some(tid)) = (oid("agent_id"), oid("tenant_id")) else {
+                return;
+            };
+            let ended = hub.terminate_external_on(aid, tid);
+            if ended > 0 {
+                info!(agent = %aid, ended, "rc ctrl: a cleared approval applied from another pod");
+            }
+        }
+        Some("terminate_external_org") => {
+            let Some(tid) = ctrl
+                .get("tenant_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| ObjectId::parse_str(s).ok())
+            else {
+                return;
+            };
+            let ended = hub.terminate_external_in(tid);
+            if ended > 0 {
+                info!(tenant = %tid, ended, "rc ctrl: an org switched off applied from another pod");
+            }
+        }
         // P2b — cycle an agent's WS so it re-establishes its overlay session
         // on the tenant's NEW block (self_ip binds once, at establish). Rides
         // the ctrl lane rather than a directed RPC because the renumber
@@ -189,6 +221,32 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
             };
             if hub.send_to_agent_in_tenant(aid, tid, msg).is_ok() {
                 info!(agent = %aid, "rc ctrl: cross-org join delivered from another pod");
+            }
+        }
+        // FR-132 P1b — a saved desired config for a device whose socket is on
+        // another pod: the PUT can land on any. `push_desired_config` re-checks
+        // the tenant, the connection's `config` and the revision, so a
+        // mismatched envelope pushes nothing and a late one cannot undo a
+        // newer save. Losing one costs a nudge: the device still converges on
+        // its next connect.
+        Some("config_push") => {
+            let oid = |key: &str| {
+                ctrl.get(key)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok())
+            };
+            let (Some(aid), Some(tid), Some(desired)) = (
+                oid("agent_id"),
+                oid("tenant_id"),
+                ctrl.get("desired")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value::<DesiredConfig>(v).ok()),
+            ) else {
+                return;
+            };
+            let revision = desired.revision;
+            if hub.push_desired_config(aid, tid, desired).is_ok() {
+                info!(agent = %aid, revision, "rc ctrl: desired config pushed from another pod");
             }
         }
         // FR-90 P2g-3b — a Hive purge for devices whose sockets are on

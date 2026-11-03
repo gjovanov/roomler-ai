@@ -133,6 +133,8 @@ export function describeFrameRateReason(word: string): string {
       return 'the connection is relayed, and a relay stays at its current rate'
     case 'refresh':
       return "the host's screen refreshes slower than that"
+    case 'viewer_refresh':
+      return 'this screen refreshes slower than that'
     case 'denied':
       return "this device's owner has turned that rate off for its encoder"
     case 'pipe':

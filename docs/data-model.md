@@ -202,6 +202,13 @@ Two patterns worth knowing when touching this layer:
   *first* (the CAS win is the release token), then return the host number to the
   pool, then fan `netmap_delta{removes}` — that order is load-bearing; see the
   address-lease section of [overlay-communication.md](overlay-communication.md).
+- **Tombstones are read by name.** `agents`, `tunnel_clients`, `tunnel_policies`
+  and `overlay_policies` each offer `find_live_in_tenant` and `find_any_in_tenant`,
+  and no un-suffixed lookup, so every call site answers "may this be a removed
+  row?" A query says `deleted_at: null` (null or absent, the same as the listings);
+  `{$type: "null"}` is the spelling for a partial unique index, and in a query it
+  would 404 a live row whose field is absent. Which readers keep the tombstone, and
+  why: [security-baseline.md](security-baseline.md#a-removed-thing-answers-nothing-1821-1829).
 - **Hand-built updates must name every field** — the DAO layer builds `doc!{}`
   updates explicitly, so adding a model field means adding it to the DAO update or
   it silently never persists.

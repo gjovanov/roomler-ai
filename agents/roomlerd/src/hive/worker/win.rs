@@ -12,7 +12,7 @@
 //! | the channel | `\\.\pipe\roomler-hive-worker-<pid>-<n>`, one instance, local clients only, its DACL protected and naming the daemon's own account alone (SYSTEM, on a device); its client end opened by the daemon, overlapped and inheritable, before any other process could take the one instance |
 //! | what it inherits | that client end and `NUL` for its standard handles, named in `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, and nothing else the daemon holds (tokio's sockets among them, #2836) |
 //! | how it finds the channel | the handle's value in [`CHANNEL_ENV`], beside `ROOMLERD_HIVE_WORKER` |
-//! | its job | `KILL_ON_JOB_CLOSE`, so the daemon's end is the worker's, and a per-process memory limit of [`MAX_MEMORY`]: an allocation past it fails in the worker, and the worker alone ends |
+//! | its job | `KILL_ON_JOB_CLOSE`, so the daemon's end is the worker's, and a per-process memory limit of [`MAX_MEMORY`] (P8-2d-1: the device's worker, at its own bound, decision 72): an allocation past it fails in the worker, and the worker alone ends |
 //! | the start | suspended, assigned to the job, then resumed, so it runs no instruction outside the job; one that cannot join is ended, never resumed |
 //! | its crash | nothing of its memory kept ([`no_crash_dump`], P8-2b-2): set before it takes its channel, `SEM_NOGPFAULTERRORBOX` makes WER write no dump, no event and no upload for the worker, on every fault path and thread. A worker that cannot set it does not run, as one that cannot set its Unix limits does not (P8-2a-3) |
 //! | its end | the job ended with a code of its own, the process waited for, then its exit code read and classified ([`InJob::ended`]): with crash reporting suppressed, nothing else on the box records how a worker ended, so the daemon logs it — a fault named, a peak at the bound read as out-of-memory |
@@ -68,7 +68,7 @@ use super::Running;
 
 /// Where a worker finds its channel: the inherited handle's value.
 pub(crate) const CHANNEL_ENV: &str = "ROOMLERD_HIVE_WORKER_CHANNEL";
-/// The most memory one worker holds: its job's per-process limit.
+/// The most memory one session's worker holds: its job's per-process limit.
 pub(crate) const MAX_MEMORY: usize = 512 << 20;
 /// How long a worker's end is waited for, once its job is ended.
 const END_WAIT: Duration = Duration::from_secs(5);
@@ -210,8 +210,8 @@ pub(crate) fn no_crash_dump() -> std::io::Result<()> {
 }
 
 /// A job of a worker's own: what it starts dies with it, and with the
-/// daemon's handle, and each of its processes holds at most [`MAX_MEMORY`].
-fn job() -> std::io::Result<OwnedHandle> {
+/// daemon's handle, and each of its processes holds at most `max_memory`.
+fn job(max_memory: usize) -> std::io::Result<OwnedHandle> {
     // SAFETY: an unnamed job with default security; owned below.
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if job.is_null() {
@@ -223,7 +223,7 @@ fn job() -> std::io::Result<OwnedHandle> {
     let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     info.BasicLimitInformation.LimitFlags =
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-    info.ProcessMemoryLimit = MAX_MEMORY;
+    info.ProcessMemoryLimit = max_memory;
     // SAFETY: `info` matches the class set, and outlives the call.
     let ok = unsafe {
         SetInformationJobObject(
@@ -310,13 +310,26 @@ fn command_line(exe: &Path, arg0: Option<&std::ffi::OsStr>, args: &[String]) -> 
 
 /// Start `exe` as a worker, its channel's client end `pipe`: as the daemon's
 /// own identity, into a job of its own, suspended until it is in it.
+#[cfg(test)]
 pub(crate) fn spawn(
     exe: &Path,
     arg0: Option<&std::ffi::OsStr>,
     args: &[String],
     pipe: OwnedHandle,
 ) -> std::io::Result<InJob> {
-    let job = job()?;
+    spawn_held_to(exe, arg0, args, pipe, MAX_MEMORY)
+}
+
+/// FR-90 P8-2d-1 — the start of a worker, its job holding it to `max_memory`:
+/// a session's [`MAX_MEMORY`], or the device's worker's own (decision 72).
+pub(crate) fn spawn_held_to(
+    exe: &Path,
+    arg0: Option<&std::ffi::OsStr>,
+    args: &[String],
+    pipe: OwnedHandle,
+    max_memory: usize,
+) -> std::io::Result<InJob> {
+    let job = job(max_memory)?;
     let (stdin, stdout, stderr) = (nul()?, nul()?, nul()?);
     let handles = vec![
         pipe.as_raw_handle() as HANDLE,
@@ -394,6 +407,7 @@ pub(crate) fn spawn(
         process,
         pid: pi.dwProcessId,
         job: Some(job),
+        max_memory,
     })
 }
 
@@ -402,6 +416,8 @@ pub(crate) struct InJob {
     process: OwnedHandle,
     pid: u32,
     job: Option<OwnedHandle>,
+    /// What its job holds it to: what a peak near it is read against.
+    max_memory: usize,
 }
 
 impl InJob {
@@ -436,7 +452,7 @@ impl InJob {
         if unsafe { GetExitCodeProcess(self.process.as_raw_handle() as HANDLE, &mut code) } == 0 {
             warn!(
                 pid = self.pid,
-                "hive: a session's worker ended; its exit code could not be read"
+                "hive: a worker ended; its exit code could not be read"
             );
             return;
         }
@@ -444,54 +460,54 @@ impl InJob {
             // It had not ended; the wait above already warned.
             return;
         }
-        let at_bound = peak.is_some_and(|p| p + (1 << 20) >= MAX_MEMORY);
+        let at_bound = peak.is_some_and(|p| p + (1 << 20) >= self.max_memory);
         let shown = format!("{code:#010x}");
         match code {
             0 | ENDED_BY_DAEMON => {
                 // A clean return, or the daemon's own job-end: not a crash.
-                tracing::debug!(pid = self.pid, code = %shown, "hive: a session's worker ended");
+                tracing::debug!(pid = self.pid, code = %shown, "hive: a worker ended");
             }
             2 | 3 => warn!(
                 pid = self.pid,
                 code = %shown,
-                "hive: a session's worker refused to run (0x2 = no channel; 0x3 = could not keep its memory out of a crash dump)"
+                "hive: a worker refused to run (0x2 = no channel; 0x3 = could not keep its memory out of a crash dump)"
             ),
             STATUS_ACCESS_VIOLATION => warn!(
                 pid = self.pid,
                 code = %shown,
-                "hive: a session's worker crashed: an access violation"
+                "hive: a worker crashed: an access violation"
             ),
             STATUS_STACK_OVERFLOW => warn!(
                 pid = self.pid,
                 code = %shown,
-                "hive: a session's worker crashed: a stack overflow"
+                "hive: a worker crashed: a stack overflow"
             ),
             STATUS_FATAL_APP_EXIT if at_bound => warn!(
                 pid = self.pid,
-                max_mib = MAX_MEMORY >> 20,
+                max_mib = self.max_memory >> 20,
                 code = %shown,
-                "hive: a session's worker ended: out of memory at its bound, an allocation past it aborted"
+                "hive: a worker ended: out of memory at its bound, an allocation past it aborted"
             ),
             STATUS_FATAL_APP_EXIT => warn!(
                 pid = self.pid,
                 code = %shown,
-                "hive: a session's worker crashed: a fail-fast — a panic past its handler, or an aborted allocation"
+                "hive: a worker crashed: a fail-fast — a panic past its handler, or an aborted allocation"
             ),
             STATUS_NO_MEMORY => warn!(
                 pid = self.pid,
                 code = %shown,
-                "hive: a session's worker crashed: out of memory"
+                "hive: a worker crashed: out of memory"
             ),
             _ if at_bound => warn!(
                 pid = self.pid,
-                max_mib = MAX_MEMORY >> 20,
+                max_mib = self.max_memory >> 20,
                 code = %shown,
-                "hive: a session's worker ended at its memory bound"
+                "hive: a worker ended at its memory bound"
             ),
             _ => warn!(
                 pid = self.pid,
                 code = %shown,
-                "hive: a session's worker ended with an unexpected exit code"
+                "hive: a worker ended with an unexpected exit code"
             ),
         }
     }
@@ -501,6 +517,24 @@ impl InJob {
 impl Running for InJob {
     fn pid(&self) -> Option<u32> {
         Some(self.pid)
+    }
+
+    #[cfg(all(test, worker_calls))]
+    fn job_limit(&self) -> Option<usize> {
+        let job = self.job.as_ref()?;
+        // SAFETY: all-zero is a valid out-buffer for this class.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is exactly the size passed, and outlives the call.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job.as_raw_handle() as HANDLE,
+                JobObjectExtendedLimitInformation,
+                (&raw mut info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(info.ProcessMemoryLimit)
     }
 
     async fn kill(&mut self) {
@@ -522,7 +556,7 @@ impl Running for InJob {
         if !matches!(waited, Ok(WAIT_OBJECT_0)) {
             warn!(
                 pid = self.pid,
-                "hive: a session's worker did not end with its job in time"
+                "hive: a worker did not end with its job in time"
             );
         }
         // Read before the job's last handle drops: the process handle is still
@@ -570,6 +604,7 @@ fn wsa_startup() -> std::io::Result<()> {
 /// fresh every time, so a hand-over and a later `rehand` (a new worker, a new
 /// pid) each duplicate the daemon's own copy again. `socket` is untouched —
 /// cloneable this way as many times as workers come and go.
+#[cfg_attr(not(worker_calls), allow(dead_code))]
 pub(crate) fn duplicate_for(
     pid: u32,
     socket: windows_sys::Win32::Networking::WinSock::SOCKET,
@@ -591,6 +626,7 @@ pub(crate) fn duplicate_for(
 /// A listener, reconstructed from `bytes` ([`duplicate_for`]'s): refused where
 /// this is not the process `pid` named, or where `bytes` is not one whole
 /// protocol info. Calls [`wsa_startup`] first, every time.
+#[cfg_attr(not(worker_calls), allow(dead_code))]
 pub(crate) fn socket_from_info(bytes: &[u8]) -> std::io::Result<std::net::TcpListener> {
     if bytes.len() != PROTOCOL_INFO_LEN {
         return Err(std::io::Error::other(format!(

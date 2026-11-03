@@ -46,6 +46,7 @@ members = [
     "agents/roomlerd",
     "agents/roomler-desktop",
     "agents/roomler-cli-shim",
+    "agents/roomlerdw",
     "agents/roomler-setup",
     "agents/roomler-cli",
 ]
@@ -161,7 +162,7 @@ wintun-bindings = { path = "crates/vendored/wintun-bindings" }
 scrap = { path = "crates/vendored/scrap" }
 
 [workspace.package]
-version = "0.4.196"
+version = "0.4.199"
 edition = "2024"
 authors = ["Goran Jovanov <goran.jovanov@gmail.com>"]
 

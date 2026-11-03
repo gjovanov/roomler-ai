@@ -558,10 +558,10 @@ pub struct AgentCaps {
     ///   to the viewer's stage (macOS; a Linux system install, a Wayland
     ///   desktop). Until P3e-2 the viewer offered the toggle on Windows only,
     ///   by OS; it now follows this word, and an absent key still offers it.
-    /// * `encoder-cells` — #3267: encoder cells this host learned not to open,
-    ///   because its capability probe died in them (`learned-deny`, naming each
-    ///   cell and how the probe ended). For a fleet read: `video_cells` and the
-    ///   other lists already leave them out, and no viewer control follows it.
+    /// * `encoder-cells` — #3267: cells this host learned not to open, because its
+    ///   probe died in them (`learned-deny`, naming each and how), or #3280: a probe
+    ///   short of time with no cell to name (`probe-short`). For a fleet read: the
+    ///   lists already leave them out, and no viewer control follows it.
     ///
     /// Empty from every agent before P0c: those agents claim what their lists
     /// say, so an absent key never means "unavailable".
@@ -1296,6 +1296,13 @@ pub enum RpcCap {
     /// is switched on (`ROOMLERD_RC_OVERLAY_AUTO`, default on). Not a prefix
     /// of another verb, nor another of it.
     RcOverlayAuto,
+    /// FR-135 R2 — this device states each session's plan on the control
+    /// channel (`rc:media-plan`) and takes the viewer's refresh back
+    /// (`rc:viewer-hz`), so a viewer can read silence on it as a fault, and
+    /// knows the second message will be understood. Advertised while it is
+    /// switched on (`ROOMLERD_MEDIA_PLAN`, default on). Not a prefix of another
+    /// verb, nor another of it.
+    MediaPlan,
 }
 
 impl RpcCap {
@@ -1350,11 +1357,12 @@ impl RpcCap {
             Self::KnowhowProbe => "knowhow-probe",
             Self::LocalRelay => "local-relay",
             Self::RcOverlayAuto => "rc-overlay-auto",
+            Self::MediaPlan => "media-plan",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 43] = [
+    pub const ALL: [RpcCap; 44] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1398,6 +1406,7 @@ impl RpcCap {
         Self::KnowhowProbe,
         Self::LocalRelay,
         Self::RcOverlayAuto,
+        Self::MediaPlan,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -2564,8 +2573,8 @@ pub struct Agent {
     /// the valid one?" has to be answerable from the row as well as the audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_code_rotated_at: Option<DateTime>,
-    /// Device config an operator has ASKED for, reconciled by the agent when
-    /// it next connects (`docs/remote-config.md` step 2).
+    /// Device config an operator has ASKED for, reconciled by the agent on
+    /// connect or on a save's nudge (`docs/remote-config.md` step 2).
     ///
     /// Desired state, not applied state: writing here records an intent, and
     /// the device remains free to refuse it — a device without
@@ -2811,7 +2820,7 @@ pub enum SshMode {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SshAccountMode {
-    /// The daemon's own identity — SYSTEM on Windows, root under systemd.
+    /// The daemon's identity: root under systemd; on Windows the worker's or the service's.
     ///
     /// The default *today* because it is what P2 can actually do, and it is
     /// why `SshMode::On` is root-equivalent until the P5 privilege-drop slice
@@ -3146,8 +3155,8 @@ pub enum ConfigOutcome {
     /// down is in `live` / `needs_restart` — see [`ConfigReport`].
     Applied,
     /// The device already matched; nothing was written. Distinct from
-    /// `Applied` with two empty lists so a reader can tell "converged" from
-    /// "applied nothing, and I am not sure why".
+    /// `Applied` with two empty lists, which says a key was written back to the
+    /// value the daemon runs (FR-132 P1c): the file changed and nothing waits.
     Noop,
     /// The device has not opted in: `remote_config_enabled` is off. This is
     /// gate 4 doing its job, not an error — the operator's move is to set the
@@ -8133,6 +8142,7 @@ mod tests {
         assert_eq!(RpcCap::KnowhowProbe.wire(), "knowhow-probe");
         assert_eq!(RpcCap::LocalRelay.wire(), "local-relay");
         assert_eq!(RpcCap::RcOverlayAuto.wire(), "rc-overlay-auto");
+        assert_eq!(RpcCap::MediaPlan.wire(), "media-plan");
     }
 
     /// FR-90 P4-4-1 — `knowhow-tools` and `knowhow-scan` are two verbs: a

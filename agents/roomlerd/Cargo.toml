@@ -610,6 +610,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_ApplicationInstallationAndServicing", # Msi* database reads — the self-updater binds an MSI's own ProductVersion to the release the manifest claimed it is (msi.dll ships in System32, so the installer-smoke import audit passes it)
     "Win32_Security_WinTrust",           # WinVerifyTrust — the self-updater refuses to run an installer it cannot attribute to us
     "Win32_Security_Cryptography",       # CryptQueryObject/CertGetNameStringW — WHO signed it, which WinVerifyTrust alone does not tell you
+    "Win32_Security_Cryptography_Catalog", # with _Sip: WTHelperProvDataFromStateData — the signer WinVerifyTrust itself verified (#3246)
+    "Win32_Security_Cryptography_Sip",
 ] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
