@@ -43,7 +43,7 @@ reading was wrong about which mattered:
 
 | Field | What |
 |---|---|
-| `status` | `InProgress` · `SucceededVerified` · `SucceededUnverified` · `InstallerFailed` · `Timeout` (`InstallStatus`, `post_install.rs:132`) |
+| `status` | `InProgress` · `SucceededVerified` · `SucceededUnverified` · `InstallerFailed` · `Timeout` · `WatcherStopped` (`InstallStatus`, `post_install.rs:132`) |
 | `expected_version` | the release tag the install was for, `agent-v0.4.172` |
 | `started_unix` / `finished_unix` | when the watcher started and when it wrote its verdict; `finished_unix` is null while `InProgress` |
 | `installer_pid`, `installer_path`, `installer_exit_code` | the installer as the watcher saw it. ⚠️ On Linux the pid is the daemon's own or already reaped — forensic, never waited on (§1) |
@@ -93,11 +93,11 @@ sequenceDiagram
 > startup (`DaemonState::status`, `agents/roomlerd/src/localapi_state.rs:961`),
 > and why a fresh `InProgress` is "still at work", not a failure (§4).
 
-## 4. The seven words
+## 4. The eight words
 
 The daemon reports the record as `NodeStatus.last_install`
 (`crates/localapi/src/lib.rs:471`), a `LastInstallStatus` (`:509`) whose
-`status` is one of seven words — the five the watcher writes, spelled exactly
+`status` is one of eight words — the six a record can hold, spelled exactly
 as the file and the watcher's `post-install verdict:` log line spell them so
 one grep finds all three surfaces (locked by
 `install_status_words_match_the_file_spelling`), plus two only the reader can
@@ -108,10 +108,11 @@ say:
 | `Absent` | no record: this daemon's updater has installed nothing yet, or the record sits in another process role's log dir (`path` says where this one looked, §5) | `none recorded — this daemon's updater has not installed anything yet` | INFO |
 | `InProgress`, younger than 25 min | the watcher is still at work (Windows: waiting on msiexec, settling the service) | `in progress — agent-v0.4.172 started 17s ago; the post-install watcher has not reported yet` | INFO |
 | `InProgress`, older | an install that **never reported**: the watcher was killed before it could write a verdict. The bug FR-67 was opened on | `NEVER REPORTED — agent-v0.4.16 started 3d ago and no verdict followed: the watcher was killed before it could write one (<path>)` | **WARN** |
-| `SucceededVerified` | installer exited 0, the new binary's `--version` answered the expected tag | `ok — agent-v0.4.172 installed 2h ago, verified: roomlerd 0.4.172` — and `— but this daemon runs 0.4.175` when the record is for another release than the one running | INFO |
-| `SucceededUnverified` | installer exited 0, the version probe did not confirm it | `UNVERIFIED — … the installer exited 0 but the version probe did not confirm it (<note>)` | WARN |
-| `InstallerFailed` | installer exited non-zero | `FAILED — … the installer exited 1603 (<note>)` | WARN |
+| `SucceededVerified` | the new binary answers the expected tag: by the watcher's probe after an installer that went through (0, 3010, 1641) or was gone before its exit could be read, or, when the watcher left nothing, by the next daemon being that version (`docs/remote-control.md` §19.2) | `ok — agent-v0.4.172 installed 2h ago, verified: roomlerd 0.4.172` — and `— but this daemon runs 0.4.175` when the record is for another release than the one running | INFO |
+| `SucceededUnverified` | the installer went through, the version probe did not confirm it. On macOS the 0 is a stand-in: nothing there reads the installer's exit | `UNVERIFIED — … the installer exited 0 but the version probe did not confirm it (<note>)` | WARN |
+| `InstallerFailed` | the installer exited with anything else, or it was gone before its exit could be read and the expected version is not on disk: `installer_exit_code` is then null, never a stand-in 0 | `FAILED — … the installer exited 1603 (<note>)`, or `exited with no code` | WARN |
 | `Timeout` | the installer did not exit within the watcher's budget (Windows: nor after the kill-and-retry) | `TIMED OUT — … (<note>)` | WARN |
+| `WatcherStopped` | nothing wrote a verdict in the watcher's whole life, and the daemon that settled the record is not the version it was for (#3302) | `WATCHER STOPPED — agent-v0.4.172 started 3d ago: <note>` | WARN |
 | `Unreadable` | a file is there and does not parse; `note` carries the error chain | `record UNREADABLE — <error> (<path>)` | WARN |
 
 The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`lib.rs:547`): the
@@ -125,7 +126,9 @@ a record older than that (`never_reported`, `:557`).
 > record says `Absent`. A record whose verdict never came says `InProgress`
 > and, once stale, `NEVER REPORTED`. Folding any two of these into one
 > "nothing to show" recreates the original bug one layer up: an operator
-> would read a frozen record as a quiet host. The split is pinned by
+> would read a frozen record as a quiet host. Since #3302 a healthy daemon
+> settles a frozen record, so `NEVER REPORTED` lasts only until that daemon
+> reaches its clean-run threshold. The split is pinned by
 > `summarize_keeps_absent_and_in_progress_apart` (daemon) and
 > `absent_never_reported_and_in_progress_are_three_sentences` (CLI).
 

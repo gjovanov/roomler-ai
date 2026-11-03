@@ -500,6 +500,7 @@ pub struct MacosGrants {
 /// | `SucceededUnverified` | the installer exited 0 but the version probe did not confirm it; `note` says what it saw |
 /// | `InstallerFailed` | the installer exited non-zero (`installer_exit_code`) |
 /// | `Timeout` | the installer did not exit within the watcher's budget (on Windows, not after the kill-and-retry either) |
+/// | `WatcherStopped` | nothing wrote a verdict in the watcher's whole life, and the daemon that settled the record is not the version it was for (#3302) |
 /// | `Unreadable` | a file is there and does not parse; `note` carries the error |
 ///
 /// Additive everywhere: a daemon that predates it sends no key, an older
@@ -538,6 +539,7 @@ impl LastInstallStatus {
     pub const SUCCEEDED_UNVERIFIED: &'static str = "SucceededUnverified";
     pub const INSTALLER_FAILED: &'static str = "InstallerFailed";
     pub const TIMEOUT: &'static str = "Timeout";
+    pub const WATCHER_STOPPED: &'static str = "WatcherStopped";
     pub const UNREADABLE: &'static str = "Unreadable";
 
     /// An `InProgress` record older than this never got its verdict. The

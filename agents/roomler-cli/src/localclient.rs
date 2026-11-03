@@ -2915,6 +2915,7 @@ fn last_install_line(
                 .unwrap_or_else(|| "with no code".to_string())
         ),
         s if s == L::TIMEOUT => format!("TIMED OUT — {expected} {since}: {note}"),
+        s if s == L::WATCHER_STOPPED => format!("WATCHER STOPPED — {expected} {since}: {note}"),
         s if s == L::UNREADABLE => format!("record UNREADABLE — {note} ({path})"),
         // A newer daemon's word: shown as it is, never an error.
         other => format!("{other} — {expected} {since} ({note})"),
@@ -2987,6 +2988,19 @@ mod last_install_tests {
 
         assert_ne!(absent, frozen);
         assert_ne!(frozen, fresh);
+    }
+
+    /// #3302 — a stopped watcher is its own sentence, never the "NEVER REPORTED" of
+    /// a record nobody has settled, and the note says what the daemon saw.
+    #[test]
+    fn a_stopped_watcher_says_so() {
+        let now = 1_792_967_966 + 3_600;
+        let line = last_install_line(&record(L::WATCHER_STOPPED), "0.4.171", now);
+        assert!(
+            line.starts_with("WATCHER STOPPED — agent-v0.4.172"),
+            "{line}"
+        );
+        assert!(line.contains("reports roomlerd 0.4.172"), "{line}");
     }
 
     /// The quiet line, and the one case it speaks up: a verified install of

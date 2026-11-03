@@ -4627,7 +4627,7 @@ outcome to `<log_dir>/last-install.json` with status
 `InstallerFailed` / `Timeout` / `WatcherStopped`. The daemon reads the file back at
 startup (one `last install:` line) and on every `roomler status`
 (`last_install`) — since FR-67 P3; for the two Linux defects that
-kept the verdict off the disk until then, the seven words the daemon
+kept the verdict off the disk until then, the eight words the daemon
 reports and which process reads it where, see
 [`update-outcome.md`](update-outcome.md).
 

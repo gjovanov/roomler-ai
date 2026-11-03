@@ -110,7 +110,7 @@ It was the first design, and it was refuted:
 Built 2026-10-26 (#2924), once the field read of that morning showed P1 and P2 holding
 on the auto-update path (13 of 13 organic updates on one `.deb` host wrote
 `SucceededVerified`, field log). The record now has three readers, none of
-them SSH; the full treatment, with the seven words and the per-role log dirs,
+them SSH; the full treatment, with the words and the per-role log dirs,
 is [`docs/update-outcome.md`](../update-outcome.md).
 
 ```mermaid
@@ -274,7 +274,7 @@ sequenceDiagram
       reads, was complete every time
 - [x] Docs: [`docs/update-outcome.md`](../update-outcome.md) — the record and
       its fields, where `<log_dir>` lands per platform and role, the two Linux
-      defects, the life of a verdict, the seven words and the three that must
+      defects, the life of a verdict, the words and the three that must
       never collapse, who reads it from which process, the three surfaces, the
       field table — with diagrams, linked from `docs/README.md`;
       `docs/remote-control.md` §19.2's "future agent startups read the file" is

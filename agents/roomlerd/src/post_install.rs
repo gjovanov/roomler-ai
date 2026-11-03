@@ -1432,6 +1432,7 @@ impl InstallStatus {
             InstallStatus::SucceededUnverified => LastInstallStatus::SUCCEEDED_UNVERIFIED,
             InstallStatus::InstallerFailed => LastInstallStatus::INSTALLER_FAILED,
             InstallStatus::Timeout => LastInstallStatus::TIMEOUT,
+            InstallStatus::WatcherStopped => LastInstallStatus::WATCHER_STOPPED,
         }
     }
 }
@@ -1518,8 +1519,8 @@ pub(crate) fn startup_level(li: &LastInstallStatus, now_unix: u64) -> tracing::L
 
 /// Say at startup what the last install came to — one line, always prefixed
 /// `last install:`, so `journalctl -g "last install"` / `roomler logs --grep`
-/// finds it whatever the verdict. The seven words of [`LastInstallStatus`]
-/// each get their own sentence; the level is [`startup_level`]'s.
+/// finds it whatever the verdict. The words of [`LastInstallStatus`] each
+/// get their own sentence; the level is [`startup_level`]'s.
 pub fn log_at_startup() {
     let li = last_install_status();
     let now = unix_now();
@@ -2055,6 +2056,16 @@ mod tests {
         assert_eq!(li.expected_version, None);
     }
 
+    /// #3302 — one watcher's life, in two crates. The reader calls a record stale
+    /// at the moment the daemon may settle it.
+    #[test]
+    fn the_wire_and_the_watcher_agree_on_its_life() {
+        assert_eq!(
+            WATCHER_LIFETIME.as_secs(),
+            LastInstallStatus::STALE_AFTER_SECS
+        );
+    }
+
     /// FR-67 P3 — the word on the wire IS the word in the file. The file is
     /// serde's spelling of `InstallStatus`; the wire is [`InstallStatus::word`];
     /// an operator grepping `SucceededVerified` must hit both, and the
@@ -2067,6 +2078,7 @@ mod tests {
             InstallStatus::SucceededUnverified,
             InstallStatus::InstallerFailed,
             InstallStatus::Timeout,
+            InstallStatus::WatcherStopped,
         ] {
             let in_file = serde_json::to_string(&st).unwrap();
             assert_eq!(in_file, format!("\"{}\"", st.word()), "{st:?}");
@@ -2122,6 +2134,7 @@ mod tests {
             LastInstallStatus::SUCCEEDED_UNVERIFIED,
             LastInstallStatus::INSTALLER_FAILED,
             LastInstallStatus::TIMEOUT,
+            LastInstallStatus::WATCHER_STOPPED,
             LastInstallStatus::UNREADABLE,
             "SomeFutureWord",
         ] {
