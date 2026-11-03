@@ -184,6 +184,23 @@ impl Refusal {
         failed(self.error_code(), self.words())
     }
 
+    /// This refusal said of one file inside an archive, which it names: the
+    /// person downloaded the archive and never saw what is in it.
+    #[cfg(any(target_os = "windows", test))]
+    fn inside(self, path: &Path) -> Refusal {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        match self {
+            Refusal::NotTrusted(why) => {
+                Refusal::NotTrusted(format!("{why} ({name}, inside the archive)"))
+            }
+            Refusal::WrongPublisher(found) => Refusal::NotTrusted(format!(
+                "{name}, inside the archive, is signed by {found}, and Roomler is signed by \
+                 {EXPECTED_PUBLISHER}"
+            )),
+            other => other,
+        }
+    }
+
     /// The elevated step's exit code for this refusal.
     #[cfg(any(target_os = "windows", test))]
     fn exit_code(&self) -> i32 {
@@ -615,7 +632,7 @@ fn check_each_file(folder: &Path) -> Result<(), Refusal> {
         if path.is_dir() {
             check_each_file(&path)?;
         } else if !is_plain_text(&path) {
-            check_held(&path, None)?;
+            check_held(&path, None).map_err(|refusal| refusal.inside(&path))?;
         }
     }
     Ok(())
@@ -993,6 +1010,29 @@ mod tests {
         std::fs::create_dir(&nested).unwrap();
         std::fs::write(nested.join("version.dll"), b"not signed").unwrap();
         assert!(check_each_file(dir.path()).is_err(), "found in a subfolder");
+    }
+
+    /// A file refused inside an archive is named, whatever the refusal.
+    #[test]
+    fn a_refusal_inside_an_archive_names_the_file() {
+        let path = Path::new("check-1").join("deeper").join("version.dll");
+        let dll = path.as_path();
+        let words = Refusal::NotTrusted("the file is not signed".into())
+            .inside(dll)
+            .words();
+        assert!(
+            words.contains("the file is not signed (version.dll, inside the archive)"),
+            "{words}"
+        );
+        let words = Refusal::WrongPublisher("Evil Corp".into())
+            .inside(dll)
+            .words();
+        assert!(words.contains("version.dll, inside the archive, is signed by Evil Corp"));
+        assert!(words.contains(EXPECTED_PUBLISHER), "{words}");
+        assert!(matches!(
+            Refusal::CouldNotCheck("gone".into()).inside(dll),
+            Refusal::CouldNotCheck(_)
+        ));
     }
 
     /// A bad archive refuses and leaves no check folder behind.

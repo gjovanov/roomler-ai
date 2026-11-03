@@ -275,12 +275,19 @@ mod win {
         // no longer hashes to what was signed, i.e. the payload was modified
         // in transit. Field-checked by flipping four bytes in a released MSI.
         const TRUST_E_BAD_DIGEST: i32 = 0x8009_6010_u32 as i32;
+        // #3246 — what a captive portal's page or a stray text file gives: no
+        // trust provider knows the form, so there is no signature to read.
+        const TRUST_E_SUBJECT_FORM_UNKNOWN: i32 = 0x800B_0003_u32 as i32;
         match status {
             OK => read.unwrap_or_else(|| Err(VerifyError::Untrusted("no verdict".into()))),
             TRUST_E_BAD_DIGEST => Err(VerifyError::Untrusted(
                 "the payload does not match its signature — it was modified after signing".into(),
             )),
             TRUST_E_NOSIGNATURE => Err(VerifyError::Untrusted("the file is not signed".into())),
+            TRUST_E_SUBJECT_FORM_UNKNOWN => Err(VerifyError::Untrusted(
+                "what arrived is not a program or an installer, so it can carry no signature"
+                    .into(),
+            )),
             TRUST_E_EXPLICIT_DISTRUST => Err(VerifyError::Untrusted(
                 "the signature is present but explicitly distrusted".into(),
             )),
