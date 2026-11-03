@@ -205,7 +205,7 @@ flowchart LR
 | **P8** | `slow_link_floor` (the opener and the relative step ride on it) | `governor.rs:449` (`open_seed_bps` filtered on `floor_relief`); `aimd.rs:269` | `governor.rs:2092` `seed_opening_is_inert_without_the_floor_relief` — OFF ⇒ opens at the 2.55 M cap, no seed, no relief; `aimd.rs:676` `ai_step_is_relative_below_the_nominal_floor` — the step at or above the floor unchanged; **this PR** `aimd.rs` `the_ladder_extension_is_inert_at_or_above_the_nominal_floor` — every rung P8 added sits below the floor and the coarsening at or above it equals the pre-P8 table's (`170d18473^`) value for value, so a switched-off session, pinned at the floor, never reaches one |
 | **T1** | none — a parse fix | `crates/vendored/webrtc-sctp` | not a switch; the vendored parser's own tests plus the CI drift gate (`ci.yml:273`, `scripts/revendor-webrtc-sctp.sh --check`) |
 
-`config_surface.rs:4315` `env_bridge_pairs_have_surface_parity` is the test that every key above is also
+`config_surface.rs:4359` `env_bridge_pairs_have_surface_parity` is the test that every key above is also
 editable through the config surface, not only by env.
 
 **Fail-first.** A unit test is evidence only if it fails without the thing it protects, so each

@@ -74,7 +74,7 @@ Two workflows sit behind the request, and they are not the same feature:
 
 `CLAUDE.md` states it for exec, SSH, peer relays and remote config, and the code
 enforces it: **the last gate is owned by the device and the server cannot write it.**
-`remote_config_enabled` (`crates/agent-core/src/config.rs:212`) is not merely
+`remote_config_enabled` (`crates/agent-core/src/config.rs:226`) is not merely
 defaulted-off — it is *structurally absent* from `DesiredConfig`, and
 `crates/remote_control/src/models.rs:2722` says so in as many words:
 
@@ -97,7 +97,7 @@ later reviewer recognises it as the tempting shortcut rather than the obvious bu
 
 The password lives **only on the device**, in `config.toml`, under the same
 atomic + fsync + `.prev` + 0600/ACL treatment `ssh_host_key` already gets
-(`crates/agent-core/src/config.rs:378`) — and, exactly as with SSH, **if it cannot be
+(`crates/agent-core/src/config.rs:392`) — and, exactly as with SSH, **if it cannot be
 persisted the feature stays off** rather than running on a per-boot secret.
 Verification is a handshake the server merely relays.
 
