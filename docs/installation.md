@@ -33,11 +33,43 @@ flowchart TB
 ```
 
 Everything needs an **enrollment token** — minted in the admin UI
-(**Admin → Agents → Enroll** for daemons, **Tunnel clients → Enroll** for CLIs),
-valid 10 minutes, single-use — or, for a daemon, a **pairing** (FR-129): the
-wizard's "Set up in the browser", and `--pair` on the terminal installers
-([below](#pairing-from-a-terminal)), mint that same token into the installing
-process after you approve a code at `/pair`, so nothing is copied or pasted.
+(**Devices → Enroll → Device** for daemons, **Devices → Enroll → Tunnel client**
+for CLIs), valid 10 minutes, single-use — or, for a daemon, a **pairing**
+(FR-129): the wizard's "Set up in the browser", and `--pair` on the terminal
+installers ([below](#pairing-from-a-terminal)), mint that same token into the
+installing process after you approve a code at `/pair`, so nothing is copied or
+pasted.
+
+### The wizard's first page: the background service by default (FR-129 C1)
+
+The Welcome page opens with a role already picked, which the person can change
+before anything happens: the background service on a machine with nothing
+installed, and an existing install's own flavour otherwise, so a default never
+switches a flavour or changes a device's security posture. Rust decides
+(`agents/roomler-setup/src/role.rs:287`, `default_role`, carried as
+`defaultRole` on the detection); the SPA only applies it, when nothing is picked
+yet, and never saves it (a click does). The "Join the overlay network" box keeps
+its per-OS default, ticked for every preselected daemon role.
+
+| OS | nothing installed | a per-user install | a machine-wide install (or both) |
+|---|---|---|---|
+| Windows | **background service** (perMachine + SystemContext: the lock screen, UAC dialogs, admin apps) | this user only | the service's SystemContext switch (`ROOMLERD_ENABLE_SYSTEM_SWAP` in the `Roomler` service's SCM Environment, read as the daemon reads it): on → background service; off or absent → attended service (SystemContext would make the lock screen remotely controllable, a choice left to the person); unreadable → nothing preselected |
+| Linux | **system service** (root), once the server offers the Linux daemon cards; the tunnel client while it does not | this user only | system service |
+| macOS | **this Mac** (with the root half, the overlay box being ticked), once the server offers the macOS cards; the tunnel client while it does not | this Mac | this Mac |
+
+Where an installed flavour is not offered (a Linux or macOS server with the
+switch off), nothing is preselected: the tunnel client would be another product
+than the one the device has. An installed tunnel client does not change the
+default; the daemon roles carry the `roomler` CLI too.
+
+**A new launch resumes a run only from the Server or the Token page.** The
+wizard's saved state (`%LOCALAPPDATA%\roomler\roomler-setup\data\wizard-state.json`
+on Windows) restores its role and device name only when the run was killed on
+one of those two pages; a run that finished, stopped on Welcome, or was cut off
+during the install starts a new run at Welcome, with the default device name.
+The server URL is kept either way. Before FR-129 C1 a finished run's role and
+name came back: a test run's tunnel-client role preselected the tunnel card on
+the operator's own machine, and its device name was offered again.
 
 ## Enrollment — what every path does
 
@@ -64,7 +96,7 @@ which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
 - `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:396`);
-- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1555`).
+- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1556`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
@@ -102,19 +134,99 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3776`, `crates/agent-core/src/config.rs:4163`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
-| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:633`, `:965`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3790`, `crates/agent-core/src/config.rs:4171`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:634`, `:966`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
 administrator.** After its first healthy run the daemon hardens that config's
 folder to SYSTEM and Administrators (#3073), and a wizard that is not elevated
 cannot open it. The wizard says so on its first page, before a token is pasted
-or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1156`), and the
+or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1157`), and the
 install refuses it before anything is downloaded (`:290`). Before the enroll it
 also stops on a config it may not read (`:634`, never reported as a damaged
 config) or a folder it may not write (`:640`). The token is never spent on a
 config that cannot be written. A **fresh** install of that role still works
 from a double-click: the folder is not hardened yet.
+
+**The wizard asks for those rights itself** (FR-129 C3). The note on its first
+page carries a **Restart as administrator** button: the wizard starts its own
+image again through the shell's `runas` verb (one UAC prompt,
+`crates/roomler-setup-core/src/elevation.rs`) with
+`--role <role> [--server <url>] [--session-data <folder>] --after-elevation <its pid>`
+(the folder is its own `%LOCALAPPDATA%`), and exits once the elevated copy has started,
+handing it the right to take the foreground. Nothing secret is on that command line:
+it happens on Welcome, before a token exists. The elevated copy
+(`agents/roomler-setup/src/launch.rs`):
+
+1. waits, at most 30 s, for the limited copy to exit, **before** Tauri's
+   single-instance plugin looks for a running copy — otherwise it would find
+   the dying copy's lock, hand it its arguments and quit. With over-the-shoulder
+   credentials (a standard user typing an administrator's password) the copy is
+   another account, may be refused a handle on the limited one, and polls the
+   process list instead; it also runs in that account's profile, which is why
+   the role travels on the command line rather than in the saved state;
+2. keeps its WebView2 data in its own folder, under the LIMITED copy's
+   `%LOCALAPPDATA%` (`...\ai.roomler.setup\elevated`): WebView2 shares one browser
+   process among every host naming the same folder, the limited copy's can
+   outlive it by a moment, and an elevated host must not join a limited browser
+   process. The folder goes through the API (Tauri's `data_directory`, so the
+   main window is created by the wizard's setup hook and `tauri.conf.json` says
+   `"create": false`), never through `WEBVIEW2_USER_DATA_FOLDER`: an elevated
+   WebView2 host ignores every `WEBVIEW2_*` environment variable — for the same
+   reason an elevated wizard's debugging port comes only from the HKLM policy.
+   It sits in the limited copy's profile because WebView2's browser process
+   de-elevates to the session's user, who cannot open an administrator's
+   profile: with the folder there, over-the-shoulder credentials give a white
+   window that goes away after about a minute. A limited run keeps Tauri's folder
+   unchanged;
+3. comes to the front, or it would open behind the browser the wizard was
+   started from;
+4. opens on Welcome with the handed role preselected, over the detected
+   default, and the Continue gate as usual.
+
+A right-click **Run as administrator** by a person who is an administrator works
+as it always has, in that account's own folder. **With another account's password
+it does not** (the white window above, or Edge's "We couldn't create the data
+directory"): that start has no limited copy to name the session's folder. Start the
+wizard normally and use the button.
+
+**The cards follow what can work here** (`role::RoleLimit`,
+`agents/roomler-setup/src/role.rs:191`), and a note on Welcome says why:
+
+| The situation | The cards | Why |
+|---|---|---|
+| Another account's password was typed at the prompt (the limited copy's `%LOCALAPPDATA%`, passed as `--session-data`, differs from this process's) | the background service only | anything else would install into that administrator's profile and still report Done |
+| The machine's policy refuses prompts from a standard user (`ConsentPromptBehaviorUser=0`, set by the CIS and STIG baselines) | **this user only**, preselected, and the tunnel client | a machine role would lead through pairing and the download into "blocked by your system administrator" |
+
+`cmd_install` and `cmd_pair_start` hold the same rule for a run that resumes past Welcome.
+
+**An elevated wizard opens the pairing page through Explorer.** A browser started directly
+would take its token: under another account's password that was Edge as the administrator,
+at high integrity, on the standard user's desktop (FR-129's log, 2026-11-02).
+`launch::open_through_the_shell` leaves it to the session's own Explorer, so the page opens in
+that person's browser and profile, at medium integrity.
+
+**What an elevated wizard trusts.** Its folder is usually Downloads, a limited process can write
+that folder and `HKCU\Environment`, and the same image goes on to run elevated:
+
+- it loads DLLs from System32 alone (the linker's `/DEPENDENTLOADFLAG:0x800`,
+  `SetDefaultDllDirectories`, and `secur32.dll` delay-loaded, since that flag does not reach an
+  import's own imports), and `pe-dependent-load-flags.ps1` reads the flag and the import table
+  back from the EXE in CI, in the release lane and in the verifier;
+- it names every program it starts by a full path from the kernel, and
+  `agents/roomler-setup/src/spawn_gate.rs` fails CI on a bare name;
+- `launch::start_clean`, the second line of `main`, gives the machine's folder variables their
+  true values on every run and leaves the current directory, and an elevated run drops
+  `ROOMLER*`, `WEBVIEW2_*`, `TAURI_*` and `SSL_CERT_*`, so the staging override a test fixture
+  uses works limited and nowhere else;
+- its WebView2 folder is made new at each start, following no link.
+
+Still open: the wizard checks no publisher on the MSI it stages, and the staged file sits in the
+user's temp folder until `msiexec` reads it (#3246).
+
+A declined prompt leaves the limited wizard as it was, with one line saying so;
+any other failure shows its reason and the right-click way. Nothing else in the
+wizard elevates itself: a fresh install still gets the MSI's own UAC prompt.
 
 **The enroll says how it was installed** (FR-102 P3, the install trace in
 [growth-observability.md](growth-observability.md)): the device row records
@@ -208,7 +320,7 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3564`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3608`) |
+| `config::load` (`crates/agent-core/src/config.rs:3572`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3616`) |
 | `config::read_if_present` (`:3617`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
@@ -244,7 +356,7 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2628`, `:2650`), at the clean-run promotion
+`crates/agent-core/src/config.rs:2634`, `:2656`), at the clean-run promotion
 (`record_clean_run_at`, `:2620`), at every `ConfigSet`, and at enrollment. The daemon, the
 desktop app and the setup wizard all write it through `config::save` (`:4062`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
@@ -338,14 +450,19 @@ remove one today.
 
 ## Windows
 
-**Recommended: the `roomler-setup` wizard** (signed EXE, downloadable from the
-admin UI or `https://roomler.ai/api/setup/windows-x86_64`). One wizard, four
-roles:
+**Recommended: the `roomler-setup` wizard**, downloadable from the admin UI or
+`https://roomler.ai/api/setup/windows`. Since `setup-v0.4.197` (FR-129 C2), that
+link serves the **signed EXE itself**,
+`roomler-setup-<v>-x86_64-pc-windows-msvc.exe`, whose bytes equal the release's
+`.exe.sha256` and carry a GPG `.asc` like every other asset;
+`https://roomler.ai/api/setup/windows?format=zip` serves the same EXE in a zip,
+for a proxy that refuses an EXE download. A release without the EXE asset keeps
+serving its zip. One wizard, four roles:
 
 | Wizard role | What it installs | Runs as |
 |---|---|---|
 | **Daemon — system** | perMachine MSI + SystemContext enabled | SCM service `Roomler` (LocalSystem) — controls lock screen, UAC, pre-logon |
-| **Daemon — per user** | perUser MSI | Scheduled Task `Roomler` at logon (limited) |
+| **Daemon — per user** | perUser MSI | Scheduled Task `Roomler` at logon (limited), with no window: [what the task runs](#what-the-per-user-scheduled-task-runs-3292) |
 | **Daemon — machine (attended)** | perMachine MSI | SCM service, no SystemContext |
 | **Tunnel client** | CLI archive + PATH entry | on demand |
 
@@ -421,6 +538,183 @@ Details worth knowing:
   [`overlay-wfp.md`](./overlay-wfp.md)). The perUser flavour cannot elevate
   and is unchanged.
 
+### What the per-user Scheduled Task runs (#3292)
+
+```mermaid
+flowchart LR
+    TS["Task Scheduler<br/>logon · OS start · after a registration"] --> W["roomlerdw.exe<br/>windows subsystem, no console<br/>kill-on-close job"]
+    W -->|"CREATE_NO_WINDOW<br/>stdio NUL"| D["roomlerd.exe run --supervisor task"]
+    D -->|"stderr: same file<br/>(capped per day)"| L[("roomlerd.log.YYYY-MM-DD")]
+    D -->|"tracing"| L
+    D -->|"spawns, outside the job"| M["msiexec, watcher,<br/>companion, session shells"]
+```
+
+`roomlerd.exe` is a console program and stays one: `enroll`, `service` and the
+diagnostics answer on the terminal they were run from. Task Scheduler gives a console
+program started with an interactive token a new console, so until #3292 a per-user
+daemon kept a terminal of raw logs on the person's desktop, and closing it stopped the
+device. Now the task runs `roomlerdw.exe` (`agents/roomlerdw/src/main.rs`), which has no
+console, passes its arguments on, and leaves with the daemon's exit code.
+
+| What | Behaviour | Why |
+|---|---|---|
+| The task's `Running`, `IgnoreNew`, `LastTaskResult` | Unchanged: the launcher stays until the daemon exits, with its code | Task Scheduler watches the process it started |
+| `schtasks /End` | Ends the launcher, whose kill-on-close job takes the daemon | Measured without the job: `/End` says success, the task reads `Ready`, the daemon runs on |
+| What the daemon spawns | Outside that job (`SILENT_BREAKAWAY_OK`, `BREAKAWAY_OK`) | `msiexec` and its watcher have to outlive the daemon on an update |
+| Sign-out | The launcher is shut down last (`SetProcessShutdownParameters`) | Otherwise it could take the daemon down through the job before its `WM_ENDSESSION` |
+| stderr | The rolling log, the same dated file tracing writes; `NUL` past 256 MiB in a day | A panic, a stack overflow and FFmpeg print only there; the launcher must not create the log folder (`appdirs::use_old_segment`) |
+| stdout | `NUL` | Tracing only, and the rolling log has the same events |
+| The MSI's custom actions, the Start menu entry | Run through the launcher too | Each opened a terminal in the foreground |
+| The default terminal | No window with Windows Terminal or `conhost` | `CREATE_NO_WINDOW` makes no console to show. Measured a start and a repair with the default set to `conhost` |
+| A running daemon, at an upgrade or an uninstall | The MSI stops it. An uninstall: `StopDaemon`, a plain `service stop`, before `UnregisterAutostart`. An upgrade: `StopOldDaemon`, `service stop --for-upgrade`, from the new product after `InstallFiles`, so it also reaches a daemon from a release without these actions | Restart Manager does not: the daemon declines its `ENDSESSION_CLOSEAPP` on purpose ([`ephemeral-nodes.md`](./ephemeral-nodes.md)), and the log still says "Successfully shut down all applications", with no event 10002. Measured from 0.4.196 to 0.4.197 by hand: the old daemon ran on until the next sign-in, and an uninstall left it running with its files gone, both with exit 0 |
+
+**A self-update whose install succeeds brings the device back by itself.** The daemon has
+exited for the installer, and registering the task is all the MSI's custom action does. So
+`service install`, when a config exists, adds one-shot `<TimeTrigger>`s one, three and ten
+minutes on (`start_soon_triggers`, `agents/roomlerd/src/service.rs`). With `IgnoreNew`
+the later ones do nothing once the daemon is up, and `StartWhenAvailable` keeps them
+through a sleep. A fresh MSI has no config and starts nothing. A `service stop` inside
+those ten minutes can therefore be undone once, and a device removed inside them gets
+one more start, which hears the server's goodbye and leaves again with exit 7, as the
+next sign-in's start would (measured, a start with the row already gone). An install that
+fails is the section [below](#when-a-per-user-upgrade-fails).
+
+**The first update onto the launcher looks a little different.** It runs the old
+product's table and the old daemon's own console: one terminal can flash when the old
+`UnregisterAutostart` runs, and nothing after that. From a launcher release onward nothing
+is shown. Measured on both jumps.
+
+**A machine whose AppLocker policy refuses the launcher keeps the console window.** The
+launcher is a file of its own, so a rule that allows `roomlerd.exe` by path refuses it:
+MSI exit 0, the task failing `0x800704EC` each minute, an 8004 event each time, the row
+offline for good (measured on a policy that lets only `roomlerd.exe` start). No custom
+action can tell, because the installer's token is `SANDBOX_INERT`, which AppLocker does not
+check: the blocked launcher ran all of them. A task is the one start with the token the
+real task gets. So `service install`, only where the compiled policy
+`%SystemRoot%\System32\AppLocker\Exe.AppLocker` exists, starts the launcher with `--version`
+through a throwaway task, `Roomler launcher check`, and reads its
+`LastTaskResult` for at most ten seconds (the answer was there in 0.6 s). `0x800704EC`
+means the real task names `roomlerd.exe`: a console window a person can close, on a device
+that is online. Any other answer keeps the launcher, so a person who is not signed in at
+that moment gets the launcher, and the block, until the next registration. Once the policy
+allows the launcher, the next update takes the window away.
+
+**`last-install.json` can stay at `InProgress` on a self-update.** The staged watcher
+holds the install folder's VC runtime through `PATH`, and Restart Manager can shut it down
+(event 10002) before it writes a verdict: read on both jumps, while another
+launcher-to-launcher update read `SucceededVerified`. Nothing reads the file, and the
+device comes back either way.
+
+**A resume from sleep needs no start.** The processes sleep with the machine and carry
+on, with the same process ids: after a hibernate the row was back online 13 s after the
+resume, and no terminal appeared. The task's second trigger is `Kernel-General` event 12,
+an OS start, which does not fire on a resume. S3 and Modern Standby are unread: the test
+guest offers only S4.
+
+⚠️ **The task is not a supervisor.** `<RestartOnFailure>` restarted nothing after exit 1
+or after `0xC000013A`, five minutes on, with `Count` 10 and `PT1M` registered. A
+per-user daemon that crashes stays down until the next sign-in or `roomlerd service
+start` (#3295). It does retry a start that could not begin at all: with a task naming a
+missing launcher it fired each minute, answering `0x80070002`.
+
+**Known gaps of the launcher**, each small enough to name and not to build yet:
+
+| Gap | What a person sees | Why it stands |
+|---|---|---|
+| The launcher cannot start the daemon: an EDR holds the replaced file at logon | Offline until the next sign-in; `LastTaskResult` 127 is the only trace | `<RestartOnFailure>` sees the launcher's start, and the launcher did start. A short retry belongs with #3295 |
+| A hand upgrade while the daemon is still starting | The stop event does not exist yet, so nothing stops it: the daemon runs on renamed files, and the one-shots exit 8, until the next sign-in | The window is the seconds before `run_cmd`'s last `select!`. `installer-smoke` waits 45 s for it |
+| A disk that is full at the day's log roll | The file log stays silent until the next start | `tracing-appender` prints that failure on stderr, which is now a file on the same disk, and its thread dies of it |
+| WDAC, or an EDR that quarantines the launcher | The AppLocker check answers nothing for them, so the launcher stays, and the row is offline | The check reads AppLocker's rules; a second kind of probe is not worth its code before one is seen in the field |
+| The Start menu entry on a machine that refuses the launcher | "Blocked by group policy" | It names the launcher, and the MSI cannot tell at build time |
+
+**Unread: Windows 10.** Every read above is on Windows 11. An older `ucrtbase.dll` may buffer a
+redirected stderr, and then the last lines before a crash die with it.
+`logging::tests::stderr_capture` on a Windows 10 guest settles it.
+
+#### When a per-user upgrade fails
+
+`RemoveExistingProducts` runs before any file of the new product, so by the time anything
+can fail the old product's `UnregisterAutostart` has deleted the task, and past
+`StopOldDaemon` the daemon has gone too. A rollback restores the old files. Nothing
+restored the task until #3292, because the old table has no rollback action of its own.
+
+| Failure, measured on signed candidates by a forced failing action | Before | Now |
+|---|---|---|
+| From a release before the launcher, after `StopOldDaemon` | Exit 1603, old files, **no task, no daemon, row offline** | Exit 1603, old files, the old task back, the old daemon started by `DaemonBackOnRollback` within a second, row online on the old version |
+| The same, just before `InstallFinalize` | Exit 1603, old files, **a task naming a launcher the rollback removed** (`0x80070002` each minute), row offline | The same as above: `AutostartBackOnRollback` overwrites it |
+| The same, before `InstallFiles` | Exit 1603, old files, **no task**. The old daemon was never stopped, so the row stays online until the next sign-in, when nothing starts it | Exit 1603, old files, the old task back. `DaemonBackOnRollback`'s start answers 8, because the old daemon still runs. Row online on the old version |
+| From a release with the launcher, after `StopOldDaemon` | Exit 1603, old files, **no task, no daemon, row offline** | The same as the first row, on the launcher |
+| From a release with the launcher, just before `InstallFinalize` | Exit 1603, old files, the restored task, whose one-shot starts the daemon a minute on | The same device, with the daemon back within a second |
+
+`AutostartBackOnRollback` and `DaemonBackOnRollback` (`agents/roomlerd/wix/main.wxs`) run
+the restored `roomlerd.exe`, the one file every release has, so the task is the one that
+release writes, and each can flash a terminal, on a failed upgrade only. They sit ahead
+of `RemoveExistingProducts` because a rollback plays the script backwards: the old files
+are back when they run. `service install` comes back first, because `service start` needs
+its task. An uninstall that fails gets the same pair (measured: exit 1603, "Removal failed", the
+daemon back within a second, row online). `InstallExecute` sits between them and
+`RemoveExistingProducts`, because that action refuses to run with anything spooled ahead of
+it: `Error 2613`, exit 1603, on every upgrade, healthy ones included (measured on signed
+candidates; ICE63 only warns). It flushes those two and nothing else, so the old product's
+removal still comes before any new file. `installer-smoke` holds the order against the
+built MSI, because WiX orders actions that share a parent by itself.
+
+**An install that never reaches its script has no rollback.** `msiexec` exits 1618 while
+another install holds the machine's mutex, so on a self-update the daemon has left and no
+action ran. `start_user_daemon_after_a_failure` (`agents/roomlerd/src/post_install.rs`)
+starts the task on a failed verdict. It runs in the watcher of the release being updated
+FROM, so the first update onto it does not have it: that device stays down until the next
+sign-in.
+
+**A standard user's rollback cannot restore the Installer's own registration.** The files
+come back and the registration does not: the rollback's registry opens under
+`HKU\<SID>\Software\Microsoft\Installer\Products` and
+`HKLM\…\Installer\UserData\<SID>\Products` answer error 5, and the MSI log counts about 166
+`Error in rollback skipped`. The failed product stays registered, with its cached package
+deleted. The released tables do the same, so this is older than #3292.
+
+| After, measured on signed candidates | The Installer's products (`ProductsEx`) | Apps & Features | What runs |
+|---|---|---|---|
+| A healthy upgrade | 1: the new version | 1: the new version | The new version |
+| A failure past `InstallFiles` | 2: the failed version (installed, no package), the old one (advertised, no version) | 1: **the failed version, which is not what runs** | The old version |
+| A failure before `InstallFiles` | 1: the old one (advertised, no version) | **None** | The old version |
+| A failed uninstall | 1: the product (advertised, no version) | **None** | The same version |
+| The next release over a failure past `InstallFiles`, by the updater | 3: the new version, the failed one, the old one | 2: the failed version, the new one | The new version |
+| The next release over a failure before `InstallFiles`, by the updater | 2: the new version, the old one (advertised) | 1: the new version | The new version |
+| A failure inside the old product's removal | 1: the new version | 1: the new version | The new version |
+| A cached package deleted from `C:\Windows\Installer`, then the next release by the updater | 2: the new version, the old one (installed, no package) | 2: the old version, the new one | The new version |
+
+**`IgnoreRemoveFailure` keeps such a device updating.** Without it the next release's
+`RemoveExistingProducts` finds a product with no package and stops the install: Error 1714,
+System Error 1612, exit 1603, on every release from then on. A cached package deleted from
+`C:\Windows\Installer` does the same to a healthy machine, and on a self-update the device
+also stays offline, because the daemon has left (measured to +6 min, on a watcher without the
+start above). With it that 1612 is ignored, and a self-update lays the new files, the task
+and the one-shots as usual (measured from the released 0.4.197's updater and from a release
+with the attribute). A daemon still on its way out when the copy reaches `roomlerd.exe` makes
+that exit 3010, with the file replaced in use and the row online on the new version in 15 s;
+the watcher records 3010 as `InstallerFailed` (#3340). A failure inside the old product's
+removal is ignored too: its table has already unregistered it and nothing is played back, so
+the install carries on to exit 0 and one product. Without the attribute that failure was exit
+1603, no Apps entry and no task.
+
+What it does not do:
+
+- **It does not remove the stale entry.** The entry stays through every later release. A
+  person's Uninstall of it answers 1612 and changes nothing, because its package is gone.
+  Uninstalling the current entry stops the daemon and removes the task, and the stale
+  product keeps the files it shares with that release in the folder.
+- **It does not help a hand upgrade with the daemon running.** The old product did not leave
+  and `StopOldDaemon` comes after `InstallFiles`, so `roomlerd.exe` is in use: Error 1310,
+  exit 1603, no change, row online on the old version. `roomlerd service stop` first, and it
+  goes through.
+- **It does not help the failed version again.** That answers 1612, so an updater retrying the
+  same release gets that until a newer one publishes.
+  `start_user_daemon_after_a_failure` has the device back in seconds; on the first update
+  onto it, the device stays down until the next sign-in.
+
+The per-machine table has no such attribute, and none of this was read on it.
+
 ### What an MSI run does to the `Roomler` service
 
 Every perMachine MSI run that is not an uninstall runs **RegisterService**
@@ -493,7 +787,7 @@ sequenceDiagram
 
 **Auto-updates and upgrades** (the open question in #3115). The updater does
 not stop the service before it runs msiexec. `spawn_installer_with_watch`
-(`agents/roomlerd/src/updater.rs:1891`) launches `msiexec /i … /qn` elevated
+(`agents/roomlerd/src/updater.rs:1892`) launches `msiexec /i … /qn` elevated
 (`:2236`, `:2636`) while the service runs; the worker that launched it exits 0,
 and its host stays up (`:593`). Measured on a vmtest Win11 cell, released code,
 with each stop held to the field's 7.8 s:
@@ -656,7 +950,7 @@ alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives fro
 the binary's symbols.
 
 Neither floor can strand a running daemon on the updater's offline `dpkg --install`
-rung (`agents/roomlerd/src/updater.rs:2299`), which is the reason libva and
+rung (`agents/roomlerd/src/updater.rs:2300`), which is the reason libva and
 `iproute2` stay out of `depends`. A host where the daemon runs already has the real
 library and OpenSSL, because without them it cannot start. A healthy install
 upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,
@@ -715,9 +1009,11 @@ library and passed while a bare 24.04 got the stub.
 
 The same `roomler-setup` wizard that installs the daemon on Windows installs it
 on a Linux desktop, with two daemon cards — **this user only** (the systemd user
-unit, the overlay through the userspace netstack; the default for a desktop)
-and **system service** (the root `roomlerd.service`, the TUN overlay, config at
-`/etc/roomler/config.toml` — the terminal path's `--system`). It is a GUI front
+unit, the overlay through the userspace netstack) and **system service** (the
+root `roomlerd.service`, the TUN overlay, config at `/etc/roomler/config.toml` —
+the terminal path's `--system`; the card preselected on a machine with nothing
+installed, [FR-129 C1](#the-wizards-first-page-the-background-service-by-default-fr-129-c1)).
+It is a GUI front
 end to the **embedded `install.sh`**, never a second implementation of its steps
 (`agents/roomler-setup/src/unix_daemon.rs`, `orchestrator_unix.rs`):
 
@@ -909,7 +1205,8 @@ signed-in user to those verbs, and the card edits as before.
 
 Where the device's owner turned workers on (`hive_worker`, `docs/hive.md`), each
 Hive session's worker runs in a cgroup of its own, its memory bounded at 512 MiB
-and kept off swap, **only where systemd delegates a cgroup with the memory
+and kept off swap, and in a build with the vault the device's own worker too, at
+1 GiB (FR-90 P8-2d-1), **only where systemd delegates a cgroup with the memory
 controller to the daemon's unit**. The packaged units do not. To give a system
 install the bound:
 
@@ -922,7 +1219,7 @@ sudo systemctl restart roomlerd
 
 As the first worker starts, the daemon moves its own processes into a leaf of the
 unit's cgroup (`roomlerd.service/roomlerd`), since cgroup v2 hands a controller
-down only from a cgroup with no processes of its own, and logs `hive: a session's
+down only from a cgroup with no processes of its own, and logs `hive: a
 worker runs in a cgroup of its own, its memory bounded`. Without the drop-in it
 logs that the worker runs without one. A per-user install takes the same two
 lines through `systemctl --user edit roomler`.
@@ -1298,11 +1595,11 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3414`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3428`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2678`).
+back to the version that is running (`crates/agent-core/src/config.rs:2684`).
 
 ### No pipe can stall the supervisor (#3080)
 
@@ -1539,7 +1836,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2177`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2191`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

@@ -131,7 +131,7 @@ REFUSAL (`other`), and only an absent or `null` field means recorded.
 ### 2. The capability — `ssh-grant-ack`, read from the LIVE connection
 
 `RpcCap::SshGrantAck` = `ssh-grant-ack`, advertised only by `ssh-server` builds, next to
-`ssh` and `ssh-consent` (`agents/roomlerd/src/encode/caps.rs:2998`).
+`ssh` and `ssh-consent` (`agents/roomlerd/src/encode/caps.rs:4095`).
 
 ⚠️ **Equality-matched**, like every verb: `ssh` is a prefix of `ssh-grant-ack` exactly as it
 is of `ssh-consent`, and `starts_with` would mark every `ssh` agent ack-capable — the
@@ -172,14 +172,14 @@ caller hears the server's reason rather than its own timeout; and it leaves ≥ 
 
 ### 4. The agent — acknowledge after recording, and every refusal
 
-The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4133`) acknowledges **after**
+The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4227`) acknowledges **after**
 `record_grant` returns: the grant is in `GRANTS` — the table the auth path reads — before
 the frame leaves, so "confirmed" means "redeemable". `record_grant`'s `Result<(), String>`
 becomes a typed rejection so the arm can say *which* refusal it was; the log text is
 unchanged.
 
 The ack is sent unconditionally by an ack-capable build. An older server cannot parse the
-frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:796`) — harmless, and
+frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:804`) — harmless, and
 one small frame per grant.
 
 ### Compatibility, both directions

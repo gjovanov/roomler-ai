@@ -334,6 +334,11 @@ mod session_decode_errors_tests;
 /// switch's empty 404, `purge_user`, and the digest's `quality.ratings`.
 #[cfg(test)]
 mod session_feedback_tests;
+/// FR-135 R2 — `rc:media-plan` and `rc:viewer-hz` through a real agent and a real
+/// viewer peer: the verb, the plan on the control channel, and the viewer's
+/// refresh reaching the agent.
+#[cfg(test)]
+mod session_media_plan_tests;
 /// FR-129 B1-s — `GET /api/setup/features`: the Phase B kill switch (one per
 /// OS since B1-s2, the legacy `wizard_unix_daemon` for both; default off) and
 /// `pairing`, each following its setting, read by a guest and a member alike.

@@ -150,6 +150,11 @@ impl RcSessionRegistry {
         self.inner.lock().unwrap().remove(session);
     }
 
+    /// #3280 — no session is live on this device, and no recording outlives one.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().is_empty()
+    }
+
     /// FR-85 P3b-3 — `session` ended. Its entry goes, UNLESS it is recording:
     /// a remote recording outlives its session for the re-attach grace, and
     /// the banner must keep saying so. `true` = the entry was kept (detached).

@@ -9,6 +9,13 @@ edition.workspace = true
 name = "roomler_ai_tests"
 path = "src/lib.rs"
 
+# #3280 — the probe spawns `current_exe()`, so this binary has to be the child as
+# well as the test, and its `main` has to be its own.
+[[test]]
+name = "caps_probe_retry"
+path = "tests/caps_probe_retry.rs"
+harness = false
+
 [dependencies]
 roomler-ai-config = { path = "../config" }
 roomler-ai-db = { path = "../db" }

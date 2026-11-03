@@ -34,12 +34,13 @@ use std::path::Path;
 /// |---|---|
 /// | Linux, the system or the user unit | nothing: `RestartPreventExitStatus=7 8` |
 /// | Windows, the `Roomler` service | its supervisor, at most 60 s apart, for good |
-/// | Windows, the per-user task | `<RestartOnFailure>`: ten times, a minute apart |
+/// | Windows, the per-user task | nothing, until the next sign-in (#3292) |
 /// | macOS, the LaunchDaemon or the LaunchAgent | launchd, on any failed exit |
 ///
 /// Before #2293 both said "wait for the supervisor to relaunch", which on
 /// Linux never comes, and offered `roomlerd run`, which by hand starts an
-/// unmanaged orphan beside the unit.
+/// unmanaged orphan beside the unit. #3292 measured that the task's
+/// `<RestartOnFailure>` restarts no exit at all: `windows` below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Install {
     /// `roomlerd.service`: root, `/etc/roomler/config.toml`.
@@ -129,10 +130,10 @@ impl Install {
                  new token now."
             }
             Self::WindowsTask => {
-                "The agent's task starts it again within a minute, with the new token, \
-                 but only ten times after a removal: if it is not back, start it with \
-                 `roomlerd service start`. If it is still running, `roomler restart` \
-                 makes it use the new token now."
+                "Start the agent: `roomlerd service start`. Its task does not restart an \
+                 agent the server removed (exit 7), and starts it again only at the next \
+                 sign-in. If it is still running, `roomler restart` makes it use the new \
+                 token now."
             }
             Self::MacOs => {
                 "launchd starts the agent again within seconds, with the new token. If \
@@ -204,8 +205,8 @@ impl Install {
                 "and the Roomler service starts it again within a minute, with the new token."
             }
             Self::WindowsTask => {
-                "and its task starts it again within a minute, but only ten times;\n\
-                 after that: roomlerd service start"
+                "then start it: roomlerd service start\n\
+                 (its task does not restart an agent the server removed)."
             }
             Self::MacOs => "and launchd starts it again within seconds, with the new token.",
             Self::Other => "then start the daemon again.",
@@ -241,21 +242,28 @@ impl std::fmt::Display for AutostartStatus {
 /// platforms (Task Scheduler replaces with `/F`, systemctl enable on
 /// an already-enabled unit is a no-op, launchctl load on an already-
 /// loaded plist returns exit 0).
-pub fn install() -> Result<()> {
+///
+/// `config_path` is the config this daemon would run with. On Windows, when it
+/// exists, the registration also starts the daemon shortly after: that is what
+/// brings a per-user device back after a self-update (#3292).
+pub fn install(config_path: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        windows::install()
+        windows::install(config_path.exists())
     }
     #[cfg(target_os = "linux")]
     {
+        let _ = config_path;
         linux::install()
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = config_path;
         macos::install()
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
+        let _ = config_path;
         bail!("auto-start is not implemented on this platform")
     }
 }
@@ -286,7 +294,7 @@ pub fn uninstall() -> Result<()> {
 /// task, `systemctl --user start` the unit, `launchctl kickstart` the agent.
 ///
 /// The caller half of `Request::RestartDaemon` (`restart_by: "caller"`): the
-/// Scheduled Task's own `<RestartOnFailure>` is a minute away at best, so the
+/// Scheduled Task restarts no exit by itself (#3292), so the
 /// companion / `roomler restart` runs this once the old daemon is gone. In
 /// every flavour the daemon is then spawned by the OS's scheduler / service
 /// manager — never as a child of the process calling this — so nothing of
@@ -644,10 +652,12 @@ pub fn stop_system() -> Result<String> {
 // file and pointing `schtasks /XML` at it, rather than the simpler
 // `schtasks /Create /SC ONLOGON ...` line. The XML buys us:
 //
-//   * `<RestartOnFailure>` — Task Scheduler relaunches the agent up to
-//     10 times at 1-minute intervals after a non-zero exit, bringing
-//     Windows to parity with systemd `Restart=on-failure` and macOS
-//     `KeepAlive`. The plain /SC ONLOGON path has none of this.
+//   * `<RestartOnFailure>` — NOT a supervisor, whatever its name says. Measured
+//     on Win11 (#3292): after exit 1 and after `0xC000013A` it restarted nothing
+//     for five minutes, with `Count` 10 and `PT1M` registered and the task reading
+//     `Ready`. So a per-user daemon that exits stays down until the next logon or
+//     `service start` (#3295); nothing here is at parity with systemd's `Restart=`
+//     or macOS's `KeepAlive`. Kept for what it can still do: a start that FAILED.
 //   * `<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>` and
 //     `<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>` — schtasks
 //     defaults to BOTH true, which silently terminates the agent the
@@ -660,6 +670,12 @@ pub fn stop_system() -> Result<String> {
 //     Kernel-General "operating system started") — covers the
 //     auto-logon-kiosk case where the user is signed in by the OS
 //     before the LogonTrigger has a chance to fire.
+//   * One-shot `<TimeTrigger>`s shortly after each registration (#3292) — what
+//     brings the daemon back after a self-update, see `start_soon_triggers`.
+//
+// The command is the windowless launcher beside this EXE (`roomlerdw.exe`,
+// #3292), not this console program: Task Scheduler gives a console program a
+// console, and a person who closes that window stops the daemon.
 //
 // Schema is pinned to v1.2 (compatible all the way back to Win 7) so
 // the same XML works on every Win10 / Win11 build we ship to.
@@ -677,7 +693,7 @@ mod windows {
     fn schtasks() -> Command {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let mut cmd = Command::new("schtasks");
+        let mut cmd = Command::new(crate::appdirs::system32_tool("schtasks.exe"));
         cmd.creation_flags(CREATE_NO_WINDOW);
         cmd
     }
@@ -690,12 +706,31 @@ mod windows {
     // upgrade forever, so the host runs TWO daemons. See docs/fr/FR-21.
     pub const LEGACY_TASK_NAME: &str = "RoomlerAgent";
 
-    pub fn install() -> Result<()> {
+    /// `enrolled`: a config exists, so a started daemon has something to do. A
+    /// fresh MSI has none, and starts nothing until `enroll` and `service start`.
+    pub fn install(enrolled: bool) -> Result<()> {
         let exe = std::env::current_exe().context("locating current exe")?;
-        let exe_str = exe.to_string_lossy().into_owned();
         let user = current_user_qualified().context("resolving current user")?;
+        let mut command = task_command(&exe);
+        if command != exe && applocker_exe_policy_in_force() && launcher_is_blocked(&command, &user)
+        {
+            eprintln!(
+                "This machine's AppLocker policy does not let {} start, so the task runs {} \
+                 instead, with a console window: closing it stops the daemon. Allow the \
+                 launcher, and the next update takes the window away.",
+                command.display(),
+                exe.display()
+            );
+            command = exe;
+        }
+        let exe_str = command.to_string_lossy().into_owned();
 
-        let xml = render_task_xml(&exe_str, &user);
+        let start_soon = if enrolled {
+            start_soon_triggers(chrono::Utc::now())
+        } else {
+            String::new()
+        };
+        let xml = render_task_xml(&exe_str, &user, &start_soon);
         let xml_path = write_temp_xml(&xml).context("writing temp XML")?;
 
         let result = schtasks()
@@ -738,6 +773,7 @@ mod windows {
         // half-migrated host (both).
         delete_task(NEW_TASK_NAME)?;
         delete_task(LEGACY_TASK_NAME)?;
+        let _ = delete_task(LAUNCHER_CHECK_TASK);
         Ok(())
     }
 
@@ -1012,10 +1048,121 @@ mod windows {
         })
     }
 
+    /// #3292 — what the task runs: the windowless launcher the per-user MSI puts
+    /// beside this EXE. Without one (the per-machine folder, a developer's build)
+    /// it is this EXE, as it always was, and a console window with it. The launcher
+    /// starts its own sibling, so `current_exe` is `roomlerd.exe` either way when
+    /// an MSI's custom action runs this through the launcher.
+    fn task_command(exe: &Path) -> PathBuf {
+        let launcher = exe.with_file_name("roomlerdw.exe");
+        if launcher.is_file() {
+            launcher
+        } else {
+            exe.to_path_buf()
+        }
+    }
+
+    /// Registered only for the seconds [`launcher_is_blocked`] runs. One that a killed
+    /// install leaves behind starts nothing that matters, and the next one replaces it.
+    const LAUNCHER_CHECK_TASK: &str = "Roomler launcher check";
+    /// `ERROR_ACCESS_DISABLED_BY_POLICY`, a task's result when policy refuses its file.
+    const BLOCKED_BY_POLICY: u32 = 0x8007_04EC;
+    /// `SCHED_S_TASK_HAS_NOT_RUN`: the check has not started yet.
+    const TASK_HAS_NOT_RUN: u32 = 0x0004_1303;
+
+    /// Is an AppLocker policy for programs in force? The compiled file is what Windows
+    /// enforces, and it outlives its rules: emptied by `Set-AppLockerPolicy`, it blocked
+    /// through a reboot (measured). A standard user may see it, also measured.
+    fn applocker_exe_policy_in_force() -> bool {
+        crate::appdirs::system32_tool(r"AppLocker\Exe.AppLocker").is_file()
+    }
+
+    /// #3292 — will a policy stop the task from starting the launcher? The launcher is
+    /// a file of its own, so a rule that names `roomlerd.exe` blocks it: MSI exit 0, a
+    /// task failing `0x800704EC` each minute, a device offline for good. Nothing a custom
+    /// action starts can tell, because the installer's token is exempt from AppLocker
+    /// (measured: the blocked launcher ran every action). A task is the one start with
+    /// the token the real task gets, so a throwaway one tries it, for seconds. Only a
+    /// clear block answers true: a person who is not signed in keeps the launcher.
+    fn launcher_is_blocked(launcher: &Path, user: &str) -> bool {
+        const TASK: &str = LAUNCHER_CHECK_TASK;
+        let xml = render_launcher_check_xml(&launcher.to_string_lossy(), user);
+        let Ok(path) = write_temp_xml(&xml) else {
+            return false;
+        };
+        let ok = |args: &[&str]| {
+            let out = schtasks().args(args).output().ok();
+            out.filter(|o| o.status.success())
+        };
+        let created = ok(&[
+            "/Create",
+            "/TN",
+            TASK,
+            "/XML",
+            &path.to_string_lossy(),
+            "/F",
+        ]);
+        let _ = std::fs::remove_file(&path);
+        let mut result = None;
+        if created.is_some() && ok(&["/Run", "/TN", TASK]).is_some() {
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                result = ok(&["/Query", "/TN", TASK, "/V", "/FO", "CSV", "/NH"])
+                    .and_then(|o| last_result(&String::from_utf8_lossy(&o.stdout)));
+                if result.is_some_and(|r| r != TASK_HAS_NOT_RUN) {
+                    break;
+                }
+            }
+        }
+        let _ = ok(&["/Delete", "/TN", TASK, "/F"]);
+        result == Some(BLOCKED_BY_POLICY)
+    }
+
+    /// The real task with one change: what it asks the launcher to do.
+    fn render_launcher_check_xml(launcher: &str, user: &str) -> String {
+        render_task_xml(launcher, user, "").replace("run --supervisor task", "--version")
+    }
+
+    /// The `Last Result` of a `schtasks /Query /V /FO CSV /NH` listing: the seventh
+    /// column in any language, in signed decimal.
+    fn last_result(listing: &str) -> Option<u32> {
+        let row = listing.lines().find(|line| !line.trim().is_empty())?;
+        let field = row.trim().trim_matches('"').split("\",\"").nth(6)?;
+        field.parse::<i64>().ok().map(|result| result as u32)
+    }
+
+    /// #3292 — when, after this registration, the task starts the daemon. A
+    /// self-update's daemon has exited for the installer, and registering the task
+    /// is all an MSI's custom action does, so the device stayed offline until the
+    /// next logon (measured: `LastTaskResult 0x41303`, ten minutes on). This is the
+    /// one place the fix can sit: on the first update onto it the old release's
+    /// watcher is what runs, and a start from a commit-time custom action would race
+    /// Restart Manager's late stop (#2711). The later ones are for an install slower
+    /// than the first, or a daemon that stop caught; `IgnoreNew` drops them when the
+    /// daemon is up. `StartWhenAvailable` keeps them through a sleep.
+    ///
+    /// UTC, with the `Z` Task Scheduler reads as "synchronize across time zones",
+    /// so no daylight-saving change can land one in the past.
+    const START_AFTER_REGISTERING: [i64; 3] = [60, 180, 600];
+
+    fn start_soon_triggers(now: chrono::DateTime<chrono::Utc>) -> String {
+        START_AFTER_REGISTERING
+            .iter()
+            .map(|secs| {
+                let at = now + chrono::Duration::seconds(*secs);
+                format!(
+                    "    <TimeTrigger>\n      <StartBoundary>{}</StartBoundary>\n      \
+                     <Enabled>true</Enabled>\n    </TimeTrigger>\n",
+                    at.format("%Y-%m-%dT%H:%M:%SZ")
+                )
+            })
+            .collect()
+    }
+
     /// Build the Task Scheduler XML that `schtasks /XML` consumes.
     /// Pure function — no I/O — so the test suite can pin the shape
     /// without touching the registry.
-    fn render_task_xml(exe_path: &str, user: &str) -> String {
+    fn render_task_xml(exe_path: &str, user: &str, start_soon: &str) -> String {
         let exe_xml = xml_escape(exe_path);
         let user_xml = xml_escape(user);
         // Schema 1.2 is the broadest compatible version (Win 7+). The
@@ -1026,7 +1173,7 @@ mod windows {
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Author>roomlerd</Author>
-    <Description>Roomler Daemon — keeps this device on your private Roomler mesh network and available for secure remote control (auto-start on logon, restart on failure).</Description>
+    <Description>Roomler Daemon — keeps this device on your private Roomler mesh network and available for secure remote control (auto-start on logon).</Description>
     <URI>\Roomler</URI>
   </RegistrationInfo>
   <Triggers>
@@ -1038,7 +1185,7 @@ mod windows {
       <Enabled>true</Enabled>
       <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="System"&gt;&lt;Select Path="System"&gt;*[System[Provider[@Name='Microsoft-Windows-Kernel-General'] and EventID=12]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
     </EventTrigger>
-  </Triggers>
+{start_soon}  </Triggers>
   <Principals>
     <Principal id="Author">
       <UserId>{user_xml}</UserId>
@@ -1110,7 +1257,7 @@ mod windows {
 
         #[test]
         fn xml_template_pins_resilience_settings() {
-            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user");
+            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user", "");
             // The five settings the resilience plan was specifically
             // about — losing any of these is the regression we're
             // guarding against.
@@ -1142,7 +1289,7 @@ mod windows {
             // Win-version compat), so these are out — the resilience-
             // critical settings (RestartOnFailure, battery, etc.)
             // are all Schema 1.2 native and survive.
-            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user");
+            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user", "");
             assert!(
                 !xml.contains("DisallowStartOnRemoteAppSession"),
                 "DisallowStartOnRemoteAppSession is Schema 1.3+; must not appear in a 1.2 document"
@@ -1155,7 +1302,7 @@ mod windows {
 
         #[test]
         fn xml_template_escapes_special_chars_in_paths_and_user() {
-            let xml = render_task_xml("C:\\Users\\Joe & Sons\\app.exe", "DOM\\joe<sons");
+            let xml = render_task_xml("C:\\Users\\Joe & Sons\\app.exe", "DOM\\joe<sons", "");
             assert!(
                 xml.contains("Joe &amp; Sons"),
                 "ampersand should be entity-encoded"
@@ -1178,11 +1325,94 @@ mod windows {
         /// refuses to restart.
         #[test]
         fn xml_template_marks_the_worker_as_task_supervised() {
-            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user");
+            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user", "");
             assert!(
                 xml.contains("<Arguments>run --supervisor task</Arguments>"),
                 "the task action must carry the supervisor flag: {xml}"
             );
+        }
+
+        /// #3292 — a registration on an enrolled machine starts the daemon soon, in
+        /// the document's own element order, which `schtasks /XML` is fussy about. The
+        /// shape was read back from a real `schtasks /Create /XML` on Win11.
+        #[test]
+        fn an_enrolled_registration_starts_the_daemon_soon() {
+            let now = chrono::DateTime::parse_from_rfc3339("2026-11-02T23:59:30Z")
+                .unwrap()
+                .to_utc();
+            let soon = start_soon_triggers(now);
+            let at = |t: &str| format!("<StartBoundary>{t}</StartBoundary>");
+            assert!(soon.contains(&at("2026-11-03T00:00:30Z")), "{soon}");
+            assert!(soon.contains(&at("2026-11-03T00:02:30Z")), "{soon}");
+            assert!(soon.contains(&at("2026-11-03T00:09:30Z")), "{soon}");
+            assert_eq!(soon.matches("<TimeTrigger>").count(), 3);
+            assert_eq!(soon.matches("<Enabled>true</Enabled>").count(), 3);
+
+            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user", &soon);
+            let triggers_end = xml.find("</Triggers>").unwrap();
+            let last_event = xml.find("</EventTrigger>").unwrap();
+            let first_time = xml.find("<TimeTrigger>").unwrap();
+            assert!(
+                last_event < first_time && first_time < triggers_end,
+                "{xml}"
+            );
+            assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+            assert!(xml.contains("<StartWhenAvailable>true</StartWhenAvailable>"));
+        }
+
+        /// A fresh MSI has no config: a daemon started now would only bail, after
+        /// starting the companion's first run.
+        #[test]
+        fn a_registration_with_no_config_starts_nothing() {
+            let xml = render_task_xml("C:\\path\\agent.exe", "DOMAIN\\user", "");
+            assert!(!xml.contains("<TimeTrigger>"), "{xml}");
+            assert!(xml.contains("<LogonTrigger>") && xml.contains("</Triggers>"));
+        }
+
+        /// #3292 — the launcher when the MSI shipped one, and the EXE itself when not:
+        /// a per-machine folder and a developer's build have no launcher.
+        #[test]
+        fn the_task_runs_the_launcher_beside_the_exe_when_there_is_one() {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = dir.path().join("roomlerd.exe");
+            std::fs::write(&exe, b"x").unwrap();
+            assert_eq!(task_command(&exe), exe);
+            let launcher = dir.path().join("roomlerdw.exe");
+            std::fs::write(&launcher, b"x").unwrap();
+            assert_eq!(task_command(&exe), launcher);
+            let xml = render_task_xml(&task_command(&exe).to_string_lossy(), "DOM\\u", "");
+            assert!(xml.contains("roomlerdw.exe</Command>"), "{xml}");
+            assert!(
+                xml.contains("<Arguments>run --supervisor task</Arguments>"),
+                "`supervision::detect` reads this argv from the daemon the launcher starts"
+            );
+        }
+
+        /// #3292 — the answers the throwaway task can give. The row's shape is a real
+        /// `schtasks` listing's on Win11; its words and the comma are this test's, for a
+        /// language the column has to hold in.
+        #[test]
+        fn a_check_reads_the_last_result_by_its_column() {
+            let row = |result: &str| {
+                format!(
+                    "\r\n\"H\",\"\\Roomler launcher check\",\"N/A\",\"Bereit, jetzt\",\"Nur interaktiv\",\
+                     \"02.11.2026 19:00:00\",\"{result}\",\"H\\u\",\"C:\\r\\roomlerdw.exe --version\"\r\n"
+                )
+            };
+            assert_eq!(last_result(&row("-2147023636")), Some(BLOCKED_BY_POLICY));
+            assert_eq!(last_result(&row("267011")), Some(TASK_HAS_NOT_RUN));
+            assert_eq!(last_result(&row("0")), Some(0));
+            assert_eq!(last_result(&row("n/a")), None);
+            assert_eq!(last_result(""), None);
+        }
+
+        #[test]
+        fn the_launcher_check_only_asks_for_a_version() {
+            let xml = render_launcher_check_xml("C:\\P\\roomlerdw.exe", "DOM\\u");
+            assert!(xml.contains("<Arguments>--version</Arguments>"), "{xml}");
+            assert!(xml.contains("<Command>C:\\P\\roomlerdw.exe</Command>"));
+            assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+            assert!(!xml.contains("--supervisor"), "{xml}");
         }
 
         #[test]
@@ -2266,15 +2496,17 @@ mod tests {
     }
 
     #[test]
-    fn the_per_user_windows_task_is_said_to_give_up() {
-        // `<RestartOnFailure>` relaunches ten times, then the task stays
-        // down until the next sign-in: unlike the service's supervisor.
+    fn the_per_user_windows_task_is_said_to_stay_down() {
+        // #3292 — `<RestartOnFailure>` restarted nothing when measured, so the
+        // person is told the command that brings it back, unlike the service,
+        // whose supervisor restarts the worker for good.
         for says in [
             Install::WindowsTask.after_re_enroll(true),
             Install::WindowsTask.after_removal(),
         ] {
-            assert!(says.contains("ten times"), "{says}");
+            assert!(says.contains("does not restart"), "{says}");
             assert!(says.contains("roomlerd service start"), "{says}");
+            assert!(!says.contains("ten times"), "{says}");
         }
         assert!(
             !Install::WindowsService

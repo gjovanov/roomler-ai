@@ -928,7 +928,7 @@ sequenceDiagram
 | the binding | `bind_net_grant` ([`tunnel.rs:547`](../crates/modules/network/src/tunnel.rs#L547)), at step 3c of the open ([`:820`](../crates/modules/network/src/tunnel.rs#L820)) |
 | each flow | `SessionGrant::admits` ([`tunnel.rs:517`](../crates/modules/network/src/tunnel.rs#L517)), first in `handle_forward_request` ([`:1184`](../crates/modules/network/src/tunnel.rs#L1184)) |
 | the principal | `Principal::Session` ([`policy.rs:48`](../crates/tunnel-core/src/policy.rs#L48)), `subject_matches` ([`:143`](../crates/tunnel-core/src/policy.rs#L143)) |
-| the audit | `TunnelAuditEvent.session_id` and `grant_id` ([`models.rs:5031`](../crates/remote_control/src/models.rs#L5031)) |
+| the audit | `TunnelAuditEvent.session_id` and `grant_id` ([`models.rs:5040`](../crates/remote_control/src/models.rs#L5040)) |
 | tests | `tunnel::tests` in the network module (3), `policy::tests::a_session_matches_no_subject_yet`, `signaling::tests::tunnel_open_carries_a_grant_and_opened_echoes_its_id`, and end to end [`tunnel_grant_tests.rs`](../crates/tests/src/tunnel_grant_tests.rs) (3) |
 
 #### The device's half: asking, and opening under the grant (P3-7-3a)
@@ -971,7 +971,7 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| asking | `vault::net` ([`vault.rs:884`](../agents/roomlerd/src/vault.rs#L884)) and its answer `on_net_granted` ([`:1049`](../agents/roomlerd/src/vault.rs#L1049)), held to what was asked by `net_granted` ([`:389`](../agents/roomlerd/src/vault.rs#L389)); the answer's own arm in the daemon's signalling ([`signaling.rs:6519`](../agents/roomlerd/src/signaling.rs#L6519)) |
+| asking | `vault::net` ([`vault.rs:884`](../agents/roomlerd/src/vault.rs#L884)) and its answer `on_net_granted` ([`:1049`](../agents/roomlerd/src/vault.rs#L1049)), held to what was asked by `net_granted` ([`:389`](../agents/roomlerd/src/vault.rs#L389)); the answer's own arm in the daemon's signalling ([`signaling.rs:6613`](../agents/roomlerd/src/signaling.rs#L6613)) |
 | presenting | `SessionParams.net_grant` ([`driver.rs:413`](../crates/tunnel-core/src/driver.rs#L413)), sent at the open ([`:1024`](../crates/tunnel-core/src/driver.rs#L1024)); a refusal typed ([`:1076`](../crates/tunnel-core/src/driver.rs#L1076)); the echo checked after the guard ([`:1102`](../crates/tunnel-core/src/driver.rs#L1102)); `SessionGrantRef` and `GrantError` ([`:2315`](../crates/tunnel-core/src/driver.rs#L2315), [`:2332`](../crates/tunnel-core/src/driver.rs#L2332)) |
 | the flow | `FlowLive.net_grant` ([`client_mgr.rs:201`](../agents/roomlerd/src/tunnel/client_mgr.rs#L201)), permanent by its type in `permanent_session_error` ([`:1737`](../agents/roomlerd/src/tunnel/client_mgr.rs#L1737)) |
 | the code | `NET_GRANT_REFUSED` ([`vault.rs:575`](../crates/remote_control/src/vault.rs#L575)), shared by the server and the device |
@@ -1083,9 +1083,9 @@ Four parties each say yes, and each for itself:
 | Piece | Where |
 |---|---|
 | the tools | `net_tools` ([`toolbelt.rs:1331`](../agents/roomlerd/src/hive/toolbelt.rs#L1331)), offered in `tools/list` ([`:1885`](../agents/roomlerd/src/hive/toolbelt.rs#L1885)) and answered in `ask_vault` ([`:1730`](../agents/roomlerd/src/hive/toolbelt.rs#L1730)); their names in the settings, `NET_TOOLS` ([`:625`](../agents/roomlerd/src/hive/toolbelt.rs#L625)) |
-| a call | `net_tools::call` ([`net_tools.rs:192`](../agents/roomlerd/src/hive/net_tools.rs#L192)), its arguments `parse` ([`:144`](../agents/roomlerd/src/hive/net_tools.rs#L144)), the run's end `drop_run` ([`:336`](../agents/roomlerd/src/hive/net_tools.rs#L336)), called as the run's leases go ([`supervisor.rs:4037`](../agents/roomlerd/src/hive/supervisor.rs#L4037)) |
-| the owner's gate | `hive_net` ([`config.rs:596`](../crates/agent-core/src/config.rs#L596)), `HiveConfig.net` ([`gates.rs:55`](../agents/roomlerd/src/hive/gates.rs#L55)), `Supervisor::net_hub` ([`supervisor.rs:1554`](../agents/roomlerd/src/hive/supervisor.rs#L1554)); the settings' `ask`, `vault_use_tools` ([`:5044`](../agents/roomlerd/src/hive/supervisor.rs#L5044)) |
-| the hub | `TunnelClientHub::set_primary` ([`client_mgr.rs:289`](../agents/roomlerd/src/tunnel/client_mgr.rs#L289)), called as the daemon builds it ([`app.rs:4549`](../agents/roomlerd/src/app.rs#L4549)) |
+| a call | `net_tools::call` ([`net_tools.rs:192`](../agents/roomlerd/src/hive/net_tools.rs#L192)), its arguments `parse` ([`:144`](../agents/roomlerd/src/hive/net_tools.rs#L144)), the run's end `drop_run` ([`:336`](../agents/roomlerd/src/hive/net_tools.rs#L336)), called as the run's leases go ([`supervisor.rs:4048`](../agents/roomlerd/src/hive/supervisor.rs#L4048)) |
+| the owner's gate | `hive_net` ([`config.rs:596`](../crates/agent-core/src/config.rs#L596)), `HiveConfig.net` ([`gates.rs:55`](../agents/roomlerd/src/hive/gates.rs#L55)), `Supervisor::net_hub` ([`supervisor.rs:1565`](../agents/roomlerd/src/hive/supervisor.rs#L1565)); the settings' `ask`, `vault_use_tools` ([`:5055`](../agents/roomlerd/src/hive/supervisor.rs#L5055)) |
+| the hub | `TunnelClientHub::set_primary` ([`client_mgr.rs:289`](../agents/roomlerd/src/tunnel/client_mgr.rs#L289)), called as the daemon builds it ([`app.rs:4564`](../agents/roomlerd/src/app.rs#L4564)) |
 | tests | `hive::toolbelt::tests` (6), `hive::net_tools::tests` (6: the call's arguments, its capability, the place it holds, a listener made after its run ended), `hive::supervisor::tests` (2: the settings' `ask`, `net_hub`), `hive::gates::tests::hive_net_is_the_owners_word`, `config_surface::tests::hive_net_defaults_off_and_clears_off`: 16, and 17 negative controls |
 
 ## LocalAPI

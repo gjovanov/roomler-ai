@@ -895,14 +895,14 @@ jobs:
         # FR-6 wave 14: the WITH-`audio` half of this step now runs in the
         # `rust-recorder-audio` lane, in parallel with this one.
         #
-        # FR-130 P1 — `encode::openh264_backend::`: the live encoder's SPS
-        # VUI carries the colour description (and nothing with the switch
-        # off), the recording profile's keeps its own. No other lane builds
-        # `openh264-encoder` without a `recording::` filter, and this one
-        # already built the test binary for the line above.
+        # FR-130 P1 — `encode::openh264_backend::`: the live encoder's SPS VUI
+        # carries the colour description (and nothing with the switch off), the
+        # recording profile's keeps its own. #3245 — `peer::codec_cap_tests::`: the
+        # RTP pump holds that encoder's ceiling. No other lane builds the feature
+        # without a `recording::` filter, and this one built the test binary above.
         run: |
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib recording::
-          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib encode::openh264_backend::
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib -- encode::openh264_backend:: peer::codec_cap_tests::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test control_dc_record
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test export
@@ -1635,6 +1635,14 @@ jobs:
       # the named pipe the person's tray and CLI dial, the peer read from the
       # OS at accept time, and (P10b) the token probe that refuses a SYSTEM
       # caller keep busy's On.
+      # #3292 — the launcher is Windows-only code, and every Linux lane compiles
+      # its stub. The rolling log's stderr capture is `cfg(windows)` too, in a crate
+      # whose tests otherwise run only on Linux and on the Mac's machine id.
+      - name: The per-user launcher and its stderr on Windows — clippy + unit tests (#3292)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings
+          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture
       - name: LocalAPI on Windows — clippy + unit tests (FR-92 P10b)
         if: ${{ !cancelled() }}
         run: |
@@ -1646,11 +1654,22 @@ jobs:
       # the SystemContext preflight, the restart onto a reinstall's enrollment
       # over the LocalAPI) first compiled at a `setup-v*` tag. `--lib` tests
       # only: its bin is `test = false` by the UAC lib-naming rule.
+      # FR-129 C3 — its mechanics crate too: `roomler-setup-core` holds the
+      # wizard's Win32 calls (the elevated relaunch, the MSI wait), and its
+      # Windows tests compiled out on the Linux step that runs its others.
       - name: The setup wizard on Windows — clippy + unit tests (#3116)
         if: ${{ !cancelled() }}
         run: |
-          cargo clippy -p roomler-setup --all-targets -- -D warnings
-          cargo test -p roomler-setup --lib
+          cargo clippy -p roomler-setup -p roomler-setup-core --all-targets -- -D warnings
+          cargo test -p roomler-setup -p roomler-setup-core --lib
+      # FR-129 C — the linker flag that keeps the wizard's own imports out of the
+      # person's Downloads, read back from the file the linker wrote: a string in
+      # build.rs says nothing about the EXE. The release lane reads the signed one.
+      - name: The setup wizard's EXE loads its imports from System32 alone
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build -p roomler-setup --bin roomler-setup
+          pwsh scripts/signing/pe-dependent-load-flags.ps1 -Path target/debug/roomler-setup.exe -Expect 0x800 -NotImported secur32.dll
       # FR-90 P1i's agent-session tests run in their own job,
       # windows-agent-sessions, below (FR-6 wave 27).
 
@@ -1867,7 +1886,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomlerd --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture --tests -- -D warnings
-          cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer capture::gpu_frame
+          cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer capture::wgc_backend::tests::the_mta_outlives_a_wgc_worker capture::gpu_frame
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.

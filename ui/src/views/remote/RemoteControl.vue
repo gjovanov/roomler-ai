@@ -266,6 +266,14 @@
              mutter capture without asking anyone, and the operator can see
              that they did. Absent on Windows, macOS and older agents. -->
         <span v-if="metrics.codec && statsCaptureLabel" class="stats-pill">{{ statsCaptureLabel }}</span>
+        <!-- FR-135 R2 — the steps this session took down from what it set out to
+             run: the last one here, all of them on hover. -->
+        <span
+          v-if="metrics.codec && statsLadderLabel"
+          class="stats-pill"
+          data-testid="rc-media-ladder"
+          :title="statsLadderTitle"
+        >{{ statsLadderLabel }}</span>
         <span v-if="metrics.bitrate" class="stats-pill">{{ statsBitrateLabel }}</span>
         <span v-if="metrics.fps" class="stats-pill">{{ statsFpsLabel }}</span>
         <span v-if="metrics.resolution && statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
@@ -1194,6 +1202,40 @@
         </v-btn>
       </div>
 
+      <!-- FR-135 R2 — and a page with no picture keeps saying why while the
+           watchdog re-creates the session. With the words only on the connected
+           stage, every redial read "Connection lost", which is false (the device
+           answered) and, from the fourth attempt, lasts minutes. -->
+      <div
+        v-else-if="noPictureWhileRedialling"
+        class="empty-state"
+        :data-testid="noPictureWhileRedialling.testId"
+      >
+        <v-icon size="72" :color="noPictureWhileRedialling.iconColor">mdi-video-off</v-icon>
+        <p class="text-body-1 mt-3">{{ noPictureWhileRedialling.title }}</p>
+        <p v-if="noPictureWhileRedialling.body" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
+          {{ noPictureWhileRedialling.body }}
+        </p>
+        <p v-if="noPictureWhileRedialling.code" class="text-caption text-medium-emphasis mt-2">
+          Reported by the device as
+          <code>{{ noPictureWhileRedialling.code }}</code>.
+          <span v-if="noPictureWhileRedialling.detail">{{ noPictureWhileRedialling.detail }}</span>
+        </p>
+        <p class="text-caption text-medium-emphasis mt-2">
+          <template v-if="rc.phase.value === 'reconnecting'">
+            Trying again by itself (attempt {{ rc.reconnectAttempt.value }})…
+          </template>
+          <template v-else>{{ phaseLabel }}</template>
+        </p>
+        <p v-if="agent && !agent.is_online" class="text-caption text-warning">
+          The device currently reports offline — retries continue until it
+          returns.
+        </p>
+        <v-btn variant="tonal" size="small" class="mt-3" @click="leave()">
+          Cancel
+        </v-btn>
+      </div>
+
       <div
         v-else-if="['requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value)"
         class="empty-state"
@@ -1395,6 +1437,25 @@
           <p v-if="mediaWaitingCopy(rc.mediaWaiting.value.for).showsDeadline" class="text-caption text-medium-emphasis mt-2">
             If nobody answers, the request ends at {{ mediaWaitingEnds }}.
           </p>
+        </div>
+        <!-- FR-135 R2 — the device said why it stopped its video, or it said
+             nothing and no picture ever came, and the page knows what it was
+             promised. Before this the page stayed black and re-created the
+             session every 10 s, with the reason only in the host's log. The
+             stage above carries the same words through the re-create. -->
+        <div v-else-if="noPicture" class="no-media-overlay" :data-testid="noPicture.testId">
+          <v-icon size="72" :color="noPicture.iconColor">mdi-video-off</v-icon>
+          <p class="text-body-1 mt-3">{{ noPicture.title }}</p>
+          <p v-if="noPicture.body" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
+            {{ noPicture.body }}
+          </p>
+          <p v-if="noPicture.code" class="text-caption text-medium-emphasis mt-2">
+            Reported by the device as
+            <code>{{ noPicture.code }}</code>.
+            <span v-if="noPicture.detail">{{ noPicture.detail }}</span>
+          </p>
+          <!-- An external session takes no retry: the watchdog ends it instead. -->
+          <p v-if="!isExternal" class="text-caption text-medium-emphasis mt-1">This page keeps trying.</p>
         </div>
         <div v-else-if="!rc.hasMedia.value" class="no-media-overlay">
           <v-icon size="72" color="grey-lighten-1">mdi-video-off</v-icon>
@@ -2587,6 +2648,7 @@ import {
   frameRateSummary,
   type FrameRate,
 } from '@/composables/frameRate'
+import { describeMediaStep, mediaLadderLabel, noPictureWords } from '@/composables/mediaPlan'
 import { featureRefusal, summarizeRefusals } from '@/composables/useSessionFeatures'
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
@@ -4808,6 +4870,8 @@ const statsBitrateLabel = computed(() => {
 /** FR-93 P2 — which Linux arm captures this session, and whether anyone at
  *  the screen was asked. `''` (no pill) for Windows, macOS and older agents. */
 const statsCaptureLabel = computed(() => captureArmLabel(rc.videoInfo.value))
+const statsLadderLabel = computed(() => mediaLadderLabel(rc.mediaPlan.value?.ladder ?? []))
+const statsLadderTitle = computed(() => (rc.mediaPlan.value?.ladder ?? []).map(describeMediaStep).join('\n'))
 const statsAgeLabel = computed(() => {
   const age = rc.decodeDiag.value?.age
   if (!age || age.n <= 0) return ''
@@ -5126,6 +5190,15 @@ const asleepWhileRedialling = computed(() => {
   if (w?.for !== 'host_sleep') return null
   return ['reconnecting', 'requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value) ? w : null
 })
+// FR-135 R2 — what this page says about having no picture, on the connected stage
+// and through a redial. The composable keeps it across a re-create, and the first
+// frame ends it.
+const noPicture = computed(() =>
+  noPictureWords(rc.mediaStop.value, rc.mediaSilent.value, rc.mediaPlan.value, rc.mediaDataArrived.value),
+)
+const noPictureWhileRedialling = computed(() =>
+  ['reconnecting', 'requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value) ? noPicture.value : null,
+)
 const mediaWaitingEnds = computed(() => {
   const w = rc.mediaWaiting.value
   return w ? new Date(w.deadlineMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''

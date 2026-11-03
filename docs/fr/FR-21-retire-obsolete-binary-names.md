@@ -47,7 +47,7 @@ the field is still on the old segment, silently, at the next update:
 |---|---|---|
 | `OLD_APP = "roomler-agent"` | `crates/agent-core/src/appdirs.rs:40` | a pre-rename host's enrolled `config.toml` is orphaned — the device drops off the mesh and re-enrolls as a stranger |
 | `LEGACY_SERVICE_NAME = "RoomlerAgentService"` | `agents/roomlerd/src/win_service/mod.rs:84` | the takeover install cannot find the running service to retire; two services, or none |
-| `LEGACY_TASK_NAME = "RoomlerAgent"` | `agents/roomlerd/src/service.rs:394` | the pre-rename scheduled task survives forever → two daemons |
+| `LEGACY_TASK_NAME = "RoomlerAgent"` | `agents/roomlerd/src/service.rs:402` | the pre-rename scheduled task survives forever → two daemons |
 | legacy log prefix `roomler-agent.log` | `crates/agent-core/src/logging.rs:315,312,440`; `agents/roomlerd/src/logs_fetch.rs:56` | `rc:logs-fetch` returns "no log file" on an upgraded host that has not rolled yet |
 | `LEGACY_INSTALL_FOLDER_NAME = "roomler-agent"` | `agents/roomlerd/src/updater.rs:369` | the vacated install dir is never swept |
 | `%h/.config/roomler-agent` in `ReadWritePaths` | `agents/roomlerd/packaging/linux/roomler.service:44` | systemd denies the daemon its own legacy tree mid-migration |
@@ -143,7 +143,7 @@ Anything a deployed host — or a deployed *operator runbook* — already depend
   people's shell history.
 - residual on-disk paths not yet behind `appdirs` (§5).
 - the HTTP `user_agent("roomler-agent/…")` sent by the updater
-  (`agents/roomlerd/src/updater.rs:717,800,1002`). It is **recorded** into device/session
+  (`agents/roomlerd/src/updater.rs:718,800,1002`). It is **recorded** into device/session
   telemetry at `crates/api/src/ws/handler.rs:69` — confirm nothing *dispatches* on it before
   changing it, because changing it also changes what historical rows mean.
 
@@ -168,13 +168,13 @@ const OLD_APP: &str = "roomler-agent";
 **The RC console's "open staging folder" affordance points at a path that does not exist on a
 fresh install.**
 
-`ui/src/views/remote/RemoteControl.vue:1925` hardcodes:
+`ui/src/views/remote/RemoteControl.vue:1986` hardcodes:
 
 ```js
 const STAGING_PATH = 'C:\\ProgramData\\roomler\\roomler-agent\\staging'
 ```
 
-But `appdirs::machine_global_dir()` (`crates/agent-core/src/appdirs.rs:73-92`) resolves
+But `appdirs::machine_global_dir()` (`crates/agent-core/src/appdirs.rs:205`) resolves
 `%PROGRAMDATA%\roomler\<segment>`, where `<segment>` is `NEW_APP = "roomler"` unless a pre-rename
 tree is present:
 
@@ -188,7 +188,7 @@ So the hardcoded path is correct **only** on a perMachine host that still carrie
 tree, and wrong on every fresh perMachine install — where the real directory is
 `C:\ProgramData\roomler\roomler\staging`.
 
-And unlike the per-user trees, `migrate_legacy_trees` (`appdirs.rs:133-175`) walks the three
+And unlike the per-user trees, `migrate_legacy_trees` (`appdirs.rs:253-295`) walks the three
 `ProjectDirs` paths **only** — it never touches the machine-global tree — so the split is
 permanent, not transitional.
 
@@ -487,7 +487,7 @@ whole of it.
 
 - **Published GitHub release assets.** Already-published names are immutable. The updater's
   pickers key on extension + arch + the `-permachine-` infix, **not** on the `roomler-agent-`
-  prefix (`agents/roomlerd/src/updater.rs:414-484`) — verified, not assumed. This is why P2
+  prefix (`agents/roomlerd/src/updater.rs:414-485`) — verified, not assumed. This is why P2
   is low-risk and why no asset rename is forced.
 - The `ROOMLER__` **server** config prefix — a different product surface, not a retired name.
 - `roomler-setup`'s own naming, including the UAC lib-naming rule (`wizard_app` / `wizard_shared`

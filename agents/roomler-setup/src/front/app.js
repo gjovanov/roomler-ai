@@ -58,14 +58,16 @@ const ROLE_COPY = {
       label: "This user only",
     },
   },
+  // FR-129 C1: "recommended" marks the card the Welcome page preselects on a
+  // machine with nothing installed (role::default_role), on every OS.
   linux: {
     "daemon-system": {
-      title: "Be accessed — system service (root, recommended for servers)",
+      title: "Be accessed — system service (root, recommended)",
       desc: "The root roomlerd service: on at boot before anyone signs in, the private network over its own TUN interface, updates installed by itself. Shows the desktop of whoever is signed in. Asks for your password once.",
       label: "System service (root)",
     },
     "daemon-user": {
-      title: "Be accessed — this user only (recommended for a desktop)",
+      title: "Be accessed — this user only",
       desc: "A service in your own session: screen sharing and the private network through a userspace stack, no root daemon. Asks for your password once, to place the package.",
       label: "This user only",
     },
@@ -74,7 +76,7 @@ const ROLE_COPY = {
     // FR-129 B2: the per-user half, and — with "Join the overlay network"
     // ticked, the default — the root half beside it, a second device.
     "daemon-user": {
-      title: "Be accessed — this Mac",
+      title: "Be accessed — this Mac (recommended)",
       desc: "Screen sharing and remote control in your session, and the private network in a root service beside it, so this Mac joins as two devices. Asks for your password once. Untick “Join the overlay network” under Advanced options for screen sharing only.",
       label: "This Mac",
     },
@@ -124,6 +126,9 @@ const state = {
   systemContextNeedsElevation: false, // #3116: a limited wizard on a device
                        // whose pre-logon service config it cannot write (a
                        // reinstall); from cmd_system_context_needs_elevation
+  relaunchNote: null,  // FR-129 C3: the line under "Restart as administrator"
+                       // (waiting, cancelled, or why it failed)
+  relaunchBusy: false, // FR-129 C3: the UAC prompt is up
   diagOptIn: false,    // FR-102 P3b: the Welcome page's diagnostics box.
                        // Memory only — deliberately NOT in the persisted
                        // WizardState and never defaulted from an earlier
@@ -172,26 +177,57 @@ let installRows = new Map();
 async function init() {
   wireGlobalListeners();
   await loadPersistedState();
+  await applyLaunchOptions();
   await probeAndRender();
 }
+
+// FR-129 C1 — which persisted steps a new launch resumes: a run killed on the
+// Server or the Token page, with its role and device name. Any other step —
+// Welcome, an install that was interrupted or that finished — starts a new
+// run at Welcome with no role and the default device name, so the role the
+// detection recommends is preselected there and a test run's name is never
+// reused. (The field case: a finished tunnel-client run's state preselected
+// the tunnel card and its device name on the operator's own machine.)
+const RESUMABLE_STEPS = ["server", "token"];
 
 async function loadPersistedState() {
   try {
     const persisted = await invoke("cmd_load_state");
-    // Unknown / stale role strings re-prompt the picker on resume.
-    state.role = ROLES.includes(persisted.role) ? persisted.role : null;
+    // The server is the person's setting, not a run's: always kept.
     state.server = persisted.serverUrl ?? "";
-    state.device = persisted.deviceName ?? "";
-    // Step "install" or "done" on relaunch means the previous install
-    // was either interrupted or successful; either way, dump the
-    // operator back at Welcome so they can re-detect and decide.
-    if (persisted.step === "install" || persisted.step === "done") {
-      state.step = "welcome";
+    // Unknown / stale role strings re-prompt the picker on resume.
+    const role = ROLES.includes(persisted.role) ? persisted.role : null;
+    if (RESUMABLE_STEPS.includes(persisted.step) && role !== null) {
+      state.step = persisted.step;
+      state.role = role;
+      state.device = persisted.deviceName ?? "";
     } else {
-      state.step = STEPS.includes(persisted.step) ? persisted.step : "welcome";
+      state.step = "welcome";
+      state.role = null;
+      state.device = "";
     }
   } catch (err) {
     console.warn("load wizard state failed:", err);
+  }
+}
+
+// FR-129 C3 — what this run was started with. "Restart as administrator"
+// hands the elevated copy the role the person had picked (and the server,
+// when it was not the default): it opens on Welcome with that role, which
+// wins over the detected default and still has to pass the Continue gate.
+async function applyLaunchOptions() {
+  let launch;
+  try {
+    launch = await invoke("cmd_launch_options");
+  } catch (err) {
+    console.warn("launch options not read:", err);
+    return;
+  }
+  if (!launch) return;
+  if (typeof launch.server === "string" && launch.server) state.server = launch.server;
+  if (ROLES.includes(launch.role)) {
+    state.role = launch.role;
+    state.step = "welcome";
   }
 }
 
@@ -232,6 +268,8 @@ async function probeAndRender() {
       agent: {
         supported: false, kind: "clean", peruserVersion: null, permachineVersion: null, ambiguous: false,
         os: "other", daemonRoles: [], featuresServer: null, daemonOffered: false,
+        // FR-129 C1: nothing is known, so nothing is preselected.
+        defaultRole: null,
       },
       tunnel: { installed: false, machineName: null, configPath: null },
     };
@@ -246,15 +284,50 @@ async function probeAndRender() {
   } catch (err) {
     console.warn("elevation probe failed:", err);
   }
-  if (state.detection.agent.featuresServer) {
-    state.features = {
-      server: state.detection.agent.featuresServer,
-      daemonOffered: state.detection.agent.daemonOffered === true,
-    };
-  }
+  applyDetectedFeatures();
 
   state.pageEnteredAt = performance.now();
   render();
+}
+
+function applyDetectedFeatures() {
+  const a = state.detection.agent;
+  if (a.featuresServer) {
+    state.features = {
+      server: a.featuresServer,
+      daemonOffered: a.daemonOffered === true,
+      answered: a.featuresAnswered !== false,
+    };
+  }
+}
+
+// FR-129 C — "could not ask" is not "switched off". A clean Linux or macOS
+// machine behind a TLS-inspecting box fails the question, so while the server
+// has not answered Rust preselects nothing and this page keeps asking: the
+// daemon cards appear when it answers, without a restart of the wizard.
+const FEATURES_RETRY_MS = 10_000;
+let detectionRetry = null;
+
+function keepAskingWhileUnanswered() {
+  const a = state.detection && state.detection.agent;
+  if (detectionRetry !== null || !a || a.featuresAnswered !== false) return;
+  detectionRetry = setTimeout(async () => {
+    detectionRetry = null;
+    if (state.step !== "welcome") return;
+    const server = state.server;
+    try {
+      const detection = await invoke("cmd_detect_install", { server });
+      if (server === state.server && state.step === "welcome") {
+        state.detection = detection;
+        applyDetectedFeatures();
+        renderWelcome();
+        return;
+      }
+    } catch (err) {
+      console.warn("[features] asked again, not read:", err);
+    }
+    keepAskingWhileUnanswered();
+  }, FEATURES_RETRY_MS);
 }
 
 function wireGlobalListeners() {
@@ -476,10 +549,13 @@ function wireWelcome() {
   document.getElementById("diag-opt-in").addEventListener("change", async (e) => {
     await setDiagOptIn(e.target.checked);
   });
+  // FR-129 C3 — #3116's note can now do what it asks for.
+  document.getElementById("elevation-relaunch").addEventListener("click", relaunchElevated);
   document.querySelectorAll("input[name='role']").forEach((radio) => {
     radio.addEventListener("change", (e) => {
       state.role = e.target.value;
       state.roleAck = false;
+      state.relaunchNote = null;
       document.getElementById("cross-flavour-ack").checked = false;
       // Role change invalidates any previous token introspection (the
       // audience gate depends on the role) — and any pairing, whose token
@@ -539,6 +615,15 @@ function renderWelcome() {
   // (copy per OS), and on Linux/macOS the server says whether they may be
   // shown at all. Off, only the tunnel-client card makes sense.
   const offered = new Set(a.supported ? (a.daemonRoles ?? []) : []);
+  // FR-129 C — every OS has the tunnel card, unless this run must not offer it
+  // (Rust's roleLimit; an unknown or absent answer leaves it shown).
+  const tunnelOffered = a.tunnelOffered !== false;
+  if (tunnelOffered) offered.add("tunnel-client");
+  document.getElementById("role-card-tunnel").hidden = !tunnelOffered;
+  const limitNote = document.getElementById("role-limit-note");
+  const limitText = ROLE_LIMIT_NOTE[a.roleLimit] ?? null;
+  limitNote.hidden = limitText === null;
+  limitNote.textContent = limitText ?? "";
   const copy = ROLE_COPY[state.os] ?? ROLE_COPY.windows;
   document.querySelectorAll("label.role-daemon").forEach((card) => {
     const role = card.dataset.role;
@@ -554,15 +639,21 @@ function renderWelcome() {
   if (!a.supported) {
     note.textContent = platformNote(a);
   }
-  if (state.role && state.role !== "tunnel-client" && !offered.has(state.role)) {
+  if (state.role && !offered.has(state.role)) {
     state.role = null;
+  }
+  // FR-129 C1 — nothing picked yet: preselect the role Rust recommends (the
+  // background service on a machine with nothing installed, the installed
+  // flavour otherwise) when this page offers it. Not persisted: a click
+  // persists, as before, and Continue persists whatever is selected.
+  if (state.role === null && isOfferedRole(a.defaultRole, offered)) {
+    state.role = a.defaultRole;
   }
 
   // Restore radio selection.
-  if (state.role) {
-    const radio = document.querySelector(`input[name='role'][value='${state.role}']`);
-    if (radio) radio.checked = true;
-  }
+  document.querySelectorAll("input[name='role']").forEach((radio) => {
+    radio.checked = radio.value === state.role;
+  });
 
   // Cross-flavour warning gate (daemon roles only) — BLOCKER-7 of
   // the rc.28 plan critique, relocated from the agent wizard.
@@ -581,6 +672,12 @@ function renderWelcome() {
   // the enroll has spent the token.
   const needsElevation = needsElevatedWizard(state.role);
   document.getElementById("elevation-note").hidden = !needsElevation;
+  // FR-129 C3 — the note's own way out: the button sits inside the note, so
+  // it shows exactly when the note does; its line says how the last try went.
+  document.getElementById("elevation-relaunch").disabled = state.relaunchBusy;
+  const relaunchStatus = document.getElementById("elevation-relaunch-status");
+  relaunchStatus.hidden = !state.relaunchNote;
+  relaunchStatus.textContent = state.relaunchNote ?? "";
 
   // Continue button gate.
   const canContinue =
@@ -592,6 +689,7 @@ function renderWelcome() {
   // enrollment goes to, as the Server page currently has it.
   document.getElementById("diag-opt-in").checked = state.diagOptIn;
   document.getElementById("diag-server").textContent = state.server || "https://roomler.ai";
+  keepAskingWhileUnanswered();
 }
 
 // #3116 — does `role` need a wizard that runs as administrator, which this one
@@ -600,6 +698,48 @@ function renderWelcome() {
 // reinstall finds. A fresh install still works from a double-click.
 function needsElevatedWizard(role) {
   return role === "daemon-system" && state.systemContextNeedsElevation === true;
+}
+
+// FR-129 C1 — may `role` be preselected on this page? A role the SPA knows,
+// and one of the cards shown.
+function isOfferedRole(role, offered) {
+  return ROLES.includes(role) && offered.has(role);
+}
+
+// FR-129 C — why this run shows fewer cards than the OS has.
+const ROLE_LIMIT_NOTE = {
+  "another-account":
+    "You approved this with another account's password, so this window runs as that account. It can install the background service for the whole computer and nothing else, because anything else would go into that account's profile. To install for your own account, close this window and open Roomler Setup again.",
+  "no-elevation":
+    "This computer's policy refuses administrator prompts for your account, so only what needs none is shown. For the background service, which also works before anyone signs in, ask your administrator to install it.",
+};
+
+// FR-129 C3 — "Restart as administrator": Rust starts this wizard again
+// through Windows' administrator prompt (one UAC prompt), with the role the
+// person picked, and this copy exits once the elevated one has started. A
+// declined prompt leaves this window as it was, with one line saying so.
+async function relaunchElevated() {
+  if (state.relaunchBusy || !state.role) return;
+  state.relaunchBusy = true;
+  state.relaunchNote = "Waiting for you to approve the administrator prompt…";
+  renderWelcome();
+  let view;
+  try {
+    view = await invoke("cmd_relaunch_elevated", { role: state.role, server: state.server });
+  } catch (err) {
+    view = { kind: "failed", message: String(err) };
+  }
+  state.relaunchBusy = false;
+  if (view && view.kind === "started") {
+    state.relaunchBusy = true; // this window is closing
+    state.relaunchNote = "Roomler Setup is starting again as administrator…";
+  } else if (view && view.kind === "cancelled") {
+    state.relaunchNote = "The administrator prompt was cancelled; Roomler Setup is still running without administrator rights.";
+  } else {
+    const reason = ((view && view.message) || "no reason given").replace(/[.\s]+$/, "");
+    state.relaunchNote = `Could not restart as administrator: ${reason}. You can close Roomler Setup, then right-click it and choose Run as administrator.`;
+  }
+  renderWelcome();
 }
 
 // FR-129 B1 — why no daemon card is shown, in the person's terms. On Linux
@@ -611,6 +751,10 @@ function platformNote(a) {
   if (os === "linux" || os === "macos") {
     const server = a.featuresServer ?? state.server;
     const shown = (server || "").replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+    // FR-129 C — nobody said so: the question did not get an answer.
+    if (a.featuresAnswered === false) {
+      return `Could not reach ${shown || "the server"} to ask what it offers, so the daemon options are not shown yet. Still trying; they appear when it answers. A network or proxy that blocks it will keep them hidden.`;
+    }
     return `${shown || "This server"} does not offer the daemon install from this wizard on ${os === "linux" ? "Linux" : "macOS"} yet (or it is an older server). This wizard can set up the tunnel client here; for the daemon, run in a terminal: curl -fsSL ${server.replace(/\/+$/, "")}/api/setup/install.sh | sh -s -- --role daemon`;
   }
   return "This platform supports the tunnel client only.";
@@ -693,17 +837,27 @@ async function refreshFeatures() {
   if (!isUnix() || !state.role || state.role === "tunnel-client") return;
   const server = state.server;
   if (!/^https?:\/\/[^\s]+$/i.test(server)) return;
-  if (state.features && state.features.server === server) return;
+  if (state.features && state.features.server === server && state.features.answered !== false) return;
   let view;
   try {
     view = await invoke("cmd_setup_features", { server });
   } catch (err) {
     console.warn("[features] not read:", err);
-    view = { daemonOffered: false };
+    view = { daemonOffered: false, answered: false };
   }
   if (server !== state.server) return;
-  state.features = { server, daemonOffered: view.daemonOffered === true };
+  state.features = { server, daemonOffered: view.daemonOffered === true, answered: view.answered !== false };
   renderServer();
+}
+
+// FR-129 C — a question that got no answer is asked again while this page is up.
+let featuresRetry = null;
+function askAgainSoon() {
+  if (featuresRetry !== null) return;
+  featuresRetry = setTimeout(() => {
+    featuresRetry = null;
+    if (state.step === "server") refreshFeatures();
+  }, FEATURES_RETRY_MS);
 }
 
 function renderServer() {
@@ -713,15 +867,19 @@ function renderServer() {
   // FR-129 B1: on Linux/macOS a daemon role needs this server's say-so.
   const note = document.getElementById("server-features-note");
   const daemonOnUnix = isUnix() && state.role && state.role !== "tunnel-client";
-  const refused = daemonOnUnix && state.features
-    && state.features.server === state.server && !state.features.daemonOffered;
-  const unknown = daemonOnUnix && (!state.features || state.features.server !== state.server);
-  note.hidden = !refused;
+  const asked = daemonOnUnix && state.features && state.features.server === state.server;
+  const unanswered = asked && state.features.answered === false;
+  const refused = asked && !unanswered && !state.features.daemonOffered;
+  const unknown = daemonOnUnix && !asked;
+  note.hidden = !(refused || unanswered);
+  const shown = state.server.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
   if (refused) {
-    const shown = state.server.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
     note.textContent = `${shown} does not offer the daemon install from this wizard on ${state.os === "linux" ? "Linux" : "macOS"} (its setup features say so, or it is an older server). Choose another server, or go back and pick the tunnel client.`;
+  } else if (unanswered) {
+    note.textContent = `Could not reach ${shown} to ask whether it offers the daemon install here. Still trying; a network or proxy that blocks it will keep this page from going on. Choose another server, or go back and pick the tunnel client.`;
+    askAgainSoon();
   }
-  if (refused || unknown) valid = false;
+  if (refused || unanswered || unknown) valid = false;
   document.getElementById("server-continue").disabled = !valid;
   // S2: the advanced section holds daemon config keys — meaningless for
   // the tunnel-client role.
@@ -874,11 +1032,13 @@ function renderToken() {
   // The paste path's role-specific hint (the whole page's lead before
   // FR-129; now the line under "I already have a token").
   const rootHalf = wantsRootHalf();
+  // FR-129 C1: the dashboard's own names (Devices → Enroll → Device or
+  // Tunnel client); the daemon is never called an agent here.
   document.getElementById("paste-lead").textContent = state.role === "tunnel-client"
-    ? "Paste a tunnel-enrollment token from Admin → Tunnels."
+    ? "Paste a tunnel-enrollment token from the dashboard's Devices → Enroll → Tunnel client."
     : rootHalf
-      ? "Paste two fresh enrollment tokens from Admin → Agents: one for this Mac's screen, one for its private network."
-      : "Paste a fresh enrollment token from Admin → Agents.";
+      ? "Paste two fresh enrollment tokens from the dashboard's Devices → Enroll → Device: one for this Mac's screen, one for its private network."
+      : "Paste a fresh enrollment token from the dashboard's Devices → Enroll → Device.";
   // FR-129 B2: the second field is the macOS root half's, shown only when
   // this install adds it.
   document.getElementById("root-token-wrap").hidden = !rootHalf;
@@ -1691,16 +1851,16 @@ function checklistLabel(event) {
   if (t === "PreflightOk") return `Pre-flight: detected ${d.existing}`;
   if (t === "PreflightWarning") return `${base}: ${d.message}`;
   if (t === "AssetResolving") return `Resolving download URL (${d.artifact})`;
-  if (t === "AssetResolved") return `Resolved tag ${d.tag} (${(d.sizeBytes / 1_000_000).toFixed(1)} MB)`;
+  if (t === "AssetResolved") return `Resolved ${releaseLabel(d.tag)} (${(d.sizeBytes / 1_000_000).toFixed(1)} MB)`;
   if (t === "MsiSpawned") return `Running MSI installer (PID ${d.pid})`;
   if (t === "MsiCompleted") return `MSI installer finished (exit ${d.code}, ${d.decoded})`;
   if (t === "ExtractDone") return `Extracted. Binary at ${d.tunnelBinary}`;
   if (t === "IntegrationDone")
     return `Integration: PATH ${d.pathUpdated ? "updated" : "unchanged"}; shortcut ${d.shortcutCreated ? "created" : "skipped"}`;
   if (t === "EnrollOk" && d.principalKind === ROOT_HALF_KIND) {
-    return `Enrolled the private network's root half (agent ${d.principalId})`;
+    return `Enrolled the private network's root half (device ${d.principalId})`;
   }
-  if (t === "EnrollOk") return `Enrolled (${d.principalKind} ${d.principalId})`;
+  if (t === "EnrollOk") return `Enrolled (${principalKindLabel(d.principalKind)} ${d.principalId})`;
   if (t === "AnchorSkipped") return `Not anchored: ${d.reason}`;
   if (t === "DaemonRestartOk" && d.pid) return `${base} (PID ${d.pid})`;
   if (t === "DaemonRestartSkipped") return `${base}: ${d.reason}`;
@@ -1714,6 +1874,28 @@ function checklistLabel(event) {
     return `${stageLabel} failed: ${d.message}${d.hint ? " — " + d.hint : ""}`;
   }
   return base;
+}
+
+// FR-129 C1 — what a person reads for a release: the product and its
+// version, never the release tag (`agent-v0.4.188`), which stays a wire
+// value — the updater, the proxies and the DoneReport all key on it.
+function releaseVersion(tag) {
+  const m = /^(?:agent|tunnel|setup)-v(.+)$/.exec(tag ?? "");
+  return m ? m[1] : (tag ?? "");
+}
+
+function releaseLabel(tag) {
+  const version = releaseVersion(tag) || "(unknown version)";
+  if (/^agent-v/.test(tag ?? "")) return `roomlerd ${version}`;
+  if (/^tunnel-v/.test(tag ?? "")) return `the roomler CLI ${version}`;
+  return version;
+}
+
+// FR-129 C1 — the EnrollOk kind for a person (the wire keeps `agent`).
+function principalKindLabel(kind) {
+  if (kind === "agent") return "device";
+  if (kind === "tunnel_client") return "tunnel client";
+  return kind ?? "";
 }
 
 // ─── Step 5: Done ──────────────────────────────────────────────────────────
@@ -1783,7 +1965,7 @@ function renderDone() {
   }
 
   document.getElementById("done-principal-label").textContent =
-    isTunnel ? "Tunnel client ID" : "Agent ID";
+    isTunnel ? "Tunnel client ID" : "Device ID";
   document.getElementById("done-principal-id").textContent =
     done.principalId ?? "(unknown — install report missing)";
   document.getElementById("done-tenant-id").textContent = done.tenantId ?? "(unknown)";
@@ -1795,7 +1977,8 @@ function renderDone() {
     document.getElementById("done-root-half-id").textContent = rootHalf.principalId;
   }
   document.getElementById("done-role").textContent = roleLabel(done.role ?? state.role);
-  document.getElementById("done-tag").textContent = done.tag ?? "(unknown)";
+  // FR-129 C1: the version, not the release tag.
+  document.getElementById("done-tag").textContent = done.tag ? releaseVersion(done.tag) : "(unknown)";
 
   // Daemon extras: the MSI flavour on Windows, the scope on Linux/macOS.
   const flavour = done.flavour ?? (isTunnel ? null : roleFlavour(state.role));

@@ -14,7 +14,7 @@ half: a Windows peer probe that starts no process.
 
 | | |
 |---|---|
-| The watch | `agents/roomlerd/src/resource_watch.rs`, started in `run_cmd` (`agents/roomlerd/src/app.rs:4393`) |
+| The watch | `agents/roomlerd/src/resource_watch.rs`, started in `run_cmd` (`agents/roomlerd/src/app.rs:4408`) |
 | Kill switch | `ROOMLERD_RESOURCE_WATCH=0` |
 | The bar | 2,000 handles on Windows, 200 descriptors on Linux and macOS (`resource_watch.rs:38`, `:40`) |
 | A lower bar, for a field test | `ROOMLERD_RESOURCE_WATCH_MIN_RISE=<n>` |
@@ -30,7 +30,7 @@ through remote configuration, and changing one takes a restart.
 Every 5 minutes it reads the count. Once an hour it logs that count. While the
 count climbs, the hourly line is a warning instead. Both go through the ordinary
 log path, so a fleet read needs no new wire: the uploader's `tracing` layer takes
-every event (`crates/agent-core/src/logs_upload.rs:128`) and `agent_logs` keeps
+every event (`crates/agent-core/src/logs_upload.rs:168`) and `agent_logs` keeps
 them for 7 days.
 
 ```mermaid
