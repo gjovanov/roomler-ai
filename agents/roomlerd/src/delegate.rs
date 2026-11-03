@@ -1211,6 +1211,19 @@ impl DelegateHost {
         })
     }
 
+    /// FR-43 P3c — the worker as the LocalAPI's `Status` reports it
+    /// ([`NodeStatus::gui_worker`](tunnel_core::localapi::NodeStatus::gui_worker)):
+    /// attached or not, the permission words the row advertises because of it
+    /// ([`Self::effective_permissions`]), and whether this daemon runs one row.
+    /// What `roomlerd one-row` verifies after its restart.
+    pub fn worker_status(&self) -> tunnel_core::localapi::GuiWorkerStatus {
+        tunnel_core::localapi::GuiWorkerStatus {
+            attached: self.inner.attached.load(Ordering::Acquire),
+            permissions: self.effective_permissions().map(|(words, _)| words),
+            one_row: self.one_row(),
+        }
+    }
+
     /// Forget the current secret — the worker it belonged to is gone.
     ///
     /// [`crate::macos_supervisor`] calls this from `stop_worker`, which takes a
