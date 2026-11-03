@@ -107,7 +107,7 @@ admin. A `PUT` for someone with no row is a 404.
 `find_one_and_update`, upsert, returning the row as it stood. `None` means this is
 their first, and the unique `{agent_id, user_id}` index arbitrates two firsts on two
 pods. It runs behind the session, in `session_opened`
-(`crates/modules/remote/src/extauth.rs:1378`), so a failure here never costs the session.
+(`crates/modules/remote/src/extauth.rs:1387`), so a failure here never costs the session.
 
 | Notice | Fires when | How often |
 |---|---|---|
@@ -116,13 +116,13 @@ pods. It runs behind the session, in `session_opened`
 
 Both go in the app and by web push to whoever holds `MANAGE_AGENTS`, and to the device's
 owner while they are a member (`people_to_tell`,
-`crates/modules/remote/src/extauth_notice.rs:51`). Nobody is told about themselves. There
+`crates/modules/remote/src/extauth_notice.rs:128`). Nobody is told about themselves. There
 is no email. The person at the machine has the prompt, which is the first line of
 defence; a notice is for the people who were not there.
 
 ⚠️ `actor` is a stranger's text, and "Alice from IT" is the classic support scam. A
 notice quotes it on one line, bounded, and words it as a claim (`quoted`,
-`extauth_notice.rs:35`). The people list shows the account id's tail beside it, because
+`extauth_notice.rs:76`). The people list shows the account id's tail beside it, because
 two accounts can carry one name.
 
 **The person at the machine is told what the server knows first**, and the name after it
@@ -235,7 +235,7 @@ bar them and change the password on the device. For guessing, rotate the connect
 | What | Where |
 |---|---|
 | The gates, the login relay, the session step | `crates/modules/remote/src/extauth.rs`: `gates` `:396`, `start` `:593`, `finish` `:775`, `open_session` `:1082` |
-| What follows a session | `session_opened`, `extauth.rs:1378` |
+| What follows a session | `session_opened`, `extauth.rs:1387` |
 | The notices | `crates/modules/remote/src/extauth_notice.rs` |
 | Gates 1 and 2, the code, the log, the people | `crates/modules/fleet/src/external_access.rs`: `decide_revocation` `:138`, `audit` `:705`, `principals` `:740`, `set_principal` `:806` |
 | Ending a person's sessions | `crates/modules/fleet/src/hub.rs:2552`, `ctrl.rs:128` |
