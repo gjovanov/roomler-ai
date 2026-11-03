@@ -1285,7 +1285,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:7016`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:7053`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -1933,7 +1933,7 @@ remote-control session is live, the daemon holds one. On the signal it tells
 each live session's controller over that session's own control channel, then
 lets go. Each session registers its control channel as it starts
 (`sleep_notice.rs:99`); the watcher (`sleep_notice.rs:534`, the rule
-`:149`) sends `peer.rs:5543`'s notice to all of them at once (`:93`):
+`:149`) sends `peer.rs:5549`'s notice to all of them at once (`:93`):
 
 ```mermaid
 sequenceDiagram
