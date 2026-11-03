@@ -2286,14 +2286,15 @@ mod sshd {
     /// holds it.
     type Asked = futures::future::BoxFuture<'static, Result<(), String>>;
 
-    /// The questions standing, by grant and activity, each with the turn it
-    /// was asked on.
-    static ASKING: std::sync::Mutex<
-        std::collections::BTreeMap<
-            (String, &'static str),
-            (u64, futures::future::WeakShared<Asked>),
-        >,
-    > = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    /// What a question is about: its grant, and the activity it names.
+    type Topic = (String, &'static str);
+
+    /// A standing question, held weakly, with the turn it was asked on.
+    type Standing = (u64, futures::future::WeakShared<Asked>);
+
+    /// The questions standing, by what each is about.
+    static ASKING: std::sync::Mutex<std::collections::BTreeMap<Topic, Standing>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
 
     /// The question about `what` under `grant`: the one standing, if another
     /// channel of the session asks it already, or a new one under an id of
@@ -2364,7 +2365,7 @@ mod sshd {
     /// question when the last channel waiting on it goes. Only its own entry:
     /// a newer question about the same thing has a turn of its own.
     struct Leave {
-        key: (String, &'static str),
+        key: Topic,
         turn: u64,
     }
 
