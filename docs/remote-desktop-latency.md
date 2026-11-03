@@ -283,6 +283,36 @@ browser with forced control to measure, which a relay-only, background-throttled
 automation tab cannot do (a background tab throttles `setTimeout` too). It is owed
 on the operator's own browser or a dedicated idle host.
 
+**2026-11-03, a real pointer: two tries, no result yet.** A headed Chromium on the
+production viewer, page visible and focused, under software compositing, with an X
+pointer moved by `xdotool` at 234 moves/s. Earlier runs through the DevTools protocol
+read nothing useful, because its acks arrive at renderer pace, so the driver itself
+followed rAF. The second try on 0.4.197:
+
+| Arm | rAF/s | Sends/s | Sends/s while input flowed | Raw events/s | Send gap p50 / p95 ms | Host load |
+|---|---|---|---|---|---|---|
+| A1, no load | 48.5 | 99.2 | 126.4 | 186.5 | 7.8 / 9.1 | 2.4-3.6 |
+| B1, compositor load | 31.7 | 94.4 | 127.3 | 176.4 | 7.8 / 9.4 | 5.2-6.7 |
+| A2, no load | 44.0 | 93.0 | 128.6 | 174.6 | 7.7 / 9.0 | 7.2-7.6 |
+| B2, compositor load | 29.6 | 100.4 | 127.0 | 186.9 | 7.8 / 9.2 | 7.4-8.9 |
+| B_heavy, compositor nearly dead | 5.1 | 90.1 | 125.2 | 166.9 | 7.7 / 8.7 | 9.0-9.6 |
+
+"While input flowed" leaves out gaps over 30 ms. Main-thread stalls, 230-380 ms each,
+took about a quarter of every arm, loaded or not, and their cause isn't known.
+
+While input flowed, sends sat at the 8 ms coalescer's ceiling of 125/s, from rAF 48
+down to rAF 5. That is what P6 claims, but **it isn't a result**, because a read counts
+only with its controls:
+
+- The second try stopped on a host-pressure limit before its controls ran. That host
+  is shared, and the pressure fell as soon as the rig stopped.
+- The first try ran every arm, on a larger window with more paint. Its busy-frame
+  control behaved: 14 sends/s, gap p50 86 ms. Its 16 ms control missed the 55-62 sends/s
+  it had to reach, at 34.7/s, though its gap p50 read 16.0 ms, so the counter does
+  follow the coalescer.
+
+AC7 stays owed. It needs an idle host, where this rig is a 5-minute run.
+
 ## 7. Config & kill-switch reference
 
 | Knob | Env | Default | Effect |
