@@ -127,6 +127,31 @@ API knows to pull.
 Neither touches TURN itself: a coturn whose Redis is down, unresolvable or
 restarting keeps relaying, and only its totals are lost.
 
+## A relay that serves only some networks (FR-76 P3)
+
+The regional PoPs serve every overlay network, and they must go on doing so,
+because some hosts on them have no carrier but DERP. A derp-relay that should
+serve only some networks, such as a tenant's own node, names them in
+`DERP_NETWORKS`: a comma-separated list of overlay network ids, each the 24
+lowercase hex characters the API mints into a ticket's `net`.
+
+| `DERP_NETWORKS` | derp-relay |
+|---|---|
+| unset | serves every network, exactly as before. Every regional PoP runs this way |
+| `6a54…,6a55…` | serves only those networks. A valid ticket for any other is answered `403` at the upgrade, before anything is registered. The node logs `refused a valid ticket for a network this relay does not serve` with the ticket's network, its own networks and a running total, at most once per network per 10 s |
+| set but empty, or anything but such ids | refuses to start, with an error that names the variable. A node that cannot read its scope serves nobody, and the operator sees it at deploy time |
+
+The match is exact: a prefix of a served id, a longer id or the same id in
+capitals is another network. A scoped relay logs
+`serving only the overlay networks DERP_NETWORKS names`, with its list, at
+start. An unscoped relay logs nothing new.
+
+⚠️ `docker-compose.pop.yml` does not pass `DERP_NETWORKS`, and it must never
+pass it as `${DERP_NETWORKS:-}`, the way it passes `TURN_STATS_REDIS`. Compose
+would then hand every regional PoP an empty value, and an empty value refuses to
+start. A node that serves some networks writes the list as a literal in its own
+`derp-relay` environment.
+
 ## Rollback
 
 A misbehaving region: set its spec `"enabled": false` (or drop it) and

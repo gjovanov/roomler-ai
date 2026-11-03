@@ -438,6 +438,42 @@ pub async fn renumber(
     let network_id = network
         .id
         .ok_or_else(|| ApiError::Internal("overlay network missing _id".into()))?;
+
+    // --- Gate 0: a GROWN network is refused outright (FR-68 AC4) ----------
+    // A network whose address space grew (FR-47 P5c) holds two or more
+    // assigned blocks, and this route is single-block-shaped end to end: it
+    // reads ONE assigned block, quarantines it, allocates a replacement at
+    // position 0 and plans every node out of `network.cidr` — block 0 alone.
+    // Against a grown network that leaves a block it never looked at still
+    // assigned beside the new one, at position 0 if that one was quarantined
+    // (two blocks at one position; `seq` exists precisely so the ordinal
+    // space never has a tie), and nodes addressed in block 1 planned as if
+    // they had no ordinal at all. Refuse before anything is touched — the
+    // dry run included, since a plan rendered from block 0 would be wrong in
+    // the same way. A multi-block renumber must retire every block and
+    // re-plan across the list; that belongs to FR-47's reconciler.
+    let assigned = state
+        .overlay_networks
+        .blocks()
+        .find_assigned_for_network_ordered(network_id)
+        .await?;
+    if assigned.len() > 1 {
+        return Err(ApiError::BadRequest(format!(
+            "this network's address space has grown to {} blocks ({}); renumber handles a \
+             single-block network only — against a grown one it would retire one block, \
+             allocate a replacement at position 0 and leave two blocks at that position, \
+             silently re-pointing every ordinal above it. A multi-block renumber must \
+             retire every block and re-plan across them, which this endpoint does not do \
+             (FR-68 AC4; the structural fix is FR-47's reconciler)",
+            assigned.len(),
+            assigned
+                .iter()
+                .map(|b| b.cidr.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
     let nodes = state
         .overlay_nodes
         .list_active_in_network(tid, network_id)

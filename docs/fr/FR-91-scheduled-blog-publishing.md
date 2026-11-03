@@ -1,7 +1,8 @@
 # FR-91: Scheduled blog publishing — a post goes live without rolling `roomler2`
 
-**Issue:** [#1880](https://github.com/gjovanov/roomler-ai/issues/1880) · **Status:** proposed 2026-10-09
-— spec and claim · **Owner:** web / public site + deploy · **Anchors:** master `251abb731` ·
+**Issue:** [#1880](https://github.com/gjovanov/roomler-ai/issues/1880) · **Status:** P0–P2 live since
+2026-10-09; P2b, P3 + P4 merged 2026-11-02 and on production, the blog's copy of the carry at the
+publisher's next release · **Owner:** web / public site + deploy · **Anchors:** master `507f1398e` ·
 **Builds on:** [FR-87](FR-87-blog-and-google-indexing.md) (the blog, its gates, IndexNow),
 [FR-60](FR-60-public-docs-site.md) (the generator), [FR-88](FR-88-promotion-attribution-and-site-video.md)
 (attribution, `INSTALL_PAGES`), [FR-73](FR-73-image-build-on-github.md) (the image pipeline)
@@ -28,7 +29,7 @@ This FR gives the blog its own publishing lane:
 What gets published, when, and how it is written is not engineering. A private publisher drives the
 lane, and it is out of scope here, as FR-39 requires for campaign material.
 
-## 2. Evidence (master `251abb731`, 2026-10-09)
+## 2. Evidence (master `507f1398e`, 2026-10-09)
 
 | What | Where | Consequence |
 |---|---|---|
@@ -92,6 +93,9 @@ Headers and caching are byte-identical to the pod nginx:
 - `error_page 404 /blog/404.html`.
 - The Atom content type on `/blog/feed.xml`.
 
+**As built (P2):** there is no initContainer. The mirror sidecar fills the `emptyDir`, polling `current`
+every 15 s, and a readiness probe on `/blog/` holds an empty pod out of the Service.
+
 ### 3c. Routing at the edge
 
 The mars edge vhost for roomler.ai gains `location ^~ /blog/` and `location = /sitemap-blog.xml`,
@@ -103,7 +107,10 @@ pointing at an upstream of the `roomler-blog` NodePort. Everything else (`/`, `/
 - It carries `/ws` and `/derp` for the whole fleet, so every edit is `nginx -t` → reload → re-check
   `/ws`, `/derp`, `/health` and a remote-desktop connect (AC9).
 
-**Kill switch:** delete the two locations. The image's own `/blog/`, as of its last build, serves again.
+**As built (P2):** three locations. `= /blog` went to the lane too, because `roomler2` answered it with an
+absolute 301.
+
+**Kill switch:** delete the locations. The image's own `/blog/`, as of its last build, serves again.
 
 While the lane is on, the sitemap index lists `sitemap-blog.xml` **without** `lastmod` (`build.ts:885-891`):
 - the image no longer knows the blog's newest date, and a stale one is worse than none;
@@ -123,7 +130,7 @@ sequenceDiagram
     P->>M: put releases/<id>/** then current = <id>
     M-->>N: sidecar mirrors <id>, swaps the symlink
     P->>E: GET /blog/<slug>/ signed out: 200, canonical, headers == /docs/
-    P->>P: indexnow.sh changed + submit (200/202)
+    P->>P: POST the post's URLs to IndexNow (200/202)
     P->>P: later: PR adding the post to ui/blog/posts/ (the archive)
 ```
 
@@ -147,40 +154,97 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
 - `GET /api/admin/stats/attribution` gains a `landing_path` breakdown limited to `/blog/` prefixes.
 - Carry-only and storage-free, under FR-88's rules and its `ATTRIBUTION_ENABLED` switch.
 
+**As built (P3).** Reading the code turned up four things this section did not say:
+
+- **The rule is on where the journey began, not the page it has reached.** "The page is under `/blog/`"
+  covers the first page only, and a reader who went from a post to an install guide would have lost the
+  journey at the guide's own sign-up link. So `landing_path` and `referrer_host` come from the URL when an
+  earlier page carried them, as they do for a campaign, and from this page otherwise.
+- **The client change is two files.** `attribution.js` alone would have put the keys on the links and lost
+  them in the register view, whose `carriedQuery` was empty without a campaign. `ui/src/utils/attribution.ts`
+  applies the same rule, and `docs/__tests__/attribution.spec.ts` runs the two on the same visits.
+- **The privacy policy described this storage for campaign links only**, so its section 2.16 changed in the
+  same PR.
+- **FR-102 came after this spec** and reads the same field. Its funnel (`by=landing_path`, `by=channel`) and
+  its Content tab gain the organic rows with no code change, and their two notes that said "until FR-91 P3"
+  are rewritten. The funnel's `landing_path` breakdown covers every path; `by_landing_path` stays limited
+  to the blog, and says which post brought a sign-up.
+
 ## 4. Phases
 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
-| P0 | Claim: issue #1880, this spec, the ledger row | Docs only | this PR |
-| P1 | `--blog-only` + the second `AssetEmitter`, `installCopy`, the sitemap-index change behind `BLOG_LANE` in `site.ts`, `files/security-headers.conf`, `public-site-smoke.sh --blog` (compares `/blog/` headers with `/docs/`), tests | `--blog-only` not passed ⇒ output identical to today; `BLOG_LANE = false` | PR open #1883 |
-| P2 | The deploy repo: `roomler-blog` Deployment + Service, bucket + scoped users, the edge vhost committed and then routed; one promote for P1 | Remove the two edge locations | — |
-| P3 | §3e: the organic carry and the admin breakdown | `ATTRIBUTION_ENABLED` (existing) | — |
-| P4 | Docs: `docs/public-site.md` gains "Publishing without a roll" (the sequence above, the edge flowchart, the kill switch); `docs/README.md` row; the field log | — | — |
+| P0 | Claim: issue #1880, this spec, the ledger row | Docs only | **merged** #1881 `059562818` |
+| P1 | `--blog-only` + the second `AssetEmitter`, `installCopy`, the sitemap-index change behind `BLOG_LANE` in `site.ts`, `files/security-headers.conf`, `public-site-smoke.sh --blog` (compares `/blog/` headers with `/docs/`), tests | `--blog-only` not passed ⇒ output identical to today; `BLOG_LANE = false` | **merged** #1883 `19a8d11c4`, verified before merge |
+| P2 | The deploy repo: `roomler-blog` Deployment + Service, bucket + scoped users, the edge vhost committed and then routed; one promote for P1 | Remove the three edge locations | **live** roomler-ai-deploy#19 `5b4e5d7`, field-verified 2026-10-09 |
+| P2b | `BLOG_LANE = true`, which P1 held back until the edge was routed and P2 did not flip | `BLOG_LANE = false` | **live** #3205 `be06c7070`, `hosted-20261102-be06c70`, GREEN 2026-11-02 (§8) |
+| P3 | §3e: the organic carry and the admin breakdown | `ATTRIBUTION_ENABLED` (existing) | **merged** #3205 `be06c7070`; the image is live, the blog's copy follows at the publisher's next release (§8) |
+| P4 | Docs: `docs/public-site.md` gains "Publishing without a roll" (the sequence above, the edge flowchart, the kill switch); `docs/README.md` row; the field log | — | **merged** #3205 `be06c7070` |
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1:** for the existing post, `--blog-only` output matches the image's `/blog/**` once asset URLs
+- [x] **AC1:** for the existing post, `--blog-only` output matches the image's `/blog/**` once asset URLs
   are normalised. A test asserts it.
-- [ ] **AC2:** a new post goes live on production with **zero** `roomler2` restarts and unchanged pod
+  **Met 2026-10-09** in P1 (#1883): `ui/docs/__tests__/blog-only.spec.ts` builds both trees and asserts every
+  page, the feed and `sitemap-blog.xml` equal once `/blog/assets/` reads `/docs/assets/`, and that the lane
+  names nothing under `/docs/assets/`
+  ([step log 2](https://github.com/gjovanov/roomler-ai/issues/1880#issuecomment-6070929601)).
+- [x] **AC2:** a new post goes live on production with **zero** `roomler2` restarts and unchanged pod
   ages, measured before and after the publish.
-- [ ] **AC3:** the served `/blog/<slug>/` sends CSP, HSTS, X-Frame-Options, X-Content-Type-Options,
+  **Met 2026-11-01** on a real post (§8): `how-does-socks5-proxy-work` was published at 06:00:04Z, between
+  pod reads at 05:46:47Z and 06:00:46Z. Both reads show the same two pods on `hosted-20261101-5d59e47`, the
+  same start times and 0 restarts, and the last promote was at 03:12Z, before the first read. P2's sync had
+  shown the same for a release with no post
+  ([step log 3](https://github.com/gjovanov/roomler-ai/issues/1880#issuecomment-6078426445)).
+- [x] **AC3:** the served `/blog/<slug>/` sends CSP, HSTS, X-Frame-Options, X-Content-Type-Options,
   Referrer-Policy and Permissions-Policy byte-identical to `/docs/`, and the `--blog` smoke passes.
   Negative control: drop the include from the blog config, and the smoke fails.
-- [ ] **AC4:** `sitemap-blog.xml` and `/blog/feed.xml` list the new post within a minute of publishing,
+  **Met 2026-10-09:** the negative control in P1 (with the include removed from the lane's config, the header
+  comparisons failed; [step log 2](https://github.com/gjovanov/roomler-ai/issues/1880#issuecomment-6070929601)),
+  and `public-site-smoke.sh --blog https://roomler.ai` 13/13 in production after P2 routed the edge
+  ([step log 3](https://github.com/gjovanov/roomler-ai/issues/1880#issuecomment-6078426445)). Re-run
+  2026-10-30 23:17Z against that morning's release: 13/13 again (§8).
+- [~] **AC4:** `sitemap-blog.xml` and `/blog/feed.xml` list the new post within a minute of publishing,
   and IndexNow answers 200 or 202 for it.
+  **Partly met:** the served half, read through the flip of the 2026-11-01 post. Published 06:00:04Z, both
+  files first named it at 06:00:28Z, then on six reads running (§8). That is 24 s at most: the reads began
+  when the flip was seen, at 06:00:27Z.
+  **Missing:** IndexNow's answer. The publisher stores it only in its own audit record and logs nothing
+  about it (§8), so the operator reads it there.
 - [ ] **AC5:** with the two edge locations removed, the image's blog serves and the smoke passes for the
   older post. Restoring them serves the lane again.
 - [ ] **AC6:** with the bucket unreachable, the running `roomler-blog` pods keep serving the last
   release.
-- [ ] **AC7:** a post that shows an install line fails `--blog-only` without `installCopy: true` and
+- [x] **AC7:** a post that shows an install line fails `--blog-only` without `installCopy: true` and
   builds with it. The carry then reaches its install links.
-- [ ] **AC8:** an organic visit (no UTM) from an external referrer to a post, followed by a signup,
+  **Met 2026-10-09** in P1 (#1883): `blog-only.spec.ts` builds a fixture post with an install command both
+  ways (exit 1 naming `INSTALL_PAGES`, then exit 0 with the post's URL inside the built carry script), and the
+  test failed with the `installCopy` wiring reverted
+  ([step log 2](https://github.com/gjovanov/roomler-ai/issues/1880#issuecomment-6070929601)). In production,
+  the served carry script lists the lane's `installCopy` posts among its install pages (§8).
+- [~] **AC8:** an organic visit (no UTM) from an external referrer to a post, followed by a signup,
   stores `landing_path=/blog/<slug>/` and `referrer_host` in `signup_attribution`. Nothing is written to
   cookies or storage.
-- [ ] **AC9:** right after each edge reload, `/ws`, `/derp`, `/health` and a remote-desktop connect all
+  **Built in P3:** `attribution.spec.ts` runs the script on a rendered post and spies on every storage API,
+  and `an_organic_journey_from_the_blog_is_stored_and_counted_by_its_post` stores the pair on a real server.
+  The RED is in §8: the served script changed 0 of 63 links on such a visit.
+  **Read 2026-11-02 on production (§8):** the image's served script is GREEN on that harness, 9 of 63 links
+  with `/register` among them, and the SPA's served chunk holds the same rule. A post loads the lane's copy,
+  which is still the old script: 0 of 63.
+  **Missing:** the same read on the lane's script, at the first release built after the merge, then a real
+  organic sign-up in `by_landing_path`.
+- [~] **AC9:** right after each edge reload, `/ws`, `/derp`, `/health` and a remote-desktop connect all
   work.
-- [ ] **AC10:** docs updated or created with mermaid diagrams (`docs/public-site.md`: the publishing
+  **Partly met 2026-10-09:** after each of P2's two reloads, `/ws` and `/derp` answered 401 from `roomler2` as
+  in the baseline, `/health`, `/docs/` and `/` answered 200, and a `roomler exec` round trip over an agent's
+  control socket passed ([step log 3](https://github.com/gjovanov/roomler-ai/issues/1880#issuecomment-6078426445)).
+  **Missing:** a remote-desktop connect right after a reload. The exec round trip stood in for it. Owed at
+  AC5's two reloads.
+- [x] **AC10:** docs updated or created with mermaid diagrams (`docs/public-site.md`: the publishing
   lane, the edge routing, the kill switch) and linked from `docs/README.md`.
+  **Met** in P4: `docs/public-site.md` §11 (the edge routing and the publishing sequence as mermaid, what
+  happens when each part fails, the kill switch, the organic carry), its `docs/README.md` row, and
+  `docs/deployment.md`'s note that the blog is off the pod path.
 
 ## 6. Open decisions
 
@@ -192,6 +256,12 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
    the edge selects, which needs an edge reload per publish and is rejected for that reason.
 3. **Search on blog pages.** `--blog-only` emits a full index (docs + posts) under `/blog/assets/`, so
    search from a post sees new posts at once. The 150 KB gzip ceiling (`site.ts:42`) still applies.
+4. **The archive has stopped (found 2026-10-31).** §3d says the repo stays the archive, and on that date
+   `ui/blog/posts/` held 2 posts while the lane served 21. The other 19 exist only in the publisher's store
+   and the bucket. The kill switch would 404 them, the image's search and backlinks do not know them, and
+   losing the bucket would lose the only built copy. The choices are to backfill and keep archiving (the
+   default in decision 1, or a bot), or to stop calling the repo the archive and say so here and in
+   `docs/public-site.md`. Either way the operator's call; publishing is unaffected.
 
 ## 7. Out of scope
 
@@ -202,7 +272,38 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
 
 ## 8. Field-verification log
 
-*(empty: nothing built yet)*
+| When (UTC) | What | Result |
+|---|---|---|
+| 2026-10-09 | P1 verified before merge; P2 field-verified in production | [step log 2](https://github.com/gjovanov/roomler-ai/issues/1880#issuecomment-6070929601), [step log 3](https://github.com/gjovanov/roomler-ai/issues/1880#issuecomment-6078426445) |
+| 2026-10-30 23:05Z | **RED, `BLOG_LANE`:** the image's sitemap index dates `sitemap-blog.xml` `2026-10-17`; the lane's newest post is `2026-10-30T06:00:20Z` | a stale date on every crawl since the lane went on |
+| 2026-10-30 23:17Z | **RED, AC8:** the served `attribution.f2ef772513.js` run on the served `/blog/subnet-router/` (jsdom, no page script), referrer `https://www.google.com/`, no campaign | 0 of 63 links change |
+| 2026-10-30 23:17Z | Positive control for that harness: the same run with `?utm_source=fr91-harness` | 9 links change, both `/register` among them, with `referrer_host` and `landing_path` |
+| 2026-10-30 23:17Z | AC7 in production: that control decorated a link to `/blog/unattended-remote-access-software/`, an `installCopy` post the served script lists among its install pages | the carry reaches a post that declared itself |
+| 2026-10-30 23:17Z | AC3: `public-site-smoke.sh --blog https://roomler.ai` against the 10-30 release | 13/13 |
+| 2026-10-31 17:37Z | The feed: a post every day since 10-21, `published` from 06:00:00Z to 06:37:10Z | the scheduled publishing the title promises runs in the publisher, as §1 says; none in this repo |
+| 2026-10-31 17:37Z | AC2 retrospective read: `roomler2` started 09:37:02Z and 09:37:19Z (the 09:32Z promote), after the 06:37Z post | proves nothing for that post; a bracket is owed |
+| 2026-10-31 17:37Z | AC6 natural experiment: `minio-0` started 10-12, the `roomler-blog` pods 10-20, so MinIO has not restarted under the running pods | no outage to read; AC6 needs a real fault |
+| 2026-10-31 17:52Z | AC4: `published` 06:37:10Z, release `20261031T063710Z-securely-access-home-server-remotely`. `Last-Modified` of `sitemap-blog.xml` and `feed.xml` is 06:37:21Z on one pod and 06:37:22Z on the other (the mirror's `wget` stamps its fetch time) | both pods held the files 12 s after the publish moment |
+| 2026-10-31 17:45Z | The archive: 2 posts in `ui/blog/posts/`, 21 in the lane, 19 only in the lane | §6 decision 4 |
+| 2026-10-31 18:41Z | AC4, IndexNow: the publisher's application log, 14 h covering the 10-31 post, counted and never printed. Control: the same filter on a planted line returned `1 202` | 112 lines, 0 naming IndexNow. The answer exists only in the publisher's audit record, where 0 means the call failed. A refused or failed call does not fail the publish and is not retried |
+| 2026-11-01 06:00Z | AC2: `roomler2` read at 05:46:47Z and 06:00:46Z around the real post `how-does-socks5-proxy-work`, `published` 06:00:04Z. Last promote 03:12Z | unchanged: the same two pods, started 03:13:00Z and 03:13:17Z, 0 restarts, `hosted-20261101-5d59e47` |
+| 2026-11-01 06:00Z | AC4, served half: release `20261101T060004Z-how-does-socks5-proxy-work` first seen 06:00:27Z. `sitemap-blog.xml` and `feed.xml` first named the post at 06:00:28Z, then on six reads running. `Last-Modified` 06:00:16Z | within 24 s of `published` |
+| 2026-11-01 06:01Z | AC3: `public-site-smoke.sh --blog https://roomler.ai` against that release | all checks passed |
+| 2026-11-02 22:24Z | **GREEN, `BLOG_LANE`:** the served `sitemap.xml` on `hosted-20261102-be06c70`, six reads | the blog child has no `<lastmod>` on any read; the RED dated it `2026-10-17` |
+| 2026-11-02 22:26Z | **GREEN, AC8, the image's script:** the served `attribution.52f8e9cb44.js` on the served `/blog/how-does-socks5-proxy-work/`, the RED's harness, referrer `https://www.google.com/`, no campaign | 9 of 63 links change, `/register` among them, with `referrer_host` and `landing_path` |
+| 2026-11-02 22:26Z | Controls for that script: on the post with no referrer, and with a same-site referrer; on `/docs/` from Google. Then `/docs/` with the pair on its URL, a journey that began on a post | 0 of 63, 0 of 63, 0 of 102. Then 17 of 102, `/register` among them |
+| 2026-11-02 22:26Z | **Still RED, AC8, the lane's script:** the served `attribution.bd6ed8e979.js` on that post, the same visit. Control: the same run with `?utm_source=fr91-harness` | 0 of 63 links, because a post loads the lane's copy. The control changes 10 |
+| 2026-11-02 22:26Z | The feed: the newest `published` is `2026-11-01T06:00:04Z`, after a post every day from 10-21, and `_release.txt` still names that post | no post yet on 11-02, so nothing built after the merge has reached the lane. The lane's read waits for it |
+| 2026-11-02 22:27Z | The SPA's half: the served `attribution-ChSnkNfg.js` | holds the rule, `"/blog/"` and `startsWith` on the landing path. Code read only: nothing was submitted |
+
+Negative controls for P3, each run and restored (hashes compared):
+
+| Mutation | What failed |
+|---|---|
+| the organic branch removed from `attribution.js` | 6 tests: every organic case, and the lock on both rules |
+| the organic branch removed from `carriedQuery` | 4 tests: the SPA's organic cases, and the lock |
+| `ORGANIC_PREFIX = '/blog'` in the static script | 1 test: the lock's `/blogroll/` case. Nothing else would have caught that drift |
+| `blogLane: false` in `build.ts`, with `BLOG_LANE` on | 1 test: the image's sitemap index |
 
 ## 9. Related
 

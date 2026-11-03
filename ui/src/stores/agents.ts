@@ -7,6 +7,8 @@ import { useTenantStore } from '@/stores/tenant'
 import { canManageOrgSettings } from '@/utils/permissions'
 import { isKeepBusyPattern, type KeepBusyPattern } from '@/composables/keepBusy'
 import type { AgentReleaseBrief } from '@/utils/updateStall'
+import type { PowerBrief, SleepView } from '@/utils/devicePresence'
+import type { ExternalAuditEntry, ExternalPrincipal } from '@/utils/externalAudit'
 
 /**
  * The three org-level switches (`exec-settings`, `ssh-settings`,
@@ -48,6 +50,11 @@ export type ConsentMode = 'auto' | 'prompt' | 'email' | 'push' | 'prompt_then_em
  *  ends. Mirrors the Rust `LockOnEnd` (lowercase on the wire). */
 export type LockOnEnd = 'never' | 'auto' | 'always'
 
+/** FR-128 — how a device's remote-desktop sessions may use the mesh: the
+ *  stored `rc_overlay` / `rc_overlay_auto` pair read as one choice (the Rust
+ *  `RcOverlayMode`). Never on the wire as such. */
+export type RcOverlayMode = 'off' | 'auto' | 'on'
+
 /** FR-101 P2 — one sensitive session feature, as an org allows it. Mirrors the
  *  Rust `RcFeaturePolicy` (lowercase on the wire). */
 export type RcFeaturePolicy = 'on' | 'ask' | 'off'
@@ -86,6 +93,11 @@ export interface AccessPolicy {
    *  the best one (it can be the only working path between two hostile NATs,
    *  but it inherits the mesh's failure modes). */
   rc_overlay?: boolean | null
+  /** FR-128 — `auto`: each session decides at the agent's offer. It takes
+   *  the mesh when the mesh link to the browser's own device is direct, and
+   *  not otherwise. `rc_overlay: true` wins over it. `null`/absent/`false`
+   *  is not auto. */
+  rc_overlay_auto?: boolean | null
   /** FR-99 P3b — what this device's sessions ask of it when the last one
    *  ends: `auto` (lock again if it was locked, or nobody was at it, when the
    *  session began) or `always`. The device takes the stricter of this and its
@@ -303,6 +315,14 @@ export interface Agent {
    *  Absent = the device does not say (no keep busy there, an older agent,
    *  or a supervised Mac's daemon): unknown, never "off". */
   keep_busy?: KeepBusyBrief
+  /** FR-55 P4 — the device's power posture as its last heartbeat reported
+   *  it: `power_policy`, the power source, whether its keeper holds it awake.
+   *  Absent = the device does not say (an agent before P4): unknown, never
+   *  `never`. */
+  power?: PowerBrief
+  /** FR-55 P4 — on a device that is not online: it announced a sleep, since
+   *  when, and its posture then. Absent = no reason given. */
+  sleep?: SleepView
   /** FR-51 — enrolled as temporary: the server reaps it after silence, and a
    *  clean stop removes it immediately. Removal is FINAL (hard delete) — a
    *  later enrollment is a NEW device. The grid badges it so nobody is
@@ -524,8 +544,9 @@ export type RemoteConfigState =
   | 'refused'
   /** The device tried and failed; `report.detail` says why. */
   | 'failed'
-  /** Waiting on the device to answer about THIS revision (includes "it has
-   *  not reconnected yet" — delivery is reconcile-on-connect). */
+  /** Waiting on the device to answer about THIS revision. A connected device
+   *  answers within seconds; an offline one when it next connects, which is
+   *  how every device converges (reconcile-on-connect). */
   | 'pending'
   /** The agent applies pushed config but predates `config-report`, so it will
    *  never say what it did. Distinct from `pending` because waiting is futile
@@ -550,6 +571,11 @@ export interface ConfigReport {
   reported_at: string
 }
 
+/** FR-130 P1b — how a pushed tribool travels: the server stores one of these
+ *  three words (`remote_config::pushed_tribool`), and the device reads them
+ *  as `roomler config set` would. `''` clears the device's key. */
+export type PushedTribool = 'on' | 'off' | ''
+
 /** The keys under management. `undefined` means NOT MANAGED — the device
  *  keeps whatever it has locally — which is a different thing from `false`.
  *
@@ -568,6 +594,15 @@ export interface DesiredConfig {
   /** FR-119 P2b — the frame-rate denylist (`name:fps` list, `*` for every
    *  encoder, or `none`); MANAGE_AGENTS only. */
   fps_deny?: string
+  /** FR-130 P1b — the colour-description switch; MANAGE_AGENTS only. `''` is
+   *  a request to CLEAR the device's key (back to its built-in default, on),
+   *  which is not the same as leaving it unmanaged (`undefined`). */
+  color_description?: PushedTribool
+  /** FR-132 P1 — the GPU-input denylist (`name:gpu` list, or `none`), the kill
+   *  switch of FR-118's GPU-input cells; MANAGE_AGENTS only. `''` is a request
+   *  to clear the device's key (deny nothing). `zero_copy` itself is never
+   *  pushable (FR-132 decision 1). */
+  zero_copy_deny?: string
   updated_by?: string
   updated_at?: string
 }
@@ -979,12 +1014,16 @@ export const useAgentStore = defineStore('agents', () => {
    *  ACTIVE org. `status` is left alone (it's the Mongo lifecycle field);
    *  `presence`/`is_online` are the reachability truth the list renders.
    *  Unknown agent ids are ignored — the next fetch converges. */
-  function applyPresence(updates: Array<{ agent_id: string; presence: 'online' | 'stale' | 'offline' }>) {
+  function applyPresence(
+    updates: Array<{ agent_id: string; presence: 'online' | 'stale' | 'offline'; sleep?: SleepView }>,
+  ) {
     for (const u of updates) {
       const a = agents.value.find((x) => x.id === u.agent_id)
       if (!a) continue
       a.presence = u.presence
       a.is_online = u.presence === 'online'
+      // FR-55 P4 — the reason rides the offline row it came with.
+      a.sleep = u.presence === 'offline' ? u.sleep : undefined
     }
   }
 
@@ -1582,6 +1621,17 @@ export const useAgentStore = defineStore('agents', () => {
     if (idx !== -1) agents.value[idx]!.external_access_policy = policy
   }
 
+  /** Read one device's connect code, approved or not: `null` when it has none.
+   *  This one throws, unlike `fetchExternalAccess`. "Could not read it" and
+   *  "there is none" must stay different answers, because the second is what
+   *  offers Create, and Create replaces a code. */
+  async function fetchConnectCode(tenantId: string, agentId: string): Promise<string | null> {
+    const resp = await api.get<{ connect_code: string | null }>(
+      `/tenant/${tenantId}/agent/${agentId}/connect-code`,
+    )
+    return resp.connect_code
+  }
+
   /** Mint or rotate a device's connect code. One call for both, because
    *  rotation IS the revocation story for a leaked code. */
   async function rotateConnectCode(tenantId: string, agentId: string): Promise<string> {
@@ -1726,9 +1776,10 @@ export const useAgentStore = defineStore('agents', () => {
 
   /** Record the device config an operator wants (`docs/remote-config.md`).
    *
-   *  This writes an INTENT, never a fact. The device reconciles it when it
-   *  next connects and is free to refuse — so the response must NOT be read
-   *  back as "this device now has exec on". Re-fetch and read
+   *  This writes an INTENT, never a fact. A connected device hears at once,
+   *  an offline one when it next connects, and either is free to refuse — so
+   *  the response must NOT be read back as "this device now has exec on".
+   *  Re-fetch and read
    *  `remote_config.state` for that; until the device answers, the honest
    *  answer is `pending`.
    *
@@ -1829,6 +1880,47 @@ export const useAgentStore = defineStore('agents', () => {
     return { items: resp.items, total: resp.total }
   }
 
+  /** FR-52 P5 — every decision about letting someone from outside the org onto
+   *  a device, the refusals included. Requires `VIEW_REMOTE_AUDIT`. */
+  async function fetchExternalAudit(
+    tenantId: string,
+    opts: { page?: number; perPage?: number } = {},
+  ): Promise<{ items: ExternalAuditEntry[]; total: number }> {
+    const q = new URLSearchParams()
+    q.set('page', String(opts.page ?? 1))
+    q.set('per_page', String(opts.perPage ?? 50))
+    const resp = await api.get<{ items: ExternalAuditEntry[]; total: number }>(
+      `/tenant/${tenantId}/external-rc-audit?${q.toString()}`,
+    )
+    return { items: resp.items, total: resp.total }
+  }
+
+  /** FR-52 P5 — who has come in from outside, device by device. The same
+   *  `VIEW_REMOTE_AUDIT` as the log it sits beside. */
+  async function fetchExternalPrincipals(
+    tenantId: string,
+    opts: { page?: number; perPage?: number } = {},
+  ): Promise<{ items: ExternalPrincipal[]; total: number }> {
+    const q = new URLSearchParams()
+    q.set('page', String(opts.page ?? 1))
+    q.set('per_page', String(opts.perPage ?? 50))
+    const resp = await api.get<{ items: ExternalPrincipal[]; total: number }>(
+      `/tenant/${tenantId}/external-principals?${q.toString()}`,
+    )
+    return { items: resp.items, total: resp.total }
+  }
+
+  /** FR-52 P5 — bar a person from a device, or let them back. `MANAGE_AGENTS` to
+   *  bar; letting back is a grant, so that takes `REMOTE_CONTROL` too. */
+  async function setExternalPrincipal(
+    tenantId: string,
+    agentId: string,
+    userId: string,
+    revoked: boolean,
+  ): Promise<void> {
+    await api.put(`/tenant/${tenantId}/agent/${agentId}/external-principals/${userId}`, { revoked })
+  }
+
   /** P8 — what devices reported doing inside their sessions.
    *
    *  `grantId` narrows to ONE session, which is how a reader gets from an
@@ -1904,6 +1996,7 @@ export const useAgentStore = defineStore('agents', () => {
     fetchExternalAccess,
     setOrgExternalAccessEnabled,
     updateExternalAccessPolicy,
+    fetchConnectCode,
     rotateConnectCode,
     orgEphemeralKeysEnabled,
     fetchOrgEphemeralKeysEnabled,
@@ -1919,6 +2012,9 @@ export const useAgentStore = defineStore('agents', () => {
     updateSshPolicy,
     updateDesiredConfig,
     fetchSshAudit,
+    fetchExternalAudit,
+    fetchExternalPrincipals,
+    setExternalPrincipal,
     fetchSshActivity,
     execOnAgent,
     execOnFleet,

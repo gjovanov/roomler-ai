@@ -25,6 +25,33 @@ pub struct BlockHeadroom {
     pub reclaimed: u32,
 }
 
+/// What [`OverlayBlockDao::next_free_slot`] found — the read half of an
+/// allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextSlot {
+    /// The aligned slot the block would be claimed at. Advisory: nothing is
+    /// reserved until [`OverlayBlockDao::claim_slot`] wins it.
+    Free(u32),
+    /// No aligned run of the requested size is left below the ceiling;
+    /// `highest_end` is the cursor the verdict was computed from.
+    Exhausted { highest_end: u32 },
+}
+
+/// What [`OverlayBlockDao::claim_slot`] decided — the write half of an
+/// allocation.
+#[derive(Debug, Clone)]
+pub enum SlotClaim {
+    /// The insert went through; this is the new row.
+    Won(OverlayBlock),
+    /// This network already holds an assigned block at the requested
+    /// position — a concurrent carve or grow of the SAME network won, and
+    /// its row is the answer.
+    AlreadyHeld(OverlayBlock),
+    /// Another allocator took the slot between the read and the write. The
+    /// network holds nothing at this position; read again and claim above.
+    Taken,
+}
+
 /// Fraction of the slot space above which a fresh carve warns.
 ///
 /// FR-47 — pressure is reported at the moment it is *created* rather than by a
@@ -124,6 +151,35 @@ impl OverlayBlockDao {
             .await
     }
 
+    /// FR-68 — the ASSIGNED block at position `seq` of `network_id`'s list,
+    /// if any. This is what [`Self::claim_slot`] re-reads after a lost race:
+    /// "does this network already hold the block I was about to insert?" is
+    /// a question about ONE position, not about the network having any block
+    /// at all (which, on a grow, it always does).
+    ///
+    /// Position `0` also matches a row with NO `seq` field: blocks carved
+    /// before FR-47 P5b were written without one, and the model reads an
+    /// absent field as `0` (`#[serde(default)]`), so the query has to as well
+    /// or a pre-P5b first block would be invisible to its own re-read.
+    pub async fn find_assigned_for_network_at_seq(
+        &self,
+        network_id: ObjectId,
+        seq: u32,
+    ) -> DaoResult<Option<OverlayBlock>> {
+        let seq_filter = if seq == 0 {
+            doc! { "$in": [0_i64, bson::Bson::Null] }.into()
+        } else {
+            bson::Bson::Int64(i64::from(seq))
+        };
+        self.base
+            .find_one(doc! {
+                "network_id": network_id,
+                "seq": seq_filter,
+                "state": bson::to_bson(&OverlayBlockState::Assigned).unwrap_or(bson::Bson::Null),
+            })
+            .await
+    }
+
     /// Every block ever carved for a tenant, newest first — the assigned one
     /// plus its quarantined predecessors (the renumber trail).
     pub async fn list_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<Vec<OverlayBlock>> {
@@ -145,6 +201,14 @@ impl OverlayBlockDao {
     /// above the winner) or buddy-aligned disjoint starts. There is no
     /// interleaving that yields a partial overlap — see
     /// `aligned_starts_are_never_partially_overlapping` in the models crate.
+    ///
+    /// FR-68 — two halves, [`Self::next_free_slot`] (the read) and
+    /// [`Self::claim_slot`] (the write), so the race between them can be
+    /// staged by a test: another tenant's carve landing on the slot this read
+    /// chose. That interleaving had no seam for two months, and the one path
+    /// the retry loop exists for — a lost race on a GROW — was wrong the whole
+    /// time (see `claim_slot`). Nothing in the loop changed; the decision it
+    /// makes on a duplicate did.
     pub async fn allocate(
         &self,
         tenant_id: ObjectId,
@@ -160,14 +224,12 @@ impl OverlayBlockDao {
 
         const ATTEMPTS: usize = 8;
         for attempt in 1..=ATTEMPTS {
-            let after = self.highest_end_slot().await?.max(OVERLAY_BLOCK_FIRST_SLOT);
-            let slot = block_align_slot(after, slots);
-            let cidr = match block_cidr_for_slot(slot, slots) {
-                Some(c) => c,
+            let slot = match self.next_free_slot(prefix).await? {
+                NextSlot::Free(slot) => slot,
                 // Monotonic space is gone. THIS is the only situation that
                 // justifies re-issuing a range an operator has reclaimed —
                 // the alternative is handing the tenant no address at all.
-                None => {
+                NextSlot::Exhausted { highest_end } => {
                     if let Some(b) = self
                         .take_reclaimed(tenant_id, network_id, slots, seq)
                         .await?
@@ -181,52 +243,132 @@ impl OverlayBlockDao {
                     }
                     return Err(DaoError::Validation(format!(
                         "overlay block space exhausted: no aligned /{prefix} left below \
-                         slot {OVERLAY_BLOCK_SLOT_COUNT} (highest allocated end {after}), \
-                         and no reclaimed range of that size is available"
+                         slot {OVERLAY_BLOCK_SLOT_COUNT} (highest allocated end \
+                         {highest_end}), and no reclaimed range of that size is available"
                     )));
                 }
             };
-            let now = DateTime::now();
-            let block = OverlayBlock {
-                id: None,
-                slot,
-                slots,
-                end_slot: slot + slots,
-                cidr,
-                seq,
-                tenant_id,
-                network_id,
-                state: OverlayBlockState::Assigned,
-                released_reason: None,
-                released_at: None,
-                created_at: now,
-                updated_at: now,
-            };
-            match self.base.insert_one(&block).await {
-                Ok(id) => {
-                    warn_if_registry_is_filling(slot + slots);
-                    return self.base.find_by_id(id).await;
-                }
-                Err(DaoError::DuplicateKey(e)) if attempt < ATTEMPTS => {
-                    // Either another allocator took this slot (retry lands
-                    // above it) or this network already holds an assigned
-                    // block — the partial-unique index on `network_id`. The
-                    // caller's own `find_assigned_for_network` check makes the
-                    // second case a lost race, so re-reading is correct.
-                    if let Some(existing) = self.find_assigned_for_network(network_id).await? {
-                        return Ok(existing);
-                    }
+            match self
+                .claim_slot(tenant_id, network_id, prefix, seq, slot)
+                .await?
+            {
+                SlotClaim::Won(block) | SlotClaim::AlreadyHeld(block) => return Ok(block),
+                SlotClaim::Taken => {
                     tracing::debug!(
-                        %tenant_id, slot, attempt, %e,
+                        %tenant_id, slot, seq, attempt,
                         "overlay block: slot taken; re-allocating"
                     );
                 }
-                Err(e) => return Err(e),
             }
         }
         Err(DaoError::Validation(
             "overlay block allocation lost too many races; try again".to_string(),
         ))
+    }
+
+    /// The READ half of [`Self::allocate`]: the aligned slot a block of
+    /// `prefix` would be claimed at right now — the highest `end_slot` in the
+    /// registry, rounded up to the block's alignment — or the exhaustion
+    /// verdict when no such slot is left below the ceiling.
+    ///
+    /// Advisory by construction: nothing is reserved, and another allocator
+    /// reading the same highest end gets the same answer. That is the race
+    /// [`Self::claim_slot`] settles.
+    pub async fn next_free_slot(&self, prefix: u8) -> DaoResult<NextSlot> {
+        let slots = block_slots_for_prefix(prefix).ok_or_else(|| {
+            DaoError::Validation(format!(
+                "unsupported overlay block prefix /{prefix} (supported: /16 … /22)"
+            ))
+        })?;
+        let highest_end = self.highest_end_slot().await?.max(OVERLAY_BLOCK_FIRST_SLOT);
+        let slot = block_align_slot(highest_end, slots);
+        Ok(match block_cidr_for_slot(slot, slots) {
+            Some(_) => NextSlot::Free(slot),
+            None => NextSlot::Exhausted { highest_end },
+        })
+    }
+
+    /// The WRITE half of [`Self::allocate`]: insert the block at `slot`, and
+    /// decide what a `DuplicateKey` on that insert means.
+    ///
+    /// Two unique indexes can refuse the row. `slot` (always present) fires
+    /// when ANOTHER allocator — any tenant — claimed this slot between the
+    /// read and the write: the answer is [`SlotClaim::Taken`], and the caller
+    /// re-reads and lands above the winner. The per-network guard (`network_id`
+    /// under single-block, `(network_id, seq)` assigned-unique under
+    /// multi-block) fires when THIS network already holds a block at this
+    /// position — a concurrent carve or grow of the same network won: the
+    /// answer is [`SlotClaim::AlreadyHeld`] with the winner's row, because the
+    /// caller wanted "the block at position `seq`", and that is what exists.
+    ///
+    /// The two cannot be told apart from the error, so the discriminator is a
+    /// re-read of the position: a block assigned at `seq` means the second
+    /// case, nothing there means the first.
+    ///
+    /// ⚠️ FR-68 AC3 — the re-read is scoped to THIS `seq`. Before, it was
+    /// `find_assigned_for_network` — "any assigned block of this network" —
+    /// which is only right for a network's FIRST block. On a grow (`seq > 0`)
+    /// the network already holds block 0 by definition, so a `slot` collision
+    /// with another tenant's carve came back as block 0: the grow reported
+    /// success with a block the network already had, the caller's re-read
+    /// found the address space unchanged, and the joiner it was growing for
+    /// was refused `AddressSpaceExhausted` — a silent no-op in exactly the
+    /// race the retry loop exists for. The loop never ran, because the arm
+    /// returned before it could.
+    pub async fn claim_slot(
+        &self,
+        tenant_id: ObjectId,
+        network_id: ObjectId,
+        prefix: u8,
+        seq: u32,
+        slot: u32,
+    ) -> DaoResult<SlotClaim> {
+        let slots = block_slots_for_prefix(prefix).ok_or_else(|| {
+            DaoError::Validation(format!(
+                "unsupported overlay block prefix /{prefix} (supported: /16 … /22)"
+            ))
+        })?;
+        let cidr = block_cidr_for_slot(slot, slots).ok_or_else(|| {
+            DaoError::Validation(format!(
+                "slot {slot} cannot hold a /{prefix} below slot {OVERLAY_BLOCK_SLOT_COUNT}"
+            ))
+        })?;
+        let now = DateTime::now();
+        let block = OverlayBlock {
+            id: None,
+            slot,
+            slots,
+            end_slot: slot + slots,
+            cidr,
+            seq,
+            tenant_id,
+            network_id,
+            state: OverlayBlockState::Assigned,
+            released_reason: None,
+            released_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        match self.base.insert_one(&block).await {
+            Ok(id) => {
+                warn_if_registry_is_filling(slot + slots);
+                Ok(SlotClaim::Won(self.base.find_by_id(id).await?))
+            }
+            Err(DaoError::DuplicateKey(e)) => {
+                if let Some(existing) = self
+                    .find_assigned_for_network_at_seq(network_id, seq)
+                    .await?
+                {
+                    return Ok(SlotClaim::AlreadyHeld(existing));
+                }
+                tracing::debug!(
+                    %tenant_id, %network_id, slot, seq, %e,
+                    "overlay block: the slot went to another allocator"
+                );
+                Ok(SlotClaim::Taken)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The range [`Self::allocate`] would hand out RIGHT NOW for `prefix`,

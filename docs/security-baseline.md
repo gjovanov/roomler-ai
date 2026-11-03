@@ -143,6 +143,48 @@ lane, because CI does not run this crate.
 `mail`/UPN are tenant-settable); its `id` (the `oid`) stays trusted and is the
 provider-identity key.
 
+### The activation resend (#3199)
+
+`POST /api/auth/resend-activation` is an open form that mails whoever its body
+names, keyed on the same reservation. It changes none of the three rules above: it
+never writes `email`, never sets `is_verified`, and a row it reaches stays unproven
+until a link is redeemed. It exists because a re-registration that replaced an
+unverified row would have reopened exactly those rules. What binds it:
+
+- **One answer.** A 202 and one sentence for an address that is unknown, waiting,
+  active or inside the cooldown (`accept_resend`). `subscribe` draws the same line;
+  see its module note.
+- **The answer does not wait for the lookup.** `subscribe` detaches its mail, and
+  that is not enough here, because a known address also costs more Mongo round trips
+  than an unknown one. `accept_resend` is deliberately not `async`, so it cannot await
+  the row. ⚠️ Moving the lookup back into the handler is a timing oracle, and
+  `the_answer_does_not_wait_for_the_lookup` fails if it does.
+- **Two limits, and only one of them is visible.** Per client address, a 429 that
+  cannot depend on the address. Per account, a 15-minute cooldown that sends nothing
+  and says nothing, because a 429 would fire only for an address with an account.
+  ⚠️ Keep the cooldown's stamp on the `users` row: `activation_codes` is TTL-reaped,
+  so at a 5-minute link a stamp kept there is gone before it has run.
+- **Only a password sign-up that is still waiting is mailed**
+  (`UserDao::claim_activation_resend`). Never an active account, a tombstone or a
+  `.invalid` placeholder. An evicted row keeps its password, so the address is what
+  excludes it.
+- **The mail carries the sign-up's own text**, so `display_name` is escaped
+  (`render_activation`). Unescaped, this route would be a way to send a stranger's
+  HTML from our domain on demand.
+- **The token is 21 characters, up from 7.** Redeeming it is what proves an address,
+  and each resend opens a new window to guess it in.
+
+Two residuals, neither of them new:
+
+- `POST /api/auth/register`'s 409 still says an address is taken. Closing that would
+  mean answering 201 for a taken address and mailing its owner instead, which is a
+  separate change.
+- A stranger who registered someone else's address can have the activation mail sent
+  again, at the cooldown's pace, and whoever clicks it hands that stranger a password
+  login. Registering a case variant of the address could already do this, because the
+  index is case-sensitive. The mail's "if you did not create an account, please ignore
+  this email" is what stands in the way of both.
+
 ### OAuth CSRF
 
 `oauth_redirect` binds its random `state` to the browser in a short-lived
@@ -324,7 +366,18 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
 - it serves exactly `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`,
   `ConsentDecide` and `RecordStatus`; `KeepBusyStatus`, `KeepBusyOff` and
   `KeepBusyOn` (FR-92 P10, the start gated again on the peer); since FR-97 P2g,
-  `Devices` and `Mesh`; and since P2h, `Peers`, served through `person_view`.
+  `Devices` and `Mesh`; since P2h, `Peers`, served through `person_view`; and
+  since FR-85 P2e, `RecordStart`, `RecordStop`, `RecordingsList` and
+  `RecordingDelete`, the start, stop and delete gated again on the peer.
+
+The recording verbs (P2e) are the second widening past the safety surface, and
+**Stop** is safety on its own: without `RecordStop` the host could not end a remote
+recording of their own screen from the banner. They reach nothing the person could not
+reach already. The recorder runs as the person at the seat, the daemon lists and deletes
+with that person's filesystem identity (`FsIdentity`), never in the unattended folder,
+and `ConfigSet` stays refused, so `record_dir` and the remote switches remain root's. The
+socket follows a user switch within 5 s, so a background user's client can act for that
+long, as the consent verbs can; it acts as the person now at the seat, whose folder it is.
 
 `Devices` and `Mesh` were the first widening for a read rather than a safety control,
 and they are bounded the same way the companion's page is everywhere else. They only
@@ -547,6 +600,34 @@ warning. The restrictive branch enumerates methods/headers because
 
 `tower_governor`, 60 req/min per IP.
 
+### What an error may say (#3216)
+
+A write that hit a unique index used to answer with MongoDB's own text, which names
+the database, the collection, the index and the value: `DaoError::DuplicateKey(msg)`
+became `ApiError::Conflict(msg)` unchanged. That variant carried two different
+things, and `DaoError` now says which:
+
+| Variant | Holds | The client reads |
+|---|---|---|
+| `DuplicateKey` | MongoDB's text, or a message that embeds it | `That already exists` |
+| `Conflict` | a sentence written for the person | that sentence |
+
+- **It fails closed.** A new raw path needs no care, and a new sentence has to say it
+  is one. Matching `E11000` at the seam would fail open: that text is not a contract,
+  and `duplicate_key_index` already allows for servers that phrase it differently.
+- **The raw text is still read below the seam.** `duplicate_key_is_on` and
+  `duplicate_key_index` work on it, so a route that can say what collided does
+  (`name_taken` on the touch presets).
+- **The log keeps where, not what.** `duplicate_key_site` stops before the `dup key`
+  document, because its value is somebody's address or username.
+- ⚠️ **A client reads the status or a code, never the words.** Three organization
+  forms matched `duplicate` or `E11000` to say a slug was taken, which is the text
+  this change removed. `POST /api/tenant` has one 409, so the status is enough; a
+  route with several causes needs a code, as `not_a_member` has.
+
+A `500` is not covered: `ApiError::Internal(msg)` still sends `msg` to the client
+(§9).
+
 ### Security headers and CSP (`files/nginx-pod.conf`)
 
 `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`,
@@ -721,6 +802,7 @@ Re-run: `bun audit` (ui) + `cargo audit` (buildhost, `~/.cargo/bin`).
 | Sev | Since | Gap |
 |---|---|---|
 | MEDIUM | 2026-08-23 | **User sessions are irrevocable** — no `token_epoch`, no password-change route, no refresh rotation (§1) |
+| LOW | 2026-10-31 | A `500` carries its cause as `message`, a database driver's text included (§5, #3216) |
 | LOW | 2026-03-10 | No secret scanner in CI, no pre-commit lint hooks (§8) |
 | — | 2026-07-29 | Four Rust advisories + one JS advisory deferred as unreachable (§8) |
 

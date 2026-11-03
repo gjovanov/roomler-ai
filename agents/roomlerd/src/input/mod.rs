@@ -496,6 +496,21 @@ pub(crate) fn stale(inj: &dyn InputInjector) -> bool {
     }
 }
 
+/// #3164 — does the OS grant THIS process input injection right now? macOS:
+/// Accessibility, read live (`AXIsProcessTrusted` sees a grant at once, no
+/// restart). Elsewhere no grant is waited on, so `false`: an injector opened
+/// without permission there stays as it was opened, exactly as before.
+pub(crate) fn os_grants_input() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::tcc::accessibility_trusted()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// FR-92 — the backend has no pixel-space read/move (Noop, uinput, a
 /// portal-owned route). Distinct from a transient failure: keep-busy reports
 /// it as unavailable rather than retrying.

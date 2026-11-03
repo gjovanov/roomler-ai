@@ -193,6 +193,9 @@ pub async fn dispatch_media_local(
         "media:producer_pause" => {
             handle_media_producer_pause(state, user_id, connection_id, data).await;
         }
+        "media:view" => {
+            handle_media_view(state, user_id, connection_id, data).await;
+        }
         "media:leave" => {
             handle_media_leave(state, user_id, connection_id, data).await;
         }
@@ -299,9 +302,23 @@ async fn handle_media_join(
         }
     }
 
+    // FR-127 P1 — `caps: ["view"]` declares a client that will report what it
+    // renders (`media:view`): its video consumers start paused and resume when
+    // a report names them, audio always flows. Absent → a legacy client, every
+    // consumer resumed as before. The flag rides the join so the server knows
+    // the client's generation before its first `media:consume`, with no
+    // ordering to get wrong. ⚠️ Read only while the lever is on: with
+    // `[meetings] visible_tiles = false` the server keeps today's shape
+    // whatever the client says, and tells it so in `meeting.view` below.
+    let view_capable = state.settings.meetings.visible_tiles
+        && data
+            .and_then(|d| d.get("caps"))
+            .and_then(|c| c.as_array())
+            .is_some_and(|caps| caps.iter().any(|c| c.as_str() == Some("view")));
+
     let transport_pair = match state
         .room_manager
-        .create_transports(rid, *user_id, connection_id.to_string())
+        .create_transports(rid, *user_id, connection_id.to_string(), view_capable)
         .await
     {
         Ok(tp) => tp,
@@ -316,8 +333,15 @@ async fn handle_media_join(
         }
     };
 
-    if let Some(room) = state.room_manager.rooms_ref().get(&rid) {
-        let caps = serde_json::to_value(room.router.rtp_capabilities()).unwrap_or_default();
+    // FR-127 P1.1 — read the capabilities and release the rooms guard BEFORE
+    // the send: a guard held across an await parks every thread that wants its
+    // shard (`room_manager.rs` `tests`).
+    let caps = state
+        .room_manager
+        .rooms_ref()
+        .get(&rid)
+        .map(|room| serde_json::to_value(room.router.rtp_capabilities()).unwrap_or_default());
+    if let Some(caps) = caps {
         let msg = serde_json::json!({
             "type": "media:router_capabilities",
             "data": { "rtp_capabilities": caps }
@@ -409,6 +433,7 @@ async fn handle_media_join(
     info!(
         %connection_id,
         force_relay,
+        view_capable,
         // The RESOLVED per-pod announced IP (S6 map), not the static setting —
         // on a multi-pod deployment they differ and the static one misleads.
         announced_ip = %state
@@ -428,6 +453,10 @@ async fn handle_media_join(
             "recv_transport": transport_pair.recv_transport,
             "ice_servers": ice_servers,
             "force_relay": force_relay,
+            // FR-127 P1 — which levers this server runs, so a behaviour the
+            // CLIENT carries (Opus DTX now, simulcast in P2) still has a
+            // server-side switch. An older client ignores the field.
+            "meeting": meeting_levers(&state.settings.meetings),
         }
     });
     roomler_core::ws::dispatcher::send_to_connection_routed(
@@ -695,6 +724,85 @@ async fn handle_media_consume(
             send_media_error(state, connection_id, &format!("consume failed: {}", e)).await;
         }
     }
+}
+
+/// FR-127 P1 — the `meeting` object of `media:transport_created`: the levers
+/// this server runs. `view` — the server pauses what a view client does not
+/// show, so the client reports its view; `audio_dtx` — the client produces
+/// its microphone with Opus DTX; `simulcast` — `null` until P2 hands the
+/// client a layer ladder here. A server switch turned off turns the client's
+/// half off too, with no client release.
+pub fn meeting_levers(meetings: &roomler_ai_config::MeetingsSettings) -> serde_json::Value {
+    serde_json::json!({
+        "view": meetings.visible_tiles,
+        "audio_dtx": meetings.audio_dtx,
+        "simulcast": serde_json::Value::Null,
+    })
+}
+
+/// FR-127 P1 — a viewer's report of what it renders: `{ room_id, seq,
+/// video: [{ producer_id, w, h }] }`, the WHOLE set, not a delta. The video
+/// consumers it names are resumed, the rest paused; audio is never touched
+/// (`media/view.rs`). No reply: the report is idempotent and the next one
+/// supersedes it, so there is nothing for the client to wait for.
+///
+/// Dispatched where `media:consume` is — through the placement gate, so a
+/// viewer whose socket is on another pod reaches the owner's
+/// `ParticipantMedia` over `media.cmd` like every other command.
+async fn handle_media_view(
+    state: &ConferenceState,
+    user_id: &ObjectId,
+    connection_id: &str,
+    data: Option<&serde_json::Value>,
+) {
+    // The kill switch: the server never joined this client as view-capable
+    // (`view = None`), so its report would be ignored anyway — say so once
+    // at debug and skip the parse.
+    if !state.settings.meetings.visible_tiles {
+        debug!(?user_id, %connection_id, "media:view ignored: visible_tiles is off");
+        return;
+    }
+    let Some(data) = data else { return };
+    let Some(room_id_str) = data.get("room_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Ok(rid) = ObjectId::parse_str(room_id_str) else {
+        return;
+    };
+    let seq = data.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    // A tile whose producer id does not parse is skipped, not an error: the
+    // producer may have closed between the client's render and this report.
+    let tiles: Vec<(ProducerId, (u32, u32))> = data
+        .get("video")
+        .and_then(|v| v.as_array())
+        .map(|tiles| {
+            tiles
+                .iter()
+                .filter_map(|t| {
+                    let pid = t.get("producer_id")?.as_str()?.parse::<ProducerId>().ok()?;
+                    let dim = |key: &str| {
+                        t.get(key)
+                            .and_then(|v| v.as_u64())
+                            .and_then(|v| u32::try_from(v).ok())
+                            .unwrap_or(0)
+                    };
+                    Some((pid, (dim("w"), dim("h"))))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let outcome = state
+        .room_manager
+        .apply_view(
+            &rid,
+            connection_id,
+            seq,
+            tiles,
+            state.settings.meetings.view_max,
+        )
+        .await;
+    debug!(?user_id, %connection_id, ?rid, seq, ?outcome, "media:view");
 }
 
 /// FR-30 — relay "my camera/mic just went off (or back on)" to the room.

@@ -4310,13 +4310,31 @@ mod tests {
     /// Create an isolated `dest_path`-style tempdir for staging tests, so
     /// the staging dir is fully under our control on every platform.
     async fn stage_tmpdir() -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "roomler-rc19-stage-{}-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-            std::process::id()
-        ));
-        tokio::fs::create_dir_all(&base).await.unwrap();
+        let base = stage_dir_at(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+        // `create_dir`, never `_all`: a folder that exists already fails the
+        // test here, instead of being shared with another one.
+        tokio::fs::create_dir(&base).await.unwrap();
         base
+    }
+
+    /// #2956 — the folder [`stage_tmpdir`] makes at the clock reading
+    /// `nanos`: unique by construction, because the clock alone is not. On a
+    /// busy 4-core Windows runner, two tests spawned back to back read the
+    /// same 100 ns tick (6 of 3000 such pairs, measured with the process
+    /// pinned to 4 loaded CPUs). Two of these tests then shared one folder,
+    /// and the first to finish removed the other's upload along with its own.
+    fn stage_dir_at(nanos: i64) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "roomler-rc19-stage-{nanos}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn two_staging_folders_made_at_one_clock_reading_are_two_folders() {
+        assert_ne!(stage_dir_at(42), stage_dir_at(42));
     }
 
     // rc.19 counter tests: ActiveTransferGuard wraps a process-

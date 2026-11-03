@@ -132,6 +132,26 @@ re-run that comparison, not a separate code path. One path means the
 offline case is exercised on every single connect rather than only in the case
 nobody tests.
 
+As built ([FR-132](fr/FR-132-zero-copy-by-default.md) P1b): the nudge is the same
+`rc:agent.config` frame, sent when a save lands on a connected device, directly
+from the pod that holds the socket or over the rc ctrl lane from the pod that
+took the PUT. It is best effort, and reconcile-on-connect stays what a device
+converges by, so a lost nudge costs only the wait for the next connect.
+
+⚠️ **The device has no revision check.** `apply` writes whatever frame arrived
+last, in every released agent. So every `rc:agent.config` leaves through one
+call, `Hub::push_desired_config`, which never sends a connection a revision at
+or below one it already carried. Without it the connect path can read the row, a
+save can push something newer, and the older read then goes out second and puts
+the device back on a config the operator replaced. Never send this frame any
+other way.
+
+Two races remain, and neither is reachable at a person's speed in the dialog.
+Reports are written by separate tasks, so two answers milliseconds apart can land
+out of order, and the row reads `pending`. Two PUTs inside the window between
+reading the row and writing it take the same revision, so the device can hold the
+document the row did not keep. The next connect heals both.
+
 **Wire.** A new `ServerMsg` variant carrying the desired keys.
 
 ⚠️ It must be gated on a hello capability flag. An older agent does not break on
@@ -199,6 +219,16 @@ decision function should return `Result<Applied, Reason>` and one call site
 should record both arms, so "a new refusal that forgets to audit itself" stays
 unrepresentable.
 
+**Keys that are never the server's (FR-52).** Every `external_*` key is the device
+owner's: gate 3 of cross-org access, and the password record behind it. `DesiredConfig`
+cannot hold one, under a prefix test, so the key that matters is also the one added
+after the test was written. The route says so instead of answering 200 for a key it
+dropped: a body naming one is refused with a 403 and audited as `device_owned_key`
+(`names_a_device_owned_key`, `crates/modules/fleet/src/remote_config.rs:172`). That
+refusal is a courtesy to the admin who asked. What stops a compromised server is the
+device, whose frame type drops the key whatever a frame carries
+(`a_pushed_external_key_never_reaches_the_device`,
+`agents/roomlerd/src/remote_config.rs:567`).
 
 **A non-security key on the same surface (FR-77 P3).** `encoder_cells_deny`
 — the cell matrix's denylist, comma-separated `name:chroma` entries or `none`
@@ -221,6 +251,84 @@ nothing, so `none` is how a push says the same thing while a blank box hands the
 key back to the device. A pushed value is not validated by the server, as with
 `encoder_cells_deny`: an entry the device cannot parse is skipped, never widened
 into a match, and `roomler config set fps_deny` refuses it locally.
+
+**A third (FR-130 P1b).** `color_description`, the switch that has every
+encoder write the BT.601 colour description it converted with
+([FR-130](fr/FR-130-colours-decode-true.md)), rides the same document on the
+same terms: `MANAGE_AGENTS` alone, because it is not a gate and grants nothing
+either way (`off` only removes metadata from the stream, and `on` writes what
+the built-in default writes), and `needs_restart`, because the encoders read it
+through the config fallbacks, registered once per process. It is the kill
+switch for a viewer or a player that misreads the description, reachable
+without a person at each device. On the device the key is a tribool, so a push
+carries a word:
+
+| pushed `color_description` | what the device's key becomes |
+|---|---|
+| absent | not managed: left as it is |
+| `""` | cleared, back to the built-in default (on) |
+| `off` | `false`: no description, the stream earlier agents sent |
+| `on` | `true` |
+
+Unlike the two denylists, the server reads the word. It takes the words
+`roomler config set` takes (`true`/`false`, `1`/`0`, `yes`/`no`, in any case),
+stores the spelling above, and refuses anything else with a 400 that names the
+key, recording nothing (`pushed_tribool`,
+`crates/modules/fleet/src/remote_config.rs:183`). A tribool has no entries a
+device could skip, so an unreadable word would reach every device as a no-op
+reported as applied. Both ends read the word with one function
+(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3118`), and a test
+holds it to what `roomler config set` reads. A word that reaches a device anyway,
+from some other server, leaves its key as it is, logged, and never fails the
+keys beside it (`agents/roomlerd/src/remote_config.rs:340`).
+
+⚠️ **Not managed is not a revert.** A device keeps what it was pushed last, so
+an `off` is undone by pushing the default, and only then stopping management:
+"Stop managing" alone leaves every device off. The dialog's select therefore
+has four states, not the switches' three: cleared (not managed), the built-in
+default, off and on (`ui/src/utils/managedTribool.ts`). An agent from before
+P1b ignores the key and reports the push applied, as it does any key it
+predates; no released agent before it writes a description at all, because P1
+ships with P1b.
+
+**A fourth (FR-132 P1).** `zero_copy_deny`, the GPU-input denylist and
+[FR-118](fr/FR-118-gpu-resident-frames.md)'s kill switch (comma-separated
+`name:gpu` entries such as `hevc_qsv:gpu`, or `none`), rides the same document
+on the terms of the two other denylists. It needs `MANAGE_AGENTS` alone, because
+it only ever *removes* a GPU form a device would otherwise open. It reports
+`needs_restart`, because the probe reads it once per process and the encoders
+read it through the config fallbacks
+(`agents/roomlerd/src/remote_config.rs:354`). The server passes it on unread
+(`crates/modules/fleet/src/remote_config.rs:283`): an entry the gate cannot read
+denies nothing, because `gpu_hint::is_denied` matches only an exact `name:gpu`.
+It exists so that a GPU-input cell can be turned off from the server before any
+cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
+
+| pushed `zero_copy_deny` | what the device's key becomes |
+|---|---|
+| absent | not managed: left as it is |
+| `""` | cleared: deny nothing |
+| `none` | `none`: deny nothing |
+| `hevc_qsv:gpu, av1_nvenc:gpu` | that list: those encoders take CPU frames, reason `denied` |
+
+⚠️ **`zero_copy` itself, the switch that turns the GPU path on, is NOT
+pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
+or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
+guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
+`crates/remote_control/src/models.rs:9779`); a prefix match would refuse the
+kill switch along with the switch.
+
+⚠️ **A push reaches a connected device within seconds, and takes effect at the
+restart after it.** A device that is offline picks it up at its next connect, and
+its row reads `pending` until then. Either way the running daemon stays on the
+old value: it writes the pushed one and reports `needs_restart`. Restart once the
+device reports `needs_restart`, because restarting a device that has not reported
+only delivers the push, and it takes a second restart. The same holds for every
+`needs_restart` key here.
+
+`roomler restart` at the device does it, with no `roomler exec` and no elevation.
+Taking a deny off costs the same: `none` arrives the same way, and the deny holds
+until the restart after it ([FR-132](fr/FR-132-zero-copy-by-default.md) §8).
 
 ## 7. What this does not do
 
@@ -338,7 +446,7 @@ flowchart TD
 
 **A second caller: the daemon itself (FR-96 P2b, 2026-10-13).** A per-user Linux
 daemon whose binary was replaced restarts through the same door once nothing it
-serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:326-385`).
+serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:335-394`).
 It runs the same supervisor proof, record and systemd read-back, but not
 `local_restart_enabled`, because no local client is asking. It is not a server
 lever: what sets it off is a file replaced ON the device, by the root update
@@ -413,7 +521,7 @@ which the daemon still refuses on the same terms as a local request.
    that `roomler exec` and `roomler ssh` talk to — measured on 0.4.169, the
    worker's file read `ssh_enabled = false` while the root half served SSH.
    The root daemon's socket is root-only and its person socket refuses every
-   config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3155`), so
+   config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3227`), so
    gate 4 on that daemon is an administrator's: `sudo roomler config set
    exec_enabled true`. The pane now says which file it edits and gives that
    command (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:828`;

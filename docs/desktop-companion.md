@@ -39,7 +39,7 @@ flowchart LR
 ```
 
 ⚠️ The LocalAPI is the trust boundary. On Windows its SDDL grants **SYSTEM, Administrators
-and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:2094`): any person
+and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:2138`): any person
 logged in at the machine can call it, a sandboxed low-integrity process cannot. Everything
 below that lets the companion *change* something is therefore something any interactive user
 can do — which is why the device-side rules (the `files_dir` SYSTEM rule, the visibility rule
@@ -110,7 +110,7 @@ sequenceDiagram
    flow id (`routeRows`, `:48`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
    one rolled generation).
-2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2187`)
+2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2231`)
    binds the first instance (retrying while another process holds the name), then runs a
    pool of accept tasks (`accept_pipe`, `:1976`), each owning one listening instance and
    re-creating it before handing a connected one off. Default 4
@@ -252,7 +252,7 @@ flowchart TD
 - **What never leaves the server:** machine ids, owner ids, WireGuard keys and key epochs,
   consent settings, codecs. Those fields are blanked *before* search runs, so `q` cannot be
   used to probe them. Search, sort and paging are the web grid's own
-  (`parse_query` / `apply_query`, `crates/api/src/routes/device.rs:289`, `:331`), so the two
+  (`parse_query` / `apply_query`, `crates/api/src/routes/device.rs:295`, `:337`), so the two
   grids cannot drift.
 - Proven by a negative control: with visibility taken from every live node instead of the
   shaped netmap, the enforce test leaks a withheld peer and fails
@@ -338,7 +338,7 @@ sequenceDiagram
     direct or relayed and over what, round trip) without any endpoint;
   - `Status` with its own name, version and server link, plus the root half's overlay
     addresses, exit status and MagicDNS (`person_socket::with_machine_network`) — and, since
-    #2892, **`network_from`** (`crates/localapi/src/lib.rs:186`): the root half's node id and
+    #2892, **`network_from`** (`crates/localapi/src/lib.rs:201`): the root half's node id and
     name, set only when those fields were lent. Nothing on the wire said so before, and `roomler status` as the console user
     printed the root half's address as this half's, right above this half's own "overlay OFF"
     enrollments. The CLI now marks `overlay ip` / `overlay ip6` "(the root daemon's)", adds a
@@ -353,7 +353,7 @@ sequenceDiagram
   `ConfigSet` are refused on the person socket, so Settings edits the per-user half's own
   file — and says so (§5). The same socket does tell the companion, and the CLI's
   `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:4646`), that a root half exists: `/var/run/roomler` is
+  `crates/localapi/src/lib.rs:4725`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
@@ -364,7 +364,7 @@ sequenceDiagram
 Most settings are read once at startup, so saving one is not the same as applying it. The
 Settings page collects the saved restart-required keys in a bar with an **Apply now** button;
 `roomler restart` is the same thing from a terminal. Both send `Request::RestartDaemon`
-(`crates/localapi/src/lib.rs:1482`), and **the daemon decides**.
+(`crates/localapi/src/lib.rs:1526`), and **the daemon decides**.
 
 It restarts only when it can prove that something will start it again — exiting an
 unsupervised `roomlerd run` would take the device offline for good:
@@ -378,7 +378,7 @@ unsupervised `roomlerd run` would take the device offline for good:
 | the macOS supervisor (FR-43) | the worker's `--supervised` flag | `9` | the supervisor |
 | anything else | — | **refused** | — |
 
-`9` is `RESTART_REQUESTED_EXIT_CODE` (`agents/roomlerd/src/watchdog.rs:190`); it is outside
+`9` is `RESTART_REQUESTED_EXIT_CODE` (`agents/roomlerd/src/watchdog.rs:199`); it is outside
 systemd's `RestartPreventExitStatus=7 8`, and the SCM host maps it to *respawn* as well.
 
 ```mermaid
@@ -399,7 +399,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/main.rs:1667`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:1814`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -439,6 +439,27 @@ sequenceDiagram
   persisted and reported as *applied-pending-restart*, and there is no server message that
   restarts anything (`docs/remote-config.md` §7b).
 
+### 7.1 The macOS permission card's Restart (#3164)
+
+macOS applies a Screen Recording grant to a freshly started process only, so a Mac's card offers
+**Restart roomlerd** beside its Screen Recording row: the same flow as *Apply now*
+(`window.Roomler.restartDaemon`, the LocalAPI `RestartDaemon` verb, the agent's own supervisor
+relaunches it). Accessibility needs none: the agent reads it live and opens its input backend
+again once it is granted.
+
+The card shows the **agent's** grants, as the agent reports them in its status
+(`NodeStatus.macos_grants`, read from its own process). Before #3164 it asked TCC about the
+menu-bar app's own process, `ai.roomler.agent-tray`, which never holds either grant: the card
+kept asking for both after the person had granted them to `roomlerd`, and its button registered
+the menu-bar app itself in the pane, as the "Roomler" entry that changes nothing. The buttons now
+only open the pane. An agent that does not report its grants (older than #3164, not running, or a
+root half with no GUI session) shows no card.
+
+macOS's own **Quit & Reopen** restarts the agent too (`agents/roomlerd/src/macos_quit.rs`): a
+Quit AppleEvent from anyone but `loginwindow` ends it with the supervisor's restart code instead
+of AppKit's exit 0. Up to 0.4.189 that button left the agent offline (`docs/installation.md`,
+the macOS grants).
+
 ## 8. What this device can encode
 
 The Overview's **Hardware video encoding** card is a codec × backend matrix — H.264, HEVC,
@@ -447,7 +468,7 @@ the software encoders — with the chroma each cell produced (4:2:0 / 4:4:4), de
 struck through, and how long the probe took.
 
 - It asks `Request::EncoderCaps`, which answers from the probe's **cached** result only
-  (`caps::cached()`, `agents/roomlerd/src/encode/caps.rs:48`). The capability probe runs in
+  (`caps::cached()`, `agents/roomlerd/src/encode/caps.rs:68`). The capability probe runs in
   child processes (vendor driver code) at the first server hello; a control-surface poll
   must never be what launches it — locked by `not_probed_never_triggers_a_probe`.
 - Three states: `ready` (the matrix), `not_probed` (the daemon has not connected yet — the
@@ -655,7 +676,9 @@ tries first:
 - it serves the safety surface: status, the sessions viewing the screen, their Disconnect,
   consent, the recording state and keep busy (FR-92); and, since FR-97 P2g, the Devices page
   and the mesh, read-only (§6); since P2h, the peers too, without the endpoints of either end
-  or of a relay, the carrier snapshot, the path decision or the probes (`localapi::person_view`).
+  or of a relay, the carrier snapshot, the path decision or the probes (`localapi::person_view`);
+  and since FR-85 P2e, recording: the Recordings view's start, stop, list and delete, and the
+  **Stop recording** on the banner and the tray.
 
 Everything else on it is refused with a pointer to `sudo roomler …`, so the companion's other
 views show that refusal on a system install. The kill switch is `ROOMLERD_PERSON_SOCKET=0`.
@@ -684,9 +707,9 @@ registered the moment it connects, and the banner used to come up then. It said 
 while nothing was shared yet. On a desktop that centres new windows, it also sat right over the
 dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat beside the
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
-dialog is the wait (`agents/roomlerd/src/peer.rs:5590`, `AskingMark`
-`agents/roomlerd/src/rc_sessions.rs:42`). The LocalAPI row carries the mark (`asking`,
-`crates/localapi/src/lib.rs:1261`), and the banner comes up only for a session that sees the
+dialog is the wait (`agents/roomlerd/src/peer.rs:5744`, `AskingMark`
+`agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
+`crates/localapi/src/lib.rs:1305`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:325`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.
@@ -815,7 +838,7 @@ step differently:
 
 | OS | How the companion ships | What moves it with the daemon |
 |---|---|---|
-| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1139`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
+| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1162`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
 | macOS | inside the daemon's `.pkg` (`/Applications/Roomler.app`) | the same `.pkg`: one install moves both |
 | Linux | its own `.deb`, or `.rpm` (§10.1) | FR-117 P1: the root update owner moves the package (`companion/package_sync.rs`) |
 

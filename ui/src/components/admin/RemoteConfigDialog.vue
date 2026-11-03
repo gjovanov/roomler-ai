@@ -23,10 +23,11 @@
           class="mb-4"
           icon="mdi-transfer-right"
         >
-          This records what you want the device to run. The device applies it
-          the next time it connects — and it may refuse: these switches belong
-          to whoever holds the machine, and a device only accepts them after
-          someone enables <code>remote_config_enabled</code> on it directly.
+          This records what you want the device to run. A connected device
+          hears within seconds and an offline one the next time it connects —
+          and it may refuse: these switches belong to whoever holds the machine,
+          and a device only accepts them after someone enables
+          <code>remote_config_enabled</code> on it directly.
         </v-alert>
 
         <!-- Where the last request actually got to. This is the whole reason
@@ -179,6 +180,48 @@
           <code>none</code> = deny nothing. It only ever removes rates, so no
           extra permission bit; takes effect at the next daemon restart.
         </div>
+        <v-text-field
+          v-model="zeroCopyDenyText"
+          label="GPU-input cells to deny (zero_copy_deny)"
+          placeholder="hevc_qsv:gpu, av1_nvenc:gpu"
+          density="compact"
+          variant="outlined"
+          hide-details
+          persistent-placeholder
+          class="mb-1"
+        />
+        <div class="text-caption text-medium-emphasis mb-4 ml-1">
+          Comma-separated <code>name:gpu</code> entries: encoders that must not
+          take captured frames straight from the GPU, and take them through
+          memory as before. The kill switch for a GPU-input cell that misbehaves
+          on a driver. Blank = not managed (the device keeps its own, which
+          denies nothing unless set there); <code>none</code> = deny nothing.
+          It only ever removes, so no extra permission bit; takes effect at the
+          next daemon restart. Turning the GPU path on is the device's own
+          setting, and cannot be pushed.
+        </div>
+        <!-- FR-130 P1b — four states, because a tribool key has three and a
+             request adds "not managed". Cleared and "default" differ: the
+             first leaves the device's value alone, the second clears it. -->
+        <v-select
+          v-model="colorDescriptionChoice"
+          :items="colorDescriptionOptions"
+          label="Colour description (color_description)"
+          density="compact"
+          variant="outlined"
+          clearable
+          hide-details
+          class="mb-1"
+        />
+        <div class="text-caption text-medium-emphasis mb-4 ml-1">
+          Whether the device's encoders tell the decoder the colour (BT.601,
+          limited range) they converted with. <strong>Off</strong> is the
+          kill switch for a viewer or player that misreads it: the stream goes
+          back to what agents sent before. Cleared = not managed, and the
+          device keeps its own value, so after an Off choose the default
+          before you stop managing it. It grants nothing, so no extra
+          permission bit; takes effect at the next daemon restart.
+        </div>
 
         <!-- The combination checks. Each of these produces a device that is
              "on" and reaches nobody — the exact silent-nothing this feature
@@ -260,6 +303,7 @@ import { deviceLabel } from '@/composables/useHideDeviceName'
 import { useAgentStore, type Agent, type DesiredConfig } from '@/stores/agents'
 import { useTenantStore } from '@/stores/tenant'
 import { canGrantDeviceExec, canGrantDeviceSsh } from '@/utils/permissions'
+import { triboolChoice, triboolWord } from '@/utils/managedTribool'
 import ManagedSwitch from './ManagedSwitch.vue'
 
 const props = defineProps<{
@@ -389,7 +433,7 @@ const status = computed<{ type: 'success' | 'info' | 'warning' | 'error'; icon: 
         icon: 'mdi-clock-outline',
         title: 'Waiting for the device',
         detail:
-          'Requested. The device reconciles when it next connects — an offline device picks this up on its own, nothing needs re-sending.',
+          'Requested. A connected device answers within seconds, and an offline device picks this up when it next connects — nothing needs re-sending.',
       }
     case 'reports_unsupported':
       return {
@@ -477,6 +521,28 @@ const fpsDenyText = computed({
     draft.value.fps_deny = t === '' ? undefined : t
   },
 })
+/** FR-132 P1 — the GPU-input denylist, the same shape again: a blank box is
+ *  "not managed", and `none` says "deny nothing". */
+const zeroCopyDenyText = computed({
+  get: () => draft.value.zero_copy_deny ?? '',
+  set: (v: string) => {
+    const t = v.trim()
+    draft.value.zero_copy_deny = t === '' ? undefined : t
+  },
+})
+/** FR-130 P1b — the colour-description switch. A cleared select is "not
+ *  managed"; "default" sends `''`, which clears the device's key. */
+const colorDescriptionChoice = computed({
+  get: () => triboolChoice(draft.value.color_description),
+  set: (v: unknown) => {
+    draft.value.color_description = triboolWord(v)
+  },
+})
+const colorDescriptionOptions = [
+  { title: 'Off: no colour description, as earlier agents sent', value: 'off' },
+  { title: 'On: describe the colour', value: 'on' },
+  { title: 'The device’s built-in default (on)', value: 'default' },
+]
 const accountOptions = [
   { title: 'The signed-in user at the device', value: 'console_user' },
   { title: 'The daemon account (SYSTEM / root)', value: 'daemon' },
@@ -484,6 +550,11 @@ const accountOptions = [
 
 const dirty = computed(() => JSON.stringify(draft.value) !== original.value)
 
+/** Fill the draft from the device's desired config on every open. Immediate
+ *  (#3156): AgentsSection mounts this dialog with `v-if` and opens it in the
+ *  same tick, so the first open MOUNTS it open and a lazy watch never fired:
+ *  the draft started empty and a Request dropped every key already managed.
+ *  It runs during setup, so it must stay below everything it reads. */
 watch(
   () => props.modelValue,
   (v) => {
@@ -499,11 +570,14 @@ watch(
       ssh_port: d?.ssh_port,
       encoder_cells_deny: d?.encoder_cells_deny,
       fps_deny: d?.fps_deny,
+      color_description: d?.color_description,
+      zero_copy_deny: d?.zero_copy_deny,
     }
     original.value = JSON.stringify(draft.value)
     if (agentStore.orgExecEnabled === null) void agentStore.fetchOrgExecEnabled(props.tenantId)
     if (agentStore.orgSshEnabled === null) void agentStore.fetchOrgSshEnabled(props.tenantId)
   },
+  { immediate: true },
 )
 
 async function submit(body: Draft) {

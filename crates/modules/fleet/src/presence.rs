@@ -26,8 +26,15 @@
 //! { "type": "device:presence",
 //!   "data": { "tenant_id": "<hex>",
 //!             "agents": [ { "agent_id": "<hex>", "name": "…",
-//!                           "presence": "online"|"stale"|"offline" } ] } }
+//!                           "presence": "online"|"stale"|"offline",
+//!                           "sleep": { "since": "<RFC 3339>",
+//!                                      "power": { "policy": "…", "on_ac": …,
+//!                                                 "held": … } } } ] } }
 //! ```
+//!
+//! `sleep` (FR-55 P4) rides an `offline` row only, and only when the device
+//! said goodbye before a sleep (`rc:agent.sleeping`): absent means "no
+//! reason given", which is every other way a device goes offline.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,6 +62,8 @@ pub struct PresenceUpdate {
     pub agent_id: ObjectId,
     pub name: String,
     pub presence: &'static str,
+    /// FR-55 P4 — why an `offline` device went: it announced a sleep.
+    pub sleep: Option<roomler_ai_remote_control::models::SleepView>,
 }
 
 /// FleetState-held fan-out state: per-tenant pending batches + the member-list
@@ -76,6 +85,20 @@ pub async fn note_transition(
     agent_id: ObjectId,
     name: &str,
     presence: &'static str,
+) -> bool {
+    note_transition_with(state, tenant_id, agent_id, name, presence, None).await
+}
+
+/// [`note_transition`], with the reason an `offline` device gave for going
+/// (FR-55 P4): the teardown after `rc:agent.sleeping` passes the notice, so
+/// the same event that turns the device grey says it is asleep.
+pub async fn note_transition_with(
+    state: &FleetState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    name: &str,
+    presence: &'static str,
+    sleep: Option<roomler_ai_remote_control::models::SleepView>,
 ) -> bool {
     match state
         .agents
@@ -107,6 +130,8 @@ pub async fn note_transition(
         agent_id,
         name: name.to_string(),
         presence,
+        // Only an offline row can carry a reason for being offline.
+        sleep: sleep.filter(|_| presence == OFFLINE),
     };
     let spawn_flusher = {
         let mut entry = state.presence_fanout.pending.entry(tenant_id).or_default();
@@ -143,16 +168,7 @@ async fn flush_tenant(state: &FleetState, tenant_id: ObjectId) {
         _ => return,
     };
 
-    let agents: Vec<serde_json::Value> = latest
-        .iter()
-        .map(|u| {
-            serde_json::json!({
-                "agent_id": u.agent_id.to_hex(),
-                "name": u.name,
-                "presence": u.presence,
-            })
-        })
-        .collect();
+    let agents: Vec<serde_json::Value> = latest.iter().map(presence_row).collect();
     let event = serde_json::json!({
         "type": "device:presence",
         "data": {
@@ -167,6 +183,22 @@ async fn flush_tenant(state: &FleetState, tenant_id: ObjectId) {
         &event,
     )
     .await;
+}
+
+/// One `device:presence` row. `sleep` is written only when there is one, so
+/// a client that predates FR-55 P4 receives byte-for-byte what it did.
+fn presence_row(u: &PresenceUpdate) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        "agent_id": u.agent_id.to_hex(),
+        "name": u.name,
+        "presence": u.presence,
+    });
+    if let Some(sleep) = &u.sleep
+        && let Ok(v) = serde_json::to_value(sleep)
+    {
+        row["sleep"] = v;
+    }
+    row
 }
 
 /// Collapse one window's transitions to a single row per agent, LAST write
@@ -351,7 +383,44 @@ mod tests {
             agent_id: ObjectId::from_bytes(raw),
             name: format!("box-{agent}"),
             presence,
+            sleep: None,
         }
+    }
+
+    /// FR-55 P4 — an offline row says why when the device announced a
+    /// sleep, and a row without a reason is exactly the pre-P4 shape.
+    #[test]
+    fn an_announced_sleep_rides_the_offline_row_and_nothing_else_changes() {
+        let plain = presence_row(&upd(1, OFFLINE));
+        let keys: Vec<&str> = plain
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["agent_id", "name", "presence"], "{plain}");
+
+        let mut asleep = upd(2, OFFLINE);
+        asleep.sleep = Some(roomler_ai_remote_control::models::SleepView {
+            since: "2026-10-30T12:00:00Z".into(),
+            power: roomler_ai_remote_control::models::PowerBrief {
+                policy: "never".into(),
+                on_ac: Some(false),
+                held: false,
+            },
+        });
+        let row = presence_row(&asleep);
+        assert_eq!(row["presence"], OFFLINE);
+        assert_eq!(row["sleep"]["since"], "2026-10-30T12:00:00Z");
+        assert_eq!(row["sleep"]["power"]["policy"], "never");
+        assert_eq!(row["sleep"]["power"]["held"], false);
+
+        // A later transition in the same window (the device woke and said
+        // hello) wins whole: the reason goes with the offline row it rode.
+        let out = coalesce(vec![asleep, upd(2, ONLINE)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].presence, ONLINE);
+        assert!(out[0].sleep.is_none());
     }
 
     /// A flapping agent must contribute exactly ONE row, carrying its LAST

@@ -182,7 +182,7 @@ describe('VideoTile — a black picture is named (FR-124)', () => {
     // which has no node, so `.vue` resolves through env.d.ts's shim and its
     // props are `object`: a literal naming a REAL prop then fails the
     // excess-property check there and nowhere else. Without it this broke
-    // every hosted-image build on master (7a5ca9f89, 2026-10-26). Same trap
+    // every hosted-image build on master (69b598136, 2026-10-26). Same trap
     // as KeepBusyMenu.spec.ts.
     await w.setProps({ videoPaused: true } as unknown as Parameters<typeof w.setProps>[0])
     expect(w.find('[data-testid="black-picture-notice"]').exists()).toBe(false)

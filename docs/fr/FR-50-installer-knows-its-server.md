@@ -19,6 +19,8 @@ script substitutes the default before the bytes leave the process.
 
 ## Root cause, with anchors
 
+*Anchors in this section: master `18b8c6870` (the claim). FR-50 shipped, and the code below moved since.*
+
 `scripts/install.sh:46`
 
 ```sh
@@ -82,7 +84,7 @@ there — but the request is made.
 **Substitute at serve time from `app.frontend_url`.**
 
 `frontend_url` is already the canonical "which server am I" value: it builds
-OAuth returns (`routes/auth.rs:167`), invite links (`routes/invite.rs:636`),
+OAuth returns (`routes/auth.rs:173`), invite links (`routes/invite.rs:636`),
 subscriber confirm/unsubscribe links (`routes/subscribe.rs:157,204`) and — since
 the 2026-07-28 tightening — the **CORS origin policy** itself
 (`crates/api/src/origin.rs:37`). A deployment whose `frontend_url` is wrong has
@@ -155,17 +157,30 @@ that could regress is the population whose served bytes do not change.
 
 ## Acceptance criteria
 
-- [ ] `curl <self-hosted>/api/setup/install.sh` returns a script whose `SERVER`
+- [x] `curl <self-hosted>/api/setup/install.sh` returns a script whose `SERVER`
       is that host, not `roomler.ai` — verified against a **running** self-host
       instance, not a unit test
-- [ ] `curl https://roomler.ai/api/setup/install.sh` is byte-identical to the
+      *Self-hosted stack on 0.4.40, failing baseline captured first:
+      `SERVER="https://roomler.ai"` before, `"http://localhost:8080"` after.*
+- [x] `curl https://roomler.ai/api/setup/install.sh` is byte-identical to the
       committed `scripts/install.sh`
-- [ ] the same holds for `install.ps1`
-- [ ] a `frontend_url` carrying a shell metacharacter serves the compiled-in
+      *On real prod, 2026-09-01: `curl … | diff - scripts/install.sh` → identical.*
+- [x] the same holds for `install.ps1`
+      *Same run: identical.*
+- [x] a `frontend_url` carrying a shell metacharacter serves the compiled-in
       default and logs a refusal (unit test)
-- [ ] editing the `SERVER=` line in either script fails `cargo test -p roomler-ai-api`
-- [ ] `docs/self-hosting.md` and `README.md` no longer instruct the reader to
+      *Unit-tested and field-tested: `…/oops"; rm -rf /; #` served the default and
+      logged a warning naming the value.*
+- [x] editing the `SERVER=` line in either script fails `cargo test -p roomler-ai-api`
+      *Checked by making the edit, not by reading the assertion.*
+- [x] `docs/self-hosting.md` and `README.md` no longer instruct the reader to
       pass `--server` on the served path
+      *`self-hosting.md` per the result; both re-read 2026-11-02: `README.md` does
+      not mention `--server` at all, and `self-hosting.md` names it only as an
+      optional override and a fallback for a wrong `ROOMLER_PUBLIC_URL`.*
+
+Evidence for all six: [#1083 — Result, field-verified on production](https://github.com/gjovanov/roomler-ai/issues/1083#issuecomment-5490112040).
+*Ticked 2026-11-02: verified on 09-01, never ticked in the spec.*
 
 ## Out of scope
 

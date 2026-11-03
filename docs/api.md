@@ -9,7 +9,10 @@ source of truth.
 - **Base URL**: `https://roomler.ai` (or your deployment). All JSON.
 - **IDs** are MongoDB ObjectIds serialized as 24-char hex strings.
 - **Errors** are JSON with an HTTP status; 404 is also used to *hide* resources the
-  caller may not see (platform-admin routes).
+  caller may not see (platform-admin routes). The body is `{error, message}`: `error`
+  is the code to branch on, and `message` is for reading. A collision no route put in
+  words answers `409 conflict` with `That already exists`
+  ([security-baseline.md](security-baseline.md) §5).
 
 ## Authentication
 
@@ -61,12 +64,69 @@ in shape (`…/tunnel-client/enroll-token` → `POST /api/tunnel-client/enroll` 
 `{tunnel_client_token}`), with a distinct audience so a leaked agent token can't
 impersonate a client or vice-versa.
 
+Since FR-129 A1 the installer can obtain the same `Enrollment` (or `TunnelEnrollment`)
+token **without anyone copying it**: `POST /api/pair/start` → the person types the
+`user_code` on `/pair` and approves → the installer's `POST /api/pair/poll` receives the
+token, minted on that first poll behind the same gate (`MANAGE_AGENTS` / membership),
+once. Everything after it — the enroll route, the single-use `jti`, the 10-minute life,
+the device cap, the archived-org refusal — is unchanged. The routes are in the public and
+user-scoped tables below; the contract is in
+[the spec](fr/FR-129-guided-cross-platform-installer.md#the-pairing-api).
+
+### Email sign-up and activation
+
+A password sign-up creates the account unverified and mails a link, which lands on the
+SPA's `/auth/activate` page. `login` refuses the account until the page has redeemed that
+link. The row keeps holding the address the whole time, because `users.email` is a unique
+index, so registering the same address again answers 409. The way back from a link that
+ran out is a new link, not a new account (#3199):
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant S as API
+    participant M as Mailbox
+
+    B->>S: POST /api/auth/register {email, username, display_name, password}
+    S-->>B: 201 {message}
+    S-->>M: a link, good for email.activation_token_ttl_minutes
+    Note over B,M: the link runs out
+    M-->>B: the person opens it anyway
+    B->>S: POST /api/auth/activate {user_id, token}
+    S-->>B: 400 Invalid or expired activation token
+    Note over B: the page offers a new link
+    B->>S: POST /api/auth/resend-activation {email}
+    S-->>B: 202 {message}, the same for every address
+    S-->>M: a new link, if the account is waiting and outside the cooldown
+    M-->>B: the person opens the new one
+    B->>S: POST /api/auth/activate {user_id, token}
+    S-->>B: 200, and sign-in works
+```
+
+| Rule | Where | Why |
+|---|---|---|
+| One answer for every address: unknown, waiting, active, inside the cooldown, malformed | `accept_resend`, `crates/api/src/routes/auth.rs:387` | a difference is an oracle for `users.email`, the key account-linking resolves against |
+| The answer does not wait for the lookup | the same function, deliberately not `async` | a known address costs more Mongo round trips than an unknown one, which is the same oracle in the latency |
+| Per client address: 5, then one every 3 minutes, a 429 with `Retry-After` | `ip_rate_limit`, `crates/api/src/middleware/auth_rate_limit.rs:157` | the route mails whoever its body names, so the budget must not reset per address |
+| Per account: one new link every 15 minutes, silently | `ACTIVATION_RESEND_COOLDOWN_SECS`, `crates/services/src/dao/user.rs:28` | a 429 here would only ever fire for an address that has an account |
+| Only a password sign-up still waiting is mailed: never an active account, a tombstone or a `.invalid` placeholder | `claim_activation_resend`, `crates/services/src/dao/user.rs:189` | it is one atomic update, so two pods cannot both send |
+
+⚠️ Sign-up does not start the cooldown. At a 5-minute link, a person back at minute 6 would
+otherwise be told a new one is coming and get nothing until minute 15. So the first resend
+is immediate at any TTL, and the stamp lives on the `users` row because `activation_codes`
+is TTL-reaped.
+
+⚠️ The address must match the sign-up's as typed, as it must for `login`: the index is
+case-sensitive, so `Alice@x` and `alice@x` can be two accounts.
+
 ### Rate limiting
 
 Everything under `/api` sits behind a per-client-IP governor (trusted-proxy-aware —
 it will not believe a client-supplied `X-Forwarded-For`). `POST /api/auth/login` and
-`/register` carry an additional per-(IP, account) brute-force gate. `/health`,
-`/ws`, `/derp`, and the Stripe webhook are deliberately outside the governor.
+`/register` carry an additional per-(IP, account) brute-force gate.
+`/resend-activation` has a stricter bucket of its own, keyed on the client address alone
+([above](#email-sign-up-and-activation)). `/health`, `/ws`, `/derp`, and the Stripe
+webhook are deliberately outside the governor.
 
 ## Public routes (no user JWT)
 
@@ -75,11 +135,12 @@ capability URLs, webhook signatures).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/auth/register` | Create account (+ optionally a tenant, or accept `invite_code`) |
+| POST | `/api/auth/register` | Create account (+ optionally a tenant, or accept `invite_code`). A taken address or username answers 409, in words (#3199) |
 | POST | `/api/auth/login` | Password login (`email` or `username`) |
 | POST | `/api/auth/logout` | Invalidate session |
 | POST | `/api/auth/refresh` | Rotate the access token |
-| POST | `/api/auth/activate` | Redeem an email activation code |
+| POST | `/api/auth/activate` | Redeem an email activation code (`{user_id, token}`); the SPA's `/auth/activate` page, where the activation email's link lands, posts it (#3029) |
+| POST | `/api/auth/resend-activation` | Ask for a new activation link (`{email}`). Always 202 with the same sentence; the lookup and the mail happen after the answer ([rules](#email-sign-up-and-activation), #3199) |
 | GET/PUT | `/api/auth/me` | Current user (read / update) |
 | GET | `/api/oauth/{provider}` | OAuth redirect (google, facebook, github, linkedin, microsoft) |
 | GET | `/api/oauth/callback/{provider}` | OAuth callback |
@@ -89,6 +150,8 @@ capability URLs, webhook signatures).
 | POST | `/api/stripe/checkout` · `/portal` | Stripe checkout / customer portal |
 | POST | `/api/stripe/webhook` | Stripe events (HMAC-signed; un-governed). FR-102 P4: the six billing kinds (`customer.subscription.{created,updated,deleted,trial_will_end}`, `invoice.paid`, `invoice.payment_failed`) are also recorded in `billing_events` with the invoice's amounts ([growth-observability.md](growth-observability.md#revenue-what-stripe-billed-p4)) |
 | POST | `/api/sendgrid/webhook` | FR-102 P5 (`saas`): SendGrid's Event Webhook — ECDSA P-256 signed, verified **before the body is parsed** (401), the empty 404 without `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY`; records `delivered` · `bounce` · `dropped` · `spamreport` of newsletter messages on their ledger rows (never opens or clicks); un-governed ([growth-observability.md](growth-observability.md#the-newsletter-delivery-per-issue-tags-and-unsubscribes-p5)) |
+| POST | `/api/pair/start` | FR-129 A1: an installer starts a **device pairing** instead of asking for a pasted token — `{machine_name, os, arch, role: daemon\|tunnel, halves?, client, client_version}` → `{device_code, user_code: "BCDF-GHJK", verification_uri, expires_in, interval}`. The `device_code` is the installer's secret (stored only as a hash, in no other response); the `user_code` is what the person types on `/pair`. Per-address ceiling (429 `rate_limited`); 415 unless the body declares `application/json` (every `/api/pair/*` route — a cross-site `text/plain` form cannot reach the cookie-authenticated routes without a preflight); 400 `network_unmounted` for a tunnel role on a server without the network module; the **empty 404** while `ROOMLER__PAIRING__ENABLED=false` ([the spec](fr/FR-129-guided-cross-platform-installer.md#the-pairing-api)) |
+| POST | `/api/pair/poll` | FR-129 A1: `{device_code}` → `{status: authorization_pending \| slow_down (+interval) \| access_denied \| expired_token \| approved (+tokens[], org_name, org_slug, approver_name, approver_username)}` — the installer shows the two unique handles beside the display names before it installs. The device code **is** the auth; an unknown, delivered or expired code answers `expired_token` alike. The first poll after an approval mints the ordinary single-use enrollment token(s) behind the approver's gate, re-checked — delivery is once |
 | POST | `/api/agent/enroll` | Exchange enrollment token → agent credential |
 | GET | `/api/agent/latest-release` | Agent release manifest (cached GitHub proxy) |
 | GET | `/api/agent/installer/{flavour}` (+`/health`) | Stream the MSI/installer through roomler.ai (`peruser` \| `permachine`) |
@@ -97,8 +160,9 @@ capability URLs, webhook signatures).
 | POST | `/api/tunnel-client/enroll` | Exchange tunnel enrollment token → client credential |
 | GET | `/api/tunnel-client/agents` | Reachable agents (TunnelClient bearer) |
 | GET | `/api/tunnel/latest-release` · `/installer/{platform}` (+`/health`) | Tunnel-CLI release manifest + artifact proxy |
-| GET | `/api/setup/latest-release` · `/{platform}` (+`/health`) | `roomler-setup` wizard manifest + artifact proxy |
+| GET | `/api/setup/latest-release` · `/{platform}` (+`/health`) | `roomler-setup` wizard manifest + artifact proxy. `?version=` (default `latest`). FR-129 C2, `?format=exe\|zip` (default `exe`): on Windows the default streams the signed wizard EXE itself (`roomler-setup-<v>-x86_64-pc-windows-msvc.exe`, `application/vnd.microsoft.portable-executable`) from the first `setup-v*` release that publishes one (`setup-v0.4.197`), and that release's zip otherwise; `zip` streams the zip, for a proxy that refuses an EXE download. Linux and macOS ignore the value; any other value is a 400. The health's `uri` carries a `format` the caller named. A sidecar (`.sha256`, `.asc`) is never the download (`crates/modules/fleet/src/setup_release.rs`, `pick_setup_asset`) |
 | GET | `/api/setup/install.sh` · `/install.ps1` | Terminal installers (served from the binary, curl-able) |
+| GET | `/api/setup/features` | FR-129 B1-s: the switches a client reads before offering an install path — `{"pairing": bool, "wizard_linux_daemon": bool, "wizard_macos_daemon": bool, "wizard_unix_daemon": bool, "wizard_pairing": bool}`, unauthenticated. `pairing` mirrors `ROOMLER__PAIRING__ENABLED`, a fact about this **server** (whether `/api/pair/*` answers), for the wizard to read. The `[setup]` switches are the operator's assertions about the **released** wizard, each default **`false`** and flipped after its field run: `wizard_linux_daemon` (`ROOMLER__SETUP__WIZARD_LINUX_DAEMON`) and `wizard_macos_daemon` (`ROOMLER__SETUP__WIZARD_MACOS_DAEMON`) — it installs the full daemon on that OS, so the enrollment dialog, both homepages and the wizard show that OS's daemon cards only on `true` (AC14; one switch per OS since B1-s2). The legacy `ROOMLER__SETUP__WIZARD_UNIX_DAEMON` turns both on, and each per-OS key answers its effective value. `wizard_unix_daemon` answers `wizard_linux_daemon && wizard_macos_daemon`: it is the one key the wizards released before the split read, for both OSes, so one OS on alone shows them nothing. A client reads its OS's key OR `wizard_unix_daemon`, which keeps a server from before the split working. `wizard_pairing` (`ROOMLER__SETUP__WIZARD_PAIRING`) — it pairs (A3), so the homepages say "sign in from your browser" only on `pairing && wizard_pairing`, never on the server's fact alone. ⚠️ Every consumer reads anything but a JSON `true` as `false`: a 404 (an older server), a 503 (fleet unmounted), non-JSON, a timeout — absent means the daemon wizard on Windows only and the token lead. Deliberately not a field on `latest-release`, whose bare array every shipped wizard parses ([the spec](fr/FR-129-guided-cross-platform-installer.md#b--the-full-daemon-from-the-gui-on-linux-and-macos)) |
 | POST | `/api/setup/diagnostics` | FR-102 P3b: the setup wizard's **opt-in** step diagnostics — one `{run, step, outcome, elapsed_ms, error_code, os, wizard_version}` per step boundary, sent only when the person ticked the box. Unauthenticated by necessity, so every field is checked against its vocabulary (422 with a code, nothing stored); body ≤ 1 KiB; ≤ 48 rows per run (429 `run_capped`); 202 with no body. Stores no IP and no User-Agent. The empty 404 while `ROOMLER__GROWTH__SETUP_DIAGNOSTICS=false` ([growth-observability.md](growth-observability.md#the-wizards-opt-in-diagnostics-p3b)). The static segment also makes `GET /api/setup/diagnostics` a 405 (it used to fall into the `{platform}` proxy's 400) |
 | POST | `/api/releases/refresh` | CI cache-bust after a release is published (bearer; fans out to all pods) |
 | GET | `/api/turn/credentials` | Ephemeral TURN credentials (user-scoped) |
@@ -123,6 +187,9 @@ capability URLs, webhook signatures).
 | PUT | `/api/notification/{id}/read` | Mark one read |
 | POST | `/api/notification/read-all` | Mark all read |
 | GET/PUT | `/api/user/newsletter` | FR-58: the signed-in newsletter toggle — a door into the same `subscribers` store the public form writes; subscribing pre-confirms only on a verified account email |
+| POST | `/api/pair/lookup` | FR-129 A1: `{user_code}` → what the typed code names, before approving it — `{machine_name, os, arch, role, halves, client, client_version, country, started_at, expires_at}`; 404 unless a live pending pairing has that code. Each 404 is a miss against the account; past `ROOMLER__PAIRING__MISSES_PER_ACCOUNT_PER_HOUR` the three pairing routes answer 429 for the hour. Every call audited (`pairing_audit`) |
+| POST | `/api/pair/approve` | FR-129 A1: `{user_code, tenant_id}` → `{approved: true}`. The decision, recorded; **no token yet**. `MANAGE_AGENTS` in that org for a daemon pairing, membership for a tunnel one — the same gate the enroll-token routes hold, re-checked at delivery. 403 `forbidden` (the gate, counted as a miss, or an **archived** org, refused before the decision is recorded; **never `not_a_member`**, the one code the SPA leaves the org on — a refused approval must not evict the person from `/pair`), 404 not pending, 400 `network_unmounted`. The org's other `MANAGE_AGENTS` holders are told by push and email |
+| POST | `/api/pair/deny` | FR-129 A1: `{user_code}` → `{denied: true}`; the installer's next poll answers `access_denied`. 404 counted as a miss |
 
 ### Device-scoped — `/api/agent/self/*` (agent JWT, no tenant prefix)
 
@@ -146,7 +213,9 @@ is listed, under `enforce` exactly the peers the netmap would ship. A device
 without a live overlay node lists itself alone (`overlay: "no_node"`; `"no_network"`
 when the org has no mesh yet, `"unavailable"` without the network module), and the
 GET never creates a network row. Rows carry `display_name`, `name`, `os`, `version`,
-`presence`, `overlay_ip`, MagicDNS, `tags`, `reachable` and `is_self` — never
+`presence`, `overlay_ip`, MagicDNS, `tags`, `reachable`, `is_self` and, on a device
+that is not online because it announced a sleep, `asleep_since` (FR-55 P4: the fact
+and the moment, never its power policy, [power.md](power.md) §3.4) — never
 `machine_id`, owner ids, keys, consent settings or codecs; those fields are blanked
 before the search runs, so `q` cannot probe them.
 
@@ -179,7 +248,7 @@ before the search runs, so `q` cannot probe them.
 | GET | `/api/admin/stats/relay/current` · `/relay/history` | Relay (TURN/DERP) load, live + series |
 | GET | `/api/admin/stats/orgs` · `/users` · `/machines` · `/calls` | Platform-wide inventories |
 | GET | `/api/admin/stats/usage` · `/usage/{user_id}` | Per-user usage across every org |
-| GET | `/api/admin/stats/attribution` | FR-88: sign-ups by campaign key and how many activated — counts only |
+| GET | `/api/admin/stats/attribution` | FR-88: sign-ups by campaign key, and FR-91: by blog landing page, and how many activated — counts only |
 | GET/PUT | `/api/admin/growth/exclusions` | FR-102 P1c: the orgs and people no growth number counts — the implicit set (platform admins, the orgs they own) marked beside the explicit rows; PUT replaces the explicit list (`{kind: tenant\|user, id, reason}`). 404 also when `growth.enabled = false` |
 | GET | `/api/admin/growth/digest?day=` · `/digests?since=&limit=` | FR-102 P1d: a stored daily digest (the latest when `day` is omitted; dates as RFC 3339 strings), and the list with each day's status and headline ([growth-observability.md](growth-observability.md)) |
 | POST | `/api/admin/growth/digest/run?day=&send=false` | Recompute and overwrite a closed day's sections, through the same claim the scheduler uses (409 while a run of that day is in progress); `send=false` ends `preview`, which the scheduler still claims; mails only with `send=true` AND a day not already `sent` |
@@ -281,7 +350,8 @@ agent's session can change it.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `…/agent` | List enrolled devices (status, caps, overlay info) |
+| GET | `…/agent` | List enrolled devices (status, caps, overlay info). FR-55 P4: `power {policy, on_ac?, held}`, the posture the device last reported (absent from an agent that predates it: unknown, never `never`), and, on a device that is not online, `sleep {since, power}` when it announced a sleep ([power.md](power.md) §3) |
+| GET | `…/device` | The unified devices grid (agents and tunnel clients), searched, sorted and paged on the server. FR-55 P4: an agent that is not online and announced a sleep carries `sleep {since, power}`, which the dashboard reads as **asleep** ([power.md](power.md) §3.4) |
 | POST | `…/agent/enroll-token` | Mint an enrollment token (10 min, single-use) |
 | POST | `…/agent/update` · `…/agent/{aid}/update` | Operator-forced self-update (fleet / one device), `{pin?, force?}` (+ `agent_ids?` for the fleet). A push that would not be acted on is refused, never sent: FR-2's downgrade guard (`pin_downgrade`, unless `force`), and since FR-67 P7 a device whose caps say it ignores the push (`primary_org`, a secondary enrollment) or drops it (`auto_update_off`). `force` lifts only the first. One device answers **409** with the reason; the fleet route skips the device with a `refused` reason and its `refused_code`, and counts it in `refused` |
 | POST | `…/agent/{aid}/join-org` · GET `…/join-targets` | Add an enrolled device to a second org (multi-org) |
@@ -292,6 +362,12 @@ agent's session can change it.
 | POST | `…/agent/{aid}/exec/{request_id}/cancel` | Cancel a running exec |
 | PUT | `…/agent/{aid}/exec-policy` | Per-device exec gate (a management act, separate from the exec power) |
 | POST | `…/agent/{aid}/overlay-key/rotate` | Order the device to retire its overlay (WireGuard) key — it mints locally, re-joins and reports back; the server never sees a private key (FR-40). `MANAGE_AGENTS`, one order per device per minute. 200 `{request_id, dispatch: "pushed" \| "queued", delivered}`; 409 `rate_limited` / `agent_unsupported` (online device without the `key-rotate` verb) — see [overlay-key-rotation.md](overlay-key-rotation.md) |
+| GET/POST | `…/agent/{aid}/connect-code` | The code an outsider names a device by (FR-52). `MANAGE_AGENTS`, and never in the ordinary device list. **GET** reads it whether or not the device is approved: 200 `{connect_code, connect_code_rotated_at}`, both null when none has been minted; 404 for a removed device. **POST** mints or rotates it: 200 `{connect_code, rotated_at}`, and the old code stops working at once |
+| GET/PUT | `…/external-access` | FR-52 gate 1, the org's switch ([external-access.md](external-access.md)). GET `MANAGE_AGENTS`, with the approved devices. PUT `MANAGE_TENANT`: it decides whether the org can be reached from outside at all |
+| PUT | `…/agent/{aid}/external-access-policy` | FR-52 gate 2: approve a device, with a ceiling and an optional expiry, or clear it. `MANAGE_AGENTS` + `REMOTE_CONTROL` to approve, `MANAGE_AGENTS` alone to clear. Both arms and every refusal reach the log |
+| GET | `…/external-rc-audit` | Every external-access decision, the refusals included, newest first (`page`, `per_page`). `VIEW_REMOTE_AUDIT`. 90 d TTL |
+| GET | `…/external-principals` | Who has come in from outside, one row per person per device, the most recent first (`page`, `per_page`): `{agent_id, user_id, name, first_session_at, last_session_at, revoked_at}`. `name` is what the account calls itself today, a claim, and `null` once it is gone. `VIEW_REMOTE_AUDIT` (FR-52 P5) |
+| PUT | `…/agent/{aid}/external-principals/{user_id}` | Bar a person from this device, or let them back: `{revoked}`. `MANAGE_AGENTS` to bar, + `REMOTE_CONTROL` to let back, decided before the row is read, so a refused caller gets one 403 whether or not the person came in. A bar ends their external session on whichever pod holds it. 404 for a person with no row: only a session makes one (FR-52 P5) |
 | GET | `…/exec-audit` | Org-wide exec attempt log (every refusal included) |
 | GET/PUT | `…/exec-settings` | Org exec kill-switch (gate 1 of 4) |
 | GET/PUT | `…/keep-busy-settings` | The org's keep-busy policy (FR-92): `{keep_busy_denied, keep_busy_default_pattern}`. **GET: any member** (a viewer pre-selects the default). **PUT: `MANAGE_TENANT`**; each field optional, absent = unchanged, `keep_busy_default_pattern: null` = the product default (circle); a pattern not in the agent's exact wire list is a 400; a deny in the body is pushed to every device — see [keep-busy.md](keep-busy.md) §7, §12 |
@@ -333,6 +409,7 @@ before it leaves the host.
 | GET/PUT | `…/magic-dns` | Tenant MagicDNS domain + upstream resolvers |
 | GET | `…/overlay-block` | The tenant's overlay address block |
 | POST | `…/overlay-block/renumber` | Migrate onto a disjoint block (**dry-run by default**; cycles agent connections) |
+| POST | `…/overlay-block/reconcile-hosts` | FR-47 P3: return leaked host ordinals to the tenant's recycle pool, each through `release_host`. Platform operator only (anyone else gets 404); **dry-run by default** ([overlay-communication.md](overlay-communication.md), *Pre-release gaps*) |
 
 ### Agent sessions (FR-90, module `hive` — mounted only with `[modules] hive = true` or a `hive.tenants` list)
 

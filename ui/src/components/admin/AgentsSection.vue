@@ -403,7 +403,7 @@
                 @input-mode="(m: 'free' | 'exclusive') => onInputModeChange(agentFor(item)!, m)"
                 @idle-minutes="(m: number) => onIdleMinutesChange(agentFor(item)!, m)"
                 @lock-on-end="(l: LockOnEnd) => onLockOnEndChange(agentFor(item)!, l)"
-                @rc-overlay="(v: boolean) => onRcOverlayChange(agentFor(item)!, v)"
+                @rc-overlay="(m: RcOverlayMode) => onRcOverlayChange(agentFor(item)!, m)"
               />
             </template>
             <span v-else class="text-caption text-medium-emphasis">—</span>
@@ -795,7 +795,7 @@
                       @input-mode="(m: 'free' | 'exclusive') => onInputModeChange(agentFor(item)!, m)"
                       @idle-minutes="(m: number) => onIdleMinutesChange(agentFor(item)!, m)"
                       @lock-on-end="(l: LockOnEnd) => onLockOnEndChange(agentFor(item)!, l)"
-                      @rc-overlay="(v: boolean) => onRcOverlayChange(agentFor(item)!, v)"
+                      @rc-overlay="(m: RcOverlayMode) => onRcOverlayChange(agentFor(item)!, m)"
                     />
                   </v-expansion-panel-text>
                 </v-expansion-panel>
@@ -1116,7 +1116,7 @@
     v-model="remoteConfigDialogOpen"
     :tenant-id="tenantId"
     :agent="remoteConfigTarget"
-    @saved="agentStore.fetchAgents(tenantId); fetchGrid()"
+    @saved="onRemoteConfigSaved"
   />
 
   <!-- FR-40 — rotate-overlay-key confirmation -->
@@ -1453,6 +1453,7 @@ import {
   type ConsentMode,
   type EnrollmentToken,
   type LockOnEnd,
+  type RcOverlayMode,
 } from '@/stores/agents'
 import { codecChips, permissionWarnings } from './agentCodecChips'
 import { keepBusyBriefTitle } from '@/composables/keepBusy'
@@ -1479,6 +1480,7 @@ import {
   type TunnelEnrollmentToken,
 } from '@/stores/tunnelClients'
 import { useDeviceStore, type DeviceRow } from '@/stores/devices'
+import { presenceColor, presenceIcon, presenceLabel, presenceTitle } from '@/utils/devicePresence'
 import { useAuthStore } from '@/stores/auth'
 import { useGridColumns } from '@/composables/useGridColumns'
 import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
@@ -1492,7 +1494,7 @@ import GridColumnPickerDialog from '@/components/common/GridColumnPickerDialog.v
 import DeviceEditDialog, { type EditableDevice } from '@/components/admin/DeviceEditDialog.vue'
 import DeviceActionsMenu, { type DeviceAction } from './DeviceActionsMenu.vue'
 import DeviceAccessPolicyFields from './DeviceAccessPolicyFields.vue'
-import { policySummary } from './devicePolicy'
+import { policySummary, rcOverlayFields, rcOverlayMode } from './devicePolicy'
 import FactChip from '@/components/common/FactChip.vue'
 
 const props = defineProps<{ tenantId: string }>()
@@ -1725,32 +1727,22 @@ const pageRangeText = computed(() => {
 })
 
 // Row-level presence rendering (DeviceRow carries presence directly).
+// FR-55 P4 — and why an offline agent is offline, when it said it was going
+// to sleep (`utils/devicePresence.ts`).
 function rowPresenceColor(r: DeviceRow): string {
-  return r.presence === 'online' ? 'success' : r.presence === 'stale' ? 'warning' : 'grey'
+  return presenceColor(r)
 }
 function rowPresenceIcon(r: DeviceRow): string {
-  return r.presence === 'online'
-    ? 'mdi-circle'
-    : r.presence === 'stale'
-      ? 'mdi-circle-half-full'
-      : 'mdi-circle-outline'
+  return presenceIcon(r)
 }
 function rowPresenceTitle(r: DeviceRow): string {
-  if (r.kind === 'tunnel_client')
-    return r.is_online ? 'Online (stored status)' : 'Offline (stored status)'
-  return r.presence === 'online'
-    ? 'Online — a control socket is registered'
-    : r.presence === 'stale'
-      ? 'Stale — heartbeat fresh but no socket registered (a half-open network leg or a ' +
-        'recent server roll). It should heal within minutes; otherwise restart the Roomler ' +
-        'service on the machine.'
-      : 'Offline'
+  return presenceTitle(r, fmtDate)
 }
 function rowStatusColor(r: DeviceRow): string {
   return rowPresenceColor(r)
 }
 function rowStatusLabel(r: DeviceRow): string {
-  return r.presence
+  return presenceLabel(r)
 }
 
 // ── Edit name & tags ─────────────────────────────────────────────
@@ -1998,13 +1990,14 @@ async function onLockOnEndChange(a: Agent, lock: LockOnEnd) {
   }
 }
 
-async function onRcOverlayChange(a: Agent, rc_overlay: boolean) {
-  if ((a.access_policy.rc_overlay ?? false) === rc_overlay) return
+async function onRcOverlayChange(a: Agent, mode: RcOverlayMode) {
+  if (rcOverlayMode(a.access_policy) === mode) return
   consentBusy.value = a.id
   try {
     await agentStore.updateAccessPolicy(props.tenantId, a.id, {
       ...a.access_policy,
-      rc_overlay,
+      // FR-128 — both fields, so the row never says `on` and `auto` at once.
+      ...rcOverlayFields(mode),
     })
   } catch (e) {
     agentStore.error = (e as Error).message
@@ -2279,6 +2272,20 @@ function openRemoteConfig(a: Agent) {
   remoteConfigDialogOpen.value = true
 }
 
+/** How long after a save the row is read again. A connected device answers
+ *  within a second or two, after the read the save itself triggers, so without
+ *  a second read the row would say `pending` until the next page load. */
+const REMOTE_CONFIG_ANSWER_MS = 3000
+
+function onRemoteConfigSaved() {
+  const refresh = () => {
+    agentStore.fetchAgents(props.tenantId)
+    fetchGrid()
+  }
+  refresh()
+  window.setTimeout(refresh, REMOTE_CONFIG_ANSWER_MS)
+}
+
 /** The row badge for a device with a pending / refused / failed config
  *  request. `null` for `applied` and for devices nobody is managing — a
  *  steady-state chip on every row is noise that trains people to stop reading
@@ -2318,7 +2325,7 @@ function remoteConfigChip(
         color: 'info',
         icon: 'mdi-clock-outline',
         text: 'config pending',
-        tooltip: 'Waiting for the device to reconnect and reconcile.',
+        tooltip: 'Waiting for the device: a connected one answers within seconds, an offline one when it next connects.',
       }
     case 'reports_unsupported':
     case 'push_unsupported':

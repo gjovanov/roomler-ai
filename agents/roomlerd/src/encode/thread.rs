@@ -147,8 +147,9 @@ impl<E: EncoderOps> EncoderThread<E> {
             .name(name.clone())
             .spawn(move || {
                 // FR-112 P1 — ask for this thread's clock before anything else:
-                // threads the encoder creates later (libvpx's workers, at the
-                // first encode) inherit it.
+                // on Linux, threads the encoder creates later (libvpx's workers,
+                // at the first encode) inherit it. macOS and Windows do not
+                // pass it on (`encode::clock`).
                 crate::encode::clock::ask_for_this_thread("encoder");
                 // The encoder arrives right after the spawn succeeded; a sender
                 // dropped without sending means the caller kept it, and this
@@ -506,7 +507,7 @@ mod tests {
             height: 2,
             stride: 8,
             pixel_format: PixelFormat::Bgra,
-            data: vec![tag; 16],
+            data: vec![tag; 16].into(),
             monotonic_us: u64::from(tag) * 33_333,
             monitor: 0,
             damage: Damage::Unknown,
@@ -543,12 +544,12 @@ mod tests {
             self.log
                 .lock()
                 .unwrap()
-                .push(format!("encode:{}@{thread}", frame.data[0]));
+                .push(format!("encode:{}@{thread}", frame.cpu()[0]));
             if self.fail_encode {
                 return Err(anyhow!("hw says no"));
             }
             Ok(vec![crate::encode::EncodedPacket {
-                data: vec![frame.data[0]],
+                data: vec![frame.cpu()[0]],
                 is_keyframe: false,
                 duration_us: 33_333,
                 qp: None,

@@ -8,7 +8,7 @@
 #   2. the CI check       -- blocks the merge (required status check on master)
 #   3. the periodic sweep -- cleans what the first two let through
 #
-# Layer 3 has now run three times. Each run force-pushes ~700 branches and ~660
+# Layer 3 has now run five times. Each run force-pushes ~1000 branches and ~700
 # tags with GitHub Actions disabled around it, and it STILL cannot remove
 # anything from GitHub: the pre-rewrite commits stay reachable by SHA through
 # refs/pull/* until GitHub Support runs GC. The only cheap place to fix this is
@@ -79,16 +79,51 @@ done
 # on its own from there.
 GITDIR="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
 
+# ── The sanitize map, on a machine that has one ──────────────────────────────
+# The map pairs every known real name with its alias, so it lives OUTSIDE the
+# repo, on the machines that run the sweep. Where one is configured, the guard
+# also refuses the names it lists wherever the commit adds one, and prints
+# only the alias (check_shapes.py, "the map gate"). Without one -- CI included
+# -- nothing here changes. The path comes from the environment or git config,
+# never from a file in this repo:
+#
+#     git config --global roomler.sanitizeMap <path-to-map>    # once per machine
+#
+# ⚠️ core.hooksPath can point every worktree at ONE clone's .githooks, while
+# GUARD is each worktree's own copy. A worktree on a branch from before the map
+# gate has a guard without --map, and handing it the flag makes argparse exit 2
+# ("could not run"), which would switch off the SHAPE check there too. So the
+# flag goes only to a guard that has the gate.
+MAP="${ROOMLER_SANITIZE_MAP:-$(git config --get roomler.sanitizeMap 2>/dev/null || true)}"
+if [ -n "$MAP" ]; then
+  if [ ! -f "$MAP" ]; then
+    echo "WARNING: sanitize map configured but not found ($MAP) -- mapped names NOT checked." >&2
+    MAP=""
+  elif ! grep -q 'class MapGate' "$GUARD"; then
+    echo "WARNING: this checkout's guard predates the map gate -- mapped names NOT checked." >&2
+    echo "         Rebase onto master to get it. The shape check still runs." >&2
+    MAP=""
+  else
+    case "$MAP" in *"'"*)   # it crosses into WSL inside single quotes
+      echo "WARNING: sanitize map path holds a quote -- mapped names NOT checked." >&2
+      MAP="" ;;
+    esac
+  fi
+fi
+
 run_guard() {
   if [ -n "$PY" ]; then
-    "$PY" "$GUARD" --root "$REPO" --staged 2>&1
+    if [ -n "$MAP" ]; then set -- --map "$MAP"; else set --; fi
+    "$PY" "$GUARD" --root "$REPO" --staged "$@" 2>&1
   else
     # No native interpreter: fall back to WSL, which is how this repo is built
     # on Windows anyway. Paths must cross the boundary too.
+    mapflag=""
+    [ -z "$MAP" ] || mapflag="--map \"\$(wslpath '$MAP')\""
     wsl -- bash -lc "
       export GIT_DIR=\"\$(wslpath '$GITDIR')\"
       export GIT_WORK_TREE=\"\$(wslpath '$REPO')\"
-      python3 \"\$(wslpath '$GUARD')\" --root \"\$(wslpath '$REPO')\" --staged" 2>&1
+      python3 \"\$(wslpath '$GUARD')\" --root \"\$(wslpath '$REPO')\" --staged $mapflag" 2>&1
   fi
 }
 
@@ -157,9 +192,13 @@ the repo, at the path recorded in the skill's SKILL.md), then re-stage:
     python3 .claude/skills/sanitize-hostnames/sanitize.py \
         --map <path-to-map> --root . --apply
 
+A line shown as `-> ALIAS` is a name from the sanitize map: write that alias
+in its place.
+
 If this is a FALSE POSITIVE, fix the SHAPE or the ALLOW list in
-check_shapes.py and add a canary to selftest.sh -- never silence it by
-adding the real name, and never by reaching for --no-verify.
+check_shapes.py and add a canary to selftest.sh (for a map name, a `!keep`
+line in the map) -- never silence it by adding the real name, and never by
+reaching for --no-verify.
 ------------------------------------------------------------------------
 EOF
   exit 1

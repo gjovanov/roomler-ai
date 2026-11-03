@@ -26,6 +26,11 @@ flowchart TB
     BIN -.->|"Ed25519 tickets"| DERP
 ```
 
+**The blog is not on this path.** The edge sends `/blog/` and `/sitemap-blog.xml` to `roomler-blog`,
+nginx ×2 in the same namespace, fed from a MinIO bucket by a private publisher (FR-91). Rolling it
+touches no long-lived socket, and publishing a post never rolls `roomler2`:
+[public-site.md §11](public-site.md).
+
 ## The server image
 
 One multi-stage `Dockerfile`:
@@ -392,6 +397,11 @@ The multi-pod design is settled and documented in
   relay: DB-free, no JWT secret, authenticates agents by server-minted Ed25519
   tickets. One small VM per region is enough; it forwards WireGuard ciphertext it
   cannot read.
+  - `DERP_NETWORKS` (FR-76 P3) makes a relay serve only the overlay networks it
+    lists, and answer a valid ticket for any other `403` before registering it.
+    The regional PoPs leave it unset and serve every network. Set but empty or
+    malformed, the relay refuses to start
+    ([`scripts/relay-pop/README.md`](../scripts/relay-pop/README.md)).
 
 ## Cluster hosts: the media DNAT and the host's own mesh node
 

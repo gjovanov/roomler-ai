@@ -284,6 +284,14 @@ impl ViewerIndicator {
         }
     }
 
+    /// FR-85 P3d — when a client first read `session_id` as recording.
+    pub fn recording_read_at(
+        &self,
+        session_id: &bson::oid::ObjectId,
+    ) -> Option<std::time::Instant> {
+        self.registry.recording_read_at(session_id)
+    }
+
     /// FR-99 — put `session_id`'s privacy curtain up (`on`) or take it down.
     /// `true` only when the curtain is UP and out of every capture path; the
     /// overlay checks the affinity after setting it rather than trusting the

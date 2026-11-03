@@ -151,6 +151,21 @@ pub struct NetworkOrigin {
     pub name: String,
 }
 
+/// FR-55 P4 — the power keeper's posture, as `roomler status` shows it. The
+/// leaf mirror of the server wire's `PowerBrief` (this crate depends on no
+/// wire crate): the same three fields, the same omission rule.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PowerStatus {
+    /// `never` · `on-ac` · `always`, as the keeper parsed `power_policy`.
+    pub policy: String,
+    /// `Some(true)` on mains, `Some(false)` on battery, `None` = cannot tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_ac: Option<bool>,
+    /// The keeper holds the machine awake right now (the policy, or a live
+    /// session).
+    pub held: bool,
+}
+
 /// Snapshot of the local node.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct NodeStatus {
@@ -186,6 +201,14 @@ pub struct NodeStatus {
     pub network_from: Option<NetworkOrigin>,
     /// Connected to the coordination server.
     pub connected: bool,
+    /// FR-55 P4 — this device's power posture: the standing `power_policy`,
+    /// the power source, and whether the keeper holds the machine awake.
+    /// What tells an operator, before it happens, whether this device will
+    /// read "asleep by policy" when it sleeps. `None` from a daemon that
+    /// predates the field, or whose keeper has not decided yet; an older CLI
+    /// ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<PowerStatus>,
     /// FR-51 P4 — this daemon's PRIMARY enrollment is ephemeral: the server
     /// reaps the device after silence, and the daemon de-enrolls itself on a
     /// clean stop. Additive both ways: an older daemon omits it (⇒ false),
@@ -423,6 +446,15 @@ pub struct NodeStatus {
     /// "Change…" / "Use default".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_dir: Option<String>,
+    /// #3164 — the two macOS grants as THIS daemon process holds them, for the
+    /// menu-bar app's permission card. That card used to ask TCC about its own
+    /// process (`ai.roomler.agent-tray`), so it never saw the agent's grants:
+    /// it kept asking for both after the person had granted them, and its
+    /// Grant button registered the menu-bar app itself in the pane (the
+    /// "Roomler" entry that changes nothing). `None` off macOS, from a daemon
+    /// with no GUI session (a Mac's root half), and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_grants: Option<MacosGrants>,
     /// FR-67 P3 — what the most recent install attempt came to, as the
     /// post-install watcher left it in `<log_dir>/last-install.json`
     /// ([`LastInstallStatus`]). Read from disk on every answer, so a verdict
@@ -437,6 +469,18 @@ pub struct NodeStatus {
     /// Collapsing any two of them recreates that bug one layer up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_install: Option<LastInstallStatus>,
+}
+
+/// #3164 — what [`NodeStatus::macos_grants`] reports.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacosGrants {
+    /// Screen Recording, as this process can use it. macOS applies a new grant
+    /// to a freshly started process only, so this stays `false` after the
+    /// person turns it on, until the daemon restarts.
+    pub screen_recording: bool,
+    /// Accessibility, read live: a grant shows here at once, and input works
+    /// from the next event without a restart.
+    pub accessibility: bool,
 }
 
 /// FR-67 P3 — the post-install watcher's record of the most recent install
@@ -2349,6 +2393,12 @@ impl ClientPeer {
         peer_may_start_keep_busy(self, scope, console_session_id(), own_uid())
     }
 
+    /// FR-85 P2e — may this peer start, stop or delete a recording, on
+    /// `scope`'s endpoint? [`peer_may_record`].
+    pub fn may_record(&self, scope: Scope) -> bool {
+        peer_may_record(self, scope, console_session_id(), own_uid())
+    }
+
     /// FR-90 P3-9-2b — may this peer run `roomler connect` here (decision
     /// 26)? [`peer_may_connect`].
     pub fn may_connect(&self) -> bool {
@@ -2465,6 +2515,26 @@ pub fn peer_may_start_keep_busy(
     match scope {
         Scope::Person => peer.uid.is_some(),
         Scope::Full => matches!((peer.uid, own_uid), (Some(p), Some(o)) if p == o),
+    }
+}
+
+/// FR-85 P2e — the pure decision behind [`ClientPeer::may_record`].
+///
+/// The daemon's own endpoints keep [`peer_is_console_user`]. On the person
+/// socket of a system install that gate cannot pass: it compares the peer with
+/// this daemon, which is root, and the person at the seat is not. There the
+/// listener has already taken the kernel's word that the peer is that person
+/// or root ([`person_peer_ok`]), so all that is left to ask is whether the
+/// peer was identified at all.
+pub fn peer_may_record(
+    peer: &ClientPeer,
+    scope: Scope,
+    console_session: Option<u32>,
+    own_uid: Option<u32>,
+) -> bool {
+    match scope {
+        Scope::Person => peer.uid.is_some(),
+        Scope::Full => peer_is_console_user(peer, console_session, own_uid),
     }
 }
 
@@ -3137,8 +3207,9 @@ pub enum Scope {
     Full,
     /// The person-at-the-device socket of a Linux system install, and of a
     /// Mac's root half ([`serve_person_socket`]): only what that person needs
-    /// to see who is viewing their screen, end it, answer a consent prompt, and
-    /// see the devices the machine's private network lets it see.
+    /// to see who is viewing their screen, end it, answer a consent prompt,
+    /// record it, and see the devices the machine's private network lets it
+    /// see.
     Person,
 }
 
@@ -3151,7 +3222,8 @@ pub enum Scope {
 /// the service is up, the sessions behind the "Being viewed by …" banner, its
 /// Disconnect, the consent prompt and its answer, and whether a recording is
 /// running (the tray turns red). FR-97 P2g adds the companion's Devices page,
-/// and P2h the live links its Connection column and Overview read.
+/// and P2h the live links its Connection column and Overview read. FR-85 P2e
+/// adds recording that person's own screen.
 pub fn person_may(req: &Request) -> bool {
     match req {
         Request::Status
@@ -3181,7 +3253,18 @@ pub fn person_may(req: &Request) -> bool {
         // (online, direct or relayed, round trip), which the Devices page's
         // Connection column and Overview's count read. Read-only, and served
         // without the endpoints and probe detail (`person_view`).
-        | Request::Peers => true,
+        | Request::Peers
+        // FR-85 P2e — this person's own screen, into this person's own folder.
+        // The recorder runs as them and the daemon lists and deletes as them
+        // (`RecordingManager`), so this reaches nothing they could not reach
+        // themselves. The Recordings view needs the list to show anything,
+        // and the start is gated again, on the peer, in the dispatcher. Where
+        // recordings go and whether a controller may make one stay
+        // `ConfigSet`, below.
+        | Request::RecordStart { .. }
+        | Request::RecordStop
+        | Request::RecordingsList
+        | Request::RecordingDelete { .. } => true,
         Request::Flows
         | Request::Ping { .. }
         | Request::CreateForward { .. }
@@ -3205,10 +3288,6 @@ pub fn person_may(req: &Request) -> bool {
         | Request::TailLog { .. }
         | Request::ExecRemote { .. }
         | Request::SshSession { .. }
-        | Request::RecordStart { .. }
-        | Request::RecordStop
-        | Request::RecordingsList
-        | Request::RecordingDelete { .. }
         | Request::RestartDaemon { .. }
         | Request::EncoderCaps
         | Request::HiveUpdateHold
@@ -3247,9 +3326,9 @@ pub fn person_view(resp: Response) -> Response {
 fn not_on_the_person_socket() -> Response {
     Response::Error {
         message: "this is the person-at-the-device socket of a system install: it shows who is \
-                  viewing this screen, ends it, answers consent prompts, and lists the devices \
-                  this machine's private network reaches and its links to them. Everything else \
-                  goes to the daemon's own socket — run `sudo roomler …`"
+                  viewing this screen, ends it, answers consent prompts, records this screen, \
+                  and lists the devices this machine's private network reaches and its links \
+                  to them. Everything else goes to the daemon's own socket — run `sudo roomler …`"
             .into(),
     }
 }
@@ -3578,7 +3657,7 @@ where
                     Request::RecordStart { .. }
                     | Request::RecordStop
                     | Request::RecordingDelete { .. },
-                ) if !peer.is_console_user() => not_the_console_user(),
+                ) if !peer.may_record(scope) => not_the_console_user(),
                 Ok(Request::RecordStart { opts }) => state.record_start(opts).await,
                 Ok(Request::RecordStop) => state.record_stop().await,
                 Ok(Request::RecordingDelete { name }) => state.recording_delete(&name).await,
@@ -5760,6 +5839,7 @@ mod tests {
                 overlay_ip6: None,
                 network_from: None,
                 connected: true,
+                power: None,
                 ephemeral: false,
                 exit_node: None,
                 route_offer_withheld: None,
@@ -5789,6 +5869,7 @@ mod tests {
                 netcheck: None,
                 pid: None,
                 started_at_ms: None,
+                macos_grants: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
@@ -6824,6 +6905,34 @@ mod tests {
         assert_eq!(back.files_dir, None);
     }
 
+    /// #3164 — `NodeStatus.macos_grants` is additive both ways: an older
+    /// daemon's status (and every non-Mac one) parses to `None`, the field is
+    /// left out when there is nothing to say, and a Mac's per-user half's two
+    /// grants round-trip as written.
+    #[test]
+    fn node_status_macos_grants_is_additive() {
+        let mut st = Mock.status();
+        let without = serde_json::to_string(&st).unwrap();
+        assert!(!without.contains("macos_grants"), "{without}");
+        assert_eq!(
+            serde_json::from_str::<NodeStatus>(&without)
+                .unwrap()
+                .macos_grants,
+            None
+        );
+        st.macos_grants = Some(MacosGrants {
+            screen_recording: false,
+            accessibility: true,
+        });
+        let with = serde_json::to_string(&st).unwrap();
+        assert!(
+            with.contains(r#""macos_grants":{"screen_recording":false,"accessibility":true}"#),
+            "{with}"
+        );
+        let back: NodeStatus = serde_json::from_str(&with).unwrap();
+        assert_eq!(back.macos_grants, st.macos_grants);
+    }
+
     /// FR-67 P3 — `NodeStatus.last_install` is additive, and the three states
     /// it must keep apart survive the wire: no key (a daemon that predates it)
     /// parses to `None`; `Absent` and `InProgress` are two different words
@@ -7714,10 +7823,14 @@ mod tests {
     }
 
     async fn ask_scoped(scope: Scope, line: &str) -> Response {
+        ask_scoped_as(ClientPeer::UNKNOWN, scope, line).await
+    }
+
+    async fn ask_scoped_as(peer: ClientPeer, scope: Scope, line: &str) -> Response {
         let (client, server) = tokio::io::duplex(4096);
         let srv = tokio::spawn(async move {
             let state = Mock;
-            serve_connection_scoped(server, &state, ClientPeer::UNKNOWN, scope).await
+            serve_connection_scoped(server, &state, peer, scope).await
         });
         let (crd, mut cwr) = tokio::io::split(client);
         let mut clines = tokio::io::BufReader::new(crd).lines();
@@ -7751,6 +7864,12 @@ mod tests {
             r#"{"t":"mesh","d":{"org":"primary"}}"#,
             // FR-97 P2h — and its live links, without the endpoints.
             r#"{"t":"peers"}"#,
+            // FR-85 P2e — recording their own screen into their own folder
+            // (the peer is gated again on top).
+            r#"{"t":"record_start","d":{}}"#,
+            r#"{"t":"record_stop"}"#,
+            r#"{"t":"recordings_list"}"#,
+            r#"{"t":"recording_delete","d":{"name":"x.mp4"}}"#,
         ];
         for j in allowed {
             let req: Request = serde_json::from_str(j).unwrap();
@@ -7780,16 +7899,11 @@ mod tests {
                 value: Some("true".into()),
             },
             Request::ConfigCleanupStale,
-            Request::RecordStop,
-            Request::RecordingsList,
             Request::EncoderCaps,
             Request::HiveUpdateHold,
             Request::KillFlow { id: "f".into() },
             Request::RouteRemove { id: "r".into() },
             Request::SetDeviceName { name: "x".into() },
-            Request::RecordingDelete {
-                name: "x.mp4".into(),
-            },
             // FR-90 P3-9-2b — the owner's grants, never the seat's.
             Request::Connect {
                 args: ConnectArgs::default(),
@@ -7891,6 +8005,74 @@ mod tests {
             }
             other => panic!("expected Peers on the full socket, got {other:?}"),
         }
+    }
+
+    /// FR-85 P2e — who may start, stop or delete a recording. The daemon's own
+    /// endpoints keep the console gate. On a system install's person socket
+    /// that gate can never pass: it compares the peer with the daemon, which
+    /// is root, and the person is not root.
+    #[test]
+    fn the_recording_decision_table() {
+        let unix = |u| ClientPeer {
+            uid: Some(u),
+            ..ClientPeer::UNKNOWN
+        };
+        let win = |s| ClientPeer {
+            session_id: Some(s),
+            ..ClientPeer::UNKNOWN
+        };
+        let full = Scope::Full;
+        let person = Scope::Person;
+        // The person at the seat of a system install, on their own socket.
+        assert!(peer_may_record(&unix(1000), person, None, Some(0)));
+        assert!(
+            !peer_is_console_user(&unix(1000), None, Some(0)),
+            "the gate this one widens"
+        );
+        // Root passes there as it does on its own socket.
+        assert!(peer_may_record(&unix(0), person, None, Some(0)));
+        // The daemon's own endpoints: nothing moved. A root daemon's socket
+        // refuses anyone else, and a per-user daemon's serves its owner.
+        assert!(peer_may_record(&unix(0), full, None, Some(0)));
+        assert!(!peer_may_record(&unix(1000), full, None, Some(0)));
+        assert!(peer_may_record(&unix(501), full, None, Some(501)));
+        assert!(!peer_may_record(&unix(502), full, None, Some(501)));
+        // Windows: the console session, RDP refused.
+        assert!(peer_may_record(&win(1), full, Some(1), None));
+        assert!(!peer_may_record(&win(2), full, Some(1), None));
+        // Fail closed.
+        for scope in [full, person] {
+            assert!(!peer_may_record(
+                &ClientPeer::UNKNOWN,
+                scope,
+                Some(1),
+                Some(0)
+            ));
+        }
+    }
+
+    /// FR-85 P2e — the person at a system install's seat works their own
+    /// recordings on their own socket, past both gates, and a peer the listener
+    /// could not name still is not them.
+    #[tokio::test]
+    async fn the_person_at_the_seat_records_on_their_own_socket() {
+        let person = || ClientPeer {
+            uid: Some(1000),
+            ..ClientPeer::UNKNOWN
+        };
+        for line in [
+            r#"{"t":"record_start","d":{}}"#,
+            r#"{"t":"record_stop"}"#,
+            r#"{"t":"recording_delete","d":{"name":"x.mp4"}}"#,
+        ] {
+            let r = ask_scoped_as(person(), Scope::Person, line).await;
+            assert!(!is_person_refusal(&r), "{line} → {r:?}");
+            assert!(!is_console_refusal(&r), "{line} → {r:?}");
+            let r = ask_scoped_as(ClientPeer::UNKNOWN, Scope::Person, line).await;
+            assert!(is_console_refusal(&r), "{line} → {r:?}");
+        }
+        let r = ask_scoped_as(person(), Scope::Person, r#"{"t":"recordings_list"}"#).await;
+        assert!(!is_person_refusal(&r), "{r:?}");
     }
 
     /// FR-97 P2h — the person's view of the peers keeps the link and drops

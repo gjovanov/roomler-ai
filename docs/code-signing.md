@@ -202,7 +202,7 @@ installing it, and is also bound to the release it claims to be: the Windows
 | perUser + perMachine `.msi` | release-agent | sign-windows, before the size-budget/sha256 steps |
 | `roomler-desktop-<v>….exe` | release-agent | sign-windows |
 | `roomler-agent-<v>-aarch64-apple-darwin.pkg` | release-agent | inline codesign → productbuild → notarytool → staple → **verify** |
-| `roomler-setup.exe` (in the zip) | release-setup | sign-windows, before zipping |
+| `roomler-setup.exe`: its own asset `roomler-setup-<v>-x86_64-pc-windows-msvc.exe` (what `/api/setup/windows` serves, FR-129 C2) and the same file in the zip | release-setup | sign-windows, before zipping and staging; the staged EXE is checked byte for byte against the zip's, and `90-verify-release.ps1` checks both signatures, the `.exe.sha256` and that the two are one program |
 | `Roomler Setup.app` (in the macOS tarball) | release-setup | sign-macos: bundle → notarise → **staple** (ticket survives tar) |
 | `roomler.exe` (tunnel zip) | release-tunnel | sign-windows (was never signed before) |
 | `roomler` (macOS universal, tunnel tarball) | release-tunnel | sign-macos: bare binary → notarise, **no staple** (Apple can't staple a loose Mach-O; curl\|tar installs never set quarantine, so unaffected) |
@@ -300,7 +300,12 @@ pwsh scripts/signing/90-verify-release.ps1 -Tag agent-v<version>   # Windows hal
 
 The PowerShell verifier also does an administrative extract of each MSI
 (`msiexec /a`) and Authenticode-checks the **payload**, and asserts
-`wintun.dll` still says WireGuard LLC. Manual user-level checks:
+`wintun.dll` still says WireGuard LLC. On the wizard's own EXE it also reads the file's bytes
+with `scripts/signing/pe-dependent-load-flags.ps1`: `DependentLoadFlags` must be `0x800`, and
+`secur32.dll` must not be in the import table, because it is delay-loaded. That EXE sits in the
+person's Downloads and goes on to run elevated, so nothing it loads may come from there (FR-129
+C). CI's Windows job runs the same script on the debug EXE, and `release-setup.yml` on the EXE it
+signs. Manual user-level checks:
 
 ```powershell
 Get-AuthenticodeSignature "$env:ProgramFiles\Roomler\roomlerd.exe"   # Valid, G ROX LTD
@@ -357,7 +362,7 @@ installed. Measured on 0.4.143 before the fix: a feed offering `agent-v0.4.999`
 with the signed 0.4.142 `.deb` passed the `.asc` gate and was staged for
 install (FR-97 §8). Each format now states its own version inside the signed
 bytes, and the updater refuses when it disagrees with the tag
-(`updater.rs:1690`):
+(`updater.rs:1691`):
 
 | Format | Where the artifact states its version | Read by | Anchor |
 |---|---|---|---|

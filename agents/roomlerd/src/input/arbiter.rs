@@ -830,6 +830,8 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
     // SystemContext worker-role probe runs at first real use, matching the
     // pre-P6 per-session open timing.
     let mut injector: Option<Box<dyn super::InputInjector + Send>> = None;
+    // #3164 — when an injector opened without the OS's grant is opened again.
+    let mut regrant = Regrant::default();
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -841,6 +843,8 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                 control,
                 cursor,
             } => {
+                // #3164 — a new session's first event asks the OS afresh.
+                regrant.session_opened();
                 state.open(session, name, can_input, mode_hint, Instant::now());
                 sinks.insert(
                     session,
@@ -865,7 +869,7 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                         released = releases.len(),
                         "input arbiter: release-all on session close"
                     );
-                    inject_all(&mut injector, &releases);
+                    inject_all(&mut injector, &mut regrant, &releases);
                     // FR-92 — a released button moves the pointer first
                     // (#1945): keep-busy must re-anchor, not fight it.
                     crate::keep_busy::note_remote_input();
@@ -890,7 +894,7 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                         released = releases.len(),
                         "input arbiter: input DC closed — released held keys"
                     );
-                    inject_all(&mut injector, &releases);
+                    inject_all(&mut injector, &mut regrant, &releases);
                     crate::keep_busy::note_remote_input();
                 }
             }
@@ -911,9 +915,9 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                                 fenced = pre.len(),
                                 "input arbiter: cross-session modifier fence"
                             );
-                            inject_all(&mut injector, &pre);
+                            inject_all(&mut injector, &mut regrant, &pre);
                         }
-                        inject_all(&mut injector, std::slice::from_ref(&msg));
+                        inject_all(&mut injector, &mut regrant, std::slice::from_ref(&msg));
                         // FR-92 — a controller's input reached the OS: a
                         // remote person is active. A heartbeat is not input.
                         if !matches!(msg, InputMsg::Heartbeat { .. }) {
@@ -923,7 +927,7 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                 }
             }
             Cmd::KeepBusy(req) => {
-                let reply = keep_busy_op(&state, &mut injector, req.op);
+                let reply = keep_busy_op(&state, &mut injector, &mut regrant, req.op);
                 let _ = req.reply.try_send(reply);
             }
             Cmd::KeepBusySet { session, request } => {
@@ -967,7 +971,7 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                 let (granted, releases) = state.request_floor(session, Instant::now());
                 tracing::info!(%session, granted, "input arbiter: floor request");
                 if !releases.is_empty() {
-                    inject_all(&mut injector, &releases);
+                    inject_all(&mut injector, &mut regrant, &releases);
                     crate::keep_busy::note_remote_input();
                 }
                 broadcast_state(&state, &sinks, &handle);
@@ -976,7 +980,7 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                 let (granted, releases) = state.grant_floor(holder, to);
                 tracing::info!(%holder, %to, granted, "input arbiter: floor grant");
                 if !releases.is_empty() {
-                    inject_all(&mut injector, &releases);
+                    inject_all(&mut injector, &mut regrant, &releases);
                     crate::keep_busy::note_remote_input();
                 }
                 // Broadcast even on a refusal: the requester may have left, or
@@ -1028,7 +1032,87 @@ fn warm(injector: &mut Option<Box<dyn super::InputInjector + Send>>) {
     }
 }
 
-fn inject_all(injector: &mut Option<Box<dyn super::InputInjector + Send>>, msgs: &[InputMsg]) {
+/// #3164 — an injector opened before the OS granted input is not final.
+///
+/// macOS: enigo refuses to construct without Accessibility, so a session's
+/// first event before the grant got `open_default`'s Noop, which was then
+/// cached for the life of the process. The grant itself is live —
+/// `AXIsProcessTrusted` sees it at once, and so does each new session's reach
+/// check, which then stops warning — while the cached Noop kept dropping every
+/// event. Field, agent 0.4.188: after the grant the viewer's banner was gone
+/// and its typed line still never landed. So an injector without the
+/// permission is dropped and opened again once the OS grants what it lacked,
+/// asked at most once per [`Regrant::EVERY`] while events arrive (a stubborn
+/// backend then costs one open a second, not one per event), and at once for
+/// the first event of each new session.
+#[derive(Debug, Default)]
+struct Regrant {
+    asked_at: Option<Instant>,
+}
+
+impl Regrant {
+    const EVERY: Duration = Duration::from_secs(1);
+
+    /// Whether to drop the cached injector and open another: it lacks the OS's
+    /// permission, the OS was not asked within [`Self::EVERY`], and asked now
+    /// (`os_grants`, only then) it grants it.
+    fn reopen(
+        &mut self,
+        has_permission: bool,
+        now: Instant,
+        os_grants: impl FnOnce() -> bool,
+    ) -> bool {
+        if has_permission {
+            return false;
+        }
+        if self
+            .asked_at
+            .is_some_and(|at| now.saturating_duration_since(at) < Self::EVERY)
+        {
+            return false;
+        }
+        self.asked_at = Some(now);
+        os_grants()
+    }
+
+    /// A session opened: its first event asks the OS again.
+    fn session_opened(&mut self) {
+        self.asked_at = None;
+    }
+}
+
+/// The cached injector, unless it no longer fits: stale (FR-95 P2,
+/// `input::stale`), or opened without a grant the OS has given since (#3164).
+fn refresh(injector: &mut Option<Box<dyn super::InputInjector + Send>>, regrant: &mut Regrant) {
+    refresh_with(injector, regrant, super::os_grants_input);
+}
+
+/// [`refresh`], with the OS's answer given (a test has no Accessibility to
+/// grant).
+fn refresh_with(
+    injector: &mut Option<Box<dyn super::InputInjector + Send>>,
+    regrant: &mut Regrant,
+    os_grants: impl FnOnce() -> bool,
+) {
+    let Some(inj) = injector.as_deref() else {
+        return;
+    };
+    if super::stale(inj) {
+        *injector = None;
+    } else if regrant.reopen(inj.has_permission(), Instant::now(), os_grants) {
+        tracing::info!(
+            "input: the OS grants this agent input now — opening the injector again, no restart \
+             needed (#3164)"
+        );
+        *injector = None;
+    }
+}
+
+fn inject_all(
+    injector: &mut Option<Box<dyn super::InputInjector + Send>>,
+    regrant: &mut Regrant,
+    msgs: &[InputMsg],
+) {
     for m in msgs {
         // FR-45 P4 — while a portal capture with granted input is live, the
         // portal session owns injection: on the hosts that backend serves,
@@ -1043,10 +1127,9 @@ fn inject_all(injector: &mut Option<Box<dyn super::InputInjector + Send>>, msgs:
         }
         // FR-95 P2 — the injector follows the automatic system capture: its
         // uinput while one reads a person's session, the configured cascade
-        // otherwise (`input::stale`).
-        if injector.as_deref().is_some_and(|i| super::stale(i)) {
-            *injector = None;
-        }
+        // otherwise (`input::stale`). #3164 — and a grant given since it
+        // opened.
+        refresh(injector, regrant);
         let inj = injector.get_or_insert_with(super::open_default);
         if let Err(e) = inj.inject(m.clone()) {
             tracing::debug!(%e, "input arbiter: inject failed");
@@ -1066,15 +1149,15 @@ fn inject_all(injector: &mut Option<Box<dyn super::InputInjector + Send>>, msgs:
 fn keep_busy_op(
     state: &ArbiterState,
     injector: &mut Option<Box<dyn super::InputInjector + Send>>,
+    regrant: &mut Regrant,
     op: KbOp,
 ) -> KbReply {
     if matches!(op, KbOp::Move { .. } | KbOp::MoveNorm { .. }) && state.any_button_held() {
         return KbReply::RemoteButtonHeld;
     }
-    // FR-95 P2 — the same swap the controller's path makes (`input::stale`).
-    if injector.as_deref().is_some_and(|i| super::stale(i)) {
-        *injector = None;
-    }
+    // FR-95 P2 — the same swap the controller's path makes (`input::stale`),
+    // and #3164's regrant.
+    refresh(injector, regrant);
     if injector.is_none() {
         let fresh = super::open_default();
         if !fresh.has_permission() {
@@ -1895,6 +1978,7 @@ mod tests {
         let moves = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut injector: Option<Box<dyn crate::input::InputInjector + Send>> =
             Some(Box::new(NormOnly(moves.clone())));
+        let mut regrant = Regrant::default();
         let mut st = ArbiterState::default();
         let a = sid();
         let now = Instant::now();
@@ -1905,26 +1989,96 @@ mod tests {
         };
         st.plan(a, &click(true), now);
         assert_eq!(
-            keep_busy_op(&st, &mut injector, half),
+            keep_busy_op(&st, &mut injector, &mut regrant, half),
             KbReply::RemoteButtonHeld
         );
         assert!(moves.lock().unwrap().is_empty(), "nothing reached the OS");
         st.plan(a, &click(false), now);
-        assert_eq!(keep_busy_op(&st, &mut injector, half), KbReply::Moved);
+        assert_eq!(
+            keep_busy_op(&st, &mut injector, &mut regrant, half),
+            KbReply::Moved
+        );
         let past = KbOp::MoveNorm {
             x: NORM_ONE * 3,
             y: 0,
         };
-        assert_eq!(keep_busy_op(&st, &mut injector, past), KbReply::Moved);
+        assert_eq!(
+            keep_busy_op(&st, &mut injector, &mut regrant, past),
+            KbReply::Moved
+        );
         assert_eq!(*moves.lock().unwrap(), vec![(0.5, 0.25), (1.0, 0.0)]);
         // The pixel ops are not this backend's: unsupported, never "failed".
         assert_eq!(
-            keep_busy_op(&st, &mut injector, KbOp::Locate),
+            keep_busy_op(&st, &mut injector, &mut regrant, KbOp::Locate),
             KbReply::Unsupported
         );
         assert_eq!(
-            keep_busy_op(&st, &mut injector, KbOp::Move { x: 1, y: 1 }),
+            keep_busy_op(&st, &mut injector, &mut regrant, KbOp::Move { x: 1, y: 1 }),
             KbReply::Unsupported
         );
+    }
+
+    /// #3164 — the Noop a session cached before the Accessibility grant is
+    /// dropped once the OS grants it, so the next event opens a real injector.
+    /// Master kept it for the life of the process (`get_or_insert_with` after
+    /// a staleness check only): the viewer stopped warning while every typed
+    /// key was still dropped.
+    #[test]
+    fn a_noop_cached_before_the_grant_is_opened_again_after_it() {
+        let mut injector: Option<Box<dyn crate::input::InputInjector + Send>> =
+            Some(Box::new(crate::input::NoopInjector));
+        let mut regrant = Regrant::default();
+        // Not granted yet: kept (and the OS was asked).
+        let mut asked = false;
+        refresh_with(&mut injector, &mut regrant, || {
+            asked = true;
+            false
+        });
+        assert!(asked);
+        assert!(injector.is_some(), "no grant, nothing to reopen");
+        // The person grants it; a new session opens, and its first event asks
+        // again at once rather than waiting out the window.
+        regrant.session_opened();
+        refresh_with(&mut injector, &mut regrant, || true);
+        assert!(
+            injector.is_none(),
+            "granted: dropped, so the next event opens the real injector"
+        );
+    }
+
+    /// The OS is asked at most once a second while events stream in, and a
+    /// permitted injector is never asked about or dropped.
+    #[test]
+    fn the_os_is_asked_about_a_grant_at_most_once_a_window() {
+        let t0 = Instant::now();
+        let mut r = Regrant::default();
+        assert!(!r.reopen(false, t0, || false));
+        assert!(
+            !r.reopen(false, t0 + Duration::from_millis(500), || panic!(
+                "asked inside the window"
+            )),
+            "inside the window: not asked"
+        );
+        assert!(
+            r.reopen(false, t0 + Regrant::EVERY, || true),
+            "a window later: asked"
+        );
+        let mut fresh = Regrant::default();
+        assert!(!fresh.reopen(true, t0, || panic!(
+            "a permitted injector is never re-asked"
+        )));
+        assert!(fresh.asked_at.is_none());
+    }
+
+    /// Off macOS no grant is waited on: an injector opened without permission
+    /// (a Noop where enigo would not open) stays as it was, as before #3164.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_an_unpermitted_injector_stays() {
+        assert!(!crate::input::os_grants_input());
+        let mut injector: Option<Box<dyn crate::input::InputInjector + Send>> =
+            Some(Box::new(crate::input::NoopInjector));
+        refresh(&mut injector, &mut Regrant::default());
+        assert!(injector.is_some());
     }
 }

@@ -1032,6 +1032,8 @@ mod tests {
             agent_version: "0".into(),
             companion_version: None,
             keep_busy: None,
+            power: None,
+            sleep: None,
             ssh_host_pubkey: String::new(),
             vault_key: String::new(),
             peer_auth_key: String::new(),

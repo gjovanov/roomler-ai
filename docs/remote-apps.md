@@ -25,7 +25,7 @@ The rest of the design follows from taking that sentence seriously.
 
 Everything is P2P over the session's existing `control` data channel — no
 server change, and the server never sees a window title. `peer.rs` routes three
-envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:9238`),
+envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:11128`),
 runs it on `spawn_blocking` because every backend shells out or calls FFI, and
 sends the returned reply back on the same channel. The request/reply shape and
 the id correlation are `rc:logs-fetch`'s.
@@ -63,7 +63,7 @@ Three properties of the wire are load-bearing:
   decimal on Windows, `tmux:<name>` for a detached session. The viewer only
   ever round-trips it, and the Linux backend re-validates the shape before
   handing it to `wmctrl -i -a` so a crafted id cannot become a flag
-  (`agents/roomlerd/src/apps/linux.rs:337`).
+  (`agents/roomlerd/src/apps/linux.rs:459`).
 - 🔑 **Launch takes a key, never a command.** `resolve_app`
   (`agents/roomlerd/src/apps/mod.rs:618`) is the security gate: the key must be
   in the device's own allowlist and the entry's `command` is run as argv with
@@ -72,7 +72,7 @@ Three properties of the wire are load-bearing:
 - 🔑 **Every path returns a well-formed `*.reply`**, including a panic in the
   handler (`peer.rs` catches the join error and answers `ok:false`). A request
   that got no answer is how the viewer detects an agent too old to speak
-  `rc:apps.*` at all (a 10 s timeout, `ui/src/composables/useRemoteControl.ts:6799`).
+  `rc:apps.*` at all (a 10 s timeout, `ui/src/composables/useRemoteControl.ts:7356`).
 
 ## 2. How the Linux backend finds a desktop — and as whom
 
@@ -80,13 +80,13 @@ Until FR-56 P1 the gate was literally `env::var_os("DISPLAY").is_some()` on
 the **daemon**, which is true only when the daemon started its own Xvfb
 (`ROOMLERD_VIRTUAL_DESKTOP=1`). On every real login session the daemon has no
 `DISPLAY`, so the feature never failed — it never engaged. `discover()`
-(`agents/roomlerd/src/apps/linux.rs:480`) replaces that with the walk below.
+(`agents/roomlerd/src/apps/linux.rs:500`) replaces that with the walk below.
 
 ```mermaid
 flowchart TD
     S([discover]) --> D{"daemon has DISPLAY?<br/>(its own Xvfb)"}
     D -- yes --> DM["Target::Daemon — runs AS THE DAEMON,<br/>DISPLAY only, byte-for-byte pre-FR-56 (AC3)"]
-    D -- no --> L{"loginctl: an ACTIVE x11 / wayland session?<br/>(companion::graphical_session)"}
+    D -- no --> L{"loginctl: a person's ACTIVE x11 / wayland session?<br/>(Class=user: desktop_session)"}
     L -- no --> NS["Err(NoSession) — nobody at the screen"]
     L -- yes --> C["candidates: Display= from loginctl, then :0, :1<br/>+ the session's cookie: newest .mutter-Xwaylandauth.*,<br/>then gdm/Xauthority, then Xauthority"]
     C --> P{"wmctrl -m — as the session's OWNER,<br/>DISPLAY + XAUTHORITY"}
@@ -101,10 +101,20 @@ flowchart TD
 | Arm | Runs as | Needs | Why it is the way it is |
 |---|---|---|---|
 | **Daemon** (`Target::Daemon`, `linux.rs:56`) | the daemon (root) | `DISPLAY` only | The daemon started that Xvfb and owns it — the only case where root on the display is the right answer. It is also the only population that used the feature before FR-56, and AC3 keeps it **unchanged, first, and unprobed** |
-| **Session** (`Target::Session`) | the session's owner, by **name** | `DISPLAY` **and** `XAUTHORITY` | ⚠️ Measured before any code: with `DISPLAY` alone — what the pre-FR-56 code passed — every call on a compositor-started Xwayland dies `Authorization required, but no authorization protocol specified`. The cookie's file name is a glob (`.mutter-Xwaylandauth.XXXXXX`), so the runtime dir is scanned newest-first (a compositor restart leaves a stale one behind that authorises nothing; `linux.rs:648`) |
+| **Session** (`Target::Session`) | the session's owner, by **name** | `DISPLAY` **and** `XAUTHORITY` | ⚠️ Measured before any code: with `DISPLAY` alone — what the pre-FR-56 code passed — every call on a compositor-started Xwayland dies `Authorization required, but no authorization protocol specified`. The cookie's file name is a glob (`.mutter-Xwaylandauth.XXXXXX`), so the runtime dir is scanned newest-first (a compositor restart leaves a stale one behind that authorises nothing; `linux.rs:680`) |
 
-Three rules the session arm enforces, each paid for somewhere:
+Four rules the session arm enforces, each paid for somewhere:
 
+- ⚠️ **The desktop is a person's, never the login screen's.** `desktop_session`
+  (`agents/roomlerd/src/apps/linux.rs:518`) asks logind for `Class=user` only.
+  GDM's greeter IS an active graphical session, owned by the service account
+  `gdm`: FR-27's consent path wants that answer, and this backend must not take
+  it. Until P7 it did. On a Wayland greeter, whose Xwayland runs at `:1024`,
+  past the candidates below, a logged-out host read *"gdm has a graphical
+  session but no X display on it answered"*. On an X11 greeter it read as a
+  complete, empty desktop with launch on offer, as `gdm`. All three verbs reach
+  a session only through `discover()`, once per request
+  (`agents/roomlerd/src/apps/mod.rs:482`).
 - ⚠️ **The privilege drop is not politeness, and it is fallible on purpose.**
   `launch` spawns a terminal and a tmux server; doing that as root on
   somebody's own desktop puts a root shell on their screen and root-owned
@@ -117,16 +127,16 @@ Three rules the session arm enforces, each paid for somewhere:
   for X11 sessions and often not for Wayland ones, so `:0` is an unavoidable
   guess — but an *unverified* guess would surface later as a reassuring
   "no windows" instead of an honest "no desktop". Each pair is tried with
-  `wmctrl -m` and the first that answers wins (`linux.rs:605`).
+  `wmctrl -m` and the first that answers wins (`linux.rs:637`).
 - ⚠️ **`wmctrl -l`'s exit status is checked.** It was not, before P1: against a
   display it cannot open the tool writes nothing to stdout and exits non-zero,
   and parsing stdout regardless turned *"I could not reach the desktop"* into
   `Ok(vec![])` — *no windows*, a different and calmer claim. Discovery makes it
   matter: a found display can go stale (the cookie dies with the compositor)
-  where an Xvfb the daemon owns could not (`linux.rs:274`).
+  where an Xvfb the daemon owns could not (`linux.rs:310`).
 
 The same `loginctl` walk serves FR-27's consent companion and FR-45's capture
-helper (`agents/roomlerd/src/companion.rs:598`) — one copy on purpose, because
+helper (`agents/roomlerd/src/companion.rs:1008`) — one copy on purpose, because
 a compositor that reports its session differently should break all three in
 the same place.
 
@@ -189,7 +199,7 @@ questions asked of every row: **does the hello advertise anything this host
 cannot do**, and **does the refusal carry its reason in the reply** — not only
 in the daemon log. The hello column is `AgentCaps.apps`
 (`crates/remote_control/src/models.rs:203`), assigned once per process by
-`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:1037`,
+`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:1061`,
 `:624` via `with_config_lists` `:655`) — in the daemon, never in the
 caps-probe child (§4.3).
 
@@ -204,7 +214,8 @@ caps-probe child (§4.3).
 | **`wmctrl` missing**, session arm | **`list · focus · launch` — advertised** | `ok:false, supported:true, error: "wmctrl not installed (apt install wmctrl)"` | yes, in `error` — but the hello claimed `list` on a host that cannot list; P1 did that deliberately so the message could reach the operator at all | not advertised; `status` + `unavailable{tool_missing}`. ⚠️ **Launch is refused too**: a host with `xterm`/`tmux` but no `wmctrl` used to launch *blind* — a window the panel could neither list nor focus, the visible-for-silent trade P5 refused — and now gets the same reason |
 | **`wmctrl` missing**, Xvfb arm | `list · focus · launch` | same actionable `error` | yes | **unchanged** — AC3 freezes the Daemon arm; recorded rather than "tidied" |
 | **Wayland session, no Xwayland** | absent | never asked; if asked, bare `supported:false` | **NO** — one `debug!` line | `status` + `unavailable{no_x_display}` |
-| **nobody logged in** (headless, greeter, no Xvfb) | absent | bare `supported:false` | **NO** — `graphical_session`'s sentence was thrown away by `.ok()?` | `status` + `unavailable{no_session}` |
+| **nobody logged in** (headless, no Xvfb) | absent | bare `supported:false` | **NO** — `graphical_session`'s sentence was thrown away by `.ok()?` | `status` + `unavailable{no_session}`, rendered in the dialog (field-read 2026-10-31) |
+| **parked at the login screen** (a greeter, `Class=greeter`) | absent | the audit counted this as the row above. Field-read on 0.4.190: a Wayland greeter answered `unavailable{no_x_display}` naming `gdm`; an X11 greeter answered `supported:true`, nothing unlisted, launch offered | yes, and **wrong** both ways | P7: `status` + `unavailable{no_session}` with *the login screen is showing — nobody is signed in at this machine's screen*. Field-read 2026-11-01 on 0.4.192, on both greeters |
 | **privilege drop failed** | absent | bare `supported:false` | **NO** — swallowed, then the log blamed Xwayland | `unavailable{cannot_run_as}`, and discovery stops at the first |
 | **disabled in config** | absent | bare `supported:false` | **NO** — one `info!` at boot | `status` + `unavailable{disabled}` |
 | **macOS** | absent | bare `supported:false` | no — and nothing to change: there is no backend | unchanged by design: no `status`, no button; `platform` answers a stray request. **Since FR-97 P2c** (§2b): `status · list · focus · launch` from a per-user agent or a supervised Mac's GUI worker, and on the root's row while its worker is attached; `quartz` lists every window, so nothing is unlisted (only the titles, without the Screen Recording grant) |
@@ -287,9 +298,9 @@ The legacy `error` string on a focus/launch refusal keeps its shape and
 
 `detect()` assigns `caps.apps = apps_caps()` once, beside `caps.rpc` and
 `caps.files` (the `with_config_lists` seam), and memoizes the whole
-`AgentCaps` behind a `OnceLock` (`agents/roomlerd/src/encode/caps.rs:37`,
+`AgentCaps` behind a `OnceLock` (`agents/roomlerd/src/encode/caps.rs:39`,
 `:624`, `:655`); both the hello and the FR-43 heartbeat re-announce
-(`agents/roomlerd/src/signaling.rs:1353`, `:2027`)
+(`agents/roomlerd/src/signaling.rs:1428`, `:2135`)
 hand out that same struct. So `list` missing from the hello can mean *nobody
 had logged in yet when the daemon started*, and nothing short of a daemon
 restart changes it. That is why P6 added a fourth value:
@@ -300,9 +311,9 @@ restart changes it. That is why P6 added a fourth value:
   backend (`apps::has_backend`, `mod.rs:434`), independent of what the host
   was doing at boot.
 - The viewer shows the *Remote apps* entry for `list` **or** `status`
-  (`ui/src/views/remote/RemoteControl.vue:4980` `agentSupportsApps`), never disables it, and lets
+  (`ui/src/views/remote/RemoteControl.vue:5341` `agentSupportsApps`), never disables it, and lets
   the **dialog** carry the truth from the live reply: the list, the caveats,
-  or the reason (`useRemoteControl.ts:9860`, the `apps_list_reply` arm). A greyed button with no tooltip
+  or the reason (`useRemoteControl.ts:10969`, the `apps_list_reply` arm). A greyed button with no tooltip
   was the one place a reason could not reach.
 - 🔑 **`availability_for()` is the single source for both** (`mod.rs:396`): the
   hello's `list` and the reply's `unavailable` come from one function, so they
@@ -313,18 +324,18 @@ restart changes it. That is why P6 added a fourth value:
   `compute_caps` advertised `list` on a device whose owner had set
   `enabled = false` — on every release's first boot, and on every boot of a
   host with no hardware cell (a no-hardware answer is never cached,
-  `caps_cache.rs:277`). `apps` is now assigned in `detect()`, in the daemon,
-  and the child's struct carries none (`apps_caps`, `caps.rs:1884`; a test locks
+  `caps_cache.rs:332`). `apps` is now assigned in `detect()`, in the daemon,
+  and the child's struct carries none (`apps_caps`, `caps.rs:4234`; a test locks
   `compute_caps(..).apps.is_empty()`). The same move takes the
   privilege-dropped `loginctl`/`wmctrl` walk out of a process that exists to
   contain untrusted driver code. `files` followed in #1672 — its `browse`
   entry rode the same default the same way — and is assigned by the same
-  seam (`with_config_lists`, `caps.rs:982`; `files_caps` `:1873`), which a
+  seam (`with_config_lists`, `caps.rs:2659`; `files_caps` `:4223`), which a
   test locks assignment by assignment: `detect()` itself cannot run in a
   unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
   The viewer names that as such (*"this agent did not say why"*,
-  `useRemoteControl.ts:1317`) rather than papering over it — inventing a reason
+  `useRemoteControl.ts:1528`) rather than papering over it — inventing a reason
   would be the same lie in the other direction.
 
 ## 5. Launch, and the tmux session model
@@ -347,7 +358,7 @@ server outlives both), it is `ssh`-attachable from a real login
   (`classify_title`, `mod.rs:732`). Anything else is an unmanaged window and is
   reported with its real title.
 - ⚠️ **A re-attach target is validated as a plain session token**
-  (`is_safe_session`, `linux.rs:447`) — defence in depth against a crafted
+  (`is_safe_session`, `linux.rs:468`) — defence in depth against a crafted
   `window_id` reaching `tmux attach -t`.
 - ⚠️ **Launching stays X11-only, on purpose, on a Wayland host.** P5 was
   written as *prefer a Wayland-native terminal where there is no Xwayland*,
@@ -366,8 +377,8 @@ server outlives both), it is `ssh`-attachable from a real login
 Streaming **one application window** instead of the monitor reuses FR-45's
 whole portal pipeline with a single change: `SelectSources(types = WINDOW)`
 (`SOURCE_WINDOW`, `agents/roomlerd/src/capture/portal/screencast.rs:95`) behind
-`ROOMLERD_WINDOW_CAPTURE` (`agents/roomlerd/src/capture/portal/backend.rs:77`,
-config key `window_capture`, `crates/agent-core/src/config.rs:969`). It is
+`ROOMLERD_WINDOW_CAPTURE` (`agents/roomlerd/src/capture/portal/backend.rs:103`,
+config key `window_capture`, `crates/agent-core/src/config.rs:1169`). It is
 **attended by construction**: the portal answers by showing the person at the
 screen a window picker, and nothing agent-side can name a window — GNOME
 refuses the only API that could supply an id, so mutter's `RecordWindow` route
@@ -381,6 +392,34 @@ grant, so the restore token splits four ways
 (`portal-restore-token{,-rd,-win,-rd-win}`); sharing a file would burn
 whichever was stored first. The cascade, the deadline and the attended-only
 rule are [`linux-capture.md`](linux-capture.md) §4.
+
+**Switching it on takes two keys.** `window_capture` only says what to ask the
+portal for. The portal arm itself is `portal_capture`
+(`agents/roomlerd/src/capture/mod.rs:3250`), and DRM is tried before it, so a
+host with `drm_capture = true` never gets there. Set `portal_capture = true` and
+`window_capture = true`, leave `drm_capture` unset or false, then
+`roomler restart`.
+
+What the person at the screen does, and what the viewer sees, field-read on
+agent 0.4.190 with GNOME's own *Share Screen* dialog:
+
+| Session | At the host | In the viewer |
+|---|---|---|
+| first | the dialog lists the open windows, native Wayland and Xwayland alike | *Waiting for the person at the screen to share it*, for up to 120 s |
+| a window picked, *Remember this selection* unticked | nothing is stored | that window alone on black; the pill reads *desktop portal · allowed at the screen* |
+| the next one | the dialog again, so answering differently **is** the switch | the other window, whole even where another window covers it on the real screen |
+| a window picked, *Remember* left ticked | the grant lands in `portal-restore-token-win` | every later session restores it in about 70 ms, with no dialog |
+
+Three limits, stated rather than discovered:
+
+- ⚠️ **Only the host can switch.** No viewer control asks for another window.
+  After *Remember*, the session owner removes
+  `~/.local/state/roomler/portal-restore-token-win` to be asked again.
+- ⚠️ **The frame is monitor-sized.** GNOME's stream arrived at 1280×800 with the
+  window drawn inside it, and nothing in the portal path reads a crop, so the
+  frame size does not tell a window from a desktop.
+- ⚠️ **Input is not remapped.** No code maps a viewer's pointer to the window's
+  place on the real screen. Read from the code, not measured.
 
 ## 7. Where it has been proven
 
@@ -406,11 +445,15 @@ rule are [`linux-capture.md`](linux-capture.md) §4.
 | 2026-10-23 | throwaway tart Macs (macOS 15.7.7), a probe run as the console user | FR-97 P2c, measured before it was built (§2b) | the on-screen list held the 3 real windows, the full list 18 untitled helpers more; a hidden app's raised window came back *behind*, until unhide-then-wait; Calculator refuses `AXRaise`; a `.command` script opens a new Terminal window every time |
 | 2026-10-23 | a tart Mac with both halves, the viewer on the root's row (a delegated session); released 0.4.158 | P2c's red | both rows `apps: null`, no entry; a raw `rc:apps.list` answered by the worker in 40 ms: `unavailable: platform` |
 | 2026-10-23 | the same, P2c's candidate | P2c's green, and its kill switch from either half | both rows `status · list · focus · launch`; the list in 85 ms with `sources: quartz`; a click brought a.txt in front (the host's probe); "New bash session" opened a Terminal window. The root's `enabled = false` → the worker's `switched_off`; the person's → `disabled` (FR-97 §8). **A refusal rendered:** the deployed viewer's dialog showed the `disabled` sentence as its warning, over an empty *Open windows* and with no *"No windows reported"* (the cell's screenshot) |
-| owed | a host whose live reply refuses — nobody logged in and no Xvfb, or the Wayland host after a logout | the refusal rendered (the same rendering is proven for `disabled`, the row above; this one is `no_session`'s own text) | the dialog showing the `no_session` reason instead of *"No windows reported"* — its content is proven on the agent (0.4.103), its rendering by the parser tests only |
+| 2026-10-31 | a throwaway GNOME Wayland guest (Ubuntu 24.04), as installed; released 0.4.190, the deployed viewer | AC10, `tool_missing` in a dialog | hello `["status"]`; the dialog read *`wmctrl` is not installed on the agent host (apt install wmctrl); this backend needs it to find and manage the desktop.* Installing `wmctrl` turned the next reply into a listing with the hello still `["status"]`: the live reply is the truth |
+| 2026-10-31 | the same guest with `gdm3` stopped: nobody logged in, no Xvfb | AC10, `no_session` in a dialog | *No active graphical login session on this host — nobody is at its screen — so there is no desktop to list windows on or launch into…*, and no *"No windows reported"* |
+| 2026-10-31 | the same guest, logged out to GDM's Wayland greeter | **RED** on 0.4.190 | *gdm has a graphical session but no X display on it answered (tried :0, :1): a Wayland compositor without Xwayland…*, over a live picture of the login screen, with that greeter's Xwayland running at `:1024` |
+| 2026-10-31 | the same guest, GDM on X11 (`WaylandEnable=false`) | **RED** on 0.4.190 | `supported: true`, `NOT listed: (nothing…)`, `windows: 0`, as `gdm`; *New bash session* started tmux and xterm as `gdm`. GNOME's greeter draws no application windows, so nobody at the screen sees them |
+| 2026-10-31 | the same guest with a person's session; `portal_capture` + `window_capture`; the picker answered at the guest's console | AC7 | *Calculator* (native Wayland) alone in the browser; the next session, *FR56-WINDOW-B* (Xwayland) whole, though the calculator covers it on the real screen; with *Remember* ticked the session after that restored it 71 ms after the request, no dialog |
+| 2026-11-01 | a fresh guest on released 0.4.192, a person signed in, one X window of theirs open | AC10, the control | the dialog listed *FR56-CONTROL* and offered *New bash session*, the hello still `["status"]` |
+| 2026-11-01 | the same daemon at GDM's Wayland greeter, then on X11 with `wmctrl` still answering as `gdm` | AC10, **GREEN** | both dialogs: *No active graphical login session on this host — … (the login screen is showing — nobody is signed in at this machine's screen)*, and no *Launch new* |
 
-Still owed to a human: a window streamed to the browser and a switch between
-two (somebody must answer the picker), and native enumeration on a wlroots host
-(none exists in the fleet).
+Still unbuilt: native enumeration on a wlroots host (none exists in the fleet).
 
 ## 8. Configuration and the probe
 
@@ -440,13 +483,13 @@ label    = "Safari"
 
 | Key | Where | Default | Notes |
 |---|---|---|---|
-| `virtual_desktop_apps.enabled` | config (`crates/agent-core/src/apps_config.rs:21`); `roomler config get virtual_desktop_apps` prints the JSON (`config_surface.rs:1550`) | `true` | the kill switch; the hello stops advertising `list` (on a caps-cache hit **and** a miss, since the review of #1667 — §4.3), and a request answers `disabled` |
+| `virtual_desktop_apps.enabled` | config (`crates/agent-core/src/apps_config.rs:21`); `roomler config get virtual_desktop_apps` prints the JSON (`config_surface.rs:1947`) | `true` | the kill switch; the hello stops advertising `list` (on a caps-cache hit **and** a miss, since the review of #1667 — §4.3), and a request answers `disabled` |
 | `virtual_desktop_apps.allowlist.<key>` | config | `bash` on Linux and macOS, `cmd` on Windows | `command` is argv; an empty command is skipped from `launchable` and refused on launch. On a Mac a `terminal`/`tmux` entry opens a new Terminal window running it, and an app is `["open", "-b", "<bundle id>"]` (§2b) |
 | `ROOMLERD_APPS` | env (`apps::APPS_ENV`); published as `0` by `env_fallbacks` from a config that says `false` | unset | FR-97 P2c — a **floor**: `0`/`false`/`no`/`off` switches Remote Apps off (`switched_off`), nothing switches them on. A supervised Mac's root forwards it to its GUI worker, which is how the root's `enabled = false` reaches the sessions |
-| `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1092`) | **off** | P4 — attended by construction; restart required |
+| `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1284`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/main.rs:6042`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:6678`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the
@@ -461,7 +504,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2985`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3024`),
 not `load`: `load` self-heals — an unreadable live file logs *the host must be
 re-enrolled* and can promote the `.prev` copy back over it — and a diagnostic
 must never write the device's config as a side effect of being run.
@@ -478,7 +521,7 @@ must never write the device's config as a side effect of being run.
 | `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:1612`, `:1618`), assigned by `with_config_lists` (`:777`) from `detect` (`:624`) beside `rpc` and `files` (`files_caps` / `files_caps_for`, `:1657`, `:1664`); `CACHED_CAPS` (`:37`) — why the hello is a snapshot; `cached_or_probed` (`:789`) — why the child's struct must carry no `apps` |
 | `agents/roomlerd/src/peer.rs` | the control-DC arm (`:8654`) |
 | `agents/roomlerd/src/companion.rs` | `graphical_session` (`:461`) |
-| `agents/roomlerd/src/main.rs` | `apps-probe` (`:4724`) — reads the device config through `read_if_present`, never `load` |
+| `agents/roomlerd/src/app.rs` | `apps-probe` (`:4724`) — reads the device config through `read_if_present`, never `load` |
 | `crates/remote_control/src/models.rs` | `AgentCaps.apps` and its known values (`:203`) |
 | `crates/agent-core/src/apps_config.rs` · `config_surface.rs` | the `[virtual_desktop_apps]` shapes (`:21`); the config-surface keys (`:1446`, `:988`) |
 | `ui/src/composables/useRemoteControl.ts` | the parsers (`parseAppsListReply` `:1105`, `parseAppsUnavailable` `:1181`), the request path (`:5474`, `refreshApps` `:5512`), the reply arm (`:8515`), the no-reason wording (`:890`) |

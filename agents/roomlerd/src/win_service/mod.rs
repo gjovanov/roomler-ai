@@ -49,6 +49,10 @@ pub mod gpu_pin_relay;
 /// its own handle table rather than timed on a pipe's EOF.
 #[cfg(test)]
 pub(crate) mod inherited_handle;
+/// #3115 — registering and retiring the SCM entry so that an MSI run never
+/// leaves the machine without it: reconfigured in place, never deleted while
+/// it runs, waits derived from the host's own shutdown.
+pub mod lifecycle;
 /// #2465 — the worker an earlier host of this service left running: found
 /// and ended before this host spawns its own.
 pub mod orphan;
@@ -100,23 +104,64 @@ pub const NEW_SERVICE_NAME: &str = "Roomler";
 // pre-rename service to retire, leaving two services or none. See docs/fr/FR-21.
 pub const LEGACY_SERVICE_NAME: &str = "RoomlerAgentService";
 
-/// The SCM service to operate on: the NEW `Roomler` service if registered,
-/// else the LEGACY `RoomlerAgentService` (a pre-rename host mid-migration).
-/// Used by the env-block R/W and status so they follow the service across the
-/// takeover. NOT cached — the name changes during an in-process install().
+/// The SCM service to operate on: the LEGACY `RoomlerAgentService` only on a
+/// pre-rename host that has it and not the NEW `Roomler` one; the NEW name
+/// otherwise, registered or not. Used by the env-block R/W and status so they
+/// follow the service across the takeover. NOT cached — the name changes
+/// during an in-process install().
+///
+/// #3115 — it used to answer LEGACY whenever NEW was missing, so an install
+/// that had lost the `Roomler` service failed naming the registry key of a
+/// service retired months before (`RegOpenKeyExW` … `error 2`).
 pub fn resolved_service_name() -> &'static str {
-    if service_present(NEW_SERVICE_NAME) {
-        NEW_SERVICE_NAME
-    } else {
+    let new_present = service_present(NEW_SERVICE_NAME);
+    // Asked only when it can matter: one SCM open on every current host.
+    let legacy_present = !new_present && service_present(LEGACY_SERVICE_NAME);
+    pick_service_name(new_present, legacy_present)
+}
+
+/// [`resolved_service_name`]'s decision, pure.
+fn pick_service_name(new_present: bool, legacy_present: bool) -> &'static str {
+    if !new_present && legacy_present {
         LEGACY_SERVICE_NAME
+    } else {
+        NEW_SERVICE_NAME
     }
 }
 
 fn service_present(name: &str) -> bool {
-    ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .ok()
-        .and_then(|m| m.open_service(name, ServiceAccess::QUERY_STATUS).ok())
-        .is_some()
+    registration(name) == Registration::Registered
+}
+
+/// #3115 — what the SCM says of a service name, for a path that must not act
+/// on a service that is not there (the env-block R/W) and must say which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registration {
+    Registered,
+    /// 1060: no service by that name.
+    Absent,
+    /// 1072: deleted, and still held by its host or a handle somewhere; the
+    /// SCM removes it once that lets go.
+    MarkedForDelete,
+    /// The SCM could not be asked, or refused (the Win32 code; -1 when not one).
+    Unknown(i32),
+}
+
+pub fn registration(name: &str) -> Registration {
+    let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    else {
+        return Registration::Unknown(-1);
+    };
+    match manager.open_service(name, ServiceAccess::QUERY_STATUS) {
+        Ok(_) => Registration::Registered,
+        Err(windows_service::Error::Winapi(e)) => match e.raw_os_error() {
+            Some(1060) => Registration::Absent,
+            Some(1072) => Registration::MarkedForDelete,
+            Some(code) => Registration::Unknown(code),
+            None => Registration::Unknown(-1),
+        },
+        Err(_) => Registration::Unknown(-1),
+    }
 }
 
 /// Display name shown in services.msc, Get-Service output, and Server Manager.
@@ -143,30 +188,10 @@ pub fn default_log_dir() -> Option<PathBuf> {
     Some(roomler_node_core::appdirs::service_log_dir())
 }
 
-/// Transactional takeover install (P3D rename).
-///
-/// Register the NEW `Roomler` service (AutoStart, LocalSystem via
-/// `account_name: None`), then **start it and wait until Running BEFORE
-/// retiring the LEGACY `RoomlerAgentService`**. If the new service never
-/// reaches Running, we return `Err` and DO NOT touch the legacy service —
-/// the MSI custom action swallows the error and the host keeps its old
-/// daemon. That ordering is the no-serviceless-window guarantee: at no
-/// point is a controlled host left with no running daemon.
-///
-/// If the new service already exists (ERROR_SERVICE_EXISTS = 1073, from an
-/// earlier install/repair), we open it and (re)start it rather than fail.
-///
-/// Requires elevation (admin token). The MSI's custom action is the
-/// natural caller; manual install via `roomlerd service install
-/// --as-service` will surface `Access is denied (os error 5)` from a
-/// filtered token.
-pub fn install(exe_path: &std::path::Path) -> Result<()> {
-    let manager = ServiceManager::local_computer(
-        None::<&str>,
-        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
-    )
-    .context("opening Service Control Manager")?;
-    let service_info = ServiceInfo {
+/// The SCM configuration of the `Roomler` service: AutoStart, LocalSystem
+/// (`account_name: None`), `<exe> service-run`.
+fn service_info(exe_path: &Path) -> ServiceInfo {
+    ServiceInfo {
         name: OsString::from(NEW_SERVICE_NAME),
         display_name: OsString::from(SERVICE_DISPLAY_NAME),
         service_type: ServiceType::OWN_PROCESS,
@@ -186,50 +211,63 @@ pub fn install(exe_path: &std::path::Path) -> Result<()> {
         // would need WTSQueryUserToken privileges we don't get there.
         account_name: None,
         account_password: None,
-    };
-    // Clean slate BEFORE creating. Retire any prior NEW service (a leftover from
-    // an interrupted upgrade) AND the LEGACY service first, so create_service
-    // always writes a fresh registry entry — reusing a half-broken / marked-for-
-    // deletion NEW entry is what wedged the P3d devbox smoke (StartServiceW then
-    // returned error 87). Deleting LEGACY first also frees its display name so
-    // the create can't hit ERROR_DUPLICATE_SERVICE_NAME during the migration
-    // overlap. Both tolerate "absent" (1060) / "marked-for-deletion" (1072).
-    let _ = delete_service(NEW_SERVICE_NAME);
-    let _ = delete_service(LEGACY_SERVICE_NAME);
+    }
+}
 
-    // START as well: a failure action that restarts the service may only be
-    // set through a handle that could start it.
-    let access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
-    match manager.create_service(&service_info, access) {
-        Ok(s) => {
-            let _ = s.set_description(SERVICE_DESCRIPTION);
-            // #2087 — without these a host process that dies stays dead until a
-            // reboot. Best-effort: a refusal must not sink the install.
-            if let Err(e) = apply_recovery_actions(&s) {
-                tracing::warn!(
-                    error = %e,
-                    service = NEW_SERVICE_NAME,
-                    "could not set the service's recovery actions"
-                );
-            }
-        }
-        // ERROR_SERVICE_EXISTS — a prior NEW service is still marked-for-deletion
-        // (a handle is open, e.g. services.msc), so we couldn't recreate it this
-        // cycle. It clears on reboot; the AutoStart service comes up then.
-        Err(windows_service::Error::Winapi(e)) if e.raw_os_error() == Some(1073) => {
-            tracing::warn!(
-                service = NEW_SERVICE_NAME,
-                "service exists + marked-for-deletion; clean recreate deferred to next boot"
-            );
-        }
-        Err(e) => return Err(anyhow::anyhow!(e).context("create_service")),
-    };
-    // Do NOT start the service from inside this deferred MSI custom action.
-    // StartServiceW mid-transaction wedged the service (error 87) in the P3d
-    // devbox smoke. The service is AutoStart and is brought up by the
-    // `DisableSystemContext` -> `environment::restart_service` action (a fresh
-    // SCM handle on a now-clean service — the proven rc.190 path) or on next boot.
-    Ok(())
+/// Register the `Roomler` service (AutoStart, LocalSystem), and never by
+/// deleting it (#3115, [`lifecycle::register`]):
+///
+/// - an existing entry is **reconfigured in place** (`ChangeServiceConfigW`, the
+///   description, the recovery actions) and a running service keeps running:
+///   no window without a registered service, and its `Environment` (the
+///   SystemContext switch) survives;
+/// - a missing one is created;
+/// - one an earlier delete still holds (1072: a major upgrade's removal of the
+///   old product, whose binary waited only 5 s for the stop) is waited out,
+///   then created.
+///
+/// A host that still has the pre-rename LEGACY `RoomlerAgentService` has it
+/// retired first, with the same bounded waits ([`lifecycle::retire`]); its
+/// failure is logged and never keeps `Roomler` from being registered.
+///
+/// Up to 0.4.189 this deleted and re-created `Roomler` on every run, after a
+/// stop it waited at most 5 s for — less than the worker's own 8 s graceful
+/// budget, so a slow but healthy stop left the machine with no service at all
+/// (#3115, `lifecycle`'s module docs).
+///
+/// It does NOT start the service. P3d's devbox smoke saw StartServiceW fail
+/// with error 87 from inside the deferred custom action (traced one rc later
+/// to a malformed empty `Environment` value, `environment::write_service_env`),
+/// and starting here is not needed: the `*SystemContext` action that follows
+/// restarts it through a fresh handle (`environment::restart_service`), the
+/// MSI's StartServices starts it, and it is AutoStart.
+///
+/// Requires elevation (admin token). The MSI's custom action is the
+/// natural caller; manual install via `roomlerd service install
+/// --as-service` will surface `Access is denied (os error 5)` from a
+/// filtered token.
+pub fn install(exe_path: &Path) -> Result<lifecycle::Registered> {
+    let scm = lifecycle::LiveScm::connect(
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    )?;
+    let bounds = lifecycle::Bounds::PRODUCTION;
+    match lifecycle::retire(&scm, LEGACY_SERVICE_NAME, bounds) {
+        Ok(lifecycle::Retired::Absent) => {}
+        Ok(retired) => log_retired(LEGACY_SERVICE_NAME, &retired),
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
+            service = LEGACY_SERVICE_NAME,
+            "could not retire the pre-rename service; registering the new one anyway"
+        ),
+    }
+    let registered = lifecycle::register(&scm, &service_info(exe_path), bounds)
+        .with_context(|| format!("registering the {NEW_SERVICE_NAME} service"))?;
+    tracing::info!(
+        ?registered,
+        service = NEW_SERVICE_NAME,
+        "service registered"
+    );
+    Ok(registered)
 }
 
 /// #2087 — the restart delays after the 1st, 2nd and every later failure.
@@ -275,61 +313,55 @@ fn apply_recovery_actions(service: &windows_service::service::Service) -> Result
     Ok(())
 }
 
-/// Stop (best-effort) and delete a single named service. Tolerates
-/// "service not installed" (ERROR_SERVICE_DOES_NOT_EXIST = 1060) so an
-/// idempotent uninstall works from MSI's symmetric custom action and from
-/// operator scripts. Extracted from the old `uninstall()` body so both the
-/// NEW and LEGACY names can be retired independently.
-fn delete_service(name: &str) -> Result<()> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .context("opening SCM for uninstall")?;
-    let service = match manager.open_service(
-        name,
-        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
-    ) {
-        Ok(s) => s,
-        Err(windows_service::Error::Winapi(e)) if e.raw_os_error() == Some(1060) => {
-            // ERROR_SERVICE_DOES_NOT_EXIST — already gone. Idempotent
-            // uninstall is what we want from MSI's symmetric custom
-            // action and from operator scripts.
-            tracing::info!(
-                service = name,
-                "uninstall: service not present, nothing to do"
-            );
-            return Ok(());
-        }
-        Err(e) => return Err(anyhow::anyhow!(e).context("open_service")),
-    };
-
-    if let Ok(s) = service.query_status()
-        && s.current_state != ServiceState::Stopped
-    {
-        // Best-effort stop; if it doesn't reach Stopped within ~5 s we
-        // proceed to delete anyway and let the SCM mark it pending.
-        let _ = service.stop();
-        for _ in 0..50 {
-            std::thread::sleep(Duration::from_millis(100));
-            if let Ok(s) = service.query_status()
-                && s.current_state == ServiceState::Stopped
-            {
-                break;
+/// Remove BOTH the NEW and LEGACY services (#3115, [`lifecycle::retire`]):
+/// each is stopped, waited for — STOPPED and its host process gone, within a
+/// bound derived from the host's own shutdown — deleted, and waited for until
+/// the SCM no longer knows it. Used by `service uninstall --as-service` and the
+/// MSI's `UnregisterService` (a full uninstall, and the old product's removal
+/// during a major upgrade). Both tolerate "not installed", so a
+/// partially-migrated or partially-installed machine still uninstalls
+/// cleanly, and a failure on one does not skip the other.
+pub fn uninstall() -> Result<()> {
+    let scm = lifecycle::LiveScm::connect(ServiceManagerAccess::CONNECT)?;
+    let mut first_err = None;
+    for name in [NEW_SERVICE_NAME, LEGACY_SERVICE_NAME] {
+        match lifecycle::retire(&scm, name, lifecycle::Bounds::PRODUCTION) {
+            Ok(retired) => log_retired(name, &retired),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), service = name, "uninstall failed");
+                first_err.get_or_insert(e);
             }
         }
     }
-
-    service.delete().context("delete service")?;
-    tracing::info!(service = name, "uninstalled");
-    Ok(())
+    first_err.map_or(Ok(()), Err)
 }
 
-/// Delete BOTH the NEW and LEGACY services. Used by `service uninstall
-/// --as-service` and the MSI's `UnregisterAutostart` symmetric custom
-/// action. Both deletes tolerate "not installed", so a partially-migrated
-/// or partially-installed machine still uninstalls cleanly.
-pub fn uninstall() -> Result<()> {
-    delete_service(NEW_SERVICE_NAME)?;
-    delete_service(LEGACY_SERVICE_NAME)?;
-    Ok(())
+fn log_retired(name: &str, retired: &lifecycle::Retired) {
+    use lifecycle::Retired;
+    match retired {
+        Retired::Absent => {
+            tracing::info!(
+                service = name,
+                "uninstall: service not present, nothing to do"
+            )
+        }
+        Retired::Removed { stopping } => {
+            tracing::info!(service = name, ?stopping, "uninstalled")
+        }
+        Retired::Held { stopping } => tracing::warn!(
+            service = name,
+            ?stopping,
+            "deleted, but a handle elsewhere still holds it (services.msc, a monitoring \
+             tool); Windows removes it once that closes"
+        ),
+        Retired::DeletedWhileRunning { stopping } => tracing::warn!(
+            service = name,
+            ?stopping,
+            bound_secs = lifecycle::STOP_WAIT_BOUND.as_secs(),
+            "did not stop within the bound; deleted anyway, and Windows removes it when its \
+             host exits (or at the next boot)"
+        ),
+    }
 }
 
 /// Whether the service is currently registered with the SCM. Cheap —
@@ -785,6 +817,38 @@ mod tests {
         assert_eq!(NEW_SERVICE_NAME, "Roomler");
         assert_eq!(LEGACY_SERVICE_NAME, "RoomlerAgentService");
         assert_eq!(RUN_SUBCOMMAND, "service-run");
+    }
+
+    /// #3115 — the LEGACY name only where the LEGACY service is the one there.
+    /// A host that has lost `Roomler` is told about `Roomler`, not about a
+    /// service retired months before.
+    #[test]
+    fn the_legacy_name_is_resolved_only_where_the_legacy_service_is() {
+        assert_eq!(pick_service_name(true, false), NEW_SERVICE_NAME);
+        assert_eq!(pick_service_name(true, true), NEW_SERVICE_NAME);
+        assert_eq!(pick_service_name(false, true), LEGACY_SERVICE_NAME);
+        assert_eq!(
+            pick_service_name(false, false),
+            NEW_SERVICE_NAME,
+            "neither registered: the error must name the service that is missing"
+        );
+    }
+
+    /// #3115 — the service the MSI registers: what `install` writes, whether it
+    /// creates the entry or reconfigures it in place.
+    #[test]
+    fn the_registered_configuration_is_an_autostart_localsystem_service_run() {
+        let info = service_info(Path::new(r"C:\Program Files\Roomler\roomlerd.exe"));
+        assert_eq!(info.name, NEW_SERVICE_NAME);
+        assert_eq!(info.display_name, SERVICE_DISPLAY_NAME);
+        assert_eq!(info.service_type, ServiceType::OWN_PROCESS);
+        assert_eq!(info.start_type, ServiceStartType::AutoStart);
+        assert_eq!(info.launch_arguments, [RUN_SUBCOMMAND]);
+        assert!(info.dependencies.is_empty());
+        assert!(
+            info.account_name.is_none() && info.account_password.is_none(),
+            "None = LocalSystem on a create, and the account left as it is on a reconfigure"
+        );
     }
 
     /// FR-84 D3 — the worker must be told it is ours. `supervision::detect`

@@ -42,7 +42,7 @@ four direct sessions on the MacBook:
   (which only runs on a direct path) read capacity claims nothing had gated.
   On a direct window the classifier does not run, so its state is `Unknown`
   with no predecessor, and only the agent's own stall and the opening apply
-  (`governor.rs:1121`).
+  (`governor.rs:1174`).
 - **`Reason::Opening`.** The opening keyframe meeting a transport that is
   still ramping blocked sends for 43–82 ms, and the drain rate folded as a
   capacity of 14–22 Mbps against a 104 Mbps ceiling, which held for its 60 s.
@@ -89,7 +89,7 @@ are read as before.
 
 ```mermaid
 flowchart TB
-    W["viewer window closes<br/>governor.rs:1058 — every window;<br/>the classifier on constrained ones only"] --> A{"a pump pass overran<br/>its stall budget?"}
+    W["viewer window closes<br/>governor.rs:1111 — every window;<br/>the classifier on constrained ones only"] --> A{"a pump pass overran<br/>its stall budget?"}
     A -- yes --> RA["Reason::AgentStalled"]
     A -- no --> O{"inside the transport's<br/>opening?"}
     O -- yes --> RO["Reason::Opening"]
@@ -110,33 +110,136 @@ flowchart TB
 
 The heartbeat carries the tally as `evidence_rejected=[agent-stalled,
 transit-stalled, stall-shadow, carrier-changed, opening, keyframe-burst]` (`Rejections`,
-`evidence.rs:219`; printed at `peer.rs:9700` for the FFmpeg pump and `:5150` for
+`evidence.rs:219`; printed at `peer.rs:10000` for the FFmpeg pump and `:5295` for
 VP9's) — one field where T1b, T2 and
 T2b each had their own counter. `opening` was appended (P2b-8) and then
 `keyframe-burst` (P2b-13), so the earlier positions keep their meaning for a
 reader that parses them.
 
-⚠️ The classifier (`encode::pipe_state`, FR-71 T1a) stopped being a shadow the
-day the gate was built on it: `transit_classify` and `transit_hold` were
-**deleted** in V1, and a `transit_hold = true` left in a host's `config.toml`
-is an inert key.
+### The classifier the gate reads (FR-71 T1a) — which plane is the limiter
+
+Every loop below used to read one number, the viewer's paint age, and every one
+of them read an excursion as "the encoder produced too much". On 2026-09-04
+(CORPLAP-3 over DERP, session `6a9abaa8`) a head-of-line block held frames in
+transit for **4.9 s** while the sender's queue held **1,485 bytes**, the worst
+pump pass was 28 ms and the encoder averaged 14 ms — nothing sender-side was
+wrong, and the AIMD and the FR-15 age loop cut the rate into an 8 Mbps link
+(FR-71's finding 4, the FAIL on record in
+[`fr/FR-71-transport-stall-classification.md`](fr/FR-71-transport-stall-classification.md)).
+FR-70 M0 split the age into the three planes that can own it
+(`viewer_rate::split_age`, `viewer_rate.rs:314`: sender wait, transit, the
+browser's own share), and FR-71 T1a turns the split plus what the governor
+already knows about its own send queue into **one verdict per constrained
+viewer window** — `encode::pipe_state::PipeClassifier::classify`
+(`pipe_state.rs:159`). The gate reads that verdict, and the previous window's,
+as two of its facts (`WindowFacts::state` / `prev_state`, `evidence.rs:172`);
+the classifier itself acts on nothing. Pure, like the gate: no clock, no I/O,
+no switch — it unit-tests on the default build and runs inside the B0 simulator.
+
+```mermaid
+flowchart TB
+    W["a constrained viewer window closes<br/>governor.rs:1141 — WindowSignals from the<br/>summed pass stats and the viewer's reports"] --> O{"the sender pushing back?<br/>inflight ≥ budget · a byte-gate skip ·<br/>a blocked send · a wait ≥ 100 ms"}
+    O -- yes --> OP["Overproduced<br/>the sender is the limiter"]
+    O -- no --> SP{"an age split<br/>this window?"}
+    SP -- "no report, frames sent,<br/>and the viewer has reported before" --> GAP["TransitStalled (gap)<br/>pipe_gap_stalls += 1"]
+    SP -- "no split, otherwise" --> UNK["Unknown<br/>a pre-M0 viewer · the first report<br/>still on its way · an idle sender"]
+    SP -- yes --> FL["learn the floors — the smallest transit<br/>and viewer share seen (a stall never lowers them)"]
+    FL --> X{"transit ≥ floor + 200 ms?<br/>viewer ≥ floor + 100 ms, or struggling?"}
+    X -- "transit only, or both<br/>and transit grew more" --> TS["TransitStalled (split)<br/>the path is the limiter"]
+    X -- "viewer only, or both<br/>and viewer grew more" --> VL["ViewerLate<br/>the browser is the limiter"]
+    X -- neither --> CL["Clear"]
+    OP & GAP & UNK & TS & VL & CL --> HB["pipe_state · pipe_states[5] · pipe_gap_stalls<br/>and the gate's facts: state + prev_state (evidence.rs:172)"]
+```
+
+| verdict | says | the rule (`decide`, `pipe_state.rs:169`) | what the gate makes of it |
+|---|---|---|---|
+| `Overproduced` | the sender is the limiter | checked **first**: `inflight_bytes ≥ budget_bytes`, or a byte-budget skip, or a blocked send the goodput sink accepted, or `send_wait_max_ms ≥ SENDER_WAIT_MS` (100 ms, `:67`) — whatever the path is doing, a full queue is real back-pressure, the one case the loops were always right about | evidence: the window measures the pipe |
+| `TransitStalled` | the path is the limiter | the transit share sits `TRANSIT_SLACK_MS` (200 ms, `:63`) or more over its learned floor while the browser's share is under its own slack (both over: the larger excess names the limiter); **or a report gap** — no report this window, frames were sent, and the viewer has reported at least once this session (`:193`) | rejected (`Reason::TransitStalled`), and the window after it too (`StallShadow`); under V5 it is also the transport pushing back — the rate-limited ×0.85 fires only while `desired > 1.2 × pipe_bps` |
+| `ViewerLate` | the browser is the limiter | the viewer share sits `VIEWER_SLACK_MS` (100 ms, `:65`) or more over its floor, or the viewer reports `struggling` (`rc:decodestat`) | evidence (an open decision in FR-79); the viewer-rate cap sheds frames, nothing cuts the bitrate |
+| `Clear` | none of the above | | evidence |
+| `Unknown` | nothing to classify | no split and no gap: a pre-M0 viewer, a report without an age, silence **before** the first report, or a window the sender was idle in — and every direct window, because the classifier runs on constrained windows only (`governor.rs:1153`) | evidence; the loops behave as they did before FR-71 |
+
+Its inputs are `WindowSignals` (`pipe_state.rs:112`), assembled once at the
+window fold (`governor.rs:1141`):
+
+| input | where it comes from | note |
+|---|---|---|
+| `split` — sender / transit / viewer ms | `split_age` over the window's average age, the viewer's arrival stamp and the window's average send wait (`governor.rs:1125`) | `None` = no split this window |
+| `reported` | any report this window — an age, a link report, or the raw count (`governor.rs:1143`) | the gap rule's subject |
+| `inflight_bytes`, `budget_bytes`, `gate_skips`, `send_wait_max_ms`, `frames_sent` | `WindowSenderStats` (`governor.rs:360`), handed over by the pump on every pass and **summed per window** since FR-119 P2b-8 (`absorb`, `:391`) | ⚠️ until P2b-8 (2026-10-23) the governor kept only the last pass, so `frames_sent` and `gate_skips` read 0–2 where a window held 30–120, and a gate skip outside the final pass never made the window `overproduced`; every test fed whole windows, so the tests describe the classifier the field runs from then on |
+| `blocked_sends` | the goodput sink's samples, drained at the fold | the same samples the fold then accepts or drops |
+| `struggling` | the viewer's decode-backlog bit | |
+
+The floors are learned the way the FR-15 age loop learns its floor — the
+smallest share seen (`pipe_state.rs:202`) — so a permanently slow path is not
+a permanent stall, and a stall never lowers the floor it is measured against.
+
+**The heartbeat.** `pipe_state` is the last window's verdict, `pipe_states` the
+session's windows per verdict as `[unknown, clear, overproduced,
+transit-stalled, viewer-late]`, and `pipe_gap_stalls` the subset of the
+transit-stalled count that came from the gap rule (`peer.rs:9998`–`:10008` for
+the FFmpeg pump; `:5280`–`:5290` for VP9's, whose transit share is an upper
+bound because that pump keeps no send-wait figure). Three rules for reading them:
+
+- a heartbeat spans about two windows, so `pipe_state` and the histogram are
+  **offset by one window** when read side by side — count stalls from the
+  histogram's deltas, not from the current verdict (measured 2026-09-07);
+- the counters are per session: the governor is built with the session, so a
+  new `session_id` restarts them at zero;
+- on `0.4.67` every session showed one `transit-stalled` window at its start —
+  the viewer's first report had not arrived yet. The "has reported once" clause
+  (#1370) fixed it from `0.4.68`; nothing needs subtracting after that.
+
+**What the field taught**, with the record in FR-71's spec:
+
+- Finding 4 has **two shapes** on the corporate hosts, and the gate answers each
+  with a different fact. The post-ack kind — an age in the hundreds of
+  milliseconds to seconds with 0 B in flight and a 0.03 ms send wait (CORPLAP-2,
+  2026-09-07 and 09-08 08:48) — is the split rule's `TransitStalled`. The
+  blocked-send kind — a DC send blocked for 2.9 s and 7.4 s inside pump passes
+  the runtime had stalled (CORPLAP-1 on the Check Point VPN, 2026-09-08 12:15)
+  — is `AgentStalled`, the gate's first reason, whatever the classifier said of
+  the window. The B0 freeze fixtures model a third: a frozen drain that fills
+  the **sender's** queue, which the classifier rightly calls `Overproduced`
+  (`t1a_freeze_stalls_are_sender_visible`, `sim.rs:2326`); the simulator's
+  `transit_stalls` (acked on time, observed late) and the `finding4_transit_stall`
+  cell (`sim.rs:1716`) model the first.
+- **96 % of `transit-stalled` verdicts are report gaps**: 209 of 218 over four
+  days of the operator's sessions (2026-09-05 → 09-08, about 15,000 constrained
+  windows on `0.4.69` → `0.4.85`), one silent window every few minutes on a
+  healthy relay, and nothing was ever classified stalled while its queue was
+  over budget. A gap is still a rejected window; whether a hidden tab's silence
+  should count as a stall is an open decision in FR-71.
+- The cell that keeps the rate is `finding_4_keeps_the_rate_with_the_validity_gate`
+  (`sim.rs:2452`): no window below the pre-stall target and the path reading
+  clear within the stall's own length. Its FAIL arm,
+  `finding_4_cuts_the_rate_without_the_validity_gate` (`:2284`), keeps the
+  defect on record — the gate has no daemon switch, so the arm lives only in
+  the simulator — and the thin pipe, the LAN burst and a genuinely slow relay
+  trace **byte-identical** with the gate on and off
+  (`t1b_hold_is_inert_where_nothing_stalls`, `:2355`).
+
+⚠️ The classifier was a shadow for one release: `transit_classify` (T1a) and
+the hold behind `transit_hold` (T1b, default off) shipped in `0.4.67`, and
+FR-79 V1 **deleted** both the day the gate was built on the verdict. A
+`transit_hold = true` left in a host's `config.toml` is an inert key.
 
 ### What each consumer does with the verdict
 
-All of it is in one function, `RateGovernor`'s window fold (`governor.rs:1058`
+All of it is in one function, `RateGovernor`'s window fold (`governor.rs:1111`
 onward). `valid` is the gate's `None`; `stall_is_ours` is V5's exception, below.
 
 | consumer | on a valid window | on a rejected window | site |
 |---|---|---|---|
-| goodput fold (`GoodputEstimator::observe_window`) | folds the window's blocked sends | samples **dropped**, not quarantined; the next valid window is measured on its own merits | `governor.rs:1163` |
-| FR-35 hard ×0.5 (a send blocked ≥ `HARD_STALL` = 1 s, `ceiling_learn.rs:64`) | `apply_hard_md` | nothing — only the window boundary knows whether the block was the pipe (12:15: 2.9 s and 7.4 s blocked sends inside stalled passes, on a path that carried 6.6 M twenty seconds later) | `governor.rs:1180` |
-| FR-63 opener ramp | doubles on a clean window, ends on congestion | neither — unless `stall_is_ours`, which ENDS it | `governor.rs:1190` |
-| FR-15 age loop | fires on a streak over the learned floor; always learns the floor | learns, does not fire, and the streak resets — unless `stall_is_ours`, which keeps both | `governor.rs:1230` |
-| FR-59 P3 arrival-rate clamp | armed / released by the viewer's report | **neither armed nor released** — whatever it held, it still holds (14:52: the report *for* the stall set 834,800 on a path that had just carried 7.45 M) | `governor.rs:1260` |
-| the rate-limited ×0.85 (`aimd.rs:180`, ≥ 500 ms apart, `aimd.rs:84`) | on `age_over` or `link_over` | on `stall_is_ours` | `governor.rs:1352` |
-| FR-70 P1 prior | re-anchors on a live measurement, decays on a clean window | does not move — unless `stall_is_ours`, which pushes it back with no value attached | `governor.rs:1368`, `:1377` |
-| FR-79 V3b belief (shadow) | a delivery every window; a capacity when the fold accepted, or the viewer's queue grew | the delivery is still recorded; no capacity | `governor.rs:1038`, `:1171`, `:1285` |
-| pair-memory write-back (V2 + V4) | the session's belief, else the opener's measurement | nothing measured ⇒ nothing written | `peer.rs:1604` |
+| goodput fold (`GoodputEstimator::observe_window`) | folds the window's blocked sends | samples **dropped**, not quarantined; the next valid window is measured on its own merits | `governor.rs:1225` |
+| FR-35 hard ×0.5 (a send blocked ≥ `HARD_STALL` = 1 s, `ceiling_learn.rs:64`) | `apply_hard_md` | nothing — only the window boundary knows whether the block was the pipe (12:15: 2.9 s and 7.4 s blocked sends inside stalled passes, on a path that carried 6.6 M twenty seconds later) | `governor.rs:1241` |
+| FR-63 opener ramp | doubles on a clean window, ends on congestion | neither — unless `stall_is_ours`, which ENDS it | `governor.rs:1247` |
+| FR-15 age loop | fires on a streak over the learned floor; always learns the floor | learns, does not fire, and the streak resets — unless `stall_is_ours`, which keeps both | `governor.rs:1287` |
+| FR-59 P3 arrival-rate clamp | armed / released by the viewer's report | **neither armed nor released** — whatever it held, it still holds (14:52: the report *for* the stall set 834,800 on a path that had just carried 7.45 M) | `governor.rs:1317` |
+| the rate-limited ×0.85 (`aimd.rs:180`, ≥ 500 ms apart, `aimd.rs:84`) | on `age_over` or `link_over` | on `stall_is_ours` | `governor.rs:1409` |
+| FR-70 P1 prior | re-anchors on a live measurement, decays on a clean window | does not move — unless `stall_is_ours`, which pushes it back with no value attached | `governor.rs:1425`, `:1434` |
+| FR-79 V3b belief (shadow) | a delivery every window; a capacity when the fold accepted, or the viewer's queue grew | the delivery is still recorded; no capacity | `governor.rs:1095`, `:1228`, `:1342` |
+| pair-memory write-back (V2 + V4) | the session's belief, else the opener's measurement | nothing measured ⇒ nothing written | `peer.rs:2133` |
 
 ### V5 — a rejected window is not a measurement, but a stall is still push-back
 
@@ -158,9 +261,9 @@ downstream of the agent, it is the only push-back there is.
 | half | rule | anchor |
 |---|---|---|
 | which rejection also speaks about the rate | `Reason::is_congestion()` is true **only** for `TransitStalled`. `AgentStalled` would re-create the 12:15 defect, `StallShadow` double-counts one stall, `CarrierChanged` cuts for a path the session has left, `Opening` cuts for the opener draining into a transport still ramping | `evidence.rs:143` |
-| whose fault the stall is | `stall_is_ours` = congestion **and** `desired > pipe_bps × 1.2`. Above the measured pipe the stall is the rate's doing; at or below it, the transport's (FR-71's finding 4: an 8 Mbps leg head-of-line-blocked for 4.9 s with 1485 bytes queued, where a cut costs quality for an event the sender did not cause); **with nothing measured there is no claim to contradict, so no cut** | `governor.rs:1150` |
-| what it reaches | only the rate-limited ×0.85, the ramp's end, the age streak and the prior's push-back. **Never `apply_hard_md`** — it has no spacing and would halve once per stalled window. Everything that sets a *number* still reads `valid` | `governor.rs:1190`, `:1230`, `:1352`, `:1377` |
-| which estimate | `pipe_bps` (`governor.rs:601`: blocked-send goodput → the viewer's arrival rate while its queue grows, 15 s TTL → the decaying prior), **never** `blocked_send_bps` (`:584`). `0.4.96` shipped on the wrong accessor: the agent's sends block only when the queue is LOCAL, and CORPLAP-3 read `goodput_bps=None` with `goodput_samples=(0, 5)` for a whole relay session — V5 inert on that host. Fixed in **V5a, `agent-v0.4.97`** | `governor.rs:1139`–`1098` |
+| whose fault the stall is | `stall_is_ours` = congestion **and** `desired > pipe_bps × 1.2`. Above the measured pipe the stall is the rate's doing; at or below it, the transport's (FR-71's finding 4: an 8 Mbps leg head-of-line-blocked for 4.9 s with 1485 bytes queued, where a cut costs quality for an event the sender did not cause); **with nothing measured there is no claim to contradict, so no cut** | `governor.rs:1207` |
+| what it reaches | only the rate-limited ×0.85, the ramp's end, the age streak and the prior's push-back. **Never `apply_hard_md`** — it has no spacing and would halve once per stalled window. Everything that sets a *number* still reads `valid` | `governor.rs:1247`, `:1287`, `:1409`, `:1434` |
+| which estimate | `pipe_bps` (`governor.rs:634`: blocked-send goodput → the viewer's arrival rate while its queue grows, 15 s TTL → the decaying prior), **never** `blocked_send_bps` (`:617`). `0.4.96` shipped on the wrong accessor: the agent's sends block only when the queue is LOCAL, and CORPLAP-3 read `goodput_bps=None` with `goodput_samples=(0, 5)` for a whole relay session — V5 inert on that host. Fixed in **V5a, `agent-v0.4.97`** | `governor.rs:1196`–`1216` |
 
 ⚠️ The control that must stay green is
 `finding_4_keeps_the_rate_with_the_validity_gate`. Its field twin is every
@@ -170,14 +273,183 @@ three-hour CORPLAP-2 session over `relay:derp/tcp` held its target through
 locally blocked send inside an agent-stalled window — the AIMD's own occupancy
 loop, not the gate) at a paint age of p50 76 ms / p95 99 ms / max 988 ms.
 
-⚠️ **Open (AC9)**: the positive half — the target *converging* toward the
-measurement across repeated stalls — has not been caught in the field yet. It
-needs a stall inside a **measured** minute on a thin relay, and a sweep of the
-three relay laptops' daemon logs for 2026-09-10 → 09-25 (24,013 heartbeats,
-7,442 constrained windows, 193 transit stalls) found the pipe estimate absent
-at every one of the 193: the blocked-send source was live in 2 % of the
-constrained windows and the prior in none. That absence is the V3b finding,
-below.
+⚠️ **AC9, partly met 2026-10-31**: the positive half — the target *converging*
+toward the measurement across repeated stalls — needs a stall inside a
+**measured** minute. A sweep of the three relay laptops' daemon logs for
+2026-09-10 → 09-25 (24,013 heartbeats, 7,442 constrained windows, 193 transit
+stalls) found the pipe estimate absent at every one of the 193: the
+blocked-send source was live in 2 % of the constrained windows and the prior in
+none. That absence is the V3b finding, below. The first sustained run came on
+2026-10-30 on CORPLAP-2, `0.4.187`: 27 stalls in 56 s at a live
+`goodput_bps=180,484`, the target held at 1.11–1.40× it, bounded by the 200 kbps
+floor. The weak point is the reading it converges to (the A/B below).
+
+⚠️ **The 2026-10-29 fleet read found the inverse (FR-71).** Over 15 days and
+40,654 constrained windows on the corporate laptops (`0.4.137` → `0.4.184`), a
+transit stall on a session with no pipe estimate was held 433 times out of
+482 — but 49 clean stall episodes cut, every one on a session whose prior stood
+at 0.02–0.8 M: `stall_is_ours` compares against `pipe_bps`, whose last source
+is the prior's stand-in (`governor.rs:648`), and pushes that prior back without
+a measurement on every window it fires on (`:1439`), so each cut lowers the
+number the next stall is judged against. One 25-minute HEVC session over DERP
+went 3.63 → 0.94 M on 24 gap windows with 0 B in flight. A second edge: the
+viewer's congested report in a stall's **onset** window (transit still under
+the classifier's 200 ms slack, so the window is `clear` and valid) arms the P3
+clamp at the collapsed arrival rate — 3.0 → 0.62 M at 09:17:07 on 10-19, 13
+such drops in the fortnight. Both are recorded with their arcs in
+[`fr/FR-71-transport-stall-classification.md`](fr/FR-71-transport-stall-classification.md)
+(§Open decisions, field log); the law is not changed on this page.
+
+⚠️ **The fix for the first is FR-79's to make (V5b, proposed 2026-10-30).**
+`stall_is_ours` would compare only against a *measured* source (the goodput, or
+the viewer's arrival rate inside its 15 s TTL, `governor.rs:415`), never against
+the stand-in, and a stall that carries no number would stop walking the prior.
+Until the operator decides it, a convergence caught in the field may be toward
+the stand-in rather than a measurement, so it cannot count as AC9. The options
+and the rig AC8 and AC9 still need are in
+[`fr/FR-79-one-validity-gate.md`](fr/FR-79-one-validity-gate.md) §Open decisions.
+
+⚠️ That prior's size did not come from the walk. The session's stand-in moved on
+the measured ×11/10 ladder (`prior.rs:80`, `:167`) above a base of at most 17,799
+bps, so a live reading anchored it, and the walk only moved it between rungs. A
+congested viewer report stores the arrival rate with no floor (`governor.rs:1343`),
+and the same window re-anchors the prior on it (`:1433`). V5b would stop the cuts,
+but the anchor would stay in `pipe_bps` until it climbs back.
+
+⚠️ **The field A/B (2026-10-30 11:48–12:19, CORPLAP-2, `0.4.187`,
+`relay:derp/tcp`).** Over one session, stalls cut the target 13 times of 16 while
+a stand-in stood and 0 of 26 while nothing did, which is V5b's case. The same
+session shows V5b is not enough. One 102 ms blocked send folded into a live
+`goodput_bps=223,794`, because a window needs only 60 ms of blocked time
+(`goodput.rs:82`), on a path that delivered 5.39 M. While it stood the target
+fell 3.0 → 0.68 M in 22 s, most of it through the queue budget, which is
+denominated in the same `pipe_bps`.
+
+### The ceiling learner (FR-35 P1) — growth above the nominal
+
+On a constrained (relayed) session the AIMD runs under a ceiling, and that
+ceiling used to be a fleet constant: `relay_max_bps` = 3 Mbps (`mod.rs:875`,
+env `ROOMLERD_RELAY_MAX_KBPS`), the encoder opened at 85 % of it. One constant
+cannot be right for the fleet. The real `neo16 → CORPLAP-2` DERP path, measured
+2026-08-29, sustains ~6–9 Mbps and absorbs short bursts far above; other corp
+relays measured ~2 Mbps. At 2.55 Mbps that first pair's opening keyframe is a
+5.6 KB max-QP smear repaired by inter frames over ~1.2 s; at a 25.5 Mbps cap the
+whole desktop arrived as one 680 KB frame at +0.3 s — yet 12.8 Mbps *sustained*
+choked it with a 7.9 s stall. So the cap must be **learned per pair**, and —
+because every NVENC rate change *down* forces a starved keyframe that replaces
+the picture (FR-31) — within a session it may only ever **climb**.
+
+`encode::ceiling_learn::CeilingLearner` (`ceiling_learn.rs:89`) sits between the
+plan's nominal ceiling and the AIMD. `RateGovernor::effective_ceiling`
+(`governor.rs:572`) returns `plan.max(learned.min(hi))` on a constrained
+session, so the learned ceiling only ever RAISES the plan's, never past `hi`
+(`relay_max_hi_bps` = 8 Mbps, `mod.rs:933`). Once per viewer window the governor
+hands the learner that window's evidence (`governor.rs:1441` → `on_window`,
+`ceiling_learn.rs:190`), and it steps the ceiling up only when **all five** gates
+pass:
+
+```mermaid
+flowchart TB
+    WIN["viewer window (1 s)<br/>governor.rs:1441 → on_window"] --> G{"all five gates?"}
+    G --> P["PINNED — AIMD target ≥ 90 % of the ceiling<br/>(it wants more)"]
+    G --> CAR["CARRIED — the window WROTE ≥ 70 % of the ceiling to the<br/>data channel (you cannot measure capacity you are not using)"]
+    G --> CL["CLEAN — no decrease and no stall in the last 10 s"]
+    G --> AGE["AGE — viewer paint age ≤ 2× its learned floor<br/>(when the viewer reports it)"]
+    G --> SP["SPACED — ≥ 5 s since the last step"]
+    P & CAR & CL & AGE & SP --> STEP["step up: ceiling += max(ceiling/16, 150 kbps),<br/>capped at hi — logs 'the pair carried the ceiling'"]
+    G -- any fails --> HOLD["hold"]
+    DEC["an AIMD DECREASE (full channel · overflow ·<br/>stall · age excess — AimdController::decreases)"] --> PULL["the learned ceiling follows it down to the<br/>post-decrease target, never below the nominal"]
+    HS["a send blocked ≥ 1 s (HARD_STALL)"] --> MD["×0.5 at the window boundary, not the ×0.85<br/>ladder (the 7.9 s P0 stall took three ×0.85 over 4 s)"]
+    MEAS["a held goodput measurement < ceiling / 2<br/>(CONTRADICTION_FACTOR)"] --> AB["ABANDON the learned ceiling back to the nominal<br/>(FR-59 P6 — a relay-keyed fast day carried onto a slow one)"]
+```
+
+| gate / rule | constant | anchor |
+|---|---|---|
+| pinned | `PINNED_PCT` 90 | `ceiling_learn.rs:55` |
+| carried | `CARRIED_PCT` 70 | `ceiling_learn.rs:57` |
+| clean | `GROW_CLEAN` 10 s (decrease **and** stall) | `ceiling_learn.rs:51` |
+| age | `AGE_FLOOR_FACTOR_PCT` 200 — was 150, until the first field run's 66–80 ms over a 43 ms floor turned out to BE the evidence | `ceiling_learn.rs:62` |
+| spaced | `GROW_INTERVAL` 5 s | `ceiling_learn.rs:53` |
+| step | `max(ceiling / 16, 150 kbps)`, capped at `hi` | `ceiling_learn.rs:69`, `:236` |
+| hard stall | `HARD_STALL` 1 s ⇒ ×0.5, applied at the window boundary (FR-79: only there is it known the block was the pipe, not a pass the runtime stalled under) | `ceiling_learn.rs:64`, `governor.rs:1241` |
+| contradiction | learned > 2 × a held measurement ⇒ abandon to the nominal, exactly once | `ceiling_learn.rs:172`, `:79` |
+
+Two things the gates measure that read differently from their names, both found
+in the 2026-10-27/28 field reads below:
+
+- **CARRIED counts bytes the send task WROTE to the data channel in the window**
+  (`governor.rs:1057`, the send task's running byte total over the elapsed
+  window), not bytes the pipe delivered, and `on_window` runs on **every**
+  constrained window — it does not read the FR-79 verdict (`governor.rs:1441`).
+  So an opening burst the socket absorbs is "carried": on 2026-10-28 07:57:43 the
+  first step landed 0.36 s *before* the opener grace ended, inside a 697 KB
+  opener that had blocked a send for 164 ms — the very `Opening` window V4
+  refuses as write-back evidence. The exposure is one step (+1/16) per session,
+  capped by `hi`; the later steps need windows that really carry.
+- **DECREASE means an AIMD decrease** — `AimdController::decreases` ticking
+  (`aimd.rs:245`, `:259`; read at `governor.rs:933`). The FR-59 P3 viewer bound
+  (`governor.rs:799`: the ceiling capped at 90 % of the viewer's reported arrival
+  rate while its queue grows) lowers the AIMD's ceiling through `set_ceiling`,
+  which clamps `desired` **without** counting a decrease (`aimd.rs:188`). The
+  learner neither follows that bound down nor restarts its 10 s clean window on
+  it — by the P3 ordering's own argument ("a live report that the receiver is
+  falling behind outranks" the learner), but a reader of the heartbeat sees
+  `target_bps` fall ×0.9 while `learned_ceiling_bps` holds.
+
+The session's **stable rate** — the highest target that held 10 s
+(`STABLE_HOLD`) with no decrease — is what the pair memory persists
+(`ceiling_learn.rs:66`; next section), so the next session opens at 85 % of what
+the pair proved and the learner climbs from that floor instead of the constant.
+⚠️ "Held" is a hold of the AIMD *target*, not a delivery: on an idle session the
+target sits at the opener's seed for the whole session, so `stable_bps()` is
+that seed — see the write-back rows below for what that does to the memory.
+Kill switches: `relay_ceiling_learn` (tribool, default on; off ⇒ `hi` = 0 ⇒ the
+plan ceiling verbatim and no memory) and `relay_max_hi_kbps`
+(`crates/agent-core/src/config_surface.rs:1236`, `:1348`; `mod.rs:933`). Direct
+sessions never touch the learner (`governor.rs:572` gates on `constrained`).
+
+⚠️ **Only the FFmpeg DC pump runs the learner.** `relay_max_hi_bps()` has one
+caller (`peer.rs:6463`, `media_pump_ffmpeg_dc`), the VP9-444 pump builds its
+governor with `hi = 0` (`peer.rs:4285`), and the RTP pump has no governor. There
+is no software FFmpeg encoder, so a host with no hardware encoder never reaches
+the learner, and `relay_ceiling_learn` reads the same on and off there. A VM
+cannot prove that switch (FR-35 AC6). ⚠️ **On `h264_vaapi` the ceiling does not show in the bytes:** on jupiter (0.4.197, Raphael iGPU) one scroll delivered 10.7 Mbps under `maxrate` 2.55, 3.0 and 5.84 M alike, so on that cell read the target, `learned_ceiling_bps` and the memory ([FR-35's kill-switch A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-kill-switch-ab-2026-11-02)).
+
+> **Field, `CORPLAP-2` over `relay:derp/tcp`, 2026-10-27/28 — agent 0.4.177,
+> 0.4.178 and 0.4.181** (the FR-35 surface is byte-identical from
+> `agent-v0.4.177` through `agent-v0.4.185` and master; the host took 0.4.178 at
+> 13:41Z and 0.4.179 at 18:01Z on 10-27, so no read here ran 0.4.179). Seven
+> sessions on the pair `100.65.4.2|relay:derp/tcp` (AV1 NVENC, 1920×1200, DERP
+> rtt 106–258 ms), read from the host's own log and `rate_memory.json`:
+>
+> - **Seeding (P2):** every session opened at 0.85 × the remembered rate —
+>   `seed_bps` 4,750,677 ⇒ `opener_maxrate_bps` 4,038,075; 4,759,961 ⇒
+>   4,045,966; 4,402,963 ⇒ 3,742,518 (×5) — against the 2.55 M a cold pair gets.
+> - **Growth (P1):** the 10-27 09:23 session (79 s) stepped 4.04 → 4.29 → 4.56 →
+>   4.84 M in its first 15 s while the 2 s heartbeats carried 6.2 / 6.3 / 4.4 /
+>   7.6 Mbps, sat at 4.84 M through 45 s of an idle desktop (0.28–0.35 Mbps at
+>   18 fps — not carried, no step), and stepped to 5.15 M at 09:24:34.8 on a
+>   6.4 Mbps window. The 10-28 16:46:31 session (90 s) stepped 3.74 → 3.98 → 4.22
+>   → 4.49 M during 12 s of motion (3.1–7.4 Mbps windows), then nothing for 60 s
+>   of idle. Of the four 11–19 s sessions, three stepped once and the 07:57 one
+>   three times (to 4.49 M on 4.7–7.3 Mbps windows); the idle 15:27 session never
+>   stepped.
+> - **Health** (the four sessions read heartbeat by heartbeat: 09:23 and 15:27
+>   on 10-27, 07:57 and 16:46:31 on 10-28): `send_stalls=0` in every one;
+>   `send_wait_max_ms` 0.04–2.1 except the heartbeat holding an opener burst
+>   (52.4 ms on 09:23:26, 163.9 ms on 10-28 07:57:43) — never near `HARD_STALL`.
+>   Viewer paint age p50 66–68 / p95 103–117 ms over a 45–50 ms floor, the maxima
+>   (438, 775 ms) in a session's opening ten seconds (4 s and 10 s in). The
+>   ceiling never passed 5,146,238 (`hi` = 8 M) in any of the seven.
+> - **What held the opener at ~1.5×, not 2.5×:** the memory sat at 4.40–4.76 M
+>   while the pipe carried 6–7.6 Mbps windows with sub-ms send waits. The
+>   write-back rows below show why: a session that *proved* 4.84 M stable moved
+>   the memory +0.2 % (`ALPHA_UP` 0.10 of the gap), the next idle session moved
+>   it −7.5 % (its own seed written back as evidence). Nothing in these reads
+>   measured a sustainable limit; the memory's level is the write-back's
+>   dynamics, not the pipe's. (FR-35 AC1's numbers passed on 2026-10-31 without
+>   moving this, and a cold opener passes them too:
+>   [the opener A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-opener-ab-2026-10-31).) ⚠️ **Compare opening keyframes only at equal `dc_unopen_drops`.** Every frame the pump encodes before the video channel opens is dropped and forces another keyframe (`peer.rs:9722`, `:9728`), and the one delivered shrinks as the count rises: 63,284 B at 2 drops and 23,435 B at 4 on one `maxrate`. At equal drops it follows `maxrate` ([what moved it](fr/FR-35-relay-ceiling-learns-the-pair.md#what-moved-the-openers-keyframe-2026-11-02), [#3334](https://github.com/gjovanov/roomler-ai/issues/3334)).
 
 ### The write-back and the seed (V2 + V4) — the pair memory
 
@@ -205,11 +477,12 @@ flowchart LR
 
 | piece | rule | anchor |
 |---|---|---|
-| the key | `remote_addr\|carrier` — `direct`, `tunnel`, `relay:<kind>/<transport>` from the LocalAPI peer record; a mid-churn carrier (`blocked` / `offline`) leaves the bare pre-FR-79 key. DERP-over-TLS and a UDP relay are different pipes on the same address, four times apart in capacity | `rate_memory.rs:42`, `:65`; `peer.rs:1566` |
-| the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:7539` (`opener_measured_bps`) |
-| the write | `record_session(peer, evidence, now)`: `None` or 0 ⇒ **no write**; first evidence ⇒ adopted outright; otherwise `damp` with the goodput estimator's own asymmetry (`ALPHA_DOWN` 0.50 / `ALPHA_UP` 0.10, `goodput.rs:94`, `:98`). The maximum rule, `had_decrease`, the unqueued ×1.5 step and its constants are gone | `rate_memory.rs:147`, `:79`; `peer.rs:1615` |
+| the key | `remote_addr\|carrier` — `direct`, `tunnel`, `relay:<kind>/<transport>` from the LocalAPI peer record; a mid-churn carrier (`blocked` / `offline`) leaves the bare pre-FR-79 key. DERP-over-TLS and a UDP relay are different pipes on the same address, four times apart in capacity | `rate_memory.rs:42`, `:65`; `peer.rs:2076` |
+| the opener | measured by the goodput estimator (bytes over blocked time) for a burst that queued; `None` for one the socket absorbed. The old `bytes × 8 / longest_single_wait × 75 %` recorded 6–8 M against a 1.8–3.4 M pipe | `peer.rs:9283` (`opener_measured_bps`) |
+| the evidence | first choice `RateGovernor::stable_bps()` — the highest AIMD target that held 10 s with no decrease, when above the nominal; then `pipe_bps`; else 0 = nothing. ⚠️ The first is a hold of the *target*, not a measurement: an idle session holds the opener's seed for its whole length and writes 0.85 × the memory back as evidence (field rows below). ⚠️ The second is the belief the gate accepted only while a measurement is live: its last source is the prior's stand-in (`governor.rs:648`), so a prior that stands low can be written back too (field rows below) | `peer.rs:9191`; `governor.rs:599` |
+| the write | `record_session(peer, evidence, now)`: `None` or 0 ⇒ **no write**; first evidence ⇒ adopted outright; otherwise `damp` with the goodput estimator's own asymmetry (`ALPHA_DOWN` 0.50 / `ALPHA_UP` 0.10, `goodput.rs:94`, `:98`). The maximum rule, `had_decrease`, the unqueued ×1.5 step and its constants are gone | `rate_memory.rs:147`, `:79`; `peer.rs:2133` |
 | the file | `rate_memory.json` in the daemon's data dir (`appdirs::project_dirs().data_dir()` — on a Windows SYSTEM service `…\config\systemprofile\AppData\Roaming\roomler\roomler\data\`); whole-file atomic write; a missing or corrupt file is an empty memory; an entry older than 7 days never seeds and is pruned on the next write | `rate_memory.rs:185`, `:22` |
-| the log line | `FR-79 V4 rate memory: … peer=… evidence_bps=… kept_bps=…` at every session end that had a key. **`kept` lies between the old value and the evidence**, so `kept > evidence` on one line proves the entry moved DOWN — no old value needed | `peer.rs:1604` |
+| the log line | `FR-79 V4 rate memory: … peer=… evidence_bps=… kept_bps=…` at every session end that had a key. **`kept` lies between the old value and the evidence**, so `kept > evidence` on one line proves the entry moved DOWN — no old value needed | `peer.rs:2142` |
 
 Field reads of the write-back so far (key `100.65.4.2\|relay:derp/tcp` unless noted):
 
@@ -219,11 +492,86 @@ Field reads of the write-back so far (key `100.65.4.2\|relay:derp/tcp` unless no
 | 2026-09-08 22:14–22:17 | CORPLAP-1 · 0.4.95 | `None → kept 2,264,993`, twice (`100.65.0.5`) | a session that measured nothing wrote nothing; the old rule would have written 3,825,000 from an absorbed burst (AC8, first half) |
 | 2026-09-10 08:39:41 | CORPLAP-2 · 0.4.97 | `Some(3187500) → 3210512` from a seed of 3,233,525 | the entry moved **down** — `damp` exactly; the max rule would have kept 3,233,525. Marginal (0.7 %), but a direction the old rule could not take |
 | 2026-09-10 14:03:44 | CORPLAP-1 · 0.4.97 | `Some(8000000) → 6318171` from 6,131,302 | the entry moved **up**, damped, after a session that measured the relay at 11.5–17.0 M — one ×0.10 step toward the learner's 8 M cap |
+| 2026-10-27 09:24:41 | CORPLAP-2 · 0.4.177 | `Some(4843519) → 4759961` from 4,750,677 | the learner's stable rate (4.84 M held 57 s, windows carrying 6–7.6 Mbps) moved the entry **+0.2 %** — `ALPHA_UP` of a 93 kbps gap |
+| 2026-10-27 15:29:46 | CORPLAP-2 · 0.4.178 | `Some(4045966) → 4402963` from 4,759,961 | **the P2b decay, in V4 form**: a 130 s session on an idle desktop (0.16–0.25 Mbps at 18 fps, a 405-byte opener) never stepped and never decreased, so `stable_bps()` was its own `opener_maxrate_bps` — 0.85 × the memory — and `damp` took half the gap: **−7.5 % for having measured nothing**. Ten such sessions halve the memory; one proving session restores a tenth of its gap |
+| 2026-10-27 16:31 · 10-28 07:58, 12:38, 16:46 | CORPLAP-2 · 0.4.178 / 0.4.181 | `None → kept 4402963`, four times | sessions of 11–19 s: nothing held 10 s, nothing written — not the value, not the timestamp (as designed) |
+| 2026-10-28 16:48:01 | CORPLAP-2 · 0.4.181 | `Some(4489010) → 4411567` from 4,402,963 | the 90 s session's stable rate (4.49 M after three steps) moved the entry **+0.2 %**; the file now holds `100.65.4.2\|relay:derp/tcp` = 4,411,567 at `at_unix` 1793206081 |
+| 2026-10-30 12:22:06 | CORPLAP-2 · 0.4.187 | `Some(84195) → 84195`, a new entry | **the prior's stand-in written as evidence**: anchored at 180,484, it walked eight rungs in 28 s once the goodput expired, and `pipe_bps`'s last source wrote it. Nobody measured 84,195 |
+| 2026-10-25 → 10-30 | CORPLAP-2 · up to 0.4.188 | 18 writes with evidence, `5955306 → 3379312` | **every one a rung of the session's own opener**, 0.85 × the memory × (17/16)^k, six at k = 0. 17 of the 18 sessions held no live measurement in any heartbeat, and the entry lost 43 % while they delivered up to 10.2 M |
 
 ⚠️ An entry written before V2 is keyed by the bare address, never matches
 again and ages out. An entry that ages out is *replaced* by the next session's
 first evidence, not damped toward it — the damping only ever acts inside the
 7-day window.
+
+⚠️ The 2026-10-27 15:29 row is the open question FR-79 q3 turns on. V4
+dropped `had_decrease` because "the gate can tell a measurement from a
+non-measurement" — but `stable_bps()` is not gated: a target that nothing pushed
+is a hold, not a measurement, and on the connect-look-leave sessions this fleet
+actually has it writes the opener's own seed back as evidence. The asymmetry
+that protects against a flooded opener (believe a drop fast) then compounds it:
+the pair that carried 6–7.6 Mbps windows is remembered at 4.4 M. A fix belongs
+with the governor (`peer.rs:9191`: require the hold to have been *carried*, or
+route the first-choice evidence through the gate); nothing here is changed yet.
+The 2026-10-25 → 10-30 row is the same defect at scale: every write on that pair,
+not only the idle sessions.
+
+**That week, replayed (2026-10-31).** `damp` reproduces all 24 sessions' logged
+`kept` to within 2 bps, so the replay is the write-back itself. All 18 writes lie
+within 0.2 % of a rung of the session's own opener, `0.85 × memory × (17/16)^k`,
+which fixes what a write can do:
+
+| rungs climbed `k` | evidence ÷ memory | the memory moves | writes that week |
+|---|---|---|---|
+| 0 | 0.850 | −7.50 % | 6 |
+| 1 | 0.903 | −4.84 % | 2 |
+| 2 | 0.960 | −2.02 % | 3 |
+| 3 | 1.020 | +0.20 % | 4 |
+| 4 | 1.083 | +0.83 % | 2 |
+| 9 | 1.467 | +4.67 % | 1 |
+
+A session raises the memory only by climbing at least three rungs and then
+holding ten seconds; the week's mean was −2.98 % per write. Only 6 of the 18 held
+a target that a 2 s window carried at ≥ 70 %. Counting only carried holds helps:
+
+| rule | writes that count | end value, evidence as logged | end value, same rungs from the higher opener | opener, × the cold 2.55 M |
+|---|---|---|---|---|
+| today | 18 | 3.38 M | 3.38 M | 1.13× |
+| the session's peak window reached 70 % of the evidence | 11 | 3.78 M | 5.51 M | 1.26–1.84× |
+| a window at the held target reached 70 % of it | 6 | 4.13 M | 5.79 M | 1.38–1.93× |
+| only rungs above the seed (`k ≥ 3`) | 7 | 4.23 M | 6.25 M | 1.41–2.08× |
+
+The fourth column is an upper bound, because CARRIED is harder to pass under a
+higher ceiling.
+
+**Corrected 2026-10-31.** This section used to say a 2.5× opener needs a memory
+of 7.5 M, on the assumption that the keyframe follows `maxrate`. It does not
+follow it in a straight line ([the opener
+A/B](fr/FR-35-relay-ceiling-learns-the-pair.md#the-opener-ab-2026-10-31)): on a
+dense screen on AV1, 1.6× the maxrate gave 3.5–5.8× the keyframe, and on H.265
+4:4:4, the same 2.55 M gave 23 to 63 KB. FR-35 AC1's numbers pass at the pair's
+own 2.85–3.0 M, on a bar a cold opener clears too, so AC1 stays `[~]` until the
+operator says which reading counts. The hold question is worth deciding for what
+the memory buys on AV1, and AC1's numbers do not depend on it.
+
+**Three writes in one night (2026-10-31, CORPLAP-2).** Evidence is
+`stable_bps()`, else `pipe_bps()` (`peer.rs:9194`), and nothing clamps the
+second to `hi`:
+
+| session | evidence | the memory |
+|---|---|---|
+| a 60 s drag, eight learner steps | 4,872,507 | 3,379,312 → 3,528,631, +4.4 % |
+| opened and maximized an Explorer window | 3,187,500 | → 3,358,065, −4.8 % |
+| 45 s, closed that window | 13,044,940 | → 4,326,752, +28.9 % |
+
+One burst moved the memory six times further than a minute of real load. That
+is the same question as the hold, from the other side: which sessions measured
+the pair.
+
+Below a memory of about 3.53 M the opener sits under the plan's 3 M, so an idle
+session has no `stable_bps()` above the nominal (`ceiling_learn.rs:266`) and, with
+nothing measured, writes nothing: an 8 min idle session read `evidence=None`. That
+is where the week's decay stopped, at 3.38 M.
 
 ### V3b — ONE belief about the path (SHADOW since `agent-v0.4.98`)
 
@@ -237,12 +585,12 @@ evidence the old `min(goodput, link_rx)` averaged together:
 
 | evidence | meaning | source | accessor |
 |---|---|---|---|
-| a **delivery** | *"the path carried at least X"* — a lower bound, available every window on every carrier | the viewer's arrival rate (`governor.rs:1038`) | `floor_bps` — a MAX for the session, lowered only by contrary evidence, never by time |
-| a **push-back** | *"the path refused above X"* — a limit | an accepted goodput fold (`governor.rs:1171`), or the arrival rate while the viewer's queue grows (`:1285`) | `capacity_bps` (`pipe.rs:216`), 60 s TTL |
+| a **delivery** | *"the path carried at least X"* — a lower bound, available every window on every carrier | the viewer's arrival rate (`governor.rs:1091`) | `floor_bps` — a MAX for the session, lowered only by contrary evidence, never by time |
+| a **push-back** | *"the path refused above X"* — a limit | an accepted goodput fold (`governor.rs:1224`), or the arrival rate while the viewer's queue grows (`:1338`) | `capacity_bps` (`pipe.rs:216`), 60 s TTL |
 | the anchor a ceiling may be built on | `max(capacity, floor)` — never `min` | — | `ceiling_anchor_bps` (`pipe.rs:242`) |
 
 ⚠️ **It is a shadow.** The heartbeat prints `pipe_belief=(anchor, floor,
-capacity)` and `pipe_belief_n=(deliveries, capacities)` (`peer.rs:8154`) and
+capacity)` and `pipe_belief_n=(deliveries, capacities)` (`peer.rs:8369`) and
 **no consumer reads them** — not V5, not the ceiling, not the memory. The
 shadow corrected its own design three times in five days, which is why this
 page stops here rather than describing a law:
@@ -367,14 +715,14 @@ show the products: 34.56 M for AV1 at 1920×1200 @ 60, 43.2 M for HEVC and
 target**: the encoders run constant quality under `maxrate`, so a settled
 desktop spends almost nothing and only motion approaches the bound.
 
-`policy::rate_plan` (`encode/policy.rs:236`) finishes the chain: × the dial
+`policy::rate_plan` (`encode/policy.rs:241`) finishes the chain: × the dial
 (`dial_rate_factor_pct` — 70 / 85 / 100, clamped to [30, 100]) × the
-encode-pressure factor (`governor.encode_factor()`, `governor.rs:1537`),
-floored at `MIN_BITRATE_BPS` (1.5 M, `encode/mod.rs:241`). On a direct
-transport `effective_ceiling` is the plan's value unchanged (`governor.rs:539`
+encode-pressure factor (`governor.encode_factor()`, `governor.rs:1616`),
+floored at `MIN_BITRATE_BPS` (1.5 M, `encode/mod.rs:258`). On a direct
+transport `effective_ceiling` is the plan's value unchanged (`governor.rs:568`
 — the learner lifts it on constrained sessions only); the shared-pipeline split
 divides it by the follower count; and the result is both the AIMD's ceiling
-and the gate's reference rate (`last_ceiling_bps`, `peer.rs:7019`).
+and the gate's reference rate (`last_ceiling_bps`, `peer.rs:7221`).
 
 ⚠️ The encode-pressure factor multiplies the bound, so a host whose encoder is
 struggling lowers its own ceiling with no path evidence in it. On 2026-09-25
@@ -399,21 +747,21 @@ meant to bound.
 |---|---|---|
 | soft budget | `direct_queue_ms` (150) × ceiling ÷ 8, floored at 48 KiB; `0` disables the gate | `rate_profile.rs:559` (`direct_queue_budget_bytes`) |
 | hard budget | `max(soft, HRD reservoir)`, the reservoir being `maxrate × open_hrd_pct ÷ 8` — 100 % on direct (`direct_hrd_pct`, `:590`; config `direct_hrd_pct`, [25, 200]), 200 % for every `av1_*` encoder regardless | `rate_profile.rs:578` (`direct_queue_hard_budget_bytes`); `ffmpeg/encoder.rs` `open_hrd_pct` |
-| measured wait | the larger of an EMA (α 0.3 per pass) of completed frames' enqueue→wire-complete waits and the **live age of the frame the send task is writing** (`send_head_enqueued_us`) — a stalled pipe completes nothing, so the EMA alone reads stale-low exactly when the queue grows | `peer.rs:6333`–`6261`; set and cleared by the send task at `:5677`, `:5745` |
-| the verdict | bytes ≥ hard ⇒ trip; bytes ≥ soft **and** wait ≥ `direct_queue_ms` ⇒ trip; otherwise pass | `rate_profile.rs:597` (`direct_gate_trips`), called at `peer.rs:6373` |
-| on a trip | the pass skips producing a frame (`frames_skipped_backpressure`) and drives the AIMD's multiplicative decrease, as the full-channel arm always did; the first trip logs `direct byte-budget gate engaged` with `inflight`, `budget`, `hard_budget` and `measured_wait_ms`, so a field read can tell which arm fired | `peer.rs:6449`, `:6331` |
-| relay paths | unchanged: bytes vs `constrained_queue_ms` (450) of the relay ceiling, no wait term | `peer.rs:6302`–`6190` |
+| measured wait | the larger of an EMA (α 0.3 per pass) of completed frames' enqueue→wire-complete waits and the **live age of the frame the send task is writing** (`send_head_enqueued_us`) — a stalled pipe completes nothing, so the EMA alone reads stale-low exactly when the queue grows | `peer.rs:6528`–`6261`; set and cleared by the send task at `:5831`, `:5899` |
+| the verdict | bytes ≥ hard ⇒ trip; bytes ≥ soft **and** wait ≥ `direct_queue_ms` ⇒ trip; otherwise pass | `rate_profile.rs:597` (`direct_gate_trips`), called at `peer.rs:6572` |
+| on a trip | the pass skips producing a frame (`frames_skipped_backpressure`) and drives the AIMD's multiplicative decrease, as the full-channel arm always did; the first trip logs `direct byte-budget gate engaged` with `inflight`, `budget`, `hard_budget` and `measured_wait_ms`, so a field read can tell which arm fired | `peer.rs:6651`, `:6526` |
+| relay paths | unchanged: bytes vs `constrained_queue_ms` (450) of the relay ceiling, no wait term | `peer.rs:6497`–`6190` |
 
 ```mermaid
 flowchart TB
     subgraph ceiling["the ceiling — a bound, never an operating point"]
         G["w × h × fps × 0.25 bpp/s<br/>(0.07 on a constrained path)"] --> C["clamp [3, 48] M × codec/chroma factor<br/>rate_profile.rs:219"]
         C --> D["× dial 70 / 85 / 100 %"]
-        D --> E["× encode-pressure factor,<br/>floor 1.5 M — policy.rs:236"]
+        D --> E["× encode-pressure factor,<br/>floor 1.5 M — policy.rs:241"]
         E --> S["÷ followers (shared split)"]
         S --> CEIL["ceiling_bps<br/>= the AIMD's ceiling = the gate's reference"]
     end
-    subgraph gate["the direct gate — one pass, before capture (peer.rs:6124–6268)"]
+    subgraph gate["the direct gate — one pass, before capture (peer.rs:6319–6454)"]
         CEIL --> SOFT["soft = 150 ms × ceiling"]
         CEIL --> HARD["hard = max(soft, HRD reservoir)"]
         W["wait = max(EMA of completed waits,<br/>age of the head-of-queue frame)"]
@@ -507,7 +855,7 @@ What it changes here:
 | Lever | Before FR-112 | Now |
 |---|---|---|
 | frame rate | a constant 30 | 60, paced by `SoftwarePace` (`encode/encode_pressure.rs:242`) in 5-fps steps, never below 30: down at once, up only with 2.5 fps of headroom (P2d) |
-| bitrate base | `w·h·fps·0.20` at the target | `bitrate_base_for_fps` (`encode/mod.rs:719`): the old figure at 30, ×√(fps/30) at the rate the pump runs at |
+| bitrate base | `w·h·fps·0.20` at the target | `bitrate_base_for_fps` (`encode/mod.rs:808`): the old figure at 30, ×√(fps/30) at the rate the pump runs at |
 | OpenH264's per-frame budget | configured for 30 whatever the rate | `set_frame_rate`: the rate the pump runs at, the keyframe period kept at 2 s |
 | the auto-fps-cap (a software encoder dropped to 30) | always | only where the tier is off: Windows and macOS by default |
 
@@ -520,6 +868,39 @@ always differ by at least a whole step. So on 0.4.142 an estimate hovering on a 
 crossed (a field trace: 55 → 50 → 55 → 50 → 45 → 50, five moves in ten windows). The software pace now steps down at
 once and up only when the encoder clears the higher step by 2.5 fps. The hardware pace keeps margin 0 until it
 is measured on hardware ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
+
+## Above 60 fps (FR-119) — the ceiling law and the pipe, per rate
+
+A viewer may ask for 120 or 144 fps, and the agent grants a rate only where the host has shown it can sustain
+it ([`remote-control.md` §5.4](remote-control.md#54-above-60-fps-the-viewer-asks-the-host-proves-it-fr-119)).
+Here is what the rate controller does differently above 60. At and below 60, every ceiling is byte-identical
+to before.
+
+**The rate law.** The ceiling is computed at `rate_law_fps` (`encode/rate_profile.rs:184`): the rate itself up to
+60, and above that the 60 fps rate scaled by `(fps / 60)^α`, with `HIGH_FPS_ALPHA = 0.8`
+(`encode/rate_profile.rs:179`). The band's top grows the same way. α is the upper envelope of FR-119 P0(d)'s
+offline measurement, where α ran from about 0 to 0.8 by codec and content. A linear law would double the bits
+at 120; a fixed band would halve them per frame.
+
+| Rate | `rate_law_fps` | Bits per frame, as a share of 60 fps |
+|---|---|---|
+| 60 | 60.0 | 1.00 |
+| 120 | 104.5 | 0.87 |
+| 144 | 120.9 | 0.84 |
+
+So 1080p at 144 gets 62.7 Mbit/s where the linear law clamped it to 48, and 2560×1600 or 4K at 144 reach the
+class top, 96.7 Mbit/s.
+
+**The pipe, per rate.** Before granting a rate the agent checks that rate's own ceiling against the session's
+pipe push-back (`pipe_covers`, `encode/frame_rate.rs:297`). Since P2b-18, a pipe that covers 120's ceiling but
+not 144's runs the session at 120 instead of the base rate. Only a push-back refuses: the FR-79 belief's
+`capacity_bps`. The belief's floor is never read as a limit. At 60 fps the floor is the content's weight at 60,
+which is always under the ceiling at 120, so read as a limit it would refuse every healthy session.
+
+⚠️ **A keyframe is not a capacity measurement** (P2b-13, P2b-14, `Reason::KeyframeBurst`,
+`encode/evidence.rs:90`). On a direct path, a window holding a blocked keyframe send is rejected as evidence.
+Before that, one ~625 KB keyframe whose send blocked for 72 ms read as 70 Mbit/s of capacity on a mesh that
+carried 311, and took 120 back on `pipe`.
 
 ## The media plan, in shadow (FR-70 M3a)
 
@@ -544,11 +925,13 @@ flowchart TD
     PACE -. "check_fps" .-> CNT
     PACE --> CAP["capture"]
     CAP --> DIMS["inline plan_dims → plan_target"]
-    DIMS -. "check_dims" .-> CNT
+    DIMS -. "check_dims(dims, inputs)" .-> CNT
+    DIMS -. "inputs moved since the snapshot" .-> APART["counted apart<br/>plan_lags · plan_stale_swaps · plan_stale_ticks"]
     DIMS --> BUILD["inline open / adopted replacement<br/>note_built(rate, dims)"]
     BUILD --> TICK["governor.pre_encode_tick"]
-    TICK -. "after_tick: republish bitrate, judge the build" .-> CNT
-    TICK --> OUT["encode → send → heartbeat<br/>plan_divergences · plan_epoch"]
+    TICK -. "after_tick(target, ceiling): republish bitrate, judge the build" .-> CNT
+    TICK -. "a replacement re-rated within the ceiling on its first tick" .-> APART
+    TICK --> OUT["encode → send → heartbeat<br/>plan_divergences · plan_epoch · plan_lags · plan_stale_*"]
 ```
 
 | plan field | what it is | the inline value it is compared with |
@@ -575,13 +958,24 @@ WARN FR-70 M3a: the shadow plan diverged from the pump's inline value (first tim
      field="dims" plan="(1920, 1200)" inline="(944, 590)"
 ```
 
-Read the line, not the count: it names the field and the two numbers. The
-counts the shadow is EXPECTED to show, each a one-frame lag M3b has to design
-for rather than a bug: a native-dims change under a live session, a refine
-flip during the pass's capture (inert on the fleet default — the dial's
-dims-caps are off), a resolution or Priority write landing between the
-snapshot and the inline read, a `pipe_bps` TTL expiry between the two reads.
-Anything else is a plan bug and blocks M3b.
+Read the line, not the count: it names the field and the two numbers.
+
+Three things are counted **apart** from the divergences, because none is a bug
+in the plan, and each logs its first occurrence once:
+
+| heartbeat field | counts | since |
+|---|---|---|
+| `plan_lags` | a geometry difference whose INPUTS moved between the plan's snapshot and the inline read: a native-dims change under a live session (a display-mode switch), a resolution or Priority write landing in between, a viewer joining a shared pipeline, a refine flip or a soft-cap move. The log line names the input that moved (`moved="native"`, `"target"`, `"priority_cap"`, …) | FR-70 M3a.3 |
+| `plan_stale_swaps` | a replacement adopted after the plan moved while it opened | FR-70 M3a.1 |
+| `plan_stale_ticks` | a replacement adopted while the plan held, whose rate the controller moved on its very next tick within the frame's ceiling (a congestion decrease, often set off by the replacement's own IDR) | FR-70 M3a.3 |
+
+The gate reads `plan_divergences` alone. A geometry divergence there had its
+inputs hold, and a bitrate divergence is an encoder built at a rate the plan
+did not stand behind: an inline open re-rated on its first tick, a replacement
+built above its frame's ceiling, or one re-rated on a tick that did not move.
+Each of those is a plan bug and blocks M3b. ⚠️ A `pipe_bps` TTL expiry between
+the two reads would still read as a budget divergence: no counter classifies
+the budget fields yet, and none has been seen.
 
 ⚠️ **No kill switch, on purpose.** The shadow changes no decision, takes no
 await, adds no env read to the frame path (every knob is resolved once per pump
@@ -589,6 +983,271 @@ into `PlanKnobs`) and logs at most seven lines per session; a switch would be
 the twelfth of the kill switches FR-70 exists to delete, guarding nothing.
 ⚠️ The VP9-444 pump and the RTP pump run no shadow (M3b decides whether the
 software pump reads the same plan; the RTP pump has no governor).
+
+## The shadow rate controller (FR-63 B1)
+
+Everything above is eight estimators of one quantity — the pipe's rate —
+composed with "the lower of" rules (the occupancy AIMD, the blocked-send
+goodput, the FR-35 learner and pair memory, FR-59's floor relief / arrival clamp
+/ drain / seed contradiction / remembered-rate opener, the FR-15 age loop). FR-63
+([`fr/FR-63-one-delay-based-rate-controller.md`](fr/FR-63-one-delay-based-rate-controller.md))
+replaces them with **one** delay-based controller, `encode::ratectl::Controller`
+(`agents/roomlerd/src/encode/ratectl.rs`), and does it the way the rate-control
+plan requires — **shadow-first**. B1 (`agent-v0.4.188`+) builds the controller
+and runs it beside the live governor, emitting what it *would* decide into six
+`shadow_*` heartbeat fields. It drives nothing; B2 flips it live on a fleet-log
+flip criterion, B3 deletes the eight.
+
+⚠️ **Containment is the whole safety property of this phase.** The governor owns
+the controller as `shadow: Option<ratectl::Controller>` (`governor.rs`), fed only
+through its methods at the five live positions and read only by the `shadow_*`
+accessors. No live decision is a function of anything it computes, and
+`governor::tests::the_shadow_never_moves_the_live_decision` proves it: two
+governors identical but for `ratectl` (Off vs Shadow), driven through the same
+frames and windows, must produce byte-identical `applied_bps`, relieved floor,
+pipe-state tally, link stats, goodput samples and viewer age — and a red-run that
+lets the shadow write a live field fails it.
+
+```mermaid
+flowchart TB
+    OPEN["open: constrained floor 200 k<br/>(NOT the 1.5 M flat pin)<br/>or 0.85 × remembered, a 10 s soft cap"] --> SU["Startup<br/>×1.08/window &lt; 50% ceiling,<br/>additive above"]
+    SU -->|"full channel · hard stall ·<br/>2 windows: age level ≥ 70 ms /<br/>loss ≥ 2% / goodput &lt; 0.9×target"| OU["OverUse<br/>target = 0.85 × measured<br/>(≥ 0.5× last, ≥ floor)"]
+    OU --> HO["Hold<br/>holds while the age LEVEL is elevated<br/>(not the derivative)"]
+    HO -->|"2 clean windows"| UU["UnderUse<br/>climb again"]
+    UU -->|"settles / reaches ceiling"| NO["Normal"]
+    NO -->|"congestion"| OU
+    UU -->|"congestion"| OU
+    HO -->|"deep level + constrained"| PA["+1 bounded pause<br/>(never on direct;<br/>counted only, in shadow)"]
+    PA --> HO
+    OUT["output → apply_deadband<br/>(decrease ≤ 1/500 ms,<br/>increase ≤ 1/2 s, |Δ| ≥ 5%)<br/>→ shadow_target_bps"]
+    SU -.-> OUT
+    OU -.-> OUT
+    UU -.-> OUT
+```
+
+`measured` is the viewer's arrival rate on a constrained path, `min(goodput, rx)`
+on a direct one; an `fps == 0` window (a DERP stall) is no evidence. The path
+floor is **200 kbps constrained** — the controller's thesis is that the
+governor's flat 1.5 M `area_min_bitrate_bps` is a pin, not evidence — and the
+governor's area floor on a direct path.
+
+The controller is fed at the five positions the governor already instruments,
+from locals the live loops computed, with no hot-path signature change:
+
+| position | call | signal |
+|---|---|---|
+| `pre_encode_tick` (per frame) | `set_domain` + `observe_frame` | the resolved floor/ceiling and the send-channel occupancy (the AIMD's own signal) |
+| `on_backpressure_skip` | `on_budget_skip` | the byte-budget gate tripped — a congestion sample, NOT a blocked send |
+| `on_send_overflow` | `on_overflow` | a send-channel overflow |
+| `note_send_stall` | `on_stall` | a blocked send (hard ≥ 1 s halves; softer is rate-limited) |
+| `tick_viewer_window` | `fold_window` | the window's age / arrival rate / queue growth / goodput / fps |
+
+The heartbeat (both DC pumps) carries, in SHADOW:
+
+| field | meaning |
+|---|---|
+| `shadow_target_bps` | what the controller would be targeting |
+| `shadow_state` | `startup` / `normal` / `overuse` / `hold` / `underuse`, or `off` when `ROOMLERD_RATECTL=off` |
+| `shadow_measured_bps` | the controller's own pipe estimate |
+| `shadow_disagree_pct` | `(shadow − live) / live` — **negative = the shadow asked for less**, the safe direction, and the quantity the flip criterion counts |
+| `shadow_pauses` | bounded pauses it would have ordered (constrained only; it cannot pause anything in B1) |
+| `shadow_reason` | why its target last moved |
+
+A `RateLaw` adapter (`sim::tests::RatectlLaw`) runs the controller on the same
+B0 cells as the shipped laws, so its numbers are the baseline B2 must beat: on
+the recorded 213 kbps cell its peak commitment is under half arm A's 2.55 M, it
+never leaves `[floor, ceiling]`, and it never pauses on a direct cell.
+
+⚠️ **B1 is the code, not the verdict.** Whether the shadow agrees with the live
+governor closely enough to flip (AC2) is a release plus a week of `agent_logs`
+read per path class — a field read, not a test, and the instrument for it is the
+next section's. The config-surface tribool
+`ratectl = shadow|live|off` and the `live` apply seam are **B2**; B1 is env-only
+(`ROOMLERD_RATECTL`), so a B1 fleet cannot be made to let the shadow steer.
+
+### Reading the shadow — AC2's instrument (FR-63 B1b)
+
+`scripts/rc-shadow-report.cjs` measures the flip criterion. It does not decide it:
+whether the bar is right, and whether to flip, stay the operator's calls.
+
+> ≥ 20 constrained + ≥ 20 direct sessions, and shadow ≤ live in ≥ 90 % of the
+> elevated-age windows (and all four B0 fixtures green).
+
+```mermaid
+flowchart LR
+    HB["DC pump heartbeat<br/>(FFmpeg ≈2 s · VP9-444 ≈1 s)<br/>target_bps + six shadow_*"] -->|"INFO line"| DISK["the host's rolling log<br/>roomlerd.log.* · 14 days"]
+    HB -->|"uploader · 5 s batches"| AL[("agent_logs<br/>every daemon and RC worker,<br/>every org · 7-day TTL")]
+    AL -->|"FLEET read: mongosh inside the Mongo pod<br/>$match created_at (index) → $filter msg →<br/>$unwind → $project 14 fields"| CORE["ShadowReport<br/>counters + sparse histograms"]
+    DISK -->|"HOST read: node over text<br/>(evidence about that host only)"| CORE
+    CORE --> OUT["per-class table · the criterion<br/>MET / NOT MET / INCONCLUSIVE<br/>· B1's invariants<br/>· what the encoder spent"]
+```
+
+**One window is one DC-pump heartbeat.** A window without `shadow_state` came from a
+build before B1 and is counted, never compared; `shadow_state="off"` is the kill
+switch; an unopened shadow (`shadow_target_bps=None`) or a zero live rate is not
+compared. Every other window compares the shadow with `target_bps` (the governor's
+`applied_bps`, the same rate `shadow_disagree_pct` divides by): **shadow ≤ live is
+agreement**, the safe direction. A window is **elevated** when
+`viewer_age_ms − viewer_age_floor_ms ≥ 70 ms` — the controller's own level threshold
+(`ratectl::AGE_SLACK_MS`; the self-test fails if the two drift apart). The path class
+is the heartbeat's `constrained` flag, which the FFmpeg pump logs every window; the
+VP9-444 heartbeat has no such field, so a VP9 session takes the `relay=` of its
+"per-session ICE path detected" line and is `unknown` without one, never `direct`.
+Windows classed that way are counted apart, because `relay` misses one case the
+pump's flag catches (an overlay remote on a relay tier).
+
+| verdict | when |
+|---|---|
+| **MET** | both session clauses met and the pooled agreement ≥ 90 % over at least one elevated window |
+| **NOT MET** | any clause below its bar |
+| **INCONCLUSIVE** | no clause fails, but there is no elevated window to judge — zero evidence is never a pass |
+
+The agreement clause is pooled, as the criterion words it; each class's own agreement
+is printed beside it, and a class below 90 % on its own is flagged, so a pool that
+passes on the strength of one class cannot hide the other. The fixtures clause is
+CI's (`cargo test -p roomlerd --lib`), so the report says "not checked here" rather
+than claiming it. The same pass reads two of **B1's invariants off the field**: a
+`shadow_pauses` rise inside a DIRECT window (the "never on direct" rule — a count
+carried over from an earlier constrained stretch is not a rise), and a constrained
+shadow below its 200 kbps floor. Both must read 0.
+
+⚠️ **The criterion judges elevated windows only, and the first field read showed why
+that is not enough on its own.** On ten direct sessions on `agent-v0.4.188`
+(2026-10-30) every window carried the shadow, and in all 43 clean windows it asked
+for **96 % less** than the governor: it opens at the direct path's area floor
+(2.46 Mbps at 2560×1600) and climbs ×1.08 per window, while the governor opens at its
+content-generous ceiling (~90 Mbps). Asking for less passes the criterion. So the
+report prints the clean-window disagreement under its own heading, with no
+threshold of its own; the detail and the B2 question it raises are in the FR-63 spec
+(§ "Day 0").
+
+#### What the encoder spent: the reading the criterion cannot make
+
+⚠️ **The criterion can fail a shadow that asks for too much, never one that asks for
+too little.** Pinned at its floor, the shadow scores 100 %:
+
+| clause | why it cannot catch a shadow asking for too little |
+|---|---|
+| sessions | counts sessions, whatever the shadow asked for |
+| agreement | `shadow ≤ live`, and the floor is one the live AIMD holds too: both take the same `floor_bps` (`governor.rs:909`, `:924`), and on a constrained path the shadow's 200 k (`ratectl.rs:293-294`) is the live floor's default stop (`encode/mod.rs:387-392`). The shadow also shares the live ceiling (`ratectl.rs:298`, `:318`) |
+| fixtures | the four fixtures run the shipped laws. `RatectlLaw`'s three tests (`sim.rs:1843-1906`) assert a domain, an upper bound and no pause on direct, and a shadow pinned at its floor passes all three |
+
+The self-test pins the result: pinned at its floor, with the encoder spending 20 Mbps,
+the verdict is MET. The clean-window disagreement cannot show it either, because
+`target_bps` is a cap, usually far above what the encoder spends: the live cap climbs
+past 200 Mbps on a desktop sending 5 kbps. So −96 % reads the same on a resting desktop
+that lost nothing and on a scroll spending 14 times the shadow's target.
+
+So the report also compares the shadow with what was actually sent. `bytes_written` is
+the send task's running total of whole frames the transport took (`peer.rs:7209`,
+`:4215`), on both heartbeats (`peer.rs:9898`, `:5206`):
+
+```mermaid
+flowchart LR
+    HB["heartbeat<br/>bytes_written + its timestamp"] --> SAME{"same pump,<br/>counter did not fall,<br/>0.5 s ≤ gap ≤ 10 s?"}
+    SAME -->|no| NR["no rate: counted apart,<br/>never read as a low one"]
+    SAME -->|yes| RATE["spent = Δbytes × 8 / gap"]
+    RATE --> OVER{"spent > the higher of the<br/>shadow's targets at the two ends?"}
+    OVER -->|yes| CAP["over: it would have<br/>capped real spending"]
+    OVER -->|no| FIT["covered: the window's<br/>average fit under it"]
+    CAP --> CUBE["one sparse cube per age class:<br/>first 120 s or later · spent · how far over ·<br/>encoder · shadow state"]
+    FIT --> CUBE
+```
+
+| reading | what it proves | what it does not |
+|---|---|---|
+| `spent > shadow`, clean window | the shadow would have capped spending the path was carrying | that the picture needed those bits. Every FFmpeg backend but NVENC anchors `bit_rate = maxrate` (`ffmpeg/encoder.rs:1876-1885`), so a high target can also draw spend, which is why the report splits by encoder. A small excess can be overshoot, hence the "by > 25 %" column |
+| `spent ≤ shadow` | the window's average fit | that no burst inside the window was capped |
+| the encoder's demand | `spent` bounds it from below | nothing bounds it from above: the heartbeat has no maxrate field (`peer.rs:9889-9904`), and a new field cannot help a read of logs already written |
+
+The live cap cannot hide a bite: while `shadow < live`, a window capped by live spends
+about live, which is over the shadow. Elevated windows are kept out of the table, since
+spending over the shadow there is the safe direction; a window with no viewer age is
+counted beside it, not judged clean. The report applies no bar, and the verdict does not
+read any of this. Each row carries the sessions, the share over and the share over by
+more than 25 % at its spend or more, so any gate can be read off one report, and `--json`
+keeps the whole cube.
+
+**First read, 2026-11-02.** Every shadow heartbeat in one dev box's service log since
+`agent-v0.4.188`: 20 sessions, 235 windows, all direct, all NVENC. It is evidence about
+that host only. The last column is a counterfactual over the same lines, a shadow that
+never left its opening target:
+
+| spent, Mbps | clean windows | spent > shadow | at this spend or more: sessions | over | over by > 25 % | pinned shadow: over |
+|---|---|---|---|---|---|---|
+| < 0.5 | 143 | 0 | 19 | 8/200 = 4.0 % | 6/200 = 3.0 % | 14/200 = 7.0 % |
+| 0.5 – 1 | 35 | 0 | 9 | 8/57 = 14.0 % | 6/57 = 10.5 % | 14/57 = 24.6 % |
+| 1 – 2 | 8 | 0 | 8 | 8/22 = 36.4 % | 6/22 = 27.3 % | 14/22 = 63.6 % |
+| 2 – 5 | 11 | 5 | 3 | 8/14 = 57.1 % | 6/14 = 42.9 % | 14/14 = 100 % |
+| 10 – 20 | 1 | 1 | 1 | 3/3 = 100 % | 3/3 = 100 % | 3/3 = 100 % |
+| 20 – 50 | 2 | 2 | 1 | 2/2 = 100 % | 2/2 = 100 % | 2/2 = 100 % |
+
+- **The −96 % was mostly a gap between two caps.** In 192 of the 200 clean windows the
+  shadow's target covered the spend and the session would have lost nothing.
+- **Where the encoder worked, the bite was hard.** One session's second heartbeat spent
+  40.7 Mbps against a 2.87 M target, ×14, on a path that carried it with a clean age.
+- **A bar over all clean windows has no power.** B1 scores 96 % and the pinned shadow
+  93 %, because resting windows dominate. Only a gate on the spend separates a working
+  controller from a pinned one, which is why the table is binned.
+- **It says nothing yet about after the climb.** All 8 fell within 14 s of the pump
+  opening, with the shadow still in `startup`, and no session on that box ran past 59 s.
+  The fleet read's "after the first 120 s" column is what answers it.
+- **The derived rate is real.** It sits within ×2 of `shadow_measured_bps`, the viewer's
+  own arrival rate on most windows, in 197 of 215 windows. The report prints that control
+  on every run.
+
+Whether the criterion gains a clause on this is the operator's call; the recommended
+wording and what it would need are in the FR-63 spec (§ "Open decisions").
+
+**Why the fleet read is server-side.** The plan assumed the API could serve it
+(`list_for_agent(?session_id=…)`). It cannot: `GET /api/tenant/{tid}/agent/{aid}/logs`
+takes only `limit`, clamped to 500 recent batches per agent — about 40 minutes of a
+session. An exec sweep of host logs is worse than incomplete: it reaches only
+exec-enabled, online hosts of one org, which is a biased sample of exactly the
+proportion AC2 asks for. `agent_logs` holds the whole population, because every
+daemon and every RC worker runs the uploader (a Windows host's RC pump runs in its
+console-session worker, `roomlerd run --supervisor scm`, which uploads like the service
+does).
+
+**The fleet read is bounded by construction**, because an unbounded read inside the
+Mongo container OOM-killed production Mongo once (2026-10-26):
+
+| bound | how |
+|---|---|
+| time | a window of at most 8 days (`agent_logs` keeps 7), read one day per query, each with `maxTimeMS` 240 s |
+| plan | `$match` on `created_at` + `$sort` served by an index — `IXSCAN created_at_1` for the fleet, `tenant_id_1_source_1_created_at_-1` (backward) for one org; `explain` shows no blocking SORT |
+| memory | only streaming stages after the index scan, `allowDiskUse: false`; mongosh holds one row at a time and folds it into counters and sparse histograms. 2,000,000 synthetic rows over 2,000 sessions peak at 14 MiB of heap |
+| data | only 14 fields are projected — never an address, a name or another line |
+| credentials | read from the container's own environment, never argv |
+| consent | `--kubectl` / `--mars` refuse without `--yes`; the mongodb pod's restart count is printed before and after, and a restart fails the run (exit 3) |
+
+**Rehearsed, not assumed.** `--to-ejson` turns real log text into `agent_logs` batches
+exactly as the uploader stores them (an integer an Int64, a `?Debug` value its printed
+string, a lone quoted value its text), and `--docker NAME --seed FILE` runs the fleet
+read against a throwaway `mongo:7` — the image production runs. On 2,274 lines (a dev
+box's real 2026-10-29 heartbeats, all pre-B1, plus synthetic B1 lines) the Node read
+over the text, the mongosh read over the seeded batches, and the Node read over the
+fleet read's own `--rows` output agreed exactly on every class, the pool, the
+criterion and the invariants.
+
+The spend reading was rehearsed the same way on 2026-11-02, on the 235 real lines of the
+table above. Master's file printed no spend section and its rows held no `bytes_written`.
+The file as pushed printed the table, and the same three reads agreed exactly, cube
+included, there and again with 17 synthetic lines for what that log does not hold (a
+constrained session, VP9-444 with and without its ICE line). `explain` still reads
+`IXSCAN created_at_1` with no SORT stage, and `rc-shadow-report.sh` did not change.
+
+```bash
+node scripts/rc-shadow-report.cjs --self-test                       # 80 cases, incl. the bar's edges, red runs and the spend's edges
+node scripts/rc-shadow-report.cjs roomlerd.log.2026-10-30 …          # a host's logs: evidence about that host only
+bash scripts/rc-shadow-report.sh --mars --yes --since 2026-10-30T14:21:00Z   # the fleet read AC2 is judged by (--until: now)
+bash scripts/rc-shadow-report.sh --docker NAME --seed seed.ejson     # the rehearsal
+```
+
+⚠️ **The window starts at `agent-v0.4.188`** (published 2026-10-30 14:21Z), the first
+release with B1. `agent_logs` deletes a batch 7 days after it arrives, so a window
+anchored at the release loses its first hours the moment it turns 7 days old: read it
+during its 7th day (`--until` = the time of the read), not after.
 
 ## Config / env reference
 
@@ -604,15 +1263,18 @@ All keys live in the agent config (`roomler config set …`) with
 | `constrained_cq_relief` | 4 | CQ softening at a sub-native rung on relay — only reachable via explicit picks / restored rungs |
 | `idle_refine_settle_constrained_ms` | 1200 | Up-flip settle on relay when a rung exists |
 | `gpu_scale` / `scale_threads` | on / 1 | HW-downscale Phase A/B levers (only active when something scales) |
-| `ROOMLERD_RELAY_MAX_KBPS` | 3000 | The constrained-transport ceiling clamp |
+| `ROOMLERD_RELAY_MAX_KBPS` | 3000 | The constrained-transport ceiling clamp (the nominal the learner grows above) |
+| `relay_ceiling_learn` / `ROOMLERD_RELAY_CEILING_LEARN` | on | FR-35 — the constrained ceiling learns the pair; off ⇒ the fixed clamp and no rate memory ([§ The ceiling learner](#the-ceiling-learner-fr-35-p1--growth-above-the-nominal)) |
+| `relay_max_hi_kbps` / `ROOMLERD_RELAY_MAX_HI_KBPS` | 8000 | FR-35 — the ceiling the learned rate may reach; `0` = nominal only (= `relay_ceiling_learn` off) |
 | `ROOMLERD_SMOOTH_MAX_EDGE` / `RELAY_MAX_EDGE` | 1024 / 1280 | Rung sizes when `priority_res_cap` is on |
 | `direct_queue_ms` | 150 | FR-74 P1/P1b — the direct gate's **lag bound**: bytes over 150 ms of the ceiling gate only once the measured send wait has also crossed 150 ms; 0 disables the gate ([§ The direct path](#the-direct-path-fr-74--a-ceiling-that-is-a-bound-a-gate-that-measures-lag)) |
 | `direct_hrd_pct` | 100 | HRD window for direct sessions, % of maxrate ([25, 200]); also the gate's hard budget. ⚠ `av1_*` encoders stay at 200 regardless (the rc.443 hang) |
 | `ROOMLERD_FFMPEG_MAXRATE_KBPS` | unset | Env only — replaces the computed ceiling in both directions (the FR-74 P0 A/B knob and the way back from P1) |
 | `ROOMLERD_VP9_DIRECT_MAX_Q` | 16 | FR-74 P3 — the libvpx VP9 4:4:4 pump's worst quality on direct transports (q-index 64); 63 = the pre-P3 behaviour |
 | `ROOMLERD_SW_FPS_60` | on (Linux), off (Windows, macOS) | FR-112 P2 — software encoders target 60, paced down to what they sustain, never below 30; `0` = 30 and the old base everywhere, `1` opts Windows or macOS in ([§ Software encoders](#software-encoders-at-60-fps-fr-112)) |
-| `ROOMLERD_ENCODER_CLOCK` | on | FR-112 P1 — the encoding and capture threads ask for their clock (a Linux `uclamp_min`); `0` = the scheduler's default ([`encoders.md`](encoders.md#software-encoders-the-clock-and-60-fps-fr-112)) |
+| `ROOMLERD_ENCODER_CLOCK` | on (Linux), off (Windows, macOS) | FR-112 P1, P3 — the encoding and capture threads ask for their clock (Linux: a `uclamp_min`; macOS: a QoS class; Windows: out of power throttling); `0` = the scheduler's default, `1` opts Windows or macOS in until their own numbers decide ([`encoders.md`](encoders.md#the-clock-on-macos-and-windows-fr-112-p3)) |
 | `ROOMLERD_SW_PACE_UP_MARGIN` | 2.5 | Env only. FR-112 P2d: how far (fps) a software encoder's estimate must clear a higher step before its pace moves up to it (0–10). `0` = 0.4.142's pace, which steps up as soon as the estimate quantises higher ([§ Software encoders](#software-encoders-at-60-fps-fr-112)) |
+| `ROOMLERD_RATECTL` | shadow | Env only (B1). FR-63 B1 — whether the shadow rate controller runs beside the governor; `off` stops it, any other value is `shadow`. It drives NOTHING — its only output is the `shadow_*` heartbeat fields ([§ The shadow rate controller](#the-shadow-rate-controller-fr-63-b1)). The config-surface tribool and the `live` value are B2 |
 
 ⚠️ Three keys an older `config.toml` may still carry are **deleted, not off**
 — the daemon ignores them: `transit_classify` and `transit_hold` (FR-71
@@ -621,6 +1283,77 @@ and the validity gate replaced the hold) and `rate_prior_decay` (FR-70 P1;
 removed by FR-79 V3a in `agent-v0.4.95` — the prior always decays, which
 FR-70 P1 field-verified on 0.4.64 with a same-build control). Their
 behaviour is described under the validity gate at the top of this page.
+
+## Kill switches and when each retires — the registry (FR-62 AC4)
+
+This is every rate-control kill switch in `agents/roomlerd/src/encode/mod.rs`, with
+the evidence that retires it and the phase that deletes it. It implements rule 4 of
+the [rate-control plan](plans/rate-control-architecture.md): a switch gets its
+retirement condition the day it ships, and it leaves the code only through its row
+here. The plan put this table in `docs/fr/README.md`. It lives on this page instead,
+beside the keys it retires, because every FR session edits that registry and these
+rows change with every deletion PR.
+
+```mermaid
+flowchart LR
+  B["a switch ships<br/>with its row: default +<br/>the evidence that flips it"] --> E["evidence on the surface:<br/>a field read shown RED first,<br/>or a release of heartbeats"]
+  E --> F["the default flips,<br/>or the condition is met"]
+  F --> S["one release soak"]
+  S --> D["the deletion PR removes the old arm<br/>AND the switch, and fills<br/>its row's Deletion PR"]
+  D --> I["an older config.toml that still<br/>carries the key is ignored,<br/>not refused"]
+```
+
+⚠️ **Nothing below has been deleted, and nothing is due before FR-63's B2 flip plus one
+release soak.** The plan sequences the deletions after that soak (its Sequencing row 5),
+and `encode/` is shadow-first (its Process rule 1). FR-62's A0 also showed that a
+heuristic which rations rate moves is dead weight on NVENC but load-bearing on QSV,
+so every retirement is gated on the backend it is retired for.
+
+**The switches.** Each one is `ROOMLERD_<KEY>` in the environment and the lowercase
+key in the config (`roomler config set`), except the three marked *env only*. A
+default of *on* guards shipped behaviour. A default of *off* means the behaviour is
+still waiting for its evidence.
+
+| Switch | `encode/mod.rs` | From | Default | What it guards | Retires when | Exit | Deletion PR |
+|---|---|---|---|---|---|---|---|
+| `ENCODER_INPLACE_RATE` | `:342` | FR-62 A1 | off | QSV applies a rate move in place; NVENC sizes its VBV to the open's window (`inplace_rate_bufsize`, `:355`) | QSV gets an in-place path (patch 0004), or the arm is dropped. On Iris Xe the Reset fails `-14` in both `low_power` modes | FR-62 | — |
+| `ENCODER_NVENC_ASSUME_IDR` (env only) | `:371` | FR-62 A2 | off | sends NVENC back onto the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` (FR-62 AC3's read) | FR-62 | — |
+| `BG_REBUILD` | `:494` | FR-1 P3 | on | a rebuild-bound rate apply opens the new encoder off-thread and swaps between frames | ⚠️ not while QSV rebuilds: inline, a QSV rebuild is the 0.34–2.0 s pump freeze (#1254) | FR-62 A4 row 2, FR-63 B3 | — |
+| `BG_REBUILD_CONSTRAINED` | `:515` | FR-62 (#1254) | on | the same on constrained sessions | never, while any rebuild backend exists | — | — |
+| `RELAY_IDR_THRIFT` | `:657` | FR-10 | on | a constrained session suppresses the idle-settle keyframe and spaces its deferred rate applies | narrows to settle-keyframe suppression on a backend whose rate move costs no IDR. The plan's precondition, "A0 pass on QSV", failed | FR-62 A4 row 1, FR-63 B3 | — |
+| `MEASURED_CEILING` | `:319` | measured-rate stage 1 | on | the ceiling is clamped to 85 % of the measured drain rate | one release after B2's `live` | FR-63 B3a | — |
+| `SLOW_LINK_FLOOR` | `:333` | FR-59 P1 | on | the floor descends toward a measured pipe | one release after `live` | FR-63 B3a | — |
+| `SEED_CONTRADICTION` | `:427` | FR-59 P6 | on | a held goodput far below the learned ceiling abandons it | one release after `live` | FR-63 B3a | — |
+| `VIEWER_RATE_CLAMP` | `:448` | FR-59 P3 | on | the viewer's arrival report drives the constrained loop | one release after `live` | FR-63 B3a | — |
+| `QUEUE_DRAIN` | `:466` | FR-59 P4 | on | a transit queue too deep to cut through pauses the pump | one release after `live` | FR-63 B3a | — |
+| `RELAY_AGE_FEEDBACK` | `:665` | FR-15 | on | the viewer's paint age caps the frame rate and cuts the rate | one release after `live` | FR-63 B3a | — |
+| `CONSTRAINED_QUEUE_MEASURED` | `:411` | FR-59 P2 | on | the constrained queue budget is counted in the measured drain rate | the budget becomes `reference_bps` | FR-63 B3b | — |
+| `SLOW_LINK_PROFILE` | `:481` | FR-59 P5 | on | a pair remembered as slow opens with fewer pixels and frames | it becomes a rung | FR-63 B3b | — |
+| `RELAY_CEILING_LEARN`, with `RELAY_MAX_HI_KBPS` | `:934` | FR-35 | on | the constrained ceiling learns the pair | it becomes the prior's bound | FR-63 B3b | — |
+| `AREA_MIN_BITRATE` | `:304` | area floor (2026-08-26) | on | the AIMD floor scales with the encoded area | it becomes a `RateDomain` rule | FR-63 B3b | — |
+| `RATE_SLOW_START` | `:542` | FR-63 | off | a session opens with slow start instead of a constant | B2's evidence flips it, or it is deleted | FR-63 | — |
+| `RATECTL` (env only) | `:582` | FR-63 B1 | shadow | whether the shadow controller runs beside the governor | B2 turns it into the `ratectl` tribool (`shadow`, `live`, `off`) | FR-63 B2 | — |
+| `SHARED_RATE_SPLIT` (env only) | `:895` | shared pipeline | on | a constrained shared encoder divides its ceiling by the live viewer count | ⚠️ an open row: the plan's B3 list does not name it | — | — |
+
+**Heuristics with no switch of their own.** These are FR-62's A4 deletions. Each one
+retires through this table too, and its deletion PR cites the precondition below.
+
+| Heuristic | Anchor | Plan row | Precondition | State |
+|---|---|---|---|---|
+| Motion-defer: `deferred_bps`, `DEFER_QUIET`, `relay_deferred_apply_allowed`, `rebuild_apply_allowed` | `peer.rs:7106`, `:7113`; `encode/mod.rs:675`, `:717` | A4 row 1 | A0 passes on QSV, and the switch is ON for one release | ❌ QSV's A0 failed (2026-09-02); both recorded causes are refuted (2026-09-04). NVENC already skips the `held_increase` arm (`peer.rs:9367`), because `NVENC_RECONFIG_FORCES_IDR` is `false` (`encode/ffmpeg/encoder.rs:893`, #1252) |
+| The coarsen ladder: `BITRATE_LADDER_BPS`, `coarsen_bitrate` | `encode/aimd.rs:297`, `:317` | A4 row 2 | VideoToolbox is measured, or kept on the settle rule | It is load-bearing for QSV, which has no cheap apply. It keeps AMF, D3D12 and Vulkan's rate IDRs rare. It is dead weight on NVENC, and it caps NVENC at the 25 Mbps rung |
+| The background swap: `rebuild_spec`, `open_rebuilt`, `adopt_rebuilt` | `encode/ffmpeg/encoder.rs:2548`, `:2596`, `:2718` | A4 row 2 | as above, plus a cheap QSV apply | load-bearing while QSV rebuilds |
+| VP9's rebuild divergence: `on_encoder_rebuilt_mirror_only` | `encode/governor.rs:1017` | A4 row 3 | none in the plan, but the code calls unifying it "a behavioral decision for the post-soak pass" | waits for B2's soak |
+
+⚠️ **B3b deletes `aimd.rs` whole, and the ladder goes with it.** The plan was written
+before A0-QSV, so whatever replaces the AIMD must carry QSV's rationing forward, or
+every QSV session pays a 0.34–2.0 s rebuild per move.
+
+Out of scope here are the feature switches, each owned by its FR: `media_thread`
+(FR-70 M1, `:597`), `par_convert` (FR-1 P5, `:629`), `color_description` (FR-130,
+`:641`), `pump_stall_watch` (FR-65 P0, `:528`), `sw_fps_60` (FR-112, `:829`) and
+`fps_high` (FR-119, `:838`). `ICE_RELAY_TCP` (`:859`) is a test pin, not a kill
+switch.
 
 ## Field history (why it is shaped this way)
 
@@ -648,6 +1381,7 @@ behaviour is described under the validity gate at the top of this page.
 | 0.4.98 | FR-79 V3b — `encode::pipe::Pipe`, ONE belief split into a demonstrated FLOOR and a pushed-back CAPACITY, in SHADOW (`pipe_belief`, `pipe_belief_n` in the heartbeat; no consumer). | Three symptoms on three hosts and two carriers, one defect: no trustworthy, always-available estimate of what the path carries. |
 | 0.4.99 | FR-79 V3b-1 + V3b-2 — no single `believed_bps()` (`capacity_bps` for "am I over?", `ceiling_anchor_bps` for "what may the ceiling be?"); the floor is retired by evidence, not by time. | An idle relay session read 1.8 M from deliveries alone with nothing wrong; a host that had demonstrated 8.4 M read 12.8 kbps on a still screen hours later. |
 | 0.4.100 | FR-79 V3b-3 — a capacity sample is also a delivery, so it raises the floor and survives its own expiry. | A 13.16 M capacity expired after one TTL and the anchor fell to a 4.05 M content floor while the target ran to the 34.56 M constant. |
+| 0.4.188 | FR-63 B1 — the ONE delay-based controller (`encode::ratectl`) runs in SHADOW beside the governor, emitting six `shadow_*` heartbeat fields ([§ The shadow rate controller](#the-shadow-rate-controller-fr-63-b1)). It drives nothing; a containment test holds the line. (Merged after 0.4.187 was cut: 0.4.188, published 2026-10-30, is the first release that carries it.) | Eight estimators of one quantity glued with "the lower of" rules. Shadow-first per the rate-control plan: a release of `shadow_*` logs against the flip criterion (AC2) decides B2's flip, so the controller is never the fleet's own first trial. |
 
 ## The measured-rate closed loop
 

@@ -59,7 +59,7 @@
 //! credential shape that needs adding to the scrub set).
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -115,6 +115,39 @@ pub fn record(reason: CrashReason, summary: &str, ctx: WriterContext) {
     record_with_log_tail(reason, summary, ctx, None);
 }
 
+/// #3018 — [`record`], with `appendix` written after the rolling log's tail.
+///
+/// [`fit_to_envelope`] trims the tail from its OLDEST line, so whatever comes
+/// last survives longest: a stall's thread stacks stay whole while the log
+/// lines from before the stall make room. The appendix goes through the same
+/// credential scrub as the tail. An empty appendix is plain [`record`].
+pub fn record_with_appendix(
+    reason: CrashReason,
+    summary: &str,
+    ctx: WriterContext,
+    appendix: &str,
+) {
+    if appendix.is_empty() {
+        return record(reason, summary, ctx);
+    }
+    let tail = read_log_tail(LOG_TAIL_LINES);
+    record_with_log_tail(
+        reason,
+        summary,
+        ctx,
+        Some(tail_then_appendix(&tail, appendix)),
+    );
+}
+
+/// #3018 — the tail, then the appendix, on lines of their own.
+fn tail_then_appendix(tail: &str, appendix: &str) -> String {
+    match (tail.is_empty(), appendix.is_empty()) {
+        (_, true) => tail.to_string(),
+        (true, false) => appendix.to_string(),
+        (false, false) => format!("{tail}\n{appendix}"),
+    }
+}
+
 /// Same as [`record`] but accepts a caller-supplied `log_tail`
 /// (typically the child worker's captured stderr) that OVERRIDES
 /// the local rolling-log read. Used by the SCM supervisor on
@@ -163,9 +196,10 @@ pub fn record_with_log_tail(
         Err(_) => {
             // The closure panicked. Avoid touching tracing here (its
             // backing subscriber may also be in a poisoned state mid
-            // crash) — `eprintln!` goes to the SCM service's stderr
-            // capture or the terminal, which is sufficient.
-            eprintln!("crash_recorder:RECURSIVE_PANIC during record()");
+            // crash) — stderr goes to the SCM service's capture, the
+            // terminal or the rolling log (#3292), which is sufficient.
+            // Never `eprintln!`: on a failing stderr it panics (#1538).
+            crate::logging::say_on_stderr("crash_recorder:RECURSIVE_PANIC during record()");
         }
     }
 }
@@ -823,22 +857,46 @@ fn detect_hostname() -> String {
     }
 }
 
+/// How much of the rolling log's end a crash sidecar reads. Its callers run in a
+/// dying process, and a per-user Windows daemon's stderr reaches this file, up to
+/// 256 MiB a day (`logging::send_stderr_to_the_log`, #3292).
+const LOG_TAIL_MAX_BYTES: u64 = 256 * 1024;
+
 fn read_log_tail(n: usize) -> String {
     let Some(log_path) = crate::logging::active_log_path() else {
         return String::new();
     };
-    let Ok(file) = fs::File::open(&log_path) else {
+    read_tail_of(&log_path, n)
+}
+
+/// The last `n` lines within [`LOG_TAIL_MAX_BYTES`] of the end. Lossy, because raw
+/// stderr need not be UTF-8 (a driver's localized text), and one such byte must not
+/// hide what came after it.
+fn read_tail_of(path: &Path, n: usize) -> String {
+    let Ok(mut file) = fs::File::open(path) else {
         return String::new();
     };
-    // Read the whole file and tail-slice. The rolling log is bounded
-    // by the file logger's daily rotation; in practice this is < 5
-    // MiB which is cheap to read at crash time. If memory pressure
-    // becomes a concern, swap for a reverse-line-reader.
-    let reader = BufReader::new(file);
-    let mut lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
-    let from = lines.len().saturating_sub(n);
-    lines.drain(..from);
-    lines.join("\n")
+    let from = file
+        .metadata()
+        .map_or(0, |m| m.len().saturating_sub(LOG_TAIL_MAX_BYTES));
+    let mut bytes = Vec::new();
+    if file.seek(SeekFrom::Start(from)).is_err()
+        || file
+            .take(LOG_TAIL_MAX_BYTES)
+            .read_to_end(&mut bytes)
+            .is_err()
+    {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    // Starting past the top of the file, the first line is a fragment.
+    let whole = if from > 0 {
+        text.split_once('\n').map_or("", |(_, rest)| rest)
+    } else {
+        &text
+    };
+    let lines: Vec<&str> = whole.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 #[cfg(test)]
@@ -857,6 +915,34 @@ mod tests {
             pid: 42,
             suppressed_since_last: 0,
         }
+    }
+
+    // ─── log tail ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_log_tail_is_bounded_and_survives_a_byte_that_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("roomlerd.log.2026-01-01");
+
+        // Past the bound, with a fragment at its edge: the tail starts on a whole line.
+        let mut big = vec![b'x'; 2 * LOG_TAIL_MAX_BYTES as usize];
+        big.extend_from_slice(b"\nstderr: caf\xe9 line\nlast line\n");
+        fs::write(&log, &big).unwrap();
+        assert_eq!(
+            read_tail_of(&log, 200),
+            "stderr: caf\u{fffd} line\nlast line"
+        );
+
+        // Inside the bound: the top line is whole, and `n` still holds.
+        fs::write(&log, b"one\ntwo\nthree\n").unwrap();
+        assert_eq!(read_tail_of(&log, 200), "one\ntwo\nthree");
+        assert_eq!(read_tail_of(&log, 2), "two\nthree");
+
+        // A file with no newline inside the bound gives nothing, not a fragment.
+        fs::write(&log, vec![b'x'; 2 * LOG_TAIL_MAX_BYTES as usize]).unwrap();
+        assert_eq!(read_tail_of(&log, 200), "");
+
+        assert_eq!(read_tail_of(&dir.path().join("absent"), 200), "");
     }
 
     // ─── scrub: Bearer ─────────────────────────────────────────────────────
@@ -1226,6 +1312,46 @@ mod tests {
         // None and a record call to log spam would race other tests).
         let _ = record_with_log_tail as fn(CrashReason, &str, WriterContext, Option<String>);
         let _ = record as fn(CrashReason, &str, WriterContext);
+        let _ = record_with_appendix as fn(CrashReason, &str, WriterContext, &str);
+    }
+
+    // ─── #3018: an appendix after the tail ──────────────────────────────────
+
+    /// #3018 — the appendix comes after the tail, and an empty side adds no
+    /// blank line.
+    #[test]
+    fn the_appendix_follows_the_tail() {
+        assert_eq!(tail_then_appendix("a\nb", "S"), "a\nb\nS");
+        assert_eq!(tail_then_appendix("", "S"), "S");
+        assert_eq!(tail_then_appendix("a", ""), "a");
+    }
+
+    /// #3018 — when the envelope cannot hold both, the oldest log lines go
+    /// first, and the appendix (a stall's thread stacks) survives whole.
+    #[test]
+    fn the_envelope_trims_the_tail_before_the_appendix() {
+        let tail: String = (0..4000).map(|i| format!("old log line {i}\n")).collect();
+        let appendix = "--- threads ---\n[4] tokio-rt-worker\n  __psynch_mutexwait";
+        let mut p = sample_payload();
+        p.log_tail = tail_then_appendix(tail.trim_end(), appendix);
+        assert!(
+            estimate_json_size(&p) > MAX_PAYLOAD_BYTES,
+            "the test needs a trim"
+        );
+        fit_to_envelope(&mut p, MAX_PAYLOAD_BYTES);
+        assert!(estimate_json_size(&p) <= MAX_PAYLOAD_BYTES);
+        assert!(
+            p.log_tail.trim_end().ends_with(appendix),
+            "the appendix survives whole"
+        );
+        assert!(
+            !p.log_tail.contains("old log line 0\n"),
+            "the oldest lines went first"
+        );
+        assert!(
+            p.log_tail.contains("old log line 3999\n"),
+            "the newest log lines stay"
+        );
     }
 
     // ─── #2955: torn sidecars ────────────────────────────────────────────────

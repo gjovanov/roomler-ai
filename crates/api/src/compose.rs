@@ -242,7 +242,10 @@ impl Modules {
             }
         }
 
-        let _ = core;
+        // FR-129 A1 — the mounted set, copied into the core from the ONE
+        // function `/api/capabilities` reads, so a module asking whether a
+        // sibling is present (fleet, about `network`) reads the same answer.
+        core.mounted.set(modules.mounted());
         Ok(modules)
     }
 
@@ -808,15 +811,21 @@ impl Modules {
     }
 
     /// The live media gauges for the cluster status snapshot:
-    /// `(per-room rows, participants_total, consumers_total)`. Empty when
-    /// the module is not mounted.
-    pub fn media_gauges(&self) -> (Vec<serde_json::Value>, usize, usize) {
+    /// `(per-room rows, participants_total, consumers_total,
+    /// video_paused_total)` — the last one FR-127 P1's "video consumers held
+    /// back by their viewer's view". Empty when the module is not mounted.
+    pub fn media_gauges(&self) -> (Vec<serde_json::Value>, usize, usize, usize) {
         #[cfg(feature = "conference")]
         if let Some(conference) = &self.conference {
             let g = conference.media_gauges();
-            return (g.rooms, g.participants_total, g.consumers_total);
+            return (
+                g.rooms,
+                g.participants_total,
+                g.consumers_total,
+                g.video_paused_total,
+            );
         }
-        (Vec::new(), 0, 0)
+        (Vec::new(), 0, 0, 0)
     }
 
     /// P6 — one `rc:*` text frame from a controller browser tab, with the

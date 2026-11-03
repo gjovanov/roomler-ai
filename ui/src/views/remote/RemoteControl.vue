@@ -266,6 +266,14 @@
              mutter capture without asking anyone, and the operator can see
              that they did. Absent on Windows, macOS and older agents. -->
         <span v-if="metrics.codec && statsCaptureLabel" class="stats-pill">{{ statsCaptureLabel }}</span>
+        <!-- FR-135 R2 — the steps this session took down from what it set out to
+             run: the last one here, all of them on hover. -->
+        <span
+          v-if="metrics.codec && statsLadderLabel"
+          class="stats-pill"
+          data-testid="rc-media-ladder"
+          :title="statsLadderTitle"
+        >{{ statsLadderLabel }}</span>
         <span v-if="metrics.bitrate" class="stats-pill">{{ statsBitrateLabel }}</span>
         <span v-if="metrics.fps" class="stats-pill">{{ statsFpsLabel }}</span>
         <span v-if="metrics.resolution && statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
@@ -587,6 +595,13 @@
             </div>
             <div v-else-if="rec.state.value === 'pending_consent'" class="text-body-2">
               Waiting for the person at the device to allow it…
+            </div>
+            <div
+              v-else-if="rec.state.value === 'announcing'"
+              class="text-body-2"
+              data-testid="rc-record-announcing"
+            >
+              Telling the person at the device first…
             </div>
             <div v-else>
               <!-- #1760 — where the device says computer audio cannot go into
@@ -1187,6 +1202,40 @@
         </v-btn>
       </div>
 
+      <!-- FR-135 R2 — and a page with no picture keeps saying why while the
+           watchdog re-creates the session. With the words only on the connected
+           stage, every redial read "Connection lost", which is false (the device
+           answered) and, from the fourth attempt, lasts minutes. -->
+      <div
+        v-else-if="noPictureWhileRedialling"
+        class="empty-state"
+        :data-testid="noPictureWhileRedialling.testId"
+      >
+        <v-icon size="72" :color="noPictureWhileRedialling.iconColor">mdi-video-off</v-icon>
+        <p class="text-body-1 mt-3">{{ noPictureWhileRedialling.title }}</p>
+        <p v-if="noPictureWhileRedialling.body" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
+          {{ noPictureWhileRedialling.body }}
+        </p>
+        <p v-if="noPictureWhileRedialling.code" class="text-caption text-medium-emphasis mt-2">
+          Reported by the device as
+          <code>{{ noPictureWhileRedialling.code }}</code>.
+          <span v-if="noPictureWhileRedialling.detail">{{ noPictureWhileRedialling.detail }}</span>
+        </p>
+        <p class="text-caption text-medium-emphasis mt-2">
+          <template v-if="rc.phase.value === 'reconnecting'">
+            Trying again by itself (attempt {{ rc.reconnectAttempt.value }})…
+          </template>
+          <template v-else>{{ phaseLabel }}</template>
+        </p>
+        <p v-if="agent && !agent.is_online" class="text-caption text-warning">
+          The device currently reports offline — retries continue until it
+          returns.
+        </p>
+        <v-btn variant="tonal" size="small" class="mt-3" @click="leave()">
+          Cancel
+        </v-btn>
+      </div>
+
       <div
         v-else-if="['requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value)"
         class="empty-state"
@@ -1358,8 +1407,11 @@
         <div v-if="rc.mediaUnavailable.value" class="no-media-overlay">
           <v-icon size="72" color="warning">mdi-monitor-off</v-icon>
           <p class="text-body-1 mt-3">This device cannot capture its screen.</p>
+          <!-- #3164 — the agent's sentence, except the one every agent up to
+               0.4.188 sends for a Mac's Screen Recording, which said "then
+               reconnect" (macOS applies the grant to a restarted agent only). -->
           <p v-if="rc.mediaUnavailable.value.hint" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
-            {{ rc.mediaUnavailable.value.hint }}
+            {{ mediaUnavailableHint(rc.mediaUnavailable.value.code, rc.mediaUnavailable.value.hint) }}
           </p>
           <p class="text-caption text-medium-emphasis mt-2">
             Reported by the device as
@@ -1385,6 +1437,25 @@
           <p v-if="mediaWaitingCopy(rc.mediaWaiting.value.for).showsDeadline" class="text-caption text-medium-emphasis mt-2">
             If nobody answers, the request ends at {{ mediaWaitingEnds }}.
           </p>
+        </div>
+        <!-- FR-135 R2 — the device said why it stopped its video, or it said
+             nothing and no picture ever came, and the page knows what it was
+             promised. Before this the page stayed black and re-created the
+             session every 10 s, with the reason only in the host's log. The
+             stage above carries the same words through the re-create. -->
+        <div v-else-if="noPicture" class="no-media-overlay" :data-testid="noPicture.testId">
+          <v-icon size="72" :color="noPicture.iconColor">mdi-video-off</v-icon>
+          <p class="text-body-1 mt-3">{{ noPicture.title }}</p>
+          <p v-if="noPicture.body" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
+            {{ noPicture.body }}
+          </p>
+          <p v-if="noPicture.code" class="text-caption text-medium-emphasis mt-2">
+            Reported by the device as
+            <code>{{ noPicture.code }}</code>.
+            <span v-if="noPicture.detail">{{ noPicture.detail }}</span>
+          </p>
+          <!-- An external session takes no retry: the watchdog ends it instead. -->
+          <p v-if="!isExternal" class="text-caption text-medium-emphasis mt-1">This page keeps trying.</p>
         </div>
         <div v-else-if="!rc.hasMedia.value" class="no-media-overlay">
           <v-icon size="72" color="grey-lighten-1">mdi-video-off</v-icon>
@@ -1942,14 +2013,21 @@
             {{ localRelayTooltip }}
           </div>
           <!-- FR-121 — which of your devices this browser runs on, so the
-               server hands its relay over and the browser never asks for the
-               local-network permission. Next Connect, like the switch. -->
+               server hands their relays over and the browser never asks for
+               the local-network permission. Next Connect, like the switch.
+               P3b (#2774) — more than one: a computer can run several agents
+               (Windows and WSL), each with its own relay and its own path. -->
           <v-select
             v-if="localRelayOn"
-            v-model="thisDevice"
+            v-model="thisDevicesPick"
             :items="thisDeviceItems"
             :disabled="sessionLive"
             label="This browser runs on"
+            placeholder="Not set — look for a relay on this computer"
+            persistent-placeholder
+            multiple
+            chips
+            closable-chips
             density="compact"
             variant="outlined"
             hide-details
@@ -2538,6 +2616,7 @@ import {
   awaitingConsentLabel,
   drawerPasteFiles,
   uploadOutcomeMessage,
+  thisDevicesFromPick,
 } from '@/composables/useRemoteControl'
 import {
   PICKER_CHROMAS,
@@ -2569,6 +2648,7 @@ import {
   frameRateSummary,
   type FrameRate,
 } from '@/composables/frameRate'
+import { describeMediaStep, mediaLadderLabel, noPictureWords } from '@/composables/mediaPlan'
 import { featureRefusal, summarizeRefusals } from '@/composables/useSessionFeatures'
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
@@ -2582,6 +2662,7 @@ import type { KeepBusyPattern } from '@/composables/keepBusy'
 import { displayMatchSummary } from '@/composables/displayMatch'
 import { agentSupportsRelativeMouse, relativeMouseSwitchedOff } from '@/composables/relativeMouse'
 import { agentSendsSas } from '@/composables/ctrlAltDel'
+import { mediaUnavailableHint } from '@/composables/macPermissionHint'
 import { pictureOverflows, stageTouchAction } from '@/composables/touchInput'
 import {
   BUILTIN_PRESETS,
@@ -3712,12 +3793,13 @@ function toggleLocalRelay() {
   rc.setLocalRelayEnabled(!localRelayOn.value)
 }
 
-// FR-121 — "This browser runs on": one of the signed-in person's own devices
-// that report their loopback relay (`local-relay`), or none of them. Named, the
-// server hands that device's relay over and the browser never fetches
-// 127.0.0.1, so Chrome's local-network permission is never asked. Per browser,
-// and like the switch above it takes effect on the next Connect. A probe that
-// finds a relay naming its device fills it in by itself.
+// FR-121 — "This browser runs on": the signed-in person's own devices that
+// report their loopback relay (`local-relay`), or none of them. Named, the
+// server hands their relays over and the browser never fetches 127.0.0.1, so
+// Chrome's local-network permission is never asked. Per browser, and like the
+// switch above it takes effect on the next Connect. A probe that finds relays
+// naming the person's devices fills them in by itself. P3b (#2774) — every
+// device on this computer, not one: a computer can run several agents.
 const thisDeviceItems = computed(() => {
   const me = authStore.user?.id
   const own = agentStore.agents
@@ -3731,9 +3813,12 @@ const thisDeviceItems = computed(() => {
     ...own,
   ]
 })
-const thisDevice = computed<string>({
-  get: () => rc.thisDeviceId.value ?? '',
-  set: (v) => rc.setThisDevice(v === '' ? null : v),
+const thisDevicesPick = computed<string[]>({
+  get: () => {
+    const v = rc.thisDevices.value
+    return v === null ? [] : v === 'none' ? ['none'] : [...v]
+  },
+  set: (next) => rc.setThisDevices(thisDevicesFromPick(thisDevicesPick.value, next)),
 })
 const localRelayRefusedText = computed<string | null>(() => {
   const why = rc.localRelayRefused.value
@@ -3742,7 +3827,9 @@ const localRelayRefusedText = computed<string | null>(() => {
     not_your_device: 'that device is not yours',
     other_network: 'that device is in another organization',
     device_offline: 'that device is offline, or reports no relay',
-    rc_overlay_off: 'this device does not let remote desktop use the mesh (rc_overlay)',
+    // FR-128 — also `auto` on an agent too old to decide it, which reads as off.
+    rc_overlay_off:
+      'this device does not let remote desktop use the mesh (rc_overlay off, or auto on an agent that predates it)',
     same_device: 'you are viewing the device this browser runs on',
   }
   return `The local relay was not used: ${reasons[why] ?? why}.`
@@ -4045,9 +4132,9 @@ const codecChoice = rc.codecChoice
 // FR-77 — the validity matrix behind the two dropdowns: the agent's cells
 // (one derivation for new and old agents) crossed with this browser's decode
 // probes and the decode failures remembered for this device. 4:2:0 cells stay
-// optimistic until the device record arrives (the rc.190 contract — the agent
-// falls back when it cannot honour a pick); every 4:4:4 cell demands proof
-// from both ends, because a chroma mismatch is a black screen.
+// optimistic until the device record arrives (connect() holds the pick to that
+// record, #3167); every 4:4:4 cell demands proof from both ends, because a
+// chroma mismatch is a black screen.
 const cellAvail = computed<Availability>(() =>
   cellAvailability({
     cells: cellsFromCaps(agent.value?.capabilities),
@@ -4783,6 +4870,8 @@ const statsBitrateLabel = computed(() => {
 /** FR-93 P2 — which Linux arm captures this session, and whether anyone at
  *  the screen was asked. `''` (no pill) for Windows, macOS and older agents. */
 const statsCaptureLabel = computed(() => captureArmLabel(rc.videoInfo.value))
+const statsLadderLabel = computed(() => mediaLadderLabel(rc.mediaPlan.value?.ladder ?? []))
+const statsLadderTitle = computed(() => (rc.mediaPlan.value?.ladder ?? []).map(describeMediaStep).join('\n'))
 const statsAgeLabel = computed(() => {
   const age = rc.decodeDiag.value?.age
   if (!age || age.n <= 0) return ''
@@ -5101,6 +5190,15 @@ const asleepWhileRedialling = computed(() => {
   if (w?.for !== 'host_sleep') return null
   return ['reconnecting', 'requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value) ? w : null
 })
+// FR-135 R2 — what this page says about having no picture, on the connected stage
+// and through a redial. The composable keeps it across a re-create, and the first
+// frame ends it.
+const noPicture = computed(() =>
+  noPictureWords(rc.mediaStop.value, rc.mediaSilent.value, rc.mediaPlan.value, rc.mediaDataArrived.value),
+)
+const noPictureWhileRedialling = computed(() =>
+  ['reconnecting', 'requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value) ? noPicture.value : null,
+)
 const mediaWaitingEnds = computed(() => {
   const w = rc.mediaWaiting.value
   return w ? new Date(w.deadlineMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''

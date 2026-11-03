@@ -8,7 +8,7 @@
 //
 // Pure functions, no Vue, so vitest covers every rule without mounting.
 import type { AgentCapabilities } from '@/stores/agents'
-import type { RcCodecChoice, RcPriority } from '@/composables/useRemoteControl'
+import type { RcCodecChoice, RcPriority, RcVideoTransport } from '@/composables/useRemoteControl'
 
 export const CELL_CODECS = ['h264', 'hevc', 'av1', 'vp9'] as const
 export type CellCodec = (typeof CELL_CODECS)[number]
@@ -231,9 +231,9 @@ export interface BrowserDecode {
 export interface AvailabilityInputs {
   cells: Cell[]
   /** False until the device record has arrived: AV1 / HEVC / VP9 4:2:0 are
-   *  then OPTIMISTIC (the agent falls back if it cannot honour the pick —
-   *  the rc.190 contract), while every 4:4:4 cell demands positive proof
-   *  from both ends, because a chroma mismatch is a black screen. */
+   *  then OPTIMISTIC (`transportForSession` holds the pick to that record at
+   *  connect, #3167), while every 4:4:4 cell demands positive proof from both
+   *  ends, because a chroma mismatch is a black screen. */
   capsLoaded: boolean
   browser: BrowserDecode
   /** `${codec}:${chroma}` keys of cells whose decoder failed on real bytes
@@ -385,4 +385,68 @@ export function forgetCellFailures(agentId: string): void {
   } catch {
     /* best-effort */
   }
+}
+
+// ── What a session can ask a device for ───────────────────────────────────
+
+/** The DataChannel transports whose pick carries no codec of its own. H.264's
+ *  does (`preferredCodec: 'h264'`), which is what makes its RTP fallback safe. */
+type CodeclessDcTransport = 'data-channel-av1' | 'data-channel-hevc' | 'data-channel-vp9-444'
+
+/** Does the agent offer this transport? `agentTransports` is what the agent's
+ *  own gate on `preferred_transport` reads, which is why this is not a cell
+ *  question: a Media Foundation HEVC is a cell with no data channel. The
+ *  hw_encoders-derived fallback is for agent rows saved before `transports`
+ *  serialization existed. */
+export function agentOffersDcTransport(
+  transport: CodeclessDcTransport,
+  agentTransports: string[],
+  agentHwEncoders: string[],
+): boolean {
+  if (agentTransports.includes(transport)) return true
+  switch (transport) {
+    case 'data-channel-av1':
+      return agentHwEncoders.some((e) => e.startsWith('ffmpeg-av1_'))
+    case 'data-channel-hevc':
+      return agentHwEncoders.some((e) => e.startsWith('ffmpeg-hevc_'))
+    case 'data-channel-vp9-444':
+      return agentHwEncoders.includes('libvpx-vp9-444-sw')
+  }
+}
+
+/** #3167 — the transport a session runs on for the viewer's stored pick. A pick
+ *  can name a transport this device never had: the picker greys what the device
+ *  lacks, but a choice made on one device is also the browser's default for the
+ *  next, and an override outlives the agent losing a cell.
+ *
+ *  Asking anyway cannot work. The agent honours `preferred_transport` only when
+ *  it offers it and otherwise drops to the RTP track without saying so, while
+ *  `pc.ontrack` leaves that track alone because this session holds a DataChannel
+ *  transport. The session reads connected, a hidden `<video>` plays, and the
+ *  canvas stays black for good: the watchdog sees frames on a healthy track.
+ *
+ *  So such a pick runs the auto rank, for this session only: the pick stays
+ *  stored, and works again if the device gains the cell. It does not take the
+ *  RTP track the way H.264's does. That one is safe because the pick forces
+ *  `preferredCodec: 'h264'`. These carry no codec, so the agent binds the track
+ *  to the best one both ends list, and AV1 from an FFmpeg-only host cannot open
+ *  there at all.
+ *
+ *  No caps means the device record has not arrived, and the pick stands, as it
+ *  does in the picker. */
+export function transportForSession(
+  picked: RcVideoTransport,
+  caps: Pick<AgentCapabilities, 'transports' | 'hw_encoders'> | null | undefined,
+): RcVideoTransport {
+  if (
+    !caps
+    || (picked !== 'data-channel-av1'
+      && picked !== 'data-channel-hevc'
+      && picked !== 'data-channel-vp9-444')
+  ) {
+    return picked
+  }
+  return agentOffersDcTransport(picked, caps.transports ?? [], caps.hw_encoders ?? [])
+    ? picked
+    : 'auto'
 }

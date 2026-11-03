@@ -89,6 +89,7 @@ export const useAuthStore = defineStore('auth', () => {
     displayName: string,
     inviteCode?: string,
     attribution?: SignupAttribution,
+    org?: { name: string; slug: string },
   ) {
     loading.value = true
     error.value = null
@@ -103,11 +104,21 @@ export const useAuthStore = defineStore('auth', () => {
       // FR-88 §3a: where this account came from, sent once, with it. Absent
       // (not `{}`) when there is nothing to say.
       if (attribution && Object.keys(attribution).length > 0) body.attribution = attribution
+      // FR-129 A2: the organization created with the account, so a person
+      // pairing a device has one to approve it into. The server creates it
+      // only when BOTH are present (`routes/auth.rs`, `tenant_name` +
+      // `tenant_slug`), so they travel together or not at all.
+      if (org && org.name && org.slug) {
+        body.tenant_name = org.name
+        body.tenant_slug = org.slug
+      }
 
       const data = await api.post<{
         access_token?: string
         user?: User
         invite_tenant?: { tenant_id: string; tenant_name: string; tenant_slug: string }
+        /** The no-session path's "check your email" (production). */
+        message?: string
       }>('/auth/register', body)
       // Production registration returns no tokens and no user — the account
       // needs email activation first, so this is NOT a session yet. Only the

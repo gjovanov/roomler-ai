@@ -8,14 +8,15 @@
 //! without spawning the Tauri webview EXE (which would require
 //! elevation on Windows when run from a non-admin shell).
 //!
-//! One app, four roles (see [`role::Role`]): the three daemon roles
-//! drive the MSI pipeline ([`orchestrator_agent`]); the tunnel-client
-//! role drives the archive pipeline ([`orchestrator_tunnel`]) — both
-//! relocated (P4a) from the legacy wizard crates retired in P4c-2.
-//! Mechanics (asset resolver, MSI runner,
-//! extract, integration, enroll HTTP, unified ProgressEvent) come
-//! from `wizard_shared` (`crates/roomler-setup-core`); the agent- and
-//! tunnel-coupled calls stay here.
+//! One app, four roles (see [`role::Role`]): on Windows the three daemon
+//! roles drive the MSI pipeline ([`orchestrator_agent`]); on Linux and macOS
+//! the two daemon roles drive the embedded `install.sh` halves
+//! ([`orchestrator_unix`], FR-129 B1); the tunnel-client role drives the
+//! archive pipeline ([`orchestrator_tunnel`]) — the last two relocated (P4a)
+//! from the legacy wizard crates retired in P4c-2. Mechanics (asset
+//! resolver, MSI runner, extract, integration, enroll HTTP, unified
+//! ProgressEvent) come from `wizard_shared` (`crates/roomler-setup-core`);
+//! the agent- and tunnel-coupled calls stay here.
 
 #![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 
@@ -23,10 +24,34 @@ pub mod commands;
 /// FR-102 P3b — the opt-in setup diagnostics: the recorder, its gate, the
 /// buffer until the server is known, and the fire-and-forget sender.
 pub mod diagnostics;
+/// #2338 — the enroll step every daemon pipeline shares: the fresh
+/// enrollment folded into the config already at its path.
+pub mod enroll_step;
+/// FR-129 B1 — `GET /api/setup/features`, read fail-closed.
+pub mod features;
+/// FR-129 C3 — the wizard's command line: what an elevated relaunch is
+/// handed, and the WebView2 folder an elevated run keeps apart.
+pub mod launch;
 pub mod orchestrator_agent;
 pub mod orchestrator_tunnel;
+/// FR-129 B1 — the Linux and macOS daemon pipeline: the embedded
+/// `install.sh` halves under the desktop's own administrator prompt.
+pub mod orchestrator_unix;
+/// FR-129 A3 — the pairing session: the device code and the delivered
+/// token live here, in this process, and never reach the webview.
+pub mod pairing;
 pub mod proxy;
 pub mod role;
+/// FR-129 B1 (F3) — the running root daemon's own word on which device it is
+/// (Linux: its person socket), asked before a system-scope enroll.
+pub mod root_identity;
+/// FR-129 C — the gate on how the wizard's Windows path names a program.
+#[cfg(test)]
+mod spawn_gate;
+/// FR-129 B1 — the mechanics under `orchestrator_unix`: the embedded
+/// script, the halves' argv, the prompt tools, the exit codes, the private
+/// scratch directory.
+pub mod unix_daemon;
 
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
@@ -65,3 +90,90 @@ pub static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// (Legacy home: module-local in the agent wizard's orchestrator; the
 /// tunnel pipeline never touches it — no msiexec to hammer.)
 pub static ACTIVE_MSI_PID: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(test)]
+mod front_tests {
+    /// FR-129 B1 — `hidden` hides, whatever an element's own `display` says.
+    /// A role card is a `label.radio` (`display: flex`), so without the
+    /// global rule a hidden card stayed on screen: on Linux and macOS the
+    /// Windows daemon cards showed (the released wizard measured in a field
+    /// cell), and the server's daemon switch hid nothing — AC14.
+    #[test]
+    fn hidden_wins_over_every_display_rule() {
+        let css = include_str!("front/styles.css").replace("\r\n", "\n");
+        assert!(
+            css.contains("[hidden] {\n  display: none !important;\n}"),
+            "the global [hidden] rule is gone"
+        );
+        let html = include_str!("front/index.html");
+        assert!(
+            html.contains("class=\"radio role-daemon\""),
+            "the role cards are still label.radio; re-check the rule if they change"
+        );
+    }
+
+    /// FR-129 C3 — "Restart as administrator" shows exactly when #3116's
+    /// note does: the button sits inside the note, the note follows
+    /// `needsElevatedWizard` alone, and nothing else un-hides the button.
+    #[test]
+    fn the_relaunch_button_shows_exactly_with_the_elevation_note() {
+        let html = include_str!("front/index.html");
+        let note = html
+            .find("<div id=\"elevation-note\"")
+            .expect("the elevation note");
+        let end = note + html[note..].find("</div>").expect("the note's end");
+        let inside = &html[note..end];
+        assert!(
+            inside.contains("id=\"elevation-relaunch\"")
+                && inside.contains("id=\"elevation-relaunch-status\""),
+            "the button and its line live inside the note"
+        );
+        assert!(
+            !inside["<div".len()..].contains("<div"),
+            "no nested block hides a second end"
+        );
+        let js = include_str!("front/app.js");
+        assert!(
+            js.contains("document.getElementById(\"elevation-note\").hidden = !needsElevation;"),
+            "the note follows needsElevatedWizard"
+        );
+        assert!(
+            js.contains(
+                "return role === \"daemon-system\" && state.systemContextNeedsElevation === true;"
+            ),
+            "only the pre-logon role on a reinstall a limited wizard cannot write"
+        );
+        assert!(
+            !js.contains("getElementById(\"elevation-relaunch\").hidden"),
+            "the button has no visibility of its own"
+        );
+        assert!(js.contains("invoke(\"cmd_relaunch_elevated\""));
+    }
+
+    /// FR-129 C1 — the operator, 2026-10-30: the wizard never calls the
+    /// daemon an "agent". The text a person sees in the page (comments and
+    /// markup aside) says `roomlerd`, "the daemon" or "device".
+    #[test]
+    fn the_page_text_never_says_agent() {
+        let html = include_str!("front/index.html");
+        let mut text = String::new();
+        let mut rest = html;
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix("<!--") {
+                rest = after.split_once("-->").map_or("", |(_, r)| r);
+            } else if rest.starts_with('<') {
+                rest = rest.split_once('>').map_or("", |(_, r)| r);
+                text.push(' ');
+            } else {
+                let next = rest.find('<').unwrap_or(rest.len());
+                text.push_str(&rest[..next]);
+                rest = &rest[next..];
+            }
+        }
+        assert!(
+            !text.to_ascii_lowercase().contains("agent"),
+            "visible text mentions an agent: {}",
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+    }
+}

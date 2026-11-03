@@ -321,6 +321,9 @@ impl AppState {
             // FR-115 — plans bind only where they are sold (`saas` compiled
             // in and switched on); self-hosting stays free and unlimited.
             plans_sold: cfg!(feature = "saas") && settings.modules.saas,
+            // FR-129 A1 — filled by `Modules::init` from its own `mounted()`
+            // once every module is composed.
+            mounted: roomler_core::state::MountedModules::default(),
         };
         // FR-69 P2 — the module crates, after the core and before the host
         // state that mounts them.

@@ -9,12 +9,14 @@ Reference doc: **[`docs/encoders.md`](../../../docs/encoders.md)** — the full
 matrix, cascade tables and field log. This file is the set of invariants that
 are cheap to break and expensive to have broken.
 
-## 1 · The probe is a child process, and any failure means "no hardware"
+## 1 · The probe is a child process, and a failure costs a cell or the hardware
 
-`encode::caps::detect()` spawns `roomlerd caps-probe` (hidden subcommand), reads
-one `ROOMLER_CAPS_JSON:{…}` line, and treats **any** failure — non-zero exit,
-killed by a signal, 60 s timeout, unspawnable, unparseable — as *every hardware
-codec is unavailable*, falling back to `compute_caps(false)`.
+`encode::caps::detect()` spawns `roomlerd caps-probe` (hidden subcommand) and
+reads one `ROOMLER_CAPS_JSON:{…}` line. A `base` child that dies inside an open
+costs that cell and nothing else (below, #3267). A failure with no cell to blame
+— two deaths between opens, unspawnable, out of runs or time — means *every
+hardware codec is unavailable*: a last child proves the software cells, and if
+that fails too it falls back to `compute_caps(false)`.
 
 A capability probe is untrusted third-party code by definition (vendor drivers,
 GPU firmware) and does not belong in the daemon's address space. Before this, a
@@ -33,6 +35,24 @@ purpose** so per-codec probe lines land in the daemon log next to the verdict.
 closed pipe, and `println!` panics there: the panic hook then filed an agent
 crash on every such update. A closed pipe now exits `EXIT_PARENT_GONE` (3) and
 records nothing.
+⚠️ **The child ends with the worker** (#2717). On Windows it joins a
+`KILL_ON_JOB_CLOSE` job that the parent holds while it waits
+(`child::tie_to_this_process`). A worker that dies mid-probe (terminated,
+crashed, or leaving at its 3 s runtime-shutdown budget, #2718) must not orphan
+a `roomlerd.exe caps-probe`. It would hold the binary an update replaces, and
+nobody would enforce the 60 s bound on a child hung in a driver.
+⚠️ **A child told to die may not go, and its pipe may not end** (#3273). A child
+stuck in a kernel call outlives the kill, and whatever it started can hold its
+stdout after it has gone. `child::wait_for_child` waits for neither past `TIMEOUT` +
+`KILL_WAIT`, and keeps what arrived by then, so in `base` a stuck child still costs
+one cell. A `wait()` or a `join()` with no bound on this path keeps the device
+offline: nothing restarts a worker during a probe.
+⚠️ **A child that would not die also denies `h264_mf`, `hevc_mf` and `av1_mf` for this
+process**: `open_default` runs Media Foundation's cascade in the daemon whatever the
+caps say. A hang whose kill landed does not, so a merely slow host keeps MF.
+⚠️ **A `444` or `gpu` child short of time leaves an answer that is not cached**
+(`why_not_cached`): stored, it is a hit for a week that never asks again. Its forms
+name no cell. A fault's death there stays cached.
 
 ### Anything derived from CONFIG belongs in the PARENT
 
@@ -52,15 +72,93 @@ could only ever answer `no_relay`.
 |---|---|
 | `base` | every 4:2:0 open + the software cells + the vp9_qsv IDR verdict |
 | `444` | only the 4:4:4 forms of `candidates_444`, answered as `ROOMLER_CAPS_444:[…]`, folded in by `merge_444` |
+| `gpu` (FR-118 P2-3) | only with `zero_copy` on: the GPU-input forms of `candidates_gpu` (QSV 4:2:0), each opened on the capture adapter's device and fed two GPU frames, answered as `ROOMLER_CAPS_GPU:[…]` |
+| `software` (#3267) | only once `base` has given up: libvpx's cell and nothing else, answered as `base` answers, so the host keeps `data-channel-vp9-444` |
 
 The 0.4.84 roll found the cost of one child: a laptop's Intel media runtime died
 with `0xc0000005` on the first `vp9_qsv` 4:4:4 open and the daemon advertised
 **no hardware at all**. A dying 4:4:4 child now costs only the 4:4:4 forms.
 
+⚠️ **`base` is still one process, so a dead child costs the cell it died in**
+(#3267, `child::run_base`, `docs/encoders.md`). AMD's driver from 32.0.21043 faults
+on `hevc_vulkan`, and a Radeon laptop lost its RTX 5090's NVENC too, with a viewer
+that looked healthy. `base` now announces each open and its end
+(`ROOMLER_CAPS_PROGRESS:-`), and the parent runs it again, at most 9 times and
+none started after 90 s:
+
+- **The same named cell, a fault's status, twice in a row: denied and cached.**
+  The first death adds nothing to the next run, so a transient passes it.
+- **A hang, or any other named death twice: denied for this process only**, and the
+  result is not cached. An OOM kill or an EDR's terminate says nothing about the
+  open it landed in, and proving a hang costs another minute.
+- **No cell to blame: one more run**, then it gives up: no hardware, as before, but a
+  last child (`software`) still proves libvpx, which needs no driver. Only if that
+  dies too is the answer `compute_caps(false)`.
+- ⚠️ A report the child printed stands however it ended afterwards, in every phase.
+- ⚠️ `windows_fault_code` is a list of what counts, because an unknown NTSTATUS must
+  not cache a healthy cell out. Don't widen it back to "any error severity": that
+  polarity let `0xffffffff` through until a field kill test found it. 255 stays on the
+  list because the field says so: 2 of 7 AMD deaths read it.
+- ⚠️ A cell learned in 4:2:0 takes its 4:4:4 form with it (`names_444`): the `444`
+  child never tested that form, and nothing checks `chroma_pref` against the hello.
+
+⚠️ **A child that would not die costs Media Foundation too**, for this process, whichever
+phase it was (`media_foundation_denies`), because a session opens those cells in the daemon on
+a wait with no bound. Only a kill that landed within its bound keeps them, so a thrashing host
+can lose them too, until a later try. With `h264` chosen the session takes OpenH264; with `av1`
+chosen it gets no video until #3279 lands.
+
+⚠️ **A first answer that ran short of time gets more tries by itself** (#3280,
+`caps::arm_retry`, `docs/encoders.md`). A detached thread climbs `LADDER`, whole probes with
+longer bounds. Keep these true when you touch it:
+
+- **A cache hit or a complete answer arms nothing.** A healthy host must run none of this.
+- **A try's children get the try's own list** (`list_for_a_try`, `Try::denied`), never through
+  `install_learned`: the daemon's list does not relax while a cell is being tested. A fault's deny
+  stays on every list; only what is there for want of time (`LearnedDeny::timed_out`) comes off.
+- **Never compare `why` strings.** `timed_out` is the mark.
+- **A session comes first.** `session_asked` kills the child at its next poll, the try is lost
+  and not counted, and an answer goes in only with nothing live.
+- **A try whose own child would not die starts no more children** (`probe_with`). A first probe
+  goes on, because it has no answer to fall back on.
+- **A try cannot take a form** (`weigh`, `keeps`). A count of cells is not enough: an answer with
+  more cells that leaves one out is dropped, and so is one where hardware came back as software.
+  Dropping a complete answer ends nothing; only an adopted one does.
+- **A fault costs its own form, at the join** (`withdraw_refused`, from `probe_with`): off the
+  daemon's list and off the answer in force before the next child starts, with the generation moved,
+  so nothing offers what a session is refused. A later answer is compared with what is left. Losing
+  the form a cell opens first loses the cell: 4:2:0 for FFmpeg's, 4:4:4 for libvpx's.
+- ⚠️ **Compare a cell with a list by `list_name`, never its wire form.** D3D12's wire form is
+  `hevc_d3d12`; the lists say `hevc_d3d12va`. Get it wrong and a fault withdraws nothing, and no later
+  answer is ever adopted.
+- **A try's stuck child never takes Media Foundation from under a session**
+  (`hold_media_foundation_back`, `busy`): a live one, because a refused rebuild is no video, or one
+  that asked in the last minute, which is in no registry until its peer is built. A first probe's
+  costs them at once; nothing is live yet.
+- **An offer reads its picks again** (`picks_at_the_offer`), codec and transport, because consent
+  can outlast that minute. What has gone is picked again by the request's rules. A GUI worker's
+  picks stand: they came from the daemon's answer, not its own.
+- **Adopt the list first and the generation last,** and read `generation()` before reading the
+  answer, so a change in between reads as news rather than getting lost.
+- ⚠️ `std::thread`, not `spawn_blocking`: a runtime's shutdown waits on those, and
+  `signaling::run` must be able to leave.
+
+When a host is missing a cell, read `learned_deny` in the log or
+`capabilities.unavailable["encoder-cells"]` (code `learned-deny`, or `probe-short` with no cell to
+name), then the WER event's faulting module.
+`roomlerd caps-probe` by hand with `ROOMLERD_CAPS_CHILD=1 ROOMLERD_CAPS_PHASE=base`
+reproduces a fault in seconds, and its last `PROGRESS` line names it. A healthy
+session is no tell, because an MF H.264 session plays with no hardware cell at all.
+
 ⚠️ **The child's stderr reaches no log on a service host.** It announces every
 open on stdout (`ROOMLER_CAPS_PROGRESS:<name>:yuv444`, line-buffered so it
 survives the crash) and the parent quotes the last one — *that* is the
-`encoder_cells_deny` entry to add.
+`encoder_cells_deny` entry to add (`<name>:gpu` → `zero_copy_deny`).
+
+⚠️ **A form no child has opened never opens in the daemon.** A session's GPU
+input reads the `gpu` child's answer at every open (`gpu_input::plan` →
+`unproven`); the probe child is the only process exempt, because proving the
+form is its job. A new input form gets a phase of its own on the same terms.
 
 ## 2 · The cache
 
@@ -80,6 +178,13 @@ GUI-session state and every verb list are recomputed by the running process
 (`caps::merge_cached`) — they change without any driver changing.
 ⚠️ On a Windows SCM host the **worker** (console session) runs the probe and owns
 the cache file, not the supervisor's `service-logs`.
+⚠️ **Only a fault's death counts as an answer for the cache.** A `444` or `gpu` child that left
+nothing for any other reason (a hang, an OOM kill, an EDR's terminate, a failed spawn) keeps the
+answer out of it, so the next start asks again (`why_not_cached`, `PhaseGaps::note`).
+⚠️ **A confirmed learned deny lives in this file and nowhere else** (#3267), and an
+answer carrying one stands for a day, not a week. Any key mismatch drops it, and the
+next probe tests the cell again: that is how a vendor's fix heals with nobody acting.
+A result leaning on an unconfirmed deny is never cached.
 
 ## 3 · The denylist is a kill switch — it must apply at EVERY entry point
 
@@ -93,6 +198,16 @@ while the hello advertised only the Vulkan cells.
 
 > **A kill switch a child process honours and the daemon ignores keeps nothing
 > out of the daemon.**
+
+⚠️ **The learned list (#3267) is not this list.** `cells::denied_cells` is the
+operator's list plus what the probe learned, so the key keeps replacing the
+built-in, clearing it still goes back to it, and nothing learned is ever written
+to the config. `none` does not reach a learned cell; `caps_learn_deny = false` does.
+Sessions read it through the same `names_420` / `names_444` and `new_preferred`;
+Media Foundation (`h264_mf`, `hevc_mf`, `av1_mf`) and libvpx (`vp9_libvpx`) refuse in
+their constructors; a recorder and the next probe child get it as
+`ROOMLERD_ENCODER_CELLS_LEARNED`. A process that opens encoders outside these must
+read the same list.
 
 Also a config key (`encoder_cells_deny`, validated `name:chroma` or `none`),
 pushable through remote config with `MANAGE_AGENTS` alone — it only ever
@@ -110,8 +225,7 @@ lacking one (`with_av1_temporal_delimiter`), for every AV1 backend — **necessa
 not sufficient**: the repaired build still showed correct keyframes and corrupt
 inter frames, and the FFmpeg CLI's own `av1_vulkan` on the same GPU emits frames
 dav1d cannot parse. That is an FFmpeg 9.0.1 / NVIDIA driver defect with no
-roomler code in the loop, so `av1_vulkan:yuv420` is the built-in denylist's one
-4:2:0 entry.
+roomler code in the loop, so `av1_vulkan:yuv420` is on the built-in denylist.
 
 Diagnostic that attributed it in one run:
 `encoder-smoke --name <x> --dump <file>` + the FFmpeg CLI's dav1d.
@@ -127,10 +241,11 @@ rebuild.
 
 | Backend | Trap |
 |---|---|
-| **NVENC** | 4:4:4 is planar `yuv444p`. `h264_nvenc` 4:4:4 needs `profile=high444p` — `rext` is HEVC-only and reads as "cannot" |
+| **NVENC** | 4:4:4 is planar `yuv444p`. `h264_nvenc` 4:4:4 needs `profile=high444p` — `rext` is HEVC-only and reads as "cannot". ⚠️ **The `nv-codec-headers` pin IS the driver floor**: FFmpeg refuses NVENC on a driver older than the SDK it was built against, and the host then advertises no NVENC cell. Linux pins 12.1 (530.41), Windows' vcpkg `ffnvcodec` 13.0 (570), and each Linux vendor job asserts the floor in the binary, so a pin bump moves that assert too. A pin at 13.1 cost every Linux host below driver 610 its NVENC (FR-122 P0c), and the dev box's newer driver could not show it. ⚠️ In a container, a working `nvidia-smi` proves nothing about NVENC: the NVIDIA runtime mounts `libnvidia-encode.so.1` and `libnvcuvid.so.1` only for the `video` driver capability (`docs/encoders.md`) |
 | **QSV** | 4:4:4 is packed **VUYX**, never planar (this is why the FR-77 P1 `vp9_qsv` 4:4:4 open failed). Profile (`rext` / `profile1`) set explicitly in the `base` tier. `hw: true` only on the oneVPL build (`qsv_is_hardware_by_construction`) |
 | **VAAPI** | Takes **hardware frames**; `encode/ffmpeg/vaapi.rs` holds the raw `ffmpeg_sys_next` calls. Device opens ONCE per process; each encoder gets a frame pool whose ref goes onto `hw_frames_ctx` **before** `open`. libva + libdrm are **bundled**, with **no `Depends`** — a `Depends: libva2` only holds where apt reaches a mirror, and the updater's offline `dpkg --install` replaces the binary *before* the dependency failure |
 | **D3D12 / Vulkan** | `dlopen`'d by FFmpeg itself — the vendor jobs assert **no link directive / DT_NEEDED**, so a host without them loses cells, never the daemon. Set `bf=0` (both default to `bf=2`). `rc_mode` constants are **UPPERCASE** for d3d12va (`VBR`), lowercase for Vulkan (`vbr`) |
+| **Media Foundation** | `ActivateObject`'s caller must end what it made, and a release does not: `HwMftCandidate`'s `Drop` calls `ShutdownObject`, or each open leaves 72 threads behind on a host with an AMD GPU. ⚠️ Candidates end when the cascade ends, **never between adapters**: until then `ActivateObject` returns the same instance, and a new one would change what wins (`docs/encoders.md`) |
 | **VideoToolbox** | macOS ships **no FFmpeg at all**. Wiring it needs BOTH the `*_videotoolbox` names in the tables **and** a re-run of `vendor-ffmpeg-macos.yml` — restoring the feature alone re-ships a dyld crash on every end-user Mac |
 
 ⚠️ **The OPEN decides the device** (`open_on_some_device`: preferred first, then

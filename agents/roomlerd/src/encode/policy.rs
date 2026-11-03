@@ -33,7 +33,12 @@ use crate::peer::{
 /// idle-refine state are resolved by the CALLER — this module never
 /// reaches into pipelines or atomics, which is what makes the frame
 /// path and the eligibility hook provably consistent.
-#[derive(Debug, Clone, Copy)]
+///
+/// `PartialEq` is FR-70 M3a.3's: the shadow plan compares the inputs it was
+/// produced from with the ones the inline arithmetic read, so a geometry
+/// divergence whose inputs moved between the two reads is told apart from one
+/// whose inputs held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DimsInputs {
     pub native_w: u32,
     pub native_h: u32,

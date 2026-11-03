@@ -27,6 +27,7 @@ fn spec(port: u16) -> Spec {
         user: None,
         ca: None,
         at: At::Loopback { peer: 0 },
+        through: None,
     }
 }
 
@@ -82,7 +83,7 @@ async fn calls_in_flight_are_each_answered_by_their_own_id() {
     let calls: Vec<_> = (1..=3u64)
         .map(|endpoint| {
             let link = Arc::clone(&link);
-            tokio::spawn(async move { link.call(Call::Values { endpoint }, None).await })
+            tokio::spawn(async move { link.call(Call::Values { endpoint }, Vec::new()).await })
         })
         .collect();
     for (endpoint, call) in (1..=3u64).zip(calls) {
@@ -101,7 +102,7 @@ async fn a_call_fails_as_the_channel_goes_and_after() {
     let (link, rd, wr, _d) = linked();
     let waiting = {
         let link = Arc::clone(&link);
-        tokio::spawn(async move { link.call(Call::Values { endpoint: 1 }, None).await })
+        tokio::spawn(async move { link.call(Call::Values { endpoint: 1 }, Vec::new()).await })
     };
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     drop((rd, wr));
@@ -110,7 +111,7 @@ async fn a_call_fails_as_the_channel_goes_and_after() {
         .expect("failed well before its bound")
         .unwrap();
     assert!(failed.is_err(), "{failed:?}");
-    let after = link.call(Call::Values { endpoint: 2 }, None).await;
+    let after = link.call(Call::Values { endpoint: 2 }, Vec::new()).await;
     assert!(after.is_err(), "{after:?}");
 }
 
@@ -162,7 +163,7 @@ async fn each_hand_overs_descriptor_is_the_one_beside_its_frame() {
                     endpoint: i as u64,
                     spec: Box::new(spec),
                 },
-                Some(fd),
+                vec![fd],
             )
             .await
             .expect("each serve answered");
@@ -190,7 +191,7 @@ async fn a_call_that_cannot_be_sent_takes_the_link_for_lost() {
         endpoint: 1,
         spec: Box::new(spec(port)),
     };
-    let failed = link.call(serve, Some(OwnedFd::from(listener))).await;
+    let failed = link.call(serve, vec![OwnedFd::from(listener)]).await;
     assert!(failed.is_err(), "{failed:?}");
     let why = tokio::time::timeout(std::time::Duration::from_secs(5), link.lost())
         .await
@@ -205,7 +206,7 @@ async fn an_unanswered_call_takes_the_link_for_lost() {
     let (link, mut rd, _wr, _d) = linked();
     let calling = {
         let link = Arc::clone(&link);
-        tokio::spawn(async move { link.call(Call::Values { endpoint: 1 }, None).await })
+        tokio::spawn(async move { link.call(Call::Values { endpoint: 1 }, Vec::new()).await })
     };
     // Its frame read here, the call waits on its bound: only then is the
     // clock paused, so it runs at once to the bound and to nothing before.

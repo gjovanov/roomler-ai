@@ -40,7 +40,7 @@ The single source of truth is
 [`scripts/licence-classes.sh`](../scripts/licence-classes.sh). `LICENSING.md`'s
 table mirrors it for readers, and CI reads only the script.
 
-| class | by path ([`:31`](../scripts/licence-classes.sh#L31), [`:45`](../scripts/licence-classes.sh#L45)) | by crate ([`:81`](../scripts/licence-classes.sh#L81), [`:100`](../scripts/licence-classes.sh#L100)) | SPDX |
+| class | by path ([`:31`](../scripts/licence-classes.sh#L31), [`:45`](../scripts/licence-classes.sh#L45)) | by crate ([`:82`](../scripts/licence-classes.sh#L82), [`:101`](../scripts/licence-classes.sh#L101)) | SPDX |
 |---|---|---|---|
 | server | `crates/{api,services,db,config,core,modules,derp-relay,tests}`, `ui/` | `roomler-ai-*`, `roomler-core`, all six `roomler-ai-mod-*`, `derp-relay` | `AGPL-3.0-only` |
 | client | `agents/*`, `crates/{agent-core,roomler-setup-core,tunnel-core,remote_control,localapi,tcp-turn-conn}` | `roomlerd`, `roomler-cli`, `roomler-node-core`, `roomler-ai-tunnel-core`, … | `MPL-2.0` |
@@ -48,8 +48,8 @@ table mirrors it for readers, and CI reads only the script.
 | excluded | `crates/vendored/*` (upstream terms, unchanged), build output | — | upstream |
 
 The **shipped** agents, the binaries the graph check guards, are listed separately
-([`:118`](../scripts/licence-classes.sh#L118)): `roomlerd`, `roomler-cli`,
-`roomler-cli-shim`, `roomler-desktop` and `roomler-setup`.
+([`:120`](../scripts/licence-classes.sh#L120)): `roomlerd`, `roomler-cli`,
+`roomler-cli-shim`, `roomlerdw`, `roomler-desktop` and `roomler-setup`.
 
 ⚠️ **A new crate must be added to one of the two crate lists.** The manifest check
 fails any workspace member it cannot classify. That failure is the reminder, and it
@@ -117,7 +117,7 @@ sequenceDiagram
 
 ⚠️ **After any change to `.github/ffmpeg-patches/` or the vcpkg baseline, dispatch
 `lgpl-source-offer.yml` before tagging.** `release-agent.yml` refuses otherwise
-([`:407`](../.github/workflows/release-agent.yml#L407)). Until 2026-09-24 the bundle
+([`:422`](../.github/workflows/release-agent.yml#L422)). Until 2026-09-24 the bundle
 held neither set of patches while three documents said we applied none. The workflow's
 own check was green throughout, because it asked whether an asset *existed*, never
 whether it was the source we built from (#1616).

@@ -125,7 +125,7 @@ fn bgra_frame(width: u32, height: u32, data: Vec<u8>) -> Frame {
         height,
         stride: width * 4,
         pixel_format: PixelFormat::Bgra,
-        data,
+        data: data.into(),
         monotonic_us: 0,
         monitor: 0,
         damage: Damage::Unknown,

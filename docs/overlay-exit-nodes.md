@@ -417,10 +417,10 @@ sequenceDiagram
 
 | Step | Where | What it guards against |
 |---|---|---|
-| Capture the uplink per family, re-read before every pin | `tun.rs:3878`, `current_uplink` `tun.rs:5441`, `bsd_default_uplink` `tun.rs:316` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
-| Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:362`, `bsd_pin_row` `tun.rs:398`, `bsd_pin_holds` `tun.rs:411`, `bsd_table` `tun.rs:5343` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
-| Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:4740` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
-| Re-check the pins | `stale_host_exemptions` `tun.rs:4838`, the gate `route_guard.rs:599` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
+| Capture the uplink per family, re-read before every pin | `tun.rs:3986`, `current_uplink` `tun.rs:5549`, `bsd_default_uplink` `tun.rs:316` | A Mac changes networks under a running daemon. A default on our own utun, a route narrower than `/0`, or one with no next-hop address (another VPN's interface route) is never an uplink |
+| Read pins from the table, never a lookup | `BsdTableRow` `tun.rs:362`, `bsd_pin_row` `tun.rs:398`, `bsd_pin_holds` `tun.rs:411`, `bsd_table` `tun.rs:5451` | The pin is the **unscoped static** host route for the address (`H`+`S`, never `W` or `I`), flagged `G` through the uplink's next hop. A lookup answers with the scoped clone a connection left instead (below) |
+| Look first, then add; replace with delete + add | `add_host_exemption` `tun.rs:4848` | BSD `route` has no idempotent write, and a re-write is a route-monitor event (#1856). `route change` resolves its target the way the lookup does, so it cannot repoint a pin |
+| Re-check the pins | `stale_host_exemptions` `tun.rs:4946`, the gate `route_guard.rs:599` | Wi-Fi ↔ Ethernet, a new network: a `/32` left on the old next hop black-holes the endpoint it was pinned for, the coordination server included |
 | A pin that cannot follow is deleted before it is forgotten | `route_guard.rs:599` | An untracked host route outlives every teardown, and turns into a black hole at the next network change |
 | One WARN per cause, and the cause in `roomler status` | `note_exemption_failure` `route_guard.rs:393`, `exemption_withheld_reason` `route_guard.rs:405` | The gate retries every few seconds; 0.4.132 logged the same failure every ~5 s and reported a guess (`no original default route?`) |
 

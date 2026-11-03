@@ -146,6 +146,10 @@ impl AgentDao {
             // reason as the host key below: enrolment never reaches the machine.
             companion_version: None,
             keep_busy: None,
+            // FR-55 P4 — the heartbeat reports the posture and the device
+            // announces its sleeps; enrolment does neither.
+            power: None,
+            sleep: None,
             // Unknown until the device's first hello — enrolment does not
             // reach the machine, so there is nothing to record yet.
             ssh_host_pubkey: String::new(),
@@ -507,7 +511,37 @@ impl AgentDao {
             set.insert("arch", arch);
             set.insert("arch_emulated", arch_emulated);
         }
-        self.base.update_by_id(agent_id, doc! { "$set": set }).await
+        // FR-55 P4 — a hello is the device awake again: whatever it last
+        // said about going to sleep is over ([`Self::record_sleep`]).
+        self.base
+            .update_by_id(agent_id, doc! { "$set": set, "$unset": { "sleep": "" } })
+            .await
+    }
+
+    /// FR-55 P4 — the device said it is going to sleep (`rc:agent.sleeping`):
+    /// record when, and its power posture, for the device lists to show why it
+    /// is offline. Answers whether it wrote.
+    ///
+    /// Keyed by `conn_id` like [`Self::mark_offline_if_conn`], and for the same
+    /// reason: only the connection that wrote the row's hello speaks for the
+    /// device. A displaced connection's late notice matches nothing, so it can
+    /// never mark a device that has already reconnected as asleep.
+    pub async fn record_sleep(
+        &self,
+        agent_id: ObjectId,
+        conn_id: &str,
+        notice: &roomler_ai_remote_control::models::SleepNotice,
+    ) -> DaoResult<bool> {
+        // The posture at the moment of sleep is also the freshest one the
+        // device has given, so it replaces the last heartbeat's.
+        let power = bson::to_bson(&notice.power)?;
+        let notice = bson::to_bson(notice)?;
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "conn_id": conn_id },
+                doc! { "$set": { "sleep": notice, "power": power } },
+            )
+            .await
     }
 
     /// #2552 — a connection's teardown: `Offline`, but only while the row
@@ -572,6 +606,7 @@ impl AgentDao {
         warm_relay: Option<&str>,
         companion_version: Option<&str>,
         keep_busy: Option<&roomler_ai_remote_control::models::KeepBusyBrief>,
+        power: Option<&roomler_ai_remote_control::models::PowerBrief>,
     ) -> DaoResult<Option<HeartbeatBefore>> {
         // C4 stage 2 — the standing warm allocation's relayed address rides
         // the same per-heartbeat write: stored pair-less so a peer can be
@@ -617,6 +652,16 @@ impl AgentDao {
             }
             None => {
                 unset.insert("keep_busy", "");
+            }
+        }
+        // FR-55 P4 — the power posture, by the same rule: an agent that stops
+        // reporting it (a rollback to a pre-P4 build) reads as unknown.
+        match power.and_then(|p| bson::to_bson(p).ok()) {
+            Some(p) => {
+                set.insert("power", p);
+            }
+            None => {
+                unset.insert("power", "");
             }
         }
         // `update_one` would stamp this; a raw find-and-update must itself.

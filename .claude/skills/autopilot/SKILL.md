@@ -34,9 +34,9 @@ That line is the whole classification.
 
 ## Where it runs
 
-- **Driver**: the dev box, interactive. Deliberately **not** a workflow lane — the sibling
-  `daily-health-check.yml` only *reports*; this one writes code and opens PRs, and those
-  deserve different leashes until it has field hours.
+- **Driver**: the dev box, interactive. Deliberately **not** a workflow lane — it writes
+  code and opens PRs, and that deserves a shorter leash than an unattended job until it has
+  field hours.
 - **Cards + board**: `roomler-ai-docs` (private) `kanban/` — `state/<FR-n>.json` per card,
   `BOARD.md` generated. Cloned at `C:/dev/gjovanov/roomler-ai-docs`.
 - **Engineering truth stays public**: the GitHub issue and `docs/fr/FR-n-*.md` remain

@@ -11,8 +11,8 @@ Today the question has an answer computed for it, and that answer is thrown away
 
 `roomlerd` already computes a verdict for every install: `InstallStatus` is a
 five-state enum (`InProgress | SucceededVerified | SucceededUnverified |
-InstallerFailed | Timeout`, `post_install.rs:131-151`) persisted to
-`<log_dir>/last-install.json` (`post_install.rs:166`).
+InstallerFailed | Timeout`, `post_install.rs:131-152`) persisted to
+`<log_dir>/last-install.json` (`post_install.rs:167`).
 
 Measured on the fleet:
 
@@ -29,11 +29,11 @@ updates, and not one recorded an outcome.
 **1. The watcher waits for its own parent to die, and that death is what kills it.**
 
 `install_tarball_linux` completes the entire install **synchronously** and returns
-`Ok(std::process::id())` — *the daemon's own pid* (`updater.rs:2207`). That pid is
+`Ok(std::process::id())` — *the daemon's own pid* (`updater.rs:2208`). That pid is
 handed to the watcher as `--installer-pid`, and `watch()` calls
 `wait_for_pid(installer_pid, INSTALLER_BUDGET)` unconditionally
-(`post_install.rs:226`), polling `kill(pid, 0)` for up to 600 s
-(`post_install.rs:1024-1049`).
+(`post_install.rs:227`), polling `kill(pid, 0)` for up to 600 s
+(`post_install.rs:1025-1050`).
 
 So the watcher's only exit condition is the daemon's exit — while the daemon's
 exit is precisely what tears down the cgroup and kills the watcher. There is
@@ -44,7 +44,7 @@ nothing being waited *for*: the install finished before the watcher existed. The
 **2. The cgroup teardown then removes any chance of finishing.** Both packaged
 units ship with no `KillMode` (`packaging/linux/roomlerd.service`,
 `roomler.service`) ⇒ systemd's default `control-group`. `spawn_watcher` launches
-the watcher as a plain child (`updater.rs:2577`) on the reasoning that it "is
+the watcher as a plain child (`updater.rs:2578`) on the reasoning that it "is
 reparented to init and runs to completion on its own" — but reparenting to PID 1
 does not leave the cgroup. `docs/fr/FR-36-wayland-capture.md:371` already recorded
 this exact lesson for a different subsystem.
@@ -55,9 +55,9 @@ mostly moot. Fixing (2) alone would be building a systemd mechanism to support a
 wait that should not exist.
 
 **3. Nothing reads the verdict, on any platform.** `post_install::read_outcome()`
-(`post_install.rs:180`) has **zero callers**. The module doc's claim that "the new
+(`post_install.rs:181`) has **zero callers**. The module doc's claim that "the new
 binary reads `last-install.json` at startup to surface the outcome"
-(`post_install.rs:84-85`, echoed at `:10`, `:115`, `docs/remote-control.md:1256`)
+(`post_install.rs:85-86`, echoed at `:10`, `:116`, `docs/remote-control.md:1256`)
 was never wired. So even on Windows — where the staged watcher does produce a
 verdict — nothing surfaces it. **P3 wires it** (2026-10-26): the daemon reads
 the record at startup and on every `roomler status`, see the P3 section below.
@@ -92,7 +92,7 @@ It was the first design, and it was refuted:
   file — see 3), and `.output()` with no timeout on the daemon's exit path is a
   genuine fleet-freeze mode.
 - **The config kill switch is inert against that mode**: config changes are
-  `restart_required` (`docs/remote-config.md:215-229`), and the failure being
+  `restart_required` (`docs/remote-config.md:225-239`), and the failure being
   guarded blocks the very exit a restart needs.
 - **It would create a failure mode that cannot exist today**: with the watcher
   surviving, PID reuse on the daemon's freed pid makes `kill(pid,0)` keep
@@ -123,11 +123,11 @@ flowchart LR
 
 | Piece | Where |
 |---|---|
-| The wire word, `LastInstallStatus` — the five verdicts spelled as the file spells them, plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:465`; `NodeStatus.last_install`, `:439` |
-| The read, fresh from disk every time | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:1168`), its pure half `summarize` (`:1181`) |
-| The startup line and its level | `log_at_startup` (`:1238`), `startup_level` (`:1222`); called right after `agent starting` (`agents/roomlerd/src/main.rs:3679`) |
-| The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:858`) |
-| The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2819`), printed under `version` (`:2429`) |
+| The wire word, `LastInstallStatus` — the five verdicts spelled as the file spells them, plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:509`; `NodeStatus.last_install`, `:471` |
+| The read, fresh from disk every time | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:1211`), its pure half `summarize` (`:1224`) |
+| The startup line and its level | `log_at_startup` (`:1281`), `startup_level` (`:1265`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4130`) |
+| The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:961`) |
+| The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2869`), printed under `version` (`:2474`) |
 
 - ⚠️ **Read on every answer, never cached at startup.** On Windows the MSI
   starts the new service while the watcher is still waiting on msiexec, so
@@ -184,10 +184,10 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:353`); `UpdateRefusal` and `update_refusal()` (`:562`, `:1416`) |
-| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:4879`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3038`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3021`), else `self` |
-| Stamped at **every** announcement | `stub_caps` (`signaling.rs:7208`, `:7221`) |
-| Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1427`): a 409 on one device (`:1474`), a `refused` row with its `refused_code` in a bulk (`:1606`) |
+| The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:360`); `UpdateRefusal` and `update_refusal()` (`:573`, `:1448`) |
+| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5030`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3054`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3037`), else `self` |
+| Stamped at **every** announcement | `stub_caps` (`signaling.rs:7362`, `:7375`) |
+| Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1446`): a 409 on one device (`:1493`), a `refused` row with its `refused_code` in a bulk (`:1625`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |
 
 > [!WARNING]
@@ -290,7 +290,7 @@ sequenceDiagram
 
 ## Out of scope
 
-- A Unix `ensure_service_running` equivalent (`post_install.rs:550`). Windows needs
+- A Unix `ensure_service_running` equivalent (`post_install.rs:551`). Windows needs
   it because the SCM does not auto-restart; Linux has `Restart=always` +
   `RestartPreventExitStatus=7 8`, and a watcher running `systemctl start` would
   fight the supervisor.
@@ -325,7 +325,7 @@ sequenceDiagram
 | 2026-10-26, 08:01Z | ✅ **Windows again, on 0.4.174 — and the panic beside every Windows record** | The dev box's worker record: `SucceededVerified` for `agent-v0.4.174`, `started_unix 1793001660 → finished_unix 1793001677` (17 s on msiexec), `note … service Roomler: running (0 starts; seen Running)`, written at 1793001692 once the service had settled. In the same second, `panic-58744-1793001692.log`: `failed printing to stdout: The pipe is being closed. (os error 232)` — and the 10-25 22:39Z record has its twin, `panic-30080-1792967976.log`, 16 s after its verdict. That is #2934: under an exec-driven `self-update` the watcher inherits the exec's stdout pipe, the install closes it, and the verdict `println!` — which runs **after** `write_outcome` — panicked. Pre-existing, not this FR's, fixed on master by #2935 (line-neutral in `main.rs`, so no anchor here moved); neither 0.4.173 nor 0.4.174 carries it. AC7 stands: the record, which is all P3 reads, was complete every time |
 | 2026-10-26, 09:55Z | ✅ **The no-key state, on a live daemon** | The branch's `roomler` (built from 98dfc4cac) against the dev box's released 0.4.174 daemon, which predates P3: `roomler status` prints no `last update` line and `--json` carries no `last_install` key — silence, never `none recorded`. The third of the three states that must stay apart, read against a real daemon rather than the CLI's own test |
 | 2026-10-26, 23:20Z | ✅ **Re-read on 0.4.177, three hosts and the dev box — and the journal surface's end date** | mars, jupiter, zeus: `SucceededVerified` for `agent-v0.4.177` on each, `started_unix == finished_unix`, mtime = the journal's verdict line (17:32:49–56Z); two more organic updates since the 0.4.174 row (0.4.175 at 13:03Z, 0.4.177 at 17:32Z — mars and zeus skipped 0.4.176, `current=0.4.175 latest=agent-v0.4.177`), every one `spawning installer and exiting` → `apt-get` → `watcher started … already_exited=true` → the verdict; mars **17 of 17** since 0.4.155. The dev box, 0.4.175 → 0.4.177 at 15:34Z: `SucceededVerified`, 13 s on msiexec, the service settled, and for the first time **no panic log** beside the record — the watcher was 0.4.175's, the first release carrying #2935 (AC7 holds; the #2934 panic is confirmed gone). ⚠️ What this read cannot show yet: **#2943** (0.4.176+) spawns the watcher with no stdio at all (`without_caller_stdio`), so the journal's `post-install watcher started` and `post-install verdict:` lines — the surface the P7 field log and the earlier rows of this log read — end with the first update a 0.4.176+ daemon spawns. None has happened on these hosts yet (every watcher so far was a ≤0.4.175 daemon's), so the end is predicted by the code, not observed. From then on the record file and P3's two readers are the only surfaces: the case for P3, made in the field |
-| 2026-10-26 | ❌→✅ **A label corrected: the dev box is attended, not SystemContext** | The 10-26 AC7 row first called the dev box "perMachine SystemContext". `roomler status` answers `mode service (per-user)` from `privileged: false` (`process_is_privileged` is `process_is_local_system()` on Windows, `agents/roomlerd/src/localapi_state.rs:401`), and `WorkerRole` names a worker `SystemContext` only when its own token is the LocalSystem SID (`agents/roomlerd/src/system_context/worker_role.rs:208`) — the record under the signed-in user's `%LOCALAPPDATA%` says the same. That is `docs/installation.md`'s "machine (attended)" row: perMachine MSI, SCM service, no SystemContext. The topology claim holds (the worker runs the updater, and the reader runs in the worker); the SystemContext mode — a LocalSystem worker whose `<log_dir>` is the SYSTEM profile's, where this box's July `InProgress` for `agent-v0.3.0-rc.183` still sits — is **unread**. Corrected in the spec, `docs/update-outcome.md` §5/§7 and the PR |
+| 2026-10-26 | ❌→✅ **A label corrected: the dev box is attended, not SystemContext** | The 10-26 AC7 row first called the dev box "perMachine SystemContext". `roomler status` answers `mode service (per-user)` from `privileged: false` (`process_is_privileged` is `process_is_local_system()` on Windows, `agents/roomlerd/src/localapi_state.rs:481`), and `WorkerRole` names a worker `SystemContext` only when its own token is the LocalSystem SID (`agents/roomlerd/src/system_context/worker_role.rs:208`) — the record under the signed-in user's `%LOCALAPPDATA%` says the same. That is `docs/installation.md`'s "machine (attended)" row: perMachine MSI, SCM service, no SystemContext. The topology claim holds (the worker runs the updater, and the reader runs in the worker); the SystemContext mode — a LocalSystem worker whose `<log_dir>` is the SYSTEM profile's, where this box's July `InProgress` for `agent-v0.3.0-rc.183` still sits — is **unread**. Corrected in the spec, `docs/update-outcome.md` §5/§7 and the PR |
 
 ## P4 — scoped, and one question left before it is safe to write
 
@@ -340,7 +340,7 @@ a live pid, so **P1 does not help there** — the watcher must actually wait, an
 therefore must actually survive.
 
 The job to fix is **`com.roomler.update`**, whose body is `roomlerd update-helper`
-(`main.rs`, `Command::UpdateHelper`) — that is where the install runs.
+(`app.rs`, `Command::UpdateHelper`) — that is where the install runs.
 `com.roomler.daemon` may need it too if the daemon ever spawns an installer
 directly rather than delegating to the helper.
 

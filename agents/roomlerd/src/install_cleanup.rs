@@ -208,6 +208,7 @@ pub fn run_cleanup(target: TargetFlavour, dry_run: bool) -> Result<CleanupReport
 #[cfg(target_os = "windows")]
 const INSTALL_DIR_PRODUCT_FILES: &[&str] = &[
     "roomlerd.exe",
+    "roomlerdw.exe",
     "roomler-agent.exe",
     "roomler.exe",
     "roomler-tunnel.exe",

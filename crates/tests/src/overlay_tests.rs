@@ -17,6 +17,7 @@ use bson::{doc, oid::ObjectId};
 use roomler_ai_db::indexes::apply_index_sets;
 use roomler_ai_remote_control::models::{NodeRef, OverlayNetwork, OverlayNode};
 use roomler_ai_services::dao::base::DaoError;
+use roomler_ai_services::dao::overlay_block::{NextSlot, SlotClaim};
 use roomler_ai_services::dao::overlay_network::OverlayNetworkDao;
 use roomler_ai_services::dao::overlay_node::{NewOverlayNode, OverlayNodeDao};
 use serde_json::Value;
@@ -2307,4 +2308,315 @@ async fn turning_multi_block_off_after_a_grow_fails_the_boot_loudly() {
     apply_index_sets(&app.db, &app.state.modules.index_sets_for(true))
         .await
         .expect("multi-block schema still applies to a grown network");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// FR-68 P1 tail — the allocator's two races, and renumber against a grown org
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A multi-block server (blocks on, `/22`, growth on) — the deployment shape
+/// every race below needs. Growth is a one-way door, so no shipped server
+/// runs like this yet; these tests are what licenses the first one to.
+async fn multi_block_app() -> TestApp {
+    TestApp::spawn_with_settings(|s| {
+        s.overlay.blocks_enabled = true;
+        s.overlay.block_prefix = 22;
+        s.overlay.multi_block_enabled = true;
+    })
+    .await
+}
+
+/// FR-68 AC3 — a cross-tenant carve racing a grow does not refuse the joiner.
+///
+/// The interleaving: tenant A's network is full and grows. The allocator
+/// READS the next free slot; before it WRITES, another tenant's carve — a
+/// first carve, a renumber, any allocation, since all compute off the same
+/// highest end — lands on that very slot, and the write collides on `slot`.
+///
+/// Before this test the collision arm re-read "any assigned block of A". A
+/// growing network holds block 0 by definition, so that re-read found block
+/// 0 and returned IT as the grow's result: the grow reported success with a
+/// block A already had, the caller re-read an unchanged address space, and
+/// the joiner was refused `AddressSpaceExhausted`. The retry loop the arm
+/// sits in never ran, because the arm returned first. The spec called this
+/// untestable for want of a hook; the allocator's two halves are the hook.
+#[tokio::test]
+async fn a_cross_tenant_carve_racing_a_grow_is_retried_above_the_winner() {
+    let app = multi_block_app().await;
+    let a = app.seed_tenant("ovrace-a").await;
+    let stranger = app.seed_tenant("ovrace-b").await;
+    let dao = OverlayNetworkDao::new(&app.db).with_block_prefix(Some(22));
+
+    // A is carved: block 0 at position 0.
+    let net_a = dao.get_or_create(tid(&a.tenant_id)).await.unwrap();
+    let nid_a = net_a.id.unwrap();
+    let block0 = dao
+        .blocks()
+        .find_assigned_for_network(nid_a)
+        .await
+        .unwrap()
+        .expect("A is carved");
+    assert_eq!(block0.seq, 0);
+
+    // The grow's READ: the slot A is about to claim for position 1.
+    let NextSlot::Free(slot) = dao.blocks().next_free_slot(22).await.unwrap() else {
+        panic!("a fresh registry is not exhausted");
+    };
+
+    // The race: the stranger's carve computes off the same highest end and
+    // wins that exact slot first.
+    let net_s = dao.get_or_create(tid(&stranger.tenant_id)).await.unwrap();
+    let theirs = dao
+        .blocks()
+        .find_assigned_for_network(net_s.id.unwrap())
+        .await
+        .unwrap()
+        .expect("the stranger is carved");
+    assert_eq!(
+        theirs.slot, slot,
+        "precondition: the stranger took the slot A's read chose"
+    );
+
+    // The grow's WRITE collides on `slot`. The only right answer is TAKEN —
+    // A holds nothing at position 1, so there is nothing to hand back.
+    match dao
+        .blocks()
+        .claim_slot(tid(&a.tenant_id), nid_a, 22, 1, slot)
+        .await
+        .unwrap()
+    {
+        SlotClaim::Taken => {}
+        SlotClaim::AlreadyHeld(b) => panic!(
+            "the lost race came back as {} (position {}) — the grow would report success \
+             with a block A already holds, and the joiner would be refused",
+            b.cidr, b.seq
+        ),
+        SlotClaim::Won(b) => panic!("the slot was not actually taken: {}", b.cidr),
+    }
+
+    // The whole allocator, run for the same grow, retries ABOVE the winner:
+    // a real second block at position 1, so the joiner gets an address.
+    let grown = dao
+        .blocks()
+        .allocate(tid(&a.tenant_id), nid_a, 22, 1)
+        .await
+        .expect("the grow retries past the lost race");
+    assert_eq!(grown.seq, 1);
+    assert!(
+        grown.slot > slot,
+        "the retry lands above the winner: {} > {slot}",
+        grown.slot
+    );
+    assert_ne!(grown.id, block0.id, "a NEW block, not block 0 handed back");
+    let list = dao
+        .blocks()
+        .find_assigned_for_network_ordered(nid_a)
+        .await
+        .unwrap();
+    assert_eq!(list.iter().map(|b| b.seq).collect::<Vec<_>>(), vec![0, 1]);
+    let mut slots = vec![block0.slot, theirs.slot, grown.slot];
+    slots.sort_unstable();
+    slots.dedup();
+    assert_eq!(
+        slots.len(),
+        3,
+        "three tenants' blocks, three disjoint slots"
+    );
+
+    // And the joiner's view: the grown space leases past the old ceiling.
+    let net_a = dao.base.find_by_id(nid_a).await.unwrap();
+    assert_eq!(dao.block_list(&net_a).await.cidrs().len(), 2);
+}
+
+/// FR-68 — two grows of the SAME network at the same position collapse to
+/// one block. Two joiners can trip a grow at once (each sees the space full,
+/// each computes `seq = assigned.len()`); the `(network_id, seq)` assigned-
+/// unique guard makes the second insert collide, and the allocator hands the
+/// loser the winner's row. Without the guard the loser inserted a twin — two
+/// assigned blocks at position 1 — and every ordinal above it was ambiguous.
+#[tokio::test]
+async fn a_second_grow_at_the_same_position_returns_the_first_block() {
+    let app = multi_block_app().await;
+    let seeded = app.seed_tenant("ovtwin").await;
+    let dao = OverlayNetworkDao::new(&app.db).with_block_prefix(Some(22));
+    let net = dao.get_or_create(tid(&seeded.tenant_id)).await.unwrap();
+    let nid = net.id.unwrap();
+    let t = tid(&seeded.tenant_id);
+
+    let first = dao.blocks().allocate(t, nid, 22, 1).await.unwrap();
+    let second = dao.blocks().allocate(t, nid, 22, 1).await.unwrap();
+    assert_eq!(
+        second.id, first.id,
+        "the loser gets the winner's row, not a twin at the same position"
+    );
+    let list = dao
+        .blocks()
+        .find_assigned_for_network_ordered(nid)
+        .await
+        .unwrap();
+    assert_eq!(
+        list.iter().map(|b| b.seq).collect::<Vec<_>>(),
+        vec![0, 1],
+        "exactly one block per position"
+    );
+}
+
+/// FR-68 AC4 — renumber against a GROWN network is refused before it touches
+/// anything, dry run included, and names the condition.
+///
+/// The route is single-block-shaped end to end: it reads ONE assigned block,
+/// quarantines it, allocates a replacement at position 0 and plans every
+/// node out of `network.cidr` — block 0 alone. Against a grown network that
+/// left a block it never looked at still assigned beside the new one — at
+/// position 0 if that one was retired, a tie `seq` exists to make impossible
+/// — and planned block-1 nodes as if they had no ordinal. Nothing of that
+/// may start.
+#[tokio::test]
+async fn renumber_refuses_a_grown_network_before_touching_it() {
+    let app = multi_block_app().await;
+    let seeded = app.seed_tenant("ovgrownrn").await;
+    let dao = OverlayNetworkDao::new(&app.db).with_block_prefix(Some(22));
+    let net = dao.get_or_create(tid(&seeded.tenant_id)).await.unwrap();
+    let nid = net.id.unwrap();
+
+    // Grow it: cursor to the ceiling, next lease appends block 1.
+    dao.base
+        .update_one(
+            doc! { "_id": nid },
+            doc! { "$set": { "next_host": 1023_i64 } },
+        )
+        .await
+        .unwrap();
+    let net = dao.base.find_by_id(nid).await.unwrap();
+    dao.allocate_host_or_grow(&net, 22)
+        .await
+        .expect("a full network grows");
+    let before = dao
+        .blocks()
+        .find_assigned_for_network_ordered(nid)
+        .await
+        .unwrap();
+    assert_eq!(
+        before.iter().map(|b| b.seq).collect::<Vec<_>>(),
+        vec![0, 1],
+        "precondition: the network holds two assigned blocks"
+    );
+    let cidr_before = dao.base.find_by_id(nid).await.unwrap().cidr;
+
+    for dry_run in [true, false] {
+        let resp = app
+            .auth_post(
+                &format!("/api/tenant/{}/overlay-block/renumber", seeded.tenant_id),
+                &seeded.admin.access_token,
+            )
+            .json(&serde_json::json!({ "dry_run": dry_run }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "dry_run={dry_run}");
+        let body: Value = resp.json().await.unwrap();
+        let text = body.to_string();
+        assert!(
+            text.contains("grown to 2 blocks"),
+            "the refusal names the condition (dry_run={dry_run}): {text}"
+        );
+    }
+
+    // Untouched: the same two blocks, same positions, nothing retired, no
+    // third block, the network still on block 0's cidr.
+    let after = dao
+        .blocks()
+        .find_assigned_for_network_ordered(nid)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.iter().map(|b| (b.id, b.seq)).collect::<Vec<_>>(),
+        before.iter().map(|b| (b.id, b.seq)).collect::<Vec<_>>(),
+        "the assigned blocks are exactly as they were"
+    );
+    let trail = dao
+        .blocks()
+        .base
+        .collection()
+        .count_documents(doc! { "network_id": nid })
+        .await
+        .unwrap();
+    assert_eq!(trail, 2, "no block was quarantined and none allocated");
+    assert_eq!(dao.base.find_by_id(nid).await.unwrap().cidr, cidr_before);
+}
+
+/// FR-68 AC4, the structural half — flipping `multi_block` on REPLACES the
+/// plain `(network_id, seq)` read index with the assigned-unique position
+/// guard, on a database that booted single-block (which is every deployment
+/// today). Then two ASSIGNED blocks at one position of one network are
+/// unrepresentable, while a retired block at that position — the renumber
+/// trail — and the next position both still insert. And the second boot with
+/// the flag on is a no-op: the guard carries its own name, so the one-time
+/// drop of the legacy index does not find and drop the guard on every roll.
+#[tokio::test]
+async fn flipping_multi_block_on_installs_the_position_guard() {
+    let app = TestApp::spawn().await; // single-block boot: the plain index exists
+    let coll = app.db.collection::<bson::Document>("overlay_blocks");
+    let names = coll.list_index_names().await.unwrap();
+    assert!(
+        names.iter().any(|n| n == "network_id_1_seq_1"),
+        "precondition: a single-block boot creates the plain read index, got {names:?}"
+    );
+
+    // The door flip — what a boot with the flag on applies.
+    apply_index_sets(&app.db, &app.state.modules.index_sets_for(true))
+        .await
+        .expect("the flip boots on a single-block database");
+    let names = coll.list_index_names().await.unwrap();
+    assert!(
+        names.iter().any(|n| n == "network_id_1_seq_1_assigned"),
+        "the position guard is installed, got {names:?}"
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|n| n == "network_id_1_seq_1" || n == "network_id_1"),
+        "both legacy indexes are gone, got {names:?}"
+    );
+
+    let nid = ObjectId::new();
+    let owner = ObjectId::new();
+    let now = bson::DateTime::now();
+    let row = |slot: i64, seq: i64, state: &str| {
+        doc! {
+            "slot": slot, "slots": 1_i64, "end_slot": slot + 1,
+            "cidr": format!("100.{}.{}.0/22", 64 + slot / 64, (slot % 64) * 4),
+            "seq": seq, "tenant_id": owner, "network_id": nid,
+            "state": state, "created_at": now, "updated_at": now,
+        }
+    };
+    coll.insert_one(row(3000, 1, "assigned"))
+        .await
+        .expect("the first block at position 1");
+    let twin = coll.insert_one(row(3001, 1, "assigned")).await;
+    let msg = twin
+        .expect_err("a second ASSIGNED block at position 1 is refused")
+        .to_string();
+    assert!(
+        msg.contains("E11000") || msg.to_lowercase().contains("duplicate"),
+        "refused by the unique index, not by something else: {msg}"
+    );
+    coll.insert_one(row(3002, 1, "quarantined"))
+        .await
+        .expect("a retired block at the same position is the renumber trail, not a twin");
+    coll.insert_one(row(3003, 2, "assigned"))
+        .await
+        .expect("the next position is free");
+
+    // The next boot: idempotent, and the guard survives it.
+    apply_index_sets(&app.db, &app.state.modules.index_sets_for(true))
+        .await
+        .expect("a second multi-block boot is a no-op");
+    let names = coll.list_index_names().await.unwrap();
+    assert!(names.iter().any(|n| n == "network_id_1_seq_1_assigned"));
+    let still_twin = coll.insert_one(row(3004, 1, "assigned")).await;
+    assert!(
+        still_twin.is_err(),
+        "the guard still holds after the second boot"
+    );
 }

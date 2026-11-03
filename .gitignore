@@ -22,6 +22,12 @@ ui/dist
 ui/docs/content-dates.json
 /models/
 media/
+# FR-127 P1: the bare `media/` above is for uploaded-media directories, but it
+# also matched the conference module's `src/media/` — its files were only ever
+# tracked by force-adding, and a NEW file there (`view.rs`) vanished from
+# `git status` while cargo compiled it happily. Negating the DIRECTORY match
+# works (negating a file beneath an excluded directory would not).
+!crates/modules/conference/src/media/
 ui/test-results/
 ui/playwright-report/
 ui/e2e/video/output/
@@ -54,6 +60,12 @@ ui/e2e/video/output/
 # would exist only on the machine that wrote it. That is exactly how the
 # sanitisation skill above was lost once already.
 !.claude/hooks/
+# .claude/rules/ holds the pillar invariants that used to sit in CLAUDE.md, as
+# path-scoped rules: each loads when Claude reads or edits a file its `paths:`
+# globs match, instead of on every prompt. Public for the same reason as the two
+# skills above -- they name no host and no IP, and a rule a contributor's agent
+# never loads is not a rule.
+!.claude/rules/
 # The FR-backlog autopilot: the orchestration skill and the worker agent it
 # dispatches. Same argument a third time -- an orchestrator that lives only on
 # the machine that wrote it is one session away from being rebuilt from scratch.

@@ -147,6 +147,22 @@ pub fn build_router(state: AppState) -> Router {
             middleware::auth_rate_limit::auth_rate_limit,
         ));
 
+    // #3199 — its own bucket, keyed on the client address alone: this route
+    // mails whoever the body names, so a per-account budget would let one
+    // client walk a list of addresses.
+    let resend_route = Router::new()
+        .route("/resend-activation", post(routes::auth::resend_activation))
+        .layer(axum::middleware::from_fn_with_state(
+            AuthRateLimitState {
+                limiter: Arc::new(AuthRateLimiter::new(
+                    middleware::auth_rate_limit::RESEND_PERIOD_MS,
+                    middleware::auth_rate_limit::RESEND_BURST,
+                )),
+                trusted_hops: state.settings.app.rate_limit_trusted_hops,
+            },
+            middleware::auth_rate_limit::ip_rate_limit,
+        ));
+
     // Auth routes (no tenant prefix)
     let auth_routes = Router::new()
         .route("/logout", post(routes::auth::logout))
@@ -154,7 +170,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/activate", post(routes::auth::activate))
         .route("/me", get(routes::auth::me))
         .route("/me", put(routes::auth::me))
-        .merge(credential_routes);
+        .merge(credential_routes)
+        .merge(resend_route);
 
     // Tenant routes
     let tenant_routes = Router::new()

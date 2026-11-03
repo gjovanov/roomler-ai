@@ -48,11 +48,16 @@ use roomler_ai_remote_control::{audit::AuditSink, models::AgentStatus};
 use roomler_ai_services::dao::{
     agent::AgentDao, agent_crash::AgentCrashDao, agent_log::AgentLogDao,
     config_audit::ConfigAuditDao, consent_request::ConsentRequestDao,
-    enroll_token_issued::EnrollTokenIssuedDao, enrollment_key::EnrollmentKeyDao,
-    exec_audit::ExecAuditDao, exec_pending::ExecPendingDao, external_rc_audit::ExternalRcAuditDao,
-    keep_busy_event::KeepBusyEventDao, setup_diagnostics::SetupDiagnosticsDao,
+    device_pairing::DevicePairingDao, enroll_token_issued::EnrollTokenIssuedDao,
+    enrollment_key::EnrollmentKeyDao, exec_audit::ExecAuditDao, exec_pending::ExecPendingDao,
+    external_principal::ExternalPrincipalDao, external_rc_audit::ExternalRcAuditDao,
+    keep_busy_event::KeepBusyEventDao, pairing_audit::PairingAuditDao,
+    setup_diagnostics::SetupDiagnosticsDao,
 };
-use roomler_core::{Capabilities, Core, Module, TenantCtx, rate_limit::RateLimiter};
+use roomler_core::{
+    Capabilities, Core, Module, TenantCtx,
+    rate_limit::{RateLimiter, WindowLimiter},
+};
 use tokio::sync::mpsc;
 
 pub mod agent;
@@ -61,6 +66,9 @@ pub mod agent_exec;
 pub mod agent_log;
 pub mod agent_org;
 pub mod agent_release;
+/// FR-129 C2b — the client the three release-asset proxies stream through: a
+/// connect and an idle-read bound, never a total deadline.
+pub mod asset_stream;
 pub mod auth_agent;
 pub mod consent;
 pub mod consent_consumer;
@@ -72,6 +80,8 @@ pub mod hub;
 pub mod install_trace;
 pub mod keep_busy;
 pub mod nudge;
+pub mod pairing;
+pub mod pairing_notice;
 pub mod presence;
 pub mod releases;
 pub mod remote_config;
@@ -103,6 +113,25 @@ pub struct FleetState {
     pub agent_logs: Arc<AgentLogDao>,
     /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
     pub consent_requests: Arc<ConsentRequestDao>,
+    /// FR-129 A1 — device pairings (`/api/pair/*`): the row is the whole
+    /// state of a pairing, so start, approve and poll may land on
+    /// different pods. Holds a device-code HASH and never a token.
+    pub device_pairings: Arc<DevicePairingDao>,
+    /// FR-129 A1 — every pairing decision, granted or refused.
+    pub pairing_audit: Arc<PairingAuditDao>,
+    /// FR-129 A1 — `start` per client address per hour, on top of the
+    /// governor. Per pod, in memory: an abuse ceiling, not the boundary.
+    pub pairing_start_limiter: Arc<WindowLimiter<std::net::IpAddr>>,
+    /// FR-129 A1 — misses (a lookup, deny or approval that named no live
+    /// pairing, or an approval the gate refused) per account per hour; at
+    /// the ceiling that account's lookups, approvals and denials answer
+    /// 429 for the rest of the hour. Per pod, in memory.
+    pub pairing_miss_limiter: Arc<WindowLimiter<ObjectId>>,
+    /// FR-129 A1 (F4) — the refusals an anonymous caller can repeat at
+    /// will are written to `pairing_audit` once per `(action, reason,
+    /// address)` per hour; this remembers which sources have had their
+    /// row. Per pod, in memory, bounded (`pairing::AUDIT_DEDUPE_MAX_KEYS`).
+    pub pairing_audit_dedupe: Arc<WindowLimiter<(&'static str, &'static str, std::net::IpAddr)>>,
     /// Fleet-RPC attempt log — every exec, allowed or denied.
     pub exec_audit: Arc<ExecAuditDao>,
     /// FR-94 — commands waiting for a Windows device's SYSTEM service to
@@ -113,6 +142,9 @@ pub struct FleetState {
     /// outsiders, and every refusal. The server's own record, never the
     /// session's.
     pub external_rc_audit: Arc<ExternalRcAuditDao>,
+    /// FR-52 P5 — who has come in from outside, per device, for as long as the
+    /// org lasts: "first ever" and a revocation both outlive the audit's TTL.
+    pub external_principals: Arc<ExternalPrincipalDao>,
     /// Remote-config decisions (`docs/remote-config.md`): what was ASKED for
     /// on a device, granted or refused — never what the device did.
     pub config_audit: Arc<ConfigAuditDao>,
@@ -286,9 +318,15 @@ impl Module for FleetState {
             agent_crashes: Arc::new(AgentCrashDao::new(db)),
             agent_logs: Arc::new(AgentLogDao::new(db)),
             consent_requests,
+            device_pairings: Arc::new(DevicePairingDao::new(db)),
+            pairing_audit: Arc::new(PairingAuditDao::new(db)),
+            pairing_start_limiter: Arc::new(WindowLimiter::hourly()),
+            pairing_miss_limiter: Arc::new(WindowLimiter::hourly()),
+            pairing_audit_dedupe: Arc::new(WindowLimiter::hourly()),
             exec_audit: Arc::new(ExecAuditDao::new(db)),
             exec_pending: Arc::new(ExecPendingDao::new(db)),
             external_rc_audit: Arc::new(ExternalRcAuditDao::new(db)),
+            external_principals: Arc::new(ExternalPrincipalDao::new(db)),
             config_audit: Arc::new(ConfigAuditDao::new(db)),
             keep_busy_events: Arc::new(KeepBusyEventDao::new(db)),
             rc_hub,
@@ -316,11 +354,27 @@ impl Module for FleetState {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    for entry in tokens.iter() {
-                        let (agent_id, token) = (*entry.key(), entry.value().clone());
+                    // The KEYS, snapshotted; never the live iterator: it holds
+                    // its shard's guard, and this loop awaits Redis per agent,
+                    // so an agent arriving or leaving meanwhile (a write to
+                    // that shard) would park a tokio worker THREAD for the
+                    // round trip. Two of them on a 2-CPU pod and the runtime
+                    // stops (FR-127 P1.1; `clippy.toml` at the root holds the
+                    // rule).
+                    let agents: Vec<ObjectId> = tokens.iter().map(|entry| *entry.key()).collect();
+                    for agent_id in agents {
                         if !hub.is_agent_online(agent_id) {
                             continue;
                         }
+                        // The token is read live, right before its refresh, as
+                        // the iterator read it: `refresh_if_mine` re-sets a
+                        // missing key, so refreshing a token released since the
+                        // snapshot would resurrect its record, and a reconnect
+                        // on this pod carries a new token that the stale one
+                        // would report as a foreign owner.
+                        let Some(token) = tokens.get(&agent_id).map(|t| t.value().clone()) else {
+                            continue;
+                        };
                         let key = roomler_core::cluster::directory::agent_key(&agent_id.to_hex());
                         match dir.refresh_if_mine(&key, &token, 90).await {
                             Ok(true) => {}
@@ -411,11 +465,17 @@ impl Module for FleetState {
                 "/{agent_id}/external-access-policy",
                 put(external_access::set_policy),
             )
-            // FR-52 §5 — mint or rotate the connect code an outsider names
-            // this device by. Rotation IS the revocation story for a leak.
+            // FR-52 §5 — read, mint or rotate the connect code an outsider
+            // names this device by. Rotation IS the revocation story for a leak.
             .route(
                 "/{agent_id}/connect-code",
-                post(external_access::rotate_connect_code),
+                get(external_access::get_connect_code).post(external_access::rotate_connect_code),
+            )
+            // FR-52 P5 — bar a person from this device, or let them back.
+            // MANAGE_AGENTS to bar, + REMOTE_CONTROL to let back (gate 2's rule).
+            .route(
+                "/{agent_id}/external-principals/{user_id}",
+                put(external_access::set_principal),
             )
             // Remote config — records an INTENT for the device to reconcile.
             .route(
@@ -435,6 +495,7 @@ impl Module for FleetState {
             get(external_access::get_settings).put(external_access::set_enabled),
         );
         let external_rc_audit = Router::new().route("/", get(external_access::audit));
+        let external_principals = Router::new().route("/", get(external_access::principals));
         let exec_settings = Router::new().route(
             "/",
             get(agent_exec::get_org_settings).put(agent_exec::set_org_settings),
@@ -515,6 +576,10 @@ impl Module for FleetState {
         // `/{platform}/health` and is refused there as before.
         let public_setup = Router::new()
             .route("/latest-release", get(setup_release::setup_latest_release))
+            // FR-129 B1-s — the switches a client reads before offering an
+            // install path (`pairing`, the daemon switch per OS, `wizard_pairing`);
+            // static, so it wins over `/{platform}` like the others.
+            .route("/features", get(setup_release::setup_features))
             .route("/install.sh", get(setup_release::install_script_sh))
             .route("/install.ps1", get(setup_release::install_script_ps1))
             .route(
@@ -532,11 +597,27 @@ impl Module for FleetState {
         // the release workflows on every published tag.
         let releases = Router::new().route("/refresh", post(releases::refresh));
 
+        // FR-129 A1 — device pairing. `start` and `poll` are public (the
+        // device code is the credential); `lookup`, `approve` and `deny`
+        // take the signed-in person (`AuthUser`, read after the kill switch
+        // so a disabled server answers 404 to everyone). Every route is the
+        // empty 404 while `[pairing] enabled = false`.
+        let pair = Router::new()
+            .route("/start", post(pairing::start))
+            .route("/poll", post(pairing::poll))
+            .route("/lookup", post(pairing::lookup))
+            .route("/approve", post(pairing::approve))
+            .route("/deny", post(pairing::deny));
+
         Router::new()
             .nest("/tenant/{tenant_id}/agent", agent)
             .nest("/tenant/{tenant_id}/exec-audit", exec_audit)
             .nest("/tenant/{tenant_id}/external-access", external_access)
             .nest("/tenant/{tenant_id}/external-rc-audit", external_rc_audit)
+            .nest(
+                "/tenant/{tenant_id}/external-principals",
+                external_principals,
+            )
             .nest("/tenant/{tenant_id}/exec-settings", exec_settings)
             .nest("/tenant/{tenant_id}/keep-busy-settings", keep_busy_settings)
             .nest("/tenant/{tenant_id}/keep-busy-history", keep_busy_history)
@@ -550,15 +631,50 @@ impl Module for FleetState {
             .nest("/tunnel", public_tunnel_release)
             .nest("/setup", public_setup)
             .nest("/releases", releases)
+            .nest("/pair", pair)
             .with_state(self.clone())
     }
 
-    /// The twelve collections this module owns. The first eight specs are the
-    /// ones the db crate's plan held before P5a, unchanged; `keep_busy_events`
-    /// (FR-92 P7), `exec_pending` (FR-94), `enroll_token_issued` (FR-102 P3)
-    /// and `setup_diagnostics` (FR-102 P3b) were born here.
+    /// The fourteen collections this module owns. The first eight specs are
+    /// the ones the db crate's plan held before P5a, unchanged;
+    /// `keep_busy_events` (FR-92 P7), `exec_pending` (FR-94),
+    /// `enroll_token_issued` (FR-102 P3), `setup_diagnostics` (FR-102 P3b),
+    /// `device_pairings` and `pairing_audit` (FR-129 A1) were born here.
     fn indexes(&self) -> Vec<IndexSet> {
         vec![
+            // FR-129 A1 — device pairings. The hash is the poll's lookup and
+            // unique; the user code is unique only among PENDING rows (the
+            // partial index), so a code is free again once its pairing is
+            // decided, and `start` regenerates on a collision. The TTL on
+            // `expires_at` only tidies: every read compares the clock itself,
+            // because the monitor passes every 60 s (a row lingers up to 60 s).
+            IndexSet {
+                collection: roomler_ai_db::models::DevicePairing::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index_unique(bson::doc! { "device_code_hash": 1 }),
+                    index_unique_partial(
+                        bson::doc! { "user_code": 1 },
+                        bson::doc! { "status": "pending" },
+                    ),
+                    index_ttl(bson::doc! { "expires_at": 1 }, 0),
+                ],
+            },
+            // FR-129 A1 — every pairing decision, granted or refused. 90 days
+            // like the other decision logs; never a device code or a token.
+            IndexSet {
+                collection: roomler_ai_db::models::PairingAuditEvent::COLLECTION,
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index(bson::doc! { "pairing_id": 1, "at": -1 }),
+                    index(bson::doc! { "tenant_id": 1, "at": -1 }),
+                    index(bson::doc! { "user_id": 1, "at": -1 }),
+                    index_ttl(
+                        bson::doc! { "at": 1 },
+                        roomler_ai_db::models::PairingAuditEvent::TTL_SECS,
+                    ),
+                ],
+            },
             IndexSet {
                 collection: "consent_requests",
                 pre_ops: Vec::new(),
@@ -664,6 +780,17 @@ impl Module for FleetState {
                     index(bson::doc! { "agent_id": 1, "at": -1 }),
                     index(bson::doc! { "tenant_id": 1, "user_id": 1, "at": -1 }),
                     index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+                ],
+            },
+            // FR-52 P5 — one row per person per device, and no TTL: "first ever"
+            // must outlive the audit log. The unique index is what arbitrates
+            // two first sessions on two pods.
+            IndexSet {
+                collection: "external_principals",
+                pre_ops: Vec::new(),
+                indexes: vec![
+                    index_unique(bson::doc! { "agent_id": 1, "user_id": 1 }),
+                    index(bson::doc! { "tenant_id": 1, "last_session_at": -1 }),
                 ],
             },
             IndexSet {

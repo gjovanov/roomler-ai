@@ -685,6 +685,21 @@ describe('useAgentStore', () => {
     )
   })
 
+  it("reads one device's connect code, and lets a failed read throw", async () => {
+    const s = useAgentStore()
+    mockApi.get.mockResolvedValueOnce({ connect_code: 'K7Q2-9XM4-TB3F' })
+    await expect(s.fetchConnectCode(TENANT_ID, 'a1')).resolves.toBe('K7Q2-9XM4-TB3F')
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/agent/a1/connect-code`)
+
+    mockApi.get.mockResolvedValueOnce({ connect_code: null })
+    await expect(s.fetchConnectCode(TENANT_ID, 'a1')).resolves.toBeNull()
+
+    // "Could not read it" must not look like "there is none": that one offers
+    // Create, and Create replaces a code.
+    mockApi.get.mockRejectedValueOnce(new Error('503'))
+    await expect(s.fetchConnectCode(TENANT_ID, 'a1')).rejects.toThrow('503')
+  })
+
   it('saving an external-access policy writes it back onto the agent row', async () => {
     // The dialog PUTs the WHOLE shape, so the store must keep the saved policy
     // — a stale row would reopen the dialog on the old ceiling and the next
@@ -911,6 +926,38 @@ describe('useAgentStore', () => {
 
     const [, body] = mockApi.put.mock.calls.at(-1)!
     expect(body).toEqual({ fps_deny: 'hevc_qsv:120' })
+  })
+
+  it('FR-130 — updateDesiredConfig sends a colour-description clear as an empty string', async () => {
+    // `''` asks the device to clear its key, back to the built-in default;
+    // dropped as falsy, it would become "not managed", and a device pushed
+    // `off` would stay off.
+    mockApi.put.mockResolvedValueOnce({
+      revision: 3,
+      desired: { revision: 3, color_description: '' },
+    })
+    const s = useAgentStore()
+    s.agents = [mkAgent()]
+    await s.updateDesiredConfig(TENANT_ID, 'a1', { color_description: '' })
+
+    const [, body] = mockApi.put.mock.calls.at(-1)!
+    expect(body).toEqual({ color_description: '' })
+    expect(s.agents[0]!.remote_config!.desired.color_description).toBe('')
+  })
+
+  it('FR-132 — updateDesiredConfig carries the GPU-input denylist as given, and keeps what the server stored', async () => {
+    mockApi.put.mockResolvedValueOnce({
+      revision: 4,
+      desired: { revision: 4, zero_copy_deny: 'hevc_qsv:gpu, av1_nvenc:gpu' },
+    })
+    const s = useAgentStore()
+    s.agents = [mkAgent()]
+    await s.updateDesiredConfig(TENANT_ID, 'a1', { zero_copy_deny: 'hevc_qsv:gpu, av1_nvenc:gpu' })
+
+    const [, body] = mockApi.put.mock.calls.at(-1)!
+    expect(body).toEqual({ zero_copy_deny: 'hevc_qsv:gpu, av1_nvenc:gpu' })
+    expect('zero_copy' in (body as object)).toBe(false)
+    expect(s.agents[0]!.remote_config!.desired.zero_copy_deny).toBe('hevc_qsv:gpu, av1_nvenc:gpu')
   })
 
   it('a saved request is optimistically PENDING, never applied', async () => {

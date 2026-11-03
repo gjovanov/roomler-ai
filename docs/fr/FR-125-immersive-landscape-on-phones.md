@@ -3,7 +3,7 @@
 **Issue:** [#2947](https://github.com/gjovanov/roomler-ai/issues/2947) · **Status:** on production since
 2026-10-26 13:45Z (`hosted-20261026-6257ff2`). AC1–AC5 and AC7 are field-verified there (§8); open for AC6, the
 operator's own phones ·
-**Owner:** the web app (UI) · **Anchors:** master `a350082a8` · **Builds on:**
+**Owner:** the web app (UI) · **Anchors:** master `7b576a6ac` · **Builds on:**
 [FR-116](FR-116-phone-and-tablet-parity.md) (its D3), [FR-120](FR-120-phone-parity-part-2.md) (D3 carried, D1's
 36 px targets, D4's full-screen Settings) and [FR-111](FR-111-touch-controls.md) (the touch presets)
 
@@ -58,7 +58,7 @@ The presets place controls at fixed distances from the stage's edges:
 | Arrows | PgUp … Esc, a column 16 px above the bottom (`touchControls.ts:166`): 16 + 5 × 44 + 4 × 6 | **260 px** | by 6–114 px |
 | Office keys | one row 12 px above the bottom | 56 px | fits |
 
-The stage card clips (`.remote-stage-card { overflow: hidden }`, `RemoteControl.vue:5583-5584`). A control past the stage's top edge is cut off, and it cannot be reached.
+The stage card clips (`.remote-stage-card { overflow: hidden }`, `RemoteControl.vue:5656-5657`). A control past the stage's top edge is cut off, and it cannot be reached.
 
 On an iPhone 14 with WASD, Fire and Aim are gone and only Jump shows; at 740 × 304 the d-pad and the stick lose their top edges too. Measured in a live session, P1's field run, §8.
 
