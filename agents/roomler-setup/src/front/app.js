@@ -1772,9 +1772,11 @@ function renderInstall() {
 
   // Progress bar visible only while a download is active.
   const downloadStarted = installRows.has("DownloadStarted");
-  // #3246 — a release with no digest sends only the publisher's row.
+  // #3246 — a release with no digest sends only the publisher's row, and a
+  // refused download sends neither: the bar must not outlive the refusal.
   const downloadVerified = installRows.has("DownloadVerified") || installRows.has("PublisherVerified");
-  document.getElementById("install-progress").hidden = !(downloadStarted && !downloadVerified);
+  document.getElementById("install-progress").hidden =
+    !(downloadStarted && !downloadVerified) || !!state.installError;
 
   // FR-129 B1: the halves' output, and the terminal fallback.
   renderScriptOutput();
