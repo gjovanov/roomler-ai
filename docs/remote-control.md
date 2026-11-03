@@ -425,6 +425,14 @@ device found, in probe order, and that connect names them, so the Hub checks eac
 
 The portal path, and macOS's Screen Recording grant, produce a system permission prompt the *first* time. That's a feature, not a bug — it's the user consent layer. The Linux arms, their order and their gates are [`linux-capture.md`](linux-capture.md).
 
+> ⚠️ **The end of a WGC capture must not end the apartment** (FR-85). The WGC worker joins the MTA and leaves it
+> when its session closes. If that was the process's last MTA thread, COM unloads `GraphicsCapture.dll`, and
+> whatever still runs in that module faults: `0xc0000005` in `GraphicsCapture.dll_unloaded`. So
+> `wgc_backend::pin_mta` takes `CoIncrementMTAUsage` once per process and never
+> gives it back. Measured on 0.4.197: a recorder child faulted during its remux and lost the recording
+> (`docs/recording.md` §5), while a session's worker still held the module after five closed sessions, because
+> something else holds the MTA there.
+
 ### 5.1a When capture cannot open, the session says why (FR-80)
 
 A capture backend that cannot open does not fail the session: the cascade
