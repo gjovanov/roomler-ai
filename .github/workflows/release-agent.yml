@@ -1743,9 +1743,16 @@ jobs:
           }
           $kb = [math]::Round((Get-Item target\release\roomler-shim.exe).Length/1KB, 0)
           Write-Host "Staged roomler-shim.exe ($kb KB, installs as roomler.exe) for the TunnelExe component"
+          # #3292: the windowless launcher the per-user Scheduled Task runs. The
+          # per-user wxs references it at harvest time.
+          cargo build -p roomlerdw --release
+          if (-not (Test-Path target\release\roomlerdw.exe)) {
+            Write-Host "::error::roomlerdw.exe not produced — the LauncherExe wxs component would fail the MSI harvest (LGHT0103)"
+            exit 1
+          }
 
-      # FR-6 wave 29, as in build-linux. A reused roomlerd.exe/roomler-shim.exe
-      # may still carry the rehearsal's signature (signing below is in place).
+      # FR-6 wave 29, as in build-linux. A reused roomlerd.exe/roomler-shim.exe/
+      # roomlerdw.exe may still carry the rehearsal's signature (signing below is in place).
       # Authenticode `sign` REPLACES it, and the signing action's verify step
       # checks the signer subject, so the tag ships only its own signature.
       - name: Stamp the seed with the tree this build compiled
@@ -1832,7 +1839,7 @@ jobs:
       #
       # Both wxs files reference target\release\{roomlerd,roomler-shim}.exe by
       # literal path and BOTH cargo-wix runs are --no-build, so signing once
-      # here covers the perUser AND perMachine MSIs.
+      # here covers the perUser AND perMachine MSIs. roomlerdw.exe is perUser's.
       #
       # Placement is load-bearing on both sides:
       #   * AFTER encoder-smoke, so a broken FFmpeg link fails the job before
@@ -1854,6 +1861,7 @@ jobs:
           files: |
             target\release\roomlerd.exe
             target\release\roomler-shim.exe
+            target\release\roomlerdw.exe
           description:              'Roomler Daemon'
           mode:                     ${{ github.event.inputs.signing_mode || 'auto' }}
           require:                  ${{ needs.validate-version.outputs.is_release == 'true' || github.event.inputs.require_signing == 'true' }}
@@ -2073,8 +2081,10 @@ jobs:
             param([string]$Dir, [switch]$Quiet)
             $found    = @()
             $appLocal = @()
-            foreach ($exe in @('roomlerd.exe', 'roomler.exe')) {
+            foreach ($exe in @('roomlerd.exe', 'roomler.exe', 'roomlerdw.exe')) {
               $path = Join-Path $Dir $exe
+              # #3292: the launcher is per-User's alone, and the loop below requires it there.
+              if ($exe -eq 'roomlerdw.exe' -and -not (Test-Path $path)) { continue }
               if (-not (Test-Path $path)) { $found += "$exe missing from the MSI payload"; continue }
               $imports = & $dumpbin /dependents $path |
                 Select-String -Pattern '^\s{4}(\S+\.dll)$' |
@@ -2121,6 +2131,9 @@ jobs:
             if (-not $hit) { throw "roomlerd.exe not found in the extracted $($f.Name) payload" }
             $installDir = $hit.DirectoryName
             Write-Host "  payload dir: $($installDir.Substring($out.Length))"
+            if ($f.Name -eq 'per-User' -and -not (Test-Path (Join-Path $installDir 'roomlerdw.exe'))) {
+              throw "roomlerdw.exe not found in the per-User payload: the Scheduled Task would open a terminal (#3292)"
+            }
 
             $r = Audit-Dir -Dir $installDir
             if ($r.Problems.Count -gt 0) {

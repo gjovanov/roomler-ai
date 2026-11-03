@@ -96,7 +96,7 @@ which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
 - `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:396`);
-- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1555`).
+- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1556`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
@@ -134,7 +134,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3776`, `crates/agent-core/src/config.rs:4171`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3790`, `crates/agent-core/src/config.rs:4171`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:634`, `:966`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -462,7 +462,7 @@ serving its zip. One wizard, four roles:
 | Wizard role | What it installs | Runs as |
 |---|---|---|
 | **Daemon — system** | perMachine MSI + SystemContext enabled | SCM service `Roomler` (LocalSystem) — controls lock screen, UAC, pre-logon |
-| **Daemon — per user** | perUser MSI | Scheduled Task `Roomler` at logon (limited) |
+| **Daemon — per user** | perUser MSI | Scheduled Task `Roomler` at logon (limited), with no window: [what the task runs](#what-the-per-user-scheduled-task-runs-3292) |
 | **Daemon — machine (attended)** | perMachine MSI | SCM service, no SystemContext |
 | **Tunnel client** | CLI archive + PATH entry | on demand |
 
@@ -538,6 +538,183 @@ Details worth knowing:
   [`overlay-wfp.md`](./overlay-wfp.md)). The perUser flavour cannot elevate
   and is unchanged.
 
+### What the per-user Scheduled Task runs (#3292)
+
+```mermaid
+flowchart LR
+    TS["Task Scheduler<br/>logon · OS start · after a registration"] --> W["roomlerdw.exe<br/>windows subsystem, no console<br/>kill-on-close job"]
+    W -->|"CREATE_NO_WINDOW<br/>stdio NUL"| D["roomlerd.exe run --supervisor task"]
+    D -->|"stderr: same file<br/>(capped per day)"| L[("roomlerd.log.YYYY-MM-DD")]
+    D -->|"tracing"| L
+    D -->|"spawns, outside the job"| M["msiexec, watcher,<br/>companion, session shells"]
+```
+
+`roomlerd.exe` is a console program and stays one: `enroll`, `service` and the
+diagnostics answer on the terminal they were run from. Task Scheduler gives a console
+program started with an interactive token a new console, so until #3292 a per-user
+daemon kept a terminal of raw logs on the person's desktop, and closing it stopped the
+device. Now the task runs `roomlerdw.exe` (`agents/roomlerdw/src/main.rs`), which has no
+console, passes its arguments on, and leaves with the daemon's exit code.
+
+| What | Behaviour | Why |
+|---|---|---|
+| The task's `Running`, `IgnoreNew`, `LastTaskResult` | Unchanged: the launcher stays until the daemon exits, with its code | Task Scheduler watches the process it started |
+| `schtasks /End` | Ends the launcher, whose kill-on-close job takes the daemon | Measured without the job: `/End` says success, the task reads `Ready`, the daemon runs on |
+| What the daemon spawns | Outside that job (`SILENT_BREAKAWAY_OK`, `BREAKAWAY_OK`) | `msiexec` and its watcher have to outlive the daemon on an update |
+| Sign-out | The launcher is shut down last (`SetProcessShutdownParameters`) | Otherwise it could take the daemon down through the job before its `WM_ENDSESSION` |
+| stderr | The rolling log, the same dated file tracing writes; `NUL` past 256 MiB in a day | A panic, a stack overflow and FFmpeg print only there; the launcher must not create the log folder (`appdirs::use_old_segment`) |
+| stdout | `NUL` | Tracing only, and the rolling log has the same events |
+| The MSI's custom actions, the Start menu entry | Run through the launcher too | Each opened a terminal in the foreground |
+| The default terminal | No window with Windows Terminal or `conhost` | `CREATE_NO_WINDOW` makes no console to show. Measured a start and a repair with the default set to `conhost` |
+| A running daemon, at an upgrade or an uninstall | The MSI stops it. An uninstall: `StopDaemon`, a plain `service stop`, before `UnregisterAutostart`. An upgrade: `StopOldDaemon`, `service stop --for-upgrade`, from the new product after `InstallFiles`, so it also reaches a daemon from a release without these actions | Restart Manager does not: the daemon declines its `ENDSESSION_CLOSEAPP` on purpose ([`ephemeral-nodes.md`](./ephemeral-nodes.md)), and the log still says "Successfully shut down all applications", with no event 10002. Measured from 0.4.196 to 0.4.197 by hand: the old daemon ran on until the next sign-in, and an uninstall left it running with its files gone, both with exit 0 |
+
+**A self-update whose install succeeds brings the device back by itself.** The daemon has
+exited for the installer, and registering the task is all the MSI's custom action does. So
+`service install`, when a config exists, adds one-shot `<TimeTrigger>`s one, three and ten
+minutes on (`start_soon_triggers`, `agents/roomlerd/src/service.rs`). With `IgnoreNew`
+the later ones do nothing once the daemon is up, and `StartWhenAvailable` keeps them
+through a sleep. A fresh MSI has no config and starts nothing. A `service stop` inside
+those ten minutes can therefore be undone once, and a device removed inside them gets
+one more start, which hears the server's goodbye and leaves again with exit 7, as the
+next sign-in's start would (measured, a start with the row already gone). An install that
+fails is the section [below](#when-a-per-user-upgrade-fails).
+
+**The first update onto the launcher looks a little different.** It runs the old
+product's table and the old daemon's own console: one terminal can flash when the old
+`UnregisterAutostart` runs, and nothing after that. From a launcher release onward nothing
+is shown. Measured on both jumps.
+
+**A machine whose AppLocker policy refuses the launcher keeps the console window.** The
+launcher is a file of its own, so a rule that allows `roomlerd.exe` by path refuses it:
+MSI exit 0, the task failing `0x800704EC` each minute, an 8004 event each time, the row
+offline for good (measured on a policy that lets only `roomlerd.exe` start). No custom
+action can tell, because the installer's token is `SANDBOX_INERT`, which AppLocker does not
+check: the blocked launcher ran all of them. A task is the one start with the token the
+real task gets. So `service install`, only where the compiled policy
+`%SystemRoot%\System32\AppLocker\Exe.AppLocker` exists, starts the launcher with `--version`
+through a throwaway task, `Roomler launcher check`, and reads its
+`LastTaskResult` for at most ten seconds (the answer was there in 0.6 s). `0x800704EC`
+means the real task names `roomlerd.exe`: a console window a person can close, on a device
+that is online. Any other answer keeps the launcher, so a person who is not signed in at
+that moment gets the launcher, and the block, until the next registration. Once the policy
+allows the launcher, the next update takes the window away.
+
+**`last-install.json` can stay at `InProgress` on a self-update.** The staged watcher
+holds the install folder's VC runtime through `PATH`, and Restart Manager can shut it down
+(event 10002) before it writes a verdict: read on both jumps, while another
+launcher-to-launcher update read `SucceededVerified`. Nothing reads the file, and the
+device comes back either way.
+
+**A resume from sleep needs no start.** The processes sleep with the machine and carry
+on, with the same process ids: after a hibernate the row was back online 13 s after the
+resume, and no terminal appeared. The task's second trigger is `Kernel-General` event 12,
+an OS start, which does not fire on a resume. S3 and Modern Standby are unread: the test
+guest offers only S4.
+
+⚠️ **The task is not a supervisor.** `<RestartOnFailure>` restarted nothing after exit 1
+or after `0xC000013A`, five minutes on, with `Count` 10 and `PT1M` registered. A
+per-user daemon that crashes stays down until the next sign-in or `roomlerd service
+start` (#3295). It does retry a start that could not begin at all: with a task naming a
+missing launcher it fired each minute, answering `0x80070002`.
+
+**Known gaps of the launcher**, each small enough to name and not to build yet:
+
+| Gap | What a person sees | Why it stands |
+|---|---|---|
+| The launcher cannot start the daemon: an EDR holds the replaced file at logon | Offline until the next sign-in; `LastTaskResult` 127 is the only trace | `<RestartOnFailure>` sees the launcher's start, and the launcher did start. A short retry belongs with #3295 |
+| A hand upgrade while the daemon is still starting | The stop event does not exist yet, so nothing stops it: the daemon runs on renamed files, and the one-shots exit 8, until the next sign-in | The window is the seconds before `run_cmd`'s last `select!`. `installer-smoke` waits 45 s for it |
+| A disk that is full at the day's log roll | The file log stays silent until the next start | `tracing-appender` prints that failure on stderr, which is now a file on the same disk, and its thread dies of it |
+| WDAC, or an EDR that quarantines the launcher | The AppLocker check answers nothing for them, so the launcher stays, and the row is offline | The check reads AppLocker's rules; a second kind of probe is not worth its code before one is seen in the field |
+| The Start menu entry on a machine that refuses the launcher | "Blocked by group policy" | It names the launcher, and the MSI cannot tell at build time |
+
+**Unread: Windows 10.** Every read above is on Windows 11. An older `ucrtbase.dll` may buffer a
+redirected stderr, and then the last lines before a crash die with it.
+`logging::tests::stderr_capture` on a Windows 10 guest settles it.
+
+#### When a per-user upgrade fails
+
+`RemoveExistingProducts` runs before any file of the new product, so by the time anything
+can fail the old product's `UnregisterAutostart` has deleted the task, and past
+`StopOldDaemon` the daemon has gone too. A rollback restores the old files. Nothing
+restored the task until #3292, because the old table has no rollback action of its own.
+
+| Failure, measured on signed candidates by a forced failing action | Before | Now |
+|---|---|---|
+| From a release before the launcher, after `StopOldDaemon` | Exit 1603, old files, **no task, no daemon, row offline** | Exit 1603, old files, the old task back, the old daemon started by `DaemonBackOnRollback` within a second, row online on the old version |
+| The same, just before `InstallFinalize` | Exit 1603, old files, **a task naming a launcher the rollback removed** (`0x80070002` each minute), row offline | The same as above: `AutostartBackOnRollback` overwrites it |
+| The same, before `InstallFiles` | Exit 1603, old files, **no task**. The old daemon was never stopped, so the row stays online until the next sign-in, when nothing starts it | Exit 1603, old files, the old task back. `DaemonBackOnRollback`'s start answers 8, because the old daemon still runs. Row online on the old version |
+| From a release with the launcher, after `StopOldDaemon` | Exit 1603, old files, **no task, no daemon, row offline** | The same as the first row, on the launcher |
+| From a release with the launcher, just before `InstallFinalize` | Exit 1603, old files, the restored task, whose one-shot starts the daemon a minute on | The same device, with the daemon back within a second |
+
+`AutostartBackOnRollback` and `DaemonBackOnRollback` (`agents/roomlerd/wix/main.wxs`) run
+the restored `roomlerd.exe`, the one file every release has, so the task is the one that
+release writes, and each can flash a terminal, on a failed upgrade only. They sit ahead
+of `RemoveExistingProducts` because a rollback plays the script backwards: the old files
+are back when they run. `service install` comes back first, because `service start` needs
+its task. An uninstall that fails gets the same pair (measured: exit 1603, "Removal failed", the
+daemon back within a second, row online). `InstallExecute` sits between them and
+`RemoveExistingProducts`, because that action refuses to run with anything spooled ahead of
+it: `Error 2613`, exit 1603, on every upgrade, healthy ones included (measured on signed
+candidates; ICE63 only warns). It flushes those two and nothing else, so the old product's
+removal still comes before any new file. `installer-smoke` holds the order against the
+built MSI, because WiX orders actions that share a parent by itself.
+
+**An install that never reaches its script has no rollback.** `msiexec` exits 1618 while
+another install holds the machine's mutex, so on a self-update the daemon has left and no
+action ran. `start_user_daemon_after_a_failure` (`agents/roomlerd/src/post_install.rs`)
+starts the task on a failed verdict. It runs in the watcher of the release being updated
+FROM, so the first update onto it does not have it: that device stays down until the next
+sign-in.
+
+**A standard user's rollback cannot restore the Installer's own registration.** The files
+come back and the registration does not: the rollback's registry opens under
+`HKU\<SID>\Software\Microsoft\Installer\Products` and
+`HKLM\…\Installer\UserData\<SID>\Products` answer error 5, and the MSI log counts about 166
+`Error in rollback skipped`. The failed product stays registered, with its cached package
+deleted. The released tables do the same, so this is older than #3292.
+
+| After, measured on signed candidates | The Installer's products (`ProductsEx`) | Apps & Features | What runs |
+|---|---|---|---|
+| A healthy upgrade | 1: the new version | 1: the new version | The new version |
+| A failure past `InstallFiles` | 2: the failed version (installed, no package), the old one (advertised, no version) | 1: **the failed version, which is not what runs** | The old version |
+| A failure before `InstallFiles` | 1: the old one (advertised, no version) | **None** | The old version |
+| A failed uninstall | 1: the product (advertised, no version) | **None** | The same version |
+| The next release over a failure past `InstallFiles`, by the updater | 3: the new version, the failed one, the old one | 2: the failed version, the new one | The new version |
+| The next release over a failure before `InstallFiles`, by the updater | 2: the new version, the old one (advertised) | 1: the new version | The new version |
+| A failure inside the old product's removal | 1: the new version | 1: the new version | The new version |
+| A cached package deleted from `C:\Windows\Installer`, then the next release by the updater | 2: the new version, the old one (installed, no package) | 2: the old version, the new one | The new version |
+
+**`IgnoreRemoveFailure` keeps such a device updating.** Without it the next release's
+`RemoveExistingProducts` finds a product with no package and stops the install: Error 1714,
+System Error 1612, exit 1603, on every release from then on. A cached package deleted from
+`C:\Windows\Installer` does the same to a healthy machine, and on a self-update the device
+also stays offline, because the daemon has left (measured to +6 min, on a watcher without the
+start above). With it that 1612 is ignored, and a self-update lays the new files, the task
+and the one-shots as usual (measured from the released 0.4.197's updater and from a release
+with the attribute). A daemon still on its way out when the copy reaches `roomlerd.exe` makes
+that exit 3010, with the file replaced in use and the row online on the new version in 15 s;
+the watcher records 3010 as `InstallerFailed` (#3340). A failure inside the old product's
+removal is ignored too: its table has already unregistered it and nothing is played back, so
+the install carries on to exit 0 and one product. Without the attribute that failure was exit
+1603, no Apps entry and no task.
+
+What it does not do:
+
+- **It does not remove the stale entry.** The entry stays through every later release. A
+  person's Uninstall of it answers 1612 and changes nothing, because its package is gone.
+  Uninstalling the current entry stops the daemon and removes the task, and the stale
+  product keeps the files it shares with that release in the folder.
+- **It does not help a hand upgrade with the daemon running.** The old product did not leave
+  and `StopOldDaemon` comes after `InstallFiles`, so `roomlerd.exe` is in use: Error 1310,
+  exit 1603, no change, row online on the old version. `roomlerd service stop` first, and it
+  goes through.
+- **It does not help the failed version again.** That answers 1612, so an updater retrying the
+  same release gets that until a newer one publishes.
+  `start_user_daemon_after_a_failure` has the device back in seconds; on the first update
+  onto it, the device stays down until the next sign-in.
+
+The per-machine table has no such attribute, and none of this was read on it.
+
 ### What an MSI run does to the `Roomler` service
 
 Every perMachine MSI run that is not an uninstall runs **RegisterService**
@@ -610,7 +787,7 @@ sequenceDiagram
 
 **Auto-updates and upgrades** (the open question in #3115). The updater does
 not stop the service before it runs msiexec. `spawn_installer_with_watch`
-(`agents/roomlerd/src/updater.rs:1891`) launches `msiexec /i … /qn` elevated
+(`agents/roomlerd/src/updater.rs:1892`) launches `msiexec /i … /qn` elevated
 (`:2236`, `:2636`) while the service runs; the worker that launched it exits 0,
 and its host stays up (`:593`). Measured on a vmtest Win11 cell, released code,
 with each stop held to the field's 7.8 s:
@@ -773,7 +950,7 @@ alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives fro
 the binary's symbols.
 
 Neither floor can strand a running daemon on the updater's offline `dpkg --install`
-rung (`agents/roomlerd/src/updater.rs:2299`), which is the reason libva and
+rung (`agents/roomlerd/src/updater.rs:2300`), which is the reason libva and
 `iproute2` stay out of `depends`. A host where the daemon runs already has the real
 library and OpenSSL, because without them it cannot start. A healthy install
 upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,
@@ -1418,7 +1595,7 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3414`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3428`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
@@ -1659,7 +1836,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2177`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2191`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

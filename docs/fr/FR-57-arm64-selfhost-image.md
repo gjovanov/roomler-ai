@@ -78,14 +78,32 @@ recorded result rather than a silent gap.
 
 ## Acceptance criteria
 
-- [ ] `docker manifest inspect ghcr.io/gjovanov/roomler-ai:<tag>` lists **both**
+- [x] `docker manifest inspect ghcr.io/gjovanov/roomler-ai:<tag>` lists **both**
       `linux/amd64` and `linux/arm64`
-- [ ] the arm64 image is smoke-tested **on an arm64 runner** — `/health` 200 and
+      *Verified anonymously against the registry for `v0.4.45` and `latest`, and
+      re-read 2026-11-02: `:latest` is a manifest list naming both.*
+- [x] the arm64 image is smoke-tested **on an arm64 runner** — `/health` 200 and
       the SPA served, not merely built
+      *Native `ubuntu-24.04-arm`: built + smoke 15m33s, healthy after 20 s, `GET / -> 200`.*
 - [ ] an actual arm64 host pulls and runs it (`fedora-arm` is on the fleet)
-- [ ] the amd64 timings do not regress from FR-42's measured 88 s
-- [ ] `README.md` and `docs/self-hosting.md` no longer say amd64-only
-- [ ] a failing arm64 build does not block the amd64 publish, and says so
+      *Half met, and the Result declined to claim it: the image RAN on a genuine
+      aarch64 runner, but no arm64 host ever PULLED it — `fedora-arm` sits on the
+      demo mesh, unreachable from the workstation. The residual risk is narrow: a
+      manifest that resolves for an anonymous HTTP client resolving differently
+      for a docker daemon on aarch64. One `docker pull` on an arm64 host settles it.*
+- [~] the amd64 timings do not regress from FR-42's measured 88 s
+      *By construction, not by measurement: only the publish workflow moved, and nobody
+      re-timed the clean-box path after it.*
+- [x] `README.md` and `docs/self-hosting.md` no longer say amd64-only
+      *Re-read 2026-11-02: no amd64-only wording in either; both state "linux/amd64
+      and linux/arm64".*
+- [~] a failing arm64 build does not block the amd64 publish, and says so
+      *Built that way: `fail-fast: false`, the merge on `always()`, and a warning naming
+      the missing architecture (`publish-selfhost-image.yml`). Never watched: of the last
+      29 runs, none failed on arm64 alone (read 2026-11-02; the three failures were amd64).*
+
+Evidence: [#1161 — Result, published multi-arch](https://github.com/gjovanov/roomler-ai/issues/1161#issuecomment-5499495658).
+*Three ticked and two marked partial 2026-11-02.*
 
 ## Out of scope
 
