@@ -422,7 +422,7 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2641`, `:2663`), at the clean-run promotion
+`crates/agent-core/src/config.rs:2648`, `:2670`), at the clean-run promotion
 (`record_clean_run_at`, `:2620`), at every `ConfigSet`, and at enrollment. The daemon, the
 desktop app and the setup wizard all write it through `config::save` (`:4193`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
@@ -1698,7 +1698,7 @@ handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3460`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2733`).
+back to the version that is running (`crates/agent-core/src/config.rs:2740`).
 
 ### No pipe can stall the supervisor (#3080)
 
