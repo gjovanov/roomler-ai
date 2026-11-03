@@ -65,7 +65,7 @@ runs, not what you run.
 ## Quickstart
 
 **You need** Docker with Compose v2, ~4 GB RAM, and ~10 GB disk. Below Docker Engine 29,
-a reboot can [cost you the relay until you run `up -d`](#after-a-reboot-or-a-docker-restart);
+a Docker restart can [cost you the relay until you run `up -d`](#after-a-reboot-or-a-docker-restart);
 the rest of the product comes back by itself.
 
 ```bash
@@ -291,20 +291,23 @@ bash scripts/selfhost-coturn-check.sh
 
 It starts coturn if it is not running, watches it for 30 seconds, then drives the
 image's own TURN client through the published port, with credentials minted the way
-the server mints them. It exits non-zero and names what failed.
+the server mints them. It exits non-zero and names what failed. Each run leaves 9 relay
+ports held for 13 minutes, because the client does not end what it allocates over UDP.
 
 | It says | What is wrong |
 |---|---|
 | `coturn is not staying up` | A crash loop. See below. |
 | `coturn is running outside the roomler service's namespace` | The server's process died moments ago, and coturn has not found its way back yet. See [if the server's process dies](#if-the-servers-process-dies). |
 | `no relay allocation` | Nothing answers on 3478. Check the `roomler` service's ports, and that it is running. |
+| `coturn has no free relay port` | Under any line. Allocations hold all 101 ports, so no client can get a relay until one ends. See [relay ports](#relay-ports). |
 | `coturn hands out … but its --external-ip is …` | The relay address is not the public address. Clients would be told the wrong place. |
 | `CreatePermission to the public address … is refused` | No call can use this relay: every browser asks for this first. coturn logs `A peer IP … denied in the range`, because it rewrites the public address to its own before the deny list reads it. An edited file has lost the `--allowed-peer-ip` line. |
 | `relay to relay carried nothing` | Two relayed clients cannot reach each other. |
 | `does not run in the server's network namespace` | An edited file has lost `network_mode: service:roomler`. A relay to the public address lands on coturn itself, so a call signals and carries no media. |
 | `NOT refused` | The deny list has a hole. See [what it refuses](#what-the-relay-refuses). |
+| `could not ask about` | coturn gave no answer about that peer, so this proves nothing about the deny list. The lines under it say why. |
 | `NOTE the relay address is 127.0.0.1` | Not a failure, but only this machine can use it. See [the two addresses](#the-two-addresses-to-set). |
-| `NOTE coturn was not running, so this started it` | It had stopped, and the note says why. See [after a reboot](#after-a-reboot-or-a-docker-restart). |
+| `NOTE coturn was not running, so this started it` | It had stopped, and the note says why. See [if the server is replaced](#if-the-server-is-replaced) and [after a reboot](#after-a-reboot-or-a-docker-restart). |
 | `NOTE coturn has restarted … and is not climbing` | Not a failure. Each server crash costs coturn one restart. |
 
 ### What a crash loop looks like
@@ -348,27 +351,47 @@ when Docker starts them. An owner cannot, on any engine. A separate small servic
 holding the namespace for both was the first design, and it let the relay's plumbing
 keep the whole app down: on Docker 28.5.2 a member lost in 2 of 24 daemon restarts.
 
-This costs two things.
+This costs three things, each below.
 
 ### If the server's process dies
 
 Docker brings `roomler` back in a new namespace and leaves `coturn` in the old one, with
 no address, still `running`. Nothing would ever move it: `up -d` sees nothing to do. So
 coturn's healthcheck ends it as soon as it has no address, and its restart policy brings
-it back into the new namespace. With `kill -9` of the server's process on Docker 29.1.3 and
-Compose 2.40.3, coturn was back within 20 s in 8 of 8 crashes, and the server answered
-after 10 s. coturn's `RestartCount` goes up by one each time.
+it back into the new namespace. With `kill -9` of the server's process and Compose 2.40.3,
+coturn was back within 20 s in 8 of 8 crashes on Docker 29.1.3 and within 21 s in 6 of 6 on
+28.5.2, and the server answered after about 10 s. coturn's `RestartCount` goes up by one
+each time.
 
 Run the check in that gap and it says
 `coturn is running outside the roomler service's namespace`, with the repair if it
-persists:
+persists. It leaves the server alone:
 
 ```bash
-docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost restart roomler
+docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost restart coturn
 ```
 
 `docker stop roomler` is different: coturn then has nothing to rejoin, and stays `exited`.
 A plain `up -d` brings both back.
+
+### If the server is replaced
+
+A new image or a changed setting replaces the server's container, and coturn has to be
+replaced with it, because it names that container by id. A plain `up -d` for the whole
+file does both, in order:
+
+```bash
+docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d
+```
+
+⚠️ Naming the server replaces only the server: `up -d roomler`, also with
+`--force-recreate` or `--no-deps`. coturn then stays `exited`, `docker inspect` says
+`joining network namespace of container: No such container`, and a plain
+`docker compose ps` leaves it out. The relay is dark until the `up -d` above.
+
+A plain `up -d` and `restart coturn` behaved the same on Compose 2.17.3 and 2.20.3 with
+Docker 28.5.2, and on 2.29.7 and 2.40.3 with Docker 29.1.3. Docker 29 refuses the two older
+Compose releases outright: `client version 1.42 is too old`.
 
 ### After a reboot or a Docker restart
 
@@ -384,15 +407,20 @@ shows it, and the check starts it and says why it had stopped. A plain `up -d` b
 docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d
 ```
 
-<!-- ENGINE_NUMBERS: the engines and Compose versions this ran on, with the round counts and coturn's losses. Owed by #3287's field run. -->
+Measured with the whole stack on Compose 2.40.3. On Docker 29.1.3, through 20 daemon
+restarts and 2 reboots, the server and coturn came back every time. On Docker 28.5.2, the
+server came back through 20 daemon restarts and 4 reboots, and coturn stayed
+`Exited (128)` after 4 of the restarts.
 
 ### The two addresses to set
 
 `ROOMLER_PUBLIC_IP` is what coturn tells clients its relay address is.
 `ROOMLER_TURN_URL` is where the server tells them to find coturn. Both default to
-`127.0.0.1`, and that fails silently for anyone on another machine: coturn starts
-clean, hands out `127.0.0.1`, and logs no error, while the client is told to reach the
-relay at its own loopback. Set both to an address clients can reach, as in
+`127.0.0.1`, and that fails silently for anyone on another machine. With the URL left
+alone, a client looks for the relay at its own loopback. With only the IP left alone,
+coturn starts clean and logs no error, and a client that reaches it gets an allocation
+and can send through it, but the address that client gives its peer is `127.0.0.1`,
+which is the peer's own loopback. Set both to an address clients can reach, as in
 [Putting it behind a real hostname](#putting-it-behind-a-real-hostname).
 
 A LAN address works for `ROOMLER_PUBLIC_IP`, although the deny list covers it, because
@@ -428,6 +456,16 @@ browsers and the agent only ever ask for a UDP relay.
 
 The relay still carries UDP to public addresses. That is what a TURN relay does.
 
+### Relay ports
+
+The file gives coturn 101 ports, 49152 to 49252. Each allocation holds one until its client
+ends it or its lifetime runs out, and a client that vanishes leaves it to run out. With
+all 101 held, coturn answers 508 to the next allocation, and that client gets no relay.
+
+To widen the range, change `--min-port`, `--max-port` and the `49152-49252` line under
+`roomler`'s `ports:` together. To free it now, `restart coturn` ends every allocation,
+including those of calls in progress.
+
 ---
 
 ## Optional integrations
@@ -459,6 +497,9 @@ docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --b
 
 Schema migrations run at startup and are leader-gated, so it is safe to restart
 into a newer build.
+
+Run `up -d` for the whole file, never for `roomler` alone: that
+[leaves the relay dark](#if-the-server-is-replaced).
 
 ⚠️ **Agent updates are a separate track from your server.** Enrolled agents ask
 *your* server for the current release, but that endpoint proxies the upstream
