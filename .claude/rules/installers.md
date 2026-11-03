@@ -78,11 +78,13 @@ also does **not** download under `%TEMP%`, and does not override `TEMP` for itse
 runs as the session's user). Any manifest name that becomes a path goes through
 `asset_resolver::plain_name`. A zip has no signature, so every file in one but plain text passes the
 publisher check: a genuine `roomler.exe` would load a `secur32.dll` left beside it (its imports are no
-KnownDLLs, and it sets no `DependentLoadFlags`). `wintrust.dll` is
-delay-loaded for the same reason as `secur32.dll`, and `-NotImported` reads both.
+KnownDLLs, and it sets no `DependentLoadFlags`). `wintrust.dll` (the publisher check) and
+`wtsapi32.dll` (#3229's look for the person's shell, which runs before any window) are
+delay-loaded for the same reason as `secur32.dll`, and `-NotImported` reads all three.
 
 ⚠️ **The cards narrow to what can work here** (`role::RoleLimit`), each with its note.
-Another account's password (`--session-data` differs from this process's `%LOCALAPPDATA%`)
+Another account's password (`--session-data`, or on a start by hand the folder `LaunchArgs::from_env`
+finds from the owner of the session's Explorer, differs from this process's `%LOCALAPPDATA%`)
 leaves only `daemon-system`, because the other roles would install into that administrator's
 profile and still report Done. A policy that refuses prompts from a standard user
 (`ConsentPromptBehaviorUser=0`) leaves `daemon-user` and the tunnel, preselected, so nobody
