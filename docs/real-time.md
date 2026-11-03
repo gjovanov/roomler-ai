@@ -135,6 +135,10 @@ while those are in use:
 
 1. A dead session with no id beside a later session of the same person that has one: that
    later session's leave closes only its own. The boot reset clears it at the next roll.
+   An older bundle leaves exactly this when its first `media:join` finds the socket not
+   open yet. The store's retry (`stores/conference.ts:172`) joins again on the open socket,
+   this time with the id, so the person holds both sessions, and the page's leave closes
+   the scoped one.
 2. Two devices of one person that both joined without an id (both older bundles, both
    raced): a miss from one closes both, so the other drops off the list while still in the
    call, and a call the person was alone in ends.
