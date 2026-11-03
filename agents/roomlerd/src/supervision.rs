@@ -17,7 +17,7 @@
 //! | variant | evidence | who relaunches, and on what |
 //! |---|---|---|
 //! | `WindowsScm` | the SCM host spawns its workers as `run --supervisor scm` (`win_service::worker_args`) | the in-process supervisor — exit **0** is `ExitReaction::Respawn`, no backoff |
-//! | `WindowsTask` | the per-user Scheduled Task's action is `run --supervisor task` (`service.rs`) | the **caller**: `<RestartOnFailure>` is a minute away at best, so whoever asked runs `roomlerd service start` once the old process is gone |
+//! | `WindowsTask` | the per-user Scheduled Task's action is `run --supervisor task` (`service.rs`) | the **caller**: the task restarts no exit by itself (#3292), so whoever asked runs `roomlerd service start` once the old process is gone |
 //! | `MacosSupervisor` | the FR-43 root daemon spawns `run --supervised` | the root daemon's poll loop, any exit, ≥ 1 s later |
 //! | `Launchd` | `XPC_SERVICE_NAME` is one of OUR labels (`com.roomler.*`) | launchd — `KeepAlive{SuccessfulExit:false}` relaunches a **non-zero** exit only |
 //! | `Systemd` | `INVOCATION_ID` is set AND this process sits in one of OUR units' cgroups | systemd — and at request time the unit's EFFECTIVE policy is read back (`systemctl show`) before anything exits |

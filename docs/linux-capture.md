@@ -55,7 +55,7 @@ A per-user daemon in its own Wayland session, with no capture key set, runs
 | Arm | Reads | Sees a locked screen / the greeter | Asks the person at the screen | Needs | Default | Gate |
 |---|---|---|---|---|---|---|
 | **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:2685`) |
-| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **no** — mutter refuses to create *or restore* a screencast while locked | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:2786`) |
+| **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **the greeter, no; a locked screen, per compositor** — mutter refuses to create *or restore* a screencast while locked, KWin keeps streaming its lock screen (§1.2) | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:2786`) |
 | **mutter direct** (`portal/mutter.rs`) | the same kind of PipeWire stream, from `org.gnome.Mutter.ScreenCast` | no (a session API) | **no** | GNOME's mutter on the user's session bus; no portal backend required | **off**; automatic in a per-user GNOME Wayland session with no key (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` **and** `ROOMLERD_MUTTER_CAPTURE=1` (`portal/backend.rs:70`) |
 | **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:2855`), after the Xwayland guard (`mod.rs:2828`) |
 
@@ -557,7 +557,7 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3411`,
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3425`,
 `virtual_desktop.rs:685`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
@@ -1255,11 +1255,11 @@ scale) and the axis calls (`portal/input.rs`).
   success (`é` and `€` vanished on a US keymap; `@ # ~` typed fine). The pump
   warns once when it forwards a non-ASCII keysym.
 
-### 4.4 The attended-only rule — no greeter, no locked screen
+### 4.4 The attended-only rule — a person at the screen, never a greeter
 
-This arm **cannot** capture a login greeter or a locked screen, and nothing in
-configuration changes that. The reasons are the portal's, established in FR-36
-P0 and re-measured in FR-45:
+This arm **cannot** capture a login greeter, and nothing in configuration changes
+that. A locked screen is the compositor's call: mutter refuses, KWin keeps streaming
+its lock screen on a token a person granted (§1.2). The reasons, from FR-36 P0 and FR-45:
 
 - ScreenCast needs an active user session and, the first time, an interactive
   consent dialog; `restore_token` only avoids re-prompting *after a human
@@ -1272,12 +1272,12 @@ P0 and re-measured in FR-45:
 So the daemon refuses early rather than waiting: `graphical_session()` finding
 no `x11`/`wayland` session that is `Active=yes` ends the open with
 *"nobody is at this machine's screen — the portal is attended-only"*
-(`portal/mod.rs:974`), and an unanswered dialog ends it at the 120 s
+(`portal/mod.rs:1197`), and an unanswered dialog ends it at the 120 s
 deadline. Both fall through to the rest of the cascade with the reason in the
 log. Unattended access on Linux is FR-36's DRM arm (or §5's mutter arm where
 there is no scanout) — never this one. ⚠️ Where the product says so: the spec,
 this page, the `portal_capture` description in the config surface
-(`crates/agent-core/src/config_surface.rs:1100`, which every `roomler config`
+(`crates/agent-core/src/config_surface.rs:1265`, which every `roomler config`
 reader sees) and the helper's own log line. Since FR-93 P2c the web viewer says
 it too: `rc:video-info` carries `capture_arm` and `attended`, and the viewer
 names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b).
@@ -1285,7 +1285,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:6812`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:6842`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -2086,7 +2086,7 @@ Measured on the WSL2 dev host, 2026-09-25: with the test rig loading the box
 fresh NVENC probe **hung** — `caps probe: the probe child hung` after 60 s,
 `env -i roomlerd caps` reproducing a 75 s stall while the same command from an
 interactive login shell finished in ~5 s — the daemon's pumps then missed the
-watchdog's 90 s window (`app.rs:3498-3486`, `watchdog.rs:552`) and it forced
+watchdog's 90 s window (`app.rs:4395-4412`, `watchdog.rs:550`) and it forced
 `exit(2)`, which systemd answered by restarting it straight back into the same
 probe. Pre-warming the cache with a matching key did not hold. With the rig
 stopped, the identical probe completed in **4.6 s** (10.4 s that evening on a

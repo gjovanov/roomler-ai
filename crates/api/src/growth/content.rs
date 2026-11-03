@@ -22,9 +22,9 @@
 //!   `not_measured` with the reason; no Search Console day pulled makes
 //!   every Google cell `not_measured`; never a 0.
 //! * ⚠️ **Sign-ups by landing path are a lower bound.** The site carries a
-//!   `landing_path` only on a journey that began on a campaign link (FR-88's
-//!   carry); an organic reader of a post who signs up carries none until
-//!   FR-91 P3 builds the organic carry. The cell says so.
+//!   `landing_path` on a journey that began on a campaign link (FR-88's
+//!   carry) or on the blog, from another site (FR-91 P3's organic carry). A
+//!   reader whose browser sent no referrer carries none. The cell says so.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -175,7 +175,7 @@ pub struct ContentReport {
 }
 
 /// The lower-bound note on every sign-up cell.
-pub const LANDING_NOTE: &str = "sign-ups whose first touch carried this post as landing_path — campaign links only; an organic arrival carries none until FR-91 P3";
+pub const LANDING_NOTE: &str = "sign-ups whose first touch carried this post as landing_path, by a campaign link or from another site; a reader with no referrer carries none";
 
 /// The post's path in the forms a stored value may take: with and without
 /// the trailing slash.

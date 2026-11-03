@@ -195,6 +195,13 @@ flowchart LR
   `service uninstall` from the outgoing binary (`UnregisterAutostart` in
   `wix/main.wxs`). A stop there would unenroll an ephemeral device on every
   manual upgrade.
+- **The MSI's own stops tell an upgrade from an uninstall (#3292).** Since neither
+  of the above stops a running daemon, the per-user MSI does. An upgrade's
+  `StopOldDaemon` runs `service stop --for-upgrade`, which records an update attempt
+  first, so `updater::should_self_unenroll` says no and the device stays enrolled.
+  An uninstall's `StopDaemon` is a plain `service stop`: the device is leaving, and
+  it removes itself. `REMOVE="ALL"` alone also holds for the old product during a
+  major upgrade, so that action's condition adds `NOT UPGRADINGPRODUCTCODE`.
 - **A daemon started while the last one is leaving** never takes that one's
   event, which may already be signaled: it would stop the moment it started. It
   takes the name as soon as the old daemon is gone.
