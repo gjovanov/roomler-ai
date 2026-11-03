@@ -6174,7 +6174,7 @@ fn set_service_env_var_cmd(name: &str, value: Option<&str>) -> Result<()> {
             environment::unset_service_env_var(name)
                 .with_context(|| format!("unset-service-env-var: {name}"))?;
             println!(
-                "{name} removed from SCM service env block. Run `roomlerd restart-service` to apply."
+                "{name} removed from the Roomler service's Environment. Run `roomlerd restart-service` to apply."
             );
         }
     }
