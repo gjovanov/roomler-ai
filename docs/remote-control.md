@@ -2377,6 +2377,17 @@ holds for an **exec** prompt (`roomler exec` with consent on), where it matters 
 Approve on a stale panel would otherwise run the command for a caller no longer waiting
 for it, and twice if that caller retried.
 
+⚠️ **A request that comes before the capability probe's first answer waits for it**
+(#3439). On a host that is slow to probe, the device comes online while its probe children
+run, and an `rc:request` then is held in its connection
+([`held_requests.rs`](../agents/roomlerd/src/held_requests.rs)). The consent broker sees it
+once the answer lands, as if it had arrived then, with its windows shortened by the wait, so
+neither the agent nor a person at the prompt runs past the hub's timer. A request whose window
+runs out first is never answered, and the hub's own consent timer ends it as a
+`ConsentTimeout`. It is never served from the interim answer, which would open Media
+Foundation in the daemon before a probe child had proved it
+([encoders.md](encoders.md#the-device-is-online-while-its-first-probe-runs-3439)).
+
 ### 11.3 Recording & audit consent
 
 If recording is enabled for the session, the controlled side gets a persistent banner (cannot be dismissed) and a red dot in the tray icon. Mirrors macOS's screen-recording indicator behavior; users have learned to look for it.

@@ -364,6 +364,83 @@ Implementation notes that keep the child honest:
 - `ROOMLERD_HW_AUTO=0` and `ROOMLERD_ENCODER=software` do **not** skip the probe.
   Those select an encoder; the probe enumerates what to *advertise*.
 
+### The device is online while its first probe runs (#3439)
+
+Until #3439, `signaling::run` awaited the whole first probe before its connect loop (#2551 put
+it there, with the pump gated off), so the control WS opened only after the first answer. On
+#3439's loaded guest, a 4-vCPU Windows 11 VM with 8 High-priority spinners for 150 s, a start
+that missed the cache stayed offline until the load ended: the WS opened 11 ms after
+`caps probe: child reported`, 101–139 s in. Every start that misses the cache pays it, the first
+start of every new build included, which is the start an update ends with.
+
+Now the probe has a thread of its own ([`start_probing`](../agents/roomlerd/src/encode/caps.rs#L2419)),
+and the start waits [`FIRST_ANSWER_WAIT`](../agents/roomlerd/src/encode/caps.rs#L127), 10 s, for its
+first answer. Every healthy host the field has read probed in 0.05–6.8 s (the `probe_ms` reads in
+this file), so its hello still carries the whole answer. Past the wait, the loop connects with the
+interim answer:
+
+```mermaid
+sequenceDiagram
+    participant R as signaling::run
+    participant P as roomlerd-caps-probe thread
+    participant C as probe children
+    participant S as server
+    participant V as viewer
+    R->>P: start_probing
+    P->>C: base, then 444 and gpu, bounds as below
+    Note over R: waits 10 s at most, the pump gated off
+    R->>S: hello with the interim answer, encoder-cells says probing
+    Note over S: the row is online: exec, SSH, tunnels and the overlay work
+    V->>S: rc:session.request
+    S->>R: rc:request
+    Note over R: held in its connection: no answer yet
+    C-->>P: the first answer
+    P->>R: the generation moves, and news wakes every connection
+    R->>S: heartbeat at once, with the answer
+    R->>S: the held request, handled with what is left of its window
+```
+
+| | Before the first answer | Once it lands |
+|---|---|---|
+| The device's row | online, with the interim answer: the cells that need no driver and no encoder open (OpenH264's), no DataChannel transport, `unavailable["encoder-cells"]` code `probing` | the answer, at once rather than within a beat |
+| `rc:request` | held in its connection ([`held_requests`](../agents/roomlerd/src/held_requests.rs)) | handled, its consent windows less the wait, rounded up to whole seconds |
+| A held request whose window runs out | dropped unanswered, and the hub's own consent timer ends it (`ConsentTimeout`) | — |
+| `rc:terminate` for a held request | drops it | — |
+| A connection that drops | its held requests go with it, and the hub pushes a pending request again to the next one | — |
+| exec, SSH, tunnels, the overlay | work: the hello carries every verb | work |
+| The LocalAPI Overview | `not_probed` | the cells |
+
+Why a request waits rather than being served from the interim answer: no driver code runs in the
+daemon until a child has opened that cell, and a session opens Media Foundation in the daemon
+whatever the caps say (`open_default`). Served early, a host whose driver faults there would crash
+on every start with a viewer that reconnects by itself, before its probe could finish: #2551's
+crash loop in a new place. Why not refused: on a host that is only slow, the answer lands inside
+the window, and the session starts a few seconds late.
+
+⚠️ **Nothing the signalling loop reads of the caps may wait for the probe.** It reads
+[`answer_now`](../agents/roomlerd/src/encode/caps.rs#L113), the answer in force or the
+interim one, at the hello, the heartbeat, a request and an offer. A `detect()` there blocks a runtime
+thread on the probe's lock while it runs, and a select loop blocked inside an arm is a pump stall
+that the watchdog ends at 90 s.
+
+⚠️ **The first answer moves the generation too**, once it is stored
+([`detect`](../agents/roomlerd/src/encode/caps.rs#L2388)), and a watch on it
+([`news`](../agents/roomlerd/src/encode/caps.rs#L89)) wakes every connection, whose heartbeat
+then re-announces. Before, only a later try's answer moved it, so a row that said hello with the
+interim answer would have kept it.
+
+**A starved child is not reported as a driver hang.** At a child's bound the parent reads the
+host's idle CPU since the spawn and the child's own CPU time
+([`host_cpu`](../agents/roomlerd/src/encode/host_cpu.rs): `GetSystemTimes` and `GetProcessTimes`
+on Windows, `/proc/stat` and `/proc/<pid>/stat` on Linux), and the host's again over the kill
+wait. With under 5 % idle, and a child that had under a tenth of its bound in CPU, the log says the
+child was most likely starved, with the numbers (`host_idle`, `host_idle_while_dying`,
+`child_cpu_ms`). Otherwise it keeps the driver's wording, with the numbers. On #3439's guest every
+killed child did die, 9–26 s after its kill, with the load still on: a process that is not
+scheduled cannot finish dying either. Nothing the probe decides changes: the bounds, the Media
+Foundation deny and the retry stay as they are. A spawn that took over a second says so
+(`spawn_ms`), so a field read can tell process creation itself from what came before it.
+
 ### A dead child costs the cell it died in
 
 `base` is still one process, and three vendor faults have now landed in it: Intel's
@@ -454,10 +531,12 @@ bounded at 70 s: the 60 s timeout, then 10 s for the kill to land and its stdout
 (`KILL_WAIT`). The worst case is therefore 90 s plus one child, 160 s against 60 s before;
 with the 4:4:4 and GPU children, 300 s against 180 s. Giving up adds the software child and
 takes those two away, so that path tops out at 230 s. It needs a host whose children each
-take a minute. The probe runs before the worker connects (#2551), with the watchdog's pump
-gated off, so this is time the device is offline, and only on a cache miss. Nothing reads
-that time as a hang: the pump is gated off, a service manager watches for an exit and not
-for a hello, and the crash-loop detector counts unclean exits. Measured on the dev box
+take a minute. The start waits for the probe 10 s at most, with the watchdog's pump gated
+off ([above](#the-device-is-online-while-its-first-probe-runs-3439)), so past that this is time
+the device is online without its hardware and a session waits, and only on a cache miss.
+Nothing reads that time as a hang: the pump is gated off for the wait, the probe runs on its
+own thread, a service manager watches for an exit and not for a hello, and the crash-loop
+detector counts unclean exits. Measured on the dev box
 with AMD's real fault (a debug build, run by hand from Git Bash): two deaths and a report
 in 7.2–7.8 s, against 3.4–3.8 s for the same probe with the cell denied from the start. A
 hung child (suspended, standing in for a driver) cost 63 s, and two of them, which is
@@ -515,15 +594,18 @@ something holds its pipe is a unit test with a real process on each OS.
 
 ### A host that ran out of time gets another try
 
-The first probe blocks the device, so its bounds cannot grow: a higher bound is a longer
-offline start for a host with a real hang. A host that is merely slow can still hit them (one
+The first probe holds every session until it answers
+([#3439](#the-device-is-online-while-its-first-probe-runs-3439)), so its bounds cannot grow: a
+higher bound is a longer wait for a session on a host with a real hang. A host that is merely
+slow can still hit them (one
 thrashing at boot, an EDR scanning a driver DLL on its first load), and it then loses what that
 child would have said until the next start, which on a server can be months away. So a first
 answer that ran short of time arms one thread that tries again by itself, with more time and
 no restart, never blocking the start or a live session
 ([`arm_retry`](../agents/roomlerd/src/encode/caps.rs#L3395), #3280). A cache hit or a complete answer arms nothing, so a
-healthy host runs none of this. `signaling::run` is what arms it, once per process however
-many organizations it serves, and `roomlerd caps` never does.
+healthy host runs none of this. The first probe's own thread arms it once the first answer
+exists (`start_probing`, #3439), once per process however many organizations it serves, and
+`roomlerd caps` never does.
 
 ```mermaid
 sequenceDiagram
@@ -532,8 +614,9 @@ sequenceDiagram
     participant C as probe child
     participant S as server
     W->>C: first probe, base, 60 s
+    W->>S: hello at 10 s, the interim answer, encoder-cells says probing
     C--xW: hung with no cell to blame, twice
-    W->>S: hello, no hardware, encoder-cells says probe-short
+    W->>S: heartbeat at once, no hardware, encoder-cells says probe-short
     W->>T: arm_retry
     Note over T: a minute with nothing live
     T->>C: try 1, base, 2 min
@@ -564,7 +647,7 @@ back on, so it runs no software child.
 
 | Try | Waits after the last one ended | Child bound | Read and kill wait | `base` budget |
 |---|---|---|---|---|
-| first probe | at start, blocking | 60 s | 10 s | 90 s |
+| first probe | at start: the start waits 10 s for it, a session all of it | 60 s | 10 s | 90 s |
 | 1 | 1 min | 2 min | 20 s | 3 min |
 | 2 | 10 min | 4 min | 40 s | 6 min |
 | 3 | 1 h | 8 min | 80 s | 12 min |
@@ -636,7 +719,8 @@ nothing has produced a stuck child in the field.
   minute, can still open them.
 - **An offer reads its picks again** ([`picks_at_the_offer`](../agents/roomlerd/src/encode/caps.rs#L4803)). A session picks its codec and transport
   at its request, before consent, and a person can take longer than that minute (`prompt_then_email`
-  waits minutes). So its offer reads both against `detect()`: what has gone is picked again by the
+  waits minutes). So its offer reads both against the answer in force (`answer_now`, which never
+  waits for a probe, #3439): what has gone is picked again by the
   request's own rules, and a pick still offered stays, even beside a better one that has appeared
   since. On the RTP track "still offered" means its opener can open it, and a session that just lost
   its DataChannel picks again (`session_codec`, below). A track bound to a codec its open is refused carries no video, and a DataChannel pump with no
@@ -669,10 +753,11 @@ in.
 
 **How it reaches the server and the viewer.** The heartbeat re-announces when something changed
 (FR-43 P2c), and the server replaces the row's blob. A generation counter joins that comparison, per
-connection, so every organization's row gets it within a beat, with no wire change. A reconnect's
-hello reads the answer in force. A viewer sees the new matrix at its next page load or 5-minute
-status read. A session starting from an older page still gets the new answer for its codec pick,
-because the agent picks from `detect()`, and a live session is not renegotiated.
+connection, with no wire change, and since #3439 a watch on it wakes every connection, so every
+organization's row gets it at once rather than within a beat. A reconnect's hello reads the answer
+in force. A viewer sees the new matrix at its next page load or 5-minute status read. A session
+starting from an older page still gets the new answer for its codec pick, because the agent picks
+from the answer in force, and a live session is not renegotiated.
 
 **The cache's rules do not change.** A try's answer goes through `why_not_cached` like a first
 probe's, with the key read when the try started, so a short answer is never frozen, and a complete
@@ -696,7 +781,8 @@ denied. `roomlerd caps` prints `learned_deny:`. The hello carries it in
 `scripts/fr97-caps-census.sh` counts it. With no cell to name and an answer short of time, the
 same key says code `probe-short`, so a host with no hardware says why instead of looking like it
 has none. The word goes when a later try answers, and once the table is done with no answer it says
-that the next start is what is left. No viewer asks for that key, so the person at the viewer is
+that the next start is what is left. A row that came online before its first answer says code
+`probing` (#3439) until that answer replaces it. No viewer asks for that key, so the person at the viewer is
 still told nothing.
 
 ## Selection at session time
