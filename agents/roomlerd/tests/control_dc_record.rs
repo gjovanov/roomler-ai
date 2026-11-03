@@ -43,6 +43,8 @@ use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 
+mod dc_stage;
+
 /// One recorder and one gate set per process: one test at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -448,6 +450,7 @@ impl Rig {
 async fn rig(opts: Opts) -> Result<Rig> {
     let s = setup();
     let (browser_pc, agent_pc) = mk_pc_pair().await?;
+    let stages = dc_stage::Stages::watch(&browser_pc, &agent_pc);
     let session_id = opts.session_id.unwrap_or_default();
     // `ObjectId`'s default is a fresh one: a new user unless the test names one.
     let controller_user_id = opts.controller.unwrap_or_default();
@@ -523,10 +526,9 @@ async fn rig(opts: Opts) -> Result<Rig> {
             }
         })
     }));
-    exchange(&browser_pc, &agent_pc).await?;
-    let agent_dc = tokio::time::timeout(Duration::from_secs(30), agent_dc_rx)
-        .await
-        .map_err(|_| anyhow!("agent on_data_channel timed out"))??;
+    exchange(&browser_pc, &agent_pc, &stages).await?;
+    let agent_dc =
+        dc_stage::agent_channel(agent_dc_rx, &stages, &browser_dc, Duration::from_secs(30)).await?;
     // The attach-time gate, as `peer.rs` runs it.
     if opts.granted {
         remote::attach(agent_dc, ctx);
@@ -547,9 +549,14 @@ async fn rig(opts: Opts) -> Result<Rig> {
     if browser_dc.ready_state()
         != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
     {
-        tokio::time::timeout(Duration::from_secs(10), open_rx)
-            .await
-            .map_err(|_| anyhow!("record DC open timed out"))??;
+        match tokio::time::timeout(Duration::from_secs(10), open_rx).await {
+            Ok(opened) => opened?,
+            Err(_) => {
+                return Err(stages
+                    .timed_out("record DC open timed out", &browser_dc)
+                    .await);
+            }
+        }
     }
     Ok(Rig {
         dc: browser_dc,
@@ -567,8 +574,13 @@ async fn rig(opts: Opts) -> Result<Rig> {
 }
 
 /// Offer/answer with every candidate in the SDP (no trickle); see
-/// `privacy_dc.rs`'s `exchange` for the race that trickling lost.
-async fn exchange(browser_pc: &RTCPeerConnection, agent_pc: &RTCPeerConnection) -> Result<()> {
+/// `privacy_dc.rs`'s `exchange` for the race that trickling lost. Each step
+/// goes on `stages`' timeline (#3078).
+async fn exchange(
+    browser_pc: &RTCPeerConnection,
+    agent_pc: &RTCPeerConnection,
+    stages: &dc_stage::Stages,
+) -> Result<()> {
     let offer = browser_pc.create_offer(None).await?;
     let mut gathered = browser_pc.gathering_complete_promise().await;
     browser_pc.set_local_description(offer).await?;
@@ -577,7 +589,9 @@ async fn exchange(browser_pc: &RTCPeerConnection, agent_pc: &RTCPeerConnection) 
         .local_description()
         .await
         .ok_or_else(|| anyhow!("no local offer"))?;
+    stages.gathered("offer", &offer);
     agent_pc.set_remote_description(offer).await?;
+    stages.mark("the agent has the offer");
     let answer = agent_pc.create_answer(None).await?;
     let mut gathered = agent_pc.gathering_complete_promise().await;
     agent_pc.set_local_description(answer).await?;
@@ -586,7 +600,9 @@ async fn exchange(browser_pc: &RTCPeerConnection, agent_pc: &RTCPeerConnection) 
         .local_description()
         .await
         .ok_or_else(|| anyhow!("no local answer"))?;
+    stages.gathered("answer", &answer);
     browser_pc.set_remote_description(answer).await?;
+    stages.mark("the browser has the answer");
     Ok(())
 }
 
