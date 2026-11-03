@@ -1143,15 +1143,37 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
     }
 }
 
+/// What `install` hands back: the scoped subscriber, and a SECOND registered
+/// dispatcher, never one alone. With exactly one registered, tracing-core
+/// rebuilds a callsite's interest from the default of whichever thread reaches
+/// it first (`Rebuilder::JustOne`) and caches it for every thread. A parallel
+/// test with no subscriber of its own makes it `never`, and the capture misses
+/// that line for good, though this thread emitted it. It can be any line: the
+/// lane installs no global subscriber, so nothing registers a callsite before
+/// the first capture does. Measured on CI, run 41584702058: "login VERIFIED by
+/// the device" missed while `the_org_hears_of_a_persons_first_session_once`
+/// logged in beside it. With two, every registered dispatcher is asked, as
+/// `roomler-node-core`'s config tests hold it. The scope ends first, then the
+/// second.
+struct CaptureGuard {
+    _scoped: tracing::subscriber::DefaultGuard,
+    _second: tracing::Dispatch,
+}
+
 impl LogCapture {
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
-        tracing::subscriber::set_default(
+    fn install(&self) -> CaptureGuard {
+        let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let scoped = tracing::subscriber::set_default(
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::TRACE)
                 .with_ansi(false)
                 .with_writer(self.clone())
                 .finish(),
-        )
+        );
+        CaptureGuard {
+            _scoped: scoped,
+            _second: second,
+        }
     }
 
     fn bytes(&self) -> Vec<u8> {
@@ -1161,6 +1183,28 @@ impl LogCapture {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes()).into_owned()
     }
+}
+
+/// The capture sees every line its own thread logs, even one another thread
+/// reached first. With one registered dispatcher that thread's `never` would be
+/// cached for both (`CaptureGuard`), which is how CI lost a line the capture
+/// test asserts on.
+#[test]
+fn the_capture_sees_a_line_another_thread_reached_first() {
+    fn reach() {
+        tracing::info!("capture probe: a line two threads reach");
+    }
+    let capture = LogCapture::default();
+    let _logs = capture.install();
+    std::thread::spawn(reach).join().unwrap();
+    reach();
+    assert!(
+        capture
+            .text()
+            .contains("capture probe: a line two threads reach"),
+        "the capture missed a line this thread logged: {:?}",
+        capture.text()
+    );
 }
 
 /// The spellings of a secret a log line, a frame or a stored field could hold.
