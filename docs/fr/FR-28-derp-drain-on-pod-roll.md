@@ -220,11 +220,11 @@ this size it is a number to measure first. The flip is a staged rollout and the 
 
 ## P3: the pre-pull
 
-The wave's largest cost is the pull, 3 to 4 s of 5.3 to 6.3 s. A promote now moves a DaemonSet's image first,
-which rolls nothing and makes both nodes pull, waits 30 s, and only then bumps `newTag`. `roomler2`'s
+The wave's largest cost is the pull, 3 to 4 s of 5.3 to 6.3 s. With #3320, a promote moves a DaemonSet's image
+first, which rolls nothing and makes both nodes pull, waits 30 s, and only then bumps `newTag`. `roomler2`'s
 `imagePullPolicy` is `IfNotPresent`, so a replacement finds the image on its node. A pull that fails or outlasts
 the wait leaves today's roll. The design, its failure table and why it is not an ArgoCD sync wave are in
-`docs/deployment.md`, "The pre-pull".
+`docs/deployment.md`, "The pre-pull", which #3320 adds.
 
 ## What the two buy
 

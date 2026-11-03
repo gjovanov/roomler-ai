@@ -822,7 +822,7 @@ why per-roll medians land on 7.5, 15 and 25 s.
 | Lever | What it changes | Switch |
 |---|---|---|
 | Flat redial | On a 502 at the upgrade, the control socket and the central `/derp` socket redial every 0.5 to 1 s instead of waiting out the next step (`agents/roomlerd/src/ws_connect.rs:60`), up to 30 times an outage. Every other failure keeps the ladder | `ws_flat_redial`, default OFF |
-| Pre-pull | A promote puts the image on both nodes 30 s before the roll, so a replacement starts without pulling ([deployment.md](deployment.md)) | The deploy repo's DaemonSet file |
+| Pre-pull | With #3320, a promote puts the image on both nodes 30 s before the roll, so a replacement starts without pulling ([deployment.md](deployment.md)) | The deploy repo's DaemonSet file |
 
 ⚠️ **A server that accepts and drops must still climb** (#2221), or a fleet reconnects to it every second. So only a
 502 is flat, an accepted socket that does not last refills nothing, and the allowance bounds a 502 that never ends,
