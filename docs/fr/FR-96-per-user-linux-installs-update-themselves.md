@@ -46,7 +46,7 @@ The code agrees, line by line (master `d7a7b17aa`):
     `sudo -n`, then `pkexec`)"*, and `:197` says *"the tarball makes self-update work everywhere"*.
   - `docs/installation.md:497` says the updater *"hands off to MSI / `dpkg` / `installer` and restarts"*.
 - **Nothing restarts a per-user daemon onto a replaced binary.** There is no restart-on-replace anywhere
-  (`strip_deleted_suffix`, `updater.rs:2232-2240`, only fixes up a path for the watcher). So even an admin's
+  (`strip_deleted_suffix`, `updater.rs:2824-2832`, only fixes up a path for the watcher). So even an admin's
   `apt upgrade` leaves the per-user daemon on the old, unlinked image until something restarts it.
 
 **Who this serves.** Not yet measured, and partly unmeasurable from the server: FR-93 P2b's hello reports
