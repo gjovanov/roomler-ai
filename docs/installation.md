@@ -134,7 +134,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3790`, `crates/agent-core/src/config.rs:4221`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3838`, `crates/agent-core/src/config.rs:4379`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:651`, `:983`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -386,8 +386,8 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3580`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3624`) |
-| `config::read_if_present` (`:3654`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3738`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3782`) |
+| `config::read_if_present` (`:3708`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
 flowchart TD
@@ -404,7 +404,7 @@ flowchart TD
 Before FR-66, two callers that expect to find nothing went through `load` and
 printed the destructive remedy about perfectly healthy hosts: the Windows
 supervisor's `netd_enabled()` flag probe
-(`agents/roomlerd/src/win_service/supervisor.rs:977`), on **every service
+(`agents/roomlerd/src/win_service/supervisor.rs:1015`), on **every service
 start** of every user-context install; and enrollment itself, reusing an
 existing `machine_id` — during the very operation that enrolls the machine.
 The noise also buried the genuine case, which prints the identical line.
@@ -422,7 +422,7 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2640`, `:2662`), at the clean-run promotion
+`crates/agent-core/src/config.rs:2749`, `:2771`), at the clean-run promotion
 (`record_clean_run_at`, `:2626`), at every `ConfigSet`, and at enrollment. The daemon, the
 desktop app and the setup wizard all write it through `config::save` (`:4201`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
@@ -869,7 +869,7 @@ sequenceDiagram
 
 **Auto-updates and upgrades** (the open question in #3115). The updater does
 not stop the service before it runs msiexec. `spawn_installer_with_watch`
-(`agents/roomlerd/src/updater.rs:1905`) launches `msiexec /i … /qn` elevated
+(`agents/roomlerd/src/updater.rs:1915`) launches `msiexec /i … /qn` elevated
 (`:2236`, `:2636`) while the service runs; the worker that launched it exits 0,
 and its host stays up (`:593`). Measured on a vmtest Win11 cell, released code,
 with each stop held to the field's 7.8 s:
@@ -1032,7 +1032,7 @@ alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives fro
 the binary's symbols.
 
 Neither floor can strand a running daemon on the updater's offline `dpkg --install`
-rung (`agents/roomlerd/src/updater.rs:2329`), which is the reason libva and
+rung (`agents/roomlerd/src/updater.rs:2339`), which is the reason libva and
 `iproute2` stay out of `depends`. A host where the daemon runs already has the real
 library and OpenSSL, because without them it cannot start. A healthy install
 upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,
@@ -1457,8 +1457,8 @@ server, and takes its sessions from the daemon's delegation channel alone. A per
 enrollment on that Mac stays in their file and is ignored, and a person with none gets
 a worker anyway. As the console user, `roomler status`, the device list and the
 companion show the root half's row, and a verb that needs the server (`forward`,
-`exec`, `ssh`, a rename) says to run it with `sudo`. Until the logs PR, that worker's
-logs stay on the Mac.
+`exec`, `ssh`, a rename) says to run it with `sudo`. The worker's log lines go up on
+the root half's row, each marked `process: gui-worker`.
 
 The switch is off by default and stays off until the
 [field proof](fr/FR-43-macos-single-enrollment.md#what-rides-what). It doesn't yet give
@@ -1712,11 +1712,11 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3428`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3469`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2690`).
+back to the version that is running (`crates/agent-core/src/config.rs:2841`).
 
 ### No pipe can stall the supervisor (#3080)
 
@@ -1959,7 +1959,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2191`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2211`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

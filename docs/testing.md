@@ -29,6 +29,8 @@ flowchart TB
 | Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2651`) |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
+| Self-host quickstart | `bash scripts/selfhost-pull-check.sh` (lane `Self-host pull`, amd64 and arm64) | a throwaway machine with Docker, since it ends with `down -v`: no registry login, an empty image cache, `pull` then `up -d`, and every image pinned |
+| A call over the self-host relay | `cd ui && E2E_EXPECT_TURN_RELAY=1 bun x playwright test e2e/selfhost-turn-relay.spec.ts` | a compose stack started with `ROOMLER__TURN__FORCE_RELAY=true` and an announced address outside its deny list, with the browser on the same machine as the server. Fails unless every connected peer connection selected a `relay` pair and both sides decode advancing remote frames |
 | Phone-width smoke | `cd ui && bun run test:phone` | nothing — the built SPA with every `/api` call mocked (`ui/e2e-phone/`) |
 | Soft-keyboard harness | `cd ui && bun run test:harness` | nothing — one harness page on the Vite dev server, in a real Chromium (`ui/e2e-harness/`, #2888) |
 | Capture smoke | `./scripts/dev-xvfb.sh` | Xvfb — paints an xterm, runs the scrap-capture path headless |
@@ -227,15 +229,18 @@ Flakes fixed on 2026-10-30, and what each one teaches:
 > description (`ErrNoRemoteDescription`), and a test that ignores the refusal and loses every
 > candidate both ways never connects. `privacy_dc` (10-30) and `control_dc_record` (10-28) hit
 > their 30 s `on_data_channel` timeout that way in CI. The pattern: `exchange` in
-> [`privacy_dc.rs:416`](../agents/roomlerd/tests/privacy_dc.rs#L416), as `dc_throughput.rs`'s
+> [`privacy_dc.rs:424`](../agents/roomlerd/tests/privacy_dc.rs#L424), as `dc_throughput.rs`'s
 > `connect` always did; `control_dc_record` and `file_dc` follow it too.
 
 > [!WARNING]
 > **A Mongo TTL index deletes on a monitor pass every 60 s, at any moment after expiry.** A test
 > that expires a row and then reads it races that pass: "one pairing row … 0" once in the
-> integration lane. `pairing_tests`' expiry test reads `serverStatus.metrics.ttl.passes`
-> ([`pairing_tests.rs:201`](../crates/tests/src/pairing_tests.rs#L201)) around each try, and
-> reruns only a try that a pass ran through. A missing row with no pass is still a failure.
+> integration lane (#3084). Don't count passes around the read to excuse a missing row:
+> `serverStatus.metrics.ttl.passes` moves when a pass *ends*, so a pass still running has
+> deleted the row and not been counted. Hold the sweep off in the test's own database instead:
+> `pairing_tests`' `hold_off_the_ttl_sweep`
+> ([`pairing_tests.rs:206`](../crates/tests/src/pairing_tests.rs#L206)) checks the index is
+> the product's, then gives it an hour's grace with `collMod`.
 
 > [!WARNING]
 > **An external tool's deadline in a test is the test's, sized for the busiest runner.**
@@ -613,7 +618,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1831`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7620`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1831`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7787`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |
@@ -636,7 +641,7 @@ VP9 DataChannel is 4:4:4 by default), less what the build cannot open (`BuildCap
 | `rtp:h264` | `encode::open_for_codec`: Media Foundation's cascade on Windows, then OpenH264 | `mf-encoder` (Windows) |
 | `rtp:h265` | FFmpeg's HEVC cascade, then MF's | FFmpeg or MF |
 | `rtp:av1` | MF's AV1 | MF |
-| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5379`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
+| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5385`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
 | `dc:vp9`, `dc:vp9:444` | the session's quick probe at 480×270, then FFmpeg's VP9 if it opened, else libvpx | FFmpeg |
 | `named` | `encode::open_named`, past every cascade and the denylist | FFmpeg |
 

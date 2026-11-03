@@ -4109,6 +4109,12 @@ async fn media_pump_vp9_444_dc(
         },
         session_id,
     );
+    // #3260 — and a capturer that cannot capture tells every viewer of this
+    // pipeline, the ones that join later included. Here rather than beside
+    // this session's own notice above: the pipeline exists only from here.
+    if let Some(reason) = capturer.unavailable() {
+        pipeline.tell_unavailable(reason);
+    }
     let mut last_viewers: usize = 0;
 
     let mut frames_captured: u64 = 0;
@@ -5609,11 +5615,14 @@ fn capture_unavailable_payload(reason: &crate::capture::CaptureUnavailable) -> S
 ///
 /// Bounded: a session that never opens its control DC must not leave a task
 /// spinning for the life of the process.
+///
+/// #3260 — a shared pipeline's followers are told through here too, each
+/// under its own session (`media_share::Pipeline::tell_unavailable`).
 #[cfg_attr(
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
     allow(dead_code)
 )]
-fn spawn_capture_unavailable_notice(
+pub(crate) fn spawn_capture_unavailable_notice(
     session_id: bson::oid::ObjectId,
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     reason: crate::capture::CaptureUnavailable,
@@ -6657,6 +6666,9 @@ async fn media_pump_ffmpeg_dc(
     // backend answers `None`, so a healthy session sends nothing.
     if let Some(reason) = capturer.unavailable() {
         spawn_capture_unavailable_notice(session_id, control_dc.clone(), reason.clone());
+        // #3260 — and so is every viewer sharing this pipeline: the ones
+        // that joined while the capture opened, and the ones that join later.
+        pipeline.tell_unavailable(reason);
     }
     // FR-93 P6g — and an arm the compositor shows nothing for still says, at
     // the screen, who is viewing it.

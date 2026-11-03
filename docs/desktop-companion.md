@@ -399,7 +399,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:1814`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:1832`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -707,7 +707,7 @@ registered the moment it connects, and the banner used to come up then. It said 
 while nothing was shared yet. On a desktop that centres new windows, it also sat right over the
 dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat beside the
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
-dialog is the wait (`agents/roomlerd/src/peer.rs:5744`, `AskingMark`
+dialog is the wait (`agents/roomlerd/src/peer.rs:5753`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
 `crates/localapi/src/lib.rs:1207`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:325`). The mark goes
