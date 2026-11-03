@@ -676,6 +676,27 @@ impl RateGovernor {
         }
     }
 
+    /// What this session has to say to the pair memory right now, `None` for
+    /// nothing. The pump reads it once per viewer window, and the last answer is
+    /// what [`rate_memory::RateMemory::record_session`] gets when the session
+    /// ends, whichever way it ends.
+    ///
+    /// FR-35 P3b — the memory wants the rate the pipe actually CARRIED, not just
+    /// the learner's above-nominal ceiling. On a short or frozen session the
+    /// learner never rises, so `stable_bps()` is `None`. FR-70 P1 — then what the
+    /// session actually KNOWS about the pipe: a live measurement, or the prior as
+    /// it has decayed. FR-79 V4 — evidence only: the applied rate used to stand
+    /// in when nothing measured, which is the memory learning from itself.
+    /// FR-79 V5b — `stable_bps()` is a hold a valid window carried. A hold nothing
+    /// carried used to write the session's own opener back here.
+    ///
+    /// [`rate_memory::RateMemory::record_session`]: super::rate_memory::RateMemory::record_session
+    #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+    pub fn session_evidence_bps(&self, now: Instant, constrained: bool) -> Option<u32> {
+        self.stable_bps()
+            .or_else(|| self.pipe_bps(now, constrained))
+    }
+
     /// FR-79 V5b — a valid window delivered `delivered_bps`, and that raised the
     /// floor: it came after whatever set the floor before it. Any reading it beats
     /// by [`CONTRADICTION_FACTOR`] is wrong, because the bytes arrived, so it

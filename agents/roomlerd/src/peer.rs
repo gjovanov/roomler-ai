@@ -9188,27 +9188,9 @@ async fn media_pump_ffmpeg_dc(
                     "FR-35 ceiling learner: the pair carried the ceiling — stepping it up"
                 );
             }
-            // FR-35 P3b — the memory wants the rate the pipe actually CARRIED,
-            // not just the learner's above-nominal ceiling. On a short/frozen
-            // session the learner never rises, so `stable_bps()` is None; fall
-            // back to the AIMD's live applied rate so a session whose seed was
-            // too hot (the grace was cut short, the AIMD then cut) records the
-            // converged rate as a decrease and the pair stops re-seeding hot.
-            // FR-70 P1 — between the learner's stable rate and the applied-
-            // rate fallback sits what the session actually KNOWS about the
-            // pipe: a live measurement, or the prior as it has decayed. The
-            // applied rate at the last window is wherever the last decrease
-            // left it, which on a lumpy relay drifts the memory DOWN across
-            // sessions (200 kbps was an attractor, not a stale day).
-            // FR-79 V5b — `stable_bps()` is a hold a valid window carried. A hold
-            // nothing carried used to write the session's own opener back here.
             rate_memory_guard.stable.store(
                 governor
-                    .stable_bps()
-                    .or_else(|| governor.pipe_bps(std::time::Instant::now(), constrained))
-                    // FR-79 V4 — evidence only: the applied rate used to stand in
-                    // here when nothing measured, which is the memory learning
-                    // from itself.
+                    .session_evidence_bps(std::time::Instant::now(), constrained)
                     .unwrap_or(0),
                 std::sync::atomic::Ordering::Relaxed,
             );
