@@ -234,7 +234,7 @@ location = /pricing { return 301 /#pricing; }
   nothing ever redirects. (This section's first draft, `try_files $uri $uri/ =404`, does 301,
   measured in `nginx:stable`; it adds nothing, so P1 ships without it.)
 - **The session cookie decides the homepage.** The session is the HttpOnly `access_token`
-  cookie (`crates/api/src/routes/auth.rs:247`). No cookie (guests and every crawler) gets the
+  cookie (`crates/api/src/routes/auth.rs:273`). No cookie (guests and every crawler) gets the
   static homepage; a cookie gets the SPA, whose router behaves as today. A cookie the server
   refuses gets the SPA, which sends the visitor to login on its first 401.
 - **`try_files` serves the chosen file inside `location = /`**, so `expires -1` applies to both
