@@ -174,6 +174,15 @@ pub async fn register(
     State(state): State<Core>,
     Json(mut body): Json<RegisterRequest>,
 ) -> Result<(StatusCode, HeaderMap, Json<RegisterResponse>), ApiError> {
+    // #3247 — answered before anything exists. The organization used to be
+    // created last, so a taken slug left the account and its activation mail
+    // behind, and pressing Register again answered 409 on the address.
+    if let Some(slug) = body.tenant_slug.as_deref()
+        && state.tenants.slug_taken(slug).await?
+    {
+        return Err(slug_taken());
+    }
+
     let password_hash = state.auth.hash_password(&body.password)?;
 
     // FR-88 — sanitised here, stored with the row, never touched again. Not
@@ -214,6 +223,31 @@ pub async fn register(
         );
     }
 
+    // Create a default tenant if requested
+    if let (Some(tenant_name), Some(tenant_slug)) = (body.tenant_name, body.tenant_slug)
+        && let Err(e) = state
+            .tenants
+            .create(tenant_name, tenant_slug, user_id)
+            .await
+    {
+        return Err(match e {
+            // #3247 — the race the check above can lose: two sign-ups for one
+            // slug. Nothing was created for this account yet, so it goes too.
+            DaoError::DuplicateKey(msg) if duplicate_key_is_on(&msg, "slug") => {
+                if let Err(e) = state
+                    .users
+                    .base
+                    .hard_delete(bson::doc! { "_id": user_id })
+                    .await
+                {
+                    warn!("a sign-up that lost its slug stays behind: {:?}", e);
+                }
+                slug_taken()
+            }
+            e => e.into(),
+        });
+    }
+
     send_activation_link(
         &state,
         user_id,
@@ -221,14 +255,6 @@ pub async fn register(
         body.display_name.clone(),
     )
     .await;
-
-    // Create a default tenant if requested
-    if let (Some(tenant_name), Some(tenant_slug)) = (body.tenant_name, body.tenant_slug) {
-        state
-            .tenants
-            .create(tenant_name, tenant_slug, user_id)
-            .await?;
-    }
 
     // Auto-accept invite if invite_code provided
     if let Some(ref invite_code) = body.invite_code {
@@ -306,6 +332,10 @@ pub async fn register(
 /// person `E11000 duplicate key error…` with their address quoted in it. #3199:
 /// that person is usually someone whose first sign-up never activated, so the
 /// answer names the way out.
+fn slug_taken() -> ApiError {
+    ApiError::Conflict("That organization short name is already taken. Pick another.".to_string())
+}
+
 fn register_conflict(e: DaoError) -> ApiError {
     match e {
         DaoError::DuplicateKey(msg) if duplicate_key_is_on(&msg, "email") => ApiError::Conflict(
@@ -413,7 +443,14 @@ pub async fn login(
     Json(body): Json<LoginRequest>,
 ) -> Result<(HeaderMap, Json<AuthResponse>), ApiError> {
     let lookup = if let Some(ref username) = body.username {
-        state.users.find_by_username(username).await
+        match state.users.find_by_username(username).await {
+            // #3247 — the sign-in page has one box, and most people type their
+            // address into it. Same answer either way when there is no account.
+            Err(DaoError::NotFound) if username.contains('@') => {
+                state.users.find_by_email(username.trim()).await
+            }
+            found => found,
+        }
     } else if let Some(ref email) = body.email {
         state.users.find_by_email(email).await
     } else {

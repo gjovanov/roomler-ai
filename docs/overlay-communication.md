@@ -821,6 +821,17 @@ under 0.4 s after its container starts. The rest is scheduling (about 1.5 s), th
 (3–4 s), and the wait for the next backoff step (`agents/roomlerd/src/derp.rs:49`), which is
 why per-roll medians land on 7.5, 15 and 25 s.
 
+**Two levers go at that wait** ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#p2-the-flat-redial)):
+
+| Lever | What it changes | Switch |
+|---|---|---|
+| Flat redial | On a 502 at the upgrade, the control socket and the central `/derp` socket redial every 0.5 to 1 s instead of waiting out the next step (`agents/roomlerd/src/ws_connect.rs:60`), up to 30 times an outage. Every other failure keeps the ladder | `ws_flat_redial`, default OFF |
+| Pre-pull | With #3320, a promote puts the image on both nodes 30 s before the roll, so a replacement starts without pulling ([deployment.md](deployment.md)) | The deploy repo's DaemonSet file |
+
+⚠️ **A server that accepts and drops must still climb** (#2221), or a fleet reconnects to it every second. So only a
+502 is flat, an accepted socket that does not last refills nothing, and the allowance bounds a 502 that never ends,
+such as a corporate proxy's.
+
 ---
 
 ## 7. What the server can and cannot see

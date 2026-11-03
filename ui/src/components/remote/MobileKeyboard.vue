@@ -113,7 +113,8 @@ const emit = defineEmits<{
   keyText: [text: string]
   /** Special-key down/up (e.g. Backspace, Enter, Esc). `mods`
    *  bitfield matches `useRemoteControl.sendKey` (0x01 Ctrl /
-   *  0x02 Shift / 0x04 Alt / 0x08 Meta). */
+   *  0x02 Shift / 0x04 Alt / 0x08 Meta); `sendKey` turns Ctrl into Cmd
+   *  on a Mac host, as the physical keyboard's path does. */
   key: [code: number, down: boolean, mods: number]
 }>()
 
@@ -184,10 +185,13 @@ function consumeModBits(): number {
 
 /** Send a special key as down → up with whatever sticky modifier
  *  bits were active. The host needs both edges; rapid tap = key
- *  press. Modifier bits are consumed on `down` only — agent's
- *  enigo backend treats `key down` with mods=Ctrl as "press Ctrl,
- *  press X, release X, release Ctrl" so we don't need separate
- *  modifier-down/up events. */
+ *  press. The modifiers travel in `mods` and nowhere else: the agent taps
+ *  the whole chord on the `down` ("press Ctrl, press X, release X, release
+ *  Ctrl", `input/arbiter.rs` `chord_tap`, #3046), so nothing can stay down
+ *  when a frame is lost on the unreliable input channel. That is why there
+ *  are no separate modifier frames here: a lost Ctrl-up would be a stuck Ctrl
+ *  on the host. An agent older than that ignores `mods` and types the bare
+ *  key. */
 function emitSpecialKey(hid: number) {
   const mods = consumeModBits()
   emit('key', hid, true, mods)
@@ -207,6 +211,17 @@ function onSpecialKey(key: SpecialKey) {
   }
   emitSpecialKey(key.hid)
   captureRef.value?.focus()
+}
+
+/** The HID usage of a character a sticky modifier can chord with, or `null`
+ *  for one it cannot: a symbol's key depends on the host's layout. */
+function chordableHid(ch: string): number | null {
+  const lower = ch.toLowerCase()
+  if (lower >= 'a' && lower <= 'z') return 0x04 + (lower.charCodeAt(0) - 'a'.charCodeAt(0))
+  if (ch >= '1' && ch <= '9') return 0x1e + (ch.charCodeAt(0) - '1'.charCodeAt(0))
+  if (ch === '0') return 0x27
+  if (ch === ' ') return 0x2c
+  return null
 }
 
 /** Accept text input from the OS soft keyboard. We rely on the
@@ -250,15 +265,12 @@ function onInput(ev: Event) {
     // then type 'word'" → Ctrl+w/Ctrl+o/Ctrl+r/Ctrl+d.
     const mods = consumeModBits()
     if (mods !== 0) {
-      // Map the first char back to a HID best-effort. v1: only
-      // ASCII letters (a-z) can carry modifiers; everything else
-      // falls through as plain text. This matches the operator's
-      // typical "Ctrl+letter" intent without trying to be clever
-      // about Ctrl+? layouts.
-      const ch = text[0]
-      const lower = ch.toLowerCase()
-      if (lower >= 'a' && lower <= 'z') {
-        const hid = 0x04 + (lower.charCodeAt(0) - 'a'.charCodeAt(0))
+      // Map the first char back to a HID best-effort. ASCII letters, digits
+      // and Space can carry modifiers; everything else falls through as
+      // plain text. This matches the operator's typical "Ctrl+letter" or
+      // "Win+1" intent without trying to be clever about Ctrl+? layouts.
+      const hid = chordableHid(text[0])
+      if (hid !== null) {
         emit('key', hid, true, mods)
         emit('key', hid, false, mods)
         // Send the rest as plain text (no mods).
