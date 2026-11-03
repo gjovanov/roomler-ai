@@ -560,7 +560,7 @@ that does not know the map works exactly as before.
 ⚠️ **An absent key never means "unavailable".** Agents before P0c send no map
 at all; their lists say what they claim. The map is off the wire when empty,
 and the server stores caps whole
-([`agent.rs:465`](../crates/services/src/dao/agent.rs#L465)), so an older
+([`agent.rs:475`](../crates/services/src/dao/agent.rs#L475)), so an older
 server drops it and a newer one keeps it with no migration.
 
 ⚠️ **`not-applicable` is the only code that hides a control, and it is how

@@ -84,7 +84,7 @@ staged by the mode.
 
 | Limit | Checked at | Refusal |
 |---|---|---|
-| devices | enrollment (`crates/modules/fleet/src/agent.rs:234`) | 403, before the single-use token is claimed |
+| devices | enrollment (`crates/modules/fleet/src/agent.rs:249`) | 403, before the single-use token is claimed |
 | tunnel clients | `crates/modules/network/src/routes/tunnel.rs:138` | 403 |
 | members | invite and admin add (`crates/api/src/routes/invite.rs:199`) | 403 naming the counts |
 | storage | upload (`crates/modules/chat/src/file.rs:312`) | 403; the check is `current + incoming`, so a file that exactly fills the quota fits |
