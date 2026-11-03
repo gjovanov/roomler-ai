@@ -280,12 +280,15 @@ thread_local! {
 /// longer answers.
 ///
 /// #3047 — the viewer sends one frame per character, and a read attaches to the
-/// foreground thread and detaches, which resets that thread's key state. While a
-/// burst outran a slow target, the target kept being reset between dequeuing
-/// Shift-down and the key it was meant for: Shift was already up in the async
-/// state, because `tap_vk` sends the whole press in one `SendInput`. Every shifted
-/// character came out unshifted until the last frame, when the resets stopped and
-/// the rest of the backlog drained correctly: the issue's clean split.
+/// foreground thread and detaches, which resets that thread's key state. A reset
+/// falling between the target reading Shift-down and reading the key it was meant
+/// for loses Shift, because `tap_vk` sends the whole press in one `SendInput`, so
+/// the async state already says Shift is up. A target spending time on each key
+/// was caught every time: every shifted character came out unshifted until the
+/// last frame, when the resets stopped and the rest of the backlog drained
+/// correctly, the issue's clean split. A target keeping up lost one in twelve,
+/// anywhere in the burst. The injected keys were right throughout, so a keyboard
+/// hook sees nothing wrong: only what the target translates shows it.
 fn caps_for_frame(fg_tid: u32, now: Instant, read: impl FnOnce(u32) -> bool) -> bool {
     let last = CAPS.with(Cell::get);
     let on = last
