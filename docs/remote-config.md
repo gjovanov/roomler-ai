@@ -146,11 +146,16 @@ save can push something newer, and the older read then goes out second and puts
 the device back on a config the operator replaced. Never send this frame any
 other way.
 
-Two races remain, and neither is reachable at a person's speed in the dialog.
-Reports are written by separate tasks, so two answers milliseconds apart can land
-out of order, and the row reads `pending`. Two PUTs inside the window between
-reading the row and writing it take the same revision, so the device can hold the
-document the row did not keep. The next connect heals both.
+Two races remain, and what each costs differs. Reports are written by separate
+tasks, so two answers milliseconds apart can land out of order. One save landing
+right after a connect's push is enough, most likely during a pod roll, and it fails
+safe: the row reads `pending`. The other takes two PUTs inside the window between
+reading the row and writing it, so a script or two operators, not one person in the
+dialog. They take the same revision and the hub sends only the first, so the device
+can hold the document the row did not keep, and the row still reads as confirmed,
+because the report's revision matches. A later save or the next connect heals both,
+and on a stable link the next connect can be days away. After scripted saves, read
+the device, not only the row.
 
 **Wire.** A new `ServerMsg` variant carrying the desired keys.
 
@@ -199,6 +204,28 @@ compromised, possibly lying, possibly just old — says happened afterwards.
 Stored on the agent row rather than folded into the audit trail so a reader can
 always tell which is which.
 
+⚠️ **`needs_restart` means this process does not run the value yet, whatever the
+file holds** ([FR-132](fr/FR-132-zero-copy-by-default.md) P1c). `apply` compares
+the desired value with the file, so once a value was written, every later frame
+found the file matching and answered `noop`. A report is last-write-wins, so any
+reconnect turned the row to `applied` while the daemon still ran the old value,
+and a pod roll did that to every such device at once. The server cannot tell a
+reconnect from a restart, so the device does it: the daemon records what it started
+on (`running_on`, `agents/roomlerd/src/remote_config.rs:251`), and a key the pushed
+document manages stays in `needs_restart` until this process runs it. A reconnect
+still writes nothing to disk. A local edit waiting on a restart is left out,
+because this report is about the push. A save back to the value this process runs
+leaves nothing waiting, so it reads `applied` at once, and a restart would change
+nothing.
+
+Two limits. A build before P1c still turns the row to `applied` at a reconnect, and
+no capability word marks the difference, so read the row's `agent_version` against
+the release that carries it. And an environment variable beats the file
+for the encoder keys (`crates/tunnel-core/src/env.rs:30`), so a key set in the
+daemon's environment reads `applied` after a restart while the environment's value
+is in force, and no restart changes that. A supervised Mac worker gets the root's
+value that way (`agents/roomlerd/src/macos_supervisor.rs:303`).
+
 ⚠️ **`config-report` is a SEPARATE capability verb from `config`**, and this is
 the `ssh` / `ssh-consent` split recurring exactly as that doc predicted it
 would. Agents rc.457 and rc.458 shipped `config`: they apply a pushed config
@@ -224,11 +251,11 @@ owner's: gate 3 of cross-org access, and the password record behind it. `Desired
 cannot hold one, under a prefix test, so the key that matters is also the one added
 after the test was written. The route says so instead of answering 200 for a key it
 dropped: a body naming one is refused with a 403 and audited as `device_owned_key`
-(`names_a_device_owned_key`, `crates/modules/fleet/src/remote_config.rs:172`). That
+(`names_a_device_owned_key`, `crates/modules/fleet/src/remote_config.rs:173`). That
 refusal is a courtesy to the admin who asked. What stops a compromised server is the
 device, whose frame type drops the key whatever a frame carries
 (`a_pushed_external_key_never_reaches_the_device`,
-`agents/roomlerd/src/remote_config.rs:567`).
+`agents/roomlerd/src/remote_config.rs:714`).
 
 **A non-security key on the same surface (FR-77 P3).** `encoder_cells_deny`
 — the cell matrix's denylist, comma-separated `name:chroma` entries or `none`
@@ -274,13 +301,13 @@ Unlike the two denylists, the server reads the word. It takes the words
 `roomler config set` takes (`true`/`false`, `1`/`0`, `yes`/`no`, in any case),
 stores the spelling above, and refuses anything else with a 400 that names the
 key, recording nothing (`pushed_tribool`,
-`crates/modules/fleet/src/remote_config.rs:183`). A tribool has no entries a
+`crates/modules/fleet/src/remote_config.rs:184`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
 (`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3118`), and a test
 holds it to what `roomler config set` reads. A word that reaches a device anyway,
 from some other server, leaves its key as it is, logged, and never fails the
-keys beside it (`agents/roomlerd/src/remote_config.rs:340`).
+keys beside it (`agents/roomlerd/src/remote_config.rs:470`).
 
 ⚠️ **Not managed is not a revert.** A device keeps what it was pushed last, so
 an `off` is undone by pushing the default, and only then stopping management:
@@ -298,8 +325,8 @@ on the terms of the two other denylists. It needs `MANAGE_AGENTS` alone, because
 it only ever *removes* a GPU form a device would otherwise open. It reports
 `needs_restart`, because the probe reads it once per process and the encoders
 read it through the config fallbacks
-(`agents/roomlerd/src/remote_config.rs:354`). The server passes it on unread
-(`crates/modules/fleet/src/remote_config.rs:283`): an entry the gate cannot read
+(`agents/roomlerd/src/remote_config.rs:484`). The server passes it on unread
+(`crates/modules/fleet/src/remote_config.rs:284`): an entry the gate cannot read
 denies nothing, because `gpu_hint::is_denied` matches only an exact `name:gpu`.
 It exists so that a GPU-input cell can be turned off from the server before any
 cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).

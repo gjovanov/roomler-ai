@@ -102,7 +102,7 @@ export const PERMISSION_FLAGS: PermissionFlag[] = [
     label: 'Run commands on devices',
     group: 'Fleet access',
     description:
-      'Run a command on a device via Fleet RPC. Commands execute as root (Linux) or, on Windows, as the daemon\'s worker: the signed-in user on an attended install, SYSTEM in SystemContext mode. Also requires the org switch, the device policy, and the device-local key.',
+      'Run a command on a device via Fleet RPC. Commands execute as root (Linux) or, on Windows, as SYSTEM through the device\'s service once an administrator has anchored it. A Windows device that is not anchored runs them as the signed-in user on an attended install, and as SYSTEM in SystemContext mode. Also requires the org switch, the device policy, and the device-local key.',
   },
   {
     key: 'VIEW_EXEC_AUDIT',

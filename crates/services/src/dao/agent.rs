@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecPolicy,
-    ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, RpcCap, SshPolicy,
+    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecAnchor,
+    ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, RpcCap, SshPolicy,
 };
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
@@ -902,8 +902,45 @@ impl AgentDao {
         let policy_bson = bson::to_bson(policy).unwrap_or(bson::Bson::Null);
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": { "external_access_policy": policy_bson } },
+            )
+            .await
+    }
+
+    /// FR-94 — record the device's anchor, replacing any earlier one: the fresh
+    /// `anchor_id` is what revokes the credentials an earlier anchor minted.
+    ///
+    /// Through [`Self::live_row`] because a removal ends the anchor (#2133) and a
+    /// tombstone revives whole: one written after the removal would come back
+    /// with the machine's next enrollment, and with it SYSTEM exec.
+    pub async fn set_exec_anchor(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        anchor: &ExecAnchor,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                Self::live_row(tenant_id, agent_id),
+                doc! { "$set": { "exec_anchor": bson::to_bson(anchor)? } },
+            )
+            .await
+    }
+
+    /// Store the config an admin wants this device to apply
+    /// (`docs/remote-config.md`). Through [`Self::live_row`], so a push that races
+    /// the removal does not wait on the row for the machine's next enrollment.
+    pub async fn set_desired_config(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        desired: &DesiredConfig,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                Self::live_row(tenant_id, agent_id),
+                doc! { "$set": { "desired_config": bson::to_bson(desired)? } },
             )
             .await
     }
@@ -926,7 +963,7 @@ impl AgentDao {
     ) -> DaoResult<bool> {
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": {
                     "connect_code": code,
                     "connect_code_rotated_at": DateTime::now(),

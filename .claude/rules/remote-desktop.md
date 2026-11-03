@@ -48,6 +48,20 @@ consent-capable, fleet-wide. Locked by `ssh_does_not_imply_ssh_consent`.
 ⚠️ The wire spellings are a compatibility surface: renaming one doesn't fail
 loudly, it makes every deployed device look like it lacks the feature.
 
+### Input: a chord only `mods` names (#3046)
+
+The arbiter reads `InputMsg::Key.mods`, and no backend does. A key press naming a
+modifier the session does not hold (the soft keyboard's sticky keys, a controller's
+one-key chord) is tapped whole on its `down` frame, with nothing recorded as held
+(`chord_tap`, `docs/remote-control.md` §6).
+⚠️ **Don't split it into a press now and a release on the up frame, and don't have the
+viewer send modifier frames for it.** The input channel is `ordered: false,
+maxRetransmits: 0`, so a lost up frame is a stuck Ctrl on the host, which is worse
+than a bare letter.
+⚠️ On a Mac host a held Cmd answers the Ctrl bit, because a viewer rewrites Ctrl to
+Cmd in the key's code and not in `mods` (FR-13). Without it every Ctrl+C from a
+viewer presses a second, literal Ctrl.
+
 ### Encoders — load the `encoder-cells` skill
 
 Preference resolution: **CLI `--encoder` > env `ROOMLERD_ENCODER` >
@@ -68,6 +82,16 @@ VAAPI / D3D12 / Vulkan / VideoToolbox) — lives in the **`encoder-cells` skill*
   denylist was probe-only until 0.4.90, and a session happily opened a denied cell
   the hello never advertised.
 - ⚠️ **A probe proves an OPEN; only a SESSION proves a CELL.**
+
+### Input: typed text never attaches per frame (#3047)
+
+`KeyText` reads the target's CapsLock through `AttachThreadInput`, and that call resets
+the target's key state. Read once a frame, it landed between the target reading
+Shift-down and reading the key Shift was for, and the character came out unshifted.
+⚠️ **The read stays once per run of typing (`caps_for_frame`, `docs/remote-control.md`
+§6.4), and nothing on the per-frame path may attach to another thread's input.**
+⚠️ A keyboard hook cannot see this bug: every lost character shows Shift held, because
+the injected keys were right. Read what the target translated.
 
 ### Host consent (FR-27, closed — the macOS native panel is still unverified)
 
