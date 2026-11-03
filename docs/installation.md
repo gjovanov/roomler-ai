@@ -134,7 +134,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3803`, `crates/agent-core/src/config.rs:4267`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3828`, `crates/agent-core/src/config.rs:4267`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:634`, `:966`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -1365,8 +1365,37 @@ still bind every session on that Mac: the worker hands them to the daemon, which
 the stricter of the person's and its own.
 
 The switch is off by default and stays off until the
-[field proof](fr/FR-43-macos-single-enrollment.md#what-rides-what). It doesn't yet give
-one row alone: the migration of a two-row Mac and the one-token install are P3c and
+[field proof](fr/FR-43-macos-single-enrollment.md#what-rides-what). It doesn't give one
+row alone: the switch leaves a person's enrollment in their file, so their row stays.
+
+**The migration (FR-43 P3c).** `sudo roomlerd one-row` makes a two-row Mac one row. It
+says its plan first and asks: `--dry-run` stops after the plan, and `--yes` goes ahead
+where no terminal can ask, as under `roomler exec`. Each enrollment in a person's file
+comes out of it. One the root half already holds, the same server and tenant, is
+**retired**: its row reads offline until a person deletes it from the device list. One
+the root doesn't hold is **moved** into the root's `[[orgs]]` with its token and
+WireGuard key, so its row stays, with its overlay off until `roomlerd org overlay` turns
+it on. Then the LaunchAgent goes, the root's file gets both switches, and the daemon
+restarts, which ends live sessions.
+
+```mermaid
+flowchart LR
+    PLAN["plan, said"] --> KEEP["copies: *.pre-one-row"] --> LA["LaunchAgent out, plist aside"]
+    LA --> FILES["root's file: both switches, moved orgs; people's files: no enrollment"]
+    FILES --> RESTART["kickstart -k: a new daemon in 30 s"] --> VERIFY{"within 60 s: connected, worker attached, screen-capture"}
+    VERIFY -- yes --> REPORT["one row: the retired rows to delete"]
+    VERIFY -- no --> UNDO["copies and plists back, LaunchAgent bootstrapped, restart"]
+    KEEP -.->|"a step fails"| UNDO
+    LA -.->|"a step fails"| UNDO
+    FILES -.->|"a step fails"| UNDO
+```
+
+Once it goes ahead it can't be stopped halfway: a detached copy of it applies the plan,
+so it outlives the restart of the daemon that carried a `roomler exec`, and a Ctrl-C
+ends only the command that waits for it. Its account also goes to
+`/var/log/roomler/one-row.log`. `sudo roomlerd one-row --revert` puts back
+every copy, the plist and the LaunchAgent, and restarts: two rows again, until a person
+deletes a retired row, whose token then cannot come back. The one-token install is
 P3d.
 
 ```bash
@@ -1530,13 +1559,13 @@ Device configuration card carries a banner naming both files
 `config set` print the "a second roomler daemon is running" note that `status`
 and `peers` already printed — a note that had gone silent for the console user,
 because the root socket's `0700` directory refuses their `stat`; the root half's
-person socket is the evidence now (`crates/localapi/src/lib.rs:4627`).
+person socket is the evidence now (`crates/localapi/src/lib.rs:4648`).
 
 The root half's switches are **root's to set by design**, not by omission: its
 LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person socket it
 serves the console user admits the safety surface only — status, sessions,
 consent, the Devices view — never a config verb (`localapi::person_may`,
-`crates/localapi/src/lib.rs:3129`). Whether the console user should flip the
+`crates/localapi/src/lib.rs:3150`). Whether the console user should flip the
 root half's gates from the app is the decision left open on #2871; until it is
 taken, the gate stays with `sudo`.
 
@@ -1616,7 +1645,7 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3437`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3462`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
@@ -1857,7 +1886,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2200`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2225`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

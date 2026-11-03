@@ -220,7 +220,7 @@ v0.2 also put the node side in a second binary, `hived`, supervised by `roomlerd
 doubles the signing, updater and installer couplings on every platform and contradicts
 "one daemon per machine". The node side is a cargo feature of `roomlerd`. Its
 user-level half is `roomlerd hive-host`, re-exec'd as the user the way `portal-helper`
-and `record` already are (`agents/roomlerd/src/app.rs:250,352`), so it ships, signs
+and `record` already are (`agents/roomlerd/src/app.rs:270,352`), so it ships, signs
 and updates with the daemon.
 
 ### 3.2 Who runs as what
@@ -881,7 +881,7 @@ One MCP server per session, reached through `roomler mcp` (a stdio shim the harn
 starts) over a **per-session endpoint**: a Unix socket owned by the mapped account
 (`0600` under a `0700` directory) or a named pipe whose DACL names only that account's
 SID. It can't be the main LocalAPI endpoint: on a root daemon that socket is root-only
-(`crates/localapi/src/lib.rs:4161-4179`), and on Windows the pipe admits every
+(`crates/localapi/src/lib.rs:4182-4200`), and on Windows the pipe admits every
 interactive user and most verbs trust the pipe alone (`lib.rs:1127-1129`).
 
 | Tool or resource | Does | Gate |
