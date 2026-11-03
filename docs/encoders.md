@@ -1548,7 +1548,7 @@ flowchart LR
     T["a thread that encodes<br/>or captures starts"] --> S{"ROOMLERD_ENCODER_CLOCK"}
     S -->|"0"| N["asks for nothing"]
     S -->|"1"| A["asks the OS"]
-    S -->|"unset"| D{"DEFAULT_ON:<br/>measured on this OS?"}
+    S -->|"unset"| D{"DEFAULT_ON:<br/>did this OS gain?"}
     D -->|"Linux, Windows"| A
     D -->|"macOS"| N
     A --> L["Linux: uclamp_min 1024"]

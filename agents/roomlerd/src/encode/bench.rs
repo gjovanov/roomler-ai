@@ -1129,6 +1129,10 @@ pub fn clock_label(outcome: super::clock::Outcome) -> String {
 /// asks for its clock first (FR-112 P1, P3), so on Linux the threads an encoder
 /// creates inherit it, and a thread-affine encoder (QSV) never changes threads
 /// between frames, which a paced row's sleeps would allow on the runtime.
+///
+/// The thread asks once, for every row, and on Windows a session's hardware
+/// encoder thread does not ask at all: `ROOMLERD_ENCODER_CLOCK=0` reads such a
+/// row the way a session runs it.
 pub async fn run(args: &BenchArgs, pref_raw: &str, name: Option<&str>) -> anyhow::Result<()> {
     let pref: EncoderPreference = pref_raw
         .parse()
