@@ -321,7 +321,7 @@ describe('PairView — the device', () => {
     await flushPromises()
     expect(postCalls('/pair/approve')).toEqual([['/pair/approve', { user_code: 'BCDFGHJK', tenant_id: 't1' }]])
     expect(w.find('[data-test="pair-approved"]').text()).toBe(
-      'Approved — your installer continues on its own. You can close this tab.',
+      'Approved — go back to your installer to finish. You can close this tab.',
     )
     expect(w.find('[data-test="pair-approve"]').exists()).toBe(false)
   })

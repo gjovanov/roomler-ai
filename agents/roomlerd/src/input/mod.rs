@@ -389,6 +389,9 @@ pub enum InputMsg {
     Key {
         code: u32,
         down: bool,
+        /// What the viewer says is down with this key: 0x01 Ctrl, 0x02 Shift,
+        /// 0x04 Alt, 0x08 Meta. The arbiter reads it (#3046, `chord_tap`) and
+        /// turns what no frame pressed into frames, so no backend reads it.
         mods: u8,
     },
     KeyText {

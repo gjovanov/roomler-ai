@@ -105,11 +105,11 @@ sequenceDiagram
 
 | Rule | Where | Why |
 |---|---|---|
-| One answer for every address: unknown, waiting, active, inside the cooldown, malformed | `accept_resend`, `crates/api/src/routes/auth.rs:387` | a difference is an oracle for `users.email`, the key account-linking resolves against |
+| One answer for every address: unknown, waiting, active, inside the cooldown, malformed | `accept_resend`, `crates/api/src/routes/auth.rs:417` | a difference is an oracle for `users.email`, the key account-linking resolves against |
 | The answer does not wait for the lookup | the same function, deliberately not `async` | a known address costs more Mongo round trips than an unknown one, which is the same oracle in the latency |
 | Per client address: 5, then one every 3 minutes, a 429 with `Retry-After` | `ip_rate_limit`, `crates/api/src/middleware/auth_rate_limit.rs:157` | the route mails whoever its body names, so the budget must not reset per address |
 | Per account: one new link every 15 minutes, silently | `ACTIVATION_RESEND_COOLDOWN_SECS`, `crates/services/src/dao/user.rs:28` | a 429 here would only ever fire for an address that has an account |
-| Only a password sign-up still waiting is mailed: never an active account, a tombstone or a `.invalid` placeholder | `claim_activation_resend`, `crates/services/src/dao/user.rs:189` | it is one atomic update, so two pods cannot both send |
+| Only a password sign-up still waiting is mailed: never an active account, a tombstone or a `.invalid` placeholder | `claim_activation_resend`, `crates/services/src/dao/user.rs:197` | it is one atomic update, so two pods cannot both send |
 
 ⚠️ Sign-up does not start the cooldown. At a 5-minute link, a person back at minute 6 would
 otherwise be told a new one is coming and get nothing until minute 15. So the first resend
@@ -135,8 +135,8 @@ capability URLs, webhook signatures).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/auth/register` | Create account (+ optionally a tenant, or accept `invite_code`). A taken address or username answers 409, in words (#3199) |
-| POST | `/api/auth/login` | Password login (`email` or `username`) |
+| POST | `/api/auth/register` | Create account (+ optionally a tenant, or accept `invite_code`). A taken address or username answers 409, in words (#3199). A taken `tenant_slug` answers 409 before anything is created, a deleted organization's slug included, so no account or activation mail is left behind (#3247) |
+| POST | `/api/auth/login` | Password login (`email` or `username`). A `username` that matches no account and holds an `@` is looked up as an address, since the sign-in page sends its one box as `username` (#3247) |
 | POST | `/api/auth/logout` | Invalidate session |
 | POST | `/api/auth/refresh` | Rotate the access token |
 | POST | `/api/auth/activate` | Redeem an email activation code (`{user_id, token}`); the SPA's `/auth/activate` page, where the activation email's link lands, posts it (#3029) |
@@ -363,8 +363,8 @@ agent's session can change it.
 | PUT | `…/agent/{aid}/exec-policy` | Per-device exec gate (a management act, separate from the exec power) |
 | POST | `…/agent/{aid}/overlay-key/rotate` | Order the device to retire its overlay (WireGuard) key — it mints locally, re-joins and reports back; the server never sees a private key (FR-40). `MANAGE_AGENTS`, one order per device per minute. 200 `{request_id, dispatch: "pushed" \| "queued", delivered}`; 409 `rate_limited` / `agent_unsupported` (online device without the `key-rotate` verb) — see [overlay-key-rotation.md](overlay-key-rotation.md) |
 | GET/POST | `…/agent/{aid}/connect-code` | The code an outsider names a device by (FR-52). `MANAGE_AGENTS`, and never in the ordinary device list. **GET** reads it whether or not the device is approved: 200 `{connect_code, connect_code_rotated_at}`, both null when none has been minted; 404 for a removed device. **POST** mints or rotates it: 200 `{connect_code, rotated_at}`, and the old code stops working at once; 404 for a removed device too |
-| GET/PUT | `…/external-access` | FR-52 gate 1, the org's switch ([external-access.md](external-access.md)). GET `MANAGE_AGENTS`, with the approved devices. PUT `MANAGE_TENANT`: it decides whether the org can be reached from outside at all |
-| PUT | `…/agent/{aid}/external-access-policy` | FR-52 gate 2: approve a device, with a ceiling and an optional expiry, or clear it. `MANAGE_AGENTS` + `REMOTE_CONTROL` to approve, `MANAGE_AGENTS` alone to clear. Both arms and every refusal reach the log. 404 for a removed device, with nothing written and no row in the log |
+| GET/PUT | `…/external-access` | FR-52 gate 1, the org's switch ([external-access.md](external-access.md)). GET `MANAGE_AGENTS`, with the approved devices. PUT `MANAGE_TENANT`: it decides whether the org can be reached from outside at all, and turning it off ends the org's external sessions |
+| PUT | `…/agent/{aid}/external-access-policy` | FR-52 gate 2: approve a device, with a ceiling and an optional expiry, or clear it. `MANAGE_AGENTS` + `REMOTE_CONTROL` to approve, `MANAGE_AGENTS` alone to clear, and clearing ends the device's external sessions. Both arms and every refusal reach the log. 404 for a removed device, with nothing written and no row in the log |
 | GET | `…/external-rc-audit` | Every external-access decision, the refusals included, newest first (`page`, `per_page`). `VIEW_REMOTE_AUDIT`. 90 d TTL |
 | GET | `…/external-principals` | Who has come in from outside, one row per person per device, the most recent first (`page`, `per_page`): `{agent_id, user_id, name, first_session_at, last_session_at, revoked_at}`. `name` is what the account calls itself today, a claim, and `null` once it is gone. `VIEW_REMOTE_AUDIT` (FR-52 P5) |
 | PUT | `…/agent/{aid}/external-principals/{user_id}` | Bar a person from this device, or let them back: `{revoked}`. `MANAGE_AGENTS` to bar, + `REMOTE_CONTROL` to let back, decided before the row is read, so a refused caller gets one 403 whether or not the person came in. A bar ends their external session on whichever pod holds it. 404 for a person with no row: only a session makes one (FR-52 P5), and 404 for a removed device |

@@ -341,6 +341,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_route_tick_secs: None,
         overlay_netmon: None,
         overlay_netmon_debounce_ms: None,
+        overlay_netchange_poke_quiet_secs: None,
         overlay_relay_tls: None,
         overlay_shared_carrier: None,
         overlay_roam: None,
