@@ -722,7 +722,7 @@ Two reports, about 19:50Z, each measured before any fix:
 
 | Report | Measured | Mechanism |
 |---|---|---|
-| "`https://roomler.ai/api/setup/windows` downloads a zip, not the installer direct." | `Content-Type: application/zip`, `roomler-setup-0.4.188-x86_64-pc-windows-msvc.zip`, while the public install page promises "a signed EXE with a role picker" (`ui/docs/content/start/install/windows.md:40`) | the release lane signs `roomler-setup.exe` and publishes it only inside a zip (`.github/workflows/release-setup.yml:528-610`); `pick_setup_asset` serves only a `.zip` for `windows-x86_64` (`crates/modules/fleet/src/setup_release.rs:221-245`); `stream_asset` (`:402`) streams that asset unchanged |
+| "`https://roomler.ai/api/setup/windows` downloads a zip, not the installer direct." | `Content-Type: application/zip`, `roomler-setup-0.4.188-x86_64-pc-windows-msvc.zip`, while the public install page promises "a signed EXE with a role picker" (`ui/docs/content/start/install/windows.md:40`) | the release lane signs `roomler-setup.exe` and publishes it only inside a zip (`.github/workflows/release-setup.yml:525-607`); `pick_setup_asset` serves only a `.zip` for `windows-x86_64` (`crates/modules/fleet/src/setup_release.rs:221-245`); `stream_asset` (`:402`) streams that asset unchanged |
 | "It installs a tunnel, not the daemon-system role (background service), which should be the default installation, with overlay and lock-screen control enabled. macOS and Linux should do the same." | on the operator's own machine the wizard's saved state (`crates/roomler-setup-core/src/wizard_state.rs:66`) held `{"step":"done","role":"tunnel-client"}` and an earlier test run's device name; the tunnel card came up selected, and a second, elevated run tried to enroll the machine under that test name | `loadPersistedState` restores the role and the device name whatever the saved step, and only moves the step back to Welcome (`agents/roomler-setup/src/front/app.js:179`); with no saved state nothing is selected at all (`state.role` starts `null`, `app.js:136`), and the Windows background service is "recommended" only in its card's title |
 
 Asked in the same exchange how the wizard could "automatically ask for sudo right or win run
@@ -841,12 +841,12 @@ sequenceDiagram
   (`crates/roomler-setup-core/src/elevation.rs:112`), with
   `--role <role> [--server <url>] [--session-data <folder>] --after-elevation <pid>` — the server
   only when it is not the default, the folder being the limited copy's `%LOCALAPPDATA%`
-  (`agents/roomler-setup/src/launch.rs:153`). The relaunch happens on Welcome, before a
+  (`agents/roomler-setup/src/launch.rs:215`). The relaunch happens on Welcome, before a
   token exists, so nothing secret is on the command line; every value is validated on both
   sides, and an unknown argument is ignored. `SEE_MASK_NOZONECHECKS`, because the file is the
   wizard's own running image, whose zone check ran when the person opened it.
 - **The wait.** The elevated copy waits, at most 30 s, for the limited one to exit
-  (`launch.rs:403`, called from `agents/roomler-setup/src/main.rs:78`) **before** Tauri's
+  (`launch.rs:465`, called from `agents/roomler-setup/src/main.rs:78`) **before** Tauri's
   single-instance plugin initialises: the plugin finds a running copy by its mutex and window
   and would hand that dying copy the arguments and quit. Under over-the-shoulder credentials
   (a standard user types an administrator's password) the elevated copy is another account,
@@ -864,7 +864,7 @@ sequenceDiagram
   `%LOCALAPPDATA%` for its saved state and log, which is why the role and server travel on the
   command line. The wizard can tell this case apart, because the limited copy names its own
   `%LOCALAPPDATA%` in `--session-data` and a different one here says so
-  (`launch::on_another_account`, `agents/roomler-setup/src/launch.rs:252`). It then offers only
+  (`launch::on_another_account`, `agents/roomler-setup/src/launch.rs:315`). It then offers only
   the machine-wide service, with a note saying why (`RoleLimit::AnotherAccount`,
   `agents/roomler-setup/src/role.rs:191`): the other roles would install into that administrator's
   profile and still report Done. `cmd_install` and `cmd_pair_start` hold the same rule for a run
@@ -873,11 +873,11 @@ sequenceDiagram
   Under over-the-shoulder credentials that was Edge as the administrator, at high integrity, on
   the standard user's desktop (the log, 2026-11-02): a browser the person at the screen could use
   to start anything as that administrator. An elevated wizard runs `<windir>\explorer.exe <url>`
-  instead (`launch::open_through_the_shell`, `launch.rs:280`), and the session's own Explorer opens
+  instead (`launch::open_through_the_shell`, `launch.rs:343`), and the session's own Explorer opens
   the page, in that user's default browser and profile, at medium integrity. Measured with Edge as
   the default browser.
 - **WebView2.** An elevated run gives WebView2 a user-data folder of its own,
-  `<the limited copy's %LOCALAPPDATA%>\ai.roomler.setup\elevated` (`launch.rs:308`, `:363`).
+  `<the limited copy's %LOCALAPPDATA%>\ai.roomler.setup\elevated` (`launch.rs:370`, `:425`).
   WebView2 shares one browser
   process among every host that names the same folder, and the limited copy's browser process
   can outlive that copy by a moment; an elevated host joining a limited browser process is the
@@ -885,7 +885,7 @@ sequenceDiagram
   ignores every `WEBVIEW2_*` environment override and honours what the app passes through the
   API (Microsoft's "Develop secure WebView2 apps"), so the folder goes to Tauri's
   `WebviewWindowBuilder::data_directory`, the `userDataFolder` argument WebView2 receives. That
-  is why the main window is now created by the setup hook (`main.rs:120`) from its
+  is why the main window is now created by the setup hook (`main.rs:121`) from its
   `tauri.conf.json` entry, which says `"create": false`; a test holds the two together. (The
   first cut of C3 set `WEBVIEW2_USER_DATA_FOLDER`, which an elevated host would have ignored;
   the #3116 kit had already met the same rule for the CDP port, which an elevated wizard takes
@@ -898,7 +898,7 @@ sequenceDiagram
   right-click, with Edge's own "We couldn't create the data directory", so C3 inherited this
   rather than caused it. So the limited copy names its own `%LOCALAPPDATA%` on the command line
   (`--session-data`, a local absolute path, checked on both sides by `safe_folder`,
-  `launch.rs:136`; a folder that is not there falls back to this process's own), which is the
+  `launch.rs:141`; a folder that is not there falls back to this process's own), which is the
   session user's and which that user has just written to. For an administrator approving their
   own prompt it is the same folder as before. Rejected: finding the folder through Explorer's
   token (`OpenProcessToken` is denied without `SeDebug`), and a folder everyone can write in
@@ -910,7 +910,7 @@ sequenceDiagram
   behind it, with only a taskbar button to show for it (2 of 2; from Explorer it came up in front,
   2 of 2). So `run_elevated` passes its right on with `AllowSetForegroundWindow`
   (`elevation.rs:112`), and a relaunched copy asks for the foreground once its window exists
-  (`main.rs:144`), which is tao's `SetForegroundWindow` with its Alt-key fallback.
+  (`main.rs:145`), which is tao's `SetForegroundWindow` with its Alt-key fallback.
 - **DLLs.** C2 puts the EXE in the person's Downloads and C3 has the same image elevate itself,
   so a DLL left beside it would load into both copies, the elevated one behind a UAC prompt
   naming our publisher. Before C the EXE ran from a folder freshly unzipped, so this is C's to
@@ -938,15 +938,15 @@ sequenceDiagram
   Windows and fails on a bare name, or on an expression it has not been told about.
 - **What an elevated run takes from its user.** A value in `HKCU\Environment` reaches an elevated
   process of that user. On the same build the elevated copy fetched its MSI from an address written
-  there, with no second prompt (the log, 2026-11-02). `launch::start_clean` (`launch.rs:213`),
+  there, with no second prompt (the log, 2026-11-02). `launch::start_clean` (`launch.rs:275`),
   `main`'s second line (`agents/roomler-setup/src/main.rs:53`), therefore does three things. The
   machine's folders take their true values on every run (`appdirs::machine_folder_variables`,
   `appdirs.rs:125`). The current directory moves to System32; an elevated copy otherwise keeps
   the limited one's. An elevated run drops `ROOMLER*`, `WEBVIEW2_*`, `TAURI_*` and `SSL_CERT_*`
-  (`launch::distrusted_variable`, `launch.rs:192`). A limited run keeps those, because it crosses
+  (`launch::distrusted_variable`, `launch.rs:254`). A limited run keeps those, because it crosses
   nothing its user cannot already do, and test fixtures use them. The elevated WebView2 folder
   sits where the limited user can write, so it is made new at each start and no link is followed
-  (`make_elevated_folder`, `launch.rs:322`), and the page holds only the grants it uses
+  (`make_elevated_folder`, `launch.rs:384`), and the page holds only the grants it uses
   (`agents/roomler-setup/capabilities/default.json`). The MSI's publisher and the `%TEMP%` swap stay
   with #3246.
 - **A desktop that refuses prompts.** `ConsentPromptBehaviorUser=0`, which the CIS and STIG baselines

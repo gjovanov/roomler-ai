@@ -40,7 +40,7 @@ The list has been unreachable end-to-end since it shipped:
    but `/` carries `meta:{auth:true}` and the router guard exact-matches
    `to.fullPath === '/'` (`ui/src/plugins/router.ts:279`): a logged-out confirmer is
    bounced to `/login` with sessionStorage noise, a signed-in one renders the dashboard,
-   and the `SUBSCRIBE_MESSAGES` handler (`ui/src/views/LandingView.vue:324-337`) is dead
+   and the `SUBSCRIBE_MESSAGES` handler (`ui/src/views/LandingView.vue:320-333`) is dead
    code.
 3. **P0 measures the prod consequences before anything is built**: subscriber counts by
    status (expected ≈0 given bug 1) and mailer health (is SendGrid's `api_key` set — do
