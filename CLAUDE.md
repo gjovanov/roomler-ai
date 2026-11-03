@@ -226,6 +226,7 @@ agents/
   roomlerd/           → the native agent: WebRTC peer, capture, encode, input, overlay, tunnels, SSH
   roomler-cli/        → tunnel client, bin `roomler` (the command surface lives in the LIB)
   roomler-cli-shim/   → installed by the MSI/.deb as `roomler`; re-execs `roomlerd cli`
+  roomlerdw/          → what the per-user Scheduled Task runs: starts the daemon with no window
   roomler-desktop/    → the tray companion (devices, tunnels, settings, consent)
   roomler-setup/      → Tauri 2 unified install wizard (lib `wizard_app`)
 ui/src/               → api/ · components/ · composables/ · stores/ · views/ · plugins/ (docs/ui.md)
