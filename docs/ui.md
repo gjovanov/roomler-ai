@@ -412,6 +412,10 @@ taken at `ConferenceView.vue:772`). It is for that one room, spent by the next m
 whatever its room, and void after 10 s. It is never a query or `history.state`, so a reload
 or a back-and-forward cannot put a camera into a call nobody just asked to join.
 `ConferenceViewRoomSwitch.spec.ts` runs the real page against the real route record.
+`e2e/conference-room-switch.spec.ts` drives the three rows in a browser against a real API
+and reads the outcome from the server's participant list for each room. Its join waits for
+the page's socket: a join sent before the socket has its connection id opens a call session
+with none, and a leave from that page, which names its connection, does not close it.
 
 **A link clicked inside the app never takes a tab away from a live session (#2841).** A
 page that holds one carries `meta.liveSession`: both remote viewers (`agent-remote`,
