@@ -1878,6 +1878,12 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
   `install.ps1 -Uninstall`; the daemon's version sweep also removes older
   same-flavour MSIs after upgrades. `roomlerd service uninstall` removes a
   manually-installed service/task.
+  From a PowerShell started as administrator, `install.ps1 -Uninstall` removes
+  either flavour and the companion it placed in `C:\Program Files\Roomler`
+  (`roomler-desktop.exe` with its `.old` and `.version`). A run that is not
+  elevated removes this account's install only, and names what it left with
+  the way on (`scripts/install.ps1:519-531`, #3247). Either way the settings in
+  `C:\ProgramData\roomler` stay.
 - **Linux and macOS** (FR-97 P6d): one command, whatever put Roomler there —
   this script, the `.deb`, the companion's `.rpm`, the tarball, the `.pkg`, the
   tunnel CLI. Every step acts only on what is present, so it also works on a

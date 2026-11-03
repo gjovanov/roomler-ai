@@ -517,18 +517,30 @@ function Uninstall-Roomler {
     }
 
     # 2) Script-copied leftovers the MSI never owned: roomler-desktop.exe
-    #    (placed by Install-Desktop) + the then-empty install dir.
-    foreach ($dir in @((Join-Path $env:ProgramFiles 'Roomler'), (Join-Path $env:LOCALAPPDATA 'Programs\Roomler'))) {
-        $desk = Join-Path $dir 'roomler-desktop.exe'
-        if (Test-Path $desk) {
-            try {
-                Get-Process -Name 'roomler-desktop' -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Path -like ($dir + '*') } | Stop-Process -Force -ErrorAction SilentlyContinue
-                Remove-Item $desk -Force
-                Say "removed leftover $desk"
-                if (-not (Get-ChildItem $dir -ErrorAction SilentlyContinue)) { Remove-Item $dir -Force }
-            } catch { Warn "could not remove ${desk}: $_" }
+    #    (placed by Install-Desktop or the wizard) with the two files the
+    #    wizard's swap and the daemon's refresh leave beside it (the names
+    #    INSTALL_DIR_PRODUCT_FILES lists in agents/roomlerd/src/install_cleanup.rs),
+    #    + the then-empty install dir. #3247 item 12: with the sidecars left the
+    #    dir never emptied, and in Program Files only an administrator may delete.
+    $companion = @('roomler-desktop.exe', 'roomler-desktop.exe.version', 'roomler-desktop.exe.old')
+    $machineDir = Join-Path $env:ProgramFiles 'Roomler'
+    foreach ($dir in @($machineDir, (Join-Path $env:LOCALAPPDATA 'Programs\Roomler'))) {
+        $found = @($companion | ForEach-Object { Join-Path $dir $_ } | Where-Object { Test-Path $_ })
+        if ($found.Count -eq 0) { continue }
+        if ($dir -eq $machineDir -and -not (Test-Elevated)) {
+            Warn "left $($found -join ', '): only an administrator may remove them. Run this again from a PowerShell started as administrator."
+            continue
         }
+        Get-Process -Name 'roomler-desktop' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -like ($dir + '*') } | Stop-Process -Force -PassThru -ErrorAction SilentlyContinue |
+            Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+        foreach ($f in $found) {
+            try {
+                Remove-Item $f -Force -ErrorAction Stop
+                Say "removed leftover $f"
+            } catch { Warn "could not remove ${f}: $_" }
+        }
+        if (-not (Get-ChildItem $dir -Force -ErrorAction SilentlyContinue)) { Remove-Item $dir -Force -ErrorAction SilentlyContinue }
     }
 
     # 3) The tunnel-client role (archive install -- by construction it has
