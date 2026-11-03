@@ -637,7 +637,7 @@ flowchart LR
     H["Claude Code, as the account<br/>ANTHROPIC_BASE_URL = 127.0.0.1:port, this session's own<br/>ANTHROPIC_API_KEY = this run's token"] -->|"x-api-key: the token"| SC
     subgraph D["roomlerd, SYSTEM or root"]
         SC["sidecar: this session's token?<br/>does it run here at that fence?<br/>offline for at most 120 s?"]
-        K["hive_api_key_helper prints the credential<br/>cached 5 min, run again after a 401"]
+        K["hive_api_key_helper prints the credential<br/>one run at a time, its result every waiting call's<br/>cached 5 min, run again after a 401"]
     end
     SC -->|"the device's credential: an API key in x-api-key,<br/>or a subscription's bearer token under the OAuth beta;<br/>the body and the other anthropic-* unchanged"| P["provider"]
     P -->|"streamed back as it arrives"| SC
@@ -654,6 +654,7 @@ flowchart LR
 | its end | the session's end closes its port and cuts what is still connected, an answer mid-stream with it. A later call finds nothing listening | a process of the session that outlived it gets no more of an answer on the device's key, and holds nothing here | [`sidecar.rs:536`](../agents/roomlerd/src/hive/sidecar.rs#L536) `serve` |
 | a refusal | answered in the provider's own error shape, with a `debug` line in the daemon's log: `hive: a model call was refused`, its `status`, its `kind` and `why`, which is what tells a lease's wait from an offline device or a failed helper. None of it holds a token or the key | Claude Code retries a `503 overloaded_error`, so the log is where a refusal shows | [`sidecar.rs:733`](../agents/roomlerd/src/hive/sidecar.rs#L733) |
 | in a worker | where a worker serves the sidecar (`hive_worker`), admission and the key stay the daemon's, asked for one call at a time, within 45 s: past the server's word, 30 s, and the helper's 10 s. A call past that gets a `503 overloaded_error` and costs its worker nothing | a slow word costs a worker-hosted call nothing that it would not cost a daemon-hosted one, and a hung worker is still found by its beats | [`link.rs:135`](../agents/roomlerd/src/hive/worker/link.rs#L135) `ADMIT_WAIT` |
+| the key | kept 5 min, and fetched by one run of the helper at a time: a call that finds no key kept waits on the run in flight, or starts one, and that run's result, the key or the failure, answers every call waiting on it. A failure is not kept, so the next call runs the helper again. A 401 forgets the key at once; a run then in flight keeps nothing, and still answers the calls waiting on it | until #3362 one lock was held across the helper, so calls that came together ran a failing helper one after another, and the last of N waited N runs of up to 10 s. A call that gives up takes nothing from the others, and a run nobody waits on ends and keeps its key | [`model_key.rs:75`](../agents/roomlerd/src/hive/sidecar/model_key.rs#L75) `ModelKey::get` |
 | the credential | the first line the helper prints. One that begins `sk-ant-oat`, a Claude subscription's token as `claude setup-token` prints it, goes as `Authorization: Bearer`, with `oauth-2025-04-20` added once to the betas the harness asked for, and with no workspace, the device's or the session's. Any other is an API key, in `x-api-key`, with `hive_api_workspace_id`, when it is configured, in place of the session's workspace | the provider takes a subscription's token only as a bearer token under that beta, and a subscription has no workspace (P2k-1) | [`sidecar.rs:636`](../agents/roomlerd/src/hive/sidecar.rs#L636) `put_credential` |
 
 ⚠️ **A subscription's token spends its owner's own usage.** Every session the device
@@ -666,7 +667,10 @@ The helper runs through `/bin/sh -c` on Unix and `cmd.exe /d /s /c "<helper>"`, 
 its full path, on Windows, within 10 s. The first line it prints is the key, and
 neither its output nor its errors' output is logged
 ([`sidecar.rs:293`](../agents/roomlerd/src/hive/sidecar.rs#L293)). With no helper a
-session has no model access: its own config directory holds no login of its own.
+session has no model access: its own config directory holds no login of its own. A
+call that gives up never cuts a run short: the run ends on its own, within those
+10 s. Past them the timeout ends only the shell, so a helper that hangs can outlive
+it (#3437).
 
 ---
 
@@ -2934,7 +2938,7 @@ stateDiagram-v2
 
 ⚠️ **The 230 s is the device's own budget, held by a test.** A roomlerd test asserts
 `UNREACHABLE_SECS == WS_RX_DEADLINE + OFFLINE_GRACE + 30 s`
-([`sidecar/tests.rs:1282`](../agents/roomlerd/src/hive/sidecar/tests.rs#L1282)).
+([`sidecar/tests.rs:1567`](../agents/roomlerd/src/hive/sidecar/tests.rs#L1567)).
 Lengthen either clock on the device and the test fails before the server moves a session
 too soon.
 
