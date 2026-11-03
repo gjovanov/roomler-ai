@@ -4488,6 +4488,16 @@ jump. At the clean-run threshold the daemon reads the record, and
 watcher's whole life has passed, into `WatcherStopped`. Younger than that
 it looks once more when the time is up.
 
+⚠️ **The record is read in two places.** A SystemContext worker logs to
+`service-logs`, and the watcher it spawns has no service role, so the
+watcher writes `last-install.json` into SYSTEM's profile. Reading only its
+own log dir, the settle found nothing there: on a per-machine guest, a real
+self-update from 0.4.220 to 0.4.221 still read `InProgress` after the
+clean-run threshold. `post_install::outcome_paths` lists the daemon's own
+log dir and the profile's. The most recently written record is the one read
+and settled, in the file it came from. The watcher runs the outgoing
+release's code, so the reader is the side a release can fix.
+
 **What stops a watcher** (#3302). Measured beside a real per-user update,
 released 0.4.196 to 0.4.197, with four stand-ins running the same
 `post-install-watch`:

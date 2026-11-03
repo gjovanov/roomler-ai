@@ -98,7 +98,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 #[cfg(all(unix, not(target_os = "windows")))]
 use std::time::Instant;
@@ -180,12 +180,65 @@ pub fn outcome_path() -> Option<PathBuf> {
 /// recoverable.
 pub fn write_outcome(outcome: &InstallOutcome) -> Result<PathBuf> {
     let path = outcome_path().context("no log dir resolvable")?;
+    write_outcome_at(&path, outcome)?;
+    Ok(path)
+}
+
+/// [`write_outcome`] into a given file: the settle writes a record back where it
+/// found it.
+fn write_outcome_at(path: &Path, outcome: &InstallOutcome) -> Result<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let json = serde_json::to_string_pretty(outcome).context("serialising install outcome")?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+}
+
+/// #3302 — every file a record may be in, this process's own log dir first.
+///
+/// ⚠️ A SystemContext worker logs to `service-logs`, and the watcher it spawns has no
+/// service role, so the watcher writes its record into SYSTEM's profile. Reading only
+/// its own dir, the worker's settle never found a record: read on a per-machine
+/// guest, the record stayed `InProgress` past the clean-run threshold. The watcher is
+/// always the outgoing release's code, so the reader is the side that can be fixed.
+fn outcome_paths() -> Vec<PathBuf> {
+    record_paths_in(crate::logging::log_dir(), crate::logging::profile_log_dir())
+}
+
+/// [`outcome_paths`] from its two directories: each once, own first.
+fn record_paths_in(own: Option<PathBuf>, profile: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for dir in [own, profile].into_iter().flatten() {
+        let path = dir.join("last-install.json");
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// The record most recently written among `paths`, with its file. The newest file
+/// speaks even when it doesn't parse, so an unreadable record is never hidden by an
+/// older one that reads.
+fn read_newest_outcome(paths: &[PathBuf]) -> Result<Option<(PathBuf, InstallOutcome)>> {
+    let mut newest: Option<(&PathBuf, std::time::SystemTime)> = None;
+    for path in paths {
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        let written = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if newest.is_none_or(|(_, seen)| written > seen) {
+            newest = Some((path, written));
+        }
+    }
+    let Some((path, _)) = newest else {
+        return Ok(None);
+    };
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let parsed =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some((path.clone(), parsed)))
 }
 
 /// Read the most recent install outcome, if any. Returns `None`
@@ -193,17 +246,7 @@ pub fn write_outcome(outcome: &InstallOutcome) -> Result<PathBuf> {
 /// install where the operator manually deleted it). Errors are
 /// surfaced — a corrupt file is operator-actionable.
 pub fn read_outcome() -> Result<Option<InstallOutcome>> {
-    let Some(path) = outcome_path() else {
-        return Ok(None);
-    };
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let parsed =
-        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(Some(parsed))
+    Ok(read_newest_outcome(&outcome_paths())?.map(|(_, outcome)| outcome))
 }
 
 /// Run the watcher loop. Blocks until the installer exits or the
@@ -1176,19 +1219,24 @@ pub(crate) fn settle_unreported(
 /// #3302 — [`settle_unreported`] on the record on disk. Returns how long to wait
 /// before looking again, when a watcher could still be at work on it.
 pub fn settle_record(running_version: &str) -> Option<Duration> {
-    let mut outcome = match read_outcome() {
-        Ok(Some(outcome)) => outcome,
+    settle_record_in(&outcome_paths(), running_version, unix_now())
+}
+
+/// [`settle_record`] over given files, at a given time.
+fn settle_record_in(paths: &[PathBuf], running_version: &str, now_unix: u64) -> Option<Duration> {
+    let (path, mut outcome) = match read_newest_outcome(paths) {
+        Ok(Some(found)) => found,
         Ok(None) => return None,
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "could not read the install record");
             return None;
         }
     };
-    match settle_unreported(&mut outcome, running_version, unix_now()) {
+    match settle_unreported(&mut outcome, running_version, now_unix) {
         Settle::HasVerdict => None,
         Settle::TooSoon(wait) => Some(wait),
         Settle::Settled => {
-            match write_outcome(&outcome) {
+            match write_outcome_at(&path, &outcome) {
                 Ok(_) => tracing::warn!(
                     status = ?outcome.status,
                     expected = %outcome.expected_version,
@@ -1486,6 +1534,111 @@ mod tests {
             assert_eq!(o.note, "the watcher's word");
             assert_eq!(o.finished_unix, None);
         }
+    }
+
+    /// Give a file a last-write time, so which record is newer doesn't hang on the
+    /// clock's resolution.
+    fn written_at(path: &Path, secs: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// #3302, the per-machine field read: a SystemContext worker logs to
+    /// `service-logs`, its watcher into SYSTEM's profile, and the settle looked in
+    /// its own dir only.
+    #[test]
+    fn a_record_is_looked_for_in_the_profile_too_and_each_dir_once() {
+        let own = PathBuf::from(r"C:\ProgramData\roomler\roomler\service-logs");
+        let profile = PathBuf::from(
+            r"C:\Windows\System32\config\systemprofile\AppData\Local\roomler\roomler\data\logs",
+        );
+        let record = |d: &PathBuf| d.join("last-install.json");
+        assert_eq!(
+            record_paths_in(Some(own.clone()), Some(profile.clone())),
+            vec![record(&own), record(&profile)]
+        );
+        assert_eq!(
+            record_paths_in(Some(profile.clone()), Some(profile.clone())),
+            vec![record(&profile)]
+        );
+        assert_eq!(
+            record_paths_in(None, Some(profile.clone())),
+            vec![record(&profile)]
+        );
+        assert!(record_paths_in(None, None).is_empty());
+    }
+
+    #[test]
+    fn the_settle_finds_the_watchers_record_in_the_other_dir_and_leaves_it_there() {
+        let own = tempfile::tempdir().unwrap();
+        let profile = tempfile::tempdir().unwrap();
+        let paths = record_paths_in(
+            Some(own.path().to_path_buf()),
+            Some(profile.path().to_path_buf()),
+        );
+        write_outcome_at(&paths[1], &unreported("agent-v0.4.221", 1000)).unwrap();
+
+        assert_eq!(settle_record_in(&paths, "0.4.221", 1400), None);
+
+        assert!(!paths[0].exists(), "nothing new in the worker's own dir");
+        let (path, o) = read_newest_outcome(&paths).unwrap().unwrap();
+        assert_eq!(path, paths[1]);
+        assert_eq!(o.status, InstallStatus::SucceededVerified);
+        assert_eq!(o.finished_unix, Some(1400));
+    }
+
+    #[test]
+    fn the_most_recently_written_record_is_the_one_read() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let paths = record_paths_in(Some(a.path().to_path_buf()), Some(b.path().to_path_buf()));
+        write_outcome_at(&paths[0], &unreported("agent-v0.4.220", 1000)).unwrap();
+        write_outcome_at(&paths[1], &unreported("agent-v0.4.221", 2000)).unwrap();
+        written_at(&paths[0], 5_000);
+        written_at(&paths[1], 6_000);
+        let (path, o) = read_newest_outcome(&paths).unwrap().unwrap();
+        assert_eq!(
+            (path, o.expected_version.as_str()),
+            (paths[1].clone(), "agent-v0.4.221")
+        );
+
+        written_at(&paths[0], 7_000);
+        let (path, o) = read_newest_outcome(&paths).unwrap().unwrap();
+        assert_eq!(
+            (path, o.expected_version.as_str()),
+            (paths[0].clone(), "agent-v0.4.220")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_newest_record_is_not_hidden_by_an_older_one() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let paths = record_paths_in(Some(a.path().to_path_buf()), Some(b.path().to_path_buf()));
+        write_outcome_at(&paths[0], &unreported("agent-v0.4.220", 1000)).unwrap();
+        std::fs::write(&paths[1], "{ \"status\": \"InProg").unwrap();
+        written_at(&paths[0], 5_000);
+        written_at(&paths[1], 6_000);
+        assert!(read_newest_outcome(&paths).is_err());
+        assert_eq!(settle_record_in(&paths, "0.4.220", 9_000), None);
+        assert_eq!(
+            std::fs::read_to_string(&paths[1]).unwrap(),
+            "{ \"status\": \"InProg",
+            "the settle writes nothing over a record it could not read"
+        );
+    }
+
+    #[test]
+    fn no_record_anywhere_is_nothing_to_settle() {
+        let a = tempfile::tempdir().unwrap();
+        let paths = record_paths_in(Some(a.path().to_path_buf()), None);
+        assert!(read_newest_outcome(&paths).unwrap().is_none());
+        assert_eq!(settle_record_in(&paths, "0.4.221", 1000), None);
+        assert!(!paths[0].exists());
     }
 
     /// What the record holds its life by: the watcher's real budgets must fit in it.
