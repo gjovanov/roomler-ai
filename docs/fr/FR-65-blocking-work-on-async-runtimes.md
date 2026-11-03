@@ -387,6 +387,12 @@ of each is to produce a number.
 - [ ] **AC4** — the encode-scheduling question is answered with canary data; if
       starvation is shown it is fixed, and the canary confirms, with frame age
       unchanged or better.
+      *2026-11-03: the canary is built (#3381) and not yet read. FR-70 M1
+      already took encode off the tokio workers, so what is left to answer is
+      whether anything still starves the runtime the pump and the overlay
+      share. The read is a 7-day window wholly on the first release that
+      carries the canary, beside the STALL census; no released build has its
+      lines yet.*
 - [~] **AC5** — overlay guard waves and forced rekeys/min are measured at idle and
       under a VPN flap, and bounded; no rekey storm.
       **Measured 2026-11-03, not yet bounded** (production `agent_logs`, 7 days,
