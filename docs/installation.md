@@ -1450,6 +1450,21 @@ Measured on 0.4.191: with `<name>` deleted, the worker exits 7 at every spawn, t
 supervisor backs off and stops, and `<name>-daemon` reads `no-gui-session`. A Mac
 enrolled with one root token and no per-user enrollment has no worker at all.
 
+**One row, behind a switch (FR-43 P3a).** With `macos_one_row = true` beside
+`macos_supervise_gui_worker = true` in the root's config, read when the daemon starts,
+the worker runs `run --supervised --unenrolled`. It holds no enrollment, dials no
+server, and takes its sessions from the daemon's delegation channel alone. A person's
+enrollment on that Mac stays in their file and is ignored, and a person with none gets
+a worker anyway. As the console user, `roomler status`, the device list and the
+companion show the root half's row, and a verb that needs the server (`forward`,
+`exec`, `ssh`, a rename) says to run it with `sudo`. Until the logs PR, that worker's
+logs stay on the Mac.
+
+The switch is off by default and stays off until the
+[field proof](fr/FR-43-macos-single-enrollment.md#what-rides-what). It doesn't yet give
+one row alone: secondary orgs, the migration of a two-row Mac and the one-token install
+are P3b, P3c and P3d.
+
 ```bash
 # Screen sharing only (one token, one device row):
 curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
