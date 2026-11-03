@@ -358,7 +358,7 @@ says. It prints `saved <path>` with `ended: recorder_exited` and the line "the
 file may be finalized at the next recording". The file appears when the next
 recording starts in that folder, so the first read after a crash finds nothing
 at that path. Measured on Windows 11 and Ubuntu X11, six hard kills lost at most
-1.81 s.
+1.81 s; two more on release 0.4.198, on Windows, at most 0.54 s.
 
 ⚠️ **A failed attempt never deletes a recording.** A recorder that dies during
 the remux leaves its temp (`<name>.remux-tmp`) beside the destination and its
@@ -369,12 +369,16 @@ release had it, on every OS). `mp4::finalize` now removes that temp and creates
 its own with `create_new`: the caller holds the partial's lock, so nothing else
 writes that name, and a link planted there is not written through.
 `reconcile_partials` removes a partial only on `mp4::NothingRecoverable`: no
-`moov`, or no complete fragment.
+`moov`, or no complete fragment. Read on release 0.4.198 (2026-11-03): a
+Windows recorder terminated with its temp written and no final file came back
+whole at the next start, all 14,772 frames, marked `interrupted`.
 
 Every other failure, such as a full disk or a corrupt fragment, follows the stop
 path's rule: the fragmented file goes under its final name, marked `interrupted`,
 the whole error chain goes to the log, and the `recovered` event names it. That
-is one attempt per partial. Listing, deleting and downloading never read a
+is one attempt per partial. Read on release 0.4.198 with a folder holding the
+temp's name: `Access is denied` in the log, the partial under its final name with
+its 31 fragments, listed, and Windows' Media Player plays it. Listing, deleting and downloading never read a
 recording's contents, so this file takes them like any other. The sidecar's
 duration, frames and bytes come from its fragments. The editor reads progressive
 files only and finds no video in it, as in the stop path's fragmented file. A
@@ -1208,8 +1212,8 @@ sequenceDiagram
 
 | Piece | Where | What it guarantees |
 |---|---|---|
-| The record context crosses | `delegate.rs:172` (`SessionParams::record`), `signaling.rs:2697` (sent AFTER the consent mode is resolved), `signaling.rs:1937` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1101`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
-| The row says what the worker can do | `delegate_worker.rs:105` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:592` (`effective_record`), `signaling.rs:1749` (the heartbeat, primary org only) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
+| The record context crosses | `delegate.rs:172` (`SessionParams::record`), `signaling.rs:2740` (sent AFTER the consent mode is resolved), `signaling.rs:1980` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1101`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
+| The row says what the worker can do | `delegate_worker.rs:105` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:592` (`effective_record`), `signaling.rs:1792` (the heartbeat, primary org only) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
 | An OFF is live | `remote.rs:463` (`subscribe_gates`), `delegate_worker.rs:428-441` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
 | The worker's account of a recording | `delegate.rs:554` (noted where the grant crosses), `delegate.rs:794` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:195`). The server bounds it again to a live session of this agent |
 

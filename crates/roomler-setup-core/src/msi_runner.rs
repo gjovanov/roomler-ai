@@ -166,6 +166,14 @@ mod imp {
             Ok(Self { pid, handle })
         }
 
+        /// #3246 — follow a process from the handle the shell handed back when
+        /// it started it, which this takes over. Nothing has to be opened by
+        /// id: under over-the-shoulder credentials the process belongs to
+        /// another account, whose process refuses this user an open.
+        pub(crate) fn from_handle(pid: u32, handle: HANDLE) -> Self {
+            Self { pid, handle }
+        }
+
         /// Wait up to `budget` for msiexec to exit, polling in
         /// 250 ms slices so the surrounding async future can be
         /// cancelled cleanly by Tauri.

@@ -11,24 +11,35 @@
 //!
 //! | Piece | As built |
 //! |---|---|
-//! | where | only where the daemon's own unit, as `run` identified it (`supervision::current`), answers `Delegate=yes` with `memory` among its `DelegateControllers`, asked of systemd within 5 s. As root a cgroup write succeeds without any delegation, so nothing is tried on a guess |
+//! | where | only where the daemon's own unit, as `run` identified it (`supervision::current`), answers `Delegate=yes` with `memory` among its `DelegateControllers`, asked of systemd within 5 s. As root a cgroup write succeeds without any delegation, so nothing is tried on a guess. Its silence is no answer: no worker runs until it has said, since it supervises this unit and a silence read as no would leave every worker unbounded (#3349) |
 //! | the daemon | moved, with every process in the unit's cgroup, into a leaf of its own (`roomlerd`) as the first worker is started, since cgroup v2 gives a controller to child cgroups only of a cgroup with no processes of its own; then the unit's cgroup hands `memory` down |
 //! | a worker | `hive-worker-<n>`, with `memory.max` at [`MAX_MEMORY`] (P8-2d-1: the device's worker, at its own bound, decision 72) and `memory.swap.max` at 0, since its memory holds the leases' values; it joins between fork and exec, writing itself into the cgroup's `cgroup.procs`, so it never runs a step outside it |
 //! | its end | its cgroup's `memory.events` read for an OOM kill, which is logged as the reason, and the cgroup removed |
-//! | a failure | where the unit delegates and the cgroups cannot be made, no worker runs: the bound is a limit as `RLIMIT_CORE` is (P8-2a-3), and a worker that cannot have it does not start |
+//! | a failure | where the unit delegates and the cgroups cannot be made, no worker runs: the bound is a limit as `RLIMIT_CORE` is (P8-2a-3), and a worker that cannot have it does not start. One that will pass is tried again by a later start (#3349, below); one that will not stays the answer until the daemon restarts |
 //!
 //! ⚠️ `supervision::detect_here` reads `/proc/self/cgroup` once, at the
 //! daemon's start, before any worker exists: after the move the path's last
 //! component is the leaf, which it would not take for the unit.
+//!
+//! ⚠️ **`cgroup.procs` is not what the kernel checks (#3349).** A process in
+//! its exit cannot be moved: the write succeeds, and it stays listed until its
+//! exit ends. A leader that exits before its threads stays listed longer than
+//! it stays here: the zombie is listed while any thread of its process lives,
+//! wherever that thread is. Its threads move, and once they have, the kernel
+//! hands the controller down with the zombie still listed, so an empty list is
+//! the wrong thing to wait for: boot's short-lived children cost one boot in
+//! six that way. The hand-down's own `EBUSY` says whether a task is still here,
+//! and that is what is waited out, for [`LEAVE_WITHIN`].
 
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{RwLock, RwLockReadGuard};
+use std::time::{Duration, Instant};
 
-use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use super::Running;
@@ -42,6 +53,17 @@ const WORKER_PREFIX: &str = "hive-worker-";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// How long systemd has to say whether it delegates.
 const ASK_WITHIN: Duration = Duration::from_secs(5);
+/// How long a task still in the unit's cgroup has to leave it. A boot waited
+/// 3 to 31 ms in 40 measured, and a 600 MiB process ends in about 40 ms (the
+/// FR-90 spec, §3i "#3349, as built"), so this is a slow host's margin. It
+/// holds up that one worker and never the daemon's boot, and whoever waits
+/// for the device's worker waits 10 s.
+const LEAVE_WITHIN: Duration = Duration::from_secs(2);
+/// How often that is looked at.
+const LOOK_EVERY: Duration = Duration::from_millis(10);
+/// The least time between two tries of a failure that passes, whoever asks:
+/// sessions that start together share one try.
+const TRY_AGAIN_AFTER: Duration = Duration::from_secs(5);
 
 /// What the workers of this daemon run in.
 enum Ready {
@@ -49,42 +71,135 @@ enum Ready {
     Unbounded,
     /// The unit's cgroup, made ready for its workers'.
     Bound(PathBuf),
-    /// Delegated, and the cgroups could not be made: no worker runs.
+    /// Delegated, and the cgroups could not be made, which will not pass by
+    /// itself: no worker runs, and nothing is tried again.
+    Broken(String),
+    /// Not made yet, for a reason that passes: no worker runs until a later
+    /// start's try makes them. `base` is what systemd said, none where it
+    /// has said nothing, so that a try never turns on its asking again.
+    Passing {
+        base: Option<PathBuf>,
+        why: String,
+        tried: Instant,
+    },
+}
+
+/// Why a try did not leave the workers' cgroups ready.
+#[derive(Debug, PartialEq, Eq)]
+enum NotReady {
+    /// A later try may find it gone.
+    Passing(String),
+    /// It stays until the host, or the unit, is changed.
     Broken(String),
 }
 
-static READY: OnceCell<Ready> = OnceCell::const_new();
-static NEXT: AtomicU64 = AtomicU64::new(1);
-
-/// Make the workers' cgroups ready, once for the daemon's life (the first
-/// worker's spawner asks, before it starts one).
-pub(crate) async fn prepare() {
-    READY
-        .get_or_init(|| async {
-            match ready().await {
-                Ok(Some(base)) => {
-                    info!(
-                        base = %base.display(),
-                        "hive: a worker runs in a cgroup of its own, its memory bounded"
-                    );
-                    Ready::Bound(base)
-                }
-                Ok(None) => {
-                    info!("hive: a worker runs without a memory bound: the service delegates no cgroup with the memory controller (systemd's Delegate=)");
-                    Ready::Unbounded
-                }
-                Err(why) => {
-                    warn!(%why, "hive: the service delegates a cgroup, and the workers' could not be made: no worker runs");
-                    Ready::Broken(why)
-                }
-            }
-        })
-        .await;
+/// What this daemon's workers run in, and the one try at a time that decides
+/// it.
+struct Workers {
+    /// `None` before the first try: only a spawn nothing prepared, a test's.
+    ready: RwLock<Option<Ready>>,
+    one_try: tokio::sync::Mutex<()>,
 }
 
-/// Where this daemon's unit delegates the memory controller: its cgroup,
-/// made ready ([`ready_at`]).
-async fn ready() -> Result<Option<PathBuf>, String> {
+static READY: Workers = Workers::new();
+static NEXT: AtomicU64 = AtomicU64::new(1);
+
+impl Workers {
+    const fn new() -> Self {
+        Self {
+            ready: RwLock::new(None),
+            one_try: tokio::sync::Mutex::const_new(()),
+        }
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, Option<Ready>> {
+        self.ready.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set(&self, ready: Ready) {
+        *self.ready.write().unwrap_or_else(|e| e.into_inner()) = Some(ready);
+    }
+
+    /// Settle what the workers run in, by `ask`ing of systemd until it has
+    /// said and `tries` at the cgroup it names. Once it is settled this does
+    /// nothing, and a failure that passes is tried again here, at most once
+    /// in `again_after`.
+    async fn prepare<Fut>(
+        &self,
+        ask: impl Future<Output = Result<Option<PathBuf>, NotReady>>,
+        tries: impl Fn(PathBuf) -> Fut,
+        again_after: Duration,
+    ) where
+        Fut: Future<Output = Result<PathBuf, NotReady>>,
+    {
+        let _one = self.one_try.lock().await;
+        let said = match &*self.read() {
+            None => None,
+            Some(Ready::Passing { base, tried, .. }) if tried.elapsed() >= again_after => {
+                base.clone()
+            }
+            Some(_) => return,
+        };
+        let base = match said {
+            Some(base) => Ok(Some(base)),
+            None => ask.await,
+        };
+        let from = Instant::now();
+        let (made, base) = match base {
+            Ok(Some(base)) => (tries(base.clone()).await.map(Some), Some(base)),
+            Ok(None) => (Ok(None), None),
+            Err(no) => (Err(no), None),
+        };
+        self.set(match made {
+            Ok(Some(base)) => {
+                info!(
+                    base = %base.display(),
+                    waited_ms = from.elapsed().as_millis() as u64,
+                    "hive: a worker runs in a cgroup of its own, its memory bounded"
+                );
+                Ready::Bound(base)
+            }
+            Ok(None) => {
+                info!("hive: a worker runs without a memory bound: the service delegates no cgroup with the memory controller (systemd's Delegate=)");
+                Ready::Unbounded
+            }
+            Err(NotReady::Passing(why)) => {
+                warn!(%why, "hive: the workers' cgroups could not be made yet: no worker runs, and a later start tries again");
+                Ready::Passing {
+                    base,
+                    why,
+                    tried: Instant::now(),
+                }
+            }
+            Err(NotReady::Broken(why)) => {
+                warn!(%why, "hive: the service delegates a cgroup, and the workers' could not be made: no worker runs");
+                Ready::Broken(why)
+            }
+        });
+    }
+
+    /// The cgroup the next worker runs in, holding it to `max`: `None` where
+    /// it runs without a bound, and an error where it must have one and
+    /// cannot, for now or for good: never `None` for a bound not made.
+    fn slot(&self, max: u64) -> std::io::Result<Option<Slot>> {
+        match &*self.read() {
+            None | Some(Ready::Unbounded) => Ok(None),
+            Some(Ready::Bound(base)) => slot_in(base, max).map(Some),
+            Some(Ready::Broken(why) | Ready::Passing { why, .. }) => Err(std::io::Error::other(
+                format!("its memory bound could not be made: {why}"),
+            )),
+        }
+    }
+}
+
+/// Make the workers' cgroups ready (a worker's spawner asks, before each
+/// start). Once settled it stays settled for the daemon's life.
+pub(crate) async fn prepare() {
+    READY.prepare(ask(), ready_at, TRY_AGAIN_AFTER).await;
+}
+
+/// Where this daemon's unit delegates the memory controller: its cgroup.
+async fn ask() -> Result<Option<PathBuf>, NotReady> {
     let Some(crate::supervision::Supervision::Systemd(unit)) = crate::supervision::current() else {
         return Ok(None);
     };
@@ -100,31 +215,42 @@ async fn ready() -> Result<Option<PathBuf>, String> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let show = match tokio::time::timeout(ASK_WITHIN, cmd.output()).await {
-        Ok(Ok(out)) if out.status.success() => {
-            Some(String::from_utf8_lossy(&out.stdout).into_owned())
-        }
-        _ => None,
-    };
+    let show = said(cmd, ASK_WITHIN).await;
     let own = std::fs::read_to_string("/proc/self/cgroup").ok();
-    match base_of(show.as_deref(), own.as_deref())? {
-        Some(base) => ready_at(&base).map(Some),
-        None => Ok(None),
+    base_of(show.as_deref().map_err(String::as_str), own.as_deref())
+}
+
+/// What `show`, a `systemctl show`, says within `within`, or in words why it
+/// said nothing. This runs on a unit systemd is known to supervise, so none of
+/// the three is its saying that the unit delegates nothing.
+async fn said(mut show: tokio::process::Command, within: Duration) -> Result<String, String> {
+    match tokio::time::timeout(within, show.output()).await {
+        Ok(Ok(out)) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+        Ok(Ok(out)) => Err(format!("systemctl failed to answer: {}", out.status)),
+        Ok(Err(e)) => Err(format!("systemctl could not be run: {e}")),
+        Err(_) => Err(format!("systemd did not answer within {within:?}")),
     }
 }
 
 /// The unit's cgroup to bound the workers in, from what systemd said of the
-/// unit (`show`, none where it did not answer) and the daemon's own
-/// `/proc/self/cgroup`: none unless the unit delegates the memory
-/// controller, since not known to delegate is not delegating; and an error
-/// where it does and there is no cgroup v2 hierarchy to bound them in.
-fn base_of(show: Option<&str>, own_cgroup: Option<&str>) -> Result<Option<PathBuf>, String> {
-    if !show.is_some_and(delegates_memory) {
+/// unit (`show`, or why it said nothing) and the daemon's own
+/// `/proc/self/cgroup`: none unless the unit delegates the memory controller.
+/// Where systemd said nothing, nothing is known, which is neither answer and
+/// passes; where it delegates and there is no cgroup v2 hierarchy to bound
+/// them in, an error.
+fn base_of(
+    show: Result<&str, &str>,
+    own_cgroup: Option<&str>,
+) -> Result<Option<PathBuf>, NotReady> {
+    let show = show.map_err(|why| NotReady::Passing(why.to_string()))?;
+    if !delegates_memory(show) {
         return Ok(None);
     }
     let path = own_cgroup
         .and_then(v2_path)
-        .ok_or("a delegated cgroup, and no cgroup v2 hierarchy")?;
+        .ok_or_else(|| NotReady::Broken("a delegated cgroup, and no cgroup v2 hierarchy".into()))?;
     Ok(Some(unit_dir(path)))
 }
 
@@ -161,43 +287,76 @@ fn unit_dir(path: &str) -> PathBuf {
 /// Make the unit's cgroup `base` ready for its workers': every process in
 /// it moved into the daemon's leaf, the memory controller handed down, and
 /// any cgroup a worker of an earlier daemon left removed.
-fn ready_at(base: &Path) -> Result<PathBuf, String> {
+async fn ready_at(base: PathBuf) -> Result<PathBuf, NotReady> {
+    ready_within(base, LEAVE_WITHIN, hand_down).await
+}
+
+/// The unit's cgroup hands the memory controller to the ones below it.
+fn hand_down(base: &Path) -> std::io::Result<()> {
+    std::fs::write(base.join("cgroup.subtree_control"), "+memory")
+}
+
+/// [`ready_at`], what is still here given `within` to leave. Everything but
+/// that wait is a failure that will not pass.
+async fn ready_within(
+    base: PathBuf,
+    within: Duration,
+    hand_down: impl Fn(&Path) -> std::io::Result<()>,
+) -> Result<PathBuf, NotReady> {
     let controllers = std::fs::read_to_string(base.join("cgroup.controllers"))
-        .map_err(|e| format!("{}: {e}", base.display()))?;
+        .map_err(|e| NotReady::Broken(format!("{}: {e}", base.display())))?;
     if !controllers.split_whitespace().any(|c| c == "memory") {
-        return Err(format!("{}: no memory controller here", base.display()));
+        return Err(NotReady::Broken(format!(
+            "{}: no memory controller here",
+            base.display()
+        )));
     }
     let leaf = base.join(DAEMON_LEAF);
     match std::fs::create_dir(&leaf) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(format!("{}: {e}", leaf.display())),
+        Err(e) => return Err(NotReady::Broken(format!("{}: {e}", leaf.display()))),
     }
     // New children can be forked into the unit's cgroup as its processes
-    // move: until it holds none.
-    let mut emptied = false;
-    for _ in 0..8 {
+    // move, and a process in its exit stays: until the kernel says none of
+    // it is left here.
+    let from = Instant::now();
+    loop {
         let procs = std::fs::read_to_string(base.join("cgroup.procs"))
-            .map_err(|e| format!("{}: {e}", base.display()))?;
-        if procs.split_whitespace().next().is_none() {
-            emptied = true;
-            break;
-        }
+            .map_err(|e| NotReady::Broken(format!("{}: {e}", base.display())))?;
         for pid in procs.split_whitespace() {
             match std::fs::write(leaf.join("cgroup.procs"), pid) {
                 Ok(()) => {}
                 // Gone meanwhile.
                 Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
-                Err(e) => return Err(format!("moving {pid} into {}: {e}", leaf.display())),
+                Err(e) => {
+                    return Err(NotReady::Broken(format!(
+                        "moving {pid} into {}: {e}",
+                        leaf.display()
+                    )));
+                }
             }
         }
+        match hand_down(&base) {
+            Ok(()) => break,
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(e) => {
+                return Err(NotReady::Broken(format!(
+                    "{}: handing memory down: {e}",
+                    base.display()
+                )));
+            }
+        }
+        if from.elapsed() >= within {
+            return Err(NotReady::Passing(format!(
+                "{}: still here after {within:?}: {}",
+                base.display(),
+                still_here(&base)
+            )));
+        }
+        tokio::time::sleep(LOOK_EVERY).await;
     }
-    if !emptied {
-        return Err(format!("{}: it kept gaining processes", base.display()));
-    }
-    std::fs::write(base.join("cgroup.subtree_control"), "+memory")
-        .map_err(|e| format!("{}: handing memory down: {e}", base.display()))?;
-    if let Ok(entries) = std::fs::read_dir(base) {
+    if let Ok(entries) = std::fs::read_dir(&base) {
         for entry in entries.flatten() {
             if entry
                 .file_name()
@@ -208,7 +367,27 @@ fn ready_at(base: &Path) -> Result<PathBuf, String> {
             }
         }
     }
-    Ok(base.to_path_buf())
+    Ok(base)
+}
+
+/// What `base` lists, for a person: each pid, with its name while it has one.
+/// None listed is a thread of a process that has moved, still in its exit.
+fn still_here(base: &Path) -> String {
+    let procs = std::fs::read_to_string(base.join("cgroup.procs")).unwrap_or_default();
+    let named: Vec<String> = procs
+        .split_whitespace()
+        .map(
+            |pid| match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+                Ok(comm) => format!("{pid} ({})", comm.trim().escape_debug()),
+                Err(_) => pid.to_string(),
+            },
+        )
+        .collect();
+    if named.is_empty() {
+        "a thread in its exit".to_string()
+    } else {
+        named.join(", ")
+    }
 }
 
 /// A worker's cgroup, made before its spawn.
@@ -221,16 +400,9 @@ pub(crate) struct Slot {
     max: u64,
 }
 
-/// The cgroup the next worker runs in, holding it to `max`: `None` where it
-/// runs without a bound, and an error where it must have one and cannot.
+/// The cgroup the next worker runs in ([`Workers::slot`]).
 pub(crate) fn slot(max: u64) -> std::io::Result<Option<Slot>> {
-    match READY.get() {
-        None | Some(Ready::Unbounded) => Ok(None),
-        Some(Ready::Bound(base)) => slot_in(base, max).map(Some),
-        Some(Ready::Broken(why)) => Err(std::io::Error::other(format!(
-            "its memory bound could not be made: {why}"
-        ))),
-    }
+    READY.slot(max)
 }
 
 static NO_SWAP_ACCOUNT: AtomicBool = AtomicBool::new(false);
@@ -343,10 +515,11 @@ impl Running for Bounded {
 /// A test's: the workers of this process bounded in `base`, made ready as a
 /// daemon's would be.
 #[cfg(test)]
-pub(crate) fn ready_for_test(base: &Path) -> Result<(), String> {
-    let base = ready_at(base)?;
-    // Another test of this process made it ready first: the same cgroup.
-    let _ = READY.set(Ready::Bound(base));
+pub(crate) async fn ready_for_test(base: &Path) -> Result<(), String> {
+    let base = ready_at(base.to_path_buf())
+        .await
+        .map_err(|no| format!("{no:?}"))?;
+    READY.set(Ready::Bound(base));
     Ok(())
 }
 

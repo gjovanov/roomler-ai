@@ -34,7 +34,7 @@ The released **0.4.130**, on the FR-93 lab's four Linux guests, 2026-10-12:
 The code agrees, line by line (master `d7a7b17aa`):
 
 - **The tarball has no way up.** `install_tarball_linux` refuses any `euid != 0`
-  (`agents/roomlerd/src/updater.rs:1836-1845`), and has since the tarball path landed (#462, 2026-08-15).
+  (`agents/roomlerd/src/updater.rs:1846-1855`), and has since the tarball path landed (#462, 2026-08-15).
 - **The `.deb` ladder asks a person.** A non-root daemon tries `pkexec apt-get install`, then `sudo -n`
   (`updater.rs:1771-1785`). On a desktop with a polkit agent that is a password prompt in front of whoever is
   at the screen, every 4 h. Without one, it is `sudo -n`, which works only where sudo needs no password.
@@ -46,7 +46,7 @@ The code agrees, line by line (master `d7a7b17aa`):
     `sudo -n`, then `pkexec`)"*, and `:197` says *"the tarball makes self-update work everywhere"*.
   - `docs/installation.md:497` says the updater *"hands off to MSI / `dpkg` / `installer` and restarts"*.
 - **Nothing restarts a per-user daemon onto a replaced binary.** There is no restart-on-replace anywhere
-  (`strip_deleted_suffix`, `updater.rs:2219-2227`, only fixes up a path for the watcher). So even an admin's
+  (`strip_deleted_suffix`, `updater.rs:2834-2842`, only fixes up a path for the watcher). So even an admin's
   `apt upgrade` leaves the per-user daemon on the old, unlinked image until something restarts it.
 
 **Who this serves.** Not yet measured, and partly unmeasurable from the server: FR-93 P2b's hello reports
@@ -76,14 +76,14 @@ sequenceDiagram
 
 | piece | reused or new | where |
 |---|---|---|
-| the release check, with no config (the feed is `ROOMLERD_UPDATE_URL`, else the proxy) | reused | `check_once`, `updater.rs:1542-1583`; `DEFAULT_PROXY_URL` `:37` |
+| the release check, with no config (the feed is `ROOMLERD_UPDATE_URL`, else the proxy) | reused | `check_once`, `updater.rs:1555-1596`; `DEFAULT_PROXY_URL` `:37` |
 | download and verify: size floor, digest, the pinned release key | reused | `download_asset` `:1269-1432`, PGP `:1358-1393` |
 | the install-storm cooldown (root's own marker) | reused | `recent_update_attempt` / `record_update_attempt` `:424-457`, `STARTUP_UPDATE_COOLDOWN` `:71` |
 | the install, as root | reused | `linux_install_candidates(0, …)` `:2009-2023`; `install_tarball_linux(0, …)` `:2075-2198` |
 | the opt-out, `/etc/roomler/disable-auto-update` | reused | the helper's `OPT_OUT` `:3527-3534` (shared by macOS and Linux) |
 | the wake file: content ignored, never followed through a symlink | generalised | `MACOS_UPDATE_TRIGGER` `:3028`, `LINUX_UPDATE_TRIGGER` `:3033`, `queue_update_check` / `queue_update_check_at` `:3248-3267` (was `macos_queue_update_check`) |
-| `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`app.rs:1849-1877`) |
-| `roomler-update.{service,timer,path}` | new (P1) | shipped in the `.deb` (`agents/roomlerd/Cargo.toml` assets `:848-887`) and the tarball (`scripts/stage-linux-tarball.sh:55-58`, `TARBALL_INSTALL_IF_ABSENT` `updater.rs:2063-2073`) |
+| `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`app.rs:1869-1897`) |
+| `roomler-update.{service,timer,path}` | new (P1) | shipped in the `.deb` (`agents/roomlerd/Cargo.toml` assets `:848-887`) and the tarball (`scripts/stage-linux-tarball.sh:55-58`, `TARBALL_INSTALL_IF_ABSENT` `updater.rs:2102-2112`) |
 | the download's private staging dir (mkdtemp, 0755, `O_EXCL` write) — the security review's finding 1 | new | `stage_dir` / `write_installer` / `discard_staging` (`updater.rs`) |
 | the run-spacing gate — launchd's `ThrottleInterval` twin, the security review's finding 2 | new | `UPDATE_HELPER_MIN_GAP` / `helper_gate_wait` / `stamp_helper_gate` (`updater.rs`) |
 | consuming the wake: a symlink unlinked NOT followed, a planted directory moved aside into a fresh root-owned dir | new | `consume_wake` (`updater.rs`) |
@@ -105,7 +105,7 @@ longer depends on how the package arrived.
 
 ### 3.2 The per-user daemon wakes the helper instead of installing (P2a, as built)
 
-`run_periodic` forks once, at the daemon's start (`updater.rs:2870-2915`). macOS takes `forward_triggers` (the
+`run_periodic` forks once, at the daemon's start (`updater.rs:2909-2954`). macOS takes `forward_triggers` (the
 shared successor of `macos_forward_triggers`, `:3334-3416`) as before. Linux asks a pure
 `decide_update_owner(euid, kill switch, enable link)` (`:3220-3238`):
 
@@ -149,7 +149,7 @@ A host without the helper (an install from before this FR) keeps today's path un
 ### 3.3 Onto the new binary (P2b, as built)
 
 The per-user daemon notices for itself (D2): `agents/roomlerd/src/replaced_binary.rs`, spawned beside the updater
-(`app.rs:5388-5395`) on a Linux, non-root daemon whose kill switch is unset and whose supervisor will relaunch it
+(`app.rs:5516-5523`) on a Linux, non-root daemon whose kill switch is unset and whose supervisor will relaunch it
 (`spawn`, `replaced_binary.rs:241-265`). ONE mechanism serves the helper's install, an admin's `apt upgrade` and a
 hand install alike, and the helper never speaks to a daemon.
 
@@ -182,7 +182,7 @@ hand install alike, and the helper never speaks to a daemon.
   its gate: with `roomlerd.service` enabled it steps aside (§3.6).
 - **Restart a daemon mid-session** before D1's 24 h ceiling (P2b's `decide`, `replaced_binary.rs:164-190`), nor
   ever beside a network transition.
-- **Run as non-root.** It refuses, as macOS's helper does (`updater.rs:3546-3553`).
+- **Run as non-root.** It refuses, as macOS's helper does (`updater.rs:3585-3592`).
 - **Stage a download at a fixed or shared name** (security review, finding 1). `/tmp` is sticky but a
   *subdirectory* of it is not, so the old fixed `/tmp/roomlerd-update/<asset>` let any local user own the
   directory, wait for root's verified `.deb` to land, and `rename` an attacker package over it in the window
@@ -212,11 +212,11 @@ at `:452` and `:461-469`):
 | `--system` | turned off, if a per-user install left it on | the root daemon installs its own updates |
 
 - **The gate is the binary's own word, not a version.** `roomlerd update-helper --capabilities` prints `wake-file`,
-  `step-aside`, `restart-on-replace` and exits; any user may ask (the words at `updater.rs:4175-4181`). `install.sh` is
+  `step-aside`, `restart-on-replace` and exits; any user may ask (the words at `updater.rs:4214-4220`). `install.sh` is
   served by the server and ships with a promote, while the daemon ships with an agent release, and the two need not
   arrive in order. A word is never renamed or removed: `the_capabilities_are_the_words_install_sh_matches` pins
   the pair.
-- ⚠️ **The query is read off argv before clap parses anything** (`app.rs:1397-1407`, `updater.rs:4183-4211`),
+- ⚠️ **The query is read off argv before clap parses anything** (`app.rs:1410-1420`, `updater.rs:4222-4250`),
   and only its exact form (`only_the_exact_capabilities_query_is_answered_before_parsing`). It was a clap flag at
   first, a `--capabilities` field on `Command::UpdateHelper`, and CI's Windows recorder lane (FR-85) went red: the
   debug binary died before printing a line, twice on the same commit, while the parent PR passed on the same base.
@@ -243,8 +243,8 @@ at `:452` and `:461-469`):
   as a real install leaves it). It failed that row and restarted onto a binary that cannot run on the first cut,
   and passes all 14 cases on this one (§8).
 - **`roomlerd self-update`**, run by a non-root user on a host whose helper owns updates, wakes the helper instead
-  of failing (`app.rs:6059-6075`). It asks the daemon's own decision, `helper_owns_updates`
-  (`updater.rs:4220-4228`), so the CLI and the daemon never disagree. Root keeps the direct path; `--check-only`
+  of failing (`app.rs:6189-6205`). It asks the daemon's own decision, `helper_owns_updates`
+  (`updater.rs:4259-4267`), so the CLI and the daemon never disagree. Root keeps the direct path; `--check-only`
   touches nothing. On a daemon host `roomler self-update` already refuses and names `roomlerd self-update`.
 - **`README.Debian`**'s manual desktop flow enables the helper before the daemon starts, and says to leave it off
   with the system unit.
@@ -270,9 +270,9 @@ flowchart LR
 |---|---|---|
 | `postinst` | enables `roomler-update.timer` and `.path` through `deb-systemd-helper`. That happens on the first configure of a version that ships it, which is an existing host's first upgrade too, and never again over an administrator who disabled them (`was-enabled` / `update-state`). It starts only enabled units. The daemon units stay untouched, as before | `packaging/linux/debian/postinst:37-54`, `:61-69` |
 | `prerm`, `postrm` | the bookkeeping `dh_installsystemd` writes: the timer and path are stopped on removal (never on upgrade, since the helper may be the process upgrading), masked on removal, purged and unmasked on purge | `packaging/linux/debian/prerm`, `postrm` |
-| the helper steps aside | after its 60 s gate, so a flood of wakes is still paced: with `roomlerd.service` enabled it exits. One updater per host, however the units got enabled | `updater.rs:3983-3992`, `SYSTEM_DAEMON_ENABLE_LINKS` `:3490-3493` |
+| the helper steps aside | after its 60 s gate, so a flood of wakes is still paced: with `roomlerd.service` enabled it exits. One updater per host, however the units got enabled | `updater.rs:4022-4031`, `SYSTEM_DAEMON_ENABLE_LINKS` `:3529-3532` |
 | the timer's first run | the timer the `postinst` starts fires at once: an `OnBootSec` already in the past elapses immediately (`systemd.timer(5)`, measured in §8). The unit is unchanged. P5 first added `OnActiveSec=5min` on a misread lab run, which only added a second run 5 min later, and it came out before the merge | `roomler-update.timer:14` |
-| a daemon that cannot install says so | a non-root daemon with `no_new_privs`, the helper off and the kill switch unset downloads nothing. It logs the one command that turns updates on, then hands over to the helper the moment one is enabled, on a push or within 10 min, with no restart. A daemon started by hand keeps the ladder, and `ROOMLERD_UPDATE_HELPER=0` keeps AC7's "today's behaviour exactly" | `updater.rs:3216-3220`; `no_new_privs` `:3501-3504`; `can_install_in_process` `:3511-3513`; `wait_for_the_helper` `:3534-3553`, `_with` `:3558-3605` |
+| a daemon that cannot install says so | a non-root daemon with `no_new_privs`, the helper off and the kill switch unset downloads nothing. It logs the one command that turns updates on, then hands over to the helper the moment one is enabled, on a push or within 10 min, with no restart. A daemon started by hand keeps the ladder, and `ROOMLERD_UPDATE_HELPER=0` keeps AC7's "today's behaviour exactly" | `updater.rs:3255-3259`; `no_new_privs` `:3540-3543`; `can_install_in_process` `:3550-3552`; `wait_for_the_helper` `:3573-3592`, `_with` `:3597-3644` |
 
 - ⚠️ **The postinst rule changes, for the update half only.** "Never enable, start, restart or stop anything" stays
   the rule for both daemon units. A package upgrade is still not permission to change what runs. But the update

@@ -26,8 +26,8 @@ pub mod app;
 // `apps` re-exports the moved config shapes; the ACL is re-exported inside
 // `tunnel/mod.rs` so `crate::tunnel::acl::…` still resolves.
 pub use roomler_node_core::{
-    appdirs, config, config_surface, crash_recorder, enrollment, files_dir, logging, logs_upload,
-    machine, pairing, pairing_terminal, token_slot,
+    appdirs, boot_id, config, config_surface, crash_recorder, enrollment, files_dir, logging,
+    logs_upload, machine, pairing, pairing_terminal, token_slot,
 };
 
 pub mod apps;
@@ -135,6 +135,7 @@ pub mod media_plan;
 pub mod mem_trim;
 pub mod power;
 pub mod remote_config;
+pub mod unenrolled;
 // P5 — crate-private: its surface leans on `peer::TargetResolution`
 // (pub(crate)) and nothing outside the agent consumes it. Compiled on
 // every build so its pure logic unit-tests on the default feature set
@@ -199,6 +200,9 @@ pub mod resource_watch;
 /// FR-98 C6 — `playout-delay` 0/0 on the RTP fallback track, so the
 /// browser's jitter buffer renders as soon as it decodes (default off).
 pub mod rtp_playout;
+/// FR-65 P2 / FR-70 AC1 — a 10 ms timer that records how late it woke, so a
+/// starved runtime shows up in the logs.
+pub mod runtime_canary;
 /// #2718 — the daemon's runtime is shut down with a budget, so a blocking
 /// read an exec left behind cannot hold the process past a stop.
 pub mod runtime_exit;

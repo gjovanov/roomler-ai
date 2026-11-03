@@ -91,8 +91,8 @@ not rotated, so reuse is undetectable.
 
 ⚠️ The **agent** half of this is fixed. `agent_log.rs` / `agent_crash.rs` no
 longer parse the bearer themselves: both go through
-`crates/api/src/extractors/agent.rs::AuthAgent`, which loads the row
-(`find_in_tenant`) and refuses via `refusal_reason`.
+`crates/modules/fleet/src/auth_agent.rs::AuthAgent`, which loads the row
+(`find_any_in_tenant`) and refuses via `refusal_reason`.
 ⚠️ A lookup **failure is deliberately 500, not 401** — a Mongo blip must not tell
 a healthy fleet its credentials were revoked, which would turn a database wobble
 into an enrollment storm.
@@ -327,6 +327,49 @@ route enforces `exp`.
   unaware, until something else dropped it. Nothing could act through it, since
   every action re-checks the row, but the device's own status still read
   "connected".
+
+### A removed thing answers nothing (#1821, #1829)
+
+Devices, tunnel clients, tunnel policies and overlay ACL policies are
+**tombstoned, not deleted**, so `{_id, tenant_id}` still finds them. Each DAO asks
+the question by name, and there is no un-suffixed `find_in_tenant`:
+
+| Lookup | Finds a tombstone | For |
+|---|---|---|
+| `find_live_in_tenant` | no: `NotFound`, like a bogus id | every GET of the thing itself, every write, every session start |
+| `find_any_in_tenant` | yes | a reader whose job is the tombstone, with the reason at the call site |
+
+`base.find_by_id_in_tenant` is the same ANY lookup with no name on it, and reaching
+through `base` is how FR-52's External access routes, written afterwards, reopened
+this hole: they minted connect codes and wrote approvals onto removed devices, and a
+tombstone revives whole when its machine re-enrolls. The admin setters are
+live-scoped on their own too (`AgentDao::live_row`), the anchor and the desired
+config among them, so a write that raced the removal matches nothing and the route
+answers 404.
+
+Readers that keep the tombstone, and why:
+
+| Reader | Why it must see one |
+|---|---|
+| `auth_agent`, the agent socket upgrade, `/derp`, `accepted_tunnel_client`, the tunnel socket's connect and its 60 s poll | they say **why** a device is refused. A removed device is told `rc:goodbye AgentDeleted` or `rc:tunnel.revoked` and stops; a bare `NotFound` would read as a network fault and it would reconnect forever. On any of them a lookup **failure** stays apart from a removal: 500 or a kept socket, never a revocation |
+| `recording-activity`, `transfer-activity`, `privacy-activity`, `…/logs`, `…/crash`, the External access decision log and people list | an audit view of a removed device. Removing a device must not be the way to hide what it did |
+| `find_by_tenant_and_machine` on agents and tunnel clients, at enrollment | the unique `(tenant_id, machine_id)` index covers tombstones, so a known machine must revive its row or it could never enroll again. Revival advances nothing that a removal ended: old tokens stay dead (`token_gen`) and the exec anchor stays gone |
+| `overlay_nodes` by id after a release | the release's own `removes` frame goes to the tombstone's address (`docs/overlay-communication.md` §1). The lease order is not changed by any of this: a node is tombstoned first, then its host goes back to the pool, and pooling first would lock the next joiner out permanently |
+
+**An overlay join reads the row, and a removed row does not join.** A socket can
+outlive its row: a tunnel client's by up to the 60 s of its revocation poll, and a
+device's until the kick reaches the pod holding it. The join used to read the row by
+id, not ask whether it was live, and lease a fresh address to something already
+removed. Peers were told of it, and `DELETE` on that row is a 404, which left only an
+admin finding the node and evicting it by hand. `handle_overlay_join` now refuses a
+tombstoned identity, and any identity in an archived org. A tunnel client's `DELETE`
+tombstones before it releases, so the window is the join already past that check; an
+agent's removal keeps its own load-bearing order (`crates/modules/fleet/src/removal.rs`).
+
+What stays open by design: an **already admitted** tunnel-client socket can keep
+opening tunnels and forwards until that 60 s poll closes it. Those flows end with the
+socket and leave nothing behind, so the lag is bounded; a push on removal would need a
+cross-pod channel the tunnel socket does not have.
 
 **A WG public key cannot be claimed by two live nodes in a network** —
 `overlay_nodes::wg_key_taken_by_other`, checked in `ws::overlay` join,
@@ -768,6 +811,13 @@ The actual fix for the account is GitHub Settings → Emails.
   lives in the operator's `ROOMLER__TURN__SHARED_SECRET` env.
 - **No git hooks for secrets**: there is no gitleaks/trufflehog scanner in CI.
   *(Open, [LOW], 2026-03-10.)*
+- **An error about a config file says where, never what** (#3086). The daemon's and
+  the CLI's config hold a bearer token, and a `toml` error quotes the line it stopped
+  at, so a typo on that line put the token in the daemon's log, which uploads to the
+  server, on the wizard's page and in the terminal. The parser's error ends where it
+  happens, so no chain holds it for a `{:#}` or `{:?}` to print:
+  [`docs/installation.md`](installation.md). Rows uploaded before the fix were not
+  rewritten.
 
 ### Dependency-uplift pass (2026-07-29)
 

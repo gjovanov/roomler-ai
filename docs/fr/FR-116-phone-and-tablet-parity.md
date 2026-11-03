@@ -152,7 +152,7 @@ The high and medium findings, by phase; anchors at `7c95d26f4`. Each phase lists
 | rich-text mode clips Send, attach, emoji and GIF off-screen | `MessageEditor.vue:12-141` | the formatting row scrolls on its own; Send stays outside it |
 | the default composer has no Send button, and no line break on a soft keyboard | `MessageEditor.vue:129-140`, `:376-384` | Send in both modes |
 | an agent-session transcript covers the room on a phone and cannot be closed | `ChatView.vue:111`, `:233`, `:526-537`; `HiveTranscript.vue:16-39` | a close button; closed by default below 960 px |
-| the call's chat and files are fixed 320 px columns that squeeze or clip the video | `ConferenceView.vue:109-158`, `:671-677` | overlays below 960 px, one at a time |
+| the call's chat and files are fixed 320 px columns that squeeze or clip the video | `ConferenceView.vue:109-158`, `:731-737` | overlays below 960 px, one at a time |
 | a screen share gets ~72 px of width on a phone (Auto picks the sidebar layout) | `useConferenceLayout.ts:92`, `SidebarLayout.vue:91-99` | spotlight on narrow containers |
 | the mini-conference names people by a 6-character user-id prefix (desktop too) | `MiniConference.vue:45` | the participant's display name |
 | a long URL or token makes the whole message list scroll sideways | `MessageBubble.vue:10`, `:77` | `overflow-wrap: anywhere` |

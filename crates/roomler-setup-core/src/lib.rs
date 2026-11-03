@@ -20,6 +20,8 @@ pub mod asset_resolver;
 /// for the limited copy to be gone.
 pub mod elevation;
 pub mod extract;
+/// #3246 — a staged artifact, held open from the check to the run.
+pub mod held_file;
 pub mod integration;
 pub mod msi_runner;
 pub mod progress;

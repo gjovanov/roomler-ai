@@ -12,10 +12,10 @@
 #
 #   Roles:
 #     daemon  — the roomlerd daemon ("be accessed"): Linux .deb / macOS .pkg,
-#               enrolls with an AGENT enrollment token (Admin → Agents),
+#               enrolls with an AGENT enrollment token (Devices → Enroll → Device),
 #               enables the packaged autostart (systemd user unit / LaunchAgent).
 #     tunnel  — the roomler CLI only ("reach others"): enrolls with a TUNNEL
-#               enrollment token (Admin → Tunnels).
+#               enrollment token (Devices → Enroll → Tunnel client).
 #
 #   --system          (daemon role, Linux only) install as a ROOT systemd
 #                     SYSTEM service instead of the per-user unit. Pick this

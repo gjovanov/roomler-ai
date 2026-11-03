@@ -96,7 +96,7 @@ which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
 - `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:396`);
-- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1556`).
+- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1569`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
@@ -134,19 +134,23 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3790`, `crates/agent-core/src/config.rs:4171`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
-| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:634`, `:966`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3838`, `crates/agent-core/src/config.rs:4379`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:651`, `:983`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
 administrator.** After its first healthy run the daemon hardens that config's
 folder to SYSTEM and Administrators (#3073), and a wizard that is not elevated
 cannot open it. The wizard says so on its first page, before a token is pasted
-or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1157`), and the
+or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1174`), and the
 install refuses it before anything is downloaded (`:290`). Before the enroll it
 also stops on a config it may not read (`:634`, never reported as a damaged
 config) or a folder it may not write (`:640`). The token is never spent on a
 config that cannot be written. A **fresh** install of that role still works
-from a double-click: the folder is not hardened yet.
+from a double-click: the folder is not hardened yet. The folder can outlive the
+service (`install.ps1 -Uninstall` leaves it), so the note says "This device
+already has the background service" only when detection found one, and
+otherwise "An earlier background service left its settings on this device"
+(#3247 item 11, `agents/roomler-setup/src/front/app.js`, `elevationNoteLead`).
 
 **The wizard asks for those rights itself** (FR-129 C3). The note on its first
 page carries a **Restart as administrator** button: the wizard starts its own
@@ -185,10 +189,16 @@ it happens on Welcome, before a token exists. The elevated copy
    default, and the Continue gate as usual.
 
 A right-click **Run as administrator** by a person who is an administrator works
-as it always has, in that account's own folder. **With another account's password
-it does not** (the white window above, or Edge's "We couldn't create the data
-directory"): that start has no limited copy to name the session's folder. Start the
-wizard normally and use the button.
+as it always has, in that account's own folder. **With another account's password**
+that start has no limited copy to name the session's folder, so it finds it (#3229): the
+owner of the session's `explorer.exe` from `WTSEnumerateProcessesW`, and that SID's folder
+from the machine's `ProfileList`. It then opens with only the machine-wide service on offer,
+as the button does. If it finds another account's shell but no folder that person can use
+(say a profile whose `AppData\Local` is elsewhere), it says so and stops, before any window,
+instead of the white window above or Edge's "We couldn't create the data directory". A
+session with no Explorer at all (a replaced shell) cannot be told apart from a person elevating
+themselves, and still shows that white window: there, start the wizard normally and use the
+button.
 
 **The cards follow what can work here** (`role::RoleLimit`,
 `agents/roomler-setup/src/role.rs:191`), and a note on Welcome says why:
@@ -210,8 +220,8 @@ that person's browser and profile, at medium integrity.
 that folder and `HKCU\Environment`, and the same image goes on to run elevated:
 
 - it loads DLLs from System32 alone (the linker's `/DEPENDENTLOADFLAG:0x800`,
-  `SetDefaultDllDirectories`, and `secur32.dll` delay-loaded, since that flag does not reach an
-  import's own imports), and `pe-dependent-load-flags.ps1` reads the flag and the import table
+  `SetDefaultDllDirectories`, and `secur32.dll`, `wintrust.dll` and `wtsapi32.dll` delay-loaded, since that flag
+  does not reach an import's own imports), and `pe-dependent-load-flags.ps1` reads the flag and the import table
   back from the EXE in CI, in the release lane and in the verifier;
 - it names every program it starts by a full path from the kernel, and
   `agents/roomler-setup/src/spawn_gate.rs` fails CI on a bare name;
@@ -221,12 +231,68 @@ that folder and `HKCU\Environment`, and the same image goes on to run elevated:
   uses works limited and nowhere else;
 - its WebView2 folder is made new at each start, following no link.
 
-Still open: the wizard checks no publisher on the MSI it stages, and the staged file sits in the
-user's temp folder until `msiexec` reads it (#3246).
-
 A declined prompt leaves the limited wizard as it was, with one line saying so;
 any other failure shows its reason and the right-click way. Nothing else in the
-wizard elevates itself: a fresh install still gets the MSI's own UAC prompt.
+wizard elevates itself: a fresh machine-wide install gets one prompt, for the
+wizard's own step below.
+
+**What the wizard runs is what it checked (#3246).** A digest comes from the same origin as the
+URL, so it says the bytes came through intact and never who made them. The anchor is the publisher:
+a valid Authenticode signature by `code_signature::EXPECTED_PUBLISHER`, compiled in.
+
+| What arrived (Windows unless named) | Digest published | What happens |
+|---|---|---|
+| MSI or desktop companion, signed by the publisher | matches | installs |
+| the same | none | installs, with a warning row: the signature decides |
+| anything | mismatch | refused |
+| unsigned, tampered, another publisher, or a root this machine does not trust | any | refused, whatever the digest says |
+| an older release with no signature | any | refused, as the updater refuses it |
+| tunnel zip, every file but plain text signed | matches, or none with a warning | extracts |
+| tunnel zip, any other file unsigned | any | refused, and nothing was extracted into place |
+| Linux or macOS tunnel archive | none | refused: there is no other anchor, as for the daemon there |
+| a `tag` or `filename` from the server that is not one plain name | any | refused before anything is written |
+
+A check is only worth something if nothing can change the file before it runs, and on the
+machine-wide roles the run crosses to the administrator. A process at the person's level can write
+their `%TEMP%` and can end or inject into a limited wizard, so anything that wizard holds it can
+drop. The check that counts therefore happens on the far side of the prompt, in the same EXE
+(`agents/roomler-setup/src/package_step.rs`):
+
+```mermaid
+sequenceDiagram
+    participant W as Limited wizard
+    participant U as UAC prompt
+    participant S as Elevated step, no window
+    participant M as msiexec
+    W->>W: download to %TEMP%, hold it, check digest and publisher
+    Note over W: a refusal here needs no prompt
+    W->>U: runas this EXE with a file, a folder name, the digest, a yes or no
+    U->>S: names Roomler Setup and its publisher
+    S->>S: new folder under %ProgramData%, SYSTEM and Administrators only, from its creation
+    Note over S: refused if the name exists, whoever made it
+    S->>S: copy in, hold it refusing writers, digest and publisher through that handle
+    S->>M: full path, TEMP set to that folder, arguments it built itself
+    M-->>S: exit code
+    S-->>W: exit code, the one channel back
+```
+
+- **The step takes nothing on trust.** A limited process can start it with any arguments, so it
+  parses exactly its own, reads the file as a claim, and builds `msiexec`'s command line itself: no
+  property, no transform, nothing we did not sign. Pointed at a genuine older MSI it installs that
+  after the person approves, which is no more than `runas msiexec` could do.
+- **It writes and deletes only inside its new folder.** An elevated write or delete under the
+  person's `%TEMP%` goes wherever a link planted there says, so the log no longer sits beside the
+  staged MSI there. A failed install leaves its log at
+  `%ProgramData%\roomler-setup-<hex>\<file>.log`, which the wizard names and only an administrator
+  can open, and the MSI copy is deleted. Otherwise the folder is removed.
+- **It opens no window and writes no state for the wizard.** Under another account's password it
+  runs as that administrator, so only its exit code comes back, through the handle the shell returned.
+- **An elevated wizard does the same in its own process.** It downloads into such a folder from the
+  start, because `%TEMP%` comes from `HKCU\Environment`, and it never starts a copy of its own image:
+  that file sits in Downloads, a limited process can rename another into its place, and an elevated
+  `runas` raises no prompt.
+- **A per-user install holds the file and checks it** with nothing to cross: `msiexec` runs at the
+  level of anything that could change it.
 
 **The enroll says how it was installed** (FR-102 P3, the install trace in
 [growth-observability.md](growth-observability.md)): the device row records
@@ -320,8 +386,8 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3572`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3616`) |
-| `config::read_if_present` (`:3617`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3738`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3782`) |
+| `config::read_if_present` (`:3708`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
 flowchart TD
@@ -338,7 +404,7 @@ flowchart TD
 Before FR-66, two callers that expect to find nothing went through `load` and
 printed the destructive remedy about perfectly healthy hosts: the Windows
 supervisor's `netd_enabled()` flag probe
-(`agents/roomlerd/src/win_service/supervisor.rs:977`), on **every service
+(`agents/roomlerd/src/win_service/supervisor.rs:1015`), on **every service
 start** of every user-context install; and enrollment itself, reusing an
 existing `machine_id` — during the very operation that enrolls the machine.
 The noise also buried the genuine case, which prints the identical line.
@@ -356,9 +422,9 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2634`, `:2656`), at the clean-run promotion
-(`record_clean_run_at`, `:2620`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4062`). Each save
+`crates/agent-core/src/config.rs:2749`, `:2771`), at the clean-run promotion
+(`record_clean_run_at`, `:2626`), at every `ConfigSet`, and at enrollment. The daemon, the
+desktop app and the setup wizard all write it through `config::save` (`:4201`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -370,7 +436,7 @@ does not model:
   upgrade did not bring them back.
 
 Now `save` writes the struct **plus** every key of the file it replaces that this build
-ignores (`serialise_for`, `:3962`):
+ignores (`serialise_for`, `:4097`):
 
 | In the file being replaced | After the save |
 |---|---|
@@ -396,14 +462,14 @@ flowchart TD
 ```
 
 "Unknown" means exactly what this build's deserializer skipped: `serde_ignored` names the
-keys (`unknown_keys`, `:3799`). A key this build knows is written as this build read it: a
+keys (`unknown_keys`, `:3929`). A key this build knows is written as this build read it: a
 value a newer build wrote that this one cannot represent — `peer_auth = "enforce"`, read as
-`audit` (`:2780`) — is rewritten to that reading, for instance after a rollback. Only the keys
+`audit` (`:2805`) — is rewritten to that reading, for instance after a rollback. Only the keys
 the deserializer skipped are kept as written.
 
 ⚠️ **An array entry is found by its identity, never by its position** (`same_entry`,
-`:3866`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
-array (`entry_identity`, `:3850`), never one read off the entry on disk. A newer build's
+`:3997`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
+array (`entry_identity`, `:3981`), never one read off the entry on disk. A newer build's
 entry can carry a key that looks like an identity (an `id` on an org) which no entry this
 build writes has: keyed on it, the entry is found nowhere, and every key on it is lost, in
 exactly the array the merge exists for. Positions move: removing an org shifts the ones
@@ -424,24 +490,35 @@ keeps it with the new primary, as `preserve_operator_config` keeps every operato
 with the file.
 
 Two guards keep the worst case at the old behaviour. The merged text must read back and
-serialise to exactly what the struct alone would have written (`:3946`), so the merge can only
+serialise to exactly what the struct alone would have written (`:4075`), so the merge can only
 add what this build ignores and never change a key it knows. And any failure writes the struct
 alone, with a WARN that names the keys it could not keep.
 
-`load` names them once per process and file (`note_unknown_keys`, `:4030`), with WARN *"config
+`load` names them once per process and file (`note_unknown_keys`, `:4163`), with WARN *"config
 keys this build does not know: ignored here, and kept in the file through every save"* and the
 key paths. After a rollback, "my setting did nothing" has its answer in the log.
 
 `load`'s recovery keeps them too. It reinstates the `config.toml.prev` copy it loaded over a
-live file that does not parse, and names the copy as the base (`save_with_base`, `:4068`):
-the keys to keep are the copy's, and the live file holds nothing a merge can read. Every
-other save reads the file it replaces, and one over a file that does not parse says so —
-WARN *"the config being replaced does not parse: keys this build does not know in it, if
+live file that does not parse, and names the copy as the base (`save_with_base`): the keys to
+keep are the copy's, and the live file holds nothing a merge can read. Every other save reads
+the file it replaces, and if that does not read as a config, its last good copy (#3087), so
+the wizard's enrollment and `adopt-enrollment`, which recover through `read_merge_base`, keep
+them as well. When neither reads it says so — WARN *"the config being replaced does not read
+as a config, and neither does its last good copy: keys this build does not know in them, if
 any, are NOT kept through this save"*, a fixed string, never the parser's.
 
 ⚠️ **Key paths only, never values.** The file holds the agent token and the overlay keys. A
-TOML parse error quotes the line it stopped at, so the merge reports fixed strings and never
-passes a parser message on.
+TOML parse error quotes the line it stopped at, and its message can quote a value, so the merge
+reports fixed strings and never passes a parser message on.
+
+⚠️ **No error about this file carries anything from it** (#3086). A typo on `agent_token`'s line
+used to print the token into the daemon's log, which uploads to the server, onto the wizard's
+page and into the terminal. The parser's error now ends where it happens (`parse_failure` in
+`crates/agent-core/src/config.rs`, and its copy in `agents/roomler-cli/src/config.rs`): what
+leaves is *"TOML parse error at line 3, column 81"* with no source behind it, so no `{:#}` or
+`{:?}` further up can reach the parser's words. The one message kept is `missing field
+\`name\``, the schema's word for a key it wanted. A key name read off the file is never kept,
+because a broken line can turn a value into one. The person has the file and the line.
 
 ⚠️ **A key a build retires now stays in the file** and is logged as unknown at every start,
 where the next save used to scrub it. Every key retired so far was a knob or a kill switch. A
@@ -520,6 +597,11 @@ Details worth knowing:
 - Daemon installs also place **`roomler-desktop`** (tray companion: status,
   tunnels pane, consent prompts) and **`roomler.exe`** — a small shim that
   re-execs `roomlerd cli`, so CLI and daemon can never version-skew.
+  On a machine-wide install a limited wizard cannot write under `%ProgramFiles%`, so
+  it leaves `roomler-desktop` to the service, waits up to a minute for it
+  (`service_places_companion`, `wait_for_file`) and reports what is there, as Done
+  and the install trace do on every path (#3174). If the EXE is still absent the
+  checklist says so: the service adds it at its next start, or within 4 hours.
 - Terminal alternative: `irm https://roomler.ai/api/setup/install.ps1 | iex`
   runs the script with its defaults (`-Role daemon-system` from an elevated
   shell, nothing enrolled — it asks for nothing). To pass parameters, which
@@ -787,7 +869,7 @@ sequenceDiagram
 
 **Auto-updates and upgrades** (the open question in #3115). The updater does
 not stop the service before it runs msiexec. `spawn_installer_with_watch`
-(`agents/roomlerd/src/updater.rs:1892`) launches `msiexec /i … /qn` elevated
+(`agents/roomlerd/src/updater.rs:1915`) launches `msiexec /i … /qn` elevated
 (`:2236`, `:2636`) while the service runs; the worker that launched it exits 0,
 and its host stays up (`:593`). Measured on a vmtest Win11 cell, released code,
 with each stop held to the field's 7.8 s:
@@ -921,7 +1003,7 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 
 The daemon's `.deb` has to start on a host with nothing on it: a bare server, a
 container, a cluster node. FFmpeg, libvpx and libva ride in the package, so
-`depends` is short (`agents/roomlerd/Cargo.toml:1024`), and every name in it backs
+`depends` is short (`agents/roomlerd/Cargo.toml:1026`), and every name in it backs
 a library the binary links directly:
 
 | `Depends` | Why it reads this way |
@@ -950,7 +1032,7 @@ alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives fro
 the binary's symbols.
 
 Neither floor can strand a running daemon on the updater's offline `dpkg --install`
-rung (`agents/roomlerd/src/updater.rs:2300`), which is the reason libva and
+rung (`agents/roomlerd/src/updater.rs:2339`), which is the reason libva and
 `iproute2` stay out of `depends`. A host where the daemon runs already has the real
 library and OpenSSL, because without them it cannot start. A healthy install
 upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,
@@ -1037,7 +1119,24 @@ sequenceDiagram
 
 - **The wizard needs WebKitGTK 4.1.** The Fedora KDE lab image lacked it
   (`sudo dnf install webkit2gtk4.1`). On Debian and Ubuntu the package is
-  `libwebkit2gtk-4.1-0`.
+  `libwebkit2gtk-4.1-0`. Its import table names `libwebkit2gtk-4.1.so.0` before
+  `libsoup-3.0.so.0` and `libjavascriptcoregtk-4.1.so.0`, so without the package a
+  terminal start stops at `error while loading shared libraries:
+  libwebkit2gtk-4.1.so.0`, before any window, and exits 127. Opened from the file
+  manager it shows nothing at all: the line goes only to the journal. Read on an
+  Ubuntu 24.04 desktop with the package removed (#3202); the stock desktop has it,
+  through `ubuntu-desktop-minimal`. Since #3202 every place a person gets
+  it says so: the Linux download block in the add-device dialog and on both
+  homepages (`LINUX_WIZARD_NEEDS`, `ui/src/utils/enrollCommands.ts`), the public
+  Linux install page, and the tarball's `README.md`
+  (`agents/roomler-setup/README-linux.md`), with the one-line install as the way
+  that needs nothing first.
+- **Two CPUs, two downloads.** `/api/setup/linux` is the x86_64 wizard and
+  `/api/setup/linux-aarch64` the ARM64 one (`normalise_platform`,
+  `crates/modules/fleet/src/setup_release.rs`). A browser can't be trusted to say
+  which CPU it runs on, because Chromium's Linux user agent always reads x86_64.
+  So since #3247 item 13 each place that offers the Linux wizard also links the
+  ARM64 one (`LINUX_ARM64_LABEL`, the same file).
 - **The cards appear only when the chosen server says so**: the wizard reads
   `GET /api/setup/features` and shows the Linux cards on a JSON
   `wizard_linux_daemon: true`, or on `wizard_unix_daemon: true`, which a server
@@ -1226,6 +1325,9 @@ lines through `systemctl --user edit roomler`.
 
 ⚠️ Delegated, and the cgroups cannot be made: no worker runs. A worker that
 cannot have its limits never runs (FR-90 P8-2a-3), and the daemon's log says why.
+A failure that passes, such as a process of the unit still in its exit or
+systemd not answering, is tried again by a later worker's start (#3349). One
+that will not pass stays until the daemon restarts.
 
 ## macOS
 
@@ -1347,6 +1449,21 @@ runs on that enrollment, so it is what the daemon's row streams through until P3
 Measured on 0.4.191: with `<name>` deleted, the worker exits 7 at every spawn, the
 supervisor backs off and stops, and `<name>-daemon` reads `no-gui-session`. A Mac
 enrolled with one root token and no per-user enrollment has no worker at all.
+
+**One row, behind a switch (FR-43 P3a).** With `macos_one_row = true` beside
+`macos_supervise_gui_worker = true` in the root's config, read when the daemon starts,
+the worker runs `run --supervised --unenrolled`. It holds no enrollment, dials no
+server, and takes its sessions from the daemon's delegation channel alone. A person's
+enrollment on that Mac stays in their file and is ignored, and a person with none gets
+a worker anyway. As the console user, `roomler status`, the device list and the
+companion show the root half's row, and a verb that needs the server (`forward`,
+`exec`, `ssh`, a rename) says to run it with `sudo`. Until the logs PR, that worker's
+logs stay on the Mac.
+
+The switch is off by default and stays off until the
+[field proof](fr/FR-43-macos-single-enrollment.md#what-rides-what). It doesn't yet give
+one row alone: secondary orgs, the migration of a two-row Mac and the one-token install
+are P3b, P3c and P3d.
 
 ```bash
 # Screen sharing only (one token, one device row):
@@ -1595,11 +1712,11 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3428`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3469`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2684`).
+back to the version that is running (`crates/agent-core/src/config.rs:2841`).
 
 ### No pipe can stall the supervisor (#3080)
 
@@ -1795,6 +1912,12 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
   `install.ps1 -Uninstall`; the daemon's version sweep also removes older
   same-flavour MSIs after upgrades. `roomlerd service uninstall` removes a
   manually-installed service/task.
+  From a PowerShell started as administrator, `install.ps1 -Uninstall` removes
+  either flavour and the companion it placed in `C:\Program Files\Roomler`
+  (`roomler-desktop.exe` with its `.old` and `.version`). A run that is not
+  elevated removes this account's install only, and names what it left with
+  the way on (`scripts/install.ps1:519-531`, #3247). Either way the settings in
+  `C:\ProgramData\roomler` stay.
 - **Linux and macOS** (FR-97 P6d): one command, whatever put Roomler there —
   this script, the `.deb`, the companion's `.rpm`, the tarball, the `.pkg`, the
   tunnel CLI. Every step acts only on what is present, so it also works on a
@@ -1836,7 +1959,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2191`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2211`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 
