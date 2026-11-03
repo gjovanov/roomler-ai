@@ -1344,34 +1344,47 @@ impl Drop for ProtectedDirSd {
 /// here because its `Builder` has no way to pass Windows security attributes.
 #[cfg(target_os = "windows")]
 fn create_fresh_protected_dir(base: &std::path::Path) -> std::io::Result<PathBuf> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
-
     for _ in 0..8 {
         let name = format!("{}{:016x}", STAGING_DIR_PREFIX, rand::random::<u64>());
         let dir = base.join(name);
-        let wide: Vec<u16> = dir
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut sd = ProtectedDirSd::new()?;
-        // SAFETY: a NUL-terminated path; the descriptor lives in `sd` for the
-        // duration of this call.
-        let ok = unsafe { CreateDirectoryW(wide.as_ptr(), sd.attributes()) };
-        if ok != 0 {
-            return Ok(dir);
+        match create_protected_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            // Name collision — try again with a fresh random suffix.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
         }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(e);
-        }
-        // Name collision — try again with a fresh random suffix.
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
         "could not allocate a unique staging dir name",
     ))
+}
+
+/// Make `dir`, which must not exist yet, readable and writable by SYSTEM and
+/// Administrators alone: the DACL is set AT CREATION ([`ProtectedDirSd`]), and
+/// the create fails if anything is already at the name, so a folder someone else
+/// made first is never taken for ours. It also fails for a caller who cannot
+/// name Administrators as the owner. The setup wizard stages what it runs
+/// elevated in one of these (#3246).
+#[cfg(target_os = "windows")]
+pub fn create_protected_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sd = ProtectedDirSd::new()?;
+    // SAFETY: a NUL-terminated path; the descriptor lives in `sd` for the
+    // duration of this call.
+    let ok = unsafe { CreateDirectoryW(wide.as_ptr(), sd.attributes()) };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// macOS: the per-user `confstr(_CS_DARWIN_USER_TEMP_DIR)` temp dir is
@@ -1967,7 +1980,9 @@ pub fn spawn_installer_with_watch(
 /// exiting, service left stopped) were undiagnosable because silent
 /// installs leave no trace; the log names the exact action a wedged
 /// run was in. The staging dir is recycled per update, so the log
-/// doesn't accumulate.
+/// doesn't accumulate. #2107 — each attempt on one staged installer
+/// gets its own name ([`next_msi_log`]): the watcher retries a wedged
+/// install from the same path, and `/l*v` truncates.
 #[cfg(any(target_os = "windows", test))]
 pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour) -> Vec<String> {
     let path = installer.to_string_lossy().into_owned();
@@ -1975,7 +1990,7 @@ pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour)
         WindowsInstallFlavour::PerUser => "/qn",
         WindowsInstallFlavour::PerMachine => "/qn",
     };
-    let log = format!("{path}.log");
+    let log = next_msi_log(&path, |candidate| std::path::Path::new(candidate).exists());
     vec![
         "/i".to_string(),
         path,
@@ -1984,6 +1999,20 @@ pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour)
         "/l*v".to_string(),
         log,
     ]
+}
+
+/// #2107 — the first free verbose-log name for one more attempt on `installer`:
+/// `<installer>.log`, then `<installer>.2.log`, and so on.
+#[cfg(any(target_os = "windows", test))]
+fn next_msi_log(installer: &str, exists: impl Fn(&str) -> bool) -> String {
+    let first = format!("{installer}.log");
+    if !exists(&first) {
+        return first;
+    }
+    (2u32..)
+        .map(|attempt| format!("{installer}.{attempt}.log"))
+        .find(|name| !exists(name))
+        .unwrap_or(first)
 }
 
 /// rc.44: variant of [`msiexec_argv`] that appends operator-supplied
@@ -6518,6 +6547,28 @@ mod tests {
     }
 
     // ----- msiexec_argv (Plan rc.18 P1) -------------------------------
+
+    /// #2107 — the verbose log exists to name the action a wedged run was in, and
+    /// the watcher's retry of the same staged installer truncated it.
+    #[test]
+    fn a_retry_never_reuses_the_log_of_the_attempt_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let msi = dir.path().join("roomlerd.msi");
+        let next_log = || {
+            msiexec_argv(&msi, WindowsInstallFlavour::PerMachine)
+                .pop()
+                .unwrap()
+        };
+        let first = next_log();
+        assert_eq!(first, format!("{}.log", msi.display()));
+        std::fs::write(&first, "the wedged attempt").unwrap();
+        let second = next_log();
+        assert_ne!(second, first);
+        std::fs::write(&second, "the retry").unwrap();
+        let third = next_log();
+        assert_ne!(third, first);
+        assert_ne!(third, second);
+    }
 
     #[test]
     fn msiexec_argv_per_user_uses_qn() {

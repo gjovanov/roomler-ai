@@ -431,7 +431,7 @@ The portal path, and macOS's Screen Recording grant, produce a system permission
 > `wgc_backend::pin_mta` takes `CoIncrementMTAUsage` once per process and never
 > gives it back. Measured on 0.4.197: a recorder child faulted during its remux and lost the recording
 > (`docs/recording.md` §5), while a session's worker still held the module after five closed sessions, because
-> something else holds the MTA there.
+> something else holds the MTA there. Read on release 0.4.198: 24 recordings stopped over a moving screen, ten of them after 60 s or more, all saved, and Windows' Application log named no fault. 0.4.197 faulted once in 44, so that count is not a rate.
 
 ### 5.1a When capture cannot open, the session says why (FR-80)
 
@@ -4459,6 +4459,20 @@ outcome to `<log_dir>/last-install.json` with status
 `InProgress` / `SucceededVerified` / `SucceededUnverified` /
 `InstallerFailed` / `Timeout`. Operators + future agent startups
 read the file to surface what actually happened to the upgrade.
+
+**Each attempt keeps its own MSI log (#2107).** The verbose `/l*v` log
+exists to name the action a wedged run stopped in, and the watcher's
+wedge recovery retries the same staged installer. `/l*v` truncates, so
+the retry used to erase the one record of where the first attempt
+wedged.
+
+| Log | Written by | Lives |
+|---|---|---|
+| `<msi>.log` | the first attempt (`next_msi_log`, `agents/roomlerd/src/updater.rs:2007`) | next to the MSI, until the startup sweep removes the staging dir, 1 h or more later |
+| `<msi>.2.log`, `<msi>.3.log` | each later attempt on the same path | the same |
+| `<log_dir>/msi-wedged.log` | the watcher, copied before its retry (`keep_wedged_log`, `agents/roomlerd/src/post_install.rs:543`) | until the next wedge moves it to `msi-wedged.prev.log` |
+
+The record's `note` in `last-install.json` names the kept copy.
 
 **It must inherit no socket (#2836, Windows).** std's `Command` spawns
 with `bInheritHandles = TRUE`, so the watcher gets a copy of every
