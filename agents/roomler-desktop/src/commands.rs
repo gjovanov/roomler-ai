@@ -83,7 +83,9 @@ pub async fn cmd_status() -> StatusReport {
 fn status_report() -> StatusReport {
     let (service_kind, service_running) = probe_service_state();
     let is_scm = service_kind == "scmService";
-    let cfg = load_optional_config(is_scm);
+    // FR-43 P3a — a person's file on a one-row Mac holds their settings and no
+    // enrollment. That reads as no file, so `cmd_status` asks the daemon.
+    let cfg = load_optional_config(is_scm).filter(AgentConfig::has_primary_enrollment);
     // S1b — read BOTH sentinel locations (per-user + machine-global) and
     // parse message/reason; the old path-only read missed a SystemContext
     // host's machine-global sentinel entirely.
@@ -167,6 +169,11 @@ fn apply_daemon_identity(report: &mut StatusReport, id: DaemonIdentity) {
 async fn daemon_node_status() -> Option<NodeStatus> {
     let mut client = localapi::connect().await.ok()?;
     client.status().await.ok()
+}
+
+/// [`daemon_node_status`], for code on the blocking pool.
+fn daemon_node_status_blocking() -> Option<NodeStatus> {
+    tauri::async_runtime::block_on(daemon_node_status())
 }
 
 /// The daemon log directory to show / open. `logging::log_dir()` only works IN
@@ -467,6 +474,14 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
     let existing = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
+    // FR-43 P3a — this file has nothing to refresh.
+    if !existing.has_primary_enrollment() {
+        return Err(
+            "The root daemon holds this Mac's enrollment. Refresh it with \
+             `sudo roomlerd re-enroll --token <token>`."
+                .to_string(),
+        );
+    }
     let fresh = enrollment::enroll(EnrollInputs {
         server_url: &existing.server_url,
         enrollment_token: &trimmed,
@@ -1410,9 +1425,20 @@ fn no_handler_message(scheme: &str) -> String {
 pub fn server_origin_blocking() -> Result<String, String> {
     let is_scm = probe_service_state().0 == "scmService";
     let path = active_config_path(is_scm)?;
-    let cfg = config::load(&path)
-        .map_err(|_| "This device isn't enrolled yet — no server to open.".to_string())?;
-    let server = cfg.server_url.trim().trim_end_matches('/').to_string();
+    let not_enrolled = || "This device isn't enrolled yet — no server to open.".to_string();
+    let cfg = config::load(&path).map_err(|_| not_enrolled())?;
+    // FR-43 P3a — on a one-row Mac the server is in the root daemon's enrollment,
+    // not in the person's file.
+    let server = if cfg.has_primary_enrollment() {
+        cfg.server_url
+    } else {
+        daemon_node_status_blocking()
+            .as_ref()
+            .and_then(daemon_identity)
+            .and_then(|id| id.server_url)
+            .ok_or_else(not_enrolled)?
+    };
+    let server = server.trim().trim_end_matches('/').to_string();
     if !server.starts_with("https://") && !server.starts_with("http://") {
         return Err("this device's config has no valid server URL".to_string());
     }
@@ -1441,6 +1467,9 @@ pub async fn cmd_open_roomler(app: tauri::AppHandle) -> Result<(), String> {
 /// org's server and tenant, which are read from this device's own
 /// `[[orgs]]` entry — still never from anything the page or a peer supplied.
 /// Absent / empty / `primary` = the primary enrollment, as before.
+///
+/// FR-43 P3a — a person's file on a one-row Mac holds no enrollment, so the same
+/// fields come from this machine's root daemon ([`daemon_remote_target`]).
 #[tauri::command]
 pub async fn cmd_open_remote(
     app: tauri::AppHandle,
@@ -1455,7 +1484,13 @@ pub async fn cmd_open_remote(
         let is_scm = probe_service_state().0 == "scmService";
         let path = active_config_path(is_scm)?;
         let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-        let (server, tid) = remote_target(&cfg, org.as_deref())?;
+        let (server, tid) = if cfg.has_primary_enrollment() {
+            remote_target(&cfg, org.as_deref())?
+        } else {
+            let status = daemon_node_status_blocking()
+                .ok_or_else(|| "The Roomler service isn't answering.".to_string())?;
+            daemon_remote_target(&status, org.as_deref())?
+        };
         Ok::<String, String>(format!("{server}/tenant/{tid}/agent/{aid}/remote"))
     })
     .await
@@ -1468,10 +1503,7 @@ pub async fn cmd_open_remote(
 /// entry's. Both validated: an http(s) origin and a 24-hex tenant id. Pure
 /// over the loaded config, so the resolution is unit-tested.
 fn remote_target(cfg: &AgentConfig, org: Option<&str>) -> Result<(String, String), String> {
-    let label = org
-        .map(str::trim)
-        .filter(|o| !o.is_empty() && *o != config::PRIMARY_ORG_LABEL);
-    let (server, tid) = match label {
+    let (server, tid) = match secondary_label(org) {
         None => (cfg.server_url.as_str(), cfg.tenant_id.as_str()),
         Some(label) => {
             let entry = cfg
@@ -1482,6 +1514,39 @@ fn remote_target(cfg: &AgentConfig, org: Option<&str>) -> Result<(String, String
             (entry.server_url.as_str(), entry.tenant_id.as_str())
         }
     };
+    checked_target(server, tid)
+}
+
+/// FR-43 P3a — [`remote_target`] from the daemon's own `orgs`, for a person's file
+/// that holds no enrollment. Still this machine's word, and validated the same.
+fn daemon_remote_target(
+    status: &NodeStatus,
+    org: Option<&str>,
+) -> Result<(String, String), String> {
+    let entry = match secondary_label(org) {
+        None => status
+            .orgs
+            .iter()
+            .find(|o| o.primary)
+            .ok_or_else(|| "this device has no primary enrollment".to_string())?,
+        Some(label) => status
+            .orgs
+            .iter()
+            .find(|o| o.label == label)
+            .ok_or_else(|| format!("this device has no enrollment labelled {label:?}"))?,
+    };
+    checked_target(&entry.server_url, entry.tenant_id.as_deref().unwrap_or(""))
+}
+
+/// The `[[orgs]]` label `org` names, if it names one and not the primary.
+fn secondary_label(org: Option<&str>) -> Option<&str> {
+    org.map(str::trim)
+        .filter(|o| !o.is_empty() && *o != config::PRIMARY_ORG_LABEL)
+}
+
+/// An http(s) origin and a 24-hex tenant id, or a refusal: what a "View screen"
+/// may open.
+fn checked_target(server: &str, tid: &str) -> Result<(String, String), String> {
     let tid = tid.trim().to_ascii_lowercase();
     if tid.len() != 24 || !tid.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("this device's config has no valid tenant id for that organization".into());
@@ -3878,6 +3943,59 @@ mod tests {
         assert!(unknown.contains("no enrollment labelled"), "{unknown}");
         // A malformed entry is refused, never opened.
         assert!(remote_target(&cfg, Some("broken")).is_err());
+    }
+
+    /// FR-43 P3a — a one-row Mac's person file names no server, so "View screen"
+    /// takes its origin and tenant from the root daemon's rows, by the same rules
+    /// as the file's: the org follows the device, and a bad row is never opened.
+    #[test]
+    fn a_daemons_rows_give_the_same_target_as_a_file() {
+        let status: NodeStatus = serde_json::from_value(serde_json::json!({
+            "node_id": "d", "name": "mac", "version": "0.4.199", "mode": "service",
+            "connected": true,
+            "orgs": [
+                { "label": "primary", "server_url": "https://roomler.ai/",
+                  "tenant_id": "AAAAAAAAAAAAAAAAAAAAAAAA", "primary": true,
+                  "enabled": true, "connected": true },
+                { "label": "acme", "server_url": "https://acme.example",
+                  "tenant_id": "bbbbbbbbbbbbbbbbbbbbbbbb", "primary": false,
+                  "enabled": true, "connected": true },
+                { "label": "no-tenant", "server_url": "https://acme.example",
+                  "primary": false, "enabled": true, "connected": true },
+                { "label": "bad-origin", "server_url": "file:///etc/passwd",
+                  "tenant_id": "bbbbbbbbbbbbbbbbbbbbbbbb", "primary": false,
+                  "enabled": true, "connected": true }
+            ]
+        }))
+        .unwrap();
+        let primary = (
+            "https://roomler.ai".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        assert_eq!(daemon_remote_target(&status, None).unwrap(), primary);
+        assert_eq!(daemon_remote_target(&status, Some("")).unwrap(), primary);
+        assert_eq!(
+            daemon_remote_target(&status, Some("primary")).unwrap(),
+            primary
+        );
+        assert_eq!(
+            daemon_remote_target(&status, Some("acme")).unwrap(),
+            (
+                "https://acme.example".to_string(),
+                "bbbbbbbbbbbbbbbbbbbbbbbb".to_string()
+            )
+        );
+        let unknown = daemon_remote_target(&status, Some("ghost")).unwrap_err();
+        assert!(unknown.contains("no enrollment labelled"), "{unknown}");
+        assert!(daemon_remote_target(&status, Some("no-tenant")).is_err());
+        assert!(daemon_remote_target(&status, Some("bad-origin")).is_err());
+
+        // A daemon with no rows (no answer from the root half) opens nothing.
+        let empty = NodeStatus {
+            orgs: Vec::new(),
+            ..status
+        };
+        assert!(daemon_remote_target(&empty, None).is_err());
     }
 
     /// FR-84 D5c — a rejected `cmd_devices` is `{code, message, status?}`,

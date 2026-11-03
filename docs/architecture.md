@@ -123,6 +123,7 @@ flowchart BT
     roomlerd["agents/roomlerd → roomlerd<br/>the daemon"]
     tunnel["agents/roomler-cli → roomler<br/>tunnel CLI (surface lives in its lib)"]
     shim["agents/roomler-cli-shim<br/>roomler.exe on daemon hosts → re-execs roomlerd cli"]
+    launcher["agents/roomlerdw<br/>roomlerdw.exe on per-user Windows hosts → starts roomlerd with no window"]
     tray["agents/roomler-desktop → roomler-desktop"]
     setup["agents/roomler-setup<br/>install wizard (Tauri)"]
 
@@ -267,7 +268,7 @@ usage, relay stats) renders with d3. i18n is wired but ships English only today.
 
 ## Deployment shape
 
-- **One Docker image** — `rust:1.88-bookworm` builds the API, `oven/bun` builds the
+- **One Docker image** — `rust:1.95-bookworm` builds the API, `oven/bun` builds the
   SPA, `debian:trixie-slim` runs nginx + the binary ([deployment.md](deployment.md)).
 - **Dev stack** — `docker compose up -d`: MongoDB (:27019), Redis, MinIO, coturn.
 - **Native artifacts** — MSI / `.deb` / `.pkg` / tarballs built by tag-triggered

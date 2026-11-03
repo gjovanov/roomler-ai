@@ -266,6 +266,14 @@
              mutter capture without asking anyone, and the operator can see
              that they did. Absent on Windows, macOS and older agents. -->
         <span v-if="metrics.codec && statsCaptureLabel" class="stats-pill">{{ statsCaptureLabel }}</span>
+        <!-- FR-135 R2 — the steps this session took down from what it set out to
+             run: the last one here, all of them on hover. -->
+        <span
+          v-if="metrics.codec && statsLadderLabel"
+          class="stats-pill"
+          data-testid="rc-media-ladder"
+          :title="statsLadderTitle"
+        >{{ statsLadderLabel }}</span>
         <span v-if="metrics.bitrate" class="stats-pill">{{ statsBitrateLabel }}</span>
         <span v-if="metrics.fps" class="stats-pill">{{ statsFpsLabel }}</span>
         <span v-if="metrics.resolution && statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
@@ -587,6 +595,13 @@
             </div>
             <div v-else-if="rec.state.value === 'pending_consent'" class="text-body-2">
               Waiting for the person at the device to allow it…
+            </div>
+            <div
+              v-else-if="rec.state.value === 'announcing'"
+              class="text-body-2"
+              data-testid="rc-record-announcing"
+            >
+              Telling the person at the device first…
             </div>
             <div v-else>
               <!-- #1760 — where the device says computer audio cannot go into
@@ -1103,13 +1118,13 @@
           This agent is currently offline. The session will fail until the agent
           reconnects.
         </p>
-        <!-- Not offered right after the person at the device ended the session:
-             their Disconnect is an explicit "stop", and the next step offered is
-             Reconnect, which asks them again. Break-glass stays available from a
-             fresh page, with its reason, audit and owner notice (operator,
-             2026-10-10). -->
+        <!-- Not offered right after the person at the device ended the session
+             (their Disconnect is an explicit "stop"; Reconnect asks them again),
+             nor ever to an outsider, who has no break-glass (#3258): see
+             `offersBreakGlass`. A member keeps it on a fresh page, with its
+             reason, audit and owner notice (operator, 2026-10-10). -->
         <v-btn
-          v-if="rc.endedBy.value !== 'host'"
+          v-if="offersBreakGlass({ external: isExternal, endedBy: rc.endedBy.value })"
           variant="text"
           size="small"
           color="warning"
@@ -1181,6 +1196,40 @@
             Reconnecting by itself once it is back (attempt {{ rc.reconnectAttempt.value }})…
           </template>
           <template v-else>{{ phaseLabel }}</template>
+        </p>
+        <v-btn variant="tonal" size="small" class="mt-3" @click="leave()">
+          Cancel
+        </v-btn>
+      </div>
+
+      <!-- FR-135 R2 — and a page with no picture keeps saying why while the
+           watchdog re-creates the session. With the words only on the connected
+           stage, every redial read "Connection lost", which is false (the device
+           answered) and, from the fourth attempt, lasts minutes. -->
+      <div
+        v-else-if="noPictureWhileRedialling"
+        class="empty-state"
+        :data-testid="noPictureWhileRedialling.testId"
+      >
+        <v-icon size="72" :color="noPictureWhileRedialling.iconColor">mdi-video-off</v-icon>
+        <p class="text-body-1 mt-3">{{ noPictureWhileRedialling.title }}</p>
+        <p v-if="noPictureWhileRedialling.body" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
+          {{ noPictureWhileRedialling.body }}
+        </p>
+        <p v-if="noPictureWhileRedialling.code" class="text-caption text-medium-emphasis mt-2">
+          Reported by the device as
+          <code>{{ noPictureWhileRedialling.code }}</code>.
+          <span v-if="noPictureWhileRedialling.detail">{{ noPictureWhileRedialling.detail }}</span>
+        </p>
+        <p class="text-caption text-medium-emphasis mt-2">
+          <template v-if="rc.phase.value === 'reconnecting'">
+            Trying again by itself (attempt {{ rc.reconnectAttempt.value }})…
+          </template>
+          <template v-else>{{ phaseLabel }}</template>
+        </p>
+        <p v-if="agent && !agent.is_online" class="text-caption text-warning">
+          The device currently reports offline — retries continue until it
+          returns.
         </p>
         <v-btn variant="tonal" size="small" class="mt-3" @click="leave()">
           Cancel
@@ -1388,6 +1437,25 @@
           <p v-if="mediaWaitingCopy(rc.mediaWaiting.value.for).showsDeadline" class="text-caption text-medium-emphasis mt-2">
             If nobody answers, the request ends at {{ mediaWaitingEnds }}.
           </p>
+        </div>
+        <!-- FR-135 R2 — the device said why it stopped its video, or it said
+             nothing and no picture ever came, and the page knows what it was
+             promised. Before this the page stayed black and re-created the
+             session every 10 s, with the reason only in the host's log. The
+             stage above carries the same words through the re-create. -->
+        <div v-else-if="noPicture" class="no-media-overlay" :data-testid="noPicture.testId">
+          <v-icon size="72" :color="noPicture.iconColor">mdi-video-off</v-icon>
+          <p class="text-body-1 mt-3">{{ noPicture.title }}</p>
+          <p v-if="noPicture.body" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
+            {{ noPicture.body }}
+          </p>
+          <p v-if="noPicture.code" class="text-caption text-medium-emphasis mt-2">
+            Reported by the device as
+            <code>{{ noPicture.code }}</code>.
+            <span v-if="noPicture.detail">{{ noPicture.detail }}</span>
+          </p>
+          <!-- An external session takes no retry: the watchdog ends it instead. -->
+          <p v-if="!isExternal" class="text-caption text-medium-emphasis mt-1">This page keeps trying.</p>
         </div>
         <div v-else-if="!rc.hasMedia.value" class="no-media-overlay">
           <v-icon size="72" color="grey-lighten-1">mdi-video-off</v-icon>
@@ -2550,6 +2618,7 @@ import {
   uploadOutcomeMessage,
   thisDevicesFromPick,
 } from '@/composables/useRemoteControl'
+import { offersBreakGlass } from '@/composables/breakGlass'
 import {
   PICKER_CHROMAS,
   PICKER_CODECS,
@@ -2580,6 +2649,7 @@ import {
   frameRateSummary,
   type FrameRate,
 } from '@/composables/frameRate'
+import { describeMediaStep, mediaLadderLabel, noPictureWords } from '@/composables/mediaPlan'
 import { featureRefusal, summarizeRefusals } from '@/composables/useSessionFeatures'
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
@@ -4063,9 +4133,9 @@ const codecChoice = rc.codecChoice
 // FR-77 — the validity matrix behind the two dropdowns: the agent's cells
 // (one derivation for new and old agents) crossed with this browser's decode
 // probes and the decode failures remembered for this device. 4:2:0 cells stay
-// optimistic until the device record arrives (the rc.190 contract — the agent
-// falls back when it cannot honour a pick); every 4:4:4 cell demands proof
-// from both ends, because a chroma mismatch is a black screen.
+// optimistic until the device record arrives (connect() holds the pick to that
+// record, #3167); every 4:4:4 cell demands proof from both ends, because a
+// chroma mismatch is a black screen.
 const cellAvail = computed<Availability>(() =>
   cellAvailability({
     cells: cellsFromCaps(agent.value?.capabilities),
@@ -4801,6 +4871,8 @@ const statsBitrateLabel = computed(() => {
 /** FR-93 P2 — which Linux arm captures this session, and whether anyone at
  *  the screen was asked. `''` (no pill) for Windows, macOS and older agents. */
 const statsCaptureLabel = computed(() => captureArmLabel(rc.videoInfo.value))
+const statsLadderLabel = computed(() => mediaLadderLabel(rc.mediaPlan.value?.ladder ?? []))
+const statsLadderTitle = computed(() => (rc.mediaPlan.value?.ladder ?? []).map(describeMediaStep).join('\n'))
 const statsAgeLabel = computed(() => {
   const age = rc.decodeDiag.value?.age
   if (!age || age.n <= 0) return ''
@@ -5119,6 +5191,15 @@ const asleepWhileRedialling = computed(() => {
   if (w?.for !== 'host_sleep') return null
   return ['reconnecting', 'requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value) ? w : null
 })
+// FR-135 R2 — what this page says about having no picture, on the connected stage
+// and through a redial. The composable keeps it across a re-create, and the first
+// frame ends it.
+const noPicture = computed(() =>
+  noPictureWords(rc.mediaStop.value, rc.mediaSilent.value, rc.mediaPlan.value, rc.mediaDataArrived.value),
+)
+const noPictureWhileRedialling = computed(() =>
+  ['reconnecting', 'requesting', 'awaiting_consent', 'negotiating'].includes(rc.phase.value) ? noPicture.value : null,
+)
 const mediaWaitingEnds = computed(() => {
   const w = rc.mediaWaiting.value
   return w ? new Date(w.deadlineMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''

@@ -43,7 +43,7 @@ was encoded with, the same YUV comes back within one code value of the source.
 | Encoder family | Converts with | Writes a colour description? | Where it would go |
 |---|---|---|---|
 | FFmpeg, every backend | BT.601 limited (the CPU form's dcv; the GPU forms, FR-118) | **no**: none of `colorspace`, `color_range`, `color_primaries`, `color_trc` is set anywhere in the agent | the codec context, in `build_encoder`'s `configure` closure (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1757`, after `:1888`), which every FFmpeg open passes through: sessions, rebuilds, probes, recordings and the GPU forms |
-| Media Foundation (Windows) | BT.601 limited (`agents/roomlerd/src/encode/color.rs:42`, `:108-109`) | **no**: the media types carry size, rate and bitrate only | the output and input types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:454`, `:476`), and again where `drain_output` renegotiates the output type (`:410`) |
+| Media Foundation (Windows) | BT.601 limited (`agents/roomlerd/src/encode/color.rs:42`, `:108-109`) | **no**: the media types carry size, rate and bitrate only | the output and input types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:464`, `:486`), and again where `drain_output` renegotiates the output type (`:420`) |
 | openh264, live | BT.601 limited | **no** (`agents/roomlerd/src/encode/openh264_backend.rs:91`) | its VUI, as the recording profile already does (`:150`, `VuiConfig::bt601()`) |
 | libvpx VP9 | BT.601 limited | **no**: `img.cs` is set (`agents/roomlerd/src/encode/libvpx.rs:629`), but libvpx writes the header's colour space from `VP9E_SET_COLOR_SPACE`, never from the image, so every VP9 stream says "unknown" | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` in `apply_screen_content_controls` (`:351`) |
 | openh264, recording | BT.601 limited | **yes**, SMPTE 170M and limited range, and the MP4's `colr` box says the same | nothing to do |
@@ -144,7 +144,7 @@ describes the desktop truthfully.
 | Family | The change | Proof (a test per backend reachable on that platform) |
 |---|---|---|
 | FFmpeg | `set_colorspace`, `set_color_range`, `set_color_primaries`, `set_color_transfer_characteristic` in `build_encoder`'s `configure` closure (`encoder.rs:1757`, after `:1888`). One place covers every cell, rebuild, probe and recording | parse the output: the H.264/HEVC SPS VUI, the AV1 sequence header's `color_config` |
-| Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES`, `MF_MT_TRANSFER_FUNCTION` on the output and input types (`sync_pipeline.rs:454`, `:476`), and **again** on the renegotiated type (`:410`), or a stream change drops them | parse the SPS VUI of the encoder's output |
+| Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES`, `MF_MT_TRANSFER_FUNCTION` on the output and input types (`sync_pipeline.rs:464`, `:486`), and **again** on the renegotiated type (`:420`), or a stream change drops them | parse the SPS VUI of the encoder's output |
 | openh264, live | the VUI the recording profile already sets (`openh264_backend.rs:150`), in `new` (`:91`) | parse the SPS VUI |
 | libvpx VP9 | `VP9E_SET_COLOR_SPACE` (`VPX_CS_BT_601`) and `VP9E_SET_COLOR_RANGE` (studio) in `apply_screen_content_controls` (`libvpx.rs:351`), for 4:2:0 and 4:4:4 alike | parse a keyframe's uncompressed header (`color_space`, `color_range`) |
 | `vp9_qsv`, `vp9_vaapi` | none: FFmpeg cannot tag them | covered by lever 2 on the data channel |

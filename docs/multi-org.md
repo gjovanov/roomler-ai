@@ -257,7 +257,7 @@ sequenceDiagram
 
 | `reason` | the server sends it when | `roomler status` says |
 |---|---|---|
-| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:436-439`](../crates/modules/network/src/overlay.rs#L436-L439)) | retrying will not help; an operator has to act |
+| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:462-465`](../crates/modules/network/src/overlay.rs#L462-L465)) | retrying will not help; an operator has to act |
 | `network_unavailable` | the tenant's network row cannot be read or created, or an allocated ordinal falls outside the network's address space | retrying will not help; an operator has to act |
 | `store_unavailable` | any other allocation failure: a store fault | transient — a retry may succeed |
 | `unknown` | a reason this build does not know, from a newer server | retrying will not help; an operator has to act |
@@ -699,6 +699,9 @@ dropping of delta frames would break reference chains, because the 13-byte DC
 header carries no sequence number. A joiner buffers until the next IDR; a
 viewer that sustainedly needs far less than the shared rate spills to its own
 encoder, bounded at 2 pipelines total. The viewer badge shows `· shared ×N`.
+An owner whose capture has no picture tells every follower why, and every later
+joiner as it joins (FR-80's `rc:media-unavailable`, #3260,
+[`remote-control.md` §5.1a](remote-control.md#51a-when-capture-cannot-open-the-session-says-why-fr-80)).
 
 ## 7. P6 — InputArbiter (shipped rc.305/306, #329 + #334)
 
@@ -893,7 +896,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
   netstack`. FR-49 had made netstack the default for `enroll --overlay`, which
   made this the common case, and #2493 measured it on 0.4.143: no listener on
   the port, no peers, no log line. Now `for_org` turns a netstack secondary on
-  when it has its own port and key (`crates/agent-core/src/config.rs:2220-2222`),
+  when it has its own port and key (`crates/agent-core/src/config.rs:2266-2268`),
   and `derived_netstack` sends it to its stack rather than to the per-org TUN
   that the device-wide `overlay_multi_org` would pick
   (`agents/roomlerd/src/overlay.rs:311`). A port that is unset is **picked**:
@@ -928,10 +931,15 @@ everything it knows.**
 
 1. hidden from the org switcher (`GET /api/tenant`; `?include_archived=true`
    still lists it — this is not erasure);
-2. no new device enrollments;
+2. no new device enrollments — a daemon or a `roomler` tunnel client, into a
+   new row or back into its old one — and no token minted for one (#3042): the
+   three mint routes refuse with the enroll routes' own sentence, so the person
+   hears it where they asked rather than in someone's terminal later;
 3. no new remote-control sessions;
-4. its devices leave its mesh — every enrollment revoked, every overlay
-   node released back to the address pool, its block quarantined;
+4. its devices leave its mesh — every enrollment revoked, tunnel clients
+   included (#3042), every overlay node released back to the address pool, its
+   block quarantined. A join into an archived org is refused whatever its row
+   says, so nothing racing the teardown takes an address on the way out;
 5. everything else — rooms, messages, files, members, roles, audit —
    retained untouched.
 

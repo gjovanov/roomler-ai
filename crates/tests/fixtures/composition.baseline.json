@@ -521,6 +521,10 @@
       "methods": "PUT"
     },
     {
+      "path": "/api/tenant/{tenant_id}/agent/{agent_id}/external-principals/{user_id}",
+      "methods": "PUT"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/agent/{agent_id}/join-org",
       "methods": "POST"
     },
@@ -583,6 +587,10 @@
     {
       "path": "/api/tenant/{tenant_id}/external-access",
       "methods": "GET,HEAD,PUT"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/external-principals",
+      "methods": "GET,HEAD"
     },
     {
       "path": "/api/tenant/{tenant_id}/external-rc-audit",
@@ -787,6 +795,10 @@
     {
       "path": "/api/tenant/{tenant_id}/overlay-node/{node_id}/exit-node",
       "methods": "PUT"
+    },
+    {
+      "path": "/api/tenant/{tenant_id}/overlay-retired-keys",
+      "methods": "GET,HEAD,PUT"
     },
     {
       "path": "/api/tenant/{tenant_id}/peer-relay",
@@ -1628,6 +1640,24 @@
         ]
       },
       {
+        "collection": "external_principals",
+        "indexes": [
+          {
+            "key": {
+              "agent_id": 1,
+              "user_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "last_session_at": -1
+            }
+          }
+        ]
+      },
+      {
         "collection": "external_rc_audit",
         "indexes": [
           {
@@ -2366,6 +2396,18 @@
             "key": {
               "tenant_id": 1,
               "node_ref.id": 1
+            }
+          },
+          {
+            "key": {
+              "network_id": 1,
+              "wg_public_key": 1
+            }
+          },
+          {
+            "key": {
+              "network_id": 1,
+              "retired_keys.public_key": 1
             }
           }
         ]
@@ -4063,6 +4105,24 @@
         ]
       },
       {
+        "collection": "external_principals",
+        "indexes": [
+          {
+            "key": {
+              "agent_id": 1,
+              "user_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "last_session_at": -1
+            }
+          }
+        ]
+      },
+      {
         "collection": "external_rc_audit",
         "indexes": [
           {
@@ -4809,6 +4869,18 @@
             "key": {
               "tenant_id": 1,
               "node_ref.id": 1
+            }
+          },
+          {
+            "key": {
+              "network_id": 1,
+              "wg_public_key": 1
+            }
+          },
+          {
+            "key": {
+              "network_id": 1,
+              "retired_keys.public_key": 1
             }
           }
         ]

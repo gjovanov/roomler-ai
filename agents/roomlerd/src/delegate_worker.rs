@@ -151,6 +151,13 @@ async fn gates_changed(w: &mut GateWatch) {
 /// launchd-owned workers, a hand-run `roomlerd run`, and the daemon.
 pub async fn run(
     supervised: bool,
+    // FR-43 P3a — this worker holds no enrollment, so this channel is all it
+    // can serve, and without it the process is of no use to anyone.
+    unenrolled: bool,
+    // FR-43 P3a — and its own log lines, which go to the daemon over the
+    // channel because this process has no row to upload them on. `None` for
+    // every other worker, which uploads its own.
+    mut logs: Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
     // FR-43 P2b-2 — the signalling loop's two ends: delegated messages go IN,
     // a delegated session's replies come OUT. `None` when this process is not
     // a worker, in which case `supervised` is false too and we return at once.
@@ -179,13 +186,27 @@ pub async fn run(
         tracing::warn!(
             "delegation: started with --supervised but no secret arrived on stdin; not attaching"
         );
+        // FR-43 P3a — an enrolled worker still serves its own row. One with no
+        // enrollment would run on, serving nothing, and read as healthy: leave,
+        // and the supervisor's bound on fast exits applies.
+        if unenrolled {
+            std::process::exit(1);
+        }
         return;
     };
 
     let mut backoff = BACKOFF_MIN;
     let mut last_error: Option<String> = None;
     loop {
-        match attach_once(&secret, &to_signaling, &mut from_signaling, &mut shutdown).await {
+        match attach_once(
+            &secret,
+            &to_signaling,
+            &mut from_signaling,
+            &mut logs,
+            &mut shutdown,
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::info!("delegation: channel closed by the daemon");
                 backoff = BACKOFF_MIN;
@@ -223,6 +244,7 @@ async fn attach_once(
     secret: &str,
     to_signaling: &tokio::sync::mpsc::Sender<WorkerInbound>,
     from_signaling: &mut tokio::sync::mpsc::Receiver<ClientMsg>,
+    logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     // Dial the daemon's DEDICATED delegation socket, not the LocalAPI control
@@ -393,7 +415,8 @@ async fn attach_once(
                         Ok(
                             DelegateFrame::FromWorker { .. }
                             | DelegateFrame::WorkerCaps { .. }
-                            | DelegateFrame::KeepBusyTold { .. },
+                            | DelegateFrame::KeepBusyTold { .. }
+                            | DelegateFrame::WorkerLogs { .. },
                         ) => {
                             // Worker → daemon only. A daemon sending one is
                             // confused about which end it is.
@@ -419,6 +442,17 @@ async fn attach_once(
                     None => return Ok(()),
                 }
             }
+            // FR-43 P3a — this worker's own log lines, for the daemon to upload
+            // on its row. What is queued goes in one frame, so a burst is one
+            // write; lines logged while detached wait in the queue, which drops
+            // the newest when full, as it would for any uploader.
+            line = next_log_line(logs) => match line {
+                Some(first) => {
+                    let lines = log_batch(first, logs);
+                    write_frame(&mut wr, &DelegateFrame::WorkerLogs { lines }).await?;
+                }
+                None => *logs = None,
+            },
             _ = tokio::time::sleep(PING_EVERY) => {
                 write_frame(&mut wr, &DelegateFrame::Ping).await?;
             }
@@ -446,6 +480,38 @@ async fn attach_once(
             }
         }
     }
+}
+
+/// FR-43 P3a — the next of this worker's log lines, or never when it forwards
+/// none. `None` when the layer's sender has gone.
+async fn next_log_line(
+    logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
+) -> Option<crate::logs_upload::LogLine> {
+    match logs {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// FR-43 P3a — `first` and whatever else is queued behind it, up to one frame's
+/// worth, each trimmed to what a frame carries.
+fn log_batch(
+    first: crate::logs_upload::LogLine,
+    logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
+) -> Vec<crate::logs_upload::LogLine> {
+    let mut lines = vec![first];
+    if let Some(rx) = logs.as_mut() {
+        while lines.len() < crate::delegate::WORKER_LOG_LINES_PER_FRAME {
+            match rx.try_recv() {
+                Ok(line) => lines.push(line),
+                Err(_) => break,
+            }
+        }
+    }
+    for line in &mut lines {
+        crate::delegate::trim_worker_line(line);
+    }
+    lines
 }
 
 /// Start the thread that owns stdin (#2987). It reads the attach secret, then
@@ -529,5 +595,52 @@ async fn read_secret(secret: tokio::sync::oneshot::Receiver<Option<String>>) -> 
             tracing::warn!("delegation: timed out waiting for the secret on stdin");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::delegate::{WORKER_LOG_LINES_PER_FRAME, WORKER_LOG_MSG_MAX};
+
+    fn line(msg: String) -> crate::logs_upload::LogLine {
+        crate::logs_upload::LogLine {
+            ts: bson::DateTime::now(),
+            level: crate::logs_upload::LogLevel::Info,
+            target: "roomlerd".into(),
+            msg,
+            fields: bson::Document::new(),
+        }
+    }
+
+    /// FR-43 P3a — a burst of the worker's log lines leaves in frames of at most
+    /// one frame's worth, in order, none lost between frames, and a message too
+    /// long for a frame is cut.
+    #[tokio::test]
+    async fn queued_log_lines_leave_in_bounded_trimmed_frames() {
+        let total = WORKER_LOG_LINES_PER_FRAME * 2 + 7;
+        let (tx, rx) = tokio::sync::mpsc::channel(total + 1);
+        for i in 0..total {
+            tx.try_send(line(i.to_string())).unwrap();
+        }
+        tx.try_send(line("x".repeat(WORKER_LOG_MSG_MAX + 100)))
+            .unwrap();
+        drop(tx);
+
+        let mut logs = Some(rx);
+        let mut seen = Vec::new();
+        let mut frames = 0;
+        while let Some(first) = next_log_line(&mut logs).await {
+            let batch = log_batch(first, &mut logs);
+            assert!(batch.len() <= WORKER_LOG_LINES_PER_FRAME);
+            seen.extend(batch);
+            frames += 1;
+        }
+        assert_eq!(frames, 3);
+        assert_eq!(seen.len(), total + 1);
+        for (i, l) in seen.iter().take(total).enumerate() {
+            assert_eq!(l.msg, i.to_string());
+        }
+        assert_eq!(seen[total].msg.len(), WORKER_LOG_MSG_MAX);
     }
 }

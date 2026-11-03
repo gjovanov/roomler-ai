@@ -46,7 +46,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
 use super::Msg;
-use super::link::Link;
+use super::link::{Linked, Role};
 
 /// The longest line that crosses: a longer one is cut there.
 pub(crate) const MAX_LINE: usize = 8 * 1024;
@@ -184,14 +184,14 @@ pub(crate) fn install(layer: ToChannel) {
         .try_init();
     let before = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        error!(panic = %info, "hive: the session's worker panicked");
+        error!(panic = %info, "hive: a worker panicked");
         before(info);
     }));
 }
 
 /// Send each line across `link`, and after one that went while some were
 /// dropped, a line that says how many, until the channel goes.
-pub(crate) async fn forward(mut lines: Lines, link: Arc<Link>) {
+pub(crate) async fn forward<R: Role>(mut lines: Lines, link: Arc<Linked<R>>) {
     while let Some(line) = lines.rx.recv().await {
         let frame = Msg::Log {
             level: line.level,
@@ -273,7 +273,7 @@ impl Relay {
             warn!(
                 worker,
                 dropped = dropped_before,
-                "hive: a session's worker logged more than {PER_SECOND} lines a second: the rest were dropped"
+                "hive: a worker logged more than {PER_SECOND} lines a second: the rest were dropped"
             );
         }
         let level = match level {
@@ -311,7 +311,7 @@ macro_rules! relayed {
         struct $ty;
         static $site: $ty = $ty;
         static $meta: Metadata<'static> = Metadata::new(
-            "hive: a session's worker logged",
+            "hive: a worker logged",
             module_path!(),
             $level,
             Some(file!()),

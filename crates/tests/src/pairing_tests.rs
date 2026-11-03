@@ -196,25 +196,46 @@ async fn pairing_row(app: &TestApp, user_code: &str) -> Document {
     found.remove(0)
 }
 
-/// MongoDB's TTL monitor passes so far (`serverStatus.metrics.ttl.passes`).
-/// A pass is the only thing that deletes a pairing row on its own.
-async fn ttl_passes(app: &TestApp) -> i64 {
-    let status = app
+/// Holds MongoDB's TTL sweep off `device_pairings` in this test's own
+/// database, after checking that the index is the product's: a TTL on
+/// `expires_at` alone, deleting at expiry. It gets an hour's grace instead.
+/// The monitor reads the grace from the catalog when it deletes, and
+/// `collMod` writes the catalog under the collection's exclusive lock, so no
+/// pass deletes a row written after this returns before that hour is up.
+/// Each test has a database of its own, so no other test's sweep changes.
+async fn hold_off_the_ttl_sweep(app: &TestApp) {
+    let listed = app
         .db
-        .client()
-        .database("admin")
-        .run_command(doc! { "serverStatus": 1 })
+        .run_command(doc! { "listIndexes": "device_pairings" })
         .await
-        .expect("serverStatus");
-    let ttl = status
-        .get_document("metrics")
-        .and_then(|m| m.get_document("ttl"))
-        .expect("serverStatus.metrics.ttl");
-    match ttl.get("passes") {
-        Some(Bson::Int64(n)) => *n,
-        Some(Bson::Int32(n)) => i64::from(*n),
-        other => panic!("serverStatus.metrics.ttl.passes: {other:?}"),
-    }
+        .expect("listIndexes");
+    let ttl = listed
+        .get_document("cursor")
+        .and_then(|c| c.get_array("firstBatch"))
+        .expect("listIndexes' first batch")
+        .iter()
+        .filter_map(Bson::as_document)
+        .find(|spec| {
+            spec.get_document("key")
+                .is_ok_and(|key| key.keys().eq(["expires_at"]))
+        })
+        .expect("a TTL index on expires_at")
+        .clone();
+    let grace = match ttl.get("expireAfterSeconds") {
+        Some(Bson::Int32(n)) => Some(i64::from(*n)),
+        Some(Bson::Int64(n)) => Some(*n),
+        Some(Bson::Double(n)) => Some(*n as i64),
+        _ => None,
+    };
+    assert_eq!(grace, Some(0), "the product deletes at expiry: {ttl}");
+    let name = ttl.get_str("name").expect("the index's name");
+    app.db
+        .run_command(doc! {
+            "collMod": "device_pairings",
+            "index": { "name": name, "expireAfterSeconds": 3600 },
+        })
+        .await
+        .expect("collMod: an hour's grace");
 }
 
 /// Create a role holding only `MANAGE_AGENTS` and hand it to `user_id`.
@@ -775,13 +796,15 @@ async fn approving_into_an_archived_org_is_refused_before_any_notice() {
 /// person, and its expiry is audited exactly once, by the reader that found
 /// it expired rather than by the TTL sweep.
 ///
-/// The TTL index on `expires_at` is real, and its monitor passes every 60 s.
-/// A pass in the second after the row expires takes it, and the readers then
-/// find no row (still `expired_token`, but audited as an unknown code), so
-/// the checks below fail with nothing wrong: "one pairing row … 0" on
-/// 2026-10-29. A try that a pass ran through proves nothing, so it runs
-/// again, with the next pass a minute off. With no pass during the try, a
-/// missing row is a real failure.
+/// The TTL index on `expires_at` is real, and its monitor may pass at any
+/// moment after the row expires. A pass in that second deletes the row, and
+/// the readers then find none (still `expired_token`, but audited as an
+/// unknown code), so the checks below fail with nothing wrong: "one pairing
+/// row … 0" on 2026-10-29 (#3084). Counting passes around a try and retrying
+/// the ones a pass ran through did not close that: `ttl.passes` moves when
+/// a pass ENDS, so a pass still running has deleted the row and not been
+/// counted. The sweep is held off in this test's database instead, and the
+/// readers alone see the row expire.
 #[tokio::test]
 async fn an_expired_pairing_is_gone_everywhere_and_its_expiry_is_audited_once() {
     let app = TestApp::spawn_with_settings(|s| {
@@ -789,42 +812,33 @@ async fn an_expired_pairing_is_gone_everywhere_and_its_expiry_is_audited_once() 
         s.pairing.ttl_secs = 1;
     })
     .await;
+    hold_off_the_ttl_sweep(&app).await;
     let org = app.seed_tenant("pair7").await;
-    for _ in 0..3 {
-        let passes = ttl_passes(&app).await;
-        let (device_code, user_code) = start_daemon(&app).await;
-        let (_, live) = lookup(&app, &org.admin.access_token, &user_code).await;
-        assert_eq!(live["role"], "daemon");
+    let (device_code, user_code) = start_daemon(&app).await;
+    let (_, live) = lookup(&app, &org.admin.access_token, &user_code).await;
+    assert_eq!(live["role"], "daemon");
 
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
-        let (_, polled) = poll(&app, &device_code).await;
-        assert_eq!(polled["status"], "expired_token", "{polled}");
-        let (status, _) = lookup(&app, &org.admin.access_token, &user_code).await;
-        assert_eq!(status, 404);
-        let (status, _) = approve(&app, &org.admin.access_token, &user_code, &org.tenant_id).await;
-        assert_eq!(status, 404);
-        let (_, polled) = poll(&app, &device_code).await;
-        assert_eq!(polled["status"], "expired_token");
+    let (_, polled) = poll(&app, &device_code).await;
+    assert_eq!(polled["status"], "expired_token", "{polled}");
+    let (status, _) = lookup(&app, &org.admin.access_token, &user_code).await;
+    assert_eq!(status, 404);
+    let (status, _) = approve(&app, &org.admin.access_token, &user_code, &org.tenant_id).await;
+    assert_eq!(status, 404);
+    let (_, polled) = poll(&app, &device_code).await;
+    assert_eq!(polled["status"], "expired_token");
 
-        let stored = user_code.replace('-', "");
-        let left = rows(&app, "device_pairings", doc! { "user_code": stored }).await;
-        if left.is_empty() && ttl_passes(&app).await != passes {
-            continue;
-        }
-        let row = pairing_row(&app, &user_code).await;
-        assert_eq!(row.get_str("status").unwrap(), "expired");
-        let id = row.get_object_id("_id").unwrap();
-        let expired = rows(
-            &app,
-            "pairing_audit",
-            doc! { "pairing_id": id, "action": "expire", "outcome": "ok" },
-        )
-        .await;
-        assert_eq!(expired.len(), 1, "audited once");
-        return;
-    }
-    panic!("a TTL monitor pass ran through three tries in a row");
+    let row = pairing_row(&app, &user_code).await;
+    assert_eq!(row.get_str("status").unwrap(), "expired");
+    let id = row.get_object_id("_id").unwrap();
+    let expired = rows(
+        &app,
+        "pairing_audit",
+        doc! { "pairing_id": id, "action": "expire", "outcome": "ok" },
+    )
+    .await;
+    assert_eq!(expired.len(), 1, "audited once");
 }
 
 // ── the decisions ───────────────────────────────────────────────────────────
@@ -1353,4 +1367,39 @@ async fn malformed_requests_are_refused_with_400() {
     )
     .await;
     assert_eq!(status, 401);
+}
+
+/// AC7 — a poll after a delivery answers like a swept row and is on the trail
+/// once per address per hour, however often it repeats. Only the loser of a
+/// race wrote this row before; a poll that came in afterwards wrote nothing.
+#[tokio::test]
+async fn a_poll_after_a_delivery_is_refused_and_on_the_trail_once() {
+    let app = app_fast().await;
+    let org = app.seed_tenant("pairgone").await;
+    let (device_code, user_code) = start_daemon(&app).await;
+    let (status, approved) =
+        approve(&app, &org.admin.access_token, &user_code, &org.tenant_id).await;
+    assert_eq!(status, 200, "{approved}");
+
+    let (status, polled) = poll(&app, &device_code).await;
+    assert_eq!(status, 200, "{polled}");
+    assert_eq!(polled["status"], "approved");
+    assert!(
+        audit(&app, "refuse", "refused:already_delivered")
+            .await
+            .is_empty(),
+        "the delivery itself refuses nobody"
+    );
+
+    for _ in 0..3 {
+        let (status, polled) = poll(&app, &device_code).await;
+        assert_eq!(status, 200, "{polled}");
+        assert_eq!(polled, json!({ "status": "expired_token" }));
+    }
+    assert_eq!(
+        audit(&app, "refuse", "refused:already_delivered")
+            .await
+            .len(),
+        1
+    );
 }

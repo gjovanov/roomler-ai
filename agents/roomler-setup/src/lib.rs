@@ -29,11 +29,17 @@ pub mod diagnostics;
 pub mod enroll_step;
 /// FR-129 B1 — `GET /api/setup/features`, read fail-closed.
 pub mod features;
+/// FR-129 C3 — the wizard's command line: what an elevated relaunch is
+/// handed, and the WebView2 folder an elevated run keeps apart.
+pub mod launch;
 pub mod orchestrator_agent;
 pub mod orchestrator_tunnel;
 /// FR-129 B1 — the Linux and macOS daemon pipeline: the embedded
 /// `install.sh` halves under the desktop's own administrator prompt.
 pub mod orchestrator_unix;
+/// #3246 — the file the wizard checks is the file `msiexec` runs: the publisher
+/// check, the hold, and the elevated step.
+pub mod package_step;
 /// FR-129 A3 — the pairing session: the device code and the delivered
 /// token live here, in this process, and never reach the webview.
 pub mod pairing;
@@ -42,6 +48,9 @@ pub mod role;
 /// FR-129 B1 (F3) — the running root daemon's own word on which device it is
 /// (Linux: its person socket), asked before a system-scope enroll.
 pub mod root_identity;
+/// FR-129 C — the gate on how the wizard's Windows path names a program.
+#[cfg(test)]
+mod spawn_gate;
 /// FR-129 B1 — the mechanics under `orchestrator_unix`: the embedded
 /// script, the halves' argv, the prompt tools, the exit codes, the private
 /// scratch directory.
@@ -104,5 +113,185 @@ mod front_tests {
             html.contains("class=\"radio role-daemon\""),
             "the role cards are still label.radio; re-check the rule if they change"
         );
+    }
+
+    /// FR-129 C3 — "Restart as administrator" shows exactly when #3116's
+    /// note does: the button sits inside the note, the note follows
+    /// `needsElevatedWizard` alone, and nothing else un-hides the button.
+    #[test]
+    fn the_relaunch_button_shows_exactly_with_the_elevation_note() {
+        let html = include_str!("front/index.html");
+        let note = html
+            .find("<div id=\"elevation-note\"")
+            .expect("the elevation note");
+        let end = note + html[note..].find("</div>").expect("the note's end");
+        let inside = &html[note..end];
+        assert!(
+            inside.contains("id=\"elevation-relaunch\"")
+                && inside.contains("id=\"elevation-relaunch-status\""),
+            "the button and its line live inside the note"
+        );
+        assert!(
+            !inside["<div".len()..].contains("<div"),
+            "no nested block hides a second end"
+        );
+        let js = include_str!("front/app.js");
+        assert!(
+            js.contains("document.getElementById(\"elevation-note\").hidden = !needsElevation;"),
+            "the note follows needsElevatedWizard"
+        );
+        assert!(
+            js.contains(
+                "return role === \"daemon-system\" && state.systemContextNeedsElevation === true;"
+            ),
+            "only the pre-logon role on a reinstall a limited wizard cannot write"
+        );
+        assert!(
+            !js.contains("getElementById(\"elevation-relaunch\").hidden"),
+            "the button has no visibility of its own"
+        );
+        assert!(js.contains("invoke(\"cmd_relaunch_elevated\""));
+    }
+
+    /// #3247 item 11 — `install.ps1 -Uninstall` removes the service and leaves
+    /// its hardened folder, so a limited wizard showed "Daemon: no existing
+    /// install detected." and, under it, "This device already has the
+    /// background service". The note's first sentence now follows detection.
+    #[test]
+    fn the_elevation_note_says_a_service_is_there_only_when_one_is() {
+        let html = include_str!("front/index.html");
+        let note = html
+            .find("<div id=\"elevation-note\"")
+            .expect("the elevation note");
+        let end = note + html[note..].find("</div>").expect("the note's end");
+        assert!(
+            html[note..end].contains("<span id=\"elevation-note-lead\">"),
+            "the first sentence is its own element, inside the note"
+        );
+        let js = include_str!("front/app.js");
+        assert!(
+            js.contains(
+                "document.getElementById(\"elevation-note-lead\").textContent = elevationNoteLead(a.kind);"
+            ),
+            "Welcome sets the sentence from what detection found"
+        );
+        assert!(
+            js.contains("return kind === \"permachine\" || kind === \"ambiguous\""),
+            "only an installed per-machine service is called one"
+        );
+        assert!(js.contains(
+            "\"An earlier background service left its settings on this device, in a folder only administrators may open.\""
+        ));
+    }
+
+    /// FR-129 C1 — the operator, 2026-10-30: the wizard never calls the
+    /// daemon an "agent". The text a person sees in the page (comments and
+    /// markup aside) says `roomlerd`, "the daemon" or "device".
+    #[test]
+    fn the_page_text_never_says_agent() {
+        let text = visible_text(include_str!("front/index.html"));
+        assert!(
+            !text.to_ascii_lowercase().contains("agent"),
+            "visible text mentions an agent: {}",
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+    }
+
+    /// The text of `html` a person sees: markup and comments dropped.
+    fn visible_text(html: &str) -> String {
+        let mut text = String::new();
+        let mut rest = html;
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix("<!--") {
+                rest = after.split_once("-->").map_or("", |(_, r)| r);
+            } else if rest.starts_with('<') {
+                rest = rest.split_once('>').map_or("", |(_, r)| r);
+                text.push(' ');
+            } else {
+                let next = rest.find('<').unwrap_or(rest.len());
+                text.push_str(&rest[..next]);
+                rest = &rest[next..];
+            }
+        }
+        text
+    }
+
+    /// The MSI's flavour names and the service's switch, which a new person
+    /// does not know (#3247).
+    const JARGON: [&str; 3] = ["perUser", "perMachine", "SystemContext"];
+
+    /// #3247 — the cards, Welcome's summary, the warnings and Done speak a
+    /// person's words. The jargon stays in code, comments and the one event
+    /// name the page matches on.
+    #[test]
+    fn the_page_never_says_the_msi_flavour_names() {
+        let text = visible_text(include_str!("front/index.html"));
+        for word in JARGON {
+            assert!(!text.contains(word), "index.html shows {word}");
+        }
+        for literal in js_string_literals(include_str!("front/app.js")) {
+            // A template's `${…}` is code, whose names may say anything.
+            let shown = without_interpolations(literal);
+            for word in JARGON {
+                assert!(
+                    !shown.contains(word) || shown == "SystemContextError",
+                    "app.js shows {word}: {literal:?}"
+                );
+            }
+        }
+        // The scanner finds literals and skips comments, or the loop above
+        // could pass by reading nothing.
+        assert_eq!(
+            js_string_literals("// \"perUser\"\nf(\"a\", 'b', `c ${d}`); /* \"perMachine\" */"),
+            ["a", "b", "c ${d}"]
+        );
+        assert_eq!(without_interpolations("a ${perUserWord} b ${c}"), "a  b ");
+    }
+
+    /// `literal` with each `${…}` taken out.
+    fn without_interpolations(literal: &str) -> String {
+        let mut shown = String::new();
+        let mut rest = literal;
+        while let Some(at) = rest.find("${") {
+            shown.push_str(&rest[..at]);
+            rest = rest[at..].split_once('}').map_or("", |(_, r)| r);
+        }
+        shown.push_str(rest);
+        shown
+    }
+
+    /// Every quoted string in `js`, outside comments. Rough, but app.js holds no
+    /// quote inside a regex literal.
+    fn js_string_literals(js: &str) -> Vec<&str> {
+        let bytes = js.as_bytes();
+        let mut found = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                }
+                quote @ (b'"' | b'\'' | b'`') => {
+                    let start = i + 1;
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != quote {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                    found.push(&js[start..i.min(js.len())]);
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        found
     }
 }

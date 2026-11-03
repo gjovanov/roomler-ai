@@ -359,6 +359,11 @@ pub async fn run_with_audio(
     }
 
     // ── the first frame decides the size ────────────────────────────────────
+    // A capturer that could not open knows why. Waiting for a frame it will
+    // never give would only turn that into "no frame", ten seconds later.
+    if let Some(why) = capturer.unavailable() {
+        return Err(refuse(StartRefusal::NoFrame, why.detail.clone()));
+    }
     let first = tokio::time::timeout(opts.first_frame_timeout, async {
         loop {
             match capturer.next_frame().await {
@@ -966,8 +971,11 @@ fn finalize_into_place(partial: &Path, dest: &Path) -> Result<mp4::FinalizeSumma
 
 /// Finalize every partial a dead recorder left in `staging` (the boot
 /// reconciler): remux what is complete, mark it `interrupted`. Returns the
-/// finished paths. A partial with nothing recoverable is removed; one whose
-/// [`PartialLock`] is held belongs to a live recorder and is left alone.
+/// finished paths. Only a partial the file itself shows to be empty is removed
+/// ([`mp4::NothingRecoverable`]). One whose remux failed goes under its final
+/// name as it is, the stop path's rule, and stays for the next start only if
+/// that fails too. One whose [`PartialLock`] is held belongs to a live recorder
+/// and is left alone.
 pub fn reconcile_partials(staging: &Path, dest_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(staging) else {
         return Vec::new();
@@ -1000,53 +1008,66 @@ pub fn reconcile_partials(staging: &Path, dest_dir: &Path) -> Vec<PathBuf> {
         if dest.exists() {
             continue;
         }
-        match finalize_into_place(&p, &dest) {
-            Ok(s) => {
-                let sc = Sidecar {
-                    version: SIDECAR_VERSION,
-                    file: name.clone(),
-                    initiator: Initiator::Local { user: None },
-                    started_at: String::new(),
-                    ended_at: None,
-                    duration_ms: s.duration_ms,
-                    width: 0,
-                    height: 0,
-                    fps: 0,
-                    codec: "h264".into(),
-                    encoder: String::new(),
-                    color: ColorInfo::BT601_LIMITED,
-                    audio: AudioInfo::default(),
-                    frames: s.video_samples,
-                    late_ticks: 0,
-                    events: Vec::new(),
-                    stop_reason: Some(StopReason::Interrupted),
-                    bytes: s.bytes,
-                    // Unknown: the recorder that knew is gone.
-                    pointer: None,
-                    scaled_from: None,
-                };
-                // A sidecar the dead recorder never wrote: keep an existing
-                // one's facts if there is one, only mark it interrupted.
-                let sc_path = Sidecar::path_for(&dest);
-                let sc = std::fs::read_to_string(&sc_path)
-                    .ok()
-                    .and_then(|j| serde_json::from_str::<Sidecar>(&j).ok())
-                    .map(|mut old| {
-                        old.stop_reason = Some(StopReason::Interrupted);
-                        old.duration_ms = s.duration_ms;
-                        old.bytes = s.bytes;
-                        old
-                    })
-                    .unwrap_or(sc);
-                let _ = std::fs::write(&sc_path, sc.to_json());
-                tracing::info!(file = %dest.display(), truncated = s.truncated, "recording: an interrupted recording was finalized");
-                done.push(dest);
-            }
-            Err(e) => {
+        let s = match finalize_into_place(&p, &dest) {
+            Ok(s) => s,
+            Err(e) if e.is::<mp4::NothingRecoverable>() => {
                 tracing::warn!(%e, partial = %p.display(), "recording: an interrupted partial holds nothing recoverable — removing it");
                 let _ = std::fs::remove_file(&p);
+                continue;
             }
-        }
+            // ⚠️ Never removed on a failure of this attempt: the partial may
+            // hold the whole recording. Keep what exists, as the stop path does:
+            // listed, deletable and playable, and a remux that failed is not
+            // run again at every start, which on a full disk would fill the
+            // volume each time.
+            Err(e) => {
+                tracing::warn!(error = format!("{e:#}"), partial = %p.display(), "recording: an interrupted partial could not be remuxed — keeping the fragmented file");
+                if let Err(e2) = std::fs::rename(&p, &dest) {
+                    tracing::warn!(%e2, partial = %p.display(), "recording: could not even keep the fragmented file — left for the next start");
+                    continue;
+                }
+                mp4::fragmented_summary(&dest)
+            }
+        };
+        let sc = Sidecar {
+            version: SIDECAR_VERSION,
+            file: name.clone(),
+            initiator: Initiator::Local { user: None },
+            started_at: String::new(),
+            ended_at: None,
+            duration_ms: s.duration_ms,
+            width: 0,
+            height: 0,
+            fps: 0,
+            codec: "h264".into(),
+            encoder: String::new(),
+            color: ColorInfo::BT601_LIMITED,
+            audio: AudioInfo::default(),
+            frames: s.video_samples,
+            late_ticks: 0,
+            events: Vec::new(),
+            stop_reason: Some(StopReason::Interrupted),
+            bytes: s.bytes,
+            // Unknown: the recorder that knew is gone.
+            pointer: None,
+            scaled_from: None,
+        };
+        // A sidecar the dead recorder never wrote: keep an existing
+        // one's facts if there is one, only mark it interrupted.
+        let sc_path = Sidecar::path_for(&dest);
+        let sc = std::fs::read_to_string(&sc_path)
+            .ok()
+            .and_then(|j| serde_json::from_str::<Sidecar>(&j).ok())
+            .map(|mut old| {
+                old.stop_reason = Some(StopReason::Interrupted);
+                old.duration_ms = s.duration_ms;
+                old.bytes = s.bytes;
+                old
+            })
+            .unwrap_or(sc);
+        let _ = std::fs::write(&sc_path, sc.to_json());
+        tracing::info!(file = %dest.display(), truncated = s.truncated, "recording: an interrupted recording was finalized");
+        done.push(dest);
     }
     done
 }

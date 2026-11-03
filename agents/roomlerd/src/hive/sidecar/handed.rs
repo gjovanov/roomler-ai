@@ -21,7 +21,7 @@
 //! | the first worker | P8-2c-4 — kept as the start opens it, before the launch starts its worker, where the device runs workers (`hive_worker`); handed by the worker's own first `rehand` as it comes up, a connection waiting in the listener's backlog till then |
 //! | `hive_worker` off | `sidecar::open` serves it in the daemon itself, exactly as before this step |
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(windows)]
@@ -314,14 +314,25 @@ fn sup_of(session: ObjectId, fence: u64, endpoint: u64) -> Option<Arc<Supervisor
 /// loop ends however it ends, as the end of its process would stop them.
 #[derive(Default)]
 pub(crate) struct Serving {
-    endpoints: Mutex<HashMap<u64, CancellationToken>>,
+    endpoints: Mutex<Endpoints>,
     pub(crate) all: CancellationToken,
+}
+
+/// Each sidecar a worker serves now, by its stop, and each one it closed.
+#[derive(Default)]
+struct Endpoints {
+    stops: HashMap<u64, CancellationToken>,
+    closed: HashSet<u64>,
 }
 
 /// The worker's answer to the daemon's [`Call::SidecarServe`]: serve the
 /// handed listener with the sidecar's own, unchanged
 /// [`super::serve`]/[`super::handle`], asking the daemon for admission
-/// and the key one call at a time ([`WorkerSource`]).
+/// and the key one call at a time ([`WorkerSource`]). One handed again (a
+/// hand-over that crossed a new worker's) is served once, the listener that
+/// came with it dropped; one whose close came first (a hand-over that crossed
+/// it) is not served. Decided in one look, since each call is answered on a
+/// task of its own.
 pub(crate) fn serve_handed(
     serving: &Arc<Serving>,
     link: Arc<Link>,
@@ -332,11 +343,8 @@ pub(crate) fn serve_handed(
     #[cfg(unix)] listener: OwnedFd,
     #[cfg(windows)] listener: Vec<u8>,
 ) -> Answer {
-    let mut endpoints = serving.endpoints.lock().unwrap_or_else(|e| e.into_inner());
-    if endpoints.contains_key(&endpoint) {
-        // A hand-over answered twice (the first already claimed it).
-        return Answer::Done;
-    }
+    // Taken first, as `vault_connect`'s is: a hand-over not served drops its copy
+    // here, and on Windows leaves no protocol info untaken.
     #[cfg(unix)]
     let std_listener = std::net::TcpListener::from(listener);
     #[cfg(windows)]
@@ -348,6 +356,10 @@ pub(crate) fn serve_handed(
             };
         }
     };
+    let mut endpoints = serving.endpoints.lock().unwrap_or_else(|e| e.into_inner());
+    if endpoints.closed.contains(&endpoint) || endpoints.stops.contains_key(&endpoint) {
+        return Answer::Done;
+    }
     let listener = match std_listener
         .set_nonblocking(true)
         .and_then(|()| TcpListener::from_std(std_listener))
@@ -360,7 +372,7 @@ pub(crate) fn serve_handed(
         }
     };
     let stop = serving.all.child_token();
-    endpoints.insert(endpoint, stop.clone());
+    endpoints.stops.insert(endpoint, stop.clone());
     drop(endpoints);
     let source = WorkerSource {
         link,
@@ -374,13 +386,13 @@ pub(crate) fn serve_handed(
 }
 
 /// The daemon's [`Call::SidecarClose`]: the sidecar stops, its
-/// connections cut.
+/// connections cut, and a hand-over of it still on its way is not served.
 pub(crate) fn close_handed(serving: &Serving, endpoint: u64) -> Answer {
-    let stop = serving
-        .endpoints
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&endpoint);
+    let stop = {
+        let mut endpoints = serving.endpoints.lock().unwrap_or_else(|e| e.into_inner());
+        endpoints.closed.insert(endpoint);
+        endpoints.stops.remove(&endpoint)
+    };
     if let Some(stop) = stop {
         stop.cancel();
     }

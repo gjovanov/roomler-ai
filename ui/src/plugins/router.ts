@@ -234,7 +234,13 @@ const routes: RouteRecordRaw[] = [
             path: 'room/:roomId/call',
             name: 'room-call',
             component: () => import('@/views/conference/ConferenceView.vue'),
-            meta: { module: 'conference', liveSession: true },
+            // #1637 — the app bar's Active Calls menu pushes another room's
+            // call onto this page in place, and the page runs its room in
+            // onMounted: it kept the previous room's call, chat and name
+            // under the new URL. Remounting by roomId gives every room a fresh
+            // page; leaving a call the page is in is the page's own question
+            // (onBeforeRouteUpdate). Locked by ConferenceViewRoomSwitch.spec.ts.
+            meta: { module: 'conference', liveSession: true, remountOn: 'roomId' },
           },
           {
             path: 'rooms',
@@ -373,6 +379,7 @@ const routes: RouteRecordRaw[] = [
               { path: 'exec',         name: 'audit-exec',         props: true, meta: { module: 'fleet' },   component: () => import('@/components/admin/ExecAuditSection.vue') },
               { path: 'ssh',          name: 'audit-ssh',          props: true, meta: { module: 'network' }, component: () => import('@/components/admin/SshAuditSection.vue') },
               { path: 'ssh-activity', name: 'audit-ssh-activity', props: true, meta: { module: 'network' }, component: () => import('@/components/admin/SshActivitySection.vue') },
+              { path: 'external',     name: 'audit-external',     props: true, meta: { module: 'fleet' },   component: () => import('@/components/admin/ExternalAuditSection.vue') },
             ],
           },
           {

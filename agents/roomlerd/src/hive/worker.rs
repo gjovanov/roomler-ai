@@ -20,11 +20,13 @@
 //! | the stop | `bye`, and the channel's end awaited within a grace, then a kill |
 //! | the daemon's end | the worker's too: it ends at its channel's end, and the channel is close-on-exec on both sides, so only the daemon holds the other end |
 //! | limits | P8-2a-3 — set as it starts: a core limit of 1 byte, so it never dumps core, even where a helper takes the dump; at most [`MAX_OPEN_FILES`] descriptors. No limit on address space: glibc reserves 64 MiB a thread for its arenas, so a cap fails healthy threads long before a runaway. P8-2a-7 — on Linux, where the service delegates a cgroup, its memory in a cgroup of its own, bounded and off swap (`worker/memory.rs`) |
+//! | whose it is | P8-2d-1 — a run's, or with the vault the device's one ([`device`]). One loop keeps either up ([`Served`]): the hello, the heartbeat, the restarts and the starts counted are the same; what its hello says, and what giving up means, are not |
 //!
 //! ⚠️ Giving up ends the run, with the reason: where the device's owner
 //! turned workers on, what has moved runs in a worker or not at all, never
 //! back in the daemon, which a part that keeps failing would take down with
-//! it.
+//! it. The device's worker has no run to end: giving up on it parks it
+//! ([`device`], decision 71).
 //!
 //! ⚠️ The worker runs as the daemon's own identity: this is crash and
 //! resource isolation, not a privilege boundary.
@@ -78,6 +80,10 @@ const MAX_OPEN_FILES: libc::rlim_t = 4096;
 #[cfg(worker_calls)]
 const UP_WAIT: Duration = Duration::from_secs(10);
 
+/// FR-90 P8-2d-0 — the device's worker's calls (P8-2d-1), a type of their
+/// own beside a session worker's ([`link::Role`]).
+#[cfg(worker_calls)]
+pub(crate) use super::device::{DeviceAnswer, DeviceCall};
 #[cfg(worker_calls)]
 pub(crate) use super::vault_connect::handed::{Answer, Call};
 
@@ -88,7 +94,10 @@ pub(crate) const MAX_FRAME: usize = 1 << 20;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub(crate) enum Msg {
-    /// The daemon: the run this worker serves.
+    /// The daemon: the run this worker serves. P8-2d-1 — or, `session` being
+    /// [`device::HELLO`], the device: the same frame on purpose, since a
+    /// variant of its own would be a parse error to a worker that predates
+    /// it, where this is answered `ready` at its version ([`device`]).
     Hello { session: String, fence: u64 },
     /// The worker: up, which process it is, and which build.
     Ready { pid: u32, version: String },
@@ -109,6 +118,13 @@ pub(crate) enum Msg {
     Call { id: u64, call: Call },
     #[cfg(worker_calls)]
     Answer { id: u64, answer: Answer },
+    /// FR-90 P8-2d-0 — the device's worker's: a call, answered by the
+    /// `device_answer` of the same id ([`link::DeviceLink`]). Never on a
+    /// session's channel.
+    #[cfg(worker_calls)]
+    DeviceCall { id: u64, call: DeviceCall },
+    #[cfg(worker_calls)]
+    DeviceAnswer { id: u64, answer: DeviceAnswer },
 }
 
 /// Write one frame, its length and its body in one write. The buffers are
@@ -369,13 +385,20 @@ pub(crate) async fn serve(
     serve_halves(rd, wr, lines).await
 }
 
-/// [`serve`], on the channel's two halves.
+/// [`serve`], on the channel's two halves. P8-2d-1 — the first frame says
+/// whose worker this is: the device's has a loop of its own ([`device::serve`]),
+/// and every other goes on as a session's always did.
 async fn serve_halves(
     mut rd: impl AsyncRead + Unpin,
     wr: impl AsyncWrite + Send + Unpin + 'static,
     #[cfg(all(worker_calls, unix))] descriptors: Option<UnixStream>,
     lines: Option<log::Lines>,
 ) -> std::io::Result<()> {
+    let mut first = Some(recv(&mut rd).await);
+    #[cfg(worker_calls)]
+    if matches!(&first, Some(Ok(Some(Msg::Hello { session, .. }))) if session == device::HELLO) {
+        return device::serve(rd, wr, lines).await;
+    }
     let mut lines = lines;
     let link = Arc::new(link::Link::worker(wr));
     // What this worker serves: stopped all at once as its loop ends, or is
@@ -396,7 +419,11 @@ async fn serve_halves(
     #[cfg(worker_calls)]
     let _stops_all_sidecars = sidecar_serving.all.clone().drop_guard();
     let ended = loop {
-        let m = match recv(&mut rd).await {
+        let got = match first.take() {
+            Some(got) => got,
+            None => recv(&mut rd).await,
+        };
+        let m = match got {
             Ok(Some(m)) => m,
             Ok(None) => break Ok(()),
             Err(e) => break Err(e),
@@ -484,6 +511,10 @@ async fn serve_halves(
                 link.answered(id, answer);
                 Ok(())
             }
+            // FR-90 P8-2d-0 — the device's worker's frames: none comes on a
+            // session's channel, whose link takes a session's calls alone.
+            #[cfg(worker_calls)]
+            Msg::DeviceCall { .. } | Msg::DeviceAnswer { .. } => Ok(()),
         };
         if let Err(e) = sent {
             break Err(e);
@@ -648,6 +679,11 @@ pub(crate) trait Running: Send {
     fn pid(&self) -> Option<u32>;
     /// End it now.
     async fn kill(&mut self);
+    /// A test's: the memory its job holds it to, on Windows.
+    #[cfg(all(test, windows, worker_calls))]
+    fn job_limit(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// FR-90 P8-2b-1 — a worker's ends of its channels, as its spawner hands
@@ -700,8 +736,9 @@ pub(crate) trait Spawn: Send + Sync {
     /// A worker with `theirs` as its channels.
     fn spawn(&self, theirs: Theirs) -> std::io::Result<Box<dyn Running>>;
 
-    /// P8-2a-7 — what has to be ready before this spawner's first worker:
-    /// nothing, for a test's.
+    /// P8-2a-7 — what has to be ready before this spawner's workers: asked
+    /// before each start, since a failure that passes is tried again (#3349).
+    /// Nothing, for a test's.
     fn prepare(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
     }
@@ -752,7 +789,26 @@ impl Running for tokio::process::Child {
 #[cfg(windows)]
 impl Spawn for Program {
     fn spawn(&self, theirs: Theirs) -> std::io::Result<Box<dyn Running>> {
-        let worker = win::spawn(&self.exe, self.arg0.as_deref(), &self.args, theirs.pipe)?;
+        self.spawn_held_to(win::MAX_MEMORY as u64, theirs)
+    }
+}
+
+#[cfg(windows)]
+impl Program {
+    /// FR-90 P8-2d-1 — a worker of this program, its job holding it to
+    /// `max_memory`: a session's bound, or (decision 72) the device's.
+    pub(crate) fn spawn_held_to(
+        &self,
+        max_memory: u64,
+        theirs: Theirs,
+    ) -> std::io::Result<Box<dyn Running>> {
+        let worker = win::spawn_held_to(
+            &self.exe,
+            self.arg0.as_deref(),
+            &self.args,
+            theirs.pipe,
+            max_memory as usize,
+        )?;
         Ok(Box::new(worker))
     }
 }
@@ -760,6 +816,33 @@ impl Spawn for Program {
 #[cfg(unix)]
 impl Spawn for Program {
     fn spawn(&self, theirs: Theirs) -> std::io::Result<Box<dyn Running>> {
+        #[cfg(target_os = "linux")]
+        let session = memory::MAX_MEMORY;
+        // No bound here: no cgroup to hold it (the FR-90 spec, P8-0's point 4).
+        #[cfg(not(target_os = "linux"))]
+        let session = 0;
+        self.spawn_held_to(session, theirs)
+    }
+
+    fn prepare(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {
+            #[cfg(target_os = "linux")]
+            memory::prepare().await;
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Program {
+    /// FR-90 P8-2d-1 — a worker of this program, on Linux its cgroup holding
+    /// it to `max_memory`: a session's bound, or (decision 72) the device's.
+    pub(crate) fn spawn_held_to(
+        &self,
+        max_memory: u64,
+        theirs: Theirs,
+    ) -> std::io::Result<Box<dyn Running>> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = max_memory;
         use std::os::fd::AsRawFd;
         // Both moved above the descriptors they land on, before the fork:
         // then neither move in the child can overwrite the other, nor land on
@@ -785,7 +868,7 @@ impl Spawn for Program {
         // P8-2a-7 — the cgroup it runs in, where its memory is bounded: made
         // now, joined by the child itself before it runs a step of its own.
         #[cfg(target_os = "linux")]
-        let mut slot = memory::slot()?;
+        let mut slot = memory::slot(max_memory)?;
         #[cfg(target_os = "linux")]
         let join = slot.as_ref().map_or(-1, memory::Slot::procs_fd);
         // SAFETY: between fork and exec only async-signal-safe calls: write
@@ -817,13 +900,6 @@ impl Spawn for Program {
             memory::Bounded { child, slot }
         };
         Ok(Box::new(child))
-    }
-
-    fn prepare(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        Box::pin(async {
-            #[cfg(target_os = "linux")]
-            memory::prepare().await;
-        })
     }
 }
 
@@ -890,7 +966,8 @@ pub(crate) struct Seen {
     pub(crate) up: bool,
     /// The last worker's process.
     pub(crate) pid: Option<u32>,
-    /// Whether the daemon gave up on this run's worker.
+    /// Whether the daemon gave up on this run's worker. P8-2d-1 — on the
+    /// device's, for as long as it is parked.
     pub(crate) gave_up: bool,
 }
 
@@ -937,12 +1014,12 @@ impl Worker {
                 fence,
                 #[cfg(worker_calls)]
                 published: Arc::clone(&published),
+                end_run: give_up,
             },
             spawner,
             timing,
             stop.clone(),
             Arc::clone(&seen),
-            give_up,
         ));
         Self {
             stop,
@@ -985,37 +1062,121 @@ enum Ended {
     Foreign(String),
 }
 
+/// FR-90 P8-2d-1 — whose worker a supervision loop keeps up: a run's
+/// ([`Run`]) or the device's ([`device`]). The loop is one, so a worker's
+/// fault is found the same way whoever it serves (decision 71); this is what
+/// differs.
+trait Served: Send + Sync + 'static {
+    /// Whose calls its link carries.
+    type Role: link::Role;
+    /// What its worker is told first.
+    fn hello(&self) -> Msg;
+    /// Its worker answered the hello, as this build: up, its link theirs now.
+    fn came_up(&self, pid: u32, link: &Arc<link::Linked<Self::Role>>);
+    /// That worker's life is over: its link is nobody's now.
+    fn went(&self);
+    /// A frame from its worker that is neither a beat nor a line of its log.
+    fn frame(&self, link: &Arc<link::Linked<Self::Role>>, m: Msg);
+    /// Its worker was lost, and another starts after `wait`.
+    fn lost(&self, why: &str, wait: Duration);
+    /// The daemon gives up on its worker, with why. What that means is the
+    /// owner's: the wait before another is tried, or `None` where nothing
+    /// ever is.
+    fn gave_up(&self, why: &str) -> Option<Duration>;
+    /// The wait [`Self::gave_up`] named is over.
+    fn cooled_off(&self) {}
+}
+
 /// The run a worker serves, as its supervisor and its life take it.
 struct Run {
     session: ObjectId,
     fence: u64,
     #[cfg(worker_calls)]
     published: Published,
+    /// What giving up does: the run ends. Where the owner turned workers on,
+    /// its parts run in one or not at all.
+    end_run: GiveUp,
 }
 
-/// Keep a worker up for the run: start it, hand it its run, beat, and
-/// restart it as it is lost, until stopped or given up on. Giving up ends
-/// the run (`end_run`): where the owner turned workers on, its parts run in
-/// one or not at all.
-async fn supervise(
-    run: Run,
+impl Served for Run {
+    type Role = link::SessionRole;
+
+    fn hello(&self) -> Msg {
+        Msg::Hello {
+            session: self.session.to_hex(),
+            fence: self.fence,
+        }
+    }
+
+    /// While it is up its link is published, for the run's endpoints, and
+    /// every endpoint handed to the run's workers so far is handed to it.
+    fn came_up(&self, pid: u32, link: &Arc<link::Link>) {
+        let (session, fence) = (self.session, self.fence);
+        info!(%session, fence, pid, "hive: a session's worker is up");
+        #[cfg(not(worker_calls))]
+        let _ = link;
+        #[cfg(worker_calls)]
+        {
+            *published(self) = Some(Arc::clone(link));
+            // On a task of its own: the hand-overs' answers come through the
+            // loop below.
+            let link = Arc::clone(link);
+            tokio::spawn(async move {
+                super::vault_connect::handed::rehand(session, fence, &link).await;
+                // P8-2a-4b — and the run's egress fronts. Unix only so far.
+                #[cfg(unix)]
+                super::egress::handed::rehand(session, fence, &link).await;
+                // FR-90 P8-2c-2 — and the toolbelt. Unix only so far.
+                #[cfg(unix)]
+                super::toolbelt::handed::rehand(session, fence, &link).await;
+                // FR-90 P8-2c-3 — and the sidecar. Both OSes, unlike the
+                // toolbelt's Unix-domain socket.
+                super::sidecar::handed::rehand(session, fence, &link).await;
+            });
+        }
+    }
+
+    fn went(&self) {
+        #[cfg(worker_calls)]
+        published(self).take();
+    }
+
+    fn frame(&self, link: &Arc<link::Link>, m: Msg) {
+        #[cfg(not(worker_calls))]
+        let _ = (link, m);
+        #[cfg(worker_calls)]
+        match m {
+            Msg::Answer { id, answer } => {
+                link.answered(id, answer);
+            }
+            Msg::Call { id, call } => answer_worker(self, link, id, call),
+            _ => {}
+        }
+    }
+
+    fn lost(&self, why: &str, wait: Duration) {
+        let (session, fence) = (self.session, self.fence);
+        warn!(%session, fence, %why, wait_ms = wait.as_millis() as u64, "hive: a session's worker was lost: starting another");
+    }
+
+    fn gave_up(&self, why: &str) -> Option<Duration> {
+        let (session, fence) = (self.session, self.fence);
+        warn!(%session, fence, %why, "hive: a session's worker is given up on: the run ends");
+        (self.end_run)(format!("its worker kept failing ({why})"));
+        None
+    }
+}
+
+/// Keep a worker up for whom it serves: start it, say its hello, beat, and
+/// restart it as it is lost, until stopped or given up on.
+async fn supervise<S: Served>(
+    run: S,
     spawner: Arc<dyn Spawn>,
     timing: Timing,
     stop: CancellationToken,
     seen: Arc<Mutex<Seen>>,
-    end_run: GiveUp,
 ) {
-    let (session, fence) = (run.session, run.fence);
     let note = |f: &dyn Fn(&mut Seen)| f(&mut seen.lock().unwrap_or_else(|e| e.into_inner()));
-    let give_up = |why: &str| {
-        warn!(%session, fence, %why, "hive: a session's worker is given up on: the run ends");
-        note(&|s| {
-            s.gave_up = true;
-            s.up = false;
-        });
-        end_run(format!("its worker kept failing ({why})"));
-    };
-    spawner.prepare().await;
     let mut starts: Vec<Instant> = Vec::new();
     loop {
         if stop.is_cancelled() {
@@ -1023,8 +1184,15 @@ async fn supervise(
         }
         let recent = within(&mut starts, timing.loop_window);
         if recent >= timing.loop_max as usize {
-            give_up(&format!("{recent} starts within {:?}", timing.loop_window));
-            return;
+            let why = format!("{recent} starts within {:?}", timing.loop_window);
+            if !give_up(&run, &why, &mut starts, &timing, &stop, &seen).await {
+                return;
+            }
+            continue;
+        }
+        tokio::select! {
+            () = stop.cancelled() => return,
+            () = spawner.prepare() => {}
         }
         starts.push(Instant::now());
         note(&|s| s.starts += 1);
@@ -1033,7 +1201,7 @@ async fn supervise(
                 Ok(mut running) => {
                     let pid = running.pid();
                     note(&|s| s.pid = pid);
-                    let ended = match daemon_end(ours).await {
+                    let ended = match daemon_end::<S::Role>(ours).await {
                         Ok((link, frames)) => life(&run, link, frames, &timing, &stop, &seen).await,
                         Err(_) => Ended::Lost("its channel could not be served".into()),
                     };
@@ -1047,16 +1215,52 @@ async fn supervise(
         };
         let why = match ended {
             Ended::Stopped => return,
-            Ended::Foreign(why) => return give_up(&why),
+            Ended::Foreign(why) => {
+                if !give_up(&run, &why, &mut starts, &timing, &stop, &seen).await {
+                    return;
+                }
+                continue;
+            }
             Ended::Lost(why) => why,
         };
         let wait = wait_before(&timing, within(&mut starts, timing.loop_window));
-        warn!(%session, fence, %why, wait_ms = wait.as_millis() as u64, "hive: a session's worker was lost: starting another");
+        run.lost(&why, wait);
         tokio::select! {
             () = stop.cancelled() => return,
             () = tokio::time::sleep(wait) => {}
         }
     }
+}
+
+/// The daemon gives up on `run`'s worker. Whether the loop goes on: only
+/// once the wait `run` names is over, and then for one start. The window is
+/// left a start short of full, so a worker that fails again inside it is given
+/// up on again, and a fault that repeats costs one start for each wait (decision
+/// 71); one that outlives the window takes the earlier starts with it.
+async fn give_up<S: Served>(
+    run: &S,
+    why: &str,
+    starts: &mut Vec<Instant>,
+    timing: &Timing,
+    stop: &CancellationToken,
+    seen: &Arc<Mutex<Seen>>,
+) -> bool {
+    let note = |f: &dyn Fn(&mut Seen)| f(&mut seen.lock().unwrap_or_else(|e| e.into_inner()));
+    note(&|s| {
+        s.gave_up = true;
+        s.up = false;
+    });
+    let Some(wait) = run.gave_up(why) else {
+        return false;
+    };
+    tokio::select! {
+        () = stop.cancelled() => return false,
+        () = tokio::time::sleep(wait) => {}
+    }
+    run.cooled_off();
+    note(&|s| s.gave_up = false);
+    *starts = vec![Instant::now(); (timing.loop_max as usize).saturating_sub(1)];
+    true
 }
 
 /// How many of `starts` are inside the window, the older ones forgotten.
@@ -1083,7 +1287,7 @@ fn wait_before(timing: &Timing, recent: usize) -> Duration {
 /// The daemon's link and frames on a worker's channels: the channel split
 /// into its two halves, and the second channel the link's.
 #[cfg(unix)]
-async fn daemon_end(ours: Ours) -> std::io::Result<(Arc<link::Link>, Frames)> {
+async fn daemon_end<R: link::Role>(ours: Ours) -> std::io::Result<(Arc<link::Linked<R>>, Frames)> {
     let tokio_of = |s: std::os::unix::net::UnixStream| {
         s.set_nonblocking(true)
             .and_then(|()| UnixStream::from_std(s))
@@ -1091,7 +1295,7 @@ async fn daemon_end(ours: Ours) -> std::io::Result<(Arc<link::Link>, Frames)> {
     let (ch, descriptors) = (tokio_of(ours.ch)?, tokio_of(ours.descriptors)?);
     let (rd, wr) = ch.into_split();
     Ok((
-        Arc::new(link::Link::daemon(wr, descriptors)),
+        Arc::new(link::Linked::daemon(wr, descriptors)),
         Frames::read(rd),
     ))
 }
@@ -1099,29 +1303,23 @@ async fn daemon_end(ours: Ours) -> std::io::Result<(Arc<link::Link>, Frames)> {
 /// FR-90 P8-2b-1 — [`daemon_end`] on Windows: its pipe, whose client end
 /// was opened as the pipe was made, so it is connected already.
 #[cfg(windows)]
-async fn daemon_end(ours: Ours) -> std::io::Result<(Arc<link::Link>, Frames)> {
+async fn daemon_end<R: link::Role>(ours: Ours) -> std::io::Result<(Arc<link::Linked<R>>, Frames)> {
     ours.pipe.connect().await?;
     let (rd, wr) = tokio::io::split(ours.pipe);
-    Ok((Arc::new(link::Link::daemon(wr)), Frames::read(rd)))
+    Ok((Arc::new(link::Linked::daemon(wr)), Frames::read(rd)))
 }
 
 /// One worker's life on its channel: the handshake, then the heartbeat and
 /// (P8-2a-2, with the vault) the calls either way, until stopped or lost.
-/// While it is up its link is published, for the run's endpoints, and every
-/// endpoint handed to the run's workers so far is handed to it.
-async fn life(
-    run: &Run,
-    link: Arc<link::Link>,
+async fn life<S: Served>(
+    run: &S,
+    link: Arc<link::Linked<S::Role>>,
     mut frames: Frames,
     timing: &Timing,
     stop: &CancellationToken,
     seen: &Arc<Mutex<Seen>>,
 ) -> Ended {
-    let (session, fence) = (run.session, run.fence);
-    let hello = Msg::Hello {
-        session: session.to_hex(),
-        fence,
-    };
+    let hello = run.hello();
     // The hello's write is inside the start bound too.
     let ready = tokio::select! {
         () = stop.cancelled() => return bye(&link, &mut frames, timing.grace).await,
@@ -1132,7 +1330,6 @@ async fn life(
     };
     let pid = match ready {
         Ok(Ok(Some(Msg::Ready { pid, version }))) if version == VERSION => {
-            info!(%session, fence, pid, "hive: a session's worker is up");
             let mut s = seen.lock().unwrap_or_else(|e| e.into_inner());
             s.up = true;
             s.pid = Some(pid);
@@ -1146,29 +1343,10 @@ async fn life(
         Ok(Err(e)) => return Ended::Lost(format!("its channel failed: {e}")),
         Err(_) => return Ended::Lost("it was not ready in time".into()),
     };
-    #[cfg(worker_calls)]
-    {
-        *published(run) = Some(Arc::clone(&link));
-        // On a task of its own: the hand-overs' answers come through the
-        // loop below.
-        let link = Arc::clone(&link);
-        tokio::spawn(async move {
-            super::vault_connect::handed::rehand(session, fence, &link).await;
-            // P8-2a-4b — and the run's egress fronts. Unix only so far.
-            #[cfg(unix)]
-            super::egress::handed::rehand(session, fence, &link).await;
-            // FR-90 P8-2c-2 — and the toolbelt. Unix only so far.
-            #[cfg(unix)]
-            super::toolbelt::handed::rehand(session, fence, &link).await;
-            // FR-90 P8-2c-3 — and the sidecar. Both OSes, unlike the
-            // toolbelt's Unix-domain socket.
-            super::sidecar::handed::rehand(session, fence, &link).await;
-        });
-    }
+    run.came_up(pid, &link);
     let mut relay = log::Relay::new(pid);
     let ended = beats(run, &link, &mut frames, timing, stop, &mut relay).await;
-    #[cfg(worker_calls)]
-    published(run).take();
+    run.went();
     link.end();
     ended
 }
@@ -1181,22 +1359,31 @@ fn published(run: &Run) -> std::sync::MutexGuard<'_, Option<Arc<link::Link>>> {
 
 /// The heartbeat and (with the vault) the calls either way, until stopped
 /// or lost.
-async fn beats(
-    run: &Run,
-    link: &Arc<link::Link>,
+async fn beats<S: Served>(
+    run: &S,
+    link: &Arc<link::Linked<S::Role>>,
     frames: &mut Frames,
     timing: &Timing,
     stop: &CancellationToken,
     relay: &mut log::Relay,
 ) -> Ended {
-    #[cfg(not(worker_calls))]
-    let _ = run;
     let mut n: u64 = 0;
     let mut missed: u32 = 0;
     loop {
         n += 1;
-        if let Err(e) = link.send(&Msg::Beat { n }).await {
-            return Ended::Lost(format!("its channel refused a beat: {e}"));
+        // P8-2d-1 — the write is bounded as the answer is: a worker that reads
+        // nothing leaves a big call's write unfinished, the writer's lock held
+        // by it, and a beat that waits on that would never find the worker hung.
+        let beat = Msg::Beat { n };
+        let sent = tokio::select! {
+            () = stop.cancelled() => return bye(link, frames, timing.grace).await,
+            why = link.lost() => return Ended::Lost(why),
+            sent = tokio::time::timeout(timing.beat * timing.misses, link.send(&beat)) => sent,
+        };
+        match sent {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Ended::Lost(format!("its channel refused a beat: {e}")),
+            Err(_) => return Ended::Lost("a beat could not be written in time".into()),
         }
         let deadline = tokio::time::Instant::now() + timing.beat;
         let mut answered = false;
@@ -1214,13 +1401,7 @@ async fn beats(
                     target,
                     line,
                 }))) => relay.write(&level, &target, &line),
-                #[cfg(worker_calls)]
-                Ok(Ok(Some(Msg::Answer { id, answer }))) => {
-                    link.answered(id, answer);
-                }
-                #[cfg(worker_calls)]
-                Ok(Ok(Some(Msg::Call { id, call }))) => answer_worker(run, link, id, call),
-                Ok(Ok(Some(_))) => continue,
+                Ok(Ok(Some(m))) => run.frame(link, m),
                 Ok(Ok(None)) => return Ended::Lost("its channel ended".into()),
                 Ok(Err(e)) => return Ended::Lost(format!("its channel failed: {e}")),
                 Err(_) => break,
@@ -1322,7 +1503,7 @@ fn answer_worker(run: &Run, link: &Arc<link::Link>, id: u64, call: Call) {
 
 /// The stop: `bye` to the worker, and its channel's end awaited, within the
 /// grace. A worker still there after it is killed all the same.
-async fn bye(link: &link::Link, frames: &mut Frames, grace: Duration) -> Ended {
+async fn bye<R: link::Role>(link: &link::Linked<R>, frames: &mut Frames, grace: Duration) -> Ended {
     let _ = tokio::time::timeout(grace, async {
         if link.send(&Msg::Bye).await.is_ok() {
             while let Ok(Some(_)) = frames.next().await {}
@@ -1616,6 +1797,10 @@ pub(crate) fn drop_run(session: ObjectId, fence: u64) -> bool {
     true
 }
 
+/// FR-90 P8-2d-1 — the device's worker: one for the device's life, parked
+/// rather than given up on, with the prober's measure in it.
+#[cfg(worker_calls)]
+pub(crate) mod device;
 /// FR-90 P8-2a-2 — the second channel: listeners from the daemon. Unix
 /// only: Windows has no fd-4 channel (P8-2b-3).
 #[cfg(all(worker_calls, unix))]

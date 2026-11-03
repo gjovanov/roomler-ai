@@ -377,7 +377,7 @@
              per item on the SERVER's own bit split (VIEW_EXEC_AUDIT vs
              VIEW_SSH_AUDIT — reviewing commands and reviewing SSH sessions
              are different jobs); the group shows when either applies. -->
-        <v-list-group v-if="canSeeExecAudit || canSeeSshAudit" value="audit">
+        <v-list-group v-if="canSeeExecAudit || canSeeSshAudit || canSeeExternalAudit" value="audit">
           <template #activator="{ props: groupProps }">
             <v-list-item v-bind="groupProps" prepend-icon="mdi-clipboard-text-clock" :title="$t('nav.audit')" />
           </template>
@@ -398,6 +398,12 @@
             :to="`/tenant/${tenantId}/audit/ssh-activity`"
             prepend-icon="mdi-pulse"
             :title="$t('nav.sshActivity')"
+          />
+          <v-list-item
+            v-if="canSeeExternalAudit"
+            :to="`/tenant/${tenantId}/audit/external`"
+            prepend-icon="mdi-account-arrow-right-outline"
+            :title="$t('nav.externalAudit')"
           />
         </v-list-group>
       </v-list>
@@ -690,8 +696,8 @@
             />
             <v-text-field
               v-model="orgSlug"
-              label="Slug"
-              hint="URL-friendly identifier, globally unique"
+              label="Short name"
+              hint="Lowercase letters, digits and dashes, used in links. Unique on this server."
               :rules="[rules.required, rules.slug]"
               @update:model-value="orgSlugTouched = true"
             />
@@ -732,6 +738,7 @@ import {
   canQueryAnalytics,
   canSeeFleetNav,
   canViewExecAudit,
+  canViewExternalAudit,
   canViewSshAudit,
 } from '@/utils/permissions'
 import { useRoomStore, type Room } from '@/stores/rooms'
@@ -1053,6 +1060,9 @@ const canSeeExecAudit = computed(() =>
 const canSeeSshAudit = computed(() =>
   canViewSshAudit(tenantStore.myPermissions, tenantStore.isOwner),
 )
+const canSeeExternalAudit = computed(() =>
+  canViewExternalAudit(tenantStore.myPermissions, tenantStore.isOwner),
+)
 const isPlatformAdmin = computed(() => auth.user?.is_platform_admin === true)
 
 // Sidebar Devices group data + capped-list resets. A SEPARATE watcher from
@@ -1190,7 +1200,7 @@ async function handleCreateOrg() {
     // tenants.slug is globally unique, and a taken slug is the only 409 here.
     showCreateOrgError(
       e instanceof ApiError && e.status === 409
-        ? 'That slug is already taken — pick another'
+        ? 'That short name is already taken — pick another'
         : msg,
     )
   } finally {

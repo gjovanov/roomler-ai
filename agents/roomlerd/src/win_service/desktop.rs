@@ -61,9 +61,9 @@ impl OwnedDesktop {
 impl Drop for OwnedDesktop {
     fn drop(&mut self) {
         // SAFETY: we own the handle (constructed via OpenDesktopW or
-        // OpenInputDesktop). CloseDesktop on a valid HDESK is the
-        // canonical cleanup; failure is logged and ignored — there's
-        // nothing to do about it from a Drop impl.
+        // OpenInputDesktop). ⚠️ CloseDesktop fails with ERROR_BUSY, and
+        // the handle stays open, while a thread of this process is bound
+        // to it: a bound handle must outlive its binding.
         unsafe {
             CloseDesktop(self.h);
         }

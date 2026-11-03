@@ -33,8 +33,8 @@
         <p id="detect-agent-summary" class="muted">Probing…</p>
         <p id="detect-tunnel-summary" class="muted"></p>
         <p id="detect-ambiguous-warning" class="warning" hidden>
-          Both perUser and perMachine daemon installs detected. The MSI's cleanup
-          custom action will remove the one not selected.
+          Roomler is installed twice here, for this user only and for the whole
+          computer. The install removes the one you did not pick.
         </p>
       </div>
 
@@ -46,36 +46,43 @@
              decided in Rust as daemonOffered); app.js fills the copy per OS
              and shows this note when no daemon card may appear. -->
         <p id="platform-note" class="muted" hidden></p>
+        <!-- FR-129 C: why this run offers fewer cards than the OS has
+             (AgentDetect.roleLimit): an administrator's password typed for a
+             standard user, or a policy that refuses administrator prompts. -->
+        <p id="role-limit-note" class="muted" hidden></p>
         <fieldset id="role-fieldset">
           <label class="radio role-daemon" data-role="daemon-system">
             <input type="radio" name="role" value="daemon-system">
             <div>
               <strong id="role-title-daemon-system">Be accessed — background service (pre-logon, recommended)</strong>
-              <p class="muted" id="role-desc-daemon-system">perMachine install + SystemContext: remote control works on
-              the lock screen, UAC dialogs, and admin apps. Requires admin (UAC prompt).</p>
+              <p class="muted" id="role-desc-daemon-system">Installed for the whole computer as a Windows service, so
+              remote control works on the lock screen, on UAC prompts and in administrator apps too. Needs an
+              administrator's approval (a UAC prompt).</p>
             </div>
           </label>
           <label class="radio role-daemon" data-role="daemon-machine">
             <input type="radio" name="role" value="daemon-machine">
             <div>
               <strong id="role-title-daemon-machine">Be accessed — attended service</strong>
-              <p class="muted" id="role-desc-daemon-machine">perMachine install for all users on this PC, without the
-              SystemContext swap. Requires admin (UAC prompt) during install.</p>
+              <p class="muted" id="role-desc-daemon-machine">Installed for everyone on this computer. Remote control
+              reaches the desktop of whoever is signed in, not the lock screen or UAC prompts. Needs an
+              administrator's approval (a UAC prompt) to install.</p>
             </div>
           </label>
           <label class="radio role-daemon" data-role="daemon-user">
             <input type="radio" name="role" value="daemon-user">
             <div>
               <strong id="role-title-daemon-user">Be accessed — this user only</strong>
-              <p class="muted" id="role-desc-daemon-user">perUser install under my account. No admin password needed.</p>
+              <p class="muted" id="role-desc-daemon-user">Installed for your account only, and runs while you are signed
+              in. No administrator needed.</p>
             </div>
           </label>
-          <label class="radio">
+          <label class="radio" id="role-card-tunnel">
             <input type="radio" name="role" value="tunnel-client">
             <div>
               <strong>Reach others only — tunnel client</strong>
               <p class="muted">Installs the <code>roomler</code> CLI and enrolls it,
-              so this machine can forward ports through enrolled agents. No daemon.</p>
+              so this machine can forward ports through enrolled devices. No daemon.</p>
             </div>
           </label>
         </fieldset>
@@ -91,12 +98,20 @@
 
         <!-- #3116: on a reinstall the pre-logon service's config is in a
              folder only administrators may open, so a wizard that is not
-             elevated stops here, before a token is pasted or paired. -->
+             elevated stops here, before a token is pasted or paired.
+             FR-129 C3: the button is INSIDE the note, so it shows exactly
+             when the note does; it restarts the wizard through Windows'
+             administrator prompt with the role kept (cmd_relaunch_elevated). -->
         <div id="elevation-note" class="warning" hidden>
-          <p>This device already has the background service, and its settings are
-          in a folder only administrators may open. To install it again, close
-          Roomler Setup, then right-click it and choose <strong>Run as
-          administrator</strong>. Or pick another option above.</p>
+          <p><span id="elevation-note-lead">This device already has the background
+          service, and its settings are in a folder only administrators may
+          open.</span> To install it again, Roomler Setup has to run as
+          administrator: restart it that way (Windows asks you to approve it
+          once), or pick another option above.</p>
+          <footer class="actions">
+            <button id="elevation-relaunch" type="button">Restart as administrator</button>
+          </footer>
+          <p id="elevation-relaunch-status" class="muted" aria-live="polite" hidden></p>
         </div>
       </div>
 
@@ -254,7 +269,7 @@
            has no pairing. Live validation unchanged. -->
       <details id="paste-wrap" class="card">
         <summary id="paste-summary">I already have a token</summary>
-        <p class="muted" id="paste-lead">Paste a fresh enrollment token from Admin → Agents.</p>
+        <p class="muted" id="paste-lead">Paste a fresh enrollment token from the dashboard's Devices → Enroll → Device.</p>
         <label class="field">
           <span>Token</span>
           <textarea id="token-input" rows="4" autocomplete="off" spellcheck="false"
@@ -272,9 +287,9 @@
             <textarea id="root-token-input" rows="3" autocomplete="off" spellcheck="false"
                       placeholder="eyJhbGc..."></textarea>
             <small class="muted">On a Mac the private network runs in a second, root
-            service, enrolled as its own device with its own token — mint a second one in
-            Admin → Agents. Or untick the overlay network under Advanced options to install
-            screen sharing only.</small>
+            service, enrolled as its own device with its own token — mint a second one under
+            Devices → Enroll → Device. Or untick the overlay network under Advanced options to
+            install screen sharing only.</small>
           </label>
           <p id="root-token-status" class="muted" hidden></p>
         </div>
@@ -293,8 +308,8 @@
         <div id="token-warn-audience" class="warning" hidden>
           This is not a tunnel-enrollment token (token type is
           <code id="token-warn-aud-name"></code>). You'll get one from
-          <strong>Admin → Tunnels</strong>; the agent-enrollment token from
-          Admin → Agents is a different one.
+          <strong>Devices → Enroll → Tunnel client</strong>; a device's enrollment
+          token, from Devices → Enroll → Device, is a different one.
         </div>
         <div id="token-warn-expired" class="error" hidden>
           This token has already expired. Ask your admin to issue a new one.
@@ -437,13 +452,12 @@
       </div>
 
       <div id="done-systemcontext-note" class="info" hidden>
-        <strong>SystemContext mode active.</strong>
-        <p>The perMachine MSI is installed, the daemon is enrolled, and the SCM
-        service runs with <code>ROOMLERD_ENABLE_SYSTEM_SWAP=1</code> in its
-        <code>Environment</code> block. Remote control can now drive the Windows
-        lock screen, UAC dialogs, and admin apps when an operator connects from
-        the browser.</p>
-        <p class="muted">To disable SystemContext mode later, run
+        <strong>Lock-screen access is on.</strong>
+        <p>Roomler is installed for the whole computer, this device is enrolled,
+        and its Windows service runs with <code>ROOMLERD_ENABLE_SYSTEM_SWAP=1</code>.
+        Remote control can now drive the Windows lock screen, UAC prompts and
+        administrator apps when someone connects from the browser.</p>
+        <p class="muted">To turn it off later, run
         <code>roomlerd disable-system-context</code> from an elevated shell,
         or re-run this wizard and pick the attended-service role.</p>
       </div>

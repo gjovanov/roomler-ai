@@ -24,7 +24,7 @@
 //! the switch, the cell, both denylists, and the probe child's proof.
 
 use std::ffi::c_void;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use anyhow::{Result, anyhow};
 use ffmpeg_next::{ffi as ff, frame};
@@ -98,11 +98,12 @@ pub(crate) fn gpu_cell(name: &str, chroma444: bool) -> bool {
 }
 
 /// The encoders whose GPU form the capability probe proved in its child
-/// process. `caps::detect` installs them once, before any session.
-static PROVEN: OnceLock<Vec<String>> = OnceLock::new();
+/// process. `caps::detect` installs them before any session, and again only when
+/// a later try's answer is adopted with no session live (#3280).
+static PROVEN: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
 pub(crate) fn install_proven(names: Vec<String>) {
-    let _ = PROVEN.set(names);
+    *PROVEN.write().unwrap_or_else(|e| e.into_inner()) = names;
 }
 
 /// Whether `name`'s GPU form may open in this process: the probe child proved
@@ -114,15 +115,16 @@ fn proven(name: &str) -> bool {
     }
     crate::encode::caps::in_probe_child()
         || PROVEN
-            .get()
-            .is_some_and(|names| names.iter().any(|n| n == name))
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|n| n == name)
 }
 
 #[cfg(test)]
 thread_local! {
-    /// A test's own proof, for its thread only: `PROVEN` is set once per
-    /// process, and a test that installed it would decide every other test's
-    /// `unproven`.
+    /// A test's own proof, for its thread only: `PROVEN` is process-wide, and a
+    /// test that installed it would decide every other test's `unproven`.
     static TEST_PROVEN: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
 }
 

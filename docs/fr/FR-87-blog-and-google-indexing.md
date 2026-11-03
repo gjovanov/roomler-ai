@@ -32,7 +32,7 @@ Each row is also an acceptance criterion's "shown failing" run.
 | `curl -sI https://roomler.ai/docs` | `301 Location: http://roomler.ai/docs/`, a **scheme downgrade** | absolute redirect built from the pod's `:80` listener behind the TLS edge |
 | `/blog/`, `/this-does-not-exist` | **200** with the SPA shell (soft 404) | SPA fallback `nginx-pod.conf:97-99` |
 | `/docs/start/install/windows` (no slash) | 200, duplicate of the slash form | `try_files $uri $uri/index.html` serves both |
-| `/` | a client-rendered shell: an empty `<div id="app">` for any crawler that doesn't run JS | `/` is `meta.auth` (`ui/src/plugins/router.ts:124`); guests are redirected to `/landing` client-side (`:350`) |
+| `/` | a client-rendered shell: an empty `<div id="app">` for any crawler that doesn't run JS | `/` is `meta.auth` (`ui/src/plugins/router.ts:124`); guests are redirected to `/landing` client-side (`:356`) |
 | sitemap | lists `/landing /pricing /privacy /terms /imprint` (`site.ts:150`), all of which declare canonical `/` (`ui/index.html:24`) | contradictory signals |
 | docs JSON-LD | author `"G ROX LTD"` (`layout.ts:221`), but the legal name everywhere else is G ROX EOOD; no `datePublished`, `image` or `mainEntityOfPage`; the `WebSite`/`SoftwareApplication` markup spec'd by FR-60 was never built (`LayoutCtx.extraJsonLd` is never passed, `build.ts:515-523`) | — |
 | docs `<title>` | up to 71 chars (e.g. `/docs/compare/teamviewer/`) | the template `layout.ts:204-209` always appends " · section — Roomler Docs" |
@@ -70,7 +70,7 @@ other with different anchor text, so they don't compete for one query.
 (`ui/blog/posts/*.md`, assets in `ui/blog/assets/`) and a **homepage template**. They share the
 `<head>`, sitemaps, robots, search index, link checker and a new asset pipeline. The build
 command (`bun run build`, `ui/package.json:9`), the Dockerfile and the CI invocation
-(`ci.yml:2357-2387`) stay as they are, and **no dependency is added**. A separate blog builder
+(`ci.yml:2465-2495`) stay as they are, and **no dependency is added**. A separate blog builder
 was rejected: it would mean two writers of `dist/sitemap.xml` and a link checker that can't see
 a `/blog` → `/docs` link.
 
@@ -234,14 +234,14 @@ location = /pricing { return 301 /#pricing; }
   nothing ever redirects. (This section's first draft, `try_files $uri $uri/ =404`, does 301,
   measured in `nginx:stable`; it adds nothing, so P1 ships without it.)
 - **The session cookie decides the homepage.** The session is the HttpOnly `access_token`
-  cookie (`crates/api/src/routes/auth.rs:247`). No cookie (guests and every crawler) gets the
+  cookie (`crates/api/src/routes/auth.rs:285`). No cookie (guests and every crawler) gets the
   static homepage; a cookie gets the SPA, whose router behaves as today. A cookie the server
   refuses gets the SPA, which sends the visitor to login on its first 401.
 - **`try_files` serves the chosen file inside `location = /`**, so `expires -1` applies to both
   branches, the server's security headers survive on both, and `internal` on `/home/` does not
   block it. Without `internal`, `/home/` would be a second URL for the homepage.
 - ⚠️ **The access cookie is not the whole session.** It lives 7 days; the refresh cookie lives
-  30, but it is scoped to `Path=/api/auth/refresh` (`auth.rs:427`), so nginx never sees it at
+  30, but it is scoped to `Path=/api/auth/refresh` (`auth.rs:570`), so nginx never sees it at
   `/`. A returning user between day 7 and day 30 has no cookie nginx can read, and is served
   the static page by a site that could still sign them in silently. §4g's hand-off closes that
   gap.

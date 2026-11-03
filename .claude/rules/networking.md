@@ -127,6 +127,20 @@ server, but an SSH channel has no server in the path at all, so empty must mean
 ⚠️ A key-list session with an unset `ssh_account_mode` authenticates and then runs
 **nothing**, rather than quietly taking SYSTEM/root. An unparseable mode is a
 refusal, never a fallback.
+⚠️ **On Windows a session's command runs in a kill-on-close job, and a Fleet RPC
+command never does** (`ExecRequest::session_owned`, #3303). A lost session ends what
+it started, with no code running, because the kernel closes the handle as the daemon
+goes. A Fleet RPC command may stop that daemon (`roomler exec … self-update`) and has
+to outlive it, so a job there would kill its own updater. A one-shot that ends by
+itself has its job let go, or `ssh node 'Start-Process msiexec …'` would kill the
+installer's client a moment after it started, and a client gone that early rolls the
+install back (1603). Neither is a simplification to make: `docs/roomler-ssh.md`
+§ What outlives a session.
+⚠️ **An interactive pump can't hear its client go.** A shell at a prompt writes
+nothing that could fail, so `channel_close` and `Handler::drop` fire an abort for a
+shell as they do for a command, and on it the pump returns without `wait`, which
+drops the pty. Awaiting `wait` there keeps the shell alive for as long as the daemon
+lives (#3303).
 ⚠️ **Session CONTENT is never recorded** — recording a terminal means shipping
 whatever the operator typed (passwords into `sudo`, `mysql -p`) off the host, which
 is the exact property this pillar exists to provide.
@@ -160,8 +174,14 @@ would hang the caller until its deadline.
 the device remotely configurable without making it server-configurable**.
 Resolution: a device-owned `remote_config_enabled`, default OFF, **structurally
 absent from `DesiredConfig`** (a test asserts it never appears in a serialised
-request). Delivery is **reconcile-on-connect only**, so an offline device converges
-by the same code path as an online one.
+request). A device **converges on connect**, so an offline device takes the same code
+path as an online one; a save also nudges a connected device with the same frame,
+best effort (FR-132 P1b).
+⚠️ **The device has no revision check**: `apply` writes whatever frame arrived last,
+in every released agent. So every `rc:agent.config` goes through
+`Hub::push_desired_config`, which never sends a connection a revision at or below one
+it already carried. Never `try_send` this frame directly: a stale connect-path read
+would put the device back on a config the operator replaced.
 ⚠️ **The device REPORTS BACK** — without it, *applied / applied-pending-restart /
 refused-not-opted-in / refused-secondary-org / never-arrived* are ONE state on
 screen, and each has a different fix. **Compare revisions, not just outcomes.**

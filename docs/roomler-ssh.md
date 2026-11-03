@@ -297,17 +297,20 @@ one since P4. The channel owns the lifetime:
 
 | Event | What ends the command |
 |---|---|
-| the client closes the channel (Ctrl-C, `ssh` exiting) | `Handler::channel_close` fires the channel's abort token → `ExecEngine::cancel` → process-**tree** kill (`taskkill /T` / the process group) |
+| the client closes the channel (Ctrl-C, `ssh` exiting) | `Handler::channel_close` fires the channel's abort token → `ExecEngine::cancel` → on Windows the session's job, then the process-**tree** kill (`taskkill /T` / the process group) |
 | the client disconnects, or the carrier dies | the handler drops; `Drop` cancels every exec it still tracks |
 | the grant's `session_secs` deadline | `arm_session_deadline` disconnects → the same `Drop` |
 | the session itself vanishes under the pump | `handle.data` fails → the pump cancels the abort |
+| the daemon leaves, by any route | on Windows the kernel ends the session's job as the process goes (§ [What outlives a session](#what-outlives-a-session-3303)) |
 | a key-list (break-glass) session | unbounded, as its pty is; the 600 s inactivity timeout still reaps a dead carrier |
 
 ⚠️ russh accepts and **discards** data for a channel the client has closed —
 the pump cannot tell — which is why `channel_close` is wired rather than
 relying on a failed write. The abort token is minted **before** the consent
 wait, so a channel closed while the operator is being asked leaves nothing to
-run; the engine re-checks it before spawning.
+run; the engine re-checks it before spawning. An interactive shell takes the same
+abort (#3303): its pump stops on it and drops the pty, because a shell at a prompt
+writes nothing that could fail.
 
 **Redaction cannot split a secret.** Every masked shape — the registered agent
 tokens, `Bearer <token>`, JWT-shaped runs — is whitespace-free, so
@@ -387,8 +390,8 @@ There is no pty pair to open. The console host owns the terminal:
 `CreatePseudoConsole` returns an `HPCON`, and a process is attached to it by
 passing that handle through a **process-thread attribute list**. Teardown is a
 **job object** (`KILL_ON_JOB_CLOSE`) rather than a process group — Windows has
-no `killpg`, and the job is what gives the same "nothing outlives the session"
-guarantee. The output stream ends at `ClosePseudoConsole`, which blocks until
+no `killpg`; § [What outlives a session](#what-outlives-a-session-3303) says
+what the job guarantees. The output stream ends at `ClosePseudoConsole`, which blocks until
 the host has flushed; a waiter closes it the moment the child exits, because
 otherwise a reader waits forever for an EOF that the console host will never
 send while the pseudoconsole lives.
@@ -428,6 +431,159 @@ turns that on, and there `console_user` works on attended installs too
 on Windows for the same reason `exec` refuses it — becoming an arbitrary local
 user needs that user's credentials.
 
+### What outlives a session (#3303)
+
+**A session that is lost ends what it started. A one-shot command that ends by
+itself leaves what it deliberately started.** On Windows:
+
+| How the session ends | `ssh node 'cmd'` | `ssh node` |
+|---|---|---|
+| the command ends by itself, or the shell `exit`s | what it left running **stays** | everything ends |
+| the client goes: closed, disconnected, the carrier dead, the grant's deadline | everything ends | everything ends |
+| the daemon stops | everything ends | everything ends |
+| the daemon crashes or is killed | everything ends | everything ends |
+
+"Everything" is the shell and whatever it started, at any depth, with the
+exceptions under *What a job cannot promise*.
+
+```mermaid
+flowchart TD
+  S["CreateProcess, suspended"] --> J["joins a kill-on-close job, then runs"]
+  J --> R{"how does it end?"}
+  R -->|"one-shot: the command ends and its output reaches EOF"| G["the job is let go:<br/>what it left running stays"]
+  R -->|"interactive: the shell exits"| C["the job closes:<br/>everything ends"]
+  R -->|"the client is gone"| T["the job is terminated:<br/>everything ends"]
+  R -->|"the daemon leaves, by any route"| K["the kernel closes the job's handle:<br/>everything ends, with no code running"]
+```
+
+**It rests on the kernel, not on code running.** A process-wide exit runs no
+destructor: a crash, `Stop-Process -Force`, or the runtime's budget
+(`runtime_exit.rs`), which leaves a blocking read behind on purpose. So
+`kill_on_drop` and `taskkill /T` cannot keep this promise, and `kill_on_drop`
+never reached a grandchild anyway. A kill-on-close job needs neither: the
+kernel closes the handle as the process goes, and ends every process in the
+job. The handle is not inheritable, so no child can hold it open past the
+daemon. The process is created suspended and joins before its first instruction,
+so nothing it starts can be outside. One-shot: `session_job`
+([`exec.rs`](../agents/roomlerd/src/exec.rs)). Interactive: `make_job`
+([`pty/windows.rs`](../agents/roomlerd/src/pty/windows.rs)). Both nest inside the
+Scheduled Task's job on a per-user daemon, and that outer job does not end them:
+it has no kill-on-close limit.
+
+**Measured on a Win11 guest** (#3303), on a candidate build of the change. Each
+cell held six forms at once: a one-shot held by its shell, `ssh -tt node 'script'`,
+a busy shell, a shell at a prompt, sftp, and a one-shot that had already returned
+and left a child. A watcher outside every session polled the process list every
+300 ms. "Gone" is every process of the five open forms, at any depth:
+
+| Event | Per-user daemon | SYSTEM service, SystemContext, `daemon` | the same, `console_user` |
+|---|---|---|---|
+| the daemon stops | gone 1.7 s before the daemon's own exit | gone 3.0 s before it | gone 2.7 s before it |
+| the client is killed | gone within 0.6 s; the daemon stays | within 0.9 s | within 0.6 s |
+| the daemon is killed | gone in the daemon's own poll | the worker killed: in its own poll, and the service restarts it; the service killed too: in its poll | not read |
+| the shell `exit`s, sftp says `bye` | its tree is gone | the same | not read |
+
+The ended one-shot's child stayed in every cell, as designed. So the bound is: no
+later than the daemon's own exit on a stop, within one 300 ms poll of it on a
+crash, and under a second after the client goes. Neither shape logged
+`could not put the session in a job object`. Unread: a corporate laptop with EDR,
+a full-tunnel VPN, a locked screen, nobody signed in, and the sessions the SYSTEM
+service serves itself (FR-105).
+
+**Why a one-shot's end is different.** `ssh node 'Start-Process notepad'` returns
+at once, and what it started is what the person asked for. Ending that would kill
+it within milliseconds and say nothing. The job was never a boundary against
+someone who means to leave something running (see below), so nothing is protected
+by ending it. A command that ended lost nothing: its job is let go, the limit
+first, so closing the handle ends nothing. A command has ended when it has exited
+and its output has reached EOF, so a plain `ssh node 'msiexec /i x.msi /qn'` had
+not ended when the daemon went: the session stayed open under the installer.
+
+**Fleet RPC is the other way round, on purpose.** A command there runs in no job,
+because it may stop this daemon and has to outlive it
+(`roomler exec … self-update`, [`fleet-rpc.md`](fleet-rpc.md) § Bounds).
+`ExecRequest::session_owned` is the switch: only `run_exec` here sets it, and
+`a_fleet_rpc_command_and_what_it_started_outlive_the_daemon` locks the other side.
+
+**What a job cannot promise.**
+- A process in the job can ask another process to start something, and that one
+  is outside: `schtasks`, WMI's `Win32_Process.Create`, a COM server, a service,
+  an elevation through `Start-Process -Verb RunAs`, and whatever runs inside WSL.
+  This is a promise about what a session leaves behind by accident, not a boundary
+  against a person with a shell.
+- If the session cannot join its job it still runs, because it may be the
+  operator's one way into the box. The daemon's log says
+  `ssh: could not put the session in a job object — descendants may outlive it`,
+  and a client gone gets `taskkill /T`, as before. Search a fleet's logs for it.
+  A command whose job cannot even be created runs the same way; a shell's is
+  refused, as it always was. A process that cannot be resumed is ended, and a
+  command says `failed to start …`.
+- `sftp-server` has no job and needs none: it starts nothing and ends on its
+  stdin's EOF, which a daemon leaving gives it.
+
+**Upgrading from inside a session.** An upgrade started in a session finishes, and
+the device comes back on the new version with nobody signing in, on both daemon
+shapes. The session does not survive it: the stop ends the shell and the script
+with the daemon. The install survives because `msiexec` in the session is only a
+client. The Windows Installer service does the work, outside every session's job,
+and finishes it with the client gone. Read on a Win11 guest from one candidate
+build of the change to the next, both with the job:
+
+| From inside the session | Per-user daemon | SYSTEM service, SystemContext |
+|---|---|---|
+| `msiexec /i x.msi /qn` typed at the prompt of `ssh node` | exit 0, back | exit 0, back |
+| `ssh -tt node 'script'`, the script runs `msiexec` and waits | exit 0, back; the script ends at the stop, before it logs `msiexec`'s exit | exit 0, back, the same |
+| `ssh node 'msiexec /i x.msi /qn'` | exit 0, back | not read |
+| `ssh node "Start-Process msiexec …"` | not read | exit 0, back; the command returns in 1 s and its `msiexec` lives to the end |
+| the client killed about a second after `msiexec` started | **1603**, rolled back: the old daemon never stopped and stayed online | not read |
+
+From released 0.4.197, which has no job for a command, every form read ended the
+same way on both shapes, except that the script outlived the stop and logged
+`msiexec`'s exit: the orphan this section is about.
+
+- **Back by itself, and nobody signs in.** The per-user daemon ran again 59 to 60 s
+  after the install finished, on the guest's own clock: the installer registers
+  the Scheduled Task with one-shot triggers 60, 180 and 600 s on
+  (`START_AFTER_REGISTERING`, [`service.rs`](../agents/roomlerd/src/service.rs)),
+  and the first starts it. The service ran again within 10 s of the upgrade's
+  start, because its installer starts it.
+- **The 1603 does no harm, and a retry works.** A client gone in the first seconds
+  takes the nested removal of the old product with it, so the running
+  `roomlerd.exe` cannot be replaced (`Error 1310`) and the installer rolls back.
+  It is the "by hand with it running" case in
+  [`installers.md`](../.claude/rules/installers.md). It predates the job:
+  released 0.4.197 ends the tree on a client gone too, and gave the same 1603.
+- **The `ssh` client is not told.** A stopping daemon sends no disconnect, so the
+  client waits for its carrier to give up: 600 s in the read, then
+  `roomler proxy` reports the connection reset.
+- **Not read:** `roomlerd self-update` typed in a session, and
+  `roomler exec … self-update`. By the code the first ends with the daemon, as
+  `msiexec`'s client does, and its watcher with it, so `last-install.json` stays
+  `InProgress` (#3289). The second runs in no job and outlives the daemon.
+
+**A stop from inside a session ends the session before the script's next line.**
+`Restart-Service Roomler`, or a script that stops the daemon and means to start it
+again, leaves the device stopped: nothing is left to run the start. Use
+`roomler restart`, which asks the daemon to restart itself and refuses unless it
+can prove a supervisor (`docs/remote-config.md`).
+
+**`ssh -t node 'cmd'` gets no terminal.** `exec_request` ignores the pty request,
+so a command with `-t` or `-tt` runs in the exec engine like any one-shot.
+`start_pty_session` runs only for a shell.
+
+**Linux and macOS: unread in the field, this is the code's account** (#3361).
+There is no job, and a process group is reached only by someone who signals it.
+Under systemd no unit sets `KillMode=`, so the default `control-group` ends
+everything in the unit's cgroup on a stop and on a crash. launchd and an unmanaged
+daemon reach no group, so a one-shot, which leads its own
+([`exec.rs`](../agents/roomlerd/src/exec.rs)), outlives them: a stop ends its direct
+child at most, through `kill_on_drop`, and a crash ends nothing. An interactive
+shell is hung up as the pty's master closes, with or without code running, and
+`PtyProcess`'s `Drop` signals its group. The pump's abort is shared code, so a
+client that goes ends a quiet shell here too, which
+`a_client_vanishing_ends_a_quiet_interactive_shell` locks on Linux. No lane runs it
+on macOS.
+
 ### Which account a session runs as (P5a)
 
 The device's `SshPolicy.account_mode` decides, and the agent maps it through
@@ -448,9 +604,9 @@ Which Windows column applies is the server's decision per grant, recorded in
 The mode means what it means on Windows: the person signed in at the device's own
 screen, and nobody else. The agent finds them at each session, then takes the drop
 a `named` account takes (`unix_priv::drop_to_console`,
-[`exec.rs:1404`](../agents/roomlerd/src/exec.rs#L1404)). Exec, the pty and `sftp`
+[`exec.rs:1410`](../agents/roomlerd/src/exec.rs#L1410)). Exec, the pty and `sftp`
 all go through `apply_run_as`
-([`exec.rs:807`](../agents/roomlerd/src/exec.rs#L807)), so one rule covers all
+([`exec.rs:813`](../agents/roomlerd/src/exec.rs#L813)), so one rule covers all
 three.
 
 ```mermaid
@@ -1013,7 +1169,7 @@ flowchart TD
 ```
 
 ⚠️ **Windows `console_user` takes `exec`'s console-user spawn** (FR-97 P4b,
-`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:937`).
+`exec::run_console_user_program`, `agents/roomlerd/src/exec.rs:943`).
 `tokio::process` cannot take a token, so the subsystem goes through
 `supervisor::spawn_in_session_captured`, the piped `CreateProcessAsUserW` spawn
 P5b built and FR-89 made streaming. Three details differ from a shell command
@@ -1373,7 +1529,7 @@ it presented (P3-8-2b).
 
 | Piece | Where |
 |---|---|
-| the wire | `ssh_ticket` on `rc:ssh.request` ([`signaling.rs:867`](../crates/remote_control/src/signaling.rs#L867)), `one_command` on `rc:ssh.grant` ([`:3920`](../crates/remote_control/src/signaling.rs#L3920)), `ssh_ticket_id` on `rc:ssh.response` ([`:3961`](../crates/remote_control/src/signaling.rs#L3961)); `RpcCap::SshOneCommand` ([`models.rs:1136`](../crates/remote_control/src/models.rs#L1136)) and the three refusals ([`models.rs:5116`](../crates/remote_control/src/models.rs#L5116)) |
+| the wire | `ssh_ticket` on `rc:ssh.request` ([`signaling.rs:867`](../crates/remote_control/src/signaling.rs#L867)), `one_command` on `rc:ssh.grant` ([`:3920`](../crates/remote_control/src/signaling.rs#L3920)), `ssh_ticket_id` on `rc:ssh.response` ([`:3961`](../crates/remote_control/src/signaling.rs#L3961)); `RpcCap::SshOneCommand` ([`models.rs:1141`](../crates/remote_control/src/models.rs#L1141)) and the three refusals ([`models.rs:5182`](../crates/remote_control/src/models.rs#L5182)) |
 | the binding | `bind_ssh_ticket` ([`agent_ssh.rs:220`](../crates/modules/network/src/routes/agent_ssh.rs#L220)), called where the request arrives ([`agent_arms.rs:194`](../crates/modules/network/src/agent_arms.rs#L194)); the outcome is a `CallerSession` ([`agent_ssh.rs:186`](../crates/modules/network/src/routes/agent_ssh.rs#L186)), and a refused one is answered at [`:411`](../crates/modules/network/src/routes/agent_ssh.rs#L411) |
 | the checks | the account and one-command checks ([`agent_ssh.rs:501`](../crates/modules/network/src/routes/agent_ssh.rs#L501)); gate 3's refusal of a session ([`:324`](../crates/modules/network/src/routes/agent_ssh.rs#L324)); what is left of a ticket ([`:963`](../crates/modules/network/src/routes/agent_ssh.rs#L963)) |
 | the audit | the `session` source and the session's ids ([`agent_ssh.rs:867`](../crates/modules/network/src/routes/agent_ssh.rs#L867)) |
@@ -1431,11 +1587,11 @@ session's grant backs it.
 
 | Piece | Where |
 |---|---|
-| the grant's field | `Grant::one_command` ([`ssh.rs:2852`](../agents/roomlerd/src/ssh.rs#L2852)), recorded by `record_grant` ([`:2928`](../agents/roomlerd/src/ssh.rs#L2928)), resolved into the session's policy ([`:833`](../agents/roomlerd/src/ssh.rs#L833)) |
-| the rules | one channel ([`ssh.rs:1693`](../agents/roomlerd/src/ssh.rs#L1693)), no forward ([`:1759`](../agents/roomlerd/src/ssh.rs#L1759)), one `exec` ([`:1854`](../agents/roomlerd/src/ssh.rs#L1854)), no shell ([`:1964`](../agents/roomlerd/src/ssh.rs#L1964)), no terminal ([`:2003`](../agents/roomlerd/src/ssh.rs#L2003)), no subsystem ([`:2106`](../agents/roomlerd/src/ssh.rs#L2106)) |
-| the device's word | `ssh-one-command` in the hello ([`caps.rs:2645`](../agents/roomlerd/src/encode/caps.rs#L2645)) |
+| the grant's field | `Grant::one_command` ([`ssh.rs:2874`](../agents/roomlerd/src/ssh.rs#L2874)), recorded by `record_grant` ([`:2950`](../agents/roomlerd/src/ssh.rs#L2950)), resolved into the session's policy ([`:833`](../agents/roomlerd/src/ssh.rs#L833)) |
+| the rules | one channel ([`ssh.rs:1713`](../agents/roomlerd/src/ssh.rs#L1713)), no forward ([`:1779`](../agents/roomlerd/src/ssh.rs#L1779)), one `exec` ([`:1874`](../agents/roomlerd/src/ssh.rs#L1874)), no shell ([`:1984`](../agents/roomlerd/src/ssh.rs#L1984)), no terminal ([`:2023`](../agents/roomlerd/src/ssh.rs#L2023)), no subsystem ([`:2126`](../agents/roomlerd/src/ssh.rs#L2126)) |
+| the device's word | `ssh-one-command` in the hello ([`caps.rs:4459`](../agents/roomlerd/src/encode/caps.rs#L4459)) |
 | the SYSTEM service | the claim's word ([`ssh_service.rs:637`](../agents/roomlerd/src/ssh_service.rs#L637)), the published word ([`:646`](../agents/roomlerd/src/ssh_service.rs#L646)), and the claimed grant's field ([`:612`](../agents/roomlerd/src/ssh_service.rs#L612)) |
-| the server | routing a session's grant to the service ([`agent_ssh.rs:784`](../crates/modules/network/src/routes/agent_ssh.rs#L784)), the claim's backstop ([`:1392`](../crates/modules/network/src/routes/agent_ssh.rs#L1392)) in the pending rows' claim ([`ssh_pending.rs:63`](../crates/services/src/dao/ssh_pending.rs#L63)), the published record ([`models.rs:2896`](../crates/remote_control/src/models.rs#L2896)) |
+| the server | routing a session's grant to the service ([`agent_ssh.rs:784`](../crates/modules/network/src/routes/agent_ssh.rs#L784)), the claim's backstop ([`:1392`](../crates/modules/network/src/routes/agent_ssh.rs#L1392)) in the pending rows' claim ([`ssh_pending.rs:63`](../crates/services/src/dao/ssh_pending.rs#L63)), the published record ([`models.rs:2910`](../crates/remote_control/src/models.rs#L2910)) |
 
 ### The session's own device: the client (FR-90 P3-8-2b)
 
@@ -1483,10 +1639,10 @@ for one `exec` because that is all it needs; the target refuses anything more
 
 | Piece | Where |
 |---|---|
-| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6551`](../agents/roomlerd/src/signaling.rs#L6551)) |
+| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6691`](../agents/roomlerd/src/signaling.rs#L6691)) |
 | the client | the key ([`ssh_client.rs:138`](../agents/roomlerd/src/ssh_client.rs#L138)), the request ([`:187`](../agents/roomlerd/src/ssh_client.rs#L187)), the answer's checks ([`:156`](../agents/roomlerd/src/ssh_client.rs#L156)), the one `exec` ([`:286`](../agents/roomlerd/src/ssh_client.rs#L286)), one call whole ([`:371`](../agents/roomlerd/src/ssh_client.rs#L371)) |
 | the dial | the netstack's ([`overlay.rs:972`](../agents/roomlerd/src/overlay.rs#L972)), the OS's ([`ssh_client.rs:240`](../agents/roomlerd/src/ssh_client.rs#L240)) |
-| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6187`](../agents/roomlerd/src/signaling.rs#L6187), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
+| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6327`](../agents/roomlerd/src/signaling.rs#L6327), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
 
 ### The tool: `ssh_run` (FR-90 P3-8-2b-2)
 
@@ -1536,8 +1692,8 @@ never recorded: what a session typed is its own.
 
 | Piece | Where |
 |---|---|
-| the owner's key | `hive_ssh` ([`config.rs:605`](../crates/agent-core/src/config.rs#L605)), never pushable ([`models.rs:9771`](../crates/remote_control/src/models.rs#L9771)), read into `HiveConfig.ssh` ([`gates.rs:58`](../agents/roomlerd/src/hive/gates.rs#L58)) |
-| the offer | `Supervisor::ssh_runner` ([`supervisor.rs:1599`](../agents/roomlerd/src/hive/supervisor.rs#L1599)), made at start ([`:879`](../agents/roomlerd/src/hive/supervisor.rs#L879)); `Run.ssh` ([`toolbelt.rs:510`](../agents/roomlerd/src/hive/toolbelt.rs#L510)); the settings' ask ([`supervisor.rs:5076`](../agents/roomlerd/src/hive/supervisor.rs#L5076), `SSH_TOOLS` at [`toolbelt.rs:631`](../agents/roomlerd/src/hive/toolbelt.rs#L631)) |
+| the owner's key | `hive_ssh` ([`config.rs:605`](../crates/agent-core/src/config.rs#L605)), never pushable ([`models.rs:9857`](../crates/remote_control/src/models.rs#L9857)), read into `HiveConfig.ssh` ([`gates.rs:58`](../agents/roomlerd/src/hive/gates.rs#L58)) |
+| the offer | `Supervisor::ssh_runner` ([`supervisor.rs:1602`](../agents/roomlerd/src/hive/supervisor.rs#L1602)), made at start ([`:878`](../agents/roomlerd/src/hive/supervisor.rs#L878)); `Run.ssh` ([`toolbelt.rs:510`](../agents/roomlerd/src/hive/toolbelt.rs#L510)); the settings' ask ([`supervisor.rs:5055`](../agents/roomlerd/src/hive/supervisor.rs#L5055), `SSH_TOOLS` at [`toolbelt.rs:631`](../agents/roomlerd/src/hive/toolbelt.rs#L631)) |
 | the tool | its definition ([`toolbelt.rs:1378`](../agents/roomlerd/src/hive/toolbelt.rs#L1378)); the call ([`ssh_tools.rs:153`](../agents/roomlerd/src/hive/ssh_tools.rs#L153)), its checks ([`:113`](../agents/roomlerd/src/hive/ssh_tools.rs#L113)), the ticket's life ([`:146`](../agents/roomlerd/src/hive/ssh_tools.rs#L146)), the daemon's runner ([`:63`](../agents/roomlerd/src/hive/ssh_tools.rs#L63)) |
 | the ask | `VaultTools::ssh` ([`toolbelt.rs:481`](../agents/roomlerd/src/hive/toolbelt.rs#L481)), on the primary's queue ([`vault.rs:668`](../agents/roomlerd/src/vault.rs#L668)) |
 

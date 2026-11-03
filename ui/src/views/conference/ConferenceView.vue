@@ -227,12 +227,16 @@
         <v-card-title class="text-h6">Already in a call</v-card-title>
         <v-card-text>
           You are already in a call in "{{ conferenceStore.roomName }}".
-          Leave that call and join this one?
+          <!-- #1637 — asked on this call's own page, before it shows another room's. -->
+          <template v-if="switchTo !== null">
+            Leave that call and join {{ switchTo ? `the call in "${switchTo}"` : 'the other call' }}?
+          </template>
+          <template v-else>Leave that call and join this one?</template>
         </v-card-text>
         <v-card-actions>
           <v-spacer />
-          <v-btn variant="text" @click="showSwitchDialog = false">Cancel</v-btn>
-          <v-btn color="primary" variant="tonal" @click="confirmSwitch">Switch Call</v-btn>
+          <v-btn variant="text" data-testid="call-switch-cancel" @click="showSwitchDialog = false">Cancel</v-btn>
+          <v-btn color="primary" variant="tonal" data-testid="call-switch-confirm" @click="confirmSwitch">Switch Call</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -242,8 +246,9 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch, nextTick, type Component } from 'vue'
 import { storeToRefs } from 'pinia'
-import { useRoute, useRouter } from 'vue-router'
+import { onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
 import { useDisplay } from 'vuetify'
+import { handOffJoin, takeJoin } from '@/composables/callSwitch'
 import { useAuthStore } from '@/stores/auth'
 import { useRoomStore } from '@/stores/rooms'
 import { useMessageStore } from '@/stores/messages'
@@ -323,6 +328,9 @@ watch(showChat, async (open) => {
   scrollChatToBottom()
 })
 const showSwitchDialog = ref(false)
+/** #1637 — while the dialog asks about an in-place switch: the other room's
+ *  name ('' when unknown). `null` when it asks for the Join button. */
+const switchTo = ref<string | null>(null)
 const chatEditorRef = ref<InstanceType<typeof MessageEditor> | null>(null)
 const chatListRef = ref<HTMLElement | null>(null)
 const roomMembers = ref<MentionItem[]>([])
@@ -527,6 +535,12 @@ async function handleDelete(messageId: string) {
 }
 
 async function confirmSwitch() {
+  // #1637 — the dialog asked about an in-place switch: the guard below leaves.
+  if (settleSwitch) {
+    answerSwitch(true)
+    showSwitchDialog.value = false
+    return
+  }
   showSwitchDialog.value = false
   // Leave the current call first
   if (conferenceStore.tenantId && conferenceStore.roomId) {
@@ -542,6 +556,7 @@ async function handleJoin() {
 
   // If already in a different call, show confirmation dialog
   if (conferenceStore.isInCall && conferenceStore.roomId !== roomId.value) {
+    switchTo.value = null
     showSwitchDialog.value = true
     return
   }
@@ -623,7 +638,8 @@ async function doJoin() {
   }
 }
 
-async function handleLeave() {
+/** This page's call, ended: the media, the handlers and the server's membership. */
+async function leaveThisCall() {
   // Remove beforeunload warning
   window.removeEventListener('beforeunload', warnBeforeLeave)
 
@@ -647,8 +663,52 @@ async function handleLeave() {
   joined.value = false
   showChat.value = false
   showFiles.value = false
+}
+
+async function handleLeave() {
+  await leaveThisCall()
   router.push(`/tenant/${tenantId.value}`)
 }
+
+// #1637 — the app bar's Active Calls menu, and the "Call started in …"
+// snackbar, push another room's call onto this page in place. The route
+// remounts the page by roomId, so the other room gets a page of its own. The
+// call this page is in is this page's to settle, and it asks what the Join
+// button asks: Switch leaves this call, and the next page joins the other
+// (`handOffJoin`); Cancel keeps the call and the URL where they are.
+let settleSwitch: ((go: boolean) => void) | null = null
+function answerSwitch(go: boolean) {
+  const settle = settleSwitch
+  settleSwitch = null
+  settle?.(go)
+}
+// Cancel, Escape and a click outside all close the dialog: each one stays.
+watch(showSwitchDialog, (open) => {
+  if (!open) answerSwitch(false)
+})
+onBeforeRouteUpdate(async (to) => {
+  const next = to.name === 'room-call' ? String(to.params.roomId ?? '') : ''
+  if (!next || next === roomId.value) return true
+  const inThisCall = joined.value && conferenceStore.isInCall && conferenceStore.roomId === roomId.value
+  if (!inThisCall) return true
+  // A second switch while the first is asked replaces it.
+  answerSwitch(false)
+  const go = await new Promise<boolean>((resolve) => {
+    settleSwitch = resolve
+    switchTo.value = roomStore.rooms.find((r) => r.id === next)?.name ?? ''
+    showSwitchDialog.value = true
+  })
+  if (!go) return false
+  try {
+    await leaveThisCall()
+  } catch (e) {
+    // The media is down already. What the server still lists is what a
+    // failed Leave leaves too, and the switch was asked for.
+    console.warn('[call] leaving before a switch failed', e)
+  }
+  handOffJoin(next)
+  return true
+})
 
 function toggleFiles() {
   showFiles.value = !showFiles.value
@@ -708,6 +768,8 @@ watch(
 )
 
 onMounted(async () => {
+  // #1637 — taken first, so a hand-off is spent by this mount whatever follows.
+  const joinOnArrival = takeJoin(roomId.value)
   // Enumerate devices for pre-join selection
   conferenceStore.enumerateDevices()
 
@@ -734,6 +796,9 @@ onMounted(async () => {
     conferenceStore.startActiveSpeaker()
     wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
     await roomStore.fetchParticipants(tenantId.value, roomId.value)
+  } else if (joinOnArrival && !conferenceStore.isInCall) {
+    // The previous room's page left its call for this one (Switch Call).
+    await doJoin()
   }
 })
 

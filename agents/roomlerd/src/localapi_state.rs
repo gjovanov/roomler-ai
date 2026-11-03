@@ -55,11 +55,20 @@ pub trait NetstackPinger: Send + Sync {
 /// OWN reported round-trip (subprocess spawn cost never pollutes the number).
 /// The overlay ICMP path is exactly what a user's own `ping 100.64.x.y`
 /// exercises, so the column now shows the same truth they'd measure.
+/// FR-134: Windows makes `ping.exe`'s own calls instead of starting it, because
+/// a probe per peer every 15 s was a process a second. `ROOMLERD_PING_SUBPROCESS=1`
+/// puts the subprocess back.
 pub struct OsPinger;
 
 #[async_trait]
 impl NetstackPinger for OsPinger {
     async fn ping(&self, dst: IpAddr, timeout: Duration) -> Result<Duration, String> {
+        #[cfg(windows)]
+        if tunnel_core::env::node_env("PING_SUBPROCESS").as_deref() != Some("1") {
+            return tokio::task::spawn_blocking(move || crate::icmp_win::echo(dst, timeout))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         let target = dst.to_string();
         let mut cmd = tokio::process::Command::new("ping");
         #[cfg(windows)]
@@ -159,6 +168,11 @@ pub struct DaemonState {
     /// config). Surfaces in `status()` so `roomler status` can say the device
     /// removes itself.
     ephemeral: bool,
+    /// FR-43 P3a — this process is a one-row Mac's GUI worker: it holds no
+    /// enrollment, and its hub and its `self_view` have only the stand-in
+    /// control plane behind them ([`crate::unenrolled`]). The root half holds
+    /// the machine's server and its host roles.
+    no_enrollment: bool,
     /// FR-27 — live remote-control sessions, written by every signalling
     /// loop through its `ViewerIndicator`. `None` in tests and in any daemon
     /// shape that never runs signalling.
@@ -558,6 +572,7 @@ impl DaemonState {
             remote_config: None,
             self_view: None,
             ephemeral: false,
+            no_enrollment: false,
             #[cfg(feature = "recording")]
             recorder: None,
             restart: None,
@@ -625,6 +640,26 @@ impl DaemonState {
     pub fn with_ephemeral(mut self, ephemeral: bool) -> Self {
         self.ephemeral = ephemeral;
         self
+    }
+
+    /// FR-43 P3a — this daemon is a GUI worker with no enrollment
+    /// ([`Self::no_enrollment`], the field).
+    pub fn with_no_enrollment(mut self, no_enrollment: bool) -> Self {
+        self.no_enrollment = no_enrollment;
+        self
+    }
+
+    /// FR-43 P3a — the answer to a verb only the root half can serve, on a
+    /// worker with no enrollment. At once: a verb that needs a server would
+    /// otherwise reach the stand-in, which discards it, and hang until its
+    /// deadline.
+    fn root_half_only(&self, what: &str) -> Option<Response> {
+        self.no_enrollment.then(|| Response::Error {
+            message: format!(
+                "on this Mac the root daemon holds the device's connection to the server, so \
+                 {what} goes to it: run this with `sudo`"
+            ),
+        })
     }
 
     /// FR-27 — attach the live remote-control session registry, so a thin
@@ -1078,7 +1113,7 @@ impl LocalApiState for DaemonState {
     fn rc_sessions(&self) -> Vec<tunnel_core::localapi::RcSessionInfo> {
         self.rc_sessions
             .as_ref()
-            .map(|r| r.list())
+            .map(|r| r.list_for_client())
             .unwrap_or_default()
     }
 
@@ -1142,6 +1177,9 @@ impl LocalApiState for DaemonState {
         transport: &str,
         start_transport: &str,
     ) -> Response {
+        if let Some(refused) = self.root_half_only("a forward") {
+            return refused;
+        }
         match self
             .tunnel_hub
             .create_forward(node, local, remote, transport, start_transport)
@@ -1153,6 +1191,9 @@ impl LocalApiState for DaemonState {
     }
 
     async fn create_socks5(&self, node: &str, local: u16, transport: &str) -> Response {
+        if let Some(refused) = self.root_half_only("a SOCKS5 listener") {
+            return refused;
+        }
         match self.tunnel_hub.create_socks5(node, local, transport).await {
             Ok(id) => Response::FlowCreated { id },
             Err(message) => Response::Error { message },
@@ -1168,6 +1209,9 @@ impl LocalApiState for DaemonState {
     }
 
     async fn route_add(&self, route: tunnel_core::localapi::RouteDescriptor) -> Response {
+        if let Some(refused) = self.root_half_only("a declared route") {
+            return refused;
+        }
         let Some(routes) = self.routes.as_ref() else {
             return Response::Error {
                 message: "declared routes are not available on this daemon".into(),
@@ -1180,6 +1224,9 @@ impl LocalApiState for DaemonState {
     }
 
     async fn set_device_name(&self, name: &str) -> Response {
+        if let Some(refused) = self.root_half_only("the device's name") {
+            return refused;
+        }
         let trimmed = name.trim();
         if trimmed.is_empty() {
             return Response::Error {
@@ -1252,6 +1299,9 @@ impl LocalApiState for DaemonState {
     /// FR-84 D1 — the atomic route edit; the reconciler's `replace` owns the
     /// validation and the one-write persistence.
     async fn route_update(&self, route: tunnel_core::localapi::RouteDescriptor) -> Response {
+        if let Some(refused) = self.root_half_only("a declared route") {
+            return refused;
+        }
         let Some(routes) = self.routes.as_ref() else {
             return Response::Error {
                 message: "declared routes are not available on this daemon".into(),
@@ -1413,6 +1463,9 @@ impl LocalApiState for DaemonState {
     /// for this argument alone while the line buffer in `serve_connection`
     /// holds the same bytes would claim a property the code does not have.
     async fn external_password_set(&self, password: &Secret) -> Response {
+        if let Some(refused) = self.root_half_only("the device's external-access password") {
+            return refused;
+        }
         let Some((path, lock)) = self.config_persist.as_ref() else {
             return Response::Error {
                 message: "config editing is not available on this daemon".into(),
@@ -1480,6 +1533,9 @@ impl LocalApiState for DaemonState {
     /// setup that a later set would silently reuse — reviving the OPAQUE
     /// identity of a credential the operator believed they had destroyed.
     async fn external_password_clear(&self) -> Response {
+        if let Some(refused) = self.root_half_only("the device's external-access password") {
+            return refused;
+        }
         let Some((path, lock)) = self.config_persist.as_ref() else {
             return Response::Error {
                 message: "config editing is not available on this daemon".into(),
@@ -1517,6 +1573,11 @@ impl LocalApiState for DaemonState {
     /// startup is exactly what the operator is checking for, and a snapshot
     /// would answer with the state they are trying to change.
     async fn external_password_status(&self) -> Response {
+        // FR-43 P3a — the person's file would answer "none set" for a device
+        // whose root half may hold one.
+        if let Some(refused) = self.root_half_only("the device's external-access password") {
+            return refused;
+        }
         let Some((path, lock)) = self.config_persist.as_ref() else {
             // No config path: report the build's capability truthfully and the
             // rest as unknown-but-closed. An `Error` here would make "is this
@@ -1831,6 +1892,9 @@ impl LocalApiState for DaemonState {
         asker: &tunnel_core::localapi::Asker,
         args: &tunnel_core::localapi::ConnectArgs,
     ) -> Response {
+        if let Some(refused) = self.root_half_only("`roomler connect`") {
+            return refused;
+        }
         match crate::hive::person_connect::open(asker, args).await {
             Ok((id, endpoint)) => Response::Connected { id, endpoint },
             Err(message) => Response::Error { message },
@@ -1873,6 +1937,9 @@ impl LocalApiState for DaemonState {
         command: &str,
         timeout_ms: u64,
     ) -> Response {
+        if let Some(refused) = self.root_half_only("a remote command") {
+            return refused;
+        }
         let Some(sink) = self.tunnel_hub.sink_now() else {
             return Response::Error {
                 message: "not connected to the server — remote commands need the control \
@@ -1941,6 +2008,9 @@ impl LocalApiState for DaemonState {
     /// The public key is the CALLER's; the daemon never sees the private half,
     /// so a grant observed anywhere along this path is useless on its own.
     async fn ssh_session(&self, node: &str, public_key: &str, session_secs: u64) -> Response {
+        if let Some(refused) = self.root_half_only("an SSH grant") {
+            return refused;
+        }
         let Some(sink) = self.tunnel_hub.sink_now() else {
             return Response::Error {
                 message: "not connected to the server — SSH grants need the control \
@@ -2011,14 +2081,6 @@ impl LocalApiState for DaemonState {
     /// the root half's, asked over its person socket
     /// ([`crate::person_socket::or_machine_view`]).
     async fn devices(&self, org: &str, query: &tunnel_core::localapi::DevicesQuery) -> Response {
-        let own = match &self.self_view {
-            Some(view) => view.devices(org, query).await,
-            None => Response::Upstream {
-                code: "unsupported".into(),
-                message: "this daemon was started without a server identity to ask".into(),
-                status: None,
-            },
-        };
         let req = tunnel_core::localapi::Request::Devices {
             org: org.to_string(),
             page: query.page,
@@ -2027,12 +2089,32 @@ impl LocalApiState for DaemonState {
             sort: query.sort.clone(),
             dir: query.dir.clone(),
         };
+        // FR-43 P3a — on a one-row Mac the worker has no server to ask, and its
+        // `self_view` holds the stand-in. The root half's answer is the only one.
+        if self.no_enrollment {
+            return crate::person_socket::machine_view(req).await;
+        }
+        let own = match &self.self_view {
+            Some(view) => view.devices(org, query).await,
+            None => Response::Upstream {
+                code: "unsupported".into(),
+                message: "this daemon was started without a server identity to ask".into(),
+                status: None,
+            },
+        };
         crate::person_socket::or_machine_view(own, req).await
     }
 
     /// FR-84 D5b — the mesh graph for the same set (and, FR-97 P2g, the
     /// machine's on a Mac's per-user half, as [`Self::devices`]).
     async fn mesh(&self, org: &str) -> Response {
+        let req = tunnel_core::localapi::Request::Mesh {
+            org: org.to_string(),
+        };
+        // FR-43 P3a — as [`Self::devices`].
+        if self.no_enrollment {
+            return crate::person_socket::machine_view(req).await;
+        }
         let own = match &self.self_view {
             Some(view) => view.mesh(org).await,
             None => Response::Upstream {
@@ -2041,9 +2123,6 @@ impl LocalApiState for DaemonState {
                 status: None,
             },
         };
-        let req = tunnel_core::localapi::Request::Mesh {
-            org: org.to_string(),
-        };
         crate::person_socket::or_machine_view(own, req).await
     }
 
@@ -2051,10 +2130,13 @@ impl LocalApiState for DaemonState {
     /// network fields of the status (overlay addresses, exit, MagicDNS) are the
     /// root half's ([`crate::person_socket::or_machine_status`]). Everywhere
     /// else, and on a half with a node of its own, the status is its own.
+    ///
+    /// FR-43 P3a — on a one-row Mac's worker, so are the identity and the link:
+    /// this process holds neither.
     async fn status_view(&self) -> NodeStatus {
         #[cfg(target_os = "macos")]
         {
-            crate::person_socket::or_machine_status(self.status()).await
+            crate::person_socket::or_machine_status(self.status(), self.no_enrollment).await
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -2616,6 +2698,116 @@ mod tests {
         assert!(matches!(
             bare.set_device_name("x").await,
             Response::Error { .. }
+        ));
+    }
+
+    /// FR-43 P3a — a worker with no enrollment answers every verb that needs a
+    /// server at once, with the way to reach the root half. The control is the
+    /// same verbs on an enrolled daemon: its rename lands in the file.
+    #[tokio::test]
+    async fn a_worker_with_no_enrollment_sends_a_server_verb_to_the_root_half() {
+        fn state(tag: &str, path: &std::path::Path) -> DaemonState {
+            let (_tx, rx) = watch::channel(view());
+            DaemonState::new(
+                String::new(),
+                "mac".into(),
+                DaemonMode::Service,
+                None,
+                Arc::new(AtomicBool::new(true)),
+                rx,
+                consent_broker(tag),
+                None,
+                crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+                empty_rtt_cache(),
+            )
+            .with_config_persist(path.to_path_buf(), Arc::new(tokio::sync::Mutex::new(())))
+        }
+        fn is_refusal(r: &Response) -> bool {
+            matches!(r, Response::Error { message } if message.contains("`sudo`"))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = crate::config::test_fixture();
+        cfg.machine_name = "from-the-file".into();
+        crate::config::save(&path, &cfg).unwrap();
+
+        let worker = state("p3a-worker", &path).with_no_enrollment(true);
+        assert!(is_refusal(
+            &worker.create_forward("n", 1, "r:1", "auto", "").await
+        ));
+        assert!(is_refusal(&worker.create_socks5("n", 1, "auto").await));
+        assert!(is_refusal(&worker.set_device_name("renamed").await));
+        assert!(is_refusal(&worker.exec_remote("n", "sh", "id", 1000).await));
+        assert!(is_refusal(&worker.ssh_session("n", "key", 60).await));
+        assert!(is_refusal(&worker.external_password_status().await));
+        assert!(is_refusal(&worker.external_password_clear().await));
+        assert_eq!(
+            crate::config::load(&path).unwrap().machine_name,
+            "from-the-file",
+            "a refused verb writes nothing"
+        );
+
+        let enrolled = state("p3a-enrolled", &path);
+        assert!(matches!(
+            enrolled.set_device_name("renamed").await,
+            Response::DeviceNameSet { .. }
+        ));
+        assert_eq!(crate::config::load(&path).unwrap().machine_name, "renamed");
+        assert!(matches!(
+            enrolled.external_password_status().await,
+            Response::ExternalPassword(_)
+        ));
+    }
+
+    /// FR-43 P3a — Devices and Mesh never reach the worker's own `self_view`,
+    /// whose row points at the stand-in. Off a Mac there is no root half to ask,
+    /// so the answer says the server is out of reach; the same label on the
+    /// same registry with the flag off is resolved against the worker's own row.
+    #[tokio::test]
+    #[cfg(not(target_os = "macos"))]
+    async fn a_worker_with_no_enrollment_never_asks_its_own_server() {
+        fn state(tag: &str, no_enrollment: bool) -> DaemonState {
+            let (_tx, rx) = watch::channel(view());
+            let registry: crate::self_view::OrgHttpRegistry =
+                Arc::new(Mutex::new(vec![crate::self_view::OrgHttp {
+                    label: "primary".into(),
+                    server_url: "http://127.0.0.1:9".into(),
+                    token: crate::token_slot::TokenSlot::new("stand-in-secret"),
+                    primary: true,
+                    enabled: true,
+                }]));
+            DaemonState::new(
+                String::new(),
+                "mac".into(),
+                DaemonMode::Service,
+                None,
+                Arc::new(AtomicBool::new(true)),
+                rx,
+                consent_broker(tag),
+                None,
+                crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+                empty_rtt_cache(),
+            )
+            .with_org_http(registry)
+            .with_no_enrollment(no_enrollment)
+        }
+        let q = tunnel_core::localapi::DevicesQuery::default();
+
+        let worker = state("p3a-views", true);
+        for answer in [
+            worker.devices("ghost", &q).await,
+            worker.mesh("ghost").await,
+        ] {
+            assert!(
+                matches!(answer, Response::Upstream { ref code, .. } if code == "server_unreachable"),
+                "{answer:?}"
+            );
+        }
+
+        let enrolled = state("p3a-views-control", false);
+        assert!(matches!(
+            enrolled.devices("ghost", &q).await,
+            Response::Upstream { ref code, .. } if code == "unknown_org"
         ));
     }
 

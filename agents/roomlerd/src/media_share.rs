@@ -35,6 +35,10 @@
 //!   * The owner leaving closes the pipeline: followers detach and
 //!     re-dispatch (first one becomes the new owner, the rest re-join) —
 //!     a one-time IDR hiccup instead of fragile in-place promotion.
+//!   * An owner whose capture cannot produce pixels (FR-80) tells every
+//!     follower why, and every later joiner as it joins (#3260). A follower
+//!     opens no capture of its own, so this is the only way its viewer
+//!     learns that there is no picture, and why.
 //!
 //! WebRTC-track sessions are excluded by design (mediasoup-style per-track
 //! REMB rate control stays per-session). Escape hatch:
@@ -169,6 +173,11 @@ struct PipelineInner {
     /// joiners so their stats badge is honest without waiting for the next
     /// owner-side refresh.
     video_info: Option<String>,
+    /// #3260 — why the owner's capture produces no pixels (FR-80), once the
+    /// owner knows. Such an owner never captures a frame, so it never
+    /// publishes `video_info`: without this a follower's viewer had a black
+    /// canvas and a stall, and blamed the network.
+    unavailable: Option<crate::capture::CaptureUnavailable>,
     /// Owner marks this when its pump exits; blocks late joins racing the
     /// registry removal.
     closed: bool,
@@ -337,6 +346,19 @@ impl Pipeline {
                 _ => None,
             }
         })
+    }
+
+    /// FR-135 R2 — the slowest screen among the viewers that have said. One
+    /// stream serves them all, and a viewer yet to measure has not asked for a
+    /// faster one, so it does not lift the floor (unlike [`Self::merged_fps_ask`]).
+    pub fn merged_viewer_hz(&self, own: Option<u32>) -> Option<u32> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .followers
+            .iter()
+            .filter_map(|f| f.sink.viewer_report.viewer_hz())
+            .chain(own)
+            .min()
     }
 
     /// Floor-merge of the Priority dial's relay resolution cap: the smallest
@@ -565,6 +587,25 @@ impl Pipeline {
             });
         }
     }
+
+    /// #3260 — the owner's capture cannot produce pixels, and `reason` says
+    /// why (FR-80). The owner tells its own controller; this tells every
+    /// follower's, and keeps the reason for the viewers that join later.
+    /// Each notice retries until its viewer's control channel takes it, as
+    /// the owner's does: a follower joins before its channels exist.
+    pub fn tell_unavailable(&self, reason: &crate::capture::CaptureUnavailable) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.unavailable = Some(reason.clone());
+        let targets: Vec<_> = inner
+            .followers
+            .iter()
+            .map(|f| (f.sink.session_id, f.sink.control_dc.clone()))
+            .collect();
+        drop(inner);
+        for (session, cdc) in targets {
+            crate::peer::spawn_capture_unavailable_notice(session, cdc, reason.clone());
+        }
+    }
 }
 
 impl Drop for Pipeline {
@@ -624,7 +665,8 @@ impl Drop for FollowerGuard {
 /// Join `key`'s pipeline as a follower. `None` when sharing is off, no
 /// pipeline owns the key, or the pipeline is closing. On success the
 /// follower's DC chunker task is running, a pipeline IDR is requested, and
-/// the last `rc:video-info` (if any) is replayed to this viewer.
+/// the last `rc:video-info` (if any) is replayed to this viewer, as is the
+/// owner's `rc:media-unavailable` (#3260).
 pub fn try_join(
     key: PipelineKey,
     sink: FollowerSink,
@@ -686,6 +728,13 @@ pub fn try_join(
             }
         });
     }
+    // #3260 — and, when the owner's capture has no picture, why. Read under
+    // the same lock as the push below, so an owner telling its followers at
+    // this moment tells this one either way, and only once.
+    let unavailable = guard
+        .unavailable
+        .clone()
+        .map(|reason| (reason, sink.control_dc.clone()));
     guard.followers.push(Follower {
         sink,
         send_tx,
@@ -699,6 +748,9 @@ pub fn try_join(
     guard.kf_needed = true;
     drop(guard);
     tracing::info!(%session_id, ?key, "media_share: joined shared encoder pipeline as follower");
+    if let Some((reason, cdc)) = unavailable {
+        crate::peer::spawn_capture_unavailable_notice(session_id, cdc, reason);
+    }
     Some(FollowerGuard {
         inner,
         session_id,
@@ -1040,6 +1092,145 @@ mod tests {
         assert_eq!(owner.follower_count(), 0);
     }
 
+    /// A control channel between two in-process peers: the device's end, and
+    /// every text message the viewer's end receives. The viewer opens it, as
+    /// a browser does, and every candidate travels in the SDP (no trickle),
+    /// as `tests/privacy_dc.rs` does.
+    async fn viewer_channel() -> (
+        [Arc<webrtc::peer_connection::RTCPeerConnection>; 2],
+        Arc<RTCDataChannel>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        use webrtc::api::APIBuilder;
+        use webrtc::peer_connection::configuration::RTCConfiguration;
+        let pc = || async {
+            Arc::new(
+                APIBuilder::new()
+                    .build()
+                    .new_peer_connection(RTCConfiguration::default())
+                    .await
+                    .expect("a peer connection"),
+            )
+        };
+        let (viewer, device) = (pc().await, pc().await);
+        let viewer_dc = viewer
+            .create_data_channel("control", None)
+            .await
+            .expect("a data channel");
+        let (heard_tx, heard) = tokio::sync::mpsc::unbounded_channel();
+        viewer_dc.on_message(Box::new(move |msg| {
+            let heard_tx = heard_tx.clone();
+            Box::pin(async move {
+                if msg.is_string
+                    && let Ok(s) = std::str::from_utf8(&msg.data)
+                {
+                    let _ = heard_tx.send(s.to_string());
+                }
+            })
+        }));
+        let (dc_tx, dc_rx) = tokio::sync::oneshot::channel();
+        let dc_tx = Mutex::new(Some(dc_tx));
+        device.on_data_channel(Box::new(move |dc| {
+            if let Some(tx) = dc_tx.lock().unwrap().take() {
+                let _ = tx.send(dc);
+            }
+            Box::pin(async {})
+        }));
+        let offer = viewer.create_offer(None).await.expect("an offer");
+        let mut gathered = viewer.gathering_complete_promise().await;
+        viewer
+            .set_local_description(offer)
+            .await
+            .expect("the offer");
+        let _ = gathered.recv().await;
+        let offer = viewer.local_description().await.expect("a local offer");
+        device
+            .set_remote_description(offer)
+            .await
+            .expect("the offer");
+        let answer = device.create_answer(None).await.expect("an answer");
+        let mut gathered = device.gathering_complete_promise().await;
+        device
+            .set_local_description(answer)
+            .await
+            .expect("the answer");
+        let _ = gathered.recv().await;
+        let answer = device.local_description().await.expect("a local answer");
+        viewer
+            .set_remote_description(answer)
+            .await
+            .expect("the answer");
+        let dc = tokio::time::timeout(Duration::from_secs(30), dc_rx)
+            .await
+            .expect("the control channel never reached the device")
+            .expect("the channel's sender");
+        ([viewer, device], dc, heard)
+    }
+
+    fn no_display() -> crate::capture::CaptureUnavailable {
+        crate::capture::CaptureUnavailable::new(
+            crate::capture::CaptureUnavailableCode::NoDisplay,
+            "no desktop session",
+        )
+    }
+
+    /// The viewer heard the owner's FR-80 reason once: the first message
+    /// within `WAIT`, and nothing more for two of the notice's retry periods.
+    async fn told_once(heard: &mut tokio::sync::mpsc::UnboundedReceiver<String>) {
+        const WAIT: Duration = Duration::from_secs(10);
+        let first = tokio::time::timeout(WAIT, heard.recv())
+            .await
+            .expect("the follower's viewer was never told why there is no picture")
+            .expect("the viewer's end closed");
+        assert!(
+            first.starts_with(r#"{"t":"rc:media-unavailable","code":"no_display","#),
+            "the owner's reason, word for word: {first}"
+        );
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(heard.try_recv().is_err(), "told once, not on every retry");
+    }
+
+    /// #3260 — an owner whose capture has no picture tells the followers it
+    /// already has why. Before it, a follower opened no capture, heard
+    /// nothing, and its viewer read the black canvas as a network fault.
+    /// Red without `tell_unavailable`'s delivery.
+    #[tokio::test]
+    async fn a_follower_is_told_why_its_owner_has_no_picture() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3260-FOLLOWER");
+        let owner = Pipeline::register(key, ObjectId::new());
+        let (pcs, dc, mut heard) = viewer_channel().await;
+        let follower = sink(ObjectId::new());
+        *follower.control_dc.lock().await = Some(dc);
+        let _guard = try_join(key, follower, 60).expect("join");
+        owner.tell_unavailable(&no_display());
+        told_once(&mut heard).await;
+        for pc in pcs {
+            let _ = pc.close().await;
+        }
+    }
+
+    /// #3260 — and a viewer that joins after the owner said so is told as it
+    /// joins. It joins before its control channel exists, as every follower
+    /// does (it registers while its peer is built), so the notice waits for
+    /// the channel. Red without `try_join`'s replay.
+    #[tokio::test]
+    async fn a_viewer_joining_later_is_told_too() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3260-JOINER");
+        let owner = Pipeline::register(key, ObjectId::new());
+        owner.tell_unavailable(&no_display());
+        let joiner = sink(ObjectId::new());
+        let control = joiner.control_dc.clone();
+        let _guard = try_join(key, joiner, 60).expect("join");
+        let (pcs, dc, mut heard) = viewer_channel().await;
+        *control.lock().await = Some(dc);
+        told_once(&mut heard).await;
+        for pc in pcs {
+            let _ = pc.close().await;
+        }
+    }
+
     #[tokio::test]
     async fn fan_out_gates_joiner_on_keyframe_then_streams() {
         let _s = serial();
@@ -1146,6 +1337,29 @@ mod tests {
         follower_report.store_fps_ask(120);
         assert_eq!(owner.merged_fps_ask(Some(144)), Some(120));
         assert_eq!(owner.merged_fps_ask(None), None);
+    }
+
+    /// FR-135 R2 — the slowest screen that has said holds the stream, and a
+    /// viewer yet to measure is no floor, or a late joiner would lift a cap the
+    /// owner's own screen set.
+    #[tokio::test]
+    async fn the_viewers_refresh_takes_the_slowest_that_said() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-VIEWER-HZ");
+        let owner = Pipeline::register(key, ObjectId::new());
+        assert_eq!(owner.merged_viewer_hz(None), None, "nobody said");
+        assert_eq!(owner.merged_viewer_hz(Some(144)), Some(144), "alone");
+        let s = sink(ObjectId::new());
+        let follower_report = s.viewer_report.clone();
+        let _g = try_join(key, s, 60).expect("join");
+        assert_eq!(
+            owner.merged_viewer_hz(Some(144)),
+            Some(144),
+            "a follower yet to measure"
+        );
+        follower_report.store_viewer_hz(60);
+        assert_eq!(owner.merged_viewer_hz(Some(144)), Some(60));
+        assert_eq!(owner.merged_viewer_hz(None), Some(60), "the owner yet to");
     }
 
     // P8 Phase 4 — the mixed-dial predicate: false with no followers,

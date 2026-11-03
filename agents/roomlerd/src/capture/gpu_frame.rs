@@ -27,7 +27,7 @@
 //! device where it cannot.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
 use windows::Win32::Graphics::Direct3D11::{
@@ -51,11 +51,12 @@ pub use super::zero_copy_enabled;
 
 /// FR-118 P3 — the encoders whose GPU-input form the capability probe proved,
 /// as the capture side sees them: the same list `encode::ffmpeg::gpu_input`
-/// gates its opens on, installed once by `caps::detect` before any session.
-static GPU_INPUT_CELLS: OnceLock<Vec<String>> = OnceLock::new();
+/// gates its opens on, installed by `caps::detect` before any session, and again
+/// only when a later try's answer is adopted with no session live (#3280).
+static GPU_INPUT_CELLS: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
 pub fn install_gpu_input_cells(names: Vec<String>) {
-    let _ = GPU_INPUT_CELLS.set(names);
+    *GPU_INPUT_CELLS.write().unwrap_or_else(|e| e.into_inner()) = names;
 }
 
 /// FR-118 P3 — the PCI vendor whose adapter a capture device belongs on: the
@@ -83,7 +84,8 @@ pub fn preferred_vendor(names: &[String]) -> Option<u32> {
 /// probe installed its cells, when no cell is proven, or when no adapter of
 /// that vendor is present.
 pub fn capture_adapter() -> Option<(IDXGIAdapter1, String)> {
-    adapter_of_vendor(preferred_vendor(GPU_INPUT_CELLS.get()?)?)
+    let vendor = preferred_vendor(&GPU_INPUT_CELLS.read().unwrap_or_else(|e| e.into_inner()))?;
+    adapter_of_vendor(vendor)
 }
 
 /// FR-118 P3 — a D3D11 device (BGRA support) on the first hardware adapter of

@@ -558,6 +558,10 @@ pub struct AgentCaps {
     ///   to the viewer's stage (macOS; a Linux system install, a Wayland
     ///   desktop). Until P3e-2 the viewer offered the toggle on Windows only,
     ///   by OS; it now follows this word, and an absent key still offers it.
+    /// * `encoder-cells` — #3267: cells this host learned not to open, because its
+    ///   probe died in them (`learned-deny`, naming each and how), or #3280: a probe
+    ///   short of time with no cell to name (`probe-short`). For a fleet read: the
+    ///   lists already leave them out, and no viewer control follows it.
     ///
     /// Empty from every agent before P0c: those agents claim what their lists
     /// say, so an absent key never means "unavailable".
@@ -622,12 +626,13 @@ impl Unavailable {
     /// The feature means nothing on this OS: hide the control.
     pub const NOT_APPLICABLE: &'static str = "not-applicable";
     /// The keys [`AgentCaps::unavailable`] may carry, in wire spelling.
-    pub const KEYS: [&'static str; 5] = [
+    pub const KEYS: [&'static str; 6] = [
         "audio",
         "clipboard",
         "clipboard-image-events",
         "sas",
         "display-match",
+        "encoder-cells",
     ];
 
     pub fn new(code: &str, reason: &str) -> Self {
@@ -1291,6 +1296,13 @@ pub enum RpcCap {
     /// is switched on (`ROOMLERD_RC_OVERLAY_AUTO`, default on). Not a prefix
     /// of another verb, nor another of it.
     RcOverlayAuto,
+    /// FR-135 R2 — this device states each session's plan on the control
+    /// channel (`rc:media-plan`) and takes the viewer's refresh back
+    /// (`rc:viewer-hz`), so a viewer can read silence on it as a fault, and
+    /// knows the second message will be understood. Advertised while it is
+    /// switched on (`ROOMLERD_MEDIA_PLAN`, default on). Not a prefix of another
+    /// verb, nor another of it.
+    MediaPlan,
 }
 
 impl RpcCap {
@@ -1345,11 +1357,12 @@ impl RpcCap {
             Self::KnowhowProbe => "knowhow-probe",
             Self::LocalRelay => "local-relay",
             Self::RcOverlayAuto => "rc-overlay-auto",
+            Self::MediaPlan => "media-plan",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 43] = [
+    pub const ALL: [RpcCap; 44] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1393,6 +1406,7 @@ impl RpcCap {
         Self::KnowhowProbe,
         Self::LocalRelay,
         Self::RcOverlayAuto,
+        Self::MediaPlan,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -2559,8 +2573,8 @@ pub struct Agent {
     /// the valid one?" has to be answerable from the row as well as the audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_code_rotated_at: Option<DateTime>,
-    /// Device config an operator has ASKED for, reconciled by the agent when
-    /// it next connects (`docs/remote-config.md` step 2).
+    /// Device config an operator has ASKED for, reconciled by the agent on
+    /// connect or on a save's nudge (`docs/remote-config.md` step 2).
     ///
     /// Desired state, not applied state: writing here records an intent, and
     /// the device remains free to refuse it — a device without
@@ -2806,7 +2820,7 @@ pub enum SshMode {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SshAccountMode {
-    /// The daemon's own identity — SYSTEM on Windows, root under systemd.
+    /// The daemon's identity: root under systemd; on Windows the worker's or the service's.
     ///
     /// The default *today* because it is what P2 can actually do, and it is
     /// why `SshMode::On` is root-equivalent until the P5 privilege-drop slice
@@ -3141,8 +3155,8 @@ pub enum ConfigOutcome {
     /// down is in `live` / `needs_restart` — see [`ConfigReport`].
     Applied,
     /// The device already matched; nothing was written. Distinct from
-    /// `Applied` with two empty lists so a reader can tell "converged" from
-    /// "applied nothing, and I am not sure why".
+    /// `Applied` with two empty lists, which says a key was written back to the
+    /// value the daemon runs (FR-132 P1c): the file changed and nothing waits.
     Noop,
     /// The device has not opted in: `remote_config_enabled` is off. This is
     /// gate 4 doing its job, not an error — the operator's move is to set the
@@ -3224,8 +3238,16 @@ pub struct KeyRotationRequest {
     /// lets a report about an EARLIER order be told apart from the answer to
     /// this one — compare ids, never outcomes alone.
     pub request_id: String,
+    /// The operator who ordered it. The zero id when no user asked: see
+    /// [`Self::trigger`].
     pub requested_by: ObjectId,
     pub requested_at: DateTime,
+    /// FR-40 P2 — `None`: an operator's order. `Some(why)`: the SERVER placed
+    /// it, and `requested_by` is the zero id — today only
+    /// [`KEY_ROTATION_TRIGGER_KEY_RETIRED`]. A string, not an enum, because
+    /// this rides the agent row every agent request reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
     /// When the order was actually pushed to a live socket. Absent = queued
     /// for the device's next connect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3307,6 +3329,61 @@ pub struct OverlayIdentity {
     #[serde(default)]
     pub key_epoch: u32,
     pub joined_at: DateTime,
+}
+
+/// FR-40 P2 — the [`KeyRotationRequest::trigger`] of an order the SERVER
+/// placed: the device presented a retired key at its join, and it advertises
+/// `key-rotate`, so it is ordered to rotate instead of being left off the mesh.
+pub const KEY_ROTATION_TRIGGER_KEY_RETIRED: &str = "key_retired";
+
+/// FR-40 P2 — one overlay public key a node has moved away from, kept on its
+/// [`OverlayNode`] row (`retired_keys`) so that the key can never be used to
+/// join this network again (`docs/overlay-key-rotation.md` § Retired keys).
+///
+/// Written at ONE moment only: an accepted join under a different key, which
+/// is the verified identity change (the P1c proof). Never on a device's
+/// report — a report is a claim, and it can be lost or raced.
+///
+/// ⚠️ PUBLIC halves only. The server never sees a private key.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RetiredKey {
+    /// Base64 WireGuard public key.
+    pub public_key: String,
+    /// The epoch the key carried while it was live.
+    #[serde(default)]
+    pub key_epoch: u32,
+    pub retired_at: DateTime,
+    pub reason: RetiredKeyReason,
+}
+
+/// Why a key left a node — forensic, never acted on.
+///
+/// `Deserialize` is hand-written for the reason [`RetiredKeyMode`]'s is: these
+/// entries ride the node row the netmap build lists for the WHOLE network, so
+/// a reason this build does not know must not fail every row read. Unknown
+/// decodes to [`Rejoin`](RetiredKeyReason::Rejoin), the claim-free arm.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetiredKeyReason {
+    /// The join that replaced it is the one that satisfied a standing
+    /// rotation order (an operator's, or the server's own for a retired key).
+    Rotate,
+    /// Any other key change at a join: a re-enrollment, a restored or
+    /// rolled-back config, a second install on the same machine.
+    Rejoin,
+}
+
+impl<'de> Deserialize<'de> for RetiredKeyReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "rotate" => RetiredKeyReason::Rotate,
+            _ => RetiredKeyReason::Rejoin,
+        })
+    }
 }
 
 /// Per-device roomler-SSH policy — gate 3 of four, the exact shape of
@@ -3994,6 +4071,65 @@ pub enum PeerRelayMode {
     On,
 }
 
+/// FR-40 P2 — the org's switch for refusing RETIRED overlay keys
+/// (`docs/overlay-key-rotation.md` § Retired keys).
+///
+/// The ledger ([`OverlayNode::retired_keys`]) records in every mode; this
+/// decides only what a join or a DERP registration presenting a retired key
+/// gets. A switch exists although a refusal fails closed: a WRONG refusal
+/// still costs a legitimate device the mesh, which is exactly what the P1b,
+/// P1c and P1d field runs found in this same flow.
+///
+/// `Deserialize` is hand-written, unlike [`OverlayAclMode`]'s, because this
+/// lives on the row EVERY join reads: a value a rolled-back build does not
+/// know must not fail the row and refuse the whole org's mesh. Unknown
+/// decodes to [`Off`](RetiredKeyMode::Off), today's behaviour.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RetiredKeyMode {
+    /// Nothing is checked: a retired key is admitted as before P2. The
+    /// default, so deploying P2 changes no device's behaviour.
+    #[default]
+    Off,
+    /// Check and LOG what would be refused (`would refuse — key_retired`), but
+    /// admit, and order nothing.
+    Warn,
+    /// Refuse `key_retired`, and order a device that advertises `key-rotate`
+    /// to rotate instead of leaving it off the mesh.
+    Enforce,
+}
+
+impl RetiredKeyMode {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Warn => "warn",
+            Self::Enforce => "enforce",
+        }
+    }
+
+    /// The STRICT parse, for an admin's write: a typo must be a 400, never a
+    /// quiet `off`. Only a stored row decodes leniently (the `Deserialize`).
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Self::Off),
+            "warn" => Some(Self::Warn),
+            "enforce" => Some(Self::Enforce),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RetiredKeyMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self::from_wire(&s).unwrap_or(Self::Off))
+    }
+}
+
 /// FR-19 gate 3 — may THIS device serve as an org relay for its tenant?
 /// Per-device and admin-set; the device's own `relay_server_enabled` (gate 4)
 /// is separate and device-local, so approving here does nothing on a device
@@ -4510,6 +4646,15 @@ pub enum ExternalRcAuditAction {
     /// session" is one join. What the DEVICE then decides — its own consent,
     /// its own ceiling — is the session's own audit trail, not this row.
     Session,
+    /// FR-52 P5 — an admin barred a person from a device (`approved:
+    /// Some(false)`) or let them back (`Some(true)`). `user_id` is the admin,
+    /// `principal` the person; a refused attempt carries `denied`.
+    Principal,
+    /// An action this build does not know, a newer server's. Read as itself,
+    /// so one new kind of row cannot fail a whole page of the log on an older
+    /// pod mid-roll.
+    #[serde(other)]
+    Other,
 }
 
 /// One external-access decision, granted or refused. TTL-expired after 90 days
@@ -4571,10 +4716,52 @@ pub struct ExternalRcAuditEvent {
     /// then decided.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<ObjectId>,
+    /// `principal` — the person the admin acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<ObjectId>,
 }
 
 impl ExternalRcAuditEvent {
     pub const COLLECTION: &'static str = "external_rc_audit";
+}
+
+/// FR-52 P5 — one person from outside, on one device: the org's lasting memory
+/// of who came in, and the row a revocation sits on.
+///
+/// It exists because [`ExternalRcAuditEvent`]s TTL out at 90 days: a "first
+/// session ever" read off them would come round every quarter. Per device, not
+/// per org, because the password is the device's, so a person proving a second
+/// device's password is a new fact.
+///
+/// ⚠️ A session makes the row and nothing else does. The people list joins
+/// `users` for a name at read time, so a route that could make a row for any id
+/// would read any account's name to any org admin.
+///
+/// No name of its own: the row has no TTL, and a name is the account's to
+/// change.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ExternalPrincipal {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub agent_id: ObjectId,
+    /// The outsider's own account.
+    pub user_id: ObjectId,
+    pub first_session_at: DateTime,
+    pub last_session_at: DateTime,
+    /// While set, this person is barred from this device (`gates` in the
+    /// extauth relay). A server gate, like the org's switch and the device's
+    /// approval: it stops an account, and it does not survive a compromised
+    /// server. Changing the device's password does both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<DateTime>,
+    /// The admin who barred them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_by: Option<ObjectId>,
+}
+
+impl ExternalPrincipal {
+    pub const COLLECTION: &'static str = "external_principals";
 }
 
 /// FR-52 P3 — why an external-access login step was refused.
@@ -4833,6 +5020,7 @@ mod external_access_tests {
             login_refused: None,
             login_detail: None,
             session_id: None,
+            principal: None,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert!(json.get("approved").is_none());
@@ -5521,10 +5709,15 @@ pub struct KeyRotationAuditEvent {
     pub id: Option<ObjectId>,
     pub tenant_id: ObjectId,
     pub agent_id: ObjectId,
-    /// Who asked.
+    /// Who asked. The zero id when no user did: see [`Self::trigger`].
     pub user_id: ObjectId,
     pub at: DateTime,
     pub request_id: String,
+    /// FR-40 P2 — `None`: an operator's order. `Some(why)`: the server's own
+    /// (today only [`KEY_ROTATION_TRIGGER_KEY_RETIRED`]), with the zero
+    /// `user_id`. Copied onto the order it audits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
     /// `pushed` (a live socket took it) or `queued` (the device was offline
     /// and will be ordered on connect). `None` on a refusal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6729,6 +6922,14 @@ pub struct OverlayNode {
     /// Bumped on key rotation (Phase 5). `0` at first join.
     #[serde(default)]
     pub key_epoch: u32,
+    /// FR-40 P2 — every key this node has moved away from, oldest first:
+    /// appended when a join under a DIFFERENT key is accepted, deduplicated by
+    /// key, capped at [`Self::MAX_RETIRED_KEYS`]. Kept on tombstones too, as
+    /// the forensic record. A join or a DERP registration presenting a key
+    /// found here, on any row of the network, is refused `key_retired` when
+    /// the org's [`OverlayNetwork::retired_key_mode`] is `enforce`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_keys: Vec<RetiredKey>,
     /// Current connectivity candidates (srflx / relay), as `host:port`
     /// strings the peer can dial. REPLACED on each `rc:overlay.endpoints`
     /// trickle from the relay coordinator.
@@ -6884,6 +7085,11 @@ pub struct OverlayNode {
 impl OverlayNode {
     pub const COLLECTION: &'static str = "overlay_nodes";
 
+    /// FR-40 P2 — how many retired keys a node row keeps (the newest win).
+    /// A device rotating weekly fills it in over a year; the cap only bounds
+    /// a pathological flapper (two installs fighting over one node).
+    pub const MAX_RETIRED_KEYS: i32 = 64;
+
     /// FR-97 P0b — the routes this node may carry for its peers: those an admin
     /// APPROVED **and** the device still ADVERTISES.
     ///
@@ -6960,6 +7166,12 @@ pub struct OverlayNetwork {
     /// is [`PeerRelayMode::Off`] so nothing is minted until an admin opts in.
     #[serde(default)]
     pub peer_relay_mode: PeerRelayMode,
+    /// FR-40 P2 — whether a join or a DERP registration presenting a RETIRED
+    /// overlay key is refused here. `#[serde(default)]` for the reason
+    /// `acl_mode` gives, and the default is [`RetiredKeyMode::Off`]: today's
+    /// behaviour, byte for byte, until an admin opts the org in.
+    #[serde(default)]
+    pub retired_key_mode: RetiredKeyMode,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
@@ -7348,6 +7560,23 @@ impl BlockList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-52 P5 — the stored spelling of the newest action, and an action from a
+    /// newer server read as `Other`, through BSON, which is how a page of the log
+    /// is read. One new kind of row must not fail the page on an older pod.
+    #[test]
+    fn an_audit_action_this_build_does_not_know_is_read_not_refused() {
+        assert_eq!(
+            bson::to_bson(&ExternalRcAuditAction::Principal).unwrap(),
+            bson::Bson::String("principal".into())
+        );
+        #[derive(Deserialize)]
+        struct Row {
+            action: ExternalRcAuditAction,
+        }
+        let row: Row = bson::from_document(bson::doc! { "action": "quorum_reached" }).unwrap();
+        assert_eq!(row.action, ExternalRcAuditAction::Other);
+    }
 
     /// #1882 — every policy row written before `rc_overlay` existed must read
     /// OFF: the default is the whole point, and it has to hold for the rows
@@ -7883,7 +8112,9 @@ mod tests {
                 "clipboard-image-events",
                 "sas",
                 // FR-97 P3e-2 — added, never renamed: an older viewer ignores it.
-                "display-match"
+                "display-match",
+                // #3267 — the same: no viewer asks for it, a fleet read does.
+                "encoder-cells"
             ]
         );
         assert_eq!(Unavailable::NOT_APPLICABLE, "not-applicable");
@@ -8005,6 +8236,7 @@ mod tests {
         assert_eq!(RpcCap::KnowhowProbe.wire(), "knowhow-probe");
         assert_eq!(RpcCap::LocalRelay.wire(), "local-relay");
         assert_eq!(RpcCap::RcOverlayAuto.wire(), "rc-overlay-auto");
+        assert_eq!(RpcCap::MediaPlan.wire(), "media-plan");
     }
 
     /// FR-90 P4-4-1 — `knowhow-tools` and `knowhow-scan` are two verbs: a
@@ -10566,6 +10798,24 @@ pub fn should_redeliver(
     }
 }
 
+/// FR-40 P2 — is a standing order being EXECUTED right now? Then a join that
+/// presents a retired key gets no second order: the one on the row is seconds
+/// from its answer (the P1b window, [`REDELIVER_AFTER_SECS`]). An order that
+/// is satisfied, answered, still queued, or delivered longer ago than that is
+/// not in flight, and a device presenting a retired key past it may be ordered
+/// again — under the per-device ceiling.
+pub fn order_in_flight(
+    request: &KeyRotationRequest,
+    report: Option<&KeyRotationReport>,
+    identity: Option<&OverlayIdentity>,
+    now: DateTime,
+) -> bool {
+    !order_is_satisfied(request, identity)
+        && report.is_none_or(|r| r.request_id != request.request_id)
+        && request.delivered_at.is_some()
+        && !should_redeliver(request, report, now)
+}
+
 #[cfg(test)]
 mod power_brief_tests {
     use super::*;
@@ -10603,5 +10853,163 @@ mod power_brief_tests {
         let back: SleepNotice = bson::from_document(b).expect("decode");
         assert_eq!(back, n);
         assert!(!back.power.by_policy(), "held: it slept past the hold");
+    }
+}
+
+/// FR-40 P2 — the retired-key shapes. Each rides a row that every join or
+/// every agent request reads, so each decodes leniently from storage, and the
+/// lock that nothing here carries a private key stays with them.
+#[cfg(test)]
+mod retired_key_tests {
+    use super::*;
+
+    fn network_doc(mode: Option<&str>) -> bson::Document {
+        let mut d = bson::doc! {
+            "tenant_id": ObjectId::new(),
+            "cidr": "100.64.0.0/10",
+            "next_host": 1_i64,
+            "mtu": 1280_i32,
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        if let Some(m) = mode {
+            d.insert("retired_key_mode", m);
+        }
+        d
+    }
+
+    /// A row from before P2 has no switch; a row written by a newer build may
+    /// hold a mode this one does not know. Both must decode, as `off` — a
+    /// failed decode here refuses every join of the org `network_unavailable`.
+    #[test]
+    fn a_missing_or_unknown_mode_reads_as_off() {
+        let read = |m| -> RetiredKeyMode {
+            bson::from_document::<OverlayNetwork>(network_doc(m))
+                .expect("the network row must decode")
+                .retired_key_mode
+        };
+        assert_eq!(read(None), RetiredKeyMode::Off);
+        assert_eq!(read(Some("enforce_strictly_v9")), RetiredKeyMode::Off);
+        assert_eq!(read(Some("warn")), RetiredKeyMode::Warn);
+        assert_eq!(read(Some("enforce")), RetiredKeyMode::Enforce);
+        assert_eq!(RetiredKeyMode::default(), RetiredKeyMode::Off);
+    }
+
+    /// An admin's write is parsed strictly: a typo is refused, never stored as
+    /// a quiet `off`. The wire strings are what the route and the docs name.
+    #[test]
+    fn the_admin_write_is_strict_and_the_wire_strings_are_locked() {
+        for m in [
+            RetiredKeyMode::Off,
+            RetiredKeyMode::Warn,
+            RetiredKeyMode::Enforce,
+        ] {
+            assert_eq!(RetiredKeyMode::from_wire(m.wire()), Some(m));
+            assert_eq!(serde_json::to_value(m).unwrap(), m.wire());
+        }
+        assert_eq!(RetiredKeyMode::Enforce.wire(), "enforce");
+        assert_eq!(RetiredKeyMode::from_wire("enforced"), None);
+        assert_eq!(RetiredKeyMode::from_wire("Enforce"), None);
+        assert_eq!(RetiredKeyMode::from_wire(""), None);
+    }
+
+    /// The ledger rides the node row the netmap build lists for the whole
+    /// network: a reason this build does not know must not fail that read.
+    #[test]
+    fn an_unknown_retirement_reason_reads_as_rejoin() {
+        let entry = |reason: &str| -> RetiredKey {
+            bson::from_document(bson::doc! {
+                "public_key": "OLD==",
+                "key_epoch": 2_i64,
+                "retired_at": DateTime::now(),
+                "reason": reason,
+            })
+            .expect("a ledger entry must decode")
+        };
+        assert_eq!(entry("rotate").reason, RetiredKeyReason::Rotate);
+        assert_eq!(entry("rejoin").reason, RetiredKeyReason::Rejoin);
+        assert_eq!(entry("revoked_v9").reason, RetiredKeyReason::Rejoin);
+        assert_eq!(
+            serde_json::to_value(RetiredKeyReason::Rotate).unwrap(),
+            "rotate"
+        );
+    }
+
+    /// A node row from before P2 decodes with an empty ledger and is written
+    /// back without the field: P2 changes no existing row's shape until a key
+    /// actually retires.
+    #[test]
+    fn a_pre_p2_node_row_has_an_empty_ledger_and_keeps_its_shape() {
+        let now = DateTime::now();
+        let row = bson::doc! {
+            "tenant_id": ObjectId::new(),
+            "node_ref": { "kind": "agent", "id": ObjectId::new() },
+            "network_id": ObjectId::new(),
+            "machine_id": "m",
+            "overlay_ip": "100.64.0.9",
+            "wg_public_key": "CURRENT==",
+            "status": "online",
+            "last_seen_at": now,
+            "created_at": now,
+            "updated_at": now,
+            "deleted_at": bson::Bson::Null,
+        };
+        let node: OverlayNode = bson::from_document(row).expect("decode");
+        assert!(node.retired_keys.is_empty());
+        let back = bson::to_document(&node).expect("encode");
+        assert!(!back.contains_key("retired_keys"), "{back:?}");
+    }
+
+    /// The order the SERVER places, and its audit row, name no user and say
+    /// why — and neither holds a private key: the only key-shaped field on
+    /// the order is the PUBLIC key it snapshots, and the audit row holds none.
+    #[test]
+    fn the_server_order_and_its_audit_row_hold_no_private_key() {
+        let req = KeyRotationRequest {
+            request_id: "r1".into(),
+            requested_by: ObjectId::from_bytes([0; 12]),
+            requested_at: DateTime::now(),
+            trigger: Some(KEY_ROTATION_TRIGGER_KEY_RETIRED.to_string()),
+            delivered_at: None,
+            public_key_before: Some("RETIRED==".into()),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["trigger"], "key_retired");
+        for k in v.as_object().unwrap().keys() {
+            let k = k.to_ascii_lowercase();
+            assert!(
+                !k.contains("secret") && !k.contains("priv"),
+                "a private-key-shaped field on the order: {k}"
+            );
+            assert!(
+                !k.contains("key") || k == "public_key_before",
+                "the only key on the order is the public one it snapshots: {k}"
+            );
+        }
+        // An operator's order keeps its pre-P2 shape: no `trigger` at all.
+        let mut operator = req.clone();
+        operator.trigger = None;
+        let v = serde_json::to_value(&operator).unwrap();
+        assert!(v.get("trigger").is_none(), "{v}");
+
+        let audit = KeyRotationAuditEvent {
+            id: None,
+            tenant_id: ObjectId::new(),
+            agent_id: ObjectId::new(),
+            user_id: ObjectId::from_bytes([0; 12]),
+            at: DateTime::now(),
+            request_id: "r1".into(),
+            trigger: Some(KEY_ROTATION_TRIGGER_KEY_RETIRED.to_string()),
+            dispatch: Some("pushed".into()),
+            denied: None,
+        };
+        let v = serde_json::to_value(&audit).unwrap();
+        for k in v.as_object().unwrap().keys() {
+            assert!(
+                !k.to_ascii_lowercase().contains("key"),
+                "the audit row stores no key of any kind: {k}"
+            );
+        }
+        assert_eq!(v["trigger"], "key_retired");
     }
 }

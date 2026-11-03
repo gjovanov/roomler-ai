@@ -65,8 +65,8 @@ flowchart LR
 ```
 
 **P1 — the DRM arm honours the pump's encode box.** `ScreenCapture::set_output_cap`
-(`agents/roomlerd/src/capture/mod.rs:398`) already exists for exactly this, and every pump calls it with its
-effective box (`peer.rs:4296`). macOS honours it; the DRM arm ignored it. Now the DRM worker reads the box on
+(`agents/roomlerd/src/capture/mod.rs:401`) already exists for exactly this, and every pump calls it with its
+effective box (`peer.rs:4372`). macOS honours it; the DRM arm ignored it. Now the DRM worker reads the box on
 every grab and takes the fused half read whenever half the source still covers it, whatever the policy says
 (`wants_half`, `agents/roomlerd/src/capture/drm_backend.rs:1329`; `set_output_cap`, `drm_backend.rs:1542`).
 A 4K scanout encoded at 1920×1012 is read at 2048×1080. A 1440p scanout for the same box keeps its full read,

@@ -474,6 +474,15 @@ pub enum OverlayJoinRefusal {
     NetworkUnavailable,
     /// A transient persistence failure. Retryable.
     StoreUnavailable,
+    /// FR-40 P2 — the presented WireGuard key was retired on this network (the
+    /// device rotated away from it), and the org refuses retired keys. Not
+    /// retryable under the same key: a device that advertises `key-rotate` is
+    /// ordered to rotate, and the join under its new key is admitted.
+    ///
+    /// Agents from 0.4.41 decode this as [`Unknown`](Self::Unknown), which they
+    /// log with the `detail` and never retry; older agents are never sent the
+    /// frame (`supports_join_refusal`).
+    KeyRetired,
     /// A reason this build does not know.
     Unknown,
 }
@@ -488,6 +497,7 @@ impl<'de> Deserialize<'de> for OverlayJoinRefusal {
             "address_space_exhausted" => OverlayJoinRefusal::AddressSpaceExhausted,
             "network_unavailable" => OverlayJoinRefusal::NetworkUnavailable,
             "store_unavailable" => OverlayJoinRefusal::StoreUnavailable,
+            "key_retired" => OverlayJoinRefusal::KeyRetired,
             _ => OverlayJoinRefusal::Unknown,
         })
     }
@@ -11458,6 +11468,28 @@ mod tests {
                 assert_eq!(reason, OverlayJoinRefusal::Unknown);
                 assert!(!reason.is_retryable());
                 assert_eq!(detail, "from a newer server");
+            }
+            other => panic!("expected OverlayJoinRefused, got {other:?}"),
+        }
+    }
+
+    /// FR-40 P2 — `key_retired` round-trips under its own wire string and is
+    /// not retryable: the same key is refused again, and the way out is the
+    /// rotation order, not another join. Every fielded agent from 0.4.41 on
+    /// runs the decoder above without this arm, so for them it is exactly the
+    /// `quota_exceeded_v9` case: `Unknown`, logged with the detail, no retry.
+    #[test]
+    fn key_retired_roundtrips_and_is_not_retryable() {
+        let m = ServerMsg::OverlayJoinRefused {
+            reason: OverlayJoinRefusal::KeyRetired,
+            detail: "this overlay key was retired".into(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""reason":"key_retired""#), "{s}");
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::OverlayJoinRefused { reason, .. } => {
+                assert_eq!(reason, OverlayJoinRefusal::KeyRetired);
+                assert!(!reason.is_retryable());
             }
             other => panic!("expected OverlayJoinRefused, got {other:?}"),
         }

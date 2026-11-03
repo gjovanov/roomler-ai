@@ -443,7 +443,7 @@ own starvation.
   3.0 → 0.68 M in 22 s at a paint age of 50–104 ms. V5 accounts for two of those
   cuts at most. The rest read `overproduced`, the classifier's verdict for the
   queue budget's gate, which is denominated in the same `pipe_bps`
-  (`peer.rs:7713`): the door FR-70 P1 was written for, opened this time by a
+  (`peer.rs:7908`): the door FR-70 P1 was written for, opened this time by a
   measurement rather than a seed. At 12:04:06 the shape repeated: one 106 ms
   block, 709,460, the arrival-rate clamp at 3.19 → 0.52 M, and 4.66 M delivered
   two seconds later. A does not touch this, because a blocked-send number is a
@@ -476,21 +476,21 @@ own starvation.
   So what cut the rate is the comparison reading the stand-in, and that is
   what V5b fixes. V5b does not remove the anchor. Until it climbs back, at
   ×1.1 per ten clean windows, `pipe_bps` still offers it to FR-59 P6's
-  contradiction (`governor.rs:777`), the encoder plan (`peer.rs:7686`), the
-  queue budget (`peer.rs:7713`) and the write-back. V5b also still reads the
+  contradiction (`governor.rs:777`), the encoder plan (`peer.rs:7881`), the
+  queue budget (`peer.rs:7908`) and the write-back. V5b also still reads the
   arrival rate itself for its 15 s TTL. That is why the onset decision may
   belong beside this one.
 
   ⚠️ **The stand-in reaches the pair memory: field-seen once.** When the learner
   holds no above-nominal stable rate, the write-back takes `pipe_bps` as the
-  session's evidence (`peer.rs:8985`–`8994`), and `pipe_bps`'s last source is
+  session's evidence (`peer.rs:9203`–`8994`), and `pipe_bps`'s last source is
   the stand-in (`governor.rs:648`). The 2026-10-30 12:19 session anchored at
   180,484, lost its goodput to the TTL at 12:20:50, and walked eight rungs down
   in 28 s: 180,484 → 164,076 → … → 84,195, the last one exact to the unit. It
   ended with `prior_bps=84195` and `goodput_bps=None`, and at 12:22:06 wrote
   `evidence=Some(84195) kept=84195` as a new entry. Nobody measured 84,195.
   FR-71's "next session 2.55 → 0.20 M" stays unconfirmed: its read did not pull
-  the write-back's line (`peer.rs:2111`–`2118`). V5b's second half closes the
+  the write-back's line (`peer.rs:2133`–`2118`). V5b's second half closes the
   stall's path into the memory.
 
   It does not settle an older tension, which is not part of this decision.

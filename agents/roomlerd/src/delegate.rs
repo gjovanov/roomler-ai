@@ -161,6 +161,47 @@ pub enum DelegateFrame {
         id: u64,
         info: Box<tunnel_core::localapi::KeepBusyInfo>,
     },
+    /// FR-43 P3a — worker → daemon: the worker's own log lines, as its upload
+    /// layer captured them. A worker with no enrollment has no row to upload
+    /// them on, so the daemon uploads them on its own, each marked as the
+    /// worker's ([`mark_worker_line`]). At most [`WORKER_LOG_LINES_PER_FRAME`]
+    /// a frame. An older daemon skips the frame, and the lines stay on the Mac.
+    WorkerLogs {
+        lines: Vec<crate::logs_upload::LogLine>,
+    },
+}
+
+/// FR-43 P3a — the most log lines one [`DelegateFrame::WorkerLogs`] carries.
+pub const WORKER_LOG_LINES_PER_FRAME: usize = 100;
+
+/// FR-43 P3a — the longest message a relayed worker line keeps, in bytes. With
+/// [`WORKER_LOG_LINES_PER_FRAME`] it bounds a frame, and it keeps a line well
+/// under the server's per-line limit, which refuses a whole batch over it.
+pub const WORKER_LOG_MSG_MAX: usize = 8 * 1024;
+
+/// FR-43 P3a — the field and value that mark a line as the GUI worker's on the
+/// daemon's row.
+pub const WORKER_LOG_FIELD: &str = "process";
+pub const WORKER_LOG_PROCESS: &str = "gui-worker";
+
+/// FR-43 P3a — cut `line`'s message to [`WORKER_LOG_MSG_MAX`] bytes, on a
+/// character boundary.
+pub fn trim_worker_line(line: &mut crate::logs_upload::LogLine) {
+    if line.msg.len() > WORKER_LOG_MSG_MAX {
+        let mut end = WORKER_LOG_MSG_MAX;
+        while !line.msg.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.msg.truncate(end);
+    }
+}
+
+/// FR-43 P3a — a worker's line as the daemon uploads it: trimmed, and marked as
+/// the worker's. The daemon sets the mark, so a worker cannot pass a line off
+/// as the daemon's own.
+pub fn mark_worker_line(line: &mut crate::logs_upload::LogLine) {
+    trim_worker_line(line);
+    line.fields.insert(WORKER_LOG_FIELD, WORKER_LOG_PROCESS);
 }
 
 /// FR-92 — how long the daemon waits for the worker's answer to a
@@ -469,6 +510,10 @@ struct Inner {
         >,
     >,
     next_keep_busy_ask: std::sync::atomic::AtomicU64,
+    /// FR-43 P3a — where a worker's log lines go: the daemon's uploader for
+    /// them, on its own enrollment. `None` (the default, and every Mac not on
+    /// `macos_one_row`) drops them: such a worker uploads its own.
+    worker_logs: Mutex<Option<tokio::sync::mpsc::Sender<crate::logs_upload::LogLine>>>,
 }
 
 /// `chown` a path to `uid`, keeping its existing group.
@@ -499,6 +544,36 @@ impl DelegateHost {
     /// without a source nothing is pushed.
     pub fn set_overlay_footprint(&self, source: FootprintSource) {
         *self.inner.footprint.lock().expect("footprint mutex") = Some(source);
+    }
+
+    /// FR-43 P3a — upload an attached worker's log lines through `sink`.
+    pub fn set_worker_log_sink(
+        &self,
+        sink: tokio::sync::mpsc::Sender<crate::logs_upload::LogLine>,
+    ) {
+        *self.inner.worker_logs.lock().expect("worker_logs mutex") = Some(sink);
+    }
+
+    /// FR-43 P3a — a worker's log lines, marked as its own, into the sink. A
+    /// full sink drops the rest of the frame: the lines are on the Mac's disk
+    /// either way, and waiting here would stall the session frames behind them.
+    fn worker_logs(&self, lines: Vec<crate::logs_upload::LogLine>) {
+        let Some(sink) = self
+            .inner
+            .worker_logs
+            .lock()
+            .expect("worker_logs mutex")
+            .clone()
+        else {
+            return;
+        };
+        for mut line in lines.into_iter().take(WORKER_LOG_LINES_PER_FRAME) {
+            mark_worker_line(&mut line);
+            if sink.try_send(line).is_err() {
+                tracing::debug!("delegation: the worker's log queue is full; dropped the rest");
+                return;
+            }
+        }
     }
 
     /// The footprint frame to push to the worker, if the source holds blocks
@@ -995,6 +1070,8 @@ impl DelegateHost {
                 // of this daemon. Data for that caller only; nothing here
                 // reaches the control WS.
                 Ok(DelegateFrame::KeepBusyTold { id, info }) => self.keep_busy_told(id, *info),
+                // FR-43 P3a — a worker with no enrollment's log lines.
+                Ok(DelegateFrame::WorkerLogs { lines }) => self.worker_logs(lines),
                 Ok(DelegateFrame::WorkerCaps { caps }) => {
                     tracing::info!(
                         permissions = ?caps.permissions,
@@ -1108,7 +1185,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 /// local" is exactly the threat this secret exists for. Length is compared
 /// first and in variable time on purpose: the length of a hex secret is not a
 /// secret.
-fn secret_eq(expected: &str, offered: &str) -> bool {
+pub(crate) fn secret_eq(expected: &str, offered: &str) -> bool {
     use subtle::ConstantTimeEq;
     let a = expected.as_bytes();
     let b = offered.as_bytes();
@@ -1175,6 +1252,90 @@ mod tests {
         drop(cwr);
         drop(lines);
         task.await.unwrap();
+    }
+
+    fn log_line(msg: &str, fields: bson::Document) -> crate::logs_upload::LogLine {
+        crate::logs_upload::LogLine {
+            ts: bson::DateTime::now(),
+            level: crate::logs_upload::LogLevel::Info,
+            target: "roomlerd::signaling".into(),
+            msg: msg.into(),
+            fields,
+        }
+    }
+
+    /// FR-43 P3a — an attached worker's log lines reach the daemon's sink, each
+    /// marked as the worker's by the daemon, whatever the worker put in the
+    /// field, and a message too long for the server is cut. The control is the
+    /// same frame with no sink: nothing is kept.
+    #[tokio::test]
+    async fn a_workers_log_lines_reach_the_sink_marked_as_its_own() {
+        for with_sink in [true, false] {
+            let host = DelegateHost::new();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            if with_sink {
+                host.set_worker_log_sink(tx);
+            } else {
+                drop(tx);
+            }
+            let secret = host.mint();
+            let (client, server) = tokio::io::duplex(1 << 20);
+            let (rd, wr) = tokio::io::split(server);
+            let h = host.clone();
+            let task =
+                tokio::spawn(async move { h.serve(&secret, Box::new(rd), Box::new(wr)).await });
+            let (crd, mut cwr) = tokio::io::split(client);
+            let mut lines = BufReader::new(crd).lines();
+            assert!(
+                lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .contains("\"attached\"")
+            );
+
+            let spoofed = bson::doc! { WORKER_LOG_FIELD: "daemon", "session": "s1" };
+            let frame = DelegateFrame::WorkerLogs {
+                lines: vec![
+                    log_line("attached", spoofed),
+                    log_line(&"é".repeat(WORKER_LOG_MSG_MAX), bson::Document::new()),
+                ],
+            };
+            write_frame(&mut cwr, &frame).await.unwrap();
+            // A ping behind it: its pong proves the frame was read.
+            cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+            assert!(
+                lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .contains("\"pong\"")
+            );
+
+            if with_sink {
+                let first = rx.recv().await.unwrap();
+                assert_eq!(first.msg, "attached");
+                assert_eq!(
+                    first.fields.get_str(WORKER_LOG_FIELD),
+                    Ok(WORKER_LOG_PROCESS)
+                );
+                assert_eq!(first.fields.get_str("session"), Ok("s1"));
+                let second = rx.recv().await.unwrap();
+                assert!(second.msg.len() <= WORKER_LOG_MSG_MAX);
+                assert!(second.msg.len() > WORKER_LOG_MSG_MAX - 4);
+                assert_eq!(
+                    second.fields.get_str(WORKER_LOG_FIELD),
+                    Ok(WORKER_LOG_PROCESS)
+                );
+            } else {
+                assert!(rx.try_recv().is_err(), "no sink keeps nothing");
+            }
+            drop(cwr);
+            drop(lines);
+            task.await.unwrap();
+        }
     }
 
     /// #1882 — the source a test daemon's footprint is read from. A static,
@@ -1722,6 +1883,17 @@ fn msg_kind(msg: &ClientMsg) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
+/// FR-43 P2b-2 — the delegation channel, if the session was built on it. The
+/// channel is the whole connection's, and a worker also serves its own sessions
+/// under its own row, so `built_on` (the session's own sender, [`crate::peer`]'s
+/// seam) tells them apart. With no session held, the channel, as ever.
+pub fn delegation_for_session<'a>(
+    delegated: Option<&'a tokio::sync::mpsc::Sender<ClientMsg>>,
+    built_on: Option<&tokio::sync::mpsc::Sender<ClientMsg>>,
+) -> Option<&'a tokio::sync::mpsc::Sender<ClientMsg>> {
+    delegated.filter(|tx| built_on.is_none_or(|own| own.same_channel(tx)))
+}
+
 #[cfg(test)]
 mod routing_tests {
     use super::*;
@@ -1729,6 +1901,31 @@ mod routing_tests {
 
     fn oid() -> bson::oid::ObjectId {
         bson::oid::ObjectId::new()
+    }
+
+    /// #3245 — what a device end says about a session takes the road the session
+    /// was built on: `delegated.unwrap_or(outbound_tx).clone()`.
+    #[test]
+    fn a_session_says_its_end_on_the_road_it_was_built_on() {
+        let (channel, _keep_channel) = tokio::sync::mpsc::channel::<ClientMsg>(1);
+        let (own_ws, _keep_own_ws) = tokio::sync::mpsc::channel::<ClientMsg>(1);
+        assert!(
+            delegation_for_session(None, Some(&own_ws)).is_none(),
+            "every host that is not a worker"
+        );
+        assert!(
+            delegation_for_session(Some(&channel), Some(&own_ws)).is_none(),
+            "a worker's own session, on its own row"
+        );
+        let built_on_it = channel.clone();
+        assert!(
+            delegation_for_session(Some(&channel), Some(&built_on_it)).is_some(),
+            "a delegated session"
+        );
+        assert!(
+            delegation_for_session(Some(&channel), None).is_some(),
+            "no session held"
+        );
     }
 
     /// The five that make a remote-desktop session, and nothing else.

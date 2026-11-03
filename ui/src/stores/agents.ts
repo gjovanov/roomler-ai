@@ -8,6 +8,7 @@ import { canManageOrgSettings } from '@/utils/permissions'
 import { isKeepBusyPattern, type KeepBusyPattern } from '@/composables/keepBusy'
 import type { AgentReleaseBrief } from '@/utils/updateStall'
 import type { PowerBrief, SleepView } from '@/utils/devicePresence'
+import type { ExternalAuditEntry, ExternalPrincipal } from '@/utils/externalAudit'
 
 /**
  * The three org-level switches (`exec-settings`, `ssh-settings`,
@@ -419,11 +420,11 @@ export type ExecMode = 'off' | 'on'
  *
  *  Deliberately separate from {@link AccessPolicy}: that grants screen-view,
  *  and "may watch your screen" must never be the same checkbox as "may run a
- *  root shell". Commands inherit the daemon's identity — root under
- *  systemd; on Windows the console-session worker's: the signed-in user on an
- *  attended install, SYSTEM in SystemContext mode (FR-94 makes SYSTEM the
- *  default) — so turning `mode` on is
- *  granting root on that device, which the dialog says in those words. */
+ *  root shell". A command runs as root under systemd; on Windows as SYSTEM
+ *  through the device's service once it is anchored (FR-94), and otherwise as
+ *  the console-session worker: the signed-in user on an attended install,
+ *  SYSTEM in SystemContext mode. So turning `mode` on is granting that identity
+ *  on that device, which the dialog says in those words. */
 export interface ExecPolicy {
   mode: ExecMode
   /** May this device ORIGINATE commands against others (`roomler exec` from
@@ -453,8 +454,8 @@ export type SshMode = 'off' | 'on'
  *  `SshAccountMode`. `daemon` means root under systemd. On Windows it means
  *  the console-session worker — the signed-in user on an attended install,
  *  SYSTEM in SystemContext mode — and `console_user` is refused on an
- *  attended install (it needs SYSTEM's `WTSQueryUserToken`). The SSH dialog
- *  still says "SYSTEM"; correcting it is FR-94's SSH follow-up (§8). On
+ *  attended install (it needs SYSTEM's `WTSQueryUserToken`), unless the device
+ *  serves SSH through its SYSTEM service (FR-105), as the SSH dialog says. On
  *  Linux and macOS `console_user` is the person at the device's screen
  *  (FR-97 P5a), for an agent that says `console-user`. */
 export type SshAccountMode = 'daemon' | 'console_user' | 'named'
@@ -543,8 +544,9 @@ export type RemoteConfigState =
   | 'refused'
   /** The device tried and failed; `report.detail` says why. */
   | 'failed'
-  /** Waiting on the device to answer about THIS revision (includes "it has
-   *  not reconnected yet" — delivery is reconcile-on-connect). */
+  /** Waiting on the device to answer about THIS revision. A connected device
+   *  answers within seconds; an offline one when it next connects, which is
+   *  how every device converges (reconcile-on-connect). */
   | 'pending'
   /** The agent applies pushed config but predates `config-report`, so it will
    *  never say what it did. Distinct from `pending` because waiting is futile
@@ -1774,9 +1776,10 @@ export const useAgentStore = defineStore('agents', () => {
 
   /** Record the device config an operator wants (`docs/remote-config.md`).
    *
-   *  This writes an INTENT, never a fact. The device reconciles it when it
-   *  next connects and is free to refuse — so the response must NOT be read
-   *  back as "this device now has exec on". Re-fetch and read
+   *  This writes an INTENT, never a fact. A connected device hears at once,
+   *  an offline one when it next connects, and either is free to refuse — so
+   *  the response must NOT be read back as "this device now has exec on".
+   *  Re-fetch and read
    *  `remote_config.state` for that; until the device answers, the honest
    *  answer is `pending`.
    *
@@ -1877,6 +1880,47 @@ export const useAgentStore = defineStore('agents', () => {
     return { items: resp.items, total: resp.total }
   }
 
+  /** FR-52 P5 — every decision about letting someone from outside the org onto
+   *  a device, the refusals included. Requires `VIEW_REMOTE_AUDIT`. */
+  async function fetchExternalAudit(
+    tenantId: string,
+    opts: { page?: number; perPage?: number } = {},
+  ): Promise<{ items: ExternalAuditEntry[]; total: number }> {
+    const q = new URLSearchParams()
+    q.set('page', String(opts.page ?? 1))
+    q.set('per_page', String(opts.perPage ?? 50))
+    const resp = await api.get<{ items: ExternalAuditEntry[]; total: number }>(
+      `/tenant/${tenantId}/external-rc-audit?${q.toString()}`,
+    )
+    return { items: resp.items, total: resp.total }
+  }
+
+  /** FR-52 P5 — who has come in from outside, device by device. The same
+   *  `VIEW_REMOTE_AUDIT` as the log it sits beside. */
+  async function fetchExternalPrincipals(
+    tenantId: string,
+    opts: { page?: number; perPage?: number } = {},
+  ): Promise<{ items: ExternalPrincipal[]; total: number }> {
+    const q = new URLSearchParams()
+    q.set('page', String(opts.page ?? 1))
+    q.set('per_page', String(opts.perPage ?? 50))
+    const resp = await api.get<{ items: ExternalPrincipal[]; total: number }>(
+      `/tenant/${tenantId}/external-principals?${q.toString()}`,
+    )
+    return { items: resp.items, total: resp.total }
+  }
+
+  /** FR-52 P5 — bar a person from a device, or let them back. `MANAGE_AGENTS` to
+   *  bar; letting back is a grant, so that takes `REMOTE_CONTROL` too. */
+  async function setExternalPrincipal(
+    tenantId: string,
+    agentId: string,
+    userId: string,
+    revoked: boolean,
+  ): Promise<void> {
+    await api.put(`/tenant/${tenantId}/agent/${agentId}/external-principals/${userId}`, { revoked })
+  }
+
   /** P8 — what devices reported doing inside their sessions.
    *
    *  `grantId` narrows to ONE session, which is how a reader gets from an
@@ -1968,6 +2012,9 @@ export const useAgentStore = defineStore('agents', () => {
     updateSshPolicy,
     updateDesiredConfig,
     fetchSshAudit,
+    fetchExternalAudit,
+    fetchExternalPrincipals,
+    setExternalPrincipal,
     fetchSshActivity,
     execOnAgent,
     execOnFleet,

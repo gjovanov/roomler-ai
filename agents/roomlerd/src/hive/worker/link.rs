@@ -8,12 +8,14 @@
 //! | Piece | As built |
 //! |---|---|
 //! | the writer | one per side, behind a lock, so a frame is never written into another; a descriptor goes on the second channel before the frame that names it, under the same lock, so the Nth descriptor is always the Nth hand-over's |
-//! | a call | an id from a counter, a waiter for its answer, and a bound on the wait ([`CALL_WAIT`]) |
+//! | a call | an id from a counter, a waiter for its answer, and a bound on the wait ([`Role::wait_of`]) |
 //! | the end | every call still waiting fails at once, as the channel goes, and every later one at its start |
-//! | lost | a call that cannot be sent, or that goes unanswered within its bound, takes the link for lost, with why ([`Link::lost`]): the daemon's side then ends that worker's life, as a channel that failed ends it, rather than hand it what it can no longer serve |
+//! | lost | a call that cannot be sent, or that goes unanswered within its bound, takes the link for lost, with why ([`Linked::lost`]): the daemon's side then ends that worker's life, as a channel that failed ends it, rather than hand it what it can no longer serve. Nothing on a worker's side watches its link, so a worker's own call past its bound fails alone |
+//! | its role | P8-2d-0 — whose calls it carries ([`Role`]): a session's worker's ([`Link`]), or the device's ([`DeviceLink`], P8-2d-1). Each takes its own calls alone |
 
 #[cfg(worker_calls)]
 use std::collections::HashMap;
+use std::marker::PhantomData;
 #[cfg(all(worker_calls, unix))]
 use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(worker_calls)]
@@ -31,12 +33,114 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(worker_calls)]
-use super::{Answer, Call};
+use super::{Answer, Call, DeviceAnswer, DeviceCall};
 use super::{Msg, send};
+#[cfg(worker_calls)]
+use crate::hive::sidecar::HELPER_TIMEOUT;
+#[cfg(worker_calls)]
+use crate::hive::supervisor::LEASE_WAIT;
 
-/// How long a call waits for its answer.
+/// FR-90 P8-2d-0 — whose calls a link carries: a session's worker's, every
+/// call so far, or (P8-2d-1) the device's own worker's. Each role's calls
+/// are a type of their own, and a link takes one role's alone, so a device's
+/// call is never handed to a session's worker, nor a session's to the
+/// device's.
+pub(crate) trait Role: Send + Sync + 'static {
+    #[cfg(worker_calls)]
+    type Call: Send + 'static;
+    #[cfg(worker_calls)]
+    type Answer: Send + 'static;
+    /// How long a call of this role waits for its answer.
+    #[cfg(worker_calls)]
+    const WAIT: Duration;
+    /// How long this `_call` waits for its answer: [`Self::WAIT`], unless its
+    /// role says otherwise.
+    #[cfg(worker_calls)]
+    fn wait_of(_call: &Self::Call) -> Duration {
+        Self::WAIT
+    }
+    /// The frame a call of this role goes in.
+    #[cfg(worker_calls)]
+    fn call_frame(id: u64, call: Self::Call) -> Msg;
+    /// The frame its answer goes in.
+    #[cfg(worker_calls)]
+    fn answer_frame(id: u64, answer: Self::Answer) -> Msg;
+}
+
+/// A session's worker: its endpoints, its egress fronts, its toolbelt and
+/// its sidecar.
+pub(crate) enum SessionRole {}
+
+impl Role for SessionRole {
+    #[cfg(worker_calls)]
+    type Call = Call;
+    #[cfg(worker_calls)]
+    type Answer = Answer;
+    #[cfg(worker_calls)]
+    const WAIT: Duration = CALL_WAIT;
+    #[cfg(worker_calls)]
+    fn wait_of(call: &Call) -> Duration {
+        match call {
+            Call::SidecarAdmit { .. } => ADMIT_WAIT,
+            _ => Self::WAIT,
+        }
+    }
+    #[cfg(worker_calls)]
+    fn call_frame(id: u64, call: Call) -> Msg {
+        Msg::Call { id, call }
+    }
+    #[cfg(worker_calls)]
+    fn answer_frame(id: u64, answer: Answer) -> Msg {
+        Msg::Answer { id, answer }
+    }
+}
+
+/// FR-90 P8-2d-0 — the device's own worker: the replica store and stream,
+/// the viewer's peer, the prober's measure (decision 63). P8-2d-1 starts it
+/// ([`super::device`]).
+#[cfg(worker_calls)]
+pub(crate) enum DeviceRole {}
+
+#[cfg(worker_calls)]
+impl Role for DeviceRole {
+    type Call = DeviceCall;
+    type Answer = DeviceAnswer;
+    const WAIT: Duration = DEVICE_CALL_WAIT;
+    fn call_frame(id: u64, call: DeviceCall) -> Msg {
+        Msg::DeviceCall { id, call }
+    }
+    fn answer_frame(id: u64, answer: DeviceAnswer) -> Msg {
+        Msg::DeviceAnswer { id, answer }
+    }
+}
+
+/// A session's worker's link: what every call so far goes on.
+pub(crate) type Link = Linked<SessionRole>;
+
+/// FR-90 P8-2d-0 — the device's worker's link, which P8-2d-1 makes.
+#[cfg(worker_calls)]
+pub(crate) type DeviceLink = Linked<DeviceRole>;
+
+/// How long a session's worker's call waits for its answer.
 #[cfg(worker_calls)]
 pub(crate) const CALL_WAIT: Duration = Duration::from_secs(10);
+
+/// #3305 — how long a worker's [`Call::SidecarAdmit`] waits for its answer: past
+/// all the daemon may take to give one, the server's word ([`LEASE_WAIT`]) and
+/// then the key helper's time limit ([`HELPER_TIMEOUT`]). At [`CALL_WAIT`] a call
+/// on a slow word came back refused where a daemon-hosted one went on. Only the
+/// worker waits this long, so it hides no hung worker: the daemon's own calls and
+/// its beats keep their bounds.
+#[cfg(worker_calls)]
+pub(crate) const ADMIT_WAIT: Duration =
+    Duration::from_secs(LEASE_WAIT.as_secs() + HELPER_TIMEOUT.as_secs() + 5);
+
+/// FR-90 P8-2d-1 — how long a device's call waits for its answer: past a
+/// measure's own deadline. A bound of that deadline or less would take a
+/// healthy worker for lost at every probe of a host that does not answer.
+#[cfg(worker_calls)]
+pub(crate) const DEVICE_CALL_WAIT: Duration =
+    Duration::from_secs(roomler_ai_remote_control::knowhow::probe_limits::TIMEOUT_SECS + 5);
 
 /// What one side writes with: its half of the channel and, the daemon's, the
 /// second channel, the one descriptors go on. Windows has no second channel
@@ -47,19 +151,20 @@ struct Writer {
     descriptors: Option<UnixStream>,
 }
 
-/// One side's end of a worker's channel.
-pub(crate) struct Link {
+/// One side's end of a worker's channel, carrying `R`'s calls (P8-2d-0).
+pub(crate) struct Linked<R: Role> {
     writer: tokio::sync::Mutex<Writer>,
     #[cfg(worker_calls)]
-    waiting: Mutex<Option<HashMap<u64, oneshot::Sender<Answer>>>>,
+    waiting: Mutex<Option<HashMap<u64, oneshot::Sender<R::Answer>>>>,
     #[cfg(worker_calls)]
     next: AtomicU64,
     /// Cancelled as a call takes the link for lost, `why` set first.
     lost: CancellationToken,
     why: std::sync::Mutex<Option<String>>,
+    role: PhantomData<fn() -> R>,
 }
 
-impl Link {
+impl<R: Role> Linked<R> {
     /// The daemon's side: its writing half and (with the vault) the second
     /// channel.
     pub(crate) fn daemon(
@@ -80,6 +185,7 @@ impl Link {
             next: AtomicU64::new(1),
             lost: CancellationToken::new(),
             why: std::sync::Mutex::new(None),
+            role: PhantomData,
         }
     }
 
@@ -97,6 +203,7 @@ impl Link {
             next: AtomicU64::new(1),
             lost: CancellationToken::new(),
             why: std::sync::Mutex::new(None),
+            role: PhantomData,
         }
     }
 
@@ -129,7 +236,7 @@ impl Link {
     /// A call's id, registered among those awaiting an answer: `None` where
     /// the channel is already gone.
     #[cfg(worker_calls)]
-    fn register(&self) -> Option<(u64, oneshot::Receiver<Answer>)> {
+    fn register(&self) -> Option<(u64, oneshot::Receiver<R::Answer>)> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
@@ -137,28 +244,28 @@ impl Link {
         Some((id, rx))
     }
 
-    /// Once a call's frame is sent (or failed): its answer, within
-    /// [`CALL_WAIT`]. A failed send, or one unanswered in time, takes the
-    /// link for lost.
+    /// Once a call's frame is sent (or failed): its answer, within `wait`. A
+    /// failed send, or one unanswered in time, takes the link for lost.
     #[cfg(worker_calls)]
     async fn finish_call(
         &self,
         id: u64,
-        rx: oneshot::Receiver<Answer>,
+        rx: oneshot::Receiver<R::Answer>,
         sent: std::io::Result<()>,
-    ) -> Result<Answer, String> {
+        wait: Duration,
+    ) -> Result<R::Answer, String> {
         if let Err(e) = sent {
             self.forget(id);
             let why = format!("the worker's channel refused a call: {e}");
             self.lose(&why);
             return Err(why);
         }
-        match tokio::time::timeout(CALL_WAIT, rx).await {
+        match tokio::time::timeout(wait, rx).await {
             Ok(Ok(answer)) => Ok(answer),
             Ok(Err(_)) => Err("the worker's channel went before it answered".into()),
             Err(_) => {
                 self.forget(id);
-                let why = format!("a call went unanswered within {CALL_WAIT:?}");
+                let why = format!("a call went unanswered within {wait:?}");
                 self.lose(&why);
                 Err(why)
             }
@@ -166,19 +273,20 @@ impl Link {
     }
 
     /// `call`, and its answer: an error once the channel is gone, and past
-    /// [`CALL_WAIT`]. `descriptors` go on the second channel just before the
-    /// call's frame, in order (the daemon's side alone has one). A call that
-    /// cannot be sent, or goes unanswered within the bound, takes the link
+    /// [`Role::wait_of`]. `descriptors` go on the second channel just before
+    /// the call's frame, in order (the daemon's side alone has one). A call
+    /// that cannot be sent, or goes unanswered within the bound, takes the link
     /// for lost.
     #[cfg(all(worker_calls, unix))]
     pub(crate) async fn call(
         &self,
-        call: Call,
+        call: R::Call,
         descriptors: Vec<OwnedFd>,
-    ) -> Result<Answer, String> {
+    ) -> Result<R::Answer, String> {
         let Some((id, rx)) = self.register() else {
             return Err("the worker's channel is gone".into());
         };
+        let wait = R::wait_of(&call);
         // A descriptor sent and its frame not would leave the next call's
         // frame naming it: the channel is gone then, and so is this link.
         let sent = {
@@ -194,33 +302,34 @@ impl Link {
                 }
             }
             match descriptors_sent {
-                Ok(()) => send(&mut w.frames, &Msg::Call { id, call }).await,
+                Ok(()) => send(&mut w.frames, &R::call_frame(id, call)).await,
                 Err(e) => Err(e),
             }
         };
         drop(descriptors);
-        self.finish_call(id, rx, sent).await
+        self.finish_call(id, rx, sent, wait).await
     }
 
     /// FR-90 P8-2b-3 — [`call`](Self::call) on Windows: no second channel, so
     /// what a Unix call hands across as a descriptor rides inside `call`
     /// itself (a listener's `WSAPROTOCOL_INFOW`, in its `Spec`).
     #[cfg(all(worker_calls, windows))]
-    pub(crate) async fn call(&self, call: Call) -> Result<Answer, String> {
+    pub(crate) async fn call(&self, call: R::Call) -> Result<R::Answer, String> {
         let Some((id, rx)) = self.register() else {
             return Err("the worker's channel is gone".into());
         };
+        let wait = R::wait_of(&call);
         let sent = {
             let mut w = self.writer.lock().await;
-            send(&mut w.frames, &Msg::Call { id, call }).await
+            send(&mut w.frames, &R::call_frame(id, call)).await
         };
-        self.finish_call(id, rx, sent).await
+        self.finish_call(id, rx, sent, wait).await
     }
 
     /// The answer to call `id`, as it arrives: `false` when nothing waits
     /// for it (it timed out, or was never made).
     #[cfg(worker_calls)]
-    pub(crate) fn answered(&self, id: u64, answer: Answer) -> bool {
+    pub(crate) fn answered(&self, id: u64, answer: R::Answer) -> bool {
         let tx = self
             .waiting
             .lock()
@@ -232,8 +341,8 @@ impl Link {
 
     /// Answer the other side's call `id`.
     #[cfg(worker_calls)]
-    pub(crate) async fn answer(&self, id: u64, answer: Answer) -> std::io::Result<()> {
-        self.send(&Msg::Answer { id, answer }).await
+    pub(crate) async fn answer(&self, id: u64, answer: R::Answer) -> std::io::Result<()> {
+        self.send(&R::answer_frame(id, answer)).await
     }
 
     /// The channel is gone: every call still waiting fails now, and every

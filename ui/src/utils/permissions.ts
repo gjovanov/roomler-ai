@@ -102,7 +102,7 @@ export const PERMISSION_FLAGS: PermissionFlag[] = [
     label: 'Run commands on devices',
     group: 'Fleet access',
     description:
-      'Run a command on a device via Fleet RPC. Commands execute as root (Linux) or, on Windows, as the daemon\'s worker: the signed-in user on an attended install, SYSTEM in SystemContext mode. Also requires the org switch, the device policy, and the device-local key.',
+      'Run a command on a device via Fleet RPC. Commands execute as root (Linux) or, on Windows, as SYSTEM through the device\'s service once an administrator has anchored it. A Windows device that is not anchored runs them as the signed-in user on an attended install, and as SYSTEM in SystemContext mode. Also requires the org switch, the device policy, and the device-local key.',
   },
   {
     key: 'VIEW_EXEC_AUDIT',
@@ -407,6 +407,33 @@ export function canViewSshAudit(mask: number | null, isOwner: boolean): boolean 
   if (isOwner) return true
   if (mask === null) return false
   return hasPermission(mask, byKeys(['VIEW_SSH_AUDIT']))
+}
+
+/**
+ * FR-52 P5 — the external-access log and the people list beside it. Server
+ * gate: `VIEW_REMOTE_AUDIT`, the bit the remote-session audit reads under.
+ */
+export function canViewExternalAudit(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, byKeys(['VIEW_REMOTE_AUDIT']))
+}
+
+/**
+ * FR-52 P5 — gate 2's rule, for one person: `MANAGE_AGENTS` alone shuts the door,
+ * because barring someone grants nothing. Letting them back opens it, so that
+ * takes `REMOTE_CONTROL` too. Server gate: `decide_revocation`.
+ */
+export function canBarExternalPerson(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS']))
+}
+
+export function canLetBackExternalPerson(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS', 'REMOTE_CONTROL']))
 }
 
 /**

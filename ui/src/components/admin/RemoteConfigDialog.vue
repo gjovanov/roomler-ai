@@ -23,10 +23,11 @@
           class="mb-4"
           icon="mdi-transfer-right"
         >
-          This records what you want the device to run. The device applies it
-          the next time it connects — and it may refuse: these switches belong
-          to whoever holds the machine, and a device only accepts them after
-          someone enables <code>remote_config_enabled</code> on it directly.
+          This records what you want the device to run. A connected device
+          hears within seconds and an offline one the next time it connects —
+          and it may refuse: these switches belong to whoever holds the machine,
+          and a device only accepts them after someone enables
+          <code>remote_config_enabled</code> on it directly.
         </v-alert>
 
         <!-- Where the last request actually got to. This is the whole reason
@@ -62,10 +63,10 @@
           label="Accept remote commands (exec_enabled)"
         />
         <div class="text-caption text-medium-emphasis mb-1 ml-1">
-          Commands run as the daemon: <strong>root</strong> under systemd; on
-          Windows the <strong>signed-in user</strong> (an attended install) or
-          <strong>SYSTEM</strong> (SystemContext mode). Takes effect immediately
-          on the device; no restart.
+          Commands run as <strong>root</strong> under systemd; on Windows as
+          <strong>SYSTEM</strong> once the device is anchored, otherwise as the
+          <strong>signed-in user</strong> (an attended install) or <strong>SYSTEM</strong>
+          (SystemContext mode). Takes effect immediately on the device; no restart.
         </div>
         <div v-if="!mayGrantExec" class="text-caption text-error mb-4 ml-1">
           You need the <strong>EXEC_DEVICE</strong> permission to change this.
@@ -432,7 +433,7 @@ const status = computed<{ type: 'success' | 'info' | 'warning' | 'error'; icon: 
         icon: 'mdi-clock-outline',
         title: 'Waiting for the device',
         detail:
-          'Requested. The device reconciles when it next connects — an offline device picks this up on its own, nothing needs re-sending.',
+          'Requested. A connected device answers within seconds, and an offline device picks this up when it next connects — nothing needs re-sending.',
       }
     case 'reports_unsupported':
       return {
@@ -544,7 +545,7 @@ const colorDescriptionOptions = [
 ]
 const accountOptions = [
   { title: 'The signed-in user at the device', value: 'console_user' },
-  { title: 'The daemon account (SYSTEM / root)', value: 'daemon' },
+  { title: 'The daemon account (root, or on Windows the agent\'s own)', value: 'daemon' },
 ]
 
 const dirty = computed(() => JSON.stringify(draft.value) !== original.value)

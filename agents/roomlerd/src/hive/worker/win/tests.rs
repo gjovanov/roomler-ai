@@ -238,6 +238,52 @@ async fn a_worker_starts_in_a_job_of_its_own_its_memory_bounded() {
     );
 }
 
+/// FR-90 P8-2d-1 (decision 72, AC4) — the device's worker starts into a job at
+/// a bound of its own, not a session's: read back from the job its own spawner
+/// made. A process the daemon starts beside it (a session's account's command,
+/// `hive-pack`) is outside that job, so the job's limit never reaches it.
+#[cfg(worker_calls)]
+#[tokio::test]
+async fn the_devices_worker_starts_into_a_job_at_its_own_bound() {
+    use super::super::device::{MAX_MEMORY as DEVICE_MEMORY, OwnBinary};
+    use super::super::{Program, channels};
+
+    let ping = Path::new(r"C:\Windows\System32\PING.EXE");
+    let args = ["-n", "30", "127.0.0.1"].map(String::from);
+    let (_ours, theirs) = channels().unwrap();
+    let spawner = OwnBinary(Program {
+        exe: ping.into(),
+        arg0: None,
+        args: args.to_vec(),
+    });
+    let mut through_its_spawner = spawner.spawn(theirs).unwrap();
+    assert_eq!(
+        through_its_spawner.job_limit(),
+        Some(DEVICE_MEMORY as usize),
+        "its own bound"
+    );
+    assert_ne!(DEVICE_MEMORY as usize, MAX_MEMORY, "not a session's");
+    through_its_spawner.kill().await;
+
+    let (_server, pipe) = channel().unwrap();
+    let mut worker = spawn_held_to(ping, None, &args, pipe, DEVICE_MEMORY as usize).unwrap();
+    let mut outside = std::process::Command::new(ping)
+        .args(&args)
+        .spawn()
+        .unwrap();
+    let job = worker.job.as_ref().unwrap().as_raw_handle() as HANDLE;
+    let mut inside = 1;
+    // SAFETY: both handles are live; `inside` is a valid out-param.
+    let ok = unsafe { IsProcessInJob(outside.as_raw_handle() as HANDLE, job, &mut inside) };
+    assert!(
+        ok != 0 && inside == 0,
+        "what the daemon starts stays outside it"
+    );
+    let _ = outside.kill();
+    let _ = outside.wait();
+    worker.kill().await;
+}
+
 /// The real `roomlerd hive-worker`, started as the daemon starts it: it
 /// finds its pipe, answers `hello` with its own pid at this build's version,
 /// each beat, and ends at `bye`. Needs the binary, which a lib test does not
@@ -309,6 +355,7 @@ async fn the_real_worker_answers_over_its_pipe() {
 /// own reconstructed listener, not this test's, is the one serving it: this
 /// test's copy is dropped the moment its protocol info is taken, so nothing
 /// is left listening here if the worker's `socket_from_info` had failed.
+#[cfg(worker_calls)]
 #[tokio::test]
 #[ignore = "needs a built roomlerd.exe with hive,vault, named in ROOMLERD_WORKER_EXE"]
 async fn the_real_worker_serves_a_credential_endpoint_handed_to_it() {
