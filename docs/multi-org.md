@@ -699,6 +699,9 @@ dropping of delta frames would break reference chains, because the 13-byte DC
 header carries no sequence number. A joiner buffers until the next IDR; a
 viewer that sustainedly needs far less than the shared rate spills to its own
 encoder, bounded at 2 pipelines total. The viewer badge shows `· shared ×N`.
+An owner whose capture has no picture tells every follower why, and every later
+joiner as it joins (FR-80's `rc:media-unavailable`, #3260,
+[`remote-control.md` §5.1a](remote-control.md#51a-when-capture-cannot-open-the-session-says-why-fr-80)).
 
 ## 7. P6 — InputArbiter (shipped rc.305/306, #329 + #334)
 
