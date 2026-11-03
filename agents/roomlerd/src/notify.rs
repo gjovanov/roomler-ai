@@ -88,9 +88,10 @@ pub fn raise_attention_machine_aware_with_reason(reason: &str, message: &str) ->
 }
 
 /// #3289 — `rollback_failed` by the same route, with the accused build. A worker
-/// in SystemContext used to write this one to its own profile, where nothing reads
-/// it: the companion, its one reader, runs as the person. `failed_version` is what
-/// lets a later build's healthy connect clear it (FR-53).
+/// in SystemContext used to write this one to its own profile, where nobody looks.
+/// The machine path is read by an administrator or a fleet scanner, not by the
+/// companion of a standard user: the hardened directory refuses it (#3373).
+/// `failed_version` is what lets a later build's healthy connect clear it (FR-53).
 pub fn raise_rollback_attention(message: &str, failed_version: &str) -> Result<PathBuf> {
     let (path, machine_global) =
         attention_path_for_worker().context("no attention path resolvable")?;
