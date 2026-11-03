@@ -33,7 +33,7 @@ async fn connect_agent(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -
 
 /// [`connect_agent`], advertising `rpc` verbs in its caps (P4b-2:
 /// `idle-timeout`, the agent that keeps an idle limit).
-async fn connect_agent_rpc(
+pub(crate) async fn connect_agent_rpc(
     app: &TestApp,
     seeded: &SeededTenant,
     machine_id: &str,
@@ -622,7 +622,7 @@ async fn the_lock_ask_reaches_only_a_device_that_honours_it() {
 
 /// FR-128 — a session request that names the browser's own device
 /// (`local_relay_from`, FR-121), answered by [`request_session`]'s two frames.
-async fn request_session_from(
+pub(crate) async fn request_session_from(
     app: &TestApp,
     token: &str,
     agent_id: &str,
