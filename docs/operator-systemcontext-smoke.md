@@ -159,7 +159,7 @@ icacls "C:\ProgramData\roomler" /inheritance:r `
 > rewritten. The daemon's hardening (`crates/agent-core/src/config.rs:3542`,
 > steps at `:3580`) takes the directory for Administrators, grants, and only
 > then drops inheritance. The wizard's
-> (`agents/roomler-setup/src/orchestrator_agent.rs:1528`) takes it, then
+> (`agents/roomler-setup/src/orchestrator_agent.rs:1605`) takes it, then
 > runs that one call. Both stop if they cannot take the directory.
 
 The daemon hardens on every save of this config, and every start saves it once
