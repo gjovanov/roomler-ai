@@ -1429,8 +1429,10 @@ pub struct AgentConfig {
     /// FR-79 V5b — only a measurement is evidence about the rate
     /// (`ROOMLERD_MEASURED_EVIDENCE`). Built-in default: on. A transit stall is
     /// judged against a live reading and never the prior's stand-in, a later
-    /// delivery at twice a reading takes the reading out, and a hold reaches
-    /// the pair memory only if a valid window carried it. `false` = V5a's rules.
+    /// delivery at twice a reading takes the reading out, a hold reaches the
+    /// pair memory only if a valid window carried it, the memory records a
+    /// reading or nothing, and a growing viewer queue counts only while the
+    /// sender offered more than arrived. `false` = V5a's rules.
     #[serde(default)]
     pub measured_evidence: Option<bool>,
     /// FR-59 P5 — a constrained session whose pair the rate memory

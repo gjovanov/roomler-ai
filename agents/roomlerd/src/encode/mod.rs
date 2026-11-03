@@ -470,8 +470,10 @@ pub fn queue_drain_enabled() -> bool {
 /// FR-79 V5b kill switch (2026-11-02): when on (default), only a measurement is
 /// evidence about the rate. A transit stall is judged against a live reading and
 /// never the prior's stand-in, and it no longer walks that prior; a later
-/// delivery at twice a reading or more takes the reading out; and a hold counts
-/// for the pair memory only if a valid window carried it. `0` = V5a's rules.
+/// delivery at twice a reading or more takes the reading out; a hold counts for
+/// the pair memory only if a valid window carried it; the memory records a
+/// reading or nothing; and a growing viewer queue counts only while the sender
+/// offered more than arrived. `0` = V5a's rules.
 #[cfg_attr(
     not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
     allow(dead_code)

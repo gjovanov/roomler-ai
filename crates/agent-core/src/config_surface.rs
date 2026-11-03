@@ -1606,7 +1606,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "Measured evidence (2026-11-02, FR-79 V5b). Default ON: only a measurement is evidence about the rate. A transit stall is judged against a live reading (the goodput, or the viewer's arrival rate inside its TTL) and never against the prior's stand-in, and it no longer walks that prior. A delivery that raises the demonstrated floor to at least twice a reading takes the reading out. A hold reaches the pair memory only if a valid window carried it. `false` restores FR-79 V5a's rules.",
+        description: "Measured evidence (2026-11-02, FR-79 V5b). Default ON: only a measurement is evidence about the rate. A transit stall is judged against a live reading (the goodput, or the viewer's arrival rate inside its TTL) and never against the prior's stand-in, and it no longer walks that prior. A delivery that raises the demonstrated floor to at least twice a reading takes the reading out. A hold reaches the pair memory only if a valid window carried it, and a session with no reading writes nothing there. A growing viewer queue counts only while the sender offered more than arrived. `false` restores FR-79 V5a's rules.",
     },
     KeyMeta {
         key: "slow_link_profile",

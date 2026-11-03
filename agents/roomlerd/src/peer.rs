@@ -5305,6 +5305,7 @@ async fn media_pump_vp9_444_dc(
                 pipe_measured = ?governor
                     .measured_bps(std::time::Instant::now(), constrained_transport),
                 readings_refuted = governor.readings_refuted(),
+                link_unoffered = governor.link_unoffered(),
                 // FR-59 P1 — see the FFmpeg pump's heartbeat.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
                 // FR-70 P1 — what stands in for a pipe measurement while
@@ -10014,8 +10015,11 @@ async fn media_pump_ffmpeg_dc(
                 // the prior's stand-in. None = no claim to contradict, so a stall
                 // cuts nothing. `readings_refuted` counts the deliveries that took
                 // out what stood below them; `goodput_bps` reads None after one.
+                // `link_unoffered` counts congested windows the sender was not
+                // feeding: a link loop gone quiet with this climbing is the rule.
                 pipe_measured = ?governor.measured_bps(std::time::Instant::now(), constrained),
                 readings_refuted = governor.readings_refuted(),
+                link_unoffered = governor.link_unoffered(),
                 // FR-59 P1 — the floor actually in force once the measured
                 // pipe has been shown to sit under the nominal legibility
                 // minimum. None = the flat floor stands, which on a slow
