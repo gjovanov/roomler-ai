@@ -39,7 +39,7 @@ flowchart LR
 ```
 
 ⚠️ The LocalAPI is the trust boundary. On Windows its SDDL grants **SYSTEM, Administrators
-and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:2061`): any person
+and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:2040`): any person
 logged in at the machine can call it, a sandboxed low-integrity process cannot. Everything
 below that lets the companion *change* something is therefore something any interactive user
 can do — which is why the device-side rules (the `files_dir` SYSTEM rule, the visibility rule
@@ -110,7 +110,7 @@ sequenceDiagram
    flow id (`routeRows`, `:48`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
    one rolled generation).
-2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2154`)
+2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2133`)
    binds the first instance (retrying while another process holds the name), then runs a
    pool of accept tasks (`accept_pipe`, `:1976`), each owning one listening instance and
    re-creating it before handing a connected one off. Default 4
@@ -180,7 +180,7 @@ compile.
   through P2. Meanwhile the Overview's network lines are the root half's (§6), so the two
   pages described different daemons and nothing said so: a person switching `ssh_enabled`
   on here changed a file the mesh node never reads (measured on 0.4.169). The card now
-  carries a banner (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:843`)
+  carries a banner (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:828`)
   naming the file it edits and the root half's (`/etc/roomler/config.toml`), with the
   administrator's command for the root half's switches: `sudo roomler config set <key>
   <value>`. It is shown only when the reached daemon says it runs unprivileged AND a root
@@ -197,15 +197,15 @@ compile.
   have — and showed "Could not load the configuration" with a Retry that never helped; with a
   stale per-user file left by an earlier per-user install it would have read, and
   `cmd_config_set` written, a file no daemon reads (#2871's failure, on Linux). Now
-  `cmd_config_target` (`agents/roomler-desktop/src/commands.rs:843`) reports `root_only`
-  (`root_daemon_only`, `agents/roomler-desktop/src/commands.rs:741`, pure: the reached daemon
+  `cmd_config_target` (`agents/roomler-desktop/src/commands.rs:828`) reports `root_only`
+  (`root_daemon_only`, `agents/roomler-desktop/src/commands.rs:726`, pure: the reached daemon
   says it runs as root, this process does not, and the OS is not Windows, whose pipe admits
   interactive users to those verbs) and the card shows the daemon, its file
   (`Status.config_path`: `/etc/roomler/config.toml`) and the administrator's commands —
   `sudo roomler config ls`, `sudo roomler config set <key> <value>` — in place of rows. A
   refusal from a root daemon is final for `cmd_config_entries`, `cmd_config_set` and
   `cmd_set_device_name`: none falls back to the file (`refused_by_root_daemon`,
-  `agents/roomler-desktop/src/commands.rs:798`). ⚠️ No new authorization path: `person_may`
+  `agents/roomler-desktop/src/commands.rs:783`). ⚠️ No new authorization path: `person_may`
   is unchanged, and #2879's test still pins `ConfigSet` of the gate keys as refused there.
 - **The Service line on Linux and macOS (#2871).** `probe_service_state` reads the root
   daemon's own `--as-service` answer — `com.roomler.daemon: running, enabled`,
@@ -353,7 +353,7 @@ sequenceDiagram
   `ConfigSet` are refused on the person socket, so Settings edits the per-user half's own
   file — and says so (§5). The same socket does tell the companion, and the CLI's
   `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:4648`), that a root half exists: `/var/run/roomler` is
+  `crates/localapi/src/lib.rs:4627`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
@@ -364,7 +364,7 @@ sequenceDiagram
 Most settings are read once at startup, so saving one is not the same as applying it. The
 Settings page collects the saved restart-required keys in a bar with an **Apply now** button;
 `roomler restart` is the same thing from a terminal. Both send `Request::RestartDaemon`
-(`crates/localapi/src/lib.rs:1449`), and **the daemon decides**.
+(`crates/localapi/src/lib.rs:1428`), and **the daemon decides**.
 
 It restarts only when it can prove that something will start it again — exiting an
 unsupervised `roomlerd run` would take the device offline for good:
@@ -399,7 +399,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:1842`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:1814`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -709,7 +709,7 @@ dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat 
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
 dialog is the wait (`agents/roomlerd/src/peer.rs:5744`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
-`crates/localapi/src/lib.rs:1228`), and the banner comes up only for a session that sees the
+`crates/localapi/src/lib.rs:1207`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:325`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.
@@ -919,7 +919,7 @@ sequenceDiagram
 | a check you can see | `MIN_CHECKING_MS`, `src/front/overview.js:173` | "Checking for updates…" stays up at least 0.7 s, and the answer carries the time it was asked ("Checked at 21:45:25."). On 0.4.177 an answer that came back at once read as no check at all (field, a Mac, 2026-10-26) |
 | into view | `scrollToUpdates`, `src/front/overview.js:214`; `revealUpdates`, `:234` | the Updates card is the last one on Overview, and `#content` is what scrolls. The scroll is INSTANT and repeated: once the page is visible, and when the answer lands. On 0.4.177 a smooth scroll never happened on a Mac: it is driven by animation frames, and the tray runs it while the window is still coming up |
 | the ring | `flashUpdates`, `src/front/overview.js:220`; `.card.flash` in `styles.css` | draws the eye to the card. A static outline instead when the OS asks for reduced motion |
-| off the main thread | `cmd_check_update`, `agents/roomler-desktop/src/commands.rs:1676` | a synchronous Tauri command runs on the app's main thread, and this one waits for a spawned `roomlerd` and a network round-trip |
+| off the main thread | `cmd_check_update`, `agents/roomler-desktop/src/commands.rs:1611` | a synchronous Tauri command runs on the app's main thread, and this one waits for a spawned `roomlerd` and a network round-trip |
 
 ⚠️ **Installing stays a separate click.** The menu item says "Check for Updates", and on macOS
 **Install update** queues the root update helper (FR-27).

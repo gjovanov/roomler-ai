@@ -440,7 +440,7 @@ the Mongo pod's restart count read 1 before and after. That is P3's before.
 > `Instant::now()` is ~20–40 ns, and there are N of them") the switch's own
 > description used to quote.
 
-`roomlerd stall-watch-cost` (`stall.rs:592`, dispatched in `app.rs:1304` before
+`roomlerd stall-watch-cost` (`stall.rs:592`, dispatched in `app.rs:1278` before
 any runtime, config, log, lock or updater) runs the pump's per-pass watch work
 through the **real** `PassWatch`, once enabled and once disabled, rounds
 alternating which arm goes first. Everything else in a pass is the same in

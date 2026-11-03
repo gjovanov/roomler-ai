@@ -225,6 +225,11 @@ fn dispatch<E: Mouse + Keyboard>(enigo: &mut E, msg: InputMsg) -> Result<()> {
             // user's own ALT+SHIFT within one event.
             #[cfg(target_os = "windows")]
             super::layout::sample_active_layout();
+            // #3047 — the next KeyText reads the target's CapsLock again.
+            #[cfg(target_os = "windows")]
+            if code == 0x39 {
+                super::win_text::caps_changed();
+            }
             let direction = if down {
                 Direction::Press
             } else {

@@ -131,8 +131,8 @@ its own updater's next check installed the release a second time.
 
 Since #2724, on Linux, the command restarts the daemon running beside it once its
 install has completed, the way `roomler restart` does
-(`restart_daemon_beside_self_update`, `agents/roomlerd/src/app.rs:6319`, called
-at `app.rs:6296`):
+(`restart_daemon_beside_self_update`, `agents/roomlerd/src/app.rs:6176`, called
+at `app.rs:6153`):
 
 ```mermaid
 sequenceDiagram
