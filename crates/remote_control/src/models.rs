@@ -1625,7 +1625,7 @@ pub struct AccessPolicy {
     /// takes a LAN, srflx or TURN pair. `true` restores the behaviour from
     /// before the field: whichever pair ICE finds best, overlay included.
     ///
-    /// Off by default because a session on the overlay inherits the
+    /// Never on by default because a session on the overlay inherits the
     /// overlay's failure modes (#1856: a 3 ms route hole on macOS killed
     /// sessions) and hides its carrier from rate control: a pair the mesh
     /// carries over DERP/TCP reads as a direct host pair.
@@ -1634,8 +1634,8 @@ pub struct AccessPolicy {
     /// FR-128 — `auto`: each session decides for itself, at the agent's
     /// offer. It takes the overlay when the mesh link to the viewer's own
     /// device is direct, and not otherwise. `rc_overlay: true` wins over
-    /// it ([`Self::rc_overlay_mode`]). `None`/`false` (the default, and every
-    /// row older than the field) is not `auto`.
+    /// it ([`Self::rc_overlay_mode`]). `None`/`false` (a row that never chose)
+    /// is not `auto`: a NEW row gets `true` when it is written (#3357).
     ///
     /// A separate field rather than a third value of `rc_overlay`, so a pod
     /// or a page older than it reads an `auto` row as `off`, never as a row

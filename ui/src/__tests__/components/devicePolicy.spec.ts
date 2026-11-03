@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest'
 import type { AccessPolicy } from '@/stores/agents'
 import {
+  RC_OVERLAY_HINT,
   idleMinuteItems,
   ownerPromptLabel,
   policySummary,
@@ -94,6 +95,18 @@ describe('rcOverlayMode / rcOverlayFields (FR-128)', () => {
     // builds it.
     expect('rc_overlay_auto' in policy()).toBe(false)
     expect(rcOverlayMode(policy({ rc_overlay: null }))).toBe('off')
+  })
+
+  it('reads the row a new device starts with as auto (#3357)', () => {
+    expect(rcOverlayMode(policy({ rc_overlay: null, rc_overlay_auto: true }))).toBe('auto')
+    expect(policySummary(policy({ rc_overlay: null, rc_overlay_auto: true }), false)).toContain(
+      'mesh when direct',
+    )
+  })
+
+  it('calls Auto, not Off, where a new device starts (#3357)', () => {
+    expect(RC_OVERLAY_HINT).toContain('Auto, where a new device starts')
+    expect(RC_OVERLAY_HINT).not.toContain('(default)')
   })
 
   it('stores each choice as both fields, and reads back what it stored', () => {

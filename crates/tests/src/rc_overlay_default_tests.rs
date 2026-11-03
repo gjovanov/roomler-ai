@@ -422,3 +422,31 @@ async fn a_new_rows_auto_reaches_only_a_device_that_decides_it() {
     assert!(request["rc_overlay_auto"].is_null(), "{request}");
     assert_ne!(request["rc_overlay"], true, "{request}");
 }
+
+/// `ROOMLER__RC__NEW_DEVICE_RC_OVERLAY_AUTO=false`: new rows go back to what
+/// they were, never chosen, through both `create` paths. A row that already
+/// says `auto` keeps it: the switch decides what a new row is written with.
+#[tokio::test]
+async fn the_server_switch_puts_new_rows_back_on_off() {
+    let app = TestApp::spawn_with_settings(|s| s.rc.new_device_rc_overlay_auto = false).await;
+    let t = app.seed_tenant("d2switch").await;
+
+    let token = enrollment_token(&app, &t).await;
+    let by_token = enroll(&app, &token, "d2-switch-token", "linux").await;
+    let key = ephemeral_key(&app, &t).await;
+    let by_key = enroll(&app, &key, "d2-switch-key", "linux").await;
+    for id in [&by_token, &by_key] {
+        assert_eq!(mode(&app, id).await, RcOverlayMode::Off, "{id}");
+        let stored = stored_policy(&app, id).await;
+        assert_eq!(stored.get("rc_overlay"), Some(&Bson::Null), "{stored}");
+        assert_eq!(stored.get("rc_overlay_auto"), Some(&Bson::Null), "{stored}");
+    }
+
+    let mut stamped = stored_policy(&app, &by_token).await;
+    stamped.insert("rc_overlay_auto", true);
+    store_policy(&app, &by_token, &stamped).await;
+    let token = enrollment_token(&app, &t).await;
+    let again = enroll(&app, &token, "d2-switch-token", "linux").await;
+    assert_eq!(again, by_token);
+    assert_eq!(mode(&app, &by_token).await, AUTO);
+}

@@ -88,12 +88,13 @@ export const RC_OVERLAY_ITEMS: { title: string; value: RcOverlayMode }[] = [
 /** #1882 / FR-128 — what the "Remote desktop over the mesh" choice does, for
  *  its tooltip. */
 export const RC_OVERLAY_HINT =
-  'Off (default): remote desktop never rides the WireGuard mesh; it connects ' +
-  'over the LAN, a direct path or a TURN relay. Auto: a session takes the mesh ' +
-  'only when the browser runs on one of your Roomler devices and that device’s ' +
-  'mesh link to this one is direct; an agent that predates Auto reads it as Off. ' +
-  'On: it may take the mesh whenever that is the best path, and inherits the ' +
-  'mesh’s outages. Applies to the next session.'
+  'Off: remote desktop never rides the WireGuard mesh; it connects over the LAN, ' +
+  'a direct path or a TURN relay. Auto, where a new device starts: a session takes ' +
+  'the mesh when the browser runs on one of your Roomler devices and that device’s ' +
+  'mesh link to this one is direct, or when UDP to the far relay is blocked; an ' +
+  'agent that predates Auto reads it as Off. On: it may take the mesh whenever ' +
+  'that is the best path, and inherits the mesh’s outages. A device enrolled ' +
+  'before Auto was the default keeps what it had. Applies to the next session.'
 
 /** FR-128 — the stored pair read as one choice: `on` wins, then `auto`. */
 export function rcOverlayMode(
