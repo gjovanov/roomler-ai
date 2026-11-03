@@ -1504,7 +1504,7 @@ flowchart LR
     C["encode/clock.rs:<br/>uclamp_min 1024 on the encoding<br/>and capture threads"] -. the clock .-> E
 ```
 
-- **The encoder asks for its clock** (P1, `encode/clock.rs:83`). On Linux the encoder thread, OpenH264's worker
+- **The encoder asks for its clock** (P1, `encode/clock.rs:90`). On Linux the encoder thread, OpenH264's worker
   and the DRM capture worker each set their own utilisation clamp (`sched_setattr`, `SCHED_FLAG_UTIL_CLAMP_MIN`,
   `uclamp_min` 1024, `encode/clock.rs:50`), keeping their policy and priority. A clamp counts only while the
   thread is runnable, and threads it starts afterwards inherit it: libvpx's workers, and Mesa's shader-cache
@@ -1563,7 +1563,7 @@ flowchart LR
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
-| The request | `uclamp_min` 1024 | the QoS class `QOS_CLASS_USER_INTERACTIVE`, `pthread_set_qos_class_self_np` (`encode/clock.rs:218`) | Microsoft's "HighQoS": `SetThreadInformation(ThreadPowerThrottling)`, `ControlMask` execution speed, `StateMask` 0 (`encode/clock.rs:276`) |
+| The request | `uclamp_min` 1024 | the QoS class `QOS_CLASS_USER_INTERACTIVE`, `pthread_set_qos_class_self_np` (`encode/clock.rs:251`) | Microsoft's "HighQoS": `SetThreadInformation(ThreadPowerThrottling)`, `ControlMask` execution speed, `StateMask` 0 (`encode/clock.rs:309`) |
 | Who asks | the encoder thread, OpenH264's worker, the DRM capture worker | the encoder thread, OpenH264's worker, the capture worker (`capture/scrap_backend.rs:154`) | a software encoder's thread (libvpx's encoder thread, OpenH264's worker); **not** a hardware encoder's thread, unless `=1`; **never** Media Foundation's worker (`encode/mf/mod.rs:199`) |
 | Threads it starts | inherit it | **do not** | **do not** |
 | `ROOMLERD_ENCODER_CLOCK` unset | asks | does not ask | a software encoder's thread asks, a hardware encoder's does not |
