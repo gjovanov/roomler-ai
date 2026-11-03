@@ -510,6 +510,12 @@ impl TenantDao {
         self.members.find_by_id(id).await
     }
 
+    /// #3247 — would `create` refuse this slug? The unique index on `slug`
+    /// is not partial, so a deleted organization still holds its slug.
+    pub async fn slug_taken(&self, slug: &str) -> DaoResult<bool> {
+        Ok(self.base.count(doc! { "slug": slug }).await? > 0)
+    }
+
     pub async fn find_by_slug(&self, slug: &str) -> DaoResult<Tenant> {
         self.base
             .find_one(doc! { "slug": slug, "deleted_at": null })

@@ -564,6 +564,52 @@ async fn a_crash_loop_parks_it_and_a_probe_says_why() {
     w.stop().await;
 }
 
+/// Workers that cannot start until `prepare` has been asked `asks` times: a
+/// failure that passes (#3349).
+struct NotYet {
+    asks: usize,
+    asked: AtomicUsize,
+    then: Arc<Fake>,
+}
+
+impl Spawn for NotYet {
+    fn spawn(&self, theirs: Theirs) -> std::io::Result<Box<dyn Running>> {
+        if self.asked.load(Ordering::SeqCst) < self.asks {
+            return Err(std::io::Error::other("not ready yet"));
+        }
+        self.then.spawn(theirs)
+    }
+
+    fn prepare(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {})
+    }
+}
+
+/// #3349 — a failure that outlasts its starts parks the worker, as any that
+/// cannot start does, and that is not for life: the start at the cool-off's
+/// end asks again, comes up and measures.
+#[tokio::test]
+async fn a_failure_that_passes_costs_a_cool_off_and_no_more() {
+    let t = quick();
+    let spawner = Arc::new(NotYet {
+        asks: t.loop_max as usize + 1,
+        asked: AtomicUsize::new(0),
+        then: Fake::new(&[Part::Serve]),
+    });
+    let w = DeviceWorker::start(spawner, t.clone(), COOL);
+    let s = until(&w, |s| s.gave_up).await;
+    assert_eq!((s.gave_up, s.starts), (true, t.loop_max), "parked: {s:?}");
+    let s = until(&w, |s| s.up).await;
+    assert_eq!(
+        (s.up, s.gave_up, s.starts),
+        (true, false, t.loop_max + 1),
+        "{s:?}"
+    );
+    measured_ok(&w).await;
+    w.stop().await;
+}
+
 /// A worker that outlives the window after a park is forgotten: its later
 /// loss is an ordinary one, restarted with no park.
 #[tokio::test]

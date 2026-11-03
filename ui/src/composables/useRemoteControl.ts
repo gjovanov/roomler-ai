@@ -7244,7 +7244,12 @@ export function useRemoteControl(
    *  0x08 = Meta/Win Ã¢ÂÂ matches `kbdCodeToHid` callers throughout
    *  the codebase. */
   function sendKey(code: number, down: boolean, mods: number = 0) {
-    sendInput({ t: 'key', code, down, mods })
+    sendInput({
+      t: 'key',
+      code,
+      down,
+      mods: translateModsForHost(mods, hostIsMac.value && ctrlAsCmd.value),
+    })
   }
 
   /**
@@ -12308,7 +12313,10 @@ export function useRemoteControl(
       const mods = pendingCtrlV.mods
       if (pendingCtrlV.timer) clearTimeout(pendingCtrlV.timer)
       pendingCtrlV = null
-      for (const frame of deferredPasteFrames(mods)) sendInput(frame)
+      // #3046: with the person's Ctrl already up, the agent presses what `mods`
+      // names, so on a Mac host that has to say Cmd.
+      const hostMods = translateModsForHost(mods, hostIsMac.value && ctrlAsCmd.value)
+      for (const frame of deferredPasteFrames(hostMods)) sendInput(frame)
     }
 
     /** Schedule a 25 ms-delayed read of the host's clipboard + mirror
@@ -14671,6 +14679,13 @@ export function translateModifierForHost(
     return 0xe3
   }
   return code
+}
+
+/** #3046: the same substitution for the `mods` bits of a chord that has no
+ * modifier key of its own for `translateModifierForHost` to rewrite: the soft
+ * keyboard's sticky Ctrl. */
+export function translateModsForHost(mods: number, enabled: boolean): number {
+  return enabled && mods & 0x01 ? (mods & ~0x01) | 0x08 : mods
 }
 
 /** The attribute that marks an editable element as a capture surface of the

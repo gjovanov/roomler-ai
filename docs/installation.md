@@ -134,7 +134,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3790`, `crates/agent-core/src/config.rs:4171`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3790`, `crates/agent-core/src/config.rs:4221`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:651`, `:983`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -386,8 +386,8 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3572`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3616`) |
-| `config::read_if_present` (`:3617`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3580`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3624`) |
+| `config::read_if_present` (`:3654`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
 flowchart TD
@@ -422,9 +422,9 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2634`, `:2656`), at the clean-run promotion
-(`record_clean_run_at`, `:2620`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4062`). Each save
+`crates/agent-core/src/config.rs:2640`, `:2662`), at the clean-run promotion
+(`record_clean_run_at`, `:2626`), at every `ConfigSet`, and at enrollment. The daemon, the
+desktop app and the setup wizard all write it through `config::save` (`:4201`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -436,7 +436,7 @@ does not model:
   upgrade did not bring them back.
 
 Now `save` writes the struct **plus** every key of the file it replaces that this build
-ignores (`serialise_for`, `:3962`):
+ignores (`serialise_for`, `:4097`):
 
 | In the file being replaced | After the save |
 |---|---|
@@ -462,14 +462,14 @@ flowchart TD
 ```
 
 "Unknown" means exactly what this build's deserializer skipped: `serde_ignored` names the
-keys (`unknown_keys`, `:3799`). A key this build knows is written as this build read it: a
+keys (`unknown_keys`, `:3929`). A key this build knows is written as this build read it: a
 value a newer build wrote that this one cannot represent — `peer_auth = "enforce"`, read as
-`audit` (`:2780`) — is rewritten to that reading, for instance after a rollback. Only the keys
+`audit` (`:2805`) — is rewritten to that reading, for instance after a rollback. Only the keys
 the deserializer skipped are kept as written.
 
 ⚠️ **An array entry is found by its identity, never by its position** (`same_entry`,
-`:3866`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
-array (`entry_identity`, `:3850`), never one read off the entry on disk. A newer build's
+`:3997`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
+array (`entry_identity`, `:3981`), never one read off the entry on disk. A newer build's
 entry can carry a key that looks like an identity (an `id` on an org) which no entry this
 build writes has: keyed on it, the entry is found nowhere, and every key on it is lost, in
 exactly the array the merge exists for. Positions move: removing an org shifts the ones
@@ -490,24 +490,35 @@ keeps it with the new primary, as `preserve_operator_config` keeps every operato
 with the file.
 
 Two guards keep the worst case at the old behaviour. The merged text must read back and
-serialise to exactly what the struct alone would have written (`:3946`), so the merge can only
+serialise to exactly what the struct alone would have written (`:4075`), so the merge can only
 add what this build ignores and never change a key it knows. And any failure writes the struct
 alone, with a WARN that names the keys it could not keep.
 
-`load` names them once per process and file (`note_unknown_keys`, `:4030`), with WARN *"config
+`load` names them once per process and file (`note_unknown_keys`, `:4163`), with WARN *"config
 keys this build does not know: ignored here, and kept in the file through every save"* and the
 key paths. After a rollback, "my setting did nothing" has its answer in the log.
 
 `load`'s recovery keeps them too. It reinstates the `config.toml.prev` copy it loaded over a
-live file that does not parse, and names the copy as the base (`save_with_base`, `:4068`):
-the keys to keep are the copy's, and the live file holds nothing a merge can read. Every
-other save reads the file it replaces, and one over a file that does not parse says so —
-WARN *"the config being replaced does not parse: keys this build does not know in it, if
+live file that does not parse, and names the copy as the base (`save_with_base`): the keys to
+keep are the copy's, and the live file holds nothing a merge can read. Every other save reads
+the file it replaces, and if that does not read as a config, its last good copy (#3087), so
+the wizard's enrollment and `adopt-enrollment`, which recover through `read_merge_base`, keep
+them as well. When neither reads it says so — WARN *"the config being replaced does not read
+as a config, and neither does its last good copy: keys this build does not know in them, if
 any, are NOT kept through this save"*, a fixed string, never the parser's.
 
 ⚠️ **Key paths only, never values.** The file holds the agent token and the overlay keys. A
-TOML parse error quotes the line it stopped at, so the merge reports fixed strings and never
-passes a parser message on.
+TOML parse error quotes the line it stopped at, and its message can quote a value, so the merge
+reports fixed strings and never passes a parser message on.
+
+⚠️ **No error about this file carries anything from it** (#3086). A typo on `agent_token`'s line
+used to print the token into the daemon's log, which uploads to the server, onto the wizard's
+page and into the terminal. The parser's error now ends where it happens (`parse_failure` in
+`crates/agent-core/src/config.rs`, and its copy in `agents/roomler-cli/src/config.rs`): what
+leaves is *"TOML parse error at line 3, column 81"* with no source behind it, so no `{:#}` or
+`{:?}` further up can reach the parser's words. The one message kept is `missing field
+\`name\``, the schema's word for a key it wanted. A key name read off the file is never kept,
+because a broken line can turn a value into one. The person has the file and the line.
 
 ⚠️ **A key a build retires now stays in the file** and is logged as unknown at every start,
 where the next save used to scrub it. Every key retired so far was a knob or a kill switch. A
@@ -586,6 +597,11 @@ Details worth knowing:
 - Daemon installs also place **`roomler-desktop`** (tray companion: status,
   tunnels pane, consent prompts) and **`roomler.exe`** — a small shim that
   re-execs `roomlerd cli`, so CLI and daemon can never version-skew.
+  On a machine-wide install a limited wizard cannot write under `%ProgramFiles%`, so
+  it leaves `roomler-desktop` to the service, waits up to a minute for it
+  (`service_places_companion`, `wait_for_file`) and reports what is there, as Done
+  and the install trace do on every path (#3174). If the EXE is still absent the
+  checklist says so: the service adds it at its next start, or within 4 hours.
 - Terminal alternative: `irm https://roomler.ai/api/setup/install.ps1 | iex`
   runs the script with its defaults (`-Role daemon-system` from an elevated
   shell, nothing enrolled — it asks for nothing). To pass parameters, which
@@ -1309,6 +1325,9 @@ lines through `systemctl --user edit roomler`.
 
 ⚠️ Delegated, and the cgroups cannot be made: no worker runs. A worker that
 cannot have its limits never runs (FR-90 P8-2a-3), and the daemon's log says why.
+A failure that passes, such as a process of the unit still in its exit or
+systemd not answering, is tried again by a later worker's start (#3349). One
+that will not pass stays until the daemon restarts.
 
 ## macOS
 
@@ -1430,6 +1449,21 @@ runs on that enrollment, so it is what the daemon's row streams through until P3
 Measured on 0.4.191: with `<name>` deleted, the worker exits 7 at every spawn, the
 supervisor backs off and stops, and `<name>-daemon` reads `no-gui-session`. A Mac
 enrolled with one root token and no per-user enrollment has no worker at all.
+
+**One row, behind a switch (FR-43 P3a).** With `macos_one_row = true` beside
+`macos_supervise_gui_worker = true` in the root's config, read when the daemon starts,
+the worker runs `run --supervised --unenrolled`. It holds no enrollment, dials no
+server, and takes its sessions from the daemon's delegation channel alone. A person's
+enrollment on that Mac stays in their file and is ignored, and a person with none gets
+a worker anyway. As the console user, `roomler status`, the device list and the
+companion show the root half's row, and a verb that needs the server (`forward`,
+`exec`, `ssh`, a rename) says to run it with `sudo`. Until the logs PR, that worker's
+logs stay on the Mac.
+
+The switch is off by default and stays off until the
+[field proof](fr/FR-43-macos-single-enrollment.md#what-rides-what). It doesn't yet give
+one row alone: secondary orgs, the migration of a two-row Mac and the one-token install
+are P3b, P3c and P3d.
 
 ```bash
 # Screen sharing only (one token, one device row):
@@ -1682,7 +1716,7 @@ handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3428`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2684`).
+back to the version that is running (`crates/agent-core/src/config.rs:2690`).
 
 ### No pipe can stall the supervisor (#3080)
 
@@ -1878,6 +1912,12 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
   `install.ps1 -Uninstall`; the daemon's version sweep also removes older
   same-flavour MSIs after upgrades. `roomlerd service uninstall` removes a
   manually-installed service/task.
+  From a PowerShell started as administrator, `install.ps1 -Uninstall` removes
+  either flavour and the companion it placed in `C:\Program Files\Roomler`
+  (`roomler-desktop.exe` with its `.old` and `.version`). A run that is not
+  elevated removes this account's install only, and names what it left with
+  the way on (`scripts/install.ps1:519-531`, #3247). Either way the settings in
+  `C:\ProgramData\roomler` stay.
 - **Linux and macOS** (FR-97 P6d): one command, whatever put Roomler there —
   this script, the `.deb`, the companion's `.rpm`, the tarball, the `.pkg`, the
   tunnel CLI. Every step acts only on what is present, so it also works on a

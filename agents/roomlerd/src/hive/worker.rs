@@ -736,8 +736,9 @@ pub(crate) trait Spawn: Send + Sync {
     /// A worker with `theirs` as its channels.
     fn spawn(&self, theirs: Theirs) -> std::io::Result<Box<dyn Running>>;
 
-    /// P8-2a-7 — what has to be ready before this spawner's first worker:
-    /// nothing, for a test's.
+    /// P8-2a-7 — what has to be ready before this spawner's workers: asked
+    /// before each start, since a failure that passes is tried again (#3349).
+    /// Nothing, for a test's.
     fn prepare(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
     }
@@ -1176,7 +1177,6 @@ async fn supervise<S: Served>(
     seen: Arc<Mutex<Seen>>,
 ) {
     let note = |f: &dyn Fn(&mut Seen)| f(&mut seen.lock().unwrap_or_else(|e| e.into_inner()));
-    spawner.prepare().await;
     let mut starts: Vec<Instant> = Vec::new();
     loop {
         if stop.is_cancelled() {
@@ -1189,6 +1189,10 @@ async fn supervise<S: Served>(
                 return;
             }
             continue;
+        }
+        tokio::select! {
+            () = stop.cancelled() => return,
+            () = spawner.prepare() => {}
         }
         starts.push(Instant::now());
         note(&|s| s.starts += 1);

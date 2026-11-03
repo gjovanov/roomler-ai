@@ -11,9 +11,12 @@
 //! | macOS | `lsof -nP -iTCP -sTCP:LISTEN -F pctn` | its own lines |
 //!
 //! The daemon's own ports are left out: its loopback forwards are its
-//! declared routes, which a scan reports as such. A daemon that is not root
-//! sees only its own account's processes, so another account's listener
-//! comes without its process, as `tunnel::port_holder` finds too.
+//! declared routes, which a scan reports as such. They are left out by the
+//! address and port the daemon holds, not by its pid alone, because a child
+//! of the daemon can hold a copy of one of its listening sockets and the
+//! table then names the child too (#3397). A daemon that is not root sees
+//! only its own account's processes, so another account's listener comes
+//! without its process, as `tunnel::port_holder` finds too.
 
 use roomler_ai_remote_control::knowhow::{Listener, MAX_TEXT};
 
@@ -30,9 +33,32 @@ struct Row {
 /// The machine's TCP listeners, each bound address and port once, those the
 /// daemon (`own`) holds left out.
 pub(super) fn listeners(own: Option<u32>) -> Result<Vec<Listener>, String> {
+    Ok(select(table(own)?, own))
+}
+
+/// The listeners in a table's rows: each bound address and port once, and
+/// none the daemon holds, whoever else holds the same socket.
+///
+/// A child the daemon starts can hold a copy of one of its listening
+/// sockets. On macOS std creates a socket and only then marks it
+/// close-on-exec, so a child spawned between the two keeps it for life, and
+/// a forked child holds every descriptor until it execs. `lsof` lists such a
+/// socket once under each process that holds it, so leaving out the
+/// daemon's pid alone reported the daemon's own port as the child's
+/// (#3397). Nothing else can share the address and port: the daemon's
+/// listeners don't set `SO_REUSEPORT`.
+fn select(rows: Vec<Row>, own: Option<u32>) -> Vec<Listener> {
+    let owned: Vec<(String, u16)> = rows
+        .iter()
+        .filter(|row| own.is_some() && row.pid == own)
+        .map(|row| (row.address.clone(), row.port))
+        .collect();
     let mut out: Vec<Listener> = Vec::new();
-    for row in table()? {
-        if own.is_some() && row.pid == own {
+    for row in rows {
+        if owned
+            .iter()
+            .any(|(address, port)| *port == row.port && *address == row.address)
+        {
             continue;
         }
         if out
@@ -49,13 +75,14 @@ pub(super) fn listeners(own: Option<u32>) -> Result<Vec<Listener>, String> {
         });
     }
     out.sort_by(|a, b| (a.port, &a.address).cmp(&(b.port, &b.address)));
-    Ok(out)
+    out
 }
 
 // ─── Linux: /proc/net/tcp names the socket inode, /proc/*/fd its owner ─────
 
+/// The table names one process a socket; `own` is named when it holds one.
 #[cfg(target_os = "linux")]
-fn table() -> Result<Vec<Row>, String> {
+fn table(own: Option<u32>) -> Result<Vec<Row>, String> {
     let mut sockets = Vec::new();
     let mut read = false;
     for (path, v6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
@@ -68,7 +95,7 @@ fn table() -> Result<Vec<Row>, String> {
     if !read {
         return Err("the system's TCP table (/proc/net/tcp) cannot be read".into());
     }
-    let owners = socket_owners(&sockets.iter().map(|s| s.2).collect());
+    let owners = socket_owners(&sockets.iter().map(|s| s.2).collect(), own);
     Ok(sockets
         .into_iter()
         .map(|(address, port, inode)| {
@@ -131,21 +158,25 @@ fn ipv6(hex: &str) -> Option<String> {
 
 /// Which process holds each socket inode, by a walk of `/proc/<pid>/fd`. A
 /// process this daemon may not look into is passed by.
+/// `own` is walked first: a socket the daemon holds is the daemon's, also
+/// when a child of it holds a copy and sorts before it in `/proc` (#3397).
 #[cfg(target_os = "linux")]
-fn socket_owners(inodes: &std::collections::HashSet<u64>) -> std::collections::HashMap<u64, u32> {
+fn socket_owners(
+    inodes: &std::collections::HashSet<u64>,
+    own: Option<u32>,
+) -> std::collections::HashMap<u64, u32> {
     let mut owners = std::collections::HashMap::new();
     let Ok(procs) = std::fs::read_dir("/proc") else {
         return owners;
     };
-    for entry in procs.flatten() {
-        let Some(pid) = entry
+    let pids = procs.flatten().filter_map(|entry| {
+        entry
             .file_name()
             .to_str()
             .and_then(|s| s.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+    });
+    for pid in own.into_iter().chain(pids) {
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
             continue;
         };
         for fd in fds.flatten() {
@@ -174,8 +205,9 @@ fn socket_owners(inodes: &std::collections::HashSet<u64>) -> std::collections::H
 #[cfg(target_os = "macos")]
 const LSOF_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// `lsof` names every process that holds a socket, so `own` needs no help.
 #[cfg(target_os = "macos")]
-fn table() -> Result<Vec<Row>, String> {
+fn table(_own: Option<u32>) -> Result<Vec<Row>, String> {
     use std::process::{Command, Stdio};
     let child = Command::new("/usr/sbin/lsof")
         // -n -P: no DNS, no port names; -b: never block in the kernel;
@@ -255,7 +287,7 @@ fn lsof_rows(text: &str) -> Vec<Row> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn table() -> Result<Vec<Row>, String> {
+fn table(_own: Option<u32>) -> Result<Vec<Row>, String> {
     Err("no reader of this system's TCP table".into())
 }
 
@@ -336,6 +368,99 @@ mod tests {
                 .iter()
                 .any(|l| l.port == port && l.address == "127.0.0.1"),
             "the daemon's own port is left out"
+        );
+    }
+
+    /// `lsof` lists a socket once under each process that holds it. A copy
+    /// that a child of the daemon holds is still the daemon's port (#3397);
+    /// the child's own listener, and another process on another address of
+    /// the same port, are reported.
+    #[test]
+    fn a_copy_of_the_daemons_socket_is_still_the_daemons() {
+        let row = |address: &str, port, pid, process: &str| Row {
+            address: address.into(),
+            port,
+            pid: Some(pid),
+            process: Some(process.into()),
+        };
+        let rows = vec![
+            row("127.0.0.1", 41999, 100, "roomlerd"),
+            row("127.0.0.1", 41999, 200, "zsh"),
+            row("127.0.0.1", 5432, 200, "zsh"),
+            row("0.0.0.0", 41999, 300, "nginx"),
+        ];
+        let found = |own| -> Vec<(String, u16)> {
+            select(rows.clone(), own)
+                .into_iter()
+                .map(|l| (l.address, l.port))
+                .collect()
+        };
+        assert_eq!(
+            found(Some(100)),
+            [
+                ("127.0.0.1".to_string(), 5432),
+                ("0.0.0.0".to_string(), 41999),
+            ]
+        );
+        assert_eq!(
+            found(None),
+            [
+                ("127.0.0.1".to_string(), 5432),
+                ("0.0.0.0".to_string(), 41999),
+                ("127.0.0.1".to_string(), 41999),
+            ]
+        );
+    }
+
+    /// The same, live: a child holding a copy of this process's listening
+    /// socket leaves the port out of the daemon's scan (#3397). On macOS std
+    /// marks a new socket close-on-exec in a second step, and a child that
+    /// another thread spawns in between keeps it. Here the child clears the
+    /// flag on its own copy before it execs, so it holds the socket for
+    /// certain, and no spawn of another test's can take it.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_holding_the_daemons_socket_leaves_its_port_out() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let fd = socket.as_raw_fd();
+        let mut sleep = Command::new("sleep");
+        sleep
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: one async-signal-safe call in the forked child, on its own
+        // copy of a descriptor it inherited: that copy survives the exec.
+        unsafe {
+            sleep.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let mut child = sleep.spawn().unwrap();
+        let child_pid = child.id();
+        let held = table(Some(child_pid)).map(|rows| {
+            rows.iter()
+                .any(|r| r.port == port && r.address == "127.0.0.1" && r.pid == Some(child_pid))
+        });
+        let without = listeners(Some(std::process::id()));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(held.unwrap(), "the child holds a copy of the socket");
+        assert!(
+            !without
+                .unwrap()
+                .iter()
+                .any(|l| l.port == port && l.address == "127.0.0.1"),
+            "the daemon's own port is left out, though its child holds it too"
         );
     }
 }

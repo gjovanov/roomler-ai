@@ -218,9 +218,9 @@ because this report is about the push. A save back to the value this process run
 leaves nothing waiting, so it reads `applied` at once, and a restart would change
 nothing.
 
-Two limits. A build before P1c still turns the row to `applied` at a reconnect, and
-no capability word marks the difference, so read the row's `agent_version` against
-the release that carries it. And an environment variable beats the file
+Two limits. A build before P1c, which shipped in 0.4.199, still turns the row to
+`applied` at a reconnect, and no capability word marks the difference, so read the
+row's `agent_version`. And an environment variable beats the file
 for the encoder keys (`crates/tunnel-core/src/env.rs:30`), so a key set in the
 daemon's environment reads `applied` after a restart while the environment's value
 is in force, and no restart changes that. A supervised Mac worker gets the root's

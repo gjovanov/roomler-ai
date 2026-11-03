@@ -112,7 +112,7 @@ admin. A `PUT` for someone with no row is a 404.
 `find_one_and_update`, upsert, returning the row as it stood. `None` means this is
 their first, and the unique `{agent_id, user_id}` index arbitrates two firsts on two
 pods. It runs behind the session, in `session_opened`
-(`crates/modules/remote/src/extauth.rs:1387`), so a failure here never costs the session.
+(`crates/modules/remote/src/extauth.rs:1390`), so a failure here never costs the session.
 
 | Notice | Fires when | How often |
 |---|---|---|
@@ -161,15 +161,20 @@ is written.
 | You do | It stops | It does not stop |
 |---|---|---|
 | **Bar** the person, on the audit page | This account on this device, from its next step. **It ends their external session** | Anyone with the password on another account. A compromised server |
+| **Clear gate 2** on the device | Every new login on that device. **It ends every external session there** | A compromised server |
+| **Turn gate 1 off** for the org | Every new login in that org. **It ends every external session in it** | A compromised server |
 | **Change the password** on the device | Every login with the old one, whoever tries it, whatever the server says | A session already open |
 | **Rotate the connect code** | Everyone holding the old code, at once | Anyone you give the new one to. A session already open |
 | **Turn gate 3 off** on the device | Every new login, read at the next knock, whatever the server says | A session already open |
-| Withdraw gate 2, or turn gate 1 off | Every new login on that device, or in that org | A session already open |
+| Leave an approval to run out, or narrow its ceiling | Every new login once it has run out. A narrower ceiling applies from the next session | A session already open |
 
-⚠️ **Of the server's levers, only a bar ends a session already open**: `set_enabled`,
-`set_policy` and `rotate_connect_code` end nothing. If someone is in and must be out now,
-bar them, then change the password. A guess still in progress is ended by rotating the
-code, which is what the guessing notice tells people to do.
+⚠️ **Three levers end a session already open: a bar, gate 2 cleared and gate 1 off**
+(FR-52 decision 16). An off switch means out, and none of them can be pulled by accident.
+Everything else refuses the next login and ends nothing, including an approval that runs
+out, because nobody acted. If one person is in and must be out now, bar them, then change
+the password: the bar leaves everyone else's session running, and the password is what
+stops them coming back on another account. A guess still in progress is ended by rotating
+the code, which is what the guessing notice tells people to do.
 
 A bar reads in `gates` (`extauth.rs:396`), so it holds at `start`, at `finish` and at
 `session`, and a login in flight dies with the rest. ⚠️ `standing` (`extauth.rs:447`)
@@ -200,11 +205,21 @@ A bar written after that read finds the session in the Hub, so there is no gap, 
 read was added to do it. A repeat `PUT` writes nothing and adds no log row, and it still
 ends the session, because the first may have raced one.
 
+**Gates 1 and 2 can cross a session the same way**, and nothing else reads them once it
+exists. So `session_opened` reads both again, from fresh rows, ahead of everything else
+it does (`org_gates_open`, `extauth.rs:1443`). A gate closed before that read ends the
+session there, and one closed after it finds the session in the Hub. A read that fails
+leaves the session running, as a failed `note_session` does. `set_enabled` and
+`set_policy` end sessions on a repeat too, for a bar's reason.
+
 **Across pods**, `set_principal` also publishes `terminate_external` on the control lane
-(`crates/modules/fleet/src/ctrl.rs:128`), and the pod holding the session applies it. The
-envelope names the tenant, and `terminate_external_of` checks it, so a mismatched one
-ends nothing. ⚠️ With Redis down that event never arrives: a session on the other pod
-keeps running, while every new login is still refused, because the row is in Mongo.
+(`crates/modules/fleet/src/ctrl.rs:128`), and the pod holding the session applies it.
+`set_enabled` publishes `terminate_external_org` and `set_policy` publishes
+`terminate_external_device` (`ctrl.rs:162`, `:148`). The scope is the event's name, so an
+envelope short a key ends nothing, and can never read as a wider one. Each names the
+tenant and the Hub checks it, so a mismatched one ends nothing. ⚠️ With Redis down that
+event never arrives: a session on the other pod keeps running, while every new login is
+still refused, because the rows are in Mongo.
 
 Nobody can be barred **before** their first session, because there is no row (§4). The
 code and the password cover that case.
@@ -240,10 +255,10 @@ bar them and change the password on the device. For guessing, rotate the connect
 | What | Where |
 |---|---|
 | The gates, the login relay, the session step | `crates/modules/remote/src/extauth.rs`: `gates` `:396`, `start` `:593`, `finish` `:775`, `open_session` `:1082` |
-| What follows a session | `session_opened`, `extauth.rs:1387` |
+| What follows a session | `session_opened`, `extauth.rs:1390` |
 | The notices | `crates/modules/remote/src/extauth_notice.rs` |
-| Gates 1 and 2, the code, the log, the people | `crates/modules/fleet/src/external_access.rs`: `decide_revocation` `:138`, `audit` `:705`, `principals` `:740`, `set_principal` `:806` |
-| Ending a person's sessions | `crates/modules/fleet/src/hub.rs:2552`, `ctrl.rs:128` |
+| Gates 1 and 2, the code, the log, the people | `crates/modules/fleet/src/external_access.rs`: `decide_revocation` `:138`, `set_enabled` `:443`, `set_policy` `:496`, `audit` `:743`, `principals` `:778`, `set_principal` `:844` |
+| Ending external sessions | `crates/modules/fleet/src/hub.rs`: a person's `:2552`, a device's `:2565`, an org's `:2571`. From another pod, `ctrl.rs`: `:128`, `:148`, `:162` |
 | The two collections | `crates/remote_control/src/models.rs:4546`, `:4621`; indexes `crates/modules/fleet/src/lib.rs:776`, `:789` |
 | The device's half | `agents/roomlerd/src/extauth.rs`, `agents/roomlerd/src/external_logins.rs` |
 | The page | `ui/src/views/remote/ConnectView.vue`, `ui/src/composables/useExternalLogin.ts` |
