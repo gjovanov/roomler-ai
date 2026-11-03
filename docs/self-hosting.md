@@ -299,7 +299,7 @@ bash scripts/selfhost-coturn-check.sh
 It starts coturn if it is not running, watches it for 30 seconds, then drives the
 image's own TURN client through the published port, with credentials minted the way
 the server mints them. It exits non-zero and names what failed. Each run leaves 9 relay
-ports held for 13 minutes, because the client does not end what it allocates over UDP.
+ports held for up to 13 minutes, because the client does not end what it allocates over UDP.
 
 | It says | What is wrong |
 |---|---|
@@ -314,7 +314,7 @@ ports held for 13 minutes, because the client does not end what it allocates ove
 | `NOT refused` | The deny list has a hole. See [what it refuses](#what-the-relay-refuses). |
 | `could not ask about` | coturn gave no answer about that peer, so this proves nothing about the deny list. The lines under it say why. |
 | `NOTE the relay address is 127.0.0.1` | Not a failure, but only this machine can use it. See [the two addresses](#the-two-addresses-to-set). |
-| `NOTE coturn was not running, so this started it` | It had stopped, and the note says why. See [if the server is replaced](#if-the-server-is-replaced) and [after a reboot](#after-a-reboot-or-a-docker-restart). |
+| `NOTE coturn was not running, so this started it` | It had stopped, and the note says why. See [if the server's process dies](#if-the-servers-process-dies), [if the server is replaced](#if-the-server-is-replaced) and [after a reboot](#after-a-reboot-or-a-docker-restart). |
 | `NOTE coturn has restarted … and is not climbing` | Not a failure. Each server crash costs coturn one restart. |
 
 ### What a crash loop looks like
@@ -380,6 +380,15 @@ docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost restart c
 
 `docker stop roomler` is different: coturn then has nothing to rejoin, and stays `exited`.
 A plain `up -d` brings both back.
+
+A server that crashes within seconds of starting can cost the relay the same way. coturn
+takes about 5 s to end once its healthcheck fires, and Docker tries to restart it once. If
+the server is still coming back at that moment, the attempt fails with
+`cannot join network namespace of container: … is restarting`, and Docker does not try
+again. In 10 crashes in a row, each as soon as the server was back, coturn was lost by the
+second, and it stayed `exited` after the server had recovered, until a plain `up -d`. A
+server that had run for at least 12 s healed wherever its crash fell: 6 of 6, with the kill
+placed from 0.7 to 8 s before coturn's next probe.
 
 ### If the server is replaced
 
@@ -448,8 +457,11 @@ be a way into the machines around it. With the shipped flags it answers 403 to a
 | `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | the `--denied-peer-ip` lines |
 | `100.64.0.0/10`, the range overlay meshes use | the `--denied-peer-ip` lines |
 | `169.254.0.0/16`, including the cloud metadata address | coturn 4.18.0 itself |
-| loopback | coturn itself |
+| loopback, `0.0.0.0`, `255.255.255.255` | coturn itself |
 | multicast | `--no-multicast-peers` |
+
+It has no IPv6 relay: a client that asks for one gets 440, so no IPv6 peer is reachable
+through it either.
 
 That includes the other containers on the stack's network and its gateway, which
 reaches every listener on the host. The check tries each of them.

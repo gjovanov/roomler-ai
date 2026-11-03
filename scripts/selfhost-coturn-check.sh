@@ -76,8 +76,12 @@ trap cleanup EXIT
 echo "== coturn from $(basename "$FILE")"
 # `up -d` below starts a stopped coturn, and says nothing about why it had stopped.
 WAS="$("${DC[@]}" ps -aq coturn 2>/dev/null)"
-if [ -n "$WAS" ] && [ "$(docker inspect -f '{{.State.Status}}' "$WAS")" != running ]; then
-  note "coturn was not running, so this started it. It had stopped with: $(docker inspect -f 'exit {{.State.ExitCode}} {{.State.Error}}' "$WAS")"
+if [ -n "$WAS" ]; then
+  case "$(docker inspect -f '{{.State.Status}}' "$WAS")" in
+    # Restarting is Docker's own doing, and the watch below judges it.
+    running | restarting) ;;
+    *) note "coturn was not running, so this started it. It had stopped with: $(docker inspect -f 'exit {{.State.ExitCode}} {{.State.Error}}' "$WAS")" ;;
+  esac
 fi
 "${DC[@]}" up -d --no-build coturn >"$OUT" 2>&1 || {
   fail "docker compose up"
@@ -299,11 +303,18 @@ OWN=" $(docker exec "$CID" hostname -I 2>/dev/null) "
 SEEN=" "
 for c in $("${DC[@]}" ps -q); do
   name="$(docker inspect -f '{{.Name}}' "$c")"
-  for a in $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.Gateway}} {{end}}' "$c"); do
-    case "$OWN$SEEN" in *" $a "*) continue ;; esac
-    SEEN="$SEEN$a "
-    refused "$a" "on this stack's network (${name#/})"
-  done
+  while read -r ip gw <&3; do
+    for a in $ip $gw; do
+      case "$OWN$SEEN" in *" $a "*) continue ;; esac
+      SEEN="$SEEN$a "
+      # The gateway is the host's, so it is named as that, not as the container it was read from.
+      if [ "$a" = "$gw" ]; then
+        refused "$a" "this stack's gateway"
+      else
+        refused "$a" "on this stack's network (${name#/})"
+      fi
+    done
+  done 3< <(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.Gateway}}{{println}}{{end}}' "$c")
 done
 
 # A TCP allocation would reach every TCP listener on the one address the deny list lets
