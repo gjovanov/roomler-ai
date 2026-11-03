@@ -423,8 +423,8 @@ question; two moved to `read_if_present`.
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2749`, `:2771`), at the clean-run promotion
-(`record_clean_run_at`, `:2620`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4193`). Each save
+(`record_clean_run_at`, `:2626`), at every `ConfigSet`, and at enrollment. The daemon, the
+desktop app and the setup wizard all write it through `config::save` (`:4201`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 

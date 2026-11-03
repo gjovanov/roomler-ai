@@ -454,7 +454,7 @@ OS: FR-43's practice of keeping the decision out of `cfg(target_os)`.
 
 | Feature | When | What the hello says |
 |---|---|---|
-| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:115`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3269`); `unavailable.audio = no-backend` |
+| `audio` | the `audio` feature is built but the OS has no capture backend: macOS until P2a (`audio/mod.rs:115`) | the `audio` list is empty, so the daemon's session gate offers no track (`signaling.rs:3312`); `unavailable.audio = no-backend` |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` (`caps.rs:2622`), the test capture makes before `no_display` | `supports_clipboard: false` and an empty `clipboard`; `unavailable.clipboard = no-session`. FR-93 P7 makes it reachable through the session |
 | `clipboard-image-events` | everywhere but Windows, whose watcher alone kept image events (`clipboard.rs:817-822` before P3e-3a); since P3e-3a a Linux X11 session keeps them too, behind its change gate (`agents/roomlerd/src/clipboard.rs:1076`), and since P2e-1 a Mac, behind its change count (`agents/roomlerd/src/encode/caps.rs:2474`) | `events` and `images` stay: text still syncs, and an image moves on request. `not-watched` |
 | `sas` | Windows | `keys-only`: the button types three ordinary keys, which apps on the desktop get and the lock screen does not. Since P4a a SystemContext worker on a host whose policy lets services says `input: sas` instead, and the button sends the real sequence (D11) |
