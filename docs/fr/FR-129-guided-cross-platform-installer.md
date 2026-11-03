@@ -32,10 +32,10 @@ The wizard's step 3 is a text box: "Paste a fresh token from the Roomler admin U
 signup page or says where a token comes from. To get one, a new person must:
 
 1. register — production answers with a message and **no session**
-   (`crates/api/src/routes/auth.rs:287-300`);
-2. open the activation email — `login` refuses an unactivated account (`auth.rs:450-454`);
+   (`crates/api/src/routes/auth.rs:313-326`);
+2. open the activation email — `login` refuses an unactivated account (`auth.rs:487-491`);
 3. log in;
-4. create an org, unless they filled the optional org fields at signup (`auth.rs:226-231`);
+4. create an org, unless they filled the optional org fields at signup (`auth.rs:227-249`);
 5. find Devices → Enroll device, which mints a **10-minute single-use** token
    (`crates/modules/fleet/src/agent.rs:25`, `:113-164`, behind `MANAGE_AGENTS`);
 6. copy it — the dialog says "then paste the token into the wizard"
@@ -85,8 +85,8 @@ it. Do not shift these anchors with code that moved later.*
 | token claims | `crates/services/src/auth/mod.rs:82-96`, `:530-563` | `EnrollmentClaims { sub = issuing admin, tenant_id, jti, anchor }`; ten audiences in `TokenType` (`:37-78`) |
 | token redeem | `crates/modules/fleet/src/agent.rs:180-260`; route `fleet/src/lib.rs:480-481`, `:567` | public `POST /api/agent/enroll`: archived org refused (`:195-210`), plan device cap before the single-use claim (`:225-245`), the claim fails closed (`:247-263`) |
 | tunnel token | `crates/modules/network/src/routes/tunnel.rs:53-75`; mint `crates/services/src/auth/mod.rs:731` | any member (`is_member`) mints a `TunnelEnrollment` token |
-| registration | `crates/api/src/routes/auth.rs:167-325` | creates the user; the org inline only with `tenant_name` + `tenant_slug` (`:250-255`); production returns no session (`:311-324`) |
-| login gate | `crates/api/src/routes/auth.rs:366-370` | an unactivated account is refused |
+| registration | `crates/api/src/routes/auth.rs:167-355` | creates the user; the org inline only with `tenant_name` + `tenant_slug` (`:276-281`); production returns no session (`:341-354`) |
+| login gate | `crates/api/src/routes/auth.rs:396-400` | an unactivated account is refused |
 | return path | `ui/src/plugins/router.ts:385-411` | `pending_redirect` in **sessionStorage** — one tab only; same-origin paths only |
 | short-lived capability row | `crates/db/src/models/consent_request.rs:13-37` | an unguessable `token`, a status enum, an `expires_at` TTL, redeemed by a public token-keyed route — the shape a pairing row needs |
 | rate limits | `crates/api/src/lib.rs:111-127`, `:143-145`, `:393`; `crates/core/src/rate_limit.rs:37-66` | per-IP governor on `/api`; `AuthRateLimiter` on register/login; a per-(caller, resource) sliding window for exec, SSH and relay mints |
