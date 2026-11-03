@@ -10,9 +10,9 @@
 //! Scope: the agent exits after spawning the installer so the installer
 //! can overwrite the binary without `ERROR_SHARING_VIOLATION`. The
 //! Scheduled Task / systemd unit / LaunchAgent registered via
-//! `roomlerd service install` re-launches the new version on
-//! the next login (Windows) or immediately (Restart=on-failure on
-//! Linux, KeepAlive on macOS).
+//! `roomlerd service install` re-launches the new version within a
+//! minute of the install (Windows, the registration's one-shot starts,
+//! #3292) or immediately (Restart=on-failure on Linux, KeepAlive on macOS).
 //!
 //! Trust model: we assume GitHub-over-TLS is sufficient for now. No
 //! signature check beyond the MSI's cargo-wix / codesign identity
@@ -420,16 +420,22 @@ pub fn update_attempt_marker_path() -> Option<PathBuf> {
 /// moment the installer process is launched. Best-effort: any I/O
 /// failure is logged but does not block the update path (we'd
 /// rather have a working install with a noisy crash counter than
-/// no install at all).
-fn record_update_attempt() {
+/// no install at all). The per-user MSI's `service stop --for-upgrade`
+/// (#3292) calls it too: an upgrade by hand has no installer spawn of ours,
+/// and that caller reads the answer: whether the marker is on disk.
+pub fn record_update_attempt() -> bool {
     let Some(p) = update_attempt_marker_path() else {
-        return;
+        return false;
     };
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(&p, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
-        tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
+    match std::fs::write(&p, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
+            false
+        }
     }
 }
 
@@ -1338,34 +1344,47 @@ impl Drop for ProtectedDirSd {
 /// here because its `Builder` has no way to pass Windows security attributes.
 #[cfg(target_os = "windows")]
 fn create_fresh_protected_dir(base: &std::path::Path) -> std::io::Result<PathBuf> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
-
     for _ in 0..8 {
         let name = format!("{}{:016x}", STAGING_DIR_PREFIX, rand::random::<u64>());
         let dir = base.join(name);
-        let wide: Vec<u16> = dir
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut sd = ProtectedDirSd::new()?;
-        // SAFETY: a NUL-terminated path; the descriptor lives in `sd` for the
-        // duration of this call.
-        let ok = unsafe { CreateDirectoryW(wide.as_ptr(), sd.attributes()) };
-        if ok != 0 {
-            return Ok(dir);
+        match create_protected_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            // Name collision — try again with a fresh random suffix.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
         }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(e);
-        }
-        // Name collision — try again with a fresh random suffix.
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
         "could not allocate a unique staging dir name",
     ))
+}
+
+/// Make `dir`, which must not exist yet, readable and writable by SYSTEM and
+/// Administrators alone: the DACL is set AT CREATION ([`ProtectedDirSd`]), and
+/// the create fails if anything is already at the name, so a folder someone else
+/// made first is never taken for ours. It also fails for a caller who cannot
+/// name Administrators as the owner. The setup wizard stages what it runs
+/// elevated in one of these (#3246).
+#[cfg(target_os = "windows")]
+pub fn create_protected_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sd = ProtectedDirSd::new()?;
+    // SAFETY: a NUL-terminated path; the descriptor lives in `sd` for the
+    // duration of this call.
+    let ok = unsafe { CreateDirectoryW(wide.as_ptr(), sd.attributes()) };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// macOS: the per-user `confstr(_CS_DARWIN_USER_TEMP_DIR)` temp dir is

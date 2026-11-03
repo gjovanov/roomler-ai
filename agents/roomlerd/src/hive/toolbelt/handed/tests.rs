@@ -119,6 +119,32 @@ async fn close_handed_stops_the_endpoints_own_token_and_nothing_else() {
     assert!(matches!(close_handed(&serving, 5), Answer::Done));
 }
 
+/// #3305 — a hand-over whose close came first is not served, as
+/// `vault_connect`'s is not: each call is answered on a task of its own, and
+/// served, nothing would stop it but the worker's end.
+#[tokio::test]
+async fn a_hand_over_that_crosses_its_close_is_not_served() {
+    let serving = Arc::new(Serving::default());
+    assert!(matches!(close_handed(&serving, 7), Answer::Done));
+    let dir = tempfile::tempdir().expect("a temp dir for a test socket");
+    let path = dir.path().join("t.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).expect("a test socket binds");
+    let answer = serve_handed(
+        &serving,
+        Arc::new(Link::worker(tokio::io::sink())),
+        ObjectId::new(),
+        1,
+        0,
+        7,
+        OwnedFd::from(listener),
+    );
+    assert!(matches!(answer, Answer::Done));
+    assert!(
+        tokio::net::UnixStream::connect(&path).await.is_err(),
+        "the listener that came after the close went with its answer"
+    );
+}
+
 // ─── The daemon's side: `opened` / `closed` ────────────────────────────────
 
 #[tokio::test]

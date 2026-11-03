@@ -1,7 +1,7 @@
 # FR-1: RustDesk-parity remote-desktop drag smoothness
 
 **Status:** phases P1–P4 shipped + field-verified; P2/P3 shipped, relay-gated after field
-read; P5 shipped in 0.4.4 (field gate pending); P6 + P7-HUD remaining. Tracking issue: `FR-1` in gjovanov/roomler-ai/issues.
+read; P5 shipped in 0.4.4; P6 + P7-HUD shipped in #793 (0.4.6 + web). **Field reads 2026-10-26 and 2026-11-02 (prod `agent_logs`):** P7's end-to-end age is on 96 % of the week's heartbeat windows (AC8, its half); P5's `>=45` fps at 2880x1800 Iris-Xe is reached with the frame on the GPU (`zero_copy`, 60 fps, encode 16.3 ms) and not on today's default path (38 fps; AC6, closes with FR-132 or the operator's call); P6's field read is owed (AC7); AC9 is the operator's A/B. Write-up: `docs/remote-desktop-latency.md`. Tracking issue: `FR-1` in gjovanov/roomler-ai/issues.
 
 ## Goal
 
@@ -71,13 +71,23 @@ lumpiness-robust estimator (its own follow-up FR when picked up).
       verified from neo16, CORPLAP-1 AND the MacBook viewing WINHOST-J)
 - [x] Relay unaffected vs rc.483 (0.4.3 gating; regression caught same-day on CORPLAP-3 +
       CORPLAP-2 and reverted)
-- [ ] P5: ≥45 fps at 2880×1800 on Iris-Xe-class with even cadence (WGC drop ratio no
-      longer ~33 % random; `avg_encode_ms` ≤ ~17 at native)
+- [~] P5: ≥45 fps at 2880×1800 on Iris-Xe-class with even cadence (WGC drop ratio no
+      longer ~33 % random; `avg_encode_ms` ≤ ~17 at native). *Met with `zero_copy` on
+      (2026-10-30, FR-118 §9.10: 594 of 596 windows at ≥ 50 fps, median 60.0, encode
+      16.34 ms). Not met on the default path: 0 of 1 701 windows at ≥ 45 in the week to
+      2026-11-02, highest 42.8. WGC drop ratio median 2 % on the one WGC host, which is
+      not Iris-Xe. Closes when FR-132 makes the GPU path the default, or on the
+      operator's call that the switch-on proof is enough.*
 - [ ] P6: pointer send rate independent of viewer rAF load
-- [ ] P7: HUD shows end-to-end age; drag test becomes a number comparable to RustDesk's
-      "Delay"
+- [~] P7: HUD shows end-to-end age; drag test becomes a number comparable to RustDesk's
+      "Delay". *The number exists fleet-wide: 123 375 of 128 325 heartbeat windows in the
+      week to 2026-11-02, direct median 15 ms, relay 42 ms. Owed: the pill read in a real
+      viewer beside the agent's `viewer_age_ms`.*
 - [ ] Final A/B on the reference pair: subjective parity-or-better vs RustDesk on BOTH
       transports
+- [x] Docs: `docs/remote-desktop-latency.md` created (P5/P6/P7 design + the 2026-10-26
+      field evidence, mermaid pipeline, `file:line` anchors), linked from
+      `docs/README.md`'s index
 
 ## Open decisions
 
@@ -102,3 +112,5 @@ lumpiness-robust estimator (its own follow-up FR when picked up).
 | 0.4.3 (relay gating) | WINHOST-J "much better now", verified from neo16, CORPLAP-1 and MacBook; relay reverted to rc.483 posture (re-test pending) |
 | 0.4.4 (P5) | **field PASS 2026-08-27**: "WINHOST-J's screen works nicely now" (direct); relay pairs handled by FR-10 (0.4.5, its own field PASS) |
 | 0.4.6 + web deploy (P6+P7, #793) | pending — expect: `~NN ms` age pill on the DC canvas paths (WINHOST-J ≈ 40–70 ms direct; CORPLAP-3-from-neo16 ≈ 120–180 ms relay; CORPLAP-1 pairs ≈ 200–300 ms — making FR-14's physics visible), drag cadence unchanged-or-better under heavy video |
+| 0.4.167-0.4.172 (field read 2026-10-26, prod `agent_logs`, read-only via mars) | **AC6 partial** — at the named 2880x1800 Iris-Xe geometry (av1_qsv, 918 windows/8 sessions) delivered fps maxed 38.5, 0% of windows `>=45`, encode ~20 ms, pace engaged 100% @ 50 (`>=45` NOT reached: the pace keys on encode time, the 5.2 MPix pipeline delivers only ~38); at 1920x1200 Iris-Xe (hevc_qsv) motion-median 45 fps, encode ~10.5 ms (met at the lower geometry); WGC drop ratio median 2% on the one WGC host (was ~33%). **AC8 met (HUD half)** — end-to-end age a real value on 209709/259704 heartbeat windows, 294 sessions/10 hosts; direct median 15 ms, relay median 36 ms. **AC7** — the `setTimeout(8 ms)` + `pointerrawupdate` mechanism is confirmed in source; a foreground-browser field read is owed. Full write-up + anchors: `docs/remote-desktop-latency.md` §6 |
+| 0.4.177-0.4.197 (field read 2026-11-02, prod `agent_logs`, read-only via mars) | **AC6:** every 2880x1800 heartbeat of the week, 2 831 windows, 17 sessions, one host (`av1_qsv`, direct). `input_path=cpu`, the default: 1 701 windows, motion median 37.1 fps, highest 42.8, none `>=45`, encode 17.7 ms. `input_path=gpu`, `zero_copy` on: 986 windows of one session (FR-118 §9.10's test pattern), median 60.0, 89 % `>=45`, encode 16.3 ms. WGC drop ratio median 2 %, p90 2, max 42, 2 571 samples, one NVENC host. **AC8:** age on 123 375 of 128 325 windows; direct 15 / 30 / 62 ms (med / p90 / p99, 411 sessions), relay 42 / 80 / 179 ms (150 sessions). **AC7:** still owed. **AC9:** the operator's. |

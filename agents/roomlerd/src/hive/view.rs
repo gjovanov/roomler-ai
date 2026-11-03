@@ -1306,4 +1306,4 @@ async fn on_feed(
 }
 
 #[cfg(all(test, unix))]
-mod tests;
+pub(crate) mod tests;

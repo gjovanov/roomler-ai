@@ -362,7 +362,7 @@ installed. Measured on 0.4.143 before the fix: a feed offering `agent-v0.4.999`
 with the signed 0.4.142 `.deb` passed the `.asc` gate and was staged for
 install (FR-97 §8). Each format now states its own version inside the signed
 bytes, and the updater refuses when it disagrees with the tag
-(`updater.rs:1690`):
+(`updater.rs:1704`):
 
 | Format | Where the artifact states its version | Read by | Anchor |
 |---|---|---|---|
@@ -457,6 +457,15 @@ The same freeze risk applies to the signing gate: a release that ships an
 unsigned or mis-signed Windows artifact does not error, it just stops updating
 the fleet. The `require` mode in `.github/actions/sign-windows` is what
 prevents that reaching a release tag — do not weaken it.
+
+**The setup wizard makes the publisher check too, and the version check not**
+(#3246). `code_signature::verify_open_publisher` reads through a handle the
+wizard holds, on the MSI, the desktop companion, and every file but plain text
+in the Windows tunnel zip; [installation.md](installation.md) has what happens on
+each path and why the check that counts runs elevated. The wizard binds no
+version, so a hostile server
+can offer it an older signed MSI under its own tag: the signature says whose, not
+which.
 
 ## 8. Enterprise pilot path (before/without the public cert)
 

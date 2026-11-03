@@ -1,6 +1,6 @@
 # FR-45 — Portal capture: Wayland where there is no scanout
 
-**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 → P3c COMPLETE and field-verified — **a Wayland desktop is captured through the portal and delivered to the daemon as a correct picture**. **P4 (RemoteDesktop input) FIELD-VERIFIED** — injection lands to the exact requested pixel, scroll sign correct, restore round trip clean. **P5 (mutter direct) FIELD-VERIFIED on WSL2, through the daemon's own cascade, encoding with `av1_nvenc` at native 1920×1080 in 11.4 ms — AC2 met** (2026-09-25). **Docs:** [`docs/linux-capture.md`](../linux-capture.md) · **Owner:** agent / capture
+**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 → P3c COMPLETE and field-verified — **a Wayland desktop is captured through the portal and delivered to the daemon as a correct picture**. **P4 (RemoteDesktop input) FIELD-VERIFIED** — injection lands to the exact requested pixel, scroll sign correct, restore round trip clean. **P5 (mutter direct) FIELD-VERIFIED on WSL2, through the daemon's own cascade, encoding with `av1_nvenc` at native 1920×1080 in 11.4 ms — AC2 met** (2026-09-25). **AC8 met 2026-11-02, on FR-93 P2c's pill; every criterion is ticked, and P5b is [#3343](https://github.com/gjovanov/roomler-ai/issues/3343).** **Docs:** [`docs/linux-capture.md`](../linux-capture.md) · **Owner:** agent / capture
 
 ## Goal
 
@@ -372,8 +372,15 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
       the portal code is Linux-only, feature-gated AND env-gated, so it cannot
       reach the other platforms. Windows/macOS CI lanes green throughout
 - [x] Field-verified with the **before** state recorded beside the after — done for P2a (`no-session-bus` → `available`, with an in-session control); each later phase repeats it
-- [ ] The spec and the UI both say **attended-only** — no greeter, no locked
-      screen
+- [x] The spec and the UI both say **attended**: a person granted it at the screen,
+      and it never captures a greeter. *Reworded 2026-11-02 from "attended-only — no
+      greeter, no locked screen". The UI half is FR-93 P2c, this criterion's option (b):
+      `rc:video-info` carries `capture_arm` and `attended`, and the viewer's pill reads
+      "desktop portal · allowed at the screen" (`useRemoteControl.ts:1277`), watched on
+      P2d-3's build and on 0.4.138 (FR-93 §11, 2026-10-13 and 2026-10-16). "No locked screen" is
+      not true of every desktop: KWin keeps streaming its lock screen, on a token a person
+      granted (same rows). FR-93's D4 names option (b) as a recommendation and has no
+      recorded tick. It was built and shipped, and it is the stricter of the two options.*
 - [x] **P4: input lands.** Field-verified on `scw-m2-asahi` (GNOME Wayland,
       RemoteDesktop v2), measured against DRM capture as ground truth: three
       `mouse_move` events landed at **(480,270) for 0.25/0.25**, **(1440,648)
@@ -441,7 +448,8 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
   compositor (`gnome-shell --nested` under WSLg) reads evdev. If it does, P4
   disappears; if it does not, the portal's RemoteDesktop interface is the only
   input path and P4 is mandatory. One nested session answers it.
-- **P5b — session resolution for hosts with no graphical logind session.**
+- **P5b — session resolution for hosts with no graphical logind session** (now
+  [#3343](https://github.com/gjovanov/roomler-ai/issues/3343)).
   Surfaced 2026-09-25 (field log): as shipped, `mutter_capture` cannot serve a
   host whose compositor user has no `x11`/`wayland` logind session — WSL2, and
   any headless-mutter box — because `helper::spawn_child` resolves the session
@@ -531,3 +539,4 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
 | 2026-09-25 | 🏆 **AC2 MET like for like — 1080p on the P5 path, 0.4.102, WSL2** | Viewer opened from the signed-in controller; its `rc:resolution` default is `original` and no preference was stored for this device, so the request does not depend on the viewport and the hidden tab is not a resolution confound (checked in `localStorage` before connecting). Every session took the same path: `portal capture: using org.gnome.Mutter.ScreenCast DIRECTLY` → `portal-helper: mutter node 44 on Meta-0 (ScreenCast v4, 16–60 ms)` → `streaming 1920x1080` → `capture: backend=portal … width=1920 height=1080` → `ffmpeg encoder opened … encoder="av1_nvenc" width=1920 height=1080 fps=30`; no slow-link line. **109 `DC pump heartbeat`s across 5 sessions, all `1920x1080`, `encoder="av1_nvenc"`, `avg_encode_ms` mean 11.39 (min 6.24, max 16.73)**; per session 7.06 (n=3), 8.69 (n=4), 8.86 (n=5), **12.00 (n=30, ~60 s)**, **11.66 (n=67, ~2.2 min, 6 484 frames captured)** — the short sessions' means are dominated by the opening frames, so the sustained figure is ~11.7–12 ms: **1.1–1.15× the 10.4 ms baseline**, `target_fps=30`, `constrained=true` (relay), `target_bps` 2.7–3.2 M. The viewer's HUD agreed: `1920×1080 shown at 1.08× ~45 ms`, `AV1 4:2:0 HW (av1_nvenc) · relay · dec HW`. ⚠️ The hidden tab's decode-progress watchdog still re-created sessions (`Connection lost — reconnecting … Reconnected in 1.8 s after 1 failed`), though two ran a full minute; the agent-side heartbeats are valid regardless. |
 | 2026-09-25 | Two log lines on this path that are noise today and worth a look | (1) `FFmpeg DC pump: encoder ignored forced keyframe — rebuilding to emit a guaranteed IDR (vp9_qsv-class runtime-force bug)` fired once per session ~14 s in, on **`av1_nvenc`** — the handling covers it (a sub-second rebuild and a fresh IDR), but NVENC ignoring a forced keyframe is not the case the message was written for; encoder-side, not FR-45's. (2) `portal capture: frame stream ended error=failed to fill whole buffer` at WARN on **every** normal session teardown — the reader hits EOF mid-frame when the helper is killed with the capture; harmless, but a WARN that fires on every clean stop should become a debug line when the capture is being dropped (`portal/backend.rs`). |
 | 2026-09-25 | ✅ **Host restored and verified** | In the order the landmine dictates: the rig down FIRST (`fr45-*` units stopped, none left), then a bounded wait for the shared host to have no builder running (fired at load 3.9), then the drop-in removed, `daemon-reload`, restart. The second fresh probe of the run (`cache miss … a ROOMLERD_* knob changed` — restoring the old knob set misses the single-entry cache too) completed in **6.6 s**, `rc:agent.hello sent` for both orgs, `NRestarts=0`; Xvfb `:103` back with xfwm4 and the two startup apps; only the three standing drop-ins; no leftover mutter/weston/`portal-helper`; logind back to its two `tty` sessions; peers online. The daemon's own write-back to `rate_memory.json` after the run: **3 187 500 bps** for the relay it nominated — a healthy number where the morning's entry held 43 514 (⚠️ a different relay address was nominated this time, so this is not a same-key A/B; the artefact's key is simply gone, and the pair opens with no memory next time). |
+| 2026-11-02 | AC8 read back against what shipped | The viewer says it: FR-93 P2c put `capture_arm` and `attended` on `rc:video-info`, and the pill "desktop portal · allowed at the screen" was watched on KDE in FR-93's rows of 2026-10-13 and 2026-10-16, with "GNOME screencast · asks nobody" beside it on mutter. The criterion's "no locked screen" had gone out of date in the same rows: KWin streams its lock screen on a restored token. So the criterion is reworded to what holds, and `docs/linux-capture.md` §4.4 and its table stop saying the arm can never show a lock. No new field run: both facts were read on those days. |
