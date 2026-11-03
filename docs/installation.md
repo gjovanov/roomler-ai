@@ -146,7 +146,11 @@ install refuses it before anything is downloaded (`:290`). Before the enroll it
 also stops on a config it may not read (`:634`, never reported as a damaged
 config) or a folder it may not write (`:640`). The token is never spent on a
 config that cannot be written. A **fresh** install of that role still works
-from a double-click: the folder is not hardened yet.
+from a double-click: the folder is not hardened yet. The folder can outlive the
+service (`install.ps1 -Uninstall` leaves it), so the note says "This device
+already has the background service" only when detection found one, and
+otherwise "An earlier background service left its settings on this device"
+(#3247 item 11, `agents/roomler-setup/src/front/app.js`, `elevationNoteLead`).
 
 **The wizard asks for those rights itself** (FR-129 C3). The note on its first
 page carries a **Restart as administrator** button: the wizard starts its own
@@ -185,10 +189,16 @@ it happens on Welcome, before a token exists. The elevated copy
    default, and the Continue gate as usual.
 
 A right-click **Run as administrator** by a person who is an administrator works
-as it always has, in that account's own folder. **With another account's password
-it does not** (the white window above, or Edge's "We couldn't create the data
-directory"): that start has no limited copy to name the session's folder. Start the
-wizard normally and use the button.
+as it always has, in that account's own folder. **With another account's password**
+that start has no limited copy to name the session's folder, so it finds it (#3229): the
+owner of the session's `explorer.exe` from `WTSEnumerateProcessesW`, and that SID's folder
+from the machine's `ProfileList`. It then opens with only the machine-wide service on offer,
+as the button does. If it finds another account's shell but no folder that person can use
+(say a profile whose `AppData\Local` is elsewhere), it says so and stops, before any window,
+instead of the white window above or Edge's "We couldn't create the data directory". A
+session with no Explorer at all (a replaced shell) cannot be told apart from a person elevating
+themselves, and still shows that white window: there, start the wizard normally and use the
+button.
 
 **The cards follow what can work here** (`role::RoleLimit`,
 `agents/roomler-setup/src/role.rs:191`), and a note on Welcome says why:
@@ -210,7 +220,7 @@ that person's browser and profile, at medium integrity.
 that folder and `HKCU\Environment`, and the same image goes on to run elevated:
 
 - it loads DLLs from System32 alone (the linker's `/DEPENDENTLOADFLAG:0x800`,
-  `SetDefaultDllDirectories`, and `secur32.dll` and `wintrust.dll` delay-loaded, since that flag
+  `SetDefaultDllDirectories`, and `secur32.dll`, `wintrust.dll` and `wtsapi32.dll` delay-loaded, since that flag
   does not reach an import's own imports), and `pe-dependent-load-flags.ps1` reads the flag and the import table
   back from the EXE in CI, in the release lane and in the verifier;
 - it names every program it starts by a full path from the kernel, and
@@ -1006,7 +1016,7 @@ alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives fro
 the binary's symbols.
 
 Neither floor can strand a running daemon on the updater's offline `dpkg --install`
-rung (`agents/roomlerd/src/updater.rs:2313`), which is the reason libva and
+rung (`agents/roomlerd/src/updater.rs:2329`), which is the reason libva and
 `iproute2` stay out of `depends`. A host where the daemon runs already has the real
 library and OpenSSL, because without them it cannot start. A healthy install
 upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,

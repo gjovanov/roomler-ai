@@ -192,6 +192,19 @@ OLD geometry. The viewer must never see a geometry change before its
 
 ### P2 — the per-frame encode call
 
+> **Status 2026-11-03 — the canary is built; the question it answers changed.**
+> FR-70 M1 moved capture, scale and encode onto their own OS thread
+> (`media_thread`, on since 0.4.70), so the encode call below no longer runs on
+> a tokio worker, and "dedicated encoder thread or not" was settled by that
+> move, not by measurement. What is left of AC4 is the measurement itself: does
+> anything still starve the runtime the pump and the overlay share? The canary
+> this section designed is now `agents/roomlerd/src/runtime_canary.rs`, a
+> 10 ms timer on the daemon's main runtime with a 10-minute lateness summary
+> and a WARN at the stall watch's 100 ms bar (manual §10,
+> [`docs/stall-watch.md`](../stall-watch.md)). It serves FR-70 AC1 as well.
+> Owed: a 7-day fleet read on the release that carries it, beside the STALL
+> census.
+
 **Confirmed mechanism, unquantified harm.** `FfmpegEncoder::encode()` is
 `async fn` in signature only — its body is `self.encode_sync(&frame)` with zero
 `.await`, and `spawn_blocking` appears nowhere in `encode/` except in comments.
@@ -429,6 +442,21 @@ path), FR-63 #1243, FR-64 #1244, #1237 (the sibling route war).
 ## Field-verification log
 
 _(every entry must carry a before/after from the stall watch.)_
+
+- **2026-11-03 — the census reads AC3, AC4 and AC5 too.** `--swaps`, `--canary` and
+  `--rekeys` are modes of the same bounded server read (the manual's §7.1), so
+  each of those criteria has one instrument for its before and its after.
+  - **The two ends agree.** One day on one Windows host, 2026-11-02: `--swaps`
+    reads the same 149 heartbeats and the same dims swap (196.4 ms) from the
+    files and from the server. `--rekeys` reads 14 140 pokes from the files and
+    14 128 from the server, one sweep of 12 lost in a batch the uploader counted
+    nowhere (`dropped=0`), and the gate replay keeps 4 004 at both ends.
+  - **P3's before, every device, 7 days (2026-10-27 04:10Z .. 2026-11-03
+    04:10Z):** 208 210 pokes, 64 138 kept by the gate replay, 33 710 route waves,
+    1 399 direct and 786 relay revalidations failed. The Mongo pod's restart
+    count read 1 before and after.
+  - **The canary has no lines yet**: no released build carries P2. `--canary`
+    reads it from the first release that does.
 
 - **2026-11-03 — the census moves to the server, and its first read splits by
   build.** One week of `agent_logs` (2026-10-27 02:00Z .. 2026-11-03 01:45Z): 397 029

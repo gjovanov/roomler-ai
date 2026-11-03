@@ -156,9 +156,15 @@ pub async fn mint_key(
     )
     .await?;
 
+    let tenant = state.tenants.base.find_by_id(tid).await?;
+    // #3042 — a key minted here could only be refused at the enroll route.
+    if tenant.is_archived {
+        return Err(ApiError::Forbidden(
+            crate::agent::ARCHIVED_ORG_REFUSES_ENROLLMENT.to_string(),
+        ));
+    }
     // Gate 1: the class switch. Checked at mint so an admin learns NOW
     // rather than when the first runner fails to come up.
-    let tenant = state.tenants.base.find_by_id(tid).await?;
     if !tenant.settings.ephemeral_keys_enabled {
         return Err(ApiError::Forbidden(
             "Ephemeral enrollment keys are disabled for this organization \
