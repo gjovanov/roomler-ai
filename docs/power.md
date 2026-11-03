@@ -111,7 +111,7 @@ sequenceDiagram
 heartbeat as an optional `power`
 ([`signaling.rs:704`](../crates/remote_control/src/signaling.rs#L704)). It is a
 claim by the device, shown and never enforced on. The keeper publishes it before
-anything connects ([`app.rs:4775`](../agents/roomlerd/src/app.rs#L4775)) and
+anything connects ([`app.rs:4801`](../agents/roomlerd/src/app.rs#L4801)) and
 after every pass, with what it actually holds, not what it wanted
 ([`power.rs:319`](../agents/roomlerd/src/power.rs#L319)).
 
@@ -152,7 +152,7 @@ sleep would say hello again and erase the reason.
 ### 3.3 The server
 
 - The fleet socket treats `rc:agent.sleeping` as the goodbye
-  ([`socket.rs:729`](../crates/modules/fleet/src/socket.rs#L729)). It records the
+  ([`socket.rs:737`](../crates/modules/fleet/src/socket.rs#L737)). It records the
   notice first, then leaves its loop, so the ordinary teardown runs at once: the
   hub unregistration, the `Offline` write, and the offline transition. Without
   the goodbye the device would read online until the receive deadline reaped a
