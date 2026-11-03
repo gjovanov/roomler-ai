@@ -153,6 +153,37 @@ mod front_tests {
         assert!(js.contains("invoke(\"cmd_relaunch_elevated\""));
     }
 
+    /// #3247 item 11 — `install.ps1 -Uninstall` removes the service and leaves
+    /// its hardened folder, so a limited wizard showed "Daemon: no existing
+    /// install detected." and, under it, "This device already has the
+    /// background service". The note's first sentence now follows detection.
+    #[test]
+    fn the_elevation_note_says_a_service_is_there_only_when_one_is() {
+        let html = include_str!("front/index.html");
+        let note = html
+            .find("<div id=\"elevation-note\"")
+            .expect("the elevation note");
+        let end = note + html[note..].find("</div>").expect("the note's end");
+        assert!(
+            html[note..end].contains("<span id=\"elevation-note-lead\">"),
+            "the first sentence is its own element, inside the note"
+        );
+        let js = include_str!("front/app.js");
+        assert!(
+            js.contains(
+                "document.getElementById(\"elevation-note-lead\").textContent = elevationNoteLead(a.kind);"
+            ),
+            "Welcome sets the sentence from what detection found"
+        );
+        assert!(
+            js.contains("return kind === \"permachine\" || kind === \"ambiguous\""),
+            "only an installed per-machine service is called one"
+        );
+        assert!(js.contains(
+            "\"An earlier background service left its settings on this device, in a folder only administrators may open.\""
+        ));
+    }
+
     /// FR-129 C1 — the operator, 2026-10-30: the wizard never calls the
     /// daemon an "agent". The text a person sees in the page (comments and
     /// markup aside) says `roomlerd`, "the daemon" or "device".
