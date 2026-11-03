@@ -61,8 +61,10 @@ Autostart on logon (registered automatically since 0.1.54)
 ----------------------------------------------------------
 The MSI registers the auto-start hook automatically on install + on
 every upgrade. After running the MSI you should already have a
-Scheduled Task called `Roomler` with the resilience XML
-(restart-on-failure, battery-defeat, single-instance belt). Confirm
+Scheduled Task called `Roomler` with the resilience XML (battery-defeat,
+single-instance belt). It runs roomlerdw.exe, a launcher with no window
+that starts roomlerd.exe, so no terminal opens on your desktop; the
+daemon's output, its errors included, is in its rolling log file. Confirm
 with:
 
     schtasks /Query /TN Roomler
