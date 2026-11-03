@@ -32,8 +32,9 @@ enum CallSessions<'a> {
     Open,
     /// The open one of this connection.
     Of(&'a str),
-    /// The open ones that no connection owns (#3416).
-    Unscoped,
+    /// The open ones that no connection owns, while this connection never
+    /// held a session in the room (#3416).
+    Unscoped(&'a str),
 }
 
 /// FR-115 P5 — one call in progress, as the meeting-length sweep reads it.
@@ -980,17 +981,20 @@ impl RoomDao {
     /// that connection's session (multi-device: the user's other browsers keep
     /// theirs); `None` is the legacy user-level leave closing all open ones.
     ///
-    /// #3416 — a connection that holds NO open session of its own closes the
-    /// user's open sessions in the room that have no connection id instead.
-    /// A page opens one when its `call/join` goes out before its socket has
-    /// an id, and so does an older client. The page's leave and its socket's
-    /// close both name the connection, which the session never carried, so
-    /// nothing closed it: the person stayed listed, and a call they were alone
-    /// in never ended. A connection that holds a session of its own never
+    /// #3416 — a connection that never held a session in the room closes the
+    /// user's open sessions there that have no connection id instead. A page
+    /// opens one when its `call/join` goes out before its socket has an id,
+    /// and so does an older client. The page's leave and its socket's close
+    /// both name the connection, which the session never carried, so nothing
+    /// closed it: the person stayed listed, and a call they were alone in
+    /// never ended. A connection that holds a session of its own never
     /// touches them, because one may be the person's other device, still in
-    /// the call. Such a session names no device, so the miss closes all of
-    /// them: the leaver's own is among them, and closing only some could
-    /// leave the leaver listed.
+    /// the call. Nor does one that held a session and closed it: it is leaving
+    /// twice (a repeated leave, a leave racing its socket's close, a leave
+    /// after the call ended), and a closed session keeps its `connection_id`.
+    /// Such a session names no device, so the heal closes all of them: the
+    /// leaver's own is among them, and closing only some could leave the
+    /// leaver listed.
     ///
     /// `participant_count` counts DISTINCT USERS, so it is decremented only
     /// when the user's last open session closed. The close runs as a single
@@ -1010,9 +1014,11 @@ impl RoomDao {
         let now = DateTime::now();
         let which = connection_id.map_or(CallSessions::Open, CallSessions::Of);
         let mut post = self.close_sessions(room_id, user_id, which, now).await?;
-        if post.is_none() && connection_id.is_some() {
+        if post.is_none()
+            && let Some(cid) = connection_id
+        {
             post = self
-                .close_sessions(room_id, user_id, CallSessions::Unscoped, now)
+                .close_sessions(room_id, user_id, CallSessions::Unscoped(cid), now)
                 .await?;
         }
 
@@ -1091,11 +1097,13 @@ impl RoomDao {
                 "sessions": { "$elemMatch": { "connection_id": cid, "left_at": null } },
             },
             // A query's `null` matches an absent field too, and a session with
-            // no connection id has none (`skip_serializing_if`).
-            CallSessions::Unscoped => doc! {
+            // no connection id has none (`skip_serializing_if`). `$ne` on the
+            // array: no session here, open or closed, was this connection's.
+            CallSessions::Unscoped(cid) => doc! {
                 "room_id": room_id,
                 "user_id": user_id,
                 "sessions": { "$elemMatch": { "connection_id": null, "left_at": null } },
+                "sessions.connection_id": { "$ne": cid },
             },
             CallSessions::Open => doc! {
                 "room_id": room_id,
@@ -1113,7 +1121,7 @@ impl RoomDao {
                 { "$eq": [ "$$s.left_at", null ] },
             ]},
             // `$ifNull` reads the absent field as null here as well.
-            CallSessions::Unscoped => doc! { "$and": [
+            CallSessions::Unscoped(_) => doc! { "$and": [
                 { "$eq": [ { "$ifNull": [ "$$s.connection_id", null ] }, null ] },
                 { "$eq": [ "$$s.left_at", null ] },
             ]},

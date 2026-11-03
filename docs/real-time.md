@@ -102,16 +102,16 @@ sequenceDiagram
     else the tab closes
         Note over S: on_closed(C): the room from C's media, else from M by C
     end
-    S->>M: close C's open session, or on a miss the person's sessions with no id
+    S->>M: close C's open session, or, if C never held one, the person's sessions with no id
     S-->>P: room:call_updated, or room:call_ended when the count reaches 0
 ```
 
 | Moment | Where | What happens |
 |---|---|---|
-| Join | `ConferenceView.vue:607`, `stores/rooms.ts:192` `callConnectionId`, `:198` `joinCall`; server `call.rs:133`, `dao/room.rs:805` `join_participant` | The page waits up to `CALL_SOCKET_WAIT_MS` (`rooms.ts:182`, 10 s) for its socket's id (`stores/ws.ts:414` `waitForConnectionId`; the id comes with the `connected` frame, `ws.ts:194`), then starts the call and joins naming it. Past the bound it starts and joins nothing, and says why: "Failed to join call: Not connected to the server…" (`ConferenceView.vue:638`). A join on a connection that already holds a session closes that one first |
-| Leave | `rooms.ts:207` `leaveCall`, `call.rs:206`, `finalize_call_leave_db` (`call.rs:283`), `leave_participant` (`dao/room.rs:1004`) | Names the socket's id at leave time and closes that connection's open session. With no body (older clients) it closes every open session of the person in the room |
+| Join | `ConferenceView.vue:607`, `stores/rooms.ts:192` `callConnectionId`, `:198` `joinCall`; server `call.rs:133`, `dao/room.rs:806` `join_participant` | The page waits up to `CALL_SOCKET_WAIT_MS` (`rooms.ts:182`, 10 s) for its socket's id (`stores/ws.ts:414` `waitForConnectionId`; the id comes with the `connected` frame, `ws.ts:194`), then starts the call and joins naming it. Past the bound it starts and joins nothing, and says why: "Failed to join call: Not connected to the server…" (`ConferenceView.vue:638`). A join on a connection that already holds a session closes that one first |
+| Leave | `rooms.ts:207` `leaveCall`, `call.rs:206`, `finalize_call_leave_db` (`call.rs:283`), `leave_participant` (`dao/room.rs:1008`) | Names the socket's id at leave time and closes that connection's open session. With no body (older clients) it closes every open session of the person in the room |
 | Socket close | `ws_media.rs:59` `on_closed` | The leave the page never sent. The room comes from the socket's media (`media:join`), else from Mongo by the connection id (`:110`), and the same leave runs naming the socket (`:117`) |
-| A miss | `dao/room.rs:1013`, the close itself `close_sessions` (`:1079`) | A leave or a socket close whose connection holds **no** open session of its own closes the person's open sessions in that room that have no connection id: a page whose join went out before its socket had an id, or an older client's. A connection that holds its own session never touches them |
+| A miss | `dao/room.rs:1017`, the close itself `close_sessions` (`:1085`) | A leave or a socket close whose connection **never held** a session in that room closes the person's open sessions there that have no connection id: a page whose join went out before its socket had an id, or an older client's. A connection that holds its own session never touches them. Nor does one that held a session and closed it, because it is leaving twice: a repeated leave, a leave racing its socket's close, a leave after the call ended. A closed session keeps its `connection_id`, so the filter can tell (`$ne` on `sessions.connection_id`) |
 | Sweep | `maintenance.rs:63` `close_orphaned_call_state`, every rollup cycle | Closes the open sessions in rooms that are **not** `in_progress`. A room in progress is skipped, so the sweep never reaches a session that keeps its call's count above 0 |
 | Boot | `maintenance.rs:21` `stale_call_reset`, at startup under the lease (`lib.rs:254`) | No call outlives a server start: every `in_progress` room is ended, then the sweep runs |
 
@@ -120,7 +120,7 @@ What a leave naming connection C may close:
 | The open session | Closed? |
 |---|---|
 | the person's, connection C | yes |
-| the person's, no connection id | only when C holds no open session of its own |
+| the person's, no connection id | only when C never held a session in that room |
 | the person's, another connection | never: that is their other device |
 | another person's | never: the update is keyed by the leaver's own `user_id` |
 
@@ -147,8 +147,8 @@ so a socket that was never in the call, such as another tab of the same person, 
 nothing.
 
 **Tests.** The #3416 block in `crates/tests/src/conference_tests.rs:2084`: a join with no
-body, then a leave or a socket close; two devices; another person's session; a repeated
-leave; a socket never in the call. `ui/src/__tests__/stores/rooms.spec.ts:259`: the wait
+body, then a leave or a socket close; two devices; another person's session; a device that
+already left, leaving again; a repeated leave; a socket never in the call. `ui/src/__tests__/stores/rooms.spec.ts:259`: the wait
 and the refusal. `ui/e2e/conference-fast-join.spec.ts` holds back the socket's frames until after
 the click, against a real API, and reads the outcome from the server's participant list.
 

@@ -2287,6 +2287,41 @@ async fn a_device_that_joined_with_its_id_leaves_an_unscoped_session_alone() {
     drop(ws_b);
 }
 
+/// #3416 — a device that joined with its id and left finds nothing open when
+/// it leaves again: a repeated leave, a leave racing its socket's close, or a
+/// leave after the call ended under it. It still held a session of its own,
+/// so a session with no connection id is not its own, and it must stay open:
+/// it may be the person's other device, on an older client, still in the call.
+#[tokio::test]
+async fn a_device_that_already_left_leaves_an_unscoped_session_alone() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("fastjoin7").await;
+    let (tid, token) = (&tenant.tenant_id, &tenant.admin.access_token);
+    let room_id = create_room_and_start_call(&app, tid, token, "Leave Again").await;
+
+    // Device A, an older client: its join raced its socket.
+    call_post(&app, tid, &room_id, token, "join", None).await;
+    // Device B joins with its id, leaves, and leaves again.
+    let (ws_b, conn_b) = ws_connect_with_conn_id(&app.addr, token).await;
+    call_post(&app, tid, &room_id, token, "join", Some(&conn_b)).await;
+    for _ in 0..2 {
+        call_post(&app, tid, &room_id, token, "leave", Some(&conn_b)).await;
+    }
+
+    assert_eq!(
+        call_user_ids(&app, tid, &room_id, token).await,
+        vec![tenant.admin.id.clone()],
+        "device B's second leave closed device A's session"
+    );
+    let room = get_room(&app, tid, &room_id, token).await;
+    assert_eq!(room["participant_count"], 1);
+    assert_eq!(
+        room["conference_status"], "in_progress",
+        "the call ended under device A"
+    );
+    drop(ws_b);
+}
+
 /// #3416 — the heal keeps the leave's one decrement per person. A second leave
 /// from the same page finds nothing open, so the count does not drop under the
 /// person still in the call.
