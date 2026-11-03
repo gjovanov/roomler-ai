@@ -15,11 +15,10 @@
 
       <!-- Say plainly what running a command here means. Under systemd the
            daemon is root. On Windows a command runs as SYSTEM through the
-           device's service once an administrator anchored it (FR-94), and
-           otherwise as the console-session worker: the signed-in user on an
-           attended install (their elevated token if they are an admin), SYSTEM
-           in SystemContext mode. An operator should learn that from the UI,
-           not from an incident. -->
+           device's service once an administrator anchored it (FR-94), else as
+           the console-session worker: the signed-in user on an attended install
+           (elevated if an admin), SYSTEM in SystemContext mode. An operator
+           should learn that from the UI, not from an incident. -->
       <!-- In the card text, not a v-card-subtitle: a subtitle never wraps and
            dims its content, which turned this warning into one clipped grey
            line ("Commands run with the Roomler d…") at every width. -->
@@ -31,12 +30,10 @@
           class="mb-3"
           icon="mdi-shield-alert-outline"
         >
-          Commands run with the Roomler daemon's privileges:
-          <strong>root</strong> on Linux. On Windows they run as
-          <strong>SYSTEM</strong> through the device's service once an
-          administrator has anchored it, and otherwise as the
-          <strong>signed-in user</strong> on an attended install, or as
-          <strong>SYSTEM</strong> in SystemContext mode.
+          Commands run with the Roomler daemon's privileges: <strong>root</strong> on Linux.
+          On Windows they run as <strong>SYSTEM</strong> through the device's service once
+          an administrator has anchored it, and otherwise as the <strong>signed-in user</strong>
+          on an attended install, or as <strong>SYSTEM</strong> in SystemContext mode.
           Every attempt is recorded in the org's execution audit log.
         </v-alert>
 

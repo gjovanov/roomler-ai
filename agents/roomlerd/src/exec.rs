@@ -36,16 +36,14 @@
 //!
 //! ## Privilege
 //!
-//! Under systemd the daemon runs as root, and commands inherit that. On
-//! Windows a command runs as SYSTEM in session 0, through the device's service,
-//! once an administrator anchored the device (FR-94, `crate::exec_service`).
-//! Otherwise it inherits the console-session WORKER's identity, because the
-//! worker holds the agent socket: the signed-in user on an attended install
-//! (their elevated token if they are an admin), SYSTEM in SystemContext mode.
-//! Root/SYSTEM is the intent and it is
-//! deliberate — `Get-NetFirewallRule`, `netsh`, route tables and service state
-//! are exactly what remote diagnosis needs — and is surfaced in the admin UI's
-//! opt-in copy rather than hidden.
+//! Under systemd the daemon runs as root, and commands inherit that. On Windows
+//! a command runs as SYSTEM in session 0, through the device's service, once an
+//! administrator anchored the device (FR-94, `crate::exec_service`). Otherwise
+//! it runs as the console-session WORKER, which holds the agent socket: the
+//! signed-in user on an attended install (elevated if an admin), SYSTEM in
+//! SystemContext mode. Root/SYSTEM is the intent and it is deliberate —
+//! `Get-NetFirewallRule`, `netsh`, route tables and service state are exactly
+//! what remote diagnosis needs — and is surfaced in the admin UI's opt-in copy.
 
 use std::collections::HashMap;
 use std::process::Stdio;

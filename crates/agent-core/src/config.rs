@@ -131,11 +131,9 @@ pub struct AgentConfig {
     /// refusal that survives a compromised server. Defaulting it on would
     /// make the other three the whole story.
     ///
-    /// Commands run as root under systemd. On Windows they run as SYSTEM
-    /// through the device's service once an administrator anchored it (FR-94),
-    /// and otherwise as the console-session worker: the signed-in user on an
-    /// attended install, SYSTEM in SystemContext mode. Turning this on is
-    /// granting that identity, and the admin UI says so.
+    /// Commands run as root under systemd; on Windows as SYSTEM once anchored
+    /// (FR-94), else as the console worker: the signed-in user, or SYSTEM in
+    /// SystemContext mode. Turning this on grants that, as the admin UI says.
     #[serde(default)]
     pub exec_enabled: bool,
 
