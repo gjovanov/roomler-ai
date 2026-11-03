@@ -1220,6 +1220,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #3433 — an answer that counted is never reported as refused. The
+    /// prompt's poll takes a sentinel the moment it exists and removes it. The
+    /// sentinel used to be chmod'ed after it was written, and that chmod
+    /// failed, "No such file or directory", once the poll had taken the file:
+    /// `record_decision` said false for an answer that had already decided the
+    /// prompt. A thread here takes every sentinel the moment it appears, as the
+    /// poll does.
+    #[cfg(unix)]
+    #[test]
+    fn an_answer_the_poll_takes_at_once_still_counts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = fixture_dir("sentinel-taken-at-once");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let taker = {
+            let (dir, done) = (dir.clone(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    if let Ok(rd) = std::fs::read_dir(&dir) {
+                        for e in rd.flatten() {
+                            if e.path().extension().is_some_and(|x| x == "deny") {
+                                let _ = std::fs::remove_file(e.path());
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        let mut misreported = 0;
+        for i in 0..5_000u32 {
+            let session = format!("3433{i:020x}");
+            let _armed = broker.arm(&session, Duration::from_secs(30));
+            if !broker.record_decision(&session, false) {
+                misreported += 1;
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+        taker.join().unwrap();
+        assert_eq!(
+            misreported, 0,
+            "answers that counted were reported as refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1632 — registration is eager, so a decision can be recorded between
     /// `request_with_mode` returning and its future's first poll. That
     /// decision must be honoured: the stale-sentinel purge runs at arm time,
