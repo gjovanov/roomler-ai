@@ -4781,6 +4781,21 @@ async fn run_cmd(
     // the daemon tells it the overlay's blocks (`rc_overlay` off needs them).
     #[cfg(target_os = "macos")]
     delegate_host.set_overlay_footprint(tunnel_core::overlay_footprint::v4_nets);
+    // FR-43 P3b — on a one-row Mac's daemon every org's session goes to the one
+    // worker, so a secondary org's loop gets the host too, and the host applies
+    // the person's floor. Everywhere else a secondary keeps `Delegation::Off`.
+    #[cfg(target_os = "macos")]
+    let secondary_host = roomlerd::delegate::one_row_daemon(
+        cfg.macos_one_row,
+        cfg.macos_supervise_gui_worker,
+        supervised,
+    )
+    .then(|| {
+        delegate_host.set_one_row();
+        delegate_host.clone()
+    });
+    #[cfg(not(target_os = "macos"))]
+    let secondary_host: Option<roomlerd::delegate::DelegateHost> = None;
     // FR-43 P3a — a one-row Mac's worker holds no enrollment, so its log lines
     // arrive over the delegation channel and go up on this row, each marked as
     // the worker's. Root only: no other process supervises a worker.
@@ -5059,6 +5074,9 @@ async fn run_cmd(
     let _delegate_worker_task = tokio::spawn(roomlerd::delegate_worker::run(
         supervised,
         unenrolled,
+        // FR-43 P3b — the person's own, from their file: handed to the daemon
+        // by a worker with no enrollment.
+        cfg.auto_grant_session,
         worker_log_lines,
         worker_channels,
         shutdown_rx.clone(),
@@ -5134,14 +5152,16 @@ async fn run_cmd(
         );
         let rx = shutdown_rx.clone();
         let broker = consent_broker.clone();
+        // FR-43 P2b — a secondary org never drives the host-global GUI worker
+        // (`handle_server_msg`'s gate), except on a one-row Mac's daemon,
+        // where it has no other way to the screen (FR-43 P3b).
+        let org_delegation = roomlerd::delegate::Delegation::for_secondary(secondary_host.as_ref());
         let span = tracing::info_span!("org", label = %org.label);
         org_tasks.push(tokio::spawn(tracing::Instrument::instrument(
             async move {
                 match signaling::run(
                     org_ctx,
-                    // FR-43 P2b — secondary orgs never drive the host-global
-                    // GUI worker (see `handle_server_msg`'s primary gate).
-                    roomlerd::delegate::Delegation::Off,
+                    org_delegation,
                     org_cfg,
                     encoder_preference,
                     rx,
@@ -5198,6 +5218,7 @@ async fn run_cmd(
         // it must not consume the captured services.
         let remote_cfg2 = remote_cfg.clone();
         let rc_sessions2 = rc_sessions.clone();
+        let secondary_host2 = secondary_host.clone();
         roomlerd::org_join::install(roomlerd::org_join::JoinRuntime {
             config_path: config_path.clone(),
             write_lock: cfg_write_lock.clone(),
@@ -5319,13 +5340,15 @@ async fn run_cmd(
                 // and this closure runs once per join.
                 let remote_cfg_join = remote_cfg2.clone();
                 let rc_sessions_join = rc_sessions2.clone();
+                // Secondary org — see above.
+                let org_delegation =
+                    roomlerd::delegate::Delegation::for_secondary(secondary_host2.as_ref());
                 let span = tracing::info_span!("org", label = %org.label);
                 tokio::spawn(tracing::Instrument::instrument(
                     async move {
                         match signaling::run(
                             org_ctx,
-                            // Secondary org — see above.
-                            roomlerd::delegate::Delegation::Off,
+                            org_delegation,
                             org_cfg,
                             enc,
                             rx,
