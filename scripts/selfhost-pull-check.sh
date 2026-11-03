@@ -111,17 +111,23 @@ cp -r ui/e2e ui/playwright.config.ts "$PW_DIR/"
 printf '{"name":"selfhost-e2e","private":true,"devDependencies":{"@playwright/test":"%s"}}\n' "$PW_VER" > "$PW_DIR/package.json"
 OVR=.selfhost-check.override.yml
 
-# restart_server [environment line]: only the server, on the given settings. The
-# rate limits are the profile matrix's one deviation: a Playwright run is one IP
-# doing a whole team's work.
-restart_server() {
+# server_settings [environment line]: the server on the given settings. The rate
+# limits are the profile matrix's one deviation: a Playwright run is one IP doing a
+# whole team's work. It is a plain `up -d`, which is also what a release does: the
+# server is recreated and coturn, in the server's namespace, has to follow. Naming
+# the service here (`up -d roomler`) would leave coturn exited.
+server_settings() {
+  local out
   {
     printf 'services:\n  roomler:\n    environment:\n'
     printf '      ROOMLER__APP__RATE_LIMIT_PER_SEC: "200"\n      ROOMLER__APP__RATE_LIMIT_BURST: "5000"\n'
     printf '      ROOMLER__APP__AUTH_RATE_LIMIT_PER_MIN: "600"\n      ROOMLER__APP__AUTH_RATE_LIMIT_BURST: "600"\n'
     [ -n "${1:-}" ] && printf '      %s\n' "$1"
   } > "$OVR"
-  "${DC[@]}" -f "$OVR" up -d roomler >/dev/null 2>&1
+  if ! out="$("${DC[@]}" -f "$OVR" up -d 2>&1)"; then
+    echo "$out" | tail -8
+    return 1
+  fi
   for _ in $(seq 1 60); do
     curl -fsS -m 3 -o /dev/null http://localhost:8080/health 2>/dev/null && return 0
     sleep 2
@@ -141,12 +147,18 @@ browser_spec() {
 }
 
 say "a two-party call on the direct path"
-restart_server || bad "the server did not come back with the browser rate limits"
+server_settings || bad "the server did not come back with the browser rate limits"
 browser_spec e2e/selfhost-collab.spec.ts || bad "the direct-path call failed on $(uname -m)"
 
 say "a two-party call with the relay forced"
-restart_server 'ROOMLER__TURN__FORCE_RELAY: "true"' || bad "the server did not come back with the relay forced"
-browser_spec e2e/selfhost-turn-relay.spec.ts -e E2E_EXPECT_TURN_RELAY=1 || bad "the call over the relay failed on $(uname -m)"
+server_settings 'ROOMLER__TURN__FORCE_RELAY: "true"' || bad "the server did not come back with the relay forced"
+# A stopped relay reaches the browser as peers stuck at `new`, which names nothing.
+coturn="$(docker inspect "$("${DC[@]}" ps -a -q coturn)" --format '{{.State.Status}}' 2>/dev/null)"
+[ "$coturn" = running ] || bad "coturn is '${coturn:-gone}' after the server was recreated, so no call can reach the relay"
+if ! browser_spec e2e/selfhost-turn-relay.spec.ts -e E2E_EXPECT_TURN_RELAY=1; then
+  bad "the call over the relay failed on $(uname -m)"
+  "${DC[@]}" ps -a --format '  {{.Service}}  {{.State}}  {{.Status}}'
+fi
 "${DC[@]}" logs --no-log-prefix coturn 2>&1 | grep -E 'denied|403' | tail -8
 
 if [ "$FAIL" != 0 ] && [ -d "$PW_DIR/test-results" ]; then
