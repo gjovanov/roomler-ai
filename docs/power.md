@@ -111,7 +111,7 @@ sequenceDiagram
 heartbeat as an optional `power`
 ([`signaling.rs:704`](../crates/remote_control/src/signaling.rs#L704)). It is a
 claim by the device, shown and never enforced on. The keeper publishes it before
-anything connects ([`app.rs:4802`](../agents/roomlerd/src/app.rs#L4802)) and
+anything connects ([`app.rs:4804`](../agents/roomlerd/src/app.rs#L4804)) and
 after every pass, with what it actually holds, not what it wanted
 ([`power.rs:319`](../agents/roomlerd/src/power.rs#L319)).
 
