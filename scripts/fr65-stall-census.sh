@@ -29,6 +29,9 @@
 #   --tenant HEX                 one org only (default: every org)
 #   --rows                       also print one JSON line per STALL, classified
 #   --probes                     the caps-probe census instead (FR-65 AC6)
+#   --rekeys                     forced rekeys and route waves instead (FR-65 AC5)
+#   --swaps                      what a capture-size change costs the pump (FR-65 AC3)
+#   --canary                     the runtime canary beside the STALLs (FR-65 AC4)
 #
 # A production read is refused without --yes: it is a bounded read of the live
 # database. The mongodb pod's restart count is printed before and after it.
@@ -65,7 +68,9 @@ while [ $# -gt 0 ]; do
     --agent)   AGENTS="${AGENTS:+$AGENTS,}${2:?}"; PASS+=("$1" "$2"); shift 2 ;;
     --rows)    ENVS+=("FR65_ROWS=1"); PASS+=("$1"); shift ;;
     --probes)  ENVS+=("FR65_PROBES=1"); PASS+=("$1"); shift ;;
-    -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
+    --rekeys|--swaps|--canary)
+               ENVS+=("FR65_MODE=${1#--}"); PASS+=("$1"); shift ;;
+    -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
     *)         die "unknown argument: $1 (--help)" ;;
   esac
 done
