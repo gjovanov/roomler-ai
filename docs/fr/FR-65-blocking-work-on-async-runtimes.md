@@ -1,6 +1,6 @@
 # FR-65 — Blocking work on async runtimes: measure first, then remove
 
-**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.035 % of the frame budget on NEO16 (AC1)**. **3 of 8 criteria ticked** — AC1, AC2, and AC6 (the caps-probe respawn, measured gone on four hosts) — AC8 (docs) `[~]`. Next: the census after-read on the release that carries #3138 (AC7), then P1. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
+**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.035 % of the frame budget on NEO16 (AC1)**. **3 of 8 criteria ticked** — AC1, AC2, and AC6 (the caps-probe respawn, measured gone on four hosts) — AC8 (docs) `[~]`. The census is a fleet-wide server read since 2026-11-03 (#PRNUM). Next: AC7's after-read on or after 2026-11-15, then AC3, AC5 and AC4. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
 
 ## Goal
 
@@ -63,6 +63,11 @@ synchronous at pump start and invisible to `open_ms` because it precedes the
 loop), rather than three wraps.
 
 ### P0 — the stall watch (blocks every other phase)
+
+> **Status 2026-11-03 — the census reads the server.** `scripts/fr65-stall-census.sh`
+> no longer visits hosts: it is a bounded read of `agent_logs`, split by
+> `agent_version`, and it agrees with the host census line for line on a test host
+> (the manual's §7). Its first read holds both sides of #3138, in §6.4.
 
 > **Status 2026-10-30 — the instrument was wrong for every stall longer than its
 > own heartbeat; fixed, six more regions named, and its cost measured (AC1).** A
@@ -340,13 +345,21 @@ of each is to produce a number.
 - [ ] **AC7** — every fix carries a before/after from the **same** instrument on
       this issue. A fix with no measurement does not count as shipped.
       *2026-10-30:* P0's two fixes (#3138: the window-reset rebase and the
-      governor's monotonic stall count) have their **before** —
-      `scripts/fr65-stall-census.sh` over 2026-10-17..30 on CORPLAP-1/-2/-3: 84
-      `reset`-class lines (7/51/26) and 46 `untimed` (4/27/15). The **after** is
-      owed: the same script, the same hosts, a 14-day window on the release that
-      carries #3138. `reset` must read 0 with those long passes attributed
+      governor's monotonic stall count) have their **before** — the host census
+      over 2026-10-17..30 on CORPLAP-1/-2/-3: 84 `reset`-class lines (7/51/26) and
+      46 `untimed` (4/27/15).
+      *2026-11-03:* the census moved to a fleet-wide server read (#PRNUM).
+      `agent_logs` keeps 7 days against that read's 14, so the before that counts
+      is a slice of the new instrument, taken while those lines still existed:
+      the builds before 0.4.192 from 2026-10-27 02:00Z, `reset` 5/26/4 and
+      `untimed` 8/5/0 over 4 541/6 195/4 667 heartbeats (the manual's §6.4). The two
+      instruments agree line for line (§7), so this before is the same read as the
+      after. The **after** is owed on or after 2026-11-15: the same read, the same
+      hosts, a 7-day window wholly on 0.4.192 or later, compared by rate per
+      1 000 heartbeats. `reset` must read 0 with those long passes attributed
       (`open`, `encode`, …), and `untimed` must shrink by what the six newly
-      named phases take.
+      named phases take. The first two days have both at 0 over 23/2 816/1 925
+      heartbeats, which is a reading and not this criterion.
 - [~] **AC8** — Docs: [`docs/stall-watch.md`](../stall-watch.md) in the house
       style (mermaid, tables, `file:line` anchors) for the instrument and for each
       later phase as it ships, and a `docs/README.md` index row.
@@ -387,6 +400,29 @@ path), FR-63 #1243, FR-64 #1244, #1237 (the sibling route war).
 ## Field-verification log
 
 _(every entry must carry a before/after from the stall watch.)_
+
+- **2026-11-03 — the census moves to the server, and its first read splits by
+  build.** One week of `agent_logs` (2026-10-27 02:00Z .. 2026-11-03 01:45Z): 397 029
+  batches, 128 426 lines of interest, 10 s, the Mongo pod's restart count 1 before
+  and after.
+  - **Before and after #3138, every device:** 909 STALL lines over 97 685 heartbeats
+    on builds before 0.4.192 (`reset` 562, `open` 269, `untimed` 60, `encode` 15, 3
+    other), 126 over 25 477 from 0.4.192 on (`reset` 0, `untimed` 0, `open` 86,
+    `dc_lock` 35, `encode` 4, `poll` 1). The three laptops are in the manual's §6.4.
+    Two days is not AC7's window; see the criterion.
+  - **The instrument, proven:** on NEO16 the old PowerShell census, as a plain file
+    over its own log directories, and the server read match on 64 of 64 lines with
+    no class disagreement, 24 of them `reset`, and the server read holds eight more
+    that those directories did not. `--from-logs` matches the same 64. The port
+    takes `reset` at ≤ 5 ms because an uploaded stamp has lost its microseconds.
+  - **`reset` was mostly not long.** 480 of 562 lines are under 200 ms, 456 of them
+    one macOS host at 108 ms. `capture` was among the six the reset zeroed and is
+    idle by rule, so a heartbeat pass with a 100 ms capture wait could read as work.
+    The rebase should have removed those lines, and so a false `agent_stalled` for
+    FR-79's gate. Not shown yet: that host's after is ten heartbeats.
+  - **`dc_lock`'s first number:** 35 lines on four hosts, mean 0.52 s, worst 2.3 s.
+  - **AC6 still holds on the server read**: `--probes` on NEO16, 2026-10-28 .. 11-03:
+    58 probe lines, all within 60 s of a start, 0 at steady state.
 
 - **2026-10-30 — a census of the instrument's own output: it was blind to every
   stall longer than its heartbeat; and its cost, measured (AC1).** The new
