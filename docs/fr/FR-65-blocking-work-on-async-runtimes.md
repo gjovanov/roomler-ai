@@ -216,7 +216,8 @@ stall count fell.
 
 ### P3 — overlay guard cadence and rekey storms
 
-> **Status 2026-11-03 — measured; the poke gate is built, its field A/B owed.**
+> **Status 2026-11-03 — measured; the poke gate is built and A/B-tested on a
+> lab guest; the 7-day read on a release is owed.**
 > Read from production `agent_logs`, 7 days, every device: the guard waves are
 > bounded (at most 20 a minute, which is their 3 s floor), the forced rekeys
 > are not. 205,892 of them in the week,
@@ -241,6 +242,18 @@ stall count fell.
 > 30 s later. The waves are left alone: they carry the P4 erase contract.
 > Manual: [`docs/overlay-nat-traversal.md`](../overlay-nat-traversal.md), "The
 > net-change gate".
+>
+> The A/B ran on a Win11 lab guest, the same storm on both builds: the
+> uplink's interface metric flipped every 3 s for 180 s, which raises the
+> field signature (61 interface notifications and no snapshot delta).
+> 0.4.197 swept its direct peers 30 times in the storm, the gate 4 times:
+> the storm's first burst, the first burst after the quiet window, an
+> address added mid-storm and that address's removal, a Major. The add came
+> 22 s into the quiet window and was poked 2.84 s after it (3.76 s on
+> 0.4.197); the Major was poked in 0.78 s (0.81 s). A deleted peer `/32` came
+> back in 0.79–0.80 s on the gate against 0.79–0.81 s, and no revalidation
+> failed on either build. Owed: the 7-day read on the release that carries
+> it (AC5).
 
 A tax rather than a block, in the same family. #1237 fixed the sibling-adapter
 cause of the ~100 `net-change — revalidating direct carrier` events/min (each
@@ -383,9 +396,9 @@ of each is to produce a number.
       netstate Majors in the week): at most 49 waves and 142 rekeys in the
       5 minutes around a Major, the first poke inline (+0.0 s, `from_major`)
       wherever a direct carrier was up, and the carriers the capture killed
-      convicted inside a minute. Open: the
-      gate's A/B on a candidate (RED on 0.4.197, GREEN on the gate), then a
-      7-day read on the release that carries it.
+      convicted inside a minute. The gate's A/B is done (2026-11-03, a Win11
+      lab guest: 30 sweeps in the storm on 0.4.197, 4 on the gate; P3's status
+      block). Open: the 7-day read on the release that carries it.
 - [x] **AC6** — caps-probe spawns at steady state are 0/hour on a measured host.
       ✅ **Measured 2026-10-30, four hosts** (`scripts/fr65-stall-census.sh
       --probes`, #3138): **0 steady-state probe runs** on CORPLAP-1/-2/-3 over
@@ -424,7 +437,10 @@ of each is to produce a number.
       verdict's rules, the bookkeeping, what the kill switch does not turn off,
       reading a STALL line, the census, the cost harness and its measurement.
       Owed: P1–P5, each as it ships.* *P1 shipped as FR-70 M2 and is documented
-      there; P4 needed no fix (AC6). Still owed: P2, P3, P5.*
+      there; P4 needed no fix (AC6). P3's gate is documented beside the
+      net-change machinery it changes,
+      [`docs/overlay-nat-traversal.md`](../overlay-nat-traversal.md), "The
+      net-change gate". Still owed: P2, P5.*
 
 ## Open decisions
 

@@ -368,6 +368,27 @@ cascade's guarantees while replacing its reactive counters:
   trigger on purpose: anything longer leaves the worst case where it is and
   only sheds pokes. `0` restores the arm exactly as it was
   (`quiet_zero_restores_the_shared_stamp`).
+
+  The field A/B, 2026-11-03, on a Win11 lab guest with the service running as
+  SYSTEM. Flipping the uplink's IPv4 interface metric every 3 s for 180 s
+  raises the field signature: 61 interface notifications (the first dozen
+  read, every one `MibParameterNotification`) and no snapshot delta. Inside
+  that storm an IPv6 ULA added to the uplink is the material move and its
+  removal the Major; after it, one direct peer's `/32` is deleted three times
+  for the route wave.
+
+  | Same guest, same storm | 0.4.197 | With the gate |
+  |---|---:|---:|
+  | Sweeps of the direct peers in the 180 s storm | 30, one every ~5 s | 4 |
+  | Address added → its poke | 3.76 s | 2.84 s; the add came 22 s into the quiet window |
+  | Address removed (a Major) → its poke, `from_major` | 0.81 s | 0.78 s |
+  | Deleted peer `/32` → back, three times | 0.79, 0.81, 0.80 s | 0.80, 0.79, 0.79 s |
+  | Failed revalidations, LAN rebuilds | 0, 0 | 0, 0 |
+
+  Each of the gate's four sweeps is one of its rules firing: the storm's first
+  burst, the first burst after the 60 s quiet, the material add and the Major.
+  The add's poke is no later with the gate; on both builds netstate took
+  about 2.3 s to publish the add.
 - **Demote-follow (#27) — the other end.** Fast conviction on ONE end is not
   enough, because a transition's outage is `max(both ends)`, not `min`. The end
   whose network did **not** change gets no Major, so it has no fast lane at all
