@@ -1734,9 +1734,9 @@ rows ran at about the same speed.
 
 Under SystemContext the same thing reaches the locked screen, where a lost Shift is
 a failed login. A password of 99 shifted characters, typed with no delay on de-AT,
-failed on released 4 times out of 4, and each time slower typing on the same build
-got in, so the password itself reaches the box. The candidate logged in 4 times
-out of 4.
+failed on released 4 times out of 4. Typed at 150 ms a character on the same build
+it logged in on 3 of 5 tries, so the password itself reaches the box. The candidate
+logged in fast 4 times out of 4.
 
 `caps_for_frame` (`:292`) now reads once per run of typing. A read stands for as
 long as frames keep coming within `CAPS_FRESH_FOR`, 2 s of each other, on one
