@@ -1,7 +1,8 @@
 # FR-91: Scheduled blog publishing — a post goes live without rolling `roomler2`
 
 **Issue:** [#1880](https://github.com/gjovanov/roomler-ai/issues/1880) · **Status:** P0–P2 live since
-2026-10-09; P3 + P4 in review · **Owner:** web / public site + deploy · **Anchors:** master `507f1398e` ·
+2026-10-09; P2b, P3 + P4 merged 2026-11-02 and on production, the blog's copy of the carry at the
+publisher's next release · **Owner:** web / public site + deploy · **Anchors:** master `507f1398e` ·
 **Builds on:** [FR-87](FR-87-blog-and-google-indexing.md) (the blog, its gates, IndexNow),
 [FR-60](FR-60-public-docs-site.md) (the generator), [FR-88](FR-88-promotion-attribution-and-site-video.md)
 (attribution, `INSTALL_PAGES`), [FR-73](FR-73-image-build-on-github.md) (the image pipeline)
@@ -176,9 +177,9 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
 | P0 | Claim: issue #1880, this spec, the ledger row | Docs only | **merged** #1881 `059562818` |
 | P1 | `--blog-only` + the second `AssetEmitter`, `installCopy`, the sitemap-index change behind `BLOG_LANE` in `site.ts`, `files/security-headers.conf`, `public-site-smoke.sh --blog` (compares `/blog/` headers with `/docs/`), tests | `--blog-only` not passed ⇒ output identical to today; `BLOG_LANE = false` | **merged** #1883 `19a8d11c4`, verified before merge |
 | P2 | The deploy repo: `roomler-blog` Deployment + Service, bucket + scoped users, the edge vhost committed and then routed; one promote for P1 | Remove the three edge locations | **live** roomler-ai-deploy#19 `5b4e5d7`, field-verified 2026-10-09 |
-| P2b | `BLOG_LANE = true`, which P1 held back until the edge was routed and P2 did not flip | `BLOG_LANE = false` | in review |
-| P3 | §3e: the organic carry and the admin breakdown | `ATTRIBUTION_ENABLED` (existing) | in review |
-| P4 | Docs: `docs/public-site.md` gains "Publishing without a roll" (the sequence above, the edge flowchart, the kill switch); `docs/README.md` row; the field log | — | in review, with P3 |
+| P2b | `BLOG_LANE = true`, which P1 held back until the edge was routed and P2 did not flip | `BLOG_LANE = false` | **live** #3205 `be06c7070`, `hosted-20261102-be06c70`, GREEN 2026-11-02 (§8) |
+| P3 | §3e: the organic carry and the admin breakdown | `ATTRIBUTION_ENABLED` (existing) | **merged** #3205 `be06c7070`; the image is live, the blog's copy follows at the publisher's next release (§8) |
+| P4 | Docs: `docs/public-site.md` gains "Publishing without a roll" (the sequence above, the edge flowchart, the kill switch); `docs/README.md` row; the field log | — | **merged** #3205 `be06c7070` |
 
 ## 5. Acceptance criteria
 
@@ -227,8 +228,11 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
   **Built in P3:** `attribution.spec.ts` runs the script on a rendered post and spies on every storage API,
   and `an_organic_journey_from_the_blog_is_stored_and_counted_by_its_post` stores the pair on a real server.
   The RED is in §8: the served script changed 0 of 63 links on such a visit.
-  **Missing:** the field half, after the merge, a promote and the publisher's next release: the served
-  script GREEN on the same harness, then a real organic sign-up in `by_landing_path`.
+  **Read 2026-11-02 on production (§8):** the image's served script is GREEN on that harness, 9 of 63 links
+  with `/register` among them, and the SPA's served chunk holds the same rule. A post loads the lane's copy,
+  which is still the old script: 0 of 63.
+  **Missing:** the same read on the lane's script, at the first release built after the merge, then a real
+  organic sign-up in `by_landing_path`.
 - [~] **AC9:** right after each edge reload, `/ws`, `/derp`, `/health` and a remote-desktop connect all
   work.
   **Partly met 2026-10-09:** after each of P2's two reloads, `/ws` and `/derp` answered 401 from `roomler2` as
@@ -285,6 +289,12 @@ onto the same targets it uses today: when **no** campaign parameter is present, 
 | 2026-11-01 06:00Z | AC2: `roomler2` read at 05:46:47Z and 06:00:46Z around the real post `how-does-socks5-proxy-work`, `published` 06:00:04Z. Last promote 03:12Z | unchanged: the same two pods, started 03:13:00Z and 03:13:17Z, 0 restarts, `hosted-20261101-5d59e47` |
 | 2026-11-01 06:00Z | AC4, served half: release `20261101T060004Z-how-does-socks5-proxy-work` first seen 06:00:27Z. `sitemap-blog.xml` and `feed.xml` first named the post at 06:00:28Z, then on six reads running. `Last-Modified` 06:00:16Z | within 24 s of `published` |
 | 2026-11-01 06:01Z | AC3: `public-site-smoke.sh --blog https://roomler.ai` against that release | all checks passed |
+| 2026-11-02 22:24Z | **GREEN, `BLOG_LANE`:** the served `sitemap.xml` on `hosted-20261102-be06c70`, six reads | the blog child has no `<lastmod>` on any read; the RED dated it `2026-10-17` |
+| 2026-11-02 22:26Z | **GREEN, AC8, the image's script:** the served `attribution.52f8e9cb44.js` on the served `/blog/how-does-socks5-proxy-work/`, the RED's harness, referrer `https://www.google.com/`, no campaign | 9 of 63 links change, `/register` among them, with `referrer_host` and `landing_path` |
+| 2026-11-02 22:26Z | Controls for that script: on the post with no referrer, and with a same-site referrer; on `/docs/` from Google. Then `/docs/` with the pair on its URL, a journey that began on a post | 0 of 63, 0 of 63, 0 of 102. Then 17 of 102, `/register` among them |
+| 2026-11-02 22:26Z | **Still RED, AC8, the lane's script:** the served `attribution.bd6ed8e979.js` on that post, the same visit. Control: the same run with `?utm_source=fr91-harness` | 0 of 63 links, because a post loads the lane's copy. The control changes 10 |
+| 2026-11-02 22:26Z | The feed: the newest `published` is `2026-11-01T06:00:04Z`, after a post every day from 10-21, and `_release.txt` still names that post | no post yet on 11-02, so nothing built after the merge has reached the lane. The lane's read waits for it |
+| 2026-11-02 22:27Z | The SPA's half: the served `attribution-ChSnkNfg.js` | holds the rule, `"/blog/"` and `startsWith` on the landing path. Code read only: nothing was submitted |
 
 Negative controls for P3, each run and restored (hashes compared):
 
