@@ -147,6 +147,39 @@ async fn five_calls_share_one_run_and_its_failure() {
     );
 }
 
+/// Many calls at once on many threads, as the daemon's runtime has them: each
+/// reaches the one run in flight while it is held, no second run starts
+/// beside it, and that run answers them all. In master's shape the lock
+/// ordered them instead, and the first to take it ran the helper and kept
+/// its key for the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_calls_on_many_threads_share_one_run() {
+    const CALLS: usize = 64;
+    let key = Arc::new(ModelKey::default());
+    let h = Helper::answering(Answer::Key("sk-many"));
+    let together = Arc::new(tokio::sync::Barrier::new(CALLS + 1));
+    let calls: Vec<_> = (0..CALLS)
+        .map(|_| {
+            let (key, h, together) = (Arc::clone(&key), h.clone(), Arc::clone(&together));
+            tokio::spawn(async move {
+                together.wait().await;
+                key.get(|| h.run()).await
+            })
+        })
+        .collect();
+    together.wait().await;
+    // Every call reaches the run meanwhile, held, on four threads. One that
+    // came later would find its key kept: no second run either way.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(h.runs(), (1, 0, 1), "one run for {CALLS} calls");
+    // Enough for a run each, were each to start one.
+    h.release(CALLS);
+    for c in calls {
+        assert_eq!(answered(c).await.as_deref(), Ok("sk-many"));
+    }
+    assert_eq!(h.runs(), (1, 1, 1), "one run, to its end");
+}
+
 /// No failure is kept: a call after a run has failed runs the helper again.
 #[tokio::test]
 async fn a_call_after_a_failed_run_runs_the_helper_again() {
