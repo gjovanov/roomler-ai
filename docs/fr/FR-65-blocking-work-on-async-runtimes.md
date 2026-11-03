@@ -401,6 +401,21 @@ path), FR-63 #1243, FR-64 #1244, #1237 (the sibling route war).
 
 _(every entry must carry a before/after from the stall watch.)_
 
+- **2026-11-03 — the census reads AC3, AC4 and AC5 too.** `--swaps`, `--canary` and
+  `--rekeys` are modes of the same bounded server read (the manual's §7.1), so
+  each of those criteria has one instrument for its before and its after.
+  - **The two ends agree.** One day on one Windows host, 2026-11-02: `--swaps`
+    reads the same 149 heartbeats and the same dims swap (196.4 ms) from the
+    files and from the server. `--rekeys` reads 14 140 pokes from the files and
+    14 128 from the server, one sweep of 12 lost in a batch the uploader counted
+    nowhere (`dropped=0`), and the gate replay keeps 4 004 at both ends.
+  - **P3's before, every device, 7 days (2026-10-27 04:10Z .. 2026-11-03
+    04:10Z):** 208 210 pokes, 64 138 kept by the gate replay, 33 710 route waves,
+    1 399 direct and 786 relay revalidations failed. The Mongo pod's restart
+    count read 1 before and after.
+  - **The canary has no lines yet**: no released build carries P2. `--canary`
+    reads it from the first release that does.
+
 - **2026-11-03 — the census moves to the server, and its first read splits by
   build.** One week of `agent_logs` (2026-10-27 02:00Z .. 2026-11-03 01:45Z): 397 029
   batches, 128 426 lines of interest, 10 s, the Mongo pod's restart count 1 before
