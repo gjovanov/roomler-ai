@@ -46,6 +46,7 @@ members = [
     "agents/roomlerd",
     "agents/roomler-desktop",
     "agents/roomler-cli-shim",
+    "agents/roomlerdw",
     "agents/roomler-setup",
     "agents/roomler-cli",
 ]

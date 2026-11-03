@@ -250,7 +250,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2813`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:191`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:363`, wired at `app.rs:4284`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:363`, wired at `app.rs:4298`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -2452,7 +2452,7 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   `enforce` can ask only about a browser the device has never met.
 - **When the config moves, its keys go with it** (#3096). A SystemContext worker that runs on the person's config
   promotes it to the machine-global path after a healthy run
-  ([`self_heal_machine_global_config`, `app.rs:1193`](../agents/roomlerd/src/app.rs#L1193)). The `peer-auth/` files
+  ([`self_heal_machine_global_config`, `app.rs:1199`](../agents/roomlerd/src/app.rs#L1199)). The `peer-auth/` files
   go first, never over a file already there, and the config is not promoted without them
   ([`promote`, `peer_auth.rs:736`](../agents/roomlerd/src/peer_auth.rs#L736)). A config promoted before that has no
   keys beside it. So an enrollment with no key at the machine-global path takes the one the active user's config
@@ -4169,6 +4169,7 @@ ONLOGON ...` with `schtasks /Create /XML <utf-16-le-bom-tempfile>`.
 Schema 1.2 (broadest universally-supported version, Win 7+).
 Settings that were previously missing or wrong:
 - `<RestartOnFailure><Interval>PT1M</Interval><Count>10</Count></RestartOnFailure>`
+  (#3292, 2026-11-02, measured: this restarts no exit, despite its name)
 - `<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>`
 - `<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>` (default
   is `true` — silently kills agent on laptop unplug)
@@ -4218,7 +4219,7 @@ where it is. The signaling loop awaits inside its `select!` arms,
 so a stall is one arm whose await never returned, and the INFO log
 is silent while it waits.
 - Every arm therefore enters a named stage first
-  (`watchdog::enter`, `agents/roomlerd/src/watchdog.rs:434`):
+  (`watchdog::enter`, `agents/roomlerd/src/watchdog.rs:432`):
   `shutdown`, `keepalive`, `netchange`, `heartbeat`, `outbound`,
   `carrier_ready`, `consent`, `device_end`, `tunnel_reap`,
   `quic_setup`, `delegated`, and `ws.text` / `ws.ping` / `ws.pong` /
@@ -4232,12 +4233,12 @@ is silent while it waits.
   from the JSON's `t` (`ws.text:rc:ssh.response`; `server_msg_tag`,
   `agents/roomlerd/src/signaling.rs:6933`). The dispatch awaits per
   message, so that is where a stall inside it shows.
-- The `StageGuard` (`watchdog.rs:448`) puts the pump back to
+- The `StageGuard` (`watchdog.rs:446`) puts the pump back to
   `select` when the arm's scope ends, however it ends. An arm that
   leaves early cannot leave its name behind for a later stall to be
   blamed on.
 - The stall report then reads `signaling=93s@ws.text:rc:ssh.response`
-  (`stall_summary`, `watchdog.rs:464`). The `name=Ns` prefix is
+  (`stall_summary`, `watchdog.rs:462`). The `name=Ns` prefix is
   unchanged, so a parser of the old line still finds the pump.
 - ⚠️ Read it from the crash record, not only the log. The summary
   also goes into the crash sidecar that the next worker uploads
@@ -4245,11 +4246,11 @@ is silent while it waits.
   own log line about 1 stall in 6, measured on a Windows dev box on
   2026-10-19.
 - The sidecar is fsync'd before its rename
-  (`crates/agent-core/src/crash_recorder.rs:286`, #2955). Without that,
+  (`crates/agent-core/src/crash_recorder.rs:287`, #2955). Without that,
   a power loss could persist a NUL-filled file that no parser reads; one
   was seen, skipped at every start for two weeks. A sidecar that does
   not parse is now moved once into `crashes/malformed/`
-  (`crash_recorder.rs:423`), so it is kept but not re-warned.
+  (`crash_recorder.rs:424`), so it is kept but not re-warned.
 
 **What the first named stall found** (#2551). The first stall to name
 its stage came on 2026-10-22, under 0.4.151, and read
@@ -4316,8 +4317,8 @@ sequenceDiagram
 
 | what | where |
 |---|---|
-| The runtime-stall exit. The exit-node routes are dropped first, because the evidence may take its whole budget | `force_exit_on_runtime_stall`, `agents/roomlerd/src/watchdog.rs:600` |
-| The pump-stall exit records the same evidence, and now also drops its routes first | `force_exit_on_stall`, `watchdog.rs:689` |
+| The runtime-stall exit. The exit-node routes are dropped first, because the evidence may take its whole budget | `force_exit_on_runtime_stall`, `agents/roomlerd/src/watchdog.rs:598` |
+| The pump-stall exit records the same evidence, and now also drops its routes first | `force_exit_on_stall`, `watchdog.rs:687` |
 | The evidence runs on a thread of its own, for at most 10 s. Whatever the stuck threads hold (the pump lock, the log writer, a filesystem) can delay the exit by that much, never stop it | `leave_stall_evidence` `:637`, `within` `:674` |
 | Each pump's age and stage, read with `try_lock`: the thread that holds the pump lock may be one of the stuck ones | `pump_ages_now` `:365` |
 | Every thread's stack, read from outside the stuck code: `/usr/bin/sample` on macOS, `/proc/self/task` on Linux, nothing on Windows yet | `thread_dump::capture`, `agents/roomlerd/src/thread_dump.rs:63` |
@@ -4332,7 +4333,7 @@ sequenceDiagram
 - As root, `sample` reads the hardened-runtime daemon: measured on a
   MacBook on 0.4.181, 43 threads with symbolized Rust frames in 1.6 s.
   On macOS the stacks are read **only as root**
-  (`may_read_own_stacks`, `watchdog.rs:656`). The FR-43 GUI worker runs
+  (`may_read_own_stacks`, `watchdog.rs:654`). The FR-43 GUI worker runs
   as the signed-in person, where a request to read the hardened binary
   would be refused, and a refused debugger-style request has no business
   on someone's desktop. Its record names the stall without the stacks.
@@ -4803,8 +4804,7 @@ Crate: `windows-service = "0.7"` for the SCM lifecycle.
     {SpawnIn|KeepCurrent|Idle}` — pure state machine, exhaustively
     unit-tested without FFI.
   - `next_backoff(consecutive_failures)` — 2 s × 2^(n−1) capped at
-    60 s, saturating against runaway counters; mirrors the
-    Scheduled Task `RestartOnFailure` PT1M cap.
+    60 s, saturating against runaway counters.
   - `run(exe, args, rx)` is the supervisor main loop on a dedicated
     OS thread. SCM session-change notifications swap the worker to
     the new active console user; worker crash respawns under backoff.
