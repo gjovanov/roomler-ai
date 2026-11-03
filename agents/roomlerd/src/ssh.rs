@@ -797,7 +797,8 @@ mod sshd {
         /// this reason when something is asked to run — a bare auth failure
         /// cannot explain itself, which is why the refusal is deferred.
         pub run_as: Result<crate::exec::RunAs, String>,
-        /// Sentinel the operator is prompted on before anything runs. `None`
+        /// The grant the operator is asked about before anything runs. Each
+        /// question is filed under an id of its own, not this (#3442). `None`
         /// = no prompt: either the policy said an explicit `Auto`, or this is
         /// a key-list session — the break-glass path, deliberately exempt
         /// from a gate the control plane owns.
@@ -885,7 +886,8 @@ mod sshd {
                 // `Email`, `Push` and a server that said NOTHING all ask —
                 // the fail-safe direction for a gate whose whole purpose is a
                 // human in the loop, and the same rule Fleet RPC applies. The
-                // grant id doubles as the sentinel the decision arrives on.
+                // question is about this grant; the decision arrives under the
+                // question's own id (#3442).
                 consent_sentinel: match consent_mode {
                     Some(ConsentMode::Auto) => None,
                     _ => Some(grant_id.clone()),
@@ -2254,13 +2256,16 @@ mod sshd {
     /// "run a command", "transfer files"). FR-27 puts it in front of the person
     /// deciding, not just in the daemon log: "grant SSH" and "give this account
     /// a root shell on my machine right now" are not the same question.
+    ///
+    /// `grant` is what the question is about, never the id it is asked under
+    /// (#3442, [`question`]).
     async fn await_consent(
         asker: &Asker,
         handle: &russh::server::Handle,
         channel: ChannelId,
         caller: &str,
-        sentinel: &str,
-        what: &str,
+        grant: &str,
+        what: &'static str,
     ) -> Result<(), String> {
         let timeout = crate::consent::DEFAULT_PROMPT_TIMEOUT;
         let _ = handle
@@ -2274,26 +2279,133 @@ mod sshd {
                 .into_bytes(),
             )
             .await;
+        question(asker, caller, grant, what, timeout).await
+    }
+
+    /// A question to the person at the device, as every channel waiting on it
+    /// holds it.
+    type Asked = futures::future::BoxFuture<'static, Result<(), String>>;
+
+    /// The questions standing, by grant and activity, each with the turn it
+    /// was asked on.
+    static ASKING: std::sync::Mutex<
+        std::collections::BTreeMap<
+            (String, &'static str),
+            (u64, futures::future::WeakShared<Asked>),
+        >,
+    > = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    /// The question about `what` under `grant`: the one standing, if another
+    /// channel of the session asks it already, or a new one under an id of
+    /// its own.
+    ///
+    /// ⚠️ One question per grant AND activity (#3442). A grant is single-use,
+    /// so every channel under it belongs to one connection, and they can ask
+    /// at once: a command waits in a task of its own. Each used to ask under
+    /// the grant's id, and the broker keeps one question per id, the newer one
+    /// winning (#3434): the older question was withdrawn, and its channel
+    /// refused although nobody had said no. A channel asking about the same
+    /// activity now waits on the standing question, and one answer settles
+    /// every channel waiting on it. A different activity is a different
+    /// question, since the question names it (FR-27): an Allow given for a
+    /// command must never open a shell.
+    ///
+    /// ⚠️ An id of its own, never the grant's: two questions standing under
+    /// one grant must not share one. The broker would take the older off its
+    /// books, and a surface dismissed by id (a desktop notification) would
+    /// come down for both. The grant is logged beside it.
+    ///
+    /// The question stands while any channel waits on it: one channel closing
+    /// does not withdraw it from the others. It comes off [`ASKING`] once it
+    /// is answered, before the answer reaches any channel, or when the last
+    /// channel waiting on it goes. A channel that asks in between the answer
+    /// and that moment takes the answer: the same caller asked about the same
+    /// activity, so the person could not have told the two channels apart.
+    fn question(
+        asker: &Asker,
+        caller: &str,
+        grant: &str,
+        what: &'static str,
+        timeout: Duration,
+    ) -> futures::future::Shared<Asked> {
+        use futures::FutureExt;
+        static TURN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let key = (grant.to_string(), what);
+        let mut asking = ASKING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(standing) = asking.get(&key).and_then(|(_, q)| q.upgrade()) {
+            info!(%caller, %grant, what, "ssh: this is asked already — waiting on that question");
+            return standing;
+        }
+        let turn = TURN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = bson::oid::ObjectId::new().to_hex();
+        info!(%caller, %grant, question = %id, what, "ssh: asking the person at the device");
+        let leave = Leave {
+            key: key.clone(),
+            turn,
+        };
+        let (asker, caller, grant) = (asker.clone(), caller.to_string(), grant.to_string());
+        let asked = async move {
+            let verdict = ask(&asker, &caller, &grant, &id, what, timeout).await;
+            // Off the table before the answer reaches anyone.
+            drop(leave);
+            verdict
+        }
+        .boxed()
+        .shared();
+        let weak = asked.downgrade().expect("a question not yet polled");
+        asking.insert(key, (turn, weak));
+        asked
+    }
+
+    /// Takes its question off [`ASKING`]: once it is answered, or with the
+    /// question when the last channel waiting on it goes. Only its own entry:
+    /// a newer question about the same thing has a turn of its own.
+    struct Leave {
+        key: (String, &'static str),
+        turn: u64,
+    }
+
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            let mut asking = ASKING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if asking
+                .get(&self.key)
+                .is_some_and(|(turn, _)| *turn == self.turn)
+            {
+                asking.remove(&self.key);
+            }
+        }
+    }
+
+    /// Ask once, under `id`: here, or (FR-105) through the worker.
+    async fn ask(
+        asker: &Asker,
+        caller: &str,
+        grant: &str,
+        id: &str,
+        what: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
         match asker {
             Asker::Here {
                 broker,
                 indicator,
                 companion,
-            } => {
-                ask_here(
-                    broker, indicator, *companion, caller, sentinel, what, timeout,
-                )
-                .await
-            }
+            } => ask_here(broker, indicator, *companion, caller, id, what, timeout).await,
             Asker::Worker(relay) => {
-                let verdict = relay.ask(sentinel, caller, what, timeout).await;
+                let verdict = relay.ask(id, caller, what, timeout).await;
                 match &verdict {
                     Ok(()) => info!(
-                        %caller, %sentinel,
+                        %caller, %grant, question = %id,
                         "ssh-service: the person at the device approved the session"
                     ),
                     Err(why) => warn!(
-                        %caller, %sentinel, %why,
+                        %caller, %grant, question = %id, %why,
                         "ssh-service: the person at the device did not approve the session"
                     ),
                 }
@@ -2305,7 +2417,7 @@ mod sshd {
     /// Ask the person at this device from THIS process: the native panel,
     /// the desktop companion, the CLI sentinel. `Err` is what the caller's
     /// terminal is told. FR-105 — also how a worker answers the question its
-    /// SYSTEM service relays.
+    /// SYSTEM service relays. `sentinel` is the question's own id (#3442).
     pub(crate) async fn ask_here(
         broker: &crate::consent::ConsentBroker,
         indicator: &crate::indicator::ViewerIndicator,
@@ -2315,6 +2427,16 @@ mod sshd {
         what: &str,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
+        // ⚠️ Armed before anything shows it (#3442): an answer counts from the
+        // moment the question is up. The panel, the marker, the companion
+        // (which may have to be started, up to 3 s) and the notification all
+        // go up after this. Armed last, an answer given while they went up was
+        // refused ("no active prompt"), and the native panel went down with
+        // it, leaving the question asking with nothing on the screen. The
+        // window still runs from the show: the prompt starts its clock at its
+        // first look, below.
+        let asking = broker.request_with_mode(sentinel, crate::consent::Mode::Prompt { timeout });
+
         // FR-27 — the same surface chain as a screen-control or exec prompt:
         // the daemon's own panel first, the desktop companion (started if it
         // is not running) second, the CLI sentinel always. SSH used to write
@@ -2383,9 +2505,7 @@ mod sshd {
         }
         info!(%caller, %sentinel, native, notified, have_surface, "consent prompt surface (ssh)");
 
-        let decision = broker
-            .request_with_mode(sentinel, crate::consent::Mode::Prompt { timeout })
-            .await;
+        let decision = asking.await;
         // The single convergence point: answered, timed out, or resolved from
         // the CLI — the panel comes down here regardless of who decided.
         indicator.hide_prompt(sentinel);

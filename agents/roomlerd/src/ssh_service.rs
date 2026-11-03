@@ -122,7 +122,9 @@ pub struct Hello {
 pub struct ConsentAsk {
     /// Matches the answer to the question; per connection.
     pub id: u32,
-    /// The grant id, which the person's decision is filed under.
+    /// The question's id, which the person's decision is filed under: an
+    /// object id of its own, never the grant's (#3442). An older service sent
+    /// the grant id, which is an object id too.
     pub sentinel: String,
     /// Who asks, from the server's grant.
     pub caller: String,
@@ -941,10 +943,10 @@ where
 async fn answer_here(ask: ConsentAsk, asker: &crate::ssh::Asker) -> ConsentAnswer {
     let id = ask.id;
     let verdict = match asker {
-        // The grant id is a file name in the broker's directory: never let
-        // anything else become one.
+        // The question's id is a file name in the broker's directory: never
+        // let anything else become one.
         _ if !crate::exec_service::valid_object_id(&ask.sentinel) => {
-            Err("the SYSTEM service asked about a malformed grant".to_string())
+            Err("the SYSTEM service asked under a malformed id".to_string())
         }
         crate::ssh::Asker::Here {
             broker,
