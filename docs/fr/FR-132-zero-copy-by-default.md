@@ -101,7 +101,10 @@ nothing about a save restarts a daemon. The device has no revision check of its 
 `noop` and the row reads `applied`, though the daemon still runs the old value. A pod roll does that to a whole fleet,
 and a kill switch that says it is in force when it is not is worse than a slow one. The server cannot tell a reconnect
 from a restart, since no process identity crosses the wire, so this is the agent's to fix: a key stays in
-`needs_restart` until the running process holds the value.
+`needs_restart` until the running process holds the value. As built, the list is exactly what the process does not
+run, so a save back to the running value leaves nothing waiting and reads `applied` at once. An independent read of
+this change also found the live `exec_enabled` gate moving only when the file changed, so a push could read `applied`
+over a gate that had not moved. It now follows the document, and a gate that moves is always in the report's `live`.
 
 ### 3b. Decode errors become countable (P1)
 
@@ -169,7 +172,7 @@ the flip on every host that runs the cell, canary or not.
 | P0 | The red record: a fleet week of heartbeats read per cell (encoder × capture arm), counting the sessions that could have opened a GPU form and read `switch_off`, and naming the hosts that run each cell | — | **done 2026-10-30** (§8, AC1) |
 | P1 | 3a and 3b: `zero_copy_deny` in `DesiredConfig` and the agent's `apply`; the viewer's decode-error message and its count in `rc:session.stats` | the push is absent (no change); a viewer without the message sends nothing | **built 2026-10-30, released 2026-10-31** ([#3154](https://github.com/gjovanov/roomler-ai/pull/3154), in 0.4.191 and `hosted-20261031-28dfd72`). 3a: `MANAGE_AGENTS` alone, passed on unread, written by the device with `needs_restart`, end to end in `agent_tests` (AC2's integration half). 3b: `rc:decode-error` per error before the fallback, `de: 1` on every `rc:decodestat`, `decode_errors` on `rc:session.stats` (absent = not counted), the first `de` and the first eight errors sent at once, end to end through a real agent and viewer peer in `session_decode_errors_tests` (AC3's integration half). The field halves of AC2 and AC3 are met (§8) |
 | P1b | 3a: a save nudges a connected device with the same frame, and one hub call sends every `rc:agent.config` | the previous image: the connect path never left, so a device still converges | **built** ([#3242](https://github.com/gjovanov/roomler-ai/pull/3242)): server and UI only, so it needs a promote and no release; AC8's field half follows it |
-| P1c | 3a: `needs_restart` holds until the daemon runs the value | the previous agent: a reconnect reads `applied` again | not started |
+| P1c | 3a: `needs_restart` holds until the daemon runs the value | the previous agent: a reconnect reads `applied` again | **built** ([#3283](https://github.com/gjovanov/roomler-ai/pull/3283)): rides the next agent release after it merges; AC9's field half follows that release |
 | P1d | 3d: `rc:session.stats` carries the encoder, the capture arm and the input form (decision 8) | absent from an older agent, and the week reads the heartbeats | not started |
 | P2 | 3c: the three-valued reading, the default list (empty), `default_off`, at both entry points | `zero_copy = off`; the list empty | not started |
 | P3 | QSV: the canary week, then the flip (if open decision 4 orders it first). `hevc_qsv` and `h264_qsv` also wait for decision 9 | `zero_copy_deny` pushed; the cell off the list in the next release | not started |
