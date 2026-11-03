@@ -1186,6 +1186,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #3433 — a withdrawn question takes no answer from the moment it is
+    /// withdrawn. `cancel` used to only wake the prompt: its entry stood until
+    /// the prompt next ran, and an answer in between was taken, and won, since
+    /// the poll looks for a decision before it looks for the cancel. The
+    /// record prompt is armed before it is shown, so "next ran" can be a
+    /// companion's start away.
+    #[tokio::test]
+    async fn a_withdrawn_question_takes_no_answer() {
+        let dir = fixture_dir("cancel-takes-no-answer");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "34330000000000000000c0c0";
+
+        let prompt = broker.request_with_mode(session, LONG_WINDOW);
+        assert!(broker.cancel(session), "a prompt was standing");
+        let taken = broker.record_decision(session, true);
+        let decision = tokio::time::timeout(PROMPT_BOUND, prompt)
+            .await
+            .expect("a withdrawn prompt must still resolve promptly");
+        assert_eq!(
+            (taken, decision),
+            (false, Decision::Cancelled),
+            "an answer after the withdrawal was taken, and decided it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1632 — registration is eager, so a decision can be recorded between
     /// `request_with_mode` returning and its future's first poll. That
     /// decision must be honoured: the stale-sentinel purge runs at arm time,

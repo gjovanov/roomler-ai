@@ -199,6 +199,21 @@ fn a_question_whose_session_dropped_is_withdrawn() -> Result<()> {
 }
 
 #[test]
+fn an_answer_the_moment_the_question_appears_is_taken() -> Result<()> {
+    rt().block_on(an_answer_the_moment_the_question_appears_is_taken_cell())
+}
+
+#[test]
+fn a_question_whose_session_ended_as_it_went_up_is_withdrawn() -> Result<()> {
+    rt().block_on(a_question_whose_session_ended_as_it_went_up_is_withdrawn_cell())
+}
+
+#[test]
+fn an_allow_whose_session_then_ended_starts_nothing() -> Result<()> {
+    rt().block_on(an_allow_whose_session_then_ended_starts_nothing_cell())
+}
+
+#[test]
 fn the_hosts_disconnect_stops_the_recording() -> Result<()> {
     rt().block_on(the_hosts_disconnect_stops_the_recording_cell())
 }
@@ -270,6 +285,9 @@ struct Opts {
     companion: bool,
     /// P3d — a companion that is up and waited for, on this clock.
     timed: Option<(Duration, Duration)>,
+    /// A companion that has to be started: up only this long after it is
+    /// asked, each time.
+    starting: Option<Duration>,
     /// The session is on the banner (the registry) at all.
     listed: bool,
     /// P3b-3 — the device this session is on (a fresh one when `None`).
@@ -288,6 +306,7 @@ impl Default for Opts {
             prompt_window: None,
             companion: true,
             timed: None,
+            starting: None,
             listed: true,
             device: None,
             controller: None,
@@ -488,9 +507,10 @@ async fn rig(opts: Opts) -> Result<Rig> {
         consent: broker.clone(),
         indicator: indicator.clone(),
         outbound: activity_tx,
-        companion: match opts.timed {
-            Some((poll, ceiling)) => Companion::Timed { poll, ceiling },
-            None => Companion::Fixed(opts.companion),
+        companion: match (opts.timed, opts.starting) {
+            (Some((poll, ceiling)), _) => Companion::Timed { poll, ceiling },
+            (None, Some(after)) => Companion::Starting(after),
+            (None, None) => Companion::Fixed(opts.companion),
         },
     };
 
@@ -1740,6 +1760,171 @@ async fn a_question_whose_session_dropped_is_withdrawn_cell() -> Result<()> {
         "a recording started for a session that is gone"
     );
     Ok(())
+}
+
+/// How long [`Companion::Starting`] takes in the cells below: the time a
+/// question stands on the screen while the companion is still being started.
+/// Long enough for the test to act inside it with room to spare under load.
+const COMPANION_STARTS: Duration = Duration::from_secs(2);
+
+/// #3433 — the question takes an answer from the moment it is on the screen.
+/// It was shown first and armed after, and in between the device may wait
+/// for a companion it had to start (up to its 3 s budget): an answer then was
+/// refused, "no active prompt", and the person who clicked watched the
+/// question run out. With no companion to wait for, an answer sent the moment
+/// the marker appeared was refused in 90 of 200 rounds under load.
+async fn an_answer_the_moment_the_question_appears_is_taken_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    let mut r = rig(Opts {
+        prompt_window: Some(Duration::from_secs(20)),
+        starting: Some(COMPANION_STARTS),
+        ..Default::default()
+    })
+    .await?;
+    r.send(json!({"t": "rc:record.start", "id": "c1"})).await?;
+    assert_eq!(r.state(START).await?["state"], "pending_consent");
+    let (prompt_id, _) = standing_prompt(&r).await?;
+    // Once, the moment it appears, as a click on a panel is: never retried.
+    assert!(
+        r.broker.record_decision(&prompt_id, false),
+        "an answer to the question on the screen was refused"
+    );
+    let v = r.state(START).await?;
+    assert_eq!(
+        (v["state"].as_str(), v["reason"].as_str()),
+        (Some("refused"), Some("consent_denied")),
+        "{v}"
+    );
+    Ok(())
+}
+
+/// #3433 — a session that ends while its question is still going up takes the
+/// question with it, and the host can answer it neither then nor after. The
+/// question was shown before it was registered with its session: an end in
+/// that time (a companion being started, a notification posted) found nothing
+/// to withdraw, a session ends once, and the question stood for its whole
+/// window with an Allow in it taken.
+///
+/// Ended by the signalling loop's word with its channel still open, as when
+/// the peer's close overran its budget, so nothing else can see the end. And
+/// answered at once, while the companion is still starting: a withdrawn
+/// question stood on the books until its prompt next ran, and the device runs
+/// it only once everything that shows it is up.
+async fn a_question_whose_session_ended_as_it_went_up_is_withdrawn_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    let mut r = rig(Opts {
+        prompt_window: Some(Duration::from_secs(20)),
+        starting: Some(COMPANION_STARTS),
+        ..Default::default()
+    })
+    .await?;
+    r.send(json!({"t": "rc:record.start", "id": "w1"})).await?;
+    assert_eq!(r.state(START).await?["state"], "pending_consent");
+    let (prompt_id, _) = standing_prompt(&r).await?;
+    let marker = r.broker.pending_path(&prompt_id);
+
+    remote::session_ended(r.session_id);
+    assert!(
+        !r.broker.record_decision(&prompt_id, true),
+        "the host could answer for a session that had ended"
+    );
+    let ended_at = tokio::time::Instant::now();
+    while marker.exists() && ended_at.elapsed() < COMPANION_STARTS + Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !marker.exists(),
+        "the question stayed on the host's screen after its session ended"
+    );
+    assert!(
+        !r.broker.record_decision(&prompt_id, true),
+        "the host could still answer for a session that had ended"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let kinds: Vec<_> = r.reports().into_iter().map(|(k, _, _)| k).collect();
+    assert!(
+        !kinds.contains(&RecordingActivityKind::PromptGranted)
+            && !kinds.contains(&RecordingActivityKind::Started),
+        "{kinds:?}"
+    );
+    assert!(
+        !s.manager.state().active,
+        "a recording started for a session that had ended"
+    );
+    r.drop_session().await
+}
+
+/// #3433 — an Allow given while the session was alive starts nothing once the
+/// session has ended. After the answer the device still raises its banner,
+/// which can mean starting the companion, and its last look before launching
+/// the recorder was at the channel alone: a session the signalling loop ended
+/// with its channel still open (a close that overran its budget) was recorded
+/// all the same.
+async fn an_allow_whose_session_then_ended_starts_nothing_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    let before = mp4s(&s.out);
+    let mut r = rig(Opts {
+        prompt_window: Some(Duration::from_secs(20)),
+        starting: Some(COMPANION_STARTS),
+        ..Default::default()
+    })
+    .await?;
+    r.send(json!({"t": "rc:record.start", "id": "a1"})).await?;
+    assert_eq!(r.state(START).await?["state"], "pending_consent");
+    let (prompt_id, _) = standing_prompt(&r).await?;
+    assert!(
+        eventually(COMPANION_STARTS + Duration::from_secs(5), || r
+            .broker
+            .record_decision(&prompt_id, true))
+        .await,
+        "the broker never took the Allow"
+    );
+    // Granted, and the banner going up: the companion is being started again.
+    let mut kinds: Vec<_> = reports_until(&mut r, RecordingActivityKind::PromptGranted, START)
+        .await
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert!(
+        kinds.contains(&RecordingActivityKind::PromptGranted),
+        "{kinds:?}"
+    );
+    remote::session_ended(r.session_id);
+
+    // A recorder takes its time to launch; nothing comes when nothing starts,
+    // so this waits out the whole ceiling then.
+    kinds.extend(
+        reports_until(
+            &mut r,
+            RecordingActivityKind::Started,
+            COMPANION_STARTS + Duration::from_secs(10),
+        )
+        .await
+        .into_iter()
+        .map(|(k, _)| k),
+    );
+    let recorded = s.manager.state().active;
+    // Whatever happened, the next cell starts from an idle recorder and no
+    // stray file.
+    idle(s).await;
+    for f in mp4s(&s.out).into_iter().filter(|f| !before.contains(f)) {
+        let _ = std::fs::remove_file(Sidecar::path_for(&f));
+        let _ = std::fs::remove_file(&f);
+    }
+    assert!(
+        !recorded && !kinds.contains(&RecordingActivityKind::Started),
+        "a recording started for a session that had ended: {kinds:?}"
+    );
+    r.drop_session().await
 }
 
 /// Every report of `r` until one of `kind` arrives, or `within` passes.

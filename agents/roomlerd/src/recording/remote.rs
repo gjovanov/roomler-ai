@@ -716,6 +716,10 @@ pub enum Companion {
     Fixed(bool),
     /// Up, and waited for as [`Self::System`] is, on a test's own clock.
     Timed { poll: Duration, ceiling: Duration },
+    /// Up once this long has passed: a companion that had to be started, which
+    /// [`Self::System`] waits for (up to its start budget). For tests, which
+    /// need that wait while the question is already on the screen.
+    Starting(Duration),
 }
 
 impl Companion {
@@ -729,6 +733,10 @@ impl Companion {
             .unwrap_or(false),
             Self::Fixed(up) => up,
             Self::Timed { .. } => true,
+            Self::Starting(after) => {
+                tokio::time::sleep(after).await;
+                true
+            }
         }
     }
 
@@ -738,7 +746,7 @@ impl Companion {
             // `ROOMLERD_RECORD_WAITS_FOR_BANNER=0` — start at once, as before P3d.
             Self::System => tunnel_core::env::flag("RECORD_WAITS_FOR_BANNER", true)
                 .then_some((BANNER_POLL, BANNER_READ_CEILING)),
-            Self::Fixed(_) => None,
+            Self::Fixed(_) | Self::Starting(_) => None,
             Self::Timed { poll, ceiling } => Some((poll, ceiling)),
         }
     }
