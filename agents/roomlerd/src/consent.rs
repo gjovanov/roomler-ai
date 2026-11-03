@@ -312,10 +312,14 @@ struct BrokerInner {
     /// [`PendingGuard`] when the future is dropped.
     ///
     /// ⚠️ Every change to a question happens under this lock (#3433): it is
-    /// armed, answered (the sentinel written), withdrawn, decided and released
-    /// (with the files that show it) under it. So an answer is on the books
-    /// before its question ends, or it is refused: never reported taken by a
-    /// question that has already ended.
+    /// armed (its old answers cleared), answered (the sentinel written),
+    /// withdrawn, decided and released (with its marker and answers) under
+    /// it. So an answer is on the books before its question ends, or it is
+    /// refused: never reported taken by a question that has already ended.
+    /// Two files are written outside it: the `.pending` marker, by the caller
+    /// that shows the question ([`ConsentBroker::write_prompt`]), and an
+    /// answer from the CLI's fallback, with no check at all. That is why
+    /// each look reads the books before any answer.
     pending: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
@@ -494,7 +498,9 @@ impl ArmedPrompt {
 
         // The look that decided released the question: off the books, its
         // marker and its sentinels gone, so a re-request of the same id sees
-        // nothing stale. The guard releases again on drop, a no-op by then.
+        // nothing stale. The guard releases again on drop. That leaves a
+        // newer question for the id alone, and with none, unlinks the
+        // question's files a second time, taking anything written since.
         tracing::info!(session = session_hex, ?outcome, "operator consent decision");
         outcome
     }
@@ -647,14 +653,18 @@ impl ConsentBroker {
         // (the RC path arms on the WS loop and polls in a spawned task). A
         // purge there ate an Approve recorded in between — the person who
         // clicked watched the prompt time out.
+        //
+        // ⚠️ And under the books, with the registration (#3433, review F2).
+        // Purged before taking them, an answer `record_decision` gave in
+        // between, for an older question still holding this id, was left
+        // for this one, whose first look took an answer given before it
+        // existed.
+        let cancel = Arc::new(Notify::new());
+        let mut books = self.inner.pending.lock().unwrap();
         let _ = std::fs::remove_file(self.inner.sentinel_path(session_hex, SentinelKind::Approve));
         let _ = std::fs::remove_file(self.inner.sentinel_path(session_hex, SentinelKind::Deny));
-        let cancel = Arc::new(Notify::new());
-        self.inner
-            .pending
-            .lock()
-            .unwrap()
-            .insert(session_hex.to_string(), cancel.clone());
+        books.insert(session_hex.to_string(), cancel.clone());
+        drop(books);
         ArmedPrompt {
             guard: PendingGuard {
                 inner: self.inner.clone(),

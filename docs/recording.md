@@ -1019,10 +1019,13 @@ prompt starts its clock once every surface is up, and each surface counts down
 from when it went up.
 
 ⚠️ **One lock for every change to a question (#3433, from review).** The
-broker's books (`BrokerInner.pending`) are held for each one: a question armed,
-answered, withdrawn, decided, and released with the files that show it. Each
-look the prompt takes is made under them too, and reads the books before any
-answer (`PendingGuard::look`).
+broker's books (`BrokerInner.pending`) are held for each one: a question armed
+(its old answers cleared), answered, withdrawn, decided, and released with its
+marker and answers. Each look the prompt takes is made under them too, and
+reads the books before any answer (`PendingGuard::look`). Two files are written
+outside them: the `.pending` marker, by the caller that shows the question, and
+an answer from the CLI's fallback, which checks nothing. The books-first look
+is what keeps the second from deciding a question that has ended.
 
 | A question that is… | now | before, found by review |
 |---|---|---|
@@ -1030,11 +1033,21 @@ answer (`PendingGuard::look`).
 | decided | is released in the same step | an answer in the gap between the two was reported taken, and its file left behind |
 | answered | gets the answer checked and written in one step, so it lands only while the question still asks | an answer that passed the check as its question was decided landed after the question had cleared its files |
 | an older one for the same id | leaves the newer one's marker and answers alone | its release unlinked the marker of a question still asking |
+| a newer one for the same id | clears the old answers and takes the id in one step | an answer given in between, for the older question, was taken by the newer one, given before it existed |
 
 A withdrawal before the prompt's next look still wins over an answer that had
 landed: the session it was for is over. ⚠️ A `release` closure runs under the
 books' lock, and the lock is not reentrant: nothing inside one may call
 `record_decision`, `cancel` or `arm`.
+
+⚠️ **The tradeoff: file work under the books.** A look stats two files and may
+unlink three, and an answer creates, writes and renames one, all under the
+books. A withdrawal (`cancel`, which the signalling loop calls on a session's
+end) waits for any of that in progress. That is microseconds on a local disk.
+But a per-user daemon keeps its sentinels under the roaming application-data
+folder, which Folder Redirection can put on a file share, and a stalled share
+then stalls the withdrawal behind it. Accepted: the alternative was an answer
+reported taken by a question that had already ended.
 
 The session's side holds the same line (`recording::remote`):
 - the question is armed before the session's prompt lock is taken, then
