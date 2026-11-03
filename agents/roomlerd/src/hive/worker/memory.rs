@@ -135,6 +135,9 @@ impl Workers {
         let _one = self.one_try.lock().await;
         let said = match &*self.read() {
             None => None,
+            Some(Ready::Passing { base, tried, .. }) if tried.elapsed() >= again_after => {
+                base.clone()
+            }
             Some(_) => return,
         };
         let base = match said {
@@ -225,7 +228,9 @@ async fn said(mut show: tokio::process::Command, within: Duration) -> Result<Str
         Ok(Ok(out)) if out.status.success() => {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         }
-        _ => Err(String::new()),
+        Ok(Ok(out)) => Err(format!("systemctl failed to answer: {}", out.status)),
+        Ok(Err(e)) => Err(format!("systemctl could not be run: {e}")),
+        Err(_) => Err(format!("systemd did not answer within {within:?}")),
     }
 }
 
@@ -239,9 +244,7 @@ fn base_of(
     show: Result<&str, &str>,
     own_cgroup: Option<&str>,
 ) -> Result<Option<PathBuf>, NotReady> {
-    let Ok(show) = show else {
-        return Ok(None);
-    };
+    let show = show.map_err(|why| NotReady::Passing(why.to_string()))?;
     if !delegates_memory(show) {
         return Ok(None);
     }
@@ -314,17 +317,13 @@ async fn ready_within(
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(NotReady::Broken(format!("{}: {e}", leaf.display()))),
     }
-    let _ = within;
     // New children can be forked into the unit's cgroup as its processes
-    // move: until it holds none.
-    let mut emptied = false;
-    for _ in 0..8 {
+    // move, and a process in its exit stays: until the kernel says none of
+    // it is left here.
+    let from = Instant::now();
+    loop {
         let procs = std::fs::read_to_string(base.join("cgroup.procs"))
             .map_err(|e| NotReady::Broken(format!("{}: {e}", base.display())))?;
-        if procs.split_whitespace().next().is_none() {
-            emptied = true;
-            break;
-        }
         for pid in procs.split_whitespace() {
             match std::fs::write(leaf.join("cgroup.procs"), pid) {
                 Ok(()) => {}
@@ -338,15 +337,25 @@ async fn ready_within(
                 }
             }
         }
+        match hand_down(&base) {
+            Ok(()) => break,
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(e) => {
+                return Err(NotReady::Broken(format!(
+                    "{}: handing memory down: {e}",
+                    base.display()
+                )));
+            }
+        }
+        if from.elapsed() >= within {
+            return Err(NotReady::Passing(format!(
+                "{}: still here after {within:?}: {}",
+                base.display(),
+                still_here(&base)
+            )));
+        }
+        tokio::time::sleep(LOOK_EVERY).await;
     }
-    if !emptied {
-        return Err(NotReady::Broken(format!(
-            "{}: it kept gaining processes",
-            base.display()
-        )));
-    }
-    hand_down(&base)
-        .map_err(|e| NotReady::Broken(format!("{}: handing memory down: {e}", base.display())))?;
     if let Ok(entries) = std::fs::read_dir(&base) {
         for entry in entries.flatten() {
             if entry
