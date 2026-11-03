@@ -321,7 +321,7 @@ file is a *normal* answer for that caller.
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
 | `config::load` (`crates/agent-core/src/config.rs:3580`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3624`) |
-| `config::read_if_present` (`:3617`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::read_if_present` (`:3654`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
 flowchart TD
@@ -357,8 +357,8 @@ question; two moved to `read_if_present`.
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2640`, `:2662`), at the clean-run promotion
-(`record_clean_run_at`, `:2620`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4062`). Each save
+(`record_clean_run_at`, `:2649`), at every `ConfigSet`, and at enrollment. The daemon, the
+desktop app and the setup wizard all write it through `config::save` (`:4159`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 

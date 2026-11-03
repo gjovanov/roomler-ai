@@ -530,7 +530,7 @@ the portal every minute would start it on every host that does not run it.
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:47`) reads it every 60 s into a cache. The hello and the
 heartbeat only read that cache (`signaling.rs:6891`). A changed brief (a login, a
-logout, the greeter) re-announces the caps on the next heartbeat (`:2112`).
+logout, the greeter) re-announces the caps on the next heartbeat (`:2448`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
 
