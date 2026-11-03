@@ -711,7 +711,7 @@ async fn copy_of(r: &Rig, sid: ObjectId, notes: &[&str]) {
 
 /// What the device logs, as text.
 #[derive(Clone, Default)]
-struct Logs(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct Logs(Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for Logs {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -728,7 +728,7 @@ impl std::io::Write for Logs {
 }
 
 impl Logs {
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
     }
 
@@ -743,7 +743,7 @@ impl Logs {
     /// that line (measured: the search tests reach the actor's lines in
     /// parallel). A second registered dispatcher makes every callsite ask the
     /// thread's own each time.
-    fn capture(&self) -> (tracing::Dispatch, tracing::dispatcher::DefaultGuard) {
+    pub(crate) fn capture(&self) -> (tracing::Dispatch, tracing::dispatcher::DefaultGuard) {
         let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let logs = self.clone();
         let guard = tracing::subscriber::set_default(
