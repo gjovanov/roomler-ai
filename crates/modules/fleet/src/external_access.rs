@@ -65,7 +65,7 @@ use roomler_ai_remote_control::{
     },
     permissions::Permissions,
 };
-use roomler_ai_services::dao::base::PaginationParams;
+use roomler_ai_services::dao::base::{DaoError, PaginationParams};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -509,9 +509,10 @@ pub async fn set_policy(
         .get_member_permissions(tid, auth.user_id)
         .await?;
 
-    // Tenant-scoped, so an agent id from another org is a 404 rather than a
-    // cross-tenant read.
-    let agent = state.agents.base.find_by_id_in_tenant(tid, aid).await?;
+    // Live and tenant-scoped, so an agent id from another org is a 404 rather
+    // than a cross-tenant read, and so is a removed device (#1821): a tombstone
+    // revives whole, so an approval written here would come back with it.
+    let agent = state.agents.find_live_in_tenant(tid, aid).await?;
 
     // Parsed BEFORE the decision, so a malformed instant is a 400 about the
     // field rather than a policy refusal — and so it never leaves a
@@ -560,10 +561,15 @@ pub async fn set_policy(
         return Err(ApiError::Forbidden(reason.message().to_string()));
     }
 
-    state
+    // `false`: the removal won the race with the lookup above, and nothing was
+    // approved.
+    if !state
         .agents
         .update_external_access_policy(tid, aid, &requested)
-        .await?;
+        .await?
+    {
+        return Err(DaoError::NotFound.into());
+    }
     // FR-52 decision 16 — cleared, not narrowed. A ceiling or an expiry applies
     // from the next session, and the approval they sit under still stands.
     let ended_here = if requested.approved {
@@ -658,8 +664,9 @@ pub async fn rotate_connect_code(
         "MANAGE_AGENTS",
     )
     .await?;
-    // Tenant-scoped: a foreign agent id 404s rather than getting a code.
-    state.agents.base.find_by_id_in_tenant(tid, aid).await?;
+    // Live and tenant-scoped: a foreign agent id or a removed device 404s rather
+    // than getting a code (#1821). The tombstone keeps the one it has, unused.
+    state.agents.find_live_in_tenant(tid, aid).await?;
 
     let mut last_err = None;
     for _ in 0..CODE_MINT_ATTEMPTS {
@@ -669,7 +676,9 @@ pub async fn rotate_connect_code(
             ApiError::Internal("could not generate a connect code".to_string())
         })?;
         match state.agents.set_connect_code(tid, aid, &code).await {
-            Ok(_) => {
+            // The removal won the race with the lookup above: no code was minted.
+            Ok(false) => return Err(DaoError::NotFound.into()),
+            Ok(true) => {
                 warn!(
                     tenant = %tenant_id, agent = %agent_id, admin = %auth.user_id,
                     "external access: connect code rotated"
@@ -846,8 +855,9 @@ pub async fn set_principal(
         .tenants
         .get_member_permissions(tid, auth.user_id)
         .await?;
-    // Tenant-scoped: an agent id from another org is a 404.
-    state.agents.base.find_by_id_in_tenant(tid, aid).await?;
+    // Live and tenant-scoped: an agent id from another org is a 404, and so is a
+    // removed device (#1821). The removal already ended its sessions.
+    state.agents.find_live_in_tenant(tid, aid).await?;
 
     let event = |denied: Option<ExternalRcDenyReason>| ExternalRcAuditEvent {
         id: None,

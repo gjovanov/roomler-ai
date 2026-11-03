@@ -33,8 +33,8 @@
         <p id="detect-agent-summary" class="muted">Probing…</p>
         <p id="detect-tunnel-summary" class="muted"></p>
         <p id="detect-ambiguous-warning" class="warning" hidden>
-          Both perUser and perMachine daemon installs detected. The MSI's cleanup
-          custom action will remove the one not selected.
+          Roomler is installed twice here, for this user only and for the whole
+          computer. The install removes the one you did not pick.
         </p>
       </div>
 
@@ -55,23 +55,26 @@
             <input type="radio" name="role" value="daemon-system">
             <div>
               <strong id="role-title-daemon-system">Be accessed — background service (pre-logon, recommended)</strong>
-              <p class="muted" id="role-desc-daemon-system">perMachine install + SystemContext: remote control works on
-              the lock screen, UAC dialogs, and admin apps. Requires admin (UAC prompt).</p>
+              <p class="muted" id="role-desc-daemon-system">Installed for the whole computer as a Windows service, so
+              remote control works on the lock screen, on UAC prompts and in administrator apps too. Needs an
+              administrator's approval (a UAC prompt).</p>
             </div>
           </label>
           <label class="radio role-daemon" data-role="daemon-machine">
             <input type="radio" name="role" value="daemon-machine">
             <div>
               <strong id="role-title-daemon-machine">Be accessed — attended service</strong>
-              <p class="muted" id="role-desc-daemon-machine">perMachine install for all users on this PC, without the
-              SystemContext swap. Requires admin (UAC prompt) during install.</p>
+              <p class="muted" id="role-desc-daemon-machine">Installed for everyone on this computer. Remote control
+              reaches the desktop of whoever is signed in, not the lock screen or UAC prompts. Needs an
+              administrator's approval (a UAC prompt) to install.</p>
             </div>
           </label>
           <label class="radio role-daemon" data-role="daemon-user">
             <input type="radio" name="role" value="daemon-user">
             <div>
               <strong id="role-title-daemon-user">Be accessed — this user only</strong>
-              <p class="muted" id="role-desc-daemon-user">perUser install under my account. No admin password needed.</p>
+              <p class="muted" id="role-desc-daemon-user">Installed for your account only, and runs while you are signed
+              in. No administrator needed.</p>
             </div>
           </label>
           <label class="radio" id="role-card-tunnel">
@@ -100,10 +103,11 @@
              when the note does; it restarts the wizard through Windows'
              administrator prompt with the role kept (cmd_relaunch_elevated). -->
         <div id="elevation-note" class="warning" hidden>
-          <p>This device already has the background service, and its settings are
-          in a folder only administrators may open. To install it again, Roomler
-          Setup has to run as administrator: restart it that way (Windows asks you
-          to approve it once), or pick another option above.</p>
+          <p><span id="elevation-note-lead">This device already has the background
+          service, and its settings are in a folder only administrators may
+          open.</span> To install it again, Roomler Setup has to run as
+          administrator: restart it that way (Windows asks you to approve it
+          once), or pick another option above.</p>
           <footer class="actions">
             <button id="elevation-relaunch" type="button">Restart as administrator</button>
           </footer>
@@ -448,13 +452,12 @@
       </div>
 
       <div id="done-systemcontext-note" class="info" hidden>
-        <strong>SystemContext mode active.</strong>
-        <p>The perMachine MSI is installed, the daemon is enrolled, and the SCM
-        service runs with <code>ROOMLERD_ENABLE_SYSTEM_SWAP=1</code> in its
-        <code>Environment</code> block. Remote control can now drive the Windows
-        lock screen, UAC dialogs, and admin apps when an operator connects from
-        the browser.</p>
-        <p class="muted">To disable SystemContext mode later, run
+        <strong>Lock-screen access is on.</strong>
+        <p>Roomler is installed for the whole computer, this device is enrolled,
+        and its Windows service runs with <code>ROOMLERD_ENABLE_SYSTEM_SWAP=1</code>.
+        Remote control can now drive the Windows lock screen, UAC prompts and
+        administrator apps when someone connects from the browser.</p>
+        <p class="muted">To turn it off later, run
         <code>roomlerd disable-system-context</code> from an elevated shell,
         or re-run this wizard and pick the attended-service role.</p>
       </div>

@@ -367,6 +367,10 @@ mod tenant_archive_tests;
 /// earlier token (agents and tunnel clients alike).
 #[cfg(test)]
 mod token_renewal_tests;
+/// #1821, #1829 — what a removal leaves behind answers nothing: External
+/// access on a removed device, and an overlay join on the socket it still holds.
+#[cfg(test)]
+mod tombstone_tests;
 /// FR-111 P4a — the org's on-screen control presets: any member reads them,
 /// `MANAGE_TENANT` writes them, a foreign id is a 404, a bad body is refused
 /// with a code, and an org keeps at most fifty.

@@ -1545,6 +1545,83 @@ async fn a_server_cannot_mint_a_session_the_device_never_logged_in() {
     let _ = dev.stop.send(true);
 }
 
+/// The name the Hub told the device, read off the audit row it writes beside the
+/// request. Both come from one value, and the row is the part a test can read.
+async fn told_the_device(app: &TestApp, session: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let row = app
+            .db
+            .collection::<bson::Document>("remote_audit")
+            .find_one(bson::doc! { "session_id": oid(session), "event.kind": "session_requested" })
+            .await
+            .unwrap();
+        if let Some(row) = row {
+            return row
+                .get_document("event")
+                .unwrap()
+                .get_str("controller_name")
+                .unwrap()
+                .to_string();
+        }
+        assert!(Instant::now() < deadline, "no session_requested row");
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Decision 8. The person at the machine is told what the server knows of who is
+/// asking: the address the account proved, or that it has none, and only after that
+/// the name it chose. The org's log keeps the name as chosen.
+#[tokio::test]
+async fn the_device_is_told_a_proven_address_or_that_there_is_none() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("extauth-asked").await;
+    let dev = device_with(
+        &app,
+        &seeded,
+        "mach-extauth-asked",
+        &pw("device"),
+        unattended(),
+    )
+    .await;
+
+    // Signed up and activated: this account proved its address.
+    let (principal, mut ws) = outsider(&app, "extasked").await;
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    assert_eq!(
+        told_the_device(&app, &session).await,
+        "extasked@outside.test (verified) as \"An Outsider\""
+    );
+    let row = wait_for_row(&app, &seeded, |r| {
+        r["action"] == "session" && r["session_id"] == json!(session)
+    })
+    .await;
+    assert_eq!(row["actor"], "An Outsider", "{row}");
+    end_session(&app, &mut ws, &session).await;
+
+    // What an unverified provider identity holds instead: a placeholder.
+    app.state
+        .users
+        .base
+        .update_by_id(
+            oid(&principal),
+            bson::doc! { "$set": {
+                "email": "microsoft-oid@unverified.invalid",
+                "is_verified": false,
+            } },
+        )
+        .await
+        .unwrap();
+    let (attempt_id, _) = login(&mut ws, &dev.code, &pw("device"), &principal).await;
+    let session = open_session(&mut ws, &dev.code, &attempt_id, "VIEW | INPUT").await;
+    assert_eq!(
+        told_the_device(&app, &session).await,
+        "Unverified account \"An Outsider\""
+    );
+    let _ = dev.stop.send(true);
+}
+
 /// One `rc:extauth.start` straight into the handler, as a socket's frame would
 /// arrive, under a fresh principal so the per-principal limit is not what gets
 /// measured: how long until the answer left, and the answer.

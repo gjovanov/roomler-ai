@@ -1434,10 +1434,10 @@ which ran in no lane before. Nothing calls them yet. The supervisor is wired to 
 | what the child inherits | `InheritOnly` (`:2440`): a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` of its three standard handles, and nothing else the daemon holds | (the hang `pty/windows.rs` measured without one) |
 | who it runs as | `SpawnAs::User(token)`. The daemon's own identity exists only under `cfg(test)`, so no build that ships can start a session as SYSTEM | |
 | the console user | `hive_win.rs:135` `console_user`: `no_console_user` with nobody signed in, and `launch_failed` naming SYSTEM when the daemon may not ask. The account comes from the token's SID, the profile from the token, `%APPDATA%` from the user's own block | a test process, which is not SYSTEM, is refused and never handed a user |
-| the mapping | `hive_win.rs:564` `names_console_user` and `:577` `check_mapping`: `name`, `DOMAIN\name` or `.\name`, case-insensitively. Anything else is `no_account`, naming who is at the console | a table of 15, including `CORP\dev` ≠ `WS-1\dev`, and `.` against a domain account |
-| the harness | `hive_win.rs:604` `harness_candidates`, `:620` `resolve_harness` | `hive_harness` alone when set; else `claude.exe`, then npm's `claude.cmd`; a directory of that name is no harness |
-| its command line | `hive_win.rs:690` `harness_command_line`: an `.exe` quoted for the C runtime; a `.cmd` through `%SystemRoot%\System32\cmd.exe /d /v:off /s /c`, an argument holding one of cmd's metacharacters (`:676`, `:680`) refused, never escaped | every argument reads back exactly through `CommandLineToArgvW`; eleven metacharacters are refused |
-| `roomlerd hive-prep` | `hive_win.rs:844` `prep`, and `:897` `run_prep`, which runs it in a job of its own with a 30 s deadline; dispatched at `app.rs:1189` | the config directory is made; memory is copied only where nothing is, so a resume keeps its edits; a folder that does not open is refused; a hang is ended at its deadline |
+| the mapping | `hive_win.rs:565` `names_console_user` and `:578` `check_mapping`: `name`, `DOMAIN\name` or `.\name`, case-insensitively. Anything else is `no_account`, naming who is at the console | a table of 15, including `CORP\dev` ≠ `WS-1\dev`, and `.` against a domain account |
+| the harness | `hive_win.rs:605` `harness_candidates`, `:621` `resolve_harness` | `hive_harness` alone when set; else `claude.exe`, then npm's `claude.cmd`; a directory of that name is no harness |
+| its command line | `hive_win.rs:691` `harness_command_line`: an `.exe` quoted for the C runtime; a `.cmd` through `%SystemRoot%\System32\cmd.exe /d /v:off /s /c`, an argument holding one of cmd's metacharacters (`:677`, `:681`) refused, never escaped | every argument reads back exactly through `CommandLineToArgvW`; eleven metacharacters are refused |
+| `roomlerd hive-prep` | `hive_win.rs:845` `prep`, and `:898` `run_prep`, which runs it in a job of its own with a 30 s deadline; dispatched at `app.rs:1189` | the config directory is made; memory is copied only where nothing is, so a resume keeps its edits; a folder that does not open is refused; a hang is ended at its deadline |
 
 Three decisions differ from the table above:
 
@@ -1484,7 +1484,7 @@ is true:
   integrity, never elevated. The recorder's token code moved, unchanged, to `win_token.rs:209`, so
   a build without `recording` has it too.
 - **The runtime files live with the store, in the service's machine-wide directory**,
-  `%ProgramData%\roomler\roomler\hive` (`hive_win.rs:1016`). Both workers reach it, so the worker
+  `%ProgramData%\roomler\roomler\hive` (`hive_win.rs:1017`). Both workers reach it, so the worker
   a swap brings finds what the last one hosted (`hosted.json`) and resumes it; a per-user data
   directory would differ by worker. Every directory there is owned by Administrators with a
   protected DACL (`:804`, `:809`, set by `dir_with_dacl` at `:897`): SYSTEM and Administrators,
@@ -1509,9 +1509,9 @@ flowchart LR
 | Piece | Where | What its tests pin (Windows CI) |
 |---|---|---|
 | the start, as the console user | `hive/supervisor.rs:2277` `spawn`: the mapping, the harness, the session's directory (`:2312`), its settings and MCP config, `roomlerd hive-prep` as the user (`blocking`, `:2366`), then the harness SUSPENDED into its Job Object | the blocks' own (P1i-1); the whole path is P1i-4's field run |
-| the harness's process | `hive_win.rs:1170` `HarnessChild`: the part of tokio's `Child` the session task uses, over the job, its pipes as async files | a line in, a line out, the exit code; a kill seen by the wait |
+| the harness's process | `hive_win.rs:1171` `HarnessChild`: the part of tokio's `Child` the session task uses, over the job, its pipes as async files | a line in, a line out, the exit code; a kill seen by the wait |
 | the stop | `hive/supervisor.rs:3308`: stdin closed, then the job ended after the grace. No signal reaches a console-less process | — |
-| the toolbelt | `hive/toolbelt.rs:1005`: a named pipe, `FILE_FLAG_FIRST_PIPE_INSTANCE`, no remote client, with `hive_win.rs:990`'s DACL: SYSTEM and Administrators, and the session's account to read and write (`0x12008b`) but not to make an instance. The relay opens it with exactly that mask (`hive_win.rs:1131`); each client's account is checked again by SID (`toolbelt.rs:1082`) | every approval test, over the pipe; another account's connection dropped unanswered; a name in use never taken as the first |
+| the toolbelt | `hive/toolbelt.rs:1005`: a named pipe, `FILE_FLAG_FIRST_PIPE_INSTANCE`, no remote client, with `hive_win.rs:991`'s DACL: SYSTEM and Administrators, and the session's account to read and write (`0x12008b`) but not to make an instance. The relay opens it with exactly that mask (`hive_win.rs:1132`); each client's account is checked again by SID (`toolbelt.rs:1082`) | every approval test, over the pipe; another account's connection dropped unanswered; a name in use never taken as the first |
 | a crash's leftover | `hive/procs.rs:120`, `:248`: creation times by `GetProcessTimes`, and an ended process reads as none even while a handle holds it open | an ended process has no start time; `take_down` ends what it is given |
 | the key helper | `hive/sidecar.rs:300`: `cmd.exe /d /s /c "<helper>"`, by its full path, passed raw | — |
 | adopting | `hive/gates.rs:79`: `hive_adopt` reads off on Windows, so the device never advertises `hive-adopt` | the owner's word on Unix, off on Windows. Since FR-97 P4c, the owner's word on Windows too, through a named pipe (`docs/hive.md` §8, *On Windows*) |
@@ -4694,9 +4694,9 @@ hive-worker`.
 - Both failed on master at "kept for the worker at the run's very first launch", the worker up,
   and pass with the fix. A kept part is served by nothing in the daemon, so every answer above is
   the worker's.
-- Windows, the sidecar: [`a_sidecar_kept_before_its_worker_is_served_by_it_once_up`](../../agents/roomlerd/src/hive/worker/win/tests.rs#L497)
+- Windows, the sidecar: [`a_sidecar_kept_before_its_worker_is_served_by_it_once_up`](../../agents/roomlerd/src/hive/worker/win/tests.rs#L499)
   (in process, over the worker's real pipe) and
-  [`the_real_worker_serves_a_sidecar_kept_before_it_started`](../../agents/roomlerd/src/hive/worker/win/tests.rs#L507)
+  [`the_real_worker_serves_a_sidecar_kept_before_it_started`](../../agents/roomlerd/src/hive/worker/win/tests.rs#L509)
   (`#[ignore]`, the real `roomlerd.exe hive-worker`): kept before any worker exists, crossed by the
   first `rehand` as `WSADuplicateSocketW`'s protocol info for the worker's pid, and a call answered
   by the worker with the daemon's word over the pipe. The first Windows sidecar hand-over ever run,
