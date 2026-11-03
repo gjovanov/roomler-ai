@@ -43,7 +43,7 @@ reading was wrong about which mattered:
 
 | Field | What |
 |---|---|
-| `status` | `InProgress` · `SucceededVerified` · `SucceededUnverified` · `InstallerFailed` · `Timeout` · `WatcherStopped` (`InstallStatus`, `post_install.rs:132`) |
+| `status` | `InProgress` · `SucceededVerified` · `SucceededUnverified` · `InstallerFailed` · `Timeout` · `WatcherStopped` (`InstallStatus`, `post_install.rs:140`) |
 | `expected_version` | the release tag the install was for, `agent-v0.4.172` |
 | `started_unix` / `finished_unix` | when the watcher started and when it wrote its verdict; `finished_unix` is null while `InProgress` |
 | `installer_pid`, `installer_path`, `installer_exit_code` | the installer as the watcher saw it. ⚠️ On Linux the pid is the daemon's own or already reaped — forensic, never waited on (§1) |
@@ -139,7 +139,7 @@ a record older than that (`never_reported`, `:557`).
 
 The reader has to look where the watcher wrote. On every platform's plain
 daemon that is the reader's own `<log_dir>`. It reads two places
-(`post_install::last_install_status`, `post_install.rs:1211`, through
+(`post_install::last_install_status`, `post_install.rs:1450`, through
 `outcome_paths`, #3302): its own `<log_dir>` first, then its account's
 profile data dir. It reports the record written last, and `path` names that
 record's file. Two topologies split roles:
@@ -163,7 +163,7 @@ record's file. Two topologies split roles:
   would report as `NEVER REPORTED` had a SystemContext worker read it.
   ⚠️ **Under SystemContext the worker and its watcher log apart.** The
   worker takes the `service-logs` role (S1b,
-  `agents/roomlerd/src/app.rs:1617`). The watcher it spawns has none and
+  `agents/roomlerd/src/app.rs:1630`). The watcher it spawns has none and
   writes the record into SYSTEM's profile. Read on a per-machine guest, a
   real self-update from candidate 0.4.220 to 0.4.221 left the record
   `InProgress` in SYSTEM's profile past the clean-run threshold, with no
