@@ -227,7 +227,7 @@ Flakes fixed on 2026-10-30, and what each one teaches:
 > description (`ErrNoRemoteDescription`), and a test that ignores the refusal and loses every
 > candidate both ways never connects. `privacy_dc` (10-30) and `control_dc_record` (10-28) hit
 > their 30 s `on_data_channel` timeout that way in CI. The pattern: `exchange` in
-> [`privacy_dc.rs:416`](../agents/roomlerd/tests/privacy_dc.rs#L416), as `dc_throughput.rs`'s
+> [`privacy_dc.rs:424`](../agents/roomlerd/tests/privacy_dc.rs#L424), as `dc_throughput.rs`'s
 > `connect` always did; `control_dc_record` and `file_dc` follow it too.
 
 > [!WARNING]
