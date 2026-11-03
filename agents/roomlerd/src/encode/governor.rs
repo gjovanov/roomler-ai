@@ -4887,6 +4887,294 @@ mod tests {
         assert_eq!(g.stable_bps(), Some(opener));
     }
 
+    /// FR-79 V5b — the pair the replay below remembers (`rate_memory::memory_key`).
+    const V5B_KEY: &str = "203.0.113.221|relay:turn/udp";
+    /// What the pump wrote in one idle window on jupiter: 2,280 B over the 2 s
+    /// before the report, about 76 B a frame at 15 fps.
+    const V5B_IDLE_BYTES: u64 = 1_140;
+    /// The same bytes as the viewer's arrival rate.
+    const V5B_IDLE_RX: u32 = 9_120;
+
+    /// FR-79 V5b — one relayed session of the replay: the pump's clock and running
+    /// byte total, a 3 M plan, an 8 M `hi`, the viewer's paint floor at 17 ms.
+    struct V5bSession {
+        g: RateGovernor,
+        t: Instant,
+        sent: u64,
+    }
+
+    impl V5bSession {
+        fn open(measured_evidence: bool, seed: Option<u32>) -> Self {
+            let t = Instant::now();
+            let mut g = RateGovernor::new(
+                30,
+                DEPTH,
+                GovernorFlags {
+                    measured_evidence,
+                    ..GovernorFlags::default()
+                },
+                8_000_000,
+                seed,
+                t,
+            );
+            g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+            Self { g, t, sent: 0 }
+        }
+
+        /// One second: the pump wrote `wrote` bytes, the viewer reported `link`
+        /// at a paint age of `age` (`None` = it said nothing at all), and the
+        /// pump's tick follows.
+        fn window(
+            &mut self,
+            wrote: u64,
+            age: Option<u16>,
+            link: u64,
+            opening: bool,
+        ) -> ViewerWindow {
+            self.t += Duration::from_secs(1);
+            self.sent += wrote;
+            self.g.note_window_sender(WindowSenderStats {
+                opening,
+                ..v5b_sender()
+            });
+            let w = self
+                .g
+                .tick_viewer_window(
+                    self.t,
+                    30,
+                    || age.map_or(0, |_| viewer_rate::pack_report(30, false)),
+                    || age.map_or(0, |a| viewer_rate::pack_age_with_arrival(a, 17, 30, a - 2)),
+                    || link,
+                    true,
+                    |o| o,
+                    self.sent,
+                )
+                .expect("window due");
+            self.g.pre_encode_tick(
+                3_000_000,
+                crate::encode::MIN_BITRATE_BPS,
+                true,
+                DEPTH,
+                self.t,
+            );
+            w
+        }
+
+        /// An idle window: the trickle, reported at paint age `age`.
+        fn idle(&mut self, age: u16) -> ViewerWindow {
+            let link = viewer_rate::pack_link(V5B_IDLE_RX, 0);
+            self.window(V5B_IDLE_BYTES, Some(age), link, false)
+        }
+
+        /// A silent window with the pump still sending: a transit stall.
+        fn stall(&mut self) {
+            self.window(V5B_IDLE_BYTES, None, 0, false);
+            assert_eq!(
+                self.g.pipe_state(),
+                Some(crate::encode::pipe_state::PipeState::TransitStalled)
+            );
+        }
+
+        fn evidence(&self) -> Option<u32> {
+            self.g.session_evidence_bps(self.t, true)
+        }
+
+        /// Field 21:05:19–21:06:25: the screen moved for a minute. 10.7 Mbps
+        /// delivered, the opener's three windows rejected, the learner stepping
+        /// every 5 s, and the session's peak delivery at the end of it.
+        fn load(&mut self) {
+            let moving = viewer_rate::pack_link(10_700_000, 0);
+            for i in 0..55 {
+                self.window(1_337_500, Some(28), moving, i < 3);
+            }
+            let peak = viewer_rate::pack_link(15_915_240, 0);
+            self.window(1_337_500, Some(28), peak, false);
+        }
+
+        /// Field 21:06:26–21:06:32: the screen stopped, a transit stall at
+        /// 21:06:31, and then the two windows that read a growing queue on idle
+        /// traffic, the first in the stall's shadow and the second valid.
+        fn idle_report(&mut self) -> ViewerWindow {
+            for _ in 0..3 {
+                self.idle(68);
+            }
+            self.stall();
+            let growing = viewer_rate::pack_link(9_489, 145);
+            self.window(V5B_IDLE_BYTES, Some(216), growing, false);
+            self.window(V5B_IDLE_BYTES, Some(216), growing, false)
+        }
+
+        /// Field 21:06:33–21:07:32. The arrival rate's 15 s first, at an elevated
+        /// age so nothing releases it early. Then one letter a window, from the
+        /// heartbeats' counters: a heartbeat spans two windows, so the mix is the
+        /// field's and the order inside a pair is not. `S` a stall, `C` a clean
+        /// report, `E` a report at an elevated age. The window after an `S` is
+        /// rejected as its shadow, whatever it says. Returns each value the
+        /// stand-in took.
+        fn walk(&mut self) -> Vec<Option<u32>> {
+            for _ in 0..15 {
+                self.idle(150);
+            }
+            let mut seen = vec![self.g.prior_bps()];
+            for window in "SSSSSSSSCECCCSSSSSSCESSSCCCSSCEE".chars() {
+                match window {
+                    'S' => self.stall(),
+                    'C' => {
+                        self.idle(56);
+                    }
+                    _ => {
+                        self.idle(150);
+                    }
+                }
+                if seen.last() != Some(&self.g.prior_bps()) {
+                    seen.push(self.g.prior_bps());
+                }
+            }
+            seen
+        }
+    }
+
+    /// FR-79 V5b, the replay, with the rules that shipped: the switch off. Field
+    /// 2026-11-02 21:05:18–21:07:34, jupiter on `0.4.197`, one relayed `h264_vaapi`
+    /// session and the sessions opened from what it wrote. It never lost a byte to
+    /// a slow path, and it left the pair remembered at 3.3 kbps:
+    ///
+    /// 1. A minute at 10.7 Mbps, then the screen stopped.
+    /// 2. The viewer's queue read as growing on idle traffic, so the arrival rate
+    ///    of that trickle became the pipe. The target fell 6.2 M → 200 kbps and
+    ///    FR-59 P6 abandoned the ceiling the session had just earned.
+    /// 3. The session walked that reading down and wrote the last rung to the pair
+    ///    memory as evidence.
+    /// 4. The next sessions opened at that number.
+    /// 5. Each wrote its own stand-in back, which refreshed the 7-day TTL, so the
+    ///    key held itself low with nothing behind it.
+    ///
+    /// Every number here is the field's, to the unit. This arm stays: it pins the
+    /// switch, and it is what says the replay is the session.
+    #[test]
+    fn the_jupiter_chain_replays_to_the_unit_with_the_switch_off() {
+        let mut s = V5bSession::open(false, None);
+        s.load();
+        assert_eq!(s.g.learned_ceiling_bps(), 6_209_663, "twelve steps");
+        assert_eq!(s.g.prior_bps(), None, "nothing measured the pipe");
+        // Step 2.
+        let w = s.idle_report();
+        assert!(w.link_congested);
+        assert_eq!(w.link_ceiling_bps, Some(8_540));
+        assert_eq!(
+            s.g.evidence_rejected()[2],
+            1,
+            "its first window, the shadow"
+        );
+        assert_eq!(s.g.applied_bps(), 200_000, "target at the floor");
+        assert_eq!(s.g.take_seed_abandoned(), Some(6_209_663));
+        assert_eq!(s.g.learned_ceiling_bps(), 0);
+        assert_eq!(s.g.prior_bps(), Some(9_489));
+        assert_eq!(
+            s.g.belief_bps(s.t),
+            (Some(7_962_364), Some(7_962_364), Some(9_489)),
+            "the heartbeat's `pipe_belief` at 21:06:33"
+        );
+        // Step 3: the rungs, ×10/11 with integer floors.
+        let rungs = s.walk();
+        let rungs: Vec<u32> = rungs.into_iter().flatten().collect();
+        assert_eq!(
+            rungs,
+            [
+                9_489, 8_626, 7_841, 7_128, 6_480, 5_890, 5_354, 4_867, 4_424, 4_021, 3_655, 3_322
+            ]
+        );
+        assert_eq!(s.g.measured_bps(s.t, true), None, "nothing live at the end");
+        let evidence = s.evidence();
+        assert_eq!(evidence, Some(3_322));
+        let mut memory = super::super::rate_memory::RateMemory::default();
+        let at = 1_793_000_000u64;
+        assert_eq!(memory.record_session(V5B_KEY, evidence, at), 3_322);
+        // Steps 4 and 5, twice: each session opens low, takes one rung off the
+        // seed (×4/5) and writes it back, damped to half the gap. The field's
+        // 3,322 → 2,989 → 2,690.
+        for (session, (stand_in, kept)) in [(2_657, 2_989), (2_391, 2_690)].into_iter().enumerate()
+        {
+            let at = at + 600 * (session as u64 + 1);
+            let seed = memory.seed_for(V5B_KEY, at);
+            let mut next = V5bSession::open(false, seed);
+            assert_eq!(next.g.open_seed_bps(), seed);
+            assert_eq!(next.g.applied_bps(), 200_000, "opens at the floor");
+            next.idle(150);
+            next.idle(150);
+            assert_eq!(next.evidence(), Some(stand_in));
+            memory.record_session(V5B_KEY, next.evidence(), at);
+            let entry = &memory.entries[V5B_KEY];
+            assert_eq!(entry.stable_bps, kept);
+            assert_eq!(entry.at_unix, at, "the TTL refreshed on nothing");
+        }
+    }
+
+    /// FR-79 V5b — the replay's step 2 with the rules on. A queue that grew on
+    /// 1,140 B a window says nothing about the rate: the sender was not offering
+    /// anything for the path to refuse, so the trickle's arrival rate is the
+    /// content's weight, the case `viewer_rate::LinkLoop`'s own warning describes.
+    #[test]
+    fn the_jupiter_chain_takes_no_reading_from_idle_traffic() {
+        let mut s = V5bSession::open(true, None);
+        s.load();
+        let before = s.g.applied_bps();
+        let w = s.idle_report();
+        assert!(!w.link_congested, "nothing the sender offered");
+        assert!(!s.g.link_loop_holding(), "no clamp to the trickle");
+        assert_eq!(s.g.measured_bps(s.t, true), None, "and no reading");
+        assert_eq!(s.g.take_seed_abandoned(), None);
+        assert_eq!(s.g.learned_ceiling_bps(), 6_209_663, "the ceiling stands");
+        assert!(s.g.applied_bps() >= before, "the target stands");
+        assert_eq!(
+            s.g.belief_bps(s.t).1,
+            Some(15_915_240),
+            "no capacity sample took the floor down"
+        );
+    }
+
+    /// FR-79 V5b — the replay's step 3 with the rules on: a session whose only
+    /// "reading" was idle traffic leaves the memory alone.
+    #[test]
+    fn the_jupiter_chain_writes_nothing_at_session_end() {
+        let mut s = V5bSession::open(true, None);
+        s.load();
+        s.idle_report();
+        s.walk();
+        assert_eq!(s.evidence(), None);
+        let mut memory = super::super::rate_memory::RateMemory::default();
+        assert_eq!(
+            memory.record_session(V5B_KEY, s.evidence(), 1_793_000_000),
+            0
+        );
+        assert!(memory.entries.is_empty());
+    }
+
+    /// FR-79 V5b — the replay's step 5 with the rules on, from a key an earlier
+    /// build already poisoned: a session that opens from it and measures nothing
+    /// leaves its value and its age, so the entry runs out rather than holding
+    /// itself low.
+    #[test]
+    fn the_jupiter_chain_does_not_refresh_a_poisoned_key() {
+        let mut memory = super::super::rate_memory::RateMemory::default();
+        let written = 1_793_000_000u64;
+        memory.record_session(V5B_KEY, Some(3_322), written);
+        let at = written + 600;
+        let mut s = V5bSession::open(true, memory.seed_for(V5B_KEY, at));
+        assert_eq!(
+            s.g.open_seed_bps(),
+            Some(3_322),
+            "step 4 stands: it opens low"
+        );
+        s.idle(150);
+        s.idle(150);
+        assert_eq!(s.evidence(), None, "a seed is not a measurement");
+        memory.record_session(V5B_KEY, s.evidence(), at);
+        let entry = &memory.entries[V5B_KEY];
+        assert_eq!(entry.stable_bps, 3_322);
+        assert_eq!(entry.at_unix, written, "its age stands");
+    }
+
     /// FR-119 P2b-14 — a DIRECT window whose blocked sends include a keyframe
     /// is not a capacity measurement even when a delta blocked beside it: the
     /// delta waited on the keyframe's backlog. Field 2026-10-25, a LAN path:
