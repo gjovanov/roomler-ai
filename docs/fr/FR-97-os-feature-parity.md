@@ -1021,10 +1021,10 @@ test of the SIGKILL property itself.
 - **P4c, Hive adopt** (built). The adopt socket is a named pipe, `\\.\pipe\roomler-hive-adopt`
   (`hive/supervisor/adopt.rs:573`), and each end checks the other through the kernel (D16):
   - The daemon names a client by its token, impersonating it just long enough after its first line
-    (`hive_win.rs:445`), never by its pid. SYSTEM, LOCAL SERVICE, NETWORK SERVICE and the anonymous logon are refused
+    (`hive_win.rs:446`), never by its pid. SYSTEM, LOCAL SERVICE, NETWORK SERVICE and the anonymous logon are refused
     as root is.
   - A person gets `0x12008b`, read and write data. Only SYSTEM, Administrators and the daemon's own account add
-    instances (`hive_win.rs:1010`). The first instance is the first, retried every 30 s while another process holds the
+    instances (`hive_win.rs:1011`). The first instance is the first, retried every 30 s while another process holds the
     name.
   - The hook opens the pipe with exactly that mask, at identification level, and sends nothing unless the pipe is
     owned by SYSTEM, Administrators or the hook's own account (`hive_adopt.rs:226`). The owner, not the server
@@ -1268,7 +1268,7 @@ model on Windows, so the three agree on what the mode means.
 
 - Unit tests wherever the logic can run on every OS (FR-43's practice: keep `decide()` out of `cfg(macos)`), and a
   macOS `cargo test` lane for `tunnel-core` with `overlay-l3`. Today macOS only compiles, plus the real-utun kernel
-  test (`ci.yml:1498-1525`).
+  test (`ci.yml:1512-1539`).
 - Extend `macos_kernel_tests` on the runner's real utun: an exemption pinned and read back, the pf anchor loaded and
   flushed, the resolver keys installed and purged.
 - Field: the `vmtest` macOS, Win11 (Home and Pro) and Ubuntu cells; one exit cell per (client OS × exit OS) pair;
