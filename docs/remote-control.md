@@ -4460,6 +4460,20 @@ outcome to `<log_dir>/last-install.json` with status
 `InstallerFailed` / `Timeout`. Operators + future agent startups
 read the file to surface what actually happened to the upgrade.
 
+**Each attempt keeps its own MSI log (#2107).** The verbose `/l*v` log
+exists to name the action a wedged run stopped in, and the watcher's
+wedge recovery retries the same staged installer. `/l*v` truncates, so
+the retry used to erase the one record of where the first attempt
+wedged.
+
+| Log | Written by | Lives |
+|---|---|---|
+| `<msi>.log` | the first attempt (`next_msi_log`, `agents/roomlerd/src/updater.rs:2007`) | next to the MSI, until the startup sweep removes the staging dir, 1 h or more later |
+| `<msi>.2.log`, `<msi>.3.log` | each later attempt on the same path | the same |
+| `<log_dir>/msi-wedged.log` | the watcher, copied before its retry (`keep_wedged_log`, `agents/roomlerd/src/post_install.rs:543`) | until the next wedge moves it to `msi-wedged.prev.log` |
+
+The record's `note` in `last-install.json` names the kept copy.
+
 **It must inherit no socket (#2836, Windows).** std's `Command` spawns
 with `bInheritHandles = TRUE`, so the watcher gets a copy of every
 inheritable handle the outgoing worker holds. It also outlives that

@@ -933,7 +933,7 @@ sequenceDiagram
   shell's one UAC prompt and `icacls` under none (the log, 2026-11-02). Every spawn on this path
   now names its program by a full path from the kernel, because `%SystemRoot%` can be overridden
   per user (`appdirs::system32_tool`, `crates/agent-core/src/appdirs.rs:113`), and `spawn_elevated`
-  refuses anything else (`agents/roomlerd/src/updater.rs:2676`).
+  refuses anything else (`agents/roomlerd/src/updater.rs:2692`).
   `agents/roomler-setup/src/spawn_gate.rs` parses the source of everything the wizard runs on
   Windows and fails on a bare name, or on an expression it has not been told about.
 - **What an elevated run takes from its user.** A value in `HKCU\Environment` reaches an elevated
