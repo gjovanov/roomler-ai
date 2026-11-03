@@ -60,8 +60,8 @@ from scratchpad to `scripts/`.
 
 ## FR-A — Encoder rate changes without an IDR (first)
 
-**A0 — measure on silicon.** Extend `Command::EncoderSmoke` (`app.rs:302–251`, dispatch
-`encoder_smoke_cmd` :4059) with `--reconfigure-sweep [--width/--height 1280×800]
+**A0 — measure on silicon.** Extend `Command::EncoderSmoke` (`app.rs:413–465`, dispatch
+`encoder_smoke_cmd` :6387) with `--reconfigure-sweep [--width/--height 1280×800]
 [--frames-per-rung 30] [--constrained] [--json]`: synthetic desktop frame with a moving 200×200
 block (solid colours make P-frames ~0 bytes and hide CBR/QVBR); 30 frames at 6 M, then rungs
 `4.5M 3M 2M 1.5M 1M 750k 550k 400k 300k 200k` down and back (20 changes via `set_bitrate`). Per

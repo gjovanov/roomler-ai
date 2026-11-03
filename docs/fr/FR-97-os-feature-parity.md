@@ -728,7 +728,7 @@ test of the SIGKILL property itself.
   two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1431-1497`): whether
   the lock screen's password field takes injected keys is not measured, so the chip claims neither way. At a prompt,
   as Windows does, as `rc:consent.pending{host_locked}`: the prompt's probe (`lock_state.rs:301-320`, read at
-  `signaling.rs:4104`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
+  `signaling.rs:4039`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
   Advisory only, never an input gate (FR-92's rule, `FR-92-keep-busy.md:53`), so the pump's overlay never sees it.
   Another user on the console (fast user switching) counts as locked: this session's screen is out of sight either
   way. The root half has no session to ask and says nothing; `ROOMLERD_LOCK_HINT=0` turns it off, as on Linux. Linux
@@ -798,7 +798,7 @@ test of the SIGKILL property itself.
   - `person_may` (`:3057`) admits `Devices` and `Mesh`, read-only. That widens a Linux system install's person
     socket the same way, and its companion's Devices page was refused there before;
   - the per-user half asks the root half only when its own answer is `no_node` and it is not root
-    (`agents/roomlerd/src/person_socket.rs:126`). It shows the root half's answer only when that is `ok` (`:134`),
+    (`agents/roomlerd/src/person_socket.rs:121`). It shows the root half's answer only when that is `ok` (`:129`),
     and keeps its own on any other answer, a timeout (5 s) or no socket (`:146`).
   Kill switch: `ROOMLERD_PERSON_SOCKET=0` on the root half, which gives the pre-P2g page.
 - **P2h, the rest of the network view on a two-half Mac.** The companion's other network fields come from the
@@ -812,8 +812,8 @@ test of the SIGKILL property itself.
   - **One async hook at the dispatch of each request**, `LocalApiState::status_view` and `peers_view`
     (`crates/localapi/src/lib.rs:2746`, `:2751`, dispatched at `:3369`). They default to the sync reads, so the
     tests' fakes are untouched.
-  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:2136`, `:2149`), with P2g's
-    rule turned to the live view: no overlay address of its own and not root (`person_socket.rs:228`). Then
+  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:2063`, `:2076`), with P2g's
+    rule turned to the live view: no overlay address of its own and not root (`person_socket.rs:200`). Then
     `Peers` is the root half's, and `Status` is its own with the root half's overlay addresses, exit status and
     MagicDNS (`with_machine_network`, `:213`).
   - **`person_may` admits `Peers`**, served through `person_view` (`crates/localapi/src/lib.rs:3210`). That drops

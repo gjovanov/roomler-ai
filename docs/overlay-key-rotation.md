@@ -252,7 +252,7 @@ the grid honest for a device that has not yet updated to it — a 0.4.25 device 
 
 | key | where | default | effect |
 |---|---|---|---|
-| `overlay_key_rotation` | device config (tribool), config surface, env `ROOMLERD_OVERLAY_KEY_ROTATION` (`crates/agent-core/src/config.rs:1000-888`, `config_surface.rs:1112-1085`) | **on** | `false` ⇒ every order is answered `refused: disabled`, key unchanged. Read from the start-time snapshot — **restart required** |
+| `overlay_key_rotation` | device config (tribool), config surface, env `ROOMLERD_OVERLAY_KEY_ROTATION` (`crates/agent-core/src/config.rs:1266-1271`, `config_surface.rs:1365-1372`) | **on** | `false` ⇒ every order is answered `refused: disabled`, key unchanged. Read from the start-time snapshot — **restart required** |
 | `overlay_wg_key_epoch` | persisted next to the key, primary scalar and per `[[orgs]]` entry (`config.rs:1974`, `:2099-2101`) | `0` | bumped per rotation; presented on every join, shown in the grid |
 | server switch | — | — | **none, deliberately**: the route is admin-initiated and permission-gated; a defective push is stopped by the device switch |
 
