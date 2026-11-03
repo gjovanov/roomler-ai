@@ -905,6 +905,16 @@ const KEYS: &[KeyMeta] = &[
          injects dozens of routes) into one delta (100-5000). Built-in default: 750.",
     },
     KeyMeta {
+        key: "overlay_netchange_poke_quiet_secs",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "Seconds a network signal that changed nothing waits behind the last forced \
+         rekey of the direct peers (0-3600). A real network move never waits. 0 lets every such \
+         signal rekey, as it did before. Built-in default: 60.",
+    },
+    KeyMeta {
         key: "netstack_socks_port",
         group: Group::Network,
         tier: Tier::Standard,
@@ -2109,6 +2119,9 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_route_tick_secs" => cfg.overlay_route_tick_secs.map(|v| v.to_string()),
         "overlay_netmon" => cfg.overlay_netmon.map(fmt_bool),
         "overlay_netmon_debounce_ms" => cfg.overlay_netmon_debounce_ms.map(|v| v.to_string()),
+        "overlay_netchange_poke_quiet_secs" => {
+            cfg.overlay_netchange_poke_quiet_secs.map(|v| v.to_string())
+        }
         "netstack_socks_port" => cfg.netstack_socks_port.map(|v| v.to_string()),
         "localapi_pipe_pool" => cfg.localapi_pipe_pool.map(|v| v.to_string()),
         "rc_max_sessions" => cfg.rc_max_sessions.map(|v| v.to_string()),
@@ -2650,6 +2663,25 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                         );
                     }
                     Some(ms)
+                }
+            }
+        }
+        "overlay_netchange_poke_quiet_secs" => {
+            cfg.overlay_netchange_poke_quiet_secs = match value
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None => None,
+                Some(v) => {
+                    let s: u32 = v.parse().map_err(|_| {
+                        format!("overlay_netchange_poke_quiet_secs must be a number (got {v:?})")
+                    })?;
+                    if s > 3600 {
+                        return Err(
+                            "overlay_netchange_poke_quiet_secs must be between 0 and 3600".into(),
+                        );
+                    }
+                    Some(s)
                 }
             }
         }
@@ -4477,6 +4509,30 @@ mod tests {
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("1")).is_err());
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("301")).is_err());
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("fast")).is_err());
+    }
+
+    /// FR-65 P3 — `0` is the kill switch, so it has to survive the round trip
+    /// and reach the env bridge as a value, not as an unset key.
+    #[test]
+    fn overlay_netchange_poke_quiet_secs_set_echo_clear_and_validate() {
+        let key = "overlay_netchange_poke_quiet_secs";
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, key, Some("0")).unwrap();
+        assert_eq!(cfg.overlay_netchange_poke_quiet_secs, Some(0));
+        assert_eq!(entry_for(&cfg, key).unwrap().value.as_deref(), Some("0"));
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("OVERLAY_NETCHANGE_POKE_QUIET_SECS")
+                .map(String::as_str),
+            Some("0")
+        );
+        apply(&mut cfg, key, None).unwrap();
+        assert_eq!(cfg.overlay_netchange_poke_quiet_secs, None);
+        assert!(
+            !crate::config::env_fallbacks(&cfg).contains_key("OVERLAY_NETCHANGE_POKE_QUIET_SECS")
+        );
+        assert!(apply(&mut cfg, key, Some("3601")).is_err());
+        assert!(apply(&mut cfg, key, Some("soon")).is_err());
     }
 
     #[test]
