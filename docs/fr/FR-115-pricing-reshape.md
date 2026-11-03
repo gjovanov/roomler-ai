@@ -44,7 +44,7 @@ p90 session length 7 minutes.
 
 | Surface | Says |
 |---|---|
-| Landing page, docs home | "$8 /user/mo" (`ui/src/views/LandingView.vue:134`, `ui/docs/theme/home-layout.ts:72`) |
+| Landing page, docs home | "$8 /user/mo" (`ui/src/views/LandingView.vue:130`, `ui/docs/theme/home-layout.ts:72`) |
 | In-app billing page | "$8 /mo" (`ui/src/views/billing/BillingView.vue:62`) |
 | Stripe checkout | `quantity = 1` — one unit per org (`crates/services/src/stripe.rs:202`) |
 | MRR estimate | price × member count (`crates/api/src/routes/cost.rs:85`) |

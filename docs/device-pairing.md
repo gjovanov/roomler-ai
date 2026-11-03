@@ -464,7 +464,7 @@ word on which install paths a client may offer, a public JSON object with every 
 | `wizard_macos_daemon` | B1-s2: `[setup] wizard_macos_daemon`, or the legacy `wizard_unix_daemon` (`SetupSettings::macos_daemon`) | the same for macOS |
 
 The homepages word the install lead as "sign in from your browser" only on
-**`pairing && wizard_pairing`** (`ui/docs/theme/home.js:195`, `ui/src/views/LandingView.vue:291`):
+**`pairing && wizard_pairing`** (`ui/docs/theme/home.js:195`, `ui/src/views/LandingView.vue:287`):
 `pairing` alone is on by default, and a server image promoted before the first `setup-v*`
 that carries A3 would otherwise promise a flow the download cannot do. Every consumer reads
 anything but a JSON `true` as **false** — an older server's **400** (measured on production
