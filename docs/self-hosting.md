@@ -42,7 +42,8 @@ and `GET /health` on any of them lists the modules it actually mounts.
 | `access` | `<tag>-access` | devices + remote desktop + mesh — no chat, no calls | MongoDB, Redis, coturn | the SFU worker build, MinIO |
 
 Pick one by **tag** when you pull (`ROOMLER_IMAGE=ghcr.io/gjovanov/roomler-ai:<tag>-mesh`
-in `.env.selfhost`) or by **`ROOMLER_PROFILE`** when you build from source. No published
+in `.env.selfhost`, with the `<tag>` that `docker-compose.selfhost.yml` names) or by
+**`ROOMLER_PROFILE`** when you build from source. No published
 `v*` image carries the hosted service's billing and newsletter module — that is what `roomler.ai`
 runs, not what you run.
 
@@ -51,7 +52,7 @@ runs, not what you run.
 > `hosted image` workflow (FR-73). It is the `full` composition **plus** the billing module,
 > holds no secret (everything is configuration), and is public because the source is — but it
 > is not a release: it is whatever `master` was an hour ago, with the Stripe webhook and the
-> newsletter routes mounted. Pull `latest` or a `v*` tag; leave `hosted-*` to the hosted service.
+> newsletter routes mounted. Pull a `v*` tag; leave `hosted-*` to the hosted service.
 
 > A profile does not reject configuration it does not use: a `mesh` image given MinIO
 > credentials simply never opens them. A web app built for `full` works against every
@@ -107,7 +108,11 @@ silently.
 > for **linux/amd64 and linux/arm64**. The tag is a manifest list, so a
 > Raspberry Pi, an Apple Silicon Mac and an x86 VPS all pull the same name and
 > get the right image. Each architecture is built on its own native runner and
-> smoke-tested there before publication — neither is emulated.
+> smoke-tested there before publication — neither is emulated. The documented path
+> itself runs on both as well: the `Self-host pull` lane pulls anonymously into an
+> empty cache, runs `up -d`, and makes a two-party call directly and over the relay
+> (`scripts/selfhost-pull-check.sh`, on every pull request that changes a compose
+> file, and weekly).
 
 ### Or build it from source
 
@@ -259,12 +264,14 @@ Two settings decide whether it works:
 
 - `ROOMLER_ANNOUNCED_IP` — the address browsers send to. `127.0.0.1` works only
   for calls made on the host itself.
-- the RTC port range — 32 ports are mapped by default, enough to try it out.
+- the RTC port range — 32 ports are mapped by default, enough to try it out. To
+  widen it, change `40000-40031` in the `roomler` service's `ports:` and
+  `ROOMLER__MEDIASOUP__RTC_MAX_PORT` together. Docker runs a proxy process per
+  mapped port by default, so map what you need rather than all of 40000–49999.
 
-On **Linux**, the clean answer is host networking: give the `roomler` service
-`network_mode: host`, delete its `ports:` block, and the full 40000–49999 range
-is reachable. That is how the hosted service runs. It is not available on Docker
-Desktop for macOS/Windows, which is why the port-mapped form is the default.
+⚠️ Don't give the `roomler` service `network_mode: host` with this compose file.
+The compose service names stop resolving on the host network, so the server loops
+on `Server selection timeout … Address: mongo:27017` and the web port answers 502.
 
 If signalling looks perfect and no video arrives, this is nearly always the
 cause. `connect_transport` succeeding proves only that the client sent its DTLS
@@ -504,11 +511,17 @@ an account nobody can use. Set it to `false` once email works.
 
 ```bash
 git pull
-docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build
+docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost pull
+docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d
 ```
 
+`git pull` is the step that moves the [pinned images](#what-is-pinned-and-what-that-costs-you);
+`pull` alone fetches what the file you already have names. A source install replaces the last
+two lines with `up -d --build`.
+
 Schema migrations run at startup and are leader-gated, so it is safe to restart
-into a newer build.
+into a newer build. They only run forward, so take a [backup](#backups) before a
+large jump.
 
 Run `up -d` for the whole file, never for `roomler` alone: that
 [leaves the relay dark](#if-the-server-is-replaced).
@@ -520,6 +533,48 @@ serve builds you produced. Your server is the download host (so corporate
 allow-lists only need to trust your hostname, and `github.com` need not be
 reachable from the endpoint), while the *version* your fleet converges on is the
 upstream one. Rebuilding the server image does not change what agents install.
+
+### What is pinned, and what that costs you
+
+Every image in `docker-compose.selfhost.yml` names an exact version, so a fresh
+install gets the bytes this file was tested with. A moving tag broke fresh installs
+twice: `minio/minio` left Docker Hub (#2034), and a new `coturn/coturn:latest`
+dropped a flag this file passed (#3287).
+
+| Service | Image | Pinned by |
+|---|---|---|
+| `mongo` | `mongo:7.0.45` | digest |
+| `redis` | `redis:7.4.12-alpine` | digest |
+| `minio`, `minio-init` | `ghcr.io/gjovanov/minio:RELEASE.2026-09-22T19-25-18Z` | digest, on our own registry |
+| `coturn` | `coturn/coturn:4.18.0-r0` | digest |
+| `roomler` | `ghcr.io/gjovanov/roomler-ai:v0.4.197` | exact tag |
+
+**The cost.** Upstream fixes, security fixes included, reach you only when this file
+moves. Nothing updates on its own: `git pull` moves the pins, and `pull` then fetches
+what they name. If you need a MongoDB or coturn fix before this file has it, move the
+line yourself (below).
+
+**A digest works on both architectures.** It names the multi-architecture index, so
+amd64 and arm64 hosts resolve the same line to their own image.
+
+**The Roomler image has a tag and no digest** because `up -d --build` cannot tag a
+build with a digest: Compose stops with `failed to solve: build tag cannot contain a
+digest`. The source build is the licence's promise, so it wins. The cost is that a tag
+is only as fixed as our promise not to re-push it. `ROOMLER_IMAGE` in `.env.selfhost`
+overrides the default, and accepts a digest if you never build from source. While it is
+set, `git pull` no longer moves your server image: you move it.
+
+**To move a pin yourself**, read the digest and edit the `image:` line:
+
+```bash
+docker pull mongo:7.0.46    # prints "Digest: sha256:…"
+```
+
+```yaml
+image: mongo:7.0.46@sha256:…
+```
+
+A local edit to that line will conflict on your next `git pull` if we moved it too.
 
 ## Backups
 
@@ -550,8 +605,6 @@ anything; on this server that name carries no limits (`Core::plans_sold`,
 
 ## Known limitations, stated plainly
 
-- **No prebuilt image yet.** First run compiles from source. Tracked in
-  [FR-39](fr/FR-39-launch-readiness.md).
 - **Single node.** The compose stack is one API instance. Multi-pod scale-out is
   supported by the code (Redis fan-out, leader-gated startup) but is a
   Kubernetes topology, not this file — see

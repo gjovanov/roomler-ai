@@ -134,7 +134,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3790`, `crates/agent-core/src/config.rs:4213`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3790`, `crates/agent-core/src/config.rs:4221`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:651`, `:983`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -386,8 +386,8 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3572`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3616`) |
-| `config::read_if_present` (`:3646`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3580`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3624`) |
+| `config::read_if_present` (`:3654`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
 flowchart TD
@@ -422,9 +422,9 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2634`, `:2656`), at the clean-run promotion
-(`record_clean_run_at`, `:2620`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4193`). Each save
+`crates/agent-core/src/config.rs:2640`, `:2662`), at the clean-run promotion
+(`record_clean_run_at`, `:2626`), at every `ConfigSet`, and at enrollment. The daemon, the
+desktop app and the setup wizard all write it through `config::save` (`:4201`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -1325,6 +1325,9 @@ lines through `systemctl --user edit roomler`.
 
 ⚠️ Delegated, and the cgroups cannot be made: no worker runs. A worker that
 cannot have its limits never runs (FR-90 P8-2a-3), and the daemon's log says why.
+A failure that passes, such as a process of the unit still in its exit or
+systemd not answering, is tried again by a later worker's start (#3349). One
+that will not pass stays until the daemon restarts.
 
 ## macOS
 
@@ -1446,6 +1449,21 @@ runs on that enrollment, so it is what the daemon's row streams through until P3
 Measured on 0.4.191: with `<name>` deleted, the worker exits 7 at every spawn, the
 supervisor backs off and stops, and `<name>-daemon` reads `no-gui-session`. A Mac
 enrolled with one root token and no per-user enrollment has no worker at all.
+
+**One row, behind a switch (FR-43 P3a).** With `macos_one_row = true` beside
+`macos_supervise_gui_worker = true` in the root's config, read when the daemon starts,
+the worker runs `run --supervised --unenrolled`. It holds no enrollment, dials no
+server, and takes its sessions from the daemon's delegation channel alone. A person's
+enrollment on that Mac stays in their file and is ignored, and a person with none gets
+a worker anyway. As the console user, `roomler status`, the device list and the
+companion show the root half's row, and a verb that needs the server (`forward`,
+`exec`, `ssh`, a rename) says to run it with `sudo`. Until the logs PR, that worker's
+logs stay on the Mac.
+
+The switch is off by default and stays off until the
+[field proof](fr/FR-43-macos-single-enrollment.md#what-rides-what). It doesn't yet give
+one row alone: secondary orgs, the migration of a two-row Mac and the one-token install
+are P3b, P3c and P3d.
 
 ```bash
 # Screen sharing only (one token, one device row):
@@ -1698,7 +1716,7 @@ handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3428`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2684`).
+back to the version that is running (`crates/agent-core/src/config.rs:2690`).
 
 ### No pipe can stall the supervisor (#3080)
 
