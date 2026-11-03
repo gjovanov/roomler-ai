@@ -526,6 +526,7 @@ fn worker_main(
             .context("RoInitialize(MTA)")?;
     }
     let _ro_guard = RoUninitializeGuard;
+    pin_mta();
 
     // 1. Create an ID3D11Device (+ context) we'll use for: (a) wrapping
     //    as IDirect3DDevice for the frame pool, (b) CopyResource
@@ -1140,9 +1141,105 @@ impl Drop for RoUninitializeGuard {
     }
 }
 
+/// Keeps this process's multithreaded apartment alive until it exits, once per
+/// process (FR-85).
+///
+/// ⚠️ `RoUninitialize` on the last MTA thread tears the apartment down, and COM
+/// unloads the DLLs it loaded for it, `GraphicsCapture.dll` among them. Whatever
+/// still runs in that module then faults: `0xc0000005` in
+/// `GraphicsCapture.dll_unloaded`. The fault on record (2026-11-02, 0.4.197) was a
+/// recorder child, during its remux, over a moving screen. A recording of 4 s
+/// exits before the worker's 100 ms poll ends, so it never gets that far. In the
+/// daemon it depends on what else holds the MTA when a session's capture ends.
+fn pin_mta() {
+    use windows::Win32::System::Com::CoIncrementMTAUsage;
+    static PIN: std::sync::Once = std::sync::Once::new();
+    PIN.call_once(|| {
+        // SAFETY: no preconditions. The cookie is dropped on purpose: never
+        // giving it back is the point.
+        if let Err(e) = unsafe { CoIncrementMTAUsage() } {
+            tracing::warn!(%e, "wgc: could not pin the MTA, so the end of a capture may fault");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With the pin, a worker leaving its apartment does not end the MTA: a
+    /// thread that never joined one still reads the implicit MTA afterwards.
+    /// Without it, and with no other MTA thread in the process, that thread has
+    /// no apartment at all (`CO_E_NOTINITIALIZED`).
+    ///
+    /// Through the real worker, so that this guards the call in `worker_main`. A
+    /// handle that names no monitor gets past that call and then fails, on a host
+    /// with WGC or without, so this needs no display and starts no capture. Not a
+    /// null handle: WGC opens a capture on that. The worker sends its failure after
+    /// `worker_main` has returned, so by then it has left the apartment.
+    #[test]
+    fn the_mta_outlives_a_wgc_worker() {
+        use windows::Win32::System::Com::{
+            APTTYPE, APTTYPE_MTA, APTTYPEQUALIFIER, CoGetApartmentType,
+        };
+        let opened = WgcCapture::for_monitor(
+            HMONITOR(usize::MAX as *mut _),
+            0,
+            30,
+            DownscalePolicy::Auto,
+            PointerRequest::Separate,
+        );
+        assert!(
+            opened.is_err(),
+            "no capture opens on a handle that names nothing"
+        );
+        let apartment = std::thread::spawn(|| {
+            let mut kind = APTTYPE::default();
+            let mut qualifier = APTTYPEQUALIFIER::default();
+            // SAFETY: both out-pointers live across the call.
+            unsafe { CoGetApartmentType(&mut kind, &mut qualifier) }.map(|()| kind)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(apartment.unwrap(), APTTYPE_MTA);
+    }
+
+    /// The mechanism itself. A hand-run, not a CI guard: no lane runs it, and it
+    /// discriminates only alone in its process, on a real desktop, where nothing
+    /// else holds the MTA:
+    ///
+    /// `cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- --exact capture::wgc_backend::tests::the_end_of_a_capture_leaves_wgc_loaded`
+    ///
+    /// The module is loaded while a capture runs and still loaded after its worker
+    /// has closed the session and left the apartment. Without the pin COM unloads
+    /// it there, and the process can fault in `GraphicsCapture.dll_unloaded` before
+    /// the assert. A host with no WGC skips.
+    #[tokio::test]
+    async fn the_end_of_a_capture_leaves_wgc_loaded() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::core::w;
+        let mut cap = match WgcCapture::primary(30, DownscalePolicy::Auto) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("no WGC-capable display ({e}) — skipping");
+                return;
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(5), cap.next_frame()).await;
+        // SAFETY: a constant name; the handle is only tested, never used.
+        assert!(
+            unsafe { GetModuleHandleW(w!("GraphicsCapture.dll")) }.is_ok(),
+            "the control: it is loaded while the capture runs"
+        );
+        drop(cap);
+        // The worker polls its shutdown flag every 100 ms.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        // SAFETY: as above.
+        assert!(
+            unsafe { GetModuleHandleW(w!("GraphicsCapture.dll")) }.is_ok(),
+            "the end of the capture unloaded GraphicsCapture.dll"
+        );
+    }
 
     /// FR-85 P1d. The live session keeps the pointer out of its frames
     /// unless the escape hatch says otherwise (it streams the pointer on its
