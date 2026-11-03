@@ -306,9 +306,10 @@ struct BrokerInner {
     /// Sessions currently awaiting a decision, each with the handle a
     /// [`ConsentBroker::cancel`] fires. Populated the moment
     /// [`ConsentBroker::request_with_mode`] is CALLED (before its future is
-    /// first polled — see there for why), cleared by the [`PendingGuard`]
-    /// when the sentinel arrives, the timeout fires, the prompt is
-    /// cancelled, or the future is dropped.
+    /// first polled — see there for why). Cleared by [`ConsentBroker::cancel`]
+    /// the moment the prompt is withdrawn, and otherwise by the
+    /// [`PendingGuard`] when the sentinel arrives, the timeout fires, or the
+    /// future is dropped.
     pending: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
@@ -599,8 +600,14 @@ impl ConsentBroker {
     /// Called from the `ServerMsg::Terminate` path: the session the question
     /// is about no longer exists, so the person at the machine must not be
     /// left deciding on it, and no verdict is owed to the server.
+    ///
+    /// ⚠️ Off the books first, then woken (#3433): from this call on the
+    /// prompt takes no answer. Woken alone, its entry stood until the prompt
+    /// next ran, which for a question armed before it is shown can be a
+    /// companion's start away, and the poll takes a decision it finds before
+    /// it looks for the cancel: an answer in between was taken, and won.
     pub fn cancel(&self, session_hex: &str) -> bool {
-        let handle = self.inner.pending.lock().unwrap().get(session_hex).cloned();
+        let handle = self.inner.pending.lock().unwrap().remove(session_hex);
         match handle {
             Some(cancel) => {
                 tracing::info!(

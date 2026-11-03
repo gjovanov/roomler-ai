@@ -1250,8 +1250,12 @@ impl Handler {
         }
 
         // The session may have gone while the host was asked, or the banner
-        // raised: nobody is left to record for, or to answer.
-        if channel_gone(&self.dc) {
+        // raised: nobody is left to record for, or to answer. ⚠️ Its end, not
+        // only its channel (#3433): the signalling loop can end a session
+        // whose channel stays open (a peer whose close overran its budget),
+        // and an Allow given just before was then recorded for a session that
+        // was over.
+        if self.gone.load(Ordering::Acquire) || channel_gone(&self.dc) {
             if !unattended {
                 self.ctx.indicator.end_recording(sid);
             }
@@ -1314,6 +1318,30 @@ impl Handler {
         // already has an answered prompt, and a decision recorded against its
         // id must not be able to answer this one (the ssh / ssh-consent lesson).
         let prompt_id = ObjectId::new().to_hex();
+        // ⚠️ Registered with this session and armed BEFORE anything shows it,
+        // under the lock `end_session` reads, and only while the session is
+        // still on (#3433). Shown first, as it was, the question could not be
+        // answered yet: the device may still be starting a companion (up to
+        // its 3 s budget) or posting a notification, and a click then was
+        // refused. Nor could it be withdrawn: a session that ended in that
+        // time found no question to cancel, and a session ends once, so the
+        // question stood for its whole window and an Allow in it was taken.
+        //
+        // The window still runs from the show: the prompt starts its clock at
+        // its first poll, below, once every surface is up, and each surface
+        // counts down from when it went up, so the host is never shown more
+        // time than it has.
+        let asking = match self.prompt.lock() {
+            Ok(mut p) if !self.gone.load(Ordering::Acquire) => {
+                *p = Some(prompt_id.clone());
+                self.ctx
+                    .consent
+                    .request_with_mode(&prompt_id, crate::consent::Mode::Prompt { timeout: window })
+            }
+            // The session is over, so nobody is asked. A poisoned lock is
+            // treated the same: what could not be withdrawn is not asked.
+            _ => return (crate::consent::Decision::Cancelled, false),
+        };
         let what = if audio {
             "record this screen and what the computer plays"
         } else {
@@ -1370,14 +1398,7 @@ impl Handler {
             }
         }
         info!(session = %self.ctx.session_id, native, notified, have_surface, "consent prompt surface (record)");
-        if let Ok(mut p) = self.prompt.lock() {
-            *p = Some(prompt_id.clone());
-        }
-        let decision = self
-            .ctx
-            .consent
-            .request_with_mode(&prompt_id, crate::consent::Mode::Prompt { timeout: window })
-            .await;
+        let decision = asking.await;
         self.ctx.indicator.hide_prompt(&prompt_id);
         if let Ok(mut p) = self.prompt.lock() {
             *p = None;
@@ -1738,6 +1759,10 @@ impl Handler {
             return;
         }
         unregister(self);
+        // ⚠️ Read only after `gone` is set (#3433). `ask_host` registers its
+        // question under this lock, and only while `gone` is clear: either it
+        // sees this end and asks nobody, or this sees its question, armed,
+        // and withdraws it.
         let prompt = self.prompt.lock().ok().and_then(|p| p.clone());
         if let Some(p) = prompt {
             self.ctx.consent.cancel(&p);
