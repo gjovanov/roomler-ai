@@ -480,8 +480,11 @@ or the composition baseline.
 Two DC sessions of one host with the same profile share one capture and one
 encoder ([`multi-org.md` §6](multi-org.md#6-p5--shared-floor-encoder-shipped-rc303-325)).
 The second is a *follower*: it opens no capture, so it never reaches the check
-that sends this message. Before #3260 its viewer had a black canvas and a
-re-created session every 10 s, and nothing said why.
+that sends this message. Before #3260 its viewer had a black canvas and no
+reason for the 10 s until its watchdog re-created the session. The new session
+heard the reason only because, by then, the owner's loop had parked in
+`NoopCapture` long enough for the pipeline to read as stale, so it opened a
+capture of its own.
 
 | Who | How it is told | Where |
 |---|---|---|
