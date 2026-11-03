@@ -141,6 +141,20 @@ speculatively.
 
 ### P1 — dims / chroma / backend rebuilds off-thread
 
+> **Status 2026-11-03 — shipped, as FR-70 M2.** The make-before-break this
+> section designed was built under FR-70 (M2, "make-before-break, as designed
+> and built", 2026-09-05) and field-verified as M2a on 0.4.75 the next day: a
+> dims change opens the replacement off the frame path while the pump serves
+> at the old dims (`peer.rs:8630`, "FR-70 M2: dims change"), adopts it in one
+> pass (`peer.rs:7453`, "dims swap adopted — the picture never froze"), and
+> counts it in the heartbeat's `dims_swaps`. On CORPLAP-3 (`av1_qsv`, direct)
+> both moves adopted in 252–285 ms off-path with an in-path adoption of
+> `apply=15 ms`; on CORPLAP-2 (`av1_nvenc`, relay) four moves, `apply=41–44 ms`,
+> no STALL after the first heartbeat. The design text below is kept as the
+> record; FR-70's spec is where the built shape and its ordering guarantees
+> live now. P1 itself owes nothing more. AC3, its measurement, still lacks one
+> cell (below).
+>
 > **Status 2026-09-04 — HALF done, and the half that shipped is the lesser one.**
 > #1284 wrapped the single encoder-open call site in `spawn_blocking`, which
 > every open flows through (first open *and* every rebuild), so the **runtime
@@ -337,6 +351,13 @@ of each is to produce a number.
       control (**26 `encode::stall` tests**, 2026-10-30).
 - [ ] **AC3** — no pump iteration exceeds 250 ms across a downscale-tier change on
       a constrained QSV session; recorded **before and after** P1.
+      *Before: the 2026-09-04 read in P1's status (the session encoder-less for
+      0.62–0.73 s per rebuild). After, read 2026-11-03 from production
+      `agent_logs` over 7 days, every device: 17 dims swaps in 120,405
+      heartbeats, none over 250 ms (worst pass 196.4 ms, direct `av1_nvenc`);
+      constrained sessions swapped twice, both `av1_nvenc` (worst 61.5 ms). No
+      session swapped on QSV in the window, constrained or direct, so the cell
+      this criterion names is still unread.*
 - [ ] **AC4** — the encode-scheduling question is answered with canary data; if
       starvation is shown it is fixed, and the canary confirms, with frame age
       unchanged or better.
@@ -379,19 +400,27 @@ of each is to produce a number.
       *Met for P0, 2026-10-30: the page and its row exist — the phases, the
       verdict's rules, the bookkeeping, what the kill switch does not turn off,
       reading a STALL line, the census, the cost harness and its measurement.
-      Owed: P1–P5, each as it ships.*
+      Owed: P1–P5, each as it ships.* *P1 shipped as FR-70 M2 and is documented
+      there; P4 needed no fix (AC6). Still owed: P2, P3, P5.*
 
 ## Open decisions
 
-- Whether the stall watch generalises to a shared crate (decide in P3, from need).
+- ~~Whether the stall watch generalises to a shared crate (decide in P3, from
+  need).~~ **No, 2026-11-03.** P3 measured the overlay from the lines it
+  already logs, read server-side from `agent_logs`, and its fix needed no
+  watch. Nothing else has asked for one.
 - Dedicated encoder thread vs. leaving encode on the worker if the canary shows no
   starvation — P2's measurement decides, not preference.
 - Whether `apply_ms` belongs in the heartbeat permanently or only under the watch.
-- **The send task's DataChannel guard** (2026-10-30). The send task holds the
+- ~~**The send task's DataChannel guard** (2026-10-30).~~ **Decided by FR-135
+  (#3293), 2026-11-02: superseded, not shipped here.** The send task holds the
   video DC's mutex across a frame's whole send (a Rust 2024 `if let` scrutinee
-  temporary, `peer.rs:7205`), so the pump's `dc_lock` waits out the previous
-  frame. Narrowing it is a one-line change; it waits for the `dc_lock` numbers
-  the next release brings, then ships with its before/after (AC7).
+  temporary, `peer.rs:7221` today), so the pump's `dc_lock` waits out the
+  previous frame. The one-line narrowing this bullet planned would re-arm
+  FR-79's 12:15 cut, because `AgentStalled` is partly this wait (FR-135 §2.5).
+  FR-135 R0 reads `dc_lock_ms` first, and R7 (`dc_sink`) replaces the guard
+  with a discriminator and an honest wait (FR-135 §7.2, "FR-65's one-line
+  narrowing: Supersede").
 - **Should the verdict survive its own kill switch?** Since FR-79,
   `pump_stall_watch = false` blinds the governor's `agent_stalled` gate. Either
   the switch keeps counting stalls (one clock read a pass) and drops only the
