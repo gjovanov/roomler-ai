@@ -170,6 +170,21 @@ pub struct EnrollResponse {
     pub ephemeral: bool,
 }
 
+/// #3357 (FR-128 D2) — the access policy a NEW device row starts on: `auto`,
+/// unless `rc.new_device_rc_overlay_auto` says otherwise. Only `rc_overlay_auto`
+/// is stamped, and `rc_overlay` stays null. The Devices page writes both, so a
+/// read of the fleet can tell this default from a person's `auto`.
+///
+/// ⚠️ A default at WRITE time, on purpose. `None` keeps meaning `off` wherever a
+/// policy is read: read as `auto`, it would flip every row that never chose. A
+/// known machine never comes here, because `AgentDao::rehydrate` keeps its row.
+fn new_device_policy(state: &FleetState) -> AccessPolicy {
+    AccessPolicy {
+        rc_overlay_auto: state.settings.rc.new_device_rc_overlay_auto.then_some(true),
+        ..AccessPolicy::default()
+    }
+}
+
 /// POST /api/agent/enroll — public (no user JWT); authenticates via the
 /// enrollment token instead. Creates or rehydrates the Agent row and returns
 /// a long-lived agent JWT.
@@ -298,6 +313,7 @@ pub async fn enroll_agent(
                     body.agent_version,
                     String::new(), // agent_token_hash unused in JWT-only scheme
                     install,
+                    new_device_policy(&state),
                 )
                 .await?
         }
@@ -425,6 +441,7 @@ async fn enroll_agent_ephemeral(
             key_id,
             key.ephemeral_ttl_secs,
             install,
+            new_device_policy(state),
         )
         .await
     {

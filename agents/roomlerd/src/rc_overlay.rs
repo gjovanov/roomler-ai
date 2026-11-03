@@ -3,7 +3,7 @@
 //! #1882 — may a remote-desktop session use the WireGuard overlay, and the
 //! filters that keep it off when it may not.
 //!
-//! The DEVICE decides: `AccessPolicy.rc_overlay`, default off, delivered per
+//! The DEVICE decides: `AccessPolicy.rc_overlay`, off unless set, delivered per
 //! session in `rc:request` (an older server never sends it, which reads off).
 //! Off means no ICE pair of the session touches an overlay address. That
 //! takes three filters, because the overlay reaches a session's ICE three
@@ -246,7 +246,7 @@ impl RcOverlay {
             (true, true) => "allowed (device policy rc_overlay=auto, decided for this session)",
             (false, true) => "excluded (device policy rc_overlay=auto, decided for this session)",
             (true, false) => "allowed (device policy rc_overlay=on)",
-            (false, false) => "excluded (device policy rc_overlay=off, the default)",
+            (false, false) => "excluded (device policy rc_overlay=off)",
         }
     }
 }
@@ -805,5 +805,14 @@ mod tests {
                 .await;
             assert_eq!(d, p);
         }
+    }
+
+    /// #3357 — `off` is no longer where a new device starts, so the line stops
+    /// calling it the default. Field reads match `overlay excluded`, from the
+    /// `rc ICE: overlay {describe}` that logs it, so that much must not move.
+    #[test]
+    fn off_keeps_the_words_field_reads_match() {
+        assert_eq!(off().describe(), "excluded (device policy rc_overlay=off)");
+        assert!(format!("rc ICE: overlay {}", off().describe()).contains("overlay excluded"));
     }
 }

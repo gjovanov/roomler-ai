@@ -45,6 +45,9 @@ impl AgentDao {
     /// `install` is the enroll request's claim, already clamped by the route
     /// (FR-102 P3); `None` = the request did not say, stored as `unknown` so
     /// a row this code created can be told from one that predates it.
+    ///
+    /// `access_policy` is the caller's, because what a NEW row starts on is the
+    /// server's setting (`fleet::agent::new_device_policy`, #3357).
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
@@ -56,6 +59,7 @@ impl AgentDao {
         agent_version: String,
         agent_token_hash: String,
         install: Option<InstallInfo>,
+        access_policy: AccessPolicy,
     ) -> DaoResult<Agent> {
         let agent = Self::new_row(
             tenant_id,
@@ -66,6 +70,7 @@ impl AgentDao {
             agent_version,
             agent_token_hash,
             install,
+            access_policy,
         );
         let id = self.base.insert_one(&agent).await?;
         self.base.find_by_id(id).await
@@ -89,6 +94,7 @@ impl AgentDao {
         key_id: ObjectId,
         ttl_secs: Option<u64>,
         install: Option<InstallInfo>,
+        access_policy: AccessPolicy,
     ) -> DaoResult<Agent> {
         let mut agent = Self::new_row(
             tenant_id,
@@ -99,6 +105,7 @@ impl AgentDao {
             agent_version,
             String::new(),
             install,
+            access_policy,
         );
         agent.ephemeral = true;
         agent.ephemeral_ttl_secs = ttl_secs;
@@ -119,6 +126,7 @@ impl AgentDao {
         agent_version: String,
         agent_token_hash: String,
         install: Option<InstallInfo>,
+        access_policy: AccessPolicy,
     ) -> Agent {
         let now = DateTime::now();
         Agent {
@@ -169,7 +177,9 @@ impl AgentDao {
             warm_relay_endpoint: None,
             displays: Vec::new(),
             capabilities: AgentCaps::default(),
-            access_policy: AccessPolicy::default(),
+            // #3357 — the caller's. Only a row being created gets one here:
+            // `rehydrate` leaves a known machine's policy as it is.
+            access_policy,
             // Fleet RPC off on a new device — enabling it is a deliberate
             // admin act, never a side effect of enrollment.
             exec_policy: ExecPolicy::default(),

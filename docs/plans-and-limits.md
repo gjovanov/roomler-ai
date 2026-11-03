@@ -84,7 +84,7 @@ staged by the mode.
 
 | Limit | Checked at | Refusal |
 |---|---|---|
-| devices | enrollment (`crates/modules/fleet/src/agent.rs:234`) | 403, before the single-use token is claimed |
+| devices | enrollment (`crates/modules/fleet/src/agent.rs:249`) | 403, before the single-use token is claimed |
 | tunnel clients | `crates/modules/network/src/routes/tunnel.rs:138` | 403 |
 | members | invite and admin add (`crates/api/src/routes/invite.rs:199`) | 403 naming the counts |
 | storage | upload (`crates/modules/chat/src/file.rs:312`) | 403; the check is `current + incoming`, so a file that exactly fills the quota fits |
@@ -125,9 +125,11 @@ P4c extends it to TURN, behind two switches that ship **off** and have been on i
 since 2026-10-23. With `count_turn` (P4c-0),
 `turn_bytes` count toward the allowance beside `derp_bytes`. With `turn` (P4c-1), the org's
 overlay pairs leave TURN for that same DERP floor, and so meet the same throttle. Remote
-desktop, meetings, hive and tunnels keep TURN: a browser's WebRTC has no DERP path, and a
+desktop, meetings, hive and tunnels keep TURN: a browser's WebRTC has no DERP path of its own, and a
 tunnel's TURN leg cannot be steered from the server. The plan's session and meeting caps bound
-them instead, and their bytes still count (FR-115 *P4c, as proposed*).
+them instead, and their bytes still count (FR-115 *P4c, as proposed*). A remote-desktop session
+that rides the mesh is the exception: over DERP it meets the throttle too
+(`docs/remote-control.md` §4.4).
 
 ```mermaid
 flowchart LR

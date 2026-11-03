@@ -898,7 +898,7 @@ Empty or `*` means every organization, which is what a self-hosted server wants.
 
 ⚠️ **The list is the switch.** A non-empty `hive.tenants` mounts the module by itself,
 with no `[modules] hive`, and `/api/capabilities` says so
-([`settings.rs:1629`](../crates/config/src/settings.rs#L1629) `Settings::hive_on`). A
+([`settings.rs:1637`](../crates/config/src/settings.rs#L1637) `Settings::hive_on`). A
 hosted server sets only the list, because that form fails safe. An image from before
 P1g never reads the list, so with `ROOMLER__MODULES__HIVE=true` beside it, promoting
 such an image (a rollback, or another session's older tag) would open the pillar to
@@ -1450,7 +1450,7 @@ sequenceDiagram
 | `replicaset.max` | `min` to 8 | |
 | `replicaset.archive` | whether every archive replica the rules allow joins | |
 | `replicaset.prefer` | `owner_devices`, once; any other word is refused | the one order decision 2 names. Refused rather than stored, so a word the server cannot place by fails at the write, not silently at every placement |
-| `replicaset.restricted_tags` | trimmed, empties dropped, once each, at most 16 of 40 characters ([`agent.rs:1093`](../crates/modules/fleet/src/agent.rs#L1093)) | normalized as device tags are, so a tag compares equal to the one a device carries |
+| `replicaset.restricted_tags` | trimmed, empties dropped, once each, at most 16 of 40 characters ([`agent.rs:1110`](../crates/modules/fleet/src/agent.rs#L1110)) | normalized as device tags are, so a tag compares equal to the one a device carries |
 | `retention_days` | 0 to 3650; 0 keeps sessions for ever | P2g applies it |
 | `archive_devices` | at most 16, each a live device of this organization and not ephemeral, each kept once ([`policy.rs:315`](../crates/modules/hive/src/policy.rs#L315)) | the administrator's half of an archive replica. The device's own `hive_archive` is the other half, read where placement runs, so either may come first |
 
@@ -1501,7 +1501,7 @@ flowchart TD
 
 | Rule | Why | Where |
 |---|---|---|
-| A member offers: its last hello advertised `hive-replica`, and it is live, not ephemeral, and not the primary | the device owner's `hive_replica` is the gate that survives a compromised server; FR-51 hard-deletes an ephemeral row once it goes quiet | [`placement.rs:275`](../crates/modules/hive/src/placement.rs#L275), [`agent.rs:289`](../crates/services/src/dao/agent.rs#L289) |
+| A member offers: its last hello advertised `hive-replica`, and it is live, not ephemeral, and not the primary | the device owner's `hive_replica` is the gate that survives a compromised server; FR-51 hard-deletes an ephemeral row once it goes quiet | [`placement.rs:275`](../crates/modules/hive/src/placement.rs#L275), [`agent.rs:299`](../crates/services/src/dao/agent.rs#L299) |
 | The owner's own devices are those whose `owner_user_id` **and** `enrolled_by` both name the session's owner | `owner_user_id` is reassignable with `MANAGE_AGENTS` alone: a device manager who hands someone a device must not receive that person's sessions on it | [`placement.rs:308`](../crates/modules/hive/src/placement.rs#L308) |
 | Archive replicas come first, in the policy's order: designated, offering `hive-archive`, and only while `archive` is on | the administrator's half and the device owner's half | [`placement.rs:283`](../crates/modules/hive/src/placement.rs#L283) |
 | The owner's devices fill to `min`, last seen first and ties by id; never more than `max` in all | decision 2, and the same answer whenever it is computed | [`placement.rs:321`](../crates/modules/hive/src/placement.rs#L321) |
@@ -1675,7 +1675,7 @@ decides again for every live placed session of the organization
 
 | What changed | Who tells hive | Where |
 |---|---|---|
-| a device's tags or owner | fleet's update route, once they are stored, through a new core hook, `agent_updated`; a failing holder is the route's 500, and a retry decides again | [`agent.rs:1204`](../crates/modules/fleet/src/agent.rs#L1204), [`hooks.rs:161`](../crates/core/src/hooks.rs#L161), [`hooks.rs:118`](../crates/modules/hive/src/hooks.rs#L118) |
+| a device's tags or owner | fleet's update route, once they are stored, through a new core hook, `agent_updated`; a failing holder is the route's 500, and a retry decides again | [`agent.rs:1221`](../crates/modules/fleet/src/agent.rs#L1221), [`hooks.rs:161`](../crates/core/src/hooks.rs#L161), [`hooks.rs:118`](../crates/modules/hive/src/hooks.rs#L118) |
 | the policy, or its archive replicas | the policy write, after it is stored | [`policy.rs:354`](../crates/modules/hive/src/policy.rs#L354) |
 | a member removed from the fleet | the removal cascade, hive first, while the row is still there: the device is named as gone | [`hooks.rs:107`](../crates/modules/hive/src/hooks.rs#L107) |
 
@@ -2870,9 +2870,9 @@ have stopped its model calls:
 "Unreachable" means two things at once: the device has no connection on this pod, and its
 row's `last_seen_at` is 230 s old. Every hello stamps that field before the connection is
 registered ([`socket.rs:142`](../crates/modules/fleet/src/socket.rs#L142)), every
-heartbeat on any pod refreshes it ([`agent.rs:589`](../crates/services/src/dao/agent.rs#L589)),
+heartbeat on any pod refreshes it ([`agent.rs:599`](../crates/services/src/dao/agent.rs#L599)),
 and every teardown stamps it as it marks the device offline
-([`agent.rs:572`](../crates/services/src/dao/agent.rs#L572)). A device with a live
+([`agent.rs:582`](../crates/services/src/dao/agent.rs#L582)). A device with a live
 connection anywhere is never unreachable.
 
 ```mermaid
@@ -4504,7 +4504,7 @@ sequenceDiagram
 
 ⚠️ **A restricted tag is compared exactly.** The server trims the tags, drops an empty one and
 keeps each once, as it does a device's tags, but it keeps their case
-([`agent.rs:1163`](../crates/modules/fleet/src/agent.rs#L1163)): `Prod` restricts nothing about a
+([`agent.rs:1180`](../crates/modules/fleet/src/agent.rs#L1180)): `Prod` restricts nothing about a
 session on a device tagged `prod`. The form offers the tags the organization's devices carry
 first for that reason ([`HiveCopiesView.vue:524`](../ui/src/views/hive/HiveCopiesView.vue#L524)).
 

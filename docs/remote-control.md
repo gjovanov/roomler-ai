@@ -210,9 +210,9 @@ This hybrid is exactly the `WorkerPool + RoomManager` pattern already in roomler
 
 ### 4.4 Whether a session may ride the overlay (#1882)
 
-A session's ICE can find a pair over the WireGuard **overlay**, not just over the LAN, a direct path or TURN. That needs only the controller's browser to run on an overlay node, which an operator's laptop usually is. Whether that is allowed is **the device's call**: `AccessPolicy.rc_overlay`, set per device on the **Devices** page (**Mesh: off / auto / on** on the device's row), **off by default**. FR-128's `auto` lets each session decide for itself ([below](#auto-the-session-decides-fr-128)).
+A session's ICE can find a pair over the WireGuard **overlay**, not just over the LAN, a direct path or TURN. That needs only the controller's browser to run on an overlay node, which an operator's laptop usually is. Whether that is allowed is **the device's call**: `AccessPolicy.rc_overlay`, set per device on the **Devices** page (**Mesh: off / auto / on** on the device's row). **A new device starts on `auto`**, where each session decides for itself ([below](#auto-the-session-decides-fr-128)). A device enrolled earlier keeps what it has, and a row that never chose reads `off` ([what a row starts on](#what-a-device-row-starts-on-3357)).
 
-**Why off.** A session on the overlay inherits the overlay's failure modes, and its carrier is invisible to rate control:
+**Why not simply on.** A session on the overlay inherits the overlay's failure modes, and its carrier is invisible to rate control:
 
 - **#1856:** a 3 ms route hole on a Mac killed RC sessions.
 - **Hidden carrier:** a pair the mesh carries over DERP/TCP reads as `local_typ=Host, relay=false`, so ABR budgets for a direct path while the video crosses a TCP relay.
@@ -221,7 +221,7 @@ On the hotspot topology in #1882, the overlay was the *only* working pair. Off m
 
 ```mermaid
 flowchart LR
-    P["AccessPolicy.rc_overlay<br/>(device row, default off)"] --> G["authz gate<br/>controller.rs"]
+    P["AccessPolicy.rc_overlay<br/>(the device row)"] --> G["authz gate<br/>controller.rs"]
     G --> H["Hub: ServerMsg::Request { rc_overlay }"]
     G --> W["Hub forward_offer:<br/>withhold the loopback-TURN<br/>relay when off"]
     H --> D["daemon: RcOverlay::resolve<br/>+ the overlay's v4 blocks"]
@@ -265,7 +265,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 **What "off" does not cover.** It keeps overlay addresses out of the session; it does not override the host's own routing. A controller host using an **exit node**, or a route the mesh advertises for the browser's LAN (a **subnet router**), still sends ordinary internet or LAN traffic through the mesh. That traffic is the host's routing choice, not an overlay candidate.
 
-**Verify on a device.** Each session logs one line, `rc ICE: overlay excluded (device policy rc_overlay=off, the default)` (or `allowed …`), with `overlay_blocks=N`. A dropped remote candidate logs at DEBUG. With `rc_overlay` on, nothing is filtered beyond the name rule, which is the behaviour from before the switch existed.
+**Verify on a device.** Each session logs one line, `rc ICE: overlay excluded (device policy rc_overlay=off)` (or `allowed …`), with `overlay_blocks=N`. Agents older than #3357 add `, the default` to it. A dropped remote candidate logs at DEBUG. With `rc_overlay` on, nothing is filtered beyond the name rule, which is the behaviour from before the switch existed.
 
 #### `auto`: the session decides (FR-128)
 
@@ -283,7 +283,7 @@ flowchart TD
     V -->|yes| C{"best mesh carrier among them<br/>(one LocalAPI peers call, ≤400 ms)"}
     C -->|direct| ON1["on: the mesh, unconstrained;<br/>a device on a worse link stays off"]
     C -->|unknown| OFF2["off"]
-    C -->|relayed| T{"far TURN usable?<br/>(both ends' netcheck)"}
+    C -->|relayed| T{"far TURN reachable over UDP?<br/>(both ends' netcheck)"}
     T -->|yes, or not measured| OFF3["off: the far TURN over UDP"]
     T -->|no| ON2["on, clamped by the relay-tier guard"]
 ```
@@ -328,8 +328,41 @@ flowchart LR
 - **Under `auto` the Hub hands out the browser's relays** to both ends, as under `on` (`resolve_local_relay`, `hub.rs:3580`; `forward_offer`, `:2333`). The agent may yet take them, and it filters out itself whichever it leaves off the mesh.
 - **Across pods** the relay envelope carries `rc_overlay_auto` and `rc_overlay_far_turn` beside the bool (`rc_overlay_to_relay`, `crates/modules/remote/src/relay.rs:585`; `rc_overlay_from_relay`, `:598`). An older pod reads only the bool, so `auto` reaches it as `off`.
 - **Status:** live since 2026-10-29, on agents from 0.4.185 and server images from `hosted-20261029-2ae4ffd`. P2b (the hint reads `stun_udp` alone) and P2c's server half (D8: the browser's best device) are live since `hosted-20261030-ff00741`; P2c's agent half (the target's own netcheck) since agent 0.4.189. The field record is FR-128 §8.
+- **Known limits (FR-128 D9, D10 and D11, open: [#3341](https://github.com/gjovanov/roomler-ai/issues/3341)).** The far-TURN hint can be wrong in both directions.
+  - **It can read a dead path as usable (D9, D10).** A device can hold a server-reflexive mapping while its UDP allocation fails (`stun_udp=true`, `relay_band_udp=None`; `stun_udp` is set at `crates/tunnel-core/src/overlay/runtime.rs:4079`). And every overlay join, a reattach included, clears the server's copy of a device's netcheck until its next measurement, up to 20 minutes later (`rehydrate`, `crates/modules/network/src/overlay.rs:365`). Either way the hint does not read the far TURN as dead. Unless the target's own netcheck says it is dead, `auto` then stays off the mesh. Where TURN over TLS fails too (#2781), that session fails as it would under `off`.
+  - **It can read a live path as dead (D11).** "Dead" means UDP to coturn got no answer: TURN over TLS on 443 is in no vector. So on a network that blocks UDP and passes TURN over TLS, usually a full-tunnel VPN, `auto` allows a relayed mesh (`rc_overlay.rs:300`) where `off` takes TURN over TLS. This is the path FR-64 recorded. No path is lost: both stay in ICE, and the pair nominated first carries the session, because the target follows a later nomination only onto a real-path remote of higher priority, or off a stale pair (`should_follow_renomination`, `crates/vendored/webrtc-ice/src/agent/agent_selector.rs:56`). So it's a race: in the lab the mesh won 8 sessions of 9, and the one it lost matched `off`. Under motion the two held the same fps and rate, with about 20 ms more transit on DERP (FR-128 §8, 2026-11-03 02:20Z). Both are TCP, with one real difference: the [relay allowance](plans-and-limits.md) throttles DERP bulk for an org past its allowance, dropping a frame past its rate (`crates/modules/network/src/derp.rs:622`), and does not throttle coturn.
 
 > ⚠️ **Never "decide while gathering" by holding overlay candidates back.** A candidate that is held has still been gathered, and webrtc-rs pairs every gathered candidate. On a weak-host OS, checks from the overlay-bound socket to a browser's LAN address can come back over the mesh as a peer-reflexive pair. The session would then ride a relayed mesh exactly when `auto` had said no.
+
+#### What a device row starts on (#3357)
+
+**A device enrolled since [#3357](https://github.com/gjovanov/roomler-ai/issues/3357) starts on `auto`, and a device that already had a row keeps what it has.** The default is written into a row as it is created (`new_device_policy`, `crates/modules/fleet/src/agent.rs:181`). It is never read into one.
+
+```mermaid
+flowchart LR
+    E["POST /api/agent/enroll<br/>token · pairing · ephemeral key ·<br/>a Mac's two halves · join-org"] --> K{"a row for this<br/>tenant and machine?"}
+    K -->|"yes, live or removed"| R["rehydrate:<br/>the policy is not touched"]
+    K -->|no| N["new_row, with<br/>new_device_policy"]
+    N -->|"switch on, the default"| A["rc_overlay null<br/>rc_overlay_auto true"]
+    N -->|"switch off"| O["both null"]
+```
+
+| Stored `rc_overlay` | Stored `rc_overlay_auto` | Reads as | What it says |
+|---|---|---|---|
+| absent or null | absent or null | `off` | never chose: nearly every row older than #3357 |
+| `false` | `false` or absent | `off` | someone chose `off` |
+| null | `true` | `auto` | the default, written as the row was created |
+| `false` | `true` | `auto` | someone chose `auto`: the page always writes both fields |
+| `true` | any | `on` | someone chose `on` |
+
+> ⚠️ **Never read a missing field as `auto`.** `rc_overlay_mode()` (`crates/remote_control/src/models.rs:1722`) reads `None` as `off`, and `AccessPolicy::default()` stays `off`. Reading `None` as `auto` would flip every row that never chose, which is the whole fleet.
+
+- **Every door ends in one place.** Token enrollment, FR-129 pairing, both halves of a Mac and a join-org all post to `POST /api/agent/enroll`, which calls `AgentDao::create` (`crates/services/src/dao/agent.rs:52`). An ephemeral key calls `create_ephemeral` (`:86`), which refuses a machine that already has a row rather than reviving it.
+- **A known machine keeps its row.** The unique `agents.{tenant_id, machine_id}` index makes a re-enrollment reuse it, and `rehydrate` (`:258`) leaves `access_policy` alone, for a removed row too.
+- **A machine joining another org gets a new row there,** so it starts on `auto` in that org. Its rows in other orgs don't move: the same machine can read `Mesh: off` on one org's Devices page and `Mesh: auto` on the other's, and each session follows the row of its own org.
+- **An agent older than 0.4.185** has no `rc-overlay-auto`, so the Hub reads its new row's `auto` as `off` ([compatibility](#44-whether-a-session-may-ride-the-overlay-1882)).
+- **External sessions (FR-52)** stay `off` on any row (`crates/modules/remote/src/extauth.rs:330`, `:1303`).
+- **Server switch:** `ROOMLER__RC__NEW_DEVICE_RC_OVERLAY_AUTO=false` (`rc.new_device_rc_overlay_auto`, `crates/config/src/settings.rs:1348`) writes new rows as never chosen, with no release, and it takes effect on a rollout restart. A row already written keeps its `auto`. On one device, `ROOMLERD_RC_OVERLAY_AUTO=0` still turns `auto` off.
 
 ### 4.5 How the viewer finds its own device's relay (FR-121)
 
@@ -560,7 +593,7 @@ that does not know the map works exactly as before.
 ⚠️ **An absent key never means "unavailable".** Agents before P0c send no map
 at all; their lists say what they claim. The map is off the wire when empty,
 and the server stores caps whole
-([`agent.rs:465`](../crates/services/src/dao/agent.rs#L465)), so an older
+([`agent.rs:475`](../crates/services/src/dao/agent.rs#L475)), so an older
 server drops it and a newer one keeps it with no migration.
 
 ⚠️ **`not-applicable` is the only code that hides a control, and it is how

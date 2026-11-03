@@ -1339,6 +1339,13 @@ pub struct RcSettings {
     /// Env: `ROOMLER__RC__SESSION_SLOTS`.
     #[serde(default)]
     pub session_slots: bool,
+    /// #3357 (FR-128 D2) — a device row created from now on starts on
+    /// `rc_overlay = auto`. Default **true**. `false` is the kill switch: new
+    /// rows start as never chosen, which reads `off`, as before. It only
+    /// decides what a NEW row is written with: no row that exists moves.
+    /// Env: `ROOMLER__RC__NEW_DEVICE_RC_OVERLAY_AUTO`.
+    #[serde(default = "default_true")]
+    pub new_device_rc_overlay_auto: bool,
 }
 
 fn default_agent_token_ttl_secs() -> u64 {
@@ -1369,6 +1376,7 @@ impl Default for RcSettings {
             removal_goodbye: true,
             org_session_cap: true,
             session_slots: false,
+            new_device_rc_overlay_auto: true,
         }
     }
 }
@@ -1891,6 +1899,7 @@ impl Settings {
             .set_default("rc.removal_goodbye", true)?
             .set_default("rc.org_session_cap", true)?
             .set_default("rc.session_slots", false)?
+            .set_default("rc.new_device_rc_overlay_auto", true)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?
