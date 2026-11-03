@@ -1160,6 +1160,12 @@ impl Handler {
             let (decision, have_surface) = self.ask_host(window, audio).await;
             use crate::consent::Decision;
             match decision {
+                // ⚠️ An Allow taken after the session ended is not one
+                // (#3433): `end_session` marks the session over before it
+                // withdraws the question, and an Allow can land in between.
+                // Nothing is owed to a session that is over, as for a
+                // withdrawn question.
+                Decision::Granted if self.gone.load(Ordering::Acquire) => return None,
                 Decision::Granted => {
                     self.report(RecordingActivityKind::PromptGranted, None, None, None, None);
                 }
@@ -1274,6 +1280,27 @@ impl Handler {
                 // before anything awaits.
                 let speaker = claim_speaker(name.as_deref().unwrap_or_default());
                 info!(session = %sid, ?name, audio, "remote recording started");
+                // ⚠️ The session may have ended while the recorder launched
+                // (#3433). Its end found nothing recording yet, or detached
+                // what had just begun into the re-attach grace, where the
+                // controller's next session picked up a recording made for a
+                // session that was over. It stops now, `session_ended`, and
+                // this session's follower reports it like any stop it asked
+                // for. `ending` is set first, then whatever was detached is
+                // taken back under the slot's lock, the one a detach reads
+                // `ending` under: a detach either comes before and is undone
+                // here, or sees `ending` and leaves it. So the grace never
+                // holds it, and nobody picks it up.
+                if self.gone.load(Ordering::Acquire) || channel_gone(&self.dc) {
+                    self.ending.store(true, Ordering::Release);
+                    slot(|s| s.take(sid));
+                    info!(session = %sid, "the session ended while its recorder launched — stopping it");
+                    tokio::spawn(async move {
+                        if let Some(m) = manager() {
+                            m.stop_with(Some("session_ended")).await;
+                        }
+                    });
+                }
                 if let Ok(mut c) = self.current.lock() {
                     *c = Some(id.to_string());
                 }
@@ -1318,30 +1345,46 @@ impl Handler {
         // already has an answered prompt, and a decision recorded against its
         // id must not be able to answer this one (the ssh / ssh-consent lesson).
         let prompt_id = ObjectId::new().to_hex();
-        // ⚠️ Registered with this session and armed BEFORE anything shows it,
-        // under the lock `end_session` reads, and only while the session is
-        // still on (#3433). Shown first, as it was, the question could not be
-        // answered yet: the device may still be starting a companion (up to
-        // its 3 s budget) or posting a notification, and a click then was
-        // refused. Nor could it be withdrawn: a session that ended in that
-        // time found no question to cancel, and a session ends once, so the
-        // question stood for its whole window and an Allow in it was taken.
+        // ⚠️ Armed, and registered with this session, BEFORE anything shows
+        // it: registered under the lock `end_session` reads, and only while
+        // the session is still on (#3433). Shown first, as it was, the
+        // question could not be answered yet: the device may still be
+        // starting a companion (up to its 3 s budget) or posting a
+        // notification, and a click then was refused. Nor could it be
+        // withdrawn: a session that ended in that time found no question to
+        // cancel, and a session ends once, so the question stood for its whole
+        // window and an Allow in it was taken.
         //
         // The window still runs from the show: the prompt starts its clock at
         // its first poll, below, once every surface is up, and each surface
         // counts down from when it went up, so the host is never shown more
         // time than it has.
-        let asking = match self.prompt.lock() {
+        //
+        // Armed before that lock is taken, not under it: arming clears old
+        // answers off the disk, and `end_session` waits on the lock from the
+        // signalling loop. It holds as tight: `end_session` marks the session
+        // over before it reads the lock, so either the question is registered
+        // and that end withdraws it, or the end is seen here and the question
+        // dropped. Nothing can answer a fresh id before it is shown.
+        let asking = self
+            .ctx
+            .consent
+            .request_with_mode(&prompt_id, crate::consent::Mode::Prompt { timeout: window });
+        let registered = match self.prompt.lock() {
             Ok(mut p) if !self.gone.load(Ordering::Acquire) => {
                 *p = Some(prompt_id.clone());
-                self.ctx
-                    .consent
-                    .request_with_mode(&prompt_id, crate::consent::Mode::Prompt { timeout: window })
+                true
             }
+            _ => false,
+        };
+        if !registered {
             // The session is over, so nobody is asked. A poisoned lock is
             // treated the same: what could not be withdrawn is not asked.
-            _ => return (crate::consent::Decision::Cancelled, false),
-        };
+            // Dropped outside the lock: it takes the question off the books
+            // and its files off the disk.
+            drop(asking);
+            return (crate::consent::Decision::Cancelled, false);
+        }
         let what = if audio {
             "record this screen and what the computer plays"
         } else {
@@ -1386,11 +1429,16 @@ impl Handler {
         let mut have_surface = native || (marker && self.ctx.companion.up().await);
         // FR-93 P6f — the last on-screen surface: a desktop notification where
         // neither the panel nor the companion can show the question.
+        //
+        // ⚠️ Not for a session that ended meanwhile (#3433): starting the
+        // companion can take its whole budget, and its question is withdrawn
+        // by then. Nothing more goes up for it, and its marker is not written
+        // again: the wait below ends at once, and takes what is up down.
         let mut notified = false;
-        if !have_surface {
+        if !have_surface && !self.gone.load(Ordering::Acquire) {
             notified = self.ctx.indicator.show_notification_prompt(view).await;
             have_surface = notified;
-            if notified && marker {
+            if notified && marker && !self.gone.load(Ordering::Acquire) {
                 prompt.surface = crate::consent::PromptSurface::Notification;
                 if let Err(e) = self.ctx.consent.write_prompt(&prompt_id, &prompt) {
                     warn!(%e, "record: could not mark the consent prompt as shown by a notification");
@@ -1826,7 +1874,12 @@ impl Handler {
             indicator: self.ctx.indicator.clone(),
             outbound: self.ctx.outbound.clone(),
         };
-        match slot(|s| s.detach(d)) {
+        // ⚠️ `ending` read again under the slot's lock (#3433): a start that
+        // finds its session ended once its recorder runs sets it, then takes
+        // back under that lock whatever is here, so the recording is that
+        // start's to stop or the grace's to hold, never both.
+        let detached = slot(|s| (!self.ending.load(Ordering::Acquire)).then(|| s.detach(d)));
+        match detached.flatten() {
             Some(Detach::Done) => {}
             // Another session's recording, over, whose grace had not looked
             // since: finished here, or its banner stays up for good.
