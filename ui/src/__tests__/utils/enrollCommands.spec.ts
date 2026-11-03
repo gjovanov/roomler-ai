@@ -5,6 +5,7 @@ import {
   DEVICE_ID_PLACEHOLDER,
   enrollCommands,
   installCards,
+  LINUX_ARM64_LABEL,
   LINUX_WIZARD_NEEDS,
   type EnrollOptions,
   type OsCommands,
@@ -291,6 +292,27 @@ describe('enrollCommands', () => {
     ])
     // No button, no line.
     expect(installCards(ORIGIN).map((c) => c.wizardHint)).toEqual([null, null, null])
+  })
+
+  it('offers the ARM64 Linux wizard beside the x86_64 one, and only there (#3247 item 13)', () => {
+    const on: EnrollOptions = { wizardLinuxDaemon: true, wizardMacosDaemon: true }
+    const arm64 = { label: LINUX_ARM64_LABEL, url: `${ORIGIN}/api/setup/linux-aarch64` }
+    for (const kind of ['agent', 'tunnel'] as const) {
+      for (const scope of SCOPES) {
+        for (const os of enrollCommands(kind, ORIGIN, TOKEN, scope, false, on)) {
+          const wizard = os.blocks.find((b) => b.isDownload)
+          expect(wizard?.alt, `${kind} ${scope} ${os.os}`).toEqual(os.os === 'linux' ? arm64 : undefined)
+          if (os.os === 'linux') expect(wizard?.command).toBe(`${ORIGIN}/api/setup/linux`)
+        }
+      }
+    }
+    expect(installCards(ORIGIN, on).map((c) => [c.os, c.wizardAlt])).toEqual([
+      ['windows', null],
+      ['linux', arm64],
+      ['macos', null],
+    ])
+    // No button, no link.
+    expect(installCards(ORIGIN).map((c) => c.wizardAlt)).toEqual([null, null, null])
   })
 
   it('never emits the retired binary names or a hardcoded server', () => {

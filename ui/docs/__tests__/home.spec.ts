@@ -150,9 +150,21 @@ describe('the static homepage', () => {
   it('says what the Linux wizard needs first, inside its hidden button', () => {
     const html = render()
     const gated = (os: string) => html.match(new RegExp(`<p data-wizard-unix="${os}" hidden>.*?</p>`, 's'))![0]
-    expect(gated('linux')).toContain(`<small class="home-hint">${LINUX_WIZARD_NEEDS}</small></p>`)
+    expect(gated('linux')).toContain(`<small class="home-hint">${LINUX_WIZARD_NEEDS}</small><small class="home-hint home-alt">`)
     expect(gated('macos')).not.toContain('WebKitGTK')
     expect(html.match(/WebKitGTK/g)).toHaveLength(1)
+  })
+
+  // #3247 item 13 — /api/setup/linux is the x86_64 wizard, so the Linux card
+  // also links the ARM64 one, in the same hidden <p> as its button.
+  it('links the ARM64 Linux wizard beside the Linux button, and nowhere else', () => {
+    const html = render()
+    const gated = (os: string) => html.match(new RegExp(`<p data-wizard-unix="${os}" hidden>.*?</p>`, 's'))![0]
+    expect(gated('linux')).toMatch(
+      /<small class="home-hint home-alt"><a href="[^"]*\/api\/setup\/linux-aarch64">For ARM64 \(aarch64\)<\/a><\/small><\/p>$/,
+    )
+    expect(gated('macos')).not.toContain('linux-aarch64')
+    expect(html.match(/linux-aarch64/g)).toHaveLength(1)
   })
 
   it('ships the fallback price table, marked up for the live refresh', () => {

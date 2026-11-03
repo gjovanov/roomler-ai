@@ -1046,6 +1046,12 @@ sequenceDiagram
   Linux install page, and the tarball's `README.md`
   (`agents/roomler-setup/README-linux.md`), with the one-line install as the way
   that needs nothing first.
+- **Two CPUs, two downloads.** `/api/setup/linux` is the x86_64 wizard and
+  `/api/setup/linux-aarch64` the ARM64 one (`normalise_platform`,
+  `crates/modules/fleet/src/setup_release.rs`). A browser can't be trusted to say
+  which CPU it runs on, because Chromium's Linux user agent always reads x86_64.
+  So since #3247 item 13 each place that offers the Linux wizard also links the
+  ARM64 one (`LINUX_ARM64_LABEL`, the same file).
 - **The cards appear only when the chosen server says so**: the wizard reads
   `GET /api/setup/features` and shows the Linux cards on a JSON
   `wizard_linux_daemon: true`, or on `wizard_unix_daemon: true`, which a server

@@ -44,8 +44,9 @@ Debian, `sudo dnf install webkit2gtk4.1` on Fedora. Without it the wizard stops
 before its window opens, and from a terminal it says `error while loading shared
 libraries: libwebkit2gtk-4.1.so.0`. The terminal install below needs nothing first.
 
-Download [Roomler Setup for Linux](https://roomler.ai/api/setup/linux), unpack it and
-run `roomler-setup`:
+Download Roomler Setup for Linux, [x86_64](https://roomler.ai/api/setup/linux) or
+[ARM64 (aarch64)](https://roomler.ai/api/setup/linux-aarch64) (`uname -m` tells you
+which), unpack it and run `roomler-setup`:
 
 1. **Be accessed — system service** is already selected. Change it if you want this
    user only, then continue to **Join your organization**.

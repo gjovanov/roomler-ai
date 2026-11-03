@@ -122,6 +122,10 @@
                   <p v-if="block.hint" class="text-caption text-medium-emphasis mt-1 mb-0">
                     {{ block.hint }}
                   </p>
+                  <!-- #3247 item 13: the same download for another CPU. -->
+                  <p v-if="block.alt" class="text-caption mt-1 mb-0">
+                    <a :href="block.alt.url" target="_blank">{{ block.alt.label }}</a>
+                  </p>
                 </template>
                 <template v-else>
                   <pre class="enroll-cmd text-caption pa-2 rounded" @click="copy(block.id, block.command)">{{ block.command }}</pre>

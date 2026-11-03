@@ -14,7 +14,7 @@
  * newsletter form, and live prices. Without JavaScript the page is complete:
  * every section renders, and the newsletter block points at sign-up.
  */
-import { installCards } from '../../src/utils/enrollCommands.ts'
+import { installCards, type DownloadAlt } from '../../src/utils/enrollCommands.ts'
 import {
   CAPABILITIES,
   CTA,
@@ -156,9 +156,18 @@ export function renderHome(ctx: HomeCtx): string {
   )
   // #3202 — what the wizard needs first goes inside the button's own `<p>`, so
   // `home.js` shows the two together.
-  const wizardButton = (url: string, gatedOn: string | null, hint: string | null) =>
+  // #3247 item 13: the ARM64 link rides in the same `<p>`, for the same reason.
+  const wizardButton = (
+    url: string,
+    gatedOn: string | null,
+    hint: string | null,
+    alt: DownloadAlt | null,
+  ) =>
     `<p${gatedOn ? ` data-wizard-unix="${gatedOn}" hidden` : ''}><a class="btn btn--tonal" href="${escapeHtml(url)}">${icon('download', { size: 17 })}<span>Roomler Setup</span></a>` +
     (hint ? `<small class="home-hint">${escapeHtml(hint)}</small>` : '') +
+    (alt
+      ? `<small class="home-hint home-alt"><a href="${escapeHtml(alt.url)}">${escapeHtml(alt.label)}</a></small>`
+      : '') +
     `</p>`
   const downloads = installCards(SITE_ORIGIN)
     .map((card) => {
@@ -167,9 +176,9 @@ export function renderHome(ctx: HomeCtx): string {
       return (
         `<div class="home-card home-card--os" data-os="${card.os}"><h3 class="home-card__title home-os">${icon(OS_ICON[card.os]!, { size: 22 })}<span>${escapeHtml(card.title)}</span></h3>` +
         (card.wizardUrl
-          ? wizardButton(card.wizardUrl, null, card.wizardHint)
+          ? wizardButton(card.wizardUrl, null, card.wizardHint, card.wizardAlt)
           : gatedUrl
-            ? wizardButton(gatedUrl, card.os, gated?.wizardHint ?? null)
+            ? wizardButton(gatedUrl, card.os, gated?.wizardHint ?? null, gated?.wizardAlt ?? null)
             : '') +
         (card.wizardUrl
           ? `<p class="home-muted">Or from a terminal:</p>`

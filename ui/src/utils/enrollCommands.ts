@@ -45,7 +45,24 @@ export interface CommandBlock {
   isDownload?: boolean
   /** #3202 — a line under a download: what it needs before it can run. */
   hint?: string
+  /** #3247 item 13 — the same download for another CPU, as a second link. */
+  alt?: DownloadAlt
 }
+
+/** A second link beside a download: its words, and where it points. */
+export interface DownloadAlt {
+  label: string
+  url: string
+}
+
+/**
+ * #3247 item 13 — `/api/setup/linux` serves the x86_64 wizard, so an ARM64
+ * visitor downloaded one that cannot run. The server has served the ARM64
+ * build on its own name since FR-97 P7b; a browser does not say its CPU
+ * reliably (Chromium's Linux user agent always reads x86_64), so both are
+ * offered and the person picks.
+ */
+export const LINUX_ARM64_LABEL = 'For ARM64 (aarch64)'
 
 /**
  * #3202 — the Linux wizard links WebKitGTK 4.1, which not every desktop has
@@ -166,7 +183,12 @@ export function enrollCommands(
     label: 'Graphical installer (Roomler Setup)',
     command: `${base}/api/setup/${platform}`,
     isDownload: true,
-    ...(os === 'linux' ? { hint: LINUX_WIZARD_NEEDS } : {}),
+    ...(os === 'linux'
+      ? {
+          hint: LINUX_WIZARD_NEEDS,
+          alt: { label: LINUX_ARM64_LABEL, url: `${base}/api/setup/linux-aarch64` },
+        }
+      : {}),
   })
   // FR-97 D5 — off Windows the wizard had no agent role to install, so an
   // agent got the script and the manual path only. FR-129 B1-s: the server
@@ -258,6 +280,8 @@ export interface InstallCard {
   wizardUrl: string | null
   /** #3202 — what the wizard needs first, where that OS says so, else null. */
   wizardHint: string | null
+  /** #3247 item 13 — the same wizard for another CPU, where that OS has one. */
+  wizardAlt: DownloadAlt | null
 }
 
 /** The homepages' install cards, one per OS, from the agent's commands. With
@@ -272,6 +296,7 @@ export function installCards(origin: string, options: EnrollOptions = {}): Insta
       command: os.blocks.find((b) => !b.isDownload)!.command,
       wizardUrl: download?.command ?? null,
       wizardHint: download?.hint ?? null,
+      wizardAlt: download?.alt ?? null,
     }
   })
 }
