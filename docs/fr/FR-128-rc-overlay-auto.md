@@ -1,6 +1,6 @@
 # FR-128: Remote desktop over the mesh, automatically — the overlay path only while the mesh link is direct, or when it is the only path
 
-**Issue:** [#2989](https://github.com/gjovanov/roomler-ai/issues/2989) · **Status:** proposed 2026-10-27, on the operator's choice of an "auto" mode after a same-network session relayed. **§2.1's premise was corrected 2026-10-28**: those sessions measured a worker that #2987 had orphaned, not `rc_overlay=off`. **D6 and D7 decided 2026-10-28**: §2.2 was re-measured (Chrome on a Mac still relays; the cause is found). P1 and P2 merged 2026-10-29 (#3079, #3088) and are live: agents from 0.4.185, server images from `hosted-20261029-2ae4ffd`. **Field verification (P4) began 2026-10-30**: AC1 holds in both directions, 10 of 10 each way; AC2 holds since P2b went live; AC4, AC5 and AC6 are met; and the far-TURN hint had two blind spots (D8), which P2c closes (AC7 met). Only AC3 is owed · **Related:** #1882 (the switch), FR-64 ([#1244](https://github.com/gjovanov/roomler-ai/issues/1244)), FR-121 ([#2862](https://github.com/gjovanov/roomler-ai/issues/2862)), [#2781](https://github.com/gjovanov/roomler-ai/issues/2781), [#2774](https://github.com/gjovanov/roomler-ai/issues/2774)
+**Issue:** [#2989](https://github.com/gjovanov/roomler-ai/issues/2989) · **Status:** proposed 2026-10-27, on the operator's choice of an "auto" mode after a same-network session relayed. **§2.1's premise was corrected 2026-10-28**: those sessions measured a worker that #2987 had orphaned, not `rc_overlay=off`. **D6 and D7 decided 2026-10-28**: §2.2 was re-measured (Chrome on a Mac still relays; the cause is found). P1 and P2 merged 2026-10-29 (#3079, #3088) and are live: agents from 0.4.185, server images from `hosted-20261029-2ae4ffd`. **Field verification (P4) began 2026-10-30**: AC1 holds in both directions, 10 of 10 each way; AC2 holds since P2b went live; AC4, AC5 and AC6 are met; the far-TURN hint had two blind spots (D8), which P2c closes (AC7 met); and AC3 holds in the lab on #2781's network rebuilt. Every criterion is met. D2, the default for new devices, is now the operator's to decide · **Related:** #1882 (the switch), FR-64 ([#1244](https://github.com/gjovanov/roomler-ai/issues/1244)), FR-121 ([#2862](https://github.com/gjovanov/roomler-ai/issues/2862)), [#2781](https://github.com/gjovanov/roomler-ai/issues/2781), [#2774](https://github.com/gjovanov/roomler-ai/issues/2774)
 
 ## 1. Goal
 
@@ -131,7 +131,7 @@ The guard keeps clamping a carrier that degrades during a session. Moving such a
 
 - [x] **AC1 (P1+P2):** same network, mesh direct, `auto`, in both directions (a Windows browser → a Mac agent, a Mac browser → a Windows agent): `session carrier recorded` shows a direct pair (the overlay, or the LAN host pair that ICE preferred over it in §2.1's control), and the session runs `constrained=false`, in at least 9 sessions of 10. The Windows → Mac half already holds under `off` with a working agent (10 of 10 since 2026-10-27 10:00Z, §2.1), so for that half AC1 is a non-regression check.
 - [x] **AC2:** the mesh forced onto DERP, far TURN reachable, `auto`: the session's carrier is `turn` and never the overlay. The log names why.
-- [ ] **AC3:** #2781's topology (UDP blocked, TLS inspected), `auto`: the session connects over the overlay, clamped. With `off` it fails: record that RED first.
+- [x] **AC3:** #2781's topology (UDP blocked, TLS inspected), `auto`: the session connects over the overlay, clamped. With `off` it fails: record that RED first. *Met in the lab on that network rebuilt, 2026-10-30, §8: `off` 18 of 18 failed, `auto` connected over `derp`, clamped, and the screen decoded.*
 - [x] **AC4:** compatibility: an older agent given `auto` behaves per D1, and an older server never sends `auto`.
 - [x] **AC5:** `ROOMLERD_RC_OVERLAY_AUTO=0` makes `auto` behave as `off`, verified on one device.
 - [x] **AC6 (docs):** `docs/remote-control.md` §4.4 documents `auto`: the decision table, a mermaid diagram of it, `file:line` anchors, linked from `docs/README.md`.
@@ -295,3 +295,32 @@ Every heartbeat read `constrained=false` at a 144 fps target (HEVC on NVENC). Ea
 - **The Mac half.** `own_far_turn=Some(true)` is the Mac's own netcheck, read at the offer from its daemon, which the per-user half now lends. The server's hint can never measure this row.
 
 **AC7 is met.** An attempt at 20:57Z landed while 0.4.189 was restarting NEO16 and NEO16-WSL: the Hub held neither relay yet (`viewers=[]`), and `decide` made no lookups. Posted on [#2989](https://github.com/gjovanov/roomler-ai/issues/2989#issuecomment-6533385211).
+
+### 2026-10-30 22:16Z — AC3 on a corp laptop: no RED, so not #2781's topology
+
+**Setup:** CORPLAP-1 (Windows, its corporate full-tunnel VPN, UDP blocked, netcheck `stun_udp=false`), driven from NEO16's Chrome with the operator's OK. There was no exec on the laptop: its side is the log lines it uploads.
+
+| Policy | The decision (its log) | The path | Carrier |
+|---|---|---|---|
+| `off`, 22:16Z | `overlay excluded (device policy rc_overlay=off, the default)` | every UDP TURN allocate unanswered; the relay came over TURN-over-TLS on 443; `Connected` 1.4 s after the offer | `turn`, constrained |
+| `auto`, 22:30Z | `stays off the mesh … carriers=[Relayed, Relayed] far_turn=None own_far_turn=Some(true) allow=false` | the same | `turn`, constrained |
+
+On #2781's network the inspecting proxy closed TURN-over-TLS on its first bytes. That evening both corp laptops allocated over TLS, so no session failed under `off`. AC3 moved to a lab cell. Posted on [#2989](https://github.com/gjovanov/roomler-ai/issues/2989#issuecomment-6535063260), with two places the hint reads wrong: [#3341](https://github.com/gjovanov/roomler-ai/issues/3341).
+
+### 2026-10-30 23:13Z — AC3 in the lab, on #2781's network rebuilt: met
+
+**Setup:** against production (`hosted-20261030-ff00741`), agent 0.4.189 at both ends.
+
+- **UDP:** every UDP packet out of the target VM dropped silently on its uplink, except DNS and DHCP. STUN to coturn went from answered to unanswered.
+- **TLS:** TCP 443 to coturn went to an inspecting box. It completes the handshake with a lab CA the VM's OS store trusts, as a corp laptop trusts its proxy's CA, then closes the stream on the first bytes. The certificate seen on coturn:443 went from ZeroSSL's to the lab CA's. TCP to coturn on every other port dropped.
+- **Untouched:** the control socket and DERP (TCP 443 to the server), and the overlay's own TUN.
+- **The viewer:** a 0.4.189 agent in a container on another lab host, with the browser in its network namespace, named as the browser's device.
+
+Before the phases the target's netcheck read `stun_udp=false, derp_ws_ok=true`, the viewer's `stun_udp=true, relay_band_udp=true`, and the mesh between them ran `relay:derp/tcp`.
+
+| Phase | The target's decision | What happened | Carrier |
+|---|---|---|---|
+| `off`, the RED | `overlay excluded (device policy rc_overlay=off, the default)` | 18 tries in about 2 minutes, none connected. Each ended with `Failed to start SCTP: DTLS not established` and `ControllerHangup`, #2781's signature. Every TURN allocation failed, and TURN over TLS on 443 failed 46 times with `err=attribute not found` | none |
+| `auto` | `the session may ride the mesh … carriers=[Relayed] far_turn=Some(false) own_far_turn=Some(false) allow=true` | `Connected` 0.25 s after the offer. The guard clamped it: `overlay carrier under the nominated pair is not direct — treating transport as constrained … carrier=Relay`. The browser decoded the remote screen, and the RD check passed | `derp` |
+
+**AC3 is met.** On this network a session under `off` cannot form a pair. Under `auto`, both the server's hint and the target's own netcheck read the far TURN dead, and the session rides the mesh over DERP, clamped. It's a rebuilt network, not a corporate one: the corp laptops no longer reproduce #2781, per the row above. Posted on [#2989](https://github.com/gjovanov/roomler-ai/issues/2989#issuecomment-6535636258). The tick landed on 2026-11-02, read back against that comment.

@@ -7,8 +7,8 @@
 //! `roomlerd.exe run` as the active user via
 //! `WTSQueryUserToken` + `CreateProcessAsUserW`, then watches it.
 //! The worker exiting non-zero triggers a respawn with exponential
-//! backoff (parity with the Scheduled Task `RestartOnFailure` PT1M
-//! × 10 we ship for the user-mode model).
+//! backoff. The per-user Scheduled Task has nothing like this: its
+//! `RestartOnFailure` restarts no exit (measured, #3292).
 //!
 //! Session change notifications from the SCM (LOGON / LOGOFF /
 //! CONSOLE_CONNECT / etc.) flow into the supervisor via a

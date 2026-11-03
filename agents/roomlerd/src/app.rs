@@ -1047,6 +1047,12 @@ enum ServiceAction {
         /// --as-service`. Requires elevation on a stock install.
         #[arg(long, visible_alias = "system")]
         as_service: bool,
+        /// The per-user MSI's stop during an upgrade (#3292): records an update
+        /// attempt first, so an ephemeral device stays enrolled. The installer
+        /// replacing the files is not the device leaving
+        /// (`updater::should_self_unenroll`, #1683).
+        #[arg(long, hide = true)]
+        for_upgrade: bool,
     },
 }
 
@@ -1621,6 +1627,14 @@ async fn daemon_main() -> Result<()> {
     }
 
     logging::init();
+
+    // #3292 — the per-user task's daemon has no console, and its launcher gave it
+    // `NUL`: what only stderr carries (a panic, a stack overflow, FFmpeg) goes to
+    // the rolling log. Only this start: every other verb answers on its terminal.
+    #[cfg(target_os = "windows")]
+    if matches!(&cli.command, Some(Command::Run { supervisor: Some(s), .. }) if s == "task") {
+        logging::send_stderr_to_the_log();
+    }
 
     // FR-46 P2b — the retired env prefix is no longer READ, so a host that
     // still sets one must be TOLD rather than quietly ignored. Straight after
@@ -4404,8 +4418,9 @@ async fn run_cmd(
     // Install the liveness watchdog. Pumps tick after every iteration;
     // the scan loop force-exits via std::process::exit(STALL_EXIT_CODE)
     // when any pump silently stalls past its threshold, relying on
-    // the OS supervisor (Win Scheduled Task with RestartOnFailure /
-    // systemd Restart=on-failure / launchd KeepAlive) to relaunch.
+    // the OS supervisor (the Windows service's / systemd Restart=on-failure /
+    // launchd KeepAlive) to relaunch. The per-user Windows task relaunches
+    // no exit, so that one stays down until the next sign-in (#3295).
     // Encoder + capture are registered but gated off until a session
     // attaches — those pumps can legitimately go idle for hours when
     // no controller is connected.
@@ -5657,8 +5672,15 @@ async fn run_cmd(
 async fn service_cmd(action: ServiceAction, config_path: &PathBuf) -> Result<()> {
     match action {
         ServiceAction::Install { as_service: false } => {
-            service::install().context("installing auto-start hook")?;
-            println!("Auto-start registered. The agent will launch on next login.");
+            service::install(config_path).context("installing auto-start hook")?;
+            println!(
+                "Auto-start registered. The agent will launch on next login{}.",
+                if cfg!(target_os = "windows") && config_path.exists() {
+                    ", and within about a minute"
+                } else {
+                    ""
+                }
+            );
             // FR-84 D6 — the per-user install's companion login start
             // (`HKCU\…\Run`): the MSI's RegisterAutostart CA runs this as the
             // installing user. A fresh install has no companion beside us yet
@@ -5698,13 +5720,36 @@ async fn service_cmd(action: ServiceAction, config_path: &PathBuf) -> Result<()>
         ServiceAction::Uninstall { as_service: true } => service_uninstall_as_service(),
         ServiceAction::Status { as_service: true } => service_status_as_service(),
         ServiceAction::Start { as_service: true } => service_start_as_service(),
-        ServiceAction::Stop { as_service: false } => {
-            let how = service::stop(config_path).context("stopping the daemon")?;
+        ServiceAction::Stop {
+            as_service: false,
+            for_upgrade,
+        } => {
+            let how = stop_for_upgrade_or_not(for_upgrade, updater::record_update_attempt, || {
+                service::stop(config_path).context("stopping the daemon")
+            })?;
             println!("{how}");
             Ok(())
         }
-        ServiceAction::Stop { as_service: true } => service_stop_as_service(),
+        ServiceAction::Stop {
+            as_service: true, ..
+        } => service_stop_as_service(),
     }
+}
+
+/// #3292 — `--for-upgrade` asks the daemon to leave only once the marker that says
+/// so is on disk. The daemon reads it on its way out, and without it an ephemeral
+/// device deletes its own row during the upgrade (#1683). Left running, the old
+/// daemon stays on the renamed files until the next sign-in: online, and the
+/// device is still itself.
+fn stop_for_upgrade_or_not(
+    for_upgrade: bool,
+    record_the_upgrade: impl FnOnce() -> bool,
+    stop: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    if for_upgrade && !record_the_upgrade() {
+        bail!("could not record the upgrade, so the daemon was left running");
+    }
+    stop()
 }
 
 #[cfg(target_os = "windows")]
@@ -7480,8 +7525,6 @@ mod tests {
         }
     }
 
-    /// #3289 — a worker the host hands a flag this build does not parse exits at
-    /// once, on every spawn, so the host's spelling is read back here.
     /// #3289 — nothing was attempted, so it does not say an attempt failed, and it
     /// does not send a person to the one thing the installer refuses.
     #[test]
@@ -7496,6 +7539,8 @@ mod tests {
         assert!(!msg.contains("reinstall manually"));
     }
 
+    /// #3289 — a worker the host hands a flag this build does not parse exits at
+    /// once, on every spawn, so the host's spelling is read back here.
     #[cfg(target_os = "windows")]
     #[test]
     fn parses_a_worker_as_the_service_host_spawns_it() {
@@ -7517,6 +7562,120 @@ mod tests {
                 other => panic!("expected run, got {other:?}"),
             }
         }
+    }
+
+    /// #3292 — the spellings in the per-user MSI's `StopOldDaemon` and
+    /// `StopDaemon`. Both are Return='ignore', so a flag that stopped parsing
+    /// would fail silently, and an upgrade would keep the old daemon again.
+    #[test]
+    fn parses_service_stop_as_the_msi_spells_it() {
+        for (argv, want) in [
+            (vec!["roomlerd", "service", "stop", "--for-upgrade"], true),
+            (vec!["roomlerd", "service", "stop"], false),
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            match cli.command {
+                Some(Command::Service {
+                    action:
+                        ServiceAction::Stop {
+                            as_service,
+                            for_upgrade,
+                        },
+                }) => {
+                    assert!(!as_service);
+                    assert_eq!(for_upgrade, want);
+                }
+                other => panic!("expected service stop, got {other:?}"),
+            }
+        }
+    }
+
+    /// #3292 — the two stops are not interchangeable. A plain stop during an
+    /// upgrade deletes an ephemeral device (#1683, `should_self_unenroll`), and
+    /// `REMOVE="ALL"` alone also holds for the old product during a MajorUpgrade.
+    #[test]
+    fn the_msi_keeps_the_plain_stop_out_of_an_upgrade() {
+        let wxs = include_str!("../wix/main.wxs");
+        let scheduled = |action: &str| -> String {
+            let open = format!("<Custom Action='{action}'");
+            let at = wxs.find(&open).expect("scheduled in the sequence");
+            let rest = &wxs[at..];
+            rest[..rest.find("</Custom>").expect("closed")].to_string()
+        };
+        let plain = scheduled("StopDaemon");
+        assert!(plain.contains("Before='UnregisterAutostart'"), "{plain}");
+        assert!(
+            plain.contains(r#"REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE"#),
+            "{plain}"
+        );
+        let upgrade = scheduled("StopOldDaemon");
+        assert!(upgrade.contains("WIX_UPGRADE_DETECTED"), "{upgrade}");
+        assert_eq!(wxs.matches("ExeCommand='service stop'").count(), 1);
+        assert_eq!(
+            wxs.matches("ExeCommand='service stop --for-upgrade'")
+                .count(),
+            1
+        );
+    }
+
+    /// #3292 — no marker, no stop: an ephemeral device's identity is at stake.
+    #[test]
+    fn an_upgrades_stop_needs_the_marker_on_disk() {
+        let stopped = std::cell::Cell::new(false);
+        let stop = || {
+            stopped.set(true);
+            Ok("stopped".to_string())
+        };
+        let refused = stop_for_upgrade_or_not(true, || false, stop);
+        assert!(refused.is_err());
+        assert!(!stopped.get(), "the daemon must be left running");
+
+        assert!(stop_for_upgrade_or_not(true, || true, stop).is_ok());
+        assert!(stopped.get());
+
+        stopped.set(false);
+        let not_consulted = || panic!("a plain stop writes no marker");
+        assert!(stop_for_upgrade_or_not(false, not_consulted, stop).is_ok());
+        assert!(stopped.get());
+    }
+
+    /// #3292 — a rollback plays the script backwards, so these must sit ahead of
+    /// `RemoveExistingProducts` to run after the old files are back, and run the
+    /// daemon's EXE: the launcher is gone after a rollback to a release without one.
+    #[test]
+    fn a_rollback_brings_back_the_task_and_then_the_daemon() {
+        let wxs = include_str!("../wix/main.wxs");
+        let action = |id: &str| -> String {
+            let at = wxs
+                .find(&format!("Id='{id}'"))
+                .expect("declared as a custom action");
+            let rest = &wxs[at..];
+            rest[..rest.find("/>").expect("closed")].to_string()
+        };
+        for (id, command) in [
+            ("AutostartBackOnRollback", "service install"),
+            ("DaemonBackOnRollback", "service start"),
+        ] {
+            let declared = action(id);
+            assert!(
+                // RETIRED-NAME-ANCHOR: an MSI FileKey is installer identity, frozen.
+                declared.contains("FileKey='roomler_agent_exe'"),
+                "{declared}"
+            );
+            assert!(declared.contains("Execute='rollback'"), "{declared}");
+            assert!(
+                declared.contains(&format!("ExeCommand='{command}'")),
+                "{declared}"
+            );
+        }
+        assert!(wxs.contains("<Custom Action='DaemonBackOnRollback' After='InstallInitialize'>"));
+        assert!(
+            wxs.contains("<Custom Action='AutostartBackOnRollback' After='DaemonBackOnRollback'>")
+        );
+        // Spooled ahead of RemoveExistingProducts with no flush, those two fail every
+        // upgrade with Error 2613. Measured on signed candidates; ICE63 only warns.
+        assert!(wxs.contains("<InstallExecute After='AutostartBackOnRollback' />"));
+        assert!(wxs.contains("Schedule='afterInstallExecute'"));
     }
 
     #[test]

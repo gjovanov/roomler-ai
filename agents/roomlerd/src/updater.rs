@@ -10,9 +10,9 @@
 //! Scope: the agent exits after spawning the installer so the installer
 //! can overwrite the binary without `ERROR_SHARING_VIOLATION`. The
 //! Scheduled Task / systemd unit / LaunchAgent registered via
-//! `roomlerd service install` re-launches the new version on
-//! the next login (Windows) or immediately (Restart=on-failure on
-//! Linux, KeepAlive on macOS).
+//! `roomlerd service install` re-launches the new version within a
+//! minute of the install (Windows, the registration's one-shot starts,
+//! #3292) or immediately (Restart=on-failure on Linux, KeepAlive on macOS).
 //!
 //! Trust model: we assume GitHub-over-TLS is sufficient for now. No
 //! signature check beyond the MSI's cargo-wix / codesign identity
@@ -420,16 +420,22 @@ pub fn update_attempt_marker_path() -> Option<PathBuf> {
 /// moment the installer process is launched. Best-effort: any I/O
 /// failure is logged but does not block the update path (we'd
 /// rather have a working install with a noisy crash counter than
-/// no install at all).
-fn record_update_attempt() {
+/// no install at all). The per-user MSI's `service stop --for-upgrade`
+/// (#3292) calls it too: an upgrade by hand has no installer spawn of ours,
+/// and that caller reads the answer: whether the marker is on disk.
+pub fn record_update_attempt() -> bool {
     let Some(p) = update_attempt_marker_path() else {
-        return;
+        return false;
     };
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(&p, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
-        tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
+    match std::fs::write(&p, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
+            false
+        }
     }
 }
 
