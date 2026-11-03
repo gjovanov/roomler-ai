@@ -123,6 +123,7 @@ flowchart BT
     roomlerd["agents/roomlerd → roomlerd<br/>the daemon"]
     tunnel["agents/roomler-cli → roomler<br/>tunnel CLI (surface lives in its lib)"]
     shim["agents/roomler-cli-shim<br/>roomler.exe on daemon hosts → re-execs roomlerd cli"]
+    launcher["agents/roomlerdw<br/>roomlerdw.exe on per-user Windows hosts → starts roomlerd with no window"]
     tray["agents/roomler-desktop → roomler-desktop"]
     setup["agents/roomler-setup<br/>install wizard (Tauri)"]
 
