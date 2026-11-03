@@ -1673,6 +1673,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #3433 review, F2 — a newer question for the same id clears the old
+    /// answers and takes the id on the books in one step. Cleared outside the
+    /// books and placed under them after, an answer recorded in between, for
+    /// the older question still on the books, was left for the newer one,
+    /// whose first look took an answer given before it existed.
+    ///
+    /// The books are held here while the newer question is armed. An arm that
+    /// clears outside them clears at once (a leftover going says so), and the
+    /// answer is then given as `record_decision` gives it: under the books,
+    /// for the question they hold.
+    #[tokio::test]
+    async fn a_newer_question_takes_no_answer_given_before_it() {
+        let dir = fixture_dir("newer-takes-none-before");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "34330000000000000000f4f4";
+        let _older = broker.arm(session, Duration::from_secs(30));
+        let leftover = broker.write_sentinel(session, SentinelKind::Deny).unwrap();
+
+        let books = broker.inner.pending.lock().unwrap();
+        let arming = {
+            let broker = broker.clone();
+            std::thread::spawn(move || broker.arm(session, Duration::from_millis(300)))
+        };
+        let waited = Instant::now();
+        while leftover.exists() && waited.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(books.contains_key(session), "the older question was asking");
+        broker
+            .write_sentinel(session, SentinelKind::Approve)
+            .unwrap();
+        drop(books);
+
+        let newer = arming.join().unwrap();
+        let decision = tokio::time::timeout(PROMPT_BOUND, newer.run())
+            .await
+            .expect("the newer prompt must resolve within its window");
+        assert_eq!(
+            decision,
+            Decision::Timeout,
+            "a newer question took an answer given before it existed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1632 — the marker the companion (and `roomlerd consent --list`) reads
     /// is removed on cancel, so the companion's 750 ms poll finds nothing
     /// pending and takes its own panel down (roomler-desktop
