@@ -157,6 +157,10 @@ Two consequences worth knowing:
 
 - **Removal is final.** A removed machine that re-enrolls comes back as a *new*
   node with a fresh address and a fresh name; the tombstone is never revived.
+  Until it does, it takes no lease at all: a join is refused while the row behind
+  the socket is a tombstone (#1829), or its org is archived (#3042), and it is the
+  kick or the revocation poll that tells it why. A relay request naming a released
+  peer gets no grant.
 - **Evict is "force a new lease", not "ban".** It doesn't touch the backing
   agent / tunnel client, so a still-enrolled device rejoins on its next connect
   with a *different* address. To remove a device for good, delete it. There is

@@ -319,6 +319,7 @@ async fn delete_agent_removes_from_list() {
 async fn a_removed_device_is_a_404_on_every_per_device_route() {
     use bson::{Bson, doc, oid::ObjectId};
     use reqwest::Method;
+    use roomler_ai_remote_control::models::{DesiredConfig, ExecAnchor};
 
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("rcgone").await;
@@ -329,11 +330,30 @@ async fn a_removed_device_is_a_404_on_every_per_device_route() {
     let aid = ObjectId::parse_str(&agent_id).unwrap();
     let agents = app.db.collection::<bson::Document>("agents");
 
+    // A second org this admin runs: join-org gates on both orgs before it
+    // looks at the device, so with no such org it could never reach the lookup.
+    let other_org: Value = app
+        .auth_post("/api/tenant", &admin)
+        .json(&json!({ "name": "Join target", "slug": "rcgone-join-target" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let other_org = other_org["id"]
+        .as_str()
+        .expect("the second org")
+        .to_string();
+
     // Every per-device route this locks, with a body each accepts: the
-    // writes (settings, the three policies, the config intent, the update
-    // order), a session start (exec) and a read that is about the device's
-    // future (join-targets). The listing-style audit reads are NOT here —
-    // `recording-activity/{aid}` deliberately still resolves a removed device.
+    // writes (settings, the policies, the config intent, the update order, the
+    // connect code), a session start (exec, ssh), the orders that would have
+    // nothing to reach (cancel, key rotation, join-org, un-anchor) and the
+    // reads about the device's future (join-targets, connect-code). The audit
+    // reads are NOT here: they are asserted below to still answer. The
+    // per-person External access route needs a row to answer at all, and has
+    // its own lock (`tombstone_tests`).
     let routes: Vec<(&str, Method, String, Value)> = vec![
         (
             "PUT settings",
@@ -381,6 +401,54 @@ async fn a_removed_device_is_a_404_on_every_per_device_route() {
             "GET join-targets",
             Method::GET,
             format!("{base}/join-targets"),
+            Value::Null,
+        ),
+        (
+            "POST join-org",
+            Method::POST,
+            format!("{base}/join-org"),
+            json!({ "target_tenant_id": other_org }),
+        ),
+        (
+            "POST exec cancel",
+            Method::POST,
+            format!("{base}/exec/not-a-request/cancel"),
+            json!({}),
+        ),
+        (
+            "DELETE exec-anchor",
+            Method::DELETE,
+            format!("{base}/exec-anchor"),
+            Value::Null,
+        ),
+        (
+            "POST ssh",
+            Method::POST,
+            format!("{base}/ssh"),
+            json!({ "public_key": "ssh-ed25519 AAAA test" }),
+        ),
+        (
+            "POST overlay-key rotate",
+            Method::POST,
+            format!("{base}/overlay-key/rotate"),
+            json!({}),
+        ),
+        (
+            "PUT external-access-policy",
+            Method::PUT,
+            format!("{base}/external-access-policy"),
+            json!({ "approved": false }),
+        ),
+        (
+            "POST connect-code",
+            Method::POST,
+            format!("{base}/connect-code"),
+            json!({}),
+        ),
+        (
+            "GET connect-code",
+            Method::GET,
+            format!("{base}/connect-code"),
             Value::Null,
         ),
     ];
@@ -454,6 +522,42 @@ async fn a_removed_device_is_a_404_on_every_per_device_route() {
         assert_eq!(status, 404, "{name} on a removed device");
     }
 
+    // A removal is not a way to hide what the device did: its history still
+    // reads, and these are the readers that stay ANY on purpose. Each answers
+    // for the tombstone, and a bogus id still 404s the ones that look at all.
+    for reader in [
+        format!("{base}/logs"),
+        format!("{base}/crash"),
+        format!(
+            "/api/tenant/{}/recording-activity/{agent_id}",
+            seeded.tenant_id
+        ),
+        format!(
+            "/api/tenant/{}/transfer-activity/{agent_id}",
+            seeded.tenant_id
+        ),
+        format!(
+            "/api/tenant/{}/privacy-activity/{agent_id}",
+            seeded.tenant_id
+        ),
+    ] {
+        let resp = app.auth_get(&reader, &admin).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{reader} on a removed device");
+    }
+    let resp = app
+        .auth_get(
+            &format!(
+                "/api/tenant/{}/recording-activity/{}",
+                seeded.tenant_id,
+                ObjectId::new().to_hex()
+            ),
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "an audit read of a bogus id");
+
     // …and none of those writes reached the tombstone.
     let row = agents.find_one(doc! { "_id": aid }).await.unwrap().unwrap();
     assert_eq!(
@@ -474,6 +578,33 @@ async fn a_removed_device_is_a_404_on_every_per_device_route() {
             .unwrap(),
         "a setter must not land on a tombstone"
     );
+    // A tombstone revives whole, so these two would come back with the machine's
+    // next enrollment: SYSTEM exec, and a config nobody is still asking for.
+    let late_anchor = ExecAnchor {
+        anchored_at: bson::DateTime::now(),
+        anchored_by: ObjectId::new(),
+        anchor_id: "late".into(),
+    };
+    assert!(
+        !fleet
+            .agents
+            .set_exec_anchor(tid, aid, &late_anchor)
+            .await
+            .unwrap(),
+        "an anchor must not land on a tombstone"
+    );
+    let late_config = DesiredConfig {
+        revision: 99,
+        ..Default::default()
+    };
+    assert!(
+        !fleet
+            .agents
+            .set_desired_config(tid, aid, &late_config)
+            .await
+            .unwrap(),
+        "a desired config must not land on a tombstone"
+    );
     // The removal time is written once: a repeat tombstoning is a no-op.
     assert!(!fleet.agents.soft_delete(tid, aid).await.unwrap());
     let row = agents.find_one(doc! { "_id": aid }).await.unwrap().unwrap();
@@ -481,6 +612,21 @@ async fn a_removed_device_is_a_404_on_every_per_device_route() {
     assert_eq!(
         row.get_array("tags").unwrap(),
         &vec![Bson::String("before".into())]
+    );
+    assert!(
+        !row.contains_key("exec_anchor"),
+        "the removal ended the anchor and nothing wrote one back"
+    );
+    assert_ne!(
+        fleet
+            .agents
+            .find_any_in_tenant(tid, aid)
+            .await
+            .unwrap()
+            .desired_config
+            .revision,
+        99,
+        "the late config did not land"
     );
 
     // A repeat DELETE is a 404 — the same answer the listing gives, and the
