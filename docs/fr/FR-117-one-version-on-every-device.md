@@ -64,8 +64,8 @@ flowchart TD
 - **Linux: the companion tracks the daemon**, the invariant Windows has had since S1a (`companion.rs:3-29`). The one
   process that installs updates as root on the host also moves an installed `roomler-desktop` package to its **own**
   version (`CARGO_PKG_VERSION`), never "latest": the companion follows the daemon, not the feed.
-  - **Who:** the owner `decide_update_owner` already names (`updater.rs:3648`, FR-96). That is a system install's root
-    daemon, or `roomlerd update-helper` (`updater.rs:3918`) for a per-user install. A per-user daemon that sees the
+  - **Who:** the owner `decide_update_owner` already names (`updater.rs:3664`, FR-96). That is a system install's root
+    daemon, or `roomlerd update-helper` (`updater.rs:3934`) for a per-user install. A per-user daemon that sees the
     skew touches the helper's wake file (`/var/tmp/roomler-update-check`): a wake, never an instruction. A non-root
     daemon with no helper skips, with one log line, never a password prompt (D3).
   - **What:** the package database that owns the companion picks the format (`installed_version_inner`,

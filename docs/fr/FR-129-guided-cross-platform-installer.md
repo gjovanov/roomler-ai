@@ -37,7 +37,7 @@ signup page or says where a token comes from. To get one, a new person must:
 3. log in;
 4. create an org, unless they filled the optional org fields at signup (`auth.rs:226-231`);
 5. find Devices → Enroll device, which mints a **10-minute single-use** token
-   (`crates/modules/fleet/src/agent.rs:24`, `:90-140`, behind `MANAGE_AGENTS`);
+   (`crates/modules/fleet/src/agent.rs:25`, `:113-164`, behind `MANAGE_AGENTS`);
 6. copy it — the dialog says "then paste the token into the wizard"
    (`ui/src/components/enroll/EnrollmentDialog.vue:119`);
 7. get back to the wizard and paste it before the 10 minutes run out.
@@ -933,7 +933,7 @@ sequenceDiagram
   shell's one UAC prompt and `icacls` under none (the log, 2026-11-02). Every spawn on this path
   now names its program by a full path from the kernel, because `%SystemRoot%` can be overridden
   per user (`appdirs::system32_tool`, `crates/agent-core/src/appdirs.rs:113`), and `spawn_elevated`
-  refuses anything else (`agents/roomlerd/src/updater.rs:2676`).
+  refuses anything else (`agents/roomlerd/src/updater.rs:2692`).
   `agents/roomler-setup/src/spawn_gate.rs` parses the source of everything the wizard runs on
   Windows and fails on a bare name, or on an expression it has not been told about.
 - **What an elevated run takes from its user.** A value in `HKCU\Environment` reaches an elevated

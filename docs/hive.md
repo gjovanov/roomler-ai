@@ -775,7 +775,7 @@ flowchart LR
 | Platform | Who installs | How the wait runs |
 |---|---|---|
 | Linux, Windows | the daemon's in-process updater | [`wait_for_agent_turns`](../agents/roomlerd/src/updater.rs#L278) runs before the installer is spawned, for the periodic check and a pushed update alike |
-| macOS | the root update helper, `com.roomler.update`, never the daemon | before `installer(8)` the helper asks the root daemon, over its system LocalAPI socket, to hold (`HiveUpdateHold`). The daemon runs the same wait and answers `HiveUpdateHeld {waited_secs, cut}`, then refuses new prompts and starts until that connection closes ([`updater.rs:349`](../agents/roomlerd/src/updater.rs#L349), [`:3520`](../agents/roomlerd/src/updater.rs#L3520)) |
+| macOS | the root update helper, `com.roomler.update`, never the daemon | before `installer(8)` the helper asks the root daemon, over its system LocalAPI socket, to hold (`HiveUpdateHold`). The daemon runs the same wait and answers `HiveUpdateHeld {waited_secs, cut}`, then refuses new prompts and starts until that connection closes ([`updater.rs:349`](../agents/roomlerd/src/updater.rs#L349), [`:3536`](../agents/roomlerd/src/updater.rs#L3536)) |
 
 - It waits at most `hive_update_wait_secs` (30 minutes; `0` never waits), looks again
   every 5 s, and logs "update deferred — agent turns running" when it starts and once
@@ -1450,7 +1450,7 @@ sequenceDiagram
 | `replicaset.max` | `min` to 8 | |
 | `replicaset.archive` | whether every archive replica the rules allow joins | |
 | `replicaset.prefer` | `owner_devices`, once; any other word is refused | the one order decision 2 names. Refused rather than stored, so a word the server cannot place by fails at the write, not silently at every placement |
-| `replicaset.restricted_tags` | trimmed, empties dropped, once each, at most 16 of 40 characters ([`agent.rs:1093`](../crates/modules/fleet/src/agent.rs#L1093)) | normalized as device tags are, so a tag compares equal to the one a device carries |
+| `replicaset.restricted_tags` | trimmed, empties dropped, once each, at most 16 of 40 characters ([`agent.rs:1104`](../crates/modules/fleet/src/agent.rs#L1104)) | normalized as device tags are, so a tag compares equal to the one a device carries |
 | `retention_days` | 0 to 3650; 0 keeps sessions for ever | P2g applies it |
 | `archive_devices` | at most 16, each a live device of this organization and not ephemeral, each kept once ([`policy.rs:315`](../crates/modules/hive/src/policy.rs#L315)) | the administrator's half of an archive replica. The device's own `hive_archive` is the other half, read where placement runs, so either may come first |
 
@@ -1675,7 +1675,7 @@ decides again for every live placed session of the organization
 
 | What changed | Who tells hive | Where |
 |---|---|---|
-| a device's tags or owner | fleet's update route, once they are stored, through a new core hook, `agent_updated`; a failing holder is the route's 500, and a retry decides again | [`agent.rs:1204`](../crates/modules/fleet/src/agent.rs#L1204), [`hooks.rs:161`](../crates/core/src/hooks.rs#L161), [`hooks.rs:118`](../crates/modules/hive/src/hooks.rs#L118) |
+| a device's tags or owner | fleet's update route, once they are stored, through a new core hook, `agent_updated`; a failing holder is the route's 500, and a retry decides again | [`agent.rs:1215`](../crates/modules/fleet/src/agent.rs#L1215), [`hooks.rs:161`](../crates/core/src/hooks.rs#L161), [`hooks.rs:118`](../crates/modules/hive/src/hooks.rs#L118) |
 | the policy, or its archive replicas | the policy write, after it is stored | [`policy.rs:354`](../crates/modules/hive/src/policy.rs#L354) |
 | a member removed from the fleet | the removal cascade, hive first, while the row is still there: the device is named as gone | [`hooks.rs:107`](../crates/modules/hive/src/hooks.rs#L107) |
 
@@ -4504,7 +4504,7 @@ sequenceDiagram
 
 ⚠️ **A restricted tag is compared exactly.** The server trims the tags, drops an empty one and
 keeps each once, as it does a device's tags, but it keeps their case
-([`agent.rs:1163`](../crates/modules/fleet/src/agent.rs#L1163)): `Prod` restricts nothing about a
+([`agent.rs:1174`](../crates/modules/fleet/src/agent.rs#L1174)): `Prod` restricts nothing about a
 session on a device tagged `prod`. The form offers the tags the organization's devices carry
 first for that reason ([`HiveCopiesView.vue:524`](../ui/src/views/hive/HiveCopiesView.vue#L524)).
 

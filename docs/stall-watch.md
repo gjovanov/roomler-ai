@@ -521,3 +521,59 @@ roomler exec <device> -- "C:/Program Files/Roomler/roomlerd.exe" stall-watch-cos
 - **A wedged capture cannot trip it** (§2).
 - **The census sees what was uploaded** (§7): 7 days, and less than that on a
   host that lost lines.
+
+## 10. The runtime canary — what the watch cannot see (FR-65 P2)
+
+The watch times the pump's own passes. A task that never got scheduled is
+invisible to it: if something holds a worker of the daemon's runtime (a
+synchronous FFI call, a guard held across an `.await`, a poll that never
+yields), every task queued behind that worker waits, and the pump's next pass
+merely starts late. FR-65 P2 asked for an instrument that measures that symptom
+itself, and FR-70 AC1 asks for the same one. This is it.
+
+| | |
+|---|---|
+| Code | `agents/roomlerd/src/runtime_canary.rs`, spawned beside the resource watch (`app.rs`) |
+| What it does | asks to wake every 10 ms on the daemon's main runtime and records how late each wake came |
+| Summary | one INFO line every 10 minutes: `runtime canary: how late a 10 ms timer woke, over 10 minutes` |
+| Warning | one WARN at most a minute when a wake comes ≥ 100 ms late (the watch's bar): `runtime canary: a 10 ms timer woke late, so the runtime did not schedule its tasks` |
+| Kill switch | `ROOMLERD_RUNTIME_CANARY=0` |
+| Its cost | one timer: 100 wakes a second, each a clock read and a histogram increment |
+
+```mermaid
+flowchart LR
+    T[sleep until due] --> W[woke: late = now − due]
+    W --> G{late ≥ 30 s?}
+    G -- yes --> GAP[gaps += 1<br/>the host slept]
+    G -- no --> H[histogram, max]
+    H --> X{late ≥ 100 ms?}
+    X -- yes --> WARN[WARN, at most once a minute<br/>unwarned counts the rest]
+    X -- no --> N
+    WARN --> N[due = now + 10 ms]
+    GAP --> N
+    N --> T
+```
+
+**The summary's fields.** `wakes`; `p50_ms`, `p99_ms`, `p999_ms`, each the
+histogram bucket bound (1, 2, 5, 10, 20, 50, 100, 250 ms) under which that share
+of the wakes fell, or the latest wake when that share is past 250 ms; `max_ms`,
+exact; `over_10ms`, `over_50ms`, `over_100ms`, wakes later than each; `gaps`,
+wakes 30 s or more late. An idle runtime reads `p999_ms=1` and every `over_*` at
+0. P2's measured case, a 13 ms synchronous encode on a worker every frame at
+30 fps, would read `p99_ms=20` with a third of the wakes in `over_10ms`
+(`a_worker_held_13_ms_a_frame_shows_in_the_tail`).
+
+**Why it measures from `now`.** The next deadline is set from the wake, not
+from the missed one, so a 2 s stall counts as one wake 2 s late, not as 200
+wakes of which 199 look on time and water the tail down.
+
+**Why a gap is not a stall.** On Windows the daemon holds a 1 ms timer
+resolution for its whole life (`win_timer`), so a late wake there is the
+scheduler, not the 15.6 ms tick. But a laptop that sleeps wakes the canary hours
+late. A wake 30 s or more late is counted in `gaps` and never warned: a runtime
+starved that long is the watchdog's to catch (its budgets are 30–90 s).
+
+**Reading it beside the census.** A STALL whose pass shows no phase and a
+canary WARN within the same second is the runtime's; a STALL with a dominant
+phase and an on-time canary is the pump's own work. A fleet read of both is
+what AC4 asks for.

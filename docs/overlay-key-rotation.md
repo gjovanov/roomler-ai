@@ -163,7 +163,7 @@ The device's report is a **claim** (the `ssh_activity` sense). What the server c
 *verify* is the join: `rc:overlay.join` under the new public key passes
 `wg_key_taken_by_other` (machine-scoped, so a device rotating its own key is admitted
 — `security-baseline.md` §4), and the server stamps what the device presented onto
-the agent row as `overlay_identity` (`crates/modules/network/src/overlay.rs:543-566`
+the agent row as `overlay_identity` (`crates/modules/network/src/overlay.rs:569-592`
 → `dao/agent.rs:815`). It is stamped on **every** join, not only after a rotation, so
 the grid can always show the device's current key.
 
@@ -183,7 +183,7 @@ duplicate-delivery race below. Any report about a *different* order, and any
 ## The state the dashboard shows
 
 Resolved **once, server-side**, from the order, the claim and the proof
-(`crates/modules/fleet/src/agent.rs:601-685`); the grid only names the states
+(`crates/modules/fleet/src/agent.rs:612-696`); the grid only names the states
 (`AgentsSection.vue:2091-2192`). The device row also carries `overlay_public_key` and
 `overlay_key_epoch` straight from the proof (`agent.rs:1463-1471`), so an operator
 can *see* the key change instead of trusting a chip.
@@ -312,9 +312,9 @@ The server cannot see the device switch, so a switched-off device is still order
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
 | reconcile-on-connect | `crates/modules/fleet/src/socket.rs:372-388`, `:453-474` |
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
-| identity stamp at the join | `crates/modules/network/src/overlay.rs:543-566`; `crates/services/src/dao/agent.rs:990` |
-| the conditional report write | `crates/services/src/dao/agent.rs:1044-1074` |
-| state resolver + grid view | `crates/modules/fleet/src/agent.rs:521-685`, `:1471-1479` |
+| identity stamp at the join | `crates/modules/network/src/overlay.rs:569-592`; `crates/services/src/dao/agent.rs:1027` |
+| the conditional report write | `crates/services/src/dao/agent.rs:1081-1111` |
+| state resolver + grid view | `crates/modules/fleet/src/agent.rs:532-696`, `:1471-1479` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:808-816` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6372-6514`, `:3232-3274`, `:3276-3297`, `:1267-1291` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:346-245` |
