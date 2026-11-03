@@ -168,7 +168,10 @@ and DACL in-process (`crates/agent-core/src/config.rs:3682`) and skips the
 steps when the directory already holds exactly what they write: owned by
 Administrators, inheritance off, full control with `(OI)(CI)` for SYSTEM and
 for Administrators, and no other entry (`crates/agent-core/src/config.rs:3625`). Anything else, a read that
-fails included, runs them as before. On a host kept busy by higher-priority work
+fails included, runs them as before. A directory that holds an entry of its own
+the steps never remove, a grant to another account for instance, never reaches
+that state: it runs them on every save, as every directory did before #3291.
+On a host kept busy by higher-priority work
 each `icacls` waited for the load to end (18.6 s for `/setowner` on a 4-vCPU
 guest), and the start could not reach its capability probe until they had run.
 

@@ -7075,6 +7075,34 @@ tenant_id = "tid2"
         assert!(!already_hardened(&missing));
     }
 
+    /// #3291 — a directory to harden as the field has one: below another,
+    /// holding no ACE of its own and inheriting all it holds, as a directory
+    /// under ProgramData does. A fresh temp directory is not that everywhere:
+    /// on CI's runner one came with a full-control `(OI)(CI)` ACE of its own
+    /// for the runner's account. No step removes such an ACE, so the steps
+    /// could never leave that directory hardened, and the check rightly kept
+    /// running them. `/reset` drops whatever ACE the new directory was given
+    /// and leaves what its parent hands down.
+    #[cfg(windows)]
+    fn inheriting_dir(parent: &std::path::Path) -> std::path::PathBuf {
+        let dir = parent.join("roomler");
+        std::fs::create_dir(&dir).expect("a directory below the temp one");
+        let reset = std::process::Command::new("icacls")
+            .arg(&dir)
+            .arg("/reset")
+            .output()
+            .expect("icacls runs");
+        assert!(reset.status.success(), "{reset:?}");
+        let acl = dir_acl(&dir).expect("the owner reads its own directory");
+        // INHERITED_ACE.
+        let own = |ace: &AclEntry| ace.flags & 0x10 == 0;
+        assert!(
+            !acl.protected && !acl.dacl.iter().flatten().any(own),
+            "the directory inherits all it holds: {acl:?}"
+        );
+        dir
+    }
+
     /// #3291 — the in-process read sees a DACL as `icacls` writes it. This
     /// token owns the directory and keeps WRITE_DAC as its owner, so it needs
     /// no elevation; an unelevated one cannot make Administrators the owner,
@@ -7082,10 +7110,11 @@ tenant_id = "tid2"
     #[cfg(windows)]
     #[test]
     fn harden_reads_the_dacl_icacls_writes() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = inheriting_dir(temp.path());
         let icacls = |args: &[&str]| {
             let out = std::process::Command::new("icacls")
-                .arg(dir.path())
+                .arg(&dir)
                 .args(args)
                 .output()
                 .expect("icacls runs");
@@ -7093,7 +7122,7 @@ tenant_id = "tid2"
         };
         icacls(HARDEN_STEPS[1]);
         icacls(HARDEN_STEPS[2]);
-        let acl = dir_acl(dir.path()).expect("the owner reads its own directory");
+        let acl = dir_acl(&dir).expect("the owner reads its own directory");
         // Back to what it inherits, so the temp dir can be removed.
         icacls(&["/reset"]);
         assert!(acl.protected, "{acl:?}");
@@ -7113,22 +7142,24 @@ tenant_id = "tid2"
         );
     }
 
-    /// #3291 — the steps leave exactly the state the check skips on, so from
-    /// the next save on a hardened directory is left alone; and one that
-    /// drifted (an administrator granted Users) is hardened again. Taking the
-    /// directory for Administrators takes an elevated token, as #3073's case.
+    /// #3291 — on a directory that inherits all it holds, as the field's does,
+    /// the steps leave exactly the state the check skips on, so from the next
+    /// save on a hardened directory is left alone; and one that drifted (an
+    /// administrator granted Users) is hardened again. Taking the directory for
+    /// Administrators takes an elevated token, as #3073's case.
     #[cfg(windows)]
     #[test]
     fn harden_once_then_skip_until_the_directory_drifts() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("config.toml"), "x").unwrap();
-        assert!(!already_hardened(dir.path()), "a fresh directory inherits");
-        harden_machine_global_dir(dir.path());
-        if !already_hardened(dir.path()) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = inheriting_dir(temp.path());
+        std::fs::write(dir.join("config.toml"), "x").unwrap();
+        assert!(!already_hardened(&dir), "a fresh directory inherits");
+        harden_machine_global_dir(&dir);
+        if !already_hardened(&dir) {
             assert!(
                 std::env::var_os("ROOMLERD_TEST_REQUIRE_ELEVATED").is_none(),
                 "this lane must run elevated for #3291's case: {:?}",
-                dir_acl(dir.path())
+                dir_acl(&dir)
             );
             eprintln!(
                 "skipped: this token cannot make Administrators the owner; run elevated to cover #3291"
@@ -7136,17 +7167,17 @@ tenant_id = "tid2"
             return;
         }
         let granted = std::process::Command::new("icacls")
-            .arg(dir.path())
+            .arg(&dir)
             .args(["/grant", "*S-1-5-32-545:(OI)(CI)RX"])
             .output()
             .expect("icacls runs");
         assert!(granted.status.success(), "{granted:?}");
-        assert!(!already_hardened(dir.path()), "a Users grant is a drift");
-        harden_machine_global_dir(dir.path());
+        assert!(!already_hardened(&dir), "a Users grant is a drift");
+        harden_machine_global_dir(&dir);
         assert!(
-            already_hardened(dir.path()),
+            already_hardened(&dir),
             "the steps took the grant away again: {:?}",
-            dir_acl(dir.path())
+            dir_acl(&dir)
         );
     }
 }
