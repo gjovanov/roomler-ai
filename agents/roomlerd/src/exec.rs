@@ -140,6 +140,12 @@ pub struct ExecRequest {
     /// never does, so its commands start where they always have. Only a
     /// person's identity has a home to start in ([`apply_run_as_at_home`]).
     pub start_in_home: bool,
+    /// #3303 — the command belongs to a Roomler SSH session and ends with it.
+    /// On Windows it runs in a kill-on-close job, so that holds whichever way
+    /// this process leaves (`session_job`). Roomler SSH's exec channel sets it;
+    /// Fleet RPC never does, because a command there may stop this very daemon
+    /// and has to outlive it (`roomler exec … self-update`).
+    pub session_owned: bool,
 }
 
 /// What came back. Mirrors `ClientMsg::RpcResult` one-for-one.
@@ -1970,7 +1976,15 @@ impl ExecEngine {
                 win_console::StartIn::Dir(req.cwd.clone())
             };
             return win_console::run(
-                program, args, &command, start_in, timeout_ms, output, cancel, stdin,
+                program,
+                args,
+                &command,
+                start_in,
+                timeout_ms,
+                output,
+                cancel,
+                stdin,
+                req.session_owned,
             )
             .await;
         }
@@ -1998,7 +2012,13 @@ impl ExecEngine {
             // CREATE_NO_WINDOW — the daemon may run in an interactive
             // session; a console flashing on the user's desktop for every
             // diagnostic would be its own bug report.
-            cmd.creation_flags(0x0800_0000);
+            let mut flags = 0x0800_0000;
+            // #3303 — held at its first instruction until it is in its job
+            // (`session_job`), so nothing it starts can be outside.
+            if req.session_owned {
+                flags |= windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+            }
+            cmd.creation_flags(flags);
         }
         #[cfg(unix)]
         {
@@ -2035,6 +2055,17 @@ impl ExecEngine {
             Err(e) => return ExecOutcome::failed(format!("failed to start {program:?}: {e}")),
         };
         let pid = child.id();
+
+        // `kill_on_drop` ends a child that never ran, on the failure's return.
+        #[cfg(windows)]
+        let job = if req.session_owned {
+            match session_job::start(&child) {
+                Ok(job) => job,
+                Err(e) => return ExecOutcome::failed(format!("failed to start {program:?}: {e}")),
+            }
+        } else {
+            None
+        };
 
         let feeder = stdin.map(|feed| tokio::spawn(feed_child_stdin(child.stdin.take(), feed)));
 
@@ -2074,10 +2105,14 @@ impl ExecEngine {
                 Err(e) => (None, Some(format!("waiting for the command failed: {e}"))),
             },
             _ = &mut timeout => {
+                #[cfg(windows)]
+                session_job::end(job.as_ref());
                 kill_tree(&mut child, pid).await;
                 (None, Some(format!("timed out after {}ms", timeout_ms.unwrap_or_default())))
             }
             _ = &mut cancel => {
+                #[cfg(windows)]
+                session_job::end(job.as_ref());
                 kill_tree(&mut child, pid).await;
                 (None, Some("cancelled by the caller".to_string()))
             }
@@ -2089,8 +2124,17 @@ impl ExecEngine {
             feeder.abort();
         }
 
-        let (stdout_bytes, out_trunc) = out_task.await.unwrap_or_default();
-        let (stderr_bytes, err_trunc) = err_task.await.unwrap_or_default();
+        let readers = async {
+            (
+                out_task.await.unwrap_or_default(),
+                err_task.await.unwrap_or_default(),
+            )
+        };
+        #[cfg(windows)]
+        let (readers, error) = session_job::finish(job, readers, &mut cancel, error).await;
+        #[cfg(not(windows))]
+        let readers = readers.await;
+        let ((stdout_bytes, out_trunc), (stderr_bytes, err_trunc)) = readers;
 
         // The text views are filled after redaction (`run_fed`).
         ExecOutcome {
@@ -2325,8 +2369,10 @@ async fn kill_tree(child: &mut tokio::process::Child, pid: Option<u32>) {
     #[cfg(windows)]
     {
         if let Some(pid) = pid {
-            // `taskkill /T` is the only way to reach grandchildren without
-            // building a Job Object around every spawn.
+            // `taskkill /T` reaches grandchildren with no job around the spawn.
+            // A Fleet RPC command has none on purpose, because it may stop this
+            // daemon and has to outlive it. A session's has one (`session_job`),
+            // and this is the fallback if it could not be made.
             kill_tree_pid(pid).await;
         }
     }
@@ -2500,6 +2546,7 @@ mod tests {
             caller: "test".into(),
             run_as: RunAs::Daemon,
             start_in_home: false,
+            session_owned: false,
         }
     }
 
@@ -3467,12 +3514,23 @@ mod win_console {
         let Some(cmdline) = build_program_cmdline(program) else {
             return ExecOutcome::failed(format!("not a program path: {program}"));
         };
-        run_cmdline(cmdline, StartIn::Profile, None, output, cancel, stdin).await
+        // No job: `sftp-server` starts nothing, and ends on its stdin's EOF when
+        // this process goes.
+        run_cmdline(
+            cmdline,
+            StartIn::Profile,
+            None,
+            output,
+            cancel,
+            stdin,
+            false,
+        )
+        .await
     }
 
     /// Spawn a shell command as the console user ([`run_cmdline`]), started
     /// in `start_in`.
-    // 8 params: the same set `spawn_and_wait` hands over, one for one.
+    // 9 params: the same set `spawn_and_wait` hands over, one for one.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run(
         program: &str,
@@ -3483,9 +3541,19 @@ mod win_console {
         output: Output,
         cancel: impl std::future::Future<Output = ()>,
         stdin: Option<super::StdinFeed>,
+        session_owned: bool,
     ) -> ExecOutcome {
         let cmdline = build_cmdline(program, args, command);
-        run_cmdline(cmdline, start_in, timeout_ms, output, cancel, stdin).await
+        run_cmdline(
+            cmdline,
+            start_in,
+            timeout_ms,
+            output,
+            cancel,
+            stdin,
+            session_owned,
+        )
+        .await
     }
 
     /// Spawn as the console user, drain both pipes, enforce the bounds.
@@ -3496,6 +3564,8 @@ mod win_console {
     /// `docs/roomler-ssh.md` note that `CreateProcessAsUserW` had "no pipes
     /// variant" was outdated the day this module shipped (P5b); what was
     /// missing was a drain that hands bytes on instead of collecting them.
+    // 7 params: `run`'s, past its command line.
+    #[allow(clippy::too_many_arguments)]
     async fn run_cmdline(
         cmdline: String,
         start_in: StartIn,
@@ -3503,6 +3573,7 @@ mod win_console {
         output: Output,
         cancel: impl std::future::Future<Output = ()>,
         stdin: Option<super::StdinFeed>,
+        session_owned: bool,
     ) -> ExecOutcome {
         let with_stdin = stdin.is_some();
 
@@ -3557,8 +3628,9 @@ mod win_console {
         // stall every other session on this device.
         let spawned = tokio::task::spawn_blocking(move || {
             // SAFETY: `token` is a live user token, alive for the call.
-            let child = unsafe {
-                supervisor::spawn_in_session_captured(
+            let (child, job) = unsafe {
+                super::session_job::spawn_as_console_user(
+                    session_owned,
                     token.raw(),
                     &cmdline,
                     cwd.as_deref().map(std::path::Path::new),
@@ -3621,11 +3693,11 @@ mod win_console {
                 }
             };
 
-            Ok::<_, anyhow::Error>((process, pid, out_t, err_t, stdin_pipe))
+            Ok::<_, anyhow::Error>((process, pid, out_t, err_t, stdin_pipe, job))
         })
         .await;
 
-        let (process, pid, out_t, err_t, stdin_pipe) = match spawned {
+        let (process, pid, out_t, err_t, stdin_pipe, job) = match spawned {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return ExecOutcome::failed(format!("spawn as console user failed: {e}")),
             Err(e) => return ExecOutcome::failed(format!("spawn task panicked: {e}")),
@@ -3667,11 +3739,13 @@ mod win_console {
         let error = tokio::select! {
             _ = &mut wait => None,
             _ = &mut timeout => {
+                super::session_job::end(job.as_ref());
                 super::kill_tree_pid(pid).await;
                 process.terminate();
                 Some(format!("timed out after {}ms", timeout_ms.unwrap_or_default()))
             }
             _ = &mut cancel => {
+                super::session_job::end(job.as_ref());
                 super::kill_tree_pid(pid).await;
                 process.terminate();
                 Some("cancelled by the caller".to_string())
@@ -3687,13 +3761,16 @@ mod win_console {
         // The drain threads end when the pipes hit EOF, which the kill above
         // guarantees even in the timeout path — the child's handles close when
         // it dies. Joining on a blocking pool keeps the runtime free.
-        let joined = tokio::task::spawn_blocking(move || {
-            let (o, ot) = out_t.join().unwrap_or_default();
-            let (e, et) = err_t.join().unwrap_or_default();
-            (o, ot, e, et)
-        })
-        .await
-        .unwrap_or_default();
+        let joined = async {
+            tokio::task::spawn_blocking(move || {
+                let (o, ot) = out_t.join().unwrap_or_default();
+                let (e, et) = err_t.join().unwrap_or_default();
+                (o, ot, e, et)
+            })
+            .await
+            .unwrap_or_default()
+        };
+        let (joined, error) = super::session_job::finish(job, joined, &mut cancel, error).await;
         let (out_bytes, out_trunc, err_bytes, err_trunc) = joined;
 
         let exit_code = match process.try_wait() {
@@ -3766,5 +3843,533 @@ mod win_console {
             );
             assert_eq!(build_program_cmdline(r#"C:\a" -x "b.exe"#), None);
         }
+    }
+}
+
+/// #3303 — a Roomler SSH command, and what it started, end with a lost session
+/// on Windows: the client gone, or this daemon gone by any route.
+///
+/// It rests on the kernel, not on code running. A process-wide exit runs no
+/// destructor (a crash, the service host's terminate, the runtime's budget in
+/// `runtime_exit`), so the `kill_on_drop` and `taskkill /T` this engine has
+/// otherwise cannot keep the promise, and a grandchild is out of `kill_on_drop`'s
+/// reach anyway. A kill-on-close job needs neither: the kernel closes the handle
+/// as this process goes, and ends every process in the job. The handle is not
+/// inheritable, so no child can hold it open past the daemon.
+///
+/// A Fleet RPC command never gets one, because it may stop this very daemon and
+/// has to outlive it (`roomler exec … self-update`).
+///
+/// A command that ENDS by itself lost nothing, so what it deliberately left
+/// running stays, the job let go: `ssh node 'Start-Process msiexec …'` returns
+/// at once, and that installer has to go on. An interactive shell's `exit` is
+/// different, its session is over and its job closes (`pty/windows.rs`).
+///
+/// A job was never a boundary against persistence: a process in it can ask
+/// another one to start something (`schtasks`, WMI, COM, a service), and that
+/// one is outside. `docs/roomler-ssh.md` says what is guaranteed.
+#[cfg(windows)]
+mod session_job {
+    use std::future::Future;
+    use std::path::Path;
+
+    use tracing::warn;
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    use crate::win_service::supervisor::{self, CapturedChild, JobObject, SpawnAs};
+
+    /// The same words as the pty's: a fleet log search finds both.
+    const NO_JOB: &str =
+        "ssh: could not put the session in a job object — descendants may outlive it";
+
+    /// Put a child that `CREATE_SUSPENDED` holds at its first instruction in a
+    /// job, then let it run. A session with no job loses the guarantee, not the
+    /// shell: this may be the operator's one way into the box, so it says so and
+    /// goes on. `Err` means it could not run, and the caller ends it.
+    pub(super) fn start(child: &tokio::process::Child) -> Result<Option<JobObject>, String> {
+        let (Some(process), Some(pid)) = (child.raw_handle(), child.id()) else {
+            return Err("the process is gone before it ran".to_string());
+        };
+        let job = JobObject::kill_on_close().and_then(|job| {
+            job.assign(process)?;
+            Ok(job)
+        });
+        let job = match job {
+            Ok(job) => Some(job),
+            Err(e) => {
+                warn!(%e, "{NO_JOB}");
+                None
+            }
+        };
+        supervisor::resume_suspended_process(pid).map_err(|e| e.to_string())?;
+        Ok(job)
+    }
+
+    /// [`supervisor::spawn_in_session_captured`], in a job when `session_owned`,
+    /// with [`start`]'s fallback: a process that could not join its job never
+    /// ran, so starting it again has no double effect.
+    ///
+    /// # Safety
+    /// `token` must be a live primary token, kept alive across the call.
+    pub(super) unsafe fn spawn_as_console_user(
+        session_owned: bool,
+        token: HANDLE,
+        cmdline: &str,
+        cwd: Option<&Path>,
+        with_stdin: bool,
+    ) -> anyhow::Result<(CapturedChild, Option<JobObject>)> {
+        if session_owned {
+            let started = JobObject::kill_on_close().and_then(|job| {
+                // SAFETY: the caller's promise about `token`.
+                let child = unsafe {
+                    supervisor::spawn_into_job(
+                        SpawnAs::User(token),
+                        cmdline,
+                        cwd,
+                        &[],
+                        with_stdin,
+                        &job,
+                    )
+                }?;
+                Ok((child, job))
+            });
+            match started {
+                Ok((child, job)) => return Ok((child, Some(job))),
+                Err(e) => warn!(%e, "{NO_JOB}"),
+            }
+        }
+        // SAFETY: the caller's promise about `token`.
+        let child =
+            unsafe { supervisor::spawn_in_session_captured(token, cmdline, cwd, with_stdin) }?;
+        Ok((child, None))
+    }
+
+    /// End every process in the session. Asynchronous, as `TerminateProcess` is:
+    /// the pipes reaching EOF is what says they are gone.
+    pub(super) fn end(job: Option<&JobObject>) {
+        if let Some(job) = job
+            && let Err(e) = job.terminate(1)
+        {
+            warn!(%e, "ssh: could not end the session's job");
+        }
+    }
+
+    /// The command is over: wait for its output, and settle what it left.
+    ///
+    /// Something it started may hold its output pipes, and the run waits on
+    /// those for as long as that lives, so a client gone has to end this wait
+    /// too. With no job there is nothing to end, and the wait is as it always
+    /// was. A command that ended by itself has its job let go. `Drop` ends what
+    /// is left in any other case, this function's own cancellation included.
+    ///
+    /// `cancel` is polled only with `error` empty: an `error` is a `cancel` that
+    /// has already fired, or a command this run is giving up on.
+    pub(super) async fn finish<T>(
+        job: Option<JobObject>,
+        readers: impl Future<Output = T>,
+        cancel: impl Future<Output = ()>,
+        error: Option<String>,
+    ) -> (T, Option<String>) {
+        let Some(job) = job else {
+            return (readers.await, error);
+        };
+        if error.is_some() {
+            end(Some(&job));
+            return (readers.await, error);
+        }
+        tokio::pin!(readers);
+        tokio::select! {
+            out = &mut readers => {
+                if let Err(e) = job.let_go() {
+                    warn!(%e, "ssh: could not let go of a finished command's job");
+                }
+                (out, None)
+            }
+            _ = cancel => {
+                end(Some(&job));
+                (readers.await, Some("cancelled by the caller".to_string()))
+            }
+        }
+    }
+}
+
+/// #3303 — nothing outlives a Roomler SSH session, on Windows. A daemon that
+/// leaves runs none of its destructors for certain (a crash, the service host's
+/// terminate, the watchdog's `exit(2)`), so these tests leave the way those do:
+/// a copy of this test binary plays the daemon, starts the session, and calls
+/// `exit`. What the session started is watched from outside it.
+#[cfg(all(test, windows))]
+pub(crate) mod session_lifetime {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    };
+
+    use super::*;
+
+    const STAND_IN: &str = "ROOMLERD_TEST_STAND_IN_DAEMON";
+    /// Under the whole Windows suite a PowerShell one-liner took 8-10+ s on the
+    /// 4-core runner (#3002).
+    const COMMAND_STARTS_WITHIN: Duration = Duration::from_secs(120);
+    /// How long a process of the session may take to be gone, on a loaded
+    /// runner. The kernel ends a job's processes as its last handle closes.
+    pub(crate) const GONE_WITHIN: Duration = Duration::from_secs(15);
+    /// How long a process that must survive is watched for.
+    const STILL_THERE_FOR: Duration = Duration::from_secs(3);
+
+    /// One process, held by a handle, so a reused pid cannot answer for it. A
+    /// test leaves none running, whatever it found.
+    pub(crate) struct Watched(HANDLE);
+
+    impl Watched {
+        pub(crate) fn open(pid: u32) -> Self {
+            // SAFETY: a documented call; the handle is owned from here on.
+            let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+            assert!(!h.is_null(), "process {pid} is gone before it was watched");
+            Self(h)
+        }
+
+        pub(crate) fn gone_within(&self, within: Duration) -> bool {
+            // SAFETY: a live handle opened with SYNCHRONIZE.
+            unsafe { WaitForSingleObject(self.0, within.as_millis() as u32) == WAIT_OBJECT_0 }
+        }
+    }
+
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            // SAFETY: a live handle opened with TERMINATE, closed once.
+            unsafe {
+                TerminateProcess(self.0, 1);
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// What a stand-in was started to do, when this process is one.
+    pub(crate) fn stand_in_args() -> Option<(String, PathBuf)> {
+        let spec = std::env::var(STAND_IN).ok()?;
+        let (mode, dir) = spec.split_once('|')?;
+        Some((mode.to_string(), PathBuf::from(dir)))
+    }
+
+    /// In the stand-in: leave when told, the way a crash leaves. `exit` runs no
+    /// destructor of anything a task holds.
+    pub(crate) fn exit_when_told(dir: &Path) -> ! {
+        while !dir.join("go").exists() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::process::exit(0)
+    }
+
+    /// PowerShell that starts a long `ping` and writes this shell's pid and its
+    /// to `<dir>\started`, the last thing it does before `then`. No double
+    /// quote in it: the pty's command line does not quote what it is given.
+    pub(crate) fn starts_a_child_then(dir: &Path, then: &str) -> String {
+        format!(
+            "$p = Start-Process ping.exe -ArgumentList '-n','300','127.0.0.1' -WindowStyle Hidden \
+             -PassThru; Set-Content -LiteralPath '{}' -Value ('{{0}} {{1}}' -f $PID, $p.Id); {then}",
+            dir.join("started").display()
+        )
+    }
+
+    /// A copy of this test binary, playing the daemon.
+    pub(crate) struct StandIn {
+        child: std::process::Child,
+        dir: PathBuf,
+    }
+
+    impl StandIn {
+        /// `stand_in_test` is the full name of the test that plays the part.
+        pub(crate) fn start(stand_in_test: &str, mode: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "roomlerd-3303-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([stand_in_test, "--exact", "--nocapture", "--test-threads=1"])
+                .env(STAND_IN, format!("{mode}|{}", dir.display()))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("a copy of this test binary");
+            Self { child, dir }
+        }
+
+        /// The shell's pid and its child's, once the session has reported them.
+        fn reported_pids(&self) -> Vec<u32> {
+            let started = self.dir.join("started");
+            let deadline = Instant::now() + COMMAND_STARTS_WITHIN;
+            loop {
+                let pids: Vec<u32> = std::fs::read_to_string(&started)
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                if pids.len() == 2 {
+                    return pids;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the session reported no processes: did the stand-in run?"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        /// The processes the session reports, watched from here.
+        pub(crate) fn wait_for_its_processes(&self) -> Vec<Watched> {
+            self.reported_pids()
+                .into_iter()
+                .map(Watched::open)
+                .collect()
+        }
+
+        /// What the session's shell started, alone: a shell that ends as soon
+        /// as it has reported may be gone before anyone can watch it.
+        fn wait_for_what_it_started(&self) -> Watched {
+            Watched::open(self.reported_pids()[1])
+        }
+
+        /// Tell the stand-in to leave, and see it gone.
+        pub(crate) fn exit(mut self) {
+            std::fs::write(self.dir.join("go"), b"").unwrap();
+            let deadline = Instant::now() + GONE_WITHIN;
+            while self.child.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "the stand-in did not leave");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        fn wait_for(&self, name: &str) {
+            let deadline = Instant::now() + COMMAND_STARTS_WITHIN;
+            while !self.dir.join(name).exists() {
+                assert!(Instant::now() < deadline, "the stand-in never wrote {name}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn req(command: String, session_owned: bool) -> ExecRequest {
+        ExecRequest {
+            request_id: "t3303".into(),
+            shell: String::new(),
+            command,
+            timeout_ms: 300_000,
+            max_output_bytes: 0,
+            cwd: None,
+            caller: "test".into(),
+            run_as: RunAs::Daemon,
+            start_in_home: false,
+            session_owned,
+        }
+    }
+
+    const STAND_IN_TEST: &str = "exec::session_lifetime::the_stand_in_daemon";
+
+    /// Not a test by itself: a copy of the test binary runs it to play the
+    /// daemon. An ordinary run has no stand-in to play, and passes.
+    #[test]
+    fn the_stand_in_daemon() {
+        let Some((mode, dir)) = stand_in_args() else {
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hold = "Start-Sleep -Seconds 300";
+        let redactor = Redactor::default();
+        let engine = ExecEngine::new();
+        match mode.as_str() {
+            // Roomler SSH's path, with the session open.
+            "session" => {
+                let (sink, chunks) = tokio::sync::mpsc::channel::<Chunk>(8);
+                std::mem::forget(chunks);
+                let req = req(starts_a_child_then(&dir, hold), true);
+                rt.spawn(async move {
+                    engine
+                        .run_streamed(
+                            req,
+                            &redactor,
+                            None,
+                            sink,
+                            tokio_util::sync::CancellationToken::new(),
+                        )
+                        .await
+                });
+            }
+            // Fleet RPC's path, with the command running.
+            "fleet" => {
+                let req = req(starts_a_child_then(&dir, hold), false);
+                rt.spawn(async move { engine.run(req, &redactor).await });
+            }
+            // Roomler SSH's path, a command that left a child and ended.
+            "ended" => {
+                let (sink, chunks) = tokio::sync::mpsc::channel::<Chunk>(8);
+                std::mem::forget(chunks);
+                let outcome = rt.block_on(engine.run_streamed(
+                    req(starts_a_child_then(&dir, "exit 0"), true),
+                    &redactor,
+                    None,
+                    sink,
+                    tokio_util::sync::CancellationToken::new(),
+                ));
+                assert_eq!(outcome.error, None);
+                std::fs::write(dir.join("returned"), b"").unwrap();
+            }
+            other => panic!("no such stand-in: {other}"),
+        }
+        exit_when_told(&dir);
+    }
+
+    /// The field's orphan (#3303): the daemon goes, and the command and what it
+    /// started end with it, with no code of the daemon's running to do it.
+    #[test]
+    fn a_sessions_command_and_what_it_started_end_with_the_daemon() {
+        let daemon = StandIn::start(STAND_IN_TEST, "session");
+        let processes = daemon.wait_for_its_processes();
+        daemon.exit();
+        for (what, p) in ["the session's shell", "what it started"]
+            .iter()
+            .zip(&processes)
+        {
+            assert!(p.gone_within(GONE_WITHIN), "{what} outlived the daemon");
+        }
+    }
+
+    /// The other side of the same line: `roomler exec … self-update` stops the
+    /// daemon, and its installer and watcher must go on (#2718). Also the
+    /// control for the test above: a process it says is gone would be here.
+    #[test]
+    fn a_fleet_rpc_command_and_what_it_started_outlive_the_daemon() {
+        let daemon = StandIn::start(STAND_IN_TEST, "fleet");
+        let processes = daemon.wait_for_its_processes();
+        daemon.exit();
+        for (what, p) in ["the command's shell", "what it started"]
+            .iter()
+            .zip(&processes)
+        {
+            assert!(
+                !p.gone_within(STILL_THERE_FOR),
+                "{what} ended with the daemon"
+            );
+        }
+    }
+
+    /// A command that started something and ENDED lost nothing to a stop:
+    /// `ssh node 'Start-Process msiexec …'` returns at once, and that installer
+    /// has to go on. It stays through the command's end and the daemon's leaving.
+    #[test]
+    fn what_a_command_left_running_when_it_ended_stays() {
+        let daemon = StandIn::start(STAND_IN_TEST, "ended");
+        let left = daemon.wait_for_what_it_started();
+        daemon.wait_for("returned");
+        assert!(
+            !left.gone_within(STILL_THERE_FOR),
+            "it ended with the command"
+        );
+        daemon.exit();
+        assert!(
+            !left.gone_within(STILL_THERE_FOR),
+            "it ended with the daemon"
+        );
+    }
+
+    /// A client gone ends what `taskkill /T` cannot reach: a process whose
+    /// parent has already exited is in no tree the shell leads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_client_gone_ends_a_process_whose_parent_already_left() {
+        let dir = std::env::temp_dir().join(format!(
+            "roomlerd-3303-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let started = dir.join("started");
+        // The inner shell starts `ping` and leaves; this one stays.
+        let inner = format!(
+            "$p = Start-Process ping.exe -ArgumentList '-n','300','127.0.0.1' -WindowStyle Hidden \
+             -PassThru; Set-Content -LiteralPath '{}' -Value $p.Id",
+            started.display()
+        );
+        let command = format!(
+            "$inner = @'\n{inner}\n'@\npowershell.exe -NoProfile -NonInteractive -Command $inner\n\
+             Start-Sleep -Seconds 300"
+        );
+        let (sink, _chunks) = tokio::sync::mpsc::channel::<Chunk>(8);
+        let abort = tokio_util::sync::CancellationToken::new();
+        let run = {
+            let abort = abort.clone();
+            tokio::spawn(async move {
+                ExecEngine::new()
+                    .run_streamed(req(command, true), &Redactor::default(), None, sink, abort)
+                    .await
+            })
+        };
+        let deadline = Instant::now() + COMMAND_STARTS_WITHIN;
+        let left = loop {
+            let pid = std::fs::read_to_string(&started)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            if let Some(pid) = pid {
+                break Watched::open(pid);
+            }
+            assert!(Instant::now() < deadline, "the command reported no process");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        abort.cancel();
+        tokio::time::timeout(GONE_WITHIN, run)
+            .await
+            .expect("the run ends once its client is gone")
+            .unwrap();
+        let gone = left.gone_within(GONE_WITHIN);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(gone, "a process whose parent had left outlived the client");
+    }
+
+    /// The shell has exited and something it started holds its output pipes, so
+    /// the run waits on them. A client gone has to end that wait too: the run
+    /// used to sit there, permit held, for as long as that process lived.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_client_gone_ends_a_process_holding_the_output_pipes() {
+        let mut req = req("start /b ping -n 120 127.0.0.1".to_string(), true);
+        req.shell = "cmd".to_string();
+        let (sink, mut chunks) = tokio::sync::mpsc::channel::<Chunk>(8);
+        let abort = tokio_util::sync::CancellationToken::new();
+        let run = {
+            let abort = abort.clone();
+            tokio::spawn(async move {
+                ExecEngine::new()
+                    .run_streamed(req, &Redactor::default(), None, sink, abort)
+                    .await
+            })
+        };
+        // `ping` printing means it runs, on the pipes the shell gave it. The
+        // first reply is a second in, and `cmd /C` has left by then.
+        tokio::time::timeout(COMMAND_STARTS_WITHIN, chunks.recv())
+            .await
+            .expect("output from the process that holds the pipes")
+            .expect("the run is still going");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        abort.cancel();
+        tokio::spawn(async move { while chunks.recv().await.is_some() {} });
+        tokio::time::timeout(GONE_WITHIN, run)
+            .await
+            .expect("the run ends once its client is gone")
+            .unwrap();
     }
 }

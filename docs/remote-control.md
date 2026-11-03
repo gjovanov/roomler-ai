@@ -250,7 +250,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2856`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:191`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:372`, wired at `app.rs:4404`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1016`, `delegate.rs:1058`; the worker side is `delegate_worker.rs:385`, wired at `app.rs:4856`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -716,7 +716,7 @@ and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5662`](../agents/roomlerd/src/peer.rs#L5662); the viewer parses it
 at [`useRemoteControl.ts:1690`](../ui/src/composables/useRemoteControl.ts#L1690)
 and puts it on the toggle's title
-([`RemoteControl.vue:3752`](../ui/src/views/remote/RemoteControl.vue#L3752)).
+([`RemoteControl.vue:3753`](../ui/src/views/remote/RemoteControl.vue#L3753)).
 
 | `code` | Means |
 |---|---|
@@ -821,7 +821,7 @@ sequenceDiagram
 - **The decision is one pure function**
   ([`sas.rs:97`](../agents/roomlerd/src/input/sas.rs#L97)), compiled on every
   OS so the lanes that never run Windows tests check it. It is made at every
-  announcement ([`signaling.rs:7382`](../agents/roomlerd/src/signaling.rs#L7382)),
+  announcement ([`signaling.rs:7385`](../agents/roomlerd/src/signaling.rs#L7385)),
   and the heartbeat re-announces the moment its answer changes, so a policy a
   GPO refresh changes reaches the server within a beat. Where it says no, the
   `keys-only` entry stays and its reason names the half that is missing.
@@ -1681,7 +1681,7 @@ composition.
 
 ⚠️ **A paste has one owner too** (#2910). Two `paste` listeners sit on
 `window`: the files drawer's `onWindowPasteForDrawer`
-(`RemoteControl.vue:3471`), registered at mount (`:5714`), and the deferred
+(`RemoteControl.vue:3472`), registered at mount (`:5715`), and the deferred
 Ctrl+V's `onPaste` (`useRemoteControl.ts:12423`), registered later by
 `attachInput` (`:12006`). Same node, same phase, so the drawer's runs
 **first** — and `preventDefault` stops no other listener on the same node.
@@ -1695,7 +1695,7 @@ upload (`:11843`). Whichever listener runs first owns the paste, so a future
 change to the registration order cannot bring the double back. With the
 drawer open, a files paste that does reach `onPaste` — one aimed at the soft
 keyboard's textarea, which the drawer leaves to it as a form field — uploads
-into the drawer's directory as well (`RemoteControl.vue:5656`).
+into the drawer's directory as well (`RemoteControl.vue:5657`).
 
 ```mermaid
 flowchart TD
@@ -2687,6 +2687,10 @@ Break-glass ("Force control") is not offered there: the person's Disconnect is a
 explicit stop, and an override as the suggested next step would undercut it
 (operator decision, 2026-10-10). Break-glass itself is unchanged. It is still on a
 fresh page, still needs a reason, and is still audited and notified to the owner.
+The external viewer never offers it, however its session ended (#3258): the reason
+rides `rc:session.request`, which an outsider's session never sends. One rule decides
+both cases, `offersBreakGlass` (`ui/src/composables/breakGlass.ts:18`), and
+`rcBreakGlassOffer.spec.ts` pins that the button renders under it.
 
 **Measured** on the macOS banner, 2026-10-09, agent 0.4.121 with the P10 image
 (the FR-27 field log):
@@ -2885,7 +2889,7 @@ hears the terminate and `merge_live_stats` matches nothing. So a session with no
 observation — overwhelmingly a short one — recorded none, which the freeze reads as `unknown`. Since
 P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:951`)
 and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2633`), by the
-same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:7268`) queues the sample on
+same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:7271`) queues the sample on
 **the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:288`) — the loop's outbound
 queue for its own session, flushed to the WS one hop later, or the delegation channel for a delegated
 session, so a supervised Mac's sample reaches the server under the daemon's identity, the one the
@@ -4370,7 +4374,7 @@ is silent while it waits.
   Only the loop waiting for its next event reads `select`.
 - A `ws.text` arm is refined to the message it is handling, read
   from the JSON's `t` (`ws.text:rc:ssh.response`; `server_msg_tag`,
-  `agents/roomlerd/src/signaling.rs:6976`). The dispatch awaits per
+  `agents/roomlerd/src/signaling.rs:6979`). The dispatch awaits per
   message, so that is where a stall inside it shows.
 - The `StageGuard` (`watchdog.rs:446`) puts the pump back to
   `select` when the arm's scope ends, however it ends. An arm that
@@ -4719,7 +4723,7 @@ which has no API (`boot_id.rs`). Measured on a Win11 guest: the registry's
 copy and KUSER both read 7 before three restarts and 10 after.
 
 ⚠️ **The bookkeeping runs after preflight**
-([`agents/roomlerd/src/app.rs:4240`](../agents/roomlerd/src/app.rs#L4240),
+([`agents/roomlerd/src/app.rs:4243`](../agents/roomlerd/src/app.rs#L4243),
 a 15 s budget). A daemon that dies before it is not counted, and marks
 nothing. This is the one crash loop the ladder cannot see.
 

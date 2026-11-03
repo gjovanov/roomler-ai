@@ -149,7 +149,7 @@ A host without the helper (an install from before this FR) keeps today's path un
 ### 3.3 Onto the new binary (P2b, as built)
 
 The per-user daemon notices for itself (D2): `agents/roomlerd/src/replaced_binary.rs`, spawned beside the updater
-(`app.rs:5505-5512`) on a Linux, non-root daemon whose kill switch is unset and whose supervisor will relaunch it
+(`app.rs:5572-5579`) on a Linux, non-root daemon whose kill switch is unset and whose supervisor will relaunch it
 (`spawn`, `replaced_binary.rs:241-265`). ONE mechanism serves the helper's install, an admin's `apt upgrade` and a
 hand install alike, and the helper never speaks to a daemon.
 
@@ -164,7 +164,7 @@ hand install alike, and the helper never speaks to a daemon.
 
 - ⚠️ **An SSH session counts as a session.** The likeliest replacement outside the helper is an admin's
   `apt upgrade` typed into a roomler SSH session on that very device. `ssh.rs` now counts its open connections
-  (`live_connections`, `ssh.rs:2779-2789`), and the restart waits for them.
+  (`live_connections`, `ssh.rs:2801-2811`), and the restart waits for them.
 - **`auto_update = false` does not stop it.** Running what is already installed is not an update. The kill switch
   is the FR's, `ROOMLERD_UPDATE_HELPER=0` (AC7).
 - **Root daemons are unchanged** (AC4). An admin's `apt upgrade` on a system install still leaves the root daemon
@@ -243,8 +243,8 @@ at `:452` and `:461-469`):
   as a real install leaves it). It failed that row and restarted onto a binary that cannot run on the first cut,
   and passes all 14 cases on this one (§8).
 - **`roomlerd self-update`**, run by a non-root user on a host whose helper owns updates, wakes the helper instead
-  of failing (`app.rs:6178-6194`). It asks the daemon's own decision, `helper_owns_updates`
-  (`updater.rs:4259-4267`), so the CLI and the daemon never disagree. Root keeps the direct path; `--check-only`
+  of failing (`app.rs:6261-6277`). It asks the daemon's own decision, `helper_owns_updates`
+  (`updater.rs:4264-4272`), so the CLI and the daemon never disagree. Root keeps the direct path; `--check-only`
   touches nothing. On a daemon host `roomler self-update` already refuses and names `roomlerd self-update`.
 - **`README.Debian`**'s manual desktop flow enables the helper before the daemon starts, and says to leave it off
   with the system unit.

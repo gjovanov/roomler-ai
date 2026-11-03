@@ -68,6 +68,11 @@ to a 1 h cap over a 24 h window. It is the device's, and a server cannot refund 
 An outsider never holds `RECORD` or `PRIVACY`, at the Hub or on the device, whatever a
 ceiling says, and a frame naming a `local_relay` is refused and logged.
 
+Nor is an outsider offered break-glass. When their session ends, the viewer offers
+**Force control** to members only (`offersBreakGlass`,
+`ui/src/composables/breakGlass.ts:18`, #3258). Its reason rides `rc:session.request`,
+and an outsider's session starts from `rc:extauth.session` and never sends that frame.
+
 ## 3. What each side is told
 
 The outsider gets one coarse word. The org's log gets the reason.

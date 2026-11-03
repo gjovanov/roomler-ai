@@ -2223,7 +2223,7 @@ bash elsewhere.
 > - **A ticket is no lease**, and it is **recorded before it is given**, as
 >   a grant is (§21).
 > - **It is never logged by a daemon.** `rc:vault.ssh.granted` has an arm of
->   its own ([`signaling.rs:6688`](../agents/roomlerd/src/signaling.rs#L6688)),
+>   its own ([`signaling.rs:6691`](../agents/roomlerd/src/signaling.rs#L6691)),
 >   where the catch-all below would print the frame and the ticket with it.
 >   Since P3-8-2b-1 it answers the asker, on the primary's connection only, as
 >   a lease is; the ticket's `Debug` names it by its id alone.
