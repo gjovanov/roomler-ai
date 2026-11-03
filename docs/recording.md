@@ -396,6 +396,11 @@ writer, or, before the writer's first fragment, **delete it as
 unrecoverable**. `a_live_partial_is_left_alone_by_the_reconciler` is red with
 the lock disabled.
 
+A recorder's own WGC capture can end it during the remux. `docs/remote-control.md`
+§5.1 has that fault, which was over a moving screen, and its fix. A recording of a
+few seconds exits before the capture thread leaves its apartment, so it never gets
+that far.
+
 ## 6. Recording through the daemon — the local verbs (P2a)
 
 The person at the device records through the running daemon: from
