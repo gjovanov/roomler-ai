@@ -311,8 +311,9 @@ cascade's guarantees while replacing its reactive counters:
   which is what lets the tight window judge a *fresh* initiation.
   Two bounds keep it safe: only ESTABLISHED **direct** carriers are armed, and
   the chattier addr/iface cause (a virtual adapter blinking, a lease renewal —
-  up to once per 3 s, vs. one Major per 120 s) still arms its poke on the
-  **tier** deadline. The residual hole is now dominated by netstate's own
+  up to once per 3 s for a real move and once per 60 s for a burst that moved
+  nothing, vs. one Major per 120 s) still arms its poke on the **tier**
+  deadline. The residual hole is now dominated by netstate's own
   debounce (0.75 s, capped at 3 s during a signal storm), which is deliberate
   flap damping — see `MAJOR_PUBLISH_COOLDOWN`.
   ⚠️ The trade: a 2 s window judges ONE initiation where 12 s judges 2-3, so a
@@ -321,6 +322,52 @@ cascade's guarantees while replacing its reactive counters:
   re-upgrades (no strike is booked, so the tier stays eligible), while a late
   conviction is 100 % loss for its whole duration. The conviction log line
   carries `from_major=` so the field can measure whether it is ever too eager.
+- **The net-change gate (FR-65 P3).** A burst that moved nothing the snapshot
+  models (`material=false`: `netstate::diff` found no default-route move, no
+  address delta and no capture change) arms the forced poke at most once per
+  `overlay_netchange_poke_quiet_secs` (default 60 s). A material delta checks
+  the LAN set and pokes at once, whatever ran a moment before
+  (`lifecycle::netchange_action`). Before the gate, one 3 s stamp covered both,
+  so a VPN adapter gaining its address just after a no-delta burst got no
+  regather, no poke and no LAN check.
+
+  ```mermaid
+  flowchart TD
+      D[netstate delta] --> S{addr or iface signal?}
+      S -- "no: route-only" --> RW[route wave only<br/>an erased peer /32 is repaired as before]
+      S -- yes --> M{material?}
+      M -- yes --> CP[check and poke now]
+      M -- no --> F{3 s since the last check?}
+      F -- no --> N[nothing]
+      F -- yes --> Q{quiet window since the last poke?}
+      Q -- yes --> CP
+      Q -- no --> C[check only<br/>the silence trigger covers the carriers]
+  ```
+
+  What it fixed, read from production `agent_logs` over the 7 days to
+  2026-11-03: a Wi-Fi adapter's parameter notifications alone
+  (`NotifyIpInterfaceChange` with `MibParameterNotification`, one per address
+  family, no route or address signal) made a no-delta burst about 20 times a
+  minute on an idle desk. Each one force-rekeyed every direct peer: 112,684
+  pokes in a week on one host, peaking at 150 a minute. The rekeys were the
+  smaller cost. Each burst also **re-armed** a poke still in flight, and a
+  re-arm restarts its deadline, so the chatter postponed the verdict on exactly
+  the carriers that had died: 11 carriers behind a full-tunnel capture were
+  convicted at +31 s instead of +15 s.
+
+  | Replay of the gate over that week | Before | With the gate |
+  |---|---:|---:|
+  | Forced pokes, every device | 205,892 | 63,747 |
+  | Peak pokes per minute, the noisiest host | 150 | 46 |
+  | Revalidation failures that began on a poke the gate drops | 56 of 2,136 | 0 |
+  | of those, back on direct within 2 min | 37 | — |
+
+  The cost is the other 19: a carrier that dies inside the quiet window, right
+  behind a no-delta poke it answered, waits for the silence trigger instead
+  (at most `POKE_SILENCE_AFTER`, 30 s, later). The window is kept above that
+  trigger on purpose: anything longer leaves the worst case where it is and
+  only sheds pokes. `0` restores the arm exactly as it was
+  (`quiet_zero_restores_the_shared_stamp`).
 - **Demote-follow (#27) — the other end.** Fast conviction on ONE end is not
   enough, because a transition's outage is `max(both ends)`, not `min`. The end
   whose network did **not** change gets no Major, so it has no fast lane at all

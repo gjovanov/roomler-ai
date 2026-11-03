@@ -197,6 +197,32 @@ stall count fell.
 
 ### P3 — overlay guard cadence and rekey storms
 
+> **Status 2026-11-03 — measured; the poke gate is built, its field A/B owed.**
+> Read from production `agent_logs`, 7 days, every device: the guard waves are
+> bounded (at most 20 a minute, which is their 3 s floor), the forced rekeys
+> are not. 205,892 of them in the week,
+> 112,684 on one Wi-Fi desk, peaking at 150 a minute and 120 on a second host:
+> #1237's ~100/min signature by another road. The cause is not ours. A listener
+> on the three Windows change notifications saw only interface notifications,
+> in pairs (one per address family), `MibParameterNotification`, on the Wi-Fi
+> adapter, with no route or address signal: the snapshot never moves, the
+> delta is `material=false`, and every one of them armed a poke of every direct
+> peer, at the wave's 3 s floor. Worse than the rekeys, each burst re-armed a
+> poke already in flight, which restarts its deadline: on 2026-10-30 a
+> corporate laptop's 11 carriers behind a full-tunnel capture were convicted
+> at +31 s instead of +15 s.
+>
+> The fix is a gate on the net-change arm, `lifecycle::netchange_action`: a
+> material delta checks and pokes at once; a no-delta burst pokes at most once
+> per `overlay_netchange_poke_quiet_secs` (default 60, `0` = the arm as it was).
+> A replay of it over the same week keeps 63,747 of the 205,892 pokes and
+> brings the noisiest host's peak from 150 to 46 a minute. Of 2,136
+> revalidation failures, 56 began on a poke it drops, 37 of those were back on
+> direct within 2 min, and the other 19 fall to the silence trigger, at most
+> 30 s later. The waves are left alone: they carry the P4 erase contract.
+> Manual: [`docs/overlay-nat-traversal.md`](../overlay-nat-traversal.md), "The
+> net-change gate".
+
 A tax rather than a block, in the same family. #1237 fixed the sibling-adapter
 cause of the ~100 `net-change — revalidating direct carrier` events/min (each
 force-rekeying **every** peer and demoting real carriers); the general guard
@@ -322,8 +348,18 @@ of each is to produce a number.
 - [ ] **AC4** — the encode-scheduling question is answered with canary data; if
       starvation is shown it is fixed, and the canary confirms, with frame age
       unchanged or better.
-- [ ] **AC5** — overlay guard waves and forced rekeys/min are measured at idle and
+- [~] **AC5** — overlay guard waves and forced rekeys/min are measured at idle and
       under a VPN flap, and bounded; no rekey storm.
+      **Measured 2026-11-03, not yet bounded** (production `agent_logs`, 7 days,
+      every device; P3's status block). At idle the waves stay under their 3 s
+      floor and the rekeys do not: peak 150/min on one host. Under a VPN flap,
+      read passively on the three corporate laptops' own full-tunnel VPN (39
+      netstate Majors in the week): at most 49 waves and 142 rekeys in the
+      5 minutes around a Major, the first poke inline (+0.0 s, `from_major`)
+      wherever a direct carrier was up, and the carriers the capture killed
+      convicted inside a minute. Open: the
+      gate's A/B on a candidate (RED on 0.4.197, GREEN on the gate), then a
+      7-day read on the release that carries it.
 - [x] **AC6** — caps-probe spawns at steady state are 0/hour on a measured host.
       ✅ **Measured 2026-10-30, four hosts** (`scripts/fr65-stall-census.sh
       --probes`, #3138): **0 steady-state probe runs** on CORPLAP-1/-2/-3 over

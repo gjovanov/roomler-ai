@@ -847,6 +847,13 @@ pub struct AgentConfig {
     /// Built-in default: 750.
     #[serde(default)]
     pub overlay_netmon_debounce_ms: Option<u32>,
+    /// FR-65 P3 — seconds a signal burst with no snapshot delta waits behind
+    /// the last forced revalidation
+    /// (`ROOMLERD_OVERLAY_NETCHANGE_POKE_QUIET_SECS`, 0–3600). Built-in
+    /// default: 60. `0` restores the arm as it was before the gate. A real
+    /// network move never waits on this.
+    #[serde(default)]
+    pub overlay_netchange_poke_quiet_secs: Option<u32>,
     /// Force overlay coturn allocations onto the TURNS/TCP (TLS) tier —
     /// the corp-VPN field probe (`ROOMLERD_OVERLAY_RELAY_TLS`).
     /// Built-in default: off.
@@ -2941,6 +2948,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_route_tick_secs: None,
         overlay_netmon: None,
         overlay_netmon_debounce_ms: None,
+        overlay_netchange_poke_quiet_secs: None,
         overlay_relay_tls: None,
         overlay_shared_carrier: None,
         overlay_roam: None,
@@ -3283,7 +3291,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 94]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 32] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 33] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -3322,6 +3330,10 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 3
         ("SCALE_THREADS", cfg.scale_threads),
         ("RC_MAX_SESSIONS", cfg.rc_max_sessions),
         ("OVERLAY_DIRECT_PORT", cfg.overlay_direct_port),
+        (
+            "OVERLAY_NETCHANGE_POKE_QUIET_SECS",
+            cfg.overlay_netchange_poke_quiet_secs,
+        ),
         ("RELAY_SERVER_PORT", cfg.relay_server_port),
     ]
 }
