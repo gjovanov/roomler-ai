@@ -1881,6 +1881,13 @@ pub struct AgentConfig {
     #[serde(default)]
     pub last_run_unhealthy: bool,
 
+    /// #3289 — the boot of the OS the last run started in
+    /// ([`crate::boot_id::current`]), so the next start can tell a crash from
+    /// the OS restarting under the daemon ([`previous_run`]). `None` on a
+    /// config an older build wrote, or where the OS cannot say.
+    #[serde(default)]
+    pub last_run_boot: Option<String>,
+
     /// Last config-schema version this file was migrated to. Used by
     /// [`migrate`] to decide which migration steps to apply at startup.
     /// `None` (or missing in TOML) on pre-rc.18 configs — those run
@@ -2765,6 +2772,48 @@ pub fn mark_clean_shutdown(cfg: &mut AgentConfig) {
     cfg.last_run_unhealthy = false;
 }
 
+/// #3289 — how the run before this one ended, as far as this start can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviousRun {
+    /// It marked itself clean or reached the clean-run threshold, or there was
+    /// no run before this one.
+    Clean,
+    /// It went away unannounced while the OS stayed up. The one case that counts
+    /// against this version ([`record_crash_at`]).
+    Crashed,
+    /// The OS restarted during it: a restart, a power cut, a kernel fault.
+    EndedWithTheOs,
+    /// Its service host watched it end, and that was not the daemon failing: the
+    /// session it ran in went away, or the host replaced it.
+    EndedByItsHost,
+}
+
+/// #3289 — a crash is the daemon dying on its own while the OS was up and nobody
+/// had asked it to go. `last_run_unhealthy` alone says only that nothing marked
+/// the last run clean, and Windows can end a worker before its service host hears
+/// of a restart: three ordinary restarts within five minutes of a self-update read
+/// as a crash loop, and a healthy device tried to roll itself back.
+///
+/// `boot_now` is [`crate::boot_id::current`]. Either boot unknown reads as the same
+/// boot, and `host_saw_no_crash` is true only when a service host says so: when in
+/// doubt this counts, because a real crash loop must still reach the rollback.
+pub fn previous_run(
+    cfg: &AgentConfig,
+    boot_now: Option<&str>,
+    host_saw_no_crash: bool,
+) -> PreviousRun {
+    if !cfg.last_run_unhealthy {
+        return PreviousRun::Clean;
+    }
+    if host_saw_no_crash {
+        return PreviousRun::EndedByItsHost;
+    }
+    match (cfg.last_run_boot.as_deref(), boot_now) {
+        (Some(then), Some(now)) if then != now => PreviousRun::EndedWithTheOs,
+        _ => PreviousRun::Crashed,
+    }
+}
+
 /// Record a crash at the given unix timestamp. Increments the
 /// counter when the prior crash was within `CRASH_WINDOW_SECS` of
 /// `now_unix`; otherwise starts a fresh crash window at 1.
@@ -3185,6 +3234,7 @@ pub fn test_fixture() -> AgentConfig {
         last_crash_unix: 0,
         rollback_attempted: false,
         last_run_unhealthy: false,
+        last_run_boot: None,
         config_schema_version: None,
         forward_acl: AgentForwardAcl::default(),
         virtual_desktop_apps: crate::apps_config::VirtualDesktopAppsConfig::default(),
@@ -6501,6 +6551,141 @@ tenant_id = "tid2"
         assert!(!cfg.last_run_unhealthy);
         assert_eq!(cfg.crash_count, 2, "clean shutdown preserves crash history");
         assert_eq!(cfg.last_crash_unix, 1_000_000);
+    }
+
+    /// #3289 — one start, through the calls `run_cmd` makes at the top of a run.
+    fn start_a_run(cfg: &mut AgentConfig, boot: Option<&str>, host_word: bool, now: u64) {
+        if previous_run(cfg, boot, host_word) == PreviousRun::Crashed {
+            record_crash_at(cfg, now);
+        }
+        mark_run_starting(cfg);
+        cfg.last_run_boot = boot.map(str::to_string);
+    }
+
+    /// A device a self-update has just moved to 0.4.197: 0.4.196 is proven, the
+    /// new version is not yet, and the run the update's exit ended was clean.
+    fn just_updated() -> AgentConfig {
+        let mut cfg = fixture();
+        cfg.last_known_good_version = Some("0.4.196".into());
+        cfg
+    }
+
+    #[test]
+    fn a_clean_last_run_is_clean_whatever_the_boot_or_the_host_says() {
+        let mut cfg = fixture();
+        cfg.last_run_boot = Some("7".into());
+        assert_eq!(previous_run(&cfg, Some("8"), false), PreviousRun::Clean);
+        assert_eq!(previous_run(&cfg, Some("7"), true), PreviousRun::Clean);
+        assert_eq!(previous_run(&cfg, None, false), PreviousRun::Clean);
+    }
+
+    #[test]
+    fn an_unhealthy_last_run_is_a_crash_only_while_the_os_stayed_up() {
+        let mut cfg = fixture();
+        mark_run_starting(&mut cfg);
+        cfg.last_run_boot = Some("7".into());
+        assert_eq!(previous_run(&cfg, Some("7"), false), PreviousRun::Crashed);
+        assert_eq!(
+            previous_run(&cfg, Some("8"), false),
+            PreviousRun::EndedWithTheOs
+        );
+        assert_eq!(
+            previous_run(&cfg, Some("7"), true),
+            PreviousRun::EndedByItsHost
+        );
+    }
+
+    /// When in doubt it counts: a real crash loop must still reach the rollback,
+    /// on a host that cannot name its boot and on a config an older build wrote.
+    #[test]
+    fn an_unknown_boot_reads_as_the_same_boot() {
+        let mut cfg = fixture();
+        mark_run_starting(&mut cfg);
+        assert_eq!(cfg.last_run_boot, None);
+        assert_eq!(previous_run(&cfg, Some("8"), false), PreviousRun::Crashed);
+        assert_eq!(previous_run(&cfg, None, false), PreviousRun::Crashed);
+        cfg.last_run_boot = Some("7".into());
+        assert_eq!(previous_run(&cfg, None, false), PreviousRun::Crashed);
+    }
+
+    /// The field read, in its order: Windows kills the worker with its session
+    /// (0x40010004), the host spawns another, and only then hears of the restart.
+    /// That worker either stops cleanly or dies with the session too, and the next
+    /// boot's worker finds it. Two restarts took 0.4.197 to `crash_count=3`.
+    #[test]
+    fn restarts_after_an_update_never_reach_a_rollback() {
+        let mut cfg = just_updated();
+        let mut now = 1_000_000;
+        let mut tick = |cfg: &mut AgentConfig, boot: &str, host_word: bool| {
+            now += 20;
+            start_a_run(cfg, Some(boot), host_word, now);
+            assert_eq!(cfg.crash_count, 0, "nothing crashed");
+            assert!(!should_rollback(cfg, "0.4.197", now));
+        };
+        // The update's own worker.
+        tick(&mut cfg, "7", false);
+        // Restart 1: its session is torn down, the host's next worker stops cleanly.
+        tick(&mut cfg, "7", true);
+        mark_clean_shutdown(&mut cfg);
+        tick(&mut cfg, "8", false);
+        // Restart 2: the host's next worker dies with the session as well.
+        tick(&mut cfg, "8", true);
+        tick(&mut cfg, "9", false);
+        // Restart 3: no worker in between, the host never saw it end.
+        tick(&mut cfg, "10", false);
+    }
+
+    /// The other side of the same table: a worker that keeps dying on its own, with
+    /// the OS up and no word from a host, reaches the rollback on the third start.
+    #[test]
+    fn a_real_crash_loop_still_reaches_the_rollback() {
+        let mut cfg = just_updated();
+        let mut now = 1_000_000;
+        start_a_run(&mut cfg, Some("7"), false, now);
+        for expected in 1..=3u32 {
+            assert!(!should_rollback(&cfg, "0.4.197", now));
+            now += 20;
+            start_a_run(&mut cfg, Some("7"), false, now);
+            assert_eq!(cfg.crash_count, expected);
+        }
+        assert!(should_rollback(&cfg, "0.4.197", now));
+    }
+
+    /// A restart in the middle of a crash loop neither counts nor wipes the count:
+    /// the two crashes before it are still crashes of this version.
+    #[test]
+    fn a_restart_during_a_crash_loop_keeps_the_count() {
+        let mut cfg = just_updated();
+        let mut now = 1_000_000;
+        start_a_run(&mut cfg, Some("7"), false, now);
+        for _ in 0..2 {
+            now += 20;
+            start_a_run(&mut cfg, Some("7"), false, now);
+        }
+        assert_eq!(cfg.crash_count, 2);
+        now += 60;
+        start_a_run(&mut cfg, Some("8"), false, now);
+        assert_eq!(cfg.crash_count, 2);
+        assert!(!should_rollback(&cfg, "0.4.197", now));
+        now += 20;
+        start_a_run(&mut cfg, Some("8"), false, now);
+        assert_eq!(cfg.crash_count, 3);
+        assert!(should_rollback(&cfg, "0.4.197", now));
+    }
+
+    #[test]
+    fn a_config_from_before_the_boot_key_loads_without_it() {
+        let mut cfg = fixture();
+        cfg.last_run_boot = Some("7".into());
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("last_run_boot = \"7\""));
+        let old: String = text
+            .lines()
+            .filter(|l| !l.starts_with("last_run_boot"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let back: AgentConfig = toml::from_str(&old).unwrap();
+        assert_eq!(back.last_run_boot, None);
     }
 
     // ---- Migration tests (rc.18 P4) ---------------------------------

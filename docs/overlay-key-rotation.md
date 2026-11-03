@@ -253,7 +253,7 @@ the grid honest for a device that has not yet updated to it — a 0.4.25 device 
 | key | where | default | effect |
 |---|---|---|---|
 | `overlay_key_rotation` | device config (tribool), config surface, env `ROOMLERD_OVERLAY_KEY_ROTATION` (`crates/agent-core/src/config.rs:1266-1271`, `config_surface.rs:1365-1372`) | **on** | `false` ⇒ every order is answered `refused: disabled`, key unchanged. Read from the start-time snapshot — **restart required** |
-| `overlay_wg_key_epoch` | persisted next to the key, primary scalar and per `[[orgs]]` entry (`config.rs:1953`, `:2078-2080`) | `0` | bumped per rotation; presented on every join, shown in the grid |
+| `overlay_wg_key_epoch` | persisted next to the key, primary scalar and per `[[orgs]]` entry (`config.rs:1981`, `:2106-2108`) | `0` | bumped per rotation; presented on every join, shown in the grid |
 | server switch | — | — | **none, deliberately**: the route is admin-initiated and permission-gated; a defective push is stopped by the device switch |
 
 ⚠️ **A kill switch, not a gate.** Unlike `exec_enabled` and `ssh_enabled`, this one
@@ -318,7 +318,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:808-816` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6393-6535`, `:3253-3295`, `:3297-3318`, `:1280-1304` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:346-245` |
-| kill switch · epoch | `crates/agent-core/src/config.rs:1266-1271`, `:1975-1980`, `:2105-2107`; `config_surface.rs:1365-1372` |
+| kill switch · epoch | `crates/agent-core/src/config.rs:1266-1271`, `:1982-1987`, `:2112-2114`; `config_surface.rs:1365-1372` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1287-1314`, `:2089-2190`; `ui/src/stores/agents.ts:948-902` |
 
 ## Not built

@@ -1168,16 +1168,13 @@ mod tests {
 
     // ─── Crash-loop suppression (2026-05-17 a third field-test host storm fix) ─────────────
 
-    fn tempdir_for_test() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "crash_recorder_supp_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("create_dir_all");
-        dir
+    /// A directory only this test sees, removed when the guard drops, a
+    /// failed assertion included (#3090). It used to be named after the
+    /// clock: two tests that read it in the same tick shared one directory
+    /// and saw each other's sidecars, and the first to finish deleted it
+    /// under the other.
+    fn tempdir_for_test() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
     }
 
     /// Drop a fake sidecar named `{ts}-{pid}.json` in `dir`. Used by
@@ -1191,31 +1188,28 @@ mod tests {
     #[test]
     fn should_suppress_returns_none_for_empty_dir() {
         let dir = tempdir_for_test();
-        assert!(should_suppress(&dir, 1_700_000_000).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(should_suppress(dir.path(), 1_700_000_000).is_none());
     }
 
     #[test]
     fn should_suppress_rate_limits_when_recent_sidecar_exists() {
         let dir = tempdir_for_test();
         // Sidecar 5 seconds ago — within the 30s MIN_INTERVAL.
-        touch_sidecar(&dir, 1_700_000_000 - 5, 12345);
+        touch_sidecar(dir.path(), 1_700_000_000 - 5, 12345);
         let now = 1_700_000_000_i64;
         assert_eq!(
-            should_suppress(&dir, now),
+            should_suppress(dir.path(), now),
             Some(SuppressReason::RecentSidecar)
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn should_suppress_allows_write_after_min_interval_elapsed() {
         let dir = tempdir_for_test();
         // Sidecar 31 seconds ago — past the 30s MIN_INTERVAL.
-        touch_sidecar(&dir, 1_700_000_000 - (MIN_INTERVAL_SECS + 1), 12345);
+        touch_sidecar(dir.path(), 1_700_000_000 - (MIN_INTERVAL_SECS + 1), 12345);
         let now = 1_700_000_000_i64;
-        assert!(should_suppress(&dir, now).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(should_suppress(dir.path(), now).is_none());
     }
 
     #[test]
@@ -1225,15 +1219,14 @@ mod tests {
         // Each gets a unique ts so filenames don't collide.
         let stale_base = 1_700_000_000_i64 - 3600;
         for i in 0..HARD_CAP {
-            touch_sidecar(&dir, stale_base + i as i64, 12345);
+            touch_sidecar(dir.path(), stale_base + i as i64, 12345);
         }
         let now = 1_700_000_000_i64;
         assert_eq!(
-            should_suppress(&dir, now),
+            should_suppress(dir.path(), now),
             Some(SuppressReason::HardCapReached),
             "hard cap must trip even when all sidecars are old"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1241,9 +1234,8 @@ mod tests {
         let dir = tempdir_for_test();
         // A *.tmp file (in-progress write) doesn't count toward the
         // cap and doesn't trigger the rate-limit.
-        std::fs::write(dir.join("1700000000-12345.json.tmp"), b"{}").unwrap();
-        assert!(should_suppress(&dir, 1_700_000_000).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::write(dir.path().join("1700000000-12345.json.tmp"), b"{}").unwrap();
+        assert!(should_suppress(dir.path(), 1_700_000_000).is_none());
     }
 
     #[test]
@@ -1277,11 +1269,6 @@ mod tests {
         // verbatim — modulo the scrub pipeline. The local rolling-log
         // read path (`read_log_tail`) is bypassed entirely so the
         // override is the authoritative source.
-        let dir = tempdir_for_test();
-        // Drive record_inner directly so we can control the dir
-        // without going through `logging::log_dir()`. Override the
-        // crashes_dir resolution: write to `dir` and verify the JSON
-        // contents.
         let now_unix = 1_700_000_000_i64;
         let mut payload = AgentCrashPayload {
             crashed_at_unix: now_unix,
@@ -1299,7 +1286,6 @@ mod tests {
         fit_to_envelope(&mut payload, MAX_PAYLOAD_BYTES);
         assert!(payload.log_tail.contains("WORKER's real log content"));
         assert!(!payload.log_tail.contains("[…log truncated"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1387,7 +1373,8 @@ mod tests {
     /// finds nothing left to move or warn about.
     #[test]
     fn a_torn_sidecar_is_moved_aside_once() {
-        let dir = tempdir_for_test();
+        let tmp = tempdir_for_test();
+        let dir = tmp.path().to_path_buf();
         write_valid_sidecar(&dir, 1_700_000_000, 1);
         let torn = write_torn_sidecar(&dir, 1_700_000_100, 2);
 
@@ -1401,20 +1388,19 @@ mod tests {
         let second = scan_dir(&dir);
         assert_eq!(second.len(), 1);
         assert!(moved.exists(), "a second scan leaves it where it is");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #2955 — when the move fails, the sidecar stays where it was, as before
     /// the quarantine existed: skipped, never lost.
     #[test]
     fn a_torn_sidecar_that_cannot_move_stays_put() {
-        let dir = tempdir_for_test();
+        let tmp = tempdir_for_test();
+        let dir = tmp.path().to_path_buf();
         // A FILE where the quarantine directory would go: create_dir_all fails.
         std::fs::write(dir.join(MALFORMED_DIR), b"not a directory").unwrap();
         let torn = write_torn_sidecar(&dir, 1_700_000_100, 2);
 
         assert!(scan_dir(&dir).is_empty());
         assert!(torn.exists(), "the sidecar was not lost");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

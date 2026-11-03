@@ -9236,6 +9236,7 @@ version = "0.4.199"
 dependencies = [
  "age",
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bson",
