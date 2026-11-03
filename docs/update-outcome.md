@@ -52,15 +52,18 @@ reading was wrong about which mattered:
 
 `<log_dir>` is `logging::resolve_log_dir`'s
 (`crates/agent-core/src/logging.rs:713`): the process's per-user data dir plus
-`logs`, except the Windows SCM host, which logs under
-`%PROGRAMDATA%\Roomler\roomler\service-logs`. Where that lands:
+`logs`, except a Windows process with a service role, which logs under
+`%PROGRAMDATA%\Roomler\roomler\service-logs`: the SCM host, the SystemContext
+worker and `netd` (`ServiceLogRole`). The watcher never has one, so the record
+always lands in its own account's data dir. Where that lands:
 
 | Who | `<log_dir>` |
 |---|---|
 | Linux root daemon (`.deb` or tarball system install) | `/root/.local/share/roomler/logs` |
 | Linux per-user daemon | `~/.local/share/roomler/logs` |
-| Windows per-user daemon | `%LOCALAPPDATA%oomleroomlerdatalogs` of the signed-in person |
-| Windows, the console-session worker (where the updater runs) | `%LOCALAPPDATA%\roomler\roomler\data\logs` of the worker's account — the signed-in user on an attended perMachine install, SYSTEM under SystemContext (§5) |
+| Windows per-user daemon | `%LOCALAPPDATA%\roomler\roomler\data\logs` of the signed-in person |
+| Windows, the console-session worker (where the updater runs), attended perMachine | `%LOCALAPPDATA%\roomler\roomler\data\logs` of the signed-in user (§5) |
+| Windows, the SystemContext worker (LocalSystem) | its own log in `%PROGRAMDATA%\Roomler\roomler\service-logs`. The record is in SYSTEM's profile, `%LOCALAPPDATA%\roomler\roomler\data\logs` as SYSTEM: its watcher writes it there and the reader reads it there too (§5) |
 | Windows, the SCM host (`service-run`) | `%PROGRAMDATA%\Roomler\roomler\service-logs` — **never written**: it spawns no watcher (§5) |
 
 ## 3. The life of a verdict
@@ -134,16 +137,18 @@ a record older than that (`never_reported`, `:557`).
 
 ## 5. Who reads it, and from which process
 
-The reader resolves the **same** `<log_dir>` the watcher wrote to only when it
-runs in the process role that spawned the watcher
-(`post_install::last_install_status`, `post_install.rs:1211`). That holds on
-every platform's plain daemon. Two topologies split roles:
+The reader has to look where the watcher wrote. On every platform's plain
+daemon that is the reader's own `<log_dir>`. It reads two places
+(`post_install::last_install_status`, `post_install.rs:1211`, through
+`outcome_paths`, #3302): its own `<log_dir>` first, then its account's
+profile data dir. It reports the record written last, and `path` names that
+record's file. Two topologies split roles:
 
 - **Windows perMachine host — an SCM service plus a console-session worker.**
   The SCM host (`roomlerd service-run`, session 0, SYSTEM) spawns a worker in
   the console session (`roomlerd run --supervisor scm`, session 1). The
   **worker** runs the signaling loop, the updater — and so the watcher — and
-  the LocalAPI `roomler status` reaches, so `<log_dir>` is the worker's
+  the LocalAPI `roomler status` reaches, so the record is in the worker's
   account's `%LOCALAPPDATA%…\logs`. Which account is the install mode's
   (`docs/installation.md` §Windows): the **signed-in user** on an attended
   install, **LocalSystem** under SystemContext — `WorkerRole` classifies the
@@ -155,12 +160,18 @@ every platform's plain daemon. Two topologies split roles:
   and 0.4.174 records sit under the signed-in user's profile, while the SYSTEM
   profile's copy is a July `InProgress` for `agent-v0.3.0-rc.183` — a watcher
   spawned under SYSTEM before the worker existed, frozen exactly the way P3
-  would report as `NEVER REPORTED` had a SystemContext worker read it. ⚠️ The
-  SystemContext mode itself is unread this cycle: there the reader and the
-  record are both the SYSTEM profile's, which the design covers and no field
-  read has yet confirmed. A reader in the SCM host would answer `Absent` —
-  honestly, with `path` naming `service-logs` — which is why nothing reads it
-  there.
+  would report as `NEVER REPORTED` had a SystemContext worker read it.
+  ⚠️ **Under SystemContext the worker and its watcher log apart.** The
+  worker takes the `service-logs` role (S1b,
+  `agents/roomlerd/src/app.rs:1617`). The watcher it spawns has none and
+  writes the record into SYSTEM's profile. Read on a per-machine guest, a
+  real self-update from candidate 0.4.220 to 0.4.221 left the record
+  `InProgress` in SYSTEM's profile past the clean-run threshold, with no
+  record in `service-logs`. So a reader of its own `<log_dir>` alone answers
+  `none recorded` after every update. Reading both, candidate 0.4.223 settled
+  that record, and `roomler status` read `ok` with `path` in SYSTEM's profile
+  (§7). The SCM host reads nothing: it spawns no watcher, and `roomler status`
+  reaches the worker.
 - **A two-half Mac.** The root half's installs are the root update helper's
   (`com.roomler.update`, FR-96 / P4); the per-user half answers its own
   `<log_dir>`, where no root install ever writes. `roomler status` as the
@@ -235,7 +246,10 @@ $ roomler status
 | 2026-10-26, 09:55Z | the dev box's released 0.4.174 daemon (pre-P3), read by the branch's CLI | `roomler status`, `roomler status --json` | no `last update` line, no `last_install` key: a daemon that predates the field is **silent**, never `none recorded` — the third state of §4's callout, on a live daemon |
 | 2026-10-26, 23:20Z | mars, jupiter, zeus, now on **0.4.177** | the same files + the journal over `roomler exec` | every record `SucceededVerified` for `agent-v0.4.177`, `started_unix == finished_unix` (1793035976 · 1793035969 · 1793035969), mtime = the journal's verdict line (17:32:56Z · 17:32:49Z · 17:32:49Z). Two more organic updates each since the 0.4.174 row — 0.4.175 at 13:03Z and 0.4.177 at 17:32Z; mars and zeus **skipped 0.4.176** (`current=0.4.175 latest=agent-v0.4.177`; jupiter's journal not read) — each `spawning installer and exiting` → `package installed bin="apt-get"` → `watcher started … already_exited=true` → the verdict. mars: **17 of 17** since 0.4.155. ⚠️ Every watcher so far was a ≤0.4.175 daemon's, so the journal still carries its lines; §6 says why it will not from 0.4.176 on |
 | 2026-10-26, 15:34Z | the dev box, on **0.4.177** | the worker's `last-install.json` + the logs dir | `SucceededVerified` for `agent-v0.4.177`, `started_unix 1793028879 → finished_unix 1793028892` (13 s on msiexec), the service settled — and **no panic log beside it**, the first Windows record this FR has read without one: the watcher was the 0.4.175 daemon's (the box went 0.4.175 → 0.4.177 directly), and 0.4.175 is the first release with #2935. #2943 (0.4.176+) goes further and gives the watcher no stdio at all, §6 |
-| — | the release that carries P3 — none yet: 0.4.197, the newest at this writing, predates #2924 | `roomler exec <host> -- roomler status`, `journalctl -g "last install"` | **owed**: the `last update` line and the startup line on a fleet host; then a synthetic stale `InProgress` and a deleted record on one host, to read `NEVER REPORTED` and `none recorded` apart in the field |
+| 2026-11-03 | a Win11 guest, per-user, a standard user at the console; candidate 0.4.223 (#2924 with #3345 and the `WatcherStopped` word), after a self-update from 0.4.221 | `roomler status`, `--json`, the startup line | the watcher's own verdict: `ok — agent-v0.4.223 installed 6m ago, verified: roomlerd 0.4.223`, INFO. An hour-old `InProgress` for the running version, written by hand: `NEVER REPORTED`, WARN, and after the clean-run threshold the daemon settled it to `ok`. A two-hour-old `InProgress` for another release: `WATCHER STOPPED`, WARN. The record deleted: `none recorded`, INFO. `--json` carried `last_install` with `path` in every state |
+| 2026-11-03 | a Win11 guest, per-machine SystemContext; released 0.4.197 updated itself to candidate 0.4.223 | the startup line; `roomler status`, elevated | 0.4.197's watcher was stopped before its verdict. The new daemon logged `last install: in progress` at its start and settled the record at its threshold, and `roomler status` read `ok — agent-v0.4.223 installed 6m ago, verified: roomlerd 0.4.223` with `path` in SYSTEM's profile (§5) |
+| 2026-11-03 | an Ubuntu guest, a root `.deb` daemon under systemd, candidate 0.4.223 installed by hand | `roomler status`, `journalctl -u roomlerd` | `none recorded` with no record, INFO; `NEVER REPORTED` for an hour-old `InProgress`, WARN. A crash loop rolled the device back to 0.4.197 on a real `dpkg` downgrade, and the candidate went in again by hand: `ok — agent-v0.4.197 installed 4m ago, verified: roomlerd 0.4.197 — but this daemon runs 0.4.223`, from the record the rollback's own watcher wrote. `none recorded` after the delete |
+| — | the release that carries P3 — none yet: 0.4.198, the newest at this writing, predates #2924, and the three rows above are candidates | `roomler exec <host> -- roomler status`, `journalctl -g "last install"` | **owed**: the `last update` line and the startup line on a fleet host; then a synthetic stale `InProgress` and a deleted record on one host, to read `NEVER REPORTED` and `none recorded` apart in the field |
 
 ## 8. Not built
 

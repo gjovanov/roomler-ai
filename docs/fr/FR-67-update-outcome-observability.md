@@ -123,8 +123,8 @@ flowchart LR
 
 | Piece | Where |
 |---|---|
-| The wire word, `LastInstallStatus` — the five verdicts spelled as the file spells them, plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:509`; `NodeStatus.last_install`, `:471` |
-| The read, fresh from disk every time | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:1211`), its pure half `summarize` (`:1224`) |
+| The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:509`; `NodeStatus.last_install`, `:471` |
+| The read, fresh from disk every time, of the newest record in the two dirs `outcome_paths` lists (#3302) | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:1211`), its pure half `summarize` (`:1224`) |
 | The startup line and its level | `log_at_startup` (`:1281`), `startup_level` (`:1265`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4130`) |
 | The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:961`) |
 | The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2869`), printed under `version` (`:2474`) |
@@ -142,10 +142,12 @@ flowchart LR
 - ⚠️ **The reader runs where the updater runs.** On a Windows perMachine
   host that is the console-session worker, under whichever account the
   install mode gives it — the signed-in user on an attended install (the dev
-  box, `privileged: false`), LocalSystem under SystemContext — so `<log_dir>`
-  is that account's `%LOCALAPPDATA%…\logs`, where the record is; never the
-  SCM host, whose `service-logs` dir is never written. Read on the attended
-  mode; the SystemContext mode is unread (`docs/update-outcome.md` §5). A
+  box, `privileged: false`), LocalSystem under SystemContext, and never the
+  SCM host. The record is in that account's `%LOCALAPPDATA%…\logs`, where
+  the watcher writes it. A SystemContext worker logs to `service-logs`
+  itself, so the reader looks in its own `<log_dir>` and in the profile's
+  (#3302). Read on both modes: attended on 10-26, SystemContext on a
+  candidate on 11-03 (`docs/update-outcome.md` §5, §7). A
   two-half Mac's per-user half reads its own dir — the root helper's installs
   are not its to claim — so it says `Absent` honestly.
 - Windows' watcher is untouched: the diff adds readers and nothing inside
