@@ -63,6 +63,15 @@ jobs:
       - name: docker-compose.selfhost.yml, with a public address
         run: bash scripts/selfhost-coturn-check.sh --file docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost-public.env"
 
+      # The client leaves what it allocates over UDP behind for 13 minutes, so a check that
+      # costs too many relay ports fails on its own leftovers the third time it runs.
+      - name: The check, twice more in a row
+        if: ${{ !cancelled() }}
+        run: |
+          for _ in 1 2; do
+            bash scripts/selfhost-coturn-check.sh --file docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost-public.env"
+          done
+
       # coturn's way back into the namespace is a healthcheck, and nothing else would notice
       # if an image or an engine stopped honouring it.
       - name: The server crashes, and coturn comes back into its namespace
