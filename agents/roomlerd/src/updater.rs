@@ -1344,34 +1344,47 @@ impl Drop for ProtectedDirSd {
 /// here because its `Builder` has no way to pass Windows security attributes.
 #[cfg(target_os = "windows")]
 fn create_fresh_protected_dir(base: &std::path::Path) -> std::io::Result<PathBuf> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
-
     for _ in 0..8 {
         let name = format!("{}{:016x}", STAGING_DIR_PREFIX, rand::random::<u64>());
         let dir = base.join(name);
-        let wide: Vec<u16> = dir
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut sd = ProtectedDirSd::new()?;
-        // SAFETY: a NUL-terminated path; the descriptor lives in `sd` for the
-        // duration of this call.
-        let ok = unsafe { CreateDirectoryW(wide.as_ptr(), sd.attributes()) };
-        if ok != 0 {
-            return Ok(dir);
+        match create_protected_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            // Name collision — try again with a fresh random suffix.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
         }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(e);
-        }
-        // Name collision — try again with a fresh random suffix.
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
         "could not allocate a unique staging dir name",
     ))
+}
+
+/// Make `dir`, which must not exist yet, readable and writable by SYSTEM and
+/// Administrators alone: the DACL is set AT CREATION ([`ProtectedDirSd`]), and
+/// the create fails if anything is already at the name, so a folder someone else
+/// made first is never taken for ours. It also fails for a caller who cannot
+/// name Administrators as the owner. The setup wizard stages what it runs
+/// elevated in one of these (#3246).
+#[cfg(target_os = "windows")]
+pub fn create_protected_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sd = ProtectedDirSd::new()?;
+    // SAFETY: a NUL-terminated path; the descriptor lives in `sd` for the
+    // duration of this call.
+    let ok = unsafe { CreateDirectoryW(wide.as_ptr(), sd.attributes()) };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// macOS: the per-user `confstr(_CS_DARWIN_USER_TEMP_DIR)` temp dir is
