@@ -18,6 +18,7 @@ use axum::{
 };
 use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
+use roomler_ai_mod_fleet::agent::org_accepts_enrollment;
 use roomler_ai_remote_control::models::{
     AgentStatus, DestinationRule, NodeRef, OsKind, PolicySubject, PolicyTarget,
 };
@@ -61,6 +62,7 @@ pub async fn issue_tunnel_enrollment_token(
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::NotAMember);
     }
+    org_accepts_enrollment(&state.tenants, tid).await?;
 
     let (token, jti) =
         state
@@ -112,6 +114,9 @@ pub async fn enroll_tunnel_client(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id claim".to_string()))?;
     let admin_uid = ObjectId::parse_str(&claims.sub)
         .map_err(|_| ApiError::BadRequest("Invalid admin user id claim".to_string()))?;
+
+    // #3042 — before the row below: this is the door that revives a tombstone.
+    org_accepts_enrollment(&state.tenants, tid).await?;
 
     let existing = state
         .tunnel_clients
@@ -544,6 +549,11 @@ pub async fn delete_tunnel_client(
     // someone else did. 404 is the one answer that leaves the state alone.
     let client = state.tunnel_clients.find_live_in_tenant(tid, cid).await?;
 
+    // Tombstone first: from here a join on the socket it still holds is refused
+    // (`handle_overlay_join`), so the release below cannot be followed by a fresh
+    // lease that nothing would release. The release reads the node, not this row.
+    state.tunnel_clients.soft_delete(tid, cid).await?;
+
     let released = crate::overlay::release_overlay_node_for(
         &state,
         tid,
@@ -554,8 +564,6 @@ pub async fn delete_tunnel_client(
         "tunnel_client_delete",
     )
     .await;
-
-    state.tunnel_clients.soft_delete(tid, cid).await?;
 
     Ok(Json(serde_json::json!({
         "deleted": true,
