@@ -5,8 +5,11 @@
 //! A visitor lands on the site with `utm_*` on the URL; the site's own links
 //! carry those keys into the register view, and the register view sends them
 //! here — nothing is ever written to the visitor's device (the whole point of
-//! §3a of the spec). This module is the ONE place a client's claim about where
-//! a sign-up came from is turned into what `users.signup_attribution` stores:
+//! §3a of the spec). FR-91 §3e adds the one journey with no campaign: a reader
+//! who reached the blog from another site, whose `referrer_host` and
+//! `landing_path` arrive the same way, and alone. This module is the ONE place
+//! a client's claim about where a sign-up came from is turned into what
+//! `users.signup_attribution` stores:
 //!
 //! * [`AttributionInput`] — the shape a client may send, on the register body
 //!   (`attribution: {…}`) or as `utm_*` query keys on `GET /api/oauth/{p}`.
@@ -587,6 +590,33 @@ mod tests {
         assert_eq!(sanitize(input(json!("youtube"))), None);
         assert_eq!(sanitize(input(json!(42))), None);
         assert_eq!(sanitize(AttributionInput::default()), None);
+    }
+
+    /// FR-91 §3e: an organic journey from the blog has no campaign key, and
+    /// is kept as it stands, on the register body and on the OAuth start URL.
+    #[test]
+    fn an_organic_journey_is_kept_without_a_campaign() {
+        let want = SignupAttribution {
+            referrer_host: Some("www.google.com".into()),
+            landing_path: Some("/blog/x/".into()),
+            ..Default::default()
+        };
+        let strip = |a: Option<SignupAttribution>| {
+            a.map(|a| SignupAttribution {
+                captured_at: None,
+                ..a
+            })
+        };
+        let body = sanitize(input(
+            json!({ "referrer_host": "www.google.com", "landing_path": "/blog/x/" }),
+        ));
+        assert_eq!(strip(body), Some(want.clone()));
+        let query = HashMap::from([
+            ("referrer_host".to_string(), "www.google.com".to_string()),
+            ("landing_path".to_string(), "/blog/x/".to_string()),
+        ]);
+        let start = sanitize(AttributionInput::from_query(&query));
+        assert_eq!(strip(start), Some(want));
     }
 
     /// The register body reads the field through serde — the lenient impl,
