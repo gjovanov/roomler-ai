@@ -810,5 +810,7 @@ async fn handle<S: Source>(
     }
 }
 
+pub(crate) mod model_key;
+
 #[cfg(all(test, unix))]
 mod tests;

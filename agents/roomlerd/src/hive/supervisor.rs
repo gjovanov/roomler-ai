@@ -601,7 +601,7 @@ pub struct Supervisor {
     /// itself, not here), the provider key the helper printed, and when
     /// the primary connection was lost (the `offline_grace` clock).
     tokens: super::sidecar::Tokens,
-    model_key: tokio::sync::Mutex<Option<(String, Instant)>>,
+    model_key: super::sidecar::model_key::ModelKey,
     offline_since: Mutex<Option<Instant>>,
     upstream: String,
     offline_grace: Duration,
@@ -1632,7 +1632,7 @@ impl Supervisor {
             parts,
             approval_timing: toolbelt::Timing::default(),
             tokens: Default::default(),
-            model_key: tokio::sync::Mutex::new(None),
+            model_key: Default::default(),
             offline_since: Mutex::new(None),
             upstream: super::sidecar::DEFAULT_UPSTREAM.to_string(),
             offline_grace: super::sidecar::OFFLINE_GRACE,
@@ -3932,28 +3932,28 @@ impl Supervisor {
     }
 
     /// The provider key, from the device's helper, reused for [`KEY_TTL`].
+    /// #3362: one run of the helper at a time, whose result every call
+    /// waiting on it gets, with no lock held across it ([`ModelKey`]).
     ///
     /// [`KEY_TTL`]: super::sidecar::KEY_TTL
+    /// [`ModelKey`]: super::sidecar::model_key::ModelKey
     pub(crate) async fn model_key(&self) -> Result<String, String> {
-        let mut cached = self.model_key.lock().await;
-        if let Some((key, at)) = cached.as_ref()
-            && at.elapsed() < super::sidecar::KEY_TTL
-        {
-            return Ok(key.clone());
-        }
         let helper = self
             .cfg
             .api_key_helper
             .as_deref()
             .ok_or("this device has no model credential (hive_api_key_helper)")?;
-        let key = super::sidecar::run_key_helper(helper).await?;
-        *cached = Some((key.clone(), Instant::now()));
-        Ok(key)
+        self.model_key
+            .get(|| {
+                let helper = helper.to_string();
+                async move { super::sidecar::run_key_helper(&helper).await }
+            })
+            .await
     }
 
-    /// The provider refused the key: run the helper again next time.
+    /// The provider refused the key: the next call runs the helper again.
     pub(crate) async fn forget_model_key(&self) {
-        *self.model_key.lock().await = None;
+        self.model_key.forget().await;
     }
 
     /// The workspace a key not scoped to one makes its calls in.
