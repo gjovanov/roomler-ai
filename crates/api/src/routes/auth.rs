@@ -333,7 +333,7 @@ pub async fn register(
 /// that person is usually someone whose first sign-up never activated, so the
 /// answer names the way out.
 fn slug_taken() -> ApiError {
-    ApiError::Conflict("That organization slug is taken. Pick another.".to_string())
+    ApiError::Conflict("That organization short name is already taken. Pick another.".to_string())
 }
 
 fn register_conflict(e: DaoError) -> ApiError {

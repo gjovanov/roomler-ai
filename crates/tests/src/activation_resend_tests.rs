@@ -576,7 +576,7 @@ async fn a_taken_slug_leaves_no_account_behind() {
     let taken = with_slug("second@test.com", "second", "taken-org").await;
     assert_eq!(taken.status().as_u16(), 409);
     let body = taken.text().await.unwrap();
-    assert!(body.contains("slug is taken"), "{body}");
+    assert!(body.contains("short name is already taken"), "{body}");
     assert!(!body.contains("E11000"), "{body}");
 
     let again = with_slug("second@test.com", "second", "free-org").await;
