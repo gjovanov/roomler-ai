@@ -29,8 +29,20 @@
 export const ATTRIBUTION_ENABLED = true
 
 /** The campaign keys a link may carry. One of them being present is what
- *  turns carrying on; without one, nothing is carried and nothing is sent. */
+ *  turns carrying on; without one, nothing is carried and nothing is sent,
+ *  except for an organic journey that began on the blog (`ORGANIC_PREFIX`). */
 export const CAMPAIGN_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'ref'] as const
+
+/**
+ * FR-91 (#1880) §3e: where a journey with no campaign must have begun, from
+ * another site, for `referrer_host` and `landing_path` to be carried and sent.
+ * That is a reader who found a blog post in search. Any other organic visit
+ * carries nothing and sends nothing.
+ *
+ * ⚠️ `ui/docs/theme/attribution.js` applies the same rule; `docs/__tests__/attribution.spec.ts`
+ * runs both on the same visits and locks them equal.
+ */
+export const ORGANIC_PREFIX = '/blog/'
 
 /**
  * Every key a static page puts on a link, in order: the campaign, then where
@@ -113,9 +125,10 @@ export function externalHost(referrer: string | undefined, host: string | undefi
  * The keys a link onward from this page carries, the same rule as the static
  * pages' `attribution.js`: the campaign as it came, then where the journey
  * began. `referrer_host` and `landing_path` come from the URL when an earlier
- * page of this site carried them, else from `landing`. Empty without a
- * campaign: without one the link says nothing about where the visitor came
- * from, and a link with nothing to carry is left as it is.
+ * page of this site carried them, else from `landing`. Without a campaign it
+ * is empty, unless the journey began on the blog (`ORGANIC_PREFIX`) from
+ * another site: then it is those two keys alone. A link with nothing to carry
+ * is left as it is.
  *
  * ⚠️ Values that ARRIVE on the URL are taken as given, like any `utm_*`: any
  * link can set them. The server clamps them; nothing checks them. That is a
@@ -128,10 +141,10 @@ export function carriedQuery(query: QueryLike, landing: Landing = {}): Record<st
     const v = value(query, k)
     if (v !== undefined) out[k] = v
   }
-  if (Object.keys(out).length === 0) return {}
   const referrer = value(query, 'referrer_host') ?? externalHost(landing.referrer, landing.host)
-  if (referrer) out.referrer_host = referrer
   const path = value(query, 'landing_path') ?? (landing.path?.trim() || undefined)?.slice(0, MAX_VALUE_CHARS)
+  if (Object.keys(out).length === 0 && !(referrer && path?.startsWith(ORGANIC_PREFIX))) return {}
+  if (referrer) out.referrer_host = referrer
   if (path) out.landing_path = path
   return out
 }
@@ -140,7 +153,9 @@ export function carriedQuery(query: QueryLike, landing: Landing = {}): Record<st
  * What the register view sends as `attribution`, or `undefined` when there is
  * nothing to send (then the request carries no `attribution` key at all).
  *
- * - The campaign and where the journey began, by `carriedQuery`'s rule.
+ * - The campaign and where the journey began, by `carriedQuery`'s rule; for
+ *   an organic journey from the blog, `referrer_host` and `landing_path`
+ *   alone (FR-91 §3e), which the server already stores as they are.
  * - `utm_source` is the source; `ref` stands in for it when it is absent.
  * - `self_reported` is the optional answer, sent with or without a campaign,
  *   and only when it is one of the offered options.

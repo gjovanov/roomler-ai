@@ -713,7 +713,8 @@ recorded size. ⚠️ **Never content**: no window titles, and nothing typed.
 
 Computer audio and the microphone are both **OFF unless asked for**
 (`--system-audio`, `--microphone`; the checkboxes in §7; `RecordStartOpts`).
-The microphone is local-only: no remote path will ever set it (P3).
+The microphone is local-only: nothing in remote recording can set it (§10, "The
+microphone is the person's", which also says what that sentence does not cover).
 
 ```mermaid
 flowchart LR
@@ -1349,43 +1350,41 @@ storage. `crates/tests/src/recording_tests.rs` tests those, and
 ### The microphone is the person's
 
 A remote recording cannot take the host's microphone. Every way into a
-recording, as reviewed on 2026-10-31:
+recording, as reviewed on 2026-10-31 and re-read on 2026-11-02, plus the one other
+way a controller hears a device:
 
 | Entry point | Reached by | The microphone | Pinned by |
 |---|---|---|---|
 | `rc:record.start` on the `record` channel | A controller whose grant holds `RECORD` | No field for it, and a `microphone` key is ignored. `audio` means what the computer plays, behind `record_remote_audio` | `the_wire_parses_and_speaks_the_documented_shapes` |
-| `RecordingManager::start_remote` | That channel's handler, in the daemon or in a Mac's worker | `microphone: false`, and not a parameter | `tests/control_dc_record.rs`: a remote recording's sidecar says no microphone |
+| `RecordingManager::start_remote` | That channel's handler, in the daemon or in a Mac's worker | `microphone: false`, and not a parameter | `tests/control_dc_record.rs` `an_auto_granted_session_records_and_stops`: the sidecar says no microphone |
 | The Mac relay, `delegate::DelegatedRecord` | The root daemon, handing a session to the GUI worker | It carries who is recording and the prompt window, and nothing about sound | `the_mac_relay_carries_no_sound_choice` |
 | Remote configuration, `DesiredConfig` | An administrator, through the server | No `record_*` key can be pushed | `no_record_key_is_server_pushable_via_desired_config` |
 | The fleet RPC verbs, `RpcCap` | An administrator, through the server | None of them is a recording verb | `rpc_cap_wire_strings_are_locked` |
 | The words of `AgentCaps.record` | The hub, reading what a device offers | `remote`, `remote-audio` and `available`, and nothing about a microphone | `remote_recording_does_not_imply_remote_audio` |
 | `RecordStart` on the LocalAPI, behind `roomler record start --microphone` and the Recordings view | The person at the console; on a Linux system install, on their own socket (§6) | Theirs to choose | `the_console_user_decision_table`, `the_recording_decision_table`, `an_unidentified_peer_cannot_start_stop_delete_or_move_recordings` |
 | `roomlerd record --microphone`, run by hand | Whoever runs it, as themselves | That account's | Nothing remote starts it |
+| A live session's sound, "Receive host audio" | A controller whose session carries sound. Not a recording | What the computer plays, never the default input, which on Linux is the microphone ([remote-control.md §5.1c](remote-control.md)). `ROOMLERD_AUDIO_SOURCE` can name another device, and it is the daemon's environment, which no wire message sets | `the_default_input_is_never_the_pick` |
 
-⚠️ **This is about the recording feature, not about control of the device.** Four
-general-control paths act as an account on the device, so they can start a LOCAL
-recording with the microphone, as they can start any other program that opens
-one:
+⚠️ **This is about the recording feature, not about control of the device.**
+Decided 2026-11-02 (FR-85 open decision 7): in AC7, "a remote controller" means the
+RC controller and the remote-recording feature, and the table above is that claim
+with its proof. Four general-control paths act as an account on the device, so they
+can start a LOCAL recording with the microphone, as they can start any other
+program that opens one. They stay as they are, and this is where they are written
+down:
 
-- A controller holding `INPUT` works roomler-desktop or a terminal with the
-  host's own mouse and keyboard.
-- `roomler exec` arrives as root on Linux, as SYSTEM in the console session on a
-  SystemContext host, and as the person on an attended Windows install. All three
-  pass the console-user gate. An anchored service, SYSTEM in session 0, does not.
-- `roomler ssh` in `console_user` mode runs in the console session on Windows. On
-  Linux it drops to the person at the screen, and on a system install that person's
-  socket serves it (P2e).
-- A Hive session (default off) runs as its mapped account, which passes the gate
-  where that account is the daemon's or root, and on a Linux system install where
-  it is the person at the seat.
+| Path | Arrives as | Its own gates | Why the local gate lets it in |
+|---|---|---|---|
+| An RC session holding `INPUT` | The person's own desktop: roomler-desktop or a terminal, worked with the host's mouse and keyboard | The host's consent to `INPUT` | The Recordings view is the person's own process |
+| `roomler exec` | Root on Linux, SYSTEM in the console session on a SystemContext host, the person on an attended Windows install | `EXEC_DEVICE` (`ADMINISTRATOR` only) and the owner's `exec_enabled` | `peer_is_console_user`: uid 0, or the console session. An anchored service, SYSTEM in session 0, does not pass |
+| `roomler ssh` in `console_user` mode | The console session on Windows. On Linux it drops to the person at the screen | `SSH_DEVICE` (`ADMINISTRATOR` only) and the owner's `ssh_enabled` | The console session on Windows. On a Linux system install, that person's socket (P2e). `daemon` mode is the exec row on Linux |
+| A Hive session (default off) | Its mapped account | The device's `hive_accounts` | Where that account is the daemon's or root, or on a Linux system install the person at the seat |
 
-Each has its own gates: the host's consent to `INPUT`, `EXEC_DEVICE` or
-`SSH_DEVICE` (`ADMINISTRATOR` only) with the owner's `exec_enabled` or
-`ssh_enabled`, and the device's `hive_accounts`. A local gate cannot tell them
-from the person, which is the limit keep busy documents
-(`peer_may_start_keep_busy`, FR-92 §3g, #2021). What they get is a local
-recording: no `controller_user_id`, so the `record` channel neither lists nor
-serves it, and the tray turns red (§7).
+A local gate cannot tell them from the person, which is the limit keep busy
+documents (`peer_may_start_keep_busy`, FR-92 §3g, #2021). A stricter gate on the
+recorder would not close it either: each path can run any other program that opens
+a microphone. What they get is a local recording: no `controller_user_id`, so the
+`record` channel neither lists nor serves it, and the tray turns red (§7).
 
 ## 11. The editor (P5)
 
