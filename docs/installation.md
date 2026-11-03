@@ -1325,6 +1325,9 @@ lines through `systemctl --user edit roomler`.
 
 ⚠️ Delegated, and the cgroups cannot be made: no worker runs. A worker that
 cannot have its limits never runs (FR-90 P8-2a-3), and the daemon's log says why.
+A failure that passes, such as a process of the unit still in its exit or
+systemd not answering, is tried again by a later worker's start (#3349). One
+that will not pass stays until the daemon restarts.
 
 ## macOS
 
