@@ -359,22 +359,22 @@ the vault is allowed it.
 
 The daemon runs as root, and a session runs as the account `hive_accounts` maps the
 starter to, through the one privilege path that exec, SSH and the PTY share, as an agent session
-runs it: [`exec::apply_session_run_as`](../agents/roomlerd/src/exec.rs#L917). The
+runs it: [`exec::apply_session_run_as`](../agents/roomlerd/src/exec.rs#L923). The
 account is resolved in the parent (`getpwnam_r`, `getgrouplist`), uid 0 is refused
-([`exec.rs:1048`](../agents/roomlerd/src/exec.rs#L1048)), and the child only calls
+([`exec.rs:1054`](../agents/roomlerd/src/exec.rs#L1054)), and the child only calls
 `setgroups`, `setgid` and `setuid`, then checks that they took.
 
 ⚠️ **A session holds no administrator group** (decision 13), as Windows denies its
 sessions the Administrators group:
 - It holds none of the account's administrator groups
-  ([`exec.rs:1121`](../agents/roomlerd/src/exec.rs#L1121)): root's own, the sudoers groups
+  ([`exec.rs:1127`](../agents/roomlerd/src/exec.rs#L1127)): root's own, the sudoers groups
   (`wheel`, `sudo`, macOS's `admin`) and those whose socket or device is root by another
   door (`docker`, `lxd`, `incus`, `libvirt`, `disk`). An account whose primary group is one
-  is refused ([`exec.rs:1186`](../agents/roomlerd/src/exec.rs#L1186)). The kernel then
+  is refused ([`exec.rs:1192`](../agents/roomlerd/src/exec.rs#L1192)). The kernel then
   grants the session nothing by those groups: no docker or libvirt socket, no disk
   device, no write into macOS's `/Applications` (`root:admin 775`).
 - On Linux the harness also starts with `no_new_privs`
-  ([`exec.rs:1243`](../agents/roomlerd/src/exec.rs#L1243)), so nothing it runs gains a
+  ([`exec.rs:1249`](../agents/roomlerd/src/exec.rs#L1249)), so nothing it runs gains a
   privilege by exec: no `sudo`, whatever sudoers says of the account.
 
 | A session, as an account whose `sudo` needs no password | Linux | macOS |
@@ -477,8 +477,8 @@ flowchart LR
 | ⚠️ A SystemContext worker is SYSTEM from the start and stays SYSTEM. With `ROOMLERD_ENABLE_SYSTEM_SWAP` on, every cycle of the service reads as if a controller were connected, so the worker is never swapped as one connects or leaves. Without SystemContext the worker is the console user throughout, elevated (`ROOMLERD_ELEVATE_WORKER`, on by default) | P1i-0 expected a remote-desktop connection to swap the worker and cut the running turns, from a gate 0.3.0-rc.7 retired. P1i-4 measured that it does not | [`win_service/supervisor.rs:891`](../agents/roomlerd/src/win_service/supervisor.rs#L891), [`:768`](../agents/roomlerd/src/win_service/supervisor.rs#L768) `decide_spawn` |
 | Either way the session is the same person at Medium. A SYSTEM worker takes the console session's token; a worker that is the user takes a restricted, Medium copy of its own token: every administrator group deny-only, no privilege but traverse (FR-85's recorder rule) | a session never holds an administrator's rights on Windows | [`hive_win.rs:135`](../agents/roomlerd/src/hive_win.rs#L135) `console_user`, [`win_token.rs:209`](../agents/roomlerd/src/win_token.rs#L209) |
 | `roomlerd hive-prep` does the wrapper's work as the user, in a Job Object of its own with a 30 s deadline: the config directory, core memory copied where nothing is, and the folder opened as the user | the daemon never writes into the user's profile | [`hive_win.rs:844`](../agents/roomlerd/src/hive_win.rs#L844) `prep`, [`:897`](../agents/roomlerd/src/hive_win.rs#L897) `run_prep` |
-| The harness is created suspended, assigned to its own Job Object (`KILL_ON_JOB_CLOSE`, no breakaway), and only then resumed. It inherits its three standard handles and nothing else | none of its tools escapes the job, and no other session's pipe leaks into it | [`spawn_into_job`](../agents/roomlerd/src/win_service/supervisor.rs#L2398), [`JobObject`](../agents/roomlerd/src/win_service/supervisor.rs#L2281) |
-| The environment is the user's own block with the session's variables laid over it by name, case-insensitively, and a NUL in a name or a value is refused | `Path` and `PATH` are one variable, and a NUL could smuggle in an entry of its own | [`merge_env_block`](../agents/roomlerd/src/win_service/supervisor.rs#L2694) |
+| The harness is created suspended, assigned to its own Job Object (`KILL_ON_JOB_CLOSE`, no breakaway), and only then resumed. It inherits its three standard handles and nothing else | none of its tools escapes the job, and no other session's pipe leaks into it | [`spawn_into_job`](../agents/roomlerd/src/win_service/supervisor.rs#L2483), [`JobObject`](../agents/roomlerd/src/win_service/supervisor.rs#L2281) |
+| The environment is the user's own block with the session's variables laid over it by name, case-insensitively, and a NUL in a name or a value is refused | `Path` and `PATH` are one variable, and a NUL could smuggle in an entry of its own | [`merge_env_block`](../agents/roomlerd/src/win_service/supervisor.rs#L2779) |
 | The harness is `hive_harness`, else the native installer's `%USERPROFILE%\.local\bin\claude.exe`, else npm's `%APPDATA%\npm\claude.cmd` run through `cmd.exe /d /v:off /s /c`. An argument holding one of cmd's metacharacters is refused, never escaped | npm's shim passes the line on again with `%*` inside an `IF (…)` block, and no quoting is right for both readers | [`hive_win.rs:690`](../agents/roomlerd/src/hive_win.rs#L690) `harness_command_line` |
 | A stop closes the harness's stdin, then ends its job after the grace | no signal reaches a console-less process | [`hive/supervisor.rs:6456`](../agents/roomlerd/src/hive/supervisor.rs#L6456) |
 
@@ -998,7 +998,7 @@ The privilege path sets the account's supplementary groups from `getgrouplist`, 
 every session on that Mac failed "starting the harness: Invalid argument (os error
 22)". The list is now cut to `sysconf(_SC_NGROUPS_MAX)`, in order, the primary group
 first, so the child holds fewer groups and never more
-([`exec.rs:1103`](../agents/roomlerd/src/exec.rs#L1103) `within_ngroups_max`). Exec, SSH
+([`exec.rs:1109`](../agents/roomlerd/src/exec.rs#L1109) `within_ngroups_max`). Exec, SSH
 and the PTY share the fix, since they share the path.
 
 The cap is for `setgroups` alone. `sudo` never reads that list on a Mac, and a Linux
@@ -1648,7 +1648,7 @@ The device advertises `hive-replica` while its owner's `hive_replica` is on and 
 opened, and `hive-archive` while `hive_archive` is on too
 ([`caps.rs:4525-4530`](../agents/roomlerd/src/encode/caps.rs#L4525-L4530)). A secondary org's
 connection strips both words, in its hello and in every heartbeat that re-announces the
-caps ([`signaling.rs:7020`](../agents/roomlerd/src/signaling.rs#L7020)), so that org's
+caps ([`signaling.rs:7023`](../agents/roomlerd/src/signaling.rs#L7023)), so that org's
 placement never picks this device.
 
 ⚠️ **Only a device with copies to tell about sends a replica frame**
@@ -2617,7 +2617,7 @@ stateDiagram-v2
 
 | Rule | Why | Where |
 |---|---|---|
-| The drain is taken up as its frame is read, before the next one: from that moment the run refuses prompts, and the session's task reads the drain before anything sent after it | a lease word right behind the drain must reach the session after it, or it would lift nothing and the drain would hold the session for ever | [`signaling.rs:5517`](../agents/roomlerd/src/signaling.rs#L5517), [`supervisor.rs:1455`](../agents/roomlerd/src/hive/supervisor.rs#L1455), [`supervisor.rs:2978`](../agents/roomlerd/src/hive/supervisor.rs#L2978) |
+| The drain is taken up as its frame is read, before the next one: from that moment the run refuses prompts, and the session's task reads the drain before anything sent after it | a lease word right behind the drain must reach the session after it, or it would lift nothing and the drain would hold the session for ever | [`signaling.rs:5520`](../agents/roomlerd/src/signaling.rs#L5520), [`supervisor.rs:1455`](../agents/roomlerd/src/hive/supervisor.rs#L1455), [`supervisor.rs:2978`](../agents/roomlerd/src/hive/supervisor.rs#L2978) |
 | Only the primary enrollment's drain counts. One for a run this device does not have at that fence, or for one a newer fence took, is refused `not_running` and moves nothing | like every Hive frame: a secondary org's admin has no say over the owner's sessions, and a stale frame moves nothing | [`supervisor.rs:1483`](../agents/roomlerd/src/hive/supervisor.rs#L1483), [`supervisor.rs:3014`](../agents/roomlerd/src/hive/supervisor.rs#L3014) |
 | No prompt begins while the session drains: a new one is refused in words, and one admitted before the drain waits in the queue | the session must go quiet at a tip | [`supervisor.rs:2894`](../agents/roomlerd/src/hive/supervisor.rs#L2894), [`supervisor.rs:5730`](../agents/roomlerd/src/hive/supervisor.rs#L5730), [`supervisor.rs:5739`](../agents/roomlerd/src/hive/supervisor.rs#L5739) |
 | The open approvals are withdrawn at once, and one that opens while the session drains is withdrawn as it opens | a turn waiting on a person could not end; the harness hears the approval withdrawn, and goes on | [`supervisor.rs:5531`](../agents/roomlerd/src/hive/supervisor.rs#L5531), [`supervisor.rs:5671`](../agents/roomlerd/src/hive/supervisor.rs#L5671), [`toolbelt.rs:304`](../agents/roomlerd/src/hive/toolbelt.rs#L304) |
@@ -2699,7 +2699,7 @@ sequenceDiagram
 
 | Rule | Why | Where |
 |---|---|---|
-| `rc:hive.prepare` runs every gate a start passes, as the device is configured now, and none of a start's side effects: nothing is stopped, nothing launched, no word kept. It answers in the start's own refusal words, on the connection it came on | a member that would refuse the start refuses before anything moves (spec §3b) | [`supervisor.rs:2545`](../agents/roomlerd/src/hive/supervisor.rs#L2545), [`supervisor.rs:713`](../agents/roomlerd/src/hive/supervisor.rs#L713), [`signaling.rs:5531`](../agents/roomlerd/src/signaling.rs#L5531) |
+| `rc:hive.prepare` runs every gate a start passes, as the device is configured now, and none of a start's side effects: nothing is stopped, nothing launched, no word kept. It answers in the start's own refusal words, on the connection it came on | a member that would refuse the start refuses before anything moves (spec §3b) | [`supervisor.rs:2545`](../agents/roomlerd/src/hive/supervisor.rs#L2545), [`supervisor.rs:713`](../agents/roomlerd/src/hive/supervisor.rs#L713), [`signaling.rs:5534`](../agents/roomlerd/src/signaling.rs#L5534) |
 | The prepare also asks for the copy: the session's checkpoints in this device's store. A teleport's prepare does not (P2f-1a): its copy comes after it | a moved start is put in place from them | [`supervisor.rs:2769`](../agents/roomlerd/src/hive/supervisor.rs#L2769) |
 | A run of the session here at an older fence does not count against `hive_max_sessions`, and a run at the fence asked, or a newer one, is refused unless it is that very run | the start supersedes the older run (P2e-1); a newer one is the session come back | [`supervisor.rs:2752`](../agents/roomlerd/src/hive/supervisor.rs#L2752), [`supervisor.rs:2720`](../agents/roomlerd/src/hive/supervisor.rs#L2720) |
 | `rc:hive.move` is kept by (session, fence) for the start right behind it, 10 min and 64 at once, and dropped only once that start has launched | a start refused before its launch finds it again when re-sent | [`supervisor.rs:1704`](../agents/roomlerd/src/hive/supervisor.rs#L1704), [`supervisor.rs:1724`](../agents/roomlerd/src/hive/supervisor.rs#L1724), [`supervisor.rs:1745`](../agents/roomlerd/src/hive/supervisor.rs#L1745) |
@@ -4272,7 +4272,7 @@ sequenceDiagram
 | Rule | Why | Where |
 |---|---|---|
 | A frame of its own, `rc:hive.search.grant`, never a field on the view grant. The device answers it as a view grant (`rc:hive.view.grant_ack`), and the peer rides the view's offer, ICE, renewal and close frames, keyed by the grant | a build before it must never read a search grant as a view of one session; the handshake is the one a view already proves | [`signaling.rs:4763`](../crates/remote_control/src/signaling.rs#L4763), [`view.rs:236`](../agents/roomlerd/src/hive/view.rs#L236) |
-| Sent only where the connection advertises `hive-search`: a build with `hive_archive` and `hive_replica` on. Matched by equality, and stripped from a secondary organization's connection with the other replica words | `hive` is its prefix and not the same promise: a build before it drops the grant, and the member would wait for an answer that never comes | [`models.rs:1036`](../crates/remote_control/src/models.rs#L1036), [`caps.rs:4536`](../agents/roomlerd/src/encode/caps.rs#L4536), [`signaling.rs:7030`](../agents/roomlerd/src/signaling.rs#L7030) |
+| Sent only where the connection advertises `hive-search`: a build with `hive_archive` and `hive_replica` on. Matched by equality, and stripped from a secondary organization's connection with the other replica words | `hive` is its prefix and not the same promise: a build before it drops the grant, and the member would wait for an answer that never comes | [`models.rs:1036`](../crates/remote_control/src/models.rs#L1036), [`caps.rs:4536`](../agents/roomlerd/src/encode/caps.rs#L4536), [`signaling.rs:7033`](../agents/roomlerd/src/signaling.rs#L7033) |
 | The device's own gates at every grant: the primary organization; an archive replica, by its owner's `hive_archive` and `hive_replica`, whatever the server asks; at most 500 sessions, the store's own bound on a filter, the two tied at compile time | a gate the server cannot open: a device that is no archive replica answers no search, whatever a server that may be compromised sends | [`view.rs:409`](../agents/roomlerd/src/hive/view.rs#L409), [`view.rs:86`](../agents/roomlerd/src/hive/view.rs#L86) |
 | What is searched: the sessions the grant names that the device holds a copy of, and nothing else. One named that it holds no copy of is left out; a copy it holds that the grant does not name is never searched, nor a session it ran itself. None left is `no_session` | the server names what the member may read; the device can narrow that, never widen it | [`view.rs:448`](../agents/roomlerd/src/hive/view.rs#L448) |
 | At most 8 searches a device, within its 32 viewers. A search is no session's viewer | a search is not a seat at one session's table, and a device's peers stay bounded | [`view.rs:528`](../agents/roomlerd/src/hive/view.rs#L528) |
