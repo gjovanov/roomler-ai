@@ -2319,7 +2319,7 @@ impl JobObject {
 
     /// Put `process` in the job. Under the per-user Scheduled Task the process
     /// is already in the task's job, and this job nests inside that one.
-    pub fn assign(&self, process: HANDLE) -> Result<()> {
+    pub(crate) fn assign(&self, process: HANDLE) -> Result<()> {
         // SAFETY: a live job handle we own; the caller keeps `process` alive
         // across the call.
         if unsafe { AssignProcessToJobObject(self.0.raw(), process) } == 0 {
