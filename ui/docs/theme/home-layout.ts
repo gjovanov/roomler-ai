@@ -151,17 +151,26 @@ export function renderHome(ctx: HomeCtx): string {
   const unlocked = new Map(
     installCards(SITE_ORIGIN, { wizardLinuxDaemon: true, wizardMacosDaemon: true }).map((card) => [
       card.os,
-      card.wizardUrl,
+      card,
     ]),
   )
-  const wizardButton = (url: string, gatedOn: string | null) =>
-    `<p${gatedOn ? ` data-wizard-unix="${gatedOn}" hidden` : ''}><a class="btn btn--tonal" href="${escapeHtml(url)}">${icon('download', { size: 17 })}<span>Roomler Setup</span></a></p>`
+  // #3202 — what the wizard needs first goes inside the button's own `<p>`, so
+  // `home.js` shows the two together.
+  const wizardButton = (url: string, gatedOn: string | null, hint: string | null) =>
+    `<p${gatedOn ? ` data-wizard-unix="${gatedOn}" hidden` : ''}><a class="btn btn--tonal" href="${escapeHtml(url)}">${icon('download', { size: 17 })}<span>Roomler Setup</span></a>` +
+    (hint ? `<small class="home-hint">${escapeHtml(hint)}</small>` : '') +
+    `</p>`
   const downloads = installCards(SITE_ORIGIN)
     .map((card) => {
-      const gatedUrl = card.wizardUrl ? null : (unlocked.get(card.os) ?? null)
+      const gated = card.wizardUrl ? null : (unlocked.get(card.os) ?? null)
+      const gatedUrl = gated?.wizardUrl ?? null
       return (
         `<div class="home-card home-card--os" data-os="${card.os}"><h3 class="home-card__title home-os">${icon(OS_ICON[card.os]!, { size: 22 })}<span>${escapeHtml(card.title)}</span></h3>` +
-        (card.wizardUrl ? wizardButton(card.wizardUrl, null) : gatedUrl ? wizardButton(gatedUrl, card.os) : '') +
+        (card.wizardUrl
+          ? wizardButton(card.wizardUrl, null, card.wizardHint)
+          : gatedUrl
+            ? wizardButton(gatedUrl, card.os, gated?.wizardHint ?? null)
+            : '') +
         (card.wizardUrl
           ? `<p class="home-muted">Or from a terminal:</p>`
           : `<p class="home-muted" data-terminal-label data-with-wizard="Or from a terminal:">From a terminal:</p>`) +

@@ -118,6 +118,10 @@
                   <span class="text-caption text-medium-emphasis ml-2">
                     then paste the token into the wizard
                   </span>
+                  <!-- #3202: what the download needs before it can run. -->
+                  <p v-if="block.hint" class="text-caption text-medium-emphasis mt-1 mb-0">
+                    {{ block.hint }}
+                  </p>
                 </template>
                 <template v-else>
                   <pre class="enroll-cmd text-caption pa-2 rounded" @click="copy(block.id, block.command)">{{ block.command }}</pre>

@@ -722,7 +722,7 @@ Two reports, about 19:50Z, each measured before any fix:
 
 | Report | Measured | Mechanism |
 |---|---|---|
-| "`https://roomler.ai/api/setup/windows` downloads a zip, not the installer direct." | `Content-Type: application/zip`, `roomler-setup-0.4.188-x86_64-pc-windows-msvc.zip`, while the public install page promises "a signed EXE with a role picker" (`ui/docs/content/start/install/windows.md:40`) | the release lane signs `roomler-setup.exe` and publishes it only inside a zip (`.github/workflows/release-setup.yml:525-607`); `pick_setup_asset` serves only a `.zip` for `windows-x86_64` (`crates/modules/fleet/src/setup_release.rs:221-245`); `stream_asset` (`:402`) streams that asset unchanged |
+| "`https://roomler.ai/api/setup/windows` downloads a zip, not the installer direct." | `Content-Type: application/zip`, `roomler-setup-0.4.188-x86_64-pc-windows-msvc.zip`, while the public install page promises "a signed EXE with a role picker" (`ui/docs/content/start/install/windows.md:40`) | the release lane signs `roomler-setup.exe` and publishes it only inside a zip (`.github/workflows/release-setup.yml:528-610`); `pick_setup_asset` serves only a `.zip` for `windows-x86_64` (`crates/modules/fleet/src/setup_release.rs:221-245`); `stream_asset` (`:402`) streams that asset unchanged |
 | "It installs a tunnel, not the daemon-system role (background service), which should be the default installation, with overlay and lock-screen control enabled. macOS and Linux should do the same." | on the operator's own machine the wizard's saved state (`crates/roomler-setup-core/src/wizard_state.rs:66`) held `{"step":"done","role":"tunnel-client"}` and an earlier test run's device name; the tunnel card came up selected, and a second, elevated run tried to enroll the machine under that test name | `loadPersistedState` restores the role and the device name whatever the saved step, and only moves the step back to Welcome (`agents/roomler-setup/src/front/app.js:179`); with no saved state nothing is selected at all (`state.role` starts `null`, `app.js:136`), and the Windows background service is "recommended" only in its card's title |
 
 Asked in the same exchange how the wizard could "automatically ask for sudo right or win run
@@ -778,7 +778,7 @@ macOS the server's switch), and the tunnel client:
 - **The release lane** stages the same signed EXE as its own asset,
   `roomler-setup-<v>-x86_64-pc-windows-msvc.exe`, with an `.exe.sha256` in the zip's format,
   after checking it byte for byte against the zip's copy
-  (`.github/workflows/release-setup.yml:615`); the publish job copies `*.exe` too (`:688`), so
+  (`.github/workflows/release-setup.yml:618`); the publish job copies `*.exe` too (`:691`), so
   the GPG step signs it and the attestation covers it. ⚠️ A tag run executes the workflow as it
   stood at the tag: the first EXE asset appears at the first `setup-v*` cut after this merges, which was `setup-v0.4.197`.
 - **The server** (`crates/modules/fleet/src/setup_release.rs:66`, `SetupFormat`; `:308`,

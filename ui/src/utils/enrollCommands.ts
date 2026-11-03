@@ -43,7 +43,17 @@ export interface CommandBlock {
   command: string
   /** True when `command` is a URL to download, not a shell command. */
   isDownload?: boolean
+  /** #3202 — a line under a download: what it needs before it can run. */
+  hint?: string
 }
+
+/**
+ * #3202 — the Linux wizard links WebKitGTK 4.1, which not every desktop has
+ * (the Fedora KDE lab image did not), and a missing library stops it before
+ * its window can say anything. So every Linux download of it says so.
+ */
+export const LINUX_WIZARD_NEEDS =
+  'Needs WebKitGTK 4.1: libwebkit2gtk-4.1-0 on Ubuntu and Debian, webkit2gtk4.1 on Fedora. The one-line install needs nothing first.'
 
 export interface OsCommands {
   os: EnrollOs
@@ -156,6 +166,7 @@ export function enrollCommands(
     label: 'Graphical installer (Roomler Setup)',
     command: `${base}/api/setup/${platform}`,
     isDownload: true,
+    ...(os === 'linux' ? { hint: LINUX_WIZARD_NEEDS } : {}),
   })
   // FR-97 D5 — off Windows the wizard had no agent role to install, so an
   // agent got the script and the manual path only. FR-129 B1-s: the server
@@ -245,16 +256,22 @@ export interface InstallCard {
    * prevent while a released wizard is not field-proven on that OS.
    */
   wizardUrl: string | null
+  /** #3202 — what the wizard needs first, where that OS says so, else null. */
+  wizardHint: string | null
 }
 
 /** The homepages' install cards, one per OS, from the agent's commands. With
  *  no `options` (the server unknown, or every switch off) the cards are
  *  exactly what they were before FR-129. */
 export function installCards(origin: string, options: EnrollOptions = {}): InstallCard[] {
-  return enrollCommands('agent', origin, null, 'system', false, options).map((os) => ({
-    os: os.os,
-    title: os.title,
-    command: os.blocks.find((b) => !b.isDownload)!.command,
-    wizardUrl: os.blocks.find((b) => b.isDownload)?.command ?? null,
-  }))
+  return enrollCommands('agent', origin, null, 'system', false, options).map((os) => {
+    const download = os.blocks.find((b) => b.isDownload)
+    return {
+      os: os.os,
+      title: os.title,
+      command: os.blocks.find((b) => !b.isDownload)!.command,
+      wizardUrl: download?.command ?? null,
+      wizardHint: download?.hint ?? null,
+    }
+  })
 }

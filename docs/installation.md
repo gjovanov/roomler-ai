@@ -1037,7 +1037,15 @@ sequenceDiagram
 
 - **The wizard needs WebKitGTK 4.1.** The Fedora KDE lab image lacked it
   (`sudo dnf install webkit2gtk4.1`). On Debian and Ubuntu the package is
-  `libwebkit2gtk-4.1-0`.
+  `libwebkit2gtk-4.1-0`. Its import table names `libwebkit2gtk-4.1.so.0` before
+  `libsoup-3.0.so.0` and `libjavascriptcoregtk-4.1.so.0`, so without the package a
+  terminal start stops at `error while loading shared libraries:
+  libwebkit2gtk-4.1.so.0`, before any window. Since #3202 every place a person gets
+  it says so: the Linux download block in the add-device dialog and on both
+  homepages (`LINUX_WIZARD_NEEDS`, `ui/src/utils/enrollCommands.ts`), the public
+  Linux install page, and the tarball's `README.md`
+  (`agents/roomler-setup/README-linux.md`), with the one-line install as the way
+  that needs nothing first.
 - **The cards appear only when the chosen server says so**: the wizard reads
   `GET /api/setup/features` and shows the Linux cards on a JSON
   `wizard_linux_daemon: true`, or on `wizard_unix_daemon: true`, which a server
