@@ -412,8 +412,11 @@ of each is to produce a number.
 
 - The instrument perturbs what it measures → AC1 exists precisely for this.
 - Off-thread work adds handoffs → every phase A/Bs **latency**, not just stalls.
-- Debouncing the route guard could delay a legitimate heal → bound it and keep the
-  worst-case reaction time.
+- Debouncing the route guard could delay a legitimate heal → P3 debounces the
+  poke only, never the route wave or the Major lane: a reaped `/32` is re-asserted
+  on the same signal as before, and a real network move pokes at once
+  (`lifecycle::netchange_action`). A no-delta burst inside the quiet falls back to
+  the silence trigger, so the worst-case reaction time stays where it was.
 
 ## Related
 
