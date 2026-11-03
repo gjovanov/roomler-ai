@@ -477,7 +477,7 @@ The operator chose on 2026-11-02 (#971): a secondary org's session is delegated 
 |---|---|---|
 | The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `agents/roomlerd/src/signaling.rs:2836` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
 | `run` refuses to start with no config | `agents/roomlerd/src/app.rs:3744-3749` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
-| Delegation is primary-org only, on purpose | `agents/roomlerd/src/signaling.rs:3454-3462`, `agents/roomlerd/src/app.rs:5034`, `:5218` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes |
+| Delegation is primary-org only, on purpose | `agents/roomlerd/src/signaling.rs:3454-3462`, `agents/roomlerd/src/app.rs:5037`, `:5221` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes |
 
 After P3 a Mac has one row in each org, and the worker talks to the server through the daemon alone:
 

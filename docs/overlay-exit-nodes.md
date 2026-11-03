@@ -235,7 +235,9 @@ context-free purges — `overlay::tun::purge_split_default()` and
 `roomlerd::purge_exit_routes()` and called:
 
 - at **startup** (a boot-reconciler that heals a stale `/1` *before* the runtime
-  reinstalls anything, regardless of `overlay_enabled`),
+  reinstalls anything, regardless of `overlay_enabled`), through
+  `roomlerd::purge_exit_routes_at_start()`, which waits for the DNS purge for
+  10 s at most: [below](#a-start-waits-for-the-dns-purge-10-s-at-most-3291),
 - immediately **before every `process::exit`** on the hard-exit paths, and
 - (FR-97 P0e) **after every exit of the daemon**, clean ones included, once the
   runtime is dropped (`purge_after_daemon` in `main.rs`): see
@@ -246,6 +248,67 @@ crash, so a leftover `0.0.0.0/1 → roomler` would black-hole all egress to a de
 NIC until the next clean run. On Linux the `dev`-scoped routes auto-cull, but the
 boot-reconciler covers kill-9/reboot there too. The NRPT DNS rule likewise
 persists across reboot, so `purge_exit_dns()` removes the tagged rule.
+
+### A start waits for the DNS purge 10 s at most (#3291)
+
+On Windows the boot purge of the exit-DNS rule is a `powershell` child, and its
+NRPT cmdlets go through WMI. Both run at Normal priority. A host kept busy by
+higher-priority work held that child for as long as the load lasted, and nothing
+before it could bring the device online: no hello, no remote control, no exec.
+A start now waits for the purge 10 s at most. Past that it goes on, and the
+purge finishes on a thread of its own.
+
+| A 4-vCPU Windows 11 guest, released 0.4.198, eight spinners at High priority | Unloaded | Under the load |
+|---|---|---|
+| the purge's `powershell` | 1.70–1.84 s | **158.68 s**, ending 0.3 s after the load |
+| `config-backed env fallbacks registered` → `caps probe: cache miss` | under 2 s | 158.75 s |
+| `cmd /c exit 0`, from a High-priority parent | 25 ms | 90.6 s |
+| `icacls <dir> /setowner`, from a High-priority parent | 14 ms | 18.6 s |
+
+The last two rows say any Normal-priority child waits this way, so the bound
+alone does not get such a start to its probe. The next children on that path
+were the four `icacls` steps of the config save every start makes for its crash
+bookkeeping (`agents/roomlerd/src/app.rs:4156`). A save now reads the
+directory's owner and DACL in-process and runs the steps only when they would
+change something
+([the hardening](operator-systemcontext-smoke.md#3-confirm-the-acl-is-locked-down)).
+
+```mermaid
+sequenceDiagram
+    participant S as start (app.rs)
+    participant G as PurgeGate
+    participant T as thread exit-dns-purge
+    participant P as powershell
+    participant O as an overlay DNS change
+    S->>G: run_within(10 s): one in flight
+    G->>T: spawn
+    T->>P: remove the rules tagged roomler-exit-dns
+    Note over S: waits 10 s at most
+    S->>S: config save, capability probe, hello: online
+    O->>G: wait_idle(): a purge is in flight, so wait
+    P-->>T: exits, once the load lets it run
+    T->>G: none in flight, notify
+    G-->>O: the steer goes on
+```
+
+| Rule | Where | Why |
+|---|---|---|
+| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:347`, `:360`, called at `agents/roomlerd/src/app.rs:4055` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
+| Past the bound the purge still runs to its end | `crates/tunnel-core/src/overlay/dns.rs:849` (`purge_exit_dns_within`), `:887` (`run_within`) | A stale `.`-root rule outlives a crash and a reboot, and it must still go |
+| Every DNS change waits while a purge is in flight | `crates/tunnel-core/src/overlay/dns.rs:596` (`run_cmd`), `:929` (`wait_idle`) | A purge that ended after a steer would delete the steer. The wait has no bound on purpose: the steer needs the order, and the change it holds is itself a child the same load would hold |
+| A purge counts in before its thread starts, and out however it ends | `crates/tunnel-core/src/overlay/dns.rs:871` (`PurgeGate`) | No DNS change slips in between, and a purge that panics holds nothing |
+| With no thread to run it on, the purge runs inline and unbounded, as before | `crates/tunnel-core/src/overlay/dns.rs:911` | The purge is load-bearing and the bound is not |
+| The purge's child has null stdio | `crates/tunnel-core/src/overlay/dns.rs:806` | A child that outlives its waiter must not hold pipes to it |
+| The route purges stay synchronous | `agents/roomlerd/src/lib.rs:360` | They are typed IP Helper calls, with no child to wait for |
+
+What the bound leaves as it was:
+
+- The hard-exit paths and `purge_after_daemon` still call `purge_exit_routes()`
+  synchronously. A process on its way out has nothing to come online for.
+- `host_ledger::purge()` runs `Remove-NetNat` only after a crashed router left a
+  NAT behind, and still waits for it.
+- The service's two `netsh` steps before it starts the worker, and the
+  capability probe's own child, are children the same load holds.
 
 ### IPv4 forwarding on a Windows exit or subnet router (FR-97 P0b-2b)
 

@@ -156,11 +156,27 @@ icacls "C:\ProgramData\roomler" /inheritance:r `
 >
 > The second command above drops inheritance and grants in one call, so
 > every child inherits SYSTEM and Administrators while it can still be
-> rewritten. The daemon's hardening (`crates/agent-core/src/config.rs:3519`,
-> steps at `:3525`) takes the directory for Administrators, grants, and only
+> rewritten. The daemon's hardening (`crates/agent-core/src/config.rs:3542`,
+> steps at `:3580`) takes the directory for Administrators, grants, and only
 > then drops inheritance. The wizard's
 > (`agents/roomler-setup/src/orchestrator_agent.rs:1528`) takes it, then
 > runs that one call. Both stop if they cannot take the directory.
+
+The daemon hardens on every save of this config, and every start saves it once
+for its crash bookkeeping. Since #3291 a save first reads the directory's owner
+and DACL in-process (`crates/agent-core/src/config.rs:3682`) and skips the
+steps when the directory already holds exactly what they write: owned by
+Administrators, inheritance off, full control with `(OI)(CI)` for SYSTEM and
+for Administrators, and no other entry (`crates/agent-core/src/config.rs:3625`). Anything else, a read that
+fails included, runs them as before. On a host kept busy by higher-priority work
+each `icacls` waited for the load to end (18.6 s for `/setowner` on a 4-vCPU
+guest), and the start could not reach its capability probe until they had run.
+
+| The steps' effect | On a directory in that state | Skipped, so |
+|---|---|---|
+| owner → Administrators; `/grant:r` SYSTEM and Administrators; `/inheritance:r` | changes nothing | nothing is lost |
+| `/remove` Users and Authenticated Users, `/T` | changes nothing on the directory; on an entry below it, removes such an ACE if someone added one | only SYSTEM, an administrator or that entry's owner can add one. The first two hold full control of the tree, and an owner can grant its own SID again at any time, which the sweep never removed. The sweep held none of them off |
+| the same `/T` on `hive` and `hive\run` | took away the hive's stat grant for Authenticated Users (`agents/roomlerd/src/hive_win.rs:972`) at every save; each session launch put it back | the grant stays as the hive wrote it |
 
 ### If SYSTEM is locked out of `C:\ProgramData\roomler\roomler` (#3073)
 
