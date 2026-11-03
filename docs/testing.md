@@ -233,9 +233,12 @@ Flakes fixed on 2026-10-30, and what each one teaches:
 > [!WARNING]
 > **A Mongo TTL index deletes on a monitor pass every 60 s, at any moment after expiry.** A test
 > that expires a row and then reads it races that pass: "one pairing row … 0" once in the
-> integration lane. `pairing_tests`' expiry test reads `serverStatus.metrics.ttl.passes`
-> ([`pairing_tests.rs:201`](../crates/tests/src/pairing_tests.rs#L201)) around each try, and
-> reruns only a try that a pass ran through. A missing row with no pass is still a failure.
+> integration lane (#3084). Don't count passes around the read to excuse a missing row:
+> `serverStatus.metrics.ttl.passes` moves when a pass *ends*, so a pass still running has
+> deleted the row and not been counted. Hold the sweep off in the test's own database instead:
+> `pairing_tests`' `hold_off_the_ttl_sweep`
+> ([`pairing_tests.rs:206`](../crates/tests/src/pairing_tests.rs#L206)) checks the index is
+> the product's, then gives it an hour's grace with `collMod`.
 
 > [!WARNING]
 > **An external tool's deadline in a test is the test's, sized for the busiest runner.**
