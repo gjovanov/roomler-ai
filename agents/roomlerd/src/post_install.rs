@@ -467,6 +467,20 @@ fn recover_wedged_install(
     run_recovery_cmd("taskkill", &["/F", "/IM", "msiexec.exe"]);
     std::thread::sleep(Duration::from_secs(5));
 
+    // #2107 — the one log that names the action this attempt stopped in.
+    let kept_note = crate::logging::log_dir()
+        .and_then(|dir| {
+            let log = PathBuf::from(format!("{}.log", installer_path.display()));
+            keep_wedged_log(&log, &dir)
+        })
+        .map_or_else(String::new, |kept| {
+            tracing::warn!(path = %kept.display(), "kept the wedged attempt's MSI log");
+            format!(
+                "; the wedged attempt's MSI log is kept at {}",
+                kept.display()
+            )
+        });
+
     // Spawn the retry against the ORIGIN install's flavour — a
     // staged-copy watcher's own path would classify PerUser and take
     // the non-elevated msiexec path, which a perMachine MSI rejects
@@ -476,7 +490,7 @@ fn recover_wedged_install(
             Ok(pid) => pid,
             Err(e) => {
                 outcome.status = InstallStatus::Timeout;
-                outcome.note = format!("installer wedged; retry spawn failed: {e:#}");
+                outcome.note = format!("installer wedged; retry spawn failed: {e:#}{kept_note}");
                 tracing::error!(error = %e, "retry spawn after wedge failed");
                 return;
             }
@@ -519,6 +533,21 @@ fn recover_wedged_install(
             tracing::error!(error = %e, "retry installer wait failed");
         }
     }
+    outcome.note.push_str(&kept_note);
+}
+
+/// #2107 — a wedged attempt's log, copied out of the staging dir: the startup sweep
+/// removes that dir an hour later. Two slots, so a host that wedges on every update
+/// keeps the last two and nothing piles up. Best effort, and returns where it landed.
+#[cfg(any(target_os = "windows", test))]
+fn keep_wedged_log(log: &std::path::Path, dir: &std::path::Path) -> Option<PathBuf> {
+    if !log.is_file() {
+        return None;
+    }
+    let kept = dir.join("msi-wedged.log");
+    let _ = std::fs::rename(&kept, dir.join("msi-wedged.prev.log"));
+    std::fs::copy(log, &kept).ok()?;
+    Some(kept)
 }
 
 /// Spawn a recovery shell-out, log its exit code, never fail the
@@ -1295,6 +1324,32 @@ mod tests {
             !should_wait_for_installer(0, false),
             "pid 0 is not waitable — kill(0, 0) addresses the whole process group, so the poll would succeed forever"
         );
+    }
+
+    /// #2107 — the copy is what outlives the staging sweep, and the slot before it
+    /// is what a second wedge on the next update does not cost.
+    #[test]
+    fn a_wedged_log_is_kept_and_the_one_before_it_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("x.msi.log");
+        let dir = tmp.path().join("logs");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(keep_wedged_log(&log, &dir), None, "no log, nothing kept");
+
+        std::fs::write(&log, "first wedge").unwrap();
+        let kept = keep_wedged_log(&log, &dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "first wedge");
+
+        std::fs::write(&log, "second wedge").unwrap();
+        assert_eq!(keep_wedged_log(&log, &dir).unwrap(), kept);
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "second wedge");
+        let prev = dir.join("msi-wedged.prev.log");
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), "first wedge");
+
+        std::fs::write(&log, "third wedge").unwrap();
+        keep_wedged_log(&log, &dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), "second wedge");
     }
 
     #[test]
