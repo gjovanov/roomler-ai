@@ -58,7 +58,7 @@ install's topology. Nothing is wrong.
 
 ## Root cause
 
-`agents/roomlerd/src/win_service/supervisor.rs:974` — `netd_enabled()`:
+`agents/roomlerd/src/win_service/supervisor.rs:1012` — `netd_enabled()`:
 
 ```rust
 fn netd_enabled() -> bool {
@@ -77,10 +77,10 @@ Its **behaviour is correct**: `.ok()` + `unwrap_or(false)` means "absent ⇒ the
 flag is off", which is right, and `overlay_netd` gates a scaffold that (per its
 own doc comment) *hosts nothing yet*.
 
-The defect is that `config::load` (`crates/agent-core/src/config.rs:3572`) is
+The defect is that `config::load` (`crates/agent-core/src/config.rs:3738`) is
 not a neutral reader. On the both-copies-missing arm it logs
 `tracing::error!(… "the host must be re-enrolled")`
-(`crates/agent-core/src/config.rs:3611-3617`) before returning `Err`.
+(`crates/agent-core/src/config.rs:3777-3783`) before returning `Err`.
 
 That severity is right for its *original* caller — the 2026-08-12 self-heal for
 an all-NUL config, where the worker really was exit-1'ing every 60 s and
