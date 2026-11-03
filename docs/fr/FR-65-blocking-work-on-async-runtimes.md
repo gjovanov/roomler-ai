@@ -192,6 +192,19 @@ OLD geometry. The viewer must never see a geometry change before its
 
 ### P2 — the per-frame encode call
 
+> **Status 2026-11-03 — the canary is built; the question it answers changed.**
+> FR-70 M1 moved capture, scale and encode onto their own OS thread
+> (`media_thread`, on since 0.4.70), so the encode call below no longer runs on
+> a tokio worker, and "dedicated encoder thread or not" was settled by that
+> move, not by measurement. What is left of AC4 is the measurement itself: does
+> anything still starve the runtime the pump and the overlay share? The canary
+> this section designed is now `agents/roomlerd/src/runtime_canary.rs`, a
+> 10 ms timer on the daemon's main runtime with a 10-minute lateness summary
+> and a WARN at the stall watch's 100 ms bar (manual §10,
+> [`docs/stall-watch.md`](../stall-watch.md)). It serves FR-70 AC1 as well.
+> Owed: a 7-day fleet read on the release that carries it, beside the STALL
+> census.
+
 **Confirmed mechanism, unquantified harm.** `FfmpegEncoder::encode()` is
 `async fn` in signature only — its body is `self.encode_sync(&frame)` with zero
 `.await`, and `spawn_blocking` appears nowhere in `encode/` except in comments.
