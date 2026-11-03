@@ -250,7 +250,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2813`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:191`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:363`, wired at `app.rs:4365`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:372`, wired at `app.rs:4404`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -2538,7 +2538,7 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   `enforce` can ask only about a browser the device has never met.
 - **When the config moves, its keys go with it** (#3096). A SystemContext worker that runs on the person's config
   promotes it to the machine-global path after a healthy run
-  ([`self_heal_machine_global_config`, `app.rs:1206`](../agents/roomlerd/src/app.rs#L1206)). The `peer-auth/` files
+  ([`self_heal_machine_global_config`, `app.rs:1212`](../agents/roomlerd/src/app.rs#L1212)). The `peer-auth/` files
   go first, never over a file already there, and the config is not promoted without them
   ([`promote`, `peer_auth.rs:736`](../agents/roomlerd/src/peer_auth.rs#L736)). A config promoted before that has no
   keys beside it. So an enrollment with no key at the machine-global path takes the one the active user's config
@@ -4626,7 +4626,7 @@ clean, and Windows can end a worker before its service host hears of a
 restart. On released 0.4.197 two `shutdown /r` within five minutes of a
 self-update reached `crash_count=3`, and a healthy device tried to roll
 itself back. `config::previous_run`
-([`crates/agent-core/src/config.rs:2748`](../crates/agent-core/src/config.rs#L2748))
+([`crates/agent-core/src/config.rs:2843`](../crates/agent-core/src/config.rs#L2843))
 is the one table that decides, on every start:
 
 | How the last run ended | Who can say | `PreviousRun` | Counts |
@@ -4666,7 +4666,7 @@ which has no API (`boot_id.rs`). Measured on a Win11 guest: the registry's
 copy and KUSER both read 7 before three restarts and 10 after.
 
 ⚠️ **The bookkeeping runs after preflight**
-([`agents/roomlerd/src/app.rs:4201`](../agents/roomlerd/src/app.rs#L4201),
+([`agents/roomlerd/src/app.rs:4240`](../agents/roomlerd/src/app.rs#L4240),
 a 15 s budget). A daemon that dies before it is not counted, and marks
 nothing. This is the one crash loop the ladder cannot see.
 
@@ -4716,7 +4716,7 @@ The sentinel goes where its reader looks:
 `attention_path_for_worker`, so a worker in SystemContext reaches the
 machine-global path, where the companion (running as the person) reads
 it. Its one reader is the companion's Overview
-([`agents/roomler-desktop/src/commands.rs:90`](../agents/roomler-desktop/src/commands.rs#L90)).
+([`agents/roomler-desktop/src/commands.rs:92`](../agents/roomler-desktop/src/commands.rs#L92)).
 
 ⚠️ **The way back by hand undoes itself unless updates are off first.**
 Uninstalling keeps the config and the enrollment, and installing the
