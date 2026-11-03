@@ -1248,6 +1248,23 @@ mod tests {
         assert!(cfg.orgs.is_empty());
     }
 
+    /// FR-43 P3 — an enrollment landing on a person's blank file is the primary,
+    /// with their settings kept. Appended beside blank identity fields, it would
+    /// be a secondary of nothing.
+    #[test]
+    fn apply_enrollment_on_a_blank_file_is_the_primary_and_keeps_settings() {
+        let mut blank = crate::config::AgentConfig::for_person_with_no_enrollment("mac").unwrap();
+        blank.keep_busy_enabled = true;
+        let fresh = fresh_for("https://a.invalid", "t1", "tok1");
+        let (cfg, outcome) = apply_enrollment(Some(blank), fresh, None, false).unwrap();
+        assert_eq!(outcome, EnrollOutcome::FreshPrimary);
+        assert_eq!(cfg.server_url, "https://a.invalid");
+        assert_eq!(cfg.tenant_id, "t1");
+        assert_eq!(cfg.agent_token, "tok1");
+        assert!(cfg.orgs.is_empty());
+        assert!(cfg.keep_busy_enabled);
+    }
+
     #[test]
     fn apply_enrollment_same_identity_refreshes_primary_and_keeps_orgs() {
         let mut existing = crate::config::test_fixture(); // server example.invalid / tenant tid

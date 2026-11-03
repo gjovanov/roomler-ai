@@ -518,6 +518,7 @@ mod tests {
             .send(WorkerInbound::Msg(Box::new(ServerMsg::Terminate {
                 session_id,
                 reason: roomler_ai_remote_control::models::EndReason::ControllerHangup,
+                limit: None,
             })))
             .await
             .unwrap();

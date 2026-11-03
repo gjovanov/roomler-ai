@@ -4890,7 +4890,10 @@ async fn run_cmd(
     // companion's device list and mesh.
     .with_org_http(org_http.clone())
     // FR-51 P4 — surface the enrollment's nature in `roomler status`.
-    .with_ephemeral(cfg.ephemeral);
+    .with_ephemeral(cfg.ephemeral)
+    // FR-43 P3a — a worker with no enrollment sends what needs a server to the
+    // root half.
+    .with_no_enrollment(unenrolled);
     // FR-85 — the local recording verbs: this daemon launches `roomlerd
     // record` (its own image, resolved now, before any package upgrade can
     // leave `/proc/self/exe` pointing at a deleted inode).

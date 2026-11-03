@@ -6397,6 +6397,125 @@ tenant_id = "tid2"
         assert!(!path.exists());
     }
 
+    /// FR-43 P3a — a GUI worker's view holds no enrollment and no host role,
+    /// because the root holds them and a second one on the machine would be a
+    /// defect, and it keeps the person's session knobs, which are why it reads
+    /// the file at all.
+    #[test]
+    fn a_workers_view_drops_every_enrollment_and_keeps_the_persons_knobs() {
+        let mut file = test_fixture();
+        file.ephemeral = true;
+        file.orgs = vec![OrgEntry {
+            label: "acme".into(),
+            server_url: "https://b.invalid".into(),
+            ws_url: None,
+            agent_token: "tok-acme".into(),
+            agent_id: "aid-acme".into(),
+            tenant_id: "t-acme".into(),
+            enabled: true,
+            overlay_mode: OrgOverlayMode::Off,
+            overlay_wg_secret_key: None,
+            overlay_wg_key_epoch: 0,
+            overlay_advertised_routes: Vec::new(),
+            overlay_exit_node_enabled: false,
+            advertise_routes: Vec::new(),
+            netstack_socks_port: None,
+        }];
+        file.overlay_enabled = true;
+        file.overlay_wg_secret_key = Some("WG".into());
+        file.ssh_enabled = true;
+        file.exec_enabled = true;
+        file.remote_config_enabled = true;
+        file.external_access_enabled = true;
+        file.hive_enabled = true;
+        file.vault_enabled = true;
+        file.auto_update = Some(true);
+        file.crash_count = 3;
+        file.rollback_attempted = true;
+        file.auto_grant_session = false;
+        file.keep_busy_enabled = true;
+        file.record_remote_enabled = true;
+        file.rc_clipboard = roomler_ai_remote_control::models::FeaturePolicy::Off;
+
+        let view =
+            file.for_unenrolled_worker("http://127.0.0.1:1", "ws://127.0.0.1:1/ws", "SECRET");
+
+        // Its signalling loop dials the stand-in, with the stand-in's secret.
+        assert_eq!(view.server_url, "http://127.0.0.1:1");
+        assert_eq!(view.ws_url.as_deref(), Some("ws://127.0.0.1:1/ws"));
+        assert_eq!(view.agent_token, "SECRET");
+        // No enrollment of any kind.
+        assert!(view.agent_id.is_empty());
+        assert!(view.tenant_id.is_empty());
+        assert!(!view.ephemeral);
+        assert!(view.orgs.is_empty());
+        assert!(!view.has_primary_enrollment());
+        // No host role, and no updater: the root owns the package.
+        assert!(!view.overlay_enabled);
+        assert_eq!(view.overlay_wg_secret_key, None);
+        assert!(!view.ssh_enabled);
+        assert!(!view.exec_enabled);
+        assert!(!view.remote_config_enabled);
+        assert!(!view.external_access_enabled);
+        assert!(!view.hive_enabled);
+        assert!(!view.vault_enabled);
+        assert_eq!(view.auto_update, Some(false));
+        assert_eq!(view.crash_count, 0);
+        assert!(!view.rollback_attempted);
+        // The person's own.
+        assert!(!view.auto_grant_session);
+        assert!(view.keep_busy_enabled);
+        assert!(view.record_remote_enabled);
+        assert_eq!(view.rc_clipboard, file.rc_clipboard);
+        assert_eq!(view.machine_name, file.machine_name);
+    }
+
+    /// FR-43 P3a — the file a person with no enrollment gets: it loads, in a
+    /// directory that wasn't there, reads as not enrolled, and holds a setting.
+    #[test]
+    fn a_blank_persons_file_loads_and_reads_as_no_enrollment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("first-run").join("config.toml");
+        let mut blank = AgentConfig::for_person_with_no_enrollment("mac").expect("blank");
+        blank.keep_busy_enabled = true;
+        save(&path, &blank).expect("save");
+
+        let loaded = load(&path).expect("load");
+        assert_eq!(loaded.machine_name, "mac");
+        assert!(loaded.keep_busy_enabled);
+        assert!(!loaded.has_primary_enrollment());
+        assert!(
+            test_fixture().has_primary_enrollment(),
+            "control: an enrolled file reads as one"
+        );
+    }
+
+    /// FR-43 P3a — a worker's startup saves leave the person's file as it was,
+    /// so their token survives for the switch's off. The control is the ordinary
+    /// startup save, which would have put the view over it.
+    #[test]
+    fn a_read_only_startup_save_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut file = test_fixture();
+        file.agent_token = "THE-PERSONS".into();
+        save(&path, &file).expect("save");
+        let on_disk = std::fs::read(&path).unwrap();
+        let view = load(&path).unwrap().for_unenrolled_worker(
+            "http://127.0.0.1:1",
+            "ws://127.0.0.1:1/ws",
+            "SECRET",
+        );
+
+        let mut writes = StartupWrites::read_only(&path);
+        writes.save(&view).expect("a save that writes nothing");
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
+
+        let mut writes = StartupWrites::after_load(&path);
+        writes.save(&view).expect("the ordinary save");
+        assert_eq!(load(&path).unwrap().agent_token, "SECRET", "control");
+    }
+
     /// #3073 — ownership and the grant come before anything that can remove
     /// access: once `/inheritance:r` has run, SYSTEM keeps the directory by
     /// owning it, and a child it does not own only through an ACE the
