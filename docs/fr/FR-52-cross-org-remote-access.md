@@ -942,7 +942,7 @@ Wrong turn, kept because it read as a result: the first "no relay" control filte
 
 Noticed, not changed:
 
-- After a session ends, the external viewer still offers **Force control (admin break-glass)**. It does nothing for an outsider, because the reason rides `rc:session.request` and the external path never sends that frame, but it should not be on that page.
+- After a session ends, the external viewer still offers **Force control (admin break-glass)**. It does nothing for an outsider, because the reason rides `rc:session.request` and the external path never sends that frame, but it should not be on that page. Filed as #3258.
 - The relayed session's device recorded `carrier="direct"`, local `Host`, remote `Prflx`. The relay's traffic reached it from an address it learnt as peer-reflexive, so FR-102's carrier label read a relayed session as direct. The viewer's `relayProtocol` and the ledger are what said relay. This guest sits close to the relay's private side, so how far that reaches past the lab was not measured.
 
 ### AC1: the N=600 runs
