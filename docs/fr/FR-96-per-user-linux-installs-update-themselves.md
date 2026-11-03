@@ -34,7 +34,7 @@ The released **0.4.130**, on the FR-93 lab's four Linux guests, 2026-10-12:
 The code agrees, line by line (master `d7a7b17aa`):
 
 - **The tarball has no way up.** `install_tarball_linux` refuses any `euid != 0`
-  (`agents/roomlerd/src/updater.rs:1836-1845`), and has since the tarball path landed (#462, 2026-08-15).
+  (`agents/roomlerd/src/updater.rs:1846-1855`), and has since the tarball path landed (#462, 2026-08-15).
 - **The `.deb` ladder asks a person.** A non-root daemon tries `pkexec apt-get install`, then `sudo -n`
   (`updater.rs:1771-1785`). On a desktop with a polkit agent that is a password prompt in front of whoever is
   at the screen, every 4 h. Without one, it is `sudo -n`, which works only where sudo needs no password.
@@ -46,7 +46,7 @@ The code agrees, line by line (master `d7a7b17aa`):
     `sudo -n`, then `pkexec`)"*, and `:197` says *"the tarball makes self-update work everywhere"*.
   - `docs/installation.md:497` says the updater *"hands off to MSI / `dpkg` / `installer` and restarts"*.
 - **Nothing restarts a per-user daemon onto a replaced binary.** There is no restart-on-replace anywhere
-  (`strip_deleted_suffix`, `updater.rs:2824-2832`, only fixes up a path for the watcher). So even an admin's
+  (`strip_deleted_suffix`, `updater.rs:2834-2842`, only fixes up a path for the watcher). So even an admin's
   `apt upgrade` leaves the per-user daemon on the old, unlinked image until something restarts it.
 
 **Who this serves.** Not yet measured, and partly unmeasurable from the server: FR-93 P2b's hello reports
@@ -149,7 +149,7 @@ A host without the helper (an install from before this FR) keeps today's path un
 ### 3.3 Onto the new binary (P2b, as built)
 
 The per-user daemon notices for itself (D2): `agents/roomlerd/src/replaced_binary.rs`, spawned beside the updater
-(`app.rs:5444-5451`) on a Linux, non-root daemon whose kill switch is unset and whose supervisor will relaunch it
+(`app.rs:5445-5452`) on a Linux, non-root daemon whose kill switch is unset and whose supervisor will relaunch it
 (`spawn`, `replaced_binary.rs:241-265`). ONE mechanism serves the helper's install, an admin's `apt upgrade` and a
 hand install alike, and the helper never speaks to a daemon.
 
@@ -243,7 +243,7 @@ at `:452` and `:461-469`):
   as a real install leaves it). It failed that row and restarted onto a binary that cannot run on the first cut,
   and passes all 14 cases on this one (§8).
 - **`roomlerd self-update`**, run by a non-root user on a host whose helper owns updates, wakes the helper instead
-  of failing (`app.rs:6115-6131`). It asks the daemon's own decision, `helper_owns_updates`
+  of failing (`app.rs:6116-6132`). It asks the daemon's own decision, `helper_owns_updates`
   (`updater.rs:4259-4267`), so the CLI and the daemon never disagree. Root keeps the direct path; `--check-only`
   touches nothing. On a daemon host `roomler self-update` already refuses and names `roomlerd self-update`.
 - **`README.Debian`**'s manual desktop flow enables the helper before the daemon starts, and says to leave it off
