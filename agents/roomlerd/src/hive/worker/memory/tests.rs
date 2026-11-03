@@ -109,6 +109,15 @@ fn sh(script: &str) -> tokio::process::Command {
 /// of the shell (#3425).
 const ASLEEP: &str = "exec sleep 30";
 
+/// One real-cgroup test at a time (#3425). They share the unit's cgroup and
+/// this process's [`READY`], and each readies them as a daemon's first start
+/// does, removing the unit's empty `hive-worker-*` cgroups: run side by side,
+/// one removed the cgroup another had just made for its worker, before the
+/// worker was in it, and that spawn failed with `ENODEV`. A daemon readies
+/// them only in a try of its own, under `one_try`, while no worker of its own
+/// has a cgroup. Each test holds this to its end.
+static REAL_CGROUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Systemd's answer is what it wrote. Each way it can say nothing is named in
 /// words, and none of them reads as an answer: past the bound, a failure to
 /// answer, and a `systemctl` that could not be run (#3349, q1's three).
@@ -163,6 +172,7 @@ fn an_oom_kill_is_read_from_its_cgroups_memory_events() {
 #[tokio::test]
 #[ignore = "needs a delegated cgroup with the memory controller (systemd-run --user --scope -p Delegate=yes)"]
 async fn a_worker_runs_in_a_bounded_cgroup_of_its_own_where_the_unit_delegates_one() {
+    let _turn = REAL_CGROUP.lock().await;
     let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
     let base = unit_dir(v2_path(&own).expect("a cgroup v2 hierarchy"));
     ready_for_test(&base).await.expect(
@@ -220,6 +230,7 @@ async fn a_worker_runs_in_a_bounded_cgroup_of_its_own_where_the_unit_delegates_o
 #[tokio::test]
 #[ignore = "needs a delegated cgroup with the memory controller (systemd-run --user --scope -p Delegate=yes)"]
 async fn the_devices_worker_has_its_own_bound_and_what_the_daemon_spawns_stays_outside() {
+    let _turn = REAL_CGROUP.lock().await;
     let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
     let base = unit_dir(v2_path(&own).expect("a cgroup v2 hierarchy"));
     ready_for_test(&base).await.expect(
@@ -551,6 +562,7 @@ async fn what_is_settled_is_asked_once() {
 #[tokio::test]
 #[ignore = "needs a delegated cgroup with the memory controller (systemd-run --user --scope -p Delegate=yes)"]
 async fn a_zombie_still_listed_holds_up_no_real_cgroup() {
+    let _turn = REAL_CGROUP.lock().await;
     let dir = cgroup_of_its_own("zombie").await;
     let pid = a_leader_gone_with_a_thread_left(&dir);
     let listed = std::fs::read_to_string(dir.join("cgroup.procs")).unwrap();
@@ -577,6 +589,7 @@ async fn a_zombie_still_listed_holds_up_no_real_cgroup() {
 #[tokio::test]
 #[ignore = "needs a delegated cgroup with the memory controller (systemd-run --user --scope -p Delegate=yes)"]
 async fn a_process_in_its_exit_is_waited_out_on_a_real_cgroup() {
+    let _turn = REAL_CGROUP.lock().await;
     let dir = cgroup_of_its_own("exit").await;
     let pid = a_process_holding_memory_in(&dir);
     // SAFETY: a signal to this test's own child.
