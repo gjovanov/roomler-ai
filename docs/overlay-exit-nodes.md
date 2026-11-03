@@ -273,6 +273,20 @@ directory's owner and DACL in-process and runs the steps only when they would
 change something
 ([the hardening](operator-systemcontext-smoke.md#3-confirm-the-acl-is-locked-down)).
 
+| The same guest and load, on a signed candidate with both changes | Measured |
+|---|---|
+| `icacls` children on the start | none |
+| the purge's `powershell` | runs to its end within a second of the load's end, in every run; a stale `roomler-exit-dns` rule planted before the start is gone afterwards |
+| the purge starts → the bound's warning | **10.28 s** with the worker's console host at High; 40.1 s and 46.0 s with it at Normal, where the warning waits for its own log line (#3438) |
+| `config-backed env fallbacks registered` → `caps probe: cache miss` | **19.1 s** with the console host at High; 57.3 s and 57.5 s with it at Normal |
+
+The rig raises the daemon to High. A daemon at Normal shares its console host's
+priority, so the console's share mostly belongs to the rig. What still waits on
+such a host: the device comes online only when the probe answers, and the
+probe's children starve until the load ends (#3439). A worker the watchdog
+stops under the load waits for the exit purge, which has no bound, before its
+replacement can start (#3440).
+
 ```mermaid
 sequenceDiagram
     participant S as start (app.rs)
