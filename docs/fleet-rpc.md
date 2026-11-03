@@ -398,7 +398,9 @@ unbounded run (`models::exec_limits`):
   exec-driven update. Under the daemon's own restart it meant 71.6 s offline,
   measured, until the watchdog forced `exit(2)`. The daemon now shuts its runtime down
   within `runtime_exit::SHUTDOWN_BUDGET` (3 s) and logs `runtime shut down at
-  its budget` when it leaves such a read behind.
+  its budget` when it leaves such a read behind. A command here runs in no job,
+  on purpose: it has to outlive the daemon it stopped. A Roomler SSH command is the
+  opposite ([`roomler-ssh.md`](roomler-ssh.md) § What outlives a session).
 
 Output is swept for the agent token(s), `Bearer …` headers and JWT-shaped
 strings **before it leaves the host** — results are persisted in `exec_audit`
