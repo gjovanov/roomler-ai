@@ -216,7 +216,7 @@ that person's browser and profile, at medium integrity.
 that folder and `HKCU\Environment`, and the same image goes on to run elevated:
 
 - it loads DLLs from System32 alone (the linker's `/DEPENDENTLOADFLAG:0x800`,
-  `SetDefaultDllDirectories`, and `secur32.dll` and `wintrust.dll` delay-loaded, since that flag
+  `SetDefaultDllDirectories`, and `secur32.dll`, `wintrust.dll` and `wtsapi32.dll` delay-loaded, since that flag
   does not reach an import's own imports), and `pe-dependent-load-flags.ps1` reads the flag and the import table
   back from the EXE in CI, in the release lane and in the verifier;
 - it names every program it starts by a full path from the kernel, and
