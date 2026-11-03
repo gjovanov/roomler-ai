@@ -284,11 +284,20 @@ its own sending is not known yet, and only `chrome://webrtc-internals` can show 
 - [ ] **AC1 — P0.** Chrome's answer is recorded (§2.3), and Safari's and Firefox's are measured or stated with why not.
 - [ ] **AC2 — the wire is additive.** An old agent sends no report and its sessions run as today; an old viewer sends no
   `local_relay_from`; an old server ignores the field, and the viewer falls back to its probe. Tests on each side.
-- [ ] **AC3 — owner-only.** A request naming a device the requester does not own is refused `not_your_device`, and no
+- [x] **AC3 — owner-only.** A request naming a device the requester does not own is refused `not_your_device`, and no
   descriptor leaves the server. Also tested for `other_network`, `device_offline`, `rc_overlay_off` and
-  `same_device`, each its own reason.
-- [ ] **AC4 — no probe once chosen.** A paired viewer makes no request to 127.0.0.1 on connect (unit test on the
-  connect path), and a viewer that is not paired probes exactly as today.
+  `same_device`, each its own reason. **Met (tests, read 2026-11-03):**
+  `resolve_local_relay_hands_out_only_the_requesters_own_device` (`crates/modules/fleet/src/hub.rs:7320`) asserts all
+  five refusals, and `a_named_device_s_relay_reaches_the_browser_and_the_target` (`:7390`) asserts through `dispatch`
+  that the browser gets the word and no relay. A refused device adds nothing to the session's relays (`:4206`), so no
+  descriptor reaches the target either. Both green on master in CI run 41538944854.
+- [~] **AC4 — no probe once chosen.** A paired viewer makes no request to 127.0.0.1 on connect (unit test on the
+  connect path), and a viewer that is not paired probes exactly as today. **Partial (read 2026-11-03):** the decision is
+  tested (`localRelayPlan`, `ui/src/__tests__/composables/useRemoteControl.spec.ts:4738`), and the connect path takes
+  its one relay probe behind that plan (`ui/src/composables/useRemoteControl.ts:9909`, `:9928`). No test drives
+  `connect`, so removing that gate would fail nothing, and the criterion names the connect path. Two requests stay by
+  design: the legacy re-look (above) and the clipboard half (§7), which fetches 127.0.0.1 when the clipboard channel
+  opens on a device with the `native` clipboard capability (`ui/src/composables/useRemoteControl.ts:10172`).
 - [ ] **AC5 — the field.** The MacBook's Chrome, the local-network permission reset to "ask", paired with the
   MacBook: a session to neo16 (`rc_overlay` on) runs `carrier="overlay_direct"` with no prompt. The red run, on
   today's build, is the same browser relaying through the far TURN (or prompting). Both runs on the issue.

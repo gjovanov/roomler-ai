@@ -1,6 +1,6 @@
 # FR-133: Nothing a person reads calls the daemon an "agent" — it is `roomlerd`
 
-**Issue:** [#3177](https://github.com/gjovanov/roomler-ai/issues/3177) · **Status:** P1 in review 2026-10-31 (D1–D3 decided 2026-10-30); spec and claim 2026-10-30 ·
+**Issue:** [#3177](https://github.com/gjovanov/roomler-ai/issues/3177) · **Status:** P1 shipped in 0.4.192 (#3209); AC1 to AC4 and AC7 met 2026-11-03; P2, P3 and P4 proposed (D1–D3 decided 2026-10-30); spec and claim 2026-10-30 ·
 **Related:** FR-46 ([#1051](https://github.com/gjovanov/roomler-ai/issues/1051), the retired `roomler-agent` names; its "MSI installer identity — its own program" row is this FR's P1) ·
 FR-21 (the retired-name guard, `scripts/name-audit.sh`) · FR-129 ([#3022](https://github.com/gjovanov/roomler-ai/issues/3022), the wizard; its phase C renames the wizard's own words)
 
@@ -57,7 +57,7 @@ and needs those lookups to accept both names.
 | phase | what | kill switch | status |
 |---|---|---|---|
 | P0 | spec + ledger row + issue | — | this commit |
-| P1 | the install surfaces: the MSI ProductName, shortcut and title (both flavours), the Authenticode description, the `.deb`/`.rpm` summary; `install.ps1`'s two lookups and the verify script accept both names; `install.sh`/`install.ps1` output. The wizard's own words ride FR-129 phase C, and the macOS grant notices ride #3164. **Where it landed:** `agents/roomlerd/wix/main.wxs:73` (Name), `:339` (shortcut), `:359` (title); `agents/roomlerd/wix-perMachine/main.wxs:71`, `:308`; `.github/workflows/release-agent.yml:2006`; `agents/roomlerd/Cargo.toml:7` (roomlerd ships no `.rpm`: only the companion does, and its summary never said "agent"); `scripts/install.ps1:109` (the exact names, old and new, per flavour), `:294`, `:476`; `agents/roomlerd/scripts/m3-a1-verify-win11.ps1:387`. Proved by `.github/workflows/installer-smoke.yml:941` | copy: a revert. The lookups match both names, so an older or a newer MSI is always found | in review: draft PR [#3209](https://github.com/gjovanov/roomler-ai/pull/3209), field-verified 2026-10-31 on the CI MSI (the log below). The release half is owed: AC1 and AC2 name the first release, and the UAC text and `apt show` only exist on a release |
+| P1 | the install surfaces: the MSI ProductName, shortcut and title (both flavours), the Authenticode description, the `.deb`/`.rpm` summary; `install.ps1`'s two lookups and the verify script accept both names; `install.sh`/`install.ps1` output. The wizard's own words ride FR-129 phase C, and the macOS grant notices ride #3164. **Where it landed:** `agents/roomlerd/wix/main.wxs:73` (Name), `:339` (shortcut), `:359` (title); `agents/roomlerd/wix-perMachine/main.wxs:71`, `:308`; `.github/workflows/release-agent.yml:2006`; `agents/roomlerd/Cargo.toml:7` (roomlerd ships no `.rpm`: only the companion does, and its summary never said "agent"); `scripts/install.ps1:109` (the exact names, old and new, per flavour), `:294`, `:476`; `agents/roomlerd/scripts/m3-a1-verify-win11.ps1:387`. Proved by `.github/workflows/installer-smoke.yml:941` | copy: a revert. The lookups match both names, so an older or a newer MSI is always found | shipped: [#3209](https://github.com/gjovanov/roomler-ai/pull/3209) merged 2026-10-31, first released in 0.4.192. Field-verified on the CI MSI on 2026-10-31 and on the released 0.4.197 packages (the log below) |
 | P2 | the companion and the web app, the viewer's banners included, and the daemon's own notifications that still open "Roomler agent:" (`agents/roomlerd/src/signaling.rs:1161`, `:1215`, `:1430`, `agents/roomlerd/src/app.rs:2537`) | a revert | proposed |
 | P3 | the docs site (`ui/docs/content`) | a revert | proposed |
 | P4 | a guard in CI: person-facing strings may not say "agent" except the listed identities (an allowlist, in the shape of `name-audit.sh`) | the guard's own baseline | proposed |
@@ -65,20 +65,29 @@ and needs those lookups to accept both names.
 
 ## Acceptance criteria
 
-- [ ] **AC1** — A fresh Windows install from the released MSI (both flavours) appears in Apps &
-      Features under the new name (D1), and its UAC prompt shows the new description.
-- [ ] **AC2** — An upgrade from 0.4.188 (named "Roomler Agent…") to the first release with P1
+- [x] **AC1** — A fresh Windows install from the released MSI (both flavours) appears in Apps &
+      Features under the new name (D1), and its UAC prompt shows the new description. **Met
+      (2026-11-02, 0.4.197):** both flavours list one entry under the new name. UAC reads
+      "Roomler installer" (was "Roomler Agent installer", `.github/workflows/release-agent.yml:2006`).
+      That half is the per-machine MSI's: the per-user one has no UAC prompt
+      (`agents/roomlerd/wix/main.wxs:16`).
+- [x] **AC2** — An upgrade from 0.4.188 (named "Roomler Agent…") to the first release with P1
       leaves ONE entry, under the new name, and keeps the service and its SystemContext mode.
-- [ ] **AC3** — `install.ps1 -Uninstall` removes an install made before P1 and one made after it.
-- [ ] **AC4** — `apt show roomlerd` and `dnf info roomlerd` print a summary without "agent".
+      **Met (2026-11-02):** read on 0.4.188 → 0.4.197. The first release with P1 was 0.4.192,
+      and this upgrade crosses the same rename.
+- [x] **AC3** — `install.ps1 -Uninstall` removes an install made before P1 and one made after it.
+      **Met (2026-11-02):** four installs, with the script production serves (the log below).
+- [x] **AC4** — `apt show roomlerd` and `dnf info roomlerd` print a summary without "agent".
       (Found 2026-10-31: roomlerd ships no `.rpm` at all, so `dnf info roomlerd` has nothing
-      to show; only the companion ships one, and its `summary` never said "agent".)
+      to show; only the companion ships one, and its `summary` never said "agent".) **Met
+      (2026-11-03, 0.4.197):** read with `apt show` on a Linux device (the log below).
 - [ ] **AC5** — Every page, progress line and Done text of the released wizard, every companion
       page and the web app's person-facing strings contain no "agent" outside the allowlist
       (asserted by tests, then by P4's guard).
 - [ ] **AC6** — The docs site's pages say `roomlerd`.
-- [ ] **AC7** — Docs: `docs/installation.md` and the `ship-it` skill updated, with a
-      `docs/README.md` row if a doc is added.
+- [x] **AC7** — Docs: `docs/installation.md` and the `ship-it` skill updated, with a
+      `docs/README.md` row if a doc is added. **Met:** `docs/installation.md:473` and
+      `.claude/skills/ship-it/SKILL.md:59`. No doc was added, so no row.
 
 ## Open decisions
 
@@ -106,3 +115,5 @@ and needs those lookups to accept both names.
 | 2026-10-31 | the same cell: `install.ps1 -Uninstall` from this branch, in Windows PowerShell 5.1 | ✅ on the upgraded per-Machine product, on a fresh per-User install and on a real pre-P1 install (released 0.4.191 per-Machine): each time 0 entries, no service, no `roomlerd.exe` |
 | 2026-10-31 | the same cell: this branch's per-User MSI, fresh | ✅ The same search: 1 app found, **Roomler** 0.4.192.1; Start menu `Roomler\Roomler.lnk`. The README as installed: 10 commands intact, none missing its space. `roomlerd --help` opens with the new summary. From an elevated SSH session the ARP record lands in HKLM, the mirror `installer-smoke` already documents: pre-existing, nothing to do with the name |
 | 2026-10-31 | the same cell: the `install.ps1` production serves today, on that per-User install | ❌ as predicted, and why `ship-it` § 2 states an order: `no 'Roomler Agent' MSI products registered`, `done.`, exit 0, and the product stays installed. The image carrying this script is promoted BEFORE the first release with the new name |
+| 2026-11-02 | released 0.4.197 MSIs, a clean throwaway Win11 guest, `install.ps1` as production serves it | ✅ **AC1, AC2, AC3**, read during FR-129's field run ([the read](https://github.com/gjovanov/roomler-ai/issues/3177#issuecomment-6578314826)). AC1: the per-machine MSI lists one entry, **Roomler (per-Machine)** 0.4.197, G ROX LTD, and UAC on the secure desktop reads "Roomler installer, Verified publisher: G ROX LTD"; the per-user MSI lists one entry, **Roomler** 0.4.197. AC2: 0.4.188 per-machine (`Roomler Agent (per-Machine)`) with SystemContext on, then `msiexec /i` of the 0.4.197 per-machine MSI: one entry under the new name, service Running and Automatic, `ROOMLERD_ENABLE_SYSTEM_SWAP=1` kept. AC3: `-Uninstall` on the wizard's install, on 0.4.188, on the upgraded one and on the per-user one: 0 entries, no service, no `roomlerd.exe`. What it leaves behind is [#3247](https://github.com/gjovanov/roomler-ai/issues/3247#issuecomment-6578313265). |
+| 2026-11-03 | released 0.4.197 `.deb`, a Linux device, read-only through `roomler exec` | ✅ **AC4.** `apt show roomlerd` and `dpkg -s roomlerd`, version `0.4.197-1`: `Description: Roomler daemon (roomlerd): remote desktop, private WireGuard mesh and tunnels`, and the extended description opens "Roomler Daemon". Neither holds the word. Before P1 the package said "Roomler AI remote-control agent — runs on the controlled host, connects to the Roomler API." (the source at `00c264cc6^`). `Provides: roomler-agent` and `Replaces: …, roomler-agent` remain in the same output: those are the retired package's identity, and the criterion is about the summary. |
