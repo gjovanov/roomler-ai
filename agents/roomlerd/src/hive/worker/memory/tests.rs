@@ -103,6 +103,12 @@ fn sh(script: &str) -> tokio::process::Command {
     cmd
 }
 
+/// What a stand-in runs: `sleep`, one process whatever `/bin/sh` is. Dash
+/// forks a `-c` line's last command, so without the `exec` the shell's child
+/// would be a second process in a worker's cgroup, and would outlive a kill
+/// of the shell (#3425).
+const ASLEEP: &str = "exec sleep 30";
+
 /// Systemd's answer is what it wrote. Each way it can say nothing is named in
 /// words, and none of them reads as an answer: past the bound, a failure to
 /// answer, and a `systemctl` that could not be run (#3349, q1's three).
@@ -114,7 +120,7 @@ async fn each_silence_of_systemd_is_named_and_none_reads_as_an_answer() {
     );
 
     let from = Instant::now();
-    let past = said(sh("sleep 30"), Duration::from_millis(50)).await;
+    let past = said(sh(ASLEEP), Duration::from_millis(50)).await;
     assert!(from.elapsed() < NOT_REACHED, "{:?}", from.elapsed());
     let failed = said(sh("echo Delegate=yes; exit 3"), NOT_REACHED).await;
     let not_run = said(
@@ -170,7 +176,7 @@ async fn a_worker_runs_in_a_bounded_cgroup_of_its_own_where_the_unit_delegates_o
     let program = super::super::Program {
         exe: "/bin/sh".into(),
         arg0: None,
-        args: vec!["-c".into(), "sleep 30".into()],
+        args: vec!["-c".into(), ASLEEP.into()],
     };
     let (_ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     let (_ours_d, theirs_d) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -222,7 +228,7 @@ async fn the_devices_worker_has_its_own_bound_and_what_the_daemon_spawns_stays_o
     let spawner = super::super::device::OwnBinary(super::super::Program {
         exe: "/bin/sh".into(),
         arg0: None,
-        args: vec!["-c".into(), "sleep 30".into()],
+        args: vec!["-c".into(), ASLEEP.into()],
     });
     let (_ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     let (_ours_d, theirs_d) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -257,7 +263,7 @@ async fn the_devices_worker_has_its_own_bound_and_what_the_daemon_spawns_stays_o
     );
 
     let mut outside = tokio::process::Command::new("/bin/sh")
-        .args(["-c", "sleep 30"])
+        .args(["-c", ASLEEP])
         .kill_on_drop(true)
         .spawn()
         .unwrap();
