@@ -37,6 +37,9 @@ pub mod orchestrator_tunnel;
 /// FR-129 B1 — the Linux and macOS daemon pipeline: the embedded
 /// `install.sh` halves under the desktop's own administrator prompt.
 pub mod orchestrator_unix;
+/// #3246 — the file the wizard checks is the file `msiexec` runs: the publisher
+/// check, the hold, and the elevated step.
+pub mod package_step;
 /// FR-129 A3 — the pairing session: the device code and the delivered
 /// token live here, in this process, and never reach the webview.
 pub mod pairing;

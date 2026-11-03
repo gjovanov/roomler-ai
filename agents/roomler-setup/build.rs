@@ -59,6 +59,8 @@ fn main() {
         // before `main` could run (measured, the spec's log). Delay-loaded, it
         // loads on first use, after `restrict_dll_search`, from System32 alone.
         println!("cargo:rustc-link-arg-bin=roomler-setup=/DELAYLOAD:secur32.dll");
+        // #3246 — the publisher check brings `wintrust.dll` in, the same case.
+        println!("cargo:rustc-link-arg-bin=roomler-setup=/DELAYLOAD:wintrust.dll");
         println!("cargo:rustc-link-arg-bin=roomler-setup=delayimp.lib");
     }
     tauri_build::build()

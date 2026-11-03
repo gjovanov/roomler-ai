@@ -269,7 +269,7 @@ sequenceDiagram
    and `#[serde(default)]`; an agent from before this change records `unknown`. `method` is one of `wizard`,
    `script-sh`, `script-ps1`, `msi`, `deb`, `pkg`, `manual`, `container`, `other`; `scope` is one of
    `system`, `per-user`, `attended`, `unknown`. The served scripts pass `--install-method`, the wizard sets
-   it in-process (`agents/roomler-setup/src/orchestrator_agent.rs:488-494`), and a hand-typed
+   it in-process (`agents/roomler-setup/src/orchestrator_agent.rs:626-627`), and a hand-typed
    `roomlerd enroll` is `manual`. Stored once on the agent row as `install`.
    *(P3 as built: the scripts set `ROOMLER_INSTALL_METHOD` / `ROOMLER_INSTALL_SCOPE`, the flag's env
    fallbacks, rather than the flag itself — a served script installs whatever release is current, and a
