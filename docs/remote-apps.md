@@ -209,7 +209,7 @@ caps-probe child (§4.3).
 | **X11 login session** | `list · focus · launch` | full list | n/a | `+ status` |
 | **Wayland session with Xwayland** (GNOME, KDE) | `list · focus · launch` | Xwayland windows; `unlisted: "native Wayland windows: this compositor exposes no protocol to enumerate them"` | `unlisted` **yes** (P2) | `+ status` |
 | ↳ **GNOME native windows** (P3) | — | named by `unlisted` | yes — GNOME *refuses* `Introspect.GetWindows` (`Access denied`, two D-Bus clients, Shell 48.8) and has no activate at all, so this is a reported limit, not a TODO | — |
-| ↳ **wlroots foreign-toplevel** | — | not built | no host in the fleet runs wlroots; a sway-in-WSL2 rig would be CI-green-equals-done | — |
+| ↳ **wlroots foreign-toplevel** | — | not built: FR-56 AC5 is waived and [#3311](https://github.com/gjovanov/roomler-ai/issues/3311) carries it | no device reports wlroots (the server's `capabilities.desktop`, 2026-11-02); a sway-in-WSL2 rig would be CI-green-equals-done | — |
 | **helpers missing** (`tmux`, `xterm`) on a working desktop | `list · focus · launch` — correct, listing and focusing work | `coverage.missing_tools` names each, with what it blocks and how to install it (P5) | **NO** — the viewer's parser copied `sources` and `unlisted` and dropped `missing_tools`; #1179 added the type and the template, never the parse. P5 was field-verified with the host probe, so nobody saw it | parser fixed; a test is red against the old parser |
 | **`wmctrl` missing**, session arm | **`list · focus · launch` — advertised** | `ok:false, supported:true, error: "wmctrl not installed (apt install wmctrl)"` | yes, in `error` — but the hello claimed `list` on a host that cannot list; P1 did that deliberately so the message could reach the operator at all | not advertised; `status` + `unavailable{tool_missing}`. ⚠️ **Launch is refused too**: a host with `xterm`/`tmux` but no `wmctrl` used to launch *blind* — a window the panel could neither list nor focus, the visible-for-silent trade P5 refused — and now gets the same reason |
 | **`wmctrl` missing**, Xvfb arm | `list · focus · launch` | same actionable `error` | yes | **unchanged** — AC3 freezes the Daemon arm; recorded rather than "tidied" |
@@ -370,7 +370,10 @@ server outlives both), it is `ssh`-attachable from a real login
   would flip toolkit apps from Xwayland to native), and the condition "no
   Xwayland at all" is not one this fleet has: GNOME and KDE start it by
   default. One rule for listing and launching, reported honestly, beats a
-  listing rule and a contradictory launching rule.
+  listing rule and a contradictory launching rule. FR-56's AC9 is waived on this
+  reasoning, which holds only while native windows cannot be listed, so
+  [#3311](https://github.com/gjovanov/roomler-ai/issues/3311) re-asks it on a
+  host where they can.
 
 ## 6. Per-window capture (P4) — the RAIL-shaped half
 
@@ -452,8 +455,9 @@ Three limits, stated rather than discovered:
 | 2026-10-31 | the same guest with a person's session; `portal_capture` + `window_capture`; the picker answered at the guest's console | AC7 | *Calculator* (native Wayland) alone in the browser; the next session, *FR56-WINDOW-B* (Xwayland) whole, though the calculator covers it on the real screen; with *Remember* ticked the session after that restored it 71 ms after the request, no dialog |
 | 2026-11-01 | a fresh guest on released 0.4.192, a person signed in, one X window of theirs open | AC10, the control | the dialog listed *FR56-CONTROL* and offered *New bash session*, the hello still `["status"]` |
 | 2026-11-01 | the same daemon at GDM's Wayland greeter, then on X11 with `wmctrl` still answering as `gdm` | AC10, **GREEN** | both dialogs: *No active graphical login session on this host — … (the login screen is showing — nobody is signed in at this machine's screen)*, and no *Launch new* |
+| 2026-11-02 | the server's `agents` collection, bounded `$group`s, counts only | the wlroots denominator behind FR-56's AC5 waiver | 28 Linux devices report a desktop and none names a wlroots compositor: 19 Wayland (2 `KDE`, 2 `gnome-wayland`, 15 naming none, which cannot exclude one, because the word is logind's), 1 X11, 8 with nobody at a seat |
 
-Still unbuilt: native enumeration on a wlroots host (none exists in the fleet).
+Still unbuilt: native enumeration on a wlroots host. No device reports one, FR-56's AC5 and AC9 are waived, and [#3311](https://github.com/gjovanov/roomler-ai/issues/3311) carries both until one exists.
 
 ## 8. Configuration and the probe
 
