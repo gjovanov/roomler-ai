@@ -470,7 +470,25 @@ so nothing it starts can be outside. One-shot: `session_job`
 Scheduled Task's job on a per-user daemon, and that outer job does not end them:
 it has no kill-on-close limit.
 
-⟦MEASURED⟧
+**Measured on a Win11 guest** (#3303), on a candidate build of the change. Each
+cell held six forms at once: a one-shot held by its shell, `ssh -tt node 'script'`,
+a busy shell, a shell at a prompt, sftp, and a one-shot that had already returned
+and left a child. A watcher outside every session polled the process list every
+300 ms. "Gone" is every process of the five open forms, at any depth:
+
+| Event | Per-user daemon | SYSTEM service, SystemContext, `daemon` | the same, `console_user` |
+|---|---|---|---|
+| the daemon stops | gone 1.7 s before the daemon's own exit | gone 3.0 s before it | gone 2.7 s before it |
+| the client is killed | gone within 0.6 s; the daemon stays | within 0.9 s | within 0.6 s |
+| the daemon is killed | gone in the daemon's own poll | the worker killed: in its own poll, and the service restarts it; the service killed too: in its poll | not read |
+| the shell `exit`s, sftp says `bye` | its tree is gone | the same | not read |
+
+The ended one-shot's child stayed in every cell, as designed. So the bound is: no
+later than the daemon's own exit on a stop, within one 300 ms poll of it on a
+crash, and under a second after the client goes. Neither shape logged
+`could not put the session in a job object`. Unread: a corporate laptop with EDR,
+a full-tunnel VPN, a locked screen, nobody signed in, and the sessions the SYSTEM
+service serves itself (FR-105).
 
 **Why a one-shot's end is different.** `ssh node 'Start-Process notepad'` returns
 at once, and what it started is what the person asked for. Ending that would kill
@@ -508,8 +526,8 @@ the device comes back on the new version with nobody signing in, on both daemon
 shapes. The session does not survive it: the stop ends the shell and the script
 with the daemon. The install survives because `msiexec` in the session is only a
 client. The Windows Installer service does the work, outside every session's job,
-and finishes it with the client gone. Read on a Win11 guest from 0.4.235 to
-0.4.236, both with the job:
+and finishes it with the client gone. Read on a Win11 guest from one candidate
+build of the change to the next, both with the job:
 
 | From inside the session | Per-user daemon | SYSTEM service, SystemContext |
 |---|---|---|
