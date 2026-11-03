@@ -633,15 +633,41 @@ impl ConsentBroker {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        std::fs::write(&path, format!("{now_ts}\n"))
-            .with_context(|| format!("writing sentinel {}", path.display()))?;
+        let body = format!("{now_ts}\n");
+        // ⚠️ Unix: written under a name of its own, created new and 0600, then
+        // renamed into place (#3433). The prompt's poll takes a sentinel the
+        // moment it exists and removes it. A chmod after the write then failed,
+        // "No such file or directory", and `record_decision` said false for an
+        // answer that had counted. The rename is atomic: the poll sees the
+        // whole file or nothing, already 0600, and an answer counts only once
+        // the rename has landed it. Windows writes no mode, so it has no step
+        // after the write to lose.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)?.permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(&path, perms)?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let tmp = self.inner.sentinel_dir.join(format!(
+                ".{session_hex}.{}.{}-{}.tmp",
+                kind.suffix(),
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let landed = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+                .and_then(|mut f| f.write_all(body.as_bytes()))
+                .and_then(|()| std::fs::rename(&tmp, &path));
+            if let Err(e) = landed {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e).with_context(|| format!("writing sentinel {}", path.display()));
+            }
         }
+        #[cfg(not(unix))]
+        std::fs::write(&path, body)
+            .with_context(|| format!("writing sentinel {}", path.display()))?;
         Ok(path)
     }
 
