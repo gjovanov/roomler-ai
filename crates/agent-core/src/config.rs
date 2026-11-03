@@ -808,6 +808,12 @@ pub struct AgentConfig {
     /// needed none of it (`ROOMLERD_WS_REPLACED_EXIT`).
     #[serde(default)]
     pub ws_replaced_exit: Option<bool>,
+    /// FR-28 — redial the control WS and the central `/derp` WS at a flat pace
+    /// while the front load balancer answers 502, instead of climbing the ladder
+    /// (`ROOMLERD_WS_FLAT_REDIAL`). Built-in default: OFF. See `ws_flat_redial`
+    /// in the config surface.
+    #[serde(default)]
+    pub ws_flat_redial: Option<bool>,
     /// C4 stage 1 — the standing warm TURN/UDP allocation, established
     /// while UDP works and kept alive so corp-VPN flow-grandfathering
     /// preserves a UDP relay leg across a VPN connect. Measurement-only
@@ -3084,6 +3090,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_init_auth_first: None,
         overlay_srflx_seek: None,
         ws_replaced_exit: None,
+        ws_flat_redial: None,
         overlay_warm_relay: None,
         overlay_quic_async: None,
         overlay_vpn_vantage: None,
@@ -3324,7 +3331,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 94] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 95] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -3389,6 +3396,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 94]
         ("OVERLAY_INIT_AUTH_FIRST", cfg.overlay_init_auth_first),
         ("OVERLAY_SRFLX_SEEK", cfg.overlay_srflx_seek),
         ("WS_REPLACED_EXIT", cfg.ws_replaced_exit),
+        ("WS_FLAT_REDIAL", cfg.ws_flat_redial),
         ("OVERLAY_WARM_RELAY", cfg.overlay_warm_relay),
         ("OVERLAY_QUIC_ASYNC", cfg.overlay_quic_async),
         ("OVERLAY_VPN_VANTAGE", cfg.overlay_vpn_vantage),

@@ -33,7 +33,7 @@ fn spawn_agent_signaling(
 /// Multi-org P1 — like [`spawn_agent_signaling`] but with an explicit
 /// [`signaling::OrgCtx`], so a test can drive a SECONDARY enrollment's loop
 /// exactly the way `run_cmd`'s org supervisors do.
-fn spawn_agent_signaling_as(
+pub(crate) fn spawn_agent_signaling_as(
     ctx: signaling::OrgCtx,
     cfg: AgentConfig,
     stop_rx: tokio::sync::watch::Receiver<bool>,
