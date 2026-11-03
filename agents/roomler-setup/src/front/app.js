@@ -44,17 +44,17 @@ const ROLE_COPY = {
   windows: {
     "daemon-system": {
       title: "Be accessed — background service (pre-logon, recommended)",
-      desc: "perMachine install + SystemContext: remote control works on the lock screen, UAC dialogs, and admin apps. Requires admin (UAC prompt).",
+      desc: "Installed for the whole computer as a Windows service, so remote control works on the lock screen, on UAC prompts and in administrator apps too. Needs an administrator's approval (a UAC prompt).",
       label: "Background service (pre-logon)",
     },
     "daemon-machine": {
       title: "Be accessed — attended service",
-      desc: "perMachine install for all users on this PC, without the SystemContext swap. Requires admin (UAC prompt) during install.",
+      desc: "Installed for everyone on this computer. Remote control reaches the desktop of whoever is signed in, not the lock screen or UAC prompts. Needs an administrator's approval (a UAC prompt) to install.",
       label: "Attended service",
     },
     "daemon-user": {
       title: "Be accessed — this user only",
-      desc: "perUser install under my account. No admin password needed.",
+      desc: "Installed for your account only, and runs while you are signed in. No administrator needed.",
       label: "This user only",
     },
   },
@@ -462,9 +462,10 @@ function roleLabel(role) {
 }
 
 function flavourLabel(flavour) {
-  if (flavour === "peruser") return "perUser";
-  if (flavour === "permachine") return "perMachine";
-  if (flavour === "permachine-system-context") return "perMachine + SystemContext";
+  // #3247: a person's words, on Done's Mode line and the install step's.
+  if (flavour === "peruser") return "for this user only";
+  if (flavour === "permachine") return "for everyone on this computer";
+  if (flavour === "permachine-system-context") return "for the whole computer, as a Windows service";
   // FR-129 B1: the Linux/macOS scopes, as the install trace spells them.
   if (flavour === "per-user") return "per-user";
   if (flavour === "system") return "system (root)";
@@ -586,20 +587,20 @@ function renderWelcome() {
 
   // Daemon detection summary. On Linux and macOS "perUser" is the person's
   // own enrollment and "perMachine" the system (root) daemon's.
-  const perUserWord = unix ? "per-user" : "perUser";
-  const perMachineWord = unix ? "system (root)" : "perMachine";
+  const perUserWord = unix ? "existing per-user install" : "installed for this user only";
+  const perMachineWord = unix ? "existing system (root) install" : "installed for the whole computer";
   if (a.kind === "clean") {
     agentSummary.textContent = unix && !a.supported
       ? "Daemon: no existing install detected."
       : "Daemon: no existing install detected.";
   } else if (a.kind === "peruser") {
-    agentSummary.textContent = `Daemon: existing ${perUserWord} install (version ${a.peruserVersion ?? "unknown"}).`;
+    agentSummary.textContent = `Daemon: ${perUserWord} (version ${a.peruserVersion ?? "unknown"}).`;
   } else if (a.kind === "permachine") {
-    agentSummary.textContent = `Daemon: existing ${perMachineWord} install (version ${a.permachineVersion ?? "unknown"}).`;
+    agentSummary.textContent = `Daemon: ${perMachineWord} (version ${a.permachineVersion ?? "unknown"}).`;
   } else if (a.kind === "ambiguous") {
     agentSummary.textContent = unix
       ? `Daemon: enrolled both per-user and as a system daemon (version ${a.peruserVersion ?? a.permachineVersion ?? "?"}) — two daemons on this machine.`
-      : `Daemon: both flavours installed (perUser ${a.peruserVersion ?? "?"} + perMachine ${a.permachineVersion ?? "?"}).`;
+      : `Daemon: installed twice, for this user only (${a.peruserVersion ?? "?"}) and for the whole computer (${a.permachineVersion ?? "?"}).`;
   }
   ambiguous.hidden = a.kind !== "ambiguous" || unix;
 
@@ -768,13 +769,13 @@ function crossFlavourWarning(agentDetect, flavour) {
   const wantsPerMachine = flavour.startsWith("permachine");
   const wantsPerUser = flavour === "peruser";
   if (agentDetect.kind === "peruser" && wantsPerMachine) {
-    return "Switching from perUser → perMachine. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator.";
+    return "Switching from an install for this user only to one for the whole computer. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator.";
   }
   if (agentDetect.kind === "permachine" && wantsPerUser) {
-    return "Switching from perMachine → perUser. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator.";
+    return "Switching from an install for the whole computer to one for this user only. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator.";
   }
   if (agentDetect.kind === "ambiguous") {
-    return "Both perUser and perMachine installs detected. The MSI's cleanup custom action will remove the one not selected.";
+    return "Roomler is installed twice here, for this user only and for the whole computer. The install removes the one you did not pick.";
   }
   return null;
 }
@@ -1490,7 +1491,7 @@ const STEP_LABELS = {
   ElevationUnavailable: "No administrator prompt — run the command below",
   Done: "Done",
   Error: "Error",
-  SystemContextError: "SystemContext step failed",
+  SystemContextError: "Turning on lock-screen access failed",
 };
 
 // FR-129 B1 — the halves' rows are keyed by half, so the privileged and the
@@ -1734,10 +1735,10 @@ function handleProgress(event, live) {
 
   if (type === "SystemContextError") {
     const stageLabel = {
-      env_var_write: "Writing the service env-var failed",
+      env_var_write: "Saving the service's lock-screen setting failed",
       service_restart: "Restarting the service failed",
-      unknown: "SystemContext step failed",
-    }[data.stage] ?? `SystemContext (${data.stage}) failed`;
+      unknown: "Turning on lock-screen access failed",
+    }[data.stage] ?? `Turning on lock-screen access (${data.stage}) failed`;
     document.getElementById("systemcontext-error-stage").textContent = stageLabel;
     document.getElementById("systemcontext-error-message").textContent = data.message ?? "";
     document.getElementById("systemcontext-error-hint").textContent = data.hint ?? "";
@@ -1874,10 +1875,10 @@ function checklistLabel(event) {
   if (t === "Error") return `Error at ${d.step}: ${d.message}`;
   if (t === "SystemContextError") {
     const stageLabel = {
-      env_var_write: "Writing service env-var",
-      service_restart: "Restarting service",
-      unknown: "SystemContext step",
-    }[d.stage] ?? `SystemContext (${d.stage})`;
+      env_var_write: "Saving the service's lock-screen setting",
+      service_restart: "Restarting the service",
+      unknown: "Turning on lock-screen access",
+    }[d.stage] ?? `Turning on lock-screen access (${d.stage})`;
     return `${stageLabel} failed: ${d.message}${d.hint ? " — " + d.hint : ""}`;
   }
   return base;
