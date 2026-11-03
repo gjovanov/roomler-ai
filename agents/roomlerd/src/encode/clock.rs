@@ -22,7 +22,7 @@
 //!
 //! Who asks: the encoder thread (`encode::thread`) and OpenH264's worker on
 //! every OS, the DRM capture worker on Linux, the capture worker on macOS.
-//! Nothing else of the daemon does.
+//! Nothing else of the daemon does: not Media Foundation's worker, on Windows.
 //!
 //! A kernel without util clamping (`CONFIG_UCLAMP_TASK` off) refuses the
 //! request, and the encoder runs as before; the log says so once.
@@ -30,18 +30,18 @@
 //! macOS and Windows have a request of their own (P3, #2430). Neither is a
 //! clamp, and neither is inherited: each covers only the thread that makes it.
 //! That is the whole of an H.264 frame, on OpenH264's one worker, and none of
-//! libvpx's workers. Neither has been measured yet, so each OS's request is
-//! opt-in until its own hardware has answered ([`DEFAULT_ON`]):
-//! - **macOS:** the thread's QoS class, `QOS_CLASS_USER_INTERACTIVE`.
-//!   `pthread_create` gives a new thread `QOS_CLASS_DEFAULT` whatever its
-//!   creator runs at (`sys/qos.h`).
-//! - **Windows:** the thread leaves power throttling, Microsoft's "HighQoS"
-//!   (`SetThreadInformation`, `ThreadPowerThrottling`). Microsoft documents the
-//!   throttling of a background service as "on battery", so a measurement says
-//!   little without its power source.
+//! libvpx's workers. Each OS's default is what its own hardware answered
+//! ([`DEFAULT_ON`]):
+//! - **macOS, off:** the thread's QoS class, `QOS_CLASS_USER_INTERACTIVE`. It
+//!   changed nothing on a Mac. `pthread_create` gives a new thread
+//!   `QOS_CLASS_DEFAULT` whatever its creator runs at (`sys/qos.h`).
+//! - **Windows, on for software encoders:** the thread leaves power throttling,
+//!   Microsoft's "HighQoS" (`SetThreadInformation`, `ThreadPowerThrottling`).
+//!   It doubled H.264's speed on a hybrid laptop on AC, nobody has measured it
+//!   on battery, and [`HARDWARE_DEFAULT_ON`] keeps hardware encoders out.
 //!
-//! The switch: `ROOMLERD_ENCODER_CLOCK=0` never asks, `=1` asks on macOS and
-//! Windows too.
+//! The switch: `ROOMLERD_ENCODER_CLOCK=0` never asks, `=1` asks on every thread
+//! that can, and unset takes the defaults below.
 
 use std::sync::Mutex;
 
@@ -50,10 +50,17 @@ use std::sync::Mutex;
 pub const CLAMP_MIN: u32 = 1024;
 
 /// Whether a thread asks when `ROOMLERD_ENCODER_CLOCK` is unset: on where the
-/// clock was measured. macOS and Windows flip this only on their own numbers
+/// request was measured to gain. Each OS moves this only on its own numbers
 /// (#2430): a frame back to back against the same frame at a 30 fps cadence
 /// (`encoder-smoke --bench`), with the request and without it.
-pub const DEFAULT_ON: bool = cfg!(target_os = "linux");
+pub const DEFAULT_ON: bool = cfg!(any(target_os = "linux", target_os = "windows"));
+
+/// [`DEFAULT_ON`] for a thread whose encoder works on the GPU. Only QSV has been
+/// measured, on Windows (#2430): 5–10 % faster on a hybrid laptop, and on a
+/// desktop `hevc_qsv`'s p95 rose 10 %. Nothing has shown a gain worth that, and
+/// a default reaches backends nobody measured, so on macOS and Windows such a
+/// thread asks only on `=1`.
+pub const HARDWARE_DEFAULT_ON: bool = cfg!(target_os = "linux");
 
 /// What a thread's request did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +91,32 @@ pub fn ask_for_this_thread(role: &'static str) -> Outcome {
     let outcome = ask(enabled());
     say_once(role, outcome);
     outcome
+}
+
+/// Ask for an encoder thread's clock, by what encodes on it: the switch means
+/// the same on both, and only the default differs. A role of its own, because
+/// one process can hold both kinds and [`say_once`] speaks once per role.
+pub fn ask_for_encoder_thread(hardware: bool) -> Outcome {
+    let role = if hardware {
+        "hardware-encoder"
+    } else {
+        "encoder"
+    };
+    let outcome = ask(tunnel_core::env::flag(
+        "ENCODER_CLOCK",
+        default_for_encoder(hardware),
+    ));
+    say_once(role, outcome);
+    outcome
+}
+
+/// The default an encoder thread takes when the switch is unset.
+fn default_for_encoder(hardware: bool) -> bool {
+    if hardware {
+        HARDWARE_DEFAULT_ON
+    } else {
+        DEFAULT_ON
+    }
 }
 
 /// The request itself, with the switch passed in (tests decide it without
@@ -332,6 +365,42 @@ mod tests {
     #[test]
     fn the_kill_switch_asks_for_nothing() {
         assert_eq!(ask(false), Outcome::Off);
+    }
+
+    /// Linux: unset, every encoder thread asks. A kernel without util clamping
+    /// refuses, which is still an ask.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unset_asks_on_linux() {
+        std::thread::spawn(|| {
+            assert_ne!(ask(default_for_encoder(false)), Outcome::Off);
+            assert_ne!(ask(default_for_encoder(true)), Outcome::Off);
+        })
+        .join()
+        .expect("test thread");
+    }
+
+    /// Windows: unset, a software encoder's thread leaves power throttling, which
+    /// doubled H.264's speed on a hybrid laptop. A hardware encoder's thread
+    /// stays as it was: `hevc_qsv`'s p95 rose 10 % on a desktop (#2430).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unset_asks_for_a_software_encoder_alone_on_windows() {
+        std::thread::spawn(|| {
+            assert_eq!(ask(default_for_encoder(true)), Outcome::Off);
+            assert_eq!(ask(default_for_encoder(false)), Outcome::Unthrottled);
+        })
+        .join()
+        .expect("test thread");
+    }
+
+    /// macOS: unset, no thread asks. The request changed nothing on a Mac
+    /// (#2430), so off is the measured choice.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unset_asks_for_nothing_on_macos() {
+        assert_eq!(ask(default_for_encoder(false)), Outcome::Off);
+        assert_eq!(ask(default_for_encoder(true)), Outcome::Off);
     }
 
     /// The request is a VER1 `sched_attr` (56 bytes, the first size that carries

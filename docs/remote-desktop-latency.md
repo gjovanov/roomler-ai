@@ -81,7 +81,7 @@ Three independent levers, each hatched (`agents/roomlerd/src/encode/`):
 2. **Off-runtime encode.** The 20–30 ms HW encode no longer stalls the async
    runtime the DataChannel send task shares. P5 did it with `block_in_place`;
    since FR-70 M1 (default on since 0.4.70) the encoder lives on its own thread per
-   session and the pump awaits the packets (`thread.rs:387` `encode`, called at
+   session and the pump awaits the packets (`thread.rs:392` `encode`, called at
    `peer.rs:9535`). `block_in_place` remains the inline path, `media_thread = false`.
 3. **fps-first shedding** (`fps_pace`, default on). When the encoder can't hold
    the target frame rate, frames are consumed on an **even grid** at the

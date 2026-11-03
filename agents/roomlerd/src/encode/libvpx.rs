@@ -803,6 +803,9 @@ impl crate::encode::thread::EncoderOps for Vp9Encoder {
     // inline path stays a plain call, verbatim.
     const INLINE_BLOCK_IN_PLACE: bool = false;
 
+    // libvpx encodes on the CPU.
+    const HARDWARE: bool = false;
+
     fn encode_sync(&mut self, frame: &Frame) -> Result<Vec<EncodedPacket>> {
         Vp9Encoder::encode_sync(self, frame)
     }
@@ -992,6 +995,10 @@ fn rc_mode_from_env() -> vpx::vpx_rc_mode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // FR-112 P3 — left out of the impl, libvpx would read as hardware, and
+    // Windows' request would silently stop reaching its encoder thread.
+    const _: () = assert!(!<Vp9Encoder as crate::encode::thread::EncoderOps>::HARDWARE);
 
     fn synth_bgra(w: u32, h: u32) -> Frame {
         let mut data = vec![0u8; (w * h * 4) as usize];

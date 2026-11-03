@@ -10,10 +10,10 @@ criterion field-verified on a release (§9).
   (11 moves in 40 s).
 - P4's docs: [#2425](https://github.com/gjovanov/roomler-ai/pull/2425).
 - P3 (macOS, Windows) moved to [#2430](https://github.com/gjovanov/roomler-ai/issues/2430), and the hardware
-  pace's own flaw to [#2432](https://github.com/gjovanov/roomler-ai/issues/2432). P3's requests are opt-in (§4) and
-  measured (§9): on a hybrid Windows laptop the request doubles H.264's speed for 9–35 % more energy a frame, on a
-  desktop it helps a little, and on a Mac it changes nothing. Each OS's defaults, a live session and a laptop on
-  battery are owed there.
+  pace's own flaw to [#2432](https://github.com/gjovanov/roomler-ai/issues/2432). P3's requests are measured (§9): on
+  a hybrid Windows laptop the request doubles H.264's speed for 9–35 % more energy a frame, on a desktop it helps a
+  little, and on a Mac it changes nothing. So on Windows a software encoder's thread asks by default, a hardware
+  encoder's does not, and on macOS none does (§4). A live session and a laptop on battery are owed there.
 Spec and claim 2026-10-17, on the operator's *"why is asahi having
 less than 30fps, cant it reach 60?"* and, after the answer, *"yes do it"* · **Owner:** remote desktop (the software
 encode paths) · **Anchors:** master `391f114a7` ·
@@ -167,8 +167,9 @@ flowchart LR
 - **macOS and Windows ask differently (P3, [#2430](https://github.com/gjovanov/roomler-ai/issues/2430)).** macOS
   sets the thread's QoS class (`QOS_CLASS_USER_INTERACTIVE`), and Windows takes the thread out of power throttling
   (`SetThreadInformation`, Microsoft's "HighQoS"). Neither passes to the threads it starts (§9), so each request
-  covers OpenH264's worker wholly and libvpx's workers not at all. Both stay opt-in (`ROOMLERD_ENCODER_CLOCK=1`,
-  `DEFAULT_ON`) until the operator decides on the numbers in §9. The two OSes turned out to have different traps. On
+  covers OpenH264's worker wholly and libvpx's workers not at all. Each default (`DEFAULT_ON`, `HARDWARE_DEFAULT_ON`)
+  follows the numbers in §9: on Windows a software encoder's thread asks and a hardware encoder's does not, and on
+  macOS none does. The two OSes turned out to have different traps. On
   a Mac the clock falls with the idle gap, as on Linux, and the request does not lift it: XNU caps a daemon's request
   at user-initiated, priority 37. On a hybrid Windows laptop a process halves in speed after its first 3–4 seconds,
   at any cadence, and the request removes that.
@@ -238,7 +239,7 @@ flowchart LR
 | **P2b** | the H.264 RTP pump's tier: target 60 on Linux, the same pace (`SoftwarePace`, shared with P2a) and ceiling, OpenH264's frame rate following the rate it runs at, its runtime settings held until its first frame and its max bitrate moving with the target, the auto-fps-cap left to Windows | `ROOMLERD_SW_FPS_60=0` | ✅ released in 0.4.142, field-verified on the Asahi host (§9) | M |
 | **P2d** | the software pace's steps up wait for headroom: down at once, up only once the estimate clears the higher step by 2.5 fps (`SW_PACE_UP_MARGIN_FPS`); the hardware pace keeps margin 0 until it is measured ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)) | `ROOMLERD_SW_PACE_UP_MARGIN=0` (0.4.142's pace) | ✅ released in **0.4.143**, field-verified on it (§9): no pace change in 38 and 43 windows where 0.4.142 flapped, and the switch gives the flapping back. Before it: a candidate on the Asahi host (0.4.142's pace 14 moves in 40 s, the margin 2); unit: margin 0 replays 0.4.142's logged field trace window for window | S |
 | ~~**P2c**~~ | ~~software H.264's ≤ 1280-px cap decided by the measured encode~~ — dropped: the viewer's default `original` already overrides the cap (§3), and the host encodes 2048×1080 in 5.5 ms | — | — | — |
-| **P3** | the clock elsewhere, moved to [#2430](https://github.com/gjovanov/roomler-ai/issues/2430) so this FR could close on what Linux measured: macOS (`QOS_CLASS_USER_INTERACTIVE` on the encoder thread, OpenH264's worker and the capture worker) and Windows (the encoder thread and OpenH264's worker out of power throttling); each OS's default for this and for the 60 fps tier follows its own measurement | `ROOMLERD_ENCODER_CLOCK`: `0` never asks, `1` asks on macOS and Windows, off there by default | 🟡 the requests are written, opt-in and measured on one hybrid laptop, one desktop and one Mac (§9): Windows gains, macOS does not; each OS's default and the tier's are the operator's; a laptop on battery, a hardware encoder's thread and the live numbers are owed on #2430 | S |
+| **P3** | the clock elsewhere, moved to [#2430](https://github.com/gjovanov/roomler-ai/issues/2430) so this FR could close on what Linux measured: macOS (`QOS_CLASS_USER_INTERACTIVE` on the encoder thread, OpenH264's worker and the capture worker) and Windows (the encoder thread and OpenH264's worker out of power throttling); each OS's default for this and for the 60 fps tier follows its own measurement | `ROOMLERD_ENCODER_CLOCK`: `0` never asks, `1` asks on every thread that can, unset asks on a Windows software encoder's thread and nowhere else off Linux | 🟡 the requests are written and measured on one hybrid laptop, one desktop and one Mac (§9). The operator's decision on those numbers: Windows asks by default, from the first release after FR-63's read has started; macOS stays off; the 60 fps tier stays off on both until a live read. The hardware arm then kept a hardware encoder's thread out of the Windows default (§9). A laptop on battery, every hardware backend but QSV and the live numbers are owed on #2430 | S |
 | **P4** | docs: `docs/rate-control.md` (the software tier, the ceiling), `docs/encoders.md` (the clock, why one slice), the `docs/README.md` index row | — | ✅ `encoders.md` § Software encoders (the clock, the tier, OpenH264's settings), `rate-control.md` § Software encoders and two config rows, both index rows | S |
 
 ## 5. Test plan
@@ -693,3 +694,83 @@ VP9-444's rows read the same way: 2.46 and 2.48 GHz at a 30 fps cadence at 1080p
   them too. Not measured here: either run an arm with `--encoder hardware`, or scope the flip to software encoders.
 - **Other machines.** One hybrid laptop, one desktop and one Mac. The drop may depend on the CPU, the power plan or
   the Windows build.
+
+**P3, 2026-11-03 01:04–01:48Z: a hardware encoder's thread.** The installed 0.4.197's `encoder-smoke --encoder hardware
+--bench`, one-shot through `roomler exec`, with `ROOMLERD_ENCODER_CLOCK=0` against `=1`, on the hybrid laptop and the
+desktop above. The operator's decision was on for Windows, with the hardware encoders still to be read. #3307 carries it
+for software encoders. The Step log is
+[on #2430](https://github.com/gjovanov/roomler-ai/issues/2430#issuecomment-6593370078).
+
+*The hardware arm.*
+
+These two hosts reach QSV only. **NVENC, AMF, D3D12 and Vulkan are unmeasured.** 10 s arms at 1920×1080, `drag:1000`,
+one process per row, at both cadences. Six rounds, except the laptop's `av1_qsv`, `vp9_qsv` and control, which have
+five.
+
+| Host, what opened | 30 fps cadence, ms p50 · p95, `=0` → `=1` | 60 fps cadence |
+|---|---|---|
+| Laptop, `h264_qsv` | 10.54 · 11.13 → **10.02 · 10.55** | 10.48 · 11.05 → **9.52 · 10.11** |
+| Laptop, `hevc_qsv` | 10.88 · 11.76 → **10.25 · 11.04** | 10.79 · 11.43 → **9.82 · 10.52** |
+| Laptop, `av1_qsv` | 10.22 · 11.10 → **9.56 · 10.41** | 10.13 · 10.75 → **9.15 · 9.86** |
+| Laptop, `vp9_qsv` | 22.88 · 26.30 → 22.32 · 25.98 | 22.87 · 25.18 → 22.32 · 24.77 |
+| Laptop, `mf-h264` software, the control | 11.33 · 11.84 → 11.29 · 11.78 | 11.27 · 11.76 → 11.21 · 11.73 |
+| Desktop, `h264_qsv` | 5.90 · 7.98 → 6.03 · 8.08 | 5.63 · 7.25 → 5.68 · 7.41 |
+| Desktop, `hevc_qsv` | 5.70 · 6.70 → 5.83 · **7.31** | 5.46 · 6.48 → 5.50 · **7.11** |
+| Desktop, `vp9_qsv` | 8.96 · 10.16 → 9.12 · 10.48 | 8.79 · 9.88 → 8.87 · 10.23 |
+| Desktop, `mf-h264` software, the control | 5.21 · 7.13 → 5.28 · **10.73** | 5.19 · 6.19 → 5.38 · 7.22 |
+
+Bold marks a change that passes the rule below.
+
+- **`hevc_qsv`'s p95 rose 9–10 % on the desktop**, in all 12 pairs, against 1–3 % between rounds. It's about 0.6 ms,
+  and nobody may ever see it. The rule was set beforehand so that this wouldn't be argued after the fact.
+- **What the scope gives up is small.** A frame's work is on the GPU, so the laptop's `h264_qsv`, `hevc_qsv` and
+  `av1_qsv` gain 5–10 %, 0.5–1 ms, and `vp9_qsv` 2 %. A software encoder doubled on the same host.
+- **A default also reaches what nobody measured.** Every other hardware backend would have taken this on no numbers at
+  all. Scoped, the default moves only the threads the 11-02 arms measured.
+
+*What else it showed.*
+
+- **The control moved too, and the cause wasn't found.** `rtp:h264` opens Microsoft's software MFT on both hosts, and
+  Media Foundation's worker never asks, so the request can't reach that encoder. On the laptop it's flat, as it should
+  be. On the desktop its p95 rises in all 6 rounds at 30 fps. Arm order doesn't explain it: every shift follows `=1`,
+  in both positions of a pair. A session's hardware encoder thread hands frames off the same way the bench's does, so
+  the control doesn't excuse `hevc_qsv`.
+- **Media Foundation's worker looks caught by the same trap, and nothing asks for it.** On the laptop the software MFT
+  took 5.24 ms p50 over a process's first 30 frames and 11.3 ms over a 10 s arm, at either setting of the switch. The
+  desktop reads 5.6 and 5.2 ms. The first figure is one short run, so this is a lead and not a measurement.
+- **Frames a second and watts don't speak for the encoder here.** The bench renders its scene on the asking thread, so
+  `=1` speeds up the harness on every row: the laptop's control goes from 30.8 to 47.4 frames a second at a 60 target
+  with its encode time flat. Set against that control, round by round, the laptop's hardware cells show no consistent
+  change in energy a frame (0.82–1.12 times the control's ratio, five pairs each), and the desktop's rise 5–7 % at 30
+  fps and 1 % at 60.
+
+*How it was judged.*
+
+- **The rule, set before the first run.** A hardware cell is worse if its p50 or p95 rises on a sign test across
+  rounds at p ≤ 0.08, by a median of at least 5 %, and by more than half the rounds' own spread, or if its energy a
+  frame rises at least 10 % with both times flat. Any such cell keeps the default off every hardware encoder's thread.
+  The energy clause fired on no hardware cell. After one round showed the harness in the watts, and before the other
+  rounds were read, I added the reading against the control.
+- **Arms.** One process per row: one cell, one size, one `--bench-fps`. `=0` and `=1` ran back to back, with the order
+  flipped every pair and every round. Same frames: each cell's output rate is the same in both arms.
+- **Positive control.** On all 204 arms `clock=` reads `off` at `=0` and `unthrottled` at `=1`. Every QSV arm opened
+  in hardware, with a verdict of `ok`.
+- **The build.** Both hosts ran one 0.4.197 binary, by length and timestamp. Master's encode path has changed since
+  only by a note on a failed open.
+- **The hosts.** Each of the 51 chunks passed its gate first: no input for 15 minutes, no installer running, load
+  under 40 %, no RC session open, and exec in the console's session, because in session 0 the input check can't see
+  the console. No gate refused. The laptop was on AC throughout.
+- **What's missing.** 54 chunks were planned. The laptop's sixth round lost three when an exec failed at the
+  controlling end. They weren't re-run, because no result could change the decision.
+- **Left behind: nothing.** No file was written to either host, no daemon restarted, and no bench process remained
+  afterwards.
+
+*Still owed.*
+
+- **A live session:** `avg_encode_ms` at a 30 target and the fps at 60 with the tier opted in, on the laptop first.
+  It's also the proof that a session's encoder thread drops the way a bench process does.
+- **A laptop on battery**, the case Microsoft documents. It needs someone to unplug a laptop for three minutes.
+- **Every hardware backend but QSV.** `=1` asks, so each can have a read of its own.
+- **Media Foundation's worker.** The ask is one line, but on by default it would ship unmeasured, and no release can
+  run its A/B. A test build on the laptop could.
+- **Other machines.** One hybrid laptop, one desktop and one Mac.
