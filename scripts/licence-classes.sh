@@ -46,6 +46,7 @@ CLIENT_PATHS=(
   agents/roomlerd
   agents/roomler-desktop
   agents/roomler-cli-shim
+  agents/roomlerdw
   agents/roomler-setup
   agents/roomler-cli
   crates/agent-core
@@ -101,6 +102,7 @@ CLIENT_CRATES=(
   roomlerd
   roomler-desktop
   roomler-cli-shim
+  roomlerdw
   roomler-setup
   roomler-cli
   roomler-node-core
@@ -117,6 +119,7 @@ CLIENT_CRATES=(
 # the header sweep, is what stops the split from silently rotting.
 SHIPPED_AGENT_CRATES=(
   roomlerd
+  roomlerdw
   roomler-cli
   roomler-cli-shim
   roomler-desktop

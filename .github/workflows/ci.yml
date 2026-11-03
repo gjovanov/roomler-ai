@@ -1635,6 +1635,14 @@ jobs:
       # the named pipe the person's tray and CLI dial, the peer read from the
       # OS at accept time, and (P10b) the token probe that refuses a SYSTEM
       # caller keep busy's On.
+      # #3292 — the launcher is Windows-only code, and every Linux lane compiles
+      # its stub. The rolling log's stderr capture is `cfg(windows)` too, in a crate
+      # whose tests otherwise run only on Linux and on the Mac's machine id.
+      - name: The per-user launcher and its stderr on Windows — clippy + unit tests (#3292)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings
+          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture
       - name: LocalAPI on Windows — clippy + unit tests (FR-92 P10b)
         if: ${{ !cancelled() }}
         run: |
@@ -1878,7 +1886,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomlerd --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture --tests -- -D warnings
-          cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer capture::gpu_frame
+          cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer capture::wgc_backend::tests::the_mta_outlives_a_wgc_worker capture::gpu_frame
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.
