@@ -4521,10 +4521,12 @@ mod tests {
         )
         .await
         .expect("the shell leaves when told to");
-        assert!(
-            !err.contains("roomler-ssh:"),
-            "the shell did not start: {err:?}"
-        );
+        // Past the line that says it waits, the server says nothing on
+        // stderr: a refusal would say why there.
+        let refused = err
+            .lines()
+            .any(|l| l.contains("roomler-ssh:") && !l.contains("waiting up to"));
+        assert!(!refused, "the shell did not start: {err:?}");
         let (out, err, exit) = command.done.await.unwrap();
         assert!(
             out.contains("command-ran"),
