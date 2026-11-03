@@ -599,10 +599,12 @@ async fn start_step(
 }
 
 /// #3246 — a zip carries no signature of its own, so what is inside decides, and
-/// all of it does: a genuine `roomler.exe` beside a `version.dll` of someone
-/// else's would load that DLL. Each file is checked except plain text, in a new
-/// folder under `work`, so a refused archive has overwritten nothing. The
-/// signer's name is the program's.
+/// all of it does: a genuine `roomler.exe` imports `secur32.dll`, `bcrypt.dll`,
+/// `iphlpapi.dll` and `crypt32.dll`, none of them a KnownDLL, with no
+/// `DependentLoadFlags`, so Windows looks for each in its own folder first and
+/// would load one of someone else's left there. Each file is checked except
+/// plain text, in a new folder under `work`, so a refused archive has
+/// overwritten nothing. The signer's name is the program's.
 #[cfg(any(target_os = "windows", test))]
 pub fn check_archive(archive: &Path, work: &Path) -> Result<String, Refusal> {
     let folder = work.join(format!("check-{}", new_stage_name()));

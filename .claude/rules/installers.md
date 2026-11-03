@@ -77,7 +77,8 @@ limited process can rename another file into that path, and an elevated `runas` 
 also does **not** download under `%TEMP%`, and does not override `TEMP` for itself (WebView2's browser
 runs as the session's user). Any manifest name that becomes a path goes through
 `asset_resolver::plain_name`. A zip has no signature, so every file in one but plain text passes the
-publisher check: a genuine `roomler.exe` would load a `version.dll` left beside it. `wintrust.dll` is
+publisher check: a genuine `roomler.exe` would load a `secur32.dll` left beside it (its imports are no
+KnownDLLs, and it sets no `DependentLoadFlags`). `wintrust.dll` is
 delay-loaded for the same reason as `secur32.dll`, and `-NotImported` reads both.
 
 ⚠️ **The cards narrow to what can work here** (`role::RoleLimit`), each with its note.
