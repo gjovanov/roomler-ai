@@ -151,6 +151,20 @@ pub struct AgentConfig {
     #[serde(default)]
     pub macos_supervise_gui_worker: bool,
 
+    /// FR-43 P3 — on macOS, ONE device row: the GUI worker holds no enrollment
+    /// of its own (`run --supervised --unenrolled`), so the root daemon's row
+    /// serves every session. Read by the root daemon at its start, and only
+    /// with [`Self::macos_supervise_gui_worker`] on: with no supervisor there
+    /// is no worker to run that way.
+    ///
+    /// Default OFF: a person's enrollment on this Mac stays what the worker
+    /// runs on, and a Mac with none has no worker. Device-owned like the key
+    /// above, so it is absent from `DesiredConfig` and no server can push it.
+    ///
+    /// No effect on any other platform.
+    #[serde(default)]
+    pub macos_one_row: bool,
+
     /// FR-55 — whether this device asks the OS to stay awake so it remains
     /// reachable: `never` (default) | `on-ac` | `always`.
     ///
@@ -2263,6 +2277,87 @@ impl AgentConfig {
         c
     }
 
+    /// FR-43 P3a — the config a GUI worker with no enrollment runs on: this
+    /// file with every enrollment and every host-global role taken out, and
+    /// its signalling loop pointed at the stand-in control plane
+    /// (`roomlerd::unenrolled`). The person's session knobs stay: they are why
+    /// the worker reads the file at all.
+    ///
+    /// ⚠️ A VIEW, and never written back. An unmigrated person's enrollment is
+    /// still in the file, which is what makes `macos_one_row = false` a real
+    /// off: [`StartupWrites::read_only`] keeps the daemon's startup saves off
+    /// it, and every later writer reloads the file first.
+    ///
+    /// The root holds what this takes out, so a worker running any of it would
+    /// be a second one on the machine. Crash bookkeeping goes too: a worker
+    /// cannot install a package, so it has no rollback to count towards, and the
+    /// supervisor records its crashes on the root's enrollment.
+    pub fn for_unenrolled_worker(&self, server_url: &str, ws_url: &str, secret: &str) -> Self {
+        let mut c = self.clone();
+        c.server_url = server_url.to_string();
+        c.ws_url = Some(ws_url.to_string());
+        c.agent_token = secret.to_string();
+        c.agent_id = String::new();
+        c.tenant_id = String::new();
+        c.ephemeral = false;
+        c.orgs = Vec::new();
+        c.tunnel_routes = Vec::new();
+        c.overlay_enabled = false;
+        c.overlay_multi_org = false;
+        c.netstack_socks_port = None;
+        c.overlay_wg_secret_key = None;
+        c.overlay_exit_node_enabled = false;
+        c.overlay_exit_node = None;
+        c.overlay_advertised_routes = Vec::new();
+        c.advertise_routes = Vec::new();
+        c.advertise_local_subnets = false;
+        c.relay_server_enabled = None;
+        c.ssh_enabled = false;
+        c.ssh_host_key = None;
+        c.ssh_authorized_keys = Vec::new();
+        c.exec_enabled = false;
+        c.remote_config_enabled = false;
+        c.external_access_enabled = false;
+        c.hive_enabled = false;
+        c.hive_adopt = false;
+        c.hive_replica = false;
+        c.hive_archive = false;
+        c.hive_net = false;
+        c.hive_ssh = false;
+        c.hive_egress = false;
+        c.hive_worker = false;
+        c.vault_enabled = false;
+        c.knowhow_scan_roots = Vec::new();
+        c.knowhow_scan_listeners = false;
+        c.knowhow_probe_reach = Vec::new();
+        c.auto_update = Some(false);
+        c.crash_count = 0;
+        c.last_crash_unix = 0;
+        c.last_run_unhealthy = false;
+        c.rollback_attempted = false;
+        c
+    }
+
+    /// FR-43 P3a — the file a worker with no enrollment writes when the person
+    /// has none: blank identity fields, and every default. `caps`, `record` and
+    /// `config set` load this file, and a person's own settings land in it.
+    pub fn for_person_with_no_enrollment(machine_name: &str) -> Result<Self> {
+        let mut cfg: Self = toml::from_str(
+            "server_url = \"\"\nagent_token = \"\"\nagent_id = \"\"\ntenant_id = \"\"\n\
+             machine_id = \"\"\nmachine_name = \"\"\n",
+        )
+        .context("the defaults of an empty config")?;
+        cfg.machine_name = machine_name.to_string();
+        Ok(cfg)
+    }
+
+    /// Does this file hold a primary enrollment? A person's file on a one-row
+    /// Mac does not (FR-43 P3): [`Self::for_person_with_no_enrollment`], or an
+    /// enrolled file the migration blanked.
+    pub fn has_primary_enrollment(&self) -> bool {
+        !self.agent_token.trim().is_empty() && !self.agent_id.trim().is_empty()
+    }
+
     /// Per-entry runnability partition for the daemon supervisor: each
     /// `[[orgs]]` entry paired with `None` (runnable) or `Some(reason)` (a
     /// validation problem — the supervisor skips it and surfaces the reason
@@ -2930,6 +3025,7 @@ pub fn test_fixture() -> AgentConfig {
         auto_grant_session: true,
         exec_enabled: false,
         macos_supervise_gui_worker: false,
+        macos_one_row: false,
         power_policy: String::new(),
         companion_autostart: true,
         remote_config_enabled: false,
@@ -4278,6 +4374,9 @@ pub struct StartupWrites {
     /// after each of its own saves. `None` when it could not be read, which
     /// leaves the saves unguarded, as they all were before.
     seen: Option<Vec<u8>>,
+    /// FR-43 P3a — this daemon runs on a view of the file, so its copy is
+    /// never the file's to write ([`Self::read_only`]).
+    read_only: bool,
 }
 
 impl StartupWrites {
@@ -4290,6 +4389,18 @@ impl StartupWrites {
         Self {
             path: path.to_path_buf(),
             seen: std::fs::read(path).ok(),
+            read_only: false,
+        }
+    }
+
+    /// FR-43 P3a — for a process running on
+    /// [`AgentConfig::for_unenrolled_worker`]'s view: every save succeeds and
+    /// writes nothing, so a view never lands on the person's file.
+    pub fn read_only(path: &std::path::Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            seen: None,
+            read_only: true,
         }
     }
 
@@ -4298,6 +4409,9 @@ impl StartupWrites {
     /// read back, is not written either: an uninstall or an unenroll removed
     /// it, and a startup save must not bring the enrollment back.
     pub fn save(&mut self, cfg: &AgentConfig) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         if let Some(seen) = &self.seen {
             let now = std::fs::read(&self.path).with_context(|| {
                 format!(
@@ -6708,6 +6822,125 @@ tenant_id = "tid2"
         std::fs::remove_file(&path).unwrap();
         assert!(writes.save(&cfg).is_err());
         assert!(!path.exists());
+    }
+
+    /// FR-43 P3a — a GUI worker's view holds no enrollment and no host role,
+    /// because the root holds them and a second one on the machine would be a
+    /// defect, and it keeps the person's session knobs, which are why it reads
+    /// the file at all.
+    #[test]
+    fn a_workers_view_drops_every_enrollment_and_keeps_the_persons_knobs() {
+        let mut file = test_fixture();
+        file.ephemeral = true;
+        file.orgs = vec![OrgEntry {
+            label: "acme".into(),
+            server_url: "https://b.invalid".into(),
+            ws_url: None,
+            agent_token: "tok-acme".into(),
+            agent_id: "aid-acme".into(),
+            tenant_id: "t-acme".into(),
+            enabled: true,
+            overlay_mode: OrgOverlayMode::Off,
+            overlay_wg_secret_key: None,
+            overlay_wg_key_epoch: 0,
+            overlay_advertised_routes: Vec::new(),
+            overlay_exit_node_enabled: false,
+            advertise_routes: Vec::new(),
+            netstack_socks_port: None,
+        }];
+        file.overlay_enabled = true;
+        file.overlay_wg_secret_key = Some("WG".into());
+        file.ssh_enabled = true;
+        file.exec_enabled = true;
+        file.remote_config_enabled = true;
+        file.external_access_enabled = true;
+        file.hive_enabled = true;
+        file.vault_enabled = true;
+        file.auto_update = Some(true);
+        file.crash_count = 3;
+        file.rollback_attempted = true;
+        file.auto_grant_session = false;
+        file.keep_busy_enabled = true;
+        file.record_remote_enabled = true;
+        file.rc_clipboard = roomler_ai_remote_control::models::FeaturePolicy::Off;
+
+        let view =
+            file.for_unenrolled_worker("http://127.0.0.1:1", "ws://127.0.0.1:1/ws", "SECRET");
+
+        // Its signalling loop dials the stand-in, with the stand-in's secret.
+        assert_eq!(view.server_url, "http://127.0.0.1:1");
+        assert_eq!(view.ws_url.as_deref(), Some("ws://127.0.0.1:1/ws"));
+        assert_eq!(view.agent_token, "SECRET");
+        // No enrollment of any kind.
+        assert!(view.agent_id.is_empty());
+        assert!(view.tenant_id.is_empty());
+        assert!(!view.ephemeral);
+        assert!(view.orgs.is_empty());
+        assert!(!view.has_primary_enrollment());
+        // No host role, and no updater: the root owns the package.
+        assert!(!view.overlay_enabled);
+        assert_eq!(view.overlay_wg_secret_key, None);
+        assert!(!view.ssh_enabled);
+        assert!(!view.exec_enabled);
+        assert!(!view.remote_config_enabled);
+        assert!(!view.external_access_enabled);
+        assert!(!view.hive_enabled);
+        assert!(!view.vault_enabled);
+        assert_eq!(view.auto_update, Some(false));
+        assert_eq!(view.crash_count, 0);
+        assert!(!view.rollback_attempted);
+        // The person's own.
+        assert!(!view.auto_grant_session);
+        assert!(view.keep_busy_enabled);
+        assert!(view.record_remote_enabled);
+        assert_eq!(view.rc_clipboard, file.rc_clipboard);
+        assert_eq!(view.machine_name, file.machine_name);
+    }
+
+    /// FR-43 P3a — the file a person with no enrollment gets: it loads, in a
+    /// directory that wasn't there, reads as not enrolled, and holds a setting.
+    #[test]
+    fn a_blank_persons_file_loads_and_reads_as_no_enrollment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("first-run").join("config.toml");
+        let mut blank = AgentConfig::for_person_with_no_enrollment("mac").expect("blank");
+        blank.keep_busy_enabled = true;
+        save(&path, &blank).expect("save");
+
+        let loaded = load(&path).expect("load");
+        assert_eq!(loaded.machine_name, "mac");
+        assert!(loaded.keep_busy_enabled);
+        assert!(!loaded.has_primary_enrollment());
+        assert!(
+            test_fixture().has_primary_enrollment(),
+            "control: an enrolled file reads as one"
+        );
+    }
+
+    /// FR-43 P3a — a worker's startup saves leave the person's file as it was,
+    /// so their token survives for the switch's off. The control is the ordinary
+    /// startup save, which would have put the view over it.
+    #[test]
+    fn a_read_only_startup_save_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut file = test_fixture();
+        file.agent_token = "THE-PERSONS".into();
+        save(&path, &file).expect("save");
+        let on_disk = std::fs::read(&path).unwrap();
+        let view = load(&path).unwrap().for_unenrolled_worker(
+            "http://127.0.0.1:1",
+            "ws://127.0.0.1:1/ws",
+            "SECRET",
+        );
+
+        let mut writes = StartupWrites::read_only(&path);
+        writes.save(&view).expect("a save that writes nothing");
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
+
+        let mut writes = StartupWrites::after_load(&path);
+        writes.save(&view).expect("the ordinary save");
+        assert_eq!(load(&path).unwrap().agent_token, "SECRET", "control");
     }
 
     /// #3073 — ownership and the grant come before anything that can remove

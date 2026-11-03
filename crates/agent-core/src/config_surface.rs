@@ -313,6 +313,14 @@ const KEYS: &[KeyMeta] = &[
         description: "macOS only. Let the root daemon spawn and babysit the GUI-session worker (FR-43 P1). Stands down whenever the LaunchAgent is loaded, so one enrollment is never served twice. Default: OFF.",
     },
     KeyMeta {
+        key: "macos_one_row",
+        group: Group::Device,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "macOS only. One device row: the root daemon's GUI worker runs with no enrollment of its own, and a person's enrollment on this Mac is ignored (FR-43 P3). Needs macos_supervise_gui_worker. Default: OFF.",
+    },
+    KeyMeta {
         key: "power_policy",
         group: Group::Device,
         tier: Tier::Essential,
@@ -2040,6 +2048,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "files_dir" => cfg.files_dir.clone(),
         "exec_enabled" => Some(fmt_bool(cfg.exec_enabled)),
         "macos_supervise_gui_worker" => Some(fmt_bool(cfg.macos_supervise_gui_worker)),
+        "macos_one_row" => Some(fmt_bool(cfg.macos_one_row)),
         "power_policy" => Some(if cfg.power_policy.is_empty() {
             "never".to_string()
         } else {
@@ -2319,6 +2328,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "macos_supervise_gui_worker" => {
             cfg.macos_supervise_gui_worker = parse_bool_or(value, false)?
         }
+        "macos_one_row" => cfg.macos_one_row = parse_bool_or(value, false)?,
         // FR-55 — validated HERE rather than at read time, so a typo is
         // refused when it is made instead of silently becoming `never` weeks
         // later on a device nobody is looking at.

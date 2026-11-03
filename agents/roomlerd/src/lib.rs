@@ -135,6 +135,7 @@ pub mod media_plan;
 pub mod mem_trim;
 pub mod power;
 pub mod remote_config;
+pub mod unenrolled;
 // P5 — crate-private: its surface leans on `peer::TargetResolution`
 // (pub(crate)) and nothing outside the agent consumes it. Compiled on
 // every build so its pure logic unit-tests on the default feature set
