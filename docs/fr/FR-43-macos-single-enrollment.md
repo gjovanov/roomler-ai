@@ -477,7 +477,7 @@ The operator chose on 2026-11-02 (#971): a secondary org's session is delegated 
 |---|---|---|
 | The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `agents/roomlerd/src/signaling.rs:2850` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
 | `run` refuses to start with no config | `agents/roomlerd/src/app.rs:3785-3790` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
-| Delegation is primary-org only, on purpose | `agents/roomlerd/src/signaling.rs:3476-3484`, `agents/roomlerd/src/app.rs:5159`, `:5343` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes |
+| Delegation is primary-org only, on purpose | `agents/roomlerd/src/signaling.rs:3519-3527`, `agents/roomlerd/src/app.rs:5159`, `:5343` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes |
 
 After P3 a Mac has one row in each org, and the worker talks to the server through the daemon alone:
 
@@ -563,7 +563,7 @@ Declared `[[tunnel_routes]]` in a person's file are named by the migration, not 
 
 ### P3b — a secondary org's session is delegated
 
-Under the switch, `run_cmd` gives every org loop the host (`app.rs:5159`, and `:5343` for a join), and these gates ask the host instead of `ctx.is_primary`: the delegation (`signaling.rs:3481-3484`), the session params (`:3835`), the audio offer (`:3660`) and the caps on the hello and the heartbeat (`:1711-1734`, `:2399-2416`).
+Under the switch, `run_cmd` gives every org loop the host (`app.rs:5159`, and `:5343` for a join), and these gates ask the host instead of `ctx.is_primary`: the delegation (`signaling.rs:3524-3527`), the session params (`:3878`), the audio offer (`:3703`) and the caps on the hello and the heartbeat (`:1754-1777`, `:2442-2459`).
 
 **Each worker reply goes to the org that asked.** `DelegateHost` holds one outbound today (`agents/roomlerd/src/delegate.rs:439`). It keeps one per enrollment and a bounded `session → enrollment` map, written where a message crosses to the worker and read in `relay_upstream` (`delegate.rs:1046`). A session it does not know goes to the primary, as every reply does today. Signing and sealing need no change: they run per loop on that loop's outbound (`signaling.rs:2547`, `:2561`), so an answer is signed with the key of the org it belongs to.
 
