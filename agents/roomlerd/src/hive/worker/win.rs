@@ -519,7 +519,7 @@ impl Running for InJob {
         Some(self.pid)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, worker_calls))]
     fn job_limit(&self) -> Option<usize> {
         let job = self.job.as_ref()?;
         // SAFETY: all-zero is a valid out-buffer for this class.
@@ -604,6 +604,7 @@ fn wsa_startup() -> std::io::Result<()> {
 /// fresh every time, so a hand-over and a later `rehand` (a new worker, a new
 /// pid) each duplicate the daemon's own copy again. `socket` is untouched —
 /// cloneable this way as many times as workers come and go.
+#[cfg_attr(not(worker_calls), allow(dead_code))]
 pub(crate) fn duplicate_for(
     pid: u32,
     socket: windows_sys::Win32::Networking::WinSock::SOCKET,
@@ -625,6 +626,7 @@ pub(crate) fn duplicate_for(
 /// A listener, reconstructed from `bytes` ([`duplicate_for`]'s): refused where
 /// this is not the process `pid` named, or where `bytes` is not one whole
 /// protocol info. Calls [`wsa_startup`] first, every time.
+#[cfg_attr(not(worker_calls), allow(dead_code))]
 pub(crate) fn socket_from_info(bytes: &[u8]) -> std::io::Result<std::net::TcpListener> {
     if bytes.len() != PROTOCOL_INFO_LEN {
         return Err(std::io::Error::other(format!(

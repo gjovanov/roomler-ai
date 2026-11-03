@@ -37,7 +37,7 @@ signup page or says where a token comes from. To get one, a new person must:
 3. log in;
 4. create an org, unless they filled the optional org fields at signup (`auth.rs:226-231`);
 5. find Devices → Enroll device, which mints a **10-minute single-use** token
-   (`crates/modules/fleet/src/agent.rs:24`, `:90-140`, behind `MANAGE_AGENTS`);
+   (`crates/modules/fleet/src/agent.rs:25`, `:113-164`, behind `MANAGE_AGENTS`);
 6. copy it — the dialog says "then paste the token into the wizard"
    (`ui/src/components/enroll/EnrollmentDialog.vue:119`);
 7. get back to the wizard and paste it before the 10 minutes run out.
@@ -770,7 +770,7 @@ macOS the server's switch), and the tunnel client:
   desktop", which would contradict it. The wizard's own text never calls the daemon an "agent"
   (the operator, 2026-10-30): the token step names the dashboard's Devices → Enroll, the
   checklist and the Done page say "device" and show a version (`roomlerd 0.4.188`), never a
-  release tag (`app.js:1859-1869`). Tags, API paths and wire strings stay as they are: they are
+  release tag (`app.js:1894-1899`). Tags, API paths and wire strings stay as they are: they are
   compatibility surfaces.
 
 #### C2 — `/api/setup/windows` serves the signed EXE
@@ -846,7 +846,7 @@ sequenceDiagram
   sides, and an unknown argument is ignored. `SEE_MASK_NOZONECHECKS`, because the file is the
   wizard's own running image, whose zone check ran when the person opened it.
 - **The wait.** The elevated copy waits, at most 30 s, for the limited one to exit
-  (`launch.rs:403`, called from `agents/roomler-setup/src/main.rs:73`) **before** Tauri's
+  (`launch.rs:403`, called from `agents/roomler-setup/src/main.rs:78`) **before** Tauri's
   single-instance plugin initialises: the plugin finds a running copy by its mutex and window
   and would hand that dying copy the arguments and quit. Under over-the-shoulder credentials
   (a standard user types an administrator's password) the elevated copy is another account,
@@ -885,7 +885,7 @@ sequenceDiagram
   ignores every `WEBVIEW2_*` environment override and honours what the app passes through the
   API (Microsoft's "Develop secure WebView2 apps"), so the folder goes to Tauri's
   `WebviewWindowBuilder::data_directory`, the `userDataFolder` argument WebView2 receives. That
-  is why the main window is now created by the setup hook (`main.rs:115`) from its
+  is why the main window is now created by the setup hook (`main.rs:120`) from its
   `tauri.conf.json` entry, which says `"create": false`; a test holds the two together. (The
   first cut of C3 set `WEBVIEW2_USER_DATA_FOLDER`, which an elevated host would have ignored;
   the #3116 kit had already met the same rule for the CDP port, which an elevated wizard takes
@@ -910,7 +910,7 @@ sequenceDiagram
   behind it, with only a taskbar button to show for it (2 of 2; from Explorer it came up in front,
   2 of 2). So `run_elevated` passes its right on with `AllowSetForegroundWindow`
   (`elevation.rs:112`), and a relaunched copy asks for the foreground once its window exists
-  (`main.rs:139`), which is tao's `SetForegroundWindow` with its Alt-key fallback.
+  (`main.rs:144`), which is tao's `SetForegroundWindow` with its Alt-key fallback.
 - **DLLs.** C2 puts the EXE in the person's Downloads and C3 has the same image elevate itself,
   so a DLL left beside it would load into both copies, the elevated one behind a UAC prompt
   naming our publisher. Before C the EXE ran from a folder freshly unzipped, so this is C's to
@@ -920,7 +920,7 @@ sequenceDiagram
   `/DEPENDENTLOADFLAG:0x800` for the imports the loader resolves before `main`
   (`agents/roomler-setup/build.rs:55`), and the first thing `main` does is
   `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)` for whatever loads later
-  (`elevation.rs:177`). The wizard ships no DLL of its own and WebView2's loads by full path.
+  (`elevation.rs:216`). The wizard ships no DLL of its own and WebView2's loads by full path.
   The flag covers the EXE's imports and not theirs: `secur32.dll`, which TLS brings in, carries no
   such flag, so with it in the import table its `SSPICLI.DLL` came from the EXE's folder before
   `main` could run, limited, elevated and from a real double-click (the log, 2026-11-02). So
@@ -933,7 +933,7 @@ sequenceDiagram
   shell's one UAC prompt and `icacls` under none (the log, 2026-11-02). Every spawn on this path
   now names its program by a full path from the kernel, because `%SystemRoot%` can be overridden
   per user (`appdirs::system32_tool`, `crates/agent-core/src/appdirs.rs:113`), and `spawn_elevated`
-  refuses anything else (`agents/roomlerd/src/updater.rs:2663`).
+  refuses anything else (`agents/roomlerd/src/updater.rs:2692`).
   `agents/roomler-setup/src/spawn_gate.rs` parses the source of everything the wizard runs on
   Windows and fails on a bare name, or on an expression it has not been told about.
 - **What an elevated run takes from its user.** A value in `HKCU\Environment` reaches an elevated
@@ -952,7 +952,7 @@ sequenceDiagram
 - **A desktop that refuses prompts.** `ConsentPromptBehaviorUser=0`, which the CIS and STIG baselines
   set, refuses every administrator prompt from a standard user. On C's first cut the default led
   that person through pairing and the download into the refusal. The wizard now reads the policy at
-  Welcome (`elevation_refused_by_policy`, `crates/roomler-setup-core/src/elevation.rs:366`) and
+  Welcome (`elevation_refused_by_policy`, `crates/roomler-setup-core/src/elevation.rs:405`) and
   offers what can work: `daemon-user`, preselected, and the tunnel, with a note
   (`RoleLimit::NoElevation`).
 - **The outcomes.** A declined prompt leaves the limited wizard as it was, with one line; any

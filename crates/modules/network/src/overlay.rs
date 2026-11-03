@@ -293,12 +293,38 @@ async fn handle_overlay_join(
             }
         }
     };
-    let Some((tenant_id, machine_id, display_name)) =
-        resolve_tenant_and_machine(state, ident).await
+    let Some(NodeOrigin {
+        tenant_id,
+        machine_id,
+        display_name,
+        removed,
+    }) = resolve_tenant_and_machine(state, ident).await
     else {
         warn!(?ident, "overlay.join from an unknown node; ignoring");
         return;
     };
+    // #1829, #1821 — a removed device or tunnel client takes no lease. Its socket
+    // can outlive its row by the kick's trip or the 60 s revocation poll, and a
+    // node leased now has no owner to release it: the routes that would are 404s
+    // on the tombstone, which leaves only an admin evicting it by hand. Nothing on
+    // the wire, because the goodbye that says why is already on its way.
+    if removed {
+        warn!(?ident, "overlay.join from a removed node; ignoring");
+        return;
+    }
+    // #3042 — and an archived org's mesh takes no new member. Archiving tombstones
+    // its devices and quarantines its block, so this is for a live row that slipped
+    // past that sweep. A failed read goes on: the arms below answer a blip.
+    if state
+        .tenants
+        .base
+        .find_by_id(tenant_id)
+        .await
+        .is_ok_and(|t| t.is_archived)
+    {
+        warn!(%tenant_id, ?ident, "overlay.join into an archived org; ignoring");
+        return;
+    }
     // Phase 0 — the DNS-safe base label from the node's display name.
     let base_name = dns_label(&display_name, &machine_id);
     // Phase 1 — drop malformed CIDRs so a bad advertisement can't poison state.
@@ -881,6 +907,12 @@ async fn handle_overlay_relay_request(
 
     // Cross-tenant gate: the peer must be in the requester's tenant.
     let peer = match state.overlay_nodes.base.find_by_id(peer_node_id).await {
+        // #1829 — by id, so this also finds a released peer: no grant for it and
+        // no org relay minted for the pair. Its address may be someone else's now.
+        Ok(p) if p.tenant_id == self_node.tenant_id && p.deleted_at.is_some() => {
+            debug!(%self_id, peer = %peer_node_id, "overlay.relay_request: peer was released");
+            return;
+        }
         Ok(p) if p.tenant_id == self_node.tenant_id => p,
         Ok(p) => {
             warn!(%self_id, peer = %peer_node_id, peer_tenant = %p.tenant_id,
@@ -1927,30 +1959,54 @@ pub async fn send_to_node_ref(state: &NetworkState, node_ref: &NodeRef, msg: Ser
     }
 }
 
-/// Resolve the underlying `(tenant_id, machine_id)` for a node identity.
-/// Returns `(tenant_id, machine_id, display_name)` for the identity — the
-/// display name is the underlying agent/tunnel-client `name` (Phase 0, for the
-/// overlay node name / MagicDNS).
+/// What a node identity's agent or tunnel-client row says about it.
+struct NodeOrigin {
+    tenant_id: ObjectId,
+    machine_id: String,
+    /// The agent/tunnel-client `name` (Phase 0, for the overlay node name /
+    /// MagicDNS).
+    display_name: String,
+    /// The row is a tombstone. A join refuses on it (#1829).
+    removed: bool,
+}
+
+/// Resolve the underlying agent or tunnel client for a node identity, whatever
+/// state its row is in: a join and [`current_node`] ask different things of a
+/// tombstone.
 async fn resolve_tenant_and_machine(
     state: &NetworkState,
     ident: NodeIdentity,
-) -> Option<(ObjectId, String, String)> {
+) -> Option<NodeOrigin> {
     match ident {
-        NodeIdentity::Agent(id) => state
-            .fleet
-            .agents
-            .base
-            .find_by_id(id)
-            .await
-            .ok()
-            .map(|a| (a.tenant_id, a.machine_id, a.name)),
-        NodeIdentity::TunnelClient(id) => state
-            .tunnel_clients
-            .base
-            .find_by_id(id)
-            .await
-            .ok()
-            .map(|c| (c.tenant_id, c.machine_id, c.name)),
+        NodeIdentity::Agent(id) => {
+            state
+                .fleet
+                .agents
+                .base
+                .find_by_id(id)
+                .await
+                .ok()
+                .map(|a| NodeOrigin {
+                    tenant_id: a.tenant_id,
+                    machine_id: a.machine_id,
+                    display_name: a.name,
+                    removed: a.deleted_at.is_some(),
+                })
+        }
+        NodeIdentity::TunnelClient(id) => {
+            state
+                .tunnel_clients
+                .base
+                .find_by_id(id)
+                .await
+                .ok()
+                .map(|c| NodeOrigin {
+                    tenant_id: c.tenant_id,
+                    machine_id: c.machine_id,
+                    display_name: c.name,
+                    removed: c.deleted_at.is_some(),
+                })
+        }
     }
 }
 
@@ -1960,8 +2016,15 @@ async fn resolve_tenant_and_machine(
 /// relay_request, DERP registration) silently no-ops for a RELEASED node — which
 /// is correct: the release already fanned its `removes`. The `deleted_at` filter
 /// below is redundant now that the lookup is scoped; kept as belt and braces.
+///
+/// It is the NODE that has to be live here, not its owner: a node leaked by a join
+/// that raced a removal must still be able to leave.
 pub async fn current_node(state: &NetworkState, ident: NodeIdentity) -> Option<OverlayNode> {
-    let (tenant_id, machine_id, _name) = resolve_tenant_and_machine(state, ident).await?;
+    let NodeOrigin {
+        tenant_id,
+        machine_id,
+        ..
+    } = resolve_tenant_and_machine(state, ident).await?;
     state
         .overlay_nodes
         .find_live_by_tenant_and_machine(tenant_id, &machine_id)
