@@ -1,7 +1,7 @@
 # pe-dependent-load-flags.ps1 -- read DependentLoadFlags and the static imports
 # from a built EXE's own bytes and assert them.
 #
-#   pwsh scripts/signing/pe-dependent-load-flags.ps1 -Path roomler-setup.exe -Expect 0x800 -NotImported secur32.dll
+#   pwsh scripts/signing/pe-dependent-load-flags.ps1 -Path roomler-setup.exe -Expect 0x800 -NotImported 'secur32.dll,wintrust.dll'
 #
 # FR-129 C: the wizard EXE sits in the person's Downloads and goes on to run
 # elevated, so its own imports must come from System32 alone. build.rs asks the
@@ -14,8 +14,9 @@
 #
 # The flag covers the EXE's own imports, not an import's imports: secur32.dll's
 # SSPICLI.DLL came from the EXE's folder with the flag set, before main can run.
-# So build.rs delay-loads secur32.dll, and -NotImported fails a file whose import
-# table still names it. A delay-loaded DLL has its own table and does not count.
+# So build.rs delay-loads secur32.dll, and wintrust.dll for the same reason (#3246),
+# and -NotImported fails a file whose import table still names one. A delay-loaded
+# DLL has its own table and does not count.
 #
 # Run by CI's Windows job on the debug EXE, by release-setup.yml on the EXE it
 # signs, and by 90-verify-release.ps1 on the published one.
@@ -111,6 +112,8 @@ if ($Expect -eq '') {
 }
 
 $imports = Get-StaticImports -Image $image -File $Path
+# One quoted comma-separated argument: a `pwsh <script>` call binds no array.
+$NotImported = @($NotImported | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $found = @($NotImported | Where-Object { $imports -contains $_ })
 if ($found.Count -gt 0) {
     Write-Host "$Path has $($found -join ', ') in its import table: it must be delay-loaded" -ForegroundColor Red

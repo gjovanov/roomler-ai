@@ -431,7 +431,7 @@ The portal path, and macOS's Screen Recording grant, produce a system permission
 > `wgc_backend::pin_mta` takes `CoIncrementMTAUsage` once per process and never
 > gives it back. Measured on 0.4.197: a recorder child faulted during its remux and lost the recording
 > (`docs/recording.md` §5), while a session's worker still held the module after five closed sessions, because
-> something else holds the MTA there.
+> something else holds the MTA there. Read on release 0.4.198: 24 recordings stopped over a moving screen, ten of them after 60 s or more, all saved, and Windows' Application log named no fault. 0.4.197 faulted once in 44, so that count is not a rate.
 
 ### 5.1a When capture cannot open, the session says why (FR-80)
 

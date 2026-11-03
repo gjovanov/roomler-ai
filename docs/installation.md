@@ -96,7 +96,7 @@ which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
 - `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:396`);
-- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1556`).
+- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1569`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
@@ -135,18 +135,22 @@ new name. Two changes close it:
 | Where | What it does |
 |---|---|
 | the daemon's start (`agents/roomlerd/src/app.rs:3790`, `crates/agent-core/src/config.rs:4179`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
-| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:634`, `:966`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
+| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:651`, `:983`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
 administrator.** After its first healthy run the daemon hardens that config's
 folder to SYSTEM and Administrators (#3073), and a wizard that is not elevated
 cannot open it. The wizard says so on its first page, before a token is pasted
-or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1157`), and the
+or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1174`), and the
 install refuses it before anything is downloaded (`:290`). Before the enroll it
 also stops on a config it may not read (`:634`, never reported as a damaged
 config) or a folder it may not write (`:640`). The token is never spent on a
 config that cannot be written. A **fresh** install of that role still works
-from a double-click: the folder is not hardened yet.
+from a double-click: the folder is not hardened yet. The folder can outlive the
+service (`install.ps1 -Uninstall` leaves it), so the note says "This device
+already has the background service" only when detection found one, and
+otherwise "An earlier background service left its settings on this device"
+(#3247 item 11, `agents/roomler-setup/src/front/app.js`, `elevationNoteLead`).
 
 **The wizard asks for those rights itself** (FR-129 C3). The note on its first
 page carries a **Restart as administrator** button: the wizard starts its own
@@ -185,10 +189,16 @@ it happens on Welcome, before a token exists. The elevated copy
    default, and the Continue gate as usual.
 
 A right-click **Run as administrator** by a person who is an administrator works
-as it always has, in that account's own folder. **With another account's password
-it does not** (the white window above, or Edge's "We couldn't create the data
-directory"): that start has no limited copy to name the session's folder. Start the
-wizard normally and use the button.
+as it always has, in that account's own folder. **With another account's password**
+that start has no limited copy to name the session's folder, so it finds it (#3229): the
+owner of the session's `explorer.exe` from `WTSEnumerateProcessesW`, and that SID's folder
+from the machine's `ProfileList`. It then opens with only the machine-wide service on offer,
+as the button does. If it finds another account's shell but no folder that person can use
+(say a profile whose `AppData\Local` is elsewhere), it says so and stops, before any window,
+instead of the white window above or Edge's "We couldn't create the data directory". A
+session with no Explorer at all (a replaced shell) cannot be told apart from a person elevating
+themselves, and still shows that white window: there, start the wizard normally and use the
+button.
 
 **The cards follow what can work here** (`role::RoleLimit`,
 `agents/roomler-setup/src/role.rs:191`), and a note on Welcome says why:
@@ -210,8 +220,8 @@ that person's browser and profile, at medium integrity.
 that folder and `HKCU\Environment`, and the same image goes on to run elevated:
 
 - it loads DLLs from System32 alone (the linker's `/DEPENDENTLOADFLAG:0x800`,
-  `SetDefaultDllDirectories`, and `secur32.dll` delay-loaded, since that flag does not reach an
-  import's own imports), and `pe-dependent-load-flags.ps1` reads the flag and the import table
+  `SetDefaultDllDirectories`, and `secur32.dll`, `wintrust.dll` and `wtsapi32.dll` delay-loaded, since that flag
+  does not reach an import's own imports), and `pe-dependent-load-flags.ps1` reads the flag and the import table
   back from the EXE in CI, in the release lane and in the verifier;
 - it names every program it starts by a full path from the kernel, and
   `agents/roomler-setup/src/spawn_gate.rs` fails CI on a bare name;
@@ -221,12 +231,68 @@ that folder and `HKCU\Environment`, and the same image goes on to run elevated:
   uses works limited and nowhere else;
 - its WebView2 folder is made new at each start, following no link.
 
-Still open: the wizard checks no publisher on the MSI it stages, and the staged file sits in the
-user's temp folder until `msiexec` reads it (#3246).
-
 A declined prompt leaves the limited wizard as it was, with one line saying so;
 any other failure shows its reason and the right-click way. Nothing else in the
-wizard elevates itself: a fresh install still gets the MSI's own UAC prompt.
+wizard elevates itself: a fresh machine-wide install gets one prompt, for the
+wizard's own step below.
+
+**What the wizard runs is what it checked (#3246).** A digest comes from the same origin as the
+URL, so it says the bytes came through intact and never who made them. The anchor is the publisher:
+a valid Authenticode signature by `code_signature::EXPECTED_PUBLISHER`, compiled in.
+
+| What arrived (Windows unless named) | Digest published | What happens |
+|---|---|---|
+| MSI or desktop companion, signed by the publisher | matches | installs |
+| the same | none | installs, with a warning row: the signature decides |
+| anything | mismatch | refused |
+| unsigned, tampered, another publisher, or a root this machine does not trust | any | refused, whatever the digest says |
+| an older release with no signature | any | refused, as the updater refuses it |
+| tunnel zip, every file but plain text signed | matches, or none with a warning | extracts |
+| tunnel zip, any other file unsigned | any | refused, and nothing was extracted into place |
+| Linux or macOS tunnel archive | none | refused: there is no other anchor, as for the daemon there |
+| a `tag` or `filename` from the server that is not one plain name | any | refused before anything is written |
+
+A check is only worth something if nothing can change the file before it runs, and on the
+machine-wide roles the run crosses to the administrator. A process at the person's level can write
+their `%TEMP%` and can end or inject into a limited wizard, so anything that wizard holds it can
+drop. The check that counts therefore happens on the far side of the prompt, in the same EXE
+(`agents/roomler-setup/src/package_step.rs`):
+
+```mermaid
+sequenceDiagram
+    participant W as Limited wizard
+    participant U as UAC prompt
+    participant S as Elevated step, no window
+    participant M as msiexec
+    W->>W: download to %TEMP%, hold it, check digest and publisher
+    Note over W: a refusal here needs no prompt
+    W->>U: runas this EXE with a file, a folder name, the digest, a yes or no
+    U->>S: names Roomler Setup and its publisher
+    S->>S: new folder under %ProgramData%, SYSTEM and Administrators only, from its creation
+    Note over S: refused if the name exists, whoever made it
+    S->>S: copy in, hold it refusing writers, digest and publisher through that handle
+    S->>M: full path, TEMP set to that folder, arguments it built itself
+    M-->>S: exit code
+    S-->>W: exit code, the one channel back
+```
+
+- **The step takes nothing on trust.** A limited process can start it with any arguments, so it
+  parses exactly its own, reads the file as a claim, and builds `msiexec`'s command line itself: no
+  property, no transform, nothing we did not sign. Pointed at a genuine older MSI it installs that
+  after the person approves, which is no more than `runas msiexec` could do.
+- **It writes and deletes only inside its new folder.** An elevated write or delete under the
+  person's `%TEMP%` goes wherever a link planted there says, so the log no longer sits beside the
+  staged MSI there. A failed install leaves its log at
+  `%ProgramData%\roomler-setup-<hex>\<file>.log`, which the wizard names and only an administrator
+  can open, and the MSI copy is deleted. Otherwise the folder is removed.
+- **It opens no window and writes no state for the wizard.** Under another account's password it
+  runs as that administrator, so only its exit code comes back, through the handle the shell returned.
+- **An elevated wizard does the same in its own process.** It downloads into such a folder from the
+  start, because `%TEMP%` comes from `HKCU\Environment`, and it never starts a copy of its own image:
+  that file sits in Downloads, a limited process can rename another into its place, and an elevated
+  `runas` raises no prompt.
+- **A per-user install holds the file and checks it** with nothing to cross: `msiexec` runs at the
+  level of anything that could change it.
 
 **The enroll says how it was installed** (FR-102 P3, the install trace in
 [growth-observability.md](growth-observability.md)): the device row records
@@ -787,7 +853,7 @@ sequenceDiagram
 
 **Auto-updates and upgrades** (the open question in #3115). The updater does
 not stop the service before it runs msiexec. `spawn_installer_with_watch`
-(`agents/roomlerd/src/updater.rs:1892`) launches `msiexec /i … /qn` elevated
+(`agents/roomlerd/src/updater.rs:1905`) launches `msiexec /i … /qn` elevated
 (`:2236`, `:2636`) while the service runs; the worker that launched it exits 0,
 and its host stays up (`:593`). Measured on a vmtest Win11 cell, released code,
 with each stop held to the field's 7.8 s:
@@ -921,7 +987,7 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 
 The daemon's `.deb` has to start on a host with nothing on it: a bare server, a
 container, a cluster node. FFmpeg, libvpx and libva ride in the package, so
-`depends` is short (`agents/roomlerd/Cargo.toml:1024`), and every name in it backs
+`depends` is short (`agents/roomlerd/Cargo.toml:1026`), and every name in it backs
 a library the binary links directly:
 
 | `Depends` | Why it reads this way |
@@ -950,7 +1016,7 @@ alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives fro
 the binary's symbols.
 
 Neither floor can strand a running daemon on the updater's offline `dpkg --install`
-rung (`agents/roomlerd/src/updater.rs:2300`), which is the reason libva and
+rung (`agents/roomlerd/src/updater.rs:2313`), which is the reason libva and
 `iproute2` stay out of `depends`. A host where the daemon runs already has the real
 library and OpenSSL, because without them it cannot start. A healthy install
 upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,

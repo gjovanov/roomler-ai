@@ -199,6 +199,7 @@ type CaptureReply = Result<Option<Frame>>;
 /// backend can scale BEFORE the CPU readback; `None` = deliver native.
 struct CaptureCmd {
     reply: oneshot::Sender<CaptureReply>,
+    #[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
     output_cap: Option<(u32, u32)>,
     /// #3272 — `None`: the pump did not ask for a pace, so this capture does
     /// exactly what it did before.
