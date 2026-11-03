@@ -462,8 +462,8 @@ prevents that reaching a release tag — do not weaken it.
 (#3246). `code_signature::verify_open_publisher` reads through a handle the
 wizard holds, on the MSI, the desktop companion, and every file but plain text
 in the Windows tunnel zip; [installation.md](installation.md) has what happens on
-each path and why the check that counts runs elevated. The updater's
-`verify_publisher` is unchanged. The wizard binds no version, so a hostile server
+each path and why the check that counts runs elevated. The wizard binds no
+version, so a hostile server
 can offer it an older signed MSI under its own tag: the signature says whose, not
 which.
 
