@@ -2208,6 +2208,16 @@ recorded and the session ran beneath it. Measured on GNOME 50 and Plasma 6.7,
 both through Xwayland; a real X server buffers the same way. The Xvfb lane now
 proves that a dismissed prompt leaves the screen, as a second client sees it.
 
+⚠️ **The Windows panel's countdown ticks on the badge's timer** (#2116). One pump
+thread drives the badge, the curtain and the consent panel, on one 120 ms
+`WM_TIMER`. That timer was killed whenever no session existed, and a prompt waits
+*before* its session exists. So a lone prompt read "Expires in 4:59" for as long
+as it was up, which a person at the machine reads as "this request does not
+expire". Approve still worked. The timer now runs while a session is up **or** the
+panel is (`pump_timer_wanted`, `agents/roomlerd/src/indicator/win.rs:703`, applied
+at `:1369`), and stops when neither is. The X11 panel needs no such rule, because
+its loop ticks on its own.
+
 ⚠️ **The X11 panel is drawn at the desktop's scale** (FR-93 P6i). On a scaled
 Wayland desktop, Xwayland's root is in device pixels and an X11 client is
 expected to scale itself. That is KDE's default and GNOME's at an integer
