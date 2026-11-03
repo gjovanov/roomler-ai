@@ -22,7 +22,7 @@ fleet, and what the watch itself costs (measured, FR-65 AC1).
 | Kill switch | `pump_stall_watch` / `ROOMLERD_PUMP_STALL_WATCH=0` (`encode/mod.rs:530`), restart required |
 | The bar | `pump_stall_warn_ms` / `ROOMLERD_PUMP_STALL_WARN_MS`, default 100 (`encode/mod.rs:618`) |
 | Its own cost | `roomlerd stall-watch-cost` (`stall.rs:592`, §8) |
-| The census | `scripts/fr65-stall-census.sh` (§7) |
+| The census | `scripts/fr65-stall-census.sh`, a fleet-wide server read of `agent_logs` (§7) |
 
 ## 1. A pass, and where its time goes
 
@@ -212,7 +212,8 @@ WARN FFmpeg DC pump STALL — one pass exceeded the budget session_id=… codec_
 ## 6. The 2026-10-30 census — what the logs of three hosts said
 
 Fourteen days of daemon logs (2026-10-17..30) on the three corporate laptops,
-read with the census of §7 before any of this shipped. 344 STALL lines:
+read host by host with the census §7 replaced, before any of this shipped.
+344 STALL lines:
 
 | Class | CORPLAP-1 | CORPLAP-2 | CORPLAP-3 | Reading |
 |---|---|---|---|---|
@@ -264,39 +265,115 @@ That would re-couple the pump to the link that rc.106 moved the send off. It is
 **named, not fixed**: `dc_lock` (and `heartbeat`, which takes the same mutex)
 ship first, and the fix waits for their number, per this FR's first rule.
 
+### 6.4 The first server read, by build (2026-11-03)
+
+One week of `agent_logs` (2026-10-27 02:00Z .. 2026-11-03 01:45Z), read with the
+census of §7. The batches carry `agent_version`, so one read holds both sides of
+the rebase, which first rode 0.4.192. A heartbeat is about 2 s of session time, so
+the rate is what compares two sides of unequal length.
+
+| Host | Build | Heartbeats | STALL lines | `reset` | `untimed` | `open` (mean, max) | Other |
+|---|---|---|---|---|---|---|---|
+| CORPLAP-1 | before | 4 541 | 35 | 5 | 8 | 13 (0.71 s, 1.2 s) | 8 `encode`, 1 `swap` |
+| CORPLAP-1 | after | 23 | 4 | **0** | **0** | 4 (0.58 s, 0.87 s) | |
+| CORPLAP-2 | before | 6 195 | 129 | 26 | 5 | 96 (0.22 s, 1.3 s) | 2 `capture` |
+| CORPLAP-2 | after | 2 816 | 4 | **0** | **0** | 4 (**2.3 s, 3.0 s**) | |
+| CORPLAP-3 | before | 4 667 | 50 | 4 | 0 | 41 (0.50 s, 0.93 s) | 5 `encode` |
+| CORPLAP-3 | after | 1 925 | 18 | **0** | **0** | 12 (0.48 s, 0.66 s) | 5 `dc_lock`, 1 `encode` |
+| Every device | before | 97 685 | 909 (9.3 per 1 000) | 562 | 60 | 269 | 15 `encode`, 2 `capture`, 1 `swap` |
+| Every device | after | 25 477 | 126 (4.9 per 1 000) | **0** | **0** | 86 | 35 `dc_lock`, 4 `encode`, 1 `poll` |
+
+The after is two days old, so it is a first reading, not AC7's. Three things it
+already says:
+
+- **The passes `reset` hid are now named.** CORPLAP-2's four `open` lines mean
+  2.3 s, where its 26 `reset` lines meant 1.9 s and its `open` lines 0.22 s: those
+  are the long opens §6.1 found, now attributed.
+- **Most `reset` lines were never long.** 480 of the 562 are under 200 ms, and 456
+  of them are one macOS host at 108 ms, once per heartbeat. The reset zeroed
+  `capture` too, and `capture` is idle by rule (§2), so a heartbeat pass on an
+  idle screen could read as work. A build with the rebase should stop logging
+  those at all. That host's after is ten heartbeats, too few to say.
+- **`dc_lock` has its first number**: 35 lines, mean 0.52 s, 2.3 s at worst, on
+  four hosts. §6.3's mutex is real in the field.
+
 ## 7. Running the census
 
-```bash
-scripts/fr65-stall-census.sh --days 14 CORPLAP-1 CORPLAP-2 CORPLAP-3
-scripts/fr65-stall-census.sh --days 3 --rows CORPLAP-1   # every line, classified
+The census is a fleet-wide server read of `agent_logs`. Nothing runs on a device.
+`roomlerd` writes each STALL line once, and the uploader carries it to the server
+with every other event, so the read covers every daemon and RC worker, on every
+OS and in every org, including a host nobody can reach. A sweep of host logs covers
+only the hosts it can reach, a biased sample
+([rate-control.md](rate-control.md) explains why).
+
+```mermaid
+flowchart LR
+  L[STALL and heartbeat lines] -->|every event| U[uploader, 5 s batches]
+  U --> A[(agent_logs, 7 days)]
+  A -->|one day per query, streaming| C[fr65-stall-census.cjs under mongosh]
+  L -->|rolling log file| F[--from-logs, under Node]
+  C --> R[one row per class, per device, per build]
+  F --> R
 ```
 
-It runs `scripts/fr65-stall-census.ps1` **on** each Windows host through
-`roomler exec`, as a PowerShell `-EncodedCommand`. Read-only: it scans the
-daemon's dated logs and prints one summary row per class (§5's table).
+```bash
+scripts/fr65-stall-census.sh --mars --yes                     # the last 7 days, every device
+scripts/fr65-stall-census.sh --mars --yes --rows              # + one JSON line per STALL, classified
+scripts/fr65-stall-census.sh --mars --yes --agent <hex> --since 2026-10-27T02:00:00Z --until 2026-11-03T02:00:00Z
+scripts/fr65-stall-census.sh --mars --yes --probes            # the caps-probe census (FR-65 AC6)
+node scripts/fr65-stall-census.cjs --from-logs <file>...      # the same classifier over log files you hold
+node scripts/fr65-stall-census.cjs --self-test
+```
 
-- `-EncodedCommand`, not a quoted command: `roomler exec` re-splits argv, so a
-  comma list or a quoted pattern arrives mangled.
-- The script pins the invariant culture: the fleet's Windows hosts are not all
-  en-US, and a German culture would format 3586.0 as `3.586,0`.
-- `--rows` also prints, for a `reset` line, the heartbeat just before it —
-  where the lost attribution can still be read.
-- ⚠️ **Today's file is open for writing, and a census must not skip it.** The
-  first version read the logs with `[IO.File]::ReadLines`, which the daemon's
-  open handle refuses (a sharing violation). PowerShell reports that as a
-  non-terminating error, `roomler exec` delivers stderr as CLIXML, the wrapper
-  drops CLIXML, and the census silently covered every day but today — five of
-  its 344 lines (2026-10-30) went uncounted on its first reading. The script now
-  opens each file the way a tail does (`FileShare 'ReadWrite, Delete'`), and its
-  summary line says how far it read (`read through …`) and `unreadable=N`, with
-  an `UNREADABLE` line per file it could not open. Read both before the counts.
-- `--probes` runs `scripts/fr65-probe-census.ps1` instead: the caps-probe runs
-  per daemon start and how many were at steady state (FR-65 AC6).
-- ⚠️ An exec sweep is a biased sample (hosts with exec on, reachable). Report
-  per host; never a fleet-wide proportion.
-- It is FR-65 AC7's "same instrument": the before of a change to the watch is
-  this script on the build without it, the after is this script on the build
-  with it, same hosts, windows of the same length.
+It prints, per device and build, the lines per class of §5's table, and the same
+totals before and after 0.4.192. A week of the whole fleet takes about 10 s.
+
+- **It is bounded by construction**, because an unbounded read inside the Mongo
+  container once OOM-killed production: at most 8 days, one day per query, each
+  with `maxTimeMS` and `allowDiskUse: false`, streaming stages only, and the fold
+  keeps counters and each session's last heartbeat. `--yes` is required, and
+  the Mongo pod's restart count is printed before and after. A count that moved
+  makes the run exit 3, and the run is harm, not data.
+- **`--rows` also carries, for a `reset` line, the heartbeat just before it**,
+  where the lost attribution can still be read. Keep the output of a read you
+  mean to compare later: the lines expire in 7 days and the rows do not.
+
+What it cannot see, and what it prints about that:
+
+| Limit | Why | What the read does |
+|---|---|---|
+| **7 days**, where the host census read 14 | the TTL on `agent_logs` | A window is at most 8 days. A before and an after are compared at the same length, or by rate per 1 000 heartbeats. |
+| **The uploader can lose lines** | a full channel drops and counts (`note_dropped_lines`, `crates/agent-core/src/logs_upload.rs:148`); a shed batch (`:419`) and a refused one are counted nowhere | Each row prints `dropped`, `hb_gaps` (a session's heartbeats over 10 s apart, with the seconds missing) and `counted`, the sum of the heartbeats' `pump_stalls`. `counted` under `stalls` means heartbeats were lost. |
+| **`reset` needs the heartbeat before it** | a lost heartbeat would turn a `reset` line into `untimed` | Such a line is counted again as `reset_no_hb`. |
+| **A stamp is in milliseconds** where the file has microseconds | `DateTime::now()` in the upload layer (`logs_upload.rs:190`) | 4.7 ms can read 5, so the fleet read takes ≤ 5 ms: an edge line is called `reset`, the class AC7 wants at 0. |
+| **Silence is not health** | only the FFmpeg DC pump has the watch (§9) | `heartbeats` is the denominator: a row with none ran another pump, or no session. |
+
+⚠️ **The two ends agree, and this is the check to repeat if the classifier
+changes.** On a test Windows host (NEO16), one week of the same lines, 2026-10-27
+02:00Z .. 2026-11-03 01:45Z:
+
+| Compared | Lines | Matched | Class disagreements |
+|---|---|---|---|
+| The PowerShell census, as a plain file, against the fleet read | 64 and 72 | 64 | 0 (35 `open`, 24 `reset`, 3 `untimed`, 2 `encode`) |
+| The PowerShell census against `--from-logs` over the same files | 64 and 64 | 64 | 0 |
+
+The eight lines on the server alone are all `open`, on 2026-10-28, from a daemon
+whose log file was in neither directory that census read. The server held more,
+and it lost none of the 64. A matched line's two stamps were at most 1 ms apart.
+
+⚠️ **`--probes` reads the same population only if the lines ship**, and they do:
+on that host and week the fleet read gives 58 probe lines, all within 60 s of a
+daemon start, 0 at steady state. The files hold 199 more, from test runs that
+never uploaded under this device, so a file count and a fleet count of one host
+can differ by what ran outside its daemon.
+
+The PowerShell census itself is gone: its last copy is
+`scripts/fr65-stall-census.ps1` at `06989b3fd`, with the invariant culture and
+file-sharing traps it paid for.
+
+It is FR-65 AC7's "same instrument": the before of a change to the watch is the
+build without it, the after is the build with it, over windows of the same
+length.
 
 ## 8. What the watch costs (FR-65 AC1)
 
@@ -374,8 +451,8 @@ The control is now a busy-wait for a fixed wall-clock time, and reads 1.00×.
 roomlerd stall-watch-cost            # ~15 s, text; exit 0 PASS, 3 FAIL, 4 INVALID
 roomlerd stall-watch-cost --json     # for a script
 roomlerd stall-watch-cost --quick    # ~1 s smoke
-# on a fleet host, once a release carries it:
-roomler exec CORPLAP-1 -- "C:/Program Files/Roomler/roomlerd.exe" stall-watch-cost
+# on a test device:
+roomler exec <device> -- "C:/Program Files/Roomler/roomlerd.exe" stall-watch-cost
 ```
 
 ## 9. Known limits
@@ -385,6 +462,5 @@ roomler exec CORPLAP-1 -- "C:/Program Files/Roomler/roomlerd.exe" stall-watch-co
   is silence, not health.
 - **`apply` nests inside `swap`, `gate` and `send`** on three rare paths (§1).
 - **A wedged capture cannot trip it** (§2).
-- **The census reads Windows hosts only.** The Linux and macOS daemons log the
-  same lines (to journald or the daemon's file); the census has not been
-  written for them.
+- **The census sees what was uploaded** (§7): 7 days, and less than that on a
+  host that lost lines.

@@ -548,7 +548,7 @@ sequenceDiagram
   · `enroll` · `companion` · `anchor` (the two best-effort steps, recorded only where they
   apply) · `done`; `outcome` is `ok` · `failed` · `cancelled`; `error_code` is a **code from a
   fixed vocabulary** (`advanced_options`, `unsupported_platform`, `preflight`, `resolve`,
-  `download`, `sha256_mismatch`, `msi_spawn`, `msi_wait`, `msi_user_cancel`,
+  `download`, `sha256_mismatch`, `signature_refused`, `msi_spawn`, `msi_wait`, `msi_user_cancel`,
   `msi_another_install`, `msi_fatal`, `msi_other`, `extract`, `integrate`, `enroll_rejected`,
   `enroll_network`, `config_write`, `companion`, `anchor`, `other`) — never the error text, a
   path, a hostname or a user name; `os` is the family; `wizard_version` the crate's version.
