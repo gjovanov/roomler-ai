@@ -39,7 +39,8 @@
         />
         <div class="text-caption text-medium-emphasis mb-4 ml-10">
           Off by default. Approving is the second of five gates — on its own it
-          opens nothing.
+          opens nothing. Turning it off and saving also ends any outside session
+          on this device.
         </div>
 
         <v-select

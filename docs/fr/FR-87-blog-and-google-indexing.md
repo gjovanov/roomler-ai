@@ -70,7 +70,7 @@ other with different anchor text, so they don't compete for one query.
 (`ui/blog/posts/*.md`, assets in `ui/blog/assets/`) and a **homepage template**. They share the
 `<head>`, sitemaps, robots, search index, link checker and a new asset pipeline. The build
 command (`bun run build`, `ui/package.json:9`), the Dockerfile and the CI invocation
-(`ci.yml:2376-2406`) stay as they are, and **no dependency is added**. A separate blog builder
+(`ci.yml:2465-2495`) stay as they are, and **no dependency is added**. A separate blog builder
 was rejected: it would mean two writers of `dist/sitemap.xml` and a link checker that can't see
 a `/blog` → `/docs` link.
 
@@ -234,14 +234,14 @@ location = /pricing { return 301 /#pricing; }
   nothing ever redirects. (This section's first draft, `try_files $uri $uri/ =404`, does 301,
   measured in `nginx:stable`; it adds nothing, so P1 ships without it.)
 - **The session cookie decides the homepage.** The session is the HttpOnly `access_token`
-  cookie (`crates/api/src/routes/auth.rs:247`). No cookie (guests and every crawler) gets the
+  cookie (`crates/api/src/routes/auth.rs:285`). No cookie (guests and every crawler) gets the
   static homepage; a cookie gets the SPA, whose router behaves as today. A cookie the server
   refuses gets the SPA, which sends the visitor to login on its first 401.
 - **`try_files` serves the chosen file inside `location = /`**, so `expires -1` applies to both
   branches, the server's security headers survive on both, and `internal` on `/home/` does not
   block it. Without `internal`, `/home/` would be a second URL for the homepage.
 - ⚠️ **The access cookie is not the whole session.** It lives 7 days; the refresh cookie lives
-  30, but it is scoped to `Path=/api/auth/refresh` (`auth.rs:427`), so nginx never sees it at
+  30, but it is scoped to `Path=/api/auth/refresh` (`auth.rs:570`), so nginx never sees it at
   `/`. A returning user between day 7 and day 30 has no cookie nginx can read, and is served
   the static page by a site that could still sign them in silently. §4g's hand-off closes that
   gap.

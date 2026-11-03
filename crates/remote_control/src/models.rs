@@ -2573,8 +2573,8 @@ pub struct Agent {
     /// the valid one?" has to be answerable from the row as well as the audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_code_rotated_at: Option<DateTime>,
-    /// Device config an operator has ASKED for, reconciled by the agent when
-    /// it next connects (`docs/remote-config.md` step 2).
+    /// Device config an operator has ASKED for, reconciled by the agent on
+    /// connect or on a save's nudge (`docs/remote-config.md` step 2).
     ///
     /// Desired state, not applied state: writing here records an intent, and
     /// the device remains free to refuse it — a device without
@@ -2820,7 +2820,7 @@ pub enum SshMode {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SshAccountMode {
-    /// The daemon's own identity — SYSTEM on Windows, root under systemd.
+    /// The daemon's identity: root under systemd; on Windows the worker's or the service's.
     ///
     /// The default *today* because it is what P2 can actually do, and it is
     /// why `SshMode::On` is root-equivalent until the P5 privilege-drop slice
@@ -3155,8 +3155,8 @@ pub enum ConfigOutcome {
     /// down is in `live` / `needs_restart` — see [`ConfigReport`].
     Applied,
     /// The device already matched; nothing was written. Distinct from
-    /// `Applied` with two empty lists so a reader can tell "converged" from
-    /// "applied nothing, and I am not sure why".
+    /// `Applied` with two empty lists, which says a key was written back to the
+    /// value the daemon runs (FR-132 P1c): the file changed and nothing waits.
     Noop,
     /// The device has not opted in: `remote_config_enabled` is off. This is
     /// gate 4 doing its job, not an error — the operator's move is to set the

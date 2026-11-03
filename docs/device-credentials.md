@@ -68,7 +68,7 @@ sequenceDiagram
   - never before the first connect, so a device that cannot reach its server asks it nothing;
   - a random 0–60 s delay spreads a fleet that reconnected at once;
   - after a failure that may pass, it waits a full hour, and reconnects meanwhile do not trigger another try.
-- **Saving** (`RemoteConfigServices::persist_agent_token`, `agents/roomlerd/src/remote_config.rs:445`). A compare-and-swap under the daemon's config lock, finding the enrollment by `(server_url, tenant_id)` wherever it now lives (scalar or `[[orgs]]`).
+- **Saving** (`RemoteConfigServices::persist_agent_token`, `agents/roomlerd/src/remote_config.rs:592`). A compare-and-swap under the daemon's config lock, finding the enrollment by `(server_url, tenant_id)` wherever it now lives (scalar or `[[orgs]]`).
   - A file holding a *different* token was re-enrolled meanwhile, and that token wins.
   - A file naming another device for the enrollment is refused, with nothing written.
   - A save that fails still puts the renewed token in use: the file's token stays valid, so nothing is lost.
@@ -76,7 +76,7 @@ sequenceDiagram
 
 ### On a 401: recover before backing off
 
-When the server refuses the token at the socket (`signaling.rs:905`), the loop tries two things before its back-off ladder:
+When the server refuses the token at the socket (`signaling.rs:924`), the loop tries two things before its back-off ladder:
 
 1. **A newer token in the config file**, matched by server, tenant *and* device id. `roomlerd re-enroll` (or the companion's Re-enroll) wrote it while the daemon ran. Before FR-103 the daemon ignored it until a restart.
 2. **A renewal**, which the server grants up to **90 days past `exp`** (`RENEWAL_GRACE_SECS`, `crates/services/src/auth/mod.rs:116`). On the renew routes only; every other route enforces `exp` as before.
@@ -89,16 +89,16 @@ Either earns one prompt retry. A refusal straight after a recovery waits out the
 
 Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape).
 
-- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1146`; tunnel clients `crates/services/src/dao/tunnel_client.rs:297`). From then on only tokens minted after the removal are accepted.
+- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1183`; tunnel clients `crates/services/src/dao/tunnel_client.rs:297`). From then on only tokens minted after the removal are accepted.
 - **Where it is checked**, at all five sites, each of which already loads the row:
 
 | Site | Where |
 |---|---|
 | `AuthAgent` (every agent HTTP route) | `generation_refusal`, `crates/modules/fleet/src/auth_agent.rs:96` |
-| the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1504` |
+| the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1512` |
 | DERP | `crates/modules/network/src/derp.rs:400` |
 | the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2305` |
-| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:249` |
+| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:254` |
 
 - **The order at each site:** the deleted/quarantined check runs first, so a removed device still gets its typed `Goodbye AgentDeleted` and exits 7. The generation is compared only on a live row.
 - **The service credential** has no generation: a removal clears `exec_anchor` (#2133), which ends it.
@@ -107,7 +107,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 
 ### A connected device is told at once (#2267)
 
-A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1223`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1202`).
+A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1238`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1229`).
 
 Before #2267 the kick only took the device out of the hub. The device kept its socket and heard nothing. It learned of its removal at its next connection, after a network change or a pod roll, and on a stable network that could take days. Nothing could be done through that socket, because every action re-checks the row, but the device's own status read "connected" throughout.
 
@@ -133,7 +133,7 @@ sequenceDiagram
 | an organization's archive | yes | before #2267 the archive did not even take the device out of the hub (`crates/modules/fleet/src/tenant_hooks.rs:50`) |
 | an ephemeral device's own unenroll | **no** | it is already shutting down, and a goodbye racing that clean stop would turn it into exit 7 (`tells_the_device`, `crates/modules/fleet/src/removal.rs:111`) |
 | a device this removal sent `rc:hive.purge_all` (FR-90 P2g-4a), on a build that drains (`hive-purge-drain`, #2294) | yes, after the purge's frame | its daemon finishes that purge before the goodbye's exit, bounded at 5 min (`finish_removal_purge`, `agents/roomlerd/src/hive/supervisor.rs:1384`) |
-| the same on `agent-v0.4.137` or `0.4.138` (`hive-purge-all` without `hive-purge-drain`) | **no**, and its socket stays open as before | that build exits at once on the goodbye, and its purge runs after its frame lands (`crates/modules/fleet/src/hub.rs:1232`) |
+| the same on `agent-v0.4.137` or `0.4.138` (`hive-purge-all` without `hive-purge-drain`) | **no**, and its socket stays open as before | that build exits at once on the goodbye, and its purge runs after its frame lands (`crates/modules/fleet/src/hub.rs:1247`) |
 
 > ⚠️ `hive.replicaset` is server-wide, and the removal's purge goes to every connected device that advertises `hive-purge-all`, in any org. Every release since 0.4.137 does, as a property of the build. Before #2294 that meant no removed device on those builds was told once the replicaset was turned on. A build that drains is told whatever the setting. The same drain also covers a pod roll mid-purge, whose reconnect is refused with the same goodbye.
 

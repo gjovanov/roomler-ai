@@ -499,7 +499,7 @@ not what the trace records. The token is minted at delivery by the admin route's
 `pairing::deliver` mints with `issue_enrollment_token_with` and writes
 `enroll_tokens.record_issued(jti, tenant_id, approver, now)`
 (`crates/modules/fleet/src/pairing.rs:992-1011`), the same call `POST …/agent/enroll-token`
-makes (`agent.rs:115-126`) — so the ledger row is `{_id: jti, tenant_id, issued_by: <the
+makes (`agent.rs:139-150`) — so the ledger row is `{_id: jti, tenant_id, issued_by: <the
 approver>, issued_at, kind: standard}`, one per half, and "tokens issued → redeemed" counts a
 paired token like any other. The tunnel kind writes no ledger row, as the tunnel route never
 has. The enroll is the ordinary one, so `agents.install` says who installed: `method: wizard`
@@ -548,7 +548,7 @@ sequenceDiagram
   · `enroll` · `companion` · `anchor` (the two best-effort steps, recorded only where they
   apply) · `done`; `outcome` is `ok` · `failed` · `cancelled`; `error_code` is a **code from a
   fixed vocabulary** (`advanced_options`, `unsupported_platform`, `preflight`, `resolve`,
-  `download`, `sha256_mismatch`, `msi_spawn`, `msi_wait`, `msi_user_cancel`,
+  `download`, `sha256_mismatch`, `signature_refused`, `msi_spawn`, `msi_wait`, `msi_user_cancel`,
   `msi_another_install`, `msi_fatal`, `msi_other`, `extract`, `integrate`, `enroll_rejected`,
   `enroll_network`, `config_write`, `companion`, `anchor`, `other`) — never the error text, a
   path, a hostname or a user name; `os` is the family; `wizard_version` the crate's version.

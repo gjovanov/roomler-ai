@@ -151,6 +151,9 @@ async fn gates_changed(w: &mut GateWatch) {
 /// launchd-owned workers, a hand-run `roomlerd run`, and the daemon.
 pub async fn run(
     supervised: bool,
+    // FR-43 P3a — this worker holds no enrollment, so this channel is all it
+    // can serve, and without it the process is of no use to anyone.
+    unenrolled: bool,
     // FR-43 P2b-2 — the signalling loop's two ends: delegated messages go IN,
     // a delegated session's replies come OUT. `None` when this process is not
     // a worker, in which case `supervised` is false too and we return at once.
@@ -179,6 +182,12 @@ pub async fn run(
         tracing::warn!(
             "delegation: started with --supervised but no secret arrived on stdin; not attaching"
         );
+        // FR-43 P3a — an enrolled worker still serves its own row. One with no
+        // enrollment would run on, serving nothing, and read as healthy: leave,
+        // and the supervisor's bound on fast exits applies.
+        if unenrolled {
+            std::process::exit(1);
+        }
         return;
     };
 

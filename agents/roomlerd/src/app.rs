@@ -231,6 +231,12 @@ enum Command {
         /// readable via `ps`, while the pipe is only the parent's.
         #[arg(long, hide = true)]
         supervised: bool,
+        /// FR-43 P3a (macOS) — this worker holds no enrollment: the root daemon
+        /// that spawned it does (`macos_one_row`). It dials no server and takes
+        /// its sessions from the delegation channel alone, and any enrollment
+        /// in the person's config is ignored and left in the file.
+        #[arg(long, hide = true, requires = "supervised")]
+        unenrolled: bool,
         /// FR-84 D3 (Windows) — which spawner started this worker: `scm` (the
         /// SCM service host's supervisor, `win_service::worker_args`) or
         /// `task` (the per-user Scheduled Task's action, `service.rs`). It is
@@ -1709,6 +1715,7 @@ async fn daemon_main() -> Result<()> {
         // A bare `roomlerd` is never a supervised worker: the supervisor always
         // spawns `run --supervised` explicitly.
         supervised: false,
+        unenrolled: false,
         // Likewise the Windows spawners always say which one they are.
         supervisor: None,
         // #1683 — only the SCM service host passes a stop-event name.
@@ -1807,6 +1814,7 @@ async fn daemon_main() -> Result<()> {
         Command::Run {
             encoder,
             supervised,
+            unenrolled,
             supervisor,
             stop_event,
             sas_event,
@@ -1830,6 +1838,7 @@ async fn daemon_main() -> Result<()> {
                 &config_path,
                 encoder.as_deref(),
                 supervised,
+                unenrolled,
                 supervisor.as_deref(),
                 stop_event.as_deref(),
             )
@@ -3747,6 +3756,10 @@ async fn run_cmd(
     config_path: &PathBuf,
     cli_encoder: Option<&str>,
     supervised: bool,
+    // FR-43 P3a — a GUI worker with no enrollment (`run --supervised
+    // --unenrolled`). Its own branches below are few on purpose: most of what
+    // it does not do follows from the view of the config it runs on.
+    unenrolled: bool,
     supervisor_flag: Option<&str>,
     // #1683 (Windows) — the SCM host's stop event, waited on by
     // `terminate_signal`. `None` on every non-service run and every other
@@ -3755,7 +3768,7 @@ async fn run_cmd(
 ) -> Result<Option<i32>> {
     // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
     let process_started = std::time::Instant::now();
-    if !config_path.exists() {
+    if !config_path.exists() && !unenrolled {
         bail!(
             "no config found at {}. Run `roomlerd enroll` first.",
             config_path.display()
@@ -3807,6 +3820,14 @@ async fn run_cmd(
     // with the session (`PartOf=`), and a user manager that outlives a logout
     // never reaches `default.target` twice. Per-user only, on its own thread.
     roomlerd::service::repair_session_wants_at_start();
+    // FR-43 P3a — a person with no enrollment on a one-row Mac has no file yet,
+    // and `caps`, `record` and `config set` all load it. After the lock, so one
+    // process writes it.
+    if unenrolled && !config_path.exists() {
+        let name = roomlerd::machine::hostname().unwrap_or_default();
+        let blank = config::AgentConfig::for_person_with_no_enrollment(&name)?;
+        config::save(config_path, &blank).context("writing the person's config")?;
+    }
     let mut cfg = config::load(config_path).context("loading config")?;
     // #3116 — every save below, up to the LocalAPI coming up, writes THIS
     // copy, so each goes through `startup_writes`: it refuses to write over a
@@ -3814,6 +3835,21 @@ async fn run_cmd(
     // enrollment, a second after the MSI restarted the service). The runtime
     // writers after it reload under the write lock instead.
     let mut startup_writes = config::StartupWrites::after_load(config_path);
+    // FR-43 P3a — from here this process runs on a view of the person's file,
+    // pointed at its own stand-in control plane. The file stays as it is: its
+    // startup saves are off, and the writers after them reload it first.
+    if unenrolled {
+        let stand_in = roomlerd::unenrolled::StandIn::start().await?;
+        cfg = cfg.for_unenrolled_worker(
+            &stand_in.server_url(),
+            &stand_in.ws_url(),
+            stand_in.secret(),
+        );
+        startup_writes = config::StartupWrites::read_only(config_path);
+        tracing::info!(
+            "a GUI worker with no enrollment: sessions come from the root daemon alone (FR-43 P3a)"
+        );
+    }
     // FR-90 P2k-4 (F4) — an archive replica enrolled before its posture
     // joined the mesh joins it at its first start in a newer image, before
     // anything reads the overlay keys (the WG key is minted below from them).
@@ -4130,8 +4166,11 @@ async fn run_cmd(
     // but logs an actionable hint up front so the operator doesn't
     // chase the wrong rabbit hole when the WS reconnect ladder kicks
     // in. 15 s overall budget, 5 s per probe in parallel.
-    let preflight_report = preflight::run_checks(&cfg.server_url).await;
-    preflight_report.log();
+    // FR-43 P3a — not a worker with no enrollment: it has no server to check.
+    if !unenrolled {
+        let preflight_report = preflight::run_checks(&cfg.server_url).await;
+        preflight_report.log();
+    }
 
     // Crash-loop bookkeeping: if the previous run was marked
     // `last_run_unhealthy=true` (started, never reached the clean
@@ -4406,6 +4445,7 @@ async fn run_cmd(
     let _ = watchdog::install(wd.clone());
     watchdog::spawn_thread_watchdog(wd.clone());
     tokio::spawn(roomlerd::resource_watch::run(shutdown_rx.clone()));
+    tokio::spawn(roomlerd::runtime_canary::run(shutdown_rx.clone()));
     let wd_task = tokio::spawn({
         let wd = wd.clone();
         let rx = shutdown_rx.clone();
@@ -4446,6 +4486,11 @@ async fn run_cmd(
         let token = primary_token.clone();
         let mut shutdown = shutdown_rx.clone();
         async move {
+            // FR-43 P3a — a worker with no enrollment has no token to upload
+            // on. Its supervisor records a crash the panic hook could not.
+            if unenrolled {
+                return;
+            }
             // Initial drain (formerly the only call site).
             crash_uploader::drain_and_upload(&cfg, &token).await;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -4478,7 +4523,11 @@ async fn run_cmd(
     // `ROOMLERD_LOGS_UPLOAD_DISABLED=1` per the rc.58 plan.
     let logs_upload_disabled =
         roomlerd::logs_upload::parse_disable_flag(node_env("LOGS_UPLOAD_DISABLED").as_deref());
-    if !logs_upload_disabled && let Some(rx) = logging::take_log_upload_receiver() {
+    // FR-43 P3a — a worker with no enrollment has no token to upload on, so its
+    // log stays on disk. The layer's queue is bounded, and full it drops.
+    if unenrolled {
+        tracing::info!("logs upload: none, this worker holds no enrollment");
+    } else if !logs_upload_disabled && let Some(rx) = logging::take_log_upload_receiver() {
         let host_hash = roomlerd::logs_upload::hash_hostname(
             &roomlerd::machine::hostname().unwrap_or_else(|_| "unknown".to_string()),
         );
@@ -4581,7 +4630,9 @@ async fn run_cmd(
         cfg_write_lock.clone(),
         cfg.exec_enabled,
         cfg.remote_config_enabled,
-    );
+    )
+    // FR-132 P1c — what this process runs, for the `needs_restart` it reports.
+    .running_on(&cfg);
     // FR-100 P1c — and every other live key it holds (`peer_auth`), from the
     // same config: a fresh `new` judges offers under `audit` until told.
     remote_cfg.adopt_local(&cfg);
@@ -4620,6 +4671,11 @@ async fn run_cmd(
     // terminal-error slot / OrgCtx) are minted here so the registry rows and
     // the spawned supervisors share the SAME instances.
     let primary_ctx = signaling::OrgCtx::primary(primary_token.clone()).with_renewal(token_renewal);
+    let primary_ctx = if unenrolled {
+        primary_ctx.unenrolled()
+    } else {
+        primary_ctx
+    };
     // FR-90 P4-3b-1 — the primary's knowhow scanner, reading its roots from
     // this config file under the LocalAPI's own write lock. A secondary's
     // context has none (decision 43).
@@ -4837,7 +4893,10 @@ async fn run_cmd(
     // companion's device list and mesh.
     .with_org_http(org_http.clone())
     // FR-51 P4 — surface the enrollment's nature in `roomler status`.
-    .with_ephemeral(cfg.ephemeral);
+    .with_ephemeral(cfg.ephemeral)
+    // FR-43 P3a — a worker with no enrollment sends what needs a server to the
+    // root half.
+    .with_no_enrollment(unenrolled);
     // FR-85 — the local recording verbs: this daemon launches `roomlerd
     // record` (its own image, resolved now, before any package upgrade can
     // leave `/proc/self/exe` pointing at a deleted inode).
@@ -4953,6 +5012,7 @@ async fn run_cmd(
     // revokes the worker. An abort would skip exactly that.
     let _macos_supervisor_task = tokio::spawn(roomlerd::macos_supervisor::run(
         cfg.macos_supervise_gui_worker,
+        cfg.macos_one_row,
         delegate_host.clone(),
         shutdown_rx.clone(),
     ));
@@ -4965,6 +5025,7 @@ async fn run_cmd(
     // Same: exits on the shutdown watch, so no abort.
     let _delegate_worker_task = tokio::spawn(roomlerd::delegate_worker::run(
         supervised,
+        unenrolled,
         worker_channels,
         shutdown_rx.clone(),
         // #2987 — a worker whose daemon is gone stops through this door.
@@ -5556,14 +5617,16 @@ async fn run_cmd(
             // (rollbacks included); the policy itself is one pure table
             // (`updater::should_self_unenroll`). Platform-neutral on purpose.
             let update_in_flight = updater::update_in_flight();
-            if updater::should_self_unenroll(current.ephemeral, os_initiated_stop, update_in_flight)
-            {
+            // FR-43 P3a — `current` is the person's file, and a worker with no
+            // enrollment is not the row in it, whatever kind that row is.
+            let ephemeral = current.ephemeral && !unenrolled;
+            if updater::should_self_unenroll(ephemeral, os_initiated_stop, update_in_flight) {
                 match enrollment::self_unenroll(&current.server_url, &current.agent_token).await {
                     Ok(()) => tracing::info!("ephemeral device unenrolled itself on shutdown"),
                     Err(e) => tracing::warn!(error = %e,
                         "ephemeral self-unenroll failed; the server-side reaper will collect this device"),
                 }
-            } else if current.ephemeral && os_initiated_stop {
+            } else if ephemeral && os_initiated_stop {
                 // The one way the gate says no to an ephemeral OS stop. Named,
                 // so "why is this row still here?" has an answer in the log.
                 tracing::info!(

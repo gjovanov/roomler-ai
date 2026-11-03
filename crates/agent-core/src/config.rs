@@ -131,9 +131,9 @@ pub struct AgentConfig {
     /// refusal that survives a compromised server. Defaulting it on would
     /// make the other three the whole story.
     ///
-    /// Commands inherit the daemon's identity — SYSTEM under a perMachine
-    /// Windows install, root under systemd. Turning this on is granting
-    /// root, and the admin UI says so.
+    /// Commands run as root under systemd; on Windows as SYSTEM once anchored
+    /// (FR-94), else as the console worker: the signed-in user, or SYSTEM in
+    /// SystemContext mode. Turning this on grants that, as the admin UI says.
     #[serde(default)]
     pub exec_enabled: bool,
 
@@ -150,6 +150,20 @@ pub struct AgentConfig {
     /// No effect on any other platform.
     #[serde(default)]
     pub macos_supervise_gui_worker: bool,
+
+    /// FR-43 P3 — on macOS, ONE device row: the GUI worker holds no enrollment
+    /// of its own (`run --supervised --unenrolled`), so the root daemon's row
+    /// serves every session. Read by the root daemon at its start, and only
+    /// with [`Self::macos_supervise_gui_worker`] on: with no supervisor there
+    /// is no worker to run that way.
+    ///
+    /// Default OFF: a person's enrollment on this Mac stays what the worker
+    /// runs on, and a Mac with none has no worker. Device-owned like the key
+    /// above, so it is absent from `DesiredConfig` and no server can push it.
+    ///
+    /// No effect on any other platform.
+    #[serde(default)]
+    pub macos_one_row: bool,
 
     /// FR-55 — whether this device asks the OS to stay awake so it remains
     /// reachable: `never` (default) | `on-ac` | `always`.
@@ -794,6 +808,12 @@ pub struct AgentConfig {
     /// needed none of it (`ROOMLERD_WS_REPLACED_EXIT`).
     #[serde(default)]
     pub ws_replaced_exit: Option<bool>,
+    /// FR-28 — redial the control WS and the central `/derp` WS at a flat pace
+    /// while the front load balancer answers 502, instead of climbing the ladder
+    /// (`ROOMLERD_WS_FLAT_REDIAL`). Built-in default: OFF. See `ws_flat_redial`
+    /// in the config surface.
+    #[serde(default)]
+    pub ws_flat_redial: Option<bool>,
     /// C4 stage 1 — the standing warm TURN/UDP allocation, established
     /// while UDP works and kept alive so corp-VPN flow-grandfathering
     /// preserves a UDP relay leg across a VPN connect. Measurement-only
@@ -847,6 +867,13 @@ pub struct AgentConfig {
     /// Built-in default: 750.
     #[serde(default)]
     pub overlay_netmon_debounce_ms: Option<u32>,
+    /// FR-65 P3 — seconds a signal burst with no snapshot delta waits behind
+    /// the last forced revalidation
+    /// (`ROOMLERD_OVERLAY_NETCHANGE_POKE_QUIET_SECS`, 0–3600). Built-in
+    /// default: 60. `0` restores the arm as it was before the gate. A real
+    /// network move never waits on this.
+    #[serde(default)]
+    pub overlay_netchange_poke_quiet_secs: Option<u32>,
     /// Force overlay coturn allocations onto the TURNS/TCP (TLS) tier —
     /// the corp-VPN field probe (`ROOMLERD_OVERLAY_RELAY_TLS`).
     /// Built-in default: off.
@@ -2249,6 +2276,87 @@ impl AgentConfig {
         c
     }
 
+    /// FR-43 P3a — the config a GUI worker with no enrollment runs on: this
+    /// file with every enrollment and every host-global role taken out, and
+    /// its signalling loop pointed at the stand-in control plane
+    /// (`roomlerd::unenrolled`). The person's session knobs stay: they are why
+    /// the worker reads the file at all.
+    ///
+    /// ⚠️ A VIEW, and never written back. An unmigrated person's enrollment is
+    /// still in the file, which is what makes `macos_one_row = false` a real
+    /// off: [`StartupWrites::read_only`] keeps the daemon's startup saves off
+    /// it, and every later writer reloads the file first.
+    ///
+    /// The root holds what this takes out, so a worker running any of it would
+    /// be a second one on the machine. Crash bookkeeping goes too: a worker
+    /// cannot install a package, so it has no rollback to count towards, and the
+    /// supervisor records its crashes on the root's enrollment.
+    pub fn for_unenrolled_worker(&self, server_url: &str, ws_url: &str, secret: &str) -> Self {
+        let mut c = self.clone();
+        c.server_url = server_url.to_string();
+        c.ws_url = Some(ws_url.to_string());
+        c.agent_token = secret.to_string();
+        c.agent_id = String::new();
+        c.tenant_id = String::new();
+        c.ephemeral = false;
+        c.orgs = Vec::new();
+        c.tunnel_routes = Vec::new();
+        c.overlay_enabled = false;
+        c.overlay_multi_org = false;
+        c.netstack_socks_port = None;
+        c.overlay_wg_secret_key = None;
+        c.overlay_exit_node_enabled = false;
+        c.overlay_exit_node = None;
+        c.overlay_advertised_routes = Vec::new();
+        c.advertise_routes = Vec::new();
+        c.advertise_local_subnets = false;
+        c.relay_server_enabled = None;
+        c.ssh_enabled = false;
+        c.ssh_host_key = None;
+        c.ssh_authorized_keys = Vec::new();
+        c.exec_enabled = false;
+        c.remote_config_enabled = false;
+        c.external_access_enabled = false;
+        c.hive_enabled = false;
+        c.hive_adopt = false;
+        c.hive_replica = false;
+        c.hive_archive = false;
+        c.hive_net = false;
+        c.hive_ssh = false;
+        c.hive_egress = false;
+        c.hive_worker = false;
+        c.vault_enabled = false;
+        c.knowhow_scan_roots = Vec::new();
+        c.knowhow_scan_listeners = false;
+        c.knowhow_probe_reach = Vec::new();
+        c.auto_update = Some(false);
+        c.crash_count = 0;
+        c.last_crash_unix = 0;
+        c.last_run_unhealthy = false;
+        c.rollback_attempted = false;
+        c
+    }
+
+    /// FR-43 P3a — the file a worker with no enrollment writes when the person
+    /// has none: blank identity fields, and every default. `caps`, `record` and
+    /// `config set` load this file, and a person's own settings land in it.
+    pub fn for_person_with_no_enrollment(machine_name: &str) -> Result<Self> {
+        let mut cfg: Self = toml::from_str(
+            "server_url = \"\"\nagent_token = \"\"\nagent_id = \"\"\ntenant_id = \"\"\n\
+             machine_id = \"\"\nmachine_name = \"\"\n",
+        )
+        .context("the defaults of an empty config")?;
+        cfg.machine_name = machine_name.to_string();
+        Ok(cfg)
+    }
+
+    /// Does this file hold a primary enrollment? A person's file on a one-row
+    /// Mac does not (FR-43 P3): [`Self::for_person_with_no_enrollment`], or an
+    /// enrolled file the migration blanked.
+    pub fn has_primary_enrollment(&self) -> bool {
+        !self.agent_token.trim().is_empty() && !self.agent_id.trim().is_empty()
+    }
+
     /// Per-entry runnability partition for the daemon supervisor: each
     /// `[[orgs]]` entry paired with `None` (runnable) or `Some(reason)` (a
     /// validation problem — the supervisor skips it and surfaces the reason
@@ -2874,6 +2982,7 @@ pub fn test_fixture() -> AgentConfig {
         auto_grant_session: true,
         exec_enabled: false,
         macos_supervise_gui_worker: false,
+        macos_one_row: false,
         power_policy: String::new(),
         companion_autostart: true,
         remote_config_enabled: false,
@@ -2932,6 +3041,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_init_auth_first: None,
         overlay_srflx_seek: None,
         ws_replaced_exit: None,
+        ws_flat_redial: None,
         overlay_warm_relay: None,
         overlay_quic_async: None,
         overlay_vpn_vantage: None,
@@ -2941,6 +3051,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_route_tick_secs: None,
         overlay_netmon: None,
         overlay_netmon_debounce_ms: None,
+        overlay_netchange_poke_quiet_secs: None,
         overlay_relay_tls: None,
         overlay_shared_carrier: None,
         overlay_roam: None,
@@ -3170,7 +3281,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 94] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 95] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -3235,6 +3346,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 94]
         ("OVERLAY_INIT_AUTH_FIRST", cfg.overlay_init_auth_first),
         ("OVERLAY_SRFLX_SEEK", cfg.overlay_srflx_seek),
         ("WS_REPLACED_EXIT", cfg.ws_replaced_exit),
+        ("WS_FLAT_REDIAL", cfg.ws_flat_redial),
         ("OVERLAY_WARM_RELAY", cfg.overlay_warm_relay),
         ("OVERLAY_QUIC_ASYNC", cfg.overlay_quic_async),
         ("OVERLAY_VPN_VANTAGE", cfg.overlay_vpn_vantage),
@@ -3283,7 +3395,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 94]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 32] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 33] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -3322,6 +3434,10 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 3
         ("SCALE_THREADS", cfg.scale_threads),
         ("RC_MAX_SESSIONS", cfg.rc_max_sessions),
         ("OVERLAY_DIRECT_PORT", cfg.overlay_direct_port),
+        (
+            "OVERLAY_NETCHANGE_POKE_QUIET_SECS",
+            cfg.overlay_netchange_poke_quiet_secs,
+        ),
         ("RELAY_SERVER_PORT", cfg.relay_server_port),
     ]
 }
@@ -3829,9 +3945,8 @@ pub fn describe_unreadable(
     }
 }
 
-/// An error chain on one line, bounded: a TOML parse error carries a source
-/// snippet over several lines, which a progress row or a terminal line cannot
-/// show.
+/// An error chain on one line, bounded, which is what a progress row or a
+/// terminal line can show.
 fn one_line(text: &str) -> String {
     let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if joined.chars().count() > 300 {
@@ -3840,6 +3955,40 @@ fn one_line(text: &str) -> String {
     } else {
         joined
     }
+}
+
+/// #3086 — what may be said about a config that does not parse: where it stopped,
+/// and a key the schema wanted. Nothing of the file. A `toml` error quotes the
+/// line it stopped at in its `Display` and its `Debug`, and its message can quote
+/// a value (`invalid type: string "…"`), and this file holds the agent token and
+/// the overlay keys. A daemon's log goes to the server, and a wizard's page and a
+/// terminal show the same words.
+///
+/// So the parser's error ends here: what leaves is a string with no source, and
+/// nothing built on it can reach those words, however it is printed. The file is
+/// there to open at that line.
+fn parse_failure(raw: &str, e: &toml::de::Error) -> String {
+    let mut said = String::from("TOML parse error");
+    if let Some(before) = e.span().and_then(|span| raw.get(..span.start)) {
+        let line = before.matches('\n').count() + 1;
+        let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+        said.push_str(&format!(" at line {line}, column {column}"));
+    }
+    // The schema's word for a key it wanted, which no file can put there. It is
+    // the one message kept: a lost key otherwise reads as something near line 1.
+    // A key name read off the file never is, because a broken line can turn a
+    // value into one.
+    if let Some(field) = e
+        .message()
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'))
+        && field
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        said.push_str(&format!(": missing field `{field}`"));
+    }
+    said
 }
 
 fn try_load(path: &PathBuf) -> Result<AgentConfig> {
@@ -3855,8 +4004,13 @@ fn try_load(path: &PathBuf) -> Result<AgentConfig> {
             raw.len()
         );
     }
-    let mut cfg: AgentConfig =
-        toml::from_str(&raw).with_context(|| format!("parsing config at {}", path.display()))?;
+    let mut cfg: AgentConfig = toml::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!(
+            "parsing config at {}: {}",
+            path.display(),
+            parse_failure(&raw, &e)
+        )
+    })?;
     // FR-101 P1b — TLS to the server whatever the file says, unless its owner
     // kept plaintext (`allow_plaintext_server`). Here, because every reader
     // parses through this function: the daemon, the probe, the recovery.
@@ -3886,12 +4040,14 @@ enum KeyStep {
 /// that knows it or left behind by a rollback. Paths only, never values: the
 /// file holds the agent token and the overlay keys.
 ///
-/// `Err` when `raw` does not parse as a config at all.
-fn unknown_keys(raw: &str) -> Result<Vec<Vec<KeyStep>>> {
+/// `None` when `raw` does not parse as a config at all. Not the parser's error,
+/// which quotes the file (#3086): no caller wants it, so none can print it.
+fn unknown_keys(raw: &str) -> Option<Vec<Vec<KeyStep>>> {
     let mut found = Vec::new();
-    let de = toml::de::Deserializer::parse(raw)?;
-    let _: AgentConfig = serde_ignored::deserialize(de, |path| found.push(key_steps(&path)))?;
-    Ok(found)
+    let de = toml::de::Deserializer::parse(raw).ok()?;
+    let _: AgentConfig =
+        serde_ignored::deserialize(de, |path| found.push(key_steps(&path))).ok()?;
+    Some(found)
 }
 
 fn key_steps(path: &serde_ignored::Path<'_>) -> Vec<KeyStep> {
@@ -4043,9 +4199,13 @@ fn merge_unknown_keys(
 /// #2078 — the text [`save`] writes over `path`: `cfg`, plus every key `base`
 /// holds that this build does not model. `base` is the file being replaced:
 /// `path` itself, or on [`load`]'s recovery the `.prev` copy it loaded, since
-/// the live file it then writes over parses as nothing. Before this, every
-/// save erased them: a key set ahead of the update that knows it was gone by
-/// the old daemon's stop, and a rollback erased every newer key for good.
+/// that live file may not even be there. Before this, every save erased them:
+/// a key set ahead of the update that knows it was gone by the old daemon's
+/// stop, and a rollback erased every newer key for good.
+///
+/// #3087 — a `base` that is there and does not read as a config holds no keys
+/// this can see, and its last good copy does. That is the config a recovery has
+/// just loaded, and [`read_merge_base`]'s callers name no base when they save it.
 ///
 /// A base with no such key is written exactly as before, byte for byte, and
 /// any failure to keep them saves `cfg` alone and says so: the worst case is
@@ -4056,31 +4216,29 @@ fn serialise_for(
     cfg: &AgentConfig,
 ) -> Result<String> {
     let plain = toml::to_string_pretty(cfg).context("serialising config")?;
-    let raw = match std::fs::read_to_string(base) {
-        Ok(raw) => raw,
-        // No file yet: a first save, nothing to keep.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(plain),
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                base = %base.display(),
-                error = %e,
-                "the config being replaced could not be read: keys this build does not know \
-                 in it, if any, are NOT kept through this save"
-            );
-            return Ok(plain);
-        }
+    let read = |file: &std::path::Path| {
+        let raw = std::fs::read_to_string(file).ok()?;
+        let unknown = unknown_keys(&raw)?;
+        Some((raw, unknown))
     };
-    // Said with a fixed string: a parse error quotes the line it stopped at,
-    // and the file holds the agent token and the overlay keys. A live file
-    // that does not parse is what `load` recovers from `.prev`, and a save
-    // over it keeps the copy's keys only when its caller names the copy.
-    let Ok(unknown) = unknown_keys(&raw) else {
+    // No file yet: a first save, nothing to keep.
+    if matches!(base.try_exists(), Ok(false)) {
+        return Ok(plain);
+    }
+    let copy = prev_path(path);
+    let (raw, base, unknown) = if let Some((raw, unknown)) = read(base) {
+        (raw, base, unknown)
+    } else if let Some((raw, unknown)) = read(&copy) {
+        (raw, copy.as_path(), unknown)
+    } else {
+        // Said with a fixed string: a parse error quotes the line it stopped
+        // at, and the file holds the agent token and the overlay keys.
         tracing::warn!(
             path = %path.display(),
             base = %base.display(),
-            "the config being replaced does not parse: keys this build does not know in it, \
-             if any, are NOT kept through this save"
+            "the config being replaced does not read as a config, and neither does its last \
+             good copy: keys this build does not know in them, if any, are NOT kept through \
+             this save"
         );
         return Ok(plain);
     };
@@ -4123,7 +4281,7 @@ fn note_unknown_keys(path: &PathBuf) {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return;
     };
-    let Ok(unknown) = unknown_keys(&raw) else {
+    let Some(unknown) = unknown_keys(&raw) else {
         return;
     };
     if unknown.is_empty() {
@@ -4174,6 +4332,9 @@ pub struct StartupWrites {
     /// after each of its own saves. `None` when it could not be read, which
     /// leaves the saves unguarded, as they all were before.
     seen: Option<Vec<u8>>,
+    /// FR-43 P3a — this daemon runs on a view of the file, so its copy is
+    /// never the file's to write ([`Self::read_only`]).
+    read_only: bool,
 }
 
 impl StartupWrites {
@@ -4186,6 +4347,18 @@ impl StartupWrites {
         Self {
             path: path.to_path_buf(),
             seen: std::fs::read(path).ok(),
+            read_only: false,
+        }
+    }
+
+    /// FR-43 P3a — for a process running on
+    /// [`AgentConfig::for_unenrolled_worker`]'s view: every save succeeds and
+    /// writes nothing, so a view never lands on the person's file.
+    pub fn read_only(path: &std::path::Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            seen: None,
+            read_only: true,
         }
     }
 
@@ -4194,6 +4367,9 @@ impl StartupWrites {
     /// read back, is not written either: an uninstall or an unenroll removed
     /// it, and a startup save must not bring the enrollment back.
     pub fn save(&mut self, cfg: &AgentConfig) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         if let Some(seen) = &self.seen {
             let now = std::fs::read(&self.path).with_context(|| {
                 format!(
@@ -4894,6 +5070,194 @@ machine_name = "devbox"
             "a recovered config's unknown keys are named, as every load's are; got: {log}"
         );
         assert!(!log.contains("NOT kept"), "{log}");
+    }
+
+    /// #3087 — the two callers of [`read_merge_base`] (the setup wizard's
+    /// enrollment and `adopt-enrollment`) recover from `.prev` and then
+    /// [`save`] over the live file that does not parse. The save read the keys
+    /// to keep off that file, found nothing, and the recovered host lost them
+    /// with a WARN, which is the case [`load`]'s own recovery already handled.
+    #[test]
+    fn a_save_over_a_corrupt_live_file_keeps_the_last_good_copys_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg: AgentConfig = toml::from_str(&minimal_toml()).unwrap();
+        std::fs::write(
+            &path,
+            format!("a_key_from_a_newer_build = true\n{}", minimal_toml()),
+        )
+        .unwrap();
+        save(&path, &cfg).unwrap();
+        assert_eq!(
+            unknown_names(&prev_path(&path)),
+            ["a_key_from_a_newer_build"],
+            "the premise: the last good copy holds the key"
+        );
+
+        // The live file breaks; what those callers do next.
+        std::fs::write(&path, "agent_token = \"broken\n").unwrap();
+        let recovered = read_merge_base(&path)
+            .into_config()
+            .expect("recovered from .prev");
+        let (cap, _guard) = captured();
+        save(&path, &recovered).unwrap();
+        assert_eq!(
+            unknown_names(&path),
+            ["a_key_from_a_newer_build"],
+            "the recovered file lost the copy's key: {}",
+            cap.text()
+        );
+        assert!(!cap.text().contains("NOT kept"), "{}", cap.text());
+
+        // …and it survives the next save, whose rotation the copy goes through.
+        save(&path, &recovered).unwrap();
+        assert_eq!(unknown_names(&path), ["a_key_from_a_newer_build"]);
+        assert_eq!(
+            unknown_names(&prev_path(&path)),
+            ["a_key_from_a_newer_build"]
+        );
+
+        // With no copy that parses there is nothing to keep, and it says so.
+        std::fs::write(&path, "agent_token = \"broken\n").unwrap();
+        std::fs::write(prev_path(&path), "agent_token = \"broken too\n").unwrap();
+        save(&path, &recovered).unwrap();
+        assert!(unknown_names(&path).is_empty());
+        assert!(cap.text().contains("NOT kept"), "{}", cap.text());
+        assert_eq!(
+            std::fs::read_to_string(prev_path(&path)).unwrap(),
+            "agent_token = \"broken too\n",
+            "a save never rotates a file that does not parse into .prev"
+        );
+    }
+
+    /// Shaped like an agent token, and not one. Built at run time, because the
+    /// secret scanner reads a literal of this shape as a live credential.
+    fn token_shaped() -> String {
+        let segment = |word: &str| format!("eyJ{}", word.repeat(3));
+        [
+            segment("notreal"),
+            segment("alsofake"),
+            "nosignature".repeat(2),
+        ]
+        .join(".")
+    }
+
+    /// Every way a hand edit leaves a value on a line the parser stops at: the
+    /// syntax errors, whose `Display` quotes the line, and the schema errors,
+    /// whose message can quote the value itself.
+    fn lines_that_do_not_parse() -> Vec<(&'static str, String)> {
+        let t = token_shaped();
+        vec![
+            ("an unterminated string", format!("agent_token = \"{t}")),
+            ("a lost opening quote", format!("agent_token = {t}\"")),
+            ("no quotes at all", format!("agent_token = {t}")),
+            ("a value with no key", t.clone()),
+            (
+                "a string where a bool belongs",
+                format!("agent_token = \"tok\"\noverlay_enabled = \"{t}\""),
+            ),
+            ("an array of it", format!("agent_token = [\"{t}\"]")),
+            (
+                "the key twice",
+                format!("agent_token = \"{t}\"\nagent_token = \"{t}\""),
+            ),
+        ]
+    }
+
+    fn with_token_line(line: &str) -> String {
+        let raw = minimal_toml();
+        assert!(raw.contains("agent_token = \"tok\""), "the premise");
+        raw.replace("agent_token = \"tok\"", line)
+    }
+
+    fn assert_no_value(shape: &str, what: &str, text: &str) {
+        let token = token_shaped();
+        for part in token.split('.') {
+            assert!(
+                !text.contains(part),
+                "{shape}: {what} carries a value from the file: {text}"
+            );
+        }
+    }
+
+    /// #3086 — a config that does not parse puts nothing of the file in any error
+    /// or log. A `toml` error quotes the line it stopped at, so a typo on
+    /// `agent_token` printed the token: in the daemon's log, which uploads to the
+    /// server, on the wizard's page and in the terminal. Every reader goes
+    /// through [`try_load`], so nothing built on its error can carry a value.
+    #[test]
+    fn a_config_that_does_not_parse_puts_no_value_in_any_error_or_log() {
+        for (shape, line) in lines_that_do_not_parse() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let raw = with_token_line(&line);
+            std::fs::write(&path, &raw).unwrap();
+            let (cap, _guard) = captured();
+
+            let err = try_load(&path).expect_err(shape);
+            assert_no_value(shape, "Display", &format!("{err}"));
+            assert_no_value(shape, "the chain", &format!("{err:#}"));
+            assert_no_value(shape, "Debug", &format!("{err:?}"));
+            for cause in err.chain() {
+                assert_no_value(shape, "a cause", &cause.to_string());
+            }
+
+            // What the wizard and `adopt-enrollment` show the person.
+            match read_merge_base(&path) {
+                MergeBase::Unreadable { reason, recovered } => {
+                    assert!(recovered.is_none(), "{shape}: no .prev yet");
+                    assert_no_value(shape, "the reason", &reason);
+                    let kept = Ok(unreadable_copy_path(&path));
+                    let told = describe_unreadable(&path, &reason, false, &kept);
+                    assert_no_value(shape, "what the person is told", &told);
+                }
+                other => panic!("{shape}: {other:?}"),
+            }
+
+            // The probe's DEBUG line, and both of `load`'s: the live file's error
+            // alone, then with the same line in the copy it falls back to.
+            assert!(read_if_present(&path).is_none(), "{shape}");
+            let err = load(&path).expect_err(shape);
+            assert_no_value(shape, "load's error", &format!("{err:?}"));
+            std::fs::write(prev_path(&path), &raw).unwrap();
+            let err = load(&path).expect_err(shape);
+            assert_no_value(shape, "load's error", &format!("{err:?}"));
+
+            let log = cap.text();
+            assert!(
+                log.contains("config unreadable") && log.contains("treating as absent"),
+                "the premise: the loggers ran: {log}"
+            );
+            assert_no_value(shape, "the log", &log);
+        }
+    }
+
+    /// #3086 — what is left is still useful: the error says where, so the person
+    /// can open the file and look, and a lost key is named, because otherwise it
+    /// reads as a problem somewhere near line 1.
+    #[test]
+    fn a_parse_error_still_says_where_and_names_a_lost_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(&path, with_token_line("agent_token = \"unterminated")).unwrap();
+        let err = format!("{:#}", try_load(&path).unwrap_err());
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("line 3"), "{err}");
+
+        // The schema's own word for it, not the file's.
+        let raw = minimal_toml().replace("agent_token = \"tok\"\n", "");
+        std::fs::write(&path, raw).unwrap();
+        let err = format!("{:#}", try_load(&path).unwrap_err());
+        assert!(err.contains("missing field `agent_token`"), "{err}");
+
+        // An unreadable file is still read apart from a parse error.
+        match read_merge_base(&path) {
+            MergeBase::Unreadable { reason, .. } => {
+                assert!(reason.contains("parsing config"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// #2078 — a key a newer build wrote into a route's entry follows THAT
@@ -6281,6 +6645,125 @@ tenant_id = "tid2"
         std::fs::remove_file(&path).unwrap();
         assert!(writes.save(&cfg).is_err());
         assert!(!path.exists());
+    }
+
+    /// FR-43 P3a — a GUI worker's view holds no enrollment and no host role,
+    /// because the root holds them and a second one on the machine would be a
+    /// defect, and it keeps the person's session knobs, which are why it reads
+    /// the file at all.
+    #[test]
+    fn a_workers_view_drops_every_enrollment_and_keeps_the_persons_knobs() {
+        let mut file = test_fixture();
+        file.ephemeral = true;
+        file.orgs = vec![OrgEntry {
+            label: "acme".into(),
+            server_url: "https://b.invalid".into(),
+            ws_url: None,
+            agent_token: "tok-acme".into(),
+            agent_id: "aid-acme".into(),
+            tenant_id: "t-acme".into(),
+            enabled: true,
+            overlay_mode: OrgOverlayMode::Off,
+            overlay_wg_secret_key: None,
+            overlay_wg_key_epoch: 0,
+            overlay_advertised_routes: Vec::new(),
+            overlay_exit_node_enabled: false,
+            advertise_routes: Vec::new(),
+            netstack_socks_port: None,
+        }];
+        file.overlay_enabled = true;
+        file.overlay_wg_secret_key = Some("WG".into());
+        file.ssh_enabled = true;
+        file.exec_enabled = true;
+        file.remote_config_enabled = true;
+        file.external_access_enabled = true;
+        file.hive_enabled = true;
+        file.vault_enabled = true;
+        file.auto_update = Some(true);
+        file.crash_count = 3;
+        file.rollback_attempted = true;
+        file.auto_grant_session = false;
+        file.keep_busy_enabled = true;
+        file.record_remote_enabled = true;
+        file.rc_clipboard = roomler_ai_remote_control::models::FeaturePolicy::Off;
+
+        let view =
+            file.for_unenrolled_worker("http://127.0.0.1:1", "ws://127.0.0.1:1/ws", "SECRET");
+
+        // Its signalling loop dials the stand-in, with the stand-in's secret.
+        assert_eq!(view.server_url, "http://127.0.0.1:1");
+        assert_eq!(view.ws_url.as_deref(), Some("ws://127.0.0.1:1/ws"));
+        assert_eq!(view.agent_token, "SECRET");
+        // No enrollment of any kind.
+        assert!(view.agent_id.is_empty());
+        assert!(view.tenant_id.is_empty());
+        assert!(!view.ephemeral);
+        assert!(view.orgs.is_empty());
+        assert!(!view.has_primary_enrollment());
+        // No host role, and no updater: the root owns the package.
+        assert!(!view.overlay_enabled);
+        assert_eq!(view.overlay_wg_secret_key, None);
+        assert!(!view.ssh_enabled);
+        assert!(!view.exec_enabled);
+        assert!(!view.remote_config_enabled);
+        assert!(!view.external_access_enabled);
+        assert!(!view.hive_enabled);
+        assert!(!view.vault_enabled);
+        assert_eq!(view.auto_update, Some(false));
+        assert_eq!(view.crash_count, 0);
+        assert!(!view.rollback_attempted);
+        // The person's own.
+        assert!(!view.auto_grant_session);
+        assert!(view.keep_busy_enabled);
+        assert!(view.record_remote_enabled);
+        assert_eq!(view.rc_clipboard, file.rc_clipboard);
+        assert_eq!(view.machine_name, file.machine_name);
+    }
+
+    /// FR-43 P3a — the file a person with no enrollment gets: it loads, in a
+    /// directory that wasn't there, reads as not enrolled, and holds a setting.
+    #[test]
+    fn a_blank_persons_file_loads_and_reads_as_no_enrollment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("first-run").join("config.toml");
+        let mut blank = AgentConfig::for_person_with_no_enrollment("mac").expect("blank");
+        blank.keep_busy_enabled = true;
+        save(&path, &blank).expect("save");
+
+        let loaded = load(&path).expect("load");
+        assert_eq!(loaded.machine_name, "mac");
+        assert!(loaded.keep_busy_enabled);
+        assert!(!loaded.has_primary_enrollment());
+        assert!(
+            test_fixture().has_primary_enrollment(),
+            "control: an enrolled file reads as one"
+        );
+    }
+
+    /// FR-43 P3a — a worker's startup saves leave the person's file as it was,
+    /// so their token survives for the switch's off. The control is the ordinary
+    /// startup save, which would have put the view over it.
+    #[test]
+    fn a_read_only_startup_save_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut file = test_fixture();
+        file.agent_token = "THE-PERSONS".into();
+        save(&path, &file).expect("save");
+        let on_disk = std::fs::read(&path).unwrap();
+        let view = load(&path).unwrap().for_unenrolled_worker(
+            "http://127.0.0.1:1",
+            "ws://127.0.0.1:1/ws",
+            "SECRET",
+        );
+
+        let mut writes = StartupWrites::read_only(&path);
+        writes.save(&view).expect("a save that writes nothing");
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
+
+        let mut writes = StartupWrites::after_load(&path);
+        writes.save(&view).expect("the ordinary save");
+        assert_eq!(load(&path).unwrap().agent_token, "SECRET", "control");
     }
 
     /// #3073 — ownership and the grant come before anything that can remove
