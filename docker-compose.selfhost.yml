@@ -25,9 +25,8 @@
 #   ROOMLER__MEDIASOUP__ANNOUNCED_IP  the address browsers send RTP to. `127.0.0.1`
 #                                     works only for calls made on this machine.
 #                                     Set it to the host's LAN or public IP.
-#   RTC_MIN_PORT / RTC_MAX_PORT       published by the `netns` service below. 32
-#                                     ports is enough to try the product; widen
-#                                     for real use.
+#   RTC_MIN_PORT / RTC_MAX_PORT       mapped below. 32 ports is enough to try
+#                                     the product; widen for real use.
 #
 # Don't give the `roomler` service `network_mode: host` to get past this: the
 # server finds its datastores by service name, those names stop resolving on the
@@ -120,50 +119,33 @@ services:
     networks: [roomler]
     restart: "no"
 
-  # The network namespace the server and coturn share. It runs nothing: it owns
-  # the network and every published port, and it must stay up for as long as they
-  # do. They share it because a browser asks the relay for the SFU at the public
-  # address, and coturn rewrites that address to its own before it sends. Only
-  # when the SFU listens on coturn's own address does that packet reach a call.
-  #
-  # If it dies, Docker brings it back with a new namespace and leaves them in the
-  # old one, with no network, while `docker ps` stays green. `restart netns` takes
-  # them along; the check names it (docs/self-hosting.md, "The TURN relay").
-  #
-  # It reuses the Redis image, so there is nothing new to pull. `init` is there
-  # because `sleep` as PID 1 ignores SIGTERM, and Docker would wait out its 10 s.
-  # The aliases keep the two services' names resolving on this network.
-  netns:
-    image: redis:7.4.12-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f
-    init: true
-    command: ["sleep", "infinity"]
-    restart: unless-stopped
-    ports:
-      - "${ROOMLER_HTTP_PORT:-8080}:80"
-      # Conference media. Must match RTC_MIN_PORT/RTC_MAX_PORT below.
-      - "40000-40031:40000-40031/udp"
-      - "40000-40031:40000-40031/tcp"
-      # TURN, and the ports coturn relays on.
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
-      - "49152-49252:49152-49252/udp"
-    networks:
-      roomler:
-        aliases: [roomler, coturn]
-
   # TURN relay. Only needed when two peers can punch no direct path AND you want
   # a relay you own; the DERP floor over the API's own :443 already guarantees
   # connectivity without it. Comment the service out if you don't want it —
-  # nothing else depends on it.
+  # nothing else depends on it, and its ports on `roomler` can go with it.
   #
   # Pinned by digest because `latest` once moved to a release that exits on a flag
   # this file passed, and the only symptom was a relay that never answered. Before
   # you move the pin, and whenever you wonder if it is healthy:
   #   bash scripts/selfhost-coturn-check.sh       (docs/self-hosting.md, "The TURN relay")
+  #
+  # It runs in the server's network namespace, because a browser asks the relay for
+  # the SFU at the public address, and coturn rewrites that address to its own before
+  # it sends. Only when the SFU listens on coturn's own address does that packet
+  # reach a call. So its ports are published by `roomler`, below.
   coturn:
     image: coturn/coturn:4.18.0-r0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
     restart: unless-stopped
-    network_mode: service:netns
+    network_mode: service:roomler
+    # When the server's process dies, Docker brings it back in a new namespace and
+    # leaves coturn in the old one, with no address, still `running`. So coturn ends
+    # itself, and its restart policy brings it back into the new one. `init` makes
+    # PID 1 a process that always takes that signal and passes it on.
+    init: true
+    healthcheck:
+      test: ["CMD-SHELL", "hostname -I | grep -q '[0-9]' || { kill 1; exit 1; }"]
+      interval: 10s
+      timeout: 5s
     command:
       - --listening-port=3478
       - --fingerprint
@@ -229,8 +211,15 @@ services:
       mongo: { condition: service_healthy }
       redis: { condition: service_healthy }
       minio: { condition: service_healthy }
-    # Its ports are published by the `netns` service, above.
-    network_mode: service:netns
+    ports:
+      - "${ROOMLER_HTTP_PORT:-8080}:80"
+      # Conference media. Must match RTC_MIN_PORT/RTC_MAX_PORT below.
+      - "40000-40031:40000-40031/udp"
+      - "40000-40031:40000-40031/tcp"
+      # TURN and the ports it relays on: coturn runs in this service's namespace.
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49152-49252:49152-49252/udp"
     environment:
       # ── identity + security ────────────────────────────────────────────────
       # `production` makes the server REFUSE to boot on the built-in default
@@ -280,6 +269,7 @@ services:
       # The first start runs schema migrations behind a lease, so give it room
       # before a failing probe starts counting against `retries`.
       start_period: 45s
+    networks: { roomler: { aliases: [coturn] } }
 
 volumes:
   mongo_data:

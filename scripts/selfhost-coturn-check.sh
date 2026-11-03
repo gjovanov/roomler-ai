@@ -16,8 +16,9 @@
 #   --env-file  passed to compose. Default: .env.selfhost beside a selfhost file.
 #   --window    how long coturn must stay up, in seconds. Default: 30.
 #
-# It runs `up -d coturn`, which brings up what coturn needs and leaves a running,
-# unchanged service alone. It stops nothing and removes nothing of the stack's.
+# It runs `up -d --no-build coturn`, which brings up what coturn needs, the server and its
+# datastores among them, and leaves a running, unchanged service alone. It starts no
+# image build, and it stops nothing and removes nothing of the stack's.
 # Run it on the Linux host that runs the stack. The client uses the host's network, so
 # it comes in through the published port as a real client does.
 #
@@ -73,7 +74,12 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== coturn from $(basename "$FILE")"
-"${DC[@]}" up -d coturn >"$OUT" 2>&1 || {
+# `up -d` below starts a stopped coturn, and says nothing about why it had stopped.
+WAS="$("${DC[@]}" ps -aq coturn 2>/dev/null)"
+if [ -n "$WAS" ] && [ "$(docker inspect -f '{{.State.Status}}' "$WAS")" != running ]; then
+  note "coturn was not running, so this started it. It had stopped with: $(docker inspect -f 'exit {{.State.ExitCode}} {{.State.Error}}' "$WAS")"
+fi
+"${DC[@]}" up -d --no-build coturn >"$OUT" 2>&1 || {
   fail "docker compose up"
   tail -5 "$OUT" | detail
   verdict
@@ -89,8 +95,9 @@ else
 fi
 
 # A crash-looping container can read `running` between two exits, so one status read
-# proves nothing. Any restart at all fails: compose has only just started it, or a
-# daemon restart has reset the count, so a non-zero count means it really died.
+# proves nothing: it has to stay running with a count that holds still. A count above 0
+# that holds still means it died and came back, as coturn's healthcheck makes it do after
+# a server crash, so that is a note.
 state() { docker inspect -f '{{.State.Status}} {{.RestartCount}}' "$CID" 2>/dev/null; }
 crashed() {
   fail "coturn is not staying up: status=$1, RestartCount=$2"
@@ -101,15 +108,18 @@ crashed() {
   verdict
 }
 END=$(( $(date +%s) + WINDOW ))
+FIRST=""
 while :; do
   read -r STATUS RESTARTS <<<"$(state)"
-  [ "$STATUS" = running ] && [ "$RESTARTS" = 0 ] || crashed "${STATUS:-gone}" "${RESTARTS:-?}"
+  : "${FIRST:=$RESTARTS}"
+  [ "$STATUS" = running ] && [ "$RESTARTS" = "$FIRST" ] || crashed "${STATUS:-gone}" "${RESTARTS:-?}"
   [ "$(date +%s)" -ge "$END" ] && break
   sleep 2
 done
-pass "it stayed up for ${WINDOW}s, RestartCount 0"
+pass "it stayed up for ${WINDOW}s, RestartCount $RESTARTS"
+[ "$RESTARTS" = 0 ] || note "coturn has restarted $RESTARTS time(s) since Docker last started it, and is not climbing now. Each server crash costs one."
 
-# The service each one takes its network from, as this file says.
+# The service coturn takes its network from, as this file says.
 network_of() {
   "${DC[@]}" config 2>/dev/null | awk -v s="  $1:" '
     $0 == s { inside = 1; next }
@@ -118,35 +128,24 @@ network_of() {
 }
 OURS="$(network_of coturn)"
 
-# A member outlives its holder. When `netns` dies, Docker brings it back with a new namespace
-# and leaves the members in the old one with no address: `docker ps` stays green, RestartCount
-# stays 0, `up -d` sees nothing to do, and nothing answers on any published port.
-HOLDER="${OURS#service:}"
-if [ "$HOLDER" != "$OURS" ]; then
+# coturn outlives the container it takes its network from. When the server's process dies,
+# Docker brings it back in a new namespace and leaves coturn in the old one with no address:
+# `docker ps` stays green and `up -d` sees nothing to do. coturn's healthcheck ends it, and
+# its restart policy brings it back in. This says so if that has not happened (yet).
+OWNER="${OURS#service:}"
+if [ "$OWNER" != "$OURS" ]; then
   namespace() { docker exec "$1" readlink /proc/self/ns/net 2>/dev/null; }
-  OWNED="$(namespace "$("${DC[@]}" ps -q "$HOLDER")")"
-  LEFT=0
-  for svc in coturn roomler; do
-    [ "$(network_of "$svc")" = "$OURS" ] || continue
-    c="$("${DC[@]}" ps -aq "$svc")"
-    [ -n "$c" ] || continue
-    if [ "$(docker inspect -f '{{.State.Status}}' "$c")" != running ]; then
-      fail "$svc is not running: $(docker inspect -f '{{.State.Status}} {{.State.Error}}' "$c")"
-      LEFT=1
-    elif [ -z "$OWNED" ] || [ "$(namespace "$c")" != "$OWNED" ]; then
-      fail "$svc is running outside the $HOLDER service's namespace, so nothing reaches it on a published port"
-      LEFT=1
-    fi
-  done
-  if [ "$LEFT" = 0 ] && [ -z "$(docker exec "$CID" hostname -I 2>/dev/null | tr -d ' ')" ]; then
-    fail "coturn's namespace has no address"
-    LEFT=1
-  fi
-  if [ "$LEFT" = 1 ]; then
-    echo "     Repair: docker compose -f $(basename "$FILE") --env-file $(basename "${ENV_FILE:-.env.selfhost}") restart $HOLDER"
+  stuck() {
+    fail "$1"
+    echo "     Its healthcheck should end it within about 10 s, and its restart policy bring it back in. If this persists:"
+    echo "     docker compose -f $(basename "$FILE") --env-file $(basename "${ENV_FILE:-.env.selfhost}") restart $OWNER"
     verdict
-  fi
-  pass "coturn shares the $HOLDER service's namespace, and it has an address"
+  }
+  THEIRS="$(namespace "$("${DC[@]}" ps -q "$OWNER")")"
+  [ -n "$THEIRS" ] || stuck "the $OWNER service, whose namespace coturn runs in, is not running"
+  [ "$(namespace "$CID")" = "$THEIRS" ] || stuck "coturn is running outside the $OWNER service's namespace, so nothing reaches it on a published port"
+  [ -n "$(docker exec "$CID" hostname -I 2>/dev/null | tr -d ' ')" ] || stuck "the namespace coturn shares with the $OWNER service has no address"
+  pass "coturn is inside the $OWNER service's namespace, and it has an address"
 fi
 
 # The secret is what this coturn runs with, so a stale env file cannot make a healthy
@@ -241,10 +240,10 @@ done
 
 # A relay to the public address lands in coturn's own namespace, so the SFU has to live
 # there too. Without that, every check above passes and a call gets no media.
-if [ -n "$OURS" ] && [ "$OURS" = "$(network_of roomler)" ]; then
-  pass "coturn and the server share one network namespace ($OURS)"
+if [ "$OURS" = service:roomler ]; then
+  pass "coturn runs in the server's network namespace ($OURS)"
 else
-  fail "coturn (network_mode: ${OURS:-none}) and the server (network_mode: $(network_of roomler | grep . || echo none)) do not share a namespace, so a relay to the public address cannot reach the SFU"
+  fail "coturn (network_mode: ${OURS:-none}) does not run in the server's network namespace, so a relay to the public address cannot reach the SFU"
 fi
 
 # A listener where the SFU's sockets are, reached the way a browser reaches them.
@@ -310,5 +309,5 @@ else
 fi
 
 read -r STATUS RESTARTS <<<"$(state)"
-[ "$STATUS" = running ] && [ "$RESTARTS" = 0 ] || crashed "${STATUS:-gone}" "${RESTARTS:-?}"
+[ "$STATUS" = running ] && [ "$RESTARTS" = "$FIRST" ] || crashed "${STATUS:-gone}" "${RESTARTS:-?}"
 verdict

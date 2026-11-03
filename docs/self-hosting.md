@@ -65,7 +65,9 @@ runs, not what you run.
 
 ## Quickstart
 
-**You need** Docker with Compose v2, ~4 GB RAM, and ~10 GB disk.
+**You need** Docker with Compose v2, ~4 GB RAM, and ~10 GB disk. Below Docker Engine 29,
+a reboot can [cost you the relay until you run `up -d`](#after-a-reboot-or-a-docker-restart);
+the rest of the product comes back by itself.
 
 ```bash
 git clone https://github.com/gjovanov/roomler-ai.git
@@ -297,13 +299,16 @@ the server mints them. It exits non-zero and names what failed.
 | It says | What is wrong |
 |---|---|
 | `coturn is not staying up` | A crash loop. See below. |
-| `no relay allocation` | Nothing answers on 3478. Check the `netns` service's ports, and that it is running. |
+| `coturn is running outside the roomler service's namespace` | The server's process died moments ago, and coturn has not found its way back yet. See [if the server's process dies](#if-the-servers-process-dies). |
+| `no relay allocation` | Nothing answers on 3478. Check the `roomler` service's ports, and that it is running. |
 | `coturn hands out … but its --external-ip is …` | The relay address is not the public address. Clients would be told the wrong place. |
 | `CreatePermission to the public address … is refused` | No call can use this relay: every browser asks for this first. coturn logs `A peer IP … denied in the range`, because it rewrites the public address to its own before the deny list reads it. An edited file has lost the `--allowed-peer-ip` line. |
 | `relay to relay carried nothing` | Two relayed clients cannot reach each other. |
-| `do not share a namespace` | coturn or the server has lost `network_mode: service:netns`. A relay to the public address lands on coturn itself, so a call signals and carries no media. |
+| `does not run in the server's network namespace` | An edited file has lost `network_mode: service:roomler`. A relay to the public address lands on coturn itself, so a call signals and carries no media. |
 | `NOT refused` | The deny list has a hole. See [what it refuses](#what-the-relay-refuses). |
 | `NOTE the relay address is 127.0.0.1` | Not a failure, but only this machine can use it. See [the two addresses](#the-two-addresses-to-set). |
+| `NOTE coturn was not running, so this started it` | It had stopped, and the note says why. See [after a reboot](#after-a-reboot-or-a-docker-restart). |
+| `NOTE coturn has restarted … and is not climbing` | Not a failure. Each server crash costs coturn one restart. |
 
 ### What a crash loop looks like
 
@@ -313,8 +318,8 @@ docker inspect -f '{{.RestartCount}}' "$(docker compose -f docker-compose.selfho
 ```
 
 The status reads `Restarting (255)`, or `running` if you catch it between two exits,
-and `RestartCount` climbs. Anything but 0 means it has died since Docker last started
-it. Read the reason from the whole log:
+and `RestartCount` climbs. A count above 0 that holds still is not a loop: it has died
+since Docker last started it, and come back. Read the reason from the whole log:
 
 ```bash
 docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost logs --no-log-prefix coturn | grep -a 'unrecognized option'
@@ -337,15 +342,52 @@ To move the pin, change the line in both files and run the check. The
 
 A browser asks the relay for the SFU at the public address, and coturn rewrites that
 address to its own before it sends. So the SFU has to listen on coturn's own address.
-The small `netns` service holds one network namespace, the Docker network and every
-published port, and `roomler` and `coturn` both run inside it with
-`network_mode: service:netns`.
+`coturn` therefore runs in the `roomler` service's network namespace, with
+`network_mode: service:roomler`, and `roomler` publishes coturn's ports with its own.
 
-The costs:
+The server owns the namespace because it has to come back by itself whatever happens to
+the relay, which is optional. A container that joins another's namespace can lose a race
+when Docker starts them. An owner cannot, on any engine. A separate small service
+holding the namespace for both was the first design, and it let the relay's plumbing
+keep the whole app down: on Docker 28.5.2 a member lost in 2 of 24 daemon restarts.
 
-- One idle container, on the Redis image, so there is nothing more to pull.
-- The ports are on `netns`, so that is the service to edit to change one, and
-  `docker compose ps` lists them there.
+This costs two things.
+
+### If the server's process dies
+
+Docker brings `roomler` back in a new namespace and leaves `coturn` in the old one, with
+no address, still `running`. Nothing would ever move it: `up -d` sees nothing to do. So
+coturn's healthcheck ends it as soon as it has no address, and its restart policy brings
+it back into the new namespace. With `kill -9` of the server's process on Docker 29.1.3 and
+Compose 2.40.3, coturn was back within 20 s in 8 of 8 crashes, and the server answered
+after 10 s. coturn's `RestartCount` goes up by one each time.
+
+Run the check in that gap and it says
+`coturn is running outside the roomler service's namespace`, with the repair if it
+persists:
+
+```bash
+docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost restart roomler
+```
+
+`docker stop roomler` is different: coturn then has nothing to rejoin, and stays `exited`.
+A plain `up -d` brings both back.
+
+### After a reboot or a Docker restart
+
+Docker 29 starts a namespace's owner before the containers that join it. Older engines
+start everything at once, so coturn can lose: it stays `Exited (128)`, the daemon does not
+retry it, and `docker inspect` says
+`cannot join network namespace of a non running container`.
+
+That costs the relay, not the app: the server comes back either way. `docker compose ps -a`
+shows it, and the check starts it and says why it had stopped. A plain `up -d` brings it back:
+
+```bash
+docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d
+```
+
+<!-- ENGINE_NUMBERS: the engines and Compose versions this ran on, with the round counts and coturn's losses. Owed by #3287's field run. -->
 
 ### The two addresses to set
 
