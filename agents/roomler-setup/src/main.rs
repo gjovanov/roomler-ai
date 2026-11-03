@@ -51,6 +51,11 @@ fn main() {
     // And before anything reads the environment or spawns a program: an
     // elevated run takes nothing from its user's own state.
     wizard_app::launch::start_clean();
+    // #3246 — the elevated half of a limited wizard's machine-wide install, which
+    // is all this copy is then: no window, no lock, no webview.
+    if let Some(code) = wizard_app::package_step::run_if_asked() {
+        std::process::exit(code);
+    }
 
     // Stderr-only tracing. The wizard is a foreground EXE the
     // operator launches manually; persistent logging is the daemon's

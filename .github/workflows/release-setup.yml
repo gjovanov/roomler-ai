@@ -633,7 +633,7 @@ jobs:
           if ($a -ne $b) { Write-Error "the staged EXE ($a) is not the zip's EXE ($b)"; exit 1 }
           # FR-129 C — it sits in the person's Downloads and goes on to run
           # elevated: its own imports must come from System32 alone.
-          pwsh scripts/signing/pe-dependent-load-flags.ps1 -Path $name -Expect 0x800 -NotImported secur32.dll
+          pwsh scripts/signing/pe-dependent-load-flags.ps1 -Path $name -Expect 0x800 -NotImported 'secur32.dll,wintrust.dll'
           if ($LASTEXITCODE -ne 0) { exit 1 }
           "$($a.ToLower())  $name" | Out-File "$name.sha256" -Encoding ascii
           "artifact=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
