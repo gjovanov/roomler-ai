@@ -135,16 +135,15 @@ OURS="$(network_of coturn)"
 OWNER="${OURS#service:}"
 if [ "$OWNER" != "$OURS" ]; then
   namespace() { docker exec "$1" readlink /proc/self/ns/net 2>/dev/null; }
-  stuck() {
+  stuck() { # stuck <what> <compose command that repairs it>
     fail "$1"
-    echo "     Its healthcheck should end it within about 10 s, and its restart policy bring it back in. If this persists:"
-    echo "     docker compose -f $(basename "$FILE") --env-file $(basename "${ENV_FILE:-.env.selfhost}") restart $OWNER"
+    echo "     If this persists: docker compose -f $(basename "$FILE") --env-file $(basename "${ENV_FILE:-.env.selfhost}") $2"
     verdict
   }
   THEIRS="$(namespace "$("${DC[@]}" ps -q "$OWNER")")"
-  [ -n "$THEIRS" ] || stuck "the $OWNER service, whose namespace coturn runs in, is not running"
-  [ "$(namespace "$CID")" = "$THEIRS" ] || stuck "coturn is running outside the $OWNER service's namespace, so nothing reaches it on a published port"
-  [ -n "$(docker exec "$CID" hostname -I 2>/dev/null | tr -d ' ')" ] || stuck "the namespace coturn shares with the $OWNER service has no address"
+  [ -n "$THEIRS" ] || stuck "the $OWNER service, whose namespace coturn runs in, is not running" "logs $OWNER"
+  [ "$(namespace "$CID")" = "$THEIRS" ] || stuck "coturn is running outside the $OWNER service's namespace, so nothing reaches it on a published port. Its healthcheck ends it within about 10 s, and it comes back inside" "restart coturn"
+  [ -n "$(docker exec "$CID" hostname -I 2>/dev/null | tr -d ' ')" ] || stuck "the namespace coturn shares with the $OWNER service has no address" "restart $OWNER"
   pass "coturn is inside the $OWNER service's namespace, and it has an address"
 fi
 
@@ -165,13 +164,18 @@ client() {
   pass="$(printf '%s' "$user" | openssl dgst -sha1 -binary -hmac "$SECRET" | base64)"
   # Against a silent port the client retries forever. As PID 1 it would ignore the SIGTERM,
   # and `docker run` would wait for it, so the check needs --init, and -k behind that.
+  # --no-even-port makes it take any free port, as a browser does.
   timeout -k 5 30 docker run --rm --init --name "$CLIENT" --network host --entrypoint turnutils_uclient "$IMAGE" \
-    -u "$user" -w "$pass" "$@" 127.0.0.1 >"$OUT" 2>&1
+    --no-even-port -u "$user" -w "$pass" "$@" 127.0.0.1 >"$OUT" 2>&1
   rc=$?
   [ "$rc" -ge 124 ] && [ "$rc" -ne 255 ] && docker rm -f "$CLIENT" >/dev/null 2>&1
   return "$rc"
 }
-said() { sed -E 's/^[0-9T:.+-]+ //; s/^(INFO|WARNING|ERROR) //' "$OUT" | grep -aE "$1" | sort -u | head -3 | detail; }
+said() {
+  # A 508 got no further than the allocation, so it says nothing about what was being tried.
+  grep -aq 'error 508' "$OUT" && echo "     coturn has no free relay port: every port of its range is held by an allocation"
+  sed -E 's/^[0-9T:.+-]+ //; s/^(INFO|WARNING|ERROR) //' "$OUT" | grep -aE "$1" | sort -u | head -3 | detail
+}
 # The client exits 0 at 100% loss, so bytes are read from its own final count.
 received() { sed -n 's/.*start_mclient: tot_send_msgs=[0-9]*, tot_recv_msgs=\([0-9]*\).*/\1/p' "$OUT" | tail -1; }
 # Refusals reach `docker logs` only under --log-file=stdout; otherwise they are in a file in the container.
@@ -265,14 +269,20 @@ fi
 
 # The deny list, and what coturn refuses by itself. A refusal counts only as its own
 # literal answer: the client also exits non-zero for reasons that prove nothing.
+# Over TCP to the server, because a client over UDP leaves its two allocations behind, each
+# holding a relay port for 777 s. Every line here over UDP would cost a run of this check
+# about 30 of the range's 101, and the third run in a row would fail on the leftovers of
+# the first two. Over TCP they end with the connection.
 refused() { # refused <peer> <why>
   [ "$1" = "$RELAY" ] && return
-  client -s -e "$1" -r 3480 -n 0 -m 1 -l 120 -c
+  client -t -s -e "$1" -r 3480 -n 0 -m 1 -l 120 -c
   local rc=$?
   if grep -aq 'create permission error 403' "$OUT"; then
     pass "refused, $2: $1"
+  elif [ "$rc" = 0 ]; then
+    fail "NOT refused, $2: $1"
   else
-    fail "NOT refused, $2: $1 (client exit $rc)"
+    fail "could not ask about $2, $1 (client exit $rc)"
     said 'create permission|rror'
   fi
 }

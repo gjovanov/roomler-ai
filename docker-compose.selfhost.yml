@@ -119,7 +119,8 @@ services:
   # It runs in the server's network namespace, because a browser asks the relay for
   # the SFU at the public address, and coturn rewrites that address to its own before
   # it sends. Only when the SFU listens on coturn's own address does that packet
-  # reach a call. So its ports are published by `roomler`, below.
+  # reach a call. So its ports are published by `roomler`, below, and `up -d` runs for
+  # the whole file: `up -d roomler` replaces the server and leaves coturn stopped.
   coturn:
     image: coturn/coturn:4.18.0-r0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
     restart: unless-stopped
