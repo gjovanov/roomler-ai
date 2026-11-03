@@ -93,12 +93,12 @@ proxy for that. Falling back to the tarball when a Debian host somehow lacks the
 New `install_tarball_linux` alongside `run_linux_install_candidates`.
 
 ⚠️ **It has no privilege ladder**, whatever this design first said. It refuses any
-non-root daemon (`agents/roomlerd/src/updater.rs:2089-2098`). It places the files
+non-root daemon (`agents/roomlerd/src/updater.rs:2099-2108`). It places the files
 in-process rather than running one command it could hand to `sudo`, so there is
 nothing to escalate. A per-user tarball install therefore never updated (#2046)
 until FR-96 gave it a root helper ([below](#the-update-half-of-a-per-user-install-fr-96)).
 The `.deb`'s ladder for a non-root daemon is `pkexec`, then `sudo -n`
-(`updater.rs:2020-2034`).
+(`updater.rs:2030-2044`).
 
 1. Extract to a staging dir under the same filesystem as `/usr`.
 2. **Assert the expected members exist** before touching anything installed —
@@ -131,8 +131,8 @@ its own updater's next check installed the release a second time.
 
 Since #2724, on Linux, the command restarts the daemon running beside it once its
 install has completed, the way `roomler restart` does
-(`restart_daemon_beside_self_update`, `agents/roomlerd/src/app.rs:6174`, called
-at `app.rs:6151`):
+(`restart_daemon_beside_self_update`, `agents/roomlerd/src/app.rs:6241`, called
+at `app.rs:6218`):
 
 ```mermaid
 sequenceDiagram
@@ -550,9 +550,9 @@ FR-117 P1 gives it the daemon's version through the same owner, trust path and c
 
 | Host | Who moves the companion | When |
 |---|---|---|
-| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3384`) | after every check that installs nothing; at the start after an update (`:3265`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3316`) |
-| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4006`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
-| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3193`, `package_needs_sync`) |
+| system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3394`) | after every check that installs nothing; at the start after an update (`:3275`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3326`) |
+| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:4016`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
+| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3203`, `package_needs_sync`) |
 | non-root daemon, no helper | nobody | one INFO line, never a password prompt |
 
 - **In the updater's loop, never beside it.** The daemon's own install and the companion's run in
