@@ -1,0 +1,35 @@
+[package]
+name = "roomler-msi-ca"
+license = "MPL-2.0"
+publish = false
+version.workspace = true
+edition.workspace = true
+description = "The per-Machine MSI's custom actions that carry the Roomler service's Environment across a major upgrade (#3375)."
+
+# msiexec loads this DLL from the MSI's Binary table, on a machine that may have
+# no VC++ redistributable: the release lane and installer-smoke build it with
+# `+crt-static`, in a target dir of their own, and read its imports (system DLLs
+# only). A load failure there is the one failure `Return="ignore"` may not cover.
+#
+# The lib name keeps dodging "install", "setup", "update" and "patch": cargo
+# names the test binary after it, and Windows UAC's installer detection
+# elevates by file name (CLAUDE.md's UAC rule).
+[lib]
+name = "roomler_msi_ca"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[target.'cfg(windows)'.dependencies]
+# Bindings-only, on the 0.59 line the agent already compiles in every Windows
+# build. msi.dll and advapi32.dll are System32's, so the import audit passes them.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_ApplicationInstallationAndServicing",
+    "Win32_System_Registry",
+] }
+
+# build.rs embeds a Windows VERSIONINFO resource: AV scans the DLL where
+# msiexec extracts it. See agents/roomlerd/Cargo.toml for the
+# embed-resource-vs-winresource rationale.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"

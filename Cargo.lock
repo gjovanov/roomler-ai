@@ -9464,6 +9464,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "roomler-msi-ca"
+version = "0.4.199"
+dependencies = [
+ "embed-resource",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "roomler-node-core"
 version = "0.4.199"
 dependencies = [
