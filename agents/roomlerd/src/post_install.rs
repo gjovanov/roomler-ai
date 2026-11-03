@@ -217,10 +217,8 @@ fn record_paths_in(own: Option<PathBuf>, profile: Option<PathBuf>) -> Vec<PathBu
     paths
 }
 
-/// The record most recently written among `paths`, with its file. The newest file
-/// speaks even when it doesn't parse, so an unreadable record is never hidden by an
-/// older one that reads.
-fn read_newest_outcome(paths: &[PathBuf]) -> Result<Option<(PathBuf, InstallOutcome)>> {
+/// The record file most recently written among `paths`, if any exists.
+fn newest_record_path(paths: &[PathBuf]) -> Option<PathBuf> {
     let mut newest: Option<(&PathBuf, std::time::SystemTime)> = None;
     for path in paths {
         let Ok(meta) = std::fs::metadata(path) else {
@@ -231,14 +229,25 @@ fn read_newest_outcome(paths: &[PathBuf]) -> Result<Option<(PathBuf, InstallOutc
             newest = Some((path, written));
         }
     }
-    let Some((path, _)) = newest else {
-        return Ok(None);
-    };
+    newest.map(|(path, _)| path.clone())
+}
+
+/// The record in one file.
+fn read_outcome_at(path: &Path) -> Result<InstallOutcome> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let parsed =
-        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(Some((path.clone(), parsed)))
+    serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// The record most recently written among `paths`, with its file. The newest file
+/// speaks even when it doesn't parse, so an unreadable record is never hidden by an
+/// older one that reads.
+fn read_newest_outcome(paths: &[PathBuf]) -> Result<Option<(PathBuf, InstallOutcome)>> {
+    let Some(path) = newest_record_path(paths) else {
+        return Ok(None);
+    };
+    let outcome = read_outcome_at(&path)?;
+    Ok(Some((path, outcome)))
 }
 
 /// Read the most recent install outcome, if any. Returns `None`
