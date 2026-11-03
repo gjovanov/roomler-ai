@@ -1,6 +1,6 @@
 # FR-65 — Blocking work on async runtimes: measure first, then remove
 
-**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.035 % of the frame budget on NEO16 (AC1)**. **3 of 8 criteria ticked** — AC1, AC2, and AC6 (the caps-probe respawn, measured gone on four hosts) — AC8 (docs) `[~]`. The census is a fleet-wide server read since 2026-11-03 (#PRNUM). Next: AC7's after-read on or after 2026-11-15, then AC3, AC5 and AC4. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
+**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.035 % of the frame budget on NEO16 (AC1)**. **3 of 8 criteria ticked** — AC1, AC2, and AC6 (the caps-probe respawn, measured gone on four hosts) — AC8 (docs) `[~]`. The census is a fleet-wide server read since 2026-11-03 (#3372). Next: AC7's after-read on or after 2026-11-15, then AC3, AC5 and AC4. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
 
 ## Goal
 
@@ -348,7 +348,7 @@ of each is to produce a number.
       governor's monotonic stall count) have their **before** — the host census
       over 2026-10-17..30 on CORPLAP-1/-2/-3: 84 `reset`-class lines (7/51/26) and
       46 `untimed` (4/27/15).
-      *2026-11-03:* the census moved to a fleet-wide server read (#PRNUM).
+      *2026-11-03:* the census moved to a fleet-wide server read (#3372).
       `agent_logs` keeps 7 days against that read's 14, so the before that counts
       is a slice of the new instrument, taken while those lines still existed:
       the builds before 0.4.192 from 2026-10-27 02:00Z, `reset` 5/26/4 and
