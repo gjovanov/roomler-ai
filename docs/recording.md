@@ -1025,14 +1025,17 @@ marker and answers. Each look the prompt takes is made under them too, and
 reads the books before any answer (`PendingGuard::look`). Two files are written
 outside them: the `.pending` marker, by the caller that shows the question, and
 an answer from the CLI's fallback, which checks nothing. The books-first look
-is what keeps the second from deciding a question that has ended.
+is what keeps the second from deciding a question that has ended. Every caller
+writes the marker only after it has armed the question: the recording question,
+and since #3442 the screen-control, exec and SSH ones (`docs/roomler-ssh.md`,
+Operator consent).
 
 | A question that is… | now | before, found by review |
 |---|---|---|
 | withdrawn | takes nothing that lands after it, whoever wrote it | the poll read the answer first: an Allow that passed `record_decision`'s check just before a cancel, or one the CLI's fallback wrote with no check at all, was taken |
 | decided | is released in the same step | an answer in the gap between the two was reported taken, and its file left behind |
 | answered | gets the answer checked and written in one step, so it lands only while the question still asks | an answer that passed the check as its question was decided landed after the question had cleared its files |
-| an older one for the same id | leaves the newer one's marker and answers alone | its release unlinked the marker of a question still asking |
+| an older one for the same id | leaves the newer one's marker and answers alone, once the newer one is armed: a marker written before its question is on the books is not one the older release can tell apart, which is why every caller arms first (#3442) | its release unlinked the marker of a question still asking |
 | a newer one for the same id | clears the old answers and takes the id in one step | an answer given in between, for the older question, was taken by the newer one, given before it existed |
 
 A withdrawal before the prompt's next look still wins over an answer that had

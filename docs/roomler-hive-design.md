@@ -480,7 +480,7 @@ boundary.
 every agent mid-turn.
 
 - Linux: `hive-host` runs as a transient unit outside the daemon's cgroup
-  (`systemd-run --uid=…`, as the companion is started, `agents/roomlerd/src/companion.rs:724-738`),
+  (`systemd-run --uid=…`, as the companion is started, `agents/roomlerd/src/companion.rs:766-780`),
   so `systemctl restart roomlerd` leaves it running, and it reconnects to the daemon's
   per-uid socket.
 - macOS: `hive-host` starts in the user's bootstrap context (`launchctl asuser`, as
@@ -956,7 +956,7 @@ field:
 ### 7.3 `ssh` by default, `exec` by exception
 
 `fleet_exec` runs as SYSTEM/root on the target — fleet RPC always uses
-`RunAs::Daemon` (`agents/roomlerd/src/signaling.rs:4833`) and run-as-user is explicitly
+`RunAs::Daemon` (`agents/roomlerd/src/signaling.rs:4843`) and run-as-user is explicitly
 deferred (`docs/fleet-rpc.md:197`). So agents get `ssh_run`, which runs as whatever
 account the **target** maps under SSH's gates and single-use grants, and `fleet_exec`
 only with a policy permit **and** a person's approval on each call. Both keep every gate
