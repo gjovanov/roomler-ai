@@ -1042,6 +1042,11 @@ Windows service install, set it with
 `roomlerd set-service-env-var --name ROOMLERD_SFTP_AS_USER --value 0`, then
 restart the service. The SystemContext worker inherits the service's
 environment, so a machine-wide variable reaches it only after a reboot.
+From 0.4.200 the switch stays through every update, the update into 0.4.200
+included, and through a repair. An uninstall removes it with the service. Up to
+0.4.199 an update dropped it with every other entry but the SystemContext switch,
+silently (#3375, `docs/installation.md`,
+[What the service's `Environment` keeps](installation.md#what-the-services-environment-keeps-3375)).
 ⚠️ Never replace the service's registry `Environment` value by hand. On a
 SystemContext install it already holds `ROOMLERD_ENABLE_SYSTEM_SWAP=1`.
 Overwriting it turned a test device into a user-context one, whose worker,

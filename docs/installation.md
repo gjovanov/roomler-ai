@@ -571,7 +571,9 @@ Details worth knowing:
   (`%PROGRAMDATA%\roomler\last-system-context-attempt.json`). A major upgrade
   re-creates the service, so the switch itself does not survive one; since
   #3115 a reinstall of the same version keeps the service, switch included
-  ([below](#what-an-msi-run-does-to-the-roomler-service)).
+  ([below](#what-an-msi-run-does-to-the-roomler-service)). From 0.4.200 an
+  upgrade carries every other entry of the service's `Environment` across
+  ([#3375](#what-the-services-environment-keeps-3375)).
   ⚠️ Before #1727, leaving it out switched SystemContext **off**: the service
   kept running, the worker could no longer find its enrollment and exited in a
   loop, and the device went offline. To rescue a host in that state, run
@@ -803,14 +805,17 @@ Every perMachine MSI run that is not an uninstall runs **RegisterService**
 (`roomlerd service install --as-service`, deferred, as LocalSystem,
 `agents/roomlerd/wix-perMachine/main.wxs:361`). One of the SystemContext actions
 follows it (Enable, Disable or Keep), which restarts the service, and then the
-MSI's own StartServices. What happens to the service depends on the run (#3115):
+MSI's own StartServices. On an upgrade the carried `Environment` is written back
+between RegisterService and that action
+([#3375](#what-the-services-environment-keeps-3375)). What happens to the service
+depends on the run (#3115):
 
 | The run | What stops the service first | What happens to the `Roomler` entry |
 |---|---|---|
 | A fresh install | nothing is running | created (`agents/roomlerd/src/win_service/lifecycle.rs:436`, `register`) |
-| A **reinstall** of the installed version: a maintenance run, such as the wizard over the same release or a hand-run `msiexec /i` of the same MSI | the SystemContext action's restart | **reconfigured in place**: `ChangeServiceConfigW`, the description and the recovery actions. It keeps running until that restart, and its `Environment` (the SystemContext switch) survives |
-| A **major upgrade** to a newer release: the auto-updater, the wizard, a hand-run install | Windows Installer's Restart Manager, at InstallValidate: `roomlerd.exe` is in use and the run has no UI, so it shuts down what holds it. Where Restart Manager is off (the "Prohibit use of Restart Manager" policy), the OLD product's `UnregisterService` does, because `MajorUpgrade` is `afterInstallInitialize` (`main.wxs:90`) and the old product is removed before the new files land | retired by the old binary, then created by the new one. If the old binary deleted it while it was still stopping (1072), the new one waits for the entry to go first |
-| An uninstall | `UnregisterService` (`main.wxs:553`) | retired (`lifecycle.rs:384`, `retire`) |
+| A **reinstall** of the installed version: a maintenance run, such as the wizard over the same release or a hand-run `msiexec /i` of the same MSI | the SystemContext action's restart | **reconfigured in place**: `ChangeServiceConfigW`, the description and the recovery actions. It keeps running until that restart, and its `Environment` survives whole: the SystemContext switch and every entry `set-service-env-var` wrote |
+| A **major upgrade** to a newer release: the auto-updater, the wizard, a hand-run install | Windows Installer's Restart Manager, at InstallValidate: `roomlerd.exe` is in use and the run has no UI, so it shuts down what holds it. Where Restart Manager is off (the "Prohibit use of Restart Manager" policy), the OLD product's `UnregisterService` does, because `MajorUpgrade` is `afterInstallInitialize` (`main.wxs:90`) and the old product is removed before the new files land | retired by the old binary, then created by the new one. If the old binary deleted it while it was still stopping (1072), the new one waits for the entry to go first. From 0.4.200 its `Environment` comes back: the new package reads it before the removal and writes it into the new entry ([below](#what-the-services-environment-keeps-3375)) |
+| An uninstall | `UnregisterService` (`main.wxs:639`) | retired (`lifecycle.rs:384`, `retire`), its `Environment` with it |
 
 **The waits are derived from the host's own shutdown**, so the two cannot drift
 apart (`lifecycle.rs:81`, pinned by the test
@@ -887,6 +892,113 @@ exited, and an install waits out an entry that an older binary deleted early.
 ⚠️ `OpenService` can succeed on such a marked entry (the upgrade above opened
 one); only a change is refused with 1072. So the install asks with a change that
 changes nothing (`lifecycle.rs:242`, `is_marked`), never by the open alone.
+
+### What the service's `Environment` keeps (#3375)
+
+The `Roomler` service's `Environment`, a `REG_MULTI_SZ` under
+`HKLM\SYSTEM\CurrentControlSet\Services\Roomler`, is where
+`roomlerd set-service-env-var` writes. The service starts with it and the
+SystemContext worker inherits it, so it holds the SystemContext switch and
+whatever an operator set there, such as the SFTP kill switch
+`ROOMLERD_SFTP_AS_USER=0` ([roomler-ssh.md](roomler-ssh.md)).
+
+Up to 0.4.199 a major upgrade kept the switch alone. The old product's removal
+ran its `UnregisterService` (`main.wxs:639`), which deleted the service, its
+registry key and the `Environment` in it. The new `RegisterService` created an
+entry with none, and the SystemContext action after it wrote the switch back.
+Every other entry lapsed at the next release, and nothing said so.
+
+From 0.4.200 the per-Machine MSI carries the block across with three actions
+(`agents/roomlerd/wix-perMachine/main.wxs:558`), two of them in a custom-action
+DLL, `agents/roomler-msi-ca`:
+
+| Action | Runs | Does |
+|---|---|---|
+| `CaptureServiceEnvironment` (`agents/roomler-msi-ca/src/msi.rs:331`) | immediate, before `InstallInitialize`, on an upgrade (`main.wxs:588`): before the old product's removal | reads the old service's `Environment` into the hidden private property `RoomlerServiceEnvironment` |
+| `SetRestoreServiceEnvironment` (`main.wxs:621`) | after `RegisterService` | hands that value to the restore as its `CustomActionData` |
+| `RestoreServiceEnvironment` (`msi.rs:341`) | deferred, as LocalSystem, before every SystemContext action (`main.wxs:624`) | puts the carried entries back into the new service's `Environment` and writes it once |
+
+Each SystemContext action restarts the service, so what was carried is in
+effect from its first start. The capture belongs to the NEW package, so the
+update into 0.4.200 itself keeps the block: nothing has to be set again.
+
+| The run | The service's `Environment` |
+|---|---|
+| A self-update, or the wizard or `msiexec /i` with a newer release (0.4.200 or later) | carried: every entry comes back as it was, except the SystemContext switch, which the SystemContext action decides |
+| A repair or a reinstall of the installed version (`msiexec /fa`, the wizard over the same release) | kept: the service is reconfigured in place (#3115), so there is nothing to carry |
+| An uninstall | removed with the service; a later install starts with none |
+| An upgrade whose capture or restore fails | the upgrade completes and nothing is carried, as up to 0.4.199; the MSI log says why |
+
+The merge rule (`agents/roomler-msi-ca/src/carry.rs:190`, `merge`): a carried
+entry replaces an entry of the same name, compared without regard to case as
+Windows compares environment names, and is added where there is none. The
+exceptions are `ROOMLERD_ENABLE_SYSTEM_SWAP` and `ROOMLER_NODE_ENABLE_SYSTEM_SWAP`,
+both spellings the daemon reads (`crates/tunnel-core/src/env.rs:197`,
+`carry.rs:37`). The installer decides the switch: the updater passes
+`ENABLE_SYSTEM_CONTEXT=1` while it is on (`agents/roomlerd/src/updater.rs:2176`),
+and otherwise KeepSystemContext follows the record of the last
+`enable-system-context` or `disable-system-context`. A carried switch never
+overrides that decision, so `set-service-env-var` says to use those two verbs for
+it (`agents/roomlerd/src/app.rs:6145`). A block larger than 64 KiB is not carried
+(`carry.rs:47`).
+
+No value reaches a command line or the MSI's log:
+
+- the restore runs in the DLL and reads `CustomActionData`, so `roomlerd.exe`
+  never gets the values as arguments;
+- both properties are in `MsiHiddenProperties` (`main.wxs:559`), the restore's
+  under the action's own name, which is the name Windows Installer logs
+  `CustomActionData` under, and the restore is `HideTarget`;
+- the DLL's log lines name entries, never values:
+  `roomler_msi_ca: capture: carrying 3 entries: ROOMLERD_ENABLE_SYSTEM_SWAP ROOMLERD_SFTP_AS_USER ROOMLERD_UPDATE_URL`,
+  then `roomler_msi_ca: restore: put back 2 entries: ROOMLERD_SFTP_AS_USER ROOMLERD_UPDATE_URL`.
+
+Neither action can fail an upgrade. Both are `Return="ignore"`, and both return
+success after logging a miss: an action that failed here would stop this
+device's updates, and a systematic failure every device's. A DLL that cannot
+load fails with 1723, which `Return="ignore"` may not cover, so the DLL links its
+CRT (`+crt-static`) and imports only what Windows ships. The release lane reads
+it out of the built MSI, checks its imports with a negative control, and checks
+that it carries the payload's signature
+(`.github/workflows/release-agent.yml:2205`). `ROOMLER_TEST_CA_FAIL=capture` or
+`=restore` (`main.wxs:561`) fails one of the two on purpose; installer-smoke uses
+it to show an upgrade completing through either failure
+(`.github/workflows/installer-smoke.yml:866`). Its only effect is that nothing is
+carried.
+
+```mermaid
+sequenceDiagram
+    participant M as msiexec, the new package
+    participant D as roomler_msi_ca.dll
+    participant Old as the old product
+    participant New as new roomlerd.exe
+    participant R as the Roomler service key
+    M->>D: CaptureServiceEnvironment, before InstallInitialize
+    D->>R: read Environment
+    D-->>M: RoomlerServiceEnvironment, hidden
+    M->>Old: RemoveExistingProducts runs its UnregisterService
+    Old->>R: delete the service, Environment with it
+    M->>New: RegisterService creates the entry
+    M->>D: RestoreServiceEnvironment, deferred, as LocalSystem
+    D->>R: merge the carried entries and write Environment once
+    M->>New: the SystemContext action decides the switch and restarts the service
+```
+
+**Why a DLL.** Of the new package, only its immediate actions run before the old
+product's removal, and of those only a DLL can hand a value on:
+
+- AppSearch reads a `REG_MULTI_SZ` as a value that begins with a null (the
+  RegLocator table's documentation), so a condition sees an empty string;
+- an EXE action cannot set a property, and before `InstallFiles` a `FileKey` one
+  runs the OLD `roomlerd.exe`;
+- a script action would put a script engine inside a SYSTEM `msiexec` on every
+  corporate laptop's update.
+
+The other direction was to keep the registration through the upgrade. That needs
+a change to the product being removed, so it cannot help the update into the
+first release that has it, and it gives the rollback a second path. The carry
+leaves the rollback as it was (#3230): no action has a rollback partner, and the
+restore writes only the new entry's `Environment`.
 
 ## Linux
 

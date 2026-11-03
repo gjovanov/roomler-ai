@@ -113,6 +113,14 @@ kill-on-close job, because `schtasks /End` kills the launcher alone (measured); 
 spawns stays out of that job, or `msiexec` dies with it on an update. It must not touch the data
 tree: `appdirs::use_old_segment` is new-if-present, so a log folder made from outside the daemon
 orphans a legacy host's config, which is why stderr capture lives in the daemon.
+⚠️ **The per-Machine MSI carries the service's `Environment` across an upgrade, and that may never fail
+one** (#3375, `docs/installation.md`). The old product's removal deletes the service, so
+`CaptureServiceEnvironment` (`agents/roomler-msi-ca`) reads the block before `InstallInitialize`, and
+`RestoreServiceEnvironment` writes it back after `RegisterService` and before every SystemContext action:
+those restart the service and decide the switch, which is never carried. Both stay `Return="ignore"` and
+return success after a logged miss. The DLL stays `+crt-static` with system imports only, because a DLL
+that cannot load (1723) is the one failure `Return="ignore"` may not cover. No value goes on a command line
+or into the log: the properties are hidden, the lines name entries.
 ⚠️ **`RegisterAutostart` stays the last action before `InstallFinalize`.** The task names the
 launcher, and a rollback onto a release without one would leave a task that starts nothing.
 ⚠️ **`AutostartBackOnRollback` and `DaemonBackOnRollback` stay ahead of `RemoveExistingProducts`.** A
