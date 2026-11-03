@@ -307,7 +307,7 @@ ports held for up to 13 minutes, because the client does not end what it allocat
 | `NOT refused` | The deny list has a hole. See [what it refuses](#what-the-relay-refuses). |
 | `could not ask about` | coturn gave no answer about that peer, so this proves nothing about the deny list. The lines under it say why. |
 | `NOTE the relay address is 127.0.0.1` | Not a failure, but only this machine can use it. See [the two addresses](#the-two-addresses-to-set). |
-| `NOTE coturn was not running, so this started it` | It had stopped, and the note says why. See [if the server is replaced](#if-the-server-is-replaced) and [after a reboot](#after-a-reboot-or-a-docker-restart). |
+| `NOTE coturn was not running, so this started it` | It had stopped, and the note says why. See [if the server's process dies](#if-the-servers-process-dies), [if the server is replaced](#if-the-server-is-replaced) and [after a reboot](#after-a-reboot-or-a-docker-restart). |
 | `NOTE coturn has restarted … and is not climbing` | Not a failure. Each server crash costs coturn one restart. |
 
 ### What a crash loop looks like
@@ -373,6 +373,15 @@ docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost restart c
 
 `docker stop roomler` is different: coturn then has nothing to rejoin, and stays `exited`.
 A plain `up -d` brings both back.
+
+A server that crashes within seconds of starting can cost the relay the same way. coturn
+takes about 5 s to end once its healthcheck fires, and Docker tries to restart it once. If
+the server is still coming back at that moment, the attempt fails with
+`cannot join network namespace of container: … is restarting`, and Docker does not try
+again. In 10 crashes in a row, each as soon as the server was back, coturn was lost by the
+second, and it stayed `exited` after the server had recovered, until a plain `up -d`. A
+server that had run for at least 12 s healed wherever its crash fell: 6 of 6, with the kill
+placed from 0.7 to 8 s before coturn's next probe.
 
 ### If the server is replaced
 
