@@ -72,6 +72,8 @@ tempfile = { workspace = true }
 tokio-test = "0.4"
 tokio-tungstenite = "0.26"
 futures.workspace = true
+# #2552 — a test lifecycle on the agent socket holds a teardown at one step.
+async-trait.workspace = true
 # FR-90 P0f — the canary test's browser writes binary DataChannel frames.
 bytes = "1"
 # FR-102 P5 — the newsletter tests sign SendGrid Event Webhook batches with a

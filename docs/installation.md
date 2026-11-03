@@ -1457,8 +1457,8 @@ server, and takes its sessions from the daemon's delegation channel alone. A per
 enrollment on that Mac stays in their file and is ignored, and a person with none gets
 a worker anyway. As the console user, `roomler status`, the device list and the
 companion show the root half's row, and a verb that needs the server (`forward`,
-`exec`, `ssh`, a rename) says to run it with `sudo`. Until the logs PR, that worker's
-logs stay on the Mac.
+`exec`, `ssh`, a rename) says to run it with `sudo`. The worker's log lines go up on
+the root half's row, each marked `process: gui-worker`.
 
 The switch is off by default and stays off until the
 [field proof](fr/FR-43-macos-single-enrollment.md#what-rides-what). It doesn't yet give

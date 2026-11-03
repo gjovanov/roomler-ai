@@ -4591,9 +4591,18 @@ async fn run_cmd(
     let logs_upload_disabled =
         roomlerd::logs_upload::parse_disable_flag(node_env("LOGS_UPLOAD_DISABLED").as_deref());
     // FR-43 P3a — a worker with no enrollment has no token to upload on, so its
-    // log stays on disk. The layer's queue is bounded, and full it drops.
+    // lines go to the root daemon over the delegation channel, and the daemon
+    // uploads them on its row (`delegate_worker`). Its kill switch is this one.
+    let worker_log_lines = if unenrolled && !logs_upload_disabled {
+        logging::take_log_upload_receiver()
+    } else {
+        None
+    };
     if unenrolled {
-        tracing::info!("logs upload: none, this worker holds no enrollment");
+        tracing::info!(
+            forwarded = worker_log_lines.is_some(),
+            "logs upload: through the root daemon, since this worker holds no enrollment"
+        );
     } else if !logs_upload_disabled && let Some(rx) = logging::take_log_upload_receiver() {
         let host_hash = roomlerd::logs_upload::hash_hostname(
             &roomlerd::machine::hostname().unwrap_or_else(|_| "unknown".to_string()),
@@ -4842,6 +4851,33 @@ async fn run_cmd(
     // the daemon tells it the overlay's blocks (`rc_overlay` off needs them).
     #[cfg(target_os = "macos")]
     delegate_host.set_overlay_footprint(tunnel_core::overlay_footprint::v4_nets);
+    // FR-43 P3a — a one-row Mac's worker holds no enrollment, so its log lines
+    // arrive over the delegation channel and go up on this row, each marked as
+    // the worker's. Root only: no other process supervises a worker.
+    #[cfg(target_os = "macos")]
+    if !unenrolled
+        && !logs_upload_disabled
+        && cfg.macos_one_row
+        && cfg.macos_supervise_gui_worker
+        // SAFETY: geteuid never fails.
+        && unsafe { libc::geteuid() } == 0
+    {
+        let (sink, lines) = tokio::sync::mpsc::channel(roomlerd::logs_upload::CHANNEL_CAPACITY);
+        delegate_host.set_worker_log_sink(sink);
+        let upload_cfg = roomlerd::logs_upload::UploadConfig {
+            server_url: cfg.server_url.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            agent_id: cfg.agent_id.clone(),
+            agent_jwt: primary_token.clone(),
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            host_id_hash: roomlerd::logs_upload::hash_hostname(
+                &roomlerd::machine::hostname().unwrap_or_else(|_| "unknown".to_string()),
+            ),
+            source: roomlerd::logs_upload::LogSource::Agent,
+        };
+        tokio::spawn(roomlerd::logs_upload::run_uploader(lines, upload_cfg));
+        tracing::info!("logs upload: the GUI worker's lines go up on this row (FR-43 P3a)");
+    }
 
     // FR-55 — keep the device reachable instead of letting it quietly sleep.
     // Default `never`, so on a device that has not opted in this task holds
@@ -5093,6 +5129,7 @@ async fn run_cmd(
     let _delegate_worker_task = tokio::spawn(roomlerd::delegate_worker::run(
         supervised,
         unenrolled,
+        worker_log_lines,
         worker_channels,
         shutdown_rx.clone(),
         // #2987 — a worker whose daemon is gone stops through this door.
