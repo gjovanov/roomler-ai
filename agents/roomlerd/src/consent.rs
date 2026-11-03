@@ -337,13 +337,16 @@ struct PendingGuard {
     cancel: Arc<Notify>,
 }
 
-impl Drop for PendingGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(
-            self.inner
-                .sentinel_dir
-                .join(format!("{}.pending", self.session_hex)),
-        );
+impl PendingGuard {
+    /// Takes the question off the books, then off the screen.
+    ///
+    /// ⚠️ In that order (#3427). `record_decision` takes an answer while the
+    /// in-memory entry stands, and the companion, `roomlerd consent --list`
+    /// and the person go by the marker. With the marker removed first, an
+    /// answer sent the moment it went was still taken, for a session that had
+    /// ended. `remove_marker` is the unlink, passed in so a test can answer at
+    /// exactly that moment.
+    fn release(&self, remove_marker: impl FnOnce(&Path)) {
         if let Ok(mut pending) = self.inner.pending.lock()
             && pending
                 .get(&self.session_hex)
@@ -351,6 +354,20 @@ impl Drop for PendingGuard {
         {
             pending.remove(&self.session_hex);
         }
+        remove_marker(
+            &self
+                .inner
+                .sentinel_dir
+                .join(format!("{}.pending", self.session_hex)),
+        );
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.release(|marker| {
+            let _ = std::fs::remove_file(marker);
+        });
     }
 }
 
@@ -1284,6 +1301,41 @@ mod tests {
             Decision::Granted,
             "the re-prompt must answer on its own handle, not the cancelled one's"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3427 — a question taken off the screen takes no more answers. The
+    /// companion, the CLI and the person go by the marker; `record_decision`
+    /// goes by the in-memory entry. With the marker removed first, an answer
+    /// sent the moment it went was still taken, for a session that had ended
+    /// (`control_dc_record`'s six-round cell under load, #1861). The unlink
+    /// here is the test's, so it can answer at exactly that moment.
+    #[test]
+    fn a_question_off_the_screen_takes_no_answer() {
+        let dir = fixture_dir("release-order");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "34270000000000000000abcd";
+        broker.write_pending(session, "{}").unwrap();
+        let armed = broker.arm(session, Duration::from_secs(30));
+        let marker = broker.pending_path(session);
+        assert!(
+            marker.exists(),
+            "precondition: the question is on the screen"
+        );
+
+        let mut taken = None;
+        armed.guard.release(|m| {
+            let _ = std::fs::remove_file(m);
+            taken = Some(broker.record_decision(session, true));
+        });
+        assert_eq!(
+            taken,
+            Some(false),
+            "an answer sent as the marker went was still taken"
+        );
+        assert!(!marker.exists());
+        drop(armed); // its guard releases again: a no-op
 
         let _ = std::fs::remove_dir_all(&dir);
     }
