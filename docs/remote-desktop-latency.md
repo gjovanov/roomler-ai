@@ -156,7 +156,7 @@ built **without a wire-format change**: the 13-byte video header already carried
 - **Measured at paint.** The decode worker computes
   `age = epochNow + offset − wireTs` (`rc-hop-stats.ts:213` `frameAgeMs`). The
   pill is the window average, `~${Math.round(age.avgMs)} ms`
-  (`RemoteControl.vue:4875` `statsAgeLabel`, rendered at `:289`).
+  (`RemoteControl.vue:4876` `statsAgeLabel`, rendered at `:289`).
 
 It covers **encode-output → send queue → network → decode → paint**. The
 agent-side capture + encode (~10–15 ms) sits *before* the stamp and is excluded,
