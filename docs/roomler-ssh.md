@@ -1203,6 +1203,11 @@ included, and through a repair. An uninstall removes it with the service. Up to
 0.4.199 an update dropped it with every other entry but the SystemContext switch,
 silently (#3375, `docs/installation.md`,
 [What the service's `Environment` keeps](installation.md#what-the-services-environment-keeps-3375)).
+To check that the switch holds, try a transfer. OpenSSH's `sftp` shows the
+refusal only as `subsystem request failed on channel 0`, without the reason the
+device sends on stderr. The device's log has
+`ssh: refused an unsupported request … request=sftp` (measured on a Win11
+SystemContext guest after an update, #3375).
 ⚠️ Never replace the service's registry `Environment` value by hand. On a
 SystemContext install it already holds `ROOMLERD_ENABLE_SYSTEM_SWAP=1`.
 Overwriting it turned a test device into a user-context one, whose worker,
