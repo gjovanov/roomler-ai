@@ -105,11 +105,11 @@ sequenceDiagram
 
 | Rule | Where | Why |
 |---|---|---|
-| One answer for every address: unknown, waiting, active, inside the cooldown, malformed | `accept_resend`, `crates/api/src/routes/auth.rs:387` | a difference is an oracle for `users.email`, the key account-linking resolves against |
+| One answer for every address: unknown, waiting, active, inside the cooldown, malformed | `accept_resend`, `crates/api/src/routes/auth.rs:417` | a difference is an oracle for `users.email`, the key account-linking resolves against |
 | The answer does not wait for the lookup | the same function, deliberately not `async` | a known address costs more Mongo round trips than an unknown one, which is the same oracle in the latency |
 | Per client address: 5, then one every 3 minutes, a 429 with `Retry-After` | `ip_rate_limit`, `crates/api/src/middleware/auth_rate_limit.rs:157` | the route mails whoever its body names, so the budget must not reset per address |
 | Per account: one new link every 15 minutes, silently | `ACTIVATION_RESEND_COOLDOWN_SECS`, `crates/services/src/dao/user.rs:28` | a 429 here would only ever fire for an address that has an account |
-| Only a password sign-up still waiting is mailed: never an active account, a tombstone or a `.invalid` placeholder | `claim_activation_resend`, `crates/services/src/dao/user.rs:189` | it is one atomic update, so two pods cannot both send |
+| Only a password sign-up still waiting is mailed: never an active account, a tombstone or a `.invalid` placeholder | `claim_activation_resend`, `crates/services/src/dao/user.rs:197` | it is one atomic update, so two pods cannot both send |
 
 ⚠️ Sign-up does not start the cooldown. At a 5-minute link, a person back at minute 6 would
 otherwise be told a new one is coming and get nothing until minute 15. So the first resend
@@ -135,8 +135,8 @@ capability URLs, webhook signatures).
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/auth/register` | Create account (+ optionally a tenant, or accept `invite_code`). A taken address or username answers 409, in words (#3199) |
-| POST | `/api/auth/login` | Password login (`email` or `username`) |
+| POST | `/api/auth/register` | Create account (+ optionally a tenant, or accept `invite_code`). A taken address or username answers 409, in words (#3199). A taken `tenant_slug` answers 409 before anything is created, a deleted organization's slug included, so no account or activation mail is left behind (#3247) |
+| POST | `/api/auth/login` | Password login (`email` or `username`). A `username` that matches no account and holds an `@` is looked up as an address, since the sign-in page sends its one box as `username` (#3247) |
 | POST | `/api/auth/logout` | Invalidate session |
 | POST | `/api/auth/refresh` | Rotate the access token |
 | POST | `/api/auth/activate` | Redeem an email activation code (`{user_id, token}`); the SPA's `/auth/activate` page, where the activation email's link lands, posts it (#3029) |

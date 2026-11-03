@@ -189,6 +189,9 @@ describe('the sign-up page', () => {
     const all = w.findAll('input')
     const slug = all[all.length - 1]!
     expect((slug.element as HTMLInputElement).value).toBe('my-home-lab')
+    // #3247: a new person's word for it.
+    expect(w.text()).toContain('Short name')
+    expect(w.text()).not.toContain('Slug')
     await w.find('form').trigger('submit')
     await flushPromises()
     expect(registerBody()).toMatchObject({
@@ -204,6 +207,12 @@ describe('the sign-up page', () => {
     const note = w.find('[data-test="register-activation"]')
     expect(note.text()).toContain('check your email')
     expect(note.text()).toContain('brought back to the pairing page')
+    // #3247: the note takes the form's place, so it is not below the fold of a
+    // laptop screen, and its words are in the body colour.
+    expect(w.find('form').exists()).toBe(false)
+    expect(w.find('input[autocomplete="email"]').exists()).toBe(false)
+    expect(w.text()).not.toContain('Or register with')
+    expect(note.findAll('.text-high-emphasis')).toHaveLength(2)
     // The marker is for the tab that signs in later, so it stays.
     expect(localStorage.getItem(PENDING_PAIR_KEY)).not.toBeNull()
   })

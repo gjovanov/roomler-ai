@@ -1278,10 +1278,19 @@ async fn open_session(
             }
         }
     }
+    // Decision 8 — what the device shows the person at the machine, on every
+    // surface. The org's log keeps `actor`, the name as chosen. A row that cannot
+    // be read says unverified: this names an address only on an answer it has seen.
+    let user = state.users.base.find_by_id(principal).await.ok();
+    let address = user
+        .as_ref()
+        .filter(|u| u.deleted_at.is_none())
+        .and_then(|u| roomler_ai_services::dao::user::proven_address(&u.email, u.is_verified));
+    let asked_by = crate::extauth_notice::asked_by(address, actor);
     let session = state.fleet.rc_hub.create_session_full(
         device,
         principal,
-        actor.to_string(),
+        asked_by,
         tx.clone(),
         permissions,
         ask.browser_caps,
