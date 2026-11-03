@@ -451,6 +451,7 @@ mod tests {
             "agent-v0.4.197",
             "tunnel-v0.4.197",
             "roomlerd-0.4.197-perMachine-x86_64-pc-windows-msvc.msi",
+            // RETIRED-NAME-ANCHOR(3): names a PUBLISHED release asset (FR-21 D6).
             "roomler-tunnel-0.4.197-x86_64-pc-windows-msvc.zip",
             "roomler-desktop-0.4.197-x86_64-pc-windows-msvc.exe",
             "roomler-tunnel-0.4.197-universal-apple-darwin.tar.gz",

@@ -49,7 +49,9 @@ use roomlerd::install_detect::{ExistingInstall, detect_existing_install};
 use roomlerd::updater::WindowsInstallFlavour;
 use tauri::ipc::Channel;
 use wizard_shared::asset_resolver;
-use wizard_shared::msi_runner::{MsiExitDecoded, MsiRunner};
+use wizard_shared::msi_runner::MsiExitDecoded;
+#[cfg(target_os = "windows")]
+use wizard_shared::msi_runner::MsiRunner;
 use wizard_shared::progress::{ProgressEvent, replay_log};
 
 use crate::commands::DoneReport;

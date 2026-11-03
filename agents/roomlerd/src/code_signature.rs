@@ -25,7 +25,8 @@
 //!
 //! 1. `WinVerifyTrust` — the file carries a valid, trusted, unrevoked
 //!    Authenticode signature (chain + timestamp).
-//! 2. The signer's common name contains [`EXPECTED_PUBLISHER`].
+//! 2. The signer's common name contains [`EXPECTED_PUBLISHER`], or is exactly
+//!    that in [`verify_open_publisher`], the wizard's check.
 //!
 //! Step 1 alone is **not** sufficient and it is the trap worth naming: it
 //! proves only that *somebody* the machine trusts signed the file, and every
@@ -114,6 +115,10 @@ pub fn verify_publisher(_path: &Path, _expected: &str) -> Result<String, VerifyE
 /// reads through `file`, and the signer's name comes from what that check
 /// verified, not from a second look at the path. `path` is the same file's name,
 /// which `WinVerifyTrust` wants as well. Returns the signer's display name.
+///
+/// The name has to match whole. A company called `BIG ROX LTD` can buy a
+/// certificate that chains to a root Windows trusts as readily as ours does, and
+/// this comparison is all that tells the two apart.
 #[cfg(windows)]
 pub fn verify_open_publisher(
     file: &std::fs::File,
@@ -121,7 +126,7 @@ pub fn verify_open_publisher(
     expected: &str,
 ) -> Result<String, VerifyError> {
     let signer = win::verify_open(file, path)?;
-    if signer.contains(expected) {
+    if signer == expected {
         Ok(signer)
     } else {
         Err(VerifyError::WrongPublisher {
@@ -480,11 +485,14 @@ mod tests {
         let signer = verify_open_publisher(&held(path), path, EXPECTED_PUBLISHER)
             .expect("a released artifact must verify through a handle");
         println!("signer: {signer}");
-        assert!(signer.contains(EXPECTED_PUBLISHER));
+        assert_eq!(signer, EXPECTED_PUBLISHER);
 
-        match verify_open_publisher(&held(path), path, "Someone Else Ltd") {
-            Err(VerifyError::WrongPublisher { found, .. }) => assert_eq!(found, signer),
-            other => panic!("the wrong name must be refused, got {other:?}"),
+        // A part of the name is not the name: this is what a lookalike is.
+        for wrong in ["Someone Else Ltd", "G ROX", "ROX LTD"] {
+            match verify_open_publisher(&held(path), path, wrong) {
+                Err(VerifyError::WrongPublisher { found, .. }) => assert_eq!(found, signer),
+                other => panic!("{wrong:?} must be refused, got {other:?}"),
+            }
         }
 
         let dir = tempfile::tempdir().unwrap();

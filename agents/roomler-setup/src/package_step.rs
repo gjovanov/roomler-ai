@@ -397,7 +397,7 @@ impl StepArgs {
 /// A file on a local drive, by its full path, named like a plain `.msi`.
 pub fn fit_source(value: &str) -> Option<&str> {
     let value = crate::launch::safe_folder(value)?;
-    let name = Path::new(value).file_name()?.to_str()?;
+    let name = value.rsplit('\\').next()?;
     wizard_shared::asset_resolver::plain_name(name).ok()?;
     name.to_ascii_lowercase().ends_with(".msi").then_some(value)
 }
