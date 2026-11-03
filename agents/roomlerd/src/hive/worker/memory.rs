@@ -53,11 +53,11 @@ const WORKER_PREFIX: &str = "hive-worker-";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// How long systemd has to say whether it delegates.
 const ASK_WITHIN: Duration = Duration::from_secs(5);
-/// How long a task still in the unit's cgroup has to leave it. The longest
-/// wait measured at a boot is about 7 ms, and a 600 MiB process ends in about
-/// 40 ms (the FR-90 spec, §3i "#3349, as built"), so this is a slow host's
-/// margin. It holds up that one worker and never the daemon's boot, and
-/// whoever waits for the device's worker waits 10 s.
+/// How long a task still in the unit's cgroup has to leave it. A boot waited
+/// 3 to 31 ms in 40 measured, and a 600 MiB process ends in about 40 ms (the
+/// FR-90 spec, §3i "#3349, as built"), so this is a slow host's margin. It
+/// holds up that one worker and never the daemon's boot, and whoever waits
+/// for the device's worker waits 10 s.
 const LEAVE_WITHIN: Duration = Duration::from_secs(2);
 /// How often that is looked at.
 const LOOK_EVERY: Duration = Duration::from_millis(10);
