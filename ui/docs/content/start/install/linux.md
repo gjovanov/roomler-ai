@@ -41,8 +41,9 @@ unit as that account (`systemctl --user disable --now roomler.service`).
 **On a desktop, Roomler Setup needs no token.** It does need WebKitGTK 4.1,
 which not every desktop has: `sudo apt install libwebkit2gtk-4.1-0` on Ubuntu and
 Debian, `sudo dnf install webkit2gtk4.1` on Fedora. Without it the wizard stops
-before its window opens, and from a terminal it says `error while loading shared
-libraries: libwebkit2gtk-4.1.so.0`. The terminal install below needs nothing first.
+before its window opens. From a terminal it says `error while loading shared
+libraries: libwebkit2gtk-4.1.so.0`; opened from the file manager, nothing appears at
+all. The terminal install below needs nothing first.
 
 Download Roomler Setup for Linux, [x86_64](https://roomler.ai/api/setup/linux) or
 [ARM64 (aarch64)](https://roomler.ai/api/setup/linux-aarch64) (`uname -m` tells you

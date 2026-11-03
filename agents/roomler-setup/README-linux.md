@@ -11,7 +11,8 @@ terminal it says:
 
     error while loading shared libraries: libwebkit2gtk-4.1.so.0: cannot open shared object file
 
-Install it, then run `./roomler-setup` again:
+Opened from the file manager, nothing appears at all: that line goes only to the
+system journal. Install it, then run `./roomler-setup` again:
 
 - Ubuntu and Debian: `sudo apt install libwebkit2gtk-4.1-0`
 - Fedora: `sudo dnf install webkit2gtk4.1`
