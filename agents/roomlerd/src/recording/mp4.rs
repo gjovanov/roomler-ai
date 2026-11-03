@@ -876,6 +876,20 @@ fn read_box_bytes<R: Read + Seek>(r: &mut R, b: &TopBox) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// The file itself shows there is nothing to recover: no `moov`, or no
+/// complete fragment. Any other error from [`finalize`] is that attempt
+/// failing, and the file may still hold the whole recording.
+#[derive(Debug)]
+pub struct NothingRecoverable(String);
+
+impl std::fmt::Display for NothingRecoverable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mp4: {}", self.0)
+    }
+}
+
+impl std::error::Error for NothingRecoverable {}
+
 /// Index a fragmented file written by [`FragmentedWriter`], stopping cleanly
 /// at the first incomplete fragment.
 pub fn read_fragmented(path: &Path) -> Result<FragmentedIndex> {
@@ -966,7 +980,10 @@ pub fn read_fragmented(path: &Path) -> Result<FragmentedIndex> {
         f.seek(SeekFrom::Start(end))?;
     }
     let moov = moov.ok_or_else(|| {
-        anyhow!("mp4: no moov — not a recording, or it died before its first keyframe")
+        anyhow::Error::new(NothingRecoverable(format!(
+            "no moov in {}: not a recording, or it died before its first keyframe",
+            path.display()
+        )))
     })?;
     Ok(FragmentedIndex {
         moov,
@@ -991,11 +1008,26 @@ pub struct FinalizeSummary {
 /// Remux the fragmented file at `partial` into a progressive, moov-first MP4
 /// at `dest` (written to a temp name beside it, synced, then renamed —
 /// never a half-written `dest`). The source is left in place; the caller
-/// removes it once it has what it needs.
+/// removes it once it has what it needs. The caller also holds the partial's
+/// lock, so a temp already there is a dead remux's and is replaced.
+///
+/// A copy that cannot fit is not started: running the volume to zero to find
+/// out would stop whatever else writes there, the next recording included.
 pub fn finalize(partial: &Path, dest: &Path) -> Result<FinalizeSummary> {
+    finalize_with_room(partial, dest, super::folder::available_space)
+}
+
+fn finalize_with_room(
+    partial: &Path,
+    dest: &Path,
+    room: impl Fn(&Path) -> Option<u64>,
+) -> Result<FinalizeSummary> {
     let index = read_fragmented(partial)?;
     if index.fragments.is_empty() {
-        bail!("mp4: {} holds no complete fragment", partial.display());
+        return Err(anyhow::Error::new(NothingRecoverable(format!(
+            "{} holds no complete fragment",
+            partial.display()
+        ))));
     }
 
     // Per-track sample tables, chunked one chunk per fragment run.
@@ -1048,6 +1080,16 @@ pub fn finalize(partial: &Path, dest: &Path) -> Result<FinalizeSummary> {
     }
 
     let tmp = temp_beside(dest);
+    // Removed, never opened: whatever stands at this name, a link another user
+    // planted in a shared folder included, is not written through. And before
+    // the room is read: a dead remux's temp is room this copy can use.
+    let _ = std::fs::remove_file(&tmp);
+    let copy = payload_start + payload_total;
+    if let Some(free) = dest.parent().and_then(&room)
+        && free < copy
+    {
+        bail!("mp4: no room for a second copy: {copy} bytes, {free} free");
+    }
     let result = (|| -> Result<u64> {
         let out = OpenOptions::new()
             .write(true)
@@ -1075,6 +1117,9 @@ pub fn finalize(partial: &Path, dest: &Path) -> Result<FinalizeSummary> {
         w.flush()?;
         let total = w.get_ref().metadata()?.len();
         w.get_ref().sync_all()?;
+        drop(w);
+        std::fs::rename(&tmp, dest)
+            .with_context(|| format!("mp4: rename {} → {}", tmp.display(), dest.display()))?;
         Ok(total)
     })();
     let bytes = match result {
@@ -1084,8 +1129,6 @@ pub fn finalize(partial: &Path, dest: &Path) -> Result<FinalizeSummary> {
             return Err(e.context("mp4: remux failed"));
         }
     };
-    std::fs::rename(&tmp, dest)
-        .with_context(|| format!("mp4: rename {} → {}", tmp.display(), dest.display()))?;
 
     let video_ticks: u64 = tracks
         .iter()
@@ -1107,6 +1150,22 @@ pub fn finalize(partial: &Path, dest: &Path) -> Result<FinalizeSummary> {
         bytes,
         truncated: index.truncated,
     })
+}
+
+/// The same facts for a fragmented file kept as it is, its remux having failed.
+/// A file that cannot be indexed reports its size and nothing else.
+pub fn fragmented_summary(path: &Path) -> FinalizeSummary {
+    let index = read_fragmented(path).ok();
+    let samples = |track| index.as_ref().map_or_else(Vec::new, |i| i.samples(track));
+    let video = samples(VIDEO_TRACK_ID);
+    let video_ticks: u64 = video.iter().map(|s| u64::from(s.duration)).sum();
+    FinalizeSummary {
+        video_samples: video.len() as u64,
+        audio_samples: samples(AUDIO_TRACK_ID).len() as u64,
+        duration_ms: ticks_to_ms(video_ticks, VIDEO_TIMESCALE),
+        bytes: std::fs::metadata(path).map_or(0, |m| m.len()),
+        truncated: index.as_ref().is_some_and(|i| i.truncated),
+    }
 }
 
 fn temp_beside(dest: &Path) -> PathBuf {
@@ -1708,6 +1767,53 @@ mod tests {
         assert_eq!(sum.video_samples, 120, "the two complete GOPs survive");
         let pf = ProgressiveFile::open(&dest).unwrap();
         assert_eq!(pf.samples(VIDEO_TRACK_ID).unwrap().len(), 120);
+    }
+
+    /// No retry comes for a temp once the caller has kept the partial under
+    /// `dest`, so a rename that fails must not leave a whole copy behind.
+    #[test]
+    fn a_rename_that_fails_leaves_no_temp() {
+        let dir = scratch("rename");
+        let partial = dir.join("r.mp4.partial");
+        write_frames(&partial, 150, 60);
+        // A directory at the final name: the temp can be written, not renamed.
+        let dest = dir.join("r.mp4");
+        std::fs::create_dir(&dest).unwrap();
+        assert!(finalize(&partial, &dest).is_err());
+        assert!(!temp_beside(&dest).exists());
+    }
+
+    #[test]
+    fn a_remux_with_no_room_for_its_copy_writes_nothing() {
+        let dir = scratch("room");
+        let partial = dir.join("r.mp4.partial");
+        write_frames(&partial, 150, 60);
+        let dest = dir.join("r.mp4");
+        // The room cannot be told: the remux goes ahead, as it always did.
+        let made = finalize_with_room(&partial, &dest, |_| None).unwrap();
+        std::fs::remove_file(&dest).unwrap();
+
+        let e = finalize_with_room(&partial, &dest, |_| Some(made.bytes - 1)).unwrap_err();
+        assert!(format!("{e:#}").contains("no room"), "{e:#}");
+        assert!(!e.is::<NothingRecoverable>(), "the recording is all there");
+        assert!(!dest.exists() && !temp_beside(&dest).exists());
+
+        // Exactly enough is enough.
+        finalize_with_room(&partial, &dest, |_| Some(made.bytes)).unwrap();
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), made.bytes);
+    }
+
+    /// A partial that holds nothing says so before anyone asks for room, or a
+    /// full disk would keep it as a recording.
+    #[test]
+    fn nothing_recoverable_comes_before_the_room() {
+        let dir = scratch("room-empty");
+        let partial = dir.join("r.mp4.partial");
+        let mut w = FragmentedWriter::create(&partial, video(), None).unwrap();
+        w.push_video(0, &au(0, true), false).unwrap();
+        drop(w);
+        let e = finalize_with_room(&partial, &dir.join("r.mp4"), |_| Some(0)).unwrap_err();
+        assert!(e.is::<NothingRecoverable>(), "{e:#}");
     }
 
     #[test]
