@@ -226,7 +226,7 @@ encodes at that geometry.
 - **WGC drop ratio** (`wgc_backend.rs:789`): median 2 %, p90 2, max 42, over 2 571
   samples on the one WGC-capture host in the week, again NVENC and not Iris-Xe.
 
-### End-to-end age (AC8) — **partial**
+### End-to-end age (AC8) — **met**
 
 | Transport | age_ms med / p90 / p99 | floor med | windows | sessions / hosts |
 |---|---|---|---|---|
@@ -252,6 +252,27 @@ two DataChannel pumps, with 6 sentinels and no `viewer_age_implausible`.
 
 The direct tail the 10-26 read showed (p90 1108, p99 1194) is not in this week's
 numbers. This read does not say why.
+
+**2026-11-02, the pill beside the wire.** A headed Chromium 151 on the production
+viewer, with the page visible and focused, held two sessions to a throwaway Linux
+device on 0.4.197. A script read the `~N ms` pill about once a second, 164 samples
+from 36 to 2 865 ms. The agent's `agent_logs` for those two sessions hold 66
+heartbeats with a `viewer_age_ms`.
+
+| Session | Heartbeats with an age | Equal to a pill value within 5 s | Of those at 300 ms or more | Equal to a value from the *other* session (chance control) |
+|---|---|---|---|---|
+| 1 | 52 | 50 | 18 of 18 | 0 |
+| 2 | 14 | 13 | 10 of 11 | 1 |
+
+So the wire carries the number the person reads. Each window's `age` goes to the
+pill and to `sendDecodeStat` from one worker `stats` message
+(`useRemoteControl.ts:7578`, `:8224`, `RemoteControl.vue:4878`). A once-a-second
+read can skip a window, which fits the three misses, though this read can't prove it.
+
+That is all this read shows. The session was VP9 software on a loaded host, under
+software compositing, with `carrier=direct`, so its ages say nothing about how low
+the number gets on real hardware. The comparison with RustDesk's own Delay readout
+is the operator's A/B (AC9).
 
 ### Pointer cadence (AC7) — mechanism confirmed, field read owed
 

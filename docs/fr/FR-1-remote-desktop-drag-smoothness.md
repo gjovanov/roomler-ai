@@ -1,7 +1,7 @@
 # FR-1: RustDesk-parity remote-desktop drag smoothness
 
 **Status:** phases P1–P4 shipped + field-verified; P2/P3 shipped, relay-gated after field
-read; P5 shipped in 0.4.4; P6 + P7-HUD shipped in #793 (0.4.6 + web). **Field reads 2026-10-26 and 2026-11-02 (prod `agent_logs`):** P7's end-to-end age is on 96 % of the week's heartbeat windows (AC8, its half); P5's `>=45` fps at 2880x1800 Iris-Xe is reached with the frame on the GPU (`zero_copy`, 60 fps, encode 16.3 ms) and not on today's default path (38 fps; AC6, closes with FR-132 or the operator's call); P6's field read is owed (AC7); AC9 is the operator's A/B. Write-up: `docs/remote-desktop-latency.md`. Tracking issue: `FR-1` in gjovanov/roomler-ai/issues.
+read; P5 shipped in 0.4.4; P6 + P7-HUD shipped in #793 (0.4.6 + web). **Field reads 2026-10-26 and 2026-11-02 (prod `agent_logs`):** P7's end-to-end age is on 96 % of the week's heartbeat windows, and the pill read in a real viewer matches the agent's `viewer_age_ms` (AC8, met); P5's `>=45` fps at 2880x1800 Iris-Xe is reached with the frame on the GPU (`zero_copy`, 60 fps, encode 16.3 ms) and not on today's default path (38 fps; AC6, closes with FR-132 or the operator's call); P6's field read is owed (AC7); AC9 is the operator's A/B. Write-up: `docs/remote-desktop-latency.md`. Tracking issue: `FR-1` in gjovanov/roomler-ai/issues.
 
 ## Goal
 
@@ -79,10 +79,11 @@ lumpiness-robust estimator (its own follow-up FR when picked up).
       not Iris-Xe. Closes when FR-132 makes the GPU path the default, or on the
       operator's call that the switch-on proof is enough.*
 - [ ] P6: pointer send rate independent of viewer rAF load
-- [~] P7: HUD shows end-to-end age; drag test becomes a number comparable to RustDesk's
+- [x] P7: HUD shows end-to-end age; drag test becomes a number comparable to RustDesk's
       "Delay". *The number exists fleet-wide: 123 375 of 128 325 heartbeat windows in the
-      week to 2026-11-02, direct median 15 ms, relay 42 ms. Owed: the pill read in a real
-      viewer beside the agent's `viewer_age_ms`.*
+      week to 2026-11-02, direct median 15 ms, relay 42 ms. The pill was read in a real
+      viewer beside the agent's `viewer_age_ms` on 2026-11-02: 63 of 66 heartbeats equal a
+      value the pill showed within 5 s. The side-by-side with RustDesk's readout is AC9.*
 - [ ] Final A/B on the reference pair: subjective parity-or-better vs RustDesk on BOTH
       transports
 - [x] Docs: `docs/remote-desktop-latency.md` created (P5/P6/P7 design + the 2026-10-26
@@ -114,3 +115,4 @@ lumpiness-robust estimator (its own follow-up FR when picked up).
 | 0.4.6 + web deploy (P6+P7, #793) | pending — expect: `~NN ms` age pill on the DC canvas paths (WINHOST-J ≈ 40–70 ms direct; CORPLAP-3-from-neo16 ≈ 120–180 ms relay; CORPLAP-1 pairs ≈ 200–300 ms — making FR-14's physics visible), drag cadence unchanged-or-better under heavy video |
 | 0.4.167-0.4.172 (field read 2026-10-26, prod `agent_logs`, read-only via mars) | **AC6 partial** — at the named 2880x1800 Iris-Xe geometry (av1_qsv, 918 windows/8 sessions) delivered fps maxed 38.5, 0% of windows `>=45`, encode ~20 ms, pace engaged 100% @ 50 (`>=45` NOT reached: the pace keys on encode time, the 5.2 MPix pipeline delivers only ~38); at 1920x1200 Iris-Xe (hevc_qsv) motion-median 45 fps, encode ~10.5 ms (met at the lower geometry); WGC drop ratio median 2% on the one WGC host (was ~33%). **AC8 met (HUD half)** — end-to-end age a real value on 209709/259704 heartbeat windows, 294 sessions/10 hosts; direct median 15 ms, relay median 36 ms. **AC7** — the `setTimeout(8 ms)` + `pointerrawupdate` mechanism is confirmed in source; a foreground-browser field read is owed. Full write-up + anchors: `docs/remote-desktop-latency.md` §6 |
 | 0.4.177-0.4.197 (field read 2026-11-02, prod `agent_logs`, read-only via mars) | **AC6:** every 2880x1800 heartbeat of the week, 2 831 windows, 17 sessions, one host (`av1_qsv`, direct). `input_path=cpu`, the default: 1 701 windows, motion median 37.1 fps, highest 42.8, none `>=45`, encode 17.7 ms. `input_path=gpu`, `zero_copy` on: 986 windows of one session (FR-118 §9.10's test pattern), median 60.0, 89 % `>=45`, encode 16.3 ms. WGC drop ratio median 2 %, p90 2, max 42, 2 571 samples, one NVENC host. **AC8:** age on 123 375 of 128 325 windows; direct 15 / 30 / 62 ms (med / p90 / p99, 411 sessions), relay 42 / 80 / 179 ms (150 sessions). **AC7:** still owed. **AC9:** the operator's. |
+| 0.4.197 (viewer read 2026-11-02 22:19-22:22Z on the production viewer; `agent_logs` read 2026-11-03, read-only via mars) | **AC8 met.** Headed Chromium 151 under Xvfb with SwiftShader, page visible and focused, two sessions to a throwaway Linux device, VP9 4:4:4 software, `carrier=direct`. 164 pill samples at about 1 Hz, 36-2 865 ms, against 66 heartbeats carrying `viewer_age_ms`: 63 equal a pill value within 5 s (session 1: 50 of 52, session 2: 13 of 14), 28 of 29 at 300 ms or more. Chance control, the same test against the other session's pill values: 1 of 66. This shows the pill and the wire agree, and nothing about how low the number gets on real hardware. **AC7:** that run's driver limited it (`rawupdate_per_s` far under 125 in every arm, and the 16 ms control read 6.6 sends/s where it had to read 55-62), so it is void and AC7 stays owed. |
