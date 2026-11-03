@@ -930,7 +930,7 @@ flowchart LR
 gate fails open until `/api/capabilities` answers. `hive` is in `DEFAULT_OFF`
 ([`registry.ts:39`](../ui/src/modules/registry.ts#L39)), and the router also asks
 whether the pillar serves the organization (`checkServed`) before it opens a Hive
-page ([`router.ts:400`](../ui/src/plugins/router.ts#L400)).
+page ([`router.ts:406`](../ui/src/plugins/router.ts#L406)).
 
 Prod has served agent sessions to one test organization since 2026-10-09; every
 other organization reads the 404.
