@@ -131,9 +131,9 @@ pub struct AgentConfig {
     /// refusal that survives a compromised server. Defaulting it on would
     /// make the other three the whole story.
     ///
-    /// Commands inherit the daemon's identity — SYSTEM under a perMachine
-    /// Windows install, root under systemd. Turning this on is granting
-    /// root, and the admin UI says so.
+    /// Commands run as root under systemd; on Windows as SYSTEM once anchored
+    /// (FR-94), else as the console worker: the signed-in user, or SYSTEM in
+    /// SystemContext mode. Turning this on grants that, as the admin UI says.
     #[serde(default)]
     pub exec_enabled: bool,
 
