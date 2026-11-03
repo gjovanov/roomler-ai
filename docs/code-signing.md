@@ -302,7 +302,7 @@ The PowerShell verifier also does an administrative extract of each MSI
 (`msiexec /a`) and Authenticode-checks the **payload**, and asserts
 `wintun.dll` still says WireGuard LLC. On the wizard's own EXE it also reads the file's bytes
 with `scripts/signing/pe-dependent-load-flags.ps1`: `DependentLoadFlags` must be `0x800`, and
-`secur32.dll` must not be in the import table, because it is delay-loaded. That EXE sits in the
+`secur32.dll`, `wintrust.dll` and `wtsapi32.dll` must not be in the import table, because they are delay-loaded. That EXE sits in the
 person's Downloads and goes on to run elevated, so nothing it loads may come from there (FR-129
 C). CI's Windows job runs the same script on the debug EXE, and `release-setup.yml` on the EXE it
 signs. Manual user-level checks:

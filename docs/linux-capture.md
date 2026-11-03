@@ -529,8 +529,8 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:47`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:6848`). A changed brief (a login, a
-logout, the greeter) re-announces the caps on the next heartbeat (`:2112`).
+heartbeat only read that cache (`signaling.rs:6891`). A changed brief (a login, a
+logout, the greeter) re-announces the caps on the next heartbeat (`:2155`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
 
@@ -672,7 +672,7 @@ report the modifiers that report ends with. So on a KDE system install "A"
 typed "a", and every shifted symbol came out unshifted: a password with a
 capital in it failed. Shift is now pressed in a report before the key and
 released in one after it, and a shift the viewer holds is left alone
-(`agents/roomlerd/src/input/uinput_backend.rs:677`).
+(`agents/roomlerd/src/input/uinput_backend.rs:679`).
 
 ⚠️ **uinput: typed text on any layout** (FR-97 P3f). evdev carries physical
 keys, so `key_text` (the mobile keyboard, IME composition) has to know which
@@ -700,7 +700,7 @@ backend's 300 ms settle still reached nobody: 2 of 8 fresh devices on KDE on
 real hardware, and the AC4 oracle's first target went missing. The device used
 to be created at the session's first event. The input arbiter now opens it as
 soon as a session that may input has its control channel
-(`warm`, `agents/roomlerd/src/input/arbiter.rs:1018`), which gives it the second
+(`warm`, `agents/roomlerd/src/input/arbiter.rs:1082`), which gives it the second
 or more a viewer takes to send anything. This applies on Linux only, and an
 injector without the OS's permission is never cached. The kill switch is
 `ROOMLERD_INPUT_WARM=0`; `ROOMLERD_UINPUT_SETTLE_MS` (at most 5 s) overrides
@@ -1277,7 +1277,7 @@ deadline. Both fall through to the rest of the cascade with the reason in the
 log. Unattended access on Linux is FR-36's DRM arm (or §5's mutter arm where
 there is no scanout) — never this one. ⚠️ Where the product says so: the spec,
 this page, the `portal_capture` description in the config surface
-(`crates/agent-core/src/config_surface.rs:1265`, which every `roomler config`
+(`crates/agent-core/src/config_surface.rs:1273`, which every `roomler config`
 reader sees) and the helper's own log line. Since FR-93 P2c the web viewer says
 it too: `rc:video-info` carries `capture_arm` and `attended`, and the viewer
 names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b).
@@ -1285,7 +1285,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:6842`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:6844`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -2037,8 +2037,8 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 ## 7. Configuration
 
 Every key below is `restart required`; env wins over the config file. The
-keys are `crates/agent-core/src/config_surface.rs:1243-1274`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3001`).
+keys are `crates/agent-core/src/config_surface.rs:1251-1282`, and they reach
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3007`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|

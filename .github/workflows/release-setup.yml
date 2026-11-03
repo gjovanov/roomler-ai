@@ -254,7 +254,9 @@ jobs:
           name="roomler-setup-${version}-x86_64-unknown-linux-gnu"
           mkdir -p "/tmp/${name}"
           cp target/release/roomler-setup "/tmp/${name}/"
-          cp LICENSE README.md "/tmp/${name}/" 2>/dev/null || true
+          cp LICENSE "/tmp/${name}/"
+          # #3202 — what a person reads after unpacking: what the wizard needs first.
+          cp agents/roomler-setup/README-linux.md "/tmp/${name}/README.md"
           (cd /tmp && tar czf "${name}.tar.gz" "${name}")
           sha256sum "/tmp/${name}.tar.gz" | awk '{print $1"  "$2}' > "/tmp/${name}.tar.gz.sha256"
           mv "/tmp/${name}.tar.gz" "/tmp/${name}.tar.gz.sha256" .
@@ -344,7 +346,8 @@ jobs:
           name="roomler-setup-${version}-aarch64-unknown-linux-gnu"
           mkdir -p "/tmp/${name}"
           cp target/release/roomler-setup "/tmp/${name}/"
-          cp LICENSE README.md "/tmp/${name}/" 2>/dev/null || true
+          cp LICENSE "/tmp/${name}/"
+          cp agents/roomler-setup/README-linux.md "/tmp/${name}/README.md"
           (cd /tmp && tar czf "${name}.tar.gz" "${name}")
           sha256sum "/tmp/${name}.tar.gz" | awk '{print $1"  "$2}' > "/tmp/${name}.tar.gz.sha256"
           mv "/tmp/${name}.tar.gz" "/tmp/${name}.tar.gz.sha256" .
@@ -633,7 +636,7 @@ jobs:
           if ($a -ne $b) { Write-Error "the staged EXE ($a) is not the zip's EXE ($b)"; exit 1 }
           # FR-129 C — it sits in the person's Downloads and goes on to run
           # elevated: its own imports must come from System32 alone.
-          pwsh scripts/signing/pe-dependent-load-flags.ps1 -Path $name -Expect 0x800 -NotImported 'secur32.dll,wintrust.dll'
+          pwsh scripts/signing/pe-dependent-load-flags.ps1 -Path $name -Expect 0x800 -NotImported 'secur32.dll,wintrust.dll,wtsapi32.dll'
           if ($LASTEXITCODE -ne 0) { exit 1 }
           "$($a.ToLower())  $name" | Out-File "$name.sha256" -Encoding ascii
           "artifact=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append

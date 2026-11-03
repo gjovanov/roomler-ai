@@ -61,6 +61,8 @@ fn main() {
         println!("cargo:rustc-link-arg-bin=roomler-setup=/DELAYLOAD:secur32.dll");
         // #3246 — the publisher check brings `wintrust.dll` in, the same case.
         println!("cargo:rustc-link-arg-bin=roomler-setup=/DELAYLOAD:wintrust.dll");
+        // #3229 — finding the person's shell brings `wtsapi32.dll` in, the same case.
+        println!("cargo:rustc-link-arg-bin=roomler-setup=/DELAYLOAD:wtsapi32.dll");
         println!("cargo:rustc-link-arg-bin=roomler-setup=delayimp.lib");
     }
     tauri_build::build()

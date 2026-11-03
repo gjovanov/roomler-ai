@@ -157,7 +157,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   60 Hz").
 - **The pick** is stored per browser (`roomler-rc-fps`,
   `composables/frameRate.ts:30`) and sent again each time the control channel
-  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7709`), so
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7714`), so
   a reload asks again without a click.
 - **The hint under it is the agent's answer**, from `rc:video-info`
   (`frameRateSummary`, `composables/frameRate.ts:149`): "120 fps"; "120 fps, on
@@ -390,6 +390,32 @@ The fix is route meta, not per-view watchers: `meta.remountOn: '<param>'`
 (`plugins/router.ts`), read by `components/layout/KeyedRouterView.vue`, keys the view by
 that one param. Every other route stays unkeyed on purpose — several views rewrite
 `route.query` in place and must not remount — so never key by `fullPath`.
+
+**The call page remounts by room, and asks before it leaves a call (#1637).** The app
+bar's Active Calls menu and the "Call started in …" snackbar push another room's call
+onto the call page in place. Until `room-call` carried `remountOn: 'roomId'`
+(`plugins/router.ts:243`), the page in room A's call kept A's call, chat and name under
+room B's URL: a message typed there went to B, and Leave left B, a call it was never in,
+while the server still listed the person in A. A remount alone would leave A's call
+running with nothing on the page to say so, because the mini-call widget hides on every
+call page. So the page settles its own call first, in `onBeforeRouteUpdate`
+(`views/conference/ConferenceView.vue:689`), with the question the Join button asks:
+
+| The page, when another room's call is pushed onto it | What happens |
+|---|---|
+| in its room's call, **Switch Call** | it leaves that call (`leaveThisCall`, `:642`), then the page for the other room joins that room's call |
+| in its room's call, **Cancel**, Escape or a click outside | the navigation is refused. The call and the URL stay where they were |
+| in no call here | it remounts for the other room with no question, and joins nothing |
+
+The join crosses the remount as a one-shot hand-off (`composables/callSwitch.ts:22`,
+taken at `ConferenceView.vue:772`). It is for that one room, spent by the next mount
+whatever its room, and void after 10 s. It is never a query or `history.state`, so a reload
+or a back-and-forward cannot put a camera into a call nobody just asked to join.
+`ConferenceViewRoomSwitch.spec.ts` runs the real page against the real route record.
+`e2e/conference-room-switch.spec.ts` drives the three rows in a browser against a real API
+and reads the outcome from the server's participant list for each room. Its join waits for
+the page's socket: a join sent before the socket has its connection id opens a call session
+with none, and a leave from that page, which names its connection, does not close it.
 
 **A link clicked inside the app never takes a tab away from a live session (#2841).** A
 page that holds one carries `meta.liveSession`: both remote viewers (`agent-remote`,

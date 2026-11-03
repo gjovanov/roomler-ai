@@ -1108,7 +1108,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 /// local" is exactly the threat this secret exists for. Length is compared
 /// first and in variable time on purpose: the length of a hex secret is not a
 /// secret.
-fn secret_eq(expected: &str, offered: &str) -> bool {
+pub(crate) fn secret_eq(expected: &str, offered: &str) -> bool {
     use subtle::ConstantTimeEq;
     let a = expected.as_bytes();
     let b = offered.as_bytes();

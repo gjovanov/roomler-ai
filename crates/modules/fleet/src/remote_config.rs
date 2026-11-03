@@ -13,9 +13,10 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use bson::{DateTime, doc, oid::ObjectId};
+use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::models::{DesiredConfig, parse_pushed_tribool, pushed_tribool_wire};
+use roomler_ai_services::dao::base::DaoError;
 use serde::{Deserialize, Serialize};
 
 use roomler_core::{ApiError, extractors::auth::AuthUser};
@@ -322,13 +323,15 @@ pub async fn set_desired_config(
         return Err(ApiError::Forbidden(reason.message().to_string()));
     }
 
-    let bson = bson::to_bson(&requested)
-        .map_err(|e| ApiError::Internal(format!("serialising desired_config: {e}")))?;
-    state
+    // `false`: the removal won the race with the lookup above, and nothing was
+    // stored.
+    if !state
         .agents
-        .base
-        .update_by_id(aid, doc! { "$set": { "desired_config": bson } })
-        .await?;
+        .set_desired_config(tid, aid, &requested)
+        .await?
+    {
+        return Err(DaoError::NotFound.into());
+    }
     nudge_connected_device(&state, tid, aid, &requested).await;
 
     Ok(Json(DesiredConfigResponse {

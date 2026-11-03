@@ -429,6 +429,66 @@ async fn too_many_starts_and_the_daemon_gives_up() {
     w.stop().await;
 }
 
+/// Workers that cannot start until `prepare` has been asked `asks` times: a
+/// failure that passes (#3349).
+struct NotYet {
+    asks: usize,
+    asked: AtomicUsize,
+    then: Arc<Fake>,
+}
+
+impl Spawn for NotYet {
+    fn spawn(&self, theirs: Theirs) -> std::io::Result<Box<dyn Running>> {
+        if self.asked.load(Ordering::SeqCst) < self.asks {
+            return Err(std::io::Error::other("not ready yet"));
+        }
+        self.then.spawn(theirs)
+    }
+
+    fn prepare(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {})
+    }
+}
+
+/// #3349 — what could not be made ready for a start is asked for again before
+/// the next, and the worker comes up: the run keeps it, and is not ended.
+#[tokio::test]
+async fn each_start_asks_for_what_has_to_be_ready() {
+    let spawner = Arc::new(NotYet {
+        asks: 2,
+        asked: AtomicUsize::new(0),
+        then: Fake::new(&[Part::Serve]),
+    });
+    let (give_up, ended) = ended_runs();
+    let w = Worker::start(ObjectId::new(), 1, spawner.clone(), quick(), give_up);
+    let s = until(&w, |s| s.up || s.gave_up).await;
+    assert_eq!((s.starts, s.up, s.gave_up), (2, true, false), "{s:?}");
+    assert_eq!(spawner.asked.load(Ordering::SeqCst), 2, "once a start");
+    assert!(ended.lock().unwrap().is_empty(), "{ended:?}");
+    w.stop().await;
+}
+
+/// #3349 — what has to be ready can take its time, before any start: a stop does
+/// not wait for it, since a run's end waits for its worker.
+#[tokio::test]
+async fn a_stop_does_not_wait_for_what_has_to_be_ready() {
+    struct Stuck;
+    impl Spawn for Stuck {
+        fn spawn(&self, _theirs: Theirs) -> std::io::Result<Box<dyn Running>> {
+            panic!("nothing was made ready");
+        }
+
+        fn prepare(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+    let w = Worker::start(ObjectId::new(), 1, Arc::new(Stuck), quick(), nobody());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(5), w.stop()).await;
+    assert!(stopped.is_ok(), "the stop ended");
+}
+
 /// A stopped worker is told `bye` and ends on it; it is not started again.
 #[tokio::test]
 async fn a_stopped_worker_is_told_bye() {

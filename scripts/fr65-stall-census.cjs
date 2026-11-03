@@ -57,6 +57,24 @@
 // logs every probe run: the decision to probe and its outcome. A start is
 // `agent starting`, a probe line within 60 s after a start is that start's probe,
 // and any other is steady state.
+//
+// THREE MORE MODES, ONE PER CRITERION THAT NEEDS A FLEET NUMBER
+//
+//   --rekeys  AC5: forced rekeys ("pokes"), one line per poked carrier, by agent
+//             and build: per minute at the peak and at p99, the sweeps they came
+//             in, the route waves and network deltas beside them, the carriers
+//             that failed their revalidation, and what P3's gate would have kept
+//             of a build without it (a replay, so a build with the gate reads
+//             kept = pokes).
+//   --swaps   AC3: what a capture-size change costs the pump, from its heartbeats,
+//             by encoder and constrained: a window whose `dims_swaps` rose
+//             (a downscale-tier change or its undo) and a window whose size moved
+//             with `dims_swaps` still (the source changed size), each with its
+//             worst `iter_ms_max`.
+//   --canary  AC4: the runtime canary's 10-minute summaries and warnings, with the
+//             pump's STALLs beside them. A STALL is the runtime's when the summary
+//             of the 10 minutes holding it saw a wake 100 ms late. A build without
+//             the canary leaves its STALLs uncovered, which is not a clean reading.
 
 'use strict';
 
@@ -354,6 +372,309 @@ class Census {
   }
 }
 
+// --------------------------------------------------------------- three more folds
+
+const POKE_RE = /revalidating direct carrier now/;
+const WAVE_RE = /network change — re-asserting peer routes now/;
+const DELTA_RE = /^netstate: network changed/;
+const FAIL_RE = /carrier failed active revalidation/;
+const RELAY_FAIL_RE = /^overlay: relay carrier/;
+const CANARY_SUM_RE = /^runtime canary: how late a 10 ms timer woke/;
+const CANARY_WARN_RE = /^runtime canary: a 10 ms timer woke late/;
+/** One network event pokes every direct carrier at once: pokes under 1 s apart are one sweep. */
+const SWEEP_MS = 1000;
+/** P3's gate, replayed: a sweep within 10 s of a `netstate: network changed` line is
+ *  material, a Major's sweep is kept, and any other is kept only when the last kept
+ *  sweep is 60 s old (`lifecycle::netchange_action`, `NETCHANGE_POKE_QUIET`). */
+const GATE_MATERIAL_MS = 10000;
+const GATE_QUIET_MS = 60000;
+/** A canary summary covers the 10 minutes before it (`runtime_canary::SUMMARY_EVERY`). */
+const CANARY_WINDOW_MS = 600000;
+const ITER_BARS_MS = [100, 250];
+
+function yes(v) {
+  return v === true || text(v) === 'true';
+}
+
+/** The `version` bucket of `agent`, made by `make` the first time. */
+function slot(map, agent, version, make) {
+  if (!map.has(agent)) map.set(agent, new Map());
+  const byVersion = map.get(agent);
+  const v = text(version) || '?';
+  if (!byVersion.has(v)) byVersion.set(v, make());
+  return byVersion.get(v);
+}
+
+/** agent -> version -> bucket, as sorted rows. */
+function rowsOf(map, shape) {
+  const out = [];
+  for (const [agent, byVersion] of map) {
+    const versions = [];
+    for (const [version, b] of byVersion) versions.push({ version, b: shape(b) });
+    versions.sort((x, y) => (x.b.first || 0) - (y.b.first || 0));
+    out.push({ agent, versions });
+  }
+  return out.sort((x, y) => (x.agent < y.agent ? -1 : 1));
+}
+
+/** AC5: forced rekeys and the waves beside them, per agent and build. */
+class Rekeys {
+  constructor(opts) {
+    this.since = (opts && opts.since) || -Infinity;
+    this.until = (opts && opts.until) || Infinity;
+    this.agents = new Map();
+    this.state = new Map();
+    this.lines = 0;
+  }
+
+  add(agent, version, stamp, msg, f) {
+    // At the server's millisecond: the replay's 60 s quiet ends on a sweep of the
+    // 3 s chatter itself, and a file's microseconds flipped 0.5 % of its verdicts.
+    const t = Math.floor(stamp);
+    const fields = f || {};
+    const inWindow = t >= this.since && t < this.until;
+    this.lines++;
+    if (!this.state.has(agent)) {
+      this.state.set(agent, { lastDelta: -Infinity, sweepAt: -Infinity, keptAt: null, kept: true, major: false });
+    }
+    const s = this.state.get(agent);
+    const b = () =>
+      slot(this.agents, agent, version, () => ({
+        pokes: 0,
+        rearmed: 0,
+        sweeps: 0,
+        majorSweeps: 0,
+        keptSweeps: 0,
+        keptPokes: 0,
+        minutes: new Map(),
+        waves: 0,
+        materialWaves: 0,
+        deltas: 0,
+        majors: 0,
+        failDirect: 0,
+        failRelay: 0,
+        first: null,
+        last: null,
+      }));
+    if (DELTA_RE.test(msg)) {
+      s.lastDelta = t;
+      if (inWindow) {
+        const x = b();
+        x.deltas++;
+        if (text(fields.severity) === 'Major') x.majors++;
+        noteTime(x, t);
+      }
+      return;
+    }
+    if (POKE_RE.test(msg)) {
+      const sweep = t - s.sweepAt > SWEEP_MS;
+      if (sweep) {
+        s.sweepAt = t;
+        s.major = yes(fields.from_major);
+        s.kept = s.major || t - s.lastDelta <= GATE_MATERIAL_MS || s.keptAt === null || t - s.keptAt >= GATE_QUIET_MS;
+        if (s.kept) s.keptAt = t;
+      }
+      if (!inWindow) return;
+      const x = b();
+      x.pokes++;
+      if (yes(fields.rearmed)) x.rearmed++;
+      if (s.kept) x.keptPokes++;
+      if (sweep) {
+        x.sweeps++;
+        if (s.major) x.majorSweeps++;
+        if (s.kept) x.keptSweeps++;
+      }
+      const m = Math.floor(t / 60000);
+      x.minutes.set(m, (x.minutes.get(m) || 0) + 1);
+      noteTime(x, t);
+      return;
+    }
+    if (!inWindow) return;
+    if (WAVE_RE.test(msg)) {
+      const x = b();
+      x.waves++;
+      if (yes(fields.material)) x.materialWaves++;
+      noteTime(x, t);
+    } else if (FAIL_RE.test(msg)) {
+      const x = b();
+      if (RELAY_FAIL_RE.test(msg)) x.failRelay++;
+      else x.failDirect++;
+      noteTime(x, t);
+    }
+  }
+
+  finish() {
+    const agents = rowsOf(this.agents, (b) => {
+      const perMin = [...b.minutes.values()].sort((x, y) => x - y);
+      const p99 = perMin.length ? perMin[Math.min(perMin.length - 1, Math.ceil(0.99 * perMin.length) - 1)] : 0;
+      return { ...b, minutes: perMin.length, peakPerMin: perMin.length ? perMin[perMin.length - 1] : 0, p99PerMin: p99 };
+    });
+    return { agents, lines: this.lines };
+  }
+}
+
+/** AC3: what a capture-size change costs the pump, per encoder, constrained and build. */
+class Swaps {
+  constructor(opts) {
+    this.since = (opts && opts.since) || -Infinity;
+    this.until = (opts && opts.until) || Infinity;
+    this.onRow = (opts && opts.onRow) || null;
+    this.cells = new Map();
+    this.sessions = new Map();
+    this.lines = 0;
+  }
+
+  add(agent, version, t, msg, f) {
+    this.lines++;
+    if (!HB_RE.test(msg)) return;
+    const fields = f || {};
+    const key = agent + '/' + (text(fields.session_id) || '?');
+    const prev = this.sessions.get(key);
+    const cur = { swaps: num(fields.dims_swaps), w: num(fields.width), h: num(fields.height) };
+    this.sessions.set(key, cur);
+    if (!(t >= this.since && t < this.until)) return;
+    const cell = `${text(fields.encoder) || '?'} constrained=${text(fields.constrained) || '?'}`;
+    const change = () => ({ windows: 0, n: 0, max: 0, over: ITER_BARS_MS.map(() => 0), agents: new Set() });
+    const b = slot(this.cells, cell, version, () => ({
+      windows: 0,
+      first: null,
+      last: null,
+      agents: new Set(),
+      swap: change(),
+      resize: change(),
+    }));
+    b.windows++;
+    b.agents.add(agent);
+    noteTime(b, t);
+    if (!prev) return;
+    let kind = null;
+    if (cur.swaps > prev.swaps) kind = 'swap';
+    else if (cur.w !== prev.w || cur.h !== prev.h) kind = 'resize';
+    if (!kind) return;
+    const iter = num(fields.iter_ms_max);
+    const c = b[kind];
+    c.windows++;
+    c.n += kind === 'swap' ? cur.swaps - prev.swaps : 1;
+    if (iter > c.max) c.max = iter;
+    ITER_BARS_MS.forEach((bar, i) => {
+      if (iter > bar) c.over[i]++;
+    });
+    c.agents.add(agent);
+    if (this.onRow) {
+      this.onRow({
+        k: kind,
+        a: agent,
+        v: text(version),
+        t: new Date(Math.floor(t)).toISOString(),
+        cell,
+        size: `${prev.w}x${prev.h}->${cur.w}x${cur.h}`,
+        dims_swaps: cur.swaps - prev.swaps,
+        iter_ms_max: iter,
+        pump_stalls: num(fields.pump_stalls),
+        apply_ms_max: num(fields.apply_ms_max),
+        open_ms_max: num(fields.open_ms_max),
+      });
+    }
+  }
+
+  finish() {
+    const cells = rowsOf(this.cells, (b) => b).map((c) => ({ cell: c.agent, versions: c.versions }));
+    return { cells, lines: this.lines };
+  }
+}
+
+/** AC4: the runtime canary and the pump's STALLs beside it, per agent and build. */
+class Canary {
+  constructor(opts) {
+    this.since = (opts && opts.since) || -Infinity;
+    this.until = (opts && opts.until) || Infinity;
+    this.agents = new Map();
+    this.pending = new Map();
+    this.lines = 0;
+  }
+
+  add(agent, version, t, msg, f) {
+    const fields = f || {};
+    const inWindow = t >= this.since && t < this.until;
+    this.lines++;
+    const b = () =>
+      slot(this.agents, agent, version, () => ({
+        summaries: 0,
+        lateSummaries: 0,
+        wakes: 0,
+        over10: 0,
+        over50: 0,
+        over100: 0,
+        gaps: 0,
+        p99: [],
+        maxMs: 0,
+        warns: 0,
+        unwarned: 0,
+        warnMaxMs: 0,
+        heartbeats: 0,
+        stalls: 0,
+        stallsCovered: 0,
+        stallsLate: 0,
+        first: null,
+        last: null,
+      }));
+    if (START_RE.test(msg)) {
+      // A new process: the summary that would have covered the old one's STALLs never comes.
+      this.pending.set(agent, []);
+      return;
+    }
+    if (CANARY_SUM_RE.test(msg)) {
+      // The summary settles every STALL its 10 minutes hold, whatever window it is in.
+      const late = num(fields.over_100ms) > 0;
+      for (const p of this.pending.get(agent) || []) {
+        if (t - p.t > CANARY_WINDOW_MS) continue;
+        p.b.stallsCovered++;
+        if (late) p.b.stallsLate++;
+      }
+      this.pending.set(agent, []);
+      if (!inWindow) return;
+      const x = b();
+      x.summaries++;
+      if (late) x.lateSummaries++;
+      x.wakes += num(fields.wakes);
+      x.over10 += num(fields.over_10ms);
+      x.over50 += num(fields.over_50ms);
+      x.over100 += num(fields.over_100ms);
+      x.gaps += num(fields.gaps);
+      x.p99.push(num(fields.p99_ms));
+      x.maxMs = Math.max(x.maxMs, num(fields.max_ms));
+      noteTime(x, t);
+      return;
+    }
+    if (!inWindow) return;
+    if (CANARY_WARN_RE.test(msg)) {
+      const x = b();
+      x.warns++;
+      x.unwarned += num(fields.unwarned);
+      x.warnMaxMs = Math.max(x.warnMaxMs, num(fields.late_ms));
+      noteTime(x, t);
+    } else if (HB_RE.test(msg)) {
+      const x = b();
+      x.heartbeats++;
+      noteTime(x, t);
+    } else if (STALL_RE.test(msg)) {
+      const x = b();
+      x.stalls++;
+      noteTime(x, t);
+      if (!this.pending.has(agent)) this.pending.set(agent, []);
+      this.pending.get(agent).push({ t, b: x });
+    }
+  }
+
+  finish() {
+    const agents = rowsOf(this.agents, (b) => {
+      const p99 = b.p99.slice().sort((x, y) => x - y);
+      return { ...b, p99Median: p99.length ? p99[Math.floor((p99.length - 1) / 2)] : 0, p99Max: p99.length ? p99[p99.length - 1] : 0 };
+    });
+    return { agents, lines: this.lines };
+  }
+}
+
 // ---------------------------------------------------------------- rendering
 
 function pad(s, n) {
@@ -418,6 +739,96 @@ function renderProbes(r, labels) {
   return out.join('\n');
 }
 
+function renderRekeys(r, labels) {
+  const out = [];
+  const total = { pokes: 0, keptPokes: 0, waves: 0, failDirect: 0, failRelay: 0 };
+  for (const { agent, versions } of r.agents) {
+    const l = labels && labels[agent];
+    out.push(`=== ${l ? l + ' ' : ''}${agent}`);
+    for (const { version, b } of versions) {
+      for (const k of Object.keys(total)) total[k] += b[k];
+      out.push(
+        `  ${version}: pokes=${b.pokes} peak=${b.peakPerMin}/min p99=${b.p99PerMin}/min over ${b.minutes} min ` +
+          `sweeps=${b.sweeps} (major ${b.majorSweeps}) rearmed=${b.rearmed} gate_replay_keeps=${b.keptPokes} pokes ` +
+          `(${b.keptSweeps} sweeps) waves=${b.waves} (material ${b.materialWaves}) deltas=${b.deltas} (Major ${b.majors}) ` +
+          `failed: direct=${b.failDirect} relay=${b.failRelay} span ${iso(b.first)} .. ${iso(b.last)}`,
+      );
+    }
+  }
+  out.push(
+    `=== every agent: pokes=${total.pokes} gate_replay_keeps=${total.keptPokes} waves=${total.waves} ` +
+      `failed: direct=${total.failDirect} relay=${total.failRelay}`,
+  );
+  return out.join('\n');
+}
+
+function renderSwaps(r) {
+  const out = [];
+  const bars = ITER_BARS_MS.map((b) => `>${b}ms`).join('/');
+  for (const { cell, versions } of r.cells) {
+    out.push(`=== ${cell}`);
+    for (const { version, b } of versions) {
+      const one = (name, c) =>
+        `${name}: windows=${c.windows} n=${c.n} iter_ms_max worst=${c.max.toFixed(1)} ${bars}=${c.over.join('/')} agents=${c.agents.size}`;
+      out.push(
+        `  ${version}: windows=${b.windows} agents=${b.agents.size}  ${one('dims swaps', b.swap)}  ${one('size changes', b.resize)}` +
+          `  span ${iso(b.first)} .. ${iso(b.last)}`,
+      );
+    }
+  }
+  return out.join('\n');
+}
+
+function renderCanary(r, labels) {
+  const out = [];
+  for (const { agent, versions } of r.agents) {
+    const l = labels && labels[agent];
+    out.push(`=== ${l ? l + ' ' : ''}${agent}`);
+    for (const { version, b } of versions) {
+      out.push(
+        `  ${version}: summaries=${b.summaries} (late ${b.lateSummaries}) wakes=${b.wakes} over_10ms=${b.over10} over_50ms=${b.over50} ` +
+          `over_100ms=${b.over100} gaps=${b.gaps} p99 median=${b.p99Median} worst=${b.p99Max} max_ms=${b.maxMs} ` +
+          `warns=${b.warns} (+${b.unwarned} unwarned, worst ${b.warnMaxMs} ms) heartbeats=${b.heartbeats} stalls=${b.stalls} ` +
+          `covered=${b.stallsCovered} runtime_late=${b.stallsLate} span ${iso(b.first)} .. ${iso(b.last)}`,
+      );
+    }
+  }
+  return out.join('\n');
+}
+
+// ---------------------------------------------------------------- the modes
+
+/** Each read: the lines the server keeps for it and the only fields it projects. */
+const MODES = {
+  stall: { pattern: MSG_PATTERN, fields: FIELDS },
+  rekeys: {
+    pattern: [POKE_RE, WAVE_RE, DELTA_RE, FAIL_RE].map((r) => r.source).join('|'),
+    fields: ['from_major', 'rearmed', 'material', 'severity'],
+  },
+  swaps: {
+    pattern: HB_RE.source,
+    fields: ['session_id', 'encoder', 'constrained', 'width', 'height', 'dims_swaps', 'iter_ms_max', 'pump_stalls', 'apply_ms_max', 'open_ms_max'],
+  },
+  canary: {
+    pattern: [CANARY_SUM_RE, CANARY_WARN_RE, HB_RE, STALL_RE, START_RE].map((r) => r.source).join('|'),
+    fields: ['wakes', 'p99_ms', 'max_ms', 'over_10ms', 'over_50ms', 'over_100ms', 'gaps', 'late_ms', 'unwarned'],
+  },
+};
+
+function foldFor(mode, opts) {
+  if (mode === 'rekeys') return new Rekeys(opts);
+  if (mode === 'swaps') return new Swaps(opts);
+  if (mode === 'canary') return new Canary(opts);
+  return new Census(opts);
+}
+
+function renderFor(mode, r, labels, probes) {
+  if (mode === 'rekeys') return renderRekeys(r, labels);
+  if (mode === 'swaps') return renderSwaps(r);
+  if (mode === 'canary') return renderCanary(r, labels);
+  return probes ? renderProbes(r, labels) : render(r, labels);
+}
+
 // ---------------------------------------------------------------- mongosh runner
 
 /**
@@ -446,13 +857,20 @@ function runMongosh() {
   }
   const showRows = env.FR65_ROWS === '1';
   const showProbes = env.FR65_PROBES === '1';
+  const modeName = env.FR65_MODE || 'stall';
+  const mode = MODES[modeName];
+  if (!mode) throw new Error('FR65_MODE must be one of ' + Object.keys(MODES).join(', '));
+  if (showProbes && modeName !== 'stall') throw new Error('--probes is a reading of the stall mode');
   const database = connectDb(env.FR65_DB || 'roomler2', env);
   const coll = database.getCollection('agent_logs');
-  print(`agent_logs ≈ ${coll.estimatedDocumentCount()} batches; reading ${new Date(since).toISOString()} → ${new Date(until).toISOString()}`);
+  print(
+    `agent_logs ≈ ${coll.estimatedDocumentCount()} batches; the ${modeName} read, ` +
+      `${new Date(since).toISOString()} → ${new Date(until).toISOString()}`,
+  );
 
-  const census = new Census({ since, until, onRow: showRows ? (row) => print(JSON.stringify(row)) : null });
+  const census = foldFor(modeName, { since, until, onRow: showRows ? (row) => print(JSON.stringify(row)) : null });
   const project = {};
-  for (const k of FIELDS) project[k] = '$lines.fields.' + k;
+  for (const k of mode.fields) project[k] = '$lines.fields.' + k;
   const agentIds = (env.FR65_AGENTS || '').split(',').filter(Boolean).map((h) => ObjectId(h));
   const scanEnd = Math.min(until + LATE_MS, now + 60000);
   for (let t0 = since - LEAD_MS; t0 < scanEnd; t0 += DAY) {
@@ -472,7 +890,7 @@ function runMongosh() {
             $filter: {
               input: '$lines',
               as: 'l',
-              cond: { $regexMatch: { input: { $ifNull: ['$$l.msg', ''] }, regex: MSG_PATTERN } },
+              cond: { $regexMatch: { input: { $ifNull: ['$$l.msg', ''] }, regex: mode.pattern } },
             },
           },
         },
@@ -509,13 +927,14 @@ function runMongosh() {
 
   const r = census.finish();
   const labels = agentLabels(database, r);
-  print(showProbes ? renderProbes(r, labels) : render(r, labels));
+  print(renderFor(modeName, r, labels, showProbes));
   print(`read ${r.lines} lines`);
 }
 
 /** Names for the report, from the one small collection that holds them. */
 function agentLabels(database, r) {
-  const ids = r.agents.map((x) => x.agent).concat(r.probes.map((x) => x.agent));
+  const ids = (r.agents || []).map((x) => x.agent).concat((r.probes || []).map((x) => x.agent));
+  if (!ids.length) return {};
   const labels = {};
   database
     .getCollection('agents')
@@ -550,18 +969,19 @@ function textStampMs(ts) {
 
 function nodeMain(argv) {
   const files = [];
-  const opts = { rows: false, probes: false, json: false, since: null, until: null };
+  const opts = { rows: false, probes: false, mode: 'stall', json: false, since: null, until: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--self-test') return process.exit(selfTest());
     else if (a === '--rows') opts.rows = true;
     else if (a === '--probes') opts.probes = true;
+    else if (a === '--rekeys' || a === '--swaps' || a === '--canary') opts.mode = a.slice(2);
     else if (a === '--since') opts.since = Date.parse(argv[++i]);
     else if (a === '--until') opts.until = Date.parse(argv[++i]);
     else if (a === '--from-logs') continue;
     else if (a === '-h' || a === '--help') {
       console.log(
-        'usage: fr65-stall-census.cjs --from-logs [--rows] [--probes] [--since ISO] [--until ISO] FILE...\n' +
+        'usage: fr65-stall-census.cjs --from-logs [--rows] [--probes|--rekeys|--swaps|--canary] [--since ISO] [--until ISO] FILE...\n' +
           '       fr65-stall-census.cjs --self-test\n' +
           'The fleet read: scripts/fr65-stall-census.sh.',
       );
@@ -574,7 +994,7 @@ function nodeMain(argv) {
   }
   const fs = require('fs');
   const { parseLogLine } = require('./rc-shadow-report.cjs');
-  const census = new Census({
+  const census = foldFor(opts.mode, {
     hbWindowMs: RESET_HB_US_MS,
     since: opts.since || -Infinity,
     until: opts.until || Infinity,
@@ -590,7 +1010,7 @@ function nodeMain(argv) {
     }
   }
   const r = census.finish();
-  console.log(opts.probes ? renderProbes(r) : render(r));
+  console.log(renderFor(opts.mode, r, null, opts.probes));
   return undefined;
 }
 
@@ -716,6 +1136,96 @@ function selfTest() {
   ok(pr.atStart === 2 && pr.steady.length === 2 && pr.fails === 1, 'within 60 s of a start, and not before it', pr);
   ok(!PROBE_RE.test('caps probe: 4:4:4 phase reported'), 'a phase line is not a run');
 
+  // --rekeys (AC5). Real line shapes: a dev box, 2026-11-01..03, ids replaced.
+  const at = (s) => new Date(Date.UTC(2026, 10, 1, 0, 0, 0) + s * 1000).toISOString().replace('Z', '000Z');
+  const poke = (s, major) =>
+    `${at(s)}  INFO overlay: net-change — revalidating direct carrier now (forced rekey poke) peer=aaaaaaaaaaaaaaaaaaaaaaaa tier=Srflx silent_s=0 rearmed=${major ? 'true' : 'false'} from_major=${major ? 'true' : 'false'}`;
+  const delta = (s, sev) =>
+    `${at(s)}  INFO netstate: network changed severity=${sev} absorbed=3 sample_ms=305 delta.summary=default_moved=false v4_default=6 addrs +0/-2 ifaces=5 (was 6, addrs 8→6)`;
+  const wave = (s, material) =>
+    `${at(s)}  INFO overlay: network change — re-asserting peer routes now (netstate event-driven; heartbeat tick is the backstop) material=${material} first=route churn, no snapshot delta (2 signals)`;
+  const failDirect = (s) =>
+    `${at(s)}  WARN overlay: established direct carrier failed active revalidation (forced rekey unanswered — path filtered / VPN / NAT rebind?) — rebuilding via relay peer=bbbbbbbbbbbbbbbbbbbbbbbb tier="srflx" from_major=false`;
+  const failRelay = (s) =>
+    `${at(s)}  WARN overlay: relay carrier failed active revalidation (forced rekey unanswered — one-way over /derp) — rebuilding the /derp carrier peer=bbbbbbbbbbbbbbbbbbbbbbbb kind=Some(Derp)`;
+  const into = (fold, lines, version) => {
+    for (const line of lines) {
+      const p = parseLogLine(line);
+      fold.add('h', version || '0.4.197', textStampMs(p.ts), p.msg, p.fields);
+    }
+    return fold.finish();
+  };
+  const rk = (lines, opts) => into(new Rekeys(opts), lines).agents[0].versions[0].b;
+  let k = rk([poke(0), poke(0.2), poke(0.4)]);
+  ok(k.pokes === 3 && k.sweeps === 1, 'pokes under 1 s apart are one sweep', k);
+  const chatter = [];
+  for (let i = 0; i < 40; i++) chatter.push(poke(3 * i), poke(3 * i + 0.1));
+  k = rk(chatter);
+  ok(k.pokes === 80 && k.sweeps === 40 && k.keptSweeps === 2 && k.keptPokes === 4, 'chatter every 3 s: the replay keeps one sweep a minute', k);
+  ok(k.peakPerMin === 40 && k.minutes === 2 && k.p99PerMin === 40, 'per minute, at the peak and at p99', k);
+  k = rk([poke(0).replace('00:00:00.000000Z', '00:00:00.000900Z'), poke(60).replace('00:01:00.000000Z', '00:01:00.000400Z')]);
+  ok(k.keptSweeps === 2, 'the quiet is read at the millisecond the server holds, not the file\'s microsecond', k);
+  k = rk([poke(0), delta(20, 'Minor'), poke(25), poke(40)]);
+  ok(k.keptSweeps === 2 && k.deltas === 1 && k.majors === 0, 'a sweep 5 s after a network delta is material and kept inside the quiet', k);
+  k = rk([poke(0), delta(20, 'Minor'), poke(31)]);
+  ok(k.keptSweeps === 1, 'and 11 s after it is chatter again', k);
+  k = rk([poke(0, true), poke(30), delta(40, 'Major')]);
+  ok(k.majorSweeps === 1 && k.keptSweeps === 1 && k.rearmed === 1 && k.majors === 1, "a Major's sweep is kept and starts the quiet", k);
+  k = rk([wave(0, 'false'), wave(3, 'true'), failDirect(5), failRelay(6), failRelay(7)]);
+  ok(k.waves === 2 && k.materialWaves === 1 && k.failDirect === 1 && k.failRelay === 2 && k.pokes === 0, 'waves, and failures by carrier', k);
+  k = rk([delta(0, 'Minor'), poke(5)], { since: Date.parse(at(1).replace('000Z', 'Z')) });
+  ok(k.pokes === 1 && k.keptSweeps === 1 && k.deltas === 0, 'a delta before the window still makes the sweep material', k);
+
+  // --swaps (AC3). The heartbeat's own fields, from the same box.
+  const hb = (s, sid, w, h, swaps, iter, enc) =>
+    `${at(s)}  INFO FFmpeg DC pump heartbeat (≈2s window) session_id=${sid} constrained=true width=${w} height=${h} encoder="${enc || 'hevc_qsv'}" dims_swaps=${swaps} apply_ms_max=58.249 open_ms_max=296.39 iter_ms_max=${iter} pump_stalls=0`;
+  let sw = into(new Swaps(), [
+    hb(0, 's1', 1920, 1080, 0, 30),
+    hb(2, 's1', 1280, 720, 1, 196.4),
+    hb(4, 's1', 1920, 1080, 2, 260),
+    hb(6, 's1', 1920, 1200, 2, 1340),
+    hb(8, 's2', 1280, 720, 5, 20),
+    hb(10, 's1', 1920, 1200, 2, 12),
+  ]);
+  const cell = sw.cells.find((c) => c.cell === 'hevc_qsv constrained=true').versions[0].b;
+  ok(cell.windows === 6 && cell.agents.size === 1, 'every heartbeat is a window of its cell', cell);
+  ok(cell.swap.windows === 2 && cell.swap.n === 2 && cell.swap.max === 260, 'a window whose dims_swaps rose is a swap, with its worst pass', cell.swap);
+  ok(cell.swap.over[0] === 2 && cell.swap.over[1] === 1, 'over 100 ms and over 250 ms', cell.swap.over);
+  ok(cell.resize.windows === 1 && cell.resize.max === 1340, 'a size change with dims_swaps still is the source changing size', cell.resize);
+  sw = into(new Swaps(), [hb(0, 's1', 1920, 1080, 0, 30, 'av1_nvenc'), hb(2, 's1', 1280, 720, 1, 61.5, 'av1_nvenc')]);
+  ok(sw.cells.length === 1 && sw.cells[0].cell === 'av1_nvenc constrained=true', 'cells split by encoder', sw.cells);
+
+  // --canary (AC4). The canary's two lines as `runtime_canary.rs` writes them.
+  const summary = (s, over100, p99) =>
+    `${at(s)}  INFO runtime canary: how late a 10 ms timer woke, over 10 minutes wakes=59990 p50_ms=1.0 p99_ms=${p99 || 2.0} p999_ms=5.0 max_ms=${over100 ? 412.3 : 12.3} over_10ms=3 over_50ms=${over100} over_100ms=${over100} gaps=0`;
+  const warn = (s) =>
+    `${at(s)}  WARN runtime canary: a 10 ms timer woke late, so the runtime did not schedule its tasks late_ms=412 unwarned=2`;
+  const stall = (s) => FIX.open.replace('2026-11-02T02:34:01.931858Z', at(s));
+  const start = (s) => `${at(s)}  INFO agent starting version=0.4.250`;
+  const cy = (lines) => into(new Canary(), lines, '0.4.250').agents[0].versions[0].b;
+  let cb = cy([stall(100), warn(101), summary(500, 1, 50)]);
+  ok(cb.stalls === 1 && cb.stallsCovered === 1 && cb.stallsLate === 1, 'a STALL in a summary with a 100 ms wake is the runtime\'s', cb);
+  ok(cb.warns === 1 && cb.unwarned === 2 && cb.warnMaxMs === 412 && cb.maxMs === 412.3, 'warnings and the worst wake', cb);
+  cb = cy([stall(100), summary(500, 0)]);
+  ok(cb.stallsCovered === 1 && cb.stallsLate === 0, "a STALL in a calm summary is the pump's own", cb);
+  cb = cy([stall(100), start(200), summary(500, 1)]);
+  ok(cb.stalls === 1 && cb.stallsCovered === 0, "a restart leaves the old process's STALLs uncovered", cb);
+  cb = cy([stall(100), summary(800, 1)]);
+  ok(cb.stallsCovered === 0, 'a summary covers only its own 10 minutes', cb);
+  cb = cy([summary(600, 0, 1), summary(1200, 0, 2), summary(1800, 1, 50)]);
+  ok(cb.summaries === 3 && cb.lateSummaries === 1 && cb.wakes === 179970 && cb.p99Median === 2 && cb.p99Max === 50, 'summaries add up', cb);
+
+  // Each mode's server-side filter keeps its own lines.
+  for (const [mode, lines] of [
+    ['rekeys', [poke(0), delta(0, 'Major'), wave(0, 'true'), failDirect(0), failRelay(0)]],
+    ['swaps', [hb(0, 's1', 1, 1, 0, 1)]],
+    ['canary', [summary(0, 0), warn(0), stall(0), start(0), FIX.heartbeat(at(0))]],
+  ]) {
+    const mre = new RegExp(MODES[mode].pattern);
+    for (const line of lines) ok(mre.test(parseLogLine(line).msg), `the ${mode} read keeps: ${parseLogLine(line).msg.slice(0, 40)}`);
+  }
+  ok(!new RegExp(MODES.rekeys.pattern).test(parseLogLine(FIX.open).msg), 'the rekeys read keeps no STALL');
+
   // The server-side filter is the union of the lines the fold reads.
   const re = new RegExp(MSG_PATTERN);
   for (const m of [
@@ -737,7 +1247,7 @@ function selfTest() {
 // ---------------------------------------------------------------- dispatch
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { Census, classify, eraOf, render, textStampMs };
+  module.exports = { Census, Rekeys, Swaps, Canary, classify, eraOf, render, textStampMs };
 }
 if (typeof Mongo === 'function' && typeof print === 'function') {
   runMongosh();

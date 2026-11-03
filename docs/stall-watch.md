@@ -375,6 +375,63 @@ It is FR-65 AC7's "same instrument": the before of a change to the watch is the
 build without it, the after is the build with it, over windows of the same
 length.
 
+### 7.1 Three more modes: forced rekeys, swaps, the runtime canary
+
+Three FR-65 criteria have their number in the fleet's logs rather than in a STALL
+line. Each gets a mode of the same read, bounded the same way: the server keeps
+only the mode's own lines and projects only the fields its fold reads.
+
+| Mode | Criterion | Lines it keeps | What it prints, per device and build |
+|---|---|---|---|
+| `--rekeys` | AC5, and P3's before and after | `overlay: net-change — revalidating direct carrier now` (a poke, one per carrier), `overlay: network change — re-asserting peer routes now` (a route wave), `netstate: network changed` (a delta), `… carrier failed active revalidation` | pokes, per minute at the peak and at p99; sweeps (pokes under 1 s apart, one network event poking every direct carrier at once); re-armed pokes; Major sweeps; what P3's gate would have kept (`gate_replay_keeps`); waves, material apart; deltas, Major apart; failed revalidations, direct and relay |
+| `--swaps` | AC3 | `FFmpeg DC pump heartbeat` | per encoder and `constrained`: heartbeat windows, then the windows where `dims_swaps` rose (a downscale-tier change or its undo) and the windows where the size moved with `dims_swaps` still (the source changed size), each with its worst `iter_ms_max` and how many passed 100 ms and 250 ms |
+| `--canary` | AC4 | both `runtime canary:` lines, STALL, heartbeat, `agent starting` | the canary's 10-minute summaries (those with a 100 ms wake apart), wakes over 10, 50 and 100 ms, gaps, p99 (median and worst), the latest wake, warnings; then the STALLs, how many a summary covered, and how many of those were in 10 minutes with a 100 ms wake (`runtime_late`) |
+
+```bash
+scripts/fr65-stall-census.sh --mars --yes --rekeys            # forced rekeys, every device, the last 7 days
+scripts/fr65-stall-census.sh --mars --yes --swaps --rows      # + one JSON line per swap or size change
+scripts/fr65-stall-census.sh --mars --yes --canary
+node scripts/fr65-stall-census.cjs --from-logs --rekeys <file>...
+```
+
+`gate_replay_keeps` replays P3's gate (`lifecycle::netchange_action`) from the log
+alone. A poke line carries no `material`, so a delta line in the 10 s before a sweep
+stands for it:
+
+```mermaid
+flowchart TD
+  P[a poke] --> S{under 1 s after the last poke?}
+  S -->|yes| J[the same sweep, the same verdict]
+  S -->|no| M{from_major, or a delta line in the 10 s before?}
+  M -->|yes| K[kept, and the quiet starts again]
+  M -->|no| Q{the last kept sweep 60 s ago or more?}
+  Q -->|yes| K
+  Q -->|no| D[dropped by the gate]
+```
+
+On a build without the gate it says what the gate would shed. On a build with it,
+every poke already passed the gate, so `gate_replay_keeps` should equal `pokes`;
+a shortfall is a disagreement between the replay and the gate. The replay reads
+stamps at the server's millisecond: its 60 s quiet ends on a sweep of the 3 s
+chatter itself, and the file's microseconds flipped 19 of the verdicts below.
+
+`--canary` covers a STALL when a summary of the same device follows it within its
+10 minutes with no `agent starting` between. A build without the canary covers
+nothing, so `covered=0` there is no reading. AC4's "frame age unchanged or better"
+is not in this mode: it is the heartbeat's `viewer_age_ms`, read beside it.
+
+⚠️ **The two ends agree here too.** The same host as above, 2026-11-02, one day:
+
+| Mode | Host files (`--from-logs`) | Fleet read | Difference |
+|---|---|---|---|
+| `--rekeys` | 14 140 pokes, 1 654 sweeps, 4 004 kept by the replay, 1 987 waves, 7 deltas, 10 + 1 failures | 14 128 pokes, 1 653 sweeps, 4 004 kept, 1 987 waves, 6 deltas, 10 + 1 failures | one sweep of 12 pokes and one delta, both on 0.4.197, missing from the server with `dropped=0`: a batch lost where the uploader counts nothing (the table above) |
+| `--swaps` | 149 heartbeats, one dims swap at 196.4 ms | the same | none |
+
+The first fleet read on `--rekeys`, 2026-10-27 04:10Z .. 2026-11-03 04:10Z, every
+device: 208 210 pokes, of which the gate would have kept 64 138; 33 710 route
+waves; 1 399 direct and 786 relay revalidations failed. It ran in about 11 s, and
+the Mongo pod's restart count read 1 before and after. That is P3's before.
+
 ## 8. What the watch costs (FR-65 AC1)
 
 > *"An instrument that costs what it measures is worthless."* AC1 asks for the
@@ -464,3 +521,59 @@ roomler exec <device> -- "C:/Program Files/Roomler/roomlerd.exe" stall-watch-cos
 - **A wedged capture cannot trip it** (§2).
 - **The census sees what was uploaded** (§7): 7 days, and less than that on a
   host that lost lines.
+
+## 10. The runtime canary — what the watch cannot see (FR-65 P2)
+
+The watch times the pump's own passes. A task that never got scheduled is
+invisible to it: if something holds a worker of the daemon's runtime (a
+synchronous FFI call, a guard held across an `.await`, a poll that never
+yields), every task queued behind that worker waits, and the pump's next pass
+merely starts late. FR-65 P2 asked for an instrument that measures that symptom
+itself, and FR-70 AC1 asks for the same one. This is it.
+
+| | |
+|---|---|
+| Code | `agents/roomlerd/src/runtime_canary.rs`, spawned beside the resource watch (`app.rs`) |
+| What it does | asks to wake every 10 ms on the daemon's main runtime and records how late each wake came |
+| Summary | one INFO line every 10 minutes: `runtime canary: how late a 10 ms timer woke, over 10 minutes` |
+| Warning | one WARN at most a minute when a wake comes ≥ 100 ms late (the watch's bar): `runtime canary: a 10 ms timer woke late, so the runtime did not schedule its tasks` |
+| Kill switch | `ROOMLERD_RUNTIME_CANARY=0` |
+| Its cost | one timer: 100 wakes a second, each a clock read and a histogram increment |
+
+```mermaid
+flowchart LR
+    T[sleep until due] --> W[woke: late = now − due]
+    W --> G{late ≥ 30 s?}
+    G -- yes --> GAP[gaps += 1<br/>the host slept]
+    G -- no --> H[histogram, max]
+    H --> X{late ≥ 100 ms?}
+    X -- yes --> WARN[WARN, at most once a minute<br/>unwarned counts the rest]
+    X -- no --> N
+    WARN --> N[due = now + 10 ms]
+    GAP --> N
+    N --> T
+```
+
+**The summary's fields.** `wakes`; `p50_ms`, `p99_ms`, `p999_ms`, each the
+histogram bucket bound (1, 2, 5, 10, 20, 50, 100, 250 ms) under which that share
+of the wakes fell, or the latest wake when that share is past 250 ms; `max_ms`,
+exact; `over_10ms`, `over_50ms`, `over_100ms`, wakes later than each; `gaps`,
+wakes 30 s or more late. An idle runtime reads `p999_ms=1` and every `over_*` at
+0. P2's measured case, a 13 ms synchronous encode on a worker every frame at
+30 fps, would read `p99_ms=20` with a third of the wakes in `over_10ms`
+(`a_worker_held_13_ms_a_frame_shows_in_the_tail`).
+
+**Why it measures from `now`.** The next deadline is set from the wake, not
+from the missed one, so a 2 s stall counts as one wake 2 s late, not as 200
+wakes of which 199 look on time and water the tail down.
+
+**Why a gap is not a stall.** On Windows the daemon holds a 1 ms timer
+resolution for its whole life (`win_timer`), so a late wake there is the
+scheduler, not the 15.6 ms tick. But a laptop that sleeps wakes the canary hours
+late. A wake 30 s or more late is counted in `gaps` and never warned: a runtime
+starved that long is the watchdog's to catch (its budgets are 30–90 s).
+
+**Reading it beside the census.** A STALL whose pass shows no phase and a
+canary WARN within the same second is the runtime's; a STALL with a dominant
+phase and an on-time canary is the pump's own work. A fleet read of both is
+what AC4 asks for.

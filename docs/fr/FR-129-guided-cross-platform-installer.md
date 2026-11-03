@@ -32,12 +32,12 @@ The wizard's step 3 is a text box: "Paste a fresh token from the Roomler admin U
 signup page or says where a token comes from. To get one, a new person must:
 
 1. register — production answers with a message and **no session**
-   (`crates/api/src/routes/auth.rs:287-300`);
-2. open the activation email — `login` refuses an unactivated account (`auth.rs:450-454`);
+   (`crates/api/src/routes/auth.rs:313-326`);
+2. open the activation email — `login` refuses an unactivated account (`auth.rs:487-491`);
 3. log in;
-4. create an org, unless they filled the optional org fields at signup (`auth.rs:226-231`);
+4. create an org, unless they filled the optional org fields at signup (`auth.rs:227-249`);
 5. find Devices → Enroll device, which mints a **10-minute single-use** token
-   (`crates/modules/fleet/src/agent.rs:24`, `:90-140`, behind `MANAGE_AGENTS`);
+   (`crates/modules/fleet/src/agent.rs:25`, `:113-164`, behind `MANAGE_AGENTS`);
 6. copy it — the dialog says "then paste the token into the wizard"
    (`ui/src/components/enroll/EnrollmentDialog.vue:119`);
 7. get back to the wizard and paste it before the 10 minutes run out.
@@ -87,7 +87,7 @@ it. Do not shift these anchors with code that moved later.*
 | tunnel token | `crates/modules/network/src/routes/tunnel.rs:53-75`; mint `crates/services/src/auth/mod.rs:731` | any member (`is_member`) mints a `TunnelEnrollment` token |
 | registration | `crates/api/src/routes/auth.rs:167-325` | creates the user; the org inline only with `tenant_name` + `tenant_slug` (`:250-255`); production returns no session (`:311-324`) |
 | login gate | `crates/api/src/routes/auth.rs:366-370` | an unactivated account is refused |
-| return path | `ui/src/plugins/router.ts:385-411` | `pending_redirect` in **sessionStorage** — one tab only; same-origin paths only |
+| return path | `ui/src/plugins/router.ts:391-417` | `pending_redirect` in **sessionStorage** — one tab only; same-origin paths only |
 | short-lived capability row | `crates/db/src/models/consent_request.rs:13-37` | an unguessable `token`, a status enum, an `expires_at` TTL, redeemed by a public token-keyed route — the shape a pairing row needs |
 | rate limits | `crates/api/src/lib.rs:111-127`, `:143-145`, `:393`; `crates/core/src/rate_limit.rs:37-66` | per-IP governor on `/api`; `AuthRateLimiter` on register/login; a per-(caller, resource) sliding window for exec, SSH and relay mints |
 | decision log | `crates/services/src/dao/peer_relay_audit.rs:3-10` | one collection per decision kind; the refused rows are the point |
@@ -204,7 +204,7 @@ The invariants, each closing a specific failure:
    - **No account:** register with the org inline (`register` already takes `tenant_name` and
      `tenant_slug`). An OAuth signup stays in one tab, so `pending_redirect` carries it. An
      email signup opens the activation link in a **new tab**, where sessionStorage is empty
-     (`ui/src/plugins/router.ts:390`). The page therefore also keeps the pending pairing in
+     (`ui/src/plugins/router.ts:396`). The page therefore also keeps the pending pairing in
      localStorage with its expiry, under the guard's same-origin rules, and the guard routes
      any signed-in tab back to `/pair` while it lives.
    - **Fallback, always:** the wizard keeps showing the code with an "Open the page again"
@@ -757,7 +757,7 @@ macOS the server's switch), and the tunnel client:
   tunnel client would be another product than the one the device has. This supersedes B.4's
   "Linux per-user (the default for a desktop)".
 - **The SPA** preselects `defaultRole` when nothing is picked and the card is shown
-  (`agents/roomler-setup/src/front/app.js:614`, `isOfferedRole` `:683`), never saves it (a
+  (`agents/roomler-setup/src/front/app.js:615`, `isOfferedRole` `:718`), never saves it (a
   click does), and evaluates the Continue gate as before — the cross-flavour acknowledgement
   and #3116's elevation note included. The overlay box keeps its per-OS default, already ticked
   for every preselected daemon role.
@@ -770,7 +770,7 @@ macOS the server's switch), and the tunnel client:
   desktop", which would contradict it. The wizard's own text never calls the daemon an "agent"
   (the operator, 2026-10-30): the token step names the dashboard's Devices → Enroll, the
   checklist and the Done page say "device" and show a version (`roomlerd 0.4.188`), never a
-  release tag (`app.js:1894-1899`). Tags, API paths and wire strings stay as they are: they are
+  release tag (`app.js:1912-1917`). Tags, API paths and wire strings stay as they are: they are
   compatibility surfaces.
 
 #### C2 — `/api/setup/windows` serves the signed EXE
@@ -778,7 +778,7 @@ macOS the server's switch), and the tunnel client:
 - **The release lane** stages the same signed EXE as its own asset,
   `roomler-setup-<v>-x86_64-pc-windows-msvc.exe`, with an `.exe.sha256` in the zip's format,
   after checking it byte for byte against the zip's copy
-  (`.github/workflows/release-setup.yml:615`); the publish job copies `*.exe` too (`:688`), so
+  (`.github/workflows/release-setup.yml:618`); the publish job copies `*.exe` too (`:691`), so
   the GPG step signs it and the attestation covers it. ⚠️ A tag run executes the workflow as it
   stood at the tag: the first EXE asset appears at the first `setup-v*` cut after this merges, which was `setup-v0.4.197`.
 - **The server** (`crates/modules/fleet/src/setup_release.rs:66`, `SetupFormat`; `:308`,
@@ -833,7 +833,7 @@ sequenceDiagram
     end
 ```
 
-- **Where.** #3116's note (`agents/roomler-setup/src/front/index.html:98`) carries a **Restart as
+- **Where.** #3116's note (`agents/roomler-setup/src/front/index.html:101`) carries a **Restart as
   administrator** button inside it, so it shows exactly when the note does: the pre-logon role,
   on a reinstall whose config folder a limited wizard cannot open. It runs
   `cmd_relaunch_elevated` (`agents/roomler-setup/src/commands.rs:373`), Windows-only: `runas`
@@ -841,12 +841,12 @@ sequenceDiagram
   (`crates/roomler-setup-core/src/elevation.rs:112`), with
   `--role <role> [--server <url>] [--session-data <folder>] --after-elevation <pid>` — the server
   only when it is not the default, the folder being the limited copy's `%LOCALAPPDATA%`
-  (`agents/roomler-setup/src/launch.rs:153`). The relaunch happens on Welcome, before a
+  (`agents/roomler-setup/src/launch.rs:215`). The relaunch happens on Welcome, before a
   token exists, so nothing secret is on the command line; every value is validated on both
   sides, and an unknown argument is ignored. `SEE_MASK_NOZONECHECKS`, because the file is the
   wizard's own running image, whose zone check ran when the person opened it.
 - **The wait.** The elevated copy waits, at most 30 s, for the limited one to exit
-  (`launch.rs:403`, called from `agents/roomler-setup/src/main.rs:78`) **before** Tauri's
+  (`launch.rs:465`, called from `agents/roomler-setup/src/main.rs:78`) **before** Tauri's
   single-instance plugin initialises: the plugin finds a running copy by its mutex and window
   and would hand that dying copy the arguments and quit. Under over-the-shoulder credentials
   (a standard user types an administrator's password) the elevated copy is another account,
@@ -864,7 +864,7 @@ sequenceDiagram
   `%LOCALAPPDATA%` for its saved state and log, which is why the role and server travel on the
   command line. The wizard can tell this case apart, because the limited copy names its own
   `%LOCALAPPDATA%` in `--session-data` and a different one here says so
-  (`launch::on_another_account`, `agents/roomler-setup/src/launch.rs:252`). It then offers only
+  (`launch::on_another_account`, `agents/roomler-setup/src/launch.rs:315`). It then offers only
   the machine-wide service, with a note saying why (`RoleLimit::AnotherAccount`,
   `agents/roomler-setup/src/role.rs:191`): the other roles would install into that administrator's
   profile and still report Done. `cmd_install` and `cmd_pair_start` hold the same rule for a run
@@ -873,11 +873,11 @@ sequenceDiagram
   Under over-the-shoulder credentials that was Edge as the administrator, at high integrity, on
   the standard user's desktop (the log, 2026-11-02): a browser the person at the screen could use
   to start anything as that administrator. An elevated wizard runs `<windir>\explorer.exe <url>`
-  instead (`launch::open_through_the_shell`, `launch.rs:280`), and the session's own Explorer opens
+  instead (`launch::open_through_the_shell`, `launch.rs:343`), and the session's own Explorer opens
   the page, in that user's default browser and profile, at medium integrity. Measured with Edge as
   the default browser.
 - **WebView2.** An elevated run gives WebView2 a user-data folder of its own,
-  `<the limited copy's %LOCALAPPDATA%>\ai.roomler.setup\elevated` (`launch.rs:308`, `:363`).
+  `<the limited copy's %LOCALAPPDATA%>\ai.roomler.setup\elevated` (`launch.rs:370`, `:425`).
   WebView2 shares one browser
   process among every host that names the same folder, and the limited copy's browser process
   can outlive that copy by a moment; an elevated host joining a limited browser process is the
@@ -885,7 +885,7 @@ sequenceDiagram
   ignores every `WEBVIEW2_*` environment override and honours what the app passes through the
   API (Microsoft's "Develop secure WebView2 apps"), so the folder goes to Tauri's
   `WebviewWindowBuilder::data_directory`, the `userDataFolder` argument WebView2 receives. That
-  is why the main window is now created by the setup hook (`main.rs:120`) from its
+  is why the main window is now created by the setup hook (`main.rs:121`) from its
   `tauri.conf.json` entry, which says `"create": false`; a test holds the two together. (The
   first cut of C3 set `WEBVIEW2_USER_DATA_FOLDER`, which an elevated host would have ignored;
   the #3116 kit had already met the same rule for the CDP port, which an elevated wizard takes
@@ -898,7 +898,7 @@ sequenceDiagram
   right-click, with Edge's own "We couldn't create the data directory", so C3 inherited this
   rather than caused it. So the limited copy names its own `%LOCALAPPDATA%` on the command line
   (`--session-data`, a local absolute path, checked on both sides by `safe_folder`,
-  `launch.rs:136`; a folder that is not there falls back to this process's own), which is the
+  `launch.rs:141`; a folder that is not there falls back to this process's own), which is the
   session user's and which that user has just written to. For an administrator approving their
   own prompt it is the same folder as before. Rejected: finding the folder through Explorer's
   token (`OpenProcessToken` is denied without `SeDebug`), and a folder everyone can write in
@@ -910,7 +910,7 @@ sequenceDiagram
   behind it, with only a taskbar button to show for it (2 of 2; from Explorer it came up in front,
   2 of 2). So `run_elevated` passes its right on with `AllowSetForegroundWindow`
   (`elevation.rs:112`), and a relaunched copy asks for the foreground once its window exists
-  (`main.rs:144`), which is tao's `SetForegroundWindow` with its Alt-key fallback.
+  (`main.rs:145`), which is tao's `SetForegroundWindow` with its Alt-key fallback.
 - **DLLs.** C2 puts the EXE in the person's Downloads and C3 has the same image elevate itself,
   so a DLL left beside it would load into both copies, the elevated one behind a UAC prompt
   naming our publisher. Before C the EXE ran from a folder freshly unzipped, so this is C's to
@@ -933,20 +933,20 @@ sequenceDiagram
   shell's one UAC prompt and `icacls` under none (the log, 2026-11-02). Every spawn on this path
   now names its program by a full path from the kernel, because `%SystemRoot%` can be overridden
   per user (`appdirs::system32_tool`, `crates/agent-core/src/appdirs.rs:113`), and `spawn_elevated`
-  refuses anything else (`agents/roomlerd/src/updater.rs:2676`).
+  refuses anything else (`agents/roomlerd/src/updater.rs:2692`).
   `agents/roomler-setup/src/spawn_gate.rs` parses the source of everything the wizard runs on
   Windows and fails on a bare name, or on an expression it has not been told about.
 - **What an elevated run takes from its user.** A value in `HKCU\Environment` reaches an elevated
   process of that user. On the same build the elevated copy fetched its MSI from an address written
-  there, with no second prompt (the log, 2026-11-02). `launch::start_clean` (`launch.rs:213`),
+  there, with no second prompt (the log, 2026-11-02). `launch::start_clean` (`launch.rs:275`),
   `main`'s second line (`agents/roomler-setup/src/main.rs:53`), therefore does three things. The
   machine's folders take their true values on every run (`appdirs::machine_folder_variables`,
   `appdirs.rs:125`). The current directory moves to System32; an elevated copy otherwise keeps
   the limited one's. An elevated run drops `ROOMLER*`, `WEBVIEW2_*`, `TAURI_*` and `SSL_CERT_*`
-  (`launch::distrusted_variable`, `launch.rs:192`). A limited run keeps those, because it crosses
+  (`launch::distrusted_variable`, `launch.rs:254`). A limited run keeps those, because it crosses
   nothing its user cannot already do, and test fixtures use them. The elevated WebView2 folder
   sits where the limited user can write, so it is made new at each start and no link is followed
-  (`make_elevated_folder`, `launch.rs:322`), and the page holds only the grants it uses
+  (`make_elevated_folder`, `launch.rs:384`), and the page holds only the grants it uses
   (`agents/roomler-setup/capabilities/default.json`). The MSI's publisher and the `%TEMP%` swap stay
   with #3246.
 - **A desktop that refuses prompts.** `ConsentPromptBehaviorUser=0`, which the CIS and STIG baselines
@@ -1067,7 +1067,7 @@ subject plain text: the machine name is the installer's own text.
 | A4 | terminal parity: `roomlerd enroll --pair [--pair-org SLUG]`, `install.sh --pair [--pair-org SLUG]`, `install.ps1 -Pair [-PairOrg SLUG]` — the code and the page on the terminal, A3's back-off, the hijack guard as `Join «org» (slug) as approved by «name» (@username)? [y/N]` on `/dev/tty` / the Windows console, `--pair-org` (byte for byte) for a terminal that has none, server text escaped, the in-process enroll through the `--token` path (invariant 10 above; the judgement calls below) | omit the flag (nothing changes without it); an older server or `[pairing] enabled = false` → "use --token", exit 1 | **merged** — [#3045](https://github.com/gjovanov/roomler-ai/pull/3045) (`fa8ce1147`, 2026-10-28), in agent 0.4.183; the scripts' `--pair` ships in the server image. End-to-end on the dev stack against A1 (the log below): the `curl … \| sh -s -- --pair` shape running the real `enroll_daemon` on a Linux pty (`y`, `n`), no terminal without and with `--pair-org`, a lookalike org refused, an org name full of escapes shown inert, an older server; the Windows build with `--pair-org`, with no console at all, and asked in a real console (code page 437); no secret in any transcript or log (AC3). The first draft, run the same way, enrolled into the lookalike and printed the escapes raw. AC13 at this head: the FR-61 no-flag cells pass on Ubuntu (per-user, `--system`); Win11 matches master check for check (its `#desktop` fails on master too) — the log below. On production on 2026-10-30: `install.sh --role daemon --pair` with `--pair-org` (no question) and without it (the `[y/N]` question), and `install.ps1 -Pair -PairOrg` (the log) |
 | B0 | spike: the privileged/user split of `install.sh` under `pkexec` (Ubuntu GNOME, Fedora KDE vmtest cells) and `osascript` admin (macOS cell); the seam recorded in this spec | — | **merged** — [#3039](https://github.com/gjovanov/roomler-ai/pull/3039) (`16c910c48`, 2026-10-28): `--privileged-steps` / `--user-steps` / `--config-from`, proven under `pkexec` on Ubuntu 24.04 GNOME-Wayland (per-user, `--system`) and Fedora 44 KDE Plasma 6 Wayland (per-user, tarball + `.rpm`); the terminal path re-run on all three and on macOS (per-user, and the root half through `--daemon-token`); the macOS native-prompt half proven on 2026-10-29 by the field sweep's `setup-v0.4.186` run (the log) |
 | B1 | wizard: daemon roles on Linux (per-user, system) and macOS (per-user) through the embedded `install.sh` steps; the companion placed as the terminal places it; #2338 folded in | the setup endpoint's switch for that OS (`wizard_linux_daemon`, `wizard_macos_daemon`; one `wizard_unix_daemon` before B1-s2) absent/false → Windows-only cards | **merged** — [#3063](https://github.com/gjovanov/roomler-ai/pull/3063) (`16f1315ed`, 2026-10-28), in agent 0.4.184. Field (log rows below): Ubuntu GNOME per-user and system, each with a remote-desktop session through the production viewer; Fedora KDE per-user (red, a fix, green); #2338 kept on Linux (per-user, system) and on Windows (red on `setup-v0.4.182`, green on B1); F1, F2 and F5 on the per-user cell, with `pkexec`'s 126/127 measured; F3 (a renamed host) and F4 (a zeroed root config) on the system cell. The orchestrator's second review (another organization: R1, U2, F3b, in the decisions above) is unit-tested, not field-run. The field sweep (2026-10-29, the log): the macOS per-user GUI half (`setup-v0.4.186`) and `org_join::heal_org_keys` (red on 0.4.183, green on 0.4.187) are green. On Windows SystemContext the operator's settings survive a reinstall, but the restarted worker writes its stale copy over the wizard's fold, so a reinstall's new enrollment never takes, and a limited wizard spends the token before it fails ([#3116](https://github.com/gjovanov/roomler-ai/issues/3116)), fixed by B1-w (the row below) and field-verified on 0.4.188. The released wizards on Linux (2026-10-30, the log): `setup-v0.4.188` through B1's shim (per-user, system, a reinstall over the running root daemon, Cancel), then, with the switch on, `setup-v0.4.189` against plain `https://roomler.ai` with no harness (Ubuntu per-user and a reinstall over it, Ubuntu system, Fedora KDE per-user), each one prompt, each device's `server_url` the production URL. Fedora KDE's remote-desktop session ran on `setup-v0.4.190` (2026-10-31, the log) |
-| B1-w | #3116, B1's Windows defects from the field sweep. The wizard asks the daemon the MSI restarted to restart again onto the folded config, through its own LocalAPI (`RestartDaemon`, the internal arm: no crash counted, no ephemeral unenroll), as the Linux half restarts its unit. A daemon's startup saves never write over a config another process wrote after it loaded it (`config::StartupWrites`, `crates/agent-core/src/config.rs:4171`). A limited wizard stops before the MSI when it could not write the SystemContext config (a reinstall: the folder is hardened, #3073), and before the enroll on a config it may not read or a folder it may not write; an access-denied read is `MergeBase::Denied`, never a damaged config. A fresh install of that role still works from a double-click. `docs/installation.md` (the reinstall section) has the mechanism | none: a bug fix. The restart is best-effort, and the Done page says why when it did not happen | **merged** — [#3125](https://github.com/gjovanov/roomler-ai/pull/3125) (`37efecf13`, 2026-10-30), in agent and setup 0.4.188. Unit-tested on Windows and Linux; a new CI step lints and tests the wizard on Windows, where no lane compiled its Windows half. Field (2026-10-30, the log): on Win11 SystemContext cells, first with the PR's wizard against agent 0.4.187, then with the released `setup-v0.4.188` as `roomler.ai` serves it against agent 0.4.188, with the red reproduced on `setup-v0.4.187`. A reinstall's new enrollment takes and the worker restarts onto it, on an upgrade (0.4.187 → 0.4.188) and on the same version; a re-enrollment after a revocation comes back online; a limited wizard is stopped on Welcome before any token; a fresh limited install still completes. The daemon's `StartupWrites` refuses the stale startup save the old wizard still provokes, so its enrollment waits in the file for the daemon's next start. Not exercised: the restart's skipped arms (no answer within 90 s, a refusal, a daemon older than `RestartDaemon`), an ephemeral device, a perUser reinstall. Noticed beside it: a limited wizard's companion placement fails with nothing on the checklist (the service places the companion anyway) |
+| B1-w | #3116, B1's Windows defects from the field sweep. The wizard asks the daemon the MSI restarted to restart again onto the folded config, through its own LocalAPI (`RestartDaemon`, the internal arm: no crash counted, no ephemeral unenroll), as the Linux half restarts its unit. A daemon's startup saves never write over a config another process wrote after it loaded it (`config::StartupWrites`, `crates/agent-core/src/config.rs:4213`). A limited wizard stops before the MSI when it could not write the SystemContext config (a reinstall: the folder is hardened, #3073), and before the enroll on a config it may not read or a folder it may not write; an access-denied read is `MergeBase::Denied`, never a damaged config. A fresh install of that role still works from a double-click. `docs/installation.md` (the reinstall section) has the mechanism | none: a bug fix. The restart is best-effort, and the Done page says why when it did not happen | **merged** — [#3125](https://github.com/gjovanov/roomler-ai/pull/3125) (`37efecf13`, 2026-10-30), in agent and setup 0.4.188. Unit-tested on Windows and Linux; a new CI step lints and tests the wizard on Windows, where no lane compiled its Windows half. Field (2026-10-30, the log): on Win11 SystemContext cells, first with the PR's wizard against agent 0.4.187, then with the released `setup-v0.4.188` as `roomler.ai` serves it against agent 0.4.188, with the red reproduced on `setup-v0.4.187`. A reinstall's new enrollment takes and the worker restarts onto it, on an upgrade (0.4.187 → 0.4.188) and on the same version; a re-enrollment after a revocation comes back online; a limited wizard is stopped on Welcome before any token; a fresh limited install still completes. The daemon's `StartupWrites` refuses the stale startup save the old wizard still provokes, so its enrollment waits in the file for the daemon's next start. Not exercised: the restart's skipped arms (no answer within 90 s, a refusal, a daemon older than `RestartDaemon`), an ephemeral device, a perUser reinstall. Noticed beside it: a limited wizard's companion placement fails with nothing on the checklist (the service places the companion anyway) |
 | B1-s | server: `GET /api/setup/features` → `{"pairing", "wizard_unix_daemon", "wizard_pairing"}`, public. `pairing` is the server's fact (A1's switch, for the wizard); the two `[setup]` switches are the operator's assertions about the **released** wizard, each default **off** until its field run — `wizard_unix_daemon` (`ROOMLER__SETUP__WIZARD_UNIX_DAEMON`; AC11; split per OS by B1-s2 below, where it stays as the legacy key that turns both OSes on) and `wizard_pairing` (`ROOMLER__SETUP__WIZARD_PAIRING`; A3 against this server). The enrollment dialog, the landing page and the static `/` (`home.js`) showed the Linux and macOS wizard only on `wizard_unix_daemon` (each OS on its own switch since B1-s2), and the install lead says "sign in from your browser" only on `pairing && wizard_pairing` — never on the server's fact alone, or a server promoted before the first `setup-v*` carrying A3 would promise a flow the download cannot do | the settings; absent/false, a 404 (an older server) and a 503 (fleet unmounted) all read as false | **merged** — [#3044](https://github.com/gjovanov/roomler-ai/pull/3044) (`f44058c8f`, 2026-10-28); on production since 2026-10-29: `/api/setup/features` answers `pairing: true` with both `[setup]` switches off; `wizard_pairing` on since 2026-10-30 16:11Z, after the production pairing run, and `wizard_unix_daemon` on since 22:33Z that day (the log) |
 | B1-s2 | the daemon switch per OS, so Linux goes live without macOS (the operator, 2026-10-30). **Server:** `[setup] wizard_linux_daemon` (`ROOMLER__SETUP__WIZARD_LINUX_DAEMON`) and `wizard_macos_daemon` (`ROOMLER__SETUP__WIZARD_MACOS_DAEMON`), each default off; the legacy `wizard_unix_daemon` turns both on (`SetupSettings::linux_daemon`, `macos_daemon`, `crates/config/src/settings.rs:128-140`). `GET /api/setup/features` adds `wizard_linux_daemon` and `wizard_macos_daemon`, each the effective value, and answers `wizard_unix_daemon` as their AND (`crates/modules/fleet/src/setup_release.rs:200-211`): the one key the wizards released before the split read, for both OSes (B.6). **Wizard:** one helper picks this OS's switch, its own key OR `wizard_unix_daemon` (`SetupFeatures::daemon_offered`, `agents/roomler-setup/src/features.rs:77-83`), for the Welcome cards (`agents/roomler-setup/src/commands.rs:232`), the Server page (`:279`) and the re-check before installing (`agents/roomler-setup/src/orchestrator_unix.rs:329`); the page gets that one boolean (`daemonOffered`). **SPA and `/`:** the setup-features store (`ui/src/stores/setupFeatures.ts:73-75`) and `home.js` (`ui/docs/theme/home.js:205-211`) apply the same OR and still fail closed; each hidden button on the static page names its OS (`data-wizard-unix="linux"`) | the two settings, each off by default; a server from before the split sends its one key, read for both OSes | **merged** — [#3162](https://github.com/gjovanov/roomler-ai/pull/3162) (`0f763366a`, 2026-10-30). The wizard half is in agent and setup 0.4.190; the server half has been on production since about 22:55Z that day (first on `hosted-20261030-9336d4b`). Red first on master: the wizard's per-OS pick, the integration test's five keys and its legacy key, and 22 Vitest checks (a Linux-only answer hid the Linux cards everywhere). Field (2026-10-31, the log): the released `setup-v0.4.190` reads its own OS's key on Ubuntu and on macOS, so each OS's cards follow its own switch, and `setup-v0.4.189` shows none on either OS against a Linux-only answer. Those one-OS answers came from a shim, because production has both on, so the server's AND rests on its integration test (AC14). The cards went on ahead of B.6's order, through the legacy key |
 | B2 | macOS root half from the GUI: the daemon role with "Join the overlay network" ticked (the macOS default now) adds the root half — one approval, two tokens (`halves: 2`), or two pasted tokens; the root half enrolled in-process under a machine id from the hardware, placed and folded by B1's `--config-from` / `adopt-enrollment`; Cancel, Retry and the late-start watch over two enrollments; the terminal's refusal kept (the decisions under "Decided by B2") | B1's macOS switch (`wizard_macos_daemon` since B1-s2, which the legacy `wizard_unix_daemon` also sets); untick the box for the per-user half alone | **merged** — [#3077](https://github.com/gjovanov/roomler-ai/pull/3077) (`f0c85a639`, 2026-10-29), rides agent 0.4.187 (the "B2" rows of the log). Unit-tested (the hardware id against two measured tart clones' facts; the halves, the tokens, the Retry state), the SPA driven in jsdom (27 checks, red on master's SPA), the device cap per half in an integration test. Field (2026-10-29, the log): red on `setup-v0.4.186`, green on `setup-v0.4.187`. Green covered a fresh install (one prompt, both rows online, the root half on the mesh), a reinstall (the same rows, key and machine id), and a Cancel after the password with a Retry that asked for no second prompt. The remote-desktop session ran on 2026-10-30 (the log): green, but only after a restart typed in Terminal. macOS's default "Quit & Reopen" left the agent offline, and nothing in the product restarted it ([#3164](https://github.com/gjovanov/roomler-ai/issues/3164)). The macOS cards went on that evening with this known (the deploy repo's #53). The fix is B2-r (the row below), and the re-run on 0.4.190 is green (2026-10-31, the log) |
@@ -1319,7 +1319,7 @@ All seven open decisions were resolved as the spec recommended
 | A4-5 | **the tunnel role does not pair from the scripts** (`--role tunnel --pair` and `-Role tunnel-client -Pair` are refused, naming `--token` and the wizard) | the `roomler` CLI's enroll is its own code (`agents/roomler-cli`) and has no `--pair` yet; a script cannot pair on its behalf without holding the token itself, which is the thing `--pair` exists to avoid. A CLI `--pair` is a follow-up. |
 | A4-6 | **`--pair-org` matches the approved slug byte for byte** — no case folding, no trimming of the server's value, no Unicode normalisation; only the person's own value is trimmed | the server takes a slug as sent (`crates/api/src/routes/tenant.rs:60-68` passes it straight to the DAO; only `ui/src/composables/useValidation.ts:10` constrains it) under the binary-collated unique index of `crates/db/src/indexes.rs:132`, so `ACME`, `acme ` and a Cyrillic `аcme` are three orgs anyone can create beside `acme`. The first A4 draft trimmed and case-folded the server's slug, which let `ACME` through with no question asked: the flag that was the guard would have been the bypass. |
 | A4-7 | **server-sent text is escaped on the terminal, and a lookalike handle is flagged** | the org's name and slug and the approver's name and username are typed by whoever made the org and the account. Printed raw, an ANSI sequence (cursor up, clear line) in an org's name can repaint the `Join …?` line with another org's; a bidi override can reorder it. Escaping controls and invisible characters keeps every byte visible, and the warnings catch what escaping cannot (a slug in capitals, a Cyrillic letter). On Windows the question goes out through `WriteConsoleW`, so the `«»` and a non-ASCII name are not garbled by the console's code page. |
-| A4-8 | **a failed poll is retried until the pairing's clock runs out**, at a doubling interval capped at 30 s | the first draft gave up after six failures in a row (about 30 s): a pod roll or a VPN reconnect mid-pairing would end the install although the approval was still coming. The wizard retries to the end (`agents/roomler-setup/src/front/app.js:1241-1253`), and RFC 8628 §3.5 asks a client to slow down after a failure, not to stop. |
+| A4-8 | **a failed poll is retried until the pairing's clock runs out**, at a doubling interval capped at 30 s | the first draft gave up after six failures in a row (about 30 s): a pod roll or a VPN reconnect mid-pairing would end the install although the approval was still coming. The wizard retries to the end (`agents/roomler-setup/src/front/app.js:1254-1266`), and RFC 8628 §3.5 asks a client to slow down after a failure, not to stop. |
 | A4-9 | **the existing config is read after the pairing, not before it** | the first draft read it before the wait and merged into that copy after: a running daemon's own writes in between (token renewal, remote configuration, the companion's settings) would be saved over. Reading after makes the paired enroll's read-to-save window the `--token` one, and every line of it the `--token` code. |
 | A4-10 | **`install.sh` gives the paired enroll `/dev/null` as stdin** | under `curl … \| sh` the shell's stdin is the rest of the script. Nothing reads it today — the daemon asks on `/dev/tty`, and sudo 1.9.15 passed a piped script through untouched by default and with `log_input` or `log_stdin` set (the log below) — so this is a belt, kept because the cost of being wrong is an install that silently stops halfway. |
 

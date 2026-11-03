@@ -143,6 +143,15 @@ pub enum ProgressEvent {
     #[serde(rename_all = "camelCase")]
     AnchorSkipped { reason: String },
 
+    /// #3174 — a limited wizard on a machine-wide install leaves the companion
+    /// to the service, and the EXE is not there yet.
+    CompanionWaiting,
+    /// #3174 — `roomler-desktop.exe` is there after the step, whoever placed it.
+    CompanionPresent,
+    /// #3174 — it is not. Never fatal: `message` says what happens next.
+    #[serde(rename_all = "camelCase")]
+    CompanionAbsent { message: String },
+
     /// #3116 — a Windows reinstall: the daemon the installer restarted loaded
     /// the config from before it, so it is asked to restart onto the one this
     /// install just wrote, as `install.sh` restarts the Linux unit. A remote

@@ -130,7 +130,7 @@ min-gap has elapsed, else arm one `setTimeout` for the remainder; latest positio
 wins. 8 ms ≈ a 125 Hz ceiling at ~60 B/message — noise even on a constrained
 relay. Where the browser supports it (Chromium), `pointerrawupdate` feeds the
 coalescer at device rate between rAF-aligned moves, so the freshest position is
-always queued (`useRemoteControl.ts:12637`). The gap is a per-browser knob,
+always queued (`useRemoteControl.ts:12645`). The gap is a per-browser knob,
 0 to 16 ms (`roomler-rc-input-gap`, `:2671` `storedInputGapMs`, from FR-98 C3); the
 same timer drives the relative-pointer path (`:7071`).
 

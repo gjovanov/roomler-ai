@@ -196,7 +196,7 @@ reaches every viewer whatever their view says. Locked against a real worker by
 scrolling ancestor, and emits `visible: { visible, w, h }` once per change and `false` on
 unmount (`:553`), while its parent still listens. Every layout forwards it with the stream
 key (`layouts/TiledLayout.vue:23`, `SpotlightLayout.vue:25`, `SidebarLayout.vue:25`), the
-call page hands it to the store (`ConferenceView.vue:427`), and the store keeps the tiles on
+call page hands it to the store (`ConferenceView.vue:435`), and the store keeps the tiles on
 screen, maps stream keys to the video producers it consumes
 (`ui/src/stores/conference.ts:428`) and sends one `media:view` at most every 100 ms
 (`:672-734`) — and again every 15 s while in the call and when the tab returns to the
