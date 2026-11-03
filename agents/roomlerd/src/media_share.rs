@@ -163,6 +163,29 @@ impl Follower {
     }
 }
 
+/// #3260, #3423 — what the owner told its own controller about a capture with
+/// no picture, kept so every follower is told too, and every viewer that joins
+/// later.
+#[derive(Clone)]
+enum OwnerNotice {
+    /// FR-80 — the capture cannot produce pixels: `rc:media-unavailable`.
+    Unavailable(crate::capture::CaptureUnavailable),
+    /// FR-93 — the capture waits on its host (`rc:media-waiting`), at the
+    /// latest until `until`. A viewer that joins later is told the time left,
+    /// not the owner's whole wait.
+    Waiting {
+        why: crate::capture::WaitFor,
+        until: std::time::Instant,
+    },
+}
+
+/// #3423 — what a viewer joining the pipeline is told, from the kept
+/// [`OwnerNotice`].
+enum JoinNotice {
+    Unavailable(crate::capture::CaptureUnavailable),
+    Waiting(crate::capture::OpenWait),
+}
+
 #[derive(Default)]
 struct PipelineInner {
     followers: Vec<Follower>,
@@ -176,8 +199,9 @@ struct PipelineInner {
     /// #3260 — why the owner's capture produces no pixels (FR-80), once the
     /// owner knows. Such an owner never captures a frame, so it never
     /// publishes `video_info`: without this a follower's viewer had a black
-    /// canvas and a stall, and blamed the network.
-    unavailable: Option<crate::capture::CaptureUnavailable>,
+    /// canvas and a stall, and blamed the network. #3423 — or what it waits
+    /// for at the host (FR-93), for as long as it waits.
+    notice: Option<OwnerNotice>,
     /// Owner marks this when its pump exits; blocks late joins racing the
     /// registry removal.
     closed: bool,
@@ -595,7 +619,7 @@ impl Pipeline {
     /// the owner's does: a follower joins before its channels exist.
     pub fn tell_unavailable(&self, reason: &crate::capture::CaptureUnavailable) {
         let mut inner = self.inner.lock().unwrap();
-        inner.unavailable = Some(reason.clone());
+        inner.notice = Some(OwnerNotice::Unavailable(reason.clone()));
         let targets: Vec<_> = inner
             .followers
             .iter()
@@ -605,6 +629,86 @@ impl Pipeline {
         for (session, cdc) in targets {
             crate::peer::spawn_capture_unavailable_notice(session, cdc, reason.clone());
         }
+    }
+
+    /// #3423 — the owner's capture waits on its host (FR-93), and `wait` is
+    /// what the owner just told its own controller. This tells every
+    /// follower's, the same way [`Self::tell_unavailable`] does, and keeps the
+    /// wait for the viewers that join later, until the owner's next frame
+    /// ([`Self::on_frame`]) or the wait's own deadline. The owner's loop
+    /// calls it; an open waits off the loop and tells through
+    /// [`Self::wait_teller`].
+    pub fn tell_waiting(&self, wait: crate::capture::OpenWait) {
+        tell_waiting(&self.inner, wait, &tokio::runtime::Handle::current());
+    }
+
+    /// #3423 — what the owner's capture open keeps of this pipeline. The
+    /// open's wait hook runs on the blocking pool and outlives any borrow, so
+    /// it holds the pipeline itself and the runtime that sends the notices.
+    pub fn wait_teller(&self) -> WaitTeller {
+        WaitTeller {
+            inner: self.inner.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    /// #3423 — the owner's capture produced a frame, so whatever it waited
+    /// for is over: a viewer that joins from now on is not told about it. The
+    /// viewers told already clear their notices at their own first frame.
+    /// #3260's reason goes too. Only `NoopCapture` has one, and it captures
+    /// nothing, so a frame means a reopen found a capture after all.
+    /// Called for every captured frame, so it only takes the lock that
+    /// [`Self::beat`] takes on every pass.
+    pub fn on_frame(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.notice = None;
+    }
+
+    /// Test hook: the wait kept for the viewers that join later, and the time
+    /// it has left.
+    #[cfg(test)]
+    pub(crate) fn kept_wait(&self) -> Option<(crate::capture::WaitFor, Duration)> {
+        match self.inner.lock().unwrap().notice {
+            Some(OwnerNotice::Waiting { why, until }) => Some((
+                why,
+                until.saturating_duration_since(std::time::Instant::now()),
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// #3423 — [`Pipeline::wait_teller`]'s handle.
+pub struct WaitTeller {
+    inner: Arc<Mutex<PipelineInner>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl WaitTeller {
+    /// [`Pipeline::tell_waiting`], from an open's wait hook.
+    pub fn tell(&self, wait: crate::capture::OpenWait) {
+        tell_waiting(&self.inner, wait, &self.runtime);
+    }
+}
+
+fn tell_waiting(
+    inner: &Mutex<PipelineInner>,
+    wait: crate::capture::OpenWait,
+    runtime: &tokio::runtime::Handle,
+) {
+    let mut guard = inner.lock().unwrap();
+    guard.notice = Some(OwnerNotice::Waiting {
+        why: wait.why,
+        until: std::time::Instant::now() + wait.gives_up_in,
+    });
+    let targets: Vec<_> = guard
+        .followers
+        .iter()
+        .map(|f| (f.sink.session_id, f.sink.control_dc.clone()))
+        .collect();
+    drop(guard);
+    for (session, cdc) in targets {
+        crate::peer::spawn_media_waiting_notice(runtime, session, cdc, wait);
     }
 }
 
@@ -666,7 +770,7 @@ impl Drop for FollowerGuard {
 /// pipeline owns the key, or the pipeline is closing. On success the
 /// follower's DC chunker task is running, a pipeline IDR is requested, and
 /// the last `rc:video-info` (if any) is replayed to this viewer, as is the
-/// owner's `rc:media-unavailable` (#3260).
+/// owner's `rc:media-unavailable` (#3260) or `rc:media-waiting` (#3423).
 pub fn try_join(
     key: PipelineKey,
     sink: FollowerSink,
@@ -730,11 +834,17 @@ pub fn try_join(
     }
     // #3260 — and, when the owner's capture has no picture, why. Read under
     // the same lock as the push below, so an owner telling its followers at
-    // this moment tells this one either way, and only once.
-    let unavailable = guard
-        .unavailable
-        .clone()
-        .map(|reason| (reason, sink.control_dc.clone()));
+    // this moment tells this one either way, and only once. #3423 — a wait
+    // is told with the time it has left; one past its deadline is not told.
+    let notice = match guard.notice.clone() {
+        Some(OwnerNotice::Waiting { why, until }) => until
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|left| !left.is_zero())
+            .map(|gives_up_in| JoinNotice::Waiting(crate::capture::OpenWait { gives_up_in, why })),
+        Some(OwnerNotice::Unavailable(reason)) => Some(JoinNotice::Unavailable(reason)),
+        None => None,
+    }
+    .map(|tells| (tells, sink.control_dc.clone()));
     guard.followers.push(Follower {
         sink,
         send_tx,
@@ -748,8 +858,15 @@ pub fn try_join(
     guard.kf_needed = true;
     drop(guard);
     tracing::info!(%session_id, ?key, "media_share: joined shared encoder pipeline as follower");
-    if let Some((reason, cdc)) = unavailable {
-        crate::peer::spawn_capture_unavailable_notice(session_id, cdc, reason);
+    match notice {
+        Some((JoinNotice::Unavailable(reason), cdc)) => {
+            crate::peer::spawn_capture_unavailable_notice(session_id, cdc, reason);
+        }
+        Some((JoinNotice::Waiting(wait), cdc)) => {
+            let runtime = tokio::runtime::Handle::current();
+            crate::peer::spawn_media_waiting_notice(&runtime, session_id, cdc, wait);
+        }
+        None => {}
     }
     Some(FollowerGuard {
         inner,
@@ -1226,6 +1343,163 @@ mod tests {
         let (pcs, dc, mut heard) = viewer_channel().await;
         *control.lock().await = Some(dc);
         told_once(&mut heard).await;
+        for pc in pcs {
+            let _ = pc.close().await;
+        }
+    }
+
+    /// The person at the screen is asked to share it, and the request gives up
+    /// in `gives_up_in` (FR-93 P2d-2's portal dialog).
+    fn dialog(gives_up_in: Duration) -> crate::capture::OpenWait {
+        crate::capture::OpenWait {
+            gives_up_in,
+            why: crate::capture::WaitFor::Dialog { control: false },
+        }
+    }
+
+    /// The viewer heard the owner's wait once, within `WAIT`, and nothing more
+    /// for two of the notice's retry periods. Its `waits_ms`.
+    async fn told_to_wait(heard: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> u64 {
+        const WAIT: Duration = Duration::from_secs(10);
+        let first = tokio::time::timeout(WAIT, heard.recv())
+            .await
+            .expect("the follower's viewer was never told that the capture waits on the host")
+            .expect("the viewer's end closed");
+        let told: serde_json::Value = serde_json::from_str(&first).expect("a JSON notice");
+        assert_eq!(told["t"], "rc:media-waiting", "{first}");
+        assert_eq!(
+            told["for"], "person_at_screen",
+            "what the owner waits for: {first}"
+        );
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(heard.try_recv().is_err(), "told once, not on every retry");
+        told["waits_ms"].as_u64().expect("waits_ms")
+    }
+
+    /// #3423 — an owner whose capture waits on its host tells the followers it
+    /// already has, with its own deadline. Before it, a follower's viewer saw no
+    /// frame and no reason, and its watchdog re-created the session every 10 s
+    /// for as long as the wait lasted. Red without `tell_waiting`'s delivery.
+    #[tokio::test]
+    async fn a_follower_is_told_its_owner_waits() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3423-FOLLOWER");
+        let owner = Pipeline::register(key, ObjectId::new());
+        let (pcs, dc, mut heard) = viewer_channel().await;
+        let follower = sink(ObjectId::new());
+        *follower.control_dc.lock().await = Some(dc);
+        let _guard = try_join(key, follower, 60).expect("join");
+        owner.tell_waiting(dialog(Duration::from_secs(120)));
+        assert_eq!(
+            told_to_wait(&mut heard).await,
+            120_000,
+            "the owner's own deadline"
+        );
+        for pc in pcs {
+            let _ = pc.close().await;
+        }
+    }
+
+    /// #3423 — a viewer that joins while the owner waits is told the time the
+    /// wait has left, not the owner's whole wait: its viewer holds its
+    /// watchdog until then. Red without `try_join`'s replay of the wait.
+    #[tokio::test]
+    async fn a_viewer_joining_during_a_wait_is_told_the_time_left() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3423-JOINER");
+        let owner = Pipeline::register(key, ObjectId::new());
+        owner.tell_waiting(dialog(Duration::from_secs(120)));
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let joiner = sink(ObjectId::new());
+        let control = joiner.control_dc.clone();
+        let _guard = try_join(key, joiner, 60).expect("join");
+        let (pcs, dc, mut heard) = viewer_channel().await;
+        *control.lock().await = Some(dc);
+        let left = told_to_wait(&mut heard).await;
+        assert!(
+            (60_000..=118_500).contains(&left),
+            "the time the wait has left, 1.5 s in: {left} ms"
+        );
+        for pc in pcs {
+            let _ = pc.close().await;
+        }
+    }
+
+    /// #3423 — a wait is over at the owner's next frame, and one past its own
+    /// deadline is over too: a viewer that joins after either is told nothing,
+    /// so no notice outlives what it describes.
+    #[tokio::test]
+    async fn a_viewer_joining_after_a_wait_ends_is_told_nothing() {
+        let _s = serial();
+        for (key, by_frame, ends) in [
+            ("TEST-3423-FRAME", true, "the owner's next frame"),
+            ("TEST-3423-DEADLINE", false, "the wait's own deadline"),
+        ] {
+            let key = PipelineKey::FfmpegDc(key);
+            let owner = Pipeline::register(key, ObjectId::new());
+            if by_frame {
+                owner.tell_waiting(dialog(Duration::from_secs(120)));
+                owner.on_frame();
+            } else {
+                owner.tell_waiting(dialog(Duration::from_millis(200)));
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+            let (pcs, dc, mut heard) = viewer_channel().await;
+            let joiner = sink(ObjectId::new());
+            *joiner.control_dc.lock().await = Some(dc);
+            let _guard = try_join(key, joiner, 60).expect("join");
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            assert!(
+                heard.try_recv().is_err(),
+                "a joiner after {ends} was told of a wait that is over"
+            );
+            for pc in pcs {
+                let _ = pc.close().await;
+            }
+        }
+    }
+
+    /// #3423 — a wait that ends with no capture (the dialog was refused, or
+    /// gave up) is replaced by the reason: a viewer that joins then is told
+    /// why there is no picture, and nothing about a wait.
+    #[tokio::test]
+    async fn a_wait_that_ends_with_no_capture_is_told_as_its_reason() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3423-REPLACED");
+        let owner = Pipeline::register(key, ObjectId::new());
+        owner.tell_waiting(dialog(Duration::from_secs(120)));
+        owner.tell_unavailable(&no_display());
+        let (pcs, dc, mut heard) = viewer_channel().await;
+        let joiner = sink(ObjectId::new());
+        *joiner.control_dc.lock().await = Some(dc);
+        let _guard = try_join(key, joiner, 60).expect("join");
+        told_once(&mut heard).await;
+        for pc in pcs {
+            let _ = pc.close().await;
+        }
+    }
+
+    /// #3260, #3423 — a capture that had no picture and then has one (a reopen
+    /// found a capture: the FFmpeg pump's transport flip reopens whatever it
+    /// holds) drops the kept reason at its first frame, so a viewer that joins
+    /// after that is not told there is no picture. Red if a frame clears only
+    /// a wait.
+    #[tokio::test]
+    async fn a_viewer_joining_after_the_capture_recovers_is_told_nothing() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3423-RECOVERED");
+        let owner = Pipeline::register(key, ObjectId::new());
+        owner.tell_unavailable(&no_display());
+        owner.on_frame();
+        let (pcs, dc, mut heard) = viewer_channel().await;
+        let joiner = sink(ObjectId::new());
+        *joiner.control_dc.lock().await = Some(dc);
+        let _guard = try_join(key, joiner, 60).expect("join");
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            heard.try_recv().is_err(),
+            "a joiner after the capture recovered was told it has no picture"
+        );
         for pc in pcs {
             let _ = pc.close().await;
         }
