@@ -292,7 +292,7 @@ bash scripts/selfhost-coturn-check.sh
 It starts coturn if it is not running, watches it for 30 seconds, then drives the
 image's own TURN client through the published port, with credentials minted the way
 the server mints them. It exits non-zero and names what failed. Each run leaves 9 relay
-ports held for 13 minutes, because the client does not end what it allocates over UDP.
+ports held for up to 13 minutes, because the client does not end what it allocates over UDP.
 
 | It says | What is wrong |
 |---|---|
@@ -441,8 +441,11 @@ be a way into the machines around it. With the shipped flags it answers 403 to a
 | `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | the `--denied-peer-ip` lines |
 | `100.64.0.0/10`, the range overlay meshes use | the `--denied-peer-ip` lines |
 | `169.254.0.0/16`, including the cloud metadata address | coturn 4.18.0 itself |
-| loopback | coturn itself |
+| loopback, `0.0.0.0`, `255.255.255.255` | coturn itself |
 | multicast | `--no-multicast-peers` |
+
+It has no IPv6 relay: a client that asks for one gets 440, so no IPv6 peer is reachable
+through it either.
 
 That includes the other containers on the stack's network and its gateway, which
 reaches every listener on the host. The check tries each of them.

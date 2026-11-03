@@ -76,8 +76,12 @@ trap cleanup EXIT
 echo "== coturn from $(basename "$FILE")"
 # `up -d` below starts a stopped coturn, and says nothing about why it had stopped.
 WAS="$("${DC[@]}" ps -aq coturn 2>/dev/null)"
-if [ -n "$WAS" ] && [ "$(docker inspect -f '{{.State.Status}}' "$WAS")" != running ]; then
-  note "coturn was not running, so this started it. It had stopped with: $(docker inspect -f 'exit {{.State.ExitCode}} {{.State.Error}}' "$WAS")"
+if [ -n "$WAS" ]; then
+  case "$(docker inspect -f '{{.State.Status}}' "$WAS")" in
+    # Restarting is Docker's own doing, and the watch below judges it.
+    running | restarting) ;;
+    *) note "coturn was not running, so this started it. It had stopped with: $(docker inspect -f 'exit {{.State.ExitCode}} {{.State.Error}}' "$WAS")" ;;
+  esac
 fi
 "${DC[@]}" up -d --no-build coturn >"$OUT" 2>&1 || {
   fail "docker compose up"
