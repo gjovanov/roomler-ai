@@ -105,7 +105,7 @@ Two settings decide it:
 | The **announced IP** | The address browsers should send media to. `127.0.0.1` works only for calls made on the host itself. |
 | The **RTC port range** | 32 ports are mapped by default — enough to try it. A real deployment widens it. |
 
-To widen the range, change `40000-40031` in the `netns` service's `ports:` and
+To widen the range, change `40000-40031` in the `roomler` service's `ports:` and
 `ROOMLER__MEDIASOUP__RTC_MAX_PORT` together. Don't give the `roomler` service
 `network_mode: host` with this compose file: the service names stop resolving
 there, so the server can't reach its database and the web port answers 502.

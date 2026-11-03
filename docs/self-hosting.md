@@ -261,7 +261,7 @@ Two settings decide whether it works:
 - `ROOMLER_ANNOUNCED_IP` — the address browsers send to. `127.0.0.1` works only
   for calls made on the host itself.
 - the RTC port range — 32 ports are mapped by default, enough to try it out. To
-  widen it, change `40000-40031` in the `netns` service's `ports:` and
+  widen it, change `40000-40031` in the `roomler` service's `ports:` and
   `ROOMLER__MEDIASOUP__RTC_MAX_PORT` together. Docker runs a proxy process per
   mapped port by default, so map what you need rather than all of 40000–49999.
 
