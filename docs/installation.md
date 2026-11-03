@@ -146,7 +146,11 @@ install refuses it before anything is downloaded (`:290`). Before the enroll it
 also stops on a config it may not read (`:634`, never reported as a damaged
 config) or a folder it may not write (`:640`). The token is never spent on a
 config that cannot be written. A **fresh** install of that role still works
-from a double-click: the folder is not hardened yet.
+from a double-click: the folder is not hardened yet. The folder can outlive the
+service (`install.ps1 -Uninstall` leaves it), so the note says "This device
+already has the background service" only when detection found one, and
+otherwise "An earlier background service left its settings on this device"
+(#3247 item 11, `agents/roomler-setup/src/front/app.js`, `elevationNoteLead`).
 
 **The wizard asks for those rights itself** (FR-129 C3). The note on its first
 page carries a **Restart as administrator** button: the wizard starts its own

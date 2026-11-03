@@ -672,6 +672,9 @@ function renderWelcome() {
   // the enroll has spent the token.
   const needsElevation = needsElevatedWizard(state.role);
   document.getElementById("elevation-note").hidden = !needsElevation;
+  // #3247 item 11 — the folder outlives the service (`install.ps1 -Uninstall`
+  // leaves it hardened), so its first sentence follows what detection found.
+  document.getElementById("elevation-note-lead").textContent = elevationNoteLead(a.kind);
   // FR-129 C3 — the note's own way out: the button sits inside the note, so
   // it shows exactly when the note does; its line says how the last try went.
   document.getElementById("elevation-relaunch").disabled = state.relaunchBusy;
@@ -698,6 +701,15 @@ function renderWelcome() {
 // reinstall finds. A fresh install still works from a double-click.
 function needsElevatedWizard(role) {
   return role === "daemon-system" && state.systemContextNeedsElevation === true;
+}
+
+// #3247 item 11 — the elevation note's first sentence. The note shows because
+// the folder refuses this wizard, and the folder can outlive the service, so
+// "already has the background service" is said only when detection found one.
+function elevationNoteLead(kind) {
+  return kind === "permachine" || kind === "ambiguous"
+    ? "This device already has the background service, and its settings are in a folder only administrators may open."
+    : "An earlier background service left its settings on this device, in a folder only administrators may open.";
 }
 
 // FR-129 C1 — may `role` be preselected on this page? A role the SPA knows,
