@@ -40,6 +40,7 @@ on:
     branches: [master]
     paths:
       - 'agents/roomlerd/**'
+      - 'agents/roomlerdw/**'
       - '.github/workflows/installer-smoke.yml'
       - 'scripts/macos-productbuild-gated.sh'
   # Also on PRs — but only those touching the INSTALLER surface, not the whole
@@ -62,6 +63,10 @@ on:
     paths:
       - 'agents/roomlerd/wix/**'
       - 'agents/roomlerd/wix-perMachine/**'
+      # #3292 — what the per-user MSI's task, custom actions and shortcut run,
+      # and what the registration writes.
+      - 'agents/roomlerdw/**'
+      - 'agents/roomlerd/src/service.rs'
       - 'agents/roomlerd/packaging/windows/**'
       # The macOS packaging was missing here, so the postinstall — the script
       # that decides whether the root daemon lives or is DELETED — could change
@@ -182,6 +187,12 @@ jobs:
           }
           $kb = [math]::Round((Get-Item target\release\roomler-shim.exe).Length/1KB, 0)
           Write-Host "Staged roomler-shim.exe ($kb KB, installs as roomler.exe) for the TunnelExe component"
+          # #3292: the windowless launcher the per-user Scheduled Task runs.
+          cargo build -p roomlerdw --release
+          if (-not (Test-Path target\release\roomlerdw.exe)) {
+            Write-Host "::error::roomlerdw.exe not produced — LauncherExe harvest would fail (LGHT0103)"
+            exit 1
+          }
 
       # Mirrors release-agent.yml's payload-signing placement exactly: after
       # the binaries are built, BEFORE the third-party DLLs (wintun, VC-CRT)
@@ -198,6 +209,7 @@ jobs:
           files: |
             target\release\roomlerd.exe
             target\release\roomler-shim.exe
+            target\release\roomlerdw.exe
           mode:               local
           require:            'true'
           # The action imports the self-signed cert into the runner's Root +
@@ -275,6 +287,43 @@ jobs:
           if (-not $msi) { throw 'MSI not produced by cargo-wix' }
           'MSI_PATH=' + $msi.FullName | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "MSI ready: $($msi.FullName) ($([math]::Round($msi.Length / 1MB, 2)) MiB)"
+
+      # #3292: a rollback plays the script backwards, so a failed upgrade restores
+      # the task and the daemon only from ahead of RemoveExistingProducts, once the
+      # old files are back, and the task must come back before the start. Anything
+      # spooled ahead of that action fails every upgrade with Error 2613, so an
+      # InstallExecute has to flush them right before it. WiX orders actions that share
+      # a parent by itself, so this reads what it built.
+      - name: "Assert the rollback actions' order in the built MSI (#3292)"
+        shell: pwsh
+        run: |
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($env:MSI_PATH, 0))
+          function Get-Seq([string]$action) {
+            $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @("SELECT Sequence FROM InstallExecuteSequence WHERE Action='$action'"))
+            [void]$view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+            $row = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+            if ($null -eq $row) { throw "$action is not in InstallExecuteSequence" }
+            [int]$row.GetType().InvokeMember('IntegerData', 'GetProperty', $null, $row, ([object[]]@([int32]1)))
+          }
+          $seq = @('InstallInitialize', 'DaemonBackOnRollback', 'AutostartBackOnRollback', 'InstallExecute', 'RemoveExistingProducts', 'InstallFiles') | ForEach-Object { Get-Seq $_ }
+          Write-Host "InstallInitialize, DaemonBackOnRollback, AutostartBackOnRollback, InstallExecute, RemoveExistingProducts, InstallFiles: $($seq -join ', ')"
+          for ($i = 1; $i -lt $seq.Count; $i++) {
+            if ($seq[$i - 1] -ge $seq[$i]) { throw "out of order: $($seq -join ', ')" }
+          }
+          # Immediately ahead: anything between InstallExecute and the removal is spooled
+          # ahead of it again.
+          $between = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @("SELECT Action FROM InstallExecuteSequence WHERE Sequence > $($seq[3]) AND Sequence < $($seq[4])"))
+          [void]$between.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $between, $null)
+          if ($null -ne $between.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $between, $null)) { throw 'an action sits between InstallExecute and RemoveExistingProducts' }
+          # A rollback leaves a registration the next release cannot remove, and only
+          # this attribute lets that release go on (docs/installation.md).
+          $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @("SELECT Attributes FROM Upgrade WHERE ActionProperty='WIX_UPGRADE_DETECTED'"))
+          [void]$view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+          $row = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+          $attributes = [int]$row.GetType().InvokeMember('IntegerData', 'GetProperty', $null, $row, ([object[]]@([int32]1)))
+          Write-Host "Upgrade.Attributes: $attributes"
+          if (($attributes -band 4) -eq 0) { throw 'msidbUpgradeAttributesIgnoreRemoveFailure is not set' }
 
       - name: Install the MSI (quiet, per-User)
         shell: pwsh
@@ -410,7 +459,7 @@ jobs:
           $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
           # msvcp140/vcruntime140* lock the app-local VcRedistCrt component
           # (fresh machines without the VC++ redist -- 2026-07-28 fix).
-          $mustExist = @('roomlerd.exe', 'roomler.exe', 'wintun.dll',
+          $mustExist = @('roomlerd.exe', 'roomler.exe', 'roomlerdw.exe', 'wintun.dll',
                          'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
           $missing = @()
           foreach ($f in $mustExist) {
@@ -477,7 +526,7 @@ jobs:
             param([switch]$Quiet)
             $found    = @()
             $appLocal = @()
-            foreach ($exe in @('roomlerd.exe', 'roomler.exe')) {
+            foreach ($exe in @('roomlerd.exe', 'roomler.exe', 'roomlerdw.exe')) {
               $path = Join-Path $installDir $exe
               if (-not (Test-Path $path)) { $found += "$exe missing"; continue }
               $imports = & $dumpbin /dependents $path |
@@ -539,6 +588,41 @@ jobs:
             Move-Item $stash $victim
           }
 
+      # #3292 — Restart Manager stops nothing once the daemon runs through the
+      # windowless launcher, so the MSI's StopDaemon custom action is what ends
+      # it. Without that action `msiexec /x` still exits 0, and the daemon runs on
+      # with its files gone. The launcher is started by hand here, so no task
+      # instance exists for the action's `schtasks /End` fallback to reach: only
+      # the daemon's stop event can pass the assert below.
+      - name: "Start a daemon for the uninstall to stop (#3292)"
+        shell: pwsh
+        run: |
+          $cfgDir = Join-Path $env:APPDATA 'roomler\roomler\config'
+          New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+          # Nothing answers on this port, so the daemon retries and stays up.
+          @(
+            'server_url = "http://127.0.0.1:9"',
+            'agent_token = "smoke"',
+            'agent_id = "000000000000000000000000"',
+            'tenant_id = "000000000000000000000000"',
+            'machine_id = "smoke"',
+            'machine_name = "smoke"'
+          ) | Set-Content -Encoding ascii -Path (Join-Path $cfgDir 'config.toml')
+          $env:ROOMLERD_AUTO_UPDATE = '0'
+          $launcher = Join-Path $env:LOCALAPPDATA 'Programs\Roomler\roomlerdw.exe'
+          Start-Process -FilePath $launcher -ArgumentList 'run', '--supervisor', 'task'
+          # Long enough to reach the wait on its stop event; a start on a slow
+          # guest had its row online in under 20 s. An action that runs before
+          # that finds no event, so a shorter sleep here reads as a false failure.
+          Start-Sleep -Seconds 45
+          $up = Get-Process roomlerd -ErrorAction SilentlyContinue
+          if (-not $up) {
+            Get-ChildItem (Join-Path $env:LOCALAPPDATA 'roomler\roomler\data\logs') -Filter 'roomlerd.log*' -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime | Select-Object -Last 1 | ForEach-Object { Get-Content -LiteralPath $_.FullName -Tail 40 }
+            throw 'the daemon did not stay up on a config with no server, so this lane proves nothing'
+          }
+          Write-Host "Daemon up under the launcher: pid $($up.Id)"
+
       - name: Uninstall the MSI (quiet)
         shell: pwsh
         run: |
@@ -553,6 +637,29 @@ jobs:
             throw "msiexec /x failed with exit $($proc.ExitCode)"
           }
           Write-Host 'Uninstall succeeded (exit 0)'
+
+      - name: "Assert the uninstall stopped the daemon (#3292)"
+        shell: pwsh
+        run: |
+          $left = Get-Process roomlerd, roomlerdw -ErrorAction SilentlyContinue
+          if ($left) {
+            $left | ForEach-Object { Write-Host "still running: $($_.Name) pid $($_.Id)" }
+            $left | Stop-Process -Force
+            throw 'msiexec /x exited 0 and the daemon runs on: is StopDaemon still in the MSI, before UnregisterAutostart?'
+          }
+          $logFile = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'roomler\roomler\data\logs') -Filter 'roomlerd.log*' |
+            Sort-Object LastWriteTime | Select-Object -Last 1
+          # A daemon that died by itself between the two steps must not pass.
+          $asked = Select-String -LiteralPath $logFile.FullName -SimpleMatch 'asked this per-user daemon to stop'
+          if (-not $asked) {
+            Get-Content -LiteralPath $logFile.FullName -Tail 40
+            throw 'the daemon is gone, and its log does not say it was asked to stop'
+          }
+          Write-Host 'The uninstall asked the daemon to stop, and it left'
+          # The later steps start from a host with no config.
+          foreach ($root in $env:APPDATA, $env:LOCALAPPDATA) {
+            Remove-Item -Recurse -Force (Join-Path $root 'roomler') -ErrorAction SilentlyContinue
+          }
 
       - name: Assert cleanup — registry + install dir gone
         shell: pwsh
@@ -589,7 +696,7 @@ jobs:
           # must have been removed (Environment Part='last' +
           # implicit Permanent='no').
           $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
-          foreach ($f in @('roomlerd.exe', 'roomler-agent.exe', 'roomler.exe', 'wintun.dll', 'msvcp140.dll', 'vcruntime140_1.dll')) {
+          foreach ($f in @('roomlerd.exe', 'roomlerdw.exe', 'roomler-agent.exe', 'roomler.exe', 'wintun.dll', 'msvcp140.dll', 'vcruntime140_1.dll')) {
             $p = Join-Path $installDir $f
             if (Test-Path $p) {
               throw "$f still at $p after uninstall — MSI uninstaller is broken"
@@ -1024,7 +1131,7 @@ jobs:
           Invoke-Msi '/i' $pu (Join-Path $logDir 'fr133-branch-peruser.log') ''
           $null = Assert-Entries 'per-User upgraded to this branch' @($new.pu) $nextMsi
           # The Start-menu entry follows the name, and the old one leaves with
-          # the old product (MajorUpgrade runs afterInstallInitialize).
+          # the old product, whose removal runs ahead of this product's files.
           $menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Roomler'
           if (-not (Test-Path -LiteralPath (Join-Path $menu "$($new.pu).lnk"))) { throw "no $($new.pu).lnk in $menu after the upgrade" }
           if (Test-Path -LiteralPath (Join-Path $menu "$($old.pu).lnk")) { throw "the pre-P1 shortcut survived the upgrade in $menu" }
