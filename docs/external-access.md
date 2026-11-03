@@ -202,7 +202,7 @@ ends the session, because the first may have raced one.
 
 **Gates 1 and 2 can cross a session the same way**, and nothing else reads them once it
 exists. So `session_opened` reads both again, from fresh rows, ahead of everything else
-it does (`org_gates_open`, `extauth.rs:1434`). A gate closed before that read ends the
+it does (`org_gates_open`, `extauth.rs:1443`). A gate closed before that read ends the
 session there, and one closed after it finds the session in the Hub. A read that fails
 leaves the session running, as a failed `note_session` does. `set_enabled` and
 `set_policy` end sessions on a repeat too, for a bar's reason.
@@ -252,7 +252,7 @@ bar them and change the password on the device. For guessing, rotate the connect
 | The gates, the login relay, the session step | `crates/modules/remote/src/extauth.rs`: `gates` `:396`, `start` `:593`, `finish` `:775`, `open_session` `:1082` |
 | What follows a session | `session_opened`, `extauth.rs:1390` |
 | The notices | `crates/modules/remote/src/extauth_notice.rs` |
-| Gates 1 and 2, the code, the log, the people | `crates/modules/fleet/src/external_access.rs`: `decide_revocation` `:138`, `set_enabled` `:443`, `set_policy` `:496`, `audit` `:734`, `principals` `:769`, `set_principal` `:835` |
+| Gates 1 and 2, the code, the log, the people | `crates/modules/fleet/src/external_access.rs`: `decide_revocation` `:138`, `set_enabled` `:443`, `set_policy` `:496`, `audit` `:743`, `principals` `:778`, `set_principal` `:844` |
 | Ending external sessions | `crates/modules/fleet/src/hub.rs`: a person's `:2552`, a device's `:2565`, an org's `:2571`. From another pod, `ctrl.rs`: `:128`, `:148`, `:162` |
 | The two collections | `crates/remote_control/src/models.rs:4546`, `:4621`; indexes `crates/modules/fleet/src/lib.rs:776`, `:789` |
 | The device's half | `agents/roomlerd/src/extauth.rs`, `agents/roomlerd/src/external_logins.rs` |
