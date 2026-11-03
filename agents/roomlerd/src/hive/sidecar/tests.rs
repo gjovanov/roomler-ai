@@ -932,6 +932,291 @@ async fn the_device_key_is_fetched_once_and_again_after_the_provider_refuses_it(
     r.sup.stop(sid, 1, "owner".into());
 }
 
+/// #3362 — how long one run of the slow key helpers below takes.
+const RUN: Duration = Duration::from_secs(2);
+
+/// #3362 — a rig whose sessions reach `provider` through the sidecar, with
+/// `helper` as the device's key helper, on a device whose owner turned
+/// workers on where `worker` says so.
+fn helper_rig(provider: &Provider, helper: String, worker: bool) -> Rig {
+    let upstream = provider.url.clone();
+    let r = rig_with(
+        true,
+        4,
+        move |cfg| {
+            cfg.api_key_helper = Some(helper);
+            cfg.worker = worker;
+        },
+        move |sup| sup.with_sidecar(upstream, OFFLINE_GRACE),
+    );
+    std::fs::write(r.root.path().join("claude"), ENV_HARNESS).unwrap();
+    r
+}
+
+/// How many lines the helper has written to `file`: one a run, where it
+/// writes there.
+fn lines_in(file: &std::path::Path) -> usize {
+    std::fs::read_to_string(file)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+/// Until the helper has written `n` lines to `file`.
+async fn until_lines(file: &std::path::Path, n: usize) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while lines_in(file) < n {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{n} lines in {}, not {}",
+            file.display(),
+            lines_in(file)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// #3362 — a helper that counts its runs in `runs`, takes [`RUN`], then
+/// marks its end in `done` and prints the device's key.
+fn slow_helper(runs: &std::path::Path, done: &std::path::Path) -> String {
+    format!(
+        "echo run >> '{}'; sleep {}; echo done >> '{}'; printf '{DEVICE_KEY}\\n'",
+        runs.display(),
+        RUN.as_secs(),
+        done.display()
+    )
+}
+
+/// #3362 — five calls at once, with no key kept, behind a helper that fails
+/// after [`RUN`]: one run of the helper answers all five, each with that
+/// run's failure, so none waits behind a second run. On master each call ran
+/// the helper in turn under the key's lock, and the fifth was answered after
+/// five runs. No failure is kept: a call after it runs the helper again.
+#[tokio::test]
+async fn five_calls_behind_a_helper_that_fails_share_one_run_of_it() {
+    five_calls_share_one_run(false).await;
+}
+
+/// #3362 — [`five_calls_behind_a_helper_that_fails_share_one_run_of_it`],
+/// each call asked of the daemon by the session's worker
+/// (`Call::SidecarAdmit`), and the worker untouched.
+#[cfg(worker_calls)]
+#[tokio::test]
+async fn five_calls_in_a_worker_behind_a_helper_that_fails_share_one_run_of_it() {
+    five_calls_share_one_run(true).await;
+}
+
+async fn five_calls_share_one_run(worker: bool) {
+    let p = provider().await;
+    let dir = tempfile::tempdir().unwrap();
+    let count = dir.path().join("helper-runs");
+    let helper = format!(
+        "echo run >> '{}'; sleep {}; exit 1",
+        count.display(),
+        RUN.as_secs()
+    );
+    let mut r = helper_rig(&p, helper, worker);
+    let o = order(&r);
+    #[cfg(worker_calls)]
+    if worker {
+        crate::hive::worker::in_process_when_live(o.session_id);
+    }
+    let (sid, base, token) = started_with(&mut r, o).await;
+    let url = format!("{base}/v1/messages");
+
+    // One client, so the five go out together.
+    let client = reqwest::Client::new();
+    let start = tokio::time::Instant::now();
+    let calls: Vec<_> = (0..5)
+        .map(|_| {
+            let (client, url, token) = (client.clone(), url.clone(), token.clone());
+            tokio::spawn(async move {
+                let resp = client
+                    .post(&url)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("x-api-key", &token)
+                    .body(r#"{"model":"m","messages":[]}"#)
+                    .send()
+                    .await
+                    .expect("the sidecar is reachable");
+                let at = start.elapsed();
+                let status = resp.status().as_u16();
+                let v: serde_json::Value = resp.json().await.expect("a refusal's body");
+                let message = v["error"]["message"].as_str().unwrap_or("").to_string();
+                (at, status, message)
+            })
+        })
+        .collect();
+    let mut answered = Vec::new();
+    for c in calls {
+        answered.push(
+            tokio::time::timeout(5 * RUN + WAIT, c)
+                .await
+                .expect("every call answered")
+                .unwrap(),
+        );
+    }
+    let ats: Vec<Duration> = answered.iter().map(|(at, ..)| *at).collect();
+    for (_, status, message) in &answered {
+        assert_eq!(*status, 503, "{answered:?}");
+        assert!(
+            message.contains("hive_api_key_helper failed"),
+            "the run's failure: {answered:?}"
+        );
+    }
+    assert_eq!(
+        lines_in(&count),
+        1,
+        "one run of the helper for five calls at once, answered at {ats:?}"
+    );
+    let (first, last) = (ats.iter().min().unwrap(), ats.iter().max().unwrap());
+    assert!(
+        *last - *first < RUN / 2,
+        "answered together, by the one run: {ats:?}"
+    );
+
+    // No failure is kept: the next call runs the helper again.
+    assert_eq!(call(&url, Some(&token)).await.status().as_u16(), 503);
+    assert_eq!(
+        lines_in(&count),
+        2,
+        "a call after the failure runs it again"
+    );
+    #[cfg(worker_calls)]
+    if worker {
+        use crate::hive::worker::seen;
+        assert!(
+            seen(sid, 1).is_some_and(|s| s.up && s.starts == 1),
+            "one worker, up all along: {:?}",
+            seen(sid, 1)
+        );
+    }
+    r.sup.stop(sid, 1, "owner".into());
+}
+
+/// #3362 — a call that gives up takes nothing from the calls waiting with
+/// it, the call whose arrival started the run included: the other two get
+/// that run's key, and the helper ran once, to its end. On master the first
+/// call held the key's lock and ran the helper itself, so giving up killed
+/// the helper's shell mid-run, and the next call ran the helper again.
+#[tokio::test]
+async fn a_call_that_gives_up_leaves_its_run_to_the_calls_waiting_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (count, done) = (dir.path().join("runs"), dir.path().join("done"));
+    let r = helper_rig(&provider().await, slow_helper(&count, &done), false);
+    let first = {
+        let sup = Arc::clone(&r.sup);
+        tokio::spawn(async move { sup.model_key().await })
+    };
+    until_lines(&count, 1).await;
+    let others: Vec<_> = (0..2)
+        .map(|_| {
+            let sup = Arc::clone(&r.sup);
+            tokio::spawn(async move { sup.model_key().await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    first.abort();
+    for other in others {
+        let key = tokio::time::timeout(2 * RUN + WAIT, other)
+            .await
+            .expect("answered")
+            .unwrap();
+        assert_eq!(key.as_deref(), Ok(DEVICE_KEY));
+    }
+    assert_eq!(
+        (lines_in(&count), lines_in(&done)),
+        (1, 1),
+        "one run of the helper, to its end"
+    );
+}
+
+/// #3362 — a run nobody waits on any more is not cut short: its only call
+/// gives up a moment in, and the run still ends as it would have, keeps the
+/// key it fetched, and leaves nothing in flight, so a later call gets that
+/// key at once. On master giving up killed the helper's shell mid-run:
+/// nothing was kept, and the next call ran the helper again.
+#[tokio::test]
+async fn a_run_nobody_waits_on_any_more_ends_and_keeps_its_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (count, done) = (dir.path().join("runs"), dir.path().join("done"));
+    let r = helper_rig(&provider().await, slow_helper(&count, &done), false);
+    let only = {
+        let sup = Arc::clone(&r.sup);
+        tokio::spawn(async move { sup.model_key().await })
+    };
+    until_lines(&count, 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    only.abort();
+    let deadline = tokio::time::Instant::now() + RUN + WAIT;
+    while lines_in(&done) < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the run was cut short when its only call gave up"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // What the run kept is in place as its helper ends: give it a moment.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let asked = tokio::time::Instant::now();
+    let key = tokio::time::timeout(RUN + WAIT, r.sup.model_key())
+        .await
+        .expect("answered");
+    assert_eq!(key.as_deref(), Ok(DEVICE_KEY));
+    assert!(
+        asked.elapsed() < RUN / 2,
+        "at once, from what the run kept: {:?}",
+        asked.elapsed()
+    );
+    assert_eq!(lines_in(&count), 1, "the helper ran once");
+}
+
+/// #3362 — the provider refuses the key while a run is in flight (its 401):
+/// the forget is done at once, a call after it waits on that run rather than
+/// start a second one, and the run keeps nothing, since it began before the
+/// refusal, so the next call runs the helper again. On master the forget
+/// waited on the key's lock behind the run, and the 401's answer with it.
+#[tokio::test]
+async fn a_forget_while_a_run_is_in_flight_is_done_at_once_and_that_run_keeps_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (count, done) = (dir.path().join("runs"), dir.path().join("done"));
+    let r = helper_rig(&provider().await, slow_helper(&count, &done), false);
+    let first = {
+        let sup = Arc::clone(&r.sup);
+        tokio::spawn(async move { sup.model_key().await })
+    };
+    until_lines(&count, 1).await;
+    tokio::time::timeout(RUN / 4, r.sup.forget_model_key())
+        .await
+        .expect("a forget does not wait on the run in flight");
+    let second = {
+        let sup = Arc::clone(&r.sup);
+        tokio::spawn(async move { sup.model_key().await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        lines_in(&count),
+        1,
+        "a call after the forget waits on the run in flight"
+    );
+    for asked in [first, second] {
+        let key = tokio::time::timeout(RUN + WAIT, asked)
+            .await
+            .expect("answered by the run")
+            .unwrap();
+        assert_eq!(key.as_deref(), Ok(DEVICE_KEY));
+    }
+    assert_eq!(lines_in(&count), 1);
+    let key = tokio::time::timeout(RUN + WAIT, r.sup.model_key())
+        .await
+        .expect("answered");
+    assert_eq!(key.as_deref(), Ok(DEVICE_KEY));
+    assert_eq!(
+        lines_in(&count),
+        2,
+        "the run began before the refusal: it kept nothing"
+    );
+}
+
 #[tokio::test]
 async fn a_session_token_opens_inference_and_token_counting_and_nothing_else() {
     let p = provider().await;
