@@ -1538,19 +1538,24 @@ flowchart LR
 ### The clock on macOS and Windows (FR-112 P3)
 
 Linux's clamp has no counterpart elsewhere, so each OS has a request of its own. Both are measured, and each default
-follows its numbers (`DEFAULT_ON`, `encode/clock.rs:56`): Windows asks and macOS does not, the operator's decision on
-these numbers ([#2430](https://github.com/gjovanov/roomler-ai/issues/2430)). **On a hybrid Windows laptop the request
-doubles H.264's speed, for 9–35 % more energy a frame. On a desktop it helps a little. On a Mac it changes nothing.**
-`ROOMLERD_ENCODER_CLOCK=0` never asks.
+follows its numbers (`DEFAULT_ON`, `encode/clock.rs:56`), the operator's decision on them
+([#2430](https://github.com/gjovanov/roomler-ai/issues/2430)): on Windows a software encoder's thread asks, and on
+macOS nothing does. **On a hybrid Windows laptop the request doubles H.264's speed, for 9–35 % more energy a frame. On a
+desktop it helps a little. On a Mac it changes nothing.** A hardware encoder's thread stays out on both
+(`HARDWARE_DEFAULT_ON`, `encode/clock.rs:63`): [its numbers](#windows-a-hardware-encoders-thread-stays-out) don't earn
+it. `ROOMLERD_ENCODER_CLOCK=0` never asks, and `=1` asks on every thread that can.
 
 ```mermaid
 flowchart LR
     T["a thread that encodes<br/>or captures starts"] --> S{"ROOMLERD_ENCODER_CLOCK"}
     S -->|"0"| N["asks for nothing"]
     S -->|"1"| A["asks the OS"]
-    S -->|"unset"| D{"DEFAULT_ON:<br/>did this OS gain?"}
-    D -->|"Linux, Windows"| A
+    S -->|"unset"| D{"did this OS gain?"}
+    D -->|"Linux"| A
     D -->|"macOS"| N
+    D -->|"Windows"| E{"what encodes<br/>on this thread?"}
+    E -->|"a software encoder"| A
+    E -->|"a hardware encoder"| N
     A --> L["Linux: uclamp_min 1024"]
     A --> M["macOS: QOS_CLASS_USER_INTERACTIVE"]
     A --> W["Windows: out of power throttling"]
@@ -1559,9 +1564,9 @@ flowchart LR
 | | Linux | macOS | Windows |
 |---|---|---|---|
 | The request | `uclamp_min` 1024 | the QoS class `QOS_CLASS_USER_INTERACTIVE`, `pthread_set_qos_class_self_np` (`encode/clock.rs:218`) | Microsoft's "HighQoS": `SetThreadInformation(ThreadPowerThrottling)`, `ControlMask` execution speed, `StateMask` 0 (`encode/clock.rs:276`) |
-| Who asks | the encoder thread, OpenH264's worker, the DRM capture worker | the encoder thread, OpenH264's worker, the capture worker (`capture/scrap_backend.rs:154`) | the encoder thread, OpenH264's worker; **not** Media Foundation's worker (`encode/mf/mod.rs:199`) |
+| Who asks | the encoder thread, OpenH264's worker, the DRM capture worker | the encoder thread, OpenH264's worker, the capture worker (`capture/scrap_backend.rs:154`) | a software encoder's thread (libvpx's encoder thread, OpenH264's worker); **not** a hardware encoder's thread, unless `=1`; **never** Media Foundation's worker (`encode/mf/mod.rs:199`) |
 | Threads it starts | inherit it | **do not** | **do not** |
-| `ROOMLERD_ENCODER_CLOCK` unset | asks | does not ask | asks |
+| `ROOMLERD_ENCODER_CLOCK` unset | asks | does not ask | a software encoder's thread asks, a hardware encoder's does not |
 | The bench's `clock=` | `clamped` | `qos-user-interactive` | `unthrottled` |
 | A refusal | no `CONFIG_UCLAMP_TASK`, or a cgroup limit | `EPERM`, only for a thread that left the QoS system through `pthread_setschedparam`, which the daemon never calls | logged with its `GetLastError` |
 
@@ -1661,19 +1666,60 @@ kind of core, at about half the clock, so this is Linux's trap and not Windows'.
 
 Here the trap costs about 3 ms of latency and no frames: every 1080p row fits its period.
 
+#### Windows: a hardware encoder's thread stays out
+
+A default reaches every thread that asks, so the hardware encoders were measured before Windows' default moved: 0.4.197's
+`encoder-smoke --encoder hardware --bench`, `=0` against `=1`, one process per row, 10 s arms at 1920×1080, on the same two
+hosts. **Those hosts reach QSV only. NVENC, AMF, D3D12 and Vulkan are unmeasured.** The rule was set before the first
+run: a hardware cell whose p50 or p95 rises, on a sign test at p ≤ 0.08, by at least 5 %, and by more than half the
+rounds' own spread, keeps the default off every hardware encoder's thread.
+
+| Host, what opened | 30 fps cadence, ms p50 · p95, `=0` → `=1` | 60 fps cadence |
+|---|---|---|
+| Laptop, `h264_qsv` | 10.54 · 11.13 → **10.02 · 10.55** | 10.48 · 11.05 → **9.52 · 10.11** |
+| Laptop, `hevc_qsv` | 10.88 · 11.76 → **10.25 · 11.04** | 10.79 · 11.43 → **9.82 · 10.52** |
+| Laptop, `av1_qsv` | 10.22 · 11.10 → **9.56 · 10.41** | 10.13 · 10.75 → **9.15 · 9.86** |
+| Laptop, `vp9_qsv` | 22.88 · 26.30 → 22.32 · 25.98 | 22.87 · 25.18 → 22.32 · 24.77 |
+| Laptop, `mf-h264` software, the control | 11.33 · 11.84 → 11.29 · 11.78 | 11.27 · 11.76 → 11.21 · 11.73 |
+| Desktop, `h264_qsv` | 5.90 · 7.98 → 6.03 · 8.08 | 5.63 · 7.25 → 5.68 · 7.41 |
+| Desktop, `hevc_qsv` | 5.70 · 6.70 → 5.83 · **7.31** | 5.46 · 6.48 → 5.50 · **7.11** |
+| Desktop, `vp9_qsv` | 8.96 · 10.16 → 9.12 · 10.48 | 8.79 · 9.88 → 8.87 · 10.23 |
+| Desktop, `mf-h264` software, the control | 5.21 · 7.13 → 5.28 · **10.73** | 5.19 · 6.19 → 5.38 · 7.22 |
+
+- **`hevc_qsv`'s p95 rose 9–10 % on the desktop**, in all 12 pairs, against 1–3 % between rounds. That trips the rule, so
+  a hardware encoder's thread keeps its old default (`EncoderOps::HARDWARE`, `encode/thread.rs:103`). `=1` still asks,
+  which is how another backend gets its own read.
+- **What that gives up is small.** A frame's work is on the GPU, so the laptop's `h264_qsv`, `hevc_qsv` and `av1_qsv` gain
+  5–10 %, about 1 ms, and `vp9_qsv` 2 %. A software encoder doubled on the same host.
+- ⚠️ **The control moved too, and the cause wasn't found.** `rtp:h264` opens Microsoft's software MFT on both hosts, and
+  Media Foundation's worker never asks, so the request can't reach that encoder. Its p95 still rises in all 6 rounds on
+  the desktop at 30 fps. So the rise isn't the encoder's own work, and arm order doesn't explain it. A session's hardware
+  encoder thread hands frames off the same way the bench's does, so the control doesn't excuse `hevc_qsv`.
+- ⚠️ **Media Foundation's worker looks caught by the trap above, and nothing asks for it.** On the laptop the software
+  MFT took 5.24 ms p50 over a process's first 30 frames and 11.3 ms over a 10 s arm, at either setting of the switch. The
+  desktop reads 5.6 and 5.2 ms. The first figure is one short run, so this is a lead and not a measurement.
+- ⚠️ **Frames a second and watts don't speak for the encoder here.** The bench renders its scene on the asking thread, so
+  `=1` speeds up the harness on every row: the laptop's control goes from 30.8 to 47.4 frames a second at a 60 target with
+  its encode time flat. Set against that control, round by round, the laptop's hardware cells show no consistent change
+  in energy a frame (0.82–1.12 times the control's ratio, five pairs each), and the desktop's rise 5–7 % at 30 fps and
+  1 % at 60.
+
 #### What the numbers recommend
 
 | | Windows | macOS |
 |---|---|---|
-| `ROOMLERD_ENCODER_CLOCK` | **on**: twice the encoder on a hybrid laptop, almost free on a desktop | **off**: it changes nothing |
+| `ROOMLERD_ENCODER_CLOCK`, a software encoder | **on**: twice the encoder on a hybrid laptop, almost free on a desktop | **off**: it changes nothing |
+| `ROOMLERD_ENCODER_CLOCK`, a hardware encoder | **off**: 5–10 % on a laptop's QSV, `hevc_qsv`'s p95 up 9–10 % on a desktop, every other backend unmeasured | **off** |
 | `ROOMLERD_SW_FPS_60` | off until a live read; the laptop reaches 60 at 1080p only with the request | off until a live read |
 | 60 fps against 30, package watts | 1.5–2× | 2.7–3×, because the clock rises with the rate (H.264: 38 % → 46 % of a core, but 1.78× the cycles) |
 
-The operator took all three on 2026-11-02. They are the bench's numbers on one host of each kind, and a live session
-can still move them: `ROOMLERD_ENCODER_CLOCK=0` gives back the old behaviour without a release.
+The operator took these on 2026-11-02, leaving the hardware row to the arm above. They are the bench's numbers on one
+host of each kind, and a live session can still move them: `ROOMLERD_ENCODER_CLOCK=0` gives back the old behaviour
+without a release.
 
 - **What is owed:** a live session on the laptop, which is also the proof that a session's encoder thread drops the
-  way a bench process does; a laptop on battery; and other machines. Every run is in
+  way a bench process does; a laptop on battery; other machines; every hardware backend but QSV; and Media Foundation's
+  worker, which would need an A/B on a build where it asks, and no release has one. Every run is in
   [FR-112 §9](fr/FR-112-software-encoding-at-60-fps.md#9-field-verification-log).
 
 ### OpenH264's runtime settings (FR-112 P2b)
