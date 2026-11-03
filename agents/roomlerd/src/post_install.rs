@@ -1443,16 +1443,18 @@ impl InstallStatus {
 /// msiexec, so the verdict lands AFTER this process began and a one-time
 /// snapshot would show `InProgress` for the daemon's whole life.
 ///
-/// ⚠️ Resolves the SAME `<log_dir>` the watcher wrote to only when this
-/// process runs in the role that spawned it. On a Windows SystemContext host
-/// that is the console-session worker (it runs the updater, the LocalAPI and
-/// the signaling loop), not the SCM host, whose log dir is `service-logs`.
-/// Field 2026-10-26 on the dev box: the 0.4.172 record sits under the console
-/// user's `%LOCALAPPDATA%`, where the worker's watcher wrote it; the SYSTEM
-/// profile's copy dates from July. A reader in the wrong role answers
-/// `Absent` honestly, and `path` says where it looked.
+/// ⚠️ A SystemContext worker logs to `service-logs`, and the watcher it spawns
+/// writes into SYSTEM's profile, so the reader looks in both
+/// ([`outcome_paths`], #3302) and `path` names the file the record came from,
+/// or, with none, the first place it looked.
 pub fn last_install_status() -> LastInstallStatus {
-    summarize(read_outcome(), outcome_path().as_deref())
+    let paths = outcome_paths();
+    let path = newest_record_path(&paths).or_else(|| paths.first().cloned());
+    let read = match &path {
+        Some(p) if p.exists() => read_outcome_at(p).map(Some),
+        _ => Ok(None),
+    };
+    summarize(read, path.as_deref())
 }
 
 /// Pure half of [`last_install_status`]: one word from what the read
