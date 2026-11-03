@@ -529,7 +529,7 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:47`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:6891`). A changed brief (a login, a
+heartbeat only read that cache (`signaling.rs:6982`). A changed brief (a login, a
 logout, the greeter) re-announces the caps on the next heartbeat (`:2155`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
@@ -2077,7 +2077,7 @@ knob half is a SHA-256 over **every** `ROOMLERD_*` variable the daemon can see
 is in [`encoders.md`](encoders.md#the-probe-lifecycle)). So a capture flag
 that has nothing to do with encoding still changes the key, the single-entry
 cache misses (`a ROOMLERD_* knob changed`), and the next start runs the full
-probe in a child process bounded at 60 s per phase (`encode/caps.rs:269`).
+probe in a child process bounded at 60 s per phase (`encode/caps.rs:334`).
 Restoring the old knob set afterwards is a **second** miss, because the cache
 now holds the new key.
 
