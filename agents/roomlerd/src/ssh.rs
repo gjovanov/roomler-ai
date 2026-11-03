@@ -3204,7 +3204,15 @@ mod tests {
     async fn serve_one_with(
         cfg: &crate::config::AgentConfig,
     ) -> (std::net::SocketAddr, crate::consent::ConsentBroker) {
-        let services = test_services();
+        serve_one_asking(cfg, crate::companion::Companion::Fixed(false)).await
+    }
+
+    /// [`serve_one_with`], asking through `companion`.
+    async fn serve_one_asking(
+        cfg: &crate::config::AgentConfig,
+        companion: crate::companion::Companion,
+    ) -> (std::net::SocketAddr, crate::consent::ConsentBroker) {
+        let services = test_services_with(companion);
         let broker = broker_of(&services);
         let ctx = super::sshd::Ctx::build(cfg, services).expect("a usable host key");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4204,6 +4212,86 @@ mod tests {
 
     // ── Operator consent ──────────────────────────────────────────────────
 
+    /// The questions standing at the device, by the id each is shown and
+    /// answered under: the `.pending` markers the companion and `roomlerd
+    /// consent --list` read.
+    fn questions_up(broker: &crate::consent::ConsentBroker) -> Vec<String> {
+        let mut ids: Vec<String> = std::fs::read_dir(broker.sentinel_dir())
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".pending"))
+                    .map(str::to_string)
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// What stands once `n` questions do, or after 5 s.
+    async fn questions_once_up(broker: &crate::consent::ConsentBroker, n: usize) -> Vec<String> {
+        for _ in 0..250 {
+            let ids = questions_up(broker);
+            if ids.len() >= n {
+                return ids;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        questions_up(broker)
+    }
+
+    /// What a channel said: stdout, stderr, exit status.
+    type Said = (String, String, Option<u32>);
+
+    /// Read `channel` to its end. `asked` fires once the server says the
+    /// channel waits on the person at the device.
+    async fn read_channel(
+        mut channel: russh::Channel<russh::client::Msg>,
+        mut asked: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Said {
+        let (mut out, mut err, mut exit) = (Vec::new(), Vec::new(), None);
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { ref data } => out.extend_from_slice(data),
+                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    err.extend_from_slice(data);
+                    if String::from_utf8_lossy(&err).contains("waiting up to")
+                        && let Some(tx) = asked.take()
+                    {
+                        let _ = tx.send(());
+                    }
+                }
+                russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                _ => {}
+            }
+        }
+        (
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+            exit,
+        )
+    }
+
+    /// A command running on a channel of its own.
+    struct Running {
+        /// Fires once the server says the channel waits on the person.
+        asked: tokio::sync::oneshot::Receiver<()>,
+        done: tokio::task::JoinHandle<Said>,
+    }
+
+    async fn exec_in_background(session: &russh::client::Handle<TestClient>, cmd: &str) -> Running {
+        let channel = session.channel_open_session().await.unwrap();
+        channel.exec(true, cmd).await.unwrap();
+        let (tx, asked) = tokio::sync::oneshot::channel();
+        Running {
+            asked,
+            done: tokio::spawn(read_channel(channel, Some(tx))),
+        }
+    }
+
     /// Drive one exec through a consent-gated session and collect the outcome.
     /// The operator's decision is played through the SAME broker the server
     /// was built with — `record_decision` only lands while the prompt is
@@ -4218,20 +4306,22 @@ mod tests {
         let _slot = exec_slot().await;
         let (key, line) = client_key(key_seed);
         let (addr, broker) = serve_one_with(&cfg_with(Vec::new())).await;
-        let grant_id = grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+        grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
 
-        let operator = {
-            let sid = grant_id.clone();
-            tokio::spawn(async move {
-                for _ in 0..200 {
-                    if broker.record_decision(&sid, approve) {
-                        return true;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Answered under the id the question is shown under, as the panel,
+        // the companion and `roomlerd consent` answer it.
+        let operator = tokio::spawn(async move {
+            for _ in 0..200 {
+                if questions_up(&broker)
+                    .iter()
+                    .any(|id| broker.record_decision(id, approve))
+                {
+                    return true;
                 }
-                false
-            })
-        };
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            false
+        });
 
         let session = connect(addr, key).await; // auth SUCCEEDS — consent is not auth
         let mut channel = session.channel_open_session().await.unwrap();
@@ -4294,6 +4384,153 @@ mod tests {
             "the caller must be told WHY it was refused, got stderr {err:?}"
         );
         assert_eq!(exit, Some(1));
+    }
+
+    /// #3442 — an answer given the moment the question is up counts, while
+    /// the desktop companion is still being started. The question used to be
+    /// shown first and armed last: an answer in between was refused ("no
+    /// active prompt"), and on the native panel the panel went down with it,
+    /// leaving the question asking with nothing on the screen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_answer_given_as_the_ssh_question_goes_up_counts() {
+        use roomler_ai_remote_control::models::ConsentMode;
+
+        let _lock = grant_test().await;
+        let _slot = exec_slot().await;
+        let (key, line) = client_key(85);
+        // A companion that takes 2 s to start: the question is up, its marker
+        // written, for all of it.
+        let (addr, broker) = serve_one_asking(
+            &cfg_with(Vec::new()),
+            crate::companion::Companion::Starting(std::time::Duration::from_secs(2)),
+        )
+        .await;
+        grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+        let session = connect(addr, key).await;
+        let command = exec_in_background(&session, "echo early-answer-ran").await;
+
+        // One answer, the moment the question is up, never retried: a refused
+        // answer fails the test rather than being tried until it lands.
+        let up = questions_once_up(&broker, 1).await;
+        let id = up.first().expect("the question went up");
+        assert!(
+            broker.record_decision(id, true),
+            "an answer given as the question went up was refused"
+        );
+        let (out, err, exit) = command.done.await.unwrap();
+        assert!(
+            out.contains("early-answer-ran"),
+            "stdout {out:?}, stderr {err:?}"
+        );
+        assert_eq!(exit, Some(0));
+    }
+
+    /// #3442 — two commands of one session that ask at once wait on ONE
+    /// question, and one Allow runs both. Each used to be asked under the
+    /// grant's id, so the second question withdrew the first (since #3434 the
+    /// newer question for an id wins), and the first command was refused
+    /// although nobody had said no.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_commands_asking_at_once_share_one_question() {
+        use roomler_ai_remote_control::models::ConsentMode;
+
+        let _lock = grant_test().await;
+        // Two commands at once: two of the engine's slots, taken together.
+        let _slots = EXEC_TEST_SLOTS
+            .acquire_many(2)
+            .await
+            .expect("the slot semaphore is never closed");
+        let (key, line) = client_key(86);
+        let (addr, broker) = serve_one_with(&cfg_with(Vec::new())).await;
+        grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+        let session = connect(addr, key).await;
+
+        let first = exec_in_background(&session, "echo first-ran").await;
+        questions_once_up(&broker, 1).await;
+        let second = exec_in_background(&session, "echo second-ran").await;
+        second
+            .asked
+            .await
+            .expect("the second command is told it waits");
+        // Past the poll that would find the first question withdrawn.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let up = questions_up(&broker);
+        assert_eq!(up.len(), 1, "one question for both commands: {up:?}");
+        assert!(
+            broker.record_decision(&up[0], true),
+            "the question was not asking"
+        );
+
+        let (out, err, exit) = first.done.await.unwrap();
+        assert!(
+            out.contains("first-ran"),
+            "the first command: stdout {out:?}, stderr {err:?}"
+        );
+        assert_eq!(exit, Some(0));
+        let (out, err, exit) = second.done.await.unwrap();
+        assert!(
+            out.contains("second-ran"),
+            "the second command: stdout {out:?}, stderr {err:?}"
+        );
+        assert_eq!(exit, Some(0));
+    }
+
+    /// #3442 — a command and a shell of one session that ask at once are two
+    /// questions, each under an id of its own, and neither withdraws the
+    /// other. The question names the activity (FR-27), so an Allow for one is
+    /// never stretched over the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_command_and_a_shell_asking_at_once_are_two_questions() {
+        use roomler_ai_remote_control::models::ConsentMode;
+
+        let _lock = grant_test().await;
+        let _slot = exec_slot().await;
+        let (key, line) = client_key(87);
+        let (addr, broker) = serve_one_with(&cfg_with(Vec::new())).await;
+        let grant_id = grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+        let session = connect(addr, key).await;
+
+        let command = exec_in_background(&session, "echo command-ran").await;
+        questions_once_up(&broker, 1).await;
+        let shell = session.channel_open_session().await.unwrap();
+        shell
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        shell.request_shell(true).await.unwrap();
+
+        let up = questions_once_up(&broker, 2).await;
+        assert_eq!(up.len(), 2, "one question per activity: {up:?}");
+        assert!(
+            !up.contains(&grant_id),
+            "a question's id is its own, not its grant's: {up:?}"
+        );
+        for id in &up {
+            assert!(broker.record_decision(id, true), "{id} was not asking");
+        }
+
+        let leave: &[u8] = if cfg!(windows) {
+            b"exit\r\n"
+        } else {
+            b"exit 0\n"
+        };
+        shell.data(leave).await.unwrap();
+        let (_, err, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            read_channel(shell, None),
+        )
+        .await
+        .expect("the shell leaves when told to");
+        assert!(
+            !err.contains("roomler-ssh:"),
+            "the shell did not start: {err:?}"
+        );
+        let (out, err, exit) = command.done.await.unwrap();
+        assert!(
+            out.contains("command-ran"),
+            "the command: stdout {out:?}, stderr {err:?}"
+        );
+        assert_eq!(exit, Some(0));
     }
 
     /// THE session bound (A1): a grant's `session_secs` now ENDS the session.
@@ -5109,7 +5346,13 @@ mod tests {
         assert_eq!(exit, Some(0));
         let asks = asks.lock().unwrap().clone();
         assert_eq!(asks.len(), 1, "asked once: {asks:?}");
-        assert_eq!(asks[0].sentinel, grant_id);
+        // #3442 — under an id of its own, which the worker files the answer
+        // under: never the grant's, which two questions of one session share.
+        assert_ne!(asks[0].sentinel, grant_id);
+        assert!(
+            crate::exec_service::valid_object_id(&asks[0].sentinel),
+            "the worker takes only an object id: {asks:?}"
+        );
         assert_eq!(asks[0].what, "run a command");
         assert!(asks[0].caller.contains("alice@example.com"), "{asks:?}");
     }
