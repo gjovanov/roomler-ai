@@ -108,7 +108,11 @@ silently.
 > for **linux/amd64 and linux/arm64**. The tag is a manifest list, so a
 > Raspberry Pi, an Apple Silicon Mac and an x86 VPS all pull the same name and
 > get the right image. Each architecture is built on its own native runner and
-> smoke-tested there before publication — neither is emulated.
+> smoke-tested there before publication — neither is emulated. The documented path
+> itself runs on both as well: the `Self-host pull` lane pulls anonymously into an
+> empty cache, runs `up -d`, and makes a two-party call directly and over the relay
+> (`scripts/selfhost-pull-check.sh`, on every pull request that changes a compose
+> file, and weekly).
 
 ### Or build it from source
 

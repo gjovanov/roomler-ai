@@ -61,9 +61,10 @@ Building instead takes roughly **six minutes** on a 16-core machine.
 
 Images are published at `ghcr.io/gjovanov/roomler-ai` for **linux/amd64 and
 linux/arm64** and are anonymously pullable; every other image in the file is
-published for both as well. The arm64 Roomler image is built and smoke-tested
-on a native arm64 machine, but the whole stack has not yet been run on an arm64
-host.
+published for both as well. The whole stack runs on both: an anonymous `pull`
+and `up -d` on a native arm64 machine and an x86 one, then a two-party call,
+directly and over the relay, on every proposed change to the compose file and
+once a week.
 
 Watch it come up:
 
@@ -131,7 +132,6 @@ back those up, not the container.
 
 - **Single node.** The compose stack runs one API instance. Multi-node scale-out *is* supported by the code, but it is a Kubernetes topology rather than this file.
 - **No automatic TLS.** Deliberate — see above.
-- **arm64 is published but not yet run end to end.** Every image has an arm64 build; nobody has brought the whole stack up on an arm64 host yet.
 - **The relay is optional.** A separate TURN server is not on the critical path: the built-in relay floor over the API's own port already guarantees connectivity when no direct path exists.
 
 ## Licensing
