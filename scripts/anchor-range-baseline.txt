@@ -14,8 +14,4 @@ docs/fr/FR-40-overlay-key-rotation.md	ui/src/stores/agents.ts:749-704
 docs/fr/FR-43-macos-single-enrollment.md	crates/localapi/src/lib.rs:1966-1875
 docs/overlay-key-rotation.md	agents/roomlerd/src/remote_config.rs:346-245
 docs/overlay-key-rotation.md	agents/roomlerd/src/remote_config.rs:346-245
-docs/overlay-key-rotation.md	config_surface.rs:1096-1069
-docs/overlay-key-rotation.md	config_surface.rs:1096-1069
-docs/overlay-key-rotation.md	crates/agent-core/src/config.rs:980-868
-docs/overlay-key-rotation.md	crates/agent-core/src/config.rs:980-868
 docs/overlay-key-rotation.md	ui/src/stores/agents.ts:948-902
