@@ -4473,6 +4473,7 @@ async fn run_cmd(
     let _ = watchdog::install(wd.clone());
     watchdog::spawn_thread_watchdog(wd.clone());
     tokio::spawn(roomlerd::resource_watch::run(shutdown_rx.clone()));
+    tokio::spawn(roomlerd::runtime_canary::run(shutdown_rx.clone()));
     let wd_task = tokio::spawn({
         let wd = wd.clone();
         let rx = shutdown_rx.clone();

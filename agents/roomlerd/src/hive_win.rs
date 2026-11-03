@@ -345,6 +345,7 @@ pub(crate) fn process_sid(pid: u32) -> Result<String, String> {
 /// TCP connection this daemon accepted: the row of the system's connection
 /// table whose local end is `client` and whose remote end is `server`.
 /// `None` when no row is that connection (its client has gone).
+#[cfg_attr(not(feature = "vault"), allow(dead_code))]
 pub(crate) fn tcp_client_pid(
     client: std::net::SocketAddrV4,
     server: std::net::SocketAddrV4,
