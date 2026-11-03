@@ -770,7 +770,7 @@ macOS the server's switch), and the tunnel client:
   desktop", which would contradict it. The wizard's own text never calls the daemon an "agent"
   (the operator, 2026-10-30): the token step names the dashboard's Devices → Enroll, the
   checklist and the Done page say "device" and show a version (`roomlerd 0.4.188`), never a
-  release tag (`app.js:1907-1912`). Tags, API paths and wire strings stay as they are: they are
+  release tag (`app.js:1912-1917`). Tags, API paths and wire strings stay as they are: they are
   compatibility surfaces.
 
 #### C2 — `/api/setup/windows` serves the signed EXE
