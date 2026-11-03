@@ -35,7 +35,10 @@ use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::{DateTime, oid::ObjectId};
-use roomler_ai_remote_control::models::{OverlayAclMode, OverlayPolicy};
+use roomler_ai_remote_control::models::{
+    KEY_ROTATION_TRIGGER_KEY_RETIRED, OverlayAclMode, OverlayIdentity, OverlayPolicy, RetiredKey,
+    RetiredKeyMode, RetiredKeyReason, order_in_flight, order_is_satisfied,
+};
 use roomler_ai_remote_control::{
     models::{AgentStatus, NodeRef, OverlayNode},
     signaling::{
@@ -372,6 +375,50 @@ async fn handle_overlay_join(
         }
     }
 
+    // FR-40 P2 — a RETIRED key: one some node of this network moved away from
+    // (a `.prev` rollback, a restored backup, or a holder of both the old key
+    // and the agent token). Read only when the org switched the check on, so
+    // `off` is the pre-P2 join byte for byte.
+    if network.retired_key_mode != RetiredKeyMode::Off {
+        let enforce = network.retired_key_mode == RetiredKeyMode::Enforce;
+        match state
+            .overlay_nodes
+            .retired_key_in_network(network_id, &wg_public_key)
+            .await
+        {
+            Ok(None) => {}
+            Ok(Some(retired)) if enforce => {
+                refuse(OverlayJoinRefusal::KeyRetired, retired_key_detail(&retired)).await;
+                // A device that can rotate is ordered to, instead of being
+                // left on the control plane and off the mesh.
+                if let NodeIdentity::Agent(agent_id) = ident {
+                    order_rotation_for_retired_key(state, tenant_id, agent_id, &wg_public_key)
+                        .await;
+                }
+                return;
+            }
+            Ok(Some(retired)) => {
+                warn!(
+                    %tenant_id, %machine_id, detail = %retired_key_detail(&retired),
+                    "overlay.join: would refuse — key_retired (retired_key_mode=warn; admitted)"
+                );
+            }
+            // Fail CLOSED under `enforce`, like the uniqueness check above;
+            // `warn` never refuses.
+            Err(e) if enforce => {
+                refuse(
+                    OverlayJoinRefusal::StoreUnavailable,
+                    format!("the retired-key check failed: {e}"),
+                )
+                .await;
+                return;
+            }
+            Err(e) => {
+                warn!(%tenant_id, %e, "overlay.join: retired-key check failed (warn; admitted)");
+            }
+        }
+    }
+
     let self_node = match state
         .overlay_nodes
         .find_live_by_tenant_and_machine(tenant_id, &machine_id)
@@ -386,6 +433,22 @@ async fn handle_overlay_join(
             } else {
                 existing.name.clone()
             };
+            // FR-40 P2 — the key this join replaces enters the node's ledger
+            // in the same write that replaces it. This accepted join IS the
+            // verified identity change, the only moment a key retires (never
+            // a device's report, which is a claim). Recorded in every mode,
+            // so the ledger is full before anything enforces it.
+            let retire =
+                if !existing.wg_public_key.is_empty() && existing.wg_public_key != wg_public_key {
+                    Some(RetiredKey {
+                        public_key: existing.wg_public_key.clone(),
+                        key_epoch: existing.key_epoch,
+                        retired_at: DateTime::now(),
+                        reason: retire_reason(state, ident, tenant_id, &wg_public_key).await,
+                    })
+                } else {
+                    None
+                };
             match state
                 .overlay_nodes
                 .rehydrate(
@@ -405,6 +468,7 @@ async fn handle_overlay_join(
                     supports_org_relay,
                     &advertised_routes,
                     route_offer_withheld.as_deref(),
+                    retire.as_ref(),
                 )
                 .await
             {
@@ -717,6 +781,140 @@ async fn handle_overlay_join(
     // the ONLY re-delivery path a single-relay DIALER has — it never sends a
     // relay_request, so it can't pick the pin back up reactively.
     repush_forced_pairs_on_join(state, &self_node).await;
+}
+
+/// FR-40 P2 — the words a `key_retired` refusal carries: to the device's log
+/// (0.4.41+ prints them beside the reason, which a build before P2 decodes as
+/// `unknown`) and to the server's. No key in them: the device knows its own,
+/// and the server's log has no use for one.
+fn retired_key_detail(retired: &RetiredKey) -> String {
+    let at = retired
+        .retired_at
+        .try_to_rfc3339_string()
+        .unwrap_or_else(|_| "an earlier join".to_string());
+    let why = match retired.reason {
+        RetiredKeyReason::Rotate => "rotated away from",
+        RetiredKeyReason::Rejoin => "replaced at a later join",
+    };
+    format!(
+        "this overlay key was retired on this network at {at} ({why}, epoch {}); \
+         a device holding it must rotate to rejoin — the server orders one that \
+         supports key rotation to",
+        retired.key_epoch
+    )
+}
+
+/// FR-40 P2 — why the key a join replaces leaves the node, for the ledger:
+/// `rotate` when THIS join is the one that satisfies the device's standing
+/// rotation order (an operator's, or the server's own), `rejoin` for every
+/// other change. Forensic only; a failed read says `rejoin`.
+async fn retire_reason(
+    state: &NetworkState,
+    ident: NodeIdentity,
+    tenant_id: ObjectId,
+    presented: &str,
+) -> RetiredKeyReason {
+    let NodeIdentity::Agent(agent_id) = ident else {
+        return RetiredKeyReason::Rejoin;
+    };
+    let Ok(agent) = state
+        .fleet
+        .agents
+        .find_live_in_tenant(tenant_id, agent_id)
+        .await
+    else {
+        return RetiredKeyReason::Rejoin;
+    };
+    let Some(order) = agent.key_rotation.as_ref() else {
+        return RetiredKeyReason::Rejoin;
+    };
+    let now = OverlayIdentity {
+        public_key: presented.to_string(),
+        key_epoch: 0,
+        joined_at: DateTime::now(),
+    };
+    if !order_is_satisfied(order, agent.overlay_identity.as_ref())
+        && order_is_satisfied(order, Some(&now))
+    {
+        RetiredKeyReason::Rotate
+    } else {
+        RetiredKeyReason::Rejoin
+    }
+}
+
+/// FR-40 P2 — the self-heal: a device refused `key_retired` is ordered to
+/// rotate instead of being left on the control plane and off the mesh.
+///
+/// Through the route's own order path (`place_order`): the per-device ceiling
+/// it shares with operators' orders, the capability gate (a device without
+/// `key-rotate` is audited `agent_unsupported` and ordered nothing), the
+/// desired state on the row, and ONE audit row, placed by the server
+/// (`trigger: key_retired`, the zero user id). The order snapshots the key the
+/// device PRESENTED, so the join under any other key satisfies it.
+///
+/// ⚠️ The loop guard is the order already on the row: one being executed (the
+/// P1b window) holds off a second, so a device that keeps presenting the key
+/// while it rotates gets one order, not a storm. Past that, the 60 s ceiling
+/// bounds it — and a device that refused (its kill switch is off, say) is
+/// ordered again only at a later join, which only a reconnect sends.
+async fn order_rotation_for_retired_key(
+    state: &NetworkState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    presented: &str,
+) {
+    let agent = match state
+        .fleet
+        .agents
+        .find_live_in_tenant(tenant_id, agent_id)
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            warn!(%tenant_id, %agent_id, %e, "overlay.join: key_retired — agent row unreadable; no rotation ordered");
+            return;
+        }
+    };
+    if let Some(order) = agent.key_rotation.as_ref()
+        && order_in_flight(
+            order,
+            agent.key_rotation_report.as_ref(),
+            agent.overlay_identity.as_ref(),
+            DateTime::now(),
+        )
+    {
+        tracing::info!(
+            %tenant_id, %agent_id, request_id = %order.request_id,
+            "overlay.join: key_retired — a rotation order is already in flight; not ordering another"
+        );
+        return;
+    }
+    match crate::routes::overlay_key::place_order(
+        state,
+        tenant_id,
+        agent_id,
+        &agent,
+        crate::routes::overlay_key::OrderedBy::Server(KEY_ROTATION_TRIGGER_KEY_RETIRED),
+        Some(presented.to_string()),
+    )
+    .await
+    {
+        Ok(placed) => match placed.outcome {
+            Ok(dispatch) => tracing::info!(
+                %tenant_id, %agent_id, request_id = %placed.request_id,
+                dispatch = dispatch.wire(),
+                "overlay.join: key_retired — the device was ordered to rotate"
+            ),
+            Err(reason) => tracing::info!(
+                %tenant_id, %agent_id, request_id = %placed.request_id,
+                reason = reason.wire(),
+                "overlay.join: key_retired — no rotation ordered; the device stays off the mesh"
+            ),
+        },
+        Err(e) => {
+            warn!(%tenant_id, %agent_id, %e, "overlay.join: key_retired — the rotation order could not be written");
+        }
+    }
 }
 
 /// Trickle: update the node's candidates → fan an upsert delta so peers
@@ -3072,6 +3270,7 @@ mod tests {
             overlay_ip: ip.into(),
             wg_public_key: "cHVia2V5".into(),
             key_epoch: 0,
+            retired_keys: Vec::new(),
             endpoints: vec!["1.2.3.4:1234".into()],
             lan_endpoints: vec!["192.168.1.5:41641".into()],
             srflx_endpoints: vec!["5.6.7.8:5678".into()],
