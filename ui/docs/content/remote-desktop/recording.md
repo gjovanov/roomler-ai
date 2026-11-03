@@ -62,7 +62,12 @@ Two switches decide whether a session can record, and both start off.
 Until both allow it, the Record control is greyed out and its tooltip says why.
 :::
 
-The machine's microphone is never recorded remotely.
+A remote recording never includes the machine's microphone. There is no option
+for it, in the viewer or on the wire.
+
+:::warning Full control of the machine is a different thing
+Someone who already controls the machine itself can start a recording there as if they were sitting at it, microphone included, just as they could start any other program. That means a session with keyboard and mouse control, `roomler exec`, `roomler ssh` or a Hive session, and each of those needs its own permission. A recording started that way is a local one: the tray icon turns red, and a controller's Record menu neither lists nor downloads it.
+:::
 
 ### Downloading a recording
 
@@ -127,8 +132,10 @@ In **Recordings**, press **Edit** on a recording.
 
 ## Limits
 
-- **macOS** records the picture only for now: no microphone and no computer
-  audio.
+- **macOS** records computer audio from agent 0.4.161 and the microphone from
+  agent 0.4.163, or 0.4.168 where the root half runs the screen. The first time,
+  macOS asks whether Roomler Daemon may use the microphone
+  ([per-OS permissions](/docs/remote-desktop/per-os-permissions/)).
 - Recording arrived with agent **0.4.110**. A machine on an older agent shows no
   Record control.
 - This page is about screens. Roomler does not record video calls.
