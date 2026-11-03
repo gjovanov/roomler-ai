@@ -200,7 +200,7 @@ docker compose up -d
 | `mongo:7.0.45`, pinned by digest | 27019→27017 | database (dev credentials in the compose file) |
 | `redis:7.4.12-alpine`, pinned by digest | 6379 | pub/sub + presence |
 | `ghcr.io/gjovanov/minio` | 9000 (API) / 9001 (console) | S3-compatible file storage: Chainguard's MinIO build, mirrored and pinned by digest, since `minio/minio` is gone from Docker Hub (#2034) |
-| `coturn/coturn` | host network | TURN relay (`turnserver.conf` — rotate the shared secret!) |
+| `coturn/coturn:4.18.0-r0`, pinned by digest | host network | TURN relay (`turnserver.conf` — rotate the shared secret!) |
 
 Then `cargo run --bin roomler-ai-api` (API :3000) and `cd ui && bun run dev`
 (SPA :5000, proxying `/api` + `/ws` to :5001).
