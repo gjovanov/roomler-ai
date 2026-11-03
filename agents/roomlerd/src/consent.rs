@@ -1446,6 +1446,143 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #3433 — a withdrawn question takes no answer that lands after the
+    /// withdrawal, whoever writes it. An Allow that passed `record_decision`'s
+    /// check just before a session's end lands after the cancel, and the CLI's
+    /// fallback writes its sentinel with no check at all. The poll looked for
+    /// an answer before it looked at the books, so its first look after the
+    /// cancel took it: Granted, for a session that had ended.
+    #[tokio::test]
+    async fn an_answer_that_lands_after_the_withdrawal_is_not_taken() {
+        let dir = fixture_dir("lands-after-cancel");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "34330000000000000000c1c1";
+
+        let prompt = broker.request_with_mode(session, LONG_WINDOW);
+        assert!(broker.cancel(session), "a prompt was standing");
+        broker
+            .write_sentinel(session, SentinelKind::Approve)
+            .unwrap();
+        let decision = tokio::time::timeout(PROMPT_BOUND, prompt)
+            .await
+            .expect("a withdrawn prompt must still resolve promptly");
+        assert_eq!(
+            decision,
+            Decision::Cancelled,
+            "an answer that landed after the withdrawal decided it"
+        );
+        assert!(
+            !broker
+                .sentinel_path(session, SentinelKind::Approve)
+                .exists(),
+            "the answer that came too late stayed behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3433 — a decided question takes no more answers. The prompt broke out
+    /// of its poll, cleared its sentinels and logged its decision, and only
+    /// then did its guard take it off the books: an answer in that gap was
+    /// written after the clearing, reported taken for nothing, and stayed
+    /// behind. The answer here comes at the decision's own log line, inside
+    /// that gap.
+    #[tokio::test]
+    async fn a_decided_question_takes_no_more_answers() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let dir = fixture_dir("decided-takes-no-more");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "34330000000000000000d2d2";
+        let late = Arc::new(Mutex::new(None));
+        let _log = tracing::subscriber::set_default(tracing_subscriber::registry().with(
+            AnswerAtTheDecision {
+                broker: broker.clone(),
+                session,
+                late: late.clone(),
+            },
+        ));
+
+        let prompt = broker.request_with_mode(session, LONG_WINDOW);
+        assert!(broker.record_decision(session, true));
+        let decision = tokio::time::timeout(PROMPT_BOUND, prompt)
+            .await
+            .expect("an answered prompt must resolve promptly");
+        assert_eq!(decision, Decision::Granted);
+        assert_eq!(
+            *late.lock().unwrap(),
+            Some(false),
+            "a question already decided took another answer"
+        );
+        assert!(
+            !broker.sentinel_path(session, SentinelKind::Deny).exists(),
+            "the answer that came too late stayed behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Answers `session` once, with a Deny, the moment its prompt logs the
+    /// decision it made: what a click lands on when it comes just too late.
+    struct AnswerAtTheDecision {
+        broker: ConsentBroker,
+        session: &'static str,
+        late: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AnswerAtTheDecision {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    if f.name() == "message" {
+                        self.0 = format!("{v:?}");
+                    }
+                }
+            }
+            let mut m = Message(String::new());
+            event.record(&mut m);
+            if m.0 == "operator consent decision" {
+                let mut late = self.late.lock().unwrap();
+                if late.is_none() {
+                    *late = Some(self.broker.record_decision(self.session, false));
+                }
+            }
+        }
+    }
+
+    /// #3433 — a question's end leaves a newer question for the same id alone.
+    /// An RC session can be asked again under its own id while its first
+    /// question still stands: arming the second takes the id's entry, and the
+    /// first one's guard then took their shared marker off the screen as it
+    /// went, leaving the second question asking with nothing to show it.
+    #[test]
+    fn an_older_question_leaves_a_newer_ones_marker() {
+        let dir = fixture_dir("older-leaves-newer");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "34330000000000000000e3e3";
+        let older = broker.arm(session, Duration::from_secs(30));
+        let newer = broker.arm(session, Duration::from_secs(30));
+        let marker = broker.write_pending(session, "{}").unwrap();
+
+        drop(older);
+        assert!(
+            marker.exists(),
+            "an older question took a newer one's marker off the screen"
+        );
+        assert!(
+            broker.record_decision(session, true),
+            "the newer question stopped taking answers"
+        );
+        drop(newer);
+        assert!(!marker.exists(), "the newer question's end left its marker");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1632 — the marker the companion (and `roomlerd consent --list`) reads
     /// is removed on cancel, so the companion's 750 ms poll finds nothing
     /// pending and takes its own panel down (roomler-desktop
