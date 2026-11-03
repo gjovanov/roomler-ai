@@ -214,6 +214,11 @@ fn an_allow_whose_session_then_ended_starts_nothing() -> Result<()> {
 }
 
 #[test]
+fn a_recorder_whose_session_ended_as_it_launched_stops() -> Result<()> {
+    rt().block_on(a_recorder_whose_session_ended_as_it_launched_stops_cell())
+}
+
+#[test]
 fn the_hosts_disconnect_stops_the_recording() -> Result<()> {
     rt().block_on(the_hosts_disconnect_stops_the_recording_cell())
 }
@@ -1924,6 +1929,141 @@ async fn an_allow_whose_session_then_ended_starts_nothing_cell() -> Result<()> {
         "a recording started for a session that had ended: {kinds:?}"
     );
     r.drop_session().await
+}
+
+/// #3433 — a recorder whose session ends while it launches stops at once,
+/// `session_ended`, reported once on its own session: nobody is left to record
+/// for. The session's end found nothing recording yet, and the start did not
+/// look again once its recorder ran: the recording went into the re-attach
+/// grace, and the controller's next session picked it up (red: `recording`
+/// there).
+///
+/// Ended by the signalling loop's word with the channel still open, as a close
+/// that overran its budget leaves it, once the recorder is spawned and before
+/// it records.
+async fn a_recorder_whose_session_ended_as_it_launched_stops_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    let before = mp4s(&s.out);
+    let (device, _kill) = Device::new();
+    let user = ObjectId::new();
+    let on_device = || Opts {
+        device: Some(device.clone()),
+        controller: Some(user),
+        ..Default::default()
+    };
+    let mut a = rig(on_device()).await?;
+    a.send(json!({"t": "rc:record.start", "id": "e1"})).await?;
+    // Spawned, not recording yet: the supervisor names the controller from
+    // the launch, and says `active` only once the recorder has started.
+    let deadline = tokio::time::Instant::now() + START;
+    let launching = loop {
+        let st = s.manager.state();
+        if st.active || tokio::time::Instant::now() >= deadline {
+            break false;
+        }
+        if st.remote_controller.is_some() {
+            break true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let in_the_launch = launching && {
+        remote::session_ended(a.session_id);
+        a.indicator.hide_session(a.session_id.to_hex());
+        !s.manager.state().active
+    };
+    let mut seen = Vec::new();
+    let mut picked = Value::Null;
+    let mut ran_for = Duration::ZERO;
+    let mut b_kinds = Vec::new();
+    if in_the_launch {
+        seen.push(a.state(START).await?);
+        // Timed on its own: setting up the next session can take a while
+        // under load, and that is not the recorder's.
+        let started = tokio::time::Instant::now();
+        let stopped = tokio::spawn(async move {
+            while s.manager.state().active && started.elapsed() < STOP {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            started.elapsed()
+        });
+        // The controller comes back within the grace.
+        let mut b = rig(on_device()).await?;
+        b.send(json!({"t": "rc:record.status"})).await?;
+        picked = b.state(START).await?;
+        ran_for = stopped.await?;
+        if let Ok(v) = a.until_not_recording(Duration::from_secs(5)).await {
+            seen.push(v);
+        }
+        b_kinds = b.reports().into_iter().map(|(k, _, _)| k).collect();
+        b.drop_session().await?;
+    }
+    let st = s.manager.state();
+    let a_kinds = reports_until(
+        &mut a,
+        RecordingActivityKind::Stopped,
+        Duration::from_secs(5),
+    )
+    .await;
+    // Whatever happened, the next cell starts from an idle recorder and no
+    // stray file.
+    idle(s).await;
+    for f in mp4s(&s.out).into_iter().filter(|f| !before.contains(f)) {
+        let _ = std::fs::remove_file(Sidecar::path_for(&f));
+        let _ = std::fs::remove_file(&f);
+    }
+    a.drop_session().await?;
+    assert!(
+        launching,
+        "the recorder was never seen launching: this cell proves nothing"
+    );
+    assert!(
+        in_the_launch,
+        "the recorder started before the session's end was in: this cell proves nothing"
+    );
+    assert_eq!(
+        picked["state"], "idle",
+        "the controller's next session picked up a recording made for a session that had ended: {picked}"
+    );
+    assert!(b_kinds.is_empty(), "{b_kinds:?}");
+    assert!(
+        !st.active && ran_for < GRACE,
+        "the recorder ran on {ran_for:?} after it started for a session that had ended"
+    );
+    assert_eq!(
+        st.last.as_ref().map(|l| l.reason.as_str()),
+        Some("session_ended")
+    );
+    let states: Vec<_> = seen
+        .iter()
+        .map(|v| (v["state"].as_str(), v["reason"].as_str()))
+        .collect();
+    assert_eq!(
+        states,
+        vec![
+            (Some("recording"), None),
+            (Some("stopped"), Some("session_ended"))
+        ]
+    );
+    assert_eq!(
+        a_kinds,
+        vec![
+            (RecordingActivityKind::Started, None),
+            (RecordingActivityKind::Stopped, Some("session_ended".into())),
+        ]
+    );
+    assert!(
+        eventually(Duration::from_secs(3), || device
+            .registry
+            .list()
+            .iter()
+            .all(|e| !e.recording))
+        .await,
+        "the banner outlived the recording"
+    );
+    Ok(())
 }
 
 /// Every report of `r` until one of `kind` arrives, or `within` passes.
