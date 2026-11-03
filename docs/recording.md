@@ -167,8 +167,9 @@ flowchart TB
   every colour.
 - **Crash recovery.** `read_fragmented` walks top-level boxes and stops at
   the first incomplete fragment. `reconcile_partials` remuxes whatever a dead
-  recorder left, marks it `interrupted`, and removes a partial that holds
-  nothing recoverable.
+  recorder left, marks it `interrupted`, and removes a partial only when the
+  file itself shows it holds nothing. Any other failure keeps the fragmented
+  file under the final name (§5).
 - If the remux itself fails (for example, no room for a second copy), the
   fragmented file is kept under the final name and the `stopped` event says
   `fragmented: true`.
@@ -330,7 +331,7 @@ the first log line. Use `recording::child::parse_event_line`.
 | `progress` | every second | `duration_ms`, `bytes`, `frames`, `late_ticks` |
 | `stopped` | the file is final | `reason`, `path`, `bytes`, `duration_ms`, `frames`, `fragmented` |
 | `refused` | it never started | `code`: `no_frame` · `disk_low` · `encoder_unavailable` · `folder_unwritable` · `audio_unavailable` · `system_audio_unavailable` · `mic_unavailable` |
-| `recovered` | a dead recorder's partial in this folder was finalized | `path` |
+| `recovered` | a dead recorder's partial in this folder was finalized, or kept under its final name because the remux failed | `path` |
 
 **stdin:** `{"cmd":"stop"}`, optionally with a `"reason"`. **End of stdin
 stops the recording** (`parent_gone`), and so does Ctrl+C. Every stop
@@ -359,6 +360,32 @@ recording starts in that folder, so the first read after a crash finds nothing
 at that path. Measured on Windows 11 and Ubuntu X11, six hard kills lost at most
 1.81 s.
 
+⚠️ **A failed attempt never deletes a recording.** A recorder that dies during
+the remux leaves its temp (`<name>.remux-tmp`) beside the destination and its
+partial whole. The retry used to refuse that temp, and the reconciler read any
+error as "nothing recoverable", so it deleted the partial: a finished recording
+lost, every fragment of it (measured 2026-11-02 on Windows, 0.4.197; every
+release had it, on every OS). `mp4::finalize` now removes that temp and creates
+its own with `create_new`: the caller holds the partial's lock, so nothing else
+writes that name, and a link planted there is not written through.
+`reconcile_partials` removes a partial only on `mp4::NothingRecoverable`: no
+`moov`, or no complete fragment.
+
+Every other failure, such as a full disk or a corrupt fragment, follows the stop
+path's rule: the fragmented file goes under its final name, marked `interrupted`,
+the whole error chain goes to the log, and the `recovered` event names it. That
+is one attempt per partial. Listing, deleting and downloading never read a
+recording's contents, so this file takes them like any other. The sidecar's
+duration, frames and bytes come from its fragments. The editor reads progressive
+files only and finds no video in it, as in the stop path's fragmented file. A
+partial stays for the next start only if that rename fails too, because the
+folder is gone or another program holds the file.
+
+A remux that cannot fit is not started. `mp4::finalize` compares the copy's exact
+size with `folder::available_space` first, because running the volume to zero to
+find out would stop whatever else writes there, the next recording included.
+Where the room cannot be told, the remux goes ahead.
+
 ⚠️ **A partial is finalized only if its `.partial.lock` can be taken**
 (`recorder::PartialLock`). The recorder takes that OS file lock before it
 creates the partial, holds it until the file is final, and the kernel releases
@@ -368,6 +395,11 @@ manual `roomlerd record` beside the daemon's) would remux a file under its
 writer, or, before the writer's first fragment, **delete it as
 unrecoverable**. `a_live_partial_is_left_alone_by_the_reconciler` is red with
 the lock disabled.
+
+A recorder's own WGC capture can end it during the remux. `docs/remote-control.md`
+§5.1 has that fault, which was over a moving screen, and its fix. A recording of a
+few seconds exits before the capture thread leaves its apartment, so it never gets
+that far.
 
 ## 6. Recording through the daemon — the local verbs (P2a)
 
@@ -1586,7 +1618,7 @@ the music in the preview.
 | `recording::folder` unit test and the CI unit start (P2c) | a read-only file system on Linux is named as the service's sandbox ("… read-only for the Roomler service (on a Linux desktop it runs sandboxed …)"), and any other refusal keeps its own words. In CI, a unit carrying `roomler.service`'s sandbox lines VERBATIM starts on a runner with no pre-rename folders, the real `roomlerd record --where` inside it chooses `~/Videos/Roomler`, and the rest of home stays read-only. Shown failing first, locally (systemd 255, a user unit): master's unit fails `226/NAMESPACE` on a host without the pre-rename folders, and with them present it starts but keeps the recorder out of `~/Videos` (the recording falls back to the data folder); the CI step's own commands fail on master's unit ("did not start") and pass on this one. With unprivileged user namespaces refused (`user.max_user_namespaces=0`), master's user unit STARTS and writes `~/Videos`: the user manager skips the whole sandbox, which the CI step's system unit never does | "Test the recorder (FR-85)" (`--lib recording::`); "The Linux user unit's sandbox (FR-85 P2c)" |
 | `tests/recorder.rs`, Windows (P1e) | the recorder an elevated daemon launches reports (`record --whoami`) the same user at MEDIUM integrity with the admin group deny-only; red with the integrity left alone, red with no group made deny-only; the positive control, launched as the daemon itself, IS elevated. A whole recording through the rule: the folder asked of the recorder (`record --where`), start, stop, and the list and delete done as it | the same Windows job |
 | `tests/recorder.rs`, the kill switch | `ROOMLERD_RECORDING=0` closes every path and says so: the state a client greys Start out with, a start, `available` (so the device stops advertising `record`), the listing and the folder a download is served from; the control, the same manager without the switch, can record. `launch::switched_off` reads only an explicit off (`0`, `false`, `off`, `no`), never a typo | "Test the recorder (FR-85)", `--test recorder` and `--lib recording::` |
-| `tests/recorder.rs` | A counter-pattern capture → openh264 recording encoder → MP4 → openh264 decode, reading the counters back (the oracle is proven to discriminate first); display change; disk-low and no-frame refusals; the real `roomlerd record` process: the stop command, stdin EOF, `kill -9` followed by `reconcile_partials`, a **live** partial left alone (red with the lock disabled); and the manager end to end (start into `record_dir`, a second start refused, stop, list, delete), a missed start deadline killing the child (red without the kill), and the refusal where there is nobody to record as | same step, `--test recorder` |
+| `tests/recorder.rs` | A counter-pattern capture → openh264 recording encoder → MP4 → openh264 decode, reading the counters back (the oracle is proven to discriminate first); display change; disk-low and no-frame refusals; the real `roomlerd record` process: the stop command, stdin EOF, `kill -9` followed by `reconcile_partials`, a **live** partial left alone (red with the lock disabled), a recorder dead during the remux losing nothing, a failed remux keeping the fragmented file under its final name with every fragment and nothing left to retry, a partial that cannot reach its folder kept for the next start, a link at the temp's name not written through, one that holds nothing or only a header removed; and the manager end to end (start into `record_dir`, a second start refused, stop, list, delete), a missed start deadline killing the child (red without the kill), and the refusal where there is nobody to record as | same step, `--test recorder` |
 | `recording::pointer` unit tests (P1d) | the pointer lands where the source says and nowhere else; a translucent pixel blends (premultiplied "over"), a transparent one changes nothing, a malformed one saturates; moving it leaves no trail (byte-equal to drawing it once at the new place); hiding it gives the frame back byte for byte; clipped at every edge and never wrapped, wholly outside draws nothing; row padding respected; an unchanged pointer re-uses the same frame; **the frame the encoder still holds is never written** (red when the canvas is written without `make_mut`); a new capture is not patched with the old one's pixels (red when `replace` keeps them), and gets the pointer even when it did not move; a frame that is not BGRA passes untouched; a scaled frame takes the position through the ratio; one poll per frame | "Test the recorder (FR-85)" (`--lib recording::`) |
 | `capture::pointer` unit tests (P1d) | Windows' straight alpha premultiplied, XFixes' words read as B, G, R, A; a short or absurd image refused, never read past; the hotspot and the display's origin both taken off, a monitor left of the primary included. Windows only: a recording's WGC session draws the pointer, the live one only under `ROOMLERD_WGC_CURSOR=1` | every unfiltered `--lib` run ("Test agent under vp9-444"); the WGC cell in "Windows recorder identity (FR-85)", which also compiles and lints the Windows capture code (WGC, DXGI, the cursor tracker) that no other lane builds |
 | `capture::pointer::x11_tests` (P1d) | against a real X server: the pointer warped to a known place reads back there less its hotspot, and less a monitor's origin; it follows a second warp; an unchanged shape is not rebuilt | `ci.yml` "The recorder's pointer on X11 (FR-85 P1d)", under Xvfb. `ROOMLERD_TEST_X11=1` makes a missing server a failure, never a skip |
