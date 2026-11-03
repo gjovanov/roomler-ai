@@ -303,11 +303,18 @@ OWN=" $(docker exec "$CID" hostname -I 2>/dev/null) "
 SEEN=" "
 for c in $("${DC[@]}" ps -q); do
   name="$(docker inspect -f '{{.Name}}' "$c")"
-  for a in $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.Gateway}} {{end}}' "$c"); do
-    case "$OWN$SEEN" in *" $a "*) continue ;; esac
-    SEEN="$SEEN$a "
-    refused "$a" "on this stack's network (${name#/})"
-  done
+  while read -r ip gw <&3; do
+    for a in $ip $gw; do
+      case "$OWN$SEEN" in *" $a "*) continue ;; esac
+      SEEN="$SEEN$a "
+      # The gateway is the host's, so it is named as that, not as the container it was read from.
+      if [ "$a" = "$gw" ]; then
+        refused "$a" "this stack's gateway"
+      else
+        refused "$a" "on this stack's network (${name#/})"
+      fi
+    done
+  done 3< <(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.Gateway}}{{println}}{{end}}' "$c")
 done
 
 # A TCP allocation would reach every TCP listener on the one address the deny list lets
