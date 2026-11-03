@@ -249,8 +249,8 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
-> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2835`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:317`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1096`, `delegate.rs:1157`; the worker side is `delegate_worker.rs:432`, wired at `app.rs:4337`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:2813`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:191`).
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:759`, `delegate.rs:796`; the worker side is `delegate_worker.rs:363`, wired at `app.rs:4298`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -258,7 +258,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 | Server | Agent | Result |
 |---|---|---|
-| Older (no field) | New | Absent reads **off** (`signaling.rs:3523`, `serde(default)`) |
+| Older (no field) | New | Absent reads **off** (`signaling.rs:3488`, `serde(default)`) |
 | New | Older | The old agent ignores the field and keeps its old behaviour, except the loopback-TURN relay, which the Hub now withholds |
 | New, policy `auto` (FR-128) | Older than `rc-overlay-auto` | The Hub reads `auto` as `off` for it: no `rc_overlay_auto`, and no relay handed out |
 | Cross-pod | | The relay envelope carries `rc_overlay`; absent reads **off** |
@@ -298,7 +298,7 @@ flowchart TD
 | the rule | `auto_allows` (`rc_overlay.rs:292`) |
 
 Notes on the implementation:
-- **It runs where the peer is built.** `RcOverlay::decide` (`rc_overlay.rs:112`) is called by the offer handler (`agents/roomlerd/src/signaling.rs:4271`), which a delegated macOS GUI worker runs too. The inputs cross to the worker inside `RcOverlay`.
+- **It runs where the peer is built.** `RcOverlay::decide` (`rc_overlay.rs:112`) is called by the offer handler (`agents/roomlerd/src/signaling.rs:4219`), which a delegated macOS GUI worker runs too. The inputs cross to the worker inside `RcOverlay`.
 - **A viewer device on a worse link stays off** (`exclude`, `rc_overlay.rs:57`). One computer can run several agents, each with its own relay: Windows and WSL, where the Windows agent is direct to its peers and the WSL one rides DERP (FR-121 P3b). A session that rides the mesh through the best one keeps every other one out of its ICE servers, its remote candidates and the offer's SDP. Otherwise ICE, which ranks relays by the order of their TURN servers, could pick the relay behind DERP.
 - **It logs one line:** `rc ICE: overlay auto (FR-128) — the session may ride the mesh` (or `stays off`), with `viewers`, `carriers`, `far_turn` (the server's hint), `own_far_turn` (D8), `allow` and `exclude`.
 - **Kill switch:** `ROOMLERD_RC_OVERLAY_AUTO=0` (`rc_overlay.rs:66`) makes `auto` behave as `off`. The device then stops advertising `rc-overlay-auto`, so the Hub reads its policy as `off` too.
@@ -323,7 +323,7 @@ flowchart LR
   - **The rule** is `far_turn_verdict` (`crates/modules/network/src/hooks.rs:168`): either end measured dead is `false`; both measured alive is `true`; anything else is not measured.
   - The gate waits at most 500 ms, then sends no hint. A slow read costs the hint, never the session.
 - **Which devices are the browser's** follows the Hub's own precedence (`viewer_devices_of`, `controller.rs:666`). Probed descriptors win over named devices, and every one the Hub hands out counts, through the Hub's own `bounded_relays` and `named_devices` (`crates/modules/fleet/src/hub.rs:104`, `:125`). The browser sends them all: the first as `local_relay`, the rest as `local_relay_also` (`ui/src/composables/useRemoteControl.ts:4250`).
-- **The target folds in its own netcheck** at the offer (D8): one LocalAPI `status` call beside the `peers` call (`own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:351`). If that netcheck found no UDP out, the far TURN is dead whatever the server saw (`with_own_reach`, `:370`). This is what measures a Mac: its RC target is the GUI worker's row, and that row has no overlay node for the hook to find (`find_live_by_agent`, `crates/services/src/dao/overlay_node.rs:413`). The per-user half answers `status` itself, so it lends the root daemon's netcheck along with the rest of the machine's network fields (`with_machine_network`, `agents/roomlerd/src/person_socket.rs:251`).
+- **The target folds in its own netcheck** at the offer (D8): one LocalAPI `status` call beside the `peers` call (`own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:351`). If that netcheck found no UDP out, the far TURN is dead whatever the server saw (`with_own_reach`, `:370`). This is what measures a Mac: its RC target is the GUI worker's row, and that row has no overlay node for the hook to find (`find_live_by_agent`, `crates/services/src/dao/overlay_node.rs:413`). The per-user half answers `status` itself, so it lends the root daemon's netcheck along with the rest of the machine's network fields (`with_machine_network`, `agents/roomlerd/src/person_socket.rs:223`).
 - **The Hub** reads `auto` as `off` for an agent that does not advertise `rc-overlay-auto` (`effective_rc_overlay`, `crates/modules/fleet/src/hub.rs:2818`). It decides this once per request, for the relay and the session alike.
 - **Under `auto` the Hub hands out the browser's relays** to both ends, as under `on` (`resolve_local_relay`, `hub.rs:3580`; `forward_offer`, `:2333`). The agent may yet take them, and it filters out itself whichever it leaves off the mesh.
 - **Across pods** the relay envelope carries `rc_overlay_auto` and `rc_overlay_far_turn` beside the bool (`rc_overlay_to_relay`, `crates/modules/remote/src/relay.rs:585`; `rc_overlay_from_relay`, `:598`). An older pod reads only the bool, so `auto` reaches it as `off`.
@@ -545,7 +545,7 @@ is tested on every OS.
 
 | Feature | When | What the hello says | What the viewer does |
 |---|---|---|---|
-| `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3599`](../agents/roomlerd/src/signaling.rs#L3599)); `no-backend` | the receive-audio toggle is off, with the device's reason |
+| `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3564`](../agents/roomlerd/src/signaling.rs#L3564)); `no-backend` | the receive-audio toggle is off, with the device's reason |
 | `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:2622`](../agents/roomlerd/src/encode/caps.rs#L2622)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows and (FR-97 P3e-3a) a Linux X11 session, whose watchers report copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
@@ -793,7 +793,7 @@ sequenceDiagram
 - **The decision is one pure function**
   ([`sas.rs:97`](../agents/roomlerd/src/input/sas.rs#L97)), compiled on every
   OS so the lanes that never run Windows tests check it. It is made at every
-  announcement ([`signaling.rs:7391`](../agents/roomlerd/src/signaling.rs#L7391)),
+  announcement ([`signaling.rs:7339`](../agents/roomlerd/src/signaling.rs#L7339)),
   and the heartbeat re-announces the moment its answer changes, so a policy a
   GPO refresh changes reaches the server within a beat. Where it says no, the
   `keys-only` entry stays and its reason names the half that is missing.
@@ -804,7 +804,7 @@ sequenceDiagram
 - **The frame goes through the input arbiter like a key**, so it needs the
   input floor and the session's input permission, as typing does. The injector
   then checks again
-  ([`enigo_backend.rs:277`](../agents/roomlerd/src/input/enigo_backend.rs#L277)):
+  ([`enigo_backend.rs:282`](../agents/roomlerd/src/input/enigo_backend.rs#L282)):
   the policy can change between the hello and the click, and a viewer is not
   trusted to have read the hello.
 - **The relay** ([`sas_relay.rs:43`](../agents/roomlerd/src/win_service/sas_relay.rs#L43))
@@ -1684,6 +1684,74 @@ seam. Still owed on real devices: a tablet with a hardware keyboard, a phone
 with a Bluetooth keyboard (Android and iOS: Backspace and Enter from the OS
 keyboard once), and a desktop with the soft keyboard toggled on.
 
+### 6.4 Typed text and the target's key state (#3047)
+
+A printable character reaches a Windows agent as `KeyText`, one frame per
+character, and `win_text::type_text` presses the real key for it: one `SendInput`
+holding `Shift↓ X↓ X↑ Shift↑` (`tap_vk`,
+`agents/roomlerd/src/input/win_text.rs:194`). To correct letters for CapsLock it
+has to know the target's CapsLock, which is per thread, so it attaches to the
+foreground thread to read it (`capslock_on`, `:244`). Microsoft documents that
+key state is reset after a call to `AttachThreadInput`.
+
+Until #3047 that read ran once per frame. A reset falling between the target
+reading `Shift↓` and reading the key Shift was for lost Shift, because by then the
+async state already said Shift was up:
+
+```mermaid
+sequenceDiagram
+    participant A as Agent's injector
+    participant Q as Target's input queue
+    participant T as Target thread
+    A->>Q: frame n: Shift↓ X↓ X↑ Shift↑, one SendInput
+    T->>Q: reads Shift↓
+    A->>T: frame n+1: attach and detach, key state reset
+    T->>Q: reads X↓. Shift is up now, so X comes out unshifted
+```
+
+How often that happens depends on what the target spends on a key. Read on a
+de-AT guest under SystemContext, in a real session typing into a text box that
+sleeps on every key-down, Shift's included. Each burst is 1,147 characters, 386 of
+them shifted. Windows rounds a sleep up to its 15.6 ms tick, so the 3 ms and 10 ms
+rows ran at about the same speed.
+
+| Sleep per key-down | Injection on released | Shifted characters lost on released 0.4.197 | Last one lost | Lost on the candidate |
+|---|---|---|---|---|
+| none, three runs | 3.7 to 4.2 s | 34, 36, 25, anywhere in the line | 1109, 1141, 1060 | 0, 0, 0 |
+| 3 ms | 4.5 s | 63 | 210 | 0 |
+| 10 ms | 3.5 s | 54 | 157 | 0 |
+| 30 ms | 2.7 s | 18 | 52 | 0 |
+
+- A target that keeps up loses about one shifted character in twelve, anywhere.
+- A target spending time on each key loses nearly every one until injection ends,
+  and then none, because the resets stop and the backlog drains correctly: a clean
+  split at chars per second × injection time. The split doesn't follow the length
+  of the burst: at 10 ms, 400 characters split at 15 and 2,400 at 69.
+- The injected keys were right in every case. A hook on the guest saw Shift held
+  for every character the target lost, so the agent never believed Shift was
+  already down. ⚠️ A keyboard hook cannot show this bug. Only what the target
+  translated can.
+
+Under SystemContext the same thing reaches the locked screen, where a lost Shift is
+a failed login. A password of 99 shifted characters, typed with no delay on de-AT,
+failed on released 4 times out of 4. Typed at 150 ms a character on the same build
+it logged in on 3 of 5 tries, so the password itself reaches the box. The candidate
+logged in fast 4 times out of 4.
+
+`caps_for_frame` (`:292`) now reads once per run of typing. A read stands for as
+long as frames keep coming within `CAPS_FRESH_FOR`, 2 s of each other, on one
+foreground thread. A CapsLock key frame clears it (`caps_changed`, `:309`, called
+from `agents/roomlerd/src/input/enigo_backend.rs:231`), so the letters after it
+take the new state (read with CapsLock toggled twice inside a run of typing,
+`abcDEFabcDEFabcDEF`). Injecting 1,147 characters went from about 3.7 s to about
+0.9 s, because the attach was costing about 2.5 ms a character.
+
+Two corners are accepted. A CapsLock toggled at the host's own keyboard while a
+controller types isn't seen until a 2 s pause. And a read after such a pause, with
+a slow target still draining a backlog, can lose the one character it lands on.
+
+⚠️ Nothing on the per-frame path may call `AttachThreadInput`.
+
 ## 7. Signaling protocol (`rc:*` namespace)
 
 Extension to the existing WebSocket. All messages are JSON envelopes; the existing `WS Handler` routes by prefix.
@@ -2321,7 +2389,7 @@ sequenceDiagram
 
 **What `ask` means.** A feature set to `ask` survives only a session that the person at the
 device approves on a prompt naming it ("Approving also allows clipboard, file transfer and
-audio.", [`session_policy.rs:202`](../agents/roomlerd/src/session_policy.rs#L202)). Every other
+audio.", [`session_policy.rs:183`](../agents/roomlerd/src/session_policy.rs#L183)). Every other
 session goes without it, with a reason:
 
 | Reason | When |
@@ -2333,8 +2401,8 @@ session goes without it, with a reason:
 | `policy_unavailable` | the org's row could not be read. The session goes ahead without the features asked for |
 
 - ⚠️ **The device enforces the floor itself.** The hub's strip is so the viewer can say why before
-  the person clicks. The agent masks the grant ([`mask`, `session_policy.rs:147`](../agents/roomlerd/src/session_policy.rs#L147),
-  applied at [`signaling.rs:3801`](../agents/roomlerd/src/signaling.rs#L3801)) the moment the consent
+  the person clicks. The agent masks the grant ([`mask`, `session_policy.rs:128`](../agents/roomlerd/src/session_policy.rs#L128),
+  applied at [`signaling.rs:3759`](../agents/roomlerd/src/signaling.rs#L3759)) the moment the consent
   mode resolves, before anything reads it. A request carrying `FILES` with no policy at all, as from a
   bypassed hub, is masked to no `FILES` when the floor says `off`
   (`the_device_floor_holds_when_the_server_sends_no_policy`). Field-verified on 0.4.136, with the red
@@ -2460,12 +2528,12 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   `enforce` can ask only about a browser the device has never met.
 - **When the config moves, its keys go with it** (#3096). A SystemContext worker that runs on the person's config
   promotes it to the machine-global path after a healthy run
-  ([`self_heal_machine_global_config`, `app.rs:1205`](../agents/roomlerd/src/app.rs#L1205)). The `peer-auth/` files
+  ([`self_heal_machine_global_config`, `app.rs:1199`](../agents/roomlerd/src/app.rs#L1199)). The `peer-auth/` files
   go first, never over a file already there, and the config is not promoted without them
-  ([`promote`, `peer_auth.rs:741`](../agents/roomlerd/src/peer_auth.rs#L741)). A config promoted before that has no
+  ([`promote`, `peer_auth.rs:736`](../agents/roomlerd/src/peer_auth.rs#L736)). A config promoted before that has no
   keys beside it. So an enrollment with no key at the machine-global path takes the one the active user's config
   holds for it, when that config carries the same enrollment, the same machine and agent id
-  ([`adoption_source`, `peer_auth.rs:689`](../agents/roomlerd/src/peer_auth.rs#L689)), instead of minting one. A
+  ([`adoption_source`, `peer_auth.rs:684`](../agents/roomlerd/src/peer_auth.rs#L684)), instead of minting one. A
   minted key reads as `key-changed` in every browser that pinned the device, whose identity did not change. With
   nobody signed in there is no active user, and that first start still mints.
 - **The policy is the device owner's**: `roomler config set peer_auth off|audit` (default `audit`), live, and only
@@ -2690,7 +2758,7 @@ sequenceDiagram
 | | |
 |---|---|
 | Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:13925`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:13903`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4285`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:13934`) |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4233`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:13934`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:104`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:677`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:342`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:805`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:434`, #2326) |
@@ -2753,8 +2821,8 @@ own `rc:terminate`), not on the controller-ended one, where `ended_at` is alread
 hears the terminate and `merge_live_stats` matches nothing. So a session with no tick after the
 observation — overwhelmingly a short one — recorded none, which the freeze reads as `unknown`. Since
 P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:951`)
-and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2612`), by the
-same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:7277`) queues the sample on
+and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2590`), by the
+same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:7225`) queues the sample on
 **the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:288`) — the loop's outbound
 queue for its own session, flushed to the WS one hop later, or the delegation channel for a delegated
 session, so a supervised Mac's sample reaches the server under the daemon's identity, the one the
@@ -4232,14 +4300,14 @@ is silent while it waits.
   `carrier_ready`, `consent`, `device_end`, `tunnel_reap`,
   `quic_setup`, `delegated`, and `ws.text` / `ws.ping` / `ws.pong` /
   `ws.close` / `ws.error` / `ws.other`
-  (`agents/roomlerd/src/signaling.rs:2094` onwards).
+  (`agents/roomlerd/src/signaling.rs:2080` onwards).
 - The connection's setup awaits too, with the pump already counting.
   It reads `setup`, and `setup.overlay` while the overlay runtime
-  starts or re-attaches (`agents/roomlerd/src/signaling.rs:1661`).
+  starts or re-attaches (`agents/roomlerd/src/signaling.rs:1647`).
   Only the loop waiting for its next event reads `select`.
 - A `ws.text` arm is refined to the message it is handling, read
   from the JSON's `t` (`ws.text:rc:ssh.response`; `server_msg_tag`,
-  `agents/roomlerd/src/signaling.rs:6985`). The dispatch awaits per
+  `agents/roomlerd/src/signaling.rs:6933`). The dispatch awaits per
   message, so that is where a stall inside it shows.
 - The `StageGuard` (`watchdog.rs:446`) puts the pump back to
   `select` when the arm's scope ends, however it ends. An arm that
@@ -4286,7 +4354,7 @@ table), on a host whose adapters and routes churn.
   `max - min` per bucket, so a zero would read as a since-boot spike.
 - The arm is staged step by step: `heartbeat.flows`, `heartbeat.sys`,
   `heartbeat.caps`, `heartbeat.send`, `heartbeat.stats`
-  (`agents/roomlerd/src/signaling.rs:2345` onwards).
+  (`agents/roomlerd/src/signaling.rs:2331` onwards).
 - The encoder capability probe never runs in the heartbeat.
   `caps::detect()` is memoized per process, so only its first call
   probes.
@@ -4298,7 +4366,7 @@ table), on a host whose adapters and routes churn.
     with the device offline.
   - It is now warmed at the top of `run`, before any connect, while the
     pump is gated off and on a blocking thread
-    (`agents/roomlerd/src/signaling.rs:929`).
+    (`agents/roomlerd/src/signaling.rs:915`).
 
 **What a stall leaves behind** (#3018). Until #3018 the
 watchdog-of-watchdog wrote one stderr line and exited. On 2026-10-26
@@ -4363,7 +4431,7 @@ ruled out by the rule above. The lock behind that borrow is what held it.
   feature includes `parking_lot`. It is task-fair: once a writer waits,
   a new `read()` parks, even on a thread that already holds a read guard.
 - `DaemonState::status()`
-  (`agents/roomlerd/src/localapi_state.rs:760`) built `NodeStatus` as
+  (`agents/roomlerd/src/localapi_state.rs:734`) built `NodeStatus` as
   one struct literal, and ten of its fields each called
   `self.overlay.borrow()`. A temporary lives until the literal is
   finished, so every field's guard was still held when the next field

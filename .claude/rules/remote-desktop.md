@@ -69,6 +69,16 @@ VAAPI / D3D12 / Vulkan / VideoToolbox) — lives in the **`encoder-cells` skill*
   the hello never advertised.
 - ⚠️ **A probe proves an OPEN; only a SESSION proves a CELL.**
 
+### Input: typed text never attaches per frame (#3047)
+
+`KeyText` reads the target's CapsLock through `AttachThreadInput`, and that call resets
+the target's key state. Read once a frame, it landed between the target reading
+Shift-down and reading the key Shift was for, and the character came out unshifted.
+⚠️ **The read stays once per run of typing (`caps_for_frame`, `docs/remote-control.md`
+§6.4), and nothing on the per-frame path may attach to another thread's input.**
+⚠️ A keyboard hook cannot see this bug: every lost character shows Shift held, because
+the injected keys were right. Read what the target translated.
+
 ### Host consent (FR-27, closed — the macOS native panel is still unverified)
 
 Moved from CLAUDE.md's Known Issues, verbatim; the full field log is in `docs/fr/FR-27-consent-surfaces-and-desktop-companion.md`.

@@ -5,6 +5,8 @@ import {
   DEVICE_ID_PLACEHOLDER,
   enrollCommands,
   installCards,
+  LINUX_ARM64_LABEL,
+  LINUX_WIZARD_NEEDS,
   type EnrollOptions,
   type OsCommands,
 } from '@/utils/enrollCommands'
@@ -267,6 +269,50 @@ describe('enrollCommands', () => {
         enrollCommands('agent', ORIGIN, null).find((o) => o.os === card.os)!.blocks[0]!.command,
       )
     }
+  })
+
+  it('says what the Linux wizard needs first, wherever it is offered, and only there (#3202)', () => {
+    const on: EnrollOptions = { wizardLinuxDaemon: true, wizardMacosDaemon: true }
+    for (const kind of ['agent', 'tunnel'] as const) {
+      for (const scope of SCOPES) {
+        for (const os of enrollCommands(kind, ORIGIN, TOKEN, scope, false, on)) {
+          const wizard = os.blocks.find((b) => b.isDownload)
+          expect(wizard?.hint, `${kind} ${scope} ${os.os}`).toBe(os.os === 'linux' ? LINUX_WIZARD_NEEDS : undefined)
+        }
+      }
+    }
+    // The library and both package names, so a person can act on the line.
+    for (const words of ['WebKitGTK 4.1', 'libwebkit2gtk-4.1-0', 'webkit2gtk4.1']) {
+      expect(LINUX_WIZARD_NEEDS).toContain(words)
+    }
+    expect(installCards(ORIGIN, on).map((c) => [c.os, c.wizardHint])).toEqual([
+      ['windows', null],
+      ['linux', LINUX_WIZARD_NEEDS],
+      ['macos', null],
+    ])
+    // No button, no line.
+    expect(installCards(ORIGIN).map((c) => c.wizardHint)).toEqual([null, null, null])
+  })
+
+  it('offers the ARM64 Linux wizard beside the x86_64 one, and only there (#3247 item 13)', () => {
+    const on: EnrollOptions = { wizardLinuxDaemon: true, wizardMacosDaemon: true }
+    const arm64 = { label: LINUX_ARM64_LABEL, url: `${ORIGIN}/api/setup/linux-aarch64` }
+    for (const kind of ['agent', 'tunnel'] as const) {
+      for (const scope of SCOPES) {
+        for (const os of enrollCommands(kind, ORIGIN, TOKEN, scope, false, on)) {
+          const wizard = os.blocks.find((b) => b.isDownload)
+          expect(wizard?.alt, `${kind} ${scope} ${os.os}`).toEqual(os.os === 'linux' ? arm64 : undefined)
+          if (os.os === 'linux') expect(wizard?.command).toBe(`${ORIGIN}/api/setup/linux`)
+        }
+      }
+    }
+    expect(installCards(ORIGIN, on).map((c) => [c.os, c.wizardAlt])).toEqual([
+      ['windows', null],
+      ['linux', arm64],
+      ['macos', null],
+    ])
+    // No button, no link.
+    expect(installCards(ORIGIN).map((c) => c.wizardAlt)).toEqual([null, null, null])
   })
 
   it('never emits the retired binary names or a hardcoded server', () => {
