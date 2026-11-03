@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="windows-1252"?>
 <!-- RETIRED-NAME-ANCHOR-BEGIN
      Every retired name here is MSI identity or legacy cleanup: the
-     roomler_agent_exe FileKey that CustomActions reference and upgrades key off,
+     roomler_agent_exe FileKey that upgrades key off,
      the inert roomler-agent.exe alias the deployed fleet still resolves, and the
      pre-P4b install folder this package vacates.
      INVARIANT: an MSI identifier that ships cannot be renamed without breaking
@@ -24,7 +24,8 @@
   Autostart: registered automatically on every install + upgrade via the
   RegisterAutostart custom action below. The action shells out to
   `roomlerd service install` which writes a Schema 1.2 Task
-  Scheduler XML with restart-on-failure + battery-defeat settings (see
+  Scheduler XML with battery-defeat settings and, on an enrolled machine,
+  a start shortly after (see
   agents/roomlerd/src/service.rs::render_task_xml). Symmetric
   UnregisterAutostart hook runs `service uninstall` before the EXE is
   removed during uninstall. Both actions Return="ignore" so an
@@ -32,6 +33,15 @@
   Win11 quirk that bit us 2026-04-29) doesn't sink the whole MSI —
   operator can still recover via the manual schtasks delete + service
   install path documented in packaging/windows/README.txt.
+
+  roomlerdw.exe (#3292): the windowless launcher. The task, the custom
+  actions and the Start menu entry all run through it, because Windows opens
+  a terminal for any console program started from one of those, on the
+  person's desktop, in the foreground. It starts its sibling roomlerd.exe with
+  the arguments it was given and leaves with its exit code. Each custom action's
+  FileKey is therefore the launcher's. A MajorUpgrade runs the OLD product's
+  UnregisterAutostart from the OLD MSI's table, so the jump from a release
+  before the launcher can still flash one terminal.
 
   Why this works without UAC: perUser MSIs run in the user's token
   context. Custom actions with Execute="deferred" Impersonate="yes"
@@ -78,8 +88,19 @@
             InstallScope='perUser'
             SummaryCodepage='1252' />
 
+        <!--
+          #3292: IgnoreRemoveFailure: an old product that cannot leave must not end a
+          device's updates. A standard user's rollback leaves the failed product
+          registered with no package (166 "Error in rollback skipped"), and a cleaned
+          C:\Windows\Installer does the same to a healthy one: every later release stopped
+          at Error 1714, System Error 1612. With this, a self-update lays the new files, the
+          task and the one-shots as usual, at the price of a stale Apps entry. An action
+          failing inside the old product's removal carries on too, with nothing played back.
+          By hand with the daemon running it does not help: Error 1310, exit 1603, no harm.
+        -->
         <MajorUpgrade
-            Schedule='afterInstallInitialize'
+            Schedule='afterInstallExecute'
+            IgnoreRemoveFailure='yes'
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.' />
 
         <!--
@@ -114,14 +135,14 @@
                                 Value='1'
                                 KeyPath='yes' />
                             <!-- P3d Slice B: the daemon EXE is now `roomlerd.exe`.
-                                 The File Id stays `roomler_agent_exe` so every
-                                 <CustomAction FileKey='roomler_agent_exe'> below
-                                 still resolves to THIS (the real daemon) file. The
-                                 component Id + Guid are unchanged for stable
-                                 component identity across upgrade. -->
-                            <!-- RETIRED-NAME-ANCHOR(3): an MSI FileKey is installer IDENTITY; five
-                                 CustomActions reference it and upgrades key off it, so it is frozen
-                                 deliberately. docs/fr/FR-21 -->
+                                 The File Id stays `roomler_agent_exe`, and the
+                                 component Id + Guid are unchanged, for stable
+                                 component identity across upgrade. The custom actions
+                                 below run through the launcher, which starts THIS
+                                 (the real daemon) file. -->
+                            <!-- RETIRED-NAME-ANCHOR(3): an MSI FileKey is installer IDENTITY, and
+                                 upgrades key off it, so it is frozen deliberately, though #3292 moved
+                                 this flavour's CustomActions to the launcher's. docs/fr/FR-21 -->
                             <File
                                 Id='roomler_agent_exe'
                                 Name='roomlerd.exe'
@@ -190,6 +211,29 @@
                                 Part='last'
                                 Action='set'
                                 System='no' />
+                        </Component>
+                        <!-- #3292: what the per-user Scheduled Task, the custom
+                             actions and the Start menu entry run, so that no
+                             terminal opens on the person's desktop. The workflow
+                             builds target\release\roomlerdw.exe via
+                             `cargo build -p roomlerdw [dash][dash]release` and signs
+                             it with the rest of the payload. Per-user only: the
+                             service's supervisor starts its worker windowless by
+                             itself. HKCU KeyPath like siblings (ICE38,
+                             user-profile dir). -->
+                        <Component Id='LauncherExe' Guid='5EB7791A-B52B-4E33-ADE3-2026B3AAA188'>
+                            <RegistryValue
+                                Root='HKCU'
+                                Key='Software\Roomler\Agent'
+                                Name='installed_launcher'
+                                Type='integer'
+                                Value='1'
+                                KeyPath='yes' />
+                            <File
+                                Id='roomlerdw_exe'
+                                Name='roomlerdw.exe'
+                                DiskId='1'
+                                Source='target\release\roomlerdw.exe' />
                         </Component>
                         <Component Id='LicenseTxt' Guid='4B1D2E80-6F3C-4B2A-9E1D-7A2B3C4D5E6F'>
                             <RegistryValue
@@ -298,13 +342,15 @@
                              product's; its Id and the component's Guid are identity
                              and stay. MajorUpgrade runs afterInstallInitialize, so
                              the old product (and its old .lnk) is removed before
-                             this one installs. -->
+                             this one installs. #3292: it starts the task, through
+                             the launcher, so a click opens no terminal and never
+                             leaves a daemon nothing supervises. -->
                         <Shortcut
                             Id='AgentShortcut'
                             Name='Roomler'
                             Description='Roomler Daemon — private mesh network + secure remote control'
-                            Target='[APPLICATIONFOLDER]roomlerd.exe'
-                            Arguments='run'
+                            Target='[APPLICATIONFOLDER]roomlerdw.exe'
+                            Arguments='service start'
                             WorkingDirectory='APPLICATIONFOLDER' />
                         <RemoveFolder Id='CleanupProgramMenuSubfolder' On='uninstall' />
                         <RegistryValue
@@ -332,6 +378,8 @@
             <ComponentRef Id='AgentExe' />
             <!-- P4b: tunnel CLI + user-PATH append. -->
             <ComponentRef Id='TunnelExe' />
+            <!-- #3292: the windowless launcher. -->
+            <ComponentRef Id='LauncherExe' />
             <ComponentRef Id='LicenseTxt' />
             <ComponentRef Id='ReadmeTxt' />
             <ComponentRef Id='WintunDll' />
@@ -354,7 +402,7 @@
         -->
         <CustomAction
             Id='RegisterAutostart'
-            FileKey='roomler_agent_exe'
+            FileKey='roomlerdw_exe'
             ExeCommand='service install'
             Execute='deferred'
             Impersonate='yes'
@@ -369,9 +417,72 @@
         -->
         <CustomAction
             Id='UnregisterAutostart'
-            FileKey='roomler_agent_exe'
+            FileKey='roomlerdw_exe'
             ExeCommand='service uninstall'
             Execute='deferred'
+            Impersonate='yes'
+            Return='ignore' />
+
+        <!--
+          #3292: stop a running daemon at an uninstall. Restart Manager does not:
+          the daemon declines its ENDSESSION_CLOSEAPP on purpose
+          (docs/ephemeral-nodes.md), the log still says "Successfully shut down all
+          applications", there is no event 10002, and the daemon runs on (measured
+          0.4.196 to 0.4.197). Without this action an uninstall exits 0 and leaves it
+          running with its files gone. A plain `service stop`, so an ephemeral device
+          removes itself: it is leaving. It asks through the daemon's stop event and
+          otherwise ends the task, whose kill-on-close job takes the daemon.
+          Return="ignore" because a failure here must not fail an uninstall.
+        -->
+        <CustomAction
+            Id='StopDaemon'
+            FileKey='roomlerdw_exe'
+            ExeCommand='service stop'
+            Execute='deferred'
+            Impersonate='yes'
+            Return='ignore' />
+
+        <!--
+          #3292: the stop on an upgrade, from the NEW product, so it also reaches a
+          daemon from a release without these actions. Otherwise that daemon stays in
+          its terminal on renamed files until the next sign-in, and the new task's
+          one-shots exit 8. The for-upgrade flag records an update attempt first: a
+          stop during an upgrade must not unenroll an ephemeral device (#1683,
+          updater::should_self_unenroll).
+        -->
+        <CustomAction
+            Id='StopOldDaemon'
+            FileKey='roomlerdw_exe'
+            ExeCommand='service stop --for-upgrade'
+            Execute='deferred'
+            Impersonate='yes'
+            Return='ignore' />
+
+        <!--
+          #3292: what a rollback puts back. The old product's UnregisterAutostart
+          has no rollback of its own, so an upgrade that fails after
+          RemoveExistingProducts restores the old files and leaves no task, or this
+          product's task naming a launcher the rollback just removed, and past
+          StopOldDaemon no daemon either: offline, even at the next sign-in.
+          These run the RESTORED roomlerd.exe, the one file every release has, so the
+          task is the one that release writes, and each flashes a terminal, on a failed
+          upgrade only. `service start` is here because a release before the one-shot
+          triggers registers a task that starts nothing until the next sign-in; with a
+          daemon that never stopped, the second start exits 8.
+          An uninstall that fails gets the same.
+        -->
+        <CustomAction
+            Id='AutostartBackOnRollback'
+            FileKey='roomler_agent_exe'
+            ExeCommand='service install'
+            Execute='rollback'
+            Impersonate='yes'
+            Return='ignore' />
+        <CustomAction
+            Id='DaemonBackOnRollback'
+            FileKey='roomler_agent_exe'
+            ExeCommand='service start'
+            Execute='rollback'
             Impersonate='yes'
             Return='ignore' />
 
@@ -390,7 +501,7 @@
         -->
         <CustomAction
             Id='CleanupLegacyPerMachine'
-            FileKey='roomler_agent_exe'
+            FileKey='roomlerdw_exe'
             ExeCommand='cleanup-legacy-install --target-flavour perUser'
             Execute='deferred'
             Impersonate='yes'
@@ -398,23 +509,43 @@
 
         <InstallExecuteSequence>
             <!--
+              #3292: ahead of RemoveExistingProducts, because a rollback plays the
+              script backwards: the old product's files must be back when these run.
+              So the task comes back first, and then the start that needs it.
+              InstallExecute sits between them and RemoveExistingProducts because
+              Windows Installer refuses that action with anything spooled ahead of it:
+              Error 2613, exit 1603, on every upgrade, and ICE63 only warns. It flushes
+              these two and nothing else, so the old product's removal still runs before
+              any file of this one. installer-smoke holds this order against the built
+              MSI, because WiX puts actions sharing a parent in name order.
+            -->
+            <Custom Action='DaemonBackOnRollback' After='InstallInitialize'>
+                WIX_UPGRADE_DETECTED OR (REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE)
+            </Custom>
+            <Custom Action='AutostartBackOnRollback' After='DaemonBackOnRollback'>
+                WIX_UPGRADE_DETECTED OR (REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE)
+            </Custom>
+            <InstallExecute After='AutostartBackOnRollback' />
+            <!--
               Run RegisterAutostart on every fresh install, repair,
               and MajorUpgrade. Skip during full uninstall — there's
               nothing to register and the EXE is about to be deleted
               anyway. The condition leaves it active for upgrade
               installs (which are technically "REMOVE=ALL" of the
               old + install of the new, scheduled separately).
+              #3292: last before the commit, because the task it writes
+              names the launcher. A failure after it rolls an upgrade from
+              a release without the launcher back to that release, and
+              AutostartBackOnRollback has to overwrite a task that names a
+              file the rollback removed.
             -->
-            <Custom Action='RegisterAutostart' After='InstallFiles'>
+            <Custom Action='RegisterAutostart' Before='InstallFinalize'>
                 NOT (REMOVE="ALL")
             </Custom>
             <!--
               rc.18: scrub stale artefacts AFTER the new EXE lands
-              (so we can shell out to it). NB both this and
-              RegisterAutostart are After='InstallFiles'; WiX v3
-              breaks the tie in DOCUMENT order, so RegisterAutostart
-              actually runs FIRST (an earlier comment here claimed
-              the opposite). Ordering is immaterial: the helper's
+              (so we can shell out to it). This now runs before
+              RegisterAutostart. Ordering is immaterial: the helper's
               CA-reachable step only sweeps the vacated pre-rename
               install dir (P4b), and its cross-flavour arms — which
               touch the other flavour's task/service namespace — are
@@ -425,12 +556,32 @@
                 NOT (REMOVE="ALL")
             </Custom>
             <!--
+              #3292: after InstallFiles, because it runs the new launcher. The
+              updater's daemon has already left, so there it finds no event, and no
+              task to end either, the old one being gone and the new one not yet
+              written. A repair or a fresh install has no WIX_UPGRADE_DETECTED and
+              leaves a running daemon alone.
+            -->
+            <Custom Action='StopOldDaemon' After='CleanupLegacyPerMachine'>
+                WIX_UPGRADE_DETECTED
+            </Custom>
+            <!--
               Run UnregisterAutostart only during full uninstall,
               and BEFORE RemoveFiles so the EXE we shell out to is
               still on disk.
             -->
             <Custom Action='UnregisterAutostart' Before='RemoveFiles'>
                 REMOVE="ALL"
+            </Custom>
+            <!--
+              #3292: BEFORE UnregisterAutostart, because deleting the task orphans
+              a running instance and `service stop` falls back to ending that task.
+              REMOVE="ALL" also holds for the OLD product during a MajorUpgrade,
+              which UPGRADINGPRODUCTCODE tells apart: an upgrade's stop is
+              StopOldDaemon, and it must not be this plain one.
+            -->
+            <Custom Action='StopDaemon' Before='UnregisterAutostart'>
+                REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE
             </Custom>
         </InstallExecuteSequence>
     </Product>

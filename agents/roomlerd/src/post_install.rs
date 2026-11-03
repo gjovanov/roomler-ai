@@ -79,10 +79,11 @@
 //!    the service STOPPED (the MSI never reached StartServices), Restart
 //!    Manager can stop the NEW service after the install has finished, and a
 //!    host that stays down is worse than any install verdict. Elsewhere the
-//!    agent comes back at the next logon (the per-user Scheduled Task), within
-//!    5 s (systemd, `Restart=always`), or through the `.pkg`'s postinstall
-//!    (launchd skips a clean exit); the new binary reads `last-install.json`
-//!    at startup.
+//!    agent comes back within a minute of the install (the per-user Scheduled
+//!    Task, whose registration by the new MSI adds the one-shot starts: #3292,
+//!    `service::windows::start_soon_triggers`), within 5 s (systemd,
+//!    `Restart=always`), or through the `.pkg`'s postinstall (launchd skips a
+//!    clean exit); the new binary reads `last-install.json` at startup.
 //!
 //! ## What this is NOT
 //!
@@ -311,6 +312,7 @@ pub fn watch(
     // leave the host's SCM service stopped. The settle can take up to
     // SERVICE_SETTLE_BUDGET, so the install's own verdict is on disk
     // first: a watcher that dies mid-settle still leaves it behind.
+    // perUser: a failed verdict starts the task.
     #[cfg(target_os = "windows")]
     {
         let _ = write_outcome(&outcome);
@@ -574,12 +576,15 @@ fn run_recovery_cmd(cmd: &str, args: &[&str]) {
 /// a worker whose token lacks SERVICE_START on a LocalSystem service.
 /// The verdict records that honestly ([`ServiceVerdict::Denied`])
 /// instead of pretending the net exists where it can't act.
+///
+/// A per-user device has a task instead, [`start_user_daemon_after_a_failure`].
 #[cfg(target_os = "windows")]
 fn ensure_service_running(
     outcome: &mut InstallOutcome,
     flavour: crate::updater::WindowsInstallFlavour,
 ) {
     if flavour != crate::updater::WindowsInstallFlavour::PerMachine {
+        start_user_daemon_after_a_failure(outcome);
         return;
     }
     let name = crate::win_service::NEW_SERVICE_NAME;
@@ -603,6 +608,44 @@ fn ensure_service_running(
     outcome
         .note
         .push_str(&format!("service {name}: {}", settle.describe()));
+}
+
+/// #3292 — a per-user daemon has left for this installer, and only a successful
+/// install has a `service install` whose one-shot triggers bring it back. A failed
+/// one can have run nothing at all: msiexec exits 1618 while another install holds
+/// the machine's mutex, so no rollback action had a turn, and the old task fires at
+/// the next sign-in. Harmless if a rollback already started it: `IgnoreNew` drops
+/// this one. This runs in the watcher of the release being updated FROM, so the
+/// first update onto this code does not have it.
+#[cfg(target_os = "windows")]
+fn start_user_daemon_after_a_failure(outcome: &mut InstallOutcome) {
+    if !user_daemon_needs_a_start(&outcome.status) {
+        return;
+    }
+    let said = match crate::service::start() {
+        Ok(()) => {
+            tracing::info!("the install failed: asked the task to start the daemon");
+            "asked the task to start the daemon".to_string()
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "the install failed, and the daemon could not be started");
+            format!("could not start the daemon: {e:#}")
+        }
+    };
+    if !outcome.note.is_empty() {
+        outcome.note.push_str("; ");
+    }
+    outcome.note.push_str(&said);
+}
+
+/// Exit 0 means the new task is registered, verified or not, and its one-shots do
+/// this. A start from here would race Restart Manager's late stop (#2711).
+#[cfg(any(target_os = "windows", test))]
+fn user_daemon_needs_a_start(status: &InstallStatus) -> bool {
+    matches!(
+        status,
+        InstallStatus::InstallerFailed | InstallStatus::Timeout
+    )
 }
 
 // ─── #2711 — settle the service, never probe it once ─────────────────────────
@@ -1423,6 +1466,19 @@ mod tests {
         for (status, expected) in cases {
             let json = serde_json::to_string(&status).unwrap();
             assert_eq!(json, expected);
+        }
+    }
+
+    #[test]
+    fn only_a_failed_install_starts_a_per_user_daemon() {
+        for (status, want) in [
+            (InstallStatus::InProgress, false),
+            (InstallStatus::SucceededVerified, false),
+            (InstallStatus::SucceededUnverified, false),
+            (InstallStatus::InstallerFailed, true),
+            (InstallStatus::Timeout, true),
+        ] {
+            assert_eq!(user_daemon_needs_a_start(&status), want, "{status:?}");
         }
     }
 
