@@ -187,8 +187,9 @@ the slowest of the 14 rolls had a median socket back at 26 s.
 ⚠️ **The wait is drawn, not fixed,** because a roll ends a whole fleet's sockets in the same millisecond. At most
 1 s keeps the promise above.
 
-⚠️ **Off is the ladder as it was.** `FlatRedial::off` always answers `None`, and the switch turns on for exactly
-`1`, which is what the config bridge writes for `true`, so a typo stays on the ladder. Set `ws_flat_redial = true`
+⚠️ **Off is the ladder as it was.** `FlatRedial::off` always answers `None`, and the switch is read as every
+opt-in gate is (`tunnel_core::env::flag`): `1`, `true`, `yes` or `on` turn it on, and anything else, a typo
+included, stays on the ladder. Set `ws_flat_redial = true`
 in the config or `ROOMLERD_WS_FLAT_REDIAL=1`, and restart. It is a device-side key and not pushable from the
 server: turning a floor's behaviour on is a decision made on the device or by a release, as FR-132 decided for
 `zero_copy`.

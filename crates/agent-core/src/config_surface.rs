@@ -4196,7 +4196,7 @@ mod tests {
                 .get("WS_FLAT_REDIAL")
                 .map(String::as_str),
             Some("1"),
-            "the one value FlatRedial turns on for"
+            "what the bridge writes for true, which FlatRedial's gate reads as on"
         );
         apply(&mut cfg, "ws_flat_redial", None).unwrap();
         assert_eq!(cfg.ws_flat_redial, None, "clear → built-in default");

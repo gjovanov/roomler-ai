@@ -76,15 +76,11 @@ impl FlatRedial {
         )
     }
 
-    /// The switch: `ws_flat_redial` in the config, or `ROOMLERD_WS_FLAT_REDIAL`.
+    /// The switch: `ws_flat_redial` in the config, or `ROOMLERD_WS_FLAT_REDIAL`,
+    /// read as every opt-in gate is: `1`, `true`, `yes` or `on`, and anything
+    /// else, a typo included, leaves the ladder.
     pub fn from_config() -> Self {
-        Self::from_value(tunnel_core::env::node_env("WS_FLAT_REDIAL").as_deref())
-    }
-
-    /// Exactly `1`, what the config bridge writes for `true`: a typo stays on the
-    /// ladder, because this loop is the connectivity floor.
-    fn from_value(value: Option<&str>) -> Self {
-        if value == Some("1") {
+        if tunnel_core::env::flag("WS_FLAT_REDIAL", false) {
             Self::on()
         } else {
             Self::off()
@@ -104,7 +100,7 @@ impl FlatRedial {
     /// The wait in place of the ladder's after a failed dial, spending one redial.
     /// `None` means the ladder decides: not a 502, or nothing left to spend.
     pub fn step(&mut self, lb_502: bool) -> Option<Duration> {
-        if !lb_502 || self.left == 0 || "RED" == "RED" {
+        if !lb_502 || self.left == 0 {
             return None;
         }
         self.left -= 1;
@@ -250,33 +246,13 @@ mod tests {
         assert_eq!(flat.step(true), None);
     }
 
-    /// FR-28 — on only for what the config bridge writes for `true`. The floor
-    /// never changes shape on a typo.
-    #[test]
-    fn the_switch_reads_exactly_one() {
-        assert_eq!(
-            FlatRedial::from_value(Some("1")).left(),
-            FLAT_REDIALS_PER_OUTAGE
-        );
-        for off in [
-            None,
-            Some("0"),
-            Some(""),
-            Some("true"),
-            Some("on"),
-            Some("banana"),
-        ] {
-            assert_eq!(FlatRedial::from_value(off).left(), 0, "{off:?}");
-        }
-    }
-
     fn http_answer(status: u16) -> tungstenite::Error {
-        tungstenite::Error::Http(
+        tungstenite::Error::Http(Box::new(
             tungstenite::http::Response::builder()
                 .status(status)
                 .body(None)
                 .unwrap(),
-        )
+        ))
     }
 
     /// FR-28 — only the load balancer's own answer. `/derp` answers 401 for any
