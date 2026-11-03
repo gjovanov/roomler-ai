@@ -172,7 +172,7 @@ const SUPERSEDE_WAIT: Duration = Duration::from_secs(2 * STOP_GRACE.as_secs() + 
 /// on a new connection before it is refused: the word answers the device's
 /// manifest, about a round trip after the connection is up, so this covers a
 /// slow resume before the manifest too. Claude Code retries the refusal.
-const LEASE_WAIT: Duration = Duration::from_secs(30);
+pub(crate) const LEASE_WAIT: Duration = Duration::from_secs(30);
 /// P2e-2 — the server's words this daemon keeps at once. A word is kept only
 /// for a session the device runs or hosts, so this bounds a server that sends
 /// more than any device holds.

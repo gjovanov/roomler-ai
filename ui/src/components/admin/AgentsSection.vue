@@ -1116,7 +1116,7 @@
     v-model="remoteConfigDialogOpen"
     :tenant-id="tenantId"
     :agent="remoteConfigTarget"
-    @saved="agentStore.fetchAgents(tenantId); fetchGrid()"
+    @saved="onRemoteConfigSaved"
   />
 
   <!-- FR-40 — rotate-overlay-key confirmation -->
@@ -2272,6 +2272,20 @@ function openRemoteConfig(a: Agent) {
   remoteConfigDialogOpen.value = true
 }
 
+/** How long after a save the row is read again. A connected device answers
+ *  within a second or two, after the read the save itself triggers, so without
+ *  a second read the row would say `pending` until the next page load. */
+const REMOTE_CONFIG_ANSWER_MS = 3000
+
+function onRemoteConfigSaved() {
+  const refresh = () => {
+    agentStore.fetchAgents(props.tenantId)
+    fetchGrid()
+  }
+  refresh()
+  window.setTimeout(refresh, REMOTE_CONFIG_ANSWER_MS)
+}
+
 /** The row badge for a device with a pending / refused / failed config
  *  request. `null` for `applied` and for devices nobody is managing — a
  *  steady-state chip on every row is noise that trains people to stop reading
@@ -2311,7 +2325,7 @@ function remoteConfigChip(
         color: 'info',
         icon: 'mdi-clock-outline',
         text: 'config pending',
-        tooltip: 'Waiting for the device to reconnect and reconcile.',
+        tooltip: 'Waiting for the device: a connected one answers within seconds, an offline one when it next connects.',
       }
     case 'reports_unsupported':
     case 'push_unsupported':

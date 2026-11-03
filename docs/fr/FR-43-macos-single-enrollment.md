@@ -101,7 +101,7 @@ the session has to reach the worker some other way.
 ### Why not "let the worker open its own WS for the session"
 
 Tempting, and it would remove the IPC entirely. It cannot work as-is: `Hub::register_agent`
-(`crates/modules/fleet/src/hub.rs:397`) is keyed on `agent_id`, and a second connection
+(`crates/modules/fleet/src/hub.rs:406`) is keyed on `agent_id`, and a second connection
 **displaces** the first — the displaced socket is cancelled within milliseconds by design
 (`hub.rs:109-114`). A worker dialling in as the same device would knock the daemon's control
 WS off the air, which is precisely the login/displace/relaunch loop P1's stand-down exists
@@ -594,7 +594,7 @@ Under the switch, `run_cmd` gives every org loop the host (`app.rs:5034`, and `:
 |---|---|
 | One daemon per machine | Still one. The worker stays a process of that install, and now holds less |
 | Who holds the TCC grant | The same bundle at the same path, through the same chain (`macos_supervisor.rs:612-667`). The migration touches no bundle, which is what AC5 reads |
-| The hub keys on `agent_id` (`crates/modules/fleet/src/hub.rs:908`) | The worker no longer dials a server, so it can displace nothing |
+| The hub keys on `agent_id` (`crates/modules/fleet/src/hub.rs:917`) | The worker no longer dials a server, so it can displace nothing |
 | The delegation channel's two gates (`delegate.rs:516-537`) | Unchanged |
 | The reap's exact match (`macos_supervisor.rs:469`, `:482`) | Matches both command lines, so a worker of either kind is found |
 
