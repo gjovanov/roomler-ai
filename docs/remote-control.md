@@ -518,8 +518,14 @@ wait differs from a reason twice: it ends, and it has a deadline.
 |---|---|---|
 | the owner tells the pipeline | when its open returns no capture (above) | when `CaptureWait::hold` tells the owner's own viewer, in the owner's loop (`agents/roomlerd/src/peer.rs:5965`), or from the wait hook of an open that runs after the registration (`shared_media_waiting_hook`, `agents/roomlerd/src/peer.rs:6037`) |
 | the followers are told by | `Pipeline::tell_unavailable` | `Pipeline::tell_waiting` (`agents/roomlerd/src/media_share.rs:641`), through the same retrying sender as the owner's own notice |
-| it is kept | for the pipeline's life, unless a wait replaces it | until the owner's next frame (`Pipeline::wait_over`, `agents/roomlerd/src/media_share.rs:660`), unless a reason replaces it |
+| it is kept | until the owner's next frame, unless a wait replaces it | until the owner's next frame (`Pipeline::on_frame`, `agents/roomlerd/src/media_share.rs:662`), unless a reason replaces it |
 | a later joiner hears | the reason | the time the wait has left, not the owner's whole wait, and nothing once that has run out (`try_join`, `agents/roomlerd/src/media_share.rs:839`) |
+
+⚠️ **A frame clears a kept reason too.** Only `NoopCapture` carries one, and it
+captures nothing, so a frame means a reopen found a capture after all: the
+FFmpeg pump's transport flip reopens whatever it holds. Until #3423 the reason
+outlived that, and a viewer that joined later was told there was no picture
+while the picture moved.
 
 ⚠️ An open tells the pipeline only where the pipeline already exists: the
 FFmpeg pump's first open (that pump registers first, so a viewer can join while

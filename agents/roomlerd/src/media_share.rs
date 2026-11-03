@@ -635,7 +635,7 @@ impl Pipeline {
     /// what the owner just told its own controller. This tells every
     /// follower's, the same way [`Self::tell_unavailable`] does, and keeps the
     /// wait for the viewers that join later, until the owner's next frame
-    /// ([`Self::wait_over`]) or the wait's own deadline. The owner's loop
+    /// ([`Self::on_frame`]) or the wait's own deadline. The owner's loop
     /// calls it; an open waits off the loop and tells through
     /// [`Self::wait_teller`].
     pub fn tell_waiting(&self, wait: crate::capture::OpenWait) {
@@ -655,13 +655,13 @@ impl Pipeline {
     /// #3423 — the owner's capture produced a frame, so whatever it waited
     /// for is over: a viewer that joins from now on is not told about it. The
     /// viewers told already clear their notices at their own first frame.
+    /// #3260's reason goes too. Only `NoopCapture` has one, and it captures
+    /// nothing, so a frame means a reopen found a capture after all.
     /// Called for every captured frame, so it only takes the lock that
     /// [`Self::beat`] takes on every pass.
-    pub fn wait_over(&self) {
+    pub fn on_frame(&self) {
         let mut inner = self.inner.lock().unwrap();
-        if matches!(inner.notice, Some(OwnerNotice::Waiting { .. })) {
-            inner.notice = None;
-        }
+        inner.notice = None;
     }
 
     /// Test hook: the wait kept for the viewers that join later, and the time
@@ -1439,7 +1439,7 @@ mod tests {
             let owner = Pipeline::register(key, ObjectId::new());
             if by_frame {
                 owner.tell_waiting(dialog(Duration::from_secs(120)));
-                owner.wait_over();
+                owner.on_frame();
             } else {
                 owner.tell_waiting(dialog(Duration::from_millis(200)));
                 tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1474,6 +1474,32 @@ mod tests {
         *joiner.control_dc.lock().await = Some(dc);
         let _guard = try_join(key, joiner, 60).expect("join");
         told_once(&mut heard).await;
+        for pc in pcs {
+            let _ = pc.close().await;
+        }
+    }
+
+    /// #3260, #3423 — a capture that had no picture and then has one (a reopen
+    /// found a capture: the FFmpeg pump's transport flip reopens whatever it
+    /// holds) drops the kept reason at its first frame, so a viewer that joins
+    /// after that is not told there is no picture. Red if a frame clears only
+    /// a wait.
+    #[tokio::test]
+    async fn a_viewer_joining_after_the_capture_recovers_is_told_nothing() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-3423-RECOVERED");
+        let owner = Pipeline::register(key, ObjectId::new());
+        owner.tell_unavailable(&no_display());
+        owner.on_frame();
+        let (pcs, dc, mut heard) = viewer_channel().await;
+        let joiner = sink(ObjectId::new());
+        *joiner.control_dc.lock().await = Some(dc);
+        let _guard = try_join(key, joiner, 60).expect("join");
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            heard.try_recv().is_err(),
+            "a joiner after the capture recovered was told it has no picture"
+        );
         for pc in pcs {
             let _ = pc.close().await;
         }

@@ -4541,8 +4541,8 @@ async fn media_pump_vp9_444_dc(
                 frames_captured += 1;
                 last_capture_at = std::time::Instant::now();
                 capture_wait.on_frame();
-                // #3423 — and a viewer that joins from now on hears of no wait.
-                pipeline.wait_over();
+                // #3423 — and a viewer that joins from now on hears no stale notice.
+                pipeline.on_frame();
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
                 // FR-101 P4b-2 — a real capture, never a keepalive: the idle limit's
@@ -8202,8 +8202,8 @@ async fn media_pump_ffmpeg_dc(
                 crate::session_idle::note_frame(&arc);
                 last_capture_at = std::time::Instant::now();
                 capture_wait.on_frame();
-                // #3423 — and a viewer that joins from now on hears of no wait.
-                pipeline.wait_over();
+                // #3423 — and a viewer that joins from now on hears no stale notice.
+                pipeline.on_frame();
                 frames_captured += 1;
                 is_real_frame = true;
                 // Motion continues — the settle gate counts the episode.
@@ -14630,7 +14630,7 @@ mod codec_cap_tests {
             left > CaptureWait::TOLD_FOR - Duration::from_secs(5),
             "the owner's whole notice: {left:?}"
         );
-        pipeline.wait_over();
+        pipeline.on_frame();
         assert_eq!(pipeline.kept_wait(), None, "the next frame ends it");
     }
 
