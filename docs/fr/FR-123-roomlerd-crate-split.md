@@ -467,7 +467,7 @@ area. Its boundary, measured on master, is a short list of small edges, each wit
 | `keep_busy` reads `win_identity`, `lock_state`, `presence` | `keep_busy/state.rs:135-248`, `keep_busy/host_win.rs:28`, `:67` | `win_identity`, `win_token` to the host leaf; `lock_state`/`lock_on_end`/`presence` move with the plane |
 | `indicator` owns `rc_sessions::RcSessionRegistry` and calls `companion::ensure_running` | `indicator/mod.rs:100-606`, `indicator/notify.rs:212`, `:526` | `rc_sessions` moves with the plane (it is the indicator's registry; `peer.rs` reads it from above); the companion start becomes a callback the hub installs |
 | `encode` names `peer::TargetResolution` | `encode/resample.rs:43`, `encode/plan.rs:645`, `encode/policy.rs:28`, `encode/sim.rs:2958` | the type moves into the plane and `peer.rs` re-exports it |
-| `recording` reaches `consent`, `supervision`, `companion`, `signaling::COMPANION_START_BUDGET` | `recording/remote.rs:711-742`, `:1278-1312`; `recording/manager.rs:479`; `recording/launch.rs:439`, `:1494`, `:1587` | `recording/` **stays in the hub** (17 out-edges, the most entangled of the group); it depends on the plane from above |
+| `recording` reaches `consent`, `supervision`, `companion`, `signaling::COMPANION_START_BUDGET` | `recording/remote.rs:711-734`, `:1266-1300`; `recording/manager.rs:479`; `recording/launch.rs:439`, `:1494`, `:1587` | `recording/` **stays in the hub** (17 out-edges, the most entangled of the group); it depends on the plane from above |
 
 What moves: `capture/`, `encode/`, `input/`, `keep_busy/`, `audio/`, `audio_source.rs`,
 `display_match.rs`, `presence.rs`, `virtual_desktop.rs`, `desktop_brief.rs`, `clipboard.rs`,
