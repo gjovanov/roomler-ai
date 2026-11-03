@@ -1770,9 +1770,8 @@ const COMPANION_STARTS: Duration = Duration::from_secs(2);
 /// #3433 — the question takes an answer from the moment it is on the screen.
 /// It was shown first and armed after, and in between the device may wait
 /// for a companion it had to start (up to its 3 s budget): an answer then was
-/// refused, "no active prompt", and the person who clicked watched the
-/// question run out. With no companion to wait for, an answer sent the moment
-/// the marker appeared was refused in 90 of 200 rounds under load.
+/// refused, "no active prompt". With no companion to wait for, an answer sent
+/// the moment the marker appeared was refused in 90 of 200 rounds under load.
 async fn an_answer_the_moment_the_question_appears_is_taken_cell() -> Result<()> {
     let _serial = SERIAL.lock().await;
     let s = setup();
