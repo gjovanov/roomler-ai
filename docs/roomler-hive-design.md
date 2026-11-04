@@ -220,7 +220,7 @@ v0.2 also put the node side in a second binary, `hived`, supervised by `roomlerd
 doubles the signing, updater and installer couplings on every platform and contradicts
 "one daemon per machine". The node side is a cargo feature of `roomlerd`. Its
 user-level half is `roomlerd hive-host`, re-exec'd as the user the way `portal-helper`
-and `record` already are (`agents/roomlerd/src/app.rs:250,359`), so it ships, signs
+and `record` already are (`agents/roomlerd/src/app.rs:311,494`), so it ships, signs
 and updates with the daemon.
 
 ### 3.2 Who runs as what
@@ -404,7 +404,7 @@ already share. No second spawn path.
 
 | OS | How | Consequence |
 |---|---|---|
-| Linux, macOS | `RunAs::Named(account)`: `setgroups → setgid → setuid` in `pre_exec`, verified afterwards (`exec.rs:738-773`); uid-0 accounts refused | any mapped account, signed in or not |
+| Linux, macOS | `RunAs::Named(account)`: `setgroups → setgid → setuid` in `pre_exec`, verified afterwards (`exec.rs:1334-1364`); uid-0 accounts refused | any mapped account, signed in or not |
 | Windows | the console user, through `WTSQueryUserToken` + `CreateProcessAsUserW` (`agents/roomlerd/src/pty/windows.rs:708-780`) | ⚠️ only the user signed in at the console (D2). There is no S4U or `LogonUser` path, and the daemon "will not ask for" credentials (`exec.rs:825-830`). Nobody signed in ⇒ `refused: no_console_user` |
 
 Two gaps in that path: it sets no working directory and only `TERM` in the environment
