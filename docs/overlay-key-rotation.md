@@ -77,9 +77,9 @@ order:
    connect, must contain `key-rotate` (`overlay_key.rs:146`). **Ceiling** — one order
    per device per minute, keyed on the device in both slots so it is per *device*, not
    per admin; checked **after** the identity gates so a refusal is attributable
-   (`overlay_key.rs:38`, `:150-152`).
+   (`overlay_key.rs:39`, `:167-169`).
 4. `decide(rate_ok, online, supports_rotation)` — a pure function whose four cells are
-   unit-tested (`overlay_key.rs:90-103`):
+   unit-tested (`overlay_key.rs:91-104`):
 
    | rate ok | online | advertises `key-rotate` | result |
    |---|---|---|---|
@@ -88,13 +88,13 @@ order:
    | yes | yes | yes | **200** `{dispatch: "pushed", delivered: true}` |
    | yes | no | — | **200** `{dispatch: "queued", delivered: false}` — ordered on its next connect |
 
-5. **Desired state first, then the push** (`overlay_key.rs:157-200`): the request is
+5. **Desired state first, then the push** (`overlay_key.rs:175-214`): the request is
    written onto the agent row — `request_id`, `requested_by`, `requested_at`, and
    **`public_key_before`**, the key the device holds *now* (its last verified join) —
    before `rc:agent.key_rotate` is sent, so a report can only ever refer to an order
    that already exists. A push that races a disconnect leaves the order standing as
    `queued`.
-6. **One audit row for either arm** (`overlay_key.rs:211-227`): `decide()` returns
+6. **One audit row for either arm** (`overlay_key.rs:225-242`): `decide()` returns
    `Result<Pushed|Queued, DenyReason>` and a single call site records both into
    `key_rotation_audit`, so a new refusal cannot forget to audit itself (the
    `config_audit` / `ssh_audit` shape). Best-effort — an audit insert is never what
@@ -113,7 +113,7 @@ costs nothing; a rotation order dropped silently by a pre-feature agent would le
 a *security action* showing "in flight" on a dashboard for a device that never heard
 it. An **online** device without the verb is therefore refused up front, never
 spun on. An **offline** device is queued regardless — it may well update before it
-reconnects, and the connect-time reconcile gates again (`overlay_key.rs:63-66`).
+reconnects, and the connect-time reconcile gates again (`overlay_key.rs:64-67`).
 
 ⚠️ **Which pod answers matters.** `is_agent_online` reads the pod-local Hub; the
 tenant-affinity LB (`deployment.md`) is what lands the admin's call on the pod that
@@ -123,18 +123,18 @@ suspect first.
 ## On the device
 
 The handler sits in the WS loop that received the order, next to `ConfigPush`
-(`agents/roomlerd/src/signaling.rs:6469-6611`). Every branch **reports**, refusals
+(`agents/roomlerd/src/signaling.rs:6499-6641`). Every branch **reports**, refusals
 included — the operator is looking at a security action and each refusal has a
 different fix:
 
 | step | what | reports | anchor |
 |---|---|---|---|
-| 1 | kill switch `overlay_key_rotation == false` | `refused: disabled` | `signaling.rs:6472-6487` |
-| 2 | the device's **own** 60 s ceiling, per org — "a bound that exists only on the ordering side is not a bound" | `refused: rate_limited` | `signaling.rs:3335-3356`, `:6490-6505` |
+| 1 | kill switch `overlay_key_rotation == false` | `refused: disabled` | `signaling.rs:6502-6517` |
+| 2 | the device's **own** 60 s ceiling, per org — "a bound that exists only on the ordering side is not a bound" | `refused: rate_limited` | `signaling.rs:3343-3364`, `:6520-6535` |
 | 3 | mint `WgKeypair::generate()` — the enrollment mint; `None` in a build with no overlay surface | `refused: unsupported` | `agents/roomlerd/src/key_rotation.rs:19-30` |
 | 4 | **persist first**: under the daemon-wide write lock, `config::load` → set the secret on the primary scalar or on the `[[orgs]]` entry whose `tenant_id` is this loop's → bump `overlay_wg_key_epoch` → atomic `config::save` (tmp + fsync + 0600/ACL + `.prev` + rename) | on error: `failed` + detail, **identity unchanged** | `agents/roomlerd/src/remote_config.rs:346-245` |
-| 5 | queue the same report for the *next* session, then send `rc:agent.key_rotated { rotated, old_pub, new_pub, key_epoch }` on this one and give the pump 300 ms | `rotated` | `signaling.rs:6567-6593` |
-| 6 | close every peer, tunnel peer and QUIC peer this org loop carries (the `Goodbye` teardown), return `ConnectError::KeyRotated { secret, epoch }` | — | `signaling.rs:6597-6609`, `:1589` |
+| 5 | queue the same report for the *next* session, then send `rc:agent.key_rotated { rotated, old_pub, new_pub, key_epoch }` on this one and give the pump 300 ms | `rotated` | `signaling.rs:6597-6623` |
+| 6 | close every peer, tunnel peer and QUIC peer this org loop carries (the `Goodbye` teardown), return `ConnectError::KeyRotated { secret, epoch }` | — | `signaling.rs:6627-6639`, `:1589` |
 | 7 | the loop adopts the key + epoch into its one config snapshot and re-enters `connect_once` **immediately** — one device re-joining, not a fleet event, so no stagger | — | `signaling.rs:1310-1334` |
 | 8 | `overlay::maybe_start` sees the fingerprint change (it includes the public key), rebuilds the runtime; the join carries the new key and epoch | — | `agents/roomlerd/src/overlay.rs:399` |
 
@@ -171,14 +171,14 @@ The device's report is a **claim** (the `ssh_activity` sense). What the server c
 *verify* is the join: `rc:overlay.join` under the new public key passes
 `wg_key_taken_by_other` (machine-scoped, so a device rotating its own key is admitted
 — `security-baseline.md` §4), and the server stamps what the device presented onto
-the agent row as `overlay_identity` (`crates/modules/network/src/overlay.rs:569-592`
+the agent row as `overlay_identity` (`crates/modules/network/src/overlay.rs:633-656`
 → `dao/agent.rs:783`). It is stamped on **every** join, not only after a rotation, so
 the grid can always show the device's current key.
 
 | record | lives in | written by | what it is |
 |---|---|---|---|
 | the **order** | `agents.key_rotation` (`KeyRotationRequest`, `models.rs:1881`) | the route, or the server itself for a retired key (P2: `trigger: key_retired`, the zero `requested_by`) | what was asked, when, by whom — and `public_key_before`, the key held at that moment |
-| the **decision** | `key_rotation_audit` (`KeyRotationAuditEvent`, `models.rs:3632`; DAO `crates/services/src/dao/key_rotation_audit.rs`) | `place_order`, one call site, both arms, whoever placed the order (`trigger` names the server's) | `pushed` / `queued` / `denied: <reason>`. Records what the **server** decided — never what the device did. 90 d TTL, `(tenant_id, at)`, `(agent_id, at)` (`network/src/lib.rs:808-816`) |
+| the **decision** | `key_rotation_audit` (`KeyRotationAuditEvent`, `models.rs:5707`; DAO `crates/services/src/dao/key_rotation_audit.rs`) | `place_order`, one call site, both arms, whoever placed the order (`trigger` names the server's) | `pushed` / `queued` / `denied: <reason>`. Records what the **server** decided — never what the device did. 90 d TTL, `(tenant_id, at)`, `(agent_id, at)` (`network/src/lib.rs:825-833`) |
 | the **claim** | `agents.key_rotation_report` (`KeyRotationReport`, `models.rs:1932`) | `rc:agent.key_rotated` ingest (`agent_socket.rs:175` → `agent_arms.rs:81-125`) | the device's account; `reported_at` is server-stamped, `detail` re-clamped on receipt |
 | the **proof** | `agents.overlay_identity` (`OverlayIdentity`, `models.rs:1963`) | the overlay join | the public key and epoch the device actually presented, and when |
 
@@ -193,7 +193,7 @@ duplicate-delivery race below. Any report about a *different* order, and any
 Resolved **once, server-side**, from the order, the claim and the proof
 (`crates/modules/fleet/src/agent.rs:612-696`); the grid only names the states
 (`AgentsSection.vue:2091-2192`). The device row also carries `overlay_public_key` and
-`overlay_key_epoch` straight from the proof (`agent.rs:1451-1459`), so an operator
+`overlay_key_epoch` straight from the proof (`agent.rs:1762-1770`), so an operator
 can *see* the key change instead of trusting a chip.
 
 ```mermaid
@@ -247,9 +247,9 @@ on every connect rather than only when nobody is watching. Three field cycles on
 
 | cycle | what the run showed | the rule it left |
 |---|---|---|
-| 1 → **P1b** | 30 ms after the re-join, the reconnect's own register re-pushed the **same** order (the `rotated` report, sent on the dying session and written by a spawned task, had not landed); the device refused the duplicate under its own ceiling, and that refusal **overwrote** the success — the grid read `refused (rate_limited)` for a rotation that worked | an order delivered < **120 s** ago is in progress, not lost: `should_redeliver` (`models.rs:6315`, `:6340`); and a refusal never overwrites a `rotated` report for the same order (`dao/agent.rs:757-774`) |
+| 1 → **P1b** | 30 ms after the re-join, the reconnect's own register re-pushed the **same** order (the `rotated` report, sent on the dying session and written by a spawned task, had not landed); the device refused the duplicate under its own ceiling, and that refusal **overwrote** the success — the grid read `refused (rate_limited)` for a rotation that worked | an order delivered < **120 s** ago is in progress, not lost: `should_redeliver` (`models.rs:6442`, `:6467`); and a refusal never overwrites a `rotated` report for the same order (`dao/agent.rs:757-774`) |
 | 2 → **P1c** | the dying-session report was **lost** this time, so the state stuck at `delivered` although the server had verified the new key at the join | the order snapshots `public_key_before`; a join under another key resolves `rotated` with or without a report; the agent **re-sends** its report on the next session, keyed per org (`signaling.rs:2600-2622`) |
-| 3 → **P1d** | the cycle-2 order (report lost, no snapshot) was re-delivered on every later connect — a pod roll, then the 0.4.26 restart: **three rotations for one click** | `order_is_satisfied` (`models.rs:6325`): a verified identity change after the order satisfies it, and a satisfied order is never pushed again |
+| 3 → **P1d** | the cycle-2 order (report lost, no snapshot) was re-delivered on every later connect — a pod roll, then the 0.4.26 restart: **three rotations for one click** | `order_is_satisfied` (`models.rs:6452`): a verified identity change after the order satisfies it, and a satisfied order is never pushed again |
 
 ⚠️ The dying-session copy of the report was lost in **3 of the 4** ordered runs. The
 re-send on the new session is the reliable path, and the identity rule is what keeps
@@ -432,17 +432,17 @@ The server cannot see the device switch, so a switched-off device is still order
 
 | piece | where |
 |---|---|
-| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:669`, `:700`, `:714`, test `:6094`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:4491-4495` |
-| wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:3287`, `:1008`; owner `network` (`:2463`, `modular-monolith.md`) |
-| models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:1881`, `:1907`, `:1932`, `:1963`, `:3620`, `:6313`, `:6328` |
+| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:926`, `:1324`, `:1373`, test `:8206`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:4491-4495` |
+| wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:3744`, `:1039`; owner `network` (`:2865`, `modular-monolith.md`) |
+| models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:3236`, `:3270`, `:3295`, `:3326`, `:5707`, `:10772`, `:10787` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
 | reconcile-on-connect | `crates/modules/fleet/src/socket.rs:267-283`, `:348-369` |
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
-| identity stamp at the join | `crates/modules/network/src/overlay.rs:569-592`; `crates/services/src/dao/agent.rs:995` |
+| identity stamp at the join | `crates/modules/network/src/overlay.rs:649-672`; `crates/services/src/dao/agent.rs:1084` |
 | the conditional report write | `crates/services/src/dao/agent.rs:1049-1079` |
-| state resolver + grid view | `crates/modules/fleet/src/agent.rs:532-696`, `:1459-1467` |
-| audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:808-816` |
-| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6469-6611`, `:3291-3333`, `:3335-3356`, `:1310-1334` |
+| state resolver + grid view | `crates/modules/fleet/src/agent.rs:770-931`, `:1762-1770` |
+| audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:825-833` |
+| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6499-6641`, `:3299-3341`, `:3343-3364`, `:1310-1334` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:346-245` |
 | kill switch · epoch | `crates/agent-core/src/config.rs:1266-1271`, `:1982-1987`, `:2112-2114`; `config_surface.rs:1365-1372` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1287-1314`, `:2089-2190`; `ui/src/stores/agents.ts:948-902` |
