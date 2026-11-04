@@ -1529,7 +1529,7 @@ it presented (P3-8-2b).
 
 | Piece | Where |
 |---|---|
-| the wire | `ssh_ticket` on `rc:ssh.request` ([`signaling.rs:867`](../crates/remote_control/src/signaling.rs#L867)), `one_command` on `rc:ssh.grant` ([`:3920`](../crates/remote_control/src/signaling.rs#L3920)), `ssh_ticket_id` on `rc:ssh.response` ([`:3961`](../crates/remote_control/src/signaling.rs#L3961)); `RpcCap::SshOneCommand` ([`models.rs:1141`](../crates/remote_control/src/models.rs#L1141)) and the three refusals ([`models.rs:5182`](../crates/remote_control/src/models.rs#L5182)) |
+| the wire | `ssh_ticket` on `rc:ssh.request` ([`signaling.rs:877`](../crates/remote_control/src/signaling.rs#L877)), `one_command` on `rc:ssh.grant` ([`:3930`](../crates/remote_control/src/signaling.rs#L3930)), `ssh_ticket_id` on `rc:ssh.response` ([`:3971`](../crates/remote_control/src/signaling.rs#L3971)); `RpcCap::SshOneCommand` ([`models.rs:1141`](../crates/remote_control/src/models.rs#L1141)) and the three refusals ([`models.rs:5304`](../crates/remote_control/src/models.rs#L5304)) |
 | the binding | `bind_ssh_ticket` ([`agent_ssh.rs:220`](../crates/modules/network/src/routes/agent_ssh.rs#L220)), called where the request arrives ([`agent_arms.rs:194`](../crates/modules/network/src/agent_arms.rs#L194)); the outcome is a `CallerSession` ([`agent_ssh.rs:180`](../crates/modules/network/src/routes/agent_ssh.rs#L180)), and a refused one is answered at [`:333`](../crates/modules/network/src/routes/agent_ssh.rs#L333) |
 | the checks | the account and one-command checks ([`agent_ssh.rs:501`](../crates/modules/network/src/routes/agent_ssh.rs#L501)); gate 3's refusal of a session ([`:324`](../crates/modules/network/src/routes/agent_ssh.rs#L324)); what is left of a ticket ([`:963`](../crates/modules/network/src/routes/agent_ssh.rs#L963)) |
 | the audit | the `session` source and the session's ids ([`agent_ssh.rs:867`](../crates/modules/network/src/routes/agent_ssh.rs#L867)) |
@@ -1589,7 +1589,7 @@ session's grant backs it.
 |---|---|
 | the grant's field | `Grant::one_command` ([`ssh.rs:2874`](../agents/roomlerd/src/ssh.rs#L2874)), recorded by `record_grant` ([`:2950`](../agents/roomlerd/src/ssh.rs#L2950)), resolved into the session's policy ([`:833`](../agents/roomlerd/src/ssh.rs#L833)) |
 | the rules | one channel ([`ssh.rs:1713`](../agents/roomlerd/src/ssh.rs#L1713)), no forward ([`:1779`](../agents/roomlerd/src/ssh.rs#L1779)), one `exec` ([`:1874`](../agents/roomlerd/src/ssh.rs#L1874)), no shell ([`:1984`](../agents/roomlerd/src/ssh.rs#L1984)), no terminal ([`:2023`](../agents/roomlerd/src/ssh.rs#L2023)), no subsystem ([`:2126`](../agents/roomlerd/src/ssh.rs#L2126)) |
-| the device's word | `ssh-one-command` in the hello ([`caps.rs:4459`](../agents/roomlerd/src/encode/caps.rs#L4459)) |
+| the device's word | `ssh-one-command` in the hello ([`caps.rs:4649`](../agents/roomlerd/src/encode/caps.rs#L4649)) |
 | the SYSTEM service | the claim's word ([`ssh_service.rs:637`](../agents/roomlerd/src/ssh_service.rs#L637)), the published word ([`:646`](../agents/roomlerd/src/ssh_service.rs#L646)), and the claimed grant's field ([`:612`](../agents/roomlerd/src/ssh_service.rs#L612)) |
 | the server | routing a session's grant to the service ([`agent_ssh.rs:784`](../crates/modules/network/src/routes/agent_ssh.rs#L784)), the claim's backstop ([`:1392`](../crates/modules/network/src/routes/agent_ssh.rs#L1392)) in the pending rows' claim ([`ssh_pending.rs:63`](../crates/services/src/dao/ssh_pending.rs#L63)), the published record ([`models.rs:2910`](../crates/remote_control/src/models.rs#L2910)) |
 
@@ -1639,10 +1639,10 @@ for one `exec` because that is all it needs; the target refuses anything more
 
 | Piece | Where |
 |---|---|
-| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6713`](../agents/roomlerd/src/signaling.rs#L6713)) |
+| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6804`](../agents/roomlerd/src/signaling.rs#L6804)) |
 | the client | the key ([`ssh_client.rs:138`](../agents/roomlerd/src/ssh_client.rs#L138)), the request ([`:187`](../agents/roomlerd/src/ssh_client.rs#L187)), the answer's checks ([`:156`](../agents/roomlerd/src/ssh_client.rs#L156)), the one `exec` ([`:286`](../agents/roomlerd/src/ssh_client.rs#L286)), one call whole ([`:371`](../agents/roomlerd/src/ssh_client.rs#L371)) |
 | the dial | the netstack's ([`overlay.rs:972`](../agents/roomlerd/src/overlay.rs#L972)), the OS's ([`ssh_client.rs:240`](../agents/roomlerd/src/ssh_client.rs#L240)) |
-| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6349`](../agents/roomlerd/src/signaling.rs#L6349), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
+| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6440`](../agents/roomlerd/src/signaling.rs#L6440), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
 
 ### The tool: `ssh_run` (FR-90 P3-8-2b-2)
 

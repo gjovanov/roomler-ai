@@ -244,7 +244,7 @@ flowchart TD
 ```
 
 - **The same code decides both.** `shape_full_netmap`
-  (`crates/modules/network/src/overlay.rs:2555`) was extracted from the overlay join and is
+  (`crates/modules/network/src/overlay.rs:2753`) was extracted from the overlay join and is
   what the join itself now calls, so the list can never show a peer the netmap withholds:
   ACL `off` / `warn` list every live node, `enforce` only the shaped set.
 - ⚠️ **The device's node is found before any ACL read.** Loading the ACL can create the
@@ -468,7 +468,7 @@ the software encoders — with the chroma each cell produced (4:2:0 / 4:4:4), de
 struck through, and how long the probe took.
 
 - It asks `Request::EncoderCaps`, which answers from the probe's **cached** result only
-  (`caps::cached()`, `agents/roomlerd/src/encode/caps.rs:68`). The capability probe runs in
+  (`caps::cached()`, `agents/roomlerd/src/encode/caps.rs:74`). The capability probe runs in
   child processes (vendor driver code) at the first server hello; a control-surface poll
   must never be what launches it — locked by `not_probed_never_triggers_a_probe`.
 - Three states: `ready` (the matrix), `not_probed` (the daemon has not connected yet — the

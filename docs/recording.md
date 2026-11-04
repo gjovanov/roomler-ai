@@ -72,7 +72,15 @@ flowchart LR
 no GPU (release 0.4.199, FR-85's field log), a 1080p30 recording over a small moving region dropped 0.72 % of its
 ticks alone, and about 3.1 % while a session's software VP9-444 encoder ran beside it. The frames stayed native and
 the file kept time, because a missed tick is the previous frame lasting longer. The sidecar's `late_ticks` is that
-count, and AC1 bounds it at 0.5 %.
+count, and AC1 bounds it at 0.5 %. With 8 vCPUs (2026-11-04) the moving region alone dropped 0.32 %, inside the
+bound, and 1.62 % with the session beside it: more CPU halves the cost, and the session's encoder still breaks it.
+
+⚠️ **Display match can change the display under a recording** ([#3467](https://github.com/gjovanov/roomler-ai/issues/3467),
+open). On an X11 host nobody has touched for five minutes, a viewer that connects makes display match
+([`display-match.md`](display-match.md)) switch the display to the viewer's size, and a running recording does not
+refuse it. A local recording keeps its frame size, but everything outside the matched area freezes until the
+session lets the display go. A remote recording started in that session is recorded at the matched size.
+`display_match = never` in the device's config avoids it until #3467 lands.
 
 ⚠️ **A process of its own.** `roomlerd record` is a child, like the capability
 probe, so a driver fault in a recording's encoder costs the recorder, never
@@ -1291,8 +1299,8 @@ sequenceDiagram
 
 | Piece | Where | What it guarantees |
 |---|---|---|
-| The record context crosses | `delegate.rs:213` (`SessionParams::record`), `signaling.rs:2754` (sent AFTER the consent mode is resolved), `signaling.rs:1994` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1101`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
-| The row says what the worker can do | `delegate_worker.rs:105` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:667` (`effective_record`), `signaling.rs:1806` (the heartbeat, primary org only) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
+| The record context crosses | `delegate.rs:213` (`SessionParams::record`), `signaling.rs:2828` (sent AFTER the consent mode is resolved), `signaling.rs:2018` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1101`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
+| The row says what the worker can do | `delegate_worker.rs:105` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1161` (`effective_record`), `signaling.rs:2518` (the heartbeat, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
 | An OFF is live | `remote.rs:463` (`subscribe_gates`), `delegate_worker.rs:462-475` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
 | The worker's account of a recording | `delegate.rs:629` (noted where the grant crosses), `delegate.rs:869` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:236`). The server bounds it again to a live session of this agent |
 
