@@ -2495,7 +2495,7 @@ sequenceDiagram
 
 **What `ask` means.** A feature set to `ask` survives only a session that the person at the
 device approves on a prompt naming it ("Approving also allows clipboard, file transfer and
-audio.", [`session_policy.rs:183`](../agents/roomlerd/src/session_policy.rs#L183)). Every other
+audio.", [`session_policy.rs:202`](../agents/roomlerd/src/session_policy.rs#L202)). Every other
 session goes without it, with a reason:
 
 | Reason | When |
@@ -2507,7 +2507,7 @@ session goes without it, with a reason:
 | `policy_unavailable` | the org's row could not be read. The session goes ahead without the features asked for |
 
 - ⚠️ **The device enforces the floor itself.** The hub's strip is so the viewer can say why before
-  the person clicks. The agent masks the grant ([`mask`, `session_policy.rs:128`](../agents/roomlerd/src/session_policy.rs#L128),
+  the person clicks. The agent masks the grant ([`mask`, `session_policy.rs:147`](../agents/roomlerd/src/session_policy.rs#L147),
   applied at [`signaling.rs:3861`](../agents/roomlerd/src/signaling.rs#L3861)) the moment the consent
   mode resolves, before anything reads it. A request carrying `FILES` with no policy at all, as from a
   bypassed hub, is masked to no `FILES` when the floor says `off`
@@ -2634,7 +2634,7 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   `enforce` can ask only about a browser the device has never met.
 - **When the config moves, its keys go with it** (#3096). A SystemContext worker that runs on the person's config
   promotes it to the machine-global path after a healthy run
-  ([`self_heal_machine_global_config`, `app.rs:1202`](../agents/roomlerd/src/app.rs#L1202)). The `peer-auth/` files
+  ([`self_heal_machine_global_config`, `app.rs:1222`](../agents/roomlerd/src/app.rs#L1222)). The `peer-auth/` files
   go first, never over a file already there, and the config is not promoted without them
   ([`promote`, `peer_auth.rs:741`](../agents/roomlerd/src/peer_auth.rs#L741)). A config promoted before that has no
   keys beside it. So an enrollment with no key at the machine-global path takes the one the active user's config
@@ -4541,7 +4541,7 @@ ruled out by the rule above. The lock behind that borrow is what held it.
   feature includes `parking_lot`. It is task-fair: once a writer waits,
   a new `read()` parks, even on a thread that already holds a read guard.
 - `DaemonState::status()`
-  (`agents/roomlerd/src/localapi_state.rs:759`) built `NodeStatus` as
+  (`agents/roomlerd/src/localapi_state.rs:762`) built `NodeStatus` as
   one struct literal, and ten of its fields each called
   `self.overlay.borrow()`. A temporary lives until the literal is
   finished, so every field's guard was still held when the next field

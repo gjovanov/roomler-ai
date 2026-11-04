@@ -792,7 +792,7 @@ test of the SIGKILL property itself.
   lists a device with no node by itself (`overlay: "no_node"`, `crates/api/src/routes/agent_self.rs`). The fix keeps
   the server and the companion as they are:
   - the root half serves the console user a person socket (FR-27 P11's mechanism) at
-    `/var/run/roomler-person/<uid>.sock` (`crates/localapi/src/lib.rs:4340`). The directory is root's and writable by
+    `/var/run/roomler-person/<uid>.sock` (`crates/localapi/src/lib.rs:4068`). The directory is root's and writable by
     nobody else (`root_only_dir`, `:4321`), so root binds and then hands the socket over (`bind_root_owned`,
     `:4334`). That is safe there and not in a directory the person owns. The per-connection uid check is unchanged;
   - `person_may` (`:3057`) admits `Devices` and `Mesh`, read-only. That widens a Linux system install's person
@@ -810,13 +810,13 @@ test of the SIGKILL property itself.
 
   Built:
   - **One async hook at the dispatch of each request**, `LocalApiState::status_view` and `peers_view`
-    (`crates/localapi/src/lib.rs:2846`, `:2851`, dispatched at `:3469`). They default to the sync reads, so the
+    (`crates/localapi/src/lib.rs:2678`, `:2683`, dispatched at `:3235`). They default to the sync reads, so the
     tests' fakes are untouched.
-  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:2067`, `:2080`), with P2g's
+  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:2096`, `:2109`), with P2g's
     rule turned to the live view: no overlay address of its own and not root (`person_socket.rs:200`). Then
     `Peers` is the root half's, and `Status` is its own with the root half's overlay addresses, exit status and
     MagicDNS (`with_machine_network`, `:213`).
-  - **`person_may` admits `Peers`**, served through `person_view` (`crates/localapi/src/lib.rs:3310`). That drops
+  - **`person_may` admits `Peers`**, served through `person_view` (`crates/localapi/src/lib.rs:3085`). That drops
     the endpoints of either end and of a relay, the carrier snapshot, the path decision and the probes, which
     name other devices' public and LAN addresses.
   - **A root half slow to answer** (1.5 s) leaves the half's own answer for that poll.
@@ -1061,10 +1061,10 @@ model on Windows, so the three agree on what the mode means.
 (`exec.rs:813`), so exec, the pty and `sftp` all take it:
 
 - **Who is at the screen.** Linux: the user of logind's `ActiveSession` on `seat0`, when that session's class is
-  `user` (`companion::seat0_user`, `companion.rs:1090`). It is not `graphical_session`, which takes the first
+  `user` (`companion::seat0_user`, `companion.rs:1137`). It is not `graphical_session`, which takes the first
   active graphical session anywhere: logind calls every seatless session active, so a remote desktop's user would
   read as the person at the screen. A text-console login on the machine's own VT counts (D7). macOS: the owner of
-  `/dev/console`, read as the pkg's postinstall reads it (`companion::console_user_name`, `companion.rs:616`),
+  `/dev/console`, read as the pkg's postinstall reads it (`companion::console_user_name`, `companion.rs:663`),
   which names the same person `SCDynamicStoreCopyConsoleUser` does and keeps the companion's launch, the
   postinstall and this rule on one reading. Nobody, when: no logind or seat0, an empty seat, a greeter, the login
   window, or a system account (`_mbsetupuser` during Setup Assistant).

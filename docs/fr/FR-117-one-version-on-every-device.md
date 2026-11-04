@@ -69,7 +69,7 @@ flowchart TD
     skew touches the helper's wake file (`/var/tmp/roomler-update-check`): a wake, never an instruction. A non-root
     daemon with no helper skips, with one log line, never a password prompt (D3).
   - **What:** the package database that owns the companion picks the format (`installed_version_inner`,
-    `companion.rs:299`, reads dpkg then rpm). The asset is `roomler-desktop-<own>-<arch>-unknown-linux-gnu.<deb|rpm>`
+    `companion.rs:346`, reads dpkg then rpm). The asset is `roomler-desktop-<own>-<arch>-unknown-linux-gnu.<deb|rpm>`
     from release `agent-v<own>` (`fetch_release_by_tag`, `updater.rs:1759`). The 0.4.147 release carries all four, each
     with `.asc` and `.sha256`.
   - **Trust:** the same `download_asset` (`updater.rs:1559`) as the daemon's own update: the digest, the `.asc` against
@@ -82,13 +82,13 @@ flowchart TD
     restarts services, roomlerd among them, after an apt run (a vmtest trap, seen 2026-10-19). Then `DEBIAN_FRONTEND=noninteractive`
     and a dpkg lock timeout, so unattended-upgrades holding the lock costs one tick, not a hang.
   - **Restart:** a companion that was running is stopped and started again in its person's graphical session, through
-    the path FR-27 already uses (`systemd_run_command`, `companion.rs:622`). One that was not running stays stopped.
+    the path FR-27 already uses (`systemd_run_command`, `companion.rs:771`). One that was not running stays stopped.
   - **Never** installs a companion where none is installed, and **never** downgrades one (D1).
   - **The heartbeat:** `installed_version`'s 10-minute cache (`companion.rs:249`, `VERSION_TTL` `:264`) is dropped
     after a sync, so the dashboard's skew clears at the next heartbeat.
 - **When:** at the owner's start, and again on a 4 h tick, so a failed sync no longer waits for the next restart.
 - **Windows: the same retry.** `refresh_if_stale` runs once, at the start of whichever process owns the refresh (#1686:
-  the SCM host, `win_service/mod.rs:511`, or the worker, `app.rs:4440`). It now runs on the same 4 h tick in that
+  the SCM host, `win_service/mod.rs:511`, or the worker, `app.rs:4319`). It now runs on the same 4 h tick in that
   process. It costs one file read when the version marker matches.
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` on both platforms gives back today's behaviour.
 

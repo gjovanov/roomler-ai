@@ -377,14 +377,14 @@ sequenceDiagram
 
 | Rule | Where | Why |
 |---|---|---|
-| The two watchdog exits wait for the DNS purge for `EXIT_DNS_PURGE_WAIT`, 5 s | `agents/roomlerd/src/lib.rs:395`, `:429`, called at `agents/roomlerd/src/watchdog.rs:611`, `:704` | Unloaded, the purge ends in under 2 s, so an unloaded exit still finishes it |
+| The two watchdog exits wait for the DNS purge for `EXIT_DNS_PURGE_WAIT`, 5 s | `agents/roomlerd/src/lib.rs:371`, `:405`, called at `agents/roomlerd/src/watchdog.rs:611`, `:704` | Unloaded, the purge ends in under 2 s, so an unloaded exit still finishes it |
 | A purge still running at the bound is recorded and left running, never killed | `crates/tunnel-core/src/overlay/dns.rs:894` (`purge_exit_dns_before_exit`), `:1045` (`hand_over`) | If nothing comes back on the host, it still removes the rule |
 | If the record cannot be written, the exit waits with no bound, as before | `crates/tunnel-core/src/overlay/dns.rs:894` | The bound is only safe with the handoff |
 | The record lives below `HKLM\SOFTWARE`, beside the host ledger, never in a file | `crates/tunnel-core/src/overlay/dns.rs:965`, `crates/tunnel-core/src/overlay/host_ledger.rs:405` | Any account may create a file under `%ProgramData%`, and a planted record would hold the SYSTEM daemon's DNS changes for a process of the planter's |
-| A start counts every live entry in flight before its own purge | `crates/tunnel-core/src/overlay/dns.rs:925` (`adopt_handed_over_purges`), called at `agents/roomlerd/src/lib.rs:370` | None of its DNS changes can come before the old purge ends, so the old purge cannot delete a steer the start makes |
+| A start counts every live entry in flight before its own purge | `crates/tunnel-core/src/overlay/dns.rs:925` (`adopt_handed_over_purges`), called at `agents/roomlerd/src/lib.rs:346` | None of its DNS changes can come before the old purge ends, so the old purge cannot delete a steer the start makes |
 | An entry is live only if its pid runs and was created when the entry says | `crates/tunnel-core/src/overlay/dns.rs:1014` (`open_running`) | A pid is reused; an ended process stays openable while a handle to it is held |
 | The live entries stay in the record, the newest 16 | `crates/tunnel-core/src/overlay/dns.rs:925`, `:967` | A second stall before the first purge ends hands both over |
-| `ROOMLERD_EXIT_PURGE_WAIT_S=0` waits with no bound | `agents/roomlerd/src/lib.rs:400` | The kill switch |
+| `ROOMLERD_EXIT_PURGE_WAIT_S=0` waits with no bound | `agents/roomlerd/src/lib.rs:376` | The kill switch |
 
 What it leaves as it was:
 
@@ -392,7 +392,7 @@ What it leaves as it was:
   fatal goodbye and a duplicate-instance loser. Nothing waits on them, and a
   purge they cut short would have no next start behind it. A requested restart
   waits too, because `purge_after_daemon` runs the whole purge before it
-  (`agents/roomlerd/src/app.rs:1349`, `:1356`).
+  (`agents/roomlerd/src/app.rs:1359`, `:1366`).
 - Linux waits as before. A daemon outside systemd (a container, a hand run)
   would leave `resolvectl revert` running beside its replacement's steer, and
   the link config dies with `roomler0` anyway. macOS has nothing to purge.

@@ -932,7 +932,7 @@ sequenceDiagram
   build before this, harmless stand-ins beside the EXE ran with `admin=True`: `msiexec` under the
   shell's one UAC prompt and `icacls` under none (the log, 2026-11-02). Every spawn on this path
   now names its program by a full path from the kernel, because `%SystemRoot%` can be overridden
-  per user (`appdirs::system32_tool`, `crates/agent-core/src/appdirs.rs:113`), and `spawn_elevated`
+  per user (`appdirs::system32_tool`, `crates/agent-core/src/appdirs.rs:130`), and `spawn_elevated`
   refuses anything else (`agents/roomlerd/src/updater.rs:2517`).
   `agents/roomler-setup/src/spawn_gate.rs` parses the source of everything the wizard runs on
   Windows and fails on a bare name, or on an expression it has not been told about.
@@ -941,7 +941,7 @@ sequenceDiagram
   there, with no second prompt (the log, 2026-11-02). `launch::start_clean` (`launch.rs:275`),
   `main`'s second line (`agents/roomler-setup/src/main.rs:53`), therefore does three things. The
   machine's folders take their true values on every run (`appdirs::machine_folder_variables`,
-  `appdirs.rs:125`). The current directory moves to System32; an elevated copy otherwise keeps
+  `appdirs.rs:142`). The current directory moves to System32; an elevated copy otherwise keeps
   the limited one's. An elevated run drops `ROOMLER*`, `WEBVIEW2_*`, `TAURI_*` and `SSL_CERT_*`
   (`launch::distrusted_variable`, `launch.rs:254`). A limited run keeps those, because it crosses
   nothing its user cannot already do, and test fixtures use them. The elevated WebView2 folder
