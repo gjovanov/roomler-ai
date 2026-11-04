@@ -124,32 +124,6 @@
           :title="$t('nav.dashboard')"
           exact
         />
-        <!-- FR-90 — agent sessions; only where the server runs `hive`, which
-             is switched off unless an operator turns it on (the capability
-             gate fails CLOSED for it). -->
-        <v-list-item
-          v-if="caps.has('hive') && hiveServed"
-          :to="`/tenant/${tenantId}/sessions`"
-          prepend-icon="mdi-robot-outline"
-          :title="$t('nav.agentSessions')"
-          data-testid="nav-agent-sessions"
-        />
-        <v-list-item
-          v-if="caps.has('hive') && hiveServed"
-          :to="`/tenant/${tenantId}/memory`"
-          prepend-icon="mdi-brain"
-          :title="$t('nav.agentMemory')"
-          data-testid="nav-agent-memory"
-        />
-        <!-- FR-90 P2h-2 — where sessions are copied: only where the server
-             copies them at all (`hive.replicaset`, off by default). -->
-        <v-list-item
-          v-if="caps.has('hive') && hiveServed && hiveCopied"
-          :to="`/tenant/${tenantId}/copies`"
-          prepend-icon="mdi-content-copy"
-          :title="$t('nav.agentCopies')"
-          data-testid="nav-agent-copies"
-        />
         <!-- Devices-first (2026-08-26): the flat Devices item became a
              collapsible group listing the fleet's AGENTS (a tap lands in the
              remote view; tunnel clients have none, so they live only on the
@@ -751,7 +725,6 @@ import { useConferenceStore } from '@/stores/conference'
 import { useCallControls } from '@/composables/useCallControls'
 import { useWsStore } from '@/stores/ws'
 import { useCapabilitiesStore } from '@/stores/capabilities'
-import { useHiveStore } from '@/stores/hive'
 import { useMessageStore } from '@/stores/messages'
 import NotificationPanel from '@/components/layout/NotificationPanel.vue'
 import KeyedRouterView from '@/components/layout/KeyedRouterView.vue'
@@ -998,19 +971,6 @@ function joinCallFromSnackbar() {
 // store still says A used to point every sidebar target at A.
 const tenantId = computed(
   () => (route.params.tenantId as string | undefined) || tenantStore.current?.id || '',
-)
-
-// FR-90 P1g — agent sessions may serve some organizations and not others:
-// their pages show only where the server says they do.
-const hive = useHiveStore()
-const hiveServed = computed(() => hive.served[tenantId.value] === true)
-const hiveCopied = computed(() => hive.copied[tenantId.value] === true)
-watch(
-  [tenantId, () => caps.has('hive')],
-  ([tid, on]) => {
-    if (tid && on) void hive.checkServed(tid)
-  },
-  { immediate: true },
 )
 
 // Route → store sync: keep tenantStore.current on the org the URL names —
