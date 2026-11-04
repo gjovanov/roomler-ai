@@ -12,8 +12,6 @@ Every enrolled device and every `roomler` tunnel client holds a long-lived crede
 | **Agent token** (`aud = agent`) | `POST /api/agent/enroll` | 365 days (`rc.agent_token_ttl_secs`) | **the device** (`POST /api/agent/self/renew`) | the device is removed (generation), or it lapses past the grace | the daemon's `config.toml` (`agent_token`, or `[[orgs]].agent_token`) |
 | **Tunnel-client token** (`aud = tunnel-client`) | `POST /api/tunnel-client/enroll` | 365 days | **the `roomler` CLI** (`POST /api/tunnel-client/renew`) | the client is removed (generation), or it lapses past the grace | the CLI's `config.toml`, `0600` |
 | **Service credential** (`AgentService`, FR-94) | `POST /api/agent/anchor`, elevated | 365 days | the SYSTEM service (`POST /api/agent/service/renew`) | the device is un-anchored, re-anchored or removed | `%ProgramData%\roomler\roomler\exec-service\anchor.json`, SYSTEM + Administrators only |
-| **Egress grant** (`net_grant`, FR-90 P3-7-1b) | the vault, answering `rc:vault.net` for one agent session | at most 900 s, with no leeway past its end | never: a session asks again for each tool call | its end; the network module believes it only on its origin device's own connection, toward the exit it names, in its organization, and holds every flow to it (P3-7-2a, [`tunnels.md`](tunnels.md#an-agent-sessions-grant-fr-90-p3-7-2a)) | the daemon that asked, once one does (P3-7-3) ([`vault.md`](vault.md) §21) |
-| **SSH ticket** (`ssh_ticket`, FR-90 P3-8-1a) | the vault, answering `rc:vault.ssh` for one agent session's command on another device | at most 900 s, with no leeway past its end | never: a session asks again for each command | its end; it never names the device the session runs on, and the network module will believe it only on that device's own connection, toward the target it names, while the target maps the account it names (P3-8-1b) | the daemon that asked, once one does (P3-8-2b) ([`vault.md`](vault.md) §22) |
 
 FR-104 adds one variation on the first row: an enrollment token minted with `anchor: true` may also anchor the device it enrolled, once ([`fleet-rpc.md`](fleet-rpc.md) § Anchoring).
 
@@ -118,7 +116,7 @@ sequenceDiagram
     participant Q as pod that holds the socket
     participant D as device
     A->>P: DELETE …/agent/{id}
-    P->>P: the holders (Hive's purge, the overlay lease), then the row
+    P->>P: the holders (the overlay lease), then the row
     P->>P: kick: out of this pod's hub
     P->>Q: control channel: kick {agent_id, goodbye}
     Q->>D: rc:goodbye AgentDeleted, behind what was queued before
@@ -132,10 +130,6 @@ sequenceDiagram
 | the ephemeral reaper | yes | |
 | an organization's archive | yes | before #2267 the archive did not even take the device out of the hub (`crates/modules/fleet/src/tenant_hooks.rs:50`) |
 | an ephemeral device's own unenroll | **no** | it is already shutting down, and a goodbye racing that clean stop would turn it into exit 7 (`tells_the_device`, `crates/modules/fleet/src/removal.rs:111`) |
-| a device this removal sent `rc:hive.purge_all` (FR-90 P2g-4a), on a build that drains (`hive-purge-drain`, #2294) | yes, after the purge's frame | its daemon finishes that purge before the goodbye's exit, bounded at 5 min (`finish_removal_purge`, `agents/roomlerd/src/hive/supervisor.rs:1384`) |
-| the same on `agent-v0.4.137` or `0.4.138` (`hive-purge-all` without `hive-purge-drain`) | **no**, and its socket stays open as before | that build exits at once on the goodbye, and its purge runs after its frame lands (`crates/modules/fleet/src/hub.rs:1247`) |
-
-> ⚠️ `hive.replicaset` is server-wide, and the removal's purge goes to every connected device that advertises `hive-purge-all`, in any org. Every release since 0.4.137 does, as a property of the build. Before #2294 that meant no removed device on those builds was told once the replicaset was turned on. A build that drains is told whatever the setting. The same drain also covers a pod roll mid-purge, whose reconnect is refused with the same goodbye.
 
 What happens after exit 7 depends on how the daemon is installed. The device stays down until it is re-enrolled, and on some installs it needs a hand to start again. `roomlerd re-enroll` ends by naming the right step for the install it runs on, and so does the removal's needs-attention sentinel (`Install`, `agents/roomlerd/src/service.rs`; #2293):
 

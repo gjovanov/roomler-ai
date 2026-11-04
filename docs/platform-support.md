@@ -149,7 +149,7 @@ and never outliving the daemon (FR-97 P0e).
 | SFTP and `scp` as the signed-in person | 🟡 where OpenSSH's `sftp-server` is installed | ✅ | ✅ | `agents/roomlerd/src/ssh.rs:1226-1230` |
 | A session starts in the person's home | ✅ | ✅ | ✅ | `agents/roomlerd/src/exec.rs:880` |
 
-## 6. The desktop: companion, power, files, agent sessions
+## 6. The desktop: companion, power, files
 
 | Feature | Windows | Linux | macOS | Why, and where |
 |---|---|---|---|---|
@@ -157,7 +157,6 @@ and never outliving the daemon (FR-97 P0e).
 | Its pages on a system install | ✅ | 🟡 the safety pages; Devices, the mesh and the live links (no endpoints) since 0.4.150 (FR-97 P2g, P2h) | 🟡 a two-half Mac: Devices, the mesh, the Connection column and Overview's network fields from the root half since 0.4.150 (FR-97 P2g, P2h) | `docs/desktop-companion.md` §6, §12 |
 | The host stays awake during a session | ✅ `PowerCreateRequest` | ✅ a logind block inhibitor | ✅ `IOPMAssertion`; a closed lid with no external display sleeps anyway (§8) | `agents/roomlerd/src/power.rs:731-744` |
 | A received file lands as the signed-in person | ✅ | ✅ the person at seat0's Downloads | ✅ | `agents/roomlerd/src/files.rs:209-227` |
-| Hive: adopt a terminal session | ✅ a named pipe | ✅ | ✅ | `agents/roomlerd/src/hive/supervisor/adopt.rs:562` |
 | The setup wizard installs the daemon | ✅ | ✅ on production since 2026-10-30 (FR-129 B1) | ✅ on production since 2026-10-30, the root half included (FR-129 B1, B2) | a GUI front end to the embedded `install.sh`, offered where the server advertises that OS on `GET /api/setup/features` (FR-129 B1-s, one switch per OS since B1-s2: `ROOMLER__SETUP__WIZARD_LINUX_DAEMON` and `ROOMLER__SETUP__WIZARD_MACOS_DAEMON`, each default off and flipped once a released wizard is field-proven there; the legacy `ROOMLER__SETUP__WIZARD_UNIX_DAEMON` turns both on, which is how production has them). Without that answer the wizard installs only the tunnel client there, and the enroll dialog, the landing page and the static `/` offer it for the daemon on Windows alone (FR-97 D5), failing closed (`ui/src/utils/enrollCommands.ts:198-203`) |
 
 ## 7. Install, update, architectures

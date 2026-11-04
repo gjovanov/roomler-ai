@@ -1559,7 +1559,8 @@ down:
 | An RC session holding `INPUT` | The person's own desktop: roomler-desktop or a terminal, worked with the host's mouse and keyboard | The host's consent to `INPUT` | The Recordings view is the person's own process |
 | `roomler exec` | Root on Linux, SYSTEM in the console session on a SystemContext host, the person on an attended Windows install | `EXEC_DEVICE` (`ADMINISTRATOR` only) and the owner's `exec_enabled` | `peer_is_console_user`: uid 0, or the console session. An anchored service, SYSTEM in session 0, does not pass |
 | `roomler ssh` in `console_user` mode | The console session on Windows. On Linux it drops to the person at the screen | `SSH_DEVICE` (`ADMINISTRATOR` only) and the owner's `ssh_enabled` | The console session on Windows. On a Linux system install, that person's socket (P2e). `daemon` mode is the exec row on Linux |
-| A Hive session (default off) | Its mapped account | The device's `hive_accounts` | Where that account is the daemon's or root, or on a Linux system install the person at the seat |
+
+The fourth, an agent session, left master when FR-90 was parked (FR-137).
 
 A local gate cannot tell them from the person, which is the limit keep busy
 documents (`peer_may_start_keep_busy`, FR-92 §3g, #2021). A stricter gate on the

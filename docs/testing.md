@@ -49,50 +49,7 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
 (+messages, +the FR-127 view: a view client's video consumers against its `media:view`
 reports, the viewer's pause against the owner's, the kill switch, a report through the
 other pod) · cluster · stats · relay-region · remote-control · agent
-(+e2e, +crash, +exec, +presence) · overlay · tunnel · hive.
-
-> [!NOTE]
-> **`tests/hive_canary.rs` is a second test binary, on purpose.** FR-90's
-> canary test (AC2) drives a real in-process device with the Hive supervisor
-> on, and that supervisor is process-global. In the lib's binary every other
-> in-process agent would re-point it at its own socket. `cargo test -p
-> roomler-ai-tests` runs both binaries, and the lane's count sums them. The
-> test is Linux-only and turns on `roomlerd`'s `hive-test-launcher` feature
-> through a Linux-only dev-dependency. That feature launches sessions as the
-> test's own account and refuses to run as root. Its log checks run under a
-> thread-default subscriber around a current-thread runtime, so they see
-> every task of the server and the device without `RUST_LOG`.
->
-> **Since P2d-6 it starts a second device, a member, as a child process: the
-> same binary**, running its `member_device_process` test with
-> `HIVE_CANARY_MEMBER` set, a no-op in an ordinary run (so it counts one
-> passed test). A `[[bin]]` could not do it: binaries get no
-> dev-dependencies, and the test launcher is one on purpose. Under that
-> feature a device takes its checkpoints in process, because the binary is a
-> test's and knows no `hive-checkpoint`.
->
-> **`tests/hive_drivers.rs` is a third, for the same reason** (FR-90 P1c-2b,
-> AC6): a reader's message in the session's room and a prompt over their own
-> viewer peer must reach no harness, while the owner's and a named driver's
-> do, each labelled `[Name] …`. Its harness writes every line it reads on
-> stdin to a file — what a model would be sent — and the test reads that
-> file. The scaffolding both binaries share (the server, the in-process
-> device, a browser's socket and viewer peer, the harness's side of a
-> toolbelt) is `tests/hive_support/mod.rs`, a module each includes, not a
-> test target of its own.
->
-> **`tests/hive_memory.rs` and `tests/hive_memory_off.rs` are a fourth and a
-> fifth** (FR-90 P1e-4, AC8): the same device, with its owner's
-> `hive_core_memory` on and then off. The gate is read once, when the
-> supervisor starts, and a process has one supervisor. The harness
-> (`MEMORY_HARNESS`) copies out what it finds where Claude Code reads core
-> memory — `$CLAUDE_CONFIG_DIR/CLAUDE.md` and the auto-memory `MEMORY.md` —
-> when it starts and at every turn.
->
-> | gate | what the test asserts |
-> |---|---|
-> | on | An org fact kept before a session starts is in its `CLAUDE.md`, and a device fact is in its `MEMORY.md`. A fact kept while it runs is not, even at its next turn. The next session has both, at a later revision. A write past the org's budget is `409 over_budget` with the numbers, and nothing is evicted |
-> | off | The transcript shows the frame arrived (its revision, and that the gate is off). Nothing reached the session's config directory, nor even the daemon's own disk |
+(+e2e, +crash, +exec, +presence) · overlay · tunnel.
 
 ## Frontend tests
 
@@ -197,9 +154,7 @@ other pod) · cluster · stats · relay-region · remote-control · agent
 The load-bearing ones: `remote_control` locks the **wire format** (every `rc:*`
 tag pinned, ObjectId-as-hex, pipe-separated `Permissions`) so a rename is a
 deliberate break; agent-side crates cover encoder cascades, config migration,
-ACLs, and overlay internals under their feature flags. `roomlerd`'s Hive
-supervisor tests (`--features hive -- hive::`) run twice: on Linux in the agent job, and on macOS
-in the macOS job (FR-90 P1h-1), which before it never compiled the supervisor for a Mac. The
+ACLs, and overlay internals under their feature flags. The
 **whole** `roomlerd --lib` suite also runs natively on Windows, in `ci.yml`'s
 `windows-agent-sessions` job (#2886) — every `#[cfg(windows)]` test, with the features the
 table below names; before it, the Windows jobs ran filtered subsets and a Windows-only failure
@@ -218,8 +173,8 @@ the Windows path. A new spawn on that path is a decision someone writes down in 
 > capture set on the test's own thread then never sees that line. Keep a second dispatcher
 > registered for the capture's life (a `NoSubscriber` will do), so every callsite asks per
 > event; and assert a line the capture must see before one it must not, since a capture that
-> sees nothing passes every absence check. The pattern: `Logs::capture` in
-> [`tests.rs:746`](../agents/roomlerd/src/hive/view/tests.rs#L746).
+> sees nothing passes every absence check. The pattern: `LogCapture::install` in
+> [`extauth_tests.rs:1164`](../crates/tests/src/extauth_tests.rs#L1164).
 
 Flakes fixed on 2026-10-30, and what each one teaches:
 
@@ -266,8 +221,7 @@ Flakes fixed on 2026-10-30, and what each one teaches:
 | vmtest (`roomler-ai-deploy/vmtest/vmtest.sh`, on demand) | Installs the product the way users do on throwaway Win11 / Ubuntu-Wayland / ARM / macOS VMs, enrols against prod, proves remote desktop + overlay + `roomler-desktop`, destroys the VM; one issue per failing condition, closed on green — [vmtest.md](vmtest.md) |
 | **Overlay stress lane** (FR-81, `vmtest.sh run --lane stress`) | A throwaway VM enrolled into the **fleet** org measures latency distributions, SSH success, bulk transfer and carrier stability against the real fleet, on a direct and a forced-relay arm — [below](#the-overlay-stress-lane-fr-81) |
 | **L0 latency harness** (FR-16, `ci.yml` recorder job) | A real remote-desktop session in one process measures capture → decode latency, and the bench probe's input → decoded-frame round trip (L4 in process), on one clock, over a simulated link, and proves it can fail — [below](#the-l0-latency-harness-fr-16) |
-| **The Windows `roomlerd --lib` suite** (#2886, `ci.yml` job `windows-agent-sessions`) | The whole agent unit-test suite natively on Windows — `cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault,system-context --no-fail-fast`, about 2,400 tests, one step, every test in parallel. Until 2026-10-25 the three Windows jobs each ran a **filtered subset**, so tests compiled into this very binary (`replaced_binary`, `win_service::companion_spawn`) ran on Windows nowhere, and two Windows-only failures went unseen until #2889. The filter was the only cost: about 8 s of a 5.5–7.2 min job is tests, the rest builds the binary from the restored cache. The media half (`full-hw`, `vp9-444`, `ffmpeg-encoder`) stays with `windows-recorder` and `windows-overlay-clippy`, which compile its Windows-only cells. ⚠️ Three things the first full runs surfaced were fixed at the source rather than retried or ignored: a `config_set` of **any** key re-seeded the process-global `files_dir` (now only a set of `files_dir` does); a sync `#[test]` was the first caller of `netstate::handle()`, whose lazy spawn needs a tokio context; and on the runner itself — a host no daemon has ever written under `%PROGRAMDATA%\roomler` — the staging sentinel's fallback to that root errored, so it now lists the nearest existing ancestor. A failure green on every enrolled dev box and red on a fresh runner is what this lane exists to find. ⚠️ On this runner, a clock reading is not a unique name. Two staging tests spawned back to back read the same 100 ns tick and shared one folder, so the first to finish deleted the other's upload (#2956). A temp name shared by parallel tests needs a counter as well as the time. ⚠️ A test's deadline is sized for that runner unless the deadline is what it tests. Under the whole suite, a PowerShell one-liner (the auto shell `exec::tests` use) took 8–10+ s to run, and a 10 s deadline made those tests the lane's most frequent red (#3002) |
-| **The flavour Windows and macOS ship** (#3304, `ci.yml:1817` job `windows-shipped-flavour`, and two steps at `:1449` in `macos-overlay-check`) | Both systems release `roomlerd` with `hive` and without `vault` (`release-agent.yml:1717`, `:2906`), and `vault` is what turns on `cfg(worker_calls)` (`agents/roomlerd/build.rs:105`). Every other Windows and macOS line builds both, so this flavour was linted and tested nowhere. Windows runs `cargo clippy -p roomlerd --features overlay-l3,ssh-server,hive,system-context --tests -- -D warnings`, then `cargo test --lib -- hive:: vault::` on the same features: the release's list less its media half, in a job and cache family of its own (`ci.yml:1828` says why). macOS has no clippy lane, so it runs `cargo check --lib --bins --features hive` and `cargo test --lib --features hive -- hive:: vault::`, about 4 min more on a warm cache. The lane-alone commit was seen red first ([run 41522300303](https://github.com/gjovanov/roomler-ai/actions/runs/41522300303)): 11 failures on Windows, none a defect in what ships. ⚠️ Without `vault`, an item only `worker_calls` code calls is dead, and a test that names one does not compile. Give the item `#[cfg_attr(not(worker_calls), allow(dead_code))]`, which changes nothing a release compiles, and the test `#[cfg(worker_calls)]`. ⚠️ Linux ships this flavour too. Its library is linted through the audited-crates line, which builds `hive` without `vault`, but no lane runs its unit tests |
+| **The Windows `roomlerd --lib` suite** (#2886, `ci.yml` job `windows-agent-sessions`) | The whole agent unit-test suite natively on Windows — `cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast`, about 2,400 tests, one step, every test in parallel. Until 2026-10-25 the three Windows jobs each ran a **filtered subset**, so tests compiled into this very binary (`replaced_binary`, `win_service::companion_spawn`) ran on Windows nowhere, and two Windows-only failures went unseen until #2889. The filter was the only cost: about 8 s of a 5.5–7.2 min job is tests, the rest builds the binary from the restored cache. The media half (`full-hw`, `vp9-444`, `ffmpeg-encoder`) stays with `windows-recorder` and `windows-overlay-clippy`, which compile its Windows-only cells. ⚠️ Three things the first full runs surfaced were fixed at the source rather than retried or ignored: a `config_set` of **any** key re-seeded the process-global `files_dir` (now only a set of `files_dir` does); a sync `#[test]` was the first caller of `netstate::handle()`, whose lazy spawn needs a tokio context; and on the runner itself — a host no daemon has ever written under `%PROGRAMDATA%\roomler` — the staging sentinel's fallback to that root errored, so it now lists the nearest existing ancestor. A failure green on every enrolled dev box and red on a fresh runner is what this lane exists to find. ⚠️ On this runner, a clock reading is not a unique name. Two staging tests spawned back to back read the same 100 ns tick and shared one folder, so the first to finish deleted the other's upload (#2956). A temp name shared by parallel tests needs a counter as well as the time. ⚠️ A test's deadline is sized for that runner unless the deadline is what it tests. Under the whole suite, a PowerShell one-liner (the auto shell `exec::tests` use) took 8–10+ s to run, and a 10 s deadline made those tests the lane's most frequent red (#3002) |
 
 Known environmental failures (conference specs without forwarded RTC ports,
 mailpit-dependent flows, the containerized-Chromium Google-OAuth redirect test)
