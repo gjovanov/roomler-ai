@@ -238,7 +238,10 @@ context-free purges — `overlay::tun::purge_split_default()` and
   reinstalls anything, regardless of `overlay_enabled`), through
   `roomlerd::purge_exit_routes_at_start()`, which waits for the DNS purge for
   10 s at most: [below](#a-start-waits-for-the-dns-purge-10-s-at-most-3291),
-- immediately **before every `process::exit`** on the hard-exit paths, and
+- immediately **before every `process::exit`** on the hard-exit paths, where the
+  two watchdog exits wait for the DNS purge 5 s at most and hand the rest to
+  their replacement: [below](#a-stall-exit-hands-a-slow-dns-purge-to-its-replacement-3440),
+  and
 - (FR-97 P0e) **after every exit of the daemon**, clean ones included, once the
   runtime is dropped (`purge_after_daemon` in `main.rs`): see
   [exit-client pins](#exit-client-pins-fr-97-p0e) below.
@@ -268,7 +271,7 @@ purge finishes on a thread of its own.
 The last two rows say any Normal-priority child waits this way, so the bound
 alone does not get such a start to its probe. The next children on that path
 were the four `icacls` steps of the config save every start makes for its crash
-bookkeeping (`agents/roomlerd/src/app.rs:4242`). A save now reads the
+bookkeeping (`agents/roomlerd/src/app.rs:4246`). A save now reads the
 directory's owner and DACL in-process and runs the steps only when they would
 change something
 ([the hardening](operator-systemcontext-smoke.md#3-confirm-the-acl-is-locked-down)).
@@ -284,8 +287,8 @@ The rig raises the daemon to High. A daemon at Normal shares its console host's
 priority, so the console's share mostly belongs to the rig. What still waits on
 such a host: the device comes online only when the probe answers, and the
 probe's children starve until the load ends (#3439). A worker the watchdog
-stops under the load waits for the exit purge, which has no bound, before its
-replacement can start (#3440).
+stopped under the load waited for the exit purge, which had no bound, before its
+replacement could start: [the next section](#a-stall-exit-hands-a-slow-dns-purge-to-its-replacement-3440).
 
 ```mermaid
 sequenceDiagram
@@ -307,22 +310,92 @@ sequenceDiagram
 
 | Rule | Where | Why |
 |---|---|---|
-| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:351`, `:364`, called at `agents/roomlerd/src/app.rs:4126` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
-| Past the bound the purge still runs to its end | `crates/tunnel-core/src/overlay/dns.rs:849` (`purge_exit_dns_within`), `:887` (`run_within`) | A stale `.`-root rule outlives a crash and a reboot, and it must still go |
-| Every DNS change waits while a purge is in flight | `crates/tunnel-core/src/overlay/dns.rs:596` (`run_cmd`), `:929` (`wait_idle`) | A purge that ended after a steer would delete the steer. The wait has no bound on purpose: the steer needs the order, and the change it holds is itself a child the same load would hold |
-| A purge counts in before its thread starts, and out however it ends | `crates/tunnel-core/src/overlay/dns.rs:871` (`PurgeGate`) | No DNS change slips in between, and a purge that panics holds nothing |
-| With no thread to run it on, the purge runs inline and unbounded, as before | `crates/tunnel-core/src/overlay/dns.rs:911` | The purge is load-bearing and the bound is not |
+| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:351`, `:367`, called at `agents/roomlerd/src/app.rs:4126` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
+| Past the bound the purge still runs to its end | `crates/tunnel-core/src/overlay/dns.rs:860` (`purge_exit_dns_within`), `:1243` (`run_within`) | A stale `.`-root rule outlives a crash and a reboot, and it must still go |
+| Every DNS change waits while a purge is in flight | `crates/tunnel-core/src/overlay/dns.rs:596` (`run_cmd`), `:1285` (`wait_idle`) | A purge that ended after a steer would delete the steer. The wait has no bound on purpose: the steer needs the order, and the change it holds is itself a child the same load would hold |
+| A purge counts in before its thread starts, and out however it ends | `crates/tunnel-core/src/overlay/dns.rs:1227` (`PurgeGate`) | No DNS change slips in between, and a purge that panics holds nothing |
+| With no thread to run it on, the purge runs inline and unbounded, as before | `crates/tunnel-core/src/overlay/dns.rs:1267` | The purge is load-bearing and the bound is not |
 | The purge's child has null stdio | `crates/tunnel-core/src/overlay/dns.rs:806` | A child that outlives its waiter must not hold pipes to it |
-| The route purges stay synchronous | `agents/roomlerd/src/lib.rs:364` | They are typed IP Helper calls, with no child to wait for |
+| The route purges stay synchronous | `agents/roomlerd/src/lib.rs:367` | They are typed IP Helper calls, with no child to wait for |
 
 What the bound leaves as it was:
 
 - The hard-exit paths and `purge_after_daemon` still call `purge_exit_routes()`
-  synchronously. A process on its way out has nothing to come online for.
+  synchronously. A process on its way out has nothing to come online for. The
+  two watchdog exits are the exception since #3440: their replacement does
+  ([below](#a-stall-exit-hands-a-slow-dns-purge-to-its-replacement-3440)).
 - `host_ledger::purge()` runs `Remove-NetNat` only after a crashed router left a
   NAT behind, and still waits for it.
 - The service's two `netsh` steps before it starts the worker, and the
   capability probe's own child, are children the same load holds.
+
+### A stall exit hands a slow DNS purge to its replacement (#3440)
+
+A stalled worker exits so that the supervisor starts a healthy one. Both
+watchdog exits ran the exit purge first and waited for it with no bound, so on a
+starved Windows host the exit waited for the purge's `powershell` as long as the
+load lasted, and the replacement could not start. Measured on 0.4.291 on the
+#3291 guest under its load, the daemon and its console raised first:
+
+| Guest time | What |
+|---|---|
+| 15:32:05.251 | the worker starts the exit purge's `powershell` |
+| 15:32:14.672 | the async watchdog logs that its own 5 s sleep took 77 s |
+| about 15:32:48 | the load ends |
+| 15:32:50.031 | the purge's `powershell` ends |
+| 15:32:50.056 | the worker exits with code 2 (`STALL_EXIT_CODE`), 25 ms later |
+| 15:32:52.340 | the replacement starts, after its 2 s backoff |
+
+A bound alone would reopen the race the start's bound closed (#3291), across two
+processes. The Windows supervisor puts the worker in no job object, so a purge
+left running outlives the worker. The replacement's own boot purge is the only
+one its gate knew of. If the old purge's `Get-DnsClientNrptRule` then ran after
+the replacement steered `.` at an exit, it would delete that steer, which
+carries the same `roomler-exit-dns` tag. Killing the old purge would close the
+race, but it would throw away its head start on DNS, and nothing would remove
+the rule on a host where no daemon comes back. So the exit hands it over:
+
+```mermaid
+sequenceDiagram
+    participant W as stalled worker (watchdog)
+    participant P as powershell (the exit purge)
+    participant R as HKLM\SOFTWARE\Roomler\Overlay
+    participant S as supervisor
+    participant N as replacement (start)
+    participant G as its PurgeGate
+    W->>P: remove the rules tagged roomler-exit-dns
+    Note over W: waits 5 s at most
+    W->>R: record ExitDnsPurge, the pid and creation time of P
+    W->>S: exit(2), with P still running
+    S->>N: start after the backoff
+    N->>R: is P running, and created when recorded?
+    N->>G: P counts in flight until it ends
+    N->>N: its own boot purge, hello: online
+    P-->>G: exits, once the load lets it run
+    G-->>N: DNS changes go on
+```
+
+| Rule | Where | Why |
+|---|---|---|
+| The two watchdog exits wait for the DNS purge for `EXIT_DNS_PURGE_WAIT`, 5 s | `agents/roomlerd/src/lib.rs:395`, `:429`, called at `agents/roomlerd/src/watchdog.rs:611`, `:704` | Unloaded, the purge ends in under 2 s, so an unloaded exit still finishes it |
+| A purge still running at the bound is recorded and left running, never killed | `crates/tunnel-core/src/overlay/dns.rs:894` (`purge_exit_dns_before_exit`), `:1045` (`hand_over`) | If nothing comes back on the host, it still removes the rule |
+| If the record cannot be written, the exit waits with no bound, as before | `crates/tunnel-core/src/overlay/dns.rs:894` | The bound is only safe with the handoff |
+| The record lives below `HKLM\SOFTWARE`, beside the host ledger, never in a file | `crates/tunnel-core/src/overlay/dns.rs:965`, `crates/tunnel-core/src/overlay/host_ledger.rs:405` | Any account may create a file under `%ProgramData%`, and a planted record would hold the SYSTEM daemon's DNS changes for a process of the planter's |
+| A start counts every live entry in flight before its own purge | `crates/tunnel-core/src/overlay/dns.rs:925` (`adopt_handed_over_purges`), called at `agents/roomlerd/src/lib.rs:370` | None of its DNS changes can come before the old purge ends, so the old purge cannot delete a steer the start makes |
+| An entry is live only if its pid runs and was created when the entry says | `crates/tunnel-core/src/overlay/dns.rs:1014` (`open_running`) | A pid is reused; an ended process stays openable while a handle to it is held |
+| The live entries stay in the record, the newest 16 | `crates/tunnel-core/src/overlay/dns.rs:925`, `:967` | A second stall before the first purge ends hands both over |
+| `ROOMLERD_EXIT_PURGE_WAIT_S=0` waits with no bound | `agents/roomlerd/src/lib.rs:400` | The kill switch |
+
+What it leaves as it was:
+
+- The exits nothing replaces wait for the purge with no bound: a plain stop, a
+  fatal goodbye and a duplicate-instance loser. Nothing waits on them, and a
+  purge they cut short would have no next start behind it. A requested restart
+  waits too, because `purge_after_daemon` runs the whole purge before it
+  (`agents/roomlerd/src/app.rs:1349`, `:1356`).
+- Linux waits as before. A daemon outside systemd (a container, a hand run)
+  would leave `resolvectl revert` running beside its replacement's steer, and
+  the link config dies with `roomler0` anyway. macOS has nothing to purge.
 
 ### IPv4 forwarding on a Windows exit or subnet router (FR-97 P0b-2b)
 

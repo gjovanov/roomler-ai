@@ -606,8 +606,9 @@ fn force_exit_on_runtime_stall(wd: &Watchdog, stuck_for: Duration) {
     // P5/A2 — this exit bypasses RAII; drop any exit-node split-default
     // first so a stalled host doesn't stay blackholed until the supervisor's
     // restart reconciles it. First of all (#3018): the evidence below may
-    // take its whole budget.
-    crate::purge_exit_routes();
+    // take its whole budget. #3440 — bounded: the supervisor's restart is
+    // what this exit is for, and a slow DNS purge goes on in the replacement.
+    crate::purge_exit_routes_before_restart();
     let pumps = wd
         .pump_ages_now(Instant::now())
         .unwrap_or_else(|| "unknown, their lock is held".to_string());
@@ -698,8 +699,9 @@ pub fn force_exit_on_stall(stalled: &[(&'static str, Duration)]) -> bool {
 
     // P5/A2 — bypasses RAII; drop any exit-node split-default so the stall
     // doesn't leave the host blackholed until the supervisor restarts it.
-    // Before the evidence (#3018), which may take its whole budget.
-    crate::purge_exit_routes();
+    // Before the evidence (#3018), which may take its whole budget. #3440 —
+    // bounded, as the watchdog-of-watchdog's is.
+    crate::purge_exit_routes_before_restart();
 
     // Phase 1B (Task 9): emit a crash sidecar BEFORE process-exit
     // so the next agent startup can upload it to roomler.ai. Worker
