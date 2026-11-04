@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-43 P3c — `sudo roomlerd one-row`: a person's one command that makes a
 //! two-row Mac one row (`docs/fr/FR-43-macos-single-enrollment.md`, "P3c — a
 //! person's one command").
