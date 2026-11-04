@@ -68,6 +68,12 @@ flowchart LR
 | Writer | `recording/mp4.rs` `FragmentedWriter` | Fragmented while recording, so a crash loses at most one fragment (~2 s). See §2. |
 | Finalize | `recording/mp4.rs` `finalize` | A remux to a progressive, `moov`-first file that QuickTime, Movies & TV and editors open. Payloads are copied, never re-encoded. |
 
+⚠️ **Measured: on a software-only host, a session beside a recording costs it ticks.** On a 4-vCPU guest with
+no GPU (release 0.4.199, FR-85's field log), a 1080p30 recording over a small moving region dropped 0.72 % of its
+ticks alone, and about 3.1 % while a session's software VP9-444 encoder ran beside it. The frames stayed native and
+the file kept time, because a missed tick is the previous frame lasting longer. The sidecar's `late_ticks` is that
+count, and AC1 bounds it at 0.5 %.
+
 ⚠️ **A process of its own.** `roomlerd record` is a child, like the capability
 probe, so a driver fault in a recording's encoder costs the recorder, never
 the daemon or a live session. It stops when its stdin closes, so a recorder
@@ -777,6 +783,11 @@ flowchart LR
 | **Soft clip, not wrap** | Two loud sources sum past full scale. Up to ¾ of full scale the sum is untouched; above it, a `tanh` knee compresses toward full scale, settling at it only far past it (never beyond, never wrapping). |
 | **A source asked for and not opened refuses the start, by name** | `system_audio_unavailable` (no loopback or monitor: set `ROOMLERD_AUDIO_SOURCE`), `mic_unavailable` (none, or on Windows the "Let desktop apps access your microphone" switch, or on a Mac a microphone turned off or restricted in Privacy & Security, FR-97 P2f), `audio_unavailable` (a build without the `audio` feature). A recording that silently lacked the audio the person asked for would be worse. |
 | **A source lost mid-recording is not fatal** | The recording goes on with that source's silence. The sidecar records `audio_source_lost`, or `audio_failed` if the encoder failed and the rest is video-only. |
+
+⚠️ **Measured (release 0.4.199, FR-85 AC3):** over a 30-minute recording on Linux, neither source drifted against
+the picture: a clap's sound held its place to within about 10 ms from the first minute to the last. The clap test
+read computer audio from −25 to +23 ms of its flash, and a virtual microphone from +5 to +48 ms. Every reading has
+a frame's slack, and the microphone's also hold the test signal's own way into it.
 
 ### The codec: AAC where FFmpeg has it, Opus everywhere else (P4)
 
