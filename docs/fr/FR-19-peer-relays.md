@@ -435,7 +435,7 @@ match a `UserId`/`RoleId`-scoped grant with no log — against `feedback_log_eve
 
 **Permissions.** ⚠️ Exit-node approval requires `MANAGE_AGENTS`
 (`crates/api/src/routes/overlay_route.rs:310`, checked at `:328`), which **is** in `DEFAULT_ADMIN`
-(`crates/db/src/models/role.rs:104`), and writes no audit row. Nominating a relay makes a
+(`crates/db/src/models/role.rs:153`), and writes no audit row. Nominating a relay makes a
 device a traffic chokepoint and a metadata observation point for the whole tenant (§12), so
 it belongs in the class `role.rs` already draws a line around — *"an admin should see every
 command the fleet ran without silently gaining the power to run one"*, which is why
@@ -726,7 +726,7 @@ Verified against `origin/master`, 2026-08-28.
 | Anti-amplification standard | `overlay/disco.rs:69-70` (`FRAME_LEN = 85`) |
 | Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:725-726` |
 | SSRF validator to reuse | `crates/api/src/routes/push.rs:20` `validate_push_endpoint` |
-| Permission bits + `ALL` bump | `crates/db/src/models/role.rs:104`, `:146` |
+| Permission bits + `ALL` bump | `crates/db/src/models/role.rs:153`, `:183` |
 | CLI surfaces | `agents/roomler-cli/src/localclient.rs:1047` (`relay_qualified_label`), `:271` (`print_why`), `:160` (`netcheck`) |
 
 **Config keys** — four wiring points each, per the contract at
