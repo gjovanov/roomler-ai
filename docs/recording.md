@@ -1044,14 +1044,17 @@ marker and answers. Each look the prompt takes is made under them too, and
 reads the books before any answer (`PendingGuard::look`). Two files are written
 outside them: the `.pending` marker, by the caller that shows the question, and
 an answer from the CLI's fallback, which checks nothing. The books-first look
-is what keeps the second from deciding a question that has ended.
+is what keeps the second from deciding a question that has ended. Every caller
+writes the marker only after it has armed the question: the recording question,
+and since #3442 the screen-control, exec and SSH ones (`docs/roomler-ssh.md`,
+Operator consent).
 
 | A question that is… | now | before, found by review |
 |---|---|---|
 | withdrawn | takes nothing that lands after it, whoever wrote it | the poll read the answer first: an Allow that passed `record_decision`'s check just before a cancel, or one the CLI's fallback wrote with no check at all, was taken |
 | decided | is released in the same step | an answer in the gap between the two was reported taken, and its file left behind |
 | answered | gets the answer checked and written in one step, so it lands only while the question still asks | an answer that passed the check as its question was decided landed after the question had cleared its files |
-| an older one for the same id | leaves the newer one's marker and answers alone | its release unlinked the marker of a question still asking |
+| an older one for the same id | leaves the newer one's marker and answers alone, once the newer one is armed: a marker written before its question is on the books is not one the older release can tell apart, which is why every caller arms first (#3442) | its release unlinked the marker of a question still asking |
 | a newer one for the same id | clears the old answers and takes the id in one step | an answer given in between, for the older question, was taken by the newer one, given before it existed |
 
 A withdrawal before the prompt's next look still wins over an answer that had
@@ -1354,8 +1357,8 @@ sequenceDiagram
 
 | Piece | Where | What it guarantees |
 |---|---|---|
-| The record context crosses | `delegate.rs:213` (`SessionParams::record`), `signaling.rs:2844` (sent AFTER the consent mode is resolved), `signaling.rs:2034` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1101`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
-| The row says what the worker can do | `delegate_worker.rs:105` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1161` (`effective_record`), `signaling.rs:2534` (the heartbeat, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
+| The record context crosses | `delegate.rs:213` (`SessionParams::record`), `signaling.rs:2846` (sent AFTER the consent mode is resolved), `signaling.rs:2035` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1101`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
+| The row says what the worker can do | `delegate_worker.rs:105` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1161` (`effective_record`), `signaling.rs:2536` (the heartbeat, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
 | An OFF is live | `remote.rs:591` (`subscribe_gates`), `delegate_worker.rs:462-475` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
 | The worker's account of a recording | `delegate.rs:629` (noted where the grant crosses), `delegate.rs:869` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:236`). The server bounds it again to a live session of this agent |
 
