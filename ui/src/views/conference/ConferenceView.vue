@@ -601,6 +601,10 @@ async function handleMediaRoomClosed(data: { room_id?: string; reason?: string }
 async function doJoin() {
   joining.value = true
   try {
+    // #3416 — the join waits for the page's socket to have its id, and is
+    // refused without one. Waiting before the start too means a refused join
+    // leaves no call started with nobody in it.
+    await roomStore.callConnectionId()
     await roomStore.startCall(tenantId.value, roomId.value)
     await roomStore.joinCall(tenantId.value, roomId.value)
     await roomStore.fetchRoom(tenantId.value, roomId.value)
