@@ -68,6 +68,20 @@ flowchart LR
 | Writer | `recording/mp4.rs` `FragmentedWriter` | Fragmented while recording, so a crash loses at most one fragment (~2 s). See §2. |
 | Finalize | `recording/mp4.rs` `finalize` | A remux to a progressive, `moov`-first file that QuickTime, Movies & TV and editors open. Payloads are copied, never re-encoded. |
 
+⚠️ **Measured: on a software-only host, a session beside a recording costs it ticks.** On a 4-vCPU guest with
+no GPU (release 0.4.199, FR-85's field log), a 1080p30 recording over a small moving region dropped 0.72 % of its
+ticks alone, and about 3.1 % while a session's software VP9-444 encoder ran beside it. The frames stayed native and
+the file kept time, because a missed tick is the previous frame lasting longer. The sidecar's `late_ticks` is that
+count, and AC1 bounds it at 0.5 %. With 8 vCPUs (2026-11-04) the moving region alone dropped 0.32 %, inside the
+bound, and 1.62 % with the session beside it: more CPU halves the cost, and the session's encoder still breaks it.
+
+⚠️ **Display match can change the display under a recording** ([#3467](https://github.com/gjovanov/roomler-ai/issues/3467),
+open). On an X11 host nobody has touched for five minutes, a viewer that connects makes display match
+([`display-match.md`](display-match.md)) switch the display to the viewer's size, and a running recording does not
+refuse it. A local recording keeps its frame size, but everything outside the matched area freezes until the
+session lets the display go. A remote recording started in that session is recorded at the matched size.
+`display_match = never` in the device's config avoids it until #3467 lands.
+
 ⚠️ **A process of its own.** `roomlerd record` is a child, like the capability
 probe, so a driver fault in a recording's encoder costs the recorder, never
 the daemon or a live session. It stops when its stdin closes, so a recorder
@@ -778,6 +792,11 @@ flowchart LR
 | **A source asked for and not opened refuses the start, by name** | `system_audio_unavailable` (no loopback or monitor: set `ROOMLERD_AUDIO_SOURCE`), `mic_unavailable` (none, or on Windows the "Let desktop apps access your microphone" switch, or on a Mac a microphone turned off or restricted in Privacy & Security, FR-97 P2f), `audio_unavailable` (a build without the `audio` feature). A recording that silently lacked the audio the person asked for would be worse. |
 | **A source lost mid-recording is not fatal** | The recording goes on with that source's silence. The sidecar records `audio_source_lost`, or `audio_failed` if the encoder failed and the rest is video-only. |
 
+⚠️ **Measured (release 0.4.199, FR-85 AC3):** over a 30-minute recording on Linux, neither source drifted against
+the picture: a clap's sound held its place to within about 10 ms from the first minute to the last. The clap test
+read computer audio from −25 to +23 ms of its flash, and a virtual microphone from +5 to +48 ms. Every reading has
+a frame's slack, and the microphone's also hold the test signal's own way into it.
+
 ### The codec: AAC where FFmpeg has it, Opus everywhere else (P4)
 
 `recording/audio_codec.rs` picks once per recording (`AudioEncoder::best`),
@@ -1280,10 +1299,10 @@ sequenceDiagram
 
 | Piece | Where | What it guarantees |
 |---|---|---|
-| The record context crosses | `delegate.rs:172` (`SessionParams::record`), `signaling.rs:2740` (sent AFTER the consent mode is resolved), `signaling.rs:1980` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1101`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
-| The row says what the worker can do | `delegate_worker.rs:105` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:592` (`effective_record`), `signaling.rs:1792` (the heartbeat, primary org only) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
-| An OFF is live | `remote.rs:463` (`subscribe_gates`), `delegate_worker.rs:428-441` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
-| The worker's account of a recording | `delegate.rs:554` (noted where the grant crosses), `delegate.rs:794` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:195`). The server bounds it again to a live session of this agent |
+| The record context crosses | `delegate.rs:213` (`SessionParams::record`), `signaling.rs:2754` (sent AFTER the consent mode is resolved), `signaling.rs:1994` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1101`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
+| The row says what the worker can do | `delegate_worker.rs:105` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1161` (`effective_record`), `signaling.rs:2444` (the heartbeat, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
+| An OFF is live | `remote.rs:463` (`subscribe_gates`), `delegate_worker.rs:462-475` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
+| The worker's account of a recording | `delegate.rs:629` (noted where the grant crosses), `delegate.rs:869` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:236`). The server bounds it again to a live session of this agent |
 
 - **Whose gates:** the worker's, which are the person's own config: the
   worker runs without `--config`, so it reads the user's. The companion's

@@ -342,7 +342,7 @@ cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
 pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
 or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
 guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
-`crates/remote_control/src/models.rs:9779`); a prefix match would refuse the
+`crates/remote_control/src/models.rs:9925`); a prefix match would refuse the
 kill switch along with the switch.
 
 ⚠️ **A push reaches a connected device within seconds, and takes effect at the
@@ -473,7 +473,7 @@ flowchart TD
 
 **A second caller: the daemon itself (FR-96 P2b, 2026-10-13).** A per-user Linux
 daemon whose binary was replaced restarts through the same door once nothing it
-serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:335-394`).
+serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:340-399`).
 It runs the same supervisor proof, record and systemd read-back, but not
 `local_restart_enabled`, because no local client is asking. It is not a server
 lever: what sets it off is a file replaced ON the device, by the root update
@@ -551,7 +551,7 @@ which the daemon still refuses on the same terms as a local request.
    config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3129`), so
    gate 4 on that daemon is an administrator's: `sudo roomler config set
    exec_enabled true`. The pane now says which file it edits and gives that
-   command (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:828`;
+   command (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:843`;
    [installation.md](installation.md), "Two configurations") instead of
    showing a switch that changes nothing. Letting the console user flip the
    root daemon's gate 4 from the app would be a **new authorization path on the
@@ -564,7 +564,7 @@ which the daemon still refuses on the same terms as a local request.
    configuration" after falling back to a per-user file a system install does
    not have. It now says whose configuration it is and gives the same command,
    `sudo roomler config set exec_enabled true`, in place of rows
-   (`root_daemon_only`, `agents/roomler-desktop/src/commands.rs:726`). Gate 4 on a
+   (`root_daemon_only`, `agents/roomler-desktop/src/commands.rs:741`). Gate 4 on a
    root daemon is an administrator's on both OSes; nothing was admitted on the
    person socket for it.
 

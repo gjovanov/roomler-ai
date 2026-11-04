@@ -257,22 +257,22 @@ sequenceDiagram
 
 | `reason` | the server sends it when | `roomler status` says |
 |---|---|---|
-| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:462-465`](../crates/modules/network/src/overlay.rs#L462-L465)) | retrying will not help; an operator has to act |
+| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:526-529`](../crates/modules/network/src/overlay.rs#L526-L529)) | retrying will not help; an operator has to act |
 | `network_unavailable` | the tenant's network row cannot be read or created, or an allocated ordinal falls outside the network's address space | retrying will not help; an operator has to act |
 | `store_unavailable` | any other allocation failure: a store fault | transient — a retry may succeed |
 | `unknown` | a reason this build does not know, from a newer server | retrying will not help; an operator has to act |
 
-Only `store_unavailable` is retryable ([`signaling.rs:503`](../crates/remote_control/src/signaling.rs#L503)).
+Only `store_unavailable` is retryable ([`signaling.rs:513`](../crates/remote_control/src/signaling.rs#L513)).
 An unknown reason takes the conservative arm. The device does not retry on its own in
 either case: its signalling loop reconnects on its own ladder, and a retry at the
 refusal would race it.
 
 - **The wire.** `rc:overlay.join_refused { reason, detail }`
-  ([`signaling.rs:4374-4380`](../crates/remote_control/src/signaling.rs#L4374-L4380)) goes only to a
+  ([`signaling.rs:4384-4390`](../crates/remote_control/src/signaling.rs#L4384-L4390)) goes only to a
   node whose join set `supports_join_refusal`
-  ([`signaling.rs:2524`](../crates/remote_control/src/signaling.rs#L2524)). An older node keeps the
+  ([`signaling.rs:2534`](../crates/remote_control/src/signaling.rs#L2534)). An older node keeps the
   old silence, and the server's ERROR line, `alert = "overlay_join_refused"`
-  ([`overlay.rs:278-295`](../crates/modules/network/src/overlay.rs#L278-L295)), is then the only
+  ([`overlay.rs:281-298`](../crates/modules/network/src/overlay.rs#L281-L298)), is then the only
   trace. The frame is a new top-level variant, which an old agent drops as an unknown
   frame, so it needed no forward-compatible pre-roll.
 - **The device.** The daemon logs `overlay: the server REFUSED our join` at ERROR and
@@ -899,7 +899,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
   netstack`. FR-49 had made netstack the default for `enroll --overlay`, which
   made this the common case, and #2493 measured it on 0.4.143: no listener on
   the port, no peers, no log line. Now `for_org` turns a netstack secondary on
-  when it has its own port and key (`crates/agent-core/src/config.rs:2266-2268`),
+  when it has its own port and key (`crates/agent-core/src/config.rs:2259-2261`),
   and `derived_netstack` sends it to its stack rather than to the per-org TUN
   that the device-wide `overlay_multi_org` would pick
   (`agents/roomlerd/src/overlay.rs:311`). A port that is unset is **picked**:

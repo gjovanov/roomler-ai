@@ -556,18 +556,9 @@ jobs:
       # `roomler-hive-node` (FR-90 P0a) joined with its first commit: the
       # transcript chain's one-writer and no-gap checks, the replica store's
       # search scoping and the empty-roots-means-nowhere rule are its tests.
-      # `roomler-ai-mod-hive` (FR-90 P0b) the same way: the start-ack table
-      # bound to its device, the status sets a device report may move, and
-      # the folder/title checks the start route applies.
       # `roomler-ai-mod-remote` (FR-101 P2a) joined with its first tests: how
       # the owner pod reads the session policy off the cross-pod relay (absent
       # vs unreadable), and the policy route's strict values.
-      # `roomler-ai-mod-vault` (FR-90 P3-1) with its first commit: a value
-      # moved to another place, altered, or held to another KEK does not
-      # open; a KEK never prints; paths and fields have one spelling.
-      # `roomler-ai-mod-knowhow` (FR-90 P4-1) the same way: a key, a kind and
-      # an attribute have one spelling, and a person's change to one fact
-      # keeps every other fact's provenance.
       # `roomler-ai-mod-conference` (FR-127 P1) with its first unit tests: a
       # viewer's view keeps `None` (a legacy client, everything flows) apart
       # from `Some(empty)` (a view client showing nothing), an older report
@@ -582,8 +573,7 @@ jobs:
           -p roomler-ai-services -p roomler-ai-db -p roomler-ai-config
           -p roomler-ai-mod-chat -p roomler-ai-mod-saas
           -p tcp-turn-conn -p roomler-setup-core -p roomler-setup
-          -p roomler-hive-node -p roomler-ai-mod-hive -p roomler-ai-mod-remote
-          -p roomler-ai-mod-vault -p roomler-ai-mod-knowhow
+          -p roomler-hive-node -p roomler-ai-mod-remote
           -p roomler-ai-mod-conference
 
       # FR-115 P4a-2 — `derp-relay`, the regional PoPs' DERP relay, ran its
