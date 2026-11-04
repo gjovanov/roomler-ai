@@ -842,6 +842,22 @@ struct PendingCodec {
     browser_caps: Option<Vec<String>>,
 }
 
+/// #3468, from review — will the peer a re-offer builds carry the session's
+/// recording? Only with RECORD in its grant AND a record context, both stashed
+/// by a request that came before this offer. A second offer for a session has
+/// neither: the first one took both, and the peer gets the default grant and
+/// no context. The hub never forwards one (`admit_offer`), so today this is
+/// always `false`, and a replaced channel's end is the recording's end.
+#[cfg_attr(not(feature = "recording"), allow(dead_code))]
+fn reoffer_carries_record(
+    permissions: Option<&roomler_ai_remote_control::permissions::Permissions>,
+    meta: Option<&SessionMeta>,
+) -> bool {
+    permissions
+        .is_some_and(|p| p.contains(roomler_ai_remote_control::permissions::Permissions::RECORD))
+        && meta.is_some_and(|m| m.3.is_some())
+}
+
 /// #3280 — the codec and transport a session's offer builds its peer with. The
 /// request's picks, unless the answer in force has since stopped offering them
 /// ([`crate::encode::caps::picks_at_the_offer`]).
@@ -4209,8 +4225,23 @@ async fn handle_server_msg(
                 // #3451 — said BEFORE the close: the old peer's `record`
                 // channel ending is not the session's end, and a recording
                 // launching for it carries on under the new peer.
+                //
+                // ⚠️ Only when the new peer carries the recording (#3468, from
+                // review). The hub forwards one offer per session
+                // (`admit_offer`), so a second one comes only from an older or
+                // hostile server, and the peer built from it gets the default
+                // grant, without RECORD, and no record context: nothing on it
+                // can pick the recording up. Said for that peer, a recording
+                // launching under the old one waited in the grace past the
+                // host's Disconnect. Not said, the old channel's end is the
+                // session's end for the recording, as on master.
                 #[cfg(feature = "recording")]
-                crate::recording::remote::peer_replaced(session_id);
+                if reoffer_carries_record(
+                    pending_permissions.get(&session_id),
+                    pending_session_meta.get(&session_id),
+                ) {
+                    crate::recording::remote::peer_replaced(session_id);
+                }
                 // FR-101 P3 — the session goes on under a new peer, and the
                 // old one's drop forgets its counters: carry the transfer
                 // readings across, so the cumulative tallies never go back.
@@ -4321,6 +4352,9 @@ async fn handle_server_msg(
                     },
                 )
                 .await;
+                // #3468, from review — the session ends here, for a recording it held too.
+                #[cfg(feature = "recording")]
+                crate::recording::remote::session_ended(session_id);
                 return Ok(());
             }
 
@@ -4373,6 +4407,9 @@ async fn handle_server_msg(
                         },
                     )
                     .await;
+                    // #3468, from review — the session ends here, for a recording it held too.
+                    #[cfg(feature = "recording")]
+                    crate::recording::remote::session_ended(session_id);
                     return Ok(());
                 }
             };
@@ -4434,6 +4471,9 @@ async fn handle_server_msg(
                         },
                     )
                     .await;
+                    // #3468, from review — the session ends here, for a recording it held too.
+                    #[cfg(feature = "recording")]
+                    crate::recording::remote::session_ended(session_id);
                     return Ok(());
                 }
             };
@@ -4463,6 +4503,9 @@ async fn handle_server_msg(
                         },
                     )
                     .await;
+                    // #3468, from review — the session ends here, for a recording it held too.
+                    #[cfg(feature = "recording")]
+                    crate::recording::remote::session_ended(session_id);
                     return Ok(());
                 }
             };
@@ -4528,6 +4571,9 @@ async fn handle_server_msg(
                 crate::lock_on_end::session_aborted(session_id);
                 indicator.hide_session(session_id.to_hex());
                 close_within_budget(peer.close(), session_id, "answer_send_failed").await;
+                // #3468, from review — the session ends here, for a recording it held too.
+                #[cfg(feature = "recording")]
+                crate::recording::remote::session_ended(session_id);
                 return Err(ConnectError::Transient(e.context("sending answer")));
             }
             // FR-101 P4b-2 — the session is live: its idle limit runs from
@@ -7698,6 +7744,39 @@ mod tests {
             }),
             ("h264".to_string(), None),
         );
+    }
+
+    /// #3468, from review — a re-offer's peer carries the recording only with
+    /// RECORD in its grant AND a record context. A second offer, the only way
+    /// a re-offer comes, finds neither stashed (the first one took them), so
+    /// the old channel's end stays the recording's end. Red when the grant
+    /// alone, or nothing at all, counts.
+    #[test]
+    fn only_a_reoffer_with_record_and_its_context_carries_the_recording() {
+        use roomler_ai_remote_control::permissions::Permissions;
+        let meta = |record: bool| -> SessionMeta {
+            (
+                "Controller".to_string(),
+                None,
+                None,
+                record.then_some(RecordMeta {
+                    controller_user_id: bson::oid::ObjectId::new(),
+                    prompt_window: None,
+                }),
+                crate::rc_overlay::RcOverlay::resolve(false),
+                None,
+                None,
+            )
+        };
+        let record = Permissions::default() | Permissions::RECORD;
+        assert!(!reoffer_carries_record(None, None), "a second offer");
+        assert!(!reoffer_carries_record(
+            Some(&Permissions::default()),
+            Some(&meta(true))
+        ));
+        assert!(!reoffer_carries_record(Some(&record), Some(&meta(false))));
+        assert!(!reoffer_carries_record(Some(&record), None));
+        assert!(reoffer_carries_record(Some(&record), Some(&meta(true))));
     }
 
     /// #2551 — a `ws.text` stage is refined to the message's wire tag, read
