@@ -3010,10 +3010,7 @@ async fn connect_once(
                         // better than exiting, and an old agent meeting a new
                         // frame family must keep running. It just has to SAY so.
                         Err(e) => {
-                            let tag = serde_json::from_str::<serde_json::Value>(&text)
-                                .ok()
-                                .and_then(|v| v.get("t")?.as_str().map(str::to_string));
-                            match tag {
+                            match undecodable_frame_tag(&text) {
                                 Some(t) if t.starts_with("rc:") => warn!(
                                     %e, %t,
                                     "DROPPED a roomler frame this build cannot decode — the \
@@ -6014,6 +6011,16 @@ fn server_msg_tag(text: &str) -> Option<&str> {
     serde_json::from_str::<Tag<'_>>(text).ok().map(|tag| tag.t)
 }
 
+/// The `t` of a text frame that did not decode as a [`ServerMsg`]: the
+/// decode-failure arm WARNs for an `rc:` tag (a frame of ours this build
+/// cannot read) and logs anything else at debug. Owned, unlike
+/// [`server_msg_tag`], so an escaped tag still reads.
+fn undecodable_frame_tag(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("t")?.as_str().map(str::to_string))
+}
+
 /// T2.10d: tear down every tunnel peer on WS disconnect. Cheap
 /// no-op when the map is empty (normal for agents that never serve
 /// a tunnel).
@@ -6709,6 +6716,24 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(server_msg_tag(&json), Some("rc:goodbye"));
+    }
+
+    /// FR-137 compatibility test 3 — a frame in one of FR-90's retired
+    /// families (an older server's `rc:hive.start`, say) no longer decodes as
+    /// a `ServerMsg`. The decode-failure arm reads its tag, which starts
+    /// `rc:`, so the frame is named in a WARN and dropped; that arm only logs,
+    /// so the socket stays up.
+    #[test]
+    fn a_retired_family_frame_fails_to_decode_and_is_named_by_its_tag() {
+        for text in [
+            r#"{"t":"rc:hive.start","session_id":"s","prompt":"x"}"#,
+            r#"{"t":"rc:vault.leased","req_id":"r"}"#,
+            r#"{"t":"rc:knowhow.scan","scan_id":"k"}"#,
+        ] {
+            assert!(serde_json::from_str::<ServerMsg>(text).is_err(), "{text}");
+            let tag = undecodable_frame_tag(text).expect("a `t`");
+            assert!(tag.starts_with("rc:"), "{tag}: the WARN arm, not debug");
+        }
     }
 
     /// #2221 — a dropped session that lived restarts the reconnect ladder. A

@@ -8637,6 +8637,38 @@ mod tests {
         }
     }
 
+    /// FR-137 compatibility test 6 (S-B5) — `ssh_audit` rows written before P2
+    /// load as they are: FR-90's three refusals, its `session` source, and the
+    /// two fields this model no longer has (`session_id`, `ssh_ticket_id`).
+    /// `BaseDao` decodes a page this way, row by row, and one row that failed
+    /// would fail the whole listing.
+    #[test]
+    fn ssh_audit_rows_written_before_p2_still_load() {
+        let id = ObjectId::new();
+        for word in ["ticket_refused", "session_not_allowed", "target_too_old"] {
+            let row = bson::doc! {
+                "_id": ObjectId::new(),
+                "tenant_id": id,
+                "agent_id": id,
+                "user_id": id,
+                "grant_id": "g-1",
+                "source": "session",
+                "session_id": ObjectId::new(),
+                "ssh_ticket_id": "t-1",
+                "caller": "an agent session",
+                "at": DateTime::now(),
+                "denied": word,
+            };
+            let ev: SshAuditEvent =
+                bson::from_document(row).unwrap_or_else(|e| panic!("{word}: {e}"));
+            assert_eq!(ev.source, "session");
+            assert_eq!(
+                serde_json::to_value(ev.denied).unwrap(),
+                serde_json::json!(word)
+            );
+        }
+    }
+
     /// FR-83 — every agent before the ack advertises `ssh` (and most
     /// `ssh-consent`) and never answers a grant. A prefix matcher would make
     /// the server wait out its full bound on every grant to every one of them

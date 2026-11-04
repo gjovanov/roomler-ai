@@ -212,3 +212,22 @@ fn diff_lists(what: &str, expected: &[String], actual: &[String], report: &mut S
         report.push_str(&format!("{what} unexpected: {extra}\n"));
     }
 }
+
+/// FR-137 S-B4 — the user socket's retired namespace (`hive:`, FR-90's viewer
+/// and search) has no handler, and no module may claim it again: a tab opened
+/// before Hive was parked gets the socket's unknown-type answer.
+#[tokio::test]
+async fn no_module_serves_a_retired_user_ws_namespace() {
+    let app = TestApp::spawn_with_settings(|_| {}).await;
+    for ns in roomler_ai_remote_control::models::RETIRED_USER_WS_NAMESPACES {
+        for msg_type in [format!("{ns}:view.open"), format!("{ns}:search.open")] {
+            assert!(
+                app.state
+                    .modules
+                    .ws_handler(roomler_core::Role::User, &msg_type)
+                    .is_none(),
+                "{msg_type} must find no handler"
+            );
+        }
+    }
+}

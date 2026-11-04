@@ -5187,6 +5187,44 @@ mod tests {
         }
     }
 
+    /// FR-137 compatibility test 1 (B-I6) — a 0.4.199 hello: FR-90's
+    /// `vault_key` beside the 21 retired verbs. It parses as it always did,
+    /// the words ride on as plain strings (the stored caps keep them), and
+    /// none of them reads as a verb this build knows.
+    #[test]
+    fn a_0_4_199_hello_with_the_retired_words_still_parses() {
+        use crate::models::{RETIRED_RPC_VERBS, RpcCap};
+        let mut rpc: Vec<String> = vec!["exec".into(), "ssh".into(), "ssh-grant-ack".into()];
+        rpc.extend(RETIRED_RPC_VERBS.iter().map(|v| v.to_string()));
+        let mut caps = serde_json::to_value(AgentCaps::default()).unwrap();
+        caps["rpc"] = serde_json::json!(rpc);
+        let hello = serde_json::json!({
+            "t": "rc:agent.hello",
+            "machine_name": "frozen-0-4-199",
+            "os": "linux",
+            "agent_version": "0.4.199",
+            "displays": [],
+            "caps": caps,
+            // FR-90 P3-3a's key: an X25519 public half, base64.
+            "vault_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        });
+        match serde_json::from_value::<ClientMsg>(hello).unwrap() {
+            ClientMsg::AgentHello {
+                agent_version,
+                caps,
+                ..
+            } => {
+                assert_eq!(agent_version, "0.4.199");
+                for word in RETIRED_RPC_VERBS {
+                    assert!(caps.rpc.iter().any(|w| w == word), "{word} kept");
+                    assert_eq!(RpcCap::from_wire(word), None, "{word} is no verb");
+                }
+                assert!(caps.has_rpc(RpcCap::Exec) && caps.has_rpc(RpcCap::Ssh));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
     #[test]
     fn ice_server_minimal() {
         let s = IceServer {

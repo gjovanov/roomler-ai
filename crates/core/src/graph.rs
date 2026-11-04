@@ -39,6 +39,17 @@ pub fn is_allowed_edge(from: &str, to: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// FR-137 — FR-90's retired module ids never come back: no module, no
+    /// hook position, no edge.
+    #[test]
+    fn no_retired_module_id_is_in_the_graph() {
+        for id in roomler_ai_remote_control::models::RETIRED_MODULE_IDS {
+            assert!(!MODULES.contains(&id), "{id} is retired");
+            assert!(!crate::hooks::HOOK_ORDER.contains(&id), "{id} is retired");
+            assert!(EDGES.iter().all(|(a, b)| *a != id && *b != id), "{id}");
+        }
+    }
+
     #[test]
     fn every_edge_names_known_modules() {
         for (from, to) in EDGES {
