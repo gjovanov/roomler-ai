@@ -361,9 +361,20 @@ pub const START_DNS_PURGE_WAIT: std::time::Duration = std::time::Duration::from_
 /// (`tunnel_core::overlay::dns::purge_exit_dns_within`), so it can never delete
 /// a steer made after it began. The route purges stay synchronous: they are
 /// typed calls into the IP helper, with no child process to wait on.
+///
+/// #3440 — a purge an earlier exit handed over is counted first, so the start's
+/// DNS changes wait for it as they wait for the start's own.
 pub fn purge_exit_routes_at_start() {
     #[cfg(feature = "overlay-l3")]
     {
+        let adopted = tunnel_core::overlay::dns::adopt_handed_over_purges();
+        if !adopted.is_empty() {
+            tracing::info!(
+                ?adopted,
+                "boot reconcile: an exit-DNS purge an earlier exit handed over is still running; \
+                 DNS changes wait for it too (#3440)"
+            );
+        }
         tunnel_core::overlay::tun::purge_split_default(tunnel_core::overlay::tun::IF_NAME);
         tunnel_core::overlay::tun::purge_stale_peer_routes(tunnel_core::overlay::tun::IF_NAME);
         if !tunnel_core::overlay::dns::purge_exit_dns_within(START_DNS_PURGE_WAIT) {
@@ -374,6 +385,65 @@ pub fn purge_exit_routes_at_start() {
             );
         }
         tunnel_core::overlay::host_ledger::purge();
+    }
+}
+
+/// #3440 — how long an exit a replacement follows waits for the exit-DNS purge
+/// before it hands the purge to that replacement. Unloaded, the purge's
+/// `powershell` ended in 1.7–1.8 s on the #3291 guest, so an unloaded exit
+/// still finishes it.
+pub const EXIT_DNS_PURGE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`EXIT_DNS_PURGE_WAIT`], or `ROOMLERD_EXIT_PURGE_WAIT_S` seconds. `0` is
+/// the kill switch: no bound, as before #3440.
+#[cfg(feature = "overlay-l3")]
+fn exit_dns_purge_wait() -> Option<std::time::Duration> {
+    exit_dns_purge_wait_from(tunnel_core::env::node_env("EXIT_PURGE_WAIT_S").as_deref())
+}
+
+/// [`exit_dns_purge_wait`] for a given setting. One that does not parse is
+/// ignored, as an absent one is.
+#[cfg(any(feature = "overlay-l3", test))]
+fn exit_dns_purge_wait_from(setting: Option<&str>) -> Option<std::time::Duration> {
+    match setting.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(s) => Some(std::time::Duration::from_secs(s)),
+        None => Some(EXIT_DNS_PURGE_WAIT),
+    }
+}
+
+/// #3440 — [`purge_exit_routes`] for an exit a replacement follows: the two
+/// watchdog exits, whose code the supervisor restarts. The same purges in the same order,
+/// but the exit waits for the exit-DNS purge for at most
+/// [`EXIT_DNS_PURGE_WAIT`] and hands one still running to the replacement
+/// (`tunnel_core::overlay::dns::purge_exit_dns_before_exit`). Before the bound
+/// a stalled worker on a starved host waited for that purge as long as the
+/// load lasted, and the supervisor could not start the worker that replaces it.
+///
+/// The exits nothing replaces keep [`purge_exit_routes`]: a plain stop, a fatal
+/// goodbye and a duplicate-instance loser. Nothing waits on them, and a purge
+/// they cut short would have no next start behind it. A requested restart
+/// keeps it too: `purge_after_daemon` has run the whole purge before it.
+///
+/// Returns `false` when it handed the DNS purge over.
+pub fn purge_exit_routes_before_restart() -> bool {
+    #[cfg(feature = "overlay-l3")]
+    {
+        tunnel_core::overlay::tun::purge_split_default(tunnel_core::overlay::tun::IF_NAME);
+        tunnel_core::overlay::tun::purge_stale_peer_routes(tunnel_core::overlay::tun::IF_NAME);
+        let ended = match exit_dns_purge_wait() {
+            Some(wait) => tunnel_core::overlay::dns::purge_exit_dns_before_exit(wait),
+            None => {
+                tunnel_core::overlay::dns::purge_exit_dns();
+                true
+            }
+        };
+        tunnel_core::overlay::host_ledger::purge();
+        ended
+    }
+    #[cfg(not(feature = "overlay-l3"))]
+    {
+        true
     }
 }
 
@@ -402,5 +472,18 @@ mod tests {
     #[test]
     fn a_running_daemon_keeps_its_routes() {
         assert!(!super::purge_exit_routes_unless_owned(true));
+    }
+
+    /// #3440 — an exit's wait for the DNS purge: 5 s, a number of seconds, or
+    /// `0`, which is no bound at all, as before.
+    #[test]
+    fn an_exit_waits_for_the_dns_purge_five_seconds_unless_told() {
+        use std::time::Duration;
+        let wait = super::exit_dns_purge_wait_from;
+        assert_eq!(wait(None), Some(Duration::from_secs(5)));
+        assert_eq!(wait(Some("12")), Some(Duration::from_secs(12)));
+        assert_eq!(wait(Some(" 3 ")), Some(Duration::from_secs(3)));
+        assert_eq!(wait(Some("0")), None, "the kill switch: no bound");
+        assert_eq!(wait(Some("soon")), Some(Duration::from_secs(5)), "ignored");
     }
 }
