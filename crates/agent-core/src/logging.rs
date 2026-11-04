@@ -162,7 +162,8 @@ fn mirror_legacy_log_target(spec: &str) -> String {
     out.join(",")
 }
 
-/// Initialise tracing subscribers. Always installs a stdout layer; adds
+/// Initialise tracing subscribers. Installs a stdout layer, except on a
+/// console nobody reads while the file has every line (#3438); adds
 /// a daily-rolling file layer + panic hook when the platform log dir
 /// is writeable. Infallible — file logging failure falls back to
 /// stdout-only without erroring out the agent (the agent's signaling
@@ -203,6 +204,8 @@ pub fn init() {
             .map_err(std::io::Error::other)
     });
     let _ = LOG_DIR.set(opened.as_ref().map(|(d, _)| d.clone()));
+    // #3438 — no line goes to a console nobody reads while the file has them all.
+    let quiet = opened.is_some() && console_nobody_reads();
 
     if let Some((dir, appender)) = opened {
         let d = dir.as_path();
@@ -215,7 +218,7 @@ pub fn init() {
             .with_ansi(false);
         let _ = tracing_subscriber::registry()
             .with(env_filter)
-            .with(stdout)
+            .with((!quiet).then_some(stdout))
             .with(file)
             .with(upload_layer)
             .try_init();
@@ -235,6 +238,46 @@ pub fn init() {
     for note in notes {
         tracing::warn!(%note, "logging: the log directory could not be used (#3073)");
     }
+    // #3438 — and what only stderr carries goes to that file too, as #3292 does
+    // for the per-user daemon: the watchdog's last words, a panic, FFmpeg.
+    #[cfg(windows)]
+    if quiet {
+        send_stderr_to_the_log();
+        tracing::info!(
+            "logging: this console has no window, so every line goes to the log file, \
+             stderr's too (#3438)"
+        );
+    }
+}
+
+/// #3438 — whether this process's stdout is a console nobody reads: a service
+/// process's console that has no window. The supervisor starts the SystemContext
+/// worker with `CREATE_NO_WINDOW` and no standard handles, so the worker's stdio
+/// is such a console, served by a `conhost.exe` of its own at Normal priority. A
+/// write there waits for that conhost, which a host busy with higher-priority work
+/// runs only now and then: the exit-DNS purge's 10 s bound was logged 40-46 s
+/// after the purge began. Only a process with a [`ServiceLogRole`] is asked, so a
+/// verb a person runs keeps its console lines, in a terminal or over SSH.
+#[cfg(windows)]
+fn console_nobody_reads() -> bool {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetConsoleWindow, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+    if SERVICE_ROLE.get().is_none() {
+        return false;
+    }
+    let mut mode = 0;
+    // SAFETY: reads this process's standard handle and its console; `mode` is a
+    // valid out-pointer.
+    unsafe {
+        GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut mode) != 0
+            && GetConsoleWindow().is_null()
+    }
+}
+
+#[cfg(not(windows))]
+fn console_nobody_reads() -> bool {
+    false
 }
 
 /// #3073 — where [`init`] logs when the resolved directory cannot be used:
@@ -722,8 +765,9 @@ pub fn resolve_log_dir() -> Option<PathBuf> {
     // file layer writing into the live daemon log, a panic hook that turns
     // a failing test into a crash of this device (the daemon uploads it),
     // and a prune of the real dir. `None` takes init's stdout-only branch.
+    // #3438: except in a child a test started with a directory of its own.
     if cfg!(test) {
-        return None;
+        return std::env::var_os("ROOMLER_TEST_LOG_DIR").map(PathBuf::from);
     }
     #[cfg(target_os = "windows")]
     if SERVICE_ROLE.get().is_some() {
@@ -1344,6 +1388,124 @@ mod tests {
                 rolling_file(dir.path(), &before).exists()
                     || rolling_file(dir.path(), &after).exists()
             );
+        }
+
+        /// #3438 — what `resolve_log_dir` reads in a test's child.
+        const CHILD_LOG_DIR: &str = "ROOMLER_TEST_LOG_DIR";
+
+        /// `child`, in a console with no window, the way the supervisor starts the
+        /// SystemContext worker (`CREATE_NO_WINDOW`, `supervisor.rs:331`). The
+        /// supervisor passes no standard handles, so the worker's are that console's.
+        /// `Command` always passes some, so the child takes its console (`CONOUT$`)
+        /// as its stdout and stderr itself.
+        fn child_in_a_console_with_no_window(name: &str, dir: &Path) -> std::process::ExitStatus {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("logging::tests::stderr_capture::{name}"),
+                    "--nocapture",
+                ])
+                .env(CHILD_DIR, dir)
+                .env(CHILD_LOG_DIR, dir)
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+        }
+
+        /// This process's console text, up to the cursor's row.
+        fn console_text() -> String {
+            use windows_sys::Win32::System::Console::{
+                CONSOLE_SCREEN_BUFFER_INFO, COORD, GetConsoleScreenBufferInfo, GetStdHandle,
+                ReadConsoleOutputCharacterW, STD_OUTPUT_HANDLE,
+            };
+            // SAFETY: `info`, `text` and `read` are valid for the sizes passed.
+            unsafe {
+                let out = GetStdHandle(STD_OUTPUT_HANDLE);
+                let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+                if GetConsoleScreenBufferInfo(out, &mut info) == 0 {
+                    return format!("(no screen buffer: {})", std::io::Error::last_os_error());
+                }
+                let rows = info.dwCursorPosition.Y.max(0) as u32 + 1;
+                let cells = info.dwSize.X.max(0) as u32 * rows;
+                let mut text = vec![0u16; cells as usize];
+                let mut read = 0u32;
+                let origin = COORD { X: 0, Y: 0 };
+                ReadConsoleOutputCharacterW(out, text.as_mut_ptr(), cells, origin, &mut read);
+                String::from_utf16_lossy(&text[..text.len().min(read as usize)])
+            }
+        }
+
+        /// A SystemContext worker's logging, in a console that has no window. It
+        /// leaves the parent whether the console has a window and the console's text.
+        /// Nothing after `init` may panic: the hook would record a crash.
+        #[test]
+        fn child_logs_in_a_console_with_no_window() {
+            use std::os::windows::io::IntoRawHandle;
+            use windows_sys::Win32::System::Console::{
+                GetConsoleWindow, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+            };
+            let Some(dir) = child_dir() else { return };
+            let report = dir.join("console.txt");
+            let console = || {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("CONOUT$")
+            };
+            let (Ok(out), Ok(err)) = (console(), console()) else {
+                let _ = std::fs::write(&report, "(no console)");
+                return;
+            };
+            // SAFETY: two valid handles, owned by the standard-handle table from here on.
+            unsafe {
+                SetStdHandle(STD_OUTPUT_HANDLE, out.into_raw_handle());
+                SetStdHandle(STD_ERROR_HANDLE, err.into_raw_handle());
+            }
+            super::super::set_service_logging(super::super::ServiceLogRole::Worker);
+            super::super::init();
+            tracing::warn!("a-line-for-the-log");
+            super::super::say_on_stderr("the-last-words");
+            super::super::say_on_stdout("a-line-on-the-console");
+            // SAFETY: takes no arguments.
+            let window = if unsafe { GetConsoleWindow() }.is_null() {
+                "none"
+            } else {
+                "some"
+            };
+            let _ = std::fs::write(&report, format!("window={window}\n{}", console_text()));
+        }
+
+        /// #3438 — the SystemContext worker's console has no window and nobody reads
+        /// it, yet every log line went there first and waited for its `conhost`: on a
+        /// starved host a 10 s bound's warning was stamped 40-46 s late. No line goes
+        /// to such a console, and what only stderr carries goes to the rolling log.
+        #[test]
+        fn a_console_with_no_window_gets_no_line_and_stderr_reaches_the_log() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = child_in_a_console_with_no_window(
+                "child_logs_in_a_console_with_no_window",
+                dir.path(),
+            );
+            assert!(status.success(), "{status:?}");
+            let console = std::fs::read_to_string(dir.path().join("console.txt")).unwrap();
+            // The premise, and a control that the console is read at all.
+            assert!(console.starts_with("window=none\n"), "{console}");
+            assert!(console.contains("a-line-on-the-console"), "{console}");
+            assert!(
+                !console.contains("a-line-for-the-log"),
+                "a log line reached the console: {console}"
+            );
+            assert!(
+                !console.contains("the-last-words"),
+                "stderr reached the console: {console}"
+            );
+            let log = today(dir.path());
+            assert!(log.contains("the-last-words"), "{log}");
         }
     }
 }

@@ -82,6 +82,9 @@ pub mod fp16;
 #[cfg(any(target_os = "linux", all(unix, feature = "recording")))]
 pub(crate) mod fs_identity;
 pub mod gpu_clock;
+/// #3439 — a session asked for before the capability probe's first answer waits
+/// for it, in its connection.
+pub mod held_requests;
 /// FR-99 P4 — the host's speakers are muted while a privacy curtain is up, and
 /// restored after it, after a crash too; the controller keeps the audio.
 pub mod host_mute;

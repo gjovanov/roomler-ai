@@ -908,12 +908,33 @@ pub async fn run(
     // (no cache yet, a week's age, a driver change) the probe children may
     // take up to 60 s each, and a watchdog kill at 90 s left the cache
     // unwritten, so the restarted worker probed again: a crash loop with the
-    // device offline. Warm it here instead, with the pump gated off and on a
-    // blocking thread.
-    let _ = tokio::task::spawn_blocking(crate::encode::caps::detect).await;
-    // #3280 — a first answer that ran short of time gets more tries, off to one
-    // side. It arms nothing on a healthy host, or in a second organization's loop.
-    crate::encode::caps::arm_retry(live_on_this_host(rc_sessions.clone()));
+    // device offline. Warm it here instead, with the pump gated off.
+    //
+    // #3439 — and wait for it `FIRST_ANSWER_WAIT` at most. Awaited whole, a
+    // starved host stayed offline for as long as its probe ran, which under load
+    // is as long as the load lasts, on every start that misses the cache (the
+    // first of every build). A healthy host answers well inside the wait, so its
+    // hello carries the whole answer as before. Past it, the loop connects with
+    // the interim answer, and the real one is announced the moment it lands.
+    // Everything the loop reads of the caps from here never waits for the probe
+    // (`caps::answer_now`), and a session asked for before the first answer waits
+    // for it in its connection (`crate::held_requests`).
+    let caps_waited = std::time::Instant::now();
+    if crate::encode::caps::start_probing(live_on_this_host(rc_sessions.clone())) {
+        if !crate::encode::caps::first_answer_within(crate::encode::caps::FIRST_ANSWER_WAIT).await {
+            info!(
+                waited_ms = caps_waited.elapsed().as_millis() as u64,
+                "caps probe: no answer yet; connecting with the encoders that need no driver, \
+                 and the hardware follows when the probe answers"
+            );
+            let _ = tokio::task::spawn_blocking(crate::encode::caps::interim).await;
+        }
+    } else {
+        let _ = tokio::task::spawn_blocking(crate::encode::caps::detect).await;
+        // #3280 — a first answer that ran short of time gets more tries, off to one
+        // side. It arms nothing on a healthy host, or in a second organization's loop.
+        crate::encode::caps::arm_retry(live_on_this_host(rc_sessions.clone()));
+    }
     // Overlay "Disconnect" control → this channel → the connect_once
     // loop, which tears the session down (peer close + ClientMsg::Terminate).
     // Created once; the receiver is polled inside connect_once across
@@ -1680,6 +1701,9 @@ async fn connect_once(
     }
 
     // Say hello.
+    // #3439 — subscribed before the generation is read, so an answer that lands
+    // after this wakes the loop, which announces it at once.
+    let mut caps_news = crate::encode::caps::news();
     // #3280 — read before the answer: one adopted in between is news next beat.
     let mut last_announced_caps_generation = crate::encode::caps::generation();
     let mut hello_caps = stub_caps(cfg.overlay_multi_org, ctx.is_primary);
@@ -1995,6 +2019,8 @@ async fn connect_once(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await; // Swallow the immediate first tick.
     let mut sys_sampler = crate::telemetry::SysSampler::new();
+    // #3439 — session requests that came before the probe's first answer.
+    let mut held = crate::held_requests::HeldRequests::default();
 
     // Receive-liveness stamp: refreshed on EVERY inbound frame (the Pongs the
     // server auto-sends for our keepalive Pings count), checked against
@@ -2299,6 +2325,54 @@ async fn connect_once(
                     netchange_probe = Some((std::time::Instant::now(), 0));
                     keepalive.reset_after(WS_NETCHANGE_PROBE_DEADLINE);
                 }
+            }
+            // #3439 — the answer in force moved: the probe's first answer, which
+            // replaces the interim one this connection may have said hello with,
+            // or a later try's (#3280). The heartbeat announces it now, not within
+            // its 30 s, and a session asked for before the first answer is handled
+            // now, as if it had arrived now.
+            Ok(()) = caps_news.changed() => {
+                let _stage = watchdog::enter(ctx.pump, "caps.news");
+                heartbeat.reset_immediately();
+                if crate::encode::caps::answered() && !held.is_empty() {
+                    for request in held.release(std::time::Instant::now()) {
+                        handle_server_msg(
+                            ctx,
+                            &cfg.tenant_id,
+                            &mut ws,
+                            request,
+                            &mut peers,
+                            &mut pending_codecs,
+                            &mut pending_transports,
+                            &mut pending_chroma,
+                            &mut pending_chunk_framing,
+                            &mut pending_audio,
+                            &mut pending_permissions,
+                            &mut pending_session_meta,
+                            &mut tunnel_peers,
+                            &mut tunnel_quic_peers,
+                            &outbound_tx,
+                            tunnel_reap_tx,
+                            &mut pending_quic_setups,
+                            quic_setup_tx,
+                            idle_tx,
+                            encoder_preference,
+                            &indicator,
+                            &consent_broker,
+                            &cfg.forward_acl,
+                            &relay_regions_slot,
+                            &derp_ticket_slot,
+                            cfg,
+                            remote_cfg,
+                            delegate.as_ref(),
+                            // Held off our own control WS: its replies belong here.
+                            None,
+                            carrier_ready_tx,
+                        )
+                        .await?;
+                    }
+                }
+                watchdog::tick(ctx.pump);
             }
             _ = heartbeat.tick() => {
                 let _stage = watchdog::enter(ctx.pump, "heartbeat");
@@ -2960,6 +3034,20 @@ async fn connect_once(
                                 Some(p) => p,
                                 None => continue,
                             };
+                            // #3439 — a session asked for before the probe's first
+                            // answer waits for it (the `caps.news` arm hands it on),
+                            // and one that ends meanwhile is forgotten.
+                            if let ServerMsg::Terminate { session_id, .. } = &parsed {
+                                held.forget(*session_id);
+                            }
+                            let parsed = if crate::encode::caps::answered() {
+                                parsed
+                            } else {
+                                match held.hold(parsed, std::time::Instant::now()) {
+                                    None => continue,
+                                    Some(other) => other,
+                                }
+                            };
                             handle_server_msg(
                                 ctx,
                                 &cfg.tenant_id,
@@ -3559,7 +3647,9 @@ async fn handle_server_msg(
                     &ctx.label,
                 )
             };
-            let our_caps = crate::encode::caps::detect();
+            // #3439 — a request reaches here only once the probe has answered
+            // (`crate::held_requests`), so this is that answer, read without a wait.
+            let our_caps = crate::encode::caps::answer_now();
 
             // Phase Y.3: figure out which video transport this
             // session will use. Honour `preferred_transport` only if
@@ -4164,7 +4254,8 @@ async fn handle_server_msg(
                 pending_codecs,
                 pending_transports,
                 session_id,
-                crate::encode::caps::detect,
+                // #3439 — never a wait on the probe inside this loop.
+                crate::encode::caps::answer_now,
             );
             // #2231 — the RTP video track's codec, read from this offer: on a
             // DataChannel transport it moves to VP8 when the browser cannot
@@ -6476,7 +6567,10 @@ fn stub_caps(multi_org_tun: bool, is_primary: bool) -> AgentCaps {
     // resulting AgentCaps populates the rc:agent.hello payload, which
     // the server persists into the agents collection and surfaces in
     // the admin UI (2A.2).
-    let mut caps = crate::encode::caps::detect();
+    // #3439 — never `detect()` here: before the first answer it would block this
+    // loop on the probe. The interim answer goes out instead, and the heartbeat
+    // replaces it the moment the probe answers.
+    let mut caps = crate::encode::caps::answer_now();
     // FR-67 P7 — whether this enrollment acts on a pushed `rc:agent.update`
     // (`self`), ignores it (`primary_org`, a secondary enrollment) or drops it
     // (`off`, auto-update off), so the server refuses the push, and says why,

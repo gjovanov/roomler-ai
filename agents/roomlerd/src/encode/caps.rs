@@ -51,6 +51,12 @@ static FIRST_SHORT: Mutex<Option<child::Shortfall>> = Mutex::new(None);
 static LAST_ASK: Mutex<Option<Instant>> = Mutex::new(None);
 /// #3280 — the GPU-input forms of the answer in force, for [`weigh`].
 static GPU_IN_FORCE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// #3439 — what the async path answers before the first probe has ([`answer_now`]).
+static INTERIM_CAPS: OnceLock<AgentCaps> = OnceLock::new();
+/// #3439 — the first answer is news, once ([`detect`]).
+static FIRST_IS_NEWS: std::sync::Once = std::sync::Once::new();
+/// #3439 — wakes every connection when [`generation`] moves ([`news`]).
+static NEWS: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
 
 fn late_caps() -> Option<AgentCaps> {
     LATE_CAPS.read().unwrap_or_else(|e| e.into_inner()).clone()
@@ -62,17 +68,76 @@ fn late_caps() -> Option<AgentCaps> {
 /// LocalAPI serves this on every Overview poll, and the first `detect()` in a
 /// process spawns the probe children (vendor driver code, the reason the
 /// probe is out-of-process at all); a control-surface read must never be what
-/// launches that. The probe runs at the first `rc:agent.hello`, so before a
-/// daemon has reached its server this is `None`, and the Overview says
-/// "not probed yet" and asks again later.
+/// launches that. The probe starts with the daemon's signalling loop
+/// ([`start_probing`]), so until its first answer this is `None`, and the
+/// Overview says "not probed yet" and asks again later.
 pub fn cached() -> Option<AgentCaps> {
     late_caps().or_else(|| CACHED_CAPS.get().cloned())
 }
 
 /// #3280 — a number that changes when the answer [`detect`] gives does. Read it
 /// BEFORE reading the answer: a change in between then reads as news next time.
+/// #3439 — the first answer moves it too: a connection that said hello with the
+/// interim answer has to hear of the real one.
 pub fn generation() -> u64 {
     CAPS_GENERATION.load(Ordering::SeqCst)
+}
+
+/// #3439 — wakes when [`generation`] moves. Each connection holds one, so a new
+/// answer reaches its row at once rather than within a heartbeat. Subscribe
+/// before reading the generation, so a change in between wakes it.
+pub fn news() -> tokio::sync::watch::Receiver<u64> {
+    news_sender().subscribe()
+}
+
+fn news_sender() -> &'static tokio::sync::watch::Sender<u64> {
+    NEWS.get_or_init(|| tokio::sync::watch::channel(generation()).0)
+}
+
+/// The answer [`detect`] gives has changed. Called once the new answer is stored:
+/// the generation, then the wake, so whoever wakes finds the new answer.
+fn answer_moved() {
+    let now = CAPS_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    news_sender().send_replace(now);
+}
+
+/// #3439 — whether the first probe has answered. Before it has, a session request
+/// waits for it (`crate::held_requests`).
+pub fn answered() -> bool {
+    CACHED_CAPS.get().is_some()
+}
+
+/// #3439 — the answer in force, or before the first probe has answered, the
+/// interim one ([`interim`]). It never waits for a probe: this is what the
+/// signalling loop reads, where a wait on the probe is a stalled pump.
+pub fn answer_now() -> AgentCaps {
+    cached().unwrap_or_else(|| INTERIM_CAPS.get_or_init(interim_answer).clone())
+}
+
+/// #3439 — build the interim answer, on a blocking thread: it reads the host the
+/// way a cache hit does. `signaling::run` builds it before it connects with it.
+pub fn interim() {
+    let _ = INTERIM_CAPS.get_or_init(interim_answer);
+}
+
+/// #3439 — how long a start waits for the first answer before it connects with
+/// the interim one. Above every healthy host the field has read (`probe_ms` 50
+/// to 6811, `docs/encoders.md`), so such a host's hello carries its whole answer,
+/// as it always did. A starved host is online after this, while its children run.
+pub const FIRST_ANSWER_WAIT: Duration = Duration::from_secs(10);
+
+/// #3439 — wait for the first answer, `within` at most. Whether it came.
+pub async fn first_answer_within(within: Duration) -> bool {
+    let mut news = news();
+    let came = async {
+        while !answered() {
+            if news.changed().await.is_err() {
+                return;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(within, came).await;
+    answered()
 }
 
 /// Whether this build carries ANY video encoder. A signalling-only build
@@ -275,6 +340,8 @@ mod child {
     /// until the next start. So it is long for a scheduler, and short for a
     /// device waiting to come online.
     const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// #3439 — a child that took longer than this to start is said so in the log.
+    const SLOW_SPAWN: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// What the child hands back: the caps, plus the per-host verdicts the
     /// probe measured that are NOT wire capabilities.
@@ -1318,28 +1385,59 @@ mod child {
                 return None;
             }
         };
+        let phase = extra.iter().find(|(k, _)| *k == PHASE_ENV);
+        let phase = phase.map(|(_, v)| v.as_str());
+        // #3439 — on #3439's loaded guest the first child started 5 to 8 s after
+        // the cache miss. Said only when slow, so a field read can tell process
+        // creation itself from what came before it.
+        let spawn_took = started.elapsed();
+        if spawn_took > SLOW_SPAWN {
+            tracing::warn!(
+                spawn_ms = spawn_took.as_millis() as u64,
+                ?phase,
+                "caps probe: starting the probe child was slow; this host is busy"
+            );
+        }
+        // #3439 — the host's CPU from here, so a child that runs out of time can
+        // say whether it was starved or stuck.
+        let host_at_spawn = crate::encode::host_cpu::HostTimes::now();
         // #2717 — the child ends with this process: a worker told to stop
         // mid-probe leaves without waiting it out (`signaling::run`).
         #[cfg(windows)]
         let _ends_with_us = tie_to_this_process(&childp);
 
         let bounds = this.bounds;
+        let mut at_bound = None;
         let (waited, output) =
             wait_for_child(childp, bounds.child, bounds.kill_wait, this.stop, |c| {
+                at_bound = Some((
+                    crate::encode::host_cpu::HostTimes::now(),
+                    crate::encode::host_cpu::of_child(c),
+                ));
                 let _ = c.kill();
             });
+        let (host_at_bound, child_cpu) = at_bound.unwrap_or((None, None));
+        let ran = crate::encode::host_cpu::Ran::of(
+            host_at_spawn,
+            host_at_bound,
+            crate::encode::host_cpu::HostTimes::now(),
+            child_cpu,
+            bounds.child,
+        );
+        let idle_running = crate::encode::host_cpu::pct(ran.idle_running);
+        let idle_dying = crate::encode::host_cpu::pct(ran.idle_dying);
+        let child_cpu_ms = crate::encode::host_cpu::ms(ran.child_cpu);
         let Output {
             text: stdout,
             cut_off,
         } = output;
-        let phase = extra.iter().find(|(k, _)| *k == PHASE_ENV);
-        let phase = phase.map(|(_, v)| v.as_str());
         let last_open = last_progress(&stdout).unwrap_or_default();
         if cut_off {
             tracing::warn!(
                 kill_wait_s = bounds.kill_wait.as_secs(),
                 ?phase,
                 %last_open,
+                host_idle = %idle_running,
                 "caps probe: the child's stdout had not ended at the bound, so anything it wrote \
                  after that is lost, a report included. Something it started may hold the pipe, \
                  or this host is too busy to read it in time."
@@ -1348,21 +1446,53 @@ mod child {
         let status = match waited {
             Waited::Exited(status) => status,
             Waited::Hung { gone } => {
-                // A hung driver. Carry on without this phase.
-                if gone {
+                // A hung driver, or a host with no CPU to give it (#3439). Carry
+                // on without this phase.
+                if gone && ran.starved_running() {
                     tracing::warn!(
                         timeout_s = bounds.child.as_secs(),
                         ?phase,
                         %last_open,
+                        host_idle = %idle_running,
+                        child_cpu_ms = %child_cpu_ms,
+                        "caps probe: the probe child ran out of time on a host with no idle CPU, \
+                         so it was most likely starved rather than hung — the daemon is \
+                         unaffected."
+                    );
+                } else if gone {
+                    tracing::warn!(
+                        timeout_s = bounds.child.as_secs(),
+                        ?phase,
+                        %last_open,
+                        host_idle = %idle_running,
+                        child_cpu_ms = %child_cpu_ms,
                         "caps probe: the probe child hung — the daemon is unaffected; this is \
                          the process boundary doing its job."
                     );
+                } else if ran.starved_dying() {
+                    tracing::error!(
+                        timeout_s = bounds.child.as_secs(),
+                        kill_wait_s = bounds.kill_wait.as_secs(),
+                        ?phase,
+                        %last_open,
+                        host_idle = %idle_running,
+                        host_idle_while_dying = %idle_dying,
+                        child_cpu_ms = %child_cpu_ms,
+                        "caps probe: the probe child ran out of time and had not died by the end \
+                         of its kill wait, on a host with no idle CPU: most likely it was never \
+                         scheduled to finish, not stuck in a driver. Going on without it; the \
+                         daemon is unaffected."
+                    );
+                    stuck_reaches_the_daemon(this);
                 } else {
                     tracing::error!(
                         timeout_s = bounds.child.as_secs(),
                         kill_wait_s = bounds.kill_wait.as_secs(),
                         ?phase,
                         %last_open,
+                        host_idle = %idle_running,
+                        host_idle_while_dying = %idle_dying,
+                        child_cpu_ms = %child_cpu_ms,
                         "caps probe: the probe child hung and did not die when killed. It is \
                          most likely stuck in a kernel call in a driver, and stays until that \
                          call returns. Going on without it; the daemon is unaffected."
@@ -2252,6 +2382,9 @@ pub(crate) fn in_probe_child() -> bool {
 /// <10ms on boxes with no HW encoder); subsequent calls return the
 /// cached result, or a later try's if one was adopted (#3280). This never waits
 /// for a try.
+///
+/// ⚠️ The first call blocks until the probe answers, and so does every call made
+/// while it runs. The signalling loop reads [`answer_now`] instead (#3439).
 pub fn detect() -> AgentCaps {
     let first = CACHED_CAPS.get_or_init(|| {
         let caps = cached_or_probed();
@@ -2267,7 +2400,41 @@ pub fn detect() -> AgentCaps {
             short.as_ref(),
         )
     });
+    // #3439 — after the store, so a connection woken by it finds the answer.
+    FIRST_IS_NEWS.call_once(answer_moved);
     late_caps().unwrap_or_else(|| first.clone())
+}
+
+/// #3439 — the first probe, on a thread of its own, so the start does not wait
+/// for it: `signaling::run` waits [`FIRST_ANSWER_WAIT`] at most, then connects with
+/// the interim answer. Once per process, so a second organization's loop finds it
+/// running. Once the first answer exists, the same thread arms #3280's retry with
+/// `live`.
+///
+/// A thread and not `spawn_blocking`, for [`arm_retry`]'s reason: a runtime's
+/// shutdown waits on those, and `signaling::run` must be able to leave. A child
+/// still running then ends with the process (`child::tie_to_this_process`).
+///
+/// `false` when no thread could start: the caller probes in place, as before.
+pub fn start_probing(live: impl Fn() -> bool + Send + 'static) -> bool {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return true;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("roomlerd-caps-probe".into())
+        .spawn(move || {
+            let _ = detect();
+            arm_retry(live);
+        });
+    match spawned {
+        Ok(_) => true,
+        Err(e) => {
+            STARTED.store(false, Ordering::SeqCst);
+            tracing::warn!(%e, "caps probe: no thread for the probe; the start waits for it");
+            false
+        }
+    }
 }
 
 /// What the daemon says over whatever `cached_or_probed` answered, on every
@@ -2294,6 +2461,29 @@ pub const LEARNED_CODE: &str = "learned-deny";
 /// #3280 — the same key's code on a host short of time with no cell to name, so
 /// that one with no hardware says why instead of looking like it has none.
 pub const SHORT_CODE: &str = "probe-short";
+/// #3439 — and on a host whose first probe has not answered yet, so a row that
+/// came online early says it is still probing rather than that it has no hardware.
+pub const PROBING_CODE: &str = "probing";
+
+/// #3439 — what a host says before its first probe has answered: what it says
+/// when no probe child comes back ([`cached_or_probed`]), everything that needs no
+/// driver, with the daemon's own words over it, and why the rest is missing.
+fn interim_answer() -> AgentCaps {
+    let caps = assigned_by_the_daemon(compute_caps(false, false), &HostFacts::here(), &[], None);
+    with_probing_word(caps)
+}
+
+fn with_probing_word(mut caps: AgentCaps) -> AgentCaps {
+    caps.unavailable.insert(
+        LEARNED_WORD.into(),
+        roomler_ai_remote_control::models::Unavailable::new(
+            PROBING_CODE,
+            "The capability probe is still running on this host, so this answer has only the \
+             encoders that need no driver. The hardware ones follow when it answers",
+        ),
+    );
+    caps
+}
 
 /// #3267 — a host that lost a cell to a driver fault says so: which cell, and
 /// how its probe child ended. The collapse this replaces went unnoticed for
@@ -3261,7 +3451,7 @@ fn offered_forms(caps: &AgentCaps) -> std::collections::BTreeMap<String, bool> {
 /// finds the new answer.
 fn install_late(answer: AgentCaps) {
     *LATE_CAPS.write().unwrap_or_else(|e| e.into_inner()) = Some(answer);
-    CAPS_GENERATION.fetch_add(1, Ordering::SeqCst);
+    answer_moved();
 }
 
 /// #3280 — a later try's child that would not die costs Media Foundation as a first
@@ -9536,5 +9726,61 @@ mod tests {
         let answered = assigned_by_the_daemon(p0c_caps(), &facts, &[], None);
         let over = word_after_the_climb(answered, &[]);
         assert!(!over.unavailable.contains_key(LEARNED_WORD));
+    }
+
+    /// #3439 — a host that came online before its first answer says it is still
+    /// probing, and offers nothing that needs a driver or an encoder open: no
+    /// hardware cell, no DataChannel transport.
+    #[test]
+    fn the_interim_answer_says_the_probe_is_still_running() {
+        let _fixture = probe_fixture();
+        let caps = interim_answer();
+        let word = &caps.unavailable[LEARNED_WORD];
+        assert_eq!(word.code, PROBING_CODE);
+        assert!(word.reason.contains("still running"), "{}", word.reason);
+        assert!(
+            caps.video_cells.iter().all(|c| !c.hw),
+            "{:?}",
+            caps.video_cells
+        );
+        assert!(caps.transports.is_empty(), "{:?}", caps.transports);
+        assert_eq!(caps.probe_ms, None);
+        assert!(!caps.probe_cached);
+        // The daemon's own lists, as on every other path.
+        assert_eq!(caps.files, files_caps());
+    }
+
+    /// #3439 — an answer that moves wakes every connection, with the generation
+    /// already moved, so whoever wakes reads the new one.
+    #[test]
+    fn a_moved_answer_wakes_every_connection() {
+        let _fixture = probe_fixture();
+        let (mut one, mut two) = (news(), news());
+        let before = generation();
+        answer_moved();
+        assert_eq!(generation(), before + 1);
+        for news in [&mut one, &mut two] {
+            assert!(
+                news.has_changed()
+                    .expect("the sender lives as long as the process")
+            );
+            assert_eq!(*news.borrow_and_update(), before + 1);
+        }
+    }
+
+    /// #3439 — the start's wait for a first answer is a bound, not a wait for the
+    /// probe. No test in this binary runs the probe, so nothing answers here.
+    #[test]
+    fn the_wait_for_a_first_answer_ends_at_its_bound() {
+        if answered() {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime");
+        let started = Instant::now();
+        assert!(!rt.block_on(first_answer_within(Duration::from_millis(50))));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }
