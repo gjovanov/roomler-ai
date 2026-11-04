@@ -1285,7 +1285,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:7076`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:7087`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -1380,10 +1380,15 @@ screen, and the viewer's own watchdog re-creates each one. A sampler on the gues
 | the person answers after the viewer's last session ended | — | dropped: no pump took it. The restore token it left opened the viewer's next session with no dialog |
 
 ⚠️ Two controllers opening the same host at once: the older one is superseded,
-not served, and reads the reason as a `backend_error`. A pump registers its shared
-pipeline (P5, `media_share`) only once its capture has opened, so while the
-request is pending the second viewer has nothing to join. That is acceptable for
-a path where one person at the screen allows one share, but it is a known edge.
+not served, and reads the reason as a `backend_error`. The VP9 pump registers its
+shared pipeline (P5, `media_share`) only once its capture has opened, so while the
+request is pending the second viewer has nothing to join. The FFmpeg pump
+registers before its open, so a second viewer of the same profile follows the
+pending open instead, and since #3423 it is told the wait (§4.7). That holds for
+the open's first 10 s only: the open blocks the owner's loop, so after that the
+pipeline reads stale (rc.443), and the next viewer evicts it and opens its own.
+That is acceptable for a path where one person at the screen allows one share,
+but it is a known edge.
 
 ### 4.7 The viewer is told, and waits (FR-93 P2d-2)
 
@@ -1413,6 +1418,7 @@ sequenceDiagram
 | the hook | `capture::open_default_async` takes an `OnOpenWait`, held for the open's blocking thread by `ParkHook`, which clears it on drop, so a pooled thread never carries one into the next open, not even after a panic | `capture/mod.rs` (`ParkHook`, `tell_open_waiting`) |
 | when it fires | a waiter still parked `TELL_AFTER` (2 s) in fires it once, with the **request's** start, so a session that joins a pending request is told that dialog's deadline, not one counted from its own join | `portal/pending.rs` (`Request::wait`, `TELL_AFTER`) |
 | the message | `rc:media-waiting {"for":"person_at_screen","waits_ms":N,"hint":…}`, retried until the control channel takes it, and never past the dialog's own deadline. A duration, not a time of day, so the viewer reads it on its own clock. From P5b `for` says what is waited for, and the hint follows it: the dialog for the screen, the dialog for remote control (P4b's automatic portal, "or to share just their screen"), `screen_unlock`, GNOME's lock screen (§5.3), (P3e) `display_wake`, a display switched off (§3.3), or (P5f) `session_away`, this user's session in the background (§5.6). A running capture sends the last two, after holding its keepalives for a 2 s quiet spell | `peer.rs` (`media_waiting_payload`, `media_waiting_hook`, P3e's `CaptureWait`) |
+| a viewer sharing the capture | a session that follows another's pipeline (P5) opens no capture, so it has no hook of its own (#3423). The owner's pipeline tells it, under its own session, with the owner's retrying sender: the followers when the owner's viewer is told, a viewer that joins later with the time the wait has left, and nobody once the owner's next frame has arrived. Only an open that runs after the pipeline exists can tell it: the FFmpeg pump's first open, and every reopen | `media_share.rs` (`Pipeline::tell_waiting`, `on_frame`, `try_join`), `peer.rs` (`shared_media_waiting_hook`, `CaptureWait::hold`) |
 | the viewer | the deadline is set at receipt. Until it passes, plus a 10 s grace (`RC_MEDIA_WAITING_GRACE_MS`), the watchdog counts no stall and re-creates nothing. A session that ends while waiting is not dead air | `useRemoteControl.ts` (`agentIsWaiting`, the watchdog tick, `isDeadAir`) |
 | what clears it | the first frame after the notice: from P5f, only media the watchdog counted from 1 s after the notice arrived (`advanceEndsWait`, `RC_MEDIA_WAITING_SETTLE_MS`), because a frame sent just before the notice on the video channel can be counted just after it; `rc:media-unavailable` (the wait ended without an answer, and that message says why); a new connect | the same |
 | kill switch | `ROOMLERD_MEDIA_WAITING=0` sends nothing, and the viewer behaves as before P2d-2. An older viewer ignores the message (an unknown `t`) | `peer.rs` |
@@ -1933,7 +1939,7 @@ remote-control session is live, the daemon holds one. On the signal it tells
 each live session's controller over that session's own control channel, then
 lets go. Each session registers its control channel as it starts
 (`sleep_notice.rs:99`); the watcher (`sleep_notice.rs:534`, the rule
-`:149`) sends `peer.rs:5549`'s notice to all of them at once (`:93`):
+`:149`) sends `peer.rs:5556`'s notice to all of them at once (`:93`):
 
 ```mermaid
 sequenceDiagram

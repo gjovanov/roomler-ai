@@ -399,23 +399,25 @@ room B's URL: a message typed there went to B, and Leave left B, a call it was n
 while the server still listed the person in A. A remount alone would leave A's call
 running with nothing on the page to say so, because the mini-call widget hides on every
 call page. So the page settles its own call first, in `onBeforeRouteUpdate`
-(`views/conference/ConferenceView.vue:689`), with the question the Join button asks:
+(`views/conference/ConferenceView.vue:693`), with the question the Join button asks:
 
 | The page, when another room's call is pushed onto it | What happens |
 |---|---|
-| in its room's call, **Switch Call** | it leaves that call (`leaveThisCall`, `:642`), then the page for the other room joins that room's call |
+| in its room's call, **Switch Call** | it leaves that call (`leaveThisCall`, `:646`), then the page for the other room joins that room's call |
 | in its room's call, **Cancel**, Escape or a click outside | the navigation is refused. The call and the URL stay where they were |
 | in no call here | it remounts for the other room with no question, and joins nothing |
 
 The join crosses the remount as a one-shot hand-off (`composables/callSwitch.ts:22`,
-taken at `ConferenceView.vue:772`). It is for that one room, spent by the next mount
+taken at `ConferenceView.vue:776`). It is for that one room, spent by the next mount
 whatever its room, and void after 10 s. It is never a query or `history.state`, so a reload
 or a back-and-forward cannot put a camera into a call nobody just asked to join.
 `ConferenceViewRoomSwitch.spec.ts` runs the real page against the real route record.
 `e2e/conference-room-switch.spec.ts` drives the three rows in a browser against a real API
 and reads the outcome from the server's participant list for each room. Its join waits for
-the page's socket: a join sent before the socket has its connection id opens a call session
-with none, and a leave from that page, which names its connection, does not close it.
+the page's socket, as a person's does. Since #3416 the page waits too: a join sent before
+the socket had its connection id opened a call session with none, which a leave from that
+page, naming its connection, did not close
+([real-time.md](real-time.md#the-call-session-join-leave-socket-close-sweep-3416)).
 
 **A link clicked inside the app never takes a tab away from a live session (#2841).** A
 page that holds one carries `meta.liveSession`: both remote viewers (`agent-remote`,

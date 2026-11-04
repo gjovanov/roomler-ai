@@ -31,6 +31,8 @@ const hoisted = vi.hoisted(() => ({
     onMediaMessage: () => {},
     offMediaMessage: () => {},
     waitForMessage: () => Promise.resolve(),
+    // The page's socket already has its id, so a join is not held (#3416).
+    waitForConnectionId: () => Promise.resolve('conn-1'),
   },
   /** A child the page renders, stubbed: these specs are about the page. */
   async stub(name: string) {

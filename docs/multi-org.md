@@ -702,6 +702,9 @@ encoder, bounded at 2 pipelines total. The viewer badge shows `· shared ×N`.
 An owner whose capture has no picture tells every follower why, and every later
 joiner as it joins (FR-80's `rc:media-unavailable`, #3260,
 [`remote-control.md` §5.1a](remote-control.md#51a-when-capture-cannot-open-the-session-says-why-fr-80)).
+An owner whose capture waits on its host tells them that too, a later joiner
+with the time the wait has left, until its next frame (FR-93's
+`rc:media-waiting`, #3423).
 
 ## 7. P6 — InputArbiter (shipped rc.305/306, #329 + #334)
 

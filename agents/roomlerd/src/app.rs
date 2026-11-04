@@ -5532,6 +5532,17 @@ async fn run_cmd(
                         }
                         Err(e) => tracing::warn!(error = %e, "could not reload config for clean-run promotion"),
                     }
+                    drop(_write_guard);
+                    // #3302 — a watcher stopped before its verdict leaves the record
+                    // at InProgress for good. Healthy this long, this daemon can say.
+                    if let Some(wait) = post_install::settle_record(&pkg) {
+                        tokio::select! {
+                            _ = tokio::time::sleep(wait) => {
+                                let _ = post_install::settle_record(&pkg);
+                            }
+                            _ = shutdown.changed() => {}
+                        }
+                    }
                 }
                 _ = shutdown.changed() => {}
             }
