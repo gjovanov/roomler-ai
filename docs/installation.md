@@ -924,7 +924,7 @@ them. The worker says so once at its start: `logging: this console has no window
 every line goes to the log file, stderr's too (#3438)`.
 
 `a_console_with_no_window_gets_no_line_and_stderr_reaches_the_log`
-(`crates/agent-core/src/logging.rs:1490`) pins it. It runs its own test binary again with
+(`crates/agent-core/src/logging.rs:1488`) pins it. It runs its own test binary again with
 `CREATE_NO_WINDOW`, hands the child that console as its stdout and stderr, and reads the
 console's text back; a control line proves the console is read at all. It runs in the
 Windows lane's `logging::tests::stderr_capture` step.
