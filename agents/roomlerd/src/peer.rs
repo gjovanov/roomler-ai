@@ -1513,6 +1513,9 @@ impl AgentPeer {
         // session. FR-97 P3e-2 — Linux too: a person's own X11 display, read
         // by the X idle clock; a virtual desktop holds its mode but for the
         // owner's `never`. P2d-2b — and a Mac, read by its HID idle clock.
+        // #3467 — and while its request waits for a recording's end: the
+        // viewer is told why once, and the request is decided again when the
+        // recording has ended.
         #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         {
             let stash = control_dc.clone();
@@ -1524,7 +1527,7 @@ impl AgentPeer {
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         tick.tick().await;
-                        if !crate::display_match::owns_mode(sid) {
+                        if !crate::display_match::watch_due(sid) {
                             continue;
                         }
                         if let Ok(Some(answer)) =

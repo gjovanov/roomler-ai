@@ -47,6 +47,12 @@
 //! guard, as Windows' `CDS_FULLSCREEN` needs none. One active display only, as
 //! on X11. Who is at that screen comes from the HID idle clock (`presence`).
 //! Kill switch `ROOMLERD_MAC_DISPLAY_MATCH=0`.
+//!
+//! #3467 — **a recording wins.** From just before a recorder launches until it
+//! has stopped, the recording holds the display ([`hold_for_recording`]): a
+//! mode a session switched goes back first, so the recording is made at the
+//! display's own mode, and every request meanwhile is refused `recording`,
+//! then decided again at the recording's end.
 
 use crate::config::DisplayMatchPolicy;
 use crate::presence::Presence;
@@ -1164,7 +1170,22 @@ pub fn restore() {
 // as the underlying `rc:display-match` semantics). The CDS_FULLSCREEN
 // process-exit auto-restore is untouched.
 
-static DM_OWNER: std::sync::Mutex<Option<bson::oid::ObjectId>> = std::sync::Mutex::new(None);
+/// The session that last applied a mode, and the request it applied: a
+/// recording's start hands the mode back, and the request then waits for the
+/// recording's end (#3467).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Owner {
+    session: bson::oid::ObjectId,
+    req_w: u32,
+    req_h: u32,
+}
+
+static DM_OWNER: std::sync::Mutex<Option<Owner>> = std::sync::Mutex::new(None);
+
+/// The tests that drive the owner slot, a recording's hold or the owner's
+/// policy run one at a time: all three are process-wide.
+#[cfg(test)]
+static SLOT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// [`apply`] with ownership: on success the session becomes the owner.
 pub fn apply_for(
@@ -1173,15 +1194,28 @@ pub fn apply_for(
     req_h: u32,
 ) -> Result<(u32, u32), ApplyError> {
     let picked = apply(req_w, req_h)?;
-    *DM_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
+    *DM_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Owner {
+        session,
+        req_w,
+        req_h,
+    });
     Ok(picked)
 }
 
 /// [`restore`] gated on ownership: restores (and clears the owner) only when
 /// `session` is the current owner. `true` when a restore actually ran.
+/// #3467 — one at a time with the decisions and a recording's hold, so a
+/// recorder never launches while a restore is still changing the mode.
+/// Blocks on OS calls.
 pub fn restore_for(session: bson::oid::ObjectId) -> bool {
+    let _deciding = DECIDING.lock().unwrap_or_else(|e| e.into_inner());
+    restore_owned_by(session)
+}
+
+/// [`restore_for`], for a caller that already holds `DECIDING`.
+fn restore_owned_by(session: bson::oid::ObjectId) -> bool {
     let mut owner = DM_OWNER.lock().unwrap_or_else(|e| e.into_inner());
-    if *owner == Some(session) {
+    if owner.is_some_and(|o| o.session == session) {
         *owner = None;
         drop(owner);
         restore();
@@ -1255,6 +1289,9 @@ pub enum Refusal {
     SwitchFailed,
     /// Not a platform display match runs on.
     Unsupported,
+    /// #3467 — a recording holds the display: it is recorded at the display's
+    /// own mode, and a switch under it would freeze it or end its file.
+    Recording,
 }
 
 impl Refusal {
@@ -1266,6 +1303,7 @@ impl Refusal {
             Self::NoFittingMode => "no_fitting_mode",
             Self::SwitchFailed => "switch_failed",
             Self::Unsupported => "unsupported",
+            Self::Recording => "recording",
         }
     }
 }
@@ -1291,15 +1329,19 @@ pub enum Answer {
     Refused(Refusal),
 }
 
-/// May a switch be tried? The owner's policy, and under `auto` who is at the
-/// screen. `presence` is only read under `auto`, so `never` and `always` cost
-/// no OS call.
+/// May a switch be tried? The owner's policy, a recording that holds the
+/// display (#3467), and under `auto` who is at the screen. `presence` is only
+/// read under `auto` with no recording, so `never`, `always` and a recording
+/// cost no OS call. The owner's `never` answers first: it outlasts any
+/// recording.
 pub fn may_switch(
     policy: DisplayMatchPolicy,
+    recording: bool,
     presence: impl FnOnce() -> Presence,
 ) -> Result<(), Refusal> {
     match policy {
         DisplayMatchPolicy::Never => Err(Refusal::DisabledOnDevice),
+        _ if recording && a_recording_wins(policy) => Err(Refusal::Recording),
         DisplayMatchPolicy::Always => Ok(()),
         DisplayMatchPolicy::Auto => match presence() {
             Presence::Locked => Err(Refusal::Locked),
@@ -1309,27 +1351,60 @@ pub fn may_switch(
     }
 }
 
+/// #3467 — does a running recording hold the display under `policy`: refuse
+/// every request, and hand back a mode switched before it started? Under
+/// `auto`, yes. Under `always`, the owner's "switch whenever a controller asks",
+/// it does too, which is the operator's call (FR-108 decision 7): a switch
+/// under a recording freezes it outside the matched area or ends its file, and
+/// the session's end would change the display under it anyway. `Always =>
+/// false` gives `always` back its rc.191 meaning, and nothing else changes.
+/// Under `never` nothing is switched to begin with.
+fn a_recording_wins(policy: DisplayMatchPolicy) -> bool {
+    match policy {
+        DisplayMatchPolicy::Always => true,
+        DisplayMatchPolicy::Auto | DisplayMatchPolicy::Never => true,
+    }
+}
+
 /// A refusal that hands the screen back: the person is using it, or its owner
 /// turned display match off. A mode this session applied earlier is restored.
-/// (Not for `locked`: the worker cannot touch the secure desktop, P0.)
+/// (Not for `locked`: the worker cannot touch the secure desktop, P0. Not for
+/// `recording`: the recording's hold handed the screen back before the
+/// recorder launched, #3467.)
 fn hands_the_screen_back(r: Refusal) -> bool {
     matches!(r, Refusal::Attended | Refusal::DisabledOnDevice)
 }
 
 /// FR-108 — a viewer asked to match `req_w × req_h`. Blocks on OS calls: run
 /// it off the async threads. A request answered `locked` is kept for the
-/// session's unlock (P1b, [`on_unlock`]); any other answer drops it.
+/// session's unlock (P1b, [`on_unlock`]), and one answered `recording` for the
+/// recording's end (#3467, [`on_tick`]); any other answer drops it.
 pub fn request_for(session: bson::oid::ObjectId, req_w: u32, req_h: u32) -> Answer {
     let answer = decide_request(session, req_w, req_h);
-    if answer == Answer::Refused(Refusal::Locked) {
-        pending_set(session, req_w, req_h);
-    } else {
-        pending_forget(session);
+    match waits_for(answer) {
+        // The answer itself tells the viewer why it waits.
+        Some(waits) => pending_set(session, req_w, req_h, waits, true),
+        None => pending_forget(session),
     }
     answer
 }
 
+/// What a request answered `answer` waits for, if anything: the unlock for
+/// `locked` (P1b), the recording's end for `recording` (#3467). Every other
+/// answer stands until the viewer asks again.
+fn waits_for(answer: Answer) -> Option<Waits> {
+    match answer {
+        Answer::Refused(Refusal::Locked) => Some(Waits::Unlock),
+        Answer::Refused(Refusal::Recording) => Some(Waits::RecordingEnd),
+        _ => None,
+    }
+}
+
 fn decide_request(session: bson::oid::ObjectId, req_w: u32, req_h: u32) -> Answer {
+    // #3467 — one decision at a time against a recording's hold: a request
+    // that read "no recording" has switched before the hold hands the screen
+    // back, never after it.
+    let _deciding = DECIDING.lock().unwrap_or_else(|e| e.into_inner());
     // FR-108 P2 — a Linux virtual desktop on Xorg with the dummy driver can
     // switch. It is this daemon's own display, so nobody can be at its screen:
     // unattended by construction, and the owner's `never` still holds.
@@ -1347,8 +1422,8 @@ fn decide_request(session: bson::oid::ObjectId, req_w: u32, req_h: u32) -> Answe
             crate::presence::now()
         }
     };
-    if let Err(r) = may_switch(device_policy(), presence) {
-        if hands_the_screen_back(r) && restore_for(session) {
+    if let Err(r) = may_switch(device_policy(), recording_holds(), presence) {
+        if hands_the_screen_back(r) && restore_owned_by(session) {
             tracing::info!(%session, why = r.word(), "display-match: restored this session's mode");
         }
         tracing::info!(req_w, req_h, why = r.word(), "display-match: not switched");
@@ -1372,30 +1447,157 @@ fn decide_request(session: bson::oid::ObjectId, req_w: u32, req_h: u32) -> Answe
     }
 }
 
-// ── FR-108 P1b: the locked host at the unlock, the person coming back ──────
+// ── #3467: a recording holds the display ────────────────────────────────────
+//
+// A recording is captured at the display's own mode (FR-85), by a capturer of
+// its own that opens once. A switch while it runs freezes it outside the
+// matched area (measured on X11: the frame keeps its size, and only the
+// matched corner changes) or ends its file (`display_changed`, where the
+// capturer sees the new size). A recording started in a switched session is
+// made at the matched size. So from just before the recorder launches until
+// it has stopped, the recording holds the display: a mode a session switched
+// goes back first, every request is refused `recording`, and the requests it
+// refused are decided again at its end, as a locked host's are at the unlock.
+// The recorder records the primary display, the one display match switches
+// (FR-108 §7).
 
-/// Requests answered `locked`, kept per session for its unlock.
-static PENDING: std::sync::Mutex<Vec<(bson::oid::ObjectId, u32, u32)>> =
-    std::sync::Mutex::new(Vec::new());
+/// Recordings that hold the display. Each [`RecordingHold`] adds one and takes
+/// it away once, so no path can let go of a hold it does not own (the shape of
+/// the recorder's own count, `recording::manager::is_recording`).
+static RECORDING_HOLDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn pending_set(session: bson::oid::ObjectId, w: u32, h: u32) {
-    let mut p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    p.retain(|(s, _, _)| *s != session);
-    p.push((session, w, h));
+/// One change of the mode at a time: a decision (and its switch), an owner's
+/// restore, and a recording's hold with its hand-back. A request that read
+/// "no recording" has switched before the hold hands the screen back, never
+/// after it, and no restore is still running when the recorder launches.
+static DECIDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A recording's hold on the display, from [`hold_for_recording`]. Dropping
+/// it lets go.
+#[must_use = "the display is held only while the hold lives"]
+#[derive(Debug)]
+pub struct RecordingHold(());
+
+impl Drop for RecordingHold {
+    fn drop(&mut self) {
+        RECORDING_HOLDS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
+/// Does a recording hold the display now?
+pub fn recording_holds() -> bool {
+    RECORDING_HOLDS.load(std::sync::atomic::Ordering::Acquire) > 0
+}
+
+/// A recorder is about to launch. From now until the hold is dropped, every
+/// request is refused `recording`, and a mode a session switched goes back
+/// first, so the recorder opens at the display's own mode. That session's
+/// request then waits for the recording's end, and its watcher tells its
+/// viewer why ([`on_tick`]). Blocks on OS calls: run it off the async threads.
+pub fn hold_for_recording() -> RecordingHold {
+    let _deciding = DECIDING.lock().unwrap_or_else(|e| e.into_inner());
+    RECORDING_HOLDS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let hold = RecordingHold(());
+    if !a_recording_wins(device_policy()) {
+        return hold;
+    }
+    let displaced = DM_OWNER.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(Owner {
+        session,
+        req_w,
+        req_h,
+    }) = displaced
+    {
+        restore();
+        tracing::info!(%session, why = Refusal::Recording.word(), "display-match: the screen is handed back");
+        pending_set(session, req_w, req_h, Waits::RecordingEnd, false);
+    }
+    hold
+}
+
+// ── FR-108 P1b: the locked host at the unlock, the person coming back ──────
+
+/// What a waiting request waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waits {
+    /// P1b — its session's unlock: it was answered `locked`.
+    Unlock,
+    /// #3467 — the end of the recording that holds the display: it was
+    /// answered `recording`, or the recording's start handed its mode back.
+    RecordingEnd,
+}
+
+/// A request kept for later, one per session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Waiting {
+    session: bson::oid::ObjectId,
+    w: u32,
+    h: u32,
+    waits: Waits,
+    /// Its viewer knows why it waits. An answer says so itself; a mode the
+    /// recording's start handed back is told by the session's watcher.
+    told: bool,
+}
+
+/// Requests answered `locked` or `recording`, kept per session.
+static PENDING: std::sync::Mutex<Vec<Waiting>> = std::sync::Mutex::new(Vec::new());
+
+fn pending() -> std::sync::MutexGuard<'static, Vec<Waiting>> {
+    PENDING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn pending_set(session: bson::oid::ObjectId, w: u32, h: u32, waits: Waits, told: bool) {
+    let mut p = pending();
+    p.retain(|x| x.session != session);
+    p.push(Waiting {
+        session,
+        w,
+        h,
+        waits,
+        told,
+    });
+}
+
+/// P1b — the request this session's unlock decides again, taken once.
 fn pending_take(session: bson::oid::ObjectId) -> Option<(u32, u32)> {
-    let mut p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    let i = p.iter().position(|(s, _, _)| *s == session)?;
-    let (_, w, h) = p.remove(i);
-    Some((w, h))
+    let mut p = pending();
+    let i = p
+        .iter()
+        .position(|x| x.session == session && x.waits == Waits::Unlock)?;
+    let x = p.remove(i);
+    Some((x.w, x.h))
 }
 
 fn pending_forget(session: bson::oid::ObjectId) {
-    PENDING
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|(s, _, _)| *s != session);
+    pending().retain(|x| x.session != session);
+}
+
+/// #3467 — what a session's watcher owes its viewer about a recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingTurn {
+    /// The recording's start handed this session's mode back: say why.
+    Tell,
+    /// The recording ended: decide the request again, now.
+    Decide { w: u32, h: u32 },
+}
+
+/// #3467 — the session's request that waits for a recording's end: told once
+/// while a recording holds the display, and taken to be decided again once
+/// none does. No OS call.
+fn recording_turn(session: bson::oid::ObjectId) -> Option<RecordingTurn> {
+    let mut p = pending();
+    let i = p
+        .iter()
+        .position(|x| x.session == session && x.waits == Waits::RecordingEnd)?;
+    if !recording_holds() {
+        let x = p.remove(i);
+        return Some(RecordingTurn::Decide { w: x.w, h: x.h });
+    }
+    if p[i].told {
+        return None;
+    }
+    p[i].told = true;
+    Some(RecordingTurn::Tell)
 }
 
 /// P1b — the session's screen unlocked: the request it was answered `locked`
@@ -1409,7 +1611,22 @@ pub fn on_unlock(session: bson::oid::ObjectId) -> Option<Answer> {
 
 /// P1b — does this session hold the mode it applied?
 pub fn owns_mode(session: bson::oid::ObjectId) -> bool {
-    *DM_OWNER.lock().unwrap_or_else(|e| e.into_inner()) == Some(session)
+    DM_OWNER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|o| o.session == session)
+}
+
+/// Has the session's watcher anything to do ([`on_tick`])? It holds a mode
+/// (P1b), or its request waits for a recording's end and is owed a word or a
+/// decision (#3467). No OS call, so the watcher asks it on the async threads.
+pub fn watch_due(session: bson::oid::ObjectId) -> bool {
+    owns_mode(session)
+        || pending().iter().any(|x| {
+            x.session == session
+                && x.waits == Waits::RecordingEnd
+                && (!x.told || !recording_holds())
+        })
 }
 
 /// P1b — should a mode this session holds go back now, and why? Pure. The
@@ -1434,8 +1651,18 @@ pub fn hand_back(
 /// P1b — the session's watcher, every quarter second while it holds a mode:
 /// a person who came back, or the owner's `never`, gets the screen back at
 /// once, and the viewer is told. It is not re-applied until the viewer asks
-/// again. Blocks on OS calls.
+/// again. #3467 — and while its request waits for a recording's end: the
+/// viewer is told once why, and the request is decided again when the
+/// recording has ended, through the whole guard. Blocks on OS calls.
 pub fn on_tick(session: bson::oid::ObjectId) -> Option<Answer> {
+    match recording_turn(session) {
+        Some(RecordingTurn::Tell) => return Some(Answer::Refused(Refusal::Recording)),
+        Some(RecordingTurn::Decide { w, h }) => {
+            tracing::info!(%session, req_w = w, req_h = h, "display-match: the recording ended — the request is decided again");
+            return Some(request_for(session, w, h));
+        }
+        None => {}
+    }
     // The virtual desktop is the daemon's own: nobody comes back to it.
     let presence = || {
         if crate::virtual_desktop::switchable_display().is_some() {
@@ -1496,7 +1723,7 @@ mod fr108_tests {
 
     #[test]
     fn never_refuses_without_asking_who_is_there() {
-        let r = may_switch(DisplayMatchPolicy::Never, || {
+        let r = may_switch(DisplayMatchPolicy::Never, false, || {
             panic!("presence must not be read under never")
         });
         assert_eq!(r, Err(Refusal::DisabledOnDevice));
@@ -1504,7 +1731,7 @@ mod fr108_tests {
 
     #[test]
     fn always_switches_without_asking_who_is_there() {
-        let r = may_switch(DisplayMatchPolicy::Always, || {
+        let r = may_switch(DisplayMatchPolicy::Always, false, || {
             panic!("presence must not be read under always")
         });
         assert_eq!(r, Ok(()));
@@ -1513,16 +1740,37 @@ mod fr108_tests {
     #[test]
     fn auto_switches_only_an_unattended_screen() {
         assert_eq!(
-            may_switch(DisplayMatchPolicy::Auto, || Presence::Unattended),
+            may_switch(DisplayMatchPolicy::Auto, false, || Presence::Unattended),
             Ok(())
         );
         assert_eq!(
-            may_switch(DisplayMatchPolicy::Auto, || Presence::Attended),
+            may_switch(DisplayMatchPolicy::Auto, false, || Presence::Attended),
             Err(Refusal::Attended)
         );
         assert_eq!(
-            may_switch(DisplayMatchPolicy::Auto, || Presence::Locked),
+            may_switch(DisplayMatchPolicy::Auto, false, || Presence::Locked),
             Err(Refusal::Locked)
+        );
+    }
+
+    /// #3467 — a running recording refuses every switch, an unattended
+    /// screen's and an `always` one's alike, before anyone at the screen is
+    /// asked about. Only the owner's `never` answers first: it outlasts the
+    /// recording.
+    #[test]
+    fn a_recording_refuses_every_switch_without_asking_who_is_there() {
+        let never_read = || -> Presence { panic!("presence must not be read under a recording") };
+        assert_eq!(
+            may_switch(DisplayMatchPolicy::Auto, true, never_read),
+            Err(Refusal::Recording)
+        );
+        assert_eq!(
+            may_switch(DisplayMatchPolicy::Always, true, never_read),
+            Err(Refusal::Recording)
+        );
+        assert_eq!(
+            may_switch(DisplayMatchPolicy::Never, true, never_read),
+            Err(Refusal::DisabledOnDevice)
         );
     }
 
@@ -1535,6 +1783,8 @@ mod fr108_tests {
             Refusal::NoFittingMode,
             Refusal::SwitchFailed,
             Refusal::Unsupported,
+            // The recording's hold handed the screen back before it started.
+            Refusal::Recording,
         ] {
             assert!(!hands_the_screen_back(r), "{r:?}");
         }
@@ -1731,10 +1981,17 @@ mod fr108_tests {
             refused,
             serde_json::json!({"t": "rc:display-match.state", "on": false, "refused": "attended"})
         );
+        let recording: serde_json::Value =
+            serde_json::from_str(&state_json(Answer::Refused(Refusal::Recording))).unwrap();
+        assert_eq!(
+            recording,
+            serde_json::json!({"t": "rc:display-match.state", "on": false, "refused": "recording"})
+        );
     }
 
     #[test]
     fn the_policy_round_trips_through_the_static() {
+        let _serial = slot_tests();
         let was = device_policy();
         for p in [
             DisplayMatchPolicy::Never,
@@ -1787,9 +2044,9 @@ mod fr108_tests {
     fn a_locked_request_waits_for_its_session() {
         let a = bson::oid::ObjectId::new();
         let b = bson::oid::ObjectId::new();
-        pending_set(a, 946, 598);
-        pending_set(a, 1600, 900);
-        pending_set(b, 800, 600);
+        pending_set(a, 946, 598, Waits::Unlock, true);
+        pending_set(a, 1600, 900, Waits::Unlock, true);
+        pending_set(b, 800, 600, Waits::Unlock, true);
         assert_eq!(pending_take(a), Some((1600, 900)), "the latest request");
         assert_eq!(pending_take(a), None, "taken once");
         forget(b);
@@ -1802,10 +2059,148 @@ mod fr108_tests {
     #[test]
     fn turning_it_off_drops_the_waiting_request() {
         let a = bson::oid::ObjectId::new();
-        pending_set(a, 946, 598);
+        pending_set(a, 946, 598, Waits::Unlock, true);
         assert_eq!(turn_off(a), Answer::Off);
         assert_eq!(pending_take(a), None, "the unlock would switch it anyway");
         assert_eq!(on_unlock(a), None);
+    }
+
+    /// The owner slot and a recording's hold are process-wide: the tests that
+    /// drive them run one at a time.
+    fn slot_tests() -> std::sync::MutexGuard<'static, ()> {
+        SLOT_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The owner slot as a successful `apply_for(session, 946, 634)` leaves it.
+    fn seed_owner(session: bson::oid::ObjectId) {
+        *DM_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Owner {
+            session,
+            req_w: 946,
+            req_h: 634,
+        });
+    }
+
+    /// #3467 — a recording that starts on a switched display hands the mode
+    /// back before the recorder launches, and holds the display: the session
+    /// no longer owns a mode, its viewer is told why once, and its request
+    /// waits for the recording's end, when it is decided again.
+    #[test]
+    fn a_recording_hands_a_switched_mode_back_before_it_starts() {
+        let _serial = slot_tests();
+        let a = bson::oid::ObjectId::new();
+        seed_owner(a);
+        assert!(owns_mode(a));
+
+        let hold = hold_for_recording();
+        assert!(recording_holds());
+        assert!(
+            !owns_mode(a),
+            "the mode went back before the recorder launched"
+        );
+        assert!(watch_due(a), "the watcher owes the viewer a word");
+        assert_eq!(
+            on_tick(a),
+            Some(Answer::Refused(Refusal::Recording)),
+            "the viewer is told why"
+        );
+        assert_eq!(on_tick(a), None, "told once");
+        assert!(!watch_due(a), "nothing more to do while the recording runs");
+        assert_eq!(pending_take(a), None, "an unlock does not decide it");
+
+        drop(hold);
+        assert!(!recording_holds());
+        assert!(watch_due(a), "the recording ended: decide again");
+        // (`on_tick` would decide it now, through the whole guard: a real
+        // switch on the test host, so the turn is read instead.)
+        assert_eq!(
+            recording_turn(a),
+            Some(RecordingTurn::Decide { w: 946, h: 634 }),
+            "the request the session applied"
+        );
+        assert_eq!(recording_turn(a), None, "taken once");
+        assert!(!watch_due(a));
+    }
+
+    /// #3467 — a session that ends during a recording drops what it waited
+    /// for, and its close restores nothing: the hold took the mode back
+    /// already, so the display is not changed under the recording. The hold
+    /// is the recording's, not the session's, and it stays.
+    #[test]
+    fn a_session_that_ends_during_a_recording_changes_nothing_under_it() {
+        let _serial = slot_tests();
+        let a = bson::oid::ObjectId::new();
+        seed_owner(a);
+        let hold = hold_for_recording();
+        // The session ends: the watcher's `forget`, then the close's restore.
+        forget(a);
+        assert!(!restore_for(a), "no second restore under the recording");
+        assert!(recording_holds(), "the recording still holds the display");
+        assert!(!watch_due(a));
+        drop(hold);
+        assert_eq!(
+            recording_turn(a),
+            None,
+            "nothing waits for a session that ended"
+        );
+        assert!(!watch_due(a));
+    }
+
+    /// #3467 — a request a recording refused waits for its end, as one
+    /// answered `locked` waits for the unlock; every other answer stands until
+    /// the viewer asks again. Told by its own answer, it owes the viewer no
+    /// second word, and the unlock leaves it to the recording's end.
+    #[test]
+    fn a_request_refused_for_a_recording_waits_for_its_end() {
+        assert_eq!(
+            waits_for(Answer::Refused(Refusal::Recording)),
+            Some(Waits::RecordingEnd)
+        );
+        assert_eq!(
+            waits_for(Answer::Refused(Refusal::Locked)),
+            Some(Waits::Unlock)
+        );
+        for a in [
+            Answer::On { w: 800, h: 600 },
+            Answer::Off,
+            Answer::Refused(Refusal::Attended),
+            Answer::Refused(Refusal::DisabledOnDevice),
+            Answer::Refused(Refusal::NoFittingMode),
+            Answer::Refused(Refusal::SwitchFailed),
+            Answer::Refused(Refusal::Unsupported),
+        ] {
+            assert_eq!(waits_for(a), None, "{a:?}");
+        }
+
+        let _serial = slot_tests();
+        let a = bson::oid::ObjectId::new();
+        let hold = hold_for_recording();
+        pending_set(a, 1600, 900, Waits::RecordingEnd, true);
+        assert!(!watch_due(a));
+        assert_eq!(on_tick(a), None, "its answer said why already");
+        assert_eq!(
+            on_unlock(a),
+            None,
+            "the unlock leaves it to the recording's end"
+        );
+        drop(hold);
+        assert_eq!(
+            recording_turn(a),
+            Some(RecordingTurn::Decide { w: 1600, h: 900 })
+        );
+    }
+
+    /// #3467 — the holds count: one recording's hold letting go while another
+    /// holds (the last one's reader ending as the next one starts) leaves the
+    /// display held.
+    #[test]
+    fn the_display_is_held_until_the_last_hold_lets_go() {
+        let _serial = slot_tests();
+        let first = hold_for_recording();
+        let second = hold_for_recording();
+        drop(first);
+        assert!(recording_holds());
+        drop(second);
+        assert!(!recording_holds());
     }
 
     #[test]
@@ -1827,14 +2222,20 @@ mod ownership_tests {
     /// Off-Windows `apply` errs, so drive the slot directly where needed.
     #[test]
     fn restore_is_owner_gated_and_takeover_moves_ownership() {
+        let _serial = SLOT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let a = bson::oid::ObjectId::new();
         let b = bson::oid::ObjectId::new();
+        let owner = |session| Owner {
+            session,
+            req_w: 946,
+            req_h: 598,
+        };
         // Seed ownership as a successful apply_for(a) would.
-        *DM_OWNER.lock().unwrap() = Some(a);
+        *DM_OWNER.lock().unwrap() = Some(owner(a));
         assert!(!restore_for(b), "non-owner must not restore");
-        assert_eq!(*DM_OWNER.lock().unwrap(), Some(a), "owner unchanged");
+        assert!(owns_mode(a), "owner unchanged");
         // Takeover: B applies (simulate the post-apply ownership write).
-        *DM_OWNER.lock().unwrap() = Some(b);
+        *DM_OWNER.lock().unwrap() = Some(owner(b));
         assert!(!restore_for(a), "displaced owner must not restore");
         assert!(restore_for(b), "current owner restores");
         assert_eq!(*DM_OWNER.lock().unwrap(), None, "slot cleared");
