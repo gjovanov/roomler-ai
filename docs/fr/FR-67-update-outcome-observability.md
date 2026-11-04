@@ -123,10 +123,10 @@ flowchart LR
 
 | Piece | Where |
 |---|---|
-| The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:510`; `NodeStatus.last_install`, `:471` |
+| The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:531`; `NodeStatus.last_install`, `:471` |
 | The read, fresh from disk every time, of the newest record in the two dirs `outcome_paths` lists (#3302) | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:1450`), its pure half `summarize` (`:1469`) |
-| The startup line and its level | `log_at_startup` (`:1281`), `startup_level` (`:1265`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4204`) |
-| The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:987`) |
+| The startup line and its level | `log_at_startup` (`:1281`), `startup_level` (`:1265`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4229`) |
+| The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:990`) |
 | The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2869`), printed under `version` (`:2474`) |
 
 - ⚠️ **Read on every answer, never cached at startup.** On Windows the MSI
@@ -188,7 +188,7 @@ sequenceDiagram
 |---|---|
 | The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:360`); `UpdateRefusal` and `update_refusal()` (`:573`, `:1448`) |
 | Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5186`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3093`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3076`), else `self` |
-| Stamped at **every** announcement | `stub_caps` (`signaling.rs:7521`, `:7534`) |
+| Stamped at **every** announcement | `stub_caps` (`signaling.rs:7616`, `:7632`) |
 | Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1451`): a 409 on one device (`:1498`), a `refused` row with its `refused_code` in a bulk (`:1630`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |
 

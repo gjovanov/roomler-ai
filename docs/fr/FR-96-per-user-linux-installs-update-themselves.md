@@ -160,11 +160,11 @@ hand install alike, and the helper never speaks to a daemon.
 | settled | the same new identity for 2 min: an install places the binary before its libraries and units | `SETTLE` `:45` |
 | answers | the new binary's `--version` must be `roomlerd <another version>`. One that cannot load (a missing shared library) is never restarted onto, so the daemon stays online on the old image; the same version is not worth cutting anything for | `verdict_from` `:196-211` |
 | idle (D1) | no remote-control session, no SSH connection, no transfer or recording — work a restart CUTS, cut after the 24 h ceiling. A network transition in the last 10 min, or an install of the daemon's own in flight — states a restart could WEDGE, never forced. Agent turns are waited for as an install waits for them | `Busy` `:82-107`, `decide` `:164-190`, `CEILING` `:48` |
-| restart | FR-84 D3's door: a supervisor that relaunches, the persisted record that makes a loop impossible, systemd's own read-back of the unit's policy. These are "Apply now"'s gates, minus the owner's switch for LOCAL CLIENTS' requests: nobody is asking. A refusal is retried after 10 min | `RestartHandle::arm_from_within`, `localapi_state.rs:340-399`; `RETRY_AFTER`, `replaced_binary.rs:52` |
+| restart | FR-84 D3's door: a supervisor that relaunches, the persisted record that makes a loop impossible, systemd's own read-back of the unit's policy. These are "Apply now"'s gates, minus the owner's switch for LOCAL CLIENTS' requests: nobody is asking. A refusal is retried after 10 min | `RestartHandle::arm_from_within`, `localapi_state.rs:343-402`; `RETRY_AFTER`, `replaced_binary.rs:52` |
 
 - ⚠️ **An SSH session counts as a session.** The likeliest replacement outside the helper is an admin's
   `apt upgrade` typed into a roomler SSH session on that very device. `ssh.rs` now counts its open connections
-  (`live_connections`, `ssh.rs:2801-2811`), and the restart waits for them.
+  (`live_connections`, `ssh.rs:2963-2973`), and the restart waits for them.
 - **`auto_update = false` does not stop it.** Running what is already installed is not an update. The kill switch
   is the FR's, `ROOMLERD_UPDATE_HELPER=0` (AC7).
 - **Root daemons are unchanged** (AC4). An admin's `apt upgrade` on a system install still leaves the root daemon

@@ -45,7 +45,7 @@ equal.
 selector reaches knows a display name: the server's exec/SSH target resolver
 (`crates/modules/fleet/src/socket.rs:1093` `resolve_exec_target`: hex id → exact
 `agents.name` → case-insensitive `agents.name`) or the daemon's ping resolver
-(`agents/roomlerd/src/localapi_state.rs:570` `resolve_overlay`: literal address
+(`agents/roomlerd/src/localapi_state.rs:736` `resolve_overlay`: literal address
 → mesh label, whole or first label). The CLI closes the gap **on the client**,
 by joining the device list the daemon already fetches for this device
 (`roomler devices`, FR-84 D5b) onto the peer list — the same two join keys the

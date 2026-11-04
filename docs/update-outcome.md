@@ -93,13 +93,13 @@ sequenceDiagram
 > the daemon's `started_at_ms` is 1792967954; the watcher's `finished_unix` is
 > 1792967960. For those seconds the record honestly reads `InProgress`, which
 > is why the daemon reads the file **on every answer** rather than once at
-> startup (`DaemonState::status`, `agents/roomlerd/src/localapi_state.rs:987`),
+> startup (`DaemonState::status`, `agents/roomlerd/src/localapi_state.rs:990`),
 > and why a fresh `InProgress` is "still at work", not a failure (§4).
 
 ## 4. The eight words
 
 The daemon reports the record as `NodeStatus.last_install`
-(`crates/localapi/src/lib.rs:471`), a `LastInstallStatus` (`:510`) whose
+(`crates/localapi/src/lib.rs:471`), a `LastInstallStatus` (`:531`) whose
 `status` is one of eight words — the six a record can hold, spelled exactly
 as the file and the watcher's `post-install verdict:` log line spell them so
 one grep finds all three surfaces (locked by
@@ -155,7 +155,7 @@ record's file. Two topologies split roles:
   worker's own token, and only the S-1-5-18 SID is `SystemContext`
   (`agents/roomlerd/src/system_context/worker_role.rs:208`); `roomler status`
   shows the same fact as `privileged` (`process_is_privileged`,
-  `agents/roomlerd/src/localapi_state.rs:486`), `service (per-user)` when it is
+  `agents/roomlerd/src/localapi_state.rs:489`), `service (per-user)` when it is
   false. The dev box is the attended case (`privileged: false`): the 0.4.172
   and 0.4.174 records sit under the signed-in user's profile, while the SYSTEM
   profile's copy is a July `InProgress` for `agent-v0.3.0-rc.183` — a watcher
@@ -163,7 +163,7 @@ record's file. Two topologies split roles:
   would report as `NEVER REPORTED` had a SystemContext worker read it.
   ⚠️ **Under SystemContext the worker and its watcher log apart.** The
   worker takes the `service-logs` role (S1b,
-  `agents/roomlerd/src/app.rs:1630`). The watcher it spawns has none and
+  `agents/roomlerd/src/app.rs:1650`). The watcher it spawns has none and
   writes the record into SYSTEM's profile. Read on a per-machine guest, a
   real self-update from candidate 0.4.220 to 0.4.221 left the record
   `InProgress` in SYSTEM's profile past the clean-run threshold, with no
@@ -202,7 +202,7 @@ $ roomler status
   the sentence per word, `last_install_line`, `:2869`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:1526`,
-  called from `run_cmd`, `agents/roomlerd/src/app.rs:4204`). `journalctl -u
+  called from `run_cmd`, `agents/roomlerd/src/app.rs:4229`). `journalctl -u
   roomlerd -g "last install"`, `roomler logs --grep "last install"`, or the
   dashboard's log viewer, since WARN lines ride the centralized upload. The
   level is `startup_level`'s (`:1265`): the two quiet states and a watcher
@@ -210,7 +210,7 @@ $ roomler status
 - **The watcher's own line — a surface that ends at 0.4.176.** Written as
   the verdict lands: `post-install verdict: SucceededVerified (new binary at
   /usr/bin/roomlerd reports roomlerd 0.4.172)` on the watcher's stdout
-  (`post_install_watch_cmd`, `app.rs:2537`), which journald captured on a
+  (`post_install_watch_cmd`, `app.rs:2562`), which journald captured on a
   systemd host, beside the watcher's `post-install watcher started` tracing
   line on its stderr. This is the line the P7 field log read on 2026-10-19
   and the rows of §7 read on 10-26; it was the only reader before P3.

@@ -83,7 +83,7 @@ on a *condition*, each one named:
 
 | Class | Site | Goes when |
 |---|---|---|
-| appdirs read-fallback | `crates/agent-core/src/appdirs.rs:205`, `:295` | **kept on purpose** — `migrate_legacy_trees` skips whenever the desktop companion is running, and the daemon respawns that companion, so on a GUI host the fallback is the *primary* path, not a safety net |
+| appdirs read-fallback | `crates/agent-core/src/appdirs.rs:222`, `:312` | **kept on purpose** — `migrate_legacy_trees` skips whenever the desktop companion is running, and the daemon respawns that companion, so on a GUI host the fallback is the *primary* path, not a safety net |
 | already-published release assets | `agents/roomlerd/src/updater.rs:989`, `agents/roomler-cli/src/update.rs:391` | no picker matches them. The daemon lane has published `roomlerd-*` since 0.4.38 (field-proven across the rename on 0.4.40). The **tunnel lane still publishes the retired prefix** (`.github/workflows/release-tunnel.yml:165`), and the CLI's updater refuses a tarball whose inner directory is not that spelling — so that rename is its own two-release migration: a CLI that accepts both first, the rename once no tunnel-only host runs an older one |
 | sweeps that delete the old thing | `agents/roomlerd/src/win_service/mod.rs:105`, `agents/roomlerd/packaging/macos/postinstall`, `scripts/install.sh --uninstall` | no host can still have the thing swept — a sweep must *name* what it removes |
 | MSI installer identity | the WiX FileKeys, the Component and Feature Ids and the UpgradeCodes | a major-upgrade decision, not a rename. The ProductName (what Apps & Features lists) was only ever a display name, since an upgrade matches the UpgradeCode: FR-133 P1 renamed it |

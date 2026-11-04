@@ -473,7 +473,7 @@ flowchart TD
 
 **A second caller: the daemon itself (FR-96 P2b, 2026-10-13).** A per-user Linux
 daemon whose binary was replaced restarts through the same door once nothing it
-serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:340-399`).
+serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:343-402`).
 It runs the same supervisor proof, record and systemd read-back, but not
 `local_restart_enabled`, because no local client is asking. It is not a server
 lever: what sets it off is a file replaced ON the device, by the root update
@@ -548,7 +548,7 @@ which the daemon still refuses on the same terms as a local request.
    that `roomler exec` and `roomler ssh` talk to — measured on 0.4.169, the
    worker's file read `ssh_enabled = false` while the root half served SSH.
    The root daemon's socket is root-only and its person socket refuses every
-   config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3229`), so
+   config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3250`), so
    gate 4 on that daemon is an administrator's: `sudo roomler config set
    exec_enabled true`. The pane now says which file it edits and gives that
    command (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:843`;
