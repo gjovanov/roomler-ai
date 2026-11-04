@@ -69,8 +69,8 @@ arrived 4.4 s late still had ~50 s of its 60 s life left — the window was ther
 | push | `crates/modules/network/src/routes/agent_ssh.rs:540` | `rc_hub.push_ssh_grant(…)` |
 | enqueue | `crates/modules/fleet/src/hub.rs:2400` → `send_to_agent` | `try_send` onto the agent's outbound mpsc — returns when **queued** |
 | answer | `crates/modules/network/src/routes/agent_ssh.rs:558` | `Ok(Granted { address, … })` — immediately |
-| record | `agents/roomlerd/src/signaling.rs:5377` → `ssh.rs:2928` | `record_grant` pushes into `GRANTS` whenever the frame arrives |
-| auth | `agents/roomlerd/src/ssh.rs:2390` (`take_grant_for`) | reads `GRANTS`; no entry ⇒ `rejected — no live grant` |
+| record | `agents/roomlerd/src/signaling.rs:5377` → `ssh.rs:2950` | `record_grant` pushes into `GRANTS` whenever the frame arrives |
+| auth | `agents/roomlerd/src/ssh.rs:2410` (`take_grant_for`) | reads `GRANTS`; no entry ⇒ `rejected — no live grant` |
 
 ```mermaid
 sequenceDiagram
@@ -131,7 +131,7 @@ REFUSAL (`other`), and only an absent or `null` field means recorded.
 ### 2. The capability — `ssh-grant-ack`, read from the LIVE connection
 
 `RpcCap::SshGrantAck` = `ssh-grant-ack`, advertised only by `ssh-server` builds, next to
-`ssh` and `ssh-consent` (`agents/roomlerd/src/encode/caps.rs:4285`).
+`ssh` and `ssh-consent` (`agents/roomlerd/src/encode/caps.rs:4095`).
 
 ⚠️ **Equality-matched**, like every verb: `ssh` is a prefix of `ssh-grant-ack` exactly as it
 is of `ssh-consent`, and `starts_with` would mark every `ssh` agent ack-capable — the
@@ -172,7 +172,7 @@ caller hears the server's reason rather than its own timeout; and it leaves ≥ 
 
 ### 4. The agent — acknowledge after recording, and every refusal
 
-The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4361`) acknowledges **after**
+The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4270`) acknowledges **after**
 `record_grant` returns: the grant is in `GRANTS` — the table the auth path reads — before
 the frame leaves, so "confirmed" means "redeemable". `record_grant`'s `Result<(), String>`
 becomes a typed rejection so the arm can say *which* refusal it was; the log text is

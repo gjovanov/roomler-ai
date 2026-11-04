@@ -2370,6 +2370,44 @@ impl JobObject {
         self.0.raw()
     }
 
+    /// Put `process` in the job. Under the per-user Scheduled Task the process
+    /// is already in the task's job, and this job nests inside that one.
+    pub(crate) fn assign(&self, process: HANDLE) -> Result<()> {
+        // SAFETY: a live job handle we own; the caller keeps `process` alive
+        // across the call.
+        if unsafe { AssignProcessToJobObject(self.0.raw(), process) } == 0 {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("AssignProcessToJobObject failed (err {err})");
+        }
+        Ok(())
+    }
+
+    /// #3303 — close the job without ending what is in it: the kill-on-close
+    /// limit goes first, so the last handle closing leaves those processes
+    /// running, out of anyone's reach. On failure the limit stands and closing
+    /// the job ends them, which is what this job was made to do.
+    pub fn let_go(self) -> Result<()> {
+        // SAFETY: all-zero is a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION:
+        // no limit set.
+        let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` matches the class being set and outlives the call.
+        let ok = unsafe {
+            SetInformationJobObject(
+                self.0.raw(),
+                JobObjectExtendedLimitInformation,
+                &info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("SetInformationJobObject(no limit) failed (err {err})");
+        }
+        Ok(())
+    }
+
     /// End every process in the job. Asynchronous, like `TerminateProcess`:
     /// wait on a process, or poll [`active_processes`](Self::active_processes),
     /// to see them gone.
@@ -2416,6 +2454,53 @@ impl JobObject {
         }
         Ok(inside != FALSE)
     }
+}
+
+/// #3303 — start a process that `CREATE_SUSPENDED` holds at its first
+/// instruction, knowing only its id: `tokio::process` keeps the thread handle
+/// `CreateProcess` returned to itself. A process with none of its threads
+/// resumed never runs, so `Err` means the caller must end it.
+pub fn resume_suspended_process(pid: u32) -> Result<()> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_SUSPEND_RESUME};
+
+    // SAFETY: a documented call; the snapshot is owned below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        // SAFETY: thread-local error read.
+        let err = unsafe { GetLastError() };
+        bail!("CreateToolhelp32Snapshot failed (err {err})");
+    }
+    let snapshot = OwnedHandle::new(snapshot)
+        .ok_or_else(|| anyhow!("CreateToolhelp32Snapshot returned no handle"))?;
+    // SAFETY: all-zero is valid for this struct, and it carries its own size,
+    // as the walk requires.
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut resumed = 0u32;
+    // SAFETY: a live snapshot and a valid out-param, for each call of the walk.
+    let mut more = unsafe { Thread32First(snapshot.raw(), &mut entry) };
+    while more != 0 {
+        if entry.th32OwnerProcessID == pid {
+            // SAFETY: a documented call; a thread gone since the snapshot
+            // answers null. The handle is owned by the wrapper.
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID) };
+            if let Some(thread) = OwnedHandle::new(thread)
+                // SAFETY: the handle was opened with the right this needs.
+                && unsafe { ResumeThread(thread.raw()) } != u32::MAX
+            {
+                resumed += 1;
+            }
+        }
+        // SAFETY: as above.
+        more = unsafe { Thread32Next(snapshot.raw(), &mut entry) };
+    }
+    if resumed == 0 {
+        bail!("no thread of process {pid} could be resumed");
+    }
+    Ok(())
 }
 
 /// Who a process started into a job runs as.
@@ -3609,6 +3694,31 @@ mod tests {
             child.process.wait_for_exit(Duration::from_secs(10)),
             "closing the job's last handle must end its processes"
         );
+    }
+
+    /// #3303 — a job let go leaves what is in it running: the installer a
+    /// finished command left behind goes on.
+    #[test]
+    fn a_job_let_go_leaves_its_processes_running() {
+        let job = JobObject::kill_on_close().unwrap();
+        // SAFETY: `Daemon` carries no token.
+        let child = unsafe {
+            spawn_into_job(
+                SpawnAs::Daemon,
+                &cmd("ping -n 60 127.0.0.1 >NUL"),
+                None,
+                &[],
+                false,
+                &job,
+            )
+        }
+        .unwrap();
+        job.let_go().unwrap();
+        assert!(
+            !child.process.wait_for_exit(Duration::from_secs(2)),
+            "a job let go must not end its processes"
+        );
+        child.process.terminate();
     }
 
     /// #1908 — a console-user command holds no handle it was not given. The

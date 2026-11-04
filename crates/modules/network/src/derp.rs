@@ -57,6 +57,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
+use roomler_ai_remote_control::models::{OverlayNode, RetiredKey, RetiredKeyMode};
 use roomler_core::ws::upgrade::WsParams;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -431,6 +432,44 @@ pub async fn derp_upgrade(
         .max_frame_size(roomler_core::ws::upgrade::MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| handle_derp_socket(state, socket, agent_id))
 }
+/// FR-40 P2 — the org's retired-key mode and, unless it is `off`, the ledger
+/// entry for the key a registration presents. Fails OPEN to the pre-P2 path:
+/// an unreadable network row reads as `off`, an unreadable ledger as "not
+/// retired". The join already enforced the check on the key the row holds,
+/// and DERP is the floor that connects a node when nothing else does.
+async fn retired_key_at_derp(
+    state: &NetworkState,
+    node: &OverlayNode,
+    presented: &str,
+) -> (RetiredKeyMode, Option<RetiredKey>) {
+    let mode = match state
+        .overlay_networks
+        .base
+        .find_by_id(node.network_id)
+        .await
+    {
+        Ok(network) => network.retired_key_mode,
+        Err(e) => {
+            info!(network = %node.network_id, %e, "derp: network row unreadable — retired-key check skipped");
+            return (RetiredKeyMode::Off, None);
+        }
+    };
+    if mode == RetiredKeyMode::Off {
+        return (mode, None);
+    }
+    match state
+        .overlay_nodes
+        .retired_key_in_network(node.network_id, presented)
+        .await
+    {
+        Ok(retired) => (mode, retired),
+        Err(e) => {
+            warn!(network = %node.network_id, %e, "derp: retired-key ledger unreadable — check skipped");
+            (mode, None)
+        }
+    }
+}
+
 /// Drive one DERP connection: resolve the agent's node, validate its
 /// registration pubkey, add it to the registry, then pump frames until the
 /// socket closes.
@@ -466,7 +505,23 @@ async fn handle_derp_socket(state: NetworkState, socket: WebSocket, agent_id: Ob
             return;
         }
     };
-    if BASE64.encode(self_pubkey) != node.wg_public_key {
+    // FR-40 P2 — whether the presented key is a RETIRED one, read only when
+    // the org switched the check on (`off` reads nothing: the pre-P2 path).
+    let presented = BASE64.encode(self_pubkey);
+    let (retired_mode, retired) = retired_key_at_derp(&state, &node, &presented).await;
+    if presented != node.wg_public_key {
+        if retired.is_some() {
+            // The same refusal as below, under its real name: a device whose
+            // join was refused `key_retired` dials DERP with the same key, and
+            // "stale row or rotation race" would send its operator after the
+            // wrong thing.
+            warn!(
+                %agent_id, %network_id, node = %node_hex, got = %pk8(&self_pubkey),
+                "derp: registration REFUSED — pubkey != node's wg_public_key, and it is a \
+                 key retired on this network (key_retired)"
+            );
+            return;
+        }
         warn!(
             %agent_id, %network_id, node = %node_hex,
             got = %pk8(&self_pubkey),
@@ -474,6 +529,22 @@ async fn handle_derp_socket(state: NetworkState, socket: WebSocket, agent_id: Ob
             "derp: registration REFUSED — pubkey != node's wg_public_key (stale node row or key rotation race)"
         );
         return;
+    }
+    // The row's OWN key is retired: it was admitted while the switch was off
+    // or `warn`, and the node has not re-joined since. Under `enforce` its
+    // next join is refused and healed; refuse its relay now too.
+    if retired.is_some() {
+        if retired_mode == RetiredKeyMode::Enforce {
+            warn!(
+                %agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey),
+                "derp: registration REFUSED — key_retired (the node's own key was retired on this network)"
+            );
+            return;
+        }
+        warn!(
+            %agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey),
+            "derp: would refuse registration — key_retired (retired_key_mode=warn; admitted)"
+        );
     }
     let key: DerpKey = (network_id, self_pubkey);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(DERP_SEND_QUEUE);
