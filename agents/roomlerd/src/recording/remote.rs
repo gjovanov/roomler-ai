@@ -706,40 +706,11 @@ const BANNER_POLL: Duration = Duration::from_millis(1100);
 /// the companion is already running.
 const BANNER_READ_CEILING: Duration = Duration::from_secs(5);
 
-/// Whether the desktop companion can show this session's prompt and banner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Companion {
-    /// Ask the system: start the companion if it is installed and not
-    /// running (`companion::ensure_running`, bounded).
-    System,
-    /// A fixed answer — for tests, which must never launch the real app.
-    Fixed(bool),
-    /// Up, and waited for as [`Self::System`] is, on a test's own clock.
-    Timed { poll: Duration, ceiling: Duration },
-    /// Up once this long has passed: a companion that had to be started, which
-    /// [`Self::System`] waits for (up to its start budget). For tests, which
-    /// need that wait while the question is already on the screen.
-    Starting(Duration),
-}
+// Whether the desktop companion can show this session's prompt and banner. The
+// type lives with the companion (#3442): an SSH question asks through it too.
+pub use crate::companion::Companion;
 
 impl Companion {
-    async fn up(self) -> bool {
-        match self {
-            Self::System => tokio::time::timeout(
-                crate::signaling::COMPANION_START_BUDGET,
-                crate::companion::ensure_running(),
-            )
-            .await
-            .unwrap_or(false),
-            Self::Fixed(up) => up,
-            Self::Timed { .. } => true,
-            Self::Starting(after) => {
-                tokio::time::sleep(after).await;
-                true
-            }
-        }
-    }
-
     /// The wait before a recorder may start, if this one has any.
     fn banner_wait(self) -> Option<(Duration, Duration)> {
         match self {
