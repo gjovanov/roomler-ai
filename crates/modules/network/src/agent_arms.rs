@@ -141,7 +141,7 @@ pub async fn handle_agent_ssh_request(
     target: String,
     public_key: String,
     session_secs: u64,
-    // FR-137 S-A2 — an agent session's ticket, which an older agent may still
+    // FR-137 S-B3 — an agent session's ticket, which an older agent may still
     // send. Refused, never verified: FR-90 is parked.
     ssh_ticket: Option<String>,
     reply_tx: roomler_ai_remote_control::session::ClientTx,
@@ -156,7 +156,6 @@ pub async fn handle_agent_ssh_request(
         host_pubkey: None,
         expires_at_ms: None,
         error: Some(msg),
-        ssh_ticket_id: None,
     };
 
     // The origin's owner is the person whose permissions this runs under. A
@@ -186,10 +185,10 @@ pub async fn handle_agent_ssh_request(
             }
         };
 
-    // FR-137 S-A2 — a request carrying an agent session's ticket rides the
-    // caller into `dispatch`, which refuses and audits it. Until P2 the wire
-    // still carries the field, and ignoring it would answer a session's
-    // request as the device owner's own.
+    // FR-137 S-B3 — a request carrying an agent session's ticket rides the
+    // caller into `dispatch`, which refuses and audits it. The wire keeps the
+    // field, parse-only, and ignoring it would answer a session's request as
+    // the device owner's own.
     use crate::routes::agent_ssh::CallerSession;
     let session = if ssh_ticket.is_some() {
         CallerSession::Refused("an agent session's ticket, and FR-90 is parked")
@@ -251,8 +250,6 @@ pub async fn handle_agent_ssh_request(
         host_pubkey,
         expires_at_ms,
         error,
-        // FR-137 S-A4 — a wire field until P2: no request is held to a ticket.
-        ssh_ticket_id: None,
     };
     if reply_tx.try_send(msg).is_err() {
         warn!(%origin_agent_id, %request_id, "rc:ssh.response undeliverable — origin WS gone");

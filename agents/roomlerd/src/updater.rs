@@ -21,7 +21,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tunnel_core::env::node_env;
 
 /// GitHub "Releases" repo slug. Centralised here so a fork can redirect
@@ -6655,7 +6655,7 @@ mod tests {
     /// exec drain threads do.
     fn eof_after(mode: &str) -> Duration {
         use std::io::Read;
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let mut caller =
             std::process::Command::new(std::env::current_exe().expect("the test binary"))
                 .args([

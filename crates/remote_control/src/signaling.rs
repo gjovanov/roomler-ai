@@ -94,6 +94,12 @@ pub const REJECT_REASON_NO_SESSION: &str = "no open session (send rc:tunnel.open
 /// Wire-stable, do not reword. Emitted at `crates/api/src/ws/tunnel.rs`.
 pub const REJECT_REASON_SESSION_MISMATCH: &str = "session_id mismatch";
 
+/// FR-137 S-B3 — the `rc:error` code that refuses an `rc:tunnel.open`
+/// carrying FR-90's retired agent-session grant ([`ClientMsg::TunnelOpen`]'s
+/// `net_grant`). Wire-stable since FR-90 P3-7-2a named it: a 0.4.199 device
+/// reads it as the end of that grant, never as a reason to retry.
+pub const NET_GRANT_REFUSED: &str = "net_grant_refused";
+
 /// #2251 — the `limit` an agent's `rc:terminate` names, with `reason`
 /// `Error`, when the browser's offer carries no codec the device's RTP video
 /// track can send. Nothing a retry changes would fix that, so a viewer reads

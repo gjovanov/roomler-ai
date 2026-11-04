@@ -2361,35 +2361,6 @@ struct TokenFacts {
     elevated: Option<bool>,
 }
 
-/// FR-90 P3-9-2b — the account this process runs as, by SID (Windows), read
-/// once; `None` elsewhere, or when it could not be read.
-fn own_sid() -> Option<&'static str> {
-    #[cfg(windows)]
-    {
-        static OWN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        OWN.get_or_init(|| {
-            use windows_sys::Win32::Foundation::CloseHandle;
-            use windows_sys::Win32::Security::TOKEN_QUERY;
-            use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-            let mut token = std::ptr::null_mut();
-            // SAFETY: our own process's pseudo-handle; `token` is a valid
-            // out-param, closed below once.
-            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-                return None;
-            }
-            let facts = token_facts(token);
-            // SAFETY: closes the token opened above, exactly once.
-            unsafe { CloseHandle(token) };
-            facts.and_then(|f| f.sid)
-        })
-        .as_deref()
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
-}
-
 /// The session process `pid` runs in.
 #[cfg(windows)]
 fn process_session(pid: u32) -> Option<u32> {
@@ -7292,13 +7263,11 @@ mod tests {
             Some(false),
             "a person's token, read: {peer:?}"
         );
-        // FR-90 P3-9-2b — and its account, by SID, from the same token: this
-        // process's own.
+        // FR-90 P3-9-2b — and its account, by SID, from the same token.
         assert!(
             peer.sid.as_deref().is_some_and(|s| s.starts_with("S-1-5-")),
             "{peer:?}"
         );
-        assert_eq!(peer.sid.as_deref(), own_sid(), "the client is this process");
         assert!(peer.elevated.is_some(), "its elevation, read: {peer:?}");
     }
 

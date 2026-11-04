@@ -169,11 +169,11 @@ pub struct Caller {
     pub display: String,
     /// Set on the device-originated leg — the device whose LocalAPI asked.
     pub origin_agent_id: Option<ObjectId>,
-    /// FR-137 S-A2 — whether the request carried an agent session's ticket.
+    /// FR-137 S-B3 — whether the request carried an agent session's ticket.
     pub session: CallerSession,
 }
 
-/// FR-137 S-A2 — an agent session's part in a request. FR-90 is parked, so no
+/// FR-137 S-B3 — an agent session's part in a request. FR-90 is parked, so no
 /// ticket is verified any more, and one is only ever refused: decided where
 /// the request arrived and carried here, so [`dispatch`] audits the refusal
 /// in its one place.
@@ -181,8 +181,8 @@ pub enum CallerSession {
     /// A person's request (`roomler ssh`, the HTTP route): no ticket.
     None,
     /// The request carried a ticket, refused, and why (for the log). Never
-    /// served as the device owner's request instead: until P2 the wire still
-    /// carries the field, and an older agent's ticketed request would
+    /// served as the device owner's request instead: the wire keeps the
+    /// field, parse-only, and an older agent's ticketed request would
     /// otherwise run as its owner's.
     Refused(&'static str),
 }
@@ -326,7 +326,7 @@ pub async fn dispatch(
     session_secs: u64,
 ) -> SshResponseBody {
     let agent_id = agent.id.unwrap_or_default();
-    // FR-137 S-A2 — a request that carried an agent session's ticket is
+    // FR-137 S-B3 — a request that carried an agent session's ticket is
     // refused here, audited like any other refusal, and never answered as the
     // device owner's request instead.
     let outcome = match &caller.session {
@@ -453,9 +453,6 @@ async fn decide(
         session_secs,
         consent_mode,
         via_service,
-        // FR-137 S-A4 — a wire field until P2: once FR-90 is parked, no grant
-        // is held to one command.
-        one_command: false,
     };
 
     // FR-105 — the service PULLS the grant with its own credential, so it is
@@ -480,8 +477,6 @@ async fn decide(
             expires_at_ms,
             session_secs,
             consent_mode,
-            // FR-137 S-A4 — a model field until P2.
-            one_command: false,
             state: SshPending::PENDING.to_string(),
             created_at: now,
             claim_by: at(ssh_limits::GRANT_ACK_TIMEOUT_SECS),
@@ -724,17 +719,13 @@ fn audit_event(
         // The HTTP leg cannot tell a browser from a script — both arrive as an
         // authenticated caller with a bearer token — so this records the only
         // distinction the server can actually observe. A request that carried
-        // an agent session's ticket is `session`, and refused (FR-137 S-A2).
+        // an agent session's ticket is `session`, and refused (FR-137 S-B3).
         source: match (&caller.session, caller.origin_agent_id) {
             (CallerSession::Refused(_), _) => "session",
             (CallerSession::None, Some(_)) => "cli",
             (CallerSession::None, None) => "api",
         }
         .to_string(),
-        // FR-137 S-A4 — model fields until P2: a refused ticket names no
-        // session, since nothing it claims was verified.
-        session_id: None,
-        ssh_ticket_id: None,
         caller: caller.display.clone(),
         account_mode: granted.map(|g| account_mode_wire(g.account_mode).to_string()),
         session_secs: granted.map(|g| g.session_secs),
@@ -1158,9 +1149,6 @@ pub async fn publish_service_endpoint(
         ceiling: body.ceiling,
         anchor_id,
         published_at: bson::DateTime::now(),
-        // FR-137 S-A4 — a model field until P2. A 0.4.199 service still sends
-        // `one_command`, which this body no longer reads.
-        one_command: false,
     };
     match state
         .fleet
@@ -1254,8 +1242,6 @@ pub async fn claim_service_grant(
                 // The id that was rung, for whoever investigates a forgery.
                 grant_id: Some(grant_id),
                 source: "service-claim".to_string(),
-                session_id: None,
-                ssh_ticket_id: None,
                 caller: String::new(),
                 account_mode: None,
                 session_secs: None,
