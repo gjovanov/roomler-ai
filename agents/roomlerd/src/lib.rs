@@ -85,6 +85,9 @@ pub mod fp16;
 #[cfg(any(target_os = "linux", all(unix, feature = "recording")))]
 pub(crate) mod fs_identity;
 pub mod gpu_clock;
+/// #3439 — a session asked for before the capability probe's first answer waits
+/// for it, in its connection.
+pub mod held_requests;
 /// FR-90 — Hive agent sessions on this device (`hive_enabled`, default off).
 /// Linux, macOS and Windows (`cfg(hive_host)`, set by `build.rs`): elsewhere
 /// the feature compiles nothing here and the build does not advertise `hive`,

@@ -595,7 +595,7 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | the device's switch | `vault_enabled` ([`config.rs:593`](../crates/agent-core/src/config.rs#L593)), off, never pushable: [`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9943) |
-| the key, and its half in the hello | [`vault.rs:35`](../agents/roomlerd/src/vault.rs#L35) `hello_key`, feature `vault` (it implies `hive`, and no release build carries it yet); the hello at [`signaling.rs:1807`](../agents/roomlerd/src/signaling.rs#L1807) |
+| the key, and its half in the hello | [`vault.rs:35`](../agents/roomlerd/src/vault.rs#L35) `hello_key`, feature `vault` (it implies `hive`, and no release build carries it yet); the hello at [`signaling.rs:1831`](../agents/roomlerd/src/signaling.rs#L1831) |
 | the wire | `AgentHello::vault_key` ([`signaling.rs:603`](../crates/remote_control/src/signaling.rs#L603)) and [`vault_key_is_well_formed`](../crates/remote_control/src/signaling.rs#L120) |
 | what the fleet stores | [`socket.rs:103`](../crates/modules/fleet/src/socket.rs#L103), [`AgentDao::update_hello`](../crates/services/src/dao/agent.rs#L495), `Agent::vault_key` ([`models.rs:2355`](../crates/remote_control/src/models.rs#L2355)); no route answers it |
 
@@ -884,7 +884,7 @@ no answer, and the daemon stops waiting for it.
 >   allow from the same answer
 >   ([`supervisor.rs:4382`](../agents/roomlerd/src/hive/supervisor.rs#L4382)).
 >   It records whether the primary connection takes leases before it resumes
->   any run ([`signaling.rs:1863`](../agents/roomlerd/src/signaling.rs#L1863)).
+>   any run ([`signaling.rs:1887`](../agents/roomlerd/src/signaling.rs#L1887)).
 
 | Piece | Where |
 |---|---|
@@ -2223,7 +2223,7 @@ bash elsewhere.
 > - **A ticket is no lease**, and it is **recorded before it is given**, as
 >   a grant is (§21).
 > - **It is never logged by a daemon.** `rc:vault.ssh.granted` has an arm of
->   its own ([`signaling.rs:6713`](../agents/roomlerd/src/signaling.rs#L6713)),
+>   its own ([`signaling.rs:6848`](../agents/roomlerd/src/signaling.rs#L6848)),
 >   where the catch-all below would print the frame and the ticket with it.
 >   Since P3-8-2b-1 it answers the asker, on the primary's connection only, as
 >   a lease is; the ticket's `Debug` names it by its id alone.
