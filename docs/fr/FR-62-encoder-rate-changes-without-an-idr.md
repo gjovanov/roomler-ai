@@ -112,7 +112,7 @@
     `InPlaceVbr` for every `*_nvenc` whatever `encoder_inplace_rate` says, and
     `NVENC_RECONFIG_FORCES_IDR` (`:893`) has been `false` since patch 0001 shipped
     (0.4.51). On NVENC the flag only sizes the VBV window that a move writes
-    (`inplace_rate_bufsize`, `encode/mod.rs:355`). So a constrained NVENC session needs
+    (`inplace_rate_bufsize`, `encode/mod.rs:358`). So a constrained NVENC session needs
     no config change to be read for AC2/AC3, and flipping the flag off does not produce
     a RED (no IDR per rate step). The read's RED is a **positive control**: a viewer
     resize that moves `dims_swaps` by one must move `idr_count` by exactly one. That
