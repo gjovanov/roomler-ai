@@ -193,7 +193,7 @@ like the device cap: no org is over it today.
 (`org_session_cap_of`, `crates/modules/remote/src/controller.rs:654`) and hands it to the hub
 in `DispatchCtx`, and in the body of a request relayed to the pod that owns the device. The
 hub counts that org's live sessions after its coalesce, so a re-asked session is not a
-second one (`crates/modules/fleet/src/hub.rs:1717`). Tenant affinity puts an org's devices
+second one (`crates/modules/fleet/src/hub.rs:1568`). Tenant affinity puts an org's devices
 and its controllers on one pod, so that pod's count is the org's. Redis leases are needed
 only for the one case affinity cannot place: a session to **another** org's device, which
 must count against the controller's org. That is **P3b** (#2637), live since 2026-10-21 with
@@ -208,13 +208,13 @@ session ending or Business. Kill switch `rc.org_session_cap = false`.
 ### P3b, as proposed: a cluster-wide session count that heals itself (O6 + O7 decided 2026-10-20)
 
 **Why P3's count cannot carry it.** P3 counts on the hub that owns the device
-(`crates/modules/fleet/src/hub.rs:1668`). Under tenant affinity, that hub holds every live
+(`crates/modules/fleet/src/hub.rs:1519`). Under tenant affinity, that hub holds every live
 session of the device's org, so the count is complete for a same-org session. A cross-org
 session breaks that assumption: the org that pays is the controller's, and its sessions live
 on whichever pods hold the devices they reach. Today FR-52's external path opens its session
 uncapped (`crates/modules/remote/src/extauth.rs:341`), waiting for this phase. P3's own count
 also has a documented race: the count and the insert are two steps, so two starts in the same
-instant can both pass (`hub.rs:1681`).
+instant can both pass (`hub.rs:1532`).
 
 **The record: session slots in the cluster directory.** C-1's directory
 (`crates/core/src/cluster/directory.rs`) already keeps per-entity records in Redis on exactly
@@ -254,7 +254,7 @@ sequenceDiagram
 **Why this is durable.**
 
 - **One atomic claim.** The Lua claim drops expired members, checks the count and adds the
-  session in one step, so the race at `hub.rs:1681` closes.
+  session in one step, so the race at `hub.rs:1532` closes.
 - **It heals itself.** A lease lives 90 s and is renewed every 30 s by the pod that holds the
   session. A pod that dies stops renewing, and its slots free themselves within 90 s. A Redis
   restart loses the set, but renewal is an upsert, so within one renewal round every live
@@ -587,7 +587,7 @@ mechanism does not exist, so this section replaces it.
   its 10-person, 60-minute meetings (P5).
 - A tunnel's TURN leg cannot be steered from the server: `quic-derp-v1` is negotiated only
   when the client asked for it and sent its DERP identity
-  (`crates/modules/network/src/tunnel.rs:878`).
+  (`crates/modules/network/src/tunnel.rs:740`).
 
 Their bytes still count toward the allowance (P4c-0), so an org that relays heavily through
 them has its mesh throttled. The alternative to O10 is a second coturn listener per site with
@@ -605,7 +605,7 @@ handshake held.
 ### P4c, as built (dark, 2026-10-23)
 
 Built as proposed, behind two switches that ship **off**: `relay_allowance.count_turn` for
-P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:421`, `:427`).
+P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:325`, `:331`).
 
 | Piece | Where |
 |---|---|
@@ -629,7 +629,7 @@ P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:421`,
   - **Enterprise has no relay allowance.** Its relay is "custom" on the ladder
     (`crates/db/src/models/tenant.rs:624`).
   - **The operator's orgs are exempt.** `relay_allowance.exempt_tenants`
-    (`crates/config/src/settings.rs:433`) names them, and `is_exempt`
+    (`crates/config/src/settings.rs:337`) names them, and `is_exempt`
     (`crates/services/src/relay_allowance.rs:42`) is asked by both the job and the org's page.
   - **That org's real seats are recorded** (data, in the annex).
 
@@ -734,8 +734,8 @@ sequenceDiagram
 
 | Guard | Where | What it prevents |
 |---|---|---|
-| The warning is a write conditional on `current_call_id = call` and `cap_warned_call_id ≠ call` | `crates/services/src/dao/room.rs:757` | two pods warning one meeting; warning a meeting that ended |
-| The end is a write conditional on `current_call_id = call` and `in_progress` | `room.rs:776` | ending the **next** meeting in a room restarted between the sweep's read and its write |
+| The warning is a write conditional on `current_call_id = call` and `cap_warned_call_id ≠ call` | `crates/services/src/dao/room.rs:674` | two pods warning one meeting; warning a meeting that ended |
+| The end is a write conditional on `current_call_id = call` and `in_progress` | `room.rs:693` | ending the **next** meeting in a room restarted between the sweep's read and its write |
 | The FR-102 collision is counted after the won end | `meeting_cap.rs:198` | a meeting counted twice when two pods reach it together |
 | `meetings.free_cap = false` | `crates/config/src/settings.rs` (`MeetingsSettings`) | the kill switch: no meeting is warned or ended |
 

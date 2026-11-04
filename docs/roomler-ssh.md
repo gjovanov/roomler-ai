@@ -650,7 +650,7 @@ flowchart TD
   inside the person's session.
 - ⚠️ **The server stores `console_user` off Windows only for an agent that
   advertises `console-user`** (`console_user_unsupported`,
-  [`agent_ssh.rs:1240`](../crates/modules/network/src/routes/agent_ssh.rs#L1240)).
+  [`agent_ssh.rs:1091`](../crates/modules/network/src/routes/agent_ssh.rs#L1091)).
   An agent rolled back since refuses the session itself, as every agent before
   P5a did, so this half fails closed either way.
 
@@ -1530,7 +1530,7 @@ it presented (P3-8-2b).
 | Piece | Where |
 |---|---|
 | the wire | `ssh_ticket` on `rc:ssh.request` ([`signaling.rs:877`](../crates/remote_control/src/signaling.rs#L877)), `one_command` on `rc:ssh.grant` ([`:3930`](../crates/remote_control/src/signaling.rs#L3930)), `ssh_ticket_id` on `rc:ssh.response` ([`:3971`](../crates/remote_control/src/signaling.rs#L3971)); `RpcCap::SshOneCommand` ([`models.rs:1141`](../crates/remote_control/src/models.rs#L1141)) and the three refusals ([`models.rs:5304`](../crates/remote_control/src/models.rs#L5304)) |
-| the binding | `bind_ssh_ticket` ([`agent_ssh.rs:220`](../crates/modules/network/src/routes/agent_ssh.rs#L220)), called where the request arrives ([`agent_arms.rs:194`](../crates/modules/network/src/agent_arms.rs#L194)); the outcome is a `CallerSession` ([`agent_ssh.rs:186`](../crates/modules/network/src/routes/agent_ssh.rs#L186)), and a refused one is answered at [`:411`](../crates/modules/network/src/routes/agent_ssh.rs#L411) |
+| the binding | `bind_ssh_ticket` ([`agent_ssh.rs:220`](../crates/modules/network/src/routes/agent_ssh.rs#L220)), called where the request arrives ([`agent_arms.rs:194`](../crates/modules/network/src/agent_arms.rs#L194)); the outcome is a `CallerSession` ([`agent_ssh.rs:180`](../crates/modules/network/src/routes/agent_ssh.rs#L180)), and a refused one is answered at [`:333`](../crates/modules/network/src/routes/agent_ssh.rs#L333) |
 | the checks | the account and one-command checks ([`agent_ssh.rs:501`](../crates/modules/network/src/routes/agent_ssh.rs#L501)); gate 3's refusal of a session ([`:324`](../crates/modules/network/src/routes/agent_ssh.rs#L324)); what is left of a ticket ([`:963`](../crates/modules/network/src/routes/agent_ssh.rs#L963)) |
 | the audit | the `session` source and the session's ids ([`agent_ssh.rs:867`](../crates/modules/network/src/routes/agent_ssh.rs#L867)) |
 | what comes next | P3-8-1b-2: gate 3 for a session, as decision 22 says. The target holding `one_command` (P3-8-2a), the device's client (P3-8-2b-1) and the tool `ssh_run` (P3-8-2b-2) are the next three sections |
