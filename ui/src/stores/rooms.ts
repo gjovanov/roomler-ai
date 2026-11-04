@@ -36,7 +36,8 @@ export interface Room {
   /**
    * FR-90 — another module owns what this room means: `{module: 'hive',
    * ref: <session id>}` is an agent session's room. Chat stores it and never
-   * interprets it; the SPA uses it to show the session's transcript.
+   * interprets it. FR-137 parked FR-90, so the SPA opens such a room as a
+   * plain Secret room.
    */
   binding?: { module: string; ref: string }
 }

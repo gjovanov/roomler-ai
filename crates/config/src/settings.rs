@@ -49,19 +49,6 @@ pub struct Settings {
     /// exactly today's server.
     #[serde(default)]
     pub modules: ModulesSettings,
-    /// FR-90 P1g — which organizations agent sessions serve once
-    /// `[modules] hive` is on. Absent ⇒ every one.
-    #[serde(default)]
-    pub hive: HiveSettings,
-    /// FR-90 P3-1 — the vault: which organizations it serves once
-    /// `[modules] vault` is on, and its key-encryption key. Absent ⇒ every
-    /// organization, and no KEK.
-    #[serde(default)]
-    pub vault: VaultSettings,
-    /// FR-90 P4-1 — knowhow, the organization's map: which organizations it
-    /// keeps one for once `[modules] knowhow` is on. Absent ⇒ every one.
-    #[serde(default)]
-    pub knowhow: KnowhowSettings,
     /// #1731 — the stall watchdog. Absent ⇒ on, with its defaults.
     #[serde(default)]
     pub diag: DiagSettings,
@@ -208,256 +195,6 @@ impl Default for PairingSettings {
             misses_per_account_per_hour: pairing_default_misses_per_account_per_hour(),
         }
     }
-}
-
-/// FR-90 P3-1 — `[vault]`, env `ROOMLER__VAULT__*`.
-///
-/// ⚠️ `kek` is the vault's root secret: whoever holds it and a copy of the
-/// database reads every secret. `Debug` is written by hand so it never
-/// prints, and nothing that reports settings may serialise this struct.
-#[derive(Deserialize, Clone, Default)]
-pub struct VaultSettings {
-    /// The organizations the vault serves, as comma-separated ids
-    /// (`ROOMLER__VAULT__TENANTS=<id>,<id>`), with `hive.tenants`'s rules:
-    /// empty or `*` is every organization, a list is only those, and an
-    /// entry that is no id matches nothing.
-    ///
-    /// ⚠️ A list switches the module ON by itself ([`Settings::vault_on`]):
-    /// the form a hosted server uses, because it fails safe — no older image
-    /// reads it. Clearing the list is the kill switch.
-    #[serde(default)]
-    pub tenants: String,
-    /// The key-encryption key (`ROOMLER__VAULT__KEK`): an `age` X25519
-    /// identity, `AGE-SECRET-KEY-1…` as `age-keygen` writes it — or the
-    /// whole text of such a file. A hosted server mounts it from a sealed
-    /// secret.
-    #[serde(default)]
-    pub kek: String,
-    /// Or the path of an `age-keygen` identity file
-    /// (`ROOMLER__VAULT__KEK_FILE`). Both set is refused: the two may
-    /// disagree, and the vault does not guess.
-    #[serde(default)]
-    pub kek_file: String,
-    /// P3-3c — how often each pod checks the leases its connected devices
-    /// hold, in seconds (`ROOMLER__VAULT__REVOKE_SWEEP_SECS`): the longest a
-    /// session's end or move, or a change made on another pod, waits to be
-    /// pushed to the device. 0 or absent: 10.
-    #[serde(default)]
-    pub revoke_sweep_secs: u64,
-    /// P3-6b — the providers a dynamic secret is leased for, as
-    /// comma-separated names (`ROOMLER__VAULT__PROVIDERS=postgres`). Empty —
-    /// the default — or `*` is every provider this build knows; a list is
-    /// only those. A provider left out is refused `not_served`, and a word
-    /// that names no provider serves nothing: `none` turns them all off.
-    #[serde(default)]
-    pub providers: String,
-    /// P3-9-1 — the organizations whose PEOPLE the vault lends to through
-    /// `roomler connect` (`ROOMLER__VAULT__PEOPLE=<id>,<id>`): a person's
-    /// endpoint, decided by Cedar's `secret:connect` for the device's owner.
-    /// ⚠️ Opt-in, the opposite sense to `tenants`: empty — the default — is
-    /// NO organization, `*` every one the vault serves, a list only those.
-    /// An organization the vault serves for its sessions lends nothing to
-    /// its people until it is listed here too. Clearing it is the kill
-    /// switch: every person's live lease is taken back at its device's next
-    /// sweep.
-    #[serde(default)]
-    pub people: String,
-    /// FR-90 P3b-2 — the organizations whose sessions may hold a secret as
-    /// a PLACEHOLDER (`ROOMLER__VAULT__PLACEHOLDER=<id>,<id>`): the value
-    /// released to the device's daemon, which swaps it in at the session's
-    /// egress proxy toward the secret's audiences only, the session holding
-    /// an opaque token (design §8.5). ⚠️ Opt-in, as `people`: empty — the
-    /// default — is NO organization, `*` every one the vault serves, a list
-    /// only those. Clearing it is the kill switch: every live placeholder
-    /// lease is taken back at its device's next sweep.
-    #[serde(default)]
-    pub placeholder: String,
-}
-
-impl std::fmt::Debug for VaultSettings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VaultSettings")
-            .field("tenants", &self.tenants)
-            .field(
-                "kek",
-                &if self.kek.trim().is_empty() {
-                    "<unset>"
-                } else {
-                    "<redacted>"
-                },
-            )
-            .field("kek_file", &self.kek_file)
-            .field("revoke_sweep_secs", &self.revoke_sweep_secs)
-            .field("providers", &self.providers)
-            .field("people", &self.people)
-            .field("placeholder", &self.placeholder)
-            .finish()
-    }
-}
-
-/// FR-90 P4-1 — `[knowhow]`, env `ROOMLER__KNOWHOW__*`.
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct KnowhowSettings {
-    /// The organizations whose map knowhow keeps, as comma-separated ids
-    /// (`ROOMLER__KNOWHOW__TENANTS=<id>,<id>`), with `hive.tenants`'s rules:
-    /// empty or `*` is every organization, a list is only those, and an
-    /// entry that is no id matches nothing.
-    ///
-    /// ⚠️ A list switches the module ON by itself ([`Settings::knowhow_on`]),
-    /// as `vault.tenants` does: the form a hosted server uses, because it
-    /// fails safe — no older image reads it. Clearing the list is the kill
-    /// switch.
-    #[serde(default)]
-    pub tenants: String,
-    /// P4-2a — how often each pod reconciles its served organizations'
-    /// machines with the fleet's devices, in seconds
-    /// (`ROOMLER__KNOWHOW__SYNC_SECS`): the longest a change no hook carries
-    /// (a display name) waits to reach the map. 0 or absent: 600.
-    #[serde(default)]
-    pub sync_secs: u64,
-    /// P4-3a — how often each pod looks for scans asked of the devices
-    /// connected to it, in seconds (`ROOMLER__KNOWHOW__SCAN_SWEEP_SECS`):
-    /// the longest a scan asked on another pod waits to be delivered. 0 or
-    /// absent: 5.
-    #[serde(default)]
-    pub scan_sweep_secs: u64,
-    /// P4-5-3 — how many days a person's fact, or a session's proposal a
-    /// person or a probe confirmed, stays `active` with nothing confirming
-    /// it before it turns `stale` (`ROOMLER__KNOWHOW__STALE_DAYS`; decisions
-    /// 40 and 57). Absent: 30. `0`: never. The sync's facts and a scan's own
-    /// never turn stale.
-    #[serde(default)]
-    pub stale_days: Option<u64>,
-    /// P4-5-3 — how often each pod sweeps for facts to turn stale, in
-    /// seconds (`ROOMLER__KNOWHOW__STALE_SWEEP_SECS`). 0 or absent: 3600.
-    #[serde(default)]
-    pub stale_sweep_secs: u64,
-    /// P4-6-1 — how long a probe's finding counts as fresh for
-    /// `roomler_connect`, in seconds (`ROOMLER__KNOWHOW__CONNECT_FRESH_SECS`;
-    /// decision 60): a path is taken only when its device's last finding is
-    /// `ok` and this young. 0 or absent: 86400, a day.
-    #[serde(default)]
-    pub connect_fresh_secs: u64,
-}
-
-/// FR-90 P1g — `[hive]`, env `ROOMLER__HIVE__*`.
-#[derive(Debug, Deserialize, Clone)]
-pub struct HiveSettings {
-    /// The organizations agent sessions serve, as comma-separated ids
-    /// (`ROOMLER__HIVE__TENANTS=<id>,<id>`). Empty — the default — or `*` is
-    /// every organization; a list is only those, and every other one is
-    /// answered as if the module were not there for it. A hosted server opens
-    /// the pillar to a test organization this way before anyone else.
-    ///
-    /// ⚠️ A list switches the module ON by itself ([`Settings::hive_on`]),
-    /// with no `ROOMLER__MODULES__HIVE`. That is the form a hosted server
-    /// uses, because it fails safe: no older image reads a list as the
-    /// switch, so promoting one leaves the pillar off — where
-    /// `modules.hive = true` on an image from before P1g, which never reads
-    /// the list, would open it to every organization. Clearing the list is
-    /// the kill switch.
-    ///
-    /// ⚠️ `String`, not `Vec<String>`, for the reason on
-    /// [`JwtSettings::previous_secrets`]: an env var cannot become a sequence.
-    #[serde(default)]
-    pub tenants: String,
-    /// FR-90 P2c — the replicaset (`ROOMLER__HIVE__REPLICASET`): an
-    /// organization's replica policy, placement, and the frames that make a
-    /// device a member. Default OFF, P2's server kill switch: off, the policy
-    /// routes answer as if they were not there and no session gets a
-    /// replicaset, so a roll that ships it exposes nothing.
-    #[serde(default)]
-    pub replicaset: bool,
-    /// FR-90 P2e-3 — how long a promotion waits for the member it moves to
-    /// to answer its prepare (`ROOMLER__HIVE__PROMOTE_PREPARE_SECS`).
-    #[serde(default = "hive_default_promote_prepare_secs")]
-    pub promote_prepare_secs: u64,
-    /// FR-90 P2e-3 — how long it waits for the primary's `rc:hive.drained`.
-    /// ⚠️ Longer than the device's turn cut
-    /// (`hive::promote_limits::DRAIN_TURN_CUT_SECS`, 60 s), and a margin for
-    /// the last checkpoint: a shorter one fails every drain of a long turn.
-    #[serde(default = "hive_default_promote_drain_secs")]
-    pub promote_drain_secs: u64,
-    /// FR-90 P2e-3 — how long it waits for the member's copy to reach the
-    /// drained tip. A slow carrier (the DERP floor, a laptop on a corporate
-    /// network) is where an operator lengthens it.
-    #[serde(default = "hive_default_promote_sync_secs")]
-    pub promote_sync_secs: u64,
-    /// FR-90 P2f-1 — how long a teleport waits for its target's copy to
-    /// catch up with the primary's before it drains the session
-    /// (`ROOMLER__HIVE__PROMOTE_JOIN_SECS`): the whole copy moves in this
-    /// time, while the session still runs. ⚠️ Under the device's own
-    /// admission of the target's join (`hive::promote_limits::
-    /// TELEPORT_ADMISSION_SECS`, 30 min): a join re-sent after that is
-    /// refused `not_prepared`.
-    #[serde(default = "hive_default_promote_join_secs")]
-    pub promote_join_secs: u64,
-    /// FR-90 P2f-2b — a teleport's target may take the workspace's first
-    /// pack as one thin against what its folder's repository holds already
-    /// (`ROOMLER__HIVE__TELEPORT_HAVE_WANT`; git's have and want). Default
-    /// OFF until the operator confirms FR-90's decision 16: such a target
-    /// holds the checkpoint without its whole pack's blobs.
-    #[serde(default)]
-    pub teleport_have_want: bool,
-    /// FR-90 P2f-3 — how long a fork waits for its device's copy to reach
-    /// the session's last checkpoint, as its primary last reported it
-    /// (`ROOMLER__HIVE__FORK_COPY_SECS`), before it is refused
-    /// `copy_behind`: a fork is made at the last checkpoint the device's
-    /// copy holds. ⚠️ A member that follows the session reports where its
-    /// copy ends at once, then at most every
-    /// `replica_limits::TIP_INTERVAL_SECS` (5 s): a bound below that can
-    /// refuse a copy that holds the checkpoint but has not said so yet
-    /// (measured: 5.2 s, two checkpoints 13 ms apart).
-    #[serde(default = "hive_default_fork_copy_secs")]
-    pub fork_copy_secs: u64,
-    /// FR-90 P2g-3 — how often the server purges the sessions an
-    /// organization's `retention_days` no longer keeps
-    /// (`ROOMLER__HIVE__RETENTION_SWEEP_SECS`): one pod a cycle, by a claim
-    /// in the database. `0` is no sweep; with `replicaset` off there is none
-    /// either. An organization's `retention_days = 0` keeps its sessions for
-    /// ever whatever this says.
-    #[serde(default = "hive_default_retention_sweep_secs")]
-    pub retention_sweep_secs: u64,
-}
-
-fn hive_default_promote_prepare_secs() -> u64 {
-    30
-}
-
-fn hive_default_promote_join_secs() -> u64 {
-    600
-}
-
-fn hive_default_promote_drain_secs() -> u64 {
-    75
-}
-
-fn hive_default_promote_sync_secs() -> u64 {
-    120
-}
-
-fn hive_default_fork_copy_secs() -> u64 {
-    30
-}
-
-impl Default for HiveSettings {
-    fn default() -> Self {
-        Self {
-            tenants: String::new(),
-            replicaset: false,
-            promote_prepare_secs: hive_default_promote_prepare_secs(),
-            promote_drain_secs: hive_default_promote_drain_secs(),
-            promote_sync_secs: hive_default_promote_sync_secs(),
-            promote_join_secs: hive_default_promote_join_secs(),
-            teleport_have_want: false,
-            fork_copy_secs: hive_default_fork_copy_secs(),
-            retention_sweep_secs: hive_default_retention_sweep_secs(),
-        }
-    }
-}
-
-fn hive_default_retention_sweep_secs() -> u64 {
-    3600
 }
 
 /// #1731 — `[diag]`, env `ROOMLER__DIAG__*`: the stall watchdog.
@@ -644,26 +381,6 @@ pub struct ModulesSettings {
     pub network: bool,
     #[serde(default = "modules_default_on")]
     pub saas: bool,
-    /// FR-90 — agent sessions. **Default OFF**, like `vault`: it is the P0
-    /// kill switch while the pillar is built, so a roll that ships the code
-    /// exposes nothing until an operator turns it on
-    /// (`ROOMLER__MODULES__HIVE=true`, or a `hive.tenants` list — read
-    /// [`Settings::hive_on`], never this field alone). Listed in
-    /// [`Self::DEFAULT_OFF`].
-    #[serde(default)]
-    pub hive: bool,
-    /// FR-90 P3-1 — the vault. **Default OFF**, for the same reason:
-    /// `ROOMLER__MODULES__VAULT=true`, or a `vault.tenants` list — read
-    /// [`Settings::vault_on`], never this field alone. Listed in
-    /// [`Self::DEFAULT_OFF`].
-    #[serde(default)]
-    pub vault: bool,
-    /// FR-90 P4-1 — knowhow, the organization's map. **Default OFF**, as
-    /// `hive` and `vault` are: `ROOMLER__MODULES__KNOWHOW=true`, or a
-    /// `knowhow.tenants` list — read [`Settings::knowhow_on`], never this
-    /// field alone. Listed in [`Self::DEFAULT_OFF`].
-    #[serde(default)]
-    pub knowhow: bool,
 }
 
 fn modules_default_on() -> bool {
@@ -679,26 +396,14 @@ impl Default for ModulesSettings {
             remote: true,
             network: true,
             saas: true,
-            hive: false,
-            vault: false,
-            knowhow: false,
         }
     }
 }
 
 impl ModulesSettings {
-    /// Modules whose switch is OFF unless an operator turns it on. Their
-    /// absence from a build that does not link them is the default, not a
-    /// configuration worth a boot warning.
-    pub const DEFAULT_OFF: &'static [&'static str] = &["hive", "vault", "knowhow"];
-
     /// The module ids an operator has switched off, in the composition order
-    /// of `roomler_core::graph::MODULES` — including a default-off module
-    /// nobody switched on, so `modules = compiled − switched_off` holds.
-    ///
-    /// ⚠️ It cannot see a `hive.tenants`, `vault.tenants` or
-    /// `knowhow.tenants` list, which also switches its module on; the boot
-    /// log and `/api/capabilities` read [`Settings::switched_off`].
+    /// of `roomler_core::graph::MODULES`, so `modules = compiled − switched_off`
+    /// holds.
     pub fn switched_off(&self) -> Vec<&'static str> {
         let mut off = Vec::new();
         if !self.saas {
@@ -718,15 +423,6 @@ impl ModulesSettings {
         }
         if !self.network {
             off.push("network");
-        }
-        if !self.hive {
-            off.push("hive");
-        }
-        if !self.vault {
-            off.push("vault");
-        }
-        if !self.knowhow {
-            off.push("knowhow");
         }
         off
     }
@@ -1790,42 +1486,16 @@ pub struct RelayCosts {
 }
 
 impl Settings {
-    /// FR-90 P1g — whether agent sessions are on: `[modules] hive`, or a
-    /// `hive.tenants` list (see [`HiveSettings::tenants`] for why a list alone
-    /// is enough).
-    pub fn hive_on(&self) -> bool {
-        self.modules.hive || !self.hive.tenants.trim().is_empty()
-    }
-
-    /// FR-90 P3-1 — whether the vault is on: `[modules] vault`, or a
-    /// `vault.tenants` list ([`VaultSettings::tenants`]).
-    pub fn vault_on(&self) -> bool {
-        self.modules.vault || !self.vault.tenants.trim().is_empty()
-    }
-
-    /// FR-90 P4-1 — whether knowhow is on: `[modules] knowhow`, or a
-    /// `knowhow.tenants` list ([`KnowhowSettings::tenants`]).
-    pub fn knowhow_on(&self) -> bool {
-        self.modules.knowhow || !self.knowhow.tenants.trim().is_empty()
-    }
-
-    /// [`ModulesSettings::switched_off`], with `hive`, `vault` and `knowhow`
-    /// on wherever [`Self::hive_on`], [`Self::vault_on`] and
-    /// [`Self::knowhow_on`] say they are — what boot logs and
+    /// [`ModulesSettings::switched_off`] — what boot logs and
     /// `GET /api/capabilities` report, so `modules = compiled − switched_off`
-    /// still holds.
+    /// holds.
+    ///
+    /// FR-137 — a deployment still carrying `ROOMLER__MODULES__HIVE`,
+    /// `__VAULT` or `__KNOWHOW` (or their `ROOMLER__HIVE__*`-style lists)
+    /// loads cleanly: `ModulesSettings` and `Settings` deny no unknown key, so
+    /// the retired switches are ignored.
     pub fn switched_off(&self) -> Vec<&'static str> {
-        let mut off = self.modules.switched_off();
-        if self.hive_on() {
-            off.retain(|m| *m != "hive");
-        }
-        if self.vault_on() {
-            off.retain(|m| *m != "vault");
-        }
-        if self.knowhow_on() {
-            off.retain(|m| *m != "knowhow");
-        }
-        off
+        self.modules.switched_off()
     }
 
     pub fn load() -> Result<Self, ConfigError> {
@@ -2078,23 +1748,6 @@ mod s6_tests {
 }
 
 #[cfg(test)]
-mod hive_settings_tests {
-    use super::HiveSettings;
-
-    /// FR-90 P2f-2b — a teleport's have and want ships OFF, both where the
-    /// settings are built whole and where a file leaves the key out: what
-    /// turns it on is the operator's word on decision 16, never an upgrade.
-    #[test]
-    fn a_teleports_have_and_want_is_off_until_turned_on() {
-        assert!(!HiveSettings::default().teleport_have_want);
-        let absent: HiveSettings = toml::from_str("").expect("every key defaults");
-        assert!(!absent.teleport_have_want, "a file without the key");
-        let on: HiveSettings = toml::from_str("teleport_have_want = true").unwrap();
-        assert!(on.teleport_have_want);
-    }
-}
-
-#[cfg(test)]
 mod pairing_settings_tests {
     use super::PairingSettings;
 
@@ -2119,6 +1772,25 @@ mod pairing_settings_tests {
             off.poll_interval_secs, 5,
             "the other keys keep their defaults"
         );
+    }
+}
+
+#[cfg(test)]
+mod modules_settings_tests {
+    use super::ModulesSettings;
+
+    /// FR-137 — production keeps `ROOMLER__MODULES__{HIVE,VAULT,KNOWHOW}` until
+    /// P1 is past its rollback window (decision D3), so a config that still
+    /// sets a retired switch must load, and must switch nothing.
+    #[test]
+    fn a_retired_module_switch_loads_and_switches_nothing() {
+        let m: ModulesSettings =
+            toml::from_str("hive = true\nvault = false\nknowhow = true\nchat = false")
+                .expect("retired switches load");
+        assert!(!m.chat, "a live switch still reads");
+        assert_eq!(m.switched_off(), vec!["chat"]);
+        let on: ModulesSettings = toml::from_str("hive = false").unwrap();
+        assert!(on.switched_off().is_empty());
     }
 }
 
@@ -2175,70 +1847,6 @@ mod setup_settings_tests {
         let legacy_and_off: SetupSettings =
             toml::from_str("wizard_unix_daemon = true\nwizard_macos_daemon = false").unwrap();
         assert!(legacy_and_off.macos_daemon());
-    }
-}
-
-#[cfg(test)]
-mod vault_settings_tests {
-    use super::{ModulesSettings, VaultSettings};
-
-    /// FR-90 P3-1 — the vault ships OFF and listed as such, and a file that
-    /// leaves every key out is a vault with no KEK.
-    #[test]
-    fn the_vault_is_off_until_turned_on() {
-        let m = ModulesSettings::default();
-        assert!(!m.vault);
-        assert!(ModulesSettings::DEFAULT_OFF.contains(&"vault"));
-        assert!(m.switched_off().contains(&"vault"));
-        let absent: VaultSettings = toml::from_str("").expect("every key defaults");
-        assert!(absent.tenants.is_empty() && absent.kek.is_empty() && absent.kek_file.is_empty());
-        // P3-9-1 — and lends to no organization's people.
-        assert!(absent.people.is_empty());
-        // P3b-2 — and releases no value as a placeholder.
-        assert!(absent.placeholder.is_empty());
-    }
-
-    /// ⚠️ The KEK is the vault's root secret: whatever prints settings must
-    /// not print it.
-    #[test]
-    fn the_kek_never_prints() {
-        // Not key-shaped on purpose: a secret scanner must not take a test's
-        // probe for a leaked key.
-        let key = "AGE-SECRET-KEY-1-REDACTION-PROBE-NOT-A-KEY";
-        let s = VaultSettings {
-            tenants: "65f0000000000000000000a1".into(),
-            kek: key.into(),
-            kek_file: String::new(),
-            revoke_sweep_secs: 0,
-            providers: String::new(),
-            people: String::new(),
-            placeholder: String::new(),
-        };
-        let shown = format!("{s:?} {s:#?}");
-        assert!(!shown.contains(key), "{shown}");
-        assert!(!shown.contains("REDACTION-PROBE"), "{shown}");
-        assert!(shown.contains("<redacted>"), "{shown}");
-        assert!(shown.contains("65f0000000000000000000a1"), "{shown}");
-        assert!(format!("{:?}", VaultSettings::default()).contains("<unset>"));
-    }
-}
-
-#[cfg(test)]
-mod knowhow_settings_tests {
-    use super::{KnowhowSettings, ModulesSettings};
-
-    /// FR-90 P4-1 — knowhow ships OFF and listed as such, and a file that
-    /// leaves every key out keeps a map for every organization once it is on.
-    #[test]
-    fn knowhow_is_off_until_turned_on() {
-        let m = ModulesSettings::default();
-        assert!(!m.knowhow);
-        assert!(ModulesSettings::DEFAULT_OFF.contains(&"knowhow"));
-        assert!(m.switched_off().contains(&"knowhow"));
-        let absent: KnowhowSettings = toml::from_str("").expect("every key defaults");
-        assert!(absent.tenants.is_empty());
-        let on: ModulesSettings = toml::from_str("knowhow = true").unwrap();
-        assert!(on.knowhow && !on.switched_off().contains(&"knowhow"));
     }
 }
 
