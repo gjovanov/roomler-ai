@@ -41,6 +41,14 @@ records nothing.
 crashed, or leaving at its 3 s runtime-shutdown budget, #2718) must not orphan
 a `roomlerd.exe caps-probe`. It would hold the binary an update replaces, and
 nobody would enforce the 60 s bound on a child hung in a driver.
+⚠️ **The start waits 10 s for the probe, and a session waits for all of it** (#3439). The
+probe runs on its own thread (`caps::start_probing`). Past `FIRST_ANSWER_WAIT` the hello
+carries the interim answer (`encoder-cells` code `probing`), and the first answer is announced
+the moment it lands (`caps::news`). The signalling loop reads `caps::answer_now()`, never
+`detect()`: a `detect()` there blocks a runtime thread on the probe's lock, which is a pump stall.
+A session request that comes before the first answer is held in its connection
+(`held_requests`) and is never served from the interim answer, which would open Media
+Foundation in the daemon before any child had proved it.
 ⚠️ **A child told to die may not go, and its pipe may not end** (#3273). A child
 stuck in a kernel call outlives the kill, and whatever it started can hold its
 stdout after it has gone. `child::wait_for_child` waits for neither past `TIMEOUT` +

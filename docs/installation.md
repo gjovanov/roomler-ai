@@ -1022,6 +1022,47 @@ change has its own rule here: an entry the installer writes itself goes into
 `INSTALLER_OWNED` or is written after the restore, because the restore puts a
 carried entry over any entry of the same name (`carry.rs:190`).
 
+### What the SYSTEM worker's console carries (#3438)
+
+```mermaid
+flowchart LR
+    H["roomlerd service-run<br/>the SCM's host, session 0"] -->|"CREATE_NO_WINDOW<br/>no standard handles"| W["roomlerd run<br/>the SystemContext worker"]
+    W -.->|"stdio: a console with no window"| C["its own conhost.exe<br/>Normal priority, read by nobody"]
+    W -->|"tracing"| L[("roomlerd.log.YYYY-MM-DD<br/>in service-logs")]
+    W -->|"stderr: same file<br/>(capped per day)"| L
+```
+
+The service host starts the SystemContext worker with `CREATE_NO_WINDOW` and passes it
+no standard handles (`agents/roomlerd/src/win_service/supervisor.rs:331`). So the
+worker's stdout and stderr are a console with no window, served by a `conhost.exe` of its
+own at Normal priority, and nobody reads it. Until #3438 every log line went there first.
+The console layer sat ahead of the file layer, so the file got a line only once the
+console write had returned, and the thread that logged it waited too. On a host whose
+CPUs belong to higher-priority work, that conhost runs only now and then. Measured on a
+4-vCPU guest under eight High-priority spinners, with the daemon raised to High and its
+conhost left at Normal, the exit-DNS purge's 10 s bound logged its warning 40.1 s and
+46.0 s after the purge began. With the conhost raised too, 10.28 s.
+
+| What the worker writes | Since #3438 | Why |
+|---|---|---|
+| tracing | The rolling log only (`crates/agent-core/src/logging.rs:221`) | The file has every line, and a console write waits for its conhost |
+| stderr | The rolling log, the same dated file tracing writes, from the end of `init` (`:245`); `NUL` past 256 MiB in a day, as for the per-user daemon (#3292) | The watchdog's last words (`say_on_stderr`), a panic, a stack overflow and FFmpeg print only there |
+| stdout, other than tracing | The console, as before | Only tracing's lines were measured waiting there |
+
+The rule asks two things (`console_nobody_reads`, `crates/agent-core/src/logging.rs:262`):
+the process logs for a service role, and its stdout is a console that has no window. A
+verb a person runs, in a terminal or over `roomler ssh`, has no service role and keeps its
+console lines. The service host and netd have no console as their stdio, so they are
+unchanged. With no usable log directory the console keeps its lines, since no file holds
+them. The worker says so once at its start: `logging: this console has no window, so
+every line goes to the log file, stderr's too (#3438)`.
+
+`a_console_with_no_window_gets_no_line_and_stderr_reaches_the_log`
+(`crates/agent-core/src/logging.rs:1490`) pins it. It runs its own test binary again with
+`CREATE_NO_WINDOW`, hands the child that console as its stdout and stderr, and reads the
+console's text back; a control line proves the console is read at all. It runs in the
+Windows lane's `logging::tests::stderr_capture` step.
+
 ## Linux
 
 ```bash
