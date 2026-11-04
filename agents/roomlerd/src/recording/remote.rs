@@ -485,11 +485,20 @@ pub fn session_ended(session_id: ObjectId) {
     }
 }
 
-/// #3451 — the signalling loop is replacing `session_id`'s peer (a re-offer
-/// for a session it has a peer for). Said BEFORE the old peer closes: that
-/// peer's `record` channel ending is then not the session's end. The session
-/// goes on under the new peer, and a recorder launching for it carries on,
-/// for the new peer's channel to pick up.
+/// #3451 — the signalling loop is replacing `session_id`'s peer with one that
+/// carries the recording (a re-offer whose grant holds RECORD and whose record
+/// context is set). Said BEFORE the old peer closes: that peer's `record`
+/// channel ending is then not the session's end. The session goes on under
+/// the new peer, and a recorder launching for it carries on, for the new
+/// peer's channel to pick up.
+///
+/// ⚠️ Never for a peer without the recording (#3468, from review). The hub
+/// forwards one offer per session, and a peer built from a second one gets
+/// the default grant and no record context: nothing on it picks the recording
+/// up, so the old channel's end IS the recording's end. Said for it, a
+/// recording launching there waited in the grace past the host's Disconnect.
+/// The loop's check is `signaling::reoffer_carries_record`, always `false`
+/// today.
 pub fn peer_replaced(session_id: ObjectId) {
     for h in handlers_of(session_id) {
         h.replaced.store(true, Ordering::Release);
@@ -1384,10 +1393,13 @@ impl Handler {
                 // session's follower reports it like any stop it asked for.
                 //
                 // ⚠️ The SESSION's end, not its channel's (#3451): the loop's
-                // word, or the channel gone with no re-offer behind it. A
-                // re-offer replaces the channel while the session goes on, and
-                // the recording carries on under the new one: the follower
-                // hands it on, as for any drop.
+                // word, or the channel gone with no replacement behind it. Only
+                // a re-offer whose new peer carries the recording replaces the
+                // channel (`peer_replaced`): the recording then carries on under
+                // the new one, its follower handing it on as for any drop. The
+                // hub forwards one offer per session, and a peer built from a
+                // second one carries no RECORD, so today every channel end here
+                // is the session's end (#3468, from review).
                 //
                 // `ending` is set before the mark comes off, and a detach reads
                 // both under the slot's lock: it came before and was refused,
@@ -1397,6 +1409,23 @@ impl Handler {
                 let over = self.over.load(Ordering::Acquire)
                     || (channel_gone(&self.dc) && !self.replaced.load(Ordering::Acquire));
                 let stop = over && !self.ending.swap(true, Ordering::AcqRel);
+                // Also before the mark comes off (#3468, from review): what a
+                // detach builds the grace's record from, and the start's report.
+                // A detach right after the mark read an empty id and a stale
+                // `unattended: false`, and the grace then never stopped an
+                // unattended recording when someone signed in.
+                if let Ok(mut c) = self.current.lock() {
+                    *c = Some(id.to_string());
+                }
+                self.unattended.store(unattended, Ordering::Release);
+                self.report(
+                    RecordingActivityKind::Started,
+                    name.clone(),
+                    None,
+                    None,
+                    None,
+                );
+                hold(&self);
                 drop(launch);
                 if stop {
                     info!(session = %sid, "the session ended while its recorder launched — stopping it");
@@ -1406,23 +1435,11 @@ impl Handler {
                         }
                     });
                 }
-                if let Ok(mut c) = self.current.lock() {
-                    *c = Some(id.to_string());
-                }
-                self.unattended.store(unattended, Ordering::Release);
                 let mut s = StateMsg::new(id, "recording");
                 s.name = name.clone();
                 s.audio = state.system_audio;
                 s.unattended = unattended;
                 send(&self.dc, &s).await;
-                self.report(
-                    RecordingActivityKind::Started,
-                    name.clone(),
-                    None,
-                    None,
-                    None,
-                );
-                hold(&self);
                 tokio::spawn(
                     self.clone()
                         .follow(id.to_string(), unattended, name, speaker),

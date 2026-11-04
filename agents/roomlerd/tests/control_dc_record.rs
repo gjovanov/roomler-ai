@@ -250,6 +250,21 @@ fn a_recording_that_ends_as_its_session_ends_is_reported_once() -> Result<()> {
     rt().block_on(a_recording_that_ends_as_its_session_ends_is_reported_once_cell())
 }
 
+#[test]
+fn a_reoffer_that_cannot_carry_the_recording_ends_it() -> Result<()> {
+    rt().block_on(a_reoffer_that_cannot_carry_the_recording_ends_it_cell())
+}
+
+#[test]
+fn a_recorder_whose_channel_went_as_it_launched_stops() -> Result<()> {
+    rt().block_on(a_recorder_whose_channel_went_as_it_launched_stops_cell())
+}
+
+#[test]
+fn a_reoffer_and_the_sessions_end_in_one_launch_stop_it() -> Result<()> {
+    rt().block_on(a_reoffer_and_the_sessions_end_in_one_launch_stop_it_cell())
+}
+
 /// The owner's two gates, as a local `ConfigSet` would set them.
 fn gates(enabled: bool, audio: bool) {
     let mut cfg = roomler_node_core::config::test_fixture();
@@ -481,11 +496,18 @@ impl Rig {
     }
 
     /// P3b-3 — the signalling loop replaces this session's peer, as a
-    /// re-offer for a session it has a peer for does (`ServerMsg::SdpOffer`):
-    /// it says so (#3451), then closes the old peer, and the session goes on,
-    /// so nothing hides it from the banner.
-    async fn reoffer(&self) {
-        remote::peer_replaced(self.session_id);
+    /// re-offer for a session it has a peer for does (`ServerMsg::SdpOffer`),
+    /// then closes the old peer, and the session goes on, so nothing hides it
+    /// from the banner. `carries`: the new peer carries the recording (RECORD
+    /// and a record context), and the loop says so first (#3451). Today it
+    /// never does: the hub forwards one offer per session, and a peer built
+    /// from a second one has neither (#3468). A cell that passes `true` tests
+    /// the handler for a hub that would send both again: it gives the new
+    /// channel a full record context itself.
+    async fn reoffer(&self, carries: bool) {
+        if carries {
+            remote::peer_replaced(self.session_id);
+        }
         let _ = self.pcs.1.close().await;
         let _ = self.pcs.0.close().await;
     }
@@ -2382,7 +2404,7 @@ async fn a_reoffer_on_the_same_session_keeps_its_banner_cell() -> Result<()> {
     let name = v["name"].as_str().unwrap().to_string();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    a.reoffer().await;
+    a.reoffer(true).await;
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // The session is listed already.
@@ -2450,7 +2472,7 @@ async fn a_reoffer_while_the_recorder_launches_keeps_the_recording_cell() -> Res
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
     let in_the_launch = launching && {
-        a.reoffer().await;
+        a.reoffer(true).await;
         !s.manager.state().active
     };
     let mut a_kinds = Vec::new();
@@ -2588,6 +2610,164 @@ async fn a_recording_that_ends_as_its_session_ends_is_reported_once_cell() -> Re
          stopped {stopped:?} after the start)"
     );
     assert!(banner_down, "the banner outlived the recording");
+    Ok(())
+}
+
+/// #3468, from review — a re-offer whose new peer cannot carry the recording
+/// ends it. The hub forwards one offer per session (`admit_offer`), so only an
+/// older or hostile server sends a second one, and the peer the loop builds
+/// from it gets the default grant, without RECORD, and no record context:
+/// nothing on it can pick the recording up. Its old channel's end is then the
+/// session's end for the recording, as for any channel gone during the launch:
+/// the start stops it `session_ended`, and the controller's next session finds
+/// nothing (red when the old channel's end reads as a replacement: the
+/// recording waits in the grace, the host's Disconnect reaches only the old,
+/// ended handler, and the next session picks it up).
+async fn a_reoffer_that_cannot_carry_the_recording_ends_it_cell() -> Result<()> {
+    ended_in_the_launch(InTheLaunch::ReofferWithoutIt).await
+}
+
+/// #3468, from review — the channel half of the start's last look: a channel
+/// gone while the recorder launches, with nothing behind it (the network
+/// dropped, no word from the loop), stops the recording `session_ended`, as the
+/// loop's word does in the L3 cell (red with the look cut to the loop's word:
+/// the recording waits in the grace and the next session picks it up).
+async fn a_recorder_whose_channel_went_as_it_launched_stops_cell() -> Result<()> {
+    ended_in_the_launch(InTheLaunch::ChannelGone).await
+}
+
+/// #3468, from review — a re-offer that would carry the recording, and the
+/// session's end in the same launch: the end wins, and the recording stops
+/// `session_ended` (red when the replacement hides the loop's word).
+async fn a_reoffer_and_the_sessions_end_in_one_launch_stop_it_cell() -> Result<()> {
+    ended_in_the_launch(InTheLaunch::ReofferThenEnd).await
+}
+
+/// What ends a session while its recorder launches, in the cells above.
+#[derive(Clone, Copy)]
+enum InTheLaunch {
+    /// A second offer: the old peer replaced by one with no RECORD.
+    ReofferWithoutIt,
+    /// The channel goes, and the loop says nothing.
+    ChannelGone,
+    /// A re-offer that would carry the recording, then the loop's word.
+    ReofferThenEnd,
+}
+
+/// The recorder caught in its launch (as in the L3 cell), `end` there, then
+/// the host's Disconnect and the controller's next session: it finds nothing,
+/// and the recording stopped `session_ended`, reported once on its session.
+async fn ended_in_the_launch(end: InTheLaunch) -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    let before = mp4s(&s.out);
+    let (device, _kill) = Device::new();
+    let user = ObjectId::new();
+    let on_device = || Opts {
+        device: Some(device.clone()),
+        controller: Some(user),
+        ..Default::default()
+    };
+    let mut a = rig(on_device()).await?;
+    a.send(json!({"t": "rc:record.start", "id": "h1"})).await?;
+    // Spawned, not recording yet, as in the L3 cell.
+    let deadline = tokio::time::Instant::now() + START;
+    let launching = loop {
+        let st = s.manager.state();
+        if st.active || tokio::time::Instant::now() >= deadline {
+            break false;
+        }
+        if st.remote_controller.is_some() {
+            break true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let in_the_launch = launching && {
+        match end {
+            InTheLaunch::ReofferWithoutIt => a.reoffer(false).await,
+            InTheLaunch::ChannelGone => {
+                let _ = a.pcs.1.close().await;
+                let _ = a.pcs.0.close().await;
+            }
+            InTheLaunch::ReofferThenEnd => {
+                a.reoffer(true).await;
+                remote::session_ended(a.session_id);
+            }
+        }
+        !s.manager.state().active
+    };
+    let mut a_kinds = Vec::new();
+    let mut picked = Value::Null;
+    let mut b_kinds = Vec::new();
+    if in_the_launch {
+        a_kinds = reports_until(&mut a, RecordingActivityKind::Started, START).await;
+        // The old channel's end is seen (its watch looks every 500 ms), so
+        // the host's Disconnect reaches only an ended handler.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        // The person at the device sends the controller away.
+        remote::host_ended(a.session_id);
+        a.indicator.hide_session(a.session_id.to_hex());
+        // The controller comes back on a new session.
+        let mut b = rig(on_device()).await?;
+        b.send(json!({"t": "rc:record.status"})).await?;
+        picked = b.state(START).await?;
+        b_kinds = b.reports().into_iter().map(|(k, _, _)| k).collect();
+        b.drop_session().await?;
+    }
+    let deadline = tokio::time::Instant::now() + STOP;
+    while s.manager.state().active && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let st = s.manager.state();
+    // `reports` drains: what the first look took is not seen again.
+    if !a_kinds
+        .iter()
+        .any(|(k, _)| *k == RecordingActivityKind::Stopped)
+    {
+        a_kinds.extend(
+            reports_until(
+                &mut a,
+                RecordingActivityKind::Stopped,
+                Duration::from_secs(5),
+            )
+            .await,
+        );
+    }
+    // Whatever happened, the next cell starts from an idle recorder and no
+    // stray file.
+    idle(s).await;
+    for f in mp4s(&s.out).into_iter().filter(|f| !before.contains(f)) {
+        let _ = std::fs::remove_file(Sidecar::path_for(&f));
+        let _ = std::fs::remove_file(&f);
+    }
+    a.drop_session().await?;
+    assert!(
+        launching,
+        "the recorder was never seen launching: this cell proves nothing"
+    );
+    assert!(
+        in_the_launch,
+        "the recorder started before the re-offer was in: this cell proves nothing"
+    );
+    assert_eq!(
+        picked["state"], "idle",
+        "a recording outlived its session's end in the launch, and the host's Disconnect: {picked}"
+    );
+    assert!(b_kinds.is_empty(), "{b_kinds:?}");
+    assert!(!st.active, "the recording ran on");
+    assert_eq!(
+        st.last.as_ref().map(|l| l.reason.as_str()),
+        Some("session_ended")
+    );
+    assert_eq!(
+        a_kinds,
+        vec![
+            (RecordingActivityKind::Started, None),
+            (RecordingActivityKind::Stopped, Some("session_ended".into())),
+        ]
+    );
     Ok(())
 }
 
