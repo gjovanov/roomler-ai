@@ -305,6 +305,11 @@ pub enum Companion {
 impl Companion {
     /// Is the companion up to show the question? [`Self::System`] waits for
     /// a start at most [`crate::signaling::COMPANION_START_BUDGET`].
+    ///
+    /// Compiled where something asks through it: a remote recording, and an
+    /// SSH session. Built without either, it is dead code, and every
+    /// `-D warnings` lane on such a build fails.
+    #[cfg(any(feature = "recording", feature = "ssh-server"))]
     pub(crate) async fn up(self) -> bool {
         match self {
             Self::System => {

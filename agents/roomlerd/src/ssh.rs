@@ -2288,18 +2288,23 @@ mod sshd {
         what: &'static str,
     ) -> Result<(), String> {
         let timeout = crate::consent::DEFAULT_PROMPT_TIMEOUT;
-        let _ = handle
-            .extended_data(
-                channel,
-                1,
-                format!(
-                    "roomler-ssh: waiting up to {}s for approval at the device…\r\n",
-                    timeout.as_secs()
-                )
-                .into_bytes(),
+        let (asked, joined) = question(asker, caller, grant, what, timeout);
+        // A channel that joins a standing question waits for what is left of
+        // that question's window, not for a window of its own.
+        let note = if joined {
+            format!(
+                "roomler-ssh: this is being asked at the device already; waiting up to the rest \
+                 of its {}s for that answer…\r\n",
+                timeout.as_secs()
             )
-            .await;
-        question(asker, caller, grant, what, timeout).await
+        } else {
+            format!(
+                "roomler-ssh: waiting up to {}s for approval at the device…\r\n",
+                timeout.as_secs()
+            )
+        };
+        let _ = handle.extended_data(channel, 1, note.into_bytes()).await;
+        asked.await
     }
 
     /// A question to the person at the device, as every channel waiting on it
@@ -2309,8 +2314,9 @@ mod sshd {
     /// What a question is about: its grant, and the activity it names.
     type Topic = (String, &'static str);
 
-    /// A standing question, held weakly, with the turn it was asked on.
-    type Standing = (u64, futures::future::WeakShared<Asked>);
+    /// A standing question, held weakly, with the turn it was asked on and
+    /// the id it is asked under.
+    type Standing = (u64, String, futures::future::WeakShared<Asked>);
 
     /// The questions standing, by what each is about.
     static ASKING: std::sync::Mutex<std::collections::BTreeMap<Topic, Standing>> =
@@ -2342,13 +2348,16 @@ mod sshd {
     /// channel waiting on it goes. A channel that asks in between the answer
     /// and that moment takes the answer: the same caller asked about the same
     /// activity, so the person could not have told the two channels apart.
+    ///
+    /// The second value says whether this channel joined a question that was
+    /// standing already.
     fn question(
         asker: &Asker,
         caller: &str,
         grant: &str,
         what: &'static str,
         timeout: Duration,
-    ) -> futures::future::Shared<Asked> {
+    ) -> (futures::future::Shared<Asked>, bool) {
         use futures::FutureExt;
         static TURN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -2356,9 +2365,12 @@ mod sshd {
         let mut asking = ASKING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(standing) = asking.get(&key).and_then(|(_, q)| q.upgrade()) {
-            info!(%caller, %grant, what, "ssh: this is asked already — waiting on that question");
-            return standing;
+        if let Some((id, standing)) = asking
+            .get(&key)
+            .and_then(|(_, id, q)| q.upgrade().map(|q| (id.clone(), q)))
+        {
+            info!(%caller, %grant, question = %id, what, "ssh: this is asked already — waiting on that question");
+            return (standing, true);
         }
         let turn = TURN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = bson::oid::ObjectId::new().to_hex();
@@ -2367,6 +2379,7 @@ mod sshd {
             key: key.clone(),
             turn,
         };
+        let asked_as = id.clone();
         let (asker, caller, grant) = (asker.clone(), caller.to_string(), grant.to_string());
         let asked = async move {
             let verdict = ask(&asker, &caller, &grant, &id, what, timeout).await;
@@ -2377,8 +2390,8 @@ mod sshd {
         .boxed()
         .shared();
         let weak = asked.downgrade().expect("a question not yet polled");
-        asking.insert(key, (turn, weak));
-        asked
+        asking.insert(key, (turn, asked_as, weak));
+        (asked, false)
     }
 
     /// Takes its question off [`ASKING`]: once it is answered, or with the
@@ -2396,7 +2409,7 @@ mod sshd {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if asking
                 .get(&self.key)
-                .is_some_and(|(turn, _)| *turn == self.turn)
+                .is_some_and(|(turn, _, _)| *turn == self.turn)
             {
                 asking.remove(&self.key);
             }
@@ -2417,7 +2430,19 @@ mod sshd {
                 broker,
                 indicator,
                 companion,
-            } => ask_here(broker, indicator, *companion, caller, id, what, timeout).await,
+            } => {
+                ask_here(
+                    broker,
+                    indicator,
+                    *companion,
+                    caller,
+                    Some(grant),
+                    id,
+                    what,
+                    timeout,
+                )
+                .await
+            }
             Asker::Worker(relay) => {
                 let verdict = relay.ask(id, caller, what, timeout).await;
                 match &verdict {
@@ -2438,12 +2463,16 @@ mod sshd {
     /// Ask the person at this device from THIS process: the native panel,
     /// the desktop companion, the CLI sentinel. `Err` is what the caller's
     /// terminal is told. FR-105 — also how a worker answers the question its
-    /// SYSTEM service relays. `sentinel` is the question's own id (#3442).
+    /// SYSTEM service relays. `sentinel` is the question's own id (#3442),
+    /// and `grant` what it is about, for the log: `None` where a worker asks
+    /// for its service, whose own line names the grant.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn ask_here(
         broker: &crate::consent::ConsentBroker,
         indicator: &crate::indicator::ViewerIndicator,
         companion: crate::companion::Companion,
         caller: &str,
+        grant: Option<&str>,
         sentinel: &str,
         what: &str,
         timeout: std::time::Duration,
@@ -2530,11 +2559,14 @@ mod sshd {
         // The single convergence point: answered, timed out, or resolved from
         // the CLI — the panel comes down here regardless of who decided.
         indicator.hide_prompt(sentinel);
+        // The grant beside the question's id: a channel that joined the
+        // question logs that id, and is matched to this answer by it.
+        let grant = grant.unwrap_or("-");
         if decision.granted() {
-            info!(%caller, %sentinel, "ssh: operator approved the session");
+            info!(%caller, %grant, %sentinel, "ssh: operator approved the session");
             return Ok(());
         }
-        warn!(%caller, %sentinel, ?decision, have_surface, "ssh: operator did not approve the session");
+        warn!(%caller, %grant, %sentinel, ?decision, have_surface, "ssh: operator did not approve the session");
         Err(match decision {
             crate::consent::Decision::Timeout if !have_surface => {
                 "nobody could be asked at this device — it has no prompt surface (no one at its \
@@ -3910,8 +3942,9 @@ mod tests {
         )
     }
 
-    /// Returns the grant id on success — it doubles as the consent sentinel,
-    /// which the operator-approval tests need to answer the prompt.
+    /// Returns the grant id on success. A question asked under the grant has
+    /// an id of its own (#3442): the operator-approval tests answer it under
+    /// the id [`questions_up`] reads off the broker, as every surface does.
     fn grant_for_with_consent(
         line: &str,
         ttl_ms: u64,
@@ -4575,6 +4608,48 @@ mod tests {
     /// although nobody had said no.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_commands_asking_at_once_share_one_question() {
+        let [first, second] = two_commands_one_answer(true, 86).await;
+        let (out, err, exit) = first;
+        assert!(
+            out.contains("first-ran"),
+            "the first command: stdout {out:?}, stderr {err:?}"
+        );
+        assert_eq!(exit, Some(0));
+        let (out, err, exit) = second;
+        assert!(
+            out.contains("second-ran"),
+            "the second command: stdout {out:?}, stderr {err:?}"
+        );
+        assert_eq!(exit, Some(0));
+    }
+
+    /// #3442 — one No reaches every channel waiting on the question: both
+    /// commands are refused, each told why, and neither runs. (A timeout
+    /// reaches them the same way, through the same shared answer, but the
+    /// window is the 30 s default with no seam to shorten it, so no test
+    /// waits it out.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_no_refuses_every_command_waiting_on_the_question() {
+        for (n, (out, err, exit)) in two_commands_one_answer(false, 88)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                !out.contains("-ran"),
+                "command {n} ran despite the No: stdout {out:?}"
+            );
+            assert!(
+                err.contains("denied"),
+                "command {n} must be told why it was refused, got stderr {err:?}"
+            );
+            assert_eq!(exit, Some(1), "command {n}");
+        }
+    }
+
+    /// Two commands of one session that ask at once, the second while the
+    /// first one's question stands, and ONE answer to the one question.
+    async fn two_commands_one_answer(allow: bool, key_seed: u8) -> [Said; 2] {
         use roomler_ai_remote_control::models::ConsentMode;
 
         let _lock = grant_test().await;
@@ -4583,7 +4658,7 @@ mod tests {
             .acquire_many(2)
             .await
             .expect("the slot semaphore is never closed");
-        let (key, line) = client_key(86);
+        let (key, line) = client_key(key_seed);
         let (addr, broker) = serve_one_with(&cfg_with(Vec::new())).await;
         grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
         let session = connect(addr, key).await;
@@ -4600,22 +4675,10 @@ mod tests {
         let up = questions_up(&broker);
         assert_eq!(up.len(), 1, "one question for both commands: {up:?}");
         assert!(
-            broker.record_decision(&up[0], true),
+            broker.record_decision(&up[0], allow),
             "the question was not asking"
         );
-
-        let (out, err, exit) = first.done.await.unwrap();
-        assert!(
-            out.contains("first-ran"),
-            "the first command: stdout {out:?}, stderr {err:?}"
-        );
-        assert_eq!(exit, Some(0));
-        let (out, err, exit) = second.done.await.unwrap();
-        assert!(
-            out.contains("second-ran"),
-            "the second command: stdout {out:?}, stderr {err:?}"
-        );
-        assert_eq!(exit, Some(0));
+        [first.done.await.unwrap(), second.done.await.unwrap()]
     }
 
     /// #3442 — a command and a shell of one session that ask at once are two

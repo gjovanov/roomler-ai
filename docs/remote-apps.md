@@ -136,7 +136,7 @@ Four rules the session arm enforces, each paid for somewhere:
   where an Xvfb the daemon owns could not (`linux.rs:310`).
 
 The same `loginctl` walk serves FR-27's consent companion and FR-45's capture
-helper (`agents/roomlerd/src/companion.rs:1050`) — one copy on purpose, because
+helper (`agents/roomlerd/src/companion.rs:1055`) — one copy on purpose, because
 a compositor that reports its session differently should break all three in
 the same place.
 

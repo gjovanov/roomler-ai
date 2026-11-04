@@ -958,6 +958,7 @@ async fn answer_here(ask: ConsentAsk, asker: &crate::ssh::Asker) -> ConsentAnswe
                 indicator,
                 *companion,
                 &clean_reason(&ask.caller),
+                None,
                 &ask.sentinel,
                 &clean_reason(&ask.what),
                 crate::consent::DEFAULT_PROMPT_TIMEOUT,
