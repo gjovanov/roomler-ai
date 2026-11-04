@@ -83,7 +83,7 @@ sequenceDiagram
 | the opt-out, `/etc/roomler/disable-auto-update` | reused | the helper's `OPT_OUT` `:3527-3534` (shared by macOS and Linux) |
 | the wake file: content ignored, never followed through a symlink | generalised | `MACOS_UPDATE_TRIGGER` `:3028`, `LINUX_UPDATE_TRIGGER` `:3033`, `queue_update_check` / `queue_update_check_at` `:3248-3267` (was `macos_queue_update_check`) |
 | `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`app.rs:1760-1788`) |
-| `roomler-update.{service,timer,path}` | new (P1) | shipped in the `.deb` (`agents/roomlerd/Cargo.toml` assets `:848-887`) and the tarball (`scripts/stage-linux-tarball.sh:55-58`, `TARBALL_INSTALL_IF_ABSENT` `updater.rs:1917-1927`) |
+| `roomler-update.{service,timer,path}` | new (P1) | shipped in the `.deb` (`agents/roomlerd/Cargo.toml` assets `:779-818`) and the tarball (`scripts/stage-linux-tarball.sh:55-58`, `TARBALL_INSTALL_IF_ABSENT` `updater.rs:1917-1927`) |
 | the download's private staging dir (mkdtemp, 0755, `O_EXCL` write) — the security review's finding 1 | new | `stage_dir` / `write_installer` / `discard_staging` (`updater.rs`) |
 | the run-spacing gate — launchd's `ThrottleInterval` twin, the security review's finding 2 | new | `UPDATE_HELPER_MIN_GAP` / `helper_gate_wait` / `stamp_helper_gate` (`updater.rs`) |
 | consuming the wake: a symlink unlinked NOT followed, a planted directory moved aside into a fresh root-owned dir | new | `consume_wake` (`updater.rs`) |
@@ -106,8 +106,8 @@ longer depends on how the package arrived.
 ### 3.2 The per-user daemon wakes the helper instead of installing (P2a, as built)
 
 `run_periodic` forks once, at the daemon's start (`updater.rs:2724-2769`). macOS takes `forward_triggers` (the
-shared successor of `macos_forward_triggers`, `:3334-3416`) as before. Linux asks a pure
-`decide_update_owner(euid, kill switch, enable link)` (`:3220-3238`):
+shared successor of `macos_forward_triggers`, `:3146-3220`) as before. Linux asks a pure
+`decide_update_owner(euid, kill switch, enable link)` (`:3032-3050`):
 
 | daemon | `ROOMLERD_UPDATE_HELPER` | helper enabled | owner |
 |---|---|---|---|

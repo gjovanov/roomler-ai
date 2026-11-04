@@ -179,8 +179,8 @@ and never outliving the daemon (FR-97 P0e).
 | The standalone tunnel client and the wizard on Linux arm64 | — | ✅ from 0.4.149 (FR-97 P7b): the wizard with the agent release, the tunnel client from tunnel-v0.4.149 (its aarch64 `.deb` and tarball run on real arm64, 16 KiB pages included). Before it, x86_64 builds only, and `install.sh --role tunnel` handed an arm64 host the x86_64 CLI; the served script picks the aarch64 build since the 2026-10-21 promote (field-verified on real arm64, FR-97 §8) | — | `.github/workflows/release-tunnel.yml:215`, `.github/workflows/release-setup.yml:298`; the proxy's `linux-aarch64` (`crates/modules/fleet/src/tunnel_release.rs:194`) |
 
 Release feature sets per OS, which decide what ships: Linux x86_64
-`.github/workflows/release-agent.yml:552`, Linux arm64 `:1185`, Windows x64 `:1717`, macOS arm64
-`:2657`. A feature that compiles but is not in an OS's set does not ship there.
+`.github/workflows/release-agent.yml:552`, Linux arm64 `:1185`, Windows x64 `:1714`, macOS arm64
+`:2654`. A feature that compiles but is not in an OS's set does not ship there.
 
 ## 8. Every ⛔, and why
 

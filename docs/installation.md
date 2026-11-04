@@ -423,8 +423,8 @@ question; two moved to `read_if_present`.
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
 `crates/agent-core/src/config.rs:2539`, `:2561`), at the clean-run promotion
-(`record_clean_run_at`, `:2626`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4592`). Each save
+(`record_clean_run_at`, `:2423`), at every `ConfigSet`, and at enrollment. The daemon, the
+desktop app and the setup wizard all write it through `config::save` (`:4406`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -870,8 +870,8 @@ sequenceDiagram
 **Auto-updates and upgrades** (the open question in #3115). The updater does
 not stop the service before it runs msiexec. `spawn_installer_with_watch`
 (`agents/roomlerd/src/updater.rs:1730`) launches `msiexec /i … /qn` elevated
-(`:2236`, `:2636`) while the service runs; the worker that launched it exits 0,
-and its host stays up (`:593`). Measured on a vmtest Win11 cell, released code,
+(`:2051`, `:2451`) while the service runs; the worker that launched it exits 0,
+and its host stays up (`:409`). Measured on a vmtest Win11 cell, released code,
 with each stop held to the field's 7.8 s:
 
 | Run | The first Stop came from | Released code |

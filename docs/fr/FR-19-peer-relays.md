@@ -94,7 +94,7 @@ head-of-line-blocking layer *below* the SCTP one FR-17 is about, on top of the 5
    (`crates/tunnel-core/src/overlay/netcheck.rs:205`). Marked as such because this spec's
    own §8 rule is that absence of measurement is never evidence of absence of capability.
 3. **A high UDP port is a real risk** on the corp-managed hosts, and the codebase already
-   says so: `crates/remote_control/src/signaling.rs:5867` — *"a corp egress that whitelists
+   says so: `crates/remote_control/src/signaling.rs:3958` — *"a corp egress that whitelists
    STUN:3478 still drops the ~10-13k relay band."*
 
 **NOT established — the port choice is a hypothesis, not a finding.** ⚠️ An earlier draft
@@ -198,9 +198,9 @@ two bound `addr:port`s selected by VNI.
 
 **This is the one change that can break the fleet silently. It ships first, alone, as P0.**
 
-`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:3348`) documents itself as safe
+`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:3771`) documents itself as safe
 to extend — *"an unknown/absent value ⇒ the client falls back to its local computation, so
-adding a variant later is forward-compatible"* (`:2015-2017`). **The comment is wrong about
+adding a variant later is forward-compatible"* (`:3755-3757`). **The comment is wrong about
 the "unknown" half and the code does not implement it.** The enum is a plain
 `#[derive(Deserialize)]` with `#[serde(rename_all = "kebab-case")]`, **no `#[serde(other)]`**
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2156`) handles a
@@ -615,7 +615,7 @@ So the design is:
 - **The transport is a fourth `RelayConn` impl.** `Carrier::Relay { conn: Arc<dyn RelayConn>, dst, dead }`
   (`wg.rs:155`) is already fully opaque to the send path, and `Carrier::send` (`wg.rs:410`)
   just calls `conn.send_to(buf, dst)`. DERP plugs in exactly this way — `impl RelayConn for
-  DerpConn` (`transport/derp.rs:276`), `DerpMux::conn_for` (`derp.rs:458`) vending one per
+  DerpConn` (`transport/derp.rs:276`), `DerpMux::conn_for` (`derp.rs:434`) vending one per
   peer off a shared connection — and there are already **three** production impls
   (`DerpConn`, `TurnRelayConn` `transport/relay.rs:348`, `UdpRelayConn` `:491`). An org relay
   is a fourth, plus an `OrgRelayMux` shaped like `DerpMux`.
@@ -713,7 +713,7 @@ Verified against `origin/master`, 2026-08-28.
 | change | file:line |
 |---|---|
 | Relay sub-kind gains `Org` | `crates/tunnel-core/src/overlay/relay_link.rs:158` `RelayKind` |
-| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:276` (`impl RelayConn for DerpConn`) and `derp.rs:458` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
+| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:276` (`impl RelayConn for DerpConn`) and `derp.rs:434` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
 | Client cascade branch | `relay_link.rs:1125` `relay_strategy` |
 | Server verdict | `crates/api/src/ws/overlay.rs:1851` / `:1944` |
 | Mint + ACL gate + rate limit | `overlay.rs:700` `handle_overlay_relay_request` (cross-tenant `:712-724`, ACL `:726-750`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
@@ -731,7 +731,7 @@ Verified against `origin/master`, 2026-08-28.
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:36-38`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3334`),
+(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3108`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 
@@ -997,8 +997,8 @@ COTURN flush on a host serving live conference media.
 Then take mars's relay down and assert re-selection to zeus without a DERP round trip.
 ⚠️ **Not via `roomler config set`.** The first draft claimed that was *"a config change, not
 a service restart"* — false: `config_surface.rs:19` states *"Every key is read at daemon
-startup, so the whole surface is `restart_required = true`"* (hardcoded `:604`, `:618`,
-asserted by `every_key_gets_and_applies` `:3194`), and the CLI's live-apply allowlist is
+startup, so the whole surface is `restart_required = true`"* (hardcoded `:408`, `:422`,
+asserted by `every_key_gets_and_applies` `:2839`), and the CLI's live-apply allowlist is
 exactly `exec_enabled | remote_config_enabled` (`localclient.rs:988`). A bound UDP socket
 does not close on a TOML write, and restarting `roomlerd` on **mars** would kill the host
 driving every `roomler exec` in this plan. **Revoke server-side** (`Agent.peer_relay_policy`

@@ -67,7 +67,7 @@ Every line below was read on `origin/master` at `861d4557`.
    Roomler SSH both prompt through the same broker and write no marker, so an
    `exec_policy` / `SshPolicy` of `prompt` can only be answered by someone who
    greps the daemon log for a request id and runs the CLI within 30 s.
-   — `signaling.rs:5515`, `ssh.rs:2165` vs `git grep write_pending`
+   — `signaling.rs:5424`, `ssh.rs:2165` vs `git grep write_pending`
 5. **`prompt_then_email` is "prompt AND email", with a 300 s on-screen modal.**
    The hub gives every owner-side mode `ASYNC_CONSENT_TIMEOUT` (300 s) and the
    agent uses that as its modal timeout. The doc-comment on
@@ -117,7 +117,7 @@ Every line below was read on `origin/master` at `861d4557`.
 11. **"Being viewed by X + Disconnect" is Windows-only**, gated on
     `all(target_os = "windows", feature = "viewer-indicator")`, with a no-op
     `Inner` on every other OS — and `viewer-indicator` is only in the `full-hw`
-    set, so the Linux and macOS release lines (`release-agent.yml:400, 621, 1922`)
+    set, so the Linux and macOS release lines (`release-agent.yml:400, 621, 1919`)
     build plain `full`. There is also no LocalAPI verb for live RC sessions, so
     no thin client can render a banner or offer a Disconnect.
 

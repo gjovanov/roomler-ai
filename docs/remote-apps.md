@@ -527,7 +527,7 @@ must never write the device's config as a side effect of being run.
 | `agents/roomlerd/src/companion.rs` | `graphical_session` (`:461`) |
 | `agents/roomlerd/src/app.rs` | `apps-probe` (`:4724`) — reads the device config through `read_if_present`, never `load` |
 | `crates/remote_control/src/models.rs` | `AgentCaps.apps` and its known values (`:203`) |
-| `crates/agent-core/src/apps_config.rs` · `config_surface.rs` | the `[virtual_desktop_apps]` shapes (`:21`); the config-surface keys (`:1446`, `:988`) |
+| `crates/agent-core/src/apps_config.rs` · `config_surface.rs` | the `[virtual_desktop_apps]` shapes (`:21`); the config-surface keys (`:1250`, `:792`) |
 | `ui/src/composables/useRemoteControl.ts` | the parsers (`parseAppsListReply` `:1105`, `parseAppsUnavailable` `:1181`), the request path (`:5474`, `refreshApps` `:5512`), the reply arm (`:8515`), the no-reason wording (`:890`) |
 | `ui/src/views/remote/RemoteControl.vue` | the *Remote apps* entry (`:1255`, gate `:3610`) and the dialog (`:1295`) |
 | `ui/src/__tests__/composables/useRemoteControl.spec.ts` | the wire-format locks, including the `missing_tools` test that is red on the pre-P6 parser (`:2184`) |
