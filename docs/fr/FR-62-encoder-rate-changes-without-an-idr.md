@@ -27,19 +27,20 @@
     sits beside a rate move, so none is AC3's RED. But AC3's read has to name every IDR before
     it can call one rate-caused.
   - 🔑 **The carrier line is not a source.** Each of the three came 1–3 s after an agent line
-    `overlay carrier under the nominated pair is not direct`. The line comes from
+    `overlay carrier under the nominated pair is not direct`. The code read here is master's,
+    and none of these paths has changed since 0.4.199, the build that ran. The line comes from
     `overlay_remote_is_relay_tier` (`peer.rs:2273`), a LocalAPI read that changes nothing. The
     FFmpeg DC pump calls it on its transport recheck, every 5 s (`TRANSPORT_RECHECK_INTERVAL`,
-    `peer.rs:2158`; the recheck at `:7606`). The answer goes two places:
+    `peer.rs:2158`; the recheck at `:7661`). The answer goes two places:
     - into `constrained`, which sets the rate ceiling and, on a flip, re-sends `rc:video-info`
-      (`:7617`);
+      (`:7672`);
     - into `FlipTracker` (`encode/rate_profile.rs:81`). It rebuilds the encoder only after two
       consecutive checks disagree with the state the pump was built for, at least 60 s after
       the last rebuild, and only when the frame rate changes. That rebuild logs its own line
-      (`peer.rs:7638`), re-opens the encoder and restarts the counters. Of the four `send_epoch`
-      bumps, only the inline open's (`:8944`) can follow from this path, through that rebuild.
-      The others are a dims swap (`:7451`), a rate swap (`:7529`) and a deferred rebuild
-      (`:9505`).
+      (`peer.rs:7693`), re-opens the encoder and restarts the counters. Of the four `send_epoch`
+      bumps, only the inline open's (`:9010`) can follow from this path, through that rebuild.
+      The others are a dims swap (`:7506`), a rate swap (`:7584`) and a deferred rebuild
+      (`:9571`).
 
     Neither happened: every heartbeat read `constrained=true`, and `idr_count` never restarted.
     The 1–3 s is the line's cadence. The heartbeat's `constrained` is the variable the recheck
@@ -60,17 +61,17 @@
 
     | Source | Site (`peer.rs`) | What shows it |
     |---|---|---|
-    | the opener, and one force per frame while the video DC is not open | `:9734`, `:9740` | `dc_unopen_drops` |
-    | frame 0 of an adopted dims swap or rate swap | `:7422`, `:7526` | `dims_swaps`, `swaps` |
-    | frame 0 of an inline open: a dims change, the force-ignored fallback (`:9092`) or a persisted transport flip (`:7624`) | `:8985` | the counters restart at zero; the fallback warns (`:9099`), the flip logs `:7638` |
-    | the viewer's `rc:keyframe`: a decode backlog, a rebuilt decoder, or the stall probe after 6 s with no media | `:11098` | the viewer's send on its control channel, and `keyframe_requests` on `rc:session.stats`. The agent's own line is `debug!` (`:11100`) |
+    | the opener, and one force per frame while the video DC is not open | `:9800`, `:9806` | `dc_unopen_drops` |
+    | frame 0 of an adopted dims swap or rate swap | `:7477`, `:7581` | `dims_swaps`, `swaps` |
+    | frame 0 of an inline open: a dims change, the force-ignored fallback (`:9158`) or a persisted transport flip (`:7679`) | `:9051` | the counters restart at zero; the fallback warns (`:9165`), the flip logs `:7693` |
+    | the viewer's `rc:keyframe`: a decode backlog, a rebuilt decoder, or the stall probe after 6 s with no media | `:11164` | the viewer's send on its control channel, and `keyframe_requests` on `rc:session.stats`. The agent's own line is `debug!` (`:11166`) |
     | a PLI or FIR on the session's RTP video track | `:843` | `PLI/FIR → forcing keyframe` |
-    | a lock or unlock | `:9042` | `lock_state: transition observed` (`lock_state.rs:471`) |
-    | the idle-settle keyframe | `:8227` | `idle-settle keyframe (motion burst ended)`. On a constrained session it is suppressed while `relay_idr_thrift` is on (the default), and counted in `settle_kf_suppressed` |
-    | a second viewer joining, or its video DC going live | `:9056` | `media_share: joined shared encoder pipeline as follower` (`media_share.rs:750`), then `…re-syncing onto a fresh IDR` (`:825`) |
-    | a second viewer's own `rc:keyframe`, or its queue overflowing | `:9056` | nothing on the reading tab. Its join logs |
-    | a force left unanswered for 4 s | `:9068` | `keyframe force retry engaged`, once per pump |
-    | a drop-burst resync: the send channel filled, so the first frame through forces the next | `:9811`, then `:9802` | `frames_dropped_backpressure` |
+    | a lock or unlock | `:9108` | `lock_state: transition observed` (`lock_state.rs:471`) |
+    | the idle-settle keyframe | `:8293` | `idle-settle keyframe (motion burst ended)`. On a constrained session it is suppressed while `relay_idr_thrift` is on (the default), and counted in `settle_kf_suppressed` |
+    | a second viewer joining, or its video DC going live | `:9122` | `media_share: joined shared encoder pipeline as follower` (`media_share.rs:860`), then `…re-syncing onto a fresh IDR` (`:942`) |
+    | a second viewer's own `rc:keyframe`, or its queue overflowing | `:9122` | nothing on the reading tab. Its join logs |
+    | a force left unanswered for 4 s | `:9134` | `keyframe force retry engaged`, once per pump |
+    | a drop-burst resync: the send channel filled, so the first frame through forces the next | `:9877`, then `:9868` | `frames_dropped_backpressure` |
 
     `invalidation_requested` is read only by the RTP pump (`:3376`), and no keyframe request
     travels over the signalling WS.
@@ -115,7 +116,7 @@
     no config change to be read for AC2/AC3, and flipping the flag off does not produce
     a RED (no IDR per rate step). The read's RED is a **positive control**: a viewer
     resize that moves `dims_swaps` by one must move `idr_count` by exactly one. That
-    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7422`), which
+    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7477`), which
     keeps the encoder's counters. A read that cannot see that IDR cannot vouch for the
     absence of the others.
   - 🔑 **AC3's read, as written, could fail with no rate-caused IDR at all.** Its
@@ -127,20 +128,20 @@
 
     | IDR source | Site (`peer.rs`) | What shows it |
     |---|---|---|
-    | the opener, and one force per frame while the DC is not open yet | `:9734`, `:9740` | `dc_unopen_drops`. Baseline the read after the first heartbeat |
-    | a dims swap | `:7450` | `dims_swaps` |
-    | the viewer's `rc:keyframe`, sent when its decode queue backs up | `:11099` | `keyframe_requests` on `rc:session.stats`, every 30 s. Its log line is `debug!` |
-    | a drop-burst resync: the send channel filled, so the next enqueue forces an IDR | `:9811`, then `:9802` | nothing of its own. `frames_dropped_backpressure` shows the burst |
-    | a lock or unlock | `:9042` | the session's lock state |
-    | a settle keyframe | `:8227` | suppressed on a constrained session (`settle_kf_suppressed`) |
-    | a force unanswered for 4 s | `:9068` | one log line per episode |
+    | the opener, and one force per frame while the DC is not open yet | `:9800`, `:9806` | `dc_unopen_drops`. Baseline the read after the first heartbeat |
+    | a dims swap | `:7505` | `dims_swaps` |
+    | the viewer's `rc:keyframe`, sent when its decode queue backs up | `:11165` | `keyframe_requests` on `rc:session.stats`, every 30 s. Its log line is `debug!` |
+    | a drop-burst resync: the send channel filled, so the next enqueue forces an IDR | `:9877`, then `:9868` | nothing of its own. `frames_dropped_backpressure` shows the burst |
+    | a lock or unlock | `:9108` | the session's lock state |
+    | a settle keyframe | `:8293` | suppressed on a constrained session (`settle_kf_suppressed`) |
+    | a force unanswered for 4 s | `:9134` | one log line per episode |
 
     The drop-burst resync is the one that matters: it is what a congested relay does,
     and it is neither a dims change nor a viewer request. So the read is per window, on
     the heartbeat's cumulative counters: **every Δ`idr_count` must have a Δ`dims_swaps`, a
     Δ`frames_dropped_backpressure`, a `keyframe_requests` tick or a lock edge beside it.
     An unexplained IDR in a window with Δ`rate_moves` > 0 is the RED.** The session must
-    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:8985`)
+    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:9051`)
     builds a new encoder whose counters restart at zero, so a window across one is not
     diffed.
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
@@ -151,7 +152,7 @@
       perfect encoder reads off by the rung's distance.
     - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung
       and move nothing. Δ`rate_moves` marks a real move. The read judges the first
-      complete 2 s heartbeat window (`peer.rs:6936`) after a Δ`rate_moves`, on
+      complete 2 s heartbeat window (`peer.rs:6991`) after a Δ`rate_moves`, on
       Δ`bytes_written` ÷ Δ`frames_encoded`. A window that starts at most 2 s after the
       move and holds the ratio shows the encoder had tracked by then.
     - ≈ 1.0 is a CBR's contract. NVENC is quality-capped VBR and sits under its cap on
