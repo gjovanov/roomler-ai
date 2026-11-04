@@ -58,7 +58,7 @@ and the places where the policy is set say so (§2).
 The policy belongs to the device. A server cannot push it (whether it should is
 an open decision in the spec). It is set in two places, and both carry the
 clamshell sentence from the key's description
-([`config_surface.rs:323`](../crates/agent-core/src/config_surface.rs#L323)):
+([`config_surface.rs:331`](../crates/agent-core/src/config_surface.rs#L331)):
 
 - **The companion's settings row** (Settings → Essentials), which renders the
   description under the control
@@ -111,7 +111,7 @@ sequenceDiagram
 heartbeat as an optional `power`
 ([`signaling.rs:704`](../crates/remote_control/src/signaling.rs#L704)). It is a
 claim by the device, shown and never enforced on. The keeper publishes it before
-anything connects ([`app.rs:4896`](../agents/roomlerd/src/app.rs#L4896)) and
+anything connects ([`app.rs:4895`](../agents/roomlerd/src/app.rs#L4895)) and
 after every pass, with what it actually holds, not what it wanted
 ([`power.rs:319`](../agents/roomlerd/src/power.rs#L319)).
 
@@ -142,9 +142,9 @@ every live control connection its goodbye
 
 The connection's own arm sends the frame, says it has gone out, closes every
 WebRTC peer and tunnel peer, and closes the socket
-([`signaling.rs:2166`](../agents/roomlerd/src/signaling.rs#L2166)). Then the run
+([`signaling.rs:2180`](../agents/roomlerd/src/signaling.rs#L2180)). Then the run
 loop holds every new dial until the wake
-([`signaling.rs:1112`](../agents/roomlerd/src/signaling.rs#L1112),
+([`signaling.rs:1126`](../agents/roomlerd/src/signaling.rs#L1126),
 [`sleep_notice.rs:319`](../agents/roomlerd/src/sleep_notice.rs#L319)
 `hold_while_asleep`). A dial inside the window the OS gave the computer to go to
 sleep would say hello again and erase the reason.

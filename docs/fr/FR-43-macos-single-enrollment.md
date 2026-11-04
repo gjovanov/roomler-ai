@@ -475,7 +475,7 @@ The operator chose on 2026-11-02 (#971): a secondary org's session is delegated 
 
 | What stops one row today | Where | Measured on 0.4.191 |
 |---|---|---|
-| The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `agents/roomlerd/src/signaling.rs:2850` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
+| The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `agents/roomlerd/src/signaling.rs:2967` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
 | `run` refuses to start with no config | `agents/roomlerd/src/app.rs:3806-3811` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
 | Delegation is primary-org only, on purpose | `agents/roomlerd/src/signaling.rs:3519-3527`, `agents/roomlerd/src/app.rs:5217`, `:5401` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes |
 
@@ -516,7 +516,7 @@ flowchart TB
 
 ### P3a — the worker holds no enrollment
 
-**A stand-in for the control plane, in the worker's process.** With `--unenrolled` the worker binds `127.0.0.1:0` and runs a small WS server that answers pings and discards the rest. Its signalling loop dials that instead of a server, so `connect_once` runs as it does everywhere, its `next_delegated` arm included, and the warning in [Order of work](#order-of-work) about the shared session-setup path does not reach this phase. The handshake must carry a secret minted for the process (`agents/roomlerd/src/signaling.rs:1596-1601` sends it as the token, and `agents/roomlerd/src/ws_connect.rs:36` dials an address literal directly), so another local process that dials the port gets a 401 and no socket.
+**A stand-in for the control plane, in the worker's process.** With `--unenrolled` the worker binds `127.0.0.1:0` and runs a small WS server that answers pings and discards the rest. Its signalling loop dials that instead of a server, so `connect_once` runs as it does everywhere, its `next_delegated` arm included, and the warning in [Order of work](#order-of-work) about the shared session-setup path does not reach this phase. The handshake must carry a secret minted for the process (`agents/roomlerd/src/signaling.rs:1660-1665` sends it as the token, and `agents/roomlerd/src/ws_connect.rs:143` dials an address literal directly), so another local process that dials the port gets a 401 and no socket.
 
 Rejected: a `ControlLink` enum over the WS. It looks small at `send_frame` and `ws.next()`, but the receive deadline and the ping arms would each need a detached branch, on the path every platform's sessions take.
 
@@ -524,7 +524,7 @@ Rejected: a `ControlLink` enum over the WS. It looks small at `send_frame` and `
 
 Rejected: a mutual check on the upgrade response. The secret goes out in the request, so whoever answers already holds it, and a real challenge would add a handshake to `connect_once` to guard a state the exit removes.
 
-⚠️ **A session reaches this process through the root's delegation socket and nothing else.** `handle_server_msg` has two callers: the `next_delegated` arm (`signaling.rs:2923`) and the `ws.next()` arm (`:3000`). With `--unenrolled` the second drops every text frame (`OrgCtx::unenrolled`, false in every other process). That gate does not depend on who holds the port. It is the one line this phase adds to `connect_once`. The worker reaches the delegation socket at a path only root can bind (`/var/run/roomler-delegate`, `agents/roomlerd/src/delegate.rs:80-81`). Its other two listeners take no session:
+⚠️ **A session reaches this process through the root's delegation socket and nothing else.** `handle_server_msg` has two callers: the `next_delegated` arm (`signaling.rs:3040`) and the `ws.next()` arm (`:3131`). With `--unenrolled` the second drops every text frame (`OrgCtx::unenrolled`, false in every other process). That gate does not depend on who holds the port. It is the one line this phase adds to `connect_once`. The worker reaches the delegation socket at a path only root can bind (`/var/run/roomler-delegate`, `agents/roomlerd/src/delegate.rs:80-81`). Its other two listeners take no session:
 
 | Listener | What it serves | Why it stays |
 |---|---|---|
@@ -533,18 +533,18 @@ Rejected: a mutual check on the upgrade response. The secret goes out in the req
 
 The WebRTC peers, the SSH server and the relay responder need an offer or an overlay this process no longer has.
 
-**The person's file is never rewritten.** `run_cmd` takes the file and runs on a view of it, `AgentConfig::for_unenrolled_worker`, built right after the load (`agents/roomlerd/src/app.rs:3844`). The startup saves that write the loaded copy (`config::StartupWrites`, from `app.rs:3866`) become no-ops in this mode, and every later writer already reloads the file first. So an unmigrated person's token survives on disk, and the switch stays a real off.
+**The person's file is never rewritten.** `run_cmd` takes the file and runs on a view of it, `AgentConfig::for_unenrolled_worker`, built right after the load (`agents/roomlerd/src/app.rs:3878`). The startup saves that write the loaded copy (`config::StartupWrites`, from `app.rs:3883`) become no-ops in this mode, and every later writer already reloads the file first. So an unmigrated person's token survives on disk, and the switch stays a real off.
 
 | In `run_cmd` | Enrolled worker | `--unenrolled` |
 |---|---|---|
 | No config file (`app.rs:3806`) | bails, the supervisor gives up | writes one with blank identity fields, because `caps`, `record` and `config set` load the file |
-| No secret on stdin (`agents/roomlerd/src/delegate_worker.rs:177`) | warns and keeps serving its own row | exits: with no channel it can serve nothing, and the supervisor's bound applies |
+| No secret on stdin (`agents/roomlerd/src/delegate_worker.rs:181`) | warns and keeps serving its own row | exits: with no channel it can serve nothing, and the supervisor's bound applies |
 | Identity, `[[orgs]]`, `[[tunnel_routes]]`, overlay, SSH, exec, relay, hive, vault | from the file | blank or off in the view: the root holds all of them |
 | Preflight to the server (`app.rs:4209`) | runs | skipped |
-| Crash bookkeeping and rollback (`app.rs:4224-4351`) | runs | skipped. A worker cannot install a package. The supervisor records its crashes on the root's enrollment (`macos_supervisor.rs:1093`) |
+| Crash bookkeeping and rollback (`app.rs:4213-4351`) | runs | skipped. A worker cannot install a package. The supervisor records its crashes on the root's enrollment (`macos_supervisor.rs:1093`) |
 | Updater (`app.rs:4361`, `:5560`) | runs | off: the view sets `auto_update = false`, and the root and its update helper own updates |
 | Crash upload (`app.rs:4561`), log upload (`app.rs:4604`) | on its own token | no token: the supervisor records a crash on the root's enrollment, and the log lines go to the daemon (below) |
-| Self-unenroll on a stop (`app.rs:5741`) | if its row is ephemeral | never: this process is not that row |
+| Self-unenroll on a stop (`app.rs:5740`) | if its row is ephemeral | never: this process is not that row |
 
 **What the person sees.** A worker with no enrollment answers `Status` with the root half's identity and link, not its own blanks, over the person socket it already uses for the network fields (`agents/roomlerd/src/person_socket.rs:269`, `:294`). `connected` comes from the root half only, since the stand-in always reads connected. With no answer from the root half the status reads disconnected and lists no org: the companion opens a row's server in a browser, and a row here would name the stand-in. `network_from` goes, because with one row nothing is lent. `Devices` and `Mesh` go straight to the root half (`person_socket.rs:172`) and never to the worker's own `self_view`, whose row points at the stand-in. The companion's `enrolled` stops meaning "a file exists" (`agents/roomler-desktop/src/commands.rs:88`), which lets the daemon's word fill it in (`:156`), and "Open Roomler" and "View screen" read the server and tenant from the daemon's rows when the person's file has none (`:1425`, `:1522`).
 
@@ -565,11 +565,11 @@ Declared `[[tunnel_routes]]` in a person's file are named by the migration, not 
 
 Under the switch, `run_cmd` gives every org loop the host (`app.rs:5217`, and `:5401` for a join), and these gates ask the host instead of `ctx.is_primary`: the delegation (`signaling.rs:3524-3527`), the session params (`:3878`), the audio offer (`:3703`) and the caps on the hello and the heartbeat (`:1754-1777`, `:2442-2459`).
 
-**Each worker reply goes to the org that asked.** `DelegateHost` holds one outbound today (`agents/roomlerd/src/delegate.rs:439`). It keeps one per enrollment and a bounded `session → enrollment` map, written where a message crosses to the worker and read in `relay_upstream` (`delegate.rs:1046`). A session it does not know goes to the primary, as every reply does today. Signing and sealing need no change: they run per loop on that loop's outbound (`signaling.rs:2547`, `:2561`), so an answer is signed with the key of the org it belongs to.
+**Each worker reply goes to the org that asked.** `DelegateHost` holds one outbound today (`agents/roomlerd/src/delegate.rs:480`). It keeps one per enrollment and a bounded `session → enrollment` map, written where a message crosses to the worker and read in `relay_upstream` (`delegate.rs:1123`). A session it does not know goes to the primary, as every reply does today. Signing and sealing need no change: they run per loop on that loop's outbound (`signaling.rs:2664`, `:2678`), so an answer is signed with the key of the org it belongs to.
 
-**The consent names the org.** The prompt stays the daemon's. `prompt_org` already names the org on a multi-org device (`signaling.rs:3590`, `docs/multi-org.md` §8b), and `asking_org` already reaches the worker's banner (`delegate.rs:205`). This is the same rule Windows and Linux run. The field proof reads the prompt itself, because the macOS native panel is still FR-27's open item.
+**The consent names the org.** The prompt stays the daemon's. `prompt_org` already names the org on a multi-org device (`signaling.rs:3721`, `docs/multi-org.md` §8b), and `asking_org` already reaches the worker's banner (`delegate.rs:246`). This is the same rule Windows and Linux run. The field proof reads the prompt itself, because the macOS native panel is still FR-27's open item.
 
-**The person's floor crosses too.** Today a person's `auto_grant_session = false` binds their own row, through their own broker. The `Request` arm reads the daemon's (`signaling.rs:3773`) and the daemon's `rc_*` floor (`:3785`), so with their row gone a person would silently lose the prompt they asked for, and the app's switch would do nothing. The worker sends its own values at attach (`DelegateFrame::PersonFloor`), and the daemon takes the stricter of the two for every org's session. It can only tighten, so this is not the authority over the root's gates that #2871 left open. A worker from before the frame sends nothing, and the root's values stand.
+**The person's floor crosses too.** Today a person's `auto_grant_session = false` binds their own row, through their own broker. The `Request` arm reads the daemon's (`signaling.rs:3906`) and the daemon's `rc_*` floor (`:3918`), so with their row gone a person would silently lose the prompt they asked for, and the app's switch would do nothing. The worker sends its own values at attach (`DelegateFrame::PersonFloor`), and the daemon takes the stricter of the two for every org's session. It can only tighten, so this is not the authority over the root's gates that #2871 left open. A worker from before the frame sends nothing, and the root's values stand.
 
 ### P3c — a person's one command
 
@@ -587,7 +587,7 @@ Under the switch, `run_cmd` gives every org loop the host (`app.rs:5217`, and `:
 | Verify | Within 60 s: connected, `delegation channel attached`, the row reports `screen-capture` | Restores both files and restarts, then says what it saw |
 | Report | Each retired row's name and id, and where to delete it | |
 
-**The retired row is deleted by a person, through the ordinary route.** `DELETE /api/tenant/{tid}/agent/{id}` (`crates/modules/fleet/src/agent.rs:1315`) is `remove_agent_device` (`crates/modules/fleet/src/removal.rs:43`): the lease released first, then the tombstone, then the kick. That is the order AC12 names. The command cannot do this itself: a device holds no user credential, and `POST /api/agent/self/unenroll` refuses a permanent row on purpose (`agent.rs:558`), so a compromised host cannot erase its own record. Deleting the row is therefore the person's second act, and the Mac works whether or not they have done it yet. A row left behind only reads offline.
+**The retired row is deleted by a person, through the ordinary route.** `DELETE /api/tenant/{tid}/agent/{id}` (`crates/modules/fleet/src/agent.rs:1332`) is `remove_agent_device` (`crates/modules/fleet/src/removal.rs:43`): the lease released first, then the tombstone, then the kick. That is the order AC12 names. The command cannot do this itself: a device holds no user credential, and `POST /api/agent/self/unenroll` refuses a permanent row on purpose (`agent.rs:569`), so a compromised host cannot erase its own record. Deleting the row is therefore the person's second act, and the Mac works whether or not they have done it yet. A row left behind only reads offline.
 
 **The overlay address.** The root's enrollment is untouched, so its row keeps its node and its address. A moved enrollment keeps its row, its key and any address it had, since only the holder of the token changed. A retired row with a node of its own releases it through the delete. Where the only address in an org was on the retired row, the plan says so before anything changes.
 
@@ -604,7 +604,7 @@ Under the switch, `run_cmd` gives every org loop the host (`app.rs:5217`, and `:
 | One daemon per machine | Still one. The worker stays a process of that install, and now holds less |
 | Who holds the TCC grant | The same bundle at the same path, through the same chain (`macos_supervisor.rs:641-700`). The migration touches no bundle, which is what AC5 reads |
 | The hub keys on `agent_id` (`crates/modules/fleet/src/hub.rs:917`) | The worker no longer dials a server, so it can displace nothing |
-| The delegation channel's two gates (`delegate.rs:516-537`) | Unchanged |
+| The delegation channel's two gates (`delegate.rs:591-612`) | Unchanged |
 | The reap's exact match (`macos_supervisor.rs:486`, `:499`) | Matches both command lines, so a worker of either kind is found |
 
 ### What rides what

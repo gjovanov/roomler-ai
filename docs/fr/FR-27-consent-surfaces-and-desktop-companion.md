@@ -33,7 +33,7 @@ Every line below was read on `origin/master` at `861d4557`.
    The agent writes a `.pending` marker and waits; only the companion renders it
    (750 ms LocalAPI poll). Nothing starts the companion, and the daemon never
    checks whether anything can ask. Observable failure: 30 s of nothing, then a
-   deny. — `agents/roomlerd/src/signaling.rs:2250`,
+   deny. — `agents/roomlerd/src/signaling.rs:2264`,
    `agents/roomler-desktop/src/main.rs` (`consent_watch_loop`)
 3. **"Nobody was there" is reported to the controller as "the user denied you".**
    `Decision::Timeout` maps to `granted: false`, and the hub terminates that as
@@ -67,7 +67,7 @@ Every line below was read on `origin/master` at `861d4557`.
    Roomler SSH both prompt through the same broker and write no marker, so an
    `exec_policy` / `SshPolicy` of `prompt` can only be answered by someone who
    greps the daemon log for a request id and runs the CLI within 30 s.
-   — `signaling.rs:3108`, `ssh.rs:2271` vs `git grep write_pending`
+   — `signaling.rs:5606`, `ssh.rs:2271` vs `git grep write_pending`
 5. **`prompt_then_email` is "prompt AND email", with a 300 s on-screen modal.**
    The hub gives every owner-side mode `ASYNC_CONSENT_TIMEOUT` (300 s) and the
    agent uses that as its modal timeout. The doc-comment on
@@ -88,7 +88,7 @@ Every line below was read on `origin/master` at `861d4557`.
    `/usr/local/bin` — hence the reported
    `Spawning self-update: No such file or directory (os error 2)`. The same
    failure kills apply-update, `probe_service_state`, service install/uninstall
-   and the log-dir probe. — `agents/roomler-desktop/src/commands.rs:1494`
+   and the log-dir probe. — `agents/roomler-desktop/src/commands.rs:1559`
 8. ~~**macOS "Check for updates" targets the wrong mechanism.**~~ **Wrong —
    corrected during implementation.** The reported
    `Spawning self-update: No such file or directory (os error 2)` made this

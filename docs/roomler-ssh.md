@@ -1639,10 +1639,10 @@ for one `exec` because that is all it needs; the target refuses anything more
 
 | Piece | Where |
 |---|---|
-| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6782`](../agents/roomlerd/src/signaling.rs#L6782)) |
+| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6804`](../agents/roomlerd/src/signaling.rs#L6804)) |
 | the client | the key ([`ssh_client.rs:138`](../agents/roomlerd/src/ssh_client.rs#L138)), the request ([`:187`](../agents/roomlerd/src/ssh_client.rs#L187)), the answer's checks ([`:156`](../agents/roomlerd/src/ssh_client.rs#L156)), the one `exec` ([`:286`](../agents/roomlerd/src/ssh_client.rs#L286)), one call whole ([`:371`](../agents/roomlerd/src/ssh_client.rs#L371)) |
 | the dial | the netstack's ([`overlay.rs:972`](../agents/roomlerd/src/overlay.rs#L972)), the OS's ([`ssh_client.rs:240`](../agents/roomlerd/src/ssh_client.rs#L240)) |
-| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6418`](../agents/roomlerd/src/signaling.rs#L6418), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
+| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6440`](../agents/roomlerd/src/signaling.rs#L6440), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
 
 ### The tool: `ssh_run` (FR-90 P3-8-2b-2)
 
@@ -1692,7 +1692,7 @@ never recorded: what a session typed is its own.
 
 | Piece | Where |
 |---|---|
-| the owner's key | `hive_ssh` ([`config.rs:605`](../crates/agent-core/src/config.rs#L605)), never pushable ([`models.rs:9857`](../crates/remote_control/src/models.rs#L9857)), read into `HiveConfig.ssh` ([`gates.rs:58`](../agents/roomlerd/src/hive/gates.rs#L58)) |
+| the owner's key | `hive_ssh` ([`config.rs:619`](../crates/agent-core/src/config.rs#L619)), never pushable ([`models.rs:10003`](../crates/remote_control/src/models.rs#L10003)), read into `HiveConfig.ssh` ([`gates.rs:58`](../agents/roomlerd/src/hive/gates.rs#L58)) |
 | the offer | `Supervisor::ssh_runner` ([`supervisor.rs:1602`](../agents/roomlerd/src/hive/supervisor.rs#L1602)), made at start ([`:878`](../agents/roomlerd/src/hive/supervisor.rs#L878)); `Run.ssh` ([`toolbelt.rs:510`](../agents/roomlerd/src/hive/toolbelt.rs#L510)); the settings' ask ([`supervisor.rs:5055`](../agents/roomlerd/src/hive/supervisor.rs#L5055), `SSH_TOOLS` at [`toolbelt.rs:631`](../agents/roomlerd/src/hive/toolbelt.rs#L631)) |
 | the tool | its definition ([`toolbelt.rs:1378`](../agents/roomlerd/src/hive/toolbelt.rs#L1378)); the call ([`ssh_tools.rs:153`](../agents/roomlerd/src/hive/ssh_tools.rs#L153)), its checks ([`:113`](../agents/roomlerd/src/hive/ssh_tools.rs#L113)), the ticket's life ([`:146`](../agents/roomlerd/src/hive/ssh_tools.rs#L146)), the daemon's runner ([`:63`](../agents/roomlerd/src/hive/ssh_tools.rs#L63)) |
 | the ask | `VaultTools::ssh` ([`toolbelt.rs:481`](../agents/roomlerd/src/hive/toolbelt.rs#L481)), on the primary's queue ([`vault.rs:668`](../agents/roomlerd/src/vault.rs#L668)) |
