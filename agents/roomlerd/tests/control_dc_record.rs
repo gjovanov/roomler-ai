@@ -240,6 +240,11 @@ fn a_reoffer_on_the_same_session_keeps_its_banner() -> Result<()> {
     rt().block_on(a_reoffer_on_the_same_session_keeps_its_banner_cell())
 }
 
+#[test]
+fn a_reoffer_while_the_recorder_launches_keeps_the_recording() -> Result<()> {
+    rt().block_on(a_reoffer_while_the_recorder_launches_keeps_the_recording_cell())
+}
+
 /// The owner's two gates, as a local `ConfigSet` would set them.
 fn gates(enabled: bool, audio: bool) {
     let mut cfg = roomler_node_core::config::test_fixture();
@@ -468,6 +473,15 @@ impl Rig {
         self.indicator.hide_session(self.session_id.to_hex());
         let _ = self.pcs.0.close().await;
         Ok(())
+    }
+
+    /// P3b-3 — the signalling loop replaces this session's peer, as a
+    /// re-offer for a session it has a peer for does (`ServerMsg::SdpOffer`):
+    /// the old peer is closed, and the session goes on, so nothing hides it
+    /// from the banner.
+    async fn reoffer(&self) {
+        let _ = self.pcs.1.close().await;
+        let _ = self.pcs.0.close().await;
     }
 }
 
@@ -2362,9 +2376,7 @@ async fn a_reoffer_on_the_same_session_keeps_its_banner_cell() -> Result<()> {
     let name = v["name"].as_str().unwrap().to_string();
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    // The loop replaces the peer. No `hide_session`: the session goes on.
-    let _ = a.pcs.1.close().await;
-    let _ = a.pcs.0.close().await;
+    a.reoffer().await;
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // The session is listed already.
@@ -2390,6 +2402,119 @@ async fn a_reoffer_on_the_same_session_keeps_its_banner_cell() -> Result<()> {
     let file = s.out.join(&name);
     let _ = std::fs::remove_file(Sidecar::path_for(&file));
     let _ = std::fs::remove_file(&file);
+    Ok(())
+}
+
+/// #3451 — a re-offer while the recorder launches is not the session's end.
+/// The session goes on under its new peer, so its recording carries on, and
+/// the new peer's channel picks it up (red: the start read the old channel's
+/// end as the session's, stopped the recording `session_ended`, and the new
+/// channel found nothing to pick up).
+///
+/// The new channel opens once the start has returned, the order a new peer's
+/// setup takes beside a launch of about a second.
+async fn a_reoffer_while_the_recorder_launches_keeps_the_recording_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    let before = mp4s(&s.out);
+    let (device, _kill) = Device::new();
+    let user = ObjectId::new();
+    let session = ObjectId::new();
+    let same = |listed| Opts {
+        device: Some(device.clone()),
+        controller: Some(user),
+        session_id: Some(session),
+        listed,
+        ..Default::default()
+    };
+    let mut a = rig(same(true)).await?;
+    a.send(json!({"t": "rc:record.start", "id": "o1"})).await?;
+    // Spawned, not recording yet, as in the L3 cell.
+    let deadline = tokio::time::Instant::now() + START;
+    let launching = loop {
+        let st = s.manager.state();
+        if st.active || tokio::time::Instant::now() >= deadline {
+            break false;
+        }
+        if st.remote_controller.is_some() {
+            break true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let in_the_launch = launching && {
+        a.reoffer().await;
+        !s.manager.state().active
+    };
+    let mut a_kinds = Vec::new();
+    let mut picked = Value::Null;
+    let mut ended = Value::Null;
+    let mut b_kinds = Vec::new();
+    if in_the_launch {
+        // The start has returned (its `Started`), and its look at the
+        // session with it.
+        a_kinds = reports_until(&mut a, RecordingActivityKind::Started, START).await;
+        let mut b = rig(same(false)).await?;
+        b.send(json!({"t": "rc:record.status"})).await?;
+        picked = b.state(START).await?;
+        if (picked["state"].as_str(), picked["id"].as_str()) == (Some("recording"), Some("o1")) {
+            b.send(json!({"t": "rc:record.stop", "id": "o1"})).await?;
+            ended = b.until_not_recording(STOP).await?;
+        }
+        b_kinds = reports_until(
+            &mut b,
+            RecordingActivityKind::Stopped,
+            Duration::from_secs(5),
+        )
+        .await;
+        b.drop_session().await?;
+    }
+    let st = s.manager.state();
+    a_kinds.extend(a.reports().into_iter().map(|(k, why, _)| (k, why)));
+    // Whatever happened, the next cell starts from an idle recorder and no
+    // stray file.
+    idle(s).await;
+    for f in mp4s(&s.out).into_iter().filter(|f| !before.contains(f)) {
+        let _ = std::fs::remove_file(Sidecar::path_for(&f));
+        let _ = std::fs::remove_file(&f);
+    }
+    a.drop_session().await?;
+    assert!(
+        launching,
+        "the recorder was never seen launching: this cell proves nothing"
+    );
+    assert!(
+        in_the_launch,
+        "the recorder started before the re-offer was in: this cell proves nothing"
+    );
+    assert_eq!(
+        (picked["state"].as_str(), picked["id"].as_str()),
+        (Some("recording"), Some("o1")),
+        "a re-offer while the recorder launched stopped the recording: {picked}"
+    );
+    assert_eq!(ended["reason"], "requested", "{ended}");
+    assert_eq!(
+        st.last.as_ref().map(|l| l.reason.as_str()),
+        Some("requested")
+    );
+    assert_eq!(a_kinds, vec![(RecordingActivityKind::Started, None)]);
+    assert_eq!(
+        b_kinds,
+        vec![
+            (RecordingActivityKind::Reattached, None),
+            (RecordingActivityKind::Stopped, Some("requested".into())),
+        ]
+    );
+    assert!(
+        eventually(Duration::from_secs(3), || device
+            .registry
+            .list()
+            .iter()
+            .all(|e| !e.recording))
+        .await,
+        "the banner outlived the recording"
+    );
     Ok(())
 }
 
