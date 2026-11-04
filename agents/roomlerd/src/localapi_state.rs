@@ -233,6 +233,9 @@ pub struct DaemonState {
     /// root daemon, so the keep-busy verbs ask it over the delegation channel.
     /// `None` everywhere else, and in the worker itself: there this process's
     /// own engine is the one that runs.
+    ///
+    /// FR-43 P3c — and `Status` reports that worker from it
+    /// ([`NodeStatus::gui_worker`]).
     keep_busy_worker: Option<crate::delegate::DelegateHost>,
 }
 
@@ -985,6 +988,11 @@ impl LocalApiState for DaemonState {
             // on every answer (a sync read of a 400-byte file). Never cached:
             // on Windows the verdict lands after this process started.
             last_install: Some(crate::post_install::last_install_status()),
+            // FR-43 P3c — the GUI worker this Mac's root daemon supervises.
+            gui_worker: self
+                .keep_busy_worker
+                .as_ref()
+                .map(crate::delegate::DelegateHost::worker_status),
         }
     }
 

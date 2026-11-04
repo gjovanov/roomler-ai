@@ -1642,8 +1642,37 @@ still bind every session on that Mac: the worker hands them to the daemon, which
 the stricter of the person's and its own.
 
 The switch is off by default and stays off until the
-[field proof](fr/FR-43-macos-single-enrollment.md#what-rides-what). It doesn't yet give
-one row alone: the migration of a two-row Mac and the one-token install are P3c and
+[field proof](fr/FR-43-macos-single-enrollment.md#what-rides-what). It doesn't give one
+row alone: the switch leaves a person's enrollment in their file, so their row stays.
+
+**The migration (FR-43 P3c).** `sudo roomlerd one-row` makes a two-row Mac one row. It
+says its plan first and asks: `--dry-run` stops after the plan, and `--yes` goes ahead
+where no terminal can ask, as under `roomler exec`. Each enrollment in a person's file
+comes out of it. One the root half already holds, the same server and tenant, is
+**retired**: its row reads offline until a person deletes it from the device list. One
+the root doesn't hold is **moved** into the root's `[[orgs]]` with its token and
+WireGuard key, so its row stays, with its overlay off until `roomlerd org overlay` turns
+it on. Then the LaunchAgent goes, the root's file gets both switches, and the daemon
+restarts, which ends live sessions.
+
+```mermaid
+flowchart LR
+    PLAN["plan, said"] --> KEEP["copies: *.pre-one-row"] --> LA["LaunchAgent out, plist aside"]
+    LA --> FILES["root's file: both switches, moved orgs; people's files: no enrollment"]
+    FILES --> RESTART["kickstart -k: a new daemon in 30 s"] --> VERIFY{"within 60 s: connected, worker attached, screen-capture"}
+    VERIFY -- yes --> REPORT["one row: the retired rows to delete"]
+    VERIFY -- no --> UNDO["copies and plists back, LaunchAgent bootstrapped, restart"]
+    KEEP -.->|"a step fails"| UNDO
+    LA -.->|"a step fails"| UNDO
+    FILES -.->|"a step fails"| UNDO
+```
+
+Once it goes ahead it can't be stopped halfway: a detached copy of it applies the plan,
+so it outlives the restart of the daemon that carried a `roomler exec`, and a Ctrl-C
+ends only the command that waits for it. Its account also goes to
+`/var/log/roomler/one-row.log`. `sudo roomlerd one-row --revert` puts back
+every copy, the plist and the LaunchAgent, and restarts: two rows again, until a person
+deletes a retired row, whose token then cannot come back. The one-token install is
 P3d.
 
 ```bash

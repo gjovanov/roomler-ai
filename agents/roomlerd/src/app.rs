@@ -209,6 +209,26 @@ enum Command {
         #[command(subcommand)]
         action: OrgAction,
     },
+    /// FR-43 P3c — make a two-row Mac one row, as root: every person's
+    /// enrollment comes off their file (retired where the root half holds the
+    /// org, moved into the root's `[[orgs]]` where it does not), the root runs
+    /// the GUI worker with no enrollment, and the daemon restarts, which ends
+    /// live sessions. It says the plan first, keeps a copy of every file it
+    /// writes, and puts everything back if the restarted daemon is not one row
+    /// within 60 s. macOS only.
+    OneRow {
+        /// Say the plan, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Put back the two rows from the copies a migration kept. A row a
+        /// person has deleted since cannot come back.
+        #[arg(long)]
+        revert: bool,
+        /// Go ahead without asking. Without a terminal (`roomler exec`), the
+        /// only way to.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Connect to the server and sit in the signaling loop (default command
     /// if none is given).
     Run {
@@ -2136,6 +2156,11 @@ async fn daemon_main() -> Result<()> {
         Command::SystemContextProbe { mode } => system_context_probe_cmd(&mode),
         Command::Caps => caps_cmd().await,
         Command::Displays => displays_cmd().await,
+        Command::OneRow {
+            dry_run,
+            revert,
+            yes,
+        } => roomlerd::one_row::run(dry_run, revert, yes).await,
         #[cfg(feature = "system-context")]
         Command::PeerPresenceStatus => peer_presence_status_cmd(),
         Command::Service { action } => service_cmd(action, &config_path).await,

@@ -469,6 +469,27 @@ pub struct NodeStatus {
     /// Collapsing any two of them recreates that bug one layer up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_install: Option<LastInstallStatus>,
+    /// FR-43 P3c — the GUI worker a Mac's root daemon supervises, as the
+    /// delegation channel sees it. What `roomlerd one-row` verifies after its
+    /// restart. `None` off macOS, from the worker itself, and from an older
+    /// daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_worker: Option<GuiWorkerStatus>,
+}
+
+/// FR-43 P3c — what [`NodeStatus::gui_worker`] reports.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GuiWorkerStatus {
+    /// A worker holds the delegation channel.
+    pub attached: bool,
+    /// The permission words it announced (`screen-capture`, `input`), which
+    /// are the ones the device's row advertises (FR-43 P2c). `None` until it
+    /// has sent its caps, and again once it detaches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<Vec<String>>,
+    /// The daemon runs with `macos_one_row`: its worker holds no enrollment.
+    #[serde(default)]
+    pub one_row: bool,
 }
 
 /// #3164 — what [`NodeStatus::macos_grants`] reports.
@@ -5872,6 +5893,7 @@ mod tests {
                 pid: None,
                 started_at_ms: None,
                 macos_grants: None,
+                gui_worker: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {

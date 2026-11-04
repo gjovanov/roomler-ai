@@ -150,6 +150,8 @@ pub mod unenrolled;
 )]
 pub(crate) mod media_share;
 pub mod notify;
+/// FR-43 P3c — `sudo roomlerd one-row`: a two-row Mac becomes one row.
+pub mod one_row;
 pub mod org_join;
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod overlay;
