@@ -152,13 +152,13 @@ sleep would say hello again and erase the reason.
 ### 3.3 The server
 
 - The fleet socket treats `rc:agent.sleeping` as the goodbye
-  ([`socket.rs:737`](../crates/modules/fleet/src/socket.rs#L737)). It records the
+  ([`socket.rs:645`](../crates/modules/fleet/src/socket.rs#L645)). It records the
   notice first, then leaves its loop, so the ordinary teardown runs at once: the
   hub unregistration, the `Offline` write, and the offline transition. Without
   the goodbye the device would read online until the receive deadline reaped a
   socket nobody answers.
 - `AgentDao::record_sleep`
-  ([`agent.rs:529`](../crates/services/src/dao/agent.rs#L529)) is keyed by the
+  ([`agent.rs:497`](../crates/services/src/dao/agent.rs#L497)) is keyed by the
   connection's `conn_id`, like `mark_offline_if_conn`: a displaced connection's
   late notice matches nothing, so it can never mark a reconnected device asleep.
 - The offline `device:presence` row carries `sleep`
@@ -166,7 +166,7 @@ sleep would say hello again and erase the reason.
   without one is byte-for-byte the old shape
   ([`presence.rs:190`](../crates/modules/fleet/src/presence.rs#L190)).
 - The next hello `$unset`s `sleep`
-  ([`agent.rs:517`](../crates/services/src/dao/agent.rs#L517)), and every reader
+  ([`agent.rs:485`](../crates/services/src/dao/agent.rs#L485)), and every reader
   goes through `SleepView::of`, which shows a notice only on a device that is not
   online ([`models.rs:2198`](../crates/remote_control/src/models.rs#L2198)). A
   read between the reconnect and that write never shows a stale "asleep".
