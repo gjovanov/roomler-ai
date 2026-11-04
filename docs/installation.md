@@ -939,7 +939,7 @@ both spellings the daemon reads (`crates/tunnel-core/src/env.rs:197`,
 and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
-it (`agents/roomlerd/src/app.rs:6148`). A block larger than 64 KiB is not carried
+it (`agents/roomlerd/src/app.rs:6159`). A block larger than 64 KiB is not carried
 (`carry.rs:47`).
 
 No value reaches a command line or the MSI's log:
