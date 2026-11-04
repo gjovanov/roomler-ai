@@ -510,11 +510,41 @@ pub fn peer_replaced(session_id: ObjectId) {
 /// it does not wait for the controller to come back. Detaching it would
 /// keep recording someone who just sent the controller away, and a
 /// controller whose device auto-grants would reconnect straight into it.
+///
+/// ⚠️ That includes one the re-attach grace already holds while the session
+/// is still live (#3474). The handler of a channel that has ended does
+/// nothing, so the grace's recording for the session is stopped here, or the
+/// controller's next session would pick it up.
 pub fn host_ended(session_id: ObjectId) {
     for h in handlers_of(session_id) {
         h.over.store(true, Ordering::Release);
         h.host_ended();
     }
+    stop_held(session_id, "host_stopped");
+}
+
+/// Stop the recording the grace holds for `session_id`, `reason`, and report
+/// how it ended. Claimed under the slot's lock BEFORE the stop, as the grace
+/// does: while its file finalizes, the controller's next session can neither
+/// pick it up nor detach it again. ⚠️ ITS recording only: one that ended by
+/// itself (another may have begun since) is not stopped, only reported. Its
+/// follower, if it has not handed it on yet, reports it instead (#3447).
+fn stop_held(session_id: ObjectId, reason: &'static str) {
+    let Some(m) = manager() else { return };
+    if slot(|s| s.claim_stop(session_id)) != Some(true) {
+        return;
+    }
+    info!(session = %session_id, reason, "stopping a detached remote recording");
+    tokio::spawn(async move {
+        if m.active_remote()
+            .is_some_and(|r| r.session_id == session_id)
+        {
+            m.stop_with(Some(reason)).await;
+        }
+        if let Some(d) = slot(|s| s.take(session_id)).flatten() {
+            finish_detached(m, d);
+        }
+    });
 }
 
 // ── The device owner's gates ────────────────────────────────────────────────
