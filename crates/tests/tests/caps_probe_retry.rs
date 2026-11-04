@@ -5,8 +5,12 @@
 //! `roomlerd`'s own signalling loop (`signaling::run`) against a real server,
 //! with a real probe child that is slow and not stuck: its `base` phase takes
 //! longer than a first probe gives a child, and less than the first try gives
-//! one. The first hello has to say no hardware, and the row has to gain it on
+//! one. The first answer has to say no hardware, and the row has to gain it on
 //! the same connection.
+//!
+//! #3439 — and the device is online long before that first answer, saying it is
+//! still probing. Its hello used to wait for the whole first probe, two children
+//! at 60 s each here, so a slow host stayed offline for as long as its probe ran.
 //!
 //! The probe spawns `current_exe()`, so THIS binary is the child: `main` plays
 //! one when it finds `ROOMLERD_CAPS_CHILD`, which is why the target is
@@ -39,8 +43,11 @@ const NAME: &str = "a_slow_host_gains_its_hardware_with_no_restart";
 
 /// Over the first probe's 60 s for a child, under the first try's 2 min.
 const BASE_TAKES: Duration = Duration::from_secs(70);
+/// #3439 — the start waits 10 s for a first answer, then connects with the interim
+/// one. The rest is a slow runner. Well under the first child's 60 s.
+const ONLINE_WITHIN: Duration = Duration::from_secs(30);
 /// Two children at 60 s each, then the software child, which answers at once.
-const FIRST_HELLO_WITHIN: Duration = Duration::from_secs(200);
+const FIRST_ANSWER_WITHIN: Duration = Duration::from_secs(200);
 /// From the first hello, a minute of waiting and a slow runner. On a build with no
 /// retry this runs out.
 const FIRST_TRY_WITHIN: Duration = Duration::from_secs(120);
@@ -376,25 +383,29 @@ async fn the_test() {
     let connected = Arc::new(AtomicBool::new(false));
     let sig = spawn_agent_signaling(cfg, stop_rx, connected.clone());
 
-    // The first answer: both `base` children ran out of time, so the device
-    // comes online with no hardware.
-    let first = wait_row(
+    // #3439 — online while the first child runs, saying it is still probing.
+    let probing = wait_row(
         &app,
         &seeded,
         &id,
-        FIRST_HELLO_WITHIN,
-        "the first hello",
-        said_hello,
+        ONLINE_WITHIN,
+        "online while the first probe runs",
+        |row| {
+            row["is_online"] == true
+                && row["capabilities"]["unavailable"]["encoder-cells"]["code"] == "probing"
+        },
     )
     .await;
     assert!(
-        !has_hardware(&first),
-        "the first probe gives a child 60 s, and this one takes 70: {}",
-        first["capabilities"]
+        base_starts().len() <= 1,
+        "the first child is still running: {:?}",
+        base_starts()
     );
+    assert!(!has_hardware(&probing), "{}", probing["capabilities"]);
 
     // A reconnect's hello would also carry the new answer, and prove nothing
-    // about the heartbeat, so the connection has to stay up throughout.
+    // about the heartbeat, so the connection has to stay up throughout: from the
+    // hello that said it was probing.
     let dropped = Arc::new(AtomicBool::new(false));
     let watch = {
         let (connected, dropped) = (connected.clone(), dropped.clone());
@@ -407,6 +418,26 @@ async fn the_test() {
             }
         })
     };
+
+    // The first answer: both `base` children ran out of time, so the row says no
+    // hardware. It comes on the heartbeat, the moment the probe answers.
+    let first = wait_row(
+        &app,
+        &seeded,
+        &id,
+        FIRST_ANSWER_WITHIN,
+        "the first answer",
+        |row| {
+            said_hello(row)
+                && row["capabilities"]["unavailable"]["encoder-cells"]["code"] != "probing"
+        },
+    )
+    .await;
+    assert!(
+        !has_hardware(&first),
+        "the first probe gives a child 60 s, and this one takes 70: {}",
+        first["capabilities"]
+    );
 
     // The first try's child is up, so a session asks. Two `base` children ran in the
     // first probe.
