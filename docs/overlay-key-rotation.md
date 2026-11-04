@@ -432,15 +432,15 @@ The server cannot see the device switch, so a switched-off device is still order
 
 | piece | where |
 |---|---|
-| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:669`, `:700`, `:714`, test `:6221`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:4491-4495` |
-| wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:3297`, `:1018`; owner `network` (`:2473`, `modular-monolith.md`) |
-| models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:1881`, `:1907`, `:1932`, `:1963`, `:3683`, `:6440`, `:6455` |
+| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:926`, `:1324`, `:1373`, test `:8206`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:4491-4495` |
+| wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:3744`, `:1039`; owner `network` (`:2865`, `modular-monolith.md`) |
+| models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:3236`, `:3270`, `:3295`, `:3326`, `:5707`, `:10772`, `:10787` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
 | reconcile-on-connect | `crates/modules/fleet/src/socket.rs:267-283`, `:348-369` |
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
-| identity stamp at the join | `crates/modules/network/src/overlay.rs:633-656`; `crates/services/src/dao/agent.rs:995` |
+| identity stamp at the join | `crates/modules/network/src/overlay.rs:649-672`; `crates/services/src/dao/agent.rs:1084` |
 | the conditional report write | `crates/services/src/dao/agent.rs:1049-1079` |
-| state resolver + grid view | `crates/modules/fleet/src/agent.rs:532-696`, `:1465-1473` |
+| state resolver + grid view | `crates/modules/fleet/src/agent.rs:770-931`, `:1762-1770` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:825-833` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6418-6560`, `:3275-3317`, `:3319-3340`, `:1294-1318` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:346-245` |
