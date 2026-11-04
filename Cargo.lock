@@ -8849,7 +8849,6 @@ dependencies = [
  "bson",
  "directories",
  "hex",
- "ipnet",
  "libc",
  "reqwest 0.12.28",
  "roomler-ai-remote-control",
