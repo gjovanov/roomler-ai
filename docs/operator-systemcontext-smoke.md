@@ -156,11 +156,30 @@ icacls "C:\ProgramData\roomler" /inheritance:r `
 >
 > The second command above drops inheritance and grants in one call, so
 > every child inherits SYSTEM and Administrators while it can still be
-> rewritten. The daemon's hardening (`crates/agent-core/src/config.rs:3685`,
-> steps at `:3575`) takes the directory for Administrators, grants, and only
+> rewritten. The daemon's hardening (`crates/agent-core/src/config.rs:3673`,
+> steps at `:3734`) takes the directory for Administrators, grants, and only
 > then drops inheritance. The wizard's
 > (`agents/roomler-setup/src/orchestrator_agent.rs:1605`) takes it, then
 > runs that one call. Both stop if they cannot take the directory.
+
+The daemon hardens on every save of this config, and every start saves it once
+for its crash bookkeeping. Since #3291 a save first reads the directory's owner
+and DACL in-process (`crates/agent-core/src/config.rs:3836`) and skips the
+steps when the directory already holds exactly what they write: owned by
+Administrators, inheritance off, full control with `(OI)(CI)` for SYSTEM and
+for Administrators, and no other entry (`crates/agent-core/src/config.rs:3779`). Anything else, a read that
+fails included, runs them as before. A directory that holds an entry of its own
+the steps never remove, a grant to another account for instance, never reaches
+that state: it runs them on every save, as every directory did before #3291.
+On a host kept busy by higher-priority work
+each `icacls` waited for the load to end (18.6 s for `/setowner` on a 4-vCPU
+guest), and the start could not reach its capability probe until they had run.
+
+| The steps' effect | On a directory in that state | Skipped, so |
+|---|---|---|
+| owner → Administrators; `/grant:r` SYSTEM and Administrators; `/inheritance:r` | changes nothing | nothing is lost |
+| `/remove` Users and Authenticated Users, `/T` | changes nothing on the directory; on an entry below it, removes such an ACE if someone added one | only SYSTEM, an administrator or that entry's owner can add one. The first two hold full control of the tree, and an owner can grant its own SID again at any time, which the sweep never removed. The sweep held none of them off |
+| the same `/T` on `hive` and `hive\run` | took away the hive's stat grant for Authenticated Users (`agents/roomlerd/src/hive_win.rs:972`) at every save; each session launch put it back | the grant stays as the hive wrote it |
 
 ### If SYSTEM is locked out of `C:\ProgramData\roomler\roomler` (#3073)
 
@@ -172,7 +191,7 @@ can open nothing that was sealed.
 
 | What you see | Why |
 |---|---|
-| The service and worker logs stop at the restart, and `roomler logs` answers `no log file for source "daemon"` | the daemon cannot create its log in `service-logs`. A daemon with the fix logs instead into SYSTEM's own profile, and its first line names the reason (`crates/agent-core/src/logging.rs:254`) |
+| The service and worker logs stop at the restart, and `roomler logs` answers `no log file for source "daemon"` | the daemon cannot create its log in `service-logs`. A daemon with the fix logs instead into SYSTEM's own profile, and its first line names the reason (`crates/agent-core/src/logging.rs:262`) |
 | `icacls C:\ProgramData\roomler\roomler` lists **no** entries | the DACL is protected and empty (`icacls … /save` shows `D:PAI`) |
 | a leftover `config.toml.tmp.<pid>` in that directory | the config save whose hardening sealed it could not rename its file into place |
 | the directory lists SYSTEM and Administrators, but a child such as `crashes`, `service-logs` or `config.toml.prev` lists **no** entries; the log says `crash_recorder: read_dir failed … Access is denied`, or the daemon logs into SYSTEM's own profile because `service-logs` refused it | 0.4.185 hardened the directory for the first time, and dropped inheritance before it granted. Each child the user owned was left with an empty DACL. The same repair below heals it |

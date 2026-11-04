@@ -145,8 +145,8 @@ speculatively.
 > section designed was built under FR-70 (M2, "make-before-break, as designed
 > and built", 2026-09-05) and field-verified as M2a on 0.4.75 the next day: a
 > dims change opens the replacement off the frame path while the pump serves
-> at the old dims (`peer.rs:8642`, "FR-70 M2: dims change"), adopts it in one
-> pass (`peer.rs:7465`, "dims swap adopted — the picture never froze"), and
+> at the old dims (`peer.rs:8708`, "FR-70 M2: dims change"), adopts it in one
+> pass (`peer.rs:7520`, "dims swap adopted — the picture never froze"), and
 > counts it in the heartbeat's `dims_swaps`. On CORPLAP-3 (`av1_qsv`, direct)
 > both moves adopted in 252–285 ms off-path with an in-path adoption of
 > `apply=15 ms`; on CORPLAP-2 (`av1_nvenc`, relay) four moves, `apply=41–44 ms`,
@@ -473,7 +473,7 @@ of each is to produce a number.
 - ~~**The send task's DataChannel guard** (2026-10-30).~~ **Decided by FR-135
   (#3293), 2026-11-02: superseded, not shipped here.** The send task holds the
   video DC's mutex across a frame's whole send (a Rust 2024 `if let` scrutinee
-  temporary, `peer.rs:7233` today), so the pump's `dc_lock` waits out the
+  temporary, `peer.rs:7288` today), so the pump's `dc_lock` waits out the
   previous frame. The one-line narrowing this bullet planned would re-arm
   FR-79's 12:15 cut, because `AgentStalled` is partly this wait (FR-135 §2.5).
   FR-135 R0 reads `dc_lock_ms` first, and R7 (`dc_sink`) replaces the guard

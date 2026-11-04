@@ -69,8 +69,8 @@ arrived 4.4 s late still had ~50 s of its 60 s life left — the window was ther
 | push | `crates/modules/network/src/routes/agent_ssh.rs:540` | `rc_hub.push_ssh_grant(…)` |
 | enqueue | `crates/modules/fleet/src/hub.rs:2400` → `send_to_agent` | `try_send` onto the agent's outbound mpsc — returns when **queued** |
 | answer | `crates/modules/network/src/routes/agent_ssh.rs:558` | `Ok(Granted { address, … })` — immediately |
-| record | `agents/roomlerd/src/signaling.rs:5377` → `ssh.rs:2928` | `record_grant` pushes into `GRANTS` whenever the frame arrives |
-| auth | `agents/roomlerd/src/ssh.rs:2390` (`take_grant_for`) | reads `GRANTS`; no entry ⇒ `rejected — no live grant` |
+| record | `agents/roomlerd/src/signaling.rs:5377` → `ssh.rs:2950` | `record_grant` pushes into `GRANTS` whenever the frame arrives |
+| auth | `agents/roomlerd/src/ssh.rs:2410` (`take_grant_for`) | reads `GRANTS`; no entry ⇒ `rejected — no live grant` |
 
 ```mermaid
 sequenceDiagram
@@ -166,13 +166,13 @@ The waiter table lives in `NetworkState` — `network` owns SSH; the Hub only ow
 socket. A guard deregisters on every exit path, as `ExecWaiterGuard` does for exec.
 
 **The 10 s bound**: 2× the worst lag observed (4.4 s); inside the originating device's own
-30 s wait for `rc:ssh.response` (`agents/roomlerd/src/localapi_state.rs:1986`), so the
+30 s wait for `rc:ssh.response` (`agents/roomlerd/src/localapi_state.rs:2047`), so the
 caller hears the server's reason rather than its own timeout; and it leaves ≥ 50 s of the
 60 s grant TTL (`ssh_limits::GRANT_TTL_SECS`) to dial in.
 
 ### 4. The agent — acknowledge after recording, and every refusal
 
-The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4270`) acknowledges **after**
+The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4292`) acknowledges **after**
 `record_grant` returns: the grant is in `GRANTS` — the table the auth path reads — before
 the frame leaves, so "confirmed" means "redeemable". `record_grant`'s `Result<(), String>`
 becomes a typed rejection so the arm can say *which* refusal it was; the log text is

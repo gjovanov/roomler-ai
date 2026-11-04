@@ -3,7 +3,9 @@
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use mongodb::options::ReturnDocument;
-use roomler_ai_remote_control::models::{BlockList, OverlayAclMode, OverlayNetwork, PeerRelayMode};
+use roomler_ai_remote_control::models::{
+    BlockList, OverlayAclMode, OverlayNetwork, PeerRelayMode, RetiredKeyMode,
+};
 
 use super::base::{BaseDao, DaoError, DaoResult};
 use super::overlay_block::OverlayBlockDao;
@@ -115,6 +117,9 @@ impl OverlayNetworkDao {
             // so that turning the feature on can never black-hole a live mesh.
             acl_mode: OverlayAclMode::default(),
             peer_relay_mode: Default::default(),
+            // FR-40 P2 — and retired keys are refused only once an admin
+            // opts the org in.
+            retired_key_mode: Default::default(),
             created_at: now,
             updated_at: now,
         };
@@ -312,6 +317,27 @@ impl OverlayNetworkDao {
         // and a concurrent grow would make a computed ceiling wrong.
         let grown = self.block_list(net).await;
         self.allocate_host(network_id, grown.capacity()).await
+    }
+
+    /// FR-40 P2 — set the org's retired-key posture (`off` | `warn` |
+    /// `enforce`). Same shape as [`Self::set_acl_mode`], including creating
+    /// the row. Read at each join and DERP registration, so a change disturbs
+    /// no live session: it applies to the next one.
+    pub async fn set_retired_key_mode(
+        &self,
+        tenant_id: ObjectId,
+        mode: RetiredKeyMode,
+    ) -> DaoResult<bool> {
+        self.get_or_create(tenant_id).await?;
+        self.base
+            .update_one(
+                doc! { "tenant_id": tenant_id },
+                doc! { "$set": {
+                    "retired_key_mode": bson::to_bson(&mode).unwrap_or(bson::Bson::Null),
+                    "updated_at": DateTime::now(),
+                }},
+            )
+            .await
     }
 
     /// FR-19 gate 1 — set the tenant's peer-relay posture (`off` | `warn` |

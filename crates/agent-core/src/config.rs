@@ -3681,8 +3681,22 @@ pub fn default_config_path() -> Result<PathBuf> {
 ///   inherited ones go.
 ///
 /// A child keeps its owner: only the directory is taken for Administrators.
+///
+/// #3291 — a directory that already holds exactly what the steps write is
+/// left alone ([`already_hardened`], read in-process). Each save ran four
+/// `icacls` children, and one save is on every start's way to the capability
+/// probe: on a starved host each child waited as long as the load lasted.
+/// On that directory the steps change nothing. What a skip leaves out is the
+/// last step's `/T`: it took Users and Authenticated Users ACEs off entries
+/// BELOW the directory, and only SYSTEM, an administrator or the entry's own
+/// owner can put one there. The first two hold full control of the tree
+/// anyway, and an owner can grant its own SID again at any time, which the
+/// sweep never removed: it held none of them off.
 #[cfg(windows)]
 fn harden_machine_global_dir(dir: &std::path::Path) {
+    if already_hardened(dir) {
+        return;
+    }
     let d = dir.display().to_string();
     for (i, args) in HARDEN_STEPS.iter().enumerate() {
         match std::process::Command::new(crate::appdirs::system32_tool("icacls.exe"))
@@ -3723,6 +3737,225 @@ const HARDEN_STEPS: [&[&str]; 4] = [
     &["/inheritance:r"],
     &["/remove", "*S-1-5-32-545", "*S-1-5-11", "/T"],
 ];
+
+/// #3291 — what [`harden_machine_global_dir`] reads of the directory before
+/// it runs anything: the owner, whether the DACL is protected, and each ACE.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirAcl {
+    /// The owner's SID, `S-1-5-32-544`.
+    owner: String,
+    /// `SE_DACL_PROTECTED`: the directory inherits nothing from its parent.
+    protected: bool,
+    /// `None` is a NULL DACL, which lets everyone do everything.
+    dacl: Option<Vec<AclEntry>>,
+}
+
+/// One ACE of a [`DirAcl`], in the order the DACL holds them.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AclEntry {
+    /// `ACE_HEADER.AceType`: [`ACE_ALLOW`], [`ACE_DENY`], or a kind that is
+    /// read no further, its `mask` 0 and its `sid` empty.
+    kind: u8,
+    /// `ACE_HEADER.AceFlags`.
+    flags: u8,
+    mask: u32,
+    sid: String,
+}
+
+/// `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_DENIED_ACE_TYPE`.
+#[cfg(any(windows, test))]
+const ACE_ALLOW: u8 = 0;
+#[cfg(any(windows, test))]
+const ACE_DENY: u8 = 1;
+
+/// #3291 — `Ok` only when `acl` is exactly what [`HARDEN_STEPS`] leave on the
+/// directory: owned by Administrators, protected, and holding two ACEs and no
+/// other, full control with `(OI)(CI)` for SYSTEM and for Administrators. On
+/// such a directory the steps change nothing. Anything else is a reason to
+/// run them, an extra, deny or unknown ACE included, and `Err` names it.
+#[cfg(any(windows, test))]
+fn hardened(acl: &DirAcl) -> std::result::Result<(), String> {
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    const SYSTEM: &str = "S-1-5-18";
+    // icacls's `(OI)(CI)F`: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE, and
+    // FILE_ALL_ACCESS.
+    const OI_CI: u8 = 0x1 | 0x2;
+    const FULL: u32 = 0x001F_01FF;
+    if acl.owner != ADMINISTRATORS {
+        return Err(format!("it is owned by {}", acl.owner));
+    }
+    if !acl.protected {
+        return Err("it inherits from its parent".into());
+    }
+    let Some(aces) = &acl.dacl else {
+        return Err("it has no DACL".into());
+    };
+    // Each of the two grants once, in either order.
+    let mut wanted = vec![SYSTEM, ADMINISTRATORS];
+    for ace in aces {
+        let full_grant = ace.kind == ACE_ALLOW && ace.flags == OI_CI && ace.mask == FULL;
+        match wanted.iter().position(|sid| full_grant && *sid == ace.sid) {
+            Some(i) => {
+                wanted.swap_remove(i);
+            }
+            None => {
+                return Err(format!(
+                    "it holds an ACE of type {} with flags {:#x} and mask {:#x} for {}",
+                    ace.kind, ace.flags, ace.mask, ace.sid
+                ));
+            }
+        }
+    }
+    match wanted.first() {
+        Some(sid) => Err(format!("it grants {sid} no full control")),
+        None => Ok(()),
+    }
+}
+
+/// #3291 — whether [`harden_machine_global_dir`] may leave `dir` as it is:
+/// its owner and DACL, read in-process, are exactly the hardened state
+/// ([`hardened`]). A read that fails is a no.
+#[cfg(windows)]
+fn already_hardened(dir: &std::path::Path) -> bool {
+    let why = match dir_acl(dir) {
+        Ok(acl) => match hardened(&acl) {
+            Ok(()) => return true,
+            Err(why) => why,
+        },
+        Err(e) => format!("its ACL could not be read: {e}"),
+    };
+    tracing::debug!(dir = %dir.display(), %why, "config: hardening the machine-global dir");
+    false
+}
+
+/// #3291 — the owner and DACL of `dir`, read in-process: the check that saves
+/// a start four `icacls` children must not be a child itself.
+#[cfg(windows)]
+fn dir_acl(dir: &std::path::Path) -> std::io::Result<DirAcl> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
+        GetAce, GetAclInformation, GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    };
+
+    let sid_string = |sid: PSID| -> std::io::Result<String> {
+        let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // SAFETY: a SID inside the descriptor read below; on success `text`
+        // is a LocalAlloc'd string, freed here.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the NUL-terminated string the call above wrote.
+        let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+        // SAFETY: `len` units were just read from `text`.
+        let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+        // SAFETY: allocated by ConvertSidToStringSidW, freed once.
+        unsafe { LocalFree(text as _) };
+        Ok(s)
+    };
+
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated path; `owner` and `dacl` point into `sd`, a
+    // LocalAlloc'd descriptor freed below.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc as i32));
+    }
+    let read = (|| {
+        let owner = sid_string(owner)?;
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        // SAFETY: the descriptor read above.
+        if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let protected = control & SE_DACL_PROTECTED != 0;
+        if dacl.is_null() {
+            return Ok(DirAcl {
+                owner,
+                protected,
+                dacl: None,
+            });
+        }
+        let mut info = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        // SAFETY: `dacl` is an ACL inside `sd`; `info` is sized for the class.
+        let ok = unsafe {
+            GetAclInformation(
+                dacl,
+                (&raw mut info).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut aces = Vec::with_capacity(info.AceCount as usize);
+        for i in 0..info.AceCount {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `i` < AceCount; `ace` points into the ACL.
+            if unsafe { GetAce(dacl, i, &mut ace) } == 0 || ace.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: every ACE starts with an ACE_HEADER.
+            let header = unsafe { std::ptr::read_unaligned(ace as *const ACE_HEADER) };
+            // An allow or a deny ACE is the header (4 bytes), the mask (4),
+            // then the SID. Any other kind differs on its type alone.
+            let (mask, sid) = if header.AceType == ACE_ALLOW || header.AceType == ACE_DENY {
+                // SAFETY: the type says this is the layout, and GetAce hands
+                // back an ACE that lies whole inside the ACL.
+                let mask =
+                    unsafe { std::ptr::read_unaligned((ace as *const u8).add(4) as *const u32) };
+                // SAFETY: the SID starts 8 bytes in, inside the ACE.
+                (
+                    mask,
+                    sid_string(unsafe { (ace as *mut u8).add(8) } as PSID)?,
+                )
+            } else {
+                (0, String::new())
+            };
+            aces.push(AclEntry {
+                kind: header.AceType,
+                flags: header.AceFlags,
+                mask,
+                sid,
+            });
+        }
+        Ok(DirAcl {
+            owner,
+            protected,
+            dacl: Some(aces),
+        })
+    })();
+    // SAFETY: the descriptor GetNamedSecurityInfoW allocated, freed once.
+    unsafe { LocalFree(sd as _) };
+    read
+}
 
 #[cfg(target_os = "windows")]
 pub fn machine_global_config_path() -> PathBuf {
@@ -7130,5 +7363,247 @@ tenant_id = "tid2"
                 assert!(dacl.contains(&ace), "{}: {ace} in {dacl}", child.display());
             }
         }
+    }
+
+    /// #3291 — the directory as the steps leave it, read on a SystemContext
+    /// host on 0.4.198: `O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`.
+    fn hardened_dir_acl() -> DirAcl {
+        let grant = |sid: &str| AclEntry {
+            kind: ACE_ALLOW,
+            flags: 0x3,
+            mask: 0x001F_01FF,
+            sid: sid.into(),
+        };
+        DirAcl {
+            owner: "S-1-5-32-544".into(),
+            protected: true,
+            dacl: Some(vec![grant("S-1-5-18"), grant("S-1-5-32-544")]),
+        }
+    }
+
+    /// #3291 — the steps are skipped for exactly that state, its two ACEs in
+    /// either order.
+    #[test]
+    fn harden_skips_only_the_exact_hardened_state() {
+        assert_eq!(hardened(&hardened_dir_acl()), Ok(()));
+        let mut swapped = hardened_dir_acl();
+        swapped.dacl.as_mut().unwrap().reverse();
+        assert_eq!(hardened(&swapped), Ok(()));
+    }
+
+    /// #3291 — and run for every way a directory can differ from it: whoever
+    /// owns it, whether it inherits, a DACL that is missing, empty or short,
+    /// any ACE beyond the two, a deny or a kind the read does not parse, and
+    /// either grant with a different mask or different flags.
+    #[test]
+    fn harden_runs_on_every_deviation() {
+        let ace = |kind: u8, flags: u8, mask: u32, sid: &str| AclEntry {
+            kind,
+            flags,
+            mask,
+            sid: sid.into(),
+        };
+        let with = |change: &dyn Fn(&mut DirAcl)| {
+            let mut acl = hardened_dir_acl();
+            change(&mut acl);
+            acl
+        };
+        let added = |extra: AclEntry| with(&|a| a.dacl.as_mut().unwrap().push(extra.clone()));
+        let system_grant = |change: &dyn Fn(&mut AclEntry)| {
+            with(&|a: &mut DirAcl| change(&mut a.dacl.as_mut().unwrap()[0]))
+        };
+        let cases: Vec<(&str, DirAcl)> = vec![
+            ("owned by SYSTEM", with(&|a| a.owner = "S-1-5-18".into())),
+            (
+                "owned by a user",
+                with(&|a| a.owner = "S-1-5-21-1-2-3-1001".into()),
+            ),
+            ("inheriting", with(&|a| a.protected = false)),
+            ("a NULL DACL", with(&|a| a.dacl = None)),
+            ("an empty DACL", with(&|a| a.dacl = Some(Vec::new()))),
+            (
+                "SYSTEM's grant alone",
+                with(&|a| {
+                    a.dacl.as_mut().unwrap().remove(1);
+                }),
+            ),
+            (
+                "SYSTEM's grant twice",
+                with(&|a| a.dacl.as_mut().unwrap()[1].sid = "S-1-5-18".into()),
+            ),
+            (
+                "Users may read",
+                added(ace(ACE_ALLOW, 0x3, 0x0012_00a9, "S-1-5-32-545")),
+            ),
+            (
+                "Authenticated Users may stat",
+                added(ace(ACE_ALLOW, 0, 0x0010_0080, "S-1-5-11")),
+            ),
+            (
+                "Everyone has full control",
+                added(ace(ACE_ALLOW, 0x3, 0x001F_01FF, "S-1-1-0")),
+            ),
+            (
+                "a user's own grant",
+                added(ace(ACE_ALLOW, 0x3, 0x001F_01FF, "S-1-5-21-1-2-3-1001")),
+            ),
+            (
+                "a deny",
+                added(ace(ACE_DENY, 0x3, 0x001F_01FF, "S-1-5-32-545")),
+            ),
+            ("an object ACE", added(ace(5, 0x3, 0, ""))),
+            (
+                "SYSTEM's grant as a deny",
+                system_grant(&|g| g.kind = ACE_DENY),
+            ),
+            ("SYSTEM reads only", system_grant(&|g| g.mask = 0x0012_00a9)),
+            (
+                "SYSTEM's grant as GENERIC_ALL",
+                system_grant(&|g| g.mask = 0x1000_0000),
+            ),
+            (
+                "SYSTEM's grant without (CI)",
+                system_grant(&|g| g.flags = 0x1),
+            ),
+            (
+                "SYSTEM's grant without (OI)",
+                system_grant(&|g| g.flags = 0x2),
+            ),
+            (
+                "SYSTEM's grant inherit-only",
+                system_grant(&|g| g.flags = 0x3 | 0x8),
+            ),
+            (
+                "SYSTEM's grant not propagated",
+                system_grant(&|g| g.flags = 0x3 | 0x4),
+            ),
+            (
+                "SYSTEM's grant inherited",
+                system_grant(&|g| g.flags = 0x3 | 0x10),
+            ),
+        ];
+        for (case, acl) in cases {
+            assert!(
+                hardened(&acl).is_err(),
+                "{case} must run the steps: {acl:?}"
+            );
+        }
+    }
+
+    /// #3291 — a read that fails runs the steps: a directory that is not there
+    /// has no ACL to read.
+    #[cfg(windows)]
+    #[test]
+    fn harden_runs_when_the_acl_cannot_be_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("not-there");
+        assert!(dir_acl(&missing).is_err());
+        assert!(!already_hardened(&missing));
+    }
+
+    /// #3291 — a directory to harden as the field has one: below another,
+    /// holding no ACE of its own and inheriting all it holds, as a directory
+    /// under ProgramData does. A fresh temp directory is not that everywhere:
+    /// on CI's runner one came with a full-control `(OI)(CI)` ACE of its own
+    /// for the runner's account. No step removes such an ACE, so the steps
+    /// could never leave that directory hardened, and the check rightly kept
+    /// running them. `/reset` drops whatever ACE the new directory was given
+    /// and leaves what its parent hands down.
+    #[cfg(windows)]
+    fn inheriting_dir(parent: &std::path::Path) -> std::path::PathBuf {
+        let dir = parent.join("roomler");
+        std::fs::create_dir(&dir).expect("a directory below the temp one");
+        let reset = std::process::Command::new("icacls")
+            .arg(&dir)
+            .arg("/reset")
+            .output()
+            .expect("icacls runs");
+        assert!(reset.status.success(), "{reset:?}");
+        let acl = dir_acl(&dir).expect("the owner reads its own directory");
+        // INHERITED_ACE.
+        let own = |ace: &AclEntry| ace.flags & 0x10 == 0;
+        assert!(
+            !acl.protected && !acl.dacl.iter().flatten().any(own),
+            "the directory inherits all it holds: {acl:?}"
+        );
+        dir
+    }
+
+    /// #3291 — the in-process read sees a DACL as `icacls` writes it. This
+    /// token owns the directory and keeps WRITE_DAC as its owner, so it needs
+    /// no elevation; an unelevated one cannot make Administrators the owner,
+    /// and the directory then counts as hardened only when it can.
+    #[cfg(windows)]
+    #[test]
+    fn harden_reads_the_dacl_icacls_writes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = inheriting_dir(temp.path());
+        let icacls = |args: &[&str]| {
+            let out = std::process::Command::new("icacls")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .expect("icacls runs");
+            assert!(out.status.success(), "icacls {args:?}: {out:?}");
+        };
+        icacls(HARDEN_STEPS[1]);
+        icacls(HARDEN_STEPS[2]);
+        let acl = dir_acl(&dir).expect("the owner reads its own directory");
+        // Back to what it inherits, so the temp dir can be removed.
+        icacls(&["/reset"]);
+        assert!(acl.protected, "{acl:?}");
+        let mut aces = acl.dacl.clone().expect("a DACL");
+        aces.sort_by(|a, b| a.sid.cmp(&b.sid));
+        let grant = |sid: &str| AclEntry {
+            kind: ACE_ALLOW,
+            flags: 0x3,
+            mask: 0x001F_01FF,
+            sid: sid.into(),
+        };
+        assert_eq!(aces, vec![grant("S-1-5-18"), grant("S-1-5-32-544")]);
+        assert_eq!(
+            hardened(&acl).is_ok(),
+            acl.owner == "S-1-5-32-544",
+            "{acl:?}"
+        );
+    }
+
+    /// #3291 — on a directory that inherits all it holds, as the field's does,
+    /// the steps leave exactly the state the check skips on, so from the next
+    /// save on a hardened directory is left alone; and one that drifted (an
+    /// administrator granted Users) is hardened again. Taking the directory for
+    /// Administrators takes an elevated token, as #3073's case.
+    #[cfg(windows)]
+    #[test]
+    fn harden_once_then_skip_until_the_directory_drifts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = inheriting_dir(temp.path());
+        std::fs::write(dir.join("config.toml"), "x").unwrap();
+        assert!(!already_hardened(&dir), "a fresh directory inherits");
+        harden_machine_global_dir(&dir);
+        if !already_hardened(&dir) {
+            assert!(
+                std::env::var_os("ROOMLERD_TEST_REQUIRE_ELEVATED").is_none(),
+                "this lane must run elevated for #3291's case: {:?}",
+                dir_acl(&dir)
+            );
+            eprintln!(
+                "skipped: this token cannot make Administrators the owner; run elevated to cover #3291"
+            );
+            return;
+        }
+        let granted = std::process::Command::new("icacls")
+            .arg(&dir)
+            .args(["/grant", "*S-1-5-32-545:(OI)(CI)RX"])
+            .output()
+            .expect("icacls runs");
+        assert!(granted.status.success(), "{granted:?}");
+        assert!(!already_hardened(&dir), "a Users grant is a drift");
+        harden_machine_global_dir(&dir);
+        assert!(
+            already_hardened(&dir),
+            "the steps took the grant away again: {:?}",
+            dir_acl(&dir)
+        );
     }
 }
