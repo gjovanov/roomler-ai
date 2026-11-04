@@ -231,7 +231,6 @@ async fn only_the_connection_that_said_hello_can_say_the_device_is_asleep() {
                 "",
                 "",
                 "",
-                "",
                 false,
                 conn,
             )
