@@ -78,7 +78,10 @@
 //! Exactly one party speaks for a recording's ending, and every hand-off
 //! names the recording (its file): the follower that last claimed it
 //! ([`Speakers`]), or the grace while it waits ([`Slot`]). The grace acts on
-//! its own recording only, and claims it before stopping it.
+//! its own recording only, and claims it before stopping it. A detached
+//! recording is the grace's to report only once its follower has handed it
+//! on (#3447): a session's end can detach it while the follower still
+//! follows it, and the follower then reports it.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -148,6 +151,12 @@ struct Detached {
     /// The grace is stopping it. From here nobody picks it up or detaches it
     /// again, or its ending would be reported twice.
     stopping: bool,
+    /// #3447 — the session's follower has handed it on and stopped following
+    /// it. Until then that follower still speaks for its ending: the session
+    /// may have asked it to end as it ended, or it may end before the
+    /// follower looks again, and the follower reports it either way. Whoever
+    /// takes it out of the slot meanwhile says nothing ([`finish_detached`]).
+    handed_on: bool,
     /// The dropped session's surfaces: its banner comes down, and the ending
     /// is reported on its queue, if nobody picks it up.
     indicator: crate::indicator::ViewerIndicator,
@@ -185,17 +194,23 @@ struct Slot {
 }
 
 impl Slot {
-    /// Put `d` into the grace.
+    /// Put `d` into the grace. A follower's hand-on of a recording already
+    /// there marks that entry (#3447), and nothing unmarks it.
     fn detach(&mut self, d: Detached) -> Detach {
         if self.launching.contains(&d.session_id) {
             return Detach::Launching;
         }
-        match &self.held {
-            Some(cur) if cur.session_id == d.session_id => Detach::Already,
-            _ => match self.held.replace(d) {
-                Some(old) => Detach::Evicted(old),
-                None => Detach::Done,
-            },
+        if let Some(cur) = self
+            .held
+            .as_mut()
+            .filter(|cur| cur.session_id == d.session_id)
+        {
+            cur.handed_on |= d.handed_on;
+            return Detach::Already;
+        }
+        match self.held.replace(d) {
+            Some(old) => Detach::Evicted(old),
+            None => Detach::Done,
         }
     }
 
@@ -345,7 +360,14 @@ fn superseded(file: &str, id: u64) -> bool {
 
 /// Report how a detached recording ended, on its own session, and take its
 /// banner down. `last` describes it only if it is its file.
+///
+/// #3447 — nothing, for one its follower never handed on: that follower
+/// still follows it and reports the ending itself. Both speaking was two
+/// `stopped` for one recording, and its banner taken down twice.
 fn finish_detached(m: &RecordingManager, d: Detached) {
+    if !d.handed_on {
+        return;
+    }
     let last = m.state().last.unwrap_or_default();
     let this = d.file.is_some() && file_name(last.path.as_deref()) == d.file;
     let msg = ClientMsg::RecordingActivity {
@@ -488,11 +510,41 @@ pub fn peer_replaced(session_id: ObjectId) {
 /// it does not wait for the controller to come back. Detaching it would
 /// keep recording someone who just sent the controller away, and a
 /// controller whose device auto-grants would reconnect straight into it.
+///
+/// ⚠️ That includes a recording the re-attach grace holds for the session
+/// (#3474): `stop_held` stops it here, then and there, and reports it once.
+/// Left to the grace, the controller's next session would pick it up. Another
+/// session's recording is never stopped by it.
 pub fn host_ended(session_id: ObjectId) {
     for h in handlers_of(session_id) {
         h.over.store(true, Ordering::Release);
         h.host_ended();
     }
+    stop_held(session_id, "host_stopped");
+}
+
+/// Stop the recording the grace holds for `session_id`, `reason`, and report
+/// how it ended. Claimed under the slot's lock BEFORE the stop, as the grace
+/// does: while its file finalizes, the controller's next session can neither
+/// pick it up nor detach it again. ⚠️ ITS recording only: one that ended by
+/// itself (another may have begun since) is not stopped, only reported. Its
+/// follower, if it has not handed it on yet, reports it instead (#3447).
+fn stop_held(session_id: ObjectId, reason: &'static str) {
+    let Some(m) = manager() else { return };
+    if slot(|s| s.claim_stop(session_id)) != Some(true) {
+        return;
+    }
+    info!(session = %session_id, reason, "stopping a detached remote recording");
+    tokio::spawn(async move {
+        if m.active_remote()
+            .is_some_and(|r| r.session_id == session_id)
+        {
+            m.stop_with(Some(reason)).await;
+        }
+        if let Some(d) = slot(|s| s.take(session_id)).flatten() {
+            finish_detached(m, d);
+        }
+    });
 }
 
 // ── The device owner's gates ────────────────────────────────────────────────
@@ -857,7 +909,9 @@ struct Handler {
     /// P3b-3 — THIS session asked the recording to end (the controller's
     /// Stop, or the follower's own gate / sign-in stop). A drop while it
     /// finalizes then neither detaches it nor silences its report: this
-    /// session's follower still reports the ending, once.
+    /// session's follower still reports the ending, once. So does a drop
+    /// that detached it a moment before (#3447): the follower never hands it
+    /// on, and the grace says nothing.
     ending: AtomicBool,
     /// The session's end has been handled ([`Handler::end_session`] runs
     /// once: from the signalling loop, `on_close`, or the channel watch that
@@ -1559,7 +1613,7 @@ impl Handler {
             && h.ctx.controller_user_id == me
             && channel_gone(&h.dc)
         {
-            h.detach_recording();
+            h.detach_recording(false);
         }
         if let Some(d) = slot(|s| s.pick_up(me)).flatten()
             && self.clone().reattach(d).await
@@ -1606,7 +1660,8 @@ impl Handler {
             m.retarget_remote(d.session_id, sid)
         };
         if !moved {
-            // It ended between the drop and now: nobody else will report it.
+            // It ended between the drop and now: reported here, or by its
+            // follower if that never handed it on (#3447).
             finish_detached(m, d);
             return false;
         }
@@ -1887,7 +1942,7 @@ impl Handler {
         // A transfer has nowhere left to go (the controller resumes it from
         // its offset on the next session).
         self.cancel("");
-        self.detach_recording();
+        self.detach_recording(false);
         // The channel's callbacks hold this handler, and it holds the
         // channel: without letting go here neither is ever freed, nor the
         // session's queue the handler keeps. A follower still reporting keeps
@@ -1922,11 +1977,19 @@ impl Handler {
     /// A recording this session already asked to end is left to finish: its
     /// follower reports the ending. One that moved to another session (picked
     /// up) is not this session's any more.
-    fn detach_recording(&self) {
+    ///
+    /// #3447 — `follower`: the session's follower hands the recording on, and
+    /// the entry says so (under the slot's lock, as it goes in or onto the
+    /// one there). `true` = the grace holds it now, put there here or before:
+    /// only then does the follower stop following it. Otherwise (asked to end
+    /// since the follower looked, its recorder still launching, not this
+    /// session's) the follower looks again. It used to leave on a detach that
+    /// did nothing, and that ending then had nobody to report it.
+    fn detach_recording(&self, follower: bool) -> bool {
         if !self.owns_active() || self.ending.load(Ordering::Acquire) {
-            return;
+            return false;
         }
-        let Some(m) = manager() else { return };
+        let Some(m) = manager() else { return false };
         let sid = self.ctx.session_id;
         let d = Detached {
             session_id: sid,
@@ -1940,6 +2003,7 @@ impl Handler {
             unattended: self.unattended.load(Ordering::Acquire),
             file: file_name(m.state().path.as_deref()),
             stopping: false,
+            handed_on: follower,
             indicator: self.ctx.indicator.clone(),
             outbound: self.ctx.outbound.clone(),
         };
@@ -1953,9 +2017,11 @@ impl Handler {
             // Another session's recording, over, whose grace had not looked
             // since: finished here, or its banner stays up for good.
             Some(Detach::Evicted(old)) => finish_detached(m, old),
-            // In the grace already; or its recorder still launching, where
-            // the start decides (#3451).
-            Some(Detach::Already | Detach::Launching) | None => return,
+            // In the grace already (a follower's hand-on marked on it).
+            Some(Detach::Already) => return true,
+            // Its recorder still launching, where the start decides (#3451);
+            // or asked to end since the first look.
+            Some(Detach::Launching) | None => return false,
         }
         info!(
             session = %sid,
@@ -1963,6 +2029,7 @@ impl Handler {
             "session ended while recording — waiting for its controller to come back"
         );
         tokio::spawn(grace_watch(sid));
+        true
     }
 
     /// Follow a recording this session started (or picked up, P3b-3) until
@@ -2019,8 +2086,12 @@ impl Handler {
                         || slot(|s| s.holds(sid)) == Some(true)
                         || channel_gone(&self.dc))
                 {
-                    self.detach_recording();
-                    return;
+                    // #3447 — it stops following only once the grace holds
+                    // the recording, its hand-on marked; else it looks again.
+                    if self.detach_recording(true) {
+                        return;
+                    }
+                    continue;
                 }
                 let off = !gates().enabled;
                 // P1f — an UNATTENDED recording ends the moment someone signs
@@ -2118,6 +2189,7 @@ mod tests {
             unattended: false,
             file: Some("a.mp4".into()),
             stopping: false,
+            handed_on: false,
             indicator: crate::indicator::ViewerIndicator::disabled(),
             outbound: mpsc::channel::<ClientMsg>(1).0,
         }
@@ -2224,6 +2296,75 @@ mod tests {
             _ => panic!("once launched, the recording is detached as any other"),
         }
         assert!(s.holds(a));
+    }
+
+    /// #3447 — a follower hands its recording on by marking the entry, under
+    /// the slot's lock, whoever put the entry there: the session's end first
+    /// (its follower still follows it), or the follower's own detach. A later
+    /// detach that is not the follower's never takes the mark off.
+    #[test]
+    fn a_followers_hand_on_is_marked_on_the_entry() {
+        let (a, user) = (ObjectId::new(), ObjectId::new());
+        let handing_on = || Detached {
+            handed_on: true,
+            ..detached(a, user)
+        };
+        let mut s = Slot::default();
+        assert!(matches!(s.detach(detached(a, user)), Detach::Done));
+        assert!(s.held.as_ref().is_some_and(|d| !d.handed_on));
+        assert!(matches!(s.detach(handing_on()), Detach::Already));
+        assert!(
+            s.held.as_ref().is_some_and(|d| d.handed_on),
+            "the follower left and the entry does not say so"
+        );
+        assert!(matches!(s.detach(detached(a, user)), Detach::Already));
+        assert!(
+            s.held.as_ref().is_some_and(|d| d.handed_on),
+            "a session end's detach took the follower's mark off"
+        );
+        assert!(s.take(a).is_some());
+        assert!(matches!(s.detach(handing_on()), Detach::Done));
+        assert!(s.held.as_ref().is_some_and(|d| d.handed_on));
+    }
+
+    /// #3447 — whoever takes a detached recording out of the slot (the grace,
+    /// a detach over it, a pick-up whose recording ended) reports its ending
+    /// only once its follower has handed it on. Before that the follower
+    /// still follows it and reports it: both speaking was two `stopped` for
+    /// one recording, and its banner taken down twice.
+    #[test]
+    fn a_recording_its_follower_still_follows_is_not_reported_by_its_taker() {
+        let m = RecordingManager::new("roomlerd".into(), "config.toml".into());
+        let (a, user) = (ObjectId::new(), ObjectId::new());
+        let (tx, mut rx) = mpsc::channel::<ClientMsg>(4);
+        finish_detached(
+            &m,
+            Detached {
+                outbound: tx.clone(),
+                ..detached(a, user)
+            },
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "reported while its follower still follows it"
+        );
+        finish_detached(
+            &m,
+            Detached {
+                handed_on: true,
+                outbound: tx,
+                ..detached(a, user)
+            },
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::RecordingActivity {
+                kind: RecordingActivityKind::Stopped,
+                session_id,
+                ..
+            }) if session_id == a
+        ));
+        assert!(rx.try_recv().is_err(), "reported twice");
     }
 
     /// P3b-3 — a recording's ending has one speaker. A pick-up's claim for
